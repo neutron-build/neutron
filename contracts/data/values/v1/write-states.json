@@ -1,0 +1,60 @@
+{
+  "format": "neutron-value-cases",
+  "version": 1,
+  "status": "normative-proposed-runtime-compliance-unverified",
+  "cases": [
+    {
+      "id": "insert-four-states",
+      "operation": "insert",
+      "sql_type": "pg_catalog.int4 DEFAULT 17",
+      "inputs": [
+        {
+          "state": "omitted"
+        },
+        {
+          "state": "default"
+        },
+        {
+          "state": "null"
+        },
+        {
+          "state": "present",
+          "value": 0
+        }
+      ],
+      "expected": [
+        17,
+        17,
+        null,
+        0
+      ]
+    },
+    {
+      "id": "update-four-states",
+      "operation": "update",
+      "initial": 42,
+      "sql_type": "pg_catalog.int4 DEFAULT 17",
+      "inputs": [
+        {
+          "state": "omitted"
+        },
+        {
+          "state": "default"
+        },
+        {
+          "state": "null"
+        },
+        {
+          "state": "present",
+          "value": 0
+        }
+      ],
+      "expected": [
+        42,
+        17,
+        null,
+        0
+      ]
+    }
+  ]
+}

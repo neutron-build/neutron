@@ -211,3 +211,13 @@ describe('encodeCell timestamptz offset discipline (S05)', () => {
     expect(encodeCell('2026-01-01T00:00:00', 'timestamp')).toEqual({ t: 'timestamp', v: '2026-01-01T00:00:00' })
   })
 })
+
+it('keeps native JSON documents as exact text distinct from SQL NULL and wire-shaped JSON', () => {
+  const text='{"number":9007199254740993,"decimal":12345678901234567890.123456789,"t":"int8","v":"not-a-cell"}'
+  expect(decodeCell({t:'jsonb',v:text})).toBe(text)
+  expect(decodeCell({t:'jsonb',v:'null'})).toBe('null')
+  expect(decodeCell(null)).toBeNull()
+  expect(decodeCell({t:'jsonb',v:'1e10000'})).toBe('1e10000')
+  expect(() => decodeCell({t:'jsonb',v:'{invalid'})).toThrow(WireDecodeError)
+  expect(encodeEdit({kind:'value',text},{name:'document',type:'jsonb',tag:null})).toEqual({kind:'value',value:text})
+})

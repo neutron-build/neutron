@@ -114,8 +114,14 @@ func ValidateSchemaDocument(raw []byte) (DocumentCheck, error) {
 			return DocumentCheck{}, err
 		}
 		return DocumentCheck{Version: SchemaDocumentVersionV2, SHA256: doc.SHA256Hex, Canonical: doc.Canonical}, nil
+	case SchemaDocumentVersionV3:
+		doc, err := ParseV3Document(raw)
+		if err != nil {
+			return DocumentCheck{}, err
+		}
+		return DocumentCheck{Version: SchemaDocumentVersionV3, SHA256: doc.SHA256Hex, Canonical: doc.Canonical}, nil
 	default:
-		return DocumentCheck{}, contractErr("unknown-version", "$.version", "schema document declares version %d; this CLI understands versions 1 and 2 only", version)
+		return DocumentCheck{}, contractErr("unknown-version", "$.version", "schema document declares version %d; this CLI understands versions 1, 2 and 3", version)
 	}
 }
 

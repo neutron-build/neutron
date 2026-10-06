@@ -11,34 +11,35 @@
   /* Typography */
   --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
   --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 14px;
-  --text-lg: 15px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
 
   /* Radius */
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 14px;
+  --radius: var(--radius-md);
 
   /* Transitions */
   --transition: 120ms ease;
 
   /* Accent */
-  --accent: #6366f1;
-  --accent-hover: #5254cc;
-  --accent-subtle: rgba(99, 102, 241, 0.12);
-  --accent-border: rgba(99, 102, 241, 0.3);
+  --accent: #0f766e;
+  --accent-hover: #115e59;
+  --accent-subtle: rgba(45, 212, 191, 0.10);
+  --accent-border: rgba(45, 212, 191, 0.30);
 
   /* Status */
   --color-success: #22c55e;
   --color-warning: #f59e0b;
-  --color-error: #ef4444;
+  --color-error: #f87171;
   --color-info: #3b82f6;
   /* Aliases */
   --success: #22c55e;
-  --danger: #ef4444;
+  --danger: #f87171;
   --warning: #f59e0b;
 
   /* Model badge colors (full + short aliases) */
@@ -49,9 +50,9 @@
   --model-ts: #f97316;
   --model-document: #14b8a6;
   --model-doc: #14b8a6;
-  --model-graph: #ef4444;
+  --model-graph: #f87171;
   --model-fts: #eab308;
-  --model-geo: #6366f1;
+  --model-geo: #2dd4bf;
   --model-blob: #94a3b8;
   --model-pubsub: #ec4899;
   --model-streams: #06b6d4;
@@ -63,24 +64,28 @@
 /* Dark theme (default) */
 :root,
 [data-theme="dark"] {
-  --bg-app: #0d0d10;
-  --bg-panel: #13131a;
-  --bg-overlay: #1a1a24;
-  --bg-hover: #1e1e28;
-  --bg-active: #25253a;
-  --bg-input: #0d0d10;
+  --bg-app: #10151d;
+  --bg-panel: #151d28;
+  --bg-overlay: #1b2633;
+  --bg-hover: #223040;
+  --bg-active: #26384a;
+  --bg-input: #10151d;
+  --bg-tertiary: var(--bg-overlay);
+  --bg-elevated: var(--bg-overlay);
+  --text-dim: var(--text-tertiary);
+  color-scheme: dark;
 
-  --border: #1e1e2e;
-  --border-focus: #6366f1;
-  --border-subtle: #16161f;
+  --border: #2c3b4c;
+  --border-focus: #2dd4bf;
+  --border-subtle: #212e3e;
 
-  --text-primary: #e2e2f0;
-  --text-secondary: #8888aa;
-  --text-tertiary: #55556a;
-  --text-inverse: #0d0d10;
-  --text-accent: #818cf8;
+  --text-primary: #eef4fa;
+  --text-secondary: #b4c2d2;
+  --text-tertiary: #94a6bc;
+  --text-inverse: #10151d;
+  --text-accent: #5eead4;
 
-  --scrollbar-thumb: #2a2a3a;
+  --scrollbar-thumb: #45566b;
   --scrollbar-track: transparent;
 
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
@@ -96,24 +101,47 @@
 
 /* Light theme */
 [data-theme="light"] {
-  --bg-app: #f5f5f8;
+  --color-success: #16733b;
+  --color-warning: #946200;
+  --color-error: #b42318;
+  --color-info: #2458a6;
+  --success: #16733b;
+  --warning: #946200;
+  --danger: #b42318;
+  --model-sql: #2458a6;
+  --model-kv: #16733b;
+  --model-vector: #7c3abd;
+  --model-timeseries: #ad4b0c;
+  --model-ts: #ad4b0c;
+  --model-document: #0b746b;
+  --model-doc: #0b746b;
+  --model-graph: #b42318;
+  --model-fts: #946200;
+  --model-geo: #4b46ac;
+  --model-pubsub: #a8276d;
+  --model-streams: #087283;
+  --model-columnar: #946200;
+  --model-datalog: #7040ac;
+  --model-cdc: #567315;
+  --bg-app: #f4f7fa;
   --bg-panel: #ffffff;
-  --bg-overlay: #f0f0f5;
-  --bg-hover: #e8e8f0;
-  --bg-active: #dcdcf0;
+  --bg-overlay: #f0f4f7;
+  --bg-hover: #e9f0f5;
+  --bg-active: #e0efed;
   --bg-input: #ffffff;
+  color-scheme: light;
 
-  --border: #e2e2ea;
-  --border-focus: #6366f1;
-  --border-subtle: #ececf2;
+  --border: #d6e0e8;
+  --border-focus: #0f766e;
+  --border-subtle: #e7edf2;
 
-  --text-primary: #111118;
-  --text-secondary: #55556a;
-  --text-tertiary: #9999b0;
+  --text-primary: #182635;
+  --text-secondary: #40566b;
+  --text-tertiary: #52667b;
   --text-inverse: #ffffff;
-  --text-accent: #4f46e5;
+  --text-accent: #0f766e;
 
-  --scrollbar-thumb: #ccccda;
+  --scrollbar-thumb: #b2c2cf;
   --scrollbar-track: transparent;
 
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);

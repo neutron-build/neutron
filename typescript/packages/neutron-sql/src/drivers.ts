@@ -15,7 +15,7 @@
 // Cancellation (I02): deadlines and AbortSignals reach the DATABASE, not just
 // the caller's promise. pg has no per-query cancel API on a pooled client, so
 // the pg leg cancels through a side channel: pg_cancel_backend(pid) executed
-// on a SECOND pooled connection (the backend pid is read from the connection
+// on an independent cancellation connection (the backend pid is read from the connection
 // running the query). postgres.js exposes native Query.cancel() (a dedicated
 // cancel connection managed by the driver) — used directly. In both cases
 // the canceled statement fails with SQLSTATE 57014 and the connection
@@ -38,6 +38,7 @@ import {
   isModuleNotFoundError,
 } from "./errors.js";
 import {
+  renderBeginSql,
   runTransaction,
   type PinnedExecutor,
   type QueryExecutionOptions,
@@ -225,6 +226,10 @@ export interface WrapAdapterOptions {
    *  never closes it. "owned" transfers disposal to the wrapper (terminate
    *  closes it; the injector must not). */
   ownership?: AdapterOwnership;
+  /** Independent pg pool used only to send cancellation. Must differ from
+   * the wrapped pool. Required for deadlines/signals on injected pg pools;
+   * owned wrappers close both pools, borrowed wrappers close neither. */
+  cancellationPool?: PgPoolLike;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,14 +359,12 @@ async function execPostgresJs(
   }
   let cancelReason: "deadline" | "signal" | undefined;
   let dispatched = false;
+  let cancelPending: Promise<void> | undefined;
   const query = owner.unsafe(sqlText, (params ?? []) as unknown[]);
   const disarm = armCancellation(options, (reason) => {
     cancelReason = reason;
     dispatched = true;
-    query.cancel()?.catch(() => {
-      // cancel dispatch failure: the query itself will settle with its own
-      // error (or complete normally) — nothing further to do
-    });
+    cancelPending = Promise.resolve().then(() => query.cancel()).then(() => {}, () => {});
   });
   try {
     const res = await query;
@@ -370,6 +373,7 @@ async function execPostgresJs(
     throw wrapIfCanceled(classifyDriverError(err, driverKind), dispatched, cancelReason, driverKind);
   } finally {
     disarm();
+    await cancelPending;
   }
 }
 
@@ -410,8 +414,8 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
     },
   });
 
-  const postgresJsPin = async (): Promise<PinnedExecutor> => {
-    const reserved = await client.reserve();
+  const postgresJsPin = async (execOptions?: QueryExecutionOptions): Promise<PinnedExecutor> => {
+    const reserved = await acquirePoolResource(() => client.reserve(), value => value.release(), execOptions, 'postgres');
     // postgres.js 3.4.8 bug dodge: reserved.release() unconditionally calls
     // onopen(c), which moves a connection back into the open pool — if the
     // socket died while reserved, that reopens a DEAD connection and the
@@ -450,19 +454,28 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
 
   const driver: Driver = {
     async query<T>(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<T[]> {
-      return execPostgresJs(client, "postgres", "query", sqlText, params, execOptions) as Promise<T[]>;
+      if (execOptions === undefined) return execPostgresJs(client, "postgres", "query", sqlText, params, execOptions) as Promise<T[]>;
+      // The native pool releases a completed query before cancel transport
+      // completion; reserve explicitly until both have settled.
+      const pin = await postgresJsPin(execOptions);
+      try { return await pin.query<T>(sqlText, params, execOptions); }
+      finally { pin.release(); }
     },
     async execute(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<number> {
-      return (await execPostgresJs(client, "postgres", "execute", sqlText, params, execOptions)) as number;
+      if (execOptions === undefined) return (await execPostgresJs(client, "postgres", "execute", sqlText, params, execOptions)) as number;
+      const pin = await postgresJsPin(execOptions);
+      try { return await pin.execute(sqlText, params, execOptions); }
+      finally { pin.release(); }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
+      renderBeginSql(modes); // invalid modes must refuse before a connection is pinned
       const pin = await postgresJsPin();
       return runTransaction(pin, (scope: TransactionScope) => fn(scope), modes);
     },
     close: () => driver.lifecycle.terminate(),
     lifecycle,
     prepare: (sqlText: string): PreparedStatement => postgresJsPrepared(client, sqlText),
-    pin: postgresJsPin,
+    pin: () => postgresJsPin(),
   };
   return driver;
 }
@@ -524,7 +537,13 @@ async function loadNodePostgres(url: string, options: LoadDriverOptions): Promis
   } catch (err) {
     throw connectionConstructionError("pg", err);
   }
-  return wrapPgPool(pool, { ownership: "owned" });
+  const cancellationPool = new mod.Pool({
+    connectionString: url,
+    max: options.max ?? 10,
+    idleTimeoutMillis: (options.idleTimeout ?? 20) * 1000,
+    connectionTimeoutMillis: (options.connectTimeout ?? 10) * 1000,
+  });
+  return wrapPgPool(pool, { ownership: "owned", cancellationPool });
 }
 
 // pg named prepared statements are SESSION-scoped. Sending every execution
@@ -557,10 +576,53 @@ const pgPrepared = (
   };
 };
 
+/** Cancel a queued checkout without ever submitting a statement. pg-pool
+ * cannot remove its queued waiter, so a late checkout is immediately returned
+ * and its rejection stays observed. */
+async function acquirePoolResource<T>(acquire: () => Promise<T>, recycle: (value: T) => void, options: QueryExecutionOptions | undefined, kind: string): Promise<T> {
+  const preReason = preCancelCheck(options);
+  if (preReason) throw new QueryCanceledError(`${kind}: canceled before pool checkout`, { reason: preReason, dispatched: false });
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let disarm = (): void => {};
+    disarm = armCancellation(options, reason => {
+      settled = true;
+      disarm();
+      reject(new QueryCanceledError(`${kind}: canceled while waiting for pool checkout`, { reason, dispatched: false }));
+    });
+    // An injected pool can throw synchronously as well as reject.
+    Promise.resolve().then(() => acquire()).then(client => {
+      disarm();
+      if (settled) { recycle(client); return; }
+      settled = true;
+      resolve(client);
+    }, (error: unknown) => {
+      disarm();
+      if (settled) return;
+      settled = true;
+      reject(classifyDriverError(error, kind));
+    }).catch((error: unknown) => {
+      // A third-party recycle hook can throw after cancellation. Observe the
+      // cleanup chain even when the caller's promise has already settled.
+      disarm();
+      if (!settled) { settled = true; reject(classifyDriverError(error, kind)); }
+    });
+    if (options?.signal?.aborted && !settled) {
+      settled = true;
+      disarm();
+      reject(new QueryCanceledError(`${kind}: canceled while waiting for pool checkout`, { reason: 'signal', dispatched: false }));
+    }
+  });
+}
+
+async function acquirePgClient(pool: PgPoolLike, options?: QueryExecutionOptions): Promise<PgPoolClientLike> {
+  return acquirePoolResource(() => pool.connect(), client => client.release(), options, 'pg');
+}
+
 /** Execute one statement on a checked-out pg client with server-side
- *  cancellation armed (pg_cancel_backend on a second pooled connection). */
+ *  cancellation armed (pg_cancel_backend on an independent connection). */
 async function execPg(
-  pool: PgPoolLike,
+  cancellationPool: PgPoolLike | undefined,
   client: PgPoolClientLike,
   backendPid: () => Promise<number>,
   kind: "query" | "execute",
@@ -572,31 +634,47 @@ async function execPg(
   if (preReason !== undefined) {
     throw new QueryCanceledError(`pg: query canceled (${preReason}) before submission — no server round trip was made`, { reason: preReason, dispatched: false });
   }
-  if (options !== undefined) {
-    // Eagerly read the backend pid BEFORE submitting the statement: the
-    // cancel side channel needs it while this client is busy running the
-    // query (a lazy read would queue behind the very statement we want to
-    // cancel). One extra round trip, only on cancellation-armed queries.
-    await backendPid();
+  const armed = options?.deadlineMs !== undefined || options?.signal !== undefined;
+  let cancelClient: PgPoolClientLike | undefined;
+  let pid: number | undefined;
+  let cancelFailed: unknown;
+  const onCancelError = (error: Error): void => { cancelFailed = error; };
+  if (armed) {
+    if (!cancellationPool) throw new NeutronSqlError('pg: deadlines/signals require an independent cancellationPool when wrapping a pool');
+    // Reserve the independent transport before submitting the main query.
+    // A saturated application pool (including max:1) cannot queue a cancel
+    // until after its target connection has been returned to another caller.
+    cancelClient = await acquirePgClient(cancellationPool, options);
+    cancelClient.once?.("error", onCancelError);
+    if (preCancelCheck(options) !== undefined) {
+      cancelClient.removeListener?.("error", onCancelError);
+      cancelClient.release();
+      throw new QueryCanceledError('pg: query canceled (signal) before submission', { reason: 'signal', dispatched: false });
+    }
+  }
+  if (armed) {
+    try { pid = await backendPid(); }
+    catch (error) {
+      cancelClient!.removeListener?.("error", onCancelError);
+      cancelClient!.release(cancelFailed);
+      throw error;
+    }
+    if (options?.signal?.aborted) {
+      cancelClient!.removeListener?.("error", onCancelError);
+      cancelClient!.release(cancelFailed);
+      throw new QueryCanceledError('pg: query canceled (signal) before submission', { reason: 'signal', dispatched: false });
+    }
   }
   let cancelReason: "deadline" | "signal" | undefined;
   let dispatched = false;
+  let cancelPending: Promise<void> | undefined;
   const disarm = armCancellation(options, (reason) => {
     cancelReason = reason;
     dispatched = true;
-    void (async () => {
-      try {
-        const pid = await backendPid();
-        // Side channel: a SECOND pooled connection asks the server to cancel
-        // the backend running our query. Requires spare pool capacity (a
-        // max:1 pool cannot service the side channel while our client is
-        // checked out — the query then simply runs to completion).
-        await pool.query("select pg_cancel_backend($1) as canceled", [pid]);
-      } catch {
-        // side-channel failure: the query settles with its own error (or
-        // completes normally if the connection is fine)
-      }
-    })();
+    cancelPending = Promise.resolve().then(() => cancelClient!.query('select pg_cancel_backend($1) as canceled', [pid])).then(
+      () => {},
+      (error: unknown) => { cancelFailed = error; },
+    );
   });
   try {
     const res = await client.query(params !== undefined && params.length > 0 ? { text: sqlText, values: params } : { text: sqlText });
@@ -605,6 +683,11 @@ async function execPg(
     throw wrapIfCanceled(classifyDriverError(err, "pg"), dispatched, cancelReason, "pg");
   } finally {
     disarm();
+    // The target connection remains checked out until every cancel request
+    // has settled, so no late cancel can hit the next statement or borrower.
+    await cancelPending;
+    cancelClient?.removeListener?.("error", onCancelError);
+    cancelClient?.release(cancelFailed);
   }
 }
 
@@ -612,10 +695,10 @@ async function execPg(
  *  cancellation-armed single query). Attaches an error listener for the
  *  pin lifetime: pg-pool detaches its own while the client is checked out,
  *  and a dying socket otherwise surfaces as an unhandled 'error' event. */
-async function pgPin(pool: PgPoolLike): Promise<PinnedExecutor> {
+async function pgPin(pool: PgPoolLike, cancellationPool?: PgPoolLike, options?: QueryExecutionOptions): Promise<PinnedExecutor> {
   let client: PgPoolClientLike;
   try {
-    client = await pool.connect();
+    client = await acquirePgClient(pool, options);
   } catch (err) {
     throw classifyDriverError(err, "pg");
   }
@@ -643,7 +726,7 @@ async function pgPin(pool: PgPoolLike): Promise<PinnedExecutor> {
   };
   const run = async (kind: "query" | "execute", sqlText: string, params?: unknown[], execOptions?: QueryExecutionOptions): Promise<unknown> => {
     try {
-      return await execPg(pool, client, backendPid, kind, sqlText, params, execOptions);
+      return await execPg(cancellationPool, client, backendPid, kind, sqlText, params, execOptions);
     } catch (err) {
       // a fatal connection loss (transport failure or FATAL 57P0x) means
       // this connection must never return to the idle set; SQL errors —
@@ -677,9 +760,12 @@ async function pgPin(pool: PgPoolLike): Promise<PinnedExecutor> {
  *  not end the pool you still own. */
 export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): Driver {
   const ownership = options.ownership ?? "borrowed";
+  const cancellationPool = options.cancellationPool;
+  if (cancellationPool === pool) throw new NeutronSqlError('pg: cancellationPool must be independent of the application pool');
   const lifecycle = makeLifecycle(ownership, async () => {
     try {
-      await pool.end();
+      const results = await Promise.allSettled([pool.end(), ...(cancellationPool ? [cancellationPool.end()] : [])]);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
     } catch (err) {
       throw classifyDriverError(err, "pg");
     }
@@ -695,7 +781,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
           throw classifyDriverError(err, "pg");
         }
       }
-      const pin = await pgPin(pool);
+      const pin = await pgPin(pool, cancellationPool, execOptions);
       try {
         return await pin.query<T>(sqlText, params, execOptions);
       } finally {
@@ -711,7 +797,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
           throw classifyDriverError(err, "pg");
         }
       }
-      const pin = await pgPin(pool);
+      const pin = await pgPin(pool, cancellationPool, execOptions);
       try {
         return await pin.execute(sqlText, params, execOptions);
       } finally {
@@ -719,13 +805,14 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
       }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
-      const pin = await pgPin(pool);
+      renderBeginSql(modes); // invalid modes must refuse before a connection is pinned
+      const pin = await pgPin(pool, cancellationPool);
       return runTransaction(pin, (scope: TransactionScope) => fn(scope), modes);
     },
     close: () => driver.lifecycle.terminate(),
     lifecycle,
     prepare: (sqlText: string): PreparedStatement => pgPrepared(pool, sqlText),
-    pin: () => pgPin(pool),
+    pin: () => pgPin(pool, cancellationPool),
   };
   return driver;
 }

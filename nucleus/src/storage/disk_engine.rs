@@ -2735,18 +2735,7 @@ impl StorageEngine for DiskEngine {
         // first: `parking_lot`'s RwLock is not reentrant and read-then-write on
         // one thread deadlocks.
         drop(tables_guard);
-        let page_id = self.alloc_data_page(table)?;
-        let slot_idx = {
-            let mut pg = self
-                .pool
-                .write_guard(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let slot = page::insert_tuple(&mut pg, &data)
-                .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
-            pg.set_dirty();
-            slot
-        };
-        self.record_dirty_page(page_id);
+        let (page_id, slot_idx) = self.place_in_new_page(table, &data)?;
         // `alloc_data_page` already published `last_page = page_id` in the same
         // `tables` write section that linked the page into the chain. Setting
         // it again here was a lost update: two sessions that both found the old
@@ -4153,20 +4142,30 @@ impl DiskEngine {
             return Ok((page_id, slot_idx));
         }
 
-        // Allocate new page
-        let page_id = self.alloc_data_page(table)?;
-        let slot_idx = {
+        self.place_in_new_page(table, data)
+    }
+
+    /// Allocate a page for `table` and place `data` in it. `alloc_data_page`
+    /// publishes the page as the table's last page before this thread takes its
+    /// write latch, so a concurrent insert can fill it first; that is retried
+    /// with another page. A tuple that does not fit an empty page is an error.
+    fn place_in_new_page(&self, table: &str, data: &[u8]) -> Result<(u32, u16), StorageError> {
+        loop {
+            let page_id = self.alloc_data_page(table)?;
             let mut pg = self
                 .pool
                 .write_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let slot = page::insert_tuple(&mut pg, data)
-                .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
-            pg.set_dirty();
-            slot
-        };
-        self.record_dirty_page(page_id);
-        Ok((page_id, slot_idx))
+            if let Some(slot) = page::insert_tuple(&mut pg, data) {
+                pg.set_dirty();
+                drop(pg);
+                self.record_dirty_page(page_id);
+                return Ok((page_id, slot));
+            }
+            if page::slot_count(&pg) == 0 {
+                return Err(StorageError::Io("failed to insert into fresh page".into()));
+            }
+        }
     }
 }
 
@@ -4335,6 +4334,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -4345,6 +4345,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -5019,6 +5020,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -5029,6 +5031,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -5039,6 +5042,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -5049,6 +5053,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -5681,6 +5686,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "b".into(),
@@ -5691,6 +5697,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "c".into(),
@@ -5701,6 +5708,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "d".into(),
@@ -5711,6 +5719,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "e".into(),
@@ -5721,6 +5730,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
             ],
             constraints: vec![],
@@ -8835,6 +8845,7 @@ mod tests {
             analyzer: None,
             generation: None,
             max_len: None,
+            numeric_typmod: None,
         })
         .collect();
         rt.block_on(catalog.create_table(TableDef {

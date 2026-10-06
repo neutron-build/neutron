@@ -243,3 +243,36 @@ describe('CommitBar — engine limits wording (X06)', () => {
     expect(screen.getByTitle(/limits are not loaded/)).toBeTruthy()
   })
 })
+
+
+describe('CommitBar shortcut ownership boundaries', () => {
+  it('cannot commit or discard hidden staged operations from dialog controls', async () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'pending workspace edit' })
+    commitOperations.mockResolvedValueOnce(okResponse)
+    render(<><CommitBar /><div role="dialog" aria-label="Import or command dialog"><input aria-label="Dialog input" /></div><button>Workspace action</button></>)
+    const input = screen.getByRole('textbox', { name: 'Dialog input' })
+    for (const modifier of [{ ctrlKey: true }, { metaKey: true }]) {
+      fireEvent.keyDown(input, { key: 's', ...modifier })
+      fireEvent.keyDown(input, { key: 'z', ...modifier })
+    }
+    expect(commitOperations).not.toHaveBeenCalled()
+    expect(stagedEdits.value).toHaveLength(1)
+    expect(commitPhase.value).toBe('idle')
+    // The same intentional save shortcut still works in the workspace.
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Workspace action' }), { key: 's', ctrlKey: true })
+    await waitFor(() => expect(commitOperations).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(stagedEdits.value).toHaveLength(0))
+  })
+
+  it('preserves native text undo while retaining workspace staged undo', () => {
+    stageEdit({ connectionId: 'c1', operation: updateOp, label: 'pending workspace edit' })
+    render(<><CommitBar /><textarea aria-label="SQL text" /><button>Workspace action</button></>)
+    const input = screen.getByRole('textbox', { name: 'SQL text' })
+    const nativeUndo = new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true, cancelable: true })
+    input.dispatchEvent(nativeUndo)
+    expect(nativeUndo.defaultPrevented).toBe(false)
+    expect(stagedEdits.value).toHaveLength(1)
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Workspace action' }), { key: 'z', ctrlKey: true })
+    expect(stagedEdits.value).toHaveLength(0)
+  })
+})

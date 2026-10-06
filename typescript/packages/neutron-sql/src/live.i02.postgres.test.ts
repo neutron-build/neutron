@@ -12,7 +12,10 @@ import {
   eq,
   getSqlState,
   integer,
+  loadDriver,
   pgTable,
+  trustSql,
+  TRUSTED_SQL_ACK,
   serial,
   sql,
   text,
@@ -22,6 +25,7 @@ import {
   type PgPoolLike,
   type SqlEvent,
 } from "./index.js";
+import { runTransaction, type TransactionScope } from "./transactions.js";
 import { TEST_URL, ensureLive, uniqueDbName } from "./live-harness.js";
 
 // I02 live battery (V14 subset owned by this card): server-reaching
@@ -79,10 +83,12 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<I02Ctx> {
   // Borrowed wraps over a real driver resource we own, so tests can read
   // pool metrics (pg) and control teardown precisely.
   let raw: unknown;
+  let cancellationPool: pg.Pool | undefined;
   let driver: Driver;
   if (driverKind === "pg") {
     raw = new pg.Pool({ connectionString: url.toString(), max: 6 });
-    driver = wrapPgPool(raw as unknown as PgPoolLike);
+    cancellationPool = new pg.Pool({ connectionString: url.toString(), max: 6 });
+    driver = wrapPgPool(raw as unknown as PgPoolLike, { cancellationPool: cancellationPool as unknown as PgPoolLike });
   } else {
     const postgres = (await import("postgres")) as unknown as { default: (u: string, o?: object) => import("./index.js").PostgresJsClient };
     raw = postgres.default(url.toString(), { max: 6 });
@@ -103,6 +109,7 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<I02Ctx> {
     admin,
     async close(): Promise<void> {
       await db.close();
+      await cancellationPool?.end();
       if (driverKind === "pg") await (raw as pg.Pool).end();
       else await (raw as { end(o?: { timeout?: number }): Promise<void> }).end({ timeout: 5 });
       await admin.query(`drop database if exists "${DB_NAME}"`);
@@ -392,12 +399,10 @@ for (const driverKind of ["postgres", "pg"] as const) {
       // after sp_a survives, and sp_b itself stays usable. sp_c was nested
       // inside the rolled-back region, so PG discarded it.
       await spB.rollbackTo();
-      // Releasing the discarded savepoint fails — and the failure ABORTS
-      // the transaction (subsequent commands are ignored). ROLLBACK TO
-      // SAVEPOINT is exactly the recovery move: it works while aborted.
+      // The discarded handle now refuses locally without aborting the transaction.
       await spC.release().then(
         () => assert.fail("released a savepoint nested inside a rolled-back region"),
-        (e: unknown) => assert.match(String((e as Error).message), /does not exist|invalid savepoint|current transaction is aborted/i),
+        (e: unknown) => assert.match(String((e as Error).message), /already released/i),
       );
       await spB.rollbackTo();
       await tx.insert(notes).values({ body: "after-b3" });
@@ -620,6 +625,14 @@ for (const driverKind of ["postgres", "pg"] as const) {
       db = await createDatabase({ driver, tables: { i02_notes: notes }, logger: true });
       await db.insert(notes).values({ body: canaryValue });
       await db.select().from(notes).where(eq(notes.body, canaryValue));
+      await db.select({ literal: sql`${trustSql(`'${canaryValue}'`, TRUSTED_SQL_ACK)}` }).from(notes).limit(1);
+      await assert.rejects(async () => db!.select({ invalid: sql`${canaryValue}::integer` }).from(notes), (err: unknown) => getSqlState(err) === "22P02");
+      const observerDb = await createDatabase({ driver, tables: { i02_notes: notes }, logger: () => { throw new Error(canaryValue); } });
+      const committedBody = `${canaryValue}_committed`;
+      await observerDb.transaction(async tx => { await tx.insert(notes).values({ body: committedBody }); });
+      const observed = await ctx.driver.query<{ n: string }>('select count(*)::text as n from i02_notes where body=$1', [committedBody]);
+      assert.equal(observed[0].n, "1", "observer failure must retain acknowledged native commit");
+      await observerDb.close();
     } finally {
       console.log = originalLog;
       await db?.close();
@@ -641,7 +654,7 @@ for (const driverKind of ["postgres", "pg"] as const) {
     // Statement identity is still observable: statement ids and kinds.
     const parsed = lines.map((l) => JSON.parse(l.slice("[neutron-sql] ".length))) as Array<Record<string, unknown>>;
     assert.ok(parsed.every((e) => typeof e.statementId === "string" && e.statementId.length === 16));
-    assert.ok(parsed.some((e) => e.kind === "query-begin" && typeof e.sql === "string"));
+    assert.ok(parsed.some((e) => e.kind === "query-begin" && typeof e.statementId === "string" && /^[0-9a-f]{16}$/.test(e.statementId) && e.sql === undefined));
     assert.ok(parsed.some((e) => e.kind === "query-end" && typeof e.durationMs === "number"));
 
     // Opt-in: NEUTRON_SQL_LOG_PARAMS=1 is the ONLY way parameters appear
@@ -820,4 +833,70 @@ test("live i02 (pg): pool fully quiescent after the battery (no stuck checkouts)
   const pool = ctx.raw as PgPoolMetrics;
   assert.ok(pool.totalCount >= 1);
   assert.equal(pool.totalCount, pool.idleCount);
+});
+
+for (const driverKind of ["postgres", "pg"] as const) {
+  test(`live i02 (${driverKind}): escaped scope and prepared handles cannot mutate after pin release`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+    let escaped!: Driver;
+    let prepared!: import("./drivers.js").PreparedStatement;
+    await ctx.driver.begin(async tx => {
+      escaped = tx;
+      prepared = tx.prepare!("insert into i02_notes(body) values ($1)");
+      await tx.execute("insert into i02_notes(body) values ($1)", ["terminal-owner-" + driverKind]);
+    });
+    await assert.rejects(escaped.execute("insert into i02_notes(body) values ($1)", ["terminal-forbidden-" + driverKind]), /scope is settled/);
+    await assert.rejects(escaped.query("select pg_backend_pid()"), /scope is settled/);
+    await assert.rejects(prepared.execute(["terminal-prepared-forbidden-" + driverKind]), /scope is settled/);
+    const native = new pg.Pool({ connectionString: ctx.dbUrl });
+    try {
+      const result = await native.query("select body from i02_notes where body like 'terminal-%' order by body");
+      assert.deepEqual(result.rows.map(row => row.body), ["terminal-owner-" + driverKind]);
+    } finally { await native.end(); }
+    await functionalPoolCheck(ctx);
+  });
+}
+
+for (const driverKind of ['postgres', 'pg'] as const) {
+  test(`live i02 (${driverKind}): escaped child scopes refuse SQL while the parent remains usable`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+    let escaped!: TransactionScope;
+    await runTransaction(await ctx.driver.pin!(), async tx => {
+      await tx.transaction(async child => { escaped = child; await child.execute('select 1'); });
+      await assert.rejects(escaped.execute("insert into i02_notes(body) values ('escaped-child')"), /settled/);
+      await tx.execute("insert into i02_notes(body) values ('valid-parent')");
+    });
+    const result = await ctx.driver.query<{body: string}>(`select body from i02_notes where body in ('escaped-child','valid-parent')`);
+    assert.deepEqual(result.map(row => row.body), ['valid-parent']);
+  });
+
+  test(`live i02 (${driverKind}): unfinished callback SQL drains then rolls back before connection reuse`, async () => {
+    const ctx = await ctxFor(driverKind);
+    if (!ctx) return;
+    let outstanding!: Promise<unknown>;
+    await assert.rejects(runTransaction(await ctx.driver.pin!(), async tx => {
+      await tx.execute("insert into i02_notes(body) values ('unfinished-root')");
+      outstanding = tx.execute('select pg_sleep(0.03)');
+    }), /pending operations/);
+    await outstanding;
+    const result = await ctx.driver.query<{n: string}>(`select count(*)::text as n from i02_notes where body = 'unfinished-root'`);
+    assert.equal(result[0]!.n, '0');
+    await runTransaction(await ctx.driver.pin!(), async tx => { await tx.execute('select 1'); });
+  });
+}
+
+
+for (const kind of ['pg', 'postgres'] as const) test(`live i02 (${kind}): owned max-one pool cancels without targeting its next borrower`, async () => {
+  if (!(await ensureLive(`live i02 (${kind}) max-one cancellation`))) return;
+  const driver = await loadDriver(TEST_URL, { driver: kind, max: 1 });
+  try {
+    for (let i = 0; i < 3; i++) {
+      const before = await driver.query<{ pid: number }>("select pg_backend_pid() as pid");
+      await assert.rejects(driver.query("select pg_sleep(2)", [], { deadlineMs: 60 }), QueryCanceledError);
+      const after = await driver.query<{ pid: number }>("select pg_backend_pid() as pid from pg_sleep(0.1)");
+      assert.equal(after[0]!.pid, before[0]!.pid, "same pooled backend is reusable after cancellation settles");
+    }
+  } finally { await driver.close(); }
 });

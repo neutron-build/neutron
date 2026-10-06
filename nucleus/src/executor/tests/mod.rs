@@ -50,12 +50,14 @@ mod test_ast_route_plan_key; // the pre-parsed route must not inherit a plan-cac
 mod test_audit_events; // N18: durable security audit events
 mod test_cache_coherence; // M2: cache + specialty-index invalidation oracle
 mod test_call_pipeline; // EXE-1/5 + PRC-1/3/4/5/7: the CALL pipeline end-to-end
+mod test_cast_null;
 mod test_cluster_routing; // A14/A15: both execution entries route + fail closed
 mod test_collections;
 mod test_column_writes; // X10: generated/identity columns, deferrable FKs, DEFAULT VALUES, varchar(n)
 mod test_copy; // COPY FROM STDIN payload reconstruction
 mod test_cross_model;
 mod test_cross_model_atomicity; // S63 slice 1: SQL+streams discard-on-no-commit-record
+mod test_cursors; // DECLARE/FETCH/CLOSE: budgets, transaction lifetime, FETCH position semantics
 mod test_ddl;
 mod test_dml;
 mod test_doc_collections; // GO-055: `collection` must isolate, not decorate
@@ -81,6 +83,8 @@ mod test_module_wiring;
 mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
 mod test_mvcc_gc_compaction; // NU-01 tail compaction: reclaim dead tails, ids never reused (WAL v2 subset)
+mod test_numeric_exact; // NP03: NUMERIC text, arithmetic and aggregates are exact-or-refused with PostgreSQL SQLSTATEs
+mod test_numeric_typmod; // NUMERIC(p,s) typmod: rounding, 22003 overflow, exact decimal literals, persistence
 mod test_observability; // M11: observability ledger surfaces (CHECKPOINT, WAL/txn state, health)
 mod test_password_lifecycle; // N16: password creation, rotation, expiry
 mod test_pk_write_cost;
@@ -118,6 +122,7 @@ mod test_temporal_range_cost; // S66: TIMESTAMP/DATE range predicates must prune
 mod test_triggers; // EXE-2: row-binding tables must never touch user tables named _new/_old
 mod test_txn;
 mod test_txn_lazy_snapshot;
+mod test_udf_coercion;
 mod test_upstream_teploy_2026_09_18; // rename-in-txn visibility + replacing upsert loss (2026-09-18 upstream reports) // R8: BEGIN/SAVEPOINT do not clone the whole database // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
 
 mod test_x09_array_semantics;

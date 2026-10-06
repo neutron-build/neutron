@@ -289,3 +289,26 @@ func TestDecodeStrictJSONBody(t *testing.T) {
 		t.Errorf("trailing whitespace must be accepted: %v", err)
 	}
 }
+
+func TestExactJSONDocumentMutationCompatibility(t *testing.T) {
+	text := `{"number":9007199254740993,"t":"int8","v":"not-a-cell"}`
+	column := tableColumnMeta{TypeOID: oidJSONB, TypeName: "jsonb"}
+	for _, input := range []any{text, map[string]any{"t": "jsonb", "v": text}} {
+		value, err := decodeColumnValue(column, input)
+		if err != nil || value != text {
+			t.Fatal("exact text/tagged JSON mutation changed")
+		}
+	}
+	if _, err := decodeColumnValue(column, map[string]any{"t": "json", "v": text}); err == nil {
+		t.Fatal("foreign JSON tag admitted")
+	}
+	if _, err := decodeColumnValue(column, map[string]any{"t": "jsonb", "v": "{bad"}); err == nil {
+		t.Fatal("invalid JSON admitted")
+	}
+	if value, err := decodeColumnValue(column, nil); err != nil || value != nil {
+		t.Fatal("SQL NULL changed")
+	}
+	if value, err := decodeColumnValue(column, map[string]any{"t": "jsonb", "v": "null"}); err != nil || value != "null" {
+		t.Fatal("JSON null collapsed")
+	}
+}

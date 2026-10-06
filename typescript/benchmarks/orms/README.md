@@ -1,5 +1,7 @@
 # Neutron ORM Benchmark Suite
 
+> Historical harness: the Neutron client here is mocked or raw SQLite, so these results do not measure the current `@neutron-build/sql` PostgreSQL ORM. See [the real PostgreSQL fixture](../orm-project/README.md) for a correctness-first public-package comparison. Existing numbers retain historical provenance and are not a current performance claim.
+
 Comprehensive benchmarks comparing Neutron ORM against Drizzle and Prisma on various query patterns and operations.
 
 ## Quick Start

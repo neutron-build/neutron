@@ -18,6 +18,7 @@ import {
   forceUnlockMigrations,
   migrationLockInfo,
   migrationChecksum,
+  migrationStatus,
   legacyGoSdkChecksum,
 } from "./migrate.js";
 import type { Transport } from "./types.js";
@@ -163,7 +164,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
       const tx = await begin(...args);
       const execute = tx.execute.bind(tx);
       tx.execute = async (sql, params, opts) => {
-        if (sql.startsWith('UPDATE _neutron_migrations') && ++updates === 2) {
+        if ((/^UPDATE (?:"(?:[^"]|"")+"\.)?"?_neutron_migrations"?\b/.test(sql)) && ++updates === 2) {
           throw new Error('injected adoption update failure');
         }
         return execute(sql, params, opts);
@@ -202,7 +203,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     const queued = new Promise<void>(resolve => { entered = resolve; });
     t.execute = async (sql, params, opts) => {
       const count = await execute(sql, params, opts);
-      if (sql.startsWith('INSERT INTO _neutron_migration_lock') && count === 0) entered();
+      if ((/^INSERT INTO (?:"(?:[^"]|"")+"\.)?"?_neutron_migration_lock"?(?: |$)/.test(sql)) && count === 0) entered();
       return count;
     };
     const controller = new AbortController();
@@ -262,7 +263,7 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     const execute = t.execute.bind(t);
     let creates = 0;
     t.execute = async (sql, params, opts) => {
-      if (/^\s*CREATE TABLE IF NOT EXISTS _neutron_migration_lock\b/.test(sql) && ++creates === 1) {
+      if (/^\s*CREATE TABLE IF NOT EXISTS (?:"(?:[^"]|"")+"\.)?"?_neutron_migration_lock"?(?:\s|$)/.test(sql) && ++creates === 1) {
         throw Object.assign(new Error('relation _neutron_migration_lock already exists'), { code: '42P07' });
       }
       return execute(sql, params, opts);
@@ -342,4 +343,44 @@ describe("Integration: migration protocol v2 (live engine)", { skip: !live() && 
     );
     await assert.rejects(() => t.query("SELECT 1 FROM ts_a"), () => true);
   });
+});
+
+
+describe("Integration: history admission", { skip: !live() }, () => {
+  let t: Transport;
+  before(() => { t = new PgTransport(url); });
+  after(async () => { await t.close(); });
+  for (const shape of ["legacy-columns", "null-format", "unknown-format"]) {
+    for (const api of ["up", "down", "status"]) {
+      it(`refuses all applied rows absent from plan: ${shape}/${api}`, async () => {
+        await reset(t);
+        const metadata = shape === "legacy-columns" ? "" : ", checksum TEXT, owner TEXT, format TEXT";
+        await t.execute(`CREATE TABLE _neutron_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ DEFAULT NOW()${metadata})`);
+        await t.execute("INSERT INTO _neutron_migrations(version,name) VALUES(1,'outside-plan')");
+        if (shape === "unknown-format") await t.execute("UPDATE _neutron_migrations SET format='v999'");
+        const plan = [{ version: 2, name: "pending", up: "CREATE TABLE ts_b(id INT)", down: "DROP TABLE ts_b" }];
+        await assert.rejects(() => api === "up" ? migrate(t, plan) : api === "down" ? migrateDown(t, plan) : migrationStatus(t), /adopt/);
+        assert.equal((await t.query<{ exists: boolean }>("SELECT to_regclass('ts_b') IS NOT NULL AS exists")).rows[0].exists, false);
+        if (shape === "legacy-columns") {
+          const columns = await t.query("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='_neutron_migrations' AND column_name IN ('checksum','owner','format')");
+          assert.deepEqual(columns.rows, []);
+        }
+      });
+    }
+  }
+  it("uses current schema and permits v2 NULL checksum without fabricating trust", async () => {
+    await reset(t);
+    await t.execute("CREATE SCHEMA admission_decoy");
+    try {
+      await t.execute("CREATE TABLE admission_decoy._neutron_migrations(version TEXT PRIMARY KEY)");
+      await t.execute("CREATE TABLE _neutron_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TIMESTAMPTZ DEFAULT NOW(),checksum TEXT,owner TEXT,format TEXT)");
+      await t.execute("INSERT INTO _neutron_migrations(version,name,format) VALUES(1,'unverified','v2')");
+      const plan = [{version:2,name:"pending",up:"CREATE TABLE ts_b(id INT)",down:"DROP TABLE ts_b"}];
+      assert.deepEqual(await migrate(t,plan),["pending"]);
+      assert.equal((await t.query<{checksum:string|null}>("SELECT checksum FROM _neutron_migrations WHERE version=1")).rows[0].checksum,null);
+      assert.equal((await migrationStatus(t)).length,2);
+      assert.deepEqual(await migrateDown(t,plan),["pending"]);
+    } finally { await t.execute("DROP SCHEMA admission_decoy CASCADE"); }
+  });
+
 });

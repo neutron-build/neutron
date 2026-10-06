@@ -96,7 +96,7 @@ export function ModelLimits({ model, compact }: Props) {
         <div key={w} class={s.warning}>{w}</div>
       ))}
       {!compact && (
-        <div class={s.notes}>
+        <div class={s.notes} hidden={!open.value && report?.engine.product === 'postgres' && chips.every(([, tone]) => tone === 'ok')}>
           <span class={s.note}>{l.transactionNote}</span>
           <span class={s.note}>{l.durabilityNote}</span>
           {l.availability !== 'supported' && <span class={s.note}>{l.availabilityReason}</span>}

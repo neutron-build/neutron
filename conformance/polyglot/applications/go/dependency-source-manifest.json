@@ -1,0 +1,313 @@
+{
+  "core_module": "github.com/go-admin-team/go-admin-core/v2",
+  "core_version": "v2.11.0",
+  "core_commit": "004376f3b940c291c67cc666e527c83f435ac787",
+  "status": "frozen-source-only; dependency graph execution pending",
+  "files": [
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_dept.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_dept.go",
+      "sha256": "e665ed13fd504b9125b5348d05dcb65d82aba1a07ea43d5ab943193919d34411",
+      "bytes": 1135
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_role.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_role.go",
+      "sha256": "d99687a7599a3c8f80f2de0a849a89bbe2efd6504aedfc91612196fbd354c2f5",
+      "bytes": 1451
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_menu.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_menu.go",
+      "sha256": "1f35fc07b6c8d635f669899f252d4f49bd8f83c32407f603da31e2da7f70ead0",
+      "bytes": 3919
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "app/admin/models/sys_api.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_api.go",
+      "sha256": "eccb4262acd07ded2c871211c69bf3d2f942e042c540be6c00681b59105cc9e8",
+      "bytes": 3028
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "cmd/migrate/migration/models/role_dept.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/cmd/migrate/migration/models/role_dept.go",
+      "sha256": "dbda249035ef00b712f99d09f940169b7a6bdbd2ecf249d7a295885cb22b669d",
+      "bytes": 191
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/models/by.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/models/by.go",
+      "sha256": "baebb6424df696f9bf97165ddba4456e8026eae75246eb00c56f10bb73fb5654",
+      "bytes": 474
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/models/type.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/models/type.go",
+      "sha256": "892b207b0309dad852bc7395e681a2e4cfd8eafb64941490624c45e09569bfab",
+      "bytes": 625
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/dto/pagination.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/dto/pagination.go",
+      "sha256": "c562ce2deb4c94386f9bbbf13cd3fb840201c898ff197c7de3bc1590a1911d14",
+      "bytes": 221
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/dto/search.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/dto/search.go",
+      "sha256": "e7bbde57707edd50d12f019f5d2a0f2fd95b0a48e8dd5d8d64f16378c9c080f0",
+      "bytes": 1184
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/dto/type.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/dto/type.go",
+      "sha256": "c5982b80f599e56df0904f1436c4677c41b2811ff28e0ad2022135aa1572fbec",
+      "bytes": 257
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/dto/generate.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/dto/generate.go",
+      "sha256": "ae115b7cc6fc88141bda1573f3d28b5ea75eefc8ac7e840a41c320f2667b5338",
+      "bytes": 357
+    },
+    {
+      "repo": "go-admin",
+      "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+      "path": "common/dto/order.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/dto/order.go",
+      "sha256": "852d0d749602613ab4b502834a2d7b8e4cb828a8b2683bed6d764cd505844349",
+      "bytes": 439
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "bytes": 11357
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "go.mod",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/go.mod",
+      "sha256": "d4a49b8601e32bcdc28792002a43893063db04ecb0039154a365bfa0633fb9f0",
+      "bytes": 5042
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "go.sum",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/go.sum",
+      "sha256": "6976537cf36d0dfc547b74fb5ddbd778d7fe01a081d488ee36625e047687d771",
+      "bytes": 42733
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/actions/permission.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/actions/permission.go",
+      "sha256": "f2818d2de1989f3972cdc71c36ddd70bcea23e15525b1dd57b866982eaf8bf1d",
+      "bytes": 9571
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/actions/permission_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/actions/permission_test.go",
+      "sha256": "f498631c1a4bd00501d381e4722034e361533441bc7620e40980382f33d1c68f",
+      "bytes": 7446
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/auto_form.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/auto_form.go",
+      "sha256": "b89e5df8b89b9251930f630c392f397fa44aee618d83c24f2a6000a774761dd6",
+      "bytes": 3079
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/generate.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/generate.go",
+      "sha256": "cc1354e9fb8eaaedd1b90d7be4dcafb5350d6aa43c53c841dd2f75f611b03c20",
+      "bytes": 2771
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/generate_bind_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/generate_bind_test.go",
+      "sha256": "14b72f67e615cdf8251a78566ee3e487ce2325de201219e4233cd4d1e861122e",
+      "bytes": 2841
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/generate_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/generate_test.go",
+      "sha256": "473a38f65e48c4040d8e139fd3b6948aa328179f535bd37021a69fa32e2fa9b3",
+      "bytes": 753
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/order.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/order.go",
+      "sha256": "4e8171da16db3fb584c7d0c353efaa7232d77f6be129327d27d5765b609b5be7",
+      "bytes": 375
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/order_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/order_test.go",
+      "sha256": "8e52dbe5782a52a1a1e5bc3d8c80c0b47bc4ba5c49e480e2058c454ce21ec7da",
+      "bytes": 886
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/pagination.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/pagination.go",
+      "sha256": "ce077017f2a044d769675038cf2cf8186c55d5757b60f7e65a9eb49063474f5d",
+      "bytes": 540
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/pagination_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/pagination_test.go",
+      "sha256": "581bd21d3b11a4995de88d875ad90603a286d64e1df490eaf7e47428b8d6c10f",
+      "bytes": 532
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/search.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/search.go",
+      "sha256": "2f51fafb044920e3cbd4a8fa46a0ab20938cbb0685d48a685df3bf4f5ee83be2",
+      "bytes": 3268
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/search_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/search_test.go",
+      "sha256": "89b8d3c69ed209cb0e403dd403d277a0c81b882ca14bfd029cdea0abf0c52873",
+      "bytes": 4803
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/type.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/type.go",
+      "sha256": "4b7df69a3c803f0e5888f79e69961e616877c27501e94e4d20b663d152ab8807",
+      "bytes": 686
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/dto/type_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/dto/type_test.go",
+      "sha256": "3e098fcfe258cf2e7985111112fceb2c0e0dc415d1d8c9130fac6d72a0efc4b0",
+      "bytes": 766
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/by.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/by.go",
+      "sha256": "cf7efc4e8f6eb9615bcf788c92adce459f226e6dae15d624378adc3a2bd23000",
+      "bytes": 1778
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/menu.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/menu.go",
+      "sha256": "13a77371a3f0259e5a272ff05464a9f96735cc33d20805906e87a574ffb708fc",
+      "bytes": 298
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/migrate.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/migrate.go",
+      "sha256": "92180a610480e1da6de8d36d08b64a70c7e472f392edb69b01779973bf1e8977",
+      "bytes": 1309
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/models_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/models_test.go",
+      "sha256": "281107aa8b3865e9e03c70c2c82783602326cce26deb800e669a3c76df9f6585",
+      "bytes": 1702
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/response.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/response.go",
+      "sha256": "c2411f70b7bd0ad5a529b1c86abafe68fb79ab0e158ec783edf49725345799cb",
+      "bytes": 864
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/schema_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/schema_test.go",
+      "sha256": "2d6c52134f5508fd0d7765b445224320e6c59debceb0f092577f0de26485b0fa",
+      "bytes": 4090
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/type.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/type.go",
+      "sha256": "c7d53981942266a16a73ed4bdc1d85c5e3d59a4d2045fe61779145acaa4d744e",
+      "bytes": 594
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/user.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/user.go",
+      "sha256": "4b45b065b2c817dfaaeafc2477f1386abce9cef4988160d7624e31c9838b40a1",
+      "bytes": 1817
+    },
+    {
+      "repo": "go-admin-core",
+      "commit": "004376f3b940c291c67cc666e527c83f435ac787",
+      "path": "sdk/contract/models/user_verify_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin-core/004376f3b940c291c67cc666e527c83f435ac787/sdk/contract/models/user_verify_test.go",
+      "sha256": "cdb4a36cb2104eafdf445ac4281949961bc38306391cc1896542812eb4e77491",
+      "bytes": 1808
+    }
+  ],
+  "core_license": "Apache-2.0"
+}

@@ -41,7 +41,7 @@ cargo run --release --features "server rusqlite" --bin fuzz -- --iterations 800 
 cargo run --release --features server --bin probe_engines
 cargo run --release --features server --bin probe_index_coherence
 cargo run --release --features server --bin probe_streams_oracle -- --iterations 120
-cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30 --skip-section catalog
+cargo run --release --features "server rusqlite" --bin probe_recover_engines -- --iterations 40 --ops 30
 cargo run --release --features "server rusqlite" --bin probe_io_faults
 cargo run --release --features "server rusqlite" --bin probe_blob
 cargo run --release --features server --bin probe_sessions
@@ -54,22 +54,21 @@ change to `storage/tuple.rs` — including one that looks like a pure
 refactor. `probe_ddl_recreate` opens all five engines, so run it after any
 change to DDL registration or to a `StorageEngine` implementation.
 
-**`probe_recover_engines`'s `catalog` section does not currently pass, and
-that is not your change.** It reports divergences for one live finding S35
-uncovered - the embedded builder never loading `meta.json` - described under
-"What the S35 probes found immediately" below; each divergence line names its
-own mechanism. The `datalog` and `vector` sections ARE clean and must stay
-clean (the vector section's two original findings - unserialized HNSW
-tombstones, unpersisted PK registry - were fixed in F1a/F1b, and its
-holdout was removed 2026-08-22).
-
-The gate line above therefore holds the `catalog` section out with
-`--skip-section`, and so does `scripts/probe.sh` (which CI runs). That is a
-deliberate, expiring holdout, not a mute: the probe prints a SKIPPED line for
-each held-out section on every run and reports it as `SKIPPED` rather than
-`0 divergence(s)` in the summary, so a green run can never be mistaken for
-full coverage. **Remove the flag when F2 is fixed** — `probe.sh` carries a
-hard expiry of 2026-09-30.
+**The `catalog` holdout was removed 2026-10-03 after an exact-binary gate.** The
+historical embedded metadata write-back defect has a source fix:
+`DatabaseBuilder::build` now calls `load_meta_sync` and refuses failed loading.
+The recovery probe formerly counted correct early startup refusal as a
+finding, and its catalog negative control could pass with a dirty baseline.
+The repaired model accepts early refusal or a poisoned authority surface only
+with unchanged corrupt bytes, requires a clean negative-control baseline, and
+adds a healthy roles/grants/RLS/views/sequences reopen control followed by DDL.
+Evidence: unskipped 40 iterations x 30 ops on buffered-disk and on
+durable-mvcc, zero divergences in every section, and the catalog negative
+control adding 6 divergences to a clean baseline of 0 on both engines. The
+probe refuses non-durable engines (`--engine mvcc` has no WAL, so a recovery
+round-trip against it is a harness error, not a finding). `--skip-section`
+still exists and still announces itself as `SKIPPED` in the summary, but no
+gate uses it.
 
 To see the findings, just drop the flags:
 
@@ -265,18 +264,14 @@ read at source level:
 The section now runs clean in the gate (its holdout was removed), and its
 negative control still discriminates.
 
-**2. The embedded `Database` builder never loads `meta.json`.** Only
-`main.rs:1191` calls `load_meta_checked`; `DatabaseBuilder::build`
-(`embedded.rs`) loads catalog.json and sequences.json but no executor
-metadata. Through `Database::durable_mvcc`, roles, RLS policies, views,
-triggers, sequences *definitions* and masking silently vanish on reopen — and
-because DDL still calls `persist_catalog`, the first post-reopen DDL writes
-the emptied state back over `meta.json`, destroying the file it never read.
-That is precisely the NU-163 write-back, closed for the server path, still
-live through the shipped embedded API. The `catalog` section of
-`probe_recover_engines` demonstrates it end to end (meta arm, embedded); its
-server-shaped arm confirms the server path refuses and leaves the corrupt
-file untouched.
+**2. Historical embedded metadata loss; qualification pending.** The original
+builder loaded catalog and sequence state without executor metadata, so later
+DDL could erase roles, RLS policies, views, triggers and sequence definitions.
+The builder now loads executor metadata synchronously and fails closed on
+corruption. The repaired `catalog` probe checks both corrupt-byte preservation
+and healthy authority retention across reopen and later DDL. The existing
+2026-09-30 holdout expiry was resolved 2026-10-03 by the unskipped native
+campaign and negative controls described above, not by a source-only change.
 
 ### The S35 class map
 

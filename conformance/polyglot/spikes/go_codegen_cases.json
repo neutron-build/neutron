@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": "prototype_requires_execution_and_independent_review",
+  "scope": "Standalone Go typed column/projection/write metadata experiment; no database support claim",
+  "module": "spikes/go_codegen",
+  "command": "python3 verify.py",
+  "cases": [
+    {"id":"GO-TYPED-COLUMN","oracle":"ID predicate accepts int64; string predicate consumer fails compilation"},
+    {"id":"GO-TYPED-PROJECTION","oracle":"Name projection has []string type; assigning to []int fails compilation"},
+    {"id":"GO-WRITE-TYPE","oracle":"Optional[string] cannot populate a bool write field"},
+    {"id":"GO-WRITE-NULL","oracle":"Nullable note binds explicit nil; nonnullable name rejects nullable pointer consumer"},
+    {"id":"GO-WRITE-ZEROS","oracle":"Omitted write produces zero bindings; false/0/empty string produce three explicit scalar bindings"},
+    {"id":"GO-TAG-DUPLICATE","oracle":"Generator and runtime reflection reject duplicate db tags"},
+    {"id":"GO-METADATA-VALIDATION","oracle":"Tampered generated metadata is rejected; fresh metadata remains valid"},
+    {"id":"GO-GENERATOR-DETERMINISM","oracle":"Two generations from identical source have identical SHA256"},
+    {"id":"GO-MODEL-REFUSAL","oracle":"Unknown tags, unexported/grouped/unsupported fields and nullable mismatch fail explicitly"}
+  ],
+  "limits": ["No SQL executor", "No generated/default column ownership", "No ORM relationships/hooks/session lifecycle", "No PostgreSQL or Nucleus certification", "Only standard scalar types and nullable pointers in prototype"]
+}

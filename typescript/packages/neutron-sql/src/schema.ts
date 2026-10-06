@@ -5,6 +5,7 @@
 import type { BigintMode, BigintOptions, TemporalMode, TemporalOptions, NumericOptions } from "./codecs.js";
 import type { SchemaExpression } from "./ddl-text.js";
 import type { OrderSpec } from "./ast.js";
+import type { PgArray } from "./pg-array-value.js";
 
 export type ColumnDataType =
   | "serial"
@@ -142,12 +143,18 @@ export class ColumnBuilder<
   canonicalText = false;
   varcharLength?: number;
   vectorDimensions?: number;
+  /** Declared NUMERIC(p,s) typmod on a numeric column (both set together;
+   *  precision-only normalizes to scale 0). Unset = unconstrained numeric. */
+  numericPrecision?: number;
+  numericScale?: number;
   nowDefault = false;
   foreignKey?: ForeignKeyRef;
   ownerTable?: AnyPgTable;
   /** Q07: set to 1 by `.array()` — a one-dimensional array whose elements
    *  have type `dataType`. */
   arrayDimensions?: 1;
+  /** Opt-in flat values retaining native dimensions and lower bounds. */
+  arrayValueMode?: "dimensions";
   /** Q07: enum type of an enum column (dataType "enum"). */
   enumDef?: PgEnumDefinition;
   /** Q07c: identity kind of an identity column. */
@@ -230,6 +237,13 @@ export class ColumnBuilder<
     }
     this.arrayDimensions = 1;
     return this as unknown as ColumnBuilder<D, NN, HD, Array<RT | null>, Array<WT | null>>;
+  }
+
+  /** Same accepted element families as array(), with explicit native shape. */
+  nativeArray(): ColumnBuilder<D, NN, HD, PgArray<RT>, PgArray<WT>> {
+    this.array();
+    this.arrayValueMode = "dimensions";
+    return this as unknown as ColumnBuilder<D, NN, HD, PgArray<RT>, PgArray<WT>>;
   }
 
   /** GENERATED ALWAYS AS IDENTITY (Q07c): the database generates values;
@@ -402,7 +416,7 @@ export interface TableMetadata<
    *  search path, exported as public). Declared through pgSchema(); the
    *  query layer (CRUD + alias joins) renders qualified references and
    *  schema export v2 exports the table under its schema (Q07), while the
-   *  legacy TS DDL emitter and relational reads reject schema-declared
+   *  legacy TS DDL emitter rejects schema-declared
    *  tables. */
   readonly schema?: string;
   readonly columns: Cols;
@@ -445,6 +459,16 @@ export function getTableName(table: AnyPgTable): string {
 /** Authoritative SQL schema name, or undefined for the default search path. */
 export function getTableSchema(table: AnyPgTable): string | undefined {
   return tableMetaOf(table, "getTableSchema").schema;
+}
+
+/** Internal relational identity. Keep legacy bare keys for unqualified tables;
+ *  PostgreSQL forbids NUL in identifiers, so qualified keys cannot collide
+ *  with any legal unqualified table name (including names containing dots). */
+export function getTableRelationKey(table: AnyPgTable): string {
+  const name = getTableName(table);
+  const schema = getTableSchema(table);
+  if (name.includes("\0") || schema?.includes("\0")) throw new Error("table identifiers cannot contain NUL");
+  return schema === undefined ? name : `${schema}\0${name}`;
 }
 
 /** Reference parts for a table: `[name]` or `[schema, name]`. Every query
@@ -802,17 +826,20 @@ function makeTable<Cols extends Record<string, AnyColumnBuilder>, N extends stri
  *  `alt.users`; `.enum(...)` declares `alt.<enum>`. The query layer (CRUD
  *  select/insert/update/delete and alias joins) renders qualified
  *  references and schema export v2 (Q07) exports these objects under their
- *  schema. The legacy TS DDL emitter (schemaToDDL) and relational reads
- *  (db.query) reject schema-declared tables. */
-export interface PgSchemaBuilder {
-  readonly schemaName: string;
+ *  schema. The legacy TS DDL emitter (schemaToDDL)
+ *  rejects schema-declared tables; relational reads/writes retain qualification. */
+export type SchemaTable<Cols extends Record<string, AnyColumnBuilder>, N extends string, S extends string> =
+  PgTable<Cols, N> & { readonly [TABLE_SYMBOL]: TableMetadata<Cols, N> & { readonly schema: S } };
+
+export interface PgSchemaBuilder<S extends string = string> {
+  readonly schemaName: S;
   table<Cols extends Record<string, AnyColumnBuilder>, N extends string = string>(
     name: N,
     columns: Cols,
     extras?: (t: PgTable<Cols, N>) => TableExtra[],
-  ): PgTable<Cols, N>;
+  ): SchemaTable<Cols, N, S>;
   enum<const V extends readonly [string, ...string[]]>(name: string, values: V): PgEnum<V>;
-  view<Cols extends Record<string, AnyColumnBuilder>>(name: string, columns: Cols, opts: ViewOptions): PgTable<Cols>;
+  view<Cols extends Record<string, AnyColumnBuilder>, N extends string = string>(name: N, columns: Cols, opts: ViewOptions): SchemaTable<Cols, N, S>;
 }
 
 function checkSchemaObjectName(value: unknown, who: string): string {
@@ -824,15 +851,15 @@ function checkSchemaObjectName(value: unknown, who: string): string {
   return value;
 }
 
-export function pgSchema(schema: string): PgSchemaBuilder {
+export function pgSchema<const S extends string>(schema: S): PgSchemaBuilder<S> {
   if (typeof schema !== "string" || schema.length === 0) throw new Error("pgSchema: schema must be a non-empty string");
   if (schema.includes("\0")) throw new Error("pgSchema: schema must not contain NUL bytes");
   checkSchemaObjectName(schema, "pgSchema: schema");
   return {
     schemaName: schema,
-    table: (name, columns, extras) => makeTable(name, columns, extras, schema),
+    table: (name, columns, extras) => makeTable(name, columns, extras, schema) as SchemaTable<typeof columns, typeof name, S>,
     enum: (name, values) => makeEnum(name, values, schema),
-    view: (name, columns, opts) => makeView(name, columns, opts, schema) as PgTable<never>,
+    view: (name, columns, opts) => makeView(name, columns, opts, schema) as SchemaTable<typeof columns, typeof name, S>,
   };
 }
 
@@ -917,7 +944,10 @@ function cloneColumnForView(column: AnyColumnBuilder, view: AnyPgTable): AnyColu
   c.valueDecoder = column.valueDecoder;
   c.varcharLength = column.varcharLength;
   c.vectorDimensions = column.vectorDimensions;
+  c.numericPrecision = column.numericPrecision;
+  c.numericScale = column.numericScale;
   c.arrayDimensions = column.arrayDimensions;
+  c.arrayValueMode = column.arrayValueMode;
   c.enumDef = column.enumDef;
   c.identityKind = column.identityKind;
   c.generatedExpr = column.generatedExpr;
@@ -1242,6 +1272,16 @@ export function isTableRelations(value: unknown): value is TableRelations {
   );
 }
 
+/** Resolve target metadata before compiling SQL. Derived/CTE identities remain
+ *  unsupported as relation targets; qualified base tables retain their schema. */
+export function validateRelationTargets(set: TableRelations, who: string): void {
+  for (const [key, rel] of Object.entries(set.entries)) {
+    rejectDerivedTable(rel.targetTable, `${who}.${key}`);
+    rejectAliasHandle(rel.targetTable, `${who}.${key}`);
+    getTableRelationKey(rel.targetTable);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Column helpers
 // ---------------------------------------------------------------------------
@@ -1286,20 +1326,66 @@ export function double(name: string): ColumnBuilder<"double", false, false> {
 export function real(name: string): ColumnBuilder<"real", false, false> {
   return new ColumnBuilder(name, "real");
 }
+/** Options for the numeric() column factory: an optional declared typmod
+ *  (precision/scale — the emitted SQL type is NUMERIC(p,s)) alongside the
+ *  optional user decoder over the exact decimal string. Value semantics are
+ *  unchanged by the typmod: reads stay exact strings (or the decoder's
+ *  return value), and PostgreSQL coerces/rounds stored values to the
+ *  declared scale. */
+export interface NumericColumnOptions<D extends (raw: string) => unknown = (raw: string) => unknown> extends NumericOptions<D> {
+  /** Total digit count of NUMERIC(p,s): integer 1..1000. Precision-only
+   *  normalizes to scale 0. */
+  precision?: number;
+  /** Fractional digit count: integer 0..precision; requires precision. */
+  scale?: number;
+}
+
+/** Validate and apply the shared-contract numeric typmod: precision integer
+ *  1..1000, scale integer 0..precision, scale requires precision (the exact
+ *  subset the Go schema-v2 contract admits — PostgreSQL's wider domain,
+ *  negative scale and scale > precision, is deliberately excluded). Invalid
+ *  values are rejected here, before any SQL is produced: no clamping, no
+ *  silent coercion. */
+function applyNumericTypmod(
+  c: ColumnBuilder<"numeric", boolean, boolean, unknown>,
+  name: string,
+  precision: number | undefined,
+  scale: number | undefined,
+): void {
+  const who = `numeric("${name}")`;
+  if (precision === undefined && scale === undefined) return;
+  if (precision === undefined) {
+    throw new Error(`${who}: scale requires precision — declare { precision } (scale 0) or { precision, scale }; scale without precision has no SQL spelling`);
+  }
+  if (!Number.isInteger(precision) || precision < 1 || precision > 1000) {
+    throw new Error(`${who}: precision must be an integer within 1..1000, got ${String(precision)}`);
+  }
+  const effectiveScale = scale ?? 0;
+  if (!Number.isInteger(effectiveScale) || effectiveScale < 0 || effectiveScale > precision) {
+    throw new Error(`${who}: scale must be an integer within 0..precision (${precision}), got ${String(scale)}`);
+  }
+  c.numericPrecision = precision;
+  c.numericScale = effectiveScale;
+}
+
 /** Exact decimal column: reads as the exact decimal string (scale and
- *  trailing zeros preserved). An optional user decoder converts the exact
- *  string and owns any precision narrowing. */
-export function numeric(name: string, opts?: { decoder?: undefined }): ColumnBuilder<"numeric", false, false>;
+ *  trailing zeros preserved — with a declared typmod, the exact DATABASE
+ *  value after PostgreSQL coercion, not the input digits). An optional user
+ *  decoder converts the exact string and owns any precision narrowing. An
+ *  optional { precision, scale } declares the NUMERIC(p,s) typmod in DDL
+ *  and schema export v2. */
+export function numeric(name: string, opts?: { decoder?: undefined; precision?: number; scale?: number }): ColumnBuilder<"numeric", false, false>;
 export function numeric<D extends (raw: string) => unknown>(
   name: string,
-  opts: { decoder: D },
+  opts: { decoder: D; precision?: number; scale?: number },
 ): ColumnBuilder<"numeric", false, false, ReturnType<D>>;
-export function numeric(name: string, opts: NumericOptions = {}): ColumnBuilder<"numeric", false, false, unknown> {
+export function numeric(name: string, opts: NumericColumnOptions = {}): ColumnBuilder<"numeric", false, false, unknown> {
   const c = new ColumnBuilder<"numeric", false, false, string>(name, "numeric");
   if (opts.decoder !== undefined) {
     if (typeof opts.decoder !== "function") throw new Error(`numeric("${name}"): decoder must be a function`);
     c.valueDecoder = opts.decoder;
   }
+  applyNumericTypmod(c, name, opts.precision, opts.scale);
   return c as unknown as ColumnBuilder<"numeric", false, false, unknown>;
 }
 export function text(name: string): ColumnBuilder<"text", false, false> {

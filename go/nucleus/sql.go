@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/neutron-build/neutron/go/neutron"
 )
 
@@ -158,6 +159,10 @@ func scanRow(rows pgx.Rows, dest any) error {
 		return err
 	}
 
+	types := pgtype.NewMap()
+	if conn := rows.Conn(); conn != nil {
+		types = conn.TypeMap()
+	}
 	for i, col := range colNames {
 		fieldIdx, ok := tagMap[col]
 		if !ok {
@@ -165,60 +170,15 @@ func scanRow(rows pgx.Rows, dest any) error {
 		}
 		field := rv.Field(fieldIdx)
 
-		// NULL → zero value
+		if !field.CanSet() {
+			return fmt.Errorf("column %q: field %s is not exported", col, rt.Field(fieldIdx).Name)
+		}
 		if rawPtrs[i] == nil {
+			field.SetZero()
 			continue
 		}
-		raw := *rawPtrs[i]
-
-		// Handle time.Time before the Kind switch — it's a struct, not a
-		// primitive, so Kind() returns reflect.Struct.
-		if field.Type() == timeType {
-			t, err := parseTimeValue(raw)
-			if err != nil {
-				return fmt.Errorf("column %q: parse time %q: %w", col, raw, err)
-			}
-			field.Set(reflect.ValueOf(t))
-			continue
-		}
-
-		switch field.Kind() {
-		case reflect.String:
-			field.SetString(raw)
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			if raw == "" {
-				field.SetInt(0)
-			} else {
-				n, err := strconv.ParseInt(raw, 10, 64)
-				if err != nil {
-					return fmt.Errorf("column %q: parse int %q: %w", col, raw, err)
-				}
-				field.SetInt(n)
-			}
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			if raw == "" {
-				field.SetUint(0)
-			} else {
-				n, err := strconv.ParseUint(raw, 10, 64)
-				if err != nil {
-					return fmt.Errorf("column %q: parse uint %q: %w", col, raw, err)
-				}
-				field.SetUint(n)
-			}
-		case reflect.Float32, reflect.Float64:
-			if raw == "" {
-				field.SetFloat(0)
-			} else {
-				f, err := strconv.ParseFloat(raw, 64)
-				if err != nil {
-					return fmt.Errorf("column %q: parse float %q: %w", col, raw, err)
-				}
-				field.SetFloat(f)
-			}
-		case reflect.Bool:
-			field.SetBool(raw == "true" || raw == "t" || raw == "1" || raw == "TRUE")
-		default:
-			field.SetString(raw)
+		if err := scanTextField(types, fieldDescs[i].DataTypeOID, *rawPtrs[i], field); err != nil {
+			return fmt.Errorf("column %q: %w", col, err)
 		}
 	}
 
@@ -247,4 +207,82 @@ func parseTimeValue(s string) (time.Time, error) {
 		return t.UTC(), nil
 	}
 	return time.Time{}, fmt.Errorf("unrecognized time format: %s", s)
+}
+
+// scanTextField preserves Nucleus scalar text conventions and delegates
+// structured PostgreSQL values to actual OID codecs.
+func scanTextField(types *pgtype.Map, oid uint32, raw string, field reflect.Value) error {
+	if field.Kind() == reflect.Ptr {
+		value := reflect.New(field.Type().Elem())
+		if err := scanTextField(types, oid, raw, value.Elem()); err != nil {
+			return err
+		}
+		field.Set(value)
+		return nil
+	}
+	if field.Type() == timeType {
+		if oid == pgtype.TimestampOID || oid == pgtype.TimestamptzOID || oid == pgtype.DateOID {
+			var value time.Time
+			if err := types.Scan(oid, pgtype.TextFormatCode, []byte(raw), &value); err == nil {
+				field.Set(reflect.ValueOf(value))
+				return nil
+			}
+		}
+		value, err := parseTimeValue(raw)
+		if err != nil {
+			return err
+		}
+		field.Set(reflect.ValueOf(value))
+		return nil
+	}
+	switch field.Kind() {
+	case reflect.String:
+		field.SetString(raw)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if raw == "" {
+			field.SetInt(0)
+			return nil
+		}
+		value, err := strconv.ParseInt(raw, 10, field.Type().Bits())
+		if err != nil {
+			return err
+		}
+		field.SetInt(value)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if raw == "" {
+			field.SetUint(0)
+			return nil
+		}
+		value, err := strconv.ParseUint(raw, 10, field.Type().Bits())
+		if err != nil {
+			return err
+		}
+		field.SetUint(value)
+	case reflect.Float32, reflect.Float64:
+		if raw == "" {
+			field.SetFloat(0)
+			return nil
+		}
+		value, err := strconv.ParseFloat(raw, field.Type().Bits())
+		if err != nil {
+			return err
+		}
+		field.SetFloat(value)
+	case reflect.Bool:
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			return err
+		}
+		field.SetBool(value)
+	case reflect.Slice, reflect.Array:
+		if _, ok := types.TypeForOID(oid); !ok {
+			return fmt.Errorf("unsupported OID %d for %s", oid, field.Type())
+		}
+		if err := types.Scan(oid, pgtype.TextFormatCode, []byte(raw), field.Addr().Interface()); err != nil {
+			return fmt.Errorf("decode OID %d into %s: %w", oid, field.Type(), err)
+		}
+	default:
+		return fmt.Errorf("unsupported target type %s", field.Type())
+	}
+	return nil
 }

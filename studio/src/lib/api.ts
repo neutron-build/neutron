@@ -1,6 +1,6 @@
 import type {
   Connection, ConnectionInput, TestResult,
-  Schema, NucleusFeatures, QueryResult,
+  Schema, NucleusFeatures, QueryResult, TablePageResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
   TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
   CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
@@ -165,6 +165,40 @@ async function requestQueryResult(method: string, path: string, body?: unknown):
   return result
 }
 
+/** Validate this narrow page protocol before decoding any tagged cells. */
+function decodeTablePage(raw: TablePageResult, limit: number): TablePageResult {
+  const tags = new Set(['int8', 'numeric', 'bytea', 'date', 'timestamp', 'timestamptz'])
+  const cellValid = (cell: unknown) => cell === null || typeof cell === 'string' || typeof cell === 'boolean'
+    || (typeof cell === 'number' && Number.isSafeInteger(cell))
+    || (typeof cell === 'object' && cell !== null && !Array.isArray(cell)
+      && Object.keys(cell).length === 2 && tags.has((cell as { t: string }).t)
+      && typeof (cell as { v: unknown }).v === 'string')
+  if (!raw || !Array.isArray(raw.columns) || raw.columns.length < 1 || raw.columns.length > 1600
+    || raw.columns.some(c => typeof c !== 'string') || new Set(raw.columns).size !== raw.columns.length
+    || !Array.isArray(raw.rows) || raw.rows.length > limit || raw.rowCount !== raw.rows.length
+    || raw.rows.some(row => !Array.isArray(row) || row.length !== raw.columns.length || !row.every(cellValid))
+    || !Array.isArray(raw.versions) || raw.versions.length !== raw.rows.length || raw.versions.some(v => typeof v !== 'string' || !/^\d+$/.test(v))
+    || !Array.isArray(raw.keyColumns) || raw.keyColumns.length !== 1 || !raw.columns.includes(raw.keyColumns[0])
+    || typeof raw.binding !== 'string' || !raw.binding || raw.versioned !== true
+    || typeof raw.readOnly !== 'boolean' || typeof raw.hasNext !== 'boolean'
+    || typeof raw.nextCursor !== 'string' || raw.nextCursor.length > 8192
+    || (raw.hasNext ? raw.rows.length === 0 || raw.nextCursor.length === 0 : raw.nextCursor !== '')
+    || raw.consistency !== 'live-keyset/request-repeatable-read') {
+    throw new ApiError(502, 'Invalid keyset page response; refresh rows.')
+  }
+  const keyIndex = raw.columns.indexOf(raw.keyColumns![0])
+  for (const row of raw.rows) {
+    const key = row[keyIndex] as { t?: unknown; v?: unknown } | null
+    if (!key || typeof key !== 'object' || key.t !== 'int8' || typeof key.v !== 'string'
+      || key.v.length > 20 || !/^(0|-[1-9]\d*|[1-9]\d*)$/.test(key.v)
+      || BigInt(key.v) < -9223372036854775808n || BigInt(key.v) > 9223372036854775807n) {
+      throw new ApiError(502, 'Invalid keyset key; refresh rows.')
+    }
+  }
+  decodeRows(raw.rows)
+  return { ...raw, duration: 0 }
+}
+
 // --- Connections ---
 
 export const api = {
@@ -258,6 +292,16 @@ export const api = {
       params.set('match', JSON.stringify(match))
     }
     return requestQueryResult('GET', `/table?${params.toString()}`)
+  },
+
+  /** Authenticated read: cursor remains in a bounded JSON body, never the URL. */
+  tablePage: async (connectionId: string, schema: string, table: string, limit: number, cursor = '') => {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000 || cursor.length > 8192) {
+      throw new ApiError(400, 'Invalid keyset page request')
+    }
+    return decodeTablePage(await mutationRequest<TablePageResult>('POST', '/table/v2/page', {
+      connectionId, schema, table, profile: 'postgres-direct', limit, cursor,
+    }), limit)
   },
 
   // --- S01 typed row identities (v2 mutation protocol) ---
@@ -370,9 +414,9 @@ export const api = {
   ddl: (connectionId: string, sql: string) =>
     mutationRequest<{ ok: boolean; duration: number; error?: string }>('POST', '/ddl', { connectionId, sql }),
 
-  codegen: (connectionId: string, schema: string, table: string, lang: string) =>
+  codegen: (connectionId: string, schema: string, table: string, lang: string, profile: 'legacy' | 'lossless-read-v1' = 'legacy') =>
     request<{ code: string }>('GET',
-      `/codegen?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&lang=${lang}`
+      `/codegen?connectionId=${connectionId}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}&lang=${encodeURIComponent(lang)}&profile=${encodeURIComponent(profile)}`
     ),
 
   // --- S05: schema navigation and planning ---

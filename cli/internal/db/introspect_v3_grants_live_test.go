@@ -1,0 +1,237 @@
+package db
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"testing"
+)
+
+func TestV3NativeExplicitDefaultAndColumnACLs(t *testing.T) {
+	h := newQ07Harness(t, "v3acl")
+	role := h.dbName + "_reader"
+	h.exec(fmt.Sprintf(`CREATE ROLE %q`, role))
+	parent := role + "_parent"
+	t.Cleanup(func() {
+		// Registered after harness cleanup: remove owned-database dependencies
+		// before removing this globally scoped, uniquely named role.
+		ctx := context.Background()
+		if err := h.client.Exec(ctx, fmt.Sprintf(`DROP OWNED BY %q`, role)); err != nil {
+			t.Errorf("ACL fixture dependency cleanup: %v", err)
+		}
+		if err := h.client.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %q`, parent)); err != nil {
+			t.Errorf("ACL fixture parent cleanup: %v", err)
+		}
+		if err := h.client.Exec(ctx, fmt.Sprintf(`DROP ROLE %q`, role)); err != nil {
+			t.Errorf("ACL fixture role cleanup: %v", err)
+		}
+	})
+	h.exec(fmt.Sprintf(`CREATE ROLE %q NOINHERIT BYPASSRLS`, parent))
+	major, err := h.client.ServerMajorVersion(context.Background())
+	if err != nil {
+		t.Fatalf("server version: %v", err)
+	}
+	// INHERIT and SET membership options exist from PostgreSQL 16. Older servers
+	// record ADMIN only, and the inventory must say so instead of guessing.
+	wantInherit, wantSet := "false", "true"
+	if major >= 16 {
+		h.exec(fmt.Sprintf(`GRANT %q TO %q WITH ADMIN TRUE, INHERIT FALSE, SET TRUE`, parent, role))
+	} else {
+		h.exec(fmt.Sprintf(`GRANT %q TO %q WITH ADMIN OPTION`, parent, role))
+		wantInherit, wantSet = "unavailable-before-pg16", "unavailable-before-pg16"
+	}
+	for _, sql := range []string{
+		`CREATE SCHEMA authority`,
+		`CREATE TABLE authority.docs (id int, "Case Column" text)`,
+		`CREATE SEQUENCE authority.seq`,
+		`CREATE DOMAIN authority.amount AS int`,
+		`CREATE FUNCTION authority.same(int) RETURNS int LANGUAGE SQL AS 'SELECT $1'`,
+		`CREATE FUNCTION authority.same(text) RETURNS text LANGUAGE SQL AS 'SELECT $1'`,
+		`REVOKE ALL ON FUNCTION authority.same(int) FROM PUBLIC`,
+		`GRANT EXECUTE ON FUNCTION authority.same(text) TO PUBLIC`,
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA authority TO %q`, role),
+		fmt.Sprintf(`GRANT SELECT ON authority.docs TO %q WITH GRANT OPTION`, role),
+		fmt.Sprintf(`GRANT UPDATE ("Case Column") ON authority.docs TO %q`, role),
+		fmt.Sprintf(`GRANT USAGE ON SEQUENCE authority.seq TO %q`, role),
+		`REVOKE ALL ON TYPE authority.amount FROM PUBLIC`,
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA authority GRANT SELECT ON TABLES TO %q`, role),
+		fmt.Sprintf(`ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO %q`, role),
+		fmt.Sprintf(`GRANT CONNECT ON DATABASE %q TO %q WITH GRANT OPTION`, h.dbName, role),
+	} {
+		h.exec(sql)
+	}
+	doc, err := h.client.IntrospectV3(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableGrant, columnGrant, schemaGrant, sequenceGrant := false, false, false, false
+	routineIntPublic, routineTextPublic := false, false
+	defaultGlobal, defaultSchema, databaseGrant := false, false, false
+	membership := false
+	for _, e := range doc.Model.Inventory {
+		if e.Identity.Catalog == "pg_roles" && e.Identity.Name == parent {
+			if e.Attributes["inherit"] != "false" || e.Attributes["bypassRLS"] != "true" {
+				t.Fatal("role authority flags disappeared")
+			}
+			for _, part := range v3PartsOfKind(e.Parts, "role-membership") {
+				a := part.Attributes
+				membership = membership || (a["member"] == role && a["admin"] == "true" && a["inherit"] == wantInherit && a["set"] == wantSet && a["grantor"] != "")
+			}
+		}
+		if e.Identity.Catalog == "pg_default_acl" || e.Identity.Catalog == "pg_database" {
+			for _, p := range v3PartsOfKind(e.Parts, "privilege") {
+				if p.Attributes["grantee"] != role {
+					continue
+				}
+				if e.Identity.Catalog == "pg_default_acl" {
+					defaultGlobal = defaultGlobal || (e.Attributes["namespaceScope"] == "global" && e.Attributes["defaultObjectKind"] == "T" && p.Attributes["privilege"] == "USAGE")
+					defaultSchema = defaultSchema || (e.Attributes["namespaceScope"] == "schema" && e.Identity.Schema == "authority" && e.Attributes["defaultObjectKind"] == "r" && p.Attributes["privilege"] == "SELECT")
+				} else {
+					databaseGrant = databaseGrant || (e.Identity.Name == h.dbName && p.Attributes["privilege"] == "CONNECT" && p.Attributes["grantable"] == "true")
+				}
+			}
+		}
+		if e.Identity.Schema != "authority" {
+			continue
+		}
+		for _, p := range v3PartsOfKind(e.Parts, "privilege") {
+			a := p.Attributes
+			if e.Identity.Catalog == "pg_class" && e.Identity.Name == "docs" && a["grantee"] == role {
+				tableGrant = tableGrant || (a["scope"] == "object" && a["privilege"] == "SELECT" && a["grantable"] == "true")
+				columnGrant = columnGrant || (a["scope"] == "column" && a["column"] == "Case Column" && a["privilege"] == "UPDATE" && a["grantable"] == "false")
+			}
+			schemaGrant = schemaGrant || (e.Identity.Catalog == "pg_namespace" && a["grantee"] == role && a["privilege"] == "USAGE")
+			sequenceGrant = sequenceGrant || (e.Identity.Catalog == "pg_class" && e.Identity.Name == "seq" && a["grantee"] == role && a["privilege"] == "USAGE")
+			if e.Identity.Catalog == "pg_proc" && e.Identity.Name == "same" && a["granteeKind"] == "public" && a["privilege"] == "EXECUTE" {
+				if e.Identity.Arguments[0].Name == "int4" {
+					routineIntPublic = true
+				}
+				if e.Identity.Arguments[0].Name == "text" {
+					routineTextPublic = true
+				}
+			}
+		}
+	}
+	if !membership {
+		t.Fatal("native direct membership options disappeared")
+	}
+	if !defaultGlobal || !defaultSchema || !databaseGrant {
+		t.Fatalf("default/database ACL inventory global=%v schema=%v database=%v", defaultGlobal, defaultSchema, databaseGrant)
+	}
+	if !tableGrant || !columnGrant || !schemaGrant || !sequenceGrant || routineIntPublic || !routineTextPublic {
+		t.Fatalf("ACL inventory table=%v column=%v schema=%v sequence=%v intPublic=%v textPublic=%v", tableGrant, columnGrant, schemaGrant, sequenceGrant, routineIntPublic, routineTextPublic)
+	}
+	if h.queryOne(fmt.Sprintf(`SELECT pg_catalog.has_column_privilege('%s','authority.docs','Case Column','UPDATE')::text`, role)) != "true" {
+		t.Fatal("native column authority oracle disagrees")
+	}
+	if h.queryOne(fmt.Sprintf(`SELECT pg_catalog.has_table_privilege('%s','authority.docs','SELECT WITH GRANT OPTION')::text`, role)) != "true" {
+		t.Fatal("native grant-option oracle disagrees")
+	}
+	raw, err := json.Marshal(doc.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := ParseV3Document(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.SHA256Hex != doc.SHA256Hex {
+		t.Fatal("ACL export/import hash changed")
+	}
+	repeated, err := h.client.IntrospectV3(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.SHA256Hex != doc.SHA256Hex {
+		t.Fatal("unchanged ACL hash drift")
+	}
+}
+
+// A NULL ACL (PostgreSQL's owner/type default) and an explicit empty ACL both
+// have no stored entries but opposite meanings; the inventory must keep them
+// apart and expand only the NULL case.
+func TestV3NativeDatabaseDefaultVersusExplicitEmptyACL(t *testing.T) {
+	h := newQ07Harness(t, "v3nullacl")
+	owner := h.queryOne(`SELECT current_user::pg_catalog.text`)
+	for _, sql := range []string{
+		`CREATE SCHEMA authority`,
+		`CREATE TABLE authority.default_acl (id int)`,
+		`CREATE TABLE authority.empty_acl (id int)`,
+		`REVOKE ALL ON authority.empty_acl FROM CURRENT_USER`,
+	} {
+		h.exec(sql)
+	}
+	if h.queryOne(`SELECT (datacl IS NULL)::pg_catalog.text FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()`) != "true" {
+		t.Fatal("native oracle: a freshly created database must have a NULL ACL")
+	}
+	if h.queryOne(`SELECT relacl::pg_catalog.text FROM pg_catalog.pg_class WHERE oid = 'authority.empty_acl'::pg_catalog.regclass`) != "{}" {
+		t.Fatal("native oracle: revoking every privilege must leave an explicit empty ACL")
+	}
+	if h.queryOne(`SELECT (relacl IS NULL)::pg_catalog.text FROM pg_catalog.pg_class WHERE oid = 'authority.default_acl'::pg_catalog.regclass`) != "true" {
+		t.Fatal("native oracle: an untouched table must have a NULL ACL")
+	}
+	find := func(doc *V3Document, catalog, schema, name string) V3InventoryEntry {
+		t.Helper()
+		for _, e := range doc.Model.Inventory {
+			if e.Identity.Catalog == catalog && e.Identity.Schema == schema && e.Identity.Name == name {
+				return e
+			}
+		}
+		t.Fatalf("no %s inventory entry for %s.%s", catalog, schema, name)
+		return V3InventoryEntry{}
+	}
+	privileges := func(e V3InventoryEntry) map[string]bool {
+		set := map[string]bool{}
+		for _, p := range v3PartsOfKind(e.Parts, "privilege") {
+			a := p.Attributes
+			if a["scope"] != "object" {
+				continue
+			}
+			set[a["granteeKind"]+":"+a["grantee"]+":"+a["privilege"]+":"+a["grantor"]] = true
+		}
+		return set
+	}
+	introspect := func() *V3Document {
+		t.Helper()
+		doc, err := h.client.IntrospectV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return doc
+	}
+
+	doc := introspect()
+	database := find(doc, "pg_database", "pg_catalog", h.dbName)
+	if database.Attributes["aclStorage"] != "default" {
+		t.Fatalf("NULL database ACL stored as %q", database.Attributes["aclStorage"])
+	}
+	granted := privileges(database)
+	for _, want := range []string{
+		"role:" + owner + ":CONNECT:" + owner, "role:" + owner + ":CREATE:" + owner, "role:" + owner + ":TEMPORARY:" + owner,
+		"public::CONNECT:" + owner, "public::TEMPORARY:" + owner,
+	} {
+		if !granted[want] {
+			t.Fatalf("default database ACL is missing %q (have %v)", want, granted)
+		}
+	}
+	if granted["public::CREATE:"+owner] {
+		t.Fatal("default database ACL must not grant PUBLIC CREATE")
+	}
+	if len(privileges(find(doc, "pg_class", "authority", "default_acl"))) == 0 || find(doc, "pg_class", "authority", "default_acl").Attributes["aclStorage"] != "default" {
+		t.Fatal("NULL table ACL was not expanded to the owner default")
+	}
+	empty := find(doc, "pg_class", "authority", "empty_acl")
+	if empty.Attributes["aclStorage"] != "explicit" || len(privileges(empty)) != 0 {
+		t.Fatalf("explicit empty ACL was reported as %q with %d privileges", empty.Attributes["aclStorage"], len(privileges(empty)))
+	}
+
+	h.exec(fmt.Sprintf(`REVOKE CONNECT ON DATABASE %q FROM PUBLIC`, h.dbName))
+	if h.queryOne(`SELECT (datacl IS NULL)::pg_catalog.text FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()`) != "false" {
+		t.Fatal("native oracle: a database REVOKE must store an explicit ACL")
+	}
+	database = find(introspect(), "pg_database", "pg_catalog", h.dbName)
+	granted = privileges(database)
+	if database.Attributes["aclStorage"] != "explicit" || granted["public::CONNECT:"+owner] || !granted["public::TEMPORARY:"+owner] || !granted["role:"+owner+":CONNECT:"+owner] {
+		t.Fatalf("explicit database ACL after REVOKE CONNECT FROM PUBLIC: storage=%q privileges=%v", database.Attributes["aclStorage"], granted)
+	}
+}

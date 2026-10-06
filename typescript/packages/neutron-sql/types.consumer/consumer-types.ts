@@ -8,6 +8,7 @@
 //
 // Never executed — `pnpm test:types` only type-checks it.
 import {
+  PgArray,
   pgTable,
   pgSchema,
   alias,
@@ -402,6 +403,28 @@ async function q02Fixtures(): Promise<void> {
     Awaited<typeof s1>[number],
     { total: bigint | null; amount: string | null; mean: string | null; lo: string | null; hi: bigint | null }
   > = true;
+
+  // 1.4: a declared NUMERIC(p,s) typmod is DDL/export metadata only — value
+  // semantics are unchanged. Constrained columns keep SelectTypeOf string,
+  // precision-only normalizes to scale 0, and an explicit decoder keeps its
+  // inferred return type alongside the typmod.
+  const prices = pgTable("prices", {
+    id: serial("id").primaryKey(),
+    net: numeric("net", { precision: 10, scale: 2 }),
+    units: numeric("units", { precision: 10 }),
+    rate: numeric("rate", { precision: 8, scale: 4, decoder: (raw: string) => Number(raw) }),
+  });
+  const priced = db.select().from(prices);
+  const eqPriced: AssertEq<
+    Awaited<typeof priced>[number],
+    { id: number; net: string | null; units: string | null; rate: number | null }
+  > = true;
+  // @ts-expect-error a constrained numeric column still reads as exact string
+  const badNet: { net: number } = ({} as Awaited<typeof priced>[number]);
+  const netSum = db.select({ total: sum(prices.net) }).from(prices);
+  const eqNetSum: AssertEq<Awaited<typeof netSum>[number], { total: string | null }> = true;
+  // @ts-expect-error the decoder's return type is not silently widened
+  const badRate: { rate: string | null } = ({} as Awaited<typeof priced>[number]);
 
   // min/max over a derived/CTE timestamptz column keep the column's read
   // type through composition (the aggregate mirrors its argument column).
@@ -888,3 +911,38 @@ async function sameShapeWithDynamicName(dynamicName: string): Promise<void> {
   void eqCat;
 }
 void sameShapeWithDynamicName;
+
+// Qualified relation typing retains the literal schema, even when table names
+// and all column types match in two schemas.
+const tenantA = pgSchema("typing_a");
+const tenantB = pgSchema("typing_b");
+const aUser = tenantA.table("users", { id: integer("id").primaryKey() });
+const bUser = tenantB.table("users", { id: integer("id").primaryKey() });
+const aPost = tenantA.table("posts", { id: integer("id").primaryKey(), userId: integer("user_id") });
+const bPost = tenantB.table("posts", { id: integer("id").primaryKey(), userId: integer("user_id") });
+const aUserEdges = relations(aUser, ({ many }) => ({ posts: many(aPost) }));
+const bUserEdges = relations(bUser, ({ many }) => ({ posts: many(bPost) }));
+const aPostEdges = relations(aPost, ({ one }) => ({ author: one(aUser, { fields: [aPost.userId], references: [aUser.id] }) }));
+const bPostEdges = relations(bPost, ({ one }) => ({ reviewer: one(bUser, { fields: [bPost.userId], references: [bUser.id] }) }));
+async function qualifiedRelationTypes() {
+  const db = await createDatabase({ url: "postgres://not-executed", tables: { aUser, bUser, aPost, bPost },
+    relations: { aUser: aUserEdges, bUser: bUserEdges, aPost: aPostEdges, bPost: bPostEdges } });
+  const result = await db.query.aUser.findMany({ with: { posts: { with: { author: true } } } });
+  const id: number | undefined = result[0]?.posts[0]?.author?.id;
+  void id;
+  // @ts-expect-error A's post has author, never B's reviewer edge.
+  db.query.aUser.findMany({ with: { posts: { with: { reviewer: true } } } });
+  // @ts-expect-error B's post has reviewer, never A's author edge.
+  db.query.bUser.findMany({ with: { posts: { with: { author: true } } } });
+}
+void qualifiedRelationTypes;
+
+const dimensionedArrays = pgTable("dimensioned_arrays", { values: bigint("values").nativeArray().notNull() });
+const exactArrayRead: AssertEq<(typeof dimensionedArrays.$inferSelect)["values"], PgArray<bigint>> = true;
+void exactArrayRead;
+declare function dimensionedInsert(value: typeof dimensionedArrays.$inferInsert): void;
+dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: -1 }], [9223372036854775807n]) });
+// @ts-expect-error native arrays require explicit dimensions rather than a plain JS array
+dimensionedInsert({ values: [1n] });
+// @ts-expect-error bigint native arrays do not accept boolean elements
+dimensionedInsert({ values: new PgArray([{ length: 1, lowerBound: 1 }], [true]) });

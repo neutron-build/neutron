@@ -331,6 +331,16 @@ has it) — transactions pin their connection through it.
 shared runner on both drivers: `BEGIN` with validated modes, real savepoints
 for nesting, `COMMIT`/`ROLLBACK`, and honest failure classification.
 
+Await each operation before starting another on the same scope. A nested callback
+owns its connection until it settles; the parent is temporarily suspended, and
+escaped child scopes or prepared handles refuse use afterward. Returning with
+unfinished operations drains them before rollback and pool release. A caught
+native SQL failure still requires rollback: use a successful explicit
+`savepoint.rollbackTo()` to recover, or let the transaction roll back. Failed
+savepoint control forces the whole transaction to roll back. Raw SQL in an owned
+scope accepts one statement and refuses transaction control or persistent session
+changes; use the transaction API and `SET LOCAL` for transaction-local settings.
+
 ```ts
 await db.transaction(
   async (tx) => {
@@ -387,10 +397,19 @@ await db.query.users.findMany({ with: { posts: true } }, { deadlineMs: 250 }); /
 ```
 
 The cancel is delivered to the **server**, not just the caller's promise:
-the pg leg runs `pg_cancel_backend(pid)` on a second pooled connection (the
-backend pid is read from the connection running the query — one extra round
-trip on cancellation-armed statements; the side channel needs spare pool
-capacity, so a `max: 1` pool cannot service it); postgres.js uses its native
+the pg leg runs `pg_cancel_backend(pid)` through an independent cancellation
+pool, reserved before submission. URL-created adapters manage this pool,
+including with application pool `max: 1`. Injected pg adapters require
+`wrapPgPool(pool, { cancellationPool })` with a separate pool; borrowed
+wrappers close neither resource, owned wrappers close both. Without that
+channel, cancellation-armed statements fail before submission. The backend
+pid costs one extra round trip. Pending cancel dispatch completes before the
+target connection can be reused. A deadline bounds each pool acquisition and
+submitted execution separately; it is not a total request deadline. Backend
+PID lookup drains before submission. PostgreSQL completion can race cancellation;
+a successful server result remains successful. postgres.js cancellation-armed
+queries explicitly reserve a backend until both query and cancel dispatch
+settle. The adapter uses its native
 `Query.cancel()` (a dedicated cancel connection managed by the driver —
 installed 3.4.x has no AbortSignal support of its own). The canceled
 statement fails with `QueryCanceledError` (`reason: "deadline" | "signal"`,
@@ -414,15 +433,12 @@ connections are removed from the pool instead of returning to the idle set.
 the same `SqlEvent`. Kinds: `query-begin`, `query-end`, `query-error`,
 `tx-begin`, `tx-commit`, `tx-rollback`, `savepoint`, `cancel` — with
 durations, 16-hex statement ids (sha256 of the SQL text), transaction ids
-and savepoint names. **Parameter values never appear**: the `params` field
-exists only when the process sets `NEUTRON_SQL_LOG_PARAMS=1`, an explicit
-redaction-free mode — the emitted values are then visible in whatever sink
-receives events, so do not enable it where logs are shared. Connection
-strings and passwords are never logged (events carry no connection
-information at all). Server error messages pass through verbatim in
-`error.message` — PostgreSQL itself may echo values there (e.g. duplicate-key
-details); that is the server's wording, not this package's emission. The
-pre-I02 logger (plain SQL lines that printed parameter values) is gone;
+and savepoint names. SQL text and bound values are omitted from default and
+custom sinks. `NEUTRON_SQL_LOG_PARAMS=1` explicitly exposes both fields for
+local diagnostics; SQL literals can contain secrets too. Error events retain
+bounded classification and SQLSTATE, while native wording stays on the original
+application error and its cause. Observer exceptions are ignored so logging
+cannot change a write or transaction outcome.
 `LogEvent` remains as a deprecated alias of `SqlEvent`.
 
 ### postgres.js 3.4.8 defects worked around (documented)
@@ -626,7 +642,7 @@ await m.applyRetention("2026-09-24T12:00:00Z"); // pinned: exactly one statement
 
 - `timeBucket(col, unit, { timeZone })` builds `date_trunc(...)` as a
   structural node carrying the `ts-bucketing` capability (probe-resolved
-  with semantic controls, including the timezone argument — Nucleus 1.0.2
+  with semantic controls, including the timezone argument — the retained Nucleus recording
   resolves `unsupported` and every bucket statement fails closed before any
   SQL runs). Bucket results follow the lossless temporal wire form:
   microsecond precision survives, bucket labels are exact instants. The
@@ -1171,12 +1187,12 @@ const affected = await db.driver.prepare!("update users set seen = true where em
   pg_stat_activity). Verified on PG 17: statements survive transaction
   ROLLBACK and ABORT — the session is their only lifetime.
 - Transaction-scoped drivers (`db.transaction`) expose `prepare` pinned to
-  the transaction's connection. That pin **outlives the transaction**: on
-  `pg`, calling the scoped driver (or its prepared statements) after
-  `commit`/`rollback` still executes — on the released pooled client, which
-  the pool may hand to another caller. This is the same posture plain
-  `tx.query` already has, and it is **unsupported**: do not use a
-  transaction-scoped driver or statement after its transaction ends.
+  the transaction's connection. Queries, writes, prepared handles and savepoint
+  handles reject use after the callback settles, before COMMIT/ROLLBACK and
+  connection release. Both bundled drivers enforce this guard. Work already
+  started during the callback still requires the caller to await completion;
+  this guard does not certify unawaited-operation draining or separate nested
+  callback lifetimes.
 
 ## Advanced query controls (Q08)
 
@@ -1513,27 +1529,31 @@ drivers; nothing outside this table is claimed.
 | Runtimes | Node.js | edge and browser runtimes (no transport adapter) |
 | Engines | PostgreSQL | Nucleus and other Postgres-wire engines (below) |
 
-**Nucleus is not supported by this package.** What the ORM can rely on is
-measured, per driver, against a named build — Nucleus 1.0.2, `nucleus/` tree
-`3313729a` — in
-[`conformance/live/orm/ORM_CONFORMANCE.md`](https://github.com/neutron-build/neutron/blob/main/conformance/live/orm/ORM_CONFORMANCE.md)
-(`pg` / `postgres`: 71/70 of 140 probes supported). By area, supported
-out of probed with `pg`: engine 1/2, relational SQL 19/25, DML 9/14,
-constraints 7/9, codecs 9/19, catalog 2/14, DDL 3/11, RLS 3/9, locks 3/11,
-transactions 4/7, ORM paths 11/19. Relational `with` reads and lossless
-int8/numeric/temporal leaves fail closed there before any SQL runs, and the
-migration workflow is PostgreSQL-only. Engine defects N1–N16 in that report
-block these claims; N1 (`SET LOCAL ROLE` survives the transaction) is a
-security defect.
+**Nucleus is not supported by this package.** The retained
+[2026-09-30 ORM conformance recording](https://github.com/neutron-build/neutron/blob/main/conformance/live/orm/ORM_CONFORMANCE.md)
+and its capability JSON identify the exact binary, drivers, source commit
+`59fad7aed7889dff2d2efbb65c5aa4c6f14f8ea5` and engine tree
+`3c5c6035b5e6602cf65ba23c917fe83848888571`. That engine tree differs from the
+current documentation source; the recording is historical evidence, not a new
+execution or certification of this checkout. Consult the report for per-probe
+results instead of treating a duplicated count as a support guarantee.
+The migration workflow remains PostgreSQL-only.
 
-The optional model modules were measured on the same build and are not
-advertised for it:
+The former N1 transaction-local role/settings finding was repaired within the
+bounded X07/X08 contract recorded there. Remaining limits include unsupported
+`set_config` transaction-local semantics, catalog DDL and client SQL-plus-specialty
+atomicity/isolation. The bounded repair does not establish universal security
+or PostgreSQL parity; see the report and root `AUDIT_OPEN.md`.
 
-| Module | PostgreSQL | Nucleus 1.0.2 |
+The optional model modules remain unadvertised for Nucleus. Their recorded
+capability outcomes are in the same named report; this documentation correction
+does not rerun them:
+
+| Module | PostgreSQL | Nucleus retained recording (unsupported package profile) |
 |---|---|---|
 | `/pgvector`, `/fts` | verified on 15, 16, 17 and 18 | vector types unsupported; the FTS functions fail a negative control; queries are refused before any statement runs |
-| `/timeseries`, `/columnar` | verified on 15, 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own time-series and columnar model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
-| `/listen-notify` | verified on 15, 16, 17 and 18 | delivers, with the divergences documented in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
+| `/timeseries`, `/columnar` | verified on 15, 16, 17 and 18 | `ts-bucketing` resolves unsupported and bucket statements fail closed; the engine's own model clients are in `@neutron-build/nucleus` ([below](#nucleus-time-series-and-columnar-model-clients)) |
+| `/listen-notify` | verified on 15, 16, 17 and 18 | delivers, with the recorded divergences in [LISTEN/NOTIFY](#listennotify-neutron-buildsqllisten-notify) |
 
 ## Upgrading from earlier builds
 
@@ -1734,3 +1754,56 @@ general-purpose use.
   open items: `studio/README.md`.
 
 MIT.
+
+Use `.nativeArray()` for native multidimensional arrays or non-default lower
+bounds. `PgArray<T>` holds row-major flat elements and explicit dimensions:
+
+```ts
+const cells = pgTable("cells", { values: bigint("values").nativeArray() });
+const values = new PgArray(
+  [{ length: 2, lowerBound: -1 }, { length: 2, lowerBound: 0 }],
+  [9223372036854775807n, null, 0n, 1n],
+);
+await db.insert(cells).values({ values });
+```
+
+Both drivers acquire array text and apply the declared scalar codec to every
+member. Dimensions retain signed 32-bit lower bounds; at most six dimensions
+and one million elements are accepted. An empty array is `new PgArray([], [])`;
+a whole SQL NULL remains `null`. For JSON/JSONB arrays, a SQL NULL member is
+`null`, while a JSON null member is `jsonNull`; JSON array members are ordinary
+nested JavaScript arrays. Input values are snapshotted and element reads return
+detached snapshots. Sparse values, recursive JSON and accessors are refused.
+
+The accepted element families match `.array()`; temporal, bytea and vector
+array elements remain unsupported. `.array()` keeps its one-dimensional,
+default-bound representation. Dimensioned arrays require explicit native DDL:
+version-2 schema export refuses this declaration because its array contract
+cannot retain these dimensions and bounds.
+
+`createQueryTelemetry()` provides counters isolated by `AsyncLocalStorage`.
+Pass its `logger` to `createDatabase`, and wrap each fully awaited request in
+`telemetry.run(async () => ...)`. Its result includes query starts, successes,
+failures, cancellations and summed query duration. Transaction control is
+separate from query counts; retries count each physical attempt. Detached
+background work must own a separate scope and database lifetime.
+
+To attach redacted events to your application's active OpenTelemetry span,
+provide `() => trace.getSpan(context.active())` from your configured
+`@opentelemetry/api` context manager. The bridge emits event kinds, statement
+hashes, durations and validated SQLSTATE only, even when diagnostic SQL logging
+is enabled. It leaves span creation, status, ending and exporter shutdown with
+the application. This follows the [OpenTelemetry context API](https://github.com/open-telemetry/opentelemetry-js/blob/main/doc/context.md).
+
+For HTTP middleware, create one `SqlRequestLifecycle(db)` alongside the pool.
+Run each request with `lifetime.run((database, signal) =>
+database.transaction(async tx => { ... }))`; keep the transaction inside that
+callback and pass `signal` to each builder's `.execute({ signal })`. Await all
+work before sending the response. On server shutdown, stop HTTP admission,
+then await `lifetime.shutdown({ graceMs: 5000, cancelMs: 5000 })`, then flush
+your telemetry exporter. New SQL requests are refused as draining starts.
+After the grace period, active signals are aborted and drained before
+`db.close()`. If callbacks ignore cancellation past the second deadline,
+shutdown rejects and keeps the database open; after those callbacks settle,
+retry shutdown. An injected borrowed driver retains its documented ownership
+and must be closed separately by its owner.

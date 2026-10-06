@@ -52,7 +52,13 @@ export function CommitBar() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (!count) return
+      if (!count || e.defaultPrevented) return
+      const target = e.target instanceof Element ? e.target : null
+      // Modal controls own their shortcuts; a dialog must not commit or
+      // discard the staged workspace behind it. Text editing owns native
+      // undo even outside a dialog (typed text is not a staged operation).
+      if (target?.closest('[role="dialog"]')) return
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && target?.closest('input, textarea, [contenteditable]')) return
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault()
         void commit()
@@ -92,7 +98,7 @@ export function CommitBar() {
       toast('success', `Committed ${res.rowsAffected} change${res.rowsAffected === 1 ? '' : 's'} ${commitWording().done}${reverted}`)
     } catch (err: unknown) {
       if (err instanceof Error && err.message) {
-        toast('error', `Commit failed: ${err.message}`)
+        toast('error', `${err.message.includes('outcome unknown') ? 'Commit outcome unknown' : 'Commit failed'}: ${err.message}`)
       }
     }
   }
@@ -134,7 +140,8 @@ export function CommitBar() {
   const conn = activeConnection.value
 
   return (
-    <div class={s.bar}>
+    <div class={s.bar} aria-label="Staged changes">
+      {count > 0 && <span class={s.stageSummary}>{count} staged</span>}
       <div class={s.changes}>
         {stagedEdits.value.map(e => (
           <span class={s.change} key={e.id} title={e.label}>
@@ -146,6 +153,7 @@ export function CommitBar() {
             <button
               class={s.revert}
               title="Discard this staged edit"
+              aria-label={`Discard staged edit: ${e.label}`}
               onClick={() => removeStagedEdit(e.id)}
             >×</button>
           </span>
@@ -169,7 +177,7 @@ export function CommitBar() {
         )}
         {commitPhase.value === 'failed' && commitError.value && (
           <div class={s.commitError} role="alert" tabIndex={-1} ref={errorRef}>
-            commit failed: {commitError.value} — the draft stays staged; fix or discard the pinned row
+            {commitError.value.includes('outcome unknown') ? 'Commit outcome unknown' : 'Commit failed'}: {commitError.value} — {commitError.value.includes('outcome unknown') ? 'Your draft is preserved. Check the table state before attempting another commit.' : 'Your draft stays staged; fix or discard the pinned row.'}
           </div>
         )}
         {last && (

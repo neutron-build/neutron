@@ -1,0 +1,553 @@
+{
+ "version": 1,
+ "afterSeed": ["SELECT setval(pg_get_serial_sequence('sys_user', 'user_id'), 100)"],
+ "seed": [
+  {
+   "table": "sys_dept",
+   "columns": ["dept_id", "parent_id", "dept_path", "dept_name", "sort", "status", "create_by", "update_by", "deleted_at"],
+   "rows": [
+    [1, 0, "/0/1/", "Root", 1, 2, 0, 0, 0],
+    [2, 1, "/0/1/2/", "Child", 1, 2, 0, 0, 0],
+    [3, 2, "/0/1/2/3/", "Grandchild", 1, 2, 0, 0, 0],
+    [4, 0, "/0/4/", "Other", 2, 2, 0, 0, 0],
+    [5, 1, "/0/1/5/", "Sibling", 2, 2, 0, 0, 0],
+    [11, 0, "/0/11/", "Eleven", 3, 2, 0, 0, 0],
+    [6, 1, "/0/1/6/", "Removed", 3, 2, 0, 0, 1700000000000]
+   ]
+  },
+  {
+   "table": "sys_role",
+   "columns": ["role_id", "role_name", "role_key", "data_scope", "deleted_at"],
+   "rows": [
+    [1, "all", "all", "1", 0],
+    [2, "custom", "custom", "2", 0],
+    [3, "dept", "dept", "3", 0],
+    [4, "tree", "tree", "4", 0],
+    [5, "self", "self", "5", 0]
+   ]
+  },
+  {
+   "table": "sys_role_dept",
+   "columns": ["role_id", "dept_id"],
+   "rows": [
+    [2, 2],
+    [2, 4],
+    [2, 6],
+    [3, 1]
+   ]
+  },
+  {
+   "table": "sys_user",
+   "columns": ["user_id", "username", "nick_name", "phone", "role_id", "dept_id", "post_id", "status", "email", "sex", "create_by", "deleted_at"],
+   "rows": [
+    [1, "alice", "Alice", "10000000001", 1, 1, 1, "1", "alice@example.com", "1", 0, 0],
+    [2, "bob", "Bob", "10000000002", 2, 2, 1, "1", "bob@example.com", "2", 1, 0],
+    [3, "carol", "Carol", "10000000003", 3, 3, 2, "1", "carol@example.com", "1", 2, 0],
+    [4, "dave", "Dave", "10000000004", 4, 4, 2, "0", "dave@example.com", "2", 1, 0],
+    [5, "erin", "Erin", "10000000005", 5, 1, 3, "1", "erin@example.com", "1", 3, 0],
+    [6, "frank", "Frank", "10000000006", 5, 5, 3, "1", "frank@example.com", "2", 5, 0],
+    [7, "grace", "Grace", "10000000007", 5, 11, 1, "1", "grace@example.com", "1", 1, 0],
+    [8, "ivan", "Ivan", "10000000008", 4, 4, 1, "1", "ivan@example.com", "2", 9, 0],
+    [9, "heidi", "Heidi", "10000000009", 2, 2, 1, "1", "heidi@example.com", "1", 1, 1700000000001],
+    [10, "judy", "Judy", "10000000010", 5, null, 1, "1", "judy@example.com", null, null, 0],
+    [11, "kim", "Kim", "10000000011", 5, 6, 1, "1", "kim@example.com", "1", 1, 0],
+    [12, "lee", "Lee", "10000000012", 5, 1, 1, "1", "lee@example.com", "2", 11, 0],
+    [13, "50%", "Fifty", "10000000013", 5, 2, 1, "1", "50%@example.com", "1", 2, 0],
+    [14, "ghost", "Ghost", "10000000014", 5, 1, 1, "1", "ghost@example.com", "1", 1, null]
+   ]
+  }
+ ],
+ "queries": [
+  {
+   "name": "dp_off_ignores_scope",
+   "enableDataPermission": false,
+   "permission": {"scope": "5", "userId": 999, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_all",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_custom",
+   "enableDataPermission": true,
+   "permission": {"scope": "2", "userId": 0, "deptId": 0, "roleId": 2},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_dept",
+   "enableDataPermission": true,
+   "permission": {"scope": "3", "userId": 0, "deptId": 1, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_dept_zero",
+   "enableDataPermission": true,
+   "permission": {"scope": "3", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_tree_1",
+   "enableDataPermission": true,
+   "permission": {"scope": "4", "userId": 0, "deptId": 1, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_tree_2",
+   "enableDataPermission": true,
+   "permission": {"scope": "4", "userId": 0, "deptId": 2, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_tree_zero",
+   "enableDataPermission": true,
+   "permission": {"scope": "4", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_self_1",
+   "enableDataPermission": true,
+   "permission": {"scope": "5", "userId": 1, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_self_5",
+   "enableDataPermission": true,
+   "permission": {"scope": "5", "userId": 5, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_self_nobody",
+   "enableDataPermission": true,
+   "permission": {"scope": "5", "userId": 999, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_unknown",
+   "enableDataPermission": true,
+   "permission": {"scope": "9", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "scope_empty",
+   "enableDataPermission": true,
+   "permission": {"scope": "", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_user_id",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userId": 7,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_username_contains",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "username": "ob",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_username_underscore_wildcard",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "username": "_ob",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_username_percent_wildcard",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "username": "%",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_username_literal_percent_user",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "username": "0%",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_role_exact",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "roleId": "5",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_post_exact",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "postId": "3",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_status_exact",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "status": "0",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_sex_exact",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "sex": "2",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_phone_contains",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "phone": "0007",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_email_contains",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "email": "@example",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_nick_contains",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "nickName": "a",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_dept_path_contains",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "deptId": "1",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "search_dept_path_segment",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "deptId": "/1/2/",
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "tree_with_dept_filter_desc",
+   "enableDataPermission": true,
+   "permission": {"scope": "4", "userId": 0, "deptId": 1, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "deptId": "2",
+    "userIdOrder": "desc"
+   }
+  },
+  {
+   "name": "page_two_desc",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 2,
+    "pageSize": 4,
+    "userIdOrder": "desc"
+   }
+  },
+  {
+   "name": "page_defaults",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 0,
+    "pageSize": 0,
+    "userIdOrder": "asc"
+   }
+  },
+  {
+   "name": "order_username_desc_uppercase",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "usernameOrder": "DESC"
+   }
+  },
+  {
+   "name": "order_invalid_direction_ignored",
+   "enableDataPermission": true,
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "search": {
+    "pageIndex": 1,
+    "pageSize": 50,
+    "userIdOrder": "sideways",
+    "usernameOrder": "asc"
+   }
+  }
+ ],
+ "operations": [
+  {
+   "name": "get_scope_all",
+   "kind": "get",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "get_self_scope_not_creator",
+   "kind": "get",
+   "permission": {"scope": "5", "userId": 5, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "get_self_scope_creator",
+   "kind": "get",
+   "permission": {"scope": "5", "userId": 1, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "get_deleted_user",
+   "kind": "get",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 9,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "get_tree_scope_member",
+   "kind": "get",
+   "permission": {"scope": "4", "userId": 0, "deptId": 1, "roleId": 0},
+   "userId": 3,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "getself_without_scope",
+   "kind": "getself",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "getself_deleted_user",
+   "kind": "getself",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 9,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "insert_user",
+   "kind": "insert",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 0,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "newbie", "password": "plain-text-password-1", "nickName": "Newbie", "phone": "13800000001", "roleId": 2, "avatar": "", "sex": "1", "email": "newbie@example.com", "deptId": 1, "postId": 1, "remark": "", "status": "1", "createBy": 1},
+   "sql": ""
+  },
+  {
+   "name": "insert_duplicate_username",
+   "kind": "insert",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 0,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "newbie", "password": "another-password-2", "nickName": "Again", "phone": "13800000002", "roleId": 2, "avatar": "", "sex": "1", "email": "again@example.com", "deptId": 1, "postId": 1, "remark": "", "status": "1", "createBy": 1},
+   "sql": ""
+  },
+  {
+   "name": "native_seed_credentials",
+   "kind": "native",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": "UPDATE sys_user SET avatar = 'keep.png', salt = 'seeded-salt', password = 'seeded-plaintext' WHERE user_id = 7"
+  },
+  {
+   "name": "update_in_scope",
+   "kind": "update",
+   "permission": {"scope": "5", "userId": 1, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 1,
+   "request": {"userId": 7, "username": "grace", "password": "", "nickName": "Grace Two", "phone": "13800000007", "roleId": 5, "avatar": "", "sex": "", "email": "grace2@example.com", "deptId": 11, "postId": 1, "remark": "", "status": "1", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "update_outside_scope",
+   "kind": "update",
+   "permission": {"scope": "5", "userId": 5, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 5,
+   "request": {"userId": 7, "username": "grace", "password": "", "nickName": "Blocked", "phone": "13800000007", "roleId": 5, "avatar": "", "sex": "", "email": "grace2@example.com", "deptId": 11, "postId": 1, "remark": "", "status": "1", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "update_self_privileged_fields",
+   "kind": "update",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 7,
+   "request": {"userId": 7, "username": "grace", "password": "", "nickName": "Grace Self", "phone": "13800000007", "roleId": 1, "avatar": "", "sex": "", "email": "grace2@example.com", "deptId": 4, "postId": 1, "remark": "", "status": "0", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "remove_outside_scope",
+   "kind": "remove",
+   "permission": {"scope": "5", "userId": 5, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "remove_in_scope",
+   "kind": "remove",
+   "permission": {"scope": "5", "userId": 1, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "remove_already_deleted",
+   "kind": "remove",
+   "permission": {"scope": "5", "userId": 1, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 0,
+   "request": {"userId": 0, "username": "", "password": "", "nickName": "", "phone": "", "roleId": 0, "avatar": "", "sex": "", "email": "", "deptId": 0, "postId": 0, "remark": "", "status": "", "createBy": 0},
+   "sql": ""
+  },
+  {
+   "name": "update_deleted_user",
+   "kind": "update",
+   "permission": {"scope": "1", "userId": 0, "deptId": 0, "roleId": 0},
+   "userId": 7,
+   "callerId": 1,
+   "request": {"userId": 7, "username": "grace", "password": "", "nickName": "Grace Two", "phone": "13800000007", "roleId": 5, "avatar": "", "sex": "", "email": "grace2@example.com", "deptId": 11, "postId": 1, "remark": "", "status": "1", "createBy": 0},
+   "sql": ""
+  }
+ ]
+}

@@ -43,7 +43,7 @@ brew upgrade neutron   # delegated automatically for Homebrew installs
 | `dev` | Detect the project language and start its dev server |
 | `project check` / `plan` / `run` | Validate, inspect and run tasks for an experimental multi-service application |
 | `db` | Manage a local Nucleus instance -- subcommands `start`, `stop`, `status`, `reset` |
-| `migrate` | Apply SQL migrations -- subcommands `status`, `create <name>`, `down [N]` |
+| `migrate` | Apply SQL migrations to PostgreSQL (Nucleus refused) -- subcommands `status`, `create <name>`, `down [N]` |
 | `seed` | Run a SQL seed file against the database |
 | `generate` | Generate typed code from a table schema (go, ts, rust, python, elixir, zig) |
 | `studio` | Launch the embedded Studio web UI in the browser |
@@ -67,13 +67,18 @@ brew upgrade neutron   # delegated automatically for Homebrew installs
 
 ## Quick Start
 
-```bash
-neutron new my-api --lang go   # scaffold a Go project (omit --lang to pick interactively)
-cd my-api
-neutron db start               # download + start a local Nucleus instance
-neutron migrate                # apply pending migrations
-neutron dev                    # start the language-appropriate dev server
-```
+For migrations, provision a PostgreSQL database first and set `DATABASE_URL`
+to its connection URL. Scaffold with `neutron new my-api --lang go`, enter the
+project, then run `neutron --url "$DATABASE_URL" migrate` to apply pending
+migration files. The generated Go application reads `NEUTRON_DATABASE_URL`
+before `DATABASE_URL`; ensure it selects that same PostgreSQL database before
+starting `neutron dev`.
+
+For experimental local Nucleus development, `neutron db start` downloads and
+starts the local engine. It does not make `neutron migrate` applicable:
+the CLI file workflow refuses Nucleus. Use the experimental language SDK
+migration APIs (`go/nucleus` or `@neutron-build/nucleus`) within their documented
+limits; SDK startup is not a promise to apply CLI migration files.
 
 Generate a typed client for a table, or every table in a schema:
 
@@ -255,3 +260,29 @@ PostgreSQL instance at `DATABASE_URL`.
 ## License
 
 MIT
+
+### Optional PostgreSQL scalar read models
+
+`neutron generate --table samples --lang python --profile lossless-read-v1 --out ./gen/`
+selects an additive read profile shared with Studio's **Codegen read profile**
+selector. The default remains `legacy`; its numeric mappings can lose precision
+(TypeScript `number`, Python `float`, Go `float64`). Existing legacy output is
+unchanged. Lossless read v1 supports TS/Python/Go only and checks actual
+PostgreSQL catalog type identity; unsupported columns fail generation rather
+than silently becoming strings. With `--all`, all tables are validated before
+any output is written for an unsupported-field failure.
+
+This is a selected-row representation, not an insert/update model, schema
+migration authority or runtime TypeScript decoder. See the exact type,
+nullability and transport contract in
+[GENERATED.md](../contracts/data/GENERATED.md). Temporal, array, domain, enum,
+composite, JSON and floating-point types are outside this initial profile.
+
+
+Studio stores local connections and saved queries under `~/.neutron` by default.
+Set `NEUTRON_STUDIO_DATA_DIR` to an absolute private directory (mode 0700) to
+isolate an instance or disposable test profile. Connection and saved-query files
+stay in that directory; changing the setting does not copy or delete other
+profiles. Malformed saved-query state causes startup to fail rather than silently
+resetting it. Studio remains a local operator tool; use a database role with the
+permissions appropriate to that instance.

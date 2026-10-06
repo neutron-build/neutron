@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
+use futures::FutureExt;
 
 use sqlparser::ast::{self, Expr, Statement};
 #[cfg(feature = "server")]
@@ -559,10 +560,23 @@ const SKIP_WARN_EVERY: u64 = 10;
 /// `limits.max_prepared_statements_per_session`.
 pub(crate) const DEFAULT_MAX_PREPARED_STMTS: usize = 1024;
 
-/// Default per-session cap on open cursors. Each cursor materializes its full
-/// row set, so this bounds both map growth and per-cursor memory pressure.
-/// Overridable via `limits.max_cursors_per_session`.
+/// Default per-session cap on open cursors. A materialized cursor holds its
+/// full row set (a lazy one holds a few integers), so this bounds both map
+/// growth and per-cursor memory pressure. Overridable via
+/// `limits.max_cursors_per_session`.
 pub(crate) const DEFAULT_MAX_CURSORS: usize = 1024;
+
+/// Default per-cursor cap on rows. A materialized cursor runs its query to
+/// completion at DECLARE, so the cap is applied as a row limit on the query
+/// itself and re-checked on the result; a lazy cursor holds no rows, so the
+/// same cap bounds the rows one FETCH may return. Overridable via
+/// `limits.max_cursor_rows`.
+pub(crate) const DEFAULT_MAX_CURSOR_ROWS: usize = 1_000_000;
+
+/// Default per-cursor cap on estimated bytes (64 MiB). Checked on a
+/// materialized result before it is stored, and on the rows one FETCH of a lazy
+/// cursor returns. Overridable via `limits.max_cursor_bytes`.
+pub(crate) const DEFAULT_MAX_CURSOR_BYTES: usize = 64 * 1024 * 1024;
 
 /// The executor holds shared catalog/storage state and per-session state.
 ///
@@ -730,6 +744,8 @@ pub struct Executor {
     snapshot_leases: snapshot_lease::SnapshotLeaseRegistry,
     /// Counter for generating unique session IDs.
     next_session_id: AtomicU64,
+    #[cfg(feature = "server")]
+    next_backend_pid: std::sync::atomic::AtomicI32,
     /// Coordinator transaction-id counter (S63): minted at BEGIN, never
     /// derived from the SQL engine's own `next_txn_id` (minted at COMMIT, and
     /// reusable across restarts after segment pruning). Seeded at open above
@@ -773,6 +789,12 @@ pub struct Executor {
     /// materializes its whole row set. Configurable via
     /// `limits.max_cursors_per_session`.
     max_cursors_per_session: AtomicUsize,
+    /// Per-cursor cap on rows (`limits.max_cursor_rows`): materialized at
+    /// DECLARE, or returned by one FETCH of a lazy cursor.
+    max_cursor_rows: AtomicUsize,
+    /// Per-cursor cap on estimated bytes (`limits.max_cursor_bytes`), applied
+    /// the same two ways.
+    max_cursor_bytes: AtomicUsize,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -1197,6 +1219,8 @@ impl Executor {
             #[cfg(feature = "server")]
             snapshot_leases: snapshot_lease::SnapshotLeaseRegistry::new(),
             next_session_id: AtomicU64::new(1),
+            #[cfg(feature = "server")]
+            next_backend_pid: std::sync::atomic::AtomicI32::new(1),
             next_xact_id: AtomicU64::new(1),
             specialty_horizon: AtomicU64::new(1),
             specialty_checkpoint_skips: AtomicU64::new(0),
@@ -1205,6 +1229,8 @@ impl Executor {
             default_slow_query_ms: AtomicU64::new(0),
             max_prepared_stmts_per_session: AtomicUsize::new(DEFAULT_MAX_PREPARED_STMTS),
             max_cursors_per_session: AtomicUsize::new(DEFAULT_MAX_CURSORS),
+            max_cursor_rows: AtomicUsize::new(DEFAULT_MAX_CURSOR_ROWS),
+            max_cursor_bytes: AtomicUsize::new(DEFAULT_MAX_CURSOR_BYTES),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -2716,6 +2742,15 @@ impl Executor {
             .store(cursors, Ordering::Release);
     }
 
+    /// Set the per-cursor budgets after construction. A DECLARE whose
+    /// materialized result exceeds either is REFUSED (54000) and stores nothing;
+    /// a FETCH on a lazy cursor that would return more is REFUSED (54000) and
+    /// does not move the cursor.
+    pub fn set_cursor_budgets(&self, max_rows: usize, max_bytes: usize) {
+        self.max_cursor_rows.store(max_rows, Ordering::Release);
+        self.max_cursor_bytes.store(max_bytes, Ordering::Release);
+    }
+
     /// Record a weak self-reference so `&self` methods can recover an owned
     /// `Arc<Executor>` (see [`Executor::arc_self`]). Call this once, right after the
     /// executor is wrapped in an `Arc` at a server/embedded entry point. Idempotent;
@@ -3261,6 +3296,42 @@ impl Executor {
         id
     }
 
+    /// Trusted wire boundary: register a unique, never-reused backend identity.
+    /// Unauthenticated sessions have no SQL cancellation authority. Rebinding
+    /// the same live session returns its original identity and shared wakeup.
+    #[cfg(feature = "server")]
+    pub fn register_session_backend(
+        &self,
+        id: u64,
+    ) -> Result<(i32, Arc<tokio::sync::Notify>), ExecError> {
+        // Hold the map guard through registration so disconnect cannot remove
+        // the session and then have a stale caller register it afterward.
+        let sessions = self.sessions.read();
+        let session = sessions.get(&id).ok_or_else(|| {
+            ExecError::PermissionDenied("cannot register an unknown backend session".into())
+        })?;
+        let _boundary = session.cancel_boundary.lock();
+        let old = session.backend_pid.load(Ordering::Acquire);
+        let pid = if old > 0 {
+            old
+        } else {
+            let pid = self.allocate_backend_pid()?;
+            session.backend_pid.store(pid, Ordering::Release);
+            pid
+        };
+        Ok((pid, session.cancel_notify.clone()))
+    }
+
+    /// Refuse exhaustion rather than wrapping a stale PID onto a new borrower.
+    #[cfg(feature = "server")]
+    pub(crate) fn allocate_backend_pid(&self) -> Result<i32, ExecError> {
+        self.next_backend_pid
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pid| {
+                pid.checked_add(1)
+            })
+            .map_err(|_| ExecError::Unsupported("backend identity space exhausted".into()))
+    }
+
     /// Install/rotate the bootstrap role's SCRAM verifier. Used by the server
     /// startup flag before accepting connections.
     #[cfg(feature = "server")]
@@ -3404,6 +3475,7 @@ impl Executor {
     pub fn drop_session(&self, id: u64) {
         let session = self.sessions.write().remove(&id);
         if let Some(session) = session {
+            session.backend_pid.store(0, Ordering::Release);
             if session.txn_active.load(Ordering::SeqCst) {
                 #[cfg(feature = "server")]
                 {
@@ -3809,9 +3881,88 @@ impl Executor {
     /// cancellation (wire CancelRequest). Long compute loops observe the flag
     /// and abort with SQLSTATE 57014; the flag clears at the next statement.
     pub fn request_session_cancel(&self, session_id: u64) {
-        self.get_session(session_id)
-            .cancel_requested
-            .store(true, Ordering::Relaxed);
+        if let Some(session) = self.sessions.read().get(&session_id) {
+            Self::signal_session_cancel(session);
+        }
+    }
+
+    fn signal_session_cancel(session: &Session) {
+        let _boundary = session.cancel_boundary.lock();
+        session.cancel_requested.store(true, Ordering::Relaxed);
+        session.cancel_notify.notify_one();
+    }
+
+    /// Wire completion fence for a cancellation signaled during a single
+    /// non-yielding executor poll. Unknown/disconnected sessions never fall back.
+    #[cfg(feature = "server")]
+    pub(crate) fn session_cancel_pending(&self, session_id: u64) -> bool {
+        self.sessions
+            .read()
+            .get(&session_id)
+            .is_some_and(|session| session.cancel_requested.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn current_backend_pid(&self) -> i32 {
+        let pid = self.current_session().backend_pid.load(Ordering::Acquire);
+        if pid > 0 {
+            pid
+        } else {
+            std::process::id() as i32
+        }
+    }
+
+    /// Finite authorization: same effective role as the authenticated target
+    /// owner, or an effective superuser. pg_signal_backend/membership authority
+    /// is not advertised here; BYPASSRLS never confers cancellation authority.
+    pub(super) fn cancel_backend(&self, pid: i32) -> Result<bool, ExecError> {
+        if pid <= 0 {
+            return Ok(false);
+        }
+        let caller = self.current_session();
+        if caller.backend_pid.load(Ordering::Acquire) <= 0
+            || caller.authenticated_user.read().is_none()
+        {
+            return Err(ExecError::PermissionDenied(
+                "unregistered or unauthenticated cancellation refused".into(),
+            ));
+        }
+        let caller_context = caller.session_context.read().clone();
+        let sessions = self.sessions.read();
+        let Some(target) = sessions
+            .values()
+            .find(|session| session.backend_pid.load(Ordering::Acquire) == pid)
+        else {
+            return Ok(false);
+        };
+        let owner = target.authenticated_user.read().clone();
+        if owner.is_none() {
+            return Ok(false);
+        }
+        // The protected target is the authenticated login role, not whichever
+        // effective role it later assumes. Consult committed attributes; if
+        // the catalog is busy or the login disappeared, fail closed.
+        let target_is_superuser = self
+            .roles
+            .try_read()
+            .map_err(|_| {
+                ExecError::PermissionDenied(
+                    "backend role catalog is busy; retry cancellation".into(),
+                )
+            })?
+            .get(owner.as_deref().expect("authenticated owner checked above"))
+            .map(|role| role.is_superuser)
+            .unwrap_or(true);
+        if !caller_context.is_superuser
+            && (target_is_superuser || owner.as_deref() != Some(caller_context.user.as_str()))
+        {
+            return Err(ExecError::PermissionDenied(
+                "permission to cancel target backend denied".into(),
+            ));
+        }
+        // Keep the map read lock until signaling: removal cannot recycle or
+        // detach the target between identity/authorization checks and wakeup.
+        Self::signal_session_cancel(target);
+        Ok(true)
     }
 
     /// Drop any pending cancel on the session. The wire layer calls this at
@@ -3820,9 +3971,11 @@ impl Executor {
     /// several internal statements (e.g. the Describe probe) and a cancel
     /// arriving during any of them targets the same client command.
     pub fn clear_session_cancel(&self, session_id: u64) {
-        self.get_session(session_id)
-            .cancel_requested
-            .store(false, Ordering::Relaxed);
+        if let Some(session) = self.sessions.read().get(&session_id) {
+            let _boundary = session.cancel_boundary.lock();
+            session.cancel_requested.store(false, Ordering::Relaxed);
+            while session.cancel_notify.notified().now_or_never().is_some() {}
+        }
     }
 
     /// Error out if the current session's statement has been cancelled.
@@ -6192,18 +6345,29 @@ impl Executor {
                 if has_enforceable_constraints {
                     return None;
                 }
-                // Generated columns, identity columns and declared lengths are
-                // enforced by the full INSERT path only.
-                if table_def
-                    .columns
-                    .iter()
-                    .any(|c| c.generation.is_some() || c.max_len.is_some())
-                {
+                // Generated columns, identity columns, declared lengths and declared
+                // numeric precisions are enforced by the full INSERT path only.
+                if table_def.columns.iter().any(|c| {
+                    c.generation.is_some() || c.max_len.is_some() || c.numeric_typmod.is_some()
+                }) {
                     return None;
                 }
                 // Column count must match exactly for a simple VALUES insert.
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.
+                }
+                // The fast-path parser reads a decimal literal as an f64. A
+                // NUMERIC column must get its digits and written scale, which
+                // only the full INSERT path keeps.
+                if values
+                    .iter()
+                    .zip(table_def.columns.iter())
+                    .any(|(lit, col)| {
+                        matches!(lit, crate::wire::kv_fast_path::SqlLiteral::Float(_))
+                            && matches!(col.data_type, DataType::Numeric)
+                    })
+                {
+                    return None;
                 }
                 // Coerce each literal to its target column's declared type
                 // so pgx SimpleProtocol text-literal inserts land in the
@@ -6272,11 +6436,12 @@ impl Executor {
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
                 // These columns require the full UPDATE path's casts,
-                // generated expressions and declared-length checks.
+                // generated expressions and declared-length / numeric-precision checks.
                 if table_def.columns.iter().any(|col| {
                     matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz)
                         || col.generation.is_some()
                         || col.max_len.is_some()
+                        || col.numeric_typmod.is_some()
                 }) {
                     return None;
                 }
@@ -6327,6 +6492,12 @@ impl Executor {
                 let mut col_updates: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
                 for (col_name, lit) in assignments {
                     let idx = table_def.column_index(col_name)?;
+                    // A decimal literal was read as f64; see SimpleInsert.
+                    if matches!(lit, crate::wire::kv_fast_path::SqlLiteral::Float(_))
+                        && matches!(table_def.columns[idx].data_type, DataType::Numeric)
+                    {
+                        return None;
+                    }
                     let v = lit
                         .to_value()
                         .cast(&table_def.columns[idx].data_type)
@@ -7447,7 +7618,14 @@ impl Executor {
                 // cacheable: a replay serves rows without taking the locks the
                 // clause promises, from a snapshot the claim already consumed.
                 let sql_text = query.to_string();
+                // Backend identity is session-local; cancellation must execute
+                // on every call. Never replay either from a shared result cache.
+                let backend_control = {
+                    let upper = sql_text.to_ascii_uppercase();
+                    upper.contains("PG_BACKEND_PID") || upper.contains("PG_CANCEL_BACKEND")
+                };
                 let cacheable = !has_row_locks
+                    && !backend_control
                     && !in_txn
                     && !Self::query_cache_disabled()
                     && !self.any_table_secured()
@@ -7494,8 +7672,15 @@ impl Executor {
                 object_type,
                 names,
                 if_exists,
+                cascade,
                 ..
-            } => Box::pin(self.execute_drop(object_type, names, if_exists)).await,
+            } => {
+                if object_type == ast::ObjectType::Schema {
+                    Box::pin(self.execute_drop_schema(names, if_exists, cascade)).await
+                } else {
+                    Box::pin(self.execute_drop(object_type, names, if_exists)).await
+                }
+            }
             Statement::CreateIndex(create_index) => {
                 Box::pin(self.execute_create_index(create_index)).await
             }
@@ -9457,6 +9642,104 @@ impl Executor {
         }
         Ok(ExecResult::Command {
             tag: "DROP EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    // ========================================================================
+    // Schemas (DROP SCHEMA)
+    // ========================================================================
+
+    /// `DROP SCHEMA [IF EXISTS] name [, ...]` — RESTRICT only.
+    ///
+    /// A schema is a name in the `schemas` registry; its objects are entries
+    /// keyed `schema.object` across the engine's flat-keyed stores: catalog
+    /// tables, indexes and enum types, views, materialized views, sequences
+    /// and functions. RESTRICT — the default, and the only mode implemented —
+    /// refuses while any such entry remains, naming the objects, so a drop can
+    /// never orphan keys under a schema that no longer exists. `IF EXISTS`
+    /// turns a missing schema into a no-op success, mirroring how
+    /// `DROP TABLE IF EXISTS` behaves. CASCADE is refused outright rather
+    /// than silently degraded to RESTRICT. `public` and the session's current
+    /// schema get no special case: unqualified DDL stores bare names, so an
+    /// empty `public` is droppable exactly like any other schema.
+    async fn execute_drop_schema(
+        &self,
+        names: Vec<ast::ObjectName>,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<ExecResult, ExecError> {
+        if cascade {
+            return Err(ExecError::Unsupported(
+                "DROP SCHEMA CASCADE is not implemented; drop the schema's objects first".into(),
+            ));
+        }
+        // Same authority gate as every other DROP (see execute_drop).
+        self.require_security_admin("drop an object")?;
+        for name in &names {
+            let schema_name = admin::object_name_value(name);
+            // Held across the member scan so two concurrent DROP SCHEMA calls
+            // cannot both pass the emptiness check for the same name. No
+            // other DDL path takes this lock, so no lock-order cycle is
+            // possible.
+            let mut schemas = self.schemas.write().await;
+            if !schemas.contains(&schema_name) {
+                if if_exists {
+                    continue;
+                }
+                return Err(ExecError::Unsupported(format!(
+                    "schema '{schema_name}' does not exist"
+                )));
+            }
+            let prefix = format!("{schema_name}.");
+            let mut members: Vec<String> = Vec::new();
+            for table in self.catalog.list_tables().await {
+                if table.name.starts_with(&prefix) {
+                    members.push(table.name.clone());
+                }
+            }
+            for index in self.catalog.get_all_indexes().await {
+                if index.name.starts_with(&prefix) {
+                    members.push(index.name.clone());
+                }
+            }
+            for type_name in self.catalog.list_enum_types().await {
+                if type_name.starts_with(&prefix) {
+                    members.push(type_name);
+                }
+            }
+            for view in self.views.read().await.keys() {
+                if view.starts_with(&prefix) {
+                    members.push(view.clone());
+                }
+            }
+            for mat_view in self.materialized_views.read().await.keys() {
+                if mat_view.starts_with(&prefix) {
+                    members.push(mat_view.clone());
+                }
+            }
+            for sequence in self.sequences.read().keys() {
+                if sequence.starts_with(&prefix) {
+                    members.push(sequence.clone());
+                }
+            }
+            for function in self.functions.read().keys() {
+                if function.starts_with(&prefix) {
+                    members.push(function.clone());
+                }
+            }
+            if !members.is_empty() {
+                members.sort();
+                return Err(ExecError::Unsupported(format!(
+                    "cannot drop schema \"{schema_name}\" because it contains {}; \
+                     drop those objects first",
+                    members.join(", ")
+                )));
+            }
+            schemas.remove(&schema_name);
+        }
+        Ok(ExecResult::Command {
+            tag: "DROP SCHEMA".into(),
             rows_affected: 0,
         })
     }

@@ -1,0 +1,401 @@
+"""Bounded qualified joins with explicit, statically nullable projections."""
+from __future__ import annotations
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from typing import Any, Callable, Generic, Mapping, TypeVar, cast
+from .core import Column, ColumnSpec, Compiled, Predicate, Table, _bound_quote, _compiled_owner
+
+T = TypeVar('T')
+U = TypeVar('U')
+
+@dataclass(frozen=True)
+class Field(Generic[T]):
+    column: Column[Any]
+    outer: bool = False
+
+    @property
+    def expression_sql(self) -> str: return self.column._bound_sql
+
+    @property
+    def result_spec(self) -> ColumnSpec[Any]:
+        return replace(self.column.spec,nullable=self.column.spec.nullable or self.outer,generated=False)
+
+    def decode(self, value: object) -> T:
+        if value is None and self.outer: return cast(T, None)
+        return cast(T, self.column.spec.decode(value))
+
+
+def field(column: Column[T]) -> Field[T]:
+    return Field(column)
+
+
+def outer_field(column: Column[T]) -> Field[T | None]:
+    """Required projection wrapper for columns on a LEFT JOIN's right side."""
+    return Field(column, True)
+
+@dataclass(frozen=True)
+class Order:
+    column: Column[Any]
+    descending: bool = False
+    nulls_first: bool = False
+
+@dataclass(frozen=True)
+class Join:
+    table: Table
+    condition: Predicate
+    left: bool
+
+@dataclass(frozen=True)
+class Scope:
+    table: Table
+    joins: tuple[Join, ...] = ()
+    correlated: frozenset[Table] = frozenset()
+
+    @property
+    def tables(self) -> frozenset[Table]:
+        return frozenset((self.table, *(join.table for join in self.joins)))
+
+    def _join(self, table: Table, on: Predicate, left: bool) -> Scope:
+        if any(_source_key(owner) == _source_key(table) or _shadows(owner,table) for owner in self.tables):
+            raise ValueError('duplicate source identity requires distinct aliases')
+        if any(_shadows(table,outer) for outer in self.correlated):
+            raise ValueError('join source shadows declared correlated source')
+        if not isinstance(on, Predicate) or table not in on.owners or not (on.owners & self.tables) or on.owners - (self.tables | {table}):
+            raise ValueError('join must connect the new table to the existing scope')
+        return replace(self, joins=self.joins + (Join(table, on, left),))
+
+    def inner_join(self, table: Table, *, on: Predicate) -> Scope:
+        return self._join(table, on, False)
+
+    def left_join(self, table: Table, *, on: Predicate) -> Scope:
+        return self._join(table, on, True)
+
+    def correlate(self,*tables: Table) -> Scope:
+        if not tables or any(any(_shadows(table,inner) for inner in self.tables | self.correlated) for table in tables):
+            raise ValueError('correlation requires distinct declared outer tables')
+        return replace(self,correlated=self.correlated | frozenset(tables))
+
+    def select(self, value: Field[T]) -> Query[T]:
+        return Query(self, (value,), lambda row: value.decode(row['p0']))
+
+    def select_pair(self, first: Field[T], second: Field[U]) -> Query[tuple[T, U]]:
+        return Query(self, (first, second), lambda row: (first.decode(row['p0']), second.decode(row['p1'])))
+
+
+def query_from(table: Table) -> Scope:
+    return Scope(table)
+
+@dataclass(frozen=True)
+class Query(Generic[T]):
+    scope: Scope
+    fields: tuple[Field[Any], ...]
+    decoder: Callable[[Mapping[str, Any]], T]
+    predicate: Predicate | None = None
+    ordering: tuple[Order, ...] = ()
+    row_limit: int | None = None
+    row_offset: int | None = None
+    grouping: tuple[Column[Any], ...] = ()
+    having_predicate: Predicate | None = None
+    distinct_rows: bool = False
+    set_terms: tuple[tuple[str,Query[T]], ...] = ()
+
+    def where(self, condition: Predicate) -> Query[T]:
+        if self.set_terms: raise ValueError('filter a set result through an explicit derived/CTE source')
+        if not isinstance(condition, Predicate) or condition.owners - (self.scope.tables | self.scope.correlated):
+            raise ValueError('predicate outside query scope')
+        return replace(self, predicate=condition if self.predicate is None else self.predicate & condition)
+
+    def order_by(self, *orders: Order) -> Query[T]:
+        if self.set_terms: raise ValueError('set-operation ordering requires a future output-label ordering API')
+        if not orders: raise ValueError('order_by requires ordering columns')
+        return replace(self, ordering=self.ordering + orders)
+
+    def group_by(self,*columns: Column[Any]) -> Query[T]:
+        if self.set_terms or not columns: raise ValueError('group_by requires columns on a plain query')
+        for column in columns: self._owned(column)
+        return replace(self,grouping=self.grouping+columns)
+
+    def having(self,condition: Predicate) -> Query[T]:
+        if self.set_terms: raise ValueError('HAVING cannot wrap a set operation')
+        self.where(condition)
+        return replace(self,having_predicate=condition if self.having_predicate is None else self.having_predicate & condition)
+
+    def distinct(self) -> Query[T]:
+        if self.set_terms: raise ValueError('DISTINCT cannot wrap a set operation')
+        return replace(self,distinct_rows=True)
+
+    def _set(self,operator: str,other: Query[T]) -> Query[T]:
+        if self.ordering or self.row_limit is not None or self.row_offset is not None:
+            raise ValueError('apply set operations before final ordering/pagination')
+        if isinstance(other,Query) and self.scope.correlated!=other.scope.correlated:
+            raise ValueError('set operations require identical correlation scopes')
+        if not isinstance(other,Query) or len(self.fields)!=len(other.fields):
+            raise ValueError('set-operation projection arity mismatch')
+        if any(a.result_spec!=b.result_spec for a,b in zip(self.fields,other.fields)):
+            raise ValueError('set-operation result profiles must agree exactly')
+        return replace(self,set_terms=self.set_terms+((operator,other),))
+
+    def union(self,other: Query[T],*,all: bool=False) -> Query[T]:
+        if type(all) is not bool: raise ValueError('UNION all requires a boolean')
+        return self._set('UNION ALL' if all else 'UNION',other)
+
+    def intersect(self,other: Query[T]) -> Query[T]: return self._set('INTERSECT',other)
+    def except_(self,other: Query[T]) -> Query[T]: return self._set('EXCEPT',other)
+
+    def limit(self, count: int) -> Query[T]:
+        _count(count)
+        return replace(self, row_limit=count)
+
+    def offset(self, count: int) -> Query[T]:
+        _count(count)
+        return replace(self, row_offset=count)
+
+    def _owned(self, column: Column[Any]) -> None:
+        if column.table not in self.scope.tables or column.table.columns.get(column.name) is not column:
+            raise ValueError('column outside query scope')
+
+    def compile(self) -> Compiled[T]:
+        if self.set_terms:
+            if self.ordering: raise ValueError('set-operation source ordering unsupported')
+            first=replace(self,set_terms=(),row_limit=None,row_offset=None).compile()
+            sql='('+first.sql+')';set_params=first.params
+            for operator,other in self.set_terms:
+                if operator not in {'UNION','UNION ALL','INTERSECT','EXCEPT'}: raise ValueError('invalid set operator')
+                replace(self,set_terms=(),ordering=(),row_limit=None,row_offset=None)._set(operator,other)
+                compiled=other.compile()
+                if compiled.catalog_owner is not None and compiled.catalog_owner is not first.catalog_owner:
+                    if first.catalog_owner is not None: raise ValueError('set query catalog ownership mismatch')
+                    first=replace(first,catalog_owner=compiled.catalog_owner)
+                # Parentheses preserve explicitly composed left-to-right set semantics.
+                sql='('+sql+' '+operator+' ('+compiled.sql+'))';set_params+=compiled.params
+            if self.row_limit is not None:
+                _count(self.row_limit);sql+=' LIMIT %s';set_params+=(self.row_limit,)
+            if self.row_offset is not None:
+                _count(self.row_offset);sql+=' OFFSET %s';set_params+=(self.row_offset,)
+            return Compiled(sql,set_params,self.decoder,first.result_oids,first.catalog_owner)
+        nullable = {join.table for join in self.scope.joins if join.left}
+        if not self.fields: raise ValueError('empty projection')
+        for item in self.fields:
+            self._owned(item.column)
+            if item.column.table in nullable and not item.outer and not isinstance(item,(Aggregate,RowNumber)):
+                raise ValueError('LEFT JOIN projection requires outer_field nullable wrapper')
+            if isinstance(item,RowNumber):
+                for column in item.partition: self._owned(column)
+                for order in item.orders:
+                    self._owned(order.column);_validate_order(order)
+            if item.outer and item.column.table not in nullable:
+                raise ValueError('outer_field requires a LEFT JOIN right-side column')
+        # Revalidate immutable AST, including directly constructed instances.
+        scope = Scope(self.scope.table,correlated=self.scope.correlated)
+        for join in self.scope.joins: scope = scope._join(join.table, join.condition, join.left)
+        aggregate=any(isinstance(item,Aggregate) for item in self.fields)
+        for column in self.grouping: self._owned(column)
+        if self.grouping or aggregate:
+            if any(not isinstance(item,(Aggregate,RowNumber)) and not any(item.column is col for col in self.grouping) for item in self.fields):
+                raise ValueError('nonaggregate projections must appear in GROUP BY')
+        if self.having_predicate is not None and not (self.grouping or aggregate):
+            raise ValueError('HAVING requires grouping or aggregate projection')
+        if type(self.distinct_rows) is not bool: raise ValueError('DISTINCT requires a boolean')
+        sql = ('SELECT DISTINCT ' if self.distinct_rows else 'SELECT ') + ', '.join(f'{item.expression_sql} AS {_bound_quote("p" + str(i))}' for i, item in enumerate(self.fields))
+        sql += ' FROM ' + self.scope.table._bound_sql
+        params: tuple[object, ...] = self.scope.table._source_params
+        for join in self.scope.joins:
+            sql += (' LEFT JOIN ' if join.left else ' INNER JOIN ') + join.table._bound_sql + ' ON ' + join.condition.sql
+            params += join.table._source_params + join.condition.params
+        if self.predicate is not None:
+            self.where(self.predicate)
+            sql += ' WHERE ' + self.predicate.sql
+            params += self.predicate.params
+        if self.grouping:
+            sql+=' GROUP BY '+', '.join(column._bound_sql for column in self.grouping)
+        if self.having_predicate is not None:
+            self.where(self.having_predicate)
+            sql+=' HAVING '+self.having_predicate.sql;params+=self.having_predicate.params
+        for order in self.ordering:
+            _validate_order(order)
+            self._owned(order.column)
+        if self.ordering:
+            sql += ' ORDER BY ' + ', '.join(order.column._bound_sql + (' DESC' if order.descending else ' ASC') + (' NULLS FIRST' if order.nulls_first else ' NULLS LAST') for order in self.ordering)
+        if self.row_limit is not None:
+            _count(self.row_limit); sql += ' LIMIT %s'; params += (self.row_limit,)
+        if self.row_offset is not None:
+            _count(self.row_offset); sql += ' OFFSET %s'; params += (self.row_offset,)
+        definitions=[];definition_params: tuple[object,...]=()
+        for table in (self.scope.table,*(join.table for join in self.scope.joins)):
+            if isinstance(table,CteTable):
+                compiled=table.source_query.compile()
+                definitions.append(_bound_quote(table.name)+' ('+', '.join(_bound_quote(label) for label in table.labels)+') AS ('+compiled.sql+')')
+                definition_params+=compiled.params
+        if definitions:
+            sql='WITH '+', '.join(definitions)+' '+sql;params=definition_params+params
+        owner=_compiled_owner(self.scope.tables,self.predicate,self.having_predicate,*(join.condition for join in self.scope.joins))
+        return Compiled(sql, params, self.decoder,tuple(("p"+str(i),item.result_spec.result_oid) for i,item in enumerate(self.fields)),owner)
+
+
+def _count(count: int) -> None:
+    if type(count) is not int or count < 0: raise ValueError('pagination requires a nonnegative integer')
+
+
+class AliasedTable(Table):
+    """Distinct read-only source identity; aliases never target ORM writes."""
+    source: Table
+    def __init__(self,source: Table,name: str) -> None:
+        if type(source) is not Table: raise ValueError('alias requires an ordinary physical Table')
+        super().__init__(name,{key:column.spec for key,column in source.columns.items()},schema=source.schema,_catalog_owner=source._catalog_owner)
+        object.__setattr__(self,'source',source)
+
+    @property
+    def _bound_sql(self) -> str:
+        return self.source._bound_sql + ' AS ' + _bound_quote(self.name)
+
+    @property
+    def _bound_reference(self) -> str: return _bound_quote(self.name)
+
+
+def alias(table: Table,name: str) -> Table:
+    return AliasedTable(table,name)
+
+
+def _source_key(table: Table) -> tuple[str,...]:
+    return ('alias',table.name) if isinstance(table,(AliasedTable,DerivedTable,CteTable)) else ('physical',table.schema,table.name)
+
+
+def exists(query: Query[Any]) -> Predicate:
+    if not isinstance(query,Query): raise ValueError('EXISTS requires a typed Query')
+    compiled=query.compile()
+    return Predicate('EXISTS ('+compiled.sql+')',compiled.params,query.scope.correlated,frozenset() if compiled.catalog_owner is None else frozenset({compiled.catalog_owner}))
+
+
+def in_query(column: Column[T],query: Query[T]) -> Predicate:
+    column._owned()
+    if not isinstance(query,Query) or len(query.fields)!=1:
+        raise ValueError('IN subquery requires exactly one typed projection')
+    source=query.fields[0].result_spec
+    if source.sql_type!=column.spec.sql_type or source.native_type!=column.spec.native_type:
+        raise ValueError('IN subquery column profiles must agree')
+    compiled=query.compile()
+    return Predicate(column._bound_sql+' IN ('+compiled.sql+')',compiled.params,query.scope.correlated | {column.table},frozenset() if compiled.catalog_owner is None else frozenset({compiled.catalog_owner}))
+
+
+def _validate_order(order: Order) -> None:
+    if not isinstance(order,Order) or type(order.descending) is not bool or type(order.nulls_first) is not bool:
+        raise ValueError('ordering requires explicit boolean direction/null placement')
+
+
+@dataclass(frozen=True)
+class Aggregate(Field[T]):
+    function: str = 'COUNT'
+
+    @property
+    def expression_sql(self) -> str:
+        self.column._owned()
+        if self.function not in {'COUNT','SUM','AVG','MIN','MAX'}: raise ValueError('unsupported aggregate')
+        self.result_spec # Validate native promotion/type support before SQL.
+        return self.function+'('+self.column._bound_sql+')'
+
+    @property
+    def result_spec(self) -> ColumnSpec[Any]:
+        source=self.column.spec
+        if self.function=='COUNT': return ColumnSpec(int,'int8')
+        if self.function in {'SUM','AVG'}:
+            if source.sql_type not in {'int2','int4','int8','numeric'}: raise ValueError('aggregate requires a supported numeric column')
+            if self.function=='SUM' and source.sql_type in {'int2','int4'}: return ColumnSpec(int,'int8',nullable=True)
+            return ColumnSpec(Decimal,'numeric',nullable=True)
+        if self.function in {'MIN','MAX'} and source.sql_type in {'int2','int4','int8','numeric','text','varchar','date','timestamp','timestamptz'}:
+            return replace(source,nullable=True,generated=False)
+        raise ValueError('unsupported aggregate result profile')
+
+    def decode(self,value: object) -> T:
+        self.result_spec.check(value);return cast(T,value)
+
+    def eq(self,value: T | None) -> Predicate:
+        if value is None: return Predicate(self.expression_sql+' IS NULL',(),frozenset({self.column.table}))
+        self.result_spec.check(value)
+        return Predicate(self.expression_sql+' = %s',(value,),frozenset({self.column.table}))
+
+    def gt(self,value: T) -> Predicate:
+        if value is None: raise ValueError('aggregate ordering comparison refuses NULL')
+        self.result_spec.check(value)
+        return Predicate(self.expression_sql+' > %s',(value,),frozenset({self.column.table}))
+
+
+def count(column: Column[Any]) -> Aggregate[int]: return Aggregate(column,function='COUNT')
+def sum_value(column: Column[int] | Column[Decimal] | Column[int | None] | Column[Decimal | None]) -> Aggregate[int | Decimal | None]:
+    return Aggregate(column,function='SUM')
+def avg(column: Column[int] | Column[Decimal] | Column[int | None] | Column[Decimal | None]) -> Aggregate[Decimal | None]:
+    return Aggregate(column,function='AVG')
+def min_value(column: Column[T]) -> Aggregate[T | None]: return Aggregate(column,function='MIN')
+def max_value(column: Column[T]) -> Aggregate[T | None]: return Aggregate(column,function='MAX')
+
+
+@dataclass(frozen=True)
+class RowNumber(Field[int]):
+    partition: tuple[Column[Any], ...] = ()
+    orders: tuple[Order, ...] = ()
+
+    @property
+    def result_spec(self) -> ColumnSpec[int]: return ColumnSpec(int,'int8')
+
+    @property
+    def expression_sql(self) -> str:
+        clauses=[]
+        if self.partition: clauses.append('PARTITION BY '+', '.join(column._bound_sql for column in self.partition))
+        for order in self.orders: _validate_order(order)
+        if self.orders:
+            clauses.append('ORDER BY '+', '.join(order.column._bound_sql+(' DESC' if order.descending else ' ASC')+(' NULLS FIRST' if order.nulls_first else ' NULLS LAST') for order in self.orders))
+        return 'ROW_NUMBER() OVER ('+' '.join(clauses)+')'
+
+    def decode(self,value: object) -> int:
+        self.result_spec.check(value);return cast(int,value)
+
+
+def row_number(table: Table,*,partition_by: tuple[Column[Any], ...]=(),order_by: tuple[Order, ...]=()) -> RowNumber:
+    return RowNumber(next(iter(table.columns.values())),partition=partition_by,orders=order_by)
+
+
+class DerivedTable(Table):
+    """Read-only projected query source with owned result column labels."""
+    source_query: Query[Any]
+    labels: tuple[str,...]
+    def __init__(self,query: Query[Any],name: str,labels: tuple[str,...]) -> None:
+        if not isinstance(query,Query) or query.scope.correlated:
+            raise ValueError('derived/CTE sources require an uncorrelated typed query')
+        if len(labels)!=len(query.fields) or len(set(labels))!=len(labels):
+            raise ValueError('derived labels must uniquely cover the projection')
+        query.compile() # Validate source before exposing metadata.
+        super().__init__(name,{label:item.result_spec for label,item in zip(labels,query.fields)},_catalog_owner=query.compile().catalog_owner)
+        object.__setattr__(self,'source_query',query)
+        object.__setattr__(self,'labels',labels)
+
+    @property
+    def _bound_sql(self) -> str:
+        compiled=self.source_query.compile()
+        return '('+compiled.sql+') AS '+_bound_quote(self.name)+' ('+', '.join(_bound_quote(label) for label in self.labels)+')'
+
+    @property
+    def _bound_reference(self) -> str: return _bound_quote(self.name)
+
+    @property
+    def _source_params(self) -> tuple[object,...]: return self.source_query.compile().params
+
+
+class CteTable(DerivedTable):
+    @property
+    def _bound_sql(self) -> str: return _bound_quote(self.name)
+
+    @property
+    def _source_params(self) -> tuple[object,...]: return ()
+
+
+def derived(query: Query[Any],name: str,*,labels: tuple[str,...]) -> Table:
+    return DerivedTable(query,name,labels)
+
+
+def cte(query: Query[Any],name: str,*,labels: tuple[str,...]) -> Table:
+    return CteTable(query,name,labels)
+
+
+def _shadows(first: Table,second: Table) -> bool:
+    # SQL resolves aliases lexically, independently of Python object ownership.
+    alias_types=(AliasedTable,DerivedTable,CteTable)
+    return first._bound_reference==second._bound_reference or (first.name==second.name and (isinstance(first,alias_types) or isinstance(second,alias_types)))

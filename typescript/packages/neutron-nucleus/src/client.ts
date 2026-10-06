@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusFeatures, NucleusPlugin } from './types.js';
-import { createTransport } from './transport.js';
+import { createTransport, PgTransport } from './transport.js';
 import { detectFeatures } from './features.js';
 
 // ---------------------------------------------------------------------------
@@ -95,6 +95,10 @@ class ClientBuilder<Acc> implements NucleusClientBuilder<Acc> {
   }
 
   async connect(): Promise<NucleusClientBase & Acc> {
+    if (this.config.transport instanceof PgTransport && this.config.transport.valueProfile === 'lossless-read-v1'
+        && this.plugins.some(plugin => plugin.name !== 'sql')) {
+      throw new Error('lossless-read-v1 is an explicit SQL-only read connection; model plugins require the default transport');
+    }
     const transport = this.config.transport ?? createTransport({
       url: this.config.url,
       headers: this.config.headers,

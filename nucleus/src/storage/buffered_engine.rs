@@ -2132,6 +2132,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -2142,6 +2143,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -2469,6 +2471,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -2479,6 +2482,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],

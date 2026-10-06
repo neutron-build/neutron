@@ -1,0 +1,19 @@
+{
+  "profile": "nucleus-relational-rc-v1-candidate",
+  "status": "uncertified-finite-candidate",
+  "package_enabled": false,
+  "implementation_base_commit": "f020a0222170d978a41dabf1339c5424956ffec5",
+  "historical_assessment_unchanged": "profile.json retains its original assessed_nucleus_tree; this admission contract is not a binary qualification",
+  "reported_identity": {
+    "startup_server_version": "16.0 (Nucleus)",
+    "sql_version": "PostgreSQL 16.0 (Nucleus 1.2.0 — The Definitive Database)",
+    "binary_attestation": false
+  },
+  "clients_in_this_slice": ["python-sync", "python-async"],
+  "admitted_metadata_types": ["int4", "int8", "bool", "text", "jsonb", "timestamptz"],
+  "parameter_restrictions": ["explicit JSONB wrapper", "UTC-aware datetime only", "no numeric/array/custom type admission"],
+  "admitted_shapes": ["single-table qualified bound-equality SELECT", "bound INSERT with DEFAULT and RETURNING", "bound UPDATE/DELETE with one equality predicate", "owned transaction/savepoint APIs"],
+  "refused_before_dispatch": ["numeric and unsupported table types including unprojected columns", "raw mutation without table metadata", "non-finite SQL or injected functions/statements", "Query algebra", "catalog admission", "server-cursor streams"],
+  "required_gates": ["Python endpoint unit suite and strict typecheck", "both fresh-installed clients against exact Nucleus binary", "matching PostgreSQL oracle", "independent review", "remaining NP01 TypeScript/Go named-profile admission", "NP02-NP06 engine qualifications"],
+  "claims": "Explicit experimental qualification entry point only. Reported identity does not establish binary provenance, PostgreSQL parity, release support, or completion of mandatory exclusions."
+}

@@ -527,6 +527,21 @@ pub struct LimitsConfig {
     /// SQL-level cursors (DECLARE) one session may hold.
     #[serde(default = "default_max_cursors_per_session")]
     pub max_cursors_per_session: usize,
+    /// Rows one DECLAREd cursor may hold or return. A materialized cursor runs
+    /// its query at DECLARE, so the row set is capped at declaration; past the
+    /// limit DECLARE fails with 54000 and nothing is stored. A lazy cursor
+    /// (a bare generate_series) holds no rows, and this caps the rows one
+    /// FETCH may return; past the limit FETCH fails with 54000 and the
+    /// cursor does not move.
+    #[serde(default = "default_max_cursor_rows")]
+    pub max_cursor_rows: usize,
+    /// Estimated heap bytes one DECLAREd cursor may hold or return (64 MiB).
+    /// Checked on a materialized result before it is stored, and on the rows
+    /// one FETCH of a lazy cursor returns; past the limit DECLARE or FETCH
+    /// fails with 54000. Worst case per session is this times
+    /// max_cursors_per_session.
+    #[serde(default = "default_max_cursor_bytes")]
+    pub max_cursor_bytes: usize,
     /// Channels one connection may LISTEN on.
     #[serde(default = "default_max_listen_channels_per_session")]
     pub max_listen_channels_per_session: usize,
@@ -555,6 +570,12 @@ fn default_max_portals_per_session() -> usize {
 fn default_max_cursors_per_session() -> usize {
     1024
 }
+fn default_max_cursor_rows() -> usize {
+    1_000_000
+}
+fn default_max_cursor_bytes() -> usize {
+    64 * 1024 * 1024
+}
 fn default_max_listen_channels_per_session() -> usize {
     1024
 }
@@ -575,6 +596,8 @@ impl Default for LimitsConfig {
             max_prepared_statements_per_session: default_max_prepared_statements_per_session(),
             max_portals_per_session: default_max_portals_per_session(),
             max_cursors_per_session: default_max_cursors_per_session(),
+            max_cursor_rows: default_max_cursor_rows(),
+            max_cursor_bytes: default_max_cursor_bytes(),
             max_listen_channels_per_session: default_max_listen_channels_per_session(),
             max_large_objects_per_session: default_max_large_objects_per_session(),
             max_auth_failure_entries: default_max_auth_failure_entries(),
@@ -739,6 +762,18 @@ impl NucleusConfig {
                 parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_CURSORS_PER_SESSION", &v)
         {
             self.limits.max_cursors_per_session = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_CURSOR_ROWS")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_CURSOR_ROWS", &v)
+        {
+            self.limits.max_cursor_rows = n;
+        }
+        if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_CURSOR_BYTES")
+            && let Some(n) =
+                parsed_env::<usize>(&mut warnings, "NUCLEUS_LIMITS_MAX_CURSOR_BYTES", &v)
+        {
+            self.limits.max_cursor_bytes = n;
         }
         if let Ok(v) = env::var("NUCLEUS_LIMITS_MAX_LISTEN_CHANNELS_PER_SESSION")
             && let Some(n) = parsed_env::<usize>(
@@ -1006,6 +1041,8 @@ impl NucleusConfig {
                 "limits.max_cursors_per_session",
                 self.limits.max_cursors_per_session,
             ),
+            ("limits.max_cursor_rows", self.limits.max_cursor_rows),
+            ("limits.max_cursor_bytes", self.limits.max_cursor_bytes),
             (
                 "limits.max_listen_channels_per_session",
                 self.limits.max_listen_channels_per_session,
@@ -1924,6 +1961,25 @@ port = 5555
         cfg.limits.max_query_cache_bytes = 1;
         assert_eq!(cfg.validate(), Ok(()));
         assert!(NucleusConfig::from_toml("[limits]\nmax_query_cache_bytes = -1").is_err());
+    }
+
+    #[test]
+    fn cursor_budget_defaults_toml_and_validation() {
+        let limits = LimitsConfig::default();
+        assert_eq!(limits.max_cursor_rows, 1_000_000);
+        assert_eq!(limits.max_cursor_bytes, 64 * 1024 * 1024);
+        let mut cfg =
+            NucleusConfig::from_toml("[limits]\nmax_cursor_rows = 7\nmax_cursor_bytes = 4096")
+                .unwrap();
+        assert_eq!(cfg.limits.max_cursor_rows, 7);
+        assert_eq!(cfg.limits.max_cursor_bytes, 4096);
+        assert_eq!(cfg.validate(), Ok(()));
+        cfg.limits.max_cursor_rows = 0;
+        assert_flags(&cfg, "limits.max_cursor_rows");
+        cfg.limits.max_cursor_rows = 1;
+        cfg.limits.max_cursor_bytes = 0;
+        assert_flags(&cfg, "limits.max_cursor_bytes");
+        assert!(NucleusConfig::from_toml("[limits]\nmax_cursor_rows = -1").is_err());
     }
 
     #[test]

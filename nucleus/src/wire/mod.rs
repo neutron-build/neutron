@@ -20,12 +20,11 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::sink::{Sink, SinkExt};
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use tokio::sync::broadcast;
 
 use pgwire::api::auth::sasl::{
@@ -361,9 +360,6 @@ pub struct NotificationRegistry {
     channels: DashMap<String, broadcast::Sender<PendingNotification>>,
     /// Default broadcast capacity per channel.
     capacity: usize,
-    /// Monotonic process ID counter (one per connection, exposed in
-    /// NotificationResponse as `pid`).
-    next_pid: AtomicI32,
 }
 
 impl NotificationRegistry {
@@ -371,13 +367,7 @@ impl NotificationRegistry {
         Self {
             channels: DashMap::new(),
             capacity,
-            next_pid: AtomicI32::new(1),
         }
-    }
-
-    /// Allocate a unique process ID for a new connection.
-    fn allocate_pid(&self) -> i32 {
-        self.next_pid.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Subscribe to a channel. Returns a receiver for notifications on that channel.
@@ -657,6 +647,20 @@ struct ExtendedQueryCounts {
     portals: usize,
 }
 
+/// The startup `server_version` a client sees in ParameterStatus. It is the same
+/// identity `SHOW server_version` and `version()` report, so a driver that
+/// admits an endpoint from the startup message and one that asks over SQL see
+/// one engine identity (pgwire's own default would advertise `16.6-pgwire-*`).
+fn startup_parameter_provider() -> DefaultServerParameterProvider {
+    // The pgwire struct is non-exhaustive, so it cannot be built with a struct expression.
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        let mut provider = DefaultServerParameterProvider::default();
+        provider.server_version = "16.0 (Nucleus)".to_string();
+        provider
+    }
+}
+
 /// The Nucleus query handler. Implements startup authentication, simple query,
 /// and extended query (prepared statement) processing.
 ///
@@ -769,7 +773,7 @@ impl NucleusHandler {
             catalog_authenticator: None,
             auth_method: AuthMethod::default(),
             scram_auth: None,
-            parameter_provider: DefaultServerParameterProvider::default(),
+            parameter_provider: startup_parameter_provider(),
             query_parser,
             compressor: WireCompressor::new(1024),
             session_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -842,7 +846,7 @@ impl NucleusHandler {
             catalog_authenticator: None,
             auth_method,
             scram_auth,
-            parameter_provider: DefaultServerParameterProvider::default(),
+            parameter_provider: startup_parameter_provider(),
             query_parser,
             compressor: WireCompressor::new(1024),
             session_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -1307,7 +1311,20 @@ impl NucleusHandler {
                                 "canceling statement due to user request".to_owned(),
                             ),
                         ))),
-                        result = fut => result.map_err(exec_error_to_pgwire),
+                        result = fut => {
+                            // A synchronous executor poll may itself signal
+                            // cancellation (including SQL self-cancellation).
+                            // Recheck the shared permit before returning rows.
+                            if self.executor.session_cancel_pending(session_id)
+                                || notify.notified().now_or_never().is_some() {
+                                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_owned(), "57014".to_owned(),
+                                    "canceling statement due to user request".to_owned(),
+                                ))))
+                            } else {
+                                result.map_err(exec_error_to_pgwire)
+                            }
+                        },
                     }
                 }
                 None => fut.await.map_err(exec_error_to_pgwire),
@@ -1759,13 +1776,17 @@ impl StartupHandler for NucleusHandler {
                 // finish_authentication) and register it so a later
                 // CancelRequest on a fresh connection can interrupt this
                 // session's running query.
-                let pid = self.connection_pid(&addr);
+                let (pid, cancel_notify) = self
+                    .executor
+                    .register_session_backend(session_id)
+                    .map_err(exec_error_to_pgwire)?;
+                self.connection_pids.write().insert(addr.clone(), pid);
                 let secret = SecretKey::I32(rand::random::<i32>());
                 client.set_pid_and_secret_key(pid, secret.clone());
                 self.cancel_keys.write().insert(pid, (secret, session_id));
                 self.cancel_notifies
                     .write()
-                    .insert(session_id, Arc::new(tokio::sync::Notify::new()));
+                    .insert(session_id, cancel_notify);
 
                 if !auth_required {
                     finish_authentication(client, &self.parameter_provider).await?;
@@ -2920,13 +2941,12 @@ impl NucleusHandler {
 
     /// Get (or allocate) the process ID assigned to this connection.
     fn connection_pid(&self, peer_addr: &str) -> i32 {
-        if let Some(&pid) = self.connection_pids.read().get(peer_addr) {
+        let mut pids = self.connection_pids.write();
+        if let Some(&pid) = pids.get(peer_addr) {
             return pid;
         }
-        let pid = self.notification_registry.allocate_pid();
-        self.connection_pids
-            .write()
-            .insert(peer_addr.to_string(), pid);
+        let pid = self.executor.allocate_backend_pid().unwrap_or(0);
+        pids.insert(peer_addr.to_string(), pid);
         pid
     }
 
@@ -3647,11 +3667,8 @@ impl CancelHandler for NucleusHandler {
                 // Cooperative flag: long compute loops poll it (rayon filters,
                 // cartesian products) — this is what interrupts CPU-bound work.
                 self.executor.request_session_cancel(session_id);
-                // Notify: wakes the wire-level race for executions parked at
-                // an await point.
-                if let Some(notify) = self.cancel_notifies.read().get(&session_id) {
-                    notify.notify_one();
-                }
+                // The shared executor signal also wakes the wire race at await
+                // points. A second notify would leave an extra stale permit.
             }
             None => {
                 tracing::debug!(
@@ -3885,7 +3902,7 @@ fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
         }
         // numeric: NBASE-10000 (ndigits, weight, sign, dscale, digit words).
         // Decoded exactly to a decimal string — no float round-trip.
-        1700 => decode_binary_numeric(bytes).map(DecodedParam::Numeric),
+        1700 => Some(decode_binary_numeric_param(bytes)),
         // interval: i64 μs, i32 days, i32 months → unit literal the interval
         // parser accepts.
         1186 => {
@@ -4021,9 +4038,21 @@ fn decode_binary_array(bytes: &[u8]) -> Option<String> {
     (off == bytes.len()).then(|| format!("{{{}}}", parts.join(",")))
 }
 
+/// Largest scale PostgreSQL's NUMERIC wire format can carry (`dscale` is 14
+/// bits).
+const NUMERIC_WIRE_MAX_DSCALE: usize = 0x3FFF;
+
 /// Decode PostgreSQL's binary NUMERIC wire format into an exact decimal
 /// string. Layout: u16 ndigits, i16 weight (in NBASE-10000 words), u16 sign
-/// (0x0000 +, 0x4000 -, 0xC000 NaN), u16 dscale, then ndigits u16 words.
+/// (0x0000 +, 0x4000 -, 0xC000 NaN, 0xD000 +Infinity, 0xF000 -Infinity), u16
+/// dscale, then ndigits u16 words.
+///
+/// Exact-or-`None`. Refused rather than guessed at: any sign other than
+/// positive or negative (the specials have no decimal text), a digit word of
+/// 10000 or more (it would render as five digits and silently change the
+/// value), a `dscale` past the format's 14 bits, a length that does not match
+/// `ndigits`, and digits present beyond `dscale` that are not zero (cutting
+/// them would round the value). A negative zero decodes as zero.
 fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 8 {
         return None;
@@ -4035,12 +4064,15 @@ fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 8 + ndigits * 2 {
         return None;
     }
-    if sign == 0xC000 {
-        return None; // NaN has no SQL literal Nucleus accepts; treat as undecodable
+    if (sign != 0x0000 && sign != 0x4000) || dscale > NUMERIC_WIRE_MAX_DSCALE {
+        return None;
     }
     let digits: Vec<u16> = (0..ndigits)
         .map(|i| u16::from_be_bytes([bytes[8 + i * 2], bytes[9 + i * 2]]))
         .collect();
+    if digits.iter().any(|word| *word >= 10_000) {
+        return None;
+    }
 
     // Integer part: words with index <= weight (each word = 4 decimal digits).
     let mut int_part = String::new();
@@ -4068,18 +4100,48 @@ fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
         frac_part.push_str(&format!("{:04}", digits[idx]));
         idx += 1;
     }
-    // Scale the fraction to dscale exactly (pad or trim trailing digits).
+    // Scale the fraction to dscale exactly: pad with zeros, or trim digits
+    // that are all zero. A nonzero digit past dscale cannot be trimmed without
+    // rounding the value, so the encoding is refused.
     if frac_part.len() < dscale {
         frac_part.push_str(&"0".repeat(dscale - frac_part.len()));
     } else {
+        if frac_part[dscale..].bytes().any(|b| b != b'0') {
+            return None;
+        }
         frac_part.truncate(dscale);
     }
-    let sign_str = if sign == 0x4000 { "-" } else { "" };
+    let is_zero = digits.iter().all(|word| *word == 0);
+    let sign_str = if sign == 0x4000 && !is_zero { "-" } else { "" };
     Some(if frac_part.is_empty() {
         format!("{sign_str}{int_part}")
     } else {
         format!("{sign_str}{int_part}.{frac_part}")
     })
+}
+
+/// A binary NUMERIC parameter as the statement will see it. Always produces a
+/// value, because the generic fallback for an undecodable binary parameter
+/// guesses an integer from its length, and an eight-byte NaN header would
+/// become the integer 3221225472.
+///
+/// An exact value is a number. NaN and the infinities become the text PostgreSQL
+/// spells them with, which the NUMERIC cast refuses by name. Any other encoding
+/// becomes a diagnostic string the NUMERIC cast refuses as invalid input, so a
+/// write fails loudly instead of storing a guess.
+fn decode_binary_numeric_param(bytes: &[u8]) -> DecodedParam {
+    if let Some(text) = decode_binary_numeric(bytes) {
+        return DecodedParam::Numeric(text);
+    }
+    let well_formed = bytes.len() >= 8
+        && bytes.len() == 8 + 2 * usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+    let text = match well_formed.then(|| u16::from_be_bytes([bytes[4], bytes[5]])) {
+        Some(0xC000) => "NaN",
+        Some(0xD000) => "Infinity",
+        Some(0xF000) => "-Infinity",
+        _ => "invalid or unsupported binary numeric encoding",
+    };
+    DecodedParam::Text(text.to_string())
 }
 
 fn decode_pg_param(
@@ -4531,46 +4593,30 @@ fn collect_referenced_tables(
         Statement::Query(q) => {
             if let SetExpr::Select(select) = q.body.as_ref() {
                 for tbl in &select.from {
-                    if let TableFactor::Table { name, .. } = &tbl.relation
-                        && let Some(part) = name.0.last()
-                        && let Some(ident) = part.as_ident()
-                    {
-                        push(&ident.value, out);
+                    if let TableFactor::Table { name, .. } = &tbl.relation {
+                        push(&crate::sql::object_name_key(name), out);
                     }
                     for join in &tbl.joins {
-                        if let TableFactor::Table { name, .. } = &join.relation
-                            && let Some(part) = name.0.last()
-                            && let Some(ident) = part.as_ident()
-                        {
-                            push(&ident.value, out);
+                        if let TableFactor::Table { name, .. } = &join.relation {
+                            push(&crate::sql::object_name_key(name), out);
                         }
                     }
                 }
             }
         }
         Statement::Insert(insert) => {
-            if let sqlparser::ast::TableObject::TableName(name) = &insert.table
-                && let Some(part) = name.0.last()
-                && let Some(ident) = part.as_ident()
-            {
-                push(&ident.value, out);
+            if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
+                push(&crate::sql::object_name_key(name), out);
             }
         }
         Statement::Update(update) => {
-            if let TableFactor::Table { name, .. } = &update.table.relation
-                && let Some(part) = name.0.last()
-                && let Some(ident) = part.as_ident()
-            {
-                push(&ident.value, out);
+            if let TableFactor::Table { name, .. } = &update.table.relation {
+                push(&crate::sql::object_name_key(name), out);
             }
         }
         Statement::Delete(d) => {
             for tbl in &d.tables {
-                if let Some(part) = tbl.0.last()
-                    && let Some(ident) = part.as_ident()
-                {
-                    push(&ident.value, out);
-                }
+                push(&crate::sql::object_name_key(tbl), out);
             }
             let from = match &d.from {
                 sqlparser::ast::FromTable::WithFromKeyword(f)
@@ -4578,11 +4624,8 @@ fn collect_referenced_tables(
             };
             {
                 for t in from {
-                    if let TableFactor::Table { name, .. } = &t.relation
-                        && let Some(part) = name.0.last()
-                        && let Some(ident) = part.as_ident()
-                    {
-                        push(&ident.value, out);
+                    if let TableFactor::Table { name, .. } = &t.relation {
+                        push(&crate::sql::object_name_key(name), out);
                     }
                 }
             }
@@ -4782,6 +4825,7 @@ fn walk_expr_for_params(
             // mirrors the executor's scalar_fns signatures.
             let fname = func.name.to_string().to_uppercase();
             let sig: &[Type] = match fname.as_str() {
+                "PG_CANCEL_BACKEND" => &[Type::INT4],
                 "FTS_SEARCH" => &[Type::TEXT, Type::INT8],
                 "FTS_FUZZY_SEARCH" => &[Type::TEXT, Type::INT8, Type::INT8],
                 "FTS_SEARCH_FILTER" => &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT],
@@ -5279,7 +5323,7 @@ fn data_type_to_pg(dt: &DataType) -> Type {
         DataType::Int32 => Type::INT4,
         DataType::Int64 => Type::INT8,
         DataType::Float64 => Type::FLOAT8,
-        DataType::Text => Type::VARCHAR,
+        DataType::Text => Type::TEXT,
         DataType::Jsonb => Type::JSONB,
         DataType::Date => Type::DATE,
         DataType::Timestamp => Type::TIMESTAMP,
@@ -5334,6 +5378,27 @@ fn encode_value_typed(
         }
         (Value::Int32(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
         (Value::Int64(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
+        // A statically inferred float8 or NUMERIC description that disagrees
+        // with the value's own type (a CASE with a decimal literal on one
+        // branch and a NUMERIC column on the other). A binary column is decoded
+        // by the advertised type, so NUMERIC words under a float8 description,
+        // or eight float bytes under a NUMERIC one, would be read as garbage.
+        // Text needs no repair: both spellings are valid text for either type.
+        (Value::Numeric(s), DataType::Float64) if matches!(fmt, FieldFormat::Binary) => {
+            return match s.parse::<f64>() {
+                Ok(n) => encoder.encode_field(&Some(n)),
+                Err(error) => Err(PgWireError::ApiError(error.to_string().into())),
+            };
+        }
+        (Value::Float64(n), DataType::Numeric) if matches!(fmt, FieldFormat::Binary) => {
+            return match Value::Float64(*n).cast(&DataType::Numeric) {
+                Ok(Value::Numeric(text)) => encode_numeric_binary(encoder, &text),
+                Ok(_) => Err(PgWireError::ApiError(
+                    "float8 to numeric conversion lost the numeric type".into(),
+                )),
+                Err(error) => Err(PgWireError::ApiError(error.into())),
+            };
+        }
         // Arrays carry the element type's own text/binary form under the
         // advertised array type OID.
         (Value::Array(vals), DataType::Array(element)) => {
@@ -5460,13 +5525,12 @@ fn encode_value(
         // BINARY-format NUMERIC must carry the NBASE-10000 wire encoding —
         // pgjdbc switches result transfer to binary once a statement is
         // server-prepared and rejects text bytes under a binary column.
+        //
+        // Built by `numeric_binary`, the same encoder arrays and COPY use. The
+        // `rust_decimal` encoding this replaced dropped the display scale of a
+        // zero (`0.00` was sent with dscale 0) and sent a one-word zero.
         Value::Numeric(s) if matches!(fmt, FieldFormat::Binary) => {
-            match rust_decimal::Decimal::from_str_exact(s) {
-                Ok(d) => encoder.encode_field(&Some(d)),
-                Err(_) => Err(PgWireError::ApiError(
-                    format!("numeric value not binary-encodable: {s}").into(),
-                )),
-            }
+            encode_numeric_binary(encoder, s)
         }
         // BINARY-format UUID is the 16 raw bytes (the &[u8] impl writes raw).
         Value::Uuid(b) if matches!(fmt, FieldFormat::Binary) => {
@@ -5480,6 +5544,18 @@ fn encode_value(
         | Value::Vector(_)
         | Value::Interval { .. } => encoder.encode_field(&Some(value.to_string().as_str())),
     }
+}
+
+/// A NUMERIC in its binary wire form (NBASE-10000 words), keeping the written
+/// scale. The payload is raw bytes, so it goes out as a binary field.
+fn encode_numeric_binary(encoder: &mut DataRowEncoder, text: &str) -> PgWireResult<()> {
+    let bytes = numeric_binary(text).map_err(|error| PgWireError::ApiError(error.into()))?;
+    encoder.encode_field_with_type_and_format(
+        &Some(bytes.as_slice()),
+        &Type::BYTEA,
+        FieldFormat::Binary,
+        &pgwire::types::format::FormatOptions::default(),
+    )
 }
 
 /// 2000-01-01T00:00:00 — the PostgreSQL timestamp epoch Nucleus stores
@@ -6141,6 +6217,136 @@ mod tests {
     #![allow(clippy::approx_constant)]
     use super::*;
 
+    /// PostgreSQL binary NUMERIC bytes: ndigits, weight, sign, dscale, words.
+    fn numeric_wire(weight: i16, sign: u16, dscale: u16, words: &[u16]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(words.len() as u16).to_be_bytes());
+        out.extend_from_slice(&weight.to_be_bytes());
+        out.extend_from_slice(&sign.to_be_bytes());
+        out.extend_from_slice(&dscale.to_be_bytes());
+        for word in words {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// NaN and the infinities have no decimal text. They must neither decode
+    /// as a number nor fall through to the integer-by-length guess (an
+    /// eight-byte NaN header is the integer 3221225472); they become the text
+    /// PostgreSQL spells them with, which the NUMERIC cast refuses by name.
+    #[test]
+    fn binary_numeric_specials_are_refused_not_guessed() {
+        for (sign, spelled) in [
+            (0xC000u16, "NaN"),
+            (0xD000, "Infinity"),
+            (0xF000, "-Infinity"),
+        ] {
+            let bytes = numeric_wire(0, sign, 0, &[]);
+            assert_eq!(decode_binary_numeric(&bytes), None, "sign {sign:#x}");
+            match decode_binary_param_typed(1700, &bytes) {
+                Some(DecodedParam::Text(text)) => assert_eq!(text, spelled),
+                other => panic!("sign {sign:#x}: expected the special's text, got {other:?}"),
+            }
+            let refused = Value::Text(spelled.into())
+                .cast(&crate::types::DataType::Numeric)
+                .unwrap_err();
+            assert!(
+                refused.contains("numeric NaN and Infinity are not supported"),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Malformed binary NUMERIC is refused as invalid input, never stored as
+    /// a different number: an unknown sign (decoded as positive before), a
+    /// digit word that does not fit base 10000 (rendered as five digits), a
+    /// length that disagrees with ndigits, and digits past dscale that cutting
+    /// would round.
+    #[test]
+    fn malformed_binary_numeric_is_refused() {
+        let malformed = [
+            numeric_wire(0, 0x1234, 0, &[1]),
+            numeric_wire(0, 0, 0, &[10_000]),
+            numeric_wire(0, 0, 0x4000, &[1]),
+            numeric_wire(0, 0, 2, &[1, 2345]),
+            {
+                let mut short = numeric_wire(0, 0, 0, &[1, 2]);
+                short.pop();
+                short
+            },
+            vec![0, 1, 2],
+        ];
+        for bytes in &malformed {
+            assert_eq!(decode_binary_numeric(bytes), None, "{bytes:?}");
+            match decode_binary_param_typed(1700, bytes) {
+                Some(DecodedParam::Text(text)) => {
+                    let refused = Value::Text(text)
+                        .cast(&crate::types::DataType::Numeric)
+                        .unwrap_err();
+                    assert!(
+                        refused.contains("invalid input syntax for type numeric"),
+                        "{refused}"
+                    );
+                }
+                other => panic!("{bytes:?}: expected a refusal text, got {other:?}"),
+            }
+        }
+        // Controls: the same shapes that are well formed decode exactly, and
+        // digits past dscale that are all zero are not a rounding.
+        assert_eq!(
+            decode_binary_numeric(&numeric_wire(0, 0, 2, &[1, 2300])).as_deref(),
+            Some("1.23")
+        );
+        assert_eq!(
+            decode_binary_numeric(&numeric_wire(0, 0x4000, 4, &[1, 2345])).as_deref(),
+            Some("-1.2345")
+        );
+        // A negative zero has no sign.
+        assert_eq!(
+            decode_binary_numeric(&numeric_wire(0, 0x4000, 3, &[])).as_deref(),
+            Some("0.000")
+        );
+    }
+
+    #[test]
+    fn numeric_binary_cast_roundtrip_preserves_display_scale() {
+        for written in [
+            "1.500",
+            "0.000",
+            "-12.3400",
+            "0.1234567890123456789012345678",
+        ] {
+            let encoded = numeric_binary(written).unwrap();
+            let decoded = decode_binary_numeric(&encoded).unwrap();
+            let stored = Value::Text(decoded)
+                .cast(&crate::types::DataType::Numeric)
+                .unwrap();
+            let Value::Numeric(stored) = stored else {
+                panic!("lost numeric physical type")
+            };
+            assert_eq!(stored, written);
+            assert_eq!(numeric_binary(&stored).unwrap(), encoded);
+        }
+    }
+
+    /// A zero keeps its display scale on the wire: PostgreSQL sends ndigits 0
+    /// with dscale 2 for `0.00`. The `rust_decimal` encoding that binary
+    /// result columns used sent a one-word zero with dscale 0. A value with a
+    /// declared NUMERIC(p, s) applied round-trips through the same encoder
+    /// unchanged.
+    #[test]
+    fn numeric_binary_zero_keeps_its_display_scale() {
+        let encoded = numeric_binary("0.00").unwrap();
+        assert_eq!(encoded, numeric_wire(0, 0, 2, &[]));
+        assert_eq!(decode_binary_numeric(&encoded).as_deref(), Some("0.00"));
+        let typmod = crate::types::NumericTypmod::new(10, 2).unwrap();
+        for written in ["1.5", "-1.005", "0.004", "99999999.99"] {
+            let stored = typmod.apply(written).unwrap();
+            let decoded = decode_binary_numeric(&numeric_binary(&stored).unwrap()).unwrap();
+            assert_eq!(decoded, stored, "{written}");
+        }
+    }
+
     // ── Binary-parameter typed decoding (corruption-class regression) ──
 
     // ── statement_timeout parsing (M11: query-time limit) ──
@@ -6698,6 +6904,52 @@ mod tests {
         assert_eq!(types[2], Type::TEXT);
     }
 
+    #[test]
+    fn startup_server_version_is_the_sql_reported_identity() {
+        assert_eq!(
+            startup_parameter_provider().server_version,
+            "16.0 (Nucleus)"
+        );
+    }
+
+    #[tokio::test]
+    async fn infer_types_resolve_schema_qualified_tables() {
+        // A table in a user schema is keyed `schema.table`; looking it up by its
+        // bare name left every parameter untyped (TEXT), which a typed client
+        // cannot encode a jsonb or timestamptz value against.
+        let executor = make_executor();
+        executor.execute("CREATE SCHEMA s1").await.unwrap();
+        executor
+            .execute(
+                "CREATE TABLE s1.docs (id BIGINT PRIMARY KEY, active BOOLEAN NOT NULL, \
+                 title TEXT NOT NULL, data JSONB, n INTEGER)",
+            )
+            .await
+            .unwrap();
+        let sql =
+            r#"INSERT INTO "s1"."docs" (id, active, title, data, n) VALUES ($1, $2, $3, $4, $5)"#;
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .unwrap();
+        let types =
+            NucleusHandler::infer_parameter_types_with_ast(sql, &[], Some(&stmts), Some(&executor));
+        assert_eq!(
+            types,
+            vec![Type::INT8, Type::BOOL, Type::TEXT, Type::JSONB, Type::INT4]
+        );
+        let update = r#"UPDATE "s1"."docs" SET data = $1 WHERE id = $2"#;
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, update)
+                .unwrap();
+        let types = NucleusHandler::infer_parameter_types_with_ast(
+            update,
+            &[],
+            Some(&stmts),
+            Some(&executor),
+        );
+        assert_eq!(types, vec![Type::JSONB, Type::INT8]);
+    }
+
     // ── NucleusQueryParser tests ───────────────────────────────────────
 
     #[test]
@@ -6798,7 +7050,7 @@ mod tests {
     fn pg_type_roundtrip_text() {
         let dt = DataType::Text;
         let pg = data_type_to_pg(&dt);
-        assert_eq!(pg, Type::VARCHAR);
+        assert_eq!(pg, Type::TEXT);
         assert_eq!(pg_type_to_data_type(&pg), DataType::Text);
     }
 
@@ -7012,7 +7264,7 @@ mod tests {
         // Verify that core types map correctly
         assert_eq!(data_type_to_pg(&DataType::Int32), Type::INT4);
         assert_eq!(data_type_to_pg(&DataType::Int64), Type::INT8);
-        assert_eq!(data_type_to_pg(&DataType::Text), Type::VARCHAR);
+        assert_eq!(data_type_to_pg(&DataType::Text), Type::TEXT);
         assert_eq!(data_type_to_pg(&DataType::Bool), Type::BOOL);
         assert_eq!(data_type_to_pg(&DataType::Float64), Type::FLOAT8);
     }
@@ -7422,16 +7674,6 @@ mod security_tests {
     // ── Notification Registry tests ─────────────────────────────────
 
     #[test]
-    fn notification_registry_allocate_pid() {
-        let registry = NotificationRegistry::new(16);
-        let pid1 = registry.allocate_pid();
-        let pid2 = registry.allocate_pid();
-        assert_ne!(pid1, pid2);
-        assert!(pid1 > 0);
-        assert!(pid2 > 0);
-    }
-
-    #[test]
     fn notification_registry_listen_and_notify() {
         let registry = NotificationRegistry::new(16);
         let mut rx = registry.listen("test_channel");
@@ -7600,6 +7842,41 @@ mod security_tests {
             got.push(n.payload);
         }
         assert_eq!(got, vec!["m4", "m5", "m6", "m7"]);
+    }
+
+    #[tokio::test]
+    async fn backend_cancel_wakes_wait_and_fences_single_poll_completion() {
+        let executor = make_executor();
+        let handler = NucleusHandler::new(executor.clone());
+        let id = executor.create_session();
+        let (_, notify) = executor.register_session_backend(id).unwrap();
+        handler.cancel_notifies.write().insert(id, notify);
+        executor.request_session_cancel(id);
+        let blocked = handler
+            .run_with_session_limits(id, std::future::pending())
+            .await;
+        assert!(
+            blocked.is_err(),
+            "shared signal must interrupt a pending executor future"
+        );
+        executor.clear_session_cancel(id);
+        let completed = handler
+            .run_with_session_limits(id, async {
+                executor.request_session_cancel(id);
+                Ok(Vec::new())
+            })
+            .await;
+        assert!(
+            completed.is_err(),
+            "cancel during the winning execution poll must fence rows"
+        );
+        executor.clear_session_cancel(id);
+        assert!(
+            handler
+                .run_with_session_limits(id, async { Ok(Vec::new()) })
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -8379,7 +8656,7 @@ mod security_tests {
         let fields = describe_static_fields("SELECT DOC_INSERT($1)", None).unwrap();
         assert_eq!(*fields[0].datatype(), Type::INT8);
         let fields = describe_static_fields("SELECT STREAM_XADD($1, $2, $3)", None).unwrap();
-        assert_eq!(*fields[0].datatype(), Type::VARCHAR);
+        assert_eq!(*fields[0].datatype(), Type::TEXT);
         let fields = describe_static_fields("SELECT KV_CDEL($1, $2) AS released", None).unwrap();
         assert_eq!(fields[0].name(), "released");
         assert_eq!(*fields[0].datatype(), Type::BOOL);
@@ -8729,7 +9006,20 @@ mod security_tests {
             "first append id must be <ms>-0, got {id}"
         );
 
-        // 2 + 3. Each failing statement: ONE error naming entry <ms>-0.
+        // 2 + 3. Each failing statement: ONE error naming the entry id that
+        // evaluation actually attempted. For SIMPLE (the second append to
+        // stream 'once'), once-ness is proven by ORDER, not by the literal
+        // seq: the attempted id must be the immediate successor of OK1's id.
+        // A literal `-0` requirement false-fails when both appends land in
+        // the same millisecond (OK1 `<ms>-0`, successor `<ms>-1`); a
+        // swallowed-and-rerun evaluation instead consumes TWO ids, so its
+        // error names the successor of the successor — which this still
+        // catches. EXTENDED appends to a fresh stream, so its first
+        // attempted id is always `<ms>-0`.
+        let (ok1_ms, ok1_seq) = id
+            .rsplit_once('-')
+            .and_then(|(ms, seq)| Some((ms.to_string(), seq.parse::<u64>().ok()?)))
+            .unwrap_or_else(|| panic!("unparseable OK1 id: {id}"));
         for marker in ["SIMPLE ", "EXTENDED "] {
             let line = stdout
                 .lines()
@@ -8746,10 +9036,24 @@ mod security_tests {
                 .nth(1)
                 .and_then(|s| s.split(" for stream").next())
                 .unwrap_or_else(|| panic!("no entry id in error: {msg}"));
-            assert!(
-                entry_id.ends_with("-0"),
-                "{marker}error names {entry_id} — a -1 suffix means an earlier \
-                 evaluation's error was swallowed and the statement re-run: {msg}"
+            let (ms, seq) = entry_id
+                .rsplit_once('-')
+                .and_then(|(ms, seq)| Some((ms.to_string(), seq.parse::<u64>().ok()?)))
+                .unwrap_or_else(|| panic!("unparseable entry id in error: {msg}"));
+            let expected: (String, u64) = if marker.trim() == "SIMPLE" && ms == ok1_ms {
+                // Same millisecond as OK1: the next seq in that millisecond.
+                (ok1_ms.clone(), ok1_seq + 1)
+            } else {
+                // Later millisecond, or EXTENDED on a fresh stream: seq 0.
+                (ms.clone(), 0)
+            };
+            assert_eq!(
+                (ms, seq),
+                expected,
+                "{marker}error names {entry_id} — the statement must consume \
+                 exactly one entry id after OK1's {id}; two ids mean an \
+                 earlier evaluation's error was swallowed and the statement \
+                 re-run: {msg}"
             );
         }
 

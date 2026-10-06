@@ -1,0 +1,8 @@
+{
+  "format": "native-python-driver-spike",
+  "version": 1,
+  "runtime_compliance": "unverified-until-run",
+  "drivers": [{"driver":"psycopg","mode":"sync"},{"driver":"psycopg","mode":"async"},{"driver":"asyncpg","mode":"async"}],
+  "cases": ["scalar-read-fidelity", "native-query-cancel", "same-connection-reuse", "persisted-state-after-cancel"],
+  "excluded": ["connection pool exhaustion/acquisition cancellation", "write binding fidelity", "Neutron compatibility adapter", "full type codecs", "performance", "ORM sessions"]
+}

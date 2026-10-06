@@ -1,0 +1,27 @@
+{
+  "format": "neutron-execution-cases",
+  "version": 1,
+  "status": "normative-proposed-runtime-compliance-unverified",
+  "cases": {
+    "postgres-direct": {
+      "interactive_tx": true,
+      "session_state": true,
+      "migration_session_lock": true
+    },
+    "postgres-session-pool": {
+      "interactive_tx": "requires-certification",
+      "session_state": "requires-certification",
+      "migration_session_lock": "requires-certification"
+    },
+    "postgres-transaction-pool": {
+      "interactive_tx": "requires-certification",
+      "session_state": false,
+      "migration_session_lock": false
+    },
+    "stateless-provider": {
+      "interactive_tx": "explicit-provider-capability",
+      "session_state": false,
+      "migration_session_lock": false
+    }
+  }
+}

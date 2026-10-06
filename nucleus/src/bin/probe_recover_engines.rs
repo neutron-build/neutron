@@ -1061,6 +1061,71 @@ fn run_vector(
     }
 }
 
+/// A refusal can occur at open or at the poisoned authority surface. The
+/// invariant is refusal AND untouched corrupt bytes; early fail-closed startup
+/// is never itself a divergence. A perturbed model expects unsafe acceptance.
+fn observe_catalog_refusal(
+    sec: &mut Sections,
+    perturb: bool,
+    arm: &str,
+    refused: bool,
+    path: &std::path::Path,
+    corrupt: &[u8],
+) {
+    let untouched = std::fs::read(path).is_ok_and(|bytes| bytes == corrupt);
+    if perturb {
+        if refused && untouched {
+            sec.push("catalog", format!("{arm}: correctly refused without rewriting corrupt state (perturbed model expects unsafe acceptance/reset)"));
+        }
+    } else if !refused || !untouched {
+        sec.push("catalog", format!("{arm}: corrupt state was not safely refused: refused={refused}, untouched={untouched}"));
+    }
+}
+
+fn probe_healthy_metadata_reopen(dir: &std::path::Path, sec: &mut Sections) {
+    let result = (|| -> Result<(), String> {
+        let db = Database::durable_mvcc(dir).map_err(|e| format!("{e:?}"))?;
+        for statement in [
+            "CREATE TABLE healthy_docs (id INT PRIMARY KEY, owner TEXT)",
+            "INSERT INTO healthy_docs VALUES (1, 'catalog_reader'), (2, 'other')",
+            "CREATE ROLE catalog_reader LOGIN PASSWORD 'probe-only'",
+            "GRANT SELECT ON healthy_docs TO catalog_reader",
+            "CREATE POLICY healthy_policy ON healthy_docs FOR SELECT USING (owner = CURRENT_USER)",
+            "ALTER TABLE healthy_docs ENABLE ROW LEVEL SECURITY",
+            "CREATE VIEW healthy_view AS SELECT id FROM healthy_docs",
+            "CREATE SEQUENCE healthy_seq",
+        ] {
+            db_exec(&db, statement)?;
+        }
+        if db_exec(&db, "SELECT NEXTVAL('healthy_seq')")? != vec![vec!["1".to_string()]] {
+            return Err("unexpected sequence baseline".into());
+        }
+        drop(db);
+        let db = Database::durable_mvcc(dir).map_err(|e| format!("{e:?}"))?;
+        if db_exec(&db, "SELECT NEXTVAL('healthy_seq')")? != vec![vec!["2".to_string()]] {
+            return Err("sequence definition/state disappeared across reopen".into());
+        }
+        if db_exec(&db, "SELECT id FROM healthy_view ORDER BY id")?
+            != vec![vec!["1".to_string()], vec!["2".to_string()]]
+        {
+            return Err("view or committed data disappeared across reopen".into());
+        }
+        // The original write-back defect erased loaded authority on the first
+        // later DDL. Reopen once more after that DDL before checking real RLS.
+        db_exec(&db, "CREATE TABLE healthy_later (id INT)")?;
+        drop(db);
+        let db = Database::durable_mvcc(dir).map_err(|e| format!("{e:?}"))?;
+        db_exec(&db, "SET SESSION AUTHORIZATION catalog_reader")?;
+        if db_exec(&db, "SELECT id FROM healthy_docs ORDER BY id")? != vec![vec!["1".to_string()]] {
+            return Err("role/grant/RLS authority disappeared after reopen and later DDL".into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        sec.push("catalog", format!("healthy metadata control: {error}"));
+    }
+}
+
 /// Class C / NU-163 + NU-165: persisted catalog state that cannot be read
 /// must be refused — never treated as empty state that the next write then
 /// persists over the original.
@@ -1074,6 +1139,7 @@ fn run_catalog_refusal(
     for iter in 0..iterations {
         let tag = format!("catalog_{seed}_{iter}");
         let tmp = TmpDir::new(&tag);
+        probe_healthy_metadata_reopen(&tmp.0.join("healthy"), sec);
 
         // ── sequences.json: corrupt bytes poison NEXTVAL (NU-165) ──
         {
@@ -1109,20 +1175,27 @@ fn run_catalog_refusal(
                 let _ = std::fs::write(&seq_path, bytes);
                 let db = match Database::durable_mvcc(&dir) {
                     Ok(d) => d,
-                    Err(e) => {
-                        if perturb {
-                            // The old bug: reopen succeeded, NEXTVAL silently
-                            // restarted from the catalog default.
-                            continue;
-                        }
-                        sec.push(
-                            "catalog",
-                            format!("seq arm ({variant}): corrupt sequences.json refused the entire open: {e:?}"),
+                    Err(_) => {
+                        observe_catalog_refusal(
+                            sec,
+                            perturb,
+                            &format!("seq arm ({variant}, startup)"),
+                            true,
+                            &seq_path,
+                            bytes,
                         );
                         continue;
                     }
                 };
                 let next = db_exec(&db, "SELECT NEXTVAL('sq')");
+                if !perturb && !std::fs::read(&seq_path).is_ok_and(|current| current == bytes) {
+                    sec.push(
+                        "catalog",
+                        format!(
+                            "seq arm ({variant}): refused sequence surface rewrote corrupt bytes"
+                        ),
+                    );
+                }
                 if perturb {
                     // Model of the bug: expect silent reset to 1. The fixed
                     // engine errors, which is the divergence the control needs.
@@ -1205,35 +1278,16 @@ fn run_catalog_refusal(
                 continue;
             }
             drop(db);
-            let original = std::fs::read(dir.join("catalog.json")).unwrap_or_default();
             let _ = std::fs::write(dir.join("catalog.json"), b"definitely not json");
-            match Database::durable_mvcc(&dir) {
-                Ok(_) => {
-                    if perturb {
-                        // The old bug: corrupt catalog treated as empty, open
-                        // succeeds. The fixed engine refuses.
-                        sec.push("catalog", "cat arm: corrupt catalog.json refused the open (perturbed model expects the bug)".to_string());
-                    } else {
-                        sec.push(
-                            "catalog",
-                            "cat arm: corrupt catalog.json OPENED — the next write persists the \
-                             emptied catalog over the original (NU-163)"
-                                .to_string(),
-                        );
-                    }
-                }
-                Err(_) => {
-                    let after = std::fs::read(dir.join("catalog.json")).unwrap_or_default();
-                    if after != b"definitely not json" && !perturb {
-                        sec.push(
-                            "catalog",
-                            "cat arm: corrupt catalog.json was rewritten during a refused open"
-                                .to_string(),
-                        );
-                    }
-                    let _ = original;
-                }
-            }
+            let refused = Database::durable_mvcc(&dir).is_err();
+            observe_catalog_refusal(
+                sec,
+                perturb,
+                "catalog.json startup",
+                refused,
+                &dir.join("catalog.json"),
+                b"definitely not json",
+            );
         }
 
         // ── meta.json: the policy catalog. Two openers, because there are two
@@ -1266,90 +1320,29 @@ fn run_catalog_refusal(
             let corrupt = b"{ this is not valid json";
             let _ = std::fs::write(&meta_path, corrupt);
 
-            // (a) Server-shaped reopen: DDL must be refused, file untouched.
-            let db = match open_harness(kind, &dir) {
-                Ok(d) => d,
-                Err(e) => {
-                    if !perturb {
-                        sec.push(
-                            "catalog",
-                            format!("meta arm (server): open failed on corrupt meta.json: {e}"),
-                        );
-                    }
-                    continue;
-                }
+            // Both early startup refusal and poisoned write-back refusal are
+            // acceptable. The public embedded opener MUST refuse at startup.
+            let server_refused = match open_harness(kind, &dir) {
+                Err(_) => true,
+                Ok(db) => harness_exec(&db, "CREATE TABLE mdocs2 (id INT)").is_err(),
             };
-            let ddl = harness_exec(&db, "CREATE TABLE mdocs2 (id INT)");
-            let bytes_now = std::fs::read(&meta_path).unwrap_or_default();
-            if perturb {
-                if ddl.is_ok() || bytes_now == corrupt.to_vec() {
-                    // Model of the bug: DDL succeeded and/or the emptied
-                    // catalog was written back.
-                    if ddl.is_ok() {
-                        sec.push("catalog", "meta arm (server): corrupt meta.json refused write-back (perturbed model expects the NU-163 bug)".to_string());
-                    }
-                }
-            } else {
-                match ddl {
-                    Ok(_) => {
-                        sec.push(
-                            "catalog",
-                            "meta arm (server): DDL succeeded against a corrupt meta.json — the \
-                             emptied policy catalog can be persisted over the original (NU-163)"
-                                .to_string(),
-                        );
-                    }
-                    Err(_) => {
-                        if bytes_now != corrupt.to_vec() {
-                            sec.push(
-                                "catalog",
-                                "meta arm (server): meta.json was rewritten despite refusing the DDL".to_string(),
-                            );
-                        }
-                    }
-                }
-            }
-            drop(db);
-
-            // (b) Embedded reopen (`Database::durable_mvcc`): the same policy
-            // catalog, the same corrupt file — but a builder that never loads
-            // meta.json at all. Expectation: still refused / not overwritten.
-            let corrupt2 = b"{ this is not valid json";
-            let _ = std::fs::write(&meta_path, corrupt2);
-            let db = match Database::durable_mvcc(&dir) {
-                Ok(d) => d,
-                Err(e) => {
-                    if !perturb {
-                        sec.push(
-                            "catalog",
-                            format!("meta arm (embedded): open failed on corrupt meta.json: {e:?}"),
-                        );
-                    }
-                    continue;
-                }
-            };
-            let ddl = db_exec(&db, "CREATE TABLE mdocs3 (id INT)");
-            let bytes_now = std::fs::read(&meta_path).unwrap_or_default();
-            if !perturb {
-                match ddl {
-                    Ok(_) if bytes_now != corrupt2.to_vec() => {
-                        sec.push(
-                            "catalog",
-                            "meta arm (embedded): DDL through the embedded API succeeded and \
-                             REWROTE a corrupt meta.json it never read — the write-back NU-163 \
-                             closed for the server, reachable through Database::durable_mvcc"
-                                .to_string(),
-                        );
-                    }
-                    Ok(_) => {
-                        sec.push(
-                            "catalog",
-                            "meta arm (embedded): DDL succeeded against corrupt meta.json through the embedded API".to_string(),
-                        );
-                    }
-                    Err(_) => {}
-                }
-            }
+            observe_catalog_refusal(
+                sec,
+                perturb,
+                "meta arm (server)",
+                server_refused,
+                &meta_path,
+                corrupt,
+            );
+            let embedded_refused = Database::durable_mvcc(&dir).is_err();
+            observe_catalog_refusal(
+                sec,
+                perturb,
+                "meta arm (embedded startup)",
+                embedded_refused,
+                &meta_path,
+                corrupt,
+            );
         }
     }
 }
@@ -1434,6 +1427,18 @@ fn main_impl() {
         }
         i += 1;
     }
+    // A recovery round-trip against an engine with no durable log can only
+    // report TableNotFound after the reopen; that is the harness being
+    // misconfigured, not a finding about the engine, and it must not be
+    // countable as one.
+    if !engine.is_durable() {
+        eprintln!(
+            "--engine {} is not durable (data does not survive reopen); \
+             use a durable engine: buffered-disk, disk, durable-mvcc",
+            engine.name()
+        );
+        std::process::exit(2);
+    }
     std::panic::set_hook(Box::new(|_| {}));
 
     // ── Negative control: prove the S35 sections can discriminate ──
@@ -1460,7 +1465,7 @@ fn main_impl() {
             .filter(|s| **s != section.as_str())
             .map(|s| pert.count(s) as i64 - base.count(s) as i64)
             .sum();
-        if gained > 0 && spilled == 0 {
+        if base.total() == 0 && gained > 0 && spilled == 0 {
             println!(
                 "\nNEGATIVE CONTROL PASSED: perturbing the {section} model added {gained} \
                  divergence(s) to {section} and none to the other sections."
@@ -1648,4 +1653,40 @@ fn run_s35_sections(
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tokio::task::spawn_blocking(main_impl).await.unwrap();
+}
+
+#[cfg(test)]
+mod catalog_model_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_model_requires_refusal_and_unchanged_bytes() {
+        let temp = TmpDir::new(&format!("model_{}", std::process::id()));
+        let path = temp.0.join("catalog.json");
+        let corrupt = b"corrupt";
+        std::fs::write(&path, corrupt).unwrap();
+        let mut clean = Sections::default();
+        observe_catalog_refusal(&mut clean, false, "early startup", true, &path, corrupt);
+        assert_eq!(clean.total(), 0);
+        let mut perturbed = Sections::default();
+        observe_catalog_refusal(&mut perturbed, true, "early startup", true, &path, corrupt);
+        assert_eq!(perturbed.count("catalog"), 1);
+        observe_catalog_refusal(
+            &mut clean,
+            false,
+            "unsafe acceptance",
+            false,
+            &path,
+            corrupt,
+        );
+        assert_eq!(clean.count("catalog"), 1);
+        std::fs::write(&path, b"reset").unwrap();
+        observe_catalog_refusal(&mut clean, false, "unsafe rewrite", true, &path, corrupt);
+        assert_eq!(clean.count("catalog"), 2);
+        observe_catalog_refusal(&mut perturbed, true, "unsafe rewrite", true, &path, corrupt);
+        assert_eq!(perturbed.count("catalog"), 1);
+        std::fs::remove_file(&path).unwrap();
+        observe_catalog_refusal(&mut clean, false, "unsafe removal", true, &path, corrupt);
+        assert_eq!(clean.count("catalog"), 3);
+    }
 }

@@ -236,6 +236,9 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                     DataType::Int32
                 } else if n.parse::<i64>().is_ok() {
                     DataType::Int64
+                } else if n.bytes().all(|b| b.is_ascii_digit()) {
+                    // An integer literal past bigint is NUMERIC.
+                    DataType::Numeric
                 } else if n.parse::<f64>().is_ok() {
                     DataType::Float64
                 } else {
@@ -350,6 +353,17 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                             DataType::Interval
                         }
                         (DataType::Interval, DataType::Interval) => DataType::Interval,
+                        // A decimal literal beside a NUMERIC or integer operand
+                        // is NUMERIC at run time (see `adopt_decimal_literals`),
+                        // so it must be described that way too.
+                        (
+                            DataType::Float64,
+                            DataType::Numeric | DataType::Int32 | DataType::Int64,
+                        ) if decimal_literal_numeric(left).is_some() => DataType::Numeric,
+                        (
+                            DataType::Numeric | DataType::Int32 | DataType::Int64,
+                            DataType::Float64,
+                        ) if decimal_literal_numeric(right).is_some() => DataType::Numeric,
                         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
                         (DataType::Numeric, _) | (_, DataType::Numeric) => DataType::Numeric,
                         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
@@ -1111,11 +1125,39 @@ pub(super) fn sql_replacement_for_value(value: &Value) -> String {
         Value::Text(s) => format!("'{}'", sanitize_sql_text_literal(s)),
         Value::Int32(n) => n.to_string(),
         Value::Int64(n) => n.to_string(),
-        Value::Float64(f) => f.to_string(),
+        // A float stays a float and an exact decimal stays a decimal: a bare `5`
+        // would be an integer and the quoted text a string, so the body would
+        // compute in a different type than the argument had.
+        Value::Float64(f) if f.is_finite() => format!("({f}::double precision)"),
+        Value::Float64(f) if f.is_nan() => "'NaN'::double precision".to_string(),
+        Value::Float64(f) if *f > 0.0 => "'Infinity'::double precision".to_string(),
+        Value::Float64(_) => "'-Infinity'::double precision".to_string(),
+        Value::Numeric(text) => format!("'{}'::numeric", sanitize_sql_text_literal(text)),
         Value::Bool(b) => b.to_string(),
         Value::Null => "NULL".to_string(),
         _ => format!("'{}'", sanitize_sql_text_literal(&value.to_string())),
     }
+}
+
+/// The implicit cast PostgreSQL applies to a function argument or result that
+/// is declared FLOAT or NUMERIC. FLOAT: an integer or exact decimal becomes a
+/// float, so the body computes in FLOAT8. NUMERIC: a float (what a bare decimal
+/// literal evaluates to here) becomes the decimal its shortest text denotes, as
+/// the float8-to-numeric cast does. Any other declared type leaves the value
+/// unchanged.
+pub(super) fn coerce_to_declared_number(value: Value, declared: &DataType) -> Value {
+    let converted = match (declared, &value) {
+        (DataType::Float64, Value::Int32(n)) => Some(Value::Float64(f64::from(*n))),
+        (DataType::Float64, Value::Int64(n)) => Some(Value::Float64(*n as f64)),
+        (DataType::Float64, Value::Numeric(text)) => text.parse::<f64>().ok().map(Value::Float64),
+        (DataType::Numeric, Value::Float64(f)) if f.is_finite() => {
+            crate::types::canonical_numeric(&f.to_string())
+                .ok()
+                .map(Value::Numeric)
+        }
+        _ => None,
+    };
+    converted.unwrap_or(value)
 }
 
 /// Substitute positional (`$1`) and named (`$name`) placeholders in SQL text.
@@ -1148,30 +1190,37 @@ fn checked_numeric_aggregate<'a>(
     let mut sum = rust_decimal::Decimal::ZERO;
     let mut count = 0u64;
     for value in values {
-        match value {
+        let decimal = match value {
             Value::Null => continue,
-            Value::Numeric(raw) => {
-                let decimal = crate::types::parse_numeric(raw).map_err(ExecError::Runtime)?;
-                sum = sum
-                    .checked_add(decimal)
-                    .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
-                count += 1;
+            Value::Numeric(raw) => crate::types::parse_numeric(raw).map_err(ExecError::Runtime)?,
+            // An integer promotes to NUMERIC exactly, as in PostgreSQL.
+            Value::Int32(n) => rust_decimal::Decimal::from(*n),
+            Value::Int64(n) => rust_decimal::Decimal::from(*n),
+            Value::Float64(_) => {
+                return Err(ExecError::Unsupported(format!(
+                    "{func} cannot mix NUMERIC and floating-point values"
+                )));
             }
             _ => {
                 return Err(ExecError::Runtime(
                     "non-NUMERIC value in NUMERIC aggregate".into(),
                 ));
             }
-        }
+        };
+        sum = crate::types::decimal_add_exact(sum, decimal)
+            .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+        count += 1;
     }
     if count == 0 {
         return Ok(Value::Null);
     }
     match func {
-        "SUM" => Ok(Value::Numeric(sum.normalize().to_string())),
+        "SUM" => Ok(Value::Numeric(crate::types::decimal_to_numeric_text(
+            sum.normalize(),
+        ))),
         "AVG" => sum
             .checked_div(rust_decimal::Decimal::from(count))
-            .map(|value| Value::Numeric(value.normalize().to_string()))
+            .map(|value| Value::Numeric(crate::types::decimal_to_numeric_text(value.normalize())))
             .ok_or_else(|| ExecError::Runtime("numeric value out of range".into())),
         _ => Err(ExecError::Unsupported(format!(
             "checked NUMERIC aggregate {func}"
@@ -1195,9 +1244,141 @@ pub(super) fn compute_numeric_aggregate_refs(
     checked_numeric_aggregate(func, rows.iter().filter_map(|row| row.get(col_idx)))
 }
 
+/// NUMERIC with FLOAT8: PostgreSQL has no numeric/float8 operator, it promotes
+/// the NUMERIC operand to float8 and the result is float8. The result here is
+/// a `Value::Float64` for the same reason, so the change of type is visible. A
+/// decimal literal written next to a NUMERIC operand never reaches this: it is
+/// adopted as NUMERIC first (see [`adopt_decimal_literals`]).
+fn eval_numeric_float_arithmetic(
+    left: &Value,
+    op: &ast::BinaryOperator,
+    right: &Value,
+) -> Result<Value, ExecError> {
+    let as_f64 = |value: &Value| -> Result<f64, ExecError> {
+        match value {
+            Value::Float64(f) => Ok(*f),
+            Value::Numeric(raw) => crate::types::parse_numeric(raw)
+                .map_err(ExecError::Runtime)?
+                .to_string()
+                .parse::<f64>()
+                .map_err(|error| ExecError::Runtime(error.to_string())),
+            Value::Int32(n) => Ok(f64::from(*n)),
+            Value::Int64(n) => Ok(*n as f64),
+            _ => Err(ExecError::Runtime(format!(
+                "cannot apply numeric operator {op} to {value:?}"
+            ))),
+        }
+    };
+    let (l, r) = (as_f64(left)?, as_f64(right)?);
+    let result = match op {
+        ast::BinaryOperator::Plus => l + r,
+        ast::BinaryOperator::Minus => l - r,
+        ast::BinaryOperator::Multiply => l * r,
+        ast::BinaryOperator::Divide => {
+            if r == 0.0 {
+                return Err(ExecError::Runtime("division by zero".into()));
+            }
+            l / r
+        }
+        _ => {
+            return Err(ExecError::Unsupported(format!(
+                "operator {op} does not exist for NUMERIC and double precision"
+            )));
+        }
+    };
+    if !result.is_finite() && l.is_finite() && r.is_finite() {
+        return Err(ExecError::Runtime("value out of range: overflow".into()));
+    }
+    Ok(Value::Float64(result))
+}
+
+/// A decimal literal (`1.5`, `2e3`) written next to a NUMERIC or integer
+/// operand is NUMERIC in PostgreSQL, not float8. The evaluators parse every
+/// decimal literal as `Float64`, which would turn `price * 1.1` into inexact
+/// float arithmetic (or a refusal), so the literal is re-read from its digits.
+/// `left_expr`/`right_expr` are the operand expressions, `left`/`right` their
+/// evaluated values. A literal NUMERIC cannot hold exactly (beyond 28
+/// fractional digits or 96 bits) is refused (SQLSTATE 22003) instead of being
+/// compared or combined as a float.
+pub(super) fn adopt_decimal_literals(
+    left_expr: &Expr,
+    right_expr: &Expr,
+    left: &mut Value,
+    right: &mut Value,
+) -> Result<(), ExecError> {
+    let exact_partner =
+        |value: &Value| matches!(value, Value::Numeric(_) | Value::Int32(_) | Value::Int64(_));
+    if matches!(&*left, Value::Float64(_))
+        && exact_partner(&*right)
+        && let Some(literal) = decimal_literal_numeric(left_expr)
+    {
+        *left = literal?;
+    } else if matches!(&*right, Value::Float64(_))
+        && exact_partner(&*left)
+        && let Some(literal) = decimal_literal_numeric(right_expr)
+    {
+        *right = literal?;
+    }
+    Ok(())
+}
+
+/// A number literal that is neither a 32- nor a 64-bit integer. PostgreSQL
+/// types an integer literal past `bigint` as NUMERIC, so it is held exactly (or
+/// refused with 22003 when it exceeds the 96-bit coefficient) instead of
+/// becoming a float that has silently lost its low digits. A decimal literal is
+/// a float8 here unless a NUMERIC operand or column adopts it (see
+/// [`adopt_decimal_literals`]); one that overflows float8 is refused.
+pub(super) fn wide_number_literal(n: &str) -> Result<Value, ExecError> {
+    if n.bytes().all(|b| b.is_ascii_digit()) {
+        return crate::types::canonical_numeric(n)
+            .map(Value::Numeric)
+            .map_err(ExecError::Runtime);
+    }
+    match n.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(Value::Float64(f)),
+        Ok(_) => Err(ExecError::Runtime(format!(
+            "numeric literal '{n}' is out of range for double precision"
+        ))),
+        Err(_) => Err(ExecError::Unsupported(format!("number: {n}"))),
+    }
+}
+
+/// The exact NUMERIC a decimal number literal denotes, `None` when `expr` is
+/// not one. Handles a leading sign and parentheses. A plain integer literal is
+/// not decimal: it already evaluates to an exact integer.
+pub(super) fn decimal_literal_numeric(expr: &Expr) -> Option<Result<Value, ExecError>> {
+    match expr {
+        Expr::Nested(inner) => decimal_literal_numeric(inner),
+        Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr: inner,
+        } => decimal_literal_numeric(inner).map(|literal| {
+            literal.and_then(|value| match value {
+                Value::Numeric(text) => crate::types::numeric_negate_keep_scale(&text)
+                    .map(Value::Numeric)
+                    .map_err(ExecError::Runtime),
+                other => Ok(other),
+            })
+        }),
+        Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr: inner,
+        } => decimal_literal_numeric(inner),
+        Expr::Value(literal) => match &literal.value {
+            ast::Value::Number(text, _) if !text.bytes().all(|b| b.is_ascii_digit()) => Some(
+                crate::types::canonical_numeric(text)
+                    .map(Value::Numeric)
+                    .map_err(ExecError::Runtime),
+            ),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Evaluate arithmetic that has at least one exact NUMERIC operand. Integers
-/// promote losslessly to NUMERIC; mixing NUMERIC with FLOAT8 is rejected so an
-/// exact expression cannot silently cross the f64 precision boundary.
+/// promote losslessly to NUMERIC. NUMERIC with FLOAT8 is float8 arithmetic, as
+/// in PostgreSQL (see [`eval_numeric_float_arithmetic`]).
 pub(super) fn eval_numeric_arithmetic(
     left: &Value,
     op: &ast::BinaryOperator,
@@ -1208,14 +1389,14 @@ pub(super) fn eval_numeric_arithmetic(
     if !matches!(left, Value::Numeric(_)) && !matches!(right, Value::Numeric(_)) {
         return None;
     }
+    if matches!(left, Value::Float64(_)) || matches!(right, Value::Float64(_)) {
+        return Some(eval_numeric_float_arithmetic(left, op, right));
+    }
     let as_decimal = |value: &Value| -> Result<Decimal, ExecError> {
         match value {
             Value::Numeric(raw) => crate::types::parse_numeric(raw).map_err(ExecError::Runtime),
             Value::Int32(value) => Ok(Decimal::from(*value)),
             Value::Int64(value) => Ok(Decimal::from(*value)),
-            Value::Float64(_) => Err(ExecError::Runtime(
-                "cannot mix exact NUMERIC and FLOAT8 without an explicit cast".into(),
-            )),
             _ => Err(ExecError::Runtime(format!(
                 "cannot apply numeric operator {op} to {value:?}"
             ))),
@@ -1225,9 +1406,10 @@ pub(super) fn eval_numeric_arithmetic(
         let left = as_decimal(left)?;
         let right = as_decimal(right)?;
         let value = match op {
-            ast::BinaryOperator::Plus => left.checked_add(right),
-            ast::BinaryOperator::Minus => left.checked_sub(right),
-            ast::BinaryOperator::Multiply => left.checked_mul(right),
+            ast::BinaryOperator::Plus => crate::types::decimal_add_exact(left, right),
+            ast::BinaryOperator::Minus => crate::types::decimal_sub_exact(left, right),
+            ast::BinaryOperator::Multiply => crate::types::decimal_mul_exact(left, right),
+            // The one inexact operation (see `types::numeric_div`).
             ast::BinaryOperator::Divide => {
                 if right.is_zero() {
                     return Err(ExecError::Runtime("division by zero".into()));
@@ -1238,7 +1420,7 @@ pub(super) fn eval_numeric_arithmetic(
                 if right.is_zero() {
                     return Err(ExecError::Runtime("division by zero".into()));
                 }
-                left.checked_rem(right)
+                crate::types::decimal_rem_exact(left, right)
             }
             _ => {
                 return Err(ExecError::Unsupported(format!(
@@ -1247,7 +1429,9 @@ pub(super) fn eval_numeric_arithmetic(
             }
         }
         .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
-        Ok(Value::Numeric(value.normalize().to_string()))
+        Ok(Value::Numeric(crate::types::decimal_to_numeric_text(
+            value.normalize(),
+        )))
     })();
     Some(result)
 }
@@ -1558,6 +1742,17 @@ pub(super) fn compute_aggregate(
     col_idx: Option<usize>,
     rows: &[Row],
 ) -> Result<Value, ExecError> {
+    // A NUMERIC input must never be skipped by the integer/float accumulators
+    // below (their catch-all arm ignores it, so the sum would silently drop
+    // those rows): it takes the exact NUMERIC path whatever the column's
+    // declared metadata says.
+    if matches!(func, "SUM" | "AVG")
+        && rows
+            .iter()
+            .any(|row| matches!(row.get(col_idx.unwrap_or(0)), Some(Value::Numeric(_))))
+    {
+        return compute_numeric_aggregate(func, col_idx.unwrap_or(0), rows);
+    }
     match func {
         // COUNT(*) counts rows; COUNT(col) counts non-NULL values of col.
         "COUNT" => match col_idx {
@@ -1709,6 +1904,17 @@ pub(super) fn compute_aggregate_refs(
     col_idx: Option<usize>,
     rows: &[&Row],
 ) -> Result<Value, ExecError> {
+    // A NUMERIC input must never be skipped by the integer/float accumulators
+    // below (their catch-all arm ignores it, so the sum would silently drop
+    // those rows): it takes the exact NUMERIC path whatever the column's
+    // declared metadata says.
+    if matches!(func, "SUM" | "AVG")
+        && rows
+            .iter()
+            .any(|row| matches!(row.get(col_idx.unwrap_or(0)), Some(Value::Numeric(_))))
+    {
+        return compute_numeric_aggregate_refs(func, col_idx.unwrap_or(0), rows);
+    }
     match func {
         // COUNT(*) counts rows; COUNT(col) counts non-NULL values of col.
         "COUNT" => match col_idx {

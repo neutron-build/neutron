@@ -299,6 +299,7 @@ impl Executor {
         self.sync_lock_timeout(&sess);
         self.metrics.open_transactions.dec();
         drop(txn);
+        sess.close_cursors_at_txn_end(true).await;
 
         // GIN is shared across sessions, so DML deliberately leaves it on the
         // committed image while a transaction is open. Refresh only after the
@@ -484,6 +485,8 @@ impl Executor {
         if was_active {
             self.metrics.open_transactions.dec();
         }
+        drop(txn);
+        sess.close_cursors_at_txn_end(false).await;
 
         Ok(ExecResult::Command {
             tag: "ROLLBACK".into(),
@@ -537,6 +540,7 @@ impl Executor {
         txn.security_savepoints.push(sp);
         sess.guc_savepoint(name);
         sess.savepoint_deferred_fks(name);
+        sess.savepoint_cursors(name);
 
         // Open a cross-model level for this savepoint. Its before-images are
         // captured lazily at the first write after this point, so a savepoint
@@ -579,6 +583,7 @@ impl Executor {
         }
         sess.guc_release_savepoint(name);
         sess.release_deferred_fks_savepoint(name);
+        sess.release_cursors_savepoint(name);
         // Releasing keeps the writes; every level below already recorded them,
         // so the level is simply discarded.
         if let Some(cm) = sess.cross_model.lock().as_mut()
@@ -664,6 +669,14 @@ impl Executor {
         self.recompute_session_context(&sess);
         self.sync_lock_timeout(&sess);
         drop(txn);
+
+        // A cursor declared after the savepoint does not survive rolling back
+        // to it (PostgreSQL closes them, held or not); an older cursor keeps
+        // the position its FETCHes left it at. Taken after the transaction
+        // lock is released, like the cursor close at transaction end.
+        if let Some(mark) = sess.rollback_cursors_savepoint(name) {
+            sess.close_cursors_since(mark).await;
+        }
 
         for (table, original) in &engine_revert {
             self.restore_table_from(table, original).await;

@@ -136,11 +136,13 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<Q08Ctx> {
   const statements = { count: 0 };
   const listeners: Array<(e: SqlEvent) => void> = [];
   let pool: pg.Pool | null = null;
+  let cancellationPool: pg.Pool | undefined;
   let pjs: { end(o?: { timeout?: number }): Promise<void> } | null = null;
   let driver: Driver;
   if (driverKind === "pg") {
     pool = new pg.Pool({ connectionString: url.toString(), max: 4 });
-    driver = wrapPgPool(pool as unknown as PgPoolLike);
+    cancellationPool = new pg.Pool({ connectionString: url.toString(), max: 4 });
+    driver = wrapPgPool(pool as unknown as PgPoolLike, { cancellationPool: cancellationPool as unknown as PgPoolLike });
   } else {
     const postgres = (await import("postgres")) as unknown as { default: (u: string, o?: object) => import("./index.js").PostgresJsClient };
     pjs = postgres.default(url.toString(), { max: 4 });
@@ -194,6 +196,7 @@ async function createCtx(driverKind: "postgres" | "pg"): Promise<Q08Ctx> {
     listeners,
     async close(): Promise<void> {
       await db.close();
+      await cancellationPool?.end();
       if (pool !== null) await pool.end();
       if (pjs !== null) await pjs.end({ timeout: 5 });
       await admin.query(`drop database if exists "${DB_NAME}"`);
@@ -1310,7 +1313,10 @@ for (const driverKind of ["postgres", "pg"] as const) {
       const s2 = tx.select({ k: kv.k }).from(kv).orderBy(desc(kv.k)).stream({ batchSize: 2 });
       const x: string[] = [];
       const y: string[] = [];
-      const [r1, r2] = await Promise.all([s1.next(), s2.next()]);
+      // Each cursor retains its own server position; one native operation
+      // runs at a time on the transaction connection.
+      const r1 = await s1.next();
+      const r2 = await s2.next();
       if (!r1.done) x.push(r1.value.k);
       if (!r2.done) y.push(r2.value.k);
       for await (const row of s1) x.push(row.k);

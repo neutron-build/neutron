@@ -1,13 +1,13 @@
 // Tagged wire values for lossless cells over the Studio HTTP transport.
 //
 // The master codec contract pins this format: bigint, decimal, binary and
-// temporal values cross HTTP as tagged strings so precision survives
+// temporal values and JSON documents cross HTTP as tagged strings so precision survives
 // JSON.parse (an int8 sent as a JSON number would arrive as a rounded
 // double). The backend emits tagged cells for those types (cli/internal/
 // studio, landed with the typed row-identity protocol); plain values pass
 // through unchanged, so connections that send untagged rows keep working.
 
-export type WireTag = 'int8' | 'numeric' | 'date' | 'timestamp' | 'timestamptz' | 'bytea' | 'vector' | 'tsvector'
+export type WireTag = 'int8' | 'numeric' | 'date' | 'timestamp' | 'timestamptz' | 'bytea' | 'vector' | 'tsvector' | 'json' | 'jsonb'
 
 export interface TaggedCell {
   t: WireTag
@@ -21,7 +21,7 @@ export class WireDecodeError extends Error {
   }
 }
 
-const TAGS: readonly WireTag[] = ['int8', 'numeric', 'date', 'timestamp', 'timestamptz', 'bytea', 'vector', 'tsvector']
+const TAGS: readonly WireTag[] = ['int8', 'numeric', 'date', 'timestamp', 'timestamptz', 'bytea', 'vector', 'tsvector', 'json', 'jsonb']
 
 export function isTaggedCell(value: unknown): value is TaggedCell {
   if (typeof value !== 'object' || value === null) return false
@@ -49,6 +49,12 @@ export function decodeCell(value: unknown): unknown {
       }
       return out
     }
+    case 'json':
+    case 'jsonb':
+      // Validate syntax without adopting JS numeric values: the exact text
+      // preserves precision, JSON null and documents resembling wire cells.
+      try { JSON.parse(value.v) } catch { throw new WireDecodeError('invalid JSON wire document') }
+      return value.v
     case 'numeric':
     case 'date':
     case 'timestamp':

@@ -170,6 +170,7 @@ func (s *Server) routes() (*http.ServeMux, error) {
 	mux.HandleFunc("/api/inspect/journey", s.handleInspectJourney)
 	mux.HandleFunc("/api/table", s.handleTable)
 	mux.HandleFunc("/api/table/v2/meta", s.handleTableRowMetaV2)
+	mux.HandleFunc("/api/table/v2/page", s.handleTablePageV2)
 	mux.HandleFunc("/api/table/v2/insert", s.handleTableRowInsertV2)
 	mux.HandleFunc("/api/table/v2/update", s.handleTableRowUpdateV2)
 	mux.HandleFunc("/api/table/v2/delete", s.handleTableRowDeleteV2)

@@ -3,7 +3,7 @@ import { api } from '../../lib/api'
 import {
   FieldRegistry, readSourceRecords, blobTextChunks, autoMap, mappingProblems, importTargets,
   isRequired, encodeRecord, encodeSourceValue, newImportJournal, runImport, resolvePending,
-  retryPending, skipPending, skipFailedRow, markPendingCommitted, sameFile, journalKey,
+  retryPending, skipPending, skipFailedRow, markPendingCommitted, sameFile, journalKey, MAX_SOURCE_FIELDS,
   loadJournal, describeJournal, MAX_BATCH_ROWS,
   type ColumnMapping, type CsvSourceOptions, type ImportFormat, type ImportJournal,
   type ImportValueOptions, type JournalStorage, type SourceField, type SourceRecord,
@@ -30,6 +30,19 @@ export interface ImportDialogProps {
   storage?: JournalStorage
   /** Batch transport; defaults to the Studio API. */
   transport?: Pick<ImportDeps, 'sendBatch' | 'outcome'>
+}
+
+// A disabled fieldset disables descendants except its first legend subtree.
+// Explicitly account for that rule as well as direct disabled controls;
+// lightweight render DOMs do not consistently implement native :disabled.
+function disabledControl(element: HTMLElement): boolean {
+  if (element.hasAttribute('disabled')) return true
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    if (parent.tagName !== 'FIELDSET' || !parent.hasAttribute('disabled')) continue
+    const firstLegend = Array.from(parent.children).find(child => child.tagName === 'LEGEND')
+    if (!firstLegend?.contains(element)) return true
+  }
+  return false
 }
 
 const PREVIEW_RECORDS = 50
@@ -106,9 +119,19 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   const abortRef = useRef<AbortController | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
   const fileRef = useRef<HTMLInputElement | null>(null)
+  const stopRef = useRef<HTMLButtonElement | null>(null)
 
   // Focus the first control on open; the opener restores focus on close.
   useEffect(() => { fileRef.current?.focus() }, [])
+
+  // Starting a batch disables/removes the focused setup control. Keep focus
+  // on the available stop action rather than leaving it on body or a disabled
+  // fieldset descendant while the modal is running.
+  useEffect(() => {
+    if (!running) return
+    const active = document.activeElement as HTMLElement | null
+    if (!active || !dialogRef.current?.contains(active) || disabledControl(active)) stopRef.current?.focus()
+  }, [running])
 
   function save(j: ImportJournal) {
     try {
@@ -349,7 +372,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
     }
     if (e.key !== 'Tab' || !dialogRef.current) return
     const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]'))
+      'button, input, select, textarea, [tabindex="0"]')).filter(element => !disabledControl(element))
     if (focusable.length === 0) return
     const first = focusable[0]
     const last = focusable[focusable.length - 1]
@@ -393,7 +416,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
         )}
 
         <div class={s.row}>
-          <label class={s.label} for={`${titleId}-file`}>Source file (CSV, JSON array or NDJSON)</label>
+          <label class={s.label} for={`${titleId}-file`}>Source file (CSV, JSON array or NDJSON; up to {MAX_SOURCE_FIELDS.toLocaleString()} source fields)</label>
           <input
             id={`${titleId}-file`}
             ref={fileRef}
@@ -629,7 +652,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
             <button class={s.btnPrimary} onClick={() => void run({ ...journal })}>Resume import</button>
           )}
           {scan && !scan.done && !running && <button class={s.btn} onClick={stop}>Stop checking</button>}
-          {running && <button class={s.btn} onClick={stop}>Stop after this batch</button>}
+          {running && <button ref={stopRef} class={s.btn} onClick={stop}>Stop after this batch</button>}
           {!running && <button class={s.btn} onClick={onClose}>Close</button>}
         </div>
       </div>

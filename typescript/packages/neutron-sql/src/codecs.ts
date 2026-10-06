@@ -14,6 +14,7 @@ import type { AnyColumnBuilder, ColumnDataType } from "./schema.js";
 import { ColumnBuilder } from "./schema.js";
 import { aggregate, fragment, projection, type AggregateNode, type ProjectionNode, type QualifiedNode, type ValueNode } from "./ast.js";
 import { formatArrayLiteral, parseArrayLiteral } from "./pg-array.js";
+import { PgArray, formatPgArray, parsePgArray } from "./pg-array-value.js";
 
 export type BigintMode = "bigint" | "string" | "number";
 export type TemporalMode = "string" | "date";
@@ -478,9 +479,19 @@ function decodeArrayElement(column: AnyColumnBuilder, ctx: ColumnContext, text: 
 
 /** Decode an array column value: the array literal text (flat path and JSON
  *  child leaves both acquire `col::text`). */
-export function decodeArrayText(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): Array<unknown> {
+export function decodeArrayText(column: AnyColumnBuilder, ctx: ColumnContext, raw: unknown): Array<unknown> | PgArray<unknown> {
   if (typeof raw !== "string") {
     throw codecError(ctx, `expected the array literal text (col::text acquisition), got ${Array.isArray(raw) ? "a driver-parsed array" : typeof raw}`);
+  }
+  if (column.arrayValueMode === "dimensions") {
+    try {
+      const parsed = parsePgArray(raw);
+      return new PgArray(parsed.dimensions, parsed.elements.map(element => {
+        if (element === null) return null;
+        const value = decodeArrayElement(column, ctx, element);
+        return value === null && (column.dataType === "json" || column.dataType === "jsonb") ? jsonNull : value;
+      }));
+    } catch (error) { throw codecError(ctx, error instanceof Error ? error.message : "invalid dimensioned array"); }
   }
   let elements: Array<string | null>;
   try {
@@ -531,22 +542,24 @@ function arrayElementText(column: AnyColumnBuilder, encoded: EncodedValue): stri
 }
 
 function encodeArrayValue(column: AnyColumnBuilder, ctx: ColumnContext, value: unknown): EncodedValue {
-  if (!Array.isArray(value)) throw codecError(ctx, `array columns accept arrays, got ${describeValue(value)}`);
+  const dimensioned = column.arrayValueMode === "dimensions";
+  if (dimensioned ? !(value instanceof PgArray) : !Array.isArray(value)) throw codecError(ctx, dimensioned ? "nativeArray columns require PgArray" : `array columns accept arrays, got ${describeValue(value)}`);
+  const elements: readonly unknown[] = value instanceof PgArray ? value.elements : value as unknown[];
   const scalar = scalarElementColumn(column);
   const texts: Array<string | null> = [];
-  value.forEach((element: unknown, i) => {
+  elements.forEach((element: unknown, i) => {
     if (element === null) {
       texts.push(null);
       return;
     }
-    if (Array.isArray(element)) {
+    if (Array.isArray(element) && !(dimensioned && (column.dataType === "json" || column.dataType === "jsonb"))) {
       throw codecError(ctx, `element ${i} is an array — the column is declared as a one-dimensional array`);
     }
     if (element === undefined) throw codecError(ctx, `element ${i} is undefined (use null for SQL NULL elements)`);
     const enc = encodeWriteValue(scalar, { ...ctx, propertyKey: `${ctx.propertyKey}[${i}]` }, element);
     texts.push(arrayElementText(column, enc));
   });
-  return { bind: formatArrayLiteral(texts), cast: arrayCastOf(column) };
+  return { bind: value instanceof PgArray ? formatPgArray(new PgArray(value.dimensions, texts)) : formatArrayLiteral(texts), cast: arrayCastOf(column) };
 }
 
 /** A scalar stand-in for an array column's element (same type, codec mode
@@ -888,15 +901,14 @@ export interface ColumnCodec {
   readonly dataType: ColumnDataType;
   readonly read: CodecRead;
   readonly textWire: boolean;
+  readonly arrayValueMode?: "dimensions";
   readonly mode?: BigintMode | TemporalMode;
 }
 
 export function codecOf(column: AnyColumnBuilder): ColumnCodec {
   const dt = column.dataType;
   if (column.arrayDimensions !== undefined) {
-    return column.readMode === undefined
-      ? { dataType: dt, read: "array-text", textWire: false }
-      : { dataType: dt, read: "array-text", textWire: false, mode: column.readMode };
+    return { dataType: dt, read: "array-text", textWire: false, ...(column.readMode === undefined ? {} : { mode: column.readMode }), ...(column.arrayValueMode === undefined ? {} : { arrayValueMode: column.arrayValueMode }) };
   }
   switch (dt) {
     case "enum":
@@ -1051,6 +1063,7 @@ export function richCodecSource(column: AnyColumnBuilder | undefined): AnyColumn
  *  its values. */
 export function copyRichCodec(from: AnyColumnBuilder, to: AnyColumnBuilder): void {
   if (from.arrayDimensions !== undefined) to.arrayDimensions = from.arrayDimensions;
+  if (from.arrayValueMode !== undefined) to.arrayValueMode = from.arrayValueMode;
   if (from.enumDef !== undefined) to.enumDef = from.enumDef;
   if (from.customCodec !== undefined) to.customCodec = from.customCodec;
 }

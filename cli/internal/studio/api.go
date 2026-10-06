@@ -272,7 +272,7 @@ type taggedResult struct {
 }
 
 // collectTaggedRows drains a pgx result, converting every cell of a tagged
-// type (int8/numeric/bytea/temporal) to its {t, v} wire form so precision
+// type (int8/numeric/bytea/temporal and JSON documents) to its {t, v} wire form so precision
 // survives JSON. Execution errors surface after iteration (pgx behavior).
 func collectTaggedRows(rows pgx.Rows) (*taggedResult, error) {
 	return collectTaggedRowsCapped(rows, 0)
@@ -300,13 +300,9 @@ func collectTaggedRowsCapped(rows pgx.Rows, max int) (*taggedResult, error) {
 		}
 		// A row that cannot be decoded fails the read loudly; silently
 		// skipping it would show a table with rows missing.
-		vals, err := rows.Values()
+		row, err := collectLosslessRow(rows)
 		if err != nil {
 			return &taggedResult{columns: cols}, err
-		}
-		row := make([]any, len(vals))
-		for i, v := range vals {
-			row[i] = encodeTaggedCell(fds[i].DataTypeOID, v)
 		}
 		data = append(data, row)
 	}

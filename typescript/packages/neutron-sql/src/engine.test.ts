@@ -8,6 +8,7 @@ import {
 } from "./engine.js";
 import {
   NeutronSqlError,
+  QueryCanceledError,
   MissingDriverError,
   ConnectionFailedError,
   ServerSqlError,
@@ -502,4 +503,98 @@ test("R04: the ts-bucketing negative control does not depend on the planner fold
   assert.equal(seen.length, 1);
   assert.match(seen[0], /^select 1\/\(case when .+ then 1 else 0 end\)$/);
   assert.doesNotMatch(seen[0], /1\/0/);
+});
+
+
+test("pg cancellation waits for dispatch before returning its target to the pool", async () => {
+  let finishQuery!: (result: { rows: Record<string, unknown>[]; rowCount: number }) => void;
+  let finishCancel!: (result: { rows: Record<string, unknown>[]; rowCount: number }) => void;
+  let cancelStarted!: () => void;
+  const cancelReady = new Promise<void>(resolve => { cancelStarted = resolve; });
+  let releases = 0;
+  const pool = {
+    query: async () => ({ rows: [], rowCount: 0 }),
+    connect: async () => ({
+      query: (sql: unknown) => typeof sql === "string"
+        ? Promise.resolve({ rows: [{ pid: 123 }], rowCount: 1 })
+        : new Promise<{ rows: Record<string, unknown>[]; rowCount: number }>(resolve => { finishQuery = resolve; }),
+      release: () => { releases++; },
+    }),
+    end: async () => {},
+  };
+  const cancellationPool = {
+    ...pool,
+    connect: async () => ({
+      query: () => new Promise<{ rows: Record<string, unknown>[]; rowCount: number }>(resolve => { finishCancel = resolve; cancelStarted(); }),
+      release: () => {},
+    }),
+  };
+  assert.throws(() => wrapPgPool(pool, { cancellationPool: pool }), /independent/);
+  const driver = wrapPgPool(pool, { cancellationPool });
+  const pending = driver.query("select 1", [], { deadlineMs: 5 });
+  // Keep the test process alive independently of the driver's unref timer.
+  const keepAlive = setTimeout(() => {}, 2000);
+  try {
+    await cancelReady;
+    finishQuery({ rows: [{ ok: 1 }], rowCount: 1 });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(releases, 0, "the target remains pinned after its query finishes while cancel dispatch is pending");
+    finishCancel({ rows: [{ canceled: false }], rowCount: 1 });
+    assert.deepEqual(await pending, [{ ok: 1 }]);
+    assert.equal(releases, 1);
+  } finally { clearTimeout(keepAlive); }
+  await assert.rejects(wrapPgPool(pool).query("select 1", [], { deadlineMs: 5 }), /independent cancellationPool/);
+});
+
+
+test("pg aborted queued checkout settles before acquisition and returns the late client unused", async () => {
+  let checkout!: (client: { query: () => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>; release: () => void }) => void;
+  let ready!: () => void;
+  const queued = new Promise<void>(resolve => { ready = resolve; });
+  let releases = 0;
+  let submissions = 0;
+  const pool = {
+    query: async () => ({ rows: [], rowCount: 0 }),
+    connect: () => new Promise<{ query: () => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>; release: () => void }>(resolve => { checkout = resolve; ready(); }),
+    end: async () => {},
+  };
+  const controller = new AbortController();
+  const pending = wrapPgPool(pool).query("select 1", [], { signal: controller.signal });
+  await queued;
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => error instanceof QueryCanceledError && !error.dispatched);
+  checkout({ query: async () => { submissions++; return { rows: [], rowCount: 0 }; }, release: () => { releases++; } });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(submissions, 0);
+  assert.equal(releases, 1);
+});
+
+
+test("postgres.js armed query reserves its backend through late cancellation dispatch", async () => {
+  type Client = Parameters<typeof wrapPostgresJs>[0];
+  let finishQuery!: (result: Awaited<ReturnType<Client['unsafe']>>) => void;
+  let finishCancel!: () => void;
+  let cancelStarted!: () => void;
+  const ready = new Promise<void>(resolve => { cancelStarted = resolve; });
+  let releases = 0;
+  const query = Object.assign(new Promise<Awaited<ReturnType<Client['unsafe']>>>(resolve => { finishQuery = resolve; }), {
+    cancel: () => new Promise<void>(resolve => { finishCancel = resolve; cancelStarted(); }),
+  });
+  const client: Client = {
+    unsafe: () => { throw Error('armed query must reserve instead of using auto-released pooled executor'); },
+    reserve: async () => ({ unsafe: () => query, release: () => { releases++; } }),
+    end: async () => {},
+    begin: async <T>(fn: (tx: Client) => Promise<T>): Promise<T> => fn(client),
+  };
+  const pending = wrapPostgresJs(client).query('select 1', [], { deadlineMs: 5 });
+  const keepAlive = setTimeout(() => {}, 2000);
+  try {
+    await ready;
+    finishQuery(Object.assign([{ ok: 1 }], { count: 1 }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(releases, 0);
+    finishCancel();
+    assert.deepEqual([...(await pending)], [{ ok: 1 }]);
+    assert.equal(releases, 1);
+  } finally { clearTimeout(keepAlive); }
 });

@@ -1,0 +1,94 @@
+{
+  "format": "schema-coverage-assessment-v1",
+  "status": "source-assessed; item-level live certification pending",
+  "schema_contract": 2,
+  "migration_protocol": 2,
+  "new_schema_version": null,
+  "compatibility_invariants": [
+    "old v2 canonical bytes/hashes/rejection semantics unchanged",
+    "v1 upgrades/refusals unchanged",
+    "migration-v2 IDs/checksum/adoption/namespace/shape unchanged",
+    "unsupported never silently flattened",
+    "query support distinct from schema management"
+  ],
+  "families": [
+    {
+      "id": "qualified-tables",
+      "decision": "representable-v2",
+      "source": "schema-v2.json $defs.identity/table; schema_v2.go",
+      "boundary": "Preserve qualified identity; runtime relational support independently tested"
+    },
+    {
+      "id": "ordinary-views-enums-constraints-indexes",
+      "decision": "representable-v2-subset",
+      "source": "schema-v2.json $defs.view/enumDef/constraint/indexDef",
+      "boundary": "No broad complete object-family management claim"
+    },
+    {
+      "id": "supported-scalars-arrays-vector",
+      "decision": "representable-v2-subset",
+      "source": "schema-v2.json $defs.columnType",
+      "boundary": "Codec and introspection fidelity separate; no array bound/dimension value claim from schema array flag"
+    },
+    {
+      "id": "domains-composites-ranges-multiranges",
+      "decision": "new-version-decision-required",
+      "source": "schema-v2.json columnType.name vocabulary; introspect_v2.go introspectV2ColumnType",
+      "boundary": "Do not flatten identity/base constraints"
+    },
+    {
+      "id": "time-timetz-interval-network-additional-types",
+      "decision": "new-version-decision-required",
+      "source": "schema-v2.json columnType.name vocabulary",
+      "boundary": "Determine needed application types before adding schema format"
+    },
+    {
+      "id": "materialized-views",
+      "decision": "preserve-external-current; management-version-decision-required",
+      "source": "introspect_v2.go rel.kind m branch",
+      "boundary": "Opaque unsupported-object; refresh/index/dependency semantics need explicit future design"
+    },
+    {
+      "id": "partitioned-foreign-inherited-unlogged-tables",
+      "decision": "preserve-external-current; management-version-decision-required",
+      "source": "introspect_v2.go relation classification",
+      "boundary": "Opaque classification; never generate replacement ordinary table"
+    },
+    {
+      "id": "RLS-policies-user-triggers",
+      "decision": "preserve-external-current; management-version-decision-required",
+      "source": "introspect_v2.go ordinary table reasons and view reasons",
+      "boundary": "Entire affected table may become opaque; runtime use is distinct from schema management"
+    },
+    {
+      "id": "extension-owned-objects",
+      "decision": "preserve-external-current",
+      "source": "introspect_v2.go extension classification; schema-v2.json opaqueEntry",
+      "boundary": "No extension-owned DDL from flattened objects"
+    },
+    {
+      "id": "functions-grants-arbitrary-DDL",
+      "decision": "scope-and-representation-audit-required",
+      "source": "schema-v2.json top-level families; MIGRATIONS.md",
+      "boundary": "No native object representation asserted; explicit SQL authority/dependencies/checksum design required"
+    },
+    {
+      "id": "managed-false",
+      "decision": "representable-v2-ownership",
+      "source": "contracts/data/README.md; plan.go PreserveUnmanaged",
+      "boundary": "Descriptive unchecked external state; preserve known dependencies"
+    },
+    {
+      "id": "internal-metadata",
+      "decision": "protected-existing-boundary",
+      "source": "plan.go WithoutInternalMetadata; MIGRATIONS.md",
+      "boundary": "Cannot manage internal tables or foreign keys into protected metadata"
+    }
+  ],
+  "required_identity_audit": [
+    "Builtin-looking type name in non-pg_catalog namespace",
+    "Domain identity distinct from base",
+    "Array element qualified type identity",
+    "Extension ownership and schema dependency closure"
+  ]
+}

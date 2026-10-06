@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact'
 import {
   activeConnection, schema, openTab, toast, toasts, tabs, stagedEdits, clearStaged,
-  failedEditFocus, bindingActive,
+  failedEditFocus, bindingActive, commitStaged, revertLastCommit, tableDataRevision,
 } from '../../lib/store'
 import { _setSessionTokenForTests } from '../../lib/api'
 import type { Schema, SqlTable, QueryResult, TableMeta } from '../../lib/types'
@@ -18,7 +18,11 @@ vi.mock('../../lib/api', async (importOriginal) => {
   return {
     ...orig,
     api: {
+      commitOperations: vi.fn(),
+      operationOutcome: vi.fn(),
+      revertOperation: vi.fn(),
       tableData: vi.fn(),
+      tablePage: vi.fn(),
       tableMeta: vi.fn(),
       tableFKs: vi.fn().mockResolvedValue({ fks: [] }),
     },
@@ -102,6 +106,7 @@ const memoSchema = () => {
 }
 
 beforeEach(() => {
+  tableDataRevision.value = {}
   vi.clearAllMocks()
   _setSessionTokenForTests('test-session-token')
   toasts.value = []
@@ -318,12 +323,17 @@ describe('SQLBrowser versioned identity editing (staged draft flow)', () => {
     // The read returns a tagged int8 cell; the UI decodes it to a bigint
     // (lib/api decodeRows) and re-tags it exactly on the way back.
     const decoded = keyedResult([[[{ t: 'int8', v: '9007199254740993' }], 'hello']], ['9'])
-    // simulate the decode layer (tableData is mocked)
+    // simulate the decode layer (the API boundary is mocked)
     ;(decoded.rows[0] as unknown[])[0] = 9007199254740993n
-    tableData.mockResolvedValue(decoded)
+    vi.mocked(api.tablePage).mockResolvedValue({
+      ...decoded, readOnly: false, hasNext: false, nextCursor: '',
+      consistency: 'live-keyset/request-repeatable-read',
+    })
 
     render(<SQLBrowser schema="public" table="memo" />)
     await waitFor(() => expect(cellAt(0, 'body').textContent).toBe('hello'))
+    expect(api.tablePage).toHaveBeenLastCalledWith('c1', 'public', 'memo', 200, '')
+    expect(tableData).not.toHaveBeenCalled()
 
     fireEvent.dblClick(cellAt(0, 'body'))
     fireEvent.input(editorInput(), { target: { value: 'big' } })
@@ -707,6 +717,24 @@ describe('SQLBrowser S01 binding, read-level state and composite FK follow', () 
     expect(tableData.mock.calls[0][8]).toEqual(match)
   })
 
+  it('column permissions suppress mutation affordances on a structurally writable table', async () => {
+    ordersSchema()
+    const metadata = docsMeta()
+    tableMeta.mockResolvedValue({ ...metadata, canDelete: false,
+      columns: metadata.columns.map(c => ({ ...c, editable: false, insertable: false })) })
+    tableData.mockResolvedValue(ordersResult([[1, 7n, 'o1']]))
+
+    render(<SQLBrowser schema="public" table="orders" />)
+    await waitFor(() => expect(screen.getByText('Read-only')).toBeTruthy())
+    fireEvent.click(screen.getByText('Read-only'))
+    expect(screen.getByRole('note').textContent).toContain('no columns can be edited or inserted')
+    expect(screen.queryByRole('button', { name: '+ Insert' })).toBeNull()
+    expect(screen.queryByText(/double-click a cell/)).toBeNull()
+    fireEvent.dblClick(cellAt(0, 'label'))
+    expect(document.querySelector('select[aria-label$=" value state"]')).toBeNull()
+    expect(stagedEdits.value).toEqual([])
+  })
+
   it('a read-only table read wins even if metadata says editable', async () => {
     ordersSchema()
     tableMeta.mockResolvedValue(docsMeta())
@@ -800,5 +828,55 @@ describe('SQLBrowser editor close is exactly-once (browser event order)', () => 
       await new Promise(r => setTimeout(r, 20))
     }
     expect(stagedEdits.value.map(e => (e.operation as { value?: unknown }).value)).toEqual(['one', 'two'])
+  })
+})
+
+
+describe('authoritative rows after staged commit', () => {
+  it('reloads committed values and new row versions, then reloads after server revert', async () => {
+    tableData.mockResolvedValueOnce(keyedResult([[1, 'Before']], ['101']))
+      .mockResolvedValueOnce(keyedResult([[1, 'Committed']], ['102']))
+      .mockResolvedValueOnce(keyedResult([[1, 'Before']], ['103']))
+    tableMeta.mockResolvedValue(singleKeyMeta({ binding: 'e1:16385' }))
+    vi.mocked(api.commitOperations).mockResolvedValue({ operationId: 'committed-op', rowsAffected: 1 } as never)
+    vi.mocked(api.revertOperation).mockResolvedValue({ operationId: 'reverted-op', rowsAffected: 1, reverted: 1 } as never)
+    render(<SQLBrowser schema="public" table="memo" />)
+    await screen.findByText('Before')
+    const body = document.querySelector('tr[data-row-index="0"] td[data-col-index="1"]')!
+    fireEvent.dblClick(body)
+    fireEvent.input(editorInput(), { target: { value: 'Committed' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+    await commitStaged(activeConnection.value!.id)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(2))
+    await screen.findByText('Committed')
+    expect(screen.queryByText('Before')).toBeNull()
+    // A second edit must use the new server row version, not the old read.
+    fireEvent.dblClick(document.querySelector('tr[data-row-index="0"] td[data-col-index="1"]')!)
+    fireEvent.input(editorInput(), { target: { value: 'Next' } })
+    fireEvent.keyDown(editorInput(), { key: 'Enter' })
+    expect(lastStaged().operation).toMatchObject({ version: '102' })
+    clearStaged()
+    await revertLastCommit(activeConnection.value!.id)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(3))
+    await screen.findByText('Before')
+    expect(screen.queryByText('Committed')).toBeNull()
+  })
+})
+
+
+describe('row reload ordering after commit invalidation', () => {
+  it('cannot let an older in-flight read overwrite the authoritative reload', async () => {
+    let finishOld!: (result: QueryResult) => void
+    tableData.mockImplementationOnce(() => new Promise<QueryResult>(resolve => { finishOld = resolve }))
+      .mockResolvedValueOnce(keyedResult([[1, 'Fresh committed read']], ['202']))
+    tableMeta.mockResolvedValue(singleKeyMeta({}))
+    render(<SQLBrowser schema="public" table="memo" />)
+    await waitFor(() => expect(tableData).toHaveBeenCalledTimes(1))
+    tableDataRevision.value = { c1: 1 }
+    await screen.findByText('Fresh committed read')
+    await act(async () => { finishOld(keyedResult([[1, 'Stale prior read']], ['201'])); await Promise.resolve() })
+    // Let both promise handlers and the rendered component settle.
+    await waitFor(() => expect(screen.queryByText('Fresh committed read')).not.toBeNull())
+    expect(screen.queryByText('Stale prior read')).toBeNull()
   })
 })

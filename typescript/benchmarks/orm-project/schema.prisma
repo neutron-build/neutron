@@ -1,0 +1,28 @@
+generator client {
+  provider = "prisma-client-js"
+  output = "../generated"
+}
+datasource db {
+  provider = "postgresql"
+}
+model Project {
+  tenant String
+  id Int
+  title String
+  documents Document[]
+  @@id([tenant,id])
+  @@map("projects")
+}
+model Document {
+  tenant String
+  id Int
+  projectId Int @map("project_id")
+  version BigInt
+  amount Decimal @db.Decimal(40,18)
+  note String?
+  binary Bytes @map("payload")
+  project Project @relation(fields:[tenant,projectId], references:[tenant,id])
+  @@id([tenant,id])
+  @@index([tenant,projectId,id])
+  @@map("documents")
+}

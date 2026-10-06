@@ -8,8 +8,8 @@
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
       "nucleusVersion": "1.2.2",
-      "nucleusTree": "e8b92af142017f73a918325e40aeb48cac72b5e6",
-      "recorded": "2026-10-04"
+      "nucleusTree": "cba383fd7db094b6d741fee4bcc8f75a28f1ae0f",
+      "recorded": "2026-10-05"
     },
     "current": true,
     "currentNote": "the connected engine reports Nucleus 1.2.2, the measured build; builds are matched by version string only (the nucleus/ tree cannot be read over the connection), so a different tree reporting the same version is treated as measured",
@@ -728,11 +728,11 @@
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
       "nucleusVersion": "1.2.2",
-      "nucleusTree": "e8b92af142017f73a918325e40aeb48cac72b5e6",
-      "recorded": "2026-10-04"
+      "nucleusTree": "cba383fd7db094b6d741fee4bcc8f75a28f1ae0f",
+      "recorded": "2026-10-05"
     },
     "current": false,
-    "currentNote": "limits were measured on Nucleus 1.2.2 (nucleus/ tree e8b92af14201); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
+    "currentNote": "limits were measured on Nucleus 1.2.2 (nucleus/ tree cba383fd7db0); the connected build reports 9.9.9 and has not been measured, so every status below is unknown",
     "models": [
       {
         "model": "sql",
@@ -1448,8 +1448,8 @@
     "measured": {
       "report": "conformance/live/orm/capabilities.nucleus.json",
       "nucleusVersion": "1.2.2",
-      "nucleusTree": "e8b92af142017f73a918325e40aeb48cac72b5e6",
-      "recorded": "2026-10-04"
+      "nucleusTree": "cba383fd7db094b6d741fee4bcc8f75a28f1ae0f",
+      "recorded": "2026-10-05"
     },
     "current": true,
     "live": {

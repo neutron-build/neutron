@@ -15,35 +15,462 @@ pub(crate) use jsonb::compare as compare_jsonb;
 mod timestamptz;
 pub use timestamptz::{format_timestamptz, zone_offset_seconds};
 
+/// Largest decimal exponent accepted in scientific notation. A finite value
+/// that fits the 96-bit coefficient and 28 fractional digits never needs more,
+/// so a larger exponent is refused instead of expanded into a huge string.
+const NUMERIC_MAX_EXPONENT: i64 = 1000;
+
+/// The one message for every text that is valid NUMERIC syntax but cannot be
+/// held exactly: more than 28 fractional digits, or a magnitude past the
+/// 96-bit coefficient. The wire layer classifies it as SQLSTATE 22003.
+fn numeric_ceiling_error(text: &str) -> String {
+    format!(
+        "numeric value '{text}' exceeds NUMERIC precision ceiling: Nucleus stores \
+         NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)"
+    )
+}
+
+/// PostgreSQL's wording for text that is not a number (SQLSTATE 22P02).
+fn numeric_syntax_error(text: &str) -> String {
+    format!("invalid input syntax for type numeric: \"{text}\"")
+}
+
+/// `NaN` and the infinities are valid PostgreSQL numerics the bounded exact
+/// representation cannot hold. Refused by name (SQLSTATE 0A000) so they are
+/// never mistaken for malformed text.
+fn numeric_special_value(trimmed: &str) -> bool {
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    // PostgreSQL never accepts a sign on NaN.
+    trimmed.eq_ignore_ascii_case("nan")
+        || unsigned.eq_ignore_ascii_case("inf")
+        || unsigned.eq_ignore_ascii_case("infinity")
+}
+
+/// A NUMERIC text split into its grammar parts. The grammar is PostgreSQL's
+/// `numeric_in` and nothing wider: an optional sign, ASCII digits with at most
+/// one point (at least one digit overall), and an optional `e`/`E` exponent
+/// with its own optional sign and at least one digit. Underscore separators,
+/// hex and non-ASCII digits are not part of it.
+struct NumericText<'a> {
+    negative: bool,
+    int_digits: &'a str,
+    frac_digits: &'a str,
+    exponent: Option<(bool, &'a str)>,
+}
+
+fn split_numeric_text(text: &str) -> Option<NumericText<'_>> {
+    let (negative, rest) = match *text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    let (int_digits, frac_digits) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(int_digits)
+        || !all_digits(frac_digits)
+        || (int_digits.is_empty() && frac_digits.is_empty())
+    {
+        return None;
+    }
+    let exponent = match exponent {
+        None => None,
+        Some(raw) => {
+            let (exp_negative, digits) = match raw.as_bytes().first() {
+                Some(b'-') => (true, &raw[1..]),
+                Some(b'+') => (false, &raw[1..]),
+                _ => (false, raw),
+            };
+            if digits.is_empty() || !all_digits(digits) {
+                return None;
+            }
+            Some((exp_negative, digits))
+        }
+    };
+    Some(NumericText {
+        negative,
+        int_digits,
+        frac_digits,
+        exponent,
+    })
+}
+
+/// Rewrite `d.ddde±x` as plain positional text by moving the decimal point.
+/// Pure text arithmetic, so no digit is ever rounded: whatever `from_str_exact`
+/// then does with the result is exact-or-refuse. The written fractional scale
+/// follows PostgreSQL (`1.50e1` is `15.0`). `None` when the exponent is past
+/// [`NUMERIC_MAX_EXPONENT`] or does not fit an `i64`.
+fn expand_numeric_exponent(
+    parts: &NumericText<'_>,
+    exp_negative: bool,
+    exp_digits: &str,
+) -> Option<String> {
+    let significant = exp_digits.trim_start_matches('0');
+    let magnitude: i64 = if significant.is_empty() {
+        0
+    } else {
+        significant.parse().ok()?
+    };
+    if magnitude > NUMERIC_MAX_EXPONENT {
+        return None;
+    }
+    let exponent = if exp_negative { -magnitude } else { magnitude };
+    let digits = format!("{}{}", parts.int_digits, parts.frac_digits);
+    let point = parts.int_digits.len() as i64 + exponent;
+    let mut out = String::with_capacity(digits.len() + magnitude as usize + 3);
+    if parts.negative {
+        out.push('-');
+    }
+    if point <= 0 {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', (-point) as usize));
+        out.push_str(&digits);
+    } else if point as usize >= digits.len() {
+        out.push_str(&digits);
+        out.extend(std::iter::repeat_n('0', point as usize - digits.len()));
+    } else {
+        out.push_str(&digits[..point as usize]);
+        out.push('.');
+        out.push_str(&digits[point as usize..]);
+    }
+    Some(out)
+}
+
 /// Parse the bounded exact NUMERIC representation used by Nucleus. The current
 /// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
 /// outside that range reject explicitly instead of degrading to f64.
 ///
-/// This uses `from_str_exact` rather than `from_str` so that a value with more
-/// fractional digits than the 28-place scale ceiling FAILS LOUDLY instead of
-/// being silently rounded (a silent-wrong-result): `from_str` rounds excess
-/// precision away, whereas `from_str_exact` returns `Underflow`. Magnitude that
-/// overflows the 96-bit coefficient is rejected by both.
+/// Exact-or-refuse, in three steps:
+/// - the text must match PostgreSQL's numeric grammar (see [`NumericText`]);
+///   anything else is `invalid input syntax for type numeric` (22P02), and
+///   `NaN`/`Infinity` are refused by name (0A000);
+/// - an exponent is expanded as text, never as arithmetic. The previous
+///   `Decimal::from_scientific` parsed the mantissa with the ROUNDING
+///   `from_str`, so `0.1234...(35 digits)e2` was silently rounded to 28;
+/// - the positional text goes through `from_str_exact`, which returns an error
+///   instead of rounding past 28 fractional digits or the 96-bit coefficient.
+///   Every such failure is [`numeric_ceiling_error`] (22003). A written
+///   trailing zero beyond the 28th fractional digit is refused too: the written
+///   scale cannot be kept.
+///
+/// A negative zero is stored as zero, as PostgreSQL has no `-0` numeric.
 pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
-    let trimmed = value.trim();
-    // Accept scientific notation ('1e3', '1.5E-2') the way PostgreSQL does —
-    // `from_str_exact` rejects it, so fall back to the scientific parser.
-    if trimmed.contains(['e', 'E'])
-        && let Ok(d) = Decimal::from_scientific(trimmed)
-    {
-        return Ok(d);
+    let trimmed =
+        value.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'));
+    if numeric_special_value(trimmed) {
+        return Err(format!(
+            "numeric NaN and Infinity are not supported: '{trimmed}' cannot be held by \
+             Nucleus NUMERIC, a bounded exact decimal"
+        ));
     }
-    Decimal::from_str_exact(trimmed).map_err(|error| match error {
-        rust_decimal::Error::Underflow => format!(
-            "numeric value '{trimmed}' exceeds NUMERIC precision ceiling: Nucleus stores \
-             NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)"
-        ),
-        other => format!("invalid numeric value: {other}"),
-    })
+    let parts = split_numeric_text(trimmed).ok_or_else(|| numeric_syntax_error(value))?;
+    let expanded;
+    let positional: &str = match parts.exponent {
+        None => trimmed,
+        Some((exp_negative, exp_digits)) => {
+            expanded = expand_numeric_exponent(&parts, exp_negative, exp_digits)
+                .ok_or_else(|| numeric_ceiling_error(trimmed))?;
+            &expanded
+        }
+    };
+    let mut decimal =
+        Decimal::from_str_exact(positional).map_err(|_| numeric_ceiling_error(trimmed))?;
+    if decimal.is_zero() {
+        decimal.set_sign_positive(true);
+    }
+    Ok(decimal)
+}
+
+/// `value` as an exact `Decimal` mantissa and scale after stripping trailing
+/// zeros, or `None` when that does not fit 96 bits and 28 fractional digits.
+fn decimal_from_exact(mut mantissa: i128, mut scale: u32) -> Option<Decimal> {
+    while scale > 0 && mantissa % 10 == 0 {
+        mantissa /= 10;
+        scale -= 1;
+    }
+    if scale > Decimal::MAX_SCALE {
+        return None;
+    }
+    Decimal::try_from_i128_with_scale(mantissa, scale).ok()
+}
+
+/// Both operands rescaled to their larger scale as exact `i128` mantissas.
+/// Operands are normalized first so trailing zeros do not cause a false
+/// overflow. `None` only when the aligned mantissa exceeds `i128`.
+fn align_exact(a: Decimal, b: Decimal) -> Option<(i128, i128, u32)> {
+    let (a, b) = (a.normalize(), b.normalize());
+    let scale = a.scale().max(b.scale());
+    let ma = a.mantissa().checked_mul(10i128.pow(scale - a.scale()))?;
+    let mb = b.mantissa().checked_mul(10i128.pow(scale - b.scale()))?;
+    Some((ma, mb, scale))
+}
+
+/// `a + b` that is exact or `None`. `Decimal::checked_add` instead rounds
+/// (banker's) when the sum carries past 96 bits at a nonzero scale, so
+/// `MAX + 0.4` came back as a different, wrong number rather than an error.
+pub(crate) fn decimal_add_exact(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (ma, mb, scale) = align_exact(a, b)?;
+    decimal_from_exact(ma.checked_add(mb)?, scale)
+}
+
+/// `a - b`, exact or `None`. See [`decimal_add_exact`].
+pub(crate) fn decimal_sub_exact(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (ma, mb, scale) = align_exact(a, b)?;
+    decimal_from_exact(ma.checked_sub(mb)?, scale)
+}
+
+/// `a * b`, exact or `None`. `Decimal::checked_mul` rounds a product that
+/// needs more than 28 fractional digits, so `1e-28 * 0.5` silently became
+/// `1e-28`; here it is refused.
+pub(crate) fn decimal_mul_exact(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (a, b) = (a.normalize(), b.normalize());
+    let product = a.mantissa().checked_mul(b.mantissa())?;
+    decimal_from_exact(product, a.scale() + b.scale())
+}
+
+/// `a % b` (the sign follows `a`), exact or `None`; `None` for `b == 0`.
+pub(crate) fn decimal_rem_exact(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (ma, mb, scale) = align_exact(a, b)?;
+    decimal_from_exact(ma.checked_rem(mb)?, scale)
 }
 
 pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
+    // Display scale is part of the persisted/wire representation: 1.500 must
+    // remain 1.500 through a validated cast. Equality ignores that scale, so
+    // hashing below uses a separate normalized comparison key.
+    parse_numeric(value).map(|decimal| decimal.to_string())
+}
+
+fn numeric_comparison_key(value: &str) -> Result<String, String> {
     parse_numeric(value).map(|decimal| decimal.normalize().to_string())
+}
+
+/// `d` as NUMERIC text with its scale kept and no negative zero (PostgreSQL has
+/// none, while `Decimal` keeps the sign of a zero that `ceil`, `trunc`, negation
+/// or rounding produced).
+pub(crate) fn decimal_to_numeric_text(mut d: Decimal) -> String {
+    if d.is_zero() {
+        d.set_sign_positive(true);
+    }
+    d.to_string()
+}
+
+/// `value` negated, keeping its written scale (`-(1.50)` is `-1.50`) and never
+/// producing a negative zero. A refusal is returned for text that is not an
+/// exact NUMERIC.
+pub(crate) fn numeric_negate_keep_scale(value: &str) -> Result<String, String> {
+    let d = parse_numeric(value)?;
+    Ok(decimal_to_numeric_text(-d))
+}
+
+/// A float8 as NUMERIC, the way PostgreSQL's `float8_numeric` does it: the
+/// value is first rendered with 15 significant digits (`DBL_DIG`, `%.15g`), so
+/// `0.1 + 0.2` becomes `0.3` and no digit beyond the 15th is invented. The
+/// shortest round-trip rendering (up to 17 digits) is NOT used: it would store
+/// digits PostgreSQL does not. NaN and the infinities are refused by name, a
+/// magnitude outside the 96-bit / scale-28 range is a precision-ceiling error.
+fn float_to_numeric_text(n: f64) -> Result<String, String> {
+    let rendered = format!("{n:.14e}");
+    let Some((mantissa, exponent)) = rendered.split_once('e') else {
+        // "NaN", "inf", "-inf": parse_numeric refuses these by name.
+        return canonical_numeric(&rendered);
+    };
+    let mantissa = if mantissa.contains('.') {
+        mantissa.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        mantissa
+    };
+    canonical_numeric(&format!("{mantissa}e{exponent}"))
+}
+
+/// Largest precision a declared `NUMERIC(p, s)` may carry (PostgreSQL's limit).
+pub const NUMERIC_MAX_PRECISION: u64 = 1000;
+
+/// Largest declared scale Nucleus can hold: the physical `Decimal` carries at
+/// most 28 fractional digits, so a wider declared scale could never be filled.
+pub const NUMERIC_MAX_SCALE: u32 = 28;
+
+/// Why a `NUMERIC(p, s)` declaration was refused. The two kinds carry different
+/// SQLSTATEs: a value PostgreSQL itself rejects is `invalid_parameter_value`
+/// (22023); a declaration PostgreSQL accepts but Nucleus cannot represent is
+/// `feature_not_supported` (0A000).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumericTypmodError {
+    /// PostgreSQL rejects it too (precision outside 1..=1000, |scale| > 1000).
+    OutOfRange(String),
+    /// Valid in PostgreSQL, not representable here.
+    Unsupported(String),
+}
+
+impl fmt::Display for NumericTypmodError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NumericTypmodError::OutOfRange(message) | NumericTypmodError::Unsupported(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+/// A declared `NUMERIC(precision, scale)` / `DECIMAL(precision, scale)`.
+///
+/// Enforced on every write and on an explicit cast: the value is rounded half
+/// away from zero to `scale`, then refused with SQLSTATE 22003 when the result
+/// needs more than `precision - scale` integer digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumericTypmod {
+    pub precision: u32,
+    pub scale: u32,
+}
+
+impl NumericTypmod {
+    /// Validate a declaration. PostgreSQL 15+ also accepts a negative scale and
+    /// a scale larger than the precision; both are refused here as unsupported
+    /// rather than approximated, as is a scale past the 28 digits `Decimal`
+    /// holds.
+    pub fn new(precision: u64, scale: i64) -> Result<Self, NumericTypmodError> {
+        if !(1..=NUMERIC_MAX_PRECISION).contains(&precision) {
+            return Err(NumericTypmodError::OutOfRange(format!(
+                "NUMERIC precision {precision} must be between 1 and {NUMERIC_MAX_PRECISION}"
+            )));
+        }
+        if !(-1000..=1000).contains(&scale) {
+            return Err(NumericTypmodError::OutOfRange(format!(
+                "NUMERIC scale {scale} must be between -1000 and 1000"
+            )));
+        }
+        if scale < 0 || scale as u64 > precision {
+            return Err(NumericTypmodError::Unsupported(format!(
+                "NUMERIC({precision},{scale}): a negative scale or a scale larger than the \
+                 precision is not supported (Nucleus requires 0 <= scale <= precision)"
+            )));
+        }
+        if scale as u64 > u64::from(NUMERIC_MAX_SCALE) {
+            return Err(NumericTypmodError::Unsupported(format!(
+                "NUMERIC({precision},{scale}): scale exceeds the {NUMERIC_MAX_SCALE} fractional \
+                 digits Nucleus NUMERIC can hold"
+            )));
+        }
+        Ok(Self {
+            precision: precision as u32,
+            scale: scale as u32,
+        })
+    }
+
+    /// PostgreSQL's `atttypmod`: `((precision << 16) | scale) + 4`.
+    pub fn atttypmod(self) -> i32 {
+        (((self.precision << 16) | self.scale) + 4) as i32
+    }
+
+    /// The declaration behind an `atttypmod`, `None` for `-1` (unconstrained)
+    /// or any value that is not a valid declaration here.
+    pub fn from_atttypmod(typmod: i32) -> Option<Self> {
+        if typmod < 4 {
+            return None;
+        }
+        let packed = (typmod - 4) as u32;
+        Self::new(u64::from(packed >> 16), i64::from(packed & 0xFFFF)).ok()
+    }
+
+    /// Round `value` to this scale (half away from zero, as PostgreSQL's
+    /// `apply_typmod`), pad it to the scale, and refuse it when it needs more
+    /// than `precision - scale` integer digits (SQLSTATE 22003). The text
+    /// operates on decimal digits, so no digit passes through a float or a
+    /// 128-bit intermediate.
+    pub fn apply(self, value: &str) -> Result<String, String> {
+        let parsed = parse_numeric(value)?;
+        let rendered = parsed.to_string();
+        let (negative, body) = match rendered.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, rendered.as_str()),
+        };
+        let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+        let scale = self.scale as usize;
+        let kept = frac_part.len().min(scale);
+        let mut digits: Vec<u8> = Vec::with_capacity(int_part.len() + scale + 1);
+        digits.extend_from_slice(int_part.as_bytes());
+        digits.extend_from_slice(&frac_part.as_bytes()[..kept]);
+        digits.extend(std::iter::repeat_n(b'0', scale - kept));
+        if frac_part
+            .as_bytes()
+            .get(scale)
+            .is_some_and(|dropped| *dropped >= b'5')
+        {
+            // Round half away from zero: the sign is applied afterwards, so
+            // rounding the magnitude up is the same thing.
+            let mut carried = true;
+            for digit in digits.iter_mut().rev() {
+                if *digit == b'9' {
+                    *digit = b'0';
+                } else {
+                    *digit += 1;
+                    carried = false;
+                    break;
+                }
+            }
+            if carried {
+                digits.insert(0, b'1');
+            }
+        }
+        let int_len = digits.len() - scale;
+        let significant = digits[..int_len]
+            .iter()
+            .skip_while(|digit| **digit == b'0')
+            .count();
+        if significant > (self.precision - self.scale) as usize {
+            return Err(format!(
+                "numeric field overflow: A field with precision {}, scale {} must round to an \
+                 absolute value less than 10^{}",
+                self.precision,
+                self.scale,
+                self.precision - self.scale
+            ));
+        }
+        let int_digits = std::str::from_utf8(&digits[..int_len])
+            .map_err(|_| numeric_syntax_error(value))?
+            .trim_start_matches('0');
+        let frac_digits =
+            std::str::from_utf8(&digits[int_len..]).map_err(|_| numeric_syntax_error(value))?;
+        let is_zero = int_digits.is_empty() && frac_digits.bytes().all(|digit| digit == b'0');
+        let mut out = String::with_capacity(digits.len() + 3);
+        if negative && !is_zero {
+            out.push('-');
+        }
+        out.push_str(if int_digits.is_empty() {
+            "0"
+        } else {
+            int_digits
+        });
+        if scale > 0 {
+            out.push('.');
+            out.push_str(frac_digits);
+        }
+        // Padding to the declared scale can need more than the 96-bit
+        // coefficient (a 29-digit value at scale 2): that is refused, never
+        // stored in a form the parser would later reject.
+        canonical_numeric(&out)
+    }
+
+    /// Apply this declaration to a stored value: a NUMERIC is rounded and
+    /// checked, an array of them element by element, anything else (NULL, or a
+    /// value the caller has not cast to NUMERIC) is left alone.
+    pub fn apply_to_value(self, value: &mut Value) -> Result<(), String> {
+        match value {
+            Value::Numeric(text) => {
+                *text = self.apply(text)?;
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.apply_to_value(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Parse the text form of a BYTEA value. The PostgreSQL standard text/wire
@@ -841,9 +1268,7 @@ impl Value {
                 Ok(Value::Int64(rounded as i64))
             }
             (Value::Float64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
-            (Value::Float64(n), DataType::Numeric) => {
-                canonical_numeric(&n.to_string()).map(Value::Numeric)
-            }
+            (Value::Float64(n), DataType::Numeric) => float_to_numeric_text(*n).map(Value::Numeric),
             // Text conversions
             (Value::Text(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -1127,7 +1552,7 @@ impl Hash for Value {
             Value::Float64(f) if f.is_nan() => f64::NAN.to_bits().hash(state),
             Value::Float64(f) => f.to_bits().hash(state),
             Value::Text(s) => s.hash(state),
-            Value::Numeric(s) => canonical_numeric(s)
+            Value::Numeric(s) => numeric_comparison_key(s)
                 .unwrap_or_else(|_| s.clone())
                 .hash(state),
             Value::Jsonb(v) => jsonb::hash(v, state),
@@ -1383,20 +1808,26 @@ fn checked_numeric_binary(
 
 /// Add two exact numeric strings.
 pub fn numeric_add(a: &str, b: &str) -> Result<String, String> {
-    checked_numeric_binary(a, b, Decimal::checked_add)
+    checked_numeric_binary(a, b, decimal_add_exact)
 }
 
 /// Subtract two numeric strings (a - b).
 pub fn numeric_sub(a: &str, b: &str) -> Result<String, String> {
-    checked_numeric_binary(a, b, Decimal::checked_sub)
+    checked_numeric_binary(a, b, decimal_sub_exact)
 }
 
 /// Multiply two numeric strings.
 pub fn numeric_mul(a: &str, b: &str) -> Result<String, String> {
-    checked_numeric_binary(a, b, Decimal::checked_mul)
+    checked_numeric_binary(a, b, decimal_mul_exact)
 }
 
 /// Divide two numeric strings (a / b), returning an error on division by zero.
+///
+/// Division is the one operation that cannot be exact (PostgreSQL rounds it
+/// too). The quotient is rounded by `Decimal::checked_div` to the 28
+/// significant digits a `Decimal` holds, so `1 / 3` is 28 threes where
+/// PostgreSQL's `select_div_scale` gives 20; a quotient that does not fit is
+/// refused.
 pub fn numeric_div(a: &str, b: &str) -> Result<String, String> {
     let divisor = parse_numeric(b)?;
     if divisor.is_zero() {
@@ -1414,8 +1845,7 @@ pub fn numeric_rem(a: &str, b: &str) -> Result<String, String> {
     if divisor.is_zero() {
         return Err("division by zero".to_string());
     }
-    parse_numeric(a)?
-        .checked_rem(divisor)
+    decimal_rem_exact(parse_numeric(a)?, divisor)
         .map(|value| value.normalize().to_string())
         .ok_or_else(|| "numeric value out of range".to_string())
 }
@@ -1788,6 +2218,46 @@ mod tests {
     }
 
     #[test]
+    fn numeric_cast_preserves_scale_without_changing_equality_hash() {
+        use std::collections::HashSet;
+        for written in ["1.500", "0.000", "-12.3400"] {
+            assert_eq!(canonical_numeric(written).unwrap(), written);
+            assert_eq!(
+                Value::Text(written.into())
+                    .cast(&DataType::Numeric)
+                    .unwrap(),
+                Value::Numeric(written.into())
+            );
+            if let Value::Numeric(stored) = Value::Numeric(written.into())
+                .cast(&DataType::Numeric)
+                .unwrap()
+            {
+                assert_eq!(stored, written);
+            } else {
+                panic!("numeric cast lost its physical type");
+            }
+        }
+        let mut equal_values = HashSet::new();
+        for written in ["1.5", "1.50", "1.500"] {
+            equal_values.insert(Value::Numeric(written.into()));
+        }
+        assert_eq!(
+            equal_values.len(),
+            1,
+            "equal numeric values must hash alike"
+        );
+        let mut zero_values = HashSet::new();
+        for written in ["0", "0.000", "-0.000"] {
+            zero_values.insert(Value::Numeric(written.into()));
+        }
+        assert_eq!(
+            zero_values.len(),
+            1,
+            "signed/scaled numeric zero hashes alike"
+        );
+    }
+
+    #[test]
     fn test_numeric_excess_precision_fails_loudly() {
         // 35 fractional digits exceeds the scale<=28 ceiling. Previously this was
         // silently ROUNDED by Decimal::from_str; it must now reject with a clear
@@ -1815,6 +2285,223 @@ mod tests {
             canonical_numeric("-0.1234567890123456789012345678").unwrap(),
             "-0.1234567890123456789012345678"
         );
+    }
+
+    const MAX_COEFFICIENT: &str = "79228162514264337593543950335";
+
+    #[test]
+    fn numeric_scientific_notation_expands_exactly() {
+        for (written, expected) in [
+            ("1e3", "1000"),
+            ("1.5E3", "1500"),
+            ("1.50e1", "15.0"),
+            ("1.5e0", "1.5"),
+            ("15e-1", "1.5"),
+            ("-2.5e-3", "-0.0025"),
+            ("+1e+2", "100"),
+            (".5e1", "5"),
+            ("5.e1", "50"),
+            ("0e5", "0"),
+            ("0.00e5", "0"),
+            ("-0e5", "0"),
+            ("123.456e-2", "1.23456"),
+            ("1e-28", "0.0000000000000000000000000001"),
+            ("7.9e28", "79000000000000000000000000000"),
+            ("1e0001", "10"),
+        ] {
+            assert_eq!(canonical_numeric(written).unwrap(), expected, "{written}");
+        }
+    }
+
+    /// `Decimal::from_scientific` parsed the mantissa with the ROUNDING
+    /// `from_str`, so an exponent form with more than 28 fractional digits was
+    /// silently rounded where the positional form was refused.
+    #[test]
+    fn numeric_scientific_notation_never_rounds_a_digit() {
+        for written in [
+            "0.12345678901234567890123456789012345e2",
+            "1.00000000000000000000000000001e1",
+            "1e-29",
+            "123.456e-26",
+            "1e29",
+            "1e5000",
+            "1e99999999999999999999",
+            "9e28",
+        ] {
+            let error = parse_numeric(written).unwrap_err();
+            assert!(error.contains("precision ceiling"), "{written}: {error}");
+        }
+    }
+
+    #[test]
+    fn numeric_text_outside_the_grammar_is_invalid_input() {
+        for written in [
+            "",
+            " ",
+            ".",
+            "+",
+            "-",
+            "e5",
+            "1e",
+            "1e+",
+            "1.2.3",
+            "1_000",
+            "1__0",
+            "0x10",
+            "1 2",
+            "--1",
+            "1,5",
+            "\u{661}\u{662}",
+            "1e5.5",
+            "abc",
+            "NaN1",
+            "-NaN",
+            "+nan",
+            "\u{a0}1",
+        ] {
+            let error = parse_numeric(written).unwrap_err();
+            assert!(
+                error.starts_with("invalid input syntax for type numeric"),
+                "{written:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_nan_and_infinity_are_refused_by_name() {
+        for written in [
+            "NaN",
+            "nan",
+            "Infinity",
+            "-infinity",
+            "+Inf",
+            "inf",
+            " NaN ",
+        ] {
+            let error = parse_numeric(written).unwrap_err();
+            assert!(
+                error.contains("numeric NaN and Infinity are not supported"),
+                "{written:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_grammar_accepts_what_postgresql_accepts() {
+        for (written, expected) in [
+            (" 1.5 ", "1.5"),
+            ("\t-3\n", "-3"),
+            ("+1.5", "1.5"),
+            ("007", "7"),
+            (".5", "0.5"),
+            ("5.", "5"),
+            ("1.500", "1.500"),
+            (MAX_COEFFICIENT, MAX_COEFFICIENT),
+            (
+                "0.1234567890123456789012345678",
+                "0.1234567890123456789012345678",
+            ),
+        ] {
+            assert_eq!(canonical_numeric(written).unwrap(), expected, "{written:?}");
+        }
+    }
+
+    /// PostgreSQL has no negative zero; neither the stored text nor the
+    /// comparison key may carry one.
+    #[test]
+    fn numeric_negative_zero_is_zero() {
+        assert_eq!(canonical_numeric("-0.000").unwrap(), "0.000");
+        assert_eq!(canonical_numeric("-0").unwrap(), "0");
+        assert_eq!(numeric_mul("-1", "0").unwrap(), "0");
+        assert_eq!(numeric_add("-0.5", "0.5").unwrap(), "0");
+        assert_eq!(numeric_neg("0").unwrap(), "0");
+    }
+
+    /// `Decimal::checked_add`/`checked_mul` round (banker's) instead of
+    /// failing when the exact result needs more than 96 bits or 28 fractional
+    /// digits. The exact helpers return the exact value or `None`.
+    #[test]
+    fn numeric_arithmetic_is_exact_or_refused() {
+        assert_eq!(numeric_add("1.5", "1.25").unwrap(), "2.75");
+        assert_eq!(numeric_add("0.1", "0.2").unwrap(), "0.3");
+        assert_eq!(numeric_add(MAX_COEFFICIENT, "0").unwrap(), MAX_COEFFICIENT);
+        assert_eq!(numeric_sub("1", "1.50").unwrap(), "-0.5");
+        assert_eq!(numeric_mul("1.5", "1.5").unwrap(), "2.25");
+        assert_eq!(
+            numeric_mul(
+                "1.0000000000000000000000000000",
+                "1.0000000000000000000000000000"
+            )
+            .unwrap(),
+            "1"
+        );
+        assert_eq!(numeric_rem("7.5", "2").unwrap(), "1.5");
+        assert_eq!(numeric_rem("-7.5", "2").unwrap(), "-1.5");
+        assert_eq!(numeric_rem("7", "-2").unwrap(), "1");
+
+        let refused = [
+            numeric_add(MAX_COEFFICIENT, "0.4"),
+            numeric_add(MAX_COEFFICIENT, "1"),
+            numeric_sub(&format!("-{MAX_COEFFICIENT}"), "0.4"),
+            numeric_sub(&format!("-{MAX_COEFFICIENT}"), "1"),
+            numeric_mul("0.0000000000000000000000000001", "0.5"),
+            numeric_mul(MAX_COEFFICIENT, "2"),
+            numeric_mul(MAX_COEFFICIENT, "0.5"),
+        ];
+        for result in refused {
+            assert_eq!(result.unwrap_err(), "numeric value out of range");
+        }
+        assert_eq!(
+            numeric_rem("1", "0").unwrap_err(),
+            "division by zero",
+            "a zero divisor is still its own error"
+        );
+    }
+
+    /// The exact helpers agree with `Decimal` wherever `Decimal` is exact.
+    #[test]
+    fn numeric_exact_helpers_match_decimal_when_decimal_is_exact() {
+        let values = [
+            "0",
+            "1",
+            "-1",
+            "0.5",
+            "-0.5",
+            "123.456",
+            "-9999.0001",
+            "0.0000000001",
+            "1000000",
+            "7.25",
+            "-3.75",
+            "42",
+        ];
+        for a in values {
+            for b in values {
+                let (da, db) = (parse_numeric(a).unwrap(), parse_numeric(b).unwrap());
+                assert_eq!(
+                    decimal_add_exact(da, db),
+                    da.checked_add(db).map(|d| d.normalize()),
+                    "{a} + {b}"
+                );
+                assert_eq!(
+                    decimal_sub_exact(da, db),
+                    da.checked_sub(db).map(|d| d.normalize()),
+                    "{a} - {b}"
+                );
+                assert_eq!(
+                    decimal_mul_exact(da, db),
+                    da.checked_mul(db).map(|d| d.normalize()),
+                    "{a} * {b}"
+                );
+                if !db.is_zero() {
+                    assert_eq!(
+                        decimal_rem_exact(da, db),
+                        da.checked_rem(db).map(|d| d.normalize()),
+                        "{a} % {b}"
+                    );
+                }
+            }
+        }
     }
 
     // ========================================================================

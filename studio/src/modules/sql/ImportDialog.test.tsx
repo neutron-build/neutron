@@ -243,3 +243,33 @@ describe('running, journaling and recovery decisions', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Resume import' })).toBeTruthy())
   })
 })
+
+
+describe('ImportDialog running focus boundary', () => {
+  it('excludes controls disabled by a fieldset and retains focus on the stop action', async () => {
+    const { storage } = storageStub()
+    let finish!: (result: { operationId: string; applied: number }) => void
+    let operationId = ''
+    const sendBatch = vi.fn((request: { operationId: string }) => {
+      operationId = request.operationId
+      return new Promise<{ operationId: string; applied: number }>(resolve => { finish = resolve })
+    })
+    render(<ImportDialog {...dialogProps({ storage, transport: { sendBatch, outcome: vi.fn() } })} />)
+    chooseFile(makeFile('id,qty,note\n1,5,a\n'))
+    const start = await screen.findByRole('button', { name: 'Import' })
+    start.focus()
+    fireEvent.click(start)
+    await waitFor(() => expect(sendBatch).toHaveBeenCalledTimes(1))
+    const stop = screen.getByRole('button', { name: 'Stop after this batch' })
+    await waitFor(() => expect(document.activeElement).toBe(stop))
+    const format = document.querySelector('fieldset select') as HTMLSelectElement
+    expect(format.hasAttribute('disabled')).toBe(false)
+    expect((format.closest('fieldset') as HTMLFieldSetElement).disabled).toBe(true)
+    fireEvent.keyDown(stop, { key: 'Tab' })
+    expect(document.activeElement).toBe(stop)
+    fireEvent.keyDown(stop, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(stop)
+    finish({ operationId, applied: 1 })
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop after this batch' })).toBeNull())
+  })
+})

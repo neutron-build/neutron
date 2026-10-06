@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -20,20 +22,49 @@ type SavedConnection struct {
 	IsNucleus bool   `json:"isNucleus"`
 }
 
-// MaskedURL replaces the password portion of a Postgres URL with ***.
-func MaskedURL(url string) string {
-	// postgres://user:pass@host/db → postgres://user:***@host/db
-	if i := strings.Index(url, "://"); i >= 0 {
-		rest := url[i+3:]
-		if at := strings.LastIndex(rest, "@"); at >= 0 {
-			userInfo := rest[:at]
-			hostPart := rest[at:]
-			if colon := strings.Index(userInfo, ":"); colon >= 0 {
-				return url[:i+3] + userInfo[:colon+1] + "***" + hostPart
+// MaskedURL removes passwords in both URI and keyword PostgreSQL connection
+// strings before a saved connection is returned to the browser.
+var connectionPassword = regexp.MustCompile(`(?i)(\bpassword\s*=\s*)(?:'(?:\\.|[^'])*'|[^\s]+)`)
+
+func MaskedURL(raw string) string {
+	masked := raw
+	if !strings.Contains(raw, "://") {
+		masked = connectionPassword.ReplaceAllString(raw, "${1}***")
+	}
+	if i := strings.Index(masked, "://"); i >= 0 {
+		rest := masked[i+3:]
+		authority := strings.SplitN(strings.SplitN(rest, "?", 2)[0], "#", 2)[0]
+		if at := strings.LastIndex(authority, "@"); at >= 0 {
+			if colon := strings.Index(rest[:at], ":"); colon >= 0 {
+				masked = masked[:i+3] + rest[:colon+1] + "***" + rest[at:]
 			}
 		}
+		// PostgreSQL also accepts passwords in URI query parameters, including
+		// percent-encoded keys. Decode keys before checking; redact all values.
+		if u, err := url.Parse(masked); err == nil {
+			query, err := url.ParseQuery(u.RawQuery)
+			if err == nil {
+				changed := false
+				for key := range query {
+					if strings.EqualFold(key, "password") {
+						query[key] = []string{"***"}
+						changed = true
+					}
+				}
+				if changed {
+					u.RawQuery = query.Encode()
+					masked = u.String()
+				}
+			} else {
+				u.RawQuery = "redacted"
+				masked = u.String()
+			}
+		} else {
+			// Saved input need not be valid; never echo an unparseable URI.
+			return "[redacted invalid connection URI]"
+		}
 	}
-	return url
+	return masked
 }
 
 type connectionStore struct {
@@ -43,13 +74,9 @@ type connectionStore struct {
 }
 
 func newConnectionStore() (*connectionStore, error) {
-	home, err := os.UserHomeDir()
+	dir, err := studioStateDir()
 	if err != nil {
-		return nil, fmt.Errorf("home dir: %w", err)
-	}
-	dir := filepath.Join(home, ".neutron")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("create ~/.neutron: %w", err)
+		return nil, err
 	}
 	path := filepath.Join(dir, "studio.json")
 	s := &connectionStore{path: path}

@@ -18,6 +18,33 @@ import { query } from "@neutron-build/nucleus/sql";
 import { vectorSearch } from "@neutron-build/nucleus/vector";
 ```
 
+## Migration metadata namespace
+
+The SDK migration APIs infer one persistent metadata schema from `current_schema()`
+at the start of each invocation and qualify all history and claim operations,
+including transaction writes, adoption, diagnostics and force-unlock. Configure
+the connection search path so that its first existing schema is the intended
+migration schema. Temporary shadows, a history or claim found in a later search
+path schema, and metadata views or unlogged tables are refused before metadata mutation; remove the
+shadow or configure the intended schema first. Quoted schema identifiers are
+supported. Existing history version columns must have actual builtin
+`pg_catalog.int2`, `int4` or `int8` identity; domains and custom types are refused
+before claim metadata is created. Canonical CLI text-ID histories still require
+`neutron migrate`.
+
+This freezes metadata resolution across pooled connections and migration SQL
+using `SET LOCAL search_path`. Supplied up/down SQL retains its own name-resolution
+semantics. Connections must target the same database and authorization principal;
+this does not pin a session or protect metadata from privileged concurrent DDL.
+The row claim, explicit recovery, checksums and adoption rules are unchanged.
+
+Actual persistent catalog identity is required. Published Nucleus 1.2.0 lacks the
+required `pg_catalog.to_regclass` capability, so these migration, status,
+lock-info and force-unlock APIs refuse that experimental provider path with an
+unsupported namespace profile before mutation. PostgreSQL wire compatibility
+alone does not admit a migration provider. Other client SQL/model APIs are not
+certified or refused by this migration-specific check.
+
 ## Documentation
 
 [neutron.build](https://neutron.build)
@@ -197,3 +224,36 @@ connection, as measured:
 ## License
 
 MIT
+
+
+### PostgreSQL scalar read profile
+
+Generated `lossless-read-v1` TypeScript models require an explicit SQL-only
+transport. The default transport keeps safe-number int8 behavior for existing
+model count/ID APIs and rejects integers beyond JavaScript precision.
+
+```ts
+import { createClient, PgTransport } from '@neutron-build/nucleus';
+import { withSQL } from '@neutron-build/nucleus/sql';
+const transport = new PgTransport(process.env.DATABASE_URL!, {
+  valueProfile: 'lossless-read-v1',
+});
+const db = await createClient({ url: process.env.DATABASE_URL!, transport })
+  .use(withSQL).connect();
+// db.sql.query<GeneratedRow>('SELECT ...') preserves int8/numeric as strings.
+```
+
+This PostgreSQL text-protocol profile matches the generator's ten builtin scalar
+types: int2/int4 numbers, int8/numeric strings, boolean, text/varchar/bpchar,
+UUID string and bytea Buffer (a Uint8Array). NULL remains null. Bytea requires
+hexadecimal output. Non-null values of other types refuse; the generator rejects
+unsupported column types before writing models. In particular, temporal values,
+arrays, JSON and domains are outside the generated profile. A null field alone
+does not prove its database type. This option does not make generic query types
+runtime schema validation.
+
+Parser policy is local to the pool; creating a Neutron transport does not change
+node-postgres's process-wide parsers or another library's int8 reads. Transaction
+reads use the same pool policy. Use separate default transports for model plugins
+and SDK migration APIs; those compositions deliberately refuse the SQL read
+profile. This profile does not certify Nucleus, HTTP/mobile or temporal precision.

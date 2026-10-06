@@ -83,7 +83,8 @@ fn prepared_statement_defaults_are_sane() {
 /// DECLARE past the cap is refused with 54000; CLOSE makes room. Cursors are
 /// the most memory-dense per-session object (each materializes its whole row
 /// set), so the churn here stays small on purpose — the assertion is the
-/// refusal, not the bytes.
+/// refusal, not the bytes. The cursors are WITH HOLD so no transaction block is
+/// needed: a refusal inside one would abort it and end the test early.
 #[tokio::test]
 async fn cursor_churn_past_the_cap_is_refused() {
     let ex = test_executor();
@@ -92,23 +93,31 @@ async fn cursor_churn_past_the_cap_is_refused() {
     for i in 0..3 {
         exec(
             &ex,
-            &format!("DECLARE c{i} CURSOR FOR SELECT id FROM cur_src"),
+            &format!("DECLARE c{i} CURSOR WITH HOLD FOR SELECT id FROM cur_src"),
         )
         .await;
     }
     let err = ex
-        .execute("DECLARE c3 CURSOR FOR SELECT id FROM cur_src")
+        .execute("DECLARE c3 CURSOR WITH HOLD FOR SELECT id FROM cur_src")
         .await
         .expect_err("the 4th distinct cursor must be refused");
     assert!(err.to_string().contains("too_many_cursors"), "got: {err}");
     assert_eq!(sqlstate_of(&err), "54000");
 
     // Control: re-declaring an existing name replaces without consuming budget.
-    exec(&ex, "DECLARE c0 CURSOR FOR SELECT id FROM cur_src").await;
+    exec(
+        &ex,
+        "DECLARE c0 CURSOR WITH HOLD FOR SELECT id FROM cur_src",
+    )
+    .await;
 
     // Control: CLOSE makes room.
     exec(&ex, "CLOSE c0").await;
-    exec(&ex, "DECLARE c4 CURSOR FOR SELECT id FROM cur_src").await;
+    exec(
+        &ex,
+        "DECLARE c4 CURSOR WITH HOLD FOR SELECT id FROM cur_src",
+    )
+    .await;
     assert_eq!(ex.current_session().cursors.read().await.len(), 3);
 }
 

@@ -11,7 +11,7 @@ use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
 
 use crate::catalog::{ColumnDef, ColumnGeneration, TableDef};
 use crate::sql::{self, Overriding};
-use crate::types::{Row, Value};
+use crate::types::{DataType, NumericTypmod, NumericTypmodError, Row, Value};
 
 use super::types::ColMeta;
 use super::{ExecError, Executor};
@@ -100,6 +100,55 @@ pub(super) fn enforce_max_len(value: &mut Value, col: &ColumnDef) -> Result<(), 
     Err(ExecError::Runtime(format!(
         "value too long for type character varying({limit})"
     )))
+}
+
+/// The declared `numeric(p, s)` of a SQL type, refused with the SQLSTATE
+/// PostgreSQL uses: a precision or scale PostgreSQL rejects is 22023, one it
+/// accepts but Nucleus cannot hold is 0A000. Called before a column is created
+/// or retyped and before an explicit cast, so an invalid declaration never
+/// reaches the catalog.
+pub(super) fn declared_numeric_typmod(
+    data_type: &sqlparser::ast::DataType,
+) -> Result<Option<NumericTypmod>, ExecError> {
+    sql::declared_numeric_typmod(data_type).map_err(|error| match error {
+        NumericTypmodError::OutOfRange(message) => ExecError::Runtime(message),
+        NumericTypmodError::Unsupported(message) => ExecError::Unsupported(message),
+    })
+}
+
+/// Enforce the declared `numeric(p, s)` on a value about to be stored: rounded
+/// half away from zero to the scale, then refused with 22003 when it needs
+/// more than `p - s` integer digits. A value that is not NUMERIC yet (the
+/// ON CONFLICT DO UPDATE path does not coerce its assignments) is cast first,
+/// as the ordinary write path would.
+pub(super) fn enforce_numeric_typmod(value: &mut Value, col: &ColumnDef) -> Result<(), ExecError> {
+    let Some(typmod) = col.numeric_typmod else {
+        return Ok(());
+    };
+    if matches!(col.data_type, DataType::Numeric)
+        && matches!(
+            value,
+            Value::Int32(_) | Value::Int64(_) | Value::Float64(_) | Value::Text(_)
+        )
+    {
+        *value = value.cast(&DataType::Numeric).map_err(ExecError::Runtime)?;
+    }
+    typmod.apply_to_value(value).map_err(ExecError::Runtime)
+}
+
+/// A decimal literal assigned to a NUMERIC column keeps its digits. Evaluating
+/// it as an expression first would round it through f64 (anything past about
+/// 17 significant digits is lost) and drop its written scale (`1.10` would be
+/// stored as `1.1`). `None` when `expr` is not a decimal literal or the column
+/// is not NUMERIC, so the caller evaluates it normally.
+pub(super) fn exact_numeric_literal(
+    expr: &Expr,
+    col: &ColumnDef,
+) -> Option<Result<Value, ExecError>> {
+    if !matches!(col.data_type, DataType::Numeric) {
+        return None;
+    }
+    super::helpers::decimal_literal_numeric(expr)
 }
 
 impl Executor {

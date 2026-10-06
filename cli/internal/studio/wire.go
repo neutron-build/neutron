@@ -317,6 +317,11 @@ var (
 
 func decodeTagged(cell taggedCell) (any, error) {
 	switch cell.T {
+	case "json", "jsonb":
+		if !json.Valid([]byte(cell.V)) {
+			return nil, fmt.Errorf("invalid JSON wire document")
+		}
+		return cell.V, nil
 	case "int8":
 		i, err := strconv.ParseInt(cell.V, 10, 64)
 		if err != nil {
@@ -384,7 +389,7 @@ func taggedCellOf(v any) (taggedCell, bool) {
 //     passed on as their literal text, so PostgreSQL parses the exact digits
 //     into the column type (never a float64 detour). A tagged cell for an
 //     untagged column is a type mismatch and is refused;
-//   - json/jsonb accept only a string holding the JSON text. "null" is JSON
+//   - json/jsonb accept exact JSON text or a matching tagged JSON document. "null" is JSON
 //     null; SQL NULL is the request's explicit isNull / JSON null. Objects
 //     are refused so that a JSON document can never be mistaken for a
 //     tagged cell (or vice versa).
@@ -405,6 +410,18 @@ func decodeColumnValue(col tableColumnMeta, raw any) (any, error) {
 		return decodeTagged(cell)
 	}
 	if col.TypeOID == oidJSON || col.TypeOID == oidJSONB {
+		// Exact tagged document reads can be submitted directly; retain legacy
+		// exact-text mutation inputs. Column identity controls the accepted tag.
+		if cell, tagged := taggedCellOf(raw); tagged {
+			expected := "json"
+			if col.TypeOID == oidJSONB {
+				expected = "jsonb"
+			}
+			if cell.T != expected {
+				return nil, fmt.Errorf("JSON wire tag disagrees with column type")
+			}
+			raw = cell.V
+		}
 		s, ok := raw.(string)
 		if !ok {
 			return nil, fmt.Errorf("%s value must be a string containing JSON text", col.TypeName)

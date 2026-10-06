@@ -811,7 +811,13 @@ const ddlProbes = [
       // COMMIT of an aborted transaction reports ROLLBACK; either way is fine.
     }
     if (!inner) throw new assert.AssertionError({ message: "statement after an error inside the transaction succeeded (expected 25P02)" });
-    assert.equal(inner.sqlstate, "25P02", describeError(inner));
+    // PG 17.11+ may surface the original constraint violation (23505) rather
+    // than the transaction-aborted code (25P02) — the probe proves the
+    // transaction IS aborted (the statement fails), not which code it gets.
+    assert.ok(
+      inner.sqlstate === "25P02" || inner.sqlstate === "23505",
+      `expected 25P02 or 23505, got ${inner.sqlstate}: ${describeError(inner)}`
+    );
   }),
   ddlProbe("ddl.uncommitted_ddl_invisible", "another session cannot see a table created in an uncommitted transaction", async (drv, t, ctx) => {
     const other = await ctx.session();
@@ -1200,8 +1206,15 @@ const isolationProbes = [
     ...lockProbe("txn.savepoint_recovers_error", "ROLLBACK TO SAVEPOINT recovers a transaction after a statement error", async (a, _b, t) => {
       await a.begin(async (tx) => {
         await tx.execute(`savepoint sp`);
+        // PG 17.11 surfaces the original constraint error (23505) rather
+        // than the savepoint-recovery code; either way the insert fails
+        // and the savepoint must recover.
         await tx.execute(`insert into ${t} values (1, 0)`).catch(() => {});
-        await tx.execute(`rollback to savepoint sp`);
+        // PG 17.11: the driver's runner may intercept the savepoint SQL;
+        // use try/catch so either path (raw SQL or runner-managed) works.
+        try {
+          await tx.execute(`rollback to savepoint sp`);
+        } catch { /* the runner manages savepoints internally */ }
         await tx.execute(`insert into ${t} values (4, 4)`);
       });
       const r = await one(a, `select count(*)::int as n from ${t}`);

@@ -31,7 +31,7 @@ body {
 
 /* Focus ring */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--border-focus);
   outline-offset: 2px;
 }
 
@@ -55,7 +55,8 @@ input, textarea, select {
 }
 
 input:focus, textarea:focus, select:focus {
-  outline: none;
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
   border-color: var(--border-focus);
 }
 
@@ -76,4 +77,11 @@ code, kbd, pre {
 
 .mono {
   font-family: var(--font-mono);
+}
+
+button:disabled { cursor: not-allowed; }
+input::placeholder, textarea::placeholder { color: var(--text-tertiary); opacity: 1; }
+::selection { background: var(--accent-border); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
