@@ -183,7 +183,9 @@ let txSequence = 0;
  * error poisons the scope even after a successful savepoint rollback.
  */
 const SAVEPOINT_RECOVERY_SQL = /^\s*ROLLBACK\s+TO\s+(?:SAVEPOINT\s+)?/i;
-function maybeRecoverFromSavepoint(owner: { failed?: unknown }, sqlText: string): void {
+/** Clear the owner's failed state BEFORE the statement runs, so that a
+ *  raw-SQL ROLLBACK TO SAVEPOINT can recover a poisoned scope. */
+function recoverIfSavepoint(owner: { failed?: unknown }, sqlText: string): void {
   if (owner.failed !== undefined && SAVEPOINT_RECOVERY_SQL.test(sqlText)) {
     owner.failed = undefined;
   }
@@ -251,16 +253,10 @@ export async function runTransaction<T>(
   const makeScope = (owner: ScopeOwner): TransactionScope => {
     const scope: TransactionScope = {
       query<R>(sqlText: string, params: unknown[] = [], options?: QueryExecutionOptions): Promise<R[]> {
-        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.query<R>(sqlText, params, options).then(res => {
-          maybeRecoverFromSavepoint(owner, sqlText);
-          return res;
-        })); });
+        return observe(() => { validateTransactionSql(sqlText); recoverIfSavepoint(owner, sqlText); return track(owner, () => pin.query<R>(sqlText, params, options)); });
       },
       execute(sqlText: string, params?: unknown[], options?: QueryExecutionOptions): Promise<number> {
-        return observe(() => { validateTransactionSql(sqlText); return track(owner, () => pin.execute(sqlText, params, options).then(res => {
-          maybeRecoverFromSavepoint(owner, sqlText);
-          return res;
-        })); });
+        return observe(() => { validateTransactionSql(sqlText); recoverIfSavepoint(owner, sqlText); return track(owner, () => pin.execute(sqlText, params, options)); });
       },
       transaction: <Tx>(nested: (tx: TransactionScope) => Promise<Tx>): Promise<Tx> => observe(() => runSavepoint(owner, nested)),
       savepoint: (name?: string) => observe(() => createSavepoint(owner, name)),
