@@ -39,6 +39,7 @@ unused-allowed-license = "allow"
 # Our own crates. A new workspace crate must be added here.
 exceptions = [
     { allow = ["BUSL-1.1"], crate = "nucleus-catalog" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-codec" },
     { allow = ["BUSL-1.1"], crate = "nucleus-embedded" },
     { allow = ["BUSL-1.1"], crate = "nucleus-kv" },
     { allow = ["BUSL-1.1"], crate = "nucleus-models" },
