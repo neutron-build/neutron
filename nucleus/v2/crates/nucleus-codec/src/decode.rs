@@ -13,7 +13,11 @@ pub(crate) struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Reader<'a> {
-        Reader { buf, pos: 0, mask: 0 }
+        Reader {
+            buf,
+            pos: 0,
+            mask: 0,
+        }
     }
     /// XOR applied to every byte read (0xFF inside a DESC column).
     pub(crate) fn set_mask(&mut self, mask: u8) {
@@ -88,11 +92,14 @@ pub(crate) fn value(ty: &KeyType, r: &mut Reader<'_>) -> Result<Value> {
             Value::Float8(x)
         }
         KeyType::Numeric => Value::Numeric(numeric(r)?),
-        KeyType::Text(_) => {
-            Value::Text(String::from_utf8(r.escaped()?).map_err(|_| CodecError::Malformed("text is not UTF-8"))?)
-        }
+        KeyType::Text(_) => Value::Text(
+            String::from_utf8(r.escaped()?)
+                .map_err(|_| CodecError::Malformed("text is not UTF-8"))?,
+        ),
         KeyType::Bytea => Value::Bytea(r.escaped()?),
-        KeyType::Interval => Value::Interval(interval(i128::from_be_bytes(r.bytes()?) ^ i128::MIN)?),
+        KeyType::Interval => {
+            Value::Interval(interval(i128::from_be_bytes(r.bytes()?) ^ i128::MIN)?)
+        }
         KeyType::Uuid => Value::Uuid(r.bytes()?),
         KeyType::Jsonb => Value::Jsonb(jsonb(r)?),
         KeyType::Array(elem) => Value::Array(array(elem, r)?),
@@ -102,7 +109,13 @@ pub(crate) fn value(ty: &KeyType, r: &mut Reader<'_>) -> Result<Value> {
 fn numeric(r: &mut Reader<'_>) -> Result<Numeric> {
     let negative = match r.u8()? {
         NUM_NEG_INF => return Ok(Numeric::NegInf),
-        NUM_ZERO => return Ok(Numeric::Finite(Decimal { negative: false, digits: Vec::new(), scale: 0 })),
+        NUM_ZERO => {
+            return Ok(Numeric::Finite(Decimal {
+                negative: false,
+                digits: Vec::new(),
+                scale: 0,
+            }))
+        }
         NUM_POS_INF => return Ok(Numeric::PosInf),
         NUM_NAN => return Ok(Numeric::NaN),
         NUM_NEG => true,
@@ -131,7 +144,11 @@ fn numeric(r: &mut Reader<'_>) -> Result<Numeric> {
     }
     let scale = i32::try_from(digits.len() as i64 - i64::from(exp))
         .map_err(|_| CodecError::Malformed("numeric scale out of range"))?;
-    Ok(Numeric::Finite(Decimal { negative, digits, scale }))
+    Ok(Numeric::Finite(Decimal {
+        negative,
+        digits,
+        scale,
+    }))
 }
 
 /// §4.3 canonical representative.
@@ -237,7 +254,10 @@ fn array(elem_ty: &KeyType, r: &mut Reader<'_>) -> Result<Array> {
     }
     let mut dims = Vec::with_capacity(ndims);
     for _ in 0..ndims {
-        dims.push(ArrayDim { len: r.i32()?, lower: 0 });
+        dims.push(ArrayDim {
+            len: r.i32()?,
+            lower: 0,
+        });
     }
     for d in &mut dims {
         d.lower = r.i32()?;

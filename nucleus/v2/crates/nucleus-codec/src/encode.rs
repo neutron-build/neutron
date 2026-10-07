@@ -34,7 +34,9 @@ pub(crate) const F32_CANONICAL_NAN: u32 = 0x7FC0_0000;
 pub(crate) fn value(ty: &KeyType, v: &Value, out: &mut Vec<u8>) -> Result<()> {
     match (ty, v) {
         (KeyType::Bool, Value::Bool(b)) => out.push(u8::from(*b)),
-        (KeyType::Int2, Value::Int2(x)) => out.extend_from_slice(&((*x as u16) ^ (1 << 15)).to_be_bytes()),
+        (KeyType::Int2, Value::Int2(x)) => {
+            out.extend_from_slice(&((*x as u16) ^ (1 << 15)).to_be_bytes())
+        }
         (KeyType::Int4, Value::Int4(x)) | (KeyType::Date, Value::Date(x)) => flip_i32(*x, out),
         (KeyType::Int8, Value::Int8(x))
         | (KeyType::Time, Value::Time(x))
@@ -160,9 +162,14 @@ fn normalize(d: &Decimal) -> Result<Option<(&[u8], i32)>> {
     let Some(start) = d.digits.iter().position(|&x| x != 0) else {
         return Ok(None);
     };
-    let end = d.digits.iter().rposition(|&x| x != 0).map_or(start, |e| e + 1);
+    let end = d
+        .digits
+        .iter()
+        .rposition(|&x| x != 0)
+        .map_or(start, |e| e + 1);
     let exp = d.digits.len() as i64 - start as i64 - i64::from(d.scale);
-    let exp = i32::try_from(exp).map_err(|_| CodecError::InvalidValue("numeric exponent out of range"))?;
+    let exp = i32::try_from(exp)
+        .map_err(|_| CodecError::InvalidValue("numeric exponent out of range"))?;
     Ok(Some((&d.digits[start..end], exp)))
 }
 
@@ -235,7 +242,9 @@ pub(crate) fn canonical_pairs(pairs: &[(String, Jsonb)]) -> Vec<&(String, Jsonb)
 }
 
 pub(crate) fn storage_order(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
 }
 
 /// §7.
@@ -269,7 +278,9 @@ pub(crate) fn check_dims(a: &Array) -> Result<()> {
         return Err(CodecError::InvalidValue("too many array dimensions"));
     }
     if a.elems.is_empty() != a.dims.is_empty() {
-        return Err(CodecError::InvalidValue("empty array must have no dimensions"));
+        return Err(CodecError::InvalidValue(
+            "empty array must have no dimensions",
+        ));
     }
     let mut n: i64 = 1;
     for d in &a.dims {
@@ -279,7 +290,9 @@ pub(crate) fn check_dims(a: &Array) -> Result<()> {
         n = n.saturating_mul(i64::from(d.len));
     }
     if !a.dims.is_empty() && n != a.elems.len() as i64 {
-        return Err(CodecError::InvalidValue("array dimensions do not match element count"));
+        return Err(CodecError::InvalidValue(
+            "array dimensions do not match element count",
+        ));
     }
     Ok(())
 }

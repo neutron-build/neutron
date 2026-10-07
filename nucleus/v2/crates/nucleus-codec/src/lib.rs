@@ -35,11 +35,19 @@ pub struct KeyColumn {
 impl KeyColumn {
     /// `ASC NULLS LAST`, PostgreSQL's default.
     pub fn asc(ty: KeyType) -> KeyColumn {
-        KeyColumn { ty, dir: Direction::Asc, nulls: Nulls::Last }
+        KeyColumn {
+            ty,
+            dir: Direction::Asc,
+            nulls: Nulls::Last,
+        }
     }
     /// `DESC NULLS FIRST`, PostgreSQL's default for DESC.
     pub fn desc(ty: KeyType) -> KeyColumn {
-        KeyColumn { ty, dir: Direction::Desc, nulls: Nulls::First }
+        KeyColumn {
+            ty,
+            dir: Direction::Desc,
+            nulls: Nulls::First,
+        }
     }
     pub fn with_nulls(self, nulls: Nulls) -> KeyColumn {
         KeyColumn { nulls, ..self }
@@ -73,7 +81,10 @@ const NULL_LAST: u8 = 0x02;
 /// left with a partial key; callers discard it.
 pub fn encode_key(cols: &[KeyColumn], vals: &[Option<Value>], out: &mut Vec<u8>) -> Result<()> {
     if cols.len() != vals.len() {
-        return Err(CodecError::Arity { expected: cols.len(), got: vals.len() });
+        return Err(CodecError::Arity {
+            expected: cols.len(),
+            got: vals.len(),
+        });
     }
     for (col, val) in cols.iter().zip(vals) {
         match val {
@@ -132,5 +143,7 @@ pub fn decode_key_prefix(cols: &[KeyColumn], bytes: &[u8]) -> Result<(Vec<Option
 pub fn hash_value(ty: &KeyType, v: &Value) -> Result<u64> {
     let mut buf = Vec::new();
     encode::value(ty, v, &mut buf)?;
-    Ok(buf.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)))
+    Ok(buf.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    }))
 }

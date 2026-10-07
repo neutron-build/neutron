@@ -87,8 +87,16 @@ pub struct Interval {
 }
 
 impl Interval {
-    pub const NEG_INFINITY: Interval = Interval { months: i32::MIN, days: i32::MIN, micros: i64::MIN };
-    pub const INFINITY: Interval = Interval { months: i32::MAX, days: i32::MAX, micros: i64::MAX };
+    pub const NEG_INFINITY: Interval = Interval {
+        months: i32::MIN,
+        days: i32::MIN,
+        micros: i64::MIN,
+    };
+    pub const INFINITY: Interval = Interval {
+        months: i32::MAX,
+        days: i32::MAX,
+        micros: i64::MAX,
+    };
     pub const USECS_PER_DAY: i64 = 86_400_000_000;
 }
 
@@ -125,7 +133,10 @@ impl Array {
         let dims = if elems.is_empty() {
             Vec::new()
         } else {
-            vec![ArrayDim { len: i32::try_from(elems.len()).unwrap_or(i32::MAX), lower: 1 }]
+            vec![ArrayDim {
+                len: i32::try_from(elems.len()).unwrap_or(i32::MAX),
+                lower: 1,
+            }]
         };
         Array { dims, elems }
     }
@@ -154,13 +165,21 @@ impl Decimal {
             digits.push(c - b'0');
         }
         let scale = i32::try_from(frac.len()).ok()?;
-        Some(Decimal { negative, digits, scale })
+        Some(Decimal {
+            negative,
+            digits,
+            scale,
+        })
     }
 }
 
 impl fmt::Display for Decimal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s: String = self.digits.iter().map(|d| char::from(b'0' + d % 10)).collect();
+        let mut s: String = self
+            .digits
+            .iter()
+            .map(|d| char::from(b'0' + d % 10))
+            .collect();
         if self.scale <= 0 {
             s.push_str(&"0".repeat(self.scale.unsigned_abs() as usize));
         } else {
@@ -174,7 +193,11 @@ impl fmt::Display for Decimal {
             s.push('0');
         }
         let int_end = s.find('.').unwrap_or(s.len());
-        let lead = s[..int_end].bytes().take_while(|&b| b == b'0').count().min(int_end.saturating_sub(1));
+        let lead = s[..int_end]
+            .bytes()
+            .take_while(|&b| b == b'0')
+            .count()
+            .min(int_end.saturating_sub(1));
         if self.negative {
             f.write_str("-")?;
         }
