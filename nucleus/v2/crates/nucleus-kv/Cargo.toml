@@ -7,5 +7,15 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["mem"]
+# MemKv: in-memory backend (WASM, tests, G0).
+mem = ["dep:imbl"]
+# Fault: WAL-modelling crash wrapper.
+fault = []
+# Shared backend conformance suite (C-K3).
+conformance = ["fault"]
+
 [dependencies]
 thiserror.workspace = true
+imbl = { workspace = true, optional = true }
