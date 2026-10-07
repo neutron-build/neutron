@@ -106,18 +106,27 @@ func generateStructs(tables []sqlTable) string {
 	var b strings.Builder
 	b.WriteString("package model\n\n")
 
-	needsTime := false
+	// The file must carry every import its own field types need. A JSON or
+	// JSONB column emits json.RawMessage, and a generated struct without the
+	// import does not compile (NA-10) — the generator's whole output failed on
+	// the first JSON column a schema happened to have.
+	needsTime, needsJSON := false, false
 	for _, t := range tables {
 		for _, c := range t.Columns {
 			goType := sqlToGoType(c.Type, c.Nullable)
-			if strings.Contains(goType, "time.Time") {
-				needsTime = true
-			}
+			needsTime = needsTime || strings.Contains(goType, "time.Time")
+			needsJSON = needsJSON || strings.Contains(goType, "json.RawMessage")
 		}
 	}
-
-	if needsTime {
-		b.WriteString("import \"time\"\n\n")
+	if needsTime || needsJSON {
+		b.WriteString("import (\n")
+		if needsJSON {
+			b.WriteString("\t\"encoding/json\"\n")
+		}
+		if needsTime {
+			b.WriteString("\t\"time\"\n")
+		}
+		b.WriteString(")\n\n")
 	}
 
 	for i, t := range tables {

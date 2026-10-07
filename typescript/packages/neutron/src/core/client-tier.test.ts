@@ -73,6 +73,59 @@ describe("parseRouteFacts", () => {
     expect(parseRouteFacts("export default function Page() { return null; }").hasAction).toBe(false);
     expect(parseRouteFacts("export const actionable = 1;").hasAction).toBe(false);
   });
+
+  // NA-04: the regex version recognized exactly one spelling per export and
+  // reported every other valid one as ABSENT — including the spellings a
+  // gated page plausibly uses. A false `hasMiddleware: false` lets the
+  // static-serving fast path skip the route's gate entirely.
+  it("does not miss middleware because it is not the first declarator", () => {
+    const src = `export const marker = 1, middleware = [requireLogin];\nexport default Page;`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(true);
+  });
+
+  it("detects a re-export list that carries middleware", () => {
+    const src = `export { requireLogin as middleware } from "./guard";\nexport default Page;`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(true);
+  });
+
+  it("treats an unresolved star re-export as potentially gated", () => {
+    const src = `export * from "./guard";\nexport default Page;`;
+    const facts = parseRouteFacts(src);
+    expect(facts.hasMiddleware).toBe(true);
+    expect(facts.hasLoader).toBe(true);
+    expect(facts.hasAction).toBe(true);
+  });
+
+  it("a type-only star re-export does not imply runtime middleware", () => {
+    const src = `export type * from "./guard";\nexport default Page;`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(false);
+  });
+
+  it("type-only exports do not imply runtime middleware", () => {
+    const src = `export type { Middleware } from "./guard";\nexport default Page;`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(false);
+  });
+
+  it("detects middleware through destructured exports", () => {
+    const src = `export const { middleware, other } = makeGuards();`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(true);
+  });
+
+  it("detects a string-literal export name", () => {
+    const src = `const guard = [];\nexport { guard as "middleware" };`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(true);
+  });
+
+  it("an unparseable module is conservatively gated", () => {
+    const facts = parseRouteFacts("export const {{{");
+    expect(facts.hasMiddleware).toBe(true);
+    expect(facts.hasLoader).toBe(true);
+  });
+
+  it("comments between tokens do not hide the export", () => {
+    const src = `export const /* tricky */ middleware = [];`;
+    expect(parseRouteFacts(src).hasMiddleware).toBe(true);
+  });
 });
 
 describe("renderSpeculationRules", () => {

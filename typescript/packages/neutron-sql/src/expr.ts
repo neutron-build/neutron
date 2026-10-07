@@ -14,6 +14,7 @@ import {
   aggregate,
   expr as exprNode,
   fragment,
+  frozen,
   ident,
   isLegacySqlFragment,
   isValueNode,
@@ -21,7 +22,9 @@ import {
   param as paramNode,
   paramCast,
   qual,
+  validIdent,
   type AggregateNode,
+  type ExcludedReferenceNode,
   type OrderSpec,
   type SubqueryNode,
   type ValueNode,
@@ -51,8 +54,8 @@ export type Condition = ValueNode;
  *  ON CONFLICT DO UPDATE SET assignments and predicates (Q03). Renders the
  *  pseudo-relation reference `excluded."col"`. Only valid in on-conflict
  *  clauses; update .set() values reject it before SQL. */
-export function excluded(col: AnyColumnBuilder): ReturnType<typeof qual> {
-  return qual("excluded", col.columnName);
+export function excluded(col: AnyColumnBuilder): ExcludedReferenceNode {
+  return frozen<ExcludedReferenceNode>({ kind: "excluded-ref", column: validIdent(col.columnName, "excluded") });
 }
 
 function colRef(col: AnyColumnBuilder | string, table?: string): ValueNode {

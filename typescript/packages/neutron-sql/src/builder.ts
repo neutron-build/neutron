@@ -50,6 +50,7 @@ import {
   assertDistinctPhysicalColumns,
   assertNoExcludedRefs,
   collectExcludedRefs,
+  type ExcludedReferenceNode,
   cte,
   defaultCell,
   fragment,
@@ -434,12 +435,12 @@ function isColumnBuilderLike(v: unknown): v is AnyColumnBuilder {
  *  physical column of the inserted table — typo'd references fail before SQL
  *  instead of as a database error. */
 function assertExcludedColumnsResolve(tableName: string, columns: Record<string, AnyColumnBuilder>, node: ValueNode, who: string): void {
-  const refs: QualifiedNode[] = [];
+  const refs: ExcludedReferenceNode[] = [];
   collectExcludedRefs(node, refs);
   const physicalNames = new Set(Object.values(columns).map((c) => c.columnName));
   for (const ref of refs) {
-    if (ref.parts.length !== 2 || !physicalNames.has(ref.parts[1])) {
-      throw new Error(`${who}: excluded reference "${ref.parts.join(".")}" is not a column of ${tableName}`);
+    if (!physicalNames.has(ref.column)) {
+      throw new Error(`${who}: excluded reference "excluded.${ref.column}" is not a column of ${tableName}`);
     }
   }
 }

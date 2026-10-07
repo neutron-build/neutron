@@ -45,6 +45,65 @@ export interface StaticRenderOptions {
  * (dynamic resource routes, per-page `.md`, etc.), edit build.ts, not this
  * file. Kept deliberately minimal to avoid a second divergent build path.
  */
+/**
+ * Callbacks the shared static-authorization preflight needs from whichever
+ * pipeline invokes it. Injected rather than imported so the production build
+ * (neutron-cli/src/commands/build.ts) and this standalone renderer run the
+ * SAME rule over their own module loaders — the two paths drifted once
+ * already, and the production loop was the one missing the gate (NA-04).
+ */
+export interface StaticGateOptions {
+  loadRouteModule: (route: Route) => Promise<RouteModule>;
+  getLayoutChain: (route: Route) => Route[];
+}
+
+/**
+ * Refuse to prerender any `mode: "static"` route whose chain actually exports
+ * middleware — checked against the loaded MODULES, not derived facts, because
+ * facts are the thing that was allowed to be wrong. A prerendered file is
+ * served before middleware ever runs, so emitting one for a gated route
+ * publishes it; presence of the export is deliberately conservative (an
+ * intentionally empty middleware export is still a gate the author wrote and
+ * can delete).
+ *
+ * This is the single gate both static pipelines call; it must run BEFORE any
+ * page or resource response is written, so a rejected build leaves nothing
+ * deployable behind.
+ */
+export async function assertStaticRoutesUngated(
+  staticRoutes: Route[],
+  options: StaticGateOptions
+): Promise<void> {
+  const gated: Array<{ route: Route; gate: Route }> = [];
+  for (const route of staticRoutes) {
+    const chain = [...options.getLayoutChain(route), route];
+    for (const member of chain) {
+      const mod = await options.loadRouteModule(member);
+      if (mod && Object.prototype.hasOwnProperty.call(mod, "middleware")) {
+        gated.push({ route, gate: member });
+        break;
+      }
+    }
+  }
+  if (gated.length > 0) {
+    const detail = gated
+      .map(
+        ({ route, gate }) =>
+          gate.id === route.id
+            ? `  ${route.path} — ${route.file} exports middleware`
+            : `  ${route.path} — its layout ${gate.file} exports middleware`
+      )
+      .join("\n");
+    throw new Error(
+      `Cannot prerender ${gated.length} route(s) that are gated by middleware:\n${detail}\n\n` +
+        "A prerendered file is served before any middleware runs, so these pages " +
+        "would be public. Either drop `config = { mode: \"static\" }` so the route " +
+        "renders per request with its gate, or remove the middleware if the page " +
+        "is genuinely public."
+    );
+  }
+}
+
 export async function renderStatic(options: StaticRenderOptions): Promise<void> {
   const { routesDir, outputDir, baseUrl = "" } = options;
   // Prefer explicit appRoot; otherwise process.cwd() (CLI runs from the app).
@@ -94,48 +153,23 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
 
   const moduleCache = new Map<string, RouteModule>();
 
-  // `mode: "static"` and `middleware` are contradictory, and the contradiction
-  // used to resolve silently in favour of the wrong one: SSG prerendered the
-  // route, the server answered from the prebuilt file, and the file is served
-  // before renderAppRoute — the only place middleware runs. The author got no
-  // error and no warning; the page was simply public. A-020.
+  // `mode: "static"` and `middleware` are contradictory, and the
+  // contradiction used to resolve silently in favour of the wrong one: SSG
+  // prerendered the route, the server answered from the prebuilt file, and the
+  // file is served before renderAppRoute — the only place middleware runs.
+  // The author got no error and no warning; the page was simply public (A-020).
   //
-  // Failing the build is the honest resolution. Prerendering-but-not-serving
-  // or serving-but-not-prerendering each silently discard half of what the
-  // route asked for, and the half discarded here is an access gate. The
-  // combination is far more likely a misunderstanding than an intent, so it
-  // should be said out loud once at build time rather than guessed at on every
-  // request.
-  // `=== true` here, but `!== false` on the serving path, and the asymmetry is
-  // deliberate. Here the flag is always populated (discoverRoutes just read
-  // every file), so unknown means synthesized, and failing a build on a guess
-  // is worse than not failing it. There, unknown means the route table came
-  // from somewhere that did not derive facts, and serving a page that might be
-  // gated is worse than losing a fast path.
-  const gated = pageRoutes
-    .filter((route) => route.config.mode === "static")
-    .map((route) => ({
-      route,
-      gate: [...getLayoutChain(route), route].find((r) => r.hasMiddleware === true),
-    }))
-    .filter((entry) => entry.gate !== undefined);
-
-  if (gated.length > 0) {
-    const detail = gated
-      .map(({ route, gate }) =>
-        gate!.id === route.id
-          ? `  ${route.path} — ${route.file} exports \`middleware\``
-          : `  ${route.path} — its layout ${gate!.file} exports \`middleware\``
-      )
-      .join("\n");
-    throw new Error(
-      `Cannot prerender ${gated.length} route(s) that are gated by middleware:\n${detail}\n\n` +
-        "A prerendered file is served before any middleware runs, so these pages " +
-        "would be public. Either drop `config = { mode: \"static\" }` so the route " +
-        "renders per request with its gate, or remove the middleware if the page " +
-        "is genuinely public."
-    );
-  }
+  // The check reads the loaded modules themselves (NA-04): derived facts are
+  // only a cache of what the module exports, and the fact detector's blind
+  // spots were exactly how a gated page reached the prerender loop. Production
+  // builds run this same helper before writing anything.
+  await assertStaticRoutesUngated(
+    pageRoutes.filter((route) => route.config.mode === "static"),
+    {
+      loadRouteModule: (route) => loadRouteModule(route.file, moduleCache),
+      getLayoutChain,
+    }
+  );
 
   for (const pageRoute of pageRoutes) {
     if (pageRoute.config.mode !== "static") {

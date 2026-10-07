@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Route, RouteConfig } from "./types.js";
+import { bindPathParams, parsePath, type PathSegment } from "./route-path.js";
+import { parse as babelParse } from "@babel/parser";
 
 export interface DiscoverOptions {
   routesDir: string;
@@ -242,27 +244,74 @@ function createRoute(
   };
 }
 
+export interface NotFoundMatch {
+  route: Route;
+  /** The scope's parameters for this URL (NA-07): `/org/acme/missing` under a
+   * `/org/:orgId` scope binds `orgId = "acme"`. */
+  params: Record<string, string>;
+}
+
+/**
+ * The not-found page covering `urlPath`, selected structurally.
+ *
+ * A scope is matched by binding its tokens against the URL (a dynamic scope
+ * like `/org/:orgId` used to be compared as a literal prefix, so it could
+ * never match its own subtree), and the winner is chosen by route structure —
+ * deeper first, then static over parameter over wildcard at each position —
+ * never by the character length of the pattern, which let a longer parameter
+ * name look "more specific" than a shorter one (NA-07).
+ */
+export function findNotFoundMatch(routes: Route[], urlPath: string): NotFoundMatch | null {
+  const segments = urlPath.split("/").filter(Boolean);
+  const candidates: NotFoundMatch[] = [];
+  for (const route of routes) {
+    if (!route.isNotFound) continue;
+    const params = bindPathParams(route.path, segments, true);
+    if (params !== null) candidates.push({ route, params });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => compareScopeSpecificity(a.route, b.route));
+  return candidates[0];
+}
+
+/** The literal suffix of a dynamic token; static tokens have none. */
+function suffixOf(token: PathSegment): string {
+  return token.type === "static" ? "" : token.suffix;
+}
+
+/**
+ * Structural specificity between two not-found scopes: deeper scopes first;
+ * at equal depth, compare tokens left to right with static before parameter
+ * before wildcard, and a longer literal suffix before a shorter one. Equal
+ * structures tie-break stably by route id so selection never depends on
+ * discovery order or parameter-name spelling.
+ */
+function compareScopeSpecificity(a: Route, b: Route): number {
+  const aa = parsePath(a.path);
+  const bb = parsePath(b.path);
+  if (aa.length !== bb.length) return bb.length - aa.length;
+  const rank = { static: 3, param: 2, wildcard: 1 } as const;
+  for (let i = 0; i < aa.length; i++) {
+    const delta = rank[bb[i].type] - rank[aa[i].type];
+    if (delta) return delta;
+    const aSuffix = suffixOf(aa[i]);
+    const bSuffix = suffixOf(bb[i]);
+    if (aSuffix.length !== bSuffix.length) return bSuffix.length - aSuffix.length;
+  }
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 /**
  * The not-found page covering `urlPath`: the deepest one whose directory is a
  * prefix of the request.
  *
  * Deepest wins so a section can present its own 404 — a miss under `/admin`
  * should look like the admin app, not like the marketing site — while the root
- * page still catches everything else.
+ * page still catches everything else. Retained as the route-only view of
+ * `findNotFoundMatch` for existing callers.
  */
 export function findNotFoundRoute(routes: Route[], urlPath: string): Route | undefined {
-  let best: Route | undefined;
-  for (const route of routes) {
-    if (!route.isNotFound) continue;
-    const base = route.path === "/" ? "/" : route.path + "/";
-    const candidate = urlPath.endsWith("/") ? urlPath : urlPath + "/";
-    if (base === "/" || candidate.startsWith(base)) {
-      if (!best || route.path.length > best.path.length) {
-        best = route;
-      }
-    }
-  }
-  return best;
+  return findNotFoundMatch(routes, urlPath)?.route;
 }
 
 /**
@@ -291,33 +340,132 @@ export interface RouteFacts {
 }
 
 /**
- * Detects a `loader` export by source shape, matching how the server-only
- * stripper identifies the same export.
+ * Minimal structural AST types for the export scan — the same approach
+ * vite/server-only.ts takes: parse with @babel/parser, walk with structural
+ * interfaces, and never execute the module.
+ */
+interface BindingNode {
+  type: string;
+  name?: string;
+  argument?: BindingNode | null;
+  left?: BindingNode | null;
+  elements?: Array<BindingNode | null> | null;
+  properties?: Array<BindingNode | null> | null;
+  value?: BindingNode | null;
+}
+
+interface ExportSpecifierNode {
+  type: string;
+  exported?: { type?: string; name?: string; value?: string } | null;
+  exportKind?: string | null;
+}
+
+interface ExportStatementNode {
+  type: string;
+  exportKind?: string | null;
+  declaration?:
+    | {
+        type: string;
+        id?: { type?: string; name?: string } | null;
+        declarations?: Array<{ id?: BindingNode | null }> | null;
+      }
+    | null;
+  specifiers?: ExportSpecifierNode[] | null;
+}
+
+/** Collect every binding name a declaration's pattern introduces, including
+ * destructured, rest, and defaulted bindings. An unsupported binding form
+ * throws rather than silently becoming "no names" — an unrecognised pattern
+ * must not turn into a false absence fact. */
+function bindingNames(node: BindingNode): string[] {
+  switch (node.type) {
+    case "Identifier":
+      return node.name ? [node.name] : [];
+    case "RestElement":
+      return node.argument ? bindingNames(node.argument) : [];
+    case "AssignmentPattern":
+      return node.left ? bindingNames(node.left) : [];
+    case "ArrayPattern":
+      return (node.elements || []).flatMap((e) => (e ? bindingNames(e) : []));
+    case "ObjectPattern":
+      return (node.properties || []).flatMap((p) => {
+        if (!p) return [];
+        if (p.type === "RestElement") return p.argument ? bindingNames(p.argument) : [];
+        return p.value ? bindingNames(p.value) : [];
+      });
+    default:
+      throw new Error(`Unsupported exported binding pattern: ${node.type}`);
+  }
+}
+
+/** The runtime names a module exports, parsed rather than pattern-matched. An
+ * unresolved runtime `export *` sets `unresolvedStar`, which every fact reads
+ * as "potentially present": conservatively true beats an absent gate. */
+function collectExportedNames(
+  statements: ExportStatementNode[]
+): { names: Set<string>; unresolvedStar: boolean } {
+  const names = new Set<string>();
+  let unresolvedStar = false;
+  for (const statement of statements) {
+    if (statement.type === "ExportAllDeclaration") {
+      if (statement.exportKind !== "type") unresolvedStar = true;
+      continue;
+    }
+    if (statement.type !== "ExportNamedDeclaration") continue;
+    if (statement.exportKind === "type") continue; // type-only: no runtime export
+    const declaration = statement.declaration;
+    if (declaration) {
+      if (declaration.type === "VariableDeclaration" && declaration.declarations) {
+        for (const declarator of declaration.declarations) {
+          if (declarator.id) for (const name of bindingNames(declarator.id)) names.add(name);
+        }
+      } else if (declaration.id && declaration.id.type === "Identifier") {
+        names.add(declaration.id.name!);
+      }
+    }
+    for (const specifier of statement.specifiers || []) {
+      if (specifier.exportKind === "type") continue;
+      const exported = specifier.exported;
+      if (exported) {
+        names.add(exported.type === "StringLiteral" ? exported.value! : exported.name!);
+      }
+    }
+  }
+  return { names, unresolvedStar };
+}
+
+/**
+ * Facts about a route module's exports, by parsing it — not by regex.
  *
- * Deliberately conservative: anything ambiguous counts as HAVING a loader, so a
- * missed detection costs a network request that was already being made rather
- * than a page rendered without its data.
+ * The regex version recognized one narrow spelling per export and reported
+ * everything else as absent: `export const marker = 1, middleware = [...]`
+ * (middleware not the first declarator), alias and string-literal export
+ * lists, and `export * from "./guard"` all produced `hasMiddleware: false`.
+ * The static-serving fast path then skipped a route whose gate existed
+ * (NA-04). The parse is deliberately conservative in the other direction:
+ * anything unresolved — a star re-export, an unparseable file — counts as
+ * present, so a missed detection costs a fast path rather than an access
+ * control.
  */
 export function parseRouteFacts(fileContent: string): RouteFacts {
-  const declared =
-    /export\s+(?:async\s+)?(?:function|const|let|var)\s+loader\b/.test(fileContent);
-  // `export { loader }` and `export { x as loader }`, including re-exports.
-  const named = /export\s*\{[^}]*\bloader\b[^}]*\}/.test(fileContent);
-  // Same two shapes for `middleware`. Conservative in the same direction and
-  // for a stronger reason: a false positive costs a static route its prebuilt
-  // fast path, a false negative serves a gated page to anyone.
-  const middlewareDeclared =
-    /export\s+(?:async\s+)?(?:function|const|let|var)\s+middleware\b/.test(fileContent);
-  const middlewareNamed = /export\s*\{[^}]*\bmiddleware\b[^}]*\}/.test(fileContent);
-  // `action` powers the OpenAPI POST operation, same detection family.
-  const actionDeclared =
-    /export\s+(?:async\s+)?(?:function|const|let|var)\s+action\b/.test(fileContent);
-  const actionNamed = /export\s*\{[^}]*\baction\b[^}]*\}/.test(fileContent);
-  return {
-    hasLoader: declared || named,
-    hasMiddleware: middlewareDeclared || middlewareNamed,
-    hasAction: actionDeclared || actionNamed,
-  };
+  try {
+    const ast = babelParse(fileContent, {
+      sourceType: "module",
+      plugins: ["typescript", "jsx"],
+    });
+    const { names, unresolvedStar } = collectExportedNames(
+      ast.program.body as unknown as ExportStatementNode[]
+    );
+    return {
+      hasLoader: unresolvedStar || names.has("loader"),
+      hasMiddleware: unresolvedStar || names.has("middleware"),
+      hasAction: unresolvedStar || names.has("action"),
+    };
+  } catch {
+    // Unparseable source: assume the heavier path, and assume gated. Never
+    // convert uncertainty into an absence fact.
+    return { hasLoader: true, hasMiddleware: true, hasAction: true };
+  }
 }
 
 function readRouteFacts(filePath: string): RouteFacts {

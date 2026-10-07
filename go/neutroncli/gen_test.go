@@ -227,3 +227,82 @@ func writeTempFile(t *testing.T, content string) *os.File {
 	f.WriteString(content)
 	return f
 }
+
+// NA-10: a JSON/JSONB column emits json.RawMessage, and the generated file
+// must import encoding/json or it does not compile. The regression type-checks
+// the real generated output, not just the import line.
+func TestGenerateStructsIncludesJSONImport(t *testing.T) {
+	cases := []struct {
+		name      string
+		tables    []sqlTable
+		wantJSON  bool
+		wantTime  bool
+	}{
+		{
+			name: "jsonb column",
+			tables: []sqlTable{{Name: "events", Columns: []sqlColumn{
+				{Name: "id", Type: "BIGSERIAL", PK: true},
+				{Name: "payload", Type: "JSONB"},
+			}}},
+			wantJSON: true,
+		},
+		{
+			name: "nullable json column",
+			tables: []sqlTable{{Name: "events", Columns: []sqlColumn{
+				{Name: "payload", Type: "JSON", Nullable: true},
+			}}},
+			wantJSON: true,
+		},
+		{
+			name: "json plus time",
+			tables: []sqlTable{{Name: "events", Columns: []sqlColumn{
+				{Name: "payload", Type: "JSONB"},
+				{Name: "created_at", Type: "TIMESTAMPTZ"},
+			}}},
+			wantJSON: true,
+			wantTime: true,
+		},
+		{
+			name: "time only",
+			tables: []sqlTable{{Name: "events", Columns: []sqlColumn{
+				{Name: "created_at", Type: "TIMESTAMPTZ"},
+			}}},
+			wantTime: true,
+		},
+		{
+			name: "neither import",
+			tables: []sqlTable{{Name: "events", Columns: []sqlColumn{
+				{Name: "id", Type: "BIGSERIAL", PK: true},
+			}}},
+		},
+		{
+			name: "multiple tables",
+			tables: []sqlTable{
+				{Name: "a", Columns: []sqlColumn{{Name: "payload", Type: "JSON"}}},
+				{Name: "b", Columns: []sqlColumn{{Name: "at", Type: "DATE"}}},
+			},
+			wantJSON: true,
+			wantTime: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code := generateStructs(tc.tables)
+			if tc.wantJSON && !strings.Contains(code, `"encoding/json"`) {
+				t.Error("generated code is missing the encoding/json import; it would not compile")
+			}
+			if !tc.wantJSON && strings.Contains(code, "encoding/json") {
+				t.Error("encoding/json imported with no JSON column")
+			}
+			if tc.wantTime && !strings.Contains(code, `"time"`) {
+				t.Error("generated code is missing the time import; it would not compile")
+			}
+			if !tc.wantTime && strings.Contains(code, `"time"`) {
+				t.Error("time imported with no temporal column")
+			}
+			if err := typeCheckGoSource(code); err != nil {
+				t.Errorf("generated code does not type-check: %v\n%s", err, code)
+			}
+		})
+	}
+}

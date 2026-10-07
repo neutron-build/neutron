@@ -118,9 +118,9 @@ describe("renderStatic refuses to prerender a gated route", () => {
     // Both gated routes are reported, each pointing at the file that gates it
     // — the page for a direct gate, the layout for an inherited one, because
     // "your page exports middleware" would be a lie for /admin.
-    expect(message).toContain("secret.tsx exports `middleware`");
+    expect(message).toContain("secret.tsx exports middleware");
     expect(message).toContain("/admin — its layout");
-    expect(message).toContain("_layout.tsx exports `middleware`");
+    expect(message).toContain("_layout.tsx exports middleware");
     // The message has to be actionable, not just accurate.
     expect(message).toContain('mode: "static"');
   });

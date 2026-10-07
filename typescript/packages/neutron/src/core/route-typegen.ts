@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { discoverRoutes } from "./manifest.js";
+import { parsePath } from "./route-path.js";
 import type { Route } from "./types.js";
 
 export interface PrepareRouteTypesOptions {
@@ -22,9 +23,7 @@ export async function prepareRouteTypes(
     return;
   }
 
-  const routes = discoverRoutes({ routesDir }).filter(
-    (route) => !route.file.includes("_layout")
-  );
+  const routes = discoverRoutes({ routesDir });
   const declaration = generateRouteTypesDeclaration(routes);
 
   const outputPath =
@@ -33,8 +32,22 @@ export async function prepareRouteTypes(
   await fs.writeFile(outputPath, declaration, "utf-8");
 }
 
+/**
+ * A route belongs in the navigable declaration set only if a URL can actually
+ * reach it: layouts share their directory's path and not-found pages are
+ * reachable only through the 404 handler, so neither is advertised. This is a
+ * route-shape predicate — `route.file.includes("_layout")` used to decide it
+ * from the absolute path, so a project directory merely named `_layout`
+ * somewhere upstream reclassified every route under it (NA-13).
+ */
+export function isNavigableRoute(route: Route): boolean {
+  return !route.isLayout && !route.isNotFound;
+}
+
 export function generateRouteTypesDeclaration(routes: Route[]): string {
-  const routePaths = [...new Set(routes.map((route) => route.path))].sort();
+  const routePaths = [
+    ...new Set(routes.filter(isNavigableRoute).map((route) => route.path)),
+  ].sort();
   const typeLines = routePaths.map((routePath) => `    | ${toPathType(routePath)}`);
 
   const pathUnion =
@@ -54,30 +67,26 @@ export function generateRouteTypesDeclaration(routes: Route[]): string {
 }
 
 function toPathType(routePath: string): string {
-  if (routePath === "/") {
-    return '"/"';
+  const tokens = parsePath(routePath);
+
+  // An entirely static path is a double-quoted string literal, and
+  // JSON.stringify is the escaping that keeps it valid for every character a
+  // filesystem route can carry: a static route containing a double quote used
+  // to emit `"/say"hi"` — a broken declaration (NA-13).
+  if (tokens.every((token) => token.type === "static")) {
+    return JSON.stringify(routePath);
   }
 
-  const segments = routePath.split("/").filter(Boolean);
-  let pattern = "";
-  let hasDynamicSegment = false;
-
-  for (const segment of segments) {
-    pattern += "/";
-    // Catch-alls are named (`*slug`), so match on the prefix, not on a bare "*".
-    if (segment.startsWith(":") || segment.startsWith("*")) {
-      pattern += "${string}";
-      hasDynamicSegment = true;
-      continue;
-    }
-    pattern += escapeTemplateSegment(segment);
-  }
-
-  if (!hasDynamicSegment) {
-    return `"${pattern}"`;
-  }
-
-  return `\`${pattern}\``;
+  // Dynamic paths are template literals. Escape only what a template literal
+  // needs (backtick, `${`, backslash), and keep each token's literal suffix —
+  // `:id.json` stays `/${string}.json`, it does not collapse to `/${string}`.
+  const pattern = tokens
+    .map((token) => {
+      if (token.type === "static") return "/" + escapeTemplateSegment(token.value);
+      return "/${string}" + escapeTemplateSegment(token.suffix);
+    })
+    .join("");
+  return "`" + pattern + "`";
 }
 
 function escapeTemplateSegment(segment: string): string {

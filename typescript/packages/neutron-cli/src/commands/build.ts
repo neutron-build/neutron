@@ -26,6 +26,7 @@ import {
   assertRenderedFragment,
   renderSpeculationRules,
   isResponse,
+  assertStaticRoutesUngated,
 } from "@neutron-build/core";
 import type {
   NeutronConfig,
@@ -582,6 +583,16 @@ export async function build(): Promise<void> {
   console.log("\nRendering static routes...");
   
   const staticRoutes = pageRoutes.filter((r) => r.config.mode === "static");
+
+  // Authorization preflight before ANY page or resource response is written
+  // (NA-04): a `mode: "static"` route whose chain actually exports middleware
+  // must not be prerendered — a prerendered file is served before middleware
+  // runs, so emitting one publishes the page. Checked against the loaded
+  // modules, not derived facts, through the same helper the standalone
+  // renderer uses; a rejected build throws before it can leave a deployable
+  // partial dist behind.
+  await assertStaticRoutesUngated(staticRoutes, { loadRouteModule, getLayoutChain });
+
   let renderedCount = 0;
   let skippedCount = 0;
   // Routes that threw while rendering. Distinct from skips (no component, no

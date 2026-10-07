@@ -30,13 +30,14 @@ interface ParseNode {
   type: string;
   start: number;
   end: number;
+  exportKind?: string;
   source?: { value?: string };
   specifiers?: Array<{
     type: string;
     start: number;
     end: number;
     local?: { name?: string };
-    exported?: { name?: string };
+    exported?: { type?: string; name?: string; value?: string };
   }>;
   declaration?: {
     type: string;
@@ -216,8 +217,12 @@ export function stripServerOnlyRouteModule(code: string): string {
       continue;
     }
 
+    // The exported NAME is what the client will see; string-literal export
+    // names (`export { x as "loader" }`) count too, so read the literal's
+    // value as well as the identifier's name.
     const kept = specifiers.filter((specifier) => {
-      const exportedName = specifier.exported?.name || specifier.local?.name || "";
+      const exportedName =
+        specifier.exported?.name ?? specifier.exported?.value ?? specifier.local?.name ?? "";
       const localName = specifier.local?.name || "";
       return (
         !SERVER_EXPORT_NAMES.has(exportedName) &&
@@ -234,8 +239,18 @@ export function stripServerOnlyRouteModule(code: string): string {
       continue;
     }
 
-    const rebuilt = kept.map((specifier) => code.slice(specifier.start, specifier.end)).join(", ");
-    magic.overwrite(node.start, node.end, `export { ${rebuilt} };`);
+    // Preserve everything outside the specifier list itself: the `export` and
+    // `{` before the first original specifier, and — critically — the source
+    // clause, attributes, and semicolon after the last one. Rebuilding the
+    // statement as `export { kept };` used to drop ` from "./shared"`, so a
+    // mixed re-export like `export { loader, Card } from "./shared"` became
+    // `export { Card };` where Card is not a local binding: a client module
+    // that no longer parses (NA-08). Prefix and suffix are taken verbatim
+    // from the original statement, so nothing else about it can be lost.
+    const prefix = code.slice(node.start, specifiers[0].start);
+    const suffix = code.slice(specifiers[specifiers.length - 1].end, node.end);
+    const body = kept.map((s) => code.slice(s.start, s.end)).join(", ");
+    magic.overwrite(node.start, node.end, prefix + body + suffix);
   }
 
   return magic.toString();

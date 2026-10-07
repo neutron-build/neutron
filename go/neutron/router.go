@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -52,12 +53,16 @@ func callerSite() string {
 func (r *Router) claimPattern(fullPattern string) {
 	site := callerSite()
 	if r.sites != nil {
-		if prev, taken := (*r.sites)[fullPattern]; taken {
+		r.routesMu.Lock()
+		prev, taken := (*r.sites)[fullPattern]
+		if taken {
+			r.routesMu.Unlock()
 			panic(fmt.Sprintf(
 				"neutron: route %q registered twice\n  first: %s\n  again: %s",
 				fullPattern, prev, site))
 		}
 		(*r.sites)[fullPattern] = site
+		r.routesMu.Unlock()
 	}
 	r.gen.Add(1)
 }
@@ -70,6 +75,8 @@ func (r *Router) covers(pattern string) bool {
 	if r.sites == nil {
 		return false
 	}
+	r.routesMu.Lock()
+	defer r.routesMu.Unlock()
 	if _, taken := (*r.sites)[pattern]; taken {
 		return true
 	}
@@ -97,8 +104,17 @@ type Router struct {
 	// make a collision panic name the two files in conflict.
 	sites *map[string]string
 	// gen counts registrations so cached artifacts (OpenAPI) can detect
-	// staliness (GO-13).
-	gen atomic.Uint64
+	// staleness (GO-13). It is a pointer for the same reason routes is: a
+	// Group registers through its own Router value, and a value counter there
+	// would never invalidate the root's cached spec - after the first
+	// generation, grouped routes were absent from /openapi.json forever
+	// (NA-05). One counter, one tree.
+	gen *atomic.Uint64
+	// routesMu serializes route-record appends against the snapshots readers
+	// (Routes(), App.OpenAPI) take. Registration is expected to finish at
+	// startup, before serving; the shared lock is what makes an early reader
+	// safe rather than lucky, and it travels through the tree like routes.
+	routesMu *sync.Mutex
 }
 
 // Generation reports the current registration generation.
@@ -153,9 +169,11 @@ func newRouter() *Router {
 	var routes []routeRecord
 	sites := map[string]string{}
 	return &Router{
-		mux:    http.NewServeMux(),
-		routes: &routes,
-		sites:  &sites,
+		mux:      http.NewServeMux(),
+		routes:   &routes,
+		sites:    &sites,
+		routesMu: &sync.Mutex{},
+		gen:      &atomic.Uint64{},
 	}
 }
 
@@ -166,8 +184,11 @@ func (r *Router) Group(prefix string, mw ...Middleware) *Router {
 		mux:        r.mux,
 		prefix:     r.prefix + prefix,
 		middleware: append(r.middleware[:len(r.middleware):len(r.middleware)], mw...),
-		routes:     r.routes, // pointer-shared across the whole tree
-		sites:      r.sites,  // same, so a collision across two groups is caught
+		routes:     r.routes,   // pointer-shared across the whole tree
+		sites:      r.sites,    // same, so a collision across two groups is caught
+		routesMu:   r.routesMu, // same, snapshots see a consistent record slice
+		gen:        r.gen,      // same counter (NA-05): a grouped registration
+		// invalidates the root's cached OpenAPI spec like any other.
 	}
 }
 
@@ -218,12 +239,30 @@ func (r *Router) Handle(pattern string, handler http.Handler) {
 	// /openapi.json with nothing reporting why.
 	if r.routes != nil {
 		method, path := splitPattern(pattern)
-		*r.routes = append(*r.routes, routeRecord{
+		r.appendRoute(routeRecord{
 			Method:  method,
 			Pattern: r.prefix + path,
 			Untyped: true,
 		})
 	}
+}
+
+// appendRoute adds one record under the registry lock, so a reader taking a
+// snapshot never sees a half-appended slice.
+func (r *Router) appendRoute(rec routeRecord) {
+	r.routesMu.Lock()
+	defer r.routesMu.Unlock()
+	*r.routes = append(*r.routes, rec)
+}
+
+// snapshotRoutes copies the current records under the registry lock.
+func (r *Router) snapshotRoutes() []routeRecord {
+	if r.routes == nil {
+		return nil
+	}
+	r.routesMu.Lock()
+	defer r.routesMu.Unlock()
+	return append([]routeRecord(nil), *r.routes...)
 }
 
 // handleIfAbsent registers a framework-supplied default route unless the
@@ -281,7 +320,7 @@ func (r *Router) register(method, pattern string, handler http.Handler, inType, 
 	r.mux.Handle(fullPattern, wrapped)
 
 	if r.routes != nil {
-		*r.routes = append(*r.routes, routeRecord{
+		r.appendRoute(routeRecord{
 			Method:  method,
 			Pattern: r.prefix + pattern,
 			InType:  inType,
@@ -404,7 +443,7 @@ func (r *Router) Routes() []RouteInfo {
 	if r.routes == nil {
 		return nil
 	}
-	records := *r.routes
+	records := r.snapshotRoutes()
 	infos := make([]RouteInfo, 0, len(records))
 	for _, rec := range records {
 		infos = append(infos, RouteInfo{

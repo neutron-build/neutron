@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"encoding/json"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -28,11 +30,21 @@ type App struct {
 	lifecycle  *lifecycle
 	config     *Config
 	logger     *slog.Logger
-	openapi    *OpenAPISpec
+	// openapiMu guards the cached spec and its serialized bytes: with the
+	// default /openapi.json endpoint resolving the spec per request (NA-05),
+	// two concurrent first requests may both reach the cache.
+	openapiMu sync.Mutex
+	openapi   *OpenAPISpec
 	// openapiGen is the router generation the cached spec was built at
 	// (GO-13).
-	openapiGen     uint64
-	oaInfo         OpenAPIInfo
+	openapiGen uint64
+	// openapiJSON caches the serialized spec bytes for the default endpoint,
+	// keyed to the same shared generation so a registration after Build()
+	// still changes what /openapi.json serves (NA-05). Before, the bytes
+	// were marshaled once at Build time, so even a root-level route added
+	// afterwards never reached the wire.
+	openapiJSON   []byte
+	oaInfo        OpenAPIInfo
 	nucleusChecker NucleusChecker
 	// built records that Build() has already registered the default routes, so
 	// Run() and Handler() can both call it without registering them twice.
@@ -126,18 +138,42 @@ func (a *App) Router() *Router {
 // OpenAPI returns the auto-generated OpenAPI 3.1 specification.
 // The spec is built lazily on first access from registered routes and
 // re-generated when routes were registered after the last build (GO-13):
-// a spec cached before later registrations was silently stale.
+// a spec cached before later registrations was silently stale. The
+// generation counter is shared with every Group, so a grouped registration
+// invalidates the cache exactly like a root one (NA-05).
 func (a *App) OpenAPI() *OpenAPISpec {
+	a.openapiMu.Lock()
+	defer a.openapiMu.Unlock()
+	return a.openapiLocked()
+}
+
+// openapiLocked is OpenAPI with a.openapiMu already held.
+func (a *App) openapiLocked() *OpenAPISpec {
 	gen := a.router.Generation()
 	if a.openapi == nil || a.openapiGen != gen {
-		var routes []routeRecord
-		if a.router.routes != nil {
-			routes = *a.router.routes
-		}
+		routes := a.router.snapshotRoutes()
 		a.openapi = generateOpenAPI(routes, a.oaInfo)
 		a.openapiGen = gen
+		a.openapiJSON = nil
 	}
 	return a.openapi
+}
+
+// openapiJSONBytes returns the marshaled spec, cached per generation so the
+// endpoint does not re-marshal on every request but also cannot serve bytes
+// from before a later registration (NA-05).
+func (a *App) openapiJSONBytes() ([]byte, error) {
+	a.openapiMu.Lock()
+	defer a.openapiMu.Unlock()
+	a.openapiLocked()
+	if a.openapiJSON == nil {
+		data, err := json.MarshalIndent(a.openapi, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		a.openapiJSON = data
+	}
+	return a.openapiJSON, nil
 }
 
 // Build registers the framework's default routes (/openapi.json, /docs,
@@ -158,7 +194,20 @@ func (a *App) Build() {
 	}
 	a.built = true
 
-	a.router.handleIfAbsent("GET /openapi.json", OpenAPIJSON(a.OpenAPI()))
+	// The default endpoint resolves the current spec for every request rather
+	// than bytes serialized once here: a registration after Build() used to be
+	// invisible to /openapi.json until the process restarted (NA-05). The
+	// spec and its bytes are still cached, keyed to the shared generation, so
+	// the common case is a map lookup, not a re-marshal.
+	a.router.handleIfAbsent("GET /openapi.json", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := a.openapiJSONBytes()
+		if err != nil {
+			http.Error(w, "OpenAPI serialization failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write(data)
+	}))
 	if !a.disableDefaultDocs {
 		a.router.handleIfAbsent("GET /docs", SwaggerUI(a.OpenAPI()))
 		a.router.handleIfAbsent("GET /docs/", SwaggerUI(a.OpenAPI()))

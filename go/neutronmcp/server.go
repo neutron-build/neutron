@@ -1,6 +1,7 @@
 package neutronmcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -206,7 +207,31 @@ func (s *Server) visibleTools(principal Principal) []ToolInfo {
 // Permission is re-checked here and not merely at listing time. Hiding a tool
 // is a courtesy to well-behaved clients; it is not access control, because
 // nothing stops a caller naming a tool it never saw.
+//
+// This is now the HTTP shim over the public in-process entry point: dispatch
+// logic lives in CallTool so an application embedding the server cannot drift
+// from what the wire serves (NA-11).
 func (s *Server) callTool(r *http.Request, name string, args map[string]any, principal Principal) toolResult {
+	return s.CallTool(r.Context(), name, args, principal)
+}
+
+// CallTool invokes a registered tool as an already-authenticated principal.
+//
+// It performs authorization — the same permission check, principal context,
+// logging, and in-band error results as an HTTP tools/call — but it does not
+// authenticate anything: the caller supplies a Principal derived from its own
+// trusted authentication boundary. Never construct one from request-scope
+// claims and pass it through as trusted.
+//
+// Registration is expected to finish before calls begin (as with serving);
+// exporting this method does not make a concurrently mutated tool map safe.
+func (s *Server) CallTool(ctx context.Context, name string, args map[string]any, principal Principal) ToolResult {
+	if ctx == nil {
+		return errorResult("neutronmcp: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return errorResult(err.Error())
+	}
 	t, found := s.tools[name]
 	if !found {
 		return errorResult("unknown tool: " + name)
@@ -220,13 +245,13 @@ func (s *Server) callTool(r *http.Request, name string, args map[string]any, pri
 	s.logger().Info("neutronmcp: tool call",
 		"server", s.Name, "tool", name, "principal", principal.Name, "destructive", t.Destructive)
 
-	out, err := t.Run(withPrincipal(r.Context(), principal), args)
+	out, err := t.Run(withPrincipal(ctx, principal), args)
 	if err != nil {
-		// A tool that failed is reported in-band. See toolResult for why this
+		// A tool that failed is reported in-band. See ToolResult for why this
 		// must not become a JSON-RPC error.
 		return errorResult(err.Error())
 	}
-	return toolResult{Content: TextContent(out)}
+	return ToolResult{Content: TextContent(out)}
 }
 
 func errorResult(message string) toolResult {

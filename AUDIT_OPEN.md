@@ -585,3 +585,128 @@ navigation. The reload was answered by the browser, never reaching the server.
   (0.2.2 predates `c31736eb` entirely: string bodies, substring
   Cache-Control parsing, no keyable-Vary admission, variant key without
   origin/Accept-Language/data-header dimensions).
+
+## Neutron framework audit NA-01..NA-14 (2026-10-06, GPT pass — wave-2 fixes)
+
+Full report: `.audits/2026-10-06/gpt-reports/neutron-full.md` (the originally
+extracted `neutron.md` was truncated at NA-05; the complete 69,011-char report
+was recovered from the source conversation). Every finding was re-verified
+against `82cb9e28` before fixing; each fix carries a fail-before/pass-after
+regression run against a clean HEAD worktree and a live PostgreSQL 17.
+
+Defects fixed (all verified+implemented on branch `audit/na-fixes`):
+
+- NA-01 | FIXED (P1) — every job terminal write (complete/retry/fail/shutdown-
+  release) is fenced by a fresh per-claim `claim_token` (`status='running' AND
+  claim_token=$n`, rows-affected checked, reaper clears the token); renewal is
+  token-fenced, expiry-bounded (`lease_expires_at > NOW()`), and a
+  confirmed-through watchdog cancels the handler at the last acknowledged lease
+  boundary, so renewal ERRORS no longer extend a handler's lifetime past its
+  lease. Same-worker-ID reclaim is explicitly covered by tests. Regressions:
+  `go/neutronjobs/queue_integration_test.go`
+  (StaleAttemptCannotMutateNewerClaim, LostLeaseCancelsHandler,
+  RenewalErrorsBoundHandlerLifetime). Rollout note preserved in code: stop old
+  workers before enabling token enforcement — old binaries still issue
+  ID-only writes.
+- NA-02 | FIXED (P1) — `Process` now runs exactly `concurrency` worker loops,
+  each claiming at most one job when ready to execute it; a claim may no
+  longer be parked without a heartbeat while waiting for a slot. Regression:
+  ClaimRequiresCapacity (B stays `pending`/attempts 0 while the only slot is
+  busy).
+- NA-03 | FIXED (P2) — `RecoverLegacyRunning(ctx)`: explicit cutover migration
+  that backfills an expired lease for NULL-lease running rows (attempts
+  unchanged), handing them to the ordinary reaper; NOT run per-boot. Regression:
+  LegacyNullLeaseRecovery (reaper ignores them before, recovery applies
+  retry/dead-letter policy after, live claims untouched).
+- NA-04 | FIXED (P1) — `parseRouteFacts` now parses the module with
+  @babel/parser (all declarators incl. destructuring, export specifier names
+  incl. string literals, runtime `export *` conservative-true, unparseable →
+  conservative-true; regex false-negatives are gone). New shared
+  `assertStaticRoutesUngated` (core, exported) checks ACTUAL module exports
+  across the layout chain and gates BOTH the standalone renderer and the
+  production `neutron-cli build` static loop before anything is written.
+  Regressions: `client-tier.test.ts` (9 spellings), `static-gate-preflight.test.ts`,
+  existing server-side prebuilt-artifact tests retained.
+- NA-05 | FIXED (P2) — `Router.gen` is one shared `*atomic.Uint64` across
+  Group trees; route-record append/snapshot and the sites map are behind a
+  shared registry mutex (race-detector-verified); `/openapi.json` resolves the
+  current spec per request with generation-keyed cached bytes; `OpenAPIJSON`
+  remains a public snapshot helper; user-owned `/openapi.json` still wins.
+  Regressions: `go/neutron/openapi_generation_regression_test.go`.
+- NA-06 | FIXED (P2) — shared `core/route-path.ts` token module;
+  `bindPathParams` re-binds parameter names from the WINNING route's pattern
+  after trie selection (scratch map no longer escapes); duplicate/wildcard
+  positions rejected at insertion. Regressions: `route-param-regression.test.ts`
+  (both insertion orders, suffixed/catch-all, backtracking, null-prototype).
+- NA-07 | FIXED (P2) — not-found scopes match structurally via the shared
+  binder (`findNotFoundMatch`), selection is by structural specificity
+  (static>param>wildcard, suffix length, stable id tie-break — never
+  parameter-name length), and `matchNotFound` returns the scope's params.
+  Regression: `/org/[orgId]/not-found` receives `orgId=acme`; deeper/static
+  scope precedence; scope stays non-navigable.
+- NA-08 | FIXED (P2) — mixed re-export stripping preserves the original
+  statement's prefix and suffix verbatim (source clause, attributes,
+  semicolon); string-literal export names are recognized. Regressions in
+  `server-only.test.ts` (parse-the-output assertions).
+- NA-09 | FIXED (P2) — destination selection is a batch decision driven by
+  the TABLE count (`planOutputDestinations`): column count can no longer
+  create a directory named `models.go`; multi-table batches get distinct
+  destinations, duplicate/explicit-file misuse is rejected with an
+  explanation; writes go through temp-sibling+rename. Regressions:
+  `cli/cmd/generate_output_test.go`.
+- NA-10 | FIXED (P2) — `generateStructs` emits `encoding/json` when any column
+  maps to `json.RawMessage`; regression type-checks the generated source with
+  the real toolchain (`go/neutroncli/typecheck_test.go`).
+- NA-11 | IMPLEMENTED (API improvement) — exported `Server.CallTool(ctx,
+  name, args, Principal) ToolResult` (the permission-aware dispatcher; HTTP
+  `callTool` is now a shim over it) and exported `ToolResult` (private alias
+  retained). External-package tests verify principal context, scope/readonly
+  refusal, unknown tool, in-band errors, canceled/nil context, and HTTP-vs-
+  in-process parity: `go/neutronmcp/server_external_test.go`.
+- NA-12 | FIXED (P2) — `excluded()` builds a semantic `excluded-ref` node
+  (ordinary `qual("excluded", …)` references are ordinary identifiers and
+  compile/execute — PG really allows a table/schema named `excluded`); the
+  validator carries lexical visibility instead of resetting it per subquery:
+  scalar subqueries in DO UPDATE SET/WHERE inherit the binding, matching
+  PostgreSQL 17 (live fixture `SET body = (SELECT excluded.body || '-seen')`
+  → `after-seen`, executed through both drivers). Genuine unbound uses still
+  fail before SQL. Regressions: `neutron-sql/src/excluded-scope.test.ts` +
+  corrected `conflicts.test.ts` scope case.
+- NA-13 | FIXED (P3) — `toPathType` uses `JSON.stringify` for static paths
+  (double quotes escape correctly), keeps literal suffixes on dynamic tokens
+  (`:id.json` → `` `/${string}.json` ``), and the navigable set is decided by
+  the `isNavigableRoute` predicate (no not-found phantom entries, no
+  absolute-path `_layout` substring matching). Regressions in
+  `route-param-regression.test.ts` incl. a Babel parse of the generated
+  declaration.
+- NA-14 | FIXED (P2) — `enumerateTables` fails closed on scan/iteration
+  errors for BOTH profiles (a partial catalog read is never success); the
+  timeout derives from `cmd.Context()`; the legacy path stages the whole batch
+  before publishing. Regressions: injected-cursor tests in
+  `cli/cmd/generate_output_test.go`.
+
+Retained protections re-verified on this pass (already fixed; no new fix
+needed, per the audit's downstream-suspicions table):
+
+- Router JSON-404 passthrough (neutron-23):
+  `TestApplication404PassesThroughUntouched` / `...405AndHtml404...` pass.
+- Mid-path `[param]` discovery: `manifest.test.ts`
+  (`api/runs/[id]/decide.tsx` → `/api/runs/:id/decide`) passes.
+- Session regeneration atomic rotation:
+  `TestSQLSessionAtomicRevocationRotationAndCAS` (live PG),
+  `TestStaleSessionCannotResurrectAfterRevoke`,
+  `TestMemorySessionRevisionRotationAndABA` pass.
+
+Suites at the end of this pass: Go `go/` all packages green (jobs + neutron
+also under `-race`; the five `go/nucleus` engine-specific tests that require a
+Nucleus engine fail identically at HEAD when pointed at plain PG — pre-existing,
+env-gated); `cli/` green; TS neutron suite 647 passed / 0 failed / 1 skipped
+(request-cache-ssr is the separately tracked flaky pre-existing finding);
+neutron-sql 531 unit + 64+ live PG tests green. The one known pre-existing
+failure was not chased, per the open item.
+
+Left open from this report: none of NA-01..NA-14 remain unfixed. The report's
+"build into staging and publish atomically" hardening for `dist/` (NA-04) and
+per-file-rename→whole-directory staging (NA-09) were implemented at the
+per-file level only; full atomic-directory publication remains unimplemented
+and unrequested.

@@ -1,8 +1,15 @@
-import { findNotFoundRoute } from "./manifest.js";
+import { findNotFoundMatch } from "./manifest.js";
+import { parsePath, bindPathParams, parseUrlPath } from "./route-path.js";
 import type { Route, RouteMatch } from "./types.js";
 
 interface TrieNode {
   children: Map<string, TrieNode>;
+  // Dynamic children key by their literal suffix — `/users/:id` and
+  // `/users/:slug` share one edge, which is the point. The edge still records
+  // a name for traversal ordering, but it is a hint, never the truth: names
+  // are re-bound from the WINNING route's own tokens after selection
+  // (NA-06 — the first inserter's name used to leak into every sibling's
+  // params).
   paramChildren: Map<string, { node: TrieNode; name: string }>;
   wildcardChildren: Map<string, { node: TrieNode; name: string }>;
   route: Route | null;
@@ -32,6 +39,21 @@ export function createRouter() {
     }
 
     const segments = parsePath(route.path);
+    // Reject malformed routes here rather than discovering a duplicate or
+    // misplaced parameter on the first request (NA-06): a route whose own
+    // pattern cannot bind is a route-table bug, not a runtime 500.
+    const seen = new Set<string>();
+    for (const segment of segments) {
+      if (segment.type === "static") continue;
+      if (seen.has(segment.value)) {
+        throw new Error(`Duplicate route parameter :${segment.value} in ${route.path} (${route.file})`);
+      }
+      seen.add(segment.value);
+      if (segment.type === "wildcard" && segment !== segments[segments.length - 1]) {
+        throw new Error(`Wildcard *${segment.value} must be the final segment of ${route.path} (${route.file})`);
+      }
+    }
+
     let node = root;
 
     for (const segment of segments) {
@@ -62,10 +84,21 @@ export function createRouter() {
 
   function match(urlPath: string): RouteMatch | null {
     const segments = parseUrlPath(urlPath);
-    const params: Record<string, string> = {};
-    
-    const result = matchNode(root, segments, 0, params);
+    // The scratch map steers traversal only (backtracking deletes as it
+    // goes); it must not escape as public params. Names are bound from the
+    // winning route's tokens below, so a shared dynamic edge built by a
+    // differently-named sibling cannot misname the parameter (NA-06).
+    const scratch: Record<string, string> = Object.create(null);
+
+    const result = matchNode(root, segments, 0, scratch);
     if (!result) return null;
+
+    const params = bindPathParams(result.path, segments);
+    if (params === null) {
+      // The trie selected a route whose own pattern cannot bind the URL it
+      // just matched — a corrupted route table, not a client error.
+      throw new Error(`Router matched an inconsistent route pattern: ${result.path} for ${urlPath}`);
+    }
 
     const layouts = getLayouts(result, routes);
 
@@ -79,15 +112,18 @@ export function createRouter() {
   /**
    * The `not-found.tsx` covering `urlPath`, as a match ready to render.
    *
-   * Returned as a full `RouteMatch` — with its layout chain — because that is
-   * the entire reason the convention exists: `notFound()` can only produce a
-   * standalone document, so a 404 arrived with none of the app's chrome. This
-   * lets the 404 render through exactly the same path as any other page.
+   * Returned as a full `RouteMatch` — with its layout chain, and with the
+   * scope's parameters bound (NA-07: a `not-found.tsx` under `[orgId]` used
+   * to never match its dynamic scope, and even a matched one arrived with
+   * `params: {}`) — because that is the entire reason the convention exists:
+   * `notFound()` can only produce a standalone document, so a 404 arrived
+   * with none of the app's chrome. This lets the 404 render through exactly
+   * the same path as any other page.
    */
   function matchNotFound(urlPath: string): RouteMatch | null {
-    const route = findNotFoundRoute(routes, urlPath);
-    if (!route) return null;
-    return { route, params: {}, layouts: getLayouts(route, routes) };
+    const found = findNotFoundMatch(routes, urlPath);
+    if (!found) return null;
+    return { route: found.route, params: found.params, layouts: getLayouts(found.route, routes) };
   }
 
   function matchNode(
@@ -139,45 +175,11 @@ export function createRouter() {
   return { insert, match, matchNotFound, getRoutes };
 }
 
-type PathSegment =
-  | { type: "static"; value: string }
-  | { type: "param"; value: string; suffix: string }
-  | { type: "wildcard"; value: string; suffix: string };
-
-function parsePath(path: string): PathSegment[] {
-  const parts = path.split("/").filter(Boolean);
-  const segments: PathSegment[] = [];
-
-  for (const part of parts) {
-    if (part.startsWith("*")) {
-      const { name, suffix } = splitDynamicSegment(part.slice(1), "*");
-      segments.push({ type: "wildcard", value: name, suffix });
-    } else if (part.startsWith(":")) {
-      const { name, suffix } = splitDynamicSegment(part.slice(1), "");
-      segments.push({ type: "param", value: name, suffix });
-    } else {
-      segments.push({ type: "static", value: part });
-    }
-  }
-
-  return segments;
-}
-
-function splitDynamicSegment(value: string, fallback: string): { name: string; suffix: string } {
-  const dot = value.indexOf(".");
-  if (dot === -1) return { name: value || fallback, suffix: "" };
-  return { name: value.slice(0, dot) || fallback, suffix: value.slice(dot) };
-}
-
 // A suffixed route such as `*slug.md` is more specific than a plain catch-all.
 // Try it first so `/docs/intro.md` reaches the markdown resource route while
 // `/docs/intro` continues to reach the page route.
 function dynamicChildren<T>(children: Map<string, T>): Array<[string, T]> {
   return [...children.entries()].sort(([a], [b]) => b.length - a.length);
-}
-
-function parseUrlPath(path: string): string[] {
-  return path.split("/").filter(Boolean);
 }
 
 function getLayouts(route: Route, allRoutes: Route[]): Route[] {
