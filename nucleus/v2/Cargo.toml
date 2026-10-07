@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "xtask"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "2.0.0-dev"
@@ -11,6 +12,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 nucleus-kv = { path = "crates/nucleus-kv" }
 nucleus-txn = { path = "crates/nucleus-txn" }
+nucleus-codec = { path = "crates/nucleus-codec" }
 thiserror = "1"
 # Maintained fork of im. 7.0 for RUSTSEC-2026-0292 (sized-chunks); needs Rust 1.85.
 imbl = { version = "7.0", default-features = false }
