@@ -36,7 +36,10 @@ pub enum Op {
     /// Removes every key in `[start, end)`. Must be correct across all levels
     /// (no older key under the range may reappear). C-T0 §9 relies on this for
     /// tombstone GC.
-    DeleteRange { start: Key, end: Key },
+    DeleteRange {
+        start: Key,
+        end: Key,
+    },
 }
 
 impl Batch {

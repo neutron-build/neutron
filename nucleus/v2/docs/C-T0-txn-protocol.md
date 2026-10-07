@@ -1,6 +1,6 @@
 # C-T0: Transaction protocol (normative)
 
-Status: draft 2 (round-1 adversarial review applied; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
+Status: draft 3 (round-1 and round-2 adversarial reviews applied; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
 
 Scope: single node. Isolation levels: RC (PostgreSQL semantics), RR = SI, SERIALIZABLE = SSI. 2PC (`PREPARE TRANSACTION`) is refused with 0A000 in 2.0. Target behaviour is PostgreSQL 17; every deliberate divergence is listed in §12.
 
@@ -12,38 +12,48 @@ Scope: single node. Isolation levels: RC (PostgreSQL semantics), RR = SI, SERIAL
 | `TxnId` | `(epoch: u32, n: u64)`. `epoch` = boot epoch. `n` dense per epoch. |
 | `S` | A snapshot ts. Snapshot visibility: committed with `commit_ts <= S`. |
 | `visible_ts` | Largest ts such that every commit `<= ts` is applied (§3). |
+| visible commit | T is `Committed(c)` and `c <= visible_ts`. A committed txn that is not yet visible is treated like `Pending` by every writer-side decision (§3.2). |
 | logical key | KV key without the version suffix (`/t/{rel}/{pk}`, `/u/{idx}/{key}`, ...). `{rel}` and `{idx}` are **storage ids** (§10), never catalog oids. |
-| version | `{logical}@{ts}`: committed value, tombstone, or moved-tombstone (§5.1). **Versions of one logical key sort newest first (descending ts).** |
+| version | `{logical}@{ts}`: a committed value with a header (§2.2). **Versions of one logical key sort newest first (descending ts).** |
 | intent | `{logical}@INTENT`: at most one per logical key; owned by one txn. Sorts before all versions of its key. |
 | `seq` | Per-txn command counter (PostgreSQL command id). Incremented per statement and per savepoint. **Never decreases**, including across `ROLLBACK TO`. |
-| view | A KV snapshot (`OrderedKv::snapshot`) or the latest state read under a latch. |
-| latch | Short striped mutex over a hash of a latch key (normally the logical key; §5.2 names the exceptions). Held only for check-and-place and for intent removal. Never held across waits on other txns. |
+| view | A KV snapshot (`OrderedKv::snapshot`), or the latest state read under a latch. |
+| latch | Short striped mutex over a hash of `latch_key(k)` (§5.0). Held only for check-and-place and for intent removal. Never held across waits on other txns. A thread never holds two latches. |
 | key column | A column of any non-partial, non-expression unique index of the relation (PostgreSQL's definition for `FOR KEY SHARE` / `NO KEY UPDATE`). |
 
 ## 2. Data
 
 ### 2.1 Intent
 ```
-Intent { txn: TxnId, layers: Vec<Layer> }          # oldest first, never empty
-Layer  { seq: Seq, data: Write(bytes) | Delete | Absent, lock: RowLockMode }
+Intent    { txn: TxnId, layers: Vec<Layer> }        # oldest first, never empty
+Layer     { seq: Seq, data_seq: Seq, data: LayerData, lock: RowLockMode }
+LayerData = Write { value: bytes, key_changed: bool } | Delete { moved: bool } | Absent
 ```
-Each layer is the **complete own state** of the key as of `seq`: `data` is the txn's own value (`Absent` = no own value; reads fall through to versions), `lock` is the strongest exclusive mode held (`NoKeyUpdate` or `Update`). The top layer is the current state.
+Each layer is the **complete own state** of the key as of `seq`. `data` is the txn's own value (`Absent` = no own value; reads fall through to versions). `data_seq` is the seq at which `data` last changed (equal to `seq` for a layer that changed data; copied from the previous layer by lock-only changes; 0 when `data` is `Absent` and never changed). `lock` is the strongest exclusive mode held (`NoKeyUpdate` or `Update`). The top layer is the current state.
 
-- A data write implies a lock: `Delete`, or a `Write` that changes a key column → `Update`; any other `Write` → `NoKeyUpdate`. The layer's `lock` is the max of the implied mode, the previous layer's lock, and any explicit lock request.
-- A lock-only request (`SELECT ... FOR UPDATE / NO KEY UPDATE`) copies the previous layer's `data` and raises `lock`. **It never replaces own data.** (A first lock-only request on a key creates a layer with `data: Absent`.)
-- New state at command `seq`: if top.seq == seq, modify the top layer in place; otherwise push a new layer.
+- A data write implies a lock: `Delete`, or a `Write` with `key_changed` (a key column changed relative to the newest committed or own previous value) → `Update`; any other `Write` → `NoKeyUpdate`. The layer's `lock` is the max of the implied mode, the previous layer's lock, and any explicit lock request.
+- `Delete { moved: true }` is written at the old `/t/` key by an UPDATE that changes the primary key (§5.1).
+- A lock-only request (`SELECT ... FOR UPDATE / NO KEY UPDATE`) copies the previous layer's `data` and `data_seq` and raises `lock`. **It never replaces own data.** A first lock-only request on a key creates a layer with `data: Absent`.
+- New state at command `seq`: if `top.seq == seq`, modify the top layer in place; otherwise push a new layer.
 - Shared modes (KEY SHARE, SHARE) are never stored in intents (§6).
 
 Foreign readers and resolution look only at the **top layer's `data`**. `Absent` means "lock only": no version is produced, nothing becomes visible.
 
-### 2.2 Version key layout (ts-in-key backends)
+### 2.2 Version key and value layout (ts-in-key backends)
 `L` = the encoded logical key, prefix-free by C-Q3s P-PREFIX, so no other logical key starts with `L`.
 ```
 intent        L ‖ 0x00
 version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts)      # newest first
 end(L)        L ‖ 0x02                            # exclusive upper bound of every entry of L
+version value header ‖ payload
+  header 0x00 live              payload = row/entry bytes
+         0x01 live, key_changed payload = row/entry bytes
+         0x02 tombstone         no payload
+         0x03 moved-tombstone   no payload
 ```
-`[L ‖ 0x00, end(L))` holds exactly the intent and versions of `L`. The GC range for tombstone `L@t` is `[L ‖ 0x01 ‖ be64(u64::MAX - t), end(L))`. Backends with user-defined timestamps store `L` as the user key, the ts in the engine's timestamp, and the intent as `L ‖ 0x00` with no timestamp.
+`[L ‖ 0x00, end(L))` holds exactly the intent and versions of `L`. The GC range for tombstone `L@t` is `[L ‖ 0x01 ‖ be64(u64::MAX - t), end(L))`. Resolution maps `Write{key_changed}` to header 0x00/0x01 and `Delete{moved}` to 0x02/0x03.
+
+The layout for backends with user-defined timestamps (intent placement, tombstone and moved-tombstone representation) is open (§12 Q2) and must be specified before such a backend is adopted.
 
 ### 2.3 Persisted system keys
 - `/sys/txn/{TxnId}`: only `Committed(ts)` is persisted. `Pending` and `Aborted` are in-memory only (§7).
@@ -54,22 +64,23 @@ end(L)        L ‖ 0x02                            # exclusive upper bound of e
 
 ## 3. Commit pipeline and visibility
 
-One **commit thread** owns the sequencer. Txns submit a commit request (status record, optional `/log` record, sync mode) on a channel. Requests are processed strictly in channel order. The thread:
+One **commit thread** owns the sequencer. Txns submit a commit request (status record, optional `/log` record, sync mode, and for SERIALIZABLE txns the prepared SSI record, §8.4) on an **unbounded** channel. Requests are processed strictly in channel order. The thread:
 
 1. Drains a group. Assigns `commit_ts` in channel order. If `commit_ts` would exceed `ts_hwm`, first writes `/sys/ts_hwm += BLOCK` in the same batch.
 2. Writes the group's records to the KV in `commit_ts` order (one write per request or one batch per group; WAL order must equal `commit_ts` order).
-3. For the prefix of `synchronous_commit=off` requests up to the first `on` request: set in-memory status `Committed(ts)`, then advance `visible_ts`, then ack.
-4. fsync (never on a tokio worker). Then, for the rest of the group in order: set status, advance `visible_ts`, ack.
-5. Wake every waiter on each committed txn (§6). Waking happens after `visible_ts >= commit_ts`.
+3. For each SERIALIZABLE request, inserts `commit_ts -> TxnId` into the SSI writer map (§8.5). This happens before step 4 sets any status.
+4. For the prefix of `synchronous_commit=off` requests up to the first `on` request: set in-memory status `Committed(ts)`, then advance `visible_ts`, then ack. Then fsync (never on a tokio worker), and for the rest of the group in order: set status, advance `visible_ts`, ack.
+5. For each committed txn, after `visible_ts >= commit_ts`, in this order: release its in-memory locks (shared row locks, relation locks, xact advisory locks, deferrable-unique prefix waits); bump its wake generation and wake every waiter (§6); queue it for async resolution (C-B1).
 
-The commit thread never aborts a txn. Once a request is on the channel the txn will commit unless the process dies (SSI decisions are made before enqueueing, §8). Failed KV write: the thread stops and the process aborts (fail-stop). It never fills a ts hole by skipping.
+The commit thread never aborts a txn. Once a request is on the channel the txn will commit unless the process dies (SSI decisions are made before enqueueing, §8.4). Failed KV write: the thread stops and the process aborts (fail-stop). It never fills a ts hole by skipping.
 
-Boot: `next_ts = ts_hwm + 1` (anything up to `ts_hwm` may have been handed out).
+Boot: `next_ts = ts_hwm + 1` and `visible_ts = ts_hwm` (anything up to `ts_hwm` without a persisted `Committed` record never committed). All persisted commits are visible at boot.
 
 ### 3.1 Snapshot and view registration
-A **registry** (one mutex) holds every live snapshot `S` and every open view's counter.
+A **registry** (one mutex) holds every live snapshot `S`, every open view's counter, and the published watermark `W` (§9.1).
 
 - **Taking a snapshot:** under the registry mutex, read `S = visible_ts` and insert `S` into the registry. One step; nothing can compute `W` or retire SSI state between the read and the insert.
+- **Registering a caller-chosen ts** (`AS OF t`, a segment build's `built_at`): under the registry mutex, check `t >= W` (the published `W`) and `t <= visible_ts`, then insert `t`. Otherwise 72000 (`snapshot_too_old`) for AS OF; a build re-takes its ts.
 - **Opening a view:** under the registry mutex, take `c = ++view_counter` and register `c`; release the mutex; then open the KV snapshot/iterator. Unregister `c` when the view closes.
 - A txn's snapshot stays registered until the txn ends (RR/SER) or until its statement ends (RC). An open cursor or portal keeps its snapshot registered until it closes.
 
@@ -80,7 +91,8 @@ A **registry** (one mutex) holds every live snapshot `S` and every open view's c
 
 Why that is enough: for any committed T with `commit_ts <= S`, T's intents were written before its commit record, which was written before `visible_ts` passed `commit_ts`, which happened before `S` was read, which happened before the view opened. So the view contains T's writes (as intents or resolved versions).
 
-**Commit-visibility window.** Between steps 3/4 setting `Committed(c)` and `visible_ts` reaching `c`, T is committed but not yet visible to new snapshots. Every writer-side decision (§5, §5.2, §6) treats `Committed(c)` with `c > visible_ts` exactly like `Pending`: it waits, and is woken at step 5. Readers need no rule: `S <= visible_ts < c`.
+### 3.2 Commit-visibility window
+Between step 4 setting `Committed(c)` and `visible_ts` reaching `c`, T is committed but not yet visible to new snapshots. Every writer-side decision (§5, §5.2, §6) treats such a T exactly like `Pending`: it waits, and is woken in step 5. Readers need no rule: `S <= visible_ts < c`. Because resolution is queued only in step 5 (and inline resolution only acts on visible commits), no **version** with ts greater than `visible_ts` ever exists; so writers never see a resolved version of a not-yet-visible commit.
 
 Backend requirement (disqualifier for C-S1): a single WAL across all keyspaces, sequential, so a sync covers every earlier write.
 
@@ -89,142 +101,154 @@ Backend requirement (disqualifier for C-S1): a single WAL across all keyspaces, 
 To read logical key `k` at snapshot `S` with statement start `seq0`, inside txn `R`, from view `V`:
 
 1. If `k@INTENT` exists in `V` with owner `T`:
-   - `T == R`: take the newest layer with `seq < seq0`. If it exists and its `data` is `Write(v)` → `v`; `Delete` → not-found; `Absent`, or no such layer → step 2.
+   - `T == R`: take the newest layer with `seq < seq0`. If it exists and its `data` is `Write` → its value; `Delete` → not-found; `Absent`, or no such layer → step 2.
    - `T != R`, top layer `data == Absent` (lock only): step 2. No SSI edge.
    - `T != R`, `status(T) == Committed(c)` and `c <= S`: the top layer's data is the newest visible version.
-   - otherwise (Pending, Aborted, or `c > S`): invisible, step 2. Under SERIALIZABLE, record rw-antidependency `R -> T` (§8).
+   - `T != R`, `status(T)` is `Pending`, or `Committed(c)` with `c > S`: invisible, step 2. Under SERIALIZABLE, record rw-antidependency `R -> T` (§8.2).
+   - `T != R`, `status(T) == Aborted`: invisible, step 2. No edge.
 2. The first version `k@t` in `V` with `t <= S`. Tombstone or moved-tombstone = not-found. Each version with `t > S` skipped under SERIALIZABLE records `R -> writer(t)` (§8.5).
 
 Status lookup never blocks and never misses (I-TRUNC, §7). A missing status for a txn of the **current** epoch is a fatal invariant violation (process aborts), never defaulted. A missing status for an older-epoch txn means Aborted.
 
 **I-HALLOWEEN.** A statement never sees its own writes with `seq >= seq0`.
 
-Views: a scan uses one view for its whole duration. RC takes a fresh `S` per statement; RR/SER take one `S` per txn. Versions `<= S` never change except by GC, which respects §9, so several views per statement are allowed. Under SERIALIZABLE every scan opens its **own** view after registering its SIREAD range (§8.1); RC and RR may share one view per statement.
+Views: a scan uses one view for its whole duration. RC takes a fresh `S` per statement; RR/SER take one `S` per txn. Versions `<= S` never change except by GC, which respects §9, so several views per statement are allowed. Under SERIALIZABLE the SIREAD ordering rules of §8.1 decide when a fresh view or a latest-state check is required.
 
-Reads at an explicit ts (`AS OF t`): `t` must be `>= W` and `<= visible_ts`; otherwise error 72000 (`snapshot_too_old`) and no data. The read registers `t` like a snapshot (§3.1), with the `>= W` check made under the registry mutex.
+Reads at an explicit ts (`AS OF t`) register `t` as in §3.1 and then read as a snapshot at `t`.
+
+Relations: a snapshot uses the latest committed catalog. Under RR/SER, if a relation's current storage id was created by a DDL with commit ts `> S` (TRUNCATE, table-rewriting ALTER), access raises 40001 (§12). An index whose `built_at > S` is not used by that snapshot.
 
 ## 5. Write path (all levels)
 
+### 5.0 Operations and latch keys
 Operations on a key `k` by txn `W` at snapshot `S`, current command `seq`, statement start `seq0`:
 
-- **Row ops** act on a row the statement found at `S`: UPDATE, DELETE, exclusive row lock (`FOR UPDATE`, `FOR NO KEY UPDATE`), shared row lock (`FOR SHARE`, `FOR KEY SHARE`, §6).
+- **Row ops** act on a row the statement found: UPDATE, DELETE, exclusive row lock (`FOR UPDATE`, `FOR NO KEY UPDATE`), shared row lock (`FOR SHARE`, `FOR KEY SHARE`, §6).
 - **Key-existence ops** create a key that must not be live: INSERT of `/t/{rel}/{pk}`, a PK-changing UPDATE's new `/t/` key, and unique entries `/u/{idx}/{key}`.
 
+`latch_key(k)` is defined once and used by **every** path that reads-then-writes `k@INTENT` (placement, every removal in §7.3, savepoint rollback):
+- for an `/i/{idx}/{key}{pk}` entry of a **deferrable** unique constraint: the prefix `/i/{idx}/{key}` (all entries with that key value);
+- otherwise: `k`.
+
+### 5.1 The loop
 ```
 loop:
-  latch(k)
+  latch(latch_key(k))
   read k@INTENT and the newest DATA version k@t from ONE fresh view of the latest state
+  g = wake_generation(owner) if a foreign intent exists
   if intent owned by T != W:
      st = status(T)
-     if st == Pending or (st == Committed(c) and c > visible_ts):
-        unlatch; wait_for(W -> T)        # §6; may raise 40P01 / 55P03 / lock_timeout
-        continue
-     if st == Committed(c):              # MANDATORY inline resolution (§7.3), joins the placement batch
-        if T's top data is Write/Delete: put k@c; the newest data version is now k@c
-        delete k@INTENT; intent_count(T) -= 1
-     if st == Aborted:                   # MANDATORY removal, joins the placement batch
-        delete k@INTENT; intent_count(T) -= 1
+     if st == Committed(c) and c <= visible_ts, or st == Aborted:
+        remove it now per §7.3 (its own KV batch, under this latch); continue
+     # T is Pending or committed-not-visible
+     if requested mode conflicts with top.lock of T's intent (§6 matrix):
+        unlatch; wait_for(W -> T, g); continue        # §6; may raise 40P01 / 55P03
+     # no conflict (e.g. KEY SHARE vs NoKeyUpdate): T's intent is invisible data; go on
   if shared row locks on k held by others conflict with the requested mode (§6):
-     unlatch; wait on every conflicting holder; continue
-  if own intent top layer has seq == seq0 and this is a row op visiting the row again (§5.4): handle per §5.4
-  row op:            t* = ts of the newest DATA version (committed lock-only intents are not versions)
-                     if t* > S:
-                        RR/SER: unlatch; raise 40001 (KEY SHARE: only if that version is a delete,
-                                moved-tombstone or key-changing write; otherwise proceed)
-                        RC: EPQ (§5.1)
-  key-existence op:  unique check (§5.2); never 40001 from t* alone, never EPQ
-  build the new top layer (§2.1); write {inline resolution ops, k@INTENT} as one KV batch
+     g' = their wake generations; unlatch; wait on every conflicting holder; continue
+  if W has an intent on k:      own-row rules (§5.4); the t* rule below is skipped
+  row op (no own intent):
+     t* = ts of the newest DATA version (committed lock-only intents are not versions)
+     if t* > S:
+        RR/SER: unlatch; raise 40001   (KEY SHARE: only if that version is a tombstone, moved-tombstone
+                                         or key_changed write; otherwise proceed)
+        RC:     EPQ (§5.2)
+  key-existence op: unique check (§5.3); never 40001 from t* alone, never EPQ
+  shared lock: record it in the lock table (tagged with seq); unlatch; done
+  if placing a new intent: intent_count(W) += 1   (before the write)
+  build the new top layer (§2.1); write k@INTENT as one KV batch
   unlatch
   SSI: if the new layer changed data (not lock-only), check SIREAD locks covering k (§8.2)
 ```
+Every early exit (40001, 23505, 21000, 27000, EPQ skip, NOWAIT, SKIP LOCKED, timeout) leaves the KV exactly as the removals already written left it; nothing is "planned" without being written.
 
-Shared row locks (KEY SHARE, SHARE) go through the same loop, including the row-op `t* > S` check, but record the lock in the in-memory table (§6) instead of writing an intent.
+**I-ONE-INTENT.** At most one intent per logical key. Guaranteed because placement happens only under `latch(latch_key(k))` when no foreign intent exists on `k`: visible-committed and aborted ones are removed by a written batch first, and a Pending one always conflicts with any op that places an intent (every exclusive mode conflicts with `NoKeyUpdate`), so only shared locks, which write no intent, pass a foreign intent.
+**I-WW.** Under RR/SER, a row op on a row with no own intent never succeeds when the row's newest data version is newer than `S`. RC instead serialises row ops through EPQ. Key-existence ops are governed by I-UNIQUE, not I-WW: inserting over a tombstone newer than `S` is allowed (PostgreSQL behaviour).
+**I-LOCK.** No two txns hold conflicting row-lock modes on one key at the same time (intent top-layer `lock` of a Pending or not-yet-visible txn, plus the shared lock table).
 
-**I-ONE-INTENT.** At most one intent per logical key. Guaranteed because placement happens only under the latch, after removing or waiting out every foreign intent, in the same batch as the removal.
-**I-WW.** Under RR/SER, a row op never succeeds on a row whose newest data version is newer than `S`. RC instead serialises row ops through EPQ. Key-existence ops are governed by I-UNIQUE, not I-WW: inserting over a tombstone newer than `S` is allowed (PostgreSQL behaviour).
-
-### 5.1 RC EvalPlanQual
+### 5.2 RC EvalPlanQual
 After a wait or when `t* > S`: re-read the newest committed data version, re-evaluate the statement's quals for this row against it (PostgreSQL EvalPlanQual). Fail: skip the row. Pass: apply the update computed from the newest version. Joined DML (UPDATE FROM, DELETE USING, MERGE): full EPQ, or an internal statement retry with a fresh snapshot (capped retries, then 40001). Which one is decided by G3c and recorded here.
 
-**Moved rows.** An UPDATE that changes the primary key writes, at the old `/t/` key, a **moved-tombstone** (a tombstone with a flag; readers treat it as not-found). EPQ that reaches a moved-tombstone raises 40001 ("tuple to be locked was already moved"). Under RR/SER the row op already raises 40001. Divergence from PostgreSQL, which follows the update chain: §12.
+**Moved rows.** EPQ that reaches a moved-tombstone (as a version, or as a foreign `Delete{moved: true}` intent) raises 40001 ("tuple to be locked was already moved"). Divergence from PostgreSQL, which follows the update chain: §12.
 
-### 5.2 Unique, primary key and FK
-**Unique check** (key-existence ops, under the latch on the key): the key's **current state** is the own intent's top-layer data if `W` has an intent on it (any seq, the current statement included), otherwise the newest committed data version.
-- Live and belonging to a different row → 23505. If the conflicting live entry was written by `W` in the **current** statement under `INSERT ... ON CONFLICT DO UPDATE` or `MERGE`, raise 21000 instead.
-- Under SERIALIZABLE, if that live version has ts `> S` and `W` holds a SIREAD covering the key, raise 40001 instead of 23505 (PostgreSQL ≥ 9.6). Otherwise 23505.
-- Not live (absent, tombstone, own `Delete`) → proceed, whatever its ts.
-- Concurrent duplicate insert: the second inserter meets the first's Pending intent and waits (§5 loop). First commits: the second re-runs and gets 23505. First aborts: the second proceeds.
+### 5.3 Unique, primary key and FK
+**Unique check** (key-existence ops, under the latch): the key's **current state** is the own intent's top-layer data if `W` has an intent on it and that data is `Write` or `Delete`; otherwise (no own intent, or own top data `Absent`) the newest committed data version.
+- Live and belonging to a different row → 23505. If the conflicting live entry was written by `W` in the **current** statement (`data_seq == seq0`) under `INSERT ... ON CONFLICT DO UPDATE` or `MERGE`, raise 21000 instead.
+- Under SERIALIZABLE, if that live version has ts `> S` and `W` holds a SIREAD covering the key, raise 40001 instead of 23505. Otherwise 23505. (To be confirmed against PostgreSQL's isolation tests in G3c.)
+- Not live (absent, tombstone, moved-tombstone, own `Delete`) → proceed, whatever its ts.
+- Concurrent duplicate insert: the second inserter meets the first's Pending intent (always conflicting: inserts hold `NoKeyUpdate` or stronger) and waits. First commits: the second re-runs and gets 23505. First aborts: the second proceeds.
 
-**I-UNIQUE.** No two live versions, or a live version and a foreign committed live intent, of one `/u/` or `/t/` key at any snapshot, and no snapshot sees two live rows with equal values of a unique key.
+**I-UNIQUE.** No snapshot sees two live rows with equal values of a unique key (NULLS DISTINCT keys with a NULL excepted), and no `/u/` or `/t/` key has two live versions at any snapshot.
 
 - **Primary key:** `/t/{rel}/{pk}` inserts and PK-changing updates run the same unique check on the new `/t/` key.
 - **NULLs:** `NULLS DISTINCT` (default): if any key column is NULL, the entry goes to `/i/{idx}/{key}{pk}` (no uniqueness). `NULLS NOT DISTINCT`: NULL is encoded in the `/u/` key and checked like any value.
-- **Deferrable unique constraints** use the non-unique `/i/` layout. The check runs in the commit phase, **before the commit request is enqueued**, under `latch(/i/{idx}/{key})`, which is the prefix of all entries with that key value, not a per-row key. It scans the prefix in the latest state: a foreign Pending (or committed-not-visible) entry → wait on its owner, then re-check; a committed live entry of another row, or a second own live entry → 23505. Every insert of an `/i/` entry for a deferrable constraint takes the same prefix latch.
+- **Deferrable unique constraints** use the non-unique `/i/` layout and the prefix latch key (§5.0). The check scans the prefix in the latest state under that latch: a foreign Pending or committed-not-visible entry → wait on its owner (it always conflicts), then re-check; a committed live entry of another row, or a second own live entry → 23505.
 
-**Foreign keys** are checked at end of statement (after all of the statement's writes), as PostgreSQL's RI triggers are. Own writes of the current statement count (`seq <= current`).
-- **Child side** (insert or FK-changing update of a child): take KEY SHARE on the parent's `/t/` key through the §5 loop (waits on pending parent writers; RR/SER raises 40001 if the parent's newest data version is newer than `S` and is a delete, moved-tombstone or key change). Then read the parent:
-  - RC: latest committed state plus own writes.
-  - RR/SER: at `S` plus own writes. Under SERIALIZABLE also register a SIREAD on the parent key.
-  - Not found → 23503.
-- **Parent side** (delete, or key change of a referenced key, NO ACTION/RESTRICT): the delete/update already holds `Update` on the parent (conflicts with KEY SHARE, so pending child inserters wait). At end of statement scan the child index for the old key in the latest committed state plus own writes. A live child → 23503. Under RR/SER, a child live in the latest state but invisible at `S` → 40001 (PostgreSQL `detectNewRows`).
+**Constraint timing.** A constraint is checked at end of statement unless it is currently deferred (`DEFERRABLE INITIALLY DEFERRED`, or `SET CONSTRAINTS ... DEFERRED`); deferred checks run in the commit phase **before the commit request is enqueued** (and before the SSI pre-commit, §8.4). `SET CONSTRAINTS ... IMMEDIATE` runs pending deferred checks at that point. End-of-statement checks see own writes with `seq <= current`.
+
+**Foreign keys.**
+- **Child side** (insert, or FK-changing update, of a child row): first read the parent: RC with a fresh snapshot, RR/SER at `S`, both plus own writes. Not found → 23503. Found → take KEY SHARE on the parent's `/t/` key as a row op through §5.1 (RC: EPQ re-check; RR/SER: 40001 if the parent's newest data version is newer than `S` and is a tombstone, moved-tombstone or key_changed write). Under SERIALIZABLE register a SIREAD on the parent key before the read.
+- **Parent side** (delete, or key change of a referenced key): the row op already holds `Update` on the parent (conflicts with KEY SHARE, so pending child inserters wait). At check time, scan the child index for the old key in the latest committed state plus own writes. A live child → for NO ACTION, first look for a live parent with the old key in the same state (`ri_Check_Pk_Match`); if one exists, no error; otherwise 23503. RESTRICT: 23503 without that look. Under RR/SER, a child live in the latest state but invisible at `S` → 40001 (PostgreSQL `detectNewRows`).
 - Referential actions (CASCADE, SET NULL, SET DEFAULT) run as ordinary DML through §5.
 
-### 5.3 Savepoints and cursors
+### 5.4 Own-row rules
+When `W` already has an intent on `k`:
+- **Revisit in the same statement** (a row op on a row whose own top layer has `data_seq == seq0`): UPDATE / DELETE skip the row (PostgreSQL `TM_SelfModified`); `INSERT ... ON CONFLICT DO UPDATE` and `MERGE` raise 21000. A layer that only changed `lock` at `seq0` (a CTE `FOR UPDATE`, the conflict lock of ON CONFLICT) does not count.
+- **Modified by a later command** (`data_seq > seq0`, e.g. a trigger or volatile function of this statement updated the row): raise 27000.
+- Otherwise: build the new layer. No `t* > S` check: the own intent has excluded foreign writers since it was placed, and its placement did the check (or was an insert, governed by I-UNIQUE).
+
+### 5.5 Savepoints and cursors
 The txn keeps a write-set log `(seq, logical key)` (spills to disk past a threshold).
 
 `ROLLBACK TO SAVEPOINT` at seq `s`:
-- For each key written at seq `>= s`: under the latch, re-read `k@INTENT`; if owned by the txn, drop layers with `seq >= s`. If no layer remains, delete the intent (`intent_count -= 1`). The restored top layer restores both data and lock.
-- Shared row locks (KEY SHARE, SHARE) taken at seq `>= s` are released.
+- For each key written at seq `>= s`: under `latch(latch_key(k))`, re-read `k@INTENT`; if owned by the txn, drop layers with `seq >= s`. If no layer remains, remove the intent per §7.3. The restored top layer restores data, `data_seq` and lock.
+- Shared row locks taken at seq `>= s` are released.
 - **SIREAD locks and recorded rw-conflicts are kept** (the client has seen the data; PostgreSQL keeps them too).
 - Portals and cursors opened at seq `>= s` are closed.
 - `seq` does not go back: the next command gets a seq greater than every seq used so far.
-- **All** waiters on the txn are woken. They re-run §5; spurious wakeups are harmless.
+- The txn's wake generation is bumped and **all** its waiters are woken. They re-run §5; spurious wakeups are harmless.
 
 Writes and locks are tagged with the seq current **when they execute**, not with the opening seq of the portal that runs them. A `FOR UPDATE` cursor fetched after `SAVEPOINT s` takes locks at seq `>= s`, so `ROLLBACK TO s` releases them.
 
 **Layer compaction.** Live boundaries are: the current statement's start, every open cursor/portal start, and every live savepoint seq. Layer `i` (with next layer `i+1`) is needed iff some live boundary `r` has `layers[i].seq < r <= layers[i+1].seq`. The top layer is always needed. Others may be dropped.
 
-### 5.4 Revisiting an own row in one statement
-If a row op finds the own intent's top layer with `seq == seq0` (the row was already changed by this statement):
-- UPDATE / DELETE: skip the row (PostgreSQL `TM_SelfModified`): not counted, no change.
-- `INSERT ... ON CONFLICT DO UPDATE`, `MERGE`: raise 21000 ("command cannot affect row a second time").
-- Locks: no-op.
-
 ## 6. Locks and waiting
 - Exclusive row modes (NO KEY UPDATE, UPDATE) live in intent layers (§2.1).
 - Shared modes (KEY SHARE, SHARE) live in an in-memory table keyed by logical key, tagged with the acquiring seq, and checked under the same latch. Safe because a crash aborts every holder.
-- Conflict matrix: PostgreSQL's row-lock matrix, applied to (requested mode, held mode). An intent holds its top layer's `lock`.
+- Conflict matrix: PostgreSQL's row-lock matrix, applied to (requested mode, held mode). An intent of a Pending or committed-not-visible txn holds its top layer's `lock`. Requested mode of each op: UPDATE without key change → NoKeyUpdate; UPDATE with key change, DELETE, PK change → Update; inserts and unique entries → NoKeyUpdate; explicit locks → their mode.
+- **Release.** A txn's in-memory locks are released at abort (§7.1) or in commit step 5 (§3), never earlier. Savepoint rollback releases those taken after the savepoint.
+- **Wake generation.** Every txn has a counter `gen(T)`, bumped on every event that can unblock its waiters: commit step 5, abort, `ROLLBACK TO`, any release of an in-memory lock it holds.
 - **Wait-for graph.** One graph covers every kind of wait: row intents, shared row locks (an edge to **every** conflicting holder), relation locks, advisory locks, deferrable-unique prefix waits.
-- **Waiting.** `wait_for(W -> T)` = (1) insert the edge into the graph and register W as a waiter on T, (2) re-read `status(T)`; if T is no longer Pending (or is committed and visible), remove the edge and return immediately, (3) park. Commit (§3 step 5), abort (§7.1) and `ROLLBACK TO` (§5.3) wake every registered waiter of T. A woken waiter removes its edges and re-runs §5.
+- **Waiting.** `wait_for(W -> T, g)` where `g = gen(T)` was read under the latch that observed the conflict: (1) insert the edge into the graph and register W as a waiter on T, (2) if `gen(T) != g`, or T is Aborted, or T is a visible commit, remove the edge and return immediately, (3) park. A woken waiter removes its edges and re-runs §5. The same pattern (read the generation where the conflict is seen, re-check after registering) is used for relation, advisory and prefix waits.
 - NOWAIT: 55P03 instead of waiting. SKIP LOCKED: skip the row. `lock_timeout`: 55P03 on expiry.
 - **Deadlock.** After `deadlock_timeout`, the waiter takes the graph mutex, runs a DFS, and if it finds a cycle containing itself, removes its own edges before releasing the mutex, then raises 40P01. Exactly one member of a cycle is aborted. No wait-die.
-- Relation locks (AccessShare … AccessExclusive) are a separate in-memory table, held to txn end. After acquiring one, catalog lookups use the latest committed catalog. Under RR/SER, if the relation's schema version is newer than `S`, raise 40001.
+- Relation locks (AccessShare … AccessExclusive) are a separate in-memory table, held to txn end. After acquiring one, catalog lookups use the latest committed catalog (§4 for RR/SER storage-id rule).
 - Advisory locks: in-memory, session or xact scope.
+- **Cancellation.** Only the owning session sets its own status to `Aborted`, and only outside any latch section. Cancel requests and timeouts set a flag that the session acts on at its next check point.
 
 ## 7. Abort, crash, resolution, status truncation
 
 ### 7.1 Abort
-Set status `Aborted` in memory, wake waiters, release shared locks, queue an async cleanup of the txn's intents (§7.3 rules). Nothing is persisted. SSI state follows §8.6.
+The owning session (§6) sets status `Aborted` in memory, releases its in-memory locks, bumps its wake generation and wakes waiters, then queues an async cleanup of its intents (§7.3 rules). Nothing is persisted. SSI state follows §8.6.
 
 ### 7.2 Crash
-On boot, `epoch += 1` (synced). Load every persisted `Committed` record and `/sys/gc_w`. An intent whose owner has `owner.epoch < current` and no `Committed` record is Aborted. That is O(1) per lookup; cleanup is lazy (on encounter in §5, or by the C-B1 sweep).
+On boot, `epoch += 1` (synced). Load every persisted `Committed` record and `/sys/gc_w`; set `visible_ts = ts_hwm` (§3). An intent whose owner has `owner.epoch < current` and no `Committed` record is Aborted. That is O(1) per lookup; cleanup is lazy (on encounter in §5, or by the C-B1 sweep).
 
 ### 7.3 Intent removal (every path)
-Paths that remove an intent: inline resolution or removal in §5, async resolution (C-B1), abort cleanup, the boot sweep, savepoint rollback. **Every one of them:**
-1. takes `latch(k)`,
+Paths that remove an intent: removal of a foreign visible-committed or aborted intent in §5.1, async resolution (C-B1), abort cleanup, the boot sweep, savepoint rollback, and retired-prefix cleanup (§9.2). Resolution of a committed T only ever runs once T is a visible commit. **Every path:**
+1. takes `latch(latch_key(k))`,
 2. re-reads `k@INTENT` from the latest state, and acts only if it is still owned by the expected txn (and, for savepoint rollback, the expected layers are present),
-3. writes its ops as one KV batch: `delete k@INTENT`, plus `put k@commit_ts` with the top layer's data when resolving a committed intent whose data is `Write` or `Delete` (a `Delete` becomes a tombstone version; `Absent` produces no version),
-4. decrements `intent_count(T)` only if it removed an intent of T,
-5. after the batch write returns, sets `last_removal_counter(T) = view_counter` (read under the registry mutex).
+3. writes its ops as one KV batch: `delete k@INTENT`, plus `put k@commit_ts` with the top layer's data when resolving a committed intent whose data is `Write` or `Delete` (§2.2 header; `Absent` produces no version),
+4. after the batch write returns, under the registry mutex: `last_removal_counter(T) = view_counter`, **then** `intent_count(T) -= 1`. Only if step 3 removed an intent of T.
 
-There is no conditional delete in the KV; steps 1-2 replace it. A removal batch that finds the intent gone or re-owned does nothing.
+There is no conditional delete in the KV; steps 1-2 replace it. A removal that finds the intent gone or re-owned writes nothing and changes no count.
 
 ### 7.4 Status truncation
-The status entry of T may be removed (in memory, and `/sys/txn/T` deleted) only when:
+Under the registry mutex, the status entry of T may be removed (in memory, and `/sys/txn/T` deleted) only when:
 1. `intent_count(T) == 0`. After a crash the count is unknown: committed records from older epochs stay until one full intent sweep has finished.
-2. Every view open when T's last intent was removed has closed: `min(registered view counters) > last_removal_counter(T)`, computed under the registry mutex.
+2. Every view open when T's last intent was removed has closed: `min(registered view counters) > last_removal_counter(T)`.
 
-**I-TRUNC.** No reader can observe an intent of T after T's status entry is gone. Condition 2 works because a view registers its counter before opening (§3.1) and the counter is recorded after the removal batch is written (§7.3): a view that could contain T's intent has a counter `<= last_removal_counter(T)`.
+**I-TRUNC.** No reader can observe an intent of T after T's status entry is gone. Condition 2 works because a view registers its counter before opening (§3.1), the counter is recorded after the removal batch is written (§7.3), and both are read together with the count under one mutex.
 The `/sys/txn/T` delete is written after the removal batches, so by I-WAL-ORDER a crash can never keep the delete and lose the resolution.
 
 SSI does not use the status table to map timestamps to txns (§8.5), so status truncation never loses an SSI edge.
@@ -233,17 +257,20 @@ SSI does not use the status table to map timestamps to txns (§8.5), so status t
 Algorithm: PostgreSQL's (Cahill, Ports & Grittner) with its commit-ordering refinements. All SSI state is guarded by one **SSI mutex** (may be striped later if G0 is extended to cover it).
 
 ### 8.1 SIREAD locks
-- SIREADs are on the KV key ranges a scan may iterate, gaps included: a scan of `[a, b)` locks `[a, b)`. Point reads lock the logical key. FK reads lock the parent key (§5.2).
-- **I-SSI-ORDER.** A scan registers its SIREAD over the full bound **before opening the view it iterates**. It may shrink the lock to the range actually iterated afterwards, never before.
-- Escalation (range → index/table prefix → relation, past `max_pred_locks_per_*`) adds the coarse lock before removing the fine ones. ANN, FTS, columnar, GIN and graph access paths take relation-level SIREAD.
-- SIREADs and recorded conflicts survive `ROLLBACK TO SAVEPOINT` (§5.3).
+- SIREADs are on the KV key ranges a scan may iterate, gaps included: a scan of `[a, b)` locks `[a, b)`. Point reads lock the logical key. FK reads lock the parent key (§5.3).
+- **I-SSI-ORDER.** For every key `k` a SER txn reads, either (a) its SIREAD covering `k` was registered before the view it reads `k` from was opened, or (b) after registering the SIREAD, it reads `k`'s latest state (intent and newest version, under no latch) and records edges exactly as §4 would for a foreign intent or a version `> S`.
+  - Scans: register the full bound, then open the scan's own view (a). Shrink the lock to the range actually iterated only afterwards.
+  - Point fetches whose key comes out of another scan (index → heap fetch, join probes): open a fresh view after registering (a), or use (b). Reusing a view opened before the registration is forbidden.
+- Escalation (range → index/table prefix → relation, past `max_pred_locks_per_*`) adds the coarse lock before removing the fine ones. ANN, FTS, columnar, GIN and graph access paths take relation-level SIREAD. **Relation-level SIREADs are keyed by relation oid**, not storage id.
+- SIREADs and recorded conflicts survive `ROLLBACK TO SAVEPOINT` (§5.5).
 
 ### 8.2 Edges
 - Writer side: after placing a data-changing intent (§5), check SIREADs covering `k` held by other SER txns; each gives `reader -> W`. Lock-only placements and shared locks do not check SIREADs.
-- Reader side: §4 skipped foreign intents (`R -> owner`) and skipped versions `> S` (`R -> writer(t)`, §8.5).
-- Edges to or from a txn that is not SERIALIZABLE are ignored.
+- DDL side: DROP, TRUNCATE and table-rewriting ALTER of a relation check every SIREAD on that relation (any granularity, any storage id of it) held by other SER txns; each gives `reader -> W`.
+- Reader side: §4 skipped foreign intents of Pending or `Committed(c > S)` owners (`R -> owner`) and skipped versions `> S` (`R -> writer(t)`, §8.5).
+- Edges to or from a txn that is not SERIALIZABLE, or that has aborted, are ignored.
 
-Correctness of I-SSI-ORDER: for a concurrent reader R and writer W on `k`, either W's intent placement precedes R's view opening (R's view contains the intent or its resolved version `> S`, so R records the edge), or it follows it, and then it follows R's SIREAD registration, so W's SIREAD check sees it.
+Correctness of I-SSI-ORDER: for a concurrent reader R and writer W on `k`: if W's intent placement precedes the moment R observes `k` (opening the view in (a), the latest-state read in (b)), R sees the intent or its resolved version `> S` and records the edge. Otherwise the placement follows R's SIREAD registration, so W's SIREAD check sees it.
 
 ### 8.3 Dangerous structure
 `T1 -> T2 -> T3` (rw-antidependencies; `T1 == T3` allowed) where T3 commits first. "Commits first" is decided by `commit_ts` for committed txns and by prepare order (§8.4) for prepared ones.
@@ -251,34 +278,36 @@ Correctness of I-SSI-ORDER: for a concurrent reader R and writer W on `k`, eithe
 - Victim: a txn that is not prepared, preferring T2 (the pivot) if it is not prepared, otherwise T1. If the only candidate is the txn running the check, it aborts itself with 40001.
 
 ### 8.4 Pre-commit
-A SER txn commits by, **in one critical section under the SSI mutex**: run the dangerous-structure check on its own edges; if it passes, mark itself `PREPARED` with `prepare_seq = ++prepare_counter`; enqueue its commit request on the commit thread's channel (non-blocking send). Because enqueue happens under the mutex and the commit thread assigns `commit_ts` in channel order (§3), commit order equals prepare order. A prepared txn can no longer be chosen as a victim. A txn doomed by another checker raises 40001 at its next statement or at commit.
+After deferred constraint checks (§5.3), a SER txn commits by, **in one critical section under the SSI mutex**: run the dangerous-structure check on its own edges; if it passes, mark itself `PREPARED` with `prepare_seq = ++prepare_counter`; enqueue its commit request (carrying its TxnId for the writer map) on the commit thread's unbounded channel. Because enqueue happens under the mutex and the commit thread assigns `commit_ts` in channel order (§3), commit order equals prepare order. A prepared txn can no longer be chosen as a victim. A txn doomed by another checker raises 40001 at its next statement or at commit.
 
 Non-SER txns enqueue without taking the SSI mutex.
 
 ### 8.5 Finding `writer(t)`
-SSI keeps its own map `commit_ts -> (TxnId, conflict-out summary)` for every SERIALIZABLE txn whose `commit_ts` is greater than the oldest registered SER snapshot. This is independent of the status table (§7.4) and corresponds to PostgreSQL's `OldCommittedSxact` summary. A `t` with no entry was written by a non-SER txn, or by a SER txn older than every live SER snapshot; neither can form a dangerous structure with the reader, so the edge is dropped.
+SSI keeps its own map `commit_ts -> (TxnId, conflict-out summary)` for SERIALIZABLE txns. The commit thread inserts the entry in §3 step 3, before status is set, so the entry exists before any version `@t` can (resolution follows visibility). An entry is kept while it can matter (§8.6). A `t` with no entry was written by a non-SER txn, or by a SER txn whose entry was retired under §8.6; neither can form a dangerous structure with the reader, so the edge is dropped. This map is independent of the status table (§7.4) and corresponds to PostgreSQL's `OldCommittedSxact` summary.
 
 ### 8.6 Retention and abort
-- The SIREADs and conflict info of a committed SER txn T are kept until every SER txn whose snapshot `S < commit_ts(T)` has ended. "Every" is evaluated against the registry (§3.1), where taking `S` and registering it are one step.
+- The SIREADs, conflict info and writer-map entry of a committed SER txn T are kept until **both** `visible_ts >= commit_ts(T)` and every SER txn with a registered snapshot `S < commit_ts(T)` has ended. Evaluated under the registry mutex (§3.1), where taking `S` and registering it are one step; after `visible_ts >= commit_ts(T)` no new snapshot can have `S < commit_ts(T)`.
 - An aborted txn's SIREADs and edges are removed when it aborts.
+- When a relation's storage is retired (DROP, TRUNCATE, rewrite), finer-grained SIREADs on the retired ids are converted to relation-level SIREADs keyed by the relation oid.
 - Read-only txns: safe-snapshot optimisation and `DEFERRABLE`.
 
 ## 9. GC
 
 ### 9.1 Watermark
-`W` = min over: registered snapshots (§3.1, txns, cursors, portals, `AS OF` reads), in-progress segment builds (`built_at`), and the `AS OF` retention window converted to ts through `/sys/ts_clock` (rounding down). Computed under the registry mutex. Then:
-- `W <= visible_ts`.
-- `W` is monotonic: the new `W` is `max(old W, computed)`, persisted to `/sys/gc_w` before any GC step uses it. `set_gc_watermark` returns an error on a decrease and the caller treats that as fatal.
+`computed` = min over: registered snapshots and caller-chosen ts (§3.1: txns, cursors, portals, `AS OF` reads, segment builds), `visible_ts`, and the `AS OF` retention window converted to ts through `/sys/ts_clock` (rounding down). In **one** registry critical section the GC job computes it and publishes `W = max(old W, computed)`. Then:
+- `W <= visible_ts`, and `W` is monotonic.
+- Every registration with a caller-chosen ts is checked against the published `W` (§3.1).
+- The new `W` is persisted to `/sys/gc_w` before any GC step (filter, DeleteRange) uses it. `set_gc_watermark` returns an error on a decrease and the caller treats that as fatal.
 - There is no snapshot age cap (PostgreSQL 17 removed `old_snapshot_threshold`). A long-running txn holds `W` back; it is exported as a metric.
 
 ### 9.2 Rules
-- Keep, for every logical key, every version `> W` and the newest version `<= W`. Intents are never GC'd.
+- Keep, for every logical key, every version `> W` and the newest version `<= W`. Intents are never removed by GC rules; only by §7.3.
 - **A tombstone may be dropped only if a newer version `<= W` of the same key is kept, or together with every older version of its key.** With timestamps inside the key, versions of one logical key can span SST files, so a compaction filter that drops the newest tombstone `<= W` can resurrect an older version sitting in another file. Therefore:
-  - **Backend with user-defined timestamps (RocksDB UDT + `full_history_ts_low = W`):** the engine owns version GC and keeps one user key's versions together. Tombstones must be timestamped `Delete`s, not puts of a tombstone value. Preferred if C-S1 confirms UDT works with DeleteRange, iterators at a read ts, and checkpoints.
-  - **Otherwise (ts in key: fjall, RocksDB without UDT):** the compaction filter may drop any version (tombstone or not) when it has already seen, earlier in the same compaction stream, a newer version `<= W` of the same logical key. It never drops the newest version `<= W` it has seen for a key. The C-B1 GC job removes a newest-`<= W` tombstone `k@t` with `DeleteRange([enc(k@t), end(k)))`, where `end(k)` is defined in §2.2. Because versions sort newest first, this range covers `k@t` and every older version.
-- **DROP / TRUNCATE** retire the relation's storage ids (table and every index) and, for TRUNCATE, allocate new ones, recorded in the versioned catalog. Once `W >` the DDL's commit ts, `DeleteRange` each retired prefix. Storage ids are never reused.
+  - **Backend with user-defined timestamps (RocksDB UDT + `full_history_ts_low = W`):** the engine owns version GC and keeps one user key's versions together. Preferred if C-S1 confirms UDT works with DeleteRange, iterators at a read ts, and checkpoints, and §12 Q2 specifies its layout.
+  - **Otherwise (ts in key: fjall, RocksDB without UDT):** the compaction filter may drop any version (tombstone or not) when it has already seen, earlier in the same compaction stream, a newer version `<= W` of the same logical key. It never drops the newest version `<= W` it has seen for a key. Filter state never crosses streams or subcompactions. The C-B1 GC job removes a newest-`<= W` tombstone or moved-tombstone `k@t` with `DeleteRange([L ‖ 0x01 ‖ be64(u64::MAX - t), end(L)))` (§2.2), start inclusive. Because versions sort newest first, this range covers `k@t` and every older version.
+- **DROP / TRUNCATE / table rewrite** retire the relation's storage ids (table and every index) and, for TRUNCATE and rewrite, allocate new ones, recorded in the versioned catalog. Once `W >` the DDL's commit ts: first remove every intent under each retired prefix through §7.3 (so counts and truncation stay exact), then `DeleteRange` each retired prefix. Storage ids are never reused.
 
-**I-GC.** For every registered snapshot (all have `S >= W`), the read path (§4) returns the same result before and after any GC step.
+**I-GC.** For every registered snapshot or caller-chosen ts (all are `>= W`), the read path (§4) returns the same result before and after any GC step.
 
 Unresolved committed intents are safe: GC only drops versions older than a kept version, and the intent's eventual version is newer than all of them.
 
@@ -289,70 +318,101 @@ Unresolved committed intents are safe: GC only drops versions older than a kept 
 - **Large txns:** intents, write-set log and SIREAD state all spill; the 10M-row gate measures commit latency, reader latency during resolution and abort cleanup time.
 
 ## 11. Invariants and the G0 model
-Checked by G0: `I-WAL-ORDER`, `I-VIS`, `I-ACK`, `I-SNAP-ORDER`, `I-HALLOWEEN`, `I-ONE-INTENT`, `I-WW`, `I-UNIQUE`, `I-TRUNC`, `I-SSI-ORDER`, `I-GC`, plus:
+Checked by G0: `I-WAL-ORDER`, `I-VIS`, `I-ACK`, `I-SNAP-ORDER`, `I-HALLOWEEN`, `I-ONE-INTENT`, `I-WW`, `I-LOCK`, `I-UNIQUE`, `I-TRUNC`, `I-SSI-ORDER`, `I-GC`, plus:
 - **I-ATOMIC.** After any crash, for every txn: all of its writes are visible at `visible_ts`, or none are.
 - **I-DURABLE.** An acked `synchronous_commit=on` commit survives any crash.
 - **I-SER.** Histories under SERIALIZABLE are serializable (Elle, G2), including predicate/phantom workloads and the read-only anomaly.
 - **I-NOBLOCK.** No read-only path (§4) waits on another txn.
-- **I-LIVE.** A waiter whose blocker has committed or aborted is eventually woken; every wait-for cycle is broken with exactly one 40P01.
+- **I-LIVE.** A waiter whose blocker has committed, aborted or released the conflicting lock is eventually woken; every wait-for cycle is broken with exactly one 40P01.
+- **I-RC-MONO.** An RC statement sees every commit whose effects an earlier statement of the same session observed (via a conflict, a wait or a read).
 
-The state space is too large for one exhaustive model, so G0 is four small-scope exhaustive models plus a deterministic simulator. All models run over MemKv, and every actor (txn steps, commit thread, async resolver, abort cleanup, GC job, compaction, crash) is a separate step that can interleave.
+The state space is too large for one exhaustive model, so G0 is four small-scope exhaustive models plus a deterministic simulator. All models run over MemKv, may start from a preloaded KV state (preloaded data does not count against the txn budget), and every actor is a separate step that can interleave: txn steps, the commit thread with **status-set and visible-advance as separate steps**, async resolver, inline removal, abort cleanup, GC job, compaction, crash.
 
 | Model | Scope | Invariants |
 |---|---|---|
-| G0-commit | 3 txns, 2 keys, commit thread, resolver, truncation, crash at every KV write and fsync, sync on/off | WAL-ORDER, VIS, ACK, SNAP-ORDER, TRUNC, ATOMIC, DURABLE |
-| G0-write | 2 txns, 2 keys (+1 unique key), 2 statements and 1 savepoint per txn, 1 shared mode, waits + DFS, resolver and abort cleanup actors | ONE-INTENT, WW, UNIQUE, HALLOWEEN, ATOMIC, LIVE |
-| G0-ssi | 3 txns (one may be SER READ ONLY), 2 keys + 1 range, 2 statements each, pre-commit, registry | SSI-ORDER, SER (cycle check over the recorded history) |
-| G0-gc | 2 txns, 1-2 keys, MemKv in **LSM mode** (≥ 2 levels, per-file compaction streams, range tombstones), GC job, registry, AS OF | GC, ATOMIC |
+| G0-commit | 3 txns, 2 keys, commit thread, async resolver + one inline remover (two removers of one intent), truncation, crash at every KV write and fsync, sync on/off | WAL-ORDER, VIS, ACK, SNAP-ORDER, TRUNC, ATOMIC, DURABLE |
+| G0-write | 2 txns, 2 keys (+1 unique key, +1 deferrable unique key), 2 statements and 1 savepoint per txn, 1 shared mode, waits + DFS + wake generations, commit thread, resolver and abort cleanup | ONE-INTENT, WW, LOCK, UNIQUE, HALLOWEEN, ATOMIC, LIVE, RC-MONO, TRUNC |
+| G0-ssi | 3 txns (one may be SER READ ONLY), 2 keys + 1 range + 1 index→row fetch, 2 statements each, pre-commit with the channel send as a separate step, commit thread, resolver, writer map, registry, one TRUNCATE | SSI-ORDER, SER (cycle check over the recorded history) |
+| G0-gc | 2 txns + 1 reader, 1-2 keys, MemKv in **LSM mode** (≥ 2 levels, per-file compaction streams, range tombstones), GC job, registry, AS OF registration, one DROP or TRUNCATE, W recomputation after a simulated restart and a widened AS OF window | GC, ATOMIC, TRUNC |
 
 The deterministic simulator runs the full pipeline with larger scopes under seeded schedules.
 
-**Seeded bugs.** G0 must catch every one of these, each reported by the model the table assigns:
+**Seeded bugs.** G0 must catch every one of these, each reported by the model named:
 1. Reader opens its view before reading `S` (commit).
 2. Status truncated without condition 2 (commit).
-3. Tombstone dropped by the compaction filter as the newest `<= W` (gc).
+3. Compaction filter drops the newest tombstone `<= W` (gc).
 4. Intent placed without the latch (write).
 5. SIREAD registered after iterating (ssi).
-6. SIREAD registered after the view opened (ssi).
+6. SIREAD registered after the scan's view opened (ssi).
 7. `visible_ts` advanced before status is set (commit).
 8. Ack before fsync for `synchronous_commit=on` (commit).
 9. Commit records written out of `commit_ts` order (commit).
 10. `/sys/txn` delete written before resolution (commit).
 11. Async resolution or abort cleanup without the latch/owner check (write).
-12. Inline resolution of a committed foreign intent skipped (write).
-13. `intent_count` decremented on a no-op removal (commit).
+12. A foreign visible-committed intent overwritten without first removing it (write).
+13. `intent_count` decremented on a removal that wrote nothing (commit).
 14. View counter taken after the view opens (commit).
 15. Lock-only request replaces own data (write).
-16. Savepoint rollback drops the lock with the data (write).
-17. `wait_for` without the re-check (write, I-LIVE).
-18. Writer proceeds on `Committed(c)` with `c > visible_ts` (write).
+16. Savepoint rollback drops the lock with the data (write, I-LOCK).
+17. `wait_for` without the generation re-check (write, I-LIVE).
+18. Writer proceeds on `Committed(c)` with `c > visible_ts` (write, I-RC-MONO).
 19. Unique check ignores own intents (write).
 20. SSI pre-commit check not atomic with enqueue (ssi).
 21. Taking `S` and registering it are separate steps (gc, and ssi retention).
 22. `W` allowed to decrease (gc).
+23. `intent_count` decremented before `last_removal_counter` is set (commit).
+24. Unique check treats an own `Absent` layer as not live (write).
+25. Deferrable `/i/` removal latched on the entry key instead of the prefix (write).
+26. Wake lost across `ROLLBACK TO` (status-only re-check) (write, I-LIVE).
+27. Async resolution queued before `visible_ts >= commit_ts` (write, I-RC-MONO).
+28. Writer-map entry inserted after status is set (ssi).
+29. SSI retention ignores `visible_ts` (ssi).
+30. Index→row fetch reuses the scan's view (ssi).
+31. AS OF registration checked against an unpublished `W` (gc).
+32. TRUNCATE without the relation-level SIREAD check (ssi).
+33. Compaction-filter state shared across streams (gc).
+34. GC DeleteRange with an exclusive start (gc).
+35. Retired-prefix DeleteRange without removing intents first (gc, I-TRUNC).
 
 ## 12. Open questions and known divergences
 Open (resolve before C-T2 merges):
 1. RC joined DML: full EPQ vs statement retry (G3c decides).
-2. RocksDB UDT viability (C-S1); otherwise the ts-in-key GC path is mandatory.
+2. RocksDB UDT viability (C-S1), and if viable the UDT layout of intents, tombstones and moved-tombstones; otherwise the ts-in-key GC path is mandatory.
 3. Whether `synchronous_commit=off` commits may be visible to `on` sessions before fsync (PostgreSQL: yes). Current spec: yes.
+4. Confirm the SERIALIZABLE unique-violation rule of §5.3 against PostgreSQL's isolation tests (G3c).
 
 Known divergences from PostgreSQL 17:
-- A concurrent primary-key change seen by RC EPQ raises 40001 instead of following the update chain (§5.1).
+- A concurrent primary-key change seen by RC EPQ raises 40001 instead of following the update chain (§5.2).
+- Under RR/SER, accessing a relation that was truncated or rewritten after `S` raises 40001; PostgreSQL returns the new (possibly empty) contents, which its documentation calls not MVCC-safe (§4).
 
 ## Changelog
+- **draft 3 (2026-10-07), round-2 adversarial review** (18 write/commit findings R2W-*, 8 SSI/GC findings R2S-*, 5 G0 findings):
+  - §5.1 Foreign visible-committed or aborted intents are removed by their own batch under the latch before anything else; nothing is planned without being written; `intent_count += 1` before placement (R2W-1).
+  - §7.3 step 4: removal counter set before the count is decremented, both under the registry mutex; §7.4 reads them under the same mutex (R2W-2).
+  - §5.3 Unique check treats an own `Absent` layer as "use committed state" (R2W-3).
+  - §5.0 One `latch_key(k)` for every path; deferrable `/i/` keys latch the prefix; never two latches (R2W-4).
+  - §5.1 Foreign Pending intents are waited on only if the requested mode conflicts with their lock; requested modes listed in §6 (R2W-5, closes F02).
+  - §5.3 FK child side reads the parent first, then takes KEY SHARE; constraint timing honours deferral and `SET CONSTRAINTS`; NO ACTION checks for a replacement parent (R2W-6, R2W-7).
+  - §2.1 Layers carry `data_seq`; §5.4 own-row rules use it (skip / 21000 / 27000); lock-only layers do not count (R2W-8, R2W-18).
+  - §3 step 5: in-memory locks released and resolution queued only after `visible_ts >= commit_ts`; §3.2 no version newer than `visible_ts` exists (R2W-9, R2W-10).
+  - §6 Per-txn wake generation read under the latch and re-checked after registering; `wait_for` returns only for aborted or visible commits (R2W-11, R2W-15, closes F08/F10).
+  - §5.4 No `t* > S` check on a key with an own intent (R2W-12).
+  - §2.1/§2.2 `Write{key_changed}` and `Delete{moved}`, carried into a version value header (R2W-13, closes F16).
+  - §4 RR/SER rule for truncated/rewritten relations defined and listed as a divergence; new indexes not used by older snapshots (R2W-14).
+  - §3 boot sets `visible_ts = ts_hwm` (R2W-16). §6 only the owning session sets Aborted (R2W-17).
+  - §8.6 SSI retention also waits for `visible_ts >= commit_ts` (R2S-1). §8.1 I-SSI-ORDER restated per key read, with index→row fetches and the latest-state alternative (R2S-2). §9.1 `W` published in the registry critical section; caller-chosen ts checked against it (R2S-3). §3 step 3 / §8.5 writer map filled by the commit thread before status; unbounded channel (R2S-4). §8.2 DDL conflict-in, relation SIREADs keyed by oid, retired-id SIREADs promoted (R2S-5). §9.2 retired prefixes: intents removed through §7.3 before DeleteRange (R2S-6). §2.2 UDT layout moved to open question Q2 (R2S-7). §4/§8.2 no edges to aborted txns (R2S-8).
+  - §5.1 I-LOCK and §11 I-RC-MONO added; G0 models gain split commit steps, two removers, wake generations, deferrable keys, index→row fetch, TRUNCATE, W recomputation; seeds 23-35 added (G0-a to G0-e).
 - **draft 2 (2026-10-07), round-1 adversarial review** (`docs/C-T0-review.local.md`, 34 findings):
   - §2.1 Intent is a stack of layers, each holding data and the strongest exclusive lock. Lock-only requests never replace own data; savepoint rollback restores data and lock; write strength is derived from key-column changes (DATA-1, F01, F02, F11). Key column defined (F02).
   - §1 Versions sort newest first; seq never decreases; storage ids in keys (GC-4, F19, GC-3). §2.2 version key layout and GC range bytes (GC-4).
   - §3 Commit thread never aborts; channel order is commit order. §3.1 registry: `S` read and registered atomically; view counters registered before views open (GC-1, TRUNC-2, SSI-2). Committed-but-not-visible is treated as Pending by writers (F07).
   - §4 Readers decide on top-layer data; missing current-epoch status is fatal; AS OF below `W` errors with 72000; SER scans open their own view (TRUNC-2, GC-2, SSI-1).
-  - §5 One fresh view for intent + newest version under the latch; inline resolution/removal of foreign intents is mandatory and joins the placement batch; `t*` ignores lock-only intents; key-existence ops use the unique check instead of the `t* > S` rule, so delete-then-reinsert works under RR/SER; shared locks run the version check; SIREAD check skipped for lock-only placements (F04, TRUNC-1, F06, F13, F14, F15, SSI-6).
+  - §5 One fresh view for intent + newest version under the latch; foreign intents removed before placement; `t*` ignores lock-only intents; key-existence ops use the unique check instead of the `t* > S` rule; shared locks run the version check; SIREAD check skipped for lock-only placements (F04, TRUNC-1, F06, F13, F14, F15, SSI-6).
   - §5.1 PK-moving updates leave a moved-tombstone; EPQ raises 40001 on it (F16).
-  - §5.2 Unique check sees own intents; SER 40001 only with a covering SIREAD; PK uses the same check; NULLS NOT DISTINCT; deferrable unique uses a prefix latch and runs before enqueue; FK checks are end-of-statement with RC/RR/SER rules and detectNewRows (F03, F13, F21, F17, F05, SSI-3).
+  - §5.2 Unique check sees own intents; SER 40001 only with a covering SIREAD; PK uses the same check; NULLS NOT DISTINCT; deferrable unique uses a prefix latch; FK checks with RC/RR/SER rules and detectNewRows (F03, F13, F21, F17, F05, SSI-3).
   - §5.3 Rollback rules: re-check owner, keep SIREADs, close later portals, wake all waiters, locks tagged with execution seq; exact layer-compaction rule (F10, F12, F19, SSI-5). §5.4 own-row revisit (F18).
-  - §6 One wait-for graph over all lock kinds; register-then-recheck; DFS and edge removal atomic (F08, F09, F20).
-  - §7.3 Every intent-removal path latches and checks the owner; counts and removal counters updated only on real removal and after the write (TRUNC-1, F04, TRUNC-2).
+  - §6 One wait-for graph over all lock kinds; DFS and edge removal atomic (F08, F09, F20).
+  - §7.3 Every intent-removal path latches and checks the owner (TRUNC-1, F04, TRUNC-2).
   - §8 SIREAD before view; atomic pre-commit + prepare + enqueue; exact read-only exception; T1 == T3; own `commit_ts -> txn` map independent of truncation; non-SER edges ignored (SSI-1, SSI-2, SSI-4, SSI-5, SSI-6).
-  - §9 `W` is a pure min, monotonic, persisted, `<= visible_ts`; no snapshot age cap; shadowed tombstones may be dropped; DeleteRange bounds explicit; UDT tombstones are timestamped deletes; DROP/TRUNCATE retire storage ids (GC-1, GC-2, GC-3, GC-4).
+  - §9 `W` is a pure min, monotonic, persisted, `<= visible_ts`; no snapshot age cap; shadowed tombstones may be dropped; DeleteRange bounds explicit; DROP/TRUNCATE retire storage ids (GC-1, GC-2, GC-3, GC-4).
   - §11 G0 split into four models with LSM-mode MemKv and interleaved actors; seeded bugs extended from 5 to 22 (G0-SEEDS, G0-1).
-  - §12 Q2 (unique SQLSTATEs) resolved in §5.2.

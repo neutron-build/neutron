@@ -68,8 +68,10 @@ impl RowLockMode {
 /// A layer's own value of the key (§2.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerData {
-    Write(Vec<u8>),
-    Delete,
+    /// `key_changed`: a key column differs from the previous value.
+    Write { value: Vec<u8>, key_changed: bool },
+    /// `moved`: left at the old `/t/` key by a primary-key change (§5.2).
+    Delete { moved: bool },
     /// No own value: reads fall through to committed versions. A layer with
     /// `Absent` data only holds a lock.
     Absent,
@@ -79,6 +81,8 @@ pub enum LayerData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layer {
     pub seq: Seq,
+    /// Seq at which `data` last changed (§5.4).
+    pub data_seq: Seq,
     pub data: LayerData,
     /// Strongest exclusive mode held: `NoKeyUpdate` or `Update`.
     pub lock: RowLockMode,
@@ -113,6 +117,10 @@ pub enum TxnError {
     ForeignKeyViolation, // 23503
     #[error("command cannot affect row a second time")]
     CardinalityViolation, // 21000
+    #[error(
+        "tuple to be updated was already modified by an operation triggered by the current command"
+    )]
+    TriggeredDataChange, // 27000
     #[error("snapshot too old")]
     SnapshotTooOld, // 72000
     #[error("kv: {0}")]
@@ -128,6 +136,7 @@ impl TxnError {
             TxnError::UniqueViolation => "23505",
             TxnError::ForeignKeyViolation => "23503",
             TxnError::CardinalityViolation => "21000",
+            TxnError::TriggeredDataChange => "27000",
             TxnError::SnapshotTooOld => "72000",
             TxnError::Kv(_) => "XX000",
         }

@@ -14,8 +14,8 @@ pub struct ReadCtx {
     pub stmt_seq: Seq,
 }
 
-/// A committed version of the logical key: `None` value = tombstone or
-/// moved-tombstone (§5.1); both read as not-found.
+/// A committed version of the logical key, header already decoded (§2.2):
+/// `None` value = tombstone or moved-tombstone; both read as not-found.
 #[derive(Debug, Clone, Copy)]
 pub struct Version<'a> {
     pub ts: Ts,
@@ -61,6 +61,7 @@ pub fn read<'a>(
                             return r;
                         }
                     }
+                    TxnStatus::Aborted => {}
                     _ => edges.push(RwEdge::ToIntentOwner(i.txn)),
                 }
             }
@@ -82,8 +83,8 @@ pub fn read<'a>(
 /// `None` = `Absent`: fall through to versions.
 fn data_read(d: &LayerData) -> Option<Read<'_>> {
     match d {
-        LayerData::Write(v) => Some(Read::Found(v)),
-        LayerData::Delete => Some(Read::NotFound),
+        LayerData::Write { value, .. } => Some(Read::Found(value)),
+        LayerData::Delete { .. } => Some(Read::NotFound),
         LayerData::Absent => None,
     }
 }
@@ -95,18 +96,37 @@ mod tests {
 
     const R: TxnId = TxnId { epoch: 1, n: 1 };
     const T: TxnId = TxnId { epoch: 1, n: 2 };
-    const OLD: [Version<'static>; 1] = [Version { ts: Ts(5), value: Some(b"old") }];
+    const OLD: [Version<'static>; 1] = [Version {
+        ts: Ts(5),
+        value: Some(b"old"),
+    }];
 
     fn ctx(s: u64, seq: Seq) -> ReadCtx {
-        ReadCtx { txn: R, snapshot: Ts(s), stmt_seq: seq }
+        ReadCtx {
+            txn: R,
+            snapshot: Ts(s),
+            stmt_seq: seq,
+        }
     }
 
     fn layer(seq: Seq, data: LayerData, lock: RowLockMode) -> Layer {
-        Layer { seq, data, lock }
+        Layer {
+            seq,
+            data_seq: seq,
+            data,
+            lock,
+        }
+    }
+
+    fn w(v: &[u8]) -> LayerData {
+        LayerData::Write {
+            value: v.to_vec(),
+            key_changed: false,
+        }
     }
 
     fn write(seq: Seq, v: &[u8]) -> Layer {
-        layer(seq, LayerData::Write(v.to_vec()), RowLockMode::NoKeyUpdate)
+        layer(seq, w(v), RowLockMode::NoKeyUpdate)
     }
 
     fn intent(txn: TxnId, layers: Vec<Layer>) -> Intent {
@@ -128,7 +148,10 @@ mod tests {
         let mut e = vec![];
         let st = |_| TxnStatus::Committed(Ts(11));
         assert_eq!(read(&ctx(10, 1), Some(&i), st, [], &mut e), Read::NotFound);
-        assert_eq!(read(&ctx(11, 1), Some(&i), st, [], &mut e), Read::Found(b"new"));
+        assert_eq!(
+            read(&ctx(11, 1), Some(&i), st, [], &mut e),
+            Read::Found(b"new")
+        );
     }
 
     #[test]
@@ -136,8 +159,14 @@ mod tests {
         let i = intent(R, vec![write(3, b"mine")]);
         let mut e = vec![];
         let st = |_| TxnStatus::Pending;
-        assert_eq!(read(&ctx(10, 3), Some(&i), st, OLD, &mut e), Read::Found(b"old"));
-        assert_eq!(read(&ctx(10, 4), Some(&i), st, OLD, &mut e), Read::Found(b"mine"));
+        assert_eq!(
+            read(&ctx(10, 3), Some(&i), st, OLD, &mut e),
+            Read::Found(b"old")
+        );
+        assert_eq!(
+            read(&ctx(10, 4), Some(&i), st, OLD, &mut e),
+            Read::Found(b"mine")
+        );
     }
 
     #[test]
@@ -146,15 +175,30 @@ mod tests {
             R,
             vec![
                 layer(1, LayerData::Absent, RowLockMode::Update),
-                layer(3, LayerData::Write(b"v3".to_vec()), RowLockMode::Update),
-                layer(5, LayerData::Delete, RowLockMode::Update),
+                layer(3, w(b"v3"), RowLockMode::Update),
+                layer(5, LayerData::Delete { moved: false }, RowLockMode::Update),
             ],
         );
         let mut e = vec![];
         let st = |_| TxnStatus::Pending;
-        assert_eq!(read(&ctx(10, 2), Some(&i), st, OLD, &mut e), Read::Found(b"old"));
-        assert_eq!(read(&ctx(10, 4), Some(&i), st, OLD, &mut e), Read::Found(b"v3"));
+        assert_eq!(
+            read(&ctx(10, 2), Some(&i), st, OLD, &mut e),
+            Read::Found(b"old")
+        );
+        assert_eq!(
+            read(&ctx(10, 4), Some(&i), st, OLD, &mut e),
+            Read::Found(b"v3")
+        );
         assert_eq!(read(&ctx(10, 6), Some(&i), st, OLD, &mut e), Read::NotFound);
+    }
+
+    #[test]
+    fn aborted_foreign_intent_is_invisible_without_edge() {
+        let i = intent(T, vec![write(1, b"new")]);
+        let mut e = vec![];
+        let r = read(&ctx(10, 1), Some(&i), |_| TxnStatus::Aborted, OLD, &mut e);
+        assert_eq!(r, Read::Found(b"old"));
+        assert!(e.is_empty());
     }
 
     #[test]
@@ -162,7 +206,10 @@ mod tests {
         let i = intent(T, vec![layer(1, LayerData::Absent, RowLockMode::Update)]);
         let mut e = vec![];
         for st in [TxnStatus::Committed(Ts(6)), TxnStatus::Pending] {
-            assert_eq!(read(&ctx(10, 1), Some(&i), |_| st, OLD, &mut e), Read::Found(b"old"));
+            assert_eq!(
+                read(&ctx(10, 1), Some(&i), |_| st, OLD, &mut e),
+                Read::Found(b"old")
+            );
         }
         assert!(e.is_empty());
     }
@@ -173,10 +220,16 @@ mod tests {
     fn lock_after_own_write_keeps_data_visible() {
         let i = intent(
             T,
-            vec![write(1, b"a"), layer(2, LayerData::Write(b"a".to_vec()), RowLockMode::Update)],
+            vec![write(1, b"a"), layer(2, w(b"a"), RowLockMode::Update)],
         );
         let mut e = vec![];
-        let r = read(&ctx(10, 1), Some(&i), |_| TxnStatus::Committed(Ts(10)), [], &mut e);
+        let r = read(
+            &ctx(10, 1),
+            Some(&i),
+            |_| TxnStatus::Committed(Ts(10)),
+            [],
+            &mut e,
+        );
         assert_eq!(r, Read::Found(b"a"));
     }
 
@@ -184,9 +237,18 @@ mod tests {
     fn newer_version_skipped_with_edge_and_tombstone_hides() {
         let mut e = vec![];
         let v = [
-            Version { ts: Ts(12), value: Some(b"future") },
-            Version { ts: Ts(8), value: None },
-            Version { ts: Ts(3), value: Some(b"ancient") },
+            Version {
+                ts: Ts(12),
+                value: Some(b"future"),
+            },
+            Version {
+                ts: Ts(8),
+                value: None,
+            },
+            Version {
+                ts: Ts(3),
+                value: Some(b"ancient"),
+            },
         ];
         let r = read(&ctx(10, 1), None, |_| TxnStatus::Pending, v, &mut e);
         assert_eq!(r, Read::NotFound);
