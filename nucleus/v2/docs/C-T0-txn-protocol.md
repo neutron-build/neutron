@@ -36,7 +36,16 @@ Each layer is the **complete own state** of the key as of `seq`: `data` is the t
 
 Foreign readers and resolution look only at the **top layer's `data`**. `Absent` means "lock only": no version is produced, nothing becomes visible.
 
-### 2.2 Persisted system keys
+### 2.2 Version key layout (ts-in-key backends)
+`L` = the encoded logical key, prefix-free by C-Q3s P-PREFIX, so no other logical key starts with `L`.
+```
+intent        L ‖ 0x00
+version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts)      # newest first
+end(L)        L ‖ 0x02                            # exclusive upper bound of every entry of L
+```
+`[L ‖ 0x00, end(L))` holds exactly the intent and versions of `L`. The GC range for tombstone `L@t` is `[L ‖ 0x01 ‖ be64(u64::MAX - t), end(L))`. Backends with user-defined timestamps store `L` as the user key, the ts in the engine's timestamp, and the intent as `L ‖ 0x00` with no timestamp.
+
+### 2.3 Persisted system keys
 - `/sys/txn/{TxnId}`: only `Committed(ts)` is persisted. `Pending` and `Aborted` are in-memory only (§7).
 - `/sys/epoch`: u32, incremented and synced at boot before any txn starts.
 - `/sys/ts_hwm`: sequencer high-water mark, reserved in blocks (§3).
@@ -266,7 +275,7 @@ SSI keeps its own map `commit_ts -> (TxnId, conflict-out summary)` for every SER
 - Keep, for every logical key, every version `> W` and the newest version `<= W`. Intents are never GC'd.
 - **A tombstone may be dropped only if a newer version `<= W` of the same key is kept, or together with every older version of its key.** With timestamps inside the key, versions of one logical key can span SST files, so a compaction filter that drops the newest tombstone `<= W` can resurrect an older version sitting in another file. Therefore:
   - **Backend with user-defined timestamps (RocksDB UDT + `full_history_ts_low = W`):** the engine owns version GC and keeps one user key's versions together. Tombstones must be timestamped `Delete`s, not puts of a tombstone value. Preferred if C-S1 confirms UDT works with DeleteRange, iterators at a read ts, and checkpoints.
-  - **Otherwise (ts in key: fjall, RocksDB without UDT):** the compaction filter may drop any version (tombstone or not) when it has already seen, earlier in the same compaction stream, a newer version `<= W` of the same logical key. It never drops the newest version `<= W` it has seen for a key. The C-B1 GC job removes a newest-`<= W` tombstone `k@t` with `DeleteRange([enc(k@t), end(k)))`, where `end(k)` is the first encoded key after every version of `k` (defined by C-K1). Because versions sort newest first, this range covers `k@t` and every older version.
+  - **Otherwise (ts in key: fjall, RocksDB without UDT):** the compaction filter may drop any version (tombstone or not) when it has already seen, earlier in the same compaction stream, a newer version `<= W` of the same logical key. It never drops the newest version `<= W` it has seen for a key. The C-B1 GC job removes a newest-`<= W` tombstone `k@t` with `DeleteRange([enc(k@t), end(k)))`, where `end(k)` is defined in §2.2. Because versions sort newest first, this range covers `k@t` and every older version.
 - **DROP / TRUNCATE** retire the relation's storage ids (table and every index) and, for TRUNCATE, allocate new ones, recorded in the versioned catalog. Once `W >` the DDL's commit ts, `DeleteRange` each retired prefix. Storage ids are never reused.
 
 **I-GC.** For every registered snapshot (all have `S >= W`), the read path (§4) returns the same result before and after any GC step.
@@ -334,7 +343,7 @@ Known divergences from PostgreSQL 17:
 ## Changelog
 - **draft 2 (2026-10-07), round-1 adversarial review** (`docs/C-T0-review.local.md`, 34 findings):
   - §2.1 Intent is a stack of layers, each holding data and the strongest exclusive lock. Lock-only requests never replace own data; savepoint rollback restores data and lock; write strength is derived from key-column changes (DATA-1, F01, F02, F11). Key column defined (F02).
-  - §1 Versions sort newest first; seq never decreases; storage ids in keys (GC-4, F19, GC-3).
+  - §1 Versions sort newest first; seq never decreases; storage ids in keys (GC-4, F19, GC-3). §2.2 version key layout and GC range bytes (GC-4).
   - §3 Commit thread never aborts; channel order is commit order. §3.1 registry: `S` read and registered atomically; view counters registered before views open (GC-1, TRUNC-2, SSI-2). Committed-but-not-visible is treated as Pending by writers (F07).
   - §4 Readers decide on top-layer data; missing current-epoch status is fatal; AS OF below `W` errors with 72000; SER scans open their own view (TRUNC-2, GC-2, SSI-1).
   - §5 One fresh view for intent + newest version under the latch; inline resolution/removal of foreign intents is mandatory and joins the placement batch; `t*` ignores lock-only intents; key-existence ops use the unique check instead of the `t* > S` rule, so delete-then-reinsert works under RR/SER; shared locks run the version check; SIREAD check skipped for lock-only placements (F04, TRUNC-1, F06, F13, F14, F15, SSI-6).
