@@ -6,6 +6,15 @@
 
 use std::ops::Bound;
 
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
+#[cfg(any(test, feature = "fault"))]
+pub mod fault;
+#[cfg(feature = "mem")]
+pub mod mem;
+#[cfg(feature = "mem")]
+pub use mem::MemKv;
+
 pub type Key = Vec<u8>;
 pub type Value = Vec<u8>;
 
@@ -35,8 +44,11 @@ pub enum Op {
     Delete(Key),
     /// Removes every key in `[start, end)`. Must be correct across all levels
     /// (no older key under the range may reappear). C-T0 §9 relies on this for
-    /// tombstone GC.
-    DeleteRange { start: Key, end: Key },
+    /// tombstone GC. An empty or inverted range is a no-op.
+    DeleteRange {
+        start: Key,
+        end: Key,
+    },
 }
 
 impl Batch {
@@ -83,7 +95,9 @@ pub trait GcFilter: Send + Sync {
 }
 
 pub trait GcStream: Send {
-    /// `true` = drop this key. Must never return `true` for a tombstone (§9).
+    /// `true` = drop this key. Must never return `true` for a tombstone (§9);
+    /// the kv applies the answer as given. A snapshot opened before the
+    /// compaction may or may not keep returning a dropped key (C-K3 suite).
     fn drop_key(&mut self, key: &[u8], value: &[u8]) -> bool;
 }
 
@@ -110,6 +124,7 @@ pub trait OrderedKv: Send + Sync + 'static {
     /// index build, restore). Atomic.
     fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()>;
     /// Consistent on-disk checkpoint at `dir` (hard links where possible).
+    /// `dir` must not exist yet. Includes every completed write.
     fn checkpoint(&self, dir: &std::path::Path) -> Result<()>;
     /// Install the compaction GC filter. Backends with native user-defined
     /// timestamps may ignore it and use `set_gc_watermark` instead.
