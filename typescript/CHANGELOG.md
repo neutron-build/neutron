@@ -2,6 +2,53 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.3.2, cli 0.3.2, create-neutron 0.1.9] - 2026-10-07
+
+### Fixed
+
+- **Both data-protocol representations now declare
+  `Vary: Accept, Accept-Language, X-Neutron-Data, X-Neutron-Routes`** (TS-33),
+  and cache-stored app responses synthesize the same set before publishing
+  `Cache-Control`. Without it a shared cache (browser HTTP cache, CDN) could
+  store the JSON payload under a page's bare URL and answer a document reload
+  with it — the raw `__neutron_serialized__` envelope painted as page content
+  (observed on a deployed app 2026-10-06). The server-side cache key was
+  already variant-split; the defect was wire-level. Route-declared `Vary` is
+  merged, never replaced; `Vary: *` is untouched.
+- **Jobs** (framework audit NA-01..NA-03): claim-token fencing on every
+  terminal write so an old attempt can never overwrite a newer one; renewal
+  is expiry-bounded and a confirmed-through watchdog bounds handler lifetime;
+  jobs are claimed only when a concurrency slot is ready; upgraded running
+  rows with NULL leases get an explicit recovery cutover. **Operators must
+  stop old workers before deploying this version** — mixed fleets keep the
+  old claim semantics against the same queue.
+- **Static builds** (NA-04): middleware route facts are parsed conservatively
+  (all declarator shapes, star exports, unparseable treated as present) and
+  the production build gates on them before any write, closing a path where
+  a protected static page skipped its route middleware.
+- OpenAPI generation is atomic and generation-keyed; group registration and
+  post-build registration no longer leave stale documents (NA-05).
+- Shared dynamic route branches bind the winning route's parameter names
+  (NA-06); dynamic-directory not-found pages receive scoped parameters with
+  a deterministic specificity order (NA-07).
+- Client export stripping preserves a surviving re-export's source clause
+  (NA-08). Generated route declarations are valid string literals (NA-13).
+- Code generation: output destinations decided by table count (a single
+  `--out` file no longer becomes a directory, NA-09); `json.RawMessage`
+  gains its import via a real `go/types` harness (NA-10); legacy table
+  enumeration fails closed on scan errors and stages whole batches before
+  publishing (NA-14).
+- `@neutron-build/mcp` exports a permission-aware in-process
+  `Server.CallTool` dispatcher; the HTTP route becomes a shim over it with
+  parity tests (NA-11).
+- ORM `excluded` validation is scope-aware (scalar subqueries inherit it;
+  ordinary identifiers are no longer rejected), verified against live
+  PostgreSQL (NA-12).
+
+### Changed
+
+- `create-neutron` 0.1.9 scaffolds pin `@neutron-build/core`/`cli` `^0.3.2`.
+
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 
 ### Changed

@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/create",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Scaffold a new Neutron project. Run with: npm create @neutron-build@latest",
   "author": "Tyler",
   "license": "MIT",
