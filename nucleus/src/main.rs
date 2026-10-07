@@ -186,7 +186,7 @@ enum Commands {
         host: String,
     },
 
-    /// Interactive SQL shell (psql-like REPL).
+    /// SQL shell: interactive REPL or one-shot command execution.
     Shell {
         /// Host to connect to.
         #[arg(short = 'H', long, default_value = "127.0.0.1")]
@@ -202,7 +202,12 @@ enum Commands {
         #[arg(short = 'c', long)]
         command: Option<String>,
 
-        /// With -c: print SELECT results as a JSON array of objects
+        /// Read one SQL command from stdin through EOF and exit.
+        /// Requires valid UTF-8; preserves SQL bytes without adding a newline.
+        #[arg(long, conflicts_with = "command")]
+        command_stdin: bool,
+
+        /// With -c or --command-stdin: print SELECT results as a JSON array of objects
         /// (machine-readable) instead of an ASCII table.
         #[arg(long)]
         json: bool,
@@ -514,10 +519,21 @@ async fn main() {
             host,
             port,
             command,
+            command_stdin,
             json,
         }) => {
-            if let Some(sql) = command {
-                cmd_shell_exec(&host, port, &sql, json).await;
+            if command_stdin {
+                let sql = match read_shell_command(std::io::stdin().lock()) {
+                    Ok(sql) => sql,
+                    Err(message) => {
+                        eprintln!("{message}");
+                        std::process::exit(1);
+                    }
+                };
+                cmd_shell_exec(&host, port, &sql, json, true).await;
+            } else if let Some(sql) = command {
+                let sql = sql.trim().trim_end_matches(';');
+                cmd_shell_exec(&host, port, sql, json, false).await;
             } else {
                 cmd_shell(&host, port).await;
             }
@@ -3565,21 +3581,39 @@ async fn cmd_status(host: &str) {
     }
 }
 
-/// One-shot shell: execute a single SQL statement and exit (`shell -c`).
+/// Read private SQL without lossy UTF-8 conversion or byte normalization.
+/// Validate before connecting: NUL cannot be represented in pgwire's C string.
+/// Diagnostics deliberately exclude input and reader-provided error messages.
+fn read_shell_command(mut reader: impl std::io::Read) -> Result<String, &'static str> {
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Failed to read SQL command from stdin")?;
+    let sql = String::from_utf8(bytes).map_err(|_| "SQL command stdin must be valid UTF-8")?;
+    if sql.contains('\0') {
+        return Err("SQL command stdin must not contain NUL bytes");
+    }
+    Ok(sql)
+}
+
+/// One-shot shell: execute SQL and exit (`shell -c` or `shell --command-stdin`).
 /// Prints SELECT results as a table (or JSON with --json), command tags as-is.
 /// Exits 1 on connection failure or statement error so scripts can gate on it.
-async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool) {
+async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool, private: bool) {
     use nucleus::cli::{PgClient, QueryResult, TableDisplay};
 
     let mut client = match PgClient::connect(host, port).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to connect: {e}");
+            if private {
+                eprintln!("Failed to connect to Nucleus for stdin command");
+            } else {
+                eprintln!("Failed to connect: {e}");
+            }
             std::process::exit(1);
         }
     };
 
-    let sql = sql.trim().trim_end_matches(';');
     let mut failed = false;
     match client.simple_query(sql).await {
         Ok(QueryResult::Select { columns, rows }) => {
@@ -3619,17 +3653,29 @@ async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool) {
             }
         }
         Ok(QueryResult::Error { message }) => {
-            eprintln!("ERROR: {message}");
+            if private {
+                eprintln!("SQL command failed");
+            } else {
+                eprintln!("ERROR: {message}");
+            }
             failed = true;
         }
         Err(e) => {
-            eprintln!("Error: {e}");
+            if private {
+                eprintln!("SQL command transport failed");
+            } else {
+                eprintln!("Error: {e}");
+            }
             failed = true;
         }
     }
 
     if let Err(e) = client.close().await {
-        eprintln!("Warning: disconnect error: {e}");
+        if private {
+            eprintln!("Warning: stdin command disconnect failed");
+        } else {
+            eprintln!("Warning: disconnect error: {e}");
+        }
     }
     if failed {
         std::process::exit(1);
@@ -3811,6 +3857,79 @@ async fn shell_execute_and_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_command_stdin_parser_and_conflict() {
+        let cli = Cli::try_parse_from(["nucleus", "shell", "--command-stdin", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Shell {
+                command: None,
+                command_stdin: true,
+                json: true,
+                ..
+            })
+        ));
+        for option in ["-c", "--command"] {
+            let error =
+                Cli::try_parse_from(["nucleus", "shell", "--command-stdin", option, "SELECT 1"])
+                    .err()
+                    .unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        let cli = Cli::try_parse_from(["nucleus", "shell", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Shell {
+                command: None,
+                command_stdin: false,
+                json: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn shell_command_stdin_exact_utf8_bytes() {
+        for sql in [
+            "",
+            " \tSELECT '雪 ; \n';;\r\n ",
+            "SELECT 1",
+            "SELECT 1; -- no newline",
+        ] {
+            assert_eq!(
+                read_shell_command(sql.as_bytes()).unwrap().as_bytes(),
+                sql.as_bytes()
+            );
+        }
+        assert_eq!(
+            read_shell_command(&b"SELECT '\xff'"[..]),
+            Err("SQL command stdin must be valid UTF-8")
+        );
+        assert_eq!(
+            read_shell_command(&b"SELECT 1\0SELECT 2"[..]),
+            Err("SQL command stdin must not contain NUL bytes")
+        );
+    }
+
+    #[test]
+    fn shell_command_stdin_partial_read_failure_is_closed() {
+        struct BrokenReader(bool);
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("reader error must not be disclosed"));
+                }
+                self.0 = true;
+                buf[0] = b'Q';
+                Ok(1)
+            }
+        }
+        assert_eq!(
+            read_shell_command(BrokenReader(false)),
+            Err("Failed to read SQL command from stdin")
+        );
+    }
 
     #[test]
     fn parse_auth_method_env_scram_variants() {
