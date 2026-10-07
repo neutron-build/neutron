@@ -153,6 +153,45 @@ function isNeutronDataRequest(request: Request): boolean {
   return request.headers.get("X-Neutron-Data") === "true";
 }
 
+/**
+ * Header fields the app-response cache keys its entries on (TS-04): the data
+ * protocol serves a second representation of the same URL (JSON for
+ * Accept-json / X-Neutron-Data requests, HTML for navigations), loaders may
+ * personalize on Accept-Language, and X-Neutron-Routes selects partial data.
+ * A response that varies on a header without declaring it in Vary lets a
+ * shared cache store one representation under the bare URL and hand it to a
+ * request for the other — a browser that cached the JSON payload answered the
+ * next document navigation with it, painting the raw
+ * `{"__neutron_serialized__": ...}` envelope as page content.
+ */
+const REPRESENTATION_VARY_FIELDS = [
+  "Accept",
+  "Accept-Language",
+  "X-Neutron-Data",
+  "X-Neutron-Routes",
+];
+
+/** Merge REPRESENTATION_VARY_FIELDS into Vary without dropping or duplicating
+ * tokens the route already declared. `Vary: *` already forbids every reuse. */
+function declareRepresentationDimensions(headers: Headers): void {
+  const tokens = (headers.get("Vary") ?? "")
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const present = new Set(tokens.map((token) => token.toLowerCase()));
+  if (present.has("*")) {
+    return;
+  }
+  for (const field of REPRESENTATION_VARY_FIELDS) {
+    if (!present.has(field.toLowerCase())) {
+      tokens.push(field);
+    }
+  }
+  if (tokens.length > 0) {
+    headers.set("Vary", tokens.join(", "));
+  }
+}
+
 function withDefaultContentType(headers: Headers, fallback: string): Headers {
   if (!headers.has("Content-Type")) {
     headers.set("Content-Type", fallback);
@@ -1145,6 +1184,12 @@ export async function renderAppRoute(
       loaderData,
       actionData,
     });
+    // Declare the representation dimensions on every outgoing app response —
+    // both the JSON and the HTML branch. This is what keeps shared caches
+    // (browser HTTP cache, CDNs) from reusing one variant's body for the
+    // other's request; the server-side cache key alone (TS-04) cannot, because
+    // the poisoned reload request is answered by the browser, never by us.
+    declareRepresentationDimensions(routeHeaders);
 
     const pathname = new URL(request.url).pathname;
     // Carry the CSP nonce (set by app middleware on `context.cspNonce`)

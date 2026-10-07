@@ -1548,6 +1548,34 @@ function buildAppCacheKey(request: Request, pathname: string): string {
 }
 
 /**
+ * The Vary fields that mirror the app-cache key dimensions — the same set
+ * maybeStoreAppResponse admits (keyableVary). A stored entry advertises shared
+ * freshness (the synthesized `Cache-Control: public, max-age=N`), so it must
+ * also declare every dimension the entry is keyed on, or a shared cache that
+ * trusts the advertisement can reuse one variant's body for another's
+ * request. Entries whose producer did not go through the render layer's
+ * declaration (e.g. resource-route Responses) rely on this.
+ */
+const KEYABLE_VARY_FIELDS = ["Accept", "Accept-Language", "X-Neutron-Data", "X-Neutron-Routes"];
+
+function appendKeyableVaryFields(headers: Headers): void {
+  const tokens = (headers.get("Vary") ?? "")
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const present = new Set(tokens.map((token) => token.toLowerCase()));
+  if (present.has("*")) {
+    return;
+  }
+  for (const field of KEYABLE_VARY_FIELDS) {
+    if (!present.has(field.toLowerCase())) {
+      tokens.push(field);
+    }
+  }
+  headers.set("Vary", tokens.join(", "));
+}
+
+/**
  * A request carries credentials when it has a Cookie or Authorization header.
  * Such requests may be authenticated/personalized and must never participate in
  * the shared, path-keyed app-response cache (read, store, or single-flight).
@@ -1800,6 +1828,11 @@ async function maybeStoreAppResponse(
   if (!headers.has("Cache-Control")) {
     headers.set("Cache-Control", `public, max-age=${effectiveMaxAge}`);
   }
+  // The stored entry advertises shared freshness; it must also declare the
+  // dimensions the entry is keyed on, or a shared cache can reuse one
+  // variant's body for another's request (reload painting the raw JSON
+  // payload). No-op for responses that already declared the full set.
+  appendKeyableVaryFields(headers);
   if (!headers.has("ETag")) {
     headers.set("ETag", createEntityTag(body));
   }

@@ -1046,7 +1046,13 @@ async function handleRequest(
     allData.__head__ = headHtml;
     allData.__css__ = collectCssFromModuleGraph(server, allRoutes.map((r) => r.file));
     return new Response(encodeSerializedPayloadAsJson(allData), {
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Same representation dimensions the production render path declares
+        // (see render-app-route.ts): the dev data response shares its URL with
+        // the HTML document and must never be reusable for a navigation.
+        Vary: "Accept, Accept-Language, X-Neutron-Data, X-Neutron-Routes",
+      },
     });
   }
 
@@ -1095,7 +1101,12 @@ async function handleRequest(
     const fullHtml = wrapHtml(html, route, request, loaderData, clientEntry, actionData, headHtml, mergedSeo);
 
     return new Response(fullHtml, {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        // Mirrors the data branch above: the document shares its URL with the
+        // JSON data protocol and must not answer a data request from a cache.
+        Vary: "Accept, Accept-Language, X-Neutron-Data, X-Neutron-Routes",
+      },
     });
   } catch (error) {
     // Render error - send enriched error to overlay

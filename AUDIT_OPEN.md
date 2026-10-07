@@ -563,3 +563,25 @@ the fallible constructor. Missing checkpoints remain valid for fresh/WAL-only
 recovery. Tests reproduce all three unsafe successes before the fix, preserve
 the failed files, and verify checkpoint-plus-tail recovery remains writable
 across a second reopen. This does not establish power-loss durability.
+
+## Data-protocol responses undeclared variation (2026-10-06, owner-reported)
+
+Reload of a deployed app painted the raw `{"__neutron_serialized__": ...}`
+payload as page content. Root cause is NOT the server cache key (TS-04 holds):
+the client router's data fetch shares the page URL, and the app-response cache
+HIT left the server advertising the framework-synthesized
+`Cache-Control: public, max-age=N` with no `Vary`, so the browser HTTP cache
+stored the JSON payload under the bare URL and handed it to the next document
+navigation. The reload was answered by the browser, never reaching the server.
+
+- TS-33 | FIXED — app responses (both the JSON data protocol and the HTML
+  document) declare every representation dimension the server cache keys on
+  (`Vary: Accept, Accept-Language, X-Neutron-Data, X-Neutron-Routes`), merged
+  with route-declared tokens; stored entries get the same set appended when
+  the store path synthesizes shared-cache freshness; the dev-server plugin's
+  data and document responses match. Regression:
+  `src/server/data-protocol-cache-headers.e2e.test.ts`. Consumers on
+  `@neutron-build/core` ≤ 0.2.2 remain exposed until a release carries this
+  (0.2.2 predates `c31736eb` entirely: string bodies, substring
+  Cache-Control parsing, no keyable-Vary admission, variant key without
+  origin/Accept-Language/data-header dimensions).
