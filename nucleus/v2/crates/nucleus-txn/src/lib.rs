@@ -65,31 +65,37 @@ impl RowLockMode {
     }
 }
 
-/// What an intent (or a history entry) says about the key.
+/// A layer's own value of the key (§2.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntentKind {
+pub enum LayerData {
     Write(Vec<u8>),
     Delete,
-    LockOnly(RowLockMode),
-}
-
-/// Earlier own value of the key inside the same txn (§2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HistoryValue {
-    Write(Vec<u8>),
-    Delete,
-    /// No own value yet at that seq: fall through to committed versions.
+    /// No own value: reads fall through to committed versions. A layer with
+    /// `Absent` data only holds a lock.
     Absent,
 }
 
-/// The `@INTENT` slot (§2). At most one per logical key (I-ONE-INTENT).
+/// The complete own state of the key as of `seq` (§2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer {
+    pub seq: Seq,
+    pub data: LayerData,
+    /// Strongest exclusive mode held: `NoKeyUpdate` or `Update`.
+    pub lock: RowLockMode,
+}
+
+/// The `@INTENT` slot (§2.1). At most one per logical key (I-ONE-INTENT).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Intent {
     pub txn: TxnId,
-    pub kind: IntentKind,
-    pub seq: Seq,
-    /// Oldest first.
-    pub history: Vec<(Seq, HistoryValue)>,
+    /// Oldest first, never empty. The last layer is the current state.
+    pub layers: Vec<Layer>,
+}
+
+impl Intent {
+    pub fn top(&self) -> Option<&Layer> {
+        self.layers.last()
+    }
 }
 
 /// SQLSTATE-bearing transaction errors raised by this crate.
@@ -105,6 +111,10 @@ pub enum TxnError {
     UniqueViolation, // 23505
     #[error("insert or update violates foreign key constraint")]
     ForeignKeyViolation, // 23503
+    #[error("command cannot affect row a second time")]
+    CardinalityViolation, // 21000
+    #[error("snapshot too old")]
+    SnapshotTooOld, // 72000
     #[error("kv: {0}")]
     Kv(String),
 }
@@ -117,6 +127,8 @@ impl TxnError {
             TxnError::LockNotAvailable => "55P03",
             TxnError::UniqueViolation => "23505",
             TxnError::ForeignKeyViolation => "23503",
+            TxnError::CardinalityViolation => "21000",
+            TxnError::SnapshotTooOld => "72000",
             TxnError::Kv(_) => "XX000",
         }
     }
