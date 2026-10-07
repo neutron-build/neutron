@@ -1,6 +1,7 @@
 # Premium-only paths (V2 plan §3). Branches named s/* must not modify these.
 # Enforced by scripts/check-core-paths.sh in CI.
 docs/C-T0-txn-protocol.md
+docs/C-Q3s-types-ordering.md
 crates/nucleus-kv/
 crates/nucleus-txn/
 crates/nucleus-catalog/
