@@ -1547,3 +1547,27 @@ NE-01..31 + MJ; Pass B: RS-01..35 + TSD-01..14; Pass C: the 76 above). The
 pack's five platform-blocked scopes remain blocked_incomplete per its own
 coverage census — device/browser/native release suites were not exercised
 beyond the explicit tests listed here.
+
+## 2026-10-07 — ADM-11 private shell command stdin
+
+Source implementation validated in isolated `audit/final-nucleus-stdin` patch
+(base `fa9cc9bb`), pending parent review/landing. `shell --command-stdin` is
+advertised by help, conflicts with `-c`/`--command`, validates UTF-8 and reads
+through EOF before connecting, then passes SQL bytes unchanged to pgwire.
+Embedded NUL is refused because pgwire SQL uses a terminated string. JSON
+applies to both one-shot modes; plain shell retains its REPL. Stdin command
+errors use fixed diagnostics so server/reader errors cannot quote private SQL.
+
+Evidence: existing binary suite 6 passed (including parser, byte preservation,
+and partial-read refusal); `scripts/test-shell-command-stdin.py` passed actual
+subprocess/pgwire capture and a live in-memory Nucleus KV round trip preserving
+literal whitespace, Unicode, newlines, and semicolons. Persistent test startup
+on this nearly-full host correctly enters read-only at the standard disk
+watermark; the command fixture intentionally uses `--memory`. No engine
+storage or authentication semantics changed. Metrics and formatting checked.
+
+Teploy CLI negotiation remains consumer-owned: its existing positive
+`shell --help` probe for `--command-stdin` returns before `ExecInput` when
+unsupported; there is no argv fallback or new capability protocol. Image
+release/version/digest, registry publication, and consumer pin remain separate
+parent-owned acceptance steps; this source validation does not assert them.
