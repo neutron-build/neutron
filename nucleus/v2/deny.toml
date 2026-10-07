@@ -1,0 +1,62 @@
+# cargo-deny policy for nucleus v2 (`cargo deny check` from nucleus/v2).
+# v2 is distributed under BUSL-1.1, so dependencies must be permissive:
+# anything not in `licenses.allow` is rejected, which covers GPL, AGPL, LGPL,
+# SSPL and other copyleft or source-available licenses.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "wasm32-unknown-unknown",
+]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unicode-3.0",
+    # imbl (MemKv). File-level copyleft; we use it unmodified.
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+# Our own crates. A new workspace crate must be added here.
+exceptions = [
+    { allow = ["BUSL-1.1"], crate = "nucleus-catalog" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-embedded" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-kv" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-models" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-server" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-sql" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-txn" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-wasm" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-wire" },
+    { allow = ["BUSL-1.1"], crate = "xtask" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,12 @@
+# Public items of nucleus-kv / nucleus-txn that standard-tier (non-core) code
+# may use. Checked by scripts/check-api-surface.sh. One crate-qualified path
+# per line (underscored crate names); an entry allows itself and everything
+# below it (variants, associated items). Widening this is a premium decision.
+
+# Error mapping to SQLSTATE / client errors (wire, server, wasm).
+nucleus_kv::KvError
+nucleus_txn::TxnError
+
+# Opaque identifiers for display and pg_catalog-style functions.
+nucleus_txn::Ts
+nucleus_txn::TxnId

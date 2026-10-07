@@ -11,3 +11,12 @@ crates/nucleus-sql/src/exec/core/
 crates/nucleus-wire/src/pgwire/state/
 crates/nucleus-embedded/src/txn.rs
 gates/
+# The enforcement itself (C-0). CORE_PATHS is read from the base ref, but the
+# allowlist, lint and policy files are read from the branch under test.
+CORE_PATHS
+api-allowlist.txt
+deny.toml
+scripts/core-paths-lib.sh
+scripts/check-core-paths.sh
+scripts/check-api-surface.sh
+xtask/

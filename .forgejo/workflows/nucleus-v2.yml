@@ -1,0 +1,68 @@
+name: Nucleus v2
+
+# Card C-0 on the source of truth. The runner is linux-amd64 only; the arm64
+# and darwin legs run on the GitHub mirror (.github/workflows/nucleus-v2.yml).
+# The core-paths check matters most here: s/* branches are pushed to Forgejo.
+
+on:
+  push:
+    paths:
+      - "nucleus/v2/**"
+      - ".forgejo/workflows/nucleus-v2.yml"
+  pull_request:
+    paths:
+      - "nucleus/v2/**"
+      - ".forgejo/workflows/nucleus-v2.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nucleus-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HOME: /var/cache/forgejo-runner/cargo
+  CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-v2
+
+jobs:
+  v2:
+    name: Gate, wasm32, policy
+    runs-on: nucleus-lab
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: nucleus/v2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Core paths self-test
+        run: bash scripts/check-core-paths.sh --self-test
+
+      - name: Core paths (s/* branches)
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BASE: origin/${{ github.base_ref || github.event.repository.default_branch }}
+        run: bash scripts/check-core-paths.sh "$BASE" "$BRANCH"
+
+      - name: Test
+        run: cargo test -q
+
+      - name: Clippy
+        run: cargo clippy -q --all-targets -- -D warnings
+
+      - name: wasm32 (nucleus-kv, nucleus-txn)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build --target wasm32-unknown-unknown -p nucleus-kv -p nucleus-txn
+
+      - name: API surface
+        run: bash scripts/check-api-surface.sh
+
+      - name: cargo-deny
+        run: |
+          cargo deny --version >/dev/null 2>&1 || cargo install cargo-deny --locked
+          cargo deny check

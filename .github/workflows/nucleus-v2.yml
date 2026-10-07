@@ -1,0 +1,92 @@
+name: Nucleus v2
+
+# Card C-0. The multi-arch matrix lives here because it needs GitHub-hosted
+# runners; the Forgejo runner is a single linux-amd64 box. The same gate,
+# wasm build and policy checks also run on Forgejo (.forgejo/workflows/nucleus-v2.yml).
+
+on:
+  push:
+    paths:
+      - "nucleus/v2/**"
+      - ".github/workflows/nucleus-v2.yml"
+  pull_request:
+    paths:
+      - "nucleus/v2/**"
+      - ".github/workflows/nucleus-v2.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nucleus-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    working-directory: nucleus/v2
+
+jobs:
+  gate:
+    name: Gate (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, os: ubuntu-24.04 }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: darwin-arm64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus/v2
+      - name: Test
+        run: cargo test -q
+      - name: Clippy
+        run: cargo clippy -q --all-targets -- -D warnings
+
+  wasm:
+    name: wasm32 (nucleus-kv, nucleus-txn)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus/v2
+      - run: cargo build --target wasm32-unknown-unknown -p nucleus-kv -p nucleus-txn
+
+  policy:
+    name: Core paths, API surface, cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus/v2
+      - name: Core paths self-test
+        run: bash scripts/check-core-paths.sh --self-test
+      - name: Core paths (s/* branches)
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BASE: origin/${{ github.base_ref || github.event.repository.default_branch }}
+        run: bash scripts/check-core-paths.sh "$BASE" "$BRANCH"
+      - name: API surface
+        run: bash scripts/check-api-surface.sh
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny
+        run: cargo deny check
