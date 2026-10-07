@@ -4021,6 +4021,14 @@ impl Executor {
         self.policy_gen.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Read the current policy generation (NE-04). Every live policy
+    /// publication bumps the counter, so a value newer than one previously
+    /// observed proves another publication intervened — used to scope
+    /// failure compensation so it can never revert a concurrent commit.
+    pub(super) fn policy_generation(&self) -> u64 {
+        self.policy_gen.load(Ordering::Relaxed)
+    }
+
     /// Read the security catalog visible to this SQL transaction. Policy DDL
     /// is staged per session, so other connections continue to see the
     /// committed catalog until COMMIT.
@@ -4050,7 +4058,18 @@ impl Executor {
         })?;
         if txn.active {
             if txn.security_pending.is_none() {
-                txn.security_pending = Some(self.security.read().clone_policy_state());
+                // NE-03: the baseline (`security_snapshot`) used to remain the
+                // BEGIN-era clone while `security_pending` was cloned from the
+                // live catalog NOW. A peer policy change landing between those
+                // two moments was already inside the staged copy but absent
+                // from the baseline, so COMMIT's three-way merge classified
+                // the peer's entry as this transaction's delta and could
+                // reinstall an outdated version of it over the peer's later
+                // tightening. Baseline and staged copy must be captured from
+                // the SAME moment: clone once under one read lock and split it.
+                let live = self.security.read().clone_policy_state();
+                txn.security_snapshot = Some(live.clone_policy_state());
+                txn.security_pending = Some(live);
             }
             return Ok(f(txn.security_pending.as_mut().expect("initialized above")));
         }
@@ -5155,6 +5174,24 @@ impl Executor {
     /// Get a reference to the blob store.
     pub fn blob_store(&self) -> &parking_lot::RwLock<crate::blob::BlobStore> {
         &self.blob_store
+    }
+
+    /// NE-14: S3/blob write admission — the same degraded/read-only gate SQL
+    /// DML already passes through. A server refusing writes under disk
+    /// pressure (or an operator hold) must refuse blob mutations too, BEFORE
+    /// any state changes; reads keep working.
+    pub fn blob_write_refused(&self) -> bool {
+        self.service.is_read_only()
+    }
+
+    /// NE-14: ordered durability barrier for blob mutations — payload
+    /// segments fsync BEFORE the manifest WAL group-syncs, so a recovered
+    /// manifest never references unwritten payload bytes and an acknowledged
+    /// mutation never loses its payload. No-op for in-memory stores.
+    pub fn blob_durability_barrier(&self) -> std::io::Result<()> {
+        let store = self.blob_store.read();
+        store.sync_segments()?;
+        store.wal_group_sync()
     }
 
     /// Convenience: put data into the blob store.

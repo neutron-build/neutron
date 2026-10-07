@@ -153,6 +153,51 @@ pub fn restore_pitr(
     //    different database identity) — also before any mutation.
     crate::backup::check_restore_destination(out_data_dir, force, &manifest.database_id)?;
 
+    // NE-18: refuse any filesystem overlap between the destination and the
+    // recovery assets themselves. The ordinary backup/restore path has this
+    // fence (audit A22); PITR lacked it, so a forced restore whose output was
+    // the base snapshot's own directory (or an ancestor of the base/archive)
+    // deleted those recovery assets at publication — after they had been used
+    // to build the image, an acknowledged restore destroyed its own sources.
+    // The descendant shape (output inside the base/archive) is destructive to
+    // the archive contents the same way.
+    crate::backup::reject_path_overlap(base_snapshot, out_data_dir, "PITR restore")?;
+    if archive_dir != base_snapshot {
+        crate::backup::reject_path_overlap(archive_dir, out_data_dir, "PITR restore")?;
+    }
+
+    // NE-18: `db_file` is joined into the staging image to locate the WAL; a
+    // multi-component, absolute or parent-traversing name can point that
+    // join outside the image (or at an unintended sibling). Exactly one
+    // normal relative filename.
+    {
+        let p = Path::new(db_file);
+        let normal_single = !db_file.is_empty()
+            && !p.is_absolute()
+            && p.components().count() == 1
+            && p.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !normal_single {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "db_file must be a single relative filename, got {db_file:?} — absolute, \
+                     empty or path-traversing names are refused"
+                ),
+            ));
+        }
+    }
+
+    // NE-18: hold the destination's directory lock for the WHOLE operation.
+    // The preflight used to probe-and-release; a Nucleus instance could open
+    // the destination in the window between the probe and the publication
+    // rename, and publication deletes the directory out from under it. The
+    // lock is advisory as ever, but a well-behaved starter now finds it held.
+    // What the acquire may create (the directory itself, the lock file) is
+    // undone on failure by `DestFence` so a rejected restore still leaves the
+    // destination byte-for-byte unchanged (A23).
+    let mut fence = DestFence::acquire(out_data_dir)?;
+
     // 4. Build the completed image in an isolated staging sibling of the
     //    destination: base laid down, WAL reconstructed, all inside
     //    `out_data_dir.pitr-image-<pid>`. Nothing under `out_data_dir` is
@@ -186,11 +231,12 @@ pub fn restore_pitr(
     };
 
     // 5. Publish: the only mutation of the destination, one rename of a
-    //    complete image.
-    if out_data_dir.exists() {
-        std::fs::remove_dir_all(out_data_dir)?;
-    }
-    std::fs::rename(&image, out_data_dir)?;
+    //    complete image — with the old generation retained aside until the
+    //    rename and its parent sync are durable (NE-17: the old
+    //    `remove_dir_all` + rename gap destroyed the previous database
+    //    before the replacement was safely installed).
+    crate::backup::publish_dir_replace(&image, out_data_dir)?;
+    fence.disarm();
 
     Ok(PitrReport {
         target_lsn,
@@ -199,6 +245,71 @@ pub fn restore_pitr(
         recovery_point_unix: recovery_point_of(archive_dir, restored_lsn),
         specialty_logs_at_base: specialty_logs,
     })
+}
+
+/// Undo-tracker for what [`crate::backup::DataDirLock::acquire`] may create
+/// at the PITR destination (NE-18): the directory itself when it did not
+/// exist, and the lock file when it did not. On failure, removes exactly
+/// that, keeping the A23 guarantee that a rejected restore leaves the
+/// destination byte-for-byte unchanged. Disarmed on success.
+struct DestFence {
+    dir: PathBuf,
+    created_dir: bool,
+    created_lock: bool,
+    armed: bool,
+    _lock: Option<crate::backup::DataDirLock>,
+}
+
+impl DestFence {
+    fn acquire(dir: &Path) -> io::Result<Self> {
+        let created_dir = !dir.exists();
+        let lock_path = dir.join(crate::backup::LOCK_NAME);
+        // A live directory (with a live writer) is `check_restore_destination`'s
+        // refusal; here the acquire failing with WouldBlock is the same race
+        // caught one moment later.
+        let created_lock = !lock_path.exists();
+        match crate::backup::DataDirLock::acquire(dir) {
+            Ok(Some(lock)) => {
+                // Hold the advisory lock until the fence drops. The guard is
+                // stored leaked-into-self via ManuallyDrop so the struct stays
+                // movable; unlock happens on disarm/drop below.
+                Ok(Self {
+                    dir: dir.to_path_buf(),
+                    created_dir,
+                    created_lock,
+                    armed: true,
+                    _lock: Some(lock),
+                })
+            }
+            Ok(None) => Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "{} is open by a running Nucleus instance — stop it before restoring over it",
+                    dir.display()
+                ),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DestFence {
+    fn drop(&mut self) {
+        // Release the advisory lock first (A24 semantics live in DataDirLock).
+        self._lock.take();
+        if !self.armed {
+            return;
+        }
+        if self.created_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        } else if self.created_lock {
+            let _ = std::fs::remove_file(self.dir.join(crate::backup::LOCK_NAME));
+        }
+    }
 }
 
 /// Lay down the base and reconstruct the truncated WAL inside `image`.
@@ -631,6 +742,167 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".pitr-image"))
             .collect();
         assert!(debris.is_empty(), "staging debris: {debris:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── NE-18: the recovery assets themselves are never the destination ──
+
+    /// Build a base snapshot with a real WAL next to a live archive, so the
+    /// overlap fixtures below exercise a fully valid-looking restore.
+    fn pitr_overlap_fixture(root: &Path) -> (PathBuf, PathBuf, u64) {
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let w = SegmentedWal::open(&data.join("nucleus.wal.d"), 10 * 1024 * 1024).unwrap();
+        let mut last = 0;
+        for i in 0..10u32 {
+            last = w
+                .log_page_write(1, i, &page_with((i % 7) as u8 + 1))
+                .unwrap();
+        }
+        w.sync().unwrap();
+        drop(w);
+        let base = root.join("base");
+        let manifest = crate::backup::backup_data_dir(&data, &base, false, "0.1.1").unwrap();
+        // An archive directory with segments + index, next to the base.
+        let archive = root.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let seg_src = data.join("nucleus.wal.d");
+        if seg_src.is_dir() {
+            for seg in wal::list_archive_segments(&seg_src).unwrap() {
+                std::fs::copy(
+                    wal::segment_file_path(&seg_src, seg),
+                    wal::segment_file_path(&archive, seg),
+                )
+                .unwrap();
+            }
+        }
+        (base, archive, manifest.consistent_lsn.max(last))
+    }
+
+    fn tree_fingerprint(dir: &Path) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push((
+                        p.strip_prefix(dir).unwrap().to_string_lossy().into_owned(),
+                        std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// NE-18: a forced PITR restore whose destination IS the base snapshot,
+    /// an ANCESTOR of it, or an ancestor of the archive, used to delete those
+    /// recovery assets at publication (after building the image from them).
+    /// Every overlap shape must be refused BEFORE any mutation.
+    #[test]
+    fn pitr_refuses_destinations_overlapping_the_recovery_assets() {
+        let root = tmp("ne18_overlap");
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, archive, lsn) = pitr_overlap_fixture(&root);
+        let base_before = tree_fingerprint(&base);
+        let archive_before = tree_fingerprint(&archive);
+
+        // (a) output == the base snapshot itself.
+        let err = restore_pitr(
+            &base,
+            &archive,
+            PitrTarget::Lsn(lsn),
+            &base,
+            "nucleus.db",
+            "0.1.1",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        // (b) output is an ANCESTOR of both the base and the archive: the
+        // publication delete would remove them both.
+        let err = restore_pitr(
+            &base,
+            &archive,
+            PitrTarget::Lsn(lsn),
+            &root,
+            "nucleus.db",
+            "0.1.1",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains("ancestor") || err.to_string().contains("contains"),
+            "refusal must name the overlap: {err}"
+        );
+
+        // (c) output inside the archive — publication would delete archive
+        // content (a subdirectory of the recovery assets).
+        let inside_archive = archive.join("sub_db");
+        std::fs::create_dir_all(&inside_archive).unwrap();
+        let err = restore_pitr(
+            &base,
+            &archive,
+            PitrTarget::Lsn(lsn),
+            &inside_archive,
+            "nucleus.db",
+            "0.1.1",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        // The recovery assets are byte-for-byte untouched in every case.
+        assert_eq!(base_before, tree_fingerprint(&base), "base must survive");
+        assert_eq!(
+            archive_before,
+            tree_fingerprint(&archive),
+            "archive must survive"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// NE-18: `db_file` joins into the staging image — absolute,
+    /// parent-traversing, empty and multi-component names are refused rather
+    /// than escaping the image directory.
+    #[test]
+    fn pitr_rejects_non_single_filename_db_file() {
+        let root = tmp("ne18_dbfile");
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, archive, lsn) = pitr_overlap_fixture(&root);
+        let dest = root.join("out");
+        for bad in [
+            "/etc/nucleus.db",
+            "../escape.db",
+            "sub/dir/nucleus.db",
+            "",
+            ".",
+            "..",
+        ] {
+            let err = restore_pitr(
+                &base,
+                &archive,
+                PitrTarget::Lsn(lsn),
+                &dest,
+                bad,
+                "0.1.1",
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "db_file {bad:?}: {err}"
+            );
+        }
+        assert!(!dest.exists(), "no destination may be created by a refusal");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2369,19 +2369,57 @@ async fn cmd_start(cfg: StartConfig) {
 
     // Spawn RESP2 (Redis protocol) server
     if resp_port > 0 {
-        let resp_addr = format!("{host}:{resp_port}");
-        let kv = std::sync::Arc::clone(executor.kv_store());
-        let resp_pw = resolved_password_for_resp.clone();
-        let resp_shutdown = shutdown_notify.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                nucleus::resp::server::start_resp_server(resp_addr, kv, resp_pw, resp_shutdown)
-                    .await
-            {
-                tracing::error!("RESP server error: {e}");
+        // NE-10: this listener used to ALWAYS start — plaintext, on a
+        // well-known port, sharing the SQL bootstrap password. Deploying SQL
+        // with TLS + SCRAM therefore still exposed that credential to anyone
+        // on the network who issued AUTH. Policy now:
+        //  - whenever SQL TLS is on, RESP gets the same TLS acceptor (the
+        //    configured certificate), so AUTH rides TLS;
+        //  - on a NON-loopback bind, RESP must be both TLS-protected and
+        //    password-gated to start — mirroring the rule SQL already
+        //    enforces for itself. Otherwise it is refused, with an explicit
+        //    NUCLEUS_RESP_INSECURE_AUTH=1 development override;
+        //  - loopback keeps the historical dev default (plaintext allowed).
+        let resp_loopback = is_loopback_host(&host);
+        let resp_tls_ok = tls_acceptor.is_some();
+        let resp_insecure_ok = env_var_truthy("NUCLEUS_RESP_INSECURE_AUTH");
+        let resp_allowed = resp_loopback || (resp_tls_ok && auth_enabled) || resp_insecure_ok;
+        if !resp_allowed {
+            tracing::error!(
+                "RESP server NOT started: a non-loopback plaintext (or unauthenticated) RESP \
+                 listener would expose the SQL bootstrap password or an open keyspace on the \
+                 network. Start RESP with TLS plus a password (--password and TLS on), or set \
+                 NUCLEUS_RESP_INSECURE_AUTH=1 to accept the exposure for development."
+            );
+        } else {
+            let resp_addr = format!("{host}:{resp_port}");
+            let kv = std::sync::Arc::clone(executor.kv_store());
+            let resp_pw = resolved_password_for_resp.clone();
+            let resp_shutdown = shutdown_notify.clone();
+            let resp_tls_config = tls_acceptor.clone();
+            let resp_config = nucleus::resp::server::RespServerConfig {
+                tls_config: resp_tls_config,
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                if let Err(e) = nucleus::resp::server::start_resp_server_with_config(
+                    resp_addr,
+                    kv,
+                    resp_pw,
+                    resp_shutdown,
+                    resp_config,
+                )
+                .await
+                {
+                    tracing::error!("RESP server error: {e}");
+                }
+            });
+            if resp_tls_ok {
+                tracing::info!("RESP server on port {resp_port} (TLS enabled)");
+            } else {
+                tracing::info!("RESP server on port {resp_port} (redis-cli compatible)");
             }
-        });
-        tracing::info!("RESP server on port {resp_port} (redis-cli compatible)");
+        }
     }
 
     // Spawn S3-compatible gateway
@@ -2541,6 +2579,22 @@ async fn cmd_start(cfg: StartConfig) {
                         continue;
                     }
                 }
+            }
+            // Reap finished connection tasks continuously (NE-19): JoinSet
+            // retains every completed entry until joined or dropped, so a
+            // churning server accumulated them for its whole lifetime and a
+            // panicked handler's result was never observed. The `if` guard
+            // keeps this branch disabled while the set is empty (an empty
+            // JoinSet is permanently ready and would starve accept()).
+            joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Err(e) = joined.unwrap_or(Ok(())) {
+                    if e.is_panic() {
+                        tracing::error!("Connection task panicked: {e}");
+                    } else {
+                        tracing::error!("Connection task failed: {e}");
+                    }
+                }
+                continue;
             }
             _ = shutdown_notify.notified() => {
                 tracing::info!("Accept loop exiting due to shutdown");

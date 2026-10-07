@@ -27,6 +27,14 @@ async fn spawn_gateway() -> (u16, Arc<tokio::sync::Notify>) {
     let catalog = Arc::new(Catalog::new());
     let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
     let executor = Arc::new(Executor::new(catalog, storage));
+    spawn_gateway_with(executor).await
+}
+
+/// Like [`spawn_gateway`] but over a caller-built executor (used to attach a
+/// service state the test can flip).
+async fn spawn_gateway_with(
+    executor: Arc<Executor>,
+) -> (u16, Arc<tokio::sync::Notify>) {
     let config = Arc::new(S3Config {
         access_key: ACCESS.to_string(),
         secret_key: SECRET.to_string(),
@@ -575,6 +583,266 @@ async fn s3_presigned_url() {
     let req = format!("GET {bad} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     let r = send_raw(port, req.into_bytes(), b"").await;
     assert_eq!(r.status, 403);
+}
+
+/// NE-13: a presigned (or header-signed) PUT grants upload-to-this-key only.
+/// Appending an UNSIGNED `x-amz-copy-source` header must not flip that grant
+/// into an arbitrary CopyObject; only a request that signs the header may
+/// perform a copy.
+#[tokio::test]
+async fn s3_unsigned_copy_source_cannot_hijack_put() {
+    let (port, _shutdown) = spawn_gateway().await;
+
+    // A "secret" object the PUT credential should not be able to read.
+    request(port, "PUT", "/src", b"", None).await;
+    request(port, "PUT", "/src/secret.txt", b"TOP SECRET", None).await;
+    request(port, "PUT", "/dst", b"", None).await;
+
+    // 1) Presigned PUT with SignedHeaders=host, plus an unsigned
+    //    x-amz-copy-source pointing at the secret.
+    let host = format!("127.0.0.1:{port}");
+    let amz_date = amz_now();
+    let scope = format!("{}/local/s3/aws4_request", &amz_date[..8]);
+    let credential = aws_uri_encode(&format!("{ACCESS}/{scope}"), true);
+    let query_pairs = vec![
+        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential".to_string(), format!("{ACCESS}/{scope}")),
+        ("X-Amz-Date".to_string(), amz_date.clone()),
+        ("X-Amz-Expires".to_string(), "300".to_string()),
+        ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+    ];
+    let headers = vec![("host".to_string(), host.clone())];
+    let auth = AuthData {
+        access_key: ACCESS.to_string(),
+        scope: scope.clone(),
+        signed_headers: vec!["host".into()],
+        signature: String::new(),
+        amz_date: amz_date.clone(),
+        expires: Some(300),
+        presigned: true,
+    };
+    let input = CanonicalRequestInput {
+        method: "PUT",
+        raw_path: "/dst/target.txt",
+        query: &query_pairs,
+        headers: &headers,
+        payload_hash: UNSIGNED_PAYLOAD,
+    };
+    let signature = compute_signature(SECRET, &auth, &input).unwrap();
+    let url = format!(
+        "/dst/target.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={credential}\
+         &X-Amz-Date={amz_date}&X-Amz-Expires=300&X-Amz-SignedHeaders=host\
+         &X-Amz-Signature={signature}"
+    );
+    let req = format!(
+        "PUT {url} HTTP/1.1\r\nHost: {host}\r\nx-amz-copy-source: /src/secret.txt\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let r = send_raw(port, req.into_bytes(), b"").await;
+    assert_eq!(r.status, 403, "{}", r.text());
+    // The destination must be untouched — no unauthorized source read landed.
+    let r = request(port, "GET", "/dst/target.txt", b"", None).await;
+    assert_eq!(r.status, 404);
+
+    // 2) Header-signed PUT with the copy header left unsigned: same refusal.
+    let r = request_with_extra_header(
+        port,
+        "PUT",
+        "/dst/hijack.txt",
+        "x-amz-copy-source: /src/secret.txt",
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.text());
+    let r = request(port, "GET", "/dst/hijack.txt", b"", None).await;
+    assert_eq!(r.status, 404);
+
+    // 3) Positive control: signing x-amz-copy-source performs the copy.
+    let r = request_with_copy_source(port, "/dst/ok.txt", "/src/secret.txt").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = request(port, "GET", "/dst/ok.txt", b"", None).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, b"TOP SECRET");
+}
+
+/// NE-16: delimited listings with small max-keys must advance — the
+/// continuation token used to be the CommonPrefix label itself, and raw keys
+/// inside the group compare greater than the label, so every page re-listed
+/// the same group forever.
+#[tokio::test]
+async fn s3_delimiter_pagination_advances() {
+    let (port, _shutdown) = spawn_gateway().await;
+    request(port, "PUT", "/delim", b"", None).await;
+    for key in ["a/1", "a/2", "b/1"] {
+        request(port, "PUT", &format!("/delim/{key}"), key.as_bytes(), None).await;
+    }
+
+    // Paginate with delimiter=/ and max-keys=1. The full logical entry set
+    // is the two CommonPrefixes a/ and b/.
+    let mut pages: Vec<(Vec<String>, bool, String)> = Vec::new();
+    let mut token = String::new();
+    for _ in 0..10 {
+        let q = if token.is_empty() {
+            "list-type=2&delimiter=%2F&max-keys=1".to_string()
+        } else {
+            format!(
+                "list-type=2&delimiter=%2F&max-keys=1&continuation-token={}",
+                aws_uri_encode(&token, false)
+            )
+        };
+        let r = request(port, "GET", &format!("/delim?{q}"), b"", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let body = r.text();
+        let prefixes: Vec<String> = body
+            .split("<CommonPrefixes>")
+            .skip(1)
+            .map(|chunk| {
+                chunk
+                    .split("</CommonPrefixes>")
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .filter_map(|chunk| {
+                chunk
+                    .split("<Prefix>")
+                    .nth(1)
+                    .and_then(|rest| rest.split("</Prefix>").next())
+                    .map(str::to_string)
+            })
+            .collect();
+        let truncated = !body.contains("<IsTruncated>false</IsTruncated>");
+        let next = extract_next_token(&body);
+        pages.push((prefixes, truncated, next.clone()));
+        if !truncated {
+            break;
+        }
+        assert!(
+            next != token,
+            "continuation token did not advance: {token:?}"
+        );
+        token = next;
+    }
+
+    let (last_page, truncated, _) = pages.last().unwrap();
+    assert!(!truncated, "pagination must terminate");
+    assert_eq!(last_page, &vec!["b/".to_string()], "second group is the final page");
+    let mut all: Vec<String> = pages.iter().flat_map(|(p, _, _)| p.clone()).collect();
+    all.sort();
+    all.dedup();
+    assert_eq!(all, vec!["a/".to_string(), "b/".to_string()]);
+
+    // max-keys=0 is a probe: not truncated, no loop.
+    let r = request(port, "GET", "/delim?list-type=2&delimiter=%2F&max-keys=0", b"", None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.text().contains("<IsTruncated>false</IsTruncated>"));
+    assert!(r.text().contains("<KeyCount>0</KeyCount>"));
+
+    // Control: a larger page covers everything in one response.
+    let r = request(port, "GET", "/delim?list-type=2&delimiter=%2F&max-keys=10", b"", None).await;
+    assert!(r.text().contains("<IsTruncated>false</IsTruncated>"));
+}
+
+fn extract_next_token(body: &str) -> String {
+    body.split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|rest| rest.split("</NextContinuationToken>").next())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// NE-14: a degraded/read-only server must refuse EVERY S3 mutator — the
+/// gateway used to return successful create/put/delete/multipart results
+/// while the SQL side refused writes under the same disk pressure — while
+/// GET/HEAD keep working.
+#[tokio::test]
+async fn read_only_server_refuses_s3_mutations_but_serves_reads() {
+    use nucleus::ops::{DegradeReason, ServiceState};
+
+    let catalog = Arc::new(Catalog::new());
+    let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+    let mut executor = Executor::new(catalog, storage);
+    let service = Arc::new(ServiceState::new());
+    executor.set_service_state(service.clone());
+    let executor = Arc::new(executor);
+    let (port, _shutdown) = spawn_gateway_with(executor.clone()).await;
+
+    // Seed while healthy: a bucket, an object, and a multipart upload id.
+    request(port, "PUT", "robucket", b"", None).await;
+    request(port, "PUT", "/robucket/keep.txt", b"kept", None).await;
+    let list = request(port, "GET", "/robucket?uploads", b"", None).await; // (may be empty)
+    let _ = list;
+    let upload_id = {
+        let r = request(
+            port,
+            "POST",
+            "/robucket/mpu.txt?uploads",
+            b"",
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.text()
+            .split("<UploadId>")
+            .nth(1)
+            .and_then(|rest| rest.split("</UploadId>").next())
+            .unwrap()
+            .to_string()
+    };
+
+    // Flip degraded read-only (the disk-watermark / operator hold shape SQL
+    // DML already passes through).
+    service.enter_read_only(DegradeReason::Operator, "test hold");
+
+    // Every mutator must refuse with 503, and none may mutate state.
+    assert_eq!(request(port, "PUT", "/robucket/new.txt", b"x", None).await.status, 503);
+    assert_eq!(request(port, "PUT", "/robucket2", b"", None).await.status, 503); // create bucket
+    assert_eq!(request(port, "DELETE", "/robucket/keep.txt", b"", None).await.status, 503);
+    assert_eq!(request(port, "POST", "/robucket/m2.txt?uploads", b"", None).await.status, 503);
+    assert_eq!(
+        request(port, "PUT", &format!("/robucket/part.txt?partNumber=1&uploadId={upload_id}"), b"p", None)
+            .await
+            .status,
+        503
+    );
+    // Complete-multipart: valid XML (validated before admission) so the
+    // read-only refusal, not a parse error, is what answers.
+    let complete_xml =
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>";
+    assert_eq!(
+        request(
+            port,
+            "POST",
+            &format!("/robucket/mpu.txt?uploadId={upload_id}"),
+            complete_xml.as_bytes(),
+            None,
+        )
+        .await
+        .status,
+        503
+    );
+    assert_eq!(
+        request(port, "DELETE", &format!("/robucket/mpu.txt?uploadId={upload_id}"), b"", None)
+            .await
+            .status,
+        503
+    );
+
+    // Reads still work: GET/HEAD/list serve the pre-degradation state.
+    let r = request(port, "GET", "/robucket/keep.txt", b"", None).await;
+    assert_eq!(r.status, 200, "GET must keep working while read-only");
+    assert_eq!(r.body, b"kept");
+    assert_eq!(request(port, "HEAD", "/robucket/keep.txt", b"", None).await.status, 200);
+    assert_eq!(request(port, "GET", "/robucket?list-type=2", b"", None).await.status, 200);
+    let body = request(port, "GET", "/robucket?list-type=2", b"", None).await.text();
+    assert!(body.contains("keep.txt"), "the pre-degradation object must list");
+    assert!(!body.contains("new.txt"), "no refused mutation may appear");
+
+    // Recovery: after the hold clears, mutations work again.
+    service.resume_if(DegradeReason::Operator);
+    assert_eq!(request(port, "PUT", "/robucket/new.txt", b"y", None).await.status, 200);
+    let r = request(port, "GET", "/robucket/new.txt", b"", None).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, b"y");
 }
 
 #[tokio::test]

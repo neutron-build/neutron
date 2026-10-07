@@ -55,8 +55,12 @@ def parse_csv_line(line: String, delimiter: String = ",") -> CSVRow:
             buf.append(0)
             current += String(buf^)
 
-    # Last field
-    if current.byte_length() > 0:
+    # Last field — appended unconditionally (MJ-16): a line ending with the
+    # delimiter carries a trailing EMPTY field, and the old
+    # `byte_length() > 0` guard dropped it, shrinking the row width and
+    # shifting downstream schema interpretation. A wholly empty line still
+    # yields zero fields (blank-line handling stays a caller concern).
+    if current.byte_length() > 0 or len(row.fields) > 0:
         row.fields.append(current)
 
     return row^

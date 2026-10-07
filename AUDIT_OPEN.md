@@ -586,6 +586,297 @@ navigation. The reload was answered by the browser, never reaching the server.
   Cache-Control parsing, no keyable-Vary admission, variant key without
   origin/Accept-Language/data-header dimensions).
 
+## Neutron audit pack Pass A — NE-*/MJ-* (2026-10-07, branch `audit/pack-ne-mj`)
+
+Source: the 193-item implementation plan at
+`.audits/2026-10-06/neutron-audit-plan/` (pinned `cfa7eefe`, no fixes
+applied by the audit). Pass A covers its NE-01..NE-31 and MJ-01..16 /
+MJ-K01..K22 clusters (68 items). This section records the pass's work;
+two cancelled prior attempts left +1,366/−91 in the tree which this pass
+inventoried file-by-file before continuing (all inherited work verified
+sound and kept, except two deliberate FAIL-BEFORE probes in
+`executor/policy.rs` which this pass completed).
+
+Status vocabulary as above. Every fix carries a fail-before/pass-after
+regression unless marked otherwise.
+
+### Engine — transaction/policy correctness
+
+- NE-03 | FIXED — policy COMMIT's three-way merge compared a staged catalog
+  cloned at the session's FIRST policy write against a baseline cloned at
+  BEGIN; a peer change landing between those moments was classified as this
+  transaction's delta and COMMIT reinstalled the peer's outdated entry.
+  Baseline and staged copy are now captured together (one clone under one
+  read lock, split). Regression:
+  `test_policy_merge_moments.rs::peer_tightening_between_begin_and_staging_survives_commit`
+  (+ drop variant).
+- NE-04 | FIXED — policy publication cloned under a read lock, merged with
+  no lock, and installed under a different write lock (two committing
+  sessions could each discard the other's delta); failure compensation
+  restored the whole pre-publish catalog after an await during which
+  another session committed. Clone+merge+install now run under ONE write
+  guard (lexical block — the guard never crosses an await) and
+  compensation is generation-CAS scoped (`policy_generation`). Regressions:
+  `peer_drop_between_begin_and_staging_survives_commit`,
+  `concurrent_disjoint_policy_commits_both_survive` (64 barrier rounds ×
+  2 threads); masking DDL failure path generation-scoped in
+  `masking_ddl.rs`.
+- NE-05 | FIXED — RLS comparison guessed numeric semantics from rendered
+  strings (`code > '2'` admitted '10' on TEXT; f64 rounding moved exact
+  numeric boundaries past 2^53). Domains are bound at CREATE POLICY time
+  from the catalog column type (`ColumnDomain::{Heuristic,Text,Numeric}`;
+  `bind_column_domains`), TEXT compares lexically, numerics compare exact
+  decimal (sign/width/digit-wise, exponent forms fall back), and reloaded
+  pre-fix policies keep their recorded Heuristic semantics via serde
+  defaults. Regression: `test_rls_typed_domains.rs` (lexical TEXT,
+  string-identity IN, >2^53 boundary both directions, decimal scales).
+- NE-06 | FIXED — a NULL literal compiled to AlwaysFalse, so `USING (NOT
+  NULL)` granted every row. New `AlwaysUnknown` predicate evaluates to
+  TriState::Unknown (never grants, including under NOT); dumper renders it
+  as `NULL` which recompiles to the same semantics. Regression:
+  `null_predicates_never_grant_even_under_not` (NULL, NOT NULL,
+  NOT (NULL OR FALSE) deny; TRUE OR NULL grants).
+
+### Engine — wire/security surface
+
+- NE-08 | FIXED — a two-byte non-ASCII RESP prefix panicked the connection
+  task inside `&line[1..]` before auth, permanently consuming one of
+  max_connections. Parser validates the type byte against `+ - : $ *`
+  before any slice; bulk-string CRLF terminators are verified (hardening);
+  every accepted connection holds an RAII slot guard (`ConnectionSlotGuard`)
+  whose Drop releases on error/cancel/panic. Regressions in
+  `resp/parser.rs` + `resp/server.rs` (multibyte sweep; two-slot server
+  survives three malformed connections and answers PING).
+- NE-09 | FIXED (panic vectors) — `is_large_object_call` sliced
+  `&str[..10]` (`SELECT 'aé'` killed the pgwire task mid-transaction); now
+  byte-wise prefix match. Email masking indexed `&local[..1]` (multibyte
+  first char panicked) and star-counted by bytes; now char-based. Both with
+  regressions. DEFERRED (see continuation): the general session-lifecycle
+  guard (cleanup-on-unwind for arbitrary handler panics) — the two known
+  reachable panic sites are closed; the guard is defense-in-depth.
+- NE-10 | FIXED — the RESP listener always started plaintext on :6379 with
+  the SQL bootstrap password. Policy: SQL's TLS acceptor is routed into
+  `start_resp_server_with_config` whenever TLS is on; on non-loopback binds
+  RESP starts only when TLS-protected AND password-gated, else refused with
+  an explicit error (override: `NUCLEUS_RESP_INSECURE_AUTH=1`); loopback
+  keeps the dev default. AUTH attempts bounded per connection
+  (5, independent of pgwire). Regression:
+  `test_auth_attempts_are_bounded_per_connection`; loopback gate has
+  compile+config-matrix coverage via `main.rs` wiring.
+- NE-11 | FIXED — requested mTLS silently downgraded three ways (CA + TLS
+  off; CA + half-set cert/key falling back to self-signed; CA-only warning
+  without a verifier). `setup_tls_with_client_ca` fails closed on every
+  inconsistent form and the generated-certificate path builds a real
+  client-CA verifier. Handshake-level regression:
+  `mtls_acceptor_rejects_certless_handshake` (real CA-signed client
+  admitted, certless client aborted). DEFERRED (see continuation): carrying
+  require_tls/client_cert into `on_startup` so a plaintext Startup packet
+  is refused before authentication when mTLS is the policy.
+- NE-13 | FIXED — a presigned PUT (SignedHeaders=host) plus an UNSIGNED
+  `x-amz-copy-source` flipped the upload grant into an arbitrary
+  CopyObject. The copy-source header family must be covered by
+  SignedHeaders before dispatch. Regression:
+  `s3_unsigned_copy_source_cannot_hijack_put` (presigned + header-signed
+  refusals, destination untouched, signed positive control).
+- NE-15 | FIXED — a multibyte character across byte 8 of `x-amz-date`
+  panicked `verify` before signature checking, leaking a gateway slot. The
+  complete timestamp parses/validates first; the gateway uses the same RAII
+  slot guard as RESP. Regressions: hostile-date unit matrix + S3 server
+  guard.
+- NE-16 | FIXED — delimiter pagination emitted the CommonPrefix label as
+  the continuation token, and raw keys inside the group compare greater
+  than the label, so `max-keys=1` re-listed `a/` forever. Resume skips
+  every key in the emitted group; max-keys=0 reports not-truncated.
+  Regression: `s3_delimiter_pagination_advances` (advancing tokens, full
+  coverage, no duplicates, probe + control pages).
+
+### Engine — S3 durability boundary
+
+- NE-14 | FIXED — S3 mutators answered 200 while the SQL side refused
+  writes under the same degraded state, and no payload/WAL durability was
+  forced. Every mutator (create/delete bucket, PUT, COPY, DELETE, batch
+  delete, multipart initiate/upload-part/complete/abort) now runs through
+  one gate: read-only admission BEFORE any state change (503; GET/HEAD/list
+  keep working), then the ordered barrier — payload segment fsync BEFORE
+  manifest WAL group-sync — with failures surfaced (503, never 200).
+  Multipart completion atomicity is stated in code: one manifest swap;
+  part-manifest deletion after the swap can never remove live chunks.
+  Regression:
+  `read_only_server_refuses_s3_mutations_but_serves_reads` (every mutator
+  503 + reads 200 + recovery). The pack's injected mid-write payload/WAL
+  fsync fault is not covered by a test injection (needs a durable blob
+  fixture; the barrier calls the same sync paths the WAL/buffer tests
+  exercise).
+
+### Engine — storage: WALs, LSM, audit
+
+- NE-22 | FIXED — KvWal/ColumnarWal reopened appends BEHIND an unrepaired
+  torn tail: the append and its fsync acknowledged, yet the next recovery
+  stopped at the tear and omitted them. Open now repairs (truncates to the
+  last complete record, durably) before the append handle exists — replay
+  reports the true record-boundary prefix (kv's Stop path and columnar's
+  framing no longer count partial parses as valid) — and a KvWal append
+  that fails after bytes may have moved fences the log until reopen (a
+  pre-write injection stays retryable, preserving the edge-triggered
+  MISCONF contract). Regressions: byte-by-byte torn-tail corpora for both
+  WALs (`torn_tail_is_repaired_*`), `poisoned_log_refuses_further_appends_until_reopen`.
+- NE-20 | FIXED — an LSM compaction input whose value could not be read
+  back (I/O error, gone file, checksum mismatch) was merged AS A TOMBSTONE
+  through the lenient read floor, written durably into the replacement run,
+  and the original files deleted: a transient read error became permanent
+  data loss. Compaction merges through a fail-closed `entries_checked()`
+  and aborts with the tree state and every input file untouched. Point
+  lookups keep their documented lenient floor. Regression:
+  `corrupt_input_aborts_compaction_instead_of_deleting_data` (checksum
+  flip → Err with byte-identical inputs → heal → compact).
+- NE-21 | FIXED-PARTIAL — input-file retirement errors were silently
+  ignored (`let _ = remove_file`), so a "successful" compaction could leave
+  a superseded input live. Deletion failures now propagate with the file
+  named. DEFERRED (see continuation): the crash-window half — a crash
+  between final-level input deletion and reopen can resurrect a flushed
+  deletion because tombstones are dropped at the final level and all
+  surviving `.sst` files are authoritative; the real fix is a committed
+  live-run manifest (format change).
+- NE-26 | FIXED — B-tree insertion never enforced MAX_KEY_SIZE; an
+  oversized first key entered split logic with no right-hand entry and
+  panicked instead of returning KeyTooLarge. Checked before any page is
+  touched. Regression: 257/4096/16349/65536-byte keys refused without
+  mutation, MAX_KEY_SIZE boundary accepted.
+- NE-28 | FIXED — an audit event larger than the whole file cap was written
+  anyway and rotation carried a copy into every retained file, defeating
+  the total bound. Oversized events are refused with InvalidInput BEFORE
+  any rotation/write/accounting. Regression:
+  `oversized_events_are_refused_without_mutation` (keep=0/1/4, control-char
+  expansion, exact boundary accepted).
+- NE-29 | FIXED — a torn final audit record (crash/partial write) let the
+  next record append mid-line: acknowledged yet unparseable; a tail ending
+  inside a UTF-8 character made `read_all` drop EVERY event in that file.
+  Open repairs the tail (truncate past the last complete line, durably)
+  before appending; a mid-line write failure fences the sink until reopen;
+  `read_all` reads bytes and splits on newlines (lossy per line).
+  Regressions: full truncated-prefix corpus (incl. mid-codepoint and
+  mid-escape), `read_all_survives_a_multibyte_torn_tail`. The mid-write
+  injection fault itself has no test hook (fence covered by inspection).
+- NE-30 | FIXED — WAL archiving deleted the live segment after a copy that
+  was never fsynced (file or directory), and `archive_active` returned
+  Ok(true) after rotation's best-effort archive error. The archive copy is
+  now fsynced before its rename and the archive directory after it;
+  same-size archive copies are verified by CONTENT (torn/corrupt twins are
+  replaced); `archive_active` re-verifies the sealed segment durably
+  archived and propagates failure; `truncate_before` keeps the live
+  segment on any archive failure (as before). Regressions:
+  `archive_active_fails_when_the_archive_is_unwritable`,
+  `a_corrupt_same_size_archive_copy_is_replaced_not_trusted`,
+  `truncate_before_keeps_the_live_segment_when_archiving_fails`. The
+  pack's owner-run power-loss filesystem tests remain owner work.
+
+### Engine — backup/PITR
+
+- NE-17 | FIXED — an approved forced restore deleted the destination and
+  then copied into it: a halfway copy/rename failure destroyed the old
+  database. Restores build the complete image in a staging sibling, fsync
+  it, then publish by rename with the old generation retained aside until
+  the new one is live and the parent dir is synced (`publish_dir_replace`;
+  sync failure propagates and keeps the aside copy). Regressions:
+  `a_halfway_copy_failure_keeps_the_previous_database` (legacy-manifest
+  fixture + unreadable file), `a_publication_failure_keeps_a_recoverable_generation`
+  (read-only parent: old generation at dest or aside). PITR publishes
+  through the same helper.
+- NE-18 | FIXED — PITR lacked the backup/restore path's overlap fence: a
+  forced restore onto the base snapshot's own directory (or an ancestor of
+  base/archive) deleted the recovery assets at publication after using
+  them; `db_file` joined multi-component/absolute names into the staging
+  image. All overlap shapes are refused before any mutation
+  (`reject_path_overlap`, message generalized for reuse); `db_file` must be
+  exactly one normal relative filename; the destination's directory lock is
+  HELD for the whole operation (`DestFence`, undoing what the acquire
+  created on failure so a refused restore still leaves the destination
+  byte-for-byte unchanged). Regressions:
+  `pitr_refuses_destinations_overlapping_the_recovery_assets`,
+  `pitr_rejects_non_single_filename_db_file`.
+
+### Engine — page format
+
+- NE-31 | FIXED — the table-directory overflow payload began at byte 4 of
+  each overflow page, overlapping the flush-stamped checksum (4..8) and
+  LSN (8..16): every WAL log/flush of an overflow page corrupted the first
+  12 payload bytes and reopen misread/lost directory entries. v3 overflow
+  layout places the payload past the common header (chain pointer stays at
+  0..4 — never stamped); `DB_FORMAT_VERSION` bumped to 3; pre-v3
+  databases WITH an overflow chain are refused with a named error (their
+  payload may already be corrupt — migrating would launder damaged bytes);
+  directories without overflow upgrade transparently as before. Physical
+  snapshots remain format-locked through the same constant. Regressions:
+  `table_directory_overflow_survives_flush_stamp_and_reopens` (800 tables,
+  full flush path, two reopens, first pages stable),
+  `pre_v3_overflow_directory_is_refused`.
+
+### Mojo (uncompiled — see note)
+
+NOTE: no Mojo toolchain exists on this machine (`mojo` not found; the pack
+installed none). The four fixes below are each a provable by-inspection
+one-line/one-constant correction against the two signatures involved;
+everything else in the MJ clusters is DEFERRED with that stated reason.
+They are UNVERIFIED BY COMPILER AND TESTS — the continuation pass must run
+`mojo test` before landing them.
+
+- MJ-02 | FIXED (uncompiled) — FP16 subnormal decode initialized the
+  normalization exponent at −1, halving every nonzero subnormal
+  (0x0001 → 2^−25); e now starts at 0 (`io/binary_reader.mojo`).
+- MJ-16 | FIXED (uncompiled) — the CSV parser dropped a trailing empty
+  field (`byte_length() > 0` guard); the final field is appended whenever
+  the line held any delimiter or content, preserving zero-field blank
+  lines (`data/csv_reader.mojo`).
+- MJ-K12 | FIXED (uncompiled) — `TensorView.reshape` used the two-argument
+  constructor, resetting the storage offset to 0 so reshaping a contiguous
+  slice silently re-based it onto the tensor start; it now passes
+  `new_shape.strides()` and `self._offset` (`tensor/view.mojo`).
+- MJ-K17 | FIXED (uncompiled) — the standalone transformer block called
+  `swiglu(gate, up)` while `swiglu(x, gate) = silu(gate)·x`, swapping the
+  FFN operands vs the Model/SIMD paths; the call is now
+  `swiglu(up, gate)` (`nn/transformer.mojo`).
+- MJ-01..15 (excl. 02/16), MJ-K01..K22 (excl. K12/K17) | DEFERRED —
+  substantive algorithm/training/kernel work (weight-reader validation,
+  GGUF layouts, DLPack contracts, scheduler admission, autograd tape
+  semantics, e-graph rebuilds, randn/streaming boundaries). Reason: no
+  Mojo toolchain on this machine; blind-editing numerical kernels without
+  compilation or tests would be unverifiable. Continuation entry below.
+
+### Deferred remainder (precise)
+
+1. NE-01 (P1) — autocommit page images inherit a buffered transaction's WAL
+   identity on unrelated pages (`buffer.rs`/`buffered_engine.rs`/
+   `disk_engine.rs`). Needs the per-page WAL owner + apply-window gate
+   design from the pack; the existing attribution test
+   (`another_sessions_write_is_not_attributed_to_the_applying_txn`) is the
+   seed to extend.
+2. NE-02 (P1) — a failed buffered COMMIT leaves its applied prefix visible
+   (`buffered_engine.rs`). Needs before-image apply contexts restored on
+   pre-decision failure; executor-level undo (NU-02/03) does not cover the
+   storage-level apply path.
+3. NE-21 remainder (P1) — LSM live-run manifest so a crash mid-retirement
+   cannot resurrect final-level tombstone-dropped deletions.
+4. NE-23/24/25 (P2) — buffer-pool async flush ownership, io_uring short
+   write accounting, failed-load frame reclamation. Note the pack's own
+   caveat: the inspected DiskEngine constructor never selects the async /
+   io_uring backends (file/directory path mismatch), so these are public
+   API defects without demonstrated server exposure; fix or document.
+5. NE-09 remainder — session-lifecycle guard (cleanup on unwind/cancel).
+6. NE-11 remainder — `on_startup` plaintext refusal under a client-cert
+   policy (the pack's required native verification branch).
+7. MJ-01..15/MJ-K01..K22 remainder — requires a Mojo toolchain; work from
+   the pack's per-item proposed changes in
+   `.audits/2026-10-06/neutron-audit-plan/findings.json`.
+
+### Pass A gates
+
+nucleus `cargo test --lib` green (full suite; count in DATABASE_COMPLETION
+updated via `scripts/metrics.sh --check`, now 0 FAIL), `cargo test --test
+s3_gateway` 10/10, targeted suites for every touched module listed in the
+per-item regressions above. No web searches were performed; no lookups
+beyond the local audit pack and repository. No commits made — tree left
+dirty for the orchestrator.
+
 ## Neutron framework audit NA-01..NA-14 (2026-10-06, GPT pass — wave-2 fixes)
 
 Full report: `.audits/2026-10-06/gpt-reports/neutron-full.md` (the originally

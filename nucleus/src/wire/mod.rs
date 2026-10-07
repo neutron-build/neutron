@@ -475,8 +475,14 @@ fn lo_blob_key(oid: u32) -> String {
 /// objects are not implemented", sends the reader to the wrong place, and
 /// aborts their transaction on the way. Say what is actually true instead.
 fn is_large_object_call(sql: &str) -> bool {
-    let trimmed = sql.trim();
-    trimmed.len() >= 10 && trimmed[..10.min(trimmed.len())].eq_ignore_ascii_case("select lo_")
+    // Byte-wise prefix match: a `&str[..10]` slice panics when byte 10 falls
+    // inside a multibyte character (e.g. `SELECT 'aé'`), which a remote peer
+    // can send inside a transaction block — killing the connection task by
+    // panic. Compare the ASCII prefix on bytes instead.
+    sql.trim()
+        .as_bytes()
+        .get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"select lo_"))
 }
 
 // ============================================================================
@@ -6216,6 +6222,23 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    #[test]
+    fn large_object_detector_is_byte_safe_for_unicode() {
+        // NE-09: `SELECT 'aé'` places a multibyte character across byte 10;
+        // the old `trimmed[..10]` string slice panicked there, killing the
+        // connection task mid-transaction. Detection must be byte-wise.
+        assert!(!is_large_object_call("SELECT 'aé'"));
+        assert!(!is_large_object_call("SELECT 'é' FROM t"));
+        assert!(!is_large_object_call("select 'aaaaaaaaaa'"));
+        // Positive controls.
+        assert!(is_large_object_call("SELECT lo_open(1, 1)"));
+        assert!(is_large_object_call("  select lo_creat(400)"));
+        assert!(is_large_object_call("SELECT LO_UNLINK(100000)"));
+        // Too short to be the prefix at all.
+        assert!(!is_large_object_call("SELECT"));
+        assert!(!is_large_object_call(""));
+    }
 
     /// PostgreSQL binary NUMERIC bytes: ndigits, weight, sign, dscale, words.
     fn numeric_wire(weight: i16, sign: u16, dscale: u16, words: &[u16]) -> Vec<u8> {

@@ -104,6 +104,11 @@ pub struct AuditSink {
     active_bytes: AtomicU64,
     max_bytes: u64,
     keep: usize,
+    /// A record write failed mid-line (NE-29): the active file may end in a
+    /// PARTIAL record, so further appends would concatenate onto it and
+    /// acknowledge events no reader can parse. Refused until reopen, which
+    /// repairs the torn tail.
+    fenced: std::sync::atomic::AtomicBool,
 }
 
 impl AuditSink {
@@ -118,6 +123,11 @@ impl AuditSink {
         // directory is over its bound.
         prune(dir, keep)?;
         let path = dir.join(ACTIVE);
+        // NE-29: repair a torn tail BEFORE the append handle exists. A crash
+        // or partial write can leave the final record unterminated; appends
+        // landing behind it used to return success yet merge with the torn
+        // bytes into a line no reader can parse.
+        repair_torn_tail(&path)?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -130,6 +140,7 @@ impl AuditSink {
             active_bytes: AtomicU64::new(len),
             max_bytes: max_bytes.max(1),
             keep,
+            fenced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -193,14 +204,44 @@ impl AuditSink {
         line.push_str("}\n");
 
         let mut file = self.file.lock();
+        // NE-29 fence: an earlier write failed mid-line, so the file may end
+        // in a partial record — appending now would acknowledge an event that
+        // merges with the torn bytes and never parses.
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "audit sink is fenced: a previous record write failed mid-line; reopen \
+                 (which repairs the torn tail) before recording again",
+            ));
+        }
+        // NE-28: an event larger than the whole file cap can never fit
+        // anywhere — writing it anyway meant rotation carried a copy into
+        // every retained file and the total bound did not hold. Refuse
+        // BEFORE any mutation (no rotation, no write, no accounting).
+        if line.len() as u64 > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "audit event ({} bytes) exceeds the per-file cap ({} bytes); refusing to \
+                     record it — the configured retention bound would not hold. Raise \
+                     NUCLEUS_AUDIT_MAX_BYTES if events this large are expected.",
+                    line.len(),
+                    self.max_bytes
+                ),
+            ));
+        }
         // Rotate BEFORE writing when this event would cross the cap, so the cap
         // is a bound on the file rather than a bound it is allowed to exceed.
         if self.active_bytes.load(Ordering::Acquire) + line.len() as u64 > self.max_bytes {
             self.rotate(&mut file)?;
         }
-        file.write_all(line.as_bytes())?;
+        if let Err(e) = file.write_all(line.as_bytes()) {
+            self.fenced.store(true, Ordering::Release);
+            return Err(e);
+        }
         // Before returning, not on a timer: the event this log exists for is
         // the one that happens immediately before the machine goes down.
+        // (The bytes may or may not have landed, but the accounting below
+        // stays honest either way because the line was fully written.)
         file.sync_all()?;
         self.active_bytes
             .fetch_add(line.len() as u64, Ordering::AcqRel);
@@ -242,6 +283,12 @@ impl AuditSink {
 
     /// Every event currently on disk, oldest file first. For tests and for
     /// whatever exports the log.
+    ///
+    /// Reads BYTES and splits on newlines (NE-29): `read_to_string` fails
+    /// wholesale on a file whose torn tail ends inside a UTF-8 character,
+    /// which silently omitted EVERY event in that file from the export.
+    /// Each complete line is converted lossily; a partial trailing line
+    /// (which `open` repairs before appends) is dropped rather than parsed.
     pub fn read_all(dir: &Path) -> Vec<String> {
         let mut out = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
@@ -253,8 +300,14 @@ impl AuditSink {
         }
         files.push(dir.join(ACTIVE));
         for f in files {
-            if let Ok(text) = std::fs::read_to_string(&f) {
-                out.extend(text.lines().filter(|l| !l.is_empty()).map(str::to_string));
+            let Ok(bytes) = std::fs::read(&f) else {
+                continue;
+            };
+            for line in bytes.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                out.push(String::from_utf8_lossy(line).into_owned());
             }
         }
         out
@@ -274,9 +327,45 @@ impl AuditSink {
     }
 }
 
+/// Truncate an unterminated final record so appends never land behind a torn
+/// tail (NE-29). A crash or partial write can leave the last line without its
+/// `\n`; the next acknowledged record used to concatenate onto it and succeed
+/// while producing a line no reader can parse. A repair that cannot complete
+/// fails the open: recording into a known-torn file is worse than refusing.
+fn repair_torn_tail(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path)?;
+    let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') else {
+        // No newline at all: either an empty file or one wholly-torn record.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let f = OpenOptions::new().write(true).open(path)?;
+        f.set_len(0)?;
+        f.sync_all()?;
+        return Ok(());
+    };
+    let complete_len = last_nl as u64 + 1;
+    if bytes.len() as u64 == complete_len {
+        return Ok(()); // already terminated
+    }
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_len(complete_len)?;
+    f.sync_all()?;
+    tracing::warn!(
+        "audit log at {} had a torn final record ({} of {} bytes kept); truncated it before \
+         appending",
+        path.display(),
+        complete_len,
+        bytes.len()
+    );
+    Ok(())
+}
+
 /// Delete retained files past `keep`, and any left by an interrupted rotation.
-fn prune(dir: &Path, keep: usize) -> std::io::Result<()> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn prune(dir: &Path, keep: usize) -> std::io::Result<()> {    let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
     };
     for entry in entries.flatten() {
@@ -502,6 +591,139 @@ mod tests {
             !lines[0].contains("\"kind\":\"login_succeeded\""),
             "a principal must not be able to forge the kind field: {}",
             lines[0]
+        );
+    }
+
+    /// NE-28: an event larger than the whole file cap can never fit. Writing
+    /// it anyway let rotation carry a copy into EVERY retained file, so the
+    /// total bound did not hold. Refusal must be explicit and mutate nothing.
+    #[test]
+    fn oversized_events_are_refused_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (max, keep) in [(1_024u64, 0usize), (1_024, 1), (1_024, 4)] {
+            let dir = tmp.path().join(format!("k{keep}"));
+            let s = sink(&dir, max, keep);
+            // One good event so the refusal is provably non-mutating against
+            // a non-empty file.
+            s.record(AuditKind::LoginSucceeded, "ok", "fine", None)
+                .unwrap();
+            let before = AuditSink::total_bytes(&dir);
+            let before_lines = AuditSink::read_all(&dir);
+
+            // keep+2 oversized attempts (detail padded past the cap, both
+            // plain and with control characters that JSON expands 6x).
+            for i in 0..keep + 2 {
+                let detail = format!("{}{}", "\u{1}".repeat(max as usize), i);
+                let err = s
+                    .record(AuditKind::PolicyChanged, "huge", &detail, None)
+                    .unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+            }
+            assert_eq!(
+                AuditSink::total_bytes(&dir),
+                before,
+                "a refused event must not rotate or write anything"
+            );
+            assert_eq!(AuditSink::read_all(&dir), before_lines);
+
+            // Sizes cap-1 and cap are fine (control chars expand 6x, so keep
+            // the raw detail well under): the boundary is exact.
+            let ok_detail = "x".repeat(max as usize / 8 - 64);
+            assert!(s.record(AuditKind::RoleAltered, "b", &ok_detail, None).is_ok());
+        }
+    }
+
+    /// NE-29: a torn final record (crash/partial write) must not corrupt the
+    /// NEXT acknowledged record. Reopen repairs the tail first, so the
+    /// sentinel lands on its own line and every acknowledged record parses
+    /// independently — for every truncation point, including inside a UTF-8
+    /// codepoint and inside a JSON escape.
+    #[test]
+    fn a_torn_tail_is_repaired_so_the_next_record_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A well-formed reference record to tear.
+        let reference = {
+            let dir = root.join("seed");
+            let s = sink(&dir, 1 << 20, 4);
+            s.record(
+                AuditKind::PolicyChanged,
+                "admén",
+                "ALTER POLICY p ON t USING (true) — ünïcode detail \\\"escaped\\\"",
+                None,
+            )
+            .unwrap();
+            std::fs::read(dir.join(ACTIVE)).unwrap()
+        };
+
+        for cut in 1..reference.len() {
+            let dir = root.join(format!("cut{cut}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Good terminated record + torn prefix of the reference record.
+            let mut seed = b"{\"ts_ms\":1,\"kind\":\"login_succeeded\",\"principal\":\"ok\"}\n".to_vec();
+            seed.extend_from_slice(&reference[..cut]);
+            std::fs::write(dir.join(ACTIVE), &seed).unwrap();
+
+            // Reopen (repairs), append a sentinel, reopen again.
+            let s = sink(&dir, 1 << 20, 4);
+            s.record(AuditKind::RoleDropped, "sentinel", "after repair", None)
+                .unwrap();
+            drop(s);
+            let s = sink(&dir, 1 << 20, 4);
+            s.record(AuditKind::RoleCreated, "second", "after reopen2", None)
+                .unwrap();
+            drop(s);
+
+            let lines = AuditSink::read_all(&dir);
+            // The good seed record and both post-repair records parse on
+            // their own lines, in order.
+            assert!(
+                lines
+                    .first()
+                    .is_some_and(|l| l.contains("\"kind\":\"login_succeeded\"")),
+                "cut {cut}: seed record lost: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("\"principal\":\"sentinel\"")),
+                "cut {cut}: the post-repair sentinel did not land as its own record: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("\"principal\":\"second\"")),
+                "cut {cut}: the second-reopen record lost: {lines:?}"
+            );
+            // Every line parses as a standalone JSON event.
+            for l in &lines {
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(l).is_ok(),
+                    "cut {cut}: unparseable audit line {l:?}"
+                );
+            }
+        }
+    }
+
+    /// NE-29's read side: a file whose torn tail ends inside a UTF-8
+    /// character used to make `read_to_string` fail wholesale, silently
+    /// omitting EVERY event in that file from the export.
+    #[test]
+    fn read_all_survives_a_multibyte_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let s = sink(dir, 1 << 20, 4);
+        s.record(AuditKind::LoginSucceeded, "ok1", "fine", None)
+            .unwrap();
+        drop(s);
+        // Append a partial record ending mid-codepoint.
+        let path = dir.join(ACTIVE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"ts_ms\":2,\"principal\":\"ad");
+        bytes.extend_from_slice(&"é".as_bytes()[..1]); // lead byte only
+        std::fs::write(&path, &bytes).unwrap();
+
+        let lines = AuditSink::read_all(dir);
+        assert!(
+            lines.iter().any(|l| l.contains("\"principal\":\"ok1\"")),
+            "the complete record must still be exported: {lines:?}"
         );
     }
 }

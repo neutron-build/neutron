@@ -15,7 +15,7 @@
 //!   3 = CHECKPOINT   — marks a consistent point (no page data)
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1261,7 +1261,18 @@ impl SegmentedWal {
         if active.bytes_written == 0 {
             return Ok(false);
         }
+        let sealed = active.segment_number;
         self.rotate_inner(&mut active)?;
+        // NE-30: rotation's own archive attempt is deliberately best-effort
+        // (a failing archive must not fail ordinary writes — the segment
+        // stays live and `truncate_before` refuses to delete it un-archived).
+        // But THIS call's contract is "the committed prefix is recoverable
+        // from the archive alone", so its success must not ride on a
+        // suppressed error: verify the sealed segment is durably archived,
+        // idempotently — a rotation that already archived it is a cheap
+        // content check, a rotation whose archive failed retries here and
+        // propagates the failure.
+        self.archive_segment(sealed)?;
         Ok(true)
     }
 
@@ -1275,6 +1286,13 @@ impl SegmentedWal {
     /// reclaimed from the live dir), `Ok(false)` when no archive is configured.
     /// The copy is staged through a temp file + atomic rename, so a crash mid
     /// copy never leaves a truncated segment a restore would trust.
+    ///
+    /// NE-30: "present in the archive" now means DURABLY present — the copied
+    /// bytes are fsynced before the rename, the archive directory after it —
+    /// because the caller (`truncate_before`) may delete the live source as
+    /// soon as this returns Ok. A same-size destination is verified by
+    /// content, not length, so a torn or corrupt prior copy is replaced
+    /// rather than silently trusted.
     fn archive_segment(&self, seg_num: u64) -> std::io::Result<bool> {
         let Some(archive) = self.archive_dir.as_ref() else {
             return Ok(false);
@@ -1288,15 +1306,31 @@ impl SegmentedWal {
         }
         let src_len = std::fs::metadata(&src)?.len();
         let dst = segment_path(archive, seg_num);
-        // Idempotent: a same-size archived copy already exists.
+        // Idempotent: an already-archived copy with the same LENGTH AND BYTES.
+        // Same length alone proved nothing — a torn or corrupt prior copy
+        // (crash mid-write of an older protocol, bit rot) was trusted as
+        // coverage while the live original was deleted (NE-30).
         if let Ok(m) = std::fs::metadata(&dst)
             && m.len() == src_len
         {
-            return Ok(true);
+            if files_equal(&src, &dst)? {
+                return Ok(true);
+            }
+            tracing::warn!(
+                "archived segment {seg_num} is same-size but different from the live one; \
+                 replacing it (the archive copy was torn or corrupt)"
+            );
         }
         let tmp = crate::storage::atomic_write::tmp_sibling(&dst);
         std::fs::copy(&src, &tmp)?;
+        // Durable before published: fsync the file contents BEFORE the rename
+        // (NE-30) — the caller may delete the live source as soon as this
+        // returns, and an archive copy that exists only in the page cache does
+        // not survive the power loss that follows.
+        sync_file_contents(&tmp)?;
         std::fs::rename(&tmp, &dst)?;
+        // Make the rename itself durable before claiming coverage.
+        sync_dir_entries(archive)?;
         // Record the LSN range + archive time for time-based PITR. The index is
         // an optimization; LSN-based restore reads the segment files directly,
         // so a missing/partial index never loses recoverability.
@@ -1856,6 +1890,55 @@ pub fn read_wal_dir_records(dir: &Path) -> std::io::Result<Vec<WalRecord>> {
 pub const ARCHIVE_INDEX_NAME: &str = "archive.index";
 
 /// Generate the path for a WAL segment file.
+/// Whether two files have identical contents (streamed, constant memory).
+/// A destination that cannot be read counts as unequal — the caller replaces
+/// it (NE-30: same-size archive copies are verified, not trusted).
+fn files_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    const CHUNK: usize = 256 * 1024;
+    let fa = File::open(a)?;
+    let fb = match File::open(b) {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let mut ra = BufReader::with_capacity(CHUNK, fa);
+    let mut rb = BufReader::with_capacity(CHUNK, fb);
+    loop {
+        let mut ba = [0u8; CHUNK];
+        let mut bb = [0u8; CHUNK];
+        let na = ra.read(&mut ba)?;
+        let nb = rb.read(&mut bb)?;
+        if na != nb || ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// fsync a file's contents through a writable handle where possible
+/// (mirrors backup.rs's `sync_file` fallback semantics).
+fn sync_file_contents(path: &Path) -> std::io::Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .or_else(|_| File::open(path))?;
+    file.sync_all()
+}
+
+/// Sync a directory's entry list so renames under it are durable; failures of
+/// the sync itself are swallowed on platforms that refuse directory sync
+/// (mirrors backup.rs's `sync_dir`), while open failures propagate.
+fn sync_dir_entries(path: &Path) -> std::io::Result<()> {
+    match File::open(path) {
+        Ok(dir) => {
+            let _ = dir.sync_all();
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn segment_path(dir: &Path, segment_number: u64) -> std::path::PathBuf {
     dir.join(format!("wal-{segment_number:06}.log"))
 }
@@ -3572,5 +3655,129 @@ mod archive_tests {
         wal.sync().unwrap();
 
         assert!(!wal.archive_active().unwrap());
+    }
+
+    /// NE-30: an archive I/O failure must surface from `archive_active` —
+    /// the old rotation path logged and suppressed it, so the call answered
+    /// "recoverable from the archive" while the archive held nothing.
+    #[cfg(unix)]
+    #[test]
+    fn archive_active_fails_when_the_archive_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("t.wal.d");
+        let archive = dir.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let wal =
+            SegmentedWal::open_with_archive(&wal_dir, 64 * 1024 * 1024, SyncMode::None, &archive)
+                .unwrap();
+        let page = [7u8; PAGE_SIZE];
+        wal.log_page_write(1, 1, &page).unwrap();
+        wal.log_commit(1, None).unwrap();
+        wal.sync().unwrap();
+
+        // Read-only archive: the copy into it fails.
+        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o555))
+            .unwrap();
+        let r = wal.archive_active();
+        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert!(
+            r.is_err(),
+            "archive_active must not claim the archive holds the tail when its copy failed \
+             (test would be vacuous as root): {:?}",
+            r.map(|b| b.to_string())
+        );
+    }
+
+    /// NE-30: a same-size but DIFFERENT archived copy must be replaced, not
+    /// trusted as coverage — the old length-only idempotence check deleted
+    /// the live original while the archive held a corrupt twin.
+    #[test]
+    fn a_corrupt_same_size_archive_copy_is_replaced_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("t.wal.d");
+        let archive = dir.path().join("archive");
+        let wal =
+            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
+                .unwrap();
+        let page = [5u8; PAGE_SIZE];
+        for txn in 1..=6u64 {
+            wal.log_page_write(txn, txn as u32, &page).unwrap();
+            wal.log_commit(txn, None).unwrap();
+        }
+        wal.sync().unwrap();
+        wal.archive_active().unwrap();
+        drop(wal);
+
+        // Corrupt one archived segment IN PLACE, preserving its length.
+        let segs = list_archive_segments(&archive).unwrap();
+        assert!(!segs.is_empty());
+        let victim = segment_path(&archive, segs[0]);
+        let bytes = std::fs::read(&victim).unwrap();
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 0xFF;
+        std::fs::write(&victim, &corrupt).unwrap();
+
+        // Reopen and force the archive guard: truncate_before re-archives
+        // (idempotently) before deleting — the content check must detect the
+        // corruption and replace the copy with the live original.
+        let wal =
+            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
+                .unwrap();
+        let last = wal.current_lsn().saturating_sub(1);
+        wal.truncate_before(last + 1).unwrap();
+        drop(wal);
+
+        let repaired = std::fs::read(&victim).unwrap();
+        assert_eq!(
+            repaired, bytes,
+            "the corrupt same-size archive copy must have been replaced with the live bytes"
+        );
+    }
+
+    /// NE-30: when archiving fails, `truncate_before` keeps the live segment
+    /// — the acknowledged history must remain recoverable somewhere.
+    #[cfg(unix)]
+    #[test]
+    fn truncate_before_keeps_the_live_segment_when_archiving_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("t.wal.d");
+        let archive = dir.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        // Small segments so several seal and rotate.
+        let wal =
+            SegmentedWal::open_with_archive(&wal_dir, 24 * 1024, SyncMode::Fsync, &archive)
+                .unwrap();
+        // Read-only BEFORE the first rotation, so NO segment is ever archived
+        // (rotation's own archive attempt fails too — deliberately
+        // best-effort — leaving every sealed segment un-archived on disk).
+        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o555))
+            .unwrap();
+        let page = [9u8; PAGE_SIZE];
+        for txn in 1..=12u64 {
+            wal.log_page_write(txn, txn as u32, &page).unwrap();
+            wal.log_commit(txn, None).unwrap();
+        }
+        wal.sync().unwrap();
+
+        let live_before: Vec<_> = list_segments(&wal_dir).unwrap();
+        let last = wal.current_lsn().saturating_sub(1);
+        wal.truncate_before(last + 1).unwrap();
+        std::fs::set_permissions(&archive, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let live_after: Vec<_> = list_segments(&wal_dir).unwrap();
+        assert!(
+            live_after.len() >= live_before.len().saturating_sub(1),
+            "sealed segments must be kept (not deleted un-archived) when the archive is \
+             unwritable: before {live_before:?} after {live_after:?}"
+        );
+        // And their records are all still readable.
+        for seg in &live_after {
+            assert!(
+                read_wal_records(&segment_path(&wal_dir, *seg)).is_ok(),
+                "kept segment {seg} must remain readable"
+            );
+        }
     }
 }

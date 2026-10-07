@@ -356,8 +356,12 @@ def _fp16_to_fp32(h: Int) -> Float32:
             f32_bits = UInt32(sign) << 31
         else:
             # Denormal: normalize by shifting mantissa until leading 1 appears
+            # MJ-02: e starts at 0. The value is mant * 2^-24; with the
+            # leading-1 normalization below, the -1 start made every nonzero
+            # subnormal ONE EXPONENT TOO SMALL (0x0001 decoded as 2^-25, not
+            # 2^-24 — all 2,046 signed nonzero subnormals were halved).
             var m = mant
-            var e = -1
+            var e = 0
             while (m & 0x400) == 0:
                 m <<= 1
                 e -= 1

@@ -471,6 +471,9 @@ fn render_rls_predicate(p: &RlsPredicate) -> String {
         RlsPredicate::Not(inner) => format!("NOT ({})", render_rls_predicate(inner)),
         RlsPredicate::AlwaysTrue => "true".to_string(),
         RlsPredicate::AlwaysFalse => "false".to_string(),
+        // NE-06: the literal NULL predicate renders as NULL, which
+        // recompiles to AlwaysUnknown — the same three-valued semantics.
+        RlsPredicate::AlwaysUnknown => "NULL".to_string(),
     }
 }
 

@@ -135,15 +135,31 @@ impl ServiceState {
     /// An operator request overrides a disk-triggered state; a disk trigger
     /// never overrides an operator request (the operator's intent outlives
     /// a transient free-space recovery).
+    ///
+    /// NE-27: the decision and the store are ONE compare-and-swap. The old
+    /// load-decide-store sequence let a disk-monitor enter that had read the
+    /// pre-operator state store its DiskWatermark OVER a just-installed
+    /// operator hold — downgrading the reason so a later disk recovery
+    /// cleared it.
     pub fn enter_read_only(&self, reason: DegradeReason, detail: impl Into<String>) -> bool {
         let detail = detail.into();
-        let previous = self.degraded.load(Ordering::Relaxed);
-        if previous == DegradeReason::Operator.as_u8() && reason != DegradeReason::Operator {
-            return false;
+        let mut current = self.degraded.load(Ordering::Relaxed);
+        loop {
+            if current == DegradeReason::Operator.as_u8() && reason != DegradeReason::Operator {
+                return false;
+            }
+            match self.degraded.compare_exchange(
+                current,
+                reason.as_u8(),
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         *self.detail.write() = detail;
-        self.degraded.store(reason.as_u8(), Ordering::SeqCst);
-        let changed = previous != reason.as_u8();
+        let changed = current != reason.as_u8();
         if changed {
             self.degrade_events.fetch_add(1, Ordering::Relaxed);
         }
@@ -165,11 +181,27 @@ impl ServiceState {
 
     /// Return to read-write only if the current degraded state was caused by
     /// `reason`. Returns `true` if the state changed.
+    ///
+    /// NE-27: the check and the clear are ONE compare-and-swap. The old
+    /// load-check-resume sequence let a disk monitor that had read
+    /// DiskWatermark clear a just-installed operator hold in the gap between
+    /// its read and its unconditional `resume`.
     pub fn resume_if(&self, reason: DegradeReason) -> bool {
-        if self.degraded.load(Ordering::Relaxed) == reason.as_u8() {
-            self.resume()
-        } else {
-            false
+        let mut current = self.degraded.load(Ordering::Relaxed);
+        loop {
+            if current != reason.as_u8() {
+                return false;
+            }
+            match self
+                .degraded
+                .compare_exchange(current, 0, Ordering::SeqCst, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    self.detail.write().clear();
+                    return true;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 
@@ -280,5 +312,51 @@ mod tests {
         // Now the disk monitor recovering must not resume.
         assert!(!s.resume_if(DegradeReason::DiskWatermark));
         assert!(s.is_read_only());
+    }
+
+    /// NE-27: a concurrent disk-monitor enter/resume must never clear or
+    /// downgrade an operator hold. The old load-decide-store transitions
+    /// could: a monitor that read the pre-operator state stored
+    /// DiskWatermark over the hold (downgrading it for a later clear), and a
+    /// resume_if that read DiskWatermark cleared the hold unconditionally in
+    /// its check→resume gap. CAS transitions close both windows; this stress
+    /// runs them continuously against an installed hold.
+    #[test]
+    fn concurrent_disk_monitor_transitions_never_clear_an_operator_hold() {
+        let s = std::sync::Arc::new(ServiceState::new());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // A churning "disk monitor": enter and exit disk degradation forever.
+        let monitor = {
+            let s = s.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.enter_read_only(DegradeReason::DiskWatermark, "churn");
+                    s.resume_if(DegradeReason::DiskWatermark);
+                }
+            })
+        };
+
+        // Install and verify operator holds repeatedly: while held, the mode
+        // must be Operator and writes refused — never cleared and never
+        // downgraded to DiskWatermark (which a monitor could then clear).
+        for _ in 0..2_000 {
+            s.enter_read_only(DegradeReason::Operator, "hold");
+            for _ in 0..50 {
+                assert!(
+                    s.is_read_only(),
+                    "the operator hold was cleared by a concurrent monitor (NE-27)"
+                );
+                assert_eq!(
+                    s.reason(),
+                    Some(DegradeReason::Operator),
+                    "the operator hold was downgraded by a concurrent monitor (NE-27)"
+                );
+            }
+            assert!(s.resume_if(DegradeReason::Operator));
+        }
+        stop.store(true, Ordering::Relaxed);
+        monitor.join().unwrap();
     }
 }

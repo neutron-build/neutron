@@ -636,7 +636,8 @@ async fn foreign_magic_is_refused() {
 
 /// A pre-v2 database (version stamped 1, empty directory) opens without error
 /// and is transparently re-stamped to the current version on the next directory
-/// save — the v1→v2 upgrade path.
+/// save — the v1 upgrade path (directories without overflow pages upgrade
+/// through every layout change; see DB_FORMAT_VERSION).
 #[tokio::test]
 async fn legacy_v1_meta_opens_and_upgrades() {
     use nucleus::storage::page;
@@ -647,8 +648,8 @@ async fn legacy_v1_meta_opens_and_upgrades() {
     let catalog = Arc::new(Catalog::new());
     catalog.create_table(t_def("up", 7)).await.unwrap();
     let eng = DiskEngine::open(&db_path, catalog.clone()).expect("v1 db must open");
-    // Materialize a table + force the directory: this rewrites the meta page in
-    // v2 layout and must re-stamp the version.
+    // Materialize a table + force the directory: this rewrites the meta page
+    // in the current layout and must re-stamp the version.
     eng.create_table("up").await.unwrap();
     eng.flush_schema().await.unwrap();
     drop(eng);

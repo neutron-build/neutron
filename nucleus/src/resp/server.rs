@@ -21,8 +21,10 @@ pub struct RespServerConfig {
     pub max_connections: usize,
     /// Idle timeout in seconds — connections with no activity are closed (default 300).
     pub idle_timeout_secs: u64,
-    /// Optional TLS config. When present, all connections are TLS-encrypted.
-    pub tls_config: Option<Arc<pgwire::tokio::tokio_rustls::rustls::ServerConfig>>,
+    /// Optional TLS acceptor. When present, all connections are TLS-encrypted
+    /// (NE-10: the SQL TLS acceptor is routed here so RESP AUTH never rides
+    /// plaintext on a TLS-enabled deployment).
+    pub tls_config: Option<pgwire::tokio::TlsAcceptor>,
 }
 
 impl Default for RespServerConfig {
@@ -32,6 +34,22 @@ impl Default for RespServerConfig {
             idle_timeout_secs: 300,
             tls_config: None,
         }
+    }
+}
+
+/// RAII connection-slot lease (NE-08).
+///
+/// The counter used to be decremented manually at the end of the spawned
+/// connection task; a panic anywhere in the handshake/parse path skipped the
+/// decrement and permanently consumed one of the `max_connections` slots.
+/// Constructing this guard immediately after admission makes `Drop` release
+/// the slot on every exit path — normal return, error, cancellation and
+/// panic unwind alike.
+struct ConnectionSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -61,19 +79,38 @@ pub async fn start_resp_server_with_config(
     config: RespServerConfig,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
+    serve_resp_connections(listener, kv, password, shutdown, config).await
+}
+
+/// Connection loop over an already-bound listener.
+///
+/// Split out of [`start_resp_server_with_config`] so tests can bind their own
+/// ephemeral loopback listener and still exercise admission, slot accounting
+/// and shutdown with the production loop.
+pub async fn serve_resp_connections(
+    listener: TcpListener,
+    kv: Arc<KvStore>,
+    password: Option<String>,
+    shutdown: Arc<tokio::sync::Notify>,
+    config: RespServerConfig,
+) -> std::io::Result<()> {
     let active_connections = Arc::new(AtomicUsize::new(0));
     let max_connections = config.max_connections;
     let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
     let pubsub = Arc::new(PubSubRegistry::new());
 
-    let tls_acceptor = config
-        .tls_config
-        .map(pgwire::tokio::tokio_rustls::TlsAcceptor::from);
+    let tls_acceptor = config.tls_config;
 
     if tls_acceptor.is_some() {
-        tracing::info!("RESP server listening on {} (TLS enabled)", bind_addr);
+        tracing::info!(
+            "RESP server listening on {} (TLS enabled)",
+            listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+        );
     } else {
-        tracing::info!("RESP server listening on {}", bind_addr);
+        tracing::info!(
+            "RESP server listening on {}",
+            listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+        );
     }
 
     loop {
@@ -90,7 +127,7 @@ pub async fn start_resp_server_with_config(
                 }
 
                 active_connections.fetch_add(1, Ordering::Relaxed);
-                let conn_counter = Arc::clone(&active_connections);
+                let slot = ConnectionSlotGuard(Arc::clone(&active_connections));
                 let kv = Arc::clone(&kv);
                 let pw = password.clone();
                 let tls = tls_acceptor.clone();
@@ -98,6 +135,9 @@ pub async fn start_resp_server_with_config(
                 let pubsub = Arc::clone(&pubsub);
 
                 tokio::spawn(async move {
+                    // Released on every exit path, including a panic anywhere
+                    // below (NE-08): the guard drops with the task.
+                    let _slot = slot;
                     let result = if let Some(acceptor) = tls {
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
@@ -115,7 +155,6 @@ pub async fn start_resp_server_with_config(
                     if let Err(e) = result {
                         tracing::debug!("RESP connection from {} closed: {}", addr, e);
                     }
-                    conn_counter.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             _ = shutdown.notified() => {
@@ -293,4 +332,74 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_prefixes_do_not_leak_connection_slots() {
+        // NE-08 regression: a two-byte non-ASCII prefix used to panic the
+        // connection task inside the parser; the manual counter decrement at
+        // the end of the task never ran, permanently consuming a slot. With
+        // a two-slot server, three sequential malformed connections exhaust
+        // admission and a subsequent valid PING is refused. The RAII slot
+        // guard (plus the parser fix) must keep all slots releasable.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let kv = Arc::new(KvStore::new());
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let config = RespServerConfig {
+            max_connections: 2,
+            idle_timeout_secs: 5,
+            tls_config: None,
+        };
+        let server = tokio::spawn(serve_resp_connections(
+            listener,
+            kv,
+            None,
+            shutdown.clone(),
+            config,
+        ));
+
+        // Three malformed connections against two slots. Each must be
+        // answered with a protocol error (or closed) and release its slot.
+        for _ in 0..3 {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            sock.write_all("é\r\n".as_bytes()).await.unwrap();
+            // Give the task time to run and exit; then close our side.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(sock);
+        }
+
+        // The slots must all be back: a valid PING on a fresh connection
+        // must be served, not silently dropped by an exhausted admission
+        // limit (an over-limit socket is dropped before any read, yielding
+        // an immediate clean close with zero response bytes).
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut sock, &mut buf),
+        )
+        .await;
+        match read {
+            Ok(Ok(0)) => panic!("valid PING connection closed without an answer (slot leak)"),
+            Ok(Ok(n)) => {
+                let body = String::from_utf8_lossy(&buf[..n]).to_string();
+                assert!(body.contains("+PONG"), "expected +PONG, got: {body:?}");
+            }
+            Ok(Err(e)) => panic!("valid PING connection failed: {e}"),
+            Err(_) => panic!("valid PING connection never answered"),
+        }
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server exits on shutdown")
+            .expect("server loop clean");
+    }
 }

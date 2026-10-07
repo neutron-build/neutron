@@ -333,26 +333,64 @@ impl Executor {
         // committed at that point; the error tells the caller the policy
         // change did not stick and must be re-run.
         if policy_dirty && let Some(pending) = security_pending {
-            let before = self.security.read().clone_policy_state();
-            // A6: publish this session's DELTAS onto the live catalog, not the
-            // staged whole-catalog clone. The clone was taken at this
-            // session's first policy write, so installing it wholesale
-            // silently reverted any policy entry another session committed
-            // after this BEGIN. The three-way merge keeps every live entry
-            // this session did not stage; an entry both sessions changed
-            // stays last-writer-wins, scoped to that entry. Without a
-            // baseline (unreachable — BEGIN always takes one, and nothing
-            // clears it before this point) the old wholesale publish is the
-            // fallback.
-            let merged = match security_base.as_ref() {
-                Some(base) => before.merge_policy_state(base, &pending),
-                None => pending,
+            // NE-04(a): clone, merge and install under ONE write guard (a
+            // lexical block — an explicit `drop()` leaves the guard in the
+            // async generator's state across the awaits below and makes the
+            // future !Send). The clone used to happen under a read lock, the
+            // merge with no lock at all, and the install under a separate
+            // write lock — two committing sessions could both clone the same
+            // pre-publish state, each merge onto it, and the second
+            // assignment silently discarded the first session's published
+            // delta. The merge is pure CPU (no await), so holding the
+            // parking_lot guard across it is sound.
+            let before = {
+                let mut guard = self.security.write();
+                let before = guard.clone_policy_state();
+                // A6: publish this session's DELTAS onto the live catalog,
+                // not the staged whole-catalog clone. The staged copy is
+                // paired with the baseline taken at the same moment (NE-03),
+                // so installing it wholesale silently reverted any policy
+                // entry another session committed after that moment. The
+                // three-way merge keeps every live entry this session did not
+                // stage; an entry both sessions changed stays
+                // last-writer-wins, scoped to that entry. Without a baseline
+                // (unreachable — BEGIN always takes one, and nothing clears
+                // it before this point) the old wholesale publish is the
+                // fallback.
+                let merged = match security_base.as_ref() {
+                    Some(base) => before.merge_policy_state(base, &pending),
+                    None => pending,
+                };
+                *guard = merged;
+                before
             };
-            *self.security.write() = merged;
             self.bump_policy_gen();
+            // NE-04(b): the generation this publication created. Every live
+            // policy mutation bumps the generation, so a later generation
+            // than this one means another session published after us.
+            let published_gen = self.policy_generation();
             #[cfg(feature = "server")]
             {
-                let unpublish = |before: crate::security::SecurityManager| {
+                // NE-04(b): the old failure closure restored the whole
+                // pre-publish catalog AFTER awaiting flush/persist. A session
+                // that committed policy during that await published on top of
+                // our state; restoring `before` wholesale then wiped its
+                // commit. Compensation is now generation-CAS scoped: only
+                // revert when no other publication has intervened — which
+                // makes the revert exactly this transaction's own delta.
+                // When someone else did publish, the durable failure already
+                // means a restart loses our change; their live state must
+                // survive untouched.
+                let unpublish = move |before: crate::security::SecurityManager| {
+                    if self.policy_generation() != published_gen {
+                        tracing::error!(
+                            "policy publication failed after another session published \
+                             concurrently; leaving the live catalog (which includes their \
+                             publication) intact — only the durable copy lacks this \
+                             transaction's policy change"
+                        );
+                        return;
+                    }
                     *self.security.write() = before;
                     self.bump_policy_gen();
                 };

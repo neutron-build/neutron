@@ -386,7 +386,7 @@ async fn a_backup_destination_inside_the_data_directory_is_refused() {
         .expect_err("a destination inside the data directory must be refused");
     let msg = err.to_string();
     assert!(
-        msg.contains("inside the data directory"),
+        msg.contains("is inside"),
         "refusal must explain the nesting problem, got: {msg}"
     );
 }

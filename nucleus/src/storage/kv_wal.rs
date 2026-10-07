@@ -127,6 +127,13 @@ pub struct KvWal {
     /// RESP layer drains this after each command and answers `-MISCONF`
     /// instead of `+OK`.
     write_error: AtomicBool,
+    /// An append failed after bytes may have reached the file, so the log may
+    /// end in a PARTIAL record (NE-22). While set, every further append is
+    /// refused: a record appended behind a torn prefix is acknowledged and
+    /// fsynced, yet the next recovery stops replay at the tear and silently
+    /// omits it. The only safe repair is reopening, which truncates the file
+    /// to its last complete record before accepting writes again.
+    poisoned: AtomicBool,
     /// Records appended but whose in-memory effect the caller has not
     /// applied yet (S63 TOCTOU).
     ///
@@ -146,6 +153,11 @@ pub struct KvWal {
     /// disk. `kv.wal_append` covers the same path out-of-process.
     #[cfg(test)]
     fail_next_append: AtomicBool,
+    /// Test-only: TORN next record — half its bytes are written before the
+    /// failure, exercising the NE-22 poison fence (a clean pre-write failure
+    /// is retryable and must not fence).
+    #[cfg(test)]
+    tear_next_append: AtomicBool,
     /// Test-only one-shot checkpoint-reopen fault; see `checkpoint`.
     #[cfg(test)]
     fail_reopen_once: AtomicBool,
@@ -186,7 +198,44 @@ impl KvWal {
             // cost 4.8 GB of buffer before a single key was parsed, on top of
             // the map it was being parsed into.
             let file = File::open(&path)?;
-            replay_reader(BufReader::with_capacity(256 * 1024, file), committed)
+            let file_len = file.metadata()?.len() as usize;
+            let (state, valid_len) =
+                replay_reader(BufReader::with_capacity(256 * 1024, file), committed);
+            if valid_len < file_len {
+                // NE-22: the log ends in a torn or corrupt tail. Appending
+                // behind the invalid bytes used to "succeed" — the append and
+                // its fsync returned Ok — while the next recovery stopped at
+                // the tear and omitted every later acknowledged record. Repair
+                // before the append handle exists: truncate to the last
+                // complete record and make that truncation durable. A repair
+                // that cannot complete fails the open rather than admitting
+                // writes the log cannot recover.
+                let repair = OpenOptions::new().write(true).open(&path).and_then(|f| {
+                    f.set_len(valid_len as u64)?;
+                    f.sync_all()
+                });
+                if let Err(e) = repair {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "KV WAL at {} has a torn tail ({} valid of {} bytes) and the \
+                             repair truncate failed: {e} — refusing to open a log whose \
+                             appends could not be recovered",
+                            path.display(),
+                            valid_len,
+                            file_len
+                        ),
+                    ));
+                }
+                tracing::warn!(
+                    "KV WAL at {} recovered a valid prefix of {} of {} bytes; truncated the \
+                     torn tail before appending (NE-22)",
+                    path.display(),
+                    valid_len,
+                    file_len
+                );
+            }
+            state
         } else {
             KvWalState {
                 items: Vec::new(),
@@ -203,9 +252,12 @@ impl KvWal {
                 max_xact_id,
                 stranded: AtomicBool::new(false),
                 write_error: AtomicBool::new(false),
+                poisoned: AtomicBool::new(false),
                 in_flight: AtomicU64::new(0),
                 #[cfg(test)]
                 fail_next_append: AtomicBool::new(false),
+                #[cfg(test)]
+                tear_next_append: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_reopen_once: AtomicBool::new(false),
             },
@@ -286,9 +338,29 @@ impl KvWal {
         self.fail_next_append.store(true, Ordering::Release);
     }
 
+    /// Test-only: arm a one-shot TORN append (half the record is written,
+    /// then the write fails) — the partial-write hazard the NE-22 poison
+    /// fence guards against.
+    #[cfg(test)]
+    pub(crate) fn tear_next_append(&self) {
+        self.tear_next_append.store(true, Ordering::Release);
+    }
+
     /// Write one already-encoded record. The single place an append can fail,
     /// so the single place that has to remember it did.
     fn write_record(&self, buf: &[u8]) -> io::Result<()> {
+        // NE-22 fence: an earlier append may have left a PARTIAL record at
+        // the end of the file; a record appended now would be acknowledged
+        // yet unrecoverable (replay stops at the tear). Only a reopen —
+        // which truncates to the last complete record — can safely resume.
+        if self.poisoned.load(Ordering::Acquire) {
+            self.note_write_error();
+            return Err(io::Error::other(
+                "KV WAL is fenced: an earlier append failed after bytes may have reached the \
+                 file, so no further record can be appended until the log is reopened (reopen \
+                 repairs the torn tail)",
+            ));
+        }
         #[cfg(test)]
         if self.fail_next_append.swap(false, Ordering::AcqRel) {
             self.note_write_error();
@@ -298,6 +370,21 @@ impl KvWal {
             self.note_write_error();
             return Err(e);
         }
+        // Test-only: a TORN append — half the record's bytes reach the file,
+        // then the write fails. Models the real partial-write hazard the
+        // poison fence exists for (a clean pre-write injection cannot).
+        #[cfg(test)]
+        if self.tear_next_append.swap(false, Ordering::AcqRel) {
+            let mut w = self.writer.lock();
+            let half = buf.len() / 2;
+            let _ = w.get_mut().write_all(&buf[..half]);
+            let _ = w.flush();
+            self.note_write_error();
+            self.poisoned.store(true, Ordering::Release);
+            return Err(io::Error::other(
+                "injected KV WAL torn append (partial record written)",
+            ));
+        }
         let mut w = self.writer.lock();
         if let Err(e) = self.reattach_if_stranded(&mut w) {
             self.note_write_error();
@@ -306,6 +393,8 @@ impl KvWal {
         let write = w.write_all(buf).and_then(|()| w.flush());
         if let Err(e) = write {
             self.note_write_error();
+            // Bytes may have partially reached the file: fence (NE-22).
+            self.poisoned.store(true, Ordering::Release);
             return Err(e);
         }
         self.syncer.on_append();
@@ -905,7 +994,7 @@ fn parse_record(
 /// exercise the code that actually runs rather than a slice-shaped twin.
 #[cfg(test)]
 fn replay(data: &[u8], committed: &HashSet<u64>) -> KvWalState {
-    replay_reader(std::io::Cursor::new(data), committed)
+    replay_reader(std::io::Cursor::new(data), committed).0
 }
 
 /// Replay the WAL from a reader, holding only a sliding window in memory.
@@ -924,15 +1013,22 @@ fn replay(data: &[u8], committed: &HashSet<u64>) -> KvWalState {
 /// The window grows only to the largest single item, and truncated tails are
 /// tolerated exactly as before: replay stops at the last complete unit.
 ///
+/// Returns `(state, valid_len)` where `valid_len` is the number of leading
+/// bytes that parsed as complete records — anything after that is a torn or
+/// corrupt tail the caller must repair (truncate) before appending (NE-22).
+///
 /// `committed` is the set of coordinating transaction ids that durably
 /// committed on the SQL side (S63); see [`parse_record`] for the filter.
-fn replay_reader<R: Read>(mut reader: R, committed: &HashSet<u64>) -> KvWalState {
+fn replay_reader<R: Read>(mut reader: R, committed: &HashSet<u64>) -> (KvWalState, usize) {
     const CHUNK: usize = 256 * 1024;
     const COMPACT_THRESHOLD: usize = 1 << 20;
 
     let mut store: HashMap<String, (Value, Option<u64>)> = HashMap::new();
     let mut buf: Vec<u8> = Vec::new();
     let mut pos = 0usize;
+    // Absolute file offset of buf[0]: the buffer drops its consumed prefix as
+    // it slides, so the valid-prefix length is `base + pos` at every stop.
+    let mut base = 0usize;
     let mut snapshot_remaining: u32 = 0;
     let mut max_xact_id: u64 = 0;
     let mut eof = false;
@@ -953,11 +1049,19 @@ fn replay_reader<R: Read>(mut reader: R, committed: &HashSet<u64>) -> KvWalState
                     }
                 }
             } else {
+                // NE-22: the record start is remembered so a Stop (unknown or
+                // corrupt entry byte) reports the PREVIOUS record's end as the
+                // valid prefix — the corrupt byte must be truncated away, not
+                // left for appends to land behind.
+                let rec_start = pos;
                 match parse_record(&buf, &mut pos, &mut store, committed, &mut max_xact_id) {
                     RecordStep::Applied => {}
                     RecordStep::SnapshotHeader(n) => snapshot_remaining = n,
                     RecordStep::NeedMore => break false,
-                    RecordStep::Stop => break true,
+                    RecordStep::Stop => {
+                        pos = rec_start;
+                        break true;
+                    }
                 }
             }
         };
@@ -968,9 +1072,11 @@ fn replay_reader<R: Read>(mut reader: R, committed: &HashSet<u64>) -> KvWalState
         // Drop the consumed prefix so the window tracks the largest item, not
         // the file.
         if pos == buf.len() {
+            base += buf.len();
             buf.clear();
             pos = 0;
         } else if pos > COMPACT_THRESHOLD {
+            base += pos;
             buf.drain(..pos);
             pos = 0;
         }
@@ -985,10 +1091,13 @@ fn replay_reader<R: Read>(mut reader: R, committed: &HashSet<u64>) -> KvWalState
         }
     }
 
-    KvWalState {
-        items: store.into_iter().map(|(k, (v, t))| (k, v, t)).collect(),
-        max_xact_id,
-    }
+    (
+        KvWalState {
+            items: store.into_iter().map(|(k, (v, t))| (k, v, t)).collect(),
+            max_xact_id,
+        },
+        base + pos,
+    )
 }
 
 // ─── Primitive readers ────────────────────────────────────────────────────────
@@ -1789,6 +1898,108 @@ mod tests {
         let torn = replay(&full[..after_set], &HashSet::new());
         let (_, _, ttl) = torn.items.iter().find(|(k, _, _)| k == "k").unwrap();
         assert_eq!(*ttl, None, "the old shape did lose the expiry");
+    }
+
+    /// NE-22: reopening a log with a torn tail used to append BEHIND the
+    /// invalid bytes — the append and its fsync acknowledged, yet the NEXT
+    /// recovery stopped at the tear and silently omitted the later record.
+    /// Open must repair (truncate to the valid prefix) before appending.
+    ///
+    /// Every byte cut inside the final record is exercised: prefix records
+    /// survive, then a post-recovery sentinel must survive a second reopen.
+    #[test]
+    fn torn_tail_is_repaired_before_append_so_later_records_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.wal");
+
+        // Three complete records; the last one is the one we tear.
+        let (wal, _) = open_keep_all(dir.path()).unwrap();
+        wal.log_set(None, "k1", &Value::Text("one".into())).unwrap();
+        wal.log_set(None, "k2", &Value::Text("two".into())).unwrap();
+        let after_two = std::fs::metadata(&path).unwrap().len() as usize;
+        wal.log_set(None, "k3", &Value::Text("three".into())).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let full = std::fs::metadata(&path).unwrap().len() as usize;
+
+        for cut in after_two..full {
+            std::fs::write(&path, &std::fs::read(&path).unwrap()[..cut]).unwrap();
+
+            // Reopen over the torn tail, append a sentinel, make it durable.
+            let (wal, state) = open_keep_all(dir.path()).unwrap();
+            assert!(
+                state.items.iter().any(|(k, _, _)| k == "k1"),
+                "cut {cut}: prefix records must recover"
+            );
+            assert!(
+                !state.items.iter().any(|(k, _, _)| k == "k3"),
+                "cut {cut}: the torn record must not half-recover"
+            );
+            wal.log_set(None, "sentinel", &Value::Text("post-recovery".into()))
+                .unwrap();
+            wal.sync().unwrap();
+            drop(wal);
+
+            // Second reopen: BOTH the pre-crash prefix and the acknowledged
+            // post-recovery sentinel must be there. Before the repair, replay
+            // stopped at the tear and the sentinel was silently gone.
+            let (_, state2) = open_keep_all(dir.path()).unwrap();
+            assert!(
+                state2.items.iter().any(|(k, _, _)| k == "k1"),
+                "cut {cut}: prefix lost on second reopen"
+            );
+            assert!(
+                state2.items.iter().any(|(k, v, _)| k == "sentinel" && *v == Value::Text("post-recovery".into())),
+                "cut {cut}: the acknowledged post-recovery sentinel was omitted by the \
+                 second recovery (NE-22)"
+            );
+        }
+    }
+
+    /// NE-22: an append that fails after bytes may have moved is a possible
+    /// PARTIAL record at the end of the file. Every further append must be
+    /// refused until the log is reopened (reopen repairs the tail) — a record
+    /// appended behind the tear is acknowledged yet unrecoverable.
+    #[test]
+    fn poisoned_log_refuses_further_appends_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (wal, _) = open_keep_all(dir.path()).unwrap();
+        wal.log_set(None, "good", &Value::Int64(1)).unwrap();
+        wal.sync().unwrap();
+
+        wal.tear_next_append();
+        let err = wal
+            .log_set(None, "torn", &Value::Int64(2))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("torn append"),
+            "{err}"
+        );
+
+        // The second write must be refused — not appended behind the tear.
+        let err = wal.log_set(None, "after", &Value::Int64(3)).unwrap_err();
+        assert!(
+            err.to_string().contains("fenced"),
+            "second append after a partial-write failure must be fenced: {err}"
+        );
+        assert!(wal.take_write_error(), "the fence must surface as MISCONF");
+
+        drop(wal);
+        // Reopen is the safe repair: the prefix recovers and appends work.
+        let (wal, state) = open_keep_all(dir.path()).unwrap();
+        assert!(
+            state.items.iter().any(|(k, _, _)| k == "good"),
+            "prefix must recover after reopen"
+        );
+        wal.log_set(None, "recovered", &Value::Int64(4)).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let (_, state2) = open_keep_all(dir.path()).unwrap();
+        assert!(
+            state2.items.iter().any(|(k, _, _)| k == "recovered"),
+            "post-reopen append must recover"
+        );
     }
 
     /// `SET k v` with no TTL over a key that had one clears the expiry in

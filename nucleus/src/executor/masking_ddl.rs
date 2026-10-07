@@ -57,6 +57,24 @@ impl Executor {
         #[cfg(feature = "server")]
         {
             let before = self.security.read().clone_policy_state();
+            // NE-04: `before` is captured AFTER the mutation (finalize runs
+            // after the staging call), so restoring it never reverts this
+            // session's own change — it could only wipe a policy another
+            // session published between the capture and a persistence
+            // failure. Generation-scope the restore: when another
+            // publication intervened, leave the live catalog alone.
+            let captured_gen = self.policy_generation();
+            let restore = move |before: crate::security::SecurityManager| {
+                if self.policy_generation() != captured_gen {
+                    tracing::error!(
+                        "masking DDL persistence failed after another session published \
+                         policy concurrently; leaving the live catalog intact"
+                    );
+                    return;
+                }
+                *self.security.write() = before;
+                self.bump_policy_gen();
+            };
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
             self.query_cache_invalidate_all();
@@ -67,13 +85,11 @@ impl Executor {
                 .await
                 .map_err(ExecError::Storage)
             {
-                *self.security.write() = before;
-                self.bump_policy_gen();
+                restore(before);
                 return Err(e);
             }
             if let Err(e) = self.persist_catalog().await {
-                *self.security.write() = before;
-                self.bump_policy_gen();
+                restore(before);
                 return Err(e);
             }
         }

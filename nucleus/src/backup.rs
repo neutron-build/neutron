@@ -815,7 +815,7 @@ fn resolve_pseudo(path: &Path) -> PathBuf {
 /// Restores need the same fence: `remove_dir_all(data_dir)` runs before the
 /// copy, so a destination that is the snapshot itself (or its ancestor)
 /// destroys the input before it is read. All checks run before any mutation.
-fn reject_path_overlap(source: &Path, destination: &Path, action: &str) -> io::Result<()> {
+pub(crate) fn reject_path_overlap(source: &Path, destination: &Path, action: &str) -> io::Result<()> {
     let src = resolve_pseudo(source);
     let dst = resolve_pseudo(destination);
     if src == dst {
@@ -832,8 +832,8 @@ fn reject_path_overlap(source: &Path, destination: &Path, action: &str) -> io::R
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "backup destination {} is inside the data directory {} — the snapshot would \
-                 copy itself recursively. Choose a destination outside the data directory.",
+                "{action} destination {} is inside {} — the operation would destroy or \
+                 recursively copy the source. Choose a destination outside it.",
                 dst.display(),
                 src.display()
             ),
@@ -1042,12 +1042,108 @@ pub fn restore_data_dir(
 
     check_restore_destination(data_dir, force, &manifest.database_id)?;
 
-    if data_dir.exists() {
-        std::fs::remove_dir_all(data_dir)?;
+    // NE-17: the replacement used to be `remove_dir_all(data_dir)` followed
+    // by a direct copy — a copy, rename or I/O failure partway through an
+    // APPROVED forced restore destroyed the old database and left a partial
+    // (or absent) replacement. Build the complete image in a staging sibling
+    // first, make it durable, then publish by rename with the old generation
+    // retained aside until the new one is live and the parent is synced.
+    let mut staging_name = data_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    staging_name.push(format!(".restore-staging-{}", std::process::id()));
+    let staging = data_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(staging_name);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
     }
-
-    copy_dir_recursive(&input_dir.join(DATA_SUBDIR), data_dir)?;
+    let built = (|| -> io::Result<()> {
+        copy_dir_recursive(&input_dir.join(DATA_SUBDIR), &staging)?;
+        sync_tree(&staging)
+    })();
+    if let Err(e) = built {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    publish_dir_replace(&staging, data_dir)?;
     Ok(manifest)
+}
+
+/// Durable publish of a fully-built sibling image over `dest` (NE-17).
+///
+/// The old generation is renamed ASIDE — never deleted — before the new
+/// image moves in; the parent directory is synced; only then is the retired
+/// generation removed. At every point a crash leaves a complete generation
+/// at `dest` (old or new) with the other recoverable at the aside path; the
+/// only live generation is never recursively deleted before its replacement
+/// is installed.
+pub(crate) fn publish_dir_replace(new: &Path, dest: &Path) -> io::Result<()> {
+    let parent = dest.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let mut aside_name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    aside_name.push(format!(".retired-{}", std::process::id()));
+    let aside = parent.join(aside_name);
+    if aside.exists() {
+        let _ = std::fs::remove_dir_all(&aside);
+    }
+    if dest.exists() {
+        std::fs::rename(dest, &aside).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot move the current database {} aside for publication: {e}",
+                    dest.display()
+                ),
+            )
+        })?;
+    }
+    if let Err(e) = std::fs::rename(new, dest) {
+        // Put the old generation back if we can; the new image stays intact
+        // in its staging path for a manual retry either way.
+        if aside.exists() {
+            let _ = std::fs::rename(&aside, dest);
+        }
+        return Err(io::Error::new(
+            e.kind(),
+            format!(
+                "cannot publish the restored image over {}: {e} (the previous database was \
+                 preserved{})",
+                dest.display(),
+                if aside.exists() { "" } else { " at the staging sibling" },
+            ),
+        ));
+    }
+    // The replacement is live. Sync the parent so the rename itself is
+    // durable BEFORE retiring the old generation (NE-17: propagate the
+    // sync failure and keep the aside copy for recovery).
+    if let Err(e) = sync_dir(&parent) {
+        return Err(io::Error::new(
+            e.kind(),
+            format!(
+                "restored database published at {} but its directory entry could not be made \
+                 durable ({e}); the previous database is preserved at {}",
+                dest.display(),
+                aside.display()
+            ),
+        ));
+    }
+    if aside.exists() && let Err(e) = std::fs::remove_dir_all(&aside) {
+        // The restore itself succeeded and is durable; the retired copy is
+        // only reclaimable space. Say so loudly rather than reporting the
+        // whole restore failed.
+        tracing::warn!(
+            "restore published over {} but the retired previous database at {} could not be \
+             removed: {e}",
+            dest.display(),
+            aside.display()
+        );
+    }
+    Ok(())
 }
 
 /// Verify a snapshot's contents against its manifest without touching any
@@ -1731,7 +1827,7 @@ mod tests {
         let err = backup_data_dir(&data, &data.join("snap"), true, "0.1.1").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
-            err.to_string().contains("inside the data directory"),
+            err.to_string().contains("is inside"),
             "nested refusal message must stay recognizable: {err}"
         );
 
@@ -1781,6 +1877,102 @@ mod tests {
     /// destination intact (staged publication): the old snapshot is removed only
     /// after the new one is complete. Failure injected as an unreadable source
     /// file.
+    /// NE-17: a copy that fails HALFWAY through an approved forced restore
+    /// must leave the destination's previous generation intact — the old
+    /// code deleted `data_dir` first and the failure left a partial (or
+    /// absent) database.
+    ///
+    /// The halfway failure is injected through a legacy (pre-checksum)
+    /// manifest — verification is skipped for those — plus one unreadable
+    /// file, so the copy itself fails after the readable prefix was staged.
+    #[cfg(unix)]
+    #[test]
+    fn a_halfway_copy_failure_keeps_the_previous_database() {
+        let root = unique_tmp("ne17_copy");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        write(&data, "catalog.json", b"old-generation");
+        let snap = root.join("snap");
+        backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+
+        // Turn the snapshot legacy (files: []) so verify is skipped, then
+        // plant an unreadable file the copy trips over.
+        let mut m = read_manifest(&snap).unwrap();
+        m.files.clear();
+        write_manifest(&snap, &m).unwrap();
+        write(&snap, &format!("{DATA_SUBDIR}/blocked.dat"), b"unreadable");
+        let victim = snap.join(DATA_SUBDIR).join("blocked.dat");
+        std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+
+        // An existing destination the operator expects to survive.
+        let dest = root.join("live");
+        write(&dest, "catalog.json", b"live-generation");
+        let before = dir_fingerprint(&dest);
+
+        let r = restore_data_dir(&snap, &dest, true, "0.1.1");
+        std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert!(
+            r.is_err(),
+            "the unreadable snapshot file must fail the restore (test would be vacuous as root)"
+        );
+        assert_eq!(
+            before,
+            dir_fingerprint(&dest),
+            "a halfway copy failure must leave the previous database intact (NE-17)"
+        );
+        // No staging debris after a clean failure.
+        let debris: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".restore-staging-"))
+            .collect();
+        assert!(debris.is_empty(), "staging debris: {debris:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// NE-17: a rename failure at PUBLICATION time must leave either the old
+    /// generation at the destination or a clearly recoverable aside copy —
+    /// never a deleted destination. The parent directory is made read-only so
+    /// the retire-aside rename fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_publication_failure_keeps_a_recoverable_generation() {
+        let root = unique_tmp("ne17_pub");
+        let _ = std::fs::remove_dir_all(&root);
+        let holder = root.join("holder");
+        std::fs::create_dir_all(&holder).unwrap();
+        let data = holder.join("data_dir");
+        write(&data, "catalog.json", b"v1");
+        let snap = holder.join("snap");
+        backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+
+        let dest = holder.join("live");
+        write(&dest, "catalog.json", b"live-generation");
+        let before = dir_fingerprint(&dest);
+
+        // Read-only parent: the publication renames inside `holder` fail.
+        std::fs::set_permissions(&holder, std::os::unix::fs::PermissionsExt::from_mode(0o555))
+            .unwrap();
+        let r = restore_data_dir(&snap, &dest, true, "0.1.1");
+        std::fs::set_permissions(&holder, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert!(r.is_err(), "publication must fail under a read-only parent");
+
+        // Either the destination still holds the old generation, or the aside
+        // sibling holds it for recovery — and it must exist somewhere.
+        let dest_intact = dir_fingerprint(&dest) == before;
+        let aside = holder.join(format!("live.retired-{}", std::process::id()));
+        let aside_intact = aside.is_dir() && dir_fingerprint(&aside) == before;
+        assert!(
+            dest_intact || aside_intact,
+            "a failed publication must leave the old generation recoverable (dest intact: \
+             {dest_intact}, aside intact: {aside_intact})"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failed_rebuild_keeps_the_previous_generation() {

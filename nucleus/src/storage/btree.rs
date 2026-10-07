@@ -251,6 +251,14 @@ impl BTreeIndex {
 
     /// Insert a (key, RowId) entry into the B-tree.
     pub fn insert(&mut self, key: &[u8], row_id: RowId) -> Result<(), BTreeError> {
+        // Enforce the documented key bound before any page is touched
+        // (NE-26): an oversized first key used to enter the split path with
+        // no right-hand entry and index an empty slice (panic) instead of
+        // returning this error. The limit (and the page-format capacity it
+        // protects) is real: a 16 KiB page cannot hold two 16 KiB keys.
+        if key.len() > MAX_KEY_SIZE {
+            return Err(BTreeError::KeyTooLarge(key.len()));
+        }
         let leaf = self.find_leaf(key)?;
         // Try to insert into the leaf. The latch is released before the split
         // path, which allocates pages — rule (A): no allocation under a latch.
@@ -1533,6 +1541,31 @@ mod tests {
             page_id: n,
             slot_idx: 0,
         }
+    }
+
+    #[test]
+    fn btree_rejects_oversized_keys_without_panic_or_mutation() {
+        // NE-26: insertion never enforced MAX_KEY_SIZE. An oversized FIRST
+        // key entered split logic with no right-hand entry and panicked
+        // indexing an empty slice instead of returning KeyTooLarge.
+        let (mut idx, _dir) = make_test_btree();
+        for len in [257, 4096, 16349, 65536] {
+            let key = vec![b'k'; len];
+            match idx.insert(&key, dummy_rid(1)) {
+                Err(BTreeError::KeyTooLarge(n)) => assert_eq!(n, len),
+                other => panic!("len {len}: expected KeyTooLarge, got {other:?}"),
+            }
+        }
+        // The tree is untouched: a normal insert still works and finds the
+        // oversized keys absent.
+        idx.insert(&int_key(7), dummy_rid(7)).unwrap();
+        assert_eq!(idx.lookup(&int_key(7)).unwrap().len(), 1);
+        assert!(idx.lookup(&vec![b'k'; 257]).unwrap().is_empty());
+
+        // Boundary: exactly MAX_KEY_SIZE is accepted (still must not panic).
+        let ok = vec![b'm'; MAX_KEY_SIZE];
+        idx.insert(&ok, dummy_rid(9)).unwrap();
+        assert_eq!(idx.lookup(&ok).unwrap().len(), 1);
     }
 
     #[test]

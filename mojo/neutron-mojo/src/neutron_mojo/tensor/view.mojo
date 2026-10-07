@@ -208,9 +208,16 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
                 + String(new_shape)
                 + ": element count mismatch"
             )
+        # MJ-K12: preserve the storage OFFSET. The two-argument constructor
+        # used here resets _offset to 0, so reshaping a contiguous SLICE
+        # silently re-based it onto the underlying tensor's start — a slice
+        # selecting [3,4,5] of [0..5] reshaped to (3,) read [0,1,2], and
+        # writes landed on the wrong elements.
         return TensorView[Self.dtype](
             self._ptr,
             new_shape,
+            new_shape.strides(),
+            self._offset,
         )
 
     # --- Properties ---

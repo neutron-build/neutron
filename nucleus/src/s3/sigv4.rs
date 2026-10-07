@@ -311,12 +311,17 @@ pub fn verify(
     input: &CanonicalRequestInput<'_>,
     now: i64,
 ) -> Result<(), String> {
-    // Scope date must match the x-amz-date day.
+    // Validate the complete timestamp BEFORE comparing (or slicing) any part
+    // of it: a multibyte character across byte 8 used to make
+    // `&auth.amz_date[..8]` panic before signature verification, killing the
+    // connection task and leaking its gateway slot (NE-15).
+    let ts = parse_amz_date(&auth.amz_date).ok_or("malformed x-amz-date")?;
+    // Scope date must match the x-amz-date day. `get(..8)` is byte-safe even
+    // for hostile non-ASCII input.
     let scope_date = auth.scope.split('/').next().unwrap_or("");
-    if auth.amz_date.len() < 8 || scope_date != &auth.amz_date[..8] {
+    if scope_date != auth.amz_date.get(..8).unwrap_or("") {
         return Err("credential scope date mismatch".into());
     }
-    let ts = parse_amz_date(&auth.amz_date).ok_or("malformed x-amz-date")?;
     if auth.presigned {
         let expires = auth.expires.unwrap_or(0) as i64;
         if !(0..=604800).contains(&expires) {
@@ -678,6 +683,42 @@ mod tests {
         assert_eq!(parse_amz_date("20240229T120000Z"), Some(1709208000)); // leap day
         assert!(parse_amz_date("garbage").is_none());
         assert!(parse_amz_date("20131324T000000Z").is_none()); // month 13
+    }
+
+    #[test]
+    fn verify_rejects_hostile_dates_without_panicking() {
+        // NE-15: a multibyte character placed across byte 8 of x-amz-date
+        // used to panic `&auth.amz_date[..8]` before signature verification.
+        // Every hostile timestamp must yield a normal error.
+        let headers = vec![("host".to_string(), "h".to_string())];
+        let input = CanonicalRequestInput {
+            method: "GET",
+            raw_path: "/",
+            query: &[],
+            headers: &headers,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let mk = |date: &str, scope: &str| AuthData {
+            access_key: "AK".to_string(),
+            scope: scope.to_string(),
+            signed_headers: vec!["host".into()],
+            signature: "00".to_string(),
+            amz_date: date.to_string(),
+            expires: None,
+            presigned: false,
+        };
+        // Multibyte char spanning byte 8 (é at bytes 7-8).
+        assert!(verify("s", &mk("2013052éT000000Z", "20130524/x/s3/aws4_request"), &input, 0)
+            .unwrap_err()
+            .contains("malformed"));
+        // Plain non-ASCII, short, empty, impossible and out-of-range forms.
+        for date in ["é0101T000000Z", "2013", "", "20130524T0000", "99999999T999999Z", "00000000T000000Z"] {
+            let err = verify("s", &mk(date, "20130524/x/s3/aws4_request"), &input, 0).unwrap_err();
+            assert!(
+                err.contains("malformed") || err.contains("scope"),
+                "date {date:?}: {err}"
+            );
+        }
     }
 
     #[test]

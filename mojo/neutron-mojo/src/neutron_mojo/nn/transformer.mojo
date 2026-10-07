@@ -197,7 +197,12 @@ def transformer_block(
     var up = linear(ffn_normed, weights.w_up)      # [ffn_dim]
 
     # 10. SwiGLU activation: silu(gate) * up
-    var ffn_out = swiglu[DType.float32](gate, up)
+    # MJ-K17: swiglu(x, gate) computes silu(gate) * x, so the value operand
+    # comes FIRST and the gate second. This site used to pass (gate, up) —
+    # computing silu(up) * gate, swapping the FFN operands unlike the main
+    # Model and SIMD kernel paths (model.mojo's simd_swiglu(gate, up) is
+    # silu(gate) * up).
+    var ffn_out = swiglu[DType.float32](up, gate)
 
     # 11. Down projection
     var down = linear(ffn_out, weights.w_down)  # [hidden_dim]

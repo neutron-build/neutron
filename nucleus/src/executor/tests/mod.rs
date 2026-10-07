@@ -94,7 +94,9 @@ mod test_query;
 mod test_read_only_mode; // M10: degraded read-only write admission
 mod test_rename_table_dependents; // CAT-4: RENAME TO must rewrite FK/view/matview dependents
 mod test_replacing_engine_recovery; // replacing_mergetree engine metadata must survive a restart
+mod test_policy_merge_moments; // NE-03/NE-04: staged/live policy snapshot pairing + atomic publication
 mod test_rls;
+mod test_rls_typed_domains; // NE-05/NE-06: typed policy comparison + NULL three-valued logic
 mod test_rls_fail_closed; // M5: unsupported policy expressions / specialty calls fail closed
 mod test_rls_surfaces; // M5: adversarial alternate-surface RLS exfiltration matrix
 mod test_row_locks; // FOR UPDATE / SKIP LOCKED / NOWAIT row locks + parameterized LIMIT (queue claims)

@@ -2,7 +2,7 @@
 
 use sqlparser::ast::{self, BinaryOperator, Expr};
 
-use crate::security::{CmpOp, PolicyCommand, RlsPolicy, RlsPredicate};
+use crate::security::{CmpOp, ColumnDomain, PolicyCommand, RlsPolicy, RlsPredicate};
 
 use super::{ExecError, ExecResult, Executor};
 
@@ -58,6 +58,37 @@ impl Executor {
             using_predicate.bind_column_ids(&resolve);
             if let Some(check) = check_predicate.as_mut() {
                 check.bind_column_ids(&resolve);
+            }
+        }
+        // NE-05: bind each comparison leaf's value domain from the catalog
+        // column type, so evaluation compares with the semantics the column
+        // has (lexical for TEXT, exact decimal for numerics) instead of
+        // guessing from the rendered strings.
+        {
+            let resolve = |name: &str| {
+                table_def
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .map(|c| match &c.data_type {
+                        // Text-family and time/UUID columns order lexically
+                        // in their rendered form (ISO-8601 for the temporal
+                        // ones), and equality is string identity.
+                        crate::types::DataType::Text
+                        | crate::types::DataType::Uuid
+                        | crate::types::DataType::Date
+                        | crate::types::DataType::Timestamp
+                        | crate::types::DataType::TimestampTz => {
+                            crate::security::ColumnDomain::Text
+                        }
+                        // Everything comparable here is numeric; Bool/Bytea
+                        // literals are rejected by the compiler anyway.
+                        _ => crate::security::ColumnDomain::Numeric,
+                    })
+            };
+            using_predicate.bind_column_domains(&resolve);
+            if let Some(check) = check_predicate.as_mut() {
+                check.bind_column_domains(&resolve);
             }
         }
         let target_roles = self.resolve_policy_roles(policy.to.unwrap_or_default())?;
@@ -326,6 +357,7 @@ impl Executor {
                     column,
                     values,
                     column_id: 0,
+                    domain: ColumnDomain::Heuristic,
                 };
                 Ok(if *negated {
                     RlsPredicate::Not(Box::new(predicate))
@@ -344,7 +376,10 @@ impl Executor {
             }
             Expr::Value(v) => match &v.value {
                 ast::Value::Boolean(true) => Ok(RlsPredicate::AlwaysTrue),
-                ast::Value::Boolean(false) | ast::Value::Null => Ok(RlsPredicate::AlwaysFalse),
+                ast::Value::Boolean(false) => Ok(RlsPredicate::AlwaysFalse),
+                // NE-06: a NULL literal is UNKNOWN, not FALSE — `USING (NOT
+                // NULL)` must never become a grant-all.
+                ast::Value::Null => Ok(RlsPredicate::AlwaysUnknown),
                 _ => Err(Self::unsupported_policy_expr(expr)),
             },
             Expr::Function(function)
@@ -439,6 +474,7 @@ impl Executor {
                 column,
                 value,
                 column_id: 0,
+                domain: ColumnDomain::Heuristic,
             });
         }
         Err(Self::unsupported_policy_expr(value_expr))
@@ -472,6 +508,7 @@ impl Executor {
             op,
             value,
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         })
     }
 
@@ -539,8 +576,10 @@ impl Executor {
                 Self::validate_rls_columns(b, table)?;
             }
             RlsPredicate::Not(p) => Self::validate_rls_columns(p, table)?,
-            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
-            }
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse
+            | RlsPredicate::AlwaysUnknown => {}
         }
         Ok(())
     }
