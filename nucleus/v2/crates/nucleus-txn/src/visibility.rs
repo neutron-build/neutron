@@ -14,8 +14,8 @@ pub struct ReadCtx {
     pub stmt_seq: Seq,
 }
 
-/// A committed version of the logical key: `None` value = tombstone or
-/// moved-tombstone (§5.1); both read as not-found.
+/// A committed version of the logical key, header already decoded (§2.2):
+/// `None` value = tombstone or moved-tombstone; both read as not-found.
 #[derive(Debug, Clone, Copy)]
 pub struct Version<'a> {
     pub ts: Ts,
@@ -61,6 +61,7 @@ pub fn read<'a>(
                             return r;
                         }
                     }
+                    TxnStatus::Aborted => {}
                     _ => edges.push(RwEdge::ToIntentOwner(i.txn)),
                 }
             }
@@ -82,8 +83,8 @@ pub fn read<'a>(
 /// `None` = `Absent`: fall through to versions.
 fn data_read(d: &LayerData) -> Option<Read<'_>> {
     match d {
-        LayerData::Write(v) => Some(Read::Found(v)),
-        LayerData::Delete => Some(Read::NotFound),
+        LayerData::Write { value, .. } => Some(Read::Found(value)),
+        LayerData::Delete { .. } => Some(Read::NotFound),
         LayerData::Absent => None,
     }
 }
@@ -109,11 +110,23 @@ mod tests {
     }
 
     fn layer(seq: Seq, data: LayerData, lock: RowLockMode) -> Layer {
-        Layer { seq, data, lock }
+        Layer {
+            seq,
+            data_seq: seq,
+            data,
+            lock,
+        }
+    }
+
+    fn w(v: &[u8]) -> LayerData {
+        LayerData::Write {
+            value: v.to_vec(),
+            key_changed: false,
+        }
     }
 
     fn write(seq: Seq, v: &[u8]) -> Layer {
-        layer(seq, LayerData::Write(v.to_vec()), RowLockMode::NoKeyUpdate)
+        layer(seq, w(v), RowLockMode::NoKeyUpdate)
     }
 
     fn intent(txn: TxnId, layers: Vec<Layer>) -> Intent {
@@ -162,8 +175,8 @@ mod tests {
             R,
             vec![
                 layer(1, LayerData::Absent, RowLockMode::Update),
-                layer(3, LayerData::Write(b"v3".to_vec()), RowLockMode::Update),
-                layer(5, LayerData::Delete, RowLockMode::Update),
+                layer(3, w(b"v3"), RowLockMode::Update),
+                layer(5, LayerData::Delete { moved: false }, RowLockMode::Update),
             ],
         );
         let mut e = vec![];
@@ -177,6 +190,15 @@ mod tests {
             Read::Found(b"v3")
         );
         assert_eq!(read(&ctx(10, 6), Some(&i), st, OLD, &mut e), Read::NotFound);
+    }
+
+    #[test]
+    fn aborted_foreign_intent_is_invisible_without_edge() {
+        let i = intent(T, vec![write(1, b"new")]);
+        let mut e = vec![];
+        let r = read(&ctx(10, 1), Some(&i), |_| TxnStatus::Aborted, OLD, &mut e);
+        assert_eq!(r, Read::Found(b"old"));
+        assert!(e.is_empty());
     }
 
     #[test]
@@ -198,10 +220,7 @@ mod tests {
     fn lock_after_own_write_keeps_data_visible() {
         let i = intent(
             T,
-            vec![
-                write(1, b"a"),
-                layer(2, LayerData::Write(b"a".to_vec()), RowLockMode::Update),
-            ],
+            vec![write(1, b"a"), layer(2, w(b"a"), RowLockMode::Update)],
         );
         let mut e = vec![];
         let r = read(
