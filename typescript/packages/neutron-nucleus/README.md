@@ -257,3 +257,102 @@ node-postgres's process-wide parsers or another library's int8 reads. Transactio
 reads use the same pool policy. Use separate default transports for model plugins
 and SDK migration APIs; those compositions deliberately refuse the SQL read
 profile. This profile does not certify Nucleus, HTTP/mobile or temporal precision.
+
+## Mobile operation safety and deadlines
+
+Mobile SQL calls have no automatic retry or caching by default: `SELECT`
+can invoke mutating Nucleus model functions. A caller can assert a pure read
+using `{ readOnly: true }`; only those calls can retry. Opt-in result caching
+also requires `{ cache: true }` and transport `cacheEnabled: true`. Do not mark
+increments, lock acquisition, stream group reads, publication, or other
+mutations as pure reads. Mutations invalidate and fence cached reads, including
+reads overlapping writes and transactions on the same transport. Other clients'
+writes require explicit `invalidateCache()` or expiration.
+
+Mobile dispatched writes and remote BEGIN are never automatically replayed. A lost
+response, deadline, abort after dispatch, or server 5xx produces
+`NucleusUnknownOutcomeError` (`UNKNOWN_OUTCOME`): the operation may have
+completed, and callers must reconcile server state before retrying. There is
+no server-backed HTTP idempotency-key protocol here. Offline queueing covers
+only writes known to be undispatched and sends each queued operation once.
+HTTP BEGIN also classifies a success response with missing/invalid identity as
+`UNKNOWN_OUTCOME`; a typed HTTP rejection or `{ ok: false }` BEGIN envelope
+remains a server rejection. The base HTTP and pgwire transports do not implement
+Mobile's general mutation-ambiguity wrapper. Remote transaction terminal errors
+require reconciliation; they do not authorize replay or establish rollback.
+
+HTTP and mobile requests default to a 30-second deadline covering headers,
+status/error bodies, and JSON body consumption. Set `timeout: 0` to disable
+the deadline. HTTP caller cancellation yields `AbortError`; deadline expiry
+yields `TimeoutError`. Aborting HTTP consumption does not prove a server-side
+mutation was rolled back. The deadline applies per attempt, not to the full
+Mobile retry sequence. Pure-read retry backoff is not abort-aware: cancellation
+during that wait is checked before the next dispatch, after the wait ends.
+There is no 30-second overall retry budget.
+
+PgTransport reserves an independent cancellation connection before submitting
+signal-bearing SQL and drains target and cancellation work before release.
+Cancellation can fail or race a successful result; it does not guarantee bounded
+server termination. PgTransactionTransport currently checks signals only before
+dispatch and cannot cancel a running transaction statement. Embedded transport
+rejects signal-bearing calls. Configured Nucleus client transports transfer
+lifecycle ownership to the client, including cleanup on failed connect/plugin
+initialization; callers needing a borrowed transport must retain that boundary
+in their own adapter.
+
+Blob store and metadata tags are separate engine writes. Tag failures or
+cancellation can leave the object stored with partial metadata; no automatic
+delete or restoration runs without a version ownership primitive. A failed
+store response can have an unknown outcome. Reconcile the object explicitly;
+a concurrent writer's acknowledged object must never be deleted as cleanup.
+
+Migration rollback selects its frontier from persisted history, newest numeric
+version first. Every requested entry must have a local migration, a matching
+verified up checksum, and non-empty down SQL before any down script runs.
+`steps` must be a finite non-negative integer; zero returns without transport
+work. Adopted histories with unverified checksums require explicit
+reconciliation before rollback.
+
+
+TIME_BUCKET admission is write-free: call `timeseries.admitPureCapabilities()`
+to run scalar negative controls without inserting points. Raw TS_RANGE conformance
+needs points: explicitly consent with
+`probeCapabilities({allowPersistentProbeWrites:true})` on an owned diagnostic
+namespace/instance, then export
+`await timeseries.admissionProfile({disposeDiagnosticNamespace: () => ownedNamespace.dispose()})`.
+The owner callback must dispose the actual namespace/engine using a genuine lifecycle;
+raw-range profiles refuse if it is missing, and failed disposal never publishes a
+profile or repeats uncertain cleanup. Pure bucket profiles need no disposal callback. There is no point-deletion
+primitive; merely closing a connection does not erase persistent diagnostic points.
+A production client can `.use(withTimeSeriesProfile(profile))` without performing
+writes there. Profiles are immutable, minted only by measured diagnostics, and bind
+the exact endpoint/auth config digest, live VERSION() and NUCLEUS_FEATURES() digest.
+Production rechecks identity with pure queries before each gated read. A different
+endpoint/engine, changed version/features, copied/unverified object or stale profile
+refuses; a diagnostic engine at another URL does not certify production. Profiles
+are in-process only, default to five minutes and allow at most one day. Requalify
+after deployment/restart; no general engine certification is implied. For configured
+HTTP/PG transports identity is automatic; custom transports must explicitly provide
+capabilityEndpoint and live identity queries, or their evidence cannot be handed off.
+No arbitrary boolean admits unknown raw functions. Existing same-model diagnostics
+remain usable, and failure to insert points cannot disable pure bucketing evidence.
+
+Transports expose typed `capabilities`; missing custom metadata means unknown.
+`createClient({requiredCapabilities})` admits requirements before feature queries.
+The common SQL lifecycle module is a required dependency but imports no driver/ORM.
+PG cancellation is a server attempt, never a universal termination guarantee;
+transaction PG is pre-dispatch only, HTTP/mobile abort response consumption, and
+embedded refuses signals. HTTP advertises BEGIN ambiguity separately from Mobile's
+general mutation unknown-outcome wrapper; pgwire/embedded preserve native errors.
+Transport close is terminal and later operations refuse; PG drains all allocated
+pools before reporting every cleanup failure and never recreates a pool after close.
+Mobile close rejects undispatched queued operations. Raw transaction ownership remains
+scoped separately and does not promise rollback of external effects.
+
+BEGIN validates the entire envelope and exact native header/body identity, including
+legacy object responses without `ok`. Null/malformed success, non-byte/control/blank
+or whitespace-normalized identity, lost response and 5xx produce UNKNOWN_OUTCOME
+with sanitized BEGIN context and cause, after one send. Explicit protocol rejection
+or recognized HTTP client rejection remains definitive. Reconcile ambiguity before
+retrying; no transaction ID is invented. Mobile caching defaults false: enable it
+and assert both `readOnly:true` and `cache:true` per call, including scalar SELECTs.

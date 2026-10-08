@@ -479,6 +479,9 @@ export class CursorStream<T> implements AsyncIterableIterator<T> {
       if (rows !== null) applyProjectionDecoders(rows, this.#compiled.decoders);
       return rows;
     } catch (err) {
+      // A decoder rejection is terminal, but the cursor may still own a
+      // transaction waiting for another pull. Stop it before marking done.
+      try { await this.#session?.stop(); } catch { /* preserve the original error */ }
       this.#finish();
       throw err;
     }

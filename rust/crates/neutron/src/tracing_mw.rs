@@ -18,6 +18,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
 
+use tracing::Instrument;
+
 use rand::Rng;
 
 use crate::handler::{Request, Response};
@@ -124,18 +126,24 @@ impl MiddlewareTrait for TracingLayer {
                 path = %path,
                 trace_id = %trace_id_str,
             );
-            let _guard = span.enter();
-
+            // The span is attached with `Instrument`, NOT a held `enter()`
+            // guard: a guard kept across `await` stays entered while the
+            // task is suspended, so another request polled on the same
+            // thread in the meantime emitted its events into THIS request's
+            // span (cross-attributed logs). Instrumentation enters/exits the
+            // span around each poll, which is the documented-safe pattern.
             let start = Instant::now();
-            let mut resp = next.run(req).await;
+            let mut resp = next.run(req).instrument(span.clone()).await;
             let duration = start.elapsed();
 
             let status = resp.status().as_u16();
-            tracing::info!(
-                status = status,
-                duration_ms = duration.as_millis() as u64,
-                "response"
-            );
+            span.in_scope(|| {
+                tracing::info!(
+                    status = status,
+                    duration_ms = duration.as_millis() as u64,
+                    "response"
+                )
+            });
 
             // Add traceparent header to response
             let traceparent = trace_id.to_traceparent();
@@ -296,6 +304,251 @@ mod tests {
         assert_ne!(
             parts1[1], parts2[1],
             "different requests should get different trace IDs"
+        );
+    }
+
+    /// Regression (RS-35): the request span used to be kept `enter()`ed
+    /// across the `next.run(req).await`, so when two request futures
+    /// interleaved on one thread, the second request's events were recorded
+    /// inside the FIRST request's (suspended) span — cross-attributed logs.
+    /// The span is now attached via `Instrument` (enter/exit per poll). Two
+    /// barrier-interleaved requests must emit every event inside their own
+    /// span.
+    #[test]
+    fn interleaved_requests_keep_their_own_spans() {
+        // Fresh thread: `tracing` caches callsite interest per thread, so a
+        // subscriber installed by an earlier test on a reused harness thread
+        // can otherwise make this test's spans (but not its events)
+        // invisible — pure test-infrastructure nondeterminism.
+        std::thread::Builder::new()
+            .name("rs35-interleaved-spans".into())
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                rt.block_on(async {
+                    interleaved_requests_keep_their_own_spans_inner().await;
+                });
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
+    }
+
+    #[test]
+    #[ignore = "run alone: intentionally installs a process-global subscriber"]
+    fn interleaved_capture_with_an_already_installed_global_subscriber() {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::Registry::default());
+        interleaved_requests_keep_their_own_spans();
+    }
+
+    async fn interleaved_requests_keep_their_own_spans_inner() {
+        use crate::extract::Extension;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct CaptureLayer(Arc<Capture>);
+        impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.on_new_span(attrs, id, ctx);
+            }
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.on_event(event, ctx);
+            }
+        }
+
+        #[derive(Default)]
+        struct FieldGrab {
+            trace_id: Option<String>,
+            own_id: Option<String>,
+            path: Option<String>,
+            status: Option<u64>,
+            duration_ms: Option<u64>,
+        }
+        impl tracing::field::Visit for FieldGrab {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                match field.name() {
+                    "status" => self.status = Some(value),
+                    "duration_ms" => self.duration_ms = Some(value),
+                    _ => {}
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "trace_id" => self.trace_id = Some(value.to_string()),
+                    "own_id" => self.own_id = Some(value.to_string()),
+                    "path" => self.path = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "own_id" => self.own_id = Some(format!("{value:?}")),
+                    "trace_id" => self.trace_id = Some(format!("{value:?}")),
+                    "path" => self.path = Some(format!("{value:?}")),
+                    _ => {}
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Capture {
+            spans: Mutex<HashMap<u64, (String, String)>>, // id -> (trace_id, path)
+            events: Mutex<Vec<(Option<String>, Option<u64>, Option<u64>, String, String)>>,
+        }
+        impl<S> tracing_subscriber::Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut v = FieldGrab::default();
+                attrs.record(&mut v);
+                if let Some(t) = v.trace_id {
+                    self.spans
+                        .lock()
+                        .unwrap()
+                        .insert(id.into_u64(), (t, v.path.unwrap_or_default()));
+                }
+            }
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut v = FieldGrab::default();
+                event.record(&mut v);
+                let span_context = ctx
+                    .current_span()
+                    .id()
+                    .and_then(|id| self.spans.lock().unwrap().get(&id.into_u64()).cloned())
+                    .unwrap_or_default();
+                self.events.lock().unwrap().push((
+                    v.own_id,
+                    v.status,
+                    v.duration_ms,
+                    span_context.0,
+                    span_context.1,
+                ));
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let cap_layer = CaptureLayer(Arc::clone(&capture));
+        let registry = tracing_subscriber::Registry::default().with(cap_layer);
+        // This fixture owns a single runtime thread. Keep the local subscriber
+        // guard alive across every poll/assertion, regardless of global ownership.
+        let _subscriber = tracing::subscriber::set_default(registry);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let router = Router::new()
+            .middleware(TracingLayer)
+            .get("/a", move |Extension(trace): Extension<TraceId>| {
+                let b = Arc::clone(&b1);
+                async move {
+                    tracing::info!(own_id = trace.0.as_str(), "first event a");
+                    b.wait().await;
+                    tracing::info!(own_id = trace.0.as_str(), "second event a");
+                    "a"
+                }
+            })
+            .get("/b", move |Extension(trace): Extension<TraceId>| {
+                let b = Arc::clone(&b2);
+                async move {
+                    tracing::info!(own_id = trace.0.as_str(), "first event b");
+                    b.wait().await;
+                    tracing::info!(own_id = trace.0.as_str(), "second event b");
+                    "b"
+                }
+            });
+        let client = crate::testing::TestClient::new(router);
+
+        // Both requests run on this single-threaded task set; the barrier
+        // forces a to suspend with its span "in progress" while b polls.
+        let requests = async { tokio::join!(client.get("/a").send(), client.get("/b").send()) };
+        tokio::pin!(requests);
+        let (r1, r2) = std::future::poll_fn(|cx| {
+            let result = requests.as_mut().poll(cx);
+            // Instrument must exit after EVERY poll, including Pending/Ready.
+            assert!(
+                tracing::Span::current().id().is_none(),
+                "request span leaked between polls"
+            );
+            result
+        })
+        .await;
+        assert_eq!(r1.status(), 200);
+        assert_eq!(r2.status(), 200);
+        let tid_a = TraceId::from_traceparent(r1.header("traceparent").unwrap())
+            .unwrap()
+            .0;
+        let tid_b = TraceId::from_traceparent(r2.header("traceparent").unwrap())
+            .unwrap()
+            .0;
+        assert_ne!(tid_a, tid_b);
+        let expected = HashMap::from([("/a", tid_a), ("/b", tid_b)]);
+        let events = capture.events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            6,
+            "two handler events and one response per request: {events:?}"
+        );
+        for (path, tid) in expected {
+            let attributed: Vec<_> = events.iter().filter(|event| event.4 == path).collect();
+            assert_eq!(attributed.len(), 3, "wrong request attribution: {events:?}");
+            let mut handlers = 0;
+            let mut responses = 0;
+            for (own, status, duration, span_tid, _) in attributed {
+                assert_eq!(span_tid, &tid, "wrong request span: {events:?}");
+                if let Some(own) = own {
+                    handlers += 1;
+                    assert_eq!(own, &tid, "handler belongs to a different request");
+                    assert!(status.is_none());
+                } else {
+                    responses += 1;
+                    assert_eq!(*status, Some(200));
+                    assert!(duration.is_some(), "response duration absent");
+                }
+            }
+            assert_eq!((handlers, responses), (2, 1));
+        }
+
+        // Poll one real request to its barrier, then cancel it while suspended.
+        let mut canceled = Box::pin(client.get("/a").send());
+        std::future::poll_fn(|cx| {
+            assert!(canceled.as_mut().poll(cx).is_pending());
+            assert!(
+                tracing::Span::current().id().is_none(),
+                "span leaked after yielding"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(canceled);
+        assert!(
+            tracing::Span::current().id().is_none(),
+            "span leaked after cancellation"
         );
     }
 }

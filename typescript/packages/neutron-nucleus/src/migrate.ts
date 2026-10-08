@@ -453,7 +453,9 @@ export async function migrateDown(
   steps = 1,
   options?: MigrateOptions,
 ): Promise<string[]> {
-  const plan = [...prepareMigrations(migrations)].reverse();
+  if (!Number.isSafeInteger(steps) || steps < 0) throw new RangeError('steps must be a finite non-negative integer');
+  if (steps === 0) return [];
+  const plan = prepareMigrations(migrations);
   const namespace = await captureMigrationNamespace(transport);
   const token = await acquireMigrationLock(transport, namespace, options);
 
@@ -462,17 +464,23 @@ export async function migrateDown(
     const applied = await appliedRows(transport, namespace);
     verifyHistory(plan, applied);
 
-    const rolled: string[] = [];
-    for (const m of plan) {
-      if (rolled.length >= steps) break;
-      if (!applied.has(m.version)) continue;
-      if (!m.down) {
-        throw new Error(`Migration ${m.version} (${m.name}) has no down SQL`);
+    const byVersion = new Map(plan.map((m) => [m.version, m]));
+    const frontier = [...applied.keys()].sort((a, b) => b - a).slice(0, steps).map((version) => {
+      const m = byVersion.get(version);
+      if (!m) throw new Error(`Cannot roll back migration ${version}: missing local migration`);
+      if (!m.down?.trim()) throw new Error(`Migration ${m.version} (${m.name}) has no down SQL`);
+      const recorded = applied.get(version)!;
+      if (recorded.checksum !== migrationChecksum(m.up)) {
+        throw new Error(`Cannot roll back migration ${version}: matching verified up checksum required`);
       }
-
+      return m;
+    });
+    // Preflight the whole persisted frontier before the first business DDL.
+    const rolled: string[] = [];
+    for (const m of frontier) {
       const tx = await transport.beginTransaction();
       try {
-        await tx.execute(m.down);
+        await tx.execute(m.down!);
         await tx.execute(namespace.sql('DELETE FROM _neutron_migrations WHERE version = $1'), [m.version]);
         await tx.commit();
         rolled.push(m.name);

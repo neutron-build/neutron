@@ -5,6 +5,7 @@
 import type { Transport, NucleusFeatures, NucleusPlugin } from './types.js';
 import { createTransport, PgTransport } from './transport.js';
 import { detectFeatures } from './features.js';
+import { admitConnection, cleanupAfterFailure, ownedClose } from '@neutron-build/sql/lifecycle';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -19,6 +20,8 @@ export interface NucleusClientConfig {
   timeout?: number;
   /** Override the default transport (e.g. for testing or explicit platform choice). */
   transport?: Transport;
+  /** Refuse unsupported/unknown operational guarantees before startup queries. */
+  requiredCapabilities?: Partial<import('@neutron-build/sql/lifecycle').ConnectionCapabilities>;
 
   // -- Mobile-specific options (used by MobileTransport when auto-detected) --
 
@@ -28,7 +31,7 @@ export interface NucleusClientConfig {
   retryDelay?: number;
   /** Time-to-live for cached SELECT results in ms (default 60000). */
   cacheTTL?: number;
-  /** Whether to cache SELECT queries (default true on mobile). */
+  /** Enable mobile caching (default false); each call must also assert readOnly:true and cache:true. SQL spelling alone never proves purity. */
   cacheEnabled?: boolean;
   /** Whether to queue writes when offline (default true on mobile). */
   offlineQueueEnabled?: boolean;
@@ -110,30 +113,35 @@ class ClientBuilder<Acc> implements NucleusClientBuilder<Acc> {
       offlineQueueEnabled: this.config.offlineQueueEnabled,
       maxQueueSize: this.config.maxQueueSize,
     });
-    const features = await detectFeatures(transport);
+    try {
+      admitConnection(transport, this.config.requiredCapabilities ?? {});
+      const features = await detectFeatures(transport);
 
-    // Base client object
-    const base: NucleusClientBase = {
-      transport,
-      features,
-      close: () => transport.close(),
-      ping: () => transport.ping(),
-    };
+      // Base client object
+      const base: NucleusClientBase = {
+        transport,
+        features,
+        close: ownedClose([() => transport.close()]),
+        ping: () => transport.ping(),
+      };
 
-    // Merge plugin contributions into the base object
-    const reserved = new Set(['transport', 'features', 'close', 'ping']);
-    const client = base as NucleusClientBase & Acc;
-    for (const plugin of this.plugins) {
-      const contribution = plugin.init(transport, features);
-      for (const key of Object.keys(contribution as object)) {
-        if (reserved.has(key)) {
-          throw new Error(`Plugin "${plugin.name}" cannot override reserved property "${key}"`);
+      // Merge plugin contributions into the base object
+      const reserved = new Set(['transport', 'features', 'close', 'ping']);
+      const client = base as NucleusClientBase & Acc;
+      for (const plugin of this.plugins) {
+        const contribution = plugin.init(transport, features);
+        for (const key of Object.keys(contribution as object)) {
+          if (reserved.has(key)) {
+            throw new Error(`Plugin "${plugin.name}" cannot override reserved property "${key}"`);
+          }
         }
+        Object.assign(client, contribution);
       }
-      Object.assign(client, contribution);
-    }
 
-    return client;
+      return client;
+    } catch (error) {
+      return cleanupAfterFailure(error, [() => transport.close()]);
+    }
   }
 }
 

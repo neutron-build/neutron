@@ -177,6 +177,7 @@ function normalizeChannels(channels: string | string[]): string[] {
  * LISTEN/NOTIFY over the `pg` driver, on ONE dedicated connection.
  */
 export function pgListener(options: PgListenerOptions): Promise<PgListenerHandle> {
+  if (options.signal?.aborted) return Promise.reject(new Error("listener is closed (signal aborted)"));
   if ((options.url !== undefined) === (options.client !== undefined)) {
     return Promise.reject(
       new Error("pgListener takes exactly one of url (owned connection) or client (borrowed, dedicated)"),
@@ -206,12 +207,15 @@ abstract class PgListenerBase implements PgListenerHandle {
   protected readonly log: ListenLogger | undefined;
   protected readonly subscribed = new Set<string>();
   protected closed = false;
+  private acquisitions: Promise<void> = Promise.resolve();
+  private closePromise: Promise<void> | null = null;
   private readonly onAbort = () => {
     void this.close();
   };
 
   constructor(protected readonly opts: { logger?: ListenLogger; signal?: AbortSignal }) {
     this.log = opts.logger;
+    this.closed = opts.signal?.aborted ?? false;
     opts.signal?.addEventListener("abort", this.onAbort, { once: true });
   }
 
@@ -226,13 +230,19 @@ abstract class PgListenerBase implements PgListenerHandle {
   ): Promise<void> {
     this.assertOpen();
     const list = normalizeChannels(channels);
-    this.attach(onNotification);
-    for (const c of list) {
-      if (this.subscribed.has(c)) throw new Error(`already listening on channel ${JSON.stringify(c)}`);
-      await this.send(`LISTEN ${quotedChannel(c)}`);
-      this.subscribed.add(c);
-      this.log?.({ kind: "listen-open", channel: c });
-    }
+    const work = this.acquisitions.then(async () => {
+      this.assertOpen();
+      this.attach(onNotification);
+      for (const c of list) {
+        this.assertOpen();
+        if (this.subscribed.has(c)) throw new Error(`already listening on channel ${JSON.stringify(c)}`);
+        await this.send(`LISTEN ${quotedChannel(c)}`);
+        this.subscribed.add(c);
+        this.log?.({ kind: "listen-open", channel: c });
+      }
+    });
+    this.acquisitions = work.catch(() => {});
+    return work;
   }
 
   async notify(channel: string, payload?: string): Promise<void> {
@@ -258,12 +268,16 @@ abstract class PgListenerBase implements PgListenerHandle {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.opts.signal?.removeEventListener("abort", this.onAbort);
-    await this.teardown();
-    this.log?.({ kind: "listener-closed" });
+    this.closePromise = this.acquisitions.then(async () => {
+      await this.teardown();
+      this.subscribed.clear();
+      this.log?.({ kind: "listener-closed" });
+    });
+    return this.closePromise;
   }
 
   protected assertOpen(): void {
@@ -316,6 +330,7 @@ class PgOwnedListener extends PgListenerBase {
     const mod = (await import(specifier)) as unknown as {
       Client: new (o: { connectionString: string }) => PgNotifyClient & { connect(): Promise<void> };
     };
+    self.assertOpen();
     const client = new mod.Client({ connectionString: opts.url });
     self.client = client;
     // A bare pg Client does NOT auto-connect — a query submitted before
@@ -325,6 +340,7 @@ class PgOwnedListener extends PgListenerBase {
     try {
       await client.connect();
       await client.query("SELECT 1");
+      self.assertOpen();
     } catch (err) {
       self.log?.({ kind: "listener-error", error: errorSummary(err) });
       await self.close();
@@ -354,7 +370,7 @@ class PgOwnedListener extends PgListenerBase {
 
   protected attach(onNotification: (n: PgNotification) => void): void {
     if (this.handler || !this.client) return;
-    this.handler = (n) => onNotification(this.normalize(n));
+    this.handler = (n) => { if (!this.closed) onNotification(this.normalize(n)); };
     this.client.on("notification", this.handler);
   }
 
@@ -427,7 +443,7 @@ class PgBorrowedListener extends PgListenerBase {
 
   protected attach(onNotification: (n: PgNotification) => void): void {
     if (this.handler) return;
-    this.handler = (n) => onNotification(this.normalize(n));
+    this.handler = (n) => { if (!this.closed) onNotification(this.normalize(n)); };
     this.borrowedClient.on("notification", this.handler);
   }
 
@@ -477,6 +493,7 @@ export interface PostgresJsListenerHandle extends ListenerHandle {
 /** Listener over a borrowed postgres.js handle using its native LISTEN
  * support. The handle is never ended by this listener. */
 export function postgresJsListener(options: PostgresJsListenerOptions): Promise<PostgresJsListenerHandle> {
+  if (options.signal?.aborted) return Promise.reject(new Error("listener is closed (signal aborted)"));
   return Promise.resolve(new PostgresJsListener(options));
 }
 
@@ -484,12 +501,15 @@ class PostgresJsListener implements PostgresJsListenerHandle {
   private readonly log: ListenLogger | undefined;
   private readonly unlistens = new Map<string, { unlisten: () => Promise<void> }>();
   private closed = false;
+  private acquisitions: Promise<void> = Promise.resolve();
+  private closePromise: Promise<void> | null = null;
   private readonly onAbort = () => {
     void this.close();
   };
 
   constructor(private readonly opts: PostgresJsListenerOptions) {
     this.log = opts.logger;
+    this.closed = opts.signal?.aborted ?? false;
     opts.signal?.addEventListener("abort", this.onAbort, { once: true });
   }
 
@@ -499,14 +519,20 @@ class PostgresJsListener implements PostgresJsListenerHandle {
 
   async listen(channels: string | string[], onNotification: (payload: string, channel: string) => void): Promise<void> {
     this.assertOpen();
-    for (const channel of normalizeChannels(channels)) {
-      if (this.unlistens.has(channel)) continue;
-      // postgres.js owns the quoting convention (double-quoted identifier),
-      // matching ours, so its channel key lines up with notifyStatement().
-      const handle = await this.opts.client.listen(channel, (payload) => onNotification(payload, channel));
-      this.unlistens.set(channel, handle);
-      this.log?.({ kind: "listen-open", channel });
-    }
+    const work = this.acquisitions.then(async () => {
+      this.assertOpen();
+      for (const channel of normalizeChannels(channels)) {
+        this.assertOpen();
+        if (this.unlistens.has(channel)) continue;
+        const handle = await this.opts.client.listen(channel, (payload) => {
+          if (!this.closed) onNotification(payload, channel);
+        });
+        this.unlistens.set(channel, handle);
+        this.log?.({ kind: "listen-open", channel });
+      }
+    });
+    this.acquisitions = work.catch(() => {});
+    return work;
   }
 
   async notify(channel: string, payload?: string): Promise<void> {
@@ -529,17 +555,18 @@ class PostgresJsListener implements PostgresJsListenerHandle {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.opts.signal?.removeEventListener("abort", this.onAbort);
-    for (const [c, handle] of [...this.unlistens]) {
-      this.unlistens.delete(c);
-      await handle.unlisten().catch(() => {
-        // Subscription connection may already be gone.
-      });
-    }
-    this.log?.({ kind: "listener-closed" });
+    this.closePromise = this.acquisitions.then(async () => {
+      for (const [c, handle] of [...this.unlistens]) {
+        this.unlistens.delete(c);
+        await handle.unlisten().catch(() => {});
+      }
+      this.log?.({ kind: "listener-closed" });
+    });
+    return this.closePromise;
   }
 
   private assertOpen(): void {

@@ -352,6 +352,13 @@ async fn test_server_accept_loop(
     state_map: Arc<StateMap>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
+    #[cfg(feature = "ws")]
+    let upgrades = crate::task_tracker::UpgradeTasks::new();
+    #[cfg(feature = "ws")]
+    let _scope = upgrades.scope();
+    #[cfg(feature = "ws")]
+    let chain = crate::task_tracker::attach(chain, upgrades.clone());
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -361,11 +368,21 @@ async fn test_server_accept_loop(
                 };
                 let chain     = Arc::clone(&chain);
                 let state_map = Arc::clone(&state_map);
-                tokio::spawn(serve_test_conn(stream, remote_addr, chain, state_map));
+                tasks.spawn(serve_test_conn(stream, remote_addr, chain, state_map));
             }
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
             _ = &mut shutdown => break,
         }
     }
+    drop(listener);
+    #[cfg(feature = "ws")]
+    upgrades.stop();
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    #[cfg(feature = "ws")]
+    upgrades
+        .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }
 
 // Serve a single hyper connection for the test server.

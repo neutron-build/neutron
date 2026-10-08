@@ -34,7 +34,8 @@ const providerJSONLimit = 64 << 20
 
 // Adapter is a Graph client bound to one mailbox.
 type Adapter struct {
-	http *http.Client
+	http           *http.Client
+	identityFormat string
 }
 
 // New wraps an HTTP client that already applies authentication.
@@ -43,6 +44,10 @@ type Adapter struct {
 // token transparently. Keeping auth outside this package means token
 // lifetime, storage, and revocation are handled in exactly one place.
 func New(hc *http.Client) *Adapter {
+	a, _ := NewWithIdentityFormat(hc, mail.GraphLegacyIDs)
+	return a
+}
+func newAdapter(hc *http.Client) *Adapter {
 	if hc == nil {
 		hc = &http.Client{Timeout: 60 * time.Second}
 	}
@@ -406,6 +411,10 @@ func (m graphMessage) toEnvelope() mail.Envelope {
 		env.Keywords.Flagged = true
 	}
 
+	env.AttachmentPresence = mail.AttachmentAbsent
+	if env.HasAttachment {
+		env.AttachmentPresence = mail.AttachmentPresent
+	}
 	env.Fingerprint = mail.ComputeFingerprint(&env)
 	return env
 }

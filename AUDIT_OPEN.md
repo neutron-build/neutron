@@ -689,6 +689,28 @@ regression unless marked otherwise.
   every key in the emitted group; max-keys=0 reports not-truncated.
   Regression: `s3_delimiter_pagination_advances` (advancing tokens, full
   coverage, no duplicates, probe + control pages).
+- NE-12 | FIXED — the S3 gateway's head reader used unbounded `read_line`
+  for the request line and every header, checking the 64 KiB cap only
+  AFTER allocation: an unauthenticated peer streaming one line without LF
+  grew the buffer without bound (process OOM) and the request line was
+  never inside any budget. One aggregate head budget now covers the
+  request line + all headers, each line read through `take(remaining+1)`
+  so bytes are bounded as they arrive (unterminated-at-budget rejected
+  before more allocation); a 256-line header-count cap; duplicate
+  Content-Length values that disagree, or Content-Length combined with
+  any Transfer-Encoding, are refused as ambiguous framing. Regressions in
+  `s3/http.rs` (duplex-fed): overlong unterminated request line and single
+  header, 300 short headers, conflicting/ambiguous lengths, mid-header
+  EOF, ordinary-head control.
+- NE-19 | FIXED — the pgwire accept loop pushed every connection task into
+  a JoinSet and never joined: completed entries accumulated for the
+  server's whole lifetime (memory growth under connection churn) and a
+  panicked handler's result was never observed. The select loop now reaps
+  through a guarded `join_next` branch (disabled while the set is empty so
+  an empty JoinSet cannot starve accept), logging panics/errors and
+  continuing; shutdown drain order unchanged. No dedicated regression
+  (needs the binary's accept loop extracted); verified by inspection and
+  build.
 
 ### Engine — S3 durability boundary
 
@@ -742,6 +764,16 @@ regression unless marked otherwise.
   panicked instead of returning KeyTooLarge. Checked before any page is
   touched. Regression: 257/4096/16349/65536-byte keys refused without
   mutation, MAX_KEY_SIZE boundary accepted.
+- NE-27 | FIXED — disk-recovery state transitions used load-decide-store
+  sequences: a monitor that had read the pre-operator state could clear a
+  just-installed operator hold (`resume_if`'s unconditional swap) or store
+  its DiskWatermark over it (`enter_read_only`'s plain store), re-admitting
+  writes the operator had frozen, or downgrading the reason so a later
+  recovery cleared it. Both transitions are now single compare-and-swap
+  loops — the operator-priority check happens INSIDE `enter_read_only`'s
+  CAS loop and `resume_if` clears only the exact reason it observed.
+  Regression: `concurrent_disk_monitor_transitions_never_clear_an_operator_hold`
+  (stress: interleaved monitor/operator transitions; operator hold survives).
 - NE-28 | FIXED — an audit event larger than the whole file cap was written
   anyway and rotation carried a copy into every retained file, defeating
   the total bound. Oversized events are refused with InvalidInput BEFORE
@@ -876,6 +908,328 @@ s3_gateway` 10/10, targeted suites for every touched module listed in the
 per-item regressions above. No web searches were performed; no lookups
 beyond the local audit pack and repository. No commits made — tree left
 dirty for the orchestrator.
+
+Post-landing verification (same day): the orchestrator landed this pass as
+`fa9cc9bb` on `origin/main`. Three fixes present in the diff but missing
+from this register on first write (NE-12, NE-19, NE-27) were added as rows
+above at that time — the fixed count is 25 NE items (24 full + NE-21
+partial), matching the diff. A detached-worktree re-run of the exact commit
+reproduced the suite results above (see the pass report).
+
+## Neutron audit pack Pass B — RS-*/TSD-* (2026-10-07, branch `audit/pack-rs-tsd`)
+
+Source: the same 193-item plan (`.audits/2026-10-06/neutron-audit-plan/`,
+pinned `cfa7eefe`). Pass B covers RS-01..35 (Rust server runtime,
+`rust/crates/*`) + TSD-01..14 (TS data layer: neutron-sql, neutron-nucleus,
+neutron-data). STATUS: IMPLEMENTED — FINAL ACCEPTANCE PENDING. All 49 findings have source
+fixes; validation results and remaining infrastructure gates are recorded below.
+
+Reconciliation vs landed work: `git diff cfa7eefe..HEAD -- rust/` is EMPTY —
+the NA wave's job fencing landed in `go/neutronjobs`, and Pass A touched only
+`nucleus/` + `typescript/packages/{neutron,neutron-sql(ast/builder/compile),
+create-neutron,neutron-cli}`. None of the 49 Pass B findings' files were
+modified, so all are verified on their merits against current code (no
+"already-fixed" classifications so far; details per item below).
+
+Status vocabulary as above. Targeted regressions are included; final aggregate
+validation is in progress. This continuation did not replay a clean baseline.
+
+### Rust — credential/protocol leaf fixes (implemented in this pass)
+
+- RS-13 | IMPLEMENTED — Stripe webhook HMAC keyed the MAC with a base64-DECODED,
+  prefix-stripped secret (`whsec_` removed), so real Stripe signatures never
+  verified while self-generated fixtures (using the same helper) passed. The
+  verifier now uses the FULL signing-secret string as key bytes and feeds
+  timestamp-bytes + "." + raw payload bytes (no UTF-8 round-trip); empty
+  secrets are refused. Regressions: an independently generated fixture
+  (Python `hmac`, the stripe-node algorithm) verifies; the old decoded-key
+  fixture now FAILS (fail-before inverted); empty-secret refusal.
+  `neutron-stripe` lib suite green.
+- RS-14 | IMPLEMENTED — the shared calendar decomposition (duplicated in
+  `neutron-storage/src/sign.rs` + `neutron-jobs/src/cron.rs`) narrowed
+  day-of-year to u8 before month conversion (2026-10-07 → signed
+  `20260124`) and anchored its 400-year cycle at 1970-01-01 (1972-12-31 →
+  1973-01-01). Both copies replaced with Hinnant civil-from-days (wide
+  integers until month/day derivation). Regressions: 180-entry fixture table
+  (independent Python `datetime` oracle; u8 boundary day-of-year 254-258,
+  leap/century/400-year edges through 2400) + the concrete audit date +
+  a month/day-restricted cron match. `neutron-storage` + `neutron-jobs`
+  suites green.
+- RS-15 | IMPLEMENTED — OAuth `fetch_userinfo` fallback invented `user.id` from
+  the first 16 access-token chars (the shared JWT header for JWT-shaped
+  tokens → distinct users conflated), and the built-in GitHub preset shipped
+  without `userinfo_url` (so GitHub ALWAYS hit the fallback). GitHub preset
+  now points at `https://api.github.com/user`; the fallback fails closed
+  with an actionable error. Regressions: all-presets-have-userinfo + a
+  fail-closed fallback test. `neutron-oauth` lib suite green.
+- RS-16 | IMPLEMENTED — OAuth callback `parse_query` kept percent-escapes literal
+  and `exchange_code` re-encoded them (`code=a%2Fb` double-encoded to
+  `a%252Fb` → valid logins failed). Now strict form-decoding (`%HH` must be
+  hex, `+`→space, UTF-8 validated) with duplicate-field rejection.
+  Regressions: `%2F`/`%2B`/escaped-equals decode, truncated/non-hex/lone-%
+  rejection, duplicate code/state rejection.
+- RS-17 | IMPLEMENTED — WebAuthn registration rejected the standard
+  none-attestation statement map: `skip_cbor_value` refused CBOR major
+  type 5 even empty, so every ordinary browser registration failed before
+  creating a credential. The parser now captures `attStmt` raw via a proper
+  bounded recursive skip (all CBOR majors, definite lengths, depth cap);
+  `finish_registration` requires fmt=="none" with an EXACTLY empty attStmt
+  map (other formats get a distinct `UnsupportedAttestationFormat` error
+  instead of silent acceptance), checks the AT flag, and verifies the
+  embedded credential ID against the response `id`. Regressions: complete
+  browser-shaped happy-path fixture, missing-AT, cred-id mismatch,
+  non-none format, non-empty attStmt. `neutron-webauthn` suite green.
+
+### Rust — runtime-correctness leaf fixes (implemented in this pass)
+
+- RS-31 | IMPLEMENTED — the OpenAPI TypeScript client generator emitted
+  `name??:` for optional query properties (invalid TypeScript — a `?` was
+  appended after the optionality marker) and made REQUIRED query params
+  optional. One-`?` semantics now; generated function arguments reflect required
+  query fields, optional query arguments before bodies use `| undefined`, and
+  URLSearchParams values stringify scalar values. Real `tsc` compiles generated
+  required/optional GET and optional-query POST clients. Regression:
+  `ts_codegen_query_param_optionality_is_valid_ts` asserts no `??`,
+  required `req: number`, optional `opt?: number`. `neutron` openapi
+  tests green.
+- RS-34 | IMPLEMENTED — the gRPC adapter dropped successful EMPTY messages
+  (`Some(msg) if !msg.is_empty()` skipped framing, so an empty protobuf
+  response vanished instead of emitting its 5-byte zero-length frame),
+  ignored the compressed-flag and trailing frames on unary requests
+  (handing compressed/garbage bytes to the app), and wrote `grpc-message`
+  trailers without percent-encoding. Now: every `Some(message)` is framed;
+  compressed frames fail closed with UNIMPLEMENTED; extra frames are
+  rejected; `grpc-message` is percent-encoded per the gRPC HTTP/2 spec.
+  Regressions: empty-message framing, compressed rejection, trailing-frame
+  rejection, percent-encode table + é message. `neutron-grpc` suite green.
+- RS-21 | IMPLEMENTED — metrics histograms double-accumulated: `observe`
+  already increments every containing (cumulative) bucket, and render
+  re-cumulated on top — finite buckets could exceed +Inf/count. Render now
+  prints each bucket counter directly (both duration and size histograms).
+  Regression: `histogram_buckets_render_without_double_counting` asserts
+  monotonic non-decreasing buckets, every-bucket-once for a below-bound
+  value, and finite ≤ +Inf. `neutron` metrics tests green.
+- RS-35 | IMPLEMENTED — the tracing middleware held a `span.enter()` guard
+  across the `next.run(req).await`: a suspended request kept its span
+  entered, so a concurrent request polled on the same thread recorded its
+  events into the FIRST request's span (cross-attributed logs). The span
+  is now attached with `Instrument` (enter/exit per poll). Regression:
+  `interleaved_requests_keep_their_own_spans` — two barrier-interleaved
+  requests on one thread, a recording subscriber maps span→trace_id and
+  asserts every event lands in its own span. `neutron` full lib suite
+  green (695 tests).
+- RS-19 | IMPLEMENTED — the inference SSE decoder ran `from_utf8` per transport
+  chunk, so a multibyte character split across chunks (legal — SSE has no
+  Unicode alignment guarantee) aborted the stream with "invalid UTF-8";
+  CRLF separators, `data:` without a space, and multi-line data were also
+  rejected. Now: byte-buffered incremental UTF-8 (incomplete tails held
+  back), CRLF + bare-`data:` + multi-line data per spec, 1 MiB event
+  bound, EOF flush. Regression: split-at-every-byte-offset Unicode event,
+  CRLF/bare-data/multiline, invalid-UTF-8 refusal, unterminated-event
+  bound. `neutron-inference` suite green.
+
+### Rust — core runtime (implemented in this pass)
+
+- RS-01 | IMPLEMENTED — default request deduplication shared whole HTTP responses
+  across callers with the same `METHOD:path?query` key: two authenticated
+  users could receive each other's body/headers/Set-Cookie, and waiters
+  skipped their own middleware. Now: credential-bearing requests
+  (Authorization/Cookie) are never deduplicated under the default key
+  (explicit `key_fn` opts back in); a leader response carrying Set-Cookie /
+  WWW-Authenticate / any Vary / private/no-store/no-cache is never
+  broadcast — waiters run their OWN chain; a `None` sentinel replaced the
+  old "leader failed" 500 (waiters run their own chain instead); the
+  pending slot is RAII-owned (`LeaderGuard`) so a cancelled leader cannot
+  strand later requests on a dead slot. Regressions: two-principal
+  isolation (distinct bodies + 2 handler calls), cookie isolation,
+  Set-Cookie non-sharing (waiter gets its own cookie), cancelled-leader
+  recovery. `neutron` dedup tests green (14).
+- RS-08 | IMPLEMENTED — response-cache flight notifications were lost (lookup of
+  the Notify followed by a later `notified()` registration missed
+  `notify_waiters`, which retains no permit) and a cancelled leader left
+  its in-flight entry stranded forever, hanging every later request for
+  the key. Flights are now `watch`-channel slots under the SAME lock as
+  entry storage (slot removal + completion send are linearized, so a
+  waiter can never miss a notification); leadership is RAII-owned
+  (`FlightGuard`): cancellation removes the slot and wakes waiters, which
+  re-check the cache and may become the next leader. Regression:
+  `cancelled_leader_does_not_strand_waiters`.
+- RS-09 | IMPLEMENTED — the response cache keyed only `METHOD:path?query` and
+  admitted any 2xx. Now the default key includes authority (Host header
+  or URI host), Accept, Accept-Language and Accept-Encoding; only full
+  **200** responses are stored (206/204 are not full representations);
+  ANY `Vary` disqualifies (the key does not encode arbitrary dimensions;
+  `Vary: *` is explicitly uncacheable); `Range` requests and requests
+  carrying `Cache-Control: no-cache/no-store` (case-insensitive) bypass
+  lookup; response `s-maxage`/`max-age` cap the configured TTL.
+  Regressions: host/language isolation, Range bypass (origin hit count),
+  206/Vary non-storage, mixed-case request no-cache, s-maxage=1s
+  expiring despite a 30s configured TTL.
+- RS-10 | IMPLEMENTED — invalidation was not fenced against in-flight stale
+  fills: a GET that started before a write could publish its pre-write
+  snapshot AFTER the write's invalidation, and the stale value stayed
+  until TTL expiry. Entries/generations/in-flights now share one lock;
+  each fill captures the path generation before loading, and publication
+  is generation-checked (an invalidated fill is discarded). All
+  CacheHandle invalidators advance the generation. Regression:
+  `invalidation_fences_in_flight_stale_fill` (held-open old fill +
+  invalidation + resume → next read sees the post-write value).
+  `neutron` cache suite green (28) + full lib suite 708/0.
+- RS-33 | IMPLEMENTED — a cancelled half-open probe (e.g. an outer `Timeout`
+  dropping the request) never cleared `probe_in_flight`; HalfOpen has no
+  expiry transition, so every later request returned 503 permanently.
+  The probe permit is now RAII-owned (`ProbePermit`: Drop releases), and
+  release happens on all paths including cancellation. Regression:
+  `cancelled_half_open_probe_does_not_wedge_the_breaker` (408-cancelled
+  probe → next request admitted, succeeds, breaker closes). Suite green.
+- RS-03 | IMPLEMENTED — a stale request could resurrect a destroyed session:
+  the layer saved unconditionally after the handler, so a request that
+  loaded a session before another request destroyed it re-created the
+  destroyed session under the same signed ID (restoring stale
+  authentication), and concurrent writers silently lost updates.
+  `SessionStore` requires atomic `load_with_revision`, fenced `save_if_current`,
+  and confirmed `destroy_checked` methods for custom stores too; the layer captures the
+  revision at load and saves CONDITIONALLY. `MemoryStore` implements
+  save/destroy under one lock with monotonic revisions and tombstoned
+  destroyed IDs; `RedisSessionStore` implements them with atomic Lua
+  (data + `:rev` counter + 7-day `:tomb` fence, standalone Redis;
+  legacy records get a revision atomically at load). A refused save returns 503 (no success-with-
+  unsaved-cookie). Regression: genuinely concurrent load→destroy→save
+  through the layer (paused handler + logout across two clients) gets
+  503 and the session stays destroyed; store-level tombstone and
+  concurrent-writer fencing tests. Session and live Redis legacy/expiry fencing regressions passed in final checks.
+- RS-04 | IMPLEMENTED — session persistence failures were reported as success:
+  `SessionStore` was infallible, so MemoryStore capacity rejections and
+  Redis save/destroy failures produced a successful login response with
+  an unsaved cookie, and logout cleared the browser cookie while the
+  authenticated record stayed usable. The layer now uses the checked
+  operations: failed save → 503 with NO cookie; failed destroy → 503
+  with the cookie INTACT. Regression:
+  `capacity_exhaustion_reports_failure_not_success` +
+  `memory_store_save_reports_capacity_failure`. Full neutron lib suite
+  721/0; neutron-redis 13/13 including live regressions.
+- RS-02 | IMPLEMENTED — `flatten_nests` hoisted a nested router's raw fallback
+  to the parent, so an unmatched path ANYWHERE invoked the child fallback
+  without the child middleware (an auth-protected fallback under
+  /private answered /unrelated anonymously) and a missing route inside
+  the prefix also bypassed the child chain. The fallback is now compiled
+  as a prefix-scoped catch-all (`{prefix}/{*__neutron_nest_fallback}`
+  plus the bare prefix when unclaimed) whose handler is the child
+  fallback wrapped with the child middleware chain; first-registered
+  nest wins for a shared path (previous tie-break preserved). Regression:
+  `nested_fallback_is_scoped_and_authenticated` — /unrelated → parent
+  404 (not the child fallback body); /private/missing → 401 without
+  credentials, fallback reachable with credentials; real routes intact.
+  Router suite 87 green; full lib 713/0.
+- RS-23 | IMPLEMENTED — Stripe API calls sent the `Authorization: Bearer
+  sk_live_…` credential over a RAW TcpStream regardless of scheme (port
+  80, plaintext) and failed real HTTPS endpoints. `execute` is now
+  scheme-aware: https dials 443 through a verified rustls connector
+  (webpki roots, hostname-checked); plaintext http is refused BEFORE any
+  connection attempt unless `StripeConfig::allow_insecure_http` is set
+  explicitly (local test doubles); unknown schemes are refused.
+  Regressions (real sockets): plaintext base refused with NO connection
+  attempted; https to an untrusted certificate fails closed with no
+  request delivered; https to a test-CA-signed server succeeds with the
+  credential observed on the wire. `neutron-stripe` 36/36.
+- RS-24 | IMPLEMENTED — the OTLP exporter dialed port 80 with a raw TcpStream
+  for EVERY scheme, silently exporting trace attributes in plaintext for
+  https endpoints. Same scheme-aware treatment: https through a verified
+  rustls connector (443), http kept as the explicit local-collector
+  path, unknown schemes refused. Regression: https endpoint against an
+  untrusted certificate fails closed, no payload delivered.
+  `neutron-otel` 49/49.
+- RS-18 | IMPLEMENTED — cancelling `Db::transaction` after BEGIN was sent but
+  before its future resolved dropped the ordinary `PooledConn` (recycled
+  to the pool), so the next borrower unknowingly executed inside the
+  open transaction. Both `neutron-nucleusdb` and `neutron-postgres` now
+  arm the transaction guard (Drop takes the client out → connection
+  discarded, never re-pooled) BEFORE sending BEGIN, so cancellation or
+  BEGIN failure discards the connection. Suites green (99 + 17). The
+  transport-stall regression sends BEGIN to a scripted PostgreSQL-wire
+  server, cancels while the reply is pending, then requires a fresh pool
+  connection (including max-size one and SSLRequest refusal).
+
+
+
+
+
+
+
+
+### Remaining implementations and TS data layer (final validation in progress)
+
+- RS-05 | IMPLEMENTED — Configured streaming transport ceilings apply to normal/TLS/worker bodies; strict buffering rechecks previously materialized bytes. Transport chunked-body regression and strict-after-broad regression retained.
+- RS-06 | IMPLEMENTED — Worker listeners share one connection cap, clone one listener on macOS/Windows, stop admission, own connection tasks, drain then reverse hooks, abort/join at deadline, and join worker threads through spawn_blocking (current-thread safe). Held-request and forced-deadline TCP regressions added.
+- RS-07 | IMPLEMENTED — Normal/TLS connection tasks are owned/reaped through JoinSet; shutdown wins admission selection; TLS handshakes have a timeout/shutdown branch. H3 owns concurrent requests and connection tasks, sends GOAWAY, drains/aborts, runs reverse hooks, and bounds transport teardown in the same deadline.
+- RS-11 | IMPLEMENTED — Persistent workers continuously poll configured/named queues as capacity becomes available; enqueue wakes admission, delayed jobs/backlogs/retries remain discoverable. Regression includes 10,001 jobs over two workers.
+- RS-12 | IMPLEMENTED — Every durable execution follows an atomic claim. Memory/PG/Redis claims carry monotonic tokens; complete/fail/retry require current token and running state. Custom JobStore transition APIs require tokens. External effects remain at least once.
+- RS-20 | IMPLEMENTED — Tower round-trips preserve owned framework request context, including state/extensions/remote/upgrade metadata. Layer service is constructed once, failed readiness and body rejection stop dispatch. Identity/context, construction count, oversized body and failed-readiness regressions added.
+- RS-22 | IMPLEMENTED — Redis response cache rejects credentials, HEAD, range, private/no-cache/no-store, Vary, cookies, non-200 and streaming bodies. Public representation keys include authority/Accept dimensions; entries have a v2 namespace, size cap, and response freshness cap. Live principal/Host isolation and policy regressions added.
+- RS-25 | IMPLEMENTED — Redis job state/hash/index changes are one Lua transition; claims and terminal/retry/recovery writes are token fenced, with index-type preflight and exhausted-attempt handling. Standalone Redis support is explicit.
+- RS-26 | IMPLEMENTED — Redis Script invocation reloads after NOSCRIPT; sequence counters expire with buckets. Backend admission is configurable and defaults to fail closed. Disposable Redis SCRIPT FLUSH regression exercises recovery.
+- RS-27 | IMPLEMENTED — WS inbound queue is bounded to 16 messages with a 1 MiB whole-message budget, including fragments. Independent reader/writer tasks preserve partially read frames across outbound writes; dropping halves aborts owned tasks. Sends acknowledge actual write completion. Real partial-frame/outbound regression added.
+- RS-28 | IMPLEMENTED — GraphQL negotiates graphql-transport-ws, multiplexes operation streams, drops canceled idle streams, handles ping/pong, duplicate IDs/init and initialization deadline. Real socket test covers simultaneous operations, idle cancellation, ping and confirmed protocol-close transmission.
+- RS-29 | IMPLEMENTED — Owned Request extraction and Clone factory bounds let exported GraphQL/OAuth factories mount directly. Consumer integration tests compile and dispatch documented factory shapes, including subscription transport.
+- RS-30 | IMPLEMENTED — Advertised optional features explicitly activate required dependency/module edges; all five examples declare their required features (Cargo metadata validated). Full/http3/Tower combinations compiled in the all-feature tests. Standalone feature-matrix acceptance remains pending and is tracked separately from workspace feature unification.
+- RS-32 | IMPLEMENTED — OTLP periodic worker flushes low-volume traffic, retains bounded failed batches, accounts for overflow, and provides explicit shutdown/final flush. Cancellation returns the owned batch; HTTP IO driver remains inside the bounded export future; initial tracing fields are recorded. Timer/outage/cancellation/shutdown/attribute regressions added.
+- TSD-01 | IMPLEMENTED — Decoder rejection stops cursor ownership before terminal completion, preserving the original error and releasing the transaction/connection.
+- TSD-02 | IMPLEMENTED — Capability checks on pinned sessions use session-local executors and savepoint-safe probes; cold single-connection transactions no longer query their occupied outer pool.
+- TSD-03 | IMPLEMENTED — Postgres queue claims one execution slot at a time; attempt/worker/active/lease fences protect acknowledgements and renewals, including reused worker IDs. Job payloads bind as JSON objects rather than double-encoded JSON strings.
+- TSD-04 | IMPLEMENTED — Native BullMQ unknown-name jobs are durably deferred through delayed disposition; they no longer complete without a handler, including across restart.
+- TSD-05 | IMPLEMENTED — Raw/mobile SELECT caching defaults off; caching requires explicit pure-read assertion. Pre-abort checks and write/transaction generation fences protect opted-in reads; actual scalar INCR/SETNX mutators dispatch each time.
+- TSD-06 | IMPLEMENTED — Dispatched mutations/BEGIN are not automatically replayed. UnknownOutcome identifies ambiguous responses; offline queue retains only known-undispatched writes. Only caller-asserted pure reads retry.
+- TSD-07 | IMPLEMENTED — Cancellation uses an independent channel with immediate rejection observation and target/cancel drain on all outcomes. Pool/PID waits recheck abort. Live PostgreSQL saturates eight main connections and proves cancellation and later reuse.
+- TSD-08 | IMPLEMENTED — HTTP signal/deadline covers response body parsing and error bodies; default is 30 seconds, explicit zero disables. Unit and real stalled-body regressions added.
+- TSD-09 | IMPLEMENTED — Removed unfenced destructive blob compensation. Store/tag remains explicitly non-atomic; partial metadata errors propagate without deleting a newer writer.
+- TSD-10 | IMPLEMENTED — Rollback preflights the persisted newest-first frontier, local migration presence, verified checksum and down SQL before DDL; missing newest/intermediate files cannot skip to older down scripts.
+- TSD-11 | IMPLEMENTED — Listener acquisition/close is serialized and generation checked; closing during subscribe releases late subscriptions and prevents post-close notifications/resources.
+- TSD-12 | IMPLEMENTED — Redis increment/anchored expiry is atomic Lua. Nucleus TTL increments require an atomic backend primitive; absent support is refused before mutation rather than implementing unsafe split operations.
+- TSD-13 | IMPLEMENTED — Cron scheduling arms bounded timers and coalesces missed work into one catch-up after forward/backward clock changes.
+- TSD-14 | IMPLEMENTED — Legacy DDL selectively defers cyclic foreign keys and emits canonical driver-aware defaults, including JSON values; known serializers are shared with typed profiles.
+
+Parent-reviewed release fixture correction was applied separately to
+`typescript/packages/neutron/src/core/static-gate-preflight.test.ts`; it preserves
+malformed-array/undefined-export security cases and public runtime types. It is
+not a Pass B finding.
+
+Framework request-cache SSR investigation remains owned by Pass C. The full core
+TS test run timed out in its existing real-SSR request-scope test; this test does
+not exercise neutron-sql/data/nucleus and was not edited in Pass B.
+
+
+### Final acceptance checkpoint
+
+Formatting and diff whitespace checks passed. Final durable-job integration tests
+passed 8/8, including real PostgreSQL/Redis and the 10,001-job two-worker case.
+The all-feature Rust workspace run passed 720 core unit tests and 32
+contract/integration tests before UI trybuild exhausted host disk; aggregate
+exit 101. Workspace clippy also failed while writing compiler metadata with
+ENOSPC. Neither gate is represented as passing. Latest-source libraries compiled: 721 core tests and the audited library suites
+passed, and the corrected PostgreSQL/Nucleus DB suites passed 19/19 and 101/101.
+Cancellation tests also exposed malformed empty/escaped pool fields: both
+connection-string serializers now quote those values correctly, with real
+tokio-postgres parser regressions preserving SSL mode and field identity.
+Direct execution of the already compiled binaries passed 13 Redis tests including
+live regressions, plus all GraphQL/OAuth consumer tests. New heavy compilation
+and standalone feature-matrix validation are paused by resource steering.
+
+Nucleus TS unit/build/lint passed (450 passed/15 gated skips); real PostgreSQL
+passed 487/510 with 23 engine-specialty skips. The shared engine instance is
+owned by another lane and the fixed global specialty fixtures lack safe
+isolation, so an owned disposable final-source engine is required for that
+acceptance coverage. Data targeted final queue tests passed 23/23 after native JSON binding correction,
+and timer/BullMQ tests passed 11/11. SQL aggregate snapshot completed 992 passed/4
+failed: two disk-exhaustion fixtures and two timezone assertions. Corrected
+targeted reruns passed 6/6 and 2/2; final finite-profile transaction evidence
+compile passed and 18/18 targeted profile/db-scope tests passed with the guard
+unchanged. These corrected checks do not make the failed aggregate green.
+
+The parent-reviewed fixture-only release patch was applied after git apply
+--check; core build passed. It is a release fix, not a Pass B finding. Core's
+request-cache-ssr test timed out in a 646-pass/1-fail/1-skip run; this framework
+request cache test is outside the data layer and is handed to Pass C without
+additional source edits.
 
 ## Neutron framework audit NA-01..NA-14 (2026-10-06, GPT pass — wave-2 fixes)
 

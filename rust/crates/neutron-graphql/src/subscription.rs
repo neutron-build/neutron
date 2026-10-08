@@ -47,9 +47,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::Stream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio_stream::StreamExt;
+use std::time::Duration;
+use tokio_stream::StreamMap;
 
 use crate::request::GraphQlRequest;
 use crate::response::GraphQlResponse;
@@ -126,6 +128,7 @@ fn make_complete(id: &str) -> String {
     .unwrap()
 }
 
+#[cfg(test)]
 fn make_error(id: &str, message: &str) -> String {
     serde_json::to_string(&ServerMessage {
         msg_type: "error",
@@ -158,6 +161,24 @@ where
         let schema = Arc::clone(&schema);
         Box::pin(async move {
             let mut req = req;
+            if !req
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| {
+                    value
+                        .split(',')
+                        .any(|protocol| protocol.trim() == "graphql-transport-ws")
+                })
+                .unwrap_or(false)
+            {
+                return http::Response::builder()
+                    .status(400)
+                    .body(neutron::handler::Body::full(
+                        "graphql-transport-ws subprotocol required",
+                    ))
+                    .unwrap();
+            }
             // Extract the WebSocket upgrade from the request.
             let ws = match WebSocketUpgrade::from_request(&mut req).await {
                 Ok(ws) => ws,
@@ -165,7 +186,7 @@ where
             };
 
             // Negotiate the graphql-ws subprotocol and begin the upgrade.
-            ws.protocols(&["graphql-ws"])
+            ws.protocols(&["graphql-transport-ws"])
                 .on_upgrade(move |socket| async move {
                     run_graphql_ws(socket, schema).await;
                 })
@@ -178,105 +199,123 @@ where
 // ---------------------------------------------------------------------------
 
 /// Drive the `graphql-ws` protocol on an established [`WebSocket`].
-async fn run_graphql_ws<S: SubscriptionSchema>(mut socket: WebSocket, schema: Arc<S>) {
+async fn run_graphql_ws<S: SubscriptionSchema>(socket: WebSocket, schema: Arc<S>) {
+    let stop = socket.shutdown_signal();
+    let (sender, receiver) = socket.split();
+    tokio::pin!(stop);
+    tokio::select! {
+        _ = &mut stop => { close_protocol(&sender, 1001, "Server shutdown").await; }
+        _ = run_session(sender.clone(), receiver, schema) => {}
+    }
+}
+
+type OperationStream = Pin<Box<dyn Stream<Item = Option<GraphQlResponse>> + Send>>;
+
+async fn run_session<S: SubscriptionSchema>(
+    sender: neutron::ws::WsSender,
+    mut receiver: neutron::ws::WsReceiver,
+    schema: Arc<S>,
+) {
     let mut init_done = false;
-
+    let deadline = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(deadline);
+    let mut operations: StreamMap<String, OperationStream> = StreamMap::new();
     loop {
-        let msg = match socket.recv().await {
-            Some(m) => m,
-            None => break, // Connection closed.
-        };
-
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            Message::Ping(d) => {
-                let _ = socket.send(Message::Pong(d)).await;
-                continue;
-            }
-            _ => continue,
-        };
-
-        let client_msg: ClientMessage = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => break, // Malformed message — close.
-        };
-
-        match client_msg.msg_type.as_str() {
-            // Step 1: client initialises the connection.
-            "connection_init" => {
-                init_done = true;
-                if socket.send(Message::Text(make_ack())).await.is_err() {
-                    break;
-                }
-            }
-
-            // Step 2: client starts a subscription.
-            "subscribe" if init_done => {
-                let id = match client_msg.id {
-                    Some(id) => id,
-                    None => continue,
-                };
-                let payload = match client_msg.payload {
-                    Some(p) => p,
-                    None => {
-                        let _ = socket
-                            .send(Message::Text(make_error(&id, "missing payload")))
-                            .await;
-                        continue;
-                    }
-                };
-
-                let gql_req = match parse_subscribe_payload(payload) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = socket.send(Message::Text(make_error(&id, &e))).await;
-                        continue;
-                    }
-                };
-
-                // Stream events to the client.
-                let mut stream = schema.clone().subscribe(gql_req);
-                while let Some(resp) = stream.next().await {
-                    // GraphQlResponse does not derive Serialize; build Value manually.
-                    let mut map = serde_json::Map::new();
-                    if let Some(data) = resp.data {
-                        map.insert("data".to_string(), data);
-                    }
-                    if !resp.errors.is_empty() {
-                        map.insert(
-                            "errors".to_string(),
-                            serde_json::to_value(&resp.errors).unwrap_or(Value::Array(vec![])),
-                        );
-                    }
-                    let payload = Value::Object(map);
-                    if socket
-                        .send(Message::Text(make_next(&id, payload)))
-                        .await
-                        .is_err()
-                    {
-                        return; // Connection dropped mid-stream.
-                    }
-                }
-
-                // Stream ended normally — send complete.
-                let _ = socket.send(Message::Text(make_complete(&id))).await;
-            }
-
-            // Client cancelled a subscription.
-            "complete" => {
-                // In a full multiplexed implementation you would cancel the
-                // specific subscription by id.  For now we just acknowledge.
-            }
-
-            // Protocol violation before init.
-            "subscribe" => {
+        tokio::select! {
+            _ = &mut deadline, if !init_done => {
+                close_protocol(&sender, 4408, "Connection initialisation timeout").await;
                 break;
             }
-
-            // Unknown message type — ignore per spec.
-            _ => {}
+            event = operations.next(), if !operations.is_empty() => {
+                if let Some((id, response)) = event {
+                    let message = if let Some(response) = response {
+                        let mut payload = serde_json::Map::new();
+                        if let Some(data) = response.data { payload.insert("data".into(), data); }
+                        if !response.errors.is_empty() { payload.insert("errors".into(), serde_json::to_value(response.errors).unwrap()); }
+                        make_next(&id, Value::Object(payload))
+                    } else {
+                        operations.remove(&id);
+                        make_complete(&id)
+                    };
+                    if sender.send(Message::Text(message)).await.is_err() { break; }
+                }
+            }
+            msg = receiver.recv() => {
+                let text = match msg {
+                    Some(Message::Text(text)) => text,
+                    Some(Message::Ping(data)) => { if sender.send(Message::Pong(data)).await.is_err() { break; } continue; }
+                    Some(Message::Pong(_)) => continue,
+                    _ => break,
+                };
+                let message: ClientMessage = match serde_json::from_str(&text) {
+                    Ok(message) => message,
+                    Err(_) => { close_protocol(&sender, 4400, "Invalid message").await; break; }
+                };
+                if !valid_client_shape(&message) { close_protocol(&sender, 4400, "Invalid message shape").await; break; }
+                match message.msg_type.as_str() {
+                    "connection_init" => {
+                        if init_done { close_protocol(&sender, 4429, "Too many initialisation requests").await; break; }
+                        init_done = true;
+                        if sender.send(Message::Text(make_ack())).await.is_err() { break; }
+                    }
+                    "ping" => {
+                        let pong = serde_json::to_string(&ServerMessage { msg_type: "pong", id: None, payload: message.payload }).unwrap();
+                        if sender.send(Message::Text(pong)).await.is_err() { break; }
+                    }
+                    "pong" => {}
+                    "subscribe" => {
+                        if !init_done { close_protocol(&sender, 4401, "Unauthorised").await; break; }
+                        let Some(id) = message.id.filter(|id| !id.is_empty()) else { close_protocol(&sender, 4400, "Missing operation ID").await; break; };
+                        if operations.contains_key(&id) { close_protocol(&sender, 4409, "Subscriber already exists").await; break; }
+                        match message.payload.ok_or_else(|| "missing payload".to_string()).and_then(parse_subscribe_payload) {
+                            Ok(req) => {
+                                let stream = schema.clone().subscribe(req).map(Some).chain(futures_util::stream::once(async { None }));
+                                operations.insert(id, Box::pin(stream));
+                            }
+                            Err(_) => { close_protocol(&sender, 4400, "Invalid subscribe payload").await; break; }
+                        }
+                    }
+                    "complete" => {
+                        if let Some(id) = message.id { operations.remove(&id); }
+                        else { close_protocol(&sender, 4400, "Missing operation ID").await; break; }
+                    }
+                    _ => { close_protocol(&sender, 4400, "Invalid message type").await; break; }
+                }
+            }
         }
+    }
+    // Dropping all streams cancels every active operation, including idle ones.
+}
+
+async fn close_protocol(sender: &neutron::ws::WsSender, code: u16, reason: &str) {
+    let _ = sender
+        .send(Message::Close(Some(neutron::ws::CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+fn valid_client_shape(message: &ClientMessage) -> bool {
+    match message.msg_type.as_str() {
+        "connection_init" | "ping" | "pong" => {
+            message.id.is_none()
+                && message
+                    .payload
+                    .as_ref()
+                    .is_none_or(|p| p.is_null() || p.is_object())
+        }
+        "subscribe" => {
+            message.id.as_ref().is_some_and(|id| !id.is_empty())
+                && message
+                    .payload
+                    .as_ref()
+                    .is_some_and(|p| parse_subscribe_payload(p.clone()).is_ok())
+        }
+        "complete" => {
+            message.id.as_ref().is_some_and(|id| !id.is_empty()) && message.payload.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -287,6 +326,19 @@ fn parse_subscribe_payload(payload: Value) -> Result<GraphQlRequest, String> {
         .ok_or("payload.query is required")?
         .to_string();
 
+    if !payload.is_object()
+        || payload
+            .get("variables")
+            .is_some_and(|v| !v.is_null() && !v.is_object())
+        || payload
+            .get("operationName")
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        || payload
+            .get("extensions")
+            .is_some_and(|v| !v.is_null() && !v.is_object())
+    {
+        return Err("invalid subscribe payload shape".into());
+    }
     let operation_name = payload
         .get("operationName")
         .and_then(Value::as_str)
@@ -375,5 +427,18 @@ mod tests {
     fn subscription_schema_trait_is_object_safe() {
         // Verify the trait can be used as a trait object.
         fn _accepts(_: Arc<dyn SubscriptionSchema>) {}
+    }
+
+    #[test]
+    fn protocol_rejects_scalar_init_ping_and_mistyped_subscribe_fields() {
+        for raw in [
+            r#"{"type":"connection_init","payload":1}"#,
+            r#"{"type":"ping","payload":true}"#,
+            r#"{"type":"subscribe","id":"x","payload":{"query":"q","variables":[]}}"#,
+            r#"{"type":"subscribe","id":"x","payload":{"query":"q","operationName":1}}"#,
+        ] {
+            let message: ClientMessage = serde_json::from_str(raw).unwrap();
+            assert!(!valid_client_shape(&message));
+        }
     }
 }

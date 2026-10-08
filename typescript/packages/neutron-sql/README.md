@@ -1807,3 +1807,27 @@ After the grace period, active signals are aborted and drained before
 shutdown rejects and keeps the database open; after those callbacks settle,
 retry shutdown. An injected borrowed driver retains its documented ownership
 and must be closed separately by its owner.
+
+
+Finite Nucleus candidate admission remains separate from PostgreSQL support:
+only the candidate's bounded point-CRUD/transaction SQL is admitted. Its one
+JSON capability probe is settled before taking a guarded pin; this does not
+admit arbitrary probe SQL, catalog migration, cursors, specialty-model isolation
+or PostgreSQL parity. Ordinary PostgreSQL scopes resolve cold capabilities on
+their own pin with savepoint recovery. PostgreSQL driver results do not certify
+an isolated final-source Nucleus engine or an installed publication artifact.
+
+
+The driver-free `@neutron-build/sql/lifecycle` subpath supplies shared ownership,
+all-owner draining, primary/cleanup error retention and operational admission for
+the SQL, Nucleus and data stacks. Their public APIs remain separate. Owned close is
+terminal even when disposal fails; repeat close observes that failure without retry.
+Borrowed wrappers leave the underlying owner in control. Bundled wrappers reject new
+queries/transactions/pins once owned close starts; retained raw driver/native handles
+remain native APIs. No cancellation attempt proves server rollback or bounded
+termination on unsupported engines. `createDatabase({requiredCapabilities})` refuses
+unknown or unsupported guarantees before profile admission and retains startup cleanup
+failures. PG advertises server attempts only when an independent cancellation channel
+is present; injected postgres.js clients default to unknown cancellation, while the
+package's native factory identifies its supported driver. Missing custom metadata is
+unknown. The finite Nucleus execution guard and codec/compiler paths are unchanged.

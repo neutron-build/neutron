@@ -6,7 +6,8 @@
 // bridges neutron-data's CacheClient interface to the KV model's SQL functions.
 // ---------------------------------------------------------------------------
 
-import type { CacheClient } from "./index.js";
+import { counterTTL } from "./counter.js";
+import type { CacheClient, CounterCapabilities } from "./index.js";
 
 /**
  * A KV-like interface matching the subset of @neutron-build/nucleus KVModel
@@ -21,6 +22,12 @@ export interface NucleusKVLike {
   delete(key: string): Promise<boolean>;
   incr(key: string, amount?: number): Promise<number>;
   expire(key: string, seconds: number): Promise<boolean>;
+  /** Atomic canonical-safe-integer validation and increment, before any mutation.
+   * Missing/expired keys start at 1; malformed/unsafe values refuse unchanged. */
+  incrChecked?(key: string): Promise<number>;
+  /** Same checked increment plus initial expiry; preserve existing expiry and
+   * attach one to nonexpiring keys. Unsupported by the bundled KVModel. */
+  incrWithExpiry?(key: string, seconds: number): Promise<number>;
 }
 
 export interface NucleusCacheClientOptions {
@@ -28,22 +35,30 @@ export interface NucleusCacheClientOptions {
   kv: NucleusKVLike;
   /** Key prefix for all cache entries (default `"cache:"`). */
   prefix?: string;
+  /** Native mode supports bundled KV_INCR; it does not validate existing stored
+   * text atomically. Strict mode requires a provider's checked primitive. */
+  counterMode?: 'native' | 'strict';
 }
 
 /**
  * CacheClient implementation backed by Nucleus KV.
  *
- * This is a drop-in replacement for `MemoryCacheClient` or `RedisCacheClient`
- * that stores data directly in Nucleus, avoiding the need for a separate
- * Redis instance.
+ * Stores simple cache operations directly in Nucleus. TTL increments
+ * require a KV implementation exposing the atomic incrWithExpiry primitive;
+ * clients with only separate incr/expire methods fail before mutation.
  */
 export class NucleusCacheClient implements CacheClient {
   private readonly kv: NucleusKVLike;
   private readonly prefix: string;
+  private readonly counterMode: 'native' | 'strict';
+  readonly counterCapabilities: Readonly<CounterCapabilities>;
 
   constructor(options: NucleusCacheClientOptions) {
     this.kv = options.kv;
     this.prefix = options.prefix ?? "cache:";
+    this.counterMode = options.counterMode ?? 'native';
+    if (this.counterMode === 'strict' && !this.kv.incrChecked) throw new Error('Nucleus KV does not expose atomic checked increment');
+    this.counterCapabilities = Object.freeze({ plain: this.counterMode === 'strict' ? 'checked' : 'native', atomicTTL: typeof this.kv.incrWithExpiry === 'function' });
   }
 
   private key(k: string): string {
@@ -64,14 +79,20 @@ export class NucleusCacheClient implements CacheClient {
   }
 
   async incr(key: string, ttlSec?: number): Promise<number> {
+    const ttl = counterTTL(ttlSec);
     const k = this.key(key);
-    const next = await this.kv.incr(k);
-    // TTL anchored at creation, matching RedisCacheClient (expire on the
-    // creating increment only — later increments must not extend it).
-    if (typeof ttlSec === "number" && ttlSec > 0 && next === 1) {
-      await this.kv.expire(k, ttlSec);
+    if (ttl !== undefined) {
+      if (!this.kv.incrWithExpiry) {
+        throw new Error("Nucleus KV does not expose atomic increment-with-expiry; incr(key, ttl) is unsupported by this adapter");
+      }
+      return this.kv.incrWithExpiry(k, ttl);
     }
-    return next;
+    if (this.counterMode === 'strict') return this.kv.incrChecked!(k);
+    const value = await this.kv.incr(k);
+    // This is acknowledgement validation AFTER native mutation, not a claim of
+    // checked storage semantics. An unsafe result requires reconciliation.
+    if (!Number.isSafeInteger(value)) throw new Error('Native counter result is unsafe; increment may have completed, reconcile before retrying');
+    return value;
   }
 }
 

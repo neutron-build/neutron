@@ -159,7 +159,9 @@ test("NP01: the named Nucleus candidate is exact, uncertified and immutable", as
   assert.throws(() => {
     (db as { endpointIdentity?: unknown }).endpointIdentity = undefined;
   }, TypeError);
-  assert.deepEqual(driver.calls.map((c) => c.sql), [STARTUP_SQL, VERSION_SQL]);
+  assert.deepEqual(driver.calls.slice(0, 2).map((c) => c.sql), [STARTUP_SQL, VERSION_SQL]);
+  assert.equal(driver.calls.length, 3, "one capability probe is resolved before guarded pin admission");
+  assert.match(driver.calls[2].sql, /^select to_jsonb\(1\)/);
   assert.equal(db.driver.prepare, undefined);
 });
 
@@ -378,4 +380,17 @@ test("NP01: an operation refused inside an owned transaction rolls the transacti
     driver.pinned.map((c) => (c.sql.startsWith("delete") ? "delete" : c.sql)),
     ["begin", "delete", "rollback"],
   );
+});
+
+
+test("TSD-02: cold finite-profile JSON transaction uses evidence admitted before pinning", async () => {
+  const driver = fakeDriver();
+  const db = await nucleusDb(driver);
+  assert.equal(driver.calls.filter((call) => call.sql.startsWith("select to_jsonb(1)")).length, 1);
+  await db.transaction(async (tx) => {
+    assert.deepEqual(await tx.select().from(docs).where(eq(docs.id, 1n)), []);
+  });
+  assert.equal(driver.calls.filter((call) => call.sql.startsWith("select to_jsonb(1)")).length, 1);
+  assert.ok(!driver.pinned.some((call) => call.sql.startsWith("select to_jsonb(1)")));
+  assert.equal(driver.released, 1);
 });

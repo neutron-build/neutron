@@ -39,10 +39,18 @@ function layoutFor(child: Route, id: string): { layout: Route; chain: (r: Route)
   };
 }
 
-function gateWith(modules: Map<string, RouteModule>, chain: (r: Route) => Route[] = () => []) {
+// Imported JS can expose invalid middleware values. The static gate must reject
+// their presence too, without widening the public route middleware contract.
+type MiddlewareExportFixture = Omit<RouteModule, "middleware"> & { middleware: unknown };
+
+function gateWith(
+  modules: Map<string, RouteModule | MiddlewareExportFixture>,
+  chain: (r: Route) => Route[] = () => []
+) {
   return (staticRoutes: Route[]) =>
     assertStaticRoutesUngated(staticRoutes, {
-      loadRouteModule: async (r) => modules.get(r.id) ?? {},
+      // Model the dynamic-import boundary; the gate never invokes middleware.
+      loadRouteModule: async (r) => (modules.get(r.id) ?? {}) as RouteModule,
       getLayoutChain: chain,
     });
 }
@@ -56,7 +64,10 @@ describe("assertStaticRoutesUngated", () => {
 
   it("rejects a direct middleware export", async () => {
     const r = route("/secret");
-    const gate = gateWith(new Map([[r.id, { default: () => null, middleware: [] }]]));
+    const gate = gateWith(new Map([[r.id, {
+      default: () => null,
+      middleware: async () => new Response("denied", { status: 403 }),
+    }]]));
     await expect(gate([r])).rejects.toThrow(/secret.*exports middleware/s);
   });
 
@@ -87,7 +98,7 @@ describe("assertStaticRoutesUngated", () => {
     const r = route("/undef-gate");
     const module = { default: () => null, middleware: undefined };
     // `export const middleware = undefined` still defines the property.
-    const gate = gateWith(new Map([[r.id, module as unknown as RouteModule]]));
+    const gate = gateWith(new Map([[r.id, module]]));
     await expect(gate([r])).rejects.toThrow(/Cannot prerender/);
   });
 
@@ -107,7 +118,7 @@ describe("assertStaticRoutesUngated", () => {
 
   it("a module without the property at all passes", async () => {
     const r = route("/clean");
-    const gate = gateWith(new Map([[r.id, { default: () => null, loader: () => null }]]));
+    const gate = gateWith(new Map([[r.id, { default: () => null, loader: async () => null }]]));
     await expect(gate([r])).resolves.toBeUndefined();
   });
 

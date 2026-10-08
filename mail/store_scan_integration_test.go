@@ -225,6 +225,10 @@ func TestIntegrationMigrationConvergesPreLedgerDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS mail_graph_id_map`,
+		`DROP TABLE IF EXISTS mail_graph_identity`,
+		`DROP TABLE IF EXISTS mail_identity_aliases`,
+		`ALTER TABLE mail_messages DROP COLUMN attachment_presence`,
 		`DROP TABLE IF EXISTS mirror_scans`,
 		`DROP TABLE IF EXISTS mirror_scan_seen`,
 		`ALTER TABLE mail_bodies DROP CONSTRAINT IF EXISTS mail_bodies_message_fk`,
@@ -259,15 +263,52 @@ func TestIntegrationMigrationConvergesPreLedgerDatabase(t *testing.T) {
 		t.Errorf("convergence lost data: %d messages, want 2", n)
 	}
 
+	// A foreign schema must neither inflate nor satisfy these assertions.
+	if _, err := s.pool.Exec(ctx, `CREATE SCHEMA mail_constraint_shadow`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.pool.Exec(ctx, `DROP SCHEMA IF EXISTS mail_constraint_shadow CASCADE`) })
+	for _, stmt := range []string{
+		`CREATE TABLE mail_constraint_shadow.mail_messages(account_id TEXT,id TEXT,PRIMARY KEY(account_id,id))`,
+		`CREATE TABLE mail_constraint_shadow.mail_bodies(account_id TEXT,message_id TEXT,CONSTRAINT mail_bodies_message_fk FOREIGN KEY(account_id,message_id) REFERENCES mail_constraint_shadow.mail_messages(account_id,id) ON DELETE CASCADE)`,
+		`CREATE TABLE mail_constraint_shadow.mail_message_mailboxes(account_id TEXT,message_id TEXT,CONSTRAINT mail_membership_message_fk FOREIGN KEY(account_id,message_id) REFERENCES mail_constraint_shadow.mail_messages(account_id,id) ON DELETE CASCADE)`,
+	} {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	query := `SELECT COUNT(*) FROM pg_constraint
+ WHERE ((conname='mail_bodies_message_fk' AND conrelid='mail_bodies'::regclass)
+ OR (conname='mail_membership_message_fk' AND conrelid='mail_message_mailboxes'::regclass))
+ AND confrelid='mail_messages'::regclass AND contype='f' AND confdeltype='c'
+ AND conkey=ARRAY[1,2]::smallint[] AND confkey=ARRAY[1,2]::smallint[] AND convalidated`
 	var constraints int
-	if err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM pg_constraint
-		 WHERE conname IN ('mail_bodies_message_fk','mail_membership_message_fk')
-		   AND convalidated`).Scan(&constraints); err != nil {
+	if err := s.pool.QueryRow(ctx, query).Scan(&constraints); err != nil {
 		t.Fatal(err)
 	}
 	if constraints != 2 {
-		t.Errorf("validated constraints = %d, want 2", constraints)
+		t.Fatalf("target validated FKs=%d, want 2 regardless of foreign schema", constraints)
+	}
+	// Drop a target FK inside a rollback-only transaction: foreign copies cannot
+	// conceal the missing target or make a deficient mirror appear valid.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE mail_bodies DROP CONSTRAINT mail_bodies_message_fk`); err != nil {
+		tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(ctx, query).Scan(&constraints); err != nil {
+		tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if constraints != 1 {
+		tx.Rollback(ctx)
+		t.Fatalf("foreign schema masked missing target FK: %d", constraints)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 
 	// A second run is a no-op, and a modified applied migration refuses

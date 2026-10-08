@@ -10,6 +10,7 @@ export { createDrizzleDatabase } from "./db/drizzle.js";
 export type {
   DrizzleDatabase,
   DrizzleDatabaseOptions,
+  NucleusCompanion,
   PostgresDrizzleDatabase,
   SqliteDrizzleDatabase,
   TypedDrizzleOptions,

@@ -192,14 +192,14 @@ fn create_worker_listeners(
         Domain::IPV4
     };
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // Linux / macOS: create N independent sockets with SO_REUSEPORT.
+        // Linux / Android: create N independent sockets with SO_REUSEPORT.
         let mut listeners = Vec::with_capacity(n);
         for _ in 0..n {
             let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
             sock.set_reuse_address(true)?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             sock.set_reuse_port(true)?;
             sock.set_nonblocking(true)?;
             sock.bind(&addr.into())?;
@@ -209,9 +209,9 @@ fn create_worker_listeners(
         Ok(listeners)
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // Windows lacks SO_REUSEPORT: create one socket and try_clone() N-1
+        // This platform lacks SO_REUSEPORT: create one socket and try_clone() N-1
         // times.  Each worker gets its own handle to the same accept queue; the
         // OS distributes concurrent accept() calls across handles.
         let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
@@ -241,6 +241,8 @@ async fn worker_accept_loop(
     tcp_config: TcpConfig,
     max_body_size: usize,
     mut stop_rx: tokio::sync::broadcast::Receiver<()>,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    shutdown_timeout: Duration,
 ) {
     let listener = match TcpListener::from_std(listener_std) {
         Ok(l) => l,
@@ -250,10 +252,22 @@ async fn worker_accept_loop(
         }
     };
 
+    #[cfg(feature = "ws")]
+    let upgrade_tasks = crate::task_tracker::UpgradeTasks::new();
+    #[cfg(feature = "ws")]
+    let _upgrade_scope = upgrade_tasks.scope();
+    #[cfg(feature = "ws")]
+    let chain = crate::task_tracker::attach(chain, upgrade_tasks.clone());
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
+        let mut conn_stop = stop_rx.resubscribe();
         let (stream, remote_addr) = tokio::select! {
             biased;
-            _ = stop_rx.recv() => break,
+            _ = stop_rx.recv() => {
+                #[cfg(feature = "ws")] upgrade_tasks.stop();
+                break;
+            },
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
             res = listener.accept() => match res {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -271,11 +285,20 @@ async fn worker_accept_loop(
             let _ = sock_ref.set_tcp_keepalive(&keepalive);
         }
 
+        let permit = if let Some(ref sem) = semaphore {
+            match sem.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
         let chain = Arc::clone(&chain);
         let state_conn = Arc::clone(&state_map);
         let h2_config = http2_config.clone();
 
-        tokio::spawn(async move {
+        tasks.spawn(async move {
+            let _permit = permit;
             let service = service_fn(move |mut req: http::Request<Incoming>| {
                 let chain = Arc::clone(&chain);
                 let state = Arc::clone(&state_conn);
@@ -297,9 +320,14 @@ async fn worker_accept_loop(
                     // P1.2: pass the body through as a lazy stream — no pre-collect.
                     // The Content-Length early-413 above is kept; the per-frame
                     // ceiling in collect_body enforces the limit for chunked bodies.
-                    let boxed: crate::handler::ReqBody = Box::pin(
+                    let raw: crate::handler::ReqBody = Box::pin(
                         body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
                     );
+                    // Transport-level ceiling (RS-05): the configured
+                    // max_body_size applies to EVERY consumer — including
+                    // chunked bodies (no Content-Length to pre-check) and
+                    // streaming handlers — with breaches classified as 413.
+                    let boxed = crate::handler::limit_body_stream(raw, body_limit);
 
                     let mut neutron_req = crate::handler::Request::with_streaming_state(
                         parts.method,
@@ -323,10 +351,36 @@ async fn worker_accept_loop(
                 apply_http2_config(&mut builder, config);
             }
             let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
-            if let Err(e) = conn.await {
-                tracing::error!("Worker connection error: {e}");
+            tokio::pin!(conn);
+            tokio::select! {
+                result = conn.as_mut() => { if let Err(e) = result { tracing::debug!("Worker connection error: {e}"); } }
+                _ = conn_stop.recv() => { conn.as_mut().graceful_shutdown(); let _ = conn.await; }
             }
         });
+    }
+    drop(listener);
+    #[cfg(feature = "ws")]
+    {
+        let end = tokio::time::Instant::now() + shutdown_timeout;
+        tokio::join!(
+            drain_connections(&mut tasks, shutdown_timeout),
+            upgrade_tasks.drain(end)
+        );
+    }
+    #[cfg(not(feature = "ws"))]
+    drain_connections(&mut tasks, shutdown_timeout).await;
+}
+
+async fn drain_connections(tasks: &mut tokio::task::JoinSet<()>, timeout: Duration) {
+    if tokio::time::timeout(timeout, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("Connection drain deadline exceeded; aborting owned tasks");
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
 }
 
@@ -394,9 +448,9 @@ impl Neutron {
         self
     }
 
-    /// Register a pre-shutdown hook (async closure).
+    /// Register a shutdown hook (async closure).
     ///
-    /// Hooks run in order after the shutdown signal is received but before
+    /// Hooks run in reverse registration order after active connections drain, before
     /// active connections begin draining. Use them for cleanup tasks like
     /// flushing metrics, closing database pools, or notifying services.
     ///
@@ -541,6 +595,12 @@ impl Neutron {
         // `tower::Service` impl uses — one compiled chain, one state map.
         let service = self.router.into_service();
         let chain = service.dispatch_chain();
+        #[cfg(feature = "ws")]
+        let upgrade_tasks = crate::task_tracker::UpgradeTasks::new();
+        #[cfg(feature = "ws")]
+        let _upgrade_scope = upgrade_tasks.scope();
+        #[cfg(feature = "ws")]
+        let chain = crate::task_tracker::attach(chain, upgrade_tasks.clone());
         let state_map = service.state();
 
         // Connection limit semaphore
@@ -567,9 +627,17 @@ impl Neutron {
                 })
             };
 
+        let mut tasks = tokio::task::JoinSet::new();
         // Accept loop
         loop {
             tokio::select! {
+                biased;
+                _ = &mut shutdown_signal => {
+                    #[cfg(feature = "ws")] upgrade_tasks.stop();
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
                 result = listener.accept() => {
                     let (stream, remote_addr) = result?;
 
@@ -603,7 +671,7 @@ impl Neutron {
 
                     active.fetch_add(1, Ordering::Relaxed);
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         // Hold permit for lifetime of the connection
                         let _permit = permit;
 
@@ -639,11 +707,15 @@ impl Neutron {
                                 // pre-collect. The Content-Length early-413 above is
                                 // kept; the per-frame ceiling in collect_body enforces
                                 // the limit for chunked bodies.
-                                let boxed: crate::handler::ReqBody =
+                                let raw: crate::handler::ReqBody =
                                     Box::pin(body.map_err(|e| {
                                         Box::new(e)
                                             as Box<dyn std::error::Error + Send + Sync>
                                     }));
+                                // RS-05: transport ceiling for chunked /
+                                // length-less bodies (see worker path note).
+                                let boxed =
+                                    crate::handler::limit_body_stream(raw, body_limit);
 
                                 let mut neutron_req = NeutronRequest::with_streaming_state(
                                     parts.method,
@@ -694,37 +766,22 @@ impl Neutron {
                         active.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
-                _ = &mut shutdown_signal => {
-                    let count = active_count.load(Ordering::Relaxed);
-                    tracing::info!("Shutdown signal received, draining {count} connection(s)...");
-
-                    // Run shutdown hooks
-                    for hook in shutdown_hooks {
-                        hook().await;
-                    }
-
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
             }
         }
 
-        // Wait for active connections to drain
-        if active_count.load(Ordering::Relaxed) > 0 {
-            let drain_result = tokio::time::timeout(shutdown_timeout, async {
-                while active_count.load(Ordering::Relaxed) > 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await;
-
-            if drain_result.is_err() {
-                let remaining = active_count.load(Ordering::Relaxed);
-                tracing::warn!(
-                    "Drain timeout ({:.0}s): {remaining} connection(s) still active",
-                    shutdown_timeout.as_secs_f64()
-                );
-            }
+        drop(listener);
+        #[cfg(feature = "ws")]
+        {
+            let end = tokio::time::Instant::now() + shutdown_timeout;
+            tokio::join!(
+                drain_connections(&mut tasks, shutdown_timeout),
+                upgrade_tasks.drain(end)
+            );
+        }
+        #[cfg(not(feature = "ws"))]
+        drain_connections(&mut tasks, shutdown_timeout).await;
+        for hook in shutdown_hooks.into_iter().rev() {
+            hook().await;
         }
 
         tracing::info!("Server stopped");
@@ -742,6 +799,10 @@ impl Neutron {
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let n = self.worker_threads;
+        let semaphore = self
+            .max_connections
+            .map(|max| Arc::new(tokio::sync::Semaphore::new(max)));
+        let shutdown_timeout = self.shutdown_timeout;
         tracing::info!("Neutron listening on http://{addr} ({n} worker threads)");
 
         // P1.3: single dispatch path shared with the `tower::Service` impl.
@@ -774,6 +835,7 @@ impl Neutron {
             let h2_config = http2_config.clone();
             let tcp_cfg = tcp_config.clone();
             let stop_rx = stop_tx.subscribe();
+            let semaphore = semaphore.clone();
 
             let handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -789,6 +851,8 @@ impl Neutron {
                     tcp_cfg,
                     max_body_size,
                     stop_rx,
+                    semaphore,
+                    shutdown_timeout,
                 ));
             });
             thread_handles.push(handle);
@@ -801,20 +865,16 @@ impl Neutron {
             default_shutdown_signal().await;
         }
 
-        // Run shutdown hooks.
-        for hook in self.shutdown_hooks {
-            hook().await;
-        }
-
-        // Signal all workers to stop.
         let _ = stop_tx.send(());
-
-        // Join worker threads (without blocking the tokio runtime).
-        tokio::task::block_in_place(|| {
+        tokio::task::spawn_blocking(move || {
             for handle in thread_handles {
                 let _ = handle.join();
             }
-        });
+        })
+        .await?;
+        for hook in self.shutdown_hooks.into_iter().rev() {
+            hook().await;
+        }
 
         tracing::info!("Server stopped");
         Ok(())
@@ -846,6 +906,12 @@ impl Neutron {
         // P1.3: single dispatch path shared with the `tower::Service` impl.
         let service = self.router.into_service();
         let chain = service.dispatch_chain();
+        #[cfg(feature = "ws")]
+        let upgrade_tasks = crate::task_tracker::UpgradeTasks::new();
+        #[cfg(feature = "ws")]
+        let _upgrade_scope = upgrade_tasks.scope();
+        #[cfg(feature = "ws")]
+        let chain = crate::task_tracker::attach(chain, upgrade_tasks.clone());
         let state_map = service.state();
 
         let conn_semaphore = self
@@ -869,8 +935,16 @@ impl Neutron {
                 })
             };
 
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                biased;
+                _ = &mut shutdown_signal => {
+                    #[cfg(feature = "ws")] upgrade_tasks.stop();
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
                 result = listener.accept() => {
                     let (stream, remote_addr) = result?;
 
@@ -903,13 +977,16 @@ impl Neutron {
 
                     active.fetch_add(1, Ordering::Relaxed);
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let _permit = permit;
                         // TLS handshake
-                        let tls_stream = match acceptor.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::debug!("TLS handshake failed: {e}");
+                        let tls_stream = match tokio::select! {
+                            _ = conn_shutdown_rx.changed() => { active.fetch_sub(1, Ordering::Relaxed); return; }
+                            result = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)) => result,
+                        } {
+                            Ok(Ok(s)) => s,
+                            error => {
+                                tracing::debug!("TLS handshake failed or timed out: {error:?}");
                                 active.fetch_sub(1, Ordering::Relaxed);
                                 return;
                             }
@@ -940,11 +1017,15 @@ impl Neutron {
                                 let (parts, body) = req.into_parts();
 
                                 // P1.2: lazy streaming body, no pre-collect (TLS path).
-                                let boxed: crate::handler::ReqBody =
+                                let raw: crate::handler::ReqBody =
                                     Box::pin(body.map_err(|e| {
                                         Box::new(e)
                                             as Box<dyn std::error::Error + Send + Sync>
                                     }));
+                                // RS-05: transport ceiling for chunked /
+                                // length-less bodies (see worker path note).
+                                let boxed =
+                                    crate::handler::limit_body_stream(raw, body_limit);
 
                                 let mut neutron_req = NeutronRequest::with_streaming_state(
                                     parts.method,
@@ -993,36 +1074,22 @@ impl Neutron {
                         active.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
-                _ = &mut shutdown_signal => {
-                    let count = active_count.load(Ordering::Relaxed);
-                    tracing::info!("Shutdown signal received, draining {count} connection(s)...");
-
-                    // Run shutdown hooks
-                    for hook in shutdown_hooks {
-                        hook().await;
-                    }
-
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
             }
         }
 
-        if active_count.load(Ordering::Relaxed) > 0 {
-            let drain_result = tokio::time::timeout(shutdown_timeout, async {
-                while active_count.load(Ordering::Relaxed) > 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await;
-
-            if drain_result.is_err() {
-                let remaining = active_count.load(Ordering::Relaxed);
-                tracing::warn!(
-                    "Drain timeout ({:.0}s): {remaining} connection(s) still active",
-                    shutdown_timeout.as_secs_f64()
-                );
-            }
+        drop(listener);
+        #[cfg(feature = "ws")]
+        {
+            let end = tokio::time::Instant::now() + shutdown_timeout;
+            tokio::join!(
+                drain_connections(&mut tasks, shutdown_timeout),
+                upgrade_tasks.drain(end)
+            );
+        }
+        #[cfg(not(feature = "ws"))]
+        drain_connections(&mut tasks, shutdown_timeout).await;
+        for hook in shutdown_hooks.into_iter().rev() {
+            hook().await;
         }
 
         tracing::info!("Server stopped");
@@ -1061,7 +1128,7 @@ impl Neutron {
         addr: SocketAddr,
         tls_config: TlsConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use crate::http3_server::{serve_h3, Http3Config};
+        use crate::http3_server::{serve_h3_with_shutdown, Http3Config};
 
         // P1.3: single dispatch path shared with the `tower::Service` impl.
         let service = self.router.into_service();
@@ -1072,7 +1139,23 @@ impl Neutron {
             max_body_size: self.max_body_size,
         };
 
-        serve_h3(addr, chain, state_map, tls_config, h3_cfg).await?;
+        let signal = self
+            .custom_shutdown
+            .unwrap_or_else(|| Box::pin(default_shutdown_signal()));
+        serve_h3_with_shutdown(
+            addr,
+            chain,
+            state_map,
+            tls_config,
+            h3_cfg,
+            signal,
+            self.shutdown_timeout,
+            self.max_connections,
+        )
+        .await?;
+        for hook in self.shutdown_hooks.into_iter().rev() {
+            hook().await;
+        }
         Ok(())
     }
 }

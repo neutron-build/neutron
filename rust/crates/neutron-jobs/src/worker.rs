@@ -125,12 +125,61 @@ impl JobWorker {
         let active = self.active;
         let store: Option<Arc<dyn JobStore>> = self.store;
 
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut queue_cursor = 0usize;
+        let mut next_recovery = tokio::time::Instant::now();
         loop {
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "job task terminated before completion");
+                }
+            }
+            // Acquire capacity before claiming: jobs never wait behind busy handlers.
+            let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+            if let Some(ref backend) = store {
+                if tokio::time::Instant::now() >= next_recovery {
+                    let stale_secs = queue.stale_secs.load(Ordering::Relaxed);
+                    if let Err(error) = backend.recover_stale(stale_secs).await {
+                        tracing::warn!(%error, "job recovery failed; retrying");
+                    }
+                    next_recovery = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                }
+                let names: Vec<_> = queue
+                    .persistent_queues
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect();
+                for offset in 0..names.len() {
+                    let index = (queue_cursor + offset) % names.len();
+                    match backend.claim_due(&names[index], 1).await {
+                        Ok(jobs) if !jobs.is_empty() => {
+                            for job in jobs {
+                                queue.enqueue_stored(job);
+                            }
+                            queue_cursor = (index + 1) % names.len();
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(%error, "job admission failed; retrying"),
+                    }
+                }
+            }
             if let Some(job) = queue.try_dequeue() {
+                if store.is_some() && job.claim_token == 0 {
+                    tracing::warn!(
+                        job_id = job.id,
+                        "unclaimed local job rejected by persistent worker"
+                    );
+                    continue;
+                }
                 let Some(handler) = handlers.get(&job.job_type).cloned() else {
                     tracing::warn!(job_type = %job.job_type, "no handler registered — dropping job");
                     if let Some(ref s) = store {
-                        let _ = s.mark_failed(job.id, "no handler registered").await;
+                        let _ = s
+                            .mark_failed(job.id, job.claim_token, "no handler registered")
+                            .await;
                     }
                     continue;
                 };
@@ -139,22 +188,16 @@ impl JobWorker {
                 let queue_clone = Arc::clone(&queue);
                 let active_clone = Arc::clone(&active);
                 let store_clone = store.clone();
-                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
 
                 active.fetch_add(1, Ordering::Release);
-                tokio::spawn(async move {
+                let active_guard = ActiveJob(active_clone);
+                tasks.spawn(async move {
                     let _permit = permit;
-                    execute_job(
-                        job,
-                        handler,
-                        state_clone,
-                        queue_clone,
-                        store_clone,
-                        active_clone,
-                    )
-                    .await;
+                    let _active_guard = active_guard;
+                    execute_job(job, handler, state_clone, queue_clone, store_clone).await;
                 });
             } else {
+                drop(permit);
                 // No ready job — wait for a new one or poll again shortly
                 tokio::select! {
                     _ = queue.wait() => {}
@@ -169,13 +212,19 @@ impl JobWorker {
 // Internal: execute one job
 // ---------------------------------------------------------------------------
 
+struct ActiveJob(Arc<AtomicUsize>);
+impl Drop for ActiveJob {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 async fn execute_job(
     job: QueuedJob,
     handler: BoxedJobFn,
     state: Arc<StateMap>,
     queue: Arc<JobQueue>,
     store: Option<Arc<dyn JobStore>>,
-    active: Arc<AtomicUsize>,
 ) {
     let ctx = JobContext {
         job_id: job.id.to_string(),
@@ -203,7 +252,7 @@ async fn execute_job(
         JobOutcome::Completed => {
             tracing::debug!(job_id = %job.id, job_type = %job.job_type, "job completed");
             if let Some(ref s) = store {
-                if let Err(e) = s.mark_completed(job.id).await {
+                if let Err(e) = s.mark_completed(job.id, job.claim_token).await {
                     tracing::warn!(job_id = %job.id, "store mark_completed failed: {e}");
                 }
             }
@@ -220,15 +269,23 @@ async fn execute_job(
                     "scheduling retry"
                 );
                 if let Some(ref s) = store {
-                    if let Err(e) = s.schedule_retry(job.id, next_attempt, run_at_ms).await {
+                    if let Err(e) = s
+                        .schedule_retry(job.id, job.claim_token, next_attempt, run_at_ms)
+                        .await
+                    {
                         tracing::warn!(job_id = %job.id, "store schedule_retry failed: {e}");
                     }
                 }
-                queue.reenqueue(job, delay);
+                if store.is_none() {
+                    queue.reenqueue(job, delay);
+                }
             } else {
                 tracing::warn!(job_id = %job.id, "job exhausted all retries");
                 if let Some(ref s) = store {
-                    if let Err(e) = s.mark_failed(job.id, "max retries exceeded").await {
+                    if let Err(e) = s
+                        .mark_failed(job.id, job.claim_token, "max retries exceeded")
+                        .await
+                    {
                         tracing::warn!(job_id = %job.id, "store mark_failed failed: {e}");
                     }
                 }
@@ -237,13 +294,15 @@ async fn execute_job(
         JobOutcome::Failed => {
             tracing::error!(job_id = %job.id, job_type = %job.job_type, "job failed permanently");
             if let Some(ref s) = store {
-                if let Err(e) = s.mark_failed(job.id, "permanent failure").await {
+                if let Err(e) = s
+                    .mark_failed(job.id, job.claim_token, "permanent failure")
+                    .await
+                {
                     tracing::warn!(job_id = %job.id, "store mark_failed failed: {e}");
                 }
             }
         }
     }
-    active.fetch_sub(1, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

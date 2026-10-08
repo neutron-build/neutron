@@ -14,6 +14,9 @@
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
     pub client_id: String,
+    pub provider: String,
+    pub subject_field: String,
+    pub numeric_subject: bool,
     pub client_secret: String,
     /// Provider's authorization endpoint (browser redirect target).
     pub auth_url: String,
@@ -33,6 +36,9 @@ impl OAuthConfig {
     pub fn new(auth_url: impl Into<String>, token_url: impl Into<String>) -> Self {
         Self {
             client_id: String::new(),
+            provider: String::new(),
+            subject_field: "sub".into(),
+            numeric_subject: false,
             client_secret: String::new(),
             auth_url: auth_url.into(),
             token_url: token_url.into(),
@@ -41,6 +47,19 @@ impl OAuthConfig {
             scopes: Vec::new(),
             secret: Vec::new(),
         }
+    }
+
+    /// Stable namespace and the genuine subject field; numeric IDs require opt-in.
+    pub fn identity(
+        mut self,
+        provider: impl Into<String>,
+        field: impl Into<String>,
+        numeric: bool,
+    ) -> Self {
+        self.provider = provider.into();
+        self.subject_field = field.into();
+        self.numeric_subject = numeric;
+        self
     }
 
     pub fn client_id(mut self, id: impl Into<String>) -> Self {
@@ -112,11 +131,19 @@ pub struct OAuthProvider;
 
 impl OAuthProvider {
     /// GitHub — default scopes: `read:user user:email`
+    ///
+    /// The preset configures GitHub's verified user endpoint
+    /// (`https://api.github.com/user`) so `fetch_userinfo` always obtains the
+    /// provider's numeric identity. Without it the old fallback derived a fake
+    /// subject from the first 16 characters of the access token, which is the
+    /// shared JWT/token header — distinct users collapsed onto one id.
     pub fn github() -> OAuthConfig {
         OAuthConfig::new(
             "https://github.com/login/oauth/authorize",
             "https://github.com/login/oauth/access_token",
         )
+        .identity("https://github.com", "id", true)
+        .userinfo_url("https://api.github.com/user")
         .scopes(["read:user", "user:email"])
     }
 
@@ -126,6 +153,7 @@ impl OAuthProvider {
             "https://accounts.google.com/o/oauth2/v2/auth",
             "https://oauth2.googleapis.com/token",
         )
+        .identity("https://accounts.google.com", "sub", false)
         .userinfo_url("https://openidconnect.googleapis.com/v1/userinfo")
         .scopes(["openid", "profile", "email"])
     }
@@ -136,6 +164,7 @@ impl OAuthProvider {
             "https://discord.com/api/oauth2/authorize",
             "https://discord.com/api/oauth2/token",
         )
+        .identity("https://discord.com", "id", false)
         .userinfo_url("https://discord.com/api/users/@me")
         .scopes(["identify", "email"])
     }
@@ -183,6 +212,19 @@ mod tests {
         let cfg = OAuthProvider::google();
         assert!(cfg.userinfo_url.is_some());
         assert!(cfg.scopes.contains(&"openid".to_string()));
+    }
+
+    /// Regression (RS-15): every built-in preset must expose a real userinfo
+    /// endpoint — GitHub previously shipped without one, so login fell back
+    /// to deriving a fake subject from the access-token prefix.
+    #[test]
+    fn all_presets_have_userinfo_url() {
+        assert_eq!(
+            OAuthProvider::github().userinfo_url.as_deref(),
+            Some("https://api.github.com/user")
+        );
+        assert!(OAuthProvider::google().userinfo_url.is_some());
+        assert!(OAuthProvider::discord().userinfo_url.is_some());
     }
 
     #[test]

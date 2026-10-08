@@ -418,7 +418,12 @@ func toEnvelope(m *gmail.Message) mail.Envelope {
 				}
 			}
 		}
+		// Envelope requests use metadata: omission of parts proves nothing.
 		env.HasAttachment = payloadHasAttachment(m.Payload)
+		env.AttachmentPresence = mail.AttachmentUnknown
+		if env.HasAttachment {
+			env.AttachmentPresence = mail.AttachmentPresent
+		}
 	}
 
 	env.Fingerprint = mail.ComputeFingerprint(&env)
@@ -475,6 +480,9 @@ func (a *Adapter) Body(ctx context.Context, id mail.MessageID) (*mail.Body, erro
 		return nil, classify(err)
 	}
 
+	if m.Payload == nil {
+		return nil, errors.New("gmail: full message omitted MIME payload")
+	}
 	body := &mail.Body{MessageID: id}
 	if m.Payload != nil {
 		if err := a.collectParts(ctx, nativeID(id), m.Payload, body); err != nil {

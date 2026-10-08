@@ -3,6 +3,8 @@ type Subscriber = (payload: unknown) => void;
 export interface RealtimeBus {
   publish(channel: string, payload: unknown): Promise<void>;
   subscribe(channel: string, subscriber: Subscriber): () => void;
+  /** Resolves after backend subscription acknowledgement. Optional for legacy buses. */
+  subscribeAsync?(channel: string, subscriber: Subscriber): Promise<() => void>;
 }
 
 export class InMemoryRealtimeBus implements RealtimeBus {
@@ -27,6 +29,10 @@ export class InMemoryRealtimeBus implements RealtimeBus {
         );
       }
     }
+  }
+
+  async subscribeAsync(channel: string, subscriber: Subscriber): Promise<() => void> {
+    return this.subscribe(channel, subscriber);
   }
 
   subscribe(channel: string, subscriber: Subscriber): () => void {

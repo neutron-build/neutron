@@ -133,10 +133,11 @@ type routeRecord struct {
 	Untyped bool
 }
 
-// RouteOption customizes per-route metadata (used for OpenAPI).
+// RouteOption customizes typed request binding and per-route metadata.
 type RouteOption func(*routeOptions)
 
 type routeOptions struct {
+	BodyLimit   int64
 	Summary     string
 	Description string
 	Tags        []string
@@ -503,4 +504,11 @@ func extractPathParams(pattern string) []string {
 		}
 	}
 	return params
+}
+
+// WithBodyLimit sets the total typed request-body ceiling for this route.
+// Nonpositive values use DefaultBodyLimit. Middleware may impose a smaller
+// ceiling. Raw Handle routes retain responsibility for their own admission.
+func WithBodyLimit(maxBytes int64) RouteOption {
+	return func(o *routeOptions) { o.BodyLimit = maxBytes }
 }

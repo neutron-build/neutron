@@ -12,6 +12,7 @@ export {
 export {
   type DrizzleDatabase,
   type DrizzleDatabaseOptions,
+  type NucleusCompanion,
 } from "./db/types.js";
 import { createDrizzleDatabase as createDrizzleDatabaseImpl } from "./db/drizzle.js";
 import type { DrizzleDatabase, DrizzleDatabaseOptions } from "./db/types.js";
@@ -30,6 +31,7 @@ export const createDrizzleDatabase: (
 export {
   MemoryCacheClient,
   type CacheClient,
+  type CounterCapabilities,
 } from "./cache/index.js";
 export {
   RedisCacheClient,
@@ -64,7 +66,9 @@ export {
 
 export {
   InMemoryQueueDriver,
+  admitQueue,
   type QueueDriver,
+  type QueueCapabilities,
   type Job,
   type JobHandler,
   type DeadLetter,

@@ -328,3 +328,93 @@ test("conformance 5: an always-failing job dead-letters at max_attempts with las
   await raw.end();
   await driver.close();
 });
+
+test("TSD-03: only executing slots are leased; later jobs remain available to another worker", { timeout: 10000 }, async (t) => {
+  if (!(await pgReachable())) return t.skip("Postgres unavailable");
+  const queue = uniqueQueue();
+  const a = await createPostgresQueueDriver({ url: PG_URL, queueName: queue, batchSize: 2, pollIntervalMs: 20, leaseMs: 300 });
+  const b = await createPostgresQueueDriver({ url: PG_URL, queueName: queue, batchSize: 2, pollIntervalMs: 20, leaseMs: 300 });
+  const raw = await openRaw();
+  let finish!: () => void;
+  let running = false;
+  let secondRuns = 0;
+  try {
+    await a.add("task", { slow: true });
+    await a.add("task", { slow: false });
+    await a.process<{ slow: boolean }>("task", (job) => {
+      if (job.payload.slow) { running = true; return new Promise<void>((r) => { finish = r; }); }
+      secondRuns++;
+    });
+    await waitFor(async () => running, 1000, "slow A handler");
+    await b.process<{ slow: boolean }>("task", (job) => { assert.equal(job.payload.slow, false); secondRuns++; });
+    await sleep(700);
+    assert.equal(secondRuns, 1);
+    finish();
+    await waitFor(async () => (await raw.unsafe("select id from neutron_jobs where queue = $1 and status = 'done'", [queue])).length === 2, 1000, "both acknowledgements");
+    assert.equal(secondRuns, 1);
+  } finally {
+    finish?.(); await a.close(); await b.close();
+    await raw.unsafe("delete from neutron_jobs where queue = $1", [queue]); await raw.end();
+  }
+});
+
+for (const outcome of ["success", "retry", "dead"] as const) {
+  test(`TSD-03: stale ${outcome} cannot overwrite a newer claim with the same workerId`, { timeout: 10000 }, async (t) => {
+    if (!(await pgReachable())) return t.skip("Postgres unavailable");
+    const queue = uniqueQueue();
+    const losses: unknown[] = [];
+    const a = await createPostgresQueueDriver({ url: PG_URL, queueName: queue, workerId: "reused", pollIntervalMs: 20, leaseMs: 6000, maxAttempts: outcome === "dead" ? 1 : 5, onLeaseLost: (_id, error) => losses.push(error) });
+    const b = await createPostgresQueueDriver({ url: PG_URL, queueName: queue, workerId: "reused", pollIntervalMs: 20, leaseMs: 300 });
+    const raw = await openRaw();
+    let finishA!: () => void; let finishB!: () => void;
+    let runningA = false; let runningB = false;
+    let signal: AbortSignal | undefined;
+    try {
+      const job = await a.add("task", {});
+      await a.process("task", async (claimed) => {
+        signal = claimed.signal; runningA = true;
+        await new Promise<void>((r) => { finishA = r; });
+        if (outcome !== "success") throw new Error("old worker failure");
+      });
+      await waitFor(async () => runningA, 1000, "A claim");
+      await raw.unsafe("update neutron_jobs set locked_at = now() - interval '1 minute' where id = $1", [job.id]);
+      await b.process("task", async () => { runningB = true; await new Promise<void>((r) => { finishB = r; }); });
+      await waitFor(async () => runningB, 1000, "B reclaim");
+      finishA();
+      await waitFor(async () => losses.length === 1, 1000, "fenced A acknowledgement");
+      const rows = await raw.unsafe("select status, locked_by, attempts from neutron_jobs where id = $1", [job.id]);
+      assert.equal(rows[0].status, "active"); assert.equal(rows[0].locked_by, "reused"); assert.equal(rows[0].attempts, 2);
+      assert.equal(signal?.aborted, true);
+      finishB();
+      await waitFor(async () => (await raw.unsafe("select status from neutron_jobs where id = $1", [job.id]))[0].status === "done", 1000, "B acknowledgement");
+    } finally {
+      finishA?.(); finishB?.(); await a.close(); await b.close();
+      await raw.unsafe("delete from neutron_jobs where queue = $1", [queue]); await raw.end();
+    }
+  });
+}
+
+test("queue JSON payloads round-trip as values including JSON null, strings and arrays", { timeout: 10000 }, async (t) => {
+  if (!(await pgReachable())) return t.skip("Postgres unavailable");
+  const queue = uniqueQueue();
+  const driver = await createPostgresQueueDriver({ url: PG_URL, queueName: queue, pollIntervalMs: 20 });
+  const raw = await openRaw();
+  const values = [null, { ready: true }, [1, "x"], "hello", 17, true];
+  let scheduled = false;
+  try {
+    for (const value of values) {
+      const job = await driver.add("roundtrip", value);
+      const rows = await raw.unsafe("select payload from neutron_jobs where id = $1", [job.id]);
+      assert.deepEqual(rows[0].payload, value);
+    }
+    await driver.schedule("null-schedule", "0 * * * *", null);
+    await raw.unsafe("update neutron_schedules set next_run_at = now() - interval '1 minute' where queue = $1", [queue]);
+    await driver.process("null-schedule", (job) => { assert.equal(job.payload, null); scheduled = true; });
+    await waitFor(async () => scheduled, 1000, "JSON null schedule");
+  } finally {
+    await driver.close();
+    await raw.unsafe("delete from neutron_jobs where queue = $1", [queue]);
+    await raw.unsafe("delete from neutron_schedules where queue = $1", [queue]);
+    await raw.end();
+  }
+});

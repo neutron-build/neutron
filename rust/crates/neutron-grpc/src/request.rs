@@ -40,8 +40,24 @@ impl FromRequest for GrpcRequest {
             .collect_body(4 * 1024 * 1024)
             .await
             .map_err(|_| GrpcStatus::ResourceExhausted.error_response("gRPC body too large"))?;
-        let (msg_bytes, _compressed) = unframe_message(&body)
+        let (msg_bytes, compressed) = unframe_message(&body)
             .ok_or_else(|| GrpcStatus::InvalidArgument.error_response("malformed gRPC frame"))?;
+
+        // Unary extraction takes exactly one uncompressed message frame.
+        // A compressed frame would hand still-compressed bytes to the
+        // application as if they were the message; this crate implements no
+        // grpc-encoding decompression, so refuse (fail closed) rather than
+        // parse garbage.
+        if compressed {
+            return Err(GrpcStatus::Unimplemented
+                .error_response("compressed gRPC messages are not supported"));
+        }
+        // Trailing bytes after the first frame mean more frames (or junk):
+        // silently ignoring them dropped parts of the request.
+        if body.len() > 5 + msg_bytes.len() {
+            return Err(GrpcStatus::InvalidArgument
+                .error_response("multiple gRPC frames are not valid on a unary request"));
+        }
 
         Ok(GrpcRequest(Bytes::copy_from_slice(msg_bytes)))
     }
@@ -80,6 +96,54 @@ mod tests {
         let GrpcRequest(payload) =
             ok_or_panic(GrpcRequest::from_request(&mut req).await, "extract failed");
         assert_eq!(payload.as_ref(), b"hello grpc");
+    }
+
+    /// Regression (RS-34): a unary request with a single empty frame is a
+    /// valid (empty) message and must extract successfully.
+    #[tokio::test]
+    async fn extracts_empty_message() {
+        let mut req = grpc_request(b"");
+        let GrpcRequest(payload) = ok_or_panic(
+            GrpcRequest::from_request(&mut req).await,
+            "empty message rejected",
+        );
+        assert!(payload.is_empty());
+    }
+
+    /// Regression (RS-34): compressed frames must be refused (fail closed),
+    /// not handed to the application as if the compressed bytes were the
+    /// message.
+    #[tokio::test]
+    async fn rejects_compressed_frame() {
+        let mut framed = vec![1u8]; // compressed flag
+        framed.extend_from_slice(&4u32.to_be_bytes());
+        framed.extend_from_slice(b"data");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/grpc".parse().unwrap());
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            headers,
+            Bytes::from(framed),
+        );
+        assert!(GrpcRequest::from_request(&mut req).await.is_err());
+    }
+
+    /// Regression (RS-34): trailing frames after the first were silently
+    /// dropped; a unary request carrying two frames must be rejected.
+    #[tokio::test]
+    async fn rejects_trailing_frames() {
+        let mut framed = frame_message(Bytes::from_static(b"first")).to_vec();
+        framed.extend_from_slice(&frame_message(Bytes::from_static(b"second")));
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/grpc".parse().unwrap());
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            headers,
+            Bytes::from(framed),
+        );
+        assert!(GrpcRequest::from_request(&mut req).await.is_err());
     }
 
     #[tokio::test]

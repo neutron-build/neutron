@@ -7,6 +7,7 @@
 import { getTableColumns, getTableName, getTableIndexes, getTableSchema, getTableConstraints, rejectDerivedTable, getViewDefinition } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable } from "./schema.js";
 import { qident } from "./expr.js";
+import { encodeWriteValue } from "./codecs.js";
 import { quoteStringLiteral } from "./compile.js";
 
 /** The legacy DDL emitter covers the pre-Q07 surface only (default
@@ -116,7 +117,9 @@ export function sqlTypeOf(col: AnyColumnBuilder): string {
 function defaultLiteral(col: AnyColumnBuilder): string | undefined {
   if (!col.hasDefault) return undefined;
   if (col.nowDefault) return "now()";
-  const v = col.defaultValue;
+  if (col.defaultValue === null) return "null";
+  if (col.defaultValue === undefined) return undefined;
+  const v = encodeWriteValue(col, { columnName: col.columnName, propertyKey: col.columnName, tableName: "DDL" }, col.defaultValue).bind;
   if (v === null) return "null";
   if (v === undefined) return undefined;
   switch (col.dataType) {
@@ -130,6 +133,9 @@ function defaultLiteral(col: AnyColumnBuilder): string | undefined {
     case "real":
     case "numeric":
       return String(v);
+    case "bytea":
+      if (!(v instanceof Uint8Array)) throw new Error("bytea default must be a Uint8Array");
+      return quoteStringLiteral(`\\x${Buffer.from(v).toString("hex")}`);
     default:
       return quoteStringLiteral(String(v));
   }
@@ -220,7 +226,10 @@ export function schemaToDDL(tables: AnyPgTable[]): string[] {
   const { order, deferredFks } = topoSortTables(tables);
   const statements: string[] = [];
   for (const table of order) {
-    statements.push(createTableSQL(table));
+    const deferred = new Set(deferredFks.filter((fk) => fk.table === table).map((fk) => fk.column));
+    const lines = (Object.values(getTableColumns(table)) as AnyColumnBuilder[])
+      .map((col) => `  ${columnDefLine(table, col, !deferred.has(col))}`);
+    statements.push(`create table ${qident(getTableName(table))} (\n${lines.join(",\n")}\n)`);
     for (const idx of getTableIndexes(table)) {
       statements.push(createIndexSQL(table, idx));
     }

@@ -8,23 +8,30 @@ import type { DatabaseProfile } from "./index.js";
 // drizzle-orm result types via Postgres/SQLite overloads) lives in
 // ./drizzle.ts behind the `@neutron-build/data/drizzle` subpath export.
 
+/** A caller-configured, already connected companion. No plugins are added. */
+export interface NucleusCompanion {
+  client: { close: () => Promise<void> };
+  /** Borrowed clients are never closed; owned clients transfer cleanup to this factory. */
+  ownership: "borrowed" | "owned";
+}
+
 export interface DrizzleDatabaseOptions<TSchema extends Record<string, unknown> = Record<string, unknown>> {
   profile?: DatabaseProfile;
   config?: DataConfigInput;
   schema?: TSchema;
+  /** Nucleus profiles only. null opts out of automatic plugin-free allocation. */
+  nucleusCompanion?: NucleusCompanion | null;
+  requiredCapabilities?: Partial<import("@neutron-build/sql/lifecycle").ConnectionCapabilities>;
 }
 
 export interface DrizzleDatabase {
+  readonly capabilities: Readonly<import('@neutron-build/sql/lifecycle').ConnectionCapabilities>;
+  readonly lifecycle: ReturnType<typeof import('@neutron-build/sql/lifecycle').resourceLifecycle>;
   profile: DatabaseProfile;
   client: unknown;
   db: unknown;
-  /**
-   * When connected to Nucleus, this holds the `@neutron-build/nucleus` client
-   * builder return value after `.connect()`. You can use it to access
-   * non-relational models (KV, Vector, Graph, etc.).
-   *
-   * `null` when connected to plain Postgres or SQLite.
-   */
+  /** Configured companion, or the legacy plugin-free client. Model properties
+   * exist only if the caller configured plugins. null for Postgres/SQLite. */
   nucleus: unknown | null;
   close: () => Promise<void>;
 }

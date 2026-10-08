@@ -2,12 +2,15 @@
 // Nucleus client — transport implementations
 // ---------------------------------------------------------------------------
 
+import { closeResources, resourceLifecycle } from '@neutron-build/sql/lifecycle';
+
 import type { Transport, TransactionTransport, QueryResult, IsolationLevel, QuerySignalOptions } from './types.js';
 import {
   NucleusAuthError,
   NucleusError,
   NucleusConflictError,
   NucleusConnectionError,
+  NucleusUnknownOutcomeError,
   NucleusNotFoundError,
   NucleusQueryError,
   NucleusTransactionError,
@@ -34,11 +37,11 @@ export interface MobileTransportConfig extends TransportConfig {
   maxRetries?: number;
   /** Base delay in ms between retries — uses exponential backoff (default 1000). */
   retryDelay?: number;
-  /** Whether to cache SELECT query results (default true). */
+  /** Enable caching for calls explicitly marked readOnly and cache (default false). */
   cacheEnabled?: boolean;
   /** Time-to-live for cached entries in ms (default 60000). */
   cacheTTL?: number;
-  /** Whether to queue writes when the device is offline (default true). */
+  /** Whether to queue undispatched writes when offline (default true). Dispatched writes are never replayed. */
   offlineQueueEnabled?: boolean;
   /** Maximum number of queued offline operations (default 100). */
   maxQueueSize?: number;
@@ -69,6 +72,8 @@ function sanitizeUrl(url: string): string {
       parsed.username = '***';
       parsed.password = '***';
     }
+    parsed.search = '';
+    parsed.hash = '';
     return parsed.toString();
   } catch {
     return url.replace(/\/\/[^@]+@/, '//***:***@');
@@ -97,43 +102,54 @@ async function request<T>(
   if (signal?.aborted) {
     throw new DOMException('This operation was aborted', 'AbortError');
   }
-  let res: Response;
-  const controller = timeout != null || signal != null ? new AbortController() : undefined;
-  // Arm the timer only for a real timeout (> 0). undefined/0 mean "no timer":
-  // setTimeout(cb, undefined) fires ~immediately and would abort the internal
-  // controller — breaking every signal-carrying request in the default
-  // construction (X04 MAJOR-1).
-  const timer = timeout != null && timeout > 0 ? setTimeout(() => controller!.abort(), timeout) : undefined;
-  const onAbort = (): void => controller?.abort();
+  const controller = new AbortController();
+  const deadline = timeout ?? 30_000;
+  const timer = deadline > 0
+    ? setTimeout(() => controller.abort(new DOMException('Nucleus request timed out', 'TimeoutError')), deadline)
+    : undefined;
+  const onAbort = (): void => controller.abort(new DOMException('This operation was aborted', 'AbortError'));
   signal?.addEventListener('abort', onAbort, { once: true });
-
+  // Race the complete response, not just fetch's header promise. This also
+  // bounds non-cooperative/custom fetch implementations during body parsing.
+  let onInternalAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onInternalAbort = () => reject(controller.signal.reason);
+    controller.signal.addEventListener('abort', onInternalAbort, { once: true });
+  });
   try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify(body),
-      signal: controller?.signal,
-      keepalive: true,
-    });
+    return await Promise.race([aborted, (async () => {
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+          keepalive: true,
+        });
+      } catch (err) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        throw new NucleusConnectionError('Failed to reach Nucleus server', {
+          cause: err instanceof Error ? err : undefined,
+          meta: { url: sanitizeUrl(url) },
+        });
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        mapHttpError(res.status, text, url);
+      }
+      return (await res.json()) as ApiResponse<T>;
+    })()]);
   } catch (err) {
-    if (signal?.aborted) {
-      throw new DOMException('This operation was aborted', 'AbortError');
-    }
-    throw new NucleusConnectionError('Failed to reach Nucleus server', {
-      cause: err instanceof Error ? err : undefined,
-      meta: { url: sanitizeUrl(url) },
+    if (err instanceof NucleusError || (err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError') throw err;
+    throw new NucleusConnectionError('Nucleus response could not be consumed', {
+      cause: err instanceof Error ? err : undefined, meta: { url: sanitizeUrl(url) },
     });
   } finally {
     if (timer != null) clearTimeout(timer);
     signal?.removeEventListener('abort', onAbort);
+    if (onInternalAbort) controller.signal.removeEventListener('abort', onInternalAbort);
   }
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    mapHttpError(res.status, text, url);
-  }
-
-  return (await res.json()) as ApiResponse<T>;
 }
 
 function mapHttpError(status: number, body: string, url: string): never {
@@ -155,16 +171,37 @@ function mapHttpError(status: number, body: string, url: string): never {
 // HttpTransport
 // ---------------------------------------------------------------------------
 
+async function endpointDigest(config: unknown): Promise<string> {
+  if (!globalThis.crypto?.subtle) throw new NucleusNotSupportedError('Endpoint admission needs WebCrypto SHA-256');
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(config)));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function beginUnknown(url: string, cause: unknown): NucleusUnknownOutcomeError {
+  return new NucleusUnknownOutcomeError('BEGIN was dispatched but its outcome or identity is unknown; reconcile before retrying', {
+    cause: cause instanceof Error ? cause : undefined,
+    meta: { operation: 'BEGIN', url: sanitizeUrl(url) },
+  });
+}
+
 export class HttpTransport implements Transport {
+  readonly capabilities = Object.freeze({ cancellation: 'response-only', mutationOutcome: 'begin-unknown', automaticMutationReplay: false } as const);
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
   private readonly timeout: number | undefined;
+  private closed = false;
+  private assertOpen(): void { if (this.closed) throw new NucleusError('CLOSED', 'Transport is closed'); }
+  capabilityEndpoint(): Promise<string> { return endpointDigest([this.baseUrl, this.headers]); }
 
   constructor(url: string, headers: Record<string, string> = {}, timeout?: number) {
     // Strip trailing slash for consistent URL building
     this.baseUrl = url.replace(/\/+$/, '');
     this.headers = headers;
-    this.timeout = timeout;
+    if (timeout != null && (!Number.isFinite(timeout) || timeout < 0)) throw new RangeError('timeout must be a finite non-negative number');
+    this.timeout = timeout ?? 30_000;
 
     // Warn about insecure connections
     if (this.baseUrl.startsWith('http://') && typeof process !== 'undefined' && process.env.NODE_ENV === 'production') {
@@ -173,12 +210,14 @@ export class HttpTransport implements Transport {
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
+    this.assertOpen();
     const res = await request<T[]>(`${this.baseUrl}/api/query`, { sql, params }, this.headers, this.timeout, opts?.signal);
     const rows = (res.data ?? []) as T[];
     return { rows, rowCount: res.rowCount ?? rows.length };
   }
 
   async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
+    this.assertOpen();
     const res = await request<void>(`${this.baseUrl}/api/execute`, { sql, params }, this.headers, this.timeout, opts?.signal);
     return res.affected ?? 0;
   }
@@ -193,24 +232,48 @@ export class HttpTransport implements Transport {
   }
 
   async beginTransaction(isolationLevel?: IsolationLevel): Promise<TransactionTransport> {
-    const res = await request<{ txId: string }>(
+    this.assertOpen();
+    const url = `${this.baseUrl}/api/transaction/begin`;
+    let res: unknown;
+    try { res = await request<{ txId: string }>(
       `${this.baseUrl}/api/transaction/begin`,
       { isolationLevel },
       this.headers,
       this.timeout,
     );
-    const txId = res.data?.txId;
-    if (!txId) {
-      throw new NucleusTransactionError('Server did not return a transaction ID');
+    } catch (cause) {
+      // Only an explicit client/protocol rejection proves BEGIN was rejected.
+      const status = cause instanceof NucleusError ? cause.meta?.status : undefined;
+      if (typeof status === 'number' && [400, 401, 403, 404, 409, 422].includes(status)) throw cause;
+      throw beginUnknown(url, cause);
     }
-    return new HttpTransactionTransport(this.baseUrl, this.headers, txId, this.timeout);
+    if (!isRecord(res) || (res.ok !== undefined && typeof res.ok !== 'boolean') ||
+        (res.error !== undefined && typeof res.error !== 'string')) {
+      throw beginUnknown(url, new NucleusTransactionError('Malformed BEGIN envelope'));
+    }
+    if (res.data !== undefined && res.data !== null && !isRecord(res.data))
+      throw beginUnknown(url, new NucleusTransactionError('Malformed BEGIN data envelope'));
+    if (res.ok === false) {
+      if (isRecord(res.data) && res.data.txId !== undefined)
+        throw beginUnknown(url, new NucleusTransactionError('Contradictory BEGIN rejection and remote identity'));
+      throw new NucleusTransactionError(res.error as string || 'Server rejected BEGIN');
+    }
+    const txId = isRecord(res.data) ? res.data.txId : undefined;
+    // An opaque identity must survive the actual native header encoding exactly.
+    let usable = typeof txId === 'string' && txId.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f]/.test(txId);
+    let headerCause: Error | undefined;
+    try { usable = usable && new Headers({ 'X-Nucleus-TxId': txId as string }).get('X-Nucleus-TxId') === txId; }
+    catch (error) { usable = false; headerCause = error instanceof Error ? error : undefined; }
+    if (!usable) throw beginUnknown(url, new NucleusTransactionError('Server did not return a transportable transaction ID', { cause: headerCause }));
+    return new HttpTransactionTransport(this.baseUrl, this.headers, txId as string, this.timeout);
   }
 
   async close(): Promise<void> {
-    // HTTP is stateless — nothing to close.
+    this.closed = true;
   }
 
   async ping(): Promise<void> {
+    this.assertOpen();
     await request<void>(`${this.baseUrl}/api/query`, { sql: 'SELECT 1', params: [] }, this.headers, this.timeout);
   }
 }
@@ -220,6 +283,7 @@ export class HttpTransport implements Transport {
 // ---------------------------------------------------------------------------
 
 class HttpTransactionTransport implements TransactionTransport {
+  readonly capabilities = Object.freeze({ cancellation: 'response-only', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const);
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
   private readonly txId: string;
@@ -326,11 +390,12 @@ interface QueuedWrite {
  * Transport for mobile (React Native) environments.
  *
  * Wraps `HttpTransport` and adds:
- * - Automatic retry with exponential backoff for transient failures
- * - In-memory cache for SELECT queries
+ * - Retry only operations explicitly asserted to be pure reads
+ * - Optional cache for explicitly opted-in pure reads
  * - Offline write queue that flushes when connectivity is restored
  */
 export class MobileTransport implements Transport {
+  readonly capabilities = Object.freeze({ cancellation: 'response-only', mutationOutcome: 'unknown-error', automaticMutationReplay: false } as const);
   private readonly http: HttpTransport;
   private readonly cache: Map<string, { data: unknown; timestamp: number }>;
   private readonly cacheTTL: number;
@@ -341,22 +406,29 @@ export class MobileTransport implements Transport {
   private readonly maxQueueSize: number;
   private offlineQueue: QueuedWrite[] = [];
   private isOnline: boolean;
+  private cacheGeneration = 0;
+  private pendingMutations = 0;
+  private activeTransactions = 0;
+  private closed = false;
+  private assertOpen(): void { if (this.closed) throw new NucleusError('CLOSED', 'Transport is closed'); }
+  capabilityEndpoint(): Promise<string> { return this.http.capabilityEndpoint(); }
 
   constructor(config: MobileTransportConfig) {
     this.http = new HttpTransport(config.url, config.headers, config.timeout);
     this.cache = new Map();
     this.cacheTTL = config.cacheTTL ?? 60_000;
-    this.cacheEnabled = config.cacheEnabled !== false;
+    this.cacheEnabled = config.cacheEnabled === true;
     this.maxRetries = config.maxRetries ?? 3;
     this.retryDelay = config.retryDelay ?? 1_000;
     this.offlineQueueEnabled = config.offlineQueueEnabled !== false;
     this.maxQueueSize = config.maxQueueSize ?? 100;
-    this.isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    this.isOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
 
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => {
+        if (this.closed) return;
         this.isOnline = true;
-        void this.flushQueue();
+        void this.flushQueue().catch(() => {});
       });
       window.addEventListener('offline', () => {
         this.isOnline = false;
@@ -365,39 +437,32 @@ export class MobileTransport implements Transport {
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
-    const isRead = sql.trimStart().toUpperCase().startsWith('SELECT');
-
-    // Check cache for read queries
-    if (isRead && this.cacheEnabled) {
-      const cacheKey = JSON.stringify({ sql, params });
+    this.assertOpen();
+    if (opts?.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError');
+    const isRead = opts?.readOnly === true;
+    const cacheable = isRead && opts?.cache === true && this.cacheEnabled &&
+      this.pendingMutations === 0 && this.activeTransactions === 0;
+    const cacheKey = JSON.stringify({ sql, params });
+    if (cacheable) {
       const cached = this.cache.get(cacheKey);
-      if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
-        return cached.data as QueryResult<T>;
-      }
+      if (cached && Date.now() - cached.timestamp < this.cacheTTL) return cached.data as QueryResult<T>;
     }
-
-    // A canceled caller must not be served a (re)tried request: abort is a
-    // caller decision, not a transient failure.
-    if (opts?.signal?.aborted) {
-      return Promise.reject(new DOMException('This operation was aborted', 'AbortError'));
-    }
-    const result = await this.withRetry(() => this.http.query<T>(sql, params, opts), opts?.signal);
-
-    // Cache read results
-    if (isRead && this.cacheEnabled) {
-      const cacheKey = JSON.stringify({ sql, params });
+    // Unknown SQL, including SELECT model functions, is potentially mutating.
+    // Fence pending reads before dispatch, even when the write outcome is lost.
+    if (!isRead) this.invalidateCache();
+    const generation = this.cacheGeneration;
+    const result = isRead
+      ? await this.withRetry(() => this.http.query<T>(sql, params, opts), opts?.signal)
+      : await this.once(() => this.http.query<T>(sql, params, opts));
+    if (cacheable && generation === this.cacheGeneration) {
       this.cache.set(cacheKey, { data: result, timestamp: Date.now() });
-      // Evict oldest entries when cache grows too large
-      if (this.cache.size > 500) {
-        const entries = [...this.cache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
-        for (let i = 0; i < 100; i++) this.cache.delete(entries[i][0]);
-      }
+      if (this.cache.size > 500) this.cache.delete(this.cache.keys().next().value!);
     }
-
     return result;
   }
 
   async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
+    this.assertOpen();
     if (opts?.signal?.aborted) {
       return Promise.reject(new DOMException('This operation was aborted', 'AbortError'));
     }
@@ -414,7 +479,8 @@ export class MobileTransport implements Transport {
         this.offlineQueue.push({ resolve, reject, sql, params });
       });
     }
-    return this.withRetry(() => this.http.execute(sql, params, opts), opts?.signal);
+    this.invalidateCache();
+    return this.once(() => this.http.execute(sql, params, opts));
   }
 
   async fetchval<T = unknown>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<T | null> {
@@ -427,16 +493,48 @@ export class MobileTransport implements Transport {
   }
 
   async beginTransaction(isolationLevel?: IsolationLevel): Promise<TransactionTransport> {
+    this.assertOpen();
     // Transactions go through the underlying HTTP transport directly — no caching or queueing
-    return this.withRetry(() => this.http.beginTransaction(isolationLevel));
+    this.invalidateCache();
+    const tx = await this.once(() => this.http.beginTransaction(isolationLevel));
+    this.activeTransactions++;
+    let finished = false;
+    const finish = (): void => {
+      if (!finished) { finished = true; this.activeTransactions--; this.invalidateCache(); }
+    };
+    return new Proxy(tx, {
+      get: (target, property) => {
+        const value = Reflect.get(target, property);
+        if (typeof value !== 'function') return value;
+        if (['commit', 'rollback', 'close'].includes(String(property))) {
+          return async (...args: unknown[]) => {
+            const result = await this.once(() => value.apply(target, args));
+            finish();
+            return result;
+          };
+        }
+        if (['query', 'execute', 'fetchval'].includes(String(property))) {
+          return (...args: unknown[]) => {
+            if ((args[2] as QuerySignalOptions | undefined)?.signal?.aborted) {
+              return Promise.reject(new DOMException('This operation was aborted', 'AbortError'));
+            }
+            return this.once(() => value.apply(target, args));
+          };
+        }
+        return value.bind(target);
+      },
+    });
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     this.cache.clear();
+    for (const item of this.offlineQueue.splice(0)) item.reject(new NucleusError('CLOSED', 'Transport closed before queued write dispatch'));
     await this.http.close();
   }
 
   async ping(): Promise<void> {
+    this.assertOpen();
     await this.withRetry(() => this.http.ping());
   }
 
@@ -444,6 +542,7 @@ export class MobileTransport implements Transport {
 
   /** Clear all cached query results, or only those matching `pattern`. */
   invalidateCache(pattern?: string): void {
+    this.cacheGeneration++;
     if (!pattern) {
       this.cache.clear();
       return;
@@ -459,6 +558,28 @@ export class MobileTransport implements Transport {
   }
 
   // -- Internals ------------------------------------------------------------
+
+  /** A dispatched mutation cannot be safely replayed without server deduplication. */
+  private async once<T>(fn: () => Promise<T>): Promise<T> {
+    this.invalidateCache();
+    this.pendingMutations++;
+    try { return await fn(); }
+    catch (err) {
+      const status = (err as NucleusError)?.meta?.status;
+      if (err instanceof NucleusConnectionError ||
+          (typeof status === 'number' && status >= 500) ||
+          (err as Error)?.name === 'AbortError' || (err as Error)?.name === 'TimeoutError' ||
+          err instanceof SyntaxError) {
+        throw new NucleusUnknownOutcomeError('The dispatched operation may have completed; reconcile its outcome before retrying', {
+          cause: err instanceof Error ? err : undefined,
+        });
+      }
+      throw err;
+    } finally {
+      this.pendingMutations--;
+      this.invalidateCache();
+    }
+  }
 
   private async withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     let lastError: Error | undefined;
@@ -481,11 +602,13 @@ export class MobileTransport implements Transport {
   }
 
   private async flushQueue(): Promise<void> {
+    this.assertOpen();
     const queue = this.offlineQueue;
     this.offlineQueue = [];
     for (const item of queue) {
       try {
-        const result = await this.http.execute(item.sql, item.params);
+        this.invalidateCache();
+        const result = await this.once(() => this.http.execute(item.sql, item.params));
         item.resolve(result);
       } catch (err) {
         item.reject(err);
@@ -508,9 +631,13 @@ type InvokeFn = (cmd: string, args: Record<string, unknown>) => Promise<unknown>
  * available.
  */
 export class EmbeddedTransport implements Transport {
+  readonly capabilities = Object.freeze({ cancellation: 'unsupported', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const);
   private readonly invoke: InvokeFn;
+  private closed = false;
+  private assertOpen(): void { if (this.closed) throw new NucleusError('CLOSED', 'Transport is closed'); }
   /** Reject signal usage: the embedded channel has no cancellation path. */
   private rejectIfSignal(opts?: QuerySignalOptions): void {
+    this.assertOpen();
     if (opts?.signal) {
       throw new NucleusNotSupportedError(
         'cancellation is not supported by EmbeddedTransport: the Tauri IPC / neutron:// channel has no abort mechanism',
@@ -573,6 +700,7 @@ export class EmbeddedTransport implements Transport {
   }
 
   async beginTransaction(isolationLevel?: IsolationLevel): Promise<TransactionTransport> {
+    this.assertOpen();
     const result = (await this.invoke('nucleus_transaction_begin', {
       isolationLevel: isolationLevel ?? null,
     })) as { txId?: string };
@@ -584,10 +712,11 @@ export class EmbeddedTransport implements Transport {
   }
 
   async close(): Promise<void> {
-    // Embedded — nothing to close from the client side.
+    this.closed = true;
   }
 
   async ping(): Promise<void> {
+    this.assertOpen();
     await this.invoke('nucleus_query', { sql: 'SELECT 1', params: [] });
   }
 }
@@ -597,7 +726,9 @@ export class EmbeddedTransport implements Transport {
 // ---------------------------------------------------------------------------
 
 class EmbeddedTransactionTransport implements TransactionTransport {
+  readonly capabilities = Object.freeze({ cancellation: 'unsupported', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const);
   private readonly invoke: InvokeFn;
+  private closed = false;
   private readonly txId: string;
   private finished = false;
 
@@ -608,6 +739,7 @@ class EmbeddedTransactionTransport implements TransactionTransport {
 
   /** Reject signal usage: the embedded channel has no cancellation path. */
   private rejectIfSignal(opts?: QuerySignalOptions): void {
+    this.assertOpen();
     if (opts?.signal) {
       throw new NucleusNotSupportedError(
         'cancellation is not supported by EmbeddedTransport transactions: the Tauri IPC / neutron:// channel has no abort mechanism',
@@ -616,6 +748,7 @@ class EmbeddedTransactionTransport implements TransactionTransport {
   }
 
   private assertOpen(): void {
+    if (this.closed) throw new NucleusError('CLOSED', 'Transport is closed');
     if (this.finished) {
       throw new NucleusTransactionError('Transaction has already been committed or rolled back');
     }
@@ -708,6 +841,8 @@ interface PgPoolClient {
   query(sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
   /** node-postgres: release(err) also removes (destroys) the client. */
   release(err?: Error): void;
+  on?(event: 'error', cb: (err: Error) => void): void;
+  removeListener?(event: 'error', cb: (err: Error) => void): void;
 }
 
 let pgModulePromise: Promise<PgModule> | null = null;
@@ -774,6 +909,7 @@ const ISOLATION_SQL: Record<IsolationLevel, string> = {
  * so construction stays synchronous and browser-safe.
  */
 export class PgTransport implements Transport {
+  readonly capabilities = Object.freeze({ cancellation: 'server-attempt', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const);
   readonly valueProfile: 'lossless-read-v1' | undefined;
   private readonly url: string;
   private readonly timeout: number | undefined;
@@ -781,6 +917,13 @@ export class PgTransport implements Transport {
   // old check-then-`await`-then-assign let two concurrent first queries each
   // construct a Pool, and the loser's connections were never `.end()`ed.
   private poolPromise: Promise<PgPool> | null = null;
+  private cancellationPoolPromise: Promise<PgPool> | null = null;
+  private readonly lifecycle = resourceLifecycle('owned', async () => {
+    const pools = [this.poolPromise, this.cancellationPoolPromise];
+    const failures = await closeResources(pools.filter((p): p is Promise<PgPool> => p !== null).map(pending => async () => (await pending).end()));
+    if (failures.length) throw new AggregateError(failures, 'Nucleus PG pools cleanup failed', { cause: failures[0] });
+  });
+  capabilityEndpoint(): Promise<string> { return endpointDigest(this.url); }
 
   constructor(url: string, config: PgTransportConfig = {}) {
     // Honors-or-rejects-at-construction: silently dropping config the caller
@@ -802,6 +945,7 @@ export class PgTransport implements Transport {
   }
 
   private getPool(): Promise<PgPool> {
+    this.lifecycle.assertOpen();
     if (!this.poolPromise) {
       const creation = loadPg().then((pg) => {
         const types = poolTypeParsers(pg, this.valueProfile);
@@ -833,9 +977,29 @@ export class PgTransport implements Transport {
     return this.poolPromise;
   }
 
+  private getCancellationPool(): Promise<PgPool> {
+    this.lifecycle.assertOpen();
+    if (!this.cancellationPoolPromise) {
+      const creation = loadPg().then((pg) => {
+        const pool = new pg.Pool({ connectionString: this.url, max: 8,
+          statement_timeout: this.timeout ?? 30_000,
+          query_timeout: this.timeout ?? 30_000,
+          connectionTimeoutMillis: this.timeout ?? 30_000 });
+        pool.on('error', () => {});
+        return pool;
+      });
+      creation.catch(() => {
+        if (this.cancellationPoolPromise === creation) this.cancellationPoolPromise = null;
+      });
+      this.cancellationPoolPromise = creation;
+    }
+    return this.cancellationPoolPromise;
+  }
+
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<QueryResult<T>> {
     if (!opts?.signal) {
       const pool = await this.getPool();
+    this.lifecycle.assertOpen();
       const res = await pool.query(sql, params);
       return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
     }
@@ -846,6 +1010,7 @@ export class PgTransport implements Transport {
   async execute(sql: string, params: unknown[] = [], opts?: QuerySignalOptions): Promise<number> {
     if (!opts?.signal) {
       const pool = await this.getPool();
+    this.lifecycle.assertOpen();
       const res = await pool.query(sql, params);
       return res.rowCount ?? 0;
     }
@@ -861,112 +1026,95 @@ export class PgTransport implements Transport {
     return (value ?? null) as T | null;
   }
 
-  /**
-   * Run one statement on a dedicated client with real cancellation armed.
-   *
-   * `pg` has no per-query AbortSignal API, so cancellation goes through the
-   * server: learn this connection's backend PID, then on abort issue
-   * `pg_cancel_backend(pid)` from the POOL — a second connection — the same
-   * discipline as the SQL ORM's I02 work. The canceled statement rejects
-   * with SQLSTATE 57014.
-   *
-   * Engines without the cancel surface (Nucleus today: pg_cancel_backend is
-   * 0A000-unknown) reject with NucleusNotSupportedError WHEN THE ABORT
-   * FIRES, while the original statement still runs to completion — the
-   * honest alternative to pretending an abort happened. The caller learns
-   * both facts from the same rejection.
-   *
-   * If the pg_backend_pid probe itself fails on this engine, the query still
-   * runs (cancellation is unavailable, not the query) — but any abort is then
-   * reported as could-not-be-dispatched with the probe failure as `cause`,
-   * NEVER silently ignored (X04 MAJOR-2).
-   */
+  /** Reserve an independent cancel connection before submitting user SQL.
+   * Cancel failures are observed immediately and drained before either client
+   * is released, even when the target statement itself fails. */
   private async queryCancelable(
     sql: string,
     params: unknown[],
     signal: AbortSignal,
   ): Promise<{ rows: unknown[]; rowCount: number | null }> {
-    if (signal.aborted) {
-      throw new DOMException('This operation was aborted', 'AbortError');
-    }
-    const pool = await this.getPool();
-    const client = await pool.connect();
-    let pid: number | null = null;
-    let cancelAttempt: Promise<void> | null = null;
-    let cancelDispatched = false;
-    let sawCancelUnsupported = false;
-    let pidProbeError: unknown;
-    const abortListener = (): void => {
-      if (pid == null) {
-        // The pid probe is still in flight or failed on this engine: no
-        // pg_cancel_backend can be dispatched. Do NOT create a no-op
-        // cancelAttempt — the completion path must see the abort as
-        // un-dispatched and report it (never resolve as if nothing happened).
-        return;
-      }
-      cancelDispatched = true;
-      cancelAttempt = (async () => {
-        try {
-          await pool.query('SELECT pg_cancel_backend($1) AS canceled', [pid]);
-        } catch (err) {
-          sawCancelUnsupported = true;
-          throw new NucleusNotSupportedError(
-            'statement cancellation failed: this engine does not support pg_cancel_backend ' +
-              '(Nucleus tracks this as a known gap); the original statement was NOT canceled and will complete',
-            { cause: err instanceof Error ? err : undefined },
-          );
-        }
-      })();
+    const preflight = (): void => {
+      this.lifecycle.assertOpen();
+      if (signal.aborted) throw new DOMException('This operation was aborted', 'AbortError');
     };
-    signal.addEventListener('abort', abortListener, { once: true });
+    preflight();
+    const pool = await this.getPool();
+    this.lifecycle.assertOpen();
+    preflight();
+    const client = await pool.connect();
+    let cancelClient: PgPoolClient | undefined;
+    let pid: number | null = null;
+    let cancelAttempt: Promise<void> | undefined;
+    let cancelError: Error | undefined;
+    let targetError: Error | undefined;
+    let pidProbeError: unknown;
+    let confirmed = false;
+    const onTargetError = (err: Error): void => { targetError = err; };
+    const onCancelError = (err: Error): void => { cancelError = err; };
+    client.on?.('error', onTargetError);
+    const abortListener = (): void => {
+      if (pid == null || !cancelClient) return;
+      // The rejection handler is installed when the promise is created.
+      cancelAttempt = Promise.resolve().then(() => cancelClient!.query(
+        'SELECT pg_cancel_backend($1) AS canceled', [pid],
+      )).then((res) => {
+        confirmed = (res.rows[0] as { canceled?: boolean } | undefined)?.canceled === true;
+      }, (err: unknown) => { cancelError = err instanceof Error ? err : new Error(String(err)); });
+    };
     try {
+      preflight();
+      cancelClient = await (await this.getCancellationPool()).connect();
+      cancelClient.on?.('error', onCancelError);
+      preflight();
       const pidRow = await client.query('SELECT pg_backend_pid() AS pid').catch((err: unknown) => {
         pidProbeError = err;
         return null;
       });
-      const pidVal = pidRow ? (pidRow.rows[0] as { pid?: number | string } | undefined)?.pid : undefined;
-      pid = pidVal != null ? Number(pidVal) : null;
-      const res = await client.query(sql, params);
-      if (signal.aborted && cancelAttempt) {
-        try {
-          await cancelAttempt;
-        } catch {
-          // Statement completed despite the abort; the unsupported-cancel
-          // fact is reported below via sawCancelUnsupported.
+      const value = pidRow ? (pidRow.rows[0] as { pid?: number | string } | undefined)?.pid : undefined;
+      const candidate = Number(value);
+      pid = value != null && Number.isSafeInteger(candidate) && candidate > 0 ? candidate : null;
+      preflight();
+      signal.addEventListener('abort', abortListener, { once: true });
+      let result: { rows: unknown[]; rowCount: number | null } | undefined;
+      let failed = false;
+      let failure: unknown;
+      try { result = await client.query(sql, params); }
+      catch (err) { failed = true; failure = err; }
+      signal.removeEventListener('abort', abortListener);
+      await cancelAttempt;
+      if (signal.aborted && (cancelError || !confirmed)) {
+        const code = (cancelError as Error & { code?: string } | undefined)?.code;
+        const unsupported = code === '0A000' || code === '42883';
+        const options = {
+          cause: cancelError ?? (pidProbeError instanceof Error ? pidProbeError : undefined),
+          meta: { cancellation: unsupported ? 'unsupported' : cancelAttempt ? 'failed' : 'not-dispatched',
+            targetFailed: failed },
+        };
+        if (unsupported || !cancelAttempt) {
+          throw new NucleusNotSupportedError('statement cancellation could not be confirmed; the statement may have completed', options);
         }
+        throw new NucleusError('CANCELLATION_FAILED', 'statement cancellation failed; the statement may have completed', options);
       }
-      if (signal.aborted && sawCancelUnsupported) {
-        throw new NucleusNotSupportedError(
-          'statement cancellation is unsupported on this engine (pg_cancel_backend missing); the statement completed anyway',
-        );
-      }
-      if (signal.aborted && !cancelDispatched) {
-        // The abort fired before the cancel channel was armed (pool checkout
-        // or the pid-probe window), or the pid probe failed so no cancel
-        // could ever be dispatched — and the statement completed anyway.
-        // Resolving normally would silently ignore the caller's abort.
-        throw new NucleusNotSupportedError(
-          'cancellation could not be dispatched (the abort fired before the cancel channel was armed' +
-            (pid == null ? ' or the pg_backend_pid probe failed on this engine' : '') +
-            '); the statement completed anyway',
-          pidProbeError !== undefined
-            ? { cause: pidProbeError instanceof Error ? pidProbeError : undefined }
-            : undefined,
-        );
-      }
-      return res;
+      if (failed) throw failure;
+      if (signal.aborted) throw new DOMException('This operation was aborted', 'AbortError');
+      return result!;
     } finally {
       signal.removeEventListener('abort', abortListener);
-      // The cancel path can poison the connection; release with an error so
-      // the pool destroys rather than recycles it.
-      client.release(signal.aborted ? new Error('canceled by AbortSignal') : undefined);
+      await cancelAttempt;
+      cancelClient?.removeListener?.('error', onCancelError);
+      cancelClient?.release(cancelError);
+      client.removeListener?.('error', onTargetError);
+      client.release(targetError ?? (signal.aborted ? new Error('canceled by AbortSignal') : undefined));
     }
   }
 
   async beginTransaction(isolationLevel?: IsolationLevel): Promise<TransactionTransport> {
     const pool = await this.getPool();
+    this.lifecycle.assertOpen();
     const client = await pool.connect();
     try {
+      this.lifecycle.assertOpen();
       const level = isolationLevel ? ` ISOLATION LEVEL ${ISOLATION_SQL[isolationLevel]}` : '';
       await client.query(`BEGIN${level}`);
     } catch (err) {
@@ -978,20 +1126,18 @@ export class PgTransport implements Transport {
 
   async ping(): Promise<void> {
     const pool = await this.getPool();
+    this.lifecycle.assertOpen();
     await pool.query('SELECT 1');
   }
 
   async close(): Promise<void> {
-    if (this.poolPromise) {
-      const pool = await this.poolPromise;
-      this.poolPromise = null;
-      await pool.end();
-    }
+    return this.lifecycle.terminate();
   }
 }
 
 /** A transaction bound to one checked-out pooled connection. */
 export class PgTransactionTransport implements TransactionTransport {
+  readonly capabilities = Object.freeze({ cancellation: 'pre-dispatch', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const);
   private readonly client: PgPoolClient;
   private finished = false;
 

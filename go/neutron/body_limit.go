@@ -9,7 +9,8 @@ const DefaultBodyLimit int64 = 1 << 20
 
 // BodyLimit returns middleware that restricts the size of request bodies.
 // If the body exceeds maxBytes, http.MaxBytesReader causes the read to fail
-// and the server returns 413 Request Entity Too Large.
+// Typed handlers classify that failure as 413 Request Entity Too Large.
+// Raw handlers must classify read errors themselves.
 //
 // Pass 0 to use DefaultBodyLimit (1 MB).
 func BodyLimit(maxBytes int64) Middleware {

@@ -2,6 +2,7 @@
 // @neutron-build/sql — database entry point
 // ---------------------------------------------------------------------------
 
+import { admitConnection, cleanupAfterFailure, type ConnectionCapabilities } from './lifecycle.js';
 import { loadDriver, assertNodeRuntime, type Driver, type LoadDriverOptions } from "./drivers.js";
 import { capabilityGate, type CapabilityEvidence, type CapabilityGate, type EngineIdentity } from "./engine.js";
 import { admitExecutionProfile, validateExecutionProfile, type AdmittedProfile, type EndpointIdentity, type ExecutionProfile } from "./profile.js";
@@ -103,6 +104,8 @@ export interface DatabaseOptions<
   /** Driver kind and pool tuning when `url` is used (renamed from the
    *  pre-I01 `driver` option, which now injects an adapter). */
   driverOptions?: LoadDriverOptions;
+  /** Required operational guarantees; absent/custom metadata fails closed. */
+  requiredCapabilities?: Partial<ConnectionCapabilities>;
   /** Explicit endpoint profile (NP01). Omitted: behavior is unchanged and no
    *  admission runs. `"postgres-direct"` admits only a reported PostgreSQL
    *  identity. `"nucleus-relational-rc-v1-candidate"` is an UNCERTIFIED finite
@@ -524,7 +527,6 @@ export async function createDatabase<
     throw new Error("createDatabase requires exactly one of `url` or `driver` (inject an adapter wrapped via wrapPgPool/wrapPostgresJs)");
   }
   const profile = options.profile === undefined ? undefined : validateExecutionProfile(options.profile);
-  const rawDriver = options.driver ?? (await loadDriver(options.url!, options.driverOptions));
   const logger = resolveLogger(options.logger);
 
   const tables = new Map<string, { key: string; table: AnyPgTable }>();
@@ -564,14 +566,17 @@ export async function createDatabase<
   for (const r of relationSets) relationsByTable.set(getTableRelationKey(r.table), r.entries);
   void resolved;
 
+  // Validate schema before allocating an owned driver. Register its cleanup
+  // before either operational or engine-profile admission can fail.
+  const rawDriver = options.driver ?? (await loadDriver(options.url!, options.driverOptions));
   let admitted: AdmittedProfile | undefined;
-  if (profile !== undefined) {
-    try {
+  try {
+    admitConnection(rawDriver, options.requiredCapabilities ?? {});
+    if (profile !== undefined) {
       admitted = await admitExecutionProfile(rawDriver, profile, [...tables.values()].map((entry) => entry.table));
-    } catch (err) {
-      await rawDriver.close().catch(() => undefined);
-      throw err;
     }
+  } catch (error) {
+    return cleanupAfterFailure(error, [() => rawDriver.close()]);
   }
   const driver: Driver = admitted?.driver ?? rawDriver;
   const capabilities: CapabilityGate = admitted?.capabilities ?? capabilityGate(rawDriver);
@@ -624,6 +629,13 @@ export async function createDatabase<
 
   const crud = makeCrud(ctx);
 
+  const scopedCapabilities = (local: Driver, scope?: TransactionScope): CapabilityGate => {
+    // A failed probe rolls back its savepoint, keeping the transaction usable.
+    return capabilities.scoped?.(local, scope ? async (sql) => {
+      await scope.transaction(async (probeScope) => { await probeScope.query(sql); });
+    } : undefined) ?? capabilities;
+  };
+
   /** Top level: a nested write opens its own transaction (the shared I02
    *  runner on a pinned connection; the adapter's begin() for custom
    *  adapters). Never retried — a failure or an ambiguous commit surfaces
@@ -635,10 +647,10 @@ export async function createDatabase<
       if (isolation !== undefined) {
         throw new NeutronSqlError("nested write isolation requires a pinnable adapter (Driver.pin) — the injected custom adapter does not provide one");
       }
-      return driver.begin((txDriver) => body({ driver: txDriver, logger, capabilities }));
+      return driver.begin((txDriver) => body({ driver: txDriver, logger, capabilities: scopedCapabilities(txDriver) }));
     }
     const hooks = { onEvent: (event: SqlEvent) => logger?.(event) };
-    return runTransaction(await driver.pin(), (scope) => body({ driver: scope, logger, capabilities }), modes, hooks);
+    return runTransaction(await driver.pin(), (scope) => body({ driver: scope, logger, capabilities: scopedCapabilities(scope, scope) }), modes, hooks);
   };
   const query = makeQuery(ctx, topLevelAtomic);
 
@@ -646,7 +658,7 @@ export async function createDatabase<
    *  tx scope (CRUD + relational queries pinned to the transaction's
    *  connection, nested savepoint transactions, explicit savepoints). */
   const adaptScope = (scope: TransactionScope): TxScope => {
-    const txCtx: ExecContext = { driver: scope, logger, capabilities };
+    const txCtx: ExecContext = { driver: scope, logger, capabilities: scopedCapabilities(scope, scope) };
     // Inside a transaction a nested write runs in its own SAVEPOINT: a failed
     // graph rolls back to it and the outer transaction stays usable.
     const savepointAtomic: AtomicRunner = (body, isolation) => {
@@ -655,7 +667,7 @@ export async function createDatabase<
           new NeutronSqlError("nested write isolation is a property of the outer BEGIN — pass it to db.transaction(fn, options); inside a transaction the write runs in a savepoint"),
         );
       }
-      return scope.transaction((inner) => body({ driver: inner, logger, capabilities }));
+      return scope.transaction((inner) => body({ driver: inner, logger, capabilities: scopedCapabilities(inner, inner) }));
     };
     return {
       ...makeCrud(txCtx),
@@ -682,7 +694,7 @@ export async function createDatabase<
   /** Legacy scope for custom adapters without Driver.pin: transactions run
    *  through their begin(), without savepoints or transaction options. */
   const legacyScope = (txDriver: Driver): TxScope => {
-    const txCtx: ExecContext = { driver: txDriver, logger, capabilities };
+    const txCtx: ExecContext = { driver: txDriver, logger, capabilities: scopedCapabilities(txDriver) };
     const noSavepoints: AtomicRunner = () =>
       Promise.reject(
         new NeutronSqlError(

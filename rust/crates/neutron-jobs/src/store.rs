@@ -22,7 +22,6 @@
 //!     .with_store(Arc::clone(&store))
 //!     .job("send_email", send_email);
 //!
-//! tokio::spawn(pq.flush_loop());
 //! tokio::spawn(worker.run());
 //! ```
 
@@ -44,6 +43,8 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct StoredJob {
     /// Store-assigned ID (0 before first `push`).
     pub id: u64,
+    /// Monotonic fencing generation assigned atomically by claim_due.
+    pub claim_token: u64,
     pub job_type: String,
     pub queue: String,
     pub payload: Vec<u8>,
@@ -66,6 +67,7 @@ impl StoredJob {
         let now = now_ms();
         Self {
             id: 0,
+            claim_token: 0,
             job_type: job_type.into(),
             queue: queue.into(),
             payload,
@@ -78,7 +80,7 @@ impl StoredJob {
 
     /// Set a deferred run time (milliseconds from now).
     pub fn with_delay_ms(mut self, delay_ms: u64) -> Self {
-        self.run_at_ms = now_ms() + delay_ms;
+        self.run_at_ms = now_ms().saturating_add(delay_ms);
         self
     }
 }
@@ -100,12 +102,15 @@ pub enum StoreError {
     Backend(Box<dyn std::error::Error + Send + Sync>),
     /// The requested job ID was not found.
     NotFound(u64),
+    /// This claim has expired or a different owner has claimed the job.
+    StaleClaim(u64),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backend(e) => write!(f, "job store error: {e}"),
+            Self::StaleClaim(id) => write!(f, "job {id} claim is no longer current"),
             Self::NotFound(id) => write!(f, "job {id} not found in store"),
         }
     }
@@ -115,7 +120,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(e) => Some(e.as_ref()),
-            Self::NotFound(_) => None,
+            Self::NotFound(_) | Self::StaleClaim(_) => None,
         }
     }
 }
@@ -145,17 +150,22 @@ pub trait JobStore: Send + Sync + 'static {
         limit: usize,
     ) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>>;
 
-    /// Mark a job as successfully completed.
-    fn mark_completed(&self, id: u64) -> BoxFuture<'_, Result<(), StoreError>>;
+    /// Mark a job as successfully completed only if its running claim is current.
+    fn mark_completed(&self, id: u64, claim_token: u64) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// Mark a job as permanently failed with an error reason.
-    fn mark_failed<'a>(&'a self, id: u64, reason: &'a str)
-        -> BoxFuture<'a, Result<(), StoreError>>;
+    /// Mark a job as permanently failed, fenced by its current running claim.
+    fn mark_failed<'a>(
+        &'a self,
+        id: u64,
+        claim_token: u64,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Reschedule a job for retry at `run_at_ms` (ms since epoch).
+    /// Reschedule a job for retry at `run_at_ms`, fenced by its current claim.
     fn schedule_retry(
         &self,
         id: u64,
+        claim_token: u64,
         attempt: u32,
         run_at_ms: u64,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
@@ -163,7 +173,8 @@ pub trait JobStore: Send + Sync + 'static {
     /// Return jobs whose `running` status is older than `stale_secs` seconds
     /// and reset them to `pending` with `attempt += 1`.
     ///
-    /// Used on startup to recover from crashes where jobs were mid-flight.
+    /// Used on startup and periodically by workers to recover crashes. Exhausted
+    /// jobs become permanently failed rather than being redelivered forever.
     fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>>;
 }
 

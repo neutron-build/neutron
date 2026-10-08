@@ -449,12 +449,13 @@ describe("X04 live battery (real Nucleus engine)", mainGate, () => {
       assert.equal(await blob.get("x04b", "ps2"), null);
     });
 
-    it("blob: abort during the metadata tag loop leaves NO partial blob", async (ctx) => {
+    it("blob: abort during metadata tagging retains the object for reconciliation", async (ctx) => {
       requireEngine(ctx);
       const feats = await detectFeatures(t);
       const ac = new AbortController();
       const watcher = new AbortAfterFirstTagTransport(t, ac);
       const blobWatched = withBlob.init(watcher as unknown as Transport, feats).blob;
+      await blob.delete("x04b", "tagabort");
 
       const before = await blob.blobCount();
       await assert.rejects(
@@ -465,8 +466,8 @@ describe("X04 live battery (real Nucleus engine)", mainGate, () => {
         }),
         /aborted/,
       );
-      assert.equal(await blob.get("x04b", "tagabort"), null, "canceled put must leave no blob");
-      assert.equal(await blob.blobCount(), before);
+      assert.ok(await blob.get("x04b", "tagabort"), "canceled metadata write leaves the stored object for reconciliation");
+      assert.equal(await blob.blobCount(), before + 1);
     });
 
     it("blob: identity-bound bucket + list scoping", async (ctx) => {

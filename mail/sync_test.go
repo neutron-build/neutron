@@ -39,8 +39,8 @@ type memStore struct {
 
 	// Staged scan state (audit SYNC-03): the double mirrors PgStore's
 	// mirror_scans/mirror_scan_seen, including the resume semantics.
-	scanSeq int64
-	scans   map[AccountID]map[MailboxID]*Scan
+	scanSeq  int64
+	scans    map[AccountID]map[MailboxID]*Scan
 	scanSeen map[ScanID]map[MessageID]bool
 	scanDone map[AccountID]map[int64]map[MailboxID]bool
 
@@ -59,7 +59,7 @@ func newMemStore() *memStore {
 		cursors:   map[AccountID]map[MailboxID]Cursor{},
 		scans:     map[AccountID]map[MailboxID]*Scan{},
 		scanSeen:  map[ScanID]map[MessageID]bool{},
-		scanDone: map[AccountID]map[int64]map[MailboxID]bool{},
+		scanDone:  map[AccountID]map[int64]map[MailboxID]bool{},
 	}
 }
 
@@ -571,7 +571,7 @@ func TestCursorIsNotAdvancedWhenStoringFails(t *testing.T) {
 	}
 }
 
-func TestPositionalIdentityIsUpgradedOnIngest(t *testing.T) {
+func TestLegacyStoreRefusesNonAtomicPromotion(t *testing.T) {
 	eng, store, acct := setup(t)
 
 	pos := PositionalMessageID("INBOX", 1, 7)
@@ -584,18 +584,12 @@ func TestPositionalIdentityIsUpgradedOnIngest(t *testing.T) {
 		pages: []*Changes{{Changes: []Change{{Kind: ChangeCreated, ID: pos, Envelope: &env}}, Next: "c1"}},
 	}
 
-	rep, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
-	if err != nil {
-		t.Fatal(err)
+	_, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
+	if !errors.Is(err, ErrIdentityTransactionRequired) {
+		t.Fatalf("promotion on legacy store = %v", err)
 	}
-	if rep.Upgraded != 1 {
-		t.Errorf("Upgraded = %d, want 1", rep.Upgraded)
-	}
-	if _, err := store.Envelope(context.Background(), acct, pos); !errors.Is(err, ErrNoStore) {
-		t.Error("superseded positional row survived the upgrade")
-	}
-	if _, err := store.Envelope(context.Background(), acct, HeaderMessageID("<real@example.com>")); err != nil {
-		t.Error("upgraded identity was not stored")
+	if _, err := store.Envelope(context.Background(), acct, HeaderMessageID("<real@example.com>")); !errors.Is(err, ErrNoStore) {
+		t.Fatal("refused promotion wrote replacement")
 	}
 }
 

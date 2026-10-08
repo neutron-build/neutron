@@ -5,6 +5,8 @@ export interface Job<TPayload = unknown> {
   name: string;
   payload: TPayload;
   createdAt: number;
+  /** Aborted when a leased worker can no longer prove ownership. */
+  signal?: AbortSignal;
 }
 
 export type JobHandler<TPayload = unknown> = (job: Job<TPayload>) => Promise<void> | void;
@@ -23,7 +25,37 @@ export interface ScheduleOptions {
   queue?: string;
 }
 
+/** Operational guarantees are independent from the shared method names. */
+export interface QueueCapabilities {
+  durability: "process" | "backend" | "unknown";
+  unknownHandlers: "retain" | "filter-before-claim" | "defer-or-fail";
+  claimFencing: "none" | "attempt" | "native" | "unknown";
+  handlerSignal: boolean;
+  close: "schedule-timers-only" | "drain-sql-worker" | "native-worker" | "unknown";
+  acknowledgement: 'process' | 'fenced-uncertain-stop' | 'native' | 'unknown';
+  errorObservation: 'dead-letters' | 'workerError-and-close' | 'workerError' | 'unknown';
+  registration: 'process-starts-worker' | 'register-and-drain-inline';
+  retry: 'three-process-attempts' | 'persisted-budget' | 'native-default-one-attempt' | 'unknown';
+  scheduling: 'process-cron' | 'persisted-cron' | 'native-repeatables' | 'unknown';
+  routing: 'registered-names' | 'shared-queue';
+  postClose: 'schedule-refusal' | 'all-refusal';
+}
+
+/** Select adapters using required guarantees, never class or method names. */
+export function admitQueue<T extends QueueDriver>(driver: T, required: Partial<QueueCapabilities>): T {
+  for (const [key, value] of Object.entries(required)) {
+    if (!driver.capabilities || driver.capabilities[key as keyof QueueCapabilities] !== value)
+      throw new Error(`Queue capability not admitted: ${key}`);
+  }
+  return driver;
+}
+
 export interface QueueDriver {
+  /** Absent for legacy/custom drivers: guarantees must be supplied by their owner. */
+  readonly capabilities?: Readonly<QueueCapabilities>;
+  close?(): void | Promise<void>;
+  /** Observable uncertainty for adapters advertising workerError-and-close. */
+  readonly workerError?: unknown;
   add<TPayload = unknown>(name: string, payload: TPayload): Promise<Job<TPayload>>;
   process<TPayload = unknown>(name: string, handler: JobHandler<TPayload>): Promise<void>;
   /**
@@ -34,7 +66,7 @@ export interface QueueDriver {
    * Durability is driver-specific: the Postgres driver persists schedules in
    * the `neutron_schedules` table, the BullMQ driver uses its native
    * repeatables, and the InMemory driver is dev-only — schedules vanish on
-   * restart and missed windows are not caught up.
+   * restart. A suspended process emits one catch-up job, then advances from now.
    */
   schedule(id: string, pattern: string, payload: unknown, opts?: ScheduleOptions): Promise<void>;
   /** Remove a schedule previously registered with `schedule()`. */
@@ -45,6 +77,8 @@ const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 10;
 
 export class InMemoryQueueDriver implements QueueDriver {
+  readonly capabilities = Object.freeze({ durability: "process", unknownHandlers: "retain", claimFencing: "none", handlerSignal: false, close: "schedule-timers-only", acknowledgement: "process", errorObservation: "dead-letters", registration: "register-and-drain-inline", retry: "three-process-attempts", scheduling: "process-cron", routing: "registered-names", postClose: "schedule-refusal" } as const);
+  private closed = false;
   private idCounter = 0;
   private handlers = new Map<string, JobHandler<any>>();
   private jobs: Job<any>[] = [];
@@ -122,6 +156,7 @@ export class InMemoryQueueDriver implements QueueDriver {
     payload: unknown,
     _opts?: ScheduleOptions
   ): Promise<void> {
+    if (this.closed) throw new Error("Queue schedules are closed");
     const cron = parseCron(pattern);
     const first = cron.next(new Date());
     this.clearSchedule(id);
@@ -139,6 +174,8 @@ export class InMemoryQueueDriver implements QueueDriver {
    * mid-flight are unaffected.
    */
   close(): void {
+    this.closed = true;
+    this.scheduleIds.clear();
     for (const id of [...this.scheduleTimers.keys()]) {
       this.clearSchedule(id);
     }
@@ -150,10 +187,14 @@ export class InMemoryQueueDriver implements QueueDriver {
     fireAt: Date,
     payload: unknown
   ): void {
-    const delay = Math.max(0, fireAt.getTime() - Date.now());
+    const delay = Math.min(2_147_483_647, Math.max(0, fireAt.getTime() - Date.now()));
     const timer = setTimeout(() => {
       this.scheduleTimers.delete(id);
       if (!this.scheduleIds.has(id)) {
+        return;
+      }
+      if (Date.now() < fireAt.getTime()) {
+        this.armSchedule(id, cron, fireAt, payload);
         return;
       }
       this.jobs.push({
@@ -163,7 +204,7 @@ export class InMemoryQueueDriver implements QueueDriver {
         createdAt: Date.now(),
       });
       void this.drain();
-      this.armSchedule(id, cron, cron.next(fireAt), payload);
+      this.armSchedule(id, cron, cron.next(new Date()), payload);
     }, delay);
     if (typeof timer.unref === "function") {
       timer.unref();

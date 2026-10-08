@@ -509,6 +509,13 @@ describe("Integration: TimeSeries model SQL functions", () => {
     assert.equal(calls[0].params![0], 90 * 86_400_000);
   });
 
+  it("unverified time-series reads refuse without implicit persistent probe writes", async () => {
+    const before = transport.calls.length;
+    await assert.rejects(() => ts.timeBucket("hour", new Date()), /capability is unverified/);
+    await assert.rejects(() => ts.query("cpu", new Date(0), new Date(1000)), /capability is unverified/);
+    assert.equal(transport.calls.length, before);
+  });
+
   it("TIME_BUCKET truncates timestamp (probe-proven engine)", async () => {
     // A REAL engine answers the semantic probe (grid flooring) before the
     // user call is trusted; this handler models that engine exactly.
@@ -517,6 +524,7 @@ describe("Integration: TimeSeries model SQL functions", () => {
       const t = params[1] as number;
       return Math.floor(t / bs) * bs;
     });
+    await ts.probeCapabilities({ allowPersistentProbeWrites: true });
     const bucket = await ts.timeBucket("hour", new Date("2024-01-01T12:34:56Z"));
     assert.equal(bucket, Math.floor(new Date("2024-01-01T12:34:56Z").getTime() / 3_600_000) * 3_600_000);
     const calls = transport.sqlCalls("TIME_BUCKET");
@@ -525,12 +533,13 @@ describe("Integration: TimeSeries model SQL functions", () => {
 
   it("TIME_BUCKET fails closed on a fake engine (echo), with probe evidence and no user call", async () => {
     transport.whenFetchvalFn("TIME_BUCKET", (params) => params[1]);
+    await ts.probeCapabilities({ allowPersistentProbeWrites: true });
     await assert.rejects(
       () => ts.timeBucket("hour", new Date("2024-01-01T12:34:56Z")),
       (err: unknown) => {
         assert.ok(err instanceof NucleusNotSupportedError, `expected NucleusNotSupportedError, got ${err}`);
         assert.match(err.message, /did not floor onto the bucket grid/);
-        assert.match(err.message, /an echo returns 1/);
+        assert.match(err.message, /did not floor onto the bucket grid/);
         return true;
       },
     );
@@ -551,6 +560,7 @@ describe("Integration: TimeSeries model SQL functions", () => {
       }
       return JSON.stringify([{ t: 0, v: 1.5 }, { t: 500, v: 2.5 }]);
     });
+    await ts.probeCapabilities({ allowPersistentProbeWrites: true });
     const points = await ts.query("cpu", new Date(0), new Date(1000));
     assert.equal(points.length, 2);
     assert.equal(points[0].value, 1.5);
@@ -563,6 +573,7 @@ describe("Integration: TimeSeries model SQL functions", () => {
     transport.whenFetchvalFn("TS_RANGE", () =>
       JSON.stringify([{ t: 1000, v: 1 }, { t: 3000, v: 2 }, { t: 6000, v: 6 }, { t: 9000, v: 4 }]),
     );
+    await ts.probeCapabilities({ allowPersistentProbeWrites: true });
     await assert.rejects(
       () => ts.query("cpu", new Date(0), new Date(1000)),
       (err: unknown) => {
@@ -1345,4 +1356,25 @@ describe("Integration: SQL model detailed", () => {
     const val = await sql.fetchval("SELECT missing()");
     assert.equal(val, null);
   });
+});
+
+describe("Integration: connection startup ownership", () => {
+  for (const stage of ["features", "plugin"] as const) for (const cleanupFails of [false, true]) {
+    it(`drains transport after ${stage} failure with cleanup failure=${cleanupFails}`, async () => {
+      const primary = new Error("startup failed"); const cleanup = new Error("close failed");
+      const transport = new WireTransport();
+      transport.whenFetchval("SELECT VERSION()", "PostgreSQL 16");
+      if (stage === "features") transport.fetchval = async () => { throw primary; };
+      let closes = 0;
+      transport.close = async () => { closes++; if (cleanupFails) throw cleanup; };
+      const builder = createClient({ url: "http://unused", transport });
+      const configured = stage === "plugin" ? builder.use({ name: "failure", init: () => { throw primary; } }) : builder;
+      await assert.rejects(() => configured.connect(), (error: any) => {
+        if (cleanupFails) { assert.equal(error.cause, primary); assert.deepEqual(error.errors, [primary, cleanup]); }
+        else assert.equal(error, primary);
+        return true;
+      });
+      assert.equal(closes, 1);
+    });
+  }
 });

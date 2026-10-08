@@ -34,7 +34,15 @@ type GmailRefresh func(context.Context, mail.AccountID, mail.Credential) (mail.C
 
 // NewWithGmailRefresh permits one refresh/retry of a rejected Gmail GET.
 // Mutations never use this recovery path.
-func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver {
+func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver { return NewWithPolicy(refresh, Policy{}) }
+
+// Policy comes from product account configuration, never request headers.
+type Policy struct {
+	GraphIdentityFormat func(context.Context, mail.AccountID) (string, error)
+	JMAPAllowedOrigins  func(context.Context, mail.AccountID) ([]string, error)
+}
+
+func NewWithPolicy(refresh GmailRefresh, policy Policy) mail.Resolver {
 	return func(ctx context.Context, acct mail.AccountID, cred mail.Credential) (mail.Adapter, func(), error) {
 		if cred.Zero() {
 			return nil, nil, fmt.Errorf("mail: no credential supplied for account %s", acct)
@@ -47,11 +55,31 @@ func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver {
 		case mail.ProviderIMAP:
 			return dialIMAP(ctx, cred)
 		case mail.ProviderJMAP:
-			return dialJMAP(ctx, cred)
+			var origins []string
+			if policy.JMAPAllowedOrigins != nil {
+				var err error
+				origins, err = policy.JMAPAllowedOrigins(ctx, acct)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			return dialJMAPOrigins(ctx, cred, origins)
 		case mail.ProviderGmail:
 			return dialGmailAccount(ctx, acct, cred, refresh)
 		case mail.ProviderGraph:
-			return dialGraph(cred)
+			format := mail.GraphLegacyIDs
+			if policy.GraphIdentityFormat != nil {
+				var err error
+				format, err = policy.GraphIdentityFormat(ctx, acct)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			ad, err := graph.NewWithIdentityFormat(bearerClient(cred.AccessToken, "graph.microsoft.com"), format)
+			if err != nil {
+				return nil, nil, err
+			}
+			return ad, func() { _ = ad.Close() }, nil
 		default:
 			return nil, nil, fmt.Errorf("mail: unsupported provider %q", cred.Provider)
 		}
@@ -75,14 +103,18 @@ func dialIMAP(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), 
 }
 
 func dialJMAP(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), error) {
+	return dialJMAPOrigins(ctx, cred, nil)
+}
+func dialJMAPOrigins(ctx context.Context, cred mail.Credential, origins []string) (mail.Adapter, func(), error) {
 	sessionURL := fmt.Sprintf("https://%s/.well-known/jmap", cred.Host)
 	if cred.Port != 0 {
 		sessionURL = fmt.Sprintf("https://%s:%d/.well-known/jmap", cred.Host, cred.Port)
 	}
 
 	ad, err := jmap.Dial(ctx, jmap.Config{
-		SessionURL: sessionURL,
-		Token:      cred.AccessToken,
+		SessionURL:     sessionURL,
+		Token:          cred.AccessToken,
+		AllowedOrigins: origins,
 	})
 	if err != nil {
 		return nil, nil, err

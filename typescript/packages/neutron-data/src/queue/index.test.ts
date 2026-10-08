@@ -143,3 +143,41 @@ test("schedule rejects an invalid cron pattern", async () => {
   await assert.rejects(() => queue.schedule("bad", "not-a-cron", null));
   queue.close();
 });
+
+test("TSD-13: yearly schedule uses bounded arms and cannot fire early", async (t) => {
+  const start = Date.UTC(2026, 0, 2);
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: start });
+  const arm = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+    assert.ok((delay ?? 0) <= 2_147_483_647, "every timer arm fits Node timer range");
+    return arm(callback, delay, ...args);
+  });
+  const queue = new InMemoryQueueDriver();
+  let fires = 0;
+  await queue.process("yearly", () => { fires++; });
+  await queue.schedule("yearly", "@yearly", null);
+  t.mock.timers.tick(2_147_483_647);
+  assert.equal(fires, 0);
+  // Long suspension: one catch-up, then advance from now.
+  t.mock.timers.setTime(Date.UTC(2029, 5, 1));
+  t.mock.timers.tick(2_147_483_647);
+  assert.equal(fires, 1);
+  t.mock.timers.tick(1);
+  assert.equal(fires, 1);
+  queue.close();
+  t.mock.timers.tick(2_147_483_647);
+  assert.equal(fires, 1);
+});
+
+test("TSD-13: unschedule during an intermediate long arm prevents firing", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.UTC(2026, 0, 2) });
+  const queue = new InMemoryQueueDriver();
+  let fires = 0;
+  await queue.process("yearly", () => { fires++; });
+  await queue.schedule("yearly", "@yearly", null);
+  t.mock.timers.tick(2_147_483_647);
+  await queue.unschedule("yearly");
+  t.mock.timers.tick(40_000_000_000);
+  assert.equal(fires, 0);
+  queue.close();
+});

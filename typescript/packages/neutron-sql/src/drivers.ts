@@ -1,3 +1,4 @@
+import { resourceLifecycle, closeResources, type ConnectionCapabilities } from './lifecycle.js';
 // ---------------------------------------------------------------------------
 // @neutron-build/sql — drivers (zero runtime deps; dynamic imports)
 // ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ export interface Driver {
   close(): Promise<void>;
   /** Explicit, typed lifecycle for this adapter. */
   readonly lifecycle: DriverLifecycle;
+  readonly capabilities?: Readonly<ConnectionCapabilities>;
   /** Connection-scoped prepared execution (Q04). OPTIONAL BY DESIGN — this
    *  is the adapter capability gate: present exactly where the adapter's
    *  semantics support safe prepared statements (both bundled drivers do;
@@ -106,6 +108,16 @@ export function preparedStatement(driver: Driver, sqlText: string): PreparedStat
     );
   }
   return driver.prepare(sqlText);
+}
+
+function guardPrepared(lifecycle: DriverLifecycle, make: () => PreparedStatement): PreparedStatement {
+  lifecycle.assertOpen?.();
+  const statement = make();
+  return {
+    sql: statement.sql, name: statement.name,
+    async query<T>(params: unknown[] = []): Promise<T[]> { lifecycle.assertOpen?.(); return statement.query<T>(params); },
+    async execute(params: unknown[] = []): Promise<number> { lifecycle.assertOpen?.(); return statement.execute(params); },
+  };
 }
 
 /** Deterministic, collision-free server-side statement name for the pg
@@ -189,35 +201,15 @@ export interface DriverLifecycle {
   readonly ownership: AdapterOwnership;
   /** True once an owned terminate have settled. */
   readonly terminated: boolean;
+  readonly closing?: boolean;
+  assertOpen?(): void;
   /** Idempotent. Owned: closes the underlying adapter exactly once and never
    *  twice. Borrowed: resolves immediately without touching the resource. */
   terminate(): Promise<void>;
 }
 
 export function makeLifecycle(ownership: AdapterOwnership, closeOnce: () => Promise<void>): DriverLifecycle {
-  let terminated = false;
-  let pending: Promise<void> | null = null;
-  const lifecycle: DriverLifecycle = {
-    ownership,
-    get terminated() {
-      return terminated;
-    },
-    terminate(): Promise<void> {
-      if (ownership === "borrowed") return Promise.resolve();
-      if (pending) return pending;
-      pending = Promise.resolve()
-        .then(closeOnce)
-        .then(() => {
-          terminated = true;
-        })
-        .catch((err: unknown) => {
-          pending = null;
-          throw err;
-        });
-      return pending;
-    },
-  };
-  return lifecycle;
+  return resourceLifecycle(ownership, closeOnce);
 }
 
 /** Options for wrapping an externally created pool/client. */
@@ -256,6 +248,8 @@ export function assertNodeRuntime(operation: string): void {
     );
   }
 }
+
+const nativePostgresJsClients = new WeakSet<object>();
 
 export async function loadDriver(url: string, options: LoadDriverOptions = {}): Promise<Driver> {
   assertNodeRuntime("loadDriver");
@@ -340,6 +334,7 @@ async function loadPostgresJs(url: string, options: LoadDriverOptions): Promise<
     // failures — never a reason to fall back to another driver.
     throw connectionConstructionError("postgres", err);
   }
+  nativePostgresJsClients.add(client);
   return wrapPostgresJs(client, { ownership: "owned" });
 }
 
@@ -415,6 +410,7 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
   });
 
   const postgresJsPin = async (execOptions?: QueryExecutionOptions): Promise<PinnedExecutor> => {
+    lifecycle.assertOpen?.();
     const reserved = await acquirePoolResource(() => client.reserve(), value => value.release(), execOptions, 'postgres');
     // postgres.js 3.4.8 bug dodge: reserved.release() unconditionally calls
     // onopen(c), which moves a connection back into the open pool — if the
@@ -454,6 +450,7 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
 
   const driver: Driver = {
     async query<T>(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<T[]> {
+      lifecycle.assertOpen?.();
       if (execOptions === undefined) return execPostgresJs(client, "postgres", "query", sqlText, params, execOptions) as Promise<T[]>;
       // The native pool releases a completed query before cancel transport
       // completion; reserve explicitly until both have settled.
@@ -462,19 +459,22 @@ export function wrapPostgresJs(client: PostgresJsClient, options: WrapAdapterOpt
       finally { pin.release(); }
     },
     async execute(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<number> {
+      lifecycle.assertOpen?.();
       if (execOptions === undefined) return (await execPostgresJs(client, "postgres", "execute", sqlText, params, execOptions)) as number;
       const pin = await postgresJsPin(execOptions);
       try { return await pin.execute(sqlText, params, execOptions); }
       finally { pin.release(); }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
+      lifecycle.assertOpen?.();
       renderBeginSql(modes); // invalid modes must refuse before a connection is pinned
       const pin = await postgresJsPin();
       return runTransaction(pin, (scope: TransactionScope) => fn(scope), modes);
     },
     close: () => driver.lifecycle.terminate(),
     lifecycle,
-    prepare: (sqlText: string): PreparedStatement => postgresJsPrepared(client, sqlText),
+    capabilities: Object.freeze({ cancellation: nativePostgresJsClients.has(client) ? 'server-attempt' : 'unknown', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const),
+    prepare: (sqlText: string): PreparedStatement => guardPrepared(lifecycle, () => postgresJsPrepared(client, sqlText)),
     pin: () => postgresJsPin(),
   };
   return driver;
@@ -764,15 +764,17 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
   if (cancellationPool === pool) throw new NeutronSqlError('pg: cancellationPool must be independent of the application pool');
   const lifecycle = makeLifecycle(ownership, async () => {
     try {
-      const results = await Promise.allSettled([pool.end(), ...(cancellationPool ? [cancellationPool.end()] : [])]);
-      for (const result of results) if (result.status === 'rejected') throw result.reason;
+      const failures = await closeResources([() => pool.end(), ...(cancellationPool ? [() => cancellationPool.end()] : [])]);
+      if (failures.length) throw new AggregateError(failures, 'PG pools cleanup failed', { cause: failures[0] });
     } catch (err) {
+      if (err instanceof AggregateError) throw err;
       throw classifyDriverError(err, "pg");
     }
   });
 
   const driver: Driver = {
     async query<T>(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<T[]> {
+      lifecycle.assertOpen?.();
       if (execOptions === undefined) {
         try {
           const res = await pool.query(sqlText, params);
@@ -789,6 +791,7 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
       }
     },
     async execute(sqlText: string, params: unknown[] = [], execOptions?: QueryExecutionOptions): Promise<number> {
+      lifecycle.assertOpen?.();
       if (execOptions === undefined) {
         try {
           const res = await pool.query(sqlText, params);
@@ -805,14 +808,16 @@ export function wrapPgPool(pool: PgPoolLike, options: WrapAdapterOptions = {}): 
       }
     },
     async begin<T>(fn: (tx: Driver) => Promise<T>, modes?: TransactionModes): Promise<T> {
+      lifecycle.assertOpen?.();
       renderBeginSql(modes); // invalid modes must refuse before a connection is pinned
       const pin = await pgPin(pool, cancellationPool);
       return runTransaction(pin, (scope: TransactionScope) => fn(scope), modes);
     },
     close: () => driver.lifecycle.terminate(),
     lifecycle,
-    prepare: (sqlText: string): PreparedStatement => pgPrepared(pool, sqlText),
-    pin: () => pgPin(pool, cancellationPool),
+    capabilities: Object.freeze({ cancellation: cancellationPool ? 'server-attempt' : 'unsupported', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const),
+    prepare: (sqlText: string): PreparedStatement => guardPrepared(lifecycle, () => pgPrepared(pool, sqlText)),
+    pin: () => { lifecycle.assertOpen?.(); return pgPin(pool, cancellationPool); },
   };
   return driver;
 }

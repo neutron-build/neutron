@@ -471,6 +471,9 @@ importers:
       '@neutron-build/nucleus':
         specifier: workspace:^
         version: link:../neutron-nucleus
+      '@neutron-build/sql':
+        specifier: workspace:^
+        version: link:../neutron-sql
       bullmq:
         specifier: ^5.58.0
         version: 5.69.0
@@ -510,6 +513,10 @@ importers:
         version: 5.7.2
 
   packages/neutron-nucleus:
+    dependencies:
+      '@neutron-build/sql':
+        specifier: workspace:^
+        version: link:../neutron-sql
     optionalDependencies:
       pg:
         specifier: ^8.11.0
@@ -9427,7 +9434,7 @@ snapshots:
 
   postcss@8.4.31:
     dependencies:
-      nanoid: 3.3.11
+      nanoid: 3.3.19
       picocolors: 1.1.1
       source-map-js: 1.2.1
     optional: true

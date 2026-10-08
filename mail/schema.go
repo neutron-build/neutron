@@ -203,6 +203,9 @@ var ReferentialSchema = []string{
 // rather than a test fixture: when a provider reports that a cursor is no
 // longer usable, discarding and refetching is the correct recovery.
 var DropSchema = []string{
+	`DROP TABLE IF EXISTS mail_graph_id_map`,
+	`DROP TABLE IF EXISTS mail_graph_identity`,
+	`DROP TABLE IF EXISTS mail_identity_aliases`,
 	`DROP TABLE IF EXISTS mail_scan_done`,
 	`DROP TABLE IF EXISTS mirror_scan_seen`,
 	`DROP TABLE IF EXISTS mirror_scans`,
@@ -213,4 +216,17 @@ var DropSchema = []string{
 	`DROP TABLE IF EXISTS mail_mailboxes`,
 	`DROP TABLE IF EXISTS mail_accounts`,
 	`DROP TABLE IF EXISTS mail_migrations`,
+}
+
+// Additive: never edit the shipped baseline/checksums. Old true is evidence;
+// old false could come from Gmail metadata and must become unknown.
+var AttachmentSchema = []string{
+	`ALTER TABLE mail_messages ADD COLUMN attachment_presence TEXT NOT NULL DEFAULT 'unknown'`,
+	`UPDATE mail_messages SET attachment_presence = 'present' WHERE has_attachment`,
+}
+
+var IdentitySchema = []string{
+	`CREATE TABLE mail_identity_aliases(account_id TEXT NOT NULL, old_id TEXT NOT NULL, new_id TEXT NOT NULL, PRIMARY KEY(account_id,old_id))`,
+	`CREATE TABLE mail_graph_identity(account_id TEXT PRIMARY KEY, mailbox_key TEXT NOT NULL, format TEXT NOT NULL)`,
+	`CREATE TABLE mail_graph_id_map(account_id TEXT NOT NULL, old_id TEXT NOT NULL, new_id TEXT, PRIMARY KEY(account_id,old_id), UNIQUE(account_id,new_id))`,
 }

@@ -103,6 +103,15 @@ type Keywords struct {
 	Custom   []string `json:"custom,omitempty"`
 }
 
+// AttachmentPresence distinguishes an incomplete MIME observation from absence.
+type AttachmentPresence string
+
+const (
+	AttachmentUnknown AttachmentPresence = "unknown"
+	AttachmentPresent AttachmentPresence = "present"
+	AttachmentAbsent  AttachmentPresence = "absent"
+)
+
 // Envelope is everything about a message except its body.
 //
 // Envelopes sync eagerly and bodies do not: envelope-only for a 100k-message
@@ -128,10 +137,11 @@ type Envelope struct {
 	SentAt     time.Time
 	ReceivedAt time.Time
 
-	Keywords      Keywords
-	HasAttachment bool
-	Size          int64
-	Preview       string
+	Keywords           Keywords
+	HasAttachment      bool // compatibility flag; false does not establish absence
+	AttachmentPresence AttachmentPresence
+	Size               int64
+	Preview            string
 
 	// RFC 5322 threading headers, retained because they are the identity
 	// fallback for providers that expose no stable ID, and the only way to

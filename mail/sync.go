@@ -81,6 +81,9 @@ type SyncReport struct {
 // Mailbox discovery runs first, so a folder created since the last sync is
 // picked up in the same pass rather than on the one after.
 func (e *Engine) SyncAccount(ctx context.Context, acct AccountID, ad Adapter) ([]SyncReport, error) {
+	if err := e.checkGraphFormat(ctx, acct, ad); err != nil {
+		return nil, err
+	}
 	unlock := e.lockAccount(acct)
 	defer unlock()
 	a, err := e.store.Account(ctx, acct)
@@ -140,6 +143,9 @@ func (e *Engine) SyncAccount(ctx context.Context, acct AccountID, ad Adapter) ([
 // staged scan when the store supports one, so interruption at any phase
 // costs resumption, never the existing mirror (audit SYNC-03/SYNC-02).
 func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID, ad Adapter) (*SyncReport, error) {
+	if err := e.checkGraphFormat(ctx, acct, ad); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	rep := &SyncReport{Account: acct, Mailbox: box}
 	defer func() { rep.Duration = time.Since(start) }()
@@ -239,8 +245,10 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 		// Writing it first would lose changes on a crash between the two:
 		// the mailbox would resume past data it never wrote.
 		cur = changes.Next
-		if err := e.store.PutCursor(ctx, acct, box, cur); err != nil {
-			return nil, err
+		if _, atomic := e.store.(IdentityPageStore); !atomic {
+			if err := e.store.PutCursor(ctx, acct, box, cur); err != nil {
+				return nil, err
+			}
 		}
 
 		if !changes.More {
@@ -417,7 +425,15 @@ func (e *Engine) resumeScan(ctx context.Context, acct AccountID, box MailboxID, 
 		if err != nil {
 			return nil, err
 		}
-		if finalizer, ok := scans.(FinalScanPageStore); changes.Complete && ok {
+		if atomic, ok := e.store.(IdentityPageStore); ok {
+			pruned, err := atomic.ApplyIdentityScanPage(ctx, scan.ID, prepared.upsert, prepared.promoted, prepared.seen, prepared.destroy, changes.Next, changes.Complete)
+			if err != nil {
+				return nil, err
+			}
+			rep.Deleted += pruned
+		} else if len(prepared.promoted) > 0 {
+			return nil, ErrIdentityTransactionRequired
+		} else if finalizer, ok := scans.(FinalScanPageStore); changes.Complete && ok {
 			// Persist completion with the terminal page. Neither a process
 			// interruption nor optional body-prefetch failure may strand a
 			// running scan at an incremental cursor that never says Complete.
@@ -442,14 +458,7 @@ func (e *Engine) resumeScan(ctx context.Context, acct AccountID, box MailboxID, 
 			}
 		}
 
-		// Old identities retire only after their replacements are staged
-		// (same ordering rule as the delta path; audit 3 SYNC-03).
-		if len(prepared.promoted) > 0 {
-			rep.Upgraded += len(prepared.promoted)
-			if err := e.store.DeleteMessages(ctx, acct, prepared.promoted); err != nil {
-				return nil, err
-			}
-		}
+		rep.Upgraded += len(prepared.promoted)
 
 		if err := e.prefetchBodies(ctx, acct, ad, prepared.upsert); err != nil {
 			return nil, err
@@ -501,11 +510,11 @@ func (e *Engine) sweepAbsent(ctx context.Context, acct AccountID, box MailboxID,
 
 // pageUpserts is the prepared write set of one page: envelopes to upsert
 // (bare-ID deltas backfilled), their post-promotion identities to record
-// as present, and superseded identities to retire afterwards.
+// as present, and explicit superseded/replacement pairs for atomic migration.
 type pageUpserts struct {
 	upsert   []Envelope
 	seen     []MessageID
-	promoted []MessageID
+	promoted []IdentityPair
 	destroy  []MessageID
 }
 
@@ -542,16 +551,10 @@ func (e *Engine) prepareUpserts(ctx context.Context, acct AccountID, box Mailbox
 	for i := range out.upsert {
 		env := &out.upsert[i]
 
-		// A message first seen without its Message-ID header carries a
-		// positional identity, which the next UIDVALIDITY change would
-		// invalidate. Promoting it now, while the header is in hand, is
-		// what keeps that message from reappearing as a duplicate later.
-		// The OLD identity is deleted only after the replacement envelope
-		// is written: deleting first turned a failed write into the loss
-		// of the only readable copy (audit 3 SYNC-03). A failure between
-		// the two now leaves the old record intact; the next sync retries.
+		// Promotion is a transactional migration, with explicit old/new pairs.
+		// A store without that contract refuses; no split delete/upsert fallback.
 		if upgraded, ok := UpgradeIdentity(env.ID, env.MessageIDHeader); ok {
-			out.promoted = append(out.promoted, env.ID)
+			out.promoted = append(out.promoted, IdentityPair{OldID: env.ID, NewID: upgraded})
 			env.ID = upgraded
 		}
 
@@ -577,25 +580,22 @@ func (e *Engine) apply(ctx context.Context, acct AccountID, box MailboxID, ad Ad
 		return err
 	}
 
-	if err := e.store.PutEnvelopes(ctx, acct, prepared.upsert); err != nil {
-		return err
-	}
-
-	// Old identities retire only after their replacements are stored (see
-	// the promotion note in prepareUpserts).
-	if len(prepared.promoted) > 0 {
-		rep.Upgraded += len(prepared.promoted)
-		if err := e.store.DeleteMessages(ctx, acct, prepared.promoted); err != nil {
+	if atomic, ok := e.store.(IdentityPageStore); ok {
+		if err := atomic.ApplyIdentityPage(ctx, acct, box, prepared.upsert, prepared.promoted, prepared.destroy, changes.Next); err != nil {
+			return err
+		}
+	} else {
+		if len(prepared.promoted) > 0 {
+			return ErrIdentityTransactionRequired
+		}
+		if err := e.store.PutEnvelopes(ctx, acct, prepared.upsert); err != nil {
+			return err
+		}
+		if err := e.store.RemoveFromMailbox(ctx, acct, box, prepared.destroy); err != nil {
 			return err
 		}
 	}
-
-	// Destroyed means "gone from this mailbox", which for a multi-mailbox
-	// provider is not the same as deleted. RemoveFromMailbox deletes only
-	// once the last membership is gone.
-	if err := e.store.RemoveFromMailbox(ctx, acct, box, prepared.destroy); err != nil {
-		return err
-	}
+	rep.Upgraded += len(prepared.promoted)
 
 	for _, c := range changes.Changes {
 		switch c.Kind {
@@ -662,6 +662,10 @@ func stopPrefetch(err error) bool {
 }
 
 func (e *Engine) fetchBody(ctx context.Context, acct AccountID, ad Adapter, id MessageID) error {
+	id, err := e.resolveIdentity(ctx, acct, id)
+	if err != nil {
+		return err
+	}
 	body, err := ad.Body(ctx, id)
 	if err != nil {
 		return err
@@ -674,6 +678,13 @@ func (e *Engine) fetchBody(ctx context.Context, acct AccountID, ad Adapter, id M
 // This is the lazy path that keeps the mirror bounded: envelopes are always
 // present, bodies arrive when something actually asks for one.
 func (e *Engine) Body(ctx context.Context, acct AccountID, id MessageID, ad Adapter) (*Body, error) {
+	id, err := e.resolveIdentity(ctx, acct, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.checkGraphFormat(ctx, acct, ad); err != nil {
+		return nil, err
+	}
 	body, err := e.store.Body(ctx, acct, id)
 	if err == nil {
 		return body, nil
@@ -729,6 +740,17 @@ func (e *Engine) Locate(ctx context.Context, acct AccountID, id MessageID, ad Ad
 // make the mirror briefly the source of truth. If the provider rejects the
 // operation, nothing local changed.
 func (e *Engine) Apply(ctx context.Context, acct AccountID, op Operation, ad Adapter) error {
+	op.IDs = append([]MessageID(nil), op.IDs...)
+	for i, id := range op.IDs {
+		resolved, err := e.resolveIdentity(ctx, acct, id)
+		if err != nil {
+			return err
+		}
+		op.IDs[i] = resolved
+	}
+	if err := e.checkGraphFormat(ctx, acct, ad); err != nil {
+		return err
+	}
 	unlock := e.lockAccount(acct)
 	defer unlock()
 	// Protocols that need a selected mailbox get one before mutating: a

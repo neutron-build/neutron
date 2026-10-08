@@ -259,8 +259,8 @@ func TestOpenAPIErrorResponses(t *testing.T) {
 		return keys(oaDig(t, spec, "paths", path, method, "responses").(map[string]any))
 	}
 	for path, want := range map[string][]string{
-		"/validated":   {"201", "400", "404", "422", "500"},
-		"/unvalidated": {"201", "400", "404", "500"},
+		"/validated":   {"201", "400", "404", "413", "422", "500"},
+		"/unvalidated": {"201", "400", "404", "413", "500"},
 		"/empty":       {"200", "400", "404", "500"},
 		"/search":      {"200", "400", "404", "422", "500"},
 	} {

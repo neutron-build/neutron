@@ -328,6 +328,23 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
 /// full in-memory buffer.
 pub struct BodyStream(pub crate::handler::ReqBody);
 
+/// The whole request, owned (RS-29 raw-handler adapter).
+///
+/// Handler factories published by addon crates (OAuth callbacks, GraphQL
+/// subscriptions) need the raw `Request` — query string, cookies, body —
+/// without going through serde extractors. Previously `Request` implemented
+/// neither `FromRequestParts` nor `FromRequest`, so `Fn(Request)` handlers
+/// could not satisfy the Router's `Handler` bounds and the documented
+/// mounting examples could not compile. Extracting the request swaps in an
+/// empty [`Request::shell`] placeholder (the same take-out pattern
+/// `BodyStream` uses), so later extractors see an empty body — order your
+/// extractors accordingly.
+impl FromRequest for Request {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        Ok(std::mem::replace(req, Request::shell()))
+    }
+}
+
 impl FromRequest for BodyStream {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
         match req.take_body() {

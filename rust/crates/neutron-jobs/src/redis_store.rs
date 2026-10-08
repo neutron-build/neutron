@@ -9,10 +9,10 @@
 //! jobs:seq              STRING (INCR counter for job IDs)
 //! ```
 //!
-//! Claiming jobs uses a Lua script so the ZPOPMIN + HSET is atomic.
+//! Admission and every state transition use Lua to update records and indexes
+//! atomically. This backend supports standalone Redis, not Redis Cluster.
 
 use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
 
 use crate::store::{now_ms, BoxFuture, JobStore, StoreError, StoredJob};
 
@@ -56,22 +56,13 @@ fn pending_key(q: &str) -> String {
 const RUNNING_KEY: &str = "jobs:running";
 const SEQ_KEY: &str = "jobs:seq";
 
-// Serialise StoredJob fields into a flat vec for HSET
-fn job_to_hset_args(job: &StoredJob) -> Vec<(String, String)> {
-    vec![
-        ("job_type".into(), job.job_type.clone()),
-        ("queue".into(), job.queue.clone()),
-        ("payload".into(), hex::encode(&job.payload)),
-        ("attempt".into(), job.attempt.to_string()),
-        ("max_attempts".into(), job.max_attempts.to_string()),
-        ("run_at_ms".into(), job.run_at_ms.to_string()),
-        ("enqueued_at_ms".into(), job.enqueued_at_ms.to_string()),
-    ]
-}
-
 fn parse_job(id: u64, map: &std::collections::HashMap<String, String>) -> Option<StoredJob> {
     Some(StoredJob {
         id,
+        claim_token: map
+            .get("claim_token")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         job_type: map.get("job_type")?.clone(),
         queue: map.get("queue")?.clone(),
         payload: hex::decode(map.get("payload")?).ok()?,
@@ -82,37 +73,152 @@ fn parse_job(id: u64, map: &std::collections::HashMap<String, String>) -> Option
     })
 }
 
+// These keys retain the existing standalone Redis layout. Cluster Redis is not
+// supported: scripts access job hashes and queue indexes across key slots.
+const CLAIM: &str = r#"
+local function uint(s, maximum)
+ if not s or not (s == '0' or string.match(s, '^[1-9][0-9]*$')) then return false end
+ return #s < #maximum or (#s == #maximum and s <= maximum)
+end
+-- Strict Unicode scalar UTF-8, matching Rust String admission (no overlong,
+-- surrogate, truncated or out-of-range sequences). Redis strings are bytes.
+local function utf8(s)
+ if not s then return false end
+ local i = 1
+ while i <= #s do
+  local a = string.byte(s, i)
+  local n, low, high = 0, 128, 191
+  if a < 128 then n = 0
+  elseif a >= 194 and a <= 223 then n = 1
+  elseif a >= 224 and a <= 239 then
+   n = 2
+   if a == 224 then low = 160 elseif a == 237 then high = 159 end
+  elseif a >= 240 and a <= 244 then
+   n = 3
+   if a == 240 then low = 144 elseif a == 244 then high = 143 end
+  else return false end
+  if i + n > #s then return false end
+  for j = 1, n do
+   local b = string.byte(s, i + j)
+   if b < (j == 1 and low or 128) or b > (j == 1 and high or 191) then return false end
+  end
+  i = i + n + 1
+ end
+ return true
+end
+-- Never decode arbitrary application/unknown hash fields in Rust.
+local function returned_job(key)
+ local names = {'job_type', 'queue', 'payload', 'attempt', 'max_attempts', 'run_at_ms', 'enqueued_at_ms', 'claim_token'}
+ local values = redis.call('HMGET', key, unpack(names))
+ local result = {}
+ for i, name in ipairs(names) do
+  table.insert(result, name)
+  table.insert(result, values[i] or '0') -- only legacy claim_token may be absent
+ end
+ return result
+end
+local function valid_job(key, id, recovery)
+ if not uint(id, '18446744073709551615') or redis.call('TYPE', key).ok ~= 'hash' then return false end
+ local f = redis.call('HMGET', key, 'job_type', 'queue', 'payload', 'attempt', 'max_attempts', 'run_at_ms', 'enqueued_at_ms', 'claim_token', 'status')
+ if not utf8(f[1]) or not utf8(f[2]) or not f[3] or #f[3] % 2 ~= 0 or string.find(f[3], '[^0-9a-fA-F]') then return false end
+ if not uint(f[4], recovery and '4294967294' or '4294967295') or not uint(f[5], '4294967295') then return false end
+ if not uint(f[6], '18446744073709551615') or not uint(f[7], '18446744073709551615') then return false end
+ if not uint(f[8] or '0', recovery and '9223372036854775807' or '9223372036854775806') then return false end
+ if not recovery and f[9] ~= 'pending' then return false end
+ return true
+end
+local ptype = redis.call('TYPE', KEYS[1]).ok
+local rtype = redis.call('TYPE', KEYS[2]).ok
+if (ptype ~= 'none' and ptype ~= 'zset') or (rtype ~= 'none' and rtype ~= 'zset') then
+ return redis.error_reply('invalid job index type')
+end
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local result = {}
+for _, id in ipairs(ids) do
+ local key = 'jobs:data:' .. id
+ if not valid_job(key, id, false) then return redis.error_reply('invalid job fields or integer overflow') end
+ if redis.call('HGET', key, 'queue') ~= ARGV[3] then return redis.error_reply('wrong pending queue') end
+end
+for _, id in ipairs(ids) do
+  local key = 'jobs:data:' .. id
+  if redis.call('EXISTS', key) == 1 then
+    redis.call('ZREM', KEYS[1], id)
+    redis.call('ZADD', KEYS[2], ARGV[1], id)
+    redis.call('HINCRBY', key, 'claim_token', 1)
+    redis.call('HSET', key, 'status', 'running')
+    table.insert(result, id)
+    table.insert(result, returned_job(key))
+  end
+end
+return result
+"#;
+const TRANSITION: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
+if redis.call('HGET', KEYS[1], 'status') ~= 'running' or
+   redis.call('HGET', KEYS[1], 'claim_token') ~= ARGV[2] then return 0 end
+local queue = redis.call('HGET', KEYS[1], 'queue')
+if not queue then return redis.error_reply('missing job queue') end
+local rtype = redis.call('TYPE', KEYS[2]).ok
+local ptype = redis.call('TYPE', 'jobs:pending:' .. queue).ok
+if (rtype ~= 'none' and rtype ~= 'zset') or (ptype ~= 'none' and ptype ~= 'zset') then
+ return redis.error_reply('invalid job index type')
+end
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('HSET', KEYS[1], 'status', ARGV[3])
+if ARGV[3] == 'pending' then
+  redis.call('HSET', KEYS[1], 'attempt', ARGV[4], 'run_at_ms', ARGV[5])
+  redis.call('ZADD', 'jobs:pending:' .. queue, ARGV[5], ARGV[1])
+else
+  redis.call('HSET', KEYS[1], 'error', ARGV[4])
+end
+return 1
+"#;
+impl RedisJobStore {
+    async fn transition(
+        &self,
+        id: u64,
+        token: u64,
+        status: &str,
+        value: &str,
+        run_at: u64,
+    ) -> Result<(), StoreError> {
+        let result: i64 = redis::Script::new(TRANSITION)
+            .key(data_key(id))
+            .key(RUNNING_KEY)
+            .arg(id)
+            .arg(token)
+            .arg(status)
+            .arg(value)
+            .arg(run_at)
+            .invoke_async(&mut self.conn())
+            .await
+            .map_err(|e| StoreError::Backend(Box::new(e)))?;
+        match result {
+            1 => Ok(()),
+            -1 => Err(StoreError::NotFound(id)),
+            _ => Err(StoreError::StaleClaim(id)),
+        }
+    }
+}
 impl JobStore for RedisJobStore {
-    fn push(&self, mut job: StoredJob) -> BoxFuture<'_, Result<u64, StoreError>> {
+    fn push(&self, job: StoredJob) -> BoxFuture<'_, Result<u64, StoreError>> {
         Box::pin(async move {
-            let mut conn = self.conn();
-
-            // Assign a monotonic ID
-            let id: u64 = conn
-                .incr(SEQ_KEY, 1u64)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-            job.id = id;
-
-            // Store job data hash
-            let args = job_to_hset_args(&job);
-            let _: () = redis::cmd("HSET")
-                .arg(data_key(id))
-                .arg(args)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            // Add to pending sorted set
-            let _: () = conn
-                .zadd(pending_key(&job.queue), id, job.run_at_ms)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            Ok(id)
+            redis::Script::new(r#"
+local ptype = redis.call('TYPE', KEYS[2]).ok
+if ptype ~= 'none' and ptype ~= 'zset' then return redis.error_reply('invalid pending index type') end
+redis.call('INCR', KEYS[1])
+local id = redis.call('GET', KEYS[1])
+redis.call('HSET', 'jobs:data:' .. id, 'job_type', ARGV[1], 'queue', ARGV[2],
+ 'payload', ARGV[3], 'attempt', ARGV[4], 'max_attempts', ARGV[5],
+ 'run_at_ms', ARGV[6], 'enqueued_at_ms', ARGV[7], 'status', 'pending', 'claim_token', '0')
+redis.call('ZADD', KEYS[2], ARGV[6], id)
+return id
+"#).key(SEQ_KEY).key(pending_key(&job.queue)).arg(&job.job_type).arg(&job.queue)
+                .arg(hex::encode(&job.payload)).arg(job.attempt).arg(job.max_attempts)
+                .arg(job.run_at_ms).arg(job.enqueued_at_ms).invoke_async(&mut self.conn()).await
+                .map_err(|e| StoreError::Backend(Box::new(e)))
         })
     }
-
     fn claim_due(
         &self,
         queue: &str,
@@ -120,183 +226,143 @@ impl JobStore for RedisJobStore {
     ) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
         let queue = queue.to_string();
         Box::pin(async move {
-            let mut conn = self.conn();
-            let now = now_ms();
-            let pkey = pending_key(&queue);
-
-            // Atomically pop up to `limit` due jobs and mark them running.
-            // Lua: ZPOPMIN by score range, then ZADD to running set.
-            let script = redis::Script::new(
-                r#"
-                local pkey   = KEYS[1]
-                local rkey   = KEYS[2]
-                local now    = tonumber(ARGV[1])
-                local limit  = tonumber(ARGV[2])
-                local now_ts = tonumber(ARGV[3])
-
-                local members = redis.call('ZRANGEBYSCORE', pkey, '-inf', now, 'LIMIT', 0, limit)
-                if #members == 0 then return {} end
-
-                redis.call('ZREM', pkey, unpack(members))
-                for _, id in ipairs(members) do
-                    redis.call('ZADD', rkey, now_ts, id)
-                end
-                return members
-            "#,
-            );
-
-            let ids: Vec<String> = script
-                .key(&pkey)
-                .key(RUNNING_KEY)
-                .arg(now)
-                .arg(limit as u64)
-                .arg(now)
-                .invoke_async(&mut conn)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            let mut jobs = Vec::with_capacity(ids.len());
-            for id_str in ids {
-                let id: u64 = id_str.parse().unwrap_or(0);
-                let map: std::collections::HashMap<String, String> = conn
-                    .hgetall(data_key(id))
-                    .await
-                    .map_err(|e| StoreError::Backend(Box::new(e)))?;
-                if let Some(job) = parse_job(id, &map) {
-                    jobs.push(job);
-                }
+            if limit == 0 {
+                return Ok(Vec::new());
             }
-            Ok(jobs)
-        })
-    }
-
-    fn mark_completed(&self, id: u64) -> BoxFuture<'_, Result<(), StoreError>> {
-        Box::pin(async move {
-            let mut conn = self.conn();
-            let _: () = conn
-                .zrem(RUNNING_KEY, id)
+            let rows: Vec<redis::Value> = redis::Script::new(CLAIM)
+                .key(pending_key(&queue))
+                .key(RUNNING_KEY)
+                .arg(now_ms())
+                .arg(limit.min(1024))
+                .arg(&queue)
+                .invoke_async(&mut self.conn())
                 .await
                 .map_err(|e| StoreError::Backend(Box::new(e)))?;
-            let _: () = conn
-                .hset(data_key(id), "status", "completed")
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-            Ok(())
+            decode_jobs(rows)
         })
     }
-
+    fn mark_completed(&self, id: u64, claim_token: u64) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async move { self.transition(id, claim_token, "completed", "", 0).await })
+    }
     fn mark_failed<'a>(
         &'a self,
         id: u64,
+        claim_token: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        let reason = reason.to_string();
-        Box::pin(async move {
-            let mut conn = self.conn();
-            let _: () = conn
-                .zrem(RUNNING_KEY, id)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-            let _: () = redis::cmd("HSET")
-                .arg(data_key(id))
-                .arg(&[("status", "failed"), ("error", &reason)])
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-            Ok(())
-        })
+        Box::pin(async move { self.transition(id, claim_token, "failed", reason, 0).await })
     }
-
     fn schedule_retry(
         &self,
         id: u64,
+        claim_token: u64,
         attempt: u32,
         run_at_ms: u64,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
-            let mut conn = self.conn();
-
-            // Get queue name for this job
-            let queue: String = conn
-                .hget(data_key(id), "queue")
+            self.transition(id, claim_token, "pending", &attempt.to_string(), run_at_ms)
                 .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            // Update attempt + run_at in hash, move from running → pending
-            let _: () = redis::cmd("HSET")
-                .arg(data_key(id))
-                .arg(&[
-                    ("attempt", attempt.to_string()),
-                    ("run_at_ms", run_at_ms.to_string()),
-                    ("status", "pending".to_string()),
-                ])
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            let _: () = conn
-                .zrem(RUNNING_KEY, id)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            let _: () = conn
-                .zadd(pending_key(&queue), id, run_at_ms)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            Ok(())
         })
     }
-
     fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
         Box::pin(async move {
-            let mut conn = self.conn();
-            let threshold = now_ms().saturating_sub(stale_secs * 1_000);
-
-            // Find all running jobs started before the threshold
-            let ids: Vec<String> = conn
-                .zrangebyscore(RUNNING_KEY, 0u64, threshold)
-                .await
-                .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-            let mut recovered = Vec::new();
-            for id_str in ids {
-                let id: u64 = id_str.parse().unwrap_or(0);
-                let map: std::collections::HashMap<String, String> = conn
-                    .hgetall(data_key(id))
-                    .await
-                    .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-                if let Some(mut job) = parse_job(id, &map) {
-                    job.attempt += 1;
-
-                    // Reset to pending in hash + sorted sets
-                    let _: () = redis::cmd("HSET")
-                        .arg(data_key(id))
-                        .arg(&[
-                            ("attempt", job.attempt.to_string()),
-                            ("run_at_ms", now_ms().to_string()),
-                            ("status", "pending".to_string()),
-                        ])
-                        .query_async(&mut conn)
-                        .await
-                        .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-                    let _: () = conn
-                        .zrem(RUNNING_KEY, id)
-                        .await
-                        .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-                    let _: () = conn
-                        .zadd(pending_key(&job.queue), id, now_ms())
-                        .await
-                        .map_err(|e| StoreError::Backend(Box::new(e)))?;
-
-                    recovered.push(job);
-                }
-            }
-
-            Ok(recovered)
+            let now = now_ms();
+            let rows: Vec<redis::Value> = redis::Script::new(r#"
+local function uint(s, maximum)
+ if not s or not (s == '0' or string.match(s, '^[1-9][0-9]*$')) then return false end
+ return #s < #maximum or (#s == #maximum and s <= maximum)
+end
+-- Strict Unicode scalar UTF-8, matching Rust String admission (no overlong,
+-- surrogate, truncated or out-of-range sequences). Redis strings are bytes.
+local function utf8(s)
+ if not s then return false end
+ local i = 1
+ while i <= #s do
+  local a = string.byte(s, i)
+  local n, low, high = 0, 128, 191
+  if a < 128 then n = 0
+  elseif a >= 194 and a <= 223 then n = 1
+  elseif a >= 224 and a <= 239 then
+   n = 2
+   if a == 224 then low = 160 elseif a == 237 then high = 159 end
+  elseif a >= 240 and a <= 244 then
+   n = 3
+   if a == 240 then low = 144 elseif a == 244 then high = 143 end
+  else return false end
+  if i + n > #s then return false end
+  for j = 1, n do
+   local b = string.byte(s, i + j)
+   if b < (j == 1 and low or 128) or b > (j == 1 and high or 191) then return false end
+  end
+  i = i + n + 1
+ end
+ return true
+end
+-- Never decode arbitrary application/unknown hash fields in Rust.
+local function returned_job(key)
+ local names = {'job_type', 'queue', 'payload', 'attempt', 'max_attempts', 'run_at_ms', 'enqueued_at_ms', 'claim_token'}
+ local values = redis.call('HMGET', key, unpack(names))
+ local result = {}
+ for i, name in ipairs(names) do
+  table.insert(result, name)
+  table.insert(result, values[i] or '0') -- only legacy claim_token may be absent
+ end
+ return result
+end
+local function valid_job(key, id, recovery)
+ if not uint(id, '18446744073709551615') or redis.call('TYPE', key).ok ~= 'hash' then return false end
+ local f = redis.call('HMGET', key, 'job_type', 'queue', 'payload', 'attempt', 'max_attempts', 'run_at_ms', 'enqueued_at_ms', 'claim_token', 'status')
+ if not utf8(f[1]) or not utf8(f[2]) or not f[3] or #f[3] % 2 ~= 0 or string.find(f[3], '[^0-9a-fA-F]') then return false end
+ if not uint(f[4], recovery and '4294967294' or '4294967295') or not uint(f[5], '4294967295') then return false end
+ if not uint(f[6], '18446744073709551615') or not uint(f[7], '18446744073709551615') then return false end
+ if not uint(f[8] or '0', recovery and '9223372036854775807' or '9223372036854775806') then return false end
+ if not recovery and f[9] ~= 'pending' then return false end
+ return true
+end
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1024)
+local result = {}
+for _, id in ipairs(ids) do
+ local key = 'jobs:data:' .. id
+ if not valid_job(key, id, true) then return redis.error_reply('invalid job fields or integer overflow') end
+ local queue = redis.call('HGET', key, 'queue')
+ if not queue then return redis.error_reply('invalid job fields') end
+ local ptype = redis.call('TYPE', 'jobs:pending:' .. queue).ok
+ if ptype ~= 'none' and ptype ~= 'zset' then return redis.error_reply('invalid pending index type') end
+end
+for _, id in ipairs(ids) do
+ local key = 'jobs:data:' .. id
+ local old_status = redis.call('HGET', key, 'status')
+ if old_status == 'running' or not old_status then
+  local attempt = redis.call('HINCRBY', key, 'attempt', 1)
+  local status = 'pending'
+  if attempt > tonumber(redis.call('HGET', key, 'max_attempts')) then status = 'failed' end
+  redis.call('HSET', key, 'status', status, 'run_at_ms', ARGV[2])
+  redis.call('ZREM', KEYS[1], id)
+  if status == 'pending' then
+   redis.call('ZADD', 'jobs:pending:' .. redis.call('HGET', key, 'queue'), ARGV[2], id)
+  end
+  table.insert(result, id)
+  table.insert(result, returned_job(key))
+ end
+end
+return result
+"#).key(RUNNING_KEY).arg(now.saturating_sub(stale_secs.saturating_mul(1_000)))
+                .arg(now).invoke_async(&mut self.conn()).await.map_err(|e| StoreError::Backend(Box::new(e)))?;
+            decode_jobs(rows)
         })
     }
+}
+fn decode_jobs(rows: Vec<redis::Value>) -> Result<Vec<StoredJob>, StoreError> {
+    let mut jobs = Vec::new();
+    for pair in rows.chunks_exact(2) {
+        let id: u64 =
+            redis::from_redis_value(&pair[0]).map_err(|e| StoreError::Backend(Box::new(e)))?;
+        let map =
+            redis::from_redis_value(&pair[1]).map_err(|e| StoreError::Backend(Box::new(e)))?;
+        jobs.push(
+            parse_job(id, &map)
+                .ok_or_else(|| StoreError::Backend("invalid stored Redis job".into()))?,
+        );
+    }
+    Ok(jobs)
 }

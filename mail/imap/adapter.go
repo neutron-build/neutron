@@ -352,6 +352,10 @@ func (a *Adapter) parseFetch(box mail.MailboxID, items token) (mail.Envelope, bo
 	}
 	if bs, ok := items.find("BODYSTRUCTURE"); ok {
 		env.HasAttachment = bodyStructureHasAttachment(bs)
+		env.AttachmentPresence = mail.AttachmentAbsent
+		if env.HasAttachment {
+			env.AttachmentPresence = mail.AttachmentPresent
+		}
 	}
 
 	if e, ok := items.find("ENVELOPE"); ok {

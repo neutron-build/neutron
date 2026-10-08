@@ -55,6 +55,10 @@ type Config struct {
 	// token elsewhere.
 	Token string
 
+	// AllowedOrigins explicitly authorizes additional credential destinations.
+	// The discovery origin is always allowed; session metadata grants nothing.
+	AllowedOrigins []string
+
 	HTTPClient *http.Client
 }
 
@@ -92,6 +96,39 @@ func Dial(ctx context.Context, cfg Config) (*Adapter, error) {
 		return nil, err
 	}
 
+	// Install mandatory checks before discovery, including with custom clients.
+	allowed := map[string]bool{endpointOrigin(sessionURL): true}
+	for _, raw := range cfg.AllowedOrigins {
+		u, err := credentialEndpoint(raw, "allowed origin")
+		if err != nil {
+			return nil, err
+		}
+		if u.Path != "" && u.Path != "/" {
+			return nil, errors.New("jmap: allowed origin contains a path")
+		}
+		allowed[endpointOrigin(u)] = true
+	}
+	clone := *hc
+	previous := hc.CheckRedirect
+	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("jmap: too many redirects")
+		}
+		if err := permittedEndpoint(req.URL, allowed); err != nil {
+			return err
+		}
+		if previous != nil {
+			return previous(req, via)
+		}
+		return nil
+	}
+	base := hc.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	clone.Transport = originTransport{base: base, allowed: allowed}
+	hc = &clone
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sessionURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("jmap: session request: %w", err)
@@ -123,42 +160,21 @@ func Dial(ctx context.Context, cfg Config) (*Adapter, error) {
 	if s.APIURL == "" || s.DownloadURL == "" {
 		return nil, fmt.Errorf("jmap: session is missing apiUrl or downloadUrl")
 	}
-	api, err := credentialEndpoint(s.APIURL, "apiUrl")
+	_, err = credentialEndpoint(s.APIURL, "apiUrl")
 	if err != nil {
 		return nil, err
 	}
-	download, err := credentialEndpoint(s.DownloadURL, "downloadUrl")
+	_, err = credentialEndpoint(s.DownloadURL, "downloadUrl")
 	if err != nil {
 		return nil, err
 	}
-	// Redirects keep credentials inside the two origins the session
-	// advertised — a redirect downgrade or a third origin must not become
-	// a silent token forwarding (audit 5 JMAP-02).
-	client := hc
-	if client.CheckRedirect == nil {
-		clone := *hc
-		client = &clone
-	}
-	if client.CheckRedirect == nil {
-		trusted := map[string]bool{
-			strings.ToLower(api.Scheme + "://" + api.Host):           true,
-			strings.ToLower(download.Scheme + "://" + download.Host): true,
-		}
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("jmap: too many provider redirects")
-			}
-			u, err := credentialEndpoint(req.URL.String(), "redirect")
-			if err != nil {
-				return err
-			}
-			if !trusted[strings.ToLower(u.Scheme+"://"+u.Host)] {
-				return errors.New("jmap: redirect left the session-advertised origins")
-			}
-			return nil
+	for _, raw := range []string{s.APIURL, s.DownloadURL} {
+		u, _ := url.Parse(raw)
+		if err := permittedEndpoint(u, allowed); err != nil {
+			return nil, err
 		}
 	}
-	return &Adapter{http: client, apiURL: s.APIURL, downloadURL: s.DownloadURL, accountID: acct, token: cfg.Token}, nil
+	return &Adapter{http: hc, apiURL: s.APIURL, downloadURL: s.DownloadURL, accountID: acct, token: cfg.Token}, nil
 }
 
 func (a *Adapter) Provider() mail.Provider { return mail.ProviderJMAP }
@@ -781,6 +797,10 @@ func decodeEmails(raw json.RawMessage) ([]mail.Envelope, error) {
 			}
 		}
 		env.Keywords = keywordsFrom(m.Keywords)
+		env.AttachmentPresence = mail.AttachmentAbsent
+		if env.HasAttachment {
+			env.AttachmentPresence = mail.AttachmentPresent
+		}
 		env.Fingerprint = mail.ComputeFingerprint(&env)
 		envs = append(envs, env)
 	}
@@ -1129,3 +1149,34 @@ var _ mail.Adapter = (*Adapter)(nil)
 // errIncompleteBody reports a provider body value that explicitly flagged
 // itself truncated or undecodable; the engine must not cache it as complete.
 var errIncompleteBody = errors.New("provider returned incomplete body content")
+
+// endpointOrigin canonicalizes effective ports, without changing path/case IDs.
+func endpointOrigin(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return strings.ToLower(u.Scheme) + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+}
+func permittedEndpoint(u *url.URL, allowed map[string]bool) error {
+	if u == nil || u.User != nil || u.Fragment != "" || !allowed[endpointOrigin(u)] {
+		return errors.New("jmap: credential destination is not permitted")
+	}
+	return nil
+}
+
+type originTransport struct {
+	base    http.RoundTripper
+	allowed map[string]bool
+}
+
+func (t originTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if err := permittedEndpoint(r.URL, t.allowed); err != nil {
+		return nil, err
+	}
+	return t.base.RoundTrip(r)
+}

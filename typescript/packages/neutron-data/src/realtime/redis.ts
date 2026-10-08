@@ -1,4 +1,5 @@
 import type { RealtimeBus } from "./index.js";
+import { closeResources } from "../internal/resources.js";
 import { lazyImport } from "../internal/lazy-import.js";
 
 type Subscriber = (payload: unknown) => void;
@@ -33,6 +34,8 @@ export interface RedisRealtimeBusOptions {
   url?: string;
   /** Supply your own ioredis client to use as the publisher connection. */
   publisherClient?: RedisPublisherLike;
+  /** Injected publishers default to borrowed; factory-created publishers are owned. */
+  publisherOwnership?: "borrowed" | "owned";
   /** Optional channel prefix, e.g. "neutron:" → publish to "neutron:my-channel". */
   channelPrefix?: string;
 }
@@ -45,10 +48,14 @@ export class RedisRealtimeBus implements RealtimeBus {
   private readonly subscribed = new Set<string>();
   private readonly channelPrefix: string;
   private closed = false;
+  private operations: Promise<void> = Promise.resolve();
+  private closePromise: Promise<void> | null = null;
+  private cleanupErrors: unknown[] = [];
 
   constructor(
     publisher: RedisPublisherLike,
-    channelPrefix = ""
+    channelPrefix = "",
+    private readonly publisherOwnership: "borrowed" | "owned" = "owned",
   ) {
     this.publisher = publisher;
     this.channelPrefix = channelPrefix;
@@ -67,79 +74,83 @@ export class RedisRealtimeBus implements RealtimeBus {
 
   // ── subscribe ────────────────────────────────────────────────────────
   subscribe(channel: string, subscriber: Subscriber): () => void {
-    if (this.closed) {
-      throw new Error("RedisRealtimeBus is closed.");
-    }
-
-    const prefixedChannel = this.prefixed(channel);
-    let subs = this.channels.get(prefixedChannel);
-    const isNew = !subs;
-
-    if (!subs) {
-      subs = new Set<Subscriber>();
-      this.channels.set(prefixedChannel, subs);
-    }
-    subs.add(subscriber);
-
-    // Tell Redis when this channel has no subscription yet — either because
-    // this is its first subscriber, or because a previous SUBSCRIBE attempt
-    // failed (see the catch below: failed attempts keep the local entry so
-    // subscribers registered mid-flight are not dropped; the next
-    // subscribe() call is what retries them).
-    if (isNew || !this.subscribed.has(prefixedChannel)) {
-      const sub = this.ensureSubscriber();
-      // Fire-and-forget; the subscriber will buffer messages once acked.
-      sub.subscribe(prefixedChannel).then(
-        () => {
-          this.subscribed.add(prefixedChannel);
-        },
-        (err: unknown) => {
-          // Keep the channel entry: deleting it wholesale would silently
-          // unregister every subscriber that joined while the SUBSCRIBE was
-          // in flight. A later subscribe() retries (not in `subscribed`).
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error(
-            `[neutron-data] RedisRealtimeBus: failed to subscribe to "${prefixedChannel}": ${msg}`
-          );
-        }
-      );
-    }
-
-    // Return an unsubscribe function (mirrors InMemoryRealtimeBus).
-    return () => {
-      const existing = this.channels.get(prefixedChannel);
-      if (!existing) {
-        return;
-      }
-      existing.delete(subscriber);
-      if (existing.size === 0) {
-        this.channels.delete(prefixedChannel);
-        this.subscribed.delete(prefixedChannel);
-        // Unsubscribe from Redis when no local handlers remain.
-        if (this.subscriber) {
-          this.subscriber.unsubscribe(prefixedChannel).catch(() => {
-            // best-effort
-          });
-        }
-      }
-    };
+    const registration = this.register(channel, subscriber);
+    registration.ready.catch((error: unknown) => {
+      console.error(`[neutron-data] RedisRealtimeBus: failed to subscribe to "${channel}": ${String(error)}`);
+    });
+    return registration.unsubscribe;
   }
 
-  // ── close ────────────────────────────────────────────────────────────
+  async subscribeAsync(channel: string, subscriber: Subscriber): Promise<() => void> {
+    const registration = this.register(channel, subscriber);
+    try { await registration.ready; }
+    catch (error) { registration.unsubscribe(); throw error; }
+    return registration.unsubscribe;
+  }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const work = this.operations.then(operation);
+    this.operations = work.catch(() => {});
+    return work;
+  }
+
+  private register(channel: string, subscriber: Subscriber): { ready: Promise<void>; unsubscribe: () => void } {
+    if (this.closed) throw new Error("RedisRealtimeBus is closed.");
+    const key = this.prefixed(channel);
+    const native = this.ensureSubscriber();
+    let handlers = this.channels.get(key);
+    if (!handlers) { handlers = new Set<Subscriber>(); this.channels.set(key, handlers); }
+    handlers.add(subscriber);
+    const registered = handlers;
+    const ready = this.enqueue(async () => {
+      if (this.closed || this.channels.get(key) !== registered) throw new Error("Subscription closed before readiness");
+      if (!this.subscribed.has(key)) {
+        await native.subscribe(key);
+        if (this.closed) {
+          try { await native.unsubscribe(key); } catch (error) { this.cleanupErrors.push(error); throw error; }
+          throw new Error("Subscription closed during acquisition");
+        }
+        if (this.channels.get(key) !== registered) throw new Error("Subscription removed during acquisition");
+        this.subscribed.add(key);
+      }
+    });
+    let removed = false;
+    const unsubscribe = (): void => {
+      if (removed) return;
+      removed = true;
+      if (this.channels.get(key) !== registered) return;
+      registered.delete(subscriber);
+      if (registered.size) return;
+      this.channels.delete(key);
+      this.subscribed.delete(key);
+      // Serialize teardown behind acquisitions and ahead of later registrations.
+      void this.enqueue(async () => {
+        if (!this.closed) {
+          try { await native.unsubscribe(key); } catch (error) { this.cleanupErrors.push(error); throw error; }
+        }
+      }).catch(() => {});
+    };
+    return { ready, unsubscribe };
+  }
+
   async close(): Promise<void> {
-    if (this.closed) {
-      return;
-    }
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.channels.clear();
     this.subscribed.clear();
-
-    if (this.subscriber) {
-      this.subscriber.removeAllListeners("message");
-      await this.subscriber.quit().catch(() => {});
-      this.subscriber = null;
-    }
-    await this.publisher.quit().catch(() => {});
+    this.closePromise = (async () => {
+      await this.operations;
+      const resources: (() => unknown | Promise<unknown>)[] = [];
+      if (this.subscriber) {
+        const native = this.subscriber;
+        resources.push(() => native.removeAllListeners("message"), () => native.quit());
+        this.subscriber = null;
+      }
+      if (this.publisherOwnership === "owned") resources.push(() => this.publisher.quit());
+      const failures = [...this.cleanupErrors, ...await closeResources(resources)];
+      if (failures.length) throw new AggregateError(failures, "Realtime cleanup failed", { cause: failures[0] });
+    })();
+    return this.closePromise;
   }
 
   // ── internals ────────────────────────────────────────────────────────
@@ -199,7 +210,8 @@ export async function createRedisRealtimeBus(
   if (options.publisherClient) {
     return new RedisRealtimeBus(
       options.publisherClient,
-      options.channelPrefix ?? ""
+      options.channelPrefix ?? "",
+      options.publisherOwnership ?? "borrowed",
     );
   }
 

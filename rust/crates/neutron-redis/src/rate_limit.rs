@@ -61,6 +61,7 @@ if count < limit then
     redis.call('ZADD', key, now, member)
     local expire_secs = math.ceil(window / 1000) + 1
     redis.call('EXPIRE', key, expire_secs)
+    redis.call('EXPIRE', key .. ':seq', expire_secs)
     return {1, limit - count - 1}
 else
     return {0, 0}
@@ -117,7 +118,7 @@ pub struct RedisRateLimitLayer {
     window: Duration,
     key_ext: KeyExtractor,
     prefix: String,
-    script_sha: Arc<std::sync::OnceLock<String>>,
+    fail_open: bool,
 }
 
 impl RedisRateLimitLayer {
@@ -133,7 +134,7 @@ impl RedisRateLimitLayer {
             window,
             key_ext: KeyExtractor::Ip,
             prefix: "neutron:rl".into(),
-            script_sha: Arc::new(std::sync::OnceLock::new()),
+            fail_open: false,
         }
     }
 
@@ -149,63 +150,39 @@ impl RedisRateLimitLayer {
         self
     }
 
-    /// Load the Lua script into Redis and cache its SHA.
-    async fn load_script(conn: &mut redis::aio::ConnectionManager) -> redis::RedisResult<String> {
-        let sha: String = redis::cmd("SCRIPT")
-            .arg("LOAD")
-            .arg(SLIDING_WINDOW_SCRIPT)
-            .query_async(conn)
-            .await?;
-        Ok(sha)
+    /// Choose whether backend failures admit requests (default: fail closed).
+    pub fn fail_open(mut self, enabled: bool) -> Self {
+        self.fail_open = enabled;
+        self
     }
 
-    /// Check rate limit.  Returns `(allowed, remaining)`.
     async fn check(
         pool: &RedisPool,
-        script_sha: &Arc<std::sync::OnceLock<String>>,
+        fail_open: bool,
         bucket_key: &str,
         limit: u32,
         window_ms: u64,
     ) -> (bool, i64) {
         let mut conn = pool.conn();
-
-        // Ensure SHA is loaded.
-        let sha = if let Some(s) = script_sha.get() {
-            s.clone()
-        } else {
-            match Self::load_script(&mut conn).await {
-                Ok(s) => {
-                    let _ = script_sha.set(s.clone());
-                    s
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "redis rate-limit script load failed, allowing request");
-                    return (true, -1);
-                }
-            }
-        };
-
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let result: redis::RedisResult<Vec<i64>> = redis::cmd("EVALSHA")
-            .arg(&sha)
-            .arg(1)
-            .arg(bucket_key)
+        let result: redis::RedisResult<Vec<i64>> = redis::Script::new(SLIDING_WINDOW_SCRIPT)
+            .key(bucket_key)
             .arg(limit)
             .arg(window_ms)
             .arg(now_ms)
-            .query_async(&mut conn)
+            .invoke_async(&mut conn)
             .await;
 
         match result {
             Ok(v) if v.len() == 2 => (v[0] == 1, v[1]),
-            Ok(_) => (true, -1),
+            Ok(_) => (fail_open, -1),
             Err(e) => {
-                tracing::warn!(error = %e, "redis rate-limit check failed, allowing request");
-                (true, -1)
+                tracing::warn!(error = %e, allowed = fail_open, "redis rate-limit backend failed; applying configured admission policy");
+                (fail_open, -1)
             }
         }
     }
@@ -218,12 +195,18 @@ impl MiddlewareTrait for RedisRateLimitLayer {
         let window_ms = self.window.as_millis() as u64;
         let client_key = self.key_ext.extract(&req);
         let bucket_key = format!("{}:{}", self.prefix, client_key);
-        let sha = Arc::clone(&self.script_sha);
+        let fail_open = self.fail_open;
 
         Box::pin(async move {
             let (allowed, remaining) =
-                Self::check(&pool, &sha, &bucket_key, limit, window_ms).await;
+                Self::check(&pool, fail_open, &bucket_key, limit, window_ms).await;
 
+            if !allowed && remaining < 0 {
+                return http::Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::full("Rate limit backend unavailable"))
+                    .unwrap();
+            }
             if !allowed {
                 let body = serde_json::to_vec(&serde_json::json!({
                     "error": { "status": 429, "message": "rate limit exceeded" }
@@ -285,5 +268,44 @@ mod tests {
                 .key(KeyExtractor::Ip)
                 .prefix("test");
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires NEUTRON_AUDIT_REDIS_URL pointing to disposable standalone Redis"]
+    async fn script_flush_recovers_and_sequence_expires() {
+        let pool = RedisPool::new(&std::env::var("NEUTRON_AUDIT_REDIS_URL").unwrap())
+            .await
+            .unwrap();
+        let key = format!("neutron:rs26:{}", std::process::id());
+        assert_eq!(
+            RedisRateLimitLayer::check(&pool, false, &key, 1, 1000).await,
+            (true, 0)
+        );
+        let mut conn = pool.conn();
+        let _: () = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            RedisRateLimitLayer::check(&pool, false, &key, 1, 1000).await,
+            (false, 0)
+        );
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("{key}:seq"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(ttl > 0);
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .arg(format!("{key}:seq"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 }

@@ -18,14 +18,15 @@
 //!     .middleware(SessionLayer::new(store, key));
 //! ```
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(test)]
 use redis::AsyncCommands;
 
-use crate::error::RedisError;
 use crate::pool::RedisPool;
-use neutron::session::SessionStore;
+use neutron::session::{SessionData, SessionFuture, SessionStore, SessionStoreError};
 
 // ---------------------------------------------------------------------------
 // RedisSessionStore
@@ -36,11 +37,9 @@ use neutron::session::SessionStore;
 /// Sessions are serialised as JSON strings under the key `{prefix}:{id}` and
 /// given a TTL equal to the session lifetime.
 ///
-/// **Runtime requirement:** neutron-redis uses
-/// `tokio::task::block_in_place` internally to bridge the sync
-/// `SessionStore` trait to async Redis operations.  The application must use
-/// a **multi-threaded** Tokio runtime (`rt-multi-thread`), which is Neutron's
-/// default.
+/// Async version 2 contract works on both current-thread and worker runtimes.
+/// Old unconditional writers must stop before cutover; use a distinct prefix
+/// when another writer's atomic revision semantics cannot be established.
 #[derive(Clone)]
 pub struct RedisSessionStore {
     pool: RedisPool,
@@ -67,72 +66,115 @@ impl RedisSessionStore {
     fn redis_key(&self, id: &str) -> String {
         format!("{}:{}", self.prefix, id)
     }
-
-    /// Synchronously run an async Redis future using `block_in_place`.
-    ///
-    /// Requires a multi-threaded Tokio runtime.
-    fn block<F, T>(&self, f: F) -> Result<T, RedisError>
-    where
-        F: std::future::Future<Output = Result<T, RedisError>>,
-    {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
-    }
 }
 
 impl SessionStore for RedisSessionStore {
-    fn load(&self, id: &str) -> Option<HashMap<String, serde_json::Value>> {
-        let key = self.redis_key(id);
-        let mut conn = self.pool.conn();
-
-        let result = self.block(async move {
-            let raw: Option<String> = conn.get(&key).await.map_err(RedisError::Redis)?;
-            Ok::<_, RedisError>(raw)
-        });
-
-        match result {
-            Ok(Some(json)) => serde_json::from_str(&json).ok(),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, "redis session load failed");
-                None
-            }
-        }
+    fn load_versioned<'a>(&'a self, id: &'a str) -> SessionFuture<'a, Option<(SessionData, u64)>> {
+        Box::pin(async move {
+            let key = self.redis_key(id);
+            let values: Vec<Option<String>> = redis::Script::new(
+                r"
+                local data = redis.call('GET', KEYS[1])
+                if not data then return {false, false} end
+                local revision = redis.call('GET', KEYS[2])
+                if not revision then
+                    revision = '1'
+                    local ttl = redis.call('PTTL', KEYS[1])
+                    redis.call('SET', KEYS[2], revision)
+                    if ttl > 0 then redis.call('PEXPIRE', KEYS[2], ttl) end
+                end
+                return {data, revision}
+            ",
+            )
+            .key(&key)
+            .key(format!("{key}:rev"))
+            .invoke_async(&mut self.pool.conn())
+            .await
+            .map_err(|e| SessionStoreError::Unavailable(e.to_string()))?;
+            let mut values = values.into_iter();
+            let Some(raw) = values.next().flatten() else {
+                return Ok(None);
+            };
+            let revision = values
+                .next()
+                .flatten()
+                .and_then(|r| r.parse::<u64>().ok())
+                .filter(|r| *r > 0)
+                .ok_or_else(|| SessionStoreError::Corrupt("invalid session revision".into()))?;
+            let data = serde_json::from_str(&raw)
+                .map_err(|e| SessionStoreError::Corrupt(e.to_string()))?;
+            Ok(Some((data, revision)))
+        })
     }
-
-    fn save(&self, id: &str, data: HashMap<String, serde_json::Value>, ttl: Duration) {
-        let key = self.redis_key(id);
-        let mut conn = self.pool.conn();
-        let ttl_secs = ttl.as_secs().max(1);
-
-        let serialised = match serde_json::to_string(&data) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "redis session serialisation failed");
-                return;
+    fn commit<'a>(
+        &'a self,
+        id: &'a str,
+        data: SessionData,
+        ttl: Duration,
+        expected: u64,
+    ) -> SessionFuture<'a, ()> {
+        Box::pin(async move {
+            if expected >= i64::MAX as u64 {
+                return Err(SessionStoreError::Conflict);
             }
-        };
-
-        let result = self.block(async move {
-            conn.set_ex::<_, _, ()>(&key, serialised, ttl_secs)
-                .await
-                .map_err(RedisError::Redis)
-        });
-
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "redis session save failed");
-        }
+            let raw = serde_json::to_string(&data)
+                .map_err(|e| SessionStoreError::Corrupt(e.to_string()))?;
+            let key = self.redis_key(id);
+            let next = expected + 1; // Rust exact integer, never Lua floating arithmetic.
+            let result: i64 = redis::Script::new(
+                r"
+                if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+                local data = redis.call('GET', KEYS[1])
+                local rev = redis.call('GET', KEYS[3])
+                if not data and ARGV[3] ~= '0' then return 0 end
+                if (rev or '0') ~= ARGV[3] then return 0 end
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+                redis.call('SET', KEYS[3], ARGV[4], 'EX', ARGV[2])
+                return 1
+            ",
+            )
+            .key(&key)
+            .key(format!("{key}:tomb"))
+            .key(format!("{key}:rev"))
+            .arg(raw)
+            .arg(ttl.as_secs().max(1))
+            .arg(expected)
+            .arg(next)
+            .invoke_async(&mut self.pool.conn())
+            .await
+            .map_err(|e| SessionStoreError::Unavailable(e.to_string()))?;
+            if result == 1 {
+                Ok(())
+            } else {
+                Err(SessionStoreError::Conflict)
+            }
+        })
     }
-
-    fn destroy(&self, id: &str) {
-        let key = self.redis_key(id);
-        let mut conn = self.pool.conn();
-
-        let result =
-            self.block(async move { conn.del::<_, ()>(&key).await.map_err(RedisError::Redis) });
-
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "redis session destroy failed");
-        }
+    fn revoke<'a>(&'a self, id: &'a str, expected: u64) -> SessionFuture<'a, ()> {
+        Box::pin(async move {
+            let key = self.redis_key(id);
+            let result: i64 = redis::Script::new(
+                r"
+                local rev = redis.call('GET', KEYS[3])
+                if (rev or '0') ~= ARGV[1] then return 0 end
+                redis.call('DEL', KEYS[1], KEYS[3])
+                redis.call('SET', KEYS[2], '1', 'EX', 604800)
+                return 1
+            ",
+            )
+            .key(&key)
+            .key(format!("{key}:tomb"))
+            .key(format!("{key}:rev"))
+            .arg(expected)
+            .invoke_async(&mut self.pool.conn())
+            .await
+            .map_err(|e| SessionStoreError::Unavailable(e.to_string()))?;
+            if result == 1 {
+                Ok(())
+            } else {
+                Err(SessionStoreError::Conflict)
+            }
+        })
     }
 }
 
@@ -147,7 +189,6 @@ mod tests {
     #[test]
     fn redis_key_format() {
         // No Redis connection needed — test key format only.
-        struct FakePool;
         // We just test the key generation logic inline.
         let prefix = "myapp:session";
         let id = "abc123";
@@ -168,5 +209,64 @@ mod tests {
             let store = RedisSessionStore::new(pool).prefix("custom");
             assert_eq!(store.prefix, "custom");
         }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires NEUTRON_AUDIT_REDIS_URL pointing to disposable standalone Redis"]
+    async fn legacy_session_receives_revision_atomically_on_load() {
+        let pool = RedisPool::new(&std::env::var("NEUTRON_AUDIT_REDIS_URL").unwrap())
+            .await
+            .unwrap();
+        let store = RedisSessionStore::new(pool.clone())
+            .prefix(format!("neutron:legacy-rs03:{}", std::process::id()));
+        let key = store.redis_key("legacy");
+        let mut conn = pool.conn();
+        let _: () = conn.set_ex(&key, r#"{"user":"legacy"}"#, 60).await.unwrap();
+        let (data, revision) = store.load_versioned("legacy").await.unwrap().unwrap();
+        assert_eq!(data["user"], "legacy");
+        assert_eq!(revision, 1);
+        let ttl: i64 = conn.ttl(format!("{key}:rev")).await.unwrap();
+        assert!(ttl > 0 && ttl <= 60);
+        assert!(store.revoke("legacy", revision).await.is_ok());
+        let _: () = conn.del(format!("{key}:tomb")).await.unwrap();
+        assert!(!store
+            .commit("legacy", data, Duration::from_secs(60), revision)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires NEUTRON_AUDIT_REDIS_URL pointing to disposable standalone Redis"]
+    async fn stale_revision_cannot_resurrect_expired_or_destroyed_data() {
+        let pool = RedisPool::new(&std::env::var("NEUTRON_AUDIT_REDIS_URL").unwrap())
+            .await
+            .unwrap();
+        let store = RedisSessionStore::new(pool.clone())
+            .prefix(format!("neutron:rs03:{}", std::process::id()));
+        let id = "session";
+        let mut data = HashMap::new();
+        data.insert("user".into(), serde_json::json!("alice"));
+        assert!(store
+            .commit(id, data.clone(), Duration::from_secs(60), 0)
+            .await
+            .is_ok());
+        let (loaded, revision) = store.load_versioned(id).await.unwrap().unwrap();
+        assert_eq!(loaded["user"], "alice");
+        assert!(revision > 0);
+        assert!(store.revoke(id, revision).await.is_ok());
+        let key = store.redis_key(id);
+        let mut conn = pool.conn();
+        // Model expiry of both the revision and the tombstone after logout.
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .arg(format!("{key}:rev"))
+            .arg(format!("{key}:tomb"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(!store
+            .commit(id, loaded, Duration::from_secs(60), revision)
+            .await
+            .is_ok());
+        assert!(store.load_versioned(id).await.unwrap().is_none());
     }
 }

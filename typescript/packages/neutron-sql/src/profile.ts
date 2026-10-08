@@ -327,7 +327,8 @@ function finiteCapabilityGate(raw: Driver, engine: EngineIdentity): CapabilityGa
     status,
     assert: async (required: readonly StatementCapability[]): Promise<void> => {
       if (required.length === 0) return;
-      const settled = await Promise.all(required.map((capability) => status(capability)));
+      const settled: CapabilityEvidence[] = [];
+      for (const capability of required) settled.push(await status(capability));
       const failing = settled.filter((result) => result.status !== "supported");
       if (failing.length > 0) {
         const lines = failing.map((result) => `  - "${result.capability}": ${result.status} (${result.evidence})`);
@@ -359,9 +360,14 @@ export async function admitExecutionProfile(raw: Driver, profile: ExecutionProfi
   if (profile !== NUCLEUS_CANDIDATE_PROFILE) {
     return { driver: raw, capabilities: capabilityGate(raw), identity: admitted.identity };
   }
+  const capabilities = finiteCapabilityGate(raw, admitted.engine);
+  // This finite profile has exactly one probeable capability. Resolve it
+  // before guarded transaction admission: the pin permits only point CRUD
+  // and transaction control, and must never run arbitrary probe SQL.
+  await capabilities.status("jsonb-functions");
   return {
     driver: guardedDriver(raw, finiteStatementGuard(tables)),
-    capabilities: finiteCapabilityGate(raw, admitted.engine),
+    capabilities,
     identity: admitted.identity,
   };
 }

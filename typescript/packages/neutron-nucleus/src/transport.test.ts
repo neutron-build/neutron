@@ -7,6 +7,7 @@ import {
   EmbeddedTransport,
   PgTransport,
   createTransport,
+  withKV,
   NucleusConnectionError,
   NucleusError,
   NucleusQueryError,
@@ -168,7 +169,7 @@ describe("MobileTransport", () => {
       offlineQueueEnabled: false,
     });
 
-    const result = await transport.query("SELECT * FROM users");
+    const result = await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
     assert.equal(result.rows.length, 1);
     assert.equal(calls.length, 3);
   });
@@ -192,7 +193,7 @@ describe("MobileTransport", () => {
     assert.equal(calls.length, 1);
   });
 
-  it("caches SELECT queries", async () => {
+  it("caches explicitly opted-in pure reads", async () => {
     const { fetch: fakeFetch, calls } = makeFakeFetch([
       { ok: true, status: 200, body: { ok: true, data: [{ id: 1 }], rowCount: 1 } },
     ]);
@@ -207,8 +208,8 @@ describe("MobileTransport", () => {
       offlineQueueEnabled: false,
     });
 
-    const result1 = await transport.query("SELECT * FROM users");
-    const result2 = await transport.query("SELECT * FROM users");
+    const result1 = await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
+    const result2 = await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
     // Fetch called only once — second call served from cache
     assert.equal(calls.length, 1);
     assert.deepEqual(result1, result2);
@@ -251,14 +252,14 @@ describe("MobileTransport", () => {
     });
 
     // First call populates cache
-    const result1 = await transport.query("SELECT * FROM users");
+    const result1 = await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
     assert.equal(calls.length, 1);
 
     // Invalidate cache entries containing "users"
     transport.invalidateCache("users");
 
     // Second call should hit the server again
-    const result2 = await transport.query("SELECT * FROM users");
+    const result2 = await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
     assert.equal(calls.length, 2);
     assert.equal((result2.rows[0] as Record<string, unknown>).id, 2);
   });
@@ -279,12 +280,12 @@ describe("MobileTransport", () => {
       offlineQueueEnabled: false,
     });
 
-    await transport.query("SELECT * FROM users");
+    await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
     assert.equal(calls.length, 1);
 
     transport.invalidateCache();
 
-    const result2 = await transport.query("SELECT * FROM users");
+    const result2 = await transport.query("SELECT * FROM users", [], { readOnly: true, cache: true });
     assert.equal(calls.length, 2);
     assert.equal((result2.rows[0] as Record<string, unknown>).id, 10);
   });
@@ -391,9 +392,11 @@ describe("MobileTransport offline queue", () => {
       maxQueueSize: 2,
     });
 
-    // Fill the queue
-    transport.execute("INSERT INTO a VALUES (1)");
-    transport.execute("INSERT INTO b VALUES (2)");
+    // Fill the queue. The queued promises only settle on close(); attach
+    // catch handlers so their eventual "transport closed" rejection does
+    // not surface as an unhandled rejection after the test ends.
+    transport.execute("INSERT INTO a VALUES (1)").catch(() => {});
+    transport.execute("INSERT INTO b VALUES (2)").catch(() => {});
     assert.equal(transport.queueSize, 2);
 
     // Third write should reject
@@ -432,11 +435,11 @@ describe("HttpTransport", () => {
 
     const transport = new HttpTransport("http://localhost:5432", {}, 50);
 
-    // Should throw a connection error wrapping the abort
+    // The configured deadline has a distinct timeout outcome
     await assert.rejects(
       () => transport.query("SELECT 1"),
       (err: unknown) => {
-        assert(err instanceof NucleusConnectionError);
+        assert.equal((err as Error).name, "TimeoutError");
         return true;
       },
     );
@@ -806,6 +809,17 @@ describe("HttpTransport signal handling (X04 MAJOR-1)", () => {
     }
   });
 
+  it("deadline aborts a real streaming response after headers arrive (TSD-08)", async () => {
+    const port = await startServer(async (res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.flushHeaders();
+      res.write('{"ok":true,"data":');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      res.end('[]}');
+    });
+    await assert.rejects(new HttpTransport(`http://127.0.0.1:${port}`, {}, 20).query('SELECT 1'), { name: 'TimeoutError' });
+  });
+
   it("default construction (no timeout) with a live signal completes normally", async () => {
     const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const port = await startServer(async (res) => {
@@ -909,6 +923,11 @@ async function patchCancelPool(cfg: CancelProbeCfg): Promise<{ records: CancelPr
         },
         connect: async () => ({
           query: async (sql: string) => {
+            if (sql.includes("pg_cancel_backend")) {
+              records.poolQueries.push({ sql, params: [PID] });
+              cancelStatement?.(new Error("canceling statement due to user request"));
+              return { rows: [{ canceled: true }], rowCount: 1 };
+            }
             if (sql.includes("pg_backend_pid")) {
               if (cfg.pidDelayMs) await sleep(cfg.pidDelayMs);
               if (cfg.pidFails) throw new Error("engine lacks pg_backend_pid");
@@ -944,9 +963,7 @@ describe("PgTransport queryCancelable pid-window honesty (X04 MAJOR-2)", () => {
       await assert.rejects(
         () => transport.fetchval("SELECT 42 AS v", [], { signal: ac.signal }),
         (err: unknown) => {
-          assert(err instanceof NucleusNotSupportedError);
-          assert.match(err.message, /could not be dispatched/);
-          assert.match(err.message, /completed anyway/);
+          assert.equal((err as Error).name, "AbortError");
           return true;
         },
       );
@@ -966,8 +983,7 @@ describe("PgTransport queryCancelable pid-window honesty (X04 MAJOR-2)", () => {
         () => transport.fetchval("SELECT 42 AS v", [], { signal: ac.signal }),
         (err: unknown) => {
           assert(err instanceof NucleusNotSupportedError);
-          assert.match(err.message, /pg_backend_pid probe failed/);
-          assert.match(err.message, /completed anyway/);
+          assert.match(err.message, /could not be confirmed/);
           assert.match(String((err as NucleusNotSupportedError).cause), /engine lacks pg_backend_pid/);
           return true;
         },
@@ -992,7 +1008,7 @@ describe("PgTransport queryCancelable pid-window honesty (X04 MAJOR-2)", () => {
       assert.equal(records.poolQueries.length, 1);
       assert.match(records.poolQueries[0].sql, /pg_cancel_backend/);
       assert.equal(records.poolQueries[0].params?.[0], 4242);
-      assert.ok(records.releases[0] instanceof Error, "canceled statement must release(err) so the pool destroys the client");
+      assert.ok(records.releases.at(-1) instanceof Error, "canceled statement must release(err) so the pool destroys the client");
       await transport.close();
     } finally {
       restore();
@@ -1009,10 +1025,282 @@ describe("PgTransport queryCancelable pid-window honesty (X04 MAJOR-2)", () => {
         records.poolQueries.every((q) => !q.sql.includes("pg_cancel_backend")),
         "no cancel may be dispatched when nothing aborted",
       );
-      assert.equal(records.releases[0], undefined, "clean release — nothing was canceled");
+      assert.ok(records.releases.every((err) => err === undefined), "clean releases — nothing was canceled");
       await transport.close();
     } finally {
       restore();
     }
+  });
+});
+
+describe('Mobile operation semantics (TSD-05/06)', () => {
+  afterEach(restoreGlobals);
+  it('BEGIN with missing or invalid remote identity is unknown after one dispatch', async () => {
+    for (const txId of [undefined, null, '', '   ', 12, {}, 'bad\nheader']) {
+      for (const kind of ['http', 'mobile']) {
+        let sends = 0;
+        let created = 0;
+        globalThis.fetch = (async () => {
+          sends++; created++;
+          return new Response(JSON.stringify({ ok: true, data: { txId } }));
+        }) as typeof fetch;
+        const transport = kind === 'http' ? new HttpTransport('http://local') : new MobileTransport({ url: 'http://local', retryDelay: 1 });
+        await assert.rejects(() => transport.beginTransaction(), (error: any) => {
+          assert.equal(error.code, 'UNKNOWN_OUTCOME');
+          assert.equal(error.cause.code, 'TRANSACTION_ERROR');
+          assert.equal(error.meta.operation, 'BEGIN');
+          return true;
+        });
+        assert.equal(sends, 1);
+        assert.equal(created, 1);
+        await transport.close();
+      }
+    }
+  });
+  it('explicit BEGIN rejection remains definitive and is never replayed', async () => {
+    let sends = 0;
+    globalThis.fetch = (async () => { sends++; return new Response(JSON.stringify({ ok: false, error: 'BEGIN rejected' })); }) as typeof fetch;
+    const transport = new MobileTransport({ url: 'http://local', retryDelay: 1 });
+    await assert.rejects(() => transport.beginTransaction(), { code: 'TRANSACTION_ERROR' });
+    assert.equal(sends, 1);
+    await transport.close();
+  });
+  it('dispatches every scalar model mutation and reports lost responses without replay', async () => {
+    let value = 0;
+    globalThis.fetch = (async (_url, init) => {
+      const { sql } = JSON.parse(String(init?.body)) as { sql: string };
+      value++;
+      if (sql.includes('LOST')) throw new TypeError('response lost after commit');
+      return new Response(JSON.stringify({ ok: true, data: [{ value }], affected: 1 }));
+    }) as typeof fetch;
+    const mobile = new MobileTransport({ url: 'http://local', retryDelay: 1, cacheEnabled: true });
+    for (const sql of ['SELECT KV_INCR($1)', 'SELECT KV_SETNX($1)', 'SELECT KV_DEL($1)',
+      'SELECT DOC_INSERT($1)', 'SELECT STREAM_READGROUP($1)', 'SELECT PUBSUB_PUBLISH($1)',
+      'SELECT BLOB_STORE($1)', 'SELECT DATALOG_ASSERT($1)']) {
+      const first = await mobile.fetchval<number>(sql, ['k']);
+      assert.equal(await mobile.fetchval(sql, ['k']), first! + 1);
+    }
+    for (const call of [() => mobile.execute('LOST'), () => mobile.fetchval('SELECT LOST()'),
+      () => mobile.beginTransaction()]) {
+      // BEGIN is deliberately given the same lost-response model.
+      const saved = globalThis.fetch;
+      globalThis.fetch = (async () => { value++; throw new TypeError('response lost after commit'); }) as typeof fetch;
+      const before = value;
+      await assert.rejects(call, { code: 'UNKNOWN_OUTCOME' });
+      assert.equal(value, before + 1);
+      globalThis.fetch = saved;
+    }
+  });
+  it('actual KV plugin increments twice and SETNX reflects the second attempt', async () => {
+    let counter = 0;
+    let locked = false;
+    globalThis.fetch = (async (_url, init) => {
+      const { sql } = JSON.parse(String(init?.body)) as { sql: string };
+      let value: unknown;
+      if (sql.includes('KV_INCR')) value = ++counter;
+      else if (sql.includes('KV_SETNX')) { value = !locked; locked = true; }
+      else throw new Error('unexpected SQL');
+      return new Response(JSON.stringify({ data: [{ value }] }));
+    }) as typeof fetch;
+    const mobile = new MobileTransport({ url: 'http://local', cacheEnabled: true });
+    const features = { version: 'test', isNucleus: true, hasKV: true, hasVector: false, hasTimeSeries: false,
+      hasDocument: false, hasGraph: false, hasFTS: false, hasGeo: false, hasBlob: false,
+      hasStreams: false, hasColumnar: false, hasDatalog: false, hasCDC: false, hasPubSub: false };
+    const { kv } = withKV.init(mobile, features);
+    assert.equal(await kv.incr('counter'), 1);
+    assert.equal(await kv.incr('counter'), 2);
+    assert.equal(await kv.setNX('lock', 'owner'), true);
+    assert.equal(await kv.setNX('lock', 'owner'), false);
+  });
+  it('suppresses shared caching for the lifetime of a remote transaction', async () => {
+    let reads = 0;
+    globalThis.fetch = (async (url) => {
+      if (String(url).endsWith('/begin')) return new Response(JSON.stringify({ data: { txId: 'test' } }));
+      if (String(url).endsWith('/commit')) return new Response(JSON.stringify({ ok: true }));
+      return new Response(JSON.stringify({ data: [{ value: ++reads }] }));
+    }) as typeof fetch;
+    const mobile = new MobileTransport({ url: 'http://local', cacheEnabled: true });
+    const opts = { readOnly: true, cache: true };
+    await mobile.query('read', [], opts);
+    const tx = await mobile.beginTransaction();
+    await mobile.query('read', [], opts);
+    await mobile.query('read', [], opts);
+    assert.equal(reads, 3);
+    await tx.commit();
+    await mobile.query('read', [], opts);
+    await mobile.query('read', [], opts);
+    assert.equal(reads, 4);
+  });
+  it('checks abort before a cache hit and fences reads overlapping a write', async () => {
+    let resolveRead!: (r: Response) => void;
+    let reads = 0;
+    globalThis.fetch = (async (_url, init) => {
+      if (String(init?.body).includes('read')) {
+        reads++;
+        if (reads === 1) return new Promise<Response>((resolve) => { resolveRead = resolve; });
+        return new Response(JSON.stringify({ data: [{ value: 2 }] }));
+      }
+      return new Response(JSON.stringify({ affected: 1 }));
+    }) as typeof fetch;
+    const mobile = new MobileTransport({ url: 'http://local', cacheEnabled: true });
+    const opts = { readOnly: true, cache: true };
+    const stale = mobile.query('read', [], opts);
+    await mobile.execute('write');
+    resolveRead(new Response(JSON.stringify({ data: [{ value: 1 }] })));
+    await stale;
+    assert.equal((await mobile.query<{ value: number }>('read', [], opts)).rows[0].value, 2);
+    const ac = new AbortController(); ac.abort();
+    await assert.rejects(mobile.query('read', [], { ...opts, signal: ac.signal }), { name: 'AbortError' });
+    assert.equal(reads, 2);
+  });
+  it('does not retry an HTTP 500 for raw SQL mutations', async () => {
+    let sends = 0;
+    globalThis.fetch = (async () => { sends++; return new Response('ambiguous server failure', { status: 500 }); }) as typeof fetch;
+    const mobile = new MobileTransport({ url: 'http://local', retryDelay: 1 });
+    await assert.rejects(mobile.query('SELECT KV_INCR($1)'), { code: 'UNKNOWN_OUTCOME' });
+    assert.equal(sends, 1);
+  });
+});
+
+describe('HTTP complete-response deadline (TSD-08)', () => {
+  afterEach(restoreGlobals);
+  for (const status of [200, 500]) {
+    it(`bounds a stalled ${status} body after headers`, async () => {
+      let internal!: AbortSignal;
+      globalThis.fetch = (async (_url, init) => {
+        internal = init!.signal!;
+        return { ok: status === 200, status, json: () => new Promise(() => {}), text: () => new Promise(() => {}) } as unknown as Response;
+      }) as typeof fetch;
+      await assert.rejects(new HttpTransport('http://local', {}, 5).query('SELECT 1'), { name: 'TimeoutError' });
+      assert.equal(internal.aborted, true);
+    });
+  }
+  it('forwards caller abort after headers with timeout explicitly disabled', async () => {
+    const ac = new AbortController();
+    let internal!: AbortSignal;
+    let entered!: () => void;
+    const bodyEntered = new Promise<void>((resolve) => { entered = resolve; });
+    globalThis.fetch = (async (_url, init) => {
+      internal = init!.signal!;
+      return { ok: true, json: () => { entered(); return new Promise(() => {}); } } as unknown as Response;
+    }) as typeof fetch;
+    const result = new HttpTransport('http://local', {}, 0).query('SELECT 1', [], { signal: ac.signal });
+    await bodyEntered;
+    ac.abort();
+    await assert.rejects(result, { name: 'AbortError' });
+    assert.equal(internal.aborted, true);
+  });
+  it('defaults to 30 seconds and accepts explicit zero, refusing invalid timeouts', async () => {
+    const defaults = new HttpTransport('http://local') as unknown as { timeout: number };
+    const disabled = new HttpTransport('http://local', {}, 0) as unknown as { timeout: number };
+    assert.equal(defaults.timeout, 30_000);
+    assert.equal(disabled.timeout, 0);
+    for (const value of [-1, Infinity, NaN]) assert.throws(() => new HttpTransport('http://local', {}, value), RangeError);
+  });
+});
+
+describe('Pg cancellation rejection lifecycle (TSD-07)', () => {
+  it('observes cancel failure immediately, drains on target rejection, and reserves an independent pool', async () => {
+    const mod = await import('pg');
+    const pg = (mod.default ?? mod) as unknown as { Pool: unknown };
+    const original = pg.Pool;
+    let finishTarget!: (v: unknown) => void;
+    let finishCancel!: () => void;
+    let submitted!: () => void;
+    let cancelEntered!: () => void;
+    const targetEntered = new Promise<void>((resolve) => { submitted = resolve; });
+    const cancellationEntered = new Promise<void>((resolve) => { cancelEntered = resolve; });
+    const releases: string[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown): void => { unhandled.push(error); };
+    process.on('unhandledRejection', onUnhandled);
+    let created = 0;
+    class Pool {
+      id = ++created;
+      on(): void {}
+      async end(): Promise<void> {}
+      async query(): Promise<never> { throw new Error('application pool must never dispatch cancellation'); }
+      async connect() {
+        const id = this.id;
+        return {
+          query: async (sql: string) => {
+            if (sql.includes('pg_backend_pid')) return { rows: [{ pid: 42 }], rowCount: 1 };
+            if (sql.includes('pg_cancel_backend')) {
+              assert.equal(id, 2);
+              cancelEntered();
+              await new Promise<void>((resolve) => { finishCancel = resolve; });
+              throw new Error('side channel lost');
+            }
+            submitted();
+            await new Promise((resolve) => { finishTarget = resolve; });
+            throw new Error('target failed');
+          },
+          release: () => { releases.push(String(id)); },
+        };
+      }
+    }
+    pg.Pool = Pool;
+    const t = new PgTransport('postgres://local');
+    try {
+      const ac = new AbortController();
+      const operation = t.query('business', [], { signal: ac.signal });
+      const rejected = assert.rejects(operation, (err: unknown) => {
+        assert(err instanceof NucleusError);
+        assert.equal(err.code, 'CANCELLATION_FAILED');
+        assert.equal(err.meta?.cancellation, 'failed');
+        return true;
+      });
+      await targetEntered; ac.abort(); await cancellationEntered;
+      finishTarget(null);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(releases, []);
+      finishCancel();
+      await rejected;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(unhandled, []);
+      assert.deepEqual(releases, ['2', '1']);
+      assert.equal(created, 2);
+    } finally {
+      process.removeListener('unhandledRejection', onUnhandled);
+      await t.close();
+      pg.Pool = original;
+    }
+  });
+  it('does not produce unhandled rejection when cancellation fails before a still-running target', async () => {
+    const mod = await import('pg');
+    const pg = (mod.default ?? mod) as unknown as { Pool: unknown };
+    const original = pg.Pool;
+    const unhandled: unknown[] = [];
+    const observe = (err: unknown): void => { unhandled.push(err); };
+    let finish!: () => void;
+    let ready!: () => void;
+    const entered = new Promise<void>((resolve) => { ready = resolve; });
+    process.on('unhandledRejection', observe);
+    class Pool {
+      on(): void {}
+      async end(): Promise<void> {}
+      async connect() {
+        return { query: async (sql: string) => {
+          if (sql.includes('pg_backend_pid')) return { rows: [{ pid: 42 }], rowCount: 1 };
+          if (sql.includes('pg_cancel_backend')) throw Object.assign(new Error('unsupported'), { code: '0A000' });
+          ready(); await new Promise<void>((resolve) => { finish = resolve; });
+          return { rows: [], rowCount: 0 };
+        }, release: () => {} };
+      }
+    }
+    pg.Pool = Pool;
+    const t = new PgTransport('postgres://local');
+    try {
+      const ac = new AbortController();
+      const operation = t.query('business', [], { signal: ac.signal });
+      const rejected = assert.rejects(operation, (err: unknown) => {
+        assert(err instanceof NucleusNotSupportedError);
+        assert.equal(err.meta?.cancellation, 'unsupported'); return true;
+      });
+      await entered; ac.abort();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(unhandled, []);
+      finish(); await rejected;
+    } finally { process.removeListener('unhandledRejection', observe); await t.close(); pg.Pool = original; }
   });
 });

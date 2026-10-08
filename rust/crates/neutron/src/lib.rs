@@ -64,6 +64,8 @@ pub mod handler;
 pub mod http2;
 pub mod middleware;
 pub mod router;
+#[cfg(feature = "ws")]
+mod task_tracker;
 
 // ---------------------------------------------------------------------------
 // Stateless middleware — no extra deps, opt-in

@@ -1,16 +1,29 @@
+import { counterTTL, nextCounter } from "./counter.js";
+
 interface CacheRecord {
   value: string;
   expiresAt: number | null;
 }
 
+export interface CounterCapabilities {
+  readonly plain: 'native' | 'checked';
+  readonly atomicTTL: boolean;
+}
 export interface CacheClient {
+  /** Missing on custom clients means unknown. Native counters do not promise
+   * atomic validation of existing storage; strict providers do. */
+  readonly counterCapabilities?: Readonly<CounterCapabilities>;
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSec?: number): Promise<void>;
   del(key: string): Promise<void>;
+  /** Backend increment; consult counterCapabilities for checked storage semantics.
+   * Supplied TTL must be 1..2147483647 whole seconds and requires atomicTTL;
+   * supported TTL increments anchor initial expiry and repair nonexpiring counters. */
   incr(key: string, ttlSec?: number): Promise<number>;
 }
 
 export class MemoryCacheClient implements CacheClient {
+  readonly counterCapabilities = Object.freeze({ plain: "checked", atomicTTL: true } as const);
   private store = new Map<string, CacheRecord>();
 
   async get(key: string): Promise<string | null> {
@@ -38,24 +51,21 @@ export class MemoryCacheClient implements CacheClient {
   }
 
   async incr(key: string, ttlSec?: number): Promise<number> {
+    const ttl = counterTTL(ttlSec);
     const existing = this.store.get(key);
     const expired =
       existing?.expiresAt != null && existing.expiresAt <= Date.now();
     if (existing && !expired) {
       // The TTL is anchored at key creation (Redis INCR + EXPIRE-once
       // semantics); a later increment must not extend the key's expiry.
-      this.store.set(key, { value: String(next(existing.value)), expiresAt: existing.expiresAt });
-      return next(existing.value);
+      const value = nextCounter(existing.value);
+      const expiresAt = existing.expiresAt ?? (ttl !== undefined ? Date.now() + ttl * 1000 : null);
+      this.store.set(key, { value: String(value), expiresAt });
+      return value;
     }
-    const expiresAt =
-      typeof ttlSec === "number" && ttlSec > 0 ? Date.now() + ttlSec * 1000 : null;
+    const expiresAt = ttl !== undefined ? Date.now() + ttl * 1000 : null;
     this.store.set(key, { value: "1", expiresAt });
     return 1;
   }
-}
-
-function next(raw: string): number {
-  const current = Number.parseInt(raw, 10);
-  return Number.isFinite(current) ? current + 1 : 1;
 }
 

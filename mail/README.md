@@ -155,3 +155,78 @@ Google permits running a model over a user's own mail as a user-facing
 feature. It prohibits training or improving a general model on that data, and
 restricts human review. Route mail content only to providers on no-training,
 zero-retention terms, and list them as subprocessors.
+
+## Identity transactions and product state
+
+Use `OpenWithIdentityPolicy(ctx, url, admit, remap)` when a product stores filing,
+receipts, Undo authority or other message references. `IdentityAdmission` runs
+on the supplied `IdentityTx` immediately after transaction begin, before the
+engine account advisory lock. Acquire and verify product owner/account row locks
+there. `IdentityRemapper` uses that same transaction after the replacement
+message, memberships, body and staged seen evidence exist, before old-ID
+retirement. Never open a separate transaction or acquire owner locks in the
+remapper. Callback errors roll back the page and cursor; neither callback may
+publish external effects. A nonnil remapper requires nonnil admission.
+
+The engine carries explicit `IdentityPair` mappings through delta, intermediate
+scan and terminal scan transactions. Old thread keys remain unchanged. Existing
+target identities without a previously committed matching alias refuse with
+`ErrIdentityCollision`; there is no implicit last-writer merge. A committed alias
+makes page replay idempotent. New mappings, including those whose old mirror row
+has expired, require a remapper. Pure mirror applications can explicitly supply
+no-op admission/remapping. Older store implementations compile, but promotion
+refuses without `IdentityPageStore`; it never falls back to separate retirement.
+
+For Graph accounts, use `OpenWithGraphIdentityPolicy(ctx, url, admit, remap,
+inventory)`. `GraphReferenceInventory` enumerates product-only message IDs under
+those locks, including retained/decrypted reply references absent from the
+mirror. Do not alter encrypted payloads, AAD or request hashes: resolve old IDs
+with account-qualified `ResolveIdentity` at dispatch. Direct provider Raw,
+Attachment and product reply callers must resolve aliases themselves. Notes
+keyed only by threads are outside message-ID remapping.
+
+`MigrateGraphIdentity` requires the account's verified authenticated `/me` ID,
+a `GraphTranslator` (implemented by `graph.Adapter`) and a batch size of 1–1000.
+An email address is not a verified mailbox binding. Historical accounts need
+explicit binding verification. Each call durably stages one translation batch;
+missing, duplicate or conflicting results refuse. While mapping is pending,
+`GraphIdentityFormat` and mirror ingestion refuse. A final transaction rechecks
+all live/scan/product references, remaps dependent state and aliases, and then
+publishes `GraphImmutableIDs`. A failed cutover leaves old rows readable and the
+mapping resumable. `AbortGraphIdentity` discards only uncommitted mappings; a
+committed format cannot be silently downgraded. Retention may remove a staged
+source; its translation remains a reference-only alias and does not resurrect
+expired mail. The full cutover is one transaction and needs representative
+mailbox sizing and backup/recovery rehearsal.
+
+Keep legacy headers until this marker commits, including on new empty accounts:
+they still need the verified binding and explicit reference inventory. Configure
+`dialer.NewWithPolicy` with the store's `GraphIdentityFormat` and product-owned
+`JMAPAllowedOrigins`. Product send/reply paths must hold account admission across
+format lookup, alias resolution and bounded provider dispatch so cutover cannot
+interleave. Refresh credentials before acquiring these database locks. Use
+`graph.WithIdentityPreference` only for the authenticated Graph API client,
+never preauthenticated upload URLs. Other Prefer values are retained. A real
+same-mailbox move/translation rehearsal remains required provider acceptance.
+
+## Attachment certainty and credential origins
+
+`Envelope.AttachmentPresence` is `unknown`, `present` or `absent`.
+`HasAttachment` remains a compatibility flag; false does not prove absence.
+Gmail metadata sync does not download full MIME solely for a badge. A complete
+body fetch updates the body and certainty together, and later metadata cannot
+erase known evidence. Existing false badges migrate to unknown; old caches are
+not guessed to be complete. Consumers must expose unknown honestly.
+
+JMAP defaults credential destinations to the configured discovery origin.
+Explicitly configure additional HTTPS origins with `Config.AllowedOrigins` or
+the resolver policy for separate API/download hosts. Session metadata cannot
+authorize an origin. Initial discovery, expanded downloads, redirects and custom
+HTTP clients all pass mandatory checks before dispatch. Effective default ports
+are normalized. Private HTTPS servers and existing loopback development HTTP
+remain supported; a redirect never grants a new plaintext origin.
+
+The production MIME renderer folds at existing syntactic whitespace and refuses
+unsplittable lines over 998 bytes, including generated part headers. Use the
+renderer before durable send admission and persist its prepared representation.
+No automatic uncertain-send retry is introduced by identity or header handling.

@@ -7,7 +7,7 @@
 // requireNucleus like before. Two client methods depend on functions the
 // X00 capability report records NO evidence for: TS_RANGE (raw point
 // fetch) and TIME_BUCKET. Those are gated by a live SEMANTIC PROBE with
-// negative controls, run lazily once per model instance and memoized:
+// negative controls, explicitly invoked through probeCapabilities and memoized:
 // a fake implementation (constant results, global-aggregate-as-range,
 // input-echo bucketing) fails the probe and the call throws
 // NucleusNotSupportedError with the probe evidence — fail closed, never a
@@ -26,7 +26,7 @@
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
 import { requireNucleus } from '../helpers.js';
 import { NucleusNotSupportedError } from '../errors.js';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -69,6 +69,14 @@ export interface TimeSeriesQueryOptions {
 // ---------------------------------------------------------------------------
 
 export interface TimeSeriesModel {
+  /** Side-effect-free TIME_BUCKET admission; does not insert points. */
+  admitPureCapabilities(): Promise<TimeSeriesModelEvidence>;
+  /** Qualified in-process handoff to a production connection with the same
+   * endpoint/auth scope, live version and feature fingerprint. Never a boolean. */
+  admissionProfile(options?: TimeSeriesAdmissionOptions): Promise<TimeSeriesAdmissionProfile>;
+  /** Explicit diagnostics: writes four persistent points to a unique probe series.
+   * No point-deletion primitive exists. Never called implicitly by a read. */
+  probeCapabilities(options: { allowPersistentProbeWrites: true }): Promise<TimeSeriesModelEvidence>;
   /** Write data points to a measurement (series). */
   write(measurement: string, points: TimeSeriesPoint[]): Promise<void>;
 
@@ -103,7 +111,7 @@ export interface TimeSeriesModel {
    * Query raw data points in a time range (`TS_RANGE`).
    *
    * NOT covered by the engine's documented surface (MODEL_SEMANTICS lists
-   * no raw point fetch) — gated by a lazily-memoized semantic probe with
+   * no raw point fetch) — gated by explicit probeCapabilities evidence with
    * negative controls. Throws NucleusNotSupportedError with the probe
    * evidence when the engine's TS_RANGE does not return the exact points
    * of the range (fake or absent implementations fail closed).
@@ -127,7 +135,7 @@ export interface TimeSeriesModel {
    * days).
    *
    * NOT covered by the engine's documented surface — gated by a
-   * lazily-memoized semantic probe: TIME_BUCKET must floor an unaligned
+   * explicit probeCapabilities evidence: TIME_BUCKET must floor an unaligned
    * timestamp to the bucket grid and map two different inputs to two
    * different buckets. Fake implementations fail closed.
    */
@@ -178,7 +186,62 @@ function num(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-export async function probeTimeSeriesModel(transport: Transport): Promise<TimeSeriesModelEvidence> {
+export interface TimeSeriesAdmissionOptions {
+  validForMs?: number;
+  /** Required for point-based evidence. Must dispose the owned diagnostic
+   * namespace/engine using a genuine backend/administrative lifecycle; closing
+   * a connection alone does not remove points. No deletion primitive is supplied. */
+  disposeDiagnosticNamespace?: () => Promise<void>;
+}
+
+export interface TimeSeriesAdmissionProfile {
+  readonly protocol: 'timeseries-admission-v1';
+  readonly identity: Readonly<{ endpoint: string; version: string; capabilities: string }>;
+  readonly measuredAt: number;
+  readonly expiresAt: number;
+  readonly evidence: TimeSeriesModelEvidence;
+}
+// Only evidence measured by this module can mint a profile. JSON or arbitrary
+// caller-created objects do not constitute admission. Profiles intentionally
+// cannot survive process restart; requalify diagnostics after deployment.
+const qualifiedProfiles = new WeakSet<TimeSeriesAdmissionProfile>();
+
+async function admissionIdentity(transport: Transport) {
+  const endpoint = await transport.capabilityEndpoint?.();
+  if (!endpoint) throw new NucleusNotSupportedError('Diagnostic handoff needs an explicit endpoint/auth identity');
+  const version = await transport.fetchval<unknown>('SELECT VERSION()', [], { readOnly: true });
+  const raw = await transport.fetchval<unknown>('SELECT NUCLEUS_FEATURES()', [], { readOnly: true });
+  if (typeof version !== 'string' || !version.includes('Nucleus') || typeof raw !== 'string')
+    throw new NucleusNotSupportedError('Diagnostic identity/version/features could not be verified');
+  const features = JSON.parse(raw) as Record<string, unknown>;
+  if (!features || Array.isArray(features) || typeof features !== 'object' || features.timeseries !== true)
+    throw new NucleusNotSupportedError('Explicit time-series capability identity is required for handoff');
+  const canonical = JSON.stringify(Object.entries(features).sort(([a], [b]) => a.localeCompare(b)));
+  return Object.freeze({ endpoint, version, capabilities: createHash('sha256').update(canonical).digest('hex') });
+}
+function freezeEvidence(evidence: TimeSeriesModelEvidence): TimeSeriesModelEvidence {
+  return Object.freeze({ ...evidence, checks: Object.freeze(evidence.checks.map(check => Object.freeze({ ...check }))) });
+}
+async function probePureBuckets(transport: Transport): Promise<TimeSeriesModelEvidence> {
+  const checks: TimeSeriesProbeCheck[] = [];
+  let bucketFn = false;
+  try {
+    const b0 = num(await transport.fetchval('SELECT TIME_BUCKET($1, $2)', [5000, 1], { readOnly: true }));
+    const b1 = num(await transport.fetchval('SELECT TIME_BUCKET($1, $2)', [5000, 12345], { readOnly: true }));
+    const b2 = num(await transport.fetchval('SELECT TIME_BUCKET($1, $2)', [5000, 17345], { readOnly: true }));
+    bucketFn = b0 === 0 && b1 !== null && b2 !== null && b1 <= 12345 && 12345 < b1 + 5000 && b2 <= 17345 && 17345 < b2 + 5000 && b1 !== b2;
+    checks.push({ name: 'time_bucket_floors', passed: bucketFn, detail: `pure TIME_BUCKET controls: ${b0},${b1},${b2}` });
+  } catch (error) {
+    checks.push({ name: 'time_bucket_floors', passed: false, detail: `TIME_BUCKET rejected: ${error instanceof Error ? error.message : String(error)}` });
+  }
+  return freezeEvidence({ series: '', checks, rangeFetch: false, bucketFn });
+}
+
+/** Explicit write diagnostics. The caller owns and disposes the diagnostic
+ * namespace/engine; there is no engine point-deletion primitive. */
+export async function probeTimeSeriesModel(transport: Transport, options: { allowPersistentProbeWrites: true }): Promise<TimeSeriesModelEvidence> {
+  if (options?.allowPersistentProbeWrites !== true) throw new Error('Persistent diagnostic write consent required');
+  const pure = await probePureBuckets(transport);
   const series = `__neutron_ts_probe_${randomBytes(6).toString('hex')}`;
   // Probe points: the middle subrange [3000, 7000) holds values 2 and 6
   // only — a TS_RANGE_COUNT that answers 4, or a TS_RANGE_AVG that answers
@@ -202,7 +265,7 @@ export async function probeTimeSeriesModel(transport: Transport): Promise<TimeSe
     check('ts_insert_acked', true, 'four probe points acked');
   } catch (err) {
     check('ts_insert_acked', false, `TS_INSERT rejected: ${err instanceof Error ? err.message : String(err)}`);
-    return { series, checks, rangeFetch: false, bucketFn: false };
+    return freezeEvidence({ series, checks: [...checks, ...pure.checks], rangeFetch: false, bucketFn: pure.bucketFn });
   }
 
   try {
@@ -246,24 +309,7 @@ export async function probeTimeSeriesModel(transport: Transport): Promise<TimeSe
     check('ts_range_exact', false, `TS_RANGE errored: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  let bucketFn = false;
-  try {
-    // Grid-INVARIANT checks (a correct engine may epoch-align or
-    // calendar-align buckets): 1ms after the epoch must bucket to the
-    // epoch itself for any 5000ms grid whose offset is a grid multiple
-    // (all real timezone offsets are) — an input-echo fake returns 1; each
-    // timestamp must land inside its own bucket; and two timestamps one
-    // full interval apart must land in different buckets — constants fail.
-    const b0 = num(await transport.fetchval('SELECT TIME_BUCKET($1, $2)', [5000, 1]));
-    const b1 = num(await transport.fetchval('SELECT TIME_BUCKET($1, $2)', [5000, 12345]));
-    const b2 = num(await transport.fetchval('SELECT TIME_BUCKET($1, $2)', [5000, 17345]));
-    bucketFn = b0 === 0 && b1 !== null && b2 !== null && b1 <= 12345 && 12345 < b1 + 5000 && b2 <= 17345 && 17345 < b2 + 5000 && b1 !== b2;
-    check('time_bucket_floors', bucketFn, `TIME_BUCKET(5000,1)=${String(b0)} (expected 0; an echo returns 1), TIME_BUCKET(5000,12345)=${String(b1)}, TIME_BUCKET(5000,17345)=${String(b2)} (each must contain its input; must differ)`);
-  } catch (err) {
-    check('time_bucket_floors', false, `TIME_BUCKET errored: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return { series, checks, rangeFetch, bucketFn };
+  return freezeEvidence({ series, checks: [...checks, ...pure.checks], rangeFetch, bucketFn: pure.bucketFn });
 }
 
 // ---------------------------------------------------------------------------
@@ -272,27 +318,88 @@ export async function probeTimeSeriesModel(transport: Transport): Promise<TimeSe
 
 class TimeSeriesModelImpl implements TimeSeriesModel {
   private evidence: Promise<TimeSeriesModelEvidence> | null = null;
+  private measuredIdentity: Awaited<ReturnType<typeof admissionIdentity>> | null = null;
+  private measuredAt = 0;
+  private diagnosticStarted = false;
+  private exportedProfile: Promise<TimeSeriesAdmissionProfile> | null = null;
 
   constructor(
     private readonly transport: Transport,
     private readonly features: NucleusFeatures,
+    private readonly profile?: TimeSeriesAdmissionProfile,
   ) {}
 
   private require(): void {
     requireNucleus(this.features, 'TimeSeries');
   }
 
-  /** Lazily-memoized probe evidence for the undocumented surfaces. Probe
-   *  failure is a permanent answer for this transport instance — cached so
-   *  every subsequent call fails closed without re-probing. */
-  private probe(): Promise<TimeSeriesModelEvidence> {
+  async admitPureCapabilities(): Promise<TimeSeriesModelEvidence> {
     this.require();
-    if (this.evidence === null) {
-      this.evidence = probeTimeSeriesModel(this.transport).catch((err) => {
+    const before = this.transport.capabilityEndpoint ? await admissionIdentity(this.transport) : null;
+    const pure = await probePureBuckets(this.transport);
+    const after = before ? await admissionIdentity(this.transport) : null;
+    if (before && JSON.stringify(before) !== JSON.stringify(after)) throw new NucleusNotSupportedError('Endpoint changed during pure admission');
+    this.measuredIdentity = after;
+    this.evidence = Promise.resolve(pure);
+    this.measuredAt = Date.now();
+    return pure;
+  }
+
+  async admissionProfile(options: TimeSeriesAdmissionOptions = {}): Promise<TimeSeriesAdmissionProfile> {
+    this.require();
+    if (this.exportedProfile) return this.exportedProfile;
+    if (!this.evidence || !this.measuredIdentity) throw new NucleusNotSupportedError('Qualify diagnostics against endpoint identity before exporting a profile');
+    const validForMs = options.validForMs ?? 300_000;
+    if (!Number.isInteger(validForMs) || validForMs < 1 || validForMs > 86_400_000) throw new RangeError('validForMs must be 1..86400000');
+    const evidence = freezeEvidence(await this.evidence);
+    if (evidence.series !== '' && typeof options.disposeDiagnosticNamespace !== 'function')
+      throw new NucleusNotSupportedError('Raw-range profile requires genuine owned diagnostic-namespace disposal; connection close alone is insufficient');
+    // Memoize terminal disposal: never repeat an ambiguous cleanup or mint a
+    // success profile after failed namespace disposal.
+    return this.exportedProfile ??= (async () => {
+      const identity = await admissionIdentity(this.transport);
+      if (JSON.stringify(identity) !== JSON.stringify(this.measuredIdentity)) throw new NucleusNotSupportedError('Diagnostic identity changed during qualification');
+      if (evidence.series !== '') await options.disposeDiagnosticNamespace!();
+      const profile: TimeSeriesAdmissionProfile = Object.freeze({ protocol: 'timeseries-admission-v1', identity, measuredAt: this.measuredAt, expiresAt: this.measuredAt + validForMs, evidence });
+      qualifiedProfiles.add(profile);
+      return profile;
+    })();
+  }
+
+  async probeCapabilities(options: { allowPersistentProbeWrites: true }): Promise<TimeSeriesModelEvidence> {
+    this.require();
+    if (options?.allowPersistentProbeWrites !== true) throw new Error('Time-series diagnostics require explicit persistent probe-write consent');
+    if (!this.diagnosticStarted) {
+      this.diagnosticStarted = true;
+      this.evidence = (async () => {
+        const before = this.transport.capabilityEndpoint ? await admissionIdentity(this.transport) : null;
+        const evidence = await probeTimeSeriesModel(this.transport, options);
+        const after = before ? await admissionIdentity(this.transport) : null;
+        if (before && JSON.stringify(before) !== JSON.stringify(after)) throw new NucleusNotSupportedError('Endpoint identity changed during diagnostics');
+        this.measuredIdentity = after;
+        this.measuredAt = Date.now();
+        return evidence;
+      })().catch((err) => {
         this.evidence = null;
+        this.diagnosticStarted = false;
         throw err;
       });
     }
+    return this.evidence!;
+  }
+
+  private async probe(): Promise<TimeSeriesModelEvidence> {
+    this.require();
+    if (this.profile) {
+      if (!qualifiedProfiles.has(this.profile) || !Object.isFrozen(this.profile) || this.profile.protocol !== 'timeseries-admission-v1' ||
+          Date.now() < this.profile.measuredAt || Date.now() >= this.profile.expiresAt)
+        throw new NucleusNotSupportedError('Time-series profile is unverified or stale');
+      const identity = await admissionIdentity(this.transport);
+      if (JSON.stringify(identity) !== JSON.stringify(this.profile.identity))
+        throw new NucleusNotSupportedError('Time-series profile does not match endpoint/version/capability identity');
+      return this.profile.evidence;
+    }
+    if (!this.evidence) throw new NucleusNotSupportedError('Time-series capability is unverified; call admitPureCapabilities for buckets, or qualify write diagnostics on an owned disposable namespace and pass its admission profile');
     return this.evidence;
   }
 
@@ -356,7 +463,7 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
     return (
       (await this.transport.fetchval<number>('SELECT TIME_BUCKET($1, $2)', [
         BUCKET_MS[interval], timestamp.getTime(),
-      ])) ?? 0
+      ], { readOnly: true })) ?? 0
     );
   }
 
@@ -393,7 +500,7 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
       measurement,
       startMs,
       endMs,
-    ]);
+    ], { readOnly: true });
     if (!raw) return [];
 
     return (JSON.parse(raw) as Array<{ t: number; v: number }>).map(({ t, v }) => ({
@@ -455,3 +562,10 @@ export const withTimeSeries: NucleusPlugin<{ timeseries: TimeSeriesModel }> = {
     return { timeseries: new TimeSeriesModelImpl(transport, features) };
   },
 };
+
+/** Add time-series reads admitted by qualified diagnostic evidence. Identity is
+ * rechecked with pure queries before every gated production read. */
+export function withTimeSeriesProfile(profile: TimeSeriesAdmissionProfile): NucleusPlugin<{ timeseries: TimeSeriesModel }> {
+  if (!qualifiedProfiles.has(profile)) throw new NucleusNotSupportedError('Unverified time-series profile');
+  return { name: 'timeseries', init: (transport, features) => ({ timeseries: new TimeSeriesModelImpl(transport, features, profile) }) };
+}

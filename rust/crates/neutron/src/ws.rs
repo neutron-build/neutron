@@ -24,6 +24,7 @@
 //! ```
 
 use std::future::Future;
+use std::sync::Arc;
 
 use base64::Engine;
 use http::{HeaderValue, StatusCode};
@@ -116,6 +117,23 @@ pub struct CloseFrame {
     pub reason: String,
 }
 
+fn validate_outbound(message: &Message) -> Result<(), WsError> {
+    let (bytes, cap) = match message {
+        Message::Text(s) => (s.len(), 1024 * 1024),
+        Message::Binary(b) => (b.len(), 1024 * 1024),
+        Message::Ping(b) | Message::Pong(b) => (b.len(), 125),
+        Message::Close(Some(c)) => (c.reason.len().saturating_add(2), 125),
+        Message::Close(None) => (0, 125),
+    };
+    if bytes > cap {
+        Err(WsError {
+            message: "outbound WebSocket message exceeds byte limit".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket error
 // ---------------------------------------------------------------------------
@@ -153,6 +171,7 @@ impl From<fastwebsockets::WebSocketError> for WsError {
 /// handshake and obtain a [`WebSocket`] connection.
 pub struct WebSocketUpgrade {
     on_upgrade: hyper::upgrade::OnUpgrade,
+    lifecycle: Arc<crate::task_tracker::UpgradeTasks>,
     sec_websocket_key: HeaderValue,
     protocols: Option<HeaderValue>,
 }
@@ -169,16 +188,27 @@ impl WebSocketUpgrade {
     {
         let accept_key = compute_accept_key(&self.sec_websocket_key);
 
-        tokio::spawn(async move {
-            match self.on_upgrade.await {
+        let shutdown = self.lifecycle.subscribe();
+        let lifecycle = Arc::downgrade(&self.lifecycle);
+        let on_upgrade = self.on_upgrade;
+        let admitted = self.lifecycle.spawn(async move {
+            match on_upgrade.await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    let ws = fastwebsockets::WebSocket::after_handshake(
+                    let mut ws = fastwebsockets::WebSocket::after_handshake(
                         io,
                         fastwebsockets::Role::Server,
                     );
-                    let ws = fastwebsockets::FragmentCollector::new(ws);
-                    let socket = WebSocket { inner: ws };
+                    ws.set_max_message_size(1024 * 1024);
+                    let ws = BoundedSocket {
+                        inner: ws,
+                        fragments: None,
+                    };
+                    let socket = WebSocket {
+                        inner: ws,
+                        shutdown,
+                        lifecycle,
+                    };
                     callback(socket).await;
                 }
                 Err(e) => {
@@ -186,6 +216,13 @@ impl WebSocketUpgrade {
                 }
             }
         });
+        if admitted.is_none() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server stopping or upgraded work at capacity",
+            )
+                .into_response();
+        }
 
         let mut builder = http::Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -210,7 +247,7 @@ impl WebSocketUpgrade {
             if let Ok(requested_str) = requested.to_str() {
                 for &supported_proto in supported {
                     for requested_proto in requested_str.split(',').map(str::trim) {
-                        if requested_proto.eq_ignore_ascii_case(supported_proto) {
+                        if requested_proto == supported_proto {
                             self.protocols = Some(HeaderValue::from_str(supported_proto).unwrap());
                             return self;
                         }
@@ -293,7 +330,18 @@ impl FromRequestParts for WebSocketUpgrade {
         // Optional: Sec-WebSocket-Protocol
         let protocols = req.headers().get("sec-websocket-protocol").cloned();
 
+        let lifecycle = req
+            .get_extension::<Arc<crate::task_tracker::UpgradeTasks>>()
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no server upgrade lifecycle",
+                )
+                    .into_response()
+            })?;
         Ok(WebSocketUpgrade {
+            lifecycle,
             on_upgrade,
             sec_websocket_key: key,
             protocols,
@@ -310,10 +358,144 @@ impl FromRequestParts for WebSocketUpgrade {
 /// Use [`recv`](Self::recv) to receive messages and [`send`](Self::send) to
 /// send them. For concurrent read/write, use [`split`](Self::split).
 pub struct WebSocket {
-    inner: fastwebsockets::FragmentCollector<TokioIo<hyper::upgrade::Upgraded>>,
+    inner: BoundedSocket,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    lifecycle: std::sync::Weak<crate::task_tracker::UpgradeTasks>,
+}
+
+// Keep fragmentation state across polls and cap the whole message, not just each frame.
+struct BoundedSocket {
+    inner: fastwebsockets::WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+    fragments: Option<(fastwebsockets::OpCode, Vec<u8>)>,
+}
+impl BoundedSocket {
+    async fn read_frame(
+        &mut self,
+    ) -> Result<fastwebsockets::Frame<'static>, fastwebsockets::WebSocketError> {
+        loop {
+            let frame = self.inner.read_frame().await?;
+            if let Some(frame) = assemble_frame(&mut self.fragments, frame)? {
+                return Ok(frame);
+            }
+        }
+    }
+    async fn write_frame(
+        &mut self,
+        frame: fastwebsockets::Frame<'_>,
+    ) -> Result<(), fastwebsockets::WebSocketError> {
+        self.inner.write_frame(frame).await
+    }
+}
+
+type WriteCommand = (
+    fastwebsockets::Frame<'static>,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
+);
+async fn write_split(
+    tx: &tokio::sync::mpsc::Sender<WriteCommand>,
+    frame: fastwebsockets::Frame<'static>,
+) -> Result<(), WsError> {
+    let (acknowledge, result) = tokio::sync::oneshot::channel();
+    tx.send((frame, acknowledge)).await.map_err(|_| WsError {
+        message: "WebSocket writer closed".into(),
+    })?;
+    result
+        .await
+        .map_err(|_| WsError {
+            message: "WebSocket writer stopped".into(),
+        })?
+        .map_err(|message| WsError { message })
+}
+
+struct SplitTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for SplitTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+fn assemble_frame(
+    fragments: &mut Option<(fastwebsockets::OpCode, Vec<u8>)>,
+    frame: fastwebsockets::Frame<'_>,
+) -> Result<Option<fastwebsockets::Frame<'static>>, fastwebsockets::WebSocketError> {
+    use fastwebsockets::{Frame, OpCode, Payload, WebSocketError};
+    let (opcode, bytes) = match frame.opcode {
+        OpCode::Text | OpCode::Binary => {
+            if fragments.is_some() {
+                return Err(WebSocketError::InvalidFragment);
+            }
+            if !frame.fin {
+                *fragments = Some((frame.opcode, frame.payload.to_vec()));
+                return Ok(None);
+            }
+            (frame.opcode, frame.payload.to_vec())
+        }
+        OpCode::Continuation => {
+            let Some((_, bytes)) = fragments.as_mut() else {
+                return Err(WebSocketError::InvalidFragment);
+            };
+            if bytes.len().saturating_add(frame.payload.len()) >= 1024 * 1024 {
+                return Err(WebSocketError::FrameTooLarge);
+            }
+            bytes.extend_from_slice(&frame.payload);
+            if !frame.fin {
+                return Ok(None);
+            }
+            fragments.take().unwrap()
+        }
+        _ => (frame.opcode, frame.payload.to_vec()),
+    };
+    if opcode == OpCode::Text && std::str::from_utf8(&bytes).is_err() {
+        return Err(WebSocketError::InvalidUTF8);
+    }
+    Ok(Some(Frame::new(true, opcode, None, Payload::Owned(bytes))))
+}
+fn frame_to_message(frame: fastwebsockets::Frame<'_>) -> Option<Message> {
+    use fastwebsockets::OpCode;
+    match frame.opcode {
+        OpCode::Text => String::from_utf8(frame.payload.to_vec())
+            .ok()
+            .map(Message::Text),
+        OpCode::Binary => Some(Message::Binary(frame.payload.to_vec())),
+        OpCode::Ping => Some(Message::Ping(frame.payload.to_vec())),
+        OpCode::Pong => Some(Message::Pong(frame.payload.to_vec())),
+        OpCode::Close => Some(Message::Close(if frame.payload.len() >= 2 {
+            Some(CloseFrame {
+                code: u16::from_be_bytes([frame.payload[0], frame.payload[1]]),
+                reason: String::from_utf8_lossy(&frame.payload[2..]).into_owned(),
+            })
+        } else {
+            None
+        })),
+        _ => None,
+    }
+}
+fn message_to_frame(msg: Message) -> fastwebsockets::Frame<'static> {
+    use fastwebsockets::{Frame, OpCode, Payload};
+    match msg {
+        Message::Text(text) => Frame::text(Payload::Owned(text.into_bytes())),
+        Message::Binary(data) => Frame::binary(Payload::Owned(data)),
+        Message::Ping(data) => Frame::new(true, OpCode::Ping, None, Payload::Owned(data)),
+        Message::Pong(data) => Frame::pong(Payload::Owned(data)),
+        Message::Close(Some(close)) => Frame::close(close.code, close.reason.as_bytes()),
+        Message::Close(None) => Frame::close(1000, b""),
+    }
 }
 
 impl WebSocket {
+    /// Cooperative server-shutdown notification. Callbacks may drain until the
+    /// server deadline; remaining callback and socket tasks are then aborted/joined.
+    pub fn shutdown_signal(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut shutdown = self.shutdown.clone();
+        async move {
+            if !*shutdown.borrow_and_update() {
+                let _ = shutdown.changed().await;
+            }
+        }
+    }
+
     /// Receive the next message.
     ///
     /// Returns `None` when the connection is closed or an error occurs.
@@ -344,6 +526,7 @@ impl WebSocket {
 
     /// Send a message.
     pub async fn send(&mut self, msg: Message) -> Result<(), WsError> {
+        validate_outbound(&msg)?;
         let frame = match msg {
             Message::Text(text) => {
                 fastwebsockets::Frame::text(fastwebsockets::Payload::Owned(text.into_bytes()))
@@ -384,129 +567,96 @@ impl WebSocket {
     /// Internally spawns a coordinator task that multiplexes reads and writes.
     /// The [`WsSender`] is cheaply cloneable for broadcasting from multiple tasks.
     pub fn split(self) -> (WsSender, WsReceiver) {
-        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Message>(32);
-        let (recv_tx, recv_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-
-        tokio::spawn(async move {
-            let mut ws = self.inner;
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<WriteCommand>(32);
+        let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let (mut read, mut write) = self.inner.inner.split(tokio::io::split);
+        let mut fragments = self.inner.fragments;
+        let automatic = send_tx.clone();
+        let reader = async move {
             loop {
-                tokio::select! {
-                    frame = ws.read_frame() => {
-                        match frame {
-                            Ok(frame) => {
-                                let msg = match frame.opcode {
-                                    fastwebsockets::OpCode::Text => {
-                                        String::from_utf8(frame.payload.to_vec())
-                                            .ok()
-                                            .map(Message::Text)
-                                    }
-                                    fastwebsockets::OpCode::Binary => {
-                                        Some(Message::Binary(frame.payload.to_vec()))
-                                    }
-                                    fastwebsockets::OpCode::Close => {
-                                        let close = if frame.payload.len() >= 2 {
-                                            let code = u16::from_be_bytes([
-                                                frame.payload[0],
-                                                frame.payload[1],
-                                            ]);
-                                            let reason = String::from_utf8_lossy(
-                                                &frame.payload[2..],
-                                            )
-                                            .into_owned();
-                                            Some(CloseFrame { code, reason })
-                                        } else {
-                                            None
-                                        };
-                                        Some(Message::Close(close))
-                                    }
-                                    fastwebsockets::OpCode::Ping => {
-                                        Some(Message::Ping(frame.payload.to_vec()))
-                                    }
-                                    fastwebsockets::OpCode::Pong => {
-                                        Some(Message::Pong(frame.payload.to_vec()))
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(msg) = msg {
-                                    let is_close = msg.is_close();
-                                    if recv_tx.send(msg).is_err() {
-                                        break;
-                                    }
-                                    if is_close {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(_) => break,
-                        }
+                let automatic = automatic.clone();
+                let mut reply = move |frame: fastwebsockets::Frame<'_>| {
+                    let frame = fastwebsockets::Frame::new(
+                        frame.fin,
+                        frame.opcode,
+                        None,
+                        fastwebsockets::Payload::Owned(frame.payload.to_vec()),
+                    );
+                    let automatic = automatic.clone();
+                    async move {
+                        write_split(&automatic, frame).await.map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, error.message)
+                        })
                     }
-                    msg = send_rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                let frame = match msg {
-                                    Message::Text(text) => {
-                                        fastwebsockets::Frame::text(
-                                            fastwebsockets::Payload::Owned(text.into_bytes()),
-                                        )
-                                    }
-                                    Message::Binary(data) => {
-                                        fastwebsockets::Frame::binary(
-                                            fastwebsockets::Payload::Owned(data),
-                                        )
-                                    }
-                                    Message::Ping(data) => fastwebsockets::Frame::new(
-                                        true,
-                                        fastwebsockets::OpCode::Ping,
-                                        None,
-                                        fastwebsockets::Payload::Owned(data),
-                                    ),
-                                    Message::Pong(data) => fastwebsockets::Frame::pong(
-                                        fastwebsockets::Payload::Owned(data),
-                                    ),
-                                    Message::Close(cf) => {
-                                        if let Some(cf) = cf {
-                                            fastwebsockets::Frame::close(
-                                                cf.code,
-                                                cf.reason.as_bytes(),
-                                            )
-                                        } else {
-                                            fastwebsockets::Frame::close(1000, b"")
-                                        }
-                                    }
-                                };
-                                if ws.write_frame(frame).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
+                };
+                // Interrupted reads terminate; an interrupted frame is never restarted.
+                let frame = tokio::select! { _ = recv_tx.closed() => break, frame = read.read_frame(&mut reply) => frame };
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                };
+                let frame = match assemble_frame(&mut fragments, frame) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                };
+                if let Some(msg) = frame_to_message(frame) {
+                    let closed = msg.is_close();
+                    if recv_tx.send(msg).await.is_err() || closed {
+                        break;
                     }
                 }
             }
-        });
-
-        (WsSender { tx: send_tx }, WsReceiver { rx: recv_rx })
+        };
+        let writer = async move {
+            while let Some((frame, acknowledge)) = send_rx.recv().await {
+                let result = write
+                    .write_frame(frame)
+                    .await
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = acknowledge.send(result);
+                if failed {
+                    break;
+                }
+            }
+        };
+        let owner = self.lifecycle.upgrade();
+        let reader = owner.as_ref().and_then(|owner| owner.spawn(reader));
+        let writer = owner.as_ref().and_then(|owner| owner.spawn(writer));
+        let tasks = Arc::new(SplitTasks(reader.into_iter().chain(writer).collect()));
+        (
+            WsSender {
+                tx: send_tx,
+                _tasks: tasks.clone(),
+            },
+            WsReceiver {
+                rx: recv_rx,
+                _tasks: tasks,
+            },
+        )
     }
 }
 
 /// Sending half of a split WebSocket. Cloneable for broadcasting.
 #[derive(Clone)]
 pub struct WsSender {
-    tx: tokio::sync::mpsc::Sender<Message>,
+    tx: tokio::sync::mpsc::Sender<WriteCommand>,
+    _tasks: Arc<SplitTasks>,
 }
 
 impl WsSender {
     /// Send a message. Returns an error if the connection is closed.
     pub async fn send(&self, msg: Message) -> Result<(), WsError> {
-        self.tx.send(msg).await.map_err(|_| WsError {
-            message: "WebSocket connection closed".into(),
-        })
+        validate_outbound(&msg)?;
+        write_split(&self.tx, message_to_frame(msg)).await
     }
 }
 
 /// Receiving half of a split WebSocket.
 pub struct WsReceiver {
-    rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    rx: tokio::sync::mpsc::Receiver<Message>,
+    _tasks: Arc<SplitTasks>,
 }
 
 impl WsReceiver {
@@ -781,5 +931,11 @@ mod tests {
             message: "test error".into(),
         };
         assert_eq!(format!("{err}"), "test error");
+    }
+    #[test]
+    fn outbound_payload_limits_bound_queued_bytes_and_control_frames() {
+        assert!(validate_outbound(&Message::Binary(vec![0; 1024 * 1024 + 1])).is_err());
+        assert!(validate_outbound(&Message::Ping(vec![0; 126])).is_err());
+        assert!(validate_outbound(&Message::Text("ok".into())).is_ok());
     }
 }

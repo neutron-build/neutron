@@ -44,6 +44,10 @@
     "./listen-notify": {
       "types": "./dist/listen-notify.d.ts",
       "import": "./dist/listen-notify.js"
+    },
+    "./lifecycle": {
+      "types": "./dist/lifecycle.d.ts",
+      "import": "./dist/lifecycle.js"
     }
   },
   "files": [

@@ -598,3 +598,20 @@ test("postgres.js armed query reserves its backend through late cancellation dis
     assert.equal(releases, 1);
   } finally { clearTimeout(keepAlive); }
 });
+
+test("TSD-02: session-local gate retries failed identity and never touches parent pool", async () => {
+  let outerCalls = 0;
+  let localCalls = 0;
+  const outer = { query: async () => { outerCalls++; throw new Error("occupied pool"); } } as any;
+  const local = { query: async () => {
+    localCalls++;
+    if (localCalls === 1) throw new Error("temporary connection failure");
+    return [{ version: "PostgreSQL 17.11" }];
+  } } as any;
+  const parent = capabilityGate(outer);
+  const gate = parent.scoped!(local);
+  await assert.rejects(() => gate.assert(["row-locking"]), /temporary/);
+  await gate.assert(["row-locking", "jsonb-functions"]);
+  assert.equal(outerCalls, 0);
+  assert.equal(localCalls, 2);
+});

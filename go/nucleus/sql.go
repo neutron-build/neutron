@@ -2,6 +2,7 @@ package nucleus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -61,10 +62,10 @@ func Query[T any](ctx context.Context, sql *SQLModel, query string, args ...any)
 	return results, nil
 }
 
-// QueryOne executes a query and scans exactly one row into T.
+// QueryOne executes a query and scans its first row into T.
+// Additional rows are drained; this helper does not assert uniqueness.
 // Returns ErrNotFound if no rows are returned.
-func QueryOne[T any](ctx context.Context, sql *SQLModel, query string, args ...any) (T, error) {
-	var result T
+func QueryOne[T any](ctx context.Context, sql *SQLModel, query string, args ...any) (result T, resultErr error) {
 	queryArgs := make([]any, 0, len(args)+1)
 	queryArgs = append(queryArgs, pgx.QueryExecModeSimpleProtocol)
 	queryArgs = append(queryArgs, args...)
@@ -72,12 +73,29 @@ func QueryOne[T any](ctx context.Context, sql *SQLModel, query string, args ...a
 	if err != nil {
 		return result, fmt.Errorf("nucleus: query: %w", err)
 	}
-	defer rows.Close()
+	missing := false
+	defer func() {
+		rows.Close()
+		if err := rows.Err(); err != nil && !errors.Is(resultErr, err) {
+			if missing {
+				resultErr = fmt.Errorf("nucleus: rows: %w", err)
+			} else {
+				resultErr = errors.Join(resultErr, fmt.Errorf("nucleus: rows: %w", err))
+			}
+		}
+		// Failed reads must not return a usable partial row, particularly for
+		// callers using this helper for authorization or revocation lookups.
+		if resultErr != nil {
+			var zero T
+			result = zero
+		}
+	}()
 
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
 			return result, fmt.Errorf("nucleus: rows: %w", err)
 		}
+		missing = true
 		return result, neutron.ErrNotFound("no rows returned")
 	}
 

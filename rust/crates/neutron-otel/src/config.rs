@@ -72,8 +72,13 @@ impl OtelConfig {
                 "service_name must not be empty".to_string(),
             ));
         }
-        if self.batch_size == 0 {
-            return Err(OtelError::Config("batch_size must be > 0".to_string()));
+        if self.export_interval_ms == 0 {
+            return Err(OtelError::Config("export_interval_ms must be > 0".into()));
+        }
+        if self.batch_size == 0 || self.batch_size > 1_000_000 {
+            return Err(OtelError::Config(
+                "batch_size must be between 1 and 1000000".to_string(),
+            ));
         }
         Ok(())
     }

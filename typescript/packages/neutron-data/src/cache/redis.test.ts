@@ -43,6 +43,12 @@ class MockRedisClient {
     }
   }
 
+  async eval(_script: string, _keys: number, key: string, ttl: number | string): Promise<number> {
+    const value = await this.incr(key);
+    if (ttl !== "" && !this.data.get(key)?.expireAt) await this.expire(key, Number(ttl));
+    return value;
+  }
+
   async quit(): Promise<void> {
     this.data.clear();
   }

@@ -100,9 +100,9 @@ from successful application typing; it does not call those declarations
 fully supported.
 
 The `nucleus` provider connects the same postgres.js driver over Nucleus's
-pg-wire protocol and additionally connects an `@neutron-build/nucleus` client
-(non-relational models). A failed Nucleus connect rejects — it never silently
-degrades to Drizzle-only mode.
+pg-wire protocol. A configured companion can provide non-relational plugins;
+legacy automatic allocation is plugin-free. A failed companion connect rejects
+and disposes owned resources; an absent optional peer permits Drizzle-only mode.
 
 ### Back-compatibility note (pre-1.0)
 
@@ -160,3 +160,113 @@ import { createS3StorageDriver } from "@neutron-build/data";
 ## License
 
 MIT
+
+Leased Postgres queue handlers receive `job.signal`, which aborts if a
+heartbeat or final acknowledgement fails, or the attempt loses ownership. Configure `onLeaseLost` to
+observe that outcome. Only the running slot is leased; `batchSize` bounds
+sequential throughput per poll. Acknowledgements are fenced by the attempt
+generation, even when `workerId` is reused. External effects still require
+idempotency because delivery is at least once. An uncertain success/retry/dead
+acknowledgement is sent once, aborts the signal, and invokes `onLeaseLost` once.
+The worker stops and retains the original failure in `workerError`; `close()`
+still ends the SQL client and rejects with that failure (and cleanup errors if
+present). Inspect server state for that attempt before replacing the worker.
+A committed acknowledgement whose response was lost is not automatically replayed.
+
+The BullMQ adapter defers unknown job names by one second without consuming
+an attempt. Such jobs remain durable across worker restarts and can execute
+when a worker registers their handler. A shared queue with disjoint handlers
+may spend time deferring jobs; use separate queue names for efficient routing.
+Custom injected worker implementations lacking BullMQ's native delayed-job
+support reject unknown jobs into the failed set for explicit operator retry.
+
+Counter TTL omission means no new expiry; every supplied TTL must be integer
+seconds in `1..2147483647`. Zero, negatives, NaN, Infinity and fractions reject
+before dispatch or memory mutation. Redis and Memory require canonical decimal
+safe integers with a safe successor; malformed/unsafe values refuse unchanged.
+Redis validates and increments atomically in EVAL and attaches an expiry only
+to nonexpiring keys; existing expiry remains anchored. Memory follows these rules.
+Nucleus's default `counterMode: 'native'` supports the bundled KVModel's plain
+`incr(key)` through one native KV_INCR. It inherits backend stored-value semantics:
+use valid integer counters in a dedicated namespace; it does not promise checked
+malformed-value refusal or atomic validation of safe successors. An unsafe numeric
+acknowledgement rejects after dispatch and requires reconciliation before retry.
+Consumers requiring pre-mutation validation must select `counterMode: 'strict'`
+and supply a genuine atomic `incrChecked` provider; construction refuses if absent.
+`counterCapabilities.plain` distinguishes native from checked semantics. Any TTL
+increment still requires a genuine checked atomic `incrWithExpiry` provider; bundled
+KVModel does not supply it and `incr(key, ttl)` refuses before mutation. No split
+INCR/EXPIRE or client GET/check/INCR is used. Existing bundled plain-increment
+consumers can keep their calls; strict-counter consumers must migrate explicitly.
+Expiring `set` remains a separate operation with its existing TTL semantics.
+
+The development in-memory scheduler bounds long timer waits, emits no job
+before its cron deadline, and emits one catch-up job after process suspension
+before calculating its next occurrence from the current time.
+
+
+Nucleus Drizzle profiles accept an already connected, caller-configured companion:
+
+```ts
+const database = await createDrizzleDatabase({
+  profile: { provider: "nucleus", connectionString: nucleusUrl },
+  schema,
+  nucleusCompanion: { client: configuredClient, ownership: "borrowed" },
+});
+```
+
+`borrowed` preserves the companion across startup failure and close. `owned`
+transfers cleanup to the factory at entry. `nucleusCompanion: null` opts out.
+Omission retains legacy optional plugin-free allocation; it does not provide
+KV/vector/graph properties. Only caller-installed plugins provide models.
+Every allocated SQL/SQLite client is owned immediately. Startup cleanup preserves
+the primary error, and aggregates any cleanup errors with it as `cause`. Close
+is memoized, attempts every owned resource, and reports all failures afterward.
+The three SQL stacks retain distinct driver/public APIs: Drizzle preserves real
+Drizzle objects, Nucleus owns its transport, and first-party SQL owns scoped pins.
+Their different cancellation and ambiguity contracts are not interchangeable.
+
+The data SessionStore is an unconditional cache store for application data. It
+has no revision/CAS save or conditional destruction contract and cannot serve as
+the core revisioned SessionStore. A future adapter must implement revision-aware
+atomic load/save/destruction and reject legacy unconditional writers.
+Memory stores are development/test adapters: they are process-local, expire
+lazily without a global retention budget, and some values retain object identity.
+Redis realtime `subscribe()` returns before native SUBSCRIBE readiness; a publish
+immediately afterward can be missed. Await `subscribeAsync()` before publishing
+when readiness matters. Acquisition/unsubscription serialize, close drains late
+acquisitions and attempts every owned connection, and failures remain observable.
+An injected publisher defaults to borrowed; set `publisherOwnership: "owned"`
+to transfer cleanup. Native subscriptions remain transient, not durable delivery.
+The synchronous compatibility API logs failures; subsequent registration retries.
+Awaitable registration rejects instead of returning a success-shaped handle. Queue adapters share method names, but
+memory is process-local, Postgres claims only registered names, and BullMQ consumes
+then defers unknown names. Registration is not an atomic complete-handler registry
+or an application-wide start/stop protocol. Draining a worker cannot undo external
+effects; application idempotency remains required.
+
+Queue `capabilities` also describe acknowledgement uncertainty, error observation,
+registration/start, retry, scheduling, routing and post-close behavior. Select
+requirements through `createJobs({driver, requiredCapabilities})` or `admitQueue`.
+Missing custom metadata fails requested admission. `process` registers a handler
+and starts PG/BullMQ workers; memory registers and drains inline. It it is not an atomic complete registry. PG stops on uncertain
+acknowledgement, exposes `workerError` and reports uncertainty on close without
+resending. Native BullMQ factory instances record error/failed events in workerError;
+the factory retains BullMQ's default one attempt per job. Directly injected BullMQ workers have
+unknown native durability/fencing/acknowledgement/scheduling guarantees. They cannot
+inherit factory admission merely by passing a boolean. PG/BullMQ refuse operations
+after terminal close; memory close ends scheduling only, and rejects new schedules.
+Already queued memory jobs and handlers remain process-local and are not drained.
+`QueueDriver.close` stays optional for custom compatibility.
+
+All three SQL stacks use the driver-free `@neutron-build/sql/lifecycle` subpath for
+ownership/drain/error semantics and typed operational admission. Data and Nucleus
+now depend on SQL's package for that small module; it loads no ORM, driver or model.
+`createDrizzleDatabase({requiredCapabilities})` refuses unsupported cancellation
+before allocation. The Drizzle wrapper advertises cancellation as unsupported:
+its raw genuine Drizzle/client handles retain their native APIs. Returned lifecycle
+can assert terminal state; using retained raw handles after close remains subject
+to native driver errors. Owned close is terminal, including failure; repeated close
+observes the same outcome without repeating disposal. Borrowed companions survive.
+Close drains independent owners together and respects queue worker→queue→Redis
+ordering; startup errors retain their causes and all cleanup failures.

@@ -66,7 +66,7 @@ form = ["dep:serde_urlencoded", "dep:serde"]
 logging = ["dep:tracing-subscriber"]
 
 # Distributed tracing layer (OpenTelemetry-compatible spans)
-tracing-mw = ["logging"]
+tracing-mw     = ["logging", "dep:rand"]
 
 # ── Stateless middleware (no extra deps) ────────────────────────────────────
 cors            = []
@@ -85,8 +85,8 @@ dedup           = []
 metrics         = []
 
 # ── Endpoints & utilities (no extra deps) ───────────────────────────────────
-health          = []
-validate        = []
+health         = ["dep:serde", "dep:serde_json"]
+validate       = ["json", "form", "dep:serde"]
 negotiate       = []
 
 # ── Request ID (needs crypto for unique ID generation) ──────────────────────
@@ -94,23 +94,23 @@ request-id      = ["dep:sha2", "dep:rand"]
 
 # ── Real-time ───────────────────────────────────────────────────────────────
 sse             = ["dep:tokio-stream"]   # Server-Sent Events
-pubsub          = []                     # In-memory pub/sub (uses tokio::sync)
+pubsub          = ["dep:serde", "dep:serde_json"] # In-memory pub/sub (uses tokio::sync)
 
 # ── Data & loading ──────────────────────────────────────────────────────────
 data            = []                     # DataLoader + join_all / try_join_all
-static-files    = []                     # Static file serving + NamedFile
+static-files    = ["dep:sha2", "dep:tokio-stream"] # Static file serving + NamedFile
 
 # ── Testing ─────────────────────────────────────────────────────────────────
-testing         = []                     # TestClient (no TCP testing harness)
+testing         = ["dep:serde", "dep:serde_json"] # TestClient (no TCP testing harness)
 
 # ── Optional protocol features (already gated, unchanged) ───────────────────
 tls             = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 compress        = ["dep:flate2", "dep:brotli"]
 ws              = ["dep:fastwebsockets", "dep:sha1", "dep:base64"]
 multipart       = ["dep:multer"]
-jwt             = ["dep:hmac", "dep:base64"]
+jwt            = ["dep:serde", "dep:serde_json", "dep:sha2", "dep:hmac", "dep:base64"]
 cookie          = ["dep:aes-gcm", "dep:hmac", "dep:base64", "dep:rand", "dep:sha2", "dep:serde_urlencoded", "dep:serde", "dep:serde_json"]
-openapi         = []
+openapi        = ["dep:serde", "dep:serde_json"]
 
 # ── Performance ceiling (opt-in, additive) ───────────────────────────────────
 
@@ -131,7 +131,7 @@ mimalloc        = ["dep:mimalloc"]
 # HTTP/3 support via QUIC.
 # Requires TLS certificates (QUIC always uses TLS 1.3).
 # Adds quinn (QUIC transport) + h3 (HTTP/3 framing) + h3-quinn (glue).
-http3           = ["dep:quinn", "dep:h3", "dep:h3-quinn", "tls"]
+http3           = ["dep:quinn", "dep:h3", "dep:h3-quinn", "tls", "dep:futures-util"]
 
 # Tower middleware compatibility — use tower-http layers alongside Neutron middleware.
 # (tower-service is now a core dep — Router implements tower::Service unconditionally.)
@@ -174,7 +174,7 @@ tokio-rustls   = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 flate2         = { workspace = true, optional = true }
 brotli         = { workspace = true, optional = true }
-fastwebsockets = { workspace = true, optional = true }
+fastwebsockets = { workspace = true, optional = true, features = ["unstable-split"] }
 sha1           = { workspace = true, optional = true }
 multer         = { workspace = true, optional = true }
 hmac           = { workspace = true, optional = true }
@@ -207,6 +207,8 @@ rcgen        = { workspace = true }
 tower        = { version = "0.5", features = ["util"] }
 # UI / compile-fail tests for the Router<S> + FromRef surface (P1.6).
 trybuild     = "1"
+# Recording subscriber for the RS-35 interleaved-span regression.
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "router"
@@ -219,19 +221,24 @@ harness = false
 [[example]]
 name = "hello"
 path = "examples/hello.rs"
+required-features = ["json", "ws", "cookie", "body-limit", "request-id", "logging", "compress", "timeout", "cors"]
 
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+required-features = ["json"]
 
 [[example]]
 name = "rest_api"
 path = "examples/rest_api.rs"
+required-features = ["json", "jwt", "openapi", "request-id", "logging", "cors"]
 
 [[example]]
 name = "realtime"
 path = "examples/realtime.rs"
+required-features = ["json", "sse", "pubsub", "ws", "logging", "request-id", "cors"]
 
 [[example]]
 name = "conformance_app"
 path = "examples/conformance_app.rs"
+required-features = ["json", "health", "openapi", "validate", "request-id", "logging", "compress", "cors"]

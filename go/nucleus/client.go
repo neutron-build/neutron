@@ -2,10 +2,14 @@ package nucleus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/neutron-build/neutron/go/neutron"
 )
@@ -21,9 +25,12 @@ func isValidIdentifier(name string) bool {
 
 // Client is the Nucleus database client. It wraps a pgx connection pool and
 // auto-detects whether the target is a plain PostgreSQL instance or Nucleus.
+// A Client must not be copied after use.
 type Client struct {
-	pool     *pgxpool.Pool
-	features Features
+	pool      *pgxpool.Pool
+	features  Features
+	closeOnce sync.Once
+	closeDone chan struct{}
 }
 
 // Features describes capabilities detected on the connected database.
@@ -49,7 +56,8 @@ type Features struct {
 type Option func(*clientOpts)
 
 type clientOpts struct {
-	poolConfig *pgxpool.Config
+	poolConfig     *pgxpool.Config
+	connectTimeout time.Duration
 }
 
 // WithPoolConfig provides a custom pgxpool.Config.
@@ -60,19 +68,21 @@ func WithPoolConfig(cfg *pgxpool.Config) Option {
 // Connect creates a new Client, establishing a connection pool and
 // auto-detecting Nucleus features via SELECT VERSION().
 func Connect(ctx context.Context, url string, opts ...Option) (*Client, error) {
-	var o clientOpts
+	o := clientOpts{connectTimeout: 30 * time.Second}
 	for _, opt := range opts {
 		opt(&o)
 	}
 
-	var pool *pgxpool.Pool
-	var err error
-
-	if o.poolConfig != nil {
-		pool, err = pgxpool.NewWithConfig(ctx, o.poolConfig)
-	} else {
-		pool, err = pgxpool.New(ctx, url)
+	if o.connectTimeout <= 0 {
+		return nil, ErrInvalidConfig
 	}
+	ctx, cancel := context.WithTimeout(ctx, o.connectTimeout)
+	defer cancel()
+	cfg, err := preparePoolConfig(url, o.poolConfig, o.connectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := newPool(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("nucleus: connect: %w", err)
 	}
@@ -80,7 +90,11 @@ func Connect(ctx context.Context, url string, opts ...Option) (*Client, error) {
 	// Auto-detect features
 	features, err := detectFeatures(ctx, pool)
 	if err != nil {
-		pool.Close()
+		// A stalled driver cleanup or BeforeClose callback must not extend
+		// the caller's startup wait. The same single shutdown worker continues
+		// owning this pool until its borrowed resources/callbacks finish.
+		cleanup := &Client{pool: pool}
+		_ = cleanup.CloseContext(ctx)
 		return nil, fmt.Errorf("nucleus: detect features: %w", err)
 	}
 
@@ -105,7 +119,34 @@ func (c *Client) IsNucleus() bool {
 
 // Close closes the connection pool.
 func (c *Client) Close() {
-	c.pool.Close()
+	c.beginClose()
+	<-c.closeDone
+}
+
+// CloseContext starts pool shutdown once and waits until completion or ctx
+// expiry. One shutdown worker is shared by all calls. Borrowed rows/transactions
+// must still be released by their owners; BeforeClose callbacks must return;
+// a timeout does not claim the underlying pool has finished closing.
+func (c *Client) CloseContext(ctx context.Context) error {
+	c.beginClose()
+	select {
+	case <-c.closeDone:
+		return nil
+	default:
+	}
+	select {
+	case <-c.closeDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) beginClose() {
+	c.closeOnce.Do(func() {
+		c.closeDone = make(chan struct{})
+		go func() { c.pool.Close(); close(c.closeDone) }()
+	})
 }
 
 // SQL returns the SQL model for type-safe queries.
@@ -191,8 +232,7 @@ func (c *Client) LifecycleHook() neutron.LifecycleHook {
 			return c.pool.Ping(ctx)
 		},
 		OnStop: func(ctx context.Context) error {
-			c.pool.Close()
-			return nil
+			return c.CloseContext(ctx)
 		},
 	}
 }
@@ -237,4 +277,110 @@ func detectFeatures(ctx context.Context, pool *pgxpool.Pool) (Features, error) {
 	}
 
 	return f, nil
+}
+
+// ErrInvalidConfig deliberately carries no DSN or parser cause: driver parse
+// errors and panic values may contain passwords in supported DSN spellings.
+var ErrInvalidConfig = errors.New("nucleus: invalid connection configuration")
+
+// ErrChannelBindingUnsupported means this SDK's driver cannot enforce the
+// requested SCRAM channel-binding contract. Refusal precedes network I/O.
+var ErrChannelBindingUnsupported = errors.New("nucleus: required channel binding is unsupported by the current driver")
+
+// WithConnectTimeout bounds initial pool acquisition and feature detection.
+// The default is 30 seconds. The caller's earlier deadline still applies.
+func WithConnectTimeout(timeout time.Duration) Option {
+	return func(o *clientOpts) { o.connectTimeout = timeout }
+}
+
+func preparePoolConfig(dsn string, supplied *pgxpool.Config, budget time.Duration) (cfg *pgxpool.Config, err error) {
+	// Recover only at the configuration boundary, before any pool goroutines.
+	defer func() {
+		if recover() != nil {
+			cfg = nil
+			err = ErrInvalidConfig
+		}
+	}()
+	if supplied != nil {
+		if supplied.ConnConfig == nil {
+			return nil, ErrInvalidConfig
+		}
+		cfg = supplied.Copy()
+	} else {
+		cfg, err = pgxpool.ParseConfig(dsn)
+		if err != nil {
+			return nil, ErrInvalidConfig
+		}
+	}
+	if cfg.MaxConns <= 0 || cfg.MinConns < 0 || cfg.MinConns > cfg.MaxConns ||
+		cfg.HealthCheckPeriod <= 0 || cfg.MaxConnLifetime <= 0 || cfg.MaxConnIdleTime <= 0 ||
+		cfg.MaxConnLifetimeJitter < 0 || cfg.MaxConnLifetimeJitter > cfg.MaxConnLifetime {
+		return nil, ErrInvalidConfig
+	}
+	// No connection constructor may silently remove the declared requirement.
+	if err := prepareConnConfig(cfg.ConnConfig, budget); err != nil {
+		return nil, err
+	}
+	before := cfg.BeforeConnect
+	cfg.BeforeConnect = func(ctx context.Context, cc *pgx.ConnConfig) error {
+		ctx, cancel := context.WithTimeout(ctx, budget)
+		defer cancel()
+		if before != nil {
+			if err := before(ctx, cc); err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return prepareConnConfig(cc, budget)
+	}
+	if after := cfg.AfterConnect; after != nil {
+		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			ctx, cancel := context.WithTimeout(ctx, budget)
+			defer cancel()
+			if err := after(ctx, conn); err != nil {
+				return err
+			}
+			return ctx.Err()
+		}
+	}
+	return cfg, nil
+}
+
+func prepareConnConfig(cc *pgx.ConnConfig, budget time.Duration) error {
+	if cc == nil || cc.ConnectTimeout < 0 {
+		return ErrInvalidConfig
+	}
+	// This driver predates MinIdleConns; reject the unsupported pool option
+	// before it can be transmitted as a server setting.
+	if _, unsupported := cc.RuntimeParams["pool_min_idle_conns"]; unsupported {
+		return ErrInvalidConfig
+	}
+	// pgx v5.7.2 has no SCRAM-PLUS dispatch. Do not send this libpq option
+	// as a server runtime parameter or claim TLS alone provides binding.
+	switch cc.RuntimeParams["channel_binding"] {
+	case "", "disable", "prefer":
+		delete(cc.RuntimeParams, "channel_binding")
+	case "require":
+		return ErrChannelBindingUnsupported
+	default:
+		return ErrInvalidConfig
+	}
+	if cc.ConnectTimeout == 0 || cc.ConnectTimeout > budget {
+		cc.ConnectTimeout = budget
+	}
+	return nil
+}
+
+// pgx enforces ParseConfig provenance with a synchronous panic. Convert that
+// configuration-only panic before NewWithConfig can start background work.
+func newPool(ctx context.Context, cfg *pgxpool.Config) (pool *pgxpool.Pool, err error) {
+	defer func() {
+		if recover() != nil {
+			pool = nil
+			err = ErrInvalidConfig
+		}
+	}()
+	return pgxpool.NewWithConfig(ctx, cfg)
 }

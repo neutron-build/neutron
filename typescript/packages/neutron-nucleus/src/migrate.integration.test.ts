@@ -384,3 +384,33 @@ describe("Integration: history admission", { skip: !live() }, () => {
   });
 
 });
+
+it('rollback validates step counts before any transport work; zero is read-only no-op (TSD-10)', async () => {
+  const forbidden = new Proxy({} as Transport, { get() { throw new Error('transport used'); } });
+  for (const steps of [-1, 0.5, NaN, Infinity]) await assert.rejects(migrateDown(forbidden, [], steps), RangeError);
+  assert.deepEqual(await migrateDown(forbidden, [], 0), []);
+});
+
+it('rollback preflights the persisted numeric frontier before business DDL (TSD-10)', { skip: !live() }, async () => {
+  const t = new PgTransport(url);
+  const plan: Migration[] = [
+    { version: 1, name: 'first', up: 'CREATE TABLE ts_a(id int)', down: 'DROP TABLE ts_a' },
+    { version: 2, name: 'second', up: 'CREATE TABLE ts_b(id int)', down: 'DROP TABLE ts_b' },
+    { version: 10, name: 'tenth', up: 'CREATE TABLE ts_c(id int)', down: 'DROP TABLE ts_c' },
+  ];
+  try {
+    await reset(t);
+    await migrate(t, plan.slice(0, 2));
+    await assert.rejects(migrateDown(t, plan.slice(0, 1), 1), /migration 2.*missing local/);
+    assert.deepEqual((await migrationStatus(t)).map((m) => Number(m.version)), [1, 2]);
+    await assert.rejects(migrateDown(t, [{ ...plan[0], down: undefined }, plan[1]], 2), /has no down SQL/);
+    assert.equal(await t.fetchval("SELECT count(*) FROM ts_b"), 0);
+    assert.deepEqual((await migrationStatus(t)).map((m) => Number(m.version)), [1, 2]);
+    await migrate(t, plan);
+    await assert.rejects(migrateDown(t, [plan[0], plan[2]], 2), /migration 2.*missing local/);
+    assert.equal(await t.fetchval("SELECT count(*) FROM ts_c"), 0);
+    assert.deepEqual(await migrateDown(t, plan, 2), ['tenth', 'second']);
+    assert.deepEqual((await migrationStatus(t)).map((m) => Number(m.version)), [1]);
+    await migrateDown(t, plan, 1);
+  } finally { await reset(t); await t.close(); }
+});

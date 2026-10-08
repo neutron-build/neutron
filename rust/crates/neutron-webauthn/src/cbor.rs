@@ -35,6 +35,9 @@ pub struct CoseKey {
 
 /// Parse a COSE_Key from CBOR bytes.
 pub fn parse_cose_key(data: &[u8]) -> Result<CoseKey, WebAuthnError> {
+    if data.len() > 65536 {
+        return Err(WebAuthnError::Cbor("COSE key too large".into()));
+    }
     let mut pos = 0usize;
 
     // Expect a map
@@ -46,8 +49,15 @@ pub fn parse_cose_key(data: &[u8]) -> Result<CoseKey, WebAuthnError> {
     let mut x: Option<Vec<u8>> = None;
     let mut y: Option<Vec<u8>> = None;
 
+    if map_len > 32 {
+        return Err(WebAuthnError::Cbor("too many COSE fields".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
     for _ in 0..map_len {
         let key = read_int(data, &mut pos)?;
+        if !seen.insert(key) {
+            return Err(WebAuthnError::Cbor("duplicate COSE field".into()));
+        }
         match key {
             1 => kty = Some(read_int(data, &mut pos)?),
             3 => alg = Some(read_int(data, &mut pos)?),
@@ -60,6 +70,9 @@ pub fn parse_cose_key(data: &[u8]) -> Result<CoseKey, WebAuthnError> {
         }
     }
 
+    if pos != data.len() {
+        return Err(WebAuthnError::Cbor("trailing COSE bytes".into()));
+    }
     Ok(CoseKey {
         kty: kty.ok_or_else(|| WebAuthnError::MissingField("kty".into()))?,
         alg: alg.ok_or_else(|| WebAuthnError::MissingField("alg".into()))?,
@@ -134,37 +147,42 @@ fn read_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, WebAuthnError> {
 }
 
 fn skip_value(data: &[u8], pos: &mut usize) -> Result<(), WebAuthnError> {
-    let b = peek(data, *pos)?;
-    let major = b >> 5;
-    match major {
-        0 | 1 => {
-            read_int(data, pos)?;
+    fn skip(data: &[u8], pos: &mut usize, depth: usize) -> Result<(), WebAuthnError> {
+        if depth > 8 {
+            return Err(WebAuthnError::Cbor("COSE nesting too deep".into()));
         }
-        2 | 3 => {
-            let (len, advance) = decode_additional(data, *pos)?;
-            *pos += advance + len as usize;
-        }
-        5 => {
-            let (map_len, advance) = decode_additional(data, *pos)?;
-            *pos += advance;
-            for _ in 0..(map_len * 2) {
-                skip_value(data, pos)?;
+        let major = peek(data, *pos)? >> 5;
+        let (len, advance) = decode_additional(data, *pos)?;
+        *pos += advance;
+        match major {
+            0 | 1 => {}
+            2 | 3 => {
+                let len = usize::try_from(len)
+                    .map_err(|_| WebAuthnError::Cbor("length overflow".into()))?;
+                if len > data.len().saturating_sub(*pos) {
+                    return Err(WebAuthnError::Cbor("truncated COSE value".into()));
+                }
+                *pos += len;
             }
-        }
-        4 => {
-            let (arr_len, advance) = decode_additional(data, *pos)?;
-            *pos += advance;
-            for _ in 0..arr_len {
-                skip_value(data, pos)?;
+            4 | 5 => {
+                let count = if major == 5 {
+                    len.checked_mul(2)
+                } else {
+                    Some(len)
+                }
+                .ok_or_else(|| WebAuthnError::Cbor("length overflow".into()))?;
+                if count > data.len().saturating_sub(*pos) as u64 {
+                    return Err(WebAuthnError::Cbor("truncated COSE container".into()));
+                }
+                for _ in 0..count {
+                    skip(data, pos, depth + 1)?;
+                }
             }
+            _ => return Err(WebAuthnError::Cbor("unsupported COSE value type".into())),
         }
-        _ => {
-            return Err(WebAuthnError::Cbor(format!(
-                "unsupported major type {major}"
-            )))
-        }
+        Ok(())
     }
-    Ok(())
+    skip(data, pos, 0)
 }
 
 /// Returns `(value, bytes_consumed)` including the initial byte.
@@ -281,5 +299,26 @@ mod tests {
         let mut pos = 0;
         let v = read_int(&[0x02], &mut pos).unwrap();
         assert_eq!(v, 2);
+    }
+
+    #[test]
+    fn cose_rejects_duplicate_trailing_nested_and_truncated_values() {
+        let mut key = build_cose_key(&[1; 32], &[2; 32]);
+        key.push(0);
+        assert!(parse_cose_key(&key).is_err());
+        let mut duplicate = build_cose_key(&[1; 32], &[2; 32]);
+        duplicate[0] = 0xa6;
+        duplicate.extend_from_slice(&[1, 2]);
+        assert!(parse_cose_key(&duplicate).is_err());
+        let mut nested = build_cose_key(&[1; 32], &[2; 32]);
+        nested[0] = 0xa6;
+        nested.push(4);
+        nested.extend_from_slice(&[0x81; 32]);
+        nested.push(0);
+        assert!(parse_cose_key(&nested).is_err());
+        let mut truncated = build_cose_key(&[1; 32], &[2; 32]);
+        truncated[0] = 0xa6;
+        truncated.extend_from_slice(&[4, 0x59, 0xff, 0xff]);
+        assert!(parse_cose_key(&truncated).is_err());
     }
 }

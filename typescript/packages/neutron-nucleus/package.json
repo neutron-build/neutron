@@ -94,7 +94,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js dist/integration.test.js dist/transport.test.js dist/retry.test.js dist/migrate.integration.test.js dist/models.live.test.js dist/geo/geo.test.js dist/blob/blob.test.js dist/kv/kv.test.js",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/*.test.js dist/*/*.test.js",
     "lint": "tsc --noEmit --pretty false",
     "typecheck": "tsc --noEmit"
   },
@@ -112,5 +112,8 @@
   },
   "optionalDependencies": {
     "pg": "^8.11.0"
+  },
+  "dependencies": {
+    "@neutron-build/sql": "workspace:^"
   }
 }
