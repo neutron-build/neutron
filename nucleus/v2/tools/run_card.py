@@ -202,9 +202,9 @@ def main():
                         proc.kill()
                         print(f"[{card_id}] no output after 10 minutes, restarting opencode (start {start + 1})", flush=True)
                         break
-                    if log.stat().st_size and time.time() - log.stat().st_mtime > 15 * 60:
+                    if log.stat().st_size and time.time() - log.stat().st_mtime > 30 * 60:
                         proc.kill()
-                        failure = "opencode run killed: no output for 15 minutes (stalled model call); continue the card"
+                        failure = "opencode run killed: no output for 30 minutes (stalled model call); continue the card"
                         break
                     if waited > 60 * 60 or free_gb(WT_ROOT) < args.min_free_gb / 2:
                         proc.kill()
