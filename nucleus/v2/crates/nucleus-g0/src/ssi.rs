@@ -11,10 +11,11 @@
 //! committed history, built from ghost state: ww, wr, rw by commit/snapshot order,
 //! with TRUNCATE's wipe as a write of every relation key), I-SSI-EDGES (the recorded
 //! rw-edge set equals the SIREAD-footprint oracle computed from ghost state, both
-//! directions) and I-SSI-PRECISION (every 40001 raised by the dangerous-structure
-//! check has a valid recorded structure), plus §4 read correctness of every
-//! performed read (a read at snapshot S returns the newest committed state <= S),
-//! which carries seed 62.
+//! directions; it carries seed 62: a read performed after commit records an edge
+//! no legitimate read could) and I-SSI-PRECISION (every 40001 raised by the
+//! dangerous-structure check has a valid recorded structure), plus §4 read
+//! correctness of every performed read (a read at snapshot S returns the newest
+//! committed state <= S).
 //!
 //! A SER read records reader-side edges (§4) and feeds the ghost read log, so reads
 //! are steps here, unlike G0-commit's pure readers (see C-T0 §11 "Model
@@ -36,7 +37,7 @@
 //! | Eo     | read h0; write h1                                   | scan [i0..i2]; write h0 | insert h2+i2 |
 //! | Scan   | scan [i0..i1]; fetch h0                             | write h0+i0             | —           |
 //! | Trunc  | read h0                                             | —                       | TRUNCATE    |
-//! | Hold   | WITH HOLD read h0 (materialise at commit, fetch after) | write h0             | —           |
+//! | Hold   | write h1; WITH HOLD read h0 (materialised at commit, fetched after) | read h1; write h0 | — |
 //!
 //! Workload write sets are pairwise disjoint (the TRUNCATE is a DDL and places no
 //! intents), so no §5.1 wait ever arises; the model stays inside G0-write's scope.
@@ -59,11 +60,24 @@
 //! | 43 | Ro    | pre-commit checks only structures with the committer as pivot |
 //! | 60 | Trunc | the DDL-side SIREAD check runs at pre-commit, after PREPARED (missing during the window) |
 //! | 61 | Eo    | `earliest_out_conflict_commit` set by an X that commits after T (spurious 40001) |
-//! | 62 | Hold  | the WITH HOLD cursor is not materialised; the fetch reads the live state after commit |
+//! | 62 | Hold  | the cursor is not materialised at commit; its read (SIREAD, fresh view, read at `S`) runs lazily only after the txn committed |
 //! | 63 | Ro    | `earliest_out_conflict_commit` update skipped because T already has a group-assigned ts |
 //!
 //! ## Scope cuts (vs the full protocol; none observable by the four invariants)
 //!
+//! - Statements per txn vs the card's "2 statements each": Skew T2 and Trunc
+//!   T1 run nothing; Ro T2 (one write), Eo T2 (one insert), Scan T1 (one
+//!   write), Trunc T0 (one read) and Trunc T2 (the DDL itself) run one
+//!   statement. Every other txn runs exactly two.
+//! - Weak catches: seeds 5, 6 and 30 are caught through the registration-order
+//!   stamps (`sver`/`vver`) of I-SSI-ORDER, seed 36 through that invariant's
+//!   "no registered view" clause (at this scope an unregistered latest-state
+//!   read returns snapshot-correct values; its real-world harm is I-TRUNC,
+//!   G0-commit's scope, cut below), and seed 60 through the I-SSI-EDGES window
+//!   between DDL execution and pre-commit. None of the five produces an
+//!   observable read or serialization anomaly here; every other seed is
+//!   caught by I-SER, I-SSI-EDGES (both directions), I-SSI-PRECISION or the
+//!   §4 read check.
 //! - No crash, fsync, `synchronous_commit` modes, ack step or `/sys` records:
 //!   G0-commit's invariants. The pipeline keeps group step 1, step 3 (writer map),
 //!   step 4 with status-set and visible-advance separate, and step 5.
@@ -265,12 +279,15 @@ struct GRead {
 struct Fired {
     t1: u8,
     t2: u8,
-    t3: u8,
+    /// None when the protocol fired on the frozen `earliest_out_conflict_commit`
+    /// of a committed t2 and its own writer map no longer named t3 (§8.6); the
+    /// oracle in `check()` then resolves t3 from ghost commits.
+    t3: Option<u8>,
     /// The `earliest_out_conflict_commit` value that fired (committed-T2 rule).
     fired: Option<Ts>,
     o1: u32,
     o2: u32,
-    o3: u32,
+    o3: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -312,8 +329,6 @@ struct Txn {
     /// Holds AccessShare on the relation (from first access to release).
     touched: bool,
     intents: BTreeSet<Key>,
-    /// Materialised WITH HOLD cursor: (ts, view ver, SIREAD ver) of the frozen read.
-    hold: Option<(Ts, u32, Option<u32>)>,
 }
 
 impl Txn {
@@ -332,7 +347,6 @@ impl Txn {
             enq: false,
             touched: false,
             intents: BTreeSet::new(),
-            hold: None,
         }
     }
 }
@@ -409,7 +423,6 @@ enum Step {
     Place { keys: &'static [Key] },
     AcquireAExcl,
     DdlExec,
-    Materialise { key: Key },
     PreCommit,
     Enqueue,
     HoldFetch { key: Key },
@@ -593,21 +606,27 @@ fn program(bug: Option<Bug>, w: Work, t: u8) -> &'static [Step] {
             S::Enqueue,
         ],
         (Work::Hold, 0) => match bug {
+            // Seed 62: no materialisation at commit; the cursor's query (SIREAD,
+            // fresh view, read at S) runs lazily only after the txn committed.
             Some(Bug::LazyHoldCursor) => &[
                 S::TakeSnapshot,
-                S::Siread(Bound::Point(H0)),
-                S::OpenView(0),
-                S::Read { slot: 0, key: H0 },
+                S::Place { keys: &[H1] },
                 S::PreCommit,
                 S::Enqueue,
-                S::HoldFetch { key: H0 },
-            ],
-            _ => &[
-                S::TakeSnapshot,
                 S::Siread(Bound::Point(H0)),
                 S::OpenView(0),
                 S::Read { slot: 0, key: H0 },
-                S::Materialise { key: H0 },
+                S::HoldFetch { key: H0 },
+            ],
+            // The cursor is materialised at commit, before the SSI pre-commit
+            // (§3.1): SIREAD, fresh view and read happen here, and the fetch
+            // after commit reads only the materialised copy.
+            _ => &[
+                S::TakeSnapshot,
+                S::Place { keys: &[H1] },
+                S::Siread(Bound::Point(H0)),
+                S::OpenView(0),
+                S::Read { slot: 0, key: H0 },
                 S::PreCommit,
                 S::Enqueue,
                 S::HoldFetch { key: H0 },
@@ -615,6 +634,9 @@ fn program(bug: Option<Bug>, w: Work, t: u8) -> &'static [Step] {
         },
         (Work::Hold, 1) => &[
             S::TakeSnapshot,
+            S::Siread(Bound::Point(H1)),
+            S::OpenView(0),
+            S::Read { slot: 0, key: H1 },
             S::Place { keys: &[H0] },
             S::PreCommit,
             S::Enqueue,
@@ -816,7 +838,7 @@ impl State {
             || matches!(self.txns[t3 as usize].assigned, Some(c) if c <= self.snap_of(t1))
     }
 
-    fn fired(&self, t1: u8, t2: u8, t3: u8, value: Option<Ts>) -> Fired {
+    fn fired(&self, t1: u8, t2: u8, t3: Option<u8>, value: Option<Ts>) -> Fired {
         Fired {
             t1,
             t2,
@@ -824,7 +846,7 @@ impl State {
             fired: value,
             o1: self.ord(t1),
             o2: self.ord(t2),
-            o3: self.ord(t3),
+            o3: t3.map(|t| self.ord(t)),
         }
     }
 
@@ -844,7 +866,7 @@ impl State {
                     continue;
                 }
                 if self.first_among(y, [x, t, y]) && self.ro_ok(x, y) {
-                    return Some((self.fired(x, t, y, None), t));
+                    return Some((self.fired(x, t, Some(y), None), t));
                 }
             }
         }
@@ -865,7 +887,14 @@ impl State {
                 };
                 if let Some(e) = e {
                     if !self.ro_at(t) || e <= self.snap_of(t) {
-                        let z = self.ghost_writer(e).unwrap_or(y);
+                        // T3 is named through the protocol's own writer map
+                        // (`wmap`, §8.5, with §8.6 retention) — never ghost
+                        // state. When the entry is retired the protocol fires
+                        // on the frozen value alone and cannot name T3 at all
+                        // (PostgreSQL's check needs no T3 here), leaving None
+                        // for the precision oracle in `check()` to resolve
+                        // from ghost commits.
+                        let z = self.wmap.get(&e).copied();
                         return Some((self.fired(t, y, z, Some(e)), t));
                     }
                 }
@@ -880,7 +909,7 @@ impl State {
                         } else {
                             t
                         };
-                        return Some((self.fired(t, y, z, None), victim));
+                        return Some((self.fired(t, y, Some(z), None), victim));
                     }
                 }
             }
@@ -1072,21 +1101,6 @@ impl State {
                 self.ddl_siread_check(t, record);
                 self.txns[t as usize].pc += 1;
             }
-            S::Materialise { key } => {
-                // §3.1: a holdable cursor is materialised at commit, before the
-                // SSI pre-commit, by re-reading at S through a fresh view.
-                if self.storage_blocked(t) {
-                    self.abort(t, None);
-                    return;
-                }
-                let kv = self.latest();
-                let ver = self.ver;
-                self.do_read(t, &kv, ver, key);
-                if let Some(r) = self.g_reads.last() {
-                    self.txns[t as usize].hold = Some((r.ts, r.vver, r.sver));
-                }
-                self.txns[t as usize].pc += 1;
-            }
             S::PreCommit => match self.txns[t as usize].st {
                 St::Active => {
                     if bug == Some(Bug::PreCommitNotAtomic) {
@@ -1129,52 +1143,12 @@ impl State {
                 self.txns[t as usize].enq = true;
                 self.txns[t as usize].pc += 1;
             }
-            S::HoldFetch { key } => {
-                let snap = self.snap_of(t);
-                match self.txns[t as usize].hold {
-                    Some((ts, vver, sver)) => {
-                        // The cursor reads the materialised copy; nothing touches
-                        // the KV after the txn ended.
-                        self.g_reads.push(GRead {
-                            t,
-                            key,
-                            snap,
-                            ts,
-                            view: true,
-                            vver,
-                            sver,
-                        });
-                    }
-                    None => {
-                        // Seed 62: nothing was materialised; the fetch re-reads
-                        // the latest committed state, ignoring the cursor's
-                        // snapshot.
-                        let kv = self.latest();
-                        let mut ts = 0;
-                        for (k, _) in kv.range(Kvk::Version(key, 0)..=Kvk::Version(key, Ts::MAX)) {
-                            if let Kvk::Version(_, c) = k {
-                                ts = ts.max(*c);
-                            }
-                        }
-                        if let Some(Val::Intent { owner, .. }) = kv.get(&Kvk::Intent(key)) {
-                            if let St::Committed(c) = self.txns[*owner as usize].st {
-                                ts = ts.max(c);
-                            }
-                        }
-                        let vver = self.ver;
-                        self.g_reads.push(GRead {
-                            t,
-                            key,
-                            snap,
-                            ts,
-                            view: false,
-                            vver,
-                            sver: None,
-                        });
-                    }
-                }
-                self.txns[t as usize].hold = None;
-                // The cursor closes; its snapshot is unregistered.
+            S::HoldFetch { .. } => {
+                // The fetch reads the cursor's materialised copy (in the clean
+                // program the materialisation step already performed and
+                // recorded the read; in the seed-62 program the lazy read
+                // steps ran before this close). Here the cursor closes and its
+                // snapshot registration ends (§3.1).
                 self.txns[t as usize].snap = None;
                 self.txns[t as usize].pc += 1;
             }
@@ -1204,9 +1178,6 @@ impl State {
             for v in x.views.iter().flatten() {
                 vals.push(v.ver);
             }
-            if let Some((_, v, _)) = x.hold {
-                vals.push(v);
-            }
         }
         for r in &self.g_reads {
             vals.push(r.vver);
@@ -1224,9 +1195,6 @@ impl State {
             }
             for v in x.views.iter_mut().flatten() {
                 v.ver = rank(v.ver);
-            }
-            if let Some((_, v, _)) = &mut x.hold {
-                *v = rank(*v);
             }
         }
         for r in &mut self.g_reads {
@@ -1246,7 +1214,11 @@ impl State {
             }
         }
         for f in self.doomed.values().chain(self.g_abort.iter()) {
-            ps.extend([f.o1, f.o2, f.o3]);
+            ps.push(f.o1);
+            ps.push(f.o2);
+            if let Some(o3) = f.o3 {
+                ps.push(o3);
+            }
         }
         ps.sort_unstable();
         ps.dedup();
@@ -1260,7 +1232,9 @@ impl State {
         for f in self.doomed.values_mut().chain(self.g_abort.iter_mut()) {
             f.o1 = prank(f.o1);
             f.o2 = prank(f.o2);
-            f.o3 = prank(f.o3);
+            if let Some(o3) = &mut f.o3 {
+                *o3 = prank(*o3);
+            }
         }
     }
 }
@@ -1345,15 +1319,19 @@ impl Model for SsiModel {
                 S::DdlExec => s.aexcl == Some(t),
                 // First relation access takes AccessShare, which waits while another
                 // txn holds AccessExclusive (§10: DDL takes AccessExclusive).
+                // A committed, released txn may still run these steps: the lazy
+                // WITH HOLD fetch of seed 62 executes the cursor's query only
+                // after its txn ended (§3.1). Every other program names such
+                // steps only while active.
                 S::Siread(_)
                 | S::OpenView(_)
                 | S::Read { .. }
                 | S::Scan { .. }
                 | S::ReadLatest { .. }
-                | S::Place { .. }
-                | S::Materialise { .. } => {
-                    matches!(txn.st, St::Active | St::Checked)
-                        && s.aexcl.is_none_or(|x| x == t || txn.touched)
+                | S::Place { .. } => {
+                    let st_ok = matches!(txn.st, St::Active | St::Checked)
+                        || (matches!(txn.st, St::Committed(_)) && txn.released);
+                    st_ok && s.aexcl.is_none_or(|x| x == t || txn.touched)
                 }
                 _ => matches!(txn.st, St::Active | St::Checked),
             };
@@ -1392,10 +1370,23 @@ impl Model for SsiModel {
         for t in 0..3u8 {
             if !s.retired[t as usize] {
                 if let St::Committed(c) = s.txns[t as usize].st {
-                    // §8.6: both visible_ts >= c and every SER snapshot below c ended.
+                    // §8.6: both visible_ts >= c and every SER snapshot below c
+                    // ended. t's own registration counts only once a WITH HOLD
+                    // cursor holds it past release (§3.1: that registration
+                    // outlives the txn, and a lazy reader may still depend on
+                    // the state); before step 5 it is a pipeline artifact of a
+                    // txn that has already ended.
                     let vis_ok = self.bug == Some(Bug::RetireIgnoresVisible) || s.visible_ts >= c;
-                    let snap_ok = (0..3u8)
-                        .all(|x| x == t || !matches!(s.txns[x as usize].snap, Some(sv) if sv < c));
+                    let snap_ok = (0..3u8).all(|x| {
+                        if x == t {
+                            !matches!(
+                                (s.txns[t as usize].released, s.txns[t as usize].snap),
+                                (true, Some(sv)) if sv < c
+                            )
+                        } else {
+                            !matches!(s.txns[x as usize].snap, Some(sv) if sv < c)
+                        }
+                    });
                     if vis_ok && snap_ok {
                         out.push(Action::Retire(t));
                     }
@@ -1450,8 +1441,10 @@ impl Model for SsiModel {
                         let upd = match self.bug {
                             // Seed 63: skipped because T already has a ts.
                             Some(Bug::SkipAssignedTsUpdate) => tx == Ts::MAX,
-                            // Seed 61: set by an X that commits after T.
-                            Some(Bug::EarliestFromLaterCommit) => it.ts >= tx,
+                            // Seed 61: the "X committed before T" guard is
+                            // dropped, so an X committing after T also sets
+                            // the value; correct updates are kept.
+                            Some(Bug::EarliestFromLaterCommit) => true,
                             _ => it.ts < tx,
                         };
                         if upd {
@@ -1667,16 +1660,28 @@ impl Model for SsiModel {
         }
         // I-SSI-PRECISION.
         for f in &s.g_abort {
-            if f.t1 != f.t3 && f.o3 >= f.o1 {
+            // T3 of a fired value is resolved here, from ghost commits, when
+            // the protocol's own writer map no longer named it at fire time
+            // (see `dangerous`). `ord` is stable: every member of a fired
+            // structure committed or prepared before the check that fired.
+            let t3 = match f.t3 {
+                Some(t3) => Some(t3),
+                None => f.fired.and_then(|e| s.ghost_writer(e)),
+            };
+            let Some(t3) = t3 else {
+                continue;
+            };
+            let o3 = f.o3.unwrap_or_else(|| s.ord(t3));
+            if f.t1 != t3 && o3 >= f.o1 {
                 return Err(format!(
                     "I-SSI-PRECISION: 40001 of T{} raised on structure T{}->T{}->T{} but T{} did not commit first",
-                    f.t1, f.t1, f.t2, f.t3, f.t3
+                    f.t1, f.t1, f.t2, t3, t3
                 ));
             }
-            if f.t2 != f.t3 && f.o3 >= f.o2 {
+            if f.t2 != t3 && o3 >= f.o2 {
                 return Err(format!(
                     "I-SSI-PRECISION: 40001 of T{} raised on structure T{}->T{}->T{} but T{} did not commit first",
-                    f.t1, f.t1, f.t2, f.t3, f.t3
+                    f.t1, f.t1, f.t2, t3, t3
                 ));
             }
             // Read-only-ness and T3's commit from ghost state, not from the
@@ -1684,18 +1689,18 @@ impl Model for SsiModel {
             let w = s.w.unwrap_or(Work::Skew);
             let t1_ro = declared_ro(w, f.t1) || s.g_writes[f.t1 as usize].is_empty();
             let s1 = s.snap_of(f.t1);
-            let c3 = ghost_c(f.t3);
+            let c3 = ghost_c(t3);
             if t1_ro && !c3.is_some_and(|c| c <= s1) {
                 return Err(format!(
                     "I-SSI-PRECISION: 40001 raised on read-only T{} with commit_ts(T{})={:?} not <= S(T1)={}",
-                    f.t1, f.t3, c3, s1
+                    f.t1, t3, c3, s1
                 ));
             }
             if let Some(v) = f.fired {
                 if c3 != Some(v) {
                     return Err(format!(
                         "I-SSI-PRECISION: fired earliest_out_conflict_commit {} is not the commit of T{} ({:?})",
-                        v, f.t3, c3
+                        v, t3, c3
                     ));
                 }
             }
