@@ -20,3 +20,7 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
+
+# G0 model checking explores millions of states; optimise it even in test builds.
+[profile.dev.package.nucleus-g0]
+opt-level = 3

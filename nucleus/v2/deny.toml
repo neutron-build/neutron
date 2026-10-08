@@ -40,6 +40,7 @@ unused-allowed-license = "allow"
 exceptions = [
     { allow = ["BUSL-1.1"], crate = "nucleus-catalog" },
     { allow = ["BUSL-1.1"], crate = "nucleus-embedded" },
+    { allow = ["BUSL-1.1"], crate = "nucleus-g0" },
     { allow = ["BUSL-1.1"], crate = "nucleus-kv" },
     { allow = ["BUSL-1.1"], crate = "nucleus-models" },
     { allow = ["BUSL-1.1"], crate = "nucleus-server" },

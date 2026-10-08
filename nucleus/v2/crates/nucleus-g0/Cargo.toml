@@ -1,0 +1,10 @@
+[package]
+name = "nucleus-g0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "G0: exhaustive small-scope model checkers for the C-T0 transaction protocol"
+
+[lints]
+workspace = true
