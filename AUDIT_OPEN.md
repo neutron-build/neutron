@@ -1547,3 +1547,76 @@ NE-01..31 + MJ; Pass B: RS-01..35 + TSD-01..14; Pass C: the 76 above). The
 pack's five platform-blocked scopes remain blocked_incomplete per its own
 coverage census — device/browser/native release suites were not exercised
 beyond the explicit tests listed here.
+
+## 2026-10-07 — codex-lane frozen-patch reconciliation vs landed main (tail items)
+
+Reconciliation record for the parallel codex lane's frozen Neutron patches
+(`.audits/2026-10-07-final/`, untracked) against landed main `90e1606b`
+(Pass A `fa9cc9bb` + Pass B `3380c650` + 0.3.2 `b3e0e562` + Pass C
+`90e1606b`). Method: each patch was applied read-only to a scratch worktree
+at its recorded base (`fa9cc9bb` for all seven) and every post-image file was
+compared byte-for-byte against current main; differing files were then
+inspected hunk-by-hunk to determine which side is the evolved successor. No
+web searches or external lookups were used; evidence is the patches, their
+receipts/reports, git history, and current source.
+
+### Disposition table
+
+| Frozen patch (paths) | Finding scope | Disposition |
+|---|---|---|
+| neutron-go-upstream-fix-r1 (10) | HTTP-01..05, QO-01, OBS-DB-01/02(SDK refusal)/03/04 | **covered-by-landed** — all 10 post-image files byte-identical to main (Pass B landed the exact candidate; per-file SHA-256s match the patch receipt's `after_sha256`). Pass B additionally aligned `openapi_contract_test.go` 413 expectations, which this patch did not touch. |
+| neutron-b-rust-fix-r3 (68) | RS-01..35 + review repairs R1–R13 | **covered-by-landed** — 57/67 changed files byte-identical to main. The 10 differing files (cache.rs ×2, redis_store.rs, exporter.rs, openapi.rs, tracing_mw.rs, README, breaker message, 2 test dirs) all show landed main as the evolved successor: Age-aware freshness with v4 Redis records + Redis-TIME-anchored Lua store admission, strict UTF-8 job-batch preflight, OTLP shutdown/in-flight accounting, OpenAPI duplicate-schema detection, request-span tracing, plus Pass B's "breaker is open or probing" message fix. The r3-specific design alternatives (global invalidation epoch, SHA-256 length-framed cache keys, async breaking SessionStore migration) are review-preference variants of the same defects Pass B closed with its own validated designs — not open defects. |
+| neutron-b-ts-fix-r5 (69) | 14 TS data-layer findings + R4-1..R4-4 | **covered-by-landed** — 63/69 files byte-identical to main. The 6 differing files are Pass B's validation-time corrections (lifecycle `assertOpen` → `ConnectionFailedError`, transport closed-check placement, four test-fixture fixes). The triage-flagged candidates are all landed and verified in source: **BEGIN-envelope identity** (`neutron-nucleus/src/transport.ts` `beginTransaction`: malformed/contradictory envelopes → UNKNOWN_OUTCOME, explicit 4xx protocol rejection distinguished from 408/5xx/connection ambiguity, opaque-ID charset + native-Headers round-trip validation); **KV counterMode** (`neutron-data/src/cache/nucleus.ts`: `'native'|'strict'`, strict refuses construction without `kv.incrChecked`, frozen `counterCapabilities`, atomicTTL capability detection); **admission profiles** (`neutron-nucleus/src/timeseries/index.ts`: `admitPureCapabilities`, `admissionProfile`, `withTimeSeriesProfile` plugin, `disposeDiagnosticNamespace` ownership contract, unverified-refusal error). R4-4's `@neutron-build/sql/lifecycle` subpath, `requiredCapabilities` admission in createClient/createDatabase/createDrizzleDatabase, and `admitQueue` are all present in landed source. |
+| neutron-b-reviewed-candidate (105) | union of the two B lanes above | **superseded** — the lane's own earlier composite; 50/104 files identical to main. Its intent is fully contained in b-rust-fix-r3 + b-ts-fix-r5 (its successors) and reconciled through those rows. No independent findings. |
+| neutron-c-ts-fix-r3 (67) | TS-F01..21 + NF-NR-18, objections O1–O4 | **covered-by-landed** — 60/67 files byte-identical to main (this worktree was one of the three killed attempts Pass C salvaged). The 7 differing files are Pass C's completions: `canonicalContentRoot` (`/var` vs `/private/var` root-key unification = the TS-F19 invalidation fix), NF-NR-10/11 camera/notifications lifecycle test extensions, `sharedCacheSafe` opt-in in protocol-e2e, and lockfile/manifest integration. O1–O4 contracts landed as Pass C's `cache-capture.ts`/`cache-publication.ts` + `AtomicCachePublication` opt-in, committed-reconciliation client fencing, and root-generation refresh fences. |
+| neutron-c-studio-fix-r5 (79) | NF-STUDIO-01..14 + R4-01..03 + five-panel sibling work | **covered-by-landed** — 70/79 files byte-identical to main (second killed attempt salvaged by Pass C). The 9 differing files are Pass C's corrections to the ported work — the duplicated `export export` keyword (the exact defect named in the Pass C commit), `role: 'button' as const`, SchemaDesigner new-index draft discard (the flagged draft-loss fix) — plus execution of the test-debt retirement (obsolete render tests deleted on main). |
+| neutron-c-platform (95) | NF-DESK-01..07, NF-NATIVE-01..06, NF-GAP-01..09, NF-CI-01 | **covered-by-landed** — 51/95 files byte-identical to main (third killed attempt salvaged by Pass C). All 44 differing files were direction-checked: main-only lines dominate (e.g. OTA client gained generation-fenced `checking`/`owned()` session semantics beyond the frozen candidate; updater/security/CI files extended). Main is the completed, re-tested successor per Pass C's salvage record. |
+| neutron-mojo-r2 (96) | all 38 MJ IDs | **mixed / remains deferred** — 0/96 files on main; the patch is fully disjoint source work. MJ-02, MJ-16, MJ-K12, MJ-K17 are **covered-by-landed** (Pass A's four surgical fixes; the r2 candidate is based on `fa9cc9bb` and preserves all four while extending further). The remaining 34 IDs are **not-applicable to landing now**: Pass A's recorded deferral (no Mojo toolchain exists locally; blind-editing numerical kernels without compilation would be unverifiable) still holds — the r2 candidate itself declares every item UNEXECUTED under the same missing toolchain. The frozen patch (SHA-256 in its receipts, checkpoints 1–6) remains the ready starting point for a toolchain-equipped continuation; landing it now would contradict the deferral rationale and this repo's accuracy discipline. |
+
+Net result: **no LANDED-MISSED-THIS finding survived verification** — every
+defect the codex lane's B/C patches targeted is closed on main, mostly with
+the lane's own bytes, and where bytes differ, main is the verified successor.
+The only unlanded body is the 34 deferred MJ items, deferred for a recorded
+environmental reason rather than missed.
+
+### go-upstream-fix-r1 rebase + first execution of its 16 contract tests
+
+Branch `audit/go-upstream` (at `90e1606b`): since the patch's post-images
+equal main exactly, the rebase is empty — nothing to implement, no conflicts.
+The 16 regression tests the codex lane wrote but never executed were run for
+the first time with full per-test evidence: `go/neutron` 7/7 PASS
+(`TestTypedBodyAdmissionUpstream` incl. 14 subtests,
+`TestTypedMultipartAdmissionAndCleanup` incl. 3 subtests, default-limit/
+middleware-ceiling, lifecycle rollback order/joined errors, problem
+extensions, dynamic OpenAPI parity, raw read-error ownership) and `go/nucleus` 9/9 PASS (QueryOne
+close/scan/terminal-error ownership incl. 5 subtests, secret-free config
+refusal, programmatic validation + callback revalidation, channel-binding
+require refused before dial, real pgx fake-wire late error, connect budget
+incl. startup+VERSION subtests, CloseContext borrowed-connection shutdown,
+unparsed-config refusal, cooperative callback expiry). `go build` + `go vet`
++ full `./neutron/ ./nucleus/` suites green, also under `-race`. Fail-before
+evidence was produced by reverting two production files to the patch base in
+a scratch worktree: base `sql.go` fails `TestQueryOneCloseErrorOwnership`
+(3 subtests), base `error.go` fails `TestProblemExtensionsSurviveWireConversion`
+— the tests are load-bearing, not vacuous.
+
+### Pushed-branch merge verification (owner call)
+
+- `audit/final-studio-outcome` `b0117973` (both remotes verified at that
+  SHA): its two files are byte-identical to main (landed via Pass B; SHA-256s
+  match the r1 receipt). Claimed focused suite rerun on current main:
+  12 root tests / 68 subtests, 0 failures. **Already merged content-wise —
+  MERGE-READY (trivially; branch can be dropped or fast-forwarded).** The r2
+  reviewer's 232-malformed-variant `commitReceipt.ts` probe was its own
+  harness evidence and is not affected.
+- `audit/final-nucleus-stdin` `b7eff782` (both remotes verified): rebased
+  onto `90e1606b` as `audit/verify-nucleus-stdin` (`124e5bc6`); sole conflict
+  AUDIT_OPEN.md (both-appended sections, kept both). Claimed suites rerun on
+  the rebased branch: `cargo test --locked --manifest-path
+nucleus/Cargo.toml --bin nucleus` **6 passed / 0 failed**, and
+`nucleus/scripts/test-shell-command-stdin.py` against the freshly built
+binary passed both stages (pgwire/process exact-bytes/JSON/errors/
+validation/conflicts/REPL, and the live in-memory KV round trip incl.
+Unicode/newline/semicolon preservation with nonzero SQL error). **MERGE-READY.** Not pushed to main
+  (owner decision); release/version/registry steps remain parent-owned per
+  the lane's handoff.
