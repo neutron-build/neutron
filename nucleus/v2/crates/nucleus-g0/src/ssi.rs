@@ -268,9 +268,6 @@ struct Fired {
     t3: u8,
     /// The `earliest_out_conflict_commit` value that fired (committed-T2 rule).
     fired: Option<Ts>,
-    c3: Ts,
-    t1_ro: bool,
-    s1: Ts,
     o1: u32,
     o2: u32,
     o3: u32,
@@ -379,7 +376,6 @@ pub struct State {
     g_reads: Vec<GRead>,
     g_edges: BTreeSet<(u8, u8)>,
     g_abort: Vec<Fired>,
-    bad: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -821,15 +817,11 @@ impl State {
     }
 
     fn fired(&self, t1: u8, t2: u8, t3: u8, value: Option<Ts>) -> Fired {
-        let c3 = value.or(self.txns[t3 as usize].assigned).unwrap_or(0);
         Fired {
             t1,
             t2,
             t3,
             fired: value,
-            c3,
-            t1_ro: self.ro_at(t1),
-            s1: self.snap_of(t1),
             o1: self.ord(t1),
             o2: self.ord(t2),
             o3: self.ord(t3),
@@ -1307,14 +1299,10 @@ impl Model for SsiModel {
             g_reads: Vec::new(),
             g_edges: BTreeSet::new(),
             g_abort: Vec::new(),
-            bad: None,
         }
     }
 
     fn actions(&self, s: &State, out: &mut Vec<Action>) {
-        if s.bad.is_some() {
-            return;
-        }
         let Some(w) = s.w else {
             out.extend(WORKS.iter().copied().map(Action::Choose));
             return;
@@ -1355,6 +1343,18 @@ impl Model for SsiModel {
                         })
                 }
                 S::DdlExec => s.aexcl == Some(t),
+                // First relation access takes AccessShare, which waits while another
+                // txn holds AccessExclusive (§10: DDL takes AccessExclusive).
+                S::Siread(_)
+                | S::OpenView(_)
+                | S::Read { .. }
+                | S::Scan { .. }
+                | S::ReadLatest { .. }
+                | S::Place { .. }
+                | S::Materialise { .. } => {
+                    matches!(txn.st, St::Active | St::Checked)
+                        && s.aexcl.is_none_or(|x| x == t || txn.touched)
+                }
                 _ => matches!(txn.st, St::Active | St::Checked),
             };
             if ok {
@@ -1551,9 +1551,6 @@ impl Model for SsiModel {
     }
 
     fn check(&self, s: &State) -> Result<(), String> {
-        if let Some(b) = &s.bad {
-            return Err(b.clone());
-        }
         // §4 read correctness of every performed read.
         for r in &s.g_reads {
             let want = s.expected_ts(r.key, r.snap);
@@ -1586,6 +1583,18 @@ impl Model for SsiModel {
                     ))
                 }
                 _ => {}
+            }
+        }
+        // I-SSI-EDGES: every recorded edge joins two concurrent txns (neither
+        // committed at or before the other's snapshot), judged from ghost commits.
+        let ghost_c = |t: u8| s.g_commits.iter().find(|p| p.0 == t).map(|p| p.1);
+        for &(r, w) in &s.edges {
+            let before = |a: u8, b: u8| ghost_c(a).is_some_and(|c| c <= s.snap_of(b));
+            if before(r, w) || before(w, r) {
+                return Err(format!(
+                    "I-SSI-EDGES: recorded rw-edge T{} -> T{} joins non-concurrent txns",
+                    r, w
+                ));
             }
         }
         // I-SSI-EDGES, both directions.
@@ -1670,17 +1679,23 @@ impl Model for SsiModel {
                     f.t1, f.t1, f.t2, f.t3, f.t3
                 ));
             }
-            if f.t1_ro && f.c3 > f.s1 {
+            // Read-only-ness and T3's commit from ghost state, not from the
+            // protocol's own classification.
+            let w = s.w.unwrap_or(Work::Skew);
+            let t1_ro = declared_ro(w, f.t1) || s.g_writes[f.t1 as usize].is_empty();
+            let s1 = s.snap_of(f.t1);
+            let c3 = ghost_c(f.t3);
+            if t1_ro && !c3.is_some_and(|c| c <= s1) {
                 return Err(format!(
-                    "I-SSI-PRECISION: 40001 raised on read-only T{} with commit_ts(T3)={} > S(T1)={}",
-                    f.t1, f.c3, f.s1
+                    "I-SSI-PRECISION: 40001 raised on read-only T{} with commit_ts(T{})={:?} not <= S(T1)={}",
+                    f.t1, f.t3, c3, s1
                 ));
             }
             if let Some(v) = f.fired {
-                if v != f.c3 {
+                if c3 != Some(v) {
                     return Err(format!(
-                        "I-SSI-PRECISION: fired earliest_out_conflict_commit {} is not the commit of T{} (ts {})",
-                        v, f.t3, f.c3
+                        "I-SSI-PRECISION: fired earliest_out_conflict_commit {} is not the commit of T{} ({:?})",
+                        v, f.t3, c3
                     ));
                 }
             }
@@ -1689,6 +1704,15 @@ impl Model for SsiModel {
     }
 
     fn is_final(&self, s: &State) -> bool {
-        s.bad.is_none()
+        // Terminal only when every txn ran its program to the end (or aborted) and
+        // the commit thread, resolver and cleanup have drained.
+        let Some(w) = s.w else { return false };
+        (0..3u8).all(|t| {
+            let x = &s.txns[t as usize];
+            x.st == St::Aborted || x.pc as usize >= program(self.bug, w, t).len()
+        }) && s.channel.is_empty()
+            && s.group.is_empty()
+            && s.resolve_q.is_empty()
+            && s.cleanup_q.is_empty()
     }
 }
