@@ -5,6 +5,7 @@
 //! Seeded bugs are model configurations; every seed must be caught by its model.
 
 pub mod commit;
+pub mod write;
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
