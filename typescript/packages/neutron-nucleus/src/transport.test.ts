@@ -321,7 +321,10 @@ describe("MobileTransport offline queue", () => {
 
     // execute() should not throw — it queues the write
     const promise = transport.execute("INSERT INTO users (name) VALUES ('offline')");
-    // The promise is pending (queued), not resolved yet
+    // The promise is pending (queued), not resolved yet; it settles on close
+    // ("transport closed") — handle it so the eventual rejection never
+    // surfaces as an unhandledRejection after the test ends.
+    promise.catch(() => {});
     assert.equal(transport.queueSize, 1);
 
     // We cannot await the promise or it will hang — it resolves only on flush
