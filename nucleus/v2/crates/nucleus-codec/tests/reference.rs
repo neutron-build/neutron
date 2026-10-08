@@ -555,8 +555,14 @@ fn jsonb_key() -> BoxedStrategy<String> {
         2 => Just(String::new()),
         4 => Just(String::from("a")),
         3 => Just(String::from("b")),
+        2 => Just(String::from("c")),
         2 => Just(String::from("aa")),
         2 => Just(String::from("ab")),
+        // Short keys over a tiny alphabet: length-first storage order
+        // (§6 rule 3) and plain bytewise order disagree often, e.g.
+        // {"aa","c"} vs {"b","d"}.
+        4 => vec(prop_oneof![Just('a'), Just('b'), Just('c'), Just('d')], 0..=3)
+            .prop_map(|cs| cs.into_iter().collect()),
     ]
     .boxed()
 }
@@ -683,8 +689,14 @@ fn value_variant(ty: &KeyType, a: &Value) -> BoxedStrategy<Value> {
     match (ty, a) {
         (KeyType::Float8, Value::Float8(x)) => {
             if x.is_nan() {
-                (0x7FF0_0000_0000_0001u64..=0x7FFF_FFFF_FFFF_FFFF)
-                    .prop_map(|b| Value::Float8(f64::from_bits(b)))
+                (
+                    0x7FF0_0000_0000_0001u64..=0x7FFF_FFFF_FFFF_FFFF,
+                    any::<bool>(),
+                )
+                    .prop_map(|(b, neg)| {
+                        let sign = if neg { 0x8000_0000_0000_0000u64 } else { 0 };
+                        Value::Float8(f64::from_bits(b | sign))
+                    })
                     .boxed()
             } else if *x == 0.0 {
                 Just(Value::Float8(-x)).boxed()
@@ -694,8 +706,11 @@ fn value_variant(ty: &KeyType, a: &Value) -> BoxedStrategy<Value> {
         }
         (KeyType::Float4, Value::Float4(x)) => {
             if x.is_nan() {
-                (0x7F80_0001u32..=0x7FFF_FFFF)
-                    .prop_map(|b| Value::Float4(f32::from_bits(b)))
+                (0x7F80_0001u32..=0x7FFF_FFFF, any::<bool>())
+                    .prop_map(|(b, neg)| {
+                        let sign = if neg { 0x8000_0000u32 } else { 0 };
+                        Value::Float4(f32::from_bits(b | sign))
+                    })
                     .boxed()
             } else if *x == 0.0 {
                 Just(Value::Float4(-x)).boxed()
@@ -868,6 +883,115 @@ fn array_variant(elem: &KeyType, arr: &Array) -> BoxedStrategy<Value> {
     }
 }
 
+/// A value structurally close to `a` but generally not equal to it, so the
+/// late tie-break rules get exercised: arrays with the same elements and
+/// different dims (§7 rule 2), jsonb objects with the same values and
+/// re-drawn keys (§6 rule 3 storage order). Other types: `a` itself.
+fn near_value(ty: &KeyType, a: &Value) -> BoxedStrategy<Value> {
+    match (ty, a) {
+        (KeyType::Array(_), Value::Array(arr)) => array_redim(arr),
+        (KeyType::Jsonb, Value::Jsonb(Jsonb::Object(pairs))) => {
+            let values: Vec<Jsonb> = pairs.iter().map(|(_, v)| v.clone()).collect();
+            vec(jsonb_key(), values.len()..=values.len())
+                .prop_map(move |keys| {
+                    Value::Jsonb(Jsonb::Object(
+                        keys.into_iter().zip(values.iter().cloned()).collect(),
+                    ))
+                })
+                .boxed()
+        }
+        _ => Just(a.clone()).boxed(),
+    }
+}
+
+/// Same elements, different dimensions (not an equal value unless the dims
+/// come out identical): exercises the §7 rule 2 tie-breaks on ndims, each
+/// length and each lower bound.
+fn array_redim(arr: &Array) -> BoxedStrategy<Value> {
+    let n = arr.elems.len();
+    let elems = arr.elems.clone();
+    if n == 0 {
+        return Just(Value::Array(arr.clone())).boxed();
+    }
+    let edge_lower = || {
+        prop_oneof![
+            Just(i32::MIN),
+            Just(-1),
+            Just(0),
+            Just(1),
+            Just(2),
+            Just(i32::MAX - 26),
+        ]
+    };
+    let mut shapes: Vec<BoxedStrategy<Vec<ArrayDim>>> = Vec::new();
+    // Same lengths, new lower bounds.
+    let lens: Vec<i32> = arr.dims.iter().map(|d| d.len).collect();
+    shapes.push(
+        vec(edge_lower(), lens.len()..=lens.len())
+            .prop_map(move |lows| {
+                lens.iter()
+                    .zip(lows)
+                    .map(|(&len, lower)| ArrayDim { len, lower })
+                    .collect()
+            })
+            .boxed(),
+    );
+    // Same ndims, first length kept and the rest reversed (same product),
+    // new lower bounds: a later length can differ while an earlier lower
+    // bound differs too (all lengths compare before any lower bound).
+    let rev: Vec<i32> = arr
+        .dims
+        .iter()
+        .take(1)
+        .chain(arr.dims.iter().skip(1).rev())
+        .map(|d| d.len)
+        .collect();
+    shapes.push(
+        vec(edge_lower(), rev.len()..=rev.len())
+            .prop_map(move |lows| {
+                rev.iter()
+                    .zip(lows)
+                    .map(|(&len, lower)| ArrayDim { len, lower })
+                    .collect()
+            })
+            .boxed(),
+    );
+    // Flattened to one dimension, or one extra unit dimension.
+    let n32 = n as i32;
+    shapes.push(
+        edge_lower()
+            .prop_map(move |lower| vec![ArrayDim { len: n32, lower }])
+            .boxed(),
+    );
+    if arr.dims.len() < 6 {
+        let dims = arr.dims.clone();
+        shapes.push(
+            (any::<bool>(), edge_lower())
+                .prop_map(move |(front, lower)| {
+                    let mut d = dims.clone();
+                    let unit = ArrayDim { len: 1, lower };
+                    if front {
+                        d.insert(0, unit);
+                    } else {
+                        d.push(unit);
+                    }
+                    d
+                })
+                .boxed(),
+        );
+    }
+    let n_shapes = shapes.len();
+    (0..n_shapes)
+        .prop_flat_map(move |i| shapes[i].clone())
+        .prop_map(move |dims| {
+            Value::Array(Array {
+                dims,
+                elems: elems.clone(),
+            })
+        })
+        .boxed()
+}
+
 fn admits_variant(elem: &KeyType, v: &Value) -> bool {
     match (elem, v) {
         (KeyType::Float8, Value::Float8(x)) => *x == 0.0 || x.is_nan(),
@@ -885,13 +1009,14 @@ fn optional_variant(ty: &KeyType, a: &Option<Value>) -> BoxedStrategy<Option<Val
         Some(v) => prop_oneof![
             1 => Just(Some(v.clone())),
             2 => value_variant(ty, v).prop_map(Some),
+            1 => near_value(ty, v).prop_map(Some),
         ]
         .boxed(),
     }
 }
 
-/// A pair of one type's values: independent values, identical values, and
-/// equal-value different-representation variants.
+/// A pair of one type's values: independent values, identical values,
+/// equal-value different-representation variants and near values.
 pub fn typed_pair(ty: KeyType) -> BoxedStrategy<(Value, Value)> {
     typed_value(ty.clone())
         .prop_flat_map(move |a| {
@@ -899,6 +1024,7 @@ pub fn typed_pair(ty: KeyType) -> BoxedStrategy<(Value, Value)> {
                 3 => typed_value(ty.clone()),
                 2 => Just(a.clone()),
                 3 => value_variant(&ty, &a),
+                1 => near_value(&ty, &a),
             ];
             b.prop_map(move |b| (a.clone(), b))
         })
@@ -965,13 +1091,17 @@ pub fn column_with_optional_pair() -> BoxedStrategy<(KeyColumn, Option<Value>, O
 /// two value tuples for the same column list.
 pub type KeyVals = Vec<Option<Value>>;
 
+/// Each column's pair comes from `optional_pair`, so leading columns are
+/// often equal (identical or variant) and later columns decide the order.
 pub fn composite_key_pair() -> BoxedStrategy<(Vec<KeyColumn>, KeyVals, KeyVals)> {
     (1usize..=4)
         .prop_flat_map(|n| {
             vec(key_column(), n..=n).prop_flat_map(|cols| {
-                let va: Vec<_> = cols.iter().map(|c| optional_value(c.ty.clone())).collect();
-                let vb = va.clone();
-                (va, vb).prop_map(move |(va, vb)| (cols.clone(), va, vb))
+                let pairs: Vec<_> = cols.iter().map(|c| optional_pair(c.ty.clone())).collect();
+                pairs.prop_map(move |pairs| {
+                    let (va, vb): (KeyVals, KeyVals) = pairs.into_iter().unzip();
+                    (cols.clone(), va, vb)
+                })
             })
         })
         .boxed()
