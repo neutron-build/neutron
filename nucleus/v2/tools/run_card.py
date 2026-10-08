@@ -23,8 +23,9 @@ import time
 V2 = pathlib.Path(__file__).resolve().parent.parent
 ROOT = V2.parent.parent
 CARDS = V2 / "cards"
-WT_ROOT = pathlib.Path("/tmp/nv2-cards")
-TARGET_DIR = pathlib.Path("/tmp/nv2-target")
+# Under ~/.cache, not /tmp: a reboot wipes /tmp and with it any uncommitted card work.
+WT_ROOT = pathlib.Path.home() / ".cache" / "nv2-cards"
+TARGET_DIR = pathlib.Path.home() / ".cache" / "nv2-target"
 MIN_FREE_GB = 10
 PROTECTED = ["nucleus/v2/docs/", "nucleus/v2/cards/", "nucleus/v2/tools/", "nucleus/src/"]
 OPENCODE_CONFIG = {
@@ -35,7 +36,7 @@ OPENCODE_CONFIG = {
         "external_directory": {
             "*": "deny",
             str(pathlib.Path.home() / ".cargo" / "registry") + "/*": "allow",
-            "/tmp/nv2-target/*": "allow",
+            str(TARGET_DIR) + "/*": "allow",
         },
         "bash": {
             "*": "allow",
