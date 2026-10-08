@@ -5,7 +5,7 @@ Usage: nucleus/v2/tools/run_card.py nucleus/v2/cards/<id>.local.md [--base <bran
        [--attempts 3] [--model zai-coding-plan/glm-5.3] [--keep]
 
 Flow: worktree on branch card/v2-<id> from --base -> copy card + worker prompt in (they are local-only)
--> opencode run (denied: rm, sudo, push, reset, checkout, curl, wget, brew) -> scope guard (only the
+-> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, push, reset, checkout, curl, wget, brew) -> scope guard (only the
 card's "Touch only" globs) -> acceptance commands -> up to N attempts with failure output fed back ->
 RUNLOG row. Every attempt first checks free disk. Nothing is merged here; the frontier reviews the branch.
 """
@@ -170,7 +170,7 @@ def main():
         result["attempts"] = attempt
         effort = "max" if attempt == args.attempts else args.effort
         log = log_dir / f"{card_id}.attempt{attempt}.jsonl"
-        cmd = ["opencode", "run", "-m", args.model, "--variant", effort, "--format", "json", "--dir", str(wt), "--pure", "--auto", "--thinking"]
+        cmd = ["opencode", "run", "--standalone", "-m", f"{args.model}#{effort}", "--format", "json", "--auto", "--thinking"]
         if session:
             cmd += ["-s", session]
         msg = prompt if (attempt == 1 or not session) else f"Acceptance or scope failed. Fix it within the same card. Failure output:\n\n{failure}\n\nRe-run the acceptance commands, commit, then end with the RESULT block."
@@ -212,6 +212,8 @@ def main():
         failures = []
         for c in accept:
             rc, out = run(c, wt, env=env, timeout=60 * 60)
+            if rc == 0 and "cargo test" in c and sum(int(n) for n in re.findall(r"test result: ok\. (\d+) passed", out)) == 0:
+                rc, out = 1, out + "\nno tests ran: a cargo test acceptance command must run at least one test"
             print(f"[{card_id}] {'PASS' if rc == 0 else 'FAIL'}: {c}", flush=True)
             if rc:
                 failures.append(f"$ {c}\n" + "\n".join(out.splitlines()[-60:]))
