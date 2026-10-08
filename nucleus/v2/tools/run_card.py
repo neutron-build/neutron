@@ -152,7 +152,9 @@ def main():
         rc, out = run(["git", "worktree", "add", "-B", branch, str(wt), args.base], ROOT)
         if rc:
             sys.exit(out)
-    env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR))
+    # opencode takes its session directory from PWD, not the process cwd; without this the
+    # worker runs in the checkout the runner was started from.
+    env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR), PWD=str(wt))
     rc, out = run("cd nucleus/v2 && cargo fmt --all -- --check", wt, env=env)
     if rc:
         sys.exit("preflight: base is not rustfmt-clean; fix it before issuing a card\n" + out[-800:])
@@ -212,6 +214,8 @@ def main():
                     finished = True
             if finished or failure.startswith("opencode run killed"):
                 break
+        if '"provider.quota"' in log.read_text(errors="replace"):
+            sys.exit(f"[{card_id}] provider usage limit reached; stopping (rerun with --keep after the reset)")
         if not finished:
             session = parse_tokens(log)[1] or session
             continue
