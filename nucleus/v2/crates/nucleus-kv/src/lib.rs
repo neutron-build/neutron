@@ -28,6 +28,8 @@ pub enum KvError {
     Format { found: u32, supported: u32 },
     #[error("backend: {0}")]
     Backend(String),
+    #[error("gc watermark regressed: current {current}, requested {requested}")]
+    WatermarkRegressed { current: u64, requested: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, KvError>;
@@ -86,18 +88,31 @@ pub trait Snapshot: Send + Sync {
     ) -> Box<dyn Iterator<Item = Result<(Key, Value)>> + 'a>;
 }
 
-/// Decides, during compaction, whether a version may be dropped (C-T0 §9).
+/// Decides, during compaction, whether an entry may be dropped (C-T0 §9.2).
 /// Called on keys in ascending order within one compaction stream. Backends
 /// that cannot provide streaming order to the filter must not register it.
 pub trait GcFilter: Send + Sync {
-    /// Called at the start of each compaction stream; returns per-stream state.
+    /// Called at the start of each compaction stream; returns per-stream
+    /// state. Filter state must never cross streams or subcompactions
+    /// (C-T0 §9.2; §11 seed 33).
     fn begin(&self) -> Box<dyn GcStream>;
 }
 
 pub trait GcStream: Send {
-    /// `true` = drop this key. Must never return `true` for a tombstone (§9);
-    /// the kv applies the answer as given. A snapshot opened before the
-    /// compaction may or may not keep returning a dropped key (C-K3 suite).
+    /// `true` = drop this key; the kv applies the answer as given.
+    ///
+    /// C-T0 §9.2 (draft 4): within one stream, a filter may drop any version
+    /// for which it has **already seen a newer version `<= W` of the same
+    /// logical key in this stream**, and must never drop the newest version
+    /// `<= W` it has seen for a key. Versions `> W` are kept: a newer
+    /// version `<= W` sorts before them (versions of one key order newest
+    /// first), so the drop rule can never fire for them. Because versions of
+    /// one logical key can span SST files, a single stream may not see them
+    /// all: dropping the newest version `<= W` (a tombstone included)
+    /// resurrects older versions sitting in files outside the compaction,
+    /// which is why the C-B1 job removes such tombstones with `DeleteRange`
+    /// instead. A snapshot opened before the compaction may or may not keep
+    /// returning a dropped key (C-K3 suite).
     fn drop_key(&mut self, key: &[u8], value: &[u8]) -> bool;
 }
 
@@ -129,6 +144,10 @@ pub trait OrderedKv: Send + Sync + 'static {
     /// Install the compaction GC filter. Backends with native user-defined
     /// timestamps may ignore it and use `set_gc_watermark` instead.
     fn set_gc_filter(&self, filter: Box<dyn GcFilter>);
-    /// Versions with ts below `watermark` may be collapsed by the engine (UDT path).
-    fn set_gc_watermark(&self, watermark: u64);
+    /// Versions with ts below `watermark` may be collapsed by the engine (UDT
+    /// path). The watermark is monotonic (C-T0 §9.1): a decrease returns
+    /// `KvError::WatermarkRegressed` and changes nothing; the caller treats
+    /// that as fatal. Backends without native timestamps (MemKv, fjall) still
+    /// track it so a regression is refused everywhere.
+    fn set_gc_watermark(&self, watermark: u64) -> Result<()>;
 }
