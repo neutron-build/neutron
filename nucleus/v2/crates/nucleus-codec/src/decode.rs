@@ -70,7 +70,13 @@ pub(crate) fn value(ty: &KeyType, r: &mut Reader<'_>) -> Result<Value> {
         KeyType::Int4 => Value::Int4(r.i32()?),
         KeyType::Int8 => Value::Int8(r.i64()?),
         KeyType::Date => Value::Date(r.i32()?),
-        KeyType::Time => Value::Time(r.i64()?),
+        KeyType::Time => {
+            let x = r.i64()?;
+            if !(0..=Interval::USECS_PER_DAY).contains(&x) {
+                return Err(CodecError::Malformed("time out of range"));
+            }
+            Value::Time(x)
+        }
         KeyType::Timestamp => Value::Timestamp(r.i64()?),
         KeyType::TimestampTz => Value::TimestampTz(r.i64()?),
         KeyType::Float4 => {

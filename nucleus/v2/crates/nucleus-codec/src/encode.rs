@@ -39,9 +39,16 @@ pub(crate) fn value(ty: &KeyType, v: &Value, out: &mut Vec<u8>) -> Result<()> {
         }
         (KeyType::Int4, Value::Int4(x)) | (KeyType::Date, Value::Date(x)) => flip_i32(*x, out),
         (KeyType::Int8, Value::Int8(x))
-        | (KeyType::Time, Value::Time(x))
         | (KeyType::Timestamp, Value::Timestamp(x))
         | (KeyType::TimestampTz, Value::TimestampTz(x)) => flip_i64(*x, out),
+        (KeyType::Time, Value::Time(x)) => {
+            // §4: the domain is 0 ..= 86_400_000_000 (one day, `24:00:00`
+            // included). `flip(i64)` for anything inside it.
+            if !(0..=Interval::USECS_PER_DAY).contains(x) {
+                return Err(CodecError::InvalidValue("time out of range"));
+            }
+            flip_i64(*x, out)
+        }
         (KeyType::Float4, Value::Float4(x)) => out.extend_from_slice(&f32_key(*x).to_be_bytes()),
         (KeyType::Float8, Value::Float8(x)) => out.extend_from_slice(&f64_key(*x).to_be_bytes()),
         (KeyType::Numeric, Value::Numeric(n)) => numeric(n, out)?,
