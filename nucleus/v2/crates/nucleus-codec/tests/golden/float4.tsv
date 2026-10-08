@@ -1,0 +1,36 @@
+# float4 (float4_cmp_internal): -Infinity < negatives < -0 = 0 < positives
+# < +Infinity < NaN (any NaN = the canonical quiet NaN, above +Infinity).
+# -0, 0, 0.0 share rank 11 (IEEE -0 = 0). 1.4e-45 is the smallest
+# subnormal, 1.17549435e-38 the smallest normal, 3.4028235e38 FLT_MAX.
+# rank	sql_literal	hex
+1	-Infinity	01007fffff
+2	-3.4028235e38	0100800000
+3	-1e38	0101698966
+4	-1e12	012c972b5a
+5	-2.5	013fdfffff
+6	-1.5	01403fffff
+7	-1.0	01407fffff
+8	-0.5	0140ffffff
+9	-1e-38	017f931c11
+10	-1.4e-45	017ffffffe
+11	-0	0180000000
+11	0	0180000000
+11	0.0	0180000000
+12	1.4e-45	0180000001
+13	1e-38	01806ce3ee
+14	1.17549435e-38	0180800000
+15	0.5	01bf000000
+16	1	01bf800000
+16	1.0	01bf800000
+17	1.5	01bfc00000
+18	2	01c0000000
+19	3	01c0400000
+20	1e12	01d368d4a5
+21	1e38	01fe967699
+22	3.4028235e38	01ff7fffff
+23	Infinity	01ff800000
+24	NaN	01ffc00000
+24	NaN	01ffc00000
+25	NULL	02
+25	NULL	02
+25	NULL	02

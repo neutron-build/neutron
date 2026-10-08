@@ -1,0 +1,30 @@
+# bool: false < true (boolcmp). ASC NULLS LAST: NULL greatest, NULL = NULL.
+# rank	sql_literal	hex
+1	false	0100
+1	false	0100
+1	false	0100
+1	false	0100
+1	false	0100
+1	false	0100
+1	false	0100
+1	false	0100
+1	false	0100
+1	f	0100
+1	FALSE	0100
+2	true	0101
+2	t	0101
+2	TRUE	0101
+2	true	0101
+2	true	0101
+2	true	0101
+2	true	0101
+2	true	0101
+2	true	0101
+3	NULL	02
+3	NULL	02
+3	NULL	02
+3	NULL	02
+3	NULL	02
+3	NULL	02
+3	NULL	02
+3	NULL	02

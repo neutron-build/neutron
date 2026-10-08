@@ -1,0 +1,31 @@
+# text, collation C (varstr_cmp C fast path): plain bytewise UTF-8 order,
+# shorter string first when it is a prefix. '' is first. ''-quote escaping
+# in `it''s`. 2-byte (é ÿ) < 3-byte (€) < 4-byte (😀) first bytes.
+# rank	sql_literal	hex
+1	''	010001
+1	''	010001
+2	' '	01200001
+3	'!'	01210001
+4	'0'	01300001
+5	'9'	01390001
+6	'A'	01410001
+7	'Ab'	0141620001
+8	'B'	01420001
+9	'a'	01610001
+9	'a'	01610001
+10	'a b'	016120620001
+11	'ab'	0161620001
+12	'ab '	016162200001
+13	'abc'	016162630001
+14	'b'	01620001
+15	'it''s'	01697427730001
+16	'z'	017a0001
+17	'zz'	017a7a0001
+18	'~'	017e0001
+19	'é'	01c3a90001
+20	'ÿ'	01c3bf0001
+21	'€'	01e282ac0001
+22	'😀'	01f09f98800001
+23	NULL	02
+23	NULL	02
+23	NULL	02

@@ -1,0 +1,30 @@
+# bytea (byteacmp): memcmp over the shorter length, shorter first. The
+# 0x00-escape (§5.1) puts '' < \x00 < \x0000 < \x0001 < \x00ff < \x00ff00
+# < \x01 ...: a proper prefix always sorts first.
+# rank	sql_literal	hex
+1	\x	010001
+1	\x	010001
+2	\x00	0100ff0001
+2	\x00	0100ff0001
+3	\x0000	0100ff00ff0001
+4	\x0000ff	0100ff00ffff0001
+5	\x0001	0100ff010001
+6	\x00ff	0100ffff0001
+7	\x00ff00	0100ffff00ff0001
+8	\x00ff01	0100ffff010001
+9	\x01	01010001
+10	\x0100	010100ff0001
+11	\x0101	0101010001
+12	\x01ff	0101ff0001
+13	\x41	01410001
+14	\x4142	0141420001
+15	\x42	01420001
+16	\x7f	017f0001
+17	\x80	01800001
+18	\xfe	01fe0001
+19	\xff	01ff0001
+20	\xff00	01ff00ff0001
+21	\xffff	01ffff0001
+22	NULL	02
+22	NULL	02
+22	NULL	02
