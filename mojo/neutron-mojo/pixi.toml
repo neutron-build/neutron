@@ -1,0 +1,10 @@
+[workspace]
+authors = ["Tyler <53561637+im-tyler@users.noreply.github.com>"]
+channels = ["conda-forge", "https://conda.modular.com/max/"]
+name = "neutron-mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[dependencies]
+mojo = "==1.0.0"
+max = ">=26.5,<26.6"
