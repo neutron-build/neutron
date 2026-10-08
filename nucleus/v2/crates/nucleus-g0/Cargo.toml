@@ -8,3 +8,8 @@ description = "G0: exhaustive small-scope model checkers for the C-T0 transactio
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The differential test drives the model's abstract LSM against MemKv's LSM
+# mode (C-K3b). Test-only; the model itself has no dependencies.
+nucleus-kv = { path = "../nucleus-kv", features = ["conformance"] }
