@@ -32,6 +32,11 @@ OPENCODE_CONFIG = {
     "permission": {
         "edit": "allow",
         "webfetch": "deny",
+        "external_directory": {
+            "*": "deny",
+            str(pathlib.Path.home() / ".cargo" / "registry") + "/*": "allow",
+            "/tmp/nv2-target/*": "allow",
+        },
         "bash": {
             "*": "allow",
             "rm *": "deny",
@@ -95,6 +100,12 @@ def scope_violations(wt, base, touch):
         elif not in_scope(f, touch):
             bad.append(f + " (outside Touch only)")
     return bad
+
+
+def stray_commits(card_id, branch, since):
+    """Commits naming this card on any branch but its own: the worker wrote outside its worktree."""
+    _, out = run(["git", "log", "--branches", "--not", branch, f"--since=@{int(since)}", "--format=%h %s"], ROOT)
+    return [l for l in out.splitlines() if card_id in l]
 
 
 def parse_tokens(log_path):
@@ -207,6 +218,11 @@ def main():
         session = sess or session
         for k, key in (("in", "input"), ("out", "output"), ("reasoning", "reasoning")):
             result[k] += toks[key]
+        stray = stray_commits(card_id, branch, t0)
+        if stray:
+            result["scope"] = "OUTSIDE"
+            print(f"[{card_id}] worker committed outside its worktree; stopping:\n" + "\n".join(stray), flush=True)
+            break
         bad = scope_violations(wt, args.base, touch)
         if bad:
             result["scope"] = "FAIL"
