@@ -132,6 +132,7 @@ def main():
     ap.add_argument("--effort", default="high")
     ap.add_argument("--attempts", type=int, default=3)
     ap.add_argument("--model", default="zai-coding-plan/glm-5.3")
+    ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB, help="refuse to start an attempt below this much free disk")
     ap.add_argument("--keep", action="store_true", help="reuse an existing worktree and branch")
     args = ap.parse_args()
 
@@ -176,8 +177,8 @@ def main():
     t0 = time.time()
     failure = ""
     for attempt in range(1, args.attempts + 1):
-        if free_gb(WT_ROOT) < MIN_FREE_GB:
-            sys.exit(f"[{card_id}] only {free_gb(WT_ROOT):.1f} GB free (< {MIN_FREE_GB}); stopping before attempt {attempt}")
+        if free_gb(WT_ROOT) < args.min_free_gb:
+            sys.exit(f"[{card_id}] only {free_gb(WT_ROOT):.1f} GB free (< {args.min_free_gb}); stopping before attempt {attempt}")
         result["attempts"] = attempt
         effort = "max" if attempt == args.attempts else args.effort
         log = log_dir / f"{card_id}.attempt{attempt}.jsonl"
@@ -203,7 +204,7 @@ def main():
                         proc.kill()
                         failure = "opencode run killed: no output for 15 minutes (stalled model call); continue the card"
                         break
-                    if waited > 60 * 60 or free_gb(WT_ROOT) < MIN_FREE_GB / 2:
+                    if waited > 60 * 60 or free_gb(WT_ROOT) < args.min_free_gb / 2:
                         proc.kill()
                         failure = "opencode run killed: timed out after 60 minutes or disk nearly full"
                         break
