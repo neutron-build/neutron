@@ -21,9 +21,13 @@
 //! (and compaction merges) resolve a key by the highest seq touching it — the
 //! memtable and the files merged newest to oldest. A range tombstone hides
 //! older data in every lower file at read time. A snapshot holds its file set
-//! (files are shared and immutable), so compaction can drop files from the
-//! live set while open snapshots keep reading them. The flat single-map mode
-//! stays the default and unchanged.
+//! (files are shared and immutable), but a compaction-filter drop is still
+//! **visible to already-open snapshots**: the live drop registry (`era` +
+//! `dropped`, G0-R5-1 — the adversarial choice the kv contract allows, which
+//! G0-gc needs) hides a key from every snapshot opened before its latest
+//! drop, even though the snapshot's own copy still holds it. The flat
+//! single-map mode stays the default and unchanged (no registry; its
+//! snapshots keep dropped keys by structural sharing).
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -52,8 +56,9 @@ const LSM_LEVELS: usize = 2;
 pub type FileMeta = (usize, u64, (Key, Key));
 
 pub struct MemKv {
-    /// Published state. Readers clone it; only `publish` replaces it.
-    st: RwLock<KvState>,
+    /// Published state. Readers clone it; only `publish` replaces it. Shared
+    /// with snapshots so they can consult the live GC-drop registry.
+    st: Arc<RwLock<KvState>>,
     /// Serialises writers (and compaction) so each builds on the latest state.
     writer: Mutex<()>,
     gc: RwLock<Option<Box<dyn GcFilter>>>,
@@ -102,6 +107,13 @@ struct LsmState {
     next_file: u64,
     /// levels[0] = L0, levels[1] = the bottommost level.
     levels: Vec<Vec<Arc<LsmFile>>>,
+    /// GC-drop registry: keys the compaction filter dropped, with the era of
+    /// their latest drop. A snapshot opened at an older era reads them as
+    /// absent (G0-R5-1: the adversarial choice the kv contract allows), even
+    /// though it keeps its file set alive.
+    dropped: OrdMap<Key, u64>,
+    /// Bumped by every compaction that drops keys; pairs with `dropped`.
+    era: u64,
 }
 
 struct LsmFile {
@@ -166,6 +178,20 @@ impl LsmState {
             mem_rts: Vec::new(),
             next_file: 1,
             levels: vec![Vec::new(), Vec::new()],
+            dropped: OrdMap::new(),
+            era: 0,
+        }
+    }
+
+    /// Records filter drops under a fresh era (atomic with the compaction's
+    /// publish, so snapshots pair a state with its era exactly).
+    fn record_drops(&mut self, keys: &[Key]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.era += 1;
+        for k in keys {
+            self.dropped.insert(k.clone(), self.era);
         }
     }
 
@@ -260,13 +286,13 @@ impl LsmState {
     }
 
     /// `compact(level, files)` (model-checker step): validates, then
-    /// [`run_compaction`]. Returns the new file ids and the dropped count.
+    /// [`run_compaction`]. Returns the new file ids.
     fn compact(
         &mut self,
         filter: Option<&dyn GcFilter>,
         level: usize,
         files: &[u64],
-    ) -> Result<(Vec<u64>, usize)> {
+    ) -> Result<Vec<u64>> {
         if self.levels.len() < 2 || level >= self.levels.len() - 1 {
             return Err(KvError::Backend(format!(
                 "compact: level {level} has no level below to compact into"
@@ -284,7 +310,8 @@ impl LsmState {
                 )));
             }
         }
-        Ok(self.run_compaction(filter, level, inputs))
+        let (ids, _) = self.run_compaction(filter, level, inputs);
+        Ok(ids)
     }
 
     /// Moves the files of `level` whose id satisfies `keep` out of the level.
@@ -316,7 +343,7 @@ impl LsmState {
         filter: Option<&dyn GcFilter>,
         level: usize,
         mut inputs: Vec<Arc<LsmFile>>,
-    ) -> (Vec<u64>, usize) {
+    ) -> (Vec<u64>, Vec<Key>) {
         // Same-level expansion, until the combined range stops growing.
         while let Some((lo, hi)) = range_of(&inputs) {
             let extra = self.take_files(level, |_| true);
@@ -336,7 +363,7 @@ impl LsmState {
             inputs.extend(grew);
         }
         let Some((lo, hi)) = range_of(&inputs) else {
-            return (Vec::new(), 0);
+            return (Vec::new(), Vec::new());
         };
         // Consume the overlapping files of the level below.
         let below = self.take_files(level + 1, |_| true);
@@ -371,6 +398,7 @@ impl LsmState {
             }));
             ids.push(id);
         }
+        self.record_drops(&dropped);
         (ids, dropped)
     }
 
@@ -394,8 +422,8 @@ impl LsmState {
         let mut dropped = 0usize;
         if !self.levels[0].is_empty() {
             let inputs = self.take_files(0, |_| true);
-            let (_, d) = self.run_compaction(filter, 0, inputs);
-            dropped += d;
+            let (_, keys) = self.run_compaction(filter, 0, inputs);
+            dropped += keys.len();
         }
         for id in l1_before {
             if self.levels[1].iter().any(|f| f.id == id) {
@@ -425,7 +453,8 @@ impl LsmState {
                 rts,
             }));
         }
-        dropped
+        self.record_drops(&dropped);
+        dropped.len()
     }
 
     /// The live files as `(level, id, (lo, hi))`.
@@ -455,7 +484,7 @@ fn merge(
     filter: Option<&dyn GcFilter>,
     bottom: bool,
     above: &[Arc<LsmFile>],
-) -> (OrdMap<Key, SeqEntry>, Vec<Rt>, usize) {
+) -> (OrdMap<Key, SeqEntry>, Vec<Rt>, Vec<Key>) {
     let srcs: Vec<Src<'_>> = files
         .iter()
         .map(|f| Src {
@@ -468,13 +497,13 @@ fn merge(
         keys.extend(src.entries.iter().map(|(k, _)| k));
     }
     let mut entries = OrdMap::new();
-    let mut dropped = 0usize;
+    let mut dropped: Vec<Key> = Vec::new();
     let mut stream = filter.map(|f| f.begin());
     for k in keys {
         match newest(k, &srcs) {
             Some(View::Put(seq, v)) => {
                 if stream.as_mut().is_some_and(|s| s.drop_key(k, v)) {
-                    dropped += 1;
+                    dropped.push(k.clone());
                 } else {
                     entries.insert(k.clone(), (seq, Entry::Put(v.clone())));
                 }
@@ -553,7 +582,7 @@ impl MemKv {
 
     fn from_state(state: KvState) -> Self {
         Self {
-            st: RwLock::new(state),
+            st: Arc::new(RwLock::new(state)),
             writer: Mutex::new(()),
             gc: RwLock::new(None),
             watermark: RwLock::new(0),
@@ -607,7 +636,7 @@ impl MemKv {
     /// the new file ids. Errors in flat mode.
     pub fn compact(&self, level: usize, files: &[u64]) -> Result<Vec<u64>> {
         let gc = self.gc.read().unwrap_or_else(PoisonError::into_inner);
-        self.publish_lsm(|l| l.compact(gc.as_deref(), level, files).map(|(ids, _)| ids))
+        self.publish_lsm(|l| l.compact(gc.as_deref(), level, files))
     }
 
     /// LSM step: the live files as `(level, file_id, (lo, hi))`, the closed
@@ -696,8 +725,14 @@ impl OrderedKv for MemKv {
     }
 
     fn snapshot(&self) -> MemSnap {
+        let st = self.st.read().unwrap_or_else(PoisonError::into_inner);
+        let live = match &*st {
+            KvState::Lsm(_) => Some(Arc::clone(&self.st)),
+            KvState::Flat(_) => None,
+        };
         MemSnap {
-            state: self.current(),
+            state: st.clone(),
+            live,
         }
     }
 
@@ -776,13 +811,53 @@ impl OrderedKv for MemKv {
 /// included, keeping it alive).
 pub struct MemSnap {
     state: KvState,
+    /// Live-state handle (LSM mode only): a key the compaction filter drops
+    /// while this snapshot is open reads as absent through it — the
+    /// adversarial choice the kv contract allows (C-T0 §11 G0-gc, G0-R5-1).
+    /// Flat mode registers no drops; its snapshots keep dropped keys by
+    /// structural sharing.
+    live: Option<Arc<RwLock<KvState>>>,
+}
+
+impl MemSnap {
+    /// The live GC-drop registry, cloned once per read (cheap: persistent
+    /// map). Empty unless this is an LSM snapshot.
+    fn live_drops(&self) -> OrdMap<Key, u64> {
+        match &self.live {
+            Some(live) => match &*live.read().unwrap_or_else(PoisonError::into_inner) {
+                KvState::Lsm(l) => l.dropped.clone(),
+                KvState::Flat(_) => OrdMap::new(),
+            },
+            None => OrdMap::new(),
+        }
+    }
+
+    /// The drop era of the state this snapshot opened at.
+    fn open_era(&self) -> u64 {
+        match &self.state {
+            KvState::Lsm(l) => l.era,
+            KvState::Flat(_) => 0,
+        }
+    }
+
+    /// A drop recorded after this snapshot opened hides the key from it.
+    fn hidden(drops: &OrdMap<Key, u64>, era: u64, key: &[u8]) -> bool {
+        drops.get(key).is_some_and(|e| *e > era)
+    }
 }
 
 impl Snapshot for MemSnap {
     fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         Ok(match &self.state {
             KvState::Flat(m) => m.get(key).cloned(),
-            KvState::Lsm(l) => l.get(key),
+            KvState::Lsm(l) => {
+                let v = l.get(key);
+                if v.is_some() && Self::hidden(&self.live_drops(), self.open_era(), key) {
+                    None
+                } else {
+                    v
+                }
+            }
         })
     }
 
@@ -806,10 +881,13 @@ impl Snapshot for MemSnap {
                 }
             }
             KvState::Lsm(l) => {
+                let drops = self.live_drops();
+                let era = self.open_era();
                 let rows: Vec<(Key, Value)> = l
                     .merged()
                     .into_iter()
                     .filter(|(k, _)| (range.0, range.1).contains(k.as_slice()))
+                    .filter(|(k, _)| !Self::hidden(&drops, era, k))
                     .collect();
                 let it = rows.into_iter().map(Ok);
                 if reverse {
@@ -879,6 +957,12 @@ fn encode_lsm(l: &LsmState) -> Result<Vec<u8>> {
     b.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
     b.extend_from_slice(&l.seq.to_le_bytes());
     b.extend_from_slice(&l.next_file.to_le_bytes());
+    b.extend_from_slice(&l.era.to_le_bytes());
+    b.extend_from_slice(&(l.dropped.len() as u64).to_le_bytes());
+    for (k, era) in &l.dropped {
+        put_bytes(&mut b, k)?;
+        b.extend_from_slice(&era.to_le_bytes());
+    }
     put_entries(&mut b, &l.memtable)?;
     b.extend_from_slice(&(l.mem_rts.len() as u64).to_le_bytes());
     for (seq, s, e) in &l.mem_rts {
@@ -995,6 +1079,14 @@ fn decode_flat_body(c: &mut Cursor<'_>) -> Result<Map> {
 fn decode_lsm_body(c: &mut Cursor<'_>) -> Result<LsmState> {
     let seq = c.u64()?;
     let next_file = c.u64()?;
+    let era = c.u64()?;
+    let mut dropped = OrdMap::new();
+    for _ in 0..c.u64()? {
+        let klen = c.u32()? as usize;
+        let k = c.take(klen)?.to_vec();
+        let e = c.u64()?;
+        dropped.insert(k, e);
+    }
     let memtable = take_entries(c)?;
     let mut mem_rts = Vec::new();
     for _ in 0..c.u64()? {
@@ -1035,6 +1127,8 @@ fn decode_lsm_body(c: &mut Cursor<'_>) -> Result<LsmState> {
     Ok(LsmState {
         seq,
         next_file,
+        era,
+        dropped,
         memtable,
         mem_rts,
         levels,
@@ -1497,6 +1591,71 @@ mod tests {
     }
 
     #[test]
+    fn lsm_drop_visible_to_open_snapshots() {
+        // G0-R5-1: a compaction-filter drop is visible to already-open
+        // snapshots (the adversarial choice the kv contract allows), which the
+        // G0-gc model needs from LSM mode. Kept keys never change and later
+        // writes stay invisible to the old snapshot.
+        use crate::GcStream;
+
+        struct DropsGarbage;
+        struct DropsGarbageStream;
+        impl GcFilter for DropsGarbage {
+            fn begin(&self) -> Box<dyn GcStream> {
+                Box::new(DropsGarbageStream)
+            }
+        }
+        impl GcStream for DropsGarbageStream {
+            fn drop_key(&mut self, _key: &[u8], value: &[u8]) -> bool {
+                value.starts_with(b"garbage")
+            }
+        }
+
+        let kv = MemKv::lsm();
+        put(&kv, b"gk/a", b"garbage");
+        put(&kv, b"gk/b", b"live");
+        ok(kv.settle(), "settle");
+        let snap = kv.snapshot();
+        assert_eq!(ok(snap.get(b"gk/a"), "get"), Some(b"garbage".to_vec()));
+
+        kv.set_gc_filter(Box::new(DropsGarbage));
+        assert_eq!(kv.compact_all(), 1, "gk/a dropped");
+        assert_eq!(get(&kv, b"gk/a"), None, "dropped from the live state");
+        assert_eq!(
+            ok(snap.get(b"gk/a"), "get"),
+            None,
+            "drop visible to the open snapshot"
+        );
+        assert_eq!(
+            ok(snap.get(b"gk/b"), "get"),
+            Some(b"live".to_vec()),
+            "kept key changed"
+        );
+        put(&kv, b"gk/c", b"later");
+        assert_eq!(ok(snap.get(b"gk/c"), "get"), None, "later write visible");
+        assert_eq!(
+            dump(&snap),
+            vec![(b"gk/b".to_vec(), b"live".to_vec())],
+            "scan hides the dropped key"
+        );
+
+        // The registry survives a checkpoint round trip: the reopened store
+        // reads exact state and does not hide keys on fresh snapshots.
+        let dir = crate::conformance::scratch_dir("memkv-lsm-drops");
+        ok(kv.checkpoint(&dir), "checkpoint");
+        let back = ok(MemKv::open_checkpoint(&dir), "open_checkpoint");
+        assert_eq!(get(&back, b"gk/a"), None);
+        assert_eq!(get(&back, b"gk/b"), Some(b"live".to_vec()));
+        assert_eq!(get(&back, b"gk/c"), Some(b"later".to_vec()));
+        put(&back, b"gk/a", b"again");
+        assert_eq!(get(&back, b"gk/a"), Some(b"again".to_vec()));
+        let back_snap = back.snapshot();
+        assert_eq!(ok(back_snap.get(b"gk/a"), "get"), Some(b"again".to_vec()));
+        assert_eq!(ok(back_snap.get(b"gk/b"), "get"), Some(b"live".to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn lsm_checkpoint_round_trip() {
         let kv = MemKv::lsm();
         ops(
@@ -1733,6 +1892,7 @@ mod tests {
                 .unwrap_or(sc.w);
             let snap = MemSnap {
                 state: KvState::Lsm(Box::new(lsm.clone())),
+                live: None,
             };
             for s in sc.w..=max_ts + 1 {
                 assert_eq!(

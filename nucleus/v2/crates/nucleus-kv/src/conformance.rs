@@ -8,9 +8,11 @@
 //!   keep returning every key the filter kept, unchanged, and must never see a
 //!   later write. Whether it still returns a key the filter dropped is
 //!   unspecified: RocksDB (since 6.0) runs compaction filters on keys visible
-//!   to live snapshots, MemKv keeps them by structural sharing. I-GC does not
-//!   depend on either: the filter only drops a version older than a kept
-//!   version `<= W`, and every open reader has `S >= W`, so §4 stops at the
+//!   to live snapshots, flat-mode MemKv keeps them by structural sharing, and
+//!   LSM-mode MemKv takes the adversarial choice (a drop is visible to
+//!   already-open snapshots, C-T0 §11 G0-gc/G0-R5-1). I-GC does not depend on
+//!   either: the filter only drops a version older than a kept version
+//!   `<= W`, and every open reader has `S >= W`, so §4 stops at the
 //!   kept version first.
 //! - **The §9.2 drop rule (draft 4).** The kv honours the filter blindly.
 //!   Within one compaction stream (keys in ascending order) a filter may drop
