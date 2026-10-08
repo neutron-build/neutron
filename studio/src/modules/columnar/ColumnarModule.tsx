@@ -1,7 +1,8 @@
 import { useSignal } from '@preact/signals'
-import { useEffect } from 'preact/hooks'
+import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
-import { api } from '../../lib/api'
+import { useRequestOwner } from '../../lib/requestOwner'
+import { queryMutationOrThrow as runMutation, api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
 import { isRlsDenied } from '../../lib/rls'
 import { RlsNotice } from '../../components/RlsNotice'
@@ -63,36 +64,74 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
   // Insert helper (COLUMNAR_INSERT)
   const insertPairs = useSignal('')
   const inserting = useSignal(false)
+  const insertVersion = useRef(0)
 
-  const conn = activeConnection.value!
-
+  const priorName = useRef(name)
+  if (priorName.current !== name) { priorName.current = name; tableName.value = name }
+  const conn = activeConnection.value
+  const metaGeneration = useRef(0)
+  const queryGeneration = useRef(0)
+  const requests = useRequestOwner(JSON.stringify([conn?.id, name, tableName.value]))
+  const unavailable = useSignal<string | null>(null)
+  const owner = useRef({ epoch: 0, alive: true, connection: conn?.id, name: name })
+  function invalidate() {
+    requests.invalidate()
+    owner.current.epoch++
+    unavailable.value = null; rlsDenied.value = null
+    metaGeneration.current++; queryGeneration.current++; insertVersion.current++; rowCount.value = null; result.value = null; running.value = false; inserting.value = false;
+  }
+  if (owner.current.connection !== conn?.id || owner.current.name !== name) {
+    invalidate(); owner.current.connection = conn?.id; owner.current.name = name
+  }
+  function capture(channel: string) {
+    const ticket = requests.begin(channel)
+    const epoch = owner.current.epoch
+    const connectionId = conn?.id
+    const target = tableName.value
+    return { connectionId, owns: () => ticket() && owner.current.alive && epoch === owner.current.epoch && connectionId === activeConnection.value?.id && target === tableName.value }
+  }
+  function fail(err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    unavailable.value = msg; rlsDenied.value = isRlsDenied(msg) ? msg : null
+  }
   useEffect(() => {
-    loadMeta()
+    owner.current.alive = true
+    let current = activeConnection.value
+    const stop = activeConnection.subscribe(next => { if (next !== current) { current = next; invalidate() } })
+    return () => { owner.current.alive = false; invalidate(); stop() }
   }, [])
+  useEffect(() => { void loadMeta() }, [conn?.id, name])
 
-  function loadMeta() {
-    const table = tableName.value.trim()
-    if (!table) return
-    api.query(`SELECT COLUMNAR_COUNT(${sqlStr(table)})`, conn.id).then(r => {
-      if (r.error) {
-        if (isRlsDenied(r.error)) rlsDenied.value = r.error
-        return
-      }
-      if (r.rows.length > 0) rowCount.value = Number(r.rows[0][0])
-    }).catch(() => { /* non-critical */ })
+  async function loadMeta() {
+    const binding = capture('meta')
+    const table = currentTable()
+    if (!table || !binding.connectionId || !binding.owns()) return
+    const generation = ++metaGeneration.current
+    const owns = () => binding.owns() && generation === metaGeneration.current
+    rowCount.value = null
+    try {
+      const r = await api.query(`SELECT COLUMNAR_COUNT(${sqlStr(table)})`, binding.connectionId)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Columnar count canceled')
+      if (r.rows[0]?.[0] == null || !Number.isFinite(Number(r.rows[0][0]))) throw new Error('Columnar count unavailable')
+      rowCount.value = Number(r.rows[0][0])
+    } catch (err) { if (owns()) fail(err) }
   }
 
   async function runQuery() {
-    running.value = true
-    result.value = null
+    const binding = capture('query')
+    if (!binding.connectionId || !binding.owns()) return
+    const generation = ++queryGeneration.current
+    const sql = query.value
+    const owns = () => binding.owns() && generation === queryGeneration.current && sql === query.value
+    running.value = true; result.value = null; unavailable.value = null
     try {
-      const r = await api.query(query.value, conn.id)
+      const r = await api.query(sql, binding.connectionId)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Columnar query canceled')
       result.value = r
-    } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
-    } finally {
-      running.value = false
-    }
+    } catch (err) { if (owns()) fail(err) }
+    finally { if (owns()) running.value = false }
   }
 
   function currentTable(): string {
@@ -115,6 +154,11 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
   }
 
   async function insertRow() {
+    if (inserting.value) return
+    const binding = capture('insert')
+    if (!binding.connectionId || !binding.owns()) return
+    const version = insertVersion.current
+    const metaRevision = metaGeneration.current
     const table = currentTable()
     if (!table) {
       toast('error', 'Table name is required')
@@ -127,14 +171,15 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
     }
     inserting.value = true
     try {
-      await api.query(sql, conn.id)
+      await queryMutationOrThrow(sql, binding.connectionId)
+      if (!binding.owns()) return
       toast('success', `Inserted into ${table}`)
-      insertPairs.value = ''
-      await loadMeta()
+      if (insertVersion.current === version && binding.owns()) insertPairs.value = ''
+      if (metaRevision === metaGeneration.current) await loadMeta()
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      if (binding.owns()) { fail(err); toast('error', err instanceof Error ? err.message : String(err)) }
     } finally {
-      inserting.value = false
+      if (binding.owns()) inserting.value = false
     }
   }
 
@@ -147,7 +192,7 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
           value={tableName.value}
           placeholder="table name"
           title="Columnar store table (user-supplied — the store has no listing surface)"
-          onInput={e => { tableName.value = (e.target as HTMLInputElement).value }}
+          onInput={e => { invalidate(); tableName.value = (e.target as HTMLInputElement).value }}
           onKeyDown={e => { if (e.key === 'Enter') loadMeta() }}
           onBlur={loadMeta}
         />
@@ -157,6 +202,7 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
       </div>
 
       {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
+      {unavailable.value && <div role="alert">Columnar data unavailable: {unavailable.value}</div>}
 
       {/* Honest durability note (engine semantics, X03 leg evidence): the
           COLUMNAR_* store is fsync-durable at commit (survives kill -9) and
@@ -202,7 +248,7 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
             style={{ height: 'auto' }}
             placeholder="col1=val1, col2=val2"
             value={insertPairs.value}
-            onInput={e => { insertPairs.value = (e.target as HTMLInputElement).value }}
+            onInput={e => { insertVersion.current++; insertPairs.value = (e.target as HTMLInputElement).value }}
           />
           <button class={s.runBtn} onClick={insertRow} disabled={inserting.value}>
             {inserting.value ? 'Inserting…' : 'Insert'}
@@ -214,7 +260,7 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
         <div class={s.queryRow}>
           <div class={s.quickBtns}>
             {QUICK_QUERIES.map((fn, i) => (
-              <button key={i} class={s.quickBtn} onClick={() => { query.value = fn(currentTable()) }}>
+              <button key={i} class={s.quickBtn} onClick={() => { queryGeneration.current++; running.value = false; result.value = null; query.value = fn(currentTable()) }}>
                 {i === 0 ? 'COUNT' : 'SUM'}
               </button>
             ))}
@@ -226,7 +272,7 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
         <textarea
           class={s.queryInput}
           value={query.value}
-          onInput={e => { query.value = (e.target as HTMLTextAreaElement).value }}
+          onInput={e => { queryGeneration.current++; running.value = false; result.value = null; query.value = (e.target as HTMLTextAreaElement).value }}
           rows={3}
           spellcheck={false}
           onKeyDown={e => {
@@ -244,3 +290,5 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
     </div>
   )
 }
+
+const queryMutationOrThrow = (sql: string, connectionId: string, params?: unknown[]) => runMutation(sql, connectionId, params, api.query)

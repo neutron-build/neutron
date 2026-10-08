@@ -31,9 +31,9 @@ it('never publishes a delayed external loader fill after a completed mutation', 
   // commit point, after the simulated network delay rather than before it.
   if ('setIfGeneration' in backing) {
     Object.assign(store, {
-      async setIfGeneration(key: string, entry: NeutronLoaderDataCacheEntry, generation: string) {
+      async setIfGeneration(key: string, entry: NeutronLoaderDataCacheEntry, generation: string, options: Parameters<NonNullable<NeutronLoaderCacheStore['setIfGeneration']>>[3]) {
         await pause();
-        return backing.setIfGeneration!(key, entry, generation);
+        return backing.setIfGeneration!(key, entry, generation, options);
       },
     });
   }
@@ -138,9 +138,9 @@ it('fences a delayed fill begun during another server’s action at the shared b
   let firstFill = true;
   const store: NeutronLoaderCacheStore = {
     ...backing,
-    async setIfGeneration(key, entry, generation) {
+    async setIfGeneration(key, entry, generation, options) {
       if (firstFill) { firstFill = false; fillStarted(); await fillReleased; }
-      return backing.setIfGeneration!(key, entry, generation);
+      return backing.setIfGeneration!(key, entry, generation, options);
     },
   };
   const servers = [] as Awaited<ReturnType<typeof createServer>>[];

@@ -1,9 +1,21 @@
+import { bindPathParams, parseUrlPath, comparePathSpecificity } from "../core/route-path.js";
 import type { RouteHref } from "../core/typed-routes.js";
 
 let currentPath = typeof window !== "undefined" ? window.location.pathname : "/";
 let currentSearch = typeof window !== "undefined" ? window.location.search : "";
 export interface NavigationListenerEvent {
   forceRevalidate?: boolean;
+  generation?: number;
+}
+
+let navigationGeneration = 0;
+export function getNavigationGeneration(): number { return navigationGeneration; }
+
+const startListeners = new Set<(generation: number) => void>();
+/** Fires synchronously before a delayed view-transition callback. */
+export function subscribeNavigationStart(listener: (generation: number) => void): () => void {
+  startListeners.add(listener);
+  return () => { startListeners.delete(listener); };
 }
 
 const listeners = new Set<(event: NavigationListenerEvent) => void | Promise<void>>();
@@ -155,7 +167,13 @@ function handlePopState(
   withTransition: boolean = true,
   event: NavigationListenerEvent = {}
 ) {
+  const generation = ++navigationGeneration;
+  for (const listener of startListeners) listener(generation);
+  event = { ...event, generation };
+  currentPath = window.location.pathname;
+  currentSearch = window.location.search;
   const apply = (): Promise<void> => {
+    if (generation !== navigationGeneration) return Promise.resolve();
     currentPath = window.location.pathname;
     currentSearch = window.location.search;
     const results = Array.from(listeners).map((listener) => listener(event));
@@ -187,73 +205,15 @@ if (typeof window !== "undefined") {
 }
 
 export function matchRoute(pathname: string, routes: string[]): string | null {
-  for (const route of routes) {
-    if (route === pathname) return route;
-    
-    const routeSegments = route.split("/").filter(Boolean);
-    const pathSegments = pathname.split("/").filter(Boolean);
-    
-    const hasWildcard = routeSegments.includes("*");
-    if (!hasWildcard && routeSegments.length !== pathSegments.length) continue;
-    // The server trie requires at least one segment after the wildcard
-    // (router.ts skips empty wildcard values); zero-remainder paths must
-    // not match here either.
-    if (hasWildcard && pathSegments.length < routeSegments.length) continue;
-
-    let matches = true;
-    for (let i = 0; i < routeSegments.length; i++) {
-      const routeSeg = routeSegments[i];
-      const pathSeg = pathSegments[i];
-
-      if (routeSeg === "*") {
-        break;
-      }
-      if (routeSeg.startsWith(":")) {
-        continue;
-      }
-
-      if (routeSeg !== pathSeg) {
-        matches = false;
-        break;
-      }
-    }
-    
-    if (matches) return route;
-  }
-  
-  return null;
-}
-
-function safeDecodeSegment(segment: string | undefined): string {
-  if (segment === undefined) return "";
   try {
-    return decodeURIComponent(segment);
-  } catch {
-    return segment;
-  }
+    const segments = parseUrlPath(decodeURIComponent(pathname));
+    return [...routes].sort(comparePathSpecificity).find(route => bindPathParams(route, segments) !== null) ?? null;
+  } catch { return null; }
 }
 
 export function extractParams(routePattern: string, pathname: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  const routeSegments = routePattern.split("/").filter(Boolean);
-  const pathSegments = pathname.split("/").filter(Boolean);
-
-  for (let i = 0; i < routeSegments.length; i++) {
-    const routeSeg = routeSegments[i];
-    const pathSeg = pathSegments[i];
-
-    if (routeSeg.startsWith(":")) {
-      // The server decodes the request path before routing, so params arrive
-      // decoded; the client must decode too or useParams differs pre/post
-      // hydration for percent-encoded segments.
-      params[routeSeg.slice(1)] = safeDecodeSegment(pathSeg);
-    } else if (routeSeg === "*") {
-      params["*"] = pathSegments.slice(i).map(safeDecodeSegment).join("/");
-      break;
-    }
-  }
-
-  return params;
+  try { return bindPathParams(routePattern, parseUrlPath(decodeURIComponent(pathname))) ?? {}; }
+  catch { return {}; }
 }
 
 function shouldUseViewTransitions(): boolean {

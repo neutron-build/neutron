@@ -1,3 +1,4 @@
+import { installTransportPeer } from "@neutron-build/core";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
@@ -22,75 +23,76 @@ const OK_RESPONSE = () => new Response("ok", { status: 200 });
 
 describe("resolveClientIp", () => {
   it("returns null when trustProxy is false (default)", () => {
-    const request = new Request("https://example.com", {
+    const request = trustedRequest("https://example.com", {
       headers: { "x-forwarded-for": "203.0.113.9" },
     });
     assert.equal(resolveClientIp(request), null);
   });
 
   it("returns the trusted right-most forwarded hop when trustProxy is enabled", () => {
-    const request = new Request("https://example.com", {
+    const request = trustedRequest("https://example.com", {
       headers: { "x-forwarded-for": "203.0.113.9, 198.51.100.7" },
     });
     // The right-most entry is the address our nearest trusted proxy observed;
     // the left-most is client-supplied and must not be returned.
-    assert.equal(resolveClientIp(request, { trustProxy: true }), "198.51.100.7");
+    assert.equal(resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true }), "198.51.100.7");
   });
 
   it("ignores a spoofed left-most forwarded entry", () => {
-    const request = new Request("https://example.com", {
+    const request = trustedRequest("https://example.com", {
       headers: { "x-forwarded-for": "1.2.3.4, 203.0.113.9" },
     });
-    assert.equal(resolveClientIp(request, { trustProxy: true }), "203.0.113.9");
+    assert.equal(resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true }), "203.0.113.9");
   });
 
   it("honors trustedHops for multi-proxy chains", () => {
-    const request = new Request("https://example.com", {
+    const request = trustedRequest("https://example.com", {
       // client, proxyA, proxyB (we trust 2 hops in front of us)
-      headers: { "x-forwarded-for": "client, 203.0.113.9, 198.51.100.7" },
+      headers: { "x-forwarded-for": "192.0.2.1, 203.0.113.9, 198.51.100.7" },
     });
     assert.equal(
-      resolveClientIp(request, { trustProxy: true, trustedHops: 2 }),
+      resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true, trustedHops: 2 }),
       "203.0.113.9"
     );
   });
 
-  it("prefers cf-connecting-ip over other headers", () => {
-    const request = new Request("https://example.com", {
+  it("ignores unverified vendor headers behind a generic proxy", () => {
+    const request = trustedRequest("https://example.com", {
       headers: {
         "cf-connecting-ip": "1.2.3.4",
         "x-real-ip": "5.6.7.8",
         "x-forwarded-for": "9.10.11.12",
       },
     });
-    assert.equal(resolveClientIp(request, { trustProxy: true }), "1.2.3.4");
+    assert.equal(resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true }), "9.10.11.12");
   });
 
-  it("falls back to x-real-ip when cf-connecting-ip is absent", () => {
-    const request = new Request("https://example.com", {
+  it("ignores x-real-ip unless explicitly configured", () => {
+    const request = trustedRequest("https://example.com", {
       headers: {
         "x-real-ip": "5.6.7.8",
         "x-forwarded-for": "9.10.11.12",
       },
     });
-    assert.equal(resolveClientIp(request, { trustProxy: true }), "5.6.7.8");
+    assert.equal(resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true }), "9.10.11.12");
   });
 
-  it("respects maxForwardedIps limit (counted from the right)", () => {
-    const request = new Request("https://example.com", {
+  it("rejects forwarded chains exceeding the configured bound", () => {
+    const request = trustedRequest("https://example.com", {
       headers: {
         "x-forwarded-for": "1.1.1.1, 2.2.2.2, 3.3.3.3",
       },
     });
-    const ip = resolveClientIp(request, { trustProxy: true, maxForwardedIps: 1 });
-    assert.equal(ip, "3.3.3.3");
+    const ip = resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true, maxForwardedIps: 1 });
+    assert.equal(ip, null);
   });
 
   it("supports custom forwarded header", () => {
-    const request = new Request("https://example.com", {
+    const request = trustedRequest("https://example.com", {
       headers: { "x-custom-forwarded": "10.0.0.1" },
     });
     const ip = resolveClientIp(request, {
+      trustedProxies: ["127.0.0.1"],
       trustProxy: true,
       forwardedHeader: "x-custom-forwarded",
     });
@@ -98,8 +100,8 @@ describe("resolveClientIp", () => {
   });
 
   it("returns null when no forwarded headers are present", () => {
-    const request = new Request("https://example.com");
-    assert.equal(resolveClientIp(request, { trustProxy: true }), null);
+    const request = trustedRequest("https://example.com");
+    assert.equal(resolveClientIp(request, { trustedProxies: ["127.0.0.1"], trustProxy: true }), null);
   });
 });
 
@@ -112,7 +114,7 @@ describe("createCspNonceMiddleware", () => {
     const mw = createCspNonceMiddleware();
     const ctx: Record<string, unknown> = {};
     const response = await mw(
-      new Request("https://example.com"),
+      trustedRequest("https://example.com"),
       ctx,
       async () => OK_RESPONSE()
     );
@@ -130,7 +132,7 @@ describe("createCspNonceMiddleware", () => {
   it("uses a custom contextKey", async () => {
     const mw = createCspNonceMiddleware({ contextKey: "myNonce" });
     const ctx: Record<string, unknown> = {};
-    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
+    await mw(trustedRequest("https://example.com"), ctx, async () => OK_RESPONSE());
 
     assert.ok(ctx["myNonce"]);
     assert.equal(ctx["cspNonce"], undefined);
@@ -142,7 +144,7 @@ describe("createCspNonceMiddleware", () => {
     });
     const ctx: Record<string, unknown> = {};
     const response = await mw(
-      new Request("https://example.com"),
+      trustedRequest("https://example.com"),
       ctx,
       async () => OK_RESPONSE()
     );
@@ -157,7 +159,7 @@ describe("createCspNonceMiddleware", () => {
     });
     const ctx: Record<string, unknown> = {};
     const response = await mw(
-      new Request("https://example.com"),
+      trustedRequest("https://example.com"),
       ctx,
       async () => OK_RESPONSE()
     );
@@ -175,7 +177,7 @@ describe("createCspNonceMiddleware", () => {
     });
     const ctx: Record<string, unknown> = {};
     const response = await mw(
-      new Request("https://example.com"),
+      trustedRequest("https://example.com"),
       ctx,
       async () => OK_RESPONSE()
     );
@@ -191,7 +193,7 @@ describe("createCspNonceMiddleware", () => {
     const mw = createCspNonceMiddleware();
     const ctx: Record<string, unknown> = {};
     const response = await mw(
-      new Request("https://example.com"),
+      trustedRequest("https://example.com"),
       ctx,
       async () =>
         new Response("ok", {
@@ -230,7 +232,7 @@ describe("createCsrfMiddleware", () => {
     const mw = createCsrfMiddleware();
     const ctx: Record<string, unknown> = {};
     const response = await mw(
-      new Request("https://example.com/account", { method: "GET" }),
+      trustedRequest("https://example.com/account", { method: "GET" }),
       ctx,
       async () => OK_RESPONSE()
     );
@@ -248,7 +250,7 @@ describe("createCsrfMiddleware", () => {
     for (const method of ["HEAD", "OPTIONS"]) {
       const ctx: Record<string, unknown> = {};
       const response = await mw(
-        new Request("https://example.com", { method }),
+        trustedRequest("https://example.com", { method }),
         ctx,
         async () => OK_RESPONSE()
       );
@@ -259,7 +261,7 @@ describe("createCsrfMiddleware", () => {
   it("rejects POST without a matching token", async () => {
     const mw = createCsrfMiddleware();
     const response = await mw(
-      new Request("https://example.com/account", { method: "POST" }),
+      trustedRequest("https://example.com/account", { method: "POST" }),
       {},
       async () => OK_RESPONSE()
     );
@@ -271,7 +273,7 @@ describe("createCsrfMiddleware", () => {
   it("rejects POST when cookie token does not match header token", async () => {
     const mw = createCsrfMiddleware();
     const response = await mw(
-      new Request("https://example.com/account", {
+      trustedRequest("https://example.com/account", {
         method: "POST",
         headers: {
           cookie: "__neutron_csrf=cookie-token",
@@ -289,7 +291,7 @@ describe("createCsrfMiddleware", () => {
     const mw = createCsrfMiddleware();
     const token = "csrf-token-123";
     const response = await mw(
-      new Request("https://example.com/account", {
+      trustedRequest("https://example.com/account", {
         method: "POST",
         headers: {
           cookie: `__neutron_csrf=${token}`,
@@ -307,7 +309,7 @@ describe("createCsrfMiddleware", () => {
     const mw = createCsrfMiddleware();
     const token = "csrf-token-123";
     const response = await mw(
-      new Request("https://example.com/account", {
+      trustedRequest("https://example.com/account", {
         method: "POST",
         headers: {
           cookie: `__neutron_csrf=${token}`,
@@ -326,7 +328,7 @@ describe("createCsrfMiddleware", () => {
     const mw = createCsrfMiddleware();
     const token = "csrf-token-123";
     const response = await mw(
-      new Request("https://example.com/account", {
+      trustedRequest("https://example.com/account", {
         method: "POST",
         headers: {
           cookie: `__neutron_csrf=${token}`,
@@ -345,7 +347,7 @@ describe("createCsrfMiddleware", () => {
   it("sets an HttpOnly, SameSite=Strict CSRF cookie by default", async () => {
     const mw = createCsrfMiddleware();
     const response = await mw(
-      new Request("https://example.com/", { method: "GET" }),
+      trustedRequest("https://example.com/", { method: "GET" }),
       {},
       async () => OK_RESPONSE()
     );
@@ -358,7 +360,7 @@ describe("createCsrfMiddleware", () => {
     const mw = createCsrfMiddleware();
     for (const method of ["PUT", "DELETE", "PATCH"]) {
       const response = await mw(
-        new Request("https://example.com/account", { method }),
+        trustedRequest("https://example.com/account", { method }),
         {},
         async () => OK_RESPONSE()
       );
@@ -372,7 +374,7 @@ describe("createCsrfMiddleware", () => {
     });
 
     const response = await mw(
-      new Request("https://example.com/account", { method: "POST" }),
+      trustedRequest("https://example.com/account", { method: "POST" }),
       {},
       async () => OK_RESPONSE()
     );
@@ -388,7 +390,7 @@ describe("createCsrfMiddleware", () => {
 
     const token = "my-token";
     const response = await mw(
-      new Request("https://example.com", {
+      trustedRequest("https://example.com", {
         method: "POST",
         headers: {
           cookie: `_my_csrf=${token}`,
@@ -406,7 +408,7 @@ describe("createCsrfMiddleware", () => {
     const mw = createCsrfMiddleware();
     const token = "existing-token";
     const response = await mw(
-      new Request("https://example.com/page", {
+      trustedRequest("https://example.com/page", {
         method: "GET",
         headers: { cookie: `__neutron_csrf=${token}` },
       }),
@@ -449,7 +451,7 @@ describe("createRateLimitMiddleware", () => {
       key: () => "test-key",
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     for (let i = 0; i < 5; i++) {
       const response = await mw(request, {}, async () => OK_RESPONSE());
       assert.equal(response.status, 200);
@@ -463,7 +465,7 @@ describe("createRateLimitMiddleware", () => {
       key: () => "shared-test-key",
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     const first = await mw(request, {}, async () => OK_RESPONSE());
     const second = await mw(request, {}, async () => OK_RESPONSE());
     const denied = await mw(request, {}, async () => OK_RESPONSE());
@@ -482,7 +484,7 @@ describe("createRateLimitMiddleware", () => {
       key: () => "retry-key",
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     await mw(request, {}, async () => OK_RESPONSE());
     const denied = await mw(request, {}, async () => OK_RESPONSE());
 
@@ -500,7 +502,7 @@ describe("createRateLimitMiddleware", () => {
     });
 
     const response = await mw(
-      new Request("https://example.com/api"),
+      trustedRequest("https://example.com/api"),
       {},
       async () => OK_RESPONSE()
     );
@@ -519,11 +521,12 @@ describe("createRateLimitMiddleware", () => {
     const mw = createRateLimitMiddleware({
       capacity: 1,
       refillPerSecond: 0.0001,
+      trustedProxies: ["127.0.0.1"],
       trustProxy: true,
     });
 
     const requestFrom = (ip: string): Request =>
-      new Request("https://example.com/api", {
+      trustedRequest("https://example.com/api", {
         headers: { "x-forwarded-for": ip },
       });
 
@@ -544,7 +547,7 @@ describe("createRateLimitMiddleware", () => {
       refillPerSecond: 0.0001,
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     const first = await mw(request, {}, async () => OK_RESPONSE());
     const second = await mw(request, {}, async () => OK_RESPONSE());
 
@@ -563,7 +566,7 @@ describe("createRateLimitMiddleware", () => {
       denyStatus: 503,
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     await mw(request, {}, async () => OK_RESPONSE());
     const denied = await mw(request, {}, async () => OK_RESPONSE());
 
@@ -578,7 +581,7 @@ describe("createRateLimitMiddleware", () => {
       key: () => `key-${callCount++}`,
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     const r1 = await mw(request, {}, async () => OK_RESPONSE());
     const r2 = await mw(request, {}, async () => OK_RESPONSE());
 
@@ -593,7 +596,7 @@ describe("createRateLimitMiddleware", () => {
       key: async () => "async-key",
     });
 
-    const request = new Request("https://example.com/api");
+    const request = trustedRequest("https://example.com/api");
     const r1 = await mw(request, {}, async () => OK_RESPONSE());
     const r2 = await mw(request, {}, async () => OK_RESPONSE());
 
@@ -642,5 +645,53 @@ describe("resolveSecureCookieOptions", () => {
     });
     assert.equal(opts.domain, "example.com");
     assert.equal(opts.maxAge, 3600);
+  });
+});
+
+function trustedRequest(input: string | URL | Request, init?: RequestInit): Request { const request = new Request(input, init); installTransportPeer(request, "127.0.0.1"); return request; }
+
+describe('Final C security regressions', () => {
+  it('TS-F10 never evicts a live exhausted identity at capacity', async () => {
+    const original = Date.now; Date.now = () => 1000;
+    try {
+      const middleware = createRateLimitMiddleware({ capacity: 1, refillPerSecond: 0.001, maxBuckets: 2, key: request => new URL(request.url).pathname });
+      const call = (key: string) => middleware(new Request('https://example.test/' + key), {}, async () => new Response('ok'));
+      assert.equal((await call('victim')).status, 200); assert.equal((await call('other')).status, 200);
+      assert.equal((await call('new')).status, 429); assert.equal((await call('victim')).status, 429);
+    } finally { Date.now = original; }
+  });
+  it('TS-F10 rejects non-finite numeric configuration', () => {
+    for (const field of ['capacity', 'refillPerSecond', 'tokensPerRequest', 'maxBuckets', 'bucketTtlMs', 'cleanupEvery', 'trustedHops', 'maxForwardedIps']) {
+      assert.throws(() => createRateLimitMiddleware({ capacity: 10, [field]: NaN }), /finite/);
+      assert.throws(() => createRateLimitMiddleware({ capacity: 10, [field]: Infinity }), /finite/);
+    }
+  });
+  it('TS-F10 rejects invalid counts and expiry instead of silently coercing them', () => {
+    for (const field of ['maxBuckets', 'cleanupEvery', 'trustedHops', 'maxForwardedIps']) {
+      for (const value of [0, -1, 1.5]) assert.throws(() => createRateLimitMiddleware({ capacity: 10, [field]: value }), /positive integer/);
+    }
+    assert.throws(() => createRateLimitMiddleware({ capacity: 10, bucketTtlMs: -1 }), /positive/);
+    assert.throws(() => createRateLimitMiddleware({ capacity: 10, denyStatus: 200 }), /error status/);
+  });
+  it('TS-F11 rejects the same host under a different scheme or port', async () => {
+    const middleware = createCsrfMiddleware();
+    for (const origin of ['http://example.test', 'https://example.test:8443']) {
+      const response = await middleware(new Request('https://example.test/', { method: 'POST', headers: { Origin: origin, Cookie: '__neutron_csrf=valid', 'x-csrf-token': 'valid' } }), {}, async () => new Response('unsafe'));
+      assert.equal(response.status, 403);
+    }
+  });
+  it('TS-F12 direct peers and invalid/short forwarding chains never authorize vendor headers', () => {
+    const request = new Request('https://example.test/', { headers: { 'cf-connecting-ip': '1.2.3.4', 'x-forwarded-for': 'invalid' } });
+    assert.equal(resolveClientIp(request, { trustProxy: true, trustedProxies: ['127.0.0.1'] }), null);
+    installTransportPeer(request, '127.0.0.1');
+    assert.equal(resolveClientIp(request, { trustProxy: true, trustedProxies: ['127.0.0.1'] }), null);
+    const short = trustedRequest('https://example.test/', { headers: { 'x-forwarded-for': '1.2.3.4' } });
+    assert.equal(resolveClientIp(short, { trustProxy: true, trustedProxies: ['127.0.0.1'], trustedHops: 2 }), null);
+  });
+  it('TS-F09 standalone public middleware accepts immutable native redirects', async () => {
+    for (const middleware of [createCspNonceMiddleware(), createCsrfMiddleware(), createRateLimitMiddleware({ capacity: 10 })]) {
+      const response = await middleware(new Request('https://example.test/'), {}, async () => Response.redirect('https://example.test/next', 307));
+      assert.equal(response.status, 307); assert.equal(response.headers.get('Location'), 'https://example.test/next');
+    }
   });
 });

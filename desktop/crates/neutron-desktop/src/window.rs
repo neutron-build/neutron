@@ -1,4 +1,5 @@
 /// Configuration for the main application window.
+#[derive(Clone, Debug, PartialEq)]
 pub struct WindowConfig {
     pub title: String,
     pub width: f64,
@@ -12,6 +13,34 @@ pub struct WindowConfig {
 }
 
 impl WindowConfig {
+    pub fn validate(&self) -> Result<(), std::io::Error> {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.width)
+            || !positive(self.height)
+            || self.min_width.is_some() != self.min_height.is_some()
+            || self
+                .min_width
+                .is_some_and(|v| !positive(v) || v > self.width)
+            || self
+                .min_height
+                .is_some_and(|v| !positive(v) || v > self.height)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid window dimensions; minimum dimensions must be paired and within initial size",
+            ));
+        }
+        // Tauri requires a special macOS private-API feature for transparency.
+        #[cfg(target_os = "macos")]
+        if self.transparent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Transparent windows require the macOS private API and are unsupported by this build",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn title(&mut self, title: impl Into<String>) -> &mut Self {
         self.title = title.into();
         self
@@ -63,5 +92,21 @@ impl Default for WindowConfig {
             min_width: None,
             min_height: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_bad_dimensions() {
+        let mut c = WindowConfig::default();
+        c.width = f64::NAN;
+        assert!(c.validate().is_err());
+        c.width = 1200.;
+        c.min_width = Some(10.);
+        assert!(c.validate().is_err());
+        c.min_height = Some(10.);
+        assert!(c.validate().is_ok());
     }
 }

@@ -313,3 +313,5 @@ export {
   type ResolvedLocalePath,
 } from "./core/i18n.js";
 export { buildRssFeed, type RssItem, type RssOptions } from "./core/rss.js";
+
+export { mutableResponse } from "./core/response.js";

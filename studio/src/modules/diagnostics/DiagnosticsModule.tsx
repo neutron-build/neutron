@@ -1,3 +1,4 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useEffect } from 'preact/hooks'
 import { useSignal } from '@preact/signals'
 import { activeConnection, openTab } from '../../lib/store'
@@ -32,29 +33,46 @@ export function DiagnosticsModule({ schema, table }: { schema?: string; table?: 
   const inputTable = useSignal(table ?? '')
   const statsSchema = useSignal(schema ?? '')
   const statsTable = useSignal(table ?? '')
+  const statsTick = useSignal(0)
   const stats = useSignal<TableStatsResponse | null>(null)
   const statsError = useSignal<string | null>(null)
 
-  useEffect(() => {
-    if (!conn || conn.isNucleus) return
-    queriesError.value = null
-    api.diagnosticsQueries(conn.id, minMs.value)
-      .then(r => { queries.value = r })
-      .catch(e => { queriesError.value = e instanceof Error ? e.message : String(e) })
-  }, [conn?.id, minMs.value, queriesTick.value])
+  const owner = useRequestOwner(JSON.stringify([conn?.id, schema, table]))
 
   useEffect(() => {
-    if (!conn || conn.isNucleus || !statsSchema.value || !statsTable.value) return
+    stats.value = null; statsError.value = null
+    inputSchema.value = schema ?? 'public'; inputTable.value = table ?? ''
+    statsSchema.value = schema ?? ''; statsTable.value = table ?? ''
+  }, [conn?.id, schema, table])
+
+  useEffect(() => {
+    const current = owner.begin('queries')
+    const threshold = minMs.value, tick = queriesTick.value
+    const owns = () => current() && threshold === minMs.value && tick === queriesTick.value
+    queries.value = null
+    if (!conn || !owns() || conn.isNucleus) return
+    queriesError.value = null
+    api.diagnosticsQueries(conn.id, minMs.value)
+      .then(r => { if (owns()) queries.value = r })
+      .catch(e => { if (!owns()) return; queriesError.value = e instanceof Error ? e.message : String(e) })
+  }, [conn?.id, schema, table, minMs.value, queriesTick.value])
+
+  useEffect(() => {
+    const current = owner.begin('stats')
+    const target = JSON.stringify([statsSchema.value, statsTable.value])
+    const owns = () => current() && target === JSON.stringify([statsSchema.value, statsTable.value])
+    if (!conn || !owns() || conn.isNucleus || !statsSchema.value || !statsTable.value) return
     stats.value = null
     statsError.value = null
     api.tableStats(conn.id, statsSchema.value, statsTable.value)
-      .then(r => { stats.value = r })
+      .then(r => { if (owns()) stats.value = r })
       .catch(e => {
+        if (!owns()) return
         statsError.value = e instanceof ApiError && e.status === 404
           ? `${statsSchema.value}.${statsTable.value} has no statistics row — dropped, renamed, or not visible; refresh the schema.`
           : e instanceof Error ? e.message : String(e)
       })
-  }, [conn?.id, statsSchema.value, statsTable.value])
+  }, [conn?.id, schema, table, statsSchema.value, statsTable.value, statsTick.value])
 
   if (!conn) return <div class={s.hint}>Connect to a database first</div>
   if (conn.isNucleus) {
@@ -72,13 +90,13 @@ export function DiagnosticsModule({ schema, table }: { schema?: string; table?: 
       <section class={s.section} aria-label="Slow queries">
         <h3>Slow queries</h3>
         <p class={s.meta}>{queries.value?.scope ?? 'loading…'}</p>
-        <button class={s.loadBtn} onClick={() => { queriesTick.value++ }}>Refresh</button>
+        <button class={s.loadBtn} onClick={() => { owner.invalidate('queries'); queries.value = null; queriesTick.value++ }}>Refresh</button>
         <label class={s.threshold}>
           threshold ≥ <input
             type="number" min="0" step="50"
             aria-label="minimum duration in milliseconds"
             value={minMs.value}
-            onChange={e => { minMs.value = Math.max(0, Number((e.target as HTMLInputElement).value) || 0) }}
+            onChange={e => { owner.invalidate('queries'); queries.value = null; minMs.value = Math.max(0, Number((e.target as HTMLInputElement).value) || 0) }}
           /> ms
         </label>
         {queriesError.value && <div class={s.error} role="alert">{queriesError.value}</div>}
@@ -149,6 +167,7 @@ export function DiagnosticsModule({ schema, table }: { schema?: string; table?: 
         <h3>Table statistics and index usage</h3>
         <form class={s.picker} onSubmit={e => {
           e.preventDefault()
+          owner.invalidate('stats'); stats.value = null; statsTick.value++
           statsSchema.value = inputSchema.value.trim()
           statsTable.value = inputTable.value.trim()
         }}>

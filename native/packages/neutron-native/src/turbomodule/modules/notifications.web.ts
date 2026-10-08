@@ -75,49 +75,85 @@ const WEB_NOTIFICATIONS: NotificationsModule = {
       return { ok: false, error: { code: 'PERMISSION_DENIED', message: 'Notification permission not granted' } }
     }
 
+    // Repeating delivery is NOT implemented on web: a single setTimeout
+    // would silently deliver once while claiming a schedule (NF-NR-11).
+    if (payload.repeat !== undefined) {
+      return { ok: false, error: { code: 'UNSUPPORTED', message: 'Repeating notifications are not supported by the web module; schedule each delivery explicitly.' } }
+    }
+
+    // Validate the requested delay/date: a garbage date is an argument
+    // error, not an immediate notification (NaN comparisons are false,
+    // which used to fire instantly).
+    let delayMs = 0
+    if (payload.fireAfter !== undefined) {
+      if (!Number.isFinite(payload.fireAfter) || payload.fireAfter < 0) {
+        return { ok: false, error: { code: 'INVALID_ARGUMENT', message: `fireAfter must be a non-negative number of seconds (got ${String(payload.fireAfter)})` } }
+      }
+      delayMs = payload.fireAfter * 1000
+    } else if (payload.fireAt !== undefined) {
+      const at = new Date(payload.fireAt).getTime()
+      if (!Number.isFinite(at)) {
+        return { ok: false, error: { code: 'INVALID_ARGUMENT', message: `fireAt is not a valid date (got ${String(payload.fireAt)})` } }
+      }
+      delayMs = Math.max(0, at - Date.now())
+    }
+
     const id = typeof crypto !== 'undefined' && crypto.randomUUID
       ? crypto.randomUUID()
       : `notif-${Date.now()}-${Math.random().toString(36).slice(2)}`
 
-    const showNotification = () => {
-      const notification = new Notification(payload.title, {
-        body: payload.body,
-        tag: id,
-        data: payload.data,
-        silent: !payload.sound,
-      })
+    const showNotification = (): NativeResult<null> => {
+      try {
+        const notification = new Notification(payload.title, {
+          body: payload.body,
+          tag: id,
+          data: payload.data,
+          silent: !payload.sound,
+        })
 
-      _activeNotifications.set(id, notification)
+        _activeNotifications.set(id, notification)
 
-      notification.onclick = () => {
-        const response: NotificationResponse = {
-          id,
-          action: 'default',
-          payload,
+        notification.onclick = () => {
+          const response: NotificationResponse = {
+            id,
+            action: 'default',
+            payload,
+          }
+          _responseCallbacks.forEach((cb) => cb(response))
         }
-        _responseCallbacks.forEach((cb) => cb(response))
-      }
 
-      notification.onclose = () => {
-        _activeNotifications.delete(id)
+        notification.onclose = () => {
+          _activeNotifications.delete(id)
+        }
+        return { ok: true, value: null }
+      } catch (err) {
+        // Constructor errors surface instead of vanishing in a timer
+        // (NF-NR-11); immediate deliveries return them to the caller,
+        // delayed ones are reported on the console with their id.
+        const message = err instanceof Error ? err.message : String(err)
+        if (delayMs === 0) {
+          return { ok: false, error: { code: 'UNAVAILABLE', message } }
+        }
+        console.error(`[neutron-native/notifications] scheduled notification ${id} failed to construct: ${message}`)
+        return { ok: false, error: { code: 'UNAVAILABLE', message } }
       }
-    }
-
-    // Determine delay
-    let delayMs = 0
-    if (payload.fireAfter) {
-      delayMs = payload.fireAfter * 1000
-    } else if (payload.fireAt) {
-      delayMs = Math.max(0, new Date(payload.fireAt).getTime() - Date.now())
     }
 
     if (delayMs > 0) {
-      const timer = setTimeout(showNotification, delayMs)
+      const timer = setTimeout(() => {
+        // Fired timers clean their own records so cancel() reflects only
+        // what is genuinely still pending (NF-NR-11).
+        _scheduledTimers.delete(id)
+        showNotification()
+      }, delayMs)
       _scheduledTimers.set(id, timer)
-    } else {
-      showNotification()
+      return { ok: true, value: id }
     }
 
+    const immediate = showNotification()
+    if (!immediate.ok) {
+      return { ok: false, error: immediate.error }
+    }
     return { ok: true, value: id }
   },
 

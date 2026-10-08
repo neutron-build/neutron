@@ -51,6 +51,16 @@ export async function build(): Promise<void> {
   const cwd = process.cwd();
   const routesDir = path.resolve(cwd, "src/routes");
   const outputDir = path.resolve(cwd, "dist");
+  const publicArtifacts = new Set<string>();
+  const recordBrowserOutput = (result: any) => {
+    for (const build of Array.isArray(result) ? result : [result]) {
+      for (const output of build?.output ?? []) {
+        // Browser emission is a public producer contract; Vite's hidden
+        // manifests/metadata are internal and never become static assets.
+        if (!output.fileName.split("/").some((part: string) => part.startsWith("."))) publicArtifacts.add(output.fileName);
+      }
+    }
+  };
   const neutronConfig = await loadNeutronConfig(cwd, { command: "build" });
   const runtime = resolveRuntime(neutronConfig);
   // JSX comes from the declared runtime, so a project needs no Vite plugin of
@@ -196,7 +206,7 @@ export async function build(): Promise<void> {
   // reach a prerendered islands page at all.
   if (appRouteCount > 0) {
     console.log("Building client bundle...");
-    await viteBuild(
+    recordBrowserOutput(await viteBuild(
       mergeConfig(userConfig, {
         oxc: oxcJsx,
         configFile: false,
@@ -238,7 +248,7 @@ export async function build(): Promise<void> {
           manifest: true,
         },
       })
-    );
+    ));
   } else {
     console.log("Building CSS bundle (static site)...");
     const cssEntryDir = path.join(cwd, ".neutron");
@@ -267,7 +277,7 @@ export async function build(): Promise<void> {
       cssEntryPath,
       importLines.join("\n") + `\nexport const __keep = [${keepRefs.join(", ")}];\n`
     );
-    await viteBuild(
+    recordBrowserOutput(await viteBuild(
       mergeConfig(userConfig, {
         oxc: oxcJsx,
         configFile: false,
@@ -314,7 +324,7 @@ export async function build(): Promise<void> {
           manifest: true,
         },
       })
-    );
+    ));
     try { fs.unlinkSync(cssEntryPath); } catch {}
     // Remove the JS lib output from the CSS-extraction build — we only need
     // the extracted CSS. Preserve any JS files that were copied here from
@@ -336,6 +346,18 @@ export async function build(): Promise<void> {
     }
   }
 
+  const publicSource = userConfig.publicDir === false ? null : path.resolve(cwd, typeof userConfig.publicDir === "string" ? userConfig.publicDir : "public");
+  const recordPublicSource = (dir: string, prefix = "") => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isSymbolicLink() || entry.name.startsWith(".")) continue;
+      const relative = prefix + entry.name;
+      if (entry.isDirectory()) recordPublicSource(path.join(dir, entry.name), relative + "/");
+      else if (entry.isFile()) publicArtifacts.add(relative);
+    }
+  };
+  if (publicSource) recordPublicSource(publicSource);
+
   const clientEntryScriptSrc = extractClientEntryScriptSrc(outputDir);
   if (clientEntryScriptSrc) {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
@@ -347,7 +369,7 @@ export async function build(): Promise<void> {
   // each island into its own chunk. Prerendered static pages with islands
   // reference THIS entry instead of the 34KB index-*.js.
   if (hasIslands) {
-    await viteBuild(
+    recordBrowserOutput(await viteBuild(
       mergeConfig(userConfig, {
         oxc: oxcJsx,
         configFile: false,
@@ -372,7 +394,7 @@ export async function build(): Promise<void> {
           },
         },
       })
-    );
+    ));
   }
 
   // Standalone islands entry chunk (tiny runtime + per-island code-split chunks).
@@ -591,7 +613,7 @@ export async function build(): Promise<void> {
   // modules, not derived facts, through the same helper the standalone
   // renderer uses; a rejected build throws before it can leave a deployable
   // partial dist behind.
-  await assertStaticRoutesUngated(staticRoutes, { loadRouteModule, getLayoutChain });
+  await assertStaticRoutesUngated(staticRoutes, { loadRouteModule, getLayoutChain, globalMiddleware: ["ts", "tsx", "js", "mjs"].some(ext => fs.existsSync(path.join(cwd, "src", `middleware.${ext}`))) });
 
   let renderedCount = 0;
   let skippedCount = 0;
@@ -632,6 +654,7 @@ export async function build(): Promise<void> {
               const outPath = getResourceOutputPath(outputDir, resolvedPath);
               fs.mkdirSync(path.dirname(outPath), { recursive: true });
               fs.writeFileSync(outPath, body);
+                  publicArtifacts.add(path.relative(outputDir, outPath).split(path.sep).join("/"));
               console.log(`  ${resolvedPath} → ${path.relative(outputDir, outPath)}`);
               renderedCount++;
             }
@@ -658,6 +681,7 @@ export async function build(): Promise<void> {
             const outPath = getResourceOutputPath(outputDir, route.path);
             fs.mkdirSync(path.dirname(outPath), { recursive: true });
             fs.writeFileSync(outPath, body);
+                publicArtifacts.add(path.relative(outputDir, outPath).split(path.sep).join("/"));
             console.log(`  ${route.path} → ${path.relative(outputDir, outPath)}`);
             renderedCount++;
             continue;
@@ -752,6 +776,7 @@ export async function build(): Promise<void> {
           const outPath = getOutputPath(outputDir, resolvedPath);
           fs.mkdirSync(path.dirname(outPath), { recursive: true });
           fs.writeFileSync(outPath, fullHtml);
+          publicArtifacts.add(path.relative(outputDir, outPath).split(path.sep).join("/"));
 
           const routeHeaders = await resolveRouteHeaders(
             route,
@@ -834,6 +859,7 @@ export async function build(): Promise<void> {
       const outPath = getOutputPath(outputDir, route.path);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, fullHtml);
+      publicArtifacts.add(path.relative(outputDir, outPath).split(path.sep).join("/"));
 
       const routeHeaders = await resolveRouteHeaders(
         route,
@@ -873,6 +899,7 @@ export async function build(): Promise<void> {
         static: staticRouteCount,
         app: appRouteCount,
       },
+      publicArtifacts: [...publicArtifacts].filter(file => fs.existsSync(path.join(outputDir, file))),
       clientEntryScriptSrc,
       ensureRuntimeBundle,
       log: (message: string) => {
@@ -1310,7 +1337,7 @@ function collectRuntimeRoutes(routes: Route[], appRoutes: Route[]): RuntimeRoute
     }));
 }
 
-function generateRuntimeEntrySource(
+export function generateRuntimeEntrySource(
   runtimeRoutes: RuntimeRouteDef[],
   appRoutes: Route[],
   clientEntryScriptSrc: string | null,
@@ -1324,10 +1351,7 @@ function generateRuntimeEntrySource(
   // Prepend an optional global middleware (outermost) in the generated entry.
   // Only references __globalMiddlewareModule when its import was emitted.
   const globalMiddlewareDecl = globalMiddlewarePath
-    ? "const GLOBAL_MIDDLEWARE = (() => {\n" +
-      "  const __gmExport = __globalMiddlewareModule.middleware ?? __globalMiddlewareModule.default;\n" +
-      "  return typeof __gmExport === 'function' ? [__gmExport] : (Array.isArray(__gmExport) ? __gmExport.filter((f) => typeof f === 'function') : []);\n" +
-      "})();"
+    ? "const GLOBAL_MIDDLEWARE = normalizeMiddlewareExport(__globalMiddlewareModule.middleware ?? __globalMiddlewareModule.default);"
     : "const GLOBAL_MIDDLEWARE = [];";
   const routeDefs: string[] = [];
   const appRouteIds = appRoutes.map((route) => route.id);
@@ -1354,7 +1378,7 @@ function generateRuntimeEntrySource(
   },`);
   });
 
-  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore } from "@neutron-build/core/runtime-edge";
+  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
 ${imports.join("\n")}
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
@@ -1416,11 +1440,14 @@ async function handleNeutronRequestInner(request) {
     routeModules.set(route.id, ROUTE_MODULES[route.id] || {});
   }
 
-  if (isMutationMethod(request.method)) {
-    await LOADER_DATA_CACHE.deleteByPath(effectivePathname);
-  }
+  const mutation = isMutationMethod(request.method);
+  const finishMutation = await beginCacheMutation(mutation, effectivePathname, [LOADER_DATA_CACHE]);
+  const generation = await LOADER_DATA_CACHE.getGeneration();
+  let response;
+  let renderFailed = false;
+  try {
 
-  const response = await renderAppRoute(
+  response = mutableResponse(await renderAppRoute(
     request,
     { route: match.route, params: match.params, layouts },
     routeModules,
@@ -1428,6 +1455,7 @@ async function handleNeutronRequestInner(request) {
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
       stylesheetHrefs: CLIENT_STYLESHEET_HREFS,
       loaderDataCache: LOADER_DATA_CACHE,
+      loaderCacheFence: { generation, stillValid: () => true },
       requestTrace: {
         requestId: String(++__requestSeq),
         method: request.method,
@@ -1435,9 +1463,15 @@ async function handleNeutronRequestInner(request) {
       },
       globalMiddleware: GLOBAL_MIDDLEWARE,
     }
-  );
+  ));
+  } catch (error) {
+    renderFailed = true;
+    throw error;
+  } finally {
+    try { await finishMutation(); } catch (error) { if (!renderFailed) throw error; }
+  }
 
-  if (isMutationMethod(request.method)) {
+  if (mutation) {
     await applyMutationInvalidationToLoaderDataCache(effectivePathname, response);
   }
 
@@ -1481,22 +1515,6 @@ function getLayoutChain(route) {
   return layouts;
 }
 
-function normalizePathname(pathname) {
-  let decoded;
-  try {
-    decoded = decodeURIComponent(pathname || "/");
-  } catch {
-    return null;
-  }
-
-  if (!decoded.startsWith("/") || decoded.includes("..")) {
-    return null;
-  }
-  if (decoded.length > 1 && decoded.endsWith("/")) {
-    return decoded.slice(0, -1);
-  }
-  return decoded;
-}
 
 function applyRouteRuleHeaders(response, pathname) {
   const matches = resolveRouteRuleHeaders(ROUTE_RULES, pathname);
@@ -1534,20 +1552,21 @@ async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
       return;
     }
     if (token === "self") {
-      await LOADER_DATA_CACHE.deleteByPath(pathname);
+      await LOADER_DATA_CACHE.deleteByPath(encodeCacheInvalidationPath(pathname));
       continue;
     }
     const normalized = normalizePathname(token);
     if (normalized) {
-      await LOADER_DATA_CACHE.deleteByPath(normalized);
+      await LOADER_DATA_CACHE.deleteByPath(encodeCacheInvalidationPath(normalized));
     }
   }
 }
 
 // Apply baseline security headers to every response from the production handler
 // (the dev server does this already; the generated handler must match).
-export async function handleNeutronRequest(request) {
-  const response = await handleNeutronRequestInner(request);
+export async function handleNeutronRequest(request, transport) {
+  if (typeof transport?.remoteAddress === "string") installTransportPeer(request, transport.remoteAddress);
+  const response = mutableResponse(await handleNeutronRequestInner(request));
   const defaults = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",

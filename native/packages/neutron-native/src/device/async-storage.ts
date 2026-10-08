@@ -44,6 +44,49 @@ const _memStore = new Map<string, string>()
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /**
+ * expo-secure-store cannot enumerate or bulk-clear its keys. Every key this
+ * module writes through that backend is therefore ALSO recorded in a durable
+ * app-owned index (stored in the backend itself), so listing and clearing
+ * target exactly what we wrote (NF-NR-07). `clear()` never resolves success
+ * unless every indexed persistent key was actually removed.
+ */
+const SECURE_INDEX_KEY = '__neutron_storage_index__'
+
+async function readSecureIndex(secureStore: any): Promise<string[]> {
+  try {
+    const raw = await secureStore.getItemAsync(SECURE_INDEX_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed.filter(k => typeof k === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+async function writeSecureIndex(secureStore: any, keys: string[]): Promise<void> {
+  await secureStore.setItemAsync(SECURE_INDEX_KEY, JSON.stringify(keys.sort()))
+}
+
+/**
+ * Merge externally-known keys into the durable index (explicit legacy
+ * migration for values written before the index existed).
+ */
+export async function importLegacySecureKeys(keys: string[]): Promise<void> {
+  const secureStore = getExpoSecureStore()
+  if (!secureStore) return
+  const index = new Set(await readSecureIndex(secureStore))
+  for (const key of keys) index.add(key)
+  await writeSecureIndex(secureStore, Array.from(index))
+}
+
+/** Thrown by clear() when some persistent keys could not be removed. */
+export class IncompleteClearError extends Error {
+  constructor(public readonly remainingKeys: string[]) {
+    super(`clear() could not remove ${remainingKeys.length} persistent key(s): ${remainingKeys.join(', ')}`)
+    this.name = 'IncompleteClearError'
+  }
+}
+
+/**
  * Get a value by key from persistent storage.
  *
  * @param key - The storage key.
@@ -74,9 +117,6 @@ export async function getItem(key: string): Promise<string | null> {
 /**
  * Set a key-value pair in persistent storage.
  *
- * @param key - The storage key.
- * @param value - The string value to store.
- *
  * @example
  * ```ts
  * import { setItem } from '@neutron-build/native/device/async-storage'
@@ -93,6 +133,13 @@ export async function setItem(key: string, value: string): Promise<void> {
   const secureStore = getExpoSecureStore()
   if (secureStore) {
     await secureStore.setItemAsync(key, value)
+    // Failure-safe index update: a failed update after a successful write
+    // leaves an unindexed (orphan) value — a leak, never data loss.
+    const index = new Set(await readSecureIndex(secureStore))
+    if (!index.has(key)) {
+      index.add(key)
+      await writeSecureIndex(secureStore, Array.from(index))
+    }
     return
   }
 
@@ -101,8 +148,6 @@ export async function setItem(key: string, value: string): Promise<void> {
 
 /**
  * Remove a key from persistent storage.
- *
- * @param key - The storage key to remove.
  *
  * @example
  * ```ts
@@ -120,6 +165,10 @@ export async function removeItem(key: string): Promise<void> {
   const secureStore = getExpoSecureStore()
   if (secureStore) {
     await secureStore.deleteItemAsync(key)
+    const index = new Set(await readSecureIndex(secureStore))
+    if (index.delete(key)) {
+      await writeSecureIndex(secureStore, Array.from(index))
+    }
     return
   }
 
@@ -129,7 +178,9 @@ export async function removeItem(key: string): Promise<void> {
 /**
  * Get all storage keys.
  *
- * @returns Array of all stored keys.
+ * With the SecureStore backend this returns the durable app-owned index —
+ * exactly the keys this module wrote (plus any merged via
+ * `importLegacySecureKeys`).
  *
  * @example
  * ```ts
@@ -145,15 +196,21 @@ export async function getAllKeys(): Promise<string[]> {
     return Array.isArray(keys) ? keys : []
   }
 
-  // expo-secure-store does not support listing keys
-  // Return in-memory keys as fallback
+  const secureStore = getExpoSecureStore()
+  if (secureStore) {
+    return readSecureIndex(secureStore)
+  }
+
   return Array.from(_memStore.keys())
 }
 
 /**
  * Clear all data from persistent storage.
  *
- * Use with caution — this removes all keys and values.
+ * Use with caution — this removes all keys and values. With the SecureStore
+ * backend, every indexed persistent key is deleted individually; if any
+ * deletion fails the call REJECTS with the remaining keys instead of
+ * claiming success (NF-NR-07).
  *
  * @example
  * ```ts
@@ -168,21 +225,35 @@ export async function clear(): Promise<void> {
     return
   }
 
-  // expo-secure-store does not support clear; remove known keys from memory
+  const secureStore = getExpoSecureStore()
+  if (secureStore) {
+    const index = await readSecureIndex(secureStore)
+    const remaining: string[] = []
+    for (const key of index) {
+      try {
+        await secureStore.deleteItemAsync(key)
+      } catch {
+        remaining.push(key)
+      }
+    }
+    if (remaining.length > 0) {
+      // Keep the failed keys indexed so a retry targets exactly them.
+      await writeSecureIndex(secureStore, remaining)
+      throw new IncompleteClearError(remaining)
+    }
+    await writeSecureIndex(secureStore, [])
+    return
+  }
+
   _memStore.clear()
 }
-
 /**
- * Get multiple values by keys in a single batch operation.
- *
- * @param keys - Array of storage keys.
- * @returns Array of [key, value] pairs. Value is null if key does not exist.
+ * Get multiple values for a set of keys.
  *
  * @example
  * ```ts
  * import { multiGet } from '@neutron-build/native/device/async-storage'
- * const results = await multiGet(['user.name', 'user.email'])
- * results.forEach(([key, value]) => console.log(key, value))
+ * const pairs = await multiGet(['user.name', 'user.email'])
  * ```
  */
 export async function multiGet(
@@ -223,7 +294,7 @@ export async function multiSet(pairs: [string, string][]): Promise<void> {
     return
   }
 
-  // Fall back to individual setItem calls
+  // Fall back to individual setItem calls (index-aware per key)
   for (const [key, value] of pairs) {
     await setItem(key, value)
   }
@@ -231,8 +302,6 @@ export async function multiSet(pairs: [string, string][]): Promise<void> {
 
 /**
  * Remove multiple keys in a single batch operation.
- *
- * @param keys - Array of storage keys to remove.
  *
  * @example
  * ```ts
@@ -258,9 +327,6 @@ export async function multiRemove(keys: string[]): Promise<void> {
  * Both values must be valid JSON strings. The merge performs a shallow merge
  * of the parsed objects.
  *
- * @param key - The storage key.
- * @param value - JSON string to merge with the existing value.
- *
  * @example
  * ```ts
  * import { mergeItem } from '@neutron-build/native/device/async-storage'
@@ -276,7 +342,7 @@ export async function mergeItem(key: string, value: string): Promise<void> {
     return
   }
 
-  // Manual merge fallback
+  // Manual merge fallback (setItem keeps the SecureStore index accurate)
   const existing = await getItem(key)
   if (existing) {
     try {

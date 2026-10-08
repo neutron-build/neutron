@@ -59,3 +59,13 @@ describe("server islands capability binding", () => {
     expect(url.searchParams.get("t")).toMatch(/^[0-9a-f]{32}$/);
   });
 });
+
+it('TS-F21 escapes closing-script input while retaining the logical DOM id', () => {
+  const id = '</script><script>fixture</script>';
+  const html = renderToString(h(ServerIsland, { id, children: h('div', null, 'safe') }));
+  expect(html.match(/<script(?:\s|>)/g)).toHaveLength(1);
+  const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/)![1];
+  expect(script).not.toContain('</script>');
+  const literal = script.match(/getElementById\(([^\n]+)\);/)![1];
+  expect(JSON.parse(literal)).toBe(id);
+});

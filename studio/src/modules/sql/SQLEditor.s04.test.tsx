@@ -276,3 +276,28 @@ describe('SQLEditor — saved queries keep working', () => {
     expect(await screen.findByLabelText('$1')).toBeTruthy()
   })
 })
+
+describe('final SQL admission and auxiliary history', () => {
+  it.each(['SELECT $0','SELECT $1025','SELECT $' + '9'.repeat(400)])('refuses %s in the real editor before allocation/transport', async sql => {
+    render(<SQLEditor tabId="final-invalid" />)
+    await setDoc(sql)
+    await screen.findByText('Parameter index must be between $1 and $1024')
+    expect(document.querySelectorAll('fieldset input')).toHaveLength(0)
+    expect((screen.getByRole('button',{name:'▶ Run'}) as HTMLButtonElement).disabled).toBe(true)
+    await fireEvent.keyDown(document.querySelector('.cm-content')!,{key:'Enter',ctrlKey:true})
+    expect(query).not.toHaveBeenCalled()
+  })
+  it.each(['setItem','getItem'] as const)('a successful write remains authoritative when history %s fails',async method => {
+    render(<SQLEditor tabId="final-history" />)
+    await setDoc('INSERT INTO users VALUES (1)')
+    query.mockResolvedValueOnce(ok({columns:[],rows:[],rowCount:1,duration:17}))
+    const fail=vi.spyOn(localStorage,method).mockImplementation(()=>{throw new Error('quota/unavailable')})
+    try {
+      await fireEvent.click(screen.getByRole('button',{name:'▶ Run'}))
+      await waitFor(()=>expect(toasts.value.some(t=>t.message==='Query completed; history could not be saved')).toBe(true))
+      expect(toasts.value.some(t=>t.kind==='error')).toBe(false)
+      expect(screen.queryByText('quota/unavailable')).toBeNull()
+      expect(query).toHaveBeenCalledTimes(1)
+    } finally { fail.mockRestore() }
+  })
+})

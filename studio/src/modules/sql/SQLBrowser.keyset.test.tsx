@@ -1,3 +1,4 @@
+import { commitReceiptFor } from '../../lib/commitFixture'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact'
 import { activeConnection, schema, stagedEdits, clearStaged, toasts, tableDataRevision, commitStaged } from '../../lib/store'
@@ -85,7 +86,7 @@ describe('SQLBrowser native bigint keyset integration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh rows' })); await screen.findByText('draft survives')
     expect(tablePage).toHaveBeenLastCalledWith('c1', 'public', 'notes', 200, '')
     expect(stagedEdits.value[0]).toBe(draft)
-    vi.mocked(api.commitOperations).mockResolvedValue({ operationId: 'owned-op', rowsAffected: 1 } as never)
+    vi.mocked(api.commitOperations).mockImplementation(async input => commitReceiptFor(input.operationId, input.operations, true))
     tablePage.mockResolvedValueOnce({ ...page(1, false, 'committed DB value'), versions: ['999'] })
     await act(async () => { await commitStaged('c1') })
     await screen.findByText('committed DB value')

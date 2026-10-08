@@ -12,4 +12,4 @@
 
 export type { NativeOTAConfig, UpdateManifest, UpdateStatus, OTAState } from './types.js'
 export { OTAClient } from './client.js'
-export { useOTA } from './hooks.js'
+export { useOTA, initOTA, disposeOTA } from './hooks.js'

@@ -4,14 +4,14 @@
 // in Quint for model-checker verification.
 //
 // Three property domains:
-//   1. Distributed transactions — serializability (no phantom reads)
+//   1. Distributed transactions — point-key serialization graph
 //   2. Multi-Raft — at most one leader per term
 //   3. Resharding — data is not lost during shard migration
 module conformance_test {
     import types.* from "../specs/common/types"
 
     // =========================================================================
-    // 1. Distributed Transactions — Serializability conformance
+    // 1. Distributed Transactions — Point-key serializability conformance
     // =========================================================================
 
     // Replicate the dtx model inline with extra conformance-level invariants
@@ -20,9 +20,16 @@ module conformance_test {
     pure val DTX_NODES: Set[NodeId] = Set(1, 2, 3)
     pure val DTX_MAX_TX: int = 4
     pure val DTX_IDS: Set[TxId] = 1.to(DTX_MAX_TX)
+    pure val DTX_KEYS: Set[Key] = Set(1, 2)
+
+    var dtx_reads_from: TxId -> (Key -> TxId)
+    var dtx_latest_writer: Key -> TxId
+    var dtx_rank: TxId -> int
+    var dtx_snapshot_rank: TxId -> int
 
     var dtx_state: TxId -> str
     var dtx_votes: TxId -> (NodeId -> str)
+    var dtx_outcomes: TxId -> (NodeId -> str)
     var dtx_next: TxId
     // Track committed transaction ordering for serializability check
     var dtx_commit_order: List[TxId]
@@ -32,7 +39,10 @@ module conformance_test {
 
     action dtx_init = all {
         dtx_state' = DTX_IDS.mapBy(t => "pending"),
-        dtx_votes' = DTX_IDS.mapBy(t => DTX_NODES.mapBy(n => "unknown")),
+        dtx_votes' = DTX_IDS.mapBy(t => DTX_NODES.mapBy(n => "unknown")), dtx_outcomes' = DTX_IDS.mapBy(t => DTX_NODES.mapBy(n => "unknown")),
+        dtx_reads_from' = DTX_IDS.mapBy(t => DTX_KEYS.mapBy(k => 0)),
+        dtx_latest_writer' = DTX_KEYS.mapBy(k => 0),
+        dtx_rank' = DTX_IDS.mapBy(t => 0), dtx_snapshot_rank' = DTX_IDS.mapBy(t => 0),
         dtx_next' = 1,
         dtx_commit_order' = List(),
         dtx_read_set' = DTX_IDS.mapBy(t => Set()),
@@ -44,12 +54,15 @@ module conformance_test {
         all {
             dtx_next <= DTX_MAX_TX,
             dtx_state' = dtx_state.set(tid, "pending"),
-            dtx_votes' = dtx_votes.set(tid, DTX_NODES.mapBy(n => "unknown")),
+            dtx_outcomes' = dtx_outcomes, dtx_votes' = dtx_votes.set(tid, DTX_NODES.mapBy(n => "unknown")),
+            dtx_reads_from' = dtx_reads_from.set(tid, dtx_latest_writer), dtx_snapshot_rank' = dtx_snapshot_rank.set(tid,dtx_commit_order.length()),
+            dtx_latest_writer' = dtx_latest_writer,
+            dtx_rank' = dtx_rank,
             dtx_next' = dtx_next + 1,
             dtx_commit_order' = dtx_commit_order,
             // Assign a read-write set to simulate key access
-            dtx_read_set' = dtx_read_set.set(tid, Set(tid, tid + 10)),
-            dtx_write_set' = dtx_write_set.set(tid, Set(tid)),
+            dtx_read_set' = dtx_read_set.set(tid, DTX_KEYS),
+            dtx_write_set' = dtx_write_set.set(tid, Set(1 + tid % 2)),
         }
     }
 
@@ -58,8 +71,11 @@ module conformance_test {
         node.in(DTX_NODES),
         dtx_state.get(tid) == "pending",
         dtx_votes.get(tid).get(node) == "unknown",
-        dtx_votes' = dtx_votes.set(tid, dtx_votes.get(tid).set(node, "prepared")),
+        dtx_outcomes' = dtx_outcomes, dtx_votes' = dtx_votes.set(tid, dtx_votes.get(tid).set(node, "prepared")),
         dtx_state' = dtx_state,
+        dtx_reads_from' = dtx_reads_from, dtx_snapshot_rank' = dtx_snapshot_rank,
+        dtx_latest_writer' = dtx_latest_writer,
+        dtx_rank' = dtx_rank,
         dtx_next' = dtx_next,
         dtx_commit_order' = dtx_commit_order,
         dtx_read_set' = dtx_read_set,
@@ -71,8 +87,11 @@ module conformance_test {
         node.in(DTX_NODES),
         dtx_state.get(tid) == "pending",
         dtx_votes.get(tid).get(node) == "unknown",
-        dtx_votes' = dtx_votes.set(tid, dtx_votes.get(tid).set(node, "aborted")),
+        dtx_outcomes' = dtx_outcomes, dtx_votes' = dtx_votes.set(tid, dtx_votes.get(tid).set(node, "aborted")),
         dtx_state' = dtx_state,
+        dtx_reads_from' = dtx_reads_from, dtx_snapshot_rank' = dtx_snapshot_rank,
+        dtx_latest_writer' = dtx_latest_writer,
+        dtx_rank' = dtx_rank,
         dtx_next' = dtx_next,
         dtx_commit_order' = dtx_commit_order,
         dtx_read_set' = dtx_read_set,
@@ -85,7 +104,10 @@ module conformance_test {
         DTX_NODES.forall(n => dtx_votes.get(tid).get(n) == "prepared"),
         dtx_state' = dtx_state.set(tid, "committed"),
         dtx_commit_order' = dtx_commit_order.append(tid),
-        dtx_votes' = dtx_votes,
+        dtx_outcomes' = dtx_outcomes, dtx_votes' = dtx_votes,
+        dtx_reads_from' = dtx_reads_from, dtx_snapshot_rank' = dtx_snapshot_rank,
+        dtx_latest_writer' = DTX_KEYS.mapBy(k => if (k.in(dtx_write_set.get(tid))) tid else dtx_latest_writer.get(k)),
+        dtx_rank' = dtx_rank.set(tid, dtx_commit_order.length() + 1),
         dtx_next' = dtx_next,
         dtx_read_set' = dtx_read_set,
         dtx_write_set' = dtx_write_set,
@@ -96,7 +118,10 @@ module conformance_test {
         dtx_state.get(tid) == "pending",
         DTX_NODES.exists(n => dtx_votes.get(tid).get(n) == "aborted"),
         dtx_state' = dtx_state.set(tid, "aborted"),
-        dtx_votes' = dtx_votes,
+        dtx_outcomes' = dtx_outcomes, dtx_votes' = dtx_votes,
+        dtx_reads_from' = dtx_reads_from, dtx_snapshot_rank' = dtx_snapshot_rank,
+        dtx_latest_writer' = dtx_latest_writer,
+        dtx_rank' = dtx_rank,
         dtx_next' = dtx_next,
         dtx_commit_order' = dtx_commit_order,
         dtx_read_set' = dtx_read_set,
@@ -111,37 +136,49 @@ module conformance_test {
         )
 
     // --- Conformance invariant: Atomicity ---
-    val dtx_atomicity: bool =
-        DTX_IDS.forall(t =>
-            not(dtx_state.get(t) == "committed" and dtx_state.get(t) == "aborted")
-        )
+    val dtx_atomicity: bool = DTX_IDS.forall(t => DTX_NODES.forall(n =>
+        dtx_outcomes.get(t).get(n) == "unknown" or dtx_outcomes.get(t).get(n) == dtx_state.get(t))) and
+        DTX_IDS.forall(t => DTX_NODES.forall(a => DTX_NODES.forall(b =>
+            not(dtx_outcomes.get(t).get(a) == "committed" and dtx_outcomes.get(t).get(b) == "aborted"))))
 
-    // --- Conformance invariant: Serializability (no phantom reads) ---
-    // Two committed transactions with write-read conflicts must appear
-    // in a consistent serial order. Here we check that no committed tx
-    // reads keys that another committed tx writes without ordering.
-    val dtx_serializability: bool =
-        DTX_IDS.forall(t1 =>
-            DTX_IDS.forall(t2 =>
-                (t1 != t2 and
-                 dtx_state.get(t1) == "committed" and
-                 dtx_state.get(t2) == "committed")
-                implies
-                // If t2 writes to keys that t1 reads, they must be serialized
-                // (both appear in commit_order => total order exists)
-                (dtx_write_set.get(t2).intersect(dtx_read_set.get(t1)).size() > 0
-                 implies
-                 // Both are in the commit order list
-                 dtx_commit_order.length() >= 2)
-            )
-        )
+    action dtx_deliver(tid:TxId,node:NodeId):bool = all {
+        tid.in(DTX_IDS), node.in(DTX_NODES),
+        dtx_state.get(tid) == "committed" or dtx_state.get(tid) == "aborted",
+        dtx_outcomes.get(tid).get(node) == "unknown",
+        dtx_outcomes' = dtx_outcomes.set(tid,dtx_outcomes.get(tid).set(node,dtx_state.get(tid))),
+        dtx_state' = dtx_state, dtx_votes' = dtx_votes, dtx_reads_from' = dtx_reads_from,
+        dtx_snapshot_rank' = dtx_snapshot_rank, dtx_latest_writer' = dtx_latest_writer, dtx_rank' = dtx_rank,
+        dtx_next' = dtx_next, dtx_commit_order' = dtx_commit_order,
+        dtx_read_set' = dtx_read_set, dtx_write_set' = dtx_write_set,
+    }
+
+    // Serialization graph over shared key snapshots: WW, WR and RW dependencies.
+    // Point-key model only. Predicate reads/phantoms require a separate range model.
+    val dtx_edges: Set[(TxId, TxId)] = tuples(DTX_IDS, DTX_IDS).filter(((a,b)) =>
+        a != b and dtx_state.get(a) == "committed" and dtx_state.get(b) == "committed" and (
+          (dtx_write_set.get(a).intersect(dtx_write_set.get(b)).size() > 0 and dtx_rank.get(a) < dtx_rank.get(b)) or
+          DTX_KEYS.exists(k => k.in(dtx_read_set.get(b)) and dtx_reads_from.get(b).get(k) == a) or
+          DTX_KEYS.exists(k => k.in(dtx_read_set.get(a)) and k.in(dtx_write_set.get(b)) and
+            (dtx_reads_from.get(a).get(k) == 0 or dtx_rank.get(dtx_reads_from.get(a).get(k)) < dtx_rank.get(b)))
+        ))
+    val dtx_closure: Set[(TxId,TxId)] = DTX_IDS.fold(dtx_edges, (reach,k) =>
+        reach.union(tuples(DTX_IDS,DTX_IDS).filter(((a,b)) => (a,k).in(reach) and (k,b).in(reach))))
+    val dtx_serializability: bool = DTX_IDS.forall(t => not((t,t).in(dtx_closure)))
+    val dtx_conflict_observed: bool = dtx_edges.size() > 0
 
     // --- Conformance invariant: No committed tx is later aborted ---
     val dtx_committed_stable: bool =
-        dtx_commit_order.length() == 0 or
-        0.to(dtx_commit_order.length() - 1).forall(i =>
-            dtx_state.get(dtx_commit_order[i]) == "committed"
-        )
+        dtx_commit_order.length() == DTX_IDS.filter(t => dtx_state.get(t) == "committed").size() and
+        (dtx_commit_order.length() == 0 or 0.to(dtx_commit_order.length()-1).forall(i =>
+            dtx_state.get(dtx_commit_order[i]) == "committed" and
+            dtx_rank.get(dtx_commit_order[i]) == i+1))
+
+    val dtx_valid_reads_from: bool = DTX_IDS.forall(t => t >= dtx_next or DTX_KEYS.forall(k => val writer = dtx_reads_from.get(t).get(k)
+        val candidates = DTX_IDS.filter(w => dtx_state.get(w) == "committed" and
+            k.in(dtx_write_set.get(w)) and dtx_rank.get(w) <= dtx_snapshot_rank.get(t))
+        (writer == 0 and candidates.size() == 0) or
+        (writer.in(candidates) and writer != t and dtx_rank.get(writer) > 0 and
+            candidates.forall(w => dtx_rank.get(w) <= dtx_rank.get(writer)))))
 
     // Test: basic DTX conformance — commit flow preserves all invariants
     run dtx_conformance_commit_test = {
@@ -150,9 +187,9 @@ module conformance_test {
             .then(dtx_prepare(1, 1))
             .then(dtx_prepare(1, 2))
             .then(dtx_prepare(1, 3))
-            .then(dtx_commit(1))
+            .then(dtx_commit(1)).then(dtx_deliver(1,1)).then(dtx_deliver(1,2))
             .expect(dtx_commit_validity and dtx_atomicity and
-                    dtx_serializability and dtx_committed_stable)
+                    dtx_serializability and dtx_valid_reads_from and dtx_committed_stable)
     }
 
     // Test: abort preserves conformance invariants
@@ -163,7 +200,7 @@ module conformance_test {
             .then(dtx_vote_abort(1, 2))
             .then(dtx_abort(1))
             .expect(dtx_commit_validity and dtx_atomicity and
-                    dtx_serializability and dtx_committed_stable)
+                    dtx_serializability and dtx_valid_reads_from and dtx_committed_stable)
     }
 
     // Test: two concurrent transactions — one commits, one aborts
@@ -178,182 +215,81 @@ module conformance_test {
             .then(dtx_vote_abort(2, 1))
             .then(dtx_abort(2))
             .expect(dtx_commit_validity and dtx_atomicity and
-                    dtx_serializability and dtx_committed_stable)
+                    dtx_serializability and dtx_valid_reads_from and dtx_committed_stable)
     }
 
     // Test: serializability with two committed transactions
     run dtx_conformance_serial_order_test = {
         dtx_init
             .then(dtx_begin)   // tx 1
-            .then(dtx_begin)   // tx 2
             .then(dtx_prepare(1, 1))
             .then(dtx_prepare(1, 2))
             .then(dtx_prepare(1, 3))
             .then(dtx_commit(1))
+            .then(dtx_begin)   // tx 2 sees tx 1 committed writes
             .then(dtx_prepare(2, 1))
             .then(dtx_prepare(2, 2))
             .then(dtx_prepare(2, 3))
             .then(dtx_commit(2))
             .expect(dtx_commit_validity and dtx_atomicity and
-                    dtx_serializability and dtx_committed_stable and
+                    dtx_serializability and dtx_conflict_observed and dtx_committed_stable and
                     // Both commits are recorded in order
                     dtx_commit_order.length() == 2 and
                     dtx_commit_order[0] == 1 and
                     dtx_commit_order[1] == 2)
     }
 
-    // =========================================================================
-    // 2. Multi-Raft — Election safety conformance
-    // =========================================================================
-
-    pure val RAFT_NODES: Set[NodeId] = Set(1, 2, 3)
-    pure val RAFT_GROUPS: Set[GroupId] = Set(1, 2)
-
-    type ConformRaftState = {
-        current_term: Term,
-        voted_for: int,
-        log_len: int,
-        role: str,
+    // Negative control: overlapping snapshots commit write skew; graph must reject it.
+    run dtx_write_skew_witness_test = {
+        dtx_init.then(dtx_begin).then(dtx_begin)
+          .then(dtx_prepare(1,1)).then(dtx_prepare(1,2)).then(dtx_prepare(1,3)).then(dtx_commit(1))
+          .then(dtx_prepare(2,1)).then(dtx_prepare(2,2)).then(dtx_prepare(2,3)).then(dtx_commit(2))
+          .expect(dtx_conflict_observed and not(dtx_serializability))
     }
 
-    var raft_state: (NodeId, GroupId) -> ConformRaftState
+    // Erasing the commit list previously hid an actual conflicting pair.
+    run dtx_missing_conflict_pair_witness_test = dtx_init.then(dtx_begin)
+        .then(dtx_prepare(1,1)).then(dtx_prepare(1,2)).then(dtx_prepare(1,3)).then(dtx_commit(1))
+        .then(dtx_begin).then(dtx_prepare(2,1)).then(dtx_prepare(2,2)).then(dtx_prepare(2,3)).then(dtx_commit(2))
+        .then(all { dtx_commit_order' = List(), dtx_state' = dtx_state, dtx_outcomes' = dtx_outcomes, dtx_votes' = dtx_votes,
+            dtx_reads_from' = dtx_reads_from, dtx_snapshot_rank' = dtx_snapshot_rank, dtx_latest_writer' = dtx_latest_writer, dtx_rank' = dtx_rank,
+            dtx_next' = dtx_next, dtx_read_set' = dtx_read_set, dtx_write_set' = dtx_write_set })
+        .expect(dtx_conflict_observed and not(dtx_committed_stable))
 
-    action raft_init = all {
-        raft_state' = tuples(RAFT_NODES, RAFT_GROUPS).mapBy(((n, g)) =>
-            { current_term: 0, voted_for: -1, log_len: 0, role: "follower" }),
-    }
-
-    action raft_request_vote(node: NodeId, group: GroupId): bool = {
-        val st = raft_state.get((node, group))
-        val new_term = st.current_term + 1
-        all {
-            node.in(RAFT_NODES),
-            group.in(RAFT_GROUPS),
-            raft_state' = raft_state.set((node, group),
-                { ...st, current_term: new_term, role: "candidate", voted_for: node }),
-        }
-    }
-
-    action raft_win(node: NodeId, group: GroupId): bool = {
-        val st = raft_state.get((node, group))
-        all {
-            node.in(RAFT_NODES),
-            group.in(RAFT_GROUPS),
-            st.role == "candidate",
-            RAFT_NODES.forall(n => n == node or
-                raft_state.get((n, group)).role != "leader" or
-                raft_state.get((n, group)).current_term != st.current_term),
-            raft_state' = raft_state.set((node, group),
-                { ...st, role: "leader" }),
-        }
-    }
-
-    action raft_append(leader: NodeId, group: GroupId): bool = {
-        val st = raft_state.get((leader, group))
-        all {
-            leader.in(RAFT_NODES),
-            group.in(RAFT_GROUPS),
-            st.role == "leader",
-            raft_state' = raft_state.set((leader, group),
-                { ...st, log_len: st.log_len + 1 }),
-        }
-    }
-
-    action raft_step_down(node: NodeId, group: GroupId, new_term: Term): bool = {
-        val st = raft_state.get((node, group))
-        all {
-            node.in(RAFT_NODES),
-            group.in(RAFT_GROUPS),
-            new_term > st.current_term,
-            raft_state' = raft_state.set((node, group),
-                { ...st, current_term: new_term, role: "follower", voted_for: -1 }),
-        }
-    }
-
-    // Conformance invariant: at most one leader per group per term
-    val raft_election_safety: bool =
-        RAFT_GROUPS.forall(g =>
-            0.to(20).forall(t =>
-                RAFT_NODES.filter(n =>
-                    raft_state.get((n, g)).role == "leader" and
-                    raft_state.get((n, g)).current_term == t
-                ).size() <= 1
-            )
-        )
-
-    // Conformance invariant: leaders have the highest term in their group
-    // (or at least no follower has a higher term that would force step-down)
-    val raft_leader_term_dominance: bool =
-        RAFT_GROUPS.forall(g =>
-            RAFT_NODES.forall(n =>
-                raft_state.get((n, g)).role == "leader" implies
-                RAFT_NODES.forall(n2 =>
-                    n2 == n or
-                    raft_state.get((n2, g)).current_term <= raft_state.get((n, g)).current_term
-                )
-            )
-        )
-
-    // Test: election safety after single election
-    run raft_conformance_single_election_test = {
-        raft_init
-            .then(raft_request_vote(1, 1))
-            .then(raft_win(1, 1))
-            .expect(raft_election_safety and raft_leader_term_dominance)
-    }
-
-    // Test: election safety across groups
-    run raft_conformance_multi_group_test = {
-        raft_init
-            .then(raft_request_vote(1, 1))
-            .then(raft_win(1, 1))
-            .then(raft_request_vote(2, 2))
-            .then(raft_win(2, 2))
-            .expect(raft_election_safety and raft_leader_term_dominance)
-    }
-
-    // Test: step-down preserves election safety
-    run raft_conformance_step_down_test = {
-        raft_init
-            .then(raft_request_vote(1, 1))
-            .then(raft_win(1, 1))
-            .then(raft_append(1, 1))
-            .then(raft_step_down(1, 1, 5))
-            // Node 2 adopts the higher term before standing for election, so the
-            // elected leader holds the cluster's highest term.
-            .then(raft_step_down(2, 1, 5))
-            .then(raft_request_vote(2, 1))
-            .then(raft_win(2, 1))
-            .expect(raft_election_safety and raft_leader_term_dominance)
-    }
-
-    // Test: leadership succession preserves safety
-    run raft_conformance_succession_test = {
-        raft_init
-            .then(raft_request_vote(1, 1))
-            .then(raft_win(1, 1))
-            .then(raft_append(1, 1))
-            .then(raft_append(1, 1))
-            .then(raft_step_down(1, 1, 3))
-            // Node 2 adopts the cluster's current term before standing, so the
-            // new leader always holds the highest term (as real Raft requires).
-            .then(raft_step_down(2, 1, 3))
-            .then(raft_request_vote(2, 1))
-            .then(raft_win(2, 1))
-            .then(raft_append(2, 1))
-            .then(raft_step_down(2, 1, 7))
-            .then(raft_step_down(3, 1, 7))
-            .then(raft_request_vote(3, 1))
-            .then(raft_win(3, 1))
-            .expect(raft_election_safety and raft_leader_term_dominance and
-                    // Node 3 is the leader of group 1
-                    raft_state.get((3, 1)).role == "leader" and
-                    // Old leaders stepped down
-                    raft_state.get((1, 1)).role == "follower" and
-                    raft_state.get((2, 1)).role == "follower")
-    }
+    run dtx_mixed_delivered_outcomes_witness_test = dtx_init.then(dtx_begin)
+        .then(dtx_prepare(1,1)).then(dtx_prepare(1,2)).then(dtx_prepare(1,3)).then(dtx_commit(1)).then(dtx_deliver(1,1))
+        .then(all { dtx_outcomes' = dtx_outcomes.set(1,dtx_outcomes.get(1).set(2,"aborted")),
+            dtx_state' = dtx_state, dtx_votes' = dtx_votes, dtx_reads_from' = dtx_reads_from,
+            dtx_snapshot_rank' = dtx_snapshot_rank, dtx_latest_writer' = dtx_latest_writer, dtx_rank' = dtx_rank,
+            dtx_next' = dtx_next, dtx_commit_order' = dtx_commit_order,
+            dtx_read_set' = dtx_read_set, dtx_write_set' = dtx_write_set }).expect(not(dtx_atomicity))
 
     // =========================================================================
+    // 2. Concrete bounded Raft model. This is model conformance, not Rust refinement.
+    import multi_raft as raft from "../specs/nucleus/multi_raft"
+    run raft_conformance_single_election_test = raft::init
+        .then(raft::request_vote(1,1)).then(raft::deliver_vote(2,1,1)).then(raft::receive_vote(2,1,1)).then(raft::win_election(1,1))
+        .expect(raft::election_safety and raft::log_matching)
+    run raft_conformance_multi_group_test = raft::init
+        .then(raft::request_vote(1,1)).then(raft::deliver_vote(2,1,1)).then(raft::receive_vote(2,1,1)).then(raft::win_election(1,1))
+        .then(raft::request_vote(2,2)).then(raft::deliver_vote(3,2,2)).then(raft::receive_vote(3,2,2)).then(raft::win_election(2,2))
+        .expect(raft::election_safety and raft::log_matching)
+    run raft_conformance_step_down_test = raft::init
+        .then(raft::request_vote(1,1)).then(raft::deliver_vote(2,1,1)).then(raft::receive_vote(2,1,1)).then(raft::win_election(1,1))
+        .then(raft::append_entry(1,1,"first")).then(raft::replicate(1,2,1))
+        .then(raft::step_down(1,1,5)).then(raft::step_down(2,1,5))
+        .then(raft::request_vote(2,1)).then(raft::deliver_vote(1,2,1)).then(raft::receive_vote(1,2,1)).then(raft::win_election(2,1))
+        .expect(raft::election_safety and raft::log_matching)
+    run raft_conformance_succession_test = raft::init
+        .then(raft::request_vote(1,1)).then(raft::deliver_vote(2,1,1)).then(raft::receive_vote(2,1,1)).then(raft::win_election(1,1))
+        .then(raft::append_entry(1,1,"first")).then(raft::append_entry(1,1,"second"))
+        .then(raft::replicate(1,2,1)).then(raft::step_down(1,1,3)).then(raft::step_down(2,1,3))
+        .then(raft::request_vote(2,1)).then(raft::deliver_vote(1,2,1)).then(raft::receive_vote(1,2,1)).then(raft::win_election(2,1))
+        .then(raft::append_entry(2,1,"third")).then(raft::replicate(2,3,1))
+        .then(raft::step_down(2,1,7)).then(raft::step_down(3,1,7))
+        .then(raft::request_vote(3,1)).then(raft::deliver_vote(2,3,1)).then(raft::receive_vote(2,3,1)).then(raft::win_election(3,1))
+        .expect(raft::election_safety and raft::log_matching and raft::group_state.get((3,1)).role == "leader")
+
     // 3. Resharding — Data conservation conformance
     // =========================================================================
 

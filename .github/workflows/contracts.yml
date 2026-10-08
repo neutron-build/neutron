@@ -46,20 +46,8 @@ jobs:
           npx --yes ajv-cli@5 compile --spec=draft2020 -s contracts/data/schema-v2.json
           npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
             -d "contracts/data/golden/valid/*.json"
-          schema_rejectable="control-in-name index-order-invalid literal-looks-expression missing-managed non-integer-number nul-in-sqltext unknown-field unknown-version"
-          validator_only="constraint-unknown-column duplicate-index duplicate-table enum-unresolved fk-unresolved generated-with-default index-method-type-invalid pk-not-null undeclared-schema ufffd-string view-second-statement view-dollar-identifier view-cr-comment default-expression-extra-clause check-expression-extra-clause default-unterminated-doubled-quote default-unterminated-escaped-quote default-unterminated-quoted-identifier default-unterminated-nested-comment"
-          for f in $schema_rejectable; do
-            if npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
-              -d "contracts/data/golden/invalid/$f.json" >/dev/null 2>&1; then
-              echo "schema-v2.json must reject golden/invalid/$f.json (shape-level rule)"; exit 1
-            fi
-          done
-          for f in $validator_only; do
-            if ! npx --yes ajv-cli@5 validate --spec=draft2020 -s contracts/data/schema-v2.json \
-              -d "contracts/data/golden/invalid/$f.json" >/dev/null 2>&1; then
-              echo "schema-v2.json must accept golden/invalid/$f.json (cross-object rule; keep the split documented in contracts/data/README.md)"; exit 1
-            fi
-          done
+          python3 contracts/data/test_check_schema.py
+          python3 contracts/data/check_schema.py
 
       - name: Install Go
         uses: actions/setup-go@v5

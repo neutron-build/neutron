@@ -40,6 +40,7 @@ interface RouteReg {
   mode?: "static" | "app";
   hasLoader?: boolean;
   default: ComponentType;
+  load?: () => Promise<unknown>;
 }
 
 interface BootOptions {
@@ -758,6 +759,72 @@ describe("hydrate — document click interceptor", () => {
     expect(booted.app.querySelector("main .title")?.textContent).toBe("About");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+  it("TS-F16 ignores a late JSON body after navigation to another page", async () => {
+    let release!: (data: unknown) => void;
+    const late = new Promise(resolve => release = resolve);
+    const fetchMock = vi.fn(async (url: string) => url.startsWith('/a')
+      ? jsonResponse({}, { json: () => late })
+      : jsonResponse({ 'route:/b': { title: 'B' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const booted = await bootAtStart(({ h, hooks }) => {
+      const Page = () => h('p', { class: 'title' }, hooks.useLoaderData<{ title: string }>()?.title);
+      return { 'route:/start': { path: '/start', mode: 'app', default: Page }, 'route:/a': { path: '/a', mode: 'app', default: Page }, 'route:/b': { path: '/b', mode: 'app', default: Page } };
+    });
+    clickAnchor(addAnchor('/a')); await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/a', expect.anything()));
+    clickAnchor(addAnchor('/b')); await vi.waitFor(() => expect(booted.app.textContent).toContain('B'));
+    release({ 'route:/a': { title: 'STALE' } }); await flush(); await flush();
+    expect(window.location.pathname).toBe('/b'); expect(booted.app.textContent).toContain('B'); expect(window.__NEUTRON_DATA__?.['route:/a']).toBeUndefined();
+  });
+
+  it("O3 diffs against committed layout data while the first destination chunk is delayed", async () => {
+    let release!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const began = new Promise<void>(resolve => { entered = resolve; });
+    const fetchMock = vi.fn(async (_url: string, _options: { headers: Record<string, string>; signal: AbortSignal }) => jsonResponse({ layout: { org: 'a' }, two: { title: 'Two' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const booted = await bootRouter({ pathname: '/org/z/home', routeId: 'home', data: { layout: { org: 'z' }, home: {} }, routes: ({ h }) => {
+      const Page = () => h('p', null, 'page');
+      return {
+        layout: { path: '/org/:org', isLayout: true, mode: 'app', default: (props: any) => h('main', null, props.data?.org, props.children) },
+        home: { path: '/org/:org/home', parentId: 'layout', mode: 'app', default: Page },
+        one: { path: '/org/:org/one', parentId: 'layout', mode: 'app', default: Page, load: async () => { entered(); await held; return { default: Page }; } },
+        two: { path: '/org/:org/two', parentId: 'layout', mode: 'app', default: Page },
+      };
+    } });
+    clickAnchor(addAnchor('/org/a/one')); await began;
+    clickAnchor(addAnchor('/org/a/two'));
+    await vi.waitFor(() => expect(window.__NEUTRON_DATA__?.layout).toEqual({ org: 'a' }));
+    expect(fetchMock.mock.calls[0][1].headers['X-Neutron-Routes'].split(',')).toEqual(['layout', 'two']);
+    release(); await flush(); await flush();
+    expect(window.location.pathname).toBe('/org/a/two'); expect(booted.app.textContent).toContain('a');
+    expect(window.__NEUTRON_DATA__?.layout).toEqual({ org: 'a' });
+  });
+  it("O3 a delayed same-URL transition immediately aborts the older body and blocks its commit", async () => {
+    let release!: (data: unknown) => void, transition!: () => void | Promise<void>;
+    const oldBody = new Promise(resolve => { release = resolve; });
+    let calls = 0;
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => ++calls === 1
+      ? jsonResponse({}, { json: () => oldBody }) : jsonResponse({ 'route:/target': { title: 'Latest' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const booted = await bootAtStart(twoAppRoutes);
+    clickAnchor(addAnchor('/target'));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    window.__NEUTRON_VIEW_TRANSITIONS__ = true;
+    const previous = (document as any).startViewTransition;
+    (document as any).startViewTransition = (callback: () => Promise<void>) => { transition = callback; return {}; };
+    vi.spyOn(performance, 'now').mockReturnValue(100000);
+    try {
+      const { navigate } = await import('./navigate.js');
+      navigate('/target');
+      expect(fetchMock.mock.calls[0][1].signal?.aborted).toBe(true);
+      expect(transition).toBeTypeOf('function');
+      release({ 'route:/target': { title: 'STALE' } }); await flush(); await flush();
+      expect(window.__NEUTRON_DATA__?.['route:/target']).toBeUndefined();
+      await transition(); await flush();
+      expect(booted.app.textContent).toContain('Latest');
+    } finally { (document as any).startViewTransition = previous; delete window.__NEUTRON_VIEW_TRANSITIONS__; }
+  });
+
 });
 
 describe("hydrate — a not-found route never shadows the page it covers", () => {

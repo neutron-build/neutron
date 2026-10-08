@@ -91,7 +91,9 @@ export function adapterVercel(
 }
 
 function buildVercelApiHandlerSource(runtimeImportPath: string): string {
-  return `import { handleNeutronRequest } from "${runtimeImportPath}";
+  return `import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { handleNeutronRequest } from "${runtimeImportPath}";
 
 function toWebRequest(req) {
   const host = req.headers?.host || "localhost";
@@ -136,20 +138,12 @@ async function writeNodeResponse(res, response) {
     return;
   }
 
-  const reader = response.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    res.write(Buffer.from(value));
-  }
-  res.end();
+  await pipeline(Readable.fromWeb(response.body), res);
 }
 
 export default async function handler(req, res) {
   const request = toWebRequest(req);
-  const response = await handleNeutronRequest(request);
+  const response = await handleNeutronRequest(request, { remoteAddress: req.socket?.remoteAddress });
   await writeNodeResponse(res, response);
 }
 `;

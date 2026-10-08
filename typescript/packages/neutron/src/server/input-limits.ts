@@ -18,6 +18,8 @@
  * substitute the Request body downstream handlers read; the adapter can.
  */
 
+import { ProblemError } from "../core/problem.js";
+import { transportPeer, installTransportPeer } from "./peer.js";
 import type { MiddlewareFn } from "../core/types.js";
 
 /**
@@ -25,9 +27,9 @@ import type { MiddlewareFn } from "../core/types.js";
  * bytes exceed the configured cap. Mapped to a 413 by the app-level error
  * handler — the same status the Content-Length early check produces.
  */
-export class RequestBodyTooLargeError extends Error {
+export class RequestBodyTooLargeError extends ProblemError {
   constructor(readonly capBytes: number) {
-    super(`Request body exceeded the ${capBytes}-byte cap while streaming`);
+    super(413, "payload-too-large", "Payload Too Large", `Request body exceeded the ${capBytes}-byte cap while streaming`);
     this.name = "RequestBodyTooLargeError";
   }
 }
@@ -51,36 +53,68 @@ export function capRequestBody(request: Request, capBytes: number): Request {
   }
   const source = request.body.getReader();
   let seen = 0;
+  let stopped = false;
+  let cancellation: Promise<void> | undefined;
+  let streamController: ReadableStreamDefaultController<Uint8Array>;
+  const cleanup = () => request.signal.removeEventListener("abort", onAbort);
+  const cancelSource = (reason?: unknown): Promise<void> => {
+    if (cancellation) return cancellation;
+    stopped = true;
+    cleanup();
+    cancellation = source.cancel(reason).catch(() => {}).finally(() => source.releaseLock());
+    return cancellation;
+  };
+  const onAbort = () => {
+    if (stopped) return;
+    const reason = request.signal.reason ?? new DOMException("Request aborted", "AbortError");
+    streamController.error(reason);
+    void cancelSource(reason);
+  };
   const capped = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      request.signal.addEventListener("abort", onAbort, { once: true });
+      if (request.signal.aborted) onAbort();
+    },
     async pull(controller) {
-      const { done, value } = await source.read();
+      if (stopped) return;
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try { result = await source.read(); }
+      catch (error) {
+        if (!stopped) { controller.error(error); await cancelSource(error); }
+        return;
+      }
+      if (stopped) return;
+      const { done, value } = result;
       if (done) {
+        stopped = true;
+        cleanup();
+        source.releaseLock();
         controller.close();
         return;
       }
       seen += value.byteLength;
       if (seen > capBytes) {
-        // Stop reading the sender and fail the consumer: the bytes already
-        // buffered past the cap never reach the handler.
-        await source.cancel().catch(() => {});
-        controller.error(new RequestBodyTooLargeError(capBytes));
+        const error = new RequestBodyTooLargeError(capBytes);
+        controller.error(error);
+        await cancelSource(error);
         return;
       }
       controller.enqueue(value);
     },
-    cancel(reason) {
-      source.cancel(reason).catch(() => {});
-    },
+    cancel(reason) { return cancelSource(reason); },
   });
-  return new Request(request.url, {
-    method: request.method,
-    headers: request.headers,
+  const wrapped = new Request(request, {
+    signal: request.signal,
     body: capped,
     // A streaming body requires half-duplex in fetch-land Request
     // construction; without it Node's undici rejects the init. Older
     // lib.dom RequestInit typings predate the duplex option, hence the cast.
     duplex: "half",
   } as RequestInit);
+  const peer = transportPeer(request);
+  if (peer) installTransportPeer(wrapped, peer.remoteAddress);
+  return wrapped;
 }
 
 export interface InputLimitsOptions {

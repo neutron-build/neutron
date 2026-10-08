@@ -124,15 +124,37 @@ export async function requestCameraPermission(): Promise<CameraPermissionStatus>
 
   const picker = getImagePicker()
   if (picker) {
-    // react-native-image-picker requests permission implicitly on launch
-    // so we just verify with a no-op call
-    return 'granted'
+    // react-native-image-picker requests permission implicitly AT LAUNCH,
+    // not here — claiming 'granted' before any prompt fabricates consent
+    // (NF-NR-08). Ask the platform permission API; on Android request,
+    // elsewhere query-only (undetermined when not introspectable).
+    return queryPlatformCameraPermission(true)
   }
 
   throw new Error(
     '[neutron-native/device/camera] No camera package found. ' +
     'Install one of: expo-camera, react-native-image-picker'
   )
+}
+
+/** Query (and on Android optionally request) the OS camera permission.
+ * Returns 'undetermined' on platforms without a queryable permission API
+ * (iOS Info.plist state is not introspectable from JS without a peer). */
+async function queryPlatformCameraPermission(request = false): Promise<CameraPermissionStatus> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { PermissionsAndroid, Platform } = require('react-native')
+    if (Platform?.OS !== 'android') return 'undetermined'
+    const granted = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA)
+    if (granted) return 'granted'
+    if (!request) return 'denied'
+    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA)
+    return result === PermissionsAndroid.RESULTS.GRANTED ? 'granted'
+      : result === PermissionsAndroid.RESULTS.DENIED ? 'denied'
+      : 'undetermined'
+  } catch {
+    return 'undetermined'
+  }
 }
 
 /**
@@ -184,6 +206,17 @@ export async function takePicture(options: CaptureOptions = {}): Promise<CameraR
       includeExtra: options.exif ?? false,
       saveToPhotos: options.saveToGallery ?? false,
     })
+
+    if (result.errorCode) {
+      // errorCode arrives BEFORE cancellation/assets in practice — a
+      // permission failure is a typed error, never an empty "no photo"
+      // (NF-NR-08): didCancel means the USER cancelled; everything else
+      // is a failure the caller must see.
+      if (result.errorCode === 'permission') {
+        throw new Error(`[neutron-native/device/camera] Camera permission was denied or unavailable (${result.errorMessage ?? 'permission'})`)
+      }
+      throw new Error(`[neutron-native/device/camera] Camera launch failed: ${result.errorCode}${result.errorMessage ? ` — ${result.errorMessage}` : ''}`)
+    }
 
     if (result.didCancel || !result.assets?.length) return null
 

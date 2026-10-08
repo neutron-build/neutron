@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tauri::plugin::TauriPlugin;
-use tauri::Wry;
+use tauri::{Manager, Wry};
 
 pub fn init() -> TauriPlugin<Wry> {
     tauri::plugin::Builder::new("neutron-window-state")
@@ -22,8 +22,15 @@ pub struct WindowState {
 }
 
 #[tauri::command]
-async fn save_window_state(label: String, state: WindowState) -> Result<(), String> {
-    let path = state_file_path(&label);
+async fn save_window_state(
+    app: tauri::AppHandle,
+    label: String,
+    state: WindowState,
+) -> Result<(), String> {
+    let path = state_file_path(
+        &app.path().app_data_dir().map_err(|e| e.to_string())?,
+        &label,
+    )?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -33,8 +40,14 @@ async fn save_window_state(label: String, state: WindowState) -> Result<(), Stri
 }
 
 #[tauri::command]
-async fn load_window_state(label: String) -> Result<Option<WindowState>, String> {
-    let path = state_file_path(&label);
+async fn load_window_state(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<Option<WindowState>, String> {
+    let path = state_file_path(
+        &app.path().app_data_dir().map_err(|e| e.to_string())?,
+        &label,
+    )?;
     if !path.exists() {
         return Ok(None);
     }
@@ -43,11 +56,15 @@ async fn load_window_state(label: String) -> Result<Option<WindowState>, String>
     Ok(Some(state))
 }
 
-fn state_file_path(label: &str) -> std::path::PathBuf {
-    let base = dirs::data_dir().expect("no data directory");
-    base.join("com.neutron.desktop")
-        .join("window-state")
-        .join(format!("{label}.json"))
+fn state_file_path(base: &std::path::Path, label: &str) -> Result<std::path::PathBuf, String> {
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Invalid window label".into());
+    }
+    Ok(base.join("window-state").join(format!("{label}.json")))
 }
 
 #[cfg(test)]
@@ -71,7 +88,8 @@ mod tests {
 
     #[test]
     fn test_window_state_deserialize() {
-        let json = r#"{"x":50,"y":50,"width":800,"height":600,"maximized":true,"fullscreen":false}"#;
+        let json =
+            r#"{"x":50,"y":50,"width":800,"height":600,"maximized":true,"fullscreen":false}"#;
         let state: WindowState = serde_json::from_str(json).unwrap();
         assert_eq!(state.x, 50);
         assert_eq!(state.y, 50);
@@ -103,9 +121,14 @@ mod tests {
 
     #[test]
     fn test_state_file_path_format() {
-        let path = state_file_path("main");
+        let path = state_file_path(std::path::Path::new("/app-a"), "main").unwrap();
         let path_str = path.to_string_lossy();
-        assert!(path_str.contains("com.neutron.desktop"));
+        assert!(path_str.contains("app-a"));
+        assert_ne!(
+            path,
+            state_file_path(std::path::Path::new("/app-b"), "main").unwrap()
+        );
+        assert!(state_file_path(std::path::Path::new("/app-a"), "../escape").is_err());
         assert!(path_str.contains("window-state"));
         assert!(path_str.ends_with("main.json"));
     }

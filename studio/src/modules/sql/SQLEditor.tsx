@@ -189,7 +189,9 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
   }, [cmReady.value, schema.value, completionSchema.value])
 
   // Size the parameter inputs to the statement, keeping entered values.
-  const paramCount = parameterCount(sqlText.value)
+  let paramCount = 0
+  let parameterError: string | null = null
+  try { paramCount = parameterCount(sqlText.value) } catch (err) { parameterError = String(err instanceof Error ? err.message : err) }
   useEffect(() => {
     const current = params.value
     if (current.length === paramCount) return
@@ -242,6 +244,7 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
     if (running.value) return
     const sqlSource = getSql()
     if (!sqlSource.trim()) return
+    try { parameterCount(sqlSource) } catch (err) { toast('error', String(err instanceof Error ? err.message : err)); return }
     const requestId = newRequestId()
     const bound = boundParams()
     running.value = { kind: 'query', requestId }
@@ -251,7 +254,7 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
     try {
       const res = await api.query(sqlSource, conn.id, bound, requestId)
       output.value = { kind: 'result', result: res.error ? { ...res, error: friendlyError(res.error) } : res }
-      pushHistory(conn.id, {
+      try { pushHistory(conn.id, {
         sql: sqlSource.trim(),
         executedAt: new Date().toISOString(),
         duration: res.duration ?? (Date.now() - start),
@@ -260,6 +263,7 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
         status: res.canceled ? 'canceled' : res.error ? 'error' : 'ok',
       })
       history.value = loadHistory(conn.id)
+      } catch { toast('info', 'Query completed; history could not be saved') }
       // DDL from the editor changes the catalog every other view reads:
       // refresh the tree and completion sources (a refresh is harmless if
       // the heuristic over-matches).
@@ -279,6 +283,7 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
     if (running.value || explainUnavailable) return
     const sqlSource = getSql()
     if (!sqlSource.trim()) return
+    try { parameterCount(sqlSource) } catch (err) { toast('error', String(err instanceof Error ? err.message : err)); return }
     const requestId = newRequestId()
     running.value = { kind: 'explain', requestId }
     cancelRequested.value = false
@@ -439,14 +444,14 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
           <button
             class={s.explainBtn}
             onClick={runExplain}
-            disabled={busy || explainUnavailable}
+            disabled={busy || explainUnavailable || !!parameterError}
             title={explainUnavailable
               ? 'EXPLAIN is not available for Nucleus connections: its plan format and read-only guarantees are not verified'
               : analyze.value ? 'Execute the statement and show the measured plan' : 'Show the estimated plan without executing the statement'}
           >
             {analyze.value ? 'Explain Analyze' : 'Explain'}
           </button>
-          <button ref={runBtn} class={s.runBtn} onClick={runQuery} disabled={busy}>
+          <button ref={runBtn} class={s.runBtn} onClick={runQuery} disabled={busy || !!parameterError}>
             {running.value?.kind === 'query' ? 'Running…' : '▶ Run'}
           </button>
           <button
@@ -504,6 +509,7 @@ export function SQLEditor({ tabId, initialSql }: SQLEditorProps) {
         </div>
       )}
 
+      {parameterError && <div role="alert">{parameterError}</div>}
       {paramCount > 0 && (
         <fieldset class={s.params}>
           <legend>Parameters</legend>

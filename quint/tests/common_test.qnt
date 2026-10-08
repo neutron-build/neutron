@@ -5,7 +5,7 @@
 // partition symmetry, FIFO ordering within links, crash/recovery semantics,
 // and failure detector accuracy.
 module common_test {
-    import types.*
+    import types.* from "../specs/common/types"
 
     // =========================================================================
     // types.qnt — Node identity and message routing properties
@@ -23,16 +23,16 @@ module common_test {
     run node_ids_unique_test = {
         val nodes = TEST_NODES
         // 5 distinct IDs must yield a set of size 5
-        assert(nodes.size() == 5)
+        (nodes.size() == 5)
     }
 
     // Property: Constructing a Message preserves sender/receiver identity.
     run message_routing_preserves_endpoints_test = {
         val msg: Message = { from_: 1, to: 3, term: 2, payload: "write" }
         all {
-            assert(msg.from_ == 1),
-            assert(msg.to == 3),
-            assert(msg.from_ != msg.to),
+            (msg.from_ == 1),
+            (msg.to == 3),
+            (msg.from_ != msg.to),
         }
     }
 
@@ -41,8 +41,8 @@ module common_test {
         val m1: Message = { from_: 1, to: 3, term: 1, payload: "a" }
         val m2: Message = { from_: 2, to: 3, term: 1, payload: "a" }
         all {
-            assert(m1.from_ != m2.from_),
-            assert(m1 != m2),
+            (m1.from_ != m2.from_),
+            (m1 != m2),
         }
     }
 
@@ -55,7 +55,7 @@ module common_test {
             { from_: 3, to: 1, term: 0, payload: "p3" }
         )
         // All three are distinct
-        assert(msgs.size() == 3)
+        (msgs.size() == 3)
     }
 
     // Property: LogEntry index ordering is well-defined.
@@ -64,17 +64,17 @@ module common_test {
         val e2: LogEntry = { term: 1, index: 2, command: "update" }
         val e3: LogEntry = { term: 2, index: 3, command: "delete" }
         all {
-            assert(e1.index < e2.index),
-            assert(e2.index < e3.index),
-            assert(e1.term <= e2.term),
-            assert(e2.term <= e3.term),
+            (e1.index < e2.index),
+            (e2.index < e3.index),
+            (e1.term <= e2.term),
+            (e2.term <= e3.term),
         }
     }
 
     // Property: KeyRange start <= end defines a valid range.
     run key_range_well_formed_test = {
         val r: KeyRange = { start: 10, end_: 50 }
-        assert(r.start <= r.end_)
+        (r.start <= r.end_)
     }
 
     // =========================================================================
@@ -98,40 +98,40 @@ module common_test {
     // Property: All defined statuses are recognized.
     run all_statuses_valid_test = {
         all {
-            assert(is_valid_status("pending")),
-            assert(is_valid_status("prepared")),
-            assert(is_valid_status("committed")),
-            assert(is_valid_status("aborted")),
-            assert(not(is_valid_status("unknown_garbage"))),
+            (is_valid_status("pending")),
+            (is_valid_status("prepared")),
+            (is_valid_status("committed")),
+            (is_valid_status("aborted")),
+            (not(is_valid_status("unknown_garbage"))),
         }
     }
 
     // Property: Committed is a terminal state — no valid transitions out.
     run committed_is_terminal_test = {
         all {
-            assert(not(valid_transition("committed", "pending"))),
-            assert(not(valid_transition("committed", "prepared"))),
-            assert(not(valid_transition("committed", "aborted"))),
-            assert(not(valid_transition("committed", "committed"))),
+            (not(valid_transition("committed", "pending"))),
+            (not(valid_transition("committed", "prepared"))),
+            (not(valid_transition("committed", "aborted"))),
+            (not(valid_transition("committed", "committed"))),
         }
     }
 
     // Property: Aborted is a terminal state.
     run aborted_is_terminal_test = {
         all {
-            assert(not(valid_transition("aborted", "pending"))),
-            assert(not(valid_transition("aborted", "prepared"))),
-            assert(not(valid_transition("aborted", "committed"))),
-            assert(not(valid_transition("aborted", "aborted"))),
+            (not(valid_transition("aborted", "pending"))),
+            (not(valid_transition("aborted", "prepared"))),
+            (not(valid_transition("aborted", "committed"))),
+            (not(valid_transition("aborted", "aborted"))),
         }
     }
 
     // Property: No backward transitions (committed/aborted -> pending).
     run no_backward_transitions_test = {
         all {
-            assert(not(valid_transition("committed", "pending"))),
-            assert(not(valid_transition("aborted", "pending"))),
-            assert(not(valid_transition("prepared", "pending"))),
+            (not(valid_transition("committed", "pending"))),
+            (not(valid_transition("aborted", "pending"))),
+            (not(valid_transition("prepared", "pending"))),
         }
     }
 }
@@ -140,8 +140,8 @@ module common_test {
 // Network properties — uses the network module's own state variables
 // =========================================================================
 module network_test {
-    import types.*
-    import network.*
+    import types.* from "../specs/common/types"
+    import network.* from "../specs/common/network"
 
     // --- Partition symmetry ---
 
@@ -153,11 +153,11 @@ module network_test {
             partitioned' = Set(),
         }.then(
             partition(1, 2)
-        ).then(
+        ).expect(
             all {
                 // Both (1,2) and (2,1) must be in the partition set
-                assert((1, 2).in(partitioned)),
-                assert((2, 1).in(partitioned)),
+                ((1, 2).in(partitioned)),
+                ((2, 1).in(partitioned)),
             }
         )
     }
@@ -171,10 +171,10 @@ module network_test {
             partition(1, 2)
         ).then(
             heal(1, 2)
-        ).then(
+        ).expect(
             all {
-                assert(not((1, 2).in(partitioned))),
-                assert(not((2, 1).in(partitioned))),
+                (not((1, 2).in(partitioned))),
+                (not((2, 1).in(partitioned))),
             }
         )
     }
@@ -195,9 +195,9 @@ module network_test {
             send(m2)
         ).then(
             send(m3)
-        ).then(
+        ).expect(
             // At most 3 messages in transit
-            assert(messages.size() <= 3)
+            (messages.size() <= 3)
         )
     }
 
@@ -209,13 +209,12 @@ module network_test {
             partitioned' = Set(),
         }.then(
             send(m1)
+        ).expect(
+            messages.size() == 1
         ).then(
-            all {
-                assert(messages.size() == 1),
-                deliver(m1),
-            }
-        ).then(
-            assert(messages.size() == 0)
+            deliver(m1)
+        ).expect(
+            (messages.size() == 0)
         )
     }
 
@@ -229,8 +228,8 @@ module network_test {
             send(m1)
         ).then(
             drop(m1)
-        ).then(
-            assert(messages.size() == 0)
+        ).expect(
+            (messages.size() == 0)
         )
     }
 
@@ -246,14 +245,14 @@ module network_test {
             partitioned' = Set(),
         }.then(
             partition(1, 2)
-        ).then(
+        ).expect(
             // send guard: not((msg.from_, msg.to).in(partitioned))
             // With partition active, send(m) is disabled.
             // We just verify the no_fabrication invariant still holds
             // and messages stays empty after we skip the blocked send.
             all {
-                assert((1, 2).in(partitioned)),
-                assert(messages.size() == 0),
+                ((1, 2).in(partitioned)),
+                (messages.size() == 0),
                 no_fabrication,
             }
         )
@@ -272,7 +271,7 @@ module network_test {
             send(m1)
         ).then(
             send(m2)
-        ).then(
+        ).expect(
             no_fabrication
         )
     }
@@ -295,13 +294,13 @@ module network_test {
             send(m1)
         ).then(
             send(m2)
-        ).then(
+        ).expect(
             all {
                 // Both messages are in transit
-                assert(m1.in(messages)),
-                assert(m2.in(messages)),
+                (m1.in(messages)),
+                (m2.in(messages)),
                 // Can be distinguished by term for FIFO reconstruction
-                assert(m1.term < m2.term),
+                (m1.term < m2.term),
             }
         )
     }
@@ -319,12 +318,12 @@ module network_test {
             send(m2)
         ).then(
             deliver(m1)
-        ).then(
+        ).expect(
             all {
                 // m1 removed, m2 still present and uncorrupted
-                assert(not(m1.in(messages))),
-                assert(m2.in(messages)),
-                assert(m2.payload == "second"),
+                (not(m1.in(messages))),
+                (m2.in(messages)),
+                (m2.payload == "second"),
             }
         )
     }
@@ -334,8 +333,8 @@ module network_test {
 // Crash model properties — uses the crash module's own state variables
 // =========================================================================
 module crash_test {
-    import types.*
-    import crash.*
+    import types.* from "../specs/common/types"
+    import crash.* from "../specs/common/crash"
 
     // --- Crashed nodes state ---
 
@@ -346,10 +345,10 @@ module crash_test {
             crashed_nodes' = Set(),
         }.then(
             crash_node(2)
-        ).then(
+        ).expect(
             all {
-                assert(not(2.in(alive))),
-                assert(2.in(crashed_nodes)),
+                (not(2.in(alive))),
+                (2.in(crashed_nodes)),
                 node_partition,
             }
         )
@@ -365,10 +364,10 @@ module crash_test {
             crashed_nodes' = Set(2),
         }.then(
             restart_node(2)
-        ).then(
+        ).expect(
             all {
-                assert(2.in(alive)),
-                assert(not(2.in(crashed_nodes))),
+                (2.in(alive)),
+                (not(2.in(crashed_nodes))),
                 node_partition,
             }
         )
@@ -381,14 +380,14 @@ module crash_test {
             crashed_nodes' = Set(2),
         }.then(
             restart_node(2)
-        ).then(
+        ).expect(
             all {
                 // Node 1 and 3 are still alive, unaffected
-                assert(1.in(alive)),
-                assert(3.in(alive)),
+                (1.in(alive)),
+                (3.in(alive)),
                 // Node 2 is now alive too
-                assert(2.in(alive)),
-                assert(crashed_nodes.size() == 0),
+                (2.in(alive)),
+                (crashed_nodes.size() == 0),
             }
         )
     }
@@ -400,7 +399,7 @@ module crash_test {
         all {
             alive' = Set(1, 2, 3),
             crashed_nodes' = Set(),
-        }.then(
+        }.expect(
             node_partition
         )
     }
@@ -412,7 +411,7 @@ module crash_test {
             crashed_nodes' = Set(),
         }.then(
             crash_node(1)
-        ).then(
+        ).expect(
             node_partition
         )
     }
@@ -426,7 +425,7 @@ module crash_test {
             crash_node(1)
         ).then(
             restart_node(1)
-        ).then(
+        ).expect(
             node_partition
         )
     }
@@ -442,9 +441,9 @@ module crash_test {
             crashed_nodes' = Set(),
         }.then(
             crash_node(3)
-        ).then(
+        ).expect(
             // Immediately after crash, the node is in crashed_nodes
-            assert(3.in(crashed_nodes))
+            (3.in(crashed_nodes))
         )
     }
 
@@ -456,11 +455,11 @@ module crash_test {
             crashed_nodes' = Set(),
         }.then(
             crash_node(2)
-        ).then(
+        ).expect(
             all {
                 // Node 1 and 3 are alive and NOT in crashed_nodes
-                assert(1.in(alive) and not(1.in(crashed_nodes))),
-                assert(3.in(alive) and not(3.in(crashed_nodes))),
+                (1.in(alive) and not(1.in(crashed_nodes))),
+                (3.in(alive) and not(3.in(crashed_nodes))),
             }
         )
     }
@@ -477,10 +476,10 @@ module crash_test {
             crash_node(3)
         ).then(
             crash_node(5)
-        ).then(
+        ).expect(
             all {
-                assert(alive == Set(2, 4)),
-                assert(crashed_nodes == Set(1, 3, 5)),
+                (alive == Set(2, 4)),
+                (crashed_nodes == Set(1, 3, 5)),
                 node_partition,
             }
         )
@@ -500,10 +499,10 @@ module crash_test {
             crash_node(3)
         ).then(
             restart_node(2)
-        ).then(
+        ).expect(
             all {
-                assert(alive == Set(1, 2)),
-                assert(crashed_nodes == Set(3)),
+                (alive == Set(1, 2)),
+                (crashed_nodes == Set(3)),
                 node_partition,
             }
         )
@@ -520,10 +519,10 @@ module crash_test {
             crash_node(2)
         ).then(
             crash_node(3)
-        ).then(
+        ).expect(
             all {
-                assert(alive.size() == 0),
-                assert(crashed_nodes.size() == 3),
+                (alive.size() == 0),
+                (crashed_nodes.size() == 3),
                 node_partition,
             }
         ).then(
@@ -532,10 +531,10 @@ module crash_test {
             restart_node(2)
         ).then(
             restart_node(3)
-        ).then(
+        ).expect(
             all {
-                assert(alive == Set(1, 2, 3)),
-                assert(crashed_nodes.size() == 0),
+                (alive == Set(1, 2, 3)),
+                (crashed_nodes.size() == 0),
                 node_partition,
             }
         )

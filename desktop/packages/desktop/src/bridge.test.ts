@@ -15,6 +15,7 @@ function clearTauri() {
 
 function setDevMode(port?: number) {
   (window as any).__NEUTRON_DEV_MODE__ = true;
+  (window as any).__NEUTRON_DEV_TOKEN__ = 'test-dev-token';
   if (port !== undefined) {
     (window as any).__NEUTRON_DEV_PORT__ = port;
   }
@@ -23,6 +24,7 @@ function setDevMode(port?: number) {
 function clearDevMode() {
   delete (window as any).__NEUTRON_DEV_MODE__;
   delete (window as any).__NEUTRON_DEV_PORT__;
+  delete (window as any).__NEUTRON_DEV_TOKEN__;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +198,12 @@ describe('neutronFetch()', () => {
     setTauri();
     const req = new Request('https://example.com/api/data');
     await neutronFetch(req);
-    expect(fetchSpy).toHaveBeenCalledWith('https://example.com/api/data', undefined);
+    // A Request input is re-issued as a Request (method/body/headers are
+    // preserved — NF-DESK-04), never flattened to (url, init).
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const forwarded = fetchSpy.mock.calls[0][0];
+    expect(forwarded).toBeInstanceOf(Request);
+    expect((forwarded as Request).url).toBe('https://example.com/api/data');
   });
 
   it('forwards RequestInit on desktop', async () => {
@@ -212,14 +219,19 @@ describe('neutronFetch()', () => {
     setTauri();
     setDevMode();
     await neutronFetch('/api/users');
-    expect(fetchSpy).toHaveBeenCalledWith('http://127.0.0.1:3001/api/users', undefined);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const forwarded = fetchSpy.mock.calls[0][0] as Request;
+    expect(forwarded.url).toBe('http://127.0.0.1:3001/api/users');
+    expect(forwarded.headers.get('X-Neutron-Dev-Token')).toBe('test-dev-token');
   });
 
   it('uses custom dev port in dev mode', async () => {
     setTauri();
     setDevMode(5555);
     await neutronFetch('/api/users');
-    expect(fetchSpy).toHaveBeenCalledWith('http://127.0.0.1:5555/api/users', undefined);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const forwarded = fetchSpy.mock.calls[0][0] as Request;
+    expect(forwarded.url).toBe('http://127.0.0.1:5555/api/users');
   });
 
   // -- Edge cases --
@@ -309,7 +321,10 @@ describe('installFetchInterceptor()', () => {
     setDevMode(9090);
     installFetchInterceptor();
     await window.fetch('/api/data');
-    expect(originalFetch).toHaveBeenCalledWith('http://127.0.0.1:9090/api/data', undefined);
+    expect(originalFetch).toHaveBeenCalledTimes(1);
+    const forwarded = originalFetch.mock.calls[0][0] as Request;
+    expect(forwarded.url).toBe('http://127.0.0.1:9090/api/data');
+    expect(forwarded.headers.get('X-Neutron-Dev-Token')).toBe('test-dev-token');
   });
 
   it('intercepted fetch passes non-string inputs through unchanged', async () => {

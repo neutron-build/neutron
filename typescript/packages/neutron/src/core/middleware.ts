@@ -34,3 +34,12 @@ export function composeMiddleware(
     });
   };
 }
+
+/** Fail closed for every supported global middleware export shape. */
+export function normalizeMiddlewareExport(exported: unknown): MiddlewareFn[] {
+  const list = typeof exported === "function" ? [exported] : exported;
+  if (!Array.isArray(list) || list.length === 0 || list.some(fn => typeof fn !== "function")) {
+    throw new TypeError("Invalid global middleware: expected a function or nonempty array of functions");
+  }
+  return list as MiddlewareFn[];
+}

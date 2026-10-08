@@ -1,7 +1,7 @@
 import { type ComponentType } from 'react'
 import { View, Text, Pressable } from 'react-native'
-import { useComputed } from '../signals/hooks.js'
-import { routerState, navigate } from '../router/navigator.js'
+import { declaredScreens, useNavigator, NavigationDepth } from './scoped.js'
+
 import type { NavigatorProps, ScreenConfig, ScreenOptions } from './types.js'
 
 // ─── Screen registry ─────────────────────────────────────────────────────────
@@ -14,7 +14,7 @@ interface TabScreenConfig extends ScreenConfig {
   }
 }
 
-const _tabScreens: TabScreenConfig[] = []
+
 
 // ─── Tabs.Screen ──────────────────────────────────────────────────────────────
 
@@ -25,9 +25,7 @@ interface TabsScreenProps {
 }
 
 function TabsScreen({ name, component, options }: TabsScreenProps) {
-  if (!_tabScreens.find(s => s.name === name)) {
-    _tabScreens.push({ name, component, options: options ?? {} })
-  }
+  void { name, component, options }
   return null
 }
 
@@ -53,22 +51,22 @@ interface TabsProps extends NavigatorProps {
  * </Tabs>
  */
 export function Tabs({
-  children: _children,
+  children,
   initialRouteName,
   tabBarStyle,
   activeColor = ACTIVE_COLOR,
   inactiveColor = INACTIVE_COLOR,
   screenOptions,
 }: TabsProps) {
-  const activeTab = useComputed(() => routerState.value.segments[0] ?? initialRouteName ?? _tabScreens[0]?.name ?? '')
-
-  const activeScreen = _tabScreens.find(s => s.name === activeTab.value)
+  const _tabScreens = declaredScreens(children, TabsScreen) as TabScreenConfig[]
+  const nav = useNavigator(_tabScreens, initialRouteName)
+  const activeScreen = nav.active
   const ActiveComponent = activeScreen?.component
 
   return (
     <View style={{ flex: 1 }}>
       <View style={{ flex: 1 }}>
-        {ActiveComponent ? <ActiveComponent /> : null}
+        {ActiveComponent ? <NavigationDepth.Provider value={nav.depth + 1}><ActiveComponent /></NavigationDepth.Provider> : null}
       </View>
       <View style={{
         height: TAB_BAR_HEIGHT,
@@ -79,7 +77,7 @@ export function Tabs({
         ...tabBarStyle,
       }}>
         {_tabScreens.map(screen => {
-          const isFocused = screen.name === activeTab.value
+          const isFocused = screen.name === activeScreen?.name
           const color = isFocused ? activeColor : inactiveColor
           const label = screen.options?.tabBarLabel ?? screen.name
           const Icon = screen.options?.tabBarIcon
@@ -89,7 +87,7 @@ export function Tabs({
           return (
             <Pressable
               key={screen.name}
-              onPress={() => navigate(`/${screen.name}`)}
+              onPress={() => nav.select(screen.name)}
               accessible
               accessibilityRole="tab"
               accessibilityState={{ selected: isFocused }}

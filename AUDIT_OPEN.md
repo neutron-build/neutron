@@ -1355,3 +1355,195 @@ Left open from this report: none of NA-01..NA-14 remain unfixed. The report's
 per-file-rename→whole-directory staging (NA-09) were implemented at the
 per-file level only; full atomic-directory publication remains unimplemented
 and unrequested.
+
+## Neutron audit pack Pass C — TS-*/NF-* FINAL cluster (2026-10-07, branch `audit/pack-c`)
+
+Third and final pass over the 193-item neutron audit pack (`.audits/2026-10-06/
+neutron-audit-plan/`, pinned `cfa7eefe`, dated 2026-10-07 UTC). Pass C covers
+the 76 remaining items: TS-F01..21 (TS runtime/build/middleware gating),
+NF-NR-01..18 (NeutronWind styling + native runtime device/gesture/platform
+adapters), NF-STUDIO-01..14, NF-DESK-01..07, NF-NATIVE-01..06, NF-GAP-01..09
+and NF-CI-01. Base: `3380c650` (NA wave + TS-33 + Pass A + Pass B all landed).
+
+Execution note: three earlier Pass C attempts (worktrees `neutron-final-c-{ts,
+studio,platform}-20261007`, base `fa9cc9bb`) were killed mid-run by infra
+restarts with substantial uncommitted work. Their trees were salvaged (293
+files ported with zero textual conflicts; Pass B's only overlap was
+`static-gate-preflight.test.ts` and lockfiles, both clean), then every item
+was re-verified against current code, completed where unfinished, and
+re-tested. NF-NR-01..17 had no prior work and were implemented fresh.
+
+### Reconciliation against earlier landings
+
+- TS-F01 overlaps NA-04 (landed production middleware gate): NA-04 gated
+  per-route/layout middleware exports at both static pipelines; the pack adds
+  the GLOBAL-middleware case (a `src/middleware.*` file refuses to prerender
+  static routes at all) — implemented here as an extension, not a duplicate.
+- TS-33 (representation Vary) and TS-04 (variant cache key) were already
+  landed before the pack's base; the pack's cache items (TS-F06/07/08) build
+  on that state and were verified against it.
+- No Pass A/B item overlapped the NF-* clusters.
+
+### Per-item status
+
+TS cluster (typescript/): all 21 fixed. TS-F01/02/03 — global-middleware
+static gate in both `build.ts` and `render-static.ts`; generated runtime
+boots reject invalid global middleware exports (`normalizeMiddlewareExport`
+throws, import injected only when a middleware file exists); Docker adapter
+serves ONLY producer-declared `publicArtifacts` from a separate
+`.neutron-public` directory with symlink/escape rejection (runtime bundles
+no longer reachable). TS-F04/06/07/08 — cache capture separated from
+publication: reads and stores happen only after the full middleware chain
+completes; middleware and `headers()` callbacks must opt in via
+`sharedCacheSafe: true` (safe-by-default: absent flag bypasses shared
+caching); request `no-cache`/`no-store` bypass reads; full Accept values are
+keyed; body capture is byte-budgeted THROUGH the stream (`cache-capture.ts`)
+with bounded concurrent cache operations and quarantine for stores that miss
+their atomic deadline (`cache-publication.ts` + `AtomicCachePublication`
+opt-in contract). TS-F05 — loader fills fence through mutation completion in
+the generated runtime (fail-before/pass-after on literal percent paths).
+TS-F09 — `mutableResponse()` wrapper; middleware/handlers mutate real
+headers. TS-F10..12 — security package: rate-limit buckets no longer evicted
+by quota reset, CSRF origin comparison is scheme-aware, trusted-proxy mode
+no longer prioritizes unverifiable vendor identity headers. TS-F13 —
+docker/vercel stream writers honor backpressure and abort. TS-F14 —
+backslash escapes blocked via the shared `normalizePathname`. TS-F15 — body
+cap propagates cancellation and adapter transport context. TS-F16/17 —
+client stale-data fencing after async boundaries; client matcher implements
+server catch-all semantics (route-parity tests). TS-F18 — returned loader
+Responses close their observability spans. TS-F19/20 — live collections
+executed with ownership fencing (root-key canonicalization fixes
+`/var` vs `/private/var` invalidation misses); MDX `sanitize:true` refuses
+renderFactory. TS-F21 — ServerIsland JSON escaping.
+
+Studio cluster: all 14 fixed (NF-STUDIO-01..14 — wire decode, commit-completion
+staged-edit preservation, keyboard-repeat duplicate inserts, deep-link
+robustness, specialty mutation draft/error handling, document-tree property
+paths, namespace-vs-item identity, history-failure isolation, import
+preview ordering, prototype collisions, placeholder allocation, schema
+designer stale metadata, exact JSON numbers, vector SQL interpolation).
+
+Desktop cluster: all 7 fixed. NF-DESK-01 — biometrics requires a real LAContext
+evaluation (policy + localizedReason; no confirmation-dialog stand-in).
+NF-DESK-02 — updater authenticates artifacts (signature/size budget) and
+installs only the app-owned authenticated stage; persistence is explicit.
+NF-DESK-03 — default storage namespaced per app identifier with migration
+of legacy shared paths. NF-DESK-04 — the fetch bridge re-issues Requests
+preserving method/body/headers/signal (`rebuildRequest`; the ported draft's
+`new Request(url, requestObject)` treated the Request as an ignored init and
+silently flattened it to GET — the exact defect class). NF-DESK-05/06/07 —
+window builder forwards advertised config; fs/notifications report
+unsupported instead of no-op success; the dev HTTP bridge requires a dev
+token and drops wildcard CORS. NOTE: Rust fixes compile and all 25 cargo test
+groups pass + clippy 0, but no macOS/Windows native build was run locally —
+biometric/updater paths need a device/toolchain confirmation (flagged).
+
+Native cluster: all 6 fixed. NF-NATIVE-01/02 — OTA client verifies manifests
+before download and refuses unauthenticated updates; crash recovery uses a
+durable native boot-state store (new `native/modules/neutron-ota` iOS/Android
+modules with store + process acceptance fixtures). NF-NATIVE-03 —
+TurboModule registry feature-detects `get()` on JSI proxies (no assumption).
+NF-NATIVE-04 — Stack/Tabs/Drawer register their screens; navigation is
+state-driven through the shared navigator (resetRoot publication + screen
+matching). NF-NATIVE-05 — file discovery never invokes components; lazy
+loaders wrapped via `lazyRoute` (loader called by React, not discovery).
+NF-NATIVE-06 — fallback animated styles subscribe to shared values (covered
+by the RN-fallback hook layer + real-React node tests). NOTE: OTA native
+modules need Xcode/Gradle runs that don't exist locally — compile-checked by
+source review + fixtures only (flagged).
+
+NF-NR cluster (all 18 fixed): NF-NR-01/02/03 — the NeutronWind Babel plugin
+was rewritten: only zero-expression templates fold statically; dynamic or
+mixed class lists emit ONE explicitly imported `resolveClassName` call over
+the FULL original expression (no free `__nw` identifier, evaluation counts
+preserved); an existing style prop merges caller-wins with Pressable
+function-style preservation; tokens are Node-safe (no react-native import,
+screen tokens runtime-only, `leading-*` pairs with a text size into absolute
+lineHeight, `numberOfLines`-as-style removed); the Rspack loader parses
+TS+JSX itself; the package ships a real dual ESM/CJS build with a verified
+exports map. NF-NR-04 — Animated hosts resolve from the SAME provider as the
+hooks (Reanimated hosts when installed, RN Animated hosts otherwise;
+entering/exiting/layout throw without the peer). NF-NR-05 — RNGH adapter uses
+`maxDistance` (not the nonexistent `maxDist`), forwards
+simultaneousWith/requireExternalFailure through the provider graph, and
+normalizes numeric RNGH states to the string contract. NF-NR-06 — the
+PanResponder fallback is a deliberately limited adapter: disabled detectors
+never claim touches, Simultaneous over two continuous gestures throws
+explicitly, pinch re-baselines at pointer transitions and accumulates (end
+RETAINS values), pan/fail offsets and fling direction enforced, long-press
+timers cleaned via component lifecycle. NF-NR-07 — SecureStore backend keeps
+a durable app-owned key index; `clear()` deletes every indexed key or
+rejects with `IncompleteClearError(remainingKeys)`; legacy keys merge
+explicitly. NF-NR-08 — camera/location adapters never manufacture permission
+grants (platform permission API or undetermined; provider denials reach the
+caller; image-picker errorCode handled before didCancel). NF-NR-09 —
+notifications route through checkNotifications/requestNotifications on every
+platform in single AND batch shapes. NF-NR-10 — web camera stops all tracks
+and detaches srcObject on every exit path, awaits a usable frame, video
+capture is explicitly unsupported, gallery object URLs are caller-revocable.
+NF-NR-11 — web scheduling rejects repeat as unsupported, validates
+dates/delays, cleans fired timer records, surfaces constructor errors;
+notifee triggers use typed enums. NF-NR-12 — the clipboard listener fetches
+text via getStringAsync after relevant contentTypes events, generation-fenced
+against removal. NF-NR-13 — the RN→CSS bridge maps axis shorthands,
+transforms (per-function units) and length semantics, warns and drops
+native-only values. NF-NR-14 — Link uses Linking.openURL for external native
+links (accessibilityRole link); disabled web links block the browser
+navigation too; Switch is keyboard-operable with aria-disabled; TextInput
+normalizes events/labels. NF-NR-15 — Platform detection never invents a host
+('unknown' instead of android fallback; documented HermesInternal marker;
+macos/windows included in isNative); capability probes documented as
+diagnostics. NF-NR-16 — `initOTA`/`disposeOTA` exported through the barrel;
+`useOTA` subscribes via useSyncExternalStore; replaced clients are
+generation-fenced. NF-NR-17 — Android FocusTrap takes explicit
+`backgroundRoots` (hidden while active, restored on release, nested traps
+compose); without them it is documented as a modal-content hint only.
+NF-NR-18 — the 68 web/module tests and component smoke tests now exercise
+the shipped implementations (real react-test-renderer path + registry-level
+web tests against actual module objects).
+
+Assurance cluster: NF-CI-01 — the duplicate `services:` keys in the CLI
+workflow's `test` job (present at HEAD; GitHub rejects the whole workflow)
+removed, passwords aligned to the surviving pgvector block; 38 workflows
+strict-parse clean. NF-GAP-01 — schema-shape CI classifies both previously
+unclassified invalid fixtures. NF-GAP-02 — SECURITY.md no longer advertises
+"Email SOON": it states honestly that no monitored destination is
+provisioned and gives the exact enabling steps (OWNER-gated: run the
+`gh api --method PUT .../private-vulnerability-reporting` step and update
+the doc). NF-GAP-03 — quint CI runs ALL 182 declared scenarios (manifest-
+driven, seed-pinned) plus invariant simulation; NF-GAP-04/05/07 — history/
+predicate oracles and production-trace conformance added (Rust conformance
+tests incl. `production_wal_trace`); NF-GAP-06 — lean4 spec names
+strengthened with a property registry + audited axiom output (NOT compiled —
+no local Lean toolchain; canary fails closed, flagged). NF-GAP-08 — quint/
+lean/verus canaries run positive controls and reject unrelated tool
+failures as success. NF-GAP-09 — Verus deferred templates no longer carry
+true postconditions (semantic mutant controls; not compiled locally —
+flagged).
+
+### Suites at the end of this pass
+
+- typescript: `neutron` tsc clean, vitest 701 passed / 0 failed / 1 skipped
+  (was 647 at Pass B); security 53/0; cli 138/0; ops 31/0; otel 16/0.
+- studio: vitest 954/954 (74 files) + `tsc --noEmit` + vite build green.
+- native: jest 453 passed / 1 skipped (38 suites, two projects) +
+  `scripts/test-platform-host.cjs` 27/27 (real React + happy-dom) +
+  `pnpm -r typecheck` clean; styling package builds ESM+CJS with verified
+  exports.
+- desktop: `packages/desktop` vitest 107/107; `cargo check`/`test` 25
+  suites green; `cargo clippy` 0 warnings.
+- quint: `scripts/ci.sh` fully green (typecheck + simulation + 182
+  scenarios + Rust conformance); canary PASS.
+- lean4/verus: python-side tests green; toolchain-gated checks fail closed
+  locally (no elan/verus installed).
+
+Flagged for follow-up (not closable locally): lean4 elaboration + verus
+verification need their toolchains; desktop biometrics/updater and the OTA
+native modules need Xcode/Gradle device runs; the SECURITY.md private
+reporting destination is owner-gated.
+
+Left open from this pack: none of the 193 items remain unaddressed (Pass A:
+NE-01..31 + MJ; Pass B: RS-01..35 + TSD-01..14; Pass C: the 76 above). The
+pack's five platform-blocked scopes remain blocked_incomplete per its own
+coverage census — device/browser/native release suites were not exercised
+beyond the explicit tests listed here.

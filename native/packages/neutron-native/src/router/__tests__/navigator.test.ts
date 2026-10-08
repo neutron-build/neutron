@@ -140,10 +140,19 @@ describe('Router Navigator', () => {
     const mockNav = {
       navigate: jest.fn(),
       goBack: jest.fn(),
+      isReady: () => true,
+      getRootState: () => ({ index: 0, routes: [] }),
+      resetRoot: jest.fn(),
+      addListener: jest.fn(() => jest.fn()),
     }
     nav.setNavigationRef(mockNav)
     nav.navigate('/home')
-    expect(mockNav.navigate).toHaveBeenCalledWith('home', {})
+    // The bridge is state-driven: a navigation publishes the full history to
+    // React Navigation through resetRoot (name from the path), never a bare
+    // imperative navigate() that could desync from the router state.
+    expect(mockNav.resetRoot).toHaveBeenCalledWith(expect.objectContaining({
+      routes: expect.arrayContaining([expect.objectContaining({ name: 'home' })]),
+    }))
   })
 
   it('setNavigationRef bridges goBack to React Navigation', () => {
@@ -151,11 +160,19 @@ describe('Router Navigator', () => {
     const mockNav = {
       navigate: jest.fn(),
       goBack: jest.fn(),
+      isReady: () => true,
+      getRootState: () => ({ index: 0, routes: [] }),
+      resetRoot: jest.fn(),
+      addListener: jest.fn(() => jest.fn()),
     }
     nav.setNavigationRef(mockNav)
     nav.navigate('/first')
     nav.navigate('/second')
+    mockNav.resetRoot.mockClear()
     nav.goBack()
-    expect(mockNav.goBack).toHaveBeenCalled()
+    // Going back republishes the truncated history: the root ends on /first.
+    expect(mockNav.resetRoot).toHaveBeenCalled()
+    const last = mockNav.resetRoot.mock.calls[mockNav.resetRoot.mock.calls.length - 1][0]
+    expect(last.routes[last.routes.length - 1].name).toBe('first')
   })
 })

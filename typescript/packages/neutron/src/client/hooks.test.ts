@@ -798,4 +798,16 @@ describe("useSubmit error state", () => {
     await flush();
     expect(error()).toBeNull();
   });
+  it("TS-F16 ignores a submit body that arrives after leaving the form", async () => {
+    window.history.replaceState(null, '', '/form');
+    let release!: (data: unknown) => void;
+    const late = new Promise(resolve => release = resolve);
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({}, { json: () => late })));
+    const { submit } = mountPanel(); const pending = submit(makeForm({ title: 'hello' }));
+    await flush(); navigate('/destination');
+    window.__NEUTRON_DATA__ = { destination: { title: 'B' } };
+    release({ 'route:/form': { title: 'STALE' } }); await pending;
+    expect(window.__NEUTRON_DATA__).toEqual({ destination: { title: 'B' } }); expect(hasFreshPrefetch('/destination')).toBe(false);
+  });
+
 });

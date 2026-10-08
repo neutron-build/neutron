@@ -12,6 +12,29 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
   return {
     name: "docker",
     async adapt(context: AdapterBuildContext) {
+      // Public membership comes from producers, never directory discovery or
+      // a reserved-name denylist. Third-party callers must supply this contract.
+      if (!context.publicArtifacts) throw new Error("Docker adapter requires producer-issued publicArtifacts");
+      const publicRoot = path.join(context.outDir, ".neutron-public");
+      fs.mkdirSync(publicRoot, { recursive: true });
+      const publicFiles: string[] = [];
+      const realOutDir = fs.realpathSync(context.outDir);
+      for (const artifact of new Set(context.publicArtifacts)) {
+        if (!artifact || artifact.includes("\\") || artifact.includes("\0") || path.isAbsolute(artifact) || artifact.split("/").some(part => !part || part === "." || part === ".." || part.startsWith(".")) || ["server", "server.mjs", "Dockerfile", "package.json"].includes(artifact.split("/")[0])) throw new Error(`Invalid public artifact: ${artifact}`);
+        const source = path.join(context.outDir, artifact);
+        // Reject symlinks at every component; realpath also fences containment.
+        let component = context.outDir;
+        for (const part of artifact.split("/")) {
+          component = path.join(component, part);
+          if (fs.lstatSync(component).isSymbolicLink()) throw new Error(`Public artifact is a symlink: ${artifact}`);
+        }
+        const realSource = fs.realpathSync(source);
+        if (!realSource.startsWith(realOutDir + path.sep) || !fs.statSync(realSource).isFile()) throw new Error(`Invalid public artifact: ${artifact}`);
+        const destination = path.join(publicRoot, artifact);
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        fs.copyFileSync(realSource, destination);
+        publicFiles.push(artifact);
+      }
       const hasAppRoutes = context.routes.app > 0;
       let runtimeEntryImport: string | null = null;
 
@@ -26,7 +49,7 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
       }
 
       const serverPath = path.join(context.outDir, "server.mjs");
-      fs.writeFileSync(serverPath, buildDockerServerSource(runtimeEntryImport), "utf-8");
+      fs.writeFileSync(serverPath, buildDockerServerSource(runtimeEntryImport, publicFiles), "utf-8");
       context.log(`Docker server entry written: ${path.relative(context.rootDir, serverPath)}`);
 
       const dockerfilePath = path.join(context.outDir, "Dockerfile");
@@ -83,25 +106,28 @@ CMD ["node", "server.mjs"]
 `;
 }
 
-function buildDockerServerSource(runtimeEntryImport: string | null): string {
+function buildDockerServerSource(runtimeEntryImport: string | null, publicFiles: string[]): string {
   const runtimeImport = runtimeEntryImport
     ? `import { handleNeutronRequest } from "${runtimeEntryImport}";`
     : "";
   const runtimeFallback = runtimeEntryImport
-    ? `  const response = await handleNeutronRequest(webRequest);
+    ? `  const response = await handleNeutronRequest(webRequest, { remoteAddress: req.socket?.remoteAddress });
   await writeWebResponse(res, response);`
     : `  res.statusCode = 404;
   res.end("Not Found");`;
 
-  return `import { createServer } from "node:http";
-import { createReadStream, existsSync, statSync } from "node:fs";
+  return `import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createServer } from "node:http";
+import { createReadStream, existsSync, statSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 ${runtimeImport}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DIST_DIR = __dirname;
+const DIST_DIR = path.join(__dirname, ".neutron-public");
+const PUBLIC_FILES = new Set(${JSON.stringify(publicFiles)});
 const PORT = Number(process.env.PORT || 3000);
 
 const MIME_TYPES = {
@@ -139,7 +165,7 @@ ${runtimeFallback}
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(\`Neutron Docker server listening on http://0.0.0.0:\${PORT}\`);
+  console.log(\`Neutron Docker server listening on http://0.0.0.0:\${server.address().port}\`);
 });
 
 // Graceful shutdown: stop accepting new connections and let in-flight requests
@@ -169,7 +195,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 function resolveStaticPath(pathname) {
-  if (pathname.includes(String.fromCharCode(0))) {
+  if (pathname.includes(String.fromCharCode(0)) || pathname.includes(String.fromCharCode(92)) || pathname.split("/").some(segment => segment.startsWith("."))) {
     return null;
   }
   const cleaned = pathname === "/" ? "/index.html" : pathname;
@@ -180,12 +206,12 @@ function resolveStaticPath(pathname) {
     return null;
   }
 
-  if (existsSync(resolved) && statSync(resolved).isFile()) {
+  if (PUBLIC_FILES.has(path.relative(DIST_DIR, resolved).split(path.sep).join("/")) && existsSync(resolved) && realpathSync(resolved).startsWith(realpathSync(DIST_DIR) + path.sep) && statSync(resolved).isFile()) {
     return resolved;
   }
 
   const nestedIndex = path.join(resolved, "index.html");
-  if ((nestedIndex === DIST_DIR || nestedIndex.startsWith(DIST_DIR + path.sep)) && existsSync(nestedIndex) && statSync(nestedIndex).isFile()) {
+  if ((nestedIndex === DIST_DIR || nestedIndex.startsWith(DIST_DIR + path.sep)) && PUBLIC_FILES.has(path.relative(DIST_DIR, nestedIndex).split(path.sep).join("/")) && existsSync(nestedIndex) && realpathSync(nestedIndex).startsWith(realpathSync(DIST_DIR) + path.sep) && statSync(nestedIndex).isFile()) {
     return nestedIndex;
   }
 
@@ -252,15 +278,7 @@ async function writeWebResponse(res, response) {
     return;
   }
 
-  const reader = response.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    res.write(Buffer.from(value));
-  }
-  res.end();
+  await pipeline(Readable.fromWeb(response.body), res);
 }
 `;
 }

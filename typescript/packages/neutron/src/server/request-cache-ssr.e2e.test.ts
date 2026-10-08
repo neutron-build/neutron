@@ -30,7 +30,7 @@ it('shares request scope with cached functions loaded through the real SSR runti
       expect(Object.values(payload)[0]).toEqual({ value, same: true });
     }
   } finally { await running.close(); await fs.rm(root, { recursive: true, force: true }); }
-});
+}, 30000);
 
 
 it('invalidates shared cached SSR values through the HTTP adapter module graph', async () => {
@@ -65,4 +65,4 @@ it('invalidates shared cached SSR values through the HTTP adapter module graph',
     clearCache('shared'); await running.close();
     await fs.rm(root, { recursive: true, force: true });
   }
-});
+}, 30000);

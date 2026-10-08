@@ -3,7 +3,7 @@ import type {
   Schema, NucleusFeatures, QueryResult, TablePageResult,
   ColumnDetail, IndexDetail, SavedQuery, FKDetail,
   TableMeta, MutationOutcome, KeyCell, MatchCell, TableFilter, TableSort,
-  CommitResponse, PreviewResponse, OutcomeResponse, CommitOperation,
+  CommitResponse, PreviewResponse, CommitOperation,
   CancelQueryResponse, ExplainOutcome, ExplainPlan, ExplainRefusal,
   SchemaObjectDetail, SchemaChange, SchemaPlanResponse,
   DiagnosticsQueriesResponse, TableStatsResponse,
@@ -11,6 +11,14 @@ import type {
   LimitsReport, JourneyResponse,
 } from './types'
 import { decodeRows } from './wire'
+import { validateCommitReceipt, validateCommitOutcome, validateCommitFailure } from './commitReceipt'
+
+/** Resolved SQL errors are failures for writes, even with HTTP 200. */
+export async function queryMutationOrThrow(sql: string, connectionId: string, params?: unknown[], query = api.query): Promise<QueryResult> {
+  const result = await query(sql, connectionId, params)
+  if (result.error || result.canceled) throw new Error(result.error || 'Query canceled; mutation outcome must be verified before retrying')
+  return result
+}
 
 const BASE = '/api'
 
@@ -357,7 +365,10 @@ export const api = {
     connectionId: string
     operationId: string
     operations: CommitOperation[]
-  }) => mutationRequest<CommitResponse>('POST', '/table/v2/commit', input),
+  }) => mutationRequest<unknown>('POST', '/table/v2/commit', input).then(body => validateCommitReceipt(body, input.operationId, input.operations)).catch(error => {
+    if (error instanceof ApiError) validateCommitFailure(error.body, input.operationId)
+    throw error
+  }),
 
   /** Dry-run the identical validation and execution, always rolled back. */
   previewOperations: (input: {
@@ -368,7 +379,7 @@ export const api = {
   /** Resolve a recorded outcome for an operation ID (status lookup must
    *  precede any retry after a dropped response). */
   operationOutcome: (connectionId: string, operationId: string) =>
-    mutationRequest<OutcomeResponse>('POST', '/table/v2/outcome', { connectionId, operationId }),
+    mutationRequest<unknown>('POST', '/table/v2/outcome', { connectionId, operationId }).then(body => validateCommitOutcome(body, operationId)),
 
   /** Undo a committed operation list through its recorded inverse; honest
    *  refusal where the inverse cannot be exact. The revert is itself a

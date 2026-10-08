@@ -15,9 +15,20 @@ function useState<T>(initial: T | (() => T)): [T, (v: T | ((prev: T) => T)) => v
   return [value, setter]
 }
 
+// Effect cleanups are retained (not run) until flushed — matching React's
+// ownership model closely enough for lifecycle assertions.
+const effectCleanups: Array<() => void> = []
 function useEffect(fn: () => void | (() => void), _deps?: unknown[]) {
   // Execute synchronously in tests
-  fn()
+  const cleanup = fn()
+  if (typeof cleanup === 'function') effectCleanups.push(cleanup)
+}
+// @internal test hook: run and drain pending effect cleanups (unmount).
+;(useEffect as unknown as { __flushCleanups: () => void; __flushOneCleanup: () => void }).__flushCleanups = () => {
+  while (effectCleanups.length) effectCleanups.pop()!()
+}
+;(useEffect as unknown as { __flushOneCleanup: () => void }).__flushOneCleanup = () => {
+  if (effectCleanups.length) effectCleanups.pop()!()
 }
 
 function useMemo<T>(fn: () => T, _deps?: unknown[]): T {
@@ -64,6 +75,37 @@ function createElement(type: unknown, props: Record<string, unknown> | null, ...
 
 const Fragment = 'Fragment'
 
+// Minimal class component base: enough to `extend` (RouteLoadBoundary) and to
+// keep state merges working if a test constructs one directly.
+class Component<P = Record<string, unknown>, S = Record<string, unknown>> {
+  props: P
+  state: S
+  constructor(props: P) { this.props = props; this.state = {} as S }
+  setState(partial: Partial<S>, callback?: () => void): void {
+    this.state = { ...this.state, ...partial }
+    if (callback) callback()
+  }
+  render(): unknown { return null }
+}
+
+function Suspense(props: { children?: unknown; fallback?: unknown }) { return props.children }
+
+function useSyncExternalStore<T>(subscribe: (listener: () => void) => () => void, getSnapshot: () => T): T {
+  // Mock: register once so subscriptions are observable, then return the
+  // current snapshot (the real hook re-renders on listener fire).
+  subscribe(() => {})
+  return getSnapshot()
+}
+
+function lazy(load: () => Promise<{ default: unknown }>) {
+  let pending: Promise<void> | null = null
+  const Lazy = function LazyRoute() {
+    if (!pending) pending = load().then(() => undefined)
+    return null
+  }
+  return Lazy
+}
+
 export {
   useRef,
   useState,
@@ -79,6 +121,10 @@ export {
   createContext,
   createElement,
   Fragment,
+  Component,
+  Suspense,
+  lazy,
+  useSyncExternalStore,
 }
 
 export default {
@@ -96,4 +142,8 @@ export default {
   createContext,
   createElement,
   Fragment,
+  Component,
+  Suspense,
+  lazy,
+  useSyncExternalStore,
 }

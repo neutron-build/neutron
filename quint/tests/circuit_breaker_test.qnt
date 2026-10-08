@@ -1,17 +1,17 @@
 // Circuit breaker invariant tests.
 module circuit_breaker_test {
-    import circuit_breaker.*
+    import circuit_breaker.* from "../specs/framework/circuit_breaker"
 
     // Test: initial state is closed and valid
     run init_valid_test = {
-        init.then(all { valid_state, non_negative_counts, closed_under_threshold })
+        init.expect(all { valid_state, non_negative_counts, closed_under_threshold })
     }
 
     // Test: success in closed state stays closed
     run closed_success_test = {
         init
             .then(closed_success)
-            .then(all { valid_state, closed_under_threshold })
+            .expect(all { valid_state, closed_under_threshold })
     }
 
     // Test: failures below threshold stay closed
@@ -20,7 +20,7 @@ module circuit_breaker_test {
             .then(closed_failure)
             .then(closed_failure)
             .then(closed_failure)
-            .then(all { valid_state, closed_under_threshold })
+            .expect(all { valid_state, closed_under_threshold })
     }
 
     // Test: reaching failure threshold trips to open
@@ -31,7 +31,7 @@ module circuit_breaker_test {
             .then(closed_failure)
             .then(closed_failure)
             .then(closed_failure)
-            .then(all { valid_state, open_has_bounded_ticks })
+            .expect(all { valid_state, open_has_bounded_ticks })
     }
 
     // Test: open rejects requests
@@ -43,7 +43,7 @@ module circuit_breaker_test {
             .then(closed_failure)
             .then(closed_failure)
             .then(open_reject)
-            .then(all { valid_state, reject_bound })
+            .expect(all { valid_state, reject_bound })
     }
 
     // Test: full cycle closed → open → half-open → closed
@@ -64,7 +64,7 @@ module circuit_breaker_test {
             .then(half_open_success)
             .then(half_open_success)
             .then(half_open_success)
-            .then(all { valid_state, closed_under_threshold })
+            .expect(all { valid_state, closed_under_threshold })
     }
 
     // Test: half-open failure goes back to open
@@ -82,6 +82,6 @@ module circuit_breaker_test {
             .then(open_timeout)
             // Fail in half-open
             .then(half_open_failure)
-            .then(all { valid_state, open_has_bounded_ticks })
+            .expect(all { valid_state, open_has_bounded_ticks })
     }
 }

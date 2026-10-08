@@ -41,18 +41,20 @@
   "dependencies": {
     "@neutron-build/core": "workspace:^",
     "@neutron-build/create": "workspace:^",
-    "preact": "^10.25.4",
     "preact-render-to-string": "^6.5.11",
     "vite": "^8.3.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "preact": "^10.25.4"
   },
   "publishConfig": {
     "access": "public"
   },
-  "peerDependencies": {},
+  "peerDependencies": {
+    "preact": "^10.25.4"
+  },
   "engines": {
     "node": ">=22.12"
   },

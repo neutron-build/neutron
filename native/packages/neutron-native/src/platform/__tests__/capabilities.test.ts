@@ -7,6 +7,7 @@ describe('Capabilities', () => {
   const originalEnv = process.env.NODE_ENV
 
   beforeEach(() => {
+    delete g.HermesInternal
     delete g.__hermes__
     delete g.nativeFabricUIManager
     delete g.__fbRCTBridgeEnabled
@@ -17,6 +18,7 @@ describe('Capabilities', () => {
   })
 
   afterEach(() => {
+    delete g.HermesInternal
     delete g.__hermes__
     delete g.nativeFabricUIManager
     delete g.__fbRCTBridgeEnabled
@@ -26,13 +28,20 @@ describe('Capabilities', () => {
     process.env.NODE_ENV = originalEnv
   })
 
-  it('detects hermes from __hermes__', () => {
-    g.__hermes__ = true
+  it('detects hermes from the documented HermesInternal marker (NF-NR-15)', () => {
+    g.HermesInternal = { isHermes: true }
     const { Capabilities } = require('../capabilities')
     expect(Capabilities.hermes).toBe(true)
+    delete g.HermesInternal
   })
 
-  it('hermes is false when __hermes__ is absent', () => {
+  it('the undocumented __hermes__ global is not the marker', () => {
+    g.__hermes__ = true
+    const { Capabilities } = require('../capabilities')
+    expect(Capabilities.hermes).toBe(false)
+  })
+
+  it('hermes is false when HermesInternal is absent', () => {
     const { Capabilities } = require('../capabilities')
     expect(Capabilities.hermes).toBe(false)
   })
@@ -43,10 +52,10 @@ describe('Capabilities', () => {
     expect(Capabilities.fabric).toBe(true)
   })
 
-  it('detects fabric from __fbRCTBridgeEnabled === false', () => {
+  it('__fbRCTBridgeEnabled === false alone is NOT fabric (diagnostic probes only, NF-NR-15)', () => {
     g.__fbRCTBridgeEnabled = false
     const { Capabilities } = require('../capabilities')
-    expect(Capabilities.fabric).toBe(true)
+    expect(Capabilities.fabric).toBe(false)
   })
 
   it('fabric is false when neither marker exists', () => {

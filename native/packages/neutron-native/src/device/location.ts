@@ -81,7 +81,12 @@ function getExpoLocation(): any {
 
 function getCommunityGeo(): any {
   if (_communityGeo === undefined) {
-    try { _communityGeo = require('@react-native-community/geolocation') } catch { _communityGeo = null }
+    try {
+      const mod = require('@react-native-community/geolocation')
+      // The package ships a default export in some versions and a named
+      // module in others — normalize once (NF-NR-08).
+      _communityGeo = mod?.default ?? mod ?? null
+    } catch { _communityGeo = null }
   }
   return _communityGeo
 }
@@ -159,10 +164,28 @@ export async function requestLocationPermission(
 
   const geo = getCommunityGeo()
   if (geo) {
-    // @react-native-community/geolocation uses PermissionsAndroid on Android
-    // and Info.plist on iOS; requestAuthorization triggers the prompt
-    await geo.requestAuthorization?.(level === 'always' ? 'always' : 'whenInUse')
-    return 'granted' // best effort — actual status depends on user action
+    // @react-native-community/geolocation ships both a default and a named
+    // export depending on version — normalize once, and AWAIT the real
+    // authorization callback: resolving 'granted' before the user (or the
+    // OS denial) has answered fabricates consent (NF-NR-08).
+    const mod = geo.default ?? geo
+    return new Promise<LocationPermissionStatus>((resolve) => {
+      let settled = false
+      const finish = (status: LocationPermissionStatus) => {
+        if (!settled) { settled = true; resolve(status) }
+      }
+      try {
+        // requestAuthorization resolves the promise through its callbacks;
+        // absence is handled by the optional call above producing no answer,
+        // which the try/catch below converts rather than fabricating.
+        mod.requestAuthorization?.(
+          (success: unknown) => finish(success === false ? 'denied' : 'granted'),
+          (_error: unknown) => finish('denied'),
+        )
+      } catch {
+        finish('undetermined')
+      }
+    })
   }
 
   throw new Error(

@@ -5,10 +5,14 @@ on:
     branches: [main]
     paths:
       - "quint/**"
+      - ".github/scripts/test_formal_gates.py"
+      - ".github/scripts/run_with_timeout.py"
       - ".github/workflows/quint.yml"
   pull_request:
     paths:
       - "quint/**"
+      - ".github/scripts/test_formal_gates.py"
+      - ".github/scripts/run_with_timeout.py"
       - ".github/workflows/quint.yml"
   schedule:
     - cron: "0 8 * * 1"
@@ -52,3 +56,15 @@ jobs:
       - name: Run quint CI gate
         run: bash scripts/ci.sh
         working-directory: quint
+
+      - name: Real declared-scenario failure propagation
+        run: python3 quint/scripts/scenario_control.py
+
+      - name: Independent finite history oracle
+        run: python3 quint/scripts/test_history_oracle.py
+
+      - name: Public production WAL trace and real mutation
+        run: python3 quint/scripts/production_trace.py
+
+      - name: Test formal gate failure reasons
+        run: python3 .github/scripts/test_formal_gates.py

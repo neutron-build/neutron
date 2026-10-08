@@ -20,6 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate YAML without duplicate keys
+        run: |
+          python3 -m pip install PyYAML==6.0.2
+          python3 .github/scripts/check_yaml.py
+          python3 .github/scripts/test_check_yaml.py
+      - name: Security policy and formal property registries
+        run: |
+          python3 .github/scripts/check_assurance.py
+          python3 lean4/scripts/test_audit_output.py
+          python3 lean4/scripts/test_ordered_model.py
+          python3 quint/scripts/test_history_oracle.py
       - name: Check .gitignore intent matches reality
         run: python3 .github/scripts/check_ignored_not_tracked.py
 

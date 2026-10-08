@@ -55,6 +55,8 @@ export function decodeCell(value: unknown): unknown {
       // preserves precision, JSON null and documents resembling wire cells.
       try { JSON.parse(value.v) } catch { throw new WireDecodeError('invalid JSON wire document') }
       return value.v
+    case 'vector':
+    case 'tsvector':
     case 'numeric':
     case 'date':
     case 'timestamp':
@@ -63,6 +65,8 @@ export function decodeCell(value: unknown): unknown {
       // temporals keep microseconds in their canonical form.
       return value.v
   }
+  const unsupported: never = value.t
+  throw new WireDecodeError(`unsupported wire tag: ${unsupported}`)
 }
 
 /** Decode every cell of a query-result row matrix in place. */

@@ -1,3 +1,4 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useSignal } from '@preact/signals'
 import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
@@ -25,27 +26,34 @@ async function loadPlot() {
 }
 
 // --- Tiny SVG sparkline for the header stats area ---
-function Sparkline({ values }: { values: number[] }) {
+function Sparkline({ values }: { values: (number | null)[] }) {
   if (values.length < 2) return null
-  const min = Math.min(...values)
-  const max = Math.max(...values)
+  const finite = values.filter((v): v is number => v !== null)
+  if (!finite.length) return null
+  const min = Math.min(...finite)
+  const max = Math.max(...finite)
   const range = max - min || 1
   const w = 200
   const h = 40
   const pts = values.map((v, i) => {
     const x = (i / (values.length - 1)) * w
+    if (v === null) return null
     const y = h - ((v - min) / range) * (h - 4) - 2
     return `${x},${y}`
   })
   return (
     <svg width={w} height={h} class={s.sparkline}>
-      <polyline
-        points={pts.join(' ')}
+      {pts.reduce<string[][]>((segments, point) => {
+        if (point === null) segments.push([])
+        else segments[segments.length - 1].push(point)
+        return segments
+      }, [[]]).filter(segment => segment.length > 0).map((segment, i) => <polyline key={i}
+        points={segment.join(' ')}
         fill="none"
         stroke="var(--model-ts)"
         strokeWidth="1.5"
         strokeLinejoin="round"
-      />
+      />)}
     </svg>
   )
 }
@@ -53,7 +61,7 @@ function Sparkline({ values }: { values: number[] }) {
 // --- Observable Plot chart component ---
 interface TimeChartProps {
   buckets: string[]
-  values: number[]
+  values: (number | null)[]
   aggFn: string
 }
 
@@ -72,7 +80,7 @@ function TimeChart({ buckets, values, aggFn }: TimeChartProps) {
       const data = buckets.map((b, i) => ({
         time: new Date(b),
         value: values[i],
-      })).filter(d => !isNaN(d.time.getTime()) && !isNaN(d.value))
+      })).filter(d => !Number.isNaN(d.time.getTime()))
 
       if (data.length === 0) return
 
@@ -129,7 +137,7 @@ function TimeChart({ buckets, values, aggFn }: TimeChartProps) {
             tip: true,
           }),
           // Rule at y=0 if values go negative
-          ...(Math.min(...values) < 0
+          ...(values.some(value => value !== null && value < 0)
             ? [Plot.ruleY([0], { stroke: 'var(--text-tertiary)', strokeDasharray: '4,3' })]
             : []),
         ],
@@ -234,7 +242,7 @@ export function TSModule({ name }: TSModuleProps) {
   const bucketMs = useSignal(60 * 60_000)
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
-  const sparkValues = useSignal<number[]>([])
+  const sparkValues = useSignal<(number | null)[]>([])
   const bucketLabels = useSignal<string[]>([])
   const stats = useSignal<{ count: number; last: number | null } | null>(null)
   const viewMode = useSignal<ViewMode>('chart')
@@ -251,15 +259,25 @@ export function TSModule({ name }: TSModuleProps) {
   const settingRetention = useSignal(false)
 
   const conn = activeConnection.value!
+  const owner = useRequestOwner(JSON.stringify([conn.id, name]))
+  const ingestRevision = useRef(0)
+
+  function readInputChanged() {
+    owner.invalidate('query'); running.value = false; result.value = null; sparkValues.value = []; bucketLabels.value = []
+  }
 
   // Load quick stats: total point count and the last value for this series.
   function loadStats() {
+    const owns = owner.begin('stats')
+    if (!owns()) return
+    const loadedSeries = seriesName.value
     const series = seriesName.value.trim()
     if (!series) return
     api.query(
       `SELECT TS_COUNT(${sqlStr(series)}), TS_LAST(${sqlStr(series)})`,
       conn.id
     ).then(r => {
+      if (!owns() || loadedSeries !== seriesName.value) return
       if (r.error) {
         if (isRlsDenied(r.error)) rlsDenied.value = r.error
         return
@@ -275,10 +293,16 @@ export function TSModule({ name }: TSModuleProps) {
   }
 
   useEffect(() => {
+    result.value = null; stats.value = null; rlsDenied.value = null; sparkValues.value = []; bucketLabels.value = []; running.value = false
     loadStats()
-  }, [])
+  }, [conn.id, name])
 
   async function ingestPoints() {
+    if (inserting.value) return
+    const submitted = pointsInput.value
+    const revision = ingestRevision.current
+    const owns = owner.begin('ingest')
+    if (!owns()) return
     const series = seriesName.value.trim()
     if (!series) {
       toast('error', 'Set a series name first')
@@ -292,9 +316,9 @@ export function TSModule({ name }: TSModuleProps) {
     inserting.value = true
     try {
       const r = await api.query(parsed.sql, conn.id)
-      if (r.error) throw new Error(r.error)
+      if (r.error || r.canceled) throw new Error(r.error || 'Query canceled; verify the operation before retrying')
       toast('success', `Inserted ${parsed.count} point${parsed.count === 1 ? '' : 's'} into ${series}`)
-      pointsInput.value = ''
+      if (owns() && revision === ingestRevision.current && seriesName.value.trim() === series && pointsInput.value === submitted) pointsInput.value = ''
       loadStats()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -304,6 +328,7 @@ export function TSModule({ name }: TSModuleProps) {
   }
 
   async function applyRetention() {
+    if (settingRetention.value || conn.id !== activeConnection.value?.id) return
     const series = seriesName.value.trim()
     if (!series) {
       toast('error', 'Set a series name first')
@@ -318,7 +343,7 @@ export function TSModule({ name }: TSModuleProps) {
     settingRetention.value = true
     try {
       const r = await api.query(buildRetentionSql(days), conn.id)
-      if (r.error) throw new Error(r.error)
+      if (r.error || r.canceled) throw new Error(r.error || 'Query canceled; verify the operation before retrying')
       toast('success', `Retention set to ${days} day(s) — GLOBAL policy, applies to EVERY series at the next checkpoint`)
       loadStats()
     } catch (err: unknown) {
@@ -329,6 +354,11 @@ export function TSModule({ name }: TSModuleProps) {
   }
 
   async function runQuery() {
+    if (running.value) return
+    const current = owner.begin('query')
+    const setup = JSON.stringify([seriesName.value, startMs.value, endMs.value, bucketMs.value, aggFn.value])
+    const owns = () => current() && setup === JSON.stringify([seriesName.value, startMs.value, endMs.value, bucketMs.value, aggFn.value])
+    if (!owns()) return
     const series = seriesName.value.trim()
     if (!series) {
       toast('error', 'Set a series name')
@@ -362,13 +392,14 @@ export function TSModule({ name }: TSModuleProps) {
         .map(b => `${fn}(${sqlStr(series)}, ${b}, ${Math.min(b + size, end)})`)
         .join(', ')
       const r = await api.query(`SELECT ${cols}`, conn.id)
-      if (r.error) throw new Error(r.error)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Query canceled; verify the operation before retrying')
       const row = (r.rows[0] ?? []) as unknown[]
 
       // Present the batched scalar row as a bucket/value grid for the DataGrid.
       const gridRows: unknown[][] = windows.map((b, i) => [
         new Date(b).toISOString(),
-        row[i] != null ? Number(row[i]) : null,
+        chartValue(row[i]),
       ])
       result.value = {
         columns: ['bucket', aggFn.value === 'count' ? 'count' : 'avg'],
@@ -377,15 +408,17 @@ export function TSModule({ name }: TSModuleProps) {
         duration: r.duration,
       }
       bucketLabels.value = windows.map(b => new Date(b).toISOString())
-      sparkValues.value = windows.map((_, i) => Number(row[i])).filter(v => !isNaN(v))
+      sparkValues.value = windows.map((_, i) => chartValue(row[i]))
     } catch (err: unknown) {
+      if (!owns()) return
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
-      running.value = false
+      if (current()) running.value = false
     }
   }
 
-  const hasData = sparkValues.value.length > 0
+  const finiteValues = sparkValues.value.filter((v): v is number => v !== null)
+  const hasData = finiteValues.length > 0
 
   return (
     <div class={s.layout}>
@@ -396,7 +429,7 @@ export function TSModule({ name }: TSModuleProps) {
           value={seriesName.value}
           placeholder="series name"
           title="Series name (user-supplied — the engine has no series listing)"
-          onInput={e => { seriesName.value = (e.target as HTMLInputElement).value }}
+          onInput={e => { ingestRevision.current++; owner.invalidate('stats'); readInputChanged(); stats.value = null; seriesName.value = (e.target as HTMLInputElement).value }}
           onKeyDown={e => { if (e.key === 'Enter') loadStats() }}
           onBlur={loadStats}
         />
@@ -417,17 +450,17 @@ export function TSModule({ name }: TSModuleProps) {
           <div class={s.fieldGroup}>
             <label class={s.fieldLabel}>Start (epoch ms)</label>
             <input class={s.fieldInput} type="number" value={startMs.value}
-              onInput={e => { startMs.value = (e.target as HTMLInputElement).value }} />
+              onInput={e => { readInputChanged(); startMs.value = (e.target as HTMLInputElement).value }} />
           </div>
           <div class={s.fieldGroup}>
             <label class={s.fieldLabel}>End (epoch ms)</label>
             <input class={s.fieldInput} type="number" value={endMs.value}
-              onInput={e => { endMs.value = (e.target as HTMLInputElement).value }} />
+              onInput={e => { readInputChanged(); endMs.value = (e.target as HTMLInputElement).value }} />
           </div>
           <div class={s.fieldGroup}>
             <label class={s.fieldLabel}>Bucket</label>
             <select class={s.fieldSelect} value={String(bucketMs.value)}
-              onChange={e => { bucketMs.value = Number((e.target as HTMLSelectElement).value) }}>
+              onChange={e => { readInputChanged(); bucketMs.value = Number((e.target as HTMLSelectElement).value) }}>
               {BUCKET_OPTS.map(o => (
                 <option key={o.ms} value={String(o.ms)}>{o.label}</option>
               ))}
@@ -436,7 +469,7 @@ export function TSModule({ name }: TSModuleProps) {
           <div class={s.fieldGroup}>
             <label class={s.fieldLabel}>Agg</label>
             <select class={s.fieldSelect} value={aggFn.value}
-              onChange={e => { aggFn.value = (e.target as HTMLSelectElement).value as 'avg' | 'count' }}>
+              onChange={e => { readInputChanged(); aggFn.value = (e.target as HTMLSelectElement).value as 'avg' | 'count' }}>
               <option value="avg">avg</option>
               <option value="count">count</option>
             </select>
@@ -457,7 +490,7 @@ export function TSModule({ name }: TSModuleProps) {
             style={{ height: 'auto' }}
             placeholder={'one point per line:\n1730000000000, 1.5\n2026-09-24T05:00:00Z, 2.0'}
             value={pointsInput.value}
-            onInput={e => { pointsInput.value = (e.target as HTMLTextAreaElement).value }}
+            onInput={e => { ingestRevision.current++; pointsInput.value = (e.target as HTMLTextAreaElement).value }}
             rows={3}
             spellcheck={false}
           />
@@ -508,7 +541,7 @@ export function TSModule({ name }: TSModuleProps) {
             <Sparkline values={sparkValues.value} />
             <span class={s.chartLabel}>
               {result.value?.rowCount} buckets &middot;
-              range [{fmt(Math.min(...sparkValues.value))}, {fmt(Math.max(...sparkValues.value))}]
+              range [{fmt(Math.min(...finiteValues))}, {fmt(Math.max(...finiteValues))}]
             </span>
           </div>
           <div class={s.viewToggle}>
@@ -562,4 +595,12 @@ function fmt(n: number) {
   if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M'
   if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(2) + 'K'
   return Number(n.toFixed(4)).toString()
+}
+
+/** Missing/nonfinite aggregates remain aligned gaps, never zero. */
+export function chartValue(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  if (typeof value === 'string' && value.trim() === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
 }

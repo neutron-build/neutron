@@ -80,17 +80,19 @@ describe('buildRouteTree', () => {
     expect(tree[0].layout).toBe(LayoutComponent)
   })
 
-  it('handles lazy components (returns promise)', () => {
-    const lazyLoader = () => Promise.resolve({ default: DummyComponent })
+  it('keeps lazy loaders un-invoked and wraps them for React', () => {
+    const lazyLoader = jest.fn(() => Promise.resolve({ default: DummyComponent }))
     const manifest: RouteManifest = {
       entries: [
         { path: 'lazy', segment: 'lazy', dynamic: false, group: false, layout: false, notFound: false },
       ],
     }
-    const components = { 'lazy': lazyLoader as any }
+    const components = { 'lazy': { kind: 'lazy', load: lazyLoader } } as any
     const tree = buildRouteTree(manifest, components)
-    // Lazy components should not be assigned directly
-    expect(tree[0].component).toBeUndefined()
+    // Discovery must neither invoke the loader (NF-NATIVE-05) nor drop it:
+    // the record carries a wrapped component React can suspend on.
+    expect(typeof tree[0].component).toBe('function')
+    expect(lazyLoader).not.toHaveBeenCalled()
   })
 
   it('sorts entries by depth so parents come first', () => {

@@ -1,5 +1,5 @@
 export { createRouter } from "../core/router.js";
-export { runMiddlewareChain } from "../core/middleware.js";
+export { runMiddlewareChain, normalizeMiddlewareExport } from "../core/middleware.js";
 export { renderToString } from "preact-render-to-string";
 export {
   encodeSerializedPayloadAsJson,
@@ -23,3 +23,11 @@ export {
   isJsonRequest,
 } from "../core/render-app-route.js";
 export { createMemoryLoaderCacheStore } from "../server/cache-store.js";
+
+export { mutableResponse } from "../core/response.js";
+
+export { beginCacheMutation, encodeCacheInvalidationPath } from "../server/cache-mutation.js";
+
+export { installTransportPeer } from "../server/peer.js";
+
+export { normalizePathname } from "../core/route-path.js";

@@ -42,6 +42,9 @@ import type {
 } from "./types.js";
 import { normalizeCachePathname, type NeutronLoaderCacheStore } from "../server/cache-store.js";
 
+import { cacheOperation, publishCacheEntry, supportsBoundedPublication } from "../server/cache-publication.js";
+import { sharedResponseMaxAge } from "./shared-cache-policy.js";
+
 const TEXT_ENCODER = new TextEncoder();
 type StreamRenderFn = (element: preact.VNode) => ReadableStream<Uint8Array> & {
   allReady?: Promise<void>;
@@ -260,20 +263,23 @@ function buildLoaderDataCacheKey(
   // under loaderMaxAge — the same reason an HTTP cache emits
   // `Vary: Accept-Language`.
   const acceptLanguage = request.headers.get("accept-language") ?? "";
+  const accept = request.headers.get("accept") ?? "";
+  const dataRequest = request.headers.get("x-neutron-data") ?? "";
+  const requestedRoutes = request.headers.get("x-neutron-routes") ?? "";
   // ORIGIN is part of the key (TS-31): one server can serve multiple hosts,
   // and a host-dependent (tenant) loader's cached result must not answer a
   // different cookieless host's request. It sits AFTER the canonical path so
   // `deleteByPath`'s `path::` prefix invalidation still sweeps every
   // origin's entry for a mutated path.
   const origin = url.origin;
-  return `${canonicalPath}::${origin}::${url.search}::${routeId}::${encodedParams}::${acceptLanguage}`;
+  return `${canonicalPath}::${origin}::${url.search}::${routeId}::${encodedParams}::${JSON.stringify([acceptLanguage, accept, dataRequest, requestedRoutes])}`;
 }
 
 async function readCachedLoaderData(
   cache: NeutronLoaderCacheStore,
   key: string
 ): Promise<unknown | null> {
-  const entry = await cache.get(key);
+  const entry = await cacheOperation(() => cache.get(key), null, cache);
   return entry ? entry.data : null;
 }
 
@@ -295,7 +301,7 @@ async function storeLoaderDataCache(
     return;
   }
 
-  await cache.setIfGeneration!(key, {
+  await publishCacheEntry(cache, key, {
     data,
     expiresAt: Date.now() + maxAgeSec * 1000,
   }, generation);
@@ -818,6 +824,14 @@ export async function renderAppRoute(
     }
   }
   const context: AppContext = {};
+  // A cache hit cannot inspect post-next privacy. Every relevant middleware
+  // must affirm the public/keyed contract before either shared layer reads.
+  const sharedCacheSafe = middlewares.every(middleware => middleware.sharedCacheSafe === true) &&
+    allRoutes.every(route => {
+      const headers = routeModules.get(route.id)?.headers;
+      return !headers || headers.sharedCacheSafe === true;
+    });
+  const stagedLoaderFills: Array<{ key: string; data: unknown; maxAge: number; generation: string }> = [];
 
   // The terminal render body, factored out so the shared-cache boundary can
   // sit INSIDE the middleware chain: a cache hit still runs every request
@@ -1007,7 +1021,7 @@ export async function renderAppRoute(
       const routeParams = { ...match.params };
       const loaderCacheMaxAge = route.config.cache?.loaderMaxAge ?? 0;
       const canCacheLoaderData =
-        loaderCacheMaxAge > 0 && isLoaderDataCacheableRequest(request);
+        sharedCacheSafe && supportsBoundedPublication(loaderDataCache) && Number.isFinite(loaderCacheMaxAge) && loaderCacheMaxAge > 0 && Reflect.ownKeys(context).length === 0 && isLoaderDataCacheableRequest(request);
       const canReadLoaderCache =
         canCacheLoaderData && isLoaderDataCacheReadableMethod(request.method) &&
         typeof loaderDataCache.getGeneration === 'function' &&
@@ -1019,7 +1033,7 @@ export async function renderAppRoute(
         typeof loaderDataCache.getGeneration === 'function' &&
         typeof loaderDataCache.setIfGeneration === 'function';
       const loaderGeneration = canWriteLoaderCache
-        ? loaderCacheFence?.generation ?? await loaderDataCache.getGeneration!()
+        ? loaderCacheFence?.generation ?? await cacheOperation<string | undefined>(() => loaderDataCache.getGeneration!(), undefined, loaderDataCache)
         : undefined;
       const loaderCacheKey = canCacheLoaderData
         ? buildLoaderDataCacheKey(request, route.id, routeParams)
@@ -1057,33 +1071,14 @@ export async function renderAppRoute(
         // treating it as component data. Matches resource-route + action
         // semantics; a plain object is still normal loader data.
         if (isResponse(data)) {
+          const endedAt = Date.now();
+          emitHook(hooks?.onLoaderEnd, { ...requestTrace, routeId: route.id, routePath: route.path, startedAt: loaderStartedAt, endedAt, durationMs: endedAt - loaderStartedAt, outcome: "response", responseStatus: data.status, cacheStatus: "bypass" });
           return { routeId: route.id, data: undefined, response: data };
         }
-        if (loaderCacheKey && canWriteLoaderCache) {
-          // Generation fence (TS-07): a mutation that COMPLETED while this
-          // loader ran advanced the server's epoch — publishing now would
-          // resurrect the pre-mutation view after the invalidation.
-          if (loaderCacheFence && !loaderCacheFence.stillValid()) {
-            emitHook(hooks?.onLoaderEnd, {
-              requestId: requestTrace.requestId,
-              method: requestTrace.method,
-              pathname: requestTrace.pathname,
-              routeId: route.id,
-              routePath: route.path,
-              startedAt: loaderStartedAt,
-              endedAt: Date.now(),
-              outcome: "success",
-              cacheStatus: "bypass",
-            });
-            return { routeId: route.id, data };
-          }
-          await storeLoaderDataCache(
-            loaderDataCache,
-            loaderCacheKey,
-            data,
-            loaderCacheMaxAge,
-            loaderGeneration!
-          );
+        if (loaderCacheKey && canWriteLoaderCache && loaderGeneration !== undefined && Reflect.ownKeys(context).length === 0) {
+          // Capture owned data now; publication awaits the COMPLETE middleware
+          // result and its final policy/context, with the original generation.
+          stagedLoaderFills.push({ key: loaderCacheKey, data: structuredClone(data), maxAge: loaderCacheMaxAge, generation: loaderGeneration });
         }
         const loaderEndedAt = Date.now();
         emitHook(hooks?.onLoaderEnd, {
@@ -1307,17 +1302,28 @@ export async function renderAppRoute(
     }
   };
 
-  return runMiddlewareChain(middlewares, request, context, async () => {
-    if (responseCache?.enabled) {
+  let rendered = false;
+  const response = await runMiddlewareChain(middlewares, request, context, async () => {
+    if (sharedCacheSafe && responseCache?.enabled && Reflect.ownKeys(context).length === 0) {
       const hit = await responseCache.read();
       if (hit) {
         return hit;
       }
     }
     const response = await renderRouteBody();
-    if (responseCache?.enabled) {
-      responseCache.store(response);
-    }
+    rendered = true;
     return response;
   });
+  // Publish only after all middleware finalizes privacy. Context-bearing
+  // middleware may inject per-request tokens even without credential headers.
+  if (rendered && sharedCacheSafe && responseCache?.enabled && Reflect.ownKeys(context).length === 0) {
+    responseCache.store(response);
+  }
+  if (rendered && sharedCacheSafe && Reflect.ownKeys(context).length === 0 && (!loaderCacheFence || loaderCacheFence.stillValid())) {
+    await Promise.all(stagedLoaderFills.map(fill => {
+      const maxAge = sharedResponseMaxAge(request.headers.get("cache-control"), response, fill.maxAge);
+      return maxAge === null ? undefined : storeLoaderDataCache(loaderDataCache, fill.key, fill.data, maxAge, fill.generation);
+    }));
+  }
+  return response;
 }

@@ -1,7 +1,8 @@
+import { commitReceiptFor, commitRefusalFor } from './commitFixture'
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import {
   connections, activeConnection, connectionLoading, connectionError,
-  features, isNucleus, schema, schemaLoading,
+  features, isNucleus, schema, schemaLoading, refreshSchema, schemaRefreshing, schemaRefreshError,
   tabs, activeTabId, activeTab, openTab, closeTab,
   pendingChanges, pendingCount, addPending, removePending, revertLast, clearPending,
   theme, toggleTheme,
@@ -9,7 +10,7 @@ import {
   toasts, toast, bindingActive,
   stagedEdits, stagedCount, stageEdit, removeStagedEdit, discardLastStaged, clearStaged,
   stagedForTable, keyStringOf, firstOffendingOpIndex, failedEditFocus,
-  commitStaged, previewStaged, revertLastCommit,
+  commitStaged, previewStaged, revertLastCommit, _resetCommitBatchesForTests,
   commitPhase, commitError, lastCommit, lastPreview,
 } from './store'
 import type { Tab, PendingChange, CommitResponse, PreviewResponse } from './types'
@@ -23,6 +24,7 @@ vi.mock('./api', async (importOriginal) => {
     ...orig,
     api: {
       ...orig.api,
+      schema: vi.fn(),
       commitOperations: vi.fn(),
       previewOperations: vi.fn(),
       operationOutcome: vi.fn(),
@@ -37,6 +39,7 @@ const commitOperations = vi.mocked(api.commitOperations)
 const previewOperations = vi.mocked(api.previewOperations)
 const operationOutcome = vi.mocked(api.operationOutcome)
 const revertOperation = vi.mocked(api.revertOperation)
+beforeEach(_resetCommitBatchesForTests)
 
 describe('store — connection state', () => {
   beforeEach(() => {
@@ -328,6 +331,7 @@ describe('store — editing binding (S01 lost-window semantics)', () => {
 })
 
 describe('store — staged edits and commit outcomes (S02)', () => {
+  beforeEach(_resetCommitBatchesForTests)
   const updateOp = {
     op: 'update' as const, schema: 'public', table: 'docs', binding: 'e:1',
     key: [{ column: 'id', value: 1 }], version: '9',
@@ -380,7 +384,7 @@ describe('store — staged edits and commit outcomes (S02)', () => {
       operations: [{ index: 0, op: 'update', rowsAffected: 1, version: '10' }],
       reversible: true,
     }
-    commitOperations.mockResolvedValue(response)
+    commitOperations.mockImplementation(async input => Object.assign(response, commitReceiptFor(input.operationId, input.operations, response.reversible)))
 
     const res = await commitStaged('c1')
     expect(res).toEqual(response)
@@ -396,7 +400,7 @@ describe('store — staged edits and commit outcomes (S02)', () => {
 
   it('a refused commit retains the staged draft (reconcilable)', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
-    commitOperations.mockRejectedValue(new ApiError(409, 'row changed since it was read', { state: 'conflict' }))
+    commitOperations.mockImplementation(async input => { throw commitRefusalFor(new ApiError(409, 'row changed since it was read', { state: 'conflict' }), input.operationId) })
 
     await expect(commitStaged('c1')).rejects.toBeInstanceOf(ApiError)
     expect(commitPhase.value).toBe('failed')
@@ -415,7 +419,7 @@ describe('store — staged edits and commit outcomes (S02)', () => {
       operations: [{ index: 0, op: 'update', rowsAffected: 1, version: '10' }],
       reversible: true,
     }
-    operationOutcome.mockResolvedValueOnce({ operationId: 'resolved', state: 'committed', status: 200, response: recorded })
+    operationOutcome.mockImplementationOnce(async (_c, id) => ({ operationId: id, state: 'committed', status: 200, response: Object.assign(recorded, commitReceiptFor(id, commitOperations.mock.calls[0][0].operations, true)) }))
 
     const res = await commitStaged('c1')
     expect(res).toEqual(recorded)
@@ -430,7 +434,7 @@ describe('store — staged edits and commit outcomes (S02)', () => {
   it('an unknown outcome (expired/evicted/restart) never auto-recommits and keeps the draft', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
     commitOperations.mockRejectedValueOnce(new TypeError('network dropped'))
-    operationOutcome.mockResolvedValueOnce({ operationId: 'x', state: 'unknown' })
+    operationOutcome.mockImplementationOnce(async (_c, id) => ({ operationId: id, state: 'unknown' }))
 
     await expect(commitStaged('c1')).rejects.toThrow('outcome unknown')
     expect(commitOperations).toHaveBeenCalledTimes(1)
@@ -441,7 +445,7 @@ describe('store — staged edits and commit outcomes (S02)', () => {
   it('a failed recorded outcome surfaces the failure without a second send', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
     commitOperations.mockRejectedValueOnce(new TypeError('network dropped'))
-    operationOutcome.mockResolvedValueOnce({ operationId: 'x', state: 'failed', status: 409 })
+    operationOutcome.mockImplementationOnce(async (_c, id) => ({ operationId: id, state: 'failed', status: 409, response: { operationId: id, error: 'network dropped' } } as never))
 
     await expect(commitStaged('c1')).rejects.toThrow('network dropped')
     expect(commitOperations).toHaveBeenCalledTimes(1)
@@ -451,8 +455,8 @@ describe('store — staged edits and commit outcomes (S02)', () => {
 
   it('a server-side unknown state (ambiguous commit) resolves the outcome instead of retrying', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note' })
-    commitOperations.mockRejectedValueOnce(new ApiError(502, 'the outcome cannot be determined', { state: 'unknown' }))
-    operationOutcome.mockResolvedValueOnce({ operationId: 'x', state: 'unknown' })
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(502, 'the outcome cannot be determined', { state: 'unknown' }), input.operationId) })
+    operationOutcome.mockImplementationOnce(async (_c, id) => ({ operationId: id, state: 'unknown' }))
 
     await expect(commitStaged('c1')).rejects.toThrow('outcome unknown')
     expect(operationOutcome).toHaveBeenCalledTimes(1)
@@ -480,7 +484,7 @@ describe('store — staged edits and commit outcomes (S02)', () => {
   })
 
   it('revert sends the last committed operation ID under a fresh idempotency key', async () => {
-    lastCommit.value = {
+    lastCommit.value = { connectionId: 'c1',
       operationId: 'original-op', at: Date.now(),
       response: { operationId: 'original-op', rowsAffected: 1, operations: [], reversible: true },
     }
@@ -507,11 +511,11 @@ describe('store — staged edits and commit outcomes (S02)', () => {
 
   it('each commit attempt uses a fresh operation ID (spent IDs are never reused)', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'a' })
-    commitOperations.mockRejectedValueOnce(new ApiError(409, 'conflict', { state: 'conflict' }))
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(409, 'conflict', { state: 'conflict' }), input.operationId) })
     await expect(commitStaged('c1')).rejects.toBeInstanceOf(ApiError)
 
     const ok: CommitResponse = { operationId: 'second', rowsAffected: 1, operations: [], reversible: true }
-    commitOperations.mockResolvedValueOnce(ok)
+    commitOperations.mockImplementationOnce(async input => Object.assign(ok, commitReceiptFor(input.operationId, input.operations, ok.reversible)))
     await commitStaged('c1')
 
     const firstId = commitOperations.mock.calls[0][0].operationId
@@ -567,8 +571,8 @@ describe('store — S03 table-scoped staging and error focus', () => {
   it('a refused commit pins the first offending staged edit for grid focus', async () => {
     stageEdit({ connectionId: 'c1', operation: upd(1), label: 'ok-row' })
     stageEdit({ connectionId: 'c1', operation: upd(2), label: 'bad-row' })
-    commitOperations.mockRejectedValueOnce(new ApiError(409,
-      'operations[1]: update refused: row changed since it was read (current row version 99)', { state: 'conflict' }))
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(409,
+      'operations[1]: update refused: row changed since it was read (current row version 99)', { state: 'conflict' }), input.operationId) })
 
     await expect(commitStaged('c1')).rejects.toBeInstanceOf(ApiError)
     expect(failedEditFocus.value).not.toBeNull()
@@ -581,10 +585,138 @@ describe('store — S03 table-scoped staging and error focus', () => {
   it('a successful commit clears any stale focus pin', async () => {
     failedEditFocus.value = { editId: 'stale', reason: 'x' }
     stageEdit({ connectionId: 'c1', operation: upd(1), label: 'a' })
-    commitOperations.mockResolvedValueOnce({
-      operationId: 'op', rowsAffected: 1, operations: [], reversible: true,
-    })
+    commitOperations.mockImplementationOnce(async input => commitReceiptFor(input.operationId, input.operations, true))
     await commitStaged('c1')
     expect(failedEditFocus.value).toBeNull()
   })
+})
+
+
+describe('final commit concurrency and uncertainty', () => {
+  beforeEach(() => { _resetCommitBatchesForTests(); stagedEdits.value = []; vi.clearAllMocks() })
+  const insert = () => stageEdit({ connectionId: 'final', label: 'insert', operation: { op:'insert', schema:'public', table:'t', binding:'e:1', values:{note:'draft'} } })
+  const response: CommitResponse = { operationId:'recorded', rowsAffected:1, operations:[], reversible:false }
+  it.each([false,true])('retains new edits on completion (recovered=%s)', async recovered => {
+    let finish!: (r: CommitResponse) => void
+    if (recovered) {
+      commitOperations.mockRejectedValueOnce(new TypeError('lost'))
+      operationOutcome.mockImplementationOnce(() => new Promise(resolve => { finish = r => resolve({ operationId:r.operationId,state:'committed',response:r }) }))
+    } else commitOperations.mockImplementationOnce(() => new Promise(resolve => { finish=resolve }))
+    const first = insert()
+    const a = commitStaged('final')
+    expect(commitStaged('final')).toBe(a)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    const later = insert()
+    removeStagedEdit(first.id) // discarding a draft does not revoke a server operation
+    Object.assign(response, commitReceiptFor(commitOperations.mock.calls[0][0].operationId, commitOperations.mock.calls[0][0].operations))
+    finish(response)
+    expect(await a).toBe(response)
+    expect(stagedEdits.value.map(e=>e.id)).toEqual([later.id])
+    expect(commitOperations).toHaveBeenCalledTimes(1)
+  })
+  it('retains ID for unknown/in-progress outcomes and only looks up on another call', async () => {
+    insert()
+    commitOperations.mockRejectedValueOnce(new TypeError('lost'))
+    operationOutcome.mockImplementationOnce(async (_c,id) => ({operationId:id,state:'in_progress'}))
+    await expect(commitStaged('final')).rejects.toThrow('outcome unknown')
+    const id = commitOperations.mock.calls[0][0].operationId
+    insert()
+    operationOutcome.mockResolvedValueOnce({operationId:id,state:'unknown'})
+    await expect(commitStaged('final')).rejects.toThrow(id)
+    expect(commitOperations).toHaveBeenCalledTimes(1)
+    Object.assign(response, commitReceiptFor(id, commitOperations.mock.calls[0][0].operations))
+    operationOutcome.mockResolvedValueOnce({operationId:id,state:'committed',response})
+    await expect(commitStaged('final')).resolves.toEqual(response)
+    expect(stagedEdits.value).toHaveLength(1)
+  })
+  it('definitive refusal preserves all edits and permits a fresh deliberate attempt', async () => {
+    insert()
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(403,'denied'), input.operationId) })
+    await expect(commitStaged('final')).rejects.toThrow('denied')
+    insert()
+    commitOperations.mockImplementationOnce(async input => Object.assign(response, commitReceiptFor(input.operationId, input.operations, response.reversible)))
+    await commitStaged('final')
+    expect(commitOperations.mock.calls[1][0].operationId).not.toBe(commitOperations.mock.calls[0][0].operationId)
+    expect(commitOperations.mock.calls[1][0].operations).toHaveLength(2)
+  })
+})
+
+
+it.each([new SyntaxError('bad response JSON'), new ApiError(500,'server lost response'), new ApiError(409,'still committing',{state:'in_progress'})])('malformed/ambiguous completion retains batch identity: %s', async error => {
+  _resetCommitBatchesForTests()
+  stagedEdits.value=[]
+  stageEdit({connectionId:'ambiguous',label:'insert',operation:{op:'insert',schema:'public',table:'t',binding:'e:1',values:{a:'b'}}})
+  commitOperations.mockReset(); operationOutcome.mockReset()
+  commitOperations.mockRejectedValueOnce(error)
+  operationOutcome.mockImplementation(async (_c,id) => ({operationId:id,state:'unknown'}))
+  await expect(commitStaged('ambiguous')).rejects.toThrow('outcome unknown')
+  await expect(commitStaged('ambiguous')).rejects.toThrow('outcome unknown')
+  expect(commitOperations).toHaveBeenCalledTimes(1)
+  expect(operationOutcome.mock.calls[0][1]).toBe(operationOutcome.mock.calls[1][1])
+})
+
+describe('shared catalog refresh ownership for designer and SQL DDL callers', () => {
+  beforeEach(() => {
+    activeConnection.value = { id: 'c1', name: 'one', url: 'pg://one', isNucleus: false }
+    vi.mocked(api.schema).mockReset()
+  })
+  it('connection switch fences catalog, loading and errors even when switching back', async () => {
+    let fail!: (e: Error) => void
+    vi.mocked(api.schema).mockImplementation(() => new Promise((_resolve, reject) => { fail = reject }))
+    const pending = refreshSchema('c1')
+    activeConnection.value = { id: 'c2', name: 'two', url: 'pg://two', isNucleus: false }
+    activeConnection.value = { id: 'c1', name: 'one', url: 'pg://one', isNucleus: false }
+    const current = { sql: [] } as never
+    schema.value = current
+    fail(new Error('obsolete error')); await pending
+    expect(schema.value).toBe(current)
+    expect(schemaRefreshError.value).toBeNull()
+    expect(schemaRefreshing.value).toBe(false)
+  })
+  it('older same-connection errors cannot finish loading or replace the latest request', async () => {
+    let fail!: (e: Error) => void, finish!: (s: never) => void
+    vi.mocked(api.schema).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject }))
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const old = refreshSchema('c1'), latest = refreshSchema('c1')
+    fail(new Error('old')); await old
+    expect(schemaRefreshError.value).toBeNull(); expect(schemaRefreshing.value).toBe(true)
+    const current = { sql: [] } as never
+    finish(current); await latest
+    expect(schema.value).toBe(current); expect(schemaRefreshing.value).toBe(false)
+  })
+})
+
+it.each(['empty', 'null', 'wrong-direct-id', 'bad-result', 'wrong-direct-refusal-id', 'missing-direct-refusal-id', 'wrong-outer-id', 'wrong-inner-id', 'wrong-failed-id', 'missing-failed-inner-id'])('retains private batch for invalid receipt %s; only recovers its ID', async mode => {
+  stagedEdits.value = []; _resetCommitBatchesForTests(); commitOperations.mockReset(); operationOutcome.mockReset()
+  const submitted = stageEdit({ connectionId: 'receipt', label: 'private', operation: { op: 'insert', schema: 'public', table: 't', binding: 'e:1', values: { note: 'private' } } })
+  commitOperations.mockImplementationOnce(async input => {
+    if (mode === 'empty') return {} as never
+    if (mode === 'null') return null as never
+    if (mode === 'wrong-direct-id') return commitReceiptFor('different', input.operations)
+    if (mode === 'wrong-direct-refusal-id') throw commitRefusalFor(new ApiError(409, 'refused', {state:'conflict'}), 'other')
+    if (mode === 'missing-direct-refusal-id') throw new ApiError(409, 'refused', {state:'conflict'})
+    if (mode === 'bad-result') return { ...commitReceiptFor(input.operationId, input.operations), operations: [{ index: -1, op: 'insert', rowsAffected: Infinity }] } as never
+    throw new TypeError('lost response')
+  })
+  operationOutcome.mockImplementation(async (_c, id) => {
+    const response = commitReceiptFor(id, [submitted.operation])
+    if (mode === 'wrong-outer-id') return { operationId: 'different', state: 'committed', response }
+    if (mode === 'wrong-inner-id') return { operationId: id, state: 'committed', response: { ...response, operationId: 'different' } }
+    if (mode === 'wrong-failed-id') return { operationId: 'different', state: 'failed', status: 409, response: { operationId: 'different', error: 'refused' } } as never
+    if (mode === 'missing-failed-inner-id') return { operationId: id, state: 'failed', status: 409, response: { error: 'refused' } } as never
+    return { operationId: id, state: 'unknown' }
+  })
+  await expect(commitStaged('receipt')).rejects.toThrow('outcome unknown')
+  const original = commitOperations.mock.calls[0][0]
+  expect(stagedEdits.value).toHaveLength(1)
+  // Local discard and a new draft must neither lose the private payload nor allow resend.
+  clearStaged('receipt')
+  stageEdit({ connectionId: 'receipt', label: 'later', operation: { ...submitted.operation, values: { note: 'later' } } })
+  await expect(commitStaged('receipt')).rejects.toThrow('outcome unknown')
+  expect(commitOperations).toHaveBeenCalledTimes(1)
+  operationOutcome.mockImplementationOnce(async (_c, id) => ({ operationId: id, state: 'committed', response: commitReceiptFor(id, original.operations) }))
+  await commitStaged('receipt')
+  expect(stagedEdits.value.map(e => e.label)).toEqual(['later'])
+  expect(lastCommit.value?.operationId).toBe(original.operationId)
+  expect(operationOutcome.mock.calls.every(([c, id]) => c === 'receipt' && id === original.operationId)).toBe(true)
 })

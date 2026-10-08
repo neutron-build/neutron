@@ -7,11 +7,13 @@
  *
  * Classes are resolved at BUILD TIME by the Babel/Rspack plugin.
  * Zero runtime overhead — no className parsing at runtime.
+ *
+ * This module is NODE-SAFE: it must never import react-native or touch
+ * device globals, because the Babel plugin and Rspack loader execute it
+ * inside build processes (NF-NR-02). Device-dependent tokens (screen
+ * sizes) live in ./runtime.ts instead.
  */
 
-import { Dimensions } from 'react-native'
-
-/** Mirrors NativeStyleProp from @neutron-build/native — avoid circular dep */
 export type StyleProp = {
   [key: string]: string | number | null | { width?: number; height?: number } | undefined
 }
@@ -68,8 +70,8 @@ export const FLEX_TOKENS: StyleMap = {
   'flex-shrink':   { flexShrink: 1 },
   'flex-shrink-0': { flexShrink: 0 },
   // Flex basis
-  'basis-auto': { flexBasis: 'auto' as unknown as number },
-  'basis-full': { flexBasis: '100%' as unknown as number },
+  'basis-auto': { flexBasis: 'auto' },
+  'basis-full': { flexBasis: '100%' },
   ...Object.fromEntries(
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(n => [
       `basis-${n}`, { flexBasis: spacing(n) },
@@ -104,20 +106,19 @@ export const SIZE_TOKENS: StyleMap = {
     ])
   ),
   // Full / screen sizes
-  'w-full':   { width: '100%' as unknown as number },
-  'w-screen': { width: Dimensions.get('window').width },
-  'h-full':   { height: '100%' as unknown as number },
-  'h-screen': { height: Dimensions.get('window').height },
+  'w-full':   { width: '100%' },
+  'h-full':   { height: '100%' },
+  // NOTE: w-screen / h-screen / max-w-screen / max-h-screen are
+  // runtime-only tokens — device dimensions cannot be known at build time
+  // (and certainly not inside a Node build process). See ./runtime.ts.
   // Min / max width
   'min-w-0':    { minWidth: 0 },
-  'min-w-full': { minWidth: '100%' as unknown as number },
-  'max-w-full':   { maxWidth: '100%' as unknown as number },
-  'max-w-screen': { maxWidth: Dimensions.get('window').width },
+  'min-w-full': { minWidth: '100%' },
+  'max-w-full': { maxWidth: '100%' },
   // Min / max height
   'min-h-0':      { minHeight: 0 },
-  'min-h-full':   { minHeight: '100%' as unknown as number },
-  'max-h-full':   { maxHeight: '100%' as unknown as number },
-  'max-h-screen': { maxHeight: Dimensions.get('window').height },
+  'min-h-full':   { minHeight: '100%' },
+  'max-h-full':   { maxHeight: '100%' },
   // Aspect ratio
   'aspect-square': { aspectRatio: 1 },
   'aspect-video':  { aspectRatio: 16 / 9 },
@@ -204,15 +205,12 @@ export const TEXT_TOKENS: StyleMap = {
   'underline':    { textDecorationLine: 'underline' },
   'line-through': { textDecorationLine: 'line-through' },
   'no-underline': { textDecorationLine: 'none' },
-  // Text ellipsis (RN-specific — signals single-line truncation)
-  'text-ellipsis': { numberOfLines: 1 } as unknown as StyleProp,
-  // Line height
-  'leading-none':    { lineHeight: 1 },
-  'leading-tight':   { lineHeight: 1.25 },
-  'leading-snug':    { lineHeight: 1.375 },
-  'leading-normal':  { lineHeight: 1.5 },
-  'leading-relaxed': { lineHeight: 1.625 },
-  'leading-loose':   { lineHeight: 2 },
+  // NOTE: text-ellipsis is deliberately NOT a token: numberOfLines is a View
+  // prop, not a style, and injecting it into a style object is a typing lie
+  // (NF-NR-03). Set numberOfLines={1} on the element directly.
+  // Line height — CSS unitless multipliers cannot be static style values on
+  // native (RN lineHeight is absolute points). They pair with a text-* font
+  // size: see LEADING_MULTIPLIERS in ./resolve.ts and the runtime resolver.
   // Letter spacing
   'tracking-tighter': { letterSpacing: -0.8 },
   'tracking-tight':   { letterSpacing: -0.4 },
@@ -613,6 +611,8 @@ export function parseOpacityModifier(cls: string): StyleProp | null {
 
 // ─── Memoized className resolver ──────────────────────────────────────────────
 
+import { resolveStaticClasses, type Platform } from './resolve.js'
+
 const _classNameCache = new Map<string, Record<string, unknown>>()
 
 /**
@@ -624,26 +624,27 @@ export function clearClassNameCache(): void {
 
 /**
  * Resolve a space-separated className string to a merged NativeStyleProp.
- * Used at runtime as fallback (build-time plugin is preferred).
+ * Node-safe static resolution: platform variants are applied for `platform`
+ * (defaults to 'all'), unknown tokens are skipped, unpaired leading-* is
+ * dropped (no font size is known here), and screen tokens are NOT resolved —
+ * use ./runtime.ts resolveClassName on the device for those.
  *
  * Results are frozen and cached (up to 10,000 entries) to avoid
  * redundant allocations on repeated renders.
  */
-export function resolveClassName(className: string): StyleProp {
-  const cached = _classNameCache.get(className)
+export function resolveClassName(className: string, platform: Platform = 'all'): StyleProp {
+  const cacheKey = `${platform}::${className}`
+  const cached = _classNameCache.get(cacheKey)
   if (cached) return cached as StyleProp
 
-  const classes = className.trim().split(/\s+/)
-  const result: Record<string, unknown> = {}
-  for (const cls of classes) {
-    const style = ALL_TOKENS[cls] ?? parseArbitraryValue(cls) ?? parseOpacityModifier(cls)
-    if (style) Object.assign(result, style)
-  }
+  const { styles } = resolveStaticClasses(className, platform)
+  // Drop the runtime-only marker: this resolver is the STATIC one; tokens it
+  // cannot resolve here are simply absent from its output.
 
   // Freeze to prevent mutation, cache for reuse
-  Object.freeze(result)
+  Object.freeze(styles)
   if (_classNameCache.size < 10000) {
-    _classNameCache.set(className, result)
+    _classNameCache.set(cacheKey, styles)
   }
-  return result as StyleProp
+  return styles as StyleProp
 }

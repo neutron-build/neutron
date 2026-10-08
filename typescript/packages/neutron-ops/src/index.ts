@@ -1,3 +1,4 @@
+import { mutableResponse } from "@neutron-build/core";
 import type {
   AppContext,
   MiddlewareFn,
@@ -50,7 +51,7 @@ export function createRequestContextMiddleware(
       context[traceIdContextKey] = traceId;
     }
 
-    const response = await next();
+    const response = mutableResponse(await next());
     if (!response.headers.has(responseHeader)) {
       response.headers.set(responseHeader, requestId);
     }

@@ -1,7 +1,8 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useSignal } from '@preact/signals'
 import { useEffect } from 'preact/hooks'
 import { activeConnection, schema, toast } from '../../lib/store'
-import { api } from '../../lib/api'
+import { queryMutationOrThrow as runMutation, api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
 import { friendlyError } from '../../lib/rls'
 import type { QueryResult } from '../../lib/types'
@@ -82,28 +83,44 @@ export function DatalogModule() {
 
   const conn = activeConnection.value!
   const dl = schema.value?.datalog
+  const owner = useRequestOwner(JSON.stringify([conn.id]))
+  const needsVerification = useSignal(false)
+  const operationStatus = useSignal<string | null>(null)
 
   useEffect(() => {
     if (dl) stats.value = { predicates: dl.predicateCount, rules: dl.ruleCount }
   }, [dl])
 
   async function evaluate() {
+    if (running.value || needsVerification.value) return
+    const owns = owner.begin()
+    if (!owns()) return
     const prog = program.value.trim()
     if (!prog) return
     running.value = true
     result.value = null
     const started = performance.now()
+    let applied = 0
+    let writeStarted = false
     try {
       const parsed = parseDatalogProgram(prog)
       for (const fact of parsed.asserts) {
-        await api.query(`SELECT DATALOG_ASSERT(${sqlStr(fact)})`, conn.id)
+        if (!owns()) throw new Error('Connection or view changed; evaluation stopped')
+        writeStarted = true
+        await queryMutationOrThrow(`SELECT DATALOG_ASSERT(${sqlStr(fact)})`, conn.id)
+        applied++
       }
       for (const rule of parsed.rules) {
-        await api.query(`SELECT DATALOG_RULE(${sqlStr(rule)})`, conn.id)
+        if (!owns()) throw new Error('Connection or view changed; evaluation stopped')
+        writeStarted = true
+        await queryMutationOrThrow(`SELECT DATALOG_RULE(${sqlStr(rule)})`, conn.id)
+        applied++
       }
       const tuples: string[][] = []
       for (const q of parsed.queries) {
-        const r = await api.query(`SELECT DATALOG_QUERY(${sqlStr(q)})`, conn.id)
+        if (!owns()) throw new Error('Connection or view changed; evaluation stopped')
+        const r = await queryMutationOrThrow(`SELECT DATALOG_QUERY(${sqlStr(q)})`, conn.id)
+        if (!owns()) throw new Error('Connection or view changed; evaluation stopped')
         if (r.error) {
           result.value = { ...r, error: friendlyError(r.error) }
           return
@@ -113,9 +130,14 @@ export function DatalogModule() {
       }
       const res = tuplesToResult(tuples)
       res.duration = Math.round(performance.now() - started)
-      result.value = res
+      operationStatus.value = `${conn.id}: ${applied} fact/rule write(s) acknowledged; each statement is independent.`
+      if (owns()) result.value = res
     } catch (err: unknown) {
-      toast('error', friendlyError(err instanceof Error ? err.message : String(err)))
+      const message = friendlyError(err instanceof Error ? err.message : String(err))
+      operationStatus.value = `${conn.id}: ${applied} earlier fact/rule write(s) succeeded. ${message}${writeStarted ? ' The last attempted write may need verification; no rollback or automatic retry was performed.' : ''}`
+      if (writeStarted) needsVerification.value = true
+      if (owns()) result.value = { columns: [], rows: [], rowCount: 0, duration: 0, error: message }
+      toast('error', operationStatus.value)
     } finally {
       running.value = false
     }
@@ -143,7 +165,7 @@ export function DatalogModule() {
             ))}
           </div>
           <span class={s.hint}>⌘↵ to evaluate</span>
-          <button class={s.evalBtn} onClick={evaluate} disabled={running.value}>
+          <button class={s.evalBtn} onClick={evaluate} disabled={running.value || needsVerification.value}>
             {running.value ? 'Evaluating…' : '▶ Evaluate'}
           </button>
         </div>
@@ -158,6 +180,8 @@ export function DatalogModule() {
         />
       </div>
 
+      {operationStatus.value && <div role="status">{operationStatus.value}</div>}
+      {needsVerification.value && <button onClick={() => { needsVerification.value = false }}>I verified database state; allow another evaluation</button>}
       <div class={s.results}>
         {result.value ? (
           result.value.error ? (
@@ -177,3 +201,5 @@ export function DatalogModule() {
     </div>
   )
 }
+
+const queryMutationOrThrow = (sql: string, connectionId: string, params?: unknown[]) => runMutation(sql, connectionId, params, api.query)

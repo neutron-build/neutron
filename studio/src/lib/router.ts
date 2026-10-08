@@ -23,7 +23,8 @@ export interface DeepLink {
 export function parseDeepLink(hash: string): DeepLink | null {
   const path = hash.replace(/^#\/?/, '')
   if (!path) return null
-  const parts = path.split('/').map(decodeURIComponent)
+  let parts: string[]
+  try { parts = path.split('/').map(decodeURIComponent) } catch { return null }
   if (parts.length < 3 || parts[0] !== 'c' || !parts[1]) return null
   const connectionId = parts[1]
   const rest = parts.slice(2)

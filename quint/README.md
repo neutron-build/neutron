@@ -4,14 +4,14 @@ This directory is the Neutron protocol-verification suite within the broader Neu
 
 Formal specifications of the stateful, distributed protocols behind Nucleus and the Neutron frameworks, written in [Quint](https://quint-lang.org/) — a modern TLA+ alternative with TypeScript-like syntax, a REPL, executable tests, and bounded model checking via Apalache.
 
-Where Lean 4 proves single-node algorithms and Verus verifies Rust code directly, Quint covers the concurrent, multi-node protocols: consensus, resharding, distributed transactions, replication, and the framework state machines that coordinate them.
+Lean 4 and Verus contain model propositions and planned implementation linkage. Quint models the concurrent, multi-node protocols: consensus, resharding, distributed transactions, replication, and the framework state machines that coordinate them.
 
 ## What it is
 
-Each spec is an executable state machine plus a set of named safety invariants. Two levels of checking run against it:
+Each spec is an executable state machine plus a set of named safety invariants. The active gates run scenarios and seeded finite simulation. Exhaustive bounded model checking is an optional tool capability; it has not run in this campaign:
 
 - **`quint test`** executes hand-written `run` scenarios — concrete traces that drive the state machine through a sequence of actions and assert the invariants hold at the end.
-- **`quint verify`** hands the spec to Apalache, which model-checks every invariant across all reachable states of a *bounded* instance (for example, 3 nodes across 2 Raft groups, or 4 shards over 100 keys). This is exhaustive within those bounds, not a proof for arbitrary cluster sizes.
+- **Optional `quint verify`** hands the spec to Apalache, which model-checks every invariant across all reachable states of a *bounded* instance (for example, 3 nodes across 2 Raft groups, or 4 shards over 100 keys). This is exhaustive within those bounds, not a proof for arbitrary cluster sizes.
 
 Specs are grouped by domain: shared modeling primitives (`common/`), database protocols (`nucleus/`), framework middleware state machines (`framework/`), and real-time transports (`realtime/`).
 
@@ -57,13 +57,13 @@ quint/
     nucleus/      # 6 database protocol specs
     framework/    # 4 middleware state-machine specs
     realtime/     # 2 real-time transport specs
-  tests/          # 14 test modules — `run` scenarios per protocol,
+  tests/          # scenario modules — `run` scenarios per protocol,
                   #   incl. fault_injection_test (partitions + crashes)
   conformance/    # spec-as-oracle scaffolding (Quint + Rust crate)
   scripts/        # check.sh, simulate.sh, ci.sh
 ```
 
-15 `.qnt` specification files, 14 `.qnt` test modules (~130 `run` scenarios), plus the conformance harness.
+`manifest.json` classifies every `.qnt` file and each scenario module. `scripts/manifest.py` rejects missing files/modules and checks actual nonzero test result counts. These counts measure executed scenarios, not state-space coverage.
 
 ## Running
 
@@ -76,7 +76,7 @@ npm i -g @informalsystems/quint
 quint typecheck specs/nucleus/multi_raft.qnt
 
 # Run the `run` test scenarios for a protocol
-quint test tests/multi_raft_test.qnt
+python3 scripts/manifest.py test
 
 # Randomized simulation — sample many traces, check an invariant
 quint run --invariant election_safety --max-samples=1000 --max-steps=50 \
@@ -127,9 +127,44 @@ the specs rather than executing the production engine.
 ## Scope and non-goals
 
 - Bounded verification only — invariants are checked over small, fixed instances, not proved for arbitrary sizes.
-- Single-node algorithm correctness lives in `lean4/`; direct Rust-code verification lives in `verus/`.
+- Hand-written algorithm models live in `lean4/`; unchecked executable proof models live in `verus/`. Neither establishes direct Rust verification.
 - No performance modeling or benchmarking here.
 
 ## License
 
-MIT (Quint specifications and tests). The `conformance/` Rust crate is BSL 1.1, matching the Nucleus engine it verifies.
+MIT (Quint specifications and tests). The `conformance/` Rust crate is BSL 1.1, matching the Nucleus engine. Model mirrors are scaffolding; the separately pinned WAL trace adapter requires actual execution.
+
+## Assurance scope
+
+`multi_raft.qnt` models durable per-term votes, log freshness, message-gated
+partitions, crashes, historical leaders and full-prefix log matching. Full-state
+log delivery abstracts AppendEntries retries; neither liveness nor shipping Rust
+refinement is checked. Fault and conformance scenarios use that concrete quorum model; transaction
+crash fixtures separately model persistent votes. Point-key conformance now records
+reads-from and WW/WR/RW dependencies over shared keys and checks graph cycles,
+with a conflicting serial positive case and a write-skew negative witness.
+A separate finite interval history model checks a conflicting serial case and
+rejects concurrent empty-range inserts and an omitted visible row. Arbitrary
+SQL predicates and production range-index refinement remain excluded.
+
+Session terminal histories, original owners, CSRF use counts, original snapshot
+data, previous configuration/version values and broadcast recipient/delivery
+histories are independent state. Finite safety simulation proves no eventual
+progress claim; fair scheduling would require temporal verification.
+
+The queued Raft model has immutable vote-request/response and snapshot payloads,
+separate deliveries, durable term/vote/log state, and volatile candidate vote sets
+cleared on crash. Network messages intentionally survive crashes and may arrive
+stale; current-term/role checks discard stale replies. Snapshot installation
+rejects stale terms/commit positions and incompatible committed prefixes.
+AppendEntries remains a complete-prefix abstraction. The checked safety relation
+maps historical concrete elections to abstract leader uniqueness; it is not a
+full transition refinement or liveness proof. New source scenarios are unexecuted
+until the pinned Quint job runs.
+
+`production-trace.json` pins the public Nucleus WAL API adapter to exact source
+hashes. `scripts/production_trace.py` runs append/commit/abort/checkpoint, sync and
+two reopen scans against an independent literal event oracle. It then copies the
+production crate and makes abort emit a commit record; the same oracle must fail
+an actual executed assertion. Both legs are mandatory CI execution gates, not
+results inferred from these files. Model mirrors remain scaffolding.

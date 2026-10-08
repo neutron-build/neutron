@@ -148,3 +148,16 @@ describe('resultToJSON', () => {
     expect(resultToJSON(qr([]))).toBe('[]\n')
   })
 })
+
+it('document downloads retain numeric source tokens and established id/data fields',async()=>{
+ const { exportDocumentJSON }=await import('./export')
+ const create=vi.spyOn(URL,'createObjectURL').mockReturnValue('blob:exact-doc')
+ const click=vi.spyOn(HTMLAnchorElement.prototype,'click').mockImplementation(()=>{})
+ try {
+  const raw='{"exact":9007199254740993,"decimal":0.1234567890123456789}'
+  exportDocumentJSON([{id:'7',raw}],'docs.json')
+  const blob=create.mock.calls[0][0] as Blob
+  expect(await blob.text()).toContain(`"data":${raw}`)
+  expect(await blob.text()).toContain('"id":"7"')
+ } finally {create.mockRestore();click.mockRestore()}
+})

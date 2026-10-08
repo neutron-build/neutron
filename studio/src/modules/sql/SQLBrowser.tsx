@@ -89,12 +89,12 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
     initialFilter ? [{ column: initialFilter.column, op: initialFilter.op, value: initialFilter.value }] : [])
   const appliedFilters = useSignal<TableFilter[]>(filters.value)
   const sorts = useSignal<TableSort[]>([])
-  const fks = useSignal<Record<string, FKDetail>>({})
+  const fks = useSignal<Record<string, FKDetail>>(Object.create(null))
   const meta = useSignal<TableMeta | null>(null)
   const showInsert = useSignal(false)
   const showColumns = useSignal(false)
   const showSearch = useSignal(false)
-  const insertEdits = useSignal<Record<string, CellEdit>>({})
+  const insertEdits = useSignal<Record<string, CellEdit>>(Object.create(null))
   const exportFormat = useSignal<ExportFormat>('csv')
   const exporting = useSignal(false)
   const showImport = useSignal(false)
@@ -205,11 +205,11 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
 
   useEffect(() => {
     let canceled = false
-    fks.value = {}
+    fks.value = Object.create(null)
     api.tableFKs(conn.id, schemaName, table)
       .then(r => {
         if (canceled) return
-        const map: Record<string, FKDetail> = {}
+        const map: Record<string, FKDetail> = Object.create(null)
         for (const fk of r.fks ?? []) {
           // Every column of a constraint links to the WHOLE tuple: following
           // a composite FK filters the target by all components at once.
@@ -236,7 +236,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       // Unsubmitted forms belong to the previous view, unlike globally staged
       // drafts whose exact relation identity is retained in the store.
       showInsert.value = false
-      insertEdits.value = {}
+      insertEdits.value = Object.create(null)
       showImport.value = false
     }
     refreshRows()
@@ -312,7 +312,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       const ks = keyStringOf(op.key ?? [])
       const idx = rowIndexByKey(ks)
       if (idx === undefined) continue // the row is not on this page; the draft survives globally
-      const st = map.get(idx) ?? { updates: {} }
+      const st: StagedRowState = map.get(idx) ?? { updates: Object.create(null) }
       if (op.op === 'update' && op.column) {
         st.updates[op.column] = {
           editId: e.id,
@@ -421,7 +421,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   function openInsert() {
     if (!guardBinding()) return
     if (insertable.value.length === 0) return
-    const init: Record<string, CellEdit> = {}
+    const init: Record<string, CellEdit> = Object.create(null)
     for (const c of insertable.value) {
       // Required columns start as an empty value; everything else starts
       // as DEFAULT (omitted column) — the honest three-way initial state.
@@ -432,7 +432,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
   }
 
   function insertError(c: { column: TableMetaColumn; required: boolean }): string | null {
-    const edit = insertEdits.value[c.column.name]
+    const edit = (Object.hasOwn(insertEdits.value, c.column.name) ? insertEdits.value[c.column.name] : undefined)
     if (!edit) return null
     if (edit.kind === 'null' && !c.column.nullable) return 'NOT NULL column cannot be NULL'
     if (edit.kind === 'default' && c.required) return 'required column — provide a value'
@@ -449,10 +449,10 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       toast('error', 'Relation binding unavailable — reload the table before inserting')
       return
     }
-    const values: Record<string, unknown> = {}
+    const values: Record<string, unknown> = Object.create(null)
     try {
       for (const c of insertable.value) {
-        const edit = insertEdits.value[c.column.name] ?? { kind: 'default' as const }
+        const edit = (Object.hasOwn(insertEdits.value, c.column.name) ? insertEdits.value[c.column.name] : undefined) ?? { kind: 'default' as const }
         const enc = encodeEdit(edit, c.column)
         if (enc.kind === 'omit') continue
         values[c.column.name] = enc.kind === 'null' ? null : enc.value
@@ -476,7 +476,7 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
       label: `insert ${table} (${Object.keys(values).length} value${Object.keys(values).length === 1 ? '' : 's'})`,
     })
     showInsert.value = false
-    insertEdits.value = {}
+    insertEdits.value = Object.create(null)
   }
 
   function setPageSize(n: number) {
@@ -756,18 +756,18 @@ export function SQLBrowser({ schema: schemaName, table, initialFilter, initialMa
                 <TypedEditor
                   column={c.column}
                   mode="insert"
-                  edit={insertEdits.value[c.column.name] ?? { kind: 'default' }}
+                  edit={(Object.hasOwn(insertEdits.value, c.column.name) ? insertEdits.value[c.column.name] : undefined) ?? { kind: 'default' }}
                   error={insertError(c)}
                   onChange={next => { insertEdits.value = { ...insertEdits.value, [c.column.name]: next } }}
                   onCommit={stageInsert}
-                  onCancel={() => { showInsert.value = false; insertEdits.value = {} }}
+                  onCancel={() => { showInsert.value = false; insertEdits.value = Object.create(null) }}
                 />
               </label>
             ))}
           </div>
           <div class={s.insertActions}>
             <button class={s.filterBtn} onClick={stageInsert}>Stage insert</button>
-            <button class={s.filterBtn} onClick={() => { showInsert.value = false; insertEdits.value = {} }}>Cancel</button>
+            <button class={s.filterBtn} onClick={() => { showInsert.value = false; insertEdits.value = Object.create(null) }}>Cancel</button>
           </div>
         </div>
       )}

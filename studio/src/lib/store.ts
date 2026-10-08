@@ -1,6 +1,7 @@
 import { signal, computed } from '@preact/signals'
 import type { Connection, Schema, NucleusFeatures, Tab, PendingChange, CommitOperation, CommitResponse, PreviewResponse, OutcomeResponse, KeyCell, LimitsReport, ModelLimits } from './types'
 import { api, ApiError } from './api'
+import { validateCommitReceipt, validateCommitOutcome, validateCommitFailure } from './commitReceipt'
 import { serializeDeepLink } from './router'
 
 // --- Connection state ---
@@ -13,21 +14,25 @@ export const connectionError = signal<string | null>(null)
 /** Connect a saved connection and refresh every connection-scoped signal
  * (features, schema, active connection). Shared by the connection manager
  * and the S05 deep-link router so both establish the same state. */
-export async function connectConnection(id: string): Promise<void> {
+let connectionGeneration = 0
+export async function connectConnection(id: string, current: () => boolean = () => true): Promise<void> {
+  const generation = ++connectionGeneration
+  const owns = () => generation === connectionGeneration && current()
   connectionLoading.value = true
   connectionError.value = null
   try {
     const { features: f, schema: sc } = await api.connections.connect(id)
+    if (!owns()) return
     features.value = f
     schema.value = sc
     const conn = connections.value.find(c => c.id === id) ?? null
     if (conn) activeConnection.value = { ...conn, isNucleus: f.isNucleus }
     void loadLimits(id)
   } catch (err: unknown) {
-    connectionError.value = err instanceof Error ? err.message : String(err)
+    if (owns()) connectionError.value = err instanceof Error ? err.message : String(err)
     throw err
   } finally {
-    connectionLoading.value = false
+    if (generation === connectionGeneration) connectionLoading.value = false
   }
 }
 
@@ -190,8 +195,8 @@ export function bindingActive(binding: EditingBinding): boolean {
 //     NEVER auto-recommits;
 //   - a refused commit (conflict, constraint, validation) retains every
 //     staged edit locally — the draft stays reconcilable;
-//   - a later attempt always uses a fresh operation ID (the failed one is
-//     spent: same ID + different payload is an operation_conflict).
+//   - a definitively refused attempt may use a fresh operation ID; an
+//     uncertain attempt only checks its original recorded outcome.
 
 export interface StagedEdit {
   id: string
@@ -267,7 +272,7 @@ export type CommitPhase = 'idle' | 'committing' | 'committed' | 'failed'
 
 export const commitPhase = signal<CommitPhase>('idle')
 export const commitError = signal<string | null>(null)
-export const lastCommit = signal<{ operationId: string; response: CommitResponse; at: number } | null>(null)
+export const lastCommit = signal<{ connectionId: string; operationId: string; response: CommitResponse; at: number } | null>(null)
 export const lastPreview = signal<PreviewResponse | null>(null)
 
 function newOperationId(): string {
@@ -276,66 +281,100 @@ function newOperationId(): string {
     : `op-${Date.now()}-${stageSeq++}`
 }
 
-/** Stage-then-commit flow for one connection's staged edits. */
-export async function commitStaged(connectionId: string): Promise<CommitResponse> {
-  const edits = stagedEdits.value.filter(e => e.connectionId === connectionId)
-  if (edits.length === 0) throw new Error('no staged edits for this connection')
+interface CommitBatch {
+  operationId: string
+  edits: StagedEdit[]
+  promise: Promise<CommitResponse> | null
+  uncertain?: boolean
+}
+export interface PendingCommit {
+  connectionId: string
+  operationId: string
+  state: 'pending' | 'uncertain'
+  checking: boolean
+}
+export const pendingCommits = signal<PendingCommit[]>([])
+const inFlight = new Map<string, CommitBatch>()
+function publishCommitBatches() {
+  pendingCommits.value = [...inFlight].map(([connectionId, batch]): PendingCommit => ({
+    connectionId, operationId: batch.operationId,
+    state: batch.uncertain ? 'uncertain' : 'pending', checking: !!batch.promise,
+  }))
+}
+/** Recovery is bound to the retained connection and operation, even with no draft. */
+export function checkCommitOutcome(connectionId: string, operationId: string): Promise<CommitResponse> {
+  const batch = inFlight.get(connectionId)
+  if (!batch || batch.operationId !== operationId) return Promise.reject(new Error('Recorded operation is no longer pending'))
+  return commitStaged(connectionId)
+}
+/** Test isolation only; production must retain unresolved operation identities. */
+export function _resetCommitBatchesForTests() { inFlight.clear(); publishCommitBatches() }
 
-  const operationId = newOperationId()
-  const payload = {
-    connectionId,
-    operationId,
-    operations: edits.map(e => e.operation),
-  }
+function completeBatch(connectionId: string, batch: CommitBatch, response: CommitResponse): CommitResponse {
+  response = validateCommitReceipt(response, batch.operationId, batch.edits.map(e => e.operation))
+  const ids = new Set(batch.edits.map(e => e.id))
+  stagedEdits.value = stagedEdits.value.filter(e => !ids.has(e.id))
+  inFlight.delete(connectionId)
+  publishCommitBatches()
+  commitPhase.value = 'committed'
+  commitError.value = null
+  lastCommit.value = { connectionId, operationId: batch.operationId, response, at: Date.now() }
+  invalidateConnectionRows(connectionId)
+  return response
+}
+
+/** Concurrent callers share the promise. An uncertain batch is never resubmitted. */
+export function commitStaged(connectionId: string): Promise<CommitResponse> {
+  const existing = inFlight.get(connectionId)
+  if (existing?.promise) return existing.promise
+  const edits = existing?.edits ?? structuredClone(stagedEdits.value.filter(e => e.connectionId === connectionId))
+  if (edits.length === 0) return Promise.reject(new Error('no staged edits for this connection'))
+  const batch: CommitBatch = existing ?? { operationId: newOperationId(), edits, promise: null }
+  inFlight.set(connectionId, batch)
   commitPhase.value = 'committing'
   commitError.value = null
   failedEditFocus.value = null
-  try {
-    const res = await api.commitOperations(payload)
-    commitPhase.value = 'committed'
-    lastCommit.value = { operationId, response: res, at: Date.now() }
-    clearStaged(connectionId)
-    invalidateConnectionRows(connectionId)
-    return res
-  } catch (err: unknown) {
-    return await resolveFailedCommit(connectionId, operationId, err, edits)
-  }
+  // Defer dispatch until the map contains its promise (including synchronous transport failures).
+  batch.promise = Promise.resolve().then(async () => {
+    let failure: unknown
+    if (!existing) {
+      try {
+        const response = await api.commitOperations({ connectionId, operationId: batch.operationId, operations: edits.map(e => e.operation) })
+        return completeBatch(connectionId, batch, response)
+      } catch (err) {
+        failure = err
+        let validRefusal = false
+        if (err instanceof ApiError && err.status >= 400 && err.status < 500 && !['unknown', 'in_progress'].includes(err.state ?? '')) {
+          try { const refusal = validateCommitFailure(err.body, batch.operationId); validRefusal = !['unknown', 'in_progress'].includes(String(refusal.state)) } catch { /* ambiguous receipt */ }
+        }
+        if (validRefusal) {
+          inFlight.delete(connectionId)
+          publishCommitBatches()
+          return failBatch(err, edits)
+        }
+      }
+    }
+    let outcome: OutcomeResponse | null = null
+    try { outcome = validateCommitOutcome(await api.operationOutcome(connectionId, batch.operationId), batch.operationId, batch.edits.map(e => e.operation)) } catch { /* retain identity */ }
+    if (outcome?.state === 'committed' && outcome.response) return completeBatch(connectionId, batch, outcome.response)
+    if (outcome?.state === 'failed') {
+      inFlight.delete(connectionId)
+      publishCommitBatches()
+      return failBatch(new Error(outcome.error || (failure instanceof Error ? failure.message : 'Commit failed')), edits)
+    }
+    batch.uncertain = true
+    publishCommitBatches()
+    return failBatch(new Error(`commit outcome unknown (${batch.operationId}) — check the recorded outcome again; no new operation will be sent`), edits)
+  }).finally(() => { batch.promise = null; publishCommitBatches() })
+  publishCommitBatches()
+  return batch.promise
 }
 
-/** A commit attempt failed: either the server refused it (nothing applied —
- *  the draft stays staged), or the response was lost mid-flight and the
- *  recorded outcome decides. Unknown outcomes never auto-retry. The first
- *  offending operation pins the error focus so the grid can land the user
- *  on the cause. */
-async function resolveFailedCommit(connectionId: string, operationId: string, err: unknown, edits: StagedEdit[]): Promise<CommitResponse> {
-  const dropped = err instanceof TypeError || (err instanceof ApiError && err.state === 'unknown')
-  if (dropped) {
-    let outcome: OutcomeResponse | null = null
-    try {
-      outcome = await api.operationOutcome(connectionId, operationId)
-    } catch {
-      outcome = null // the lookup itself failed
-    }
-    if (outcome && outcome.state === 'committed' && outcome.response) {
-      commitPhase.value = 'committed'
-      lastCommit.value = { operationId, response: outcome.response, at: Date.now() }
-      clearStaged(connectionId)
-      invalidateConnectionRows(connectionId)
-      return outcome.response
-    }
-    if (!outcome || outcome.state === 'unknown') {
-      commitPhase.value = 'failed'
-      commitError.value = 'commit outcome unknown — verify the table state before retrying with a new operation ID'
-      throw new Error(commitError.value)
-    }
-    // failed / in_progress: fall through with the original error.
-  }
+function failBatch(err: unknown, edits: StagedEdit[]): never {
   commitPhase.value = 'failed'
   commitError.value = err instanceof Error ? err.message : String(err)
   const offender = edits[firstOffendingOpIndex(commitError.value)]
-  if (offender) {
-    failedEditFocus.value = { editId: offender.id, reason: commitError.value }
-  }
+  if (offender) failedEditFocus.value = { editId: offender.id, reason: commitError.value }
   throw err
 }
 
@@ -355,12 +394,13 @@ export async function previewStaged(connectionId: string): Promise<PreviewRespon
 export async function revertLastCommit(connectionId: string): Promise<CommitResponse> {
   const last = lastCommit.value
   if (!last) throw new Error('nothing to revert')
+  if (connectionId !== last.connectionId) throw new Error('Committed batch belongs to another connection')
   const res = await api.revertOperation({
     connectionId,
     operationId: last.operationId,
     revertOperationId: newOperationId(),
   })
-  lastCommit.value = null
+  if (lastCommit.value === last) lastCommit.value = null
   commitPhase.value = 'idle'
   invalidateConnectionRows(connectionId)
   return res
@@ -415,20 +455,28 @@ export function toggleTheme() {
 export const schemaRefreshing = signal(false)
 export const schemaRefreshError = signal<string | null>(null)
 
+let schemaRefreshGeneration = 0
+activeConnection.subscribe(() => {
+  schemaRefreshGeneration++
+  schemaRefreshing.value = false
+  schemaRefreshError.value = null
+})
+
 export async function refreshSchema(connectionId?: string): Promise<Schema | null> {
   const id = connectionId ?? activeConnection.value?.id
   if (!id) return null
-  schemaRefreshing.value = true
-  schemaRefreshError.value = null
+  const generation = activeConnection.value?.id === id ? ++schemaRefreshGeneration : -1
+  const owns = () => generation === schemaRefreshGeneration && activeConnection.value?.id === id
+  if (owns()) { schemaRefreshing.value = true; schemaRefreshError.value = null }
   try {
     const sc = await api.schema(id)
-    schema.value = sc
+    if (owns()) schema.value = sc
     return sc
   } catch (err: unknown) {
-    schemaRefreshError.value = err instanceof Error ? err.message : String(err)
+    if (owns()) schemaRefreshError.value = err instanceof Error ? err.message : String(err)
     return null
   } finally {
-    schemaRefreshing.value = false
+    if (owns()) schemaRefreshing.value = false
   }
 }
 

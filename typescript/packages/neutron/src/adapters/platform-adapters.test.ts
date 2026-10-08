@@ -234,6 +234,7 @@ describe("platform adapters", () => {
     await adapter.adapt({
       rootDir: outDir,
       outDir,
+      publicArtifacts: [],
       routes: { total: 3, static: 2, app: 1 },
       ensureRuntimeBundle: async () => ({
         target: "node",

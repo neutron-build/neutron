@@ -6,8 +6,8 @@ Each subdirectory is an independent project with its own language, toolchain, an
 
 | Directory | Language | How to contribute |
 |-----------|----------|-------------------|
-| `rs/` | Rust | `cargo test` |
-| `ts/` | TypeScript | `pnpm test` |
+| `rust/` | Rust | `cargo test` |
+| `typescript/` | TypeScript | `pnpm test` |
 | `mojo/` | Mojo | `pixi run mojo build` |
 | `nucleus/` | Rust | `cargo test --lib` |
 | `studio/` | TypeScript | `pnpm dev` |
@@ -38,7 +38,7 @@ Each subdirectory is an independent project with its own language, toolchain, an
 ## Issues
 
 - Use the issue tracker for bugs and feature requests
-- Tag issues with the relevant project (`rs`, `ts`, `nucleus`, etc.)
+- Tag issues with the relevant project (`rust`, `typescript`, `nucleus`, etc.)
 
 ## Code of Conduct
 
@@ -47,3 +47,5 @@ Be respectful and constructive. See [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
 ## License
 
 By contributing, you agree your contributions will be licensed under the MIT License.
+
+Security reporting and release support are described in [SECURITY.md](SECURITY.md).

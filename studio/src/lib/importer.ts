@@ -214,7 +214,7 @@ export function autoMap(fields: SourceField[], columns: TableMetaColumn[]): Reco
     const k = f.label.toLowerCase()
     if (!byName.has(k)) byName.set(k, f)
   }
-  const out: Record<string, ColumnMapping> = {}
+  const out: Record<string, ColumnMapping> = Object.create(null)
   for (const col of columns) {
     const f = byName.get(col.name.toLowerCase())
     out[col.name] = f ? { kind: 'field', field: f.id } : { kind: 'default' }
@@ -227,7 +227,7 @@ export function mappingProblems(mapping: Record<string, ColumnMapping>, columns:
   const problems: string[] = []
   let mapped = 0
   for (const col of columns) {
-    const m = mapping[col.name] ?? { kind: 'default' }
+    const m = (Object.hasOwn(mapping, col.name) ? mapping[col.name] : undefined) ?? { kind: 'default' }
     if (m.kind === 'field') mapped++
     if (m.kind === 'default' && isRequired(col)) {
       problems.push(`${col.name} is NOT NULL without a default — map a source field to it`)
@@ -345,9 +345,9 @@ export function encodeRecord(
   opts: ImportValueOptions,
 ): Record<string, unknown> {
   if (rec.shapeError) throw new RowEncodeError(`the row ${rec.shapeError}`)
-  const values: Record<string, unknown> = {}
+  const values: Record<string, unknown> = Object.create(null)
   for (const col of columns) {
-    const m = mapping[col.name] ?? { kind: 'default' }
+    const m = (Object.hasOwn(mapping, col.name) ? mapping[col.name] : undefined) ?? { kind: 'default' }
     let cell: EncodedCell
     if (m.kind === 'default') cell = { kind: 'omit' }
     else if (m.kind === 'null') cell = { kind: 'null' }

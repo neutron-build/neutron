@@ -1,8 +1,7 @@
-// Quint-connect conformance testing harness for Nucleus.
-//
-// This crate bridges Quint specifications (formal models) with the actual
-// Nucleus Rust implementation. The spec acts as an oracle — if the
-// implementation diverges from the spec, the test fails.
+// Model mirrors remain scaffolding. The feature-gated WAL adapter below calls
+// actual public Nucleus APIs; its execution receipt is a separate CI artifact.
+#[cfg(feature = "production-trace")]
+pub mod production_wal_trace;
 
 pub mod multi_raft_conform;
 pub mod resharding_conform;

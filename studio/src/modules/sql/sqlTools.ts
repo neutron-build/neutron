@@ -12,7 +12,7 @@ import type { QueryHistoryEntry, SqlTable } from '../../lib/types'
 
 // --- Lexical scan -----------------------------------------------------------
 
-type Token = { kind: 'word'; text: string } | { kind: 'param'; index: number } | { kind: 'paren' }
+type Token = { kind: 'word'; text: string } | { kind: 'param'; digits: string } | { kind: 'paren' }
 
 const isIdentStart = (c: string) => /[A-Za-z_\u0080-￿]/.test(c)
 const isIdentChar = (c: string) => /[A-Za-z0-9_$\u0080-￿]/.test(c)
@@ -74,7 +74,7 @@ function scan(sql: string): Token[] {
       if (/[0-9]/.test(next ?? '') && !isIdentChar(sql[i - 1] ?? ' ')) {
         let j = i + 1
         while (j < n && /[0-9]/.test(sql[j])) j++
-        out.push({ kind: 'param', index: Number(sql.slice(i + 1, j)) })
+        out.push({ kind: 'param', digits: sql.slice(i + 1, j) })
         i = j
         continue
       }
@@ -110,10 +110,18 @@ function scan(sql: string): Token[] {
  * referenced outside literals and comments ($3 alone still binds three
  * values — PostgreSQL parameters are positional).
  */
+// Studio admits 1,024 positional values, below /api/query's 10,000 cap.
+export const MAX_PARAMETERS = 1024
+export class ParameterError extends Error {}
 export function parameterCount(sql: string): number {
   let max = 0
   for (const t of scan(sql)) {
-    if (t.kind === 'param' && t.index > max) max = t.index
+    if (t.kind !== 'param') continue
+    const digits = t.digits.replace(/^0+/, '')
+    if (!digits || digits.length > 4 || (digits.length === 4 && digits > String(MAX_PARAMETERS))) {
+      throw new ParameterError(`Parameter index must be between $1 and $${MAX_PARAMETERS}`)
+    }
+    max = Math.max(max, Number(digits))
   }
   return max
 }
@@ -173,9 +181,9 @@ export function quoteIdentIfNeeded(name: string): string {
  * tables complete schema-qualified.
  */
 export function buildCompletionNamespace(tables: readonly SqlTable[]): SQLNamespace {
-  const ns: Record<string, Record<string, Completion[]>> = {}
+  const ns: Record<string, Record<string, Completion[]>> = Object.create(null)
   for (const t of tables) {
-    const schemaLevel = (ns[t.schema] ??= {})
+    const schemaLevel = (ns[t.schema] ??= Object.create(null))
     schemaLevel[t.name] = t.columns.map(c => {
       const quoted = quoteIdentIfNeeded(c.name)
       const completion: Completion = { label: c.name, type: 'property', detail: c.type }
@@ -307,11 +315,11 @@ export interface PlanTreeNode {
 
 /** Fields the curated metrics line covers; everything else lands in extras. */
 const CURATED_NODE_FIELDS = new Set([
-  'Node Type', 'Relation Name', 'Schema', 'Alias', 'CTE Name', 'Function Name', 'Index Name',
+  'Node Type', 'Relation Name', 'Schema', 'CTE Name', 'Function Name', 'Index Name',
   'Join Type', 'Operation', 'Index Cond', 'Hash Cond', 'Merge Cond', 'Join Filter', 'Filter',
-  'Sort Key', 'Group Key', 'Startup Cost', 'Total Cost', 'Plan Rows', 'Plan Width',
+  'Sort Key', 'Group Key', 'Startup Cost', 'Total Cost', 'Plan Rows',
   'Actual Startup Time', 'Actual Total Time', 'Actual Rows', 'Actual Loops', 'Plans',
-  'Parent Relationship', 'Rows Removed by Filter', 'Rows Removed by Join Filter',
+  'Parent Relationship', 'Rows Removed by Filter',
   'Shared Hit Blocks', 'Shared Read Blocks', 'Shared Dirtied Blocks', 'Shared Written Blocks',
   'Local Hit Blocks', 'Local Read Blocks', 'Local Dirtied Blocks', 'Local Written Blocks',
   'Temp Read Blocks', 'Temp Written Blocks',
@@ -408,22 +416,41 @@ export function planTree(plan: unknown): PlanTreeNode | null {
 // --- History (localStorage, per connection) ---------------------------------------
 
 export const HISTORY_MAX = 50
+export const HISTORY_MAX_BYTES = 256 * 1024
 
 export function historyKey(connId: string) {
   return `neutron:query-history:${connId}`
 }
 
-export function loadHistory(connId: string): QueryHistoryEntry[] {
+export function loadHistory(connId: string, strict = false): QueryHistoryEntry[] {
   try {
-    const parsed = JSON.parse(localStorage.getItem(historyKey(connId)) ?? '[]')
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
+    const raw = localStorage.getItem(historyKey(connId)) ?? '[]'
+    if (new TextEncoder().encode(raw).length > HISTORY_MAX_BYTES) return []
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter(validHistoryEntry).slice(0, HISTORY_MAX) : []
+  } catch (error) {
+    if (strict) throw error
     return []
   }
 }
 
+function validHistoryEntry(value: unknown): value is QueryHistoryEntry {
+  if (!value || typeof value !== 'object') return false
+  const e = value as QueryHistoryEntry
+  return typeof e.sql === 'string' && typeof e.executedAt === 'string' &&
+    Number.isFinite(e.duration) && e.duration >= 0 && Number.isSafeInteger(e.rowCount) && e.rowCount >= 0 &&
+    (e.params === undefined || (Array.isArray(e.params) && e.params.length <= MAX_PARAMETERS && e.params.every(p => p === null || typeof p === 'string'))) &&
+    (e.status === undefined || ['ok', 'error', 'canceled'].includes(e.status))
+}
+
 function saveHistory(connId: string, entries: QueryHistoryEntry[]) {
-  localStorage.setItem(historyKey(connId), JSON.stringify(entries.slice(0, HISTORY_MAX)))
+  const bounded: QueryHistoryEntry[] = []
+  for (const entry of entries.slice(0, HISTORY_MAX)) {
+    if (!validHistoryEntry(entry)) continue
+    const next = [...bounded, entry]
+    if (new TextEncoder().encode(JSON.stringify(next)).length <= HISTORY_MAX_BYTES) bounded.push(entry)
+  }
+  localStorage.setItem(historyKey(connId), JSON.stringify(bounded))
 }
 
 /**
@@ -433,7 +460,7 @@ function saveHistory(connId: string, entries: QueryHistoryEntry[]) {
 export function pushHistory(connId: string, entry: QueryHistoryEntry) {
   const sameRun = (e: QueryHistoryEntry) =>
     e.sql === entry.sql && JSON.stringify(e.params ?? []) === JSON.stringify(entry.params ?? [])
-  const existing = loadHistory(connId).filter(e => !sameRun(e))
+  const existing = loadHistory(connId, true).filter(e => !sameRun(e))
   saveHistory(connId, [entry, ...existing])
 }
 

@@ -1,5 +1,5 @@
 /** @type {import('ts-jest').JestConfigWithTsJest} */
-module.exports = {
+const base = {
   preset: 'ts-jest',
   testEnvironment: 'node',
   roots: ['<rootDir>/packages'],
@@ -52,3 +52,14 @@ module.exports = {
     '/node_modules/(?!(@preact)/)',
   ],
 };
+
+const componentTest = '**/components/__tests__/components.test.tsx';
+module.exports = { projects: [
+  { ...base, displayName: 'source-unit', testPathIgnorePatterns: [...base.testPathIgnorePatterns, '/components/__tests__/components.test.tsx'] },
+  { ...base, displayName: 'react-integration', testMatch: [componentTest], modulePathIgnorePatterns: [...base.modulePathIgnorePatterns, '/src/__mocks__/react.ts', '/src/__mocks__/react-native.ts'], moduleNameMapper: {
+      ...base.moduleNameMapper,
+      '^react$': require.resolve('react', { paths: [__dirname + '/packages/neutron-native'] }),
+      '^react/jsx-runtime$': require.resolve('react/jsx-runtime', { paths: [__dirname + '/packages/neutron-native'] }),
+      '^react-native$': '<rootDir>/packages/neutron-native/src/__mocks__/react-native-renderer.ts',
+    } },
+] };

@@ -1,13 +1,14 @@
 import { useSignal } from '@preact/signals'
-import { useEffect, useRef, useCallback } from 'preact/hooks'
+import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
-import { api } from '../../lib/api'
+import { api, queryMutationOrThrow as runMutation } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
 import { isRlsDenied } from '../../lib/rls'
 import { RlsNotice } from '../../components/RlsNotice'
 import s from './KVModule.module.css'
 
 interface KVEntry {
+  connectionId: string
   key: string
   value: string
   ttl: number | null // seconds remaining, null = no expiry
@@ -35,6 +36,9 @@ export function KVModule({ name }: KVModuleProps) {
   const newTTL = useSignal('')
   const filterText = useSignal('')
   const saving = useSignal(false)
+  const adding = useRef(false)
+  const inlineVersion = useRef(0)
+  const newVersion = useRef(0)
 
   // Inline editing state
   const inlineEditKey = useSignal<string | null>(null)
@@ -52,14 +56,40 @@ export function KVModule({ name }: KVModuleProps) {
   const rlsDenied = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
+  const viewGeneration = useRef(0)
+  const readGeneration = useRef(0)
+  const selectionRevision = useRef(0)
+  const deleting = useRef(new Set<string>())
+  const connectionOwner = useRef(conn.id)
+  function clearConfirmation() {
+    if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
+    confirmTimerRef.current = null
+    confirmDeleteKey.value = null
+  }
+  // Invalidate synchronously, before effects or any old callback can run.
+  useEffect(() => activeConnection.subscribe(next => {
+    if (next?.id === connectionOwner.current) return
+    connectionOwner.current = next?.id ?? ''
+    viewGeneration.current++; readGeneration.current++; selectionRevision.current++
+    inlineVersion.current++; newVersion.current++
+    clearConfirmation()
+    entries.value = []; selected.value = null
+    inlineEditKey.value = null; editValue.value = ''; editTTL.value = ''
+    rlsDenied.value = null; loading.value = false
+  }), [])
 
   async function load() {
+    if (activeConnection.value?.id !== conn.id) return
+    const view = viewGeneration.current
+    const own = ++readGeneration.current
+    const owns = () => activeConnection.value?.id === conn.id && view === viewGeneration.current && own === readGeneration.current
     loading.value = true
     try {
       // The KV store is a single global keyspace — enumerate keys with
       // KV_KEYS(pattern), which returns a JSON array of key strings.
       const keyRes = await api.query(`SELECT KV_KEYS('*')`, conn.id)
-      if (keyRes.error) throw new Error(keyRes.error)
+      if (!owns()) return
+      if (keyRes.error || keyRes.canceled) throw new Error(keyRes.error || 'Read canceled')
       const cell = keyRes.rows[0]?.[0]
       const keys: string[] = Array.isArray(cell)
         ? cell.map(String)
@@ -74,23 +104,26 @@ export function KVModule({ name }: KVModuleProps) {
       // select: KV_GET(k), KV_TTL(k) pairs.
       const cols = keys.flatMap(k => [`KV_GET(${sqlStr(k)})`, `KV_TTL(${sqlStr(k)})`]).join(', ')
       const valRes = await api.query(`SELECT ${cols}`, conn.id)
-      if (valRes.error) throw new Error(valRes.error)
+      if (!owns()) return
+      if (valRes.error || valRes.canceled) throw new Error(valRes.error || 'Read canceled')
       const valRow = (valRes.rows[0] ?? []) as unknown[]
       entries.value = keys.map((k, i) => ({
+        connectionId: conn.id,
         key: k,
         value: valRow[i * 2] != null ? String(valRow[i * 2]) : '',
         ttl: ttlFromEngine(valRow[i * 2 + 1]),
       }))
     } catch (err: unknown) {
+      if (!owns()) return
       const msg = err instanceof Error ? err.message : String(err)
       rlsDenied.value = isRlsDenied(msg) ? msg : null
       toast('error', msg)
     } finally {
-      loading.value = false
+      if (owns()) loading.value = false
     }
   }
 
-  useEffect(() => { load() }, [name])
+  useEffect(() => { void load(); return () => { viewGeneration.current++; readGeneration.current++; clearConfirmation() } }, [name, conn.id])
 
   // Clean up confirm timer on unmount
   useEffect(() => {
@@ -100,7 +133,9 @@ export function KVModule({ name }: KVModuleProps) {
   }, [])
 
   function selectEntry(e: KVEntry) {
-    selected.value = e
+    if (e.connectionId !== activeConnection.value?.id) return
+    selectionRevision.current++
+    selected.value = { ...e }
     editValue.value = e.value
     editTTL.value = e.ttl != null ? String(e.ttl) : ''
   }
@@ -108,31 +143,37 @@ export function KVModule({ name }: KVModuleProps) {
   // Start inline editing a value cell
   function startInlineEdit(e: KVEntry, ev: Event) {
     ev.stopPropagation()
+    if (e.connectionId !== activeConnection.value?.id) return
+    inlineVersion.current++
     inlineEditKey.value = e.key
     inlineEditValue.value = e.value
     inlineEditDirty.value = false
   }
 
   function cancelInlineEdit() {
+    inlineVersion.current++
     inlineEditKey.value = null
     inlineEditValue.value = ''
     inlineEditDirty.value = false
   }
 
   async function saveInlineEdit() {
+    if (saving.value) return
+    const version = inlineVersion.current
+    const submitted = inlineEditValue.value
     const key = inlineEditKey.value
-    if (!key) return
+    if (!key || activeConnection.value?.id !== conn.id) return
     saving.value = true
     try {
       // Find the entry to preserve TTL
       const entry = entries.value.find(e => e.key === key)
       const ttlArg = entry?.ttl != null ? `, ${entry.ttl}` : ''
-      await api.query(
-        `SELECT KV_SET(${sqlStr(key)}, ${sqlStr(inlineEditValue.value)}${ttlArg})`,
+      await queryMutationOrThrow(
+        `SELECT KV_SET(${sqlStr(key)}, ${sqlStr(submitted)}${ttlArg})`,
         conn.id
       )
       toast('success', `Saved ${key}`)
-      cancelInlineEdit()
+      if (inlineVersion.current === version && activeConnection.value?.id === conn.id) cancelInlineEdit()
       await load()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -142,14 +183,15 @@ export function KVModule({ name }: KVModuleProps) {
   }
 
   async function saveEdit() {
+    if (saving.value) return
     const e = selected.value
-    if (!e) return
+    if (!e || e.connectionId !== activeConnection.value?.id) return
     saving.value = true
     try {
       const ttlArg = editTTL.value ? `, ${parseInt(editTTL.value)}` : ''
-      await api.query(
+      await queryMutationOrThrow(
         `SELECT KV_SET(${sqlStr(e.key)}, ${sqlStr(editValue.value)}${ttlArg})`,
-        conn.id
+        e.connectionId
       )
       toast('success', `Saved ${e.key}`)
       await load()
@@ -160,52 +202,61 @@ export function KVModule({ name }: KVModuleProps) {
     }
   }
 
-  // Delete with confirmation
-  const requestDelete = useCallback((key: string, ev: Event) => {
+  const entryIdentity = (e: KVEntry) => JSON.stringify([e.connectionId, e.key])
+  function requestDelete(entry: KVEntry, ev: Event) {
     ev.stopPropagation()
-    if (confirmDeleteKey.value === key) {
-      // Already confirming — execute delete
-      if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
-      confirmDeleteKey.value = null
-      doDelete(key)
+    if (entry.connectionId !== activeConnection.value?.id) { clearConfirmation(); return }
+    const identity = entryIdentity(entry)
+    if (deleting.current.has(identity)) return
+    if (confirmDeleteKey.value === identity) {
+      clearConfirmation()
+      void doDelete(entry)
     } else {
-      // First click — show confirm
-      confirmDeleteKey.value = key
-      if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
-      confirmTimerRef.current = setTimeout(() => {
-        confirmDeleteKey.value = null
+      clearConfirmation()
+      confirmDeleteKey.value = identity
+      const timer = setTimeout(() => {
+        if (confirmTimerRef.current === timer && confirmDeleteKey.value === identity) clearConfirmation()
       }, 3000)
-    }
-  }, [])
-
-  async function doDelete(key: string) {
-    try {
-      await api.query(`SELECT KV_DEL(${sqlStr(key)})`, conn.id)
-      if (selected.value?.key === key) selected.value = null
-      toast('info', `Deleted ${key}`)
-      await load()
-    } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      confirmTimerRef.current = timer
     }
   }
 
+  async function doDelete(entry: KVEntry) {
+    const identity = entryIdentity(entry)
+    if (entry.connectionId !== activeConnection.value?.id || deleting.current.has(identity)) return
+    const selectedAtDispatch = selected.value
+    const revision = selectionRevision.current
+    deleting.current.add(identity)
+    try {
+      await queryMutationOrThrow(`SELECT KV_DEL(${sqlStr(entry.key)})`, entry.connectionId)
+      if (revision === selectionRevision.current && selected.value === selectedAtDispatch &&
+          selected.value && entryIdentity(selected.value) === identity) selected.value = null
+      toast('info', `Deleted ${entry.key} on ${entry.connectionId}`)
+      await load()
+    } catch (err: unknown) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally { deleting.current.delete(identity) }
+  }
+
   async function addEntry() {
+    if (adding.current || activeConnection.value?.id !== conn.id) return
+    const version = newVersion.current
     if (!newKey.value.trim() || !newValue.value.trim()) return
+    adding.current = true
     try {
       const ttlArg = newTTL.value ? `, ${parseInt(newTTL.value)}` : ''
-      await api.query(
+      await queryMutationOrThrow(
         `SELECT KV_SET(${sqlStr(newKey.value)}, ${sqlStr(newValue.value)}${ttlArg})`,
         conn.id
       )
-      newKey.value = ''
-      newValue.value = ''
-      newTTL.value = ''
-      showNewKeyForm.value = false
+      if (newVersion.current === version && activeConnection.value?.id === conn.id) {
+        newKey.value = ''; newValue.value = ''; newTTL.value = ''; showNewKeyForm.value = false
+      }
       toast('success', 'Key added')
       await load()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
-    }
+    } finally { adding.current = false }
   }
 
   const visible = filterText.value
@@ -241,7 +292,7 @@ export function KVModule({ name }: KVModuleProps) {
           >JSON</button>
           <button
             class={s.newKeyBtn}
-            onClick={() => { showNewKeyForm.value = !showNewKeyForm.value }}
+            onClick={() => { newVersion.current++; showNewKeyForm.value = !showNewKeyForm.value }}
             title="New Key"
           >+</button>
         </div>
@@ -256,13 +307,13 @@ export function KVModule({ name }: KVModuleProps) {
               class={s.addInput}
               placeholder="Key"
               value={newKey.value}
-              onInput={e => { newKey.value = (e.target as HTMLInputElement).value }}
+              onInput={e => { newVersion.current++; newKey.value = (e.target as HTMLInputElement).value }}
             />
             <input
               class={s.addInput}
               placeholder="Value"
               value={newValue.value}
-              onInput={e => { newValue.value = (e.target as HTMLInputElement).value }}
+              onInput={e => { newVersion.current++; newValue.value = (e.target as HTMLInputElement).value }}
             />
             <div class={s.addRow}>
               <input
@@ -270,10 +321,10 @@ export function KVModule({ name }: KVModuleProps) {
                 placeholder="TTL (s)"
                 type="number"
                 value={newTTL.value}
-                onInput={e => { newTTL.value = (e.target as HTMLInputElement).value }}
+                onInput={e => { newVersion.current++; newTTL.value = (e.target as HTMLInputElement).value }}
               />
               <button class={s.addBtn} onClick={addEntry}>Set</button>
-              <button class={s.cancelBtn} onClick={() => { showNewKeyForm.value = false; newKey.value = ''; newValue.value = ''; newTTL.value = '' }}>Cancel</button>
+              <button class={s.cancelBtn} onClick={() => { newVersion.current++; showNewKeyForm.value = false; newKey.value = ''; newValue.value = ''; newTTL.value = '' }}>Cancel</button>
             </div>
           </div>
         )}
@@ -285,11 +336,11 @@ export function KVModule({ name }: KVModuleProps) {
           )}
           {visible.map(e => {
             const isEditing = inlineEditKey.value === e.key
-            const isConfirmingDelete = confirmDeleteKey.value === e.key
+            const isConfirmingDelete = confirmDeleteKey.value === entryIdentity(e)
             return (
               <div
-                key={e.key}
-                class={`${s.keyRow} ${selected.value?.key === e.key ? s.keyRowActive : ''} ${isEditing ? s.keyRowEditing : ''}`}
+                key={entryIdentity(e)}
+                class={`${s.keyRow} ${selected.value && entryIdentity(selected.value) === entryIdentity(e) ? s.keyRowActive : ''} ${isEditing ? s.keyRowEditing : ''}`}
                 onClick={() => selectEntry(e)}
               >
                 <span class={s.keyName}>{e.key}</span>
@@ -308,6 +359,7 @@ export function KVModule({ name }: KVModuleProps) {
                       class={s.inlineTextarea}
                       value={inlineEditValue.value}
                       onInput={ev => {
+                        inlineVersion.current++
                         inlineEditValue.value = (ev.target as HTMLTextAreaElement).value
                         inlineEditDirty.value = true
                       }}
@@ -325,7 +377,7 @@ export function KVModule({ name }: KVModuleProps) {
                 {e.ttl != null && <span class={s.ttlBadge}>{formatTTL(e.ttl)}</span>}
                 <button
                   class={`${s.deleteBtn} ${isConfirmingDelete ? s.deleteBtnConfirm : ''}`}
-                  onClick={ev => requestDelete(e.key, ev)}
+                  onClick={ev => requestDelete(e, ev)}
                   title={isConfirmingDelete ? 'Click again to confirm' : 'Delete key'}
                 >{isConfirmingDelete ? 'Confirm?' : '\u00d7'}</button>
               </div>
@@ -349,7 +401,7 @@ export function KVModule({ name }: KVModuleProps) {
             <textarea
               class={s.valueEditor}
               value={editValue.value}
-              onInput={e => { editValue.value = (e.target as HTMLTextAreaElement).value }}
+              onInput={e => { selectionRevision.current++; editValue.value = (e.target as HTMLTextAreaElement).value }}
             />
             <div class={s.valueFooter}>
               <div class={s.ttlRow}>
@@ -359,7 +411,7 @@ export function KVModule({ name }: KVModuleProps) {
                   type="number"
                   placeholder="no expiry"
                   value={editTTL.value}
-                  onInput={e => { editTTL.value = (e.target as HTMLInputElement).value }}
+                  onInput={e => { selectionRevision.current++; editTTL.value = (e.target as HTMLInputElement).value }}
                 />
               </div>
               <button class={s.saveBtn} onClick={saveEdit} disabled={saving.value}>
@@ -377,8 +429,10 @@ function sqlStr(s: string) {
   return `'${s.replace(/'/g, "''")}'`
 }
 
-function formatTTL(seconds: number) {
+export function formatTTL(seconds: number) {
   if (seconds < 60) return `${seconds}s`
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
   return `${Math.floor(seconds / 3600)}h`
 }
+
+const queryMutationOrThrow = (sql: string, connectionId: string, params?: unknown[]) => runMutation(sql, connectionId, params, api.query)

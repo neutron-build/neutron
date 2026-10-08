@@ -5,12 +5,26 @@ import { styleToCSS } from '../web-compat/style.js'
 export function Switch({ value, onValueChange, disabled, trackColor, thumbColor, style, testID }: SwitchProps) {
   const track = value ? (trackColor?.true ?? '#34c759') : (trackColor?.false ?? '#e5e5ea')
 
+  function handleKey(e: KeyboardEvent) {
+    if (disabled) return
+    // A switch is operable from the keyboard (NF-NR-14): Space and Enter
+    // toggle, matching the WAI-ARIA switch pattern.
+    if (e.key === ' ' || e.key === 'Enter') {
+      e.preventDefault()
+      onValueChange?.(!value)
+    }
+  }
+
   return (
     <div
       data-testid={testID}
       role="switch"
       aria-checked={value}
+      aria-disabled={disabled}
+      aria-label={testID}
+      tabIndex={disabled ? -1 : 0}
       onClick={disabled ? undefined : () => onValueChange?.(!value)}
+      onKeyDown={handleKey}
       style={{
         display: 'inline-flex',
         alignItems: 'center',

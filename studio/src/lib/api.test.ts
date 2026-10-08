@@ -563,3 +563,27 @@ describe('PostgreSQL keyset page API', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+// Parseable JSON must cross the real mutation transport validator.
+describe('commit transport receipt validation', () => {
+  beforeEach(() => { vi.stubGlobal('fetch', vi.fn()); _setSessionTokenForTests('token') })
+  afterEach(() => { vi.unstubAllGlobals(); _setSessionTokenForTests(null) })
+  function mockOk(body: unknown) { vi.mocked(fetch).mockResolvedValueOnce({ok:true, json:async()=>body} as Response) }
+  it.each([{}, null, { operationId: 'other', rowsAffected: 0, operations: [], reversible: false }])('rejects a malformed direct receipt %j', async body => {
+    _setSessionTokenForTests('token')
+    mockOk(body)
+    await expect(api.commitOperations({ connectionId: 'c', operationId: 'requested', operations: [] })).rejects.toThrow('receipt')
+  })
+  it.each([{ operationId: 'other', state: 'unknown' }, { operationId: 'requested', state: 'committed', response: {} }, { operationId: 'requested', state: 'failed', status: 409, response: { operationId: 'other', error: 'no' } }])('rejects malformed outcome %j', async body => {
+    _setSessionTokenForTests('token')
+    mockOk(body)
+    await expect(api.operationOutcome('c', 'requested')).rejects.toThrow('receipt')
+  })
+})
+
+it('direct failed commit response with mismatched identity stays ambiguous', async () => {
+  _setSessionTokenForTests('token')
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 409, text: async () => JSON.stringify({ operationId: 'other', state: 'conflict', error: 'refused' }) }))
+  try { await expect(api.commitOperations({ connectionId: 'c', operationId: 'requested', operations: [] })).rejects.toThrow('receipt') }
+  finally { vi.unstubAllGlobals(); _setSessionTokenForTests(null) }
+})

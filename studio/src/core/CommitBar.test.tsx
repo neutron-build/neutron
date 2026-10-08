@@ -1,8 +1,9 @@
+import { commitReceiptFor, commitRefusalFor } from '../lib/commitFixture'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact'
 import {
   stagedEdits, stageEdit, clearStaged, commitPhase, commitError, lastCommit, lastPreview,
-  activeConnection, toasts, failedEditFocus, limitsReport,
+  activeConnection, toasts, failedEditFocus, limitsReport, pendingCommits, _resetCommitBatchesForTests,
 } from '../lib/store'
 import limitsFixture from '../lib/limits.fixture.json'
 import type { LimitsReport } from '../lib/types'
@@ -49,6 +50,8 @@ const okResponse: CommitResponse = {
 
 beforeEach(() => {
   cleanup()
+  _resetCommitBatchesForTests()
+  vi.mocked(api.operationOutcome).mockReset()
   stagedEdits.value = []
   commitPhase.value = 'idle'
   commitError.value = null
@@ -80,7 +83,7 @@ describe('CommitBar — staged atomic commits (S02)', () => {
 
   it('lists staged operations and commits them as one batch', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
-    commitOperations.mockResolvedValueOnce(okResponse)
+    commitOperations.mockImplementationOnce(async input => commitReceiptFor(input.operationId, input.operations, true))
     render(<CommitBar />)
 
     expect(screen.getByText('docs.note = staged')).toBeTruthy()
@@ -98,7 +101,7 @@ describe('CommitBar — staged atomic commits (S02)', () => {
 
   it('a refused commit keeps the staged edits visible (reconcilable draft)', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
-    commitOperations.mockRejectedValueOnce(new ApiError(409, 'row changed since it was read', { state: 'conflict' }))
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(409, 'row changed since it was read', { state: 'conflict' }), input.operationId) })
     render(<CommitBar />)
 
     fireEvent.click(screen.getByTitle(/Commit all staged edits as one atomic batch/))
@@ -134,7 +137,7 @@ describe('CommitBar — staged atomic commits (S02)', () => {
   })
 
   it('revert undoes the last committed batch through the server', async () => {
-    lastCommit.value = { operationId: 'op-1', response: okResponse, at: Date.now() }
+    lastCommit.value = { connectionId: 'c1', operationId: 'op-1', response: okResponse, at: Date.now() }
     revertOperation.mockResolvedValueOnce({ ...okResponse, reverted: 'op-1' })
     render(<CommitBar />)
 
@@ -145,7 +148,7 @@ describe('CommitBar — staged atomic commits (S02)', () => {
   })
 
   it('an irreversible commit shows its honest refusal instead of a revert button', () => {
-    lastCommit.value = {
+    lastCommit.value = { connectionId: 'c1',
       operationId: 'op-9', at: Date.now(),
       response: { ...okResponse, operationId: 'op-9', reversible: false, reversibleReason: 'identity column "id" cannot be re-inserted on revert' },
     }
@@ -165,8 +168,8 @@ describe('CommitBar — staged atomic commits (S02)', () => {
 
   it('a binding refusal at commit keeps the draft and surfaces the state', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
-    commitOperations.mockRejectedValueOnce(new ApiError(409,
-      'public.docs is no longer the relation these rows were read from; reload before editing', { state: 'binding' }))
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(409,
+      'public.docs is no longer the relation these rows were read from; reload before editing', { state: 'binding' }), input.operationId) })
     render(<CommitBar />)
 
     fireEvent.click(screen.getByTitle(/Commit all staged edits as one atomic batch/))
@@ -178,8 +181,8 @@ describe('CommitBar — staged atomic commits (S02)', () => {
   it('a failed commit pins the first offending staged edit (error focus)', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'first' })
     stageEdit({ connectionId: 'c1', operation: { ...updateOp, value: 'second' }, label: 'second' })
-    commitOperations.mockRejectedValueOnce(new ApiError(409,
-      'operations[1]: update refused: row changed since it was read', { state: 'conflict' }))
+    commitOperations.mockImplementationOnce(async input => { throw commitRefusalFor(new ApiError(409,
+      'operations[1]: update refused: row changed since it was read', { state: 'conflict' }), input.operationId) })
     render(<CommitBar />)
 
     fireEvent.click(screen.getByTitle(/Commit all staged edits as one atomic batch/))
@@ -223,7 +226,7 @@ describe('CommitBar — engine limits wording (X06)', () => {
     activeConnection.value = { id: 'c1', name: 'nuc', url: 'postgres://n', isNucleus: true }
     limitsReport.value = limitsFixture.nucleus as LimitsReport
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'docs.note = staged' })
-    commitOperations.mockResolvedValueOnce(okResponse)
+    commitOperations.mockImplementationOnce(async input => commitReceiptFor(input.operationId, input.operations, true))
     render(<CommitBar />)
     expect(screen.queryByTitle(/atomic batch/)).toBeNull()
     const btn = screen.getByTitle(/Commit all staged edits in one transaction/)
@@ -248,7 +251,7 @@ describe('CommitBar — engine limits wording (X06)', () => {
 describe('CommitBar shortcut ownership boundaries', () => {
   it('cannot commit or discard hidden staged operations from dialog controls', async () => {
     stageEdit({ connectionId: 'c1', operation: updateOp, label: 'pending workspace edit' })
-    commitOperations.mockResolvedValueOnce(okResponse)
+    commitOperations.mockImplementationOnce(async input => commitReceiptFor(input.operationId, input.operations, true))
     render(<><CommitBar /><div role="dialog" aria-label="Import or command dialog"><input aria-label="Dialog input" /></div><button>Workspace action</button></>)
     const input = screen.getByRole('textbox', { name: 'Dialog input' })
     for (const modifier of [{ ctrlKey: true }, { metaKey: true }]) {
@@ -275,4 +278,67 @@ describe('CommitBar shortcut ownership boundaries', () => {
     fireEvent.keyDown(screen.getByRole('button', { name: 'Workspace action' }), { key: 'z', ctrlKey: true })
     expect(stagedEdits.value).toHaveLength(0)
   })
+})
+
+it('repeated and simultaneous save shortcuts send one frozen operation ID', async () => {
+  stageEdit({connectionId:'c1',operation:{op:'insert',schema:'public',table:'docs',binding:'e:1',values:{note:'draft'}},label:'insert'})
+  let finish!:(response:CommitResponse)=>void
+  commitOperations.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve}))
+  render(<><CommitBar/><button>Workspace shortcut</button></>)
+  const workspace=screen.getByText('Workspace shortcut')
+  await fireEvent.keyDown(workspace,{key:'s',ctrlKey:true})
+  await fireEvent.keyDown(workspace,{key:'s',ctrlKey:true,repeat:true})
+  await fireEvent.keyDown(workspace,{key:'s',ctrlKey:true})
+  await waitFor(()=>expect(commitOperations).toHaveBeenCalledTimes(1))
+  stageEdit({connectionId:'c1',operation:updateOp,label:'later draft'})
+  finish(commitReceiptFor(commitOperations.mock.calls[0][0].operationId, commitOperations.mock.calls[0][0].operations, true))
+  await waitFor(()=>expect(commitPhase.value).toBe('committed'))
+  expect(stagedEdits.value.map(e=>e.label)).toEqual(['later draft'])
+})
+
+// R4: exercise the actual count-independent bar and keyboard recovery.
+it.each(['button', 'keyboard'])('recovers discarded uncertain batch through %s on its original connection', async mode => {
+  let lose!: (error: Error) => void
+  commitOperations.mockImplementation(() => new Promise((_resolve, reject) => { lose = reject }))
+  vi.mocked(api.operationOutcome).mockImplementationOnce(async (_c, id) => ({operationId:id, state:'unknown'}))
+  stageEdit({ connectionId: 'c1', operation: updateOp, label: 'original' })
+  render(<CommitBar />)
+  fireEvent.click(screen.getByTitle(/Commit all staged edits/))
+  await waitFor(() => expect(commitOperations).toHaveBeenCalledTimes(1))
+  const operationId = commitOperations.mock.calls[0][0].operationId
+  fireEvent.click(screen.getByTitle('Discard every staged edit'))
+  expect(stagedEdits.value).toHaveLength(0)
+  lose(new Error('lost response'))
+  await waitFor(() => expect(pendingCommits.value[0]?.state).toBe('uncertain'))
+  activeConnection.value = { id: 'c2', name: 'two', url: 'postgres://b', isNucleus: false }
+  vi.mocked(api.operationOutcome).mockResolvedValueOnce({ operationId, state: 'committed', response: commitReceiptFor(operationId, commitOperations.mock.calls[0][0].operations, true) } as never)
+  const recovery = await screen.findByRole('button', { name: `Check outcome ${operationId} on c1` })
+  if (mode === 'button') fireEvent.click(recovery)
+  else fireEvent.keyDown(document.body, { key: 's', ctrlKey: true })
+  await waitFor(() => expect(pendingCommits.value).toHaveLength(0))
+  expect(api.operationOutcome).toHaveBeenLastCalledWith('c1', operationId)
+  expect(commitOperations).toHaveBeenCalledTimes(1)
+  expect(lastCommit.value?.operationId).toBe(operationId)
+})
+
+it.each([{}, null, 'wrong-committed-id', 'wrong-failed-id'])('zero-draft UI retains outcome recovery after invalid receipt %j', async malformed => {
+  stageEdit({ connectionId: 'c1', operation: updateOp, label: 'original' })
+  commitOperations.mockResolvedValueOnce(malformed as never)
+  vi.mocked(api.operationOutcome).mockImplementation(async (_c, id) => malformed === 'wrong-committed-id'
+    ? { operationId: 'other', state: 'committed', response: commitReceiptFor('other', [updateOp]) }
+    : malformed === 'wrong-failed-id'
+      ? { operationId: 'other', state: 'failed', status: 409, response: { operationId: 'other', error: 'no' } } as never
+      : { operationId: id, state: 'unknown' })
+  render(<CommitBar />)
+  fireEvent.click(screen.getByText(/Commit 1 change/))
+  await waitFor(() => expect(commitOperations).toHaveBeenCalledTimes(1))
+  const operationId = commitOperations.mock.calls[0][0].operationId
+  await screen.findByRole('button', { name: `Check outcome ${operationId} on c1` })
+  clearStaged('c1')
+  const recovery = await screen.findByRole('button', { name: `Check outcome ${operationId} on c1` })
+  vi.mocked(api.operationOutcome).mockImplementationOnce(async (_c, id) => ({ operationId: id, state: 'committed', response: commitReceiptFor(id, [updateOp]) }))
+  fireEvent.click(recovery)
+  await waitFor(() => expect(lastCommit.value?.operationId).toBe(operationId))
+  expect(commitOperations).toHaveBeenCalledTimes(1)
+  expect(api.operationOutcome).toHaveBeenLastCalledWith('c1', operationId)
 })

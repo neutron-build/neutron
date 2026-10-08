@@ -1,3 +1,6 @@
+import { mutableResponse } from "@neutron-build/core";
+import { isIP } from "node:net";
+import { transportPeer } from "@neutron-build/core";
 import { timingSafeEqual } from "node:crypto";
 import {
   getCookie,
@@ -26,6 +29,8 @@ export interface CsrfMiddlewareOptions {
 
 export interface TrustedProxyOptions {
   trustProxy?: boolean;
+  /** Verify the transport socket address before trusting forwarded identities. */
+  trustedProxies?: string[] | ((address: string) => boolean);
   forwardedHeader?: string;
   maxForwardedIps?: number;
   /**
@@ -63,7 +68,7 @@ export function createCspNonceMiddleware(
   return async (request, context, next) => {
     const nonce = createNonce();
     context[contextKey] = nonce;
-    const response = await next();
+    const response = mutableResponse(await next());
     if (!response.headers.has(headerName)) {
       response.headers.set(
         headerName,
@@ -129,7 +134,7 @@ export function createCsrfMiddleware(
       }
     }
 
-    const response = await next();
+    const response = mutableResponse(await next());
     if (!existingToken) {
       response.headers.append(
         "Set-Cookie",
@@ -157,53 +162,39 @@ export function resolveClientIp(
     return null;
   }
 
-  const maxForwardedIps = Math.max(1, options.maxForwardedIps ?? 5);
+  const peer = transportPeer(request)?.remoteAddress;
+  const trusted = options.trustedProxies;
+  if (!peer || !trusted || !(typeof trusted === "function" ? trusted(peer) : trusted.includes(peer))) return null;
+  const maxForwardedIps = options.maxForwardedIps ?? 5;
+  const trustedHops = options.trustedHops ?? 1;
+  if (!Number.isSafeInteger(maxForwardedIps) || maxForwardedIps < 1 || !Number.isSafeInteger(trustedHops) || trustedHops < 1) return null;
   const forwardedHeader = (options.forwardedHeader || "x-forwarded-for").toLowerCase();
-
-  const cfConnectingIp = request.headers.get("cf-connecting-ip");
-  if (cfConnectingIp) {
-    return cfConnectingIp.trim();
-  }
-
-  const xRealIp = request.headers.get("x-real-ip");
-  if (xRealIp) {
-    return xRealIp.trim();
-  }
-
-  const xForwardedFor = request.headers.get(forwardedHeader);
-  if (!xForwardedFor || !trustProxy) {
-    return null;
-  }
-
-  const ips = xForwardedFor
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .slice(-maxForwardedIps);
-
-  if (ips.length === 0) {
-    return null;
-  }
-
-  // The left-most entries are supplied by the client and cannot be trusted.
-  // Read the entry `trustedHops` from the right — the address observed by the
-  // outermost proxy we actually trust.
-  const trustedHops = Math.max(1, options.trustedHops ?? 1);
-  const index = ips.length - trustedHops;
-  return ips[Math.max(0, index)] ?? null;
+  const ips = (request.headers.get(forwardedHeader) ?? "").split(",").map(value => value.trim());
+  if (ips.length < trustedHops || ips.length > maxForwardedIps || ips.some(ip => !isIP(ip))) return null;
+  return ips[ips.length - trustedHops] ?? null;
 }
 
 export function createRateLimitMiddleware(
   options: RateLimitMiddlewareOptions
 ): MiddlewareFn {
+  for (const [name, value] of Object.entries(options)) {
+    if (typeof value === "number" && !Number.isFinite(value)) throw new RangeError(`${name} must be finite`);
+  }
+  if (options.capacity <= 0 || (options.refillPerSecond !== undefined && options.refillPerSecond <= 0) || (options.tokensPerRequest !== undefined && options.tokensPerRequest <= 0)) throw new RangeError("Rate limit values must be positive");
+  for (const name of ["maxBuckets", "cleanupEvery", "trustedHops", "maxForwardedIps"] as const) {
+    const value = options[name];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new RangeError(`${name} must be a positive integer`);
+  }
+  if (options.bucketTtlMs !== undefined && options.bucketTtlMs <= 0) throw new RangeError("bucketTtlMs must be positive");
+  if (options.denyStatus !== undefined && (!Number.isInteger(options.denyStatus) || options.denyStatus < 400 || options.denyStatus > 599)) throw new RangeError("denyStatus must be an HTTP error status");
   const capacity = Math.max(1, Math.floor(options.capacity));
   const refillPerSecond = Math.max(0.001, options.refillPerSecond ?? capacity);
   const tokensPerRequest = Math.max(1, options.tokensPerRequest ?? 1);
   const denyStatus = options.denyStatus ?? 429;
-  const maxBuckets = Math.max(1_000, Math.floor(options.maxBuckets ?? 50_000));
+  const maxBuckets = Math.max(1, Math.floor(options.maxBuckets ?? 50_000));
   const bucketTtlMs = Math.max(
     1_000,
-    Math.floor(options.bucketTtlMs ?? (capacity / refillPerSecond) * 4_000)
+    Math.floor(Math.max(options.bucketTtlMs ?? 0, (capacity / refillPerSecond) * 1_000))
   );
   const cleanupEvery = Math.max(1, Math.floor(options.cleanupEvery ?? 128));
   const buckets = new Map<string, { tokens: number; lastRefillMs: number }>();
@@ -222,10 +213,13 @@ export function createRateLimitMiddleware(
       : resolveClientIp(request, options) || "anonymous";
     const now = Date.now();
     handledRequests += 1;
-    if (handledRequests % cleanupEvery === 0 || buckets.size > maxBuckets) {
+    if (handledRequests % cleanupEvery === 0 || buckets.size >= maxBuckets) {
       pruneBuckets(buckets, now, maxBuckets, bucketTtlMs);
     }
 
+    if (!buckets.has(key) && buckets.size >= maxBuckets) {
+      return new Response("Rate limit capacity exhausted", { status: 429, headers: { "Retry-After": "1" } });
+    }
     const state = buckets.get(key) || { tokens: capacity, lastRefillMs: now };
     const elapsedSeconds = Math.max(0, (now - state.lastRefillMs) / 1000);
     const replenished = Math.min(capacity, state.tokens + elapsedSeconds * refillPerSecond);
@@ -243,7 +237,7 @@ export function createRateLimitMiddleware(
     }
 
     buckets.set(key, { tokens: remainingAfter, lastRefillMs: now });
-    const response = await next();
+    const response = mutableResponse(await next());
     const resetSec = Math.ceil((capacity - remainingAfter) / refillPerSecond);
     response.headers.set("RateLimit-Limit", String(capacity));
     response.headers.set("RateLimit-Remaining", String(Math.floor(remainingAfter)));
@@ -268,17 +262,7 @@ function pruneBuckets(
     }
   }
 
-  if (buckets.size <= maxBuckets) {
-    return;
-  }
 
-  const overflow = buckets.size - maxBuckets;
-  const oldest = Array.from(buckets.entries())
-    .sort((left, right) => left[1].lastRefillMs - right[1].lastRefillMs)
-    .slice(0, overflow);
-  for (const [key] of oldest) {
-    buckets.delete(key);
-  }
 }
 
 export function resolveSecureCookieOptions(
@@ -333,7 +317,7 @@ function isSameOrigin(request: Request): boolean {
     return true;
   }
   try {
-    return new URL(source).host === new URL(request.url).host;
+    return new URL(source).origin === new URL(request.url).origin;
   } catch {
     return false;
   }

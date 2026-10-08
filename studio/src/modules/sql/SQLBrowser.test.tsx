@@ -1,3 +1,4 @@
+import { commitReceiptFor } from '../../lib/commitFixture'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact'
 import {
@@ -838,7 +839,7 @@ describe('authoritative rows after staged commit', () => {
       .mockResolvedValueOnce(keyedResult([[1, 'Committed']], ['102']))
       .mockResolvedValueOnce(keyedResult([[1, 'Before']], ['103']))
     tableMeta.mockResolvedValue(singleKeyMeta({ binding: 'e1:16385' }))
-    vi.mocked(api.commitOperations).mockResolvedValue({ operationId: 'committed-op', rowsAffected: 1 } as never)
+    vi.mocked(api.commitOperations).mockImplementation(async input => commitReceiptFor(input.operationId, input.operations, true))
     vi.mocked(api.revertOperation).mockResolvedValue({ operationId: 'reverted-op', rowsAffected: 1, reverted: 1 } as never)
     render(<SQLBrowser schema="public" table="memo" />)
     await screen.findByText('Before')

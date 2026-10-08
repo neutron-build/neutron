@@ -116,10 +116,30 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   })
   const [running, setRunning] = useState(false)
   const [status, setStatus] = useState('')
+  const [persistenceError, setPersistenceError] = useState<string | null>(null)
+  const persistenceHealthy = useRef(true)
   const abortRef = useRef<AbortController | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
   const fileRef = useRef<HTMLInputElement | null>(null)
   const stopRef = useRef<HTMLButtonElement | null>(null)
+
+  const previewGeneration = useRef(0)
+  const checkGeneration = useRef(0)
+  const setup = JSON.stringify([file?.name, file?.size, file?.lastModified, format, csv, values, mapping, batchSize, connectionId, schemaName, table, meta.binding])
+  const setupRef = useRef(setup)
+  setupRef.current = setup
+  const previewIdentity = JSON.stringify([file?.name, file?.size, file?.lastModified, format, csv, connectionId, schemaName, table, meta.binding])
+  const previewIdentityRef = useRef(previewIdentity)
+  previewIdentityRef.current = previewIdentity
+  const [readyPreviewIdentity, setReadyPreviewIdentity] = useState<string | null>(null)
+  const ready = preview !== null && readyPreviewIdentity === previewIdentity
+  useEffect(() => {
+    checkGeneration.current++
+    abortRef.current?.abort()
+    setScan(null)
+    setDryRun(null)
+  }, [setup])
+  useEffect(() => () => { previewGeneration.current++; checkGeneration.current++; abortRef.current?.abort() }, [])
 
   // Focus the first control on open; the opener restores focus on close.
   useEffect(() => { fileRef.current?.focus() }, [])
@@ -138,6 +158,9 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
       if (j.status === 'done') store.removeItem(key)
       else store.setItem(key, JSON.stringify(j))
     } catch {
+      persistenceHealthy.current = false
+      setPersistenceError('Import journal could not be saved. Reload recovery is unavailable; the import stops before the next batch. Keep this window open to resolve any submitted batch.')
+      abortRef.current?.abort()
       // Storage full/unavailable: the in-memory journal still drives this
       // session; resuming after a reload is then not possible.
     }
@@ -159,20 +182,31 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   // --- source selection and preview ---
 
   async function loadPreview(f: File, fmt: ImportFormat, csvOpts: CsvSourceOptions, keepMapping?: Record<string, ColumnMapping>) {
+    const own = ++previewGeneration.current
+    const identity = JSON.stringify([f.name, f.size, f.lastModified, fmt, csvOpts, connectionId, schemaName, table, meta.binding])
+    setPreview(null)
+    setReadyPreviewIdentity(null)
     setPreviewError(null)
     setScan(null)
     setDryRun(null)
     try {
       const p = await readPreview(f, fmt, csvOpts)
+      if (own !== previewGeneration.current || identity !== previewIdentityRef.current) return
       setPreview(p)
+      setReadyPreviewIdentity(identity)
       setMapping(keepMapping ?? autoMap(p.fields, targets))
     } catch (err) {
+      if (own !== previewGeneration.current || identity !== previewIdentityRef.current) return
       setPreview(null)
       setPreviewError(err instanceof Error ? err.message : String(err))
     }
   }
 
   function chooseFile(f: File | null) {
+    previewGeneration.current++
+    setReadyPreviewIdentity(null)
+    setPreview(null)
+    setPreviewError(null)
     setFile(f)
     if (!f) {
       setPreview(null)
@@ -211,12 +245,23 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
     if (file) void loadPreview(file, format, next)
   }
 
+  function invalidateChecks() {
+    checkGeneration.current++
+    abortRef.current?.abort()
+    setScan(null)
+    setDryRun(null)
+  }
+  function changeValues(next: ImportValueOptions) { invalidateChecks(); setValues(next) }
+  function changeMapping(next: Record<string, ColumnMapping>) { invalidateChecks(); setMapping(next) }
   const problems = preview ? mappingProblems(mapping, targets) : []
 
   // --- whole-file check (client-side encoding of every row) ---
 
   async function scanFile() {
-    if (!file) return
+    if (!file || !ready) return
+    const identity = setup
+    const own = ++checkGeneration.current
+    const owns = () => own === checkGeneration.current && identity === setupRef.current
     const ctl = new AbortController()
     abortRef.current = ctl
     const registry = new FieldRegistry()
@@ -224,7 +269,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
     setScan({ ...state })
     try {
       for await (const rec of readSourceRecords(blobTextChunks(file), format, csv, registry)) {
-        if (ctl.signal.aborted) break
+        if (ctl.signal.aborted || !owns()) break
         state.rows++
         try {
           encodeRecord(rec, targets, mapping, values)
@@ -238,6 +283,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
       state.errors.push(err instanceof Error ? err.message : String(err))
       state.done = true
     }
+    if (!owns()) return
     abortRef.current = null
     setScan({ ...state, errors: [...state.errors] })
   }
@@ -245,7 +291,10 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   // --- server dry-run of the first batch (rolled back) ---
 
   async function dryRunFirstBatch() {
-    if (!preview || !meta.binding) return
+    if (!preview || !ready || !meta.binding) return
+    const identity = setup
+    const own = ++checkGeneration.current
+    const owns = () => own === checkGeneration.current && identity === setupRef.current
     const rows: Array<Record<string, unknown>> = []
     const rowNumbers: number[] = []
     for (const rec of preview.records.slice(0, Math.min(batchSize, PREVIEW_RECORDS))) {
@@ -262,8 +311,10 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
         connectionId,
         operations: rows.map(v => ({ op: 'insert' as const, schema: schemaName, table, binding: meta.binding!, values: v })),
       })
+      if (!owns()) return
       setDryRun({ ok: true, message: `The first ${res.counts.insert ?? rows.length} rows would insert (validated by the database, then rolled back — nothing was written).` })
     } catch (err) {
+      if (!owns()) return
       const msg = err instanceof Error ? err.message : String(err)
       const m = /^operations\[(\d+)\]/.exec(msg)
       const row = m ? rowNumbers[Number(m[1])] : undefined
@@ -275,7 +326,10 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
 
   function deps(signal: AbortSignal): ImportDeps {
     return {
-      sendBatch: transport?.sendBatch ?? (req => api.importBatch(req)),
+      sendBatch: req => {
+        if (!persistenceHealthy.current || signal.aborted) return Promise.reject(new Error('Import paused: journal persistence unavailable or import stopped'))
+        return (transport?.sendBatch ?? (input => api.importBatch(input)))(req)
+      },
       outcome: transport?.outcome ?? ((c, id) => api.importOutcome(c, id)),
       save,
       signal,
@@ -297,6 +351,12 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
     setRunning(true)
     let j = start
     try {
+      if (!persistenceHealthy.current) {
+        // Storage failure forbids further sends, but must leave outcome-only
+        // reconciliation available for an already-submitted batch.
+        if (j.pending?.state === 'sending') await resolvePending(j, deps(ctl.signal))
+        return
+      }
       // The binding pins the relation. On resume the connection epoch may
       // have changed (reconnect); the table must still be the SAME relation.
       const live = await freshMeta()
@@ -327,7 +387,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
   }
 
   function start() {
-    if (!file || !meta.binding || problems.length > 0) return
+    if (!file || !ready || !meta.binding || problems.length > 0 || setup !== setupRef.current) return
     const j = newImportJournal({
       connectionId, schema: schemaName, table, binding: meta.binding,
       format, csv, values, mapping,
@@ -456,7 +516,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
                   Unquoted empty field means
                   <select
                     value={values.emptyUnquoted}
-                    onChange={e => setValues({ ...values, emptyUnquoted: (e.target as HTMLSelectElement).value as 'null' | 'empty' })}
+                    onChange={e => changeValues({ ...values, emptyUnquoted: (e.target as HTMLSelectElement).value as 'null' | 'empty' })}
                   >
                     <option value="null">NULL (PostgreSQL COPY convention)</option>
                     <option value="empty">empty string</option>
@@ -471,7 +531,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
                     placeholder="none"
                     onInput={e => {
                       const v = (e.target as HTMLInputElement).value
-                      setValues({ ...values, nullMarker: v === '' ? null : v })
+                      changeValues({ ...values, nullMarker: v === '' ? null : v })
                     }}
                   />
                 </label>
@@ -508,7 +568,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
                           onChange={e => {
                             const v = (e.target as HTMLSelectElement).value
                             const next: ColumnMapping = v === 'default' ? { kind: 'default' } : v === 'null' ? { kind: 'null' } : { kind: 'field', field: v.slice(2) }
-                            setMapping({ ...mapping, [col.name]: next })
+                            changeMapping({ ...mapping, [col.name]: next })
                             setDryRun(null)
                             setScan(null)
                           }}
@@ -614,6 +674,7 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
             </div>
           </div>
         )}
+        {persistenceError && <div role="alert">{persistenceError}</div>}
         <div class={s.status} role="status" aria-live="polite">{status}</div>
         {journal?.status === 'error' && journal.error && (
           <div class={s.error} role="alert">{journal.error}</div>
@@ -641,11 +702,11 @@ export function ImportDialog({ connectionId, schema: schemaName, table, meta, on
         )}
 
         <div class={s.footer}>
-          {!running && preview && !resuming && (
+          {!running && ready && preview && !resuming && (
             <>
               <button class={s.btn} onClick={scanFile}>Check whole file</button>
-              <button class={s.btn} onClick={dryRunFirstBatch} disabled={problems.length > 0 || !meta.binding}>Dry-run first batch</button>
-              <button class={s.btnPrimary} onClick={start} disabled={problems.length > 0 || !meta.binding}>Import</button>
+              <button class={s.btn} onClick={dryRunFirstBatch} disabled={!ready || problems.length > 0 || !meta.binding}>Dry-run first batch</button>
+              <button class={s.btnPrimary} onClick={start} disabled={!ready || problems.length > 0 || !meta.binding}>Import</button>
             </>
           )}
           {!running && resuming && file && preview && journal && journal.status !== 'needs-decision' && journal.status !== 'error' && (

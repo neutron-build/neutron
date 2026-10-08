@@ -4,7 +4,7 @@ import { CompletionContext, type CompletionResult, type CompletionSource } from 
 import { sql, PostgreSQL } from '@codemirror/lang-sql'
 import type { SqlTable } from '../../lib/types'
 import {
-  buildCompletionNamespace, completionSchemas, defaultCompletionSchema, flattenPlan,
+  buildCompletionNamespace, completionSchemas, defaultCompletionSchema, flattenPlan, planTree,
   isWriteStatement, leadingKeyword, loadHistory, newRequestId, parameterCount,
   pushHistory, quoteIdentIfNeeded, HISTORY_MAX,
   mayChangeCatalog,
@@ -199,4 +199,9 @@ describe('mayChangeCatalog (S05 schema refresh trigger)', () => {
     expect(mayChangeCatalog('-- drop table t\nselect 1')).toBe(false)
     expect(mayChangeCatalog('/* alter table t */ select 1')).toBe(false)
   })
+})
+
+it('plan tree retains previously hidden alias, width and join-removal fields in extras', () => {
+  const tree = planTree([{ Plan: { 'Node Type': 'Seq Scan', 'Alias': 'o', 'Plan Width': 32, 'Rows Removed by Join Filter': 7 } }])
+  expect(tree?.extras).toEqual(expect.arrayContaining([['Alias', 'o'], ['Plan Width', '32'], ['Rows Removed by Join Filter', '7']]))
 })

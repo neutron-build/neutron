@@ -1,0 +1,386 @@
+{
+  "files": [
+    {
+      "path": "conformance/conformance_test.qnt",
+      "modules": [
+        {
+          "module": "conformance_test",
+          "role": "scenario",
+          "expectedTests": 16
+        }
+      ]
+    },
+    {
+      "path": "conformance/predicate_history_test.qnt",
+      "modules": [
+        {
+          "module": "predicate_history_test",
+          "role": "scenario",
+          "expectedTests": 12
+        }
+      ]
+    },
+    {
+      "path": "specs/common/crash.qnt",
+      "modules": [
+        {
+          "module": "crash",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ]
+    },
+    {
+      "path": "specs/common/network.qnt",
+      "modules": [
+        {
+          "module": "network",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ]
+    },
+    {
+      "path": "specs/common/types.qnt",
+      "modules": [
+        {
+          "module": "types",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ]
+    },
+    {
+      "path": "specs/framework/circuit_breaker.qnt",
+      "modules": [
+        {
+          "module": "circuit_breaker",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "valid_state and non_negative_counts and reject_bound and open_has_bounded_ticks and half_open_bounded and closed_under_threshold"
+    },
+    {
+      "path": "specs/framework/csrf_lifecycle.qnt",
+      "modules": [
+        {
+          "module": "csrf_lifecycle",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "valid_token_states and no_replay and session_isolation and expired_not_active and ttl_non_negative"
+    },
+    {
+      "path": "specs/framework/rate_limiter.qnt",
+      "modules": [
+        {
+          "module": "rate_limiter",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "offset_bounded and count_bounded and rate_enforced and fair_capacity and no_undercount and reject_accounting"
+    },
+    {
+      "path": "specs/framework/session_lifecycle.qnt",
+      "modules": [
+        {
+          "module": "session_lifecycle",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "valid_phases and terminal_permanent and renewal_bounded and active_has_ttl and expired_reason and owner_immutable and revoked_is_final"
+    },
+    {
+      "path": "specs/nucleus/distributed_tx.qnt",
+      "modules": [
+        {
+          "module": "distributed_tx",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "commit_validity and atomicity and no_committed_abort"
+    },
+    {
+      "path": "specs/nucleus/membership.qnt",
+      "modules": [
+        {
+          "module": "membership",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "non_empty and no_duplicate_add and config_monotonic"
+    },
+    {
+      "path": "specs/nucleus/multi_raft.qnt",
+      "modules": [
+        {
+          "module": "multi_raft",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "election_safety and log_matching and concrete_abstract_safety"
+    },
+    {
+      "path": "specs/nucleus/replication.qnt",
+      "modules": [
+        {
+          "module": "replication",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "replicas_behind and sync_durability"
+    },
+    {
+      "path": "specs/nucleus/resharding.qnt",
+      "modules": [
+        {
+          "module": "resharding",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "no_data_loss and no_double_ownership and key_conservation"
+    },
+    {
+      "path": "specs/nucleus/snapshot_transfer.qnt",
+      "modules": [
+        {
+          "module": "snapshot_transfer",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "source_unchanged"
+    },
+    {
+      "path": "specs/realtime/hot_reload.qnt",
+      "modules": [
+        {
+          "module": "hot_reload",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "version_monotonic and connected_bounded_lag and delta_ordering and no_version_gaps and sync_client_not_ahead and server_monotonic and disconnected_no_pending and valid_client_states"
+    },
+    {
+      "path": "specs/realtime/websocket_hub.qnt",
+      "modules": [
+        {
+          "module": "websocket_hub",
+          "role": "typecheck",
+          "expectedTests": 0
+        }
+      ],
+      "invariant": "members_connected and no_self_delivery and delivered_was_pending and no_duplicate_delivery and empty_rooms_clean and broadcast_scoped"
+    },
+    {
+      "path": "tests/circuit_breaker_test.qnt",
+      "modules": [
+        {
+          "module": "circuit_breaker_test",
+          "role": "scenario",
+          "expectedTests": 7
+        }
+      ]
+    },
+    {
+      "path": "tests/common_test.qnt",
+      "modules": [
+        {
+          "module": "common_test",
+          "role": "scenario",
+          "expectedTests": 10
+        },
+        {
+          "module": "network_test",
+          "role": "scenario",
+          "expectedTests": 9
+        },
+        {
+          "module": "crash_test",
+          "role": "scenario",
+          "expectedTests": 11
+        }
+      ]
+    },
+    {
+      "path": "tests/csrf_lifecycle_test.qnt",
+      "modules": [
+        {
+          "module": "csrf_lifecycle_test",
+          "role": "scenario",
+          "expectedTests": 6
+        }
+      ]
+    },
+    {
+      "path": "tests/distributed_tx_test.qnt",
+      "modules": [
+        {
+          "module": "distributed_tx_test",
+          "role": "scenario",
+          "expectedTests": 6
+        }
+      ]
+    },
+    {
+      "path": "tests/fault_injection_test.qnt",
+      "modules": [
+        {
+          "module": "partition_consensus_test",
+          "role": "scenario",
+          "expectedTests": 6
+        },
+        {
+          "module": "crash_transaction_test",
+          "role": "scenario",
+          "expectedTests": 7
+        },
+        {
+          "module": "combined_faults_test",
+          "role": "scenario",
+          "expectedTests": 6
+        }
+      ]
+    },
+    {
+      "path": "tests/history_witness_test.qnt",
+      "modules": [
+        {
+          "module": "csrf_lifecycle_witness_test",
+          "role": "scenario",
+          "expectedTests": 2
+        },
+        {
+          "module": "session_lifecycle_witness_test",
+          "role": "scenario",
+          "expectedTests": 3
+        },
+        {
+          "module": "distributed_tx_witness_test",
+          "role": "scenario",
+          "expectedTests": 2
+        },
+        {
+          "module": "membership_witness_test",
+          "role": "scenario",
+          "expectedTests": 1
+        },
+        {
+          "module": "hot_reload_witness_test",
+          "role": "scenario",
+          "expectedTests": 1
+        },
+        {
+          "module": "snapshot_transfer_witness_test",
+          "role": "scenario",
+          "expectedTests": 1
+        },
+        {
+          "module": "websocket_hub_witness_test",
+          "role": "scenario",
+          "expectedTests": 3
+        }
+      ]
+    },
+    {
+      "path": "tests/hot_reload_test.qnt",
+      "modules": [
+        {
+          "module": "hot_reload_test",
+          "role": "scenario",
+          "expectedTests": 6
+        }
+      ]
+    },
+    {
+      "path": "tests/membership_test.qnt",
+      "modules": [
+        {
+          "module": "membership_test",
+          "role": "scenario",
+          "expectedTests": 8
+        }
+      ]
+    },
+    {
+      "path": "tests/multi_raft_test.qnt",
+      "modules": [
+        {
+          "module": "multi_raft_test",
+          "role": "scenario",
+          "expectedTests": 19
+        }
+      ]
+    },
+    {
+      "path": "tests/rate_limiter_test.qnt",
+      "modules": [
+        {
+          "module": "rate_limiter_test",
+          "role": "scenario",
+          "expectedTests": 6
+        }
+      ]
+    },
+    {
+      "path": "tests/replication_test.qnt",
+      "modules": [
+        {
+          "module": "replication_test",
+          "role": "scenario",
+          "expectedTests": 7
+        }
+      ]
+    },
+    {
+      "path": "tests/resharding_test.qnt",
+      "modules": [
+        {
+          "module": "resharding_test",
+          "role": "scenario",
+          "expectedTests": 7
+        }
+      ]
+    },
+    {
+      "path": "tests/session_lifecycle_test.qnt",
+      "modules": [
+        {
+          "module": "session_lifecycle_test",
+          "role": "scenario",
+          "expectedTests": 7
+        }
+      ]
+    },
+    {
+      "path": "tests/snapshot_transfer_test.qnt",
+      "modules": [
+        {
+          "module": "snapshot_transfer_test",
+          "role": "scenario",
+          "expectedTests": 7
+        }
+      ]
+    },
+    {
+      "path": "tests/websocket_hub_test.qnt",
+      "modules": [
+        {
+          "module": "websocket_hub_test",
+          "role": "scenario",
+          "expectedTests": 6
+        }
+      ]
+    }
+  ]
+}

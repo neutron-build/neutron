@@ -9,10 +9,12 @@ module membership {
     var pending_remove: Set[NodeId]
     var config_version: int
 
+    var previous_config_version: int
     action init = all {
         members' = Set(1, 2, 3),
         pending_add' = Set(),
         pending_remove' = Set(),
+        previous_config_version' = 1,
         config_version' = 1,
     }
 
@@ -25,6 +27,7 @@ module membership {
         pending_add' = pending_add.union(Set(node)),
         members' = members,
         pending_remove' = pending_remove,
+        previous_config_version' = config_version,
         config_version' = config_version,
     }
 
@@ -34,6 +37,7 @@ module membership {
         members' = members.union(Set(node)),
         pending_add' = pending_add.exclude(Set(node)),
         pending_remove' = pending_remove,
+        previous_config_version' = config_version,
         config_version' = config_version + 1,
     }
 
@@ -45,6 +49,7 @@ module membership {
         pending_remove' = pending_remove.union(Set(node)),
         members' = members,
         pending_add' = pending_add,
+        previous_config_version' = config_version,
         config_version' = config_version,
     }
 
@@ -54,6 +59,7 @@ module membership {
         members' = members.exclude(Set(node)),
         pending_remove' = pending_remove.exclude(Set(node)),
         pending_add' = pending_add,
+        previous_config_version' = config_version,
         config_version' = config_version + 1,
     }
 
@@ -78,5 +84,5 @@ module membership {
         members.intersect(pending_add).size() == 0
 
     // Config version is monotonically increasing (implied by the model)
-    val config_monotonic: bool = config_version >= 1
+    val config_monotonic: bool = config_version >= previous_config_version
 }

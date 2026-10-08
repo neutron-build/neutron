@@ -8,7 +8,7 @@ interface RlsNoticeProps {
 /**
  * Shown in place of a specialty-store browser's data when the engine denied
  * the load because row-level security is active. Explains why and shows the
- * exact SQL that restores access instead of showing the raw error.
+ * read-only policy inspection query instead of showing the raw error.
  */
 export function RlsNotice({ detail }: RlsNoticeProps) {
   return (

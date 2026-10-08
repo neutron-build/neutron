@@ -10,18 +10,20 @@ import { CommandPalette } from './CommandPalette'
 /** Apply a #/c/<id>/... deep link: connect the named connection (once) and
  * open the addressed tab. An unknown connection id surfaces an honest
  * connection-manager error instead of guessing. */
-async function applyDeepLink(hash: string, handled: Set<string>): Promise<void> {
+export async function applyDeepLink(hash: string, current: () => boolean): Promise<void> {
   const link = parseDeepLink(hash)
   if (!link) return
-  handled.add(hash)
+  if (!current()) return
   if (activeConnection.value?.id !== link.connectionId) {
     if (!connections.value.some(c => c.id === link.connectionId)) {
       // The connection list may not have loaded yet: load it here rather
       // than racing the connection manager.
       try {
-        connections.value = await api.connections.list()
+        const loaded = await api.connections.list()
+        if (!current()) return
+        connections.value = loaded
       } catch (err: unknown) {
-        connectionError.value = err instanceof Error ? err.message : String(err)
+        if (current()) connectionError.value = err instanceof Error ? err.message : String(err)
         return
       }
       if (!connections.value.some(c => c.id === link.connectionId)) {
@@ -30,26 +32,25 @@ async function applyDeepLink(hash: string, handled: Set<string>): Promise<void> 
       }
     }
     try {
-      await connectConnection(link.connectionId)
+      await connectConnection(link.connectionId, current)
     } catch {
       return // connectConnection recorded the error
     }
   }
+  if (!current() || activeConnection.value?.id !== link.connectionId) return
   openTab({ id: crypto.randomUUID(), ...link.tab })
 }
 
 export function App() {
-  // Deep links: on load and on every hash change (browser back/forward,
-  // pasted URLs). Each hash is applied at most once per load.
-  const handled = new Set<string>()
   useEffect(() => {
-    void applyDeepLink(window.location.hash, handled)
-    const onHash = () => {
-      if (handled.has(window.location.hash)) return
-      void applyDeepLink(window.location.hash, handled)
+    let generation = 0
+    const navigate = () => {
+      const own = ++generation
+      void applyDeepLink(window.location.hash, () => own === generation)
     }
-    window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
+    navigate()
+    window.addEventListener('hashchange', navigate)
+    return () => { generation++; window.removeEventListener('hashchange', navigate) }
   }, [])
 
   return (

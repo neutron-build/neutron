@@ -33,6 +33,9 @@ module websocket_hub {
 
     // === ACTIONS ===
 
+    var broadcast_recipients: MsgId -> Set[ConnId]
+    var was_pending: ConnId -> Set[MsgId]
+    var delivery_count: ConnId -> (MsgId -> int)
     action init = all {
         room_members' = ROOMS.mapBy(r => Set()),
         connected' = Set(),
@@ -40,6 +43,9 @@ module websocket_hub {
         delivered' = CONNS.mapBy(c => Set()),
         msg_sender' = MSG_IDS.mapBy(m => 0),
         msg_room' = MSG_IDS.mapBy(m => 0),
+        broadcast_recipients' = MSG_IDS.mapBy(m => Set()),
+        was_pending' = CONNS.mapBy(c => Set()),
+        delivery_count' = CONNS.mapBy(c => MSG_IDS.mapBy(m => 0)),
         next_msg' = 1,
     }
 
@@ -53,6 +59,9 @@ module websocket_hub {
         delivered' = delivered,
         msg_sender' = msg_sender,
         msg_room' = msg_room,
+        broadcast_recipients' = broadcast_recipients,
+        was_pending' = was_pending,
+        delivery_count' = delivery_count,
         next_msg' = next_msg,
     }
 
@@ -68,6 +77,9 @@ module websocket_hub {
         delivered' = delivered,
         msg_sender' = msg_sender,
         msg_room' = msg_room,
+        broadcast_recipients' = broadcast_recipients,
+        was_pending' = was_pending,
+        delivery_count' = delivery_count,
         next_msg' = next_msg,
     }
 
@@ -83,6 +95,9 @@ module websocket_hub {
         delivered' = delivered,
         msg_sender' = msg_sender,
         msg_room' = msg_room,
+        broadcast_recipients' = broadcast_recipients,
+        was_pending' = was_pending,
+        delivery_count' = delivery_count,
         next_msg' = next_msg,
     }
 
@@ -98,6 +113,9 @@ module websocket_hub {
         delivered' = delivered,
         msg_sender' = msg_sender,
         msg_room' = msg_room,
+        broadcast_recipients' = broadcast_recipients,
+        was_pending' = was_pending,
+        delivery_count' = delivery_count,
         next_msg' = next_msg,
     }
 
@@ -116,6 +134,9 @@ module websocket_hub {
                 else pending.get(c)),
             msg_sender' = msg_sender.set(mid, sender),
             msg_room' = msg_room.set(mid, room),
+            broadcast_recipients' = broadcast_recipients.set(mid, room_members.get(room).intersect(connected).exclude(Set(sender))),
+            was_pending' = CONNS.mapBy(c => if (c.in(room_members.get(room)) and c != sender and c.in(connected)) was_pending.get(c).union(Set(mid)) else was_pending.get(c)),
+            delivery_count' = delivery_count,
             next_msg' = next_msg + 1,
             connected' = connected,
             room_members' = room_members,
@@ -135,6 +156,9 @@ module websocket_hub {
         room_members' = room_members,
         msg_sender' = msg_sender,
         msg_room' = msg_room,
+        broadcast_recipients' = broadcast_recipients,
+        was_pending' = was_pending,
+        delivery_count' = delivery_count.set(conn, delivery_count.get(conn).set(mid, delivery_count.get(conn).get(mid) + 1)),
         next_msg' = next_msg,
     }
 
@@ -173,19 +197,19 @@ module websocket_hub {
             not(m.in(delivered.get(msg_sender.get(m))))
         )
 
-    // Delivery completeness: every pending message for a connected
-    // member will eventually be delivered (stated as: delivered ⊆ was-pending)
+    // Delivery provenance safety: every delivered message was previously pending.
+    // Eventual delivery is a separate liveness obligation requiring fairness.
     val delivered_was_pending: bool =
         CONNS.forall(c =>
             delivered.get(c).forall(m =>
-                m >= 1 and m < next_msg
+                m.in(was_pending.get(c))
             )
         )
 
     // No duplicate delivery: a message is in pending OR delivered, not both
     val no_duplicate_delivery: bool =
         CONNS.forall(c =>
-            pending.get(c).intersect(delivered.get(c)).size() == 0
+            MSG_IDS.forall(m => delivery_count.get(c).get(m) <= 1)
         )
 
     // Room cleanup: empty rooms have no members
@@ -200,7 +224,7 @@ module websocket_hub {
         CONNS.forall(c =>
             pending.get(c).union(delivered.get(c)).forall(m =>
                 m >= 1 and m < next_msg implies
-                msg_sender.get(m) != c  // sender excluded
+                c.in(broadcast_recipients.get(m))
             )
         )
 }

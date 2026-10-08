@@ -134,3 +134,17 @@ describe('DiagnosticsModule (S05)', () => {
     expect(screen.getByText(/neither is verified on Nucleus yet/)).toBeTruthy()
   })
 })
+
+it('threshold changes fence old diagnostics failures', async () => {
+  let fail!: (e: Error) => void
+  queriesMock.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject }))
+    .mockResolvedValueOnce({ entries: [], stats: { count: 0, p50Ms: 0, p95Ms: 0, maxMs: 0 }, scope: 'latest-threshold' })
+  render(<DiagnosticsModule />)
+  await waitFor(() => expect(fail).toBeTypeOf('function'))
+  fireEvent.change(screen.getByLabelText('minimum duration in milliseconds'), { target: { value: '200' } })
+  await screen.findByText('latest-threshold')
+  fail(new Error('obsolete diagnostics'))
+  await new Promise(resolve => setTimeout(resolve, 0))
+  expect(screen.queryByText('obsolete diagnostics')).toBeNull()
+  expect(screen.getByText('latest-threshold')).toBeTruthy()
+})

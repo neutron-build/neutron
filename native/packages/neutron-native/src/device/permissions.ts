@@ -60,9 +60,40 @@ let _rnPermissions: any = undefined
 
 function getRNPermissions(): any {
   if (_rnPermissions === undefined) {
-    try { _rnPermissions = require('react-native-permissions') } catch { _rnPermissions = null }
+    try {
+      const mod = require('react-native-permissions')
+      // Community library ships both default- and named-export shapes.
+      _rnPermissions = mod?.default ?? mod ?? null
+    } catch { _rnPermissions = null }
   }
   return _rnPermissions
+}
+
+/**
+ * Notifications have no PERMISSIONS constant: react-native-permissions
+ * routes them through checkNotifications/requestNotifications on every
+ * platform (iOS included), and on Android ≤12 POST_NOTIFICATIONS does not
+ * exist as a runtime permission at all. Resolving them through the
+ * constant map disabled the valid iOS path (NF-NR-09).
+ */
+async function checkSpecialPermission(name: PermissionName): Promise<PermissionStatus | null> {
+  if (name !== 'notifications') return null
+  const rnp = getRNPermissions()
+  if (typeof rnp?.checkNotifications === 'function') {
+    const { status } = await rnp.checkNotifications()
+    return normalizeStatus(status)
+  }
+  return null
+}
+
+async function requestSpecialPermission(name: PermissionName): Promise<PermissionStatus | null> {
+  if (name !== 'notifications') return null
+  const rnp = getRNPermissions()
+  if (typeof rnp?.requestNotifications === 'function') {
+    const { status } = await rnp.requestNotifications(['alert', 'badge', 'sound'])
+    return normalizeStatus(status)
+  }
+  return null
 }
 
 function getPlatformOS(): 'ios' | 'android' | 'web' {
@@ -265,6 +296,10 @@ async function expoRequest(name: PermissionName): Promise<PermissionStatus> {
 export async function check(permission: PermissionName): Promise<PermissionStatus> {
   const rnp = getRNPermissions()
   if (rnp) {
+    // Notifications (and any future constant-less permission) resolve
+    // through their dedicated provider APIs first (NF-NR-09).
+    const special = await checkSpecialPermission(permission)
+    if (special !== null) return special
     const mapped = mapPermission(permission)
     if (!mapped) return PermissionStatus.UNAVAILABLE
     const status = await rnp.check(mapped)
@@ -296,6 +331,8 @@ export async function check(permission: PermissionName): Promise<PermissionStatu
 export async function request(permission: PermissionName): Promise<PermissionStatus> {
   const rnp = getRNPermissions()
   if (rnp) {
+    const special = await requestSpecialPermission(permission)
+    if (special !== null) return special
     const mapped = mapPermission(permission)
     if (!mapped) return PermissionStatus.UNAVAILABLE
     const status = await rnp.request(mapped)
@@ -322,22 +359,25 @@ export async function checkMultiple(
 ): Promise<Record<PermissionName, PermissionStatus>> {
   const rnp = getRNPermissions()
   if (rnp) {
-    const mapped = permissions
-      .map((p) => ({ name: p, native: mapPermission(p) }))
-      .filter((m) => m.native !== null)
+    // The same special-path resolution as the single-permission check,
+    // shared across both batch shapes (NF-NR-09).
+    const out: Partial<Record<PermissionName, PermissionStatus>> = {}
+    const nativeNames: string[] = []
+    const nativeMapped: Array<{ name: PermissionName; native: string }> = []
+    for (const p of permissions) {
+      const special = await checkSpecialPermission(p)
+      if (special !== null) { out[p] = special; continue }
+      const native = mapPermission(p)
+      if (native !== null) { nativeNames.push(native); nativeMapped.push({ name: p, native }) }
+      else out[p] = PermissionStatus.UNAVAILABLE
+    }
 
-    const nativePermissions = mapped.map((m) => m.native!)
-    const result = nativePermissions.length > 0
-      ? await rnp.checkMultiple(nativePermissions)
+    const result = nativeNames.length > 0
+      ? await rnp.checkMultiple(nativeNames)
       : {}
 
-    const out: Partial<Record<PermissionName, PermissionStatus>> = {}
-    for (const { name, native } of mapped) {
-      out[name] = normalizeStatus(result[native!] ?? 'unavailable')
-    }
-    // Fill in unmapped permissions
-    for (const p of permissions) {
-      if (!(p in out)) out[p] = PermissionStatus.UNAVAILABLE
+    for (const { name, native } of nativeMapped) {
+      out[name] = normalizeStatus(result[native] ?? 'unavailable')
     }
     return out as Record<PermissionName, PermissionStatus>
   }
@@ -370,21 +410,25 @@ export async function requestMultiple(
 ): Promise<Record<PermissionName, PermissionStatus>> {
   const rnp = getRNPermissions()
   if (rnp) {
-    const mapped = permissions
-      .map((p) => ({ name: p, native: mapPermission(p) }))
-      .filter((m) => m.native !== null)
+    // Shared special-path resolution (NF-NR-09): notifications resolve
+    // through their dedicated provider APIs on every platform.
+    const out: Partial<Record<PermissionName, PermissionStatus>> = {}
+    const nativeNames: string[] = []
+    const nativeMapped: Array<{ name: PermissionName; native: string }> = []
+    for (const p of permissions) {
+      const special = await requestSpecialPermission(p)
+      if (special !== null) { out[p] = special; continue }
+      const native = mapPermission(p)
+      if (native !== null) { nativeNames.push(native); nativeMapped.push({ name: p, native }) }
+      else out[p] = PermissionStatus.UNAVAILABLE
+    }
 
-    const nativePermissions = mapped.map((m) => m.native!)
-    const result = nativePermissions.length > 0
-      ? await rnp.requestMultiple(nativePermissions)
+    const result = nativeNames.length > 0
+      ? await rnp.requestMultiple(nativeNames)
       : {}
 
-    const out: Partial<Record<PermissionName, PermissionStatus>> = {}
-    for (const { name, native } of mapped) {
-      out[name] = normalizeStatus(result[native!] ?? 'unavailable')
-    }
-    for (const p of permissions) {
-      if (!(p in out)) out[p] = PermissionStatus.UNAVAILABLE
+    for (const { name, native } of nativeMapped) {
+      out[name] = normalizeStatus(result[native] ?? 'unavailable')
     }
     return out as Record<PermissionName, PermissionStatus>
   }

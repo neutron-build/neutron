@@ -1,4 +1,4 @@
-import { useEffect } from 'preact/hooks'
+import { useEffect, useRef } from 'preact/hooks'
 import { useSignal, useComputed } from '@preact/signals'
 import { schema, activeConnection, toast, refreshSchema } from '../../lib/store'
 import { api, ApiError } from '../../lib/api'
@@ -46,7 +46,7 @@ const COMMON_TYPES = [
   'uuid', 'jsonb', 'json', 'bytea',
 ]
 
-function colsFromDetail(d: SchemaObjectDetail): EditCol[] {
+export function colsFromDetail(d: SchemaObjectDetail): EditCol[] {
   return (d.table?.columns ?? []).map(c => {
     const editable = c.default && (c.default.kind === 'literal' || c.default.kind === 'expression')
     return {
@@ -64,7 +64,7 @@ function colsFromDetail(d: SchemaObjectDetail): EditCol[] {
   })
 }
 
-function indexesFromDetail(d: SchemaObjectDetail): DesignIndex[] {
+export function indexesFromDetail(d: SchemaObjectDetail): DesignIndex[] {
   return (d.table?.indexes ?? []).map(ix => ({
     name: ix.name,
     key: ix.key.map(k => k.expression ?? k.column ?? '?').join(', '),
@@ -89,6 +89,14 @@ function applyRefusal(err: ApiError): string {
 }
 
 export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?: string; initialTable?: string }) {
+  const mounted = useRef(true)
+  const generation = useRef(0)
+  const draftRevision = useRef(0)
+  const reconciliation = useSignal<string | null>(null)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++ } }, [])
+  const metadataGeneration = useRef(0)
+  const baseline = useSignal<string | null>(null)
+  const planBinding = useSignal<string | null>(null)
   const conn = activeConnection.value
   const sc = schema.value
 
@@ -136,14 +144,28 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
     })
   )
 
+  const selectionIdentity = () => JSON.stringify([activeConnection.value?.id, selectedSchema.value, selectedTable.value, isNewTable.value, newTableName.value])
+  const baselineIdentity = () => JSON.stringify([activeConnection.value?.id, selectedSchema.value, selectedTable.value])
+
   // Load the table's structure from the shared metadata when the selection
   // changes (or after an apply / a refused stale apply).
   useEffect(() => {
-    if (!selectedTable.value || !conn) return
+    const own = ++metadataGeneration.current
+    const identity = baselineIdentity()
+    const table = selectedTable.value
+    const schemaName = selectedSchema.value
+    const owns = () => own === metadataGeneration.current && identity === baselineIdentity() && !isNewTable.value
+    baseline.value = null
+    if (!table || !conn || isNewTable.value) return
+    cols.value = []
+    originalCols.value = []
+    indexes.value = []
+    resetPlan()
     colsLoading.value = true
     loadError.value = null
-    api.schemaObject(conn.id, selectedSchema.value, selectedTable.value)
+    api.schemaObject(conn.id, schemaName, table)
       .then(d => {
+        if (!owns()) return
         if (d.kind !== 'table') {
           loadError.value = d.kind === 'opaque'
             ? `${d.schema}.${d.name} is not managed by the planner (${d.opaque?.reason ?? 'opaque object'}); change it in the SQL editor.`
@@ -153,18 +175,30 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
           indexes.value = []
           return
         }
+        baseline.value = identity
         const loaded = colsFromDetail(d)
         originalCols.value = loaded
         cols.value = loaded.map(c => ({ ...c }))
         indexes.value = indexesFromDetail(d)
       })
       .catch(e => {
+        if (!owns()) return
         loadError.value = e instanceof ApiError && e.status === 404
           ? `${selectedSchema.value}.${selectedTable.value} is gone from the live catalog (dropped or renamed). Refresh the schema.`
           : e instanceof Error ? e.message : String(e)
       })
-      .finally(() => { colsLoading.value = false })
+      .finally(() => { if (owns()) colsLoading.value = false })
+    return () => { metadataGeneration.current++ }
   }, [selectedTable.value, selectedSchema.value, conn?.id, reloadTick.value])
+
+  useEffect(() => {
+    resetPlan()
+    if (isNewTable.value) {
+      isNewTable.value = false
+      cols.value = []
+      originalCols.value = []
+    }
+  }, [conn?.id])
 
   // Load codegen when table or lang changes
   useEffect(() => {
@@ -187,6 +221,10 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   // --- Handlers ---
 
   function resetPlan() {
+    generation.current++
+    planBinding.value = null
+    planning.value = false
+    applying.value = false
     pendingPlan.value = null
     planError.value = null
     applyError.value = null
@@ -194,14 +232,31 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   }
 
   function selectTable(schemaName: string, tableName: string) {
+    reconciliation.value = null
+    draftRevision.current++
     resetPlan()
+    metadataGeneration.current++
+    baseline.value = null
+    cols.value = []
+    originalCols.value = []
+    indexes.value = []
+    // A new-index draft belongs to the table it was drafted on; switching or
+    // explicitly reloading metadata discards it with the rest of the draft.
+    newIdxCol.value = ''
+    newIdxUnique.value = false
     isNewTable.value = false
     selectedSchema.value = schemaName
     selectedTable.value = tableName
+    reloadTick.value++
   }
 
   function startNewTable() {
+    reconciliation.value = null
+    draftRevision.current++
     resetPlan()
+    metadataGeneration.current++
+    baseline.value = null
+    colsLoading.value = false
     selectedTable.value = null
     isNewTable.value = true
     newTableName.value = ''
@@ -215,7 +270,13 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
     codegenCode.value = ''
   }
 
+  function draftChanged() {
+    draftRevision.current++
+    if (!applying.value) resetPlan()
+  }
+
   function addColumn() {
+    draftChanged()
     cols.value = [...cols.value, {
       name: '', dataType: 'text', isNullable: true,
       default: null, isPrimaryKey: false,
@@ -224,12 +285,14 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   }
 
   function updateCol(idx: number, patch: Partial<EditCol>) {
+    draftChanged()
     cols.value = cols.value.map((c, i) => i === idx ? { ...c, ...patch } : c)
   }
 
   function deleteCol(idx: number) {
     const c = cols.value[idx]
     if (c.isNew) {
+      draftChanged()
       cols.value = cols.value.filter((_, i) => i !== idx)
     } else {
       updateCol(idx, { isDeleted: true })
@@ -239,6 +302,8 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   /** The visual edits as structured changes for the plan endpoint. */
   function computeChanges(): { changes: SchemaChange[]; error: string | null } {
     const changes: SchemaChange[] = []
+    if (reconciliation.value) return { changes: [], error: reconciliation.value }
+    if (!isNewTable.value && baseline.value !== baselineIdentity()) return { changes: [], error: 'Wait for the selected table metadata' }
     if (isNewTable.value) {
       const name = newTableName.value.trim()
       if (!name) return { changes: [], error: 'Table name is required' }
@@ -314,13 +379,22 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   async function requestPlan(changes: SchemaChange[]): Promise<boolean> {
     const c = activeConnection.value
     if (!c) return false
+    if (reconciliation.value) return false
+    if (!isNewTable.value && baseline.value !== baselineIdentity()) return false
     resetPlan()
+    const own = generation.current
+    const identity = selectionIdentity()
+    const owns = () => mounted.current && own === generation.current && identity === selectionIdentity()
     planning.value = true
     try {
-      pendingPlan.value = await api.schemaPlan({ connectionId: c.id, changes })
+      const plan = await api.schemaPlan({ connectionId: c.id, changes })
+      if (!owns()) return false
+      pendingPlan.value = plan
+      planBinding.value = identity
       plannedChanges.value = changes
       return true
     } catch (err: unknown) {
+      if (!owns()) return false
       planError.value = err instanceof Error ? err.message : String(err)
       if (err instanceof ApiError && err.status === 400 && /does not exist/.test(err.message)) {
         // The live catalog moved under the edit: refresh what we show.
@@ -328,7 +402,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
       }
       return false
     } finally {
-      planning.value = false
+      if (owns()) planning.value = false
     }
   }
 
@@ -342,7 +416,11 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   async function applyPlan(acknowledged: boolean) {
     const c = activeConnection.value
     const plan = pendingPlan.value
-    if (!c || !plan) return
+    if (!c || !plan || planBinding.value !== selectionIdentity()) return
+    const own = generation.current
+    const revision = draftRevision.current
+    const identity = selectionIdentity()
+    const owns = () => mounted.current && own === generation.current && identity === selectionIdentity()
     applying.value = true
     applyError.value = null
     try {
@@ -352,6 +430,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
         planId: plan.planId,
         allowDestructive: acknowledged,
       })
+      if (!owns()) { void refreshSchema(c.id); return }
       if (res.verification === 'in-sync') {
         toast('success', res.applied ? `Applied ${res.up.length} statement(s) in one transaction` : 'Already in sync')
       } else if (res.verification === 'drift') {
@@ -361,7 +440,16 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
       }
       const created = isNewTable.value ? newTableName.value.trim() : null
       resetPlan()
+      const continuation = generation.current
+      const continuationIdentity = selectionIdentity()
       await refreshSchema(c.id)
+      if (!mounted.current || continuationIdentity !== selectionIdentity()) return
+      if (revision !== draftRevision.current) {
+        baseline.value = null
+        reconciliation.value = 'Apply succeeded. Newer local edits were retained; reload metadata before planning another change.'
+        return
+      }
+      if (continuation !== generation.current) return
       if (created) {
         isNewTable.value = false
         selectedTable.value = created
@@ -369,6 +457,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
         reloadTick.value++
       }
     } catch (err: unknown) {
+      if (!owns()) return
       if (err instanceof ApiError) {
         applyError.value = applyRefusal(err)
         if (err.state === 'stale-plan' && err.body && typeof err.body.plan === 'object' && err.body.plan) {
@@ -382,7 +471,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
         applyError.value = err instanceof Error ? err.message : String(err)
       }
     } finally {
-      applying.value = false
+      if (owns()) applying.value = false
     }
   }
 
@@ -394,13 +483,14 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
   }
 
   async function addIndex() {
+    const revision = draftRevision.current
     if (!selectedTable.value || !newIdxCol.value) return
     const idxName = `${selectedTable.value}_${newIdxCol.value}_idx`
     const ok = await requestPlan([{
       op: 'add-index', schema: selectedSchema.value, table: selectedTable.value,
       index: idxName, column: newIdxCol.value, unique: newIdxUnique.value,
     }])
-    if (ok) {
+    if (ok && revision === draftRevision.current) {
       newIdxCol.value = ''
       newIdxUnique.value = false
     }
@@ -453,6 +543,14 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
         {planError.value && (
           <div class={s.planError} role="alert">{planError.value}</div>
         )}
+        {reconciliation.value && <div role="status">
+          {reconciliation.value}
+          <button onClick={() => {
+            const created = isNewTable.value ? newTableName.value.trim() : selectedTable.value
+            reconciliation.value = null
+            if (created) selectTable(selectedSchema.value, created)
+          }}>Reload metadata and discard retained draft</button>
+        </div>}
         {pendingPlan.value && (
           <PlanReview
             key={pendingPlan.value.planId}
@@ -472,7 +570,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
                 class={s.tableNameInput}
                 placeholder="table_name"
                 value={newTableName.value}
-                onInput={e => { newTableName.value = (e.target as HTMLInputElement).value }}
+                onInput={e => { draftChanged(); newTableName.value = (e.target as HTMLInputElement).value }}
               />
               <span class={s.newBadge}>new table in {selectedSchema.value}</span>
             </div>
@@ -486,7 +584,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
 
             <div class={s.actions}>
               <button class={s.cancelBtn} onClick={() => { isNewTable.value = false; resetPlan() }}>Cancel</button>
-              <button class={s.createBtn} onClick={saveChanges} disabled={planning.value}>
+              <button class={s.createBtn} onClick={saveChanges} disabled={planning.value || (!isNewTable.value && baseline.value !== baselineIdentity())}>
                 {planning.value ? 'Planning…' : 'Plan Create Table'}
               </button>
             </div>
@@ -517,8 +615,8 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
                 {dirty.value && (
                   <div class={s.dirtyBar}>
                     <span class={s.dirtyMsg}>Unsaved changes</span>
-                    <button class={s.cancelBtn} onClick={() => { resetPlan(); cols.value = originalCols.value.map(c => ({ ...c })) }}>Revert</button>
-                    <button class={s.saveBtn} onClick={saveChanges} disabled={planning.value}>
+                    <button class={s.cancelBtn} onClick={() => { draftChanged(); resetPlan(); cols.value = originalCols.value.map(c => ({ ...c })) }}>Revert</button>
+                    <button class={s.saveBtn} onClick={saveChanges} disabled={planning.value || (!isNewTable.value && baseline.value !== baselineIdentity())}>
                       {planning.value ? 'Planning…' : 'Plan Changes'}
                     </button>
                   </div>
@@ -542,7 +640,7 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
                     <select
                       class={s.idxColSelect}
                       value={newIdxCol.value}
-                      onChange={e => { newIdxCol.value = (e.target as HTMLSelectElement).value }}
+                      onChange={e => { draftChanged(); newIdxCol.value = (e.target as HTMLSelectElement).value }}
                     >
                       <option value="">Column…</option>
                       {originalCols.value.map(c => (
@@ -553,14 +651,14 @@ export function SchemaDesigner({ initialSchema, initialTable }: { initialSchema?
                       <input
                         type="checkbox"
                         checked={newIdxUnique.value}
-                        onChange={e => { newIdxUnique.value = (e.target as HTMLInputElement).checked }}
+                        onChange={e => { draftChanged(); newIdxUnique.value = (e.target as HTMLInputElement).checked }}
                       />
                       Unique
                     </label>
                     <button
                       class={s.addIdxBtn}
                       onClick={addIndex}
-                      disabled={!newIdxCol.value || planning.value}
+                      disabled={!newIdxCol.value || planning.value || baseline.value !== baselineIdentity()}
                     >
                       + Plan Index
                     </button>

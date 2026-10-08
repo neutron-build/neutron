@@ -1,3 +1,5 @@
+import { useEffect } from 'preact/hooks'
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useSignal } from '@preact/signals'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
@@ -51,10 +53,20 @@ export function GeoModule({ name }: GeoModuleProps) {
   const running = useSignal(false)
 
   const conn = activeConnection.value!
+  const owner = useRequestOwner(JSON.stringify([conn.id, name]))
+
+  useEffect(() => { result.value = null; running.value = false }, [conn.id, name])
+
+  function inputChanged() { owner.invalidate('query'); running.value = false; result.value = null }
 
   // Build a closed WKT ring from flat x,y coordinates (area/contains).
 
   async function runCalc() {
+    if (running.value) return
+    const current = owner.begin('query')
+    const setup = JSON.stringify([calcType.value, lat1.value, lon1.value, lat2.value, lon2.value, radius.value, polygon.value, ptX.value, ptY.value])
+    const owns = () => current() && setup === JSON.stringify([calcType.value, lat1.value, lon1.value, lat2.value, lon2.value, radius.value, polygon.value, ptX.value, ptY.value])
+    if (!owns()) return
     running.value = true
     result.value = null
     try {
@@ -93,13 +105,15 @@ export function GeoModule({ name }: GeoModuleProps) {
         }
       }
       const r = await api.query(sql!, conn.id)
-      if (r.error) throw new Error(r.error)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Query canceled')
       const cell = r.rows.length > 0 ? r.rows[0][0] : null
       result.value = formatResult(calcType.value, cell)
     } catch (err: unknown) {
+      if (!owns()) return
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
-      running.value = false
+      if (current()) running.value = false
     }
   }
 
@@ -116,7 +130,7 @@ export function GeoModule({ name }: GeoModuleProps) {
             <button
               key={t}
               class={`${s.tab} ${calcType.value === t ? s.tabActive : ''}`}
-              onClick={() => { calcType.value = t; result.value = null }}
+              onClick={() => { inputChanged(); calcType.value = t; result.value = null }}
             >
               {t === 'distance' ? 'Distance' : t === 'within' ? 'Within Radius' : t === 'area' ? 'Polygon Area' : 'Contains Point'}
             </button>
@@ -126,19 +140,19 @@ export function GeoModule({ name }: GeoModuleProps) {
         <div class={s.fields}>
           {(calcType.value === 'distance' || calcType.value === 'within') && (
             <>
-              <Field label="Lat 1" value={lat1.value} onChange={v => { lat1.value = v }} />
-              <Field label="Lon 1" value={lon1.value} onChange={v => { lon1.value = v }} />
-              <Field label="Lat 2" value={lat2.value} onChange={v => { lat2.value = v }} />
-              <Field label="Lon 2" value={lon2.value} onChange={v => { lon2.value = v }} />
+              <Field label="Lat 1" value={lat1.value} onChange={v => { inputChanged(); lat1.value = v }} />
+              <Field label="Lon 1" value={lon1.value} onChange={v => { inputChanged(); lon1.value = v }} />
+              <Field label="Lat 2" value={lat2.value} onChange={v => { inputChanged(); lat2.value = v }} />
+              <Field label="Lon 2" value={lon2.value} onChange={v => { inputChanged(); lon2.value = v }} />
               {calcType.value === 'within' && (
-                <Field label="Radius (m)" value={radius.value} onChange={v => { radius.value = v }} />
+                <Field label="Radius (m)" value={radius.value} onChange={v => { inputChanged(); radius.value = v }} />
               )}
             </>
           )}
           {calcType.value === 'contains' && (
             <>
-              <Field label="Point x" value={ptX.value} onChange={v => { ptX.value = v }} />
-              <Field label="Point y" value={ptY.value} onChange={v => { ptY.value = v }} />
+              <Field label="Point x" value={ptX.value} onChange={v => { inputChanged(); ptX.value = v }} />
+              <Field label="Point y" value={ptY.value} onChange={v => { inputChanged(); ptY.value = v }} />
             </>
           )}
           {(calcType.value === 'area' || calcType.value === 'contains') && (
@@ -148,7 +162,7 @@ export function GeoModule({ name }: GeoModuleProps) {
                 class={s.fieldInput}
                 rows={5}
                 value={polygon.value}
-                onInput={e => { polygon.value = (e.target as HTMLTextAreaElement).value }}
+                onInput={e => { inputChanged(); polygon.value = (e.target as HTMLTextAreaElement).value }}
               />
             </div>
           )}

@@ -13,14 +13,24 @@ const KEYBOARD_TO_INPUT_MODE: Record<string, string> = {
   'number-pad': 'numeric',
 }
 
+/** RN autoCapitalize values map onto the HTML attribute's own enum. */
+const AUTOCAPITALIZE: Record<string, string> = {
+  none: 'off',
+  sentences: 'sentences',
+  words: 'words',
+  characters: 'characters',
+}
+
 export function TextInput({
   value,
   defaultValue,
   onChangeText,
+  onChange,
   onSubmitEditing,
   onFocus,
   onBlur,
   placeholder,
+  placeholderTextColor,
   secureTextEntry,
   keyboardType,
   autoCapitalize,
@@ -30,6 +40,8 @@ export function TextInput({
   style,
   editable,
   maxLength,
+  autoFocus,
+  accessibilityLabel,
   testID,
 }: TextInputProps) {
   const sharedProps = {
@@ -38,24 +50,37 @@ export function TextInput({
     placeholder,
     disabled: editable === false,
     maxLength,
+    autoFocus,
     'data-testid': testID,
-    autoCapitalize: autoCapitalize ?? 'sentences',
+    'aria-label': accessibilityLabel,
+    autoCapitalize: AUTOCAPITALIZE[autoCapitalize ?? 'sentences'],
     autoCorrect: String(autoCorrect ?? true),
     style: styleToCSS(style) as preact.JSX.CSSProperties,
-    onInput: onChangeText
-      ? (e: Event) => onChangeText((e.target as HTMLInputElement).value)
+    onInput: (onChangeText || onChange)
+      ? (e: Event) => {
+          const text = (e.target as HTMLInputElement).value
+          onChangeText?.(text)
+          // RN's onChange carries { nativeEvent: { text } } (NF-NR-14).
+          onChange?.({ nativeEvent: { text } })
+        }
       : undefined,
-    onFocus: onFocus ? () => onFocus() : undefined,
-    onBlur: onBlur ? () => onBlur() : undefined,
+    onFocus: onFocus ? (e: FocusEvent) => onFocus(e) : undefined,
+    onBlur: onBlur ? (e: FocusEvent) => onBlur(e) : undefined,
     onKeyDown: onSubmitEditing
-      ? (e: KeyboardEvent) => { if (e.key === 'Enter' && !multiline) onSubmitEditing() }
+      ? (e: KeyboardEvent) => { if (e.key === 'Enter' && !multiline) onSubmitEditing(e) }
       : undefined,
     inputMode: KEYBOARD_TO_INPUT_MODE[keyboardType ?? 'default'] as preact.JSX.HTMLAttributes<HTMLInputElement>['inputMode'],
   }
 
+  // placeholderTextColor has no CSS equivalent — the ::placeholder pseudo
+  //element needs a stylesheet; surfaced as a CSS variable for one.
+  const styleWithPlaceholder = placeholderTextColor
+    ? { ...sharedProps.style, '--placeholder-color': placeholderTextColor } as preact.JSX.CSSProperties
+    : sharedProps.style
+
   if (multiline) {
-    return <textarea rows={numberOfLines ?? 4} {...sharedProps as preact.JSX.HTMLAttributes<HTMLTextAreaElement>} />
+    return <textarea rows={numberOfLines ?? 4} {...sharedProps as preact.JSX.HTMLAttributes<HTMLTextAreaElement>} style={styleWithPlaceholder} />
   }
 
-  return <input type={secureTextEntry ? 'password' : 'text'} {...sharedProps as preact.JSX.HTMLAttributes<HTMLInputElement>} />
+  return <input type={secureTextEntry ? 'password' : 'text'} {...sharedProps as preact.JSX.HTMLAttributes<HTMLInputElement>} style={styleWithPlaceholder} />
 }

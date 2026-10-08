@@ -2,8 +2,8 @@
  * NeutronWind Babel plugin.
  *
  * Transforms JSX className props into inline style objects at build time.
- * This runs during the Re.Pack/Rspack compilation step so there is
- * zero runtime cost — no className string parsing on device.
+ * This runs during the Re.Pack/Rspack compilation step so static classes
+ * cost nothing at runtime — no className string parsing on device.
  *
  * Input:
  *   <View className="flex-1 bg-slate-900 p-4 ios:shadow-lg android:elevation-4" />
@@ -19,120 +19,168 @@
  *   w-[42px]           → { width: 42 }
  *   bg-blue-500/50     → { backgroundColor: 'rgba(59,130,246,0.5)' }
  *
- * If className contains dynamic values (template literals, variables),
- * the plugin falls back to a runtime resolveClassName() call.
+ * Dynamic values (template literals with expressions, identifiers, ternaries)
+ * and anything not statically resolvable (unknown tokens, screen sizes,
+ * unpaired leading-*) are routed through ONE explicitly imported
+ * `resolveClassName` call from 'neutron-native-styling/runtime' — never a
+ * free/unbound helper identifier (NF-NR-01). The full original expression is
+ * passed to the resolver so every interpolated expression still evaluates
+ * exactly once. An existing style prop on the same element is merged (caller
+ * style wins; function-valued Pressable styles preserved) instead of being
+ * duplicated.
  */
 
 import type { NodePath, PluginObj } from '@babel/core'
 import type * as BabelTypes from '@babel/types'
-import { ALL_TOKENS, parseArbitraryValue, parseOpacityModifier } from './tokens.js'
-import type { StyleProp } from './tokens.js'
+import { resolveStaticClasses } from './resolve.js'
+import { ALL_TOKENS } from './tokens.js'
 
-type Platform = 'ios' | 'android' | 'all'
+export type Platform = 'ios' | 'android' | 'all'
 
 interface PluginOptions {
   /** Target platform — filters platform-specific class variants */
   platform?: Platform
+  /** Module specifier for the runtime resolver (tests/overrides). */
+  runtimeModule?: string
 }
 
 interface BabelAPI {
   types: typeof BabelTypes
+  /**
+   * Babel ≥7.17 hands plugins an `availableHelper`-adjacent scope API; the
+   * loader passes the real one. We only need generateUidIdentifier, which
+   * plain @babel/traverse scopes provide.
+   */
 }
 
-const PLATFORM_PREFIXES = ['ios', 'android'] as const
-
-/**
- * Strip platform prefix from a class and check if it applies.
- * Returns { base, applies } — base is the token name, applies is whether
- * this class should be included for the given platform.
- */
-function resolvePlatformClass(cls: string, platform: Platform): { base: string; applies: boolean } {
-  for (const prefix of PLATFORM_PREFIXES) {
-    if (cls.startsWith(`${prefix}:`)) {
-      const base = cls.slice(prefix.length + 1)
-      return { base, applies: platform === prefix || platform === 'all' }
-    }
-  }
-  return { base: cls, applies: true }
-}
-
-/**
- * Resolve a single class token to a style object. Checks the static
- * token map first, then falls back to arbitrary value / opacity modifier parsing.
- */
-function resolveToken(cls: string): StyleProp | null {
-  return ALL_TOKENS[cls] ?? parseArbitraryValue(cls) ?? parseOpacityModifier(cls) ?? null
-}
+const RUNTIME_MODULE = 'neutron-native-styling/runtime'
 
 export default function neutronWindPlugin({ types: t }: BabelAPI, options: PluginOptions = {}): PluginObj {
   const platform = options.platform ?? 'all'
+  const runtimeModule = options.runtimeModule ?? RUNTIME_MODULE
+
+  // Per-program import bookkeeping: bindings are generated lazily on first
+  // use so a file with no dynamic classes never gets an unused import.
+  let resolveBinding: BabelTypes.Identifier | null = null
+  let mergeBinding: BabelTypes.Identifier | null = null
+  let programPath: NodePath<BabelTypes.Program> | null = null
+
+  function ensureResolveImport(): BabelTypes.Identifier {
+    if (!resolveBinding) {
+      if (!programPath) throw new Error('neutron-wind: program not registered')
+      resolveBinding = programPath.scope.generateUidIdentifier('neutronWindResolve')
+      programPath.node.body.unshift(
+        t.importDeclaration(
+          [t.importSpecifier(resolveBinding, t.identifier('resolveClassName'))],
+          t.stringLiteral(runtimeModule),
+        ),
+      )
+      programPath.scope.registerDeclaration(programPath.get('body.0') as NodePath<BabelTypes.ImportDeclaration>)
+    }
+    return resolveBinding
+  }
+
+  function ensureMergeImport(): BabelTypes.Identifier {
+    if (!mergeBinding) {
+      if (!programPath) throw new Error('neutron-wind: program not registered')
+      mergeBinding = programPath.scope.generateUidIdentifier('neutronWindMerge')
+      programPath.node.body.unshift(
+        t.importDeclaration(
+          [t.importSpecifier(mergeBinding, t.identifier('mergeStyles'))],
+          t.stringLiteral(runtimeModule),
+        ),
+      )
+      programPath.scope.registerDeclaration(programPath.get('body.0') as NodePath<BabelTypes.ImportDeclaration>)
+    }
+    return mergeBinding
+  }
 
   return {
     name: 'neutron-wind',
     visitor: {
+      Program(path: NodePath<BabelTypes.Program>) {
+        programPath = path
+      },
       JSXAttribute(path: NodePath<BabelTypes.JSXAttribute>) {
-        // Only handle className attributes
         if (!t.isJSXIdentifier(path.node.name, { name: 'className' })) return
-
         const value = path.node.value
         if (!value) return
 
-        // Static string literal — resolve at compile time
+        const element = path.parentPath
+        if (!element || !t.isJSXOpeningElement(element.node)) return
+
+        // Existing style attribute (either side of className) — merged, never
+        // duplicated.
+        const styleAttr = element.node.attributes.find(
+          attr => t.isJSXAttribute(attr) && t.isJSXIdentifier(attr.name, { name: 'style' }),
+        ) as BabelTypes.JSXAttribute | undefined
+
+        let resolvedExpr: BabelTypes.Expression | null = null
+
         if (t.isStringLiteral(value)) {
-          const classes = value.value.trim().split(/\s+/)
-          const merged: Record<string, unknown> = {}
-          const unresolved: string[] = []
-
-          for (const cls of classes) {
-            const { base, applies } = resolvePlatformClass(cls, platform)
-            if (!applies) continue  // wrong platform
-
-            const token = resolveToken(base)
-            if (token) {
-              Object.assign(merged, token)
+          resolvedExpr = resolveStaticString(value.value)
+        } else if (t.isJSXExpressionContainer(value)) {
+          const expr = value.expression
+          if (t.isTemplateLiteral(expr)) {
+            // Only fold templates with ZERO expressions: joining the quasis
+            // of a template that interpolates anything silently discards the
+            // interpolated values (NF-NR-01).
+            if (expr.expressions.length === 0) {
+              const raw = expr.quasis.map(q => q.value.cooked ?? '').join('')
+              resolvedExpr = resolveStaticString(raw)
             } else {
-              unresolved.push(base)
+              resolvedExpr = callResolver(expr)
             }
+          } else if (t.isExpression(expr)) {
+            // Any other dynamic expression: one resolver call over the full
+            // original expression — evaluation count preserved.
+            resolvedExpr = callResolver(expr)
           }
-
-          if (unresolved.length === 0 && Object.keys(merged).length > 0) {
-            // Fully resolved — emit static object
-            path.node.name = t.jsxIdentifier('style')
-            path.node.value = t.jsxExpressionContainer(
-              _objectToASTExpression(merged, t)
-            )
-          } else if (Object.keys(merged).length > 0) {
-            // Partial — warn and fall back to runtime for unresolved
-            path.node.name = t.jsxIdentifier('style')
-            path.node.value = t.jsxExpressionContainer(
-              t.callExpression(
-                t.memberExpression(t.identifier('__nw'), t.identifier('resolveClassName')),
-                [t.stringLiteral(unresolved.join(' '))]
-              )
-            )
-          }
-          return
         }
 
-        // JSX expression — resolve static template literals
-        if (t.isJSXExpressionContainer(value)) {
-          const expr = value.expression
-          if (t.isTemplateLiteral(expr) && expr.quasis.every(q => q.type === 'TemplateElement')) {
-            const raw = expr.quasis.map(q => q.value.cooked ?? '').join('')
-            const classes = raw.trim().split(/\s+/)
-            const merged: Record<string, unknown> = {}
-            for (const cls of classes) {
-              const { base, applies } = resolvePlatformClass(cls, platform)
-              if (!applies) continue
-              const token = resolveToken(base)
-              if (token) Object.assign(merged, token)
-            }
-            if (Object.keys(merged).length > 0) {
-              path.node.name = t.jsxIdentifier('style')
-              path.node.value = t.jsxExpressionContainer(_objectToASTExpression(merged, t))
-            }
+        if (!resolvedExpr) return
+
+        const finalExpr = styleAttr
+          ? t.callExpression(ensureMergeImport(), [resolvedExpr, unwrapStyleValue(styleAttr)])
+          : resolvedExpr
+
+        if (styleAttr) {
+          // Rewrite the existing style attribute; drop className entirely.
+          styleAttr.value = t.jsxExpressionContainer(finalExpr)
+          path.remove()
+        } else {
+          path.node.name = t.jsxIdentifier('style')
+          path.node.value = t.jsxExpressionContainer(finalExpr)
+        }
+        return
+
+        function callResolver(arg: BabelTypes.Expression): BabelTypes.Expression {
+          return t.callExpression(ensureResolveImport(), [arg])
+        }
+
+        function resolveStaticString(raw: string): BabelTypes.Expression | null {
+          const { styles, needsRuntime } = resolveStaticClasses(raw, platform)
+          const staticEntries = Object.keys(styles).length
+          if (!needsRuntime && staticEntries > 0) {
+            return _objectToASTExpression(styles, t)
           }
-          // Dynamic expressions fall through unchanged
+          if (needsRuntime) {
+            // Unknown/screen/unpaired tokens: hand the FULL original string
+            // to the runtime resolver (it keeps platform handling and merges
+            // everything, including what we resolved statically here).
+            return callResolver(t.stringLiteral(raw))
+          }
+          // Whitespace-only or empty: no style at all. Leave the attribute
+          // alone — an explicit, boring contract (NF-NR-01).
+          return null
+        }
+
+        function unwrapStyleValue(attr: BabelTypes.JSXAttribute): BabelTypes.Expression {
+          const v = attr.value
+          if (!v) return t.nullLiteral()
+          if (t.isStringLiteral(v)) return v
+          if (t.isJSXExpressionContainer(v) && t.isExpression(v.expression)) return v.expression
+          return t.nullLiteral()
         }
       },
     },
@@ -163,4 +211,4 @@ function _valueToAST(value: unknown, t: typeof BabelTypes): BabelTypes.Expressio
 
 // Export token map for external tooling (IDE plugins, etc.)
 export { ALL_TOKENS }
-export type { StyleProp, Platform }
+export type { StyleProp } from './tokens.js'

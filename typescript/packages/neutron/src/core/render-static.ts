@@ -55,6 +55,7 @@ export interface StaticRenderOptions {
 export interface StaticGateOptions {
   loadRouteModule: (route: Route) => Promise<RouteModule>;
   getLayoutChain: (route: Route) => Route[];
+  globalMiddleware?: unknown;
 }
 
 /**
@@ -74,6 +75,9 @@ export async function assertStaticRoutesUngated(
   staticRoutes: Route[],
   options: StaticGateOptions
 ): Promise<void> {
+  if (options.globalMiddleware && staticRoutes.length > 0) {
+    throw new Error("Cannot prerender routes behind global middleware: static files bypass request authorization.");
+  }
   const gated: Array<{ route: Route; gate: Route }> = [];
   for (const route of staticRoutes) {
     const chain = [...options.getLayoutChain(route), route];
@@ -168,6 +172,7 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
     {
       loadRouteModule: (route) => loadRouteModule(route.file, moduleCache),
       getLayoutChain,
+      globalMiddleware: ["ts", "tsx", "js", "mjs"].some(ext => fs.existsSync(path.join(appRoot, "src", `middleware.${ext}`))),
     }
   );
 

@@ -251,3 +251,8 @@ export function isResponse(value: unknown): value is Response {
   );
 }
 
+
+/** Return a response with writable headers, retaining the original body stream. */
+export function mutableResponse(response: Response): Response {
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) });
+}

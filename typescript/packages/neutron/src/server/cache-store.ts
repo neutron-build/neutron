@@ -1,3 +1,4 @@
+import { normalizePathname } from "../core/route-path.js";
 export interface NeutronAppResponseCacheEntry {
   status: number;
   statusText: string;
@@ -25,8 +26,12 @@ export interface NeutronLoaderDataCacheEntry {
  * server-side script. A client-side check followed by set is insufficient.
  */
 export interface AtomicCachePublication<T> {
+  /** Opt-in provider guarantee: setIfGeneration checks the deadline and
+   * generation atomically at publication. Unsupported adapters bypass shared
+   * caching. Signal cancellation alone is not this guarantee. */
+  publicationDeadline?: true;
   getGeneration(): Promise<string>;
-  setIfGeneration(key: string, entry: T, generation: string): Promise<boolean>;
+  setIfGeneration(key: string, entry: T, generation: string, options?: { deadline: number; signal: AbortSignal }): Promise<boolean>;
 }
 
 export interface NeutronAppCacheStore extends Partial<AtomicCachePublication<NeutronAppResponseCacheEntry>> {
@@ -80,6 +85,7 @@ export function createMemoryAppCacheStore(
   }
 
   return {
+    publicationDeadline: true,
     async get(key) {
       const entry = cache.get(key);
       if (!entry) {
@@ -96,7 +102,8 @@ export function createMemoryAppCacheStore(
       return entry;
     },
     async getGeneration() { return generation.toString(); },
-    async setIfGeneration(key, entry, expected) {
+    async setIfGeneration(key, entry, expected, options) {
+      if (options && (options.signal.aborted || Date.now() >= options.deadline)) return false;
       if (generation.toString() !== expected) return false;
       storeEntry(key, entry);
       return true;
@@ -138,7 +145,10 @@ export function createMemoryLoaderCacheStore(
     DEFAULT_MEMORY_LOADER_CACHE_ENTRIES
   );
 
-  function storeEntry(key: string, entry: NeutronLoaderDataCacheEntry): void {
+  function storeEntry(key: string, entry: NeutronLoaderDataCacheEntry, owned = false): void {
+    // Clone before any cache mutation; a slow clone must not move the final
+    // deadline/generation check away from conditional publication.
+    const value = owned ? entry : cloneLoaderEntry(entry);
     if (!cache.has(key) && cache.size >= maxEntries) {
       const oldest = cache.keys().next().value;
       if (typeof oldest === "string") {
@@ -146,10 +156,11 @@ export function createMemoryLoaderCacheStore(
       }
     }
     // Clone at ingress too: the caller keeps its reference after storing.
-    cache.set(key, cloneLoaderEntry(entry));
+    cache.set(key, value);
   }
 
   return {
+    publicationDeadline: true,
     async get(key) {
       const entry = cache.get(key);
       if (!entry) {
@@ -168,9 +179,12 @@ export function createMemoryLoaderCacheStore(
       return cloneLoaderEntry(entry);
     },
     async getGeneration() { return generation.toString(); },
-    async setIfGeneration(key, entry, expected) {
+    async setIfGeneration(key, entry, expected, options) {
+      if (options && (options.signal.aborted || Date.now() >= options.deadline)) return false;
+      const owned = cloneLoaderEntry(entry);
+      if (options && (options.signal.aborted || Date.now() >= options.deadline)) return false;
       if (generation.toString() !== expected) return false;
-      storeEntry(key, entry);
+      storeEntry(key, owned, true);
       return true;
     },
     async set(key, entry) { storeEntry(key, entry); },
@@ -225,24 +239,7 @@ function resolveMaxEntries(value: number | undefined, fallback: number): number 
  * Returns null when the path cannot be safely normalized (undecodable, not
  * rooted, contains a `..` segment).
  */
-export function normalizeCachePathname(pathname: string): string | null {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(pathname || "/");
-  } catch {
-    return null;
-  }
-
-  if (!decoded.startsWith("/") || decoded.split("/").includes("..")) {
-    return null;
-  }
-
-  if (decoded.length > 1 && decoded.endsWith("/")) {
-    return decoded.slice(0, -1);
-  }
-
-  return decoded;
-}
+export const normalizeCachePathname = normalizePathname;
 
 /** Refuse unsafe external adapters before creating any server resources. */
 export function assertAtomicCacheStore(store: NeutronAppCacheStore | NeutronLoaderCacheStore): void {

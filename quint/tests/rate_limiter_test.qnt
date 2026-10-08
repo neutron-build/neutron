@@ -1,10 +1,10 @@
 // Rate limiter invariant tests.
 module rate_limiter_test {
-    import rate_limiter.*
+    import rate_limiter.* from "../specs/framework/rate_limiter"
 
     // Test: initial state satisfies all invariants
     run init_valid_test = {
-        init.then(all {
+        init.expect(all {
             offset_bounded, count_bounded, rate_enforced,
             fair_capacity, no_undercount
         })
@@ -14,7 +14,7 @@ module rate_limiter_test {
     run single_request_test = {
         init
             .then(request(1))
-            .then(all { rate_enforced, count_bounded })
+            .expect(all { rate_enforced, count_bounded })
     }
 
     // Test: time advances correctly
@@ -22,7 +22,7 @@ module rate_limiter_test {
         init
             .then(tick)
             .then(tick)
-            .then(all { offset_bounded, no_undercount })
+            .expect(all { offset_bounded, no_undercount })
     }
 
     // Test: window rollover resets counts
@@ -32,7 +32,7 @@ module rate_limiter_test {
             // Advance through full window
             .then(tick).then(tick).then(tick).then(tick).then(tick)
             .then(tick).then(tick).then(tick).then(tick).then(tick)
-            .then(all { offset_bounded, count_bounded })
+            .expect(all { offset_bounded, count_bounded })
     }
 
     // Test: fairness — equal requests get equal treatment
@@ -41,7 +41,7 @@ module rate_limiter_test {
             .then(request(1))
             .then(request(2))
             .then(request(3))
-            .then(fair_capacity)
+            .expect(fair_capacity)
     }
 
     // Test: requests and ticks interleaved
@@ -52,6 +52,6 @@ module rate_limiter_test {
             .then(request(2))
             .then(tick)
             .then(request(1))
-            .then(all { rate_enforced, no_undercount, reject_accounting })
+            .expect(all { rate_enforced, no_undercount, reject_accounting })
     }
 }

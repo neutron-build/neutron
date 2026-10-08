@@ -30,8 +30,20 @@ const WEB_CAMERA: CameraModule = {
       return { ok: false, error: { code: 'UNAVAILABLE', message: 'getUserMedia not supported in this browser' } }
     }
 
+    // Video capture is a SEPARATE capability this web module does not
+    // implement (a data-URL photo is not a video); say so instead of
+    // silently returning a JPEG (NF-NR-10).
+    if (options?.mediaType === 'video') {
+      return { ok: false, error: { code: 'UNSUPPORTED', message: 'Video capture is not supported by the web camera module' } }
+    }
+
+    // Declared OUTSIDE the try: every exit path stops every acquired track,
+    // detaches the stream and releases the temporary elements (NF-NR-10) —
+    // a rejected play() or a stalled frame must not leave the camera on.
+    let stream: MediaStream | null = null
+    let video: HTMLVideoElement | null = null
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: options?.facing === 'front' ? 'user' : 'environment',
           width: { ideal: options?.maxWidth || 1280 },
@@ -39,31 +51,31 @@ const WEB_CAMERA: CameraModule = {
         },
       })
 
-      // Create a hidden video element and wait for it to produce frames
-      const video = document.createElement('video')
-      video.srcObject = stream
+      video = document.createElement('video')
+      video.muted = true
       video.setAttribute('playsinline', 'true') // Required for iOS Safari
+      video.srcObject = stream
       await video.play()
 
-      // Wait a frame for the video dimensions to settle
-      await new Promise((r) => requestAnimationFrame(r))
+      // Wait for a USABLE frame, not just the next paint tick: the video
+      // must report real dimensions before drawing (NF-NR-10).
+      await waitForUsableFrame(video)
+
+      if (!video.videoWidth || !video.videoHeight) {
+        return { ok: false, error: { code: 'UNAVAILABLE', message: 'Camera produced no decodable frame' } }
+      }
 
       const canvas = document.createElement('canvas')
       canvas.width = video.videoWidth
       canvas.height = video.videoHeight
       const ctx = canvas.getContext('2d')
       if (!ctx) {
-        stream.getTracks().forEach((t) => t.stop())
         return { ok: false, error: { code: 'UNAVAILABLE', message: 'Canvas 2D context unavailable' } }
       }
       ctx.drawImage(video, 0, 0)
 
-      // Stop the camera stream immediately
-      stream.getTracks().forEach((t) => t.stop())
-
       const quality = options?.quality ?? 0.85
-      const mimeType = options?.mediaType === 'photo' || !options?.mediaType ? 'image/jpeg' : 'image/jpeg'
-      const dataUrl = canvas.toDataURL(mimeType, quality)
+      const dataUrl = canvas.toDataURL('image/jpeg', quality)
 
       return {
         ok: true,
@@ -81,6 +93,13 @@ const WEB_CAMERA: CameraModule = {
         : error.name === 'NotFoundError' ? 'UNAVAILABLE'
         : 'UNAVAILABLE'
       return { ok: false, error: { code, message: error.message } }
+    } finally {
+      if (stream) {
+        for (const track of stream.getTracks()) track.stop()
+      }
+      if (video) {
+        video.srcObject = null
+      }
     }
   },
 
@@ -160,6 +179,39 @@ function getImageDimensions(uri: string): Promise<{ width: number; height: numbe
     img.onerror = reject
     img.src = uri
   })
+}
+
+/** Wait until the video element reports a decodable frame with dimensions. */
+function waitForUsableFrame(video: HTMLVideoElement): Promise<void> {
+  return new Promise((resolve) => {
+    if (video.readyState >= 2 && video.videoWidth > 0) {
+      resolve()
+      return
+    }
+    const done = () => {
+      video.removeEventListener('loadeddata', done)
+      video.removeEventListener('canplay', done)
+      resolve()
+    }
+    video.addEventListener('loadeddata', done, { once: true })
+    video.addEventListener('canplay', done, { once: true })
+    // Bounded wait: a stream that never produces a frame resolves anyway
+    // and the caller's dimension check reports the failure honestly.
+    setTimeout(done, 2000)
+  })
+}
+
+/**
+ * Release gallery object URLs. `pickFromGallery` hands the caller blob:
+ * URLs whose lifecycle the CALLER owns (NF-NR-10): revoke them with this
+ * helper when the results are no longer needed.
+ */
+export function revokeGalleryUris(results: Array<{ uri: string }>): void {
+  for (const result of results) {
+    if (result.uri.startsWith('blob:')) {
+      try { URL.revokeObjectURL(result.uri) } catch { /* already gone */ }
+    }
+  }
 }
 
 // ─── Register web implementation ─────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'preact/hooks'
 import {
   stagedEdits, stagedCount, removeStagedEdit, discardLastStaged, clearStaged,
-  commitStaged, previewStaged, revertLastCommit,
+  commitStaged, previewStaged, revertLastCommit, pendingCommits, checkCommitOutcome,
   commitPhase, commitError, lastCommit, lastPreview,
   activeConnection, toast, bindingActive, limitsFor,
 } from '../lib/store'
@@ -52,7 +52,9 @@ export function CommitBar() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (!count || e.defaultPrevented) return
+      const pending = pendingCommits.value.filter(p => p.state === 'uncertain')
+      const recovery = pending.find(p => p.connectionId === activeConnection.value?.id) ?? (pending.length === 1 ? pending[0] : undefined)
+      if ((!count && !recovery) || e.defaultPrevented || e.repeat) return
       const target = e.target instanceof Element ? e.target : null
       // Modal controls own their shortcuts; a dialog must not commit or
       // discard the staged workspace behind it. Text editing owns native
@@ -61,7 +63,8 @@ export function CommitBar() {
       if ((e.metaKey || e.ctrlKey) && e.key === 'z' && target?.closest('input, textarea, [contenteditable]')) return
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault()
-        void commit()
+        if (recovery) { if (!recovery.checking) void recover(recovery.connectionId, recovery.operationId) }
+        else void commit()
       }
       if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
         e.preventDefault()
@@ -70,7 +73,7 @@ export function CommitBar() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [count])
+  }, [count, pendingCommits.value])
 
   // Error focus: the failed commit pinned the first offending staged edit
   // (the grid focuses its row); this bar also takes focus itself so the
@@ -81,7 +84,7 @@ export function CommitBar() {
     }
   }, [commitPhase.value, commitError.value])
 
-  if (count === 0 && !lastCommit.value && commitPhase.value !== 'failed') return null
+  if (count === 0 && pendingCommits.value.length === 0 && !lastCommit.value && commitPhase.value !== 'failed') return null
 
   async function commit() {
     const conn = activeConnection.value
@@ -103,6 +106,13 @@ export function CommitBar() {
     }
   }
 
+  async function recover(connectionId: string, operationId: string) {
+    try {
+      const res = await checkCommitOutcome(connectionId, operationId)
+      toast('success', `Recorded operation ${operationId} on ${connectionId} committed (${res.rowsAffected} changes)`)
+    } catch (err) { toast('error', err instanceof Error ? err.message : String(err)) }
+  }
+
   async function preview() {
     const conn = activeConnection.value
     if (!conn) return
@@ -120,10 +130,10 @@ export function CommitBar() {
   }
 
   async function revert() {
-    const conn = activeConnection.value
-    if (!conn) return
+    const last = lastCommit.value
+    if (!last) return
     try {
-      const res = await revertLastCommit(conn.id)
+      const res = await revertLastCommit(last.connectionId)
       toast('success', `Reverted ${res.reverted}`)
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -163,6 +173,16 @@ export function CommitBar() {
         )}
       </div>
       <div class={s.actions}>
+        {pendingCommits.value.map(p => (
+          <span key={p.operationId} class={s.change}>
+            @{p.connectionId} · {p.operationId} · {p.state === 'pending' ? 'Commit pending' : 'Outcome uncertain'}
+            {p.state === 'uncertain' && <button class={s.commit}
+              aria-label={`Check outcome ${p.operationId} on ${p.connectionId}`}
+              disabled={p.checking} onClick={() => recover(p.connectionId, p.operationId)}>
+              {p.checking ? 'Checking outcome...' : 'Check outcome'}
+            </button>}
+          </span>
+        ))}
         {previewReport && count > 0 && (
           <details class={s.previewDetails}>
             <summary class={s.change} title="Last dry-run preview (nothing was applied)">
@@ -177,7 +197,7 @@ export function CommitBar() {
         )}
         {commitPhase.value === 'failed' && commitError.value && (
           <div class={s.commitError} role="alert" tabIndex={-1} ref={errorRef}>
-            {commitError.value.includes('outcome unknown') ? 'Commit outcome unknown' : 'Commit failed'}: {commitError.value} — {commitError.value.includes('outcome unknown') ? 'Your draft is preserved. Check the table state before attempting another commit.' : 'Your draft stays staged; fix or discard the pinned row.'}
+            {commitError.value.includes('outcome unknown') ? 'Commit outcome unknown' : 'Commit failed'}: {commitError.value} — {commitError.value.includes('outcome unknown') ? 'The operation is retained independently of local drafts. Check outcome to query this operation again; it will never resend the batch.' : 'Your draft stays staged; fix or discard the pinned row.'}
           </div>
         )}
         {last && (
@@ -203,7 +223,7 @@ export function CommitBar() {
             <button class={s.revert} onClick={preview} disabled={busy} title="Dry-run this batch in a rolled-back transaction">
               Preview
             </button>
-            <button class={s.commit} onClick={commit} disabled={busy} title={commitWording().title}>
+            <button class={s.commit} onClick={commit} disabled={busy || pendingCommits.value.some(p => p.connectionId === conn?.id)} title={commitWording().title}>
               Commit {count} change{count === 1 ? '' : 's'}
             </button>
           </>

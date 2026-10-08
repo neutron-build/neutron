@@ -92,3 +92,38 @@ export function bindPathParams(
 export function parseUrlPath(path: string): string[] {
   return path.split("/").filter(Boolean);
 }
+
+/** Static segments beat parameters, which beat catch-alls; longer suffixes win. */
+export function comparePathSpecificity(a: string, b: string): number {
+  const left = parsePath(a), right = parsePath(b);
+  const rank = { static: 3, param: 2, wildcard: 1 };
+  for (let index = 0; index < Math.max(left.length, right.length); index++) {
+    const x = left[index], y = right[index];
+    if (!x || !y) return right.length - left.length;
+    const difference = rank[y.type] - rank[x.type];
+    if (difference) return difference;
+    if (x.type !== 'static' && y.type !== 'static' && x.suffix.length !== y.suffix.length) return y.suffix.length - x.suffix.length;
+  }
+  return 0;
+}
+
+export function normalizePathname(pathname: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname || "/");
+  } catch {
+    return null;
+  }
+
+  // Traversal is a whole segment equal to "..", not a substring: `/a..b`
+  // and `/v1.2..3` are legal paths, `/a/../b` is not.
+  if (!decoded.startsWith("/") || decoded.includes("\\") || decoded.includes("\0") || decoded.split("/").includes("..")) {
+    return null;
+  }
+
+  if (decoded.length > 1 && decoded.endsWith("/")) {
+    return decoded.slice(0, -1);
+  }
+
+  return decoded;
+}

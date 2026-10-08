@@ -117,6 +117,8 @@ export interface PrepareContentCollectionsOptions {
   writeManifest?: boolean;
   writeTypes?: boolean;
   manifestPath?: string;
+  /** Explicitly snapshot live data during a static build (default: reject). */
+  snapshotLive?: boolean;
 }
 
 type CollectionConfigMap = Record<string, CollectionDefinition<unknown>>;
@@ -139,6 +141,7 @@ interface SerializedCollectionEntry {
 }
 
 interface CacheRecord {
+  expiresAt?: number;
   fingerprint: string;
   store: CollectionStore;
 }
@@ -153,6 +156,10 @@ const CONTENT_CONFIG_CANDIDATES = [
 const CONTENT_MANIFEST_DIST_NAME = ".neutron-content.json";
 const COLLECTION_FILE_EXTENSIONS = new Set([".md", ".mdx", ".html", ".htm", ".json", ".yaml", ".yml"]);
 const cacheByRoot = new Map<string, CacheRecord>();
+interface RootLoadState { generation: number; refresh: number; latestRefresh: number; pending: number }
+const rootLoads = new Map<string, RootLoadState>();
+const MAX_LIVE_CACHE_TTL_MS = 2_147_483_647;
+
 
 // In-memory, content-addressed render cache. Body rendering (KaTeX/Shiki/MDX)
 // is the expensive part of serving a markdown/MDX entry; caching it lets a
@@ -244,9 +251,48 @@ function setCachedMarkup(key: string, value: RenderedMarkup): void {
   renderCache.set(key, value);
 }
 
+/** Live collections are data rows with unique schema-validated string IDs. */
+function validateLiveCollection(options: Partial<DefineCollectionOptions<unknown>>): void {
+  if (options.live !== undefined && typeof options.live !== "boolean") throw new TypeError("live must be boolean");
+  if (options.live) {
+    if (options.type !== "data" || typeof options.loader !== "function") throw new TypeError("Live collections require type:data and a loader function");
+    if (options.cacheTtl !== undefined && (!Number.isFinite(options.cacheTtl) || options.cacheTtl < 0 || options.cacheTtl > MAX_LIVE_CACHE_TTL_MS)) throw new TypeError("cacheTtl must be a finite nonnegative number");
+  } else if (options.loader !== undefined || options.cacheTtl !== undefined) {
+    throw new TypeError("loader and cacheTtl require live:true");
+  }
+}
+
+/**
+ * Canonical cache key for a content root. `process.cwd()` is always
+ * fully-resolved by the OS (on macOS `/var` reports as `/private/var`),
+ * while callers naturally pass the path they were handed (`mkdtemp`,
+ * config values). realpathSync unifies both spellings so an invalidation
+ * keyed by one spelling reaches a load keyed by the other.
+ */
+function canonicalContentRoot(rootDir: string): string {
+  try {
+    return fs.realpathSync(path.resolve(rootDir));
+  } catch {
+    return path.resolve(rootDir);
+  }
+}
+
+/** Refresh all collections for this root on the next read; no persisted snapshot is changed. */
+export function invalidateContentCollections(rootDir = process.cwd()): void {
+  const root = canonicalContentRoot(rootDir);
+  const state = rootLoads.get(root);
+  if (state) {
+    state.generation++;
+    state.refresh++;
+    if (!state.pending) rootLoads.delete(root);
+  }
+  cacheByRoot.delete(root);
+}
+
 export function defineCollection<TData>(
   options: DefineCollectionOptions<TData>
 ): CollectionDefinition<TData> {
+  validateLiveCollection(options);
   return {
     type: options.type ?? "content",
     schema: options.schema,
@@ -333,6 +379,8 @@ export async function prepareContentCollections(
 
   const store = await loadCollectionStore(rootDir, {
     force: true,
+    snapshotLive: options.snapshotLive === true,
+    preparing: true,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     markdownConfig: (options as any).markdownConfig ?? activeMarkdownConfig,
   });
@@ -372,6 +420,11 @@ export function setActiveMarkdownConfig(config: NeutronMarkdownConfig | undefine
   // reference and correctly invalidate.
   if (activeMarkdownConfig === config) return;
   activeMarkdownConfig = config;
+  for (const [root, state] of rootLoads) {
+    state.generation++;
+    state.refresh++;
+    if (!state.pending) rootLoads.delete(root);
+  }
   cacheByRoot.clear();
   // A config change can alter rendered output (themes, plugins, extensions), so
   // the content-addressed render cache — whose key intentionally omits the
@@ -386,56 +439,51 @@ export function getActiveMarkdownConfig(): NeutronMarkdownConfig | undefined {
 
 async function loadCollectionStore(
   rootDir: string,
-  options: { force?: boolean; markdownConfig?: NeutronMarkdownConfig } = {}
+  options: { force?: boolean; markdownConfig?: NeutronMarkdownConfig; preparing?: boolean; snapshotLive?: boolean } = {}
 ): Promise<CollectionStore> {
-  const fingerprint = await computeContentFingerprint(rootDir);
-  const cached = cacheByRoot.get(rootDir);
-  if (!options.force && cached && cached.fingerprint === fingerprint) {
-    return cached.store;
-  }
-  const effectiveConfig = options.markdownConfig ?? activeMarkdownConfig;
-
-  const config = await loadContentConfig(rootDir);
-  if (!config) {
-    const manifestStore = await loadManifestStore(rootDir);
-    if (manifestStore) {
-      cacheByRoot.set(rootDir, { fingerprint, store: manifestStore });
-      return manifestStore;
-    }
-    const emptyStore: CollectionStore = {
-      collections: {},
-      generatedTypes: [
-        "// Auto-generated by Neutron. Do not edit.",
-        'declare module "@neutron-build/core/content" {',
-        "  interface ContentCollectionMap {}",
-        "}",
-        "",
-        "export {};",
-        "",
-      ].join("\n"),
-    };
-    cacheByRoot.set(rootDir, { fingerprint, store: emptyStore });
-    return emptyStore;
-  }
-
-  const collections: Record<string, Array<CollectionEntry<unknown>>> = {};
-  for (const [collectionName, definition] of Object.entries(config)) {
-    collections[collectionName] = await readCollectionEntries(
-      rootDir,
-      collectionName,
-      definition,
-      effectiveConfig
-    );
-  }
-
-  const generatedTypes = generateCollectionTypes(config);
-  const store: CollectionStore = {
-    collections,
-    generatedTypes,
+  rootDir = canonicalContentRoot(rootDir);
+  // Capture ownership BEFORE any async config/fingerprint/loader work.
+  let state = rootLoads.get(rootDir);
+  if (!state) { state = { generation: 0, refresh: 0, latestRefresh: 0, pending: 0 }; rootLoads.set(rootDir, state); }
+  state.pending++;
+  const generation = state.generation;
+  const refresh = ++state.refresh;
+  const startedAt = Date.now();
+  const publish = (record: CacheRecord) => {
+    if (!options.preparing && state.generation === generation && state.latestRefresh === refresh && (record.expiresAt === undefined || record.expiresAt > Date.now())) cacheByRoot.set(rootDir, record);
   };
-
-  cacheByRoot.set(rootDir, { fingerprint, store });
-  return store;
+  try {
+    const fingerprint = await computeContentFingerprint(rootDir);
+    const cached = cacheByRoot.get(rootDir);
+    if (!options.force && state.generation === generation && cached && cached.fingerprint === fingerprint && (cached.expiresAt === undefined || Date.now() < cached.expiresAt)) return cached.store;
+    state.latestRefresh = Math.max(state.latestRefresh, refresh);
+    const effectiveConfig = options.markdownConfig ?? activeMarkdownConfig;
+    const config = await loadContentConfig(rootDir);
+    if (!config) {
+      const store = await loadManifestStore(rootDir) ?? {
+        collections: {},
+        generatedTypes: ['// Auto-generated by Neutron. Do not edit.', 'declare module "@neutron-build/core/content" {', '  interface ContentCollectionMap {}', '}', '', 'export {};', ''].join("\n"),
+      };
+      publish({ fingerprint, store });
+      return store;
+    }
+    const collections: Record<string, Array<CollectionEntry<unknown>>> = {};
+    for (const [collectionName, definition] of Object.entries(config)) {
+      validateLiveCollection(definition);
+      if (definition.live && options.preparing && !options.snapshotLive) throw new Error(`Live collection "${collectionName}" requires snapshotLive:true for build preparation`);
+      collections[collectionName] = await readCollectionEntries(rootDir, collectionName, definition, effectiveConfig);
+    }
+    const store: CollectionStore = { collections, generatedTypes: generateCollectionTypes(config) };
+    const liveTtls = Object.values(config).filter(definition => definition.live).map(definition => definition.cacheTtl ?? 60_000);
+    // Freshness starts at load start, not completion: a slow/stale refresh
+    // cannot acquire a fresh full TTL just by finishing late. Superseded
+    // callers may receive their own snapshot, but it never becomes shared.
+    publish({ fingerprint, store, expiresAt: liveTtls.length ? startedAt + Math.min(...liveTtls) : undefined });
+    return store;
+  } finally {
+    state.pending--;
+    if (!state.pending && !cacheByRoot.has(rootDir) && rootLoads.get(rootDir) === state) rootLoads.delete(rootDir);
+  }
 }
 
 async function loadContentConfig(rootDir: string): Promise<CollectionConfigMap | null> {
@@ -599,6 +647,20 @@ async function readCollectionEntries(
   definition: CollectionDefinition<unknown>,
   markdownConfig?: NeutronMarkdownConfig
 ): Promise<Array<CollectionEntry<unknown>>> {
+  validateLiveCollection(definition);
+  if (definition.live) {
+    const rows = await definition.loader!();
+    if (!Array.isArray(rows)) throw new TypeError(`Live collection "${collectionName}" loader must return an array`);
+    const ids = new Set<string>();
+    return rows.map((row, index) => {
+      const data = definition.schema.parse(row);
+      const id = data && typeof data === "object" ? (data as { id?: unknown }).id : undefined;
+      if (typeof id !== "string" || !id || ids.has(id)) throw new TypeError(`Live collection "${collectionName}" row ${index} requires a unique nonempty schema-validated string id`);
+      ids.add(id);
+      return createEntry({ id: `${collectionName}/${id}`, slug: id, collection: collectionName,
+        filePath: "", body: "", html: "", data, sourceType: "data", sanitize: definition.sanitize });
+    });
+  }
   const collectionDir = path.join(rootDir, "src", "content", collectionName);
   if (!fs.existsSync(collectionDir)) {
     return [];
@@ -610,6 +672,7 @@ async function readCollectionEntries(
   for (const relativeFilePath of files) {
     const ext = path.extname(relativeFilePath).toLowerCase();
     const filePath = path.join(collectionDir, relativeFilePath);
+    if (definition.sanitize && ext === ".mdx") throw new Error("Untrusted MDX is not supported: sanitize:true requires Markdown or data, because MDX executes JavaScript.");
     const raw = await fsp.readFile(filePath, "utf-8");
     const slug = relativeFilePath
       .slice(0, -ext.length)
@@ -808,7 +871,7 @@ function createEntry(input: {
   const lazyRender = input.lazyMarkup
     ? async () => {
         const rendered = await input.lazyMarkup!();
-        if (rendered.renderFactory) {
+        if (rendered.renderFactory && !input.sanitize) {
           return rendered.renderFactory();
         }
         const html = input.sanitize ? await sanitizeHtml(rendered.html) : rendered.html;
@@ -831,7 +894,7 @@ function createEntry(input: {
     });
   }
   Object.defineProperty(entry, 'render', {
-    value: renderFactory || lazyRender || fallbackRender,
+    value: (!input.sanitize && renderFactory) || lazyRender || fallbackRender,
     writable: false,
     enumerable: false,
     configurable: false,

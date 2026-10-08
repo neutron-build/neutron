@@ -1,10 +1,10 @@
 // Resharding invariant tests.
 module resharding_test {
-    import resharding.*
+    import resharding.* from "../specs/nucleus/resharding"
 
     // Test: initial state has all keys covered
     run init_coverage_test = {
-        init.then(all { no_data_loss, no_double_ownership, key_conservation })
+        init.expect(all { no_data_loss, no_double_ownership, key_conservation })
     }
 
     // Test: begin reshard maintains invariants
@@ -12,7 +12,7 @@ module resharding_test {
         init
             .then(begin_reshard(1, 2))
             .then(start_copying)
-            .then(all { no_data_loss, no_double_ownership, key_conservation })
+            .expect(all { no_data_loss, no_double_ownership, key_conservation })
     }
 
     // Test: copy key maintains no-data-loss and no-double-ownership
@@ -21,7 +21,7 @@ module resharding_test {
             .then(begin_reshard(1, 2))
             .then(start_copying)
             .then(copy_key(1))
-            .then(all { no_data_loss, no_double_ownership })
+            .expect(all { no_data_loss, no_double_ownership })
     }
 
     // Test: full reshard cycle preserves all invariants
@@ -32,7 +32,7 @@ module resharding_test {
             .then(copy_key(1))
             .then(copy_key(2))
             .then(finish_reshard)
-            .then(all { no_data_loss, no_double_ownership, key_conservation })
+            .expect(all { no_data_loss, no_double_ownership, key_conservation })
     }
 
     // Test: multiple keys copied preserve conservation
@@ -45,7 +45,7 @@ module resharding_test {
             .then(copy_key(3))
             .then(copy_key(4))
             .then(copy_key(5))
-            .then(all { no_data_loss, no_double_ownership, key_conservation })
+            .expect(all { no_data_loss, no_double_ownership, key_conservation })
     }
 
     // Test: resharding between different shard pairs
@@ -56,7 +56,7 @@ module resharding_test {
             .then(copy_key(51))
             .then(copy_key(52))
             .then(finish_reshard)
-            .then(all { no_data_loss, no_double_ownership, key_conservation })
+            .expect(all { no_data_loss, no_double_ownership, key_conservation })
     }
 
     // Test: sequential resharding operations
@@ -71,6 +71,6 @@ module resharding_test {
             .then(start_copying)
             .then(copy_key(1))
             .then(finish_reshard)
-            .then(all { no_data_loss, key_conservation })
+            .expect(all { no_data_loss, key_conservation })
     }
 }

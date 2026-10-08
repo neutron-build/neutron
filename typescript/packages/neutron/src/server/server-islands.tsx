@@ -1,3 +1,4 @@
+import { escapeJsonForInlineScript } from "../core/serialization.js";
 /**
  * Server Islands - Progressive Server-Side Rendering
  * Inspired by Astro 6's server:defer pattern
@@ -66,8 +67,8 @@ export function ServerIsland({ children, fallback, id }: ServerIslandProps) {
   // Server-side: render fallback + fetch script
   const islandId = generateIslandId(id);
   const islandToken = generateIslandToken();
-  const islandIdJson = JSON.stringify(islandId);
-  const islandEndpointJson = JSON.stringify(
+  const islandIdJson = escapeJsonForInlineScript(islandId);
+  const islandEndpointJson = escapeJsonForInlineScript(
     `/__neutron_island/${encodeURIComponent(islandId)}?t=${islandToken}`
   );
 

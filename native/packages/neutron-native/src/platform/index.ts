@@ -2,25 +2,35 @@
  * Platform — runtime detection utilities.
  *
  * Mirrors React Native's Platform API but adds Neutron-specific helpers.
+ * Detection never invents a platform: when the environment cannot be
+ * identified, OS is 'unknown' and isNative is false (NF-NR-15).
  */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const g = globalThis as any
 
-export type OS = 'ios' | 'android' | 'web' | 'macos' | 'windows'
+export type OS = 'ios' | 'android' | 'web' | 'macos' | 'windows' | 'unknown'
 
 function _detect(): OS {
-  // React Native environment
+  // React Native injects Platform with every supported host OS
+  // (ios, android, macos, windows, web) — trust it first.
   if (g.Platform?.OS) return g.Platform.OS as OS
-  // Hermes V1 injects __hermes__
-  if (g.__hermes__) {
-    const userAgent = g.navigator?.userAgent ?? ''
-    if (userAgent.includes('iPhone') || userAgent.includes('iPad')) return 'ios'
-    return 'android'
-  }
+
   // Browser / web
   if (typeof document !== 'undefined' && typeof window !== 'undefined') return 'web'
-  return 'android' // safe fallback
+
+  // Hermes engine without the RN Platform global: the documented runtime
+  // marker is global.HermesInternal. The ENGINE does not identify the HOST
+  // OS — an Android guess here was invented (NF-NR-15). A user agent, when
+  // one exists at all, is the only honest signal left.
+  if (g.HermesInternal) {
+    const userAgent: string = g.navigator?.userAgent ?? ''
+    if (/iPhone|iPad|iPod/.test(userAgent)) return 'ios'
+    if (/Android/.test(userAgent)) return 'android'
+    return 'unknown'
+  }
+
+  return 'unknown'
 }
 
 export const Platform = {
@@ -28,7 +38,7 @@ export const Platform = {
   get isIOS(): boolean { return this.OS === 'ios' },
   get isAndroid(): boolean { return this.OS === 'android' },
   get isWeb(): boolean { return this.OS === 'web' },
-  get isNative(): boolean { return this.OS === 'ios' || this.OS === 'android' },
+  get isNative(): boolean { return this.OS === 'ios' || this.OS === 'android' || this.OS === 'macos' || this.OS === 'windows' },
 
   /**
    * Select a value based on platform.

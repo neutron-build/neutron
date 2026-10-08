@@ -36,35 +36,38 @@ describe('Platform', () => {
     expect(Platform.isNative).toBe(true)
   })
 
-  it('detects ios from __hermes__ + iPhone user agent', () => {
-    g.__hermes__ = true
+  it('detects ios from HermesInternal + iPhone user agent (NF-NR-15)', () => {
+    g.HermesInternal = { isHermes: true }
     g.navigator = { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0)' }
     const { Platform } = require('../index')
     expect(Platform.OS).toBe('ios')
     delete g.navigator
+    delete g.HermesInternal
   })
 
-  it('detects ios from __hermes__ + iPad user agent', () => {
-    g.__hermes__ = true
+  it('detects ios from the documented HermesInternal marker + iPad user agent (NF-NR-15)', () => {
+    g.HermesInternal = { isHermes: true }
     g.navigator = { userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_0)' }
     const { Platform } = require('../index')
     expect(Platform.OS).toBe('ios')
     delete g.navigator
+    delete g.HermesInternal
   })
 
-  it('defaults to android from __hermes__ without matching user agent', () => {
-    g.__hermes__ = true
+  it('Hermes without an identifying user agent is unknown — never an invented android', () => {
+    g.HermesInternal = { isHermes: true }
     g.navigator = { userAgent: 'SomeOtherAgent' }
     const { Platform } = require('../index')
-    expect(Platform.OS).toBe('android')
+    expect(Platform.OS).toBe('unknown')
+    expect(Platform.isNative).toBe(false)
     delete g.navigator
+    delete g.HermesInternal
   })
 
-  it('falls back to android when nothing else matches', () => {
-    // No Platform, no __hermes__, no document/window
+  it('an unidentifiable environment is unknown, not android', () => {
+    // No Platform, no HermesInternal, no document/window
     const { Platform } = require('../index')
-    // In test environment, document and window may be undefined -> android fallback
-    expect(['android', 'web']).toContain(Platform.OS)
+    expect(['unknown', 'web']).toContain(Platform.OS)
   })
 
   it('select() returns value for current platform', () => {
