@@ -1409,7 +1409,10 @@ impl State {
     }
 
     /// Is the edge (x -> t, kind) a current conflict (I-LIVE)?
-    fn edge_current(&self, _x: u8, t: u8, kind: EdgeKind) -> bool {
+    fn edge_current(&self, x: u8, t: u8, kind: EdgeKind) -> bool {
+        if matches!(self.txns[x as usize].phase, Phase::Done { .. }) {
+            return false;
+        }
         let st = match self.status.get(&t) {
             None => return false,
             Some(e) => e.st,
@@ -2514,6 +2517,8 @@ impl Model for WriteModel {
                 {
                     let cc = matches!(s.txns[*w as usize].phase, Phase::Parked { cc: true });
                     s.txns[*w as usize].phase = if cc { Phase::CommitCheck } else { Phase::Op };
+                    // §6: a woken waiter removes any remaining edges.
+                    s.edges.retain(|(x, _, _)| x != w);
                 }
             }
             Action::SelfAbort(w) => {
@@ -2764,6 +2769,7 @@ impl Model for WriteModel {
             && s.shared.is_empty()
             && s.rels.is_empty()
             && s.pending_wake.is_none()
+            && KEYS.iter().all(|k| s.slot(*k).intent.is_none())
             && (0..s.ntxns()).all(|w| matches!(s.txns[w].phase, Phase::Done { .. }))
     }
 }
