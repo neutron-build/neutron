@@ -664,8 +664,9 @@ impl MemKv {
     /// registered GC filter exactly once. Flat mode: one stream over the map.
     /// LSM mode: flush, compact all of L0 into L1, then re-stream the L1
     /// files that compaction did not consume. Returns the number dropped; 0
-    /// without a filter. Snapshots taken earlier keep seeing dropped keys.
-    /// The filter must not call back into this store.
+    /// without a filter. Flat mode: snapshots taken earlier keep seeing
+    /// dropped keys. LSM mode: a drop is visible to already-open snapshots
+    /// (G0-R5-1). The filter must not call back into this store.
     pub fn compact_all(&self) -> usize {
         let gc = self.gc.read().unwrap_or_else(PoisonError::into_inner);
         let filter = gc.as_deref();
@@ -1937,6 +1938,16 @@ mod tests {
                         dfs(&next, written, sc, filter, visited, stats);
                     }
                 }
+            }
+            // Bottommost re-compaction: one L1 file alone through a fresh
+            // stream (it may hold an older version whose shadowing newer
+            // version sits in another file). Not an `acted` step: it is
+            // always available, so terminals are the states without the
+            // steps above.
+            for id in lsm.levels[1].iter().map(|f| f.id) {
+                let mut next = lsm.clone();
+                next.restream(Some(filter), id);
+                dfs(&next, written, sc, filter, visited, stats);
             }
             if !acted {
                 // Terminal: every version written, memtable and L0 empty.

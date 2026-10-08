@@ -94,7 +94,7 @@ pub trait Snapshot: Send + Sync {
 pub trait GcFilter: Send + Sync {
     /// Called at the start of each compaction stream; returns per-stream
     /// state. Filter state must never cross streams or subcompactions
-    /// (C-T0 §11, seed 33).
+    /// (C-T0 §9.2; §11 seed 33).
     fn begin(&self) -> Box<dyn GcStream>;
 }
 

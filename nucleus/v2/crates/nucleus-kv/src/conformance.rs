@@ -1169,6 +1169,14 @@ pub fn gc_watermark_monotonic<H: Harness>(h: &H) {
         }) => {}
         other => panic!("regression not refused: {other:?}"),
     }
+    // The refusal left W at 20: a value between 5 and 20 is still refused.
+    match kv.set_gc_watermark(19) {
+        Err(KvError::WatermarkRegressed {
+            current: 20,
+            requested: 19,
+        }) => {}
+        other => panic!("refused regression changed W: {other:?}"),
+    }
     ok(kv.set_gc_watermark(20), "equal after refusal");
     ok(kv.set_gc_watermark(21), "increase after refusal");
 }
