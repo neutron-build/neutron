@@ -751,6 +751,20 @@ fn hash_follows_sql_equality() {
     };
     assert!(ht("a", "a"));
     assert!(!ht("a", "ab"));
+
+    // Pinned FNV-1a-64 values, computed outside the codec: offset
+    // 0xcbf29ce484222325, prime 0x100000001b3, over enc_asc(v).
+    let pinned = [
+        (KeyType::Bool, Value::Bool(true), 0xaf63_bc4c_8601_b62c_u64), // [01]
+        (
+            KeyType::Text(Collation::C),
+            Value::Text("a".into()),
+            0xe5d2_f819_0427_081f, // [61 00 01]
+        ),
+    ];
+    for (ty, v, want) in pinned {
+        assert_eq!(want, hash_value(&ty, &v).unwrap_or_else(|e| panic!("{e}")));
+    }
 }
 
 // ---- P-PREFIX ----
@@ -860,7 +874,8 @@ fn desc_inverts_value_bytes_only() {
         all_asc[6..10].iter().map(|b| !b).collect::<Vec<u8>>()
     ); // col 2 value bytes inverted
     assert_eq!(mixed[10..].to_vec(), all_asc[10..].to_vec()); // col 3
-                                                              // direction affects only non-NULL columns; NULL uses the placement marker
+
+    // direction affects only non-NULL columns; NULL uses the placement marker
     let mut nf = Vec::new();
     encode_key(
         &[KeyColumn::desc(KeyType::Int4).with_nulls(Nulls::Last)],
