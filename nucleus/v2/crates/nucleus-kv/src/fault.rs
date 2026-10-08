@@ -78,7 +78,7 @@ impl<K: OrderedKv> Fault<K> {
             fresh.set_gc_filter(Box::new(SharedFilter(Arc::clone(f))));
         }
         if let Some(w) = st.watermark {
-            fresh.set_gc_watermark(w);
+            fresh.set_gc_watermark(w)?;
         }
         for entry in &st.durable {
             match entry {
@@ -156,10 +156,11 @@ impl<K: OrderedKv> OrderedKv for Fault<K> {
         st.gc = Some(shared);
     }
 
-    fn set_gc_watermark(&self, watermark: u64) {
+    fn set_gc_watermark(&self, watermark: u64) -> Result<()> {
         let mut st = self.lock();
-        st.live.set_gc_watermark(watermark);
+        st.live.set_gc_watermark(watermark)?;
         st.watermark = Some(watermark);
+        Ok(())
     }
 }
 

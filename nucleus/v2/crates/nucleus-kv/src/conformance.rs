@@ -12,14 +12,16 @@
 //!   depend on either: the filter only drops a version older than a kept
 //!   version `<= W`, and every open reader has `S >= W`, so §4 stops at the
 //!   kept version first.
-//! - **Tombstones.** The kv honours the filter blindly. Never dropping a
-//!   tombstone is the filter's obligation (`GcStream::drop_key`), and
-//!   `TombstoneGuard` makes a filter that breaks it detectable. C-T0 fixes the
-//!   key layout (`{logical}@{ts}`, the intent slot sorting first; byte
-//!   encoding by C-K1) but leaves the value bytes of a version, and so the
-//!   tombstone encoding, open (§2 only defines the intent value). The guard
-//!   therefore takes the predicate as a parameter, and this suite uses a
-//!   stand-in: first value byte `0` = tombstone.
+//! - **The §9.2 drop rule (draft 4).** The kv honours the filter blindly.
+//!   Within one compaction stream (keys in ascending order) a filter may drop
+//!   any version for which it has already seen a newer version `<= W` of the
+//!   same logical key in the same stream, and must never drop the newest
+//!   version `<= W` it has seen for a key. `layout` implements the §2.2 key
+//!   and version-value encoding, `SpecGcFilter` is the reference filter over
+//!   it, and `SpecGcGuard` makes a rule-violating filter detectable. Versions
+//!   of one logical key can span SST files (a stream may not see them all);
+//!   MemKv's LSM mode reproduces the tombstone resurrection a violating
+//!   filter causes (`gc_tombstone_resurrection_lsm`, C-K3b).
 //! - **Crash.** WAL-prefix semantics are checked through `fault::Fault` over
 //!   the backend, so they hold for the wrapper's model of the backend. A
 //!   backend's own on-disk crash behaviour is C-G1's power-cut harness.
@@ -32,7 +34,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::fault::Fault;
-use crate::{Batch, Durability, GcFilter, GcStream, Key, Op, OrderedKv, Result, Snapshot, Value};
+use crate::{
+    Batch, Durability, GcFilter, GcStream, Key, KvError, Op, OrderedKv, Result, Snapshot, Value,
+};
+
+pub mod layout;
 
 /// How the suite drives one backend.
 pub trait Harness: Clone + Send + Sync + 'static {
@@ -118,7 +124,8 @@ macro_rules! kv_conformance_tests {
             gc_streams_ascending_cover_every_key,
             gc_drops_and_keeps,
             gc_snapshot_before_compact,
-            gc_tombstone_drop_detectable,
+            gc_spec_violation_detectable,
+            gc_watermark_monotonic,
             gc_without_filter_keeps_all,
         );
     };
@@ -881,24 +888,66 @@ pub fn gc_snapshot_before_compact<H: Harness>(h: &H) {
     }
 }
 
-/// Wraps a filter and records every dropped value `is_tombstone` classifies
-/// as a tombstone (a C-T0 §9 violation). Passes decisions through unchanged.
-pub struct TombstoneGuard {
+/// Reference implementation of the C-T0 §9.2 (draft 4) drop rule over the
+/// §2.2 layout: within one stream it may drop a version when it has already
+/// seen a newer version `<= W` of the same logical key in this stream, and it
+/// never drops the newest version `<= W` it has seen for a key. Versions
+/// `> W`, intents and keys outside the layout are always kept.
+pub struct SpecGcFilter {
+    /// The GC watermark `W` (C-T0 §9.1).
+    pub w: u64,
+}
+
+impl GcFilter for SpecGcFilter {
+    fn begin(&self) -> Box<dyn GcStream> {
+        Box::new(SpecGcStream {
+            w: self.w,
+            seen: std::collections::HashSet::new(),
+        })
+    }
+}
+
+struct SpecGcStream {
+    w: u64,
+    seen: std::collections::HashSet<Key>,
+}
+
+impl GcStream for SpecGcStream {
+    fn drop_key(&mut self, key: &[u8], _value: &[u8]) -> bool {
+        match layout::parse(key) {
+            // Versions arrive newest first, so the first version `<= W` of a
+            // logical key seen in this stream is the newest one: keep it and
+            // remember it; every later (older) version of the same key is
+            // shadowed by it and may be dropped.
+            Some((l, layout::Entry::Version(ts))) if ts <= self.w => {
+                if self.seen.insert(l) {
+                    return false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Wraps a filter and records every drop C-T0 §9.2 does not allow: a version
+/// that is not shadowed by an already-seen newer version `<= W` of the same
+/// logical key in the same stream (the newest version `<= W`, a version
+/// `> W`, an intent, or a key outside the layout). Decisions pass through
+/// unchanged, so the kv still honours a violating filter blindly.
+pub struct SpecGcGuard {
+    w: u64,
     inner: Box<dyn GcFilter>,
-    is_tombstone: fn(&[u8]) -> bool,
     violations: Arc<Mutex<Vec<Key>>>,
 }
 
-impl TombstoneGuard {
-    /// Returns the guard and a handle on the keys of dropped tombstones.
-    pub fn new(
-        inner: Box<dyn GcFilter>,
-        is_tombstone: fn(&[u8]) -> bool,
-    ) -> (Self, Arc<Mutex<Vec<Key>>>) {
+impl SpecGcGuard {
+    /// Returns the guard and a handle on the keys it recorded.
+    pub fn new(w: u64, inner: Box<dyn GcFilter>) -> (Self, Arc<Mutex<Vec<Key>>>) {
         let violations = Arc::new(Mutex::new(Vec::new()));
         let g = Self {
+            w,
             inner,
-            is_tombstone,
             violations: Arc::clone(&violations),
         };
         (g, violations)
@@ -906,16 +955,18 @@ impl TombstoneGuard {
 }
 
 struct GuardStream {
+    w: u64,
     inner: Box<dyn GcStream>,
-    is_tombstone: fn(&[u8]) -> bool,
+    seen: std::collections::HashSet<Key>,
     violations: Arc<Mutex<Vec<Key>>>,
 }
 
-impl GcFilter for TombstoneGuard {
+impl GcFilter for SpecGcGuard {
     fn begin(&self) -> Box<dyn GcStream> {
         Box::new(GuardStream {
+            w: self.w,
             inner: self.inner.begin(),
-            is_tombstone: self.is_tombstone,
+            seen: std::collections::HashSet::new(),
             violations: Arc::clone(&self.violations),
         })
     }
@@ -923,8 +974,18 @@ impl GcFilter for TombstoneGuard {
 
 impl GcStream for GuardStream {
     fn drop_key(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let allowed = match layout::parse(key) {
+            Some((l, layout::Entry::Version(ts))) if ts <= self.w => self.seen.contains(&l),
+            // A version `> W`, an intent, or a foreign key: never droppable.
+            _ => false,
+        };
+        if let Some((l, layout::Entry::Version(ts))) = layout::parse(key) {
+            if ts <= self.w {
+                self.seen.insert(l);
+            }
+        }
         let drop = self.inner.drop_key(key, value);
-        if drop && (self.is_tombstone)(value) {
+        if drop && !allowed {
             self.violations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -934,9 +995,53 @@ impl GcStream for GuardStream {
     }
 }
 
-/// Stand-in version encoding for this suite (C-T0 leaves it open): first value byte 0.
-pub fn stand_in_is_tombstone(value: &[u8]) -> bool {
-    value.first() == Some(&0)
+/// The seeded rule-2 bug (C-T0 §11 seed 3): drops every tombstone version
+/// `<= W`. In the fixtures below the only such tombstone is also the newest
+/// version `<= W` of its key, so dropping it resurrects the older versions
+/// sitting outside the stream.
+pub struct DropsTombstonesLeW {
+    pub w: u64,
+}
+
+impl GcFilter for DropsTombstonesLeW {
+    fn begin(&self) -> Box<dyn GcStream> {
+        Box::new(DropsTombstonesLeWStream { w: self.w })
+    }
+}
+
+struct DropsTombstonesLeWStream {
+    w: u64,
+}
+
+impl GcStream for DropsTombstonesLeWStream {
+    fn drop_key(&mut self, key: &[u8], value: &[u8]) -> bool {
+        matches!(layout::parse(key), Some((_, layout::Entry::Version(ts))) if ts <= self.w)
+            && layout::is_tombstone(value)
+    }
+}
+
+/// Reads logical key `l` at snapshot ts `s` the way C-T0 §4 step 2 does over
+/// the §2.2 layout: the first (newest) version with `ts <= s`; tombstones and
+/// moved-tombstones read as not-found.
+pub fn read_at<S: Snapshot>(snap: &S, l: &[u8], s: u64) -> Option<Value> {
+    let rows = scan(
+        snap,
+        Bound::Included(layout::intent_key(l).as_slice()),
+        Bound::Excluded(layout::end_key(l).as_slice()),
+        false,
+    );
+    for (key, value) in rows {
+        if let Some((_, layout::Entry::Version(ts))) = layout::parse(&key) {
+            if ts <= s {
+                return if layout::is_tombstone(&value) {
+                    None
+                } else {
+                    Some(value)
+                };
+            }
+        }
+    }
+    None
 }
 
 struct DropAll;
@@ -952,38 +1057,31 @@ impl GcStream for DropAllStream {
     }
 }
 
-struct DropLive;
-struct DropLiveStream;
-impl GcFilter for DropLive {
-    fn begin(&self) -> Box<dyn GcStream> {
-        Box::new(DropLiveStream)
-    }
-}
-impl GcStream for DropLiveStream {
-    fn drop_key(&mut self, _key: &[u8], value: &[u8]) -> bool {
-        !stand_in_is_tombstone(value)
-    }
-}
-
-/// The kv applies a filter that drops tombstones (it does not second-guess),
-/// and `TombstoneGuard` detects every such drop; a compliant filter yields none.
-pub fn gc_tombstone_drop_detectable<H: Harness>(h: &H) {
+/// The kv honours a filter that breaks §9.2 (it does not second-guess), and
+/// `SpecGcGuard` detects every disallowed drop; the reference `SpecGcFilter`
+/// yields none, keeps the newest version `<= W` and drops the shadowed ones.
+pub fn gc_spec_violation_detectable<H: Harness>(h: &H) {
+    const W: u64 = 25;
+    let l: &[u8] = b"row/7";
     let fill = |kv: &H::Kv| {
         write(
             kv,
             vec![
-                Op::Put(k("tb/a@2"), vec![0]),
-                Op::Put(k("tb/a@1"), vec![1, b'x']),
-                Op::Put(k("tb/b@1"), vec![1, b'y']),
-                Op::Put(k("tb/c@3"), vec![0]),
+                Op::Put(layout::version_key(l, 30), layout::live_value(b"v30")),
+                Op::Put(layout::version_key(l, 20), layout::tombstone_value()),
+                Op::Put(layout::version_key(l, 10), layout::live_value(b"v10")),
+                Op::Put(layout::intent_key(b"row/9"), b"intent".to_vec()),
             ],
             Durability::No,
         );
     };
 
+    // A filter that drops everything. Dropping k@10 is *allowed* (shadowed by
+    // the newer k@20 <= W seen earlier in the stream); the other three drops
+    // violate the rule.
     let kv = h.make();
     fill(&kv);
-    let (guard, violations) = TombstoneGuard::new(Box::new(DropAll), stand_in_is_tombstone);
+    let (guard, violations) = SpecGcGuard::new(W, Box::new(DropAll));
     kv.set_gc_filter(Box::new(guard));
     ok(h.compact(&kv), "compact");
     let mut v = violations
@@ -993,24 +1091,84 @@ pub fn gc_tombstone_drop_detectable<H: Harness>(h: &H) {
     v.sort();
     assert_eq!(
         v,
-        vec![k("tb/a@2"), k("tb/c@3")],
-        "tombstone drops not detected"
+        vec![
+            layout::version_key(l, 30),
+            layout::version_key(l, 20),
+            layout::intent_key(b"row/9"),
+        ],
+        "disallowed drops not detected"
     );
     assert!(state(&kv).is_empty(), "kv must honour the filter");
 
+    // The seed-3 bug: dropping the newest tombstone <= W (k@20) resurrects
+    // k@10 for reads at S in [20, 30) -- the §9.2 hazard, visible even
+    // without files.
     let kv = h.make();
     fill(&kv);
-    let (guard, violations) = TombstoneGuard::new(Box::new(DropLive), stand_in_is_tombstone);
+    assert_eq!(read_at(&kv.snapshot(), l, 25), None, "tombstone at 20");
+    let (guard, violations) = SpecGcGuard::new(W, Box::new(DropsTombstonesLeW { w: W }));
+    kv.set_gc_filter(Box::new(guard));
+    ok(h.compact(&kv), "compact");
+    assert_eq!(
+        violations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        vec![layout::version_key(l, 20)],
+        "tombstone drop not detected"
+    );
+    assert_eq!(
+        read_at(&kv.snapshot(), l, 25),
+        Some(layout::live_value(b"v10")),
+        "resurrected k@10"
+    );
+
+    // The reference filter: compliant, keeps 30 (> W) and 20 (newest <= W),
+    // drops 10 (shadowed by 20 in the same stream).
+    let kv = h.make();
+    fill(&kv);
+    let (guard, violations) = SpecGcGuard::new(W, Box::new(SpecGcFilter { w: W }));
     kv.set_gc_filter(Box::new(guard));
     ok(h.compact(&kv), "compact");
     assert!(violations
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .is_empty());
-    let model: Model = [(k("tb/a@2"), vec![0]), (k("tb/c@3"), vec![0])]
-        .into_iter()
-        .collect();
-    assert_state(&kv, &model, "compliant filter");
+    let model: Model = [
+        (layout::version_key(l, 30), layout::live_value(b"v30")),
+        (layout::version_key(l, 20), layout::tombstone_value()),
+        (layout::intent_key(b"row/9"), b"intent".to_vec()),
+    ]
+    .into_iter()
+    .collect();
+    assert_state(&kv, &model, "reference filter");
+    assert_eq!(read_at(&kv.snapshot(), l, 25), None, "still not found");
+    assert_eq!(
+        read_at(&kv.snapshot(), l, 35),
+        Some(layout::live_value(b"v30")),
+        "reads through the newest version"
+    );
+}
+
+/// `set_gc_watermark` accepts an increase or an equal value and refuses a
+/// decrease with `KvError::WatermarkRegressed`, leaving the watermark
+/// unchanged (C-T0 §9.1: `W` is monotonic; the caller treats a regression as
+/// fatal).
+pub fn gc_watermark_monotonic<H: Harness>(h: &H) {
+    let kv = h.make();
+    ok(kv.set_gc_watermark(0), "initial (equal to the default)");
+    ok(kv.set_gc_watermark(10), "increase");
+    ok(kv.set_gc_watermark(10), "equal");
+    ok(kv.set_gc_watermark(20), "increase");
+    match kv.set_gc_watermark(5) {
+        Err(KvError::WatermarkRegressed {
+            current: 20,
+            requested: 5,
+        }) => {}
+        other => panic!("regression not refused: {other:?}"),
+    }
+    ok(kv.set_gc_watermark(20), "equal after refusal");
+    ok(kv.set_gc_watermark(21), "increase after refusal");
 }
 
 /// Without a registered filter, compaction drops nothing.
