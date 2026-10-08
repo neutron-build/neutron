@@ -20,3 +20,4 @@ scripts/core-paths-lib.sh
 scripts/check-core-paths.sh
 scripts/check-api-surface.sh
 xtask/
+crates/nucleus-codec/
