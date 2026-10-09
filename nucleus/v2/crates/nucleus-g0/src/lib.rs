@@ -7,6 +7,7 @@
 pub mod commit;
 pub mod gc;
 pub mod ssi;
+pub mod write;
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
