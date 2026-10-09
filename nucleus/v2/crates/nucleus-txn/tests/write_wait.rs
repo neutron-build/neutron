@@ -224,16 +224,15 @@ fn wait_targets_are_deduped_per_txn() {
         &mut Fixed(RowOp::Lock(RowLockMode::Share)),
     ));
 
-    // An UPDATE conflicts with both acquisitions: one Wait with one entry.
+    // An exclusive UPDATE-mode request conflicts with both acquisitions
+    // (KEY SHARE conflicts with UPDATE; SHARE with everything stronger
+    // than KEY SHARE): one Wait with one entry.
     let w = rig.txn();
     let sw = ok(w.next_seq());
     let mut task = RowOpTask::new(
         b"/t/1/k",
         None,
-        RowOp::Update {
-            value: b"v1".to_vec(),
-            key_cols_changed: false,
-        },
+        RowOp::Lock(RowLockMode::Update),
         StmtCtx::new(rig.core.visible_ts(), sw, sw),
     );
     let targets = match task.step(&rig.core, &w).expect("step") {
