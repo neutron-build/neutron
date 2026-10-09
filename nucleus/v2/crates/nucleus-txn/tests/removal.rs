@@ -86,6 +86,7 @@ fn resolve_committed_intent_writes_top_layer_version() {
         ],
     );
     ok(core.status.set_committed(t, Ts(9)));
+    core.advance_visible_ts(Ts(9));
     {
         let _view = core.open_view(); // counter 1
     }
@@ -127,6 +128,7 @@ fn resolve_absent_top_layer_writes_no_version() {
         vec![layer(1, LayerData::Absent, RowLockMode::NoKeyUpdate)],
     );
     ok(core.status.set_committed(t, Ts(9)));
+    core.advance_visible_ts(Ts(9));
     assert_eq!(
         ok(remove_intent(&core, K, None, t, RemovalMode::Resolve)),
         RemovalOutcome::Removed
@@ -184,6 +186,14 @@ fn removal_modes_check_the_owner_status() {
     // Discard on a Committed owner: invariant violation (a committed write
     // must be resolved, not dropped).
     ok(core.status.set_committed(t, Ts(4)));
+    // Resolve on a commit that is not yet visible (§3.2, §7.3): invariant
+    // violation, nothing written.
+    assert!(matches!(
+        remove_intent(&core, K, None, t, RemovalMode::Resolve),
+        Err(TxnError::Invariant(_))
+    ));
+    assert_eq!(ok(core.kv.get_latest(&version_key(K, Ts(4)))), None);
+    core.advance_visible_ts(Ts(4));
     assert!(matches!(
         remove_intent(&core, K, None, t, RemovalMode::Discard),
         Err(TxnError::Invariant(_))

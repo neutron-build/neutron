@@ -50,6 +50,7 @@ fn place(core: &Core<MemKv>, key: &[u8], id: TxnId) {
 fn committed_and_released(core: &Core<MemKv>, ts: u64) -> TxnId {
     let id = core.status.begin();
     ok(core.status.set_committed(id, Ts(ts)));
+    core.advance_visible_ts(Ts(ts)); // released implies a visible commit
     ok(core.status.mark_released(id));
     id
 }

@@ -58,9 +58,8 @@ impl Latches {
 
     /// Takes the latch for `key`. The guard releases it on drop.
     pub fn lock(&self, key: &[u8]) -> LatchGuard<'_> {
-        let guard = self.strips[self.strip(key)]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        // Checked before blocking: a second latch on the same stripe would
+        // otherwise self-deadlock before the assert could fire.
         #[cfg(debug_assertions)]
         {
             let already = HOLDING_LATCH.with(Cell::get);
@@ -68,8 +67,12 @@ impl Latches {
                 !already,
                 "a thread must never hold two latches (C-T0 §1, §5.0)"
             );
-            HOLDING_LATCH.with(|h| h.set(true));
         }
+        let guard = self.strips[self.strip(key)]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(debug_assertions)]
+        HOLDING_LATCH.with(|h| h.set(true));
         LatchGuard { _guard: guard }
     }
 }

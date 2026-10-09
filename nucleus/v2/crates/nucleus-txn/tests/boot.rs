@@ -142,7 +142,7 @@ fn older_epoch_intent_without_record_reads_as_aborted() {
         let view = core.open_view();
         let got = ok(read_key(
             &core,
-            view.as_snap(),
+            &view,
             b"/t/1/r",
             &ReadCtx {
                 txn: reader,
@@ -226,4 +226,17 @@ fn registry_visible_ts_matches_core() {
     assert_eq!(core.registry.visible_ts(), Ts(41));
     core.advance_visible_ts(Ts(7)); // monotonic: no going back
     assert_eq!(core.registry.visible_ts(), Ts(41));
+}
+
+#[test]
+fn epoch_increment_is_synced_before_boot_continues() {
+    // A crash right after boot that drops every unsynced batch must keep the
+    // new epoch (§2.3, §7.2: incremented and synced before any txn starts).
+    use nucleus_kv::fault::Fault;
+    let kv = Fault::new(MemKv::new(), || Ok(MemKv::new()));
+    let core = ok(Core::open(kv));
+    assert_eq!(core.epoch(), 1);
+    ok(core.kv.crash(0));
+    let core = ok(Core::open(core.kv));
+    assert_eq!(core.epoch(), 2, "epoch 1 survived the crash");
 }

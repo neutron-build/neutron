@@ -150,3 +150,86 @@ fn register_at_rejects_below_published_w_after_publish() {
     ));
     assert!(core.registry.register_at(Ts(10)).is_ok());
 }
+
+/// A KV whose `snapshot()` reports to the test and waits for it, so the test
+/// can inspect the registry while a view's KV snapshot is being opened.
+struct Gate {
+    inner: MemKv,
+    hook: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
+}
+
+impl OrderedKv for Gate {
+    type Snap = <MemKv as OrderedKv>::Snap;
+    fn write(&self, b: nucleus_kv::Batch, d: nucleus_kv::Durability) -> nucleus_kv::Result<()> {
+        self.inner.write(b, d)
+    }
+    fn sync_wal(&self) -> nucleus_kv::Result<()> {
+        self.inner.sync_wal()
+    }
+    fn snapshot(&self) -> Self::Snap {
+        let hook = self
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut f) = hook {
+            f();
+        }
+        self.inner.snapshot()
+    }
+    fn get_latest(&self, k: &[u8]) -> nucleus_kv::Result<Option<nucleus_kv::Value>> {
+        self.inner.get_latest(k)
+    }
+    fn ingest_sorted(
+        &self,
+        e: &mut dyn Iterator<Item = (nucleus_kv::Key, nucleus_kv::Value)>,
+    ) -> nucleus_kv::Result<()> {
+        self.inner.ingest_sorted(e)
+    }
+    fn checkpoint(&self, dir: &std::path::Path) -> nucleus_kv::Result<()> {
+        self.inner.checkpoint(dir)
+    }
+    fn set_gc_filter(&self, f: Box<dyn nucleus_kv::GcFilter>) {
+        self.inner.set_gc_filter(f)
+    }
+    fn set_gc_watermark(&self, w: u64) -> nucleus_kv::Result<()> {
+        self.inner.set_gc_watermark(w)
+    }
+}
+
+#[test]
+fn open_view_registers_before_opening_the_kv_snapshot() {
+    // I-SNAP-ORDER (§3.1): counter and vts registered, mutex released, then
+    // the KV snapshot opened.
+    let gate = Gate {
+        inner: MemKv::new(),
+        hook: std::sync::Mutex::new(None),
+    };
+    let core = ok(Core::open(gate));
+    core.advance_visible_ts(Ts(7));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    *core
+        .kv
+        .hook
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv();
+    }));
+    std::thread::scope(|s| {
+        let opener = s.spawn(|| core.open_view().counter());
+        ok(entered_rx.recv());
+        // Inside snapshot(): the registry is not locked and already holds the
+        // view's counter and vts. Observe first, release the opener, then
+        // assert, so a failure cannot leave the opener blocked.
+        let min_counter = core.registry.min_view_counter();
+        core.advance_visible_ts(Ts(9));
+        let computed = core.registry.computed_watermark(None);
+        ok(go_tx.send(()));
+        let counter = opener.join().unwrap_or(0);
+        assert_eq!(min_counter, 1, "view counter registered before snapshot");
+        assert_eq!(computed, Ts(7), "view vts registered before snapshot");
+        assert_eq!(counter, 1);
+    });
+}

@@ -95,7 +95,7 @@ impl Fixture {
         let mut obs = Collect::default();
         let r = read_key(
             &self.core,
-            view.as_snap(),
+            &view,
             key,
             &self.ctx(snapshot, stmt_seq),
             &mut obs,
@@ -342,7 +342,7 @@ fn scan_returns_logical_rows_in_key_order() {
         let mut obs = Collect::default();
         let rows = ok(scan(
             &f.core,
-            view.as_snap(),
+            &view,
             (Bound::Unbounded, Bound::Unbounded),
             &f.ctx(10, 1),
             &mut obs,
@@ -363,7 +363,7 @@ fn scan_returns_logical_rows_in_key_order() {
         let mut obs = Collect::default();
         let rows = ok(scan(
             &f.core,
-            view.as_snap(),
+            &view,
             (Bound::Included(b"a"), Bound::Excluded(b"ab")),
             &f.ctx(10, 1),
             &mut obs,
@@ -380,7 +380,7 @@ fn scan_returns_logical_rows_in_key_order() {
         let mut obs = Collect::default();
         let rows = ok(scan(
             &f.core,
-            view.as_snap(),
+            &view,
             (Bound::Excluded(b"a"), Bound::Unbounded),
             &f.ctx(10, 1),
             &mut obs,
@@ -397,7 +397,7 @@ fn scan_returns_logical_rows_in_key_order() {
         let mut obs = Collect::default();
         let rows = ok(scan(
             &f.core,
-            view.as_snap(),
+            &view,
             (Bound::Included(b"b"), Bound::Included(b"c")),
             &f.ctx(10, 1),
             &mut obs,
@@ -417,7 +417,7 @@ fn scan_returns_logical_rows_in_key_order() {
         let mut obs = Collect::default();
         let rows = ok(scan(
             &f.core,
-            view.as_snap(),
+            &view,
             (Bound::Included(b"a"), Bound::Excluded(b"b")),
             &own,
             &mut obs,
@@ -446,7 +446,7 @@ fn scan_missing_current_epoch_status_is_fatal() {
     let mut obs = Collect::default();
     let r = scan(
         &f.core,
-        view.as_snap(),
+        &view,
         (Bound::Unbounded, Bound::Unbounded),
         &f.ctx(10, 1),
         &mut obs,
@@ -461,11 +461,11 @@ fn corrupt_intent_in_a_view_is_an_error_not_a_panic() {
     batch.put(intent_key(b"k"), b"not an intent".to_vec());
     ok(f.core.kv.write(batch, Durability::No));
     let view = f.core.open_view();
-    let r = read_key(&f.core, view.as_snap(), b"k", &f.ctx(10, 1), &mut NoSsi);
+    let r = read_key(&f.core, &view, b"k", &f.ctx(10, 1), &mut NoSsi);
     assert!(matches!(r, Err(TxnError::Corrupt(_))));
     let r = scan(
         &f.core,
-        view.as_snap(),
+        &view,
         (Bound::Unbounded, Bound::Unbounded),
         &f.ctx(10, 1),
         &mut NoSsi,

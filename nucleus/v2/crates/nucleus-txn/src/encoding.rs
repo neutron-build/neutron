@@ -278,7 +278,7 @@ impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], TxnError> {
         let s = self
             .b
-            .get(self.pos..self.pos + n)
+            .get(self.pos..self.pos.saturating_add(n))
             .ok_or_else(|| TxnError::Corrupt("intent value truncated".into()))?;
         self.pos += n;
         Ok(s)
@@ -308,7 +308,7 @@ pub fn decode_intent(value: &[u8]) -> Result<Intent, TxnError> {
     if layer_count == 0 {
         return Err(TxnError::Corrupt("intent value: no layers".into()));
     }
-    if r.b.len().saturating_sub(r.pos) < layer_count * MIN_LAYER_LEN {
+    if r.b.len().saturating_sub(r.pos) < layer_count.saturating_mul(MIN_LAYER_LEN) {
         return Err(TxnError::Corrupt(
             "intent value: layer count too large".into(),
         ));

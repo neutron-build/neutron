@@ -17,6 +17,7 @@ use nucleus_kv::{Key, OrderedKv, Snapshot};
 use crate::boot::Core;
 use crate::encoding::{decode_intent, decode_version, end_key, intent_key, parse_key, Entry};
 use crate::kv_err;
+use crate::registry::ViewGuard;
 use crate::visibility::{read as visibility_read, Read, ReadCtx, RwEdge, Version};
 use crate::{Intent, Ts, TxnError, TxnStatus};
 
@@ -37,23 +38,23 @@ impl ReadObserver for NoSsi {
 /// Reads one logical key at the reader's snapshot (§4). Returns the visible
 /// value, or `None` for not-found (including tombstones and moved
 /// tombstones).
-pub fn read_key<K: OrderedKv, S: Snapshot>(
+pub fn read_key<K: OrderedKv>(
     core: &Core<K>,
-    view: &S,
+    view: &ViewGuard<'_, K::Snap>,
     key: &[u8],
     ctx: &ReadCtx,
     observer: &mut dyn ReadObserver,
 ) -> Result<Option<Vec<u8>>, TxnError> {
-    let entries = collect_entries(view, key)?;
+    let entries = collect_entries(view.as_snap(), key)?;
     read_entries(core, &entries, ctx, observer)
 }
 
 /// Scans logical keys in `range` (over logical keys, not stored keys),
 /// returning the visible rows in key order. Each logical key is read once;
 /// intents and versions are grouped by [`parse_key`].
-pub fn scan<K: OrderedKv, S: Snapshot>(
+pub fn scan<K: OrderedKv>(
     core: &Core<K>,
-    view: &S,
+    view: &ViewGuard<'_, K::Snap>,
     range: (Bound<&[u8]>, Bound<&[u8]>),
     ctx: &ReadCtx,
     observer: &mut dyn ReadObserver,

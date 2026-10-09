@@ -75,7 +75,9 @@ pub fn remove_intent_under_latch<K: OrderedKv>(
 
     let removal_ts = match mode {
         RemovalMode::Resolve => match core.status.lookup_for_intent(expected)? {
-            TxnStatus::Committed(ts) => Some(ts),
+            // §7.3: resolution only runs once T is a visible commit (§3.2:
+            // no version above visible_ts ever exists).
+            TxnStatus::Committed(ts) if ts <= core.visible_ts() => Some(ts),
             other => {
                 return Err(TxnError::Invariant(format!(
                     "Resolve removal of {expected:?} with status {other:?}"

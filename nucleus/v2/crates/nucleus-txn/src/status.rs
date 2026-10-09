@@ -244,7 +244,7 @@ impl StatusTable {
     /// txns have no count). Must be called under the registry mutex, after
     /// the removal batch was written, and only when a removal actually
     /// happened.
-    pub fn removal_bookkeeping(&self, id: TxnId, view_counter: u64) -> Result<(), TxnError> {
+    pub(crate) fn removal_bookkeeping(&self, id: TxnId, view_counter: u64) -> Result<(), TxnError> {
         let mut st = self.lock();
         match st.map.get_mut(&id) {
             Some(e) => {
@@ -297,7 +297,7 @@ impl StatusTable {
     /// The delete is written after the removal batches, so by I-WAL-ORDER a
     /// crash can never keep the delete and lose the resolution. Returns
     /// `true` if an entry was removed.
-    pub fn truncate<K: OrderedKv>(&self, id: TxnId, kv: &K) -> Result<bool, TxnError> {
+    pub(crate) fn truncate<K: OrderedKv>(&self, id: TxnId, kv: &K) -> Result<bool, TxnError> {
         let removed = {
             let mut st = self.lock();
             st.map.remove(&id)

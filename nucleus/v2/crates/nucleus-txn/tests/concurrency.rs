@@ -10,6 +10,7 @@ use nucleus_txn::boot::Core;
 use nucleus_txn::encoding::{decode_intent, encode_intent, intent_key};
 use nucleus_txn::read::{read_key, NoSsi};
 use nucleus_txn::removal::{remove_intent, RemovalMode};
+use nucleus_txn::status::Remembered;
 use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId, TxnStatus};
 
@@ -80,6 +81,11 @@ fn concurrent_snapshots_views_removals_and_truncation() {
                 batch.put(intent_key(&key_of(i)), value);
                 core.kv.write(batch, Durability::No).map_err(kverr)?;
                 core.status.set_committed(id, Ts(200 + i as u64))?;
+                // Commit step 4: visible every other txn, so workers see both
+                // visible and not-yet-visible commits.
+                if i % 2 == 0 {
+                    core.advance_visible_ts(Ts(200 + i as u64));
+                }
                 core.status.mark_released(id)?;
                 lock_done(&done).push(id);
             }
@@ -100,7 +106,7 @@ fn concurrent_snapshots_views_removals_and_truncation() {
                 match rng.next() % 5 {
                     0 => {
                         let snap = core.registry.take_snapshot();
-                        assert!(snap.ts() <= Ts(100));
+                        assert!(snap.ts() <= core.visible_ts());
                         drop(snap);
                     }
                     1 => {
@@ -115,7 +121,7 @@ fn concurrent_snapshots_views_removals_and_truncation() {
                         let view = core.open_view();
                         read_key(
                             &core,
-                            view.as_snap(),
+                            &view,
                             &key,
                             &ReadCtx {
                                 txn: me,
@@ -136,15 +142,20 @@ fn concurrent_snapshots_views_removals_and_truncation() {
                                 Some(v) => Ok(Some(decode_intent(&v)?.txn)),
                                 None => Ok(None),
                             })?;
+                        // The owner was read without a latch or a view, so it
+                        // is a remembered id: another worker may resolve the
+                        // intent and truncate the status in between.
                         if let Some(owner) = owner {
-                            match core.status.lookup_for_intent(owner)? {
-                                TxnStatus::Committed(_) => {
+                            match core.status.lookup_remembered(owner) {
+                                Remembered::Live(TxnStatus::Committed(c), _)
+                                    if c <= core.visible_ts() =>
+                                {
                                     remove_intent(&core, &key, None, owner, RemovalMode::Resolve)?;
                                 }
-                                TxnStatus::Aborted => {
+                                Remembered::Live(TxnStatus::Aborted, _) => {
                                     remove_intent(&core, &key, None, owner, RemovalMode::Discard)?;
                                 }
-                                TxnStatus::Pending => {}
+                                _ => {}
                             }
                         }
                         // And a truncation attempt on a finished txn.
