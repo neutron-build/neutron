@@ -5,6 +5,7 @@
 
 mod ssi_support;
 
+use nucleus_txn::resolver::Resolver;
 use nucleus_txn::ssi::{Siread, SsiStats};
 use nucleus_txn::write::SsiHook;
 use nucleus_txn::TxnError;
@@ -116,7 +117,9 @@ fn precision_serial_schedule_never_aborts() {
             rig.update(&t, &keys[next(keys.len())], &v);
         }
         rig.commit(t).unwrap_or_else(|e| panic!("txn {i}: {e:?}"));
-        if i % 10 == 0 {
+        // Resolve, so later reads pass versions (not only intents).
+        Resolver::run_once(&rig.core).expect("resolve");
+        if i % 50 == 49 {
             rig.ssi.run_retention(&rig.core);
         }
     }
