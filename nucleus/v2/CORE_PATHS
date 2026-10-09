@@ -4,6 +4,7 @@ docs/C-T0-txn-protocol.md
 docs/C-Q3s-types-ordering.md
 crates/nucleus-kv/
 crates/nucleus-txn/
+crates/nucleus-g0/
 crates/nucleus-catalog/
 crates/nucleus-sql/src/binder/
 crates/nucleus-sql/src/types/
