@@ -75,7 +75,6 @@ impl<K: OrderedKv> GcJob<K> {
             }
         }
         let durable_w = Arc::new(AtomicU64::new(w.0));
-        core.set_kv_gc_filter(Box::new(TxnGcFilter::new(Arc::clone(&durable_w))));
         if let Err(e) = core.set_kv_gc_watermark(w.0) {
             // Undo the registration so a later install can proceed.
             installed_jobs()
@@ -84,6 +83,8 @@ impl<K: OrderedKv> GcJob<K> {
                 .remove(&(Arc::as_ptr(core) as usize));
             return Err(e);
         }
+        // Filter after the watermark, so a failed install leaves no filter.
+        core.set_kv_gc_filter(Box::new(TxnGcFilter::new(Arc::clone(&durable_w))));
         Ok(GcJob {
             core: Arc::clone(core),
             config,

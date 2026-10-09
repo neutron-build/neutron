@@ -57,8 +57,9 @@ impl GcStream for TxnGcStream {
     /// protected by the newest-`<= W` rule, not by their bytes).
     fn drop_key(&mut self, key: &[u8], _value: &[u8]) -> bool {
         // §10: every /sys/ key except the catalog is never dropped, even
-        // when its bytes match the version-key pattern (no catalog exists
-        // yet, so no /sys/ key qualifies).
+        // when its bytes match the version-key pattern. Catalog GC
+        // (`/sys/catalog/`, versioned like a table) is out of scope here:
+        // the catalog card adds it, so for now no /sys/ key qualifies.
         if key.starts_with(SYS_PREFIX) {
             return false;
         }
