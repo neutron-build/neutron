@@ -1,0 +1,38 @@
+[package]
+name = "nucleus-bakeoff"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[workspace]
+
+[features]
+default = ["rocks", "fjall"]
+rocks = ["dep:rocksdb"]
+fjall = ["dep:fjall"]
+
+[dependencies]
+nucleus-kv = { path = "../crates/nucleus-kv", features = ["conformance"] }
+rocksdb = { version = "0.25", optional = true }
+fjall = { version = "3.1", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+
+[[bin]]
+name = "bakeoff-child"
+path = "src/bin/child.rs"
+
+[[bin]]
+name = "tiny-rocks"
+path = "src/bin/tiny_rocks.rs"
+required-features = ["rocks"]
+
+[[bin]]
+name = "tiny-fjall"
+path = "src/bin/tiny_fjall.rs"
+required-features = ["fjall"]
