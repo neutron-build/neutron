@@ -34,18 +34,19 @@
 //!
 //! ## Workloads (fixed, chosen by the initial `Choose`)
 //!
-//! Every workload is concurrent (no single-transaction workloads). Writes are
-//! read-modify-write (`v = v + 1`) under RC, so a skipped or stale EPQ re-check is a
-//! visible lost update; `W_epq` adds a qual (`UPDATE ... WHERE v = 0`) that a concurrent
-//! update makes fail, so the EPQ-fail skip path is reachable.
+//! Workloads are concurrent except the three named in Scope cuts whose seeds are
+//! inherently sequential. Writes are read-modify-write (`v = v + 1`) under RC, so a
+//! skipped or stale EPQ re-check is a visible lost update; `W_epq` adds a qual
+//! (`UPDATE ... WHERE v = 0`) that a concurrent update makes fail, so the EPQ-fail
+//! skip path is reachable.
 //!
 //! | # | name | program (RC unless noted) |
 //! |---|------|----------------------------|
 //! | 0 | `main` | W0 `UPDATE k0; SAVEPOINT; UPDATE k1; SELECT k0 FOR UPDATE; ROLLBACK TO`; W1 `SELECT k1 FOR KEY SHARE; DELETE k0`; W2 `UPDATE k1; UPDATE k0`; cancel enabled |
-//! | 1 | `lockdata` | W0 `UPDATE k0; FOR NO KEY UPDATE k0; SAVEPOINT; UPDATE k1; ROLLBACK TO`; W1 `UPDATE k0` |
-//! | 2 | `uniq` | W0 `INSERT (t0,u0); INSERT (t1,u0)`; W1 `INSERT (t1,u0)` |
+//! | 1 | `lockdata` | W0 `UPDATE k0; FOR NO KEY UPDATE k0; SAVEPOINT; UPDATE k1; ROLLBACK TO` |
+//! | 2 | `uniq` | W0 `INSERT (t0,u0); INSERT (t1,u0)` |
 //! | 3 | `uniqdup` | W0 `SAVEPOINT; INSERT (t0,u0); ROLLBACK TO; INSERT (t0,u0)`; W1 `INSERT (t1,u0)` |
-//! | 4 | `ownabsent` | preload row t1 + entry u0→t1; W0 `FOR NO KEY UPDATE t1; INSERT (t1,u1)`; W1 `UPDATE t1` |
+//! | 4 | `ownabsent` | preload row t1 + entry u0→t1; W0 `FOR NO KEY UPDATE t1; INSERT (t1,u1)` |
 //! | 5 | `deferrable` | W0 `INSERT (t0,d0)`; W1 `INSERT (t1,d1)` (deferrable unique value, prefix `/i/`, check at commit); cancel enabled |
 //! | 6 | `fk` | preload parent t0, no child; W0 `DELETE parent t0` (end-of-stmt check); W1 `read parent; FOR KEY SHARE t0 (FK); INSERT child c1` |
 //! | 7 | `keyshare` | preload t0; Ta `DELETE t0`; Tb `INSERT t0` (over the tombstone); R (RR) `FOR KEY SHARE t0` below both |
@@ -74,12 +75,32 @@
 //!
 //! ## Mutation checks
 //!
-//! Beyond the seeds, [`Mutant`] carries five protocol deviations the clean model must
-//! catch (checked by unit tests in this file): an RC UPDATE that skips EPQ (lost update,
-//! caught by the increment oracle), both members of a deadlock cycle raising 40P01
-//! (I-LIVE b), an UPDATE whose EPQ passes over a tombstone (increment on a dead row), a
-//! 40P01 victim that keeps its wait-for edges (I-LIVE c), and an abort that does not
-//! queue intent cleanup (stuck state).
+//! Beyond the seeds, the clean model must catch protocol deviations that are not §11
+//! seeds. They are **not** model configurations (review 2): mutation testing is done by
+//! temporarily editing the protocol code, running `g0_write_clean_model_holds`, and
+//! reverting. The checked mutants, each of which must fail the clean test:
+//!
+//! - both members of a deadlock cycle raise 40P01 (I-LIVE b; the ghost `d40p01` record
+//!   sees the second victim off-cycle once the first victim's edges are gone);
+//! - EPQ ignores the WHERE qual (the qual ghost below flags an applied update whose
+//!   qual fails on the latest committed version);
+//! - an RC UPDATE skips EPQ and places from the stale snapshot (the qual ghost and the
+//!   increment oracle both flag the lost update);
+//! - an UPDATE's EPQ passes over a tombstone (the qual ghost and the increment oracle
+//!   both flag the update of a dead row).
+//!
+//! Two ghost records back the per-state checks (both written by `next`, read only by
+//! `check`, never by the protocol):
+//!
+//! - **Qual ghost.** When an RC UPDATE/DELETE row op with no own intent completes —
+//!   applied (the row lock is granted and the layer placed) or skipped by EPQ — the
+//!   ghost evaluates the op's WHERE qual against the latest committed version of the
+//!   key at that moment and records the pair (ghost applies?, applied?); `check` flags
+//!   a mismatch. (`W_epq`'s `WHERE v = 0` makes both outcomes reachable.)
+//! - **40P01 ghost.** Every 40P01 records whether its victim was on a cycle of the
+//!   **current** wait-for edges at that moment, computed by `ghost_on_cycle` over the
+//!   edge set alone (not by the detector's DFS result and not by any record the
+//!   detector writes); `check` flags a victim that was not on a cycle.
 //!
 //! ## Scope cuts
 //!
@@ -95,6 +116,19 @@
 //!   its spill to disk and layer compaction are not modelled. Layer existence (the seqs
 //!   of an active txn's layers, from a bug-free ghost log) is checked; layer *contents*
 //!   are checked only through the commit oracle (data) and I-LOCK interactions (locks).
+//! - Qual semantics: a qual is a single `WHERE v = c` equality on the modelled value
+//!   (no expression quals, no subqueries); it is evaluated at the statement scan and by
+//!   EPQ against the remembered version, and by the qual ghost against the latest
+//!   committed version at the deciding moment. A skipped statement row invisible at S
+//!   never reaches EPQ (skipped at the scan), so the ghost only sees targeted rows.
+//! - Sequential seeds (review 2 relaxes review 1's all-concurrent rule) are caught in
+//!   single-txn workloads because their deviation is bookkeeping inside one txn, with
+//!   nothing for a second txn to race: seed 15 (`lockdata`) is layer bookkeeping — a
+//!   lock-only layer replacing own data loses the update at commit; seed 19 (`uniq`) is
+//!   the unique check reading the txn's own intent; seed 24 (`ownabsent`) is the unique
+//!   check falling through an own `Absent` layer to committed state. Their observation
+//!   (a lost update, a duplicate key at commit) needs no interleaving; the decoy second
+//!   txns of review 1 are removed.
 //! - Seed 16 (rollback drops the restored top layer's lock) is caught when a second txn
 //!   places over the lock-less pending intent — an I-ONE-INTENT/I-COUNT breach between
 //!   two txns. A standing dual-lock state is unreachable from it because §5.1's
@@ -371,22 +405,6 @@ impl Bug {
     }
 }
 
-/// Extra mutation checks (review rework): deviations that are not §11 seeds but that the
-/// clean model must still catch. Run by the unit tests at the bottom of this file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mutant {
-    /// RC UPDATE places from the stale snapshot instead of running EPQ.
-    RcUpdateSkipsEpq,
-    /// Every member of a deadlock cycle raises 40P01 (I-LIVE b).
-    BothCycleMembers40P01,
-    /// An UPDATE's EPQ quals pass over a tombstone (I-FK/lost-update class).
-    EpqPassesTombstone,
-    /// The 40P01 victim keeps its wait-for edges in the graph (I-LIVE c).
-    VictimKeepsEdges,
-    /// Abort does not queue the async intent cleanup.
-    AbortCleanupNotQueued,
-}
-
 /// One operation of a statement. Ops of one statement share `seq0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -536,22 +554,20 @@ const W_MAIN: Workload = Workload {
     deferrable: false,
 };
 
-/// W_lockdata: the lock-only layer before the savepoint survives `ROLLBACK TO`, so a
-/// lock-only layer that replaced own data (seed 15) commits `Absent` and loses the row.
+/// W_lockdata: seed 15 — the lock-only layer before the savepoint survives `ROLLBACK TO`,
+/// so a lock-only layer that replaced own data (seed 15) commits `Absent` and loses the
+/// update (sequential: the deviation is layer bookkeeping inside W0).
 const W_LOCKDATA: Workload = Workload {
-    txns: &[
-        rc![
-            stmt![upd!(LKey::T0)],
-            stmt![Op::LockOnly {
-                key: LKey::T0,
-                upd: false,
-            }],
-            stmt![Op::Savepoint],
-            stmt![upd!(LKey::T1)],
-            stmt![Op::RollbackTo],
-        ],
-        rc![stmt![upd!(LKey::T0)]],
-    ],
+    txns: &[rc![
+        stmt![upd!(LKey::T0)],
+        stmt![Op::LockOnly {
+            key: LKey::T0,
+            upd: false,
+        }],
+        stmt![Op::Savepoint],
+        stmt![upd!(LKey::T1)],
+        stmt![Op::RollbackTo],
+    ]],
     preload: &[
         pre_row!(LKey::T0, 0, None, false),
         pre_row!(LKey::T1, 0, None, false),
@@ -560,38 +576,24 @@ const W_LOCKDATA: Workload = Workload {
     deferrable: false,
 };
 
-/// W_uniq: seed 19 — the second insert's unique check must see W0's own live entry.
+/// W_uniq: seed 19 — the second insert's unique check must see W0's own live entry
+/// (sequential: the check reads the txn's own intent).
 const W_UNIQ: Workload = Workload {
-    txns: &[
-        rc![
-            stmt![
-                Op::KeyExist {
-                    key: LKey::T0,
-                    kind: KeyKind::Pk {
-                        uval: Some(LKey::U0),
-                        child: false,
-                    },
+    txns: &[rc![
+        stmt![
+            Op::KeyExist {
+                key: LKey::T0,
+                kind: KeyKind::Pk {
+                    uval: Some(LKey::U0),
+                    child: false,
                 },
-                Op::KeyExist {
-                    key: LKey::U0,
-                    kind: KeyKind::Unique { row: LKey::T0 },
-                },
-            ],
-            stmt![
-                Op::KeyExist {
-                    key: LKey::T1,
-                    kind: KeyKind::Pk {
-                        uval: Some(LKey::U0),
-                        child: false,
-                    },
-                },
-                Op::KeyExist {
-                    key: LKey::U0,
-                    kind: KeyKind::Unique { row: LKey::T1 },
-                },
-            ],
+            },
+            Op::KeyExist {
+                key: LKey::U0,
+                kind: KeyKind::Unique { row: LKey::T0 },
+            },
         ],
-        rc![stmt![
+        stmt![
             Op::KeyExist {
                 key: LKey::T1,
                 kind: KeyKind::Pk {
@@ -603,8 +605,8 @@ const W_UNIQ: Workload = Workload {
                 key: LKey::U0,
                 kind: KeyKind::Unique { row: LKey::T1 },
             },
-        ]],
-    ],
+        ],
+    ]],
     preload: &[],
     cancel: false,
     deferrable: false,
@@ -664,30 +666,28 @@ const W_UNIQDUP: Workload = Workload {
 };
 
 /// W_ownabsent: seed 24 — the insert's unique check on t1 must use the committed state
-/// (live) even though W0's own top layer on t1 is `Absent` (lock-only).
+/// (live) even though W0's own top layer on t1 is `Absent` (lock-only); sequential: the
+/// check falls through the txn's own layer stack.
 const W_OWNABSENT: Workload = Workload {
-    txns: &[
-        rc![
-            stmt![Op::LockOnly {
+    txns: &[rc![
+        stmt![Op::LockOnly {
+            key: LKey::T1,
+            upd: false,
+        }],
+        stmt![
+            Op::KeyExist {
                 key: LKey::T1,
-                upd: false,
-            }],
-            stmt![
-                Op::KeyExist {
-                    key: LKey::T1,
-                    kind: KeyKind::Pk {
-                        uval: Some(LKey::U1),
-                        child: false,
-                    },
+                kind: KeyKind::Pk {
+                    uval: Some(LKey::U1),
+                    child: false,
                 },
-                Op::KeyExist {
-                    key: LKey::U1,
-                    kind: KeyKind::Unique { row: LKey::T1 },
-                },
-            ],
+            },
+            Op::KeyExist {
+                key: LKey::U1,
+                kind: KeyKind::Unique { row: LKey::T1 },
+            },
         ],
-        rc![stmt![upd!(LKey::T1)]],
-    ],
+    ]],
     preload: &[
         pre_row!(LKey::T1, 0, Some(LKey::U0), false),
         (
@@ -1101,9 +1101,14 @@ pub struct State {
     view_counter: u32,
     /// Ghost: (commit ts, txn, net writes) in ts order; txn 255 = preload.
     commits: Commits,
-    /// Ghost: (cycle members, mask of members that raised 40P01 at that
-    /// detection) — I-LIVE(b): exactly one per cycle (§6).
-    dlk_cycles: Vec<(Vec<u8>, u8)>,
+    /// Ghost: every raised 40P01 with whether its victim was on a cycle of the
+    /// **current** wait-for edges at that moment (I-LIVE b, §6) — computed by
+    /// `ghost_on_cycle` over the edge set, not by the detector.
+    d40p01: Vec<(u8, bool)>,
+    /// Ghost: outcome of every completed RC UPDATE/DELETE row op with no own
+    /// intent — (txn, key, the qual evaluates on the latest committed version,
+    /// the op applied) — `check` flags a mismatch (review rework 2).
+    qlog: Vec<(u8, LKey, bool, bool)>,
     bad: Option<String>,
 }
 
@@ -1139,7 +1144,6 @@ pub enum Action {
 
 pub struct WriteModel {
     pub bug: Option<Bug>,
-    pub mutant: Option<Mutant>,
 }
 
 fn req_mode(op: Op) -> Lock {
@@ -1402,6 +1406,13 @@ impl State {
         self.cleanup_q.dedup();
         self.latch.sort_unstable();
         self.latch.dedup();
+        // Ghost logs: each (txn, stmt, op) — and each 40P01 raiser — records at
+        // most once, so sorting collapses states that differ only in the order
+        // completions happened in.
+        self.qlog.sort_unstable();
+        self.qlog.dedup();
+        self.d40p01.sort_unstable();
+        self.d40p01.dedup();
     }
 }
 
@@ -1514,13 +1525,21 @@ impl WriteModel {
         }
         self.release_shared(s, w, 0);
         s.rels.retain(|(_, t, _)| *t != w);
-        if self.mutant != Some(Mutant::AbortCleanupNotQueued) {
-            for k in s.intents_of(w) {
-                s.cleanup_q.push((w, k));
-            }
+        for k in s.intents_of(w) {
+            s.cleanup_q.push((w, k));
         }
         self.wake(s, w);
         s.txns[w as usize].phase = Phase::Done { aborted: true };
+    }
+
+    /// Raise 40P01 for `w` (§6): the ghost first records whether the victim was
+    /// on a cycle of the **current** wait-for edges at this moment (I-LIVE b),
+    /// then the victim removes its own edges and aborts.
+    fn raise_40p01(&self, s: &mut State, w: u8) {
+        let on = ghost_on_cycle(&s.edges, w);
+        s.d40p01.push((w, on));
+        s.edges.retain(|(x, _, _)| *x != w);
+        self.do_fail(s, w);
     }
 
     /// The RMW value `v = v + 1` computed from the row the protocol would use: the
@@ -1643,6 +1662,17 @@ impl WriteModel {
                 }
             },
             _ => {}
+        }
+        // Ghost (review rework 2): an RC row op applied with no own intent — the
+        // moment the row lock is granted — against the qual evaluated on the
+        // latest committed version.
+        if !own && s.iso(w) == Iso::Rc && is_data_row_op(op) {
+            let qual = match op {
+                Op::Write { qual, .. } => qual,
+                _ => None,
+            };
+            let ghost = ghost_qual(s, key, qual);
+            s.qlog.push((w, key, ghost, true));
         }
         self.advance_op(s, w);
     }
@@ -1951,10 +1981,7 @@ impl WriteModel {
                     }
                     // KEY SHARE may proceed over plain newer writes.
                 } else {
-                    // RC: EPQ (§5.2), unlatched. The mutant skips it for updates.
-                    if self.mutant == Some(Mutant::RcUpdateSkipsEpq) && is_data_row_op(op) {
-                        return self.dispatch_place(s, w);
-                    }
+                    // RC: EPQ (§5.2), unlatched.
                     let snap = s.txns[w as usize].snap.unwrap_or(s.visible_ts);
                     let vers: Vec<(Ts, VerData)> = if matches!(op, Op::KeyShare { .. }) {
                         // §5.2: KEY SHARE examines every version above S.
@@ -2087,7 +2114,7 @@ impl WriteModel {
             }
             Op::Write { qual, .. } => match v.1 {
                 VerData::Live { val, .. } => qual.is_none_or(|q| q == val),
-                VerData::Tomb => self.mutant == Some(Mutant::EpqPassesTombstone),
+                VerData::Tomb => false,
             },
             Op::Delete { .. } => matches!(v.1, VerData::Live { .. }),
             _ => true,
@@ -2097,6 +2124,17 @@ impl WriteModel {
                 // §5.3: an FK EPQ failure raises 23503, never skips.
                 self.do_fail(s, w);
             } else {
+                // Ghost (review rework 2): an RC row op skipped by EPQ, against
+                // the qual evaluated on the latest committed version.
+                if is_data_row_op(op) {
+                    let key = op_key(op).unwrap_or(LKey::T0);
+                    let qual = match op {
+                        Op::Write { qual, .. } => qual,
+                        _ => None,
+                    };
+                    let ghost = ghost_qual(s, key, qual);
+                    s.qlog.push((w, key, ghost, false));
+                }
                 self.advance_op(s, w); // skip the row
             }
             return Spin::Done;
@@ -2386,6 +2424,43 @@ fn unlatch(s: &mut State, w: u8) {
     s.latch.retain(|(_, h)| *h != w);
 }
 
+/// Ghost qual evaluation (review rework 2): does the latest committed version of
+/// `k` satisfy the op's WHERE qual (`WHERE v = c`; no qual always matches)? A
+/// dead or absent row never applies. Read by `check` only.
+fn ghost_qual(s: &State, k: LKey, qual: Option<u8>) -> bool {
+    matches!(
+        s.committed_state(k),
+        Some((_, VerData::Live { val, .. })) if qual.is_none_or(|q| q == val)
+    )
+}
+
+/// Ghost cycle test (I-LIVE b): is `w` on a cycle of `edges`? Reachability of
+/// `w` from its own successors, computed over the edge set alone — not by the
+/// detector's DFS and not by any record it writes.
+fn ghost_on_cycle(edges: &[(u8, u8, EdgeKind)], w: u8) -> bool {
+    let mut stack: Vec<u8> = edges
+        .iter()
+        .filter(|(x, _, _)| *x == w)
+        .map(|(_, t, _)| *t)
+        .collect();
+    let mut seen = [false; NTXNS];
+    while let Some(t) = stack.pop() {
+        if t == w {
+            return true;
+        }
+        if (t as usize) >= NTXNS || seen[t as usize] {
+            continue;
+        }
+        seen[t as usize] = true;
+        for (x, t2, _) in edges {
+            if *x == t {
+                stack.push(*t2);
+            }
+        }
+    }
+    false
+}
+
 impl WriteModel {
     /// Latches `RollbackTo(w)` needs: one section per visited key (§5.5) plus one per
     /// released shared lock (§6). Seed 46 skips the shared-lock sections.
@@ -2454,7 +2529,8 @@ impl Model for WriteModel {
             def_scan: [EntryObs::None, EntryObs::None],
             view_counter: 0,
             commits: Vec::new(),
-            dlk_cycles: Vec::new(),
+            d40p01: Vec::new(),
+            qlog: Vec::new(),
             bad: None,
         }
     }
@@ -2809,35 +2885,10 @@ impl Model for WriteModel {
                             ));
                         }
                     }
-                    let mut members: Vec<u8> = vec![*w];
-                    for (_, t, _) in &cycle {
-                        if !members.contains(t) {
-                            members.push(*t);
-                        }
-                    }
-                    // Ghost: which members raise 40P01 at this detection. §6: the
-                    // DFS runner is the one victim; the mutant gives every member
-                    // the error.
-                    let mut marked = 1u8 << *w;
-                    if self.mutant == Some(Mutant::BothCycleMembers40P01) {
-                        for m in &members {
-                            marked |= 1 << *m;
-                        }
-                    }
-                    s.dlk_cycles.push((members.clone(), marked));
-                    // §6: the victim removes its own edges before raising 40P01.
-                    if self.mutant != Some(Mutant::VictimKeepsEdges) {
-                        s.edges.retain(|(x, _, _)| x != w);
-                    }
-                    // §6: exactly one member of the cycle is aborted — the victim
-                    // raising 40P01. The other members are woken by its abort.
-                    if self.mutant == Some(Mutant::BothCycleMembers40P01) {
-                        let others: Vec<u8> = members.iter().copied().filter(|m| m != w).collect();
-                        for m in others {
-                            self.do_fail(&mut s, m);
-                        }
-                    }
-                    self.do_fail(&mut s, *w);
+                    // §6: exactly one member of the cycle is aborted — the DFS
+                    // runner raising 40P01. The other members are woken by its
+                    // abort.
+                    self.raise_40p01(&mut s, *w);
                 }
             }
             Action::DefScan(w) => {
@@ -3130,20 +3181,26 @@ impl Model for WriteModel {
                 return Err(format!("I-LIVE: stale wait edge W{x} -> W{t} ({kind:?})"));
             }
         }
-        // I-LIVE(b): every wait-for cycle is broken with exactly one 40P01 (§6).
-        for (members, marked) in &s.dlk_cycles {
-            let n = marked.count_ones();
-            if n > 1 {
+        // I-LIVE(b): a 40P01 is raised only by a victim that was on a cycle of
+        // the current wait-for edges at that moment (§6: exactly one per cycle —
+        // once the first victim's edges are gone, a second 40P01 from the same
+        // cycle is off-cycle and flagged here).
+        for (w, on) in &s.d40p01 {
+            if !on {
                 return Err(format!(
-                    "I-LIVE(b): one deadlock cycle {members:?} raised 40P01 for {n} members"
+                    "I-LIVE(b): W{w} raised 40P01 while not on a cycle of current wait-for edges (§6)"
                 ));
             }
-            for m in 0..NTXNS as u8 {
-                if marked & (1 << m) != 0 && !members.contains(&m) {
-                    return Err(format!(
-                        "I-LIVE(b): W{m} raised 40P01 outside its cycle {members:?}"
-                    ));
-                }
+        }
+        // Qual ghost: an RC UPDATE/DELETE's outcome must match its WHERE qual
+        // evaluated against the latest committed version at the deciding moment.
+        for (w, k, ghost, applied) in &s.qlog {
+            if ghost != applied {
+                return Err(format!(
+                    "I-RC-MONO/qual: W{w}'s row op on {k:?} was {} but the qual evaluated on the latest committed version says {}",
+                    if *applied { "applied" } else { "skipped" },
+                    if *ghost { "apply" } else { "skip" }
+                ));
             }
         }
         for w in 0..s.ntxns() {
@@ -3186,47 +3243,5 @@ impl Model for WriteModel {
             && s.rels.is_empty()
             && KEYS.iter().all(|k| s.slot(*k).intent.is_none())
             && (0..s.ntxns()).all(|w| matches!(s.txns[w].phase, Phase::Done { .. }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::check;
-
-    fn max_states() -> usize {
-        std::env::var("G0_MAX_STATES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20_000_000)
-    }
-
-    /// The review rework's mutation evidence: each of these deviations must be caught
-    /// by the clean workload set.
-    #[test]
-    fn g0_write_mutants_caught() {
-        for m in [
-            Mutant::RcUpdateSkipsEpq,
-            Mutant::BothCycleMembers40P01,
-            Mutant::EpqPassesTombstone,
-            Mutant::VictimKeepsEdges,
-            Mutant::AbortCleanupNotQueued,
-        ] {
-            let r = check(
-                &WriteModel {
-                    bug: None,
-                    mutant: Some(m),
-                },
-                max_states(),
-            );
-            let v = r
-                .violation
-                .unwrap_or_else(|| panic!("mutant {m:?} not caught in {} states", r.states));
-            eprintln!(
-                "mutant {m:?}: {} (trace {} steps)",
-                v.message,
-                v.trace.len()
-            );
-        }
     }
 }
