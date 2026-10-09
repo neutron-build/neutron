@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nucleus_kv::{Batch, Durability, GcFilter, Key, KvError, MemKv, Op, OrderedKv, Result, Value};
 
@@ -186,6 +187,19 @@ impl nucleus_txn::commit::Clock for FakeClock {
     fn now_secs(&self) -> u64 {
         self.secs.load(Ordering::SeqCst)
     }
+}
+
+/// Waits until commit step 5 has run for `id` (`released`). The ack (step 4)
+/// legally precedes step 5, so tests that need release/resolution-queueing
+/// poll for it.
+pub fn wait_released<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleus_txn::TxnId) {
+    for _ in 0..10_000 {
+        if core.status.entry(id).is_some_and(|e| e.released) {
+            return;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    panic!("step 5 never ran for {id:?}");
 }
 
 /// Places an intent the way §5.1 will: latch, log, count, then the write.

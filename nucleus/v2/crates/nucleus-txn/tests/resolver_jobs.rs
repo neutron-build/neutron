@@ -18,7 +18,8 @@ use nucleus_txn::status::Remembered;
 use nucleus_txn::txn::Isolation;
 use nucleus_txn::{Ts, TxnStatus};
 
-/// Commits a txn with one hand-placed intent through the real pipeline.
+/// Commits a txn with one hand-placed intent through the real pipeline,
+/// and waits for commit step 5 (release + resolution queueing).
 fn commit_one(
     core: &Arc<Core<RecKv>>,
     key: &[u8],
@@ -28,6 +29,7 @@ fn commit_one(
     let txn = core.begin(Isolation::ReadCommitted);
     place_intent(core, &txn, key, value);
     let ts = ok(core.commit(&txn, sync));
+    common::wait_released(core, txn.id);
     (txn.id, ts)
 }
 

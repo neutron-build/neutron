@@ -60,7 +60,9 @@ fn a_new_snapshot_sees_the_commit_across_threads() {
     // A snapshot from *before* the commit must not see it (no snapshot
     // taken before ts1 exists here, so register at the boot ts: 0 values).
     // Instead: resolve and read the version at exactly ts1.
-    ok(core.commit(&w2, SyncCommit::Off));
+    let ts2 = ok(core.commit(&w2, SyncCommit::Off));
+    assert!(ts2 > ts1);
+    common::wait_released(&core, w2.id);
     ok(Resolver::run_once(&core));
     let view = core.open_view();
     let ctx = ReadCtx {
