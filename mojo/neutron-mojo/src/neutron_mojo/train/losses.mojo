@@ -17,8 +17,11 @@ from neutron_mojo.autograd.tape import (
 from neutron_mojo.autograd.ops import tracked_sum, tracked_scalar_mul, tracked_add
 
 
-def log_softmax(mut tape: Tape, x_idx: Int) -> Int:
+def log_softmax(mut tape: Tape, x_idx: Int) raises -> Int:
     """Numerically stable log-softmax."""
+    tape.validate_variable(x_idx)
+    if tape.var_numel(x_idx) <= 0:
+        raise Error("Log-softmax requires nonempty logits")
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -47,11 +50,14 @@ def log_softmax(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def cross_entropy_loss(mut tape: Tape, logits_idx: Int, target: Int, vocab_size: Int) -> Int:
+def cross_entropy_loss(mut tape: Tape, logits_idx: Int, target: Int, vocab_size: Int) raises -> Int:
     """Cross-entropy loss: -log(softmax(logits)[target]).
 
     Fused backward: softmax(logits) - one_hot(target).
     """
+    tape.validate_variable(logits_idx)
+    if vocab_size <= 0 or tape.var_numel(logits_idx) != vocab_size or target < 0 or target >= vocab_size:
+        raise Error("Cross-entropy logits/vocabulary/target mismatch")
     var dims = List[Int]()
     dims.append(1)
     var loss_idx = tape.add_variable(dims^, requires_grad=True)
@@ -76,9 +82,12 @@ def cross_entropy_loss(mut tape: Tape, logits_idx: Int, target: Int, vocab_size:
     return loss_idx
 
 
-def mse_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
+def mse_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) raises -> Int:
     """Mean squared error loss: mean((pred - target)^2)."""
+    tape.validate_same_shape(pred_idx, target_idx)
     var n = tape.var_numel(pred_idx)
+    if n <= 0:
+        raise Error("Mean loss requires nonempty operands")
     var dims = List[Int]()
     dims.append(1)
     var loss_idx = tape.add_variable(dims^, requires_grad=True)
@@ -94,9 +103,12 @@ def mse_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     return loss_idx
 
 
-def l1_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
+def l1_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) raises -> Int:
     """L1 (mean absolute error) loss: mean(|pred - target|)."""
+    tape.validate_same_shape(pred_idx, target_idx)
     var n = tape.var_numel(pred_idx)
+    if n <= 0:
+        raise Error("Mean loss requires nonempty operands")
     var dims = List[Int]()
     dims.append(1)
     var loss_idx = tape.add_variable(dims^, requires_grad=True)
@@ -112,9 +124,12 @@ def l1_loss(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     return loss_idx
 
 
-def binary_cross_entropy(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
+def binary_cross_entropy(mut tape: Tape, pred_idx: Int, target_idx: Int) raises -> Int:
     """Binary cross-entropy: -mean(target*log(pred) + (1-target)*log(1-pred))."""
+    tape.validate_same_shape(pred_idx, target_idx)
     var n = tape.var_numel(pred_idx)
+    if n <= 0:
+        raise Error("Mean loss requires nonempty operands")
     var dims = List[Int]()
     dims.append(1)
     var loss_idx = tape.add_variable(dims^, requires_grad=True)
@@ -133,8 +148,9 @@ def binary_cross_entropy(mut tape: Tape, pred_idx: Int, target_idx: Int) -> Int:
     return loss_idx
 
 
-def kl_divergence(mut tape: Tape, p_idx: Int, q_idx: Int) -> Int:
+def kl_divergence(mut tape: Tape, p_idx: Int, q_idx: Int) raises -> Int:
     """KL divergence: sum(p * log(p/q))."""
+    tape.validate_same_shape(p_idx, q_idx)
     var n = tape.var_numel(p_idx)
     var dims = List[Int]()
     dims.append(1)
@@ -157,7 +173,7 @@ def sequence_cross_entropy_loss(
     logits_indices: List[Int],
     targets: List[Int],
     vocab_size: Int,
-) -> Int:
+) raises -> Int:
     """Average cross-entropy loss across all positions in a sequence.
 
     Computes per-position cross-entropy, sums them with tracked_add,
@@ -174,6 +190,12 @@ def sequence_cross_entropy_loss(
         Variable index of the scalar mean loss.
     """
     var seq_len = len(logits_indices)
+    if seq_len <= 0 or len(targets) != seq_len or vocab_size <= 0:
+        raise Error("Sequence loss requires matching nonempty logits and targets")
+    for i in range(seq_len):
+        tape.validate_variable(logits_indices[i])
+        if tape.var_numel(logits_indices[i]) != vocab_size or targets[i] < 0 or targets[i] >= vocab_size:
+            raise Error("Invalid sequence loss logits or target")
 
     # Compute first position loss
     var acc_idx = cross_entropy_loss(tape, logits_indices[0], targets[0], vocab_size)

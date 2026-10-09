@@ -17,9 +17,11 @@ struct BatchResult(Movable):
     var seq_len: Int
 
     def __init__(out self, var inputs: Tensor[DType.float32], var targets: List[Int],
-                batch_size: Int, seq_len: Int):
+                batch_size: Int, seq_len: Int) raises:
         self.inputs = inputs^
         self.targets = targets^
+        if batch_size <= 0:
+            raise Error("DataLoader batch_size must be positive")
         self.batch_size = batch_size
         self.seq_len = seq_len
 
@@ -39,7 +41,7 @@ struct DataLoader(Movable):
     var order: List[Int]
     var _seed: Int
 
-    def __init__(out self, var dataset: Dataset, batch_size: Int = 4, shuffle: Bool = True):
+    def __init__(out self, var dataset: Dataset, batch_size: Int = 4, shuffle: Bool = True) raises:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.current_idx = 0
@@ -85,14 +87,24 @@ struct DataLoader(Movable):
     def has_next(self) -> Bool:
         return self.current_idx < self.dataset.size()
 
-    def next_batch(mut self) -> BatchResult:
+    def next_batch(mut self) raises -> BatchResult:
         """Get the next batch of data."""
         var n = self.dataset.size()
+        if self.batch_size <= 0 or self.current_idx < 0 or self.current_idx >= n:
+            raise Error("DataLoader is exhausted or invalid")
         var actual_batch = min(self.batch_size, n - self.current_idx)
 
         # Get the first sample to determine seq_len
         var first_sample = self.dataset.get(self.order[self.current_idx])
         var seq_len = first_sample.seq_len()
+
+        # Fixed-length collation: validate the entire batch before allocation
+        # or cursor mutation. Padding/truncation must be an explicit policy.
+        for b in range(actual_batch):
+            if self.dataset.get(self.order[self.current_idx + b]).seq_len() != seq_len:
+                raise Error("DataLoader requires equal sample lengths")
+        if seq_len <= 0 or actual_batch > 0x7FFFFFFFFFFFFFFF // seq_len:
+            raise Error("Invalid or overflowing batch shape")
 
         # Create flat input tensor: (batch_size * seq_len)
         var inputs = Tensor[DType.float32](actual_batch * seq_len)
@@ -109,7 +121,9 @@ struct DataLoader(Movable):
         self.current_idx += actual_batch
         return BatchResult(inputs^, targets^, actual_batch, seq_len)
 
-    def num_batches(self) -> Int:
+    def num_batches(self) raises -> Int:
         """Return the number of batches per epoch."""
+        if self.batch_size <= 0:
+            raise Error("DataLoader batch size must remain positive")
         var n = self.dataset.size()
-        return (n + self.batch_size - 1) // self.batch_size
+        return n // self.batch_size + Int(n % self.batch_size != 0)

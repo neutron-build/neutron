@@ -48,6 +48,12 @@ def test_alignment() raises:
     print("  alignment: PASS")
 
 
+def _pad_to_alignment(mut buf: List[UInt8], alignment: Int = GGUF_DEFAULT_ALIGNMENT):
+    """Strict parser requires the aligned data offset to fit in the buffer."""
+    while len(buf) % alignment != 0:
+        buf.append(0)
+
+
 def test_parse_minimal_gguf() raises:
     """Test parsing a minimal GGUF with no metadata and no tensors."""
     var buf = List[UInt8]()
@@ -55,6 +61,7 @@ def test_parse_minimal_gguf() raises:
     _write_u32_le(buf, 3)
     _write_u64_le(buf, 0)
     _write_u64_le(buf, 0)
+    _pad_to_alignment(buf)
 
     var gguf = parse_gguf_from_buffer(buf^)
     assert_true(gguf.is_valid(), "should be valid GGUF")
@@ -89,6 +96,7 @@ def test_version_2_accepted() raises:
     _write_u32_le(buf, 2)
     _write_u64_le(buf, 0)
     _write_u64_le(buf, 0)
+    _pad_to_alignment(buf)
 
     var gguf = parse_gguf_from_buffer(buf^)
     assert_eq(gguf.version, 2, "version should be 2")
@@ -106,6 +114,7 @@ def test_metadata_string() raises:
     _write_string_gguf(buf, "general.architecture")
     _write_u32_le(buf, 8)  # STRING type
     _write_string_gguf(buf, "llama")
+    _pad_to_alignment(buf)
 
     var gguf = parse_gguf_from_buffer(buf^)
     var arch = gguf.get_str("general.architecture", "unknown")
@@ -128,6 +137,7 @@ def test_metadata_int_and_float() raises:
     _write_string_gguf(buf, "llama.rope.freq_base")
     _write_u32_le(buf, 6)  # FLOAT32
     _write_f32_le(buf, Float32(500000.0))
+    _pad_to_alignment(buf)
 
     var gguf = parse_gguf_from_buffer(buf^)
     assert_eq(gguf.get_int("llama.block_count", 0), 32, "block_count 32")
@@ -162,6 +172,7 @@ def test_tensor_info_parsing() raises:
     _write_u64_le(buf, 4)
     _write_u32_le(buf, 1)  # F16
     _write_u64_le(buf, 128)
+    _pad_to_alignment(buf)
 
     var gguf = parse_gguf_from_buffer(buf^)
     assert_eq(gguf.tensor_count, 2, "2 tensors")

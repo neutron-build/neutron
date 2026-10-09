@@ -191,11 +191,11 @@ def _build_mini_tinyllama_gguf() raises -> List[UInt8]:
     # Tensor info section (all F32)
     var data_cursor = 0
 
-    # Global tensors
+    # Global tensors (GGUF dims are fastest-varying-first)
     _write_string_gguf(buf, "token_embd.weight")
     _write_u32_le(buf, 2)  # ndims
-    _write_u64_le(buf, vocab)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, vocab)
     _write_u32_le(buf, 0)  # F32
     _write_u64_le(buf, data_cursor)
     data_cursor += vocab * hidden * 4
@@ -209,8 +209,8 @@ def _build_mini_tinyllama_gguf() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "output.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, vocab)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, vocab)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += vocab * hidden * 4
@@ -228,32 +228,32 @@ def _build_mini_tinyllama_gguf() raises -> List[UInt8]:
 
         _write_string_gguf(buf, lp + "attn_q.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, q_dim)
         _write_u64_le(buf, hidden)
+        _write_u64_le(buf, q_dim)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += q_dim * hidden * 4
 
         _write_string_gguf(buf, lp + "attn_k.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, kv_dim)
         _write_u64_le(buf, hidden)
+        _write_u64_le(buf, kv_dim)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += kv_dim * hidden * 4
 
         _write_string_gguf(buf, lp + "attn_v.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, kv_dim)
         _write_u64_le(buf, hidden)
+        _write_u64_le(buf, kv_dim)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += kv_dim * hidden * 4
 
         _write_string_gguf(buf, lp + "attn_output.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, hidden)
         _write_u64_le(buf, q_dim)
+        _write_u64_le(buf, hidden)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += hidden * q_dim * 4
@@ -267,24 +267,24 @@ def _build_mini_tinyllama_gguf() raises -> List[UInt8]:
 
         _write_string_gguf(buf, lp + "ffn_gate.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, ffn_dim)
         _write_u64_le(buf, hidden)
+        _write_u64_le(buf, ffn_dim)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += ffn_dim * hidden * 4
 
         _write_string_gguf(buf, lp + "ffn_up.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, ffn_dim)
         _write_u64_le(buf, hidden)
+        _write_u64_le(buf, ffn_dim)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += ffn_dim * hidden * 4
 
         _write_string_gguf(buf, lp + "ffn_down.weight")
         _write_u32_le(buf, 2)
-        _write_u64_le(buf, hidden)
         _write_u64_le(buf, ffn_dim)
+        _write_u64_le(buf, hidden)
         _write_u32_le(buf, 0)
         _write_u64_le(buf, data_cursor)
         data_cursor += hidden * ffn_dim * 4

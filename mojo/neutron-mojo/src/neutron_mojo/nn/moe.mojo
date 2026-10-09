@@ -65,7 +65,7 @@ struct MoERouter(Movable):
     var top_k: Int
     var hidden_dim: Int
 
-    def __init__(out self, num_experts: Int, top_k: Int, hidden_dim: Int):
+    def __init__(out self, num_experts: Int, top_k: Int, hidden_dim: Int) raises:
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_dim = hidden_dim
@@ -77,7 +77,7 @@ struct MoERouter(Movable):
         self.top_k = move.top_k^
         self.hidden_dim = move.hidden_dim^
 
-    def route(self, x: Tensor[DType.float32]) -> RoutingResult:
+    def route(self, x: Tensor[DType.float32]) raises -> RoutingResult:
         """Compute routing for a single token.
 
         Args:
@@ -176,7 +176,7 @@ struct ExpertWeights(Movable):
     var expert_dim: Int
     var expert_stride: Int  # Elements per expert
 
-    def __init__(out self, num_experts: Int, hidden_dim: Int, expert_dim: Int):
+    def __init__(out self, num_experts: Int, hidden_dim: Int, expert_dim: Int) raises:
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.expert_dim = expert_dim
@@ -208,7 +208,7 @@ def expert_ffn(
     x: Tensor[DType.float32],
     weights: ExpertWeights,
     expert_id: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Run a single expert's FFN: SwiGLU(gate, up) → down.
 
     Args:
@@ -249,7 +249,7 @@ def moe_forward(
     x: Tensor[DType.float32],
     router: MoERouter,
     expert_weights: ExpertWeights,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Full MoE forward pass for a single token.
 
     Routes to top-k experts, runs each expert FFN, combines with routing weights.

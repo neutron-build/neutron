@@ -33,6 +33,7 @@ from .dlpack import (
 )
 
 from .exchange import (
+    OwnedDLPackTensor,
     tensor_to_dlpack,
     dlpack_to_tensor,
     dlpack_shape,

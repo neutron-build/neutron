@@ -33,7 +33,7 @@ struct SGD(Movable):
         self.velocity = move.velocity^
         self.initialized = move.initialized^
 
-    def step(mut self, mut tape: Tape, param_indices: List[Int]):
+    def step(mut self, mut tape: Tape, param_indices: List[Int]) raises:
         """Perform one SGD update step."""
         # Initialize velocity on first call
         if not self.initialized:

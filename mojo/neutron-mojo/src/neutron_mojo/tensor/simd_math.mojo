@@ -148,7 +148,7 @@ def simd_rmsnorm(
     w_offset: Int,
     n: Int,
     eps: Float32 = 1e-6,
-):
+) raises:
     """Fused RMSNorm: out = (x / rms(x)) * weight.
 
     Two passes: (1) compute sum of squares, (2) normalize + scale.
@@ -202,7 +202,7 @@ def simd_softmax(
     x: Tensor[DType.float32],
     x_offset: Int,
     n: Int,
-):
+) raises:
     """Numerically stable softmax: out = exp(x - max(x)) / sum(exp(x - max(x))).
 
     Three passes: (1) find max, (2) exp and sum, (3) normalize.
@@ -315,7 +315,7 @@ def simd_axpy(
     x_offset: Int,
     alpha: Float32,
     n: Int,
-):
+) raises:
     """BLAS-style axpy: y = y + alpha * x.
 
     Used for residual connections, LoRA delta addition, etc.
@@ -383,8 +383,7 @@ def par_simd_matvec(
     var o_ptr = out.data_ptr() + out_offset
     var simd_end = (cols // F32_SIMD_WIDTH) * F32_SIMD_WIDTH
 
-    @parameter
-    def compute_row(i: Int):
+    def compute_row(i: Int) {imm}:
         var row_ptr = w_ptr + i * cols
         var acc = SIMD[DType.float32, F32_SIMD_WIDTH](0)
 
@@ -399,7 +398,7 @@ def par_simd_matvec(
 
         o_ptr[i] = dot
 
-    parallelize[compute_row](rows, num_physical_cores())
+    parallelize(compute_row, rows, num_physical_cores())
 
 
 # ===----------------------------------------------------------------------=== #
@@ -751,8 +750,7 @@ def par_tiled_simd_matvec(
     var o_ptr = out.data_ptr() + out_offset
     var simd_end = (cols // F32_SIMD_WIDTH) * F32_SIMD_WIDTH
 
-    @parameter
-    def compute_row(i: Int):
+    def compute_row(i: Int) {imm}:
         var row_ptr = w_ptr + i * cols
         var acc = SIMD[DType.float32, F32_SIMD_WIDTH](0)
 
@@ -767,7 +765,7 @@ def par_tiled_simd_matvec(
 
         o_ptr[i] = dot
 
-    parallelize[compute_row](rows, num_physical_cores())
+    parallelize(compute_row, rows, num_physical_cores())
 
 
 # ===----------------------------------------------------------------------=== #
@@ -827,7 +825,7 @@ def simd_attention_weighted_sum(
     v_stride: Int,
     seq_len: Int,
     head_dim: Int,
-):
+) raises:
     """Compute weighted sum of values: out = sum(weights[pos] * v[pos]).
 
     SIMD-vectorized value accumulation across cached positions.
@@ -875,7 +873,7 @@ def simd_online_softmax_attention(
     seq_len: Int,
     head_dim: Int,
     scale: Float32,
-):
+) raises:
     """Single-head attention with online softmax (Flash Attention style).
 
     Computes attention in a single pass over K/V without materializing
@@ -1010,7 +1008,7 @@ def simd_batch_rmsnorm(
     batch: Int,
     dim: Int,
     eps: Float32 = 1e-6,
-):
+) raises:
     """Batch RMSNorm: apply RMSNorm to each vector in a batch.
 
     For each b in [0, batch): normalize x[b*dim : (b+1)*dim] with shared gamma.
@@ -1077,7 +1075,7 @@ def simd_batch_add(
     b_offset: Int,
     batch: Int,
     dim: Int,
-):
+) raises:
     """Batch element-wise addition: out = a + b for each vector in batch.
 
     Args:

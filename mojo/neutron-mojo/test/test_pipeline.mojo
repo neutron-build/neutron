@@ -58,6 +58,8 @@ def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 def _build_tiny_model() raises -> Model:
     """Create a tiny model with populated weights."""
     var p = tiny_test_params()
+    # EOS test uses a 100-token budget; align context capacity with it.
+    p.max_seq_len = 256
     var model = Model(p)
 
     # Populate with small deterministic weights

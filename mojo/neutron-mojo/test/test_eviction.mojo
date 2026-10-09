@@ -407,8 +407,10 @@ def test_generation_with_streaming_eviction() raises:
             model.layer_weights.set(off.attn_norm + i, 1.0)
             model.layer_weights.set(off.ffn_norm + i, 1.0)
 
-    # Create a small cache that will overflow
-    var max_seq = 8
+    # Create a small cache whose *policy budget* (sink=2 + window=4) is smaller
+    # than the run so eviction still trims; capacity must cover absolute
+    # positions (strict admission checks pos against cache/rope capacity).
+    var max_seq = 16
     var cache = MultiLayerKVCache(
         num_layers=params.num_layers, max_seq_len=max_seq,
         num_kv_heads=params.num_kv_heads, head_dim=params.head_dim,

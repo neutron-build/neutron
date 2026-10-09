@@ -845,12 +845,19 @@ regression unless marked otherwise.
 
 ### Mojo (uncompiled — see note)
 
-NOTE: no Mojo toolchain exists on this machine (`mojo` not found; the pack
-installed none). The four fixes below are each a provable by-inspection
-one-line/one-constant correction against the two signatures involved;
-everything else in the MJ clusters is DEFERRED with that stated reason.
-They are UNVERIFIED BY COMPILER AND TESTS — the continuation pass must run
-`mojo test` before landing them.
+NOTE (superseded 2026-10-09 — see "Mojo r2 reconciliation" below): a Mojo
+toolchain now exists in the worktree (`mojo/neutron-mojo/.pixi/envs/default`,
+MAX-activated) and the full core suite runs: **141/141 pass**
+(`bash scripts/validate-core.sh`, report `mojo/reports/core-validation-20261009T002622Z.*`,
+git-ignored). The four fixes below are now compiler- and test-verified as part
+of that run. The original deferral note is retained for history:
+
+NOTE (original): no Mojo toolchain exists on this machine (`mojo` not found;
+the pack installed none). The four fixes below are each a provable
+by-inspection one-line/one-constant correction against the two signatures
+involved; everything else in the MJ clusters is DEFERRED with that stated
+reason. They are UNVERIFIED BY COMPILER AND TESTS — the continuation pass must
+run `mojo test` before landing them.
 
 - MJ-02 | FIXED (uncompiled) — FP16 subnormal decode initialized the
   normalization exponent at −1, halving every nonzero subnormal
@@ -873,6 +880,87 @@ They are UNVERIFIED BY COMPILER AND TESTS — the continuation pass must run
   semantics, e-graph rebuilds, randn/streaming boundaries). Reason: no
   Mojo toolchain on this machine; blind-editing numerical kernels without
   compilation or tests would be unverifiable. Continuation entry below.
+
+### Mojo r2 reconciliation (2026-10-09, branch `audit/mojo-r2`)
+
+The r2 candidate's production code (dirty tree, uncommitted) makes
+previously-lenient admission paths strictly refuse invalid inputs instead of
+silently defaulting. Its test suite expected the lenient behavior, so 29 of
+141 core tests failed on unhandled refusals. All 29 were reconciled by
+updating the TESTS to the strict contract (production checks were not
+weakened); final state **141/141 pass** under
+`cd mojo && bash scripts/validate-core.sh`
+(import path `-I src` + MAX activation via
+`.pixi/envs/default/etc/conda/activate.d/10-activate-max.sh`).
+Four conversion archetypes, per test:
+
+1. STRICT-REFUSAL (assert the refusal; matches the two examples already
+   landed in `test_architecture.mojo` / `test_auto_config.mojo`):
+   `test_multi_arch` (Phi pre-norm-bias, Gemma adapter, Mistral sliding
+   window, Q8 specialized-path partial-rotary — each converted to
+   try/except-refused; Phi keeps an aligned `RoPETable(head_dim, seq, theta,
+   rotary_dim)` so the intended norm-bias refusal fires, not an incidental
+   RoPE mismatch).
+2. FIXTURE-ALIGN (fixtures must produce strictly valid inputs):
+   - GGUF spec conformance: tensor dims written fastest-varying-first
+     (reverse of row-major `expected_weight_shape`), offsets multiple of
+     `general.alignment` (32), data section padded so the aligned data
+     offset fits, Q8_0/Q4_0 tensors holding whole 32-element blocks with
+     32-divisible fastest dim: `test_gguf_parser` (alignment padding),
+     `test_gguf_names`, `test_mmap_reader` (+ `llama.vocab_size` metadata),
+     `test_model_loading` (register_tensor offset 144→160),
+     `test_quant_weight_reader` (fixtures resized hidden=32/vocab=32),
+     `test_weight_reader`, `test_validation`, `test_sprint10_integration`,
+     `test_sprint11_integration`, `test_direct_q8_loading` (fixtures
+     redesigned to hidden=32/q_dim=32/kv_dim=8/ffn=32/vocab=32).
+   - Context/RoPE capacity: `max_seq_len`/rope table sized to prompt+budget
+     (char-tokenized templates need far more than the 32-token default):
+     `test_conversation` (512; vocab 32 per its 32-id tokenizer),
+     `test_eviction` (cache/rope 16; eviction still bounds lengths),
+     `test_mixed_pipeline` (256, vocab 32), `test_pipeline` (256),
+     `test_q8_cache_pipeline` (256), `test_scheduler` and
+     `test_paged_scheduler` (vocab 32 + scheduler built from model params).
+   - Autograd operand shapes: `tracked_matmul`/`tracked_add` require 2-D,
+     equal shapes: `test_sprint61_72_integration` (`_make_var2d` helper).
+   - Fusion-engine contracts: scalar constants via `EGraph.add_scalar_f32`
+     (payload-checked), identity/commutativity rules run under
+     `RewriteEngine(fast_math=True)` + `create_default_ruleset(fast_math=True)`
+     (11 rules), opaque leaves keep auto-assigned distinct symbols (fake
+     `ClassId(999)`-style inputs now crash the union-find and were removed):
+     `test_fusion_complete`, `test_fusion_forward`, `test_fusion_integration`
+     (hash-consing test converted: bare Input leaves are DISTINCT by design;
+     structurally identical composites hash-cons).
+3. TOOLCHAIN/STDLIB MODERNIZATION (test-only compile fixes, no behavior
+   change): reserved keywords `alias`/`match`/`case` renamed;
+   `List[T](...)` variadic construction replaced by appends; `Array`-literal
+   arguments converted to the declared `List` types; `Int` literals wrapped
+   `Float32(...)` where implicit conversion is refused; stdlib
+   `assert_equal` requires `Equatable & Writable` so `ClassId`/`Shape`/
+   `ArchitectureKind` comparisons moved to `assert_true(a == b)`:
+   `test_r2_boundary_oracles`, `test_r2_container_oracles`,
+   `test_r2_dlpack_oracles`, `test_r2_prefix_oracles`,
+   `test_r2_sequence_oracle`, `test_r2_training_oracles`,
+   `test_tensor_boundary_regressions`.
+4. PRODUCTION DEFECTS FOUND AND FIXED (one src change, documented):
+   - `nn/tokenizer.mojo` `BPETokenizer.decode_bytes` (candidate-added) read
+     symbol bytes with `ord(symbol[byte=p])` written against raw-byte
+     indexing semantics; in this toolchain `String[byte=i]` returns the
+     CODEPOINT at boundary `i` (and asserts on mid-codepoint indices), so
+     GPT-2 byte-vocab symbols (chr(256+n), 2-byte UTF-8) crashed with
+     "String span index … does not lie on a codepoint boundary". Rewritten
+     to iterate codepoints and advance by each one's UTF-8 width — exactly
+     equivalent to the intended raw-byte recombination, verified by the
+     GPT-2 roundtrip + published `Ġ`/`Ċ` anchors in
+     `test_r2_boundary_oracles`.
+   - Documented caveat (NOT fixed; repo-code workaround only): chained
+     `tensor.data_ptr()[i]` subscript reads return wrong values in some
+     expression contexts under this Mojo build (verified in isolation;
+     `_storage.load`/`Tensor.get` are correct). `test_r2_dlpack_oracles`
+     reads its imported scalar via `.get()` and notes why. Any future test
+     writing dense `data_ptr()[i]` assertions should prefer `.get()`.
+
+No other production code was changed; the strict refusals are the
+candidate's intent and all remain in force.
 
 ### Deferred remainder (precise)
 
@@ -1571,7 +1659,7 @@ receipts/reports, git history, and current source.
 | neutron-c-ts-fix-r3 (67) | TS-F01..21 + NF-NR-18, objections O1–O4 | **covered-by-landed** — 60/67 files byte-identical to main (this worktree was one of the three killed attempts Pass C salvaged). The 7 differing files are Pass C's completions: `canonicalContentRoot` (`/var` vs `/private/var` root-key unification = the TS-F19 invalidation fix), NF-NR-10/11 camera/notifications lifecycle test extensions, `sharedCacheSafe` opt-in in protocol-e2e, and lockfile/manifest integration. O1–O4 contracts landed as Pass C's `cache-capture.ts`/`cache-publication.ts` + `AtomicCachePublication` opt-in, committed-reconciliation client fencing, and root-generation refresh fences. |
 | neutron-c-studio-fix-r5 (79) | NF-STUDIO-01..14 + R4-01..03 + five-panel sibling work | **covered-by-landed** — 70/79 files byte-identical to main (second killed attempt salvaged by Pass C). The 9 differing files are Pass C's corrections to the ported work — the duplicated `export export` keyword (the exact defect named in the Pass C commit), `role: 'button' as const`, SchemaDesigner new-index draft discard (the flagged draft-loss fix) — plus execution of the test-debt retirement (obsolete render tests deleted on main). |
 | neutron-c-platform (95) | NF-DESK-01..07, NF-NATIVE-01..06, NF-GAP-01..09, NF-CI-01 | **covered-by-landed** — 51/95 files byte-identical to main (third killed attempt salvaged by Pass C). All 44 differing files were direction-checked: main-only lines dominate (e.g. OTA client gained generation-fenced `checking`/`owned()` session semantics beyond the frozen candidate; updater/security/CI files extended). Main is the completed, re-tested successor per Pass C's salvage record. |
-| neutron-mojo-r2 (96) | all 38 MJ IDs | **mixed / remains deferred** — 0/96 files on main; the patch is fully disjoint source work. MJ-02, MJ-16, MJ-K12, MJ-K17 are **covered-by-landed** (Pass A's four surgical fixes; the r2 candidate is based on `fa9cc9bb` and preserves all four while extending further). The remaining 34 IDs are **not-applicable to landing now**: Pass A's recorded deferral (no Mojo toolchain exists locally; blind-editing numerical kernels without compilation would be unverifiable) still holds — the r2 candidate itself declares every item UNEXECUTED under the same missing toolchain. The frozen patch (SHA-256 in its receipts, checkpoints 1–6) remains the ready starting point for a toolchain-equipped continuation; landing it now would contradict the deferral rationale and this repo's accuracy discipline. |
+| neutron-mojo-r2 (96) | all 38 MJ IDs | **mixed — reconciled on branch, not landed** — 0/96 files on main; the patch is fully disjoint source work. MJ-02, MJ-16, MJ-K12, MJ-K17 are **covered-by-landed** (Pass A's four surgical fixes; the r2 candidate is based on `fa9cc9bb` and preserves all four while extending further). Update 2026-10-09: a Mojo toolchain now exists locally; on branch `audit/mojo-r2` the candidate's tree was executed for the first time and its 29 failing tests reconciled to the strict contracts (see "Mojo r2 reconciliation" above) — **141/141 core tests pass** there (dirty tree, uncommitted). The remaining 34 IDs are still **not landed on main**; the validated branch is now the ready starting point for a review-and-land decision instead of a blind deferral. |
 
 Net result: **no LANDED-MISSED-THIS finding survived verification** — every
 defect the codex lane's B/C patches targeted is closed on main, mostly with

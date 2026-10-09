@@ -94,36 +94,36 @@ struct ChatCompletionResponse(Movable):
 # ===----------------------------------------------------------------------=== #
 
 def _escape_json_string(s: String) -> String:
-    """Escape special characters for JSON string value."""
-    var out = String("")
+    """Escape ASCII controls while preserving complete UTF-8 text bytes."""
+    var out = List[UInt8]()
+    var hex = String("0123456789abcdef")
     for i in range(s.byte_length()):
         var c = ord(s[byte=i])
-        if c == ord('"'):
-            out += '\\"'
-        elif c == ord('\\'):
-            out += '\\\\'
-        elif c == ord('\n'):
-            out += '\\n'
-        elif c == ord('\r'):
-            out += '\\r'
-        elif c == ord('\t'):
-            out += '\\t'
+        if c == 34 or c == 92:
+            out.append(92)
+            out.append(UInt8(c))
+        elif c < 32:
+            out.append(92)
+            out.append(117)
+            out.append(48)
+            out.append(48)
+            out.append(UInt8(ord(hex[byte=c // 16])))
+            out.append(UInt8(ord(hex[byte=c % 16])))
         else:
-            # Direct byte append — safe for ASCII
-            out += chr(Int(c))
-    return out^
+            out.append(UInt8(c))
+    return String(unsafe_from_utf8=out)
 
 
 def format_chat_response(resp: ChatCompletionResponse) -> String:
     """Format response as OpenAI-compatible JSON."""
     var json = String('{"id":"')
-    json += resp.id
+    json += _escape_json_string(resp.id)
     json += '","object":"chat.completion","model":"'
-    json += resp.model
+    json += _escape_json_string(resp.model)
     json += '","choices":[{"index":0,"message":{"role":"assistant","content":"'
     json += _escape_json_string(resp.content)
     json += '"},"finish_reason":"'
-    json += resp.finish_reason
+    json += _escape_json_string(resp.finish_reason)
     json += '"}],"usage":{"prompt_tokens":'
     json += String(resp.prompt_tokens)
     json += ',"completion_tokens":'

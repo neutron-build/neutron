@@ -40,7 +40,7 @@ struct Q8Weight(Movable):
     var block_size: Int
     var num_blocks_per_row: Int
 
-    def __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32):
+    def __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32) raises:
         """Create storage for Q8_0 quantized weights.
 
         Args:
@@ -70,7 +70,7 @@ def quantize_weight_q8(
     out_features: Int,
     in_features: Int,
     block_size: Int = 32,
-) -> Q8Weight:
+) raises -> Q8Weight:
     """Quantize an FP32 weight matrix to Q8_0.
 
     Args:
@@ -129,7 +129,7 @@ def quantize_weight_q8(
 def q8_linear(
     x: Tensor[DType.float32],
     qw: Q8Weight,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Quantized linear projection: y = dequant(W_q) @ x.
 
     SIMD-accelerated dequant-on-the-fly. Scale is factored out of
@@ -167,7 +167,7 @@ struct Q4Weight(Movable):
     var block_size: Int
     var num_blocks_per_row: Int
 
-    def __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32):
+    def __init__(out self, out_features: Int, in_features: Int, block_size: Int = 32) raises:
         self.out_features = out_features
         self.in_features = in_features
         self.block_size = block_size
@@ -191,7 +191,7 @@ def quantize_weight_q4(
     out_features: Int,
     in_features: Int,
     block_size: Int = 32,
-) -> Q4Weight:
+) raises -> Q4Weight:
     """Quantize an FP32 weight matrix to Q4_0 (symmetric 4-bit).
 
     Maps values to [-8, 7] range.
@@ -248,7 +248,7 @@ def quantize_weight_q4(
 def q4_linear(
     x: Tensor[DType.float32],
     qw: Q4Weight,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Quantized linear with Q4_0 weights.
 
     Args:

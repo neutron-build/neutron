@@ -14,7 +14,7 @@ from neutron_mojo.train.losses import (
 )
 
 
-def _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32]) raises -> Int:
     """Helper: create a tape variable from a list of values."""
     var dims = List[Int]()
     dims.append(len(vals))

@@ -72,7 +72,7 @@ struct TransformerWeights(Movable):
         num_kv_heads: Int,
         head_dim: Int,
         ffn_dim: Int,
-    ):
+    ) raises:
         """Create transformer weights (initialized to zeros).
 
         Args:

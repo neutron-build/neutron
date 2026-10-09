@@ -180,12 +180,13 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     # Track byte offsets
     var data_cursor = 0
 
-    # token_embd [vocab, hidden] = 64 floats = 256 bytes
+    # token_embd row-major [vocab, hidden] = 64 floats = 256 bytes
+    # (GGUF dims are fastest-varying-first; offsets stay 32-aligned)
     var embed_numel = vocab * hidden
     _write_string_gguf(buf, "token_embd.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, vocab)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, vocab)
     _write_u32_le(buf, 0)   # F32
     _write_u64_le(buf, data_cursor)
     data_cursor += embed_numel * 4
@@ -198,11 +199,12 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     _write_u64_le(buf, data_cursor)
     data_cursor += hidden * 4
 
-    # output [vocab, hidden] = 64 floats = 256 bytes
+    # output row-major [vocab, hidden] = 64 floats = 256 bytes
+    data_cursor = _align_offset(data_cursor, GGUF_DEFAULT_ALIGNMENT)
     _write_string_gguf(buf, "output.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, vocab)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, vocab)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += vocab * hidden * 4
@@ -215,38 +217,39 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     _write_u64_le(buf, data_cursor)
     data_cursor += hidden * 4
 
-    # blk.0.attn_q [q_dim, hidden]
+    # blk.0.attn_q row-major [q_dim, hidden]
+    data_cursor = _align_offset(data_cursor, GGUF_DEFAULT_ALIGNMENT)
     _write_string_gguf(buf, "blk.0.attn_q.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, q_dim)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, q_dim)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += q_dim * hidden * 4
 
-    # blk.0.attn_k [kv_dim, hidden]
+    # blk.0.attn_k row-major [kv_dim, hidden]
     _write_string_gguf(buf, "blk.0.attn_k.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, kv_dim)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, kv_dim)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += kv_dim * hidden * 4
 
-    # blk.0.attn_v [kv_dim, hidden]
+    # blk.0.attn_v row-major [kv_dim, hidden]
     _write_string_gguf(buf, "blk.0.attn_v.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, kv_dim)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, kv_dim)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += kv_dim * hidden * 4
 
-    # blk.0.attn_output [hidden, q_dim]
+    # blk.0.attn_output row-major [hidden, q_dim]
     _write_string_gguf(buf, "blk.0.attn_output.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, hidden)
     _write_u64_le(buf, q_dim)
+    _write_u64_le(buf, hidden)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += hidden * q_dim * 4
@@ -259,29 +262,30 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     _write_u64_le(buf, data_cursor)
     data_cursor += hidden * 4
 
-    # blk.0.ffn_gate [ffn, hidden]
+    # blk.0.ffn_gate row-major [ffn, hidden]
+    data_cursor = _align_offset(data_cursor, GGUF_DEFAULT_ALIGNMENT)
     _write_string_gguf(buf, "blk.0.ffn_gate.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, ffn_dim)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, ffn_dim)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += ffn_dim * hidden * 4
 
-    # blk.0.ffn_up [ffn, hidden]
+    # blk.0.ffn_up row-major [ffn, hidden]
     _write_string_gguf(buf, "blk.0.ffn_up.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, ffn_dim)
     _write_u64_le(buf, hidden)
+    _write_u64_le(buf, ffn_dim)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += ffn_dim * hidden * 4
 
-    # blk.0.ffn_down [hidden, ffn]
+    # blk.0.ffn_down row-major [hidden, ffn]
     _write_string_gguf(buf, "blk.0.ffn_down.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, hidden)
     _write_u64_le(buf, ffn_dim)
+    _write_u64_le(buf, hidden)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, data_cursor)
     data_cursor += hidden * ffn_dim * 4
@@ -299,6 +303,9 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     # output_norm: hidden = 4 floats (all 1.0)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
+    # alignment padding (16 bytes)
+    for _ in range(16):
+        buf.append(0)
 
     # output/lm_head: vocab*hidden = 64 floats
     for i in range(vocab * hidden):
@@ -307,6 +314,9 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     # blk.0.attn_norm: hidden = 4
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
+    # alignment padding (16 bytes)
+    for _ in range(16):
+        buf.append(0)
 
     # blk.0.attn_q: q_dim*hidden = 16
     for i in range(q_dim * hidden):
@@ -327,6 +337,9 @@ def _build_full_gguf_with_tokenizer() raises -> List[UInt8]:
     # blk.0.ffn_norm: hidden = 4
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
+    # alignment padding (16 bytes)
+    for _ in range(16):
+        buf.append(0)
 
     # blk.0.ffn_gate: ffn*hidden = 32
     for i in range(ffn_dim * hidden):

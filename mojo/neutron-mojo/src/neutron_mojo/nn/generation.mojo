@@ -54,7 +54,7 @@ def apply_frequency_penalty(
     generated_tokens: List[Int],
     frequency_penalty: Float32,
     presence_penalty: Float32,
-):
+) raises:
     """Apply frequency and presence penalties (OpenAI-style).
 
     frequency_penalty: Penalizes tokens proportional to their count.
@@ -237,7 +237,7 @@ def beam_search_step(
     beams: List[BeamEntry],
     beam_width: Int,
     beam_idx: Int,
-) -> List[BeamEntry]:
+) raises -> List[BeamEntry]:
     """Expand one beam by considering all next tokens, return top candidates.
 
     Args:

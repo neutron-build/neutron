@@ -9,6 +9,7 @@ transformer blocks with simplified attention (no KV cache for training).
 """
 
 from std.math import sqrt, exp
+from neutron_mojo.autograd.ops import tracked_slice, tracked_concat_flat, tracked_vector_scale
 
 from neutron_mojo.autograd.tape import Tape, TapeEntry, OP_SOFTMAX
 from neutron_mojo.autograd.ops import (
@@ -90,7 +91,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         self.ffn_dim = move.ffn_dim^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register all parameters on the tape."""
         self.attn_norm.register(tape)
         self.q_proj.register(tape)
@@ -103,7 +104,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         self.down_proj.register(tape)
         self.registered = True
 
-    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """Forward pass through one transformer block (single token).
 
         For a single token, Q @ K^T is a scalar and softmax of one value = 1.0,
@@ -111,18 +112,21 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         """
         return self.forward_with_seq(tape, x_idx, 1)
 
-    def forward_with_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) -> Int:
+    def forward_with_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) raises -> Int:
         """Forward pass through one transformer block with sequence support.
 
         For seq_len=1: single-token optimization (attn = O(V)).
         For seq_len>1: x_idx is (seq_len * hidden_dim), performs real
         causal self-attention with Q @ K^T / sqrt(d) masking.
         """
+        tape.validate_variable(x_idx)
+        if seq_len <= 0 or self.hidden_dim <= 0 or seq_len > 0x7FFFFFFFFFFFFFFF // self.hidden_dim or tape.var_numel(x_idx) != seq_len * self.hidden_dim:
+            raise Error("Transformer training sequence size mismatch")
         if seq_len == 1:
             return self._forward_single(tape, x_idx)
         return self._forward_seq(tape, x_idx, seq_len)
 
-    def _forward_single(self, mut tape: Tape, x_idx: Int) -> Int:
+    def _forward_single(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """Single-token forward: attention is just O(V)."""
         var normed = self.attn_norm.forward(tape, x_idx)
         var q_idx = self.q_proj.forward(tape, normed)
@@ -135,7 +139,7 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         var post_attn = tracked_add(tape, x_idx, attn_out)
         return self._ffn_block(tape, post_attn)
 
-    def _forward_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) -> Int:
+    def _forward_seq(self, mut tape: Tape, x_idx: Int, seq_len: Int) raises -> Int:
         """Multi-token forward with real causal self-attention.
 
         x_idx has shape (seq_len * hidden_dim).
@@ -166,24 +170,16 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         # Residual + FFN for each position, pack into flat output
         return self._seq_residual_ffn(tape, x_idx, attn_outputs, seq_len, hd)
 
-    def _extract_token(self, mut tape: Tape, x_idx: Int, t: Int, hd: Int) -> Int:
-        """Extract token t from flat (seq_len * hd) tensor."""
-        var dims = List[Int]()
-        dims.append(hd)
-        var tok_idx = tape.add_variable(dims^, requires_grad=True)
-        var off = t * hd
-        for d in range(hd):
-            tape.set_data(tok_idx, d, tape.get_data(x_idx, off + d))
-        # Record as identity (reshape/split-like) for backward
-        from neutron_mojo.autograd.tape import OP_SPLIT
-        tape.record(TapeEntry(OP_SPLIT(), x_idx, -1, tok_idx, cached_int=off))
-        return tok_idx
+    def _extract_token(self, mut tape: Tape, x_idx: Int, t: Int, hd: Int) raises -> Int:
+        if t < 0 or hd <= 0 or t > 0x7FFFFFFFFFFFFFFF // hd:
+            raise Error("Invalid sequence token slice")
+        return tracked_slice(tape, x_idx, t * hd, hd)
 
     def _causal_attn_pos(
         self, mut tape: Tape,
         q_list: List[Int], k_list: List[Int], v_list: List[Int],
         t: Int, hd: Int,
-    ) -> Int:
+    ) raises -> Int:
         """Compute causal attention for position t: attn(Q_t, K_{0..t}, V_{0..t}).
 
         Uses tracked_scalar_mul + tracked_add for the weighted sum
@@ -192,55 +188,44 @@ struct TrainableTransformerBlock(ImplicitlyCopyable, Copyable, Movable):
         var scale = 1.0 / sqrt(Float64(hd))
         var num_keys = t + 1
 
-        # Compute scores: Q_t . K_j / sqrt(d)
-        var score_dims = List[Int]()
-        score_dims.append(num_keys)
-        var scores_idx = tape.add_variable(score_dims^, requires_grad=True)
-
+        # Build every Q/K score with tracked multiplication and reduction.
+        var scores_idx = -1
         for j in range(num_keys):
-            var dot_val = Float64(0.0)
-            for d in range(hd):
-                dot_val += Float64(tape.get_data(q_list[t], d)) * Float64(tape.get_data(k_list[j], d))
-            tape.set_data(scores_idx, j, Float32(dot_val * scale))
-
-        # Softmax
+            var product = tracked_mul(tape, q_list[t], k_list[j])
+            var dot = tracked_sum(tape, product)
+            var score = tracked_scalar_mul(tape, dot, scale)
+            if j == 0:
+                scores_idx = score
+            else:
+                scores_idx = tracked_concat_flat(tape, scores_idx, score)
         var attn_weights_idx = tracked_softmax(tape, scores_idx)
-
-        # Weighted sum: out = sum_j w_j * V_j (using tracked ops)
-        var w0 = Float64(tape.get_data(attn_weights_idx, 0))
-        var out_idx = tracked_scalar_mul(tape, v_list[0], w0)
-
+        var w0 = tracked_slice(tape, attn_weights_idx, 0, 1)
+        var out_idx = tracked_vector_scale(tape, v_list[0], w0)
         for j in range(1, num_keys):
-            var wj = Float64(tape.get_data(attn_weights_idx, j))
-            var scaled_vj = tracked_scalar_mul(tape, v_list[j], wj)
-            out_idx = tracked_add(tape, out_idx, scaled_vj)
+            var wj = tracked_slice(tape, attn_weights_idx, j, 1)
+            var scaled = tracked_vector_scale(tape, v_list[j], wj)
+            out_idx = tracked_add(tape, out_idx, scaled)
 
         return out_idx
 
     def _seq_residual_ffn(
         self, mut tape: Tape, x_idx: Int,
         attn_outputs: List[Int], seq_len: Int, hd: Int,
-    ) -> Int:
+    ) raises -> Int:
         """Apply residual + FFN for each position, return flat output."""
-        var out_dims = List[Int]()
-        out_dims.append(seq_len * hd)
-        var result_idx = tape.add_variable(out_dims^, requires_grad=True)
-
+        var result_idx = -1
         for t in range(seq_len):
-            # Extract x_t for residual
             var x_t = self._extract_token(tape, x_idx, t, hd)
-            # Residual: x_t + attn_output_t
             var post_attn = tracked_add(tape, x_t, attn_outputs[t])
-            # FFN
             var ffn_out = self._ffn_block(tape, post_attn)
-            # Pack into result
-            var off = t * hd
-            for d in range(hd):
-                tape.set_data(result_idx, off + d, tape.get_data(ffn_out, d))
+            if t == 0:
+                result_idx = ffn_out
+            else:
+                result_idx = tracked_concat_flat(tape, result_idx, ffn_out)
 
         return result_idx
 
-    def _ffn_block(self, mut tape: Tape, x_idx: Int) -> Int:
+    def _ffn_block(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """FFN sub-block: norm -> gate * up (relu) -> down + residual."""
         var ffn_normed = self.ffn_norm.forward(tape, x_idx)
         var gate = self.gate_proj.forward(tape, ffn_normed)
@@ -307,7 +292,7 @@ struct TrainableLM(Movable):
         self.num_layers = move.num_layers^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register all parameters on the tape."""
         self.embedding.register(tape)
         for i in range(len(self.blocks)):
@@ -316,7 +301,7 @@ struct TrainableLM(Movable):
         self.lm_head.register(tape)
         self.registered = True
 
-    def forward(self, mut tape: Tape, token_id: Int) -> Int:
+    def forward(self, mut tape: Tape, token_id: Int) raises -> Int:
         """Forward pass: token_id -> logits.
 
         Returns the variable index of the logits (shape: vocab_size).
@@ -356,7 +341,7 @@ struct TrainableLM(Movable):
             total += tape.var_numel(params[i])
         return total
 
-    def forward_seq(self, mut tape: Tape, token_ids: List[Int]) -> List[Int]:
+    def forward_seq(self, mut tape: Tape, token_ids: List[Int]) raises -> List[Int]:
         """Forward pass for a sequence: token_ids -> per-position logits.
 
         Embeds all tokens, processes through blocks with causal attention,
@@ -367,15 +352,19 @@ struct TrainableLM(Movable):
         var seq_len = len(token_ids)
         var hd = self.hidden_dim
 
-        # Embed all tokens into flat (seq_len * hidden_dim)
-        var flat_dims = List[Int]()
-        flat_dims.append(seq_len * hd)
-        var x_idx = tape.add_variable(flat_dims^, requires_grad=True)
+        if seq_len <= 0 or hd <= 0 or seq_len > 0x7FFFFFFFFFFFFFFF // hd:
+            raise Error("Invalid training sequence shape")
+        # Validate all tokens before embedding or creating graph state.
+        for t in range(seq_len):
+            if token_ids[t] < 0 or token_ids[t] >= self.vocab_size:
+                raise Error("Training token outside vocabulary")
+        var x_idx = -1
         for t in range(seq_len):
             var emb_t = self.embedding.forward(tape, token_ids[t])
-            var off = t * hd
-            for d in range(hd):
-                tape.set_data(x_idx, off + d, tape.get_data(emb_t, d))
+            if t == 0:
+                x_idx = emb_t
+            else:
+                x_idx = tracked_concat_flat(tape, x_idx, emb_t)
 
         # Process through transformer blocks
         for i in range(len(self.blocks)):
@@ -384,19 +373,14 @@ struct TrainableLM(Movable):
         # Extract each position, norm, and project to logits
         var logits_list = List[Int]()
         for t in range(seq_len):
-            var tok_dims = List[Int]()
-            tok_dims.append(hd)
-            var x_t = tape.add_variable(tok_dims^, requires_grad=True)
-            var off = t * hd
-            for d in range(hd):
-                tape.set_data(x_t, d, tape.get_data(x_idx, off + d))
+            var x_t = tracked_slice(tape, x_idx, t * hd, hd)
             var normed = self.final_norm.forward(tape, x_t)
             var logits = self.lm_head.forward(tape, normed)
             logits_list.append(logits)
         return logits_list^
 
 
-def causal_lm_loss(mut tape: Tape, model: TrainableLM, token_id: Int, target_id: Int) -> Int:
+def causal_lm_loss(mut tape: Tape, model: TrainableLM, token_id: Int, target_id: Int) raises -> Int:
     """Compute language modeling loss for a single token prediction.
 
     Forward passes the token through the model and computes

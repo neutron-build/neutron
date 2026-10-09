@@ -16,7 +16,7 @@ from std.math import exp, sqrt, tanh, log
 from neutron_mojo.tensor.tensor import Tensor
 from .tape import (
     Tape, TapeEntry,
-    OP_ADD, OP_MUL, OP_MATMUL, OP_RELU, OP_SIGMOID, OP_TANH,
+    OP_ADD, OP_MUL, OP_MATMUL, OP_MATMUL_RIGHT_TRANSPOSE, OP_BIAS_ADD, OP_VECTOR_SCALE, OP_RELU, OP_SIGMOID, OP_TANH,
     OP_EXP, OP_LOG, OP_SOFTMAX, OP_SUM, OP_MEAN, OP_SUB,
     OP_DIV, OP_POW, OP_SQRT, OP_NEG, OP_CLAMP, OP_SCALAR_MUL,
     OP_RMSNORM, OP_LAYERNORM, OP_GELU, OP_SILU, OP_SWIGLU,
@@ -29,13 +29,24 @@ from .tape import (
 comptime BACKWARD_SIMD_WIDTH = 4
 
 
-def run_backward(mut tape: Tape, loss_var_idx: Int):
+def run_backward(mut tape: Tape, loss_var_idx: Int) raises:
     """Run backward pass: seed loss gradient with 1.0, reverse-walk tape.
 
     Args:
         tape: The autograd tape with recorded operations.
         loss_var_idx: The variable index of the scalar loss.
     """
+    tape.validate_variable(loss_var_idx)
+    if tape.var_numel(loss_var_idx) != 1:
+        raise Error("Backward requires a scalar loss")
+    for entry_idx in range(tape.num_entries()):
+        tape.validate_entry(tape.get_entry(entry_idx))
+    # Walk only the ancestry of this loss. Disconnected NaN branches must
+    # not enter derivative kernels even with zero upstream gradients.
+    var reachable = List[Bool]()
+    for _ in range(tape.num_variables()):
+        reachable.append(False)
+    reachable[loss_var_idx] = True
     # Seed loss gradient
     tape.set_grad(loss_var_idx, 0, Float32(1.0))
 
@@ -44,14 +55,30 @@ def run_backward(mut tape: Tape, loss_var_idx: Int):
     var i = num_entries - 1
     while i >= 0:
         var entry = tape.get_entry(i)
-        _dispatch_backward(tape, entry)
+        if reachable[entry.output_idx]:
+            _dispatch_backward(tape, entry)
+            if entry.input0_idx >= 0:
+                reachable[entry.input0_idx] = True
+            if entry.input1_idx >= 0:
+                reachable[entry.input1_idx] = True
+            if entry.op_kind == OP_LAYERNORM():
+                reachable[entry.cached_int3] = True
         i -= 1
 
 
 def _dispatch_backward(mut tape: Tape, entry: TapeEntry):
     """Dispatch to the appropriate backward function based on op code."""
     var op = entry.op_kind
-    if op == OP_ADD():
+    if op == OP_VECTOR_SCALE():
+        for i in range(tape.var_numel(entry.output_idx)):
+            var g = tape.get_grad(entry.output_idx, i)
+            tape.accumulate_grad(entry.input0_idx, i, g * tape.get_data(entry.input1_idx, 0))
+            tape.accumulate_grad(entry.input1_idx, 0, g * tape.get_data(entry.input0_idx, i))
+    elif op == OP_MATMUL_RIGHT_TRANSPOSE():
+        _backward_matmul_right_transpose(tape, entry)
+    elif op == OP_BIAS_ADD():
+        _backward_bias_add(tape, entry)
+    elif op == OP_ADD():
         _backward_add(tape, entry)
     elif op == OP_SUB():
         _backward_sub(tape, entry)
@@ -557,7 +584,7 @@ def _backward_rmsnorm(mut tape: Tape, entry: TapeEntry):
 
     y = (x / rms) * gamma, where rms = sqrt(mean(x^2) + eps).
     d_gamma[i] = grad_out[i] * x[i] / rms
-    d_x[i] = gamma[i] * (grad_out[i] / rms - x[i] * dot / (n * rms^3))
+    d_x[i] = gamma[i] * grad_out[i] / rms - x[i] * dot / (n * rms^3)
     where dot = sum(grad_out[j] * gamma[j] * x[j])
     """
     var n = entry.cached_int
@@ -592,7 +619,7 @@ def _backward_rmsnorm(mut tape: Tape, entry: TapeEntry):
         var x = Float64(tape.get_data(x_idx, i))
         # d_x
         if x_idx >= 0 and tape.var_requires_grad[x_idx]:
-            var dx = g * (go * inv_rms - x * coeff)
+            var dx = g * go * inv_rms - x * coeff
             tape.accumulate_grad(x_idx, i, Float32(dx))
         # d_gamma
         if gamma_idx >= 0 and tape.var_requires_grad[gamma_idx]:
@@ -856,3 +883,25 @@ def _backward_kl_div(mut tape: Tape, entry: TapeEntry):
             # d/dq = -p/q
             var dq = -p_val / q_val
             tape.accumulate_grad(entry.input1_idx, i, Float32(Float64(loss_grad) * dq))
+
+
+def _backward_matmul_right_transpose(mut tape: Tape, entry: TapeEntry):
+    var M = entry.cached_int
+    var K = entry.cached_int2
+    var N = entry.cached_int3
+    for m in range(M):
+        for n in range(N):
+            var g = tape.get_grad(entry.output_idx, m * N + n)
+            for k in range(K):
+                tape.accumulate_grad(entry.input0_idx, m * K + k,
+                    g * tape.get_data(entry.input1_idx, n * K + k))
+                tape.accumulate_grad(entry.input1_idx, n * K + k,
+                    g * tape.get_data(entry.input0_idx, m * K + k))
+
+
+def _backward_bias_add(mut tape: Tape, entry: TapeEntry):
+    var n = tape.var_numel(entry.output_idx)
+    for i in range(n):
+        var g = tape.get_grad(entry.output_idx, i)
+        tape.accumulate_grad(entry.input0_idx, i, g)
+        tape.accumulate_grad(entry.input1_idx, i % entry.cached_int, g)

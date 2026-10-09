@@ -6,17 +6,21 @@
 
 Format:
     Header: magic(4 bytes "NMF\0") + version(4 bytes u32) + params_len(4 bytes u32)
-    Params: JSON-encoded ModelParams string
+    Params: newline-delimited key=value inference configuration (NMF v2)
     Weights: raw float32 data (layer_weights, embed, final_norm, lm_head)
 
-For quantized models, the format includes quantized int8 data and scale data
-in addition to FP32 norm weights.
+This module serializes FP32 Model storage. Quantized model export requires a
+separate format adapter.
 """
 
 from std.memory import Pointer, alloc
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.model import Model, ModelParams
+from neutron_mojo.io.json import json_parse_int
+from neutron_mojo.io.binary_reader import _u64_to_f64
+from std.math import isfinite
+from std.collections import Dict
 
 
 # ===----------------------------------------------------------------------=== #
@@ -28,15 +32,25 @@ def NMF_MAGIC() -> Int:
 
 
 def NMF_VERSION() -> Int:
-    return 1
+    return 2
 
 
 # ===----------------------------------------------------------------------=== #
 # Params serialization (simple key=value text format)
 # ===----------------------------------------------------------------------=== #
 
-def serialize_params(p: ModelParams) -> String:
-    """Serialize ModelParams to a simple text format."""
+def _float_bits(value: Float64) -> Int:
+    from std.memory import alloc
+    var p = alloc[Float64](1)
+    p.unsafe_store(value)
+    var bits = Int(p.unsafe_bitcast[Int64]().unsafe_load())
+    p.free()
+    return bits
+
+
+def serialize_params(p: ModelParams) raises -> String:
+    """NMF v2 preserves all inference configuration, using exact float bits."""
+    p.validate()
     var s = String("")
     s += "num_layers=" + String(p.num_layers) + "\n"
     s += "vocab_size=" + String(p.vocab_size) + "\n"
@@ -47,69 +61,96 @@ def serialize_params(p: ModelParams) -> String:
     s += "ffn_dim=" + String(p.ffn_dim) + "\n"
     s += "max_seq_len=" + String(p.max_seq_len) + "\n"
     s += "arch=" + p.arch.kind.name() + "\n"
+    s += "rope_theta_bits=" + String(_float_bits(p.rope_theta)) + "\n"
+    s += "use_sliding_window=" + String(Int(p.arch.use_sliding_window)) + "\n"
+    s += "window_size=" + String(p.arch.window_size) + "\n"
+    s += "partial_rotary_factor_bits=" + String(_float_bits(Float64(p.arch.partial_rotary_factor))) + "\n"
+    s += "use_gelu=" + String(Int(p.arch.use_gelu)) + "\n"
+    s += "use_pre_norm_bias=" + String(Int(p.arch.use_pre_norm_bias)) + "\n"
+    s += "rope_scaling_bits=" + String(_float_bits(Float64(p.arch.rope_scaling))) + "\n"
+    s += "norm_eps_bits=" + String(_float_bits(Float64(p.arch.norm_eps))) + "\n"
     return s^
 
 
-def _parse_int_field(data: String, key: String, default: Int) -> Int:
-    """Parse an integer field from serialized params."""
-    var search = key + "="
-    for i in range(data.byte_length() - search.byte_length()):
-        var found = True
-        for j in range(search.byte_length()):
-            if ord(data[byte=i + j]) != ord(search[byte=j]):
-                found = False
+def _params_fields(data: String) raises -> Dict[String,String]:
+    var fields = Dict[String,String]()
+    var start = 0
+    for end in range(data.byte_length()):
+        if ord(data[byte=end]) != 10:
+            continue
+        var line = String(data[byte=start:end])
+        var eq = -1
+        for i in range(line.byte_length()):
+            if ord(line[byte=i]) == 61:
+                eq = i
                 break
-        if found:
-            var start = i + search.byte_length()
-            var end_idx = start
-            while end_idx < data.byte_length() and ord(data[byte=end_idx]) != ord('\n') and ord(data[byte=end_idx]) != ord('\r'):
-                end_idx += 1
-            var result = 0
-            for k in range(start, end_idx):
-                var c = Int(ord(data[byte=k]))
-                if c >= Int(ord('0')) and c <= Int(ord('9')):
-                    result = result * 10 + c - Int(ord('0'))
-            return result
-    return default
+        if eq <= 0:
+            raise Error("Malformed NMF parameter line")
+        var key = String(line[byte=:eq])
+        if key in fields:
+            raise Error("Duplicate NMF parameter")
+        fields[key] = String(line[byte=eq+1:])
+        start = end + 1
+    if start != data.byte_length():
+        raise Error("Unterminated NMF parameter line")
+    return fields^
 
 
-def _parse_string_field(data: String, key: String, default: String) -> String:
-    """Parse a string field from serialized params."""
-    var search = key + "="
-    for i in range(data.byte_length() - search.byte_length()):
-        var found = True
-        for j in range(search.byte_length()):
-            if ord(data[byte=i + j]) != ord(search[byte=j]):
-                found = False
-                break
-        if found:
-            var start = i + search.byte_length()
-            var end_idx = start
-            while end_idx < data.byte_length() and ord(data[byte=end_idx]) != ord('\n') and ord(data[byte=end_idx]) != ord('\r'):
-                end_idx += 1
-            var result = String("")
-            for k in range(start, end_idx):
-                result += chr(Int(ord(data[byte=k])))
-            return result^
-    return default
+def _required_int(fields: Dict[String,String], key: String) raises -> Int:
+    if key not in fields:
+        raise Error("Missing NMF parameter: " + key)
+    var value = fields[key]
+    var parsed = json_parse_int(value, 0)
+    if parsed.pos != value.byte_length():
+        raise Error("Malformed NMF integer")
+    return parsed.value
 
 
-def deserialize_params(data: String) -> ModelParams:
-    """Deserialize ModelParams from text format."""
+def _required_bool(fields: Dict[String,String], key: String) raises -> Bool:
+    var value = _required_int(fields, key)
+    if value != 0 and value != 1:
+        raise Error("Invalid NMF boolean")
+    return value == 1
+
+
+def _required_float(fields: Dict[String,String], key: String) raises -> Float64:
+    var value = _u64_to_f64(UInt64(_required_int(fields,key)))
+    if not isfinite(value):
+        raise Error("Nonfinite NMF configuration")
+    return value
+
+
+def deserialize_params(data: String, legacy_defaults: Bool = False) raises -> ModelParams:
+    """Read v2 configuration; explicit legacy opt-in defaults omitted v1 fields."""
+    var f = _params_fields(data)
     var p = ModelParams()
-    p.num_layers = _parse_int_field(data, "num_layers", 1)
-    p.vocab_size = _parse_int_field(data, "vocab_size", 32000)
-    p.hidden_dim = _parse_int_field(data, "hidden_dim", 4096)
-    p.num_q_heads = _parse_int_field(data, "num_q_heads", 32)
-    p.num_kv_heads = _parse_int_field(data, "num_kv_heads", 8)
-    p.head_dim = _parse_int_field(data, "head_dim", 128)
-    p.ffn_dim = _parse_int_field(data, "ffn_dim", 14336)
-    p.max_seq_len = _parse_int_field(data, "max_seq_len", 2048)
-
-    var arch_name = _parse_string_field(data, "arch", "Llama")
+    p.num_layers = _required_int(f,"num_layers")
+    p.vocab_size = _required_int(f,"vocab_size")
+    p.hidden_dim = _required_int(f,"hidden_dim")
+    p.num_q_heads = _required_int(f,"num_q_heads")
+    p.num_kv_heads = _required_int(f,"num_kv_heads")
+    p.head_dim = _required_int(f,"head_dim")
+    p.ffn_dim = _required_int(f,"ffn_dim")
+    p.max_seq_len = _required_int(f,"max_seq_len")
+    if "arch" not in f:
+        raise Error("Missing NMF architecture")
+    var name = f["arch"]
+    if name != "Llama" and name != "Mistral" and name != "Phi" and name != "Gemma" and name != "Qwen":
+        raise Error("Unsupported NMF architecture")
     from neutron_mojo.model.architecture import arch_from_name
-    p.arch = arch_from_name(arch_name)
-
+    p.arch = arch_from_name(name)
+    if not legacy_defaults:
+        p.rope_theta = _required_float(f,"rope_theta_bits")
+        p.arch.use_sliding_window = _required_bool(f,"use_sliding_window")
+        p.arch.window_size = _required_int(f,"window_size")
+        p.arch.partial_rotary_factor = Float32(_required_float(f,"partial_rotary_factor_bits"))
+        p.arch.use_gelu = _required_bool(f,"use_gelu")
+        p.arch.use_pre_norm_bias = _required_bool(f,"use_pre_norm_bias")
+        p.arch.rope_scaling = Float32(_required_float(f,"rope_scaling_bits"))
+        p.arch.norm_eps = Float32(_required_float(f,"norm_eps_bits"))
+    p.validate()
+    if p.rope_theta <= 0 or p.arch.partial_rotary_factor < 0 or p.arch.partial_rotary_factor > 1 or p.arch.rope_scaling <= 0 or p.arch.norm_eps <= 0 or p.arch.window_size < 0:
+        raise Error("Invalid NMF inference configuration")
     return p^
 
 
@@ -130,13 +171,15 @@ struct NMFBuffer(Movable):
     def __init__(out self, *, deinit move: Self):
         self.data = move.data^
 
-    def _write_u32(mut self, val: Int):
+    def _write_u32(mut self, val: Int) raises:
+        if val < 0 or val > 0xFFFFFFFF:
+            raise Error("NMF unsigned field overflow")
         self.data.append(UInt8(val & 0xFF))
         self.data.append(UInt8((val >> 8) & 0xFF))
         self.data.append(UInt8((val >> 16) & 0xFF))
         self.data.append(UInt8((val >> 24) & 0xFF))
 
-    def _write_f32(mut self, val: Float32):
+    def _write_f32(mut self, val: Float32) raises:
         # Float32 -> UInt32 bits -> 4 LE bytes
         var p = alloc[Float32](1)
         p.store(val)
@@ -147,14 +190,18 @@ struct NMFBuffer(Movable):
         self.data.append(UInt8((bits >> 16) & 0xFF))
         self.data.append(UInt8((bits >> 24) & 0xFF))
 
-    def _read_u32(self, offset: Int) -> Int:
+    def _read_u32(self, offset: Int) raises -> Int:
+        if offset < 0 or offset > len(self.data) or 4 > len(self.data) - offset:
+            raise Error("Truncated NMF field")
         var b0 = Int(self.data[offset])
         var b1 = Int(self.data[offset + 1])
         var b2 = Int(self.data[offset + 2])
         var b3 = Int(self.data[offset + 3])
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
-    def _read_f32(self, offset: Int) -> Float32:
+    def _read_f32(self, offset: Int) raises -> Float32:
+        if offset < 0 or offset > len(self.data) or 4 > len(self.data) - offset:
+            raise Error("Truncated NMF float")
         # 4 LE bytes -> UInt32 bits -> Float32
         var b0 = Int(self.data[offset])
         var b1 = Int(self.data[offset + 1])
@@ -171,7 +218,7 @@ struct NMFBuffer(Movable):
         return len(self.data)
 
 
-def save_model_to_buffer(model: Model) -> NMFBuffer:
+def save_model_to_buffer(model: Model) raises -> NMFBuffer:
     """Save FP32 model to an NMF buffer.
 
     Args:
@@ -180,6 +227,7 @@ def save_model_to_buffer(model: Model) -> NMFBuffer:
     Returns:
         NMFBuffer containing the serialized model.
     """
+    model.validate_storage()
     var buf = NMFBuffer()
 
     # Header: magic + version
@@ -224,7 +272,7 @@ def save_model_to_buffer(model: Model) -> NMFBuffer:
     return buf^
 
 
-def load_model_from_buffer(buf: NMFBuffer) raises -> Model:
+def load_model_from_buffer(buf: NMFBuffer, allow_legacy_defaults: Bool = False) raises -> Model:
     """Load FP32 model from an NMF buffer.
 
     Args:
@@ -239,19 +287,35 @@ def load_model_from_buffer(buf: NMFBuffer) raises -> Model:
         raise Error("Invalid NMF magic number")
 
     var version = buf._read_u32(4)
-    if version != NMF_VERSION():
+    if version != NMF_VERSION() and not (version == 1 and allow_legacy_defaults):
         raise Error("Unsupported NMF version")
 
     # Read params
     var params_len = buf._read_u32(8)
-    var params_str = String("")
+    if params_len > len(buf.data) - 12:
+        raise Error("Truncated NMF parameters")
+    var params_bytes = List[UInt8]()
     for i in range(params_len):
-        params_str += chr(Int(buf.data[12 + i]))
-    var params = deserialize_params(params_str)
+        params_bytes.append(buf.data[12+i])
+    var params_str = String(from_utf8=params_bytes)
+    var params = deserialize_params(params_str, legacy_defaults=version == 1)
 
-    var model = Model(params)
     var offset = 12 + params_len
+    var layer_count = Shape(params.num_layers, params.layer_weight_count()).numel()
+    var matrix_count = Shape(params.vocab_size, params.hidden_dim).numel()
+    var counts = [layer_count, matrix_count, params.hidden_dim, matrix_count]
+    var check_offset = offset
+    for section in range(4):
+        var count = buf._read_u32(check_offset)
+        check_offset += 4
+        if count != counts[section] or count > (len(buf.data) - check_offset) // 4:
+            raise Error("NMF section shape or byte count mismatch")
+        check_offset += count * 4
+    if check_offset != len(buf.data):
+        raise Error("Trailing NMF data")
 
+    # Allocate only after every declared section has passed exact-byte checks.
+    var model = Model(params)
     # Read layer_weights
     var lw_size = buf._read_u32(offset)
     offset += 4

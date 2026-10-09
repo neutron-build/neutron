@@ -38,6 +38,33 @@ from neutron_mojo.nn.pipeline import PipelineConfig, _apply_template
 # Token Event
 # ===----------------------------------------------------------------------=== #
 
+def _utf8_complete_prefix(bytes: List[UInt8]) raises -> Int:
+    """Validate UTF-8 and retain an incomplete final code point for later tokens."""
+    var p = 0
+    while p < len(bytes):
+        var lead = Int(bytes[p])
+        var width = 1
+        if lead >= 194 and lead <= 223:
+            width = 2
+        elif lead >= 224 and lead <= 239:
+            width = 3
+        elif lead >= 240 and lead <= 244:
+            width = 4
+        elif lead >= 128:
+            raise Error("Generated token bytes are invalid UTF-8")
+        var available = min(width, len(bytes) - p)
+        for j in range(1, available):
+            var tail = Int(bytes[p + j])
+            if tail < 128 or tail > 191:
+                raise Error("Generated token bytes are invalid UTF-8")
+            if j == 1 and ((lead == 224 and tail < 160) or (lead == 237 and tail >= 160) or (lead == 240 and tail < 144) or (lead == 244 and tail >= 144)):
+                raise Error("Generated UTF-8 contains an invalid code point")
+        if available < width:
+            return p
+        p += width
+    return p
+
+
 struct TokenEvent(Copyable, Movable, ImplicitlyCopyable):
     """A single token emission from streaming generation.
 
@@ -105,6 +132,7 @@ struct StreamingGenerator(Movable):
     var generated: List[Int]
     var stop_tokens: List[Int]
     var input_len: Int
+    var emitted_bytes: Int
     var step: Int
     var finished: Bool
     var prefilled: Bool
@@ -140,15 +168,16 @@ struct StreamingGenerator(Movable):
         var formatted = _apply_template(prompt, self.config)
         self.input_ids = tokenizer.encode_with_special(formatted, add_bos=self.config.add_bos)
         self.input_len = len(self.input_ids)
+        self.emitted_bytes = 0
 
-        var total_len = self.input_len + self.config.max_new_tokens
+        var total_len = self.config.validate_request(self.input_ids, p, p.max_seq_len)
 
         self.cache = MultiLayerKVCache(
             num_layers=p.num_layers, max_seq_len=total_len,
             num_kv_heads=p.num_kv_heads, head_dim=p.head_dim,
         )
         self.rope = RoPETable(
-            head_dim=p.head_dim, max_seq_len=total_len, theta=p.rope_theta,
+            head_dim=p.head_dim, max_seq_len=total_len, theta=p.rope_theta, rotary_dim=p.rotary_dim(),
         )
         self.sampler = Sampler(self.config.sampler_config)
         self.logits = Tensor[DType.float32](Shape(p.vocab_size))
@@ -161,7 +190,7 @@ struct StreamingGenerator(Movable):
         self.model = model^
         self.tokenizer = tokenizer^
         self.step = 0
-        self.finished = False
+        self.finished = self.config.max_new_tokens == 0
         self.prefilled = False
         self.start_ns = UInt(0)
 
@@ -177,6 +206,7 @@ struct StreamingGenerator(Movable):
         self.stop_tokens = move.stop_tokens^
         self.input_ids = move.input_ids^
         self.input_len = move.input_len^
+        self.emitted_bytes = move.emitted_bytes^
         self.step = move.step^
         self.finished = move.finished^
         self.prefilled = move.prefilled^
@@ -190,7 +220,7 @@ struct StreamingGenerator(Movable):
         """Number of tokens generated so far."""
         return len(self.generated)
 
-    def get_text(self) -> String:
+    def get_text(self) raises -> String:
         """Get all generated text so far."""
         return self.tokenizer.decode(self.generated)
 
@@ -234,13 +264,24 @@ struct StreamingGenerator(Movable):
 
         # Check stop
         if should_stop(next_tok, self.stop_tokens):
+            var bytes = self.tokenizer.decode_bytes(self.generated)
+            if _utf8_complete_prefix(bytes) != len(bytes):
+                raise Error("Generation ended with incomplete UTF-8")
             self.finished = True
             var elapsed = UInt(perf_counter_ns()) - self.start_ns
             return TokenEvent(String(""), next_tok, self.step, True, elapsed)
 
         # Record and advance
         self.generated.append(next_tok)
-        var text = self.tokenizer.decode_single(next_tok)
+        var bytes = self.tokenizer.decode_bytes(self.generated)
+        var complete = _utf8_complete_prefix(bytes)
+        if self.step + 1 >= self.config.max_new_tokens and complete != len(bytes):
+            raise Error("Generation budget ended with incomplete UTF-8")
+        var emitted = List[UInt8]()
+        for i in range(self.emitted_bytes, complete):
+            emitted.append(bytes[i])
+        var text = String(from_utf8=emitted)
+        self.emitted_bytes = complete
         var elapsed = UInt(perf_counter_ns()) - self.start_ns
 
         var event = TokenEvent(text, next_tok, self.step, False, elapsed)

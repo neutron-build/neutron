@@ -35,9 +35,13 @@ def assert_true(cond: Bool, msg: String) raises:
 # Helper builders
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny model for testing (2 layers, vocab=32, dim=16)."""
     var params = tiny_test_params()
+    # Tokenizer has 32 ids (0..31); strict admission rejects out-of-vocab prompts
+    params.vocab_size = 32
+    # Scheduler runs with max_seq_len=256; align model context capacity
+    params.max_seq_len = 256
     var model = Model(params)
     var total = model.layer_weights.numel()
     for i in range(total):
@@ -120,6 +124,8 @@ def test_paged_scheduler_enqueue() raises:
 def test_paged_scheduler_admit() raises:
     """Test admitting requests from queue to active batch."""
     var params = tiny_test_params()
+    # Tokenizer ids go up to 31; strict admission rejects out-of-vocab prompts
+    params.vocab_size = 32
     var sched = PagedBatchScheduler(params, max_batch_size=2, max_seq_len=64)
     var tok = _build_tiny_tokenizer()
 
@@ -139,7 +145,7 @@ def test_paged_scheduler_single_request() raises:
     """Test processing a single request to completion."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=64, theta=params.rope_theta,
     )
@@ -164,7 +170,7 @@ def test_paged_scheduler_multiple_requests() raises:
     """Test processing multiple requests."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=64, theta=params.rope_theta,
     )
@@ -192,7 +198,7 @@ def test_paged_scheduler_batch_overflow() raises:
     """Test that requests beyond batch size wait in queue."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=64, theta=params.rope_theta,
     )
@@ -218,7 +224,7 @@ def test_paged_scheduler_stats() raises:
     """Test that statistics are tracked correctly."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=64, theta=params.rope_theta,
     )
@@ -263,7 +269,7 @@ def test_paged_scheduler_pages_used() raises:
     """Test page usage tracking during processing."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=64, theta=params.rope_theta,
     )
@@ -295,7 +301,7 @@ def test_paged_scheduler_memory_savings() raises:
     """Compare memory usage: paged vs contiguous scheduler."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var max_seq = 64
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=max_seq, theta=params.rope_theta,
@@ -329,7 +335,7 @@ def test_paged_vs_contiguous_output() raises:
     """Verify paged scheduler produces same tokens as contiguous scheduler."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim, max_seq_len=64, theta=params.rope_theta,
     )
@@ -366,6 +372,8 @@ def test_paged_vs_contiguous_output() raises:
 def test_paged_scheduler_peak_batch() raises:
     """Test peak batch size tracking."""
     var params = tiny_test_params()
+    # Tokenizer ids go up to 31; strict admission rejects out-of-vocab prompts
+    params.vocab_size = 32
     var tok = _build_tiny_tokenizer()
     var sched = PagedBatchScheduler(
         params, max_batch_size=4, max_seq_len=64,

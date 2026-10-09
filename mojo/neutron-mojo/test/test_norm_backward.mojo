@@ -13,7 +13,7 @@ from neutron_mojo.train.modules import RMSNormModule, LayerNormModule, Linear
 from neutron_mojo.train.losses import mse_loss
 
 
-def _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) raises -> Int:
     var dims = List[Int]()
     dims.append(len(vals))
     var idx = tape.add_variable(dims^, requires_grad=requires_grad)

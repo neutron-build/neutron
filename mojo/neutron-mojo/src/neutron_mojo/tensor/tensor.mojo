@@ -15,6 +15,7 @@ from std.random import random_float64
 from .shape import Shape
 from .storage import Storage, DeviceKind
 from .view import TensorView
+from std.math import sqrt, log, cos, sin
 
 
 # ===----------------------------------------------------------------------=== #
@@ -33,13 +34,13 @@ struct Tensor[dtype: DType](Writable, Movable):
 
     # --- Constructors ---
 
-    def __init__(out self, shape: Shape):
+    def __init__(out self, shape: Shape) raises:
         """Create a zero-initialized tensor with the given shape."""
         var numel = shape.numel()
         self._storage = Storage[Self.dtype](numel)
         self._view = TensorView[Self.dtype](self._storage.unsafe_ptr(), shape)
 
-    def __init__(out self, *dims: Int):
+    def __init__(out self, *dims: Int) raises:
         """Create a zero-initialized tensor from variadic dimension sizes."""
         var dim_list = List[Int]()
         for i in range(len(dims)):
@@ -49,12 +50,13 @@ struct Tensor[dtype: DType](Writable, Movable):
         self._storage = Storage[Self.dtype](numel)
         self._view = TensorView[Self.dtype](self._storage.unsafe_ptr(), shape)
 
-    def __init__(out self, view: TensorView[Self.dtype]):
+    def __init__(out self, view: TensorView[Self.dtype]) raises:
         """Create an owned tensor by copying data from a (possibly non-contiguous) view.
 
         Use this to materialize a safe owned copy from a transposed, sliced,
         or broadcast view: `var owned = Tensor[dtype](some_view)`
         """
+        view.validate()
         var shape = view.shape.copy()
         var numel = shape.numel()
         self._storage = Storage[Self.dtype](numel)
@@ -73,6 +75,12 @@ struct Tensor[dtype: DType](Writable, Movable):
                 offset += coord * src_strides[d]
             dst.store(i, view._ptr.load(offset))
 
+    def __init__(out self, *, copy_data: Self):
+        """Copy an admitted owned allocation without re-entering admission."""
+        self._storage = Storage[Self.dtype](copy_from=copy_data._storage)
+        self._view = TensorView[Self.dtype](copy=copy_data._view)
+        self._view._ptr = self._storage.unsafe_ptr()
+
     def __init__(out self, *, deinit move: Self):
         """Move constructor."""
         self._storage = move._storage^
@@ -81,26 +89,26 @@ struct Tensor[dtype: DType](Writable, Movable):
     # --- Factory methods ---
 
     @staticmethod
-    def zeros(shape: Shape) -> Tensor[Self.dtype]:
+    def zeros(shape: Shape) raises -> Tensor[Self.dtype]:
         """Create a tensor filled with zeros."""
         return Tensor[Self.dtype](shape)
 
     @staticmethod
-    def ones(shape: Shape) -> Tensor[Self.dtype]:
+    def ones(shape: Shape) raises -> Tensor[Self.dtype]:
         """Create a tensor filled with ones."""
         var t = Tensor[Self.dtype](shape)
         t._storage.fill(Scalar[Self.dtype](1))
         return t^
 
     @staticmethod
-    def full(shape: Shape, value: Scalar[Self.dtype]) -> Tensor[Self.dtype]:
+    def full(shape: Shape, value: Scalar[Self.dtype]) raises -> Tensor[Self.dtype]:
         """Create a tensor filled with a constant value."""
         var t = Tensor[Self.dtype](shape)
         t._storage.fill(value)
         return t^
 
     @staticmethod
-    def rand(shape: Shape) -> Tensor[Self.dtype]:
+    def rand(shape: Shape) raises -> Tensor[Self.dtype]:
         """Create a tensor filled with uniform random values in [0, 1)."""
         var t = Tensor[Self.dtype](shape)
         for i in range(shape.numel()):
@@ -108,12 +116,11 @@ struct Tensor[dtype: DType](Writable, Movable):
         return t^
 
     @staticmethod
-    def randn(shape: Shape) -> Tensor[Self.dtype]:
+    def randn(shape: Shape) raises -> Tensor[Self.dtype]:
         """Create a tensor with approximate standard normal values.
 
         Uses Box-Muller transform on pairs of uniform samples.
         """
-        from std.math import sqrt, log, cos
 
         comptime TWO_PI = 6.283185307179586
 
@@ -128,9 +135,7 @@ struct Tensor[dtype: DType](Writable, Movable):
                 u1 = 1e-15
             var mag = sqrt(-2.0 * log(u1))
             var z0 = mag * cos(TWO_PI * u2)
-            var z1 = mag * sqrt(1.0 - cos(TWO_PI * u2) * cos(TWO_PI * u2))
-            if u2 > 0.5:
-                z1 = -z1
+            var z1 = mag * sin(TWO_PI * u2)
             t._storage.store(i, Scalar[Self.dtype](z0))
             t._storage.store(i + 1, Scalar[Self.dtype](z1))
             i += 2
@@ -138,7 +143,8 @@ struct Tensor[dtype: DType](Writable, Movable):
             var u = random_float64()
             if u < 1e-15:
                 u = 1e-15
-            var z = sqrt(-2.0 * log(u))
+            var angle = TWO_PI * random_float64()
+            var z = sqrt(-2.0 * log(u)) * cos(angle)
             t._storage.store(i, Scalar[Self.dtype](z))
         return t^
 
@@ -178,14 +184,9 @@ struct Tensor[dtype: DType](Writable, Movable):
 
     def view(self) -> TensorView[Self.dtype]:
         """Returns the current view of this tensor."""
-        return TensorView[Self.dtype](
-            self._storage.unsafe_ptr(),
-            self._view.shape,
-            self._view.strides(),
-            self._view.offset(),
-        )
+        return TensorView[Self.dtype](copy=self._view)
 
-    def transpose(self, dim0: Int, dim1: Int) -> TensorView[Self.dtype]:
+    def transpose(self, dim0: Int, dim1: Int) raises -> TensorView[Self.dtype]:
         """Returns a transposed view (no data copy).
 
         The returned view borrows this tensor's memory. Ensure this tensor
@@ -203,9 +204,7 @@ struct Tensor[dtype: DType](Writable, Movable):
 
     def clone(self) -> Tensor[Self.dtype]:
         """Returns a deep copy of this tensor with independent storage."""
-        var t = Tensor[Self.dtype](self.shape())
-        t._storage.copy_from(self._storage)
-        return t^
+        return Tensor[Self.dtype](copy_data=self)
 
     def is_contiguous(self) -> Bool:
         """Returns True if the tensor's view is contiguous."""

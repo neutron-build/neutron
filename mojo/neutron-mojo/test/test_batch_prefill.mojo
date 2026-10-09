@@ -39,7 +39,7 @@ def assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helper builders
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny model for testing (2 layers, vocab=8, dim=4)."""
     var params = tiny_test_params()
     var model = Model(params)

@@ -251,9 +251,13 @@ def test_format_conversation_dispatch() raises:
 # Conversation Generate Tests
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny model for testing (1 layer, vocab=32, dim=16)."""
     var params = tiny_test_params()
+    params.vocab_size = 32
+    # Formatted multi-turn prompts are char-tokenized and easily exceed the
+    # 32-token default context; align capacity with what generation needs.
+    params.max_seq_len = 512
     var model = Model(params)
     # Fill layer weights with small values so forward pass doesn't NaN
     var total = model.layer_weights.numel()

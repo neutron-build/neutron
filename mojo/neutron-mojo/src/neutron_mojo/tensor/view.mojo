@@ -9,6 +9,7 @@ and broadcasting by manipulating shape and strides without copying data.
 """
 
 from .shape import Shape
+from std.sys import size_of
 
 
 # ===----------------------------------------------------------------------=== #
@@ -37,23 +38,25 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
         shape: Shape,
         strides: List[Int],
         offset: Int = 0,
-    ):
+    ) raises:
         """Create a view from a raw pointer, shape, strides, and offset."""
         self._ptr = ptr
         self.shape = shape.copy()
         self._strides = strides.copy()
         self._offset = offset
+        self.validate()
 
     def __init__(
         out self,
         ptr: Pointer[Scalar[Self.dtype], MutUntrackedOrigin],
         shape: Shape,
-    ):
+    ) raises:
         """Create a contiguous view (computes row-major strides automatically)."""
         self._ptr = ptr
         self.shape = shape.copy()
         self._strides = shape.strides()
         self._offset = 0
+        self.validate()
 
     def __init__(out self, *, copy: Self):
         """Copy constructor — shallow copy (non-owning view)."""
@@ -68,6 +71,28 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
         self.shape = move.shape^
         self._strides = move._strides^
         self._offset = move._offset
+
+    def validate(self) raises:
+        """Admit nonnegative element strides and checked addressed offsets.
+
+        Raw-pointer allocation extent and lifetime remain the caller's contract.
+        Negative-stride adapters are explicitly outside this view API.
+        """
+        self.shape.validate()
+        if self._offset < 0 or len(self._strides) != self.shape.ndim():
+            raise Error("Invalid tensor view offset or stride rank")
+        var last = self._offset
+        for d in range(self.shape.ndim()):
+            var stride = self._strides[d]
+            if stride < 0:
+                raise Error("Negative tensor view strides are unsupported")
+            if self.shape.numel() != 0 and self.shape[d] > 1:
+                var steps = self.shape[d] - 1
+                if stride > (0x7FFFFFFFFFFFFFFF - last) // steps:
+                    raise Error("Tensor view address overflow")
+                last += steps * stride
+        if last > 0x7FFFFFFFFFFFFFFF // size_of[Scalar[Self.dtype]]():
+            raise Error("Tensor view byte address overflow")
 
     # --- Element access ---
 
@@ -87,7 +112,7 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
             offset += indices[i] * self._strides[i]
         return self._ptr.load(offset)
 
-    def store(self, *indices: Int, value: Scalar[Self.dtype]):
+    def store(self, *indices: Int, value: Scalar[Self.dtype]) raises:
         """Store a single element at the given indices."""
         var n = len(indices)
         var offset = self._offset
@@ -97,16 +122,19 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
 
     # --- View operations ---
 
-    def transpose(self, dim0: Int, dim1: Int) -> TensorView[Self.dtype]:
+    def transpose(self, dim0: Int, dim1: Int) raises -> TensorView[Self.dtype]:
         """Returns a view with two dimensions swapped. No data copy.
 
         WARNING: The returned view borrows from the same memory as self.
         The caller must ensure the underlying Storage/Tensor outlives this view.
         Use Tensor(view) to materialize an owned copy if needed.
         """
+        self.validate()
+        var ndim = self.shape.ndim()
+        if dim0 < 0 or dim0 >= ndim or dim1 < 0 or dim1 >= ndim:
+            raise Error("transpose: invalid dimension")
         var new_dims = List[Int]()
         var new_strides = List[Int]()
-        var ndim = self.shape.ndim()
         for i in range(ndim):
             new_dims.append(self.shape[i])
             new_strides.append(self._strides[i])
@@ -137,7 +165,11 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
         WARNING: The returned view borrows from the same memory as self.
         The caller must ensure the underlying Storage/Tensor outlives this view.
         """
+        self.validate()
+        target.validate()
         var ndim_out = target.ndim()
+        if ndim_out < self.shape.ndim():
+            raise Error("broadcast_to cannot drop dimensions")
         var new_strides = List[Int]()
         for _ in range(ndim_out):
             new_strides.append(0)
@@ -166,12 +198,19 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
             self._offset,
         )
 
-    def slice_dim(self, dim: Int, start: Int, length: Int) -> TensorView[Self.dtype]:
+    def slice_dim(self, dim: Int, start: Int, length: Int) raises -> TensorView[Self.dtype]:
         """Returns a view sliced along a single dimension.
 
         WARNING: The returned view borrows from the same memory as self.
         The caller must ensure the underlying Storage/Tensor outlives this view.
         """
+        self.validate()
+        if dim < 0 or dim >= self.shape.ndim():
+            raise Error("slice: invalid dimension")
+        var extent = self.shape[dim]
+        if start < 0 or start > extent or length < 0 or length > extent - start:
+            raise Error("slice: invalid span")
+
         var new_dims = List[Int]()
         for i in range(self.shape.ndim()):
             if i == dim:
@@ -183,6 +222,8 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
         for i in range(self.shape.ndim()):
             new_strides.append(self._strides[i])
 
+        if start > 0 and self._strides[dim] > (0x7FFFFFFFFFFFFFFF - self._offset) // start:
+            raise Error("slice: offset overflow")
         var new_offset = self._offset + start * self._strides[dim]
 
         return TensorView[Self.dtype](
@@ -198,6 +239,8 @@ struct TensorView[dtype: DType](Writable, Copyable, Movable, ImplicitlyCopyable)
         WARNING: The returned view borrows from the same memory as self.
         The caller must ensure the underlying Storage/Tensor outlives this view.
         """
+        self.validate()
+        new_shape.validate()
         if not self.is_contiguous():
             raise Error("Cannot reshape non-contiguous view")
         if self.shape.numel() != new_shape.numel():

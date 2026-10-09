@@ -8,7 +8,7 @@ Separate from ops.mojo to avoid concurrent edit conflicts.
 All functions follow the same pattern: allocate result, scalar loop, return.
 """
 
-from std.math import sqrt
+from std.math import sqrt, ceil, isfinite
 
 from .shape import Shape
 from .tensor import Tensor
@@ -27,9 +27,13 @@ def concat2[dtype: DType](
     For 1D: concat along axis 0.
     For 2D dim=0: stack rows. dim=1: stack columns.
     """
+    if dim < 0 or dim >= a.ndim() or a.ndim() != b.ndim():
+        raise Error("concat2: invalid dimension or mismatched rank")
     if a.ndim() == 1 and b.ndim() == 1:
         var n_a = a.numel()
         var n_b = b.numel()
+        if n_b > 0x7FFFFFFFFFFFFFFF - n_a:
+            raise Error("concat2: extent overflow")
         var result = Tensor[dtype](n_a + n_b)
         var r_ptr = result.data_ptr()
         var a_ptr = a.data_ptr()
@@ -51,6 +55,8 @@ def concat2[dtype: DType](
         if dim == 0:
             if a_cols != b_cols:
                 raise Error("concat2 dim=0: column count must match")
+            if b_rows > 0x7FFFFFFFFFFFFFFF - a_rows:
+                raise Error("concat2: extent overflow")
             var result = Tensor[dtype](a_rows + b_rows, a_cols)
             var r_ptr = result.data_ptr()
             for i in range(a_rows * a_cols):
@@ -61,6 +67,8 @@ def concat2[dtype: DType](
         elif dim == 1:
             if a_rows != b_rows:
                 raise Error("concat2 dim=1: row count must match")
+            if b_cols > 0x7FFFFFFFFFFFFFFF - a_cols:
+                raise Error("concat2: extent overflow")
             var out_cols = a_cols + b_cols
             var result = Tensor[dtype](a_rows, out_cols)
             var r_ptr = result.data_ptr()
@@ -133,6 +141,8 @@ def split2[dtype: DType](
     x: Tensor[dtype], split_at: Int, dim: Int = 0
 ) raises -> SplitResult2[dtype]:
     """Split a tensor into 2 parts at the given index along dim."""
+    if dim < 0 or dim >= x.ndim():
+        raise Error("split2: invalid dimension")
     var x_ptr = x.data_ptr()
 
     if x.ndim() == 1:
@@ -245,7 +255,7 @@ def unsqueeze[dtype: DType](x: Tensor[dtype], dim: Int) raises -> Tensor[dtype]:
     return result^
 
 
-def flatten[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def flatten[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Flatten to 1D."""
     var n = x.numel()
     var result = Tensor[dtype](n)
@@ -260,6 +270,15 @@ def expand[dtype: DType](x: Tensor[dtype], shape: Shape) raises -> Tensor[dtype]
     """Expand a tensor to a larger shape by repeating along size-1 dims."""
     if x.ndim() != shape.ndim():
         raise Error("expand: ndim must match")
+
+    var count = 1
+    for d in range(shape.ndim()):
+        var extent = shape[d]
+        if extent < 0 or (extent != 0 and count > 0x7fffffffffffffff // extent):
+            raise Error("expand: invalid or overflowing shape")
+        count *= extent
+        if x.shape()[d] != extent and x.shape()[d] != 1:
+            raise Error("expand: incompatible extent")
 
     var result = Tensor[dtype](shape)
     var n = shape.numel()
@@ -291,13 +310,14 @@ def expand[dtype: DType](x: Tensor[dtype], shape: Shape) raises -> Tensor[dtype]
 
 def arange[dtype: DType](start: Float64, stop: Float64, step: Float64 = 1.0) raises -> Tensor[dtype]:
     """Create a 1D tensor with evenly spaced values."""
-    if step == 0.0:
-        raise Error("arange: step must be non-zero")
-    var n: Int
-    if step > 0:
-        n = max(0, Int((stop - start + step - 1e-10) / step))
-    else:
-        n = max(0, Int((start - stop - step - 1e-10) / (-step)))
+    if not isfinite(start) or not isfinite(stop) or not isfinite(step) or step == 0:
+        raise Error("arange: finite endpoints and nonzero finite step required")
+    var count = ceil((stop - start) / step)
+    if not isfinite(count) or count >= Float64(0x7FFFFFFFFFFFFFFF):
+        raise Error("arange: element count overflow")
+    var n = 0
+    if count > 0:
+        n = Int(count)
     if n == 0:
         return Tensor[dtype](0)
 
@@ -323,7 +343,7 @@ def linspace[dtype: DType](start: Float64, stop: Float64, num: Int) raises -> Te
     return result^
 
 
-def eye[dtype: DType](n: Int) -> Tensor[dtype]:
+def eye[dtype: DType](n: Int) raises -> Tensor[dtype]:
     """Create an n x n identity matrix."""
     var result = Tensor[dtype](n, n)
     var r_ptr = result.data_ptr()

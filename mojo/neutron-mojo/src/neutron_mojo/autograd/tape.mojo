@@ -15,6 +15,7 @@ Gradients are stored in a parallel grad_flat tensor with the same layout.
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from .variable import Variable
+from std.math import isfinite
 
 
 # ===----------------------------------------------------------------------=== #
@@ -128,6 +129,16 @@ def OP_KL_DIV() -> Int:
     return 34
 
 
+def OP_MATMUL_RIGHT_TRANSPOSE() -> Int:
+    return 35
+
+def OP_BIAS_ADD() -> Int:
+    return 36
+
+def OP_VECTOR_SCALE() -> Int:
+    return 37
+
+
 # ===----------------------------------------------------------------------=== #
 # TapeEntry — records one operation
 # ===----------------------------------------------------------------------=== #
@@ -238,7 +249,7 @@ struct Tape(Movable):
     var total_used: Int
     var capacity: Int
 
-    def __init__(out self, initial_capacity: Int = 65536):
+    def __init__(out self, initial_capacity: Int = 65536) raises:
         """Create a tape with the given initial flat capacity."""
         self.capacity = initial_capacity
         self.data_flat = Tensor[DType.float32](initial_capacity)
@@ -261,13 +272,20 @@ struct Tape(Movable):
         self.total_used = move.total_used^
         self.capacity = move.capacity^
 
-    def _ensure_capacity(mut self, needed: Int):
+    def _ensure_capacity(mut self, needed: Int) raises:
         """Grow flat tensors if needed."""
+        if self.capacity < 0 or self.capacity != self.data_flat.numel() or self.capacity != self.grad_flat.numel() or self.total_used > self.capacity:
+            raise Error("Tape capacity does not match owned storage")
+        if needed < 0 or self.total_used < 0 or needed > 0x7FFFFFFFFFFFFFFF - self.total_used:
+            raise Error("Tape storage overflow")
         if self.total_used + needed <= self.capacity:
             return
-        var new_cap = self.capacity
+        var new_cap = max(self.capacity, 1)
         while new_cap < self.total_used + needed:
-            new_cap *= 2
+            if new_cap > 0x7FFFFFFFFFFFFFFF // 2:
+                new_cap = self.total_used + needed
+            else:
+                new_cap *= 2
 
         var new_data = Tensor[DType.float32](new_cap)
         var new_grad = Tensor[DType.float32](new_cap)
@@ -281,14 +299,17 @@ struct Tape(Movable):
         self.grad_flat = new_grad^
         self.capacity = new_cap
 
-    def add_variable(mut self, shape_dims: List[Int], requires_grad: Bool = True) -> Int:
+    def add_variable(mut self, shape_dims: List[Int], requires_grad: Bool = True) raises -> Int:
         """Add a new variable to the tape. Returns its index."""
-        var numel = 1
-        for i in range(len(shape_dims)):
-            numel *= shape_dims[i]
+        var admitted_shape = Shape(shape_dims.copy())
+        var numel = admitted_shape.numel()
 
         self._ensure_capacity(numel)
 
+        # Reused arena slots must never carry previous data or gradients.
+        for i in range(numel):
+            self.data_flat.set(self.total_used + i, Float32(0))
+            self.grad_flat.set(self.total_used + i, Float32(0))
         var idx = len(self.var_offsets)
         self.var_offsets.append(self.total_used)
         self.var_sizes.append(numel)
@@ -300,7 +321,7 @@ struct Tape(Movable):
         self.total_used += numel
         return idx
 
-    def add_variable_from_shape(mut self, shape: Shape, requires_grad: Bool = True) -> Int:
+    def add_variable_from_shape(mut self, shape: Shape, requires_grad: Bool = True) raises -> Int:
         """Add a variable using a Shape object."""
         var dims = List[Int]()
         for i in range(shape.ndim()):
@@ -310,6 +331,26 @@ struct Tape(Movable):
     def num_variables(self) -> Int:
         """Return the number of variables on the tape."""
         return len(self.var_offsets)
+
+    def validate_variable(self, idx: Int) raises:
+        """Validate a variable before a public tracked operation touches data."""
+        var count = self.num_variables()
+        if len(self.var_sizes) != count or len(self.var_shapes) != count or len(self.var_requires_grad) != count or self.total_used < 0 or self.total_used > self.data_flat.numel() or self.total_used > self.grad_flat.numel():
+            raise Error("Invalid tape arena metadata")
+        if idx < 0 or idx >= count:
+            raise Error("Invalid tape variable index")
+        var offset = self.var_offsets[idx]
+        var size = self.var_sizes[idx]
+        if offset < 0 or size < 0 or offset > self.total_used or size > self.total_used - offset:
+            raise Error("Invalid tape variable span")
+        if Shape(self.var_shapes[idx].copy()).numel() != size:
+            raise Error("Tape variable shape/count mismatch")
+
+    def validate_same_shape(self, a: Int, b: Int) raises:
+        self.validate_variable(a)
+        self.validate_variable(b)
+        if self.var_shapes[a] != self.var_shapes[b]:
+            raise Error("Tracked operands must have equal shapes")
 
     def var_numel(self, var_idx: Int) -> Int:
         """Return the number of elements for a variable."""
@@ -343,7 +384,7 @@ struct Tape(Movable):
         var current = self.grad_flat.get(offset)
         self.grad_flat.set(offset, current + value)
 
-    def get_data_copy(self, var_idx: Int) -> Tensor[DType.float32]:
+    def get_data_copy(self, var_idx: Int) raises -> Tensor[DType.float32]:
         """Copy a variable's data into a new tensor."""
         var n = self.var_sizes[var_idx]
         var offset = self.var_offsets[var_idx]
@@ -352,7 +393,7 @@ struct Tape(Movable):
             result.set(i, self.data_flat.get(offset + i))
         return result^
 
-    def get_grad_copy(self, var_idx: Int) -> Tensor[DType.float32]:
+    def get_grad_copy(self, var_idx: Int) raises -> Tensor[DType.float32]:
         """Copy a variable's gradient into a new tensor."""
         var n = self.var_sizes[var_idx]
         var offset = self.var_offsets[var_idx]
@@ -361,15 +402,81 @@ struct Tape(Movable):
             result.set(i, self.grad_flat.get(offset + i))
         return result^
 
-    def set_data_from_tensor(mut self, var_idx: Int, tensor: Tensor[DType.float32]):
+    def set_data_from_tensor(mut self, var_idx: Int, tensor: Tensor[DType.float32]) raises:
         """Copy tensor data into a variable's data slot."""
+        if var_idx < 0 or var_idx >= self.num_variables():
+            raise Error("Invalid tape variable")
         var n = self.var_sizes[var_idx]
+        if n != tensor.numel():
+            raise Error("Tensor size does not match tape variable")
         var offset = self.var_offsets[var_idx]
         for i in range(n):
-            self.data_flat.set(offset + i, tensor.get(i))
+            self.data_flat.set(offset + i, tensor.data_ptr()[i])
 
-    def record(mut self, entry: TapeEntry):
-        """Record an operation on the tape."""
+    def validate_entry(self, entry: TapeEntry) raises:
+        self.validate_variable(entry.output_idx)
+        self.validate_variable(entry.input0_idx)
+        if entry.op_kind < 0 or entry.op_kind > 37 or entry.input0_idx >= entry.output_idx or entry.input1_idx >= entry.output_idx or entry.input1_idx < -1:
+            raise Error("Invalid or non-topological tape entry")
+        if entry.input1_idx >= 0:
+            self.validate_variable(entry.input1_idx)
+        if entry.op_kind == OP_LAYERNORM():
+            self.validate_variable(entry.cached_int3)
+            if entry.cached_int3 >= entry.output_idx:
+                raise Error("Invalid LayerNorm beta dependency")
+
+        var op = entry.op_kind
+        var a = self.var_sizes[entry.input0_idx]
+        var o = self.var_sizes[entry.output_idx]
+        var b = 0
+        if entry.input1_idx >= 0:
+            b = self.var_sizes[entry.input1_idx]
+        if op == OP_MATMUL() or op == OP_MATMUL_RIGHT_TRANSPOSE():
+            if entry.input1_idx < 0 or entry.cached_int <= 0 or entry.cached_int2 <= 0 or entry.cached_int3 <= 0:
+                raise Error("Invalid recorded matrix dimensions")
+            if a != Shape(entry.cached_int, entry.cached_int2).numel() or b != Shape(entry.cached_int2, entry.cached_int3).numel() or o != Shape(entry.cached_int, entry.cached_int3).numel():
+                raise Error("Recorded matrix spans do not match dimensions")
+        elif op == OP_SUM() or op == OP_MEAN():
+            if o != 1 or entry.cached_int != a or (op == OP_MEAN() and a == 0):
+                raise Error("Invalid recorded reduction spans")
+        elif op == OP_CONCAT():
+            if entry.input1_idx < 0 or b > 0x7FFFFFFFFFFFFFFF - a or o != a + b:
+                raise Error("Invalid recorded concat spans")
+        elif op == OP_SPLIT():
+            if entry.cached_int < 0 or entry.cached_int > a or o > a - entry.cached_int:
+                raise Error("Invalid recorded slice span")
+        elif op == OP_TRANSPOSE():
+            if entry.cached_int < 0 or entry.cached_int2 < 0 or a != Shape(entry.cached_int, entry.cached_int2).numel() or o != a:
+                raise Error("Invalid recorded transpose spans")
+        elif op == OP_EMBEDDING():
+            if entry.cached_int <= 0 or entry.cached_int2 < 0 or a % entry.cached_int != 0 or entry.cached_int2 >= a // entry.cached_int or o != entry.cached_int:
+                raise Error("Invalid recorded embedding row")
+        elif op == OP_CROSS_ENTROPY():
+            if a <= 0 or o != 1 or entry.cached_int2 != a or entry.cached_int < 0 or entry.cached_int >= a:
+                raise Error("Invalid recorded cross entropy spans")
+        elif op == OP_MSE() or op == OP_L1() or op == OP_BCE() or op == OP_KL_DIV():
+            if entry.input1_idx < 0 or a <= 0 or b != a or o != 1:
+                raise Error("Invalid recorded loss spans")
+        elif op == OP_RMSNORM() or op == OP_LAYERNORM():
+            if entry.input1_idx < 0 or a <= 0 or b != a or o != a or (entry.cached_int != 0 and entry.cached_int != a) or not isfinite(entry.cached_scalar) or entry.cached_scalar <= 0:
+                raise Error("Invalid recorded normalization spans")
+            if op == OP_LAYERNORM() and self.var_sizes[entry.cached_int3] != a:
+                raise Error("Invalid recorded LayerNorm beta span")
+        elif op == OP_BIAS_ADD():
+            if entry.input1_idx < 0 or entry.cached_int <= 0 or b != entry.cached_int or a % b != 0 or o != a:
+                raise Error("Invalid recorded bias broadcast")
+        elif op == OP_VECTOR_SCALE():
+            if entry.input1_idx < 0 or b != 1 or o != a:
+                raise Error("Invalid recorded vector scale")
+        elif op == OP_ADD() or op == OP_SUB() or op == OP_MUL() or op == OP_DIV() or op == OP_SWIGLU():
+            if entry.input1_idx < 0 or a != b or o != a:
+                raise Error("Invalid recorded elementwise spans")
+        elif o != a:
+            raise Error("Invalid recorded unary spans")
+
+    def record(mut self, entry: TapeEntry) raises:
+        """Admit variable spans and dependency order before recording an operation."""
+        self.validate_entry(entry)
         self.entries.append(entry.copy())
 
     def zero_all_grads(mut self):
@@ -392,3 +499,25 @@ struct Tape(Movable):
         for i in range(len(shape)):
             dims.append(shape[i])
         return Variable(var_idx, self.var_requires_grad[var_idx], dims^, self.var_sizes[var_idx])
+
+
+    def rewind_activations(mut self, parameter_count: Int) raises:
+        """Discard the step graph after the persistent parameter frontier.
+
+        Activation Int handles must not escape this step boundary. Parameters
+        retain their indices, data and accumulated gradients; arena capacity is
+        reused so equal-sized steps stop growing after warmup.
+        """
+        if parameter_count < 0 or parameter_count > self.num_variables():
+            raise Error("Invalid tape parameter frontier")
+        var used = 0
+        if parameter_count > 0:
+            var last = parameter_count - 1
+            used = self.var_offsets[last] + self.var_sizes[last]
+        while self.num_variables() > parameter_count:
+            _ = self.var_offsets.pop()
+            _ = self.var_sizes.pop()
+            _ = self.var_shapes.pop()
+            _ = self.var_requires_grad.pop()
+        self.total_used = used
+        self.entries = List[TapeEntry]()

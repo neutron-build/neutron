@@ -86,9 +86,13 @@ def test_detect_qwen() raises:
 def test_unknown_defaults_to_llama() raises:
     """Unknown architecture defaults to Llama."""
     var gguf = _make_gguf_with_arch("foobar_unknown")
-    var arch = detect_arch_from_gguf(gguf)
-    assert_true(arch.kind == ArchitectureKind.Llama, "Unknown should default to Llama")
-    print("  unknown_defaults_to_llama: PASS")
+    var refused = False
+    try:
+        _ = detect_arch_from_gguf(gguf)
+    except:
+        refused = True
+    assert_true(refused, "Unknown arch must be refused, not defaulted")
+    print("  unknown_arch_refused: PASS")
 
 
 def test_missing_arch_defaults_to_llama() raises:

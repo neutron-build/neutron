@@ -181,7 +181,7 @@ def _matmul_2d_kernel[
     N: Int,
     transpose_a: Bool,
     transpose_b: Bool
-):
+) raises:
     """2D matmul kernel that works on a slice of memory with offsets."""
     comptime simd_width = simd_width_of[dtype]()
 
@@ -371,7 +371,7 @@ def matmul[
 # ===----------------------------------------------------------------------=== #
 
 
-def relu[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def relu[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """ReLU activation: max(0, x).
 
     Scalar loop — SIMD blocked by Mojo 0.26.2 limitation: SIMD comparison
@@ -397,9 +397,14 @@ def softmax[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dty
     Supports 1D tensors and 2D tensors (softmax along last axis).
     Uses the standard max-subtract trick for numerical stability.
     """
+    if x.numel() == 0:
+        raise Error("empty tensor has no reduction result")
     var actual_axis = axis
     if actual_axis < 0:
         actual_axis += x.ndim()
+
+    if actual_axis < 0 or actual_axis >= x.ndim():
+        raise Error("invalid reduction axis")
 
     if x.ndim() == 1:
         return _softmax_1d[dtype](x)
@@ -409,7 +414,7 @@ def softmax[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[dty
         raise Error("softmax currently supports 1D or 2D (axis=-1) tensors")
 
 
-def _softmax_1d[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def _softmax_1d[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Softmax for a 1D tensor."""
     var n = x.numel()
     var x_ptr = x.data_ptr()
@@ -438,7 +443,7 @@ def _softmax_1d[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def _softmax_2d_last[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def _softmax_2d_last[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Softmax along last axis of a 2D tensor."""
     var rows = x.shape()[0]
     var cols = x.shape()[1]
@@ -537,9 +542,14 @@ def reduce_max[dtype: DType](x: Tensor[dtype], axis: Int = -1) raises -> Tensor[
 
     axis=-1 reduces the last dimension.
     """
+    if x.numel() == 0:
+        raise Error("empty tensor has no reduction result")
     var actual_axis = axis
     if actual_axis < 0:
         actual_axis += x.ndim()
+
+    if actual_axis < 0 or actual_axis >= x.ndim():
+        raise Error("invalid reduction axis")
 
     if x.ndim() == 1:
         var x_ptr = x.data_ptr()
@@ -951,7 +961,7 @@ def swiglu[dtype: DType](x: Tensor[dtype], gate: Tensor[dtype]) raises -> Tensor
 # ===----------------------------------------------------------------------=== #
 
 
-def neg[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def neg[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Negate all elements: -x."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -962,7 +972,7 @@ def neg[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def abs_val[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def abs_val[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Absolute value of all elements."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -975,7 +985,7 @@ def abs_val[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def exp_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def exp_op[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise exponential: exp(x)."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -986,7 +996,7 @@ def exp_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def log_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def log_op[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise natural log: log(x)."""
     from std.math import log
     var result = Tensor[dtype](x.shape())
@@ -998,7 +1008,7 @@ def log_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def sqrt_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def sqrt_op[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise square root: sqrt(x)."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1009,7 +1019,7 @@ def sqrt_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def sigmoid[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def sigmoid[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Sigmoid activation: 1 / (1 + exp(-x))."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1021,7 +1031,7 @@ def sigmoid[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def tanh_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
+def tanh_op[dtype: DType](x: Tensor[dtype]) raises -> Tensor[dtype]:
     """Elementwise hyperbolic tangent: tanh(x)."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1032,7 +1042,7 @@ def tanh_op[dtype: DType](x: Tensor[dtype]) -> Tensor[dtype]:
     return result^
 
 
-def pow_scalar[dtype: DType](x: Tensor[dtype], exponent: Float64) -> Tensor[dtype]:
+def pow_scalar[dtype: DType](x: Tensor[dtype], exponent: Float64) raises -> Tensor[dtype]:
     """Raise all elements to a power: x^exponent."""
     from std.math import pow
     var result = Tensor[dtype](x.shape())
@@ -1044,7 +1054,7 @@ def pow_scalar[dtype: DType](x: Tensor[dtype], exponent: Float64) -> Tensor[dtyp
     return result^
 
 
-def clamp[dtype: DType](x: Tensor[dtype], min_val: Float64, max_val: Float64) -> Tensor[dtype]:
+def clamp[dtype: DType](x: Tensor[dtype], min_val: Float64, max_val: Float64) raises -> Tensor[dtype]:
     """Clamp all elements to [min_val, max_val]."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1063,7 +1073,7 @@ def clamp[dtype: DType](x: Tensor[dtype], min_val: Float64, max_val: Float64) ->
     return result^
 
 
-def scalar_mul[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
+def scalar_mul[dtype: DType](x: Tensor[dtype], scalar: Float64) raises -> Tensor[dtype]:
     """Multiply all elements by a scalar."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1075,7 +1085,7 @@ def scalar_mul[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]
     return result^
 
 
-def scalar_add[dtype: DType](x: Tensor[dtype], scalar: Float64) -> Tensor[dtype]:
+def scalar_add[dtype: DType](x: Tensor[dtype], scalar: Float64) raises -> Tensor[dtype]:
     """Add a scalar to all elements."""
     var result = Tensor[dtype](x.shape())
     var n = x.numel()
@@ -1110,9 +1120,11 @@ struct ArgResult(Copyable, Movable, ImplicitlyCopyable):
         self.value = move.value^
 
 
-def argmax_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
+def argmax_tensor[dtype: DType](x: Tensor[dtype]) raises -> ArgResult:
     """Find the index and value of the maximum element (1D)."""
     var n = x.numel()
+    if n == 0:
+        raise Error("Empty tensor has no extremum")
     var x_ptr = x.data_ptr()
     var best_idx = 0
     var best_val = Float64(x_ptr.load(0))
@@ -1124,9 +1136,11 @@ def argmax_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
     return ArgResult(best_idx, best_val)
 
 
-def argmin_tensor[dtype: DType](x: Tensor[dtype]) -> ArgResult:
+def argmin_tensor[dtype: DType](x: Tensor[dtype]) raises -> ArgResult:
     """Find the index and value of the minimum element (1D)."""
     var n = x.numel()
+    if n == 0:
+        raise Error("Empty tensor has no extremum")
     var x_ptr = x.data_ptr()
     var best_idx = 0
     var best_val = Float64(x_ptr.load(0))
@@ -1142,6 +1156,8 @@ def argmax_axis[dtype: DType](x: Tensor[dtype], axis: Int) raises -> Tensor[dtyp
     """Argmax along axis for 2D tensor. Returns indices as float values."""
     if x.ndim() != 2:
         raise Error("argmax_axis: only 2D tensors supported")
+    if x.numel() == 0:
+        raise Error("Empty tensor has no axis extremum")
     var rows = x.shape()[0]
     var cols = x.shape()[1]
     var x_ptr = x.data_ptr()
@@ -1247,6 +1263,12 @@ def gather[dtype: DType](
     For 2D dim=0: result[i, j] = x[indices[i], j]
     For 2D dim=1: result[i, j] = x[i, indices[j]]
     """
+    if dim < 0 or dim >= x.ndim():
+        raise Error("gather: invalid dimension")
+    for i in range(len(indices)):
+        if indices[i] < 0 or indices[i] >= x.shape()[dim]:
+            raise Error("gather: index out of bounds")
+
     var x_ptr = x.data_ptr()
 
     if x.ndim() == 1:

@@ -69,12 +69,23 @@ struct Storage[dtype: DType](Movable):
 
     # --- Constructors ---
 
-    def __init__(out self, size: Int, device: DeviceKind = DeviceKind.CPU):
+    def __init__(out self, size: Int, device: DeviceKind = DeviceKind.CPU) raises:
         """Allocate storage for `size` elements, zero-initialized."""
+        if size < 0 or size > 0x7FFFFFFFFFFFFFFF // size_of[Scalar[Self.dtype]]():
+            raise Error("Negative or overflowing tensor allocation")
+        if device != DeviceKind.CPU:
+            raise Error("Storage currently supports CPU allocation only")
         self._size = size
         self._device = device
         self._ptr = alloc[Scalar[Self.dtype]](size)
         memset_zero(self._ptr.unsafe_value(), size)
+
+    def __init__(out self, *, copy_from: Self):
+        """Deep copy an already admitted allocation; no unchecked size input."""
+        self._size = copy_from._size
+        self._device = copy_from._device
+        self._ptr = alloc[Scalar[Self.dtype]](self._size)
+        self.copy_from(copy_from)
 
     def __init__(out self, *, deinit move: Self):
         """Move constructor — transfers ownership; the source is left empty."""

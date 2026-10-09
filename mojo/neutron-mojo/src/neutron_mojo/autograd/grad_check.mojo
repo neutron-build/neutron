@@ -9,6 +9,7 @@ gradients. Essential for testing new backward implementations.
 """
 
 from neutron_mojo.tensor.tensor import Tensor
+from std.math import isfinite
 
 
 struct GradCheckResult(Copyable, Movable, ImplicitlyCopyable):
@@ -50,7 +51,11 @@ def compare_gradients(
     Returns:
         GradCheckResult with max differences and pass/fail.
     """
+    if (analytical.shape() != numerical.shape() or rtol < 0 or atol < 0
+        or not isfinite(rtol) or not isfinite(atol)):
+        return GradCheckResult(0, 0, False)
     var n = analytical.numel()
+    var passed = True
     var max_abs = Float64(0.0)
     var max_rel = Float64(0.0)
     var a_ptr = analytical.data_ptr()
@@ -59,7 +64,11 @@ def compare_gradients(
     for i in range(n):
         var a_val = Float64(a_ptr.load(i))
         var n_val = Float64(n_ptr.load(i))
+        if not isfinite(a_val) or not isfinite(n_val):
+            return GradCheckResult(0, 0, False)
         var abs_diff = abs(a_val - n_val)
+        if abs_diff > atol + rtol * max(abs(a_val), abs(n_val)):
+            passed = False
         if abs_diff > max_abs:
             max_abs = abs_diff
 
@@ -68,10 +77,5 @@ def compare_gradients(
             var rel = abs_diff / denom
             if rel > max_rel:
                 max_rel = rel
-
-    var passed = max_abs <= atol + rtol * max_rel
-    # Also check absolute: all diffs within tolerance
-    if max_abs > atol * 10.0 and max_rel > rtol * 10.0:
-        passed = False
 
     return GradCheckResult(max_abs, max_rel, passed)

@@ -71,7 +71,7 @@ struct LoRAWeight(Movable):
     var lora_b: Tensor[DType.float32]   # [out_features * rank]
     var config: LoRAConfig
 
-    def __init__(out self, config: LoRAConfig):
+    def __init__(out self, config: LoRAConfig) raises:
         self.config = config.copy()
         self.lora_a = Tensor[DType.float32](Shape(config.rank * config.in_features))
         self.lora_b = Tensor[DType.float32](Shape(config.out_features * config.rank))
@@ -90,7 +90,7 @@ struct LoRAWeight(Movable):
 def lora_forward(
     x: Tensor[DType.float32],
     lora: LoRAWeight,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Compute LoRA delta output: (alpha/rank) * B @ (A @ x).
 
     This is the additive correction, NOT the full output.
@@ -129,7 +129,7 @@ def lora_linear(
     x: Tensor[DType.float32],
     base_weight: Tensor[DType.float32],
     lora: LoRAWeight,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Linear projection with LoRA: y = W @ x + (alpha/rank) * B @ A @ x.
 
     Args:

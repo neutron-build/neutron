@@ -52,7 +52,7 @@ def assert_close(a: Float32, b: Float32, tol: Float32, msg: String) raises:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     var p = tiny_test_params()
     var model = Model(p)
     for v in range(p.vocab_size):

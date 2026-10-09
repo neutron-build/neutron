@@ -10,6 +10,11 @@ instead of pre-allocated contiguous memory, allowing 2-4x more concurrent
 requests at the same peak memory.
 
 Usage:
+    if max_pages <= 0 or page_size <= 0:
+        raise Error("Paged generation requires positive page capacity and page size")
+    var per_layer = total_len // page_size + Int(total_len % page_size != 0)
+    if per_layer > max_pages // p.num_layers:
+        raise Error("Paged generation lacks capacity for prompt and budget")
     var cache = PagedKVCache(max_pages=256, page_size=16,
                               num_layers=model.params.num_layers,
                               num_kv_heads=model.params.num_kv_heads,
@@ -63,6 +68,11 @@ def paged_forward_layer(
     Returns:
         Output hidden state [hidden_dim].
     """
+    model.params.validate_execution(rope, pos, specialized=True)
+    model.validate_storage()
+    if layer < 0 or layer >= model.params.num_layers or x.numel() != model.params.hidden_dim:
+        raise Error("Paged model layer/input span mismatch")
+    cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, pos, 1, layer)
     var p = model.params.copy()
     var hd = p.hidden_dim
     var off = model._layer_offsets(layer)
@@ -150,6 +160,11 @@ def paged_forward(
     Returns:
         Logits [vocab_size].
     """
+    model.params.validate_execution(rope, pos, specialized=True)
+    model.validate_storage()
+    if token_id < 0 or token_id >= model.params.vocab_size:
+        raise Error("Paged model token outside vocabulary")
+    cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, pos, 1)
     var hidden = embed_token(model.embed, token_id, model.params.hidden_dim)
 
     for layer in range(model.params.num_layers):
@@ -189,8 +204,18 @@ def paged_generate(
         Generated token IDs (not including prompt).
     """
     var p = model.params.copy()
-    var total_len = len(prompt_tokens) + max_new_tokens
+    var total_len = p.validate_generation(prompt_tokens, max_new_tokens, p.max_seq_len)
+    from std.math import isfinite
+    if not isfinite(temperature) or temperature < 0:
+        raise Error("Invalid generation temperature")
+    if max_new_tokens == 0:
+        return List[Int]()
 
+    if max_pages <= 0 or page_size <= 0:
+        raise Error("Paged generation requires positive page capacity and page size")
+    var per_layer = total_len // page_size + Int(total_len % page_size != 0)
+    if per_layer > max_pages // p.num_layers:
+        raise Error("Paged generation lacks capacity for prompt and budget")
     var cache = PagedKVCache(
         max_pages=max_pages,
         page_size=page_size,
@@ -202,6 +227,7 @@ def paged_generate(
         head_dim=p.head_dim,
         max_seq_len=total_len,
         theta=p.rope_theta,
+        rotary_dim=p.rotary_dim(),
     )
 
     var generated = List[Int]()
@@ -238,6 +264,11 @@ def paged_q8_forward_layer(
     pos: Int,
 ) raises -> Tensor[DType.float32]:
     """Single Q8 layer forward with paged KV cache."""
+    model.params.validate_execution(rope, pos, specialized=True)
+    model.validate_storage()
+    if layer < 0 or layer >= model.params.num_layers or x.numel() != model.params.hidden_dim:
+        raise Error("Paged model layer/input span mismatch")
+    cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, pos, 1, layer)
     var p = model.params.copy()
     var hd = p.hidden_dim
     var off = model._layer_offsets(layer)
@@ -306,6 +337,11 @@ def paged_q8_forward(
     pos: Int,
 ) raises -> Tensor[DType.float32]:
     """Full Q8 forward pass with paged KV cache."""
+    model.params.validate_execution(rope, pos, specialized=True)
+    model.validate_storage()
+    if token_id < 0 or token_id >= model.params.vocab_size:
+        raise Error("Paged model token outside vocabulary")
+    cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, pos, 1)
     var hidden = embed_token(model.embed, token_id, model.params.hidden_dim)
 
     for layer in range(model.params.num_layers):
@@ -333,8 +369,18 @@ def paged_q8_generate(
 ) raises -> List[Int]:
     """Autoregressive generation with Q8 model + paged KV cache."""
     var p = model.params.copy()
-    var total_len = len(prompt_tokens) + max_new_tokens
+    var total_len = p.validate_generation(prompt_tokens, max_new_tokens, p.max_seq_len)
+    from std.math import isfinite
+    if not isfinite(temperature) or temperature < 0:
+        raise Error("Invalid generation temperature")
+    if max_new_tokens == 0:
+        return List[Int]()
 
+    if max_pages <= 0 or page_size <= 0:
+        raise Error("Paged generation requires positive page capacity and page size")
+    var per_layer = total_len // page_size + Int(total_len % page_size != 0)
+    if per_layer > max_pages // p.num_layers:
+        raise Error("Paged generation lacks capacity for prompt and budget")
     var cache = PagedKVCache(
         max_pages=max_pages, page_size=page_size,
         num_layers=p.num_layers,
@@ -374,6 +420,11 @@ def paged_q4_forward_layer(
     pos: Int,
 ) raises -> Tensor[DType.float32]:
     """Single Q4 layer forward with paged KV cache."""
+    model.params.validate_execution(rope, pos, specialized=True)
+    model.validate_storage()
+    if layer < 0 or layer >= model.params.num_layers or x.numel() != model.params.hidden_dim:
+        raise Error("Paged model layer/input span mismatch")
+    cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, pos, 1, layer)
     var p = model.params.copy()
     var hd = p.hidden_dim
     var off = model._layer_offsets(layer)
@@ -442,6 +493,11 @@ def paged_q4_forward(
     pos: Int,
 ) raises -> Tensor[DType.float32]:
     """Full Q4 forward pass with paged KV cache."""
+    model.params.validate_execution(rope, pos, specialized=True)
+    model.validate_storage()
+    if token_id < 0 or token_id >= model.params.vocab_size:
+        raise Error("Paged model token outside vocabulary")
+    cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, pos, 1)
     var hidden = embed_token(model.embed, token_id, model.params.hidden_dim)
 
     for layer in range(model.params.num_layers):
@@ -469,8 +525,18 @@ def paged_q4_generate(
 ) raises -> List[Int]:
     """Autoregressive generation with Q4 model + paged KV cache."""
     var p = model.params.copy()
-    var total_len = len(prompt_tokens) + max_new_tokens
+    var total_len = p.validate_generation(prompt_tokens, max_new_tokens, p.max_seq_len)
+    from std.math import isfinite
+    if not isfinite(temperature) or temperature < 0:
+        raise Error("Invalid generation temperature")
+    if max_new_tokens == 0:
+        return List[Int]()
 
+    if max_pages <= 0 or page_size <= 0:
+        raise Error("Paged generation requires positive page capacity and page size")
+    var per_layer = total_len // page_size + Int(total_len % page_size != 0)
+    if per_layer > max_pages // p.num_layers:
+        raise Error("Paged generation lacks capacity for prompt and budget")
     var cache = PagedKVCache(
         max_pages=max_pages, page_size=page_size,
         num_layers=p.num_layers,

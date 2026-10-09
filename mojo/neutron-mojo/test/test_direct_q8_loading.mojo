@@ -185,19 +185,74 @@ def test_quantized_tensor_data_struct() raises:
 # Full GGUF Builder with Mixed F32 + Q8 Tensors
 # ===----------------------------------------------------------------------=== #
 
+def _emit_tensor_info(mut buf: List[UInt8], name: String, dim0: Int, dim1: Int, ttype: Int, cursor: Int) raises -> Int:
+    """Emit 2-D tensor info at a 32-aligned offset; returns the aligned offset."""
+    var off = _align_offset(cursor, GGUF_DEFAULT_ALIGNMENT)
+    _write_string_gguf(buf, name)
+    _write_u32_le(buf, 2)
+    _write_u64_le(buf, dim0)
+    _write_u64_le(buf, dim1)
+    _write_u32_le(buf, ttype)
+    _write_u64_le(buf, off)
+    return off
+
+
+def _emit_tensor_info_1d(mut buf: List[UInt8], name: String, dim0: Int, ttype: Int, cursor: Int) raises -> Int:
+    """Emit 1-D tensor info at a 32-aligned offset; returns the aligned offset."""
+    var off = _align_offset(cursor, GGUF_DEFAULT_ALIGNMENT)
+    _write_string_gguf(buf, name)
+    _write_u32_le(buf, 1)
+    _write_u64_le(buf, dim0)
+    _write_u32_le(buf, ttype)
+    _write_u64_le(buf, off)
+    return off
+
+
+def _pad_data(mut buf: List[UInt8]):
+    """Pad the data section so the next tensor starts at a 32-aligned offset."""
+    while len(buf) % GGUF_DEFAULT_ALIGNMENT != 0:
+        buf.append(0)
+
+
+def _write_q8_blocks(mut buf: List[UInt8], scale: Float32, numel: Int, value_fn: Int) -> None:
+    """Write numel/32 Q8_0 blocks using deterministic per-index patterns.
+
+    value_fn selects the value pattern (kept in INT8 range):
+      0 -> (i % 100) + 1, 1 -> (i % 11) - 5, 2 -> (i % 13) - 6, 3 -> (i % 7) - 3
+    """
+    var block = List[Int]()
+    for i in range(numel):
+        var v = 0
+        if value_fn == 0:
+            v = (i % 100) + 1
+        elif value_fn == 1:
+            v = (i % 11) - 5
+        elif value_fn == 2:
+            v = (i % 13) - 6
+        else:
+            v = (i % 7) - 3
+        block.append(v)
+        if len(block) == 32:
+            _write_q8_block(buf, scale, block)
+            block = List[Int]()
+    if len(block) > 0:
+        _write_q8_block(buf, scale, block)
+
+
 def _build_mixed_gguf() raises -> List[UInt8]:
     """Build GGUF with F32 embed/norm/lm_head + Q8_0 projection weights.
 
-    Model: 1 layer, hidden=4, heads=2, kv_heads=1, head_dim=2, ffn=8, vocab=8
-    This creates a model matching tiny_test_params except vocab=8.
+    Model: 1 layer, hidden=32, heads=4 (head_dim=8), kv_heads=1, ffn=32, vocab=32.
+    Dims chosen so every Q8_0 tensor holds whole 32-element blocks and every
+    tensor offset is 32-aligned, as strict GGUF admission requires.
     """
     var buf = List[UInt8]()
 
-    var hidden = 4
-    var q_dim = 4   # num_q_heads*head_dim = 2*2
-    var kv_dim = 2  # num_kv_heads*head_dim = 1*2
-    var ffn_dim = 8
-    var vocab = 8
+    var hidden = 32
+    var q_dim = 32   # num_q_heads*head_dim = 4*8
+    var kv_dim = 8   # num_kv_heads*head_dim = 1*8
+    var ffn_dim = 32
+    var vocab = 32
 
     # Tensor count: 12 (embed, output_norm, output, attn_norm, q, k, v, o, ffn_norm, gate, up, down)
     var tensor_count = 12
@@ -224,7 +279,7 @@ def _build_mixed_gguf() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "llama.attention.head_count")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 2)
+    _write_u32_le(buf, 4)
 
     _write_string_gguf(buf, "llama.attention.head_count_kv")
     _write_u32_le(buf, 4)
@@ -242,205 +297,119 @@ def _build_mixed_gguf() raises -> List[UInt8]:
     _write_u32_le(buf, 4)
     _write_u32_le(buf, 32)
 
-    # Tensor info — compute data offsets
-    # F32 tensors: token_embd (vocab*hidden), output_norm (hidden), output (vocab*hidden)
-    # F32 tensors: blk.0.attn_norm (hidden), blk.0.ffn_norm (hidden)
-    # Q8_0 tensors: blk.0.attn_q, attn_k, attn_v, attn_output, ffn_gate, ffn_up, ffn_down
+    # Tensor info — GGUF dims are fastest-varying-first (reverse of row-major),
+    # offsets advance over each tensor's encoded byte size and stay 32-aligned.
     var data_cursor = 0
 
-    # token_embd [vocab, hidden] F32
+    # token_embd row-major [vocab, hidden] F32
     var embed_numel = vocab * hidden
-    _write_string_gguf(buf, "token_embd.weight")
-    _write_u32_le(buf, 2)  # ndims
-    _write_u64_le(buf, vocab)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)  # F32 type
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "token_embd.weight", hidden, vocab, 0, data_cursor)
     data_cursor += embed_numel * 4
 
     # output_norm [hidden] F32
-    _write_string_gguf(buf, "output_norm.weight")
-    _write_u32_le(buf, 1)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info_1d(buf, "output_norm.weight", hidden, 0, data_cursor)
     data_cursor += hidden * 4
 
-    # output [vocab, hidden] F32
-    _write_string_gguf(buf, "output.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, vocab)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    # output row-major [vocab, hidden] F32
+    _ = _emit_tensor_info(buf, "output.weight", hidden, vocab, 0, data_cursor)
     data_cursor += vocab * hidden * 4
 
     # blk.0.attn_norm [hidden] F32
-    _write_string_gguf(buf, "blk.0.attn_norm.weight")
-    _write_u32_le(buf, 1)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info_1d(buf, "blk.0.attn_norm.weight", hidden, 0, data_cursor)
     data_cursor += hidden * 4
 
-    # Q8_0 projections — each is blocks of 32 elements
-    # Q8_0 block size = 34 bytes (2 scale + 32 int8)
-    # For tensors smaller than 32 elements, still 1 block
+    # Q8_0 projections — whole 32-element blocks (34 bytes each)
+    var attn_q_numel = q_dim * hidden      # 1024 -> 32 blocks
+    var attn_k_numel = kv_dim * hidden     # 256 -> 8 blocks
+    var attn_v_numel = kv_dim * hidden     # 256 -> 8 blocks
+    var attn_o_numel = hidden * q_dim      # 1024 -> 32 blocks
+    var ffn_gate_numel = ffn_dim * hidden  # 1024 -> 32 blocks
+    var ffn_up_numel = ffn_dim * hidden    # 1024 -> 32 blocks
+    var ffn_down_numel = hidden * ffn_dim  # 1024 -> 32 blocks
 
-    # blk.0.attn_q [q_dim, hidden] = 16 elements -> 1 block = 34 bytes
-    var attn_q_numel = q_dim * hidden
-    var attn_q_blocks = (attn_q_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.attn_q.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, q_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 8)  # Q8_0 type
-    _write_u64_le(buf, data_cursor)
-    data_cursor += attn_q_blocks * 34
+    # row-major [q_dim, hidden] -> GGUF [hidden, q_dim]
+    _ = _emit_tensor_info(buf, "blk.0.attn_q.weight", hidden, q_dim, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + attn_q_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
-    # blk.0.attn_k [kv_dim, hidden] = 8 elements -> 1 block
-    var attn_k_numel = kv_dim * hidden
-    var attn_k_blocks = (attn_k_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.attn_k.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, kv_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 8)
-    _write_u64_le(buf, data_cursor)
-    data_cursor += attn_k_blocks * 34
+    # row-major [kv_dim, hidden] -> GGUF [hidden, kv_dim]
+    _ = _emit_tensor_info(buf, "blk.0.attn_k.weight", hidden, kv_dim, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + attn_k_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
-    # blk.0.attn_v [kv_dim, hidden] = 8 elements -> 1 block
-    var attn_v_numel = kv_dim * hidden
-    var attn_v_blocks = (attn_v_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.attn_v.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, kv_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 8)
-    _write_u64_le(buf, data_cursor)
-    data_cursor += attn_v_blocks * 34
+    _ = _emit_tensor_info(buf, "blk.0.attn_v.weight", hidden, kv_dim, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + attn_v_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
-    # blk.0.attn_output [hidden, q_dim] = 16 elements -> 1 block
-    var attn_o_numel = hidden * q_dim
-    var attn_o_blocks = (attn_o_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.attn_output.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, hidden)
-    _write_u64_le(buf, q_dim)
-    _write_u32_le(buf, 8)
-    _write_u64_le(buf, data_cursor)
-    data_cursor += attn_o_blocks * 34
+    # row-major [hidden, q_dim] -> GGUF [q_dim, hidden]
+    _ = _emit_tensor_info(buf, "blk.0.attn_output.weight", q_dim, hidden, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + attn_o_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
     # blk.0.ffn_norm [hidden] F32
-    _write_string_gguf(buf, "blk.0.ffn_norm.weight")
-    _write_u32_le(buf, 1)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info_1d(buf, "blk.0.ffn_norm.weight", hidden, 0, data_cursor)
     data_cursor += hidden * 4
 
-    # blk.0.ffn_gate [ffn, hidden] = 32 elements -> 1 block
-    var ffn_gate_numel = ffn_dim * hidden
-    var ffn_gate_blocks = (ffn_gate_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.ffn_gate.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, ffn_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 8)
-    _write_u64_le(buf, data_cursor)
-    data_cursor += ffn_gate_blocks * 34
+    # row-major [ffn, hidden] -> GGUF [hidden, ffn]
+    _ = _emit_tensor_info(buf, "blk.0.ffn_gate.weight", hidden, ffn_dim, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + ffn_gate_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
-    # blk.0.ffn_up [ffn, hidden] = 32 elements -> 1 block
-    var ffn_up_numel = ffn_dim * hidden
-    var ffn_up_blocks = (ffn_up_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.ffn_up.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, ffn_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 8)
-    _write_u64_le(buf, data_cursor)
-    data_cursor += ffn_up_blocks * 34
+    _ = _emit_tensor_info(buf, "blk.0.ffn_up.weight", hidden, ffn_dim, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + ffn_up_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
-    # blk.0.ffn_down [hidden, ffn] = 32 elements -> 1 block
-    var ffn_down_numel = hidden * ffn_dim
-    var ffn_down_blocks = (ffn_down_numel + 31) // 32
-    _write_string_gguf(buf, "blk.0.ffn_down.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, hidden)
-    _write_u64_le(buf, ffn_dim)
-    _write_u32_le(buf, 8)
-    _write_u64_le(buf, data_cursor)
-    data_cursor += ffn_down_blocks * 34
+    # row-major [hidden, ffn] -> GGUF [ffn, hidden]
+    _ = _emit_tensor_info(buf, "blk.0.ffn_down.weight", ffn_dim, hidden, 8, data_cursor)
+    data_cursor = _align_offset(data_cursor + ffn_down_numel // 32 * 34, GGUF_DEFAULT_ALIGNMENT)
 
-    # Align
+    # Align header end to the data section boundary
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
     while len(buf) < aligned:
         buf.append(0)
 
-    # --- Tensor Data ---
+    # --- Tensor Data (same order; pad to 32 before each tensor) ---
 
-    # token_embd: vocab*hidden = 32 floats (F32)
+    # token_embd: vocab*hidden floats (F32)
+    _pad_data(buf)
     for i in range(embed_numel):
         _write_f32_le(buf, Float32(i) * 0.01)
 
-    # output_norm: hidden = 4 floats (F32)
+    # output_norm: hidden floats (F32)
+    _pad_data(buf)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
 
-    # output/lm_head: vocab*hidden = 32 floats (F32)
+    # output/lm_head: vocab*hidden floats (F32)
+    _pad_data(buf)
     for i in range(vocab * hidden):
         _write_f32_le(buf, Float32(i % 7) * 0.02)
 
-    # blk.0.attn_norm: hidden = 4 floats (F32)
+    # blk.0.attn_norm: hidden floats (F32)
+    _pad_data(buf)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
 
-    # Q8_0 projection data: attn_q (16 elements, 1 block)
-    # scale=0.5, values = [1, 2, 3, ..., 16, 0, 0, ..., 0]
-    var q_vals = List[Int]()
-    for i in range(attn_q_numel):
-        q_vals.append(i + 1)
-    _write_q8_block(buf, 0.5, q_vals)
+    # Q8_0 projection data
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.5, attn_q_numel, 0)
 
-    # attn_k (8 elements, 1 block)
-    var k_vals = List[Int]()
-    for i in range(attn_k_numel):
-        k_vals.append(i + 1)
-    _write_q8_block(buf, 0.25, k_vals)
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.25, attn_k_numel, 0)
 
-    # attn_v (8 elements, 1 block)
-    var v_vals = List[Int]()
-    for i in range(attn_v_numel):
-        v_vals.append(i + 1)
-    _write_q8_block(buf, 0.25, v_vals)
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.25, attn_v_numel, 0)
 
-    # attn_output (16 elements, 1 block)
-    var o_vals = List[Int]()
-    for i in range(attn_o_numel):
-        o_vals.append(i + 1)
-    _write_q8_block(buf, 0.5, o_vals)
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.5, attn_o_numel, 0)
 
-    # blk.0.ffn_norm: hidden = 4 floats (F32)
+    # blk.0.ffn_norm: hidden floats (F32)
+    _pad_data(buf)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
 
-    # ffn_gate (32 elements, 1 block)
-    var gate_vals = List[Int]()
-    for i in range(ffn_gate_numel):
-        gate_vals.append((i % 11) - 5)
-    _write_q8_block(buf, 0.125, gate_vals)
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.125, ffn_gate_numel, 1)
 
-    # ffn_up (32 elements, 1 block)
-    var up_vals = List[Int]()
-    for i in range(ffn_up_numel):
-        up_vals.append((i % 13) - 6)
-    _write_q8_block(buf, 0.125, up_vals)
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.125, ffn_up_numel, 2)
 
-    # ffn_down (32 elements, 1 block)
-    var down_vals = List[Int]()
-    for i in range(ffn_down_numel):
-        down_vals.append((i % 7) - 3)
-    _write_q8_block(buf, 0.125, down_vals)
+    _pad_data(buf)
+    _write_q8_blocks(buf, 0.125, ffn_down_numel, 3)
 
     return buf^
 
@@ -474,8 +443,8 @@ def test_load_direct_q8_from_buffer() raises:
     var buf = _build_mixed_gguf()
     var model = load_gguf_quantized_direct_from_buffer(buf^, block_size=32)
 
-    assert_eq(model.params.vocab_size, 8, "vocab=8")
-    assert_eq(model.params.hidden_dim, 4, "hidden=4")
+    assert_eq(model.params.vocab_size, 32, "vocab=32")
+    assert_eq(model.params.hidden_dim, 32, "hidden=32")
     assert_eq(model.params.num_layers, 1, "layers=1")
     assert_eq(model.block_size, 32, "block_size=32")
 
@@ -526,8 +495,8 @@ def test_direct_vs_roundtrip_equivalence() raises:
 
     # Both should produce valid tokens
     for i in range(3):
-        assert_true(rt_tokens[i] >= 0 and rt_tokens[i] < 8, "rt valid")
-        assert_true(dr_tokens[i] >= 0 and dr_tokens[i] < 8, "dr valid")
+        assert_true(rt_tokens[i] >= 0 and rt_tokens[i] < 32, "rt valid")
+        assert_true(dr_tokens[i] >= 0 and dr_tokens[i] < 32, "dr valid")
 
     # For F32 GGUF, both paths should give identical results
     for i in range(3):
@@ -550,7 +519,7 @@ def test_direct_q8_generates() raises:
 
     for i in range(len(tokens)):
         assert_true(tokens[i] >= 0, "token >= 0")
-        assert_true(tokens[i] < 8, "token < vocab_size")
+        assert_true(tokens[i] < 32, "token < vocab_size")
 
     print("  direct_q8_generates: PASS")
 
@@ -562,15 +531,16 @@ def test_direct_q8_generates() raises:
 def _build_all_f32_gguf() raises -> List[UInt8]:
     """Build all-F32 GGUF for equivalence testing (same architecture as mixed).
 
-    Model: 1 layer, hidden=4, heads=2, kv_heads=1, head_dim=2, ffn=8, vocab=8
+    Model: 1 layer, hidden=32, heads=4 (head_dim=8), kv_heads=1, ffn=32, vocab=32.
+    All F32 byte sizes are multiples of 32 so offsets stay aligned.
     """
     var buf = List[UInt8]()
 
-    var hidden = 4
-    var q_dim = 4
-    var kv_dim = 2
-    var ffn_dim = 8
-    var vocab = 8
+    var hidden = 32
+    var q_dim = 32
+    var kv_dim = 8
+    var ffn_dim = 32
+    var vocab = 32
 
     var tensor_count = 12
     var meta_count = 8
@@ -596,7 +566,7 @@ def _build_all_f32_gguf() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "llama.attention.head_count")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 2)
+    _write_u32_le(buf, 4)
 
     _write_string_gguf(buf, "llama.attention.head_count_kv")
     _write_u32_le(buf, 4)
@@ -614,112 +584,43 @@ def _build_all_f32_gguf() raises -> List[UInt8]:
     _write_u32_le(buf, 4)
     _write_u32_le(buf, 32)
 
-    # All tensor info — all F32
+    # All tensor info — all F32, GGUF dims fastest-varying-first
     var data_cursor = 0
 
-    # token_embd
-    _write_string_gguf(buf, "token_embd.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, vocab)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "token_embd.weight", hidden, vocab, 0, data_cursor)
     data_cursor += vocab * hidden * 4
 
-    # output_norm
-    _write_string_gguf(buf, "output_norm.weight")
-    _write_u32_le(buf, 1)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info_1d(buf, "output_norm.weight", hidden, 0, data_cursor)
     data_cursor += hidden * 4
 
-    # output
-    _write_string_gguf(buf, "output.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, vocab)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "output.weight", hidden, vocab, 0, data_cursor)
     data_cursor += vocab * hidden * 4
 
-    # blk.0.attn_norm
-    _write_string_gguf(buf, "blk.0.attn_norm.weight")
-    _write_u32_le(buf, 1)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info_1d(buf, "blk.0.attn_norm.weight", hidden, 0, data_cursor)
     data_cursor += hidden * 4
 
-    # blk.0.attn_q
-    _write_string_gguf(buf, "blk.0.attn_q.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, q_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.attn_q.weight", hidden, q_dim, 0, data_cursor)
     data_cursor += q_dim * hidden * 4
 
-    # blk.0.attn_k
-    _write_string_gguf(buf, "blk.0.attn_k.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, kv_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.attn_k.weight", hidden, kv_dim, 0, data_cursor)
     data_cursor += kv_dim * hidden * 4
 
-    # blk.0.attn_v
-    _write_string_gguf(buf, "blk.0.attn_v.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, kv_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.attn_v.weight", hidden, kv_dim, 0, data_cursor)
     data_cursor += kv_dim * hidden * 4
 
-    # blk.0.attn_output
-    _write_string_gguf(buf, "blk.0.attn_output.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, hidden)
-    _write_u64_le(buf, q_dim)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.attn_output.weight", q_dim, hidden, 0, data_cursor)
     data_cursor += hidden * q_dim * 4
 
-    # blk.0.ffn_norm
-    _write_string_gguf(buf, "blk.0.ffn_norm.weight")
-    _write_u32_le(buf, 1)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info_1d(buf, "blk.0.ffn_norm.weight", hidden, 0, data_cursor)
     data_cursor += hidden * 4
 
-    # blk.0.ffn_gate
-    _write_string_gguf(buf, "blk.0.ffn_gate.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, ffn_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.ffn_gate.weight", hidden, ffn_dim, 0, data_cursor)
     data_cursor += ffn_dim * hidden * 4
 
-    # blk.0.ffn_up
-    _write_string_gguf(buf, "blk.0.ffn_up.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, ffn_dim)
-    _write_u64_le(buf, hidden)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.ffn_up.weight", hidden, ffn_dim, 0, data_cursor)
     data_cursor += ffn_dim * hidden * 4
 
-    # blk.0.ffn_down
-    _write_string_gguf(buf, "blk.0.ffn_down.weight")
-    _write_u32_le(buf, 2)
-    _write_u64_le(buf, hidden)
-    _write_u64_le(buf, ffn_dim)
-    _write_u32_le(buf, 0)
-    _write_u64_le(buf, data_cursor)
+    _ = _emit_tensor_info(buf, "blk.0.ffn_down.weight", ffn_dim, hidden, 0, data_cursor)
     data_cursor += hidden * ffn_dim * 4
 
     # Align
@@ -727,52 +628,64 @@ def _build_all_f32_gguf() raises -> List[UInt8]:
     while len(buf) < aligned:
         buf.append(0)
 
-    # Tensor data — all F32
+    # Tensor data — all F32 (same order as tensor infos)
     # token_embd
+    _pad_data(buf)
     for i in range(vocab * hidden):
         _write_f32_le(buf, Float32(i) * 0.01)
 
     # output_norm
+    _pad_data(buf)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
 
     # output/lm_head
+    _pad_data(buf)
     for i in range(vocab * hidden):
         _write_f32_le(buf, Float32(i % 7) * 0.02)
 
     # blk.0.attn_norm
+    _pad_data(buf)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
 
     # blk.0.attn_q
+    _pad_data(buf)
     for i in range(q_dim * hidden):
         _write_f32_le(buf, Float32(i % 5) * 0.01)
 
     # blk.0.attn_k
+    _pad_data(buf)
     for i in range(kv_dim * hidden):
         _write_f32_le(buf, Float32(i % 3) * 0.01)
 
     # blk.0.attn_v
+    _pad_data(buf)
     for i in range(kv_dim * hidden):
         _write_f32_le(buf, Float32(i % 4) * 0.01)
 
     # blk.0.attn_output
+    _pad_data(buf)
     for i in range(hidden * q_dim):
         _write_f32_le(buf, Float32(i % 6) * 0.01)
 
     # blk.0.ffn_norm
+    _pad_data(buf)
     for _ in range(hidden):
         _write_f32_le(buf, Float32(1.0))
 
     # blk.0.ffn_gate
+    _pad_data(buf)
     for i in range(ffn_dim * hidden):
         _write_f32_le(buf, Float32(i % 11) * 0.001)
 
     # blk.0.ffn_up
+    _pad_data(buf)
     for i in range(ffn_dim * hidden):
         _write_f32_le(buf, Float32(i % 13) * 0.001)
 
     # blk.0.ffn_down
+    _pad_data(buf)
     for i in range(hidden * ffn_dim):
         _write_f32_le(buf, Float32(i % 7) * 0.001)
 

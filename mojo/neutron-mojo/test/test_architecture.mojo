@@ -100,8 +100,13 @@ def test_from_name_all() raises:
     assert_true(arch_from_name("phi").kind == ArchitectureKind.Phi, "phi")
     assert_true(arch_from_name("gemma").kind == ArchitectureKind.Gemma, "gemma")
     assert_true(arch_from_name("qwen").kind == ArchitectureKind.Qwen, "qwen")
-    # Unknown defaults to Llama
-    assert_true(arch_from_name("unknown_model").kind == ArchitectureKind.Llama, "unknown -> Llama")
+    # Unknown names are refused rather than silently defaulting
+    var refused = False
+    try:
+        _ = arch_from_name("unknown_model")
+    except:
+        refused = True
+    assert_true(refused, "unknown -> refused")
     print("  from_name_all: PASS")
 
 
@@ -150,15 +155,20 @@ def test_forward_with_default_arch() raises:
 
 
 def test_forward_with_gelu_arch() raises:
-    """Forward pass with GeLU activation (Phi-like)."""
+    """Phi-like GeLU forward is refused on this execution path (pre-norm bias unimplemented)."""
     var p = tiny_test_params()
+    p.head_dim = 4
     p.arch = phi_arch(0.5)
     var model = Model(p)
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
-    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    var logits = model.forward(0, cache, rope, 0)
-    assert_true(logits.numel() == p.vocab_size, "Logits should be vocab_size")
-    print("  forward_with_gelu_arch: PASS")
+    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta, p.head_dim // 2)
+    var refused = False
+    try:
+        _ = model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "norm-bias execution path must be refused")
+    print("  forward_with_gelu_arch: PASS (refused as documented)")
 
 
 def main() raises:

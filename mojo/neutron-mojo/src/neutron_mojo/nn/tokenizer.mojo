@@ -47,6 +47,36 @@ struct MergeRule(Copyable, Movable, ImplicitlyCopyable):
 # BPE Tokenizer
 # ===----------------------------------------------------------------------=== #
 
+def _gpt2_visible_byte(b: Int) -> Bool:
+    return (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or (b >= 174 and b <= 255)
+
+
+def _byte_symbol(b: Int, encoding: Int) -> String:
+    if encoding == 0 or _gpt2_visible_byte(b):
+        return chr(b)
+    var index = 0
+    for candidate in range(b):
+        if not _gpt2_visible_byte(candidate):
+            index += 1
+    return chr(256 + index)
+
+
+def _symbol_byte(codepoint: Int, encoding: Int) raises -> UInt8:
+    if encoding == 0:
+        if codepoint < 0 or codepoint > 255:
+            raise Error("Vocabulary does not use the Latin-1 byte alphabet")
+        return UInt8(codepoint)
+    if codepoint <= 255 and _gpt2_visible_byte(codepoint):
+        return UInt8(codepoint)
+    var index = 0
+    for b in range(256):
+        if not _gpt2_visible_byte(b):
+            if codepoint == 256 + index:
+                return UInt8(b)
+            index += 1
+    raise Error("Vocabulary does not use the GPT-2 byte alphabet")
+
+
 struct BPETokenizer(Movable):
     """Byte-level BPE tokenizer.
 
@@ -67,6 +97,7 @@ struct BPETokenizer(Movable):
     var unk_id: Int
     var pad_id: Int
     var vocab_size: Int
+    var byte_encoding: Int  # 0: Latin-1 local byte alphabet, 1: GPT-2
 
     def __init__(out self):
         """Create an empty tokenizer."""
@@ -79,6 +110,7 @@ struct BPETokenizer(Movable):
         self.unk_id = -1
         self.pad_id = -1
         self.vocab_size = 0
+        self.byte_encoding = 0
 
     def __init__(out self, *, deinit move: Self):
         self.id_to_token = move.id_to_token^
@@ -90,6 +122,7 @@ struct BPETokenizer(Movable):
         self.unk_id = move.unk_id^
         self.pad_id = move.pad_id^
         self.vocab_size = move.vocab_size^
+        self.byte_encoding = move.byte_encoding^
 
     def add_token(mut self, token: String) -> Int:
         """Add a token to the vocabulary.
@@ -178,7 +211,7 @@ struct BPETokenizer(Movable):
         var tokens = List[String]()
         var bytes = text.as_bytes()
         for i in range(len(bytes)):
-            tokens.append(chr(Int(bytes[i])))
+            tokens.append(_byte_symbol(Int(bytes[i]), self.byte_encoding))
 
         # Step 2: Iteratively apply merges
         var changed = True
@@ -245,38 +278,56 @@ struct BPETokenizer(Movable):
 
     # === Decode ===
 
-    def decode(self, ids: List[Int]) -> String:
-        """Decode token IDs back to text.
-
-        Args:
-            ids: List of token IDs.
-
-        Returns:
-            Decoded text string.
-        """
-        var result = String("")
+    def decode_bytes(self, ids: List[Int]) raises -> List[UInt8]:
+        """Recover token bytes; UTF-8 may be incomplete across token boundaries."""
+        if self.byte_encoding != 0 and self.byte_encoding != 1:
+            raise Error("Unsupported tokenizer byte alphabet")
+        var bytes = List[UInt8]()
         for i in range(len(ids)):
             var id = ids[i]
+            if id < 0 or id >= self.vocab_size or id >= len(self.id_to_token):
+                raise Error("Invalid tokenizer token ID")
             if id == self.bos_id or id == self.eos_id or id == self.pad_id:
                 continue
-            if id >= 0 and id < self.vocab_size:
-                result += self.id_to_token[id]
-            else:
-                result += "<unk>"
-        return result^
+            var symbol = self.id_to_token[id]
+            var p = 0
+            while p < symbol.byte_length():
+                # String[byte=p] yields the codepoint starting at boundary p
+                # (and refuses mid-codepoint indices), so iterate codepoints
+                # and advance by each one's UTF-8 width. This is equivalent to
+                # reading the raw UTF-8 bytes and recombining 2-byte pairs.
+                var c = ord(symbol[byte=p])
+                var width = 1
+                if c < 128:
+                    width = 1
+                elif c < 2048:
+                    width = 2
+                elif c < 65536:
+                    width = 3
+                else:
+                    width = 4
+                if p + width > symbol.byte_length():
+                    raise Error("Invalid tokenizer byte symbol")
+                bytes.append(_symbol_byte(c, self.byte_encoding))
+                p += width
+        return bytes^
 
-    def decode_single(self, id: Int) -> String:
-        """Decode a single token ID.
+    def decode(self, ids: List[Int]) raises -> String:
+        """Recover the byte alphabet, then decode complete UTF-8 exactly once."""
+        return String(from_utf8=self.decode_bytes(ids))
 
-        Args:
-            id: Token ID.
+    def decode_single(self, id: Int) raises -> String:
+        """Decode a complete one-token UTF-8 value; streaming uses decode_bytes.
 
-        Returns:
-            Token string.
+        Out-of-range IDs keep the documented "<unk>" fallback so callers can
+        surface unknown tokens; strict ID admission lives in decode_bytes.
         """
-        if id >= 0 and id < self.vocab_size:
-            return String(self.id_to_token[id])
-        return String("<unk>")
+        if id < 0 or id >= self.vocab_size or id >= len(self.id_to_token):
+            return String("<unk>")
+        var ids = List[Int]()
+        ids.append(id)
+        return self.decode(ids)
+
 
 
 # ===----------------------------------------------------------------------=== #
@@ -300,11 +351,7 @@ def build_byte_level_vocab(mut tokenizer: BPETokenizer):
         tokenizer: Tokenizer to populate.
     """
     for i in range(256):
-        if i >= 32 and i < 127:
-            _ = tokenizer.add_token(chr(i))
-        else:
-            var s = String("<0x") + _hex_char(i >> 4) + _hex_char(i & 0x0F) + ">"
-            _ = tokenizer.add_token(s)
+        _ = tokenizer.add_token(_byte_symbol(i, tokenizer.byte_encoding))
 
 
 def build_test_tokenizer() -> BPETokenizer:
@@ -414,7 +461,8 @@ def load_gguf_tokenizer(
     token_merges: List[String],
     bos_id: Int,
     eos_id: Int,
-) -> BPETokenizer:
+    model_type: String = "latin1",
+) raises -> BPETokenizer:
     """Create a BPETokenizer from GGUF tokenizer data.
 
     Args:
@@ -427,7 +475,10 @@ def load_gguf_tokenizer(
     Returns:
         Configured BPETokenizer.
     """
+    if model_type != "latin1" and model_type != "gpt2":
+        raise Error("This byte-BPE tokenizer requires latin1 or gpt2 metadata; SentencePiece needs a separate adapter")
     var tok = BPETokenizer()
+    tok.byte_encoding = 1 if model_type == "gpt2" else 0
 
     # Add all vocab tokens
     for i in range(len(token_vocab)):

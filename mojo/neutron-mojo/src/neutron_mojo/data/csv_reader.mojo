@@ -36,31 +36,29 @@ def parse_csv_line(line: String, delimiter: String = ",") -> CSVRow:
     Simple parser: splits on delimiter, no quote handling.
     """
     var row = CSVRow()
-    var current = String("")
+    var current = List[UInt8]()
     var delim_byte = ord(delimiter[byte=0])
 
     for i in range(line.byte_length()):
         var ch = ord(line[byte=i])
         if ch == delim_byte:
-            row.fields.append(current)
-            current = String("")
+            row.fields.append(String(unsafe_from_utf8=current))
+            current = List[UInt8]()
         elif ch == 13:  # skip CR
             pass
         elif ch == 10:  # skip LF
             pass
         else:
-            # Build character
-            var buf = List[UInt8]()
-            buf.append(UInt8(ch))
-            buf.append(0)
-            current += String(buf^)
+            # Decode the complete field once. String(List[UInt8]) formats the
+            # list on Mojo 1.x; decoding individual bytes also splits UTF-8.
+            current.append(UInt8(ch))
 
     # Last field — appended unconditionally (MJ-16): a line ending with the
     # delimiter carries a trailing EMPTY field, and the old
     # `byte_length() > 0` guard dropped it, shrinking the row width and
     # shifting downstream schema interpretation. A wholly empty line still
     # yields zero fields (blank-line handling stays a caller concern).
-    if current.byte_length() > 0 or len(row.fields) > 0:
-        row.fields.append(current)
+    if len(current) > 0 or len(row.fields) > 0:
+        row.fields.append(String(unsafe_from_utf8=current))
 
     return row^

@@ -341,7 +341,15 @@ struct MixedQuantModel(Movable):
     var scales_per_layer: Int
 
     def __init__(out self, params: ModelParams, layer_modes: List[Int],
-                block_size: Int = 32):
+                block_size: Int = 32) raises:
+        params.validate()
+        if block_size <= 0:
+            raise Error("Quantization block size must be positive")
+        if len(layer_modes) != params.num_layers:
+            raise Error("Mixed quantization requires one mode per layer")
+        for mode in layer_modes:
+            if mode < 0 or mode > 2:
+                raise Error("Unknown mixed quantization mode")
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
         self.block_size = block_size
@@ -395,6 +403,25 @@ struct MixedQuantModel(Movable):
         self.block_size = move.block_size^
         self.scales_per_layer = move.scales_per_layer^
 
+    def validate_storage(self) raises:
+        """Check model metadata against actual owned spans before forward access."""
+        self.params.validate()
+        var p = self.params.copy()
+        var matrix_count = Shape(p.vocab_size, p.hidden_dim).numel()
+        var layer_count = p.layer_weight_count()
+        if self.layer_size != layer_count or self.embed.numel() != matrix_count or self.lm_head.numel() != matrix_count or self.final_norm.numel() != p.hidden_dim or self.layer_weights.numel() != Shape(p.num_layers, layer_count).numel():
+            raise Error("Model parameter storage does not match metadata")
+        if self.block_size <= 0:
+            raise Error("Invalid model quantization block size")
+        var scales = _scales_count(p.q_dim(), p.hidden_dim, self.block_size) + _scales_count(p.kv_dim(), p.hidden_dim, self.block_size) * 2 + _scales_count(p.hidden_dim, p.q_dim(), self.block_size) + _scales_count(p.ffn_dim, p.hidden_dim, self.block_size) * 2 + _scales_count(p.hidden_dim, p.ffn_dim, self.block_size)
+        if self.scales_per_layer != scales or self.layer_scales.numel() != Shape(p.num_layers, scales).numel():
+            raise Error("Model scale storage does not match metadata")
+        if len(self.layer_modes) != p.num_layers:
+            raise Error("Mixed quantization layer mode count mismatch")
+        for mode in self.layer_modes:
+            if mode < 0 or mode > 2:
+                raise Error("Unknown mixed quantization layer mode")
+
     def _layer_scale_offsets(self, layer: Int) -> LayerScaleOffsets:
         """Compute scale offsets for a layer's projections."""
         return _compute_scale_offsets(
@@ -409,7 +436,7 @@ struct MixedQuantModel(Movable):
         scales_offset: Int,
         out_dim: Int,
         in_dim: Int,
-    ) -> Tensor[DType.float32]:
+    ) raises -> Tensor[DType.float32]:
         """Dispatch linear to FP32 or quantized path based on mode."""
         var result = Tensor[DType.float32](Shape(out_dim))
         if mode == 0:
@@ -434,6 +461,11 @@ struct MixedQuantModel(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Forward pass through a single layer with mixed-precision dispatch."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        if x.numel() != self.params.hidden_dim:
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1, layer)
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = _compute_offsets(p, layer)
@@ -534,6 +566,9 @@ struct MixedQuantModel(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Full forward pass: embed -> N mixed-precision layers -> norm -> logits."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1)
         var hidden = embed_token(self.embed, token_id, self.params.hidden_dim)
 
         for layer in range(self.params.num_layers):
@@ -574,7 +609,7 @@ def quantize_mixed(
     model: Model,
     layer_modes: List[Int],
     block_size: Int = 32,
-) -> MixedQuantModel:
+) raises -> MixedQuantModel:
     """Convert FP32 Model to MixedQuantModel with per-layer modes.
 
     Args:
@@ -724,7 +759,7 @@ def auto_quantize(
     model: Model,
     q4_threshold: Float32 = 0.01,
     block_size: Int = 32,
-) -> MixedQuantModel:
+) raises -> MixedQuantModel:
     """One-call sensitivity analysis + calibration + quantization.
 
     Chains analyze_sensitivity -> auto_calibrate -> quantize_mixed into
@@ -766,7 +801,12 @@ def mixed_generate(
         Generated token IDs (not including prompt).
     """
     var p = model.params.copy()
-    var total_len = len(prompt_tokens) + max_new_tokens
+    var total_len = p.validate_generation(prompt_tokens, max_new_tokens, p.max_seq_len)
+    from std.math import isfinite
+    if not isfinite(temperature) or temperature < 0:
+        raise Error("Invalid generation temperature")
+    if max_new_tokens == 0:
+        return List[Int]()
 
     var cache = MultiLayerKVCache(
         num_layers=p.num_layers,
@@ -778,6 +818,7 @@ def mixed_generate(
         head_dim=p.head_dim,
         max_seq_len=total_len,
         theta=p.rope_theta,
+        rotary_dim=p.rotary_dim(),
     )
 
     var generated = List[Int]()

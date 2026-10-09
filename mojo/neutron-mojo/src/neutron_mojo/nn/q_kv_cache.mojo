@@ -9,7 +9,7 @@ reducing memory usage by ~4x compared to FP32. Dequantizes on-the-fly
 during attention computation.
 """
 
-from std.math import abs as math_abs
+from std.math import abs as math_abs, sqrt
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
@@ -36,7 +36,7 @@ def quantize_vector_q8(
     src: Tensor[DType.float32],
     offset: Int,
     length: Int,
-) -> QuantResult:
+) raises -> QuantResult:
     """Quantize a float vector to INT8 range [-127, 127].
 
     Returns QuantResult with scale factor and quantized values.
@@ -110,7 +110,7 @@ struct Q8KVCache(Movable):
     var head_dim: Int
     var length: Int
 
-    def __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int):
+    def __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int) raises:
         self.max_seq_len = max_seq_len
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -184,7 +184,7 @@ struct Q8KVCache(Movable):
         var scale_idx = pos * self.num_kv_heads + head
         return self.value_data.get(data_offset) * self.value_scales.get(scale_idx)
 
-    def get_key_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_key_head_vector(self, pos: Int, head: Int) raises -> Tensor[DType.float32]:
         """Get dequantized key vector for a position and head."""
         var result = Tensor[DType.float32](Shape(self.head_dim))
         var scale_idx = pos * self.num_kv_heads + head
@@ -194,7 +194,7 @@ struct Q8KVCache(Movable):
             result.set(d, self.key_data.get(base + d) * scale)
         return result^
 
-    def get_value_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_value_head_vector(self, pos: Int, head: Int) raises -> Tensor[DType.float32]:
         """Get dequantized value vector for a position and head."""
         var result = Tensor[DType.float32](Shape(self.head_dim))
         var scale_idx = pos * self.num_kv_heads + head
@@ -235,7 +235,7 @@ def q8_attention_single_head(
     q_head: Int,
     kv_head: Int,
     head_dim: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Compute attention for a single Q head using quantized KV cache.
 
     Dequantizes K/V on-the-fly during the dot product computation.
@@ -254,15 +254,7 @@ def q8_attention_single_head(
     if seq_len == 0:
         return Tensor[DType.float32](Shape(head_dim))
 
-    var inv_sqrt_d = Float32(1.0)
-    if head_dim > 1:
-        # 1/sqrt(head_dim) — compute manually
-        var d = Float32(head_dim)
-        # Newton's method for 1/sqrt: start with reasonable guess
-        var x = Float32(0.5)
-        for _ in range(10):
-            x = x * (1.5 - 0.5 * d * x * x)
-        inv_sqrt_d = x
+    var inv_sqrt_d = Float32(1.0) / sqrt(Float32(head_dim))
 
     # Compute attention scores: Q dot K^T / sqrt(d)
     var scores = Tensor[DType.float32](Shape(seq_len))
@@ -282,7 +274,7 @@ def q8_attention_single_head(
         if v > max_score:
             max_score = v
 
-    from std.math import exp
+    from std.math import exp, sqrt
     var sum_exp: Float32 = 0.0
     for i in range(seq_len):
         var e = Float32(exp(Float64(scores.get(i) - max_score)))
@@ -341,7 +333,11 @@ struct MultiLayerQ8KVCache(Movable):
         max_seq_len: Int,
         num_kv_heads: Int,
         head_dim: Int,
-    ):
+    ) raises:
+        if num_layers <= 0 or max_seq_len < 0 or num_kv_heads <= 0 or head_dim <= 0:
+            raise Error("Invalid multi-layer KV cache dimensions")
+        var admitted_data = Shape(num_layers, max_seq_len, num_kv_heads, head_dim)
+        var admitted_scales = Shape(num_layers, max_seq_len, num_kv_heads)
         self.num_layers = num_layers
         self.max_seq_len = max_seq_len
         self.num_kv_heads = num_kv_heads
@@ -384,6 +380,25 @@ struct MultiLayerQ8KVCache(Movable):
         """Elements per position (num_kv_heads * head_dim)."""
         return self.num_kv_heads * self.head_dim
 
+    def validate_request(self, num_layers: Int, num_kv_heads: Int, head_dim: Int,
+                         pos: Int, count: Int, layer: Int = -1) raises:
+        """Admit layout, storage spans and append position before any cache write."""
+        if self.num_layers != num_layers or self.num_kv_heads != num_kv_heads or self.head_dim != head_dim or self.max_seq_len < 0:
+            raise Error("KV cache/model layout mismatch")
+        if num_layers <= 0 or num_kv_heads <= 0 or head_dim <= 0 or len(self.lengths) != num_layers:
+            raise Error("Invalid KV cache metadata")
+        var total = Shape(num_layers, self.max_seq_len, num_kv_heads, head_dim).numel()
+        if self.key_data.numel() != total or self.value_data.numel() != total:
+            raise Error("KV cache storage span mismatch")
+        var scales = Shape(num_layers, self.max_seq_len, num_kv_heads).numel()
+        if self.key_scales.numel() != scales or self.value_scales.numel() != scales:
+            raise Error("Q8 KV scale storage span mismatch")
+        if pos < 0 or count < 0 or pos > self.max_seq_len or count > self.max_seq_len - pos or layer < -1 or layer >= num_layers:
+            raise Error("KV cache request exceeds capacity")
+        for i in range(num_layers):
+            if (layer == -1 or layer == i) and self.lengths[i] != pos:
+                raise Error("KV cache append position does not match filled length")
+
     def append_kv(
         mut self,
         layer: Int,
@@ -399,7 +414,13 @@ struct MultiLayerQ8KVCache(Movable):
             value: FP32 values, same shape.
             num_new_tokens: Positions to append.
         """
+        if layer < 0 or layer >= self.num_layers or len(self.lengths) != self.num_layers:
+            raise Error("KV cache layer index out of range")
         var cur_len = self.lengths[layer]
+        self.validate_request(self.num_layers, self.num_kv_heads, self.head_dim, cur_len, num_new_tokens, layer)
+        var input_count = Shape(num_new_tokens, self.num_kv_heads, self.head_dim).numel()
+        if key.numel() != input_count or value.numel() != input_count:
+            raise Error("KV cache append input span mismatch")
         if cur_len + num_new_tokens > self.max_seq_len:
             raise Error("Q8 KV cache overflow at layer " + String(layer))
 
@@ -428,7 +449,7 @@ struct MultiLayerQ8KVCache(Movable):
 
         self.lengths[layer] = cur_len + num_new_tokens
 
-    def get_layer_cache(self, layer: Int) -> Q8KVCache:
+    def get_layer_cache(self, layer: Int) raises -> Q8KVCache:
         """Extract a single layer's cache as a Q8KVCache (copy).
 
         Args:
@@ -492,7 +513,7 @@ def q8_gqa_attention(
     num_q_heads: Int,
     num_kv_heads: Int,
     head_dim: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """GQA attention using quantized KV cache.
 
     Args:

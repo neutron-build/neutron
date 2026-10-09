@@ -31,7 +31,7 @@ struct KVCache(Movable):
     var head_dim: Int
     var length: Int  # Number of positions currently cached
 
-    def __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int):
+    def __init__(out self, max_seq_len: Int, num_kv_heads: Int, head_dim: Int) raises:
         """Create an empty KV cache.
 
         Args:
@@ -115,7 +115,7 @@ struct KVCache(Movable):
         var offset = pos * self.num_kv_heads * self.head_dim + head * self.head_dim + dim
         return self.value_cache.get(offset)
 
-    def get_key_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_key_head_vector(self, pos: Int, head: Int) raises -> Tensor[DType.float32]:
         """Get the key vector for a specific position and head.
 
         Args:
@@ -131,7 +131,7 @@ struct KVCache(Movable):
             result.set(d, self.key_cache.get(base + d))
         return result^
 
-    def get_value_head_vector(self, pos: Int, head: Int) -> Tensor[DType.float32]:
+    def get_value_head_vector(self, pos: Int, head: Int) raises -> Tensor[DType.float32]:
         """Get the value vector for a specific position and head.
 
         Args:
@@ -188,7 +188,7 @@ struct MultiLayerKVCache(Movable):
         max_seq_len: Int,
         num_kv_heads: Int,
         head_dim: Int,
-    ):
+    ) raises:
         """Create KV caches for all layers.
 
         Args:
@@ -211,6 +211,16 @@ struct MultiLayerKVCache(Movable):
         for _ in range(num_layers):
             self.lengths.append(0)
 
+    def __init__(out self, *, copy_data: Self):
+        """Copy admitted allocations without accepting new allocation sizes."""
+        self.key_data = copy_data.key_data.clone()
+        self.value_data = copy_data.value_data.clone()
+        self.lengths = copy_data.lengths.copy()
+        self.num_layers = copy_data.num_layers
+        self.max_seq_len = copy_data.max_seq_len
+        self.num_kv_heads = copy_data.num_kv_heads
+        self.head_dim = copy_data.head_dim
+
     def __init__(out self, *, deinit move: Self):
         self.key_data = move.key_data^
         self.value_data = move.value_data^
@@ -227,6 +237,28 @@ struct MultiLayerKVCache(Movable):
     def _stride_per_pos(self) -> Int:
         """Elements per position."""
         return self.num_kv_heads * self.head_dim
+
+    def validate_request(self, num_layers: Int, num_kv_heads: Int, head_dim: Int,
+                         pos: Int, count: Int, layer: Int = -1) raises:
+        """Validate layout and capacity for a complete request before any mutation.
+
+        Admission covers the whole call (prefill or per-token decode) so a
+        refusal leaves the cache untouched.
+        """
+        if self.num_layers != num_layers or self.num_kv_heads != num_kv_heads or self.head_dim != head_dim:
+            raise Error("Cache/model layout mismatch")
+        if num_layers <= 0 or num_kv_heads <= 0 or head_dim <= 0 or self.max_seq_len <= 0 or len(self.lengths) != num_layers:
+            raise Error("Invalid cache geometry")
+        if pos < 0 or count < 0 or pos > self.max_seq_len or count > self.max_seq_len - pos:
+            raise Error("Cache request exceeds maximum sequence length")
+        if layer < -1 or layer >= num_layers:
+            raise Error("Invalid cache layer index")
+        var total = Shape(num_layers, self.max_seq_len, num_kv_heads, head_dim).numel()
+        if self.key_data.numel() != total or self.value_data.numel() != total:
+            raise Error("Cache pool span mismatch")
+        for i in range(num_layers):
+            if self.lengths[i] < 0 or self.lengths[i] > self.max_seq_len:
+                raise Error("Corrupt cache layer length")
 
     def append_kv(
         mut self,

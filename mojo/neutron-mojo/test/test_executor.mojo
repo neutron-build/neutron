@@ -26,7 +26,7 @@ def approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
     return abs(a - b) < tol
 
 
-def make_vector(size: Int, val: Float32) -> Tensor[DType.float32]:
+def make_vector(size: Int, val: Float32) raises -> Tensor[DType.float32]:
     """Create a tensor filled with a constant value."""
     var t = Tensor[DType.float32](Shape(size))
     for i in range(size):
@@ -34,7 +34,7 @@ def make_vector(size: Int, val: Float32) -> Tensor[DType.float32]:
     return t^
 
 
-def make_range_vector(size: Int) -> Tensor[DType.float32]:
+def make_range_vector(size: Int) raises -> Tensor[DType.float32]:
     """Create a tensor with values 1.0, 2.0, ..., size."""
     var t = Tensor[DType.float32](Shape(size))
     for i in range(size):
@@ -42,7 +42,7 @@ def make_range_vector(size: Int) -> Tensor[DType.float32]:
     return t^
 
 
-def make_matrix(rows: Int, cols: Int, val: Float32) -> Tensor[DType.float32]:
+def make_matrix(rows: Int, cols: Int, val: Float32) raises -> Tensor[DType.float32]:
     """Create a matrix (flat row-major) filled with a constant."""
     var t = Tensor[DType.float32](Shape(rows * cols))
     for i in range(rows * cols):
@@ -50,7 +50,7 @@ def make_matrix(rows: Int, cols: Int, val: Float32) -> Tensor[DType.float32]:
     return t^
 
 
-def make_identity_matrix(dim: Int) -> Tensor[DType.float32]:
+def make_identity_matrix(dim: Int) raises -> Tensor[DType.float32]:
     """Create an identity matrix (flat row-major)."""
     var t = Tensor[DType.float32](Shape(dim * dim))
     for i in range(dim * dim):

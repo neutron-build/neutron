@@ -17,7 +17,7 @@ For FP16 data, provides manual bit-manipulation conversion to FP32.
 from std.pathlib import Path
 from std.memory import Pointer, alloc
 from std.ffi import external_call, c_int
-from std.os import stat as os_stat
+from std.sys import CompilationTarget
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
@@ -29,8 +29,8 @@ from neutron_mojo.tensor.shape import Shape
 def _u32_to_f32(bits: UInt32) -> Float32:
     """Reinterpret UInt32 bits as Float32 via heap alloc + pointer cast."""
     var p = alloc[UInt32](1)
-    p.store(bits)
-    var result = p.bitcast[Float32]().load()
+    p.unsafe_store(bits)
+    var result = p.bitcast[Float32]().unsafe_load()
     p.free()
     return result
 
@@ -38,8 +38,8 @@ def _u32_to_f32(bits: UInt32) -> Float32:
 def _u64_to_f64(bits: UInt64) -> Float64:
     """Reinterpret UInt64 bits as Float64 via heap alloc + pointer cast."""
     var p = alloc[UInt64](1)
-    p.store(bits)
-    var result = p.bitcast[Float64]().load()
+    p.unsafe_store(bits)
+    var result = p.bitcast[Float64]().unsafe_load()
     p.free()
     return result
 
@@ -119,7 +119,7 @@ struct BinaryReader(Movable):
 
     def __deinit__(deinit self):
         """Clean up mmap mapping if in mmap mode."""
-        if self._is_mmap and self.size > 0:
+        if self._is_mmap and self._mmap_ptr and self.size > 0:
             _ = external_call["munmap", c_int](self._mmap_ptr.unsafe_value(), self.size)
 
     # --- Byte access ---
@@ -156,8 +156,7 @@ struct BinaryReader(Movable):
         Args:
             n: Number of bytes to skip.
         """
-        if self.cursor + n > self.size:
-            raise Error("skip past end of data")
+        self._check(n)
         self.cursor += n
 
     def remaining(self) -> Int:
@@ -168,12 +167,18 @@ struct BinaryReader(Movable):
 
     def _check(self, n: Int) raises:
         """Check that N bytes are available."""
-        if self.cursor + n > self.size:
+        if n < 0 or self.cursor < 0 or self.cursor > self.size or n > self.size - self.cursor:
             raise Error(
                 "read past end: need " + String(n)
                 + " bytes at offset " + String(self.cursor)
                 + " but size is " + String(self.size)
             )
+
+    def _check_elements(self, count: Int, width: Int) raises:
+        # Divide before multiplying, so hostile counts cannot overflow.
+        self._check(0)
+        if count < 0 or count > self.remaining() // width:
+            raise Error("element count exceeds remaining data")
 
     def read_u8(mut self) raises -> UInt8:
         """Read 1 byte."""
@@ -206,12 +211,13 @@ struct BinaryReader(Movable):
         Cap at 63-bit for Mojo Int safety (Int is signed 64-bit).
         """
         self._check(8)
+        if Int(self._byte_at(self.cursor + 7)) & 0x80:
+            raise Error("u64 value exceeds signed Int range")
         var result = 0
         for i in range(8):
             result |= Int(self._byte_at(self.cursor + i)) << (i * 8)
         self.cursor += 8
-        # Mask to 63 bits to keep Int positive
-        return result & 0x7FFFFFFFFFFFFFFF
+        return result
 
     def read_i32_le(mut self) raises -> Int:
         """Read 4 bytes little-endian as signed Int."""
@@ -272,12 +278,13 @@ struct BinaryReader(Movable):
         if length == 0:
             return String("")
         self._check(length)
-        # Build string character by character
-        var result = String("")
-        for i in range(length):
-            result += chr(Int(self._byte_at(self.cursor + i)))
-        self.cursor += length
-        return result^
+        var saved = self.cursor
+        var bytes = self.read_bytes(length)
+        try:
+            return String(from_utf8=bytes)
+        except e:
+            self.cursor = saved
+            raise e
 
     def read_f32_array(mut self, count: Int) raises -> Tensor[DType.float32]:
         """Read N float32 values into a tensor.
@@ -288,7 +295,7 @@ struct BinaryReader(Movable):
         Returns:
             Tensor with the values.
         """
-        self._check(count * 4)
+        self._check_elements(count, 4)
         var result = Tensor[DType.float32](Shape(count))
         for i in range(count):
             var base = self.cursor + i * 4
@@ -312,7 +319,7 @@ struct BinaryReader(Movable):
         Returns:
             Tensor[float32] with converted values.
         """
-        self._check(count * 2)
+        self._check_elements(count, 2)
         var result = Tensor[DType.float32](Shape(count))
         for i in range(count):
             var base = self.cursor + i * 2
@@ -330,7 +337,7 @@ struct BinaryReader(Movable):
 # FP16 -> FP32 Conversion
 # ===----------------------------------------------------------------------=== #
 
-def _fp16_to_fp32(h: Int) -> Float32:
+def _fp16_to_fp32(h: Int) raises -> Float32:
     """Convert a 16-bit IEEE 754 half-precision float to Float32.
 
     Layout of FP16 (16 bits):
@@ -383,6 +390,36 @@ def _fp16_to_fp32(h: Int) -> Float32:
 # Mmap Reader Factory
 # ===----------------------------------------------------------------------=== #
 
+def _posix_errno() -> Int:
+    """Read thread-local errno immediately, before another libc call."""
+    comptime if CompilationTarget.is_macos():
+        return Int(external_call["__error", Pointer[c_int, MutUntrackedOrigin]]().unsafe_load())
+    elif CompilationTarget.is_linux():
+        return Int(external_call["__errno_location", Pointer[c_int, MutUntrackedOrigin]]().unsafe_load())
+    else:
+        return 0
+
+
+def _map_readonly_descriptor(fd: c_int, file_size: Int) raises -> Pointer[UInt8, MutUntrackedOrigin]:
+    """Mapping seam: borrowed fd, no close and no failed-pointer dereference."""
+    if file_size <= 0:
+        raise Error("mmap: nonpositive mapping length")
+    var ptr = external_call["mmap", Optional[Pointer[UInt8, MutUntrackedOrigin]]](
+        None, file_size, c_int(1), c_int(2), fd, Int64(0)
+    )
+    var mapping_errno = _posix_errno()
+    if ptr == None:
+        # NULL differs from MAP_FAILED: mapping at address zero succeeded, but
+        # Optional cannot retain it. Release that mapping before refusing it.
+        _ = external_call["munmap", c_int](
+            Optional[Pointer[UInt8, MutUntrackedOrigin]]().unsafe_value(), file_size
+        )
+        raise Error("mmap: null address cannot be represented; errno=" + String(mapping_errno))
+    if Int(ptr.unsafe_value()) == -1:
+        raise Error("mmap: mapping failed; errno=" + String(mapping_errno))
+    return ptr.unsafe_value()
+
+
 def mmap_reader(path: String) raises -> BinaryReader:
     """Create a memory-mapped BinaryReader.
 
@@ -396,41 +433,34 @@ def mmap_reader(path: String) raises -> BinaryReader:
     Returns:
         BinaryReader in mmap mode.
     """
-    # Get file size
-    var st = os_stat(path)
-    var file_size = st.st_size
-
     # Open file read-only (O_RDONLY = 0 on Linux)
-    var path_bytes = path.as_bytes()
+    # Mojo String buffers are NUL-terminated, so the raw pointer is a valid
+    # C string for open(2).
+    var c_path = path
     var fd = external_call["open", c_int, num_fixed_args=2](
-        path_bytes.unsafe_ptr(),
+        c_path.unsafe_ptr(),
         c_int(0),
     )
     if Int(fd) < 0:
-        raise Error("mmap: open() failed for: " + path)
+        raise Error("mmap: open() failed; errno=" + String(_posix_errno()) + " for: " + path)
 
-    # mmap the file (PROT_READ=1, MAP_PRIVATE=2)
-    var ptr = external_call[
-        "mmap", Optional[Pointer[UInt8, MutUntrackedOrigin]]
-    ](
-        None,
-        file_size,
-        c_int(1),
-        c_int(2),
-        fd,
-        Int64(0),
-    )
+    # Obtain size from the opened descriptor, not a separately resolved path.
+    var file_size = Int(external_call["lseek", Int64](fd, Int64(0), c_int(2)))
+    if file_size < 0:
+        var size_errno = _posix_errno()
+        _ = external_call["close", c_int](fd)
+        raise Error("mmap: cannot determine opened file size; errno=" + String(size_errno) + " for: " + path)
+    if file_size == 0:
+        _ = external_call["close", c_int](fd)
+        return BinaryReader(List[UInt8]())
 
-    # Close fd (mmap keeps its own reference to the file)
+    var ptr: Pointer[UInt8, MutUntrackedOrigin]
+    try:
+        ptr = _map_readonly_descriptor(fd, file_size)
+    except error:
+        _ = external_call["close", c_int](fd)
+        raise Error(String(error) + " for: " + path)
     _ = external_call["close", c_int](fd)
 
-    # Basic check — null pointer means mmap returned NULL (shouldn't happen
-    # for valid files, but check anyway). Note: MAP_FAILED is (void*)-1
-    # which we can't easily check, but null is caught here.
-    if ptr == None:
-        raise Error("mmap: returned null for: " + path)
-
-    # Hint OS for sequential access (MADV_SEQUENTIAL=2)
-    _ = external_call["madvise", c_int](ptr[], file_size, c_int(2))
-
-    return BinaryReader(path, ptr[], file_size)
+    _ = external_call["madvise", c_int](ptr, file_size, c_int(2))
+    return BinaryReader(path, ptr, file_size)

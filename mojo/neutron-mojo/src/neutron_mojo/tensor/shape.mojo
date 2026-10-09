@@ -21,15 +21,17 @@ struct Shape(Writable, Copyable, Movable, ImplicitlyCopyable):
 
     # --- Constructors ---
 
-    def __init__(out self, *dims: Int):
+    def __init__(out self, *dims: Int) raises:
         """Create a shape from variadic dimension sizes."""
         self._dims = List[Int]()
         for i in range(len(dims)):
             self._dims.append(dims[i])
+        self.validate()
 
-    def __init__(out self, var dims: List[Int]):
+    def __init__(out self, var dims: List[Int]) raises:
         """Create a shape from a List[Int]."""
         self._dims = dims^
+        self.validate()
 
     def __init__(out self, *, copy: Self):
         """Copy constructor."""
@@ -42,13 +44,28 @@ struct Shape(Writable, Copyable, Movable, ImplicitlyCopyable):
         """Returns the number of dimensions."""
         return len(self._dims)
 
+    def validate(self) raises:
+        """Check dimensions and row-major strides before any pointer allocation."""
+        var product = 1
+        var i = self.ndim() - 1
+        while i >= 0:
+            var d = self._dims[i]
+            if d < 0 or (d > 0 and product > 0x7FFFFFFFFFFFFFFF // d):
+                raise Error("Negative or overflowing tensor shape")
+            product *= d
+            i -= 1
+
     def numel(self) -> Int:
-        """Returns the total number of elements (product of all dimensions)."""
-        if self.ndim() == 0:
-            return 0
+        """Element count of an admitted shape; rank zero is a scalar.
+
+        Constructors check reverse products (including every row-major stride).
+        Reverse evaluation also avoids an overflowing prefix before a zero axis.
+        """
         var total = 1
-        for i in range(self.ndim()):
+        var i = self.ndim() - 1
+        while i >= 0:
             total *= self._dims[i]
+            i -= 1
         return total
 
     def __getitem__(self, idx: Int) -> Int:
@@ -60,7 +77,7 @@ struct Shape(Writable, Copyable, Movable, ImplicitlyCopyable):
 
     def copy(self) -> Shape:
         """Returns an explicit copy of this shape."""
-        return Shape(self._dims.copy())
+        return Shape(copy=self)
 
     # --- Strides ---
 

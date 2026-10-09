@@ -4,9 +4,9 @@
 
 """DLPack v1.0 C ABI struct definitions and Mojo DType conversion.
 
-These structs mirror the C layout defined in dlpack.h exactly, enabling
-zero-copy tensor exchange with PyTorch, JAX, NumPy, and other DLPack-
-compliant frameworks.
+These are borrowed C-layout descriptors. Copying one never transfers buffer
+ownership. Local copy exchange uses OwnedDLPackTensor; an external capsule
+adapter with a C-callable deleter is required for managed framework transfer.
 
 All small value types use TrivialRegisterPassable for efficient
 pass-by-value semantics matching C ABI expectations.
@@ -310,10 +310,12 @@ def dl_to_mojo_dtype(dl: DLDataType) raises -> DType:
 
     Raises an error for unrecognized combinations.
     """
+    if dl.lanes != 1:
+        raise Error("DLPack vector lanes are not supported")
     var code = dl.code
     var bits = Int(dl.bits)
 
-    if code == kDLBool:
+    if code == kDLBool and bits == 8:
         return DType.bool
     if code == kDLBfloat and bits == 16:
         return DType.bfloat16

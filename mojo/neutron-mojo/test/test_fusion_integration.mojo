@@ -40,15 +40,24 @@ def test_graph_to_egraph_conversion() raises:
 
 
 def test_egraph_hash_consing() raises:
-    """Test that e-graph properly deduplicates nodes."""
+    """Opaque leaves are distinct; identical composites hash-cons."""
     var eg = EGraph()
 
-    # Add same Input node twice - should hash-cons
+    # Bare opaque leaves get distinct symbols (never presumed identical)
     var input1 = eg.add(CanonicalNode(OpKind.Input))
     var input2 = eg.add(CanonicalNode(OpKind.Input))
 
-    assert_true(input1 == input2, "Duplicate Input nodes should hash-cons")
-    assert_true(eg.num_nodes() == 1, "Should only have 1 node after hash-consing")
+    assert_true(input1 != input2, "Opaque Input leaves must stay distinct")
+    assert_true(eg.num_nodes() == 2, "Two distinct leaf nodes")
+
+    # Structurally identical composites over the same children hash-cons
+    var n1 = CanonicalNode(OpKind.Add, input1, input2)
+    var c1 = eg.add(n1^)
+    var n2 = CanonicalNode(OpKind.Add, input1, input2)
+    var c2 = eg.add(n2^)
+
+    assert_true(eg.find(c1) == eg.find(c2), "Duplicate composite nodes should hash-cons")
+    assert_true(eg.num_nodes() == 3, "3 nodes after composite hash-consing")
 
     print("  egraph_hash_consing: PASS")
 
@@ -182,10 +191,10 @@ def test_transpose_involution_scenario() raises:
 def test_rewrite_engine_initialization() raises:
     """Test that RewriteEngine can be created and configured."""
     var engine = RewriteEngine(max_iterations=10, max_nodes=5000)
-    var ruleset = create_default_ruleset()
+    var ruleset = create_default_ruleset(fast_math=True)
 
     assert_true(engine.max_iterations == 10, "Engine should have correct max_iterations")
-    assert_true(ruleset.num_rules() == 11, "Default ruleset should have 11 rules")
+    assert_true(ruleset.num_rules() == 11, "Full fast-math ruleset should have 11 rules")
 
     print("  rewrite_engine_initialization: PASS")
 
@@ -236,7 +245,7 @@ def test_complex_expression_graph() raises:
     var c = eg.add(CanonicalNode(OpKind.Input))
     var d = eg.add(CanonicalNode(OpKind.Input))
 
-    # Note: Multiple Input nodes will hash-cons, so we get fewer unique classes
+    # Note: opaque Input leaves are distinct, so each of a..d stays unique
     var ab_add = CanonicalNode(OpKind.Add, a, b)
     var ab = eg.add(ab_add^)
 

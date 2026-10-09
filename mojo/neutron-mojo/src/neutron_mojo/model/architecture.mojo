@@ -171,11 +171,11 @@ def qwen_arch() -> ArchitectureConfig:
     return c^
 
 
-def arch_from_name(name: String) -> ArchitectureConfig:
+def arch_from_name(name: String) raises -> ArchitectureConfig:
     """Create an ArchitectureConfig from a name string.
 
     Supported names: llama, mistral, phi, gemma, qwen.
-    Unknown names default to Llama.
+    Unknown names are refused.
     """
     if name == "llama" or name == "Llama" or name == "LlamaForCausalLM":
         return llama_arch()
@@ -187,11 +187,10 @@ def arch_from_name(name: String) -> ArchitectureConfig:
         return gemma_arch()
     elif name == "qwen" or name == "Qwen" or name == "Qwen2ForCausalLM":
         return qwen_arch()
-    # Default to Llama
-    return llama_arch()
+    raise Error("Unsupported architecture: " + name)
 
 
-def detect_architecture(arch_name: String, has_sliding_window: Bool, sw_size: Int) -> ArchitectureConfig:
+def detect_architecture(arch_name: String, has_sliding_window: Bool, sw_size: Int) raises -> ArchitectureConfig:
     """Auto-detect architecture from metadata.
 
     Args:

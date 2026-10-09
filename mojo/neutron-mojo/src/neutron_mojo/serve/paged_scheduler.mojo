@@ -65,12 +65,14 @@ struct PagedBatchEntry(Copyable, Movable, ImplicitlyCopyable):
     var max_new_tokens: Int
     var stop_tokens: List[Int]
     var config: PipelineConfig
+    var sampler: Sampler
+    var prefill_logits: Tensor[DType.float32]
     var enqueue_time_ns: Int
     var start_gen_time_ns: Int
 
     def __init__(out self, request_id: String, input_ids: List[Int],
                 var cache: PagedKVCache, config: PipelineConfig,
-                stop_tokens: List[Int], enqueue_time_ns: Int):
+                stop_tokens: List[Int], enqueue_time_ns: Int) raises:
         self.request_id = request_id
         self.input_ids = List[Int]()
         for i in range(len(input_ids)):
@@ -85,6 +87,11 @@ struct PagedBatchEntry(Copyable, Movable, ImplicitlyCopyable):
         for i in range(len(stop_tokens)):
             self.stop_tokens.append(stop_tokens[i])
         self.config = config.copy()
+        self.sampler = Sampler(config.sampler_config)
+        self.prefill_logits = Tensor[DType.float32](Shape(0))
+        if config.max_new_tokens == 0:
+            self.finished = True
+            self.prefilled = True
         self.enqueue_time_ns = enqueue_time_ns
         self.start_gen_time_ns = 0
 
@@ -105,6 +112,9 @@ struct PagedBatchEntry(Copyable, Movable, ImplicitlyCopyable):
         for i in range(len(copy.stop_tokens)):
             self.stop_tokens.append(copy.stop_tokens[i])
         self.config = copy.config.copy()
+        self.sampler = Sampler(copy.sampler.config)
+        self.sampler.rng.state = copy.sampler.rng.state
+        self.prefill_logits = copy.prefill_logits.clone()
         self.enqueue_time_ns = copy.enqueue_time_ns
         self.start_gen_time_ns = copy.start_gen_time_ns
 
@@ -119,6 +129,8 @@ struct PagedBatchEntry(Copyable, Movable, ImplicitlyCopyable):
         self.max_new_tokens = move.max_new_tokens^
         self.stop_tokens = move.stop_tokens^
         self.config = move.config^
+        self.sampler = move.sampler^
+        self.prefill_logits = move.prefill_logits^
         self.enqueue_time_ns = move.enqueue_time_ns^
         self.start_gen_time_ns = move.start_gen_time_ns^
 
@@ -149,7 +161,7 @@ struct PagedBatchScheduler(Movable):
 
     def __init__(out self, params: ModelParams, max_batch_size: Int = 4,
                 max_seq_len: Int = 512, max_queue_depth: Int = 64,
-                max_pages_per_request: Int = 64, page_size: Int = 16):
+                max_pages_per_request: Int = 64, page_size: Int = 16) raises:
         """Create a paged batch scheduler.
 
         Args:
@@ -160,6 +172,9 @@ struct PagedBatchScheduler(Movable):
             max_pages_per_request: Max pages per request's KV cache.
             page_size: Tokens per page.
         """
+        params.validate()
+        if max_batch_size <= 0 or max_seq_len <= 0 or max_queue_depth <= 0 or max_pages_per_request <= 0 or page_size <= 0:
+            raise Error("Paged scheduler capacities must be positive")
         self.active = List[PagedBatchEntry]()
         self.queue = RequestQueue(max_queue_depth)
         self.stats = SchedulerStats()
@@ -204,12 +219,19 @@ struct PagedBatchScheduler(Movable):
             tokenizer: BPE tokenizer for encoding prompts.
         """
         while len(self.active) < self.max_batch_size and not self.queue.is_empty():
-            var queued = self.queue.dequeue()
+            var queued = self.queue.peek()
             var req = queued.request.copy()
             var cfg = req.to_pipeline_config()
 
             # Encode prompt
             var input_ids = tokenizer.encode_with_special(req.prompt, add_bos=True)
+
+            var total_len = cfg.validate_request(input_ids, self.params, self.max_seq_len)
+            if self.page_size <= 0 or self.max_pages_per_request <= 0:
+                raise Error("Invalid paged scheduler capacity")
+            var pages_per_layer = total_len // self.page_size + Int(total_len % self.page_size != 0)
+            if pages_per_layer > self.max_pages_per_request // self.params.num_layers:
+                raise Error("Request exceeds paged allocator capacity")
 
             # Create paged KV cache for this request
             var cache = PagedKVCache(
@@ -230,6 +252,7 @@ struct PagedBatchScheduler(Movable):
                 stop_tokens, queued.enqueue_time_ns,
             )
             self.active.append(entry^)
+            _ = self.queue.dequeue()
 
             # Track peak batch size
             if len(self.active) > self.stats.peak_batch_size:
@@ -253,6 +276,21 @@ struct PagedBatchScheduler(Movable):
         Returns:
             List of requests that finished during this step.
         """
+        for i in range(len(self.active)):
+            if not self.active[i].finished:
+                _ = self.active[i].config.validate_request(self.active[i].input_ids, model.params, self.max_seq_len)
+                model.params.validate_execution(rope, 0, len(self.active[i].input_ids) + self.active[i].max_new_tokens, specialized=True)
+                model.validate_storage()
+                if self.params.vocab_size != model.params.vocab_size or self.params.hidden_dim != model.params.hidden_dim:
+                    raise Error("Scheduler/model dimensions changed")
+                var count = 0
+                if not self.active[i].prefilled:
+                    count = len(self.active[i].input_ids)
+                elif len(self.active[i].generated) > 0:
+                    count = 1
+                self.active[i].cache.validate_request(model.params.num_layers, model.params.num_kv_heads, model.params.head_dim, self.active[i].pos, count)
+                if self.active[i].prefilled and len(self.active[i].generated) == 0 and self.active[i].prefill_logits.numel() != model.params.vocab_size:
+                    raise Error("Scheduler prefill logits span mismatch")
         self.stats.total_steps += 1
         var finished_list = List[FinishedRequest]()
         var now = Int(perf_counter_ns())
@@ -266,7 +304,7 @@ struct PagedBatchScheduler(Movable):
                 var n_prompt = len(self.active[i].input_ids)
                 if n_prompt > 0:
                     for t in range(n_prompt):
-                        _ = paged_forward(
+                        self.active[i].prefill_logits = paged_forward(
                             model,
                             self.active[i].input_ids[t],
                             self.active[i].cache,
@@ -282,14 +320,7 @@ struct PagedBatchScheduler(Movable):
             # Decode phase: generate one token
             var logits: Tensor[DType.float32]
             if len(self.active[i].generated) == 0:
-                # First decode step — use last prompt token
-                var last_token = self.active[i].input_ids[
-                    len(self.active[i].input_ids) - 1
-                ]
-                logits = paged_forward(
-                    model, last_token, self.active[i].cache, rope,
-                    pos=self.active[i].pos - 1,
-                )
+                logits = self.active[i].prefill_logits.clone()
             else:
                 var last_gen = self.active[i].generated[
                     len(self.active[i].generated) - 1
@@ -313,8 +344,7 @@ struct PagedBatchScheduler(Movable):
                     cfg.frequency_penalty, cfg.presence_penalty)
 
             # Sample
-            var sampler = Sampler(cfg.sampler_config)
-            var next_token = sampler.sample(logits, self.params.vocab_size)
+            var next_token = self.active[i].sampler.sample(logits, self.params.vocab_size)
 
             # Check stop
             if should_stop(next_token, self.active[i].stop_tokens):
