@@ -155,8 +155,10 @@ def main():
             sys.exit(out)
     # opencode takes its session directory from PWD, not the process cwd; without this the
     # worker runs in the checkout the runner was started from.
-    env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR), PWD=str(wt))
-    rc, out = run("cd nucleus/v2 && cargo fmt --all -- --check", wt, env=env)
+    # one target per card: concurrent cards on a shared target serialize on its lock
+    env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR / card_id), PWD=str(wt))
+    # --keep resumes unfinished work, which need not be formatted yet
+    rc, out = (0, "") if args.keep else run("cd nucleus/v2 && cargo fmt --all -- --check", wt, env=env)
     if rc:
         sys.exit("preflight: base is not rustfmt-clean; fix it before issuing a card\n" + out[-800:])
 
