@@ -170,11 +170,13 @@ fn holder_still_holds<K: OrderedKv>(core: &Core<K>, holder: TxnId) -> bool {
 }
 
 /// How a wait's outcome maps into the driver loop (§6): a cancelled wait is
-/// 57014; everything else retries the step. C-T2b adds arms (deadlock
-/// 40P01, `lock_timeout` 55P03) here only.
+/// 57014, a detected deadlock 40P01, an expired `lock_timeout` 55P03;
+/// everything else retries the step.
 pub(crate) fn map_wait_outcome(o: WaitOutcome) -> Result<(), TxnError> {
     match o {
         WaitOutcome::Cancelled => Err(TxnError::QueryCanceled),
+        WaitOutcome::Deadlock => Err(TxnError::Deadlock),
+        WaitOutcome::LockTimeout => Err(TxnError::LockNotAvailable),
         WaitOutcome::Ended
         | WaitOutcome::Aborted
         | WaitOutcome::Committed(_)
@@ -749,6 +751,7 @@ impl<K: OrderedKv> Core<K> {
         ctx: StmtCtx,
         epq: &mut dyn Epq,
     ) -> Result<RowOutcome, TxnError> {
+        let deadline = ctx.lock_deadline();
         let mut task = RowOpTask::new(key, latch_prefix, op, ctx);
         loop {
             if txn.is_cancelled() {
@@ -758,7 +761,7 @@ impl<K: OrderedKv> Core<K> {
                 Step::Done(outcome) => return Ok(outcome),
                 Step::Again => {}
                 Step::Wait(targets) => {
-                    map_wait_outcome(self.wait_on_any(txn, &targets))?;
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?;
                 }
                 Step::Epq(req) => {
                     let requested = task.requested_mode();
@@ -789,6 +792,7 @@ impl<K: OrderedKv> Core<K> {
         ctx: StmtCtx,
         unique: UniqueRule,
     ) -> Result<(), TxnError> {
+        let deadline = ctx.lock_deadline();
         let mut task = KeyOpTask::new(key, latch_prefix, value, ctx, unique);
         loop {
             if txn.is_cancelled() {
@@ -803,7 +807,7 @@ impl<K: OrderedKv> Core<K> {
                 }
                 Step::Again => {}
                 Step::Wait(targets) => {
-                    map_wait_outcome(self.wait_on_any(txn, &targets))?;
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?;
                 }
                 Step::Epq(_) | Step::Restart => {
                     return Err(TxnError::Invariant(
@@ -882,6 +886,7 @@ impl<K: OrderedKv> Core<K> {
         epq: &mut dyn Epq,
         fold: &mut dyn FnMut(&mut RowOpTask, EpqDecision) -> Result<(), TxnError>,
     ) -> Result<RowOutcome, TxnError> {
+        let deadline = task.ctx.lock_deadline();
         loop {
             if txn.is_cancelled() {
                 return Err(TxnError::QueryCanceled);
@@ -889,7 +894,9 @@ impl<K: OrderedKv> Core<K> {
             match task.step(self, txn)? {
                 Step::Done(outcome) => return Ok(outcome),
                 Step::Again => {}
-                Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
+                Step::Wait(targets) => {
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?
+                }
                 Step::Epq(req) => {
                     let requested = task.requested_mode();
                     if let Some(outcome) = self.epq_pass(requested, &req, epq, &mut task, fold)? {

@@ -27,6 +27,10 @@ pub struct StmtCtx {
     wait: LockWait,
     internal: bool,
     revisit_is_error: bool,
+    /// The statement's `lock_timeout` (§6): past this deadline a blocking
+    /// lock wait raises 55P03 instead of parking on. `None` (the default)
+    /// waits indefinitely (C-T2b).
+    lock_timeout: Option<std::time::Duration>,
     /// The seq the next layer places at (§2.1: `s = max(place_seq, top.seq)`)
     /// and the `data_seq` a data change records. Defaults: place at `seq`,
     /// `data_seq = seq0` (the statement's own write keeps `data_seq = seq0`
@@ -48,9 +52,18 @@ impl StmtCtx {
             wait: LockWait::Block,
             internal: false,
             revisit_is_error: false,
+            lock_timeout: None,
             place_seq: seq,
             data_seq: seq0,
         }
+    }
+
+    /// The statement's `lock_timeout` (§6, C-T2b): a blocking lock wait
+    /// past `timeout` raises 55P03 (`LockNotAvailable`) instead of parking
+    /// on. The deadline starts when the wait begins.
+    pub fn lock_timeout(mut self, timeout: std::time::Duration) -> StmtCtx {
+        self.lock_timeout = Some(timeout);
+        self
     }
 
     /// `NOWAIT`: a conflicting lock raises 55P03 instead of waiting (§6).
@@ -115,6 +128,12 @@ impl StmtCtx {
     }
     pub(crate) fn wait(&self) -> LockWait {
         self.wait
+    }
+    /// The `lock_timeout` deadline (§6): `Instant::now() + timeout` when the
+    /// statement set one. Crate-private: the blocking drivers pass it into
+    /// the wait (C-T2b's third allowed change in this module).
+    pub(crate) fn lock_deadline(&self) -> Option<std::time::Instant> {
+        self.lock_timeout.map(|t| std::time::Instant::now() + t)
     }
 }
 

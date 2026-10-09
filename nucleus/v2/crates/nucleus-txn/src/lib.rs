@@ -24,6 +24,16 @@
 //! `DeleteRange` sees it), removes newest-`<= W` tombstones, and retires
 //! dropped/truncated storage prefixes (intents out through §7.3 first), so
 //! I-GC and I-GC-QUIESCE hold for registered snapshots and open views.
+//!
+//! Card C-T2b adds the in-memory lock side of §6 (`locks`): the shared
+//! row-lock table (KEY SHARE, SHARE) behind C-T2's `RowLocks` seam,
+//! relation locks and transaction-scoped advisory locks with NOWAIT /
+//! SKIP LOCKED / `lock_timeout`, the `ReleaseHook` that drops relation and
+//! advisory locks at commit step 5, abort and `ROLLBACK TO`, and — in
+//! `wait` — the wait-for graph with waker-side edge removal, deadlock
+//! detection after `deadlock_timeout` (40P01, one victim per cycle) and
+//! the split begin / poll / deadlock-check / end wait steps C-SIM drives
+//! on one thread.
 
 pub mod boot;
 pub mod commit;
@@ -32,6 +42,7 @@ pub mod gc;
 #[cfg(test)]
 mod internal_tests;
 pub mod latch;
+pub mod locks;
 pub mod read;
 pub mod registry;
 pub mod removal;
