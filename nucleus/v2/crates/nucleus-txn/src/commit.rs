@@ -353,22 +353,38 @@ impl<K: OrderedKv> Core<K> {
         // (commit order equals prepare order because the commit thread
         // assigns commit_ts in channel order).
         let mut req = Some(req);
+        let mut enqueued = false;
         let enqueue =
             self.ssi_hook()
                 .pre_commit(txn.id, txn.isolation, &mut || -> Result<(), TxnError> {
                     let req = req
                         .take()
                         .ok_or_else(|| TxnError::Invariant("enqueue ran twice".into()))?;
-                    self.send_commit(req)
+                    self.send_commit(req)?;
+                    enqueued = true;
+                    Ok(())
                 });
         if let Err(e) = enqueue {
+            if enqueued {
+                // §3: once on the channel the txn will commit; aborting it
+                // here would make the commit thread fail-stop on an Aborted
+                // status. A hook that errors after enqueueing breaks C-T3's
+                // contract.
+                return Err(TxnError::Invariant(format!(
+                    "SsiHook::pre_commit failed after the enqueue: {e}"
+                )));
+            }
             // C-T2 rework 2 / §7.1: the request never reached the channel,
             // so the commit thread will never act on this txn — it aborts
             // here, before the error surfaces, or it would stay Pending
             // forever with its waiters unparked and its intents in the KV.
             // `abort` runs the full §7.1 sequence: Aborted, release, bump
             // and wake, released, cleanup queued.
-            self.abort(txn)?;
+            if let Err(abort_err) = self.abort(txn) {
+                return Err(TxnError::Invariant(format!(
+                    "abort after a failed pre_commit ({e}) failed: {abort_err}"
+                )));
+            }
             return Err(e);
         }
         Ok(ticket)

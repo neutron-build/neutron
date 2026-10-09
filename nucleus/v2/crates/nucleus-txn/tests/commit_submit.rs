@@ -493,3 +493,56 @@ fn seen_committed_does_not_survive_address_reuse() {
     // by applying the mutant — it fires on the first collision).
     let _ = collided;
 }
+
+/// A hook that enqueues and then fails: it breaks C-T3's contract.
+struct EnqueueThenFail;
+impl nucleus_txn::write::SsiHook for EnqueueThenFail {
+    fn covers(&self, _txn: nucleus_txn::TxnId, _key: &[u8]) -> bool {
+        false
+    }
+    fn before_point_read(&self, _txn: nucleus_txn::TxnId, _key: &[u8]) {}
+    fn on_data_placed(
+        &self,
+        _writer: nucleus_txn::TxnId,
+        _isolation: nucleus_txn::txn::Isolation,
+        _key: &[u8],
+    ) -> Result<(), TxnError> {
+        Ok(())
+    }
+    fn pre_commit(
+        &self,
+        _txn: nucleus_txn::TxnId,
+        _isolation: nucleus_txn::txn::Isolation,
+        enqueue: &mut dyn FnMut() -> Result<(), TxnError>,
+    ) -> Result<(), TxnError> {
+        enqueue()?;
+        Err(TxnError::SerializationFailure)
+    }
+    fn on_abort(&self, _txn: nucleus_txn::TxnId) {}
+}
+
+/// Merge review: once the request is on the channel the txn will commit
+/// (§3), so an error from the hook after the enqueue must not abort it
+/// (the commit thread would fail-stop on an Aborted status). It surfaces
+/// as an invariant error, and the queued commit still succeeds. Mutant:
+/// abort on any `pre_commit` error.
+#[test]
+fn pre_commit_error_after_enqueue_does_not_abort() {
+    let core = Arc::new(ok(Core::open(RecKv::new())));
+    core.set_ssi_hook(Arc::new(EnqueueThenFail));
+    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    let t = core.begin(nucleus_txn::txn::Isolation::ReadCommitted);
+    let id = t.id;
+    one_write_at(&core, &t, b"/t/1/k");
+    let r = core.commit_submit(t, SyncCommit::On);
+    assert!(matches!(r, Err(TxnError::Invariant(_))), "{:?}", r.err());
+    let group = pipeline.drain_available();
+    assert_eq!(group.len(), 1, "the request reached the channel");
+    pipeline.process_group(group);
+    let entry = core.status.entry(id).expect("status entry");
+    assert!(
+        matches!(entry.status, nucleus_txn::TxnStatus::Committed(_)),
+        "{:?}",
+        entry.status
+    );
+}

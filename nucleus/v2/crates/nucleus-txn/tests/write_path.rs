@@ -1846,3 +1846,40 @@ fn cancel_before_a_step_and_cancel_during_a_wait_are_57014() {
     }
     assert!(start.elapsed() < Duration::from_millis(500));
 }
+
+/// Merge review: an EPQ callback that returns any `Apply` other than
+/// `Update` would leave the stale snapshot value on the new key; it is an
+/// invariant error. Mutant: the fold ignores a non-Update `Apply`.
+#[test]
+fn update_pk_epq_apply_must_be_an_update() {
+    let mut rig = Rig::new();
+    let ts1 = rig.preload(b"/t/1/r1", b"1");
+    {
+        let a = rig.txn(Isolation::ReadCommitted);
+        let sa = ok(a.next_seq());
+        ok(rig.core.row_op(
+            &a,
+            b"/t/1/r1",
+            None,
+            RowOp::Update {
+                value: b"2".to_vec(),
+                key_cols_changed: false,
+            },
+            StmtCtx::new(ts1, sa, sa),
+            &mut IncrEpq,
+        ));
+        rig.commit(a);
+        ok(Resolver::run_once(&rig.core));
+    }
+    let t = rig.txn(Isolation::ReadCommitted);
+    let s = ok(t.next_seq());
+    let r = rig.core.update_pk(
+        &t,
+        b"/t/1/r1",
+        b"/t/1/r2",
+        b"1+10".to_vec(),
+        StmtCtx::new(ts1, s, s),
+        &mut ApplyOp(RowOp::Delete),
+    );
+    assert!(matches!(r, Err(TxnError::Invariant(_))), "{r:?}");
+}

@@ -838,8 +838,16 @@ impl<K: OrderedKv> Core<K> {
         let task = RowOpTask::new(old_key, None, RowOp::Delete, ctx.clone()).moved_delete();
         let mut new_value = value;
         let mut fold = |task: &mut RowOpTask, decision: EpqDecision| -> Result<(), TxnError> {
-            if let EpqDecision::Apply(RowOp::Update { value, .. }) = &decision {
-                new_value = value.clone();
+            match &decision {
+                EpqDecision::Apply(RowOp::Update { value, .. }) => new_value = value.clone(),
+                EpqDecision::Apply(other) => {
+                    // Anything but an Update would leave the stale value
+                    // on the new key (a lost update).
+                    return Err(TxnError::Invariant(format!(
+                        "update_pk: the EPQ callback must return Apply(Update), got {other:?}"
+                    )));
+                }
+                EpqDecision::Skip => {}
             }
             // The old key keeps the moved delete whatever the callback
             // applied; only the re-base on the remembered version is
