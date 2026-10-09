@@ -246,6 +246,10 @@ def main():
             print(f"[{card_id}] {'PASS' if rc == 0 else 'FAIL'}: {c}", flush=True)
             if rc:
                 failures.append(f"$ {c}\n" + "\n".join(out.splitlines()[-60:]))
+        _, dirty = run("git status --porcelain --untracked-files=all -- . ':!opencode.json'", wt)
+        if dirty.strip():
+            failures.append("Uncommitted changes (commit the card's work):\n" + dirty.strip())
+            print(f"[{card_id}] FAIL: uncommitted changes", flush=True)
         if not failures:
             result["pass"] = True
             break
