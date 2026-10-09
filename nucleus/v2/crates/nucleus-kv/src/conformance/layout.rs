@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! intent        L ‖ 0x00
-//! version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts)      # newest first
+//! version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts) ‖ 0x01   # newest first
 //! end(L)        L ‖ 0x02                            # exclusive upper bound
 //! ```
 //!
@@ -38,6 +38,7 @@ pub fn version_key(l: &[u8], ts: u64) -> Key {
     let mut k = logical(l);
     k.push(0x01);
     k.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
+    k.push(0x01);
     k
 }
 
@@ -71,9 +72,9 @@ pub fn parse(key: &[u8]) -> Option<(Key, Entry)> {
     let l = key[4..split].to_vec();
     match key[split] {
         0x00 if key.len() == split + 1 => Some((l, Entry::Intent)),
-        0x01 if key.len() == split + 9 => {
+        0x01 if key.len() == split + 10 && key[split + 9] == 0x01 => {
             let mut b = [0u8; 8];
-            b.copy_from_slice(&key[split + 1..]);
+            b.copy_from_slice(&key[split + 1..split + 9]);
             Some((l, Entry::Version(u64::MAX - u64::from_be_bytes(b))))
         }
         _ => None,

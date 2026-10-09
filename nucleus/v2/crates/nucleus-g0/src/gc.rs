@@ -217,11 +217,12 @@ pub fn intent_key(l: &[u8]) -> Vec<u8> {
     k
 }
 
-/// The `L ‖ 0x01 ‖ be64(u64::MAX - ts)` version key: newest first.
+/// The `L ‖ 0x01 ‖ be64(u64::MAX - ts) ‖ 0x01` version key: newest first.
 pub fn version_key(l: &[u8], ts: u64) -> Vec<u8> {
     let mut k = logical(l);
     k.push(0x01);
     k.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
+    k.push(0x01);
     k
 }
 
@@ -254,9 +255,9 @@ pub fn parse_key(key: &[u8]) -> Option<(Vec<u8>, EntryKind)> {
     let l = key[4..split].to_vec();
     match key[split] {
         0x00 if key.len() == split + 1 => Some((l, EntryKind::Intent)),
-        0x01 if key.len() == split + 9 => {
+        0x01 if key.len() == split + 10 && key[split + 9] == 0x01 => {
             let mut b = [0u8; 8];
-            b.copy_from_slice(&key[split + 1..]);
+            b.copy_from_slice(&key[split + 1..split + 9]);
             Some((l, EntryKind::Version(u64::MAX - u64::from_be_bytes(b))))
         }
         _ => None,
