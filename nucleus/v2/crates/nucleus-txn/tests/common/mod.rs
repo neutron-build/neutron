@@ -430,6 +430,13 @@ impl<B: OrderedKv> OrderedKv for CrashAt<B> {
     }
 }
 
+/// Records that `id` was committed (the caller holds the ack). Used by
+/// [`wait_released`]'s missing-entry rule: an entry that vanished may only
+/// count as released for a txn known to have committed.
+pub fn note_committed(id: nucleus_txn::TxnId) {
+    seen_committed().lock().expect("seen").insert(id);
+}
+
 /// TxnIds this test process has observed `Committed` at least once, for
 /// [`wait_released`]'s missing-entry rule.
 fn seen_committed() -> &'static std::sync::Mutex<std::collections::HashSet<nucleus_txn::TxnId>> {
@@ -442,15 +449,17 @@ fn seen_committed() -> &'static std::sync::Mutex<std::collections::HashSet<nucle
 /// Waits until commit step 5 has run for `id` (`released`). The ack (step 4)
 /// legally precedes step 5, so tests that need release/resolution-queueing
 /// poll for it. A missing entry counts **only** if the txn was previously
-/// seen `Committed` (then truncated by the resolver); an entry that
-/// vanishes without ever being observed Committed is a failure, not a
+/// seen `Committed` — by this helper's polls, or by a caller's
+/// [`note_committed`] after an acked commit (after which the resolver may
+/// have truncated the entry before this helper first looked). An entry that
+/// vanishes without the txn ever being known committed is a failure, not a
 /// pass.
 pub fn wait_released<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleus_txn::TxnId) {
     for _ in 0..10_000 {
         match core.status.entry(id) {
             Some(e) => {
                 if matches!(e.status, nucleus_txn::TxnStatus::Committed(_)) {
-                    seen_committed().lock().expect("seen").insert(id);
+                    note_committed(id);
                 }
                 if e.released {
                     return;

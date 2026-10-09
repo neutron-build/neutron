@@ -30,6 +30,7 @@ fn commit_one(
     let id = txn.id;
     place_intent(core, &txn, key, value);
     let ts = ok(core.commit(txn, sync));
+    common::note_committed(id);
     common::wait_released(core, id);
     (id, ts)
 }
@@ -354,6 +355,7 @@ fn resolver_error_requeues_the_work_and_reports_through_fail_stop() {
         let txn_id = txn.id;
         place_intent(&core, &txn, key.as_bytes(), b"v");
         let ts = ok(core.commit(txn, SyncCommit::On));
+        common::note_committed(txn_id);
         common::wait_released(&core, txn_id);
         committed.push((txn_id, key, ts));
     }
