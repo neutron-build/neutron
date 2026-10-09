@@ -10,7 +10,13 @@ fn max_states() -> usize {
 
 #[test]
 fn g0_write_clean_model_holds() {
-    let r = check(&WriteModel { bug: None }, max_states());
+    let r = check(
+        &WriteModel {
+            bug: None,
+            mutant: None,
+        },
+        max_states(),
+    );
     eprintln!(
         "G0-write: {} states, {} transitions",
         r.states, r.transitions
@@ -28,7 +34,13 @@ fn g0_write_catches_every_seed() {
         [4, 11, 12, 15, 16, 17, 18, 19, 24, 25, 26, 27, 37, 38, 45, 46, 47, 48, 50, 52, 59]
     );
     for bug in Bug::ALL {
-        let r = check(&WriteModel { bug: Some(bug) }, max_states());
+        let r = check(
+            &WriteModel {
+                bug: Some(bug),
+                mutant: None,
+            },
+            max_states(),
+        );
         let v = r.violation.unwrap_or_else(|| {
             panic!(
                 "seed {} ({bug:?}) not caught in {} states",
