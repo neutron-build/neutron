@@ -396,6 +396,47 @@ fn resolver_error_requeues_the_work_and_reports_through_fail_stop() {
 }
 
 #[test]
+fn truncation_deletes_the_sys_log_record_with_the_status() {
+    // Rework item 12: `/sys/log/{TxnId}` dies with the status at §7.4
+    // truncation (same batch as the `/sys/txn` delete). A commit carrying
+    // a log record, resolved and truncated, must leave neither key.
+    let kv = RecKv::new();
+    let core = Arc::new(ok(Core::open(kv.clone())));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
+    let txn = core.begin(Isolation::ReadCommitted);
+    let txn_id = txn.id;
+    place_intent(&core, &txn, b"/t/1/r", b"v");
+    let (req, ack) = nucleus_txn::commit::CommitRequest::new(
+        txn_id,
+        SyncCommit::On,
+        Some(b"commit-log-record".to_vec()),
+        false,
+        txn.write_set_keys(),
+    );
+    ok(core.submit(req));
+    let ts = ok(ok(ack.recv_timeout(Duration::from_secs(5))));
+    assert!(ts > Ts::ZERO);
+    common::wait_released(&core, txn_id);
+    // Both records exist right after the commit.
+    assert!(
+        ok(core.latest_get(&nucleus_txn::encoding::sys_log_key(txn_id))).is_some(),
+        "the log record was written in the commit batch"
+    );
+    ok(Resolver::run_once(&core)); // resolve
+    ok(Resolver::run_once(&core)); // truncate
+    assert!(core.status.entry(txn_id).is_none(), "truncated");
+    assert!(
+        ok(core.latest_get(&nucleus_txn::encoding::sys_txn_key(txn_id))).is_none(),
+        "the /sys/txn record is gone"
+    );
+    assert!(
+        ok(core.latest_get(&nucleus_txn::encoding::sys_log_key(txn_id))).is_none(),
+        "the /sys/log record dies with the status"
+    );
+    ok(handle.shutdown());
+}
+
+#[test]
 fn aborted_txn_cleanup_discards_intents() {
     let core = Arc::new(ok(Core::open(RecKv::new())));
     let handle = ok(spawn_commit_thread(Arc::clone(&core)));

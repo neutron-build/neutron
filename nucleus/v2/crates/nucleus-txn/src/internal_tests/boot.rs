@@ -221,6 +221,21 @@ fn corrupt_system_state_is_an_error_not_a_panic() {
         vec![nucleus_kv::Op::Put(b"/sys/txn/x".to_vec(), vec![0; 8])],
     );
     assert!(matches!(Core::open(kv), Err(TxnError::Corrupt(_))));
+    // Bad /sys/ts_hwm length: the sequencer's single source (the boot read
+    // Core stores and the pipeline reserves from) must fail-stop at open,
+    // never default to 0 — a silent 0 reuses every committed ts.
+    let kv = MemKv::new();
+    put_kv(
+        &kv,
+        vec![
+            nucleus_kv::Op::Put(sys_epoch_key(), 3u32.to_be_bytes().to_vec()),
+            nucleus_kv::Op::Put(sys_ts_hwm_key(), vec![1, 2, 3]),
+        ],
+    );
+    assert!(
+        matches!(Core::open(kv), Err(TxnError::Corrupt(_))),
+        "a corrupt ts_hwm is Corrupt, not Ts(0)"
+    );
 }
 
 #[test]
