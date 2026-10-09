@@ -293,6 +293,20 @@ impl StatusTable {
         }
     }
 
+    /// §7.4 truncation candidates: every txn with a status entry that is
+    /// `released` with `intent_count == 0`. Older-epoch records are
+    /// released by definition and their count is 0 (boot sets it), so they
+    /// are candidates; the sweep/view-counter conditions are still
+    /// re-checked by `truncate_eligible` under the registry mutex.
+    pub fn truncation_candidates(&self) -> Vec<TxnId> {
+        let st = self.lock();
+        st.map
+            .iter()
+            .filter(|(id, e)| e.released && (e.intent_count == 0 || id.epoch < self.epoch))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Removes the entry and writes the `/sys/txn/{TxnId}` delete (§7.4).
     /// The delete is written after the removal batches, so by I-WAL-ORDER a
     /// crash can never keep the delete and lose the resolution. Returns

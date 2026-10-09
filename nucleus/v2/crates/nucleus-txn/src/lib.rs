@@ -1,21 +1,30 @@
 //! nucleus-txn: MVCC transactions over `OrderedKv`. Normative spec:
 //! `docs/C-T0-txn-protocol.md`. Section numbers below refer to it.
 //!
-//! Card C-T1a builds the shared core every later T card extends: the §2
+//! Card C-T1a built the shared core every later T card extends: the §2
 //! on-disk encoding (`encoding`), the status table with epochs and boot
 //! (`status`, `boot`), the snapshot/view registry (`registry`), latches
 //! (`latch`), intent removal (`removal`) and the read path (`read`). The
-//! commit thread, write path, row locks, SSI and the GC job are C-T1b..T4;
-//! the pure §4 rule lives in `visibility`.
+//! pure §4 rule lives in `visibility`.
+//!
+//! Card C-T1b adds the txn handle (`txn`), the §3 commit pipeline and §7.1
+//! abort (`commit`), §6 waiting with wake generations (`wait`), and the
+//! resolution/truncation jobs (`resolver`). The write path (§5), shared
+//! locks and the wait-for graph (C-T2b), SSI (C-T3) and GC (C-T4) are later
+//! cards; only the hooks named in the card exist.
 
 pub mod boot;
+pub mod commit;
 pub mod encoding;
 pub mod latch;
 pub mod read;
 pub mod registry;
 pub mod removal;
+pub mod resolver;
 pub mod status;
+pub mod txn;
 pub mod visibility;
+pub mod wait;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

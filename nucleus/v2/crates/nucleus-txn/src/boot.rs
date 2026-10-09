@@ -9,12 +9,14 @@
 //! `ts_hwm` without a persisted record never committed). A fresh store starts
 //! with epoch 1, `ts_hwm` 0 and `W` 0.
 
+use std::collections::{HashMap, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot, Value};
 
+use crate::commit::{CommitMsg, ReleaseHook};
 use crate::encoding::{
     parse_sys_txn_key, sys_epoch_key, sys_gc_w_key, sys_ts_hwm_key, sys_txn_prefix,
     sys_txn_prefix_end,
@@ -22,6 +24,7 @@ use crate::encoding::{
 use crate::latch::Latches;
 use crate::registry::Registry;
 use crate::status::StatusTable;
+use crate::wait::Waits;
 use crate::{kv_err, Ts, TxnError, TxnId};
 
 /// The shared transaction core (§3, §7.2).
@@ -38,9 +41,23 @@ pub struct Core<K: OrderedKv> {
     pub registry: Registry,
     /// Striped latches (§5.0).
     pub latches: Latches,
+    /// Waiter tables, parker maker and wait hook (§6).
+    pub waits: Waits,
     /// `visible_ts` (§3), shared with the registry so `take_snapshot` reads
     /// and registers it in one critical section.
     visible_ts: Arc<AtomicU64>,
+    /// The commit channel's sending end, attached by a `CommitPipeline`
+    /// (§3). `None` until one is attached.
+    pub(crate) commit_tx: Mutex<Option<std::sync::mpsc::Sender<CommitMsg>>>,
+    /// The C-T2b release hook (§3 step 5, §7.1); no-op until installed.
+    pub(crate) release_hook: Mutex<Arc<dyn ReleaseHook>>,
+    /// Write sets of txns whose commit request is on the channel or in the
+    /// pipeline (§3 step 5 queues resolution from here): the caller may
+    /// drop its `Txn` once the ack arrives.
+    pub(crate) write_sets: Mutex<HashMap<TxnId, Vec<nucleus_kv::Key>>>,
+    /// Queued resolution/cleanup entries (§3 step 5, §7.1), drained by the
+    /// resolver.
+    pub(crate) resolve_q: Mutex<VecDeque<crate::commit::ResolveEntry>>,
 }
 
 impl<K: OrderedKv> Core<K> {
@@ -117,7 +134,12 @@ impl<K: OrderedKv> Core<K> {
             status,
             registry: Registry::new(visible_ts.clone(), gc_w),
             latches: Latches::default(),
+            waits: Waits::new(),
             visible_ts,
+            commit_tx: Mutex::new(None),
+            release_hook: Mutex::new(Arc::new(crate::commit::NoReleaseHook)),
+            write_sets: Mutex::new(HashMap::new()),
+            resolve_q: Mutex::new(VecDeque::new()),
         })
     }
 
