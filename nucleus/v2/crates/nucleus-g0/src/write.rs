@@ -1,10 +1,11 @@
-//! G0-write (C-T0 §11): the write path — §5.0-§5.5 (without §5.3.1 ON CONFLICT, which is
-//! card C-G0wb), §6 (locks, waits, wake generations, deadlock DFS, cancel), §7.1 (abort),
-//! §7.3 (intent removal) and §7.4 (status truncation with remembered-TxnId lookups), plus
-//! the commit thread of §3 with status-set, visible-advance, the shared-lock release and
-//! the step-5 wake as separate steps, and the async resolver. Checked: I-ONE-INTENT,
-//! I-WW, I-LOCK, I-UNIQUE, I-FK, I-HALLOWEEN, I-ATOMIC, I-LIVE (a/b/c), I-PROGRESS
-//! (retry bound), I-RC-MONO, I-TRUNC, I-COUNT, and no lost update under RC.
+//! G0-write (C-T0 §11): the write path — §5.0-§5.5 including §5.3.1 ON CONFLICT
+//! (C-G0wb), §6 (locks, waits, wake generations, deadlock DFS, cancel), §7.1
+//! (abort), §7.3 (intent removal) and §7.4 (status truncation with
+//! remembered-TxnId lookups), plus the commit thread of §3 with status-set,
+//! visible-advance, the shared-lock release and the step-5 wake as separate
+//! steps, and the async resolver. Checked: I-ONE-INTENT, I-WW, I-LOCK,
+//! I-UNIQUE, I-FK, I-HALLOWEEN, I-ATOMIC, I-LIVE (a/b/c), I-PROGRESS (retry
+//! bound), I-RC-MONO, I-TRUNC, I-COUNT, and no lost update under RC.
 //!
 //! ## Latch ownership
 //!
@@ -31,6 +32,16 @@
 //!   latch — the exact §3.1/§4 I-TRUNC fatality.
 //! - Every removal (`Resolve`, `Cleanup`, `RollbackTo`, the shared releases of step 5,
 //!   abort) takes the latch its spec section names, as an action guard.
+//! - The §5.3.1 pre-check (`ArbPre`) takes `latch_key(arb)` for its read of the
+//!   arbiter key (plus the inline §7.3 removal of an ended foreign intent, as
+//!   §5.1's block). The arbiter **lock** runs as an ordinary §5.1 row op
+//!   (`SecRead`/`SecPlace` over the synthesized lock op) with base `v_r.ts` and
+//!   no EPQ: with that base a non-empty N restarts the arbiter (§5.3.1(3)). The
+//!   **abandon** (`Abandon`, phase `ArbAb`) rolls back to `sa` as `ROLLBACK TO`
+//!   — one latch section per visited key, guarded exactly like `RollbackTo`.
+//!   The insert path's arbiter entry op routes its "live entry of another row"
+//!   23505 and its waits into the abandon (§5.3.1(2)), so both a conflict and a
+//!   wait can land between the attempt's write and its rollback.
 //!
 //! ## Workloads (fixed, chosen by the initial `Choose`)
 //!
@@ -56,6 +67,9 @@
 //! | 11 | `dlk3` | preload t0,t1,c0; W0 `UPDATE t0; UPDATE t1`; W1 `UPDATE t1; UPDATE c0`; W2 `UPDATE c0; UPDATE t0` (3-txn cycle) |
 //! | 12 | `epqtomb` | preload t0; W0 `DELETE t0`; W1 `UPDATE t0` |
 //! | 13 | `rellock` | preload t0; W0 `LOCK TABLE R EXCLUSIVE`; W1 relation lock R, `UPDATE t0` |
+//! | 14 | `ocdup` | preload t0, u0→t0, t1, c1; W0 `DELETE t1; INSERT (t1,u0) ON CONFLICT (u0) DO UPDATE SET v=v+1 WHERE v=0` (AFTER event `UPDATE c1`); W1 `UPDATE t0; INSERT (c0,u0)`; W2 `DELETE t0; DELETE u0` |
+//! | 15 | `ocnothing` | preload t0, u0→t0; W0 `INSERT (t1,u0) ON CONFLICT (u0) DO NOTHING`; W1 `DELETE t0; DELETE u0` |
+//! | 16 | `fkmoved` | preload parent t0; W0 `DELETE t0 (moved); INSERT t1` (PK change, end-of-stmt check); W1 `read parent; FOR KEY SHARE t0 (FK); INSERT child c1`; W2 `DELETE t0` (plain, end-of-stmt check) |
 //!
 //! ## Seed -> workload
 //!
@@ -70,8 +84,11 @@
 //! | 18 | main | | 48 | main |
 //! | 19 | uniq | | 50 | main |
 //! | 24 | ownabsent | | 52 | epqshare |
-//! | 25 | deferrable | | 59 | dlk3 |
-//! | 26 | main | | | |
+//! | 25 | deferrable | | 53 | ocdup |
+//! | 26 | main | | 54 | ocdup |
+//! | 58 | fk | | 56 | ocdup |
+//! | 59 | dlk3 | | 57 | ocdup |
+//! | | | | 64 | ocdup |
 //!
 //! ## Mutation checks
 //!
@@ -101,6 +118,24 @@
 //!   **current** wait-for edges at that moment, computed by `ghost_on_cycle` over the
 //!   edge set alone (not by the detector's DFS result and not by any record the
 //!   detector writes); `check` flags a victim that was not on a cycle.
+//! - **Arbiter ghost** (§5.3.1). Every ON CONFLICT statement that ends with **no**
+//!   row outcome records whether the arbiter key's current state (§5.3's rule) is
+//!   live at that moment; `check` flags a no-outcome completion over a not-live
+//!   arbiter key. §5.3.1(3) never skips — a conflict that vanished must restart
+//!   the arbiter and insert — and the legal no-outcome completions (DO NOTHING on
+//!   a live conflict, a false DO UPDATE `WHERE` on the locked row) always face a
+//!   live arbiter key, so the ghost is sound (it reads the committed state and the
+//!   own intent only, never any record the protocol's decision writes).
+//! - **Event ghost queue.** Each AFTER event is queued twice: in the protocol's
+//!   queue with the tag the code writes, and in a ghost queue with the spec's
+//!   `sa`. An abandon discards tag `>= sa` from both. An event that fires while
+//!   absent from the ghost queue (seed 64: tagged `seq0`, survived the abandon)
+//!   applies its write without a ghost net effect, so the commit oracle flags the
+//!   extra increment; the ghost queue itself is never read by the protocol.
+//! - **FK error log.** Every FK EPQ failure records whether the parent moved
+//!   (§5.3: 23503 vs 40001). Both codes abort in-model — the log is reachability
+//!   evidence only (`fkmoved` exercises both: 1272 moved-parent failures in the
+//!   clean run), not an oracle.
 //!
 //! ## Scope cuts
 //!
@@ -109,9 +144,11 @@
 //!   (the FK read, the parent-side scan), so `min(registered view counters)` is always
 //!   `u32::MAX`; G0-commit owns the non-trivial truncation view-counter conditions.
 //! - I-PROGRESS is checked by the §11 retry bound (a per-actor spin counter, bumped by
-//!   each non-parking retry and reset by any other actor's step), not by lasso detection
-//!   over the counter-dropping abstraction; on these fixed workloads the bound subsumes
-//!   the lasso (every spin loop here is unbounded rather than cyclic).
+//!   each non-parking retry and reset by any other actor's step — and by the actor's
+//!   own inline §7.3 removals, which write state and so cannot recur without bound),
+//!   not by lasso detection over the counter-dropping abstraction; on these fixed
+//!   workloads the bound subsumes the lasso (every spin loop here is unbounded rather
+//!   than cyclic).
 //! - The write-set log is the in-memory list §5.5 describes (one entry per layer change);
 //!   its spill to disk and layer compaction are not modelled. Layer existence (the seqs
 //!   of an active txn's layers, from a bug-free ghost log) is checked; layer *contents*
@@ -136,11 +173,38 @@
 //!   used (and none is needed).
 //! - Relation locks have two modes (RowExclusive, Exclusive) exercised by `rellock` only;
 //!   their release is fused into the step-5 wake (no per-key latch). No NOWAIT / SKIP
-//!   LOCKED / `lock_timeout`, no advisory locks, no moved-tombstones or PK-changing
-//!   UPDATEs (`key_changed` is still modelled and exercised by `keyshare`), no SIREAD or
+//!   LOCKED / `lock_timeout`, no advisory locks, no SIREAD or
 //!   SSI state (G0-ssi), no `WITH HOLD` cursors, no deferred-trigger fixpoint, no NULLS
-//!   DISTINCT, no ON CONFLICT (C-G0wb), and the deadlock DFS runs whenever a cycle exists
-//!   (`deadlock_timeout` is not modelled).
+//!   DISTINCT, and the deadlock DFS runs whenever a cycle exists (`deadlock_timeout` is
+//!   not modelled).
+//! - ON CONFLICT (C-G0wb) is modelled for RC only: §5.3.1(3)'s "Under RR/SER, if r's
+//!   newest committed version is newer than S: 40001 (DO NOTHING too)" is a scope cut
+//!   (every ON CONFLICT txn here is RC), as are multi-row arbiter statements, arbing on
+//!   a PK or a deferrable index, `SET CONSTRAINTS`, and BEFORE triggers. Moved
+//!   tombstones (`Delete { moved }`, §2.1) exist for the FK-parent path: §5.3's FK
+//!   EPQ failure raises 23503, or 40001 when the parent moved (both abort in-model;
+//!   the codes are recorded in `errs`); the general §5.2 rule "EPQ that reaches a
+//!   moved-tombstone raises 40001" is a scope cut — no non-FK row op here meets one.
+//!   The ON CONFLICT attempt's queued *checks* are modelled through AFTER events
+//!   (same tag-and-discard rule, §5.5); end-of-statement FK checks remain
+//!   statement-end scans. An attempt abandons only from the insert path (§5.3.1(2));
+//!   the arbiter lock's waits follow §5.1 directly.
+//! - Two C-G0wb conformance notes. (1) The unique check now follows §5.3's current-state
+//!   rule exactly: an own `Delete` top layer is *not* live ("own `Delete` → proceed"),
+//!   so a txn can delete and re-insert one key; C-G0wa's code read the committed state
+//!   there, which no pre-C-G0wb workload exercises (no delete-then-insert of one key),
+//!   and `ocdup` needs the spec's behaviour. (2) The I-UNIQUE oracle now tracks entry
+//!   liveness (`Entry` live, `Dead` kills): C-G0wa's workloads never deleted a unique
+//!   entry, so the check misread a legal row+entry delete as an orphaned entry;
+//!   `ocdup`/`ocnothing`/`fkmoved` delete entries.
+//! - ON CONFLICT gaps found in review (mutants that survive the clean model):
+//!   the pre-check's wait on a Pending non-`Absent` arbiter intent is reachable but
+//!   unobservable (skipping it only delays the same outcome through §5.1's wait);
+//!   no oracle evaluates the `DO UPDATE ... WHERE` qual (the qual ghost covers RC
+//!   row ops only); and no txn ever waits on an attempt's own intents, so an abandon
+//!   that skips the wake-generation bump is unobservable.
+//! - `INSERT ... ON CONFLICT DO UPDATE` revisiting a row the same statement inserted
+//!   (21000) is not modelled: statements propose one row each.
 
 use std::collections::BTreeMap;
 
@@ -208,21 +272,28 @@ fn implied(data: Data) -> Lock {
                 Lock::NoKeyUpd
             }
         }
-        Data::Delete => Lock::Update,
+        Data::Delete { .. } => Lock::Update,
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Data {
     Absent,
-    Write { val: u8, kc: bool },
-    Delete,
+    Write {
+        val: u8,
+        kc: bool,
+    },
+    /// §2.1 `Delete { moved }`: a PK-changing UPDATE's moved-tombstone at the old
+    /// `/t/` key (C-G0wb; exercised by the FK-child workload).
+    Delete {
+        moved: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VerData {
     Live { val: u8, kc: bool },
-    Tomb,
+    Tomb { moved: bool },
 }
 
 /// Ghost net effect of a txn's surviving statements on one key. Updates are increments
@@ -275,7 +346,7 @@ type Commits = Vec<(Ts, u8, ExpWrites)>;
 fn ver_of(d: Data) -> Option<VerData> {
     match d {
         Data::Write { val, kc } => Some(VerData::Live { val, kc }),
-        Data::Delete => Some(VerData::Tomb),
+        Data::Delete { moved } => Some(VerData::Tomb { moved }),
         Data::Absent => None,
     }
 }
@@ -351,10 +422,25 @@ pub enum Bug {
     EpqRepeatOnIntent,
     /// Seed 59: waker leaves woken waiters' edges in the graph.
     WakerLeavesEdges,
+    /// Seed 53: ON CONFLICT lock runs EPQ and skips a deleted conflicting row.
+    ArbLockEpq,
+    /// Seed 54: abandoned ON CONFLICT attempt removes whole intents instead of
+    /// rolling back to its internal savepoint.
+    AbandonWholeIntent,
+    /// Seed 56: ON CONFLICT attempt writes at `seq0` instead of `sa`, so abandoning
+    /// leaves its new arbiter intent.
+    ArbSeq0,
+    /// Seed 57: arbiter lock measures newer versions against `S` instead of `v_r`.
+    ArbBaseS,
+    /// Seed 58: FK child check skips on a failed EPQ instead of raising 23503.
+    FkEpqSkip,
+    /// Seed 64: ON CONFLICT attempt's queued checks or AFTER events tagged `seq0`,
+    /// surviving an abandon.
+    EventTagSeq0,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 21] = [
+    pub const ALL: [Bug; 27] = [
         Bug::PlaceWithoutLatch,
         Bug::NoOwnerRecheck,
         Bug::OverwriteForeignEnded,
@@ -376,6 +462,12 @@ impl Bug {
         Bug::LogOnlyNewIntents,
         Bug::EpqRepeatOnIntent,
         Bug::WakerLeavesEdges,
+        Bug::ArbLockEpq,
+        Bug::AbandonWholeIntent,
+        Bug::ArbSeq0,
+        Bug::ArbBaseS,
+        Bug::FkEpqSkip,
+        Bug::EventTagSeq0,
     ];
 
     pub fn seed(self) -> u8 {
@@ -401,6 +493,12 @@ impl Bug {
             Bug::LogOnlyNewIntents => 50,
             Bug::EpqRepeatOnIntent => 52,
             Bug::WakerLeavesEdges => 59,
+            Bug::ArbLockEpq => 53,
+            Bug::AbandonWholeIntent => 54,
+            Bug::ArbSeq0 => 56,
+            Bug::ArbBaseS => 57,
+            Bug::FkEpqSkip => 58,
+            Bug::EventTagSeq0 => 64,
         }
     }
 }
@@ -414,8 +512,11 @@ pub enum Op {
         kc: bool,
         qual: Option<u8>,
     },
+    /// §2.1 `Delete { moved }`: a PK-changing UPDATE writes `moved: true` at the
+    /// old `/t/` key (plus the new row's key-existence ops).
     Delete {
         key: LKey,
+        moved: bool,
     },
     /// Key-existence op: INSERT of the `/t/` row key (Pk), a `/u/` unique entry
     /// (Unique) or an `/i/` deferrable entry (Def, checked at commit, not here).
@@ -434,6 +535,21 @@ pub enum Op {
     /// FK child-side read of the parent (registered view, §3.1/§5.3).
     FkRead {
         key: LKey,
+    },
+    /// §5.3.1 `INSERT ... ON CONFLICT (arb) DO UPDATE/NOTHING`. Runs the arbiter
+    /// protocol; on the insert path the ops that follow it in the statement are
+    /// the proposed row and its entries, placed at the attempt's `sa` (§5.3.1).
+    /// An entry key's live version value names the owning row (`KEYS` index), so
+    /// the pre-check can find `r`. `qual` is the DO UPDATE's `WHERE v = qual`
+    /// (evaluated on the locked row; a false qual leaves the lock, §5.3.1(3));
+    /// `ev` is an AFTER-trigger internal `UPDATE <key> v = v + 1` queued (tagged
+    /// `sa`) per row outcome.
+    OnConflict {
+        arb: LKey,
+        row: LKey,
+        upd: bool,
+        qual: Option<u8>,
+        ev: Option<LKey>,
     },
     RelLock {
         excl: bool,
@@ -542,7 +658,10 @@ const W_MAIN: Workload = Workload {
                 key: LKey::T1,
                 fk: false,
             },
-            Op::Delete { key: LKey::T0 },
+            Op::Delete {
+                key: LKey::T0,
+                moved: false,
+            },
         ]],
         rc![stmt![upd!(LKey::T1), upd!(LKey::T0)]],
     ],
@@ -742,7 +861,10 @@ const W_DEFERRABLE: Workload = Workload {
 /// EPQ sees the tombstone (23503, never a skip).
 const W_FK: Workload = Workload {
     txns: &[
-        rc![pcheck![Op::Delete { key: LKey::T0 }]],
+        rc![pcheck![Op::Delete {
+            key: LKey::T0,
+            moved: false,
+        }]],
         rc![stmt![
             Op::FkRead { key: LKey::T0 },
             Op::KeyShare {
@@ -767,7 +889,10 @@ const W_FK: Workload = Workload {
 /// non-key commit (the re-insert) above the RR reader's snapshot.
 const W_KEYSHARE: Workload = Workload {
     txns: &[
-        rc![stmt![Op::Delete { key: LKey::T0 }]],
+        rc![stmt![Op::Delete {
+            key: LKey::T0,
+            moved: false,
+        }]],
         rc![stmt![Op::KeyExist {
             key: LKey::T0,
             kind: KeyKind::Pk {
@@ -801,7 +926,10 @@ const W_SHARE: Workload = Workload {
             }],
             stmt![Op::RollbackTo],
         ],
-        rc![stmt![Op::Delete { key: LKey::T0 }]],
+        rc![stmt![Op::Delete {
+            key: LKey::T0,
+            moved: false,
+        }]],
     ],
     preload: &[pre_row!(LKey::T0, 0, None, false)],
     cancel: false,
@@ -861,7 +989,10 @@ const W_DLK3: Workload = Workload {
 /// tombstone must skip the row (the increment-on-dead-row oracle).
 const W_EPQTOMB: Workload = Workload {
     txns: &[
-        rc![stmt![Op::Delete { key: LKey::T0 }]],
+        rc![stmt![Op::Delete {
+            key: LKey::T0,
+            moved: false,
+        }]],
         rc![stmt![upd!(LKey::T0)]],
     ],
     preload: &[pre_row!(LKey::T0, 0, None, false)],
@@ -887,6 +1018,178 @@ const W_RELLOCK: Workload = Workload {
     deferrable: false,
 };
 
+/// W_ocdup (C-G0wb): the §5.3.1 ON CONFLICT DO UPDATE workload. W0 deletes t1
+/// (the pre-`sa` layer the seed-54 abandon must keep), then runs the arbiter
+/// statement (`WHERE v = 0`, AFTER event `UPDATE c1`). W1 updates the
+/// conflicting row and then inserts the racing row (seed 57: `v_r` above W0's
+/// `S`; seeds 54/56/64: the insert-path abandon — over a wait or a live entry —
+/// and the events queued during the attempt). W2 only deletes row+entry and
+/// stays deleted (seed 53: the conflicting row dies between the pre-check and
+/// the lock, so the arbiter key is *not* live when the buggy EPQ skips).
+const W_OCDUP: Workload = Workload {
+    txns: &[
+        rc![
+            stmt![Op::Delete {
+                key: LKey::T1,
+                moved: false,
+            }],
+            stmt![
+                Op::OnConflict {
+                    arb: LKey::U0,
+                    row: LKey::T1,
+                    upd: true,
+                    qual: Some(0),
+                    ev: Some(LKey::C1),
+                },
+                Op::KeyExist {
+                    key: LKey::T1,
+                    kind: KeyKind::Pk {
+                        uval: Some(LKey::U0),
+                        child: false,
+                    },
+                },
+                Op::KeyExist {
+                    key: LKey::U0,
+                    kind: KeyKind::Unique { row: LKey::T1 },
+                },
+            ],
+        ],
+        rc![
+            stmt![upd!(LKey::T0)],
+            stmt![
+                Op::KeyExist {
+                    key: LKey::C0,
+                    kind: KeyKind::Pk {
+                        uval: Some(LKey::U0),
+                        child: false,
+                    },
+                },
+                Op::KeyExist {
+                    key: LKey::U0,
+                    kind: KeyKind::Unique { row: LKey::C0 },
+                },
+            ],
+        ],
+        rc![stmt![
+            Op::Delete {
+                key: LKey::T0,
+                moved: false,
+            },
+            Op::Delete {
+                key: LKey::U0,
+                moved: false,
+            },
+        ]],
+    ],
+    preload: &[
+        pre_row!(LKey::T0, 0, Some(LKey::U0), false),
+        (
+            LKey::U0,
+            1,
+            VerData::Live { val: 0, kc: false },
+            ED::Entry { row: LKey::T0 },
+        ),
+        pre_row!(LKey::T1, 0, None, false),
+        pre_row!(LKey::C1, 0, None, false),
+    ],
+    cancel: false,
+    deferrable: false,
+};
+
+/// W_ocnothing: the §5.3.1 DO NOTHING shape — a live conflict skips the
+/// proposed row; a conflict deleted by W1 before the pre-check lets the insert
+/// path run (coverage workload; no owned seed).
+const W_OCNOTHING: Workload = Workload {
+    txns: &[
+        rc![stmt![
+            Op::OnConflict {
+                arb: LKey::U0,
+                row: LKey::T1,
+                upd: false,
+                qual: None,
+                ev: None,
+            },
+            Op::KeyExist {
+                key: LKey::T1,
+                kind: KeyKind::Pk {
+                    uval: Some(LKey::U0),
+                    child: false,
+                },
+            },
+            Op::KeyExist {
+                key: LKey::U0,
+                kind: KeyKind::Unique { row: LKey::T1 },
+            },
+        ]],
+        rc![stmt![
+            Op::Delete {
+                key: LKey::T0,
+                moved: false,
+            },
+            Op::Delete {
+                key: LKey::U0,
+                moved: false,
+            },
+        ]],
+    ],
+    preload: &[
+        pre_row!(LKey::T0, 0, Some(LKey::U0), false),
+        (
+            LKey::U0,
+            1,
+            VerData::Live { val: 0, kc: false },
+            ED::Entry { row: LKey::T0 },
+        ),
+    ],
+    cancel: false,
+    deferrable: false,
+};
+
+/// W_fkmoved (C-G0wb): the §5.3 FK-child EPQ workload. W1 reads the parent,
+/// takes the FK KEY SHARE and inserts the child. W0 moves the parent (a
+/// PK-changing UPDATE: moved-tombstone at t0 plus the new key t1 — the EPQ
+/// reaches the moved-tombstone and raises 40001); W2 plainly deletes it (the
+/// EPQ fails on the tombstone and raises 23503 — seed 58's skip must not
+/// happen). Both movers run the parent-side end-of-statement check.
+const W_FKMOVED: Workload = Workload {
+    txns: &[
+        rc![pcheck![
+            Op::Delete {
+                key: LKey::T0,
+                moved: true,
+            },
+            Op::KeyExist {
+                key: LKey::T1,
+                kind: KeyKind::Pk {
+                    uval: None,
+                    child: false,
+                },
+            },
+        ]],
+        rc![stmt![
+            Op::FkRead { key: LKey::T0 },
+            Op::KeyShare {
+                key: LKey::T0,
+                fk: true,
+            },
+            Op::KeyExist {
+                key: LKey::C1,
+                kind: KeyKind::Pk {
+                    uval: None,
+                    child: true,
+                },
+            },
+        ]],
+        rc![pcheck![Op::Delete {
+            key: LKey::T0,
+            moved: false,
+        }]],
+    ],
+    preload: &[pre_row!(LKey::T0, 0, None, false)],
+    cancel: false,
+    deferrable: false,
+};
+
 const WORKLOADS: &[Workload] = &[
     W_MAIN,
     W_LOCKDATA,
@@ -902,6 +1205,9 @@ const WORKLOADS: &[Workload] = &[
     W_DLK3,
     W_EPQTOMB,
     W_RELLOCK,
+    W_OCDUP,
+    W_OCNOTHING,
+    W_FKMOVED,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -920,6 +1226,16 @@ enum Phase {
     WaitReg,
     /// Unlatched, EPQ quals re-evaluation pending (`EpqStep`).
     Epq,
+    /// The ON CONFLICT insert path found a conflict or a wait on the arbiter
+    /// key (§5.3.1(2)): roll back to `sa` (one latched section per visited key),
+    /// then restart from the pre-check (after the wait, if one was needed).
+    ArbAb,
+    /// End-of-statement AFTER events pending: the head of `evq` runs as an
+    /// internal command at a fresh seq (§5.3).
+    EvSnap,
+    /// The head event's write applied; its ghost net effect and the queue
+    /// advance next.
+    EvNext,
     /// Parked on the wait-for graph (`cc`: parked from the deferrable commit check).
     Parked {
         cc: bool,
@@ -938,6 +1254,22 @@ enum Phase {
         aborted: bool,
     },
 }
+
+/// §5.3.1 attempt state: the internal savepoint's seq, the conflicting row and
+/// its newest committed data version `v_r`, and the DO UPDATE's WHERE qual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ArbSt {
+    sa: u8,
+    r: LKey,
+    v_r: (Ts, VerData),
+    qual: Option<u8>,
+}
+
+/// A queued AFTER-trigger event (§5.3.1/§5.5): `(tag, target)`. The protocol
+/// queue `evq` carries the tags the code under test writes (seed 64: `seq0`);
+/// the ghost queue `gevq` always carries the spec's `sa` and is the oracle's
+/// notion of which events are live.
+type EvEnt = (u8, LKey);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Txn {
@@ -958,6 +1290,27 @@ struct Txn {
     holders: Vec<u8>,
     seq: u8,
     seq0: u8,
+    /// The command seq layer placement uses (§2.1/§5.3.1): `seq0` for ordinary
+    /// statements and internal event commands, the attempt's `sa` inside an
+    /// ON CONFLICT attempt.
+    cmd_seq: u8,
+    /// ON CONFLICT attempt in flight (§5.3.1).
+    arb: Option<ArbSt>,
+    /// The attempt is on the insert path (the ops after the OnConflict op are
+    /// the proposed row and its entries).
+    ains: bool,
+    /// The attempt produced a row outcome (a placed insert or update).
+    aeff: bool,
+    /// The current synthesized op is the §5.3.1(3) arbiter lock (never runs EPQ).
+    alock: bool,
+    /// The current op is an internal event command; its ghost net effect is
+    /// recorded at `EvNext` (from the ghost event queue), not at placement.
+    evop: bool,
+    /// The synthesized current op (the arbiter lock/update, an event command).
+    synth: Option<Op>,
+    /// Queued AFTER events: the protocol's queue (tags as written) and the ghost's.
+    evq: Vec<EvEnt>,
+    gevq: Vec<EvEnt>,
     /// Ghost: net effect of the surviving statements (frozen at commit).
     expected: [Option<ED>; NKEYS],
     sp: Vec<(u8, [Option<ED>; NKEYS])>,
@@ -991,6 +1344,15 @@ impl Txn {
             holders: Vec::new(),
             seq: 1,
             seq0: 0,
+            cmd_seq: 0,
+            arb: None,
+            ains: false,
+            aeff: false,
+            alock: false,
+            evop: false,
+            synth: None,
+            evq: Vec::new(),
+            gevq: Vec::new(),
             expected: [None; NKEYS],
             sp: Vec::new(),
             glog: Vec::new(),
@@ -1058,13 +1420,17 @@ enum EdgeKind {
 }
 
 /// I-PROGRESS accounting for one actor step: the step completed work outside the
-/// retry loop (reset), continued the loop without retrying (keep), or retried
-/// without parking (bump).
+/// retry loop (reset), continued the loop without retrying (keep), retried
+/// without parking (bump), or retried after itself changing intent state — an
+/// inline §7.3 removal writes the KV, so it cannot recur without bound and
+/// resets the backstop (§11: "preceded by ... a change of committed or intent
+/// state").
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Spin {
     Done,
     Mid,
     Retry,
+    Removed,
 }
 
 /// A deferrable `/i/` entry as read by `DefScan` under the prefix latch.
@@ -1109,6 +1475,15 @@ pub struct State {
     /// intent — (txn, key, the qual evaluates on the latest committed version,
     /// the op applied) — `check` flags a mismatch (review rework 2).
     qlog: Vec<(u8, LKey, bool, bool)>,
+    /// Ghost (§5.3.1): every ON CONFLICT statement that ended with **no** row
+    /// outcome — (txn, arbiter key, the key's current state is live). §5.3.1(3)
+    /// never skips: a vanished conflict must restart the arbiter; `check` flags
+    /// a no-outcome completion over a not-live arbiter key.
+    alog: Vec<(u8, LKey, bool)>,
+    /// Observation log: every FK EPQ failure with whether the parent moved
+    /// (§5.3: 23503 vs 40001; both abort in-model — the codes are recorded as
+    /// reachability evidence only).
+    errs: Vec<(u8, bool)>,
     bad: Option<String>,
 }
 
@@ -1126,6 +1501,16 @@ pub enum Action {
     EndStmt(u8),
     Savepoint(u8),
     RollbackTo(u8),
+    /// §5.3.1 attempt: take the internal savepoint `sa` (when fresh) and run the
+    /// arbiter pre-check on `latch_key(arb)`.
+    ArbPre(u8),
+    /// Abandon the attempt: roll back to `sa` (§5.5), then restart from the
+    /// pre-check (after the pending wait, if any).
+    Abandon(u8),
+    /// Start the head AFTER event's internal command (§5.3).
+    EvSnap(u8),
+    /// Finish the head event (ghost net effect, queue advance).
+    EvNext(u8),
     Request(u8),
     Drain(u8),
     SetStatus(u8),
@@ -1172,7 +1557,7 @@ fn req_mode(op: Op) -> Lock {
 fn op_key(op: Op) -> Option<LKey> {
     match op {
         Op::Write { key, .. }
-        | Op::Delete { key }
+        | Op::Delete { key, .. }
         | Op::KeyExist { key, .. }
         | Op::LockOnly { key, .. }
         | Op::KeyShare { key, .. }
@@ -1206,7 +1591,59 @@ impl State {
 
     fn cur_op(&self, w: u8) -> Op {
         let t = &self.txns[w as usize];
+        if let Some(op) = t.synth {
+            return op;
+        }
         WORKLOADS[self.wl as usize].txns[w as usize].stmts[t.stmt as usize].ops[t.op as usize]
+    }
+
+    /// The OnConflict op of `w`'s current statement, if any (None before `Choose`
+    /// or for statements without one).
+    fn oc_of(&self, w: u8) -> Option<Op> {
+        let t = &self.txns[w as usize];
+        if (t.stmt as usize) < WORKLOADS[self.wl as usize].txns[w as usize].stmts.len() {
+            WORKLOADS[self.wl as usize].txns[w as usize].stmts[t.stmt as usize]
+                .ops
+                .iter()
+                .find(|o| matches!(o, Op::OnConflict { .. }))
+                .copied()
+        } else {
+            None
+        }
+    }
+
+    /// §5.3's "current state" liveness of key `k` for txn `w`, bug-free: the own
+    /// intent's top-layer data if it is `Write` (live) or `Delete` (not live —
+    /// §5.3: "own `Delete` → proceed"), otherwise the newest committed version.
+    fn cur_live(&self, k: LKey, w: u8) -> bool {
+        let own_top = match &self.slot(k).intent {
+            Some(i) if i.owner == w => Some(top_layer(i).data),
+            _ => None,
+        };
+        match own_top {
+            Some(Data::Write { .. }) => true,
+            Some(Data::Delete { .. }) => false,
+            _ => matches!(self.committed_state(k), Some((_, VerData::Live { .. }))),
+        }
+    }
+
+    /// The row a live entry key `k` (whose live version's value names the owning
+    /// row, `KEYS`-indexed) points at, for txn `w`'s current-state read.
+    fn cur_row(&self, k: LKey, w: u8, dflt: LKey) -> LKey {
+        let val = match &self.slot(k).intent {
+            Some(i) if i.owner == w => match top_layer(i).data {
+                Data::Write { val, .. } => Some(val),
+                _ => None,
+            },
+            _ => None,
+        };
+        let val = val.or(match self.committed_state(k) {
+            Some((_, VerData::Live { val, .. })) => Some(val),
+            _ => None,
+        });
+        KEYS.get(val.map_or(256, |v| v as usize))
+            .copied()
+            .unwrap_or(dflt)
     }
 
     fn iso(&self, w: u8) -> Iso {
@@ -1272,7 +1709,7 @@ impl State {
                     if c <= ts {
                         return match top_layer(i).data {
                             Data::Write { val, .. } => Some(val),
-                            Data::Delete => None,
+                            Data::Delete { .. } => None,
                             Data::Absent => match self.vers_read(slot, ts) {
                                 Some(VerData::Live { val, .. }) => Some(val),
                                 _ => None,
@@ -1297,7 +1734,7 @@ impl State {
                     match l.data {
                         // §4: an own `Absent` layer is lock-only; reads fall through.
                         Data::Write { val, .. } => return Some(val),
-                        Data::Delete => return None,
+                        Data::Delete { .. } => return None,
                         Data::Absent => {}
                     }
                 }
@@ -1413,6 +1850,11 @@ impl State {
         self.qlog.dedup();
         self.d40p01.sort_unstable();
         self.d40p01.dedup();
+        self.alog.sort_unstable();
+        self.alog.dedup();
+        self.errs.sort_unstable();
+        self.errs.dedup();
+        // (`evq`/`gevq` keep their order: events fire FIFO, §5.3.)
     }
 }
 
@@ -1557,6 +1999,7 @@ impl WriteModel {
         let op = s.cur_op(w);
         let key = op_key(op).unwrap_or(LKey::T0);
         let seq0 = s.txns[w as usize].seq0;
+        let cseq = s.txns[w as usize].cmd_seq;
         let prev = s.slot(key).intent.clone();
         let own = matches!(&prev, Some(i) if i.owner == w);
         let mut layers = match &prev {
@@ -1577,8 +2020,16 @@ impl WriteModel {
                     seq0,
                 )
             }
-            Op::Delete { .. } => (Data::Delete, seq0),
-            Op::KeyExist { .. } => (Data::Write { val: 1, kc: false }, seq0),
+            Op::Delete { moved, .. } => (Data::Delete { moved }, seq0),
+            Op::KeyExist { kind, .. } => {
+                // An entry key's value names the owning row (KEYS index), so the
+                // §5.3.1 pre-check can find `r`; a row key carries the row value.
+                let val = match kind {
+                    KeyKind::Pk { .. } => 1,
+                    KeyKind::Unique { row } | KeyKind::Def { row } => row as u8,
+                };
+                (Data::Write { val, kc: false }, seq0)
+            }
             Op::LockOnly { .. } => {
                 if let Some(top) = layers.last().copied() {
                     if self.bug != Some(Bug::LockOnlyReplacesData) {
@@ -1601,7 +2052,7 @@ impl WriteModel {
             lock = lock.max(req);
         }
         let top_seq = layers.last().map(|l| l.seq).unwrap_or(0);
-        let seq = seq0.max(top_seq);
+        let seq = cseq.max(top_seq);
         let layer = Layer {
             seq,
             dseq,
@@ -1632,36 +2083,73 @@ impl WriteModel {
                 e.count += 1;
             }
         }
-        // Ghost net effect of the surviving statements.
-        let exp = &mut s.txns[w as usize].expected;
-        match op {
-            Op::Write { .. } => {
-                exp[key as usize] = match exp[key as usize] {
-                    Some(ED::Inc { d }) => Some(ED::Inc {
-                        d: d.saturating_add(1),
-                    }),
-                    Some(ED::Row { val, uval, child }) => Some(ED::Row {
-                        val: val.saturating_add(1),
-                        uval,
-                        child,
-                    }),
-                    _ => Some(ED::Inc { d: 1 }),
-                };
+        // Ghost net effect of the surviving statements. An internal event
+        // command's effect is recorded at `EvNext` (from the ghost event queue),
+        // so an event that should have been discarded by an abandon (seed 64)
+        // applies its write without a ghost effect — the commit oracle flags it.
+        if !s.txns[w as usize].evop {
+            let exp = &mut s.txns[w as usize].expected;
+            match op {
+                Op::Write { .. } => {
+                    exp[key as usize] = match exp[key as usize] {
+                        Some(ED::Inc { d }) => Some(ED::Inc {
+                            d: d.saturating_add(1),
+                        }),
+                        Some(ED::Row { val, uval, child }) => Some(ED::Row {
+                            val: val.saturating_add(1),
+                            uval,
+                            child,
+                        }),
+                        _ => Some(ED::Inc { d: 1 }),
+                    };
+                }
+                Op::Delete { .. } => exp[key as usize] = Some(ED::Dead),
+                Op::KeyExist { kind, .. } => match kind {
+                    KeyKind::Pk { uval, child } => {
+                        exp[key as usize] = Some(ED::Row {
+                            val: 1,
+                            uval,
+                            child,
+                        })
+                    }
+                    KeyKind::Unique { row } | KeyKind::Def { row } => {
+                        exp[key as usize] = Some(ED::Entry { row })
+                    }
+                },
+                _ => {}
             }
-            Op::Delete { .. } => exp[key as usize] = Some(ED::Dead),
-            Op::KeyExist { kind, .. } => match kind {
-                KeyKind::Pk { uval, child } => {
-                    exp[key as usize] = Some(ED::Row {
-                        val: 1,
-                        uval,
-                        child,
-                    })
+        }
+        // §5.3.1: a row outcome of an attempt queues its AFTER event, tagged
+        // `sa` (seed 64 tags it `seq0`, so an abandon no longer discards it).
+        if let Some(a) = s.txns[w as usize].arb {
+            let outcome = (s.txns[w as usize].ains
+                && is_key_exist(op)
+                && key
+                    == s.oc_of(w).map_or(a.r, |o| match o {
+                        Op::OnConflict { row, .. } => row,
+                        _ => a.r,
+                    }))
+                || (!s.txns[w as usize].ains
+                    && s.txns[w as usize].synth.is_some()
+                    && is_data_row_op(op));
+            if outcome {
+                let ev = s.oc_of(w).and_then(|o| match o {
+                    Op::OnConflict { ev, .. } => ev,
+                    _ => None,
+                });
+                if let Some(target) = ev {
+                    let tag = if self.bug == Some(Bug::EventTagSeq0) {
+                        seq0
+                    } else {
+                        a.sa
+                    };
+                    s.txns[w as usize].aeff = true;
+                    s.txns[w as usize].evq.push((tag, target));
+                    s.txns[w as usize].gevq.push((a.sa, target));
+                } else {
+                    s.txns[w as usize].aeff = true;
                 }
-                KeyKind::Unique { row } | KeyKind::Def { row } => {
-                    exp[key as usize] = Some(ED::Entry { row })
-                }
-            },
-            _ => {}
+            }
         }
         // Ghost (review rework 2): an RC row op applied with no own intent — the
         // moment the row lock is granted — against the qual evaluated on the
@@ -1673,6 +2161,47 @@ impl WriteModel {
             };
             let ghost = ghost_qual(s, key, qual);
             s.qlog.push((w, key, ghost, true));
+        }
+        // §5.3.1(3): the arbiter lock is placed; the DO UPDATE is computed from
+        // the locked row (own data if any, else `v_r`) and applied through §5.4.
+        // A false WHERE leaves the lock and ends the statement with no outcome.
+        if s.txns[w as usize].alock && matches!(op, Op::LockOnly { .. }) {
+            let a = s.txns[w as usize].arb.unwrap_or(ArbSt {
+                sa: 0,
+                r: key,
+                v_r: (0, VerData::Tomb { moved: false }),
+                qual: None,
+            });
+            let val = s.read_own(key, a.v_r.0, w, seq0);
+            let applies = match a.qual {
+                Some(q) => val == Some(q),
+                None => true,
+            };
+            {
+                let txn = &mut s.txns[w as usize];
+                txn.base = a.v_r.0;
+                txn.epq_count = 0;
+                txn.epq_v = None;
+                txn.epq_n.clear();
+                txn.wait = None;
+                txn.wait_cc = false;
+                txn.holders.clear();
+            }
+            if applies {
+                s.txns[w as usize].synth = Some(Op::Write {
+                    key: a.r,
+                    kc: false,
+                    qual: None,
+                });
+                s.txns[w as usize].phase = Phase::Op;
+            } else {
+                // A false WHERE leaves the lock (§5.3.1(3)); the statement ends
+                // with no outcome (the arbiter ghost checks liveness).
+                s.txns[w as usize].alock = false;
+                s.txns[w as usize].synth = None;
+                self.advance_op(s, w);
+            }
+            return;
         }
         self.advance_op(s, w);
     }
@@ -1688,7 +2217,7 @@ impl WriteModel {
             for (ts, v) in s.slot(key).vers.clone() {
                 if ts > snap {
                     let bad = match v {
-                        VerData::Tomb => true,
+                        VerData::Tomb { .. } => true,
                         VerData::Live { kc, .. } => kc,
                     };
                     if bad {
@@ -1733,6 +2262,7 @@ impl WriteModel {
     }
 
     fn advance_op(&self, s: &mut State, w: u8) {
+        let evop;
         {
             let txn = &mut s.txns[w as usize];
             txn.op += 1;
@@ -1743,6 +2273,15 @@ impl WriteModel {
             txn.wait = None;
             txn.wait_cc = false;
             txn.holders.clear();
+            txn.alock = false;
+            txn.synth = None;
+            evop = txn.evop;
+        }
+        if evop {
+            // The head AFTER event's write applied; its ghost net effect and the
+            // queue advance in `EvNext` (§5.3).
+            s.txns[w as usize].phase = Phase::EvNext;
+            return;
         }
         self.scan_ready(s, w);
     }
@@ -1766,7 +2305,128 @@ impl WriteModel {
             txn.phase = Phase::EndS;
             return;
         }
+        if s.txns[w as usize].arb.is_some() {
+            // The ON CONFLICT statement's ops are done: end the attempt (§5.3.1),
+            // then run the queued AFTER events before the next statement.
+            self.arb_done(s, w);
+            return;
+        }
         self.advance_stmt(s, w);
+    }
+
+    /// End of an ON CONFLICT statement (§5.3.1): pop the attempt's savepoint
+    /// push, record the no-outcome ghost (a no-outcome completion requires the
+    /// conflict to still exist), clear the attempt, then drain AFTER events.
+    fn arb_done(&self, s: &mut State, w: u8) {
+        let (arb_key, aeff, sa) = match s.oc_of(w) {
+            Some(Op::OnConflict { arb, .. }) => (
+                arb,
+                s.txns[w as usize].aeff,
+                s.txns[w as usize].arb.map_or(0, |a| a.sa),
+            ),
+            _ => (LKey::U0, false, 0),
+        };
+        if s.txns[w as usize].sp.last().is_some_and(|(q, _)| *q == sa) {
+            s.txns[w as usize].sp.pop();
+        }
+        if !aeff {
+            let live = s.cur_live(arb_key, w);
+            s.alog.push((w, arb_key, live));
+        }
+        {
+            let txn = &mut s.txns[w as usize];
+            txn.arb = None;
+            txn.ains = false;
+            txn.aeff = false;
+            txn.alock = false;
+            txn.synth = None;
+            txn.evop = false;
+            txn.cmd_seq = txn.seq0;
+        }
+        if s.txns[w as usize].evq.is_empty() {
+            self.advance_stmt(s, w);
+        } else {
+            s.txns[w as usize].phase = Phase::EvSnap;
+        }
+    }
+
+    /// §5.3: the head AFTER event runs as an internal command at a fresh seq
+    /// (greater than the statement's), reading the latest committed state plus
+    /// own writes through §5.1 like any row op.
+    fn do_ev_snap(&self, s: &mut State, w: u8) {
+        let head = s.txns[w as usize].evq.first().copied();
+        let visible = s.visible_ts;
+        {
+            let txn = &mut s.txns[w as usize];
+            txn.seq += 1;
+            txn.seq0 = txn.seq;
+            txn.cmd_seq = txn.seq;
+            txn.observing = 0;
+            txn.snap = Some(visible);
+            txn.base = visible;
+            txn.skip = 0;
+        }
+        let Some((_, target)) = head else {
+            self.advance_stmt(s, w);
+            return;
+        };
+        let seq0 = s.txns[w as usize].seq0;
+        if s.read_own(target, visible, w, seq0).is_none() {
+            // The internal UPDATE's scan finds no row: the event is skipped;
+            // both queues drop it.
+            let txn = &mut s.txns[w as usize];
+            txn.evq.remove(0);
+            if let Some(i) = txn.gevq.iter().position(|e| e.1 == target) {
+                txn.gevq.remove(i);
+            }
+            if txn.evq.is_empty() {
+                self.advance_stmt(s, w);
+            }
+            return;
+        }
+        let txn = &mut s.txns[w as usize];
+        txn.evop = true;
+        txn.synth = Some(Op::Write {
+            key: target,
+            kc: false,
+            qual: None,
+        });
+        txn.phase = Phase::Op;
+    }
+
+    /// The head event's write applied (§5.3): record its ghost net effect iff it
+    /// is still live in the ghost queue (an event an abandon should have
+    /// discarded — seed 64 — applies without a ghost effect), then continue.
+    fn do_ev_next(&self, s: &mut State, w: u8) {
+        let head = s.txns[w as usize].evq.first().copied();
+        {
+            let txn = &mut s.txns[w as usize];
+            txn.evop = false;
+            txn.synth = None;
+        }
+        let Some((_, target)) = head else {
+            self.advance_stmt(s, w);
+            return;
+        };
+        let txn = &mut s.txns[w as usize];
+        txn.evq.remove(0);
+        if let Some(i) = txn.gevq.iter().position(|e| e.1 == target) {
+            txn.gevq.remove(i);
+            txn.expected[target as usize] = match txn.expected[target as usize] {
+                Some(ED::Inc { d }) => Some(ED::Inc {
+                    d: d.saturating_add(1),
+                }),
+                Some(ED::Row { val, uval, child }) => Some(ED::Row {
+                    val: val.saturating_add(1),
+                    uval,
+                    child,
+                }),
+                _ => Some(ED::Inc { d: 1 }),
+            };
+        }
+        if txn.evq.is_empty() {
+            self.advance_stmt(s, w);
+        }
     }
 
     fn advance_stmt(&self, s: &mut State, w: u8) {
@@ -1788,6 +2448,7 @@ impl WriteModel {
                     txn.op = 0;
                     txn.seq0 = txn.seq;
                     txn.seq += 1;
+                    txn.cmd_seq = txn.seq0;
                 }
                 // One snapshot per txn (§4); later statements re-derive their skip set.
                 s.txns[w as usize].skip = self.compute_skip(s, w, next);
@@ -1817,6 +2478,227 @@ impl WriteModel {
                 self.bug == Some(Bug::ProceedBeforeVisible) || c <= s.visible_ts
             }
         }
+    }
+
+    // ---- the §5.3.1 arbiter protocol ----
+
+    /// Is `w`'s current op the arbiter entry op of an in-flight insert-path
+    /// attempt? §5.3.1(2): its unique check finding a live entry of another
+    /// row, or a wait, abandons the attempt.
+    fn is_arb_entry(&self, s: &State, w: u8, key: LKey) -> bool {
+        match s.txns[w as usize].arb {
+            Some(a) => {
+                let arb_key = s.oc_of(w).map_or(a.r, |o| match o {
+                    Op::OnConflict { arb, .. } => arb,
+                    _ => a.r,
+                });
+                s.txns[w as usize].ains
+                    && matches!(s.cur_op(w), Op::KeyExist { .. })
+                    && key == arb_key
+            }
+            None => false,
+        }
+    }
+
+    /// §5.3.1 "restart from 1": drop the attempt's (write-less) savepoint push
+    /// and re-enter the pre-check as a fresh attempt (a fresh `sa`).
+    fn restart_arb(&self, s: &mut State, w: u8) {
+        let sa = s.txns[w as usize].arb.map_or(0, |a| a.sa);
+        if s.txns[w as usize].sp.last().is_some_and(|(q, _)| *q == sa) {
+            s.txns[w as usize].sp.pop();
+        }
+        let txn = &mut s.txns[w as usize];
+        txn.arb = None;
+        txn.ains = false;
+        txn.aeff = false;
+        txn.alock = false;
+        txn.synth = None;
+        txn.evop = false;
+        txn.cmd_seq = txn.seq0;
+        txn.op = 0;
+        txn.phase = Phase::Op;
+    }
+
+    /// §5.3.1 step 1: take the attempt's internal savepoint at a fresh `sa`
+    /// (only when no attempt is in flight — a wait-restart re-uses it, having
+    /// written nothing) and run the arbiter pre-check on `latch_key(arb)`.
+    fn do_arb_pre(&self, s: &mut State, w: u8) -> Spin {
+        let (arb_key, row_key, upd) = match s.cur_op(w) {
+            Op::OnConflict { arb, row, upd, .. } => (arb, row, upd),
+            // Only dispatched for the OnConflict op (actions); stay sound anyway.
+            _ => return Spin::Done,
+        };
+        if s.txns[w as usize].arb.is_none() {
+            let qual = match s.cur_op(w) {
+                Op::OnConflict { qual, .. } => qual,
+                _ => None,
+            };
+            let txn = &mut s.txns[w as usize];
+            txn.seq += 1;
+            let sa = txn.seq;
+            txn.cmd_seq = if self.bug == Some(Bug::ArbSeq0) {
+                // Seed 56: the attempt's writes place at seq0.
+                txn.seq0
+            } else {
+                sa
+            };
+            let exp = txn.expected;
+            txn.sp.push((sa, exp));
+            txn.arb = Some(ArbSt {
+                sa,
+                r: row_key,
+                v_r: (0, VerData::Tomb { moved: false }),
+                qual,
+            });
+            txn.ains = false;
+            txn.aeff = false;
+            txn.alock = false;
+        }
+        let sa = s.txns[w as usize].arb.map_or(0, |a| a.sa);
+        let qual = s.txns[w as usize].arb.and_then(|a| a.qual);
+        s.latch.push((lk_of(arb_key), w));
+        // 1. Foreign intent on the arbiter key, as §5.1's block (§5.3.1(1)).
+        if let Some(i) = s.slot(arb_key).intent.clone() {
+            if i.owner != w {
+                let owner = i.owner;
+                let top = top_layer(&i);
+                if self.foreign_ended(s, owner) {
+                    let committed_visible = matches!(
+                        s.status.get(&owner).map(|e| e.st),
+                        Some(St::Committed(c)) if c <= s.visible_ts
+                    );
+                    self.remove_intent(s, owner, arb_key, true);
+                    if committed_visible {
+                        s.txns[w as usize].observing |= 1 << owner;
+                    }
+                    unlatch(s, w);
+                    return Spin::Removed; // re-read (the removal wrote state)
+                }
+                if top.data != Data::Absent {
+                    // Pending or committed-not-visible: wait_for, restart from 1.
+                    let g = s.status.get(&owner).map(|e| e.gen).unwrap_or(0);
+                    let txn = &mut s.txns[w as usize];
+                    txn.wait = Some(vec![(owner, g)]);
+                    txn.wait_kind = EdgeKind::Key(arb_key, Lock::NoKeyUpd);
+                    txn.wait_cc = false;
+                    txn.phase = Phase::WaitReg;
+                    unlatch(s, w);
+                    return Spin::Mid;
+                }
+                // A lock-only foreign intent does not block the state read.
+            }
+        }
+        // 2. The key's current state (§5.3's unique-check rule): a live entry of
+        //    another row r is the conflict (§5.3.1(1) -> 3).
+        let live = s.cur_live(arb_key, w);
+        let r_conflict = live && s.cur_row(arb_key, w, row_key) != row_key;
+        if r_conflict {
+            let r = s.cur_row(arb_key, w, row_key);
+            // v_r: the newest committed data version of r's /t/ key, read from a
+            // registered view (§3.1 — the read is outside r's latch).
+            s.view_counter += 1;
+            if let Some(v_r) = s.committed_state(r) {
+                let nops = WORKLOADS[s.wl as usize].txns[w as usize].stmts
+                    [s.txns[w as usize].stmt as usize]
+                    .ops
+                    .len() as u8;
+                let vis = s.visible_ts;
+                s.txns[w as usize].arb = Some(ArbSt { sa, r, v_r, qual });
+                if !upd {
+                    // DO NOTHING: skip the proposed row (§5.3.1(3)); the
+                    // statement ends with no outcome.
+                    s.txns[w as usize].op = nops;
+                    unlatch(s, w);
+                    self.scan_ready(s, w); // -> arb_done (the ghost checks liveness)
+                    return Spin::Done;
+                }
+                let txn = &mut s.txns[w as usize];
+                txn.op = nops; // skip the proposed row's ops
+                txn.base = if self.bug == Some(Bug::ArbBaseS) {
+                    // Seed 57: measure newer versions against S, not v_r.
+                    txn.snap.unwrap_or(vis)
+                } else {
+                    v_r.0
+                };
+                txn.alock = true;
+                txn.synth = Some(Op::LockOnly { key: r, upd: false });
+                txn.phase = Phase::Op;
+                unlatch(s, w);
+                return Spin::Mid;
+            }
+        }
+        // 3. Insert path (§5.3.1(2)): the proposed row and its entries follow as
+        //    key-existence ops through §5.1, placed at the attempt's `sa`.
+        s.txns[w as usize].ains = true;
+        s.txns[w as usize].op = 1;
+        unlatch(s, w);
+        self.scan_ready(s, w);
+        Spin::Done
+    }
+
+    /// §5.3.1(2) abandon: roll back to `sa` exactly as `ROLLBACK TO SAVEPOINT`
+    /// (§5.5 — only the layers this attempt pushed or modified are dropped, an
+    /// intent is removed only if no layer remains), discard the checks and AFTER
+    /// events queued during the attempt, wake waiters, then restart from the
+    /// pre-check (after the pending wait, if one was needed).
+    fn do_abandon(&self, s: &mut State, w: u8) -> Spin {
+        let (sa, exp) = match s.txns[w as usize].sp.pop() {
+            Some(x) => x,
+            None => (u8::MAX, s.txns[w as usize].expected),
+        };
+        let keys: Vec<LKey> = s.txns[w as usize]
+            .wlog
+            .iter()
+            .filter(|(q, _)| *q >= sa)
+            .map(|(_, k)| *k)
+            .collect();
+        for k in keys {
+            if self.bug == Some(Bug::AbandonWholeIntent) {
+                // Seed 54: remove whole intents, losing layers below sa.
+                self.remove_intent(s, w, k, true);
+                continue;
+            }
+            let layers = s
+                .slot(k)
+                .intent
+                .clone()
+                .map(|i| i.layers)
+                .unwrap_or_default();
+            let kept: Vec<Layer> = layers.iter().copied().filter(|l| l.seq < sa).collect();
+            if kept.is_empty() {
+                self.remove_intent(s, w, k, true);
+            } else {
+                s.kv.entry(k).or_default().intent = Some(Intent {
+                    owner: w,
+                    layers: kept,
+                });
+            }
+        }
+        {
+            let txn = &mut s.txns[w as usize];
+            txn.wlog.retain(|(q, _)| *q < sa);
+            txn.glog.retain(|(q, _)| *q < sa);
+            // §5.5: pending checks and queued AFTER events with tag >= sa are
+            // discarded. The ghost queue always carries the spec's `sa`; the
+            // protocol queue carries what the code wrote (seed 64: `seq0`).
+            txn.evq.retain(|(tag, _)| *tag < sa);
+            txn.gevq.retain(|(tag, _)| *tag < sa);
+            txn.expected = exp;
+            txn.arb = None;
+            txn.ains = false;
+            txn.aeff = false;
+            txn.alock = false;
+            txn.synth = None;
+            txn.evop = false;
+            txn.cmd_seq = txn.seq0;
+            txn.op = 0;
+        }
+        self.release_shared(s, w, sa);
+        // §5.5/§5.3.1: bump the wake generation so waiters re-run.
+        self.wake(s, w);
+        let has_wait = s.txns[w as usize].wait.is_some();
+        s.txns[w as usize].phase = if has_wait { Phase::WaitReg } else { Phase::Op };
+        Spin::Retry
     }
 
     // ---- the §5.1 latch section ----
@@ -1854,7 +2736,7 @@ impl WriteModel {
                         s.txns[w as usize].observing |= 1 << owner;
                     }
                     unlatch(s, w);
-                    return Spin::Retry; // `continue`
+                    return Spin::Removed; // `continue` (the removal wrote state)
                 }
                 // R3W-8: no wait on a lock-only intent over a live row.
                 if is_key_exist(op)
@@ -1862,6 +2744,12 @@ impl WriteModel {
                     && matches!(s.committed_state(key), Some((_, VerData::Live { .. })))
                 {
                     unlatch(s, w);
+                    if self.is_arb_entry(s, w, key) {
+                        // §5.3.1(2): the arbiter key's unique check found a live
+                        // entry of another row: abandon the attempt.
+                        s.txns[w as usize].phase = Phase::ArbAb;
+                        return Spin::Mid;
+                    }
                     self.do_fail(s, w); // 23505
                     return Spin::Done;
                 }
@@ -1870,8 +2758,14 @@ impl WriteModel {
                     s.txns[w as usize].wait = Some(vec![(owner, g)]);
                     s.txns[w as usize].wait_kind = EdgeKind::Key(key, m);
                     s.txns[w as usize].wait_cc = false;
-                    s.txns[w as usize].phase = Phase::WaitReg;
                     unlatch(s, w);
+                    if self.is_arb_entry(s, w, key) {
+                        // §5.3.1(2): must wait — abandon the attempt first, then
+                        // wait, then restart from the pre-check.
+                        s.txns[w as usize].phase = Phase::ArbAb;
+                    } else {
+                        s.txns[w as usize].phase = Phase::WaitReg;
+                    }
                     return Spin::Mid;
                 }
                 // Non-conflicting foreign intent (e.g. KEY SHARE vs NO KEY UPDATE).
@@ -1971,7 +2865,7 @@ impl WriteModel {
                         n.clone()
                     };
                     let bad = examined.iter().any(|(_, v)| match v {
-                        VerData::Tomb => true,
+                        VerData::Tomb { .. } => true,
                         VerData::Live { kc, .. } => *kc,
                     });
                     if bad {
@@ -1981,7 +2875,21 @@ impl WriteModel {
                     }
                     // KEY SHARE may proceed over plain newer writes.
                 } else {
-                    // RC: EPQ (§5.2), unlatched.
+                    // RC.
+                    if s.txns[w as usize].alock {
+                        // §5.3.1(3): the ON CONFLICT lock never runs EPQ — with
+                        // base = v_r.ts a non-empty N means the row changed
+                        // since the pre-check, so the arbiter restarts (always
+                        // preceded by a foreign change of state, §5.3.1).
+                        if self.bug != Some(Bug::ArbLockEpq) {
+                            unlatch(s, w);
+                            self.restart_arb(s, w);
+                            return Spin::Retry;
+                        }
+                        // Seed 53: the lock runs EPQ like a plain row op, so a
+                        // deleted conflicting row is skipped instead of restarting.
+                    }
+                    // EPQ (§5.2), unlatched.
                     let snap = s.txns[w as usize].snap.unwrap_or(s.visible_ts);
                     let vers: Vec<(Ts, VerData)> = if matches!(op, Op::KeyShare { .. }) {
                         // §5.2: KEY SHARE examines every version above S.
@@ -2022,13 +2930,20 @@ impl WriteModel {
             } else if own_top == Some(Data::Absent) && self.bug == Some(Bug::OwnAbsentNotLive) {
                 false
             } else {
-                match own_top {
-                    Some(Data::Write { .. }) => true,
-                    Some(Data::Delete) | Some(Data::Absent) | None => committed_live,
-                }
+                // §5.3: the current state is the own intent's top layer if it is
+                // `Write` (live) or `Delete` (not live — "own `Delete` → proceed",
+                // so a delete-then-reinsert of one key in a txn inserts), else
+                // the newest committed version.
+                s.cur_live(key, w)
             };
             if live {
                 unlatch(s, w);
+                if self.is_arb_entry(s, w, key) {
+                    // §5.3.1(2): the arbiter key's unique check found a live
+                    // entry of another row: abandon the attempt.
+                    s.txns[w as usize].phase = Phase::ArbAb;
+                    return Spin::Mid;
+                }
                 self.do_fail(s, w); // 23505
                 return Spin::Done;
             }
@@ -2094,36 +3009,69 @@ impl WriteModel {
         s.txns[w as usize].wait_kind = EdgeKind::Key(key, m);
         s.txns[w as usize].wait_cc = false;
         s.txns[w as usize].holders.clear();
-        s.txns[w as usize].phase = Phase::WaitReg;
+        s.txns[w as usize].phase = if self.is_arb_entry(s, w, key) {
+            // §5.3.1(2): the arbiter entry must wait — abandon first.
+            Phase::ArbAb
+        } else {
+            Phase::WaitReg
+        };
         unlatch(s, w);
         Spin::Mid
     }
 
     /// §5.2 EPQ: re-evaluate the quals against the remembered version(s), unlatched.
     fn do_epq_step(&self, s: &mut State, w: u8) -> Spin {
-        let v = s.txns[w as usize].epq_v.unwrap_or((0, VerData::Tomb));
+        let v = s.txns[w as usize]
+            .epq_v
+            .unwrap_or((0, VerData::Tomb { moved: false }));
         let n = s.txns[w as usize].epq_n.clone();
         let op = s.cur_op(w);
+        // The ON CONFLICT lock re-evaluates the DO UPDATE's WHERE (§5.3.1(3)
+        // evaluates it on the locked row); it only runs EPQ at all under seed 53.
+        let alock = s.txns[w as usize].alock;
+        let aqual = s.txns[w as usize].arb.and_then(|a| a.qual);
         let pass = match op {
             Op::KeyShare { .. } => {
                 // §5.1/§5.2: KEY SHARE examines every version above S.
                 n.iter().all(|(_, vd)| match vd {
-                    VerData::Tomb => false,
+                    VerData::Tomb { .. } => false,
                     VerData::Live { kc, .. } => !*kc,
                 })
             }
+            Op::LockOnly { .. } if alock => match v.1 {
+                VerData::Live { val, .. } => aqual.is_none_or(|q| q == val),
+                VerData::Tomb { .. } => false,
+            },
             Op::Write { qual, .. } => match v.1 {
                 VerData::Live { val, .. } => qual.is_none_or(|q| q == val),
-                VerData::Tomb => false,
+                VerData::Tomb { .. } => false,
             },
             Op::Delete { .. } => matches!(v.1, VerData::Live { .. }),
             _ => true,
         };
         if !pass {
             if matches!(op, Op::KeyShare { fk: true, .. }) {
-                // §5.3: an FK EPQ failure raises 23503, never skips.
-                self.do_fail(s, w);
+                // §5.3: an FK EPQ failure raises 23503, never skips; a moved
+                // parent raises 40001. Both abort; the raised code is recorded
+                // for reachability evidence (see the module doc).
+                let moved = n
+                    .iter()
+                    .any(|(_, vd)| matches!(vd, VerData::Tomb { moved: true }));
+                s.errs.push((w, moved));
+                if self.bug != Some(Bug::FkEpqSkip) {
+                    self.do_fail(s, w); // 23503 / 40001
+                } else {
+                    // Seed 58: skip the row instead of raising.
+                    self.advance_op(s, w);
+                }
             } else {
+                if alock {
+                    // Seed 53's EPQ skipped the row: the arbiter statement ends
+                    // with no outcome; `arb` stays armed so the statement-end
+                    // ghost (§5.3.1) can check the arbiter key's liveness.
+                    s.txns[w as usize].alock = false;
+                    s.txns[w as usize].synth = None;
+                }
                 // Ghost (review rework 2): an RC row op skipped by EPQ, against
                 // the qual evaluated on the latest committed version.
                 if is_data_row_op(op) {
@@ -2375,7 +3323,7 @@ impl WriteModel {
                             self.remove_intent(s, owner, *d, true);
                             unlatch(s, w);
                             s.txns[w as usize].phase = Phase::CommitCheck;
-                            return Spin::Retry;
+                            return Spin::Removed;
                         }
                         // Pending or committed-not-visible: wait on its owner.
                         let g = s.status.get(&owner).map(|e| e.gen).unwrap_or(0);
@@ -2531,6 +3479,8 @@ impl Model for WriteModel {
             commits: Vec::new(),
             d40p01: Vec::new(),
             qlog: Vec::new(),
+            alog: Vec::new(),
+            errs: Vec::new(),
             bad: None,
         }
     }
@@ -2571,6 +3521,12 @@ impl Model for WriteModel {
                             out.push(Action::RollbackTo(w));
                         }
                     }
+                    Op::OnConflict { arb, .. } => {
+                        // §5.3.1(1): the pre-check's latch section.
+                        if latch_free(s, lk_of(arb)) {
+                            out.push(Action::ArbPre(w));
+                        }
+                    }
                     op => {
                         let key = op_key(op).unwrap_or(LKey::T0);
                         if matches!(op, Op::RelLock { .. }) || latch_free(s, lk_of(key)) {
@@ -2583,6 +3539,15 @@ impl Model for WriteModel {
                 Phase::SecGrant => out.push(Action::SecGrant(w)),
                 Phase::WaitReg => out.push(Action::WaitEnter(w)),
                 Phase::Epq => out.push(Action::EpqStep(w)),
+                Phase::ArbAb => {
+                    // §5.3.1(2)/§5.5: one latch section per visited key (and
+                    // per released shared lock), as ROLLBACK TO.
+                    if self.rollback_latches_free(s, w) {
+                        out.push(Action::Abandon(w));
+                    }
+                }
+                Phase::EvSnap => out.push(Action::EvSnap(w)),
+                Phase::EvNext => out.push(Action::EvNext(w)),
                 Phase::Parked { .. } => {
                     if s.cycle_through(w).is_some() && self.abort_latches_free(s, w) {
                         out.push(Action::DeadlockCheck(w));
@@ -2732,6 +3697,7 @@ impl Model for WriteModel {
                     txn.base = visible;
                     txn.seq0 = txn.seq;
                     txn.seq += 1;
+                    txn.cmd_seq = txn.seq0;
                 }
                 s.txns[*w as usize].skip = self.compute_skip(&s, *w, s.txns[*w as usize].stmt);
                 self.scan_ready(&mut s, *w);
@@ -2784,6 +3750,22 @@ impl Model for WriteModel {
             Action::RollbackTo(w) => {
                 subject = Some(*w);
                 self.do_rollback(&mut s, *w);
+            }
+            Action::ArbPre(w) => {
+                subject = Some(*w);
+                spin_code = self.do_arb_pre(&mut s, *w);
+            }
+            Action::Abandon(w) => {
+                subject = Some(*w);
+                spin_code = self.do_abandon(&mut s, *w);
+            }
+            Action::EvSnap(w) => {
+                subject = Some(*w);
+                self.do_ev_snap(&mut s, *w);
+            }
+            Action::EvNext(w) => {
+                subject = Some(*w);
+                self.do_ev_next(&mut s, *w);
             }
             Action::Request(w) => {
                 subject = Some(*w);
@@ -2912,7 +3894,7 @@ impl Model for WriteModel {
             t.spin = match spin_code {
                 Spin::Retry => t.spin.saturating_add(1).min(4),
                 Spin::Mid => t.spin,
-                Spin::Done => 0,
+                Spin::Done | Spin::Removed => 0,
             };
         }
         s.normalize();
@@ -3066,6 +4048,10 @@ impl Model for WriteModel {
                 let mut reset = 0u8;
                 let mut since = 0u8;
                 let mut ident: Option<(Option<LKey>, bool)> = None;
+                // An entry key's liveness: `Entry` makes it live (pointing at its
+                // row), `Dead` kills it (C-G0wb: workloads that delete a row
+                // delete its entry in the same statement).
+                let mut entry: Option<LKey> = None;
                 let mut bad_inc = false;
                 for (ts, _, map) in &s.commits {
                     if *ts > target {
@@ -3092,10 +4078,14 @@ impl Model for WriteModel {
                                 live = None;
                                 since = 0;
                                 ident = None;
+                                entry = None;
                             }
-                            ED::Entry { row } => entries.push((k, *row)),
+                            ED::Entry { row } => entry = Some(*row),
                         }
                     }
+                }
+                if let Some(row) = entry {
+                    entries.push((k, row));
                 }
                 if bad_inc {
                     return Err(format!(
@@ -3200,6 +4190,17 @@ impl Model for WriteModel {
                     "I-RC-MONO/qual: W{w}'s row op on {k:?} was {} but the qual evaluated on the latest committed version says {}",
                     if *applied { "applied" } else { "skipped" },
                     if *ghost { "apply" } else { "skip" }
+                ));
+            }
+        }
+        // §5.3.1 ghost: an ON CONFLICT statement that ends with no row outcome
+        // must still face a live conflict — a conflict that vanished (the row
+        // was deleted, moved or re-owned) must restart the arbiter and insert,
+        // never skip the proposed row (seed 53).
+        for (w, k, live) in &s.alog {
+            if !live {
+                return Err(format!(
+                    "C-T0 §5.3.1: W{w}'s ON CONFLICT statement ended with no row outcome while the arbiter key {k:?} is not live (the lock must restart the arbiter, never skip)"
                 ));
             }
         }
