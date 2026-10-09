@@ -16,7 +16,7 @@ use std::sync::{Mutex, PoisonError};
 
 use nucleus_kv::{Batch, Durability, OrderedKv};
 
-use crate::encoding::sys_txn_key;
+use crate::encoding::{sys_log_key, sys_txn_key};
 use crate::{Ts, TxnError, TxnId, TxnStatus};
 
 /// One txn's status-table entry (§7.4): status, wake generation (§6), release
@@ -149,8 +149,10 @@ impl StatusTable {
     }
 
     /// Sets `Committed(ts)` (§3 step 4). Only a current-epoch `Pending` txn
-    /// can commit, and `Ts::ZERO` is never a commit ts.
-    pub fn set_committed(&self, id: TxnId, ts: Ts) -> Result<(), TxnError> {
+    /// can commit, and `Ts::ZERO` is never a commit ts. Crate-private: the
+    /// commit pipeline is the only writer; tests drive it through the
+    /// public commit API.
+    pub(crate) fn set_committed(&self, id: TxnId, ts: Ts) -> Result<(), TxnError> {
         let mut st = self.lock();
         match st.map.get_mut(&id) {
             Some(e) if e.status == TxnStatus::Pending && id.epoch == self.epoch => {
@@ -173,8 +175,9 @@ impl StatusTable {
     }
 
     /// Sets `Aborted` (§7.1). Only the owning session aborts, and only a
-    /// `Pending` txn can abort.
-    pub fn set_aborted(&self, id: TxnId) -> Result<(), TxnError> {
+    /// `Pending` txn can abort. Crate-private: [`Core::abort`](crate::boot::Core::abort)
+    /// is the public path.
+    pub(crate) fn set_aborted(&self, id: TxnId) -> Result<(), TxnError> {
         let mut st = self.lock();
         match st.map.get_mut(&id) {
             Some(e) if e.status == TxnStatus::Pending => {
@@ -192,7 +195,9 @@ impl StatusTable {
     }
 
     /// Bumps the wake generation (§6) and returns the new value.
-    pub fn bump_gen(&self, id: TxnId) -> Result<u64, TxnError> {
+    /// Crate-private: every bump is paired with a wake or an abort through
+    /// [`Core::bump_and_wake`](crate::wait) / [`Core::abort`](crate::boot::Core::abort).
+    pub(crate) fn bump_gen(&self, id: TxnId) -> Result<u64, TxnError> {
         let mut st = self.lock();
         match st.map.get_mut(&id) {
             Some(e) => {
@@ -206,8 +211,9 @@ impl StatusTable {
     }
 
     /// Marks the txn released (§7.4 condition 0): abort cleanup or commit
-    /// step 5 has run.
-    pub fn mark_released(&self, id: TxnId) -> Result<(), TxnError> {
+    /// step 5 has run. Crate-private: the pipeline's step 5 and
+    /// [`Core::abort`](crate::boot::Core::abort) are the writers.
+    pub(crate) fn mark_released(&self, id: TxnId) -> Result<(), TxnError> {
         let mut st = self.lock();
         match st.map.get_mut(&id) {
             Some(e) => {
@@ -320,8 +326,12 @@ impl StatusTable {
             Some(e) => {
                 if matches!(e.status, TxnStatus::Committed(_)) {
                     // Only Committed records are ever persisted (§2.3).
+                    // The optional `/sys/log/{TxnId}` record dies with the
+                    // status in the same batch. (Key added by C-T1b; a spec
+                    // note for it is pending in C-T0 §7.4.)
                     let mut batch = Batch::default();
                     batch.delete(sys_txn_key(id));
+                    batch.delete(sys_log_key(id));
                     kv.write(batch, Durability::No).map_err(crate::kv_err)?;
                 }
                 Ok(true)

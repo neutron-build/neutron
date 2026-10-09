@@ -248,6 +248,25 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
         parker: &Arc<dyn Parker>,
         cancel: &CancelFlag,
     ) -> WaitOutcome {
+        // Publish the parker so `cancel()` can unpark this park (§6). The
+        // store happens before the loop's first flag re-check, which closes
+        // the set-then-store race: a cancel that ran before the store is
+        // either already visible to the flag check below, or its unpark
+        // lands on the stored parker.
+        cancel.set_parked(Arc::clone(parker));
+        let outcome = self.wait_loop(target, g, parker, cancel);
+        // Every return path of the wait clears the publication.
+        cancel.clear_parked();
+        outcome
+    }
+
+    fn wait_loop(
+        &self,
+        target: TxnId,
+        g: u64,
+        parker: &Arc<dyn Parker>,
+        cancel: &CancelFlag,
+    ) -> WaitOutcome {
         loop {
             // §6 step 2 re-check, in order: missing status first (`gen`
             // lives in the status entry), then Aborted, then visible

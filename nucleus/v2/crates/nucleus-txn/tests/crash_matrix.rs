@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use common::ok;
 use nucleus_kv::fault::Fault;
-use nucleus_kv::MemKv;
+use nucleus_kv::{MemKv, OrderedKv};
 use nucleus_txn::boot::Core;
-use nucleus_txn::commit::{spawn_commit_thread, CommitPipeline, SyncCommit};
+use nucleus_txn::commit::{spawn_commit_thread, CommitPipeline, CommitRequest, SyncCommit};
 use nucleus_txn::encoding::Entry;
 use nucleus_txn::encoding::{decode_intent, encode_intent, intent_key, parse_key};
 use nucleus_txn::read::{read_key, NoSsi};
@@ -36,13 +36,164 @@ impl Rng {
     }
 }
 
+/// Rework item 6: the hwm reservation under in-group crashes. A small
+/// configured block (2), five On requests in one manually driven group,
+/// and a crash fired at each in-group write keeping each possible prefix
+/// of the unsynced batches. After every such crash, the reopened store
+/// must (a) open at all — a `/sys/txn` record above the persisted
+/// `ts_hwm` is Corrupt, which is exactly what a mutant writing the hwm in
+/// its own batch after the record produces —, (b) give
+/// `next_ts > ts_hwm` with ts_hwm read directly from the KV, and (c) hold
+/// no surviving record at or above `next_ts` (no ts reuse).
+#[test]
+fn hwm_reservation_survives_crashes_inside_a_group() {
+    use common::CrashAt;
+    use nucleus_kv::fault::Fault;
+
+    // Write counts from a fresh store: 1 = boot epoch write; 2..=6 = the
+    // five hand-placed intents; 7..=11 = the group's five record batches.
+    const GROUP_FIRST_WRITE: u64 = 7;
+    const N: u64 = 5;
+    for k in 1..=N {
+        // Crash fires on the k-th record write; at that moment the unsynced
+        // queue holds the 5 intents plus the k-1 completed record batches.
+        let unsynced_at_trigger = 5 + (k - 1);
+        for keep in 0..=unsynced_at_trigger {
+            let kv = CrashAt::new(Fault::new(MemKv::new(), || Ok(MemKv::new())));
+            let core = Arc::new(ok(Core::open(kv.clone())));
+            #[derive(Default)]
+            struct Rec;
+            impl nucleus_txn::commit::FailStop for Rec {
+                fn on_kv_error(&self, _err: &nucleus_txn::TxnError) {}
+            }
+            let mut pipeline = ok(CommitPipeline::with_config(
+                Arc::clone(&core),
+                nucleus_txn::commit::CommitConfig::new()
+                    .with_fail_stop(Arc::new(Rec) as Arc<dyn nucleus_txn::commit::FailStop>),
+            ));
+            pipeline.set_hwm_block(2);
+
+            let mut txns = Vec::new();
+            for i in 0..N {
+                let txn = core.begin(Isolation::ReadCommitted);
+                let seq = ok(txn.next_seq());
+                txn.log_write(seq, format!("/t/1/r{i}").as_bytes());
+                ok(core.count_placement(&txn));
+                let mut batch = nucleus_kv::Batch::default();
+                batch.put(
+                    intent_key(format!("/t/1/r{i}").as_bytes()),
+                    ok(encode_intent(&nucleus_txn::Intent {
+                        txn: txn.id,
+                        layers: vec![nucleus_txn::Layer {
+                            seq,
+                            data_seq: seq,
+                            data: nucleus_txn::LayerData::Write {
+                                value: format!("v{i}").into_bytes(),
+                                key_changed: false,
+                            },
+                            lock: nucleus_txn::RowLockMode::NoKeyUpdate,
+                        }],
+                    })),
+                );
+                ok(core.write(batch, nucleus_kv::Durability::No));
+                txns.push(txn);
+            }
+            for txn in txns {
+                let (req, _ack) =
+                    CommitRequest::new(txn.id, SyncCommit::On, None, false, txn.write_set_keys());
+                ok(core.submit(req));
+            }
+            kv.crash_at_write(GROUP_FIRST_WRITE + k - 1, keep);
+            let group = pipeline.drain_available();
+            assert_eq!(group.len() as u64, N);
+            pipeline.process_group(group); // fail-stops at the chosen write
+
+            drop(pipeline);
+            let kv = match Arc::try_unwrap(core) {
+                Ok(c) => c.into_kv(),
+                Err(_) => panic!("core still shared"),
+            };
+            // (a) The store reopens: a surviving record above the persisted
+            // hwm is Corrupt (the hwm-in-its-own-batch mutant dies here).
+            let core2 = Arc::new(ok(Core::open(kv.clone())));
+            // (b) ts_hwm read directly from the KV bytes.
+            let hwm = match ok(kv.get_latest(&nucleus_txn::encoding::sys_ts_hwm_key())) {
+                Some(v) => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&v);
+                    Ts(u64::from_be_bytes(b))
+                }
+                None => Ts(0),
+            };
+            let mut pipeline2 = ok(CommitPipeline::new(Arc::clone(&core2)));
+            let next_ts = pipeline2.next_ts();
+            assert!(
+                next_ts > hwm,
+                "next_ts {next_ts:?} not above the persisted ts_hwm {hwm:?} (k={k}, keep={keep})"
+            );
+            assert_eq!(core2.visible_ts(), hwm, "boot visible_ts = ts_hwm");
+            // (c) No surviving record at or above next_ts: no ts reuse.
+            {
+                let view = core2.open_view();
+                let lo = nucleus_txn::encoding::sys_txn_prefix();
+                let hi = nucleus_txn::encoding::sys_txn_prefix_end();
+                for row in view.scan(
+                    (
+                        std::ops::Bound::Included(lo.as_slice()),
+                        std::ops::Bound::Excluded(hi.as_slice()),
+                    ),
+                    false,
+                ) {
+                    let (rkey, v) = ok(row);
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&v);
+                    let ts = Ts(u64::from_be_bytes(b));
+                    assert!(
+                        ts < next_ts,
+                        "surviving record {ts:?} at or above next_ts {next_ts:?} (key {rkey:?}, k={k}, keep={keep})"
+                    );
+                }
+            }
+            // The store stays usable after the crash mid-group.
+            let txn = core2.begin(Isolation::ReadCommitted);
+            let seq = ok(txn.next_seq());
+            txn.log_write(seq, b"/t/2/new");
+            ok(core2.count_placement(&txn));
+            let mut batch = nucleus_kv::Batch::default();
+            batch.put(
+                intent_key(b"/t/2/new"),
+                ok(encode_intent(&nucleus_txn::Intent {
+                    txn: txn.id,
+                    layers: vec![nucleus_txn::Layer {
+                        seq,
+                        data_seq: seq,
+                        data: nucleus_txn::LayerData::Write {
+                            value: b"post-crash".to_vec(),
+                            key_changed: false,
+                        },
+                        lock: nucleus_txn::RowLockMode::NoKeyUpdate,
+                    }],
+                })),
+            );
+            ok(core2.write(batch, nucleus_kv::Durability::No));
+            let (req, ack) =
+                CommitRequest::new(txn.id, SyncCommit::On, None, false, txn.write_set_keys());
+            ok(core2.submit(req));
+            let group = pipeline2.drain_available();
+            pipeline2.process_group(group);
+            let new_ts = ok(ok(ack.recv_timeout(std::time::Duration::from_secs(5))));
+            assert!(new_ts >= next_ts);
+        }
+    }
+}
+
 /// One round: fresh store, a mix of On/Off commits and aborts, a seeded
 /// crash, a reopen, the four properties.
 fn round(seed: u64) {
     let kv = Fault::new(MemKv::new(), || Ok(MemKv::new()));
     let core = Arc::new(ok(Core::open(kv)));
     let epoch = core.epoch();
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
     let mut rng = Rng(seed | 1);
 
     // (commit order, id, ts, on/off, key, value)
@@ -51,9 +202,10 @@ fn round(seed: u64) {
     let n = 4 + (rng.next() % 5);
     for i in 0..n {
         let txn = core.begin(Isolation::ReadCommitted);
+        let txn_id = txn.id;
         let key = format!("/t/1/r{i}");
         let value = format!("v{i}").into_bytes();
-        let seq = txn.next_seq();
+        let seq = ok(txn.next_seq());
         txn.log_write(seq, key.as_bytes());
         ok(core.count_placement(&txn));
         let mut batch = nucleus_kv::Batch::default();
@@ -75,12 +227,12 @@ fn round(seed: u64) {
         ok(core.write(batch, nucleus_kv::Durability::No));
         let abort = rng.next().is_multiple_of(5);
         if abort {
-            ok(core.abort(&txn));
-            aborted.push((txn.id, key, value));
+            ok(core.abort(txn));
+            aborted.push((txn_id, key, value));
         } else {
             let on = rng.next().is_multiple_of(2);
-            let ts = ok(core.commit(&txn, if on { SyncCommit::On } else { SyncCommit::Off }));
-            committed.push((committed.len(), txn.id, ts, on, key, value));
+            let ts = ok(core.commit(txn, if on { SyncCommit::On } else { SyncCommit::Off }));
+            committed.push((committed.len(), txn_id, ts, on, key, value));
         }
     }
     ok(handle.shutdown());
@@ -134,7 +286,7 @@ fn round(seed: u64) {
 
     // (2) No commit_ts reused: next_ts > ts_hwm, strictly above every
     // surviving ts, and the next commit's ts does not collide.
-    let mut pipeline = CommitPipeline::new(Arc::clone(&core2));
+    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core2)));
     let next_ts = pipeline.next_ts();
     for (_, ts) in &surviving {
         assert!(
@@ -144,7 +296,7 @@ fn round(seed: u64) {
     }
     {
         let txn = core2.begin(Isolation::ReadCommitted);
-        let seq = txn.next_seq();
+        let seq = ok(txn.next_seq());
         txn.log_write(seq, b"/t/2/new");
         ok(core2.count_placement(&txn));
         let mut batch = nucleus_kv::Batch::default();
@@ -164,13 +316,17 @@ fn round(seed: u64) {
             })),
         );
         ok(core2.write(batch, nucleus_kv::Durability::No));
-        core2.register_write_set(&txn);
-        let (req, ack) =
-            nucleus_txn::commit::CommitRequest::new(txn.id, SyncCommit::On, None, false);
-        ok(core2.send_commit(req));
+        let (req, ack) = nucleus_txn::commit::CommitRequest::new(
+            txn.id,
+            SyncCommit::On,
+            None,
+            false,
+            txn.write_set_keys(),
+        );
+        ok(core2.submit(req));
         let group = pipeline.drain_available();
         pipeline.process_group(group);
-        let new_ts = ok(ack.recv_timeout(std::time::Duration::from_secs(5)));
+        let new_ts = ok(ok(ack.recv_timeout(std::time::Duration::from_secs(5))));
         assert!(new_ts >= next_ts);
         for (_, ts) in &surviving {
             assert!(*ts != new_ts, "commit_ts {ts:?} reused as {new_ts:?}");

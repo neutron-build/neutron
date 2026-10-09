@@ -16,12 +16,12 @@ use nucleus_txn::{Ts, TxnStatus};
 fn next_seq_is_strictly_increasing() {
     let core = ok(Core::open(RecKv::new()));
     let txn = core.begin(Isolation::ReadCommitted);
-    assert_eq!(txn.next_seq(), 1);
-    assert_eq!(txn.next_seq(), 2);
+    assert_eq!(txn.next_seq(), Ok(1));
+    assert_eq!(txn.next_seq(), Ok(2));
     // `ROLLBACK TO` never gives a seq back (§5.5); new commands keep going
     // up from the same counter.
-    txn.log_write(txn.next_seq(), b"/t/1/r");
-    assert_eq!(txn.next_seq(), 4);
+    txn.log_write(ok(txn.next_seq()), b"/t/1/r");
+    assert_eq!(txn.next_seq(), Ok(4));
     assert_eq!(txn.seq(), 4);
 }
 
@@ -79,15 +79,16 @@ fn read_only_txn_commits_without_a_ts_or_a_write() {
     let core = ok(Core::open(kv.clone()));
     let writes_before = kv.log().len();
     let txn = core.begin(Isolation::ReadCommitted);
-    let ts = ok(core.commit(&txn, SyncCommit::On));
+    let txn_id = txn.id;
+    let ts = ok(core.commit(txn, SyncCommit::On));
     assert_eq!(ts, Ts::ZERO, "no writes and not SER: no ts (§3)");
     // No record, no sync, nothing written past the boot writes.
     assert_eq!(kv.log().len(), writes_before, "wrote nothing");
     // Released immediately: truncation is possible with no views open.
-    let entry = core.status.entry(txn.id);
+    let entry = core.status.entry(txn_id);
     assert_eq!(entry.map(|e| e.released), Some(true));
-    assert!(ok(core.truncate_status(txn.id)));
-    assert_eq!(core.status.lookup_remembered(txn.id), Remembered::Ended);
+    assert!(ok(core.truncate_status(txn_id)));
+    assert_eq!(core.status.lookup_remembered(txn_id), Remembered::Ended);
 }
 
 #[test]
@@ -96,12 +97,15 @@ fn read_only_serializable_txn_still_takes_a_ts() {
     // ordering is what SSI needs), so they get a real ts.
     let core = ok(Core::open(RecKv::new()));
     let core = std::sync::Arc::new(core);
-    let handle = nucleus_txn::commit::spawn_commit_thread(std::sync::Arc::clone(&core));
+    let handle = ok(nucleus_txn::commit::spawn_commit_thread(
+        std::sync::Arc::clone(&core),
+    ));
     let txn = core.begin(Isolation::Serializable);
-    let ts = ok(core.commit(&txn, SyncCommit::On));
+    let txn_id = txn.id;
+    let ts = ok(core.commit(txn, SyncCommit::On));
     assert!(ts > Ts::ZERO);
     assert_eq!(
-        core.status.entry(txn.id).map(|e| e.status),
+        core.status.entry(txn_id).map(|e| e.status),
         Some(TxnStatus::Committed(ts))
     );
     ok(handle.shutdown());
@@ -111,18 +115,21 @@ fn read_only_serializable_txn_still_takes_a_ts() {
 fn a_written_txn_commits_through_the_pipeline() {
     let core = ok(Core::open(RecKv::new()));
     let core = std::sync::Arc::new(core);
-    let handle = nucleus_txn::commit::spawn_commit_thread(std::sync::Arc::clone(&core));
+    let handle = ok(nucleus_txn::commit::spawn_commit_thread(
+        std::sync::Arc::clone(&core),
+    ));
     let txn = core.begin(Isolation::ReadCommitted);
+    let txn_id = txn.id;
     place_intent(&core, &txn, b"/t/1/r", b"v");
-    let ts = ok(core.commit(&txn, SyncCommit::On));
+    let ts = ok(core.commit(txn, SyncCommit::On));
     assert!(ts > Ts::ZERO);
     assert!(core.visible_ts() >= ts, "I-ACK: visible on return");
     assert_eq!(
-        core.status.entry(txn.id).map(|e| e.status),
+        core.status.entry(txn_id).map(|e| e.status),
         Some(TxnStatus::Committed(ts))
     );
     // The ack (step 4) precedes step 5; poll for the release.
-    common::wait_released(&core, txn.id);
-    assert_eq!(core.status.entry(txn.id).map(|e| e.released), Some(true));
+    common::wait_released(&core, txn_id);
+    assert_eq!(core.status.entry(txn_id).map(|e| e.released), Some(true));
     ok(handle.shutdown());
 }

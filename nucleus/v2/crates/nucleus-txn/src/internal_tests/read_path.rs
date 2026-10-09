@@ -3,12 +3,12 @@
 
 use std::ops::Bound;
 
+use crate::boot::Core;
+use crate::encoding::{encode_intent, encode_version, intent_key, version_key};
+use crate::read::{read_key, scan, NoSsi, ReadObserver};
+use crate::visibility::{ReadCtx, RwEdge};
+use crate::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId};
 use nucleus_kv::{Batch, Durability, MemKv};
-use nucleus_txn::boot::Core;
-use nucleus_txn::encoding::{encode_intent, encode_version, intent_key, version_key};
-use nucleus_txn::read::{read_key, scan, NoSsi, ReadObserver};
-use nucleus_txn::visibility::{ReadCtx, RwEdge};
-use nucleus_txn::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId};
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -333,10 +333,7 @@ fn scan_returns_logical_rows_in_key_order() {
         ); // committed at 9 <= 10: visible
            // A system key among the data must be ignored by scans.
         let mut batch = Batch::default();
-        batch.put(
-            nucleus_txn::encoding::sys_gc_w_key(),
-            0u64.to_be_bytes().to_vec(),
-        );
+        batch.put(crate::encoding::sys_gc_w_key(), 0u64.to_be_bytes().to_vec());
         ok(f.core.write(batch, Durability::No));
 
         let view = f.core.open_view();

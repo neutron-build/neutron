@@ -59,6 +59,20 @@ impl CancelFlag {
     fn lock_parked(&self) -> MutexGuard<'_, Option<Arc<dyn crate::wait::Parker>>> {
         self.parked.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Publishes the parker the session is about to park on, so
+    /// [`CancelFlag::cancel`] can unpark it (§6: setting the flag also wakes
+    /// a parked session). Callers re-check [`CancelFlag::is_cancelled`]
+    /// after this store: a cancel that ran between the last check and the
+    /// store is then still observed before the park.
+    pub(crate) fn set_parked(&self, parker: Arc<dyn crate::wait::Parker>) {
+        *self.lock_parked() = Some(parker);
+    }
+
+    /// Clears the published parker (every return path of a wait).
+    pub(crate) fn clear_parked(&self) {
+        *self.lock_parked() = None;
+    }
 }
 
 /// A handle to a txn's cancel flag, cloned from [`Txn::cancel_handle`] and
@@ -102,12 +116,26 @@ impl Txn {
     }
 
     /// Allocates the next command seq: strictly above every seq used so far
-    /// (§5.5: `ROLLBACK TO` does not give it back).
-    pub fn next_seq(&self) -> Seq {
-        let s = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        // fetch_add wraps only past u32::MAX; a txn that ran 4G commands is
-        // not a wrap bug, it is exhaustion.
-        s
+    /// (§5.5: `ROLLBACK TO` does not give it back). Exhaustion at
+    /// `u32::MAX` is an error, never a wrap: a wrapped seq would reuse a
+    /// command id and break I-HALLOWEEN.
+    pub fn next_seq(&self) -> Result<Seq, crate::TxnError> {
+        let mut cur = self.seq.load(Ordering::SeqCst);
+        loop {
+            if cur == u32::MAX {
+                return Err(crate::TxnError::Invariant(format!(
+                    "txn {:?} exhausted the seq space (u32::MAX)",
+                    self.id
+                )));
+            }
+            match self
+                .seq
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Ok(cur + 1),
+                Err(c) => cur = c,
+            }
+        }
     }
 
     /// The current command seq (the last one handed out).
@@ -171,5 +199,20 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
     /// C-T2 write path calls this next to [`Txn::log_write`].
     pub fn count_placement(&self, txn: &Txn) -> Result<(), crate::TxnError> {
         self.status.note_intent_placed(txn.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_seq_errors_at_u32_max_instead_of_wrapping() {
+        let txn = Txn::new(TxnId { epoch: 1, n: 1 }, Isolation::ReadCommitted);
+        txn.seq.store(u32::MAX, Ordering::SeqCst);
+        assert!(txn.next_seq().is_err(), "exhaustion must not wrap");
+        // Still exhausted, never wrapped back to 0.
+        assert!(txn.next_seq().is_err());
+        assert_eq!(txn.seq(), u32::MAX);
     }
 }

@@ -27,17 +27,18 @@ fn commit_one(
     sync: SyncCommit,
 ) -> (nucleus_txn::TxnId, Ts) {
     let txn = core.begin(Isolation::ReadCommitted);
+    let id = txn.id;
     place_intent(core, &txn, key, value);
-    let ts = ok(core.commit(&txn, sync));
-    common::wait_released(core, txn.id);
-    (txn.id, ts)
+    let ts = ok(core.commit(txn, sync));
+    common::wait_released(core, id);
+    (id, ts)
 }
 
 #[test]
 fn resolver_resolves_versions_and_truncates() {
     let kv = RecKv::new();
     let core = Arc::new(ok(Core::open(kv.clone())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
     let (id, ts) = commit_one(&core, b"/t/1/r", b"v1", SyncCommit::On);
     // Queued in step 5; the intent is still there right after the ack.
     assert_eq!(core.status.entry(id).map(|e| e.intent_count), Some(1));
@@ -81,7 +82,7 @@ fn seed10_no_truncation_before_resolution() {
     // truncated, however many views open and close; a view held across the
     // resolution keeps it past the count reaching 0; only then does it go.
     let core = Arc::new(ok(Core::open(RecKv::new())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
     let (id, ts) = commit_one(&core, b"/t/1/r", b"v", SyncCommit::Off);
     assert!(ts > Ts::ZERO);
 
@@ -124,7 +125,7 @@ fn seed13_no_decrement_on_a_noop_removal() {
     // count again.
     let kv = RecKv::new();
     let core = Arc::new(ok(Core::open(kv.clone())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
     let (id, _ts) = commit_one(&core, b"/t/1/r", b"v", SyncCommit::On);
 
     // A view open before the removal keeps §7.4 condition 2 blocking, so
@@ -176,7 +177,7 @@ fn seed23_counter_set_with_the_decrement_under_interleaving() {
     // still up or the counter already set. A view is kept open throughout
     // so a legitimate zeroing always records a counter >= 1.
     let core = Arc::new(ok(Core::open(RecKv::new())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
     let stop = Arc::new(AtomicBool::new(false));
     let bad = Arc::new(Mutex::new(None::<String>));
     let samples = Arc::new(Mutex::new(0u64));
@@ -196,17 +197,18 @@ fn seed23_counter_set_with_the_decrement_under_interleaving() {
             for i in 0..15 {
                 let key = format!("/t/{w}/r{i}");
                 let txn = core.begin(Isolation::ReadCommitted);
+                let txn_id = txn.id;
                 place_intent(&core, &txn, key.as_bytes(), format!("v{w}-{i}").as_bytes());
-                ids.lock().expect("ids").push(txn.id);
+                ids.lock().expect("ids").push(txn_id);
                 let ts = core.commit(
-                    &txn,
+                    txn,
                     if (w + i) % 2 == 0 {
                         SyncCommit::On
                     } else {
                         SyncCommit::Off
                     },
                 )?;
-                committed.lock().expect("committed").push((txn.id, ts));
+                committed.lock().expect("committed").push((txn_id, ts));
             }
             Ok(())
         })
@@ -253,7 +255,7 @@ fn seed23_counter_set_with_the_decrement_under_interleaving() {
     // Let the interleaving run against the background jobs too.
     {
         let core2 = Arc::clone(&core);
-        let bg = spawn_background(core2);
+        let bg = ok(spawn_background(core2));
         std::thread::sleep(Duration::from_millis(200));
         stop.store(true, Ordering::SeqCst);
         jobs.join().expect("jobs");
@@ -293,8 +295,8 @@ fn seed23_counter_set_with_the_decrement_under_interleaving() {
 #[test]
 fn background_jobs_drain_automatically() {
     let core = Arc::new(ok(Core::open(RecKv::new())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
-    let bg = spawn_background(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
+    let bg = ok(spawn_background(Arc::clone(&core)));
     let mut committed = Vec::new();
     for i in 0..10 {
         let key = format!("/t/1/r{i}");
@@ -321,23 +323,97 @@ fn background_jobs_drain_automatically() {
 }
 
 #[test]
+fn resolver_error_requeues_the_work_and_reports_through_fail_stop() {
+    // Rework item 8: a failing removal keeps its queued entry (and every
+    // unprocessed one) instead of dropping it, and the background thread
+    // reports the error through the core's FailStop hook rather than
+    // exiting silently. Once the KV is healthy again the kept work runs.
+    #[derive(Default)]
+    struct Rec {
+        errs: Mutex<Vec<String>>,
+    }
+    impl nucleus_txn::commit::FailStop for Rec {
+        fn on_kv_error(&self, err: &nucleus_txn::TxnError) {
+            self.errs.lock().expect("errs").push(err.to_string());
+        }
+    }
+
+    let (kv, fail) = common::FailKv::shared();
+    let core = Arc::new(ok(Core::open(kv)));
+    let hook = Arc::new(Rec::default());
+    let handle = ok(nucleus_txn::commit::spawn_commit_thread_with(
+        Arc::clone(&core),
+        nucleus_txn::commit::CommitConfig::new()
+            .with_fail_stop(Arc::clone(&hook) as Arc<dyn nucleus_txn::commit::FailStop>),
+    ));
+    let mut committed = Vec::new();
+    for i in 0..3 {
+        // `commit_one` is typed to RecKv; inline the same steps for FailKv.
+        let key = format!("/t/1/r{i}");
+        let txn = core.begin(Isolation::ReadCommitted);
+        let txn_id = txn.id;
+        place_intent(&core, &txn, key.as_bytes(), b"v");
+        let ts = ok(core.commit(txn, SyncCommit::On));
+        common::wait_released(&core, txn_id);
+        committed.push((txn_id, key, ts));
+    }
+    let bg = ok(spawn_background(Arc::clone(&core)));
+
+    // Every removal write now fails: the resolver must report and keep.
+    fail.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    while hook.errs.lock().expect("errs").is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never reported");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        bg.stop().is_err(),
+        "the background thread exits on the error"
+    );
+    // The intents are still there: the failing round kept its work.
+    for (_, key, _) in &committed {
+        assert!(
+            ok(core.latest_get(&intent_key(key.as_bytes()))).is_some(),
+            "the unresolved intent of {key:?} is still in the KV"
+        );
+    }
+
+    // Healthy again: the kept entries process and truncate.
+    fail.store(false, Ordering::SeqCst);
+    let n = ok(Resolver::run_once(&core));
+    assert!(n >= 1, "the requeued entries were kept: {n}");
+    for (_, key, _) in &committed {
+        assert!(ok(core.latest_get(&intent_key(key.as_bytes()))).is_none());
+    }
+    ok(Resolver::run_once(&core)); // the truncation pass
+    for (id, _, _) in &committed {
+        assert!(
+            core.status.entry(*id).is_none(),
+            "the kept work truncates {id:?}"
+        );
+    }
+    ok(handle.shutdown());
+}
+
+#[test]
 fn aborted_txn_cleanup_discards_intents() {
     let core = Arc::new(ok(Core::open(RecKv::new())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
     let txn = core.begin(Isolation::ReadCommitted);
+    let txn_id = txn.id;
     place_intent(&core, &txn, b"/t/1/r", b"doomed");
-    ok(core.abort(&txn));
+    ok(core.abort(txn));
     assert_eq!(
-        core.status.entry(txn.id).map(|e| e.status),
+        core.status.entry(txn_id).map(|e| e.status),
         Some(TxnStatus::Aborted)
     );
-    assert_eq!(core.status.entry(txn.id).map(|e| e.released), Some(true));
+    assert_eq!(core.status.entry(txn_id).map(|e| e.released), Some(true));
     // Nothing persisted for an abort; the cleanup is queued.
     assert!(ok(core.latest_get(&intent_key(b"/t/1/r"))).is_some());
     ok(Resolver::run_once(&core));
     assert!(ok(core.latest_get(&intent_key(b"/t/1/r"))).is_none());
     // No version was written.
-    assert!(core.status.entry(txn.id).is_none(), "truncated");
+    assert!(core.status.entry(txn_id).is_none(), "truncated");
     let view = core.open_view();
     assert!(ok(view.get(&version_key(b"/t/1/r", Ts(1)))).is_none());
     drop(view);

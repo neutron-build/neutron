@@ -34,13 +34,41 @@ impl Resolver {
     /// (older-epoch records included; the §7.4 conditions are re-checked
     /// under the registry mutex by `truncate_status`). Returns the number
     /// of queued entries processed.
+    ///
+    /// On an error the work is kept: the failing entry and every
+    /// unprocessed entry after it are requeued (in order) before the error
+    /// is returned, and the truncation pass is skipped that round.
     pub fn run_once<K: OrderedKv>(core: &Core<K>) -> Result<usize, TxnError> {
         let entries: Vec<ResolveEntry> = core.drain_resolve_queue();
         let n = entries.len();
-        for e in entries {
+        let mut first_err: Option<TxnError> = None;
+        let mut i = 0;
+        while i < entries.len() {
+            let e = &entries[i];
+            let mut failed: Option<TxnError> = None;
             for key in &e.keys {
-                remove_intent(core, key, None, e.txn, e.mode)?;
+                if let Err(err) = remove_intent(core, key, None, e.txn, e.mode) {
+                    failed = Some(err);
+                    break;
+                }
             }
+            if let Some(err) = failed {
+                first_err = Some(err);
+                break;
+            }
+            i += 1;
+        }
+        // Requeue the unprocessed tail, including the failing entry: an
+        // error must not drop cleanup work (the intents would linger and
+        // the counts would stay up forever).
+        {
+            let mut q = core.lock_resolve_queue();
+            for e in entries.iter().skip(i) {
+                q.push_back(e.clone());
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
         }
         for id in core.status.truncation_candidates() {
             core.truncate_status(id)?;
@@ -50,9 +78,11 @@ impl Resolver {
 }
 
 /// Runs [`Resolver::run_once`] in a background thread until
-/// [`BackgroundHandle::stop`]. Exits (cleanly) on the first error: the
-/// caller observes it through the returned handle.
-pub fn spawn_background<K: OrderedKv>(core: Arc<Core<K>>) -> BackgroundHandle {
+/// [`BackgroundHandle::stop`]. On an error the thread reports it through
+/// the core's [`FailStop`](crate::commit::FailStop) hook (the default
+/// aborts the process; a recording hook observes it) and then stops; the
+/// failed work stays queued for a later round.
+pub fn spawn_background<K: OrderedKv>(core: Arc<Core<K>>) -> Result<BackgroundHandle, TxnError> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let core = Arc::clone(&core);
@@ -67,16 +97,19 @@ pub fn spawn_background<K: OrderedKv>(core: Arc<Core<K>>) -> BackgroundHandle {
                     match Resolver::run_once(&core) {
                         Ok(0) => std::thread::sleep(IDLE_PAUSE),
                         Ok(_) => {}
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            core.fail_stop().on_kv_error(&e);
+                            return Err(e);
+                        }
                     }
                 }
             })
-            .unwrap_or_else(|e| panic!("failed to spawn the resolver thread: {e}"))
+            .map_err(|e| TxnError::Invariant(format!("failed to spawn the resolver thread: {e}")))?
     };
-    BackgroundHandle {
+    Ok(BackgroundHandle {
         stop,
         thread: Some(thread),
-    }
+    })
 }
 
 /// Handle to the background resolver thread.

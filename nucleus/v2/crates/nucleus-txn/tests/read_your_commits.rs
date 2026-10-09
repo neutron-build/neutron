@@ -18,15 +18,16 @@ use nucleus_txn::Ts;
 #[test]
 fn a_new_snapshot_sees_the_commit_across_threads() {
     let core = Arc::new(ok(Core::open(RecKv::new())));
-    let handle = spawn_commit_thread(Arc::clone(&core));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
 
     // W1 commits first; W2's intent is still Pending when the reader runs.
     let w1 = core.begin(Isolation::ReadCommitted);
     place_intent(&core, &w1, b"/t/1/r", b"one");
     let w2 = core.begin(Isolation::RepeatableRead);
+    let w2_id = w2.id;
     place_intent(&core, &w2, b"/t/1/s", b"two");
 
-    let ts1 = ok(core.commit(&w1, SyncCommit::On));
+    let ts1 = ok(core.commit(w1, SyncCommit::On));
     let core2 = Arc::clone(&core);
     let reader = std::thread::spawn(move || -> nucleus_txn::TxnId {
         // A fresh session: its snapshot is taken now, after the ack.
@@ -60,9 +61,9 @@ fn a_new_snapshot_sees_the_commit_across_threads() {
     // A snapshot from *before* the commit must not see it (no snapshot
     // taken before ts1 exists here, so register at the boot ts: 0 values).
     // Instead: resolve and read the version at exactly ts1.
-    let ts2 = ok(core.commit(&w2, SyncCommit::Off));
+    let ts2 = ok(core.commit(w2, SyncCommit::Off));
     assert!(ts2 > ts1);
-    common::wait_released(&core, w2.id);
+    common::wait_released(&core, w2_id);
     ok(Resolver::run_once(&core));
     let view = core.open_view();
     let ctx = ReadCtx {

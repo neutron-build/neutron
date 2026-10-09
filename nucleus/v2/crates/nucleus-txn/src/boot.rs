@@ -9,14 +9,14 @@
 //! `ts_hwm` without a persisted record never committed). A fresh store starts
 //! with epoch 1, `ts_hwm` 0 and `W` 0.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot, Value};
 
-use crate::commit::{CommitMsg, ReleaseHook};
+use crate::commit::{AbortFailStop, CommitMsg, FailStop, ReleaseHook};
 use crate::encoding::{
     parse_sys_txn_key, sys_epoch_key, sys_gc_w_key, sys_ts_hwm_key, sys_txn_prefix,
     sys_txn_prefix_end,
@@ -46,15 +46,21 @@ pub struct Core<K: OrderedKv> {
     /// `visible_ts` (§3), shared with the registry so `take_snapshot` reads
     /// and registers it in one critical section.
     visible_ts: Arc<AtomicU64>,
+    /// The `/sys/ts_hwm` read once at boot: the single source the commit
+    /// pipeline reserves from. Reading it again from the KV later could
+    /// observe a newer reservation (or a decode error) and reuse or lose
+    /// timestamps (seed 5 of the C-T1b rework).
+    boot_ts_hwm: Ts,
     /// The commit channel's sending end, attached by a `CommitPipeline`
-    /// (§3). `None` until one is attached.
+    /// (§3). `None` until one is attached; a second attach is an error.
     pub(crate) commit_tx: Mutex<Option<std::sync::mpsc::Sender<CommitMsg>>>,
+    /// The fail-stop hook (§3): a KV error on the commit thread or the
+    /// background resolver. Default [`AbortFailStop`]; a spawned commit
+    /// thread's [`CommitConfig`](crate::commit::CommitConfig) installs
+    /// its hook here so both threads report the same way.
+    pub(crate) fail_stop: Mutex<Arc<dyn FailStop>>,
     /// The C-T2b release hook (§3 step 5, §7.1); no-op until installed.
     pub(crate) release_hook: Mutex<Arc<dyn ReleaseHook>>,
-    /// Write sets of txns whose commit request is on the channel or in the
-    /// pipeline (§3 step 5 queues resolution from here): the caller may
-    /// drop its `Txn` once the ack arrives.
-    pub(crate) write_sets: Mutex<HashMap<TxnId, Vec<nucleus_kv::Key>>>,
     /// Queued resolution/cleanup entries (§3 step 5, §7.1), drained by the
     /// resolver.
     pub(crate) resolve_q: Mutex<VecDeque<crate::commit::ResolveEntry>>,
@@ -136,9 +142,10 @@ impl<K: OrderedKv> Core<K> {
             latches: Latches::default(),
             waits: Waits::new(),
             visible_ts,
+            boot_ts_hwm: ts_hwm,
             commit_tx: Mutex::new(None),
+            fail_stop: Mutex::new(Arc::new(AbortFailStop)),
             release_hook: Mutex::new(Arc::new(crate::commit::NoReleaseHook)),
-            write_sets: Mutex::new(HashMap::new()),
             resolve_q: Mutex::new(VecDeque::new()),
         })
     }
@@ -149,8 +156,16 @@ impl<K: OrderedKv> Core<K> {
     }
 
     /// Advances `visible_ts` (commit thread step 4; monotonic).
-    pub fn advance_visible_ts(&self, ts: Ts) {
+    /// Crate-private: the pipeline's step 4 is the only advancer.
+    pub(crate) fn advance_visible_ts(&self, ts: Ts) {
         self.visible_ts.fetch_max(ts.0, Ordering::SeqCst);
+    }
+
+    /// The `/sys/ts_hwm` read at boot: the sequencer's reserved floor
+    /// (`next_ts = ts_hwm + 1`, §3). One source, read once — the pipeline
+    /// never re-reads the KV for it.
+    pub fn ts_hwm(&self) -> Ts {
+        self.boot_ts_hwm
     }
 
     /// The boot epoch.

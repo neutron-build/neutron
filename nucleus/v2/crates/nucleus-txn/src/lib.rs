@@ -16,6 +16,8 @@
 pub mod boot;
 pub mod commit;
 pub mod encoding;
+#[cfg(test)]
+mod internal_tests;
 pub mod latch;
 pub mod read;
 pub mod registry;
@@ -123,7 +125,7 @@ impl Intent {
 }
 
 /// SQLSTATE-bearing transaction errors raised by this crate.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TxnError {
     #[error("could not serialize access")]
     SerializationFailure, // 40001
