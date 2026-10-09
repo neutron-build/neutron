@@ -1,55 +1,57 @@
-//! C-T0 §2.2/§2.3 on-disk encoding: the intent/version/end keys over
-//! prefix-free logical keys, the version and intent value formats, and the
-//! persisted system keys.
+//! C-T0 §2.2/§2.3 on-disk encoding (draft 7.2): the intent/version/end keys
+//! over prefix-free logical keys, the version and intent value formats, and
+//! the persisted system keys.
 //!
-//! Byte-for-byte compatible with `nucleus_kv::conformance::layout`, the
-//! reference §2.2 layout: a logical key `l` is stored as
-//! `be32(l.len()) ‖ l`, which makes any caller byte string prefix-free
-//! (C-Q3s P-PREFIX), so no other logical key starts with it. That module is
-//! compiled only for the conformance suite, so the rules are restated here
-//! and equality is enforced by tests:
+//! `L` is the caller's encoded logical key, used **as-is** (no length
+//! prefix): by C-Q3s P-PREFIX it is order-preserving and prefix-free, so
+//! logical keys keep their SQL order in the KV and no other logical key
+//! starts with `L`. `L` cannot be delimited from the left without the
+//! schema, so raw keys are split from the right (§2.2):
 //!
 //! ```text
 //! intent        L ‖ 0x00
-//! version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts)      # newest first
-//! end(L)        L ‖ 0x02                            # exclusive upper bound
+//! version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts) ‖ 0x01   # newest first
+//! end(L)        L ‖ 0x02                                # exclusive upper bound
 //! ```
+//!
+//! [`intent_key`], [`version_key`] and [`end_key`] agree byte-for-byte with
+//! `nucleus_kv::conformance::layout` on logical keys made prefix-free by
+//! `layout::logical` (its `be32` length prefix is a test convenience, not
+//! part of the format; asserted by tests).
 
 use crate::{Intent, Layer, LayerData, RowLockMode, Seq, Ts, TxnError, TxnId};
 use nucleus_kv::{Key, Value};
 
 // ---- Keys (§2.2) -----------------------------------------------------------
 
-/// The stored form of a logical key: `be32(len) ‖ bytes`, prefix-free for any
-/// input.
-pub fn logical(l: &[u8]) -> Key {
-    let mut out = Vec::with_capacity(4 + l.len());
-    let n = u32::try_from(l.len()).unwrap_or(u32::MAX);
-    out.extend_from_slice(&n.to_be_bytes());
-    out.extend_from_slice(l);
-    out
-}
+/// A version key is `L ‖ 0x01 ‖ be64(…) ‖ 0x01`: 10 bytes after `L`.
+pub const VERSION_SUFFIX_LEN: usize = 10;
 
 /// The `k@INTENT` slot (§1): at most one per logical key, sorts before every
 /// version of `l`.
 pub fn intent_key(l: &[u8]) -> Key {
-    let mut k = logical(l);
+    let mut k = Vec::with_capacity(l.len() + 1);
+    k.extend_from_slice(l);
     k.push(0x00);
     k
 }
 
 /// The `k@ts` version key: versions of one logical key sort newest first
-/// (descending ts).
+/// (descending ts). The trailing `0x01` tag lets [`parse_key`] find the
+/// separator from the right without the schema (§2.2, draft 7.2).
 pub fn version_key(l: &[u8], ts: Ts) -> Key {
-    let mut k = logical(l);
+    let mut k = Vec::with_capacity(l.len() + VERSION_SUFFIX_LEN);
+    k.extend_from_slice(l);
     k.push(0x01);
     k.extend_from_slice(&(u64::MAX - ts.0).to_be_bytes());
+    k.push(0x01);
     k
 }
 
 /// Exclusive upper bound of every entry (intent and versions) of `l`.
 pub fn end_key(l: &[u8]) -> Key {
-    let mut k = logical(l);
+    let mut k = Vec::with_capacity(l.len() + 1);
+    k.extend_from_slice(l);
     k.push(0x02);
     k
 }
@@ -61,27 +63,23 @@ pub enum Entry {
     Version(Ts),
 }
 
-/// Splits a key from [`intent_key`] or [`version_key`] back into
-/// `(logical key, entry)`. `None` for anything else: `end_key`s, a length
-/// that runs past the key, trailing bytes.
+/// Splits a raw key from the right (§2.2): the last byte `0x00` is an intent
+/// (`L` = all but the last byte); the last byte `0x01`, with the byte 9
+/// positions before it also `0x01`, is a version (`L` = all but the last 10
+/// bytes). `None` for anything else: `end_key`s and foreign keys.
 pub fn parse_key(key: &[u8]) -> Option<(&[u8], Entry)> {
-    if key.len() < 5 {
-        return None;
-    }
-    let mut n = [0u8; 4];
-    n.copy_from_slice(&key[..4]);
-    let len = u32::from_be_bytes(n) as usize;
-    let split = 4usize.checked_add(len)?;
-    if key.len() <= split {
-        return None;
-    }
-    let l = &key[4..split];
-    match key[split] {
-        0x00 if key.len() == split + 1 => Some((l, Entry::Intent)),
-        0x01 if key.len() == split + 9 => {
+    match *key.last()? {
+        0x00 => Some((&key[..key.len() - 1], Entry::Intent)),
+        0x01 => {
+            if key.len() < VERSION_SUFFIX_LEN || key[key.len() - VERSION_SUFFIX_LEN] != 0x01 {
+                return None;
+            }
             let mut b = [0u8; 8];
-            b.copy_from_slice(&key[split + 1..]);
-            Some((l, Entry::Version(Ts(u64::MAX - u64::from_be_bytes(b)))))
+            b.copy_from_slice(&key[key.len() - 9..key.len() - 1]);
+            Some((
+                &key[..key.len() - VERSION_SUFFIX_LEN],
+                Entry::Version(Ts(u64::MAX - u64::from_be_bytes(b))),
+            ))
         }
         _ => None,
     }

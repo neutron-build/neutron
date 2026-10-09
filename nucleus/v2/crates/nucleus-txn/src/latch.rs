@@ -14,6 +14,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use nucleus_kv::Key;
+
 /// The latch key of `k` (§5.0): `deferrable_prefix` for an
 /// `/i/{idx}/{key}{pk}` entry of a deferrable unique constraint (all entries
 /// with that key value latch together), `k` otherwise.
@@ -56,7 +58,9 @@ impl Latches {
         (h.finish() as usize) % self.strips.len()
     }
 
-    /// Takes the latch for `key`. The guard releases it on drop.
+    /// Takes the latch for `key`. The guard releases it on drop and remembers
+    /// `key`, so callers that must hold a specific key's latch (§7.3 step 1)
+    /// can be checked.
     pub fn lock(&self, key: &[u8]) -> LatchGuard<'_> {
         // Checked before blocking: a second latch on the same stripe would
         // otherwise self-deadlock before the assert could fire.
@@ -73,14 +77,30 @@ impl Latches {
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(debug_assertions)]
         HOLDING_LATCH.with(|h| h.set(true));
-        LatchGuard { _guard: guard }
+        LatchGuard {
+            key: key.to_vec(),
+            _guard: guard,
+        }
     }
 }
 
 /// A held latch. `!Send`: a latch is never held across a wait (§1). The
 /// mutex guard field is held only for its `Drop` (the unlock).
 pub struct LatchGuard<'a> {
+    key: Key,
     _guard: MutexGuard<'a, ()>,
+}
+
+impl LatchGuard<'_> {
+    /// The latch key this guard locked.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Whether this guard latches exactly `want` (§5.0, §7.3 step 1).
+    pub fn protects(&self, want: &[u8]) -> bool {
+        self.key == want
+    }
 }
 
 impl Drop for LatchGuard<'_> {

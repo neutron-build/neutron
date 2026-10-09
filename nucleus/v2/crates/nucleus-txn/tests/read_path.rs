@@ -3,7 +3,7 @@
 
 use std::ops::Bound;
 
-use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
+use nucleus_kv::{Batch, Durability, MemKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::encoding::{encode_intent, encode_version, intent_key, version_key};
 use nucleus_txn::read::{read_key, scan, NoSsi, ReadObserver};
@@ -65,7 +65,7 @@ impl Fixture {
     fn put_intent(&self, key: &[u8], txn: TxnId, layers: Vec<Layer>) {
         let mut batch = Batch::default();
         batch.put(intent_key(key), ok(encode_intent(&Intent { txn, layers })));
-        ok(self.core.kv.write(batch, Durability::No));
+        ok(self.core.write(batch, Durability::No));
     }
 
     fn put_version(&self, key: &[u8], ts: u64, data: LayerData) {
@@ -74,7 +74,7 @@ impl Fixture {
             version_key(key, Ts(ts)),
             encode_version(&data).unwrap_or_default(),
         );
-        ok(self.core.kv.write(batch, Durability::No));
+        ok(self.core.write(batch, Durability::No));
     }
 
     fn ctx(&self, snapshot: u64, stmt_seq: u32) -> ReadCtx {
@@ -309,10 +309,11 @@ fn every_section4_case() {
 
 #[test]
 fn scan_returns_logical_rows_in_key_order() {
+    // With `L` stored as-is (draft 7.2 §2.2), stored order over prefix-free
+    // logical keys is the byte order of the logical keys: "a" < "ab" < "b"
+    // < "c". (The old length-prefix layout ordered them a < b < c < ab.)
     for (mode, make) in [("flat", MemKv::new as fn() -> MemKv), ("lsm", MemKv::lsm)] {
         let f = fixture(make);
-        // Encoded order of the logical keys: the be32 length prefix sorts
-        // first, so "a" < "b" < "c" < "ab".
         let pending = f.core.status.begin();
         f.put_version(b"a", 1, write(b"a1"));
         f.put_intent(
@@ -320,6 +321,8 @@ fn scan_returns_logical_rows_in_key_order() {
             pending,
             vec![layer(1, write(b"a2"), RowLockMode::NoKeyUpdate)],
         ); // pending: invisible, one edge
+        f.put_version(b"ab", 3, write(b"ab3"));
+        f.put_version(b"ab", 7, write(b"ab7")); // newest <= 10 wins
         f.put_version(b"b", 2, LayerData::Delete { moved: false }); // tombstone: excluded
         f.put_version(b"c", 4, write(b"c4"));
         ok(f.core.status.set_committed(f.writer, Ts(9)));
@@ -328,15 +331,13 @@ fn scan_returns_logical_rows_in_key_order() {
             f.writer,
             vec![layer(1, write(b"c5"), RowLockMode::NoKeyUpdate)],
         ); // committed at 9 <= 10: visible
-        f.put_version(b"ab", 3, write(b"ab3"));
-        f.put_version(b"ab", 7, write(b"ab7")); // newest <= 10 wins
-                                                // A system key among the data must be ignored by scans.
+           // A system key among the data must be ignored by scans.
         let mut batch = Batch::default();
         batch.put(
             nucleus_txn::encoding::sys_gc_w_key(),
             0u64.to_be_bytes().to_vec(),
         );
-        ok(f.core.kv.write(batch, Durability::No));
+        ok(f.core.write(batch, Durability::No));
 
         let view = f.core.open_view();
         let mut obs = Collect::default();
@@ -346,13 +347,14 @@ fn scan_returns_logical_rows_in_key_order() {
             (Bound::Unbounded, Bound::Unbounded),
             &f.ctx(10, 1),
             &mut obs,
-        ));
+        )
+        .collect::<Result<Vec<_>, _>>());
         assert_eq!(
             rows,
             vec![
                 (b"a".to_vec(), b"a1".to_vec()),
-                (b"c".to_vec(), b"c5".to_vec()),
                 (b"ab".to_vec(), b"ab7".to_vec()),
+                (b"c".to_vec(), b"c5".to_vec()),
             ],
             "{mode}: unbounded scan"
         );
@@ -367,13 +369,11 @@ fn scan_returns_logical_rows_in_key_order() {
             (Bound::Included(b"a"), Bound::Excluded(b"ab")),
             &f.ctx(10, 1),
             &mut obs,
-        ));
+        )
+        .collect::<Result<Vec<_>, _>>());
         assert_eq!(
             rows,
-            vec![
-                (b"a".to_vec(), b"a1".to_vec()),
-                (b"c".to_vec(), b"c5".to_vec())
-            ],
+            vec![(b"a".to_vec(), b"a1".to_vec())],
             "{mode}: [a, ab)"
         );
 
@@ -384,12 +384,13 @@ fn scan_returns_logical_rows_in_key_order() {
             (Bound::Excluded(b"a"), Bound::Unbounded),
             &f.ctx(10, 1),
             &mut obs,
-        ));
+        )
+        .collect::<Result<Vec<_>, _>>());
         assert_eq!(
             rows,
             vec![
-                (b"c".to_vec(), b"c5".to_vec()),
-                (b"ab".to_vec(), b"ab7".to_vec())
+                (b"ab".to_vec(), b"ab7".to_vec()),
+                (b"c".to_vec(), b"c5".to_vec())
             ],
             "{mode}: (a, ..)"
         );
@@ -398,14 +399,18 @@ fn scan_returns_logical_rows_in_key_order() {
         let rows = ok(scan(
             &f.core,
             &view,
-            (Bound::Included(b"b"), Bound::Included(b"c")),
+            (Bound::Included(b"ab"), Bound::Included(b"c")),
             &f.ctx(10, 1),
             &mut obs,
-        ));
+        )
+        .collect::<Result<Vec<_>, _>>());
         assert_eq!(
             rows,
-            vec![(b"c".to_vec(), b"c5".to_vec())],
-            "{mode}: [b, c]"
+            vec![
+                (b"ab".to_vec(), b"ab7".to_vec()),
+                (b"c".to_vec(), b"c5".to_vec())
+            ],
+            "{mode}: [ab, c]"
         );
 
         // Own intents are read by scans too (the pending txn reads "a").
@@ -418,16 +423,164 @@ fn scan_returns_logical_rows_in_key_order() {
         let rows = ok(scan(
             &f.core,
             &view,
-            (Bound::Included(b"a"), Bound::Excluded(b"b")),
+            (Bound::Included(b"a"), Bound::Excluded(b"ab")),
             &own,
             &mut obs,
-        ));
+        )
+        .collect::<Result<Vec<_>, _>>());
         assert_eq!(
             rows,
             vec![(b"a".to_vec(), b"a2".to_vec())],
             "{mode}: own scan"
         );
     }
+}
+
+#[test]
+fn scan_order_is_the_sql_order_of_codec_encoded_keys() {
+    // The point of `L` as-is (draft 7.2 §2.2): logical keys produced by
+    // `nucleus_codec::encode_key` are prefix-free and order-preserving
+    // (C-Q3s P-ORDER), so a scan returns rows in the SQL order of the keys.
+    // Single text column, then a composite (text, int4) key.
+    use nucleus_codec::{Collation, KeyColumn, KeyType, Value as CodecValue};
+
+    fn text_key(s: &str) -> Vec<u8> {
+        let mut out = b"/t/1/".to_vec();
+        nucleus_codec::encode_key(
+            &[KeyColumn::asc(KeyType::Text(Collation::C))],
+            &[Some(CodecValue::Text(s.into()))],
+            &mut out,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        out
+    }
+
+    fn composite_key(s: &str, i: i32) -> Vec<u8> {
+        let mut out = b"/t/2/".to_vec();
+        nucleus_codec::encode_key(
+            &[
+                KeyColumn::asc(KeyType::Text(Collation::C)),
+                KeyColumn::asc(KeyType::Int4),
+            ],
+            &[Some(CodecValue::Text(s.into())), Some(CodecValue::Int4(i))],
+            &mut out,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        out
+    }
+
+    for (mode, make) in [("flat", MemKv::new as fn() -> MemKv), ("lsm", MemKv::lsm)] {
+        let f = fixture(make);
+        // Relation 1 has a single text key column, relation 2 a composite
+        // (text, int4) key; different relations never interleave.
+        // Single text column: "a" < "ab" < "b" (a prefix pair: a length
+        // prefix would order them a, b, ab).
+        for (s, v) in [("a", b"1"), ("ab", b"2"), ("b", b"3")] {
+            f.put_version(&text_key(s), 4, write(v));
+        }
+        // Composite (text, int4): ("a",2) < ("a",10) < ("b",1) — int4 order
+        // is numeric, not string order ("10" < "2" as bytes of the digits).
+        for ((s, i), v) in [(("a", 2), b"x"), (("a", 10), b"y"), (("b", 1), b"z")] {
+            f.put_version(&composite_key(s, i), 4, write(v));
+        }
+
+        let view = f.core.open_view();
+        let mut obs = Collect::default();
+        let rows = ok(scan(
+            &f.core,
+            &view,
+            (Bound::Unbounded, Bound::Unbounded),
+            &f.ctx(10, 1),
+            &mut obs,
+        )
+        .collect::<Result<Vec<_>, _>>());
+        assert_eq!(
+            rows,
+            vec![
+                (text_key("a"), b"1".to_vec()),
+                (text_key("ab"), b"2".to_vec()),
+                (text_key("b"), b"3".to_vec()),
+                (composite_key("a", 2), b"x".to_vec()),
+                (composite_key("a", 10), b"y".to_vec()),
+                (composite_key("b", 1), b"z".to_vec()),
+            ],
+            "{mode}: SQL key order"
+        );
+
+        // A SQL range over the composite text prefix ("a", ..) returns
+        // exactly the ("a", *) rows, in numeric int4 order.
+        let mut obs = Collect::default();
+        let rows = ok(scan(
+            &f.core,
+            &view,
+            (
+                Bound::Included(&composite_key("a", 2)),
+                Bound::Excluded(&composite_key("b", 1)),
+            ),
+            &f.ctx(10, 1),
+            &mut obs,
+        )
+        .collect::<Result<Vec<_>, _>>());
+        assert_eq!(
+            rows,
+            vec![
+                (composite_key("a", 2), b"x".to_vec()),
+                (composite_key("a", 10), b"y".to_vec()),
+            ],
+            "{mode}: composite prefix range"
+        );
+    }
+}
+
+#[test]
+fn scan_is_lazy_and_streams_rows() {
+    // The iterator stays lazy: rows are produced before the range is
+    // exhausted, and stopping early reads only what was needed. Checked by
+    // yielding rows one by one and asserting after each step.
+    let f = fixture(MemKv::new);
+    f.put_version(b"k1", 1, write(b"v1"));
+    f.put_version(b"k2", 2, write(b"v2"));
+    f.put_version(b"k3", 3, write(b"v3"));
+    let view = f.core.open_view();
+    let mut obs = Collect::default();
+    let ctx = f.ctx(10, 1);
+    let mut rows = scan(
+        &f.core,
+        &view,
+        (Bound::Unbounded, Bound::Unbounded),
+        &ctx,
+        &mut obs,
+    );
+    assert_eq!(
+        ok(rows.next().transpose()),
+        Some((b"k1".to_vec(), b"v1".to_vec()))
+    );
+    assert_eq!(
+        ok(rows.next().transpose()),
+        Some((b"k2".to_vec(), b"v2".to_vec()))
+    );
+    assert_eq!(
+        ok(rows.next().transpose()),
+        Some((b"k3".to_vec(), b"v3".to_vec()))
+    );
+    assert_eq!(rows.next().transpose(), Ok(None));
+    assert_eq!(
+        rows.next().transpose(),
+        Ok(None),
+        "exhausted stays exhausted"
+    );
+
+    // It stops at the range end: an upper bound past nothing yields nothing.
+    let mut obs = Collect::default();
+    let rows = ok(scan(
+        &f.core,
+        &view,
+        (Bound::Included(b"k9"), Bound::Unbounded),
+        &f.ctx(10, 1),
+        &mut obs,
+    )
+    .collect::<Result<Vec<_>, _>>());
+    assert_eq!(rows, Vec::<(Vec<u8>, Vec<u8>)>::new());
 }
 
 #[test]
@@ -450,7 +603,8 @@ fn scan_missing_current_epoch_status_is_fatal() {
         (Bound::Unbounded, Bound::Unbounded),
         &f.ctx(10, 1),
         &mut obs,
-    );
+    )
+    .collect::<Result<Vec<_>, _>>();
     assert!(matches!(r, Err(TxnError::Invariant(_))));
 }
 
@@ -459,7 +613,7 @@ fn corrupt_intent_in_a_view_is_an_error_not_a_panic() {
     let f = fixture(MemKv::new);
     let mut batch = Batch::default();
     batch.put(intent_key(b"k"), b"not an intent".to_vec());
-    ok(f.core.kv.write(batch, Durability::No));
+    ok(f.core.write(batch, Durability::No));
     let view = f.core.open_view();
     let r = read_key(&f.core, &view, b"k", &f.ctx(10, 1), &mut NoSsi);
     assert!(matches!(r, Err(TxnError::Corrupt(_))));
@@ -469,6 +623,7 @@ fn corrupt_intent_in_a_view_is_an_error_not_a_panic() {
         (Bound::Unbounded, Bound::Unbounded),
         &f.ctx(10, 1),
         &mut NoSsi,
-    );
+    )
+    .collect::<Result<Vec<_>, _>>();
     assert!(matches!(r, Err(TxnError::Corrupt(_))));
 }

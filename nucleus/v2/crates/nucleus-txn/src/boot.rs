@@ -13,7 +13,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot};
+use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot, Value};
 
 use crate::encoding::{
     parse_sys_txn_key, sys_epoch_key, sys_gc_w_key, sys_ts_hwm_key, sys_txn_prefix,
@@ -26,8 +26,12 @@ use crate::{kv_err, Ts, TxnError, TxnId};
 
 /// The shared transaction core (§3, §7.2).
 pub struct Core<K: OrderedKv> {
-    /// The KV store.
-    pub kv: K,
+    /// The KV store. Private: reads reachable by later cards go through
+    /// registered views ([`Core::open_view`]) or, under the key's latch,
+    /// [`Core::latest_get`]; writes through [`Core::write`]. There is no
+    /// public handle, so I-SNAP-ORDER and the §3.1 view rules hold by
+    /// construction.
+    kv: K,
     /// Status table with the boot epoch.
     pub status: StatusTable,
     /// Snapshot/view registry (§3.1, §9.1).
@@ -135,6 +139,34 @@ impl<K: OrderedKv> Core<K> {
     /// Opens a registered view (§3.1) over this core's KV.
     pub fn open_view(&self) -> crate::registry::ViewGuard<'_, K::Snap> {
         self.registry.open_view(&self.kv)
+    }
+
+    /// Latest-state point read of `key` (§3.1, §5.1). **Valid only while the
+    /// caller holds `latch(latch_key(key))`**: under the latch no removal of
+    /// `key@INTENT` can run (§7.3 step 1), so the read cannot race a
+    /// resolution. Every read outside a latch section must go through
+    /// [`Core::open_view`] instead.
+    pub fn latest_get(&self, key: &[u8]) -> Result<Option<Value>, TxnError> {
+        self.kv.get_latest(key).map_err(crate::kv_err)
+    }
+
+    /// Writes one atomic batch (§3 step 2). Ordering between concurrent
+    /// writers is the caller's latch discipline, not this method.
+    pub fn write(&self, batch: Batch, durability: Durability) -> Result<(), TxnError> {
+        self.kv.write(batch, durability).map_err(crate::kv_err)
+    }
+
+    /// fsyncs the WAL through everything written so far (§3; never on an
+    /// async executor thread).
+    pub fn sync_wal(&self) -> Result<(), TxnError> {
+        self.kv.sync_wal().map_err(crate::kv_err)
+    }
+
+    /// Gives up the KV store: the shutdown/reopen path (§7.2 boot, §3). The
+    /// `Core` is consumed, so this grants no read path — no view or latch
+    /// discipline can be bypassed through it.
+    pub fn into_kv(self) -> K {
+        self.kv
     }
 
     /// Truncates `id`'s status entry if and only if the §7.4 conditions

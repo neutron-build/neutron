@@ -42,7 +42,7 @@ fn place(core: &Core<MemKv>, key: &[u8], id: TxnId) {
             layers: vec![layer(1, write(b"v"))],
         })),
     );
-    ok(core.kv.write(batch, Durability::No));
+    ok(core.write(batch, Durability::No));
 }
 
 /// A current-epoch txn that committed and released: conditions 1 and 2 are
@@ -145,11 +145,11 @@ fn truncate_deletes_the_persisted_record() {
     // Hand-write the persisted record the way the commit thread would.
     let mut batch = Batch::default();
     batch.put(sys_txn_key(id), 9u64.to_be_bytes().to_vec());
-    ok(core.kv.write(batch, Durability::No));
-    assert!(ok(core.kv.get_latest(&sys_txn_key(id))).is_some());
+    ok(core.write(batch, Durability::No));
+    assert!(ok(core.latest_get(&sys_txn_key(id))).is_some());
     assert!(ok(core.truncate_status(id)));
     assert!(
-        ok(core.kv.get_latest(&sys_txn_key(id))).is_none(),
+        ok(core.latest_get(&sys_txn_key(id))).is_none(),
         "/sys/txn delete written"
     );
     // An aborted txn was never persisted: no delete is written.
@@ -199,7 +199,7 @@ fn older_epoch_records_wait_for_the_sweep_and_the_views() {
     }));
     let mut batch = Batch::default();
     batch.put(intent_key(b"/t/1/r"), value);
-    ok(core.kv.write(batch, Durability::No));
+    ok(core.write(batch, Durability::No));
     {
         let _view = core.open_view(); // counter 1
         assert_eq!(

@@ -12,6 +12,8 @@ nucleus-kv.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# Tests run over MemKv (flat and LSM mode) and compare the §2.2 layout against
-# the reference in the kv conformance suite.
+# Tests run over MemKv (flat and LSM mode), compare the §2.2 layout against
+# the reference in the kv conformance suite, and check scan order against
+# codec-encoded (prefix-free, SQL-ordered) logical keys.
 nucleus-kv = { path = "../nucleus-kv", features = ["mem", "conformance"] }
+nucleus-codec.workspace = true

@@ -11,7 +11,7 @@ use crate::boot::Core;
 use crate::encoding::encode_intent;
 use crate::encoding::{decode_intent, encode_version, intent_key, version_key};
 use crate::latch::{latch_key, LatchGuard};
-use crate::{kv_err, Intent, Layer, Seq, TxnError, TxnId, TxnStatus};
+use crate::{Intent, Layer, Seq, TxnError, TxnId, TxnStatus};
 
 /// Which removal rule to apply (§7.3 step 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,21 +50,36 @@ pub fn remove_intent<K: OrderedKv>(
     mode: RemovalMode,
 ) -> Result<RemovalOutcome, TxnError> {
     let latch = core.latches.lock(latch_key(key, deferrable_prefix));
-    remove_intent_under_latch(core, key, expected, mode, &latch)
+    remove_intent_under_latch(core, key, deferrable_prefix, expected, mode, &latch)
 }
 
 /// §7.3 steps 2–5 for a caller that already holds the latch (the §5.1 loop).
-/// The `_latch` witness proves a latch is held; debug builds additionally
-/// assert the thread holds exactly one.
+/// The guard must be for `latch_key(key, deferrable_prefix)` (§7.3 step 1):
+/// checked with a debug assert, and with an invariant error in release
+/// builds so a wrong-latch removal is fatal, not silent.
 pub fn remove_intent_under_latch<K: OrderedKv>(
     core: &Core<K>,
     key: &[u8],
+    deferrable_prefix: Option<&[u8]>,
     expected: TxnId,
     mode: RemovalMode,
-    _latch: &LatchGuard<'_>,
+    latch: &LatchGuard<'_>,
 ) -> Result<RemovalOutcome, TxnError> {
-    // Step 2: re-read the latest state; act only if still owned by `expected`.
-    let raw = core.kv.get_latest(&intent_key(key)).map_err(kv_err)?;
+    let want = latch_key(key, deferrable_prefix);
+    debug_assert!(
+        latch.protects(want),
+        "removal of {key:?} under the latch of {:?} (want {want:?})",
+        latch.key()
+    );
+    if !latch.protects(want) {
+        return Err(TxnError::Invariant(format!(
+            "removal of {key:?} under the latch of {:?}, want {want:?} (C-T0 §7.3 step 1)",
+            latch.key()
+        )));
+    }
+    // Step 2: re-read the latest state (valid under this latch, §3.1); act
+    // only if still owned by `expected`.
+    let raw = core.latest_get(&intent_key(key))?;
     let Some(raw) = raw else {
         return Ok(RemovalOutcome::Noop);
     };
@@ -106,7 +121,7 @@ pub fn remove_intent_under_latch<K: OrderedKv>(
                     batch.put(version_key(key, ts), value);
                 }
             }
-            core.kv.write(batch, Durability::No).map_err(kv_err)?;
+            core.write(batch, Durability::No)?;
             bookkeeping(core, expected)?;
             Ok(RemovalOutcome::Removed)
         }
@@ -125,7 +140,7 @@ pub fn remove_intent_under_latch<K: OrderedKv>(
             let mut batch = Batch::default();
             if kept.is_empty() {
                 batch.delete(intent_key(key));
-                core.kv.write(batch, Durability::No).map_err(kv_err)?;
+                core.write(batch, Durability::No)?;
                 bookkeeping(core, expected)?;
                 Ok(RemovalOutcome::Removed)
             } else {
@@ -136,7 +151,7 @@ pub fn remove_intent_under_latch<K: OrderedKv>(
                     layers: kept,
                 })?;
                 batch.put(intent_key(key), value);
-                core.kv.write(batch, Durability::No).map_err(kv_err)?;
+                core.write(batch, Durability::No)?;
                 // The intent remains: no bookkeeping (§7.3 step 4 only runs
                 // when an intent was removed).
                 Ok(RemovalOutcome::LayersDropped)
@@ -145,9 +160,14 @@ pub fn remove_intent_under_latch<K: OrderedKv>(
     }
 }
 
-/// §7.3 step 4, under the registry mutex (the caller still holds the latch):
-/// `last_removal_counter(T) = view_counter`, then — for a current-epoch T —
-/// `intent_count(T) -= 1`.
+/// §7.3 step 4, under the registry mutex (the caller still holds the latch),
+/// after the removal batch write returned: `last_removal_counter(T) =
+/// view_counter` **first**, then — for a current-epoch T —
+/// `intent_count(T) -= 1`. The order inside this one critical section is what
+/// §7.3 step 4 fixes ("then"); no external observer can interleave between
+/// the two updates, so no test can distinguish the order — it is asserted by
+/// construction here and checked at the single-update level in
+/// `tests/removal.rs`.
 fn bookkeeping<K: OrderedKv>(core: &Core<K>, id: TxnId) -> Result<(), TxnError> {
     core.registry
         .with_registry(|r| core.status.removal_bookkeeping(id, r.view_counter()))

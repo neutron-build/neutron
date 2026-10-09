@@ -56,7 +56,7 @@ impl RegistryState {
     }
 
     /// The published watermark `W` (§9.1).
-    pub fn w(&self) -> Ts {
+    pub fn published_w(&self) -> Ts {
         self.w
     }
 
@@ -68,7 +68,7 @@ impl RegistryState {
 
     /// The §9.1 min: registered snapshots and caller-chosen ts, every open
     /// view's `vts`, `visible_ts`, and `extra_floor` (an AS OF retention
-    /// window converted to ts).
+    /// window converted to ts). Read-only.
     pub fn computed_watermark(&self, extra_floor: Option<Ts>) -> Ts {
         let mut min = Ts(self.visible_ts.load(Ordering::SeqCst));
         if let Some(f) = extra_floor {
@@ -83,9 +83,12 @@ impl RegistryState {
         min
     }
 
-    /// `W = max(old W, computed)` (§9.1: `W` is monotonic). Must run in the
-    /// same critical section as the computation of `computed`.
-    pub fn publish_w(&mut self, computed: Ts) -> Ts {
+    /// Computes the §9.1 min and publishes `W = max(old W, computed)` in one
+    /// step (§9.1), inside the caller's registry critical section. There is
+    /// no other publisher: `W` cannot be set from a value computed in an
+    /// earlier critical section.
+    pub fn publish_computed_w(&mut self, extra_floor: Option<Ts>) -> Ts {
+        let computed = self.computed_watermark(extra_floor);
         self.w = self.w.max(computed);
         self.w
     }
@@ -169,30 +172,16 @@ impl Registry {
         self.lock().min_view_counter()
     }
 
-    /// The published `W`.
-    pub fn w(&self) -> Ts {
-        self.lock().w()
-    }
-
-    /// The §9.1 min (see [`RegistryState::computed_watermark`]). Read-only
-    /// convenience; the GC job must use [`Registry::publish_computed_w`] so
-    /// the computation and the publish are one critical section.
-    pub fn computed_watermark(&self, extra_floor: Option<Ts>) -> Ts {
-        self.lock().computed_watermark(extra_floor)
-    }
-
-    /// `W = max(old W, computed)` (§9.1). Read-only convenience taking an
-    /// already-computed value; prefer [`Registry::publish_computed_w`].
-    pub fn publish_w(&self, computed: Ts) -> Ts {
-        self.lock().publish_w(computed)
+    /// The published `W` (§9.1), read-only.
+    pub fn published_w(&self) -> Ts {
+        self.lock().published_w()
     }
 
     /// Computes the §9.1 min and publishes `W = max(old W, computed)` in one
-    /// critical section, as §9.1 requires.
+    /// critical section, as §9.1 requires: the GC job's only publish path.
     pub fn publish_computed_w(&self, extra_floor: Option<Ts>) -> Ts {
         let mut st = self.lock();
-        let computed = st.computed_watermark(extra_floor);
-        st.publish_w(computed)
+        st.publish_computed_w(extra_floor)
     }
 
     /// `Some(view_counter)` once the boot sweep has finished, `None` before

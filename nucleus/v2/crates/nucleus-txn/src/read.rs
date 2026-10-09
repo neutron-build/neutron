@@ -12,7 +12,7 @@
 
 use std::ops::Bound;
 
-use nucleus_kv::{Key, OrderedKv, Snapshot};
+use nucleus_kv::{Key, OrderedKv, Snapshot, Value};
 
 use crate::boot::Core;
 use crate::encoding::{decode_intent, decode_version, end_key, intent_key, parse_key, Entry};
@@ -52,63 +52,117 @@ pub fn read_key<K: OrderedKv>(
 /// Scans logical keys in `range` (over logical keys, not stored keys),
 /// returning the visible rows in key order. Each logical key is read once;
 /// intents and versions are grouped by [`parse_key`].
-pub fn scan<K: OrderedKv>(
-    core: &Core<K>,
-    view: &ViewGuard<'_, K::Snap>,
+///
+/// Streaming and lazy (§4 "a scan uses one view for its whole duration"):
+/// rows are produced as the view's KV iterator is consumed, and iteration
+/// stops at the range end. SSI edges fire as the rows that produce them are
+/// pulled. After an error the iterator is exhausted.
+pub fn scan<'a, K: OrderedKv>(
+    core: &'a Core<K>,
+    view: &'a ViewGuard<'_, K::Snap>,
     range: (Bound<&[u8]>, Bound<&[u8]>),
-    ctx: &ReadCtx,
-    observer: &mut dyn ReadObserver,
-) -> Result<Vec<(Key, Vec<u8>)>, TxnError> {
-    let mut out = Vec::new();
-    let mut current: Option<(Key, KeyEntries)> = None;
+    ctx: &'a ReadCtx,
+    observer: &'a mut dyn ReadObserver,
+) -> ScanRows<'a, K> {
     let stored_range = map_bounds(range);
     let (lo, hi) = borrow_bounds(&stored_range);
-    for entry in view.scan((lo, hi), false) {
-        let (stored, value) = entry.map_err(kv_err)?;
-        let Some((logical, kind)) = parse_key(&stored) else {
-            continue; // end keys, system keys, anything not ours
-        };
-        match kind {
-            Entry::Intent => {
-                let intent = decode_intent(&value)?;
-                match &mut current {
-                    Some((cur, entries)) if cur.as_slice() == logical => {
-                        entries.intent = Some(intent);
-                    }
-                    _ => {
-                        flush(core, &current, ctx, observer, &mut out)?;
-                        current = Some((
-                            logical.to_vec(),
-                            KeyEntries {
-                                intent: Some(intent),
-                                versions: Vec::new(),
-                            },
-                        ));
-                    }
-                }
+    ScanRows {
+        core,
+        ctx,
+        observer,
+        inner: view.scan((lo, hi), false),
+        current: None,
+        finished: false,
+    }
+}
+
+/// The iterator behind [`scan`]: pulls stored entries from the view's KV
+/// iterator, groups them by logical key, and yields one visible row per
+/// completed group.
+pub struct ScanRows<'a, K: OrderedKv> {
+    core: &'a Core<K>,
+    ctx: &'a ReadCtx,
+    observer: &'a mut dyn ReadObserver,
+    inner: Box<dyn Iterator<Item = nucleus_kv::Result<(Key, Value)>> + 'a>,
+    /// The group being collected: its logical key and entries so far.
+    current: Option<(Key, KeyEntries)>,
+    finished: bool,
+}
+
+impl<'a, K: OrderedKv> ScanRows<'a, K> {
+    /// Adds `entry` as the start of a new group for `logical`.
+    fn start_group(&mut self, logical: &[u8], kind: Entry, value: Value) -> Result<(), TxnError> {
+        self.current = Some((logical.to_vec(), KeyEntries::new(kind, value)?));
+        Ok(())
+    }
+
+    /// Merges `entry` into the group under `logical` (the caller checked it
+    /// is the same logical key).
+    fn merge_group(&mut self, kind: Entry, value: Value) -> Result<(), TxnError> {
+        if let Some((_, entries)) = self.current.as_mut() {
+            entries.push(kind, value)?;
+        }
+        Ok(())
+    }
+
+    /// Emits the completed group, if it has a visible row. Takes ownership of
+    /// the group so the borrow ends before the caller mutates `self`.
+    fn flush(&mut self) -> Result<Option<(Key, Vec<u8>)>, TxnError> {
+        match self.current.take() {
+            Some((logical, entries)) => {
+                let row = read_entries(self.core, &entries, self.ctx, self.observer)?;
+                Ok(row.map(|value| (logical, value)))
             }
-            Entry::Version(ts) => {
-                let value = decode_version(&value)?.into_option();
-                match &mut current {
-                    Some((cur, entries)) if cur.as_slice() == logical => {
-                        entries.versions.push((ts, value));
-                    }
-                    _ => {
-                        flush(core, &current, ctx, observer, &mut out)?;
-                        current = Some((
-                            logical.to_vec(),
-                            KeyEntries {
-                                intent: None,
-                                versions: vec![(ts, value)],
-                            },
-                        ));
-                    }
+            None => Ok(None),
+        }
+    }
+
+    /// Pulls stored entries until one logical row is ready, the range ends,
+    /// or an error surfaces.
+    fn advance(&mut self) -> Result<Option<(Key, Vec<u8>)>, TxnError> {
+        loop {
+            let (stored, value) = match self.inner.next() {
+                None => {
+                    self.finished = true;
+                    return self.flush();
+                }
+                Some(Err(e)) => return Err(kv_err(e)),
+                Some(Ok(kv)) => kv,
+            };
+            let Some((logical, kind)) = parse_key(&stored) else {
+                continue; // end keys, system keys, anything not ours
+            };
+            let same = self
+                .current
+                .as_ref()
+                .is_some_and(|(l, _)| l.as_slice() == logical);
+            if same {
+                self.merge_group(kind, value)?;
+            } else {
+                // A new logical key: the previous group is complete.
+                let row = self.flush()?;
+                self.start_group(logical, kind, value)?;
+                if let Some(row) = row {
+                    return Ok(Some(row));
                 }
             }
         }
     }
-    flush(core, &current, ctx, observer, &mut out)?;
-    Ok(out)
+}
+
+impl<K: OrderedKv> Iterator for ScanRows<'_, K> {
+    type Item = Result<(Key, Vec<u8>), TxnError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let row = self.advance();
+        if row.is_err() {
+            self.finished = true;
+        }
+        row.transpose()
+    }
 }
 
 /// Runs the §4 rule for one logical key's entries and returns the visible
@@ -152,6 +206,28 @@ fn read_entries<K: OrderedKv>(
 struct KeyEntries {
     intent: Option<Intent>,
     versions: Vec<(Ts, Option<Vec<u8>>)>,
+}
+
+impl KeyEntries {
+    /// Collects one stored entry.
+    fn new(kind: Entry, value: Value) -> Result<KeyEntries, TxnError> {
+        let mut entries = KeyEntries {
+            intent: None,
+            versions: Vec::new(),
+        };
+        entries.push(kind, value)?;
+        Ok(entries)
+    }
+
+    fn push(&mut self, kind: Entry, value: Value) -> Result<(), TxnError> {
+        match kind {
+            Entry::Intent => self.intent = Some(decode_intent(&value)?),
+            Entry::Version(ts) => self
+                .versions
+                .push((ts, decode_version(&value)?.into_option())),
+        }
+        Ok(())
+    }
 }
 
 /// Collects exactly the entries of one logical key: the range
@@ -213,20 +289,4 @@ fn borrow_bound(b: &Bound<Key>) -> Bound<&[u8]> {
 /// Borrows the bounds of [`map_bounds`] for a `Snapshot::scan` call.
 fn borrow_bounds(range: &(Bound<Key>, Bound<Key>)) -> (Bound<&[u8]>, Bound<&[u8]>) {
     (borrow_bound(&range.0), borrow_bound(&range.1))
-}
-
-/// Emits the pending group, if any.
-fn flush<K: OrderedKv>(
-    core: &Core<K>,
-    current: &Option<(Key, KeyEntries)>,
-    ctx: &ReadCtx,
-    observer: &mut dyn ReadObserver,
-    out: &mut Vec<(Key, Vec<u8>)>,
-) -> Result<(), TxnError> {
-    if let Some((logical, entries)) = current {
-        if let Some(value) = read_entries(core, entries, ctx, observer)? {
-            out.push((logical.clone(), value));
-        }
-    }
-    Ok(())
 }

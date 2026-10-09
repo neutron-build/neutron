@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
+use nucleus_kv::{Batch, Durability, MemKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::encoding::{decode_intent, encode_intent, intent_key};
 use nucleus_txn::read::{read_key, NoSsi};
@@ -19,10 +19,6 @@ fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
         Ok(v) => v,
         Err(e) => panic!("unexpected error: {e:?}"),
     }
-}
-
-fn kverr(e: nucleus_kv::KvError) -> TxnError {
-    TxnError::Kv(e.to_string())
 }
 
 fn lock_done(done: &Mutex<Vec<TxnId>>) -> MutexGuard<'_, Vec<TxnId>> {
@@ -79,7 +75,7 @@ fn concurrent_snapshots_views_removals_and_truncation() {
                 }));
                 let mut batch = Batch::default();
                 batch.put(intent_key(&key_of(i)), value);
-                core.kv.write(batch, Durability::No).map_err(kverr)?;
+                core.write(batch, Durability::No)?;
                 core.status.set_committed(id, Ts(200 + i as u64))?;
                 // Commit step 4: visible every other txn, so workers see both
                 // visible and not-yet-visible commits.
@@ -134,14 +130,12 @@ fn concurrent_snapshots_views_removals_and_truncation() {
                     _ => {
                         // The §5.1 inline-removal shape: read the intent and
                         // its owner's status, then remove under the latch.
-                        let owner = core
-                            .kv
-                            .get_latest(&intent_key(&key))
-                            .map_err(kverr)
-                            .and_then(|raw| match raw {
-                                Some(v) => Ok(Some(decode_intent(&v)?.txn)),
-                                None => Ok(None),
-                            })?;
+                        let owner =
+                            core.latest_get(&intent_key(&key))
+                                .and_then(|raw| match raw {
+                                    Some(v) => Ok(Some(decode_intent(&v)?.txn)),
+                                    None => Ok(None),
+                                })?;
                         // The owner was read without a latch or a view, so it
                         // is a remembered id: another worker may resolve the
                         // intent and truncate the status in between.

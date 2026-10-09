@@ -1,7 +1,9 @@
 //! C-T1a tests: §2.2/§2.3 encoding — byte-equality with the reference layout
-//! in the kv conformance suite, ordering, round-trips, and that decoders
-//! never panic on arbitrary bytes.
+//! in the kv conformance suite (on keys made prefix-free by `layout::logical`),
+//! ordering, round-trips, the right-split key rules, and that decoders never
+//! panic on arbitrary bytes.
 
+use nucleus_codec::{Collation, KeyColumn, KeyType, Value as CodecValue};
 use nucleus_kv::conformance::layout;
 use nucleus_kv::Key;
 use nucleus_txn::encoding::{
@@ -85,17 +87,37 @@ const LOGICAL: [&[u8]; 7] = [
 
 #[test]
 fn keys_are_byte_identical_to_conformance_layout() {
+    // `layout` prefixes its logical keys with `be32(len)` to make test inputs
+    // prefix-free; on such keys the two key builders must agree byte for
+    // byte. The txn layer uses the caller's `L` as-is (draft 7.2 §2.2).
     for l in LOGICAL {
-        assert_eq!(intent_key(l), layout::intent_key(l), "intent {l:?}");
-        assert_eq!(end_key(l), layout::end_key(l), "end {l:?}");
+        let pf = layout::logical(l);
+        assert_eq!(intent_key(&pf), layout::intent_key(l), "intent {l:?}");
+        assert_eq!(end_key(&pf), layout::end_key(l), "end {l:?}");
         for ts in [0u64, 1, 5, 90, 101, u64::MAX - 1, u64::MAX] {
             assert_eq!(
-                version_key(l, Ts(ts)),
+                version_key(&pf, Ts(ts)),
                 layout::version_key(l, ts),
                 "version {l:?}@{ts}"
             );
         }
     }
+    // On the stored key of a codec-encoded (already prefix-free) logical key,
+    // `L` is the key as-is: no prefix, no transformation.
+    let mut l = Vec::new();
+    nucleus_codec::encode_key(
+        &[KeyColumn::asc(KeyType::Text(Collation::C))],
+        &[Some(CodecValue::Text("row/7".into()))],
+        &mut l,
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(intent_key(&l), [l.as_slice(), &[0x00]].concat());
+    let mut v = l.clone();
+    v.push(0x01);
+    v.extend_from_slice(&(u64::MAX - 42u64).to_be_bytes());
+    v.push(0x01);
+    assert_eq!(version_key(&l, Ts(42)), v);
+    assert_eq!(end_key(&l), [l.as_slice(), &[0x02]].concat());
 }
 
 #[test]
@@ -112,9 +134,12 @@ fn parse_agrees_with_conformance_layout() {
         })
     }
     fn conv_ref(theirs: Option<(Key, layout::Entry)>) -> Option<(Vec<u8>, Option<u64>)> {
+        // `layout::parse` returns the caller's logical key; `parse_key` the
+        // stored `L`. On layout keys, `L = layout::logical(l)`, so re-prefix
+        // theirs before comparing.
         theirs.map(|(l, e)| {
             (
-                l,
+                layout::logical(&l),
                 match e {
                     layout::Entry::Intent => None,
                     layout::Entry::Version(ts) => Some(ts),
@@ -122,15 +147,14 @@ fn parse_agrees_with_conformance_layout() {
             )
         })
     }
+    // The parsers agree on the layout's own keys (intent, versions, end key).
     for l in LOGICAL {
         for key in [
-            intent_key(l),
-            end_key(l),
-            version_key(l, Ts(0)),
-            version_key(l, Ts(42)),
-            version_key(l, Ts(u64::MAX)),
-            b"short".to_vec(),
-            b"\x00\x00\x00\x09abc\x00".to_vec(),
+            layout::intent_key(l),
+            layout::version_key(l, 0),
+            layout::version_key(l, 42),
+            layout::version_key(l, u64::MAX),
+            layout::end_key(l),
         ] {
             assert_eq!(
                 conv(parse_key(&key)),
@@ -139,6 +163,54 @@ fn parse_agrees_with_conformance_layout() {
             );
         }
     }
+    // Both reject keys that are neither (an end key is neither): here, one
+    // that is too short to be a version and does not end in a tag byte.
+    for key in [&b""[..], b"short", b"\x00\x00\x00\x09abc\xff"] {
+        assert_eq!(conv(parse_key(key)), None, "{key:?}");
+    }
+}
+
+#[test]
+fn parse_splits_from_the_right_without_a_schema() {
+    // §2.2 draft 7.2: the last byte decides. Round-trips hold for arbitrary
+    // logical keys (prefix-free or not) because the split is from the right.
+    let mut rng = Lcg(0x9e3779b97f4a7c15);
+    for _ in 0..2000 {
+        let l = rng.bytes(24);
+        let got = parse_key(&intent_key(&l)).map(|(o, e)| (o.to_vec(), e));
+        assert_eq!(got, Some((l.clone(), Entry::Intent)), "intent {l:?}");
+        let ts = Ts(rng.next());
+        let got = parse_key(&version_key(&l, ts)).map(|(o, e)| (o.to_vec(), e));
+        assert_eq!(got, Some((l.clone(), Entry::Version(ts))), "version {l:?}");
+        assert_eq!(parse_key(&end_key(&l)), None, "end {l:?}");
+    }
+    // The empty logical key.
+    assert_eq!(parse_key(&[0x00]), Some((&[][..], Entry::Intent)));
+    let mut v = vec![0x01];
+    v.extend_from_slice(&(u64::MAX - 7u64).to_be_bytes());
+    v.push(0x01);
+    assert_eq!(parse_key(&v), Some((&[][..], Entry::Version(Ts(7)))));
+    // A logical key that itself ends in the tag bytes still round-trips.
+    for l in [&b"\x00"[..], b"\x01", b"a\x00", b"a\x01", b"\x00\x01\x00"] {
+        assert_eq!(
+            parse_key(&intent_key(l)).map(|(o, e)| (o.to_vec(), e)),
+            Some((l.to_vec(), Entry::Intent)),
+            "{l:?}"
+        );
+    }
+    // Version rule: the byte 9 before the final 0x01 must be the 0x01
+    // separator; anything else is None (here: 0x00, 0x02, or a too-short key).
+    let mut bad = vec![0x00u8];
+    bad.extend_from_slice(&[0u8; 8]);
+    bad.push(0x01);
+    assert_eq!(parse_key(&bad), None, "separator not 0x01");
+    let mut short = vec![0x01, 0x01];
+    short.extend_from_slice(&[0u8; 5]);
+    short.push(0x01);
+    assert_eq!(parse_key(&short), None, "shorter than 10 bytes");
+    // A key ending in a foreign byte is never ours.
+    assert_eq!(parse_key(b"/sys/epoch"), None);
+    assert_eq!(parse_key(b"/sys/gc_w"), None);
 }
 
 #[test]

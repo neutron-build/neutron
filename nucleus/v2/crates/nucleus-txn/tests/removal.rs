@@ -47,7 +47,7 @@ fn place(core: &Core<MemKv>, key: &[u8], id: TxnId, layers: Vec<Layer>) {
     let value = ok(encode_intent(&Intent { txn: id, layers }));
     let mut batch = Batch::default();
     batch.put(intent_key(key), value);
-    ok(core.kv.write(batch, Durability::No));
+    ok(core.write(batch, Durability::No));
 }
 
 /// Places an intent for a txn this process never begun (older epoch, loaded
@@ -56,11 +56,11 @@ fn place_uncounted(core: &Core<MemKv>, key: &[u8], id: TxnId, layers: Vec<Layer>
     let value = ok(encode_intent(&Intent { txn: id, layers }));
     let mut batch = Batch::default();
     batch.put(intent_key(key), value);
-    ok(core.kv.write(batch, Durability::No));
+    ok(core.write(batch, Durability::No));
 }
 
 fn raw_intent(core: &Core<MemKv>, key: &[u8]) -> Option<Vec<u8>> {
-    ok(core.kv.get_latest(&intent_key(key)))
+    ok(core.latest_get(&intent_key(key)))
 }
 
 const K: &[u8] = b"/t/1/r";
@@ -99,7 +99,7 @@ fn resolve_committed_intent_writes_top_layer_version() {
     );
     assert_eq!(raw_intent(&core, K), None);
     // The version comes from the top layer, with its header.
-    let v = ok(core.kv.get_latest(&version_key(K, Ts(9)))).unwrap_or_default();
+    let v = ok(core.latest_get(&version_key(K, Ts(9)))).unwrap_or_default();
     assert_eq!(
         v,
         nucleus_txn::encoding::encode_version(&LayerData::Write {
@@ -134,7 +134,7 @@ fn resolve_absent_top_layer_writes_no_version() {
         RemovalOutcome::Removed
     );
     assert_eq!(raw_intent(&core, K), None);
-    assert_eq!(ok(core.kv.get_latest(&version_key(K, Ts(9)))), None);
+    assert_eq!(ok(core.latest_get(&version_key(K, Ts(9)))), None);
 }
 
 #[test]
@@ -159,9 +159,9 @@ fn discard_aborted_intent_writes_nothing_else() {
         version_key(K, Ts(3)),
         encode_version(&write(b"old")).unwrap_or_default(),
     );
-    ok(core.kv.write(batch, Durability::No));
+    ok(core.write(batch, Durability::No));
     assert_eq!(
-        ok(core.kv.get_latest(&version_key(K, Ts(3)))),
+        ok(core.latest_get(&version_key(K, Ts(3)))),
         Some(vec![0x00, b'o', b'l', b'd']),
         "old version untouched"
     );
@@ -192,7 +192,7 @@ fn removal_modes_check_the_owner_status() {
         remove_intent(&core, K, None, t, RemovalMode::Resolve),
         Err(TxnError::Invariant(_))
     ));
-    assert_eq!(ok(core.kv.get_latest(&version_key(K, Ts(4)))), None);
+    assert_eq!(ok(core.latest_get(&version_key(K, Ts(4)))), None);
     core.advance_visible_ts(Ts(4));
     assert!(matches!(
         remove_intent(&core, K, None, t, RemovalMode::Discard),
@@ -401,7 +401,7 @@ fn older_epoch_removal_sets_counter_but_never_touches_a_count() {
         ok(remove_intent(&core, K, None, old, RemovalMode::Resolve)),
         RemovalOutcome::Removed
     );
-    assert!(ok(core.kv.get_latest(&version_key(K, Ts(5)))).is_some());
+    assert!(ok(core.latest_get(&version_key(K, Ts(5)))).is_some());
     let entry = some(core.status.entry(old));
     assert_eq!(entry.intent_count, 0, "older-epoch txns have no count");
     assert_eq!(entry.last_removal_counter, 1, "counter still recorded");
@@ -414,9 +414,122 @@ fn corrupt_intent_value_is_an_error_not_a_panic() {
     ok(core.status.set_aborted(t));
     let mut batch = Batch::default();
     batch.put(intent_key(K), b"garbage".to_vec());
-    ok(core.kv.write(batch, Durability::No));
+    ok(core.write(batch, Durability::No));
     assert!(matches!(
         remove_intent(&core, K, None, t, RemovalMode::Discard),
         Err(TxnError::Corrupt(_))
     ));
+}
+
+#[test]
+fn under_latch_removal_runs_steps_2_to_5_and_checks_the_guard() {
+    // Rework item 5: `remove_intent_under_latch` verifies the guard is for
+    // `latch_key(key, deferrable_prefix)` (§7.3 step 1).
+    use nucleus_txn::removal::remove_intent_under_latch;
+
+    /// Runs `f` expecting the debug assert to panic (silenced); returns
+    /// whether it did. In release builds `f`'s error result is checked by
+    /// the caller instead.
+    #[cfg(debug_assertions)]
+    fn assert_panics(f: impl FnOnce()) {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "wrong latch must trip the debug assert");
+    }
+
+    // Happy path: the caller of §5.1 holds the latch and runs steps 2-5.
+    let core = ok(Core::open(MemKv::new()));
+    let t = core.status.begin();
+    place(
+        &core,
+        K,
+        t,
+        vec![layer(1, write(b"x"), RowLockMode::Update)],
+    );
+    ok(core.status.set_aborted(t));
+    {
+        let guard = core.latches.lock(K);
+        assert_eq!(
+            ok(remove_intent_under_latch(
+                &core,
+                K,
+                None,
+                t,
+                RemovalMode::Discard,
+                &guard
+            )),
+            RemovalOutcome::Removed
+        );
+    }
+    assert_eq!(raw_intent(&core, K), None);
+    assert_eq!(some(core.status.entry(t)).intent_count, 0);
+
+    // A guard latched on a different key is refused: nothing is removed.
+    // Debug builds trip the assert; release builds get an invariant error.
+    let t2 = core.status.begin();
+    place(
+        &core,
+        K,
+        t2,
+        vec![layer(1, write(b"y"), RowLockMode::Update)],
+    );
+    ok(core.status.set_aborted(t2));
+    {
+        let wrong = core.latches.lock(b"/t/1/other");
+        #[cfg(debug_assertions)]
+        assert_panics(|| {
+            let _ = remove_intent_under_latch(&core, K, None, t2, RemovalMode::Discard, &wrong);
+        });
+        #[cfg(not(debug_assertions))]
+        assert!(matches!(
+            remove_intent_under_latch(&core, K, None, t2, RemovalMode::Discard, &wrong),
+            Err(TxnError::Invariant(_))
+        ));
+    }
+    assert!(raw_intent(&core, K).is_some(), "nothing removed");
+    assert_eq!(some(core.status.entry(t2)).intent_count, 1);
+
+    // A deferrable entry must be removed under the prefix's latch (§5.0): a
+    // guard on the entry key itself is the wrong latch.
+    let entry_key = b"/i/3/ab\x00pk1";
+    place(
+        &core,
+        entry_key,
+        t2,
+        vec![layer(2, write(b"dup"), RowLockMode::NoKeyUpdate)],
+    );
+    {
+        let wrong = core.latches.lock(entry_key); // the entry, not the prefix
+        #[cfg(debug_assertions)]
+        assert_panics(|| {
+            let _ = remove_intent_under_latch(
+                &core,
+                entry_key,
+                Some(b"/i/3/ab"),
+                t2,
+                RemovalMode::Discard,
+                &wrong,
+            );
+        });
+        #[cfg(not(debug_assertions))]
+        assert!(matches!(
+            remove_intent_under_latch(
+                &core,
+                entry_key,
+                Some(b"/i/3/ab"),
+                t2,
+                RemovalMode::Discard,
+                &wrong
+            ),
+            Err(TxnError::Invariant(_))
+        ));
+    }
+    assert!(raw_intent(&core, entry_key).is_some(), "nothing removed");
+    assert_eq!(
+        some(core.status.entry(t2)).intent_count,
+        2,
+        "two placements, no removal"
+    );
 }

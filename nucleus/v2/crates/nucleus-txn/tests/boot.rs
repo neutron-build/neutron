@@ -2,7 +2,7 @@
 //! epoch handling, and the older-epoch intent rule. Over MemKv flat and LSM
 //! mode.
 
-use nucleus_kv::{Batch, Durability, MemKv, OrderedKv, Snapshot};
+use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::encoding::{
     encode_intent, intent_key, sys_epoch_key, sys_gc_w_key, sys_ts_hwm_key, sys_txn_key,
@@ -26,7 +26,12 @@ fn kv_modes() -> [(&'static str, KvMaker); 2] {
     [("flat", MemKv::new as fn() -> MemKv), ("lsm", MemKv::lsm)]
 }
 
-fn put(kv: &MemKv, ops: Vec<nucleus_kv::Op>) {
+fn put(core: &Core<MemKv>, ops: Vec<nucleus_kv::Op>) {
+    ok(core.write(Batch { ops }, Durability::No));
+}
+
+/// Writes before `Core::open` (hand-built system state), on the raw store.
+fn put_kv(kv: &MemKv, ops: Vec<nucleus_kv::Op>) {
     ok(kv.write(Batch { ops }, Durability::No));
 }
 
@@ -36,7 +41,7 @@ fn fresh_store_starts_at_epoch_one() {
         let core = ok(Core::open(make()));
         assert_eq!(core.epoch(), 1, "{mode}: epoch");
         assert_eq!(core.visible_ts(), Ts(0), "{mode}: visible_ts");
-        assert_eq!(core.registry.w(), Ts(0), "{mode}: W");
+        assert_eq!(core.registry.published_w(), Ts(0), "{mode}: W");
         assert_eq!(core.registry.sweep_counter(), None, "{mode}: sweep");
         assert_eq!(core.registry.min_view_counter(), u64::MAX, "{mode}: views");
         let a = core.status.begin();
@@ -55,7 +60,7 @@ fn reopen_after_hand_written_commits() {
     for (mode, make) in kv_modes() {
         let kv = make();
         // epoch 3, commits at ts 5 and 7, ts_hwm 7, gc_w 4.
-        put(
+        put_kv(
             &kv,
             vec![
                 nucleus_kv::Op::Put(sys_epoch_key(), 3u32.to_be_bytes().to_vec()),
@@ -74,7 +79,7 @@ fn reopen_after_hand_written_commits() {
         let core = ok(Core::open(kv));
         assert_eq!(core.epoch(), 4, "{mode}: epoch bumped by one");
         assert_eq!(core.visible_ts(), Ts(7), "{mode}: visible_ts == ts_hwm");
-        assert_eq!(core.registry.w(), Ts(4), "{mode}: W loaded");
+        assert_eq!(core.registry.published_w(), Ts(4), "{mode}: W loaded");
         assert_eq!(
             core.status.lookup_remembered(TxnId { epoch: 1, n: 1 }),
             Remembered::Live(TxnStatus::Committed(Ts(5)), 0),
@@ -86,15 +91,15 @@ fn reopen_after_hand_written_commits() {
             "{mode}: second record loaded"
         );
         // The new epoch is persisted durably before anything else.
-        let snap = core.kv.snapshot();
+        let view = core.open_view();
         assert_eq!(
-            ok(snap.get(&sys_epoch_key())),
+            ok(view.get(&sys_epoch_key())),
             Some(4u32.to_be_bytes().to_vec()),
             "{mode}: /sys/epoch persisted"
         );
+        drop(view);
         // A third open bumps again.
-        let kv = core.kv;
-        let core = ok(Core::open(kv));
+        let core = ok(Core::open(core.into_kv()));
         assert_eq!(core.epoch(), 5);
     }
 }
@@ -114,7 +119,7 @@ fn older_epoch_intent_without_record_reads_as_aborted() {
         })
         .unwrap_or_default();
         put(
-            &core.kv,
+            &core,
             vec![
                 nucleus_kv::Op::Put(
                     intent_key(b"/t/1/r"),
@@ -159,7 +164,7 @@ fn older_epoch_intent_without_record_reads_as_aborted() {
 fn corrupt_system_state_is_an_error_not_a_panic() {
     // Bad /sys/epoch length.
     let kv = MemKv::new();
-    put(
+    put_kv(
         &kv,
         vec![nucleus_kv::Op::Put(sys_epoch_key(), vec![1, 2, 3])],
     );
@@ -169,7 +174,7 @@ fn corrupt_system_state_is_an_error_not_a_panic() {
     ));
     // Record from a future epoch.
     let kv = MemKv::new();
-    put(
+    put_kv(
         &kv,
         vec![
             nucleus_kv::Op::Put(sys_epoch_key(), 3u32.to_be_bytes().to_vec()),
@@ -183,7 +188,7 @@ fn corrupt_system_state_is_an_error_not_a_panic() {
     assert!(matches!(Core::open(kv), Err(TxnError::Corrupt(_))));
     // Record above ts_hwm.
     let kv = MemKv::new();
-    put(
+    put_kv(
         &kv,
         vec![
             nucleus_kv::Op::Put(sys_epoch_key(), 3u32.to_be_bytes().to_vec()),
@@ -197,7 +202,7 @@ fn corrupt_system_state_is_an_error_not_a_panic() {
     assert!(matches!(Core::open(kv), Err(TxnError::Corrupt(_))));
     // Record at ts 0 (never a commit ts).
     let kv = MemKv::new();
-    put(
+    put_kv(
         &kv,
         vec![
             nucleus_kv::Op::Put(sys_epoch_key(), 3u32.to_be_bytes().to_vec()),
@@ -211,7 +216,7 @@ fn corrupt_system_state_is_an_error_not_a_panic() {
     assert!(matches!(Core::open(kv), Err(TxnError::Corrupt(_))));
     // Garbage in the /sys/txn/ range.
     let kv = MemKv::new();
-    put(
+    put_kv(
         &kv,
         vec![nucleus_kv::Op::Put(b"/sys/txn/x".to_vec(), vec![0; 8])],
     );
@@ -236,7 +241,8 @@ fn epoch_increment_is_synced_before_boot_continues() {
     let kv = Fault::new(MemKv::new(), || Ok(MemKv::new()));
     let core = ok(Core::open(kv));
     assert_eq!(core.epoch(), 1);
-    ok(core.kv.crash(0));
-    let core = ok(Core::open(core.kv));
+    let kv = core.into_kv();
+    ok(kv.crash(0));
+    let core = ok(Core::open(kv));
     assert_eq!(core.epoch(), 2, "epoch 1 survived the crash");
 }
