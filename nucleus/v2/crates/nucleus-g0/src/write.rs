@@ -21,8 +21,9 @@
 //!   latch (seed 46) can slip between the two reads; the waiter then records the
 //!   post-bump generation and parks on a holder that no longer conflicts (I-LIVE a/c).
 //! - `SecPlace`/`SecGrant` write the intent / record the shared lock under the same
-//!   latch. A placement without the latch (seed 4) fuses the whole iteration and can land
-//!   inside another txn's read→write window, clobbering its intent (I-COUNT/I-ONE-INTENT).
+//!   latch. A placement without the latch (seed 4) releases it after `SecRead`, so a
+//!   second txn's `SecRead` can find no intent and both place, clobbering one intent
+//!   (I-COUNT/I-ONE-INTENT).
 //! - The deferrable commit check (§5.3 timing 3) is `DefScan` (take the prefix latch,
 //!   read the `/i/` entries) then `DefLook` (status lookups and verdict, still latched).
 //!   A `/i/` removal latched on the entry key (seed 25) plus a truncation can slip
@@ -1531,8 +1532,8 @@ impl WriteModel {
     }
 
     /// Build and write the new top layer (§2.1), update the logs and the count, and
-    /// record the ghost net effect. `SecPlace` runs this under the held latch; the
-    /// seed-4 fused path and the seed-47 EPQ path run it without one.
+    /// record the ghost net effect. `SecPlace` runs this under the held latch (seed 4:
+    /// after releasing it); the seed-12 and seed-47 paths run it fused.
     fn do_place(&self, s: &mut State, w: u8) {
         let op = s.cur_op(w);
         let key = op_key(op).unwrap_or(LKey::T0);
@@ -1790,7 +1791,7 @@ impl WriteModel {
 
     // ---- the §5.1 latch section ----
 
-    /// One §5.1 iteration for `w`'s current op: take `latch_key(k)` (seed 4: none),
+    /// One §5.1 iteration for `w`'s current op: take `latch_key(k)`,
     /// run the foreign-intent block, read the shared-lock table, and decide.
     fn do_sec_read(&self, s: &mut State, w: u8) -> Spin {
         let op = s.cur_op(w);
@@ -1799,10 +1800,7 @@ impl WriteModel {
         }
         let key = op_key(op).unwrap_or(LKey::T0);
         let lk = lk_of(key);
-        let bare = self.bug == Some(Bug::PlaceWithoutLatch);
-        if !bare {
-            s.latch.push((lk, w));
-        }
+        s.latch.push((lk, w));
         let m = req_mode(op);
         // 1. Foreign intent (§5.1).
         let foreign = s.slot(key).intent.clone();
@@ -1813,6 +1811,7 @@ impl WriteModel {
                 if self.foreign_ended(s, owner) {
                     if self.bug == Some(Bug::OverwriteForeignEnded) {
                         // Seed 12: place without removing first.
+                        unlatch(s, w);
                         self.do_place(s, w);
                         return Spin::Done;
                     }
@@ -1824,9 +1823,7 @@ impl WriteModel {
                     if committed_visible {
                         s.txns[w as usize].observing |= 1 << owner;
                     }
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     return Spin::Retry; // `continue`
                 }
                 // R3W-8: no wait on a lock-only intent over a live row.
@@ -1834,9 +1831,7 @@ impl WriteModel {
                     && top.data == Data::Absent
                     && matches!(s.committed_state(key), Some((_, VerData::Live { .. })))
                 {
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     self.do_fail(s, w); // 23505
                     return Spin::Done;
                 }
@@ -1846,9 +1841,7 @@ impl WriteModel {
                     s.txns[w as usize].wait_kind = EdgeKind::Key(key, m);
                     s.txns[w as usize].wait_cc = false;
                     s.txns[w as usize].phase = Phase::WaitReg;
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     return Spin::Mid;
                 }
                 // Non-conflicting foreign intent (e.g. KEY SHARE vs NO KEY UPDATE).
@@ -1869,9 +1862,7 @@ impl WriteModel {
                     s.txns[w as usize].epq_n = vers;
                     s.txns[w as usize].epq_count += 1;
                     s.txns[w as usize].phase = Phase::Epq;
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     return Spin::Retry;
                 }
             }
@@ -1891,10 +1882,10 @@ impl WriteModel {
             return Spin::Mid; // the latch stays held
         }
         // 3. Decide (unique check / §5.4 / newer-version rule) and dispatch.
-        self.sec_decide(s, w, bare)
+        self.sec_decide(s, w)
     }
 
-    fn sec_decide(&self, s: &mut State, w: u8, bare: bool) -> Spin {
+    fn sec_decide(&self, s: &mut State, w: u8) -> Spin {
         let op = s.cur_op(w);
         let key = op_key(op).unwrap_or(LKey::T0);
         let seq0 = s.txns[w as usize].seq0;
@@ -1913,24 +1904,20 @@ impl WriteModel {
             if is_data_row_op(op) {
                 if top.dseq == seq0 {
                     // Revisit in the same statement: skip the row.
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     self.advance_op(s, w);
                     return Spin::Done;
                 }
                 if top.dseq > seq0 {
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     self.do_fail(s, w); // 27000
                     return Spin::Done;
                 }
-                return self.dispatch_place(s, w, bare);
+                return self.dispatch_place(s, w);
             }
             if !is_key_exist(op) {
                 // A lock-only request on the own intent builds a new layer.
-                return self.dispatch_place(s, w, bare);
+                return self.dispatch_place(s, w);
             }
             // A key-existence op always runs the unique check, own intent or not.
         }
@@ -1958,9 +1945,7 @@ impl WriteModel {
                         VerData::Live { kc, .. } => *kc,
                     });
                     if bad {
-                        if !bare {
-                            unlatch(s, w);
-                        }
+                        unlatch(s, w);
                         self.do_fail(s, w); // 40001
                         return Spin::Done;
                     }
@@ -1968,7 +1953,7 @@ impl WriteModel {
                 } else {
                     // RC: EPQ (§5.2), unlatched. The mutant skips it for updates.
                     if self.mutant == Some(Mutant::RcUpdateSkipsEpq) && is_data_row_op(op) {
-                        return self.dispatch_place(s, w, bare);
+                        return self.dispatch_place(s, w);
                     }
                     let snap = s.txns[w as usize].snap.unwrap_or(s.visible_ts);
                     let vers: Vec<(Ts, VerData)> = if matches!(op, Op::KeyShare { .. }) {
@@ -1991,9 +1976,7 @@ impl WriteModel {
                     s.txns[w as usize].epq_n = vers;
                     s.txns[w as usize].epq_count += 1;
                     s.txns[w as usize].phase = Phase::Epq;
-                    if !bare {
-                        unlatch(s, w);
-                    }
+                    unlatch(s, w);
                     return if repeat { Spin::Retry } else { Spin::Mid };
                 }
             }
@@ -2018,41 +2001,32 @@ impl WriteModel {
                 }
             };
             if live {
-                if !bare {
-                    unlatch(s, w);
-                }
+                unlatch(s, w);
                 self.do_fail(s, w); // 23505
                 return Spin::Done;
             }
         }
         if matches!(op, Op::KeyShare { .. }) {
-            self.dispatch_grant(s, w, bare)
+            self.dispatch_grant(s, w)
         } else {
-            self.dispatch_place(s, w, bare)
+            self.dispatch_place(s, w)
         }
     }
 
-    /// Place under the held latch (`SecPlace`), or fused without one (seed 4's bare
-    /// path; nothing holds the latch for it, so the write can land inside another
-    /// txn's read->write window).
-    fn dispatch_place(&self, s: &mut State, w: u8, bare: bool) -> Spin {
-        if bare {
-            self.do_place(s, w);
-            Spin::Done
-        } else {
-            s.txns[w as usize].phase = Phase::SecPlace;
-            Spin::Mid
+    /// Place under the held latch (`SecPlace`). Seed 4 releases the latch before the
+    /// placement, so another txn's latch section can run between this section's read
+    /// and its write.
+    fn dispatch_place(&self, s: &mut State, w: u8) -> Spin {
+        if self.bug == Some(Bug::PlaceWithoutLatch) {
+            unlatch(s, w);
         }
+        s.txns[w as usize].phase = Phase::SecPlace;
+        Spin::Mid
     }
 
-    fn dispatch_grant(&self, s: &mut State, w: u8, bare: bool) -> Spin {
-        if bare {
-            self.do_grant(s, w);
-            Spin::Done
-        } else {
-            s.txns[w as usize].phase = Phase::SecGrant;
-            Spin::Mid
-        }
+    fn dispatch_grant(&self, s: &mut State, w: u8) -> Spin {
+        s.txns[w as usize].phase = Phase::SecGrant;
+        Spin::Mid
     }
 
     fn do_rel_lock(&self, s: &mut State, w: u8, excl: bool) -> Spin {
@@ -2523,8 +2497,7 @@ impl Model for WriteModel {
                     }
                     op => {
                         let key = op_key(op).unwrap_or(LKey::T0);
-                        let bare = self.bug == Some(Bug::PlaceWithoutLatch);
-                        if bare || matches!(op, Op::RelLock { .. }) || latch_free(s, lk_of(key)) {
+                        if matches!(op, Op::RelLock { .. }) || latch_free(s, lk_of(key)) {
                             out.push(Action::SecRead(w));
                         }
                     }
