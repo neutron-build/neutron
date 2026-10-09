@@ -15,7 +15,9 @@
 //!   wakes every waiter and each re-tries.
 //! - **Advisory locks** are xact scope only (§6; session scope is §12 Q5).
 //!   Exclusive conflicts with any other txn's lock on the key; shared
-//!   conflicts only with exclusive. Re-entrant per txn.
+//!   conflicts only with exclusive. Re-entrant per txn: a txn holds a
+//!   key/mode once until txn end or `ROLLBACK TO`, however often it takes
+//!   it (there is no unlock in xact scope, so no counter).
 //! - Conflict checks ignore ended holders (§6): a holder that is Aborted
 //!   or a visible commit never conflicts, even before its release ran; a
 //!   missing status means ended (§4). A committed-but-not-visible holder
@@ -259,13 +261,13 @@ struct RelAcquisition {
     seq: Seq,
 }
 
-/// One advisory-lock entry per `(key, txn, shared)`: the re-entrancy
-/// counter and the txn's seq when first taken (§6).
+/// One advisory-lock entry per `(key, txn, shared)`: the txn's seq when
+/// first taken (§6). Re-taking it adds nothing: xact-scope locks have no
+/// unlock, so they are held once until txn end or `ROLLBACK TO`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AdvEntry {
     txn: TxnId,
     shared: bool,
-    count: u32,
     seq: Seq,
 }
 
@@ -396,8 +398,7 @@ impl LockManager {
     /// (transaction scope only; session scope is §12 Q5). Exclusive
     /// (`shared = false`) conflicts with any other txn's lock on `key`;
     /// shared conflicts only with another txn's exclusive. Re-entrant per
-    /// txn: a second acquisition of the same txn and mode bumps a counter
-    /// and keeps the older seq. `Ok(true)`: acquired. `Ok(false)`:
+    /// txn: re-taking a held key/mode is a no-op that keeps the older seq. `Ok(true)`: acquired. `Ok(false)`:
     /// [`LockWait::NoWait`] or [`LockWait::SkipLocked`] found a conflict
     /// (the `pg_try_advisory_xact_lock` form — advisory NOWAIT skips
     /// instead of erroring). Block parks through the wait-for graph,
@@ -415,12 +416,13 @@ impl LockManager {
         loop {
             let blockers = {
                 let mut adv = self.lock_advisory();
-                if let Some(e) = adv.get_mut(&key) {
-                    if let Some(e) = e.iter_mut().find(|e| e.txn == txn.id && e.shared == shared) {
-                        // Re-entrant: a counter, keeping the older seq.
-                        e.count = e.count.saturating_add(1);
-                        return Ok(true);
-                    }
+                if adv
+                    .get(&key)
+                    .is_some_and(|es| es.iter().any(|e| e.txn == txn.id && e.shared == shared))
+                {
+                    // Re-entrant: already held in this mode; keep the
+                    // older seq.
+                    return Ok(true);
                 }
                 let mut blockers: Vec<(TxnId, u64)> = Vec::new();
                 if let Some(entries) = adv.get(&key) {
@@ -445,7 +447,6 @@ impl LockManager {
                     adv.entry(key).or_default().push(AdvEntry {
                         txn: txn.id,
                         shared,
-                        count: 1,
                         seq: txn.seq(),
                     });
                     return Ok(true);
@@ -542,5 +543,135 @@ fn map_wait(o: WaitOutcome) -> Result<(), TxnError> {
         WaitOutcome::LockTimeout => Err(TxnError::LockNotAvailable),
         WaitOutcome::Ended | WaitOutcome::Aborted | WaitOutcome::Committed(_) => Ok(()),
         WaitOutcome::GenChanged => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Table internals the public API cannot observe: the per-txn index
+    //! of the row table is emptied, re-taking an advisory lock adds no
+    //! entry, and a holder with no status entry (§4: ended and released)
+    //! never conflicts.
+
+    use std::sync::Arc;
+
+    use nucleus_kv::MemKv;
+
+    use super::{LockManager, RelAcquisition, RelLockMode, RowLockTable};
+    use crate::boot::Core;
+    use crate::txn::Isolation;
+    use crate::write::{LockWait, RowLocks};
+    use crate::{RowLockMode, TxnId};
+
+    fn core() -> Arc<Core<MemKv>> {
+        match Core::open(MemKv::new()) {
+            Ok(c) => Arc::new(c),
+            Err(e) => panic!("core: {e:?}"),
+        }
+    }
+
+    fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    /// Releasing a txn's last acquisition removes its per-txn index entry.
+    /// Mutant: the empty `by_txn` entry is never removed.
+    #[test]
+    fn row_table_release_empties_the_txn_index() {
+        let t = RowLockTable::new();
+        let x = TxnId { epoch: 1, n: 7 };
+        ok(t.grant(b"k1", x, RowLockMode::KeyShare, 1, None));
+        ok(t.grant(b"k2", x, RowLockMode::Share, 2, None));
+        t.release(b"k1", x, 0);
+        assert!(t.lock().by_txn.contains_key(&x), "x still holds k2");
+        t.release(b"k2", x, 0);
+        let inner = t.lock();
+        assert!(inner.by_txn.is_empty(), "no empty per-txn entry is kept");
+        assert!(inner.by_key.is_empty());
+    }
+
+    /// Re-taking a held advisory key/mode adds no entry (it keeps the
+    /// older seq); the other mode is a separate entry.
+    /// Mutant: the re-entrant early return removed (a duplicate entry).
+    #[test]
+    fn advisory_reacquire_adds_no_entry() {
+        let core = core();
+        let mgr = LockManager::install(&core);
+        let t = core.begin(Isolation::ReadCommitted);
+        for _ in 0..3 {
+            assert!(ok(mgr.advisory_xact_lock(
+                &core,
+                &t,
+                9,
+                true,
+                LockWait::NoWait,
+                None
+            )));
+        }
+        assert_eq!(mgr.lock_advisory().get(&9).map(Vec::len), Some(1));
+        assert!(ok(mgr.advisory_xact_lock(
+            &core,
+            &t,
+            9,
+            false,
+            LockWait::NoWait,
+            None
+        )));
+        assert_eq!(mgr.lock_advisory().get(&9).map(Vec::len), Some(2));
+        ok(core.abort(t));
+        assert!(mgr.lock_advisory().is_empty());
+    }
+
+    /// A holder whose status entry is gone (§4: a missing status means
+    /// ended and released) does not block a conflicting NOWAIT request,
+    /// relation or advisory. The entries are planted directly: no public
+    /// path leaves a lock behind a truncated status.
+    /// Mutant: a missing status counted as a live holder.
+    #[test]
+    fn missing_status_holder_never_blocks() {
+        let core = core();
+        let mgr = LockManager::install(&core);
+        let ghost = TxnId {
+            epoch: 1,
+            n: 1_000_000,
+        };
+        assert!(core.status.entry(ghost).is_none());
+        mgr.lock_relations()
+            .entry(4)
+            .or_default()
+            .push(RelAcquisition {
+                txn: ghost,
+                mode: RelLockMode::AccessExclusive,
+                seq: 0,
+            });
+        mgr.lock_advisory()
+            .entry(4)
+            .or_default()
+            .push(super::AdvEntry {
+                txn: ghost,
+                shared: false,
+                seq: 0,
+            });
+        let u = core.begin(Isolation::ReadCommitted);
+        assert!(ok(mgr.lock_relation(
+            &core,
+            &u,
+            4,
+            RelLockMode::AccessExclusive,
+            LockWait::NoWait,
+            None
+        )));
+        assert!(ok(mgr.advisory_xact_lock(
+            &core,
+            &u,
+            4,
+            false,
+            LockWait::NoWait,
+            None
+        )));
+        ok(core.abort(u));
     }
 }

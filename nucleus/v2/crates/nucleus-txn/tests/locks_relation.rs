@@ -12,11 +12,14 @@ mod locks_support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use locks_support::{ok, InfiniteParkers, Rig};
-use nucleus_txn::locks::RelLockMode;
-use nucleus_txn::txn::Isolation;
+use locks_support::{hold_latch, lock_row, not_within_200ms, ok, upd, InfiniteParkers, Rig};
+use nucleus_txn::commit::SyncCommit;
+use nucleus_txn::locks::{LockManager, RelLockMode};
+use nucleus_txn::resolver::Resolver;
+use nucleus_txn::status::StatusEntry;
+use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::write::LockWait;
-use nucleus_txn::TxnError;
+use nucleus_txn::{RowLockMode, TxnError, TxnStatus};
 
 /// Acquire, NOWAIT (55P03), SKIP LOCKED (`Ok(false)`), a blocking wait
 /// released by abort within 100 ms, compatible holders, and `lock_timeout`
@@ -380,8 +383,9 @@ fn advisory_conflicts_reentrancy_and_release_at_txn_end() {
 /// savepoint), takes AccessExclusive and an advisory lock after the
 /// savepoint; U blocks on both; `rollback_to(s)` wakes U within 100 ms,
 /// U gets the locks, and T still holds AccessShare.
-/// Mutants: `release_from` no-op (U never wakes); drops seq < s too (the
-/// AccessShare probe below acquires); no wake (rollback_to's bump_and_wake
+/// Mutants: `release_from` no-op (U never wakes); drops seq < s too, for
+/// relations or advisory locks (the AccessShare probe, or the advisory
+/// probe on key 41, below acquires); no wake (rollback_to's bump_and_wake
 /// removed — U stays parked).
 #[test]
 fn rollback_to_releases_relation_and_advisory_locks() {
@@ -398,6 +402,15 @@ fn rollback_to_releases_relation_and_advisory_locks() {
         RelLockMode::AccessShare,
         LockWait::Block,
         None,
+    )));
+    // An advisory lock taken before the savepoint, too: it must survive.
+    assert!(ok(rig.locks.advisory_xact_lock(
+        &rig.core,
+        &t,
+        41,
+        false,
+        LockWait::Block,
+        None
     )));
     let s = ok(t.savepoint());
     // After the savepoint: AccessExclusive on another relation and an
@@ -477,6 +490,12 @@ fn rollback_to_releases_relation_and_advisory_locks() {
         Err(TxnError::LockNotAvailable),
         "T still holds its pre-savepoint AccessShare"
     );
+    assert!(
+        !ok(rig
+            .locks
+            .advisory_xact_lock(&rig.core, &w, 41, false, LockWait::NoWait, None)),
+        "T still holds its pre-savepoint advisory lock"
+    );
     ok(rig.core.abort(t));
     assert!(
         ok(rig.locks.lock_relation(
@@ -490,4 +509,232 @@ fn rollback_to_releases_relation_and_advisory_locks() {
         "the AccessShare died with the txn"
     );
     ok(rig.core.abort(w));
+}
+
+/// A txn's own locks never conflict with its own requests: T holds
+/// AccessShare and takes AccessExclusive with NOWAIT at once.
+/// Mutant: the own-holder skip removed (T's AccessShare blocks its own
+/// AccessExclusive: 55P03).
+#[test]
+fn relation_own_lock_never_conflicts() {
+    let rig = Rig::new();
+    let t = rig.txn(Isolation::ReadCommitted);
+    assert!(ok(rig.locks.lock_relation(
+        &rig.core,
+        &t,
+        8,
+        RelLockMode::AccessShare,
+        LockWait::NoWait,
+        None,
+    )));
+    assert_eq!(
+        rig.locks.lock_relation(
+            &rig.core,
+            &t,
+            8,
+            RelLockMode::AccessExclusive,
+            LockWait::NoWait,
+            None,
+        ),
+        Ok(true),
+        "T's own AccessShare does not block its AccessExclusive"
+    );
+    ok(rig.core.abort(t));
+}
+
+/// An upgrade records the stronger mode: T holds AccessShare and takes
+/// AccessExclusive; another txn's NOWAIT AccessShare then fails.
+/// Mutant: re-acquisition matches any held mode (the upgrade returns
+/// `Ok(true)` without recording AccessExclusive, so the probe acquires).
+#[test]
+fn relation_upgrade_records_the_stronger_mode() {
+    let rig = Rig::new();
+    let t = rig.txn(Isolation::ReadCommitted);
+    assert!(ok(rig.locks.lock_relation(
+        &rig.core,
+        &t,
+        8,
+        RelLockMode::AccessShare,
+        LockWait::NoWait,
+        None,
+    )));
+    assert!(ok(rig.locks.lock_relation(
+        &rig.core,
+        &t,
+        8,
+        RelLockMode::AccessExclusive,
+        LockWait::NoWait,
+        None,
+    )));
+    let u = rig.txn(Isolation::ReadCommitted);
+    assert_eq!(
+        rig.locks.lock_relation(
+            &rig.core,
+            &u,
+            8,
+            RelLockMode::AccessShare,
+            LockWait::NoWait,
+            None,
+        ),
+        Err(TxnError::LockNotAvailable),
+        "T's AccessExclusive blocks another txn's AccessShare"
+    );
+    ok(rig.core.abort(u));
+    ok(rig.core.abort(t));
+}
+
+/// NOWAIT probes, relation (RowShare vs a held Exclusive) and advisory
+/// (exclusive vs a held exclusive), on `rel` / `key`: both acquire.
+fn probes_acquire(locks: &LockManager, rig: &Rig, rel: u64, key: i64, why: &str) {
+    let u = rig.txn(Isolation::ReadCommitted);
+    assert_eq!(
+        locks.lock_relation(
+            &rig.core,
+            &u,
+            rel,
+            RelLockMode::RowShare,
+            LockWait::NoWait,
+            None
+        ),
+        Ok(true),
+        "relation: {why}"
+    );
+    assert_eq!(
+        locks.advisory_xact_lock(&rig.core, &u, key, false, LockWait::NoWait, None),
+        Ok(true),
+        "advisory: {why}"
+    );
+    ok(rig.core.abort(u));
+}
+
+/// Takes, for `h`, a KEY SHARE on `latch_key` (its release needs that
+/// key's latch), relation `rel` in Exclusive and advisory `key` exclusive.
+fn hold_all(rig: &Rig, h: &Txn, latch_key: &[u8], rel: u64, key: i64) {
+    let s = ok(h.next_seq());
+    lock_row(&rig.core, h, s, latch_key, RowLockMode::KeyShare);
+    assert!(ok(rig.locks.lock_relation(
+        &rig.core,
+        h,
+        rel,
+        RelLockMode::Exclusive,
+        LockWait::NoWait,
+        None,
+    )));
+    assert!(ok(rig.locks.advisory_xact_lock(
+        &rig.core,
+        h,
+        key,
+        false,
+        LockWait::NoWait,
+        None
+    )));
+}
+
+/// §6: an ended holder never conflicts, even before its release ran. The
+/// holder also holds a KEY SHARE on a key whose latch the test holds, so
+/// its release (row locks first, under the latch, then `release_all`)
+/// stalls with the relation and advisory entries still in their tables.
+/// (a) Aborted: `abort` set Aborted, `release_all` has not run.
+/// (b) A visible commit: step 4 acked, step 5 has not run.
+/// In both, a conflicting NOWAIT relation request and a NOWAIT advisory
+/// request acquire. (A holder with no status entry is the unit test
+/// `locks::tests::missing_status_holder_never_blocks`: no public path
+/// leaves a lock behind a truncated status.)
+/// Mutants: Aborted holders conflict; visible-committed holders conflict.
+#[test]
+fn ended_holders_never_block_relation_or_advisory() {
+    let mut rig = Rig::new();
+    rig.preload(b"/t/1/la", b"v");
+    rig.preload(b"/t/1/lc", b"v");
+    rig.preload(b"/t/1/w", b"v");
+    let locks = Arc::clone(&rig.locks);
+
+    // (a) Aborted, release_all not yet run.
+    {
+        let h = rig.txn(Isolation::ReadCommitted);
+        hold_all(&rig, &h, b"/t/1/la", 20, 200);
+        let h_id = h.id;
+        let latch = hold_latch(&rig.core, b"/t/1/la");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        {
+            let core = Arc::clone(&rig.core);
+            std::thread::spawn(move || {
+                let _ = core.abort(h);
+                let _ = tx.send(());
+            });
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !matches!(
+            rig.core.status.entry(h_id),
+            Some(StatusEntry {
+                status: TxnStatus::Aborted,
+                ..
+            })
+        ) {
+            assert!(Instant::now() < deadline, "abort set Aborted");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        probes_acquire(
+            &locks,
+            &rig,
+            20,
+            200,
+            "an Aborted holder never conflicts, even before release_all ran",
+        );
+        not_within_200ms(&rx);
+        latch.release();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "abort finished after the latch was released"
+        );
+    }
+
+    // (b) A visible commit before step 5.
+    {
+        let c = rig.txn(Isolation::ReadCommitted);
+        hold_all(&rig, &c, b"/t/1/lc", 21, 201);
+        // A write keeps the commit off the no-write fast path.
+        let sw = ok(c.next_seq());
+        upd(&rig.core, &c, sw, b"/t/1/w", b"w");
+        let c_id = c.id;
+        let ticket = ok(rig.core.commit_submit(c, SyncCommit::On));
+        let latch = hold_latch(&rig.core, b"/t/1/lc");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        {
+            let pipeline = Arc::clone(&rig.pipeline);
+            std::thread::spawn(move || {
+                let mut p = pipeline.lock().expect("pipeline");
+                let group = p.drain_available();
+                p.process_group(group);
+                drop(p);
+                let _ = tx.send(());
+            });
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while ticket.try_ack().is_none() {
+            assert!(Instant::now() < deadline, "step 4 acked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            rig.core.status.entry(c_id),
+            Some(StatusEntry {
+                status: TxnStatus::Committed(_),
+                ..
+            })
+        ));
+        probes_acquire(
+            &locks,
+            &rig,
+            21,
+            201,
+            "a visible-committed holder never conflicts, even before step 5 ran",
+        );
+        not_within_200ms(&rx);
+        latch.release();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "step 5 finished after the latch was released"
+        );
+        ok(Resolver::run_once(&rig.core));
+    }
 }

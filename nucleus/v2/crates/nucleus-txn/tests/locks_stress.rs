@@ -1,13 +1,16 @@
-//! C-T2b stress test (§6): 8 real threads, 6 keys, one relation; each txn
-//! takes the relation lock first (a random mode), then locks 2-3 keys in
-//! random order with a random mix of UPDATE, `FOR SHARE` and
-//! `FOR KEY SHARE`, and commits or aborts at random; `deadlock_timeout`
-//! is 20 ms and every 40P01 aborts and retries. Row waits run through a
-//! test-side wrapper of the step API (`wait_begin` / park / `wait_poll` /
-//! `wait_deadlock_check` / `wait_end`) that captures `wait_edges()`
-//! **before** each deadlock check, so every recorded 40P01 victim is
-//! verifiably on a cycle of the current edges — never a flag the code
-//! sets. Afterwards: no edge, no row/relation/advisory lock left (the
+//! C-T2b stress test (§6): 8 real threads, 6 keys, 2 relations, 6
+//! advisory keys; each txn locks 2-3 keys in random order with a random
+//! mix of UPDATE, `FOR SHARE` and `FOR KEY SHARE`, takes one relation lock
+//! (random relation and mode) at a random position among those ops and one advisory
+//! lock (random key, shared or exclusive) at another random position, and
+//! commits or aborts at random; `deadlock_timeout` is 20 ms and every
+//! 40P01 aborts. Row waits run through a test-side wrapper of the step
+//! API (`wait_begin` / park / `wait_poll` / `wait_deadlock_check` /
+//! `wait_end`) whose deadlock check returns the edges it ran over, so
+//! every 40P01 a row waiter records is verifiably on a cycle of those
+//! edges (re-derived test-side) — never a flag the code sets. Relation and advisory
+//! waits go through the blocking drivers, so cycles mix all three kinds.
+//! Afterwards: no edge, no slot, no row/relation/advisory lock left (the
 //! wait-hook's start/end counts balance, so every blocking wait returned
 //! and unregistered), no thread hangs, at least 1000 txns, under 20 s.
 
@@ -35,7 +38,19 @@ const TXNS_PER_THREAD: usize = 150; // 8 * 150 = 1200 >= 1000
 const KEYS: [&[u8]; 6] = [
     b"/t/1/k0", b"/t/1/k1", b"/t/1/k2", b"/t/1/k3", b"/t/1/k4", b"/t/1/k5",
 ];
-const REL: u64 = 77;
+const RELS: [u64; 2] = [77, 78];
+const ADV_KEYS: [i64; 6] = [1, 2, 3, 4, 5, 6];
+
+/// One lock step of a stress txn.
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    /// A row op on `KEYS[i]` (its kind is drawn when it runs).
+    Row(usize),
+    /// A relation lock on this relation, in this mode.
+    Rel(u64, RelLockMode),
+    /// An advisory lock on this key, shared or exclusive.
+    Adv(i64, bool),
+}
 const DEADLOCK_TIMEOUT: Duration = Duration::from_millis(20);
 /// One park slice of the wrapper's loop: short enough that the deadlock
 /// check fires on time, long enough that wakes (unparks) dominate.
@@ -86,13 +101,12 @@ fn on_cycle(edges: &[(TxnId, TxnId)], w: TxnId) -> bool {
     false
 }
 
-/// Every 40P01 victim with the `wait_edges()` snapshot captured inside
-/// (right before) its deadlock check.
+/// Every row-wait 40P01 victim with the edges its deadlock check ran over.
 type Victims = Mutex<Vec<(TxnId, Vec<(TxnId, TxnId)>)>>;
 
 /// The test-side wrapper of the §6 wait steps: begin, park in short
-/// slices, poll, run the deadlock check once after `deadlock_timeout`
-/// (capturing `wait_edges()` first), end. Returns the driver-style
+/// slices, poll, run the (traced) deadlock check once after
+/// `deadlock_timeout`, end. Returns the driver-style
 /// mapping: cancel 57014, deadlock 40P01; anything else retries.
 fn wait_steps(
     core: &Arc<Core<MemKv>>,
@@ -125,11 +139,11 @@ fn wait_steps(
         }
         if !checked && Instant::now() >= dl_at {
             checked = true;
-            // Capture the edges BEFORE the check (the check removes the
-            // victim's own edges): the victim must be on a cycle of the
-            // current edges, computed test-side, never from a code flag.
-            let edges = core.wait_edges();
-            if core.wait_deadlock_check(&h) {
+            // The traced check returns the exact edges its DFS ran over
+            // (a separate `wait_edges()` snapshot races with concurrent
+            // registrations): the victim must be on a cycle of them,
+            // re-derived test-side, never trusted from a code flag.
+            if let Some(edges) = core.wait_deadlock_check_traced(&h) {
                 assert!(
                     on_cycle(&edges, txn.id),
                     "a 40P01 victim was on a cycle of the captured edges"
@@ -216,6 +230,7 @@ fn stress_locks_deadlocks_and_no_leaks() {
 
     let victims: Arc<Victims> = Arc::new(Mutex::new(Vec::new()));
     let deadlocks = Arc::new(AtomicUsize::new(0));
+    let driver_deadlocks = Arc::new(AtomicUsize::new(0));
     let modes = [
         RelLockMode::AccessShare,
         RelLockMode::RowShare,
@@ -233,50 +248,62 @@ fn stress_locks_deadlocks_and_no_leaks() {
         let locks = Arc::clone(&locks);
         let victims = Arc::clone(&victims);
         let deadlocks = Arc::clone(&deadlocks);
+        let driver_deadlocks = Arc::clone(&driver_deadlocks);
         threads.push(std::thread::spawn(move || {
             let mut rng = Rng(tid as u64 * 2_654_435_761 + 12_345);
             let mut finished = 0usize;
             'txn: while finished < TXNS_PER_THREAD {
                 let txn = core.begin(Isolation::ReadCommitted);
-                // The relation lock first: no cycle can pass through a
-                // relation edge, so every deadlock victim below is a row
-                // waiter the wrapper observes (the card's record).
-                let mode = modes[rng.below(modes.len())];
-                if let Err(e) = locks.lock_relation(&core, &txn, REL, mode, LockWait::Block, None) {
-                    match e {
-                        TxnError::Deadlock => {
-                            deadlocks.fetch_add(1, Ordering::SeqCst);
-                            core.abort(txn).expect("victim abort");
-                            finished += 1;
-                            continue;
-                        }
-                        other => panic!("relation lock: {other:?}"),
-                    }
-                }
                 // 2-3 distinct keys in random order, random mix of UPDATE,
-                // FOR SHARE and FOR KEY SHARE.
+                // FOR SHARE and FOR KEY SHARE; the relation lock and one
+                // advisory lock each at a random position among them.
                 let mut idx: Vec<usize> = (0..KEYS.len()).collect();
                 for i in (1..idx.len()).rev() {
                     let j = rng.below(i + 1);
                     idx.swap(i, j);
                 }
                 let nkeys = 2 + rng.below(2);
-                for &k in &idx[..nkeys] {
-                    let op = match rng.below(3) {
-                        0 => RowOp::Update {
-                            value: b"s".to_vec(),
-                            key_cols_changed: false,
-                        },
-                        1 => RowOp::Lock(RowLockMode::Share),
-                        _ => RowOp::Lock(RowLockMode::KeyShare),
+                let mut ops: Vec<Op> = idx[..nkeys].iter().map(|&k| Op::Row(k)).collect();
+                let rel = RELS[rng.below(RELS.len())];
+                let mode = modes[rng.below(modes.len())];
+                let at = rng.below(ops.len() + 1);
+                ops.insert(at, Op::Rel(rel, mode));
+                let adv = ADV_KEYS[rng.below(ADV_KEYS.len())];
+                let shared = rng.below(2) == 0;
+                let at = rng.below(ops.len() + 1);
+                ops.insert(at, Op::Adv(adv, shared));
+                for op in ops {
+                    let r = match op {
+                        Op::Row(k) => {
+                            let op = match rng.below(3) {
+                                0 => RowOp::Update {
+                                    value: b"s".to_vec(),
+                                    key_cols_changed: false,
+                                },
+                                1 => RowOp::Lock(RowLockMode::Share),
+                                _ => RowOp::Lock(RowLockMode::KeyShare),
+                            };
+                            row_op_steps(&core, &txn, KEYS[k], op, &victims).map(|_| ())
+                        }
+                        Op::Rel(rel, mode) => locks
+                            .lock_relation(&core, &txn, rel, mode, LockWait::Block, None)
+                            .map(|got| assert!(got, "a blocking relation lock acquires")),
+                        Op::Adv(key, shared) => locks
+                            .advisory_xact_lock(&core, &txn, key, shared, LockWait::Block, None)
+                            .map(|got| assert!(got, "a blocking advisory lock acquires")),
                     };
-                    if let Err(TxnError::Deadlock) =
-                        row_op_steps(&core, &txn, KEYS[k], op, &victims)
-                    {
-                        deadlocks.fetch_add(1, Ordering::SeqCst);
-                        core.abort(txn).expect("victim abort");
-                        finished += 1;
-                        continue 'txn;
+                    match r {
+                        Ok(()) => {}
+                        Err(TxnError::Deadlock) => {
+                            deadlocks.fetch_add(1, Ordering::SeqCst);
+                            if !matches!(op, Op::Row(_)) {
+                                driver_deadlocks.fetch_add(1, Ordering::SeqCst);
+                            }
+                            core.abort(txn).expect("victim abort");
+                            finished += 1;
+                            continue 'txn;
+                        }
+                        Err(other) => panic!("{op:?}: {other:?}"),
                     }
                 }
                 if rng.below(2) == 0 {
@@ -305,6 +332,10 @@ fn stress_locks_deadlocks_and_no_leaks() {
         "the stress finished in {elapsed:?}"
     );
     let dl = deadlocks.load(Ordering::SeqCst);
+    eprintln!(
+        "STATS total={total} dl={dl} drv={} elapsed={elapsed:?}",
+        driver_deadlocks.load(Ordering::SeqCst)
+    );
     assert!(
         dl >= 1,
         "the workload produced at least one 40P01 (got {dl})"
@@ -315,6 +346,11 @@ fn stress_locks_deadlocks_and_no_leaks() {
         core.wait_edges().is_empty(),
         "no wait-for edge leaked: {:?}",
         core.wait_edges()
+    );
+    assert!(
+        core.wait_slots().is_empty(),
+        "no waiter slot leaked: {:?}",
+        core.wait_slots()
     );
     for k in KEYS {
         assert!(
@@ -343,7 +379,12 @@ fn stress_locks_deadlocks_and_no_leaks() {
     // deadlock check (re-checked over the recordings).
     {
         let v = victims.lock().expect("victims");
-        assert_eq!(v.len(), dl, "every 40P01 went through the wrapper");
+        let drv = driver_deadlocks.load(Ordering::SeqCst);
+        assert_eq!(
+            v.len(),
+            dl - drv,
+            "every row-wait 40P01 went through the wrapper"
+        );
         for (w, edges) in v.iter() {
             assert!(
                 on_cycle(edges, *w),
@@ -354,17 +395,19 @@ fn stress_locks_deadlocks_and_no_leaks() {
     // Behaviorally: a fresh txn can take everything (no live holder left).
     {
         let fresh = core.begin(Isolation::ReadCommitted);
-        assert!(locks
-            .lock_relation(
-                &core,
-                &fresh,
-                REL,
-                RelLockMode::AccessExclusive,
-                LockWait::NoWait,
-                None
-            )
-            .expect("relation probe"));
-        for key in [1i64, 3, 5] {
+        for rel in RELS {
+            assert!(locks
+                .lock_relation(
+                    &core,
+                    &fresh,
+                    rel,
+                    RelLockMode::AccessExclusive,
+                    LockWait::NoWait,
+                    None
+                )
+                .expect("relation probe"));
+        }
+        for key in ADV_KEYS {
             assert!(locks
                 .advisory_xact_lock(&core, &fresh, key, false, LockWait::NoWait, None)
                 .expect("advisory probe"));

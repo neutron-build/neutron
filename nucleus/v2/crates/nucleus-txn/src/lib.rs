@@ -42,7 +42,6 @@ pub mod gc;
 #[cfg(test)]
 mod internal_tests;
 pub mod latch;
-pub mod locks;
 pub mod read;
 pub mod registry;
 pub mod removal;
@@ -52,6 +51,10 @@ pub mod txn;
 pub mod visibility;
 pub mod wait;
 pub mod write;
+
+// C-T2b, appended at the end of the module list (a separate group, so
+// rustfmt does not sort it back in).
+pub mod locks;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

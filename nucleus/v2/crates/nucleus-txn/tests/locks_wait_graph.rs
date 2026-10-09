@@ -700,10 +700,11 @@ fn mixed_relation_row_two_cycle_exactly_one_40p01() {
 
 /// Two txns in opposite order on two keys with `deadlock_timeout` = 50 ms
 /// on real threads (a spawned commit thread processes their commits):
-/// exactly one driver returns 40P01 within 1 s, its session aborts, and
-/// the other's op completes and commits after the victim aborted.
-/// Mutant: two victims (both drivers return 40P01), or none (a hang past
-/// the 1 s bound).
+/// exactly one driver returns 40P01 within 400 ms, its session aborts,
+/// and the other's op completes and commits after the victim aborted.
+/// Mutants: two victims (both drivers return 40P01), or none (a hang past
+/// the 400 ms bound); the first park not bounded by `deadlock_timeout`
+/// (the check waits out the 1 s park slice).
 #[test]
 fn threads_two_txn_row_deadlock_one_40p01() {
     let core = Arc::new(ok(nucleus_txn::boot::Core::open(nucleus_kv::MemKv::new())));
@@ -803,8 +804,8 @@ fn threads_two_txn_row_deadlock_one_40p01() {
     // commit ack.
     let start = Instant::now();
     let first = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("the victim reported within 1 s");
+        .recv_timeout(Duration::from_millis(400))
+        .expect("the victim reported within 400 ms");
     assert_eq!(
         first,
         Err(TxnError::Deadlock),
@@ -876,4 +877,177 @@ fn lock_timeout_returns_55p03_and_leaves_no_edge() {
         "the timed-out wait removed its edges"
     );
     ok(rig.core.abort(t1));
+}
+
+// ---- 40P01 through the blocking relation driver -----------------------------
+
+/// The driver thread's result channel: `(lock_relation outcome, ended txn)`.
+type DriverRx = std::sync::mpsc::Receiver<(Result<bool, TxnError>, nucleus_txn::txn::Txn)>;
+
+/// T1 holds relation R `Exclusive` and waits (step-driven) on T2's row
+/// intent; T2 calls `lock_relation(R, RowExclusive, Block)` on a thread
+/// with `deadlock_timeout` = `dt`. Returns T2's driver result, T2 itself
+/// (for the caller to end), T1 and T1's wait handle.
+fn relation_driver_cycle(
+    rig: &mut Rig,
+    dt: Duration,
+) -> (
+    DriverRx,
+    nucleus_txn::txn::Txn,
+    nucleus_txn::wait::WaitHandle,
+    nucleus_txn::TxnId,
+) {
+    rig.core.waits.set_deadlock_timeout(dt);
+    rig.preload(b"/t/1/k", b"v");
+    let t1 = rig.txn(Isolation::ReadCommitted);
+    let t2 = rig.txn(Isolation::ReadCommitted);
+    assert!(ok(rig.locks.lock_relation(
+        &rig.core,
+        &t1,
+        5,
+        RelLockMode::Exclusive,
+        LockWait::NoWait,
+        None,
+    )));
+    let s2 = ok(t2.next_seq());
+    upd(&rig.core, &t2, s2, b"/t/1/k", b"v2");
+    let s1 = ok(t1.next_seq());
+    let mut task = RowOpTask::new(
+        b"/t/1/k",
+        None,
+        RowOp::Update {
+            value: b"v1".to_vec(),
+            key_cols_changed: false,
+        },
+        StmtCtx::new(rig.core.visible_ts(), s1, s1),
+    );
+    let targets = match ok(task.step(&rig.core, &t1)) {
+        Step::Wait(targets) => targets,
+        other => panic!("T1 must wait on T2's intent, got {other:?}"),
+    };
+    let h1 = match rig.core.wait_begin(&t1, &targets) {
+        WaitBegin::Registered(h) => h,
+        other => panic!("T1 must register, got {other:?}"),
+    };
+    let t2_id = t2.id;
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let core = Arc::clone(&rig.core);
+        let locks = Arc::clone(&rig.locks);
+        std::thread::spawn(move || {
+            let r = locks.lock_relation(
+                &core,
+                &t2,
+                5,
+                RelLockMode::RowExclusive,
+                LockWait::Block,
+                None,
+            );
+            let _ = tx.send((r, t2));
+        });
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !rig.core.wait_edges().contains(&(t2_id, t1.id)) {
+        assert!(
+            Instant::now() < deadline,
+            "the relation wait never registered its edge"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    (rx, t1, h1, t2_id)
+}
+
+/// A relation wait's own deadlock check raises 40P01 through the blocking
+/// driver. Ordering 1: T1 (row waiter) never checks; T2's driver checks
+/// after 50 ms and is the victim — exactly one 40P01, T1's check then
+/// finds no cycle and T1 proceeds after T2 aborts. Ordering 2: T1 checks
+/// first (T2's check is 1 h away) and is the victim; T2's driver then
+/// acquires R — exactly one 40P01.
+/// Mutant: the relation driver maps `Deadlock` to a retry (T2 re-waits
+/// and re-detects forever: no result within 400 ms).
+#[test]
+fn relation_driver_raises_40p01_exactly_one_victim() {
+    // Ordering 1: the relation waiter is the victim.
+    {
+        let mut rig = Rig::new();
+        let (rx, t1, h1, t2_id) = relation_driver_cycle(&mut rig, Duration::from_millis(50));
+        let (r, t2) = rx
+            .recv_timeout(Duration::from_millis(400))
+            .expect("T2's driver returned within 400 ms");
+        assert_eq!(
+            r,
+            Err(TxnError::Deadlock),
+            "the relation waiter is the victim"
+        );
+        assert!(
+            !rig.core.wait_edges().iter().any(|(a, _)| *a == t2_id),
+            "the victim's edges are gone"
+        );
+        assert!(
+            !rig.core.wait_deadlock_check(&h1),
+            "exactly one victim: T1's check finds no cycle"
+        );
+        ok(rig.core.abort(t2));
+        assert_eq!(rig.core.wait_poll(&h1), Some(WaitOutcome::Aborted));
+        rig.core.wait_end(h1);
+        ok(rig.core.abort(t1));
+        assert!(rig.core.wait_edges().is_empty());
+        assert!(rig.core.wait_slots().is_empty());
+    }
+    // Ordering 2: the row waiter is the victim.
+    {
+        let mut rig = Rig::new();
+        let (rx, t1, h1, _t2_id) = relation_driver_cycle(&mut rig, Duration::from_secs(3600));
+        assert!(rig.core.wait_deadlock_check(&h1), "T1 is the victim");
+        rig.core.wait_end(h1);
+        ok(rig.core.abort(t1));
+        let (r, t2) = rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("T2's driver returned after the victim aborted");
+        assert_eq!(r, Ok(true), "exactly one victim: T2 acquired R");
+        ok(rig.core.abort(t2));
+        assert!(rig.core.wait_edges().is_empty());
+        assert!(rig.core.wait_slots().is_empty());
+    }
+}
+
+// ---- WaitHandle: removal by registration id ---------------------------------
+
+/// Two live waits of the same txn W (on T and on U, then two on T):
+/// ending or dropping one leaves the other's edges and slots in place;
+/// `Drop` after `wait_end` removes nothing.
+/// Mutant: end / `Drop` remove every edge and slot of the waiter (the
+/// newer wait loses its edge to U, and its slot).
+#[test]
+fn wait_handle_removes_only_its_own_registration() {
+    let rig = Rig::new();
+    let t = rig.txn(Isolation::ReadCommitted);
+    let u = rig.txn(Isolation::ReadCommitted);
+    let w = rig.txn(Isolation::ReadCommitted);
+    let gen = |id| rig.core.status.entry(id).map(|e| e.gen).unwrap_or(0);
+    let begin = |targets: &[(nucleus_txn::TxnId, u64)]| match rig.core.wait_begin(&w, targets) {
+        WaitBegin::Registered(h) => h,
+        other => panic!("W must register, got {other:?}"),
+    };
+
+    let h_t = begin(&[(t.id, gen(t.id))]);
+    let h_u = begin(&[(u.id, gen(u.id))]);
+    drop(h_t);
+    assert_eq!(rig.core.wait_edges(), vec![(w.id, u.id)]);
+    assert_eq!(rig.core.wait_slots(), vec![(u.id, w.id)]);
+
+    let h_t1 = begin(&[(t.id, gen(t.id))]);
+    let h_t2 = begin(&[(t.id, gen(t.id))]);
+    rig.core.wait_end(h_t1);
+    assert_eq!(rig.core.wait_edges(), vec![(w.id, t.id), (w.id, u.id)]);
+    assert_eq!(rig.core.wait_slots(), vec![(t.id, w.id), (u.id, w.id)]);
+
+    rig.core.wait_end(h_u);
+    assert_eq!(rig.core.wait_edges(), vec![(w.id, t.id)]);
+    rig.core.wait_end(h_t2);
+    assert!(rig.core.wait_edges().is_empty());
+    assert!(rig.core.wait_slots().is_empty());
+    ok(rig.core.abort(w));
+    ok(rig.core.abort(u));
+    ok(rig.core.abort(t));
 }

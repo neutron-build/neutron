@@ -36,15 +36,21 @@
 //!   contains the waiter, remove the waiter's own edges and slots **before
 //!   releasing the mutex** and return `true` (the caller raises 40P01).
 //!   Exactly one member of a cycle aborts (I-LIVE b).
-//! - **End** ([`Core::wait_end`]): removes the waiter's remaining edges
-//!   and slots. [`WaitHandle`]'s `Drop` does the same, so no path leaks an
-//!   edge.
-//! - **Wake** ([`Waits::wake`], §6 "Waking"): the waker (commit step 5,
-//!   abort, `bump_and_wake`, any lock release) has already bumped the
-//!   generation; then, under the graph mutex, it removes every woken
-//!   waiter's edges **to that txn** and their slots on it, releases the
-//!   mutex, and only then unparks them (seed 59: the DFS never sees an
-//!   edge for a wait that has already been satisfied).
+//! - **End** ([`Core::wait_end`]): removes this wait's remaining edges
+//!   and slots. [`WaitHandle`]'s `Drop` does the same (and is a no-op
+//!   after `wait_end`), so no path leaks an edge. Every registration has
+//!   its own id and is removed by id, so ending or dropping one wait never
+//!   touches another wait of the same txn.
+//! - **Wake** ([`Core::bump_and_wake`], §6 "Waking"): the one wake path
+//!   (commit step 5, abort, `ROLLBACK TO`, any lock release). Under the
+//!   graph mutex it bumps the target's generation (the status table is a
+//!   leaf, §3.1), removes every edge `* -> target` and takes the target's
+//!   slots; it releases the mutex and only then unparks them (seed 59:
+//!   the DFS never sees an edge for a wait that has already been
+//!   satisfied). Bump and edge removal in one critical section mean a
+//!   waiter that registers with the **new** generation always registers
+//!   after the removal, so its edge and slot survive (no missed deadlock,
+//!   no lost wakeup).
 //!
 //! `deadlock_timeout` (default 1 s, PostgreSQL's default) is a [`Waits`]
 //! setting: after it has elapsed since the wait began, the blocking wait
@@ -59,7 +65,7 @@
 //! and only the graph does.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -188,30 +194,55 @@ pub enum WaitOutcome {
     LockTimeout,
 }
 
-/// One registered waiter: its txn and the parker it parks on.
+/// One registered waiter slot: the registration it belongs to and the
+/// parker it parks on.
 struct WaitSlot {
+    reg: u64,
     waiter: TxnId,
     parker: Arc<dyn Parker>,
 }
 
-/// The graph state under the one graph mutex: the edges `waiter -> target`
-/// and every target's registered waiter slots. `BTree` containers keep
-/// iteration deterministic (C-SIM replays seeds).
+/// One registered wait: the waiter and the targets it still has an edge
+/// to (a wake of a target removes that target).
+struct Reg {
+    waiter: TxnId,
+    targets: BTreeSet<TxnId>,
+}
+
+/// The graph state under the one graph mutex: every registered wait (its
+/// edges `waiter -> target`, keyed by registration id) and every target's
+/// waiter slots. `BTree` containers keep iteration deterministic (C-SIM
+/// replays seeds).
 #[derive(Default)]
 struct Graph {
-    edges: BTreeMap<TxnId, BTreeSet<TxnId>>,
+    next_reg: u64,
+    regs: BTreeMap<u64, Reg>,
     slots: BTreeMap<TxnId, Vec<Arc<WaitSlot>>>,
 }
 
 impl Graph {
-    /// Removes `w`'s edges and its slots on every target (wait end, a
-    /// positive deadlock check). Idempotent.
-    fn remove_waiter(&mut self, w: TxnId) {
-        self.edges.remove(&w);
+    /// Removes registration `reg`'s edges and its slots on every target
+    /// (wait end, `Drop`, a positive deadlock check). Idempotent, and
+    /// never touches another registration of the same waiter.
+    fn remove_reg(&mut self, reg: u64) {
+        self.regs.remove(&reg);
         for list in self.slots.values_mut() {
-            list.retain(|s| s.waiter != w);
+            list.retain(|s| s.reg != reg);
         }
         self.slots.retain(|_, l| !l.is_empty());
+    }
+
+    /// The current edges `waiter -> targets`, merged over registrations.
+    fn edges(&self) -> BTreeMap<TxnId, BTreeSet<TxnId>> {
+        let mut out: BTreeMap<TxnId, BTreeSet<TxnId>> = BTreeMap::new();
+        for r in self.regs.values() {
+            if !r.targets.is_empty() {
+                out.entry(r.waiter)
+                    .or_default()
+                    .extend(r.targets.iter().copied());
+            }
+        }
+        out
     }
 }
 
@@ -299,27 +330,6 @@ impl Waits {
             .unwrap_or_else(PoisonError::into_inner)
             .make()
     }
-
-    /// Wakes every waiter registered on `target` (§6 "Waking"): the caller
-    /// bumped the generation first. Under the graph mutex, removes every
-    /// woken waiter's edges **to `target`** and their slots on it; releases
-    /// the mutex; then unparks them (seed 59: a stale edge must never close
-    /// a false cycle). Spurious unparks are harmless — waiters re-check the
-    /// generation.
-    pub(crate) fn wake(&self, target: TxnId) {
-        let slots = {
-            let mut g = self.lock_graph();
-            for set in g.edges.values_mut() {
-                set.remove(&target);
-            }
-            g.slots.remove(&target)
-        };
-        if let Some(slots) = slots {
-            for s in slots {
-                s.parker.unpark();
-            }
-        }
-    }
 }
 
 /// A registered wait: what [`Core::wait_end`] and the park loop hold, and
@@ -332,6 +342,11 @@ pub struct WaitHandle {
 
 struct WaitInner {
     waits: Arc<WaitsInner>,
+    /// This registration's id in the graph: end, `Drop` and the deadlock
+    /// check remove by it.
+    reg: u64,
+    /// Set by [`Core::wait_end`]; `Drop` is then a no-op.
+    ended: AtomicBool,
     waiter: TxnId,
     targets: Vec<(TxnId, u64)>,
     parker: Arc<dyn Parker>,
@@ -360,10 +375,9 @@ impl WaitHandle {
 
 impl Drop for WaitHandle {
     fn drop(&mut self) {
-        self.inner
-            .waits
-            .lock_graph()
-            .remove_waiter(self.inner.waiter);
+        if !self.inner.ended.swap(true, Ordering::SeqCst) {
+            self.inner.waits.lock_graph().remove_reg(self.inner.reg);
+        }
     }
 }
 
@@ -440,6 +454,14 @@ fn cycle_through(edges: &BTreeMap<TxnId, BTreeSet<TxnId>>, w: TxnId) -> bool {
         }
     }
     false
+}
+
+/// The sorted `(waiter, target)` pairs of an edge map.
+fn flatten_edges(edges: &BTreeMap<TxnId, BTreeSet<TxnId>>) -> Vec<(TxnId, TxnId)> {
+    edges
+        .iter()
+        .flat_map(|(w, ts)| ts.iter().map(move |t| (*w, *t)))
+        .collect()
 }
 
 impl<K: nucleus_kv::OrderedKv> Core<K> {
@@ -521,11 +543,12 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
             }
             // Park, bounded by the lost-wakeup slice, the deadline and
             // (until the check has run) the deadlock timeout, so the check
-            // runs on time even if an earlier park was cut short.
+            // runs on time even if an earlier park was cut short; a zero
+            // bound skips the park.
             let now = Instant::now();
             let mut bound = PARK_SLICE;
-            if !checked && now < dl_at {
-                bound = bound.min(dl_at - now);
+            if !checked {
+                bound = bound.min(dl_at.saturating_duration_since(now));
             }
             match deadline {
                 Some(d) if now < d => bound = bound.min(d - now),
@@ -578,17 +601,28 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
         if let Some(o) = recheck(self, targets, &waiter.cancel) {
             return WaitBegin::Done(o);
         }
+        let reg = g.next_reg;
+        g.next_reg = g.next_reg.wrapping_add(1);
         let slot = Arc::new(WaitSlot {
+            reg,
             waiter: waiter.id,
             parker: Arc::clone(&parker),
         });
+        g.regs.insert(
+            reg,
+            Reg {
+                waiter: waiter.id,
+                targets: targets.iter().map(|(t, _)| *t).collect(),
+            },
+        );
         for (t, _) in targets {
-            g.edges.entry(waiter.id).or_default().insert(*t);
             g.slots.entry(*t).or_default().push(Arc::clone(&slot));
         }
         WaitBegin::Registered(WaitHandle {
             inner: Arc::new(WaitInner {
                 waits: Arc::clone(&self.waits.inner),
+                reg,
+                ended: AtomicBool::new(false),
                 waiter: waiter.id,
                 targets: targets.to_vec(),
                 parker,
@@ -605,48 +639,201 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
 
     /// The §6 deadlock check: under the graph mutex, a DFS from the waiter
     /// over the **current** edges (never anything else); if a cycle
-    /// contains the waiter, its own edges and slots are removed **before
-    /// the mutex is released** and the answer is `true` — the caller raises
-    /// 40P01 and aborts the waiter, so exactly one member of the cycle
-    /// aborts (I-LIVE b, c). `false` otherwise.
+    /// contains the waiter, this wait's edges and slots are removed
+    /// **before the mutex is released** and the answer is `true` — the
+    /// caller raises 40P01 and aborts the waiter, so exactly one member of
+    /// the cycle aborts (I-LIVE b, c). `false` otherwise.
     pub fn wait_deadlock_check(&self, h: &WaitHandle) -> bool {
+        self.deadlock_check(h).is_some()
+    }
+
+    /// [`Core::wait_deadlock_check`] that also returns, when the waiter is
+    /// the victim, the sorted edges the DFS ran over (before the victim's
+    /// own were removed) — diagnostics, so a test can re-derive the cycle
+    /// from the exact graph the check saw. `None` when no cycle contains
+    /// the waiter.
+    pub fn wait_deadlock_check_traced(&self, h: &WaitHandle) -> Option<Vec<(TxnId, TxnId)>> {
+        self.deadlock_check(h).map(|edges| flatten_edges(&edges))
+    }
+
+    fn deadlock_check(&self, h: &WaitHandle) -> Option<BTreeMap<TxnId, BTreeSet<TxnId>>> {
         let mut g = self.waits.lock_graph();
-        if cycle_through(&g.edges, h.inner.waiter) {
-            g.remove_waiter(h.inner.waiter);
-            true
+        let edges = g.edges();
+        if cycle_through(&edges, h.inner.waiter) {
+            g.remove_reg(h.inner.reg);
+            Some(edges)
         } else {
-            false
+            None
         }
     }
 
-    /// Ends the wait: removes the waiter's remaining edges and slots.
-    /// [`WaitHandle`]'s `Drop` does the same, so dropping the handle is
-    /// also a valid end.
+    /// Ends the wait: removes this wait's remaining edges and slots (and
+    /// only this wait's: another wait of the same txn keeps its own).
+    /// Dropping the handle is also a valid end; after `wait_end` the
+    /// handle's `Drop` does nothing.
     pub fn wait_end(&self, h: WaitHandle) {
-        let w = h.inner.waiter;
-        self.waits.lock_graph().remove_waiter(w);
+        if !h.inner.ended.swap(true, Ordering::SeqCst) {
+            self.waits.lock_graph().remove_reg(h.inner.reg);
+        }
     }
 
     /// A sorted snapshot of the current wait-for edges — diagnostics (the
     /// `pg_locks` analogue of §6). Tests observe the graph through it;
     /// nothing in the crate reads it to make a decision.
     pub fn wait_edges(&self) -> Vec<(TxnId, TxnId)> {
+        flatten_edges(&self.waits.lock_graph().edges())
+    }
+
+    /// A sorted snapshot of the registered waiter slots as
+    /// `(target, waiter)` pairs — diagnostics like [`Core::wait_edges`]
+    /// (a slot is what a wake of `target` unparks). Nothing in the crate
+    /// reads it to make a decision.
+    pub fn wait_slots(&self) -> Vec<(TxnId, TxnId)> {
         let g = self.waits.lock_graph();
         let mut out: Vec<(TxnId, TxnId)> = g
-            .edges
+            .slots
             .iter()
-            .flat_map(|(w, ts)| ts.iter().map(move |t| (*w, *t)))
+            .flat_map(|(t, l)| l.iter().map(move |s| (*t, s.waiter)))
             .collect();
         out.sort_unstable();
         out
     }
 
-    /// Bumps `txn`'s wake generation and wakes its waiters (§6): the wake
-    /// path of `ROLLBACK TO` (§5.5) and of every in-memory lock release.
-    /// Bump first, then wake (the wake removes the woken waiters' edges).
+    /// Bumps `txn`'s wake generation and wakes its waiters (§6 "Waking"):
+    /// the one wake path — commit step 5, abort, `ROLLBACK TO` (§5.5) and
+    /// every in-memory lock release. Under the graph mutex: bump the
+    /// generation (the status table mutex is a leaf, §3.1), remove every
+    /// edge `* -> txn`, take `txn`'s slots; release the mutex; then
+    /// unpark. A waiter registering with the new generation can only do
+    /// so after this critical section, so its edge and slot survive.
+    /// Spurious unparks are harmless — waiters re-check the generation.
     pub fn bump_and_wake(&self, txn: TxnId) -> Result<u64, crate::TxnError> {
-        let gen = self.status.bump_gen(txn)?;
-        self.waits.wake(txn);
+        let (gen, slots) = {
+            let mut g = self.waits.lock_graph();
+            let gen = self.status.bump_gen(txn)?;
+            for r in g.regs.values_mut() {
+                r.targets.remove(&txn);
+            }
+            (gen, g.slots.remove(&txn))
+        };
+        #[cfg(test)]
+        tests::after_bump(txn);
+        if let Some(slots) = slots {
+            for s in slots {
+                s.parker.unpark();
+            }
+        }
         Ok(gen)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The bump/wake window (§6 "Waking"): a seam between the graph
+    //! critical section of [`Core::bump_and_wake`] and its unparks, where a
+    //! test registers a wait with the target's **new** generation — the
+    //! interleaving that, with bump and edge removal in separate critical
+    //! sections, lost the edge and the slot.
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use nucleus_kv::MemKv;
+
+    use super::{WaitBegin, WaitHandle, WaitOutcome};
+    use crate::boot::Core;
+    use crate::status::Remembered;
+    use crate::txn::Isolation;
+    use crate::TxnId;
+
+    type AfterBump = Box<dyn FnOnce(TxnId)>;
+
+    thread_local! {
+        static AFTER_BUMP: RefCell<Option<AfterBump>> = const { RefCell::new(None) };
+    }
+
+    /// Runs (once) the hook the current thread installed, if any.
+    pub(super) fn after_bump(txn: TxnId) {
+        if let Some(f) = AFTER_BUMP.with(|h| h.borrow_mut().take()) {
+            f(txn);
+        }
+    }
+
+    fn gen_of(core: &Core<MemKv>, id: TxnId) -> u64 {
+        match core.status.lookup_remembered(id) {
+            Remembered::Live(_, g) => g,
+            Remembered::Ended => panic!("{id:?} has no status entry"),
+        }
+    }
+
+    /// W registers its wait on T with T's new generation inside the
+    /// bump/wake window: W -> T stays in the graph, W's slot on T stays
+    /// registered (a later wake of T unparks W), and a T <-> W cycle is
+    /// detected.
+    /// Mutant: bump outside the graph mutex, the edge removal in a second
+    /// critical section after the window (the reviewer's race: W -> T and
+    /// the slot are lost; the deadlock goes undetected).
+    #[test]
+    fn register_in_bump_wake_window_keeps_edge_and_slot() {
+        let core = Arc::new(match Core::open(MemKv::new()) {
+            Ok(c) => c,
+            Err(e) => panic!("core: {e:?}"),
+        });
+        let t = core.begin(Isolation::ReadCommitted);
+        let w = Arc::new(core.begin(Isolation::ReadCommitted));
+        let stash: Rc<RefCell<Option<WaitHandle>>> = Rc::new(RefCell::new(None));
+        {
+            let (core, w, stash) = (Arc::clone(&core), Arc::clone(&w), Rc::clone(&stash));
+            AFTER_BUMP.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |target: TxnId| {
+                    let g = gen_of(&core, target);
+                    match core.wait_begin(&w, &[(target, g)]) {
+                        WaitBegin::Registered(h) => *stash.borrow_mut() = Some(h),
+                        other => panic!("W must register with the new gen, got {other:?}"),
+                    }
+                }));
+            });
+        }
+        let g1 = match core.bump_and_wake(t.id) {
+            Ok(g) => g,
+            Err(e) => panic!("bump: {e:?}"),
+        };
+        assert_eq!(g1, 1);
+        let wh = match stash.borrow_mut().take() {
+            Some(h) => h,
+            None => panic!("the hook did not run"),
+        };
+        assert!(
+            core.wait_edges().contains(&(w.id, t.id)),
+            "W -> T survived the wake that preceded its registration"
+        );
+        assert!(
+            core.wait_slots().contains(&(t.id, w.id)),
+            "W's slot on T survived"
+        );
+        assert_eq!(core.wait_poll(&wh), None, "W's wait is not over");
+
+        // T waits on W: a real two-cycle, detected.
+        let th = match core.wait_begin(&t, &[(w.id, gen_of(&core, w.id))]) {
+            WaitBegin::Registered(h) => h,
+            other => panic!("T must register, got {other:?}"),
+        };
+        assert!(
+            core.wait_deadlock_check(&th),
+            "the T <-> W cycle is detected"
+        );
+        core.wait_end(th);
+
+        // No lost wakeup: the next wake of T unparks W.
+        if let Err(e) = core.bump_and_wake(t.id) {
+            panic!("bump: {e:?}");
+        }
+        assert!(wh.park(Duration::ZERO), "W's parker was unparked");
+        assert_eq!(core.wait_poll(&wh), Some(WaitOutcome::GenChanged));
+        core.wait_end(wh);
+        assert!(core.wait_edges().is_empty());
+        assert!(core.wait_slots().is_empty());
     }
 }
