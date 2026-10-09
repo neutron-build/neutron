@@ -7,9 +7,10 @@ use crate::{Intent, Layer, LayerData, RowLockMode, Seq, TxnId};
 
 /// One change to place on the intent (exclusive modes only for `Lock`:
 /// shared requests are granted in the [`RowLocks`](crate::write::RowLocks)
-/// table and never reach this function).
+/// table and never reach this function). Crate-private (C-T2 rework 7e):
+/// tested by the in-crate unit tests in `write::tests`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
+pub(crate) enum Change {
     Write {
         value: Vec<u8>,
         /// The caller's statement that a key column differs from the newest
@@ -69,7 +70,7 @@ fn implied_lock(data: &LayerData) -> Option<RowLockMode> {
 ///
 /// `current` is the intent as read under the latch; it must be `None` or
 /// owned by `owner` (the §5.1 loop removed any foreign one first).
-pub fn apply_change(
+pub(crate) fn apply_change(
     current: Option<&Intent>,
     owner: TxnId,
     place_seq: Seq,

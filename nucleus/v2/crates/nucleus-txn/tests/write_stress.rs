@@ -2,10 +2,12 @@
 //! write path — UPDATE as an increment through EPQ, DELETE + re-insert,
 //! `FOR UPDATE`, SAVEPOINT / ROLLBACK TO — committing or aborting at
 //! random, with the commit thread and the resolver running. Lost-update
-//! oracle: each key's committed value equals the number of committed
-//! increments since its last committed re-insert. Afterwards: no intent
-//! remains, every surviving status entry has count 0 (I-COUNT), no
-//! invariant error.
+//! oracle (C-T2 rework 3): the **full committed history** of every key,
+//! oldest first, must form a chain — each live value is the previous live
+//! value + 1, or the reset value 0 right after a delete or re-insert — so
+//! a lost update anywhere in the history fails, not only one hidden
+//! behind a later reset. Afterwards: no intent remains, every surviving
+//! status entry has count 0 (I-COUNT), no invariant error.
 //!
 //! Txns touch their keys in ascending order (there is no deadlock detector
 //! until C-T2b, so the generator keeps a global lock order — as the §6
@@ -13,7 +15,6 @@
 
 mod common;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,17 +80,13 @@ impl Rng {
     }
 }
 
-type Effects = Vec<(usize, bool)>; // (key, reset?) — last one per key wins
-
-/// Runs one txn. `Ok(None)` = randomly aborted; `Ok(Some((ts, effects)))` =
-/// committed at `ts` (unique, total order — the pipeline assigns them in
-/// commit order) with its per-key effects.
+/// Runs one txn. `Ok(None)` = randomly aborted; `Ok(Some(()))` = committed.
 fn run_txn(
     core: &Arc<Core<MemKv>>,
     iso: Isolation,
     rng: &mut Rng,
     cancels: &Arc<Mutex<Vec<CancelHandle>>>,
-) -> Result<Option<(Ts, Effects)>, TxnError> {
+) -> Result<Option<()>, TxnError> {
     let txn = core.begin(iso);
     cancels.lock().expect("cancels").push(txn.cancel_handle());
     // 1-4 ops over a sorted key subset: (key, kind) with kind 0=Inc, 1=DelRes,
@@ -115,11 +112,10 @@ fn run_txn(
 
     let snap = core.registry.take_snapshot();
     let s = snap.ts();
-    let mut applied: HashMap<usize, bool> = HashMap::new(); // key -> reset?
-                                                            // On a §5 error the txn is aborted before the error surfaces: a leaked
-                                                            // pending intent would block every later txn on its keys (there is no
-                                                            // deadlock detector until C-T2b).
-    let r = run_ops(core, &txn, s, &ops, &mut applied);
+    // On a §5 error the txn is aborted before the error surfaces: a leaked
+    // pending intent would block every later txn on its keys (there is no
+    // deadlock detector until C-T2b).
+    let r = run_ops(core, &txn, s, &ops);
     if let Err(e) = r {
         drop(snap);
         core.abort(txn).expect("abort the failed txn");
@@ -135,8 +131,8 @@ fn run_txn(
     } else {
         SyncCommit::Off
     };
-    let ts = core.commit(txn, sync)?;
-    Ok(Some((ts, applied.into_iter().collect())))
+    core.commit(txn, sync)?;
+    Ok(Some(()))
 }
 
 fn run_ops(
@@ -144,7 +140,6 @@ fn run_ops(
     txn: &nucleus_txn::txn::Txn,
     s: Ts,
     ops: &[(usize, u8)],
-    applied: &mut HashMap<usize, bool>,
 ) -> Result<(), TxnError> {
     for &(k, kind) in ops {
         let key = format!("/t/1/k{k}").into_bytes();
@@ -162,10 +157,7 @@ fn run_ops(
                     value: v.to_be_bytes().to_vec(),
                     key_cols_changed: false,
                 };
-                let out = core.row_op(txn, &key, None, op.clone(), ctx, &mut IncrEpq(op))?;
-                if out == RowOutcome::Applied {
-                    applied.insert(k, false);
-                }
+                core.row_op(txn, &key, None, op.clone(), ctx, &mut IncrEpq(op))?;
             }
             1 => {
                 // DELETE + re-insert at 0.
@@ -185,7 +177,6 @@ fn run_ops(
                     ctx,
                     UniqueRule::Unique { same_row: None },
                 )?;
-                applied.insert(k, true);
             }
             2 => {
                 // FOR UPDATE: no effect.
@@ -246,11 +237,6 @@ fn stress_write_path_lost_update_oracle() {
     core.set_row_locks(common::TestRowLocks::new());
     let commit_handle = spawn_commit_thread(Arc::clone(&core)).expect("commit thread");
     let bg = spawn_background(Arc::clone(&core)).expect("resolver");
-    // The lost-update oracle's input: one (commit_ts, effects) per
-    // committed txn, folded in ts order below (commits have unique ts, so
-    // the fold is the true commit order — resets are not commutative with
-    // increments, so thread-completion order would not do).
-    let effects_log: Arc<Mutex<Vec<(Ts, Effects)>>> = Arc::new(Mutex::new(Vec::new()));
     let cancels: Arc<Mutex<Vec<CancelHandle>>> = Arc::new(Mutex::new(Vec::new()));
     let start = Instant::now();
 
@@ -269,7 +255,6 @@ fn stress_write_path_lost_update_oracle() {
     let mut writers = Vec::new();
     for t in 0..THREADS {
         let core = Arc::clone(&core);
-        let effects_log = Arc::clone(&effects_log);
         let cancels = Arc::clone(&cancels);
         let mut rng = Rng(0x9e3779b97f4a7c15 ^ (t as u64 + 101));
         writers.push(std::thread::spawn(move || {
@@ -281,13 +266,13 @@ fn stress_write_path_lost_update_oracle() {
                 };
                 // RR serialization failures are retried in a fresh txn.
                 let mut attempt = 0;
-                let committed = loop {
+                loop {
                     attempt += 1;
                     if attempt > 64 {
                         panic!("a txn retried 64 times without succeeding");
                     }
                     match run_txn(&core, iso, &mut rng, &cancels) {
-                        Ok(done) => break done,
+                        Ok(_) => break,
                         Err(TxnError::SerializationFailure) => continue,
                         Err(TxnError::UniqueViolation) => continue, // a racing re-insert
                         Err(TxnError::QueryCanceled) => {
@@ -295,19 +280,15 @@ fn stress_write_path_lost_update_oracle() {
                         }
                         Err(e) => panic!("unexpected error: {e:?}"),
                     }
-                };
-                if let Some((ts, effects)) = committed {
-                    effects_log.lock().expect("log").push((ts, effects));
                 }
             }
         }));
     }
 
-    for (t, w) in writers.into_iter().enumerate() {
+    for w in writers.into_iter() {
         if let Err(e) = w.join() {
             std::panic::resume_unwind(e);
         }
-        let _ = t;
     }
     let _ = wd_tx.send(());
     let _ = watchdog.join();
@@ -339,26 +320,8 @@ fn stress_write_path_lost_update_oracle() {
         }
     }
 
-    // The lost-update oracle: fold the committed effects in commit-ts
-    // order. A key never written stays `None` (the KV has no version).
-    let mut log = effects_log.lock().expect("log").clone();
-    log.sort_by_key(|(ts, _)| *ts);
-    let mut o: Vec<Option<u64>> = vec![None; KEYS];
-    for (_, effects) in &log {
-        for &(k, reset) in effects {
-            o[k] = Some(if reset { 0 } else { o[k].unwrap_or(0) + 1 });
-        }
-    }
-    for (k, want) in o.iter().enumerate() {
-        let key = format!("/t/1/k{k}").into_bytes();
-        let got = read_latest(&core, &key);
-        let want_bytes = want.map(|v| v.to_be_bytes().to_vec());
-        assert_eq!(
-            got.as_ref(),
-            want_bytes.as_ref(),
-            "key {key:?}: committed history disagrees with the oracle"
-        );
-    }
+    // The lost-update oracle (rework 3): the full-history check.
+    verify_full_history(&core);
 }
 
 const _: () = assert!(THREADS * TXNS_PER_THREAD >= 2000, "at least 2000 txns");
@@ -387,12 +350,57 @@ fn count_intents(core: &Core<MemKv>) -> usize {
     n
 }
 
-fn read_latest(core: &Core<MemKv>, key: &[u8]) -> Option<Vec<u8>> {
-    // The newest committed version of the key (no intent remains).
+/// The full-history oracle (C-T2 rework 3): scan each key's committed
+/// versions oldest first and walk the chain. Every version in this
+/// workload is written by a committed txn's single net op on the key:
+///
+/// - an increment commits `previous live value + 1` — or `1` when the
+///   statement read no row (a virgin or deleted key);
+/// - a DELETE + re-insert commits the reset value `0` ("right after a
+///   delete or re-insert"; over a live row or a tombstone alike);
+/// - a tombstone (nothing in this generator writes a net delete, but the
+///   walk handles one) resets the chain.
+///
+/// A lost update — RC placing the stale snapshot value without EPQ, or no
+/// re-check after an EPQ pass — writes a value that is not the previous
+/// live value + 1 and fails the chain, wherever in the history it lands.
+fn verify_full_history(core: &Arc<Core<MemKv>>) {
+    for k in 0..KEYS {
+        let key = format!("/t/1/k{k}").into_bytes();
+        let versions = versions_oldest_first(core, &key);
+        let mut prev: Option<u64> = None;
+        for (i, value) in versions.iter().enumerate() {
+            match &value {
+                nucleus_txn::encoding::VersionValue::Tombstone { .. } => prev = None,
+                nucleus_txn::encoding::VersionValue::Live { payload, .. } => {
+                    let val =
+                        u64::from_be_bytes(payload.as_slice().try_into().expect("8-byte value"));
+                    match prev {
+                        Some(p) => assert!(
+                            val == p + 1 || val == 0,
+                            "key {key:?} version #{i}: {val} after live {p} — a lost update"
+                        ),
+                        None => assert!(
+                            val == 0 || val == 1,
+                            "key {key:?} version #{i}: {val} with no previous live value"
+                        ),
+                    }
+                    prev = Some(val);
+                }
+            }
+        }
+    }
+}
+
+/// One key's committed versions, oldest first (§2.2: stored newest first).
+fn versions_oldest_first(
+    core: &Core<MemKv>,
+    key: &[u8],
+) -> Vec<nucleus_txn::encoding::VersionValue> {
     let view = core.open_view();
     let lo = intent_key(key);
     let hi = nucleus_txn::encoding::end_key(key);
-    let mut newest: Option<(Ts, Vec<u8>)> = None;
+    let mut versions = Vec::new();
     for row in view.scan(
         (
             std::ops::Bound::Included(lo.as_slice()),
@@ -401,15 +409,13 @@ fn read_latest(core: &Core<MemKv>, key: &[u8]) -> Option<Vec<u8>> {
         false,
     ) {
         let (k, v) = row.expect("scan");
-        if let Some((_, nucleus_txn::encoding::Entry::Version(ts))) =
+        if let Some((_, nucleus_txn::encoding::Entry::Version(_))) =
             nucleus_txn::encoding::parse_key(&k)
         {
-            if newest.as_ref().is_none_or(|(t, _)| ts > *t) {
-                let decoded = decode_version(&v).expect("version");
-                newest = Some((ts, decoded.into_option().unwrap_or_default()));
-            }
+            versions.push(decode_version(&v).expect("version"));
         }
     }
     drop(view);
-    newest.map(|(_, v)| v)
+    versions.reverse();
+    versions
 }

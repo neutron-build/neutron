@@ -455,10 +455,104 @@ fn seed46_shared_release_under_latch() {
             "step 5 finished after the release"
         );
     }
-    common::wait_released(&rig.core, t2_id);
+    common::wait_released(&common::TestCore::from_arc(Arc::clone(&rig.core)), t2_id);
 }
 
 // ---- queued events (§5.3/§5.5) ----------------------------------------------
+
+/// C-T2 rework 7b: shared-lock release latches `latch_key(key, prefix)`
+/// with the prefix the grant ran under (recorded in the lock table), not
+/// plain `&key`. A shared lock on a deferrable-layout `/i/` key is granted
+/// under the prefix latch, so holding **that** latch must block the
+/// release. Mutant: any release path latching `&key`.
+#[test]
+fn shared_release_latches_the_logged_prefix() {
+    let rig = Rig::new();
+    // A deferrable-layout key: latch key = the /i/1/d0 prefix.
+    let prefix = b"/i/1/d0".to_vec();
+    let mut key = prefix.clone();
+    key.extend_from_slice(b"/t/1/r1");
+
+    // ROLLBACK TO path: a shared lock taken after the savepoint.
+    let t = rig.txn();
+    let sp = ok(t.savepoint());
+    let s = ok(t.next_seq());
+    ok(rig.core.row_op(
+        &t,
+        &key,
+        Some(prefix.len()),
+        RowOp::Lock(RowLockMode::Share),
+        StmtCtx::new(rig.core.visible_ts(), s, s),
+        &mut Fixed(RowOp::Lock(RowLockMode::Share)),
+    ));
+    let holder = hold_latch(&rig.core, &prefix);
+    let (tx, rx) = mpsc::channel::<()>();
+    {
+        let core = Arc::clone(&rig.core);
+        let t = Arc::new(t);
+        std::thread::spawn(move || {
+            let _ = core.rollback_to(&t, sp);
+            let _ = tx.send(());
+        });
+    }
+    not_within_200ms(&rx);
+    assert!(
+        !rig.locks.holders(&key).is_empty(),
+        "the shared lock was released without the prefix's latch (rework 7b)"
+    );
+    holder.release();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_ok(),
+        "the rollback finished after the release"
+    );
+
+    // Commit step 5 path: the same release under the same latch.
+    let t2 = rig.txn();
+    let s2 = ok(t2.next_seq());
+    ok(rig.core.row_op(
+        &t2,
+        &key,
+        Some(prefix.len()),
+        RowOp::Lock(RowLockMode::Share),
+        StmtCtx::new(rig.core.visible_ts(), s2, s2),
+        &mut Fixed(RowOp::Lock(RowLockMode::Share)),
+    ));
+    // A write on another key keeps t2 off the no-write fast path, so its
+    // commit really goes through the pipeline and step 5.
+    let s2b = ok(t2.next_seq());
+    upd(&rig.core, &t2, s2b, b"/t/1/other", b"w");
+    let t2_id = t2.id;
+    let ticket = ok(rig.core.commit_submit(t2, SyncCommit::On));
+    let holder2 = hold_latch(&rig.core, &prefix);
+    {
+        let (tx5, rx5) = mpsc::channel::<()>();
+        {
+            let pipeline = Arc::clone(&rig.pipeline);
+            std::thread::spawn(move || {
+                let mut p = pipeline.lock().expect("pipeline");
+                let group = p.drain_available();
+                p.process_group(group);
+                drop(p);
+                let _ = tx5.send(());
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !rig.locks.holders(&key).is_empty(),
+            "step 5 released the shared lock without the prefix's latch (rework 7b)"
+        );
+        assert!(
+            ticket.try_ack().is_some(),
+            "the ack (step 4) is not blocked by step 5"
+        );
+        holder2.release();
+        assert!(
+            rx5.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "step 5 finished after the release"
+        );
+    }
+    common::wait_released(&common::TestCore::from_arc(Arc::clone(&rig.core)), t2_id);
+}
 
 #[test]
 fn rollback_discards_queued_events_tagged_at_or_above_the_savepoint() {

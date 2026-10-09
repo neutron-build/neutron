@@ -440,6 +440,64 @@ fn key_existence_vs_foreign_lock_only_over_live_row_23505_at_once() {
     assert_eq!(err, TxnError::UniqueViolation);
 }
 
+/// C-T2 rework 7a: the early 23505 against a foreign lock-only intent
+/// over a live row applies only to a `Unique` rule, and the live
+/// committed version of the **same** row (`same_row`) never conflicts.
+/// Both cases fall through to the lock conflict check and wait instead.
+/// Mutant: the unconditional 23505 of the pre-rework code.
+#[test]
+fn early_23505_respects_the_rule_and_same_row() {
+    let mut rig = Rig::new();
+    rig.preload(b"/t/1/k", b"v");
+    let t1 = rig.txn(Isolation::ReadCommitted);
+    let s1 = ok(t1.next_seq());
+    ok(rig.core.row_op(
+        &t1,
+        b"/t/1/k",
+        None,
+        lock_op(RowLockMode::NoKeyUpdate),
+        StmtCtx::new(rig.core.visible_ts(), s1, s1),
+        &mut ApplyOp(lock_op(RowLockMode::NoKeyUpdate)),
+    ));
+
+    // A `Unique` op of the same row: `same_row` matches the live payload.
+    let t2 = rig.txn(Isolation::ReadCommitted);
+    let s2 = ok(t2.next_seq());
+    let mut task = nucleus_txn::write::KeyOpTask::new(
+        b"/t/1/k",
+        None,
+        b"v".to_vec(),
+        StmtCtx::new(rig.core.visible_ts(), s2, s2),
+        UniqueRule::Unique {
+            same_row: Some(b"v".to_vec()),
+        },
+    );
+    match task.step(&rig.core, &t2).expect("step") {
+        Step::Wait(w) => assert_eq!(w, vec![(t1.id, 0)], "same_row waits on the lock"),
+        s => panic!("same_row over a lock-only intent waits on the lock, got {s:?}"),
+    }
+    ok(rig.core.abort(t2));
+
+    // A deferrable entry's placement skips the per-row check entirely
+    // (`is_defer_op`): the prefix check at end of statement decides, so
+    // the placement only waits on the lock.
+    let t3 = rig.txn(Isolation::ReadCommitted);
+    let s3 = ok(t3.next_seq());
+    let mut task3 = nucleus_txn::write::KeyOpTask::new(
+        b"/t/1/k",
+        None,
+        b"e".to_vec(),
+        StmtCtx::new(rig.core.visible_ts(), s3, s3),
+        UniqueRule::Deferrable,
+    );
+    match task3.step(&rig.core, &t3).expect("step") {
+        Step::Wait(w) => assert_eq!(w, vec![(t1.id, 0)], "a deferrable placement waits"),
+        s => panic!("a deferrable placement waits on the lock-only intent, got {s:?}"),
+    }
+    ok(rig.core.abort(t3));
+    ok(rig.core.abort(t1));
+}
+
 #[test]
 fn serializable_unique_rule_needs_a_covering_siread() {
     let mut rig = Rig::new();
@@ -518,14 +576,11 @@ fn serializable_unique_rule_needs_a_covering_siread() {
 
 // ---- seed 45: KEY SHARE examines all newer versions -----------------------
 
-#[test]
-fn seed45_keyshare_examines_all_newer() {
-    let mut rig = Rig::new();
+/// Seed 45's setup: preload t0; Ta deletes it and commits; Tb re-inserts
+/// it (over the tombstone) and commits. Returns a snapshot below both
+/// commits: N above it holds Tb's live write **and** Ta's tombstone.
+fn seed45_preload(rig: &mut Rig) -> Ts {
     rig.preload(b"/t/1/k", b"v");
-    // Ta deletes k and commits; Tb inserts k (over the tombstone) and
-    // commits; an RR txn with S below both requests KEY SHARE → 40001
-    // because Ta's tombstone is in N (seed 45), even though the newest
-    // version (Tb's) is a plain write.
     let s_below = rig.core.visible_ts();
     let ta = rig.txn(Isolation::ReadCommitted);
     let sa = ok(ta.next_seq());
@@ -554,7 +609,16 @@ fn seed45_keyshare_examines_all_newer() {
     rig.commit(tb);
     ok(Resolver::run_once(&rig.core));
     ok(Resolver::run_once(&rig.core));
+    s_below
+}
 
+#[test]
+fn seed45_keyshare_examines_all_newer() {
+    let mut rig = Rig::new();
+    let s_below = seed45_preload(&mut rig);
+    // An RR txn with S below both requests KEY SHARE → 40001 because Ta's
+    // tombstone is in N (seed 45), even though the newest version (Tb's)
+    // is a plain write.
     let rr = rig.txn(Isolation::RepeatableRead);
     let sq = ok(rr.next_seq());
     let err = rig
@@ -570,6 +634,33 @@ fn seed45_keyshare_examines_all_newer() {
         .expect_err("a tombstone inside N blocks KEY SHARE (seed 45)");
     assert_eq!(err, TxnError::SerializationFailure);
     ok(rig.core.abort(rr));
+}
+
+/// Seed 45's RC variant (C-T2 rework 5): the EPQ pass of a KEY SHARE
+/// request examines every version above `S` — the tombstone below Tb's
+/// live write fails it, so the row is skipped even though the newest
+/// version is live. Mutant: `above_s.iter().take(1)` (only the newest
+/// examined → the lock is granted).
+#[test]
+fn seed45_rc_keyshare_examines_all_newer() {
+    let mut rig = Rig::new();
+    let s_below = seed45_preload(&mut rig);
+    let rc = rig.txn(Isolation::ReadCommitted);
+    let sq = ok(rc.next_seq());
+    let out = ok(rig.core.row_op(
+        &rc,
+        b"/t/1/k",
+        None,
+        lock_op(RowLockMode::KeyShare),
+        StmtCtx::new(s_below, sq, sq),
+        &mut ApplyOp(lock_op(RowLockMode::KeyShare)),
+    ));
+    assert_eq!(
+        out,
+        RowOutcome::Skipped(SkipReason::EpqFailed),
+        "the tombstone above S fails the KEY SHARE EPQ (seed 45, RC)"
+    );
+    ok(rig.core.abort(rc));
 }
 
 // ---- seed 47: EPQ re-verifies ---------------------------------------------
@@ -637,7 +728,7 @@ fn seed47_epq_reverifies() {
     // The EPQ closure evaluated the remembered version (v = 2).
     let mut epq = IncrEpq;
     match epq.recheck(&req.v) {
-        EpqDecision::Apply(op) => task.epq_result(EpqDecision::Apply(op)),
+        EpqDecision::Apply(op) => ok(task.epq_result(EpqDecision::Apply(op))),
         EpqDecision::Skip => panic!("qual passed"),
     }
     // Next step: the newest is no longer v → EPQ again (seed 47).
@@ -647,7 +738,7 @@ fn seed47_epq_reverifies() {
     };
     assert_eq!(req2.v.ts, ts3, "re-EPQ against the newer version");
     match epq.recheck(&req2.v) {
-        EpqDecision::Apply(op) => task.epq_result(EpqDecision::Apply(op)),
+        EpqDecision::Apply(op) => ok(task.epq_result(EpqDecision::Apply(op))),
         EpqDecision::Skip => panic!("qual passed"),
     }
     // Now places, counting both increments.
@@ -719,7 +810,7 @@ fn seed52_epq_once_over_nonconflicting_intent() {
         assert!(steps < 20, "too many steps");
         match task.step(&rig.core, &t1).expect("step") {
             Step::Epq(req) => match epq.recheck(&req.v) {
-                EpqDecision::Apply(op) => task.epq_result(EpqDecision::Apply(op)),
+                EpqDecision::Apply(op) => ok(task.epq_result(EpqDecision::Apply(op))),
                 EpqDecision::Skip => break RowOutcome::Skipped(SkipReason::EpqFailed),
             },
             Step::Done(o) => break o,
@@ -1125,7 +1216,7 @@ fn nowait_and_skip_locked_on_conflicting_shared_holders() {
     ok(rig.core.abort(t1));
     // Put the stale entry back by hand: the release ran, but a late entry
     // simulates "committed-visible before its release ran".
-    ok(locks.grant(b"/t/1/k", t1_id, RowLockMode::Share, 0));
+    ok(locks.grant(b"/t/1/k", t1_id, RowLockMode::Share, 0, None));
     let t3 = rig.txn(Isolation::ReadCommitted);
     let s3 = ok(t3.next_seq());
     let mut task = RowOpTask::new(
@@ -1485,6 +1576,204 @@ fn update_pk_leaves_a_moved_tombstone_and_blocks_epq_and_waits() {
         .expect_err("EPQ over a moved tombstone is 40001");
     assert_eq!(err, TxnError::SerializationFailure);
     ok(rig.core.abort(t3));
+}
+
+/// The PK-changer's EPQ closure (rework 1's value test): the new row is
+/// the newest committed value with "+10" appended, computed from the
+/// version the EPQ re-checked. A tombstone skips.
+struct ConcatEpq;
+impl Epq for ConcatEpq {
+    fn recheck(&mut self, newest: &CommittedVersion) -> EpqDecision {
+        match &newest.value {
+            nucleus_txn::encoding::VersionValue::Live { payload, .. } => {
+                EpqDecision::Apply(RowOp::Update {
+                    value: [payload.as_slice(), b"+10"].concat(),
+                    key_cols_changed: false,
+                })
+            }
+            nucleus_txn::encoding::VersionValue::Tombstone { .. } => EpqDecision::Skip,
+        }
+    }
+}
+
+/// C-T2 rework 1, case 1: `update_pk`'s EPQ that reaches a moved
+/// tombstone raises 40001 (§5.2 "Moved rows"), never a skip that silently
+/// drops the row. Mutant: the direct `recheck` call in `row_op_task`.
+#[test]
+fn update_pk_epq_moved_tombstone_is_40001() {
+    let mut rig = Rig::new();
+    let s_below = rig.core.visible_ts();
+    rig.preload(b"/t/1/r1", b"row");
+    // Another PK change moved r1 away: the old key's newest version is a
+    // moved tombstone above s_below.
+    {
+        let tm = rig.txn(Isolation::ReadCommitted);
+        let sm = ok(tm.next_seq());
+        ok(rig.core.update_pk(
+            &tm,
+            b"/t/1/r1",
+            b"/t/1/r9",
+            b"row".to_vec(),
+            StmtCtx::new(rig.core.visible_ts(), sm, sm),
+            &mut ApplyOp(RowOp::Delete),
+        ));
+        rig.commit(tm);
+        ok(Resolver::run_once(&rig.core));
+    }
+    let t = rig.txn(Isolation::ReadCommitted);
+    let s = ok(t.next_seq());
+    let err = rig
+        .core
+        .update_pk(
+            &t,
+            b"/t/1/r1",
+            b"/t/1/r2",
+            b"row".to_vec(),
+            StmtCtx::new(s_below, s, s),
+            &mut ApplyOp(RowOp::Delete),
+        )
+        .expect_err("a moved tombstone under the PK change's EPQ is 40001 (§5.2)");
+    assert_eq!(err, TxnError::SerializationFailure);
+    ok(rig.core.abort(t));
+}
+
+/// C-T2 rework 1, case 2: a plain tombstone under the EPQ skips the row
+/// and the **new key is not inserted** — the callback would apply (the
+/// fixed `ApplyOp`), so only the §5.2 rule can produce the skip. Mutant:
+/// the direct `recheck` call resurrects the row under the new key.
+#[test]
+fn update_pk_epq_tombstone_skips_without_inserting() {
+    let mut rig = Rig::new();
+    let s_below = rig.core.visible_ts();
+    rig.preload(b"/t/1/r1", b"row");
+    // Delete r1 above s_below: the old key's newest version is a
+    // tombstone.
+    {
+        let td = rig.txn(Isolation::ReadCommitted);
+        let sd = ok(td.next_seq());
+        ok(rig.core.row_op(
+            &td,
+            b"/t/1/r1",
+            None,
+            RowOp::Delete,
+            StmtCtx::new(rig.core.visible_ts(), sd, sd),
+            &mut ApplyOp(RowOp::Delete),
+        ));
+        rig.commit(td);
+        ok(Resolver::run_once(&rig.core));
+    }
+    let t = rig.txn(Isolation::ReadCommitted);
+    let s = ok(t.next_seq());
+    let out = ok(rig.core.update_pk(
+        &t,
+        b"/t/1/r1",
+        b"/t/1/r2",
+        b"row".to_vec(),
+        StmtCtx::new(s_below, s, s),
+        &mut ApplyOp(RowOp::Update {
+            value: b"row".to_vec(),
+            key_cols_changed: false,
+        }),
+    ));
+    assert_eq!(out, RowOutcome::Skipped(SkipReason::EpqFailed));
+    assert!(
+        rig.core
+            .latest_get(&intent_key(b"/t/1/r2"))
+            .expect("read")
+            .is_none(),
+        "the new key was not inserted"
+    );
+    assert!(
+        rig.core
+            .latest_get(&intent_key(b"/t/1/r1"))
+            .expect("read")
+            .is_none(),
+        "no intent was placed on the old key either"
+    );
+}
+
+/// C-T2 rework 1, case 3: a concurrent update `1 → 2`, then `+10` — the
+/// new key holds `"2+10"`, the value computed from the EPQ version, not
+/// the stale snapshot value `"1+10"`. Mutant: the direct `recheck` call
+/// drops the applied value and the new key gets the stale one.
+#[test]
+fn update_pk_takes_the_new_row_value_from_the_epq_apply() {
+    let mut rig = Rig::new();
+    let ts1 = rig.preload(b"/t/1/r1", b"1");
+    // A concurrent update 1 -> 2 commits above the PK-changer's base.
+    {
+        let a = rig.txn(Isolation::ReadCommitted);
+        let sa = ok(a.next_seq());
+        ok(rig.core.row_op(
+            &a,
+            b"/t/1/r1",
+            None,
+            RowOp::Update {
+                value: b"2".to_vec(),
+                key_cols_changed: false,
+            },
+            StmtCtx::new(ts1, sa, sa),
+            &mut IncrEpq,
+        ));
+        rig.commit(a);
+        ok(Resolver::run_once(&rig.core));
+    }
+    let t = rig.txn(Isolation::ReadCommitted);
+    let s = ok(t.next_seq());
+    ok(rig.core.update_pk(
+        &t,
+        b"/t/1/r1",
+        b"/t/1/r2",
+        // The caller's snapshot computation: "1" + "+10".
+        b"1+10".to_vec(),
+        StmtCtx::new(ts1, s, s),
+        &mut ConcatEpq,
+    ));
+    // The old key holds the moved delete; the new key holds "2+10".
+    assert!(matches!(
+        rig.intent(b"/t/1/r1").layers.last().map(|l| l.data.clone()),
+        Some(nucleus_txn::LayerData::Delete { moved: true })
+    ));
+    let new_data = rig.intent(b"/t/1/r2").layers.last().map(|l| l.data.clone());
+    assert!(
+        matches!(&new_data, Some(nucleus_txn::LayerData::Write { value, .. }) if value == b"2+10"),
+        "the new row value comes from the EPQ Apply (2+10), not the snapshot (1+10): {new_data:?}"
+    );
+    let ts = rig.commit(t);
+    ok(Resolver::run_once(&rig.core));
+    assert!(
+        matches!(
+            &rig.version(b"/t/1/r2", ts),
+            nucleus_txn::encoding::VersionValue::Live { payload, .. } if payload == b"2+10"
+        ),
+        "the committed new-key version holds the EPQ-computed value"
+    );
+}
+
+/// C-T2 rework 7d: `epq_result` after a step that did not return `Epq` is
+/// an invariant error — there is no remembered version, and silently
+/// re-basing on `S` would skip the seed 47 re-check. Mutant: the old
+/// `epq_result`, which returned `()` (and reset `base` to `None`).
+#[test]
+fn epq_result_after_a_non_epq_step_is_an_invariant_error() {
+    let mut rig = Rig::new();
+    rig.preload(b"/t/1/k", b"v");
+    let t = rig.txn(Isolation::ReadCommitted);
+    let s = ok(t.next_seq());
+    let mut task = RowOpTask::new(
+        b"/t/1/k",
+        None,
+        lock_op(RowLockMode::Update),
+        StmtCtx::new(rig.core.visible_ts(), s, s),
+    );
+    match task.step(&rig.core, &t).expect("step") {
+        Step::Done(RowOutcome::Applied) => {}
+        st => panic!("expected Done, got {st:?}"),
+    }
+    let err = task
+        .epq_result(EpqDecision::Apply(RowOp::Delete))
+        .expect_err("epq_result after a non-Epq step is an invariant error");
+    assert!(matches!(err, TxnError::Invariant(_)));
 }
 
 // ---- cancellation -------------------------------------------------------------

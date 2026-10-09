@@ -1,7 +1,7 @@
 //! Unit tests of the pure §2.1 layer rules (the card's "Layers" table
 //! test). Interleaving tests live in `tests/`.
 
-use crate::write::{apply_change, Change};
+use crate::write::layer::{apply_change, Change};
 use crate::{Intent, Layer, LayerData, RowLockMode, TxnId};
 
 const W: TxnId = TxnId { epoch: 1, n: 1 };
@@ -452,6 +452,29 @@ mod c_t2c_seams {
 
         let pre = ArbiterPreCheck::new(b"/u/1/zz", None, Some(b"/t/1/r0".to_vec()));
         assert_eq!(pre.step(&core, &txn).expect("step"), ArbPreStep::Insert);
+    }
+
+    /// C-T2 rework 4: an own `Delete` layer on the arbiter key means "not
+    /// live", exactly as in `unique_verdict` — the txn deleted the entry,
+    /// so the pre-check returns `Insert`. Mutant: the own Delete falls
+    /// through to the newest committed version (a live entry → Conflict).
+    #[test]
+    fn arbiter_pre_check_own_delete_is_not_live() {
+        let (core, mut pipeline) = new_core();
+        committed_row(&core, &mut pipeline, b"/u/1/k", b"/t/1/r0");
+        let txn = core.begin(Isolation::ReadCommitted);
+        // The txn deletes the arbiter key: an own intent whose top layer
+        // is a Delete.
+        let seq = txn.next_seq().expect("seq");
+        let ctx = StmtCtx::new(core.visible_ts(), seq, seq);
+        core.row_op(&txn, b"/u/1/k", None, RowOp::Delete, ctx, &mut NoopEpq)
+            .expect("delete");
+        let pre = ArbiterPreCheck::new(b"/u/1/k", None, Some(b"/t/1/r9".to_vec()));
+        assert_eq!(
+            pre.step(&core, &txn).expect("step"),
+            ArbPreStep::Insert,
+            "an own Delete is not live: the pre-check inserts (rework 4)"
+        );
     }
 
     /// A foreign **pending** data intent waits; a lock-only one does not

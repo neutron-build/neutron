@@ -353,13 +353,24 @@ impl<K: OrderedKv> Core<K> {
         // (commit order equals prepare order because the commit thread
         // assigns commit_ts in channel order).
         let mut req = Some(req);
-        self.ssi_hook()
-            .pre_commit(txn.id, txn.isolation, &mut || -> Result<(), TxnError> {
-                let req = req
-                    .take()
-                    .ok_or_else(|| TxnError::Invariant("enqueue ran twice".into()))?;
-                self.send_commit(req)
-            })?;
+        let enqueue =
+            self.ssi_hook()
+                .pre_commit(txn.id, txn.isolation, &mut || -> Result<(), TxnError> {
+                    let req = req
+                        .take()
+                        .ok_or_else(|| TxnError::Invariant("enqueue ran twice".into()))?;
+                    self.send_commit(req)
+                });
+        if let Err(e) = enqueue {
+            // C-T2 rework 2 / §7.1: the request never reached the channel,
+            // so the commit thread will never act on this txn — it aborts
+            // here, before the error surfaces, or it would stay Pending
+            // forever with its waiters unparked and its intents in the KV.
+            // `abort` runs the full §7.1 sequence: Aborted, release, bump
+            // and wake, released, cleanup queued.
+            self.abort(txn)?;
+            return Err(e);
+        }
         Ok(ticket)
     }
 
@@ -392,13 +403,15 @@ impl<K: OrderedKv> Core<K> {
     }
 
     /// §6 "Release" / §3 step 5: release every shared row lock `txn` holds,
-    /// each under its key's latch (seed 46), bumping the holder's wake
-    /// generation after the removal (the generation bump that follows in
-    /// every caller). Crate-private: commit step 5, abort and the no-write
-    /// fast path are the callers.
+    /// each under `latch_key(key, prefix)` with the prefix the grant ran
+    /// under (rework 7b; seed 46), bumping the holder's wake generation
+    /// after the removal (the generation bump that follows in every
+    /// caller). Crate-private: commit step 5, abort and the no-write fast
+    /// path are the callers.
     pub(crate) fn release_row_locks(&self, txn: TxnId) {
-        for key in self.row_locks().keys_of(txn, 0) {
-            let _latch = self.latches.lock(&key);
+        for (key, prefix) in self.row_locks().keys_of(txn, 0) {
+            let lk = crate::latch::latch_prefix_of(&key, prefix).unwrap_or(&key);
+            let _latch = self.latches.lock(lk);
             self.row_locks().release(&key, txn, 0);
         }
     }
@@ -825,10 +838,11 @@ impl<K: OrderedKv> Core<K> {
         )
     }
 
-    /// Installs the fail-stop hook (§3). Public: the same slot
-    /// [`CommitConfig::fail_stop`] fills through
-    /// [`CommitPipeline::with_config`], for callers that attach no thread.
-    pub fn set_fail_stop(&self, hook: Arc<dyn FailStop>) {
+    /// Installs the fail-stop hook (§3). Crate-private (C-T2 rework 7e):
+    /// the public path is [`CommitPipeline::with_config`] (which also
+    /// orders the install after the attach, follow-up 4); the pipeline and
+    /// the resolver are the only in-crate callers.
+    pub(crate) fn set_fail_stop(&self, hook: Arc<dyn FailStop>) {
         *self
             .fail_stop
             .lock()

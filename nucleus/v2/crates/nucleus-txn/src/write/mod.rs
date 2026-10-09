@@ -47,9 +47,7 @@ pub use ctx::{
     CommittedVersion, Epq, EpqDecision, EpqRequest, LockWait, RowOp, RowOutcome, SkipReason,
     StmtCtx, UniqueRule, WaitSet,
 };
-pub use layer::{apply_change, Change};
 pub use step::{KeyOpTask, RowOpTask, Step};
 pub use unique::{DefStep, DeferrableCheckTask};
-
 #[cfg(test)]
 mod tests;

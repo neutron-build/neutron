@@ -181,6 +181,96 @@ fn seed37_waiter_returns_when_target_truncated() {
     }
 }
 
+/// C-T2 rework 6: one holder with several acquisitions (KEY SHARE at seq
+/// 1, SHARE at seq 2) appears **once** in the wait set, so
+/// `on_wait_start`/`on_wait_end` fire once per target txn (the wait
+/// registers per entry; a duplicate would double-register the edge).
+/// Mutant: no dedup of the holders list.
+#[test]
+fn wait_targets_are_deduped_per_txn() {
+    let mut rig = Rig::new();
+    {
+        let t0 = rig.txn();
+        let s0 = ok(t0.next_seq());
+        ok(rig.core.insert_key(
+            &t0,
+            b"/t/1/k",
+            None,
+            b"v0".to_vec(),
+            StmtCtx::new(rig.core.visible_ts(), s0, s0),
+            nucleus_txn::write::UniqueRule::Unique { same_row: None },
+        ));
+        rig.commit(t0);
+        ok(Resolver::run_once(&rig.core));
+    }
+    // One holder acquires twice: KEY SHARE at seq 1, SHARE at seq 2.
+    let h = rig.txn();
+    let sh1 = ok(h.next_seq());
+    ok(rig.core.row_op(
+        &h,
+        b"/t/1/k",
+        None,
+        RowOp::Lock(RowLockMode::KeyShare),
+        StmtCtx::new(rig.core.visible_ts(), sh1, sh1),
+        &mut Fixed(RowOp::Lock(RowLockMode::KeyShare)),
+    ));
+    let sh2 = ok(h.next_seq());
+    ok(rig.core.row_op(
+        &h,
+        b"/t/1/k",
+        None,
+        RowOp::Lock(RowLockMode::Share),
+        StmtCtx::new(rig.core.visible_ts(), sh2, sh2),
+        &mut Fixed(RowOp::Lock(RowLockMode::Share)),
+    ));
+
+    // An UPDATE conflicts with both acquisitions: one Wait with one entry.
+    let w = rig.txn();
+    let sw = ok(w.next_seq());
+    let mut task = RowOpTask::new(
+        b"/t/1/k",
+        None,
+        RowOp::Update {
+            value: b"v1".to_vec(),
+            key_cols_changed: false,
+        },
+        StmtCtx::new(rig.core.visible_ts(), sw, sw),
+    );
+    let targets = match task.step(&rig.core, &w).expect("step") {
+        nucleus_txn::write::Step::Wait(t) => t,
+        s => panic!("expected Wait on the shared holder, got {s:?}"),
+    };
+    assert_eq!(targets, vec![(h.id, 0)], "one entry per txn (rework 6)");
+
+    // The hook fires once per target txn, not once per acquisition.
+    #[derive(Default)]
+    struct RecHook {
+        starts: std::sync::Mutex<Vec<(nucleus_txn::TxnId, nucleus_txn::TxnId)>>,
+        ends: std::sync::Mutex<Vec<(nucleus_txn::TxnId, nucleus_txn::TxnId)>>,
+    }
+    impl nucleus_txn::wait::WaitHook for RecHook {
+        fn on_wait_start(&self, waiter: nucleus_txn::TxnId, target: nucleus_txn::TxnId) {
+            self.starts.lock().expect("starts").push((waiter, target));
+        }
+        fn on_wait_end(&self, waiter: nucleus_txn::TxnId, target: nucleus_txn::TxnId) {
+            self.ends.lock().expect("ends").push((waiter, target));
+        }
+    }
+    let hook = Arc::new(RecHook::default());
+    rig.core
+        .waits
+        .set_hook(Arc::clone(&hook) as Arc<dyn nucleus_txn::wait::WaitHook>);
+    let h_id = h.id;
+    ok(rig.core.abort(h));
+    assert_eq!(
+        rig.core.wait_on_any(&w, &targets),
+        WaitOutcome::Aborted,
+        "the wait ends when the (single) holder ends"
+    );
+    assert_eq!(&*hook.starts.lock().expect("starts"), &[(w.id, h_id)]);
+    assert_eq!(&*hook.ends.lock().expect("ends"), &[(w.id, h_id)]);
+}
+
 /// §5.1: two conflicting shared holders → one `Wait` with both; the waiter
 /// wakes when either ends, re-waits on the rest, and finally places.
 #[test]

@@ -129,8 +129,9 @@ fn a_written_txn_commits_through_the_pipeline() {
         Some(TxnStatus::Committed(ts))
     );
     // The ack (step 4) precedes step 5; poll for the release.
-    common::note_committed(&core, txn_id);
-    common::wait_released(&core, txn_id);
+    let tcore = common::TestCore::from_arc(std::sync::Arc::clone(&core));
+    common::note_committed(&tcore, txn_id);
+    common::wait_released(&tcore, txn_id);
     assert_eq!(core.status.entry(txn_id).map(|e| e.released), Some(true));
     ok(handle.shutdown());
 }

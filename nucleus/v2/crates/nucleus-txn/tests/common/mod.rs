@@ -485,35 +485,71 @@ impl<B: OrderedKv> OrderedKv for CrashAt<B> {
 
 /// Records that `id` was committed (the caller holds the ack). Used by
 /// [`wait_released`]'s missing-entry rule: an entry that vanished may only
-/// count as released for a txn known to have committed. Keyed **per core**
-/// (C-T1b follow-up 5): every test's core allocates the same dense ids, so
-/// one process-wide set would leak acks between tests.
-pub fn note_committed<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleus_txn::TxnId) {
+/// count as released for a txn known to have committed. Keyed by the
+/// [`TestCore`] wrapper's per-core token (C-T2 rework 7c): every test's
+/// core allocates the same dense ids, and an address-keyed map would also
+/// alias a dropped core with the next core allocated at the same address.
+pub fn note_committed<K: OrderedKv>(core: &TestCore<K>, id: nucleus_txn::TxnId) {
     seen_committed()
         .lock()
         .expect("seen")
-        .entry(core_key(core))
+        .entry(core.token)
         .or_default()
         .insert(id);
-}
-
-/// The identity of one core inside this process: its address (stable for
-/// the `Arc`'s lifetime, unique among live cores).
-fn core_key<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>) -> usize {
-    std::ptr::from_ref(core).addr()
 }
 
 /// TxnIds each core in this test process has observed `Committed` at least
 /// once, for [`wait_released`]'s missing-entry rule.
 fn seen_committed() -> &'static std::sync::Mutex<
-    std::collections::HashMap<usize, std::collections::HashSet<nucleus_txn::TxnId>>,
+    std::collections::HashMap<u64, std::collections::HashSet<nucleus_txn::TxnId>>,
 > {
     static SEEN: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<usize, std::collections::HashSet<nucleus_txn::TxnId>>,
+            std::collections::HashMap<u64, std::collections::HashSet<nucleus_txn::TxnId>>,
         >,
     > = std::sync::OnceLock::new();
     SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A test core wrapper (C-T2 rework 7c): the [`Core`] plus a process-wide
+/// unique token (a monotonic counter, never reused — unlike an address,
+/// which the allocator hands to the next core after this one drops). The
+/// `seen_committed` map is keyed by it. Create one per core, once, with
+/// [`TestCore::open`] or [`TestCore::from_arc`].
+pub struct TestCore<K: OrderedKv> {
+    pub core: Arc<nucleus_txn::boot::Core<K>>,
+    token: u64,
+}
+
+impl<K: OrderedKv> TestCore<K> {
+    /// Opens a core and wraps it.
+    pub fn open(kv: K) -> std::result::Result<TestCore<K>, nucleus_txn::TxnError> {
+        Ok(TestCore::from_arc(Arc::new(nucleus_txn::boot::Core::open(
+            kv,
+        )?)))
+    }
+
+    /// Wraps an already-opened core. One wrapper per core: two wrappers of
+    /// one core do not share a `seen_committed` entry.
+    pub fn from_arc(core: Arc<nucleus_txn::boot::Core<K>>) -> TestCore<K> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        TestCore {
+            core,
+            token: NEXT.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+
+    /// This wrapper's process-unique token.
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+impl<K: OrderedKv> std::ops::Deref for TestCore<K> {
+    type Target = nucleus_txn::boot::Core<K>;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
 }
 
 /// Waits until commit step 5 has run for `id` (`released`). The ack (step 4)
@@ -524,10 +560,10 @@ fn seen_committed() -> &'static std::sync::Mutex<
 /// have truncated the entry before this helper first looked). An entry that
 /// vanishes without the txn ever being known committed is a failure, not a
 /// pass.
-pub fn wait_released<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleus_txn::TxnId) {
-    let key = core_key(core);
+pub fn wait_released<K: OrderedKv>(core: &TestCore<K>, id: nucleus_txn::TxnId) {
+    let key = core.token;
     for _ in 0..10_000 {
-        match core.status.entry(id) {
+        match core.core.status.entry(id) {
             Some(e) => {
                 if matches!(e.status, nucleus_txn::TxnStatus::Committed(_)) {
                     note_committed(core, id);
@@ -597,18 +633,23 @@ pub fn assert_count_exact<K: OrderedKv>(
     }
 }
 
+/// One recorded grant of [`TestRowLocks`]: key, txn, mode, acquiring seq,
+/// and the latch prefix the grant ran under (§5.0, rework 7b).
+pub type TestGrant = (
+    nucleus_kv::Key,
+    nucleus_txn::TxnId,
+    nucleus_txn::RowLockMode,
+    nucleus_txn::Seq,
+    Option<usize>,
+);
+
 /// The card's Vec-backed [`RowLocks`](nucleus_txn::write::RowLocks) double
-/// (C-T2b replaces it with the real table): one shared list of grants.
+/// (C-T2b replaces it with the real table): one shared list of grants,
+/// each remembering the latch prefix its grant ran under (rework 7b), so
+/// `keys_of` hands the release paths the right `latch_key`.
 #[derive(Default)]
 pub struct TestRowLocks {
-    grants: Mutex<
-        Vec<(
-            nucleus_kv::Key,
-            nucleus_txn::TxnId,
-            nucleus_txn::RowLockMode,
-            nucleus_txn::Seq,
-        )>,
-    >,
+    grants: Mutex<Vec<TestGrant>>,
 }
 
 impl TestRowLocks {
@@ -617,14 +658,7 @@ impl TestRowLocks {
     }
 
     /// The raw grant list, copied out (test assertions).
-    pub fn snapshot(
-        &self,
-    ) -> Vec<(
-        nucleus_kv::Key,
-        nucleus_txn::TxnId,
-        nucleus_txn::RowLockMode,
-        nucleus_txn::Seq,
-    )> {
+    pub fn snapshot(&self) -> Vec<TestGrant> {
         self.grants.lock().expect("grants").clone()
     }
 }
@@ -642,8 +676,8 @@ impl nucleus_txn::write::RowLocks for TestRowLocks {
             .lock()
             .expect("grants")
             .iter()
-            .filter(|(k, _, _, _)| k.as_slice() == key)
-            .map(|(_, t, m, s)| (*t, *m, *s))
+            .filter(|(k, _, _, _, _)| k.as_slice() == key)
+            .map(|(_, t, m, s, _)| (*t, *m, *s))
             .collect()
     }
 
@@ -653,21 +687,26 @@ impl nucleus_txn::write::RowLocks for TestRowLocks {
         txn: nucleus_txn::TxnId,
         mode: nucleus_txn::RowLockMode,
         seq: nucleus_txn::Seq,
+        latch_prefix: Option<usize>,
     ) -> std::result::Result<(), nucleus_txn::TxnError> {
         self.grants
             .lock()
             .expect("grants")
-            .push((key.to_vec(), txn, mode, seq));
+            .push((key.to_vec(), txn, mode, seq, latch_prefix));
         Ok(())
     }
 
-    fn keys_of(&self, txn: nucleus_txn::TxnId, from_seq: nucleus_txn::Seq) -> Vec<nucleus_kv::Key> {
+    fn keys_of(
+        &self,
+        txn: nucleus_txn::TxnId,
+        from_seq: nucleus_txn::Seq,
+    ) -> Vec<(nucleus_kv::Key, Option<usize>)> {
         self.grants
             .lock()
             .expect("grants")
             .iter()
-            .filter(|(_, t, _, s)| *t == txn && *s >= from_seq)
-            .map(|(k, _, _, _)| k.clone())
+            .filter(|(_, t, _, s, _)| *t == txn && *s >= from_seq)
+            .map(|(k, _, _, _, p)| (k.clone(), *p))
             .collect()
     }
 
@@ -675,7 +714,7 @@ impl nucleus_txn::write::RowLocks for TestRowLocks {
         self.grants
             .lock()
             .expect("grants")
-            .retain(|(k, t, _, s)| !(k.as_slice() == key && *t == txn && *s >= from_seq));
+            .retain(|(k, t, _, s, _)| !(k.as_slice() == key && *t == txn && *s >= from_seq));
     }
 }
 

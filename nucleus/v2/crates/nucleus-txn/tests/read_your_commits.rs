@@ -63,8 +63,9 @@ fn a_new_snapshot_sees_the_commit_across_threads() {
     // Instead: resolve and read the version at exactly ts1.
     let ts2 = ok(core.commit(w2, SyncCommit::Off));
     assert!(ts2 > ts1);
-    common::note_committed(&core, w2_id);
-    common::wait_released(&core, w2_id);
+    let tcore = common::TestCore::from_arc(Arc::clone(&core));
+    common::note_committed(&tcore, w2_id);
+    common::wait_released(&tcore, w2_id);
     ok(Resolver::run_once(&core));
     let view = core.open_view();
     let ctx = ReadCtx {

@@ -161,8 +161,10 @@ fn pre_commit_wraps_the_enqueue() {
 fn step4_status_failure_stops_the_group() {
     let core = Arc::new(ok(Core::open(RecKv::new())));
     let fs = RecFailStop::new();
-    core.set_fail_stop(fs.clone());
-    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    let mut pipeline = ok(CommitPipeline::with_config(
+        Arc::clone(&core),
+        CommitConfig::new().with_fail_stop(fs.clone()),
+    ));
 
     let t1 = core.begin(nucleus_txn::txn::Isolation::ReadCommitted);
     one_write(&core, &t1);
@@ -221,8 +223,10 @@ fn wal_reached_error_acks_are_indeterminate() {
     let kv = FailNthKv::new();
     let core = Arc::new(ok(Core::open(kv.clone())));
     let fs = RecFailStop::new();
-    core.set_fail_stop(fs.clone());
-    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    let mut pipeline = ok(CommitPipeline::with_config(
+        Arc::clone(&core),
+        CommitConfig::new().with_fail_stop(fs.clone()),
+    ));
 
     let t1 = core.begin(nucleus_txn::txn::Isolation::ReadCommitted);
     one_write(&core, &t1);
@@ -249,8 +253,10 @@ fn step2_failure_at_first_request_acks_raw_error() {
     let kv = FailNthKv::new();
     let core = Arc::new(ok(Core::open(kv.clone())));
     let fs = RecFailStop::new();
-    core.set_fail_stop(fs.clone());
-    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    let mut pipeline = ok(CommitPipeline::with_config(
+        Arc::clone(&core),
+        CommitConfig::new().with_fail_stop(fs.clone()),
+    ));
     let t1 = core.begin(nucleus_txn::txn::Isolation::ReadCommitted);
     one_write(&core, &t1);
     let a1 = ok(core.commit_submit(t1, SyncCommit::On));
@@ -332,4 +338,158 @@ fn abort_reports_to_the_ssi_hook() {
     ok(core.abort(t));
     assert_eq!(&*ssi.aborts.lock().expect("aborts"), &[id]);
     let _ = Duration::from_millis(0);
+}
+
+/// Gives a txn one write on a fixed key (through the write path) so it is
+/// not on the no-write fast path.
+fn one_write_at(core: &Arc<Core<RecKv>>, txn: &Txn, key: &[u8]) {
+    let s = ok(txn.next_seq());
+    ok(core.insert_key(
+        txn,
+        key,
+        None,
+        b"v".to_vec(),
+        nucleus_txn::write::StmtCtx::new(core.visible_ts(), s, s),
+        nucleus_txn::write::UniqueRule::Unique { same_row: None },
+    ));
+}
+
+/// C-T2 rework 2: a failed `pre_commit` (here the §8.4 gate) aborts the
+/// txn before the error surfaces — §7.1 runs (Aborted, release, bump +
+/// wake, released, cleanup queued), a waiter on its intent wakes, and
+/// after `Resolver::run_once` no intent remains. A txn that stayed
+/// Pending would park its waiters forever. Mutant: return the error
+/// without aborting.
+#[test]
+fn failed_pre_commit_aborts_the_txn_and_wakes_waiters() {
+    let core = Arc::new(ok(Core::open(RecKv::new())));
+    core.set_row_locks(TestRowLocks::new());
+    let ssi = common::RecordingSsi::new();
+    core.set_ssi_hook(ssi.clone());
+    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    let parkers = common::InfiniteParkers::new();
+    core.waits.set_parker_maker(parkers.clone());
+
+    // T1 holds a write intent on /t/1/k.
+    let t1 = core.begin(nucleus_txn::txn::Isolation::ReadCommitted);
+    let t1_id = t1.id;
+    one_write_at(&core, &t1, b"/t/1/k");
+
+    // T2 waits on it, parked (the infinite parker makes a lost wake a
+    // hang, not a timeout rescue). The thread also aborts T2 once the op
+    // completes, so one resolver round drains both cleanups.
+    let t2 = core.begin(nucleus_txn::txn::Isolation::ReadCommitted);
+    let s2 = ok(t2.next_seq());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    {
+        let core2 = Arc::clone(&core);
+        std::thread::spawn(move || {
+            let _ = tx.send(core2.row_op(
+                &t2,
+                b"/t/1/k",
+                None,
+                nucleus_txn::write::RowOp::Update {
+                    value: b"v2".to_vec(),
+                    key_cols_changed: false,
+                },
+                nucleus_txn::write::StmtCtx::new(core2.visible_ts(), s2, s2),
+                &mut Fixed,
+            ));
+            let _ = tx2.send(core2.abort(t2));
+        });
+    }
+    parkers.wait_parked();
+
+    // The gate fails the pre-commit with 40001, before the enqueue.
+    ssi.close_gate(TxnError::SerializationFailure);
+    let err = match core.commit_submit(t1, SyncCommit::On) {
+        Err(e) => e,
+        Ok(_) => panic!("the closed gate fails the commit"),
+    };
+    assert_eq!(err, TxnError::SerializationFailure);
+    assert!(
+        pipeline.drain_available().is_empty(),
+        "the request never reached the channel"
+    );
+    // §7.1 ran for T1: Aborted and released, its SSI state dropped.
+    let entry = core.status.entry(t1_id).expect("T1's status entry");
+    assert_eq!(entry.status, nucleus_txn::TxnStatus::Aborted);
+    assert!(entry.released, "the abort marked T1 released");
+    assert_eq!(&*ssi.aborts.lock().expect("aborts"), &[t1_id]);
+
+    // The waiter woke, retried past the aborted intent, and placed.
+    match rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(Ok(nucleus_txn::write::RowOutcome::Applied)) => {}
+        other => panic!("the waiter was not woken and placed after the abort: {other:?}"),
+    }
+    assert!(rx2.recv_timeout(Duration::from_millis(100)).is_ok());
+
+    // Both cleanups were queued (T1's by the abort inside commit_submit,
+    // T2's by its own abort): one resolver round, then no intent remains.
+    ok(Resolver::run_once(&core));
+    let view = core.open_view();
+    let intents: Vec<nucleus_kv::Key> = view
+        .scan(
+            (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+            false,
+        )
+        .filter_map(|row| {
+            let (k, _) = row.expect("scan");
+            nucleus_txn::encoding::parse_key(&k)
+                .is_some_and(|(_, e)| matches!(e, nucleus_txn::encoding::Entry::Intent))
+                .then_some(k)
+        })
+        .collect();
+    drop(view);
+    assert!(
+        intents.is_empty(),
+        "no intent remains after the resolver round: {intents:?}"
+    );
+}
+
+/// C-T2 rework 7c: `seen_committed` is keyed by the wrapper's per-core
+/// token, never by the core's address — a dropped core's address is
+/// routinely handed to the next core, which would inherit the dead
+/// core's acks and let `wait_released` pass for a txn that never
+/// committed. Mutant: the address-keyed map.
+#[test]
+fn seen_committed_does_not_survive_address_reuse() {
+    use nucleus_kv::MemKv;
+    // One wrapper per attempt; the panic hook is silenced while the
+    // correct code fails `wait_released` on purpose.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut collided = false;
+    for _ in 0..64 {
+        let c1 = common::TestCore::<MemKv>::open(MemKv::new()).expect("core");
+        let addr1 = std::ptr::from_ref(c1.core.as_ref()).addr();
+        let id = nucleus_txn::TxnId {
+            epoch: c1.epoch(),
+            n: 3,
+        };
+        common::note_committed(&c1, id);
+        drop(c1);
+        let c2 = common::TestCore::<MemKv>::open(MemKv::new()).expect("core");
+        let addr2 = std::ptr::from_ref(c2.core.as_ref()).addr();
+        if addr1 == addr2 {
+            collided = true;
+            // c2's txn 3 never began, let alone committed: wait_released
+            // must fail (panic), not treat the vanished entry as released.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                common::wait_released(&c2, id);
+            }));
+            assert!(
+                r.is_err(),
+                "the address-reused core inherited the dead core's seen acks"
+            );
+            break;
+        }
+    }
+    std::panic::set_hook(prev);
+    // No assertion on `collided`: the correct code passes with or without
+    // an observed collision; the address-keyed mutant fails whenever the
+    // allocator hands a dropped core's address to the next one (checked
+    // by applying the mutant — it fires on the first collision).
+    let _ = collided;
 }

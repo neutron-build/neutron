@@ -30,8 +30,9 @@ fn commit_one(
     let id = txn.id;
     place_intent(core, &txn, key, value);
     let ts = ok(core.commit(txn, sync));
-    common::note_committed(core, id);
-    common::wait_released(core, id);
+    let tcore = common::TestCore::from_arc(Arc::clone(core));
+    common::note_committed(&tcore, id);
+    common::wait_released(&tcore, id);
     (id, ts)
 }
 
@@ -355,8 +356,9 @@ fn resolver_error_requeues_the_work_and_reports_through_fail_stop() {
         let txn_id = txn.id;
         place_intent(&core, &txn, key.as_bytes(), b"v");
         let ts = ok(core.commit(txn, SyncCommit::On));
-        common::note_committed(&core, txn_id);
-        common::wait_released(&core, txn_id);
+        let tcore = common::TestCore::from_arc(Arc::clone(&core));
+        common::note_committed(&tcore, txn_id);
+        common::wait_released(&tcore, txn_id);
         committed.push((txn_id, key, ts));
     }
     let bg = ok(spawn_background(Arc::clone(&core)));
@@ -418,7 +420,7 @@ fn truncation_deletes_the_sys_log_record_with_the_status() {
     ok(core.submit(req));
     let ts = ok(ok(ack.recv_timeout(Duration::from_secs(5))));
     assert!(ts > Ts::ZERO);
-    common::wait_released(&core, txn_id);
+    common::wait_released(&common::TestCore::from_arc(Arc::clone(&core)), txn_id);
     // Both records exist right after the commit.
     assert!(
         ok(core.latest_get(&nucleus_txn::encoding::sys_log_key(txn_id))).is_some(),

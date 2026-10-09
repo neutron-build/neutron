@@ -22,10 +22,23 @@ pub trait RowLocks: Send + Sync {
     fn holders(&self, key: &[u8]) -> Vec<(TxnId, RowLockMode, Seq)>;
 
     /// Records that `txn` holds `mode` on `key` from `seq` (§5.1).
-    fn grant(&self, key: &[u8], txn: TxnId, mode: RowLockMode, seq: Seq) -> Result<(), TxnError>;
+    /// `latch_prefix` is the §5.0 prefix of `key` the grant's caller
+    /// latched (the deferrable `/i/{idx}/{key}` prefix, or `None`); the
+    /// table remembers it so `keys_of` can hand it back and every release
+    /// path latches `latch_key(key, prefix)` — the same latch the grant
+    /// ran under (seed 46, C-T2 rework 7b).
+    fn grant(
+        &self,
+        key: &[u8],
+        txn: TxnId,
+        mode: RowLockMode,
+        seq: Seq,
+        latch_prefix: Option<usize>,
+    ) -> Result<(), TxnError>;
 
-    /// Every key `txn` holds a shared lock on with `seq >= from_seq` (§5.5).
-    fn keys_of(&self, txn: TxnId, from_seq: Seq) -> Vec<Key>;
+    /// Every key `txn` holds a shared lock on with `seq >= from_seq`
+    /// (§5.5), each with the latch prefix its grant ran under (§5.0).
+    fn keys_of(&self, txn: TxnId, from_seq: Seq) -> Vec<(Key, Option<usize>)>;
 
     /// Drops `txn`'s shared locks on `key` with `seq >= from_seq` (§6, §5.5).
     /// The caller bumps the holder's wake generation after the removal.
@@ -50,13 +63,14 @@ impl RowLocks for NoRowLocks {
         _txn: TxnId,
         _mode: RowLockMode,
         _seq: Seq,
+        _latch_prefix: Option<usize>,
     ) -> Result<(), TxnError> {
         Err(TxnError::Invariant(
             "no row lock table installed (shared row locks need C-T2b's RowLocks)".into(),
         ))
     }
 
-    fn keys_of(&self, _txn: TxnId, _from_seq: Seq) -> Vec<Key> {
+    fn keys_of(&self, _txn: TxnId, _from_seq: Seq) -> Vec<(Key, Option<usize>)> {
         Vec::new()
     }
 

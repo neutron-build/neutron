@@ -187,6 +187,14 @@ fn latch_bytes(key: &[u8], latch_prefix: Option<usize>) -> &[u8] {
     latch_prefix_of(key, latch_prefix).unwrap_or(key)
 }
 
+/// Keeps one entry per txn in a wait set (rework 6: the wait registers and
+/// fires `on_wait_start`/`on_wait_end` per entry, so a holder with several
+/// acquisitions — KEY SHARE at seq 1, SHARE at seq 2 — must appear once).
+fn dedup_targets(targets: &mut WaitSet) {
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|(t, _)| seen.insert(*t));
+}
+
 /// What the task places once §5.1's checks passed: a layer change, or a
 /// shared lock granted in the [`RowLocks`](crate::write::RowLocks) table
 /// (§2.1: shared modes are never stored in intents).
@@ -256,10 +264,23 @@ pub(crate) fn place_step<K: OrderedKv>(
                         let top_lock = intent.top().map_or(RowLockMode::NoKeyUpdate, |t| t.lock);
                         let top_absent = intent.top().is_some_and(|t| t.data == LayerData::Absent);
                         // R3W-8: no wait on a lock-only intent over a live
-                        // row: a key-existence op raises 23505 at once.
+                        // row: a key-existence op raises the §5.3 verdict at
+                        // once. C-T2 rework 7a: only a `Unique` rule's op
+                        // conflicts here, and `same_row` never does — the
+                        // per-row verdict (`unique_verdict` with no own top
+                        // layer: W has no intent on the key) decides.
                         if key_exist && top_absent && state.committed_live() {
-                            drop(latch);
-                            return Err(TxnError::UniqueViolation);
+                            if let Some(rule) = unique {
+                                unique_verdict(
+                                    core,
+                                    txn,
+                                    key,
+                                    None,
+                                    state.newest_committed(),
+                                    rule,
+                                    ctx.snapshot(),
+                                )?;
+                            }
                         }
                         if requested.conflicts_with(top_lock) {
                             let g = gen_of(core, owner);
@@ -279,7 +300,9 @@ pub(crate) fn place_step<K: OrderedKv>(
 
         // §5.1: conflicting shared holders (§6): minus W, minus ended
         // holders; every conflicting holder's generation is read under this
-        // latch.
+        // latch. One entry per txn (rework 6: a holder with several
+        // acquisitions appears once, so `on_wait_start`/`on_wait_end` fire
+        // once per target txn).
         let holders: Vec<TxnId> = core
             .row_locks()
             .holders(key)
@@ -290,7 +313,8 @@ pub(crate) fn place_step<K: OrderedKv>(
             .map(|(h, _, _)| h)
             .collect();
         if !holders.is_empty() {
-            let targets: WaitSet = holders.iter().map(|h| (*h, gen_of(core, *h))).collect();
+            let mut targets: WaitSet = holders.iter().map(|h| (*h, gen_of(core, *h))).collect();
+            dedup_targets(&mut targets);
             drop(latch);
             return Ok(StepOutcome::Step(wait_or_err(ctx, key_exist, targets)?));
         }
@@ -379,7 +403,8 @@ pub(crate) fn place_step<K: OrderedKv>(
         // tagged with the writing command's seq (§5.5: `ROLLBACK TO s`
         // releases those taken at `seq >= s`); no intent is written (§2.1).
         if let PlaceAction::GrantShared(mode) = action {
-            core.row_locks().grant(key, txn.id, *mode, ctx.seq())?;
+            core.row_locks()
+                .grant(key, txn.id, *mode, ctx.seq(), latch_prefix)?;
             drop(latch);
             return Ok(StepOutcome::Step(Step::Done(RowOutcome::Applied)));
         }
@@ -545,15 +570,31 @@ impl RowOpTask {
         }
     }
 
+    /// The requested row-lock mode of the op the task currently carries
+    /// (§6): an EPQ `Apply` may have replaced the op, so the §5.2 pass
+    /// reads the mode here rather than caching the initial op's.
+    pub(crate) fn requested_mode(&self) -> RowLockMode {
+        self.op.requested_mode()
+    }
+
     /// Feeds the caller's §5.2 EPQ verdict back: `Apply(op)` re-bases the
     /// task on the remembered version (`base = v.ts`) and adopts the new
     /// op; `Skip` is the caller's business (the driver stops with
     /// `Skipped(EpqFailed)`). On the retry, under the latch, `N` is empty
     /// while the newest committed data version is still `v`, so the intent
     /// is placed; if it is not `v` any more, the step EPQs again (seed 47).
-    pub fn epq_result(&mut self, decision: EpqDecision) {
+    ///
+    /// C-T2 rework 7d: a call after a step that did **not** return `Epq`
+    /// is an invariant error (there is no remembered version to re-base
+    /// on; silently falling back to `S` would lose the seed 47 re-check).
+    pub fn epq_result(&mut self, decision: EpqDecision) -> Result<(), TxnError> {
+        let Some(v) = self.pending_epq.take() else {
+            return Err(TxnError::Invariant(
+                "epq_result called after a step that did not return Epq".into(),
+            ));
+        };
         if let EpqDecision::Apply(op) = decision {
-            self.base = self.pending_epq.as_ref().map(|v| v.ts);
+            self.base = Some(v.ts);
             // A moved delete (update_pk) stays moved; any other applied op
             // is not a move.
             if !matches!(op, RowOp::Delete) {
@@ -561,6 +602,7 @@ impl RowOpTask {
             }
             self.op = op;
         }
+        Ok(())
     }
 }
 
@@ -636,28 +678,25 @@ impl KeyOpTask {
 }
 
 impl<K: OrderedKv> Core<K> {
-    /// The §5.2 RC EvalPlanQual pass, between steps, never under a latch.
-    /// Returns the driver's stop outcome, or `None` to retry with the task
-    /// re-based on `v`.
-    fn epq_pass(
-        &self,
+    /// The §5.2 rules that run before the caller's recheck, shared by
+    /// every EPQ pass: a moved tombstone is 40001 ("tuple to be locked was
+    /// already moved"), a plain tombstone skips, and a KEY SHARE request
+    /// examines **every** version above `S`, not only the newest (seed 45).
+    fn epq_pre_rules(
         requested: RowLockMode,
         req: &EpqRequest,
-        epq: &mut dyn Epq,
-        task: &mut RowOpTask,
     ) -> Result<Option<RowOutcome>, TxnError> {
         let v = &req.v;
-        // §5.2 moved rows: EPQ that reaches a moved-tombstone raises 40001
-        // ("tuple to be locked was already moved"); a just-resolved foreign
-        // `Delete { moved: true }` intent wrote exactly that version.
+        // §5.2 moved rows: EPQ that reaches a moved-tombstone raises 40001;
+        // a just-resolved foreign `Delete { moved: true }` intent wrote
+        // exactly that version.
         if v.is_moved_tombstone() {
             return Err(TxnError::SerializationFailure);
         }
         if v.is_tombstone() {
             return Ok(Some(RowOutcome::Skipped(SkipReason::EpqFailed)));
         }
-        // §5.1/§5.2: KEY SHARE examines every version above S, not only the
-        // newest (seed 45).
+        // §5.1/§5.2: KEY SHARE examines every version above S (seed 45).
         if requested == RowLockMode::KeyShare {
             for ver in &req.above_s {
                 if ver.is_moved_tombstone() {
@@ -668,10 +707,30 @@ impl<K: OrderedKv> Core<K> {
                 }
             }
         }
-        match epq.recheck(v) {
+        Ok(None)
+    }
+
+    /// The §5.2 RC EvalPlanQual pass, between steps, never under a latch:
+    /// the pre-rules above, then the caller's `recheck`. `fold` applies an
+    /// `Apply` verdict to the task (the public driver feeds it straight to
+    /// [`RowOpTask::epq_result`]; `update_pk` also reads the new row value
+    /// out of it). Returns the driver's stop outcome, or `None` to retry
+    /// with the task re-based on `v`.
+    fn epq_pass(
+        &self,
+        requested: RowLockMode,
+        req: &EpqRequest,
+        epq: &mut dyn Epq,
+        task: &mut RowOpTask,
+        fold: &mut dyn FnMut(&mut RowOpTask, EpqDecision) -> Result<(), TxnError>,
+    ) -> Result<Option<RowOutcome>, TxnError> {
+        if let Some(outcome) = Self::epq_pre_rules(requested, req)? {
+            return Ok(Some(outcome));
+        }
+        match epq.recheck(&req.v) {
             EpqDecision::Skip => Ok(Some(RowOutcome::Skipped(SkipReason::EpqFailed))),
             EpqDecision::Apply(op) => {
-                task.epq_result(EpqDecision::Apply(op));
+                fold(task, EpqDecision::Apply(op))?;
                 Ok(None)
             }
         }
@@ -690,7 +749,6 @@ impl<K: OrderedKv> Core<K> {
         ctx: StmtCtx,
         epq: &mut dyn Epq,
     ) -> Result<RowOutcome, TxnError> {
-        let requested = op.requested_mode();
         let mut task = RowOpTask::new(key, latch_prefix, op, ctx);
         loop {
             if txn.is_cancelled() {
@@ -703,7 +761,10 @@ impl<K: OrderedKv> Core<K> {
                     map_wait_outcome(self.wait_on_any(txn, &targets))?;
                 }
                 Step::Epq(req) => {
-                    if let Some(outcome) = self.epq_pass(requested, &req, epq, &mut task)? {
+                    let requested = task.requested_mode();
+                    if let Some(outcome) =
+                        self.epq_pass(requested, &req, epq, &mut task, &mut |t, d| t.epq_result(d))?
+                    {
                         return Ok(outcome);
                     }
                 }
@@ -759,6 +820,12 @@ impl<K: OrderedKv> Core<K> {
     /// `Apply` re-enters the loop as the moved delete), then a
     /// key-existence insert of `new_key` with `Unique { same_row: None }`.
     /// Resolution writes header 0x03 for the moved delete (§2.2).
+    ///
+    /// C-T2 rework 1: the EPQ pass runs through the full §5.2 rules
+    /// (`epq_pass`: a moved tombstone is 40001, a plain tombstone skips and
+    /// the new key is **not** inserted), and the inserted value comes from
+    /// the `Apply(Update { value, .. })` the callback returned — computed
+    /// from the newest version, never the stale snapshot value.
     pub fn update_pk(
         &self,
         txn: &Txn,
@@ -769,7 +836,17 @@ impl<K: OrderedKv> Core<K> {
         epq: &mut dyn Epq,
     ) -> Result<RowOutcome, TxnError> {
         let task = RowOpTask::new(old_key, None, RowOp::Delete, ctx.clone()).moved_delete();
-        match self.row_op_task(txn, task, epq)? {
+        let mut new_value = value;
+        let mut fold = |task: &mut RowOpTask, decision: EpqDecision| -> Result<(), TxnError> {
+            if let EpqDecision::Apply(RowOp::Update { value, .. }) = &decision {
+                new_value = value.clone();
+            }
+            // The old key keeps the moved delete whatever the callback
+            // applied; only the re-base on the remembered version is
+            // taken.
+            task.epq_result(EpqDecision::Apply(RowOp::Delete))
+        };
+        match self.row_op_task(txn, task, epq, &mut fold)? {
             RowOutcome::Applied => {}
             skipped => return Ok(skipped),
         }
@@ -777,7 +854,7 @@ impl<K: OrderedKv> Core<K> {
             txn,
             new_key,
             None,
-            value,
+            new_value,
             ctx,
             UniqueRule::Unique { same_row: None },
         )?;
@@ -785,12 +862,17 @@ impl<K: OrderedKv> Core<K> {
     }
 
     /// The blocking driver for a pre-built (crate-private) task:
-    /// `update_pk`'s moved delete and C-T2c's arbiter lock.
+    /// `update_pk`'s moved delete and C-T2c's arbiter lock. The §5.2 EPQ
+    /// pass runs through [`Core::row_op`]'s rules (`epq_pass`, rework 1 —
+    /// never a bare `recheck`); `fold` applies an `Apply` verdict to the
+    /// task, so `update_pk` can keep the moved delete and read the new row
+    /// value out of the verdict.
     pub(crate) fn row_op_task(
         &self,
         txn: &Txn,
         mut task: RowOpTask,
         epq: &mut dyn Epq,
+        fold: &mut dyn FnMut(&mut RowOpTask, EpqDecision) -> Result<(), TxnError>,
     ) -> Result<RowOutcome, TxnError> {
         loop {
             if txn.is_cancelled() {
@@ -801,14 +883,10 @@ impl<K: OrderedKv> Core<K> {
                 Step::Again => {}
                 Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
                 Step::Epq(req) => {
-                    // §5.2/§5.3.1: any Apply keeps the task's own op shape
-                    // (a moved delete stays the moved delete; the arbiter
-                    // lock stays a lock) — the row qualifies.
-                    let decision = match epq.recheck(&req.v) {
-                        EpqDecision::Skip => return Ok(RowOutcome::Skipped(SkipReason::EpqFailed)),
-                        EpqDecision::Apply(_) => EpqDecision::Apply(RowOp::Delete),
-                    };
-                    task.epq_result(decision);
+                    let requested = task.requested_mode();
+                    if let Some(outcome) = self.epq_pass(requested, &req, epq, &mut task, fold)? {
+                        return Ok(outcome);
+                    }
                 }
                 Step::Restart => {
                     return Err(TxnError::Invariant(
@@ -934,11 +1012,15 @@ impl ArbiterPreCheck {
         drop(latch);
         // The key's current state (§5.3's unique-check rule): the own top
         // layer's data if it is Write/Delete, else the newest committed
-        // data version.
+        // data version. C-T2 rework 4: an own `Delete` layer means "not
+        // live", exactly as in `unique_verdict` — the txn deleted the
+        // entry, so a re-insert of the arbiter key is an `Insert`.
         let own = state.intent.as_ref().filter(|i| i.txn == txn.id);
         let live_payload: Option<Vec<u8>> = match own.and_then(|i| i.top()).map(|t| &t.data) {
             Some(LayerData::Write { value, .. }) => Some(value.clone()),
-            // Own Delete / Absent → the newest committed version.
+            // Own Delete → not live.
+            Some(LayerData::Delete { .. }) => None,
+            // Own Absent or no own intent → the newest committed version.
             _ => state
                 .newest_committed()
                 .and_then(|v| v.live_payload().map(|p| p.to_vec())),

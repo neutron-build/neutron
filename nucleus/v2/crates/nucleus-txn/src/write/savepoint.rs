@@ -41,9 +41,12 @@ impl<K: OrderedKv> Core<K> {
             }
         }
         // Shared row locks taken at seq >= s, each under its key's latch
-        // (§5.5, §6; seed 46).
-        for key in self.row_locks().keys_of(txn.id, s) {
-            let _latch = self.latches.lock(&key);
+        // (§5.5, §6; seed 46). C-T2 rework 7b: the latch is
+        // `latch_key(key, prefix)` with the prefix the grant ran under
+        // (from the lock table), never plain `&key`.
+        for (key, prefix) in self.row_locks().keys_of(txn.id, s) {
+            let lk = latch_prefix_of(&key, prefix).unwrap_or(&key);
+            let _latch = self.latches.lock(lk);
             self.row_locks().release(&key, txn.id, s);
         }
         // Queued checks and AFTER-trigger events tagged >= s.
