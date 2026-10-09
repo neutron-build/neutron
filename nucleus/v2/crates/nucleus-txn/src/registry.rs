@@ -134,6 +134,19 @@ impl Registry {
         SnapshotGuard { ts: s, reg: self }
     }
 
+    /// [`Registry::take_snapshot`] that also runs `f(S)` inside the same
+    /// registry critical section (§3.1, §8.6): SSI creates the txn's entry
+    /// there, so no retention pass can run between taking `S` and the entry
+    /// existing (seed 21). `f` must not take the registry mutex; it may take
+    /// locks later in the §3.1 order (SSI, graph).
+    pub fn take_snapshot_with<R>(&self, f: impl FnOnce(Ts) -> R) -> (SnapshotGuard<'_>, R) {
+        let mut st = self.lock();
+        let s = Ts(self.visible_ts.load(Ordering::SeqCst));
+        let r = f(s);
+        *st.snapshots.entry(s).or_insert(0) += 1;
+        (SnapshotGuard { ts: s, reg: self }, r)
+    }
+
     /// Registers a caller-chosen ts (`AS OF t`, a segment build's
     /// `built_at`): requires `t >= W` and `t <= visible_ts`, else 72000
     /// (§3.1). This is the primitive AS OF reads are built on.

@@ -24,6 +24,13 @@
 //! `DeleteRange` sees it), removes newest-`<= W` tombstones, and retires
 //! dropped/truncated storage prefixes (intents out through §7.3 first), so
 //! I-GC and I-GC-QUIESCE hold for registered snapshots and open views.
+//!
+//! Card C-T3 adds §8 SSI (`ssi`): SIREADs registered before the view they
+//! protect (I-SSI-ORDER), reader-, writer- and DDL-side rw-edges between
+//! concurrent SERIALIZABLE txns, the commit thread's writer map, the
+//! dangerous-structure check atomic with prepare and enqueue, abort cleanup,
+//! retired-id SIREAD promotion and §8.6 retention. It plugs into the
+//! `SsiHook`, `CommitObserver` and `ReadObserver` seams.
 
 pub mod boot;
 pub mod commit;
@@ -36,6 +43,7 @@ pub mod read;
 pub mod registry;
 pub mod removal;
 pub mod resolver;
+pub mod ssi;
 pub mod status;
 pub mod txn;
 pub mod visibility;
