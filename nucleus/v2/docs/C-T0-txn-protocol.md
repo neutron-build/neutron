@@ -1,6 +1,6 @@
 # C-T0: Transaction protocol (normative)
 
-Status: draft 7.1 (adversarial review rounds 1-6 applied, G0 representation fixed; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
+Status: draft 7.2 (adversarial review rounds 1-6 applied, G0 representation fixed; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
 
 Scope: single node. Isolation levels: RC (PostgreSQL semantics), RR = SI, SERIALIZABLE = SSI. 2PC (`PREPARE TRANSACTION`) is refused with 0A000 in 2.0. Target behaviour is PostgreSQL 17; every deliberate divergence is listed in §12.
 
@@ -44,15 +44,15 @@ Foreign readers and resolution look only at the **top layer's `data`**. `Absent`
 `L` = the encoded logical key, prefix-free by C-Q3s P-PREFIX, so no other logical key starts with `L`.
 ```
 intent        L ‖ 0x00
-version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts)      # newest first
-end(L)        L ‖ 0x02                            # exclusive upper bound of every entry of L
+version @ts   L ‖ 0x01 ‖ be64(u64::MAX - ts) ‖ 0x01   # newest first
+end(L)        L ‖ 0x02                                # exclusive upper bound of every entry of L
 version value header ‖ payload
   header 0x00 live              payload = row/entry bytes
          0x01 live, key_changed payload = row/entry bytes
          0x02 tombstone         no payload
          0x03 moved-tombstone   no payload
 ```
-`[L ‖ 0x00, end(L))` holds exactly the intent and versions of `L`. The GC range for tombstone `L@t` is `[L ‖ 0x01 ‖ be64(u64::MAX - t), end(L))`. Resolution maps `Write{key_changed}` to header 0x00/0x01 and `Delete{moved}` to 0x02/0x03.
+`L` is the codec's encoded logical key as-is (order-preserving and prefix-free, C-Q3s), so logical keys keep their SQL order in the KV. `L` cannot be delimited from the left without the schema, so a raw key is split from the right: the last byte is `0x00` for an intent (`L` = all but the last byte) and `0x01` for a version (`L` = all but the last 10 bytes, the byte before the timestamp being `0x01`). The txn layer and the GC filter therefore parse keys without a schema. `[L ‖ 0x00, end(L))` holds exactly the intent and versions of `L`. The GC range for tombstone `L@t` is `[L ‖ 0x01 ‖ be64(u64::MAX - t), end(L))`. Resolution maps `Write{key_changed}` to header 0x00/0x01 and `Delete{moved}` to 0x02/0x03.
 
 The layout for backends with user-defined timestamps (intent placement, tombstone and moved-tombstone representation) is open (§12 Q2) and must be specified before such a backend is adopted.
 
@@ -468,6 +468,8 @@ Known divergences from PostgreSQL 17:
 - `AS OF` (not a PostgreSQL feature) is refused inside SERIALIZABLE txns (§4).
 
 ## Changelog
+
+- **Draft 7.2** (2026-10-08): §2.2 version keys end in a `0x01` tag byte so a raw key splits from the right without the schema (found in C-T1a review: a length-prefixed `L` broke SQL key order). Ordering, `end(L)` and the GC range are unchanged.
 - **draft 7.1 (2026-10-07), G0-commit built:** §11 exhaustive models run over a pure-value abstract KV (MemKv is for the simulator); rank renumbering and read-as-check reductions stated; G0-commit scope is 2 writers with a write-set choice + 2 readers (3 txns at once deferred). 8.39M states, all 11 owned seeds caught.
 - **draft 7 (2026-10-07), round-6 delta review** (1 critical, 4 major, 2 minor; 3 round-5 residues):
   - §8.5 `earliest_out_conflict_commit` condition is `commit_ts(X) < commit_ts(T)` with unassigned = infinity, not "T uncommitted" (group-assigned ts) (R6-1, seed 63; G0-ssi groups of 2).
