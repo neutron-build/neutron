@@ -2,14 +2,12 @@
 //! layer restoration, counter bookkeeping, and the deferrable prefix latch
 //! key (§5.0).
 
+use crate::boot::Core;
+use crate::encoding::{decode_intent, encode_intent, encode_version, intent_key, version_key};
+use crate::latch::latch_key;
+use crate::removal::{remove_intent, RemovalMode, RemovalOutcome};
+use crate::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId, TxnStatus};
 use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
-use nucleus_txn::boot::Core;
-use nucleus_txn::encoding::{
-    decode_intent, encode_intent, encode_version, intent_key, version_key,
-};
-use nucleus_txn::latch::latch_key;
-use nucleus_txn::removal::{remove_intent, RemovalMode, RemovalOutcome};
-use nucleus_txn::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId, TxnStatus};
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -102,7 +100,7 @@ fn resolve_committed_intent_writes_top_layer_version() {
     let v = ok(core.latest_get(&version_key(K, Ts(9)))).unwrap_or_default();
     assert_eq!(
         v,
-        nucleus_txn::encoding::encode_version(&LayerData::Write {
+        crate::encoding::encode_version(&LayerData::Write {
             value: b"new".to_vec(),
             key_changed: true
         })
@@ -373,15 +371,15 @@ fn older_epoch_removal_sets_counter_but_never_touches_a_count() {
     let old = TxnId { epoch: 1, n: 1 };
     let mut batch = Batch::default();
     batch.put(
-        nucleus_txn::encoding::sys_epoch_key(),
+        crate::encoding::sys_epoch_key(),
         1u32.to_be_bytes().to_vec(),
     );
     batch.put(
-        nucleus_txn::encoding::sys_ts_hwm_key(),
+        crate::encoding::sys_ts_hwm_key(),
         5u64.to_be_bytes().to_vec(),
     );
     batch.put(
-        nucleus_txn::encoding::sys_txn_key(old),
+        crate::encoding::sys_txn_key(old),
         5u64.to_be_bytes().to_vec(),
     );
     ok(kv.write(batch, Durability::Yes));
@@ -425,7 +423,7 @@ fn corrupt_intent_value_is_an_error_not_a_panic() {
 fn under_latch_removal_runs_steps_2_to_5_and_checks_the_guard() {
     // Rework item 5: `remove_intent_under_latch` verifies the guard is for
     // `latch_key(key, deferrable_prefix)` (§7.3 step 1).
-    use nucleus_txn::removal::remove_intent_under_latch;
+    use crate::removal::remove_intent_under_latch;
 
     /// Runs `f` expecting the debug assert to panic (silenced); returns
     /// whether it did. In release builds `f`'s error result is checked by

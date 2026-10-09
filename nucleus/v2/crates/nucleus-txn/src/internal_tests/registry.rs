@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use crate::boot::Core;
+use crate::{Ts, TxnError};
 use nucleus_kv::{MemKv, OrderedKv};
-use nucleus_txn::boot::Core;
-use nucleus_txn::{Ts, TxnError};
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -50,10 +50,7 @@ fn w_is_monotonic() {
     assert_eq!(core.registry.publish_computed_w(Some(Ts(9))), Ts(9));
     // W is loaded from /sys/gc_w at boot and never decreases across boots.
     let mut batch = nucleus_kv::Batch::default();
-    batch.put(
-        nucleus_txn::encoding::sys_gc_w_key(),
-        6u64.to_be_bytes().to_vec(),
-    );
+    batch.put(crate::encoding::sys_gc_w_key(), 6u64.to_be_bytes().to_vec());
     ok(core.write(batch, nucleus_kv::Durability::Yes));
     let core2 = ok(Core::open(core.into_kv()));
     assert_eq!(core2.registry.published_w(), Ts(6));

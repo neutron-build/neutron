@@ -1,13 +1,11 @@
 //! C-T1a tests: status truncation (§7.4) — each condition blocks on its own,
 //! all together allow, and older-epoch records go through the sweep counter.
 
+use crate::boot::Core;
+use crate::encoding::{encode_intent, intent_key, sys_epoch_key, sys_ts_hwm_key, sys_txn_key};
+use crate::status::Remembered;
+use crate::{Intent, Layer, LayerData, RowLockMode, Ts, TxnId, TxnStatus};
 use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
-use nucleus_txn::boot::Core;
-use nucleus_txn::encoding::{
-    encode_intent, intent_key, sys_epoch_key, sys_ts_hwm_key, sys_txn_key,
-};
-use nucleus_txn::status::Remembered;
-use nucleus_txn::{Intent, Layer, LayerData, RowLockMode, Ts, TxnId, TxnStatus};
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -82,14 +80,14 @@ fn condition1_intent_count_blocks_on_its_own() {
     place(&core, b"/t/1/r", id2);
     assert!(!ok(core.truncate_status(id2)));
     assert_eq!(
-        ok(nucleus_txn::removal::remove_intent(
+        ok(crate::removal::remove_intent(
             &core,
             b"/t/1/r",
             None,
             id2,
-            nucleus_txn::removal::RemovalMode::Resolve
+            crate::removal::RemovalMode::Resolve
         )),
-        nucleus_txn::removal::RemovalOutcome::Removed
+        crate::removal::RemovalOutcome::Removed
     );
     assert!(ok(core.truncate_status(id2)));
 }
@@ -102,14 +100,14 @@ fn condition2_open_views_block_on_their_own() {
     {
         let _view = core.open_view(); // counter 1, open at removal time
         assert_eq!(
-            ok(nucleus_txn::removal::remove_intent(
+            ok(crate::removal::remove_intent(
                 &core,
                 b"/t/1/r",
                 None,
                 id,
-                nucleus_txn::removal::RemovalMode::Resolve
+                crate::removal::RemovalMode::Resolve
             )),
-            nucleus_txn::removal::RemovalOutcome::Removed
+            crate::removal::RemovalOutcome::Removed
         );
         // last_removal_counter == 1, min_view_counter == 1: 1 > 1 is false.
         assert!(!ok(core.truncate_status(id)), "view open at removal blocks");
@@ -122,14 +120,14 @@ fn condition2_open_views_block_on_their_own() {
     {
         let _earlier = core.open_view(); // counter 2, before the removal
         assert_eq!(
-            ok(nucleus_txn::removal::remove_intent(
+            ok(crate::removal::remove_intent(
                 &core,
                 b"/t/1/s",
                 None,
                 id2,
-                nucleus_txn::removal::RemovalMode::Resolve
+                crate::removal::RemovalMode::Resolve
             )),
-            nucleus_txn::removal::RemovalOutcome::Removed
+            crate::removal::RemovalOutcome::Removed
         );
         let _later = core.open_view(); // counter 3, after the removal
         drop(_earlier);
@@ -203,14 +201,14 @@ fn older_epoch_records_wait_for_the_sweep_and_the_views() {
     {
         let _view = core.open_view(); // counter 1
         assert_eq!(
-            ok(nucleus_txn::removal::remove_intent(
+            ok(crate::removal::remove_intent(
                 &core,
                 b"/t/1/r",
                 None,
                 old,
-                nucleus_txn::removal::RemovalMode::Resolve
+                crate::removal::RemovalMode::Resolve
             )),
-            nucleus_txn::removal::RemovalOutcome::Removed
+            crate::removal::RemovalOutcome::Removed
         );
         core.registry.record_sweep(); // sweep_counter = Some(1)
         assert_eq!(core.registry.sweep_counter(), Some(1));

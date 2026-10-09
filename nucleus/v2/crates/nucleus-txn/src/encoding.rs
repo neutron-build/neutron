@@ -430,6 +430,17 @@ pub fn sys_gc_w_key() -> Key {
     k
 }
 
+/// `/sys/log/{TxnId}` (§3): the optional per-request log record, written in
+/// the same batch as the commit record. `be32(epoch) ‖ be64(n)` like
+/// [`sys_txn_key`] so records pair up in scans.
+pub fn sys_log_key(id: TxnId) -> Key {
+    let mut k = SYS_PREFIX.to_vec();
+    k.extend_from_slice(b"log/");
+    k.extend_from_slice(&id.epoch.to_be_bytes());
+    k.extend_from_slice(&id.n.to_be_bytes());
+    k
+}
+
 /// `/sys/ts_clock/{ts}` (§2.3): sparse `(wall_time, ts)` samples; the ts is
 /// the key so samples sort by it.
 pub fn sys_ts_clock_key(ts: Ts) -> Key {

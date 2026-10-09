@@ -2,16 +2,16 @@
 //! epoch handling, and the older-epoch intent rule. Over MemKv flat and LSM
 //! mode.
 
-use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
-use nucleus_txn::boot::Core;
-use nucleus_txn::encoding::{
+use crate::boot::Core;
+use crate::encoding::{
     encode_intent, intent_key, sys_epoch_key, sys_gc_w_key, sys_ts_hwm_key, sys_txn_key,
     version_key,
 };
-use nucleus_txn::read::{read_key, NoSsi};
-use nucleus_txn::status::Remembered;
-use nucleus_txn::visibility::ReadCtx;
-use nucleus_txn::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId, TxnStatus};
+use crate::read::{read_key, NoSsi};
+use crate::status::Remembered;
+use crate::visibility::ReadCtx;
+use crate::{Intent, Layer, LayerData, RowLockMode, Ts, TxnError, TxnId, TxnStatus};
+use nucleus_kv::{Batch, Durability, MemKv, OrderedKv};
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -113,7 +113,7 @@ fn older_epoch_intent_without_record_reads_as_aborted() {
         let old = TxnId { epoch: 0, n: 1 };
         // An intent left behind by an older-epoch txn with no committed
         // record, plus a live old version.
-        let v3 = nucleus_txn::encoding::encode_version(&LayerData::Write {
+        let v3 = crate::encoding::encode_version(&LayerData::Write {
             value: b"v3".to_vec(),
             key_changed: false,
         })
@@ -221,6 +221,21 @@ fn corrupt_system_state_is_an_error_not_a_panic() {
         vec![nucleus_kv::Op::Put(b"/sys/txn/x".to_vec(), vec![0; 8])],
     );
     assert!(matches!(Core::open(kv), Err(TxnError::Corrupt(_))));
+    // Bad /sys/ts_hwm length: the sequencer's single source (the boot read
+    // Core stores and the pipeline reserves from) must fail-stop at open,
+    // never default to 0 — a silent 0 reuses every committed ts.
+    let kv = MemKv::new();
+    put_kv(
+        &kv,
+        vec![
+            nucleus_kv::Op::Put(sys_epoch_key(), 3u32.to_be_bytes().to_vec()),
+            nucleus_kv::Op::Put(sys_ts_hwm_key(), vec![1, 2, 3]),
+        ],
+    );
+    assert!(
+        matches!(Core::open(kv), Err(TxnError::Corrupt(_))),
+        "a corrupt ts_hwm is Corrupt, not Ts(0)"
+    );
 }
 
 #[test]
