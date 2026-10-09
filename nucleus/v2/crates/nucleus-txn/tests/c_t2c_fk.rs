@@ -318,6 +318,50 @@ fn parent_side_no_live_child_is_ok() {
     ok(rig.core.abort(w));
 }
 
+/// Rework item 4: the child's KEY SHARE EPQ examines **every** parent
+/// version above `S` (§5.1/§5.2, seed 45 applied to §5.3), not only the
+/// newest: the parent was deleted and re-inserted above `S`, so the newest
+/// version matches but the tombstone in between is a 23503 — never a skip.
+/// Mutant killed: `fk_epq` ignores `above_s` (the re-inserted matching
+/// parent passes and the check returns Ok).
+#[test]
+fn fk_child_epq_examines_versions_above_s() {
+    let rig = Rig::new();
+    rig.preload(PARENT, b"k1");
+    let c = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(c.next_seq());
+    let snap = rig.core.registry.take_snapshot();
+    let s = snap.ts();
+
+    // Delete the parent above S, then re-insert it (still matching) above S.
+    let d = rig.txn(Isolation::ReadCommitted);
+    let ds = ok(d.next_seq());
+    rig.delete_in(&d, ds, PARENT);
+    assert_count_exact(&rig.core, &d);
+    rig.commit(d);
+    rig.resolve();
+    let i = rig.txn(Isolation::ReadCommitted);
+    let is = ok(i.next_seq());
+    ok(rig.core.insert_key(
+        &i,
+        PARENT,
+        None,
+        b"k1".to_vec(),
+        StmtCtx::new(rig.core.visible_ts(), is, is),
+        UniqueRule::Unique { same_row: None },
+    ));
+    assert_count_exact(&rig.core, &i);
+    rig.commit(i);
+    rig.resolve();
+
+    // The read at S finds the parent; the lock's EPQ sees the tombstone.
+    let ctx = fk_ctx(&c, s, seq0);
+    let r = rig.core.fk_check_child(&c, &ctx, PARENT, &is_k1);
+    assert_eq!(r, Err(TxnError::ForeignKeyViolation));
+    assert_count_exact(&rig.core, &c);
+    ok(rig.core.abort(c));
+}
+
 /// RR: a child live in the latest state but invisible at `S` → 40001
 /// (`detectNewRows`); a child visible at `S` → 23503.
 /// Mutant killed: no RR/SER detectNewRows check (23503 instead of 40001).

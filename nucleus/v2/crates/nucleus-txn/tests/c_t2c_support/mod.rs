@@ -131,7 +131,11 @@ pub fn assert_count_exact(core: &Core<MemKv>, txn: &Txn) {
     }
 }
 
-/// Every `@INTENT` in the KV.
+/// Every `@INTENT` in the KV, excluding the internal `/sys/` keys
+/// (`encoding::SYS_PREFIX`: ts_clock samples, gc state, txn records), whose
+/// payloads can end in a byte `parse_key` reads as an intent tag. They are
+/// never user intents, so counting them made the drain assertion flake
+/// (rework item 3).
 pub fn count_intents(core: &Core<MemKv>) -> usize {
     let view = core.open_view();
     let mut n = 0;
@@ -140,6 +144,9 @@ pub fn count_intents(core: &Core<MemKv>) -> usize {
         false,
     ) {
         let (k, _) = ok(row);
+        if k.starts_with(nucleus_txn::encoding::SYS_PREFIX) {
+            continue;
+        }
         if nucleus_txn::encoding::parse_key(&k)
             .is_some_and(|(_, e)| matches!(e, nucleus_txn::encoding::Entry::Intent))
         {
