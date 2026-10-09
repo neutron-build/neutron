@@ -81,7 +81,7 @@ impl Rng {
 
 fn place(core: &Core<SharedKv>, txn: &Txn, key: &[u8], value: Option<&[u8]>) -> Result<(), String> {
     let seq = txn.next_seq().map_err(str_err)?;
-    txn.log_write(seq, key);
+    txn.log_write(seq, key, None);
     core.count_placement(txn).map_err(str_err)?;
     let (data, lock) = match value {
         Some(v) => (

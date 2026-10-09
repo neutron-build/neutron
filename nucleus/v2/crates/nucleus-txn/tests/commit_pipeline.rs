@@ -28,7 +28,7 @@ fn commit_one(core: &Arc<Core<RecKv>>, i: usize, sync: SyncCommit) -> (nucleus_t
     let id = txn.id;
     let key = format!("/t/1/r{i}");
     place_intent(core, &txn, key.as_bytes(), format!("v{i}").as_bytes());
-    txn.log_write(ok(txn.next_seq()), key.as_bytes()); // a second layer's entry
+    txn.log_write(ok(txn.next_seq()), key.as_bytes(), None); // a second layer's entry
     let ts = ok(core.commit(txn, sync));
     (id, ts)
 }
@@ -542,7 +542,7 @@ fn ts_clock_samples_at_most_once_per_clock_second() {
     pipeline.set_clock(clock.clone());
     for i in 0..3 {
         let txn = core.begin(Isolation::ReadCommitted);
-        txn.log_write(ok(txn.next_seq()), b"/t/1/r"); // a write, so no fast path
+        txn.log_write(ok(txn.next_seq()), b"/t/1/r", None); // a write, so no fast path
         let (req, ack) =
             CommitRequest::new(txn.id, SyncCommit::Off, None, false, txn.write_set_keys());
         ok(core.submit(req));
@@ -686,7 +686,7 @@ fn fail_stop_recording_hook_stops_the_pipeline() {
     // the stop instead of hanging.
     drop(pipeline);
     let txn3 = core.begin(Isolation::ReadCommitted);
-    txn3.log_write(ok(txn3.next_seq()), b"k");
+    txn3.log_write(ok(txn3.next_seq()), b"k", None);
     match core.commit(txn3, SyncCommit::Off) {
         Err(TxnError::Invariant(msg)) => assert!(msg.contains("stopped"), "{msg}"),
         other => panic!("expected invariant error, got {other:?}"),
@@ -713,7 +713,7 @@ fn fail_stop_panicking_hook_surfaces_at_shutdown() {
         let core = Arc::clone(&core);
         std::thread::spawn(move || {
             let txn = core.begin(Isolation::ReadCommitted);
-            txn.log_write(ok(txn.next_seq()), b"k");
+            txn.log_write(ok(txn.next_seq()), b"k", None);
             core.commit(txn, SyncCommit::Off)
         })
     };
@@ -780,7 +780,7 @@ fn commit_thread_drains_greedily_and_shuts_down() {
     let start = Instant::now();
     for i in 0..50 {
         let txn = core.begin(Isolation::ReadCommitted);
-        txn.log_write(ok(txn.next_seq()), b"k");
+        txn.log_write(ok(txn.next_seq()), b"k", None);
         let ts = ok(core.commit(
             txn,
             if i % 2 == 0 {
@@ -799,7 +799,7 @@ fn commit_thread_drains_greedily_and_shuts_down() {
     ok(handle.shutdown());
     // After shutdown, new sends are refused rather than hanging.
     let txn = core.begin(Isolation::ReadCommitted);
-    txn.log_write(ok(txn.next_seq()), b"k");
+    txn.log_write(ok(txn.next_seq()), b"k", None);
     assert!(core.commit(txn, SyncCommit::Off).is_err());
 }
 

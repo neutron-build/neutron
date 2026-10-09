@@ -23,6 +23,14 @@ pub fn latch_key<'a>(k: &'a [u8], deferrable_prefix: Option<&'a [u8]>) -> &'a [u
     deferrable_prefix.unwrap_or(k)
 }
 
+/// Resolves a write-set log entry's latch prefix length (§5.0, §5.5): `n`
+/// bytes of the key, `None` when the key latches itself. A length beyond
+/// the key clamps to the whole key (defensive; the write path never logs
+/// one).
+pub fn latch_prefix_of(k: &[u8], prefix: Option<usize>) -> Option<&[u8]> {
+    prefix.map(|n| &k[..n.min(k.len())])
+}
+
 /// Striped latches (§5.0). One fixed stripe set; a key always maps to the
 /// same stripe.
 pub struct Latches {

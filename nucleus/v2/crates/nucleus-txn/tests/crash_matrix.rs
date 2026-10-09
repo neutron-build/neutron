@@ -77,7 +77,7 @@ fn hwm_reservation_survives_crashes_inside_a_group() {
             for i in 0..N {
                 let txn = core.begin(Isolation::ReadCommitted);
                 let seq = ok(txn.next_seq());
-                txn.log_write(seq, format!("/t/1/r{i}").as_bytes());
+                txn.log_write(seq, format!("/t/1/r{i}").as_bytes(), None);
                 ok(core.count_placement(&txn));
                 let mut batch = nucleus_kv::Batch::default();
                 batch.put(
@@ -157,7 +157,7 @@ fn hwm_reservation_survives_crashes_inside_a_group() {
             // The store stays usable after the crash mid-group.
             let txn = core2.begin(Isolation::ReadCommitted);
             let seq = ok(txn.next_seq());
-            txn.log_write(seq, b"/t/2/new");
+            txn.log_write(seq, b"/t/2/new", None);
             ok(core2.count_placement(&txn));
             let mut batch = nucleus_kv::Batch::default();
             batch.put(
@@ -206,7 +206,7 @@ fn round(seed: u64) {
         let key = format!("/t/1/r{i}");
         let value = format!("v{i}").into_bytes();
         let seq = ok(txn.next_seq());
-        txn.log_write(seq, key.as_bytes());
+        txn.log_write(seq, key.as_bytes(), None);
         ok(core.count_placement(&txn));
         let mut batch = nucleus_kv::Batch::default();
         batch.put(
@@ -297,7 +297,7 @@ fn round(seed: u64) {
     {
         let txn = core2.begin(Isolation::ReadCommitted);
         let seq = ok(txn.next_seq());
-        txn.log_write(seq, b"/t/2/new");
+        txn.log_write(seq, b"/t/2/new", None);
         ok(core2.count_placement(&txn));
         let mut batch = nucleus_kv::Batch::default();
         batch.put(

@@ -571,7 +571,7 @@ fn place_layer<K: OrderedKv>(
     lock: RowLockMode,
 ) {
     let seq = ok(txn.next_seq());
-    txn.log_write(seq, key);
+    txn.log_write(seq, key, None);
     ok(core.count_placement(txn));
     let intent = nucleus_txn::Intent {
         txn: txn.id,

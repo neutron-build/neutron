@@ -1,14 +1,18 @@
 //! C-T0 §1/§5.5: the txn handle. `Txn` carries the id, the isolation level,
 //! the per-txn command counter `seq` (never decreases, including across
-//! `ROLLBACK TO`), the write-set log `(seq, key)` with one entry per layer
-//! pushed or modified (in memory here; spilling is C-T4's problem), and a
-//! cancel flag settable from another thread (§6).
+//! `ROLLBACK TO`), the write-set log `(seq, key, latch_prefix)` with one
+//! entry per layer pushed or modified (in memory here; spilling is C-T4's
+//! problem), queued end-of-statement / deferred-check / AFTER-trigger
+//! events (§5.3, §5.5; opaque here), and a cancel flag settable from
+//! another thread (§6).
 //!
 //! The C-T2 write path calls [`Txn::log_write`] and
 //! [`Core::count_placement`](crate::boot::Core::count_placement) before each
 //! placement (§5.1: "log and count both before the write"), so the write-set
 //! log names every layer `ROLLBACK TO` must drop and every intent abort
 //! cleanup must remove, and `intent_count` never undercounts (I-COUNT).
+//! Every entry carries its key's latch prefix (§5.0), so every removal path
+//! (abort cleanup, the resolver, `ROLLBACK TO`) latches `latch_key(k)`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -90,6 +94,12 @@ impl CancelHandle {
     }
 }
 
+/// One write-set log entry (§5.5): `(seq, key, latch_prefix)`.
+pub(crate) type WriteSetEntry = (Seq, Key, Option<usize>);
+
+/// A queued event (§5.3, §5.5), tagged with the seq that queued it.
+pub(crate) type QueuedEvent = (Seq, Vec<u8>);
+
 /// One in-flight txn (§1). Owned by its session; the cancel handle is the
 /// only part other threads touch.
 pub struct Txn {
@@ -98,9 +108,15 @@ pub struct Txn {
     pub isolation: Isolation,
     /// Per-txn command counter. Never decreases; `ROLLBACK TO` keeps it.
     seq: AtomicU32,
-    /// The write-set log (§5.5): `(seq, key)` per layer pushed or modified,
-    /// once per `(seq, key)` (§5.1).
-    pub(crate) write_set: Arc<Mutex<Vec<(Seq, Key)>>>,
+    /// The write-set log (§5.5): `(seq, key, latch_prefix)` per layer pushed
+    /// or modified, once per `(seq, key)` (§5.1). The latch prefix (§5.0) is
+    /// `Some(n)` when the key is a deferrable `/i/{idx}/{key}{pk}` entry
+    /// whose latch key is `key[..n]`, `None` when the key latches itself.
+    pub(crate) write_set: Arc<Mutex<Vec<WriteSetEntry>>>,
+    /// Queued events (§5.3, §5.5): end-of-statement and deferred checks and
+    /// AFTER-trigger events, tagged with the seq that queued them. Opaque
+    /// here; the SQL layer reads them through [`Txn::take_events`].
+    events: Arc<Mutex<Vec<QueuedEvent>>>,
     pub(crate) cancel: Arc<CancelFlag>,
 }
 
@@ -111,6 +127,7 @@ impl Txn {
             isolation,
             seq: AtomicU32::new(0),
             write_set: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
             cancel: Arc::new(CancelFlag::default()),
         }
     }
@@ -143,33 +160,70 @@ impl Txn {
         self.seq.load(Ordering::SeqCst)
     }
 
-    /// Appends `(seq, key)` to the write-set log, once per `(seq, key)`
-    /// (§5.1): a command that modifies an existing layer in place logs the
-    /// same pair it logged when the layer was pushed, so the log names every
-    /// layer exactly once. C-T2 calls this before each placement write.
-    pub fn log_write(&self, seq: Seq, key: &[u8]) {
+    /// Appends `(seq, key, latch_prefix)` to the write-set log, once per
+    /// `(seq, key)` (§5.1): a command that modifies an existing layer in
+    /// place logs the same pair it logged when the layer was pushed, so the
+    /// log names every layer exactly once (seed 50). The latch prefix
+    /// (§5.0) travels with the entry so every removal path — abort cleanup,
+    /// the resolver, `ROLLBACK TO` — latches `latch_key(k)` (seed 25). The
+    /// C-T2 write path calls this before each placement write.
+    pub fn log_write(&self, seq: Seq, key: &[u8], latch_prefix: Option<usize>) {
         let mut ws = self.lock_write_set();
-        if !ws.iter().any(|&(s, ref k)| s == seq && k.as_slice() == key) {
-            ws.push((seq, key.to_vec()));
+        if !ws
+            .iter()
+            .any(|&(s, ref k, _)| s == seq && k.as_slice() == key)
+        {
+            ws.push((seq, key.to_vec(), latch_prefix));
         }
     }
 
     /// The write-set log, copied out.
-    pub fn write_set(&self) -> Vec<(Seq, Key)> {
+    pub fn write_set(&self) -> Vec<WriteSetEntry> {
         self.lock_write_set().clone()
     }
 
-    /// The distinct keys of the write-set log, in first-written order: what
-    /// abort cleanup and the resolver must touch.
-    pub fn write_set_keys(&self) -> Vec<Key> {
+    /// The distinct keys of the write-set log, in first-written order, each
+    /// with its latch prefix (§5.0): what abort cleanup, the resolver and
+    /// `ROLLBACK TO` must touch, and under which latch.
+    pub fn write_set_keys(&self) -> Vec<(Key, Option<usize>)> {
         let ws = self.lock_write_set();
-        let mut keys: Vec<Key> = Vec::new();
-        for (_, k) in ws.iter() {
-            if !keys.iter().any(|e| e == k) {
-                keys.push(k.clone());
+        let mut keys: Vec<(Key, Option<usize>)> = Vec::new();
+        for (_, k, p) in ws.iter() {
+            if !keys.iter().any(|(e, _)| e == k) {
+                keys.push((k.clone(), *p));
             }
         }
         keys
+    }
+
+    /// Takes a savepoint (§5.5): returns the seq that identifies it. The
+    /// next command gets a seq greater than every seq used so far (`seq`
+    /// never goes back, including across `ROLLBACK TO`).
+    pub fn savepoint(&self) -> Result<Seq, crate::TxnError> {
+        self.next_seq()
+    }
+
+    /// Queues an event tagged with the seq that queued it (§5.3, §5.5):
+    /// end-of-statement and deferred constraint checks and AFTER-trigger
+    /// events, opaque to this crate. `ROLLBACK TO s` discards those with
+    /// `tag >= s`.
+    pub fn queue_event(&self, tag: Seq, payload: Vec<u8>) {
+        self.lock_events().push((tag, payload));
+    }
+
+    /// Drains the queued events (the SQL layer reads them at end of
+    /// statement / commit).
+    pub fn take_events(&self) -> Vec<QueuedEvent> {
+        std::mem::take(&mut *self.lock_events())
+    }
+
+    /// Discards queued events with `tag >= s` (§5.5), keeping the rest.
+    pub(crate) fn discard_events_from(&self, s: Seq) {
+        self.lock_events().retain(|(t, _)| *t < s);
+    }
+
+    fn lock_events(&self) -> MutexGuard<'_, Vec<QueuedEvent>> {
+        self.events.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -182,7 +236,7 @@ impl Txn {
         CancelHandle(Arc::clone(&self.cancel))
     }
 
-    pub(crate) fn lock_write_set(&self) -> MutexGuard<'_, Vec<(Seq, Key)>> {
+    pub(crate) fn lock_write_set(&self) -> MutexGuard<'_, Vec<WriteSetEntry>> {
         self.write_set
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

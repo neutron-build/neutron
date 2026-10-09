@@ -3,16 +3,69 @@
 //! compiles this module and uses a different subset of it.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nucleus_kv::{Batch, Durability, GcFilter, Key, KvError, MemKv, Op, OrderedKv, Result, Value};
+use nucleus_kv::{
+    Batch, Durability, GcFilter, Key, KvError, MemKv, Op, OrderedKv, Result, Snapshot, Value,
+};
 
 pub fn ok<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> T {
     match r {
         Ok(v) => v,
         Err(e) => panic!("unexpected error: {e:?}"),
+    }
+}
+
+/// A parker maker whose parks never time out (a lost wakeup fails the test
+/// by hanging past its bounds instead of being rescued by the 1 s re-check)
+/// and that counts parks so a test can wait until a thread really parked.
+pub struct InfiniteParkers {
+    parks: Arc<AtomicUsize>,
+}
+
+impl InfiniteParkers {
+    pub fn new() -> Arc<InfiniteParkers> {
+        Arc::new(InfiniteParkers {
+            parks: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Waits until at least one park was entered (then a small beat).
+    pub fn wait_parked(&self) {
+        while self.parks.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+impl nucleus_txn::wait::MakeParker for InfiniteParkers {
+    fn make(&self) -> Arc<dyn nucleus_txn::wait::Parker> {
+        Arc::new(OneParker {
+            inner: nucleus_txn::wait::CondvarParker::new(),
+            parks: Arc::clone(&self.parks),
+        })
+    }
+}
+
+struct OneParker {
+    inner: nucleus_txn::wait::CondvarParker,
+    parks: Arc<AtomicUsize>,
+}
+
+impl nucleus_txn::wait::Parker for OneParker {
+    fn park(&self, _timeout: Duration) -> bool {
+        self.parks.fetch_add(1, Ordering::SeqCst);
+        // Effectively infinite: the PARK_SLICE re-check must not rescue a
+        // lost-wakeup test.
+        self.inner.park(Duration::from_secs(3600))
+    }
+
+    fn unpark(&self) {
+        self.inner.unpark();
     }
 }
 
@@ -432,41 +485,100 @@ impl<B: OrderedKv> OrderedKv for CrashAt<B> {
 
 /// Records that `id` was committed (the caller holds the ack). Used by
 /// [`wait_released`]'s missing-entry rule: an entry that vanished may only
-/// count as released for a txn known to have committed.
-pub fn note_committed(id: nucleus_txn::TxnId) {
-    seen_committed().lock().expect("seen").insert(id);
+/// count as released for a txn known to have committed. Keyed by the
+/// [`TestCore`] wrapper's per-core token (C-T2 rework 7c): every test's
+/// core allocates the same dense ids, and an address-keyed map would also
+/// alias a dropped core with the next core allocated at the same address.
+pub fn note_committed<K: OrderedKv>(core: &TestCore<K>, id: nucleus_txn::TxnId) {
+    seen_committed()
+        .lock()
+        .expect("seen")
+        .entry(core.token)
+        .or_default()
+        .insert(id);
 }
 
-/// TxnIds this test process has observed `Committed` at least once, for
-/// [`wait_released`]'s missing-entry rule.
-fn seen_committed() -> &'static std::sync::Mutex<std::collections::HashSet<nucleus_txn::TxnId>> {
+/// TxnIds each core in this test process has observed `Committed` at least
+/// once, for [`wait_released`]'s missing-entry rule.
+fn seen_committed() -> &'static std::sync::Mutex<
+    std::collections::HashMap<u64, std::collections::HashSet<nucleus_txn::TxnId>>,
+> {
     static SEEN: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<nucleus_txn::TxnId>>,
+        std::sync::Mutex<
+            std::collections::HashMap<u64, std::collections::HashSet<nucleus_txn::TxnId>>,
+        >,
     > = std::sync::OnceLock::new();
-    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A test core wrapper (C-T2 rework 7c): the [`Core`] plus a process-wide
+/// unique token (a monotonic counter, never reused — unlike an address,
+/// which the allocator hands to the next core after this one drops). The
+/// `seen_committed` map is keyed by it. Create one per core, once, with
+/// [`TestCore::open`] or [`TestCore::from_arc`].
+pub struct TestCore<K: OrderedKv> {
+    pub core: Arc<nucleus_txn::boot::Core<K>>,
+    token: u64,
+}
+
+impl<K: OrderedKv> TestCore<K> {
+    /// Opens a core and wraps it.
+    pub fn open(kv: K) -> std::result::Result<TestCore<K>, nucleus_txn::TxnError> {
+        Ok(TestCore::from_arc(Arc::new(nucleus_txn::boot::Core::open(
+            kv,
+        )?)))
+    }
+
+    /// Wraps an already-opened core. One wrapper per core: two wrappers of
+    /// one core do not share a `seen_committed` entry.
+    pub fn from_arc(core: Arc<nucleus_txn::boot::Core<K>>) -> TestCore<K> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        TestCore {
+            core,
+            token: NEXT.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+
+    /// This wrapper's process-unique token.
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+impl<K: OrderedKv> std::ops::Deref for TestCore<K> {
+    type Target = nucleus_txn::boot::Core<K>;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
 }
 
 /// Waits until commit step 5 has run for `id` (`released`). The ack (step 4)
 /// legally precedes step 5, so tests that need release/resolution-queueing
 /// poll for it. A missing entry counts **only** if the txn was previously
-/// seen `Committed` — by this helper's polls, or by a caller's
+/// seen `Committed` on this core — by this helper's polls, or by a caller's
 /// [`note_committed`] after an acked commit (after which the resolver may
 /// have truncated the entry before this helper first looked). An entry that
 /// vanishes without the txn ever being known committed is a failure, not a
 /// pass.
-pub fn wait_released<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleus_txn::TxnId) {
+pub fn wait_released<K: OrderedKv>(core: &TestCore<K>, id: nucleus_txn::TxnId) {
+    let key = core.token;
     for _ in 0..10_000 {
-        match core.status.entry(id) {
+        match core.core.status.entry(id) {
             Some(e) => {
                 if matches!(e.status, nucleus_txn::TxnStatus::Committed(_)) {
-                    note_committed(id);
+                    note_committed(core, id);
                 }
                 if e.released {
                     return;
                 }
             }
             None => {
-                if seen_committed().lock().expect("seen").contains(&id) {
+                if seen_committed()
+                    .lock()
+                    .expect("seen")
+                    .get(&key)
+                    .is_some_and(|ids| ids.contains(&id))
+                {
                     return;
                 }
             }
@@ -474,6 +586,316 @@ pub fn wait_released<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleu
         std::thread::sleep(Duration::from_micros(200));
     }
     panic!("step 5 never ran for {id:?}");
+}
+
+/// I-COUNT checker (the card's `assert_count_exact`): scans every
+/// `@INTENT` key through a registered view and checks that
+/// `intent_count(txn)` equals the number of intents owned by the txn in the
+/// KV, and that the txn's write-set log names each of them.
+pub fn assert_count_exact<K: OrderedKv>(
+    core: &nucleus_txn::boot::Core<K>,
+    txn: &nucleus_txn::txn::Txn,
+) {
+    let view = core.open_view();
+    let mut owned: Vec<Vec<u8>> = Vec::new();
+    for row in view.scan(
+        (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        false,
+    ) {
+        let (k, v) = ok(row);
+        if let Some((logical, nucleus_txn::encoding::Entry::Intent)) =
+            nucleus_txn::encoding::parse_key(&k)
+        {
+            let intent = ok(nucleus_txn::encoding::decode_intent(&v));
+            if intent.txn == txn.id {
+                owned.push(logical.to_vec());
+            }
+        }
+    }
+    drop(view);
+    let count = core
+        .status
+        .entry(txn.id)
+        .map(|e| e.intent_count)
+        .unwrap_or_default();
+    assert_eq!(
+        count,
+        owned.len() as i64,
+        "I-COUNT: {count} counted vs {:?} owned in the KV",
+        owned
+    );
+    let log = txn.write_set_keys();
+    for key in &owned {
+        assert!(
+            log.iter().any(|(k, _)| k == key),
+            "I-COUNT: the write-set log does not name the owned intent {key:?}"
+        );
+    }
+}
+
+/// One recorded grant of [`TestRowLocks`]: key, txn, mode, acquiring seq,
+/// and the latch prefix the grant ran under (§5.0, rework 7b).
+pub type TestGrant = (
+    nucleus_kv::Key,
+    nucleus_txn::TxnId,
+    nucleus_txn::RowLockMode,
+    nucleus_txn::Seq,
+    Option<usize>,
+);
+
+/// The card's Vec-backed [`RowLocks`](nucleus_txn::write::RowLocks) double
+/// (C-T2b replaces it with the real table): one shared list of grants,
+/// each remembering the latch prefix its grant ran under (rework 7b), so
+/// `keys_of` hands the release paths the right `latch_key`.
+#[derive(Default)]
+pub struct TestRowLocks {
+    grants: Mutex<Vec<TestGrant>>,
+}
+
+impl TestRowLocks {
+    pub fn new() -> Arc<TestRowLocks> {
+        Arc::new(TestRowLocks::default())
+    }
+
+    /// The raw grant list, copied out (test assertions).
+    pub fn snapshot(&self) -> Vec<TestGrant> {
+        self.grants.lock().expect("grants").clone()
+    }
+}
+
+impl nucleus_txn::write::RowLocks for TestRowLocks {
+    fn holders(
+        &self,
+        key: &[u8],
+    ) -> Vec<(
+        nucleus_txn::TxnId,
+        nucleus_txn::RowLockMode,
+        nucleus_txn::Seq,
+    )> {
+        self.grants
+            .lock()
+            .expect("grants")
+            .iter()
+            .filter(|(k, _, _, _, _)| k.as_slice() == key)
+            .map(|(_, t, m, s, _)| (*t, *m, *s))
+            .collect()
+    }
+
+    fn grant(
+        &self,
+        key: &[u8],
+        txn: nucleus_txn::TxnId,
+        mode: nucleus_txn::RowLockMode,
+        seq: nucleus_txn::Seq,
+        latch_prefix: Option<usize>,
+    ) -> std::result::Result<(), nucleus_txn::TxnError> {
+        self.grants
+            .lock()
+            .expect("grants")
+            .push((key.to_vec(), txn, mode, seq, latch_prefix));
+        Ok(())
+    }
+
+    fn keys_of(
+        &self,
+        txn: nucleus_txn::TxnId,
+        from_seq: nucleus_txn::Seq,
+    ) -> Vec<(nucleus_kv::Key, Option<usize>)> {
+        self.grants
+            .lock()
+            .expect("grants")
+            .iter()
+            .filter(|(_, t, _, s, _)| *t == txn && *s >= from_seq)
+            .map(|(k, _, _, _, p)| (k.clone(), *p))
+            .collect()
+    }
+
+    fn release(&self, key: &[u8], txn: nucleus_txn::TxnId, from_seq: nucleus_txn::Seq) {
+        self.grants
+            .lock()
+            .expect("grants")
+            .retain(|(k, t, _, s, _)| !(k.as_slice() == key && *t == txn && *s >= from_seq));
+    }
+}
+
+/// The card's recording [`SsiHook`](nucleus_txn::write::SsiHook): records
+/// every call; `covers` answers from a configurable set.
+#[derive(Default)]
+pub struct RecordingSsi {
+    pub covers: Mutex<std::collections::HashSet<Vec<u8>>>,
+    pub data_placed: Mutex<Vec<(nucleus_txn::TxnId, Vec<u8>)>>,
+    pub before_point_read: Mutex<Vec<(nucleus_txn::TxnId, Vec<u8>)>>,
+    pub pre_commits: Mutex<Vec<nucleus_txn::TxnId>>,
+    pub aborts: Mutex<Vec<nucleus_txn::TxnId>>,
+    /// When set, `pre_commit` returns this error **without** enqueuing: the
+    /// §8.4 gate a test closes to prove the enqueue cannot escape the hook.
+    pub gate: Mutex<Option<nucleus_txn::TxnError>>,
+    /// Set inside `pre_commit` while `enqueue` runs.
+    pub enqueued_inside: AtomicBool,
+}
+
+impl RecordingSsi {
+    pub fn new() -> Arc<RecordingSsi> {
+        Arc::new(RecordingSsi::default())
+    }
+
+    /// Closes the §8.4 gate: pre_commit fails with this error, un-enqueued.
+    pub fn close_gate(&self, e: nucleus_txn::TxnError) {
+        *self.gate.lock().expect("gate") = Some(e);
+    }
+
+    /// Re-opens the §8.4 gate.
+    pub fn open_gate(&self) {
+        *self.gate.lock().expect("gate") = None;
+    }
+}
+
+impl nucleus_txn::write::SsiHook for RecordingSsi {
+    fn covers(&self, _txn: nucleus_txn::TxnId, key: &[u8]) -> bool {
+        self.covers.lock().expect("covers").contains(key)
+    }
+
+    fn before_point_read(&self, txn: nucleus_txn::TxnId, key: &[u8]) {
+        self.before_point_read
+            .lock()
+            .expect("bpr")
+            .push((txn, key.to_vec()));
+    }
+
+    fn on_data_placed(
+        &self,
+        writer: nucleus_txn::TxnId,
+        _isolation: nucleus_txn::txn::Isolation,
+        key: &[u8],
+    ) -> std::result::Result<(), nucleus_txn::TxnError> {
+        self.data_placed
+            .lock()
+            .expect("placed")
+            .push((writer, key.to_vec()));
+        Ok(())
+    }
+
+    fn pre_commit(
+        &self,
+        txn: nucleus_txn::TxnId,
+        _isolation: nucleus_txn::txn::Isolation,
+        enqueue: &mut dyn FnMut() -> std::result::Result<(), nucleus_txn::TxnError>,
+    ) -> std::result::Result<(), nucleus_txn::TxnError> {
+        self.pre_commits.lock().expect("pc").push(txn);
+        if let Some(e) = self.gate.lock().expect("gate").clone() {
+            return Err(e);
+        }
+        self.enqueued_inside.store(true, Ordering::SeqCst);
+        let r = enqueue();
+        self.enqueued_inside.store(false, Ordering::SeqCst);
+        r
+    }
+
+    fn on_abort(&self, txn: nucleus_txn::TxnId) {
+        self.aborts.lock().expect("aborts").push(txn);
+    }
+}
+
+/// An `OrderedKv` wrapper whose snapshot **reads** fail for keys accepted
+/// by `fail_on` (writes pass through): the boot-read failure injection for
+/// the C-T1b follow-up 2 test. The predicate must be `Clone` (a closure
+/// capturing only `Copy`/`Arc` data is).
+pub struct FailReadsKv<F: Fn(&[u8]) -> bool + Send + Sync + Clone + 'static> {
+    inner: Arc<MemKv>,
+    fail_on: F,
+}
+
+/// The snapshot of [`FailReadsKv`]: fails `get`/`scan` where the predicate
+/// says so.
+pub struct FailReadsSnap<F: Fn(&[u8]) -> bool + Send + Sync + Clone + 'static> {
+    inner: <MemKv as OrderedKv>::Snap,
+    fail_on: F,
+}
+
+impl<F: Fn(&[u8]) -> bool + Send + Sync + Clone + 'static> FailReadsKv<F> {
+    pub fn new(fail_on: F) -> FailReadsKv<F> {
+        FailReadsKv {
+            inner: Arc::new(MemKv::new()),
+            fail_on,
+        }
+    }
+
+    fn check(&self, key: &[u8]) -> Result<()> {
+        if (self.fail_on)(key) {
+            Err(KvError::Backend("injected read failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<F: Fn(&[u8]) -> bool + Send + Sync + Clone + 'static> Snapshot for FailReadsSnap<F> {
+    fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+        if (self.fail_on)(key) {
+            Err(KvError::Backend("injected read failure".into()))
+        } else {
+            self.inner.get(key)
+        }
+    }
+
+    fn scan<'a>(
+        &'a self,
+        range: (Bound<&[u8]>, Bound<&[u8]>),
+        reverse: bool,
+    ) -> Box<dyn Iterator<Item = Result<(Key, Value)>> + 'a> {
+        let fail = match range.0 {
+            Bound::Included(lo) => (self.fail_on)(lo),
+            Bound::Excluded(lo) => (self.fail_on)(lo),
+            Bound::Unbounded => false,
+        };
+        if fail {
+            Box::new(std::iter::once(Err(KvError::Backend(
+                "injected scan failure".into(),
+            ))))
+        } else {
+            self.inner.scan(range, reverse)
+        }
+    }
+}
+
+impl<F: Fn(&[u8]) -> bool + Send + Sync + Clone + 'static> OrderedKv for FailReadsKv<F> {
+    type Snap = FailReadsSnap<F>;
+
+    fn write(&self, batch: Batch, sync: Durability) -> Result<()> {
+        self.inner.write(batch, sync)
+    }
+
+    fn sync_wal(&self) -> Result<()> {
+        self.inner.sync_wal()
+    }
+
+    fn snapshot(&self) -> Self::Snap {
+        FailReadsSnap {
+            inner: self.inner.snapshot(),
+            fail_on: self.fail_on.clone(),
+        }
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.check(key)?;
+        self.inner.get_latest(key)
+    }
+
+    fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()> {
+        self.inner.ingest_sorted(entries)
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<()> {
+        self.inner.checkpoint(dir)
+    }
+
+    fn set_gc_filter(&self, filter: Box<dyn GcFilter>) {
+        self.inner.set_gc_filter(filter);
+    }
+
+    fn set_gc_watermark(&self, watermark: u64) -> Result<()> {
+        self.inner.set_gc_watermark(watermark)
+    }
 }
 
 /// Places an intent the way §5.1 will: latch, log, count, then the write.
@@ -484,7 +906,7 @@ pub fn place_intent<K: OrderedKv>(
     value: &[u8],
 ) {
     let seq = ok(txn.next_seq());
-    txn.log_write(seq, key);
+    txn.log_write(seq, key, None);
     ok(core.count_placement(txn));
     let intent = nucleus_txn::Intent {
         txn: txn.id,

@@ -20,7 +20,7 @@ fn next_seq_is_strictly_increasing() {
     assert_eq!(txn.next_seq(), Ok(2));
     // `ROLLBACK TO` never gives a seq back (§5.5); new commands keep going
     // up from the same counter.
-    txn.log_write(ok(txn.next_seq()), b"/t/1/r");
+    txn.log_write(ok(txn.next_seq()), b"/t/1/r", None);
     assert_eq!(txn.next_seq(), Ok(4));
     assert_eq!(txn.seq(), 4);
 }
@@ -28,22 +28,22 @@ fn next_seq_is_strictly_increasing() {
 #[test]
 fn log_write_records_once_per_seq_and_key() {
     let txn = ok(Core::open(RecKv::new())).begin(Isolation::RepeatableRead);
-    txn.log_write(1, b"/t/1/a");
-    txn.log_write(1, b"/t/1/a"); // same layer modified in place: once per (s,k)
-    txn.log_write(1, b"/t/1/b"); // same command, other key
-    txn.log_write(2, b"/t/1/a"); // a new layer on the same key
+    txn.log_write(1, b"/t/1/a", None);
+    txn.log_write(1, b"/t/1/a", None); // same layer modified in place: once per (s,k)
+    txn.log_write(1, b"/t/1/b", None); // same command, other key
+    txn.log_write(2, b"/t/1/a", None); // a new layer on the same key
     assert_eq!(
         txn.write_set(),
         vec![
-            (1, b"/t/1/a".to_vec()),
-            (1, b"/t/1/b".to_vec()),
-            (2, b"/t/1/a".to_vec()),
+            (1, b"/t/1/a".to_vec(), None),
+            (1, b"/t/1/b".to_vec(), None),
+            (2, b"/t/1/a".to_vec(), None),
         ]
     );
     assert_eq!(
         txn.write_set_keys(),
-        vec![b"/t/1/a".to_vec(), b"/t/1/b".to_vec()],
-        "distinct keys in first-written order"
+        vec![(b"/t/1/a".to_vec(), None), (b"/t/1/b".to_vec(), None)],
+        "distinct keys (with their latch prefixes) in first-written order"
     );
 }
 
@@ -129,8 +129,9 @@ fn a_written_txn_commits_through_the_pipeline() {
         Some(TxnStatus::Committed(ts))
     );
     // The ack (step 4) precedes step 5; poll for the release.
-    common::note_committed(txn_id);
-    common::wait_released(&core, txn_id);
+    let tcore = common::TestCore::from_arc(std::sync::Arc::clone(&core));
+    common::note_committed(&tcore, txn_id);
+    common::wait_released(&tcore, txn_id);
     assert_eq!(core.status.entry(txn_id).map(|e| e.released), Some(true));
     ok(handle.shutdown());
 }

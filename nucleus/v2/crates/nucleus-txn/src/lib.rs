@@ -9,9 +9,14 @@
 //!
 //! Card C-T1b adds the txn handle (`txn`), the §3 commit pipeline and §7.1
 //! abort (`commit`), §6 waiting with wake generations (`wait`), and the
-//! resolution/truncation jobs (`resolver`). The write path (§5), shared
-//! locks and the wait-for graph (C-T2b), SSI (C-T3) and GC (C-T4) are later
-//! cards; only the hooks named in the card exist.
+//! resolution/truncation jobs (`resolver`).
+//!
+//! Card C-T2 adds the §5 write path (`write`): the §5.1 placement loop as
+//! non-blocking steps plus blocking drivers, intent layers (§2.1), row ops,
+//! unique checks (§5.3), savepoints and `ROLLBACK TO` (§5.5), and the
+//! `RowLocks` / `SsiHook` seams that C-T2b and C-T3 plug into. The
+//! wait-for graph, deadlock detection and SSI state are later cards; only
+//! the hooks named in the card exist.
 //!
 //! Card C-T4 adds the §9 GC (`gc`): the compaction filter `gc::TxnGcFilter`
 //! and the job `gc::GcJob` that publishes the watermark `W` (one registry
@@ -35,6 +40,7 @@ pub mod status;
 pub mod txn;
 pub mod visibility;
 pub mod wait;
+pub mod write;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -153,6 +159,13 @@ pub enum TxnError {
     TriggeredDataChange, // 27000
     #[error("snapshot too old")]
     SnapshotTooOld, // 72000
+    #[error("canceling statement due to user request")]
+    QueryCanceled, // 57014
+    /// A commit whose records may have reached the WAL cannot be reported
+    /// as failed: its resolution is unknown (PostgreSQL 08007). Every error
+    /// ack of a group after any of its records reached the WAL uses this.
+    #[error("transaction resolution unknown")]
+    CommitIndeterminate, // 08007
     /// A protocol invariant was violated (C-T0 §4, §7): e.g. the owner of an
     /// intent found in a view has no current-epoch status entry. The caller
     /// makes this fatal (process abort); it is never defaulted.
@@ -177,6 +190,8 @@ impl TxnError {
             TxnError::CardinalityViolation => "21000",
             TxnError::TriggeredDataChange => "27000",
             TxnError::SnapshotTooOld => "72000",
+            TxnError::QueryCanceled => "57014",
+            TxnError::CommitIndeterminate => "08007",
             TxnError::Invariant(_) => "XX000",
             TxnError::Corrupt(_) => "XX000",
             TxnError::Kv(_) => "XX000",
