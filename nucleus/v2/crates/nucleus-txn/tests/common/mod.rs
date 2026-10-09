@@ -191,11 +191,15 @@ impl nucleus_txn::commit::Clock for FakeClock {
 
 /// Waits until commit step 5 has run for `id` (`released`). The ack (step 4)
 /// legally precedes step 5, so tests that need release/resolution-queueing
-/// poll for it.
+/// poll for it. A missing entry also counts: truncation requires release
+/// (§7.4 condition 0), and the background resolver may already have gone
+/// all the way.
 pub fn wait_released<K: OrderedKv>(core: &nucleus_txn::boot::Core<K>, id: nucleus_txn::TxnId) {
     for _ in 0..10_000 {
-        if core.status.entry(id).is_some_and(|e| e.released) {
-            return;
+        match core.status.entry(id) {
+            None => return,
+            Some(e) if e.released => return,
+            Some(_) => {}
         }
         std::thread::sleep(Duration::from_micros(200));
     }
