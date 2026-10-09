@@ -17,10 +17,18 @@
 //! `RowLocks` / `SsiHook` seams that C-T2b and C-T3 plug into. The
 //! wait-for graph, deadlock detection and SSI state are later cards; only
 //! the hooks named in the card exist.
+//!
+//! Card C-T4 adds the §9 GC (`gc`): the compaction filter `gc::TxnGcFilter`
+//! and the job `gc::GcJob` that publishes the watermark `W` (one registry
+//! critical section, then `/sys/gc_w` synced before the filter or any
+//! `DeleteRange` sees it), removes newest-`<= W` tombstones, and retires
+//! dropped/truncated storage prefixes (intents out through §7.3 first), so
+//! I-GC and I-GC-QUIESCE hold for registered snapshots and open views.
 
 pub mod boot;
 pub mod commit;
 pub mod encoding;
+pub mod gc;
 #[cfg(test)]
 mod internal_tests;
 pub mod latch;
