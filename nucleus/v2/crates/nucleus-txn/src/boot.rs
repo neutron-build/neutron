@@ -223,6 +223,27 @@ impl<K: OrderedKv> Core<K> {
             }
         })
     }
+
+    /// Installs the KV's compaction GC filter (§9.2). Crate-private: only
+    /// the GC job ([`crate::gc::GcJob`]) hands the KV a filter, after
+    /// `GcJob::install`'s ordering rules.
+    pub(crate) fn set_kv_gc_filter(&self, filter: Box<dyn nucleus_kv::GcFilter>) {
+        self.kv.set_gc_filter(filter);
+    }
+
+    /// The KV's GC watermark (§9.1): monotonic; a decrease is
+    /// `KvError::WatermarkRegressed`, mapped to [`TxnError::Invariant`]
+    /// (the caller treats it as fatal). Crate-private for the same reason.
+    pub(crate) fn set_kv_gc_watermark(&self, watermark: u64) -> Result<(), TxnError> {
+        self.kv.set_gc_watermark(watermark).map_err(|e| match e {
+            nucleus_kv::KvError::WatermarkRegressed { current, requested } => {
+                TxnError::Invariant(format!(
+                    "gc watermark regressed: current {current}, requested {requested} (C-T0 §9.1)"
+                ))
+            }
+            other => crate::kv_err(other),
+        })
+    }
 }
 
 fn read_ts<S: nucleus_kv::Snapshot>(snap: &S, key: &[u8]) -> Result<Ts, TxnError> {
