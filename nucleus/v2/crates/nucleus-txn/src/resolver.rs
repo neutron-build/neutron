@@ -29,11 +29,12 @@ pub struct Resolver;
 
 impl Resolver {
     /// Takes every queued resolution/cleanup entry and runs
-    /// `remove_intent(Resolve | Discard)` for each key of its write set,
-    /// then attempts §7.4 truncation of every released txn whose count is 0
-    /// (older-epoch records included; the §7.4 conditions are re-checked
-    /// under the registry mutex by `truncate_status`). Returns the number
-    /// of queued entries processed.
+    /// `remove_intent(Resolve | Discard)` for each key of its write set
+    /// (under the key's latch prefix, §5.0), then attempts §7.4 truncation
+    /// of every released txn whose count is 0 (older-epoch records
+    /// included; the §7.4 conditions are re-checked under the registry
+    /// mutex by `truncate_status`). Returns the number of queued entries
+    /// processed.
     ///
     /// On an error the work is kept: the failing entry and every
     /// unprocessed entry after it are requeued (in order) before the error
@@ -46,8 +47,14 @@ impl Resolver {
         while i < entries.len() {
             let e = &entries[i];
             let mut failed: Option<TxnError> = None;
-            for key in &e.keys {
-                if let Err(err) = remove_intent(core, key, None, e.txn, e.mode) {
+            for (key, prefix) in &e.keys {
+                if let Err(err) = remove_intent(
+                    core,
+                    key,
+                    crate::latch::latch_prefix_of(key, *prefix),
+                    e.txn,
+                    e.mode,
+                ) {
                     failed = Some(err);
                     break;
                 }

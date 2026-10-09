@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot, Value};
 
@@ -25,6 +25,7 @@ use crate::latch::Latches;
 use crate::registry::Registry;
 use crate::status::StatusTable;
 use crate::wait::Waits;
+use crate::write::{NoRowLocks, NoSsiHook, RowLocks, SsiHook};
 use crate::{kv_err, Ts, TxnError, TxnId};
 
 /// The shared transaction core (§3, §7.2).
@@ -59,6 +60,12 @@ pub struct Core<K: OrderedKv> {
     /// thread's [`CommitConfig`](crate::commit::CommitConfig) installs
     /// its hook here so both threads report the same way.
     pub(crate) fail_stop: Mutex<Arc<dyn FailStop>>,
+    /// The C-T2b shared row-lock table (§6). Default [`NoRowLocks`].
+    /// `holders`, `grant` and `release` are called only under the key's
+    /// latch.
+    row_locks: Mutex<Arc<dyn RowLocks>>,
+    /// The C-T3 SSI hook (§8). Default [`NoSsiHook`].
+    ssi_hook: Mutex<Arc<dyn SsiHook>>,
     /// The C-T2b release hook (§3 step 5, §7.1); no-op until installed.
     pub(crate) release_hook: Mutex<Arc<dyn ReleaseHook>>,
     /// Queued resolution/cleanup entries (§3 step 5, §7.1), drained by the
@@ -145,6 +152,8 @@ impl<K: OrderedKv> Core<K> {
             boot_ts_hwm: ts_hwm,
             commit_tx: Mutex::new(None),
             fail_stop: Mutex::new(Arc::new(AbortFailStop)),
+            row_locks: Mutex::new(Arc::new(NoRowLocks)),
+            ssi_hook: Mutex::new(Arc::new(NoSsiHook)),
             release_hook: Mutex::new(Arc::new(crate::commit::NoReleaseHook)),
             resolve_q: Mutex::new(VecDeque::new()),
         })
@@ -222,6 +231,38 @@ impl<K: OrderedKv> Core<K> {
                 Ok(false)
             }
         })
+    }
+
+    /// The shared row-lock table (C-T2b's seam, §6). Crate-private: the
+    /// write path is the only caller; `NoRowLocks` until C-T2b installs the
+    /// real table through [`Core::set_row_locks`].
+    pub(crate) fn row_locks(&self) -> Arc<dyn RowLocks> {
+        Arc::clone(
+            &self
+                .row_locks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Installs the shared row-lock table (C-T2b).
+    pub fn set_row_locks(&self, table: Arc<dyn RowLocks>) {
+        *self
+            .row_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = table;
+    }
+
+    /// The SSI hook (C-T3's seam, §8). Crate-private: the write path and the
+    /// commit pipeline are the only callers; [`NoSsiHook`] until C-T3
+    /// installs the real hook through [`Core::set_ssi_hook`].
+    pub(crate) fn ssi_hook(&self) -> Arc<dyn SsiHook> {
+        Arc::clone(&self.ssi_hook.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Installs the SSI hook (C-T3).
+    pub fn set_ssi_hook(&self, hook: Arc<dyn SsiHook>) {
+        *self.ssi_hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
     }
 }
 

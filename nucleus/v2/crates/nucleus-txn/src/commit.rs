@@ -31,7 +31,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvError, Sender, TryRecvError};
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nucleus_kv::{Batch, Durability, OrderedKv};
 
@@ -66,8 +66,10 @@ pub enum CommitMsg {
 /// One commit request (§3): the status record target, the optional `/log`
 /// record, the sync mode, the SSI marker, and the write-set keys (step 5
 /// queues resolution from them; the caller may drop its `Txn` as soon as
-/// the ack arrives). Build it with [`CommitRequest::new`], which also
-/// returns the ack receiver the caller blocks on.
+/// the ack arrives). Each key carries its latch prefix (§5.0) so the
+/// resolution removals latch `latch_key(k)` (seed 25). Build it with
+/// [`CommitRequest::new`], which also returns the ack receiver the caller
+/// blocks on.
 pub struct CommitRequest {
     pub txn: TxnId,
     pub sync: SyncCommit,
@@ -75,9 +77,10 @@ pub struct CommitRequest {
     /// A SerIALIZABLE txn's request: step 3 reports it to the
     /// [`CommitObserver`] before any status is set (§8.4/§8.5).
     pub ssi: bool,
-    /// The distinct keys of the txn's write set: what step 5 queues for
-    /// resolution (§7.1 queues the same for abort cleanup).
-    pub keys: Vec<nucleus_kv::Key>,
+    /// The distinct keys of the txn's write set with their latch prefixes:
+    /// what step 5 queues for resolution (§7.1 queues the same for abort
+    /// cleanup).
+    pub keys: Vec<(nucleus_kv::Key, Option<usize>)>,
     ack: Sender<CommitAck>,
 }
 
@@ -88,7 +91,7 @@ impl CommitRequest {
         sync: SyncCommit,
         log: Option<Vec<u8>>,
         ssi: bool,
-        keys: Vec<nucleus_kv::Key>,
+        keys: Vec<(nucleus_kv::Key, Option<usize>)>,
     ) -> (CommitRequest, mpsc::Receiver<CommitAck>) {
         let (ack_tx, ack_rx) = mpsc::channel();
         (
@@ -109,6 +112,88 @@ impl CommitRequest {
         // stands (§3: once on the channel, it commits).
         let _ = self.ack.send(r);
     }
+}
+
+/// The ticket [`Core::commit_submit`](crate::boot::Core::commit_submit)
+/// returns: poll it with [`CommitTicket::try_ack`] (the deterministic
+/// simulator interleaves other actors between the enqueue and the ack), or
+/// block on it with [`CommitTicket::wait`]. The first answer is remembered,
+/// so `wait` after a successful `try_ack` returns the same ack.
+pub struct CommitTicket {
+    ack: Option<mpsc::Receiver<CommitAck>>,
+    seen: Mutex<Option<CommitAck>>,
+    pre: Option<CommitAck>,
+}
+
+impl CommitTicket {
+    /// A ticket already acked (the no-write fast path of §3, which returns
+    /// `Ts::ZERO` and never touches the channel).
+    pub(crate) fn acked(r: CommitAck) -> CommitTicket {
+        CommitTicket {
+            ack: None,
+            seen: Mutex::new(None),
+            pre: Some(r),
+        }
+    }
+
+    fn from_receiver(ack: mpsc::Receiver<CommitAck>) -> CommitTicket {
+        CommitTicket {
+            ack: Some(ack),
+            seen: Mutex::new(None),
+            pre: None,
+        }
+    }
+
+    /// `None` until the pipeline acks the request (fail-stop error acks
+    /// included): the step-by-step polling primitive.
+    pub fn try_ack(&self) -> Option<CommitAck> {
+        if let Some(pre) = &self.pre {
+            return Some(pre.clone());
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(r) = &*seen {
+            return Some(r.clone());
+        }
+        match &self.ack {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => {
+                    *seen = Some(r.clone());
+                    Some(r)
+                }
+                Err(_) => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Blocks for the ack (the session API's wait). After a `try_ack` that
+    /// already consumed the answer, the remembered ack is returned.
+    pub fn wait(self) -> Result<Ts, TxnError> {
+        if let Some(pre) = self.pre {
+            return pre;
+        }
+        let rx = self.ack.unwrap_or_else(unreachable_or_none);
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(r) = seen.take() {
+            return r;
+        }
+        match rx.recv() {
+            Ok(r) => Ok(r?),
+            Err(RecvError) => Err(TxnError::Invariant(
+                "commit was never acked: the commit pipeline stopped (fail-stop)".into(),
+            )),
+        }
+    }
+}
+
+/// The `ack`-less arm of [`CommitTicket::wait`]: unreachable because the
+/// ticket is built either with a receiver or with `pre`.
+fn unreachable_or_none() -> mpsc::Receiver<CommitAck> {
+    // A closed channel: recv on it returns the stop error, which `wait`
+    // maps to the pipeline-stopped invariant error.
+    let (tx, rx) = mpsc::channel();
+    drop(tx);
+    rx
 }
 
 /// Fail-stop hook (§3): a KV error on the commit thread (or reported by the
@@ -167,6 +252,13 @@ impl Clock for SystemClock {
 /// [`Core::set_release_hook`](crate::boot::Core::set_release_hook).
 pub trait ReleaseHook: Send + Sync {
     fn release_all(&self, txn: TxnId);
+    /// `ROLLBACK TO SAVEPOINT s` (§5.5): release relation and advisory
+    /// locks taken at seq `>= s` (shared row locks are released by
+    /// [`Core::rollback_to`](crate::write) itself, under each key's latch).
+    /// No-op by default; C-T2b implements it.
+    fn release_from(&self, txn: TxnId, from_seq: crate::Seq) {
+        let _ = (txn, from_seq);
+    }
 }
 
 /// The no-op [`ReleaseHook`].
@@ -178,12 +270,13 @@ impl ReleaseHook for NoReleaseHook {
 }
 
 /// One queued resolution/cleanup entry (§3 step 5, §7.1): the txn and the
-/// keys of its write set. Crate-private: only the pipeline, abort and the
-/// resolver produce and consume these.
+/// keys of its write set, each with its latch prefix (§5.0) so the removal
+/// latches `latch_key(k)` (seed 25). Crate-private: only the pipeline,
+/// abort and the resolver produce and consume these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolveEntry {
     pub txn: TxnId,
-    pub keys: Vec<nucleus_kv::Key>,
+    pub keys: Vec<(nucleus_kv::Key, Option<usize>)>,
     pub mode: crate::removal::RemovalMode,
 }
 
@@ -225,29 +318,49 @@ impl<K: OrderedKv> Core<K> {
     /// The commit API (§3): enqueues the request, blocks for the ack and
     /// returns `commit_ts`. Consumes the txn: after a commit (or a
     /// fail-stop error ack) the caller has no further use for it.
+    /// [`Core::commit_submit`] + [`CommitTicket::wait`].
     ///
     /// A txn with no writes, and not SERIALIZABLE, commits without a ts: it
     /// returns [`Ts::ZERO`], writes nothing and is released immediately, as
     /// in PostgreSQL where a read-only txn gets no xid. Its release hook
     /// still runs (a lock-only txn may hold shared locks, §6).
     pub fn commit(&self, txn: Txn, sync: SyncCommit) -> Result<Ts, TxnError> {
+        self.commit_submit(txn, sync)?.wait()
+    }
+
+    /// [`Core::commit`] without the wait: enqueues the request and returns
+    /// at once. The enqueue (for every txn that goes on the channel) runs
+    /// inside [`Core::ssi_hook`](crate::write::SsiHook)'s `pre_commit`
+    /// (§8.4), so C-T3's dangerous-structure check and prepare are atomic
+    /// with the channel send. The no-write, non-SERIALIZABLE path returns a
+    /// ticket already acked with [`Ts::ZERO`] (§3). Tests and the simulator
+    /// interleave other actors by polling [`CommitTicket::try_ack`] and
+    /// driving the pipeline themselves.
+    pub fn commit_submit(&self, txn: Txn, sync: SyncCommit) -> Result<CommitTicket, TxnError> {
         if txn.write_set_keys().is_empty() && txn.isolation != Isolation::Serializable {
+            // §3: no writes and not SERIALIZABLE — no ts, nothing written,
+            // released at once (a lock-only txn may hold shared locks).
+            self.release_row_locks(txn.id);
             self.release_hook().release_all(txn.id);
             self.bump_and_wake(txn.id)?;
             self.status.mark_released(txn.id)?;
-            return Ok(Ts::ZERO);
+            return Ok(CommitTicket::acked(Ok(Ts::ZERO)));
         }
         let ssi = txn.isolation == Isolation::Serializable;
         let (req, ack) = CommitRequest::new(txn.id, sync, None, ssi, txn.write_set_keys());
-        self.submit(req)?;
-        match ack.recv() {
-            Ok(Ok(ts)) => Ok(ts),
-            Ok(Err(e)) => Err(e),
-            Err(RecvError) => Err(TxnError::Invariant(format!(
-                "commit of {:?} never acked: the commit pipeline stopped (fail-stop)",
-                txn.id
-            ))),
-        }
+        let ticket = CommitTicket::from_receiver(ack);
+        // §8.4: the enqueue runs inside the SSI pre-commit critical section
+        // (commit order equals prepare order because the commit thread
+        // assigns commit_ts in channel order).
+        let mut req = Some(req);
+        self.ssi_hook()
+            .pre_commit(txn.id, txn.isolation, &mut || -> Result<(), TxnError> {
+                let req = req
+                    .take()
+                    .ok_or_else(|| TxnError::Invariant("enqueue ran twice".into()))?;
+                self.send_commit(req)
+            })?;
+        Ok(ticket)
     }
 
     /// §7.1: the owning session, outside any latch, sets `Aborted`, releases
@@ -257,7 +370,13 @@ impl<K: OrderedKv> Core<K> {
     /// txn: only the owning session calls it, at most once.
     pub fn abort(&self, txn: Txn) -> Result<(), TxnError> {
         self.status.set_aborted(txn.id)?;
+        // §6/§3 step 5: shared row locks are released under each key's
+        // latch, before the release hook (relation/advisory locks).
+        self.release_row_locks(txn.id);
         self.release_hook().release_all(txn.id);
+        // §8.6: an aborted txn's SIREADs and edges are removed when it
+        // aborts — before the wake, so re-running waiters see none of them.
+        self.ssi_hook().on_abort(txn.id);
         self.bump_and_wake(txn.id)?;
         self.status.mark_released(txn.id)?;
         let keys = txn.write_set_keys();
@@ -270,6 +389,18 @@ impl<K: OrderedKv> Core<K> {
             });
         }
         Ok(())
+    }
+
+    /// §6 "Release" / §3 step 5: release every shared row lock `txn` holds,
+    /// each under its key's latch (seed 46), bumping the holder's wake
+    /// generation after the removal (the generation bump that follows in
+    /// every caller). Crate-private: commit step 5, abort and the no-write
+    /// fast path are the callers.
+    pub(crate) fn release_row_locks(&self, txn: TxnId) {
+        for key in self.row_locks().keys_of(txn, 0) {
+            let _latch = self.latches.lock(&key);
+            self.row_locks().release(&key, txn, 0);
+        }
     }
 }
 
@@ -320,15 +451,17 @@ impl<K: OrderedKv> CommitPipeline<K> {
 
     /// [`CommitPipeline::new`] with a [`CommitConfig`]: the fail-stop hook
     /// is installed on the core (the resolver reports through it too), the
-    /// observer and clock on the pipeline.
+    /// observer and clock on the pipeline. The hook is installed **only
+    /// after** the attach succeeds: a core that already has a pipeline
+    /// keeps its previous hook (C-T1b follow-up 4).
     pub fn with_config(
         core: Arc<Core<K>>,
         config: CommitConfig,
     ) -> Result<CommitPipeline<K>, TxnError> {
+        let mut pipeline = CommitPipeline::new(Arc::clone(&core))?;
         if let Some(f) = &config.fail_stop {
             core.set_fail_stop(Arc::clone(f));
         }
-        let mut pipeline = CommitPipeline::new(Arc::clone(&core))?;
         if let Some(o) = config.observer {
             pipeline.observer = o;
         }
@@ -430,8 +563,10 @@ impl<K: OrderedKv> CommitPipeline<K> {
             }
             if let Err(e) = self.core.write(batch, Durability::No) {
                 // Nothing in the group has been acked yet (acks are step
-                // 4): every request gets the error ack.
-                self.stop_group(&group, 0, e);
+                // 4): every request gets the error ack. Records of requests
+                // before `i` are in the WAL: their acks (and every later
+                // one's) are CommitIndeterminate (follow-up 3).
+                self.stop_group(&group, 0, e, i > 0);
                 return;
             }
         }
@@ -449,7 +584,7 @@ impl<K: OrderedKv> CommitPipeline<K> {
             .unwrap_or(group.len());
         for i in 0..split {
             if let Err(e) = self.make_visible(&group[i], ts_of[i]) {
-                self.stop_group(&group, i, e);
+                self.stop_group(&group, i, e, true);
                 return;
             }
         }
@@ -457,12 +592,12 @@ impl<K: OrderedKv> CommitPipeline<K> {
             // The one fsync of the group (§3 step 4). This thread is the
             // commit thread, never a caller thread.
             if let Err(e) = self.core.sync_wal() {
-                self.stop_group(&group, split, e);
+                self.stop_group(&group, split, e, true);
                 return;
             }
             for i in split..group.len() {
                 if let Err(e) = self.make_visible(&group[i], ts_of[i]) {
-                    self.stop_group(&group, i, e);
+                    self.stop_group(&group, i, e, true);
                     return;
                 }
             }
@@ -494,8 +629,10 @@ impl<K: OrderedKv> CommitPipeline<K> {
     }
 
     /// §3 step 5 for one txn. Bumps the wake generation **then** wakes the
-    /// waiters (§6).
-    fn step5(&self, txn: TxnId, keys: &[nucleus_kv::Key]) -> Result<(), TxnError> {
+    /// waiters (§6). Shared row locks are released before the release hook,
+    /// each under its key's latch (§6).
+    fn step5(&self, txn: TxnId, keys: &[(nucleus_kv::Key, Option<usize>)]) -> Result<(), TxnError> {
+        self.core.release_row_locks(txn);
         self.core.release_hook().release_all(txn);
         self.core.bump_and_wake(txn)?;
         self.core.queue_resolution(txn, keys);
@@ -504,10 +641,19 @@ impl<K: OrderedKv> CommitPipeline<K> {
 
     /// Fail-stop mid-group (§3): stop, run the hook, and error-ack every
     /// request from `from` (the first one not yet ackged) to the end.
-    fn stop_group(&self, group: &[CommitRequest], from: usize, err: TxnError) {
+    /// `wal_reached` says whether any of the group's records already
+    /// reached the WAL: if so, those records may become durable, and every
+    /// error ack is [`TxnError::CommitIndeterminate`] (08007, "transaction
+    /// resolution unknown"), never a plain failure (C-T1b follow-up 3).
+    fn stop_group(&self, group: &[CommitRequest], from: usize, err: TxnError, wal_reached: bool) {
         self.fail_stop(&err);
+        let ack_err = if wal_reached {
+            TxnError::CommitIndeterminate
+        } else {
+            err
+        };
         for req in &group[from..] {
-            req.ack(Err(err.clone()));
+            req.ack(Err(ack_err.clone()));
         }
     }
 
@@ -679,7 +825,10 @@ impl<K: OrderedKv> Core<K> {
         )
     }
 
-    pub(crate) fn set_fail_stop(&self, hook: Arc<dyn FailStop>) {
+    /// Installs the fail-stop hook (§3). Public: the same slot
+    /// [`CommitConfig::fail_stop`] fills through
+    /// [`CommitPipeline::with_config`], for callers that attach no thread.
+    pub fn set_fail_stop(&self, hook: Arc<dyn FailStop>) {
         *self
             .fail_stop
             .lock()
@@ -704,8 +853,8 @@ impl<K: OrderedKv> Core<K> {
     }
 
     /// §3 step 5: queue `txn` for async resolution with the write-set keys
-    /// carried by its commit request.
-    pub(crate) fn queue_resolution(&self, txn: TxnId, keys: &[nucleus_kv::Key]) {
+    /// (and their latch prefixes, §5.0) carried by its commit request.
+    pub(crate) fn queue_resolution(&self, txn: TxnId, keys: &[(nucleus_kv::Key, Option<usize>)]) {
         if !keys.is_empty() {
             self.lock_resolve_queue().push_back(ResolveEntry {
                 txn,

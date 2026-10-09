@@ -213,38 +213,60 @@ impl Waits {
 }
 
 impl<K: nucleus_kv::OrderedKv> Core<K> {
-    /// §6 "Waiting" steps 1–3, without the wait-for graph:
-    /// 1. the hook fires and the waiter registers on `target`;
-    /// 2. re-check (the gen-recheck rule): return at once if the target has
-    ///    ended, is Aborted, is a visible commit, its `gen != g`, or the
-    ///    waiter's cancel flag is set;
-    /// 3. park until the target's generation changes or the waiter is
-    ///    cancelled, re-checking after every wake.
-    ///
-    /// `g` is the generation the caller read where it observed the conflict
-    /// (under the key's latch, §5.1). Never called with a latch held.
+    /// §6 "Waiting" steps 1–3 on one target:
+    /// [`Core::wait_on_any`] with a one-element target list.
     pub fn wait_on(&self, waiter: &Txn, target: TxnId, g: u64) -> WaitOutcome {
+        self.wait_on_any(waiter, &[(target, g)])
+    }
+
+    /// §6 "Waiting" steps 1–3 over several targets (C-T0 §5.1: a row op may
+    /// have to wait on a foreign intent's owner and on every conflicting
+    /// shared-row-lock holder at once):
+    /// 1. the hook fires and the waiter registers on **every** target;
+    /// 2. re-check (the gen-recheck rule): return at once if any target has
+    ///    ended, is Aborted, is a visible commit, or its `gen != g`;
+    /// 3. park until any target's generation changes, any target ends, or
+    ///    the waiter is cancelled, re-checking after every wake.
+    ///
+    /// Every `g` is the generation the caller read where it observed the
+    /// conflict (under the key's latch, §5.1). All targets share one parker,
+    /// so any target's wake (or the cancel flag) unblocks the park. The
+    /// waiter unregisters from every target and fires `on_wait_end` for each
+    /// on **every** return path. Never called with a latch held.
+    pub fn wait_on_any(&self, waiter: &Txn, targets: &[(TxnId, u64)]) -> WaitOutcome {
+        debug_assert!(
+            !targets.is_empty(),
+            "wait_on_any with no targets: there is nothing to wait on"
+        );
+        if targets.is_empty() {
+            // Defensive: an empty wait is vacuously over (§4: a missing
+            // status means ended and released).
+            return WaitOutcome::Ended;
+        }
         let hook = self.waits.hook();
-        hook.on_wait_start(waiter.id, target);
         let parker = self.waits.make_parker();
         let slot = Arc::new(WaitSlot {
             waiter: waiter.id,
             parker: Arc::clone(&parker),
         });
-        self.waits.register(target, slot);
-        let outcome = self.park_until_unblocked(target, g, &parker, &waiter.cancel);
-        self.waits.unregister(target, waiter.id);
-        hook.on_wait_end(waiter.id, target);
+        for (t, _) in targets {
+            hook.on_wait_start(waiter.id, *t);
+            self.waits.register(*t, Arc::clone(&slot));
+        }
+        let outcome = self.park_until_unblocked(targets, &parker, &waiter.cancel);
+        for (t, _) in targets {
+            self.waits.unregister(*t, waiter.id);
+            hook.on_wait_end(waiter.id, *t);
+        }
         outcome
     }
 
-    /// The park loop. Split from [`Core::wait_on`] so the register step is
-    /// visibly before the first re-check (§6 step 2's order: register, then
-    /// re-check — that is what makes a lost wakeup impossible).
+    /// The park loop. Split from [`Core::wait_on_any`] so the register step
+    /// is visibly before the first re-check (§6 step 2's order: register,
+    /// then re-check — that is what makes a lost wakeup impossible).
     fn park_until_unblocked(
         &self,
-        target: TxnId,
-        g: u64,
+        targets: &[(TxnId, u64)],
         parker: &Arc<dyn Parker>,
         cancel: &CancelFlag,
     ) -> WaitOutcome {
@@ -254,7 +276,7 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
         // either already visible to the flag check below, or its unpark
         // lands on the stored parker.
         cancel.set_parked(Arc::clone(parker));
-        let outcome = self.wait_loop(target, g, parker, cancel);
+        let outcome = self.wait_loop(targets, parker, cancel);
         // Every return path of the wait clears the publication.
         cancel.clear_parked();
         outcome
@@ -262,25 +284,28 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
 
     fn wait_loop(
         &self,
-        target: TxnId,
-        g: u64,
+        targets: &[(TxnId, u64)],
         parker: &Arc<dyn Parker>,
         cancel: &CancelFlag,
     ) -> WaitOutcome {
         loop {
-            // §6 step 2 re-check, in order: missing status first (`gen`
-            // lives in the status entry), then Aborted, then visible
-            // commit, then the generation, then the cancel flag.
-            match self.status.lookup_remembered(target) {
-                Remembered::Ended => return WaitOutcome::Ended,
-                Remembered::Live(TxnStatus::Aborted, _) => return WaitOutcome::Aborted,
-                Remembered::Live(TxnStatus::Committed(c), _) if c <= self.visible_ts() => {
-                    return WaitOutcome::Committed(c);
+            // §6 step 2 re-check, per target, in order: missing status first
+            // (`gen` lives in the status entry), then Aborted, then visible
+            // commit, then the generation. The first target that unblocked
+            // decides the outcome.
+            for (target, g) in targets {
+                match self.status.lookup_remembered(*target) {
+                    Remembered::Ended => return WaitOutcome::Ended,
+                    Remembered::Live(TxnStatus::Aborted, _) => return WaitOutcome::Aborted,
+                    Remembered::Live(TxnStatus::Committed(c), _) if c <= self.visible_ts() => {
+                        return WaitOutcome::Committed(c);
+                    }
+                    // Committed but not yet visible, or Pending: keep
+                    // waiting; commit step 5 (after visibility) bumps the
+                    // generation.
+                    Remembered::Live(_, gen) if gen != *g => return WaitOutcome::GenChanged,
+                    Remembered::Live(..) => {}
                 }
-                // Committed but not yet visible, or Pending: keep waiting;
-                // commit step 5 (after visibility) bumps the generation.
-                Remembered::Live(_, gen) if gen != g => return WaitOutcome::GenChanged,
-                Remembered::Live(..) => {}
             }
             if cancel.is_cancelled() {
                 return WaitOutcome::Cancelled;

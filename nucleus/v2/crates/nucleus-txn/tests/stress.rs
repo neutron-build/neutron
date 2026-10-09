@@ -94,7 +94,7 @@ fn place_with_waits(
         let latch = core.latches.lock(key);
         match core.latest_get(&nucleus_txn::encoding::intent_key(key))? {
             None => {
-                txn.log_write(seq, key);
+                txn.log_write(seq, key, None);
                 core.count_placement(txn)?;
                 let mut batch = nucleus_kv::Batch::default();
                 batch.put(nucleus_txn::encoding::intent_key(key), encoded.clone());

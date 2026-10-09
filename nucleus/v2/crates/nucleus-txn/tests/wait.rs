@@ -287,7 +287,7 @@ fn gen_recheck_returns_at_once_when_target_ended_before_registration() {
     place_intent(&core, &target, b"/t/1/r", b"v");
     let ts = ok(core.commit(target, SyncCommit::On));
     assert!(ts > nucleus_txn::Ts::ZERO);
-    common::note_committed(target_id);
+    common::note_committed(&core, target_id);
     common::wait_released(&core, target_id);
     ok(nucleus_txn::resolver::Resolver::run_once(&core));
     ok(nucleus_txn::resolver::Resolver::run_once(&core));
