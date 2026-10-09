@@ -25,7 +25,10 @@ fn g0_write_clean_model_holds() {
 fn g0_write_catches_every_seed() {
     assert_eq!(
         Bug::ALL.map(|b| b.seed()),
-        [4, 11, 12, 15, 16, 17, 18, 19, 24, 25, 26, 27, 37, 38, 45, 46, 47, 48, 50, 52, 59]
+        [
+            4, 11, 12, 15, 16, 17, 18, 19, 24, 25, 26, 27, 37, 38, 45, 46, 47, 48, 50, 52, 59, 53,
+            54, 56, 57, 58, 64
+        ]
     );
     for bug in Bug::ALL {
         let r = check(&WriteModel { bug: Some(bug) }, max_states());
