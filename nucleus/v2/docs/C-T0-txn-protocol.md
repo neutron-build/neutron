@@ -1,6 +1,6 @@
 # C-T0: Transaction protocol (normative)
 
-Status: draft 7.2 (adversarial review rounds 1-6 applied, G0 representation fixed; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
+Status: draft 7.3 (adversarial review rounds 1-6 applied, G0 representation fixed; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
 
 Scope: single node. Isolation levels: RC (PostgreSQL semantics), RR = SI, SERIALIZABLE = SSI. 2PC (`PREPARE TRANSACTION`) is refused with 0A000 in 2.0. Target behaviour is PostgreSQL 17; every deliberate divergence is listed in §12.
 
@@ -86,7 +86,7 @@ A **registry** (one mutex) holds every live snapshot `S`, every open view's coun
 - A txn's snapshot stays registered until the txn ends (RR/SER) or until its statement ends (RC). An open cursor or portal keeps its snapshot registered until it closes. A `WITH HOLD` cursor is materialised at commit, before the SSI pre-commit (§8.4). As in PostgreSQL's `CommitTransaction`, firing deferred triggers and constraint checks and materialising holdable portals repeat until neither has anything left (a deferred trigger may declare a new holdable cursor); nothing reads the KV for such a cursor after its txn ends.
 - **Every KV read made outside a latch section opens a registered view**: scans, point reads, FK parent and child reads, constraint-check scans, EPQ re-reads, SSI fetches. A read made under `latch(latch_key(k))` may read the latest state of `k` directly: every removal of `k@INTENT` takes the same latch (§7.3), so the intent cannot be removed and its owner's status cannot be truncated while the read runs.
 
-**Lock order.** Latch → registry mutex → SSI mutex → wait-for-graph mutex. A thread holds at most one latch and never acquires an earlier lock in this order while holding a later one.
+**Lock order.** Latch → registry mutex → SSI mutex → wait-for-graph mutex. A thread holds at most one latch and never acquires an earlier lock in this order while holding a later one. The row-lock, relation-lock and advisory-lock tables, the waiter tables and the status-table mutex are leaves: each may be taken under any lock above, never held while taking another lock, except that status lookups are allowed under a lock-table mutex.
 
 **I-WAL-ORDER.** KV WAL order of commit records equals `commit_ts` order, and every intent write of a txn precedes its commit record in the WAL. Consequence: a durable commit implies its intents and every earlier commit are durable (crash loses a suffix only).
 **I-VIS.** In-memory status of T is `Committed(ts)` before `visible_ts` reaches `ts`.
@@ -253,11 +253,11 @@ Writes and locks are tagged with the seq current **when they execute**, not with
 - **Wake generation.** Every txn has a counter `gen(T)`, stored in its status entry, bumped on every event that can unblock its waiters: commit step 5, abort, `ROLLBACK TO` (including an abandoned ON CONFLICT attempt), any release of an in-memory lock it holds.
 - **Wait-for graph.** One graph covers every kind of wait: row intents, shared row locks (an edge to **every** conflicting holder), relation locks, advisory locks, deferrable-unique prefix waits.
 - **Waking.** Whoever wakes waiters (commit step 5, §7.1 abort, `ROLLBACK TO`, a lock release) first removes the woken waiters' edges to that txn under the graph mutex, then wakes them, so the deadlock DFS never sees an edge for a wait that has already been satisfied.
-- **Waiting.** `wait_for(W -> T, g)` where `g = gen(T)` was read under the latch that observed the conflict: (1) insert the edge into the graph and register W as a waiter on T, (2) if T's status is missing (ended, §4; checked first, since `gen(T)` lives in the status entry), or T is Aborted, or T is a visible commit, or `gen(T) != g`, or W's cancel flag is set, remove the edge and return immediately, (3) park. A woken waiter removes any remaining edges and re-runs §5. The same pattern (read the generation where the conflict is seen, re-check after registering) is used for relation, advisory and prefix waits.
+- **Waiting.** `wait_for(W -> T, g)` where `g = gen(T)` was read under the latch that observed the conflict: (1) insert the edge into the graph and register W as a waiter on T, (2) in the same graph-mutex critical section as (1), if T's status is missing (ended, §4; checked first, since `gen(T)` lives in the status entry), or T is Aborted, or T is a visible commit, or `gen(T) != g`, or W's cancel flag is set, remove the edge and return immediately, (3) park. A woken waiter removes any remaining edges and re-runs §5. The same pattern (read the generation where the conflict is seen, re-check after registering) is used for relation, advisory and prefix waits.
 - NOWAIT: 55P03 instead of waiting. SKIP LOCKED: skip the row. `lock_timeout`: 55P03 on expiry.
 - **Deadlock.** After `deadlock_timeout`, the waiter takes the graph mutex, runs a DFS, and if it finds a cycle containing itself, removes its own edges before releasing the mutex, then raises 40P01. Exactly one member of a cycle is aborted. No wait-die.
-- Relation locks (AccessShare … AccessExclusive) are a separate in-memory table, held to txn end. After acquiring one, catalog lookups use the latest committed catalog (§4 for RR/SER storage-id rule).
-- Advisory locks: in-memory, session or xact scope.
+- Relation locks (AccessShare … AccessExclusive) are a separate in-memory table, held to txn end, except that `ROLLBACK TO` releases those taken after the savepoint (as PostgreSQL does). Lock queues are not fair: a released lock wakes every waiter, and each re-tries. After acquiring one, catalog lookups use the latest committed catalog (§4 for RR/SER storage-id rule).
+- Advisory locks: in-memory, xact scope. Session-scope advisory locks are deferred (§12).
 - **Cancellation.** Only the owning session sets its own status to `Aborted`, and only outside any latch section. Cancel requests and timeouts set a flag that the session acts on at its next check point. Setting the flag also wakes the session if it is parked (lock wait, deferrable-prefix wait, relation or advisory wait) or blocked on client input inside a txn; every park and idle read re-checks the flag on wake.
 
 ## 7. Abort, crash, resolution, status truncation
@@ -332,12 +332,12 @@ SSI keeps its own map `commit_ts -> TxnId` for SERIALIZABLE txns; the txn's SSI 
 - The SIREADs, conflict info and writer-map entry of a committed SER txn T are kept until **both** `visible_ts >= commit_ts(T)` and every SER txn with a registered snapshot `S < commit_ts(T)` has ended. Evaluated under the registry mutex (§3.1), where taking `S` and registering it are one step; after `visible_ts >= commit_ts(T)` no new snapshot can have `S < commit_ts(T)`.
 - An aborted txn's SIREADs and edges are removed when it aborts.
 - When a relation's storage is retired (DROP, TRUNCATE, rewrite), finer-grained SIREADs on the retired ids are converted to relation-level SIREADs keyed by the relation oid. The retired ids are taken from the DDL txn's own in-memory catalog changes (no catalog read, so no registry access under the SSI mutex). The conversion runs in the DDL txn's pre-commit critical section under the SSI mutex, before its commit request is enqueued (§8.4), so no SIREAD on a retired id survives into a state where the new ids are in use.
-- Read-only txns: safe-snapshot optimisation and `DEFERRABLE`.
+- Read-only txns: the safe-snapshot optimisation and `DEFERRABLE` are not implemented (§12). The dangerous-structure check runs only at pre-commit (§8.4); PostgreSQL also checks when an edge is created, which only fails earlier.
 
 ## 9. GC
 
 ### 9.1 Watermark
-`computed` = min over: registered snapshots and caller-chosen ts (§3.1: txns, cursors, portals, `AS OF` reads, segment builds), the `vts` of every open view (§3.1), `visible_ts`, and the `AS OF` retention window converted to ts through `/sys/ts_clock` (rounding down). In **one** registry critical section the GC job computes it and publishes `W = max(old W, computed)`. Then:
+`computed` = min over: registered snapshots and caller-chosen ts (§3.1: txns, cursors, portals, `AS OF` reads, segment builds), the `vts` of every open view (§3.1), `visible_ts`, and the `AS OF` retention window converted to ts through `/sys/ts_clock`: the largest sampled ts whose wall time is at or before the cutoff, or 0 if no sample qualifies (a clock that goes backwards can only lower it). In **one** registry critical section the GC job computes it and publishes `W = max(old W, computed)`. Then:
 - `W <= visible_ts`, and `W` is monotonic.
 - Every registration with a caller-chosen ts is checked against the published `W` (§3.1).
 - The new `W` is persisted to `/sys/gc_w` with `Durability::Yes` (synced) before any GC step (filter, DeleteRange) uses it; the compaction filter is only ever handed a `W` that is already durable. So after a crash, boot loads a `W` at least as large as any `W` a GC step acted on, and AS OF registration (§3.1) can never be admitted below data GC already dropped. `set_gc_watermark` returns an error on a decrease and the caller treats that as fatal.
@@ -357,7 +357,7 @@ Unresolved committed intents are safe: GC only drops versions older than a kept 
 ## 10. Other rules
 - **Storage ids:** u64, allocated from a persisted counter, never reused. Catalog rows map relation and index oids to their current storage ids.
 - **Sequences:** non-transactional; the high-water mark is persisted (synced) before a value from a new block is handed out. Values may skip, never repeat.
-- **Catalog:** rows in `/sys/catalog`, versioned like any table; DDL is transactional and takes AccessExclusive.
+- **Catalog:** rows in `/sys/catalog`, versioned like any table; DDL is transactional and takes AccessExclusive. The GC rules (§9.2) apply to data prefixes and `/sys/catalog/` only; every other `/sys/` key is never dropped by the filter, even if its bytes match the version-key pattern.
 - **Large txns:** intents, write-set log and SIREAD state all spill; the 10M-row gate measures commit latency, reader latency during resolution and abort cleanup time.
 
 ## 11. Invariants and the G0 model
@@ -455,11 +455,14 @@ The deterministic simulator runs the full pipeline with larger scopes under seed
 64. ON CONFLICT attempt's queued checks or AFTER events tagged `seq0`, surviving an abandon (write).
 
 ## 12. Open questions and known divergences
-Open (resolve before C-T2 merges):
-1. RC joined DML: full EPQ vs statement retry (G3c decides).
+Open:
+1. RC joined DML: full EPQ vs statement retry (G3c decides). Deferred to the executor cards: C-T2 implements single-row EPQ (§5.2) only.
 2. RocksDB UDT viability (C-S1), and if viable the UDT layout of intents, tombstones and moved-tombstones; otherwise the ts-in-key GC path is mandatory.
 3. Whether `synchronous_commit=off` commits may be visible to `on` sessions before fsync (PostgreSQL: yes). Current spec: yes.
-4. Confirm the SERIALIZABLE unique-violation rule of §5.3 against PostgreSQL's isolation tests (G3c).
+4. Confirm the SERIALIZABLE unique-violation rule of §5.3 against PostgreSQL's isolation tests (G3c). C-T2 implements the rule as written; G3c gates release, not C-T2.
+5. Session-scope advisory locks: wake generations and the wait-for graph are per txn. Deferred.
+6. `SERIALIZABLE READ ONLY DEFERRABLE` and the safe-snapshot optimisation (§8.6). Deferred; `DEFERRABLE` is accepted and ignored.
+7. Relation SIREADs (§8.1) are keyed by relation oid, but a writer has only the raw key: the mapping from storage id to relation is maintained by the catalog layer and handed to SSI.
 
 Known divergences from PostgreSQL 17:
 - A concurrent primary-key change seen by RC EPQ raises 40001 instead of following the update chain (§5.2).
@@ -469,6 +472,7 @@ Known divergences from PostgreSQL 17:
 
 ## Changelog
 
+- **Draft 7.3** (2026-10-08, from drafting C-T2..C-SIM): §3.1 lock-table, waiter-table and status mutexes are leaves. §6 the waiter's re-check runs in the same graph critical section as the edge insert (otherwise a stale edge can give a false 40P01); `ROLLBACK TO` releases relation locks taken after the savepoint; queues are not fair; advisory locks xact scope only. §8.6 safe snapshots and `DEFERRABLE` not implemented; check at pre-commit only. §9.1 `/sys/ts_clock` conversion defined. §10 GC rules skip `/sys/` except the catalog. §12 Q1 deferred to executor cards, Q4 gates release not C-T2, Q5-Q7 added.
 - **Draft 7.2** (2026-10-08): §2.2 version keys end in a `0x01` tag byte so a raw key splits from the right without the schema (found in C-T1a review: a length-prefixed `L` broke SQL key order). Ordering, `end(L)` and the GC range are unchanged.
 - **draft 7.1 (2026-10-07), G0-commit built:** §11 exhaustive models run over a pure-value abstract KV (MemKv is for the simulator); rank renumbering and read-as-check reductions stated; G0-commit scope is 2 writers with a write-set choice + 2 readers (3 txns at once deferred). 8.39M states, all 11 owned seeds caught.
 - **draft 7 (2026-10-07), round-6 delta review** (1 critical, 4 major, 2 minor; 3 round-5 residues):
