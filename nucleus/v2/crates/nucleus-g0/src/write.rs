@@ -86,7 +86,7 @@
 //! | 24 | ownabsent | | 52 | epqshare |
 //! | 25 | deferrable | | 53 | ocdup |
 //! | 26 | main | | 54 | ocdup |
-//! | 58 | fkmoved | | 56 | ocdup |
+//! | 58 | fk | | 56 | ocdup |
 //! | 59 | dlk3 | | 57 | ocdup |
 //! | | | | 64 | ocdup |
 //!
@@ -197,6 +197,14 @@
 //!   liveness (`Entry` live, `Dead` kills): C-G0wa's workloads never deleted a unique
 //!   entry, so the check misread a legal row+entry delete as an orphaned entry;
 //!   `ocdup`/`ocnothing`/`fkmoved` delete entries.
+//! - ON CONFLICT gaps found in review (mutants that survive the clean model):
+//!   the pre-check's wait on a Pending non-`Absent` arbiter intent is reachable but
+//!   unobservable (skipping it only delays the same outcome through §5.1's wait);
+//!   no oracle evaluates the `DO UPDATE ... WHERE` qual (the qual ghost covers RC
+//!   row ops only); and no txn ever waits on an attempt's own intents, so an abandon
+//!   that skips the wake-generation bump is unobservable.
+//! - `INSERT ... ON CONFLICT DO UPDATE` revisiting a row the same statement inserted
+//!   (21000) is not modelled: statements propose one row each.
 
 use std::collections::BTreeMap;
 
@@ -2358,7 +2366,7 @@ impl WriteModel {
             txn.base = visible;
             txn.skip = 0;
         }
-        let Some((tag, target)) = head else {
+        let Some((_, target)) = head else {
             self.advance_stmt(s, w);
             return;
         };
@@ -2368,7 +2376,7 @@ impl WriteModel {
             // both queues drop it.
             let txn = &mut s.txns[w as usize];
             txn.evq.remove(0);
-            if let Some(i) = txn.gevq.iter().position(|e| *e == (tag, target)) {
+            if let Some(i) = txn.gevq.iter().position(|e| e.1 == target) {
                 txn.gevq.remove(i);
             }
             if txn.evq.is_empty() {
@@ -2396,13 +2404,13 @@ impl WriteModel {
             txn.evop = false;
             txn.synth = None;
         }
-        let Some((tag, target)) = head else {
+        let Some((_, target)) = head else {
             self.advance_stmt(s, w);
             return;
         };
         let txn = &mut s.txns[w as usize];
         txn.evq.remove(0);
-        if let Some(i) = txn.gevq.iter().position(|e| *e == (tag, target)) {
+        if let Some(i) = txn.gevq.iter().position(|e| e.1 == target) {
             txn.gevq.remove(i);
             txn.expected[target as usize] = match txn.expected[target as usize] {
                 Some(ED::Inc { d }) => Some(ED::Inc {
