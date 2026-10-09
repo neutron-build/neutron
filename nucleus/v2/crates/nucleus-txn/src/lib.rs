@@ -1,9 +1,20 @@
 //! nucleus-txn: MVCC transactions over `OrderedKv`. Normative spec:
 //! `docs/C-T0-txn-protocol.md`. Section numbers below refer to it.
 //!
-//! This file fixes the core types and the pure visibility rule (§4). Everything
-//! else (commit thread, write path, locks, SSI, GC) is built by the C-T cards.
+//! Card C-T1a builds the shared core every later T card extends: the §2
+//! on-disk encoding (`encoding`), the status table with epochs and boot
+//! (`status`, `boot`), the snapshot/view registry (`registry`), latches
+//! (`latch`), intent removal (`removal`) and the read path (`read`). The
+//! commit thread, write path, row locks, SSI and the GC job are C-T1b..T4;
+//! the pure §4 rule lives in `visibility`.
 
+pub mod boot;
+pub mod encoding;
+pub mod latch;
+pub mod read;
+pub mod registry;
+pub mod removal;
+pub mod status;
 pub mod visibility;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
@@ -123,6 +134,15 @@ pub enum TxnError {
     TriggeredDataChange, // 27000
     #[error("snapshot too old")]
     SnapshotTooOld, // 72000
+    /// A protocol invariant was violated (C-T0 §4, §7): e.g. the owner of an
+    /// intent found in a view has no current-epoch status entry. The caller
+    /// makes this fatal (process abort); it is never defaulted.
+    #[error("transaction invariant violated: {0}")]
+    Invariant(String), // XX000
+    /// Persisted bytes did not decode (§2.2/§2.3 formats). Reported, never a
+    /// panic.
+    #[error("corrupt persisted data: {0}")]
+    Corrupt(String), // XX000
     #[error("kv: {0}")]
     Kv(String),
 }
@@ -138,7 +158,13 @@ impl TxnError {
             TxnError::CardinalityViolation => "21000",
             TxnError::TriggeredDataChange => "27000",
             TxnError::SnapshotTooOld => "72000",
+            TxnError::Invariant(_) => "XX000",
+            TxnError::Corrupt(_) => "XX000",
             TxnError::Kv(_) => "XX000",
         }
     }
+}
+
+pub(crate) fn kv_err(e: nucleus_kv::KvError) -> TxnError {
+    TxnError::Kv(e.to_string())
 }

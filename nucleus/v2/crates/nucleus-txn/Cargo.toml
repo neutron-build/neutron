@@ -10,3 +10,8 @@ workspace = true
 [dependencies]
 nucleus-kv.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Tests run over MemKv (flat and LSM mode) and compare the §2.2 layout against
+# the reference in the kv conformance suite.
+nucleus-kv = { path = "../nucleus-kv", features = ["mem", "conformance"] }
