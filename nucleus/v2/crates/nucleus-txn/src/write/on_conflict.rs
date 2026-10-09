@@ -8,15 +8,24 @@
 //! ([`StmtCtx::attempt`], seed 56), and every restart rolls back to `sa`
 //! (seed 54), which also discards the checks and AFTER events the SQL layer
 //! queued for the attempt under the tag `sa` it was handed (seed 64).
+//!
+//! C-T2c rework: §5.3.1(1)'s pre-check rule also governs `r` and the arbiter
+//! entry at the conflict/lock/apply points ([`Core::conflict_row_state`] and
+//! the ownership re-check after the lock), so a committed-but-unapplied
+//! change of what the arbiter entry names forces a wait-and-restart (or an
+//! inline resolution) instead of a decision on stale state.
 
 use nucleus_kv::{Key, OrderedKv};
 
 use crate::boot::Core;
+use crate::removal::{remove_intent_under_latch, RemovalMode};
 use crate::txn::Txn;
-use crate::write::ctx::{is_snapshot_iso, WaitSet};
+use crate::write::ctx::{classify_foreign, is_snapshot_iso, Foreign, WaitSet};
 use crate::write::step::{map_wait_outcome, read_key_state, ArbPreStep, ArbiterPreCheck};
-use crate::write::{KeyOpTask, RowOp, RowOpTask, RowOutcome, Step, StmtCtx, UniqueRule};
-use crate::{LayerData, RowLockMode, Seq, Ts, TxnError};
+use crate::write::{
+    CommittedVersion, KeyOpTask, RowOp, RowOpTask, RowOutcome, Step, StmtCtx, UniqueRule,
+};
+use crate::{Layer, LayerData, RowLockMode, Seq, Ts, TxnError, TxnStatus};
 
 /// One unique-index entry of a proposed row (`/u/{idx}/{key}`), whose value
 /// names the row (the caller's `t_key_of` maps it back to the `/t/` key).
@@ -134,7 +143,7 @@ impl<K: OrderedKv> Core<K> {
                     ArbPreStep::Insert => break,
                     ArbPreStep::Conflict { entry_payload } => {
                         let r = t_key_of(&entry_payload);
-                        return self.arbiter_conflict(txn, actx, &r, action);
+                        return self.arbiter_conflict(txn, actx, entry, &r, t_key_of, action);
                     }
                 }
             }
@@ -195,25 +204,27 @@ impl<K: OrderedKv> Core<K> {
         Ok(Attempt::Done(OnConflictResult::Inserted))
     }
 
-    /// §5.3.1(3): conflict on row `r`.
+    /// §5.3.1(3): conflict on row `r`, which the live arbiter `entry` names.
     fn arbiter_conflict(
         &self,
         txn: &Txn,
         actx: &StmtCtx,
+        entry: &IndexEntry,
         r: &[u8],
+        t_key_of: &dyn Fn(&[u8]) -> Key,
         action: &mut OnConflictAction<'_>,
     ) -> Result<Attempt, TxnError> {
-        // v_r and r's own top layer from one registered view (outside r's
-        // latch, §3.1).
-        let (v_r, own_top) = {
-            let view = self.open_view();
-            let state = read_key_state(&view, r)?;
-            let own_top = state
-                .intent
-                .as_ref()
-                .filter(|i| i.txn == txn.id)
-                .and_then(|i| i.top().cloned());
-            (state.newest_committed().cloned(), own_top)
+        // v_r and r's own top layer under §5.3.1(1)'s pre-check rule, which
+        // governs r here too (rework item 2): a foreign visible-committed or
+        // aborted intent on r is removed per §7.3 first (its version then
+        // counts as applied state), and a foreign Pending or
+        // committed-not-visible data intent is waited on with a restart from
+        // (1), so the (3) check below decides on applied state — a
+        // committed-but-unapplied writer of `r` above `S` is a 40001 under
+        // RR/SER, `DO NOTHING` included.
+        let (v_r, own_top) = match self.conflict_row_state(txn, r)? {
+            ConflictRow::Ready { v_r, own_top } => (v_r, own_top),
+            ConflictRow::Wait(targets) => return Ok(Attempt::Restart(Some(targets))),
         };
         if is_snapshot_iso(txn.isolation) && v_r.as_ref().is_some_and(|v| v.ts > actx.snapshot()) {
             return Err(TxnError::SerializationFailure);
@@ -240,6 +251,31 @@ impl<K: OrderedKv> Core<K> {
                     return Err(TxnError::Invariant(format!(
                         "ON CONFLICT arbiter lock returned {other:?}"
                     )))
+                }
+            }
+        }
+
+        // The ownership re-check (rework item 1): the pre-check rule governs
+        // the arbiter entry at the apply point, so DO UPDATE never applies to
+        // a row that no longer owns the conflicting entry, in any
+        // commit-visibility stage. The window between the pre-check and here
+        // can hide a key-moving writer whose commit left `r`'s own `/t/` key
+        // untouched (the lock at `base = v_r.ts` saw `v_r` as still-newest):
+        // a foreign intent on the entry is removed (visible) or waited on
+        // (Pending / committed-not-visible, restart from (1)), and the live
+        // entry must still name `r`. Anything else restarts, and (1)
+        // re-derives the conflict (or inserts).
+        let pre = ArbiterPreCheck::new(&entry.key, None, Some(entry.value.clone()));
+        loop {
+            match pre.step(self, txn)? {
+                ArbPreStep::Again => {}
+                ArbPreStep::Wait(targets) => return Ok(Attempt::Restart(Some(targets))),
+                ArbPreStep::Insert => return Ok(Attempt::Restart(None)),
+                ArbPreStep::Conflict { entry_payload } => {
+                    if t_key_of(&entry_payload).as_slice() != r {
+                        return Ok(Attempt::Restart(None));
+                    }
+                    break;
                 }
             }
         }
@@ -300,4 +336,75 @@ impl<K: OrderedKv> Core<K> {
             }
         }
     }
+
+    /// §5.3.1(1)'s pre-check rule applied to `r`'s `/t/` key at the conflict
+    /// point (rework items 1-2: the rule "must govern `r` ... at the
+    /// lock/apply point too"): under `latch(r)`, read `r@INTENT` and its
+    /// versions from one fresh view. A foreign visible-committed or aborted
+    /// intent is removed per §7.3 steps 2-4 under the latch already held and
+    /// the read re-runs (so a committed-but-unapplied writer's version
+    /// counts as applied state); a foreign Pending or committed-not-visible
+    /// intent whose top data is not `Absent` waits on its owner, and the
+    /// caller restarts from (1). A lock-only foreign intent produces no
+    /// version and does not block the read. Crate-private.
+    fn conflict_row_state(&self, txn: &Txn, r: &[u8]) -> Result<ConflictRow, TxnError> {
+        loop {
+            let latch = self.latches.lock(r);
+            let state = {
+                let view = self.open_view();
+                let s = read_key_state(&view, r)?;
+                drop(view);
+                s
+            };
+            if let Some(intent) = &state.intent {
+                if intent.txn != txn.id {
+                    let owner = intent.txn;
+                    let status = self.status.lookup_for_intent(owner)?;
+                    match classify_foreign(status, self.visible_ts()) {
+                        Foreign::RemoveResolve | Foreign::RemoveDiscard => {
+                            let mode = if matches!(status, TxnStatus::Committed(_)) {
+                                RemovalMode::Resolve
+                            } else {
+                                RemovalMode::Discard
+                            };
+                            remove_intent_under_latch(self, r, None, owner, mode, &latch)?;
+                            drop(latch);
+                            continue;
+                        }
+                        Foreign::Blocking => {
+                            // Only a non-Absent foreign intent waits; a
+                            // lock-only one changes no applied state.
+                            let top_absent =
+                                intent.top().is_some_and(|t| t.data == LayerData::Absent);
+                            if !top_absent {
+                                let g = self.status.entry(owner).map_or(0, |e| e.gen);
+                                drop(latch);
+                                return Ok(ConflictRow::Wait(vec![(owner, g)]));
+                            }
+                        }
+                    }
+                }
+            }
+            drop(latch);
+            let own_top = state
+                .intent
+                .as_ref()
+                .filter(|i| i.txn == txn.id)
+                .and_then(|i| i.top().cloned());
+            return Ok(ConflictRow::Ready {
+                v_r: state.newest_committed().cloned(),
+                own_top,
+            });
+        }
+    }
+}
+
+/// [`Core::conflict_row_state`]'s outcome: `r`'s state once the pre-check
+/// rule ran, or the owner to wait on before restarting from (1).
+enum ConflictRow {
+    Ready {
+        v_r: Option<CommittedVersion>,
+        own_top: Option<Layer>,
+    },
+    Wait(WaitSet),
 }
