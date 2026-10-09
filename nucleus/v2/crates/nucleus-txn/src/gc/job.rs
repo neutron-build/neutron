@@ -3,10 +3,10 @@
 //! [`gc`](crate::gc) module docs for the step ordering and the seeds each
 //! rule answers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use nucleus_kv::{Batch, Durability, Key, OrderedKv};
@@ -36,7 +36,7 @@ pub struct GcConfig {
 /// The §9 GC job. Created by [`GcJob::install`] (after [`Core::open`],
 /// before the first [`GcJob::publish`]); one internal mutex serialises the
 /// job's steps, so two publishes — or a publish and a tombstone pass —
-/// never interleave.
+/// never interleave. At most one job is live per core (see `install`).
 pub struct GcJob<K: OrderedKv> {
     core: Arc<Core<K>>,
     config: GcConfig,
@@ -49,16 +49,41 @@ pub struct GcJob<K: OrderedKv> {
 }
 
 impl<K: OrderedKv> GcJob<K> {
-    /// Installs the job: the filter goes to the KV with durable W = the
-    /// boot `W` (`registry.published_w()` right after `Core::open`, which
-    /// came from the synced `/sys/gc_w`), and the KV's watermark is set to
-    /// the same W. Must run after `Core::open` and before the first
-    /// `publish`.
+    /// Installs the job. The durable W comes from `/sys/gc_w` itself (read
+    /// through a registered view), **not** `registry.published_w()`: only
+    /// `/sys/gc_w` is known-synced, and a `publish_computed_w` run directly
+    /// on the registry (§9.1 lets it happen outside the job) must not hand
+    /// the filter or the KV a W that no GC step may act on yet. The filter
+    /// goes to the KV with that W, and the KV's watermark is set to it.
+    /// Must run after `Core::open` and before the first `publish`.
+    ///
+    /// At most one job may be live per core: a second `install` while one
+    /// is alive is an error (two publishers would race `/sys/gc_w`). The
+    /// slot is released when the job drops, so a reopen-style reinstall is
+    /// allowed once the previous job is gone. (`std::mem::forget`ting a
+    /// job leaks its slot, like any other resource.)
     pub fn install(core: &Arc<Core<K>>, config: GcConfig) -> Result<GcJob<K>, TxnError> {
-        let w = core.registry.published_w();
+        let w = durable_gc_w(core)?;
+        {
+            let mut installed = installed_jobs()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !installed.insert(Arc::as_ptr(core) as usize) {
+                return Err(TxnError::Invariant(
+                    "a GC job is already installed on this core (C-T0 §9.1: one publisher)".into(),
+                ));
+            }
+        }
         let durable_w = Arc::new(AtomicU64::new(w.0));
         core.set_kv_gc_filter(Box::new(TxnGcFilter::new(Arc::clone(&durable_w))));
-        core.set_kv_gc_watermark(w.0)?;
+        if let Err(e) = core.set_kv_gc_watermark(w.0) {
+            // Undo the registration so a later install can proceed.
+            installed_jobs()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&(Arc::as_ptr(core) as usize));
+            return Err(e);
+        }
         Ok(GcJob {
             core: Arc::clone(core),
             config,
@@ -222,20 +247,34 @@ impl<K: OrderedKv> GcJob<K> {
         if Ts(self.durable_w.load(Ordering::SeqCst)) <= retired_at {
             return Ok(false);
         }
-        // The removal plan, through one registered view (§3.1).
+        // The removal plan, through one registered view (§3.1). The owner's
+        // status is looked up **inside the scan, while the view is open**:
+        // I-TRUNC guarantees the entry as long as the view can see the
+        // intent, so the plan cannot hit the window where the async
+        // resolver removes the intent and truncates the owner between the
+        // scan and a lookup done after the view is gone — a spurious
+        // `Invariant`, fatal under `spawn_gc`. `remove_intent` re-reads
+        // under the latch and no-ops if the intent is already gone, so a
+        // resolver that wins the race after the plan is simply tolerated.
+        struct PlannedRemoval {
+            key: Key,
+            /// The deferrable prefix (§5.0), resolved under the view.
+            prefix: Option<Key>,
+            owner: TxnId,
+            /// The status decision made under the view: `Resolve` for a
+            /// visible commit, `Discard` for an Aborted owner.
+            mode: RemovalMode,
+        }
         let view = self.core.open_view();
-        let mut plan: Vec<(Key, TxnId)> = Vec::new();
+        let mut plan: Vec<PlannedRemoval> = Vec::new();
         for entry in view.scan((Bound::Included(lo), Bound::Excluded(hi)), false) {
             let (stored, value) = entry.map_err(kv_err)?;
             let Some((l, Entry::Intent)) = parse_key(&stored) else {
                 continue;
             };
             let intent = decode_intent(&value)?;
-            plan.push((l.to_vec(), intent.txn));
-        }
-        drop(view);
-        for (l, owner) in &plan {
-            let mode = match self.core.status.lookup_for_intent(*owner)? {
+            let owner = intent.txn;
+            let mode = match self.core.status.lookup_for_intent(owner)? {
                 TxnStatus::Committed(c) if c <= self.core.visible_ts() => RemovalMode::Resolve,
                 TxnStatus::Aborted => RemovalMode::Discard,
                 other => {
@@ -247,7 +286,7 @@ impl<K: OrderedKv> GcJob<K> {
             };
             let prefix = match latch_prefix(l) {
                 Some(len) => match l.get(..len) {
-                    Some(p) => Some(p),
+                    Some(p) => Some(p.to_vec()),
                     None => {
                         return Err(TxnError::Invariant(format!(
                             "latch_prefix returned {len} for key {l:?} of length {}",
@@ -257,7 +296,16 @@ impl<K: OrderedKv> GcJob<K> {
                 },
                 None => None,
             };
-            remove_intent(&self.core, l, prefix, *owner, mode)?;
+            plan.push(PlannedRemoval {
+                key: l.to_vec(),
+                prefix,
+                owner,
+                mode,
+            });
+        }
+        drop(view);
+        for r in &plan {
+            remove_intent(&self.core, &r.key, r.prefix.as_deref(), r.owner, r.mode)?;
         }
         // Every removal returned: the prefix itself goes in one batch
         // (seed 35 — removals first, so counts and truncation stay exact).
@@ -277,6 +325,47 @@ impl<K: OrderedKv> GcJob<K> {
 
     fn lock_step(&self) -> MutexGuard<'_, ()> {
         self.step.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Cores with a live installed job ([`GcJob::install`] refuses a second one
+/// while the first is alive). Keyed by the `Arc<Core>` address: an entry
+/// exists only while its job (which holds an `Arc` to the core) is alive, so
+/// an address is never mistaken for installed once its job is gone; `Drop`
+/// for `GcJob` removes the entry. Entry removal happens in `Drop`'s body,
+/// before the `Arc` inside the job can be released, so a core freed after
+/// its job cannot alias a live entry.
+fn installed_jobs() -> &'static Mutex<BTreeSet<usize>> {
+    static INSTALLED: OnceLock<Mutex<BTreeSet<usize>>> = OnceLock::new();
+    INSTALLED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// The durable W as `/sys/gc_w` holds it, read through a registered view
+/// (§3.1). Missing key → 0 (a fresh store). This mirrors boot's private
+/// `read_ts`; `boot.rs` is off-limits to this card beyond the KV
+/// pass-throughs, so the few lines are repeated here.
+fn durable_gc_w<K: OrderedKv>(core: &Core<K>) -> Result<Ts, TxnError> {
+    let view = core.open_view();
+    match view.get(&sys_gc_w_key()).map_err(kv_err)? {
+        Some(v) if v.len() == 8 => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&v);
+            Ok(Ts(u64::from_be_bytes(b)))
+        }
+        Some(v) => Err(TxnError::Corrupt(format!(
+            "/sys/gc_w value of {} bytes, expected 8",
+            v.len()
+        ))),
+        None => Ok(Ts::ZERO),
+    }
+}
+
+impl<K: OrderedKv> Drop for GcJob<K> {
+    fn drop(&mut self) {
+        installed_jobs()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(Arc::as_ptr(&self.core) as usize));
     }
 }
 
@@ -379,7 +468,8 @@ impl GcStop {
 /// `now` from `clock`. On an error the thread reports it through
 /// `fail_stop`, stores it as its last result and stops (the caller treats a
 /// KV error as fatal, §3); [`GcHandle::stop`] joins the thread and returns
-/// that last result.
+/// that last result. A thread-spawn failure and a thread panic are reported
+/// through `fail_stop` as well.
 pub fn spawn_gc<K: OrderedKv>(
     job: GcJob<K>,
     interval: Duration,
@@ -391,6 +481,7 @@ pub fn spawn_gc<K: OrderedKv>(
     let thread = {
         let stop = Arc::clone(&stop);
         let last = Arc::clone(&last);
+        let fail_stop = Arc::clone(&fail_stop);
         std::thread::Builder::new()
             .name("nucleus-gc".into())
             .spawn(move || loop {
@@ -418,14 +509,18 @@ pub fn spawn_gc<K: OrderedKv>(
             stop,
             last,
             thread: Some(t),
+            fail_stop,
         },
-        Err(e) => GcHandle {
-            stop,
-            last: Arc::new(Mutex::new(Some(Err(TxnError::Invariant(format!(
-                "failed to spawn the gc thread: {e}"
-            )))))),
-            thread: None,
-        },
+        Err(e) => {
+            let err = TxnError::Invariant(format!("failed to spawn the gc thread: {e}"));
+            fail_stop.on_kv_error(&err);
+            GcHandle {
+                stop,
+                last: Arc::new(Mutex::new(Some(Err(err)))),
+                thread: None,
+                fail_stop,
+            }
+        }
     }
 }
 
@@ -434,6 +529,10 @@ pub struct GcHandle {
     stop: Arc<GcStop>,
     last: Arc<Mutex<Option<Result<(), TxnError>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The hook a panicked thread is reported through when the handle is
+    /// dropped without [`GcHandle::stop`] (there is no caller to return
+    /// the error to).
+    fail_stop: Arc<dyn FailStop>,
 }
 
 impl GcHandle {
@@ -460,10 +559,17 @@ impl GcHandle {
 impl Drop for GcHandle {
     fn drop(&mut self) {
         // Not stopping explicitly would park the thread for its interval
-        // forever; stop it even when the handle is dropped unused.
+        // forever; stop it even when the handle is dropped unused. A panic
+        // in the thread is reported through the fail-stop hook — there is
+        // no caller left to return it to (Rework 6).
         self.stop.signal();
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            match t.join() {
+                Ok(()) => {}
+                Err(_) => self.fail_stop.on_kv_error(&TxnError::Invariant(
+                    "gc thread panicked (observed at handle drop)".into(),
+                )),
+            }
         }
     }
 }

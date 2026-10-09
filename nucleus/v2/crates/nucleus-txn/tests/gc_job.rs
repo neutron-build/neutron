@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gc_support::{
-    ok, preload_gc_w, preload_ts_hwm, CountingClock, FailOnKey, RecFailStop, SharedKv,
+    ok, preload_gc_w, preload_ts_hwm, CountingClock, FailOnKey, PanicWhenArmed, RecFailStop,
+    SharedKv,
 };
 use nucleus_txn::boot::Core;
 use nucleus_txn::encoding::sys_gc_w_key;
@@ -70,4 +71,37 @@ fn spawn_gc_reports_fail_stop_and_stops() {
     );
     // And the durable W never moved: /sys/gc_w is still the boot 10.
     assert_eq!(gc_support::sys_gc_w(&core), 10);
+}
+
+/// Rework 6: a GC thread that panics (a KV wrapper that panics inside the
+/// first publish's write) is reported through the fail-stop hook when the
+/// handle is dropped without `stop` - there is no caller left to return
+/// the error to.
+///
+/// Mutant: `let _ = t.join()` in `Drop for GcHandle` - the panic is
+/// swallowed, the hook never fires and `errors()` stays empty.
+#[test]
+fn dropped_handle_reports_a_panicked_gc_thread() {
+    let kv = SharedKv::lsm();
+    preload_ts_hwm(&kv, 20);
+    preload_gc_w(&kv, 10);
+    let panicking = PanicWhenArmed::new(kv.clone());
+    let core = Arc::new(ok(Core::open(panicking.clone())));
+    let job = ok(GcJob::install(&core, GcConfig::default()));
+
+    let clock = CountingClock::new();
+    let fail = RecFailStop::new();
+    panicking.arm();
+    let handle = spawn_gc(job, Duration::from_millis(1), clock, fail.clone());
+
+    // Wait until the thread is inside the write that panics, then drop
+    // without stop: the join in Drop observes the panic and reports it.
+    panicking.entered.wait_at_least(1, Duration::from_secs(10));
+    drop(handle);
+    assert_eq!(
+        fail.errors().len(),
+        1,
+        "the panicked round is reported through the fail-stop hook: {:?}",
+        fail.errors()
+    );
 }

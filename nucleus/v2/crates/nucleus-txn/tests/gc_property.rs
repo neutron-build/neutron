@@ -1,19 +1,27 @@
 //! The C-T4 I-GC property (C-T0 §11): seeded, deterministic random
 //! histories of 1-3 keys (puts, deletes, re-inserts, commits at increasing
-//! ts) over `MemKv` in LSM mode, with random registered snapshots and one
-//! open view; then a random sequence of `publish`, `flush`, single-file
-//! `compact`, `drop_tombstones` and `compact_all`. After every GC step,
-//! every registered snapshot and the open view must read the same value
-//! for every key as before the step (and every read must equal the commit
-//! history's oracle). After the steps, with every snapshot and view
-//! dropped, one final publish + tombstone pass + full compaction must
-//! leave no tombstone or moved-tombstone as any key's newest version
-//! `<= W` (the I-GC-QUIESCE postcondition — the reads alone cannot see a
-//! surviving newest-`<= W` tombstone, which is exactly seed 34's mutant).
+//! ts) over `MemKv` in LSM mode **and flat mode** (Rework 5), with random
+//! registered snapshots and one open view; then a random sequence of
+//! `publish`, `flush`, single-file `compact`, `drop_tombstones` and
+//! `compact_all`. Some commits are left **committed-unresolved** during
+//! the GC phase (the last round always; Rework 4) with newer commits
+//! around them, so the phase runs over live intents the tombstone job must
+//! not touch. After every GC step, every registered snapshot and the open
+//! view must read the same value for every key as before the step (and
+//! every read must equal the commit history's oracle). After the steps,
+//! with every snapshot and view dropped, the resolver drains, then one
+//! final publish + tombstone pass + full compaction must leave no
+//! tombstone or moved-tombstone as any key's newest version `<= W` (the
+//! I-GC-QUIESCE postcondition - the reads alone cannot see a surviving
+//! newest-`<= W` tombstone, which is exactly seed 34's mutant), and every
+//! committed txn must be resolved and truncated (a tombstone batch that
+//! deleted an intent would leave its owner's count above 0 forever -
+//! Rework 4's catch).
 //!
 //! Mutants (each must fail this property for at least one case): seed 3
 //! (the filter drops every tombstone `<= W`), seed 33 (stream state shared
-//! across streams), seed 34 (an exclusive `DeleteRange` start).
+//! across streams), seed 34 (an exclusive `DeleteRange` start), Rework 4
+//! (the tombstone batch also deletes `intent_key(L)`).
 
 mod gc_support;
 
@@ -221,8 +229,15 @@ fn quiesce_offenders(kv: &SharedKv, w: u64) -> Result<Vec<String>, String> {
 
 // ---- The case ---------------------------------------------------------------
 
-fn run_case(seed: u64) -> Result<(), String> {
-    let kv = SharedKv::lsm();
+/// One property case. `lsm` picks the `MemKv` mode (Rework 5); the seed
+/// fixes the whole history. Errors are strings so a mutant's failures can
+/// be counted per case.
+fn run_case(seed: u64, lsm: bool) -> Result<(), String> {
+    let kv = if lsm {
+        SharedKv::lsm()
+    } else {
+        SharedKv::flat()
+    };
     preload_ts_hwm(&kv, 20);
     preload_gc_w(&kv, 10);
     let core = Arc::new(Core::open(kv.clone()).map_err(str_err)?);
@@ -231,8 +246,8 @@ fn run_case(seed: u64) -> Result<(), String> {
     let mut rng = Rng::new(seed);
 
     // The history: 3-8 rounds; each round is one txn writing 1-2 distinct
-    // keys (a put or a delete), committed and resolved at an increasing
-    // ts, with a random flush splitting the versions across files.
+    // keys (a put or a delete), committed at an increasing ts, with a
+    // random flush splitting the versions across files.
     let nkeys = 1 + rng.below(3);
     let keys: Vec<&[u8]> = KEYS[..nkeys as usize].to_vec();
     let mut histories: Vec<History> = vec![Vec::new(); nkeys as usize];
@@ -240,13 +255,21 @@ fn run_case(seed: u64) -> Result<(), String> {
     let mut snaps: Vec<SnapshotGuard<'_>> = Vec::new();
     let mut open_view: Option<ViewGuard<'_, Snap>> = None;
     let mut vts = Ts::ZERO;
+    // Rework 4: commits whose intents stay unresolved during the GC phase.
+    // Rounds from `resolve_from` on are left for the resolver's final
+    // drain; at least the last round always is (`resolve_from <= rounds-1`
+    // by construction). A round that reuses a key with a pending intent
+    // resolves the queue first (one intent slot per key, 2.1).
+    let resolve_from = rng.below(rounds);
+    let mut pending: Vec<bool> = vec![false; nkeys as usize];
+    let mut committed: Vec<TxnId> = Vec::new();
 
     for round in 0..rounds {
         let txn = core.begin(Isolation::ReadCommitted);
         let mut ops: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
         for _ in 0..(1 + rng.below(2)) {
             let k = rng.below(nkeys) as usize;
-            if ops.iter().any(|(i, _)| *i == k) {
+            if ops.iter().any(|(i, _)| *i == k) || pending[k] {
                 continue;
             }
             let val = if rng.coin() {
@@ -259,21 +282,40 @@ fn run_case(seed: u64) -> Result<(), String> {
             ops.push((k, val.map(|v| v.to_vec())));
         }
         if ops.is_empty() {
-            // Fall back to one op on the first key.
+            // Fall back to one op on the first key that is not pending
+            // (`must_resolve` above keeps at least one free whenever a
+            // round follows).
+            let k = (0..nkeys as usize)
+                .find(|k| !pending[*k])
+                .expect("a non-pending key (must_resolve drained the queue)");
             let val: Option<Vec<u8>> = if rng.coin() {
-                Some(format!("v{round}-0").into_bytes())
+                Some(format!("v{round}-{k}").into_bytes())
             } else {
                 None
             };
-            place(&core, &txn, keys[0], val.as_deref())?;
-            ops.push((0, val));
+            place(&core, &txn, keys[k], val.as_deref())?;
+            ops.push((k, val));
         }
+        let tid = txn.id;
         let c = commit(&core, &mut pipeline, txn)?;
-        Resolver::run_once(&core).map_err(str_err)?;
+        committed.push(tid);
+        for (k, _) in &ops {
+            pending[*k] = true;
+        }
+        // Resolve lazily: never for the unresolved suffix (Rework 4), and
+        // eagerly only when every key is pending - the next round could
+        // otherwise have no writable key (one intent slot per key, 2.1).
+        let must_resolve = round + 1 < rounds && pending.iter().all(|p| *p);
+        if round < resolve_from || must_resolve {
+            Resolver::run_once(&core).map_err(str_err)?;
+            for p in pending.iter_mut() {
+                *p = false;
+            }
+        }
         for (k, v) in ops {
             histories[k].push((c, v));
         }
-        if rng.coin() {
+        if lsm && rng.coin() {
             kv.flush();
         }
         if open_view.is_none() && round > 0 && rng.coin() {
@@ -288,6 +330,9 @@ fn run_case(seed: u64) -> Result<(), String> {
             snaps.remove(i);
         }
     }
+    // A snapshot above every unresolved commit: the read-side catch of an
+    // intent the tombstone job must not delete (Rework 4).
+    snaps.push(core.registry.take_snapshot());
 
     // The GC phase: 4-10 random steps, checking before/after each.
     let steps = 4 + rng.below(7);
@@ -326,17 +371,30 @@ fn run_case(seed: u64) -> Result<(), String> {
         prev = cur;
     }
 
-    // The drain: with every snapshot and view dropped, publish to
-    // visible_ts, run the tombstone job and a full compaction. No tombstone
-    // may remain as any key's newest version <= W.
+    // The drain: with every snapshot and view dropped, resolve every
+    // committed intent first (Rework 4: the tombstone pass must run over
+    // the fully resolved state), then publish to visible_ts, run the
+    // tombstone job and a full compaction. No tombstone may remain as any
+    // key's newest version <= W, and every committed txn must have been
+    // resolved and truncated - an intent deleted behind the resolver's
+    // back leaves its owner's count above 0 and its entry alive forever.
     snaps.clear();
     drop(open_view.take());
+    while Resolver::run_once(&core).map_err(str_err)? > 0 {}
     let w = job.publish(0).map_err(str_err)?;
     job.drop_tombstones().map_err(str_err)?;
     kv.compact_all();
     let offenders = quiesce_offenders(&kv, w.0)?;
     if !offenders.is_empty() {
         return Err(format!("not quiesced at W={w:?}: {offenders:?}"));
+    }
+    for id in &committed {
+        if core.status.entry(*id).is_some() {
+            return Err(format!(
+                "committed {id:?} was not resolved and truncated (its \
+                 intent count never reached 0)"
+            ));
+        }
     }
     Ok(())
 }
@@ -345,15 +403,19 @@ fn run_case(seed: u64) -> Result<(), String> {
 fn igc_property() {
     let mut failures = Vec::new();
     for seed in 1..=CASES {
-        if let Err(e) = run_case(seed) {
-            failures.push(format!("seed {seed}: {e}"));
+        if let Err(e) = run_case(seed, true) {
+            failures.push(format!("lsm seed {seed}: {e}"));
+        }
+        if let Err(e) = run_case(seed, false) {
+            failures.push(format!("flat seed {seed}: {e}"));
         }
     }
     let n = failures.len();
     let shown: Vec<_> = failures.iter().take(10).cloned().collect();
     assert!(
         failures.is_empty(),
-        "I-GC violations in {n}/{CASES} cases: {}{}",
+        "I-GC violations in {n}/{} cases: {}{}",
+        CASES * 2,
         shown.join("; "),
         if n > shown.len() { " ..." } else { "" }
     );

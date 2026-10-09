@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gc_support::{commit, ok, place_write, preload_gc_w, preload_ts_hwm, SharedKv};
+use gc_support::{
+    commit, ok, place_write, preload_gc_w, preload_stale_intent, preload_ts_hwm, PauseOnKey,
+    SharedKv,
+};
 use nucleus_txn::boot::Core;
 use nucleus_txn::commit::CommitPipeline;
 use nucleus_txn::encoding::{end_key, intent_key};
@@ -194,5 +197,82 @@ fn retire_pending_owner_is_invariant() {
     assert!(
         matches!(err, TxnError::Invariant(_)),
         "Invariant expected, got {err:?}"
+    );
+}
+
+// ---- Rework 1: the retire races the resolver -------------------------------
+
+/// Rework 1 (binding): the retire must look every intent's owner up inside
+/// the scan, while the view is open. A KV wrapper parks the **first
+/// removal's write** (the older-epoch intent on `/t/0/ra`) and the test
+/// runs `Resolver::run_once` on another thread during the park: the
+/// resolver resolves the committed-unresolved intent on `/t/0/rb` and
+/// truncates its owner. With the status lookup after the view is dropped,
+/// that lookup then finds no entry for a current-epoch txn and returns a
+/// spurious `Invariant` — fatal under `spawn_gc`.
+///
+/// Mutant: the old lookup after the view is dropped — `retire_storage`
+/// returns `Err(Invariant)` instead of `Ok`, and the second intent is
+/// neither removed nor resolved.
+#[test]
+fn retire_resolves_owners_inside_the_view() {
+    let kv = SharedKv::lsm();
+    preload_ts_hwm(&kv, 20);
+    preload_gc_w(&kv, 10);
+    // An older-epoch (Aborted, §7.2) intent on the first retired key: its
+    // removal is the write the wrapper parks on.
+    const KA: &[u8] = b"/t/0/ra";
+    preload_stale_intent(&kv, KA, b"old");
+    // The committed-unresolved intent goes on a *later* key on a *different
+    // latch stripe*: the parked retire holds KA's latch while the resolver
+    // removes KB's intent, so a shared stripe would self-deadlock.
+    let kb: Vec<u8> = [b"/t/0/rb0", b"/t/0/rb1", b"/t/0/rb2", b"/t/0/rb3"]
+        .into_iter()
+        .find(|k| gc_support::latch_stripe(k.as_slice()) != gc_support::latch_stripe(KA))
+        .expect("four candidates cannot share one stripe of 1024")
+        .to_vec();
+    let kb = kb.as_slice();
+
+    let wrapper = PauseOnKey::new(kv.clone(), &intent_key(KA));
+    let core = Arc::new(ok(Core::open(wrapper.clone())));
+    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    let job = ok(GcJob::install(&core, GcConfig::default()));
+
+    // T's committed, unresolved intent under the retired prefix (visible
+    // commit @21; the resolver has not run).
+    let txn = core.begin(Isolation::ReadCommitted);
+    place_write(&core, &txn, kb, b"v");
+    let t = txn.id;
+    assert_eq!(ok(commit(&core, &mut pipeline, txn)), Ts(21));
+    assert_eq!(ok(job.publish(0)), Ts(21), "W = 21 > retired 20");
+
+    // The retire runs on a worker thread; the wrapper parks its first
+    // removal's write, and the resolver runs on this thread during the
+    // park (Rework 1's scenario, verbatim).
+    wrapper.arm();
+    let lo = b"/t/0/".to_vec();
+    let hi = b"/t/1".to_vec();
+    let retire = std::thread::scope(|s| {
+        let retire = s.spawn(|| job.retire_storage(&lo, &hi, Ts(20), &|_| None));
+        // Wait until the retire is parked inside the first removal's write.
+        wrapper.entered.wait_at_least(1, Duration::from_secs(30));
+        // The resolver resolves KB's intent (count reaches 0) and truncates
+        // T: exactly the racing removal+truncation the plan must survive.
+        ok(nucleus_txn::resolver::Resolver::run_once(&core));
+        wrapper.release.hit();
+        ok(ok(retire.join()))
+    });
+
+    assert!(retire, "the retire survived the racing resolver (Rework 1)");
+    // T resolved and truncated; nothing raw remains under the prefix.
+    ok(nucleus_txn::resolver::Resolver::run_once(&core));
+    assert!(
+        core.status.entry(t).is_none(),
+        "T truncated: resolved by the racing resolver or by the retire"
+    );
+    kv.compact_all();
+    assert!(
+        kv.raw_entries(b"/t/0/", b"/t/1").is_empty(),
+        "both retired-prefix intents (older-epoch and committed) are gone"
     );
 }

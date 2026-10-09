@@ -35,32 +35,59 @@ pub fn ok<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> T {
 /// `OrderedKv` over an `Arc<MemKv>` the test keeps, so a `Core` can be
 /// opened on it while the test still drives `flush`/`compact`/`files`/
 /// `compact_all` (the card's prescribed wrapper; `Core` owns its KV
-/// privately otherwise).
+/// privately otherwise). Two modes: `lsm()` (writes go to a memtable,
+/// `flush` makes L0 files, `compact`/`compact_all` run the registered
+/// filter per output stream, a filter drop is visible to already-open
+/// snapshots — the adversarial choice G0-gc needs) and `flat()`
+/// (`MemKv::new()`: one map; `flush`/`compact`/`files`/`settle` are no-ops,
+/// `compact_all` runs the filter over the whole map in one stream, and a
+/// drop is invisible to already-open snapshots). The I-GC property loop
+/// runs over both (Rework 5).
 #[derive(Clone)]
 pub struct SharedKv {
     pub mem: Arc<MemKv>,
+    lsm: bool,
 }
 
 impl SharedKv {
-    /// `MemKv` in LSM mode: writes go to a memtable, `flush` makes L0
-    /// files, `compact`/`compact_all` run the registered filter per
-    /// output stream, and a filter drop is visible to already-open
-    /// snapshots (the adversarial choice G0-gc needs).
+    /// `MemKv` in LSM mode.
     pub fn lsm() -> SharedKv {
         SharedKv {
             mem: Arc::new(MemKv::lsm()),
+            lsm: true,
         }
     }
 
+    /// `MemKv::new()` flat mode.
+    pub fn flat() -> SharedKv {
+        SharedKv {
+            mem: Arc::new(MemKv::new()),
+            lsm: false,
+        }
+    }
+
+    pub fn is_lsm(&self) -> bool {
+        self.lsm
+    }
+
     pub fn flush(&self) -> Option<u64> {
+        if !self.lsm {
+            return None; // flat mode has no memtable to flush
+        }
         ok(self.mem.flush())
     }
 
     pub fn compact(&self, level: usize, files: &[u64]) -> Vec<u64> {
+        if !self.lsm {
+            return Vec::new(); // flat mode has no files to compact
+        }
         ok(self.mem.compact(level, files))
     }
 
     pub fn files(&self) -> Vec<FileMeta> {
+        if !self.lsm {
+            return Vec::new();
+        }
         ok(self.mem.files())
     }
 
@@ -71,6 +98,9 @@ impl SharedKv {
     /// Flush + compact all of L0 into L1 without the filter (the kv
     /// harness's state-building step).
     pub fn settle(&self) {
+        if !self.lsm {
+            return;
+        }
         ok(self.mem.settle());
     }
 
@@ -205,6 +235,230 @@ impl OrderedKv for FailOnKey {
     }
 }
 
+/// An `OrderedKv` wrapper that records the `Durability` of every write
+/// touching a chosen key (Rework 3: `/sys/gc_w` must be `Durability::Yes`).
+#[derive(Clone)]
+pub struct DurabilitySpy {
+    inner: SharedKv,
+    key: Key,
+    seen: Arc<Mutex<Vec<Durability>>>,
+}
+
+impl DurabilitySpy {
+    pub fn new(inner: SharedKv, key: &[u8]) -> DurabilitySpy {
+        DurabilitySpy {
+            inner,
+            key: key.to_vec(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The durabilities of the writes that touched the key, in order.
+    pub fn seen(&self) -> Vec<Durability> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn touches(&self, ops: &[Op]) -> bool {
+        ops.iter().any(|op| match op {
+            Op::Put(k, _) | Op::Delete(k) => k == &self.key,
+            Op::DeleteRange { start, end } => start <= &self.key && &self.key < end,
+        })
+    }
+}
+
+impl OrderedKv for DurabilitySpy {
+    type Snap = <MemKv as OrderedKv>::Snap;
+
+    fn write(&self, batch: Batch, sync: Durability) -> Result<()> {
+        if !batch.ops.is_empty() && self.touches(&batch.ops) {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(sync);
+        }
+        self.inner.write(batch, sync)
+    }
+
+    fn sync_wal(&self) -> Result<()> {
+        self.inner.sync_wal()
+    }
+
+    fn snapshot(&self) -> Self::Snap {
+        self.inner.snapshot()
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.inner.get_latest(key)
+    }
+
+    fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()> {
+        self.inner.ingest_sorted(entries)
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<()> {
+        self.inner.checkpoint(dir)
+    }
+
+    fn set_gc_filter(&self, filter: Box<dyn GcFilter>) {
+        self.inner.set_gc_filter(filter);
+    }
+
+    fn set_gc_watermark(&self, watermark: u64) -> Result<()> {
+        self.inner.set_gc_watermark(watermark)
+    }
+}
+
+/// An `OrderedKv` wrapper whose `set_gc_watermark` fails while armed
+/// (Rework 6: the error from the KV watermark call must propagate).
+#[derive(Clone)]
+pub struct FailWatermark {
+    inner: SharedKv,
+    armed: Arc<AtomicBool>,
+}
+
+impl FailWatermark {
+    pub fn new(inner: SharedKv) -> FailWatermark {
+        FailWatermark {
+            inner,
+            armed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// From now on every `set_gc_watermark` fails.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl OrderedKv for FailWatermark {
+    type Snap = <MemKv as OrderedKv>::Snap;
+
+    fn write(&self, batch: Batch, sync: Durability) -> Result<()> {
+        self.inner.write(batch, sync)
+    }
+
+    fn sync_wal(&self) -> Result<()> {
+        self.inner.sync_wal()
+    }
+
+    fn snapshot(&self) -> Self::Snap {
+        self.inner.snapshot()
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.inner.get_latest(key)
+    }
+
+    fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()> {
+        self.inner.ingest_sorted(entries)
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<()> {
+        self.inner.checkpoint(dir)
+    }
+
+    fn set_gc_filter(&self, filter: Box<dyn GcFilter>) {
+        self.inner.set_gc_filter(filter);
+    }
+
+    fn set_gc_watermark(&self, _watermark: u64) -> Result<()> {
+        if self.armed.load(Ordering::SeqCst) {
+            return Err(KvError::Backend("injected gc-watermark failure".into()));
+        }
+        self.inner.set_gc_watermark(_watermark)
+    }
+}
+
+/// An `OrderedKv` wrapper that parks the **first armed** write touching a
+/// chosen key until the test releases it (Rework 1: run the resolver on
+/// another thread during the first removal's write). While parked, the
+/// write has not applied; `entered` counts the park, `release` ends it.
+#[derive(Clone)]
+pub struct PauseOnKey {
+    inner: SharedKv,
+    key: Key,
+    armed: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+    pub entered: Arc<Flag>,
+    pub release: Arc<Flag>,
+}
+
+impl PauseOnKey {
+    pub fn new(inner: SharedKv, key: &[u8]) -> PauseOnKey {
+        PauseOnKey {
+            inner,
+            key: key.to_vec(),
+            armed: Arc::new(AtomicBool::new(false)),
+            fired: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Flag::new()),
+            release: Arc::new(Flag::new()),
+        }
+    }
+
+    /// From now on the first write touching the key parks.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn touches(&self, ops: &[Op]) -> bool {
+        ops.iter().any(|op| match op {
+            Op::Put(k, _) | Op::Delete(k) => k == &self.key,
+            Op::DeleteRange { start, end } => start <= &self.key && &self.key < end,
+        })
+    }
+}
+
+impl OrderedKv for PauseOnKey {
+    type Snap = <MemKv as OrderedKv>::Snap;
+
+    fn write(&self, batch: Batch, sync: Durability) -> Result<()> {
+        if !batch.ops.is_empty()
+            && self.armed.load(Ordering::SeqCst)
+            && !self.fired.load(Ordering::SeqCst)
+            && self.touches(&batch.ops)
+        {
+            self.fired.store(true, Ordering::SeqCst);
+            self.entered.hit();
+            // Park mid-write until the test's resolver round finishes. A
+            // park that is never released panics after the bound instead of
+            // hanging the suite.
+            self.release.wait_at_least(1, Duration::from_secs(30));
+        }
+        self.inner.write(batch, sync)
+    }
+
+    fn sync_wal(&self) -> Result<()> {
+        self.inner.sync_wal()
+    }
+
+    fn snapshot(&self) -> Self::Snap {
+        self.inner.snapshot()
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.inner.get_latest(key)
+    }
+
+    fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()> {
+        self.inner.ingest_sorted(entries)
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<()> {
+        self.inner.checkpoint(dir)
+    }
+
+    fn set_gc_filter(&self, filter: Box<dyn GcFilter>) {
+        self.inner.set_gc_filter(filter);
+    }
+
+    fn set_gc_watermark(&self, watermark: u64) -> Result<()> {
+        self.inner.set_gc_watermark(watermark)
+    }
+}
+
 // ---- State building --------------------------------------------------------
 
 /// A hand-written live version (§2.2), the preloaded-state primitive.
@@ -247,6 +501,40 @@ pub fn preload_ts_clock(kv: &SharedKv, ts: u64, wall_secs: u64) {
     let mut batch = Batch::default();
     batch.put(sys_ts_clock_key(Ts(ts)), wall_secs.to_be_bytes().to_vec());
     kv.preload(batch);
+}
+
+/// Preloads an intent owned by an older-epoch txn (the boot sweep's /
+/// retire's Discard path: an owner without a record is Aborted, §7.2).
+/// One `Write` layer; the owner defaults to epoch 0 (any fresh `Core`
+/// boots at epoch 1).
+pub fn preload_stale_intent(kv: &SharedKv, key: &[u8], value: &[u8]) {
+    let intent = nucleus_txn::Intent {
+        txn: TxnId { epoch: 0, n: 1 },
+        layers: vec![Layer {
+            seq: 1,
+            data_seq: 1,
+            data: LayerData::Write {
+                value: value.to_vec(),
+                key_changed: false,
+            },
+            lock: RowLockMode::NoKeyUpdate,
+        }],
+    };
+    let mut batch = Batch::default();
+    batch.put(intent_key(key), ok(encode_intent(&intent)));
+    kv.preload(batch);
+}
+
+/// The latch stripe a key maps to — a test-side replica of
+/// `Latches::strip` (same hasher, same modulus) so a test that must not
+/// self-deadlock across two latched keys can pick keys on different
+/// stripes. `Latches::strip` itself is private.
+pub fn latch_stripe(key: &[u8]) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    (h.finish() as usize) % nucleus_txn::latch::DEFAULT_STRIPES
 }
 
 /// Places a one-layer write intent the §5.1 way: log, count, then one
@@ -396,6 +684,72 @@ pub fn only_l0_file(kv: &SharedKv) -> u64 {
         .collect();
     assert_eq!(l0.len(), 1, "expected exactly one L0 file, got {l0:?}");
     l0[0]
+}
+
+/// An `OrderedKv` wrapper whose `write` panics while armed (Rework 6: a
+/// panicked GC thread is reported through the fail-stop hook when the
+/// handle is dropped without `stop`). `entered` counts each panic (fired
+/// just before), so a test can wait until the thread is inside the write.
+#[derive(Clone)]
+pub struct PanicWhenArmed {
+    inner: SharedKv,
+    armed: Arc<AtomicBool>,
+    pub entered: Arc<Flag>,
+}
+
+impl PanicWhenArmed {
+    pub fn new(inner: SharedKv) -> PanicWhenArmed {
+        PanicWhenArmed {
+            inner,
+            armed: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Flag::new()),
+        }
+    }
+
+    /// From now on every write panics.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl OrderedKv for PanicWhenArmed {
+    type Snap = <MemKv as OrderedKv>::Snap;
+
+    fn write(&self, _batch: Batch, _sync: Durability) -> Result<()> {
+        if self.armed.load(Ordering::SeqCst) {
+            self.entered.hit();
+            panic!("injected gc-thread panic");
+        }
+        self.inner.write(_batch, _sync)
+    }
+
+    fn sync_wal(&self) -> Result<()> {
+        self.inner.sync_wal()
+    }
+
+    fn snapshot(&self) -> Self::Snap {
+        self.inner.snapshot()
+    }
+
+    fn get_latest(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.inner.get_latest(key)
+    }
+
+    fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()> {
+        self.inner.ingest_sorted(entries)
+    }
+
+    fn checkpoint(&self, dir: &std::path::Path) -> Result<()> {
+        self.inner.checkpoint(dir)
+    }
+
+    fn set_gc_filter(&self, filter: Box<dyn GcFilter>) {
+        self.inner.set_gc_filter(filter);
+    }
+
+    fn set_gc_watermark(&self, watermark: u64) -> Result<()> {
+        self.inner.set_gc_watermark(watermark)
+    }
 }
 
 // ---- Thread handshakes -----------------------------------------------------
