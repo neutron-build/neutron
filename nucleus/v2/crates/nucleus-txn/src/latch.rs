@@ -121,3 +121,15 @@ impl Drop for LatchGuard<'_> {
         }
     }
 }
+
+/// Debug-build assertion that the calling thread holds no latch. C-SIM's
+/// `CommitProbe` points must run with no latch held (§3, §5.0), so
+/// [`CommitPipeline::process_group`](crate::commit::CommitPipeline) asserts
+/// this before every probe call.
+pub(crate) fn assert_no_latch_held() {
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        !HOLDING_LATCH.with(Cell::get),
+        "a probe point ran while a latch was held (C-T0 §3, §11)"
+    );
+}

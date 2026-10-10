@@ -14,6 +14,7 @@ thiserror.workspace = true
 [dev-dependencies]
 # Tests run over MemKv (flat and LSM mode), compare the §2.2 layout against
 # the reference in the kv conformance suite, and check scan order against
-# codec-encoded (prefix-free, SQL-ordered) logical keys.
-nucleus-kv = { path = "../nucleus-kv", features = ["mem", "conformance"] }
+# codec-encoded (prefix-free, SQL-ordered) logical keys. The C-SIM
+# simulator additionally drives the Fault crash wrapper.
+nucleus-kv = { path = "../nucleus-kv", features = ["mem", "conformance", "fault"] }
 nucleus-codec.workspace = true
