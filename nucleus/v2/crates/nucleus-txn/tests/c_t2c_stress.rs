@@ -110,6 +110,7 @@ fn upsert_txn(
             value: pk.as_bytes().to_vec(),
             arbiter: true,
         }],
+        pk_arbiter: false,
     };
     let mut f = |v: &[u8]| {
         let (kk, n) = parse_row(v);

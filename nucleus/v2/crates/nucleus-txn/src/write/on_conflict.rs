@@ -14,6 +14,14 @@
 //! the ownership re-check after the lock), so a committed-but-unapplied
 //! change of what the arbiter entry names forces a wait-and-restart (or an
 //! inline resolution) instead of a decision on stale state.
+//!
+//! C-T2c rework round 2: the pre-check never passes `same_row` — a live
+//! arbiter entry naming **this row's own PK** is a conflict like any other
+//! (§5.3.1(1)→(3): the same-row upsert skips or updates, it never reaches
+//! the insert whose `/t/` unique check would raise 23505) — and the primary
+//! key itself can be an arbiter ([`ProposedRow::pk_arbiter`]): §5.3 with
+//! §5.3.1 includes the `/t/` key in the arbiter set, where a live version
+//! names exactly one row, itself, so `r = t_key`.
 
 use nucleus_kv::{Key, OrderedKv};
 
@@ -38,12 +46,17 @@ pub struct IndexEntry {
 }
 
 /// The row `INSERT ... ON CONFLICT` proposes: its `/t/` key and value and
-/// every unique entry (arbiter or not).
+/// every unique entry (arbiter or not). `pk_arbiter` declares the primary
+/// key itself a member of the statement's arbiter set `A`
+/// (`ON CONFLICT (pk)`, §5.3.1 with §5.3): the `/t/` key's unique check
+/// becomes the arbiter check with `r = t_key` — a live version there names
+/// exactly one row, itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedRow {
     pub t_key: Key,
     pub value: Vec<u8>,
     pub entries: Vec<IndexEntry>,
+    pub pk_arbiter: bool,
 }
 
 /// The conflict action. `DoUpdate`'s closure gets the locked row value and
@@ -84,6 +97,16 @@ enum Attempt {
     Done(OnConflictResult),
     /// Abandon: roll back to `sa`, park on the wait set if any, restart.
     Restart(Option<WaitSet>),
+}
+
+/// Which arbiter key of `A` found the conflict of §5.3.1(1): a `/u/` entry
+/// of the arbiter set, whose live payload names `r` through `t_key_of`, or
+/// the row's own `/t/` key (`pk_arbiter`), whose live version names exactly
+/// one row — itself — so `r` is the `/t/` key and no payload mapping
+/// applies.
+enum Arbiter<'a> {
+    Entry(&'a IndexEntry),
+    Pk,
 }
 
 impl<K: OrderedKv> Core<K> {
@@ -133,9 +156,12 @@ impl<K: OrderedKv> Core<K> {
         t_key_of: &dyn Fn(&[u8]) -> Key,
         action: &mut OnConflictAction<'_>,
     ) -> Result<Attempt, TxnError> {
-        // (1) Pre-check, one latch section per arbiter key.
+        // (1) Pre-check, one latch section per arbiter key. Round 2: no
+        // `same_row` — a live entry naming this row's own PK is a conflict
+        // like any other (the same-row upsert goes to (3), never to the
+        // insert whose `/t/` unique check would raise 23505).
         for entry in row.entries.iter().filter(|e| e.arbiter) {
-            let pre = ArbiterPreCheck::new(&entry.key, None, Some(entry.value.clone()));
+            let pre = ArbiterPreCheck::new(&entry.key, None, None);
             loop {
                 match pre.step(self, txn)? {
                     ArbPreStep::Again => {}
@@ -143,7 +169,30 @@ impl<K: OrderedKv> Core<K> {
                     ArbPreStep::Insert => break,
                     ArbPreStep::Conflict { entry_payload } => {
                         let r = t_key_of(&entry_payload);
-                        return self.arbiter_conflict(txn, actx, entry, &r, t_key_of, action);
+                        return self.arbiter_conflict(
+                            txn,
+                            actx,
+                            Arbiter::Entry(entry),
+                            &r,
+                            t_key_of,
+                            action,
+                        );
+                    }
+                }
+            }
+        }
+        // (1) for the PK arbiter: the `/t/` key's live version names exactly
+        // one row, itself, so `r = t_key` (§5.3.1 with §5.3).
+        if row.pk_arbiter {
+            let pre = ArbiterPreCheck::new(&row.t_key, None, None);
+            loop {
+                match pre.step(self, txn)? {
+                    ArbPreStep::Again => {}
+                    ArbPreStep::Wait(targets) => return Ok(Attempt::Restart(Some(targets))),
+                    ArbPreStep::Insert => break,
+                    ArbPreStep::Conflict { .. } => {
+                        let r = row.t_key.clone();
+                        return self.arbiter_conflict(txn, actx, Arbiter::Pk, &r, t_key_of, action);
                     }
                 }
             }
@@ -154,6 +203,9 @@ impl<K: OrderedKv> Core<K> {
 
     /// §5.3.1(2): the row and every entry as key-existence ops at `sa`. An
     /// arbiter key's unique conflict, or any wait, abandons the attempt.
+    /// With `pk_arbiter` the `/t/` key's unique check is the arbiter check:
+    /// a live entry of another row abandons and restarts from (1) (which
+    /// then finds the conflict), never 23505.
     fn arbiter_insert(
         &self,
         txn: &Txn,
@@ -169,7 +221,7 @@ impl<K: OrderedKv> Core<K> {
                 actx.clone(),
                 UniqueRule::Unique { same_row: None },
             ),
-            false,
+            row.pk_arbiter,
         ));
         for e in &row.entries {
             ops.push((
@@ -204,12 +256,13 @@ impl<K: OrderedKv> Core<K> {
         Ok(Attempt::Done(OnConflictResult::Inserted))
     }
 
-    /// §5.3.1(3): conflict on row `r`, which the live arbiter `entry` names.
+    /// §5.3.1(3): conflict on row `r`, found by the arbiter key `arbiter`
+    /// (a `/u/` entry that names `r`, or the `/t/` key itself).
     fn arbiter_conflict(
         &self,
         txn: &Txn,
         actx: &StmtCtx,
-        entry: &IndexEntry,
+        arbiter: Arbiter<'_>,
         r: &[u8],
         t_key_of: &dyn Fn(&[u8]) -> Key,
         action: &mut OnConflictAction<'_>,
@@ -256,26 +309,36 @@ impl<K: OrderedKv> Core<K> {
         }
 
         // The ownership re-check (rework item 1): the pre-check rule governs
-        // the arbiter entry at the apply point, so DO UPDATE never applies to
-        // a row that no longer owns the conflicting entry, in any
+        // the arbiter key at the apply point, so DO UPDATE never applies to
+        // a row that no longer owns the conflicting key, in any
         // commit-visibility stage. The window between the pre-check and here
         // can hide a key-moving writer whose commit left `r`'s own `/t/` key
         // untouched (the lock at `base = v_r.ts` saw `v_r` as still-newest):
-        // a foreign intent on the entry is removed (visible) or waited on
-        // (Pending / committed-not-visible, restart from (1)), and the live
-        // entry must still name `r`. Anything else restarts, and (1)
-        // re-derives the conflict (or inserts).
-        let pre = ArbiterPreCheck::new(&entry.key, None, Some(entry.value.clone()));
+        // a foreign intent on the key is removed (visible) or waited on
+        // (Pending / committed-not-visible, restart from (1)), and the key
+        // must still name `r`. Anything else restarts, and (1) re-derives
+        // the conflict (or inserts). For the PK arbiter (round 2) the
+        // arbiter key **is** `r`'s `/t/` key and its live payload is a row
+        // value, not a row name, so any live version still names `r`: only
+        // liveness is re-checked (defense in depth — the lock at
+        // `base = v_r.ts` already pinned `r`, and the own intent the lock
+        // placed excludes foreign writers, so nothing but `r` dying can
+        // reach the `Insert` arm).
+        let recheck_key: &[u8] = match &arbiter {
+            Arbiter::Entry(e) => &e.key,
+            Arbiter::Pk => r,
+        };
+        let pre = ArbiterPreCheck::new(recheck_key, None, None);
         loop {
             match pre.step(self, txn)? {
                 ArbPreStep::Again => {}
                 ArbPreStep::Wait(targets) => return Ok(Attempt::Restart(Some(targets))),
                 ArbPreStep::Insert => return Ok(Attempt::Restart(None)),
                 ArbPreStep::Conflict { entry_payload } => {
-                    if t_key_of(&entry_payload).as_slice() != r {
-                        return Ok(Attempt::Restart(None));
+                    if matches!(arbiter, Arbiter::Pk) || t_key_of(&entry_payload).as_slice() == r {
+                        break;
                     }
-                    break;
+                    return Ok(Attempt::Restart(None));
                 }
             }
         }

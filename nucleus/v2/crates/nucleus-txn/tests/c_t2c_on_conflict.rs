@@ -44,6 +44,18 @@ fn proposed(pk: &str, v: u64, arbiters: &[&str]) -> ProposedRow {
                 arbiter: true,
             })
             .collect(),
+        pk_arbiter: false,
+    }
+}
+
+/// A proposed row `pk` = `v` whose only arbiter is the primary key
+/// (`ON CONFLICT (pk)`, rework item 2).
+fn pk_proposed(pk: &str, v: u64) -> ProposedRow {
+    ProposedRow {
+        t_key: t_key(pk),
+        value: u64v(v),
+        entries: vec![],
+        pk_arbiter: true,
     }
 }
 
@@ -980,11 +992,405 @@ fn where_false_keeps_the_lock() {
         r.0 > before,
         "the concurrent writer parked on the WhereFalse lock"
     );
-    assert_eq!(r.1, Ok(RowOutcome::Applied));
+    assert_eq!(
+        r.1,
+        Ok(RowOutcome::Applied),
+        "the concurrent writer completes after W's commit"
+    );
     assert_count_exact(&rig.core, &t);
     rig.commit(t);
     rig.resolve();
     assert_eq!(rig.read_latest(&t_key("1")), Some(u64v(10)));
     assert_eq!(rig.read_latest(&u_key("K")), Some(b"1".to_vec()));
     assert_eq!(rig.read_latest(&t_key("2")), None);
+}
+
+// ---- C-T2c rework round 2 --------------------------------------------------
+
+/// Rework item 3 (the same-row upsert, /u/ arbiter): `INSERT (pk=0, u=K) ON
+/// CONFLICT (u) DO NOTHING` on the existing row (pk=0, u=K). The live
+/// arbiter entry names this row's own PK, which must read as the conflict
+/// (§5.3.1(1)→(3)): PostgreSQL skips the row. Round 1 instead treated the
+/// entry as "this row's own" and went to the insert, whose `/t/` unique
+/// check raised 23505.
+/// Mutant killed: the pre-check passes `same_row: Some(entry.value)` (the
+/// upsert returns `Err(UniqueViolation)` instead of `Nothing`).
+#[test]
+fn same_row_upsert_do_nothing() {
+    let rig = Rig::new();
+    preload_row(&rig, "0", 0, "K");
+    let w = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = rig.core.visible_ts();
+    let out = ok(upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, seq0, seq0),
+        proposed("0", 5, &["K"]),
+        OnConflictAction::DoNothing,
+    ));
+    assert_eq!(out.result, OnConflictResult::Nothing);
+    assert_eq!(out.restarts, 0);
+    assert!(
+        rig.intent(&t_key("0")).is_none(),
+        "DO NOTHING writes nothing"
+    );
+    assert_count_exact(&rig.core, &w);
+    rig.commit(w);
+    rig.resolve();
+    assert_eq!(rig.read_latest(&t_key("0")), Some(u64v(0)));
+    assert_eq!(rig.read_latest(&u_key("K")), Some(b"0".to_vec()));
+}
+
+/// Rework item 3 (the same-row upsert, DO UPDATE): the same shape updates
+/// the row — the conflict path locks `r` (= the proposed row's own `/t/`
+/// key) and applies the update, and the ownership re-check after the lock
+/// accepts the entry naming `r`.
+/// Mutant killed: the ownership re-check passes
+/// `same_row: Some(entry.value)` (the live entry naming `r` reads as "not a
+/// conflict" → `Insert` → restart forever; the attempt bound below fails).
+#[test]
+fn same_row_upsert_do_update() {
+    let rig = Rig::new();
+    preload_row(&rig, "0", 9, "K");
+    let w = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = rig.core.visible_ts();
+    let mut attempts = 0u32;
+    let mut f = incr;
+    let out = ok(rig.core.insert_on_conflict(
+        &w,
+        StmtCtx::new(s, seq0, seq0),
+        proposed("0", 5, &["K"]),
+        &t_key_of,
+        &mut |_| {
+            attempts += 1;
+            assert!(attempts <= 5, "the arbiter spins (I-PROGRESS)");
+        },
+        OnConflictAction::DoUpdate(&mut f),
+    ));
+    assert_eq!(out.result, OnConflictResult::Updated);
+    assert_eq!(out.restarts, 0);
+    assert_count_exact(&rig.core, &w);
+    rig.commit(w);
+    rig.resolve();
+    assert_eq!(rig.read_latest(&t_key("0")), Some(u64v(10)));
+    assert_eq!(rig.read_latest(&u_key("K")), Some(b"0".to_vec()));
+}
+
+/// Rework item 3 (the own-txn variant): a plain INSERT of the row earlier in
+/// the same txn, then the same-row upsert. `DO NOTHING` skips it (the own
+/// entry names it), a later statement's `DO UPDATE` updates it from the own
+/// intent's data, and a `DO UPDATE` in the row's inserting statement is
+/// 21000 (§5.4 revisit, `data_seq == seq0`).
+/// Mutant killed: the pre-check passes `same_row: Some(entry.value)` (the
+/// upsert returns `Err(UniqueViolation)` on both statements).
+#[test]
+fn own_txn_insert_then_same_row_upsert() {
+    let rig = Rig::new();
+    let w = rig.txn(Isolation::ReadCommitted);
+    let s = rig.core.visible_ts();
+    let early = ok(w.next_seq());
+    let ictx = StmtCtx::new(s, early, early);
+    ok(rig.core.insert_key(
+        &w,
+        &t_key("0"),
+        None,
+        u64v(3),
+        ictx.clone(),
+        UniqueRule::Unique { same_row: None },
+    ));
+    ok(rig.core.insert_key(
+        &w,
+        &u_key("K"),
+        None,
+        b"0".to_vec(),
+        ictx,
+        UniqueRule::Unique { same_row: None },
+    ));
+    assert_count_exact(&rig.core, &w);
+
+    // The same statement cannot upsert the row it just inserted: 21000.
+    let mut called = false;
+    let mut f = |v: &[u8]| {
+        called = true;
+        incr(v)
+    };
+    let r = upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, early, early),
+        proposed("0", 5, &["K"]),
+        OnConflictAction::DoUpdate(&mut f),
+    );
+    assert_eq!(r, Err(TxnError::CardinalityViolation));
+    assert!(!called, "21000 is raised before the update closure");
+
+    // A later statement: DO NOTHING skips the row.
+    let seq1 = ok(w.next_seq());
+    let out = ok(upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, seq1, seq1),
+        proposed("0", 5, &["K"]),
+        OnConflictAction::DoNothing,
+    ));
+    assert_eq!(out.result, OnConflictResult::Nothing);
+    assert_count_exact(&rig.core, &w);
+
+    // DO UPDATE updates it from the own intent's data (3 → 4).
+    let seq2 = ok(w.next_seq());
+    let mut attempts = 0u32;
+    let mut f = incr;
+    let out = ok(rig.core.insert_on_conflict(
+        &w,
+        StmtCtx::new(s, seq2, seq2),
+        proposed("0", 5, &["K"]),
+        &t_key_of,
+        &mut |_| {
+            attempts += 1;
+            assert!(attempts <= 5, "the arbiter spins (I-PROGRESS)");
+        },
+        OnConflictAction::DoUpdate(&mut f),
+    ));
+    assert_eq!(out.result, OnConflictResult::Updated);
+    assert_count_exact(&rig.core, &w);
+    rig.commit(w);
+    rig.resolve();
+    assert_eq!(rig.read_latest(&t_key("0")), Some(u64v(4)));
+    assert_eq!(rig.read_latest(&u_key("K")), Some(b"0".to_vec()));
+}
+
+/// Rework item 4 (the PK as arbiter): `INSERT (pk=0) ON CONFLICT (pk) DO
+/// NOTHING` where pk=0 exists — PostgreSQL skips. Round 1's `/t/` key
+/// insert was never an arbiter, so this raised 23505.
+/// Mutant killed: the PK conflict path raises 23505 / the `/t/` key is not
+/// treated as an arbiter (`Err(UniqueViolation)` instead of `Nothing`).
+#[test]
+fn pk_arbiter_do_nothing() {
+    let rig = Rig::new();
+    rig.preload(&t_key("0"), &u64v(0));
+    let w = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = rig.core.visible_ts();
+    let out = ok(upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, seq0, seq0),
+        pk_proposed("0", 5),
+        OnConflictAction::DoNothing,
+    ));
+    assert_eq!(out.result, OnConflictResult::Nothing);
+    assert_eq!(out.restarts, 0);
+    assert!(
+        rig.intent(&t_key("0")).is_none(),
+        "DO NOTHING writes nothing"
+    );
+    assert_count_exact(&rig.core, &w);
+    rig.commit(w);
+    rig.resolve();
+    assert_eq!(rig.read_latest(&t_key("0")), Some(u64v(0)));
+}
+
+/// Rework item 4 (the PK as arbiter): the same shape with `DO UPDATE`
+/// locks `r = t_key` at `base = v_r.ts` and applies the update through
+/// §5.4; the ownership re-check on the `/t/` key accepts the still-live
+/// row.
+/// Mutant killed: the PK conflict path raises 23505 (`Err(UniqueViolation)`
+/// instead of `Updated`).
+#[test]
+fn pk_arbiter_do_update() {
+    let rig = Rig::new();
+    rig.preload(&t_key("0"), &u64v(0));
+    let w = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = rig.core.visible_ts();
+    let mut f = incr;
+    let out = ok(upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, seq0, seq0),
+        pk_proposed("0", 5),
+        OnConflictAction::DoUpdate(&mut f),
+    ));
+    assert_eq!(out.result, OnConflictResult::Updated);
+    assert_eq!(out.restarts, 0);
+    assert_count_exact(&rig.core, &w);
+    rig.commit(w);
+    rig.resolve();
+    assert_eq!(rig.read_latest(&t_key("0")), Some(u64v(1)));
+}
+
+/// Rework item 4: a same-statement revisit through the PK arbiter is 21000
+/// (§5.4: the row's own top layer has `data_seq == seq0`), raised before
+/// the lock.
+#[test]
+fn pk_arbiter_revisit_same_statement_is_21000() {
+    let rig = Rig::new();
+    let w = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = rig.core.visible_ts();
+    let out = ok(upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, seq0, seq0),
+        pk_proposed("1", 3),
+        OnConflictAction::DoNothing,
+    ));
+    assert_eq!(out.result, OnConflictResult::Inserted);
+    assert_count_exact(&rig.core, &w);
+    let before = rig.intent(&t_key("1"));
+    let mut called = false;
+    let mut f = |v: &[u8]| {
+        called = true;
+        incr(v)
+    };
+    let r = upsert(
+        &rig,
+        &w,
+        StmtCtx::new(s, seq0, seq0),
+        pk_proposed("1", 0),
+        OnConflictAction::DoUpdate(&mut f),
+    );
+    assert_eq!(r, Err(TxnError::CardinalityViolation));
+    assert!(!called);
+    assert_eq!(
+        rig.intent(&t_key("1")),
+        before,
+        "no layer added before 21000"
+    );
+    assert_count_exact(&rig.core, &w);
+    ok(rig.core.abort(w));
+}
+
+/// Rework item 4, the seed-53 shape through the PK arbiter: T holds a
+/// lock-only intent on `/t/r/1` (it never blocks the PK pre-check's state
+/// read, §5.3.1(1)), so W reaches the arbiter lock and parks on T. While W
+/// is parked, T deletes row 1, commits and resolves. W's re-stepped lock
+/// sees the tombstone above `base = v_r.ts` and restarts the arbiter (never
+/// EPQ-and-skip); attempt 2 finds `/t/r/1` dead and inserts.
+/// Mutant killed: the PK arbiter lock runs EPQ and skips, or returns the
+/// §5.1 error, instead of restarting (no `Inserted` outcome / an error).
+#[test]
+fn pk_arbiter_seed53_delete_in_window_restarts_and_inserts() {
+    let rig = Rig::new();
+    let parkers = rig.parkers();
+    rig.preload(&t_key("1"), &u64v(0));
+    let t = rig.txn(Isolation::ReadCommitted);
+    let tseq = ok(t.next_seq());
+    let lock_op = RowOp::Lock(RowLockMode::NoKeyUpdate);
+    ok(rig.core.row_op(
+        &t,
+        &t_key("1"),
+        None,
+        lock_op.clone(),
+        StmtCtx::new(rig.core.visible_ts(), tseq, tseq),
+        &mut Fixed(lock_op),
+    ));
+    assert_count_exact(&rig.core, &t);
+
+    let w = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = rig.core.visible_ts();
+    let core = &rig.core;
+    let before = parkers.parks();
+    let out = std::thread::scope(|scope| {
+        let h = scope.spawn(|| {
+            let mut f = incr;
+            core.insert_on_conflict(
+                &w,
+                StmtCtx::new(s, seq0, seq0),
+                pk_proposed("1", 7),
+                &t_key_of,
+                &mut |_| {},
+                OnConflictAction::DoUpdate(&mut f),
+            )
+        });
+        parkers.wait_parked_unless(before, &|| h.is_finished());
+        let parked = parkers.parks();
+        // W parked before placing anything: the intent is still T's.
+        let parked_intent = rig.intent(&t_key("1"));
+        let t_id = t.id;
+        // T deletes row 1 in a later statement, ends, and the resolver
+        // applies the tombstone — only then can W re-step its lock.
+        let ts2 = ok(t.next_seq());
+        rig.delete_in(&t, ts2, &t_key("1"));
+        rig.commit(t);
+        rig.resolve();
+        let out = match h.join() {
+            Ok(r) => ok(r),
+            Err(e) => std::panic::resume_unwind(e),
+        };
+        (parked, parked_intent, t_id, out)
+    });
+    assert!(out.0 > before, "W parked on T's lock-only intent");
+    assert!(
+        out.1.as_ref().is_some_and(|i| i.txn == out.2),
+        "W placed nothing before the park: {:?}",
+        out.1
+    );
+    assert_eq!(
+        out.3.result,
+        OnConflictResult::Inserted,
+        "restart, then insert"
+    );
+    assert_eq!(out.3.restarts, 1);
+    assert_count_exact(&rig.core, &w);
+    rig.commit(w);
+    rig.resolve();
+    assert_eq!(rig.read_latest(&t_key("1")), Some(u64v(7)));
+}
+
+/// Rework item 4: under RR/SER, `r` (= `t_key`) newer than `S` is a 40001
+/// through the PK arbiter, `DO NOTHING` included
+/// (`ExecCheckTupleVisible`, §5.3.1(3)). RC at the same `S` skips.
+/// Mutant killed: the (3) check is skipped for the PK arbiter (`Nothing` /
+/// `Updated` instead of the 40001).
+#[test]
+fn pk_arbiter_rr_ser_r_newer_than_s_is_40001() {
+    for iso in [Isolation::RepeatableRead, Isolation::Serializable] {
+        let rig = Rig::new();
+        rig.preload(&t_key("1"), &u64v(0));
+        let w = rig.txn(iso);
+        let snap = rig.core.registry.take_snapshot();
+        let s = snap.ts();
+        rig.update(&t_key("1"), &u64v(1));
+        assert!(rig.core.visible_ts() > s);
+        let seq0 = ok(w.next_seq());
+        let r = upsert(
+            &rig,
+            &w,
+            StmtCtx::new(s, seq0, seq0),
+            pk_proposed("1", 5),
+            OnConflictAction::DoNothing,
+        );
+        assert_eq!(r, Err(TxnError::SerializationFailure), "{iso:?} DO NOTHING");
+        assert_count_exact(&rig.core, &w);
+        let seq1 = ok(w.next_seq());
+        let mut f = incr;
+        let r = upsert(
+            &rig,
+            &w,
+            StmtCtx::new(s, seq1, seq1),
+            pk_proposed("1", 5),
+            OnConflictAction::DoUpdate(&mut f),
+        );
+        assert_eq!(r, Err(TxnError::SerializationFailure), "{iso:?} DO UPDATE");
+        assert_count_exact(&rig.core, &w);
+        ok(rig.core.abort(w));
+
+        // RC at the same S: skip / update.
+        let rc = rig.txn(Isolation::ReadCommitted);
+        let q = ok(rc.next_seq());
+        let out = ok(upsert(
+            &rig,
+            &rc,
+            StmtCtx::new(s, q, q),
+            pk_proposed("1", 5),
+            OnConflictAction::DoNothing,
+        ));
+        assert_eq!(out.result, OnConflictResult::Nothing, "{iso:?} RC");
+        assert_count_exact(&rig.core, &rc);
+        ok(rig.core.abort(rc));
+    }
 }
