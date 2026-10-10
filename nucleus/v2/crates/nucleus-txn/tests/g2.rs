@@ -15,5 +15,6 @@
 mod g2 {
     pub mod check;
     pub mod history;
+    pub mod inject;
     pub mod runner;
 }
