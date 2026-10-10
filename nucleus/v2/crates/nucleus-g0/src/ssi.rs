@@ -24,11 +24,12 @@
 //! ## Workloads (fixed, chosen by the initial `Choose`)
 //!
 //! Keys: heap keys `h0..h2` (`h0`, `h1` preloaded; `h2` exists only after the
-//! phantom insert) and index entries `i0..i2` (`i0`, `i1` preloaded). "read hK" is
-//! a point read (SIREAD, view, read); "scan [i0..i2]" an index range scan (SIREAD
-//! on the bound, view, read of every entry in range); "fetch h0" the index→row
-//! fetch (SIREAD on the heap key, then a **fresh** view); "write" places intents on
-//! the listed keys; "insert" additionally creates `h2`/`i2` inside the scanned gap.
+//! phantom insert or Late's deferred write) and index entries `i0..i2` (`i0`,
+//! `i1` preloaded). "read hK" is a point read (SIREAD, view, read); "scan
+//! [i0..i2]" an index range scan (SIREAD on the bound, view, read of every
+//! entry in range); "fetch h0" the index→row fetch (SIREAD on the heap key,
+//! then a **fresh** view); "write" places intents on the listed keys; "insert"
+//! additionally creates `h2`/`i2` inside the scanned gap.
 //!
 //! | Work   | T0                                                  | T1                      | T2          |
 //! |--------|-----------------------------------------------------|-------------------------|-------------|
@@ -38,6 +39,14 @@
 //! | Scan   | scan [i0..i1]; fetch h0                             | write h0+i0             | —           |
 //! | Trunc  | read h0                                             | —                       | TRUNCATE    |
 //! | Hold   | write h1; WITH HOLD read h0 (materialised at commit, fetched after) | read h1; write h0 | — |
+//! | Late   | read h1; write h2 (deferred)                        | read h0; write h1       | write h0    |
+//!
+//! Late is the §8.3 write-less-non-committer workload: T0 is an undeclared
+//! reader whose write comes last, so T1's pre-commit can run while T0 is
+//! active and write-less — exactly the txn the read-only exception must not
+//! cover (an active txn can still write). The structure T0 -> T1 -> T2 with
+//! T2 committing first then aborts the pivot; the permissive form (exception
+//! for any write-less txn) would spare it.
 //!
 //! Workload write sets are pairwise disjoint (the TRUNCATE is a DDL and places no
 //! intents), so no §5.1 wait ever arises; the model stays inside G0-write's scope.
@@ -67,8 +76,8 @@
 //!
 //! - Statements per txn vs the card's "2 statements each": Skew T2 and Trunc
 //!   T1 run nothing; Ro T2 (one write), Eo T2 (one insert), Scan T1 (one
-//!   write), Trunc T0 (one read) and Trunc T2 (the DDL itself) run one
-//!   statement. Every other txn runs exactly two.
+//!   write), Trunc T0 (one read), Trunc T2 (the DDL itself) and Late T2 (one
+//!   write) run one statement. Every other txn runs exactly two.
 //! - Weak catches: seeds 5, 6 and 30 are caught through the registration-order
 //!   stamps (`sver`/`vver`) of I-SSI-ORDER, seed 36 through that invariant's
 //!   "no registered view" clause (at this scope an unregistered latest-state
@@ -197,15 +206,17 @@ pub enum Work {
     Scan,
     Trunc,
     Hold,
+    Late,
 }
 
-const WORKS: [Work; 6] = [
+const WORKS: [Work; 7] = [
     Work::Skew,
     Work::Ro,
     Work::Eo,
     Work::Scan,
     Work::Trunc,
     Work::Hold,
+    Work::Late,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -642,6 +653,36 @@ fn program(bug: Option<Bug>, w: Work, t: u8) -> &'static [Step] {
             S::Enqueue,
         ],
         (Work::Hold, _) => &[],
+        // Late: T0 defers its write, so at T1's pre-commit it is an active
+        // write-less reader (no READ ONLY declaration); §8.3's no-writes
+        // exception belongs to the txn committing now, so the T0 -> T1 -> T2
+        // structure with T2 committing first must abort the pivot T1. T0's
+        // write of h2 (an insert outside every SIREAD) keeps the workload's
+        // write sets disjoint and makes every committed T0 a writer.
+        (Work::Late, 0) => &[
+            S::TakeSnapshot,
+            S::Siread(Bound::Point(H1)),
+            S::OpenView(0),
+            S::Read { slot: 0, key: H1 },
+            S::Place { keys: &[H2] },
+            S::PreCommit,
+            S::Enqueue,
+        ],
+        (Work::Late, 1) => &[
+            S::TakeSnapshot,
+            S::Siread(Bound::Point(H0)),
+            S::OpenView(0),
+            S::Read { slot: 0, key: H0 },
+            S::Place { keys: &[H1] },
+            S::PreCommit,
+            S::Enqueue,
+        ],
+        (Work::Late, 2) => &[
+            S::TakeSnapshot,
+            S::Place { keys: &[H0] },
+            S::PreCommit,
+            S::Enqueue,
+        ],
         _ => &[],
     }
 }
@@ -681,9 +722,15 @@ impl State {
         self.txns[t as usize].snap_at
     }
 
-    fn ro_at(&self, t: u8) -> bool {
-        // §8.3: declared READ ONLY, or no writes and committing.
-        declared_ro(self.w.unwrap_or(Work::Skew), t) || self.g_writes[t as usize].is_empty()
+    /// §8.3 read-only-ness of `t` as judged by the pre-commit check that
+    /// `now` (the txn committing) is running: declared READ ONLY, or no
+    /// writes and committing (`t == now`), or no writes and already
+    /// committed (a committed txn can no longer write either). An active
+    /// write-less txn does not qualify: it can still write, so a structure
+    /// through it stays dangerous.
+    fn ro_at(&self, t: u8, now: u8) -> bool {
+        declared_ro(self.w.unwrap_or(Work::Skew), t)
+            || (self.g_writes[t as usize].is_empty() && (t == now || self.is_committed(t)))
     }
 
     /// §4 read of `key` at snapshot `snap` through `view`: the ts of the version
@@ -833,8 +880,8 @@ impl State {
         members.iter().any(|&m| m != t3) && members.iter().all(|&m| m == t3 || self.ord(m) > o3)
     }
 
-    fn ro_ok(&self, t1: u8, t3: u8) -> bool {
-        !self.ro_at(t1)
+    fn ro_ok(&self, t1: u8, t3: u8, now: u8) -> bool {
+        !self.ro_at(t1, now)
             || matches!(self.txns[t3 as usize].assigned, Some(c) if c <= self.snap_of(t1))
     }
 
@@ -865,7 +912,7 @@ impl State {
                 if y == t || !self.edges.contains(&(t, y)) {
                     continue;
                 }
-                if self.first_among(y, [x, t, y]) && self.ro_ok(x, y) {
+                if self.first_among(y, [x, t, y]) && self.ro_ok(x, y, t) {
                     return Some((self.fired(x, t, Some(y), None), t));
                 }
             }
@@ -886,7 +933,9 @@ impl State {
                     self.earliest.get(&y).copied()
                 };
                 if let Some(e) = e {
-                    if !self.ro_at(t) || e <= self.snap_of(t) {
+                    // t is the txn committing now, so §8.3's no-writes
+                    // exception is available to it.
+                    if !self.ro_at(t, t) || e <= self.snap_of(t) {
                         // T3 is named through the protocol's own writer map
                         // (`wmap`, §8.5, with §8.6 retention) — never ghost
                         // state. When the entry is retired the protocol fires
@@ -903,7 +952,7 @@ impl State {
                     if z == t || z == y || !self.edges.contains(&(y, z)) {
                         continue;
                     }
-                    if self.first_among(z, [t, y, z]) && self.ro_ok(t, z) {
+                    if self.first_among(z, [t, y, z]) && self.ro_ok(t, z, t) {
                         let victim = if self.txns[y as usize].pseq.is_none() {
                             y
                         } else {
@@ -1685,9 +1734,16 @@ impl Model for SsiModel {
                 ));
             }
             // Read-only-ness and T3's commit from ghost state, not from the
-            // protocol's own classification.
+            // protocol's own classification. §8.3's no-writes case is
+            // restricted to the txn committing (or already committed): an
+            // active txn can still write, so a fire through an active
+            // write-less T1 was legal and must not be judged read-only here
+            // — such a T1 either writes later (no longer write-less) or is
+            // still active (not terminal). Only a terminal write-less T1,
+            // which can no longer write, qualifies.
             let w = s.w.unwrap_or(Work::Skew);
-            let t1_ro = declared_ro(w, f.t1) || s.g_writes[f.t1 as usize].is_empty();
+            let terminal = matches!(s.txns[f.t1 as usize].st, St::Committed(_) | St::Aborted);
+            let t1_ro = declared_ro(w, f.t1) || (s.g_writes[f.t1 as usize].is_empty() && terminal);
             let s1 = s.snap_of(f.t1);
             let c3 = ghost_c(t3);
             if t1_ro && !c3.is_some_and(|c| c <= s1) {
@@ -1720,4 +1776,25 @@ impl Model for SsiModel {
             && s.resolve_q.is_empty()
             && s.cleanup_q.is_empty()
     }
+}
+
+// -- test-facing views ------------------------------------------------------
+
+/// The commit ts of `t`, or `None` while it has not committed.
+pub fn committed_ts(s: &State, t: u8) -> Option<Ts> {
+    match s.txns[t as usize].st {
+        St::Committed(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// The dangerous structures `(t1, t2, t3)` recorded with `t` as the pivot of
+/// a raised 40001; `t3` is `None` when the protocol fired on the frozen
+/// `earliest_out_conflict_commit` alone (§8.5).
+pub fn raised_structures(s: &State, t: u8) -> Vec<(u8, u8, Option<u8>)> {
+    s.g_abort
+        .iter()
+        .filter(|f| f.t2 == t)
+        .map(|f| (f.t1, f.t2, f.t3))
+        .collect()
 }
