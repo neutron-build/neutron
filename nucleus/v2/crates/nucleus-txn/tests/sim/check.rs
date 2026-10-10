@@ -1261,6 +1261,28 @@ pub fn on_reboot(sim: &mut Sim, core: &Core<super::SimKv>) {
     }
 }
 
+/// Every KV entry of `key` (its intent and versions), for violation
+/// messages.
+fn dump_key(core: &Core<super::SimKv>, key: &[u8]) -> Vec<String> {
+    let view = core.open_view();
+    let lo = intent_key(key);
+    let hi = end_key(key);
+    let mut out = Vec::new();
+    for entry in view.scan(
+        (
+            Bound::Included(lo.as_slice()),
+            Bound::Excluded(hi.as_slice()),
+        ),
+        false,
+    ) {
+        match entry {
+            Ok((k, v)) => out.push(format!("{:?} -> {} bytes", parse_key(&k), v.len())),
+            Err(e) => out.push(format!("scan error {e:?}")),
+        }
+    }
+    out
+}
+
 fn read_at_visible(sim: &Sim, core: &Core<super::SimKv>, key: &[u8]) -> Option<Vec<u8>> {
     let view = core.open_view();
     let ctx = ReadCtx {
@@ -1482,7 +1504,24 @@ pub fn final_checks(sim: &mut Sim, core: &Core<super::SimKv>) {
             sim.violate(
                 "LOST-UPDATE",
                 format!(
-                    "key {key:?} ends at {actual:?} but the committed fold gives {cur:?} (every increment must be counted exactly once)"
+                    "key {key:?} ends at {actual:?} but the committed fold gives {cur:?} (every increment must be counted exactly once); txns writing the key: {:?}; kv entries: {:?}",
+                    sim.ghost
+                        .txns
+                        .iter()
+                        .filter(|(_, t)| t.writes.iter().any(|w| w.key == *key))
+                        .map(|(id, t)| format!(
+                            "{id:?} {:?} sync={:?} ts={:?} writes={:?}",
+                            t.outcome,
+                            t.sync,
+                            t.known_ts,
+                            t.writes
+                                .iter()
+                                .filter(|w| w.key == *key)
+                                .map(|w| (w.seq, &w.kind))
+                                .collect::<Vec<_>>()
+                        ))
+                        .collect::<Vec<_>>(),
+                    dump_key(core, key)
                 ),
             );
             return;

@@ -663,6 +663,9 @@ pub struct Sim {
     /// it, never with the global step count, so removing a session step
     /// from a replayed schedule does not change which GC action is offered.
     pub maint: u64,
+    /// The era step from which a crash is offered (drawn per era from the
+    /// aux stream, so crashes land at varied depths of the history).
+    pub crash_at: u64,
     /// Steps taken with every session finished (bounded by `TAIL_STEPS`).
     pub tail_steps: u64,
     /// Submitted, not yet acked, in submission (channel) order.
@@ -791,7 +794,7 @@ pub fn collect_actions(sim: &Sim, probe_mode: bool) -> Vec<Action> {
         if !sim.inflight.is_empty() {
             out.push(Action::CommitThread);
         }
-        if sim.crashes_left > 0 && sim.era_steps > 8 {
+        if sim.crashes_left > 0 && sim.era_steps >= sim.crash_at {
             out.push(Action::Crash);
         }
     }
@@ -1795,6 +1798,7 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
         steps: 0,
         era_steps: 0,
         maint: 0,
+        crash_at: 8,
         tail_steps: 0,
         inflight: Vec::new(),
         current_group: Vec::new(),
@@ -1832,6 +1836,7 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
             s.gc = gc.clone();
             s.sessions = (0..cfg.sessions).map(Session::new).collect();
             s.era_steps = 0;
+            s.crash_at = 8 + s.choices.aux.below(140) as u64;
             s.current_group.clear();
             s.chk.new_era(&core);
             check::on_reboot(&mut s, &core);

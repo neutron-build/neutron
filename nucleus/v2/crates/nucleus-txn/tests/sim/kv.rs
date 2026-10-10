@@ -77,7 +77,10 @@ impl Record {
         };
         self.dead.push((new_durable, self.events.len()));
         self.durable = new_durable;
-        self.unsynced.truncate(keep);
+        // The kept batches are durable now (`Fault::crash` syncs them), so
+        // nothing is unsynced: a later crash must count only batches queued
+        // after this reboot, as `Fault` does.
+        self.unsynced.clear();
     }
 }
 
