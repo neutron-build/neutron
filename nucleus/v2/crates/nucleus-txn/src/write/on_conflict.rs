@@ -23,6 +23,8 @@
 //! §5.3.1 includes the `/t/` key in the arbiter set, where a live version
 //! names exactly one row, itself, so `r = t_key`.
 
+use std::time::Instant;
+
 use nucleus_kv::{Key, OrderedKv};
 
 use crate::boot::Core;
@@ -124,6 +126,15 @@ impl<K: OrderedKv> Core<K> {
         on_attempt: &mut dyn FnMut(Seq),
         mut action: OnConflictAction<'_>,
     ) -> Result<OnConflictOutcome, TxnError> {
+        // One `lock_timeout` deadline per statement (§6), computed before
+        // the restart loop and shared by every wait below — the same
+        // pattern as the `step.rs` drivers, which compute it once per
+        // call. A restart is not a new statement: recomputing the deadline
+        // at each wait would hand a statement whose waits keep ending
+        // (every `GenChanged`/commit outcome of a wait maps to `Ok`, i.e.
+        // a restart) a fresh clock per wait, and 55P03 would never arrive
+        // (the r4 gate's MEDIUM finding).
+        let deadline = ctx.lock_deadline();
         let mut restarts = 0u32;
         loop {
             if txn.is_cancelled() {
@@ -132,7 +143,7 @@ impl<K: OrderedKv> Core<K> {
             let sa = txn.next_seq()?;
             on_attempt(sa);
             let actx = ctx.clone().attempt(sa);
-            match self.arbiter_attempt(txn, &actx, &row, t_key_of, &mut action)? {
+            match self.arbiter_attempt(txn, &actx, &row, t_key_of, &mut action, deadline)? {
                 Attempt::Done(result) => return Ok(OnConflictOutcome { result, restarts }),
                 Attempt::Restart(wait) => {
                     // Abandon exactly as ROLLBACK TO SAVEPOINT sa (§5.5):
@@ -140,7 +151,7 @@ impl<K: OrderedKv> Core<K> {
                     // discarded, the wake generation is bumped.
                     self.rollback_to(txn, sa)?;
                     if let Some(targets) = wait {
-                        map_wait_outcome(self.wait_on_any(txn, &targets))?;
+                        map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?;
                     }
                     restarts = restarts.saturating_add(1);
                 }
@@ -155,6 +166,7 @@ impl<K: OrderedKv> Core<K> {
         row: &ProposedRow,
         t_key_of: &dyn Fn(&[u8]) -> Key,
         action: &mut OnConflictAction<'_>,
+        deadline: Option<Instant>,
     ) -> Result<Attempt, TxnError> {
         // (1) Pre-check, one latch section per arbiter key. Round 2: no
         // `same_row` — a live entry naming this row's own PK is a conflict
@@ -176,6 +188,7 @@ impl<K: OrderedKv> Core<K> {
                             &r,
                             t_key_of,
                             action,
+                            deadline,
                         );
                     }
                 }
@@ -192,7 +205,15 @@ impl<K: OrderedKv> Core<K> {
                     ArbPreStep::Insert => break,
                     ArbPreStep::Conflict { .. } => {
                         let r = row.t_key.clone();
-                        return self.arbiter_conflict(txn, actx, Arbiter::Pk, &r, t_key_of, action);
+                        return self.arbiter_conflict(
+                            txn,
+                            actx,
+                            Arbiter::Pk,
+                            &r,
+                            t_key_of,
+                            action,
+                            deadline,
+                        );
                     }
                 }
             }
@@ -258,6 +279,7 @@ impl<K: OrderedKv> Core<K> {
 
     /// §5.3.1(3): conflict on row `r`, found by the arbiter key `arbiter`
     /// (a `/u/` entry that names `r`, or the `/t/` key itself).
+    #[allow(clippy::too_many_arguments)] // one struct per call site would not be plainer
     fn arbiter_conflict(
         &self,
         txn: &Txn,
@@ -266,6 +288,7 @@ impl<K: OrderedKv> Core<K> {
         r: &[u8],
         t_key_of: &dyn Fn(&[u8]) -> Key,
         action: &mut OnConflictAction<'_>,
+        deadline: Option<Instant>,
     ) -> Result<Attempt, TxnError> {
         // v_r and r's own top layer under §5.3.1(1)'s pre-check rule, which
         // governs r here too (rework item 2): a foreign visible-committed or
@@ -298,7 +321,9 @@ impl<K: OrderedKv> Core<K> {
             match lock.step(self, txn)? {
                 Step::Done(RowOutcome::Applied) => break,
                 Step::Again => {}
-                Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
+                Step::Wait(targets) => {
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?
+                }
                 Step::Restart => return Ok(Attempt::Restart(None)),
                 other => {
                     return Err(TxnError::Invariant(format!(
@@ -390,7 +415,9 @@ impl<K: OrderedKv> Core<K> {
                 Step::Again => {}
                 // Shared holders (KEY SHARE vs a key-changing update): the
                 // own intent excludes foreign writers, so wait and re-step.
-                Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
+                Step::Wait(targets) => {
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?
+                }
                 other => {
                     return Err(TxnError::Invariant(format!(
                         "ON CONFLICT update of the locked row returned {other:?}"
