@@ -13,5 +13,6 @@
 //! - `soak`: the bounded multi-level soak.
 
 mod g2 {
+    pub mod check;
     pub mod history;
 }
