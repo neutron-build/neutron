@@ -34,7 +34,7 @@ pub fn minimize(start: &[u64], wanted: &str, run: impl Fn(&[u64]) -> Option<Stri
         if chunk == 1 {
             break;
         }
-        chunk = (chunk + 1).div_ceil(2);
+        chunk = chunk.div_ceil(2);
     }
     cur
 }
