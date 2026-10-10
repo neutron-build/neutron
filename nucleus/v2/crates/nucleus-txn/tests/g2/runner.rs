@@ -132,6 +132,8 @@ pub struct Run {
     pub history: History,
     /// `@INTENT` entries left in the KV once everything drained (I-LEAK).
     pub leaked_intents: usize,
+    /// Who owns each leaked intent and what became of the owner.
+    pub leak_report: String,
 }
 
 impl Rig {
@@ -249,16 +251,26 @@ impl Rig {
         while Resolver::run_once(&self.core).expect("resolve") > 0 {}
         let view = self.core.open_view();
         let mut leaked = 0;
+        let mut report = String::new();
         for row in view.scan((Bound::Unbounded, Bound::Unbounded), false) {
-            let (k, _) = row.expect("scan the kv");
-            if matches!(parse_key(&k), Some((_, Entry::Intent))) {
+            let (k, v) = row.expect("scan the kv");
+            // Only row keys: a `/sys/..` key whose last byte happens to be
+            // 0x00 parses as an intent without a schema.
+            if let Some((l, Entry::Intent)) = parse_key(&k).filter(|(l, _)| l.starts_with(b"/t/")) {
                 leaked += 1;
+                let slot = slot_of(l).map_or("?".to_string(), super::history::key_name);
+                let owner = decode_intent(&v).map(|i| {
+                    let st = self.core.status.entry(i.txn);
+                    format!("owner {:?} status {:?} layers {:?}", i.txn, st, i.layers)
+                });
+                report.push_str(&format!("  leaked intent on {slot}: {owner:?}\n"));
             }
         }
         drop(view);
         Run {
             history: self.rec.drain(),
             leaked_intents: leaked,
+            leak_report: report,
         }
     }
 }

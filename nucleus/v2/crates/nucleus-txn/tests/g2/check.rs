@@ -291,6 +291,9 @@ struct Checker<'a> {
     ver_of_val: HashMap<Val, usize>,
     succ: Vec<Vec<usize>>,
     ext: Vec<Vec<Ext>>,
+    /// Every read of every txn, own-write reads included: SSI takes a SIREAD
+    /// for those too.
+    all_reads: Vec<Vec<Ext>>,
     by_session: Vec<Vec<usize>>,
     /// Committed-txn graph: node of a txn index.
     node_of: Vec<Option<usize>>,
@@ -320,6 +323,7 @@ impl<'a> Checker<'a> {
             ver_of_val: HashMap::new(),
             succ: Vec::new(),
             ext: Vec::new(),
+            all_reads: Vec::new(),
             by_session: Vec::new(),
             node_of: Vec::new(),
             nodes: Vec::new(),
@@ -630,14 +634,21 @@ impl<'a> Checker<'a> {
     /// the snapshot rule; and the external reads the graph is built from.
     fn scan_reads(&mut self) {
         self.ext = vec![Vec::new(); self.h.txns.len()];
+        self.all_reads = vec![Vec::new(); self.h.txns.len()];
         for ti in 0..self.h.txns.len() {
             let t = &self.h.txns[ti];
             let mut own: HashMap<u8, Obs> = HashMap::new();
             let mut first: HashMap<u8, Obs> = HashMap::new();
             let mut found: Vec<(Kind, Level, Vec<u32>, String)> = Vec::new();
             let mut exts: Vec<Ext> = Vec::new();
+            let mut all: Vec<Ext> = Vec::new();
             for op in &t.ops {
                 for &(k, obs) in &op.reads {
+                    all.push(Ext {
+                        key: k,
+                        obs,
+                        snap: op.snap,
+                    });
                     if let Some(&o) = own.get(&k) {
                         if o != obs {
                             found.push((
@@ -784,6 +795,7 @@ impl<'a> Checker<'a> {
                 self.flag(k, l, u, d);
             }
             self.ext[ti] = exts;
+            self.all_reads[ti] = all;
         }
     }
 
@@ -1102,7 +1114,7 @@ impl<'a> Checker<'a> {
         let mut out = Vec::new();
         for &c in self.concurrent(x).iter() {
             let ct = &self.h.txns[c];
-            let hit = self.ext[x].iter().any(|e| {
+            let hit = self.all_reads[x].iter().any(|e| {
                 ct.ops.iter().any(|op| {
                     // A write rolled back to a savepoint still recorded its
                     // conflicts (C-T0 5.5: SIREADs and rw-conflicts are kept).

@@ -29,7 +29,7 @@ use std::sync::Barrier;
 
 use super::check::{check, Kind, Verdict};
 use super::history::{Hb, History, Level, Obs, OpKind, SqlErr, Val};
-use super::runner::{Bug, Rig, Run};
+use super::runner::{Bug, Rig};
 
 const RC: Level = Level::ReadCommitted;
 const RR: Level = Level::RepeatableRead;
@@ -82,11 +82,13 @@ fn clean(h: &History, level: Level) -> Verdict {
 }
 
 fn live(rig: &Rig) -> History {
-    let Run {
-        history,
-        leaked_intents,
-    } = rig.finish();
-    assert_eq!(leaked_intents, 0, "I-LEAK: intents remain after the drain");
+    let run = rig.finish();
+    let history = run.history;
+    assert_eq!(
+        run.leaked_intents, 0,
+        "I-LEAK: intents remain after the drain\n{}",
+        run.leak_report
+    );
     history
 }
 
