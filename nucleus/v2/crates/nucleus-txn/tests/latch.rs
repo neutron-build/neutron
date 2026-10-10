@@ -2,6 +2,7 @@
 //! including a second latch on the same stripe (which must fail fast, not
 //! self-deadlock), and release on drop.
 
+#[cfg(debug_assertions)]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use nucleus_txn::latch::Latches;

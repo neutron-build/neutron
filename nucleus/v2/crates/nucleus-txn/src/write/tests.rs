@@ -642,10 +642,9 @@ fn seed04_placement_requires_latch() {
     #[cfg(not(debug_assertions))]
     {
         let err = place_intent_under_latch(&core, b"/t/1/k", None, &intent, &other)
-            .err()
-            .expect("Invariant in release builds");
+            .expect_err("Invariant in release builds");
         assert!(
-            matches!(err, crate::TxnError::Invariant(m) if m.contains("§5.1")),
+            matches!(err, crate::TxnError::Invariant(ref m) if m.contains("§5.1")),
             "{err:?}"
         );
     }
