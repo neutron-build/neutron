@@ -17,4 +17,5 @@ mod g2 {
     pub mod history;
     pub mod inject;
     pub mod runner;
+    pub mod soak;
 }
