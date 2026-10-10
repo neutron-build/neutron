@@ -246,6 +246,51 @@ impl Clock for SystemClock {
     }
 }
 
+/// A yield point inside
+/// [`CommitPipeline::process_group`](crate::commit::CommitPipeline::process_group)
+/// (§11: the commit thread's status-set and visible-advance are separate
+/// interleavable steps). The index is the request's position in the group.
+///
+/// The probe is called **with no latch and no crate mutex held**, so it may
+/// run other work between the pipeline's steps: the deterministic simulator
+/// (C-SIM) checks invariants here and interleaves other actors' steps.
+/// [`NoProbe`] is the default no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePoint {
+    /// After the group's step-2 record write of request `i`.
+    RecordWritten(usize),
+    /// After step 3 inserted request `i` into the SSI writer map.
+    Assigned(usize),
+    /// After step 4 set the in-memory status of request `i` to
+    /// `Committed(ts)` (before `visible_ts` advances).
+    StatusSet(usize),
+    /// After step 4 advanced `visible_ts` past request `i`'s `commit_ts`
+    /// (before the ack).
+    VisibleAdvanced(usize),
+    /// After step 4 acked request `i`.
+    Acked(usize),
+    /// After the group's one fsync.
+    Synced,
+    /// After step 5 finished for request `i` (release, wake, resolution
+    /// queued, released marked).
+    Step5Done(usize),
+}
+
+/// The probe seam (§11): called at each [`ProbePoint`] of
+/// `process_group`, never under a latch. No-op by default; the deterministic
+/// simulator installs one through [`CommitConfig::with_probe`].
+pub trait CommitProbe: Send + Sync {
+    fn at(&self, point: ProbePoint);
+}
+
+/// The no-op [`CommitProbe`].
+#[derive(Default)]
+pub struct NoProbe;
+
+impl CommitProbe for NoProbe {
+    fn at(&self, _point: ProbePoint) {}
+}
+
 /// The C-T2b hook (§3 step 5, §7.1): release a txn's in-memory locks
 /// (shared row locks, relation locks, advisory locks, deferrable-unique
 /// prefix waits). No-op by default; installed on the core through
@@ -291,6 +336,9 @@ pub struct CommitConfig {
     pub observer: Option<Arc<dyn CommitObserver>>,
     /// The `/sys/ts_clock` clock; default [`SystemClock`].
     pub clock: Option<Arc<dyn Clock>>,
+    /// The §11 yield-point probe; default [`NoProbe`]. The deterministic
+    /// simulator (C-SIM) interleaves other actors' steps here.
+    pub probe: Option<Arc<dyn CommitProbe>>,
 }
 
 impl CommitConfig {
@@ -310,6 +358,11 @@ impl CommitConfig {
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> CommitConfig {
         self.clock = Some(clock);
+        self
+    }
+
+    pub fn with_probe(mut self, probe: Arc<dyn CommitProbe>) -> CommitConfig {
+        self.probe = Some(probe);
         self
     }
 }
@@ -450,6 +503,8 @@ pub struct CommitPipeline<K: OrderedKv> {
     hwm_block: u64,
     observer: Arc<dyn CommitObserver>,
     clock: Arc<dyn Clock>,
+    /// The §11 yield-point probe (no-op by default).
+    probe: Arc<dyn CommitProbe>,
     /// The clock second of the last `/sys/ts_clock` sample.
     last_clock_sample: Option<u64>,
     stopped: std::sync::atomic::AtomicBool,
@@ -473,6 +528,7 @@ impl<K: OrderedKv> CommitPipeline<K> {
             hwm_block: TS_HWM_BLOCK,
             observer: Arc::new(NoObserver),
             clock: Arc::new(SystemClock),
+            probe: Arc::new(NoProbe),
             last_clock_sample: None,
             stopped: std::sync::atomic::AtomicBool::new(false),
         })
@@ -497,6 +553,9 @@ impl<K: OrderedKv> CommitPipeline<K> {
         if let Some(c) = config.clock {
             pipeline.clock = c;
         }
+        if let Some(p) = config.probe {
+            pipeline.probe = p;
+        }
         Ok(pipeline)
     }
 
@@ -506,6 +565,19 @@ impl<K: OrderedKv> CommitPipeline<K> {
 
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = clock;
+    }
+
+    /// Installs the §11 yield-point probe (tests and the deterministic
+    /// simulator).
+    pub fn set_probe(&mut self, probe: Arc<dyn CommitProbe>) {
+        self.probe = probe;
+    }
+
+    /// Fires the probe at `point`, asserting no latch is held (§11: probe
+    /// points run lock-free, so the probe may run other work).
+    fn at(&self, point: ProbePoint) {
+        crate::latch::assert_no_latch_held();
+        self.probe.at(point);
     }
 
     /// Shrinks the `/sys/ts_hwm` reservation block (tests and the
@@ -598,12 +670,14 @@ impl<K: OrderedKv> CommitPipeline<K> {
                 self.stop_group(&group, 0, e, i > 0);
                 return;
             }
+            self.at(ProbePoint::RecordWritten(i));
         }
         // Step 3: the SSI writer map, before any status is set (§8.5).
         for (i, req) in group.iter().enumerate() {
             if req.ssi {
                 self.observer.on_assigned(req.txn, ts_of[i]);
             }
+            self.at(ProbePoint::Assigned(i));
         }
         // Step 4: the off prefix (status, visible_ts, ack), then one fsync,
         // then the rest in order.
@@ -612,7 +686,7 @@ impl<K: OrderedKv> CommitPipeline<K> {
             .position(|r| r.sync == SyncCommit::On)
             .unwrap_or(group.len());
         for i in 0..split {
-            if let Err(e) = self.make_visible(&group[i], ts_of[i]) {
+            if let Err(e) = self.make_visible(&group[i], ts_of[i], i) {
                 self.stop_group(&group, i, e, true);
                 return;
             }
@@ -624,8 +698,9 @@ impl<K: OrderedKv> CommitPipeline<K> {
                 self.stop_group(&group, split, e, true);
                 return;
             }
+            self.at(ProbePoint::Synced);
             for i in split..group.len() {
-                if let Err(e) = self.make_visible(&group[i], ts_of[i]) {
+                if let Err(e) = self.make_visible(&group[i], ts_of[i], i) {
                     self.stop_group(&group, i, e, true);
                     return;
                 }
@@ -644,16 +719,22 @@ impl<K: OrderedKv> CommitPipeline<K> {
                 self.fail_stop(&e);
                 return;
             }
+            self.at(ProbePoint::Step5Done(i));
         }
     }
 
     /// §3 step 4 for one request: in-memory status `Committed(ts)`, then
-    /// advance `visible_ts` (I-VIS), then ack (I-ACK). On error nothing has
+    /// advance `visible_ts` (I-VIS), then ack (I-ACK). The §11 probe points
+    /// `StatusSet`/`VisibleAdvanced`/`Acked` fire between the three, so the
+    /// simulator can interleave other actors there. On error nothing has
     /// been ackged; the caller stops the group.
-    fn make_visible(&self, req: &CommitRequest, ts: Ts) -> Result<(), TxnError> {
+    fn make_visible(&self, req: &CommitRequest, ts: Ts, i: usize) -> Result<(), TxnError> {
         self.core.status.set_committed(req.txn, ts)?;
+        self.at(ProbePoint::StatusSet(i));
         self.core.advance_visible_ts(ts);
+        self.at(ProbePoint::VisibleAdvanced(i));
         req.ack(Ok(ts));
+        self.at(ProbePoint::Acked(i));
         Ok(())
     }
 
