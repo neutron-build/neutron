@@ -341,8 +341,11 @@ fn count_intents(core: &Core<MemKv>) -> usize {
     let mut n = 0;
     for row in rows {
         let (k, _) = row.expect("scan");
-        if nucleus_txn::encoding::parse_key(&k)
-            .is_some_and(|(_, e)| matches!(e, nucleus_txn::encoding::Entry::Intent))
+        // `/sys/` internals (ts_clock, gc, txn records) also encode as
+        // intents; they are not leftover user intents.
+        if !k.starts_with(nucleus_txn::encoding::SYS_PREFIX)
+            && nucleus_txn::encoding::parse_key(&k)
+                .is_some_and(|(_, e)| matches!(e, nucleus_txn::encoding::Entry::Intent))
         {
             n += 1;
         }

@@ -394,7 +394,9 @@ fn stress_commit_abort_resolve_truncate_with_readers() {
     );
 }
 
-/// Counts intent entries in the whole KV.
+/// Counts intent entries in the whole KV, excluding the engine's own
+/// `/sys/` keys (ts_clock, gc and txn records also encode as intents;
+/// they are not leftover user intents).
 fn count_intents(core: &Core<MemKv>) -> usize {
     let view = core.open_view();
     let rows = view.scan(
@@ -404,8 +406,9 @@ fn count_intents(core: &Core<MemKv>) -> usize {
     let mut n = 0;
     for row in rows {
         let (k, _) = ok(row);
-        if nucleus_txn::encoding::parse_key(&k)
-            .is_some_and(|(_, e)| matches!(e, nucleus_txn::encoding::Entry::Intent))
+        if !k.starts_with(nucleus_txn::encoding::SYS_PREFIX)
+            && nucleus_txn::encoding::parse_key(&k)
+                .is_some_and(|(_, e)| matches!(e, nucleus_txn::encoding::Entry::Intent))
         {
             n += 1;
         }
