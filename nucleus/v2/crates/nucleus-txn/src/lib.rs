@@ -40,6 +40,14 @@
 //! detection after `deadlock_timeout` (40P01, one victim per cycle) and
 //! the split begin / poll / deadlock-check / end wait steps C-SIM drives
 //! on one thread.
+//!
+//! Card C-T7 adds §10 "Sequences" (`seq`): non-transactional
+//! `Core::seq_next` value allocation in blocks of `seq::BLOCK` — the
+//! persisted high-water mark `/sys/seq/{id}` is written `Durability::Yes`
+//! before the first value of a new block is handed out, so values may
+//! skip but never repeat, across crashes, torn writes and concurrent
+//! callers. Sequences stay off the commit path and out of every txn's
+//! write set.
 
 pub mod boot;
 pub mod commit;
@@ -62,6 +70,9 @@ pub mod write;
 // C-T2b, appended at the end of the module list (a separate group, so
 // rustfmt does not sort it back in).
 pub mod locks;
+
+// C-T7, appended the same way.
+pub mod seq;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
