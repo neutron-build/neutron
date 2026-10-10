@@ -101,6 +101,12 @@ impl<K: OrderedKv> Core<K> {
             RowOp::Lock(RowLockMode::KeyShare),
             ctx.clone(),
         );
+        // One `lock_timeout` deadline per check (§6), computed before the
+        // loop like the `step.rs` drivers: the KEY SHARE may wait several
+        // times (each ended wait re-steps), and every one of those waits
+        // must see the same clock — a fresh deadline per wait would defer
+        // 55P03 forever on a check that keeps re-waiting.
+        let deadline = ctx.lock_deadline();
         loop {
             if txn.is_cancelled() {
                 return Err(TxnError::QueryCanceled);
@@ -109,7 +115,7 @@ impl<K: OrderedKv> Core<K> {
                 Step::Done(RowOutcome::Applied) => return Ok(()),
                 Step::Again => {}
                 Step::Wait(targets) => {
-                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, ctx.lock_deadline()))?
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?
                 }
                 Step::Epq(req) => {
                     fk_epq(&req, matches)?;
