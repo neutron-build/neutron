@@ -153,6 +153,11 @@ pub fn probe_point(sim: &mut Sim, point: ProbePoint) {
 }
 
 fn battery(sim: &mut Sim) {
+    battery_inner(sim);
+    flush_bad_state(sim);
+}
+
+fn battery_inner(sim: &mut Sim) {
     walk_record(sim);
     observe_statuses(sim);
     let dv = sim.chk.data_ops
@@ -427,13 +432,48 @@ struct OwnedIntent {
     owner: TxnId,
 }
 
+/// An oracle met state it cannot decode (or a KV error): the engine left
+/// the store in a shape the layout forbids. Reported as the named violation
+/// `STATE-DECODE` at the end of the current check (the oracle itself never
+/// panics on engine output).
+pub fn flag_bad_state(sim: &Sim, what: String) {
+    let mut slot = sim.bad_state.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(what);
+    }
+}
+
+/// Turns a flagged undecodable state into the named violation.
+pub fn flush_bad_state(sim: &mut Sim) {
+    let bad = sim.bad_state.borrow_mut().take();
+    if let Some(what) = bad {
+        sim.violate("STATE-DECODE", what);
+    }
+    let stopped = sim.failstop.lock().map(|g| g.is_some()).unwrap_or(false);
+    if stopped {
+        sim.violate("FAIL-STOP", String::new());
+    }
+}
+
 fn scan_intents(sim: &Sim) -> Vec<OwnedIntent> {
     let view = sim.core.open_view();
     let mut out = Vec::new();
     for entry in view.scan((Bound::Unbounded, Bound::Unbounded), false) {
-        let (k, v) = entry.expect("kv scan");
+        let (k, v) = match entry {
+            Ok(kv) => kv,
+            Err(e) => {
+                flag_bad_state(sim, format!("kv scan error: {e:?}"));
+                break;
+            }
+        };
         if let Some((logical, Entry::Intent)) = parse_key(&k) {
-            let intent = decode_intent(&v).expect("intent decode");
+            let intent = match decode_intent(&v) {
+                Ok(i) => i,
+                Err(e) => {
+                    flag_bad_state(sim, format!("intent at {logical:?} does not decode: {e:?}"));
+                    continue;
+                }
+            };
             let lock = intent.top().map_or(RowLockMode::NoKeyUpdate, |t| t.lock);
             out.push(OwnedIntent {
                 key: logical.to_vec(),
@@ -532,17 +572,19 @@ fn full_state_checks(sim: &mut Sim) {
     // exclusive side lives in intent top layers, the shared side in the
     // row-lock table; two exclusives cannot coexist on one key — that is
     // I-ONE-INTENT, caught above as a count mismatch).
-    let table = sim.locks.as_ref().expect("lock manager").row_table();
+    // The shared side comes from the ghost ledger of granted shared locks,
+    // not from the lock table under test.
+    let visible = sim.core.visible_ts();
     for it in &intents {
         if !holds_exclusively(sim, it.owner) {
             continue;
         }
-        for (h, m, _) in table.holders(&it.key) {
-            if h != it.owner && holds_exclusively(sim, h) && m.conflicts_with(it.lock) {
+        for (h, m) in sim.ghost.shared_holders(&it.key, visible, sim.core.epoch()) {
+            if h != it.owner && m.conflicts_with(it.lock) {
                 sim.violate(
                     "I-LOCK",
                     format!(
-                        "{:?} (intent lock {:?}) and {h:?} (shared {m:?}) conflict on {:?}",
+                        "{:?} (intent lock {:?}) and {h:?} (shared {m:?}, granted to it per the ghost ledger) conflict on {:?}",
                         it.owner, it.lock, it.key
                     ),
                 );
@@ -552,13 +594,37 @@ fn full_state_checks(sim: &mut Sim) {
     }
 }
 
+/// An exclusive-mode statement was applied: no other live txn may hold a
+/// conflicting shared lock on the key according to the ghost ledger (a live
+/// KEY SHARE holder must block a DELETE / key-changing UPDATE, a live SHARE
+/// holder any UPDATE; the engine had to wait or fail instead of applying).
+pub fn applied_vs_ledger(sim: &mut Sim, tid: TxnId, stmt: Stmt) {
+    let (key, mode) = match stmt {
+        Stmt::Update(k) => (sim.keys[k].clone(), RowLockMode::NoKeyUpdate),
+        Stmt::Delete(k) | Stmt::LockUpdate(k) => (sim.keys[k].clone(), RowLockMode::Update),
+        _ => return,
+    };
+    let visible = sim.core.visible_ts();
+    for (h, m) in sim.ghost.shared_holders(&key, visible, sim.core.epoch()) {
+        if h != tid && m.conflicts_with(mode) {
+            sim.violate(
+                "I-LOCK(block)",
+                format!(
+                    "{tid:?} applied {stmt:?} ({mode:?}) while {h:?} holds {m:?} on {key:?} (ghost ledger)"
+                ),
+            );
+            return;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // I-LIVE
 // ---------------------------------------------------------------------------
 
 /// Every holder whose lock on `key` conflicts with `mode` right now,
-/// recomputed from ghost lock ownership (the intents in the KV and the shared
-/// lock table, minus ended holders and `except`; ended = aborted or a
+/// recomputed from ghost lock ownership (the intents in the KV and the ghost
+/// ledger of granted shared locks, minus ended holders and `except`; ended = aborted or a
 /// visible commit, §6).
 fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) -> Vec<TxnId> {
     let mut out = Vec::new();
@@ -572,9 +638,11 @@ fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) 
             out.push(it.owner);
         }
     }
-    let table = sim.locks.as_ref().expect("lock manager").row_table();
-    for (h, m, _) in table.holders(key) {
-        if h != except && holds_exclusively(sim, h) && m.conflicts_with(mode) && !out.contains(&h) {
+    for (h, m) in sim
+        .ghost
+        .shared_holders(key, sim.core.visible_ts(), sim.core.epoch())
+    {
+        if h != except && m.conflicts_with(mode) && !out.contains(&h) {
             out.push(h);
         }
     }
@@ -836,6 +904,7 @@ pub fn i_ww_check(sim: &mut Sim, _core: &Core<super::SimKv>, tid: &TxnId, stmt: 
         Stmt::Delete(k) => (sim.keys[k].clone(), RowLockMode::Update),
         Stmt::LockUpdate(k) => (sim.keys[k].clone(), RowLockMode::Update),
         Stmt::LockKeyShare(k) => (sim.keys[k].clone(), RowLockMode::KeyShare),
+        Stmt::LockShare(k) => (sim.keys[k].clone(), RowLockMode::Share),
         _ => return,
     };
     let seq0 = sim
@@ -1185,7 +1254,13 @@ pub fn on_reboot(sim: &mut Sim, core: &Core<super::SimKv>) {
             ),
             false,
         ) {
-            let (k, v) = entry.expect("kv scan");
+            let (k, v) = match entry {
+                Ok(kv) => kv,
+                Err(e) => {
+                    flag_bad_state(sim, format!("kv scan error at reboot: {e:?}"));
+                    break;
+                }
+            };
             if let Some(id) = parse_sys_txn_key(&k) {
                 if v.len() == 8 {
                     let mut b = [0u8; 8];
@@ -1377,8 +1452,13 @@ fn read_at_visible(sim: &Sim, core: &Core<super::SimKv>, key: &[u8]) -> Option<V
         snapshot: core.visible_ts(),
         stmt_seq: 0,
     };
-    let _ = sim;
-    read::read_key(core, &view, key, &ctx, &mut NoSsi).expect("read at visible")
+    match read::read_key(core, &view, key, &ctx, &mut NoSsi) {
+        Ok(v) => v,
+        Err(e) => {
+            flag_bad_state(sim, format!("read of {key:?} at visible_ts failed: {e:?}"));
+            None
+        }
+    }
 }
 
 /// Whether `id`'s write on `key`, committed at `ts`, is visible at
@@ -1417,12 +1497,24 @@ fn write_visible(
         ),
         false,
     ) {
-        let (k, v) = entry.expect("kv scan");
+        let (k, v) = match entry {
+            Ok(kv) => kv,
+            Err(e) => {
+                flag_bad_state(sim, format!("kv scan error: {e:?}"));
+                break;
+            }
+        };
         match parse_key(&k) {
             Some((_, Entry::Intent)) => {
-                let intent = decode_intent(&v).expect("intent");
+                let Ok(intent) = decode_intent(&v) else {
+                    flag_bad_state(sim, format!("intent of {key:?} does not decode"));
+                    continue;
+                };
                 if intent.txn == id {
-                    let top = intent.top().expect("layer");
+                    let Some(top) = intent.top() else {
+                        flag_bad_state(sim, format!("intent of {key:?} has no layer"));
+                        continue;
+                    };
                     let same = match (&top.data, &w) {
                         (LayerData::Write { value, .. }, gw) => {
                             write_value(gw).is_some_and(|x| x == *value)
@@ -1436,7 +1528,13 @@ fn write_visible(
                 }
             }
             Some((_, Entry::Version(vts))) if vts == ts => {
-                let decoded = decode_version(&v).expect("version");
+                let Ok(decoded) = decode_version(&v) else {
+                    flag_bad_state(
+                        sim,
+                        format!("version of {key:?} at {vts:?} does not decode"),
+                    );
+                    continue;
+                };
                 let same = match (&decoded, &w) {
                     (nucleus_txn::encoding::VersionValue::Live { payload, .. }, gw) => {
                         write_value(gw).is_some_and(|x| x == *payload)
@@ -1470,6 +1568,11 @@ pub fn after_crash_checks(sim: &mut Sim) {
 /// The end-of-run battery: the drained system's quiescent state and the
 /// committed fold (lost updates).
 pub fn final_checks(sim: &mut Sim, core: &Core<super::SimKv>) {
+    final_checks_inner(sim, core);
+    flush_bad_state(sim);
+}
+
+fn final_checks_inner(sim: &mut Sim, core: &Core<super::SimKv>) {
     // No current-epoch intents remain (older-epoch ones are cleaned lazily,
     // §7.2).
     for it in scan_intents(sim) {

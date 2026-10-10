@@ -10,6 +10,46 @@
 //! owns its `Core`; the RR/SER snapshot guards borrow it and live on the era
 //! driver's stack, so a crash ends the era (sessions die, as in a real
 //! crash) and the next era reopens the store.
+//!
+//! # What this simulator does NOT reach (read before trusting a green run)
+//!
+//! **Out of reach by construction (single-threaded scheduler):**
+//! - Mutation seeds 4 and 46 are latch-free races between real threads
+//!   (a window inside one latch-free critical section); a scheduler that
+//!   runs one step at a time cannot interleave inside it. They are not
+//!   simulated and not faked.
+//! - Mutation N2 (the truncation condition on the view counter) needs a
+//!   registered view that spans a resolver step. The simulator's views live
+//!   inside a single step (a read, a check), so no view is open across a
+//!   `Resolver::run_once`; the condition is covered by the crate's own
+//!   truncation tests (`internal_tests/truncation.rs`), not here.
+//!
+//! **Paths that are NOT simulated (card-level gap, F3):** there is no
+//! upsert (`INSERT ... ON CONFLICT`), no FK parent write, no FOR SHARE with
+//! an FK check and no deferred-constraint workload. The crate offers these
+//! (`insert_on_conflict`, `fk_check_child`) only as blocking calls, and this
+//! card forbids blocking APIs in the simulator; the step variants do not
+//! exist. The compensating coverage is the G2 checker and the crate's own
+//! C-T2c tests. Whether the crate should grow step variants so that the
+//! simulator can drive them is a card-level decision for the integrator.
+//!
+//! **Weights and gaps that cannot be closed here:**
+//! - Cancellation is the program's planned self-cancel mid-wait (one in
+//!   eight); there is no timeout-driven cancel (no wall clocks) and no
+//!   `lock_timeout` / NOWAIT / SKIP LOCKED statements.
+//! - Relation and advisory locks and DDL are not part of the workload, so
+//!   the SSI DDL side (§8.2) and relation-level SIREADs are never exercised.
+//! - MemKv has two levels: GC mutations whose effect needs a third level
+//!   (a tombstone dropped while an older version survives in a deeper,
+//!   untouched file) are observationally equivalent here.
+//! - A livelock is only found by the step bound (`I-LIVE(bound)`, 2000
+//!   steps; clean runs finish near 750 at most); a livelock that needs more
+//!   steps than the bound to show would be missed.
+//! - The oracles do not read the lock table under test: the shared side of
+//!   I-LOCK and the I-LIVE(c) graph use a ghost ledger of the shared locks
+//!   the simulator was granted (`ghost.rs`), but the exclusive side still
+//!   reads the intents in the KV (an intent is data the simulator may scan
+//!   through the public view API).
 
 pub mod check;
 pub mod ghost;
@@ -95,6 +135,8 @@ pub struct OpWeights {
     pub insert: usize,
     pub lock_update: usize,
     pub lock_key_share: usize,
+    /// FOR SHARE.
+    pub lock_share: usize,
     pub savepoint: usize,
     pub rollback_to: usize,
 }
@@ -108,6 +150,7 @@ impl OpWeights {
             + self.insert
             + self.lock_update
             + self.lock_key_share
+            + self.lock_share
             + self.savepoint
             + self.rollback_to
     }
@@ -176,6 +219,7 @@ impl Config {
                     insert: 100,
                     lock_update: 50,
                     lock_key_share: 100,
+                    lock_share: 40,
                     savepoint: 50,
                     rollback_to: 50,
                 },
@@ -207,6 +251,7 @@ impl Config {
                     insert: 50,
                     lock_update: 50,
                     lock_key_share: 250,
+                    lock_share: 60,
                     savepoint: 50,
                     rollback_to: 50,
                 },
@@ -238,6 +283,7 @@ impl Config {
                     insert: 100,
                     lock_update: 0,
                     lock_key_share: 50,
+                    lock_share: 20,
                     savepoint: 50,
                     rollback_to: 50,
                 },
@@ -274,6 +320,7 @@ impl Config {
                     insert: 0,
                     lock_update: 350,
                     lock_key_share: 300,
+                    lock_share: 150,
                     savepoint: 50,
                     rollback_to: 50,
                 },
@@ -305,6 +352,7 @@ impl Config {
                     insert: 150,
                     lock_update: 100,
                     lock_key_share: 50,
+                    lock_share: 40,
                     savepoint: 50,
                     rollback_to: 50,
                 },
@@ -340,6 +388,7 @@ impl Config {
                     insert: 150,
                     lock_update: 0,
                     lock_key_share: 50,
+                    lock_share: 30,
                     savepoint: 50,
                     rollback_to: 50,
                 },
@@ -372,6 +421,7 @@ pub enum Stmt {
     Insert(usize, u64),
     LockUpdate(usize),
     LockKeyShare(usize),
+    LockShare(usize),
     Savepoint,
     RollbackTo,
 }
@@ -415,7 +465,30 @@ fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
     // A savepoint block (§5.5): SAVEPOINT, one or two statements that take
     // locks or write, ROLLBACK TO, and sometimes a statement after it.
     if cfg.sp_block_pm > 0 && rng.chance_pm(cfg.sp_block_pm) {
-        let mut stmts = vec![Stmt::Savepoint, gen_inner_stmt(cfg, rng)];
+        // Often a shared lock before the savepoint and the same key locked
+        // again inside it: ROLLBACK TO must release only the inner grant
+        // (the outer one survives, and must keep blocking DELETEs).
+        let mut stmts = Vec::new();
+        let mut inner = gen_inner_stmt(cfg, rng);
+        if rng.chance_pm(500) {
+            let a = rng.below(nk);
+            let kind_ks = rng.chance_pm(500);
+            let outer = if kind_ks {
+                Stmt::LockKeyShare(a)
+            } else {
+                Stmt::LockShare(a)
+            };
+            stmts.push(outer);
+            inner = match outer {
+                Stmt::LockKeyShare(_) => Stmt::LockKeyShare(a),
+                _ => Stmt::LockShare(a),
+            };
+            if rng.chance_pm(300) {
+                inner = Stmt::LockKeyShare(a);
+            }
+        }
+        stmts.push(Stmt::Savepoint);
+        stmts.push(inner);
         if rng.chance_pm(400) {
             stmts.push(gen_inner_stmt(cfg, rng));
         }
@@ -478,8 +551,10 @@ fn gen_stmt(cfg: &Config, rng: &mut Rng) -> Stmt {
                             pick -= w.lock_update;
                             if pick < w.lock_key_share {
                                 Stmt::LockKeyShare(rng.below(nk))
+                            } else if pick - w.lock_key_share < w.lock_share {
+                                Stmt::LockShare(rng.below(nk))
                             } else {
-                                pick -= w.lock_key_share;
+                                pick -= w.lock_key_share + w.lock_share;
                                 if pick < w.savepoint {
                                     Stmt::Savepoint
                                 } else {
@@ -724,6 +799,11 @@ pub struct Sim {
     pub resolve_pending: bool,
     pub crashes_left: usize,
     pub violation: Option<Violation>,
+    /// A state an oracle could not decode (see `check::flag_bad_state`).
+    pub bad_state: std::cell::RefCell<Option<String>>,
+    /// The first fail-stop the commit pipeline raised (its default hook
+    /// would abort the process); reported as the named violation FAIL-STOP.
+    pub failstop: Arc<Mutex<Option<String>>>,
     pub keys: Vec<Vec<u8>>,
     pub chk: Checker,
     pub probe_points: u64,
@@ -731,6 +811,19 @@ pub struct Sim {
 
 impl Sim {
     pub fn violate(&mut self, inv: &'static str, detail: String) {
+        // An undecodable store state flagged by an oracle outranks whatever
+        // the oracle concluded from the partial data around it.
+        let bad = self.bad_state.borrow_mut().take();
+        let stopped = self
+            .failstop
+            .lock()
+            .map(|mut g| g.take())
+            .unwrap_or_default();
+        let (inv, detail) = match (stopped, bad) {
+            (Some(f), _) => ("FAIL-STOP", f),
+            (None, Some(b)) => ("STATE-DECODE", b),
+            (None, None) => (inv, detail),
+        };
         if self.violation.is_none() {
             self.violation = Some(Violation {
                 inv,
@@ -877,6 +970,18 @@ pub fn collect_actions(sim: &Sim, probe_mode: bool) -> Vec<Action> {
 // ---------------------------------------------------------------------------
 // The probe and the clock
 // ---------------------------------------------------------------------------
+
+/// Records a commit-thread fail-stop instead of aborting the process, so an
+/// engine invariant error under a mutant is a named violation with a trace.
+pub struct RecordFailStop(Arc<Mutex<Option<String>>>);
+
+impl nucleus_txn::commit::FailStop for RecordFailStop {
+    fn on_kv_error(&self, err: &TxnError) {
+        if let Ok(mut g) = self.0.lock() {
+            g.get_or_insert_with(|| format!("commit pipeline fail-stop: {err:?}"));
+        }
+    }
+}
 
 pub struct SimProbe {
     pub sim: Arc<Mutex<Sim>>,
@@ -1299,6 +1404,12 @@ fn build_task(sim: &mut Sim, i: usize, stmt: Stmt) {
             RowOp::Lock(RowLockMode::KeyShare),
             ctx,
         )),
+        Stmt::LockShare(k) => Task::Row(RowOpTask::new(
+            &key(sim, k),
+            None,
+            RowOp::Lock(RowLockMode::Share),
+            ctx,
+        )),
         other => {
             sim.violate("SCHED", format!("unexpected stmt {other:?} for a task"));
             return;
@@ -1532,6 +1643,7 @@ fn pending_wait_key_mode(sim: &Sim, i: usize) -> (Vec<u8>, RowLockMode) {
             (sim.keys[k].clone(), RowLockMode::Update)
         }
         Some(Stmt::LockKeyShare(k)) => (sim.keys[k].clone(), RowLockMode::KeyShare),
+        Some(Stmt::LockShare(k)) => (sim.keys[k].clone(), RowLockMode::Share),
         Some(Stmt::Insert(k, _)) => (sim.keys[k].clone(), RowLockMode::NoKeyUpdate),
         _ => (Vec::new(), RowLockMode::NoKeyUpdate),
     }
@@ -1590,6 +1702,22 @@ fn applied_outcome(
     let tid = sim.sessions[i].txn.as_ref().map(|t| t.id).expect("txn");
     let seq0 = sim.sessions[i].seq0;
     if outcome == RowOutcome::Applied {
+        // The ghost ledger of shared locks: an exclusive-mode statement may
+        // not have been applied over a live conflicting holder; a lock
+        // statement records its grant (from what was asked and answered).
+        check::applied_vs_ledger(sim, tid, stmt);
+        match stmt {
+            Stmt::LockKeyShare(k) => {
+                let key = sim.keys[k].clone();
+                sim.ghost
+                    .grant_shared(tid, &key, RowLockMode::KeyShare, seq0);
+            }
+            Stmt::LockShare(k) => {
+                let key = sim.keys[k].clone();
+                sim.ghost.grant_shared(tid, &key, RowLockMode::Share, seq0);
+            }
+            _ => {}
+        }
         let write_value = sim.sessions[i].write_value;
         if let Some(t) = sim.ghost.txns.get_mut(&tid) {
             t.placement_bound = rec_after;
@@ -1684,6 +1812,9 @@ fn exec_epq(sim: &mut Sim, i: usize) {
         }
         (VersionValue::Live { .. }, Stmt::LockKeyShare(_)) => {
             EpqDecision::Apply(RowOp::Lock(RowLockMode::KeyShare))
+        }
+        (VersionValue::Live { .. }, Stmt::LockShare(_)) => {
+            EpqDecision::Apply(RowOp::Lock(RowLockMode::Share))
         }
         _ => EpqDecision::Skip,
     };
@@ -1862,6 +1993,8 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
         resolve_pending: false,
         crashes_left: cfg.crashes,
         violation: None,
+        bad_state: std::cell::RefCell::new(None),
+        failstop: Arc::new(Mutex::new(None)),
         keys,
         chk: Checker::new(),
         probe_points: 0,
@@ -1897,6 +2030,7 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
             s.current_group.clear();
             s.chk.new_era(&core);
             check::on_reboot(&mut s, &core);
+            check::flush_bad_state(&mut s);
         }
         if sim.lock().expect("sim").violation.is_some() {
             return fail(&sim, seed, "BOOT", String::new());
@@ -1911,7 +2045,11 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
         });
         // §3 step 3: SERIALIZABLE runs wire the SSI observer, so the commit
         // thread fills the §8.5 writer map and the `eocc` updates.
-        let mut cc = CommitConfig::new().with_probe(probe).with_clock(clock);
+        let failstop = Arc::clone(&sim.lock().expect("sim").failstop);
+        let mut cc = CommitConfig::new()
+            .with_probe(probe)
+            .with_clock(clock)
+            .with_fail_stop(Arc::new(RecordFailStop(failstop)));
         if let Some(ssi) = &ssi {
             cc = cc.with_observer(ssi.commit_observer());
         }
@@ -2044,15 +2182,31 @@ fn drive_era(
         if sim.lock().expect("sim").violation.is_some() {
             return EraEnd::Done;
         }
-        // The step bound: abort what is in flight, drain, end.
+        // The step bound is a liveness violation, never a green exit: every
+        // clean run finishes far below it (the tail bound ends the
+        // background-only phase), so reaching it means some session spins
+        // without finishing (a livelock: e.g. a wait that restarts forever).
         {
-            let s = sim.lock().expect("sim");
+            let mut s = sim.lock().expect("sim");
             if s.steps >= s.cfg.max_steps {
-                drop(s);
-                let mut s = sim.lock().expect("sim");
-                force_abort_all(&mut s, core);
-                drop(s);
-                drain(sim, core, pipeline);
+                let phases: Vec<String> = s
+                    .sessions
+                    .iter()
+                    .map(|x| {
+                        format!(
+                            "s{}:{:?} stmt {} retries {}",
+                            x.id, x.phase, x.stmt_idx, x.retries
+                        )
+                    })
+                    .collect();
+                let diag = check::ghost_diag(&s);
+                let bound = s.cfg.max_steps;
+                s.violate(
+                    "I-LIVE(bound)",
+                    format!(
+                        "the run reached its step bound of {bound} without finishing (livelock); sessions: {phases:?}; waits: {diag}"
+                    ),
+                );
                 return EraEnd::Done;
             }
         }
@@ -2319,29 +2473,6 @@ fn drive_era(
 fn session_is_rc(sim: &Arc<Mutex<Sim>>, i: usize) -> bool {
     let s = sim.lock().expect("sim");
     s.cfg.isolation[i % s.cfg.isolation.len()] == Isolation::ReadCommitted
-}
-
-fn force_abort_all(sim: &mut Sim, core: &Core<SimKv>) {
-    for s in sim.sessions.iter_mut() {
-        if let Some(t) = s.txn.take() {
-            let id = t.id;
-            if let Err(e) = core.abort(t) {
-                sim.violate("ABORT", format!("force abort: {e:?}"));
-                return;
-            }
-            if let Some(g) = sim.ghost.txns.get_mut(&id) {
-                g.outcome = ghost::Outcome::Aborted;
-            }
-            s.program = None;
-            s.wait = None;
-            s.pending_wait = None;
-            s.task = None;
-            s.epq = None;
-            s.phase = Phase::Idle;
-        }
-    }
-    sim.trace
-        .push(format!("{:>5} step-bound force abort", sim.steps));
 }
 
 fn retry_or_next(sim: &mut Sim, i: usize) {

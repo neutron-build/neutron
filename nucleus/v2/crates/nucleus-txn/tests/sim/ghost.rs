@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use nucleus_txn::commit::SyncCommit;
 use nucleus_txn::txn::Isolation;
-use nucleus_txn::{Seq, Ts, TxnId};
+use nucleus_txn::{RowLockMode, Seq, Ts, TxnId};
 
 /// One applied write of a txn, in program order (§5.5's write-set shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +103,17 @@ impl GhostTxn {
     }
 }
 
+/// One shared row lock (FOR SHARE / FOR KEY SHARE) the simulator was granted:
+/// the statement asked for `mode` on `key` at statement seq `seq` and the
+/// API answered `Applied`. The ledger is built from that alone.
+#[derive(Debug, Clone)]
+pub struct SharedGrant {
+    pub txn: TxnId,
+    pub key: Vec<u8>,
+    pub mode: RowLockMode,
+    pub seq: Seq,
+}
+
 /// The committed history: every txn known committed with a ts, and its
 /// surviving writes as of its end.
 pub struct Ghost {
@@ -115,6 +126,10 @@ pub struct Ghost {
     pub lost: BTreeSet<Ts>,
     /// The largest ts ever assigned to a txn we know of.
     pub max_ts: Ts,
+    /// The independent ledger of granted shared row locks (I-LOCK's shared
+    /// side, the I-LIVE(c) graph). Entries are dropped by savepoint
+    /// rollback; a txn's entries stop counting when it ends.
+    pub shared: Vec<SharedGrant>,
 }
 
 impl Ghost {
@@ -124,6 +139,7 @@ impl Ghost {
             committed: BTreeMap::new(),
             lost: BTreeSet::new(),
             max_ts: Ts(0),
+            shared: Vec::new(),
         }
     }
 
@@ -225,6 +241,44 @@ impl Ghost {
         if let Some(t) = self.txns.get_mut(&id) {
             t.writes.retain(|w| w.seq < s);
         }
+        // ROLLBACK TO s releases the shared locks taken at seq >= s (§5.5)
+        // and nothing else.
+        self.shared.retain(|g| !(g.txn == id && g.seq >= s));
+    }
+
+    /// Records a granted shared lock.
+    pub fn grant_shared(&mut self, txn: TxnId, key: &[u8], mode: RowLockMode, seq: Seq) {
+        self.shared.push(SharedGrant {
+            txn,
+            key: key.to_vec(),
+            mode,
+            seq,
+        });
+    }
+
+    /// Whether `id` still holds its locks at `visible_ts` (§6, §3.2): it has
+    /// neither been aborted nor lost in a crash nor acked, and it has not
+    /// become a visible commit (a commit record at `ts <= visible_ts` ends
+    /// the holder even before its ack is observed). Pending and
+    /// committed-not-visible txns hold. A crash ends every holder of the
+    /// older epochs (§6: a crash aborts them all).
+    pub fn holds(&self, id: TxnId, visible: Ts, epoch: u32) -> bool {
+        id.epoch == epoch
+            && self.txns.get(&id).is_some_and(|t| {
+                t.outcome == Outcome::Active && !t.known_ts.is_some_and(|ts| ts <= visible)
+            })
+    }
+
+    /// The live shared holders of `key` at `visible_ts`, from the ledger.
+    pub fn shared_holders(&self, key: &[u8], visible: Ts, epoch: u32) -> Vec<(TxnId, RowLockMode)> {
+        let mut out: Vec<(TxnId, RowLockMode)> = Vec::new();
+        for g in &self.shared {
+            if g.key == key && self.holds(g.txn, visible, epoch) && !out.contains(&(g.txn, g.mode))
+            {
+                out.push((g.txn, g.mode));
+            }
+        }
+        out
     }
 }
 
