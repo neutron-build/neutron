@@ -9,6 +9,7 @@
 //! rollback): the deferrable-unique prefix `/i/{idx}/{key}` for entries of a
 //! deferrable unique constraint, `k` itself otherwise.
 
+#[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
