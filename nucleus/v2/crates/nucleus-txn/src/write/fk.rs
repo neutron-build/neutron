@@ -108,7 +108,9 @@ impl<K: OrderedKv> Core<K> {
             match task.step(self, txn)? {
                 Step::Done(RowOutcome::Applied) => return Ok(()),
                 Step::Again => {}
-                Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
+                Step::Wait(targets) => {
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, ctx.lock_deadline()))?
+                }
                 Step::Epq(req) => {
                     fk_epq(&req, matches)?;
                     task.epq_result(EpqDecision::Apply(RowOp::Lock(RowLockMode::KeyShare)))?;

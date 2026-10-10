@@ -140,7 +140,11 @@ impl<K: OrderedKv> Core<K> {
                     // discarded, the wake generation is bumped.
                     self.rollback_to(txn, sa)?;
                     if let Some(targets) = wait {
-                        map_wait_outcome(self.wait_on_any(txn, &targets))?;
+                        map_wait_outcome(self.wait_on_any_deadline(
+                            txn,
+                            &targets,
+                            actx.lock_deadline(),
+                        ))?;
                     }
                     restarts = restarts.saturating_add(1);
                 }
@@ -298,7 +302,11 @@ impl<K: OrderedKv> Core<K> {
             match lock.step(self, txn)? {
                 Step::Done(RowOutcome::Applied) => break,
                 Step::Again => {}
-                Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
+                Step::Wait(targets) => map_wait_outcome(self.wait_on_any_deadline(
+                    txn,
+                    &targets,
+                    actx.lock_deadline(),
+                ))?,
                 Step::Restart => return Ok(Attempt::Restart(None)),
                 other => {
                     return Err(TxnError::Invariant(format!(
@@ -390,7 +398,11 @@ impl<K: OrderedKv> Core<K> {
                 Step::Again => {}
                 // Shared holders (KEY SHARE vs a key-changing update): the
                 // own intent excludes foreign writers, so wait and re-step.
-                Step::Wait(targets) => map_wait_outcome(self.wait_on_any(txn, &targets))?,
+                Step::Wait(targets) => map_wait_outcome(self.wait_on_any_deadline(
+                    txn,
+                    &targets,
+                    actx.lock_deadline(),
+                ))?,
                 other => {
                     return Err(TxnError::Invariant(format!(
                         "ON CONFLICT update of the locked row returned {other:?}"

@@ -253,3 +253,69 @@ fn g0_ssi_committing_no_write_txn_gets_the_exception() {
     assert!(committed_ts(&s, 2).is_some());
     assert!(m.check(&s).is_ok());
 }
+
+/// C-T2c-r4 (gate round-2, mutant A3): a **prepared** (pre-committed, not
+/// committed) write-less T0 gets no exception when T1 runs its own
+/// pre-commit — only the txn committing now does (engine `t1 == committer
+/// && !wrote`). T0 pre-commits first (it IS committing then, so it is
+/// spared); T1's pre-commit then sees T0 merely prepared and must abort the
+/// pivot on T0 -> T1 -> T2. Mutant A3 (grant the exception to any
+/// prepared-or-later write-less txn) leaves T1 un-aborted and fails here.
+#[test]
+fn g0_ssi_prepared_write_less_gets_no_exception() {
+    let m = SsiModel::default();
+    let mut s = m.init();
+    let run = |s: &State, acts: &[Action]| {
+        let mut cur = s.clone();
+        for a in acts {
+            cur = m.next(&cur, a);
+        }
+        cur
+    };
+    // LateOpt: T0 reads h1 and never writes; T1 reads h0 before T2 commits.
+    s = run(
+        &s,
+        &[
+            Action::Choose(Work::LateOpt),
+            Action::Step(0),
+            Action::Step(0),
+            Action::Step(0),
+            Action::Step(0),
+            Action::Step(1),
+            Action::Step(1),
+        ],
+    );
+    // T2 writes h0 and commits first.
+    s = run(
+        &s,
+        &[
+            Action::Step(2),
+            Action::Step(2),
+            Action::Step(2),
+            Action::Step(2),
+            Action::Drain(1),
+            Action::InsMap(0),
+            Action::SetStatus(0),
+            Action::Advance(0),
+            Action::Step5(0),
+            Action::Resolve(2, Key::Heap(0)),
+        ],
+    );
+    // T1 reads h0 (skipping T2's version: T1 -> T2), writes h1 (T0's SIREAD:
+    // T0 -> T1).
+    s = run(&s, &[Action::Step(1), Action::Step(1), Action::Step(1)]);
+    // T0 pre-commits: it is the txn committing now, write-less, and
+    // commit_ts(T2)=1 > S(T0)=0 — the exception applies, nothing fires.
+    s = run(&s, &[Action::Step(0)]);
+    assert!(raised_structures(&s, 1).is_empty());
+    assert!(
+        committed_ts(&s, 0).is_none(),
+        "T0 is prepared, not committed"
+    );
+    // T1 pre-commits: T0 is now write-less but NOT the txn committing — no
+    // exception, the pivot aborts itself with 40001 on T0 -> T1 -> T2.
+    s = run(&s, &[Action::Step(1)]);
+    assert_eq!(raised_structures(&s, 1), vec![(0, 1, Some(2))]);
+    assert!(committed_ts(&s, 0).is_none());
+    assert!(m.check(&s).is_ok());
+}
