@@ -87,7 +87,7 @@ pub fn reduce_config(
     let mut cur = choices.to_vec();
     loop {
         let mut progressed = false;
-        for step in 0..5 {
+        for step in 0..6 {
             let mut cand = cfg.clone();
             let ok = match step {
                 0 if cand.sessions > 2 => {
@@ -108,6 +108,14 @@ pub fn reduce_config(
                 }
                 4 if cand.crashes > 0 => {
                     cand.crashes -= 1;
+                    true
+                }
+                // Only for a livelock (`I-LIVE(bound)`), which fails at any smaller
+                // bound too: halving the step bound shortens its trace. For any
+                // other invariant a lower bound would turn a clean tail into a
+                // false livelock.
+                5 if wanted == "I-LIVE(bound)" && cand.max_steps > 64 => {
+                    cand.max_steps /= 2;
                     true
                 }
                 _ => false,

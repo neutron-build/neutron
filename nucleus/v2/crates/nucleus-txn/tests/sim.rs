@@ -54,7 +54,7 @@ fn expect_green(cfg: &Config, seed: u64) {
             let m = min::shrink(&v.choices, wanted, |l| replay(cfg, l));
             let (cfg2, m2) = min::reduce_config(cfg, &m, wanted, replay);
             msg.push_str(&format!(
-                "minimized schedule ({} choices, was {}; config sessions={} keys={} txns={} stmts={} crashes={}): {:?}\n",
+                "minimized schedule ({} choices, was {}; config sessions={} keys={} txns={} stmts={} crashes={} max_steps={}): {:?}\n",
                 m2.len(),
                 v.choices.len(),
                 cfg2.sessions,
@@ -62,6 +62,7 @@ fn expect_green(cfg: &Config, seed: u64) {
                 cfg2.txns_per_session,
                 cfg2.max_stmts,
                 cfg2.crashes,
+                cfg2.max_steps,
                 m2
             ));
             if let RunResult::Violation(v2) = run(&cfg2, seed, Some(m2.clone())) {
