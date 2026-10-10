@@ -556,9 +556,15 @@ fn full_state_checks(sim: &mut Sim) {
 // I-LIVE
 // ---------------------------------------------------------------------------
 
-/// The conflicting holders of `key` against `mode` (ghost lock ownership:
-/// the intents in the KV and the shared lock table, minus ended holders and
-/// `except`).
+/// The holders a waiter requesting `mode` on `key` is blocked by right now,
+/// recomputed from ghost lock ownership (the intents in the KV and the shared
+/// lock table, minus ended holders and `except`), in the order §5.1 checks
+/// them: a conflicting foreign intent first; only when there is none, every
+/// conflicting shared holder (§6: an edge to every conflicting holder of
+/// that kind). A waiter parked on an intent owner has no edge to a shared
+/// holder yet: it re-runs §5.1 after the owner ends and waits again then, so
+/// a cycle that would only close through that second wait is not a deadlock
+/// the check may report (the owner it waits for is not itself blocked).
 fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) -> Vec<TxnId> {
     let mut out = Vec::new();
     for it in scan_intents(sim) {
@@ -569,6 +575,9 @@ fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) 
         {
             out.push(it.owner);
         }
+    }
+    if !out.is_empty() {
+        return out;
     }
     let table = sim.locks.as_ref().expect("lock manager").row_table();
     for (h, m, _) in table.holders(key) {
@@ -1043,7 +1052,10 @@ fn i_ser(sim: &mut Sim) {
             let mut why = String::new();
             for m in &members {
                 if let Some(t) = sim.ghost.txns.get(m) {
-                    why.push_str(&format!("{m:?}: {:?}; ", t.events));
+                    why.push_str(&format!(
+                        "{m:?} S={:?} outcome={:?} ts={:?}: {:?}; ",
+                        t.snapshot, t.outcome, t.known_ts, t.events
+                    ));
                 }
             }
             sim.violate(
@@ -1427,7 +1439,28 @@ pub fn final_checks(sim: &mut Sim, core: &Core<super::SimKv>) {
                             cur = Some(c + 1);
                         }
                         None => {
-                            bad = Some(format!("{id:?} incremented absent key {key:?}"));
+                            let history: Vec<String> = committed
+                                .iter()
+                                .filter_map(|(ts, tid)| {
+                                    let tt = sim.ghost.txns.get(tid)?;
+                                    let ws: Vec<String> = tt
+                                        .writes
+                                        .iter()
+                                        .filter(|x| x.key == *key)
+                                        .map(|x| format!("s{} {:?}", x.seq, x.kind))
+                                        .collect();
+                                    (!ws.is_empty()).then(|| {
+                                        format!(
+                                            "{tid:?}@{ts:?} {:?} S={:?}: {ws:?}",
+                                            tt.isolation, tt.snapshot
+                                        )
+                                    })
+                                })
+                                .collect();
+                            bad = Some(format!(
+                                "{id:?} incremented absent key {key:?}; txn events {:?}; committed history of the key: {history:?}",
+                                t.events
+                            ));
                         }
                     },
                     GWrite::Delete => cur = None,

@@ -382,8 +382,8 @@ impl Program {
     }
 }
 
-/// Program generation draws from the **aux** stream (see `sched.rs`): it is
-/// not part of the recorded choice list, so minimizing a schedule does not
+/// Program generation draws from a per-(session, txn) stream (see
+/// `sched.rs`): it is not part of the recorded choice list, so minimizing a schedule does not
 /// reshuffle the programs it replays.
 fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
     let nk = cfg.keys;
@@ -522,6 +522,10 @@ pub struct Session {
     pub cancel: Option<CancelHandle>,
     /// The txn's snapshot (RR/SER).
     pub snapshot_ts: Ts,
+    /// The RC statement's snapshot, registered by the era driver for the
+    /// statement's life (the guard sits in the driver's `guards[i]`): §3.1,
+    /// GC's watermark must not pass a running statement's snapshot.
+    pub rc_snap: Ts,
     pub program: Option<Program>,
     pub retries: u32,
     pub stmt_idx: usize,
@@ -555,6 +559,7 @@ impl Session {
             txn: None,
             cancel: None,
             snapshot_ts: Ts(0),
+            rc_snap: Ts(0),
             program: None,
             retries: 0,
             stmt_idx: 0,
@@ -637,6 +642,9 @@ fn act_name(a: &Action) -> String {
 // Sim: everything the scheduler and the probe share
 // ---------------------------------------------------------------------------
 
+/// Background-only steps allowed after every session has finished.
+const TAIL_STEPS: u64 = 40;
+
 pub struct Sim {
     pub cfg: Config,
     pub choices: Choices,
@@ -651,6 +659,12 @@ pub struct Sim {
     pub budgets: Vec<usize>,
     pub steps: u64,
     pub era_steps: u64,
+    /// Maintenance actions (GC) run so far: the GC rotation advances with
+    /// it, never with the global step count, so removing a session step
+    /// from a replayed schedule does not change which GC action is offered.
+    pub maint: u64,
+    /// Steps taken with every session finished (bounded by `TAIL_STEPS`).
+    pub tail_steps: u64,
     /// Submitted, not yet acked, in submission (channel) order.
     pub inflight: Vec<TxnId>,
     /// The group `process_group` is currently running.
@@ -714,14 +728,22 @@ fn resolver_needed(sim: &Sim) -> bool {
 /// Whether `a` may run while the commit thread's `process_group` is on the
 /// stack (the probe): never the commit actor or a crash, and never a
 /// session step that touches the era driver's snapshot guards (begin /
-/// commit / abort run only in the main loop).
-fn probe_runnable(a: &Action) -> bool {
+/// commit / abort, and an RC statement's start, run only in the main loop).
+fn probe_runnable(sim: &Sim, a: &Action) -> bool {
     match a {
         Action::CommitThread | Action::Crash => false,
-        Action::Sess(_, sa) => !matches!(
-            sa,
-            SAction::BeginTxn | SAction::RetryBeginTxn | SAction::CommitSubmit | SAction::AbortTxn
-        ),
+        Action::Sess(i, sa) => {
+            let rc_start = *sa == SAction::StartStmt
+                && sim.cfg.isolation[i % sim.cfg.isolation.len()] == Isolation::ReadCommitted;
+            !rc_start
+                && !matches!(
+                    sa,
+                    SAction::BeginTxn
+                        | SAction::RetryBeginTxn
+                        | SAction::CommitSubmit
+                        | SAction::AbortTxn
+                )
+        }
         _ => true,
     }
 }
@@ -777,15 +799,11 @@ pub fn collect_actions(sim: &Sim, probe_mode: bool) -> Vec<Action> {
         out.push(Action::Resolver);
     }
     if sim.ssi.as_ref().is_some_and(|s| s.stats().entries > 0) {
-        // Rotated with the GC actor below: one maintenance action per step,
-        // so background actors cannot starve the sessions.
-        if sim.steps.is_multiple_of(2) {
-            out.push(Action::Retention);
-        }
+        out.push(Action::Retention);
     }
     if sim.gc.is_some() {
-        // One GC action per step, rotating.
-        match sim.steps % 5 {
+        // One GC action offered at a time, rotating with the GC steps run.
+        match sim.maint % 5 {
             0 => out.push(Action::GcPublish),
             1 => out.push(Action::GcTomb),
             2 => out.push(Action::GcFlush),
@@ -799,7 +817,7 @@ pub fn collect_actions(sim: &Sim, probe_mode: bool) -> Vec<Action> {
         }
     }
     if probe_mode {
-        out.retain(probe_runnable);
+        out.retain(|a| probe_runnable(sim, a));
     }
     out
 }
@@ -858,7 +876,8 @@ impl Sim {
             if self.choices.pick(1000) >= self.cfg.yield_pm {
                 break;
             }
-            let idx = self.choices.pick(acts.len());
+            let names: Vec<String> = acts.iter().map(act_name).collect();
+            let idx = self.choices.pick_action(&names);
             let act = acts[idx];
             self.trace.push(format!(
                 "  {:>5} probe+ {} [{:?}",
@@ -884,6 +903,16 @@ impl Sim {
 
 pub fn exec(sim: &mut Sim, act: Action) {
     let core = Arc::clone(&sim.core);
+    if matches!(
+        act,
+        Action::GcPublish
+            | Action::GcTomb
+            | Action::GcFlush
+            | Action::GcCompact
+            | Action::GcCompactAll
+    ) {
+        sim.maint += 1;
+    }
     match act {
         Action::Sess(i, sa) => exec_sess(sim, &core, i, sa),
         Action::Resolver => {
@@ -1002,7 +1031,7 @@ fn exec_sess(sim: &mut Sim, core: &Core<SimKv>, i: usize, sa: SAction) {
                     // A write/lock statement that needs no pre-read: the RC
                     // statement snapshot is taken now.
                     let snapshot = if iso == Isolation::ReadCommitted {
-                        core.visible_ts()
+                        sim.sessions[i].rc_snap
                     } else {
                         sim.sessions[i].snapshot_ts
                     };
@@ -1334,9 +1363,9 @@ fn read_key_stmt(
             (snapshot, v)
         }
         Isolation::ReadCommitted => {
-            // §3.1: RC takes a fresh, registered statement snapshot.
-            let guard = core.registry.take_snapshot();
-            let snapshot = guard.ts();
+            // §3.1: RC takes a fresh statement snapshot, registered by the
+            // era driver at StartStmt and held until the next statement.
+            let snapshot = sim.sessions[i].rc_snap;
             let view = core.open_view();
             let v = match read::read_key(core, &view, &key, &mk(snapshot), &mut NoSsi) {
                 Ok(v) => v,
@@ -1402,13 +1431,11 @@ fn scan_stmt(
             }
         }
         _ => {
-            // The RC scan's statement snapshot stays registered until the
-            // scan's view is done (`_guard` drops at the end of this arm).
-            let (snapshot, _guard) = if iso == Isolation::RepeatableRead {
-                (sim.sessions[i].snapshot_ts, None)
+            // The RC scan's statement snapshot was registered at StartStmt.
+            let snapshot = if iso == Isolation::RepeatableRead {
+                sim.sessions[i].snapshot_ts
             } else {
-                let g = core.registry.take_snapshot();
-                (g.ts(), Some(g))
+                sim.sessions[i].rc_snap
             };
             let ctx = ReadCtx {
                 txn: tid,
@@ -1668,7 +1695,21 @@ fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
     } else if ghost_cycle && check::ghost_cycle_is_parked(sim, waiter) {
         sim.violate(
             "I-LIVE(b)",
-            format!("deadlock check of {waiter:?} found no cycle but a parked ghost cycle exists"),
+            format!(
+                "deadlock check of {waiter:?} found no cycle but a parked ghost cycle exists \
+                 (diagnostics only: wait_edges {:?}, wait_slots {:?}, waits {:?})",
+                core.wait_edges(),
+                core.wait_slots(),
+                sim.sessions
+                    .iter()
+                    .filter_map(|x| x.wait.as_ref().map(|w| (
+                        x.id,
+                        w.handle.waiter(),
+                        w.key.clone(),
+                        w.mode
+                    )))
+                    .collect::<Vec<_>>()
+            ),
         );
     }
 }
@@ -1753,6 +1794,8 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
         budgets: vec![cfg.txns_per_session; cfg.sessions],
         steps: 0,
         era_steps: 0,
+        maint: 0,
+        tail_steps: 0,
         inflight: Vec::new(),
         current_group: Vec::new(),
         resolve_pending: false,
@@ -1804,10 +1847,13 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
         let clock = Arc::new(SimClock {
             sim: Arc::clone(&sim),
         });
-        let mut pipeline = match CommitPipeline::with_config(
-            Arc::clone(&core),
-            CommitConfig::new().with_probe(probe).with_clock(clock),
-        ) {
+        // §3 step 3: SERIALIZABLE runs wire the SSI observer, so the commit
+        // thread fills the §8.5 writer map and the `eocc` updates.
+        let mut cc = CommitConfig::new().with_probe(probe).with_clock(clock);
+        if let Some(ssi) = &ssi {
+            cc = cc.with_observer(ssi.commit_observer());
+        }
+        let mut pipeline = match CommitPipeline::with_config(Arc::clone(&core), cc) {
             Ok(p) => p,
             Err(e) => return fail(&sim, seed, "BOOT", format!("pipeline: {e:?}")),
         };
@@ -1951,10 +1997,22 @@ fn drive_era(
         let next = {
             let mut s = sim.lock().expect("sim");
             let acts = collect_actions(&s, false);
-            if acts.is_empty() {
+            // Once every session is done and only background actors (GC,
+            // resolver, retention) remain, they get a bounded tail of steps
+            // (a few GC rounds over the finished history), then the run
+            // drains and ends: GC offers actions forever.
+            let sessions_done = s.budgets.iter().all(|&b| b == 0)
+                && s.sessions
+                    .iter()
+                    .all(|x| x.txn.is_none() && x.ticket.is_none());
+            if sessions_done && s.inflight.is_empty() {
+                s.tail_steps += 1;
+            }
+            if acts.is_empty() || (sessions_done && s.tail_steps > TAIL_STEPS) {
                 None
             } else {
-                let idx = s.choices.pick(acts.len());
+                let names: Vec<String> = acts.iter().map(act_name).collect();
+                let idx = s.choices.pick_action(&names);
                 Some(acts[idx])
             }
         };
@@ -2040,9 +2098,10 @@ fn drive_era(
                 if !retry {
                     s.budgets[i] -= 1;
                     let cfg = s.cfg.clone();
-                    let mut aux = std::mem::replace(&mut s.choices.aux, Rng::new(0));
-                    let program = gen_program(&cfg, i, &mut aux);
-                    s.choices.aux = aux;
+                    // Per-(session, txn) stream: stable under schedule edits.
+                    let nth = cfg.txns_per_session - s.budgets[i] - 1;
+                    let mut prng = s.choices.program_rng(i, nth);
+                    let program = gen_program(&cfg, i, &mut prng);
                     let ssn = &mut s.sessions[i];
                     ssn.program = Some(program);
                 }
@@ -2060,6 +2119,20 @@ fn drive_era(
                 }
                 guards[i] = guard;
                 drop(s);
+            }
+            Action::Sess(i, SAction::StartStmt) if session_is_rc(sim, i) => {
+                // §3.1: an RC statement takes a fresh snapshot and keeps it
+                // registered for the statement's life (the new guard is
+                // taken before the previous statement's is dropped).
+                let g = core.registry.take_snapshot();
+                let mut s = sim.lock().expect("sim");
+                s.sessions[i].rc_snap = g.ts();
+                guards[i] = Some(g);
+                exec(&mut s, act);
+                check::post_step(&mut s);
+                if s.violation.is_some() {
+                    return EraEnd::Done;
+                }
             }
             Action::Sess(i, SAction::CommitSubmit) => {
                 let (txn, sync) = {
@@ -2139,6 +2212,13 @@ fn drive_era(
             }
         }
     }
+}
+
+/// Whether session `i` runs READ COMMITTED (its isolation is the config's,
+/// round-robin).
+fn session_is_rc(sim: &Arc<Mutex<Sim>>, i: usize) -> bool {
+    let s = sim.lock().expect("sim");
+    s.cfg.isolation[i % s.cfg.isolation.len()] == Isolation::ReadCommitted
 }
 
 fn force_abort_all(sim: &mut Sim, core: &Core<SimKv>) {
