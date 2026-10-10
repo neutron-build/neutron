@@ -46,26 +46,28 @@ fn expect_green(cfg: &Config, seed: u64) {
             v.inv, v.config, v.seed, v.step, v.detail
         );
         if std::env::var("SIM_MINIMIZE").as_deref() == Ok("1") {
-            let cfg2 = cfg.clone();
             let wanted = v.inv;
-            let seed2 = seed;
-            let choices = v.choices.clone();
-            let m = min::minimize(&choices, wanted, move |list| {
-                match run(&cfg2, seed2, Some(list.to_vec())) {
-                    RunResult::Violation(x) => Some(x.inv.to_string()),
-                    RunResult::Ok(_) => None,
-                }
-            });
+            let replay = |c: &Config, list: &[u64]| match run(c, seed, Some(list.to_vec())) {
+                RunResult::Violation(x) => Some((x.inv.to_string(), x.choices.clone())),
+                RunResult::Ok(_) => None,
+            };
+            let m = min::shrink(&v.choices, wanted, |l| replay(cfg, l));
+            let (cfg2, m2) = min::reduce_config(cfg, &m, wanted, replay);
             msg.push_str(&format!(
-                "minimized schedule ({} choices, was {}): {:?}\n",
-                m.len(),
-                choices.len(),
-                m
+                "minimized schedule ({} choices, was {}; config sessions={} keys={} txns={} stmts={} crashes={}): {:?}\n",
+                m2.len(),
+                v.choices.len(),
+                cfg2.sessions,
+                cfg2.keys,
+                cfg2.txns_per_session,
+                cfg2.max_stmts,
+                cfg2.crashes,
+                m2
             ));
-            if let RunResult::Violation(v2) = run(cfg, seed, Some(m.clone())) {
+            if let RunResult::Violation(v2) = run(&cfg2, seed, Some(m2.clone())) {
                 msg.push_str(&format!(
                     "minimized trace ({} steps, violation {}):\n{}\n",
-                    m.len(),
+                    m2.len(),
                     v2.inv,
                     v2.trace
                 ));

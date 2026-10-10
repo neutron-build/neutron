@@ -2,7 +2,14 @@
 //! `SIM_CONFIG=<name>`) runs exactly one seed and prints the full trace; the
 //! minimizer repeatedly tries removing chunks (halves, then quarters, ...
 //! then single choices) from a failing choice list and keeps any shorter
-//! list that still fails with the same invariant.
+//! list that still fails with the same invariant; `shrink` iterates it to a
+//! fixpoint on the consumed schedule and `reduce_config` then tries a smaller
+//! configuration.
+
+// `sim_regressions.rs` shares this module but replays schedules directly.
+#![allow(dead_code)]
+
+use super::Config;
 
 /// Minimizes a failing choice list against `run`: a closure that runs a
 /// schedule and returns the invariant name it fails with (`None` = no
@@ -37,6 +44,96 @@ pub fn minimize(start: &[u64], wanted: &str, run: impl Fn(&[u64]) -> Option<Stri
         chunk = chunk.div_ceil(2);
     }
     cur
+}
+
+/// One replay's answer for the shrinkers: the invariant it failed with and
+/// the choices it actually consumed up to the violation (a replay whose
+/// list ran out draws the rest from the seed's stream, so a short list is
+/// not the whole schedule; the consumed list is).
+pub type Replay = (String, Vec<u64>);
+
+/// [`minimize`] to a fixpoint, normalized: each round's result is replaced
+/// by the choices the failing replay actually consumed, so the returned
+/// list is the complete schedule (its length is the trace length) and it
+/// replays exactly with no fallback draws.
+pub fn shrink(start: &[u64], wanted: &str, run: impl Fn(&[u64]) -> Option<Replay>) -> Vec<u64> {
+    let mut cur = start.to_vec();
+    loop {
+        let m = minimize(&cur, wanted, |l| run(l).map(|r| r.0));
+        let eff = match run(&m) {
+            Some((inv, taken)) if inv == wanted => taken,
+            _ => m,
+        };
+        if eff.len() < cur.len() {
+            cur = eff;
+        } else {
+            return cur;
+        }
+    }
+}
+
+/// Config reduction (after schedule minimization): tries fewer sessions,
+/// fewer keys, fewer txns per session, fewer statements per txn and fewer
+/// crashes, keeping each reduction under which the failure survives with the
+/// same invariant (the schedule is re-shrunk under the reduced config).
+/// `run(cfg, list)` replays the failing seed on `cfg`.
+pub fn reduce_config(
+    cfg: &Config,
+    choices: &[u64],
+    wanted: &str,
+    run: impl Fn(&Config, &[u64]) -> Option<Replay>,
+) -> (Config, Vec<u64>) {
+    let mut cfg = cfg.clone();
+    let mut cur = choices.to_vec();
+    loop {
+        let mut progressed = false;
+        for step in 0..5 {
+            let mut cand = cfg.clone();
+            let ok = match step {
+                0 if cand.sessions > 2 => {
+                    cand.sessions -= 1;
+                    true
+                }
+                1 if cand.keys > 3 => {
+                    cand.keys -= 1;
+                    true
+                }
+                2 if cand.txns_per_session > 1 => {
+                    cand.txns_per_session -= 1;
+                    true
+                }
+                3 if cand.max_stmts > 1 => {
+                    cand.max_stmts -= 1;
+                    true
+                }
+                4 if cand.crashes > 0 => {
+                    cand.crashes -= 1;
+                    true
+                }
+                _ => false,
+            };
+            if !ok {
+                continue;
+            }
+            let replay = |l: &[u64]| run(&cand, l);
+            let Some((inv, taken)) = replay(&cur) else {
+                continue;
+            };
+            if inv != wanted {
+                continue;
+            }
+            let shrunk = shrink(&taken, wanted, replay);
+            // A reduced config is progress when the schedule did not grow.
+            if shrunk.len() <= cur.len() {
+                cfg = cand;
+                cur = shrunk;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return (cfg, cur);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +191,35 @@ mod tests {
         let failing = vec![1u64, 5u64, 2u64];
         let min = minimize(&failing, "OTHER", toy_run);
         assert_eq!(min, failing, "a different invariant is not minimized");
+    }
+
+    /// The consumed-schedule normalization: a replay that runs past its list
+    /// draws the remainder (here: zeros) and reports what it consumed.
+    #[test]
+    fn shrink_returns_the_consumed_schedule_and_is_strictly_shorter() {
+        let run = |list: &[u64]| {
+            // Fails once it has seen a 7 followed by any choice; draws 0s
+            // when the list ends before that.
+            let mut taken = Vec::new();
+            let mut seen7 = false;
+            for i in 0.. {
+                let c = list.get(i).copied().unwrap_or(0);
+                taken.push(c);
+                if seen7 {
+                    return Some(("BOOM".to_string(), taken));
+                }
+                seen7 = c == 7;
+                if i > list.len() + 4 {
+                    return None;
+                }
+            }
+            None
+        };
+        let start = vec![1u64, 2, 7, 3, 4, 5, 6];
+        let m = shrink(&start, "BOOM", run);
+        assert!(m.len() < start.len(), "{m:?}");
+        let (inv, taken) = run(&m).expect("minimized schedule fails");
+        assert_eq!(inv, "BOOM");
+        assert_eq!(taken, m, "the shrunk list is the complete schedule");
     }
 }
