@@ -34,6 +34,16 @@
 //! simulator can drive them is a card-level decision for the integrator.
 //!
 //! **Weights and gaps that cannot be closed here:**
+//! - No partial-layer `ROLLBACK TO`: every savepoint block rolls back to a
+//!   point before the txn's first write to the key, so all of that txn's
+//!   layers on the key are dropped. The §5.5 "restore the previous top
+//!   layer" path (an earlier layer of the same intent survives) and its
+//!   `intent_count` bookkeeping in `removal.rs` are never exercised (found by
+//!   the C-SIM re-gate: a mutant running `bookkeeping` on a partial drop was
+//!   uncaught at 500 seeds). Closing it means emitting a write to the key
+//!   before the SAVEPOINT in `gen_program`.
+//! - No oracle reads the commit-path `/sys/log` record, so an atomicity
+//!   break between the log write and the commit record is invisible here.
 //! - Cancellation is the program's planned self-cancel mid-wait (one in
 //!   eight); there is no timeout-driven cancel (no wall clocks) and no
 //!   `lock_timeout` / NOWAIT / SKIP LOCKED statements.
