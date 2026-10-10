@@ -279,6 +279,7 @@ impl<K: OrderedKv> Core<K> {
 
     /// §5.3.1(3): conflict on row `r`, found by the arbiter key `arbiter`
     /// (a `/u/` entry that names `r`, or the `/t/` key itself).
+    #[allow(clippy::too_many_arguments)] // one struct per call site would not be plainer
     fn arbiter_conflict(
         &self,
         txn: &Txn,

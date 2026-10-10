@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use c_t2c_support::{assert_count_exact, as_u64, ok, u64v, Fixed, Rig};
+use c_t2c_support::{as_u64, assert_count_exact, ok, u64v, Fixed, Rig};
 use nucleus_txn::txn::{CancelHandle, Isolation};
 use nucleus_txn::write::{OnConflictAction, OnConflictResult, ProposedRow, RowOp, StmtCtx};
 use nucleus_txn::{RowLockMode, TxnError};
@@ -79,10 +79,7 @@ fn preload_row(rig: &Rig, pk: &str, v: u64, k: &str) {
 /// instead of hanging the binary. `f` gets everything it owns moved in
 /// (`Arc`-shared core, the txn) and may move the txn back out through
 /// the result, so the caller can keep using the session.
-fn bounded<R: Send + 'static>(
-    leash: &CancelHandle,
-    f: impl FnOnce() -> R + Send + 'static,
-) -> R {
+fn bounded<R: Send + 'static>(leash: &CancelHandle, f: impl FnOnce() -> R + Send + 'static) -> R {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
@@ -101,7 +98,10 @@ fn bounded<R: Send + 'static>(
 
 /// The pinned post-55P03 state (card item 4): no wait edges, no wait
 /// slots, I-COUNT exact.
-fn assert_clean_timeout(core: &nucleus_txn::boot::Core<nucleus_kv::MemKv>, txn: &nucleus_txn::txn::Txn) {
+fn assert_clean_timeout(
+    core: &nucleus_txn::boot::Core<nucleus_kv::MemKv>,
+    txn: &nucleus_txn::txn::Txn,
+) {
     assert!(
         core.wait_edges().is_empty(),
         "the timed-out waiter left wait edges: {:?}",
@@ -153,10 +153,7 @@ fn precheck_wait_honors_lock_timeout() {
         );
         (r, w)
     });
-    assert_eq!(
-        out.map(|o| o.result),
-        Err(TxnError::LockNotAvailable)
-    );
+    assert_eq!(out.map(|o| o.result), Err(TxnError::LockNotAvailable));
     assert!(start.elapsed() < Duration::from_secs(1), "prompt 55P03");
     assert_clean_timeout(&rig.core, &w);
     // The blocker finishes; a retry of the statement succeeds.
@@ -211,10 +208,7 @@ fn arbiter_lock_wait_honors_lock_timeout() {
         );
         (r, w)
     });
-    assert_eq!(
-        out.map(|o| o.result),
-        Err(TxnError::LockNotAvailable)
-    );
+    assert_eq!(out.map(|o| o.result), Err(TxnError::LockNotAvailable));
     assert!(start.elapsed() < Duration::from_secs(1), "prompt 55P03");
     assert_clean_timeout(&rig.core, &w);
     // The blocker finishes; a retry of the statement succeeds.
@@ -269,10 +263,7 @@ fn update_path_wait_honors_lock_timeout() {
         );
         (r, w)
     });
-    assert_eq!(
-        out.map(|o| o.result),
-        Err(TxnError::LockNotAvailable)
-    );
+    assert_eq!(out.map(|o| o.result), Err(TxnError::LockNotAvailable));
     assert!(start.elapsed() < Duration::from_secs(1), "prompt 55P03");
     assert_clean_timeout(&rig.core, &w);
     // The blocker finishes; a retry of the statement succeeds (the failed
@@ -333,12 +324,11 @@ fn fk_child_wait_honors_lock_timeout() {
     rig.resolve();
     let seq = ok(c.next_seq());
     let s = rig.core.visible_ts();
-    ok(rig.core.fk_check_child(
-        &c,
-        &StmtCtx::new(s, seq, seq).internal(),
-        b"/t/p/1",
-        &|v| v == b"k1",
-    ));
+    ok(rig
+        .core
+        .fk_check_child(&c, &StmtCtx::new(s, seq, seq).internal(), b"/t/p/1", &|v| {
+            v == b"k1"
+        }));
     ok(rig.core.abort(c));
 }
 
