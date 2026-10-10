@@ -48,6 +48,15 @@
 //! skip but never repeat, across crashes, torn writes and concurrent
 //! callers. Sequences stay off the commit path and out of every txn's
 //! write set.
+//!
+//! Card C-T5 adds §10's catalog (`catalog`): relation and index rows as
+//! versioned data under `/sys/catalog/` placed through the §5 write path
+//! (DDL is thereby transactional and takes AccessExclusive first), storage
+//! ids and oids from persisted block counters (never reused), and the
+//! boot-time rebuild of the SSI storage map from the committed catalog.
+//! The `/sys/catalog/` compaction-filter carve-out of §10 is **not** in:
+//! `TxnGcFilter` lives in `gc/filter.rs`, outside that card's file scope —
+//! see `catalog`'s module docs.
 
 pub mod boot;
 pub mod commit;
@@ -73,6 +82,9 @@ pub mod locks;
 
 // C-T7, appended the same way.
 pub mod seq;
+
+// C-T5, likewise appended (rustfmt does not sort it back in).
+pub mod catalog;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -13,8 +13,13 @@
 //!   streams (seed 33). It drops a version only when a newer version
 //!   `<= W` of the same logical key passed by earlier in the same stream;
 //!   the newest version `<= W` is never dropped, tombstone or not
-//!   (seed 3). `/sys/` keys are never dropped (§10; the catalog does not
-//!   exist yet, so no `/sys/` key qualifies).
+//!   (seed 3). `/sys/` keys are never dropped (§10). **The
+//!   `/sys/catalog/` carve-out of §10 (catalog rows are versioned,
+//!   GC-able data) is not implemented**: `TxnGcFilter` lives in
+//!   `gc/filter.rs`, which is outside card C-T5's Touch-only scope, so
+//!   the filter still keeps every `/sys/` key, including the catalog's —
+//!   catalog rows accumulate versions until the filter is extended (the
+//!   C-T5 escalation; see `catalog`'s module docs).
 //! - [`GcJob::install`] wires the filter into the KV. The durable W it
 //!   hands out comes from `/sys/gc_w` itself (read through a registered
 //!   view), never from `registry.published_w()`: a `publish_computed_w`
