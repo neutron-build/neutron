@@ -1072,30 +1072,28 @@ fn i_ser(sim: &mut Sim) {
                     }
                 }
             }
-            // rw: the writer of the next version of the key (or, for scans,
-            // any committed write) above the read's S. The range covers the
-            // read's key for point reads and `[lo, end(hi)]` for scans (all
-            // logical keys are the same length, so the end key of the last
-            // key bounds the range exactly).
-            let range = r
-                .range
-                .clone()
-                .unwrap_or_else(|| (r.key.clone(), end_key(&r.key)));
-            let mut above: Vec<Ts> = sim
-                .keys
-                .iter()
-                .filter(|k| k.as_slice() >= range.0.as_slice() && k.as_slice() < range.1.as_slice())
-                .flat_map(|k| {
-                    sim.ghost
-                        .versions_of(k)
-                        .into_iter()
-                        .filter(|(ts, _)| *ts > r.snapshot)
-                        .map(|(ts, _)| ts)
-                        .collect::<Vec<_>>()
-                })
+            // rw: the writer of the next version of the key above the read's
+            // S. A scan has one ghost read per key of its range (absent keys
+            // included), so phantoms are the absent keys' next *live*
+            // version: a tombstone over an absent key changes no match, and
+            // a key the txn itself wrote (skipped above) is not a read of
+            // the committed row, so a concurrent delete of it is no
+            // anti-dependency (PostgreSQL's snapshot read would see the old
+            // tuple, but the scan's result does not depend on it).
+            let read_live = sim
+                .ghost
+                .version_at(&r.key, r.snapshot)
+                .is_some_and(|(_, w)| write_value(w).is_some());
+            let mut above: Vec<(Ts, bool)> = sim
+                .ghost
+                .versions_of(&r.key)
+                .into_iter()
+                .filter(|(ts, _)| *ts > r.snapshot)
+                .map(|(ts, w)| (ts, write_value(w).is_some()))
                 .collect();
             above.sort_unstable();
-            if let Some(next) = above.first() {
+            let next = above.iter().find(|(_, live)| read_live || *live);
+            if let Some((next, _)) = next {
                 if let Some(w) = sim.ghost.committed.get(next) {
                     if ser.contains(w) {
                         edge(
@@ -1103,7 +1101,12 @@ fn i_ser(sim: &mut Sim) {
                             &mut why_edges,
                             *id,
                             *w,
-                            format!("rw k{} S={}", key_index_of(sim, &r.key), r.snapshot.0),
+                            format!(
+                                "rw{} k{} S={}",
+                                if r.range.is_some() { " (scan)" } else { "" },
+                                key_index_of(sim, &r.key),
+                                r.snapshot.0
+                            ),
                         );
                     }
                 }

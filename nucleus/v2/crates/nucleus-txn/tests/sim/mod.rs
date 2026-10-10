@@ -1023,7 +1023,9 @@ fn exec_sess(sim: &mut Sim, core: &Core<SimKv>, i: usize, sa: SAction) {
                 s.streak = 0;
             }
             match stmt {
-                Stmt::Read(_) | Stmt::Scan(..) | Stmt::Update(_) => {
+                Stmt::Read(_) | Stmt::Scan(..) | Stmt::Update(_) | Stmt::Delete(_) => {
+                    // UPDATE and DELETE find the row first, like an executor's
+                    // scan: an absent row is a no-op, never a blind tombstone.
                     sim.sessions[i].phase = Phase::ReadStmt;
                 }
                 Stmt::Savepoint => {
@@ -1266,7 +1268,7 @@ fn exec_read(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
     let iso = sim.sessions[i].iso();
     let (snapshot, results): ReadOut = match stmt {
         Stmt::Scan(lo, hi) => scan_stmt(sim, core, i, iso, lo, hi),
-        Stmt::Read(k) | Stmt::Update(k) => {
+        Stmt::Read(k) | Stmt::Update(k) | Stmt::Delete(k) => {
             let (s, v) = read_key_stmt(sim, core, i, iso, k);
             (s, vec![(k, v)])
         }
@@ -1307,7 +1309,7 @@ fn exec_read(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
     if failed {
         return;
     }
-    if let Stmt::Update(_) = stmt {
+    if let Stmt::Update(_) | Stmt::Delete(_) = stmt {
         let v = sim
             .ghost
             .txns
