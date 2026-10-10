@@ -8,8 +8,15 @@
 
 mod decode;
 mod encode;
+pub mod kernels;
+pub mod registry;
 mod value;
 
+pub use kernels::{
+    compare, compare_key, eq, hash, in_bounds, try_compare, try_compare_key, try_eq, try_hash,
+    try_in_bounds,
+};
+pub use registry::{ops, OpOid, TypeKind, TypeOps, OP_BTREE_CMP, OP_EQ, OP_HASH};
 pub use value::{Array, ArrayDim, Collation, Decimal, Interval, Jsonb, KeyType, Numeric, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
