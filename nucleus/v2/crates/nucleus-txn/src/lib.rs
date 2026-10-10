@@ -31,6 +31,15 @@
 //! dangerous-structure check atomic with prepare and enqueue, abort cleanup,
 //! retired-id SIREAD promotion and §8.6 retention. It plugs into the
 //! `SsiHook`, `CommitObserver` and `ReadObserver` seams.
+//! Card C-T2b adds the in-memory lock side of §6 (`locks`): the shared
+//! row-lock table (KEY SHARE, SHARE) behind C-T2's `RowLocks` seam,
+//! relation locks and transaction-scoped advisory locks with NOWAIT /
+//! SKIP LOCKED / `lock_timeout`, the `ReleaseHook` that drops relation and
+//! advisory locks at commit step 5, abort and `ROLLBACK TO`, and — in
+//! `wait` — the wait-for graph with waker-side edge removal, deadlock
+//! detection after `deadlock_timeout` (40P01, one victim per cycle) and
+//! the split begin / poll / deadlock-check / end wait steps C-SIM drives
+//! on one thread.
 
 pub mod boot;
 pub mod commit;
@@ -49,6 +58,10 @@ pub mod txn;
 pub mod visibility;
 pub mod wait;
 pub mod write;
+
+// C-T2b, appended at the end of the module list (a separate group, so
+// rustfmt does not sort it back in).
+pub mod locks;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
