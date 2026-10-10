@@ -41,12 +41,14 @@ fn declared_read_only_spared_when_t3_after_snapshot() {
     assert!(rig.has_edge(i2, i3));
     // T1 -> T2 -> T3 with commit_ts(T3) > S(T1) and T1 declared read-only:
     // the exception applies, no 40001 — and the pivot T2 is not doomed.
-    rig.commit(t1).expect("read-only T1 is spared by the exception");
+    rig.commit(t1)
+        .expect("read-only T1 is spared by the exception");
     assert!(!rig.ssi.is_doomed(i2), "the spared structure dooms nobody");
     // Unlike the no-write clause, the declared flag follows T1 forever:
     // T2's own later commit re-checks the triple with T1 still read-only
     // (commit_ts(T3) > S(T1)) and is spared too.
-    rig.commit(t2).expect("T2 commits after the spared structure");
+    rig.commit(t2)
+        .expect("T2 commits after the spared structure");
 }
 
 /// The same structure, but T1 is not declared READ ONLY — it simply never
@@ -69,7 +71,8 @@ fn committing_no_write_txn_gets_the_exception() {
     rig.update(&t2, b"b", b"y");
     assert!(rig.has_edge(i1, i2));
     assert!(rig.has_edge(i2, i3));
-    rig.commit(t1).expect("a committing txn with no writes gets the exception");
+    rig.commit(t1)
+        .expect("a committing txn with no writes gets the exception");
     assert!(!rig.ssi.is_doomed(i2), "t1's own check dooms nobody");
     // At T2's later commit the same triple is re-evaluated with T1 no
     // longer the txn committing: §8.3 does not extend the exception to a
