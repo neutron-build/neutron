@@ -3,15 +3,19 @@
 //! inserts and deletes children of 2 parents (FK child check), another
 //! deletes and re-inserts the parents (FK parent check, RESTRICT or NO
 //! ACTION); a checker thread verifies I-FK at registered snapshots while
-//! they run. Afterwards: each arbiter key has exactly one live row whose
-//! value is (committed upserts on the key) - 1 — no lost upsert, never two
-//! rows for one key — no committed child without its parent, no intent
-//! remains once the jobs drain, and every surviving status entry has count
-//! 0 (I-COUNT).
+//! they run. A recycler thread repeatedly deletes each key's winning row
+//! (round 3: key recycling — every key goes dead→live many times, so the
+//! insert step's unique check keeps meeting concurrent winners, the M5/M10
+//! window), quiescing the key while it checks the generation's oracle.
+//! Afterwards: each arbiter key has exactly one live row whose value is
+//! (committed upserts on the key since its last recycle) - 1 — no lost
+//! upsert, never two rows for one key — no committed child without its
+//! parent, no intent remains once the jobs drain, and every surviving
+//! status entry has count 0 (I-COUNT).
 
 mod c_t2c_support;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,9 +40,48 @@ const UPSERTS_PER_THREAD: usize = 250;
 const KEYS: usize = 4;
 const PARENTS: usize = 2;
 const FK_TXNS: usize = 300;
+const RECYCLES_PER_KEY: usize = 25;
 const WATCHDOG_AFTER: Duration = Duration::from_secs(15);
 
 type Cancels = Arc<Mutex<Vec<CancelHandle>>>;
+
+/// The upserters' shared ledger (one mutex with the recycler's quiesce
+/// guard): per arbiter key, the committed upserts of the current
+/// generation (`gen`, reset by each recycle), the all-time total, the
+/// recycler's gate, and the upserts begun but not yet recorded
+/// (`in_flight`). `in_flight == 0` with `recycling` held means every
+/// committed upsert on the key is both recorded and visible, so the
+/// recycler reads an exact generation state.
+#[derive(Default)]
+struct Ledger {
+    gen: [u64; KEYS],
+    total: [u64; KEYS],
+    recycling: [bool; KEYS],
+    in_flight: [usize; KEYS],
+}
+
+type Ledgers = Arc<Mutex<Ledger>>;
+
+impl Ledger {
+    /// Tries one key: `None` while the recycler holds it (the caller
+    /// retries off the lock — never spin under the mutex, the recycler
+    /// needs it to clear the gate). Marks the upsert in flight on success.
+    fn try_pick(&mut self, rng: &mut Rng) -> Option<usize> {
+        let k = (rng.next() as usize) % KEYS;
+        if self.recycling[k] {
+            None
+        } else {
+            self.in_flight[k] += 1;
+            Some(k)
+        }
+    }
+
+    fn record(&mut self, k: usize) {
+        self.gen[k] += 1;
+        self.total[k] += 1;
+        self.in_flight[k] -= 1;
+    }
+}
 
 struct Rng(u64);
 impl Rng {
@@ -272,6 +315,107 @@ fn parent_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnE
     Ok(deletes)
 }
 
+/// Reads one key at a registered snapshot of the latest state (exact key,
+/// no prefix ranges: `/t/r/3-1` must not match `/t/r/3-17`).
+fn read_live(core: &Core<MemKv>, key: &[u8]) -> Option<Vec<u8>> {
+    let snap = core.registry.take_snapshot();
+    let view = core.open_view();
+    read_key(
+        core,
+        &view,
+        key,
+        &ReadCtx {
+            txn: nucleus_txn::TxnId { epoch: 0, n: 0 },
+            snapshot: snap.ts(),
+            stmt_seq: 0,
+        },
+        &mut NoSsi,
+    )
+    .expect("read_live")
+}
+
+/// One key recycle (round 3): quiesce the key, check the current
+/// generation's oracle (exactly the committed upserts since the last
+/// recycle, no lost update: `v == gen - 1`), then delete the winning row
+/// and its entry in one txn — the key goes dead, and the next upserts race
+/// to re-insert it (the M5/M10 window). `/t/` first, then the `/u/` entry.
+fn recycle_key(core: &Core<MemKv>, cancels: &Cancels, ledger: &Ledgers, k: usize) {
+    // Gate new upserts, drain the in-flight ones. in_flight == 0 means
+    // every committed upsert on k is recorded (record precedes the
+    // decrement) and its commit is acked, so visible.
+    let mut l = ledger.lock().expect("ledger");
+    l.recycling[k] = true;
+    while l.in_flight[k] > 0 {
+        drop(l);
+        std::thread::sleep(Duration::from_millis(1));
+        l = ledger.lock().expect("ledger");
+    }
+    let gen = l.gen[k];
+    drop(l);
+
+    // The entry names the generation's winning row; dead key → nothing
+    // to recycle (and then gen must be 0: no upsert since the reset).
+    let Some(pk) = read_live(core, &arb_key(k)) else {
+        assert_eq!(gen, 0, "key {k}: a live generation with no entry");
+        ledger.lock().expect("ledger").recycling[k] = false;
+        return;
+    };
+    let row = read_live(core, &row_key(&pk))
+        .unwrap_or_else(|| panic!("key {k}: the live entry names {pk:?} but its row is dead"));
+    let (_, v) = parse_row(&row);
+    assert!(
+        gen >= 1 && v == gen - 1,
+        "key {k}: generation oracle v={v} vs gen={gen} (lost upsert)"
+    );
+
+    // Delete the row and the entry in one txn (a plain RC txn, like
+    // the upserts; each statement at its own seq). No upserter can
+    // interfere: the key is gated.
+    let txn = begin(core, cancels);
+    let snap = core.registry.take_snapshot();
+    let seq0 = txn.next_seq().expect("seq");
+    let rk = row_key(&pk);
+    core.row_op(
+        &txn,
+        &rk,
+        None,
+        RowOp::Delete,
+        StmtCtx::new(snap.ts(), seq0, seq0),
+        &mut Fixed(RowOp::Delete),
+    )
+    .expect("delete row");
+    let seq1 = txn.next_seq().expect("seq");
+    core.row_op(
+        &txn,
+        &arb_key(k),
+        None,
+        RowOp::Delete,
+        StmtCtx::new(snap.ts(), seq1, seq1),
+        &mut Fixed(RowOp::Delete),
+    )
+    .expect("delete entry");
+    drop(snap);
+    core.commit(txn, SyncCommit::Off).expect("recycle commit");
+
+    let mut l = ledger.lock().expect("ledger");
+    l.gen[k] = 0;
+    l.recycling[k] = false;
+}
+
+/// The recycler: round-robins the keys, `RECYCLES_PER_KEY` passes each,
+/// pacing so the upserters refill every generation.
+fn recycler_thread(core: Arc<Core<MemKv>>, cancels: Cancels, ledger: Ledgers) -> usize {
+    let mut recycles = 0;
+    for _ in 0..RECYCLES_PER_KEY {
+        for k in 0..KEYS {
+            recycle_key(&core, &cancels, &ledger, k);
+            recycles += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    recycles
+}
+
 /// Live rows of `[lo, hi)` at a registered snapshot of the latest state.
 fn live_rows(core: &Core<MemKv>, s: Ts, lo: &[u8], hi: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let view = core.open_view();
@@ -359,20 +503,26 @@ fn stress_upserts_and_fk() {
         })
     };
 
-    let committed: Arc<Mutex<HashMap<usize, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let ledger: Ledgers = Arc::new(Mutex::new(Ledger::default()));
     let mut upserters = Vec::new();
     for th in 0..UPSERT_THREADS {
         let core = Arc::clone(&core);
         let cancels = Arc::clone(&cancels);
-        let committed = Arc::clone(&committed);
+        let ledger = Arc::clone(&ledger);
         upserters.push(std::thread::spawn(move || {
             let mut rng = Rng(0x9e3779b97f4a7c15 ^ (th as u64 + 7));
             for i in 0..UPSERTS_PER_THREAD {
-                let k = (rng.next() as usize) % KEYS;
+                // A gated key (being recycled) is skipped, off the lock.
+                let k = loop {
+                    match ledger.lock().expect("ledger").try_pick(&mut rng) {
+                        Some(k) => break k,
+                        None => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                };
                 let pk = format!("{th}-{i}");
                 match upsert_txn(&core, &cancels, k, &pk) {
                     Ok(OnConflictResult::Inserted | OnConflictResult::Updated) => {
-                        *committed.lock().expect("committed").entry(k).or_default() += 1;
+                        ledger.lock().expect("ledger").record(k);
                     }
                     Ok(other) => panic!("unexpected upsert result {other:?}"),
                     Err(TxnError::QueryCanceled) => panic!("upserter cancelled: watchdog fired"),
@@ -381,6 +531,12 @@ fn stress_upserts_and_fk() {
             }
         }));
     }
+    let recycler = {
+        let core = Arc::clone(&core);
+        let cancels = Arc::clone(&cancels);
+        let ledger = Arc::clone(&ledger);
+        std::thread::spawn(move || recycler_thread(core, cancels, ledger))
+    };
     let children = {
         let core = Arc::clone(&core);
         let cancels = Arc::clone(&cancels);
@@ -411,6 +567,11 @@ fn stress_upserts_and_fk() {
             std::panic::resume_unwind(e);
         }
     }
+    let recycles = match recycler.join() {
+        Ok(n) => n,
+        Err(e) => std::panic::resume_unwind(e),
+    };
+    assert_eq!(recycles, KEYS * RECYCLES_PER_KEY);
     let inserted = match children.join() {
         Ok(r) => r.expect("child thread"),
         Err(e) => std::panic::resume_unwind(e),
@@ -454,8 +615,10 @@ fn stress_upserts_and_fk() {
         }
     }
 
-    // The upsert oracle: per arbiter key exactly one live row, value =
-    // committed upserts - 1, and the entry names it.
+    // The upsert oracle: per arbiter key exactly one live row of the
+    // current generation, value = its committed upserts - 1, and the
+    // entry names it. A key whose generation is empty (its last recycle
+    // was never followed by an upsert) has no row and no entry.
     let s = core.visible_ts();
     let rows = live_rows(&core, s, b"/t/r/", b"/t/r0");
     let mut by_key: BTreeMap<usize, Vec<(Vec<u8>, u64)>> = BTreeMap::new();
@@ -463,14 +626,21 @@ fn stress_upserts_and_fk() {
         let (k, v) = parse_row(&value);
         by_key.entry(k).or_default().push((key, v));
     }
-    let committed = committed.lock().expect("committed").clone();
-    let total: u64 = committed.values().sum();
+    let ledger = ledger.lock().expect("ledger");
+    let total: u64 = ledger.total.iter().sum();
     assert_eq!(total as usize, UPSERT_THREADS * UPSERTS_PER_THREAD);
     for k in 0..KEYS {
-        let n = committed.get(&k).copied().unwrap_or(0);
+        let gen = ledger.gen[k];
         let rows = by_key.get(&k).cloned().unwrap_or_default();
-        if n == 0 {
-            assert!(rows.is_empty());
+        if gen == 0 {
+            assert!(
+                rows.is_empty(),
+                "key {k}: rows {rows:?} with an empty generation"
+            );
+            assert!(
+                read_live(&core, &arb_key(k)).is_none(),
+                "key {k}: a live entry with an empty generation"
+            );
             continue;
         }
         assert_eq!(
@@ -478,12 +648,18 @@ fn stress_upserts_and_fk() {
             1,
             "key {k}: rows {rows:?} (two rows for one key)"
         );
-        assert_eq!(rows[0].1, n - 1, "key {k}: lost upsert ({n} committed)");
+        assert_eq!(
+            rows[0].1,
+            gen - 1,
+            "key {k}: lost upsert ({gen} committed this generation)"
+        );
         let entry = live_rows(&core, s, &arb_key(k), &[arb_key(k), vec![0xff]].concat());
         assert_eq!(entry.len(), 1);
         assert_eq!(row_key(&entry[0].1), rows[0].0, "the entry names the row");
     }
+    drop(ledger);
     check_ifk(&core);
 }
 
-const _: () = assert!(UPSERT_THREADS * UPSERTS_PER_THREAD + 2 * FK_TXNS >= 2000);
+const _: () =
+    assert!(UPSERT_THREADS * UPSERTS_PER_THREAD + 2 * FK_TXNS + KEYS * RECYCLES_PER_KEY >= 2000);
