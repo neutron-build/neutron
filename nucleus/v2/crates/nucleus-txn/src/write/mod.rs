@@ -32,7 +32,9 @@
 //! right time, through [`Txn::queue_event`](crate::txn::Txn::queue_event)).
 
 mod ctx;
+mod fk;
 mod layer;
+mod on_conflict;
 mod savepoint;
 mod step;
 mod unique;
@@ -46,6 +48,10 @@ pub use ssi_api::{NoSsiHook, SsiHook};
 pub use ctx::{
     CommittedVersion, Epq, EpqDecision, EpqRequest, LockWait, RowOp, RowOutcome, SkipReason,
     StmtCtx, UniqueRule, WaitSet,
+};
+pub use fk::FkParentMode;
+pub use on_conflict::{
+    DoUpdateFn, IndexEntry, OnConflictAction, OnConflictOutcome, OnConflictResult, ProposedRow,
 };
 pub use step::{KeyOpTask, RowOpTask, Step};
 pub use unique::{DefStep, DeferrableCheckTask};
