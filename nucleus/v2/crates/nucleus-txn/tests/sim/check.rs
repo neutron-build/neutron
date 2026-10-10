@@ -905,17 +905,24 @@ fn read_at(
     read::read_key(core, &view, key, &ctx, &mut NoSsi)
 }
 
-/// Every registered snapshot (the live RR/SER txn snapshots) reading every
-/// key, before a GC step.
+/// Every registered snapshot reading every key, before a GC step: the live
+/// RR/SER txn snapshots, the running RC statements' snapshots, and the
+/// witness any new txn could take right now (`visible_ts`; it is never below
+/// the watermark a GC step may publish, so it stays registrable after).
 pub fn gc_guard_reads(sim: &mut Sim) -> Vec<(Ts, Vec<Option<Vec<u8>>>)> {
     let core = Arc::clone(&sim.core);
-    let snaps: Vec<Ts> = sim
+    let mut snaps: Vec<Ts> = sim
         .sessions
         .iter()
         .filter(|s| s.txn.is_some())
-        .filter(|s| matches!(s.iso(), Isolation::RepeatableRead | Isolation::Serializable))
-        .map(|s| s.snapshot_ts)
+        .filter_map(|s| match s.iso() {
+            Isolation::RepeatableRead | Isolation::Serializable => Some(s.snapshot_ts),
+            Isolation::ReadCommitted => s.rc_live.then_some(s.rc_snap),
+        })
         .collect();
+    snaps.push(core.visible_ts());
+    snaps.sort_unstable();
+    snaps.dedup();
     let mut out = Vec::new();
     for s in snaps {
         let mut row = Vec::new();

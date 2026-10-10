@@ -571,6 +571,9 @@ pub struct Session {
     /// statement's life (the guard sits in the driver's `guards[i]`): §3.1,
     /// GC's watermark must not pass a running statement's snapshot.
     pub rc_snap: Ts,
+    /// Whether `rc_snap` is currently registered (an RC statement started
+    /// and its guard is held).
+    pub rc_live: bool,
     pub program: Option<Program>,
     pub retries: u32,
     pub stmt_idx: usize,
@@ -605,6 +608,7 @@ impl Session {
             cancel: None,
             snapshot_ts: Ts(0),
             rc_snap: Ts(0),
+            rc_live: false,
             program: None,
             retries: 0,
             stmt_idx: 0,
@@ -2212,6 +2216,7 @@ fn drive_era(
                     t.snapshot = snap;
                 }
                 guards[i] = guard;
+                s.sessions[i].rc_live = false;
                 drop(s);
             }
             Action::Sess(i, SAction::StartStmt) if session_is_rc(sim, i) => {
@@ -2221,6 +2226,7 @@ fn drive_era(
                 let g = core.registry.take_snapshot();
                 let mut s = sim.lock().expect("sim");
                 s.sessions[i].rc_snap = g.ts();
+                s.sessions[i].rc_live = true;
                 guards[i] = Some(g);
                 exec(&mut s, act);
                 check::post_step(&mut s);
