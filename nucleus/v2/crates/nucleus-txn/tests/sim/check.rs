@@ -200,9 +200,6 @@ fn battery(sim: &mut Sim) {
     if sim.cfg.check_i_ser && sim.ghost.committed.len() > sim.chk.i_ser_at {
         sim.chk.i_ser_at = sim.ghost.committed.len();
         i_ser(sim);
-        if sim.violation.is_some() {
-            return;
-        }
     }
 }
 
@@ -251,11 +248,7 @@ fn walk_record(sim: &mut Sim) {
                         sim.ghost.note_ts(id, ts);
                         // I-WAL-ORDER: every intent write of the txn
                         // preceded its commit record.
-                        let bound = sim
-                            .ghost
-                            .txns
-                            .get(&id)
-                            .map_or(0, |t| t.placement_bound);
+                        let bound = sim.ghost.txns.get(&id).map_or(0, |t| t.placement_bound);
                         if bound > i {
                             sim.violate(
                                 "I-WAL-ORDER",
@@ -318,9 +311,7 @@ fn observe_statuses(sim: &mut Sim) {
                         if active {
                             sim.violate(
                                 "STATUS",
-                                format!(
-                                    "{id:?} was aborted by someone other than its session"
-                                ),
+                                format!("{id:?} was aborted by someone other than its session"),
                             );
                             return;
                         }
@@ -499,7 +490,7 @@ fn full_state_checks(sim: &mut Sim) {
     }
     // Ended-but-not-truncated txns: counts exact, and the write-set log
     // names every owned intent while the handle lives.
-    for (id, _) in sim.ghost.txns.iter() {
+    for id in sim.ghost.txns.keys() {
         if id.epoch != epoch {
             continue;
         }
@@ -518,13 +509,15 @@ fn full_state_checks(sim: &mut Sim) {
             return;
         }
         if let Some(keys) = owned.get(id) {
-            if let Some(s) = sim.sessions.iter().find(|s| {
-                s.txn.as_ref().is_some_and(|t| t.id == *id)
-            }) {
+            if let Some(s) = sim
+                .sessions
+                .iter()
+                .find(|s| s.txn.as_ref().is_some_and(|t| t.id == *id))
+            {
                 let log = s.txn.as_ref().expect("txn").write_set_keys();
-                let missing = keys.iter().any(|k| {
-                    !log.iter().any(|(lk, _)| lk.as_slice() == k.as_slice())
-                });
+                let missing = keys
+                    .iter()
+                    .any(|k| !log.iter().any(|(lk, _)| lk.as_slice() == k.as_slice()));
                 if missing {
                     sim.violate(
                         "I-COUNT",
@@ -913,10 +906,10 @@ fn i_ser(sim: &mut Sim) {
     // (from, to, why) — provenance for the audit dump.
     let mut why_edges: Vec<(TxnId, TxnId, String)> = Vec::new();
     let edge = |g: &mut BTreeMap<TxnId, BTreeSet<TxnId>>,
-                    why: &mut Vec<(TxnId, TxnId, String)>,
-                    a: TxnId,
-                    b: TxnId,
-                    reason: String| {
+                why: &mut Vec<(TxnId, TxnId, String)>,
+                a: TxnId,
+                b: TxnId,
+                reason: String| {
         if a != b && g.entry(a).or_default().insert(b) {
             why.push((a, b, reason));
         }
@@ -935,7 +928,7 @@ fn i_ser(sim: &mut Sim) {
                 if !ser.contains(id) {
                     return None;
                 }
-                let live = sim.ghost.txns.get(id).map_or(false, |t| {
+                let live = sim.ghost.txns.get(id).is_some_and(|t| {
                     let mut last = None;
                     for w in &t.writes {
                         if w.key == *key {
@@ -950,7 +943,7 @@ fn i_ser(sim: &mut Sim) {
                     .txns
                     .get(id)
                     .is_some_and(|t| t.writes.iter().any(|w| w.key == *key))
-                    .then(|| (*ts, *id, live))
+                    .then_some((*ts, *id, live))
             })
             .collect();
         writers.sort_unstable();
@@ -969,7 +962,9 @@ fn i_ser(sim: &mut Sim) {
         }
     }
     for id in &ser {
-        let Some(t) = sim.ghost.txns.get(id) else { continue };
+        let Some(t) = sim.ghost.txns.get(id) else {
+            continue;
+        };
         for r in &t.reads {
             // A read satisfied by the txn's own write consumed no committed
             // version and creates no dependency on other writers (neither
@@ -1029,7 +1024,7 @@ fn i_ser(sim: &mut Sim) {
             }
         }
     }
-    for (n, _) in &g {
+    for n in g.keys() {
         if cycle_through(&g, *n) {
             let mut desc = String::new();
             for (a, bs) in &g {
@@ -1048,10 +1043,7 @@ fn i_ser(sim: &mut Sim) {
             let mut why = String::new();
             for m in &members {
                 if let Some(t) = sim.ghost.txns.get(m) {
-                    why.push_str(&format!(
-                        "{m:?}: {:?}; ",
-                        t.events
-                    ));
+                    why.push_str(&format!("{m:?}: {:?}; ", t.events));
                 }
             }
             sim.violate(
@@ -1169,7 +1161,7 @@ pub fn on_reboot(sim: &mut Sim, core: &Core<super::SimKv>) {
     // was never durable and may be reassigned, §7.2's boot).
     let hwm = core.ts_hwm();
     let max_surviving = loaded.values().max().copied().unwrap_or(Ts(0));
-    if hwm.0 + 1 <= max_surviving.0 {
+    if hwm.0 < max_surviving.0 {
         sim.violate(
             "NEXT-TS",
             format!(
@@ -1212,16 +1204,14 @@ pub fn on_reboot(sim: &mut Sim, core: &Core<super::SimKv>) {
         .txns
         .iter()
         .filter(|(_, t)| {
-            matches!(t.outcome, ghost::Outcome::Acked(_))
-                && t.sync == Some(SyncCommit::On)
+            matches!(t.outcome, ghost::Outcome::Acked(_)) && t.sync == Some(SyncCommit::On)
         })
         .filter_map(|(id, t)| {
             let ts = match t.outcome {
                 ghost::Outcome::Acked(ts) => ts,
                 _ => return None,
             };
-            let keys: BTreeSet<Vec<u8>> =
-                t.writes.iter().map(|w| w.key.clone()).collect();
+            let keys: BTreeSet<Vec<u8>> = t.writes.iter().map(|w| w.key.clone()).collect();
             Some((*id, ts, keys))
         })
         .collect();
@@ -1299,8 +1289,13 @@ fn write_visible(
     let view = core.open_view();
     let lo = intent_key(key);
     let hi = end_key(key);
-    for entry in view.scan((Bound::Included(lo.as_slice()), Bound::Excluded(hi.as_slice())), false)
-    {
+    for entry in view.scan(
+        (
+            Bound::Included(lo.as_slice()),
+            Bound::Excluded(hi.as_slice()),
+        ),
+        false,
+    ) {
         let (k, v) = entry.expect("kv scan");
         match parse_key(&k) {
             Some((_, Entry::Intent)) => {
@@ -1319,25 +1314,20 @@ fn write_visible(
                     }
                 }
             }
-            Some((_, Entry::Version(vts))) => {
-                if vts == ts {
-                    let decoded = decode_version(&v).expect("version");
-                    let same = match (&decoded, &w) {
-                        (nucleus_txn::encoding::VersionValue::Live { payload, .. }, gw) => {
-                            write_value(gw).is_some_and(|x| x == *payload)
-                        }
-                        (
-                            nucleus_txn::encoding::VersionValue::Tombstone { .. },
-                            GWrite::Delete,
-                        ) => true,
-                        _ => false,
-                    };
-                    if same {
-                        return true;
+            Some((_, Entry::Version(vts))) if vts == ts => {
+                let decoded = decode_version(&v).expect("version");
+                let same = match (&decoded, &w) {
+                    (nucleus_txn::encoding::VersionValue::Live { payload, .. }, gw) => {
+                        write_value(gw).is_some_and(|x| x == *payload)
                     }
+                    (nucleus_txn::encoding::VersionValue::Tombstone { .. }, GWrite::Delete) => true,
+                    _ => false,
+                };
+                if same {
+                    return true;
                 }
             }
-            None => {}
+            Some((_, Entry::Version(_))) | None => {}
         }
     }
     false
@@ -1375,7 +1365,10 @@ pub fn final_checks(sim: &mut Sim, core: &Core<super::SimKv>) {
     }
     // No wait edges or slots, no shared locks.
     if !core.wait_edges().is_empty() || !core.wait_slots().is_empty() {
-        sim.violate("END-STATE", "wait edges or slots remain after the drain".into());
+        sim.violate(
+            "END-STATE",
+            "wait edges or slots remain after the drain".into(),
+        );
         return;
     }
     let table = sim.locks.as_ref().expect("lock manager").row_table();
@@ -1401,7 +1394,10 @@ pub fn final_checks(sim: &mut Sim, core: &Core<super::SimKv>) {
         .map(|(id, _)| *id)
         .collect();
     if let Some(id) = pending.first() {
-        sim.violate("END-STATE", format!("{id:?} is still Pending after the drain"));
+        sim.violate(
+            "END-STATE",
+            format!("{id:?} is still Pending after the drain"),
+        );
         return;
     }
     // Lost updates: each key's committed value equals its ghost fold (every
@@ -1414,7 +1410,9 @@ pub fn final_checks(sim: &mut Sim, core: &Core<super::SimKv>) {
         let mut cur: Option<u64> = None;
         let mut bad: Option<String> = None;
         for (_, id) in &committed {
-            let Some(t) = sim.ghost.txns.get(id) else { continue };
+            let Some(t) = sim.ghost.txns.get(id) else {
+                continue;
+            };
             for w in t.writes.iter().filter(|w| w.key == *key) {
                 match &w.kind {
                     GWrite::Set(v) => cur = Some(ghost::payload_u64(v)),

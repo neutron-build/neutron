@@ -35,11 +35,11 @@ use nucleus_txn::txn::{CancelHandle, Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::wait::{WaitBegin, WaitHandle, WaitOutcome};
 use nucleus_txn::write::{
-    EpqDecision, EpqRequest, KeyOpTask, RowOp, RowOpTask, RowOutcome, StmtCtx, Step, UniqueRule,
+    EpqDecision, EpqRequest, KeyOpTask, RowOp, RowOpTask, RowOutcome, Step, StmtCtx, UniqueRule,
 };
 use nucleus_txn::{RowLockMode, Seq, Ts, TxnError, TxnId, TxnStatus};
 
-pub use ghost::{payload_u64, u64_payload, Ghost, GWrite};
+pub use ghost::{payload_u64, u64_payload, GWrite, Ghost};
 pub use kv::SimKv;
 pub use sched::{Choices, Rng, Trace};
 
@@ -49,7 +49,10 @@ use check::Checker;
 // Results
 // ---------------------------------------------------------------------------
 
-/// One run's terminal answer.
+/// One run's terminal answer. (`sim.rs` reads the `Ok` payload and every
+/// `Violation` field; `sim_regressions.rs` matches only the variant it
+/// replays, so the unread fields are allowed dead there.)
+#[allow(dead_code)]
 pub enum RunResult {
     /// The run finished (or hit its step bound) with every check green.
     Ok(Box<Finished>),
@@ -58,6 +61,7 @@ pub enum RunResult {
     Violation(Box<Violation>),
 }
 
+#[allow(dead_code)]
 pub struct Finished {
     pub steps: u64,
     pub choices: Vec<u64>,
@@ -66,6 +70,7 @@ pub struct Finished {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct Violation {
     pub inv: &'static str,
     pub detail: String,
@@ -386,7 +391,11 @@ fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
     if cfg.lock_pairs_pm > 0 && rng.chance_pm(cfg.lock_pairs_pm) {
         let a = rng.below(nk);
         let b = (a + 1 + rng.below((nk - 1).max(1))) % nk;
-        let (first, second) = if session % 2 == 0 { (a, b) } else { (b, a) };
+        let (first, second) = if session.is_multiple_of(2) {
+            (a, b)
+        } else {
+            (b, a)
+        };
         return Program {
             stmts: vec![Stmt::LockUpdate(first), Stmt::LockUpdate(second)],
             cancel_mid_wait: rng.chance_pm(cfg.cancel_pm),
@@ -465,6 +474,12 @@ fn bool_sync(on: bool) -> SyncCommit {
 // Sessions and actions
 // ---------------------------------------------------------------------------
 
+/// What `Wait` parked: the wait targets, the key and the requested mode.
+pub type PendingWait = (Vec<(TxnId, u64)>, Vec<u8>, RowLockMode);
+
+/// One read statement's outcome: its snapshot and the per-key results.
+pub type ReadOut = (Ts, Vec<(usize, Option<Vec<u8>>)>);
+
 /// The write/lock task of the current statement.
 pub enum Task {
     Row(RowOpTask),
@@ -521,7 +536,7 @@ pub struct Session {
     pub task: Option<Task>,
     pub epq: Option<EpqRequest>,
     /// The wait a step's `Wait(targets)` parked, until `wait_begin` runs.
-    pub pending_wait: Option<(Vec<(TxnId, u64)>, Vec<u8>, RowLockMode)>,
+    pub pending_wait: Option<PendingWait>,
     pub wait: Option<WaitState>,
     pub ticket: Option<CommitTicket>,
     /// The txn id the pending ticket belongs to.
@@ -561,7 +576,9 @@ impl Session {
     }
 
     pub fn iso(&self) -> Isolation {
-        self.txn.as_ref().map_or(Isolation::ReadCommitted, |t| t.isolation)
+        self.txn
+            .as_ref()
+            .map_or(Isolation::ReadCommitted, |t| t.isolation)
     }
 
     pub fn stmt(&self) -> Option<Stmt> {
@@ -669,7 +686,10 @@ impl Sim {
 /// A statement error the session handles by aborting and retrying (40001 /
 /// 40P01 / 55P03 / 23505, plus 57014 from a self-cancel).
 fn retryable_error(e: &TxnError) -> bool {
-    matches!(e.sqlstate(), "40001" | "40P01" | "55P03" | "23505" | "57014")
+    matches!(
+        e.sqlstate(),
+        "40001" | "40P01" | "55P03" | "23505" | "57014"
+    )
 }
 
 /// Whether the resolver has work: the driver's abort/commit flag, any
@@ -759,7 +779,7 @@ pub fn collect_actions(sim: &Sim, probe_mode: bool) -> Vec<Action> {
     if sim.ssi.as_ref().is_some_and(|s| s.stats().entries > 0) {
         // Rotated with the GC actor below: one maintenance action per step,
         // so background actors cannot starve the sessions.
-        if sim.steps % 2 == 0 {
+        if sim.steps.is_multiple_of(2) {
             out.push(Action::Retention);
         }
     }
@@ -770,9 +790,7 @@ pub fn collect_actions(sim: &Sim, probe_mode: bool) -> Vec<Action> {
             1 => out.push(Action::GcTomb),
             2 => out.push(Action::GcFlush),
             _ => {
-                let has_files = sim
-                    .kv
-                    .with_live(|m| m.files().map_or(false, |f| !f.is_empty()));
+                let has_files = sim.kv.with_live(|m| m.files().is_ok_and(|f| !f.is_empty()));
                 if has_files {
                     out.push(Action::GcCompact);
                 }
@@ -879,7 +897,10 @@ pub fn exec(sim: &mut Sim, act: Action) {
                 ssi.run_retention(&core);
             }
         }
-        Action::GcPublish | Action::GcTomb | Action::GcFlush | Action::GcCompact
+        Action::GcPublish
+        | Action::GcTomb
+        | Action::GcFlush
+        | Action::GcCompact
         | Action::GcCompactAll => exec_gc(sim, act),
         Action::CommitThread | Action::Crash => {
             sim.violate("SCHED", format!("{act:?} is driver-level"));
@@ -945,10 +966,7 @@ fn exec_sess(sim: &mut Sim, core: &Core<SimKv>, i: usize, sa: SAction) {
     }
     match sa {
         SAction::BeginTxn | SAction::RetryBeginTxn | SAction::CommitSubmit | SAction::AbortTxn => {
-            sim.violate(
-                "SCHED",
-                format!("lifecycle action {sa:?} is driver-level"),
-            );
+            sim.violate("SCHED", format!("lifecycle action {sa:?} is driver-level"));
         }
         SAction::StartStmt => {
             let seq0 = match sim.sessions[i].txn.as_ref().map(|t| t.next_seq()) {
@@ -1208,7 +1226,7 @@ fn exec_read(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
         None => return,
     };
     let iso = sim.sessions[i].iso();
-    let (snapshot, results): (Ts, Vec<(usize, Option<Vec<u8>>)>) = match stmt {
+    let (snapshot, results): ReadOut = match stmt {
         Stmt::Scan(lo, hi) => scan_stmt(sim, core, i, iso, lo, hi),
         Stmt::Read(k) | Stmt::Update(k) => {
             let (s, v) = read_key_stmt(sim, core, i, iso, k);
@@ -1333,7 +1351,12 @@ fn read_key_stmt(
 }
 
 /// Maps scan rows onto the key indices in `[lo, hi)`.
-fn map_scan_rows(sim: &Sim, lo: usize, hi: usize, rows: &[(nucleus_kv::Key, Vec<u8>)]) -> Vec<(usize, Option<Vec<u8>>)> {
+fn map_scan_rows(
+    sim: &Sim,
+    lo: usize,
+    hi: usize,
+    rows: &[(nucleus_kv::Key, Vec<u8>)],
+) -> Vec<(usize, Option<Vec<u8>>)> {
     (lo..hi)
         .map(|kidx| {
             let v = rows
@@ -1352,7 +1375,7 @@ fn scan_stmt(
     iso: Isolation,
     lo: usize,
     hi: usize,
-) -> (Ts, Vec<(usize, Option<Vec<u8>>)>) {
+) -> ReadOut {
     let hi = hi.clamp(lo + 1, sim.cfg.keys);
     let tid = sim.sessions[i].txn.as_ref().map(|t| t.id).expect("txn");
     let seq0 = sim.sessions[i].seq0;
@@ -1501,7 +1524,11 @@ fn applied_outcome(
                 if let Some(t) = sim.ghost.txns.get_mut(&tid) {
                     t.events
                         .push(format!("s{seq0} applied {stmt:?} k{ki} = {write_value}"));
-                    t.writes.push(ghost::GhostWrite { seq: seq0, key, kind });
+                    t.writes.push(ghost::GhostWrite {
+                        seq: seq0,
+                        key,
+                        kind,
+                    });
                 }
             }
         }
@@ -1541,7 +1568,15 @@ fn exec_epq(sim: &mut Sim, i: usize) {
                 stmt_error(sim, i, TxnError::SerializationFailure);
                 return;
             }
-            if tomb(&v.value) || matches!(v.value, VersionValue::Live { key_changed: true, .. }) {
+            if tomb(&v.value)
+                || matches!(
+                    v.value,
+                    VersionValue::Live {
+                        key_changed: true,
+                        ..
+                    }
+                )
+            {
                 finish_epq_skip(sim, i);
                 return;
             }
@@ -1633,9 +1668,7 @@ fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
     } else if ghost_cycle && check::ghost_cycle_is_parked(sim, waiter) {
         sim.violate(
             "I-LIVE(b)",
-            format!(
-                "deadlock check of {waiter:?} found no cycle but a parked ghost cycle exists"
-            ),
+            format!("deadlock check of {waiter:?} found no cycle but a parked ghost cycle exists"),
         );
     }
 }
@@ -1734,7 +1767,7 @@ pub fn run(cfg: &Config, seed: u64, replay: Option<Vec<u64>>) -> RunResult {
         // ---- install the era's hooks ----
         kv.set_era(core.epoch());
         let locks = LockManager::install(&core);
-        let needs_ssi = cfg.isolation.iter().any(|i| *i == Isolation::Serializable);
+        let needs_ssi = cfg.isolation.contains(&Isolation::Serializable);
         let ssi = if needs_ssi {
             Some(Ssi::install(&core))
         } else {
@@ -1928,8 +1961,7 @@ fn drive_era(
         let Some(act) = next else {
             let all_done = {
                 let s = sim.lock().expect("sim");
-                s.budgets.iter().all(|&b| b == 0)
-                    && s.sessions.iter().all(|x| x.txn.is_none())
+                s.budgets.iter().all(|&b| b == 0) && s.sessions.iter().all(|x| x.txn.is_none())
             };
             if all_done {
                 drain(sim, core, pipeline);
@@ -2193,11 +2225,7 @@ fn drain(sim: &Arc<Mutex<Sim>>, core: &Core<SimKv>, pipeline: &mut CommitPipelin
                 }
             }
             s.inflight.clear();
-            let pending: Vec<TxnId> = s
-                .sessions
-                .iter()
-                .filter_map(|x| x.ticket_txn)
-                .collect();
+            let pending: Vec<TxnId> = s.sessions.iter().filter_map(|x| x.ticket_txn).collect();
             s.inflight.extend(pending);
             s.inflight.clone()
         };

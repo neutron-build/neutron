@@ -106,7 +106,15 @@ fn suite() {
     let start = Instant::now();
     let n = seed_count();
     let det_up_to = n.min(20);
-    for cfg in configs() {
+    // `SIM_ONLY=<name>`: the one configuration to run (mutation evidence:
+    // a mutant is hunted on its named configuration).
+    let all = configs();
+    let selected: Vec<Config> = match std::env::var("SIM_ONLY") {
+        Ok(name) => vec![one_config(&name)],
+        Err(_) => all.clone(),
+    };
+    let n_selected = selected.len();
+    for cfg in selected {
         for seed in 1..=n {
             expect_green(&cfg, seed);
             // Determinism: the first seeds run twice, byte for byte.
@@ -135,7 +143,10 @@ fn suite() {
         }
     }
     let el = start.elapsed();
-    println!("suite: {} configs x {n} seeds in {el:?}", configs().len());
+    println!(
+        "suite: {n_selected} of {} configs x {n} seeds in {el:?}",
+        all.len()
+    );
     assert!(
         el.as_secs() < 60,
         "the default suite must stay under 60 s (took {el:?})"

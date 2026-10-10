@@ -9,11 +9,7 @@
 /// failure). Returns a list that is strictly shorter and fails with the
 /// same invariant. A removed choice whose action is no longer enabled is
 /// skipped naturally: the replay picks `choice % enabled.len()`.
-pub fn minimize(
-    start: &[u64],
-    wanted: &str,
-    run: impl Fn(&[u64]) -> Option<String>,
-) -> Vec<u64> {
+pub fn minimize(start: &[u64], wanted: &str, run: impl Fn(&[u64]) -> Option<String>) -> Vec<u64> {
     let mut cur: Vec<u64> = start.to_vec();
     let fails = |list: &[u64], cur: &[u64]| {
         run(list).is_some_and(|inv| inv == wanted) && list.len() < cur.len()
@@ -38,7 +34,7 @@ pub fn minimize(
         if chunk == 1 {
             break;
         }
-        chunk = (chunk + 1) / 2;
+        chunk = (chunk + 1).div_ceil(2);
     }
     cur
 }
