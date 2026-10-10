@@ -147,6 +147,9 @@ pub struct Config {
     /// Probability of a two-lock program in per-session-opposite orders
     /// (deadlocks).
     pub lock_pairs_pm: usize,
+    /// Probability of a SAVEPOINT / statements / ROLLBACK TO block, per
+    /// mille.
+    pub sp_block_pm: usize,
     pub max_steps: u64,
     /// I-PROGRESS bound R.
     pub progress_r: u32,
@@ -185,6 +188,7 @@ impl Config {
                 gc: false,
                 check_i_ser: false,
                 lock_pairs_pm: 0,
+                sp_block_pm: 150,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -215,6 +219,7 @@ impl Config {
                 gc: false,
                 check_i_ser: false,
                 lock_pairs_pm: 0,
+                sp_block_pm: 150,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -245,6 +250,7 @@ impl Config {
                 gc: false,
                 check_i_ser: true,
                 lock_pairs_pm: 0,
+                sp_block_pm: 150,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -280,6 +286,7 @@ impl Config {
                 gc: false,
                 check_i_ser: false,
                 lock_pairs_pm: 400,
+                sp_block_pm: 500,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -310,6 +317,7 @@ impl Config {
                 gc: false,
                 check_i_ser: false,
                 lock_pairs_pm: 0,
+                sp_block_pm: 150,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -344,6 +352,7 @@ impl Config {
                 gc: true,
                 check_i_ser: false,
                 lock_pairs_pm: 0,
+                sp_block_pm: 150,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -403,55 +412,28 @@ fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
             sync: bool_sync(rng.chance_pm(cfg.sync_on_pm)),
         };
     }
+    // A savepoint block (§5.5): SAVEPOINT, one or two statements that take
+    // locks or write, ROLLBACK TO, and sometimes a statement after it.
+    if cfg.sp_block_pm > 0 && rng.chance_pm(cfg.sp_block_pm) {
+        let mut stmts = vec![Stmt::Savepoint, gen_inner_stmt(cfg, rng)];
+        if rng.chance_pm(400) {
+            stmts.push(gen_inner_stmt(cfg, rng));
+        }
+        stmts.push(Stmt::RollbackTo);
+        if rng.chance_pm(500) {
+            stmts.push(gen_inner_stmt(cfg, rng));
+        }
+        return Program {
+            stmts,
+            cancel_mid_wait: rng.chance_pm(cfg.cancel_pm),
+            commit: !rng.chance_pm(125),
+            sync: bool_sync(rng.chance_pm(cfg.sync_on_pm)),
+        };
+    }
     let nstmts = 1 + rng.below(cfg.max_stmts);
-    let w = &cfg.ops;
     let mut stmts = Vec::with_capacity(nstmts);
     for _ in 0..nstmts {
-        let mut pick = rng.below(w.total().max(1));
-        let stmt = if pick < w.read {
-            Stmt::Read(rng.below(nk))
-        } else {
-            pick -= w.read;
-            if pick < w.scan {
-                let a = rng.below(nk);
-                let b = rng.below(nk);
-                let (lo, hi) = if a <= b { (a, b + 1) } else { (b, a + 1) };
-                Stmt::Scan(lo, hi.min(nk).max(lo + 1))
-            } else {
-                pick -= w.scan;
-                if pick < w.update {
-                    Stmt::Update(rng.below(nk))
-                } else {
-                    pick -= w.update;
-                    if pick < w.delete {
-                        Stmt::Delete(rng.below(nk))
-                    } else {
-                        pick -= w.delete;
-                        if pick < w.insert {
-                            Stmt::Insert(rng.below(nk), 1 + rng.below(999) as u64)
-                        } else {
-                            pick -= w.insert;
-                            if pick < w.lock_update {
-                                Stmt::LockUpdate(rng.below(nk))
-                            } else {
-                                pick -= w.lock_update;
-                                if pick < w.lock_key_share {
-                                    Stmt::LockKeyShare(rng.below(nk))
-                                } else {
-                                    pick -= w.lock_key_share;
-                                    if pick < w.savepoint {
-                                        Stmt::Savepoint
-                                    } else {
-                                        Stmt::RollbackTo
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        stmts.push(stmt);
+        stmts.push(gen_stmt(cfg, rng));
     }
     Program {
         stmts,
@@ -460,6 +442,67 @@ fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
         commit: !rng.chance_pm(125),
         sync: bool_sync(rng.chance_pm(cfg.sync_on_pm)),
     }
+}
+
+/// One random statement by the config's weights.
+fn gen_stmt(cfg: &Config, rng: &mut Rng) -> Stmt {
+    let nk = cfg.keys;
+    let w = &cfg.ops;
+    let mut pick = rng.below(w.total().max(1));
+    if pick < w.read {
+        Stmt::Read(rng.below(nk))
+    } else {
+        pick -= w.read;
+        if pick < w.scan {
+            let a = rng.below(nk);
+            let b = rng.below(nk);
+            let (lo, hi) = if a <= b { (a, b + 1) } else { (b, a + 1) };
+            Stmt::Scan(lo, hi.min(nk).max(lo + 1))
+        } else {
+            pick -= w.scan;
+            if pick < w.update {
+                Stmt::Update(rng.below(nk))
+            } else {
+                pick -= w.update;
+                if pick < w.delete {
+                    Stmt::Delete(rng.below(nk))
+                } else {
+                    pick -= w.delete;
+                    if pick < w.insert {
+                        Stmt::Insert(rng.below(nk), 1 + rng.below(999) as u64)
+                    } else {
+                        pick -= w.insert;
+                        if pick < w.lock_update {
+                            Stmt::LockUpdate(rng.below(nk))
+                        } else {
+                            pick -= w.lock_update;
+                            if pick < w.lock_key_share {
+                                Stmt::LockKeyShare(rng.below(nk))
+                            } else {
+                                pick -= w.lock_key_share;
+                                if pick < w.savepoint {
+                                    Stmt::Savepoint
+                                } else {
+                                    Stmt::RollbackTo
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A non-savepoint statement (inside a savepoint block).
+fn gen_inner_stmt(cfg: &Config, rng: &mut Rng) -> Stmt {
+    for _ in 0..16 {
+        let s = gen_stmt(cfg, rng);
+        if !matches!(s, Stmt::Savepoint | Stmt::RollbackTo) {
+            return s;
+        }
+    }
+    Stmt::LockUpdate(rng.below(cfg.keys))
 }
 
 fn bool_sync(on: bool) -> SyncCommit {
