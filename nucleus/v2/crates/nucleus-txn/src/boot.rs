@@ -71,6 +71,11 @@ pub struct Core<K: OrderedKv> {
     /// Queued resolution/cleanup entries (§3 step 5, §7.1), drained by the
     /// resolver.
     pub(crate) resolve_q: Mutex<VecDeque<crate::commit::ResolveEntry>>,
+    /// The seq module (§10, C-T7r2): this core's sequence state, owned by
+    /// construction — one core = one module for its whole lifetime, so
+    /// `fail_stop` hook swaps or hooks shared across cores cannot split
+    /// or alias it. See `seq.rs`.
+    pub(crate) seq: Mutex<crate::seq::SeqModule>,
 }
 
 impl<K: OrderedKv> Core<K> {
@@ -156,6 +161,7 @@ impl<K: OrderedKv> Core<K> {
             ssi_hook: Mutex::new(Arc::new(NoSsiHook)),
             release_hook: Mutex::new(Arc::new(crate::commit::NoReleaseHook)),
             resolve_q: Mutex::new(VecDeque::new()),
+            seq: Mutex::new(crate::seq::SeqModule::new()),
         })
     }
 
