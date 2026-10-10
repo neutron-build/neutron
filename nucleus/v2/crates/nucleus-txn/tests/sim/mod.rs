@@ -494,6 +494,8 @@ pub struct WaitState {
     /// holds what).
     pub key: Vec<u8>,
     pub mode: RowLockMode,
+    /// The targets `wait_begin` was given (what the step API returned).
+    pub targets: Vec<TxnId>,
 }
 
 /// Where a session is.
@@ -1052,6 +1054,7 @@ fn exec_sess(sim: &mut Sim, core: &Core<SimKv>, i: usize, sa: SAction) {
                 sim.violate("SCHED", "wait_begin without a pending wait".into());
                 return;
             };
+            let target_ids: Vec<TxnId> = targets.iter().map(|(t, _)| *t).collect();
             let outcome = {
                 let txn = sim.sessions[i].txn.as_ref().expect("txn");
                 core.wait_begin(txn, &targets)
@@ -1066,6 +1069,7 @@ fn exec_sess(sim: &mut Sim, core: &Core<SimKv>, i: usize, sa: SAction) {
                         began,
                         key,
                         mode,
+                        targets: target_ids,
                     });
                     s.phase = Phase::Wait;
                 }
@@ -1082,7 +1086,9 @@ fn exec_sess(sim: &mut Sim, core: &Core<SimKv>, i: usize, sa: SAction) {
                 handle_wait_outcome(sim, i, o);
             }
         }
-        SAction::WaitDeadlock => exec_deadlock_check(sim, core, i),
+        SAction::WaitDeadlock => {
+            exec_deadlock_check(sim, core, i);
+        }
         SAction::DoCancel => {
             let s = &mut sim.sessions[i];
             s.cancelled = true;
@@ -1673,9 +1679,9 @@ fn handle_wait_outcome(sim: &mut Sim, i: usize, o: WaitOutcome) {
     }
 }
 
-fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
+fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) -> bool {
     let Some(w) = sim.sessions[i].wait.as_ref() else {
-        return;
+        return false;
     };
     let waiter = w.handle.waiter();
     let fired = core.wait_deadlock_check(&w.handle);
@@ -1692,7 +1698,7 @@ fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
                 "I-LIVE(c)",
                 format!("40P01 for {waiter:?} without a ghost-lock cycle at that moment"),
             );
-            return;
+            return true;
         }
         stmt_error(sim, i, TxnError::Deadlock);
     } else if ghost_cycle && check::ghost_cycle_is_parked(sim, waiter) {
@@ -1700,9 +1706,10 @@ fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
             "I-LIVE(b)",
             format!(
                 "deadlock check of {waiter:?} found no cycle but a parked ghost cycle exists \
-                 (diagnostics only: wait_edges {:?}, wait_slots {:?}, waits {:?})",
+                 (diagnostics only: wait_edges {:?}, wait_slots {:?}, ghost {}, waits {:?})",
                 core.wait_edges(),
                 core.wait_slots(),
+                check::ghost_diag(sim),
                 sim.sessions
                     .iter()
                     .filter_map(|x| x.wait.as_ref().map(|w| (
@@ -1715,6 +1722,7 @@ fn exec_deadlock_check(sim: &mut Sim, core: &Core<SimKv>, i: usize) {
             ),
         );
     }
+    fired
 }
 
 fn stmt_error(sim: &mut Sim, i: usize, e: TxnError) {
@@ -2002,6 +2010,42 @@ fn drive_era(
         let next = {
             let mut s = sim.lock().expect("sim");
             let acts = collect_actions(&s, false);
+            // I-LIVE (b), global form: every session is waiting, parked and
+            // past `deadlock_timeout`, nothing else can change the state,
+            // so running the checks must break a cycle (a 40P01 fires).
+            if check::all_sessions_deadlocked(&s) {
+                let line = format!(
+                    "{:>5} forced deadlock checks (every session waiting)",
+                    s.steps
+                );
+                s.trace.push(line);
+                s.steps += 1;
+                s.era_steps += 1;
+                let waiting: Vec<usize> = s
+                    .sessions
+                    .iter()
+                    .filter(|x| x.wait.is_some())
+                    .map(|x| x.id)
+                    .collect();
+                let mut fired = 0;
+                for i in waiting {
+                    if s.violation.is_none() && exec_deadlock_check(&mut s, core, i) {
+                        fired += 1;
+                    }
+                }
+                if fired == 0 && s.violation.is_none() {
+                    let diag = check::ghost_diag(&s);
+                    s.violate(
+                        "I-LIVE(b)",
+                        format!("every session is waiting and parked but no deadlock check fired ({diag})"),
+                    );
+                }
+                check::post_step(&mut s);
+                if s.violation.is_some() {
+                    return EraEnd::Done;
+                }
+                continue;
+            }
             // Once every session is done and only background actors (GC,
             // resolver, retention) remain, they get a bounded tail of steps
             // (a few GC rounds over the finished history), then the run

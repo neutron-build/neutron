@@ -149,8 +149,10 @@ fn suite() {
         "suite: {n_selected} of {} configs x {n} seeds in {el:?}",
         all.len()
     );
+    // The budget is for the default seed count (`SIM_SEEDS` runs are long
+    // runs by request).
     assert!(
-        el.as_secs() < 60,
+        std::env::var("SIM_SEEDS").is_ok() || el.as_secs() < 60,
         "the default suite must stay under 60 s (took {el:?})"
     );
 }

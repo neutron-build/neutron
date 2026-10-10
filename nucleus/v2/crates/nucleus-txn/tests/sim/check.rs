@@ -556,15 +556,10 @@ fn full_state_checks(sim: &mut Sim) {
 // I-LIVE
 // ---------------------------------------------------------------------------
 
-/// The holders a waiter requesting `mode` on `key` is blocked by right now,
+/// Every holder whose lock on `key` conflicts with `mode` right now,
 /// recomputed from ghost lock ownership (the intents in the KV and the shared
-/// lock table, minus ended holders and `except`), in the order §5.1 checks
-/// them: a conflicting foreign intent first; only when there is none, every
-/// conflicting shared holder (§6: an edge to every conflicting holder of
-/// that kind). A waiter parked on an intent owner has no edge to a shared
-/// holder yet: it re-runs §5.1 after the owner ends and waits again then, so
-/// a cycle that would only close through that second wait is not a deadlock
-/// the check may report (the owner it waits for is not itself blocked).
+/// lock table, minus ended holders and `except`; ended = aborted or a
+/// visible commit, §6).
 fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) -> Vec<TxnId> {
     let mut out = Vec::new();
     for it in scan_intents(sim) {
@@ -572,12 +567,10 @@ fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) 
             && it.owner != except
             && holds_exclusively(sim, it.owner)
             && (mode.conflicts_with(it.lock) || it.lock.conflicts_with(mode))
+            && !out.contains(&it.owner)
         {
             out.push(it.owner);
         }
-    }
-    if !out.is_empty() {
-        return out;
     }
     let table = sim.locks.as_ref().expect("lock manager").row_table();
     for (h, m, _) in table.holders(key) {
@@ -588,47 +581,101 @@ fn conflicting_holders(sim: &Sim, key: &[u8], mode: RowLockMode, except: TxnId) 
     out
 }
 
-/// I-LIVE (a): a parked waiter whose blockers no longer hold a conflicting
-/// lock must not stay parked (the poll must return).
-fn i_live_a(sim: &mut Sim) {
-    let waiting: Vec<(usize, Vec<u8>, RowLockMode, TxnId)> = sim
-        .sessions
+/// The wait edges of one waiting session, recomputed from ghost lock
+/// ownership: the targets the wait API handed out when the wait began
+/// (recorded by the simulator) that still hold a conflicting lock. A wait's
+/// edges are fixed at `wait_begin` (§6): a txn that takes a conflicting
+/// shared lock later gives no edge until the waiter wakes and re-runs §5.1,
+/// so only the original targets count. Never read from `wait_edges()`.
+fn ghost_edges_of(sim: &Sim, w: &super::WaitState) -> Vec<TxnId> {
+    let holders = conflicting_holders(sim, &w.key, w.mode, w.handle.waiter());
+    w.targets
         .iter()
-        .filter(|s| s.wait.is_some())
-        .map(|s| {
-            let w = s.wait.as_ref().expect("wait");
-            (s.id, w.key.clone(), w.mode, w.handle.waiter())
-        })
-        .collect();
-    for (i, key, mode, waiter) in waiting {
-        let parked = sim.sessions[i]
-            .wait
-            .as_ref()
-            .is_some_and(|w| sim.core.wait_poll(&w.handle).is_none());
-        if !parked {
+        .copied()
+        .filter(|t| holders.contains(t))
+        .collect()
+}
+
+/// Diagnostics for a liveness violation: per waiting session, the ghost's
+/// holders of its key (intents with their lock modes and owners' statuses,
+/// shared holders) and the session's parked state. Printed, never used as an
+/// oracle answer.
+pub fn ghost_diag(sim: &Sim) -> String {
+    let intents = scan_intents(sim);
+    let table = sim.locks.as_ref().expect("lock manager").row_table();
+    let mut out = Vec::new();
+    for s in &sim.sessions {
+        let Some(w) = &s.wait else { continue };
+        let waiter = w.handle.waiter();
+        let ints: Vec<String> = intents
+            .iter()
+            .filter(|it| it.key == w.key)
+            .map(|it| {
+                format!(
+                    "intent {:?} {:?} status {:?}",
+                    it.owner,
+                    it.lock,
+                    sim.core.status.entry(it.owner).map(|e| e.status)
+                )
+            })
+            .collect();
+        let shared: Vec<String> = table
+            .holders(&w.key)
+            .into_iter()
+            .map(|(h, m, _)| {
+                format!(
+                    "shared {h:?} {m:?} status {:?}",
+                    sim.core.status.entry(h).map(|e| e.status)
+                )
+            })
+            .collect();
+        out.push(format!(
+            "session {} {:?} waits {:?} {:?} parked={} visible={:?}: {ints:?} {shared:?}",
+            s.id,
+            waiter,
+            w.key,
+            w.mode,
+            sim.core.wait_poll(&w.handle).is_none(),
+            sim.core.visible_ts()
+        ));
+    }
+    out.join(" | ")
+}
+
+/// I-LIVE (a): a parked waiter none of whose targets still holds a
+/// conflicting lock (all ended, released or rolled back, so the wake
+/// generation changed) must not stay parked: the poll must return.
+fn i_live_a(sim: &mut Sim) {
+    let mut bad: Option<String> = None;
+    for s in &sim.sessions {
+        let Some(w) = &s.wait else { continue };
+        if sim.core.wait_poll(&w.handle).is_some() {
             continue;
         }
-        if conflicting_holders(sim, &key, mode, waiter).is_empty() {
-            sim.violate(
-                "I-LIVE(a)",
-                format!(
-                    "session {i} ({waiter:?}) stays parked on {key:?} with no conflicting holder left"
-                ),
-            );
-            return;
+        if ghost_edges_of(sim, w).is_empty() {
+            bad = Some(format!(
+                "session {} ({:?}) stays parked on {:?} though none of its targets {:?} holds a conflicting lock",
+                s.id,
+                w.handle.waiter(),
+                w.key,
+                w.targets
+            ));
+            break;
         }
+    }
+    if let Some(b) = bad {
+        sim.violate("I-LIVE(a)", b);
     }
 }
 
-/// The wait-for graph recomputed from ghost lock ownership at this moment:
-/// every waiting session edges to the current conflicting holders of its
-/// key. Independent of the crate's graph — that is the point (I-LIVE c).
+/// The wait-for graph recomputed from ghost lock ownership at this moment
+/// (see [`ghost_edges_of`]). Independent of the crate's graph (I-LIVE c).
 fn ghost_wait_graph(sim: &Sim) -> BTreeMap<TxnId, BTreeSet<TxnId>> {
     let mut g: BTreeMap<TxnId, BTreeSet<TxnId>> = BTreeMap::new();
     for s in &sim.sessions {
         if let Some(w) = &s.wait {
             let waiter = w.handle.waiter();
-            for h in conflicting_holders(sim, &w.key, w.mode, waiter) {
+            for h in ghost_edges_of(sim, w) {
                 g.entry(waiter).or_default().insert(h);
             }
         }
@@ -654,6 +701,36 @@ fn cycle_through(g: &BTreeMap<TxnId, BTreeSet<TxnId>>, w: TxnId) -> bool {
         }
     }
     false
+}
+
+/// I-LIVE (b), global form: every session that has a txn is in a wait, every
+/// wait is parked (its poll would not return), none can be cancelled, no
+/// commit is in flight and every deadlock check is already enabled. Nothing
+/// but deadlock checks can change the state, so a check must fire.
+pub fn all_sessions_deadlocked(sim: &Sim) -> bool {
+    use super::Phase;
+    if !sim.inflight.is_empty() {
+        return false;
+    }
+    let mut waiting = 0;
+    for (i, s) in sim.sessions.iter().enumerate() {
+        match s.phase {
+            Phase::Wait => {
+                let Some(w) = &s.wait else { return false };
+                let planned = s.program.as_ref().is_some_and(|p| p.cancel_mid_wait);
+                if sim.core.wait_poll(&w.handle).is_some()
+                    || (planned && !s.cancelled)
+                    || sim.steps.saturating_sub(w.began) < sim.cfg.deadlock_after
+                {
+                    return false;
+                }
+                waiting += 1;
+            }
+            Phase::Idle if sim.budgets[i] == 0 => {}
+            _ => return false,
+        }
+    }
+    waiting > 0
 }
 
 /// Whether `waiter` is on a cycle of the ghost wait graph right now.
@@ -682,7 +759,7 @@ pub fn ghost_cycle_is_parked(sim: &Sim, waiter: TxnId) -> bool {
             if !parked.contains(&wid) {
                 continue;
             }
-            for h in conflicting_holders(sim, &w.key, w.mode, wid) {
+            for h in ghost_edges_of(sim, w) {
                 if parked.contains(&h) {
                     g.entry(wid).or_default().insert(h);
                 }
