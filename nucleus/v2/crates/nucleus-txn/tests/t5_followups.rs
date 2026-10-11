@@ -614,7 +614,10 @@ fn rollback_to_keeps_the_pre_savepoint_ddl_map_changes() {
     // The DROP alone is undone: t's row is back, its (pre-savepoint
     // truncated) storage mapped, the CREATE's storage still mapped, the
     // TRUNCATE's old storage still retired.
-    assert!(rig.rel_row(oid).is_some(), "t survived the rolled-back DROP");
+    assert!(
+        rig.rel_row(oid).is_some(),
+        "t survived the rolled-back DROP"
+    );
     assert!(rig.storage_maps(&table_key(sid1, "p"), oid as u32));
     assert!(rig.storage_maps(&table_key(sid_n, "p"), oid_n as u32));
     assert!(!rig.storage_maps(&table_key(sid0, "p"), oid as u32));
@@ -624,5 +627,8 @@ fn rollback_to_keeps_the_pre_savepoint_ddl_map_changes() {
     assert!(rig.storage_maps(&table_key(sid1, "p"), oid as u32));
     assert!(rig.storage_maps(&table_key(sid_n, "p"), oid_n as u32));
     assert!(!rig.storage_maps(&table_key(sid0, "p"), oid as u32));
-    assert!(rig.rel_row(oid_n).is_some(), "the pre-savepoint CREATE stands");
+    assert!(
+        rig.rel_row(oid_n).is_some(),
+        "the pre-savepoint CREATE stands"
+    );
 }

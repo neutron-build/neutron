@@ -75,8 +75,10 @@ impl ReleaseHook for Outer {
 
     fn release_all(&self, txn: TxnId) {
         if *self.target.lock().expect("gate target") == Some(txn) {
-            let aborted =
-                matches!(self.core.status.lookup_for_intent(txn), Ok(TxnStatus::Aborted));
+            let aborted = matches!(
+                self.core.status.lookup_for_intent(txn),
+                Ok(TxnStatus::Aborted)
+            );
             if let Some(tx) = self.fired.lock().expect("fired").take() {
                 ok(tx.send(aborted));
                 let rx = self
@@ -96,11 +98,7 @@ impl ReleaseHook for Outer {
     }
 }
 
-fn commit(
-    core: &Core<MemKv>,
-    p: &Mutex<CommitPipeline<MemKv>>,
-    txn: Txn,
-) -> Result<Ts, TxnError> {
+fn commit(core: &Core<MemKv>, p: &Mutex<CommitPipeline<MemKv>>, txn: Txn) -> Result<Ts, TxnError> {
     let ticket = core.commit_submit(txn, SyncCommit::On)?;
     {
         let mut p = p.lock().expect("pipeline");
@@ -127,7 +125,14 @@ fn ins(core: &Core<MemKv>, txn: &Txn, s: Ts, key: &[u8]) {
 /// acts after the abort finished (the control). Returns (edge X->W
 /// recorded, whether `before_abort` fired for S while Pending, X's commit
 /// result, W's commit result).
-fn run(window: bool) -> (bool, Option<bool>, Result<Ts, TxnError>, Result<Ts, TxnError>) {
+fn run(
+    window: bool,
+) -> (
+    bool,
+    Option<bool>,
+    Result<Ts, TxnError>,
+    Result<Ts, TxnError>,
+) {
     let core = Arc::new(ok(Core::open(MemKv::new())));
     let ssi = Ssi::install(&core);
     let locks = LockManager::install(&core);
@@ -182,10 +187,7 @@ fn run(window: bool) -> (bool, Option<bool>, Result<Ts, TxnError>, Result<Ts, Tx
     let s = core.begin(Isolation::ReadCommitted);
     let seq = ok(s.next_seq());
     let ss = core.visible_ts();
-    ok(_catalog.catalog_drop_table(
-        &Ddl::new(&core, &s, StmtCtx::new(ss, seq, seq)),
-        oid,
-    ));
+    ok(_catalog.catalog_drop_table(&Ddl::new(&core, &s, StmtCtx::new(ss, seq, seq)), oid));
     let k = {
         let mut k = table_range(sid).0;
         k.extend_from_slice(b"k");
