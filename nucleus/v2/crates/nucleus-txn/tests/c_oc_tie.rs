@@ -238,11 +238,7 @@ fn spec_race_two_sessions_bounded() {
         let a = rig.txn(Isolation::ReadCommitted);
         let b = rig.txn(Isolation::ReadCommitted);
         let barrier = Arc::new(Barrier::new(2));
-        let side_a = spawn_session(
-            &rig.core,
-            a,
-            race_session(Arc::clone(&barrier), tie_row(0)),
-        );
+        let side_a = spawn_session(&rig.core, a, race_session(Arc::clone(&barrier), tie_row(0)));
         let side_b = spawn_session(&rig.core, b, race_session(barrier, tie_row(1)));
         let leashes = [side_a.leash.clone(), side_b.leash.clone()];
         let (ra, _) = recv_bounded(&side_a, &leashes, BOUND, "session 0's upsert");
@@ -295,7 +291,11 @@ fn spec_race_three_session_ring_bounded() {
         let mut leashes = Vec::with_capacity(3);
         for i in 0..3 {
             let t = rig.txn(Isolation::ReadCommitted);
-            let side = spawn_session(&rig.core, t, race_session(Arc::clone(&barrier), ring_row(i)));
+            let side = spawn_session(
+                &rig.core,
+                t,
+                race_session(Arc::clone(&barrier), ring_row(i)),
+            );
             leashes.push(side.leash.clone());
             sides.push(side);
         }
@@ -333,9 +333,7 @@ fn placement_is_ascending_key_order() {
     // 30 s: the wait at /u/z/Z is one-directional (H waits on nobody), so
     // the detector must not touch it; the poll and receive bounds below
     // bound this test instead.
-    rig.core
-        .waits
-        .set_deadlock_timeout(Duration::from_secs(30));
+    rig.core.waits.set_deadlock_timeout(Duration::from_secs(30));
     let waits = CountingWaits::new();
     rig.core.waits.set_hook(waits.clone());
 
@@ -465,11 +463,8 @@ fn spec_race_winner_commits() {
                 a,
                 commit_session(Arc::clone(&barrier), tie_row(0), do_update),
             );
-            let side_b = spawn_session(
-                &rig.core,
-                b,
-                commit_session(barrier, tie_row(1), do_update),
-            );
+            let side_b =
+                spawn_session(&rig.core, b, commit_session(barrier, tie_row(1), do_update));
             let leashes = [side_a.leash.clone(), side_b.leash.clone()];
 
             // Poll both receivers, committing each txn as soon as it
@@ -521,8 +516,10 @@ fn spec_race_winner_commits() {
                 !(oa.restarts > 0 && ob.restarts > 0),
                 "at most one side may restart: {oa:?} / {ob:?}"
             );
-            let inserted =
-                [oa.result, ob.result].iter().filter(|r| **r == OnConflictResult::Inserted).count();
+            let inserted = [oa.result, ob.result]
+                .iter()
+                .filter(|r| **r == OnConflictResult::Inserted)
+                .count();
             assert_eq!(inserted, 1, "exactly one Inserted: {oa:?} / {ob:?}");
             let expected_other = if do_update {
                 OnConflictResult::Updated
