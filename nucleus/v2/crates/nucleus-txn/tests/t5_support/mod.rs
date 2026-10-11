@@ -570,8 +570,22 @@ impl ReleaseHook for AeFreeGate {
         }
     }
 
+    /// The §5.5 mirror (C-T5-ABORT's gate F2): after the lock manager has
+    /// dropped the locks taken at `seq >= s` — the earliest a concurrent
+    /// session can acquire one of them — wake as the engine's
+    /// bump-and-wake would, signal `fired`, and freeze the rollback
+    /// until `proceed`. The journal settle of [`CatalogRelease`]'s
+    /// `release_from` has already run by then (it chains around this
+    /// hook), so the map the test observes at `fired` must be the
+    /// settled one.
     fn release_from(&self, txn: TxnId, from_seq: nucleus_txn::Seq) -> bool {
-        self.inner.release_from(txn, from_seq)
+        let released = self.inner.release_from(txn, from_seq);
+        if *self.target.lock().expect("gate target") == Some(txn) {
+            ok(self.core.bump_and_wake(txn));
+            self.fired.hit();
+            self.proceed.wait_at_least(1, GATE_BOUND);
+        }
+        released
     }
 }
 

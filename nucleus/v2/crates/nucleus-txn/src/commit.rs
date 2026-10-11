@@ -296,6 +296,19 @@ impl CommitProbe for NoProbe {
 /// prefix waits). No-op by default; installed on the core through
 /// [`Core::set_release_hook`](crate::boot::Core::set_release_hook).
 pub trait ReleaseHook: Send + Sync {
+    /// §7.1 (draft 7.6): [`Core::abort`](crate::boot::Core::abort) calls
+    /// this for the txn **before** it sets the status to `Aborted`,
+    /// outside any latch, while the txn is still `Pending` — the moment
+    /// an abort settles the in-memory side effects that must not survive
+    /// the status flip. §6 says an `Aborted` holder never conflicts, so
+    /// the instant the status flips a concurrent session can acquire a
+    /// relation the aborting txn's DDL had locked: the DDL storage-map
+    /// journal is undone here so the map already says what the abort
+    /// means by then (C-T5-ABORT's window). No-op by default.
+    fn before_abort(&self, txn: TxnId) {
+        let _ = txn;
+    }
+
     fn release_all(&self, txn: TxnId);
     /// `ROLLBACK TO SAVEPOINT s` (§5.5): release relation and advisory
     /// locks taken at seq `>= s` (shared row locks are released by
@@ -447,12 +460,23 @@ impl<K: OrderedKv> Core<K> {
         Ok(ticket)
     }
 
-    /// §7.1: the owning session, outside any latch, sets `Aborted`, releases
-    /// its in-memory locks, bumps its wake generation and wakes waiters,
-    /// marks itself released, then queues an async cleanup of its intents,
-    /// found through its write-set log. Nothing is persisted. Consumes the
-    /// txn: only the owning session calls it, at most once.
+    /// §7.1: the owning session, outside any latch and while still
+    /// `Pending`, first reverts the in-memory side effects its executed
+    /// DDL made under relation locks — [`ReleaseHook::before_abort`]
+    /// undoes the §10 SSI storage-map journal here, so no session can
+    /// acquire a relation while the map still reflects the aborting DDL
+    /// (§6: an `Aborted` holder never conflicts, so after the status
+    /// flip a concurrent acquirer is granted at once; the map must
+    /// already be settled then). It then sets `Aborted`, releases its
+    /// in-memory locks, bumps its wake generation and wakes waiters,
+    /// marks itself released, then queues an async cleanup of its
+    /// intents, found through its write-set log. Nothing is persisted.
+    /// Consumes the txn: only the owning session calls it, at most once.
     pub fn abort(&self, txn: Txn) -> Result<(), TxnError> {
+        // Draft 7.6: settle the DDL map journal while still Pending,
+        // BEFORE the status flips — this is the whole point of the
+        // order (see the trait docs and C-T5-ABORT).
+        self.release_hook().before_abort(txn.id);
         self.status.set_aborted(txn.id)?;
         // §6/§3 step 5: shared row locks are released under each key's
         // latch, before the release hook (relation/advisory locks).

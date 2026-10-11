@@ -413,3 +413,222 @@ fn create_table_holds_access_exclusive_over_the_new_relation() {
     ));
     ok(rig.core.abort(other2));
 }
+
+/// Mutant R1 (the old order in `release_from` only: the relation locks
+/// dropped before the journal's undo — C-T5-ABORT gate F2): SAVEPOINT;
+/// DROP t; ROLLBACK TO. The gate freezes the rollback at the AE-free
+/// moment — after the lock manager dropped the locks taken at
+/// `seq >= s`, the earliest a concurrent session can acquire one — and a
+/// fresh NOWAIT acquirer there must see t **mapped**: the Unmap was
+/// undone before the lock went free. Under the mutant the acquirer is
+/// granted the freed lock while the map still says the DROP's, and the
+/// probe catches the wrong map deterministically.
+#[test]
+fn rollback_to_settles_the_map_before_the_released_locks_go_free() {
+    let (rig, gate) = Rig::gated();
+    let rig = Arc::new(rig);
+
+    // A committed table on its own storage, mapped.
+    let t0 = rig.rc();
+    let s0 = rig.core.visible_ts();
+    let (oid, sid) = rig.create_table(&t0, s0, b"t");
+    ok(rig.commit_rc(t0));
+    assert!(rig.storage_maps(&table_key(sid, "probe"), oid as u32));
+
+    // S: SAVEPOINT, then DROP t inside it (the AE and the Unmap both at
+    // seq >= sp).
+    let s = rig.rc();
+    let sp = ok(s.savepoint());
+    let ss = rig.core.visible_ts();
+    rig.drop_table(&s, ss, oid);
+    assert!(!rig.storage_maps(&table_key(sid, "probe"), oid as u32));
+    gate.arm(s.id);
+
+    // The rollback freezes at the AE-free moment.
+    let rig_s = Arc::clone(&rig);
+    let roller = std::thread::spawn(move || {
+        ok(rig_s.core.rollback_to(&s, sp));
+        ok(rig_s.core.abort(s));
+    });
+    gate.fired.wait_at_least(1, Duration::from_secs(5));
+
+    // A fresh NOWAIT acquirer at the AE-free moment: granted, and the
+    // map already settled — the relation mapped to its old storage.
+    let u = rig.rc();
+    assert!(ok(rig.locks.lock_relation(
+        &rig.core,
+        &u,
+        oid,
+        RelLockMode::RowExclusive,
+        LockWait::NoWait,
+        None
+    )));
+    assert!(
+        rig.storage_maps(&table_key(sid, "probe"), oid as u32),
+        "the relation is mapped to its old storage at the moment the \
+         rolled-back DROP's AE goes free"
+    );
+    ok(rig.core.abort(u));
+
+    // Let the rollback (and S's abort, in the same thread) finish: the
+    // row survived it, the map stays.
+    gate.proceed.hit();
+    roller.join().expect("rollback thread");
+    rig.settle();
+    assert!(
+        rig.rel_row(oid).is_some(),
+        "t survived the rolled-back DROP"
+    );
+    assert!(rig.storage_maps(&table_key(sid, "probe"), oid as u32));
+}
+
+/// Mutant R7 (`CatalogRelease::release_from` returns only the journal's
+/// bool, dropping the inner hook's — C-T5-ABORT gate F3a): a ROLLBACK TO
+/// that releases a relation lock taken after the savepoint must wake a
+/// waiter parked on it (§5.5 / I-LIVE a). With no DDL after the
+/// savepoint the journal undoes nothing, so only the inner release's
+/// `true` makes [`Core::rollback_to`] bump and wake — under the mutant
+/// the waiter stays parked and the bounded `wait_at_least` fails the
+/// test instead of hanging it.
+#[test]
+fn rollback_to_that_releases_a_relation_lock_wakes_its_parked_waiter() {
+    let rig = Arc::new(Rig::new());
+
+    // Two committed tables (the rig's catalog hook chain is installed).
+    let t0 = rig.rc();
+    let s0 = rig.core.visible_ts();
+    let (oid_a, _sid_a) = rig.create_table(&t0, s0, b"a");
+    let (oid_b, _sid_b) = rig.create_table(&t0, s0, b"b");
+    ok(rig.commit_rc(t0));
+
+    // S holds a's AccessExclusive before the savepoint, b's after it.
+    let s = rig.rc();
+    ok(rig.locks.lock_relation(
+        &rig.core,
+        &s,
+        oid_a,
+        RelLockMode::AccessExclusive,
+        LockWait::Block,
+        None,
+    ));
+    let sp = ok(s.savepoint());
+    ok(rig.locks.lock_relation(
+        &rig.core,
+        &s,
+        oid_b,
+        RelLockMode::AccessExclusive,
+        LockWait::Block,
+        None,
+    ));
+
+    // R parks on b: RowExclusive conflicts with the AccessExclusive (§6).
+    let r = rig.rc();
+    let rid = r.id;
+    let acquired = Arc::new(Flag::new());
+    let acquired_r = Arc::clone(&acquired);
+    let (rig_r, locksr) = (Arc::clone(&rig), Arc::clone(&rig.locks));
+    let waiter = std::thread::spawn(move || {
+        ok(locksr.lock_relation(
+            &rig_r.core,
+            &r,
+            oid_b,
+            RelLockMode::RowExclusive,
+            LockWait::Block,
+            None,
+        ));
+        acquired_r.hit();
+    });
+    wait_until(Duration::from_secs(5), || {
+        rig.wait_edges()
+            .iter()
+            .any(|(waiter, target)| *waiter == rid && *target == s.id)
+    });
+
+    // The rollback releases exactly b's AE (seq >= sp) and must wake R.
+    ok(rig.core.rollback_to(&s, sp));
+    acquired.wait_at_least(1, Duration::from_secs(10));
+    waiter.join().expect("waiter thread");
+
+    // The woken waiter holds b (an AccessExclusive probe conflicts with
+    // its RowExclusive); a's pre-savepoint AE is still S's.
+    let u = rig.rc();
+    assert_eq!(
+        rig.locks.lock_relation(
+            &rig.core,
+            &u,
+            oid_b,
+            RelLockMode::AccessExclusive,
+            LockWait::NoWait,
+            None,
+        ),
+        Err(TxnError::LockNotAvailable),
+        "the woken waiter holds b"
+    );
+    assert_eq!(
+        rig.locks.lock_relation(
+            &rig.core,
+            &u,
+            oid_a,
+            RelLockMode::RowExclusive,
+            LockWait::NoWait,
+            None,
+        ),
+        Err(TxnError::LockNotAvailable),
+        "the pre-savepoint AE on a survived the rollback"
+    );
+    ok(rig.core.abort(u));
+    ok(rig.core.abort(s));
+    rig.settle();
+}
+
+/// Mutant R8 (`undo_from` ignores `from`, undoing every entry —
+/// C-T5-ABORT gate F3b): DDL both before and after the savepoint in one
+/// txn. The ROLLBACK TO undoes exactly the post-savepoint DROP; the
+/// pre-savepoint statements (a CREATE, a TRUNCATE) keep their map
+/// changes, and the commit keeps them too. Under the mutant the
+/// rollback also unmaps the CREATE's storage and re-maps the TRUNCATE's
+/// old one.
+#[test]
+fn rollback_to_keeps_the_pre_savepoint_ddl_map_changes() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core.visible_ts();
+    let (oid, sid0) = rig.create_table(&t0, s0, b"t");
+    ok(rig.commit_rc(t0));
+    assert!(rig.storage_maps(&table_key(sid0, "p"), oid as u32));
+
+    let t = rig.rc();
+    let s = rig.core.visible_ts();
+    // Before the savepoint: CREATE n, then TRUNCATE t.
+    let (oid_n, sid_n) = rig.create_table(&t, s, b"n");
+    let sid1 = rig.truncate_table(&t, s, oid);
+    assert!(!rig.storage_maps(&table_key(sid0, "p"), oid as u32));
+    assert!(rig.storage_maps(&table_key(sid1, "p"), oid as u32));
+    let sp = ok(t.savepoint());
+    // After the savepoint: DROP t.
+    rig.drop_table(&t, s, oid);
+    assert!(!rig.storage_maps(&table_key(sid1, "p"), oid as u32));
+
+    ok(rig.core.rollback_to(&t, sp));
+
+    // The DROP alone is undone: t's row is back, its (pre-savepoint
+    // truncated) storage mapped, the CREATE's storage still mapped, the
+    // TRUNCATE's old storage still retired.
+    assert!(
+        rig.rel_row(oid).is_some(),
+        "t survived the rolled-back DROP"
+    );
+    assert!(rig.storage_maps(&table_key(sid1, "p"), oid as u32));
+    assert!(rig.storage_maps(&table_key(sid_n, "p"), oid_n as u32));
+    assert!(!rig.storage_maps(&table_key(sid0, "p"), oid as u32));
+
+    // The txn commits with exactly that map.
+    ok(rig.commit_rc(t));
+    assert!(rig.storage_maps(&table_key(sid1, "p"), oid as u32));
+    assert!(rig.storage_maps(&table_key(sid_n, "p"), oid_n as u32));
+    assert!(!rig.storage_maps(&table_key(sid0, "p"), oid as u32));
+    assert!(
+        rig.rel_row(oid_n).is_some(),
+        "the pre-savepoint CREATE stands"
+    );
+}

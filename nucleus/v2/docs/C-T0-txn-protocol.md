@@ -1,6 +1,6 @@
 # C-T0: Transaction protocol (normative)
 
-Status: draft 7.5 (adversarial review rounds 1-6 applied, G0 representation fixed; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
+Status: draft 7.6 (adversarial review rounds 1-6 applied, G0 representation fixed; changelog at the bottom). Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`) needs a spec change first, then the G0 model updated, then code.
 
 Scope: single node. Isolation levels: RC (PostgreSQL semantics), RR = SI, SERIALIZABLE = SSI. 2PC (`PREPARE TRANSACTION`) is refused with 0A000 in 2.0. Target behaviour is PostgreSQL 17; every deliberate divergence is listed in §12.
 
@@ -263,7 +263,7 @@ Writes and locks are tagged with the seq current **when they execute**, not with
 ## 7. Abort, crash, resolution, status truncation
 
 ### 7.1 Abort
-The owning session (§6) sets status `Aborted` in memory, releases its in-memory locks, bumps its wake generation and wakes waiters, marks itself `released`, then queues an async cleanup of its intents (§7.3 rules), found through its write-set log. Nothing is persisted. SSI state follows §8.6.
+The owning session (§6), outside any latch and while still `Pending`, first reverts the in-memory side effects its executed DDL made under relation locks (the §10 SSI storage-map journal is undone), so no session can acquire a relation while the map still reflects the aborting DDL. It then sets status `Aborted` in memory, releases its in-memory locks, bumps its wake generation and wakes waiters, marks itself `released`, then queues an async cleanup of its intents (§7.3 rules), found through its write-set log. Nothing is persisted. SSI state follows §8.6.
 
 ### 7.2 Crash
 On boot, `epoch += 1` (synced). Load every persisted `Committed` record and `/sys/gc_w`; set `visible_ts = ts_hwm` (§3). An intent whose owner has `owner.epoch < current` and no `Committed` record is Aborted. That is O(1) per lookup; cleanup is lazy (on encounter in §5, or by the C-B1 sweep).
@@ -357,7 +357,7 @@ Unresolved committed intents are safe: GC only drops versions older than a kept 
 ## 10. Other rules
 - **Storage ids:** u64, allocated from a persisted counter, never reused. Catalog rows map relation and index oids to their current storage ids.
 - **Sequences:** non-transactional; the high-water mark is persisted (synced) before a value from a new block is handed out. Values may skip, never repeat.
-- **Catalog:** rows in `/sys/catalog`, versioned like any table; DDL is transactional and takes AccessExclusive. The GC rules (§9.2) apply to data prefixes and `/sys/catalog/` only; every other `/sys/` key is never dropped by the filter, even if its bytes match the version-key pattern.
+- **Catalog:** rows in `/sys/catalog`, versioned like any table; DDL is transactional and takes AccessExclusive. A DDL's SSI storage-map changes are settled while its AccessExclusive still conflicts: before `Aborted` on abort (§7.1), and before the relation locks are released on `ROLLBACK TO` (§5.5) and commit (§3 step 5). (An `Aborted` holder never conflicts, §6, so settling after `Aborted` would let a writer into the old storage range while it is unmapped and drop its rw-edges.) The GC rules (§9.2) apply to data prefixes and `/sys/catalog/` only; every other `/sys/` key is never dropped by the filter, even if its bytes match the version-key pattern.
 - **Large txns:** intents, write-set log and SIREAD state all spill; the 10M-row gate measures commit latency, reader latency during resolution and abort cleanup time.
 
 ## 11. Invariants and the G0 model
@@ -472,6 +472,7 @@ Known divergences from PostgreSQL 17:
 
 ## Changelog
 
+- **Draft 7.6** (2026-10-10, C-T5r2 gate): §7.1 the aborting session settles its DDL's SSI storage-map journal while still `Pending`, before `Aborted`; §10 states when map changes settle. The gate reproduced write skew through the old order (an acquirer granted the relation because the holder was already `Aborted` wrote into the still-unmapped old range and no rw-edge was recorded). Card C-T5-ABORT.
 - **Draft 7.4** (2026-10-10, ESCALATE-1 from G2, card C-OC-LIVE): §5.5 `ROLLBACK TO` bumps the wake generation only if it released something; a rollback that released nothing no longer wakes (and so no longer tears down) its waiters' wait-for edges, so restarting ON CONFLICT statements present a stable cycle to the deadlock check (I-LIVE b). §5.3.1(2) a non-arbiter unique wait during an attempt is an ordinary §5.1 wait in place (PostgreSQL `UNIQUE_CHECK_YES`); only arbiter keys abandon. §6 wake-generation and Waking wording follow. The symmetric speculative-insert race is named as a known residual (C-OC-TIE).
 - **Draft 7.5** (2026-10-10, card C-OC-TIE): §5.3.1(2) an attempt places the `/t/` key and all entries in ascending key order, so two attempts cannot abandon on each other's freshly placed arbiter entries and restart in lockstep. Gate finding on 7.5: the order covers only step 2's own placements, and BEFORE ROW triggers inside the attempt could still write each other's arbiter keys and restart in lockstep (903 restarts measured); §5.3.1 now runs BEFORE ROW INSERT triggers once per proposed row before the first attempt, as PostgreSQL does, which closes the 7.4 residual.
 - **Draft 7.3** (2026-10-08, from drafting C-T2..C-SIM): §3.1 lock-table, waiter-table and status mutexes are leaves. §6 the waiter's re-check runs in the same graph critical section as the edge insert (otherwise a stale edge can give a false 40P01); `ROLLBACK TO` releases relation locks taken after the savepoint; queues are not fair; advisory locks xact scope only. §8.6 safe snapshots and `DEFERRABLE` not implemented; check at pre-commit only. §9.1 `/sys/ts_clock` conversion defined. §10 GC rules skip `/sys/` except the catalog. §12 Q1 deferred to executor cards, Q4 gates release not C-T2, Q5-Q7 added.
