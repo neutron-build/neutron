@@ -13,17 +13,16 @@
 //! counts its 23503-covered delete attempts on the contested parents,
 //! and the test asserts a nonzero count — the cover/race dynamic, not
 //! just each thread's first txn, is what the soak must keep exercising.
-//! A checker
-//! thread verifies I-FK at registered snapshots while they run. A
-//! recycler thread repeatedly deletes each key's winning row (round 3:
-//! key recycling — every key goes dead→live many times, so the insert
-//! step's unique check keeps meeting concurrent winners, the M5/M10
-//! window), quiescing the key while it checks the generation's oracle.
-//! Afterwards: each arbiter key has exactly one live row whose value is
-//! (committed upserts on the key since its last recycle) - 1 — no lost
-//! upsert, never two rows for one key — no committed child without its
-//! parent, no intent remains once the jobs drain, and every surviving
-//! status entry has count 0 (I-COUNT).
+//! A checker thread verifies I-FK at registered snapshots while they
+//! run. A recycler thread repeatedly deletes each key's winning row
+//! (round 3: key recycling — every key goes dead→live many times, so
+//! the insert step's unique check keeps meeting concurrent winners, the
+//! M5/M10 window), quiescing the key while it checks the generation's
+//! oracle. Afterwards: each arbiter key has exactly one live row whose
+//! value is (committed upserts on the key since its last recycle) - 1 —
+//! no lost upsert, never two rows for one key — no committed child
+//! without its parent, no intent remains once the jobs drain, and every
+//! surviving status entry has count 0 (I-COUNT).
 
 mod c_t2c_support;
 
