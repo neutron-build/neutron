@@ -15,8 +15,8 @@ use std::sync::Arc;
 use nucleus_txn::boot::Core;
 use nucleus_txn::commit::{ProbePoint, SyncCommit};
 use nucleus_txn::encoding::{
-    decode_intent, decode_version, end_key, intent_key, parse_key, parse_sys_txn_key,
-    sys_txn_prefix, sys_txn_prefix_end, Entry,
+    decode_intent, decode_version, end_key, intent_key, parse_key, parse_sys_txn_key, sys_log_key,
+    sys_txn_key, sys_txn_prefix, sys_txn_prefix_end, Entry, SYS_PREFIX,
 };
 use nucleus_txn::read::{self, NoSsi};
 use nucleus_txn::txn::Isolation;
@@ -128,6 +128,12 @@ pub fn probe_point(sim: &mut Sim, point: ProbePoint) {
                     }
                     if ts != Ts::ZERO {
                         on_ack(sim, &tid);
+                        if sim.violation.is_some() {
+                            return;
+                        }
+                        // C-SIMr2: I-LOG, at the moment the pipeline sends
+                        // the ack (the record must already be written).
+                        on_ack_records(sim, &tid, ts);
                         if sim.violation.is_some() {
                             return;
                         }
@@ -419,6 +425,117 @@ pub fn on_ack(sim: &mut Sim, id: &TxnId) {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I-LOG: the commit-path records against the ghost model (C-SIMr2)
+// ---------------------------------------------------------------------------
+
+/// The `/sys/log/` range: `[prefix, prefix_end)` covers exactly its records
+/// (`/sys/log/` sorts before `/sys/txn/`, so the §7.4 status scan above
+/// never sees them, and vice versa).
+fn sys_log_prefix() -> Vec<u8> {
+    let mut k = SYS_PREFIX.to_vec();
+    k.extend_from_slice(b"log/");
+    k
+}
+
+/// See [`sys_log_prefix`]: the exclusive upper bound (`/sys/log0`).
+fn sys_log_prefix_end() -> Vec<u8> {
+    let mut k = sys_log_prefix();
+    let last = k.len() - 1;
+    k[last] = k[last].saturating_add(1);
+    k
+}
+
+/// Splits a `/sys/log/{TxnId}` key back into its id (`be32(epoch) ‖ be64(n)`,
+/// the same shape [`parse_sys_txn_key`] reads).
+fn parse_sys_log_key(key: &[u8]) -> Option<TxnId> {
+    let tail = key.strip_prefix(SYS_PREFIX)?.strip_prefix(b"log/")?;
+    if tail.len() != 12 {
+        return None;
+    }
+    let mut e = [0u8; 4];
+    e.copy_from_slice(&tail[..4]);
+    let mut n = [0u8; 8];
+    n.copy_from_slice(&tail[4..]);
+    Some(TxnId {
+        epoch: u32::from_be_bytes(e),
+        n: u64::from_be_bytes(n),
+    })
+}
+
+/// A big-endian `Ts` record value, if it decodes.
+fn ts_of(v: &[u8]) -> Option<Ts> {
+    (v.len() == 8).then(|| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(v);
+        Ts(u64::from_be_bytes(b))
+    })
+}
+
+/// I-LOG, ack half: at a quiescent point where the simulator observes a
+/// commit ack (the session's poll, the pipeline's `Acked` probe point, the
+/// end-of-run drain), read the commit-path records through the
+/// simulator's KV (latest state: no view to register, no scheduling draws)
+/// and check them against the ghost model:
+///
+/// - the `/sys/txn/{id}` commit record carries **exactly the acked ts** —
+///   a wrong ts in the persisted record is invisible to every other oracle
+///   (the status table, `visible_ts` and the resolved data all keep the
+///   real one);
+/// - a commit that submitted a `/sys/log` payload (every non-SER commit
+///   with a write set, C-SIMr2) has the record, byte for byte — an ack
+///   before the record is written leaves it absent here.
+///
+/// A txn whose records were truncated (§7.4 deletes both with the status;
+/// the ghost observed it) promises nothing.
+pub fn on_ack_records(sim: &mut Sim, id: &TxnId, ts: Ts) {
+    if ts == Ts::ZERO {
+        return; // the no-write fast path writes no record
+    }
+    if sim.ghost.txns.get(id).is_some_and(|t| t.truncated_seen) {
+        return;
+    }
+    let record = match sim.core.latest_get(&sys_txn_key(*id)) {
+        Ok(v) => v,
+        Err(e) => {
+            flag_bad_state(sim, format!("read of the commit record of {id:?}: {e:?}"));
+            return;
+        }
+    };
+    match record.as_deref().and_then(ts_of) {
+        Some(r) if r == ts => {}
+        other => {
+            sim.violate(
+                "I-LOG",
+                format!(
+                    "the /sys/txn record of {id:?} reads {other:?} at its ack (acked ts {ts:?})"
+                ),
+            );
+            return;
+        }
+    }
+    let Some(payload) = sim.ghost.txns.get(id).and_then(|t| t.log_payload.clone()) else {
+        return; // committed without a /sys/log record (SER or the fast path)
+    };
+    let log = match sim.core.latest_get(&sys_log_key(*id)) {
+        Ok(v) => v,
+        Err(e) => {
+            flag_bad_state(sim, format!("read of the /sys/log record of {id:?}: {e:?}"));
+            return;
+        }
+    };
+    if log.as_deref() != Some(payload.as_slice()) {
+        sim.violate(
+            "I-LOG",
+            format!(
+                "the /sys/log record of {id:?} at its ack is {:?} ({} bytes were submitted)",
+                log.as_deref().map(|v| v.len()),
+                payload.len()
+            ),
+        );
     }
 }
 
@@ -1281,6 +1398,54 @@ pub fn on_reboot(sim: &mut Sim, core: &Core<super::SimKv>) {
             }
         }
         sim.ghost.commit_at(*id, *ts);
+    }
+    // C-SIMr2: the I-LOG crash-recovery half. The `/sys/log/{TxnId}` record
+    // is written in the same batch as the commit record (§3 step 2), so a
+    // surviving one implies its batch — and the commit record — survived:
+    // every surviving `/sys/log` record must pair with a loaded commit
+    // record and match the payload its session submitted (the ghost's
+    // copy). An atomicity break between the log write and the commit record
+    // (a log record without its commit record, or a payload mismatch)
+    // fires I-LOG.
+    {
+        let view = core.open_view();
+        let lo = sys_log_prefix();
+        let hi = sys_log_prefix_end();
+        let mut bad: Option<String> = None;
+        for entry in view.scan(
+            (
+                Bound::Included(lo.as_slice()),
+                Bound::Excluded(hi.as_slice()),
+            ),
+            false,
+        ) {
+            let (k, v) = match entry {
+                Ok(kv) => kv,
+                Err(e) => {
+                    flag_bad_state(sim, format!("kv scan error at reboot (/sys/log): {e:?}"));
+                    break;
+                }
+            };
+            let Some(id) = parse_sys_log_key(&k) else {
+                continue;
+            };
+            let paired = loaded.get(&id).copied();
+            let expected = sim.ghost.txns.get(&id).and_then(|t| t.log_payload.clone());
+            let ok = paired.is_some() && expected.as_deref() == Some(v.as_slice());
+            if !ok {
+                bad = Some(format!(
+                    "a surviving /sys/log record of {id:?} ({} bytes) with commit record \
+                     {paired:?} and submitted payload {:?} after the crash",
+                    v.len(),
+                    expected.as_deref().map(|p| p.len())
+                ));
+                break;
+            }
+        }
+        if let Some(what) = bad {
+            sim.violate("I-LOG", what);
+            return;
+        }
     }
     // Old-epoch txns the reboot did **not** load: their /sys/txn record is
     // either gone with a dropped batch (§7.2: an `off`-acked commit never
