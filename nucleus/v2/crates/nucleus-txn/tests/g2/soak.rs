@@ -1,7 +1,10 @@
 //! G2 soak: 8 threads over the 16-slot key space at each of RC, RR and SER,
 //! with deterministic seeds. The size is an iteration count (programs per
-//! thread, calibrated so the three levels run well under 20 s together in a
-//! debug build), never a wall-clock bound.
+//! thread), never a wall-clock bound. Every level runs the full
+//! `Mix::STANDARD` workload — upserts wherever they fall, writes on the FK
+//! parents — now that the engine fixes it existed to provoke are merged;
+//! the SER levels retry more (the mix's strictness is the point), so a SER
+//! seed costs on the order of ten seconds in a debug build.
 //!
 //! Asserted per level (the engine's promises, C-T0 §8 and §11):
 //!
@@ -20,8 +23,9 @@
 //! compact trace format on stderr, and the violation report in the panic.
 //!
 //! The soak must also be able to fail: a run of the same workload on a
-//! deliberately broken store (an RR claim with per-statement snapshots) is
-//! flagged, and an RC run judged as if it were SERIALIZABLE shows cycles.
+//! deliberately broken store (an RR claim with per-statement *read*
+//! snapshots; a hand-scheduled history of the same defect sits next to it)
+//! is flagged, and an RC run judged as if it were SERIALIZABLE shows cycles.
 
 use super::check::{check, Kind, Verdict};
 use super::history::{Fate, History, Level, OpKind};
@@ -102,7 +106,7 @@ fn summary(level: Level, seed: u64, v: &Verdict) {
 #[test]
 fn g2_soak_serializable() {
     for seed in SEEDS_SER {
-        let (run, verdict) = run_seed(Level::Serializable, seed, PROGS_PER_THREAD, Mix::SER);
+        let (run, verdict) = run_seed(Level::Serializable, seed, PROGS_PER_THREAD, Mix::STANDARD);
         summary(Level::Serializable, seed, &verdict);
         assert_sound(Level::Serializable, seed, &run, &verdict);
         assert!(
@@ -150,12 +154,18 @@ fn g2_soak_read_committed() {
     }
 }
 
-/// An RR claim on a store that snapshots per statement: the soak notices.
+/// An RR claim on a store that snapshots its reads per statement: the soak
+/// notices. The deterministic half of the check is the hand-scheduled
+/// history below; this one supplies the real-threads end-to-end half and
+/// must not flake: the `PerStmtReadSnapshot` defect leaves the writes on
+/// the txn snapshot (no abort churn to close the windows), and 240
+/// programs per thread on 8 real threads leave plenty of them — a
+/// concurrent commit landing between two read statements of one RR txn.
 #[test]
 fn g2_soak_broken_store_is_caught() {
     let mut cfg = Config::new(0x4732_00ff, Level::RepeatableRead);
-    cfg.progs = 60;
-    cfg.bug = Bug::PerStmtSnapshot;
+    cfg.progs = 240;
+    cfg.bug = Bug::PerStmtReadSnapshot;
     let run = run_workload(&cfg);
     let verdict = check(&run.history, Level::RepeatableRead);
     assert!(
@@ -163,6 +173,44 @@ fn g2_soak_broken_store_is_caught() {
         "the broken store went unnoticed: {:?}",
         verdict.stats
     );
+}
+
+/// The deterministic half of the broken-store check: a hand-scheduled
+/// history of exactly what a per-statement-read-snapshot store produces —
+/// an RR txn reads k00 at the setup value, D commits a new k00, the txn's
+/// next read sees it — and the checker flags the non-repeatable read.
+/// This cannot flake, whatever the thread scheduler does to the soak
+/// above. (The same history also reads skew — T both anti-depends on D
+/// and read its value — which the checker names as a same-key rw+wr
+/// two-cycle, LostUpdate.)
+#[test]
+fn g2_broken_store_history_is_caught() {
+    use super::history::{Hb, Obs, Val};
+    let iv = |k: u8| Val::new(1, u16::from(k) + 1); // the setup value of k
+    let mut hb = Hb::new();
+    let su = hb.begin(1, Level::ReadCommitted);
+    for &k in &[0u8, 2] {
+        hb.insert(su, k, iv(k));
+    }
+    hb.commit(su, 1);
+    let t = hb.begin(2, Level::RepeatableRead);
+    let d = hb.begin(3, Level::RepeatableRead);
+    hb.read(t, 0, Obs::Val(iv(0)));
+    hb.update(d, 0, iv(0), Val::new(3, 1));
+    hb.commit(d, 2);
+    // The broken store's per-statement read snapshot: T sees D's commit
+    // mid-txn and reads the new k00.
+    hb.read(t, 0, Obs::Val(Val::new(3, 1)));
+    hb.commit(t, 0);
+    let h = hb.finish();
+    let verdict = check(&h, Level::RepeatableRead);
+    assert!(
+        verdict.violates(Kind::NonRepeatableRead),
+        "the checker stayed silent about the broken store:\n{}{}",
+        verdict.report(&h),
+        h.trace()
+    );
+    assert!(verdict.violates(Kind::LostUpdate), "{}", verdict.report(&h));
 }
 
 // ----- determinism -------------------------------------------------------------
@@ -242,75 +290,96 @@ fn g2_same_seed_same_op_streams() {
     }
 }
 
-// ----- ESCALATE -----------------------------------------------------------------
+// ----- pins of the merged engine fixes -----------------------------------------
+//
+// G2 once shipped these as `#[ignore = "ESCALATE: .."]` repros of two
+// engine bugs and two workload restrictions that kept the soaks green
+// around them. Both bugs are fixed on the base (C-OC-LIVE: an ON CONFLICT
+// restart cycle ends in exactly one 40P01; C-FK-SSI: the SER FK child
+// check records its reader-side rw edges), so the repros are now plain
+// assertions of the fixed behaviour and the restrictions are gone.
 
-/// ESCALATE (engine liveness bug found by the soak; the engine is not
-/// touched by this card). Two sessions each hold a row and then upsert the
-/// row the other holds. Every restart of an `INSERT .. ON CONFLICT` attempt
-/// (C-T0 5.3.1: "abandon exactly as ROLLBACK TO") bumps the abandoning txn's
-/// wake generation and wakes its waiters (5.5) even when the abandon dropped
-/// nothing, so the two upserts keep waking each other, neither wait lasts
-/// `deadlock_timeout`, no 40P01 is ever raised and both threads spin (I-LIVE
-/// b is violated). The same script with plain UPDATEs ends in one 40P01
-/// (`g2_live_ww_deadlock_is_broken_once`). The soak's generator keeps an
-/// upsert off any txn that already holds a lock, so it does not trip this.
+/// The pin of the C-OC-LIVE fix (the former ESCALATE-1 repro): two
+/// sessions each hold a row and then upsert (`ON CONFLICT (pk) DO UPDATE`)
+/// the row the other holds. With `rollback_to` bumping the wake generation
+/// only when it released something (C-T0 5.5) and non-arbiter unique waits
+/// waiting in place (5.3.1), the two restarting upserts leave a stable
+/// wait-for cycle and the deadlock check breaks it with exactly one 40P01
+/// at `deadlock_timeout`. There is no watchdog: the bound is *asserted*
+/// (a whole repeat, barrier included, stays far below it), not enforced
+/// by cancelling — a regression hangs the test rather than aborting the
+/// process. Ten repeats, each on a fresh rig.
 #[test]
-#[ignore = "ESCALATE: ON CONFLICT restart livelocks two upserts that wait on each other (no 40P01)"]
-fn g2_escalate_upsert_cycle_livelocks() {
+fn g2_upsert_cycle_ends_in_one_deadlock() {
     use super::history::SqlErr;
     use super::runner::Rig;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Barrier;
+    use std::time::{Duration, Instant};
 
-    let rig = Rig::new(5);
-    rig.setup();
-    let barrier = Barrier::new(2);
-    let finished = AtomicBool::new(false);
-    let go = |id: u16, first: u8, second: u8| -> Result<(), SqlErr> {
-        let mut s = rig.session(id, Level::ReadCommitted);
-        s.update(first)?;
-        barrier.wait();
-        s.upsert(second)?;
-        s.commit()
-    };
-    let (r1, r2) = std::thread::scope(|sc| {
-        // Not a timing assertion: it only turns a livelock into a failure.
-        sc.spawn(|| {
-            for _ in 0..200 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if finished.load(Ordering::SeqCst) {
-                    return;
-                }
-            }
-            eprintln!("g2: the upsert cycle never resolved (livelock)");
-            std::process::abort();
+    const REPEATS: usize = 10;
+    let mut total_deadlocks = 0usize;
+    for _ in 0..REPEATS {
+        let rig = Rig::new(5);
+        rig.setup();
+        let barrier = Barrier::new(2);
+        let go = |id: u16, first: u8, second: u8| -> Result<(), SqlErr> {
+            let mut s = rig.session(id, Level::ReadCommitted);
+            s.update(first)?;
+            barrier.wait();
+            s.upsert(second)?;
+            s.commit()
+        };
+        let t0 = Instant::now();
+        let (r1, r2) = std::thread::scope(|sc| {
+            let a = sc.spawn(|| go(1, 0, 2));
+            let b = sc.spawn(|| go(2, 2, 0));
+            (a.join().expect("t1"), b.join().expect("t2"))
         });
-        let a = sc.spawn(|| go(1, 0, 2));
-        let b = sc.spawn(|| go(2, 2, 0));
-        let r = (a.join().expect("t1"), b.join().expect("t2"));
-        finished.store(true, Ordering::SeqCst);
-        r
-    });
-    let deadlocks = [&r1, &r2]
-        .iter()
-        .filter(|r| matches!(r, Err(SqlErr::Deadlock)))
-        .count();
-    assert_eq!(deadlocks, 1, "{r1:?} {r2:?}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the upsert cycle resolved in {:?} (deadlock_timeout is 5 ms)",
+            t0.elapsed()
+        );
+        let deadlocks = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(SqlErr::Deadlock)))
+            .count();
+        assert_eq!(deadlocks, 1, "exactly one 40P01: {r1:?} {r2:?}");
+        assert_eq!(
+            [&r1, &r2].iter().filter(|r| r.is_ok()).count(),
+            1,
+            "the other side completes: {r1:?} {r2:?}"
+        );
+        total_deadlocks += deadlocks;
+        // The history agrees: the 40P01 sat on a potential wait-for cycle,
+        // nothing leaked, and the surviving txn left no anomaly.
+        let run = rig.finish();
+        let verdict = check(&run.history, Level::ReadCommitted);
+        assert_eq!(verdict.stats.e40p01, 1, "{}", verdict.report(&run.history));
+        assert_eq!(verdict.stats.deadlocks_explained, 1);
+        assert!(
+            verdict.violations().is_empty(),
+            "{}{}",
+            verdict.report(&run.history),
+            run.leak_report
+        );
+        assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
+    }
+    assert_eq!(total_deadlocks, REPEATS, "every repeat broke its cycle");
 }
 
-/// ESCALATE (engine SSI bug found by the soak; the engine is not touched by
-/// this card). `Core::fk_check_child` registers the SIREAD on the parent but
-/// reads it with `NoSsi`, so the reader-side rw edge to a parent writer whose
-/// intent was placed *before* the SIREAD is dropped (C-T0 8.2 relies on that
-/// edge: "if W's intent placement precedes the opening of the view R reads k
-/// from, R sees the intent and records the edge"). Result: write skew that
-/// SERIALIZABLE lets through. A reads child c0 (absent) and updates parent p0;
-/// B inserts c0 and so reads p0. A plain `Ssi::read_key` in B's place aborts
-/// one of them (`g2_live_ser_plain_parent_read_aborts_one`).
+/// The pin of the C-FK-SSI fix (the former ESCALATE-2 repro): the
+/// SERIALIZABLE FK child check registers the SIREAD on the parent and
+/// reads it through SSI, so the reader-side rw edge to a concurrent parent
+/// writer survives and the write skew (A reads c0 absent and updates p0;
+/// B inserts c0 and so reads p0) closes into a cycle that SSI breaks by
+/// aborting exactly one of the pair. The control below proves the plain
+/// parent-read path already did.
 #[test]
-#[ignore = "ESCALATE: fk_check_child drops the reader-side rw edge (NoSsi): SER write skew"]
-fn g2_escalate_fk_parent_read_drops_rw_edge() {
+fn g2_fk_parent_read_records_rw_edge() {
+    use super::history::SqlErr;
     use super::runner::Rig;
+
     let rig = Rig::new(5);
     rig.setup();
     let mut a = rig.session(1, Level::Serializable);
@@ -318,19 +387,27 @@ fn g2_escalate_fk_parent_read_drops_rw_edge() {
     assert!(!a.update(14).expect("A reads c0"), "c0 does not exist yet");
     assert!(a.update(12).expect("A updates p0"));
     b.fk_insert(14).expect("B inserts c0 under p0");
-    a.commit().expect("A commits");
-    b.commit()
-        .expect("B commits: SSI missed the rw edge B -> A");
+    let ra = a.commit();
+    let rb = b.commit();
+    assert!(
+        ra.is_err() != rb.is_err(),
+        "exactly one of the pair aborts: {ra:?} {rb:?}"
+    );
+    for r in [ra, rb] {
+        if let Err(e) = r {
+            assert_eq!(e, SqlErr::SerFailure, "the abort is a 40001: {e:?}");
+        }
+    }
     let run = rig.finish();
     let verdict = check(&run.history, Level::Serializable);
     assert!(
         verdict.serializable(),
-        "SERIALIZABLE committed a non-serializable pair:\n{}",
+        "SERIALIZABLE let a non-serializable pair through:\n{}",
         verdict.report(&run.history)
     );
 }
 
-/// The control for the ESCALATE above: the same shape with B reading the
+/// The control for the pin above: the same shape with B reading the
 /// parent through the SSI read path loses one of the two.
 #[test]
 fn g2_live_ser_plain_parent_read_aborts_one() {
@@ -354,14 +431,22 @@ fn g2_live_ser_plain_parent_read_aborts_one() {
     assert!(verdict.serializable(), "{}", verdict.report(&run.history));
 }
 
-/// The full-mix SERIALIZABLE soak (FK parents written too): fails with a
-/// cycle through an FK parent read until the ESCALATE above is fixed.
+/// The full-mix SERIALIZABLE soak (FK parents written too) over four more
+/// seeds: with the FK child check recording its reader-side rw edges
+/// (C-FK-SSI, merged) the strict workload — the one `Mix::STANDARD` always
+/// ran at RC and RR — holds at SER as well.
 #[test]
-#[ignore = "ESCALATE: fk_check_child drops the reader-side rw edge (NoSsi): SER write skew"]
 fn g2_soak_serializable_fk_parent_writes() {
     for seed in [0x4732_0013, 0x4732_0014, 0x4732_0015, 0x4732_0016] {
         let (run, verdict) = run_seed(Level::Serializable, seed, PROGS_PER_THREAD, Mix::STANDARD);
         summary(Level::Serializable, seed, &verdict);
         assert_sound(Level::Serializable, seed, &run, &verdict);
+        assert!(
+            verdict.serializable(),
+            "SER run not serializable:\n{}",
+            verdict.report(&run.history)
+        );
+        assert!(verdict.stats.committed > 500, "{:?}", verdict.stats);
+        assert_eq!(verdict.stats.f_unexplained, 0);
     }
 }
