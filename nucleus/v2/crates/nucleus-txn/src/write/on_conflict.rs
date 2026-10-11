@@ -22,6 +22,11 @@
 //! key itself can be an arbiter ([`ProposedRow::pk_arbiter`]): §5.3 with
 //! §5.3.1 includes the `/t/` key in the arbiter set, where a live version
 //! names exactly one row, itself, so `r = t_key`.
+//!
+//! C-OC-TIE: §5.3.1(2) every attempt places its ops — the `/t/` key, arbiter
+//! entries and non-arbiter entries — in ascending key order, so two
+//! attempts that both passed the pre-check can never abandon on each other's
+//! freshly placed arbiter entries.
 
 use std::time::Instant;
 
@@ -224,16 +229,37 @@ impl<K: OrderedKv> Core<K> {
         self.arbiter_insert(txn, actx, row, deadline)
     }
 
-    /// §5.3.1(2): the row and every entry as key-existence ops at `sa`. An
-    /// **arbiter** key's unique conflict or wait abandons the attempt; a
-    /// non-arbiter key's wait is an ordinary §5.1 key-existence wait: the
-    /// attempt keeps its layers and waits in place, re-stepping the same
-    /// op (PostgreSQL's `UNIQUE_CHECK_YES` waits on non-arbiter indexes).
-    /// Abandoning on a non-arbiter wait would release the layers the
-    /// attempt has already placed, bump the wake generation and recreate
-    /// the ESCALATE-1 livelock: two upserts each waiting on the other's
-    /// pending non-arbiter value would keep waking each other and never
-    /// leave a stable cycle for the deadlock check (I-LIVE b).
+    /// §5.3.1(2): the row and every entry as key-existence ops at `sa`,
+    /// placed in **ascending key order** — one global order over every op:
+    /// the `/t/` key, arbiter entries and non-arbiter entries alike.
+    /// Placement order is the only thing that can let two attempts that
+    /// both passed the pre-check abandon on each other: placing in the
+    /// caller's order, two rows can take shared arbiter keys as X,Y and
+    /// Y,X, each attempt then meets the other's freshly placed arbiter
+    /// entry and abandons. Both abandons release real layers and so bump,
+    /// legitimately (§5.5); each wakes the other, and both restart in
+    /// lockstep. With one global order, an attempt blocked at key `k`
+    /// holds exactly its keys `< k`, so "A is blocked by B's attempt at
+    /// `k_A` while B is blocked by A's at `k_B`" needs both `k_B < k_A`
+    /// and `k_A < k_B` — and the same contradiction breaks any cycle of
+    /// attempts. The loser abandons once and waits on a winner that
+    /// released nothing and so does not bump. This is the unique-index
+    /// analogue of PostgreSQL's fixed index insertion order under the
+    /// btree leaf lock (`_bt_check_unique` checks and places atomically
+    /// and never waits); PG's in-place `CEOUC_LIVELOCK_PREVENTING_WAIT`
+    /// tiebreak applies only to exclusion constraints and is deliberately
+    /// not used: an in-place wait on an arbiter key would hold the
+    /// attempt's layers while waiting and create deadlocks PG's unique
+    /// path never has. An **arbiter** key's unique conflict or wait
+    /// abandons the attempt; a non-arbiter key's wait is an ordinary §5.1
+    /// key-existence wait: the attempt keeps its layers and waits in
+    /// place, re-stepping the same op (PostgreSQL's `UNIQUE_CHECK_YES`
+    /// waits on non-arbiter indexes). Abandoning on a non-arbiter wait
+    /// would release the layers the attempt has already placed, bump the
+    /// wake generation and recreate the ESCALATE-1 livelock: two upserts
+    /// each waiting on the other's pending non-arbiter value would keep
+    /// waking each other and never leave a stable cycle for the deadlock
+    /// check (I-LIVE b).
     /// With `pk_arbiter` the `/t/` key's unique check is the arbiter
     /// check: a live entry of another row abandons and restarts from (1)
     /// (which then finds the conflict), never 23505.
@@ -244,8 +270,11 @@ impl<K: OrderedKv> Core<K> {
         row: &ProposedRow,
         deadline: Option<Instant>,
     ) -> Result<Attempt, TxnError> {
-        let mut ops: Vec<(KeyOpTask, bool)> = Vec::with_capacity(row.entries.len() + 1);
+        // Each op carries its key so the sort below orders the real
+        // placement (the task itself keeps its key private).
+        let mut ops: Vec<(Key, KeyOpTask, bool)> = Vec::with_capacity(row.entries.len() + 1);
         ops.push((
+            row.t_key.clone(),
             KeyOpTask::new(
                 &row.t_key,
                 None,
@@ -257,6 +286,7 @@ impl<K: OrderedKv> Core<K> {
         ));
         for e in &row.entries {
             ops.push((
+                e.key.clone(),
                 KeyOpTask::new(
                     &e.key,
                     None,
@@ -269,7 +299,10 @@ impl<K: OrderedKv> Core<K> {
                 e.arbiter,
             ));
         }
-        for (mut task, arbiter) in ops {
+        // §5.3.1(2): every op of the attempt places in ascending key
+        // order. Stable, so equal keys keep the build order.
+        ops.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_key, mut task, arbiter) in ops {
             loop {
                 match task.step(self, txn) {
                     Ok(Step::Done(RowOutcome::Applied)) => break,
