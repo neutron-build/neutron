@@ -4,10 +4,11 @@
 //!
 //! Every txn has a wake generation `gen(T)` in its status entry, bumped on
 //! every event that can unblock its waiters: commit step 5 (§3), abort
-//! (§7.1), `ROLLBACK TO`/[`Core::bump_and_wake`], any release of an
-//! in-memory lock it holds. Whoever wakes waiters **bumps first, then
-//! wakes** (§6 "Waking"), so a parked waiter always sees the new
-//! generation when it re-checks.
+//! (§7.1), a `ROLLBACK TO` that released something (§5.5) — one that
+//! released nothing bumps nothing, because none of its waiters can be
+//! unblocked by it — and any release of an in-memory lock it holds.
+//! Whoever wakes waiters **bumps first, then wakes** (§6 "Waking"), so a
+//! parked waiter always sees the new generation when it re-checks.
 //!
 //! ## The graph
 //!
@@ -700,13 +701,14 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
     }
 
     /// Bumps `txn`'s wake generation and wakes its waiters (§6 "Waking"):
-    /// the one wake path — commit step 5, abort, `ROLLBACK TO` (§5.5) and
-    /// every in-memory lock release. Under the graph mutex: bump the
-    /// generation (the status table mutex is a leaf, §3.1), remove every
-    /// edge `* -> txn`, take `txn`'s slots; release the mutex; then
-    /// unpark. A waiter registering with the new generation can only do
-    /// so after this critical section, so its edge and slot survive.
-    /// Spurious unparks are harmless — waiters re-check the generation.
+    /// the one wake path — commit step 5, abort, a `ROLLBACK TO` that
+    /// released something (§5.5) and every in-memory lock release. Under
+    /// the graph mutex: bump the generation (the status table mutex is a
+    /// leaf, §3.1), remove every edge `* -> txn`, take `txn`'s slots;
+    /// release the mutex; then unpark. A waiter registering with the new
+    /// generation can only do so after this critical section, so its edge
+    /// and slot survive. Spurious unparks are harmless — waiters re-check
+    /// the generation.
     pub fn bump_and_wake(&self, txn: TxnId) -> Result<u64, crate::TxnError> {
         let (gen, slots) = {
             let mut g = self.waits.lock_graph();

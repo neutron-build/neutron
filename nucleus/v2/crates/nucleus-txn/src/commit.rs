@@ -300,9 +300,13 @@ pub trait ReleaseHook: Send + Sync {
     /// `ROLLBACK TO SAVEPOINT s` (§5.5): release relation and advisory
     /// locks taken at seq `>= s` (shared row locks are released by
     /// [`Core::rollback_to`](crate::write) itself, under each key's latch).
-    /// No-op by default; C-T2b implements it.
-    fn release_from(&self, txn: TxnId, from_seq: crate::Seq) {
+    /// Returns whether any relation or advisory acquisition was removed,
+    /// so the caller bumps and wakes only when a waiter can be unblocked
+    /// (§5.5: a rollback that released nothing wakes nobody). The default
+    /// releases nothing and returns `false`; C-T2b implements it.
+    fn release_from(&self, txn: TxnId, from_seq: crate::Seq) -> bool {
         let _ = (txn, from_seq);
+        false
     }
 }
 

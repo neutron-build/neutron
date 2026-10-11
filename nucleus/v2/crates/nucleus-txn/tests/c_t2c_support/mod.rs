@@ -18,12 +18,39 @@ use nucleus_txn::resolver::Resolver;
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::write::{CommittedVersion, Epq, EpqDecision, RowOp, StmtCtx, UniqueRule};
-use nucleus_txn::{Intent, Ts, TxnError};
+use nucleus_txn::{Intent, Ts, TxnError, TxnId};
 
 pub fn ok<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> T {
     match r {
         Ok(v) => v,
         Err(e) => panic!("unexpected error: {e:?}"),
+    }
+}
+
+/// A [`nucleus_txn::wait::WaitHook`] that counts wait starts and ends:
+/// C-OC-LIVE bounds a scenario's total waits (a livelock spins in the
+/// hundreds of thousands; a healthy cycle makes a handful).
+pub struct CountingWaits {
+    pub starts: AtomicUsize,
+    pub ends: AtomicUsize,
+}
+
+impl CountingWaits {
+    pub fn new() -> Arc<CountingWaits> {
+        Arc::new(CountingWaits {
+            starts: AtomicUsize::new(0),
+            ends: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl nucleus_txn::wait::WaitHook for CountingWaits {
+    fn on_wait_start(&self, _waiter: TxnId, _target: TxnId) {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_wait_end(&self, _waiter: TxnId, _target: TxnId) {
+        self.ends.fetch_add(1, Ordering::SeqCst);
     }
 }
 

@@ -495,25 +495,42 @@ impl ReleaseHook for LockManager {
     }
 
     /// §5.5 `ROLLBACK TO s`: drop this txn's relation and advisory
-    /// acquisitions taken at `seq >= s` (§6). The wake is
+    /// acquisitions taken at `seq >= s` (§6), and return whether any was
+    /// removed, so [`Core::rollback_to`]'s bump-and-wake runs only when a
+    /// waiter can be unblocked (§5.5: a rollback that released nothing
+    /// wakes nobody). The wake itself is
     /// [`Core::rollback_to`](crate::boot::Core::rollback_to)'s own
     /// bump-and-wake, which runs right after this — the same way commit
     /// step 5 wakes after `release_all`.
-    fn release_from(&self, txn: TxnId, from_seq: Seq) {
+    fn release_from(&self, txn: TxnId, from_seq: Seq) -> bool {
+        let mut released = false;
         {
             let mut rel = self.lock_relations();
+            let before: usize = rel.values().map(Vec::len).sum();
             for acs in rel.values_mut() {
                 acs.retain(|a| !(a.txn == txn && a.seq >= from_seq));
             }
             rel.retain(|_, acs| !acs.is_empty());
+            // Lengths compared before and after: `true` iff some `retain`
+            // removed an acquisition (a relation re-acquired by the same
+            // txn at an earlier seq keeps its entry, so the map's key
+            // count alone is not enough).
+            if rel.values().map(Vec::len).sum::<usize>() != before {
+                released = true;
+            }
         }
         {
             let mut adv = self.lock_advisory();
+            let before: usize = adv.values().map(Vec::len).sum();
             for entries in adv.values_mut() {
                 entries.retain(|e| !(e.txn == txn && e.seq >= from_seq));
             }
             adv.retain(|_, entries| !entries.is_empty());
+            if adv.values().map(Vec::len).sum::<usize>() != before {
+                released = true;
+            }
         }
+        released
     }
 }
 

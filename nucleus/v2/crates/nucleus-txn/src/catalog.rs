@@ -201,16 +201,21 @@ impl MapJournal {
     }
 
     /// §5.5 `ROLLBACK TO s`: undo the entries tagged `>= s`, keep the rest.
-    fn undo_from(&self, txn: TxnId, from: Seq, ssi: &Ssi) {
+    /// Returns whether at least one entry was undone, so
+    /// [`CatalogRelease::release_from`] can report whether the release
+    /// changed anything.
+    fn undo_from(&self, txn: TxnId, from: Seq, ssi: &Ssi) -> bool {
         let mut map = self.lock();
         let Some(entries) = map.get_mut(&txn) else {
-            return;
+            return false;
         };
         let split = entries.partition_point(|(seq, _)| *seq < from);
         let undone = entries.split_off(split);
+        let undid = !undone.is_empty();
         for (_, undo) in undone.into_iter().rev() {
             apply_undo(ssi, &undo);
         }
+        undid
     }
 }
 
@@ -271,12 +276,17 @@ impl ReleaseHook for CatalogRelease {
         }
     }
 
-    fn release_from(&self, txn: TxnId, from_seq: Seq) {
-        self.inner.release_from(txn, from_seq);
+    fn release_from(&self, txn: TxnId, from_seq: Seq) -> bool {
+        let mut released = self.inner.release_from(txn, from_seq);
         let (Some(journal), Some(ssi)) = (self.journal.upgrade(), self.ssi.upgrade()) else {
-            return;
+            return released;
         };
-        journal.undo_from(txn, from_seq, &ssi);
+        // The journal's undo counts as a release: the map change was part
+        // of what the rollback took away.
+        if journal.undo_from(txn, from_seq, &ssi) {
+            released = true;
+        }
+        released
     }
 }
 
