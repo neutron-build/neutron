@@ -1,7 +1,8 @@
 //! Test support for the C-T2c tests (copied from `tests/common`, which this
 //! card never edits): `ok`, the infinite-timeout parker, the I-COUNT
 //! checker, the shared-lock table double, an SSI hook that records the
-//! view counter at `before_point_read`, and a hand-driven rig.
+//! view counter at `before_point_read`, a hand-driven rig, and (C-T2c-r6)
+//! the deterministic arbiter-lock cycle world.
 #![allow(dead_code)]
 
 use std::cell::RefCell;
@@ -18,7 +19,7 @@ use nucleus_txn::resolver::Resolver;
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::write::{CommittedVersion, Epq, EpqDecision, RowOp, StmtCtx, UniqueRule};
-use nucleus_txn::{Intent, Ts, TxnError, TxnId};
+use nucleus_txn::{Intent, RowLockMode, Ts, TxnError, TxnId};
 
 pub fn ok<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> T {
     match r {
@@ -117,6 +118,214 @@ impl nucleus_txn::wait::Parker for OneParker {
     fn unpark(&self) {
         self.inner.unpark();
     }
+}
+
+/// C-T2c-r6: the arbiter-lock restart world. A statement under test
+/// restarts through the ON CONFLICT **arbiter-lock** wait (§5.3.1(3),
+/// `write/on_conflict.rs`'s lock loop) once per cycle, and the whole
+/// cycle is driven by the waiter's own park, so the interleaving is
+/// single-threaded and deterministic:
+///
+/// - [`ArbiterCycles::place_blocker`] — called from the statement's
+///   `on_attempt` hook, at the start of every attempt: a fresh pending
+///   txn takes a lock-only `NoKeyUpdate` intent on the row (a shared
+///   grant would not block the arbiter lock; a data intent would divert
+///   the attempt to the pre-check wait instead), so the attempt's
+///   arbiter lock must wait on it.
+/// - [`ArbiterCycles::advance`] — from [`CyclePark::park`], while that
+///   attempt is parked: the blocker updates the row in its own txn and
+///   commits; resolution leaves a version newer than the parked
+///   attempt's `v_r`, so the lock's re-step returns `Step::Restart` and
+///   the attempt restarts into the next cycle's wait. The next blocker
+///   is placed by the next attempt's `on_attempt`; nothing advances
+///   between parks, so every attempt finds a blocker and none ever
+///   slips past the lock.
+pub struct ArbiterCycles {
+    core: Arc<Core<MemKv>>,
+    pipeline: Mutex<CommitPipeline<MemKv>>,
+    row: Vec<u8>,
+    state: Mutex<CycleState>,
+    parks: AtomicUsize,
+    cycles: AtomicUsize,
+}
+
+#[derive(Default)]
+struct CycleState {
+    /// The pending lock-holder of the current cycle: placed by
+    /// `place_blocker`, consumed by `advance`.
+    blocker: Option<Txn>,
+    /// The next row value a blocker's update writes.
+    value: u64,
+    stopped: bool,
+}
+
+impl ArbiterCycles {
+    /// Attaches the one commit pipeline to `core` and pins the cycled row.
+    /// `Core::set_row_locks` must already have run on `core`.
+    pub fn new(core: Arc<Core<MemKv>>, row: &[u8]) -> ArbiterCycles {
+        ArbiterCycles {
+            pipeline: Mutex::new(ok(CommitPipeline::new(Arc::clone(&core)))),
+            core,
+            row: row.to_vec(),
+            state: Mutex::new(CycleState::default()),
+            parks: AtomicUsize::new(0),
+            cycles: AtomicUsize::new(0),
+        }
+    }
+
+    /// Places the current cycle's blocker: a pending lock-only
+    /// `NoKeyUpdate` intent on the row. Idempotent per cycle (the next
+    /// call only works after `advance` consumed the previous blocker).
+    pub fn place_blocker(&self) {
+        {
+            let st = self.state.lock().expect("cycle state");
+            if st.stopped || st.blocker.is_some() {
+                return;
+            }
+        }
+        let m = self.core.begin(Isolation::ReadCommitted);
+        let seq = ok(m.next_seq());
+        let lock = RowOp::Lock(RowLockMode::NoKeyUpdate);
+        ok(self.core.row_op(
+            &m,
+            &self.row,
+            None,
+            lock.clone(),
+            StmtCtx::new(self.core.visible_ts(), seq, seq),
+            &mut Fixed(lock),
+        ));
+        self.state.lock().expect("cycle state").blocker = Some(m);
+    }
+
+    /// One world advance, run from the waiter's park: the blocker updates
+    /// the row in its own txn and commits (the sync commit acks after
+    /// visibility), then the resolver writes the new version and removes
+    /// the intent. At return the row is free and one version newer.
+    fn advance(&self) {
+        let (m, value) = {
+            let mut st = self.state.lock().expect("cycle state");
+            if st.stopped {
+                return;
+            }
+            let Some(m) = st.blocker.take() else {
+                return;
+            };
+            st.value += 1;
+            (m, st.value)
+        };
+        let seq = ok(m.next_seq());
+        let op = RowOp::Update {
+            value: u64v(value),
+            key_cols_changed: false,
+        };
+        ok(self.core.row_op(
+            &m,
+            &self.row,
+            None,
+            op.clone(),
+            StmtCtx::new(self.core.visible_ts(), seq, seq),
+            &mut Fixed(op),
+        ));
+        self.commit(m);
+        self.resolve();
+        self.cycles.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Stops the cycling (parks become no-ops). The caller then drains
+    /// the interrupted cycle through [`ArbiterCycles::take_blocker`].
+    pub fn stop(&self) {
+        self.state.lock().expect("cycle state").stopped = true;
+    }
+
+    /// The interrupted cycle's pending blocker, if any, for the caller to
+    /// abort and resolve.
+    pub fn take_blocker(&self) -> Option<Txn> {
+        self.state.lock().expect("cycle state").blocker.take()
+    }
+
+    /// Parks served so far (one per arbiter-lock wait that reached its
+    /// park).
+    pub fn parks(&self) -> usize {
+        self.parks.load(Ordering::SeqCst)
+    }
+
+    /// Cycles completed so far (one per committed blocker).
+    pub fn cycles(&self) -> usize {
+        self.cycles.load(Ordering::SeqCst)
+    }
+
+    /// Commit through the hand-driven pipeline: submit, process, ack (the
+    /// `Rig` shape, on a `Mutex` so the waiter's park can share it).
+    fn commit(&self, txn: Txn) -> Ts {
+        let ticket = ok(self.core.commit_submit(txn, SyncCommit::On));
+        let mut p = self.pipeline.lock().expect("cycle pipeline");
+        let group = p.drain_available();
+        p.process_group(group);
+        drop(p);
+        ok(ticket.try_ack().expect("acked after process_group"))
+    }
+
+    /// Inserts `key` = `value` in its own txn; commits and resolves.
+    pub fn preload(&self, key: &[u8], value: &[u8]) -> Ts {
+        let t = self.core.begin(Isolation::ReadCommitted);
+        let seq = ok(t.next_seq());
+        ok(self.core.insert_key(
+            &t,
+            key,
+            None,
+            value.to_vec(),
+            StmtCtx::new(self.core.visible_ts(), seq, seq),
+            UniqueRule::Unique { same_row: None },
+        ));
+        let ts = self.commit(t);
+        self.resolve();
+        ts
+    }
+
+    /// Drains the resolver until idle.
+    pub fn resolve(&self) {
+        while ok(Resolver::run_once(&self.core)) > 0 {}
+    }
+}
+
+/// The [`nucleus_txn::wait::MakeParker`] over an [`ArbiterCycles`]:
+/// installs with `core.waits.set_parker_maker(..)`.
+pub struct CycleMaker {
+    world: Arc<ArbiterCycles>,
+}
+
+impl CycleMaker {
+    pub fn new(world: Arc<ArbiterCycles>) -> CycleMaker {
+        CycleMaker { world }
+    }
+}
+
+impl nucleus_txn::wait::MakeParker for CycleMaker {
+    fn make(&self) -> Arc<dyn nucleus_txn::wait::Parker> {
+        Arc::new(CyclePark {
+            world: Arc::clone(&self.world),
+        })
+    }
+}
+
+struct CyclePark {
+    world: Arc<ArbiterCycles>,
+}
+
+impl nucleus_txn::wait::Parker for CyclePark {
+    /// The world advance **is** the park: it runs on the waiter's own
+    /// thread, inside its wait, so nothing races. Returns `false` (a
+    /// spurious return) so the waiter re-polls and sees the blocker
+    /// ended. A stopped world parks as an immediate timeout.
+    fn park(&self, _timeout: Duration) -> bool {
+        self.world.parks.fetch_add(1, Ordering::SeqCst);
+        self.world.advance();
+        false
+    }
+
+    /// The world never really parks; the commit's `bump_and_wake` unparks
+    /// into the void (the waiter re-polls regardless of the unpark).
+    fn unpark(&self) {}
 }
 
 /// I-COUNT: `intent_count(txn)` equals the intents the txn owns in the KV,

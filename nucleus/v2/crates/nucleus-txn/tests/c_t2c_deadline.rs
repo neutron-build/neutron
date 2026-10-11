@@ -20,9 +20,20 @@
 //! exact, and once the blocker finishes a retry of the statement
 //! succeeds.
 //!
+//! C-T2c-r6: the restart loop is pinned **through the other sites too**.
+//! `restart_loop_still_hits_lock_timeout` only drives the pre-check
+//! restart wait, so a per-*attempt* deadline (mutant O2: the
+//! `arbiter_attempt` call passing `actx.lock_deadline()`) survived it —
+//! sites 2/3 got a fresh clock each attempt. The r6 tests restart the
+//! statement through the arbiter-lock wait (`ArbiterCycles`: one
+//! deterministic cycle per attempt, the blocker placed at `on_attempt`
+//! and committed from the waiter's own park) and re-wait the FK KEY
+//! SHARE (mutant O8: the deadline recomputed per wait) — both still
+//! 55P03 within the bound.
+//!
 //! Mutants: a site passing `None` (or recomputing the deadline at each
-//! wait, the r4 behaviour) never returns and its test fails at the 2 s
-//! bound with the binary still exiting.
+//! wait or each attempt, the r4/r6 behaviours) never returns and its
+//! test fails at the 2 s bound with the binary still exiting.
 
 mod c_t2c_support;
 
@@ -30,7 +41,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use c_t2c_support::{as_u64, assert_count_exact, ok, u64v, Fixed, Rig};
+use c_t2c_support::{
+    as_u64, assert_count_exact, ok, u64v, ArbiterCycles, CountingWaits, CycleMaker, Fixed, Rig,
+    TestRowLocks,
+};
+use nucleus_kv::MemKv;
+use nucleus_txn::boot::Core;
 use nucleus_txn::txn::{CancelHandle, Isolation};
 use nucleus_txn::write::{OnConflictAction, OnConflictResult, ProposedRow, RowOp, StmtCtx};
 use nucleus_txn::{RowLockMode, TxnError};
@@ -445,4 +461,207 @@ fn restart_loop_still_hits_lock_timeout() {
     ));
     assert_eq!(out.result, OnConflictResult::Nothing);
     ok(rig.core.abort(w));
+}
+
+/// Sites 2/3, restart-bounded (C-T2c-r6, the O2 scenario): an
+/// arbiter-lock wait that ends, a re-step into `Step::Restart` on a newer
+/// version of `r`, and the next attempt waiting at the same site again —
+/// once per cycle, deterministically, through [`ArbiterCycles`]: every
+/// `on_attempt` places the next blocker (a lock-only `NoKeyUpdate`
+/// intent on `r`) before the attempt reaches the lock, and the waiter's
+/// own park commits that blocker's update of `r` and resolves it, so the
+/// re-step sees a free row one version newer and restarts. The statement
+/// restarts through the arbiter-lock wait for as long as it runs; only
+/// the statement-wide deadline ends it. Under a per-attempt deadline (O2:
+/// the `arbiter_attempt` call passing `actx.lock_deadline()`) every
+/// restart buys a fresh clock, 55P03 never arrives, and this test fails
+/// at the 2 s bound.
+#[test]
+fn arbiter_lock_restart_still_hits_lock_timeout() {
+    let core = Arc::new(ok(Core::open(MemKv::new())));
+    core.set_row_locks(TestRowLocks::new());
+    let world = ArbiterCycles::new(Arc::clone(&core), &t_key("1"));
+    let world = Arc::new(world);
+    world.preload(&t_key("1"), &u64v(0));
+    world.preload(&u_key("K"), b"1");
+    core.waits
+        .set_parker_maker(Arc::new(CycleMaker::new(Arc::clone(&world))));
+
+    let w = core.begin(Isolation::ReadCommitted);
+    let seq0 = ok(w.next_seq());
+    let s = core.visible_ts();
+    let waiter_core = Arc::clone(&core);
+    let leash = w.cancel_handle();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&attempts);
+    let blocker_world = Arc::clone(&world);
+    let parks_before = world.parks();
+    let start = Instant::now();
+    let (out, w) = bounded(&leash, move || {
+        let mut on_attempt = move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            blocker_world.place_blocker();
+        };
+        let r = waiter_core.insert_on_conflict(
+            &w,
+            StmtCtx::new(s, seq0, seq0).lock_timeout(Duration::from_millis(300)),
+            proposed("1", 0, &["K"]),
+            &t_key_of,
+            &mut on_attempt,
+            OnConflictAction::DoUpdate(&mut |v: &[u8]| Some((u64v(as_u64(v) + 5), false))),
+        );
+        (r, w)
+    });
+    let elapsed = start.elapsed();
+    // Stop the world and drain the interrupted cycle's blocker.
+    world.stop();
+    if let Some(m) = world.take_blocker() {
+        ok(core.abort(m));
+    }
+    world.resolve();
+    assert_eq!(
+        out.map(|o| o.result),
+        Err(TxnError::LockNotAvailable),
+        "the restart loop ended in 55P03, not a watchdog or a decision"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "55P03 did not cut the wait short of lock_timeout ({} ms)",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "55P03 arrived {elapsed:?} after statement start: later than lock_timeout + margin"
+    );
+    let attempts = attempts.load(Ordering::SeqCst);
+    assert!(
+        attempts > 1,
+        "the statement restarted through the arbiter lock: {attempts} attempts"
+    );
+    assert!(
+        world.cycles() > 1,
+        "the blocker cycled the row: {} cycles",
+        world.cycles()
+    );
+    assert!(
+        world.parks() > parks_before + 1,
+        "the statement made more than one arbiter-lock wait (parks {} -> {})",
+        parks_before,
+        world.parks()
+    );
+    assert_clean_timeout(&core, &w);
+    // Every blocker is gone; a retry of the statement succeeds.
+    let seq0 = ok(w.next_seq());
+    let out = ok(core.insert_on_conflict(
+        &w,
+        StmtCtx::new(core.visible_ts(), seq0, seq0),
+        proposed("1", 0, &["K"]),
+        &t_key_of,
+        &mut |_| {},
+        OnConflictAction::DoUpdate(&mut |v: &[u8]| Some((u64v(as_u64(v) + 5), false))),
+    ));
+    assert_eq!(out.result, OnConflictResult::Updated);
+    ok(core.abort(w));
+}
+
+/// Site 4, restart-bounded (C-T2c-r6, the O8 scenario): a KEY SHARE wait
+/// that keeps re-waiting as the blocker's generation bumps. An
+/// `Update`-strength holder of the parent blocks the child check's KEY
+/// SHARE; a bumper bumps the holder's wake generation ~every ms, so each
+/// wait ends `GenChanged`, the re-step finds the holder's intent again,
+/// and the check waits once more — for as long as the bumper runs. Only
+/// the check-wide deadline ends it: under the r4 behaviour (O8: the
+/// deadline recomputed at each wait) every wait buys a fresh clock,
+/// 55P03 never arrives, and this test fails at the 2 s bound.
+#[test]
+fn fk_child_restart_still_hits_lock_timeout() {
+    let rig = Rig::new();
+    let parkers = rig.parkers();
+    let waits = CountingWaits::new();
+    rig.core.waits.set_hook(waits.clone());
+    rig.preload(b"/t/p/1", b"k1");
+    let holder = rig.txn(Isolation::ReadCommitted);
+    let seq = ok(holder.next_seq());
+    // KEY SHARE conflicts only with UPDATE-strength holders (§6).
+    let lock = RowOp::Lock(RowLockMode::Update);
+    ok(rig.core.row_op(
+        &holder,
+        b"/t/p/1",
+        None,
+        lock.clone(),
+        StmtCtx::new(rig.core.visible_ts(), seq, seq),
+        &mut Fixed(lock),
+    ));
+
+    // The bumper: bump the holder's generation ~every ms until stopped,
+    // hard-capped at ~3 s (past the 2 s bound, so a regressed build's
+    // leaked statement thread also drains once the bumps end).
+    let stop = Arc::new(AtomicBool::new(false));
+    let bumper_stop = Arc::clone(&stop);
+    let bumper_core = rig.core.clone();
+    let holder_id = holder.id;
+    let bumper = std::thread::spawn(move || {
+        for _ in 0..3_000 {
+            if bumper_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            ok(bumper_core.bump_and_wake(holder_id));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let c = rig.txn(Isolation::ReadCommitted);
+    let seq0 = ok(c.next_seq());
+    let s = rig.core.visible_ts();
+    let ctx = StmtCtx::new(s, seq0, ok(c.next_seq()))
+        .internal()
+        .lock_timeout(Duration::from_millis(300));
+    let core = rig.core.clone();
+    let leash = c.cancel_handle();
+    let parks_before = parkers.parks();
+    let waits_before = waits.starts.load(Ordering::SeqCst);
+    let start = Instant::now();
+    let (out, c) = bounded(&leash, move || {
+        let r = core.fk_check_child(&c, &ctx, b"/t/p/1", &|v| v == b"k1");
+        (r, c)
+    });
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    if let Err(e) = bumper.join() {
+        std::panic::resume_unwind(e);
+    }
+    assert_eq!(
+        out,
+        Err(TxnError::LockNotAvailable),
+        "the re-waiting KEY SHARE ended in 55P03, not a decision"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "55P03 did not cut the wait short of lock_timeout ({} ms)",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "55P03 arrived {elapsed:?} after the check began: later than lock_timeout + margin"
+    );
+    let waited = waits.starts.load(Ordering::SeqCst) - waits_before;
+    assert!(waited > 1, "the KEY SHARE re-waited: {waited} waits");
+    assert!(
+        parkers.parks() > parks_before + 1,
+        "the KEY SHARE parked more than once (parks {} -> {})",
+        parks_before,
+        parkers.parks()
+    );
+    assert_clean_timeout(&rig.core, &c);
+    // The blocker finishes; a retry of the check succeeds.
+    rig.commit(holder);
+    rig.resolve();
+    let seq = ok(c.next_seq());
+    let s = rig.core.visible_ts();
+    ok(rig
+        .core
+        .fk_check_child(&c, &StmtCtx::new(s, seq, seq).internal(), b"/t/p/1", &|v| {
+            v == b"k1"
+        }));
+    ok(rig.core.abort(c));
 }

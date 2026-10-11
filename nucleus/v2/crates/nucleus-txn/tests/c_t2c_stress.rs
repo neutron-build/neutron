@@ -1,11 +1,17 @@
 //! C-T2c stress: 8 threads upsert 4 arbiter keys with `DO UPDATE SET v =
 //! v + 1` (RC), one txn per upsert, each proposing a fresh row; one thread
-//! inserts and deletes children of 2 parents (FK child check), another
-//! deletes and re-inserts the parents (FK parent check, RESTRICT or NO
-//! ACTION); a checker thread verifies I-FK at registered snapshots while
-//! they run. A recycler thread repeatedly deletes each key's winning row
-//! (round 3: key recycling — every key goes dead→live many times, so the
-//! insert step's unique check keeps meeting concurrent winners, the M5/M10
+//! inserts and deletes children of the covered parents (FK child check),
+//! another deletes and re-inserts the parents (FK parent check, RESTRICT
+//! or NO ACTION). The parent set is larger than the child thread can
+//! keep covered (r6): two parents are contested, one anchor is never
+//! deleted by the deleter (so the child's first txn always commits) and
+//! one parent never receives children (so the deleter's first txn always
+//! commits) — the progress counters are by construction, not luck, while
+//! the contested pair keeps the original cover/race dynamics. A checker
+//! thread verifies I-FK at registered snapshots while they run. A
+//! recycler thread repeatedly deletes each key's winning row (round 3:
+//! key recycling — every key goes dead→live many times, so the insert
+//! step's unique check keeps meeting concurrent winners, the M5/M10
 //! window), quiescing the key while it checks the generation's oracle.
 //! Afterwards: each arbiter key has exactly one live row whose value is
 //! (committed upserts on the key since its last recycle) - 1 — no lost
@@ -38,7 +44,24 @@ use nucleus_txn::{Ts, TxnError};
 const UPSERT_THREADS: usize = 8;
 const UPSERTS_PER_THREAD: usize = 250;
 const KEYS: usize = 4;
-const PARENTS: usize = 2;
+/// All parents: seeded, and every one's child range is checked by I-FK.
+const PARENTS: usize = 4;
+/// The parents the child thread covers (`0..CHILD_PARENTS`, the anchor
+/// included) — one fewer than exist, so the parent-delete thread always
+/// has a child-free parent to make progress on.
+const CHILD_PARENTS: usize = PARENTS - 1;
+/// The child's anchor: live from the seed and never picked by the parent
+/// thread, so it is always live for the child's inserts — the child's
+/// first txn (which targets it) commits, making `inserted > 0` hold by
+/// construction (r6: with only the two contested parents, the child
+/// could keep both covered for the whole run and every parent delete
+/// hit 23503, so `deletes == 0` in ~20% of loaded runs).
+const ANCHOR: usize = CHILD_PARENTS - 1;
+/// The parent thread's guaranteed-free parent: the child thread never
+/// targets it, so no child can ever exist under it and its deletes
+/// always succeed — the parent thread's first txn (which targets it)
+/// commits, making `deletes > 0` hold by construction.
+const FREE: usize = PARENTS - 1;
 const FK_TXNS: usize = 300;
 const RECYCLES_PER_KEY: usize = 25;
 const WATCHDOG_AFTER: Duration = Duration::from_secs(15);
@@ -213,7 +236,7 @@ fn child_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnEr
     let mut live: Vec<(usize, u64)> = Vec::new();
     let mut next_id = 0u64;
     let mut inserted = 0;
-    for _ in 0..FK_TXNS {
+    for i in 0..FK_TXNS {
         if !live.is_empty() && rng.next().is_multiple_of(3) {
             let i = (rng.next() as usize) % live.len();
             let (p, id) = live[i];
@@ -233,7 +256,14 @@ fn child_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnEr
                 live.swap_remove(i);
             }
         } else {
-            let p = (rng.next() as usize) % PARENTS;
+            // The first insert targets the anchor: always live, so the
+            // workload's insert progress is by construction. Later picks
+            // cover the contested parents and the anchor, never FREE.
+            let p = if i == 0 {
+                ANCHOR
+            } else {
+                (rng.next() as usize) % CHILD_PARENTS
+            };
             next_id += 1;
             let id = next_id;
             let key = format!("/t/c/{p}/{id}").into_bytes();
@@ -266,8 +296,17 @@ fn parent_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnE
     let mut rng = Rng(0xbadcafe);
     let mut live = [true; PARENTS];
     let mut deletes = 0;
-    for _ in 0..FK_TXNS {
-        let p = (rng.next() as usize) % PARENTS;
+    for i in 0..FK_TXNS {
+        // The first delete targets FREE: child-free by construction, so
+        // it commits and the workload's delete progress is by
+        // construction. Later picks split between the two contested
+        // parents and FREE; the anchor is never picked, so it stays live
+        // for the child's inserts.
+        let p = if i == 0 {
+            FREE
+        } else {
+            [0, 1, FREE][(rng.next() as usize) % 3]
+        };
         let pk = parent_key(p);
         if live[p] {
             let restrict = rng.next().is_multiple_of(2);
