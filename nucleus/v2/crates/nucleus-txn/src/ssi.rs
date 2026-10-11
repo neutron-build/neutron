@@ -82,9 +82,17 @@ pub struct Ssi {
 }
 
 /// Collects a read's reader-side edges; they are recorded under the SSI
-/// mutex after the read.
+/// mutex after the read. `pub(crate)`: the FK child check (§5.3) reuses it
+/// for its parent read instead of a second collector type.
 #[derive(Default)]
-struct Collect(Vec<RwEdge>);
+pub(crate) struct Collect(Vec<RwEdge>);
+
+impl Collect {
+    /// The edges collected so far.
+    pub(crate) fn into_edges(self) -> Vec<RwEdge> {
+        self.0
+    }
+}
 
 impl ReadObserver for Collect {
     fn on_edge(&mut self, edge: RwEdge) {
@@ -200,7 +208,7 @@ impl Ssi {
         let view = core.open_view();
         let mut edges = Collect::default();
         let value = read::read_key(core, &view, key, ctx, &mut edges)?;
-        self.record_read(txn, &edges.0, view.counter());
+        self.record_read(txn, &edges.into_edges(), view.counter());
         Ok(value)
     }
 
@@ -234,7 +242,7 @@ impl Ssi {
             &mut edges,
         )
         .collect::<Result<Vec<_>, _>>()?;
-        self.record_read(txn, &edges.0, view.counter());
+        self.record_read(txn, &edges.into_edges(), view.counter());
         Ok(rows)
     }
 
@@ -408,6 +416,12 @@ impl SsiHook for Ssi {
         if let Some(host) = self.host.upgrade() {
             self.register(host.registry(), txn, Siread::Point { key: key.to_vec() });
         }
+    }
+
+    fn on_read_edges(&self, txn: TxnId, edges: &[RwEdge], view_counter: u64) {
+        // The same bookkeeping as `Ssi::read_key`: edges under the SSI
+        // mutex, `last_view` updated (§8.2 reader side).
+        self.record_read(txn, edges, view_counter);
     }
 
     fn on_data_placed(
