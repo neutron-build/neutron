@@ -7,7 +7,13 @@
 //! deleted by the deleter (so the child's first txn always commits) and
 //! one parent never receives children (so the deleter's first txn always
 //! commits) — the progress counters are by construction, not luck, while
-//! the contested pair keeps the original cover/race dynamics. A checker
+//! the contested pair keeps the original cover/race dynamics. Because
+//! that construction makes the plain progress counters guaranteed, the
+//! race itself is asserted separately (C-FIXUPS3): the parent thread
+//! counts its 23503-covered delete attempts on the contested parents,
+//! and the test asserts a nonzero count — the cover/race dynamic, not
+//! just each thread's first txn, is what the soak must keep exercising.
+//! A checker
 //! thread verifies I-FK at registered snapshots while they run. A
 //! recycler thread repeatedly deletes each key's winning row (round 3:
 //! key recycling — every key goes dead→live many times, so the insert
@@ -292,10 +298,18 @@ fn child_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnEr
     Ok(inserted)
 }
 
-fn parent_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnError> {
+/// The parent thread: deletes and re-inserts the parents. Returns
+/// `(committed deletes, 23503-covered delete attempts on the contested
+/// parents)` — the second count is the cover/race dynamic the r6
+/// anchors took out of the plain progress counters (C-FIXUPS3): a
+/// delete of a live contested parent that fails `fk_check_parent` with
+/// 23503 is a child-covered parent racing the deleter, which is what
+/// this workload exists to soak.
+fn parent_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<(usize, usize), TxnError> {
     let mut rng = Rng(0xbadcafe);
     let mut live = [true; PARENTS];
     let mut deletes = 0;
+    let mut contested_23503 = 0;
     for i in 0..FK_TXNS {
         // The first delete targets FREE: child-free by construction, so
         // it commits and the workload's delete progress is by
@@ -335,6 +349,11 @@ fn parent_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnE
             if done {
                 live[p] = false;
                 deletes += 1;
+            } else if p != ANCHOR && p != FREE {
+                // A failed delete is a 23503 out of `fk_check_parent`
+                // (the only statement error `fk_txn` maps to `Ok(false)`),
+                // and on a contested parent it means a child covered it.
+                contested_23503 += 1;
             }
         } else {
             let done = fk_txn(&core, &cancels, |t, s, seq0| {
@@ -351,7 +370,7 @@ fn parent_thread(core: Arc<Core<MemKv>>, cancels: Cancels) -> Result<usize, TxnE
             live[p] = true;
         }
     }
-    Ok(deletes)
+    Ok((deletes, contested_23503))
 }
 
 /// Reads one key at a registered snapshot of the latest state (exact key,
@@ -615,7 +634,7 @@ fn stress_upserts_and_fk() {
         Ok(r) => r.expect("child thread"),
         Err(e) => std::panic::resume_unwind(e),
     };
-    let deletes = match parents.join() {
+    let (deletes, contested_23503) = match parents.join() {
         Ok(r) => r.expect("parent thread"),
         Err(e) => std::panic::resume_unwind(e),
     };
@@ -634,6 +653,12 @@ fn stress_upserts_and_fk() {
         "bounded run: {elapsed:?}"
     );
     assert!(inserted > 0 && deletes > 0, "the FK workload made progress");
+    assert!(
+        contested_23503 > 0,
+        "the contested-parent cover/race happened ({contested_23503} 23503-covered \
+         deletes on parents 0/1; the plain progress counters are guaranteed by \
+         each thread's first txn, so they no longer show it)"
+    );
     assert!(checks > 0);
 
     // Drain the jobs: no intent remains; I-COUNT for every surviving entry.

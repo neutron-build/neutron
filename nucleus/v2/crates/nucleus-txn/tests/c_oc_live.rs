@@ -758,10 +758,16 @@ fn advisory_only_rollback_wakes(locks: Arc<LockManager>, rig: &Rig, what: &str) 
     // acquire without ever parking, passing a mutant the same way).
     let t0 = Instant::now();
     while !rig.core.wait_edges().contains(&(wid, t.id)) {
-        assert!(
-            t0.elapsed() < BOUND,
-            "{what}: W never blocked on the advisory lock"
-        );
+        if t0.elapsed() >= BOUND {
+            // Clean up before panicking (C-FIXUPS3): the detached W is
+            // parked on T's advisory lock with no cycle to break, so it
+            // would stay parked forever — fire its leash and end T, so
+            // the cancelled statement drains and its thread exits (the
+            // r5 rule: never join a possibly blocked thread).
+            leash.cancel();
+            ok(rig.core.abort(t));
+            panic!("{what}: W never blocked on the advisory lock");
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
     let start = Instant::now();
@@ -890,8 +896,8 @@ fn nonarbiter_wait_in_place_honours_lock_timeout() {
         "the wait-in-place ends in 55P03 at lock_timeout"
     );
     assert!(
-        el >= Duration::from_millis(200),
-        "55P03 must not predate the deadline ({el:?})"
+        el >= Duration::from_millis(240),
+        "55P03 must not predate the deadline ({el:?} against a 250 ms lock_timeout)"
     );
     assert!(
         el < Duration::from_millis(1500),

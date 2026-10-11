@@ -305,6 +305,14 @@ pub trait ReleaseHook: Send + Sync {
     /// relation the aborting txn's DDL had locked: the DDL storage-map
     /// journal is undone here so the map already says what the abort
     /// means by then (C-T5-ABORT's window). No-op by default.
+    ///
+    /// A hook layered outside `CatalogRelease` (a test gate, a wrapper)
+    /// must forward `before_abort` to its inner hook, exactly as it
+    /// forwards `release_all` and `release_from`: a wrapper that drops
+    /// the call silently skips the journal settle, and the pre-C-T5-ABORT
+    /// order — the map still saying the aborting DDL's while §6 already
+    /// grants against it — returns without any test of the wrapper seeing
+    /// an error.
     fn before_abort(&self, txn: TxnId) {
         let _ = txn;
     }
@@ -448,8 +456,9 @@ impl<K: OrderedKv> Core<K> {
             // so the commit thread will never act on this txn — it aborts
             // here, before the error surfaces, or it would stay Pending
             // forever with its waiters unparked and its intents in the KV.
-            // `abort` runs the full §7.1 sequence: Aborted, release, bump
-            // and wake, released, cleanup queued.
+            // `abort` runs the full §7.1 sequence: settle the DDL map
+            // journal (`before_abort`, while still Pending), Aborted,
+            // release, bump and wake, released, cleanup queued.
             if let Err(abort_err) = self.abort(txn) {
                 return Err(TxnError::Invariant(format!(
                     "abort after a failed pre_commit ({e}) failed: {abort_err}"

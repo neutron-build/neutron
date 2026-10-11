@@ -36,7 +36,10 @@ const PROGS_PER_THREAD: u32 = 1500;
 
 const SEEDS_RC: [u64; 1] = [0x4732_0001];
 const SEEDS_RR: [u64; 1] = [0x4732_0002];
-const SEEDS_SER: [u64; 1] = [0x4732_0003];
+/// Two seeds (C-FIXUPS3): under a C-FK-SSI revert the single-seed SER
+/// soak missed the regression in 1 of 6 runs — a second seed halves the
+/// chance a revert lands on a lucky interleaving.
+const SEEDS_SER: [u64; 2] = [0x4732_0003, 0x4732_0004];
 
 fn run_seed(level: Level, seed: u64, progs: u32, mix: Mix) -> (Run, Verdict) {
     let mut cfg = Config::new(seed, level);
@@ -181,8 +184,9 @@ fn g2_soak_broken_store_is_caught() {
 /// next read sees it — and the checker flags the non-repeatable read.
 /// This cannot flake, whatever the thread scheduler does to the soak
 /// above. (The same history also reads skew — T both anti-depends on D
-/// and read its value — which the checker names as a same-key rw+wr
-/// two-cycle, LostUpdate.)
+/// and read its value — a same-key rw+wr two-cycle; what the assert
+/// below targets is the RR violation itself, not the checker's label for
+/// it, which may be either `LostUpdate` or `NonRepeatableRead`.)
 #[test]
 fn g2_broken_store_history_is_caught() {
     use super::history::{Hb, Obs, Val};
@@ -210,7 +214,12 @@ fn g2_broken_store_history_is_caught() {
         verdict.report(&h),
         h.trace()
     );
-    assert!(verdict.violates(Kind::LostUpdate), "{}", verdict.report(&h));
+    assert!(
+        verdict.violates(Kind::LostUpdate) || verdict.violates(Kind::NonRepeatableRead),
+        "the read-skew rw+wr two-cycle went unflagged (the checker names it \
+         LostUpdate or NonRepeatableRead):\n{}",
+        verdict.report(&h)
+    );
 }
 
 // ----- determinism -------------------------------------------------------------

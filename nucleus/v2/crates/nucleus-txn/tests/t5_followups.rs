@@ -3,6 +3,11 @@
 //! `ROLLBACK TO` map undo, the counter-write fault path, DROP's
 //! `on_ddl_execute`, and the three AccessExclusive acquisitions the gate
 //! found untested. Every test names the mutant it kills.
+//!
+//! C-FIXUPS3 adds the abort-side map-undo order pins (the C-T5-ABORT
+//! gate's mutant O2: `undo_all` in forward order) for the two shapes the
+//! gate found untested: CREATE+DROP and CREATE+two TRUNCATEs, both
+//! aborted.
 
 mod t5_support;
 
@@ -630,5 +635,108 @@ fn rollback_to_keeps_the_pre_savepoint_ddl_map_changes() {
     assert!(
         rig.rel_row(oid_n).is_some(),
         "the pre-savepoint CREATE stands"
+    );
+}
+
+/// Mutant O2 (C-T5-ABORT gate: `MapJournal::undo_all` applying its
+/// entries in forward order instead of last-recorded-first): a CREATE
+/// then a DROP of the created table in one aborted txn. The journal
+/// holds `Map(rng)` then `Unmap(rng)`; undoing them last-first leaves
+/// the range unmapped — exactly as before the txn — while under the
+/// mutant the `Unmap`'s undo runs last and re-maps the range to the oid
+/// of a relation that no longer exists.
+#[test]
+fn abort_after_create_then_drop_restores_the_map_exactly() {
+    let rig = Rig::new();
+
+    // A committed table exists before the txn (the control: its own
+    // range stays mapped through the abort).
+    let t0 = rig.rc();
+    let s0 = rig.core.visible_ts();
+    let (oid0, sid0) = rig.create_table(&t0, s0, b"t");
+    ok(rig.commit_rc(t0));
+    assert!(rig.storage_maps(&table_key(sid0, "p"), oid0 as u32));
+
+    // One txn: CREATE a table, then DROP it.
+    let t = rig.rc();
+    let s = rig.core.visible_ts();
+    let (oid, sid) = rig.create_table(&t, s, b"created");
+    assert!(
+        rig.storage_maps(&table_key(sid, "p"), oid as u32),
+        "the created range is mapped inside the txn"
+    );
+    rig.drop_table(&t, s, oid);
+    ok(rig.core.abort(t));
+    rig.settle();
+
+    // The map is exactly as before the txn: the created range unmapped
+    // (forward undo leaves it mapped to the dead oid), the pre-existing
+    // table's range untouched, no row of the aborted CREATE surviving.
+    assert!(
+        !rig.storage_maps(&table_key(sid, "p"), oid as u32),
+        "the created-then-dropped range is unmapped after the abort"
+    );
+    assert!(
+        rig.storage_maps(&table_key(sid0, "p"), oid0 as u32),
+        "the pre-existing table's range never moved"
+    );
+    assert!(rig.rel_row(oid0).is_some(), "the pre-existing table stands");
+    assert!(
+        rig.rel_row(oid).is_none(),
+        "the aborted CREATE leaves no catalog row"
+    );
+}
+
+/// Mutant O2 again, the shape with two interleaved inverse pairs: a
+/// CREATE then two TRUNCATEs of the created table in one aborted txn.
+/// The journal holds `Map(rng0)`, `Unmap(rng0)`, `Map(rng1)`,
+/// `Unmap(rng1)`, `Map(rng2)`; undoing last-first leaves every range
+/// unmapped, while forward order re-maps rng0 and rng1 to the dead oid
+/// — dead ranges a later SSI writer would resolve against a relation
+/// that no longer exists.
+#[test]
+fn abort_after_create_and_two_truncates_restores_the_map_exactly() {
+    let rig = Rig::new();
+
+    // The control table of the shape above.
+    let t0 = rig.rc();
+    let s0 = rig.core.visible_ts();
+    let (oid0, sid0) = rig.create_table(&t0, s0, b"t");
+    ok(rig.commit_rc(t0));
+
+    // One txn: CREATE a table, TRUNCATE it twice (each truncate retires
+    // the current storage and maps a fresh one).
+    let t = rig.rc();
+    let s = rig.core.visible_ts();
+    let (oid, sid_create) = rig.create_table(&t, s, b"created");
+    let sid_trunc1 = rig.truncate_table(&t, s, oid);
+    let sid_trunc2 = rig.truncate_table(&t, s, oid);
+    assert!(rig.storage_maps(&table_key(sid_trunc2, "p"), oid as u32));
+    ok(rig.core.abort(t));
+    rig.settle();
+
+    // Every range the txn touched is unmapped: the CREATE's (also the
+    // first TRUNCATE's retired one), both TRUNCATEs' fresh ones. Under
+    // the forward-order mutant the retired ranges stay mapped to the
+    // dead oid.
+    assert!(
+        !rig.storage_maps(&table_key(sid_create, "p"), oid as u32),
+        "the created range is unmapped after the abort"
+    );
+    assert!(
+        !rig.storage_maps(&table_key(sid_trunc1, "p"), oid as u32),
+        "the first TRUNCATE's fresh range is unmapped after the abort"
+    );
+    assert!(
+        !rig.storage_maps(&table_key(sid_trunc2, "p"), oid as u32),
+        "the second TRUNCATE's fresh range is unmapped after the abort"
+    );
+    assert!(
+        rig.storage_maps(&table_key(sid0, "p"), oid0 as u32),
+        "the pre-existing table's range never moved"
+    );
+    assert!(
+        rig.rel_row(oid).is_none(),
+        "the aborted CREATE leaves no row"
     );
 }

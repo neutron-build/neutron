@@ -463,7 +463,7 @@ fn restart_loop_still_hits_lock_timeout() {
     ok(rig.core.abort(w));
 }
 
-/// Sites 2/3, restart-bounded (C-T2c-r6, the O2 scenario): an
+/// Site 2, restart-bounded (C-T2c-r6, the O2 scenario): an
 /// arbiter-lock wait that ends, a re-step into `Step::Restart` on a newer
 /// version of `r`, and the next attempt waiting at the same site again —
 /// once per cycle, deterministically, through [`ArbiterCycles`]: every

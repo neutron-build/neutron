@@ -11,9 +11,14 @@
 //! An internal test because the wrapper hook needs
 //! [`Core::release_hook`](crate::boot::Core::release_hook) (crate-private)
 //! to layer itself outermost, above the catalog's
-//! [`crate::catalog::CatalogRelease`], freezing the abort exactly at the
-//! moment the lock manager has dropped the target's locks — the earliest
-//! a concurrent session can acquire the relation.
+//! [`crate::catalog::CatalogRelease`], freezing the abort at the top of
+//! `release_all` — before the inner hooks run, so the target's relation
+//! locks are still in the table. A concurrent NOWAIT acquirer is granted
+//! even there: the status is already `Aborted` (`set_aborted` precedes
+//! the release hooks) and §6 says an `Aborted` holder never conflicts.
+//! That grant is the anomaly's interleaving — W acquires the relation
+//! while the journal's undo (`before_abort`) has already settled the map
+//! or, under the old order, had not yet.
 //!
 //! Mutants (the card's binding evidence): M-A — `before_abort` not
 //! called (the old order) — fails `abort_window_settles_the_map_before_aborted`
@@ -48,10 +53,14 @@ fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
 /// The outermost [`ReleaseHook`] of the window test: layered above the
 /// catalog's wrapper (installed after `Catalog::open`, chaining around
 /// whatever the core carried), it freezes the armed target's
-/// `release_all` at the AE-free moment — after the lock manager has
-/// dropped the target's locks, before anything later in the abort runs.
-/// `before_abort` records whether the target was still `Pending` when it
-/// fired (the M-B discriminator: the settle must precede `set_aborted`).
+/// `release_all` **before** calling the inner hooks — the lock manager's
+/// release has not run yet, so the target's relation locks are still in
+/// the table at the freeze. W's NOWAIT is granted anyway: the status is
+/// already `Aborted` and §6 ignores an `Aborted` holder, which is
+/// precisely the acquisition the window must cover (the same grant the
+/// anomaly exploited). `before_abort` records whether the target was
+/// still `Pending` when it fired (the M-B discriminator: the settle must
+/// precede `set_aborted`).
 struct Outer {
     inner: Arc<dyn ReleaseHook>,
     core: Arc<Core<MemKv>>,
