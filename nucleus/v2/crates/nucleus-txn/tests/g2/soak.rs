@@ -305,10 +305,11 @@ fn g2_same_seed_same_op_streams() {
 /// only when it released something (C-T0 5.5) and non-arbiter unique waits
 /// waiting in place (5.3.1), the two restarting upserts leave a stable
 /// wait-for cycle and the deadlock check breaks it with exactly one 40P01
-/// at `deadlock_timeout`. There is no watchdog: the bound is *asserted*
-/// (a whole repeat, barrier included, stays far below it), not enforced
-/// by cancelling — a regression hangs the test rather than aborting the
-/// process. Ten repeats, each on a fresh rig.
+/// at `deadlock_timeout`. Each repeat is asserted to finish in 5 s, and a
+/// detached watchdog aborts the process at 10 s: a livelock regression
+/// never returns from the joins, so the assertion alone would leave the
+/// test hanging (the C-OC-LIVE revert did exactly that in the G2r3 gate).
+/// Ten repeats, each on a fresh rig.
 #[test]
 fn g2_upsert_cycle_ends_in_one_deadlock() {
     use super::history::SqlErr;
@@ -329,12 +330,24 @@ fn g2_upsert_cycle_ends_in_one_deadlock() {
             s.upsert(second)?;
             s.commit()
         };
+        // The watchdog holds the receiver; dropping the sender after the
+        // joins disconnects it, so only a repeat that never returns aborts.
+        let (done, watch) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                watch.recv_timeout(Duration::from_secs(10))
+            {
+                eprintln!("g2: the upsert cycle did not resolve in 10 s: livelock (no 40P01)");
+                std::process::abort();
+            }
+        });
         let t0 = Instant::now();
         let (r1, r2) = std::thread::scope(|sc| {
             let a = sc.spawn(|| go(1, 0, 2));
             let b = sc.spawn(|| go(2, 2, 0));
             (a.join().expect("t1"), b.join().expect("t2"))
         });
+        drop(done);
         assert!(
             t0.elapsed() < Duration::from_secs(5),
             "the upsert cycle resolved in {:?} (deadlock_timeout is 5 ms)",
