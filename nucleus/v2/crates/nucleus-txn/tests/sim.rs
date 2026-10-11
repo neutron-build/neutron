@@ -1,11 +1,15 @@
 //! C-SIM work item 8: the suite. Configurations `rc_mix`, `rr_mix`,
 //! `ser_only`, `locks_heavy`, `crash`, `gc`; 50 seeds per configuration by
 //! default (`SIM_SEEDS=<n>` overrides), each bounded to 2000 steps, the
-//! whole suite under 60 s in the dev profile. The first 20 seeds run twice
-//! in debug-assert mode and the two traces are compared byte for byte (the
-//! determinism check). `SIM_SEED=<u64>` (with `SIM_CONFIG=<name>`) runs
-//! exactly one seed and prints the full trace; `SIM_MINIMIZE=1` minimizes a
-//! failure's choice list and prints the minimized trace.
+//! whole suite inside a per-configuration **step budget** (see
+//! [`STEP_BUDGETS`]) — a load-independent measure: the scheduler is
+//! single-threaded and every clock it reads is the step counter, so the
+//! suite's total step count is deterministic, unlike its wall time (the
+//! wall clock is still printed, as information only). The first 20 seeds
+//! run twice in debug-assert mode and the two traces are compared byte for
+//! byte (the determinism check). `SIM_SEED=<u64>` (with `SIM_CONFIG=<name>`)
+//! runs exactly one seed and prints the full trace; `SIM_MINIMIZE=1`
+//! minimizes a failure's choice list and prints the minimized trace.
 
 #[path = "sim/mod.rs"]
 mod sim;
@@ -36,11 +40,57 @@ fn one_config(name: &str) -> Config {
     Config::named(name)
 }
 
+/// Per-configuration step budgets (C-FIXUPS3): the scheduler steps of one
+/// default suite run (50 seeds plus the first 20 seeds' two determinism
+/// re-runs each, debug profile) summed per configuration. The count is
+/// deterministic — the scheduler is single-threaded and every clock it
+/// reads (`/sys/ts_clock`, `deadlock_after`, `crash_at`) is the step
+/// counter, never the wall clock — so a budget on it is a real bound on
+/// the suite's work, unlike the wall-clock assert it replaces: the suite
+/// measured 11-23 s on an idle machine but 68-112 s under parallel load
+/// and failed three acceptance runs that way.
+///
+/// Measured on the base (debug profile, `nucleus/v2`):
+///
+/// | config       | measured steps | budget (+50%) |
+/// |--------------|----------------|---------------|
+/// | `rc_mix`     | 15047          | 22571         |
+/// | `rr_mix`     | 14368          | 21552         |
+/// | `ser_only`   | 30226          | 45339         |
+/// | `locks_heavy` | 41160          | 61740         |
+/// | `crash`      | 13737          | 20606         |
+/// | `gc`         | 42450          | 63675         |
+///
+/// Each budget is the measured count + 50% headroom, rounded up: room for
+/// deliberate workload growth, no room for a silent doubling. A config
+/// that grows past its budget should re-measure and update this table
+/// together with the workload change.
+fn step_budget(name: &str) -> u64 {
+    match name {
+        "rc_mix" => 22571,
+        "rr_mix" => 21552,
+        "ser_only" => 45339,
+        "locks_heavy" => 61740,
+        "crash" => 20606,
+        "gc" => 63675,
+        // An unknown configuration has no measurement to budget: the
+        // named suite configurations are the only ones the budget governs.
+        _ => u64::MAX,
+    }
+}
+
 /// One (config, seed) run; on a violation, panics with the seed, the
 /// invariant and the trace (and, with `SIM_MINIMIZE=1`, the minimized
-/// schedule and trace).
-fn expect_green(cfg: &Config, seed: u64) {
-    if let RunResult::Violation(v) = run(cfg, seed, None) {
+/// schedule and trace). Returns the run's scheduler step count for the
+/// suite's step budget.
+fn expect_green(cfg: &Config, seed: u64) -> u64 {
+    let r = run(cfg, seed, None);
+    let steps = match &r {
+        RunResult::Ok(f) => f.steps,
+        // A violation panics right below; the count is never used.
+        RunResult::Violation(_) => 0,
+    };
+    if let RunResult::Violation(v) = r {
         let mut msg = format!(
             "\nC-SIM violation: {} (config {}, seed {}, step {})\n{}\n",
             v.inv, v.config, v.seed, v.step, v.detail
@@ -77,6 +127,7 @@ fn expect_green(cfg: &Config, seed: u64) {
         msg.push_str(&format!("trace:\n{}\n", v.trace));
         panic!("{msg}");
     }
+    steps
 }
 
 #[test]
@@ -117,13 +168,20 @@ fn suite() {
         Err(_) => all.clone(),
     };
     let n_selected = selected.len();
+    // Every run's scheduler steps, per configuration (the load-independent
+    // budget): the primary run of every seed plus the determinism check's
+    // re-runs, all of them — the budget bounds the work the suite actually
+    // executes, so extra runs trip it too.
+    let mut cfg_steps: Vec<(&'static str, u64)> = Vec::with_capacity(n_selected);
     for cfg in selected {
+        let mut total = 0u64;
         for seed in 1..=n {
-            expect_green(&cfg, seed);
+            total += expect_green(&cfg, seed);
             // Determinism: the first seeds run twice, byte for byte.
             if cfg!(debug_assertions) && seed <= det_up_to {
                 let a = run(&cfg, seed, None);
                 let b = run(&cfg, seed, None);
+                total += steps_of(&a) + steps_of(&b);
                 let (ta, ca) = match &a {
                     RunResult::Ok(f) => (f.trace.clone(), f.choices.clone()),
                     RunResult::Violation(v) => (v.trace.clone(), v.choices.clone()),
@@ -144,18 +202,37 @@ fn suite() {
                 );
             }
         }
+        cfg_steps.push((cfg.name, total));
     }
     let el = start.elapsed();
+    for (name, steps) in &cfg_steps {
+        println!("suite: config {name} took {steps} scheduler steps");
+    }
     println!(
-        "suite: {n_selected} of {} configs x {n} seeds in {el:?}",
+        "suite: {n_selected} of {} configs x {n} seeds in {el:?} (wall time, information only)",
         all.len()
     );
     // The budget is for the default seed count (`SIM_SEEDS` runs are long
     // runs by request).
-    assert!(
-        std::env::var("SIM_SEEDS").is_ok() || el.as_secs() < 60,
-        "the default suite must stay under 60 s (took {el:?})"
-    );
+    if std::env::var("SIM_SEEDS").is_err() {
+        for (name, steps) in &cfg_steps {
+            let budget = step_budget(name);
+            assert!(
+                *steps <= budget,
+                "config {name} ran {steps} scheduler steps, over its \
+                 budget of {budget} (the workload got heavier; raise the \
+                 budget with the measurements in its doc comment)"
+            );
+        }
+    }
+}
+
+/// A run's step count (0 for a violation; the caller panics on those).
+fn steps_of(r: &RunResult) -> u64 {
+    match r {
+        RunResult::Ok(f) => f.steps,
+        RunResult::Violation(_) => 0,
+    }
 }
 
 /// The probe actually interleaves: probe points must fire (otherwise the
