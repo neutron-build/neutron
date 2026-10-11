@@ -10,6 +10,7 @@ use nucleus_kv::{Key, OrderedKv};
 
 use crate::boot::Core;
 use crate::read::{read_key, scan, NoSsi};
+use crate::ssi::Collect;
 use crate::txn::{Isolation, Txn};
 use crate::visibility::ReadCtx;
 use crate::write::ctx::{is_snapshot_iso, EpqRequest};
@@ -79,17 +80,24 @@ impl<K: OrderedKv> Core<K> {
         }
         let found = {
             let view = self.open_view();
-            read_key(
-                self,
-                &view,
-                parent_key,
-                &ReadCtx {
-                    txn: txn.id,
-                    snapshot: ctx.snapshot(),
-                    stmt_seq: ctx.seq(),
-                },
-                &mut NoSsi,
-            )?
+            let rctx = ReadCtx {
+                txn: txn.id,
+                snapshot: ctx.snapshot(),
+                stmt_seq: ctx.seq(),
+            };
+            if txn.isolation == Isolation::Serializable {
+                let mut collected = Collect::default();
+                let found = read_key(self, &view, parent_key, &rctx, &mut collected)?;
+                let edges = collected.into_edges();
+                // The parent's writer may have placed its intent before our
+                // SIREAD was registered, so this read is the only place the
+                // rw edge can come from (§8.2).
+                self.ssi_hook()
+                    .on_read_edges(txn.id, &edges, view.counter());
+                found
+            } else {
+                read_key(self, &view, parent_key, &rctx, &mut NoSsi)?
+            }
         };
         match found {
             Some(v) if matches(&v) => {}

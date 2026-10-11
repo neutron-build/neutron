@@ -3,16 +3,18 @@
 //!
 //! Call sites (§8.2, §8.4, §8.6): the read path's edges flow through
 //! C-T1a's `ReadObserver`; the write path calls `before_point_read`
-//! (before a view opens), `covers` (under the key's latch, §5.3's
-//! SERIALIZABLE unique rule) and `on_data_placed` (after the latch is
-//! released, §5.1); the commit pipeline wraps every channel enqueue in
-//! `pre_commit` (§8.4) and reports aborts (`on_abort`, §8.6).
+//! (before a view opens), `on_read_edges` (after a write-path read
+//! through a registered view: the FK child check's parent read) and
+//! `on_data_placed` (after the latch is released, §5.1); the commit
+//! pipeline wraps every channel enqueue in `pre_commit` (§8.4) and
+//! reports aborts (`on_abort`, §8.6).
 //!
 //! `covers` may be called with the key's latch held: C-T3 implements it
 //! without taking the registry mutex (the card's §5.1 note). Every other
 //! hook runs outside any latch.
 
 use crate::txn::Isolation;
+use crate::visibility::RwEdge;
 use crate::{TxnError, TxnId};
 
 /// The SSI hook (§8). C-T3 implements the real one; [`NoSsiHook`] is the
@@ -25,6 +27,14 @@ pub trait SsiHook: Send + Sync {
     /// Registers a SIREAD on `key` for `txn` **before** the view the read
     /// runs through is opened (§8.1 I-SSI-ORDER). Called outside any latch.
     fn before_point_read(&self, txn: TxnId, key: &[u8]);
+
+    /// §8.2 reader side for reads made by the write path (the FK child
+    /// check, §5.3) through a registered view opened **after** the SIREAD:
+    /// `edges` is what the read skipped (`R -> owner`, `R -> writer(t)`),
+    /// handed over with that view's counter. Called outside any latch,
+    /// SERIALIZABLE readers only. The default is a no-op, so test-only
+    /// hooks need not implement it.
+    fn on_read_edges(&self, _txn: TxnId, _edges: &[RwEdge], _view_counter: u64) {}
 
     /// §8.2 writer side: after a data-changing intent was placed, check
     /// SIREADs covering `key` held by other SERIALIZABLE txns (each gives
@@ -62,6 +72,8 @@ impl SsiHook for NoSsiHook {
     }
 
     fn before_point_read(&self, _txn: TxnId, _key: &[u8]) {}
+
+    fn on_read_edges(&self, _txn: TxnId, _edges: &[RwEdge], _view_counter: u64) {}
 
     fn on_data_placed(
         &self,
