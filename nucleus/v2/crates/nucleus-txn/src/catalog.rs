@@ -58,7 +58,10 @@
 //! installs around the lock manager's hook (§7.1 sets `Aborted` before the
 //! hook runs, and commit step 5 runs it after `Committed`, so the status
 //! tells the two apart; both precede the wake, so no waiter re-runs
-//! against a half-undone map). A commit drops the journal entry and keeps
+//! against a half-undone map). **The journal is settled before
+//! `inner.release_*` drops the relation lock** (see [`CatalogRelease`]):
+//! there is no window where the AccessExclusive is free but the map is
+//! still the aborted DDL's. A commit drops the journal entry and keeps
 //! the map; the undo restores exactly the pre-statement map (a `Map` is
 //! unmapped, an `Unmap` re-mapped).
 //!
@@ -201,16 +204,22 @@ impl MapJournal {
     }
 
     /// §5.5 `ROLLBACK TO s`: undo the entries tagged `>= s`, keep the rest.
+    /// The split-off entries are taken under the journal mutex, the guard
+    /// is dropped, and only then does `apply_undo` run (as `undo_all`
+    /// already did) — the SSI mutex is never taken while the journal
+    /// guard is held, so the leaf claim of the type's doc holds here too.
     /// Returns whether at least one entry was undone, so
     /// [`CatalogRelease::release_from`] can report whether the release
     /// changed anything.
     fn undo_from(&self, txn: TxnId, from: Seq, ssi: &Ssi) -> bool {
-        let mut map = self.lock();
-        let Some(entries) = map.get_mut(&txn) else {
-            return false;
+        let undone = {
+            let mut map = self.lock();
+            let Some(entries) = map.get_mut(&txn) else {
+                return false;
+            };
+            let split = entries.partition_point(|(seq, _)| *seq < from);
+            entries.split_off(split)
         };
-        let split = entries.partition_point(|(seq, _)| *seq < from);
-        let undone = entries.split_off(split);
         let undid = !undone.is_empty();
         for (_, undo) in undone.into_iter().rev() {
             apply_undo(ssi, &undo);
@@ -246,12 +255,27 @@ impl<K: OrderedKv> ReleaseHost for Core<K> {
     }
 }
 
-/// The [`ReleaseHook`] chain [`Catalog::open`] installs: every release
-/// first runs the previous hook (the lock manager's — relation locks go
-/// first), then the journal is settled — undone for an abort or a
-/// `ROLLBACK TO`, kept for a commit. Both callers run it before the wake
-/// (§7.1, §3 step 5), so a waiter that re-runs never sees a half-undone
-/// map.
+/// The [`ReleaseHook`] chain [`Catalog::open`] installs: the journal is
+/// settled — undone for an abort or a `ROLLBACK TO`, kept for a commit —
+/// **before** the previous hook (the lock manager's) releases the
+/// AccessExclusive relation lock. The order is the point: the other way
+/// round, an aborted DROP/TRUNCATE would leave the table unmapped (a
+/// CREATE's range still mapped) while its lock is already free, so a
+/// concurrent SER reader/writer re-running against the relation registers
+/// SIREADs or checks conflicts against the wrong mapping and misses
+/// relation-level rw edges, and a concurrent DDL that slipped in would be
+/// clobbered by the late undo. Settled-first closes that window: when the
+/// lock goes free, the map already says what the txn's final status says.
+/// Both callers run the hook before the wake (§7.1, §3 step 5), so a
+/// waiter that re-runs never sees a half-undone map either way.
+///
+/// Lock order (§3.1) — no inversion across the settle/release split: the
+/// settle takes the journal mutex, drops it, then the SSI mutex per undo
+/// (`undo_all`/`undo_from` split the entries out first), plus one
+/// status-table leaf read for `abort_status`; the lock manager's
+/// `release_*` (the relation/advisory table mutexes) runs afterwards and
+/// is never held while any of those is taken, nor are any of them held
+/// when it runs.
 struct CatalogRelease {
     inner: Arc<dyn ReleaseHook>,
     journal: Weak<MapJournal>,
@@ -261,8 +285,12 @@ struct CatalogRelease {
 
 impl ReleaseHook for CatalogRelease {
     fn release_all(&self, txn: TxnId) {
-        self.inner.release_all(txn);
+        // Settle the journal first (undo for an abort, keep for a
+        // commit); only then let the lock manager drop the relation
+        // lock — the map must already be settled when the lock goes
+        // free.
         let (Some(journal), Some(ssi)) = (self.journal.upgrade(), self.ssi.upgrade()) else {
+            self.inner.release_all(txn);
             return;
         };
         let aborted = self
@@ -274,16 +302,24 @@ impl ReleaseHook for CatalogRelease {
         } else {
             journal.keep(txn);
         }
+        self.inner.release_all(txn);
     }
 
     fn release_from(&self, txn: TxnId, from_seq: Seq) -> bool {
-        let mut released = self.inner.release_from(txn, from_seq);
+        // Same order for §5.5: the journal's undo of the entries at or
+        // after the savepoint runs before the relation locks taken at or
+        // after it are dropped. The journal's undo counts as a release
+        // (the map change was part of what the rollback took away); both
+        // steps always run, so the return value is the OR of the two,
+        // exactly as the C-OC-LIVE contract has it.
+        let mut released = false;
         let (Some(journal), Some(ssi)) = (self.journal.upgrade(), self.ssi.upgrade()) else {
-            return released;
+            return self.inner.release_from(txn, from_seq);
         };
-        // The journal's undo counts as a release: the map change was part
-        // of what the rollback took away.
         if journal.undo_from(txn, from_seq, &ssi) {
+            released = true;
+        }
+        if self.inner.release_from(txn, from_seq) {
             released = true;
         }
         released
