@@ -52,14 +52,14 @@ fn one_config(name: &str) -> Config {
 ///
 /// Measured on the base (debug profile, `nucleus/v2`):
 ///
-/// | config       | measured steps | budget (+50%) |
-/// |--------------|----------------|---------------|
-/// | `rc_mix`     | 15047          | 22571         |
-/// | `rr_mix`     | 14368          | 21552         |
-/// | `ser_only`   | 30226          | 45339         |
+/// | config        | measured steps | budget (+50%) |
+/// |---------------|----------------|---------------|
+/// | `rc_mix`      | 15047          | 22571         |
+/// | `rr_mix`      | 14368          | 21552         |
+/// | `ser_only`    | 30226          | 45339         |
 /// | `locks_heavy` | 41160          | 61740         |
-/// | `crash`      | 13737          | 20606         |
-/// | `gc`         | 42450          | 63675         |
+/// | `crash`       | 13737          | 20606         |
+/// | `gc`          | 42450          | 63675         |
 ///
 /// Each budget is the measured count + 50% headroom, rounded up: room for
 /// deliberate workload growth, no room for a silent doubling. A config
