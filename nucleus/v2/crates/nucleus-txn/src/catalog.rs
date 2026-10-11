@@ -55,15 +55,25 @@
 //! execution, so the map changes are journalled per DDL statement and
 //! undone when the txn aborts or rolls back to a savepoint below the
 //! statement — through the [`ReleaseHook`] chain [`Catalog::open`]
-//! installs around the lock manager's hook (§7.1 sets `Aborted` before the
-//! hook runs, and commit step 5 runs it after `Committed`, so the status
-//! tells the two apart; both precede the wake, so no waiter re-runs
-//! against a half-undone map). **The journal is settled before
-//! `inner.release_*` drops the relation lock** (see [`CatalogRelease`]):
-//! there is no window where the AccessExclusive is free but the map is
-//! still the aborted DDL's. A commit drops the journal entry and keeps
-//! the map; the undo restores exactly the pre-statement map (a `Map` is
-//! unmapped, an `Unmap` re-mapped).
+//! installs around the lock manager's hook. When the journal settles:
+//! an **abort settles it in [`ReleaseHook::before_abort`], while the txn
+//! is still `Pending` and before `Core::abort` sets `Aborted`** (§7.1,
+//! draft 7.6 — §6 grants a relation to a conflicting acquirer the moment
+//! the holder is `Aborted`, so the map must already be the pre-DDL one
+//! by then); a `ROLLBACK TO` (§5.5) and a commit (§3 step 5, which runs
+//! after `Committed`, so the status tells the commit apart) settle it in
+//! `release_from`/`release_all`, **before `inner.release_*` drops the
+//! relation lock**: there is no window where the AccessExclusive is free
+//! but the map is still the aborting DDL's. A commit drops the journal
+//! entry and keeps the map; the undo restores exactly the pre-statement
+//! map (a `Map` is unmapped, an `Unmap` re-mapped).
+//!
+//! `note_retired` notes are **not** journalled: a `ROLLBACK TO` of a
+//! DROP/TRUNCATE leaves them, so the rolled-back DDL's pre-commit still
+//! promotes concurrent holders' finer SIREADs inside the noted ranges to
+//! relation granularity (§8.6). That is conservative only — a relation
+//! SIREAD covers everything the finer ones did, so the promotion can add
+//! false 40001s at pre-commit, never miss an edge.
 //!
 //! Two naming notes. The card writes these as `Core::catalog_create_table`
 //! etc.; they live on [`Catalog`] because their state (the id counters and
@@ -240,8 +250,12 @@ fn apply_undo(ssi: &Ssi, undo: &MapUndo) {
 }
 
 /// What [`CatalogRelease`] needs from the core: the txn's status, read as a
-/// leaf (§3.1) to tell an abort's `release_all` from a commit's. The Ssi's
-/// `RegistryHost` pattern.
+/// leaf (§3.1) so `release_all` can keep the commit path's journal entry
+/// (a commit's `release_all` runs after `Committed`). The abort path no
+/// longer relies on it: `before_abort` settles the journal while the txn
+/// is still `Pending`, so the abort branch of `release_all` is defensive
+/// only (every abort goes through `Core::abort`; none bypasses it). The
+/// Ssi's `RegistryHost` pattern.
 trait ReleaseHost: Send + Sync {
     fn abort_status(&self, txn: TxnId) -> bool;
 }
@@ -255,19 +269,28 @@ impl<K: OrderedKv> ReleaseHost for Core<K> {
     }
 }
 
-/// The [`ReleaseHook`] chain [`Catalog::open`] installs: the journal is
-/// settled — undone for an abort or a `ROLLBACK TO`, kept for a commit —
-/// **before** the previous hook (the lock manager's) releases the
-/// AccessExclusive relation lock. The order is the point: the other way
-/// round, an aborted DROP/TRUNCATE would leave the table unmapped (a
-/// CREATE's range still mapped) while its lock is already free, so a
-/// concurrent SER reader/writer re-running against the relation registers
-/// SIREADs or checks conflicts against the wrong mapping and misses
-/// relation-level rw edges, and a concurrent DDL that slipped in would be
-/// clobbered by the late undo. Settled-first closes that window: when the
-/// lock goes free, the map already says what the txn's final status says.
-/// Both callers run the hook before the wake (§7.1, §3 step 5), so a
-/// waiter that re-runs never sees a half-undone map either way.
+/// The [`ReleaseHook`] chain [`Catalog::open`] installs. When the
+/// journal settles depends on the path, and each path settles it before
+/// the relation lock can be re-acquired:
+///
+/// - **Abort (§7.1, draft 7.6):** [`CatalogRelease::before_abort`] undoes
+///   the journal while the txn is still `Pending`, **before
+///   `Core::abort` sets `Aborted`**. The point of doing it that early:
+///   §6 says an `Aborted` holder never conflicts, so the moment the
+///   status flips, a concurrent NOWAIT acquirer is granted the relation
+///   — if the map still reflected the aborting DDL then (a DROP's range
+///   unmapped), the acquirer's writes would resolve their rw-edges
+///   against the wrong mapping and a cycle could pass undetected
+///   (C-T5-ABORT's write skew). The later `release_all` then finds an
+///   empty journal for the txn and only forwards to the inner hook.
+/// - **`ROLLBACK TO` (§5.5) and commit (§3 step 5):** `release_from` /
+///   `release_all` settle the journal (undo from the savepoint / keep)
+///   **before** the inner hook drops the relation locks — the settled
+///   map is what a waiter that re-runs against the relation sees, and a
+///   concurrent DDL that slipped in cannot be clobbered by a late undo.
+///
+/// Both abort callers run the hooks before the wake (§7.1, §3 step 5),
+/// so a waiter that re-runs never sees a half-undone map either way.
 ///
 /// Lock order (§3.1) — no inversion across the settle/release split: the
 /// settle takes the journal mutex, drops it, then the SSI mutex per undo
@@ -275,7 +298,9 @@ impl<K: OrderedKv> ReleaseHost for Core<K> {
 /// status-table leaf read for `abort_status`; the lock manager's
 /// `release_*` (the relation/advisory table mutexes) runs afterwards and
 /// is never held while any of those is taken, nor are any of them held
-/// when it runs.
+/// when it runs. `before_abort` takes the journal mutex and the SSI
+/// mutex only — no lock-manager mutex, no latch (§7.1: outside any
+/// latch).
 struct CatalogRelease {
     inner: Arc<dyn ReleaseHook>,
     journal: Weak<MapJournal>,
@@ -284,11 +309,28 @@ struct CatalogRelease {
 }
 
 impl ReleaseHook for CatalogRelease {
+    /// §7.1 (draft 7.6), the abort settle: while the txn is still
+    /// `Pending` (the caller is `Core::abort`, before `set_aborted`),
+    /// undo every journalled map change of the txn, then forward. The
+    /// later `release_all` finds an empty journal and only releases.
+    fn before_abort(&self, txn: TxnId) {
+        let (Some(journal), Some(ssi)) = (self.journal.upgrade(), self.ssi.upgrade()) else {
+            self.inner.before_abort(txn);
+            return;
+        };
+        journal.undo_all(txn, &ssi);
+        self.inner.before_abort(txn);
+    }
+
     fn release_all(&self, txn: TxnId) {
-        // Settle the journal first (undo for an abort, keep for a
-        // commit); only then let the lock manager drop the relation
-        // lock — the map must already be settled when the lock goes
-        // free.
+        // Commit path (§3 step 5, and the no-write fast path): the map
+        // changes are kept, the journal entry dropped, before the inner
+        // hook releases the relation locks. The abort branch is
+        // defensive only: every abort goes through `Core::abort`, whose
+        // `before_abort` already emptied the journal (there is no other
+        // abort path — a crash aborts every holder of the process's
+        // in-memory locks with it), so an abort reaching here undoes
+        // nothing and just forwards.
         let (Some(journal), Some(ssi)) = (self.journal.upgrade(), self.ssi.upgrade()) else {
             self.inner.release_all(txn);
             return;
