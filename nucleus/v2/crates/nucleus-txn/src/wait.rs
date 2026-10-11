@@ -43,7 +43,8 @@
 //!   its own id and is removed by id, so ending or dropping one wait never
 //!   touches another wait of the same txn.
 //! - **Wake** ([`Core::bump_and_wake`], §6 "Waking"): the one wake path
-//!   (commit step 5, abort, `ROLLBACK TO`, any lock release). Under the
+//!   (commit step 5, abort, a `ROLLBACK TO` that released something
+//!   (§5.5), any lock release). Under the
 //!   graph mutex it bumps the target's generation (the status table is a
 //!   leaf, §3.1), removes every edge `* -> target` and takes the target's
 //!   slots; it releases the mutex and only then unparks them (seed 59:
@@ -184,7 +185,8 @@ pub enum WaitOutcome {
     /// The target is a visible commit: `commit_ts <= visible_ts`.
     Committed(Ts),
     /// The target's wake generation is no longer `g` (§6 step 2): it was
-    /// woken by commit step 5, abort, `ROLLBACK TO` or a lock release.
+    /// woken by commit step 5, abort, a `ROLLBACK TO` that released
+    /// something (§5.5) or a lock release.
     GenChanged,
     /// The waiter's cancel flag was set (§6).
     Cancelled,
