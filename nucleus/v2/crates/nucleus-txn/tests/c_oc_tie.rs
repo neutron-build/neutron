@@ -31,6 +31,21 @@
 //! total order prevents the race, and T3 pins the spec's ascending choice
 //! while T1/T2 pin the bound; M3 (sort only the arbiter ops, one plausible
 //! half-fix) fails only T3.
+//!
+//! C-FIXUPS2 — the two survivors the C-OC-TIE gate left: **M3b** (sort
+//! the arbiter ops and place them FIRST, then the `/t/` key and the
+//! non-arbiter entries in caller order) and **M8** (entries sorted, the
+//! `/t/` key placed last) both keep every class internally ordered, so
+//! the arbiter tie races of T1/T2/T4 still pass — but both break §5.3.1
+//! step 2's ONE global ascending order over all ops. T3 now pins the
+//! full order mid-wait — every op whose key sorts below the blocking
+//! key is held, nothing above it is — which catches M3b and M8
+//! deterministically, without a race. S4
+//! (`nonarbiter_opposite_orders_no_deadlock`) pins M3b's behaviour
+//! change: with disjoint arbiters, the non-arbiter pair M,N in opposite
+//! caller orders hold-and-waits in a cycle under M3b (a real 40P01; the
+//! gate measured 36/100 iterations) and can never form one under the
+//! ascending order (0/100).
 
 mod c_t2c_support;
 
@@ -98,6 +113,33 @@ fn ring_row(i: usize) -> ProposedRow {
         t_key: t_key.clone(),
         value: u64v(i as u64),
         entries: keys.iter().map(|k| entry(k, &t_key, true)).collect(),
+        pk_arbiter: false,
+    }
+}
+
+/// S4's rows (the C-OC-TIE gate's scratch shape): session `i` proposes
+/// `/t/r/{i}` with a **disjoint** arbiter `/u/a/A{i}` and the same two
+/// non-arbiter entries M,N — session 0 in caller order M,N, session 1
+/// N,M. The arbiters can never meet, so only the non-arbiter pair can
+/// collide; any order that is not globally ascending over them (M3b:
+/// arbiters first, then the rest in caller order) lets session 0 hold M
+/// and wait at N while session 1 holds N and waits at M — a real cycle
+/// of in-place non-arbiter waits, and 40P01.
+fn opposite_nonarbiter_row(i: usize) -> ProposedRow {
+    let t_key = format!("/t/r/{i}").into_bytes();
+    let mut entries = vec![entry(format!("/u/a/A{i}").as_bytes(), &t_key, true)];
+    let pair: [&[u8]; 2] = if i == 0 {
+        [b"/u/m/M", b"/u/n/N"]
+    } else {
+        [b"/u/n/N", b"/u/m/M"]
+    };
+    for k in pair {
+        entries.push(entry(k, &t_key, false));
+    }
+    ProposedRow {
+        t_key: t_key.clone(),
+        value: u64v(i as u64),
+        entries,
         pk_arbiter: false,
     }
 }
@@ -267,6 +309,74 @@ fn spec_race_two_sessions_bounded() {
     );
 }
 
+/// S4 — opposite caller orders of the **non-arbiter** entries with
+/// disjoint arbiters (C-FIXUPS2; the shape that survived T1–T4 under
+/// mutant M3b): sorting only the arbiter ops leaves the non-arbiter
+/// pair in caller order, and two upserts M,N vs N,M then hold-and-wait
+/// on each other (0 holds M waits at N while 1 holds N waits at M) — a
+/// stable cycle of in-place §5.1 waits, so the deadlock detector raises
+/// 40P01 (the gate measured 36/100 iterations under M3b; 0/100 on the
+/// real code). With §5.3.1 step 2's one global ascending order both
+/// sessions walk M,N the same way: the loser parks once on the winner
+/// and completes after the winner's self-abort — both statements
+/// complete, zero errors of any kind.
+#[test]
+fn nonarbiter_opposite_orders_no_deadlock() {
+    const ITERATIONS: usize = 100;
+    let mut histogram: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    let mut iterations_with_a_wait = 0usize;
+    for _ in 0..ITERATIONS {
+        let rig = Rig::new();
+        rig.core
+            .waits
+            .set_deadlock_timeout(Duration::from_millis(DEADLOCK_MS));
+        let waits = CountingWaits::new();
+        rig.core.waits.set_hook(waits.clone());
+
+        let a = rig.txn(Isolation::ReadCommitted);
+        let b = rig.txn(Isolation::ReadCommitted);
+        let barrier = Arc::new(Barrier::new(2));
+        let side_a = spawn_session(
+            &rig.core,
+            a,
+            race_session(Arc::clone(&barrier), opposite_nonarbiter_row(0)),
+        );
+        let side_b = spawn_session(
+            &rig.core,
+            b,
+            race_session(barrier, opposite_nonarbiter_row(1)),
+        );
+        let leashes = [side_a.leash.clone(), side_b.leash.clone()];
+        let (ra, _) = recv_bounded(&side_a, &leashes, BOUND, "session 0's upsert");
+        let (rb, _) = recv_bounded(&side_b, &leashes, BOUND, "session 1's upsert");
+
+        let (oa, ob) = match (&ra, &rb) {
+            (Ok(a), Ok(b)) => (*a, *b),
+            _ => panic!(
+                "both sessions must complete with no error of any kind (in particular no 40P01 from the non-arbiter pair M,N): {ra:?} / {rb:?}"
+            ),
+        };
+        assert_eq!(oa.result, OnConflictResult::Inserted, "session 0: {oa:?}");
+        assert_eq!(ob.result, OnConflictResult::Inserted, "session 1: {ob:?}");
+        // The only possible wait is the loser's in-place park on the
+        // winner; an in-place wait never restarts the attempt.
+        assert_eq!(oa.restarts, 0, "session 0 never restarts: {oa:?}");
+        assert_eq!(ob.restarts, 0, "session 1 never restarts: {ob:?}");
+        let starts = waits.starts.load(Ordering::SeqCst);
+        assert!(
+            starts <= 2,
+            "the loser parks once on the winner: {starts} waits"
+        );
+        if starts > 0 {
+            iterations_with_a_wait += 1;
+        }
+        *histogram.entry((oa.restarts, ob.restarts)).or_insert(0) += 1;
+    }
+    eprintln!(
+        "S4 opposite non-arbiter orders: restart histogram over {ITERATIONS} iterations: {histogram:?}; {iterations_with_a_wait} iterations with a wait"
+    );
+}
+
 /// T2 — the 3-session ring: session `i` holds `/u/k/{i}` and waits for
 /// `/u/k/{(i+1)%3}` (caller order), so every pair of neighbours shares one
 /// arbiter and the old caller-order placement could abandon all three on
@@ -319,14 +429,21 @@ fn spec_race_three_session_ring_bounded() {
     eprintln!("T2 ring: worst per-side restarts over {ITERATIONS} iterations: {worst}");
 }
 
-/// T3 — the placement order itself, deterministic (one race-free
-/// sequence): H holds `/u/z/Z` pending; A upserts `/t/r/a` whose caller
-/// entry order is `[/u/z/Z non-arbiter, /u/a/A arbiter]`. Ascending order
-/// is `/t/r/a < /u/a/A < /u/z/Z`, so A must place `/u/a/A` **before** it
-/// waits in place at `/u/z/Z` — while it is parked there it already holds
-/// `/u/a/A`'s intent. Caller order (or descending, or the arbiter-only
-/// half-fix) waits at `/u/z/Z` first and holds nothing on `/u/a/A`, which
-/// this test catches mid-wait, without any race.
+/// T3 — the FULL ascending placement order of §5.3.1 step 2, pinned
+/// deterministically (one race-free sequence): H holds `/u/z/Z` pending;
+/// A upserts `/t/r/a` whose caller entry order is adversarial —
+/// `[/u/z/Z` non-arbiter (the blocker), `/u/zz/ZZ` non-arbiter (above
+/// the blocker), `/u/b/B` non-arbiter (below the blocker), `/u/a/A`
+/// arbiter `]`. Ascending order is
+/// `/t/r/a < /u/a/A < /u/b/B < /u/z/Z < /u/zz/ZZ`, so while A is parked
+/// in place at `/u/z/Z` it must already hold the intents of EVERY op
+/// whose key sorts below the blocking key — the `/t/` key, the arbiter
+/// and the lower non-arbiter entry — and nothing above it. Each
+/// surviving half-order loses a different key mid-wait, without any
+/// race: M1 (caller order) and M3 (arbiter ops sorted in place) hold
+/// only `/t/r/a`; M2 (descending) holds `/u/zz/ZZ`; M3b (arbiters
+/// first, the rest in caller order) reaches `/t/r/a` but loses
+/// `/u/b/B`; M8 (`/t/` last) loses `/t/r/a`.
 #[test]
 fn placement_is_ascending_key_order() {
     let rig = Rig::new();
@@ -350,8 +467,8 @@ fn placement_is_ascending_key_order() {
         UniqueRule::Unique { same_row: None },
     ));
 
-    // A upserts /t/r/a with [/u/z/Z non-arbiter, /u/a/A arbiter], in that
-    // caller order, on a detached thread (its statement blocks).
+    // A upserts /t/r/a with the four entries in the adversarial caller
+    // order above, on a detached thread (its statement blocks).
     let a = rig.txn(Isolation::ReadCommitted);
     let a_id = a.id;
     let t_key = b"/t/r/a".to_vec();
@@ -360,6 +477,8 @@ fn placement_is_ascending_key_order() {
         value: u64v(1),
         entries: vec![
             entry(b"/u/z/Z", &t_key, false),
+            entry(b"/u/zz/ZZ", &t_key, false),
+            entry(b"/u/b/B", &t_key, false),
             entry(b"/u/a/A", &t_key, true),
         ],
         pk_arbiter: false,
@@ -398,12 +517,35 @@ fn placement_is_ascending_key_order() {
     }
     // A waits in place on H, and only on H.
     assert_eq!(rig.core.wait_edges(), vec![(a_id, h_id)], "A waits on H");
-    // The load-bearing assert: ascending placement put /u/a/A down before
-    // the wait at /u/z/Z, so A already holds it while parked.
+    // The load-bearing asserts: ascending placement put EVERY op whose
+    // key sorts below the blocking key /u/z/Z down before the wait, and
+    // nothing above it. C-FIXUPS2: the /t/ key pins M8 (/t/ placed
+    // last), the lower non-arbiter /u/b/B pins M3b (arbiters first,
+    // rest in caller order), and the empty /u/zz/ZZ pins the direction
+    // (M2, descending).
+    assert_eq!(
+        rig.intent(b"/t/r/a").map(|i| i.txn),
+        Some(a_id),
+        "A must already hold the /t/ key while waiting in place at /u/z/Z"
+    );
     assert_eq!(
         rig.intent(b"/u/a/A").map(|i| i.txn),
         Some(a_id),
-        "A must already hold /u/a/A while waiting in place at /u/z/Z"
+        "A must already hold the arbiter entry /u/a/A while waiting in place at /u/z/Z"
+    );
+    assert_eq!(
+        rig.intent(b"/u/b/B").map(|i| i.txn),
+        Some(a_id),
+        "A must already hold the lower non-arbiter entry /u/b/B while waiting in place at /u/z/Z"
+    );
+    assert_eq!(
+        rig.intent(b"/u/z/Z").map(|i| i.txn),
+        Some(h_id),
+        "H, not A, owns the blocking key /u/z/Z"
+    );
+    assert!(
+        rig.intent(b"/u/zz/ZZ").is_none(),
+        "A must own nothing above the blocking key: /u/zz/ZZ has an intent while A is parked at /u/z/Z"
     );
     let starts = waits.starts.load(Ordering::SeqCst);
     assert!(starts <= 2, "one in-place wait, no spin: {starts} waits");
