@@ -58,7 +58,27 @@ fn assert_exact_and_green(cfg: Config, seed: u64, choices: &[u64], exact: bool) 
 
 /// A reduced configuration: the named one with the minimizer's smaller
 /// sessions / keys / txns per session / statements per txn / crashes.
+/// The partial-layer savepoint weight is zeroed: the 14 pre-C-SIMr2
+/// schedules below were minimized against the old generator, and a live
+/// `sp_layer_pm` would redraw their `(session, txn)` program streams and
+/// break the exact replays (the weight is part of the frozen
+/// configuration, like the counts above).
 fn reduced(name: &str, s: usize, k: usize, t: usize, m: usize, c: usize) -> Config {
+    Config {
+        sessions: s,
+        keys: k,
+        txns_per_session: t,
+        max_stmts: m,
+        crashes: c,
+        sp_layer_pm: 0,
+        ..Config::named(name)
+    }
+}
+
+/// [`reduced`] with the partial-layer savepoint weight kept at the named
+/// configuration's value: the C-SIMr2 schedules replay under the generator
+/// they were minimized against.
+fn reduced_sp(name: &str, s: usize, k: usize, t: usize, m: usize, c: usize) -> Config {
     Config {
         sessions: s,
         keys: k,
@@ -1498,4 +1518,187 @@ fn mutant_n4_crash_i_vis() {
         12816920937924164708,
     ];
     assert_exact_and_green(reduced("crash", 2, 3, 3, 3, 1), 1, choices, true);
+}
+
+/// Mutant M2 (C-SIMr2): `ROLLBACK TO` runs the §7.3 step-4 bookkeeping on a
+/// **partial** layer drop (`DropLayersFrom` with layers below `s`
+/// surviving): `intent_count` is decremented although the intent remains.
+/// Found uncaught by the C-SIM re-gate at 500 seeds (no workload wrote a key
+/// both before a savepoint and inside it); the partial-layer workload kills
+/// it. Minimized from `rc_mix` seed 1 (I-COUNT, 40 choices).
+#[test]
+fn mutant_m2_rc_mix_i_count_partial_layer() {
+    let choices: &[u64] = &[
+        14096124591738067474,
+        11356687587340621409,
+        13795216013587330594,
+        14653971037609175131,
+        14292239500611405217,
+        11356687587340621409,
+        17269108783448632067,
+        13795216013587330594,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        13875289228893918177,
+        11759720759472125314,
+        12816920937924164708,
+        1769661039505662495,
+        940002233291805047,
+        12315296326122086742,
+        3650901824743153221,
+        12315296326122086742,
+        3950671758201046922,
+        1069653123863097502,
+        5995876489601524545,
+        2154459627034255740,
+        6082846910047110132,
+        12315296326122086742,
+        7102855973989942175,
+        17269108783448632067,
+        14292239500611405217,
+        17269108783448632067,
+        14096124591738067474,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        15969007938986996583,
+        17581488960850471074,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        15969007938986996583,
+        10291396803082557962,
+    ];
+    assert_exact_and_green(reduced_sp("rc_mix", 2, 3, 2, 1, 0), 1, choices, true);
+}
+
+/// Mutant M1 (C-SIMr2): `ROLLBACK TO` on a partial layer drop restores the
+/// **base** value instead of the previous top layer (the removal drops the
+/// whole intent, so the key reads its committed version). The read oracle
+/// catches it through the ghost's per-txn layer model: after `ROLLBACK TO`
+/// the expected value of k is the txn's pre-savepoint write, not the base.
+/// Minimized from `rc_mix` seed 1 (READ-ORACLE, 42 choices).
+#[test]
+fn mutant_m1_rc_mix_read_oracle_partial_layer() {
+    let choices: &[u64] = &[
+        14096124591738067474,
+        11356687587340621409,
+        13795216013587330594,
+        14653971037609175131,
+        14292239500611405217,
+        11356687587340621409,
+        17269108783448632067,
+        13795216013587330594,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        13875289228893918177,
+        11759720759472125314,
+        12816920937924164708,
+        1769661039505662495,
+        940002233291805047,
+        12315296326122086742,
+        3650901824743153221,
+        12315296326122086742,
+        3950671758201046922,
+        1069653123863097502,
+        5995876489601524545,
+        2154459627034255740,
+        6082846910047110132,
+        12315296326122086742,
+        7102855973989942175,
+        17269108783448632067,
+        14292239500611405217,
+        17269108783448632067,
+        14096124591738067474,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        15969007938986996583,
+        17581488960850471074,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        15969007938986996583,
+        10291396803082557962,
+        15969007938986996583,
+        17191754709355905095,
+    ];
+    assert_exact_and_green(reduced_sp("rc_mix", 2, 3, 2, 1, 0), 1, choices, true);
+}
+
+/// Mutant M3 (C-SIMr2): the commit acks before the `/sys/log` record is
+/// written — the record moves out of the step-2 batch and lands after the
+/// ack (`make_visible`). The I-LOG oracle catches it at the pipeline's
+/// `Acked` probe point: the record the session submitted is not in the KV
+/// yet. (The card's alternative arm — "the record omits a written key" —
+/// has no engine-side per-key form in the merged code: the payload is
+/// opaque to the engine, built by the caller; the omission the oracle is
+/// designed for is the missing record itself.) Minimized from `rc_mix`
+/// seed 1 (I-LOG, 21 choices).
+#[test]
+fn mutant_m3_rc_mix_i_log_ack_before_record() {
+    let choices: &[u64] = &[
+        14096124591738067474,
+        11356687587340621409,
+        13795216013587330594,
+        14653971037609175131,
+        14292239500611405217,
+        17269108783448632067,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        11759720759472125314,
+        12816920937924164708,
+        1769661039505662495,
+        940002233291805047,
+        12315296326122086742,
+        3650901824743153221,
+        12315296326122086742,
+        3950671758201046922,
+        1069653123863097502,
+        6082846910047110132,
+        17269108783448632067,
+        828337060840500581,
+    ];
+    assert_exact_and_green(reduced_sp("rc_mix", 2, 3, 1, 1, 0), 1, choices, true);
+}
+
+/// Mutant M4 (C-SIMr2): the commit record carries the wrong commit ts
+/// (`ts + 1` in the `/sys/txn/{TxnId}` put of the step-2 batch — in the
+/// merged code the ts lives in that record, written in the same batch as
+/// the `/sys/log` one). A wrong ts there is invisible to every other
+/// oracle (the status table, `visible_ts` and the resolved data all keep
+/// the real ts; I-VIS only tests `ts <= visible`); the I-LOG oracle reads
+/// the record at the ack and compares. The minimized schedule coincides
+/// with M3's (same seed and catch point — the `Acked` probe point; the
+/// failing arm differs). Minimized from `rc_mix` seed 1 (I-LOG, 21
+/// choices).
+#[test]
+fn mutant_m4_rc_mix_i_log_wrong_ts() {
+    let choices: &[u64] = &[
+        14096124591738067474,
+        11356687587340621409,
+        13795216013587330594,
+        14653971037609175131,
+        14292239500611405217,
+        17269108783448632067,
+        15969007938986996583,
+        17191754709355905095,
+        10473027141419423012,
+        11759720759472125314,
+        12816920937924164708,
+        1769661039505662495,
+        940002233291805047,
+        12315296326122086742,
+        3650901824743153221,
+        12315296326122086742,
+        3950671758201046922,
+        1069653123863097502,
+        6082846910047110132,
+        17269108783448632067,
+        828337060840500581,
+    ];
+    assert_exact_and_green(reduced_sp("rc_mix", 2, 3, 1, 1, 0), 1, choices, true);
 }
