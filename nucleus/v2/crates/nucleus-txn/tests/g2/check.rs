@@ -33,10 +33,15 @@
 //! every cycle without two adjacent rw edges (Cerone-Gotsman / Fekete: SI
 //! allows only cycles with two adjacent anti-dependencies), non-repeatable
 //! reads and statement-level lost updates; SER prevents every cycle. The
-//! search for RR-forbidden cycles is bounded (400 rw edges tried); when the
-//! SI relation provably has a cycle — including a two-txn self-loop — but
-//! the bounded search did not name one, the checker still reports a
-//! G-single-class anomaly naming the cyclic SI component, never silence.
+//! search for RR-forbidden cycles is bounded (400 rw edges tried, and only
+//! rw edges whose head lies in a cyclic SI component — no shaped path can
+//! open anywhere else, so the budget is spent on edges that can close one);
+//! when an SI cycle that needs an anti-dependency provably exists but the
+//! bounded search did not name one, the checker still reports a
+//! G-single-class anomaly naming that cyclic SI component, never silence.
+//! A cycle of the SI relation that uses no anti-dependency is a ww/wr
+//! cycle (G0/G1c) and stays with the RC-level searches that report it with
+//! a real cycle.
 //!
 //! **Cross-checks with outcomes** (C-T0 §11 names in reports: I-SER,
 //! I-SSI-PRECISION, I-UNIQUE, I-FK, I-LIVE): every 40001 is explained by a
@@ -971,6 +976,20 @@ impl<'a> Checker<'a> {
         let si_adj = gs.si_adj();
         let si_comp = scc(&si_adj);
         let si_cycle = has_cycle(&si_comp, &si_adj);
+        // The cyclic-SI-component mask the candidate prune below uses: a
+        // node whose SI component is non-trivial or self-looped. Walking an
+        // RR-forbidden cycle as SI steps composes it through exactly these
+        // nodes, so an rw edge whose head is elsewhere can never open the
+        // shaped path — skipping those keeps the 400-edge budget for edges
+        // that can (verified on the gate's injected read skews: with the
+        // prune they are named as cycles instead of reaching the verdict
+        // unnamed through the fallback).
+        let cyc_v = {
+            let sizes = comp_sizes(&si_comp);
+            (0..gs.n)
+                .map(|v| sizes[si_comp[v]] > 1 || si_adj[v].contains(&v))
+                .collect::<Vec<_>>()
+        };
         // Set when the capped fallback below already reported the SI cycle,
         // so the any-cycle search adds no second report of it.
         let mut si_fallback = false;
@@ -978,7 +997,7 @@ impl<'a> Checker<'a> {
             let mut tried = 0;
             let mut si_named = false;
             for (ei, e) in gs.list.iter().enumerate() {
-                if e.2 != Ek::Rw || comp_s[e.0] != comp_s[e.1] {
+                if e.2 != Ek::Rw || comp_s[e.0] != comp_s[e.1] || !cyc_v[e.1] {
                     continue;
                 }
                 tried += 1;
@@ -994,46 +1013,41 @@ impl<'a> Checker<'a> {
                     break;
                 }
             }
-            // Never silent. `si_cycle` says an RR-forbidden cycle exists;
-            // when the bounded search did not name one (the 400-rw-edge cap
-            // was hit, or the shaped-path search found nothing), report it
-            // anyway as a G-single-class violation naming the members of a
-            // cyclic SI component. Without this, a legal write-skew cycle
-            // in the same history fills the report and the RR violation
-            // disappears from the verdict. The rw-edge candidate filter
-            // stays "inside one SCC of the full graph" on purpose. The
-            // closing edge's tail never lies in a cyclic SI component in
-            // general, and although its head always does (it sits on the
-            // SI walk), pruning on that would skip exactly the legal
-            // readers whose anti-dependencies spend the budget inside a
-            // big SCC — leaving the cap unreachable and this fallback
-            // unprovable. Clean RR runs pay nothing either way: without an
-            // SI cycle the loop body never runs.
+            // Never silent. `si_cycle` says the SI relation is cyclic —
+            // through an anti-dependency (an RR-forbidden cycle) or through
+            // direct ww/wr edges alone; when the bounded search did not name
+            // one (the 400-rw-edge cap was hit, or the shaped-path search
+            // found nothing), report it anyway as a G-single-class violation
+            // naming the members of an SI component that is cyclic through
+            // an anti-dependency: one of the composed SI edges (a non-rw
+            // edge followed by an rw edge) has both ends inside it. Without
+            // this, a legal write-skew cycle in the same history fills the
+            // report and the RR violation disappears from the verdict. A
+            // component cyclic through direct (ww/wr) SI edges alone is a
+            // G0/G1c cycle — the RC-level searches' territory, already
+            // reported there with a real cycle — and relabelling it here
+            // would only duplicate the report.
             if !si_named {
-                let sizes = comp_sizes(&si_comp);
-                let mut cyclic = vec![false; sizes.len()];
-                for (i, &s) in sizes.iter().enumerate() {
-                    if s > 1 {
-                        cyclic[i] = true;
+                let n_comp = comp_sizes(&si_comp).len();
+                let mut rw_cyclic = vec![false; n_comp];
+                for &(u, v) in &gs.si_composed() {
+                    if si_comp[u] == si_comp[v] {
+                        rw_cyclic[si_comp[u]] = true;
                     }
                 }
-                for (v, a) in si_adj.iter().enumerate() {
-                    if a.contains(&v) {
-                        cyclic[si_comp[v]] = true;
-                    }
-                }
-                if let Some(c) = (0..cyclic.len()).find(|&c| cyclic[c]) {
+                let n_cyclic = rw_cyclic.iter().filter(|&&b| b).count();
+                if let Some(c) = (0..n_comp).find(|&c| rw_cyclic[c]) {
                     let mut members: Vec<u32> = (0..gs.n)
                         .filter(|&v| si_comp[v] == c)
                         .map(|v| gs.uids[v])
                         .collect();
                     members.sort_unstable();
                     members.dedup();
-                    let n_cyclic = cyclic.iter().filter(|&&b| b).count();
                     let detail = format!(
                         "an RR-forbidden SI cycle exists but the bounded search \
                          (cap 400 rw edges) did not name it; members of the first \
-                         cyclic SI component: {:?} ({} cyclic component(s) in total)",
+                         SI component cyclic through an anti-dependency: {:?} \
+                         ({} such component(s) in total)",
                         members, n_cyclic
                     );
                     self.anomalies.push(Anomaly {
@@ -1752,6 +1766,28 @@ impl Graph {
             }
         }
         a
+    }
+
+    /// The composed SI edges only: `(u, v)` for a non-rw edge `u -> w`
+    /// whose head `w` has an rw out-edge `w -> v`. An SI cycle through one
+    /// of these is a dependency cycle that uses an anti-dependency — what
+    /// RR forbids; an SI cycle of direct edges alone is a ww/wr cycle
+    /// (G0/G1c), which the RC-level searches already report with a real
+    /// cycle. The capped fallback relies on the distinction.
+    fn si_composed(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for e in &self.list {
+            if e.2 == Ek::Rw {
+                continue;
+            }
+            for &ri in &self.out[e.1] {
+                let r = self.list[ri];
+                if r.2 == Ek::Rw {
+                    out.push((e.0, r.1));
+                }
+            }
+        }
+        out
     }
 
     fn rebuild(

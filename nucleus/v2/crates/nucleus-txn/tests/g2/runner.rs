@@ -19,9 +19,10 @@
 //!
 //! **Harness-level bug injection** ([`Bug`]): ways a *store* could be broken,
 //! arranged entirely in the harness (the engine is never edited): sessions
-//! that take a fresh snapshot per statement while claiming REPEATABLE READ,
-//! that read straight from the intents (read uncommitted), or that apply each
-//! write in its own autocommitted txn.
+//! that take a fresh snapshot per statement — reads only or reads and
+//! writes alike — while claiming REPEATABLE READ, that read straight from
+//! the intents (read uncommitted), or that apply each write in its own
+//! autocommitted txn.
 
 use std::cell::Cell;
 use std::ops::Bound;
@@ -298,13 +299,23 @@ impl Drop for Rig {
 
 // ----- sessions ------------------------------------------------------------------
 
-/// A harness-level defect injected into a session (the "broken store").
+/// Harness-level defect injected into a session (the "broken store").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bug {
     None,
-    /// A REPEATABLE READ session that takes a fresh snapshot per statement
-    /// (RC behaviour under an RR claim).
+    /// A REPEATABLE READ session that takes a fresh snapshot per statement,
+    /// reads and writes alike (RC behaviour under an RR claim): its writes
+    /// evaluate against versions its txn never saw, so an application-level
+    /// lost update slips through (the `inject` proof of life).
     PerStmtSnapshot,
+    /// A REPEATABLE READ session whose *reads* take a fresh snapshot per
+    /// statement while its writes keep the txn snapshot. The soak's
+    /// detection model: a store that mis-schedules reads is already
+    /// broken (non-repeatable reads, read skews), and keeping the writes
+    /// on the txn snapshot removes the abort churn that closed exactly
+    /// the windows the checker needs (a concurrent commit landing between
+    /// two read statements of one txn) — the G2r3 deflake.
+    PerStmtReadSnapshot,
     /// Plain reads peek at the newest intent, committed or not.
     DirtyReads,
     /// Every write statement commits in its own txn at once.
@@ -502,9 +513,13 @@ impl<'r> Session<'r> {
         }
     }
 
-    /// The engine txn and snapshot a read statement uses.
-    fn read_env<R>(
+    /// The engine txn and snapshot a statement uses. `broken_reads` turns
+    /// on the `PerStmtReadSnapshot` defect's fresh per-statement snapshot —
+    /// reads only; writes keep the txn snapshot (`PerStmtSnapshot` is fresh
+    /// for every statement either way; see `Bug`).
+    fn stmt_env<R>(
         &self,
+        broken_reads: bool,
         f: impl FnOnce(&Txn, bool, Ts, u32) -> Result<R, TxnError>,
     ) -> Result<R, TxnError> {
         let Some(txn) = self.txn.as_ref() else {
@@ -521,7 +536,10 @@ impl<'r> Session<'r> {
             self.rig.ssi.check_doomed(txn.id)?;
         }
         let fresh = self.level == Level::ReadCommitted
-            || (self.level == Level::RepeatableRead && self.bug == Bug::PerStmtSnapshot);
+            || (self.level == Level::RepeatableRead && self.bug == Bug::PerStmtSnapshot)
+            || (broken_reads
+                && self.level == Level::RepeatableRead
+                && self.bug == Bug::PerStmtReadSnapshot);
         let seq = txn.next_seq()?;
         if fresh {
             let g = self.rig.core.registry.take_snapshot();
@@ -532,14 +550,23 @@ impl<'r> Session<'r> {
         }
     }
 
-    /// The engine txn and snapshot a write statement uses; an autocommit
-    /// session runs it in its own RC txn and commits at once.
+    /// The engine txn and snapshot a read statement uses.
+    fn read_env<R>(
+        &self,
+        f: impl FnOnce(&Txn, bool, Ts, u32) -> Result<R, TxnError>,
+    ) -> Result<R, TxnError> {
+        self.stmt_env(true, f)
+    }
+
+    /// The engine txn and snapshot a write statement uses (the txn
+    /// snapshot even under `PerStmtSnapshot`); an autocommit session runs
+    /// it in its own RC txn and commits at once.
     fn write_env<R>(
         &self,
         f: impl FnOnce(&Txn, bool, Ts, u32) -> Result<R, TxnError>,
     ) -> Result<R, TxnError> {
         if self.bug != Bug::Autocommit {
-            return self.read_env(f);
+            return self.stmt_env(false, f);
         }
         let t = self.rig.core.begin(Isolation::ReadCommitted);
         let g = self.rig.core.registry.take_snapshot();
@@ -980,14 +1007,6 @@ impl Mix {
         sp_update: 4,
         parent_writes: true,
     };
-
-    /// The SERIALIZABLE soak's mix: the FK parents are never written. See the
-    /// ESCALATE note in `soak`: the FK check of a child insert drops the
-    /// reader-side rw edge to a concurrent parent writer.
-    pub const SER: Mix = Mix {
-        parent_writes: false,
-        ..Mix::STANDARD
-    };
 }
 
 /// The program of `(seed, session, index)`.
@@ -1041,18 +1060,10 @@ pub fn gen_prog(seed: u64, session: u16, index: u32, mix: &Mix) -> Prog {
         } else if pick(mix.delete) {
             ops.push(POp::Delete(row(&mut rng, true, true)));
         } else if pick(mix.upsert) {
-            // An upsert only ever runs in a txn that holds nothing yet (the
-            // first write statement): see the ESCALATE note in `soak`, the
-            // engine livelocks two upserts that wait on each other's rows.
-            let k = row(&mut rng, false, true);
-            let wrote = ops
-                .iter()
-                .any(|o| !matches!(o, POp::Read(_) | POp::Scan(..)));
-            ops.push(if wrote {
-                POp::Update(k)
-            } else {
-                POp::Upsert(k)
-            });
+            // Upserts run wherever they fall in the program, holding rows
+            // or not: C-OC-LIVE (merged) made an ON CONFLICT restart cycle
+            // end in exactly one 40P01, so the strict workload is back.
+            ops.push(POp::Upsert(row(&mut rng, false, true)));
         } else if pick(mix.fk_insert) {
             ops.push(POp::FkInsert(CHILD0 + rng.below(2) as u8));
         } else {
