@@ -234,6 +234,7 @@ The txn keeps a write-set log `(seq, logical key)` with one entry per layer push
 `ROLLBACK TO SAVEPOINT` at seq `s`:
 - For each key written at seq `>= s`: under `latch(latch_key(k))`, re-read `k@INTENT`; if owned by the txn, drop layers with `seq >= s`. If no layer remains, remove the intent per §7.3. The restored top layer restores data, `data_seq` and lock.
 - Shared row locks taken at seq `>= s` are released (under each key's latch, §6).
+- The SSI storage-map changes of DDL executed at seq `>= s` are undone (§10 map journal) before the relation locks taken at seq `>= s` are released; an undone change counts as having released something.
 - Pending end-of-statement and deferred constraint checks and queued AFTER-trigger events with seq `>= s` are discarded.
 - **SIREAD locks and recorded rw-conflicts are kept** (the client has seen the data; PostgreSQL keeps them too).
 - Portals and cursors opened at seq `>= s` are closed.
@@ -357,7 +358,7 @@ Unresolved committed intents are safe: GC only drops versions older than a kept 
 ## 10. Other rules
 - **Storage ids:** u64, allocated from a persisted counter, never reused. Catalog rows map relation and index oids to their current storage ids.
 - **Sequences:** non-transactional; the high-water mark is persisted (synced) before a value from a new block is handed out. Values may skip, never repeat.
-- **Catalog:** rows in `/sys/catalog`, versioned like any table; DDL is transactional and takes AccessExclusive. A DDL's SSI storage-map changes are settled while its AccessExclusive still conflicts: before `Aborted` on abort (§7.1), and before the relation locks are released on `ROLLBACK TO` (§5.5) and commit (§3 step 5). (An `Aborted` holder never conflicts, §6, so settling after `Aborted` would let a writer into the old storage range while it is unmapped and drop its rw-edges.) The GC rules (§9.2) apply to data prefixes and `/sys/catalog/` only; every other `/sys/` key is never dropped by the filter, even if its bytes match the version-key pattern.
+- **Catalog:** rows in `/sys/catalog`, versioned like any table; DDL is transactional and takes AccessExclusive. The SSI storage-map changes a DDL makes are recorded per txn and statement (the map journal) and settled before anyone else can act on the relation: undone before `Aborted` on abort (§7.1, while the AccessExclusive still conflicts), undone before the relation locks are released on `ROLLBACK TO` (§5.5), and kept on commit (§3 step 5; keeping changes nothing a later acquirer could observe). (An `Aborted` holder never conflicts, §6, so settling after `Aborted` would let a writer into the old storage range while it is unmapped and drop its rw-edges.) The GC rules (§9.2) apply to data prefixes and `/sys/catalog/` only; every other `/sys/` key is never dropped by the filter, even if its bytes match the version-key pattern.
 - **Large txns:** intents, write-set log and SIREAD state all spill; the 10M-row gate measures commit latency, reader latency during resolution and abort cleanup time.
 
 ## 11. Invariants and the G0 model
@@ -472,6 +473,7 @@ Known divergences from PostgreSQL 17:
 
 ## Changelog
 
+- **Draft 7.6.1** (2026-10-11, C-T5-ABORT gate nits): §10 names the map journal and says commit keeps (not settles-under-conflict); §5.5 lists the map undo and counts it as a release.
 - **Draft 7.6** (2026-10-10, C-T5r2 gate): §7.1 the aborting session settles its DDL's SSI storage-map journal while still `Pending`, before `Aborted`; §10 states when map changes settle. The gate reproduced write skew through the old order (an acquirer granted the relation because the holder was already `Aborted` wrote into the still-unmapped old range and no rw-edge was recorded). Card C-T5-ABORT.
 - **Draft 7.4** (2026-10-10, ESCALATE-1 from G2, card C-OC-LIVE): §5.5 `ROLLBACK TO` bumps the wake generation only if it released something; a rollback that released nothing no longer wakes (and so no longer tears down) its waiters' wait-for edges, so restarting ON CONFLICT statements present a stable cycle to the deadlock check (I-LIVE b). §5.3.1(2) a non-arbiter unique wait during an attempt is an ordinary §5.1 wait in place (PostgreSQL `UNIQUE_CHECK_YES`); only arbiter keys abandon. §6 wake-generation and Waking wording follow. The symmetric speculative-insert race is named as a known residual (C-OC-TIE).
 - **Draft 7.5** (2026-10-10, card C-OC-TIE): §5.3.1(2) an attempt places the `/t/` key and all entries in ascending key order, so two attempts cannot abandon on each other's freshly placed arbiter entries and restart in lockstep. Gate finding on 7.5: the order covers only step 2's own placements, and BEFORE ROW triggers inside the attempt could still write each other's arbiter keys and restart in lockstep (903 restarts measured); §5.3.1 now runs BEFORE ROW INSERT triggers once per proposed row before the first attempt, as PostgreSQL does, which closes the 7.4 residual.
