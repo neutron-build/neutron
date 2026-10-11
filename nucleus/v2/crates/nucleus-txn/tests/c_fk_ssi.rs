@@ -29,7 +29,7 @@ use nucleus_txn::commit::SyncCommit;
 use nucleus_txn::locks::LockManager;
 use nucleus_txn::read::{read_key, NoSsi};
 use nucleus_txn::resolver::Resolver;
-use nucleus_txn::ssi::Ssi;
+use nucleus_txn::ssi::{Siread, Ssi};
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::{ReadCtx, RwEdge};
 use nucleus_txn::write::{RowOp, SsiHook, StmtCtx, UniqueRule};
@@ -340,6 +340,52 @@ fn fk_missing_parent_23503_still_records_reader_edge() {
         rig.has_edge(b.id(), iw),
         "the 23503 outcome must not drop the reader-side edge"
     );
+}
+
+/// The FK check's read hands its **own view's** counter to
+/// `on_read_edges` (§8.2): the SIREAD registers first (stamped with the
+/// registry's view counter), the view opens after it (the counter it was
+/// handed is strictly greater), and `last_read_view_counter` reports that
+/// view — the monotone relation I-SSI-ORDER is asserted on.
+/// Mutant killed: R3 (`fk_check_child` passing `0` instead of
+/// `view.counter()`): `last_read_view_counter` reports a counter at or
+/// below the SIREAD's registration stamp and the assertion fails.
+/// Diagnostic-only (the edges themselves are unaffected), so this is the
+/// only observable seam.
+#[test]
+fn fk_child_read_view_counter_is_past_the_siread_stamp() {
+    let rig = lock_rig();
+    rig.preload(P0, b"k1");
+    let a = rig.ser(false);
+    let b = rig.ser(false);
+    assert_eq!(rig.read(&a, C0), None);
+    rig.update(&a, P0, b"k1v2");
+    rig.insert(&b, C0, b"k1");
+    // The FK check is B's last SSI read, so `last_read_view_counter`
+    // names exactly the view that read the parent.
+    fk(&rig, &b, P0).expect("the FK check passes");
+
+    let stamp = rig
+        .ssi
+        .sireads_of(b.id())
+        .into_iter()
+        .find_map(|(sr, c)| match sr {
+            Siread::Point { ref key } if key.as_slice() == P0 => Some(c),
+            _ => None,
+        })
+        .expect("the FK check registered a point SIREAD on the parent");
+    let view = rig
+        .ssi
+        .last_read_view_counter(b.id())
+        .expect("the FK check recorded its read");
+    assert!(
+        view > stamp,
+        "the read ran through a view opened after the SIREAD registered \
+         (view counter {view} must be past the stamp {stamp})"
+    );
+    // The stamp itself was a real registration (the counter handed out
+    // at least one view since the registry opened).
+    assert!(stamp > 0, "the registry handed out views before the check");
 }
 
 /// RC/RR keep the no-op path: the same interleaving with both txns RR,

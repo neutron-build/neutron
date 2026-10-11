@@ -34,7 +34,14 @@
 //! `arbiter_insert`) fails T3; M3/M4 (never set `released` for the layer
 //! / shared-row-lock loop) fail T5(b)/(c) and the seed 26/46 tests; M5
 //! (`LockManager::release_from` always `false`) fails T5(d) and
-//! `locks_relation`'s rollback test.
+//! `locks_relation`'s rollback test. C-FIXUPS1 pins the ones those left:
+//! M8 (`CatalogRelease::release_from` ignoring the inner hook's bool)
+//! fails the catalog-chain wake test; M9 (the advisory branch of
+//! `LockManager::release_from` never setting `released`) fails the
+//! advisory-only wake test — `locks_relation`'s rollback test releases a
+//! relation lock in the same rollback, whose branch sets `released`
+//! anyway, masking it; M10 (the non-arbiter wait-in-place passing `None`
+//! instead of the statement deadline) fails the `lock_timeout` test.
 
 mod c_t2c_support;
 
@@ -45,12 +52,14 @@ use std::time::{Duration, Instant};
 use c_t2c_support::{assert_count_exact, ok, u64v, CountingWaits, Fixed, Rig};
 use nucleus_kv::MemKv;
 use nucleus_txn::boot::Core;
+use nucleus_txn::catalog::Catalog;
 use nucleus_txn::locks::{LockManager, RelLockMode};
+use nucleus_txn::ssi::Ssi;
 use nucleus_txn::txn::{CancelHandle, Isolation, Txn};
 use nucleus_txn::wait::{WaitBegin, WaitOutcome};
 use nucleus_txn::write::{
-    IndexEntry, OnConflictAction, OnConflictOutcome, OnConflictResult, ProposedRow, RowOp, StmtCtx,
-    UniqueRule,
+    IndexEntry, LockWait, OnConflictAction, OnConflictOutcome, OnConflictResult, ProposedRow,
+    RowOp, StmtCtx, UniqueRule,
 };
 use nucleus_txn::{RowLockMode, TxnError, TxnId};
 
@@ -702,4 +711,204 @@ fn rollback_to_bumps_iff_released() {
         ok(rig.core.abort(u));
         ok(rig.core.abort(t));
     }
+}
+
+// ------------------------------------------------------------ C-FIXUPS1 ----
+
+/// Runs `f` on a detached thread and returns a receiver of its result
+/// (the r5 rule: never join a possibly blocked thread; the caller bounds
+/// with `recv_timeout` and a fired cancel handle drains the statement).
+fn detached<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> mpsc::Receiver<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx
+}
+
+/// The C-FIXUPS1 driver: T takes an **advisory** lock after a savepoint
+/// — and nothing else after it, no layer, no row lock, no relation lock —
+/// W parks on that advisory lock, and T's `ROLLBACK TO` releases exactly
+/// the advisory lock. W must wake promptly: `rollback_to` bumps only if
+/// the release hook reported something, and the advisory lock is the
+/// only thing that could be reported.
+fn advisory_only_rollback_wakes(locks: Arc<LockManager>, rig: &Rig, what: &str) {
+    // The deadlock check must not fire inside the bounds (there is no
+    // cycle): park the waiter on a long deadlock timeout.
+    rig.core.waits.set_deadlock_timeout(Duration::from_secs(30));
+    let t = rig.txn(Isolation::ReadCommitted);
+    let sp = ok(t.savepoint());
+    assert!(
+        ok(locks.advisory_xact_lock(&rig.core, &t, 42, false, LockWait::Block, None,)),
+        "T takes the advisory lock after the savepoint"
+    );
+    let w = rig.txn(Isolation::ReadCommitted);
+    let wid = w.id;
+    let leash = w.cancel_handle();
+    let core = Arc::clone(&rig.core);
+    let waiter_locks = Arc::clone(&locks);
+    let rx = detached(move || {
+        let r = waiter_locks.advisory_xact_lock(&core, &w, 42, false, LockWait::Block, None);
+        let _ = core.abort(w);
+        r
+    });
+    // W must already be waiting on T when the rollback runs: the edge and
+    // the slot land in one graph critical section, so observing the edge
+    // means the wait is registered (a rollback before that would let W
+    // acquire without ever parking, passing a mutant the same way).
+    let t0 = Instant::now();
+    while !rig.core.wait_edges().contains(&(wid, t.id)) {
+        assert!(
+            t0.elapsed() < BOUND,
+            "{what}: W never blocked on the advisory lock"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let start = Instant::now();
+    ok(rig.core.rollback_to(&t, sp));
+    match rx.recv_timeout(BOUND) {
+        Ok(r) => {
+            assert_eq!(r, Ok(true), "{what}: the woken waiter acquires");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{what}: the wake is prompt ({:?})",
+                start.elapsed()
+            );
+        }
+        Err(_) => {
+            leash.cancel();
+            panic!(
+                "{what}: LOST WAKE — W still parked after a ROLLBACK TO \
+                 that released only its blocking advisory lock"
+            );
+        }
+    }
+    ok(rig.core.abort(t));
+    assert!(
+        rig.core.wait_edges().is_empty(),
+        "wait edges left: {:?}",
+        rig.core.wait_edges()
+    );
+    assert!(
+        rig.core.wait_slots().is_empty(),
+        "wait slots left: {:?}",
+        rig.core.wait_slots()
+    );
+}
+
+/// A `ROLLBACK TO` that releases **only** an advisory lock wakes the
+/// waiter on it. The advisory branch of
+/// `LockManager::release_from` must set `released` for exactly this
+/// rollback: no layer drop, no shared row lock and no relation lock
+/// happens, so the other branches cannot report the release for it.
+/// Mutant killed: M9 (that branch never sets `released`) —
+/// `rollback_to` bumps nobody and W stays parked; this test fails at its
+/// bound. `locks_relation::rollback_to_releases_relation_and_advisory_locks`
+/// releases a relation lock in the same rollback, whose branch sets
+/// `released` anyway, so it cannot catch M9; this test has no relation
+/// lock to mask it.
+#[test]
+fn rollback_to_releasing_only_an_advisory_lock_wakes_the_waiter() {
+    let rig = Rig::new();
+    let locks = LockManager::install(&rig.core);
+    advisory_only_rollback_wakes(locks, &rig, "advisory-only");
+}
+
+/// The same advisory-only release through the production
+/// `Catalog::open` hook chain (`CatalogRelease` wrapping the lock
+/// manager's hook — the chain `Catalog::open` installs on every booted
+/// core): the inner hook's `released` bool must survive the chain, or
+/// the journal-less rollback (no DDL ran) reports nothing and wakes
+/// nobody.
+/// Mutant killed: M8 (`CatalogRelease::release_from` ignoring the inner
+/// hook's bool) — the advisory lock is still released, but the bump
+/// never runs and W stays parked; this test fails at its bound.
+#[test]
+fn rollback_to_advisory_only_release_wakes_through_catalog_chain() {
+    let rig = Rig::new();
+    let ssi = Ssi::install(&rig.core);
+    let locks = LockManager::install(&rig.core);
+    let _catalog = ok(Catalog::open(&rig.core, &ssi, &locks));
+    advisory_only_rollback_wakes(locks, &rig, "catalog-chain");
+}
+
+/// A row whose non-arbiter entry `/u/n/N` is the only thing another txn
+/// holds pending: the `/t/` insert and the arbiter entry place freely,
+/// and the non-arbiter wait-in-place is the statement's only wait.
+fn row_with_n() -> ProposedRow {
+    fn u_entry(key: &[u8], payload: &[u8], arbiter: bool) -> IndexEntry {
+        IndexEntry {
+            key: key.to_vec(),
+            value: payload.to_vec(),
+            arbiter,
+        }
+    }
+    ProposedRow {
+        t_key: b"/t/r/new".to_vec(),
+        value: u64v(5),
+        entries: vec![
+            u_entry(b"/u/a/new", b"/t/r/new", true),
+            u_entry(b"/u/n/N", b"/t/r/new", false),
+        ],
+        pk_arbiter: false,
+    }
+}
+
+/// The non-arbiter wait-in-place runs on the statement's one
+/// `lock_timeout` deadline (§5.3.1(2), r5): B's upsert waits in place on
+/// A's pending non-arbiter value and must return 55P03 when the deadline
+/// passes — not park until A ends — leaving no stale edges or slots.
+/// Mutant killed: M10 (that wait passing `None` instead of the statement
+/// deadline) — the wait is unbounded, no 55P03 arrives, and this test
+/// fails at its bound (the fired cancel handle ends the statement).
+#[test]
+fn nonarbiter_wait_in_place_honours_lock_timeout() {
+    let rig = Rig::new();
+    rig.core.waits.set_deadlock_timeout(Duration::from_secs(30));
+    // A holds /u/n/N pending (no lock_timeout of its own; it never waits).
+    let a = rig.txn(Isolation::ReadCommitted);
+    let sa = ok(a.next_seq());
+    ok(rig.core.insert_key(
+        &a,
+        b"/u/n/N",
+        None,
+        b"/t/r/other".to_vec(),
+        StmtCtx::new(rig.core.visible_ts(), sa, sa),
+        UniqueRule::Unique { same_row: None },
+    ));
+    // B upserts a row whose non-arbiter entry is that value, with a
+    // 250 ms lock_timeout: the wait-in-place must end in 55P03 at it.
+    let b = rig.txn(Isolation::ReadCommitted);
+    let sb = ok(b.next_seq());
+    let ctx = StmtCtx::new(rig.core.visible_ts(), sb, sb).lock_timeout(Duration::from_millis(250));
+    let side = spawn_session(&rig.core, b, upsert_body(ctx, row_with_n(), 77));
+    let leashes = [side.leash.clone()];
+    let (r, tb, el) = recv_bounded(&side, &leashes, BOUND, "B's upsert");
+    assert_eq!(
+        r.map(|o| o.result),
+        Err(TxnError::LockNotAvailable),
+        "the wait-in-place ends in 55P03 at lock_timeout"
+    );
+    assert!(
+        el >= Duration::from_millis(200),
+        "55P03 must not predate the deadline ({el:?})"
+    );
+    assert!(
+        el < Duration::from_millis(1500),
+        "55P03 must be prompt, not the park slice or the deadlock timeout ({el:?})"
+    );
+    // The victim rule aborted B on its own thread; nothing of the wait
+    // survives, and A's abort leaves a clean graph.
+    assert!(tb.is_none(), "the failed statement's txn was aborted");
+    ok(rig.core.abort(a));
+    assert!(
+        rig.core.wait_edges().is_empty(),
+        "wait edges left: {:?}",
+        rig.core.wait_edges()
+    );
+    assert!(
+        rig.core.wait_slots().is_empty(),
+        "wait slots left: {:?}",
+        rig.core.wait_slots()
+    );
 }
