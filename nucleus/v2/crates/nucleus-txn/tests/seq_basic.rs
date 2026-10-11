@@ -284,11 +284,30 @@ fn i64_boundary_seed_errors_per_call() {
         matches!(core.seq_next(13), Err(TxnError::Invariant(_))),
         "value i64::MAX + 1 cannot be returned"
     );
-    assert!(
-        matches!(core.seq_next(13), Err(TxnError::Invariant(_))),
-        "the error is stable; the cursor stands still"
-    );
     assert_eq!(hwm_of(&kv, 13), Some(i64::MAX as u64 + 4));
+
+    // C-T7r3: more calls than the block size. A mutant that advances the
+    // cursor before the i64 check walks the cursor one per erroring call;
+    // once it reaches H it reserves again, so H creeps past i64::MAX and
+    // the reservation count grows. Pin all three: every call errors, the
+    // persisted H never moves after the first error, and the reservation
+    // count never grows (the overflowing call consumed nothing).
+    for call in 1..=(3 * 4) {
+        assert!(
+            matches!(core.seq_next(13), Err(TxnError::Invariant(_))),
+            "call {call}: the error is stable; the cursor stands still"
+        );
+        assert_eq!(
+            hwm_of(&kv, 13),
+            Some(i64::MAX as u64 + 4),
+            "call {call}: an overflowing call writes nothing"
+        );
+        assert_eq!(
+            core.seq_reservations_for_tests(13),
+            Some(1),
+            "call {call}: an overflowing call reserves nothing"
+        );
+    }
 }
 
 /// An `OrderedKv` wrapper whose writes fail once `fail` is set (reads keep
