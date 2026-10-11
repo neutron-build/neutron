@@ -7,16 +7,19 @@
 //! which has no getter).
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use nucleus_kv::fault::Fault;
-use nucleus_kv::{Batch, Durability, Key, MemKv, OrderedKv};
+use nucleus_kv::{Batch, Durability, Key, KvError, MemKv, Op, OrderedKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::catalog::{
-    table_range, Catalog, Ddl, IdxRow, KeyRange, RelRow, SYS_CATALOG_PREFIX,
+    next_storage_id_key, table_range, Catalog, Ddl, IdxRow, KeyRange, RelRow, SYS_CATALOG_PREFIX,
 };
-use nucleus_txn::commit::{CommitConfig, CommitObserver, CommitPipeline, CommitTicket, SyncCommit};
+use nucleus_txn::commit::{
+    CommitConfig, CommitObserver, CommitPipeline, CommitTicket, ReleaseHook, SyncCommit,
+};
 use nucleus_txn::locks::LockManager;
 use nucleus_txn::read::NoSsi;
 use nucleus_txn::registry::{SnapshotGuard, ViewGuard};
@@ -178,6 +181,46 @@ impl Rig {
             kv,
             pipeline: Mutex::new(pipeline),
         }
+    }
+
+    /// The C-T5r2 window-test rig: the [`AeFreeGate`] sits between the
+    /// lock manager's hook and the catalog's wrapper, and the test holds
+    /// its handle. Everything else is the plain rig.
+    pub fn gated() -> (Rig, Gate) {
+        let kv = Arc::new(Fault::new(MemKv::new(), || Ok(MemKv::new())));
+        let core = Arc::new(ok(Core::open(SharedFault(kv.clone()))));
+        let ssi = Ssi::install(&core);
+        let locks = LockManager::install(&core);
+        let target: Arc<Mutex<Option<TxnId>>> = Arc::new(Mutex::new(None));
+        let fired = Arc::new(Flag::new());
+        let proceed = Arc::new(Flag::new());
+        core.set_release_hook(Arc::new(AeFreeGate {
+            inner: Arc::clone(&locks) as Arc<dyn ReleaseHook>,
+            core: Arc::clone(&core),
+            target: Arc::clone(&target),
+            fired: Arc::clone(&fired),
+            proceed: Arc::clone(&proceed),
+        }));
+        let catalog = ok(Catalog::open(&core, &ssi, &locks));
+        let pipeline = ok(CommitPipeline::with_config(
+            Arc::clone(&core),
+            CommitConfig::new().with_observer(ssi.commit_observer()),
+        ));
+        (
+            Rig {
+                core,
+                ssi,
+                locks,
+                catalog,
+                kv,
+                pipeline: Mutex::new(pipeline),
+            },
+            Gate {
+                target,
+                fired,
+                proceed,
+            },
+        )
     }
 
     /// Crashes (keeping `keep` unsynced batches) and reopens the whole
@@ -485,4 +528,183 @@ pub fn table_key(sid: u64, suffix: &str) -> Vec<u8> {
 /// A key-range pair as `[lo, hi)` bytes.
 pub fn range_bytes(r: &KeyRange) -> (&[u8], &[u8]) {
     (r.0.as_slice(), r.1.as_slice())
+}
+
+// ---- C-T5r2: the AE-free gate and the counter-write fault -------------------
+
+/// Bound for the gate's hand-offs (a timeout is a failure, never a pass).
+const GATE_BOUND: Duration = Duration::from_secs(30);
+
+/// The C-T5r2 window-test hook: a [`ReleaseHook`] layered **between** the
+/// lock manager's hook and the catalog's wrapper ([`Rig::gated`] installs
+/// it before `Catalog::open`, which chains around it), so it observes a
+/// release exactly when the lock manager has dropped the target's locks —
+/// the earliest moment a concurrent session can acquire the relation.
+///
+/// For the armed target only: after the inner release it bumps the
+/// target's wake generation and wakes its waiters — as the engine would
+/// at any in-memory lock release (§6) — signals `fired`, and then holds
+/// the release (and with it, under the pre-C-T5r2 order, the journal
+/// settle that had not run yet) until `proceed`. Every other txn passes
+/// straight through. The test asserts the map is already settled when
+/// `fired` goes up: that is the invariant "settle the journal before
+/// `inner.release_*`".
+pub struct AeFreeGate {
+    inner: Arc<dyn ReleaseHook>,
+    core: Arc<Core<SharedFault>>,
+    target: Arc<Mutex<Option<TxnId>>>,
+    fired: Arc<Flag>,
+    proceed: Arc<Flag>,
+}
+
+impl ReleaseHook for AeFreeGate {
+    fn release_all(&self, txn: TxnId) {
+        self.inner.release_all(txn);
+        if *self.target.lock().expect("gate target") == Some(txn) {
+            // The AE is free: wake the parked waiter here, as a lock
+            // release would (§6), and freeze the release until the test
+            // has observed the map.
+            ok(self.core.bump_and_wake(txn));
+            self.fired.hit();
+            self.proceed.wait_at_least(1, GATE_BOUND);
+        }
+    }
+
+    fn release_from(&self, txn: TxnId, from_seq: nucleus_txn::Seq) -> bool {
+        self.inner.release_from(txn, from_seq)
+    }
+}
+
+/// The test's handle to an [`AeFreeGate`].
+pub struct Gate {
+    target: Arc<Mutex<Option<TxnId>>>,
+    /// Hits when the lock manager has dropped the armed target's locks.
+    pub fired: Arc<Flag>,
+    /// Lets the frozen release continue.
+    pub proceed: Arc<Flag>,
+}
+
+impl Gate {
+    /// Arms the gate: the target's next `release_all` freezes at the
+    /// AE-free moment.
+    pub fn arm(&self, txn: TxnId) {
+        *self.target.lock().expect("gate target") = Some(txn);
+    }
+}
+
+/// An `OrderedKv` wrapper that fails every write whose batch touches
+/// `key` while `fail` is set: the counter-write fault of the C-T5r2 id
+/// tests (the `common::FailNthKv` pattern, keyed instead of counted, over
+/// the WAL-faithful [`Fault`]).
+#[derive(Clone)]
+pub struct FailKeyKv {
+    inner: SharedFault,
+    key: Vec<u8>,
+    fail: Arc<AtomicBool>,
+}
+
+impl FailKeyKv {
+    /// Wraps `inner`; writes touching `key` fail once `fail` is set.
+    pub fn new(inner: SharedFault, key: Vec<u8>, fail: Arc<AtomicBool>) -> FailKeyKv {
+        FailKeyKv { inner, key, fail }
+    }
+
+    fn touches(&self, op: &Op) -> bool {
+        match op {
+            Op::Put(k, _) | Op::Delete(k) => k.as_slice() == self.key,
+            Op::DeleteRange { start, end } => {
+                start.as_slice() <= self.key.as_slice() && self.key.as_slice() < end.as_slice()
+            }
+        }
+    }
+}
+
+impl OrderedKv for FailKeyKv {
+    type Snap = <MemKv as OrderedKv>::Snap;
+
+    fn write(&self, batch: Batch, sync: Durability) -> nucleus_kv::Result<()> {
+        if self.fail.load(Ordering::SeqCst) && batch.ops.iter().any(|op| self.touches(op)) {
+            return Err(KvError::Backend("injected counter-write failure".into()));
+        }
+        self.inner.write(batch, sync)
+    }
+    fn sync_wal(&self) -> nucleus_kv::Result<()> {
+        self.inner.sync_wal()
+    }
+    fn snapshot(&self) -> Self::Snap {
+        self.inner.snapshot()
+    }
+    fn get_latest(&self, key: &[u8]) -> nucleus_kv::Result<Option<Vec<u8>>> {
+        self.inner.get_latest(key)
+    }
+    fn ingest_sorted(
+        &self,
+        entries: &mut dyn Iterator<Item = (Key, Vec<u8>)>,
+    ) -> nucleus_kv::Result<()> {
+        self.inner.ingest_sorted(entries)
+    }
+    fn checkpoint(&self, dir: &std::path::Path) -> nucleus_kv::Result<()> {
+        self.inner.checkpoint(dir)
+    }
+    fn set_gc_filter(&self, filter: Box<dyn nucleus_kv::GcFilter>) {
+        self.inner.set_gc_filter(filter)
+    }
+    fn set_gc_watermark(&self, watermark: u64) -> nucleus_kv::Result<()> {
+        self.inner.set_gc_watermark(watermark)
+    }
+}
+
+/// The C-T5r2 counter rig: a core + catalog whose writes to the storage-id
+/// counter key fail on demand (no pipeline — the id tests never commit).
+pub struct CounterRig {
+    pub core: Arc<Core<FailKeyKv>>,
+    pub catalog: Catalog,
+    pub fail: Arc<AtomicBool>,
+}
+
+impl CounterRig {
+    pub fn new() -> CounterRig {
+        let kv = Arc::new(Fault::new(MemKv::new(), || Ok(MemKv::new())));
+        let fail = Arc::new(AtomicBool::new(false));
+        let core = Arc::new(ok(Core::open(FailKeyKv::new(
+            SharedFault(kv),
+            next_storage_id_key(),
+            Arc::clone(&fail),
+        ))));
+        let ssi = Ssi::install(&core);
+        let locks = LockManager::install(&core);
+        let catalog = ok(Catalog::open(&core, &ssi, &locks));
+        CounterRig {
+            core,
+            catalog,
+            fail,
+        }
+    }
+
+    /// A fresh RC txn (the DDL session of the id tests).
+    pub fn rc(&self) -> Txn {
+        self.core.begin(Isolation::ReadCommitted)
+    }
+
+    /// The blocking Ddl for `txn` at snapshot `s`.
+    pub fn ddl<'c>(&'c self, txn: &'c Txn, s: Ts) -> Ddl<'c, FailKeyKv> {
+        let seq = txn.next_seq().expect("seq");
+        Ddl::new(&self.core, txn, StmtCtx::new(s, seq, seq))
+    }
+
+    /// `catalog_create_table` driven end to end at snapshot `s`.
+    pub fn create_table(&self, txn: &Txn, s: Ts, name: &[u8]) -> (u64, u64) {
+        ok(self.catalog.catalog_create_table(
+            &self.ddl(txn, s),
+            name,
+            nucleus_txn::catalog::RelKind::Table,
+            b"",
+        ))
+    }
+}
+
+impl Default for CounterRig {
+    fn default() -> Self {
+        CounterRig::new()
+    }
 }
