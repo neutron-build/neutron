@@ -48,6 +48,24 @@
 //!   was not 1 and its own `/sys/seq/{id}` was never written, so a crash
 //!   repeated its values.
 //!
+//! # One core per store (C-T7r3)
+//!
+//! The boot rule (§10, §7.2) is **one core per store**: `Core::open` is a
+//! store's boot, and a store has one live core at a time. The seq module
+//! relies on that: it boots each id's cursor from the persisted `H` at the
+//! id's first use on the core and then assumes it is `H`'s only writer.
+//! Two *live* cores over one store — reachable only by wrapping one KV in
+//! a shared `Arc` and handing clones to two `Core::open` calls in the same
+//! process (the tests' `SharedKv`/`SharedFaultKv` shape) — each load `H`
+//! at their own first use and each believe they own the cursor, so both
+//! hand out values from the same block and values repeat, the one
+//! failure §10 forbids. Sequential cores (open, drop, reopen) are the
+//! crash/reboot path and are fine. `K: OrderedKv` cannot detect a shared
+//! wrapper, so this is a documented deployment assumption, not a runtime
+//! guard (C-T7r3: none required); a later card may add one (e.g. a boot
+//! lease checked on `/sys/seq` writes) if a real deployment ever shares a
+//! store between live cores.
+//!
 //! # Concurrency
 //!
 //! One mutex (the `Core` field) guards the module. It is a leaf: no
