@@ -3,7 +3,8 @@
 //!
 //! Call sites (§8.2, §8.4, §8.6): the read path's edges flow through
 //! C-T1a's `ReadObserver`; the write path calls `before_point_read`
-//! (before a view opens), `on_read_edges` (after a write-path read
+//! (before a view opens), `covers` (under the key's latch, §5.3's
+//! SERIALIZABLE unique rule), `on_read_edges` (after a write-path read
 //! through a registered view: the FK child check's parent read) and
 //! `on_data_placed` (after the latch is released, §5.1); the commit
 //! pipeline wraps every channel enqueue in `pre_commit` (§8.4) and
