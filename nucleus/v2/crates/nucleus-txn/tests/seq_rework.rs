@@ -67,6 +67,11 @@ struct Gate {
     release_cv: Condvar,
 }
 
+/// C-T7r3: how long [`Gate::wait_until_parked`] waits before failing the
+/// test. Without it, a mutant that skips the parked write hangs the suite
+/// forever instead of failing it.
+const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct GateState {
     count: u64,
     parked: u64,
@@ -100,21 +105,39 @@ impl Gate {
         }
     }
 
-    /// Blocks until `n` writers are parked.
+    /// Blocks until `n` writers are parked, or panics after
+    /// [`GATE_TIMEOUT`] (C-T7r3): the parked write is the synchronisation
+    /// the test's assertions stand on, so a mutant that never performs it
+    /// must fail with a clear message, not hang the suite.
     fn wait_until_parked(&self, n: u64) {
         let mut st = self.st.lock().expect("gate");
         while st.parked < n {
-            st = self.parked_cv.wait(st).expect("gate");
+            let (guard, timed_out) = self.parked_cv.wait_timeout(st, GATE_TIMEOUT).expect("gate");
+            st = guard;
+            if timed_out.timed_out() {
+                panic!(
+                    "gate: fewer than {n} writers parked within {GATE_TIMEOUT:?} — \
+                     the synced /sys/seq write this gate parks inside never ran"
+                );
+            }
         }
     }
 
+    /// How many writers have arrived at the gate, parked or not: every
+    /// write to the gated key counts, before and after `release`.
+    fn arrivals(&self) -> u64 {
+        self.st.lock().expect("gate").count
+    }
+
     /// Waits a bounded margin for `n` parked writers; returns whether they
-    /// arrived. The margin is *not* the synchronisation — the gate's
-    /// condvars are. It exists only because a correct core can never
-    /// satisfy `n >= 2` in the hook-swap test (thread B cannot reach the
-    /// KV while thread A holds the seq mutex across its synced write), so
-    /// there is nothing to block on; the timeout lets the test proceed and
-    /// assert on values instead.
+    /// arrived. The margin is **extra safety only, never the
+    /// synchronisation** (C-T7r3): a correct core can never satisfy
+    /// `n >= 2` in the hook-swap test (thread B cannot reach the KV while
+    /// thread A holds the seq mutex across its synced write), so on
+    /// correct code this always burns the margin — it is kept small for
+    /// exactly that reason. The synchronisation is the thread joins plus
+    /// [`Gate::arrivals`]: under correct code no third write to the gated
+    /// key ever happens, however long B takes.
     fn wait_until_parked_margin(&self, n: u64, margin: Duration) -> bool {
         let mut st = self.st.lock().expect("gate");
         while st.parked < n {
@@ -344,18 +367,23 @@ fn hook_swap_mid_reservation_hands_out_distinct_values() {
     // B calls seq_next on the same id while A is still parked. Under the
     // fixed code B cannot pass the seq mutex, so it can never reach the KV
     // while A is parked; under the old sidecar B's fresh module wrote to
-    // /sys/seq/0 and parked at the gate too. The bounded margin is extra
-    // safety only — the synchronisation is the gate itself.
+    // /sys/seq/0 and parked at the gate too. The 100 ms margin is extra
+    // safety only — never the synchronisation (C-T7r3): correct code
+    // always burns it, so it is kept small. The synchronisation is the
+    // joins below plus the gate's arrival count: only A's two writes
+    // (creation + reservation) may ever arrive, whenever B runs.
     let core_b = Arc::clone(&core);
     let handle_b = thread::spawn(move || core_b.seq_next(0));
-    let b_reached_the_kv = kv.gate.wait_until_parked_margin(2, Duration::from_secs(2));
+    let b_parked_early = kv
+        .gate
+        .wait_until_parked_margin(2, Duration::from_millis(100));
 
     kv.gate.release();
     let a = ok(handle_a.join().expect("thread A"));
     let b = ok(handle_b.join().expect("thread B"));
 
     assert!(
-        !b_reached_the_kv,
+        !b_parked_early && kv.gate.arrivals() == 2,
         "thread B reached /sys/seq/0 while A was parked mid-reservation: \
          the seq state is not owned by the core"
     );
