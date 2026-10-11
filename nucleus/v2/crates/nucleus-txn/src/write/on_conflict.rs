@@ -274,7 +274,9 @@ impl<K: OrderedKv> Core<K> {
                 match task.step(self, txn) {
                     Ok(Step::Done(RowOutcome::Applied)) => break,
                     Ok(Step::Again) => {}
-                    Ok(Step::Wait(targets)) if arbiter => return Ok(Attempt::Restart(Some(targets))),
+                    Ok(Step::Wait(targets)) if arbiter => {
+                        return Ok(Attempt::Restart(Some(targets)))
+                    }
                     // §5.1 `wait_for; continue`: a non-arbiter key is an
                     // ordinary key-existence op, so it waits in place on
                     // the statement's one `lock_timeout` deadline (r5)

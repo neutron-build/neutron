@@ -506,7 +506,9 @@ fn g2_escalate_upsert_cycle_port() {
     for _ in 0..REPEATS {
         let rig = Rig::new();
         let _locks = LockManager::install(&rig.core);
-        rig.core.waits.set_deadlock_timeout(Duration::from_millis(5));
+        rig.core
+            .waits
+            .set_deadlock_timeout(Duration::from_millis(5));
         rig.preload(b"/t/r/0", &u64v(0));
         rig.preload(b"/t/r/2", &u64v(2));
         let barrier = Arc::new(Barrier::new(2));
@@ -518,11 +520,7 @@ fn g2_escalate_upsert_cycle_port() {
             a,
             g2_body(Arc::clone(&barrier), b"/t/r/0", b"/t/r/2", 10),
         );
-        let side_b = spawn_session(
-            &rig.core,
-            b,
-            g2_body(barrier, b"/t/r/2", b"/t/r/0", 20),
-        );
+        let side_b = spawn_session(&rig.core, b, g2_body(barrier, b"/t/r/2", b"/t/r/0", 20));
         let leashes = [side_a.leash.clone(), side_b.leash.clone()];
         let (ra, ta, _) = recv_bounded(&side_a, &leashes, bound, "A's session");
         let (rb, tb, _) = recv_bounded(&side_b, &leashes, bound, "B's session");
@@ -531,7 +529,10 @@ fn g2_escalate_upsert_cycle_port() {
             .iter()
             .filter(|r| matches!(r, Err(TxnError::Deadlock)))
             .count();
-        assert_eq!(deadlocks, 1, "exactly one 40P01 per repeat: {ra:?} / {rb:?}");
+        assert_eq!(
+            deadlocks, 1,
+            "exactly one 40P01 per repeat: {ra:?} / {rb:?}"
+        );
         total_deadlocks += deadlocks;
         // The winner returns its txn; the main thread ends it and drains
         // resolution, so each repeat's core is clean before it drops.
