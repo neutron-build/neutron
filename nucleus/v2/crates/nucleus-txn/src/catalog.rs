@@ -289,8 +289,8 @@ impl<K: OrderedKv> ReleaseHost for Core<K> {
 ///   map is what a waiter that re-runs against the relation sees, and a
 ///   concurrent DDL that slipped in cannot be clobbered by a late undo.
 ///
-/// Both abort callers run the hooks before the wake (§7.1, §3 step 5),
-/// so a waiter that re-runs never sees a half-undone map either way.
+/// Both hook callers run them before the wake (§7.1, §3 step 5), so a
+/// waiter that re-runs never sees a half-undone map either way.
 ///
 /// Lock order (§3.1) — no inversion across the settle/release split: the
 /// settle takes the journal mutex, drops it, then the SSI mutex per undo
