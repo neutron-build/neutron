@@ -148,7 +148,9 @@ impl<K: OrderedKv> Core<K> {
                 Attempt::Restart(wait) => {
                     // Abandon exactly as ROLLBACK TO SAVEPOINT sa (§5.5):
                     // only the attempt's layers go, its events are
-                    // discarded, the wake generation is bumped.
+                    // discarded, and the wake generation is bumped **only
+                    // if the rollback released something** (§5.5) — an
+                    // attempt that had placed nothing wakes nobody.
                     self.rollback_to(txn, sa)?;
                     if let Some(targets) = wait {
                         map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?;
@@ -219,19 +221,28 @@ impl<K: OrderedKv> Core<K> {
             }
         }
         // (2) Insert.
-        self.arbiter_insert(txn, actx, row)
+        self.arbiter_insert(txn, actx, row, deadline)
     }
 
     /// §5.3.1(2): the row and every entry as key-existence ops at `sa`. An
-    /// arbiter key's unique conflict, or any wait, abandons the attempt.
-    /// With `pk_arbiter` the `/t/` key's unique check is the arbiter check:
-    /// a live entry of another row abandons and restarts from (1) (which
-    /// then finds the conflict), never 23505.
+    /// **arbiter** key's unique conflict or wait abandons the attempt; a
+    /// non-arbiter key's wait is an ordinary §5.1 key-existence wait: the
+    /// attempt keeps its layers and waits in place, re-stepping the same
+    /// op (PostgreSQL's `UNIQUE_CHECK_YES` waits on non-arbiter indexes).
+    /// Abandoning on a non-arbiter wait would release the layers the
+    /// attempt has already placed, bump the wake generation and recreate
+    /// the ESCALATE-1 livelock: two upserts each waiting on the other's
+    /// pending non-arbiter value would keep waking each other and never
+    /// leave a stable cycle for the deadlock check (I-LIVE b).
+    /// With `pk_arbiter` the `/t/` key's unique check is the arbiter
+    /// check: a live entry of another row abandons and restarts from (1)
+    /// (which then finds the conflict), never 23505.
     fn arbiter_insert(
         &self,
         txn: &Txn,
         actx: &StmtCtx,
         row: &ProposedRow,
+        deadline: Option<Instant>,
     ) -> Result<Attempt, TxnError> {
         let mut ops: Vec<(KeyOpTask, bool)> = Vec::with_capacity(row.entries.len() + 1);
         ops.push((
@@ -263,7 +274,14 @@ impl<K: OrderedKv> Core<K> {
                 match task.step(self, txn) {
                     Ok(Step::Done(RowOutcome::Applied)) => break,
                     Ok(Step::Again) => {}
-                    Ok(Step::Wait(targets)) => return Ok(Attempt::Restart(Some(targets))),
+                    Ok(Step::Wait(targets)) if arbiter => return Ok(Attempt::Restart(Some(targets))),
+                    // §5.1 `wait_for; continue`: a non-arbiter key is an
+                    // ordinary key-existence op, so it waits in place on
+                    // the statement's one `lock_timeout` deadline (r5)
+                    // and re-steps the same task.
+                    Ok(Step::Wait(targets)) => {
+                        map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?
+                    }
                     Ok(other) => {
                         return Err(TxnError::Invariant(format!(
                             "ON CONFLICT insert step returned {other:?} (§5.1 forbids it)"
