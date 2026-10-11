@@ -34,16 +34,6 @@
 //! simulator can drive them is a card-level decision for the integrator.
 //!
 //! **Weights and gaps that cannot be closed here:**
-//! - No partial-layer `ROLLBACK TO`: every savepoint block rolls back to a
-//!   point before the txn's first write to the key, so all of that txn's
-//!   layers on the key are dropped. The §5.5 "restore the previous top
-//!   layer" path (an earlier layer of the same intent survives) and its
-//!   `intent_count` bookkeeping in `removal.rs` are never exercised (found by
-//!   the C-SIM re-gate: a mutant running `bookkeeping` on a partial drop was
-//!   uncaught at 500 seeds). Closing it means emitting a write to the key
-//!   before the SAVEPOINT in `gen_program`.
-//! - No oracle reads the commit-path `/sys/log` record, so an atomicity
-//!   break between the log write and the commit record is invisible here.
 //! - Cancellation is the program's planned self-cancel mid-wait (one in
 //!   eight); there is no timeout-driven cancel (no wall clocks) and no
 //!   `lock_timeout` / NOWAIT / SKIP LOCKED statements.
@@ -60,6 +50,37 @@
 //!   the simulator was granted (`ghost.rs`), but the exclusive side still
 //!   reads the intents in the KV (an intent is data the simulator may scan
 //!   through the public view API).
+//! - The I-LOG oracle covers the commits that carry a `/sys/log` record
+//!   (every non-SERIALIZABLE commit with a write set, C-SIMr2) plus the
+//!   `/sys/txn` commit record of every acked commit. SERIALIZABLE commits
+//!   and the no-write fast path carry no record — the merged
+//!   `Core::commit_submit` has no payload parameter and is the only public
+//!   §8.4 pre-commit path a SER commit may take — so their record half is
+//!   the `/sys/txn` ts check alone.
+//!
+//! **C-SIMr2 additions** (both close gaps the C-SIM module docs listed):
+//!
+//! - **Partial-layer `ROLLBACK TO` workload** (`Config::sp_layer_pm`, per
+//!   mille of programs): a program writes key k, takes a SAVEPOINT, writes
+//!   k again (or deletes it), rolls back to the savepoint, then reads k /
+//!   writes on it again / commits or aborts. This exercises the §5.5
+//!   "restore the previous top layer" path in `removal.rs`
+//!   (`DropLayersFrom` with layers below `s` surviving: the intent is
+//!   rewritten, not removed, and `intent_count` must not move) and the
+//!   ghost's per-txn layer model (`ghost::Ghost::rollback_to`): the
+//!   expected value after the rollback is the pre-savepoint write, never
+//!   the base.
+//! - **The I-LOG oracle** (`check::on_ack_records` and the `/sys/log` half
+//!   of `check::on_reboot`): at the quiescent points the scheduler already
+//!   has — an observed commit ack (the session's poll or the pipeline's
+//!   `Acked` probe point) and crash recovery — it reads the commit-path
+//!   records through the simulator's KV (latest state, no view, no
+//!   scheduling draws) and checks them against the ghost model: the
+//!   `/sys/txn/{id}` record carries exactly the acked ts, a submitted
+//!   `/sys/log/{id}` record is present and byte-identical, and after a
+//!   crash every surviving `/sys/log` record pairs with its commit record
+//!   and its submitted payload (one batch — an atomicity break between the
+//!   log write and the commit record is a violation).
 
 pub mod check;
 pub mod ghost;
@@ -68,11 +89,12 @@ pub mod min;
 pub mod sched;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use nucleus_txn::boot::Core;
 use nucleus_txn::commit::{
-    Clock, CommitConfig, CommitPipeline, CommitProbe, CommitTicket, ProbePoint, SyncCommit,
+    Clock, CommitAck, CommitConfig, CommitPipeline, CommitProbe, CommitRequest, CommitTicket,
+    ProbePoint, SyncCommit,
 };
 use nucleus_txn::encoding::end_key;
 use nucleus_txn::gc::{GcConfig, GcJob};
@@ -94,6 +116,33 @@ pub use kv::SimKv;
 pub use sched::{Choices, Rng, Trace};
 
 use check::Checker;
+
+// ---------------------------------------------------------------------------
+// Commit acks
+// ---------------------------------------------------------------------------
+
+/// Where a submitted commit's ack comes from (C-SIMr2): the
+/// [`CommitTicket`] of `Core::commit_submit`, or the raw ack receiver of a
+/// manually built [`CommitRequest`] — the path a session takes when it
+/// submits a `/sys/log` payload with its commit (`Core::commit_submit`'s
+/// merged signature passes no payload, and a SERIALIZABLE txn must use it:
+/// it is the only public path that runs the §8.4 SSI pre-commit around the
+/// enqueue).
+pub enum AckSource {
+    Ticket(CommitTicket),
+    Rx(mpsc::Receiver<CommitAck>),
+}
+
+impl AckSource {
+    /// `None` until the pipeline acks the request (fail-stop error acks
+    /// included): the step-by-step polling primitive, for both shapes.
+    pub fn try_ack(&self) -> Option<CommitAck> {
+        match self {
+            AckSource::Ticket(t) => t.try_ack(),
+            AckSource::Rx(rx) => rx.try_recv().ok(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Results
@@ -203,6 +252,11 @@ pub struct Config {
     /// Probability of a SAVEPOINT / statements / ROLLBACK TO block, per
     /// mille.
     pub sp_block_pm: usize,
+    /// Probability of a **partial-layer** savepoint program (C-SIMr2), per
+    /// mille: write k, SAVEPOINT, write k again (or delete it), ROLLBACK
+    /// TO, then read k / write on it / commit or abort. Zero in the frozen
+    /// configurations the pre-C-SIMr2 regression schedules replay under.
+    pub sp_layer_pm: usize,
     pub max_steps: u64,
     /// I-PROGRESS bound R.
     pub progress_r: u32,
@@ -243,6 +297,7 @@ impl Config {
                 check_i_ser: false,
                 lock_pairs_pm: 0,
                 sp_block_pm: 150,
+                sp_layer_pm: 100,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -275,6 +330,7 @@ impl Config {
                 check_i_ser: false,
                 lock_pairs_pm: 0,
                 sp_block_pm: 150,
+                sp_layer_pm: 100,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -307,6 +363,7 @@ impl Config {
                 check_i_ser: true,
                 lock_pairs_pm: 0,
                 sp_block_pm: 150,
+                sp_layer_pm: 100,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -344,6 +401,7 @@ impl Config {
                 check_i_ser: false,
                 lock_pairs_pm: 400,
                 sp_block_pm: 500,
+                sp_layer_pm: 150,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -376,6 +434,7 @@ impl Config {
                 check_i_ser: false,
                 lock_pairs_pm: 0,
                 sp_block_pm: 150,
+                sp_layer_pm: 100,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -412,6 +471,7 @@ impl Config {
                 check_i_ser: false,
                 lock_pairs_pm: 0,
                 sp_block_pm: 150,
+                sp_layer_pm: 100,
                 max_steps: 2000,
                 progress_r: 8,
             },
@@ -454,7 +514,7 @@ impl Program {
 /// Program generation draws from a per-(session, txn) stream (see
 /// `sched.rs`): it is not part of the recorded choice list, so minimizing a schedule does not
 /// reshuffle the programs it replays.
-fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
+pub fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
     let nk = cfg.keys;
     // Deadlock bias: two FOR UPDATE locks in per-session-opposite orders.
     if cfg.lock_pairs_pm > 0 && rng.chance_pm(cfg.lock_pairs_pm) {
@@ -469,6 +529,35 @@ fn gen_program(cfg: &Config, session: usize, rng: &mut Rng) -> Program {
             stmts: vec![Stmt::LockUpdate(first), Stmt::LockUpdate(second)],
             cancel_mid_wait: rng.chance_pm(cfg.cancel_pm),
             commit: true,
+            sync: bool_sync(rng.chance_pm(cfg.sync_on_pm)),
+        };
+    }
+    // A partial-layer savepoint program (C-SIMr2): write k, SAVEPOINT,
+    // write k again (or delete it), ROLLBACK TO — §5.5's restore-the-
+    // previous-top-layer path: an earlier layer of the same intent
+    // survives, the intent is rewritten (not removed) and `intent_count`
+    // must not move — then read k (the oracle checks the restored layer,
+    // not the base) / write on it again / commit or abort, so the restored
+    // layer is the one that commits.
+    if cfg.sp_layer_pm > 0 && rng.chance_pm(cfg.sp_layer_pm) {
+        let k = rng.below(nk);
+        let mut stmts = vec![Stmt::Update(k), Stmt::Savepoint];
+        let inner = if rng.chance_pm(700) {
+            Stmt::Update(k)
+        } else {
+            Stmt::Delete(k)
+        };
+        stmts.push(inner);
+        stmts.push(Stmt::RollbackTo);
+        match rng.below(3) {
+            0 => stmts.push(Stmt::Read(k)),
+            1 => stmts.push(Stmt::Update(k)),
+            _ => {}
+        }
+        return Program {
+            stmts,
+            cancel_mid_wait: rng.chance_pm(cfg.cancel_pm),
+            commit: !rng.chance_pm(125),
             sync: bool_sync(rng.chance_pm(cfg.sync_on_pm)),
         };
     }
@@ -675,7 +764,7 @@ pub struct Session {
     /// The wait a step's `Wait(targets)` parked, until `wait_begin` runs.
     pub pending_wait: Option<PendingWait>,
     pub wait: Option<WaitState>,
-    pub ticket: Option<CommitTicket>,
+    pub ticket: Option<AckSource>,
     /// The txn id the pending ticket belongs to.
     pub ticket_txn: Option<TxnId>,
     pub savepoints: Vec<Seq>,
@@ -1359,6 +1448,11 @@ fn absorb_ack(sim: &mut Sim, i: usize, tid: TxnId, ts: Ts) {
     // record and promises nothing.
     if ts != Ts::ZERO {
         check::on_ack(sim, &tid);
+        if sim.violation.is_some() {
+            return;
+        }
+        // C-SIMr2: the commit-path records against the ghost model (I-LOG).
+        check::on_ack_records(sim, &tid, ts);
         if sim.violation.is_some() {
             return;
         }
@@ -2408,14 +2502,50 @@ fn drive_era(
                 };
                 guards[i] = None;
                 let id = txn.id;
-                let r = core.commit_submit(txn, sync);
+                // C-SIMr2: a commit that can carry a `/sys/log` record goes
+                // down as a manually built request (`Core::submit`), so the
+                // commit path writes the record the I-LOG oracle reads.
+                // SERIALIZABLE txns must run the §8.4 SSI pre-commit —
+                // `commit_submit` is its only public path, and its merged
+                // signature carries no payload — and the no-write fast path
+                // writes no record either way; both keep `commit_submit`
+                // and submit no payload (the ghost records `log_payload:
+                // None`). For a non-SER, non-DDL txn the two paths are
+                // behaviourally identical (the pre-commit hook only
+                // enqueues).
+                let keys = txn.write_set_keys();
+                let r = if txn.isolation == Isolation::Serializable || keys.is_empty() {
+                    core.commit_submit(txn, sync).map(AckSource::Ticket)
+                } else {
+                    let payload = {
+                        let mut s = sim.lock().expect("sim");
+                        let writes: Vec<ghost::GhostWrite> = s
+                            .ghost
+                            .txns
+                            .get(&id)
+                            .map(|t| t.writes.clone())
+                            .unwrap_or_default();
+                        let payload = ghost::log_payload_of(&writes);
+                        if let Some(t) = s.ghost.txns.get_mut(&id) {
+                            t.log_payload = Some(payload.clone());
+                            t.events.push(format!(
+                                "submit sync={sync:?} log={} bytes ({} writes)",
+                                payload.len(),
+                                writes.len()
+                            ));
+                        }
+                        payload
+                    };
+                    let (req, rx) = CommitRequest::new(id, sync, Some(payload), false, keys);
+                    core.submit(req).map(|()| AckSource::Rx(rx))
+                };
                 let mut s = sim.lock().expect("sim");
                 match r {
-                    Ok(ticket) => {
+                    Ok(src) => {
                         if let Some(t) = s.ghost.txns.get_mut(&id) {
                             t.sync = Some(sync);
                         }
-                        s.sessions[i].ticket = Some(ticket);
+                        s.sessions[i].ticket = Some(src);
                         s.sessions[i].ticket_txn = Some(id);
                         s.sessions[i].phase = Phase::PollTicket;
                         s.inflight.push(id);
@@ -2535,6 +2665,12 @@ fn drain(sim: &Arc<Mutex<Sim>>, core: &Core<SimKv>, pipeline: &mut CommitPipelin
                 let released = s.core.status.entry(id).is_some_and(|e| e.released);
                 if ts != Ts::ZERO {
                     s.ghost.commit_at(id, ts);
+                    // C-SIMr2: the commit-path records against the ghost
+                    // model (I-LOG), at this quiescent point too.
+                    check::on_ack_records(&mut s, &id, ts);
+                    if s.violation.is_some() {
+                        return;
+                    }
                 }
                 if let Some(g) = s.ghost.txns.get_mut(&id) {
                     g.outcome = ghost::Outcome::Acked(ts);

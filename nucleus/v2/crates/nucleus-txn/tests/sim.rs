@@ -172,3 +172,57 @@ fn probe_points_fire() {
     }
     assert!(total > 0, "no probe point fired across 5 runs");
 }
+
+/// The C-SIMr2 partial-layer savepoint shape is generated in every
+/// configuration that weights it, and never in one with weight 0 (the
+/// frozen regression configurations rely on that).
+#[test]
+fn partial_layer_shape_is_generated() {
+    // write k, SAVEPOINT, write k again (or delete it), ROLLBACK TO: the
+    // pre-savepoint write is what ROLLBACK TO must restore.
+    let is_shape = |stmts: &[sim::Stmt]| -> bool {
+        let key_of = |s: &sim::Stmt| -> Option<usize> {
+            match s {
+                sim::Stmt::Update(k) | sim::Stmt::Delete(k) => Some(*k),
+                _ => None,
+            }
+        };
+        stmts.len() >= 4
+            && key_of(&stmts[0]).is_some()
+            && stmts[1] == sim::Stmt::Savepoint
+            && key_of(&stmts[2]).is_some()
+            && key_of(&stmts[2]) == key_of(&stmts[0])
+            && stmts[3] == sim::Stmt::RollbackTo
+    };
+    for name in ["rc_mix", "rr_mix", "ser_only", "locks_heavy", "crash", "gc"] {
+        let cfg = one_config(name);
+        let mut shapes = 0usize;
+        for nth in 0..2000usize {
+            let mut rng = sim::Rng::new(0xABCD ^ (nth as u64).wrapping_mul(7919));
+            let p = sim::gen_program(&cfg, nth % cfg.sessions.max(1), &mut rng);
+            if is_shape(&p.stmts) {
+                shapes += 1;
+            }
+        }
+        assert!(
+            shapes > 10,
+            "config {name} generated only {shapes} partial-layer programs in 2000 draws"
+        );
+    }
+    let frozen = sim::Config {
+        sp_layer_pm: 0,
+        ..one_config("rc_mix")
+    };
+    let mut shapes = 0usize;
+    for nth in 0..2000usize {
+        let mut rng = sim::Rng::new(0xABCD ^ (nth as u64).wrapping_mul(7919));
+        let p = sim::gen_program(&frozen, 0, &mut rng);
+        if is_shape(&p.stmts) {
+            shapes += 1;
+        }
+    }
+    assert_eq!(
+        shapes, 0,
+        "weight 0 must generate no partial-layer programs"
+    );
+}

@@ -84,6 +84,13 @@ pub struct GhostTxn {
     /// The KV record length right after this txn's last intent placement
     /// (I-WAL-ORDER: every intent write precedes the commit record).
     pub placement_bound: usize,
+    /// The `/sys/log` payload the session submitted with its commit request
+    /// (C-SIMr2): `None` for commits that carry no record (the no-write
+    /// fast path, and every SERIALIZABLE commit, which must go through
+    /// `commit_submit` — the only public §8.4 pre-commit path — whose
+    /// merged signature passes no payload). The I-LOG oracle compares the
+    /// record the commit path wrote against this copy.
+    pub log_payload: Option<Vec<u8>>,
     /// A compact event log (session index, statement, action, key, detail)
     /// for auditing violations.
     pub events: Vec<String>,
@@ -157,6 +164,7 @@ impl Ghost {
                 released_seen: false,
                 truncated_seen: false,
                 placement_bound: 0,
+                log_payload: None,
                 events: Vec::new(),
             },
         );
@@ -236,7 +244,13 @@ impl Ghost {
         best
     }
 
-    /// `ROLLBACK TO s`: drop this txn's writes at `seq >= s` (§5.5).
+    /// `ROLLBACK TO s`: drop this txn's writes at `seq >= s` (§5.5). The
+    /// surviving writes are the per-txn layer model: a later read's
+    /// own-write overlay ([`GhostTxn::own_write_at`]) and the committed
+    /// history both see the **pre-savepoint layer** — the last surviving
+    /// write below `s` — never the base value (the C-SIMr2 partial-layer
+    /// workload exercises this: the same key written before the savepoint
+    /// and again inside it).
     pub fn rollback_to(&mut self, id: TxnId, s: Seq) {
         if let Some(t) = self.txns.get_mut(&id) {
             t.writes.retain(|w| w.seq < s);
@@ -280,6 +294,31 @@ impl Ghost {
         }
         out
     }
+}
+
+/// Encodes a txn's surviving write set as the `/sys/log` payload its session
+/// submits with its commit request (C-SIMr2): per write, a 2-byte key
+/// length, the key, a kind tag (0 Set, 1 Inc, 2 Delete) and — for Set/Inc —
+/// a 2-byte length and the bytes the txn computed. Deterministic; the I-LOG
+/// oracle compares the record the commit path wrote with this byte for byte,
+/// so any record-content break (a dropped or altered write) shows up.
+pub fn log_payload_of(writes: &[GhostWrite]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for w in writes {
+        out.extend_from_slice(&(w.key.len() as u16).to_be_bytes());
+        out.extend_from_slice(&w.key);
+        let (tag, value): (u8, Option<&[u8]>) = match &w.kind {
+            GWrite::Set(v) => (0, Some(v)),
+            GWrite::Inc { wrote } => (1, Some(wrote)),
+            GWrite::Delete => (2, None),
+        };
+        out.push(tag);
+        if let Some(v) = value {
+            out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            out.extend_from_slice(v);
+        }
+    }
+    out
 }
 
 /// Decodes a row payload the simulator wrote (a big-endian u64 counter).
