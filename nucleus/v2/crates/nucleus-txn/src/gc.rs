@@ -69,4 +69,4 @@ mod filter;
 mod job;
 
 pub use filter::TxnGcFilter;
-pub use job::{spawn_gc, GcConfig, GcHandle, GcJob};
+pub use job::{spawn_gc, GcConfig, GcHandle, GcJob, GcRunner};

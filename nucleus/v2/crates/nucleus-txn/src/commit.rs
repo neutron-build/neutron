@@ -422,6 +422,9 @@ impl<K: OrderedKv> Core<K> {
             self.release_hook().release_all(txn.id);
             self.bump_and_wake(txn.id)?;
             self.status.mark_released(txn.id)?;
+            // §9.3 wake-on-enqueue: the released entry is a truncation
+            // candidate only the resolver acts on, so wake it now.
+            self.wake_job(crate::jobs::JobKind::Resolver);
             return Ok(CommitTicket::acked(Ok(Ts::ZERO)));
         }
         let ssi = txn.isolation == Isolation::Serializable;
@@ -505,6 +508,10 @@ impl<K: OrderedKv> Core<K> {
                 mode: crate::removal::RemovalMode::Discard,
             });
         }
+        // §9.3 wake-on-enqueue, placed after the cleanup enqueue so the
+        // wake can never be consumed before the entry it announces is on
+        // the queue (the entry would otherwise wait out an idle interval).
+        self.wake_job(crate::jobs::JobKind::Resolver);
         Ok(())
     }
 
@@ -783,7 +790,11 @@ impl<K: OrderedKv> CommitPipeline<K> {
         self.core.release_hook().release_all(txn);
         self.core.bump_and_wake(txn)?;
         self.core.queue_resolution(txn, keys);
-        self.core.status.mark_released(txn)
+        self.core.status.mark_released(txn)?;
+        // §9.3 wake-on-enqueue: the queue entry (and the truncation
+        // candidate the release creates) is what the resolver acts on.
+        self.core.wake_job(crate::jobs::JobKind::Resolver);
+        Ok(())
     }
 
     /// Fail-stop mid-group (§3): stop, run the hook, and error-ack every

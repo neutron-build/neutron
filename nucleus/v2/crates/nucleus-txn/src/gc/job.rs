@@ -5,9 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use nucleus_kv::{Batch, Durability, Key, OrderedKv};
 
@@ -17,6 +17,7 @@ use crate::encoding::{
     decode_intent, decode_version, end_key, parse_key, sys_gc_w_key, version_key, Entry,
     VersionValue, SYS_PREFIX,
 };
+use crate::jobs::{Job, JobConfig, JobCtx, JobKind, JobOutcome, JobPoint, JobSet};
 use crate::kv_err;
 use crate::removal::{remove_intent, RemovalMode};
 use crate::{Ts, TxnError, TxnId, TxnStatus};
@@ -118,10 +119,17 @@ impl<K: OrderedKv> GcJob<K> {
             None => None,
         };
         let w = self.core.registry.publish_computed_w(extra_floor);
+        // §9.3 probe: the registry critical section is over (it ended
+        // inside `publish_computed_w`); only this job's step serialiser
+        // may be held here.
+        self.core.job_probe_at(JobPoint::GcAfterPublish);
         if w.0 > self.durable_w.load(Ordering::SeqCst) {
             let mut batch = Batch::default();
             batch.put(sys_gc_w_key(), w.0.to_be_bytes().to_vec());
             self.core.write(batch, Durability::Yes)?;
+            // §9.3 probe: right after the synced /sys/gc_w write, before
+            // the watermark reaches the KV.
+            self.core.job_probe_at(JobPoint::GcAfterWatermarkSync);
             // Only after the synced write: the KV's watermark, then the
             // durable slot the filter reads (§9.1; seed 42).
             self.core.set_kv_gc_watermark(w.0)?;
@@ -210,7 +218,14 @@ impl<K: OrderedKv> GcJob<K> {
             batch.delete_range(version_key(l, *t), end_key(l));
         }
         self.core.write(batch, Durability::No)?;
-        Ok(targets.len())
+        // §9.3 probe: after the tombstone batch write (the registered view
+        // is closed; only the step serialiser may be held).
+        self.core.job_probe_at(JobPoint::GcAfterTombstones);
+        let n = targets.len();
+        if n > 0 {
+            self.core.job_items(JobKind::Gc, n as u64);
+        }
+        Ok(n)
     }
 
     /// §9.2 retired-storage cleanup. Returns `Ok(false)` and does nothing
@@ -418,159 +433,89 @@ fn decode_secs(value: &[u8]) -> Result<u64, TxnError> {
     Ok(u64::from_be_bytes(b))
 }
 
-/// The stop signal of a spawned GC thread: a flag plus a condvar so
-/// [`GcHandle::stop`] joins promptly even with a long interval.
-struct GcStop {
-    stop: AtomicBool,
-    pair: (Mutex<()>, Condvar),
+/// The GC job as a §9.3 background job: one `step` is one
+/// `GcJob::run_once` at the clock's now, always `Idle` (the runner paces
+/// it with the idle interval, as the old interval sleep did).
+pub struct GcRunner<K: OrderedKv> {
+    job: Arc<GcJob<K>>,
+    clock: Arc<dyn Clock>,
 }
 
-impl GcStop {
-    fn new() -> Arc<GcStop> {
-        Arc::new(GcStop {
-            stop: AtomicBool::new(false),
-            pair: (Mutex::new(()), Condvar::new()),
-        })
-    }
-
-    /// Signals the thread to stop after its current round and wakes a
-    /// sleeping round promptly.
-    fn signal(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let _woken = self.pair.0.lock().unwrap_or_else(PoisonError::into_inner);
-        self.pair.1.notify_all();
-    }
-
-    /// Sleeps up to `interval`, waking early on [`GcStop::signal`]. Returns
-    /// `true` when stopping was signalled.
-    fn sleep_or_stop(&self, interval: Duration) -> bool {
-        let deadline = Instant::now() + interval;
-        let mut g = self.pair.0.lock().unwrap_or_else(PoisonError::into_inner);
-        while !self.stop.load(Ordering::SeqCst) {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (g2, timeout) = self
-                .pair
-                .1
-                .wait_timeout(g, deadline - now)
-                .unwrap_or_else(PoisonError::into_inner);
-            g = g2;
-            if timeout.timed_out() && Instant::now() >= deadline {
-                return self.stop.load(Ordering::SeqCst);
-            }
-        }
-        true
+impl<K: OrderedKv> GcRunner<K> {
+    pub fn new(job: Arc<GcJob<K>>, clock: Arc<dyn Clock>) -> GcRunner<K> {
+        GcRunner { job, clock }
     }
 }
 
-/// Runs [`GcJob::run_once`] in a background thread every `interval`, taking
-/// `now` from `clock`. On an error the thread reports it through
-/// `fail_stop`, stores it as its last result and stops (the caller treats a
-/// KV error as fatal, §3); [`GcHandle::stop`] joins the thread and returns
-/// that last result. A thread-spawn failure and a thread panic are reported
-/// through `fail_stop` as well.
+impl<K: OrderedKv> Job for GcRunner<K> {
+    fn kind(&self) -> JobKind {
+        JobKind::Gc
+    }
+
+    fn step(&mut self, _cx: &JobCtx) -> Result<JobOutcome, TxnError> {
+        self.job.run_once(self.clock.now_secs())?;
+        Ok(JobOutcome::Idle)
+    }
+}
+
+/// Runs the [`GcRunner`] in a background thread (§9.3) every
+/// `idle_interval` (the old `interval`), taking `now` from `clock`. On an
+/// error the thread reports it through `fail_stop` (the old hook
+/// parameter: `with_fail_stop`), stops every job of its set and stops
+/// (the caller treats a KV error as fatal, §3); [`GcHandle::stop`] joins
+/// the thread and returns that first error. A thread-spawn failure and a
+/// thread panic are reported through `fail_stop` as well.
 pub fn spawn_gc<K: OrderedKv>(
     job: GcJob<K>,
     interval: Duration,
     clock: Arc<dyn Clock>,
     fail_stop: Arc<dyn FailStop>,
 ) -> GcHandle {
-    let stop = GcStop::new();
-    let last: Arc<Mutex<Option<Result<(), TxnError>>>> = Arc::new(Mutex::new(None));
-    let thread = {
-        let stop = Arc::clone(&stop);
-        let last = Arc::clone(&last);
-        let fail_stop = Arc::clone(&fail_stop);
-        std::thread::Builder::new()
-            .name("nucleus-gc".into())
-            .spawn(move || loop {
-                if stop.stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                match job.run_once(clock.now_secs()) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // Store first: the fail-stop hook may abort the
-                        // process (its default), and the last result must
-                        // still be observable.
-                        *last.lock().unwrap_or_else(PoisonError::into_inner) = Some(Err(e.clone()));
-                        fail_stop.on_kv_error(&e);
-                        return;
-                    }
-                }
-                if stop.sleep_or_stop(interval) {
-                    return;
-                }
-            })
-    };
-    match thread {
-        Ok(t) => GcHandle {
-            stop,
-            last,
-            thread: Some(t),
-            fail_stop,
+    let core = Arc::clone(&job.core);
+    let mut set = JobSet::new(core).with_fail_stop(Arc::clone(&fail_stop));
+    let runner = GcRunner::new(Arc::new(job), clock);
+    // A spawn failure is recorded by `start` and reported to the very
+    // hook passed above before the error returns; the handle below then
+    // carries it out of `stop`, exactly as the pre-C-B1a wrapper did.
+    let _spawn_failed = set.start(
+        Box::new(runner),
+        JobConfig {
+            idle_interval: interval,
         },
-        Err(e) => {
-            let err = TxnError::Invariant(format!("failed to spawn the gc thread: {e}"));
-            fail_stop.on_kv_error(&err);
-            GcHandle {
-                stop,
-                last: Arc::new(Mutex::new(Some(Err(err)))),
-                thread: None,
-                fail_stop,
-            }
-        }
+    );
+    GcHandle {
+        shutdown: Some(Box::new(move || set.shutdown())),
     }
 }
 
-/// Handle to a spawned GC thread ([`spawn_gc`]).
+/// Handle to a spawned GC thread ([`spawn_gc`]): a one-job [`JobSet`]
+/// behind an erasing shutdown closure (the handle stays non-generic, as
+/// before C-B1a). `stop` (and `Drop`) run the set's ordered shutdown and
+/// return the job's first error, if any.
 pub struct GcHandle {
-    stop: Arc<GcStop>,
-    last: Arc<Mutex<Option<Result<(), TxnError>>>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    /// The hook a panicked thread is reported through when the handle is
-    /// dropped without [`GcHandle::stop`] (there is no caller to return
-    /// the error to).
-    fail_stop: Arc<dyn FailStop>,
+    shutdown: Option<Box<dyn FnOnce() -> Result<(), TxnError> + Send>>,
 }
 
 impl GcHandle {
-    /// Signals the loop to stop, joins the thread and returns its last
-    /// round's result (the first error it hit, if any).
+    /// Signals the loop to stop, joins the thread and returns its first
+    /// error, if any.
     pub fn stop(mut self) -> Result<(), TxnError> {
-        self.stop.signal();
-        if let Some(t) = self.thread.take() {
-            t.join()
-                .map_err(|_| TxnError::Invariant("gc thread panicked".into()))?;
-        }
-        match self
-            .last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            Some(Err(e)) => Err(e),
-            Some(Ok(())) | None => Ok(()),
+        match self.shutdown.take() {
+            Some(shutdown) => shutdown(),
+            None => Ok(()),
         }
     }
 }
 
 impl Drop for GcHandle {
     fn drop(&mut self) {
-        // Not stopping explicitly would park the thread for its interval
-        // forever; stop it even when the handle is dropped unused. A panic
-        // in the thread is reported through the fail-stop hook — there is
-        // no caller left to return it to (Rework 6).
-        self.stop.signal();
-        if let Some(t) = self.thread.take() {
-            match t.join() {
-                Ok(()) => {}
-                Err(_) => self.fail_stop.on_kv_error(&TxnError::Invariant(
-                    "gc thread panicked (observed at handle drop)".into(),
-                )),
-            }
+        // Not stopping explicitly would park the thread for its idle
+        // interval forever; stop it even when the handle is dropped
+        // unused. A panic observed at the shutdown join is recorded and
+        // reported through the fail-stop hook inside the shutdown — there
+        // is no caller left to return it to (Rework 6).
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown();
         }
     }
 }

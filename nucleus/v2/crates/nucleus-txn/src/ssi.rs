@@ -27,14 +27,14 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use nucleus_kv::{Key, OrderedKv};
 
 use crate::boot::Core;
-use crate::commit::{CommitObserver, FailStop};
+use crate::commit::CommitObserver;
+use crate::jobs::JobKind;
 use crate::read::{self, ReadObserver};
 use crate::registry::{Registry, SnapshotGuard};
 use crate::txn::{Isolation, Txn};
@@ -475,24 +475,58 @@ impl SsiHook for Ssi {
     }
 }
 
-/// Handle to a spawned retention thread ([`spawn_retention`]).
+/// The SSI retention pass as a §9.3 background job (C-B1a): one `step` is
+/// one [`Ssi::run_retention`], always `Idle` (the runner paces it with
+/// the idle interval). The `RetentionAfterPass` probe fires after each
+/// pass, so hand-driven callers hit it too.
+pub struct RetentionJob<K: OrderedKv> {
+    core: Arc<Core<K>>,
+    ssi: Arc<Ssi>,
+}
+
+impl<K: OrderedKv> RetentionJob<K> {
+    pub fn new(core: Arc<Core<K>>, ssi: Arc<Ssi>) -> RetentionJob<K> {
+        RetentionJob { core, ssi }
+    }
+
+    /// One retention pass by hand (the §9.3 step body outside the runner):
+    /// counts the retired entries as the job's `items` and fires the
+    /// `RetentionAfterPass` probe exactly as the runner-driven step does.
+    pub fn run_once(&self) {
+        let retired = self.ssi.run_retention(&self.core);
+        self.core.job_items(JobKind::SsiRetention, retired as u64);
+        self.core
+            .job_probe_at(crate::jobs::JobPoint::RetentionAfterPass);
+    }
+}
+
+impl<K: OrderedKv> crate::jobs::Job for RetentionJob<K> {
+    fn kind(&self) -> crate::jobs::JobKind {
+        crate::jobs::JobKind::SsiRetention
+    }
+
+    fn step(&mut self, _cx: &crate::jobs::JobCtx) -> Result<crate::jobs::JobOutcome, TxnError> {
+        self.run_once();
+        Ok(crate::jobs::JobOutcome::Idle)
+    }
+}
+
+/// Handle to a spawned retention thread ([`spawn_retention`]): a one-job
+/// [`JobSet`](crate::jobs::runner::JobSet) behind an erasing shutdown
+/// closure (the handle stays non-generic, as before C-B1a). Since C-B1a,
+/// **`Drop` joins** (the thread no longer detaches): the ordered shutdown
+/// signals stop, wakes and joins.
 pub struct RetentionHandle {
-    stop: Option<mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    fail_stop: Arc<dyn FailStop>,
+    shutdown: Option<Box<dyn FnOnce() -> Result<(), TxnError> + Send>>,
 }
 
 impl RetentionHandle {
-    /// Stops the thread and joins it. A panicked thread is reported through
-    /// the core's fail-stop hook and returned as an error.
+    /// Stops the thread and joins it. A panicked thread is recorded,
+    /// reported through the set's fail-stop hook (the core's) and
+    /// returned as an error.
     pub fn stop(mut self) -> Result<(), TxnError> {
-        self.stop.take();
-        match self.thread.take() {
-            Some(t) => t.join().map_err(|_| {
-                let e = TxnError::Invariant("ssi retention thread panicked".into());
-                self.fail_stop.on_kv_error(&e);
-                e
-            }),
+        match self.shutdown.take() {
+            Some(shutdown) => shutdown(),
             None => Ok(()),
         }
     }
@@ -500,42 +534,31 @@ impl RetentionHandle {
 
 impl Drop for RetentionHandle {
     fn drop(&mut self) {
-        // Dropping the sender wakes and ends the loop; the thread detaches.
-        self.stop.take();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown();
+        }
     }
 }
 
-/// Runs [`Ssi::run_retention`] every `interval` in a background thread
-/// until the handle is stopped or dropped. A spawn failure goes to the
-/// core's fail-stop hook.
+/// Runs the [`RetentionJob`] in a background thread (§9.3) every
+/// `interval` until the handle is stopped or dropped. A spawn failure goes
+/// to the core's fail-stop hook (read at error time).
 pub fn spawn_retention<K: OrderedKv>(
     core: Arc<Core<K>>,
     ssi: Arc<Ssi>,
     interval: Duration,
 ) -> RetentionHandle {
-    let fail_stop = core.fail_stop();
-    let (tx, rx) = mpsc::channel::<()>();
-    let spawned = std::thread::Builder::new()
-        .name("nucleus-ssi-retention".into())
-        .spawn(move || loop {
-            ssi.run_retention(&core);
-            match rx.recv_timeout(interval) {
-                Err(RecvTimeoutError::Timeout) => {}
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-            }
-        });
-    let thread = match spawned {
-        Ok(t) => Some(t),
-        Err(e) => {
-            fail_stop.on_kv_error(&TxnError::Invariant(format!(
-                "failed to spawn the ssi retention thread: {e}"
-            )));
-            None
-        }
-    };
+    let mut set = crate::jobs::JobSet::new(Arc::clone(&core));
+    let job = RetentionJob::new(Arc::clone(&core), ssi);
+    if let Err(e) = set.start(
+        Box::new(job),
+        crate::jobs::JobConfig {
+            idle_interval: interval,
+        },
+    ) {
+        core.fail_stop().on_kv_error(&e);
+    }
     RetentionHandle {
-        stop: Some(tx),
-        thread,
-        fail_stop,
+        shutdown: Some(Box::new(move || set.shutdown())),
     }
 }
