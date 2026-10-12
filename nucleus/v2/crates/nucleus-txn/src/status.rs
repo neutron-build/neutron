@@ -14,9 +14,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
-use nucleus_kv::{Batch, Durability, OrderedKv};
-
-use crate::encoding::{sys_log_key, sys_txn_key};
 use crate::{Ts, TxnError, TxnId, TxnStatus};
 
 /// One txn's status-table entry (§7.4): status, wake generation (§6), release
@@ -313,30 +310,28 @@ impl StatusTable {
             .collect()
     }
 
-    /// Removes the entry and writes the `/sys/txn/{TxnId}` delete (§7.4).
-    /// The delete is written after the removal batches, so by I-WAL-ORDER a
-    /// crash can never keep the delete and lose the resolution. Returns
-    /// `true` if an entry was removed.
-    pub(crate) fn truncate<K: OrderedKv>(&self, id: TxnId, kv: &K) -> Result<bool, TxnError> {
-        let removed = {
-            let mut st = self.lock();
-            st.map.remove(&id)
-        };
-        match removed {
-            Some(e) => {
-                if matches!(e.status, TxnStatus::Committed(_)) {
-                    // Only Committed records are ever persisted (§2.3).
-                    // The optional `/sys/log/{TxnId}` record dies with the
-                    // status in the same batch. (Key added by C-T1b; a spec
-                    // note for it is pending in C-T0 §7.4.)
-                    let mut batch = Batch::default();
-                    batch.delete(sys_txn_key(id));
-                    batch.delete(sys_log_key(id));
-                    kv.write(batch, Durability::No).map_err(crate::kv_err)?;
-                }
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+    /// Removes the entry from the in-memory table only (§7.4, draft 7.7
+    /// SD1), returning it — `None` when there was nothing to remove. The
+    /// `/sys/txn` (+ `/sys/log`) delete batch is the caller's
+    /// ([`Core::truncate_status`](crate::boot::Core::truncate_status)'s)
+    /// job, written after the registry critical section: it only has to
+    /// follow the removal batches in the WAL (I-WAL-ORDER: a crash can
+    /// never keep the delete and lose the resolution). Must run under the
+    /// registry mutex together with the eligibility check.
+    pub(crate) fn truncate(&self, id: TxnId) -> Option<StatusEntry> {
+        let mut st = self.lock();
+        st.map.remove(&id)
+    }
+
+    /// How many entries the table holds (the `nucleus_status_entries`
+    /// gauge).
+    pub fn len(&self) -> usize {
+        let st = self.lock();
+        st.map.len()
+    }
+
+    /// Whether the table holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

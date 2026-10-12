@@ -18,15 +18,15 @@ use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot, Value};
 
 use crate::commit::{AbortFailStop, CommitMsg, FailStop, ReleaseHook};
 use crate::encoding::{
-    parse_sys_txn_key, sys_epoch_key, sys_gc_w_key, sys_ts_hwm_key, sys_txn_prefix,
-    sys_txn_prefix_end,
+    parse_sys_txn_key, sys_epoch_key, sys_gc_w_key, sys_log_key, sys_ts_hwm_key, sys_txn_key,
+    sys_txn_prefix, sys_txn_prefix_end,
 };
 use crate::latch::Latches;
 use crate::registry::Registry;
 use crate::status::StatusTable;
 use crate::wait::Waits;
 use crate::write::{NoRowLocks, NoSsiHook, RowLocks, SsiHook};
-use crate::{kv_err, Ts, TxnError, TxnId};
+use crate::{kv_err, Ts, TxnError, TxnId, TxnStatus};
 
 /// The shared transaction core (§3, §7.2).
 pub struct Core<K: OrderedKv> {
@@ -76,6 +76,11 @@ pub struct Core<K: OrderedKv> {
     /// `fail_stop` hook swaps or hooks shared across cores cannot split
     /// or alias it. See `seq.rs`.
     pub(crate) seq: Mutex<crate::seq::SeqModule>,
+    /// The background-job framework's shared state (§9.3, C-B1a): one
+    /// wake and one counter block per job kind, plus the job probe.
+    /// Reached by the runner threads through their `Arc<Core>` and by the
+    /// job bodies through `Core::job_probe_at`/`Core::wake_job`.
+    pub(crate) jobs: crate::jobs::JobsShared,
 }
 
 impl<K: OrderedKv> Core<K> {
@@ -162,6 +167,7 @@ impl<K: OrderedKv> Core<K> {
             release_hook: Mutex::new(Arc::new(crate::commit::NoReleaseHook)),
             resolve_q: Mutex::new(VecDeque::new()),
             seq: Mutex::new(crate::seq::SeqModule::new()),
+            jobs: crate::jobs::JobsShared::new(),
         })
     }
 
@@ -222,21 +228,40 @@ impl<K: OrderedKv> Core<K> {
     }
 
     /// Truncates `id`'s status entry if and only if the §7.4 conditions
-    /// hold, checking them under the registry mutex together with
-    /// `min_view_counter`/`sweep_counter` and removing the entry + writing
-    /// the `/sys/txn` delete inside the same critical section. Returns
-    /// whether the entry was removed.
+    /// hold. The eligibility check and the in-memory removal are one
+    /// registry critical section; the `/sys/txn` + `/sys/log` delete batch
+    /// is written **after leaving it** (draft 7.7 §7.4 SD1): it only has
+    /// to follow `id`'s removal batches in the WAL, and those preceded
+    /// their §7.3 step-4 bookkeeping — so holding the registry mutex over
+    /// the KV write would only block every snapshot and view registration
+    /// behind it. Returns whether the entry was removed.
     pub fn truncate_status(&self, id: TxnId) -> Result<bool, TxnError> {
-        self.registry.with_registry(|r| {
+        let removed = self.registry.with_registry(|r| {
             if self
                 .status
                 .truncate_eligible(id, r.min_view_counter(), r.sweep_counter())
             {
-                self.status.truncate(id, &self.kv)
+                self.status.truncate(id)
             } else {
-                Ok(false)
+                None
             }
-        })
+        });
+        match removed {
+            Some(entry) => {
+                // Only Committed records are ever persisted (§2.3), so only
+                // a Committed entry has keys to delete. The optional
+                // `/sys/log/{TxnId}` record dies with the status in the
+                // same batch.
+                if matches!(entry.status, TxnStatus::Committed(_)) {
+                    let mut batch = Batch::default();
+                    batch.delete(sys_txn_key(id));
+                    batch.delete(sys_log_key(id));
+                    self.write(batch, Durability::No)?;
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// The shared row-lock table (C-T2b's seam, §6). Crate-private: the

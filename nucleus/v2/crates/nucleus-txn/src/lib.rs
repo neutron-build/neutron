@@ -15,8 +15,8 @@
 //! non-blocking steps plus blocking drivers, intent layers (§2.1), row ops,
 //! unique checks (§5.3), savepoints and `ROLLBACK TO` (§5.5), and the
 //! `RowLocks` / `SsiHook` seams that C-T2b and C-T3 plug into. The
-//! wait-for graph, deadlock detection and SSI state are later cards; only
-//! the hooks named in the card exist.
+//! wait-for graph and deadlock detection are C-T2b (`locks`); SSI state is
+//! C-T3 (`ssi`).
 //!
 //! Card C-T4 adds the §9 GC (`gc`): the compaction filter `gc::TxnGcFilter`
 //! and the job `gc::GcJob` that publishes the watermark `W` (one registry
@@ -57,6 +57,14 @@
 //! The `/sys/catalog/` compaction-filter carve-out of §10 is **not** in:
 //! `TxnGcFilter` lives in `gc/filter.rs`, outside that card's file scope —
 //! see `catalog`'s module docs.
+//!
+//! Card C-B1a adds the §9.3 background-job framework (`jobs`): the
+//! resolver, GC and SSI retention run as bounded-step jobs on std threads
+//! under one runner, with a common shutdown order, fail-stop for the set,
+//! per-job counters, named crash points and wake-on-enqueue for the
+//! resolver (commit step 5, abort and the no-write commit all wake it, so
+//! it no longer polls). The old `spawn_background`/`spawn_gc`/
+//! `spawn_retention` helpers remain, now one-job `jobs::runner::JobSet`s.
 
 pub mod boot;
 pub mod commit;
@@ -85,6 +93,9 @@ pub mod seq;
 
 // C-T5, likewise appended (rustfmt does not sort it back in).
 pub mod catalog;
+
+// C-B1a, appended the same way (its own group at the end).
+pub mod jobs;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
