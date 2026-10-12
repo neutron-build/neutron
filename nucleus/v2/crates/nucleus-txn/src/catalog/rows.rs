@@ -66,6 +66,32 @@ pub fn parse_idx_key(key: &[u8]) -> Option<u64> {
     parse_prefixed_be64(key, &idx_prefix())
 }
 
+/// `/sys/catalog/retired/`: one row per retired-storage set (§9.2), keyed
+/// by `be64(id)` with `id` from the oid counter. The family sorts after
+/// `idx/`, inside the catalog subtree the sweep and GC rules cover.
+pub fn retired_prefix() -> Key {
+    let mut k = SYS_CATALOG_PREFIX.to_vec();
+    k.extend_from_slice(b"retired/");
+    k
+}
+
+/// Exclusive upper bound of [`retired_prefix`]: `/sys/catalog/retired0`.
+pub fn retired_prefix_end() -> Key {
+    prefix_end(retired_prefix())
+}
+
+/// The logical key of retired-storage row `id` (§9.2).
+pub fn retired_key(id: u64) -> Key {
+    let mut k = retired_prefix();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// Splits a `/sys/catalog/retired/{be64 id}` logical key back into its id.
+pub fn parse_retired_key(key: &[u8]) -> Option<u64> {
+    parse_prefixed_be64(key, &retired_prefix())
+}
+
 /// `/sys/next_storage_id` (§10): the persisted storage-id counter.
 pub fn next_storage_id_key() -> Key {
     sys_key(b"next_storage_id")
@@ -318,6 +344,61 @@ impl IdxRow {
     }
 }
 
+// ---- retired-storage rows (§9.2) ---------------------------------------------
+
+/// One `/sys/catalog/retired/{id}` row (§9.2): the relation whose storage
+/// was retired (DROP TABLE, TRUNCATE, DROP INDEX — the transactional record
+/// the drop-cleanup job reads) and every retired `[lo, hi)` range. Written
+/// through the §5 write path in the DDL's own txn, so it commits, aborts
+/// and rolls back to a savepoint with the DDL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredRow {
+    /// The relation the retired ranges belong to (a catalog oid, §10).
+    pub rel_oid: u64,
+    /// Every retired range, exactly as `note_retired` received them.
+    pub ranges: Vec<KeyRange>,
+}
+
+impl RetiredRow {
+    /// Self-describing: `0x01 ‖ be64(rel_oid) ‖ be32(n) ‖ n × (bytes lo,
+    /// bytes hi)`, each byte string length-prefixed be32 like [`RelRow`].
+    pub fn encode(&self) -> Result<Vec<u8>, TxnError> {
+        let n = u32::try_from(self.ranges.len())
+            .map_err(|_| TxnError::Corrupt("catalog retired row: range count over u32".into()))?;
+        let mut v = Vec::with_capacity(13);
+        v.push(0x01);
+        v.extend_from_slice(&self.rel_oid.to_be_bytes());
+        v.extend_from_slice(&n.to_be_bytes());
+        for (lo, hi) in &self.ranges {
+            put_bytes(&mut v, lo)?;
+            put_bytes(&mut v, hi)?;
+        }
+        Ok(v)
+    }
+
+    pub fn decode(b: &[u8]) -> Result<RetiredRow, TxnError> {
+        let mut r = Reader { b, pos: 0 };
+        let tag = r.u8()?;
+        if tag != 0x01 {
+            return Err(TxnError::Corrupt(format!(
+                "catalog retired row: tag {tag:#x}"
+            )));
+        }
+        let rel_oid = r.u64()?;
+        let n = r.u32()? as usize;
+        // A corrupt count fails fast on the first truncated field: the
+        // loop never allocates ahead of the input.
+        let mut ranges = Vec::new();
+        for _ in 0..n {
+            let lo = r.bytes()?;
+            let hi = r.bytes()?;
+            ranges.push((lo, hi));
+        }
+        r.done()?;
+        Ok(RetiredRow { rel_oid, ranges })
+    }
+}
+
 // ---- codec helpers ----------------------------------------------------------
 
 /// Appends `be32(len) ‖ bytes`; an over-long byte string is an error, never
@@ -341,6 +422,12 @@ impl Reader<'_> {
         let b = self.b.get(self.pos).copied();
         self.pos += 1;
         b.ok_or_else(|| TxnError::Corrupt("catalog row truncated".into()))
+    }
+
+    fn u32(&mut self) -> Result<u32, TxnError> {
+        let mut n = [0u8; 4];
+        n.copy_from_slice(self.take(4)?);
+        Ok(u32::from_be_bytes(n))
     }
 
     fn u64(&mut self) -> Result<u64, TxnError> {
@@ -427,6 +514,66 @@ mod tests {
         good.push(0); // trailing byte
         assert!(super::RelRow::decode(&good).is_err());
         assert!(super::IdxRow::decode(&[0x02, 0x00]).is_err()); // truncated
+    }
+
+    #[test]
+    fn retired_rows_round_trip() {
+        let row = super::RetiredRow {
+            rel_oid: 7,
+            ranges: vec![
+                (
+                    b"/t/\x00\x00\x00\x00\x00\x00\x00\x05/".to_vec(),
+                    b"/x".to_vec(),
+                ),
+                (Vec::new(), vec![0u8, 1, 2]),
+            ],
+        };
+        assert_eq!(ok(super::RetiredRow::decode(&ok(row.encode()))), row);
+        let empty = super::RetiredRow {
+            rel_oid: 0,
+            ranges: Vec::new(),
+        };
+        assert_eq!(ok(super::RetiredRow::decode(&ok(empty.encode()))), empty);
+    }
+
+    #[test]
+    fn corrupt_retired_rows_are_errors_never_panics() {
+        assert!(super::RetiredRow::decode(&[]).is_err());
+        assert!(super::RetiredRow::decode(&[0x02, 0, 0, 0, 0]).is_err()); // wrong tag
+                                                                          // Truncated inside the first range's `hi` length prefix.
+        let mut truncated = vec![0x01];
+        truncated.extend_from_slice(&9u64.to_be_bytes());
+        truncated.extend_from_slice(&1u32.to_be_bytes());
+        truncated.extend_from_slice(&4u32.to_be_bytes());
+        truncated.extend_from_slice(b"lo!!");
+        assert!(super::RetiredRow::decode(&truncated).is_err());
+        let mut good = ok(super::RetiredRow {
+            rel_oid: 1,
+            ranges: vec![(b"a".to_vec(), b"b".to_vec())],
+        }
+        .encode());
+        good.push(0); // trailing byte
+        assert!(super::RetiredRow::decode(&good).is_err());
+        // A huge corrupt count fails on the first missing field, quickly.
+        let mut bomb = vec![0x01];
+        bomb.extend_from_slice(&0u64.to_be_bytes());
+        bomb.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(super::RetiredRow::decode(&bomb).is_err());
+    }
+
+    #[test]
+    fn retired_key_helpers_split_and_bound() {
+        let k = super::retired_key(u64::MAX);
+        assert_eq!(super::parse_retired_key(&k), Some(u64::MAX));
+        assert_eq!(super::parse_retired_key(&super::rel_key(5)), None);
+        assert!(
+            k.as_slice() < super::retired_prefix_end().as_slice(),
+            "the prefix bound covers every retired row"
+        );
+        assert!(
+            super::idx_prefix().as_slice() < super::retired_prefix().as_slice(),
+            "retired/ sorts inside the catalog subtree"
+        );
     }
 
     #[test]

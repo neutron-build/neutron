@@ -30,12 +30,19 @@
 //! `map_storage(new, oid)`, and — at execution, while the txn can still be
 //! chosen as a victim — `on_ddl_execute(txn, oid)`.
 //!
-//! **Not this card:** DROP's data-prefix deletion (the §9.2
-//! retired-prefix `DeleteRange` once `W` passes the DDL) is GC/Drop-range
-//! work; the catalog only notes the retirement. The `/sys/catalog/`
-//! compaction-filter carve-out of §10 is also open: `TxnGcFilter` lives in
-//! `gc/filter.rs`, which is outside this card's Touch-only scope, so the
-//! filter still keeps every `/sys/` key — see the note in [`crate::gc`].
+//! **Not this card:** the retired-prefix `DeleteRange` itself (§9.2: once
+//! the durable `W` passes the DDL, remove every intent under each retired
+//! range through §7.3, then delete the range) is the drop-cleanup job's
+//! work (`jobs::drop_cleanup`, C-B1b), not the catalog's. The catalog's
+//! part — writing the transactional retired-storage row
+//! `/sys/catalog/retired/{id}` (§9.2, one per DDL statement, the ranges
+//! exactly as `note_retired` received them) — **is** in: the row commits,
+//! aborts and rolls back to a savepoint with the DDL, and the cleanup job
+//! reads it through §4, so a crash forgets no retirement. The
+//! `/sys/catalog/` compaction-filter carve-out of §10 is still open:
+//! `TxnGcFilter` lives in `gc/filter.rs`, which is outside this card's
+//! Touch-only scope, so the filter still keeps every `/sys/` key — see the
+//! note in [`crate::gc`].
 //!
 //! **Boot rebuild** (§10, the card's item 6): [`Catalog::open`] scans the
 //! committed catalog at `visible_ts` and rebuilds the SSI storage map
@@ -107,8 +114,9 @@ use crate::{Seq, TxnError, TxnId};
 
 pub use rows::{
     idx_key, idx_prefix, idx_prefix_end, index_ranges, next_oid_key, next_storage_id_key,
-    parse_idx_key, parse_rel_key, rel_key, rel_prefix, rel_prefix_end, table_range, IdxRow,
-    IdxStorage, KeyRange, RelKind, RelRow, SYS_CATALOG_PREFIX,
+    parse_idx_key, parse_rel_key, parse_retired_key, rel_key, rel_prefix, rel_prefix_end,
+    retired_key, retired_prefix, retired_prefix_end, table_range, IdxRow, IdxStorage, KeyRange,
+    RelKind, RelRow, RetiredRow, SYS_CATALOG_PREFIX,
 };
 
 /// Ids are reserved in blocks of this many (§10: "reserved in blocks,
@@ -638,6 +646,40 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Every visible retired-storage row at `ctx.snapshot`, in id order
+    /// (§9.2, read like [`Catalog::scan_rels`]): the drop-cleanup job's
+    /// input. A row a committed DDL wrote is visible once that DDL is; a
+    /// row an aborted or rolled-back DDL wrote never is.
+    pub fn scan_retired<K: OrderedKv>(
+        core: &Core<K>,
+        view: &ViewGuard<'_, K::Snap>,
+        ctx: &ReadCtx,
+    ) -> Result<Vec<(u64, RetiredRow)>, TxnError> {
+        let mut out = Vec::new();
+        let mut no_ssi = NoSsi;
+        let iter = read::scan(
+            core,
+            view,
+            (
+                std::ops::Bound::Included(retired_prefix().as_slice()),
+                std::ops::Bound::Excluded(retired_prefix_end().as_slice()),
+            ),
+            ctx,
+            &mut no_ssi,
+        );
+        for (key, value) in iter.collect::<Result<Vec<_>, _>>()? {
+            match parse_retired_key(&key) {
+                Some(id) => out.push((id, RetiredRow::decode(&value)?)),
+                None => {
+                    return Err(TxnError::Corrupt(format!(
+                        "catalog retired key {key:?} outside the id layout"
+                    )))
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // ---- DDL (§6, §10): AE lock first, then the SSI hooks, then rows ----
 
     /// `CREATE TABLE`-shaped DDL (the card's `Core::catalog_create_table`):
@@ -761,7 +803,24 @@ impl Catalog {
                 retired.push((lo, hi));
             }
         }
-        ssi.note_retired(txn.id, rel, retired);
+        ssi.note_retired(txn.id, rel, retired.clone());
+        // §9.2: the durable, transactional retirement record — one row per
+        // DDL statement, the ranges exactly as `note_retired` received
+        // them. The drop-cleanup job (§9.3) reads it after the durable `W`
+        // passes the snapshot that saw it.
+        let retired_row_id = self.alloc_oid(core)?;
+        core.insert_key(
+            txn,
+            &retired_key(retired_row_id),
+            None,
+            RetiredRow {
+                rel_oid: oid,
+                ranges: retired,
+            }
+            .encode()?,
+            (*ctx).clone(),
+            UniqueRule::None,
+        )?;
         ssi.on_ddl_execute(txn.id, txn.isolation, rel)?;
         write_catalog_row(core, txn, ctx, &rel_key(oid), RowOp::Delete)?;
         for idx in &idxs {
@@ -819,6 +878,10 @@ impl Catalog {
         );
         ssi.unmap_storage(&old_lo, &old_hi);
         ssi.note_retired(txn.id, rel, vec![(old_lo.clone(), old_hi.clone())]);
+        // §9.2: every range this statement retires (the table's old range
+        // and each Id-storage index's), for the single retired-storage row
+        // the statement writes after its last `note_retired`.
+        let mut retired_all: Vec<KeyRange> = vec![(old_lo.clone(), old_hi.clone())];
         let (new_lo, new_hi) = table_range(new_storage);
         self.journal.record(
             txn.id,
@@ -867,8 +930,26 @@ impl Catalog {
                 ssi.map_storage(&lo, &hi, rel);
             }
             ssi.note_retired(txn.id, rel, retired);
+            retired_all.extend(index_ranges(old_sid));
             idx_updates.push((idx_key(idx.oid), idx.with_storage_id(new_sid).encode()?));
         }
+
+        // §9.2 (after the statement's last `note_retired`): the durable,
+        // transactional retirement record. One row per DDL statement, so
+        // TRUNCATE's table and index ranges travel together.
+        let retired_row_id = self.alloc_oid(core)?;
+        core.insert_key(
+            txn,
+            &retired_key(retired_row_id),
+            None,
+            RetiredRow {
+                rel_oid: oid,
+                ranges: retired_all,
+            }
+            .encode()?,
+            (*ctx).clone(),
+            UniqueRule::None,
+        )?;
 
         // At execution (seed 60): with the retirement noted and the new
         // storage mapped, while the txn can still be a victim.
@@ -1015,10 +1096,41 @@ impl Catalog {
             );
             ssi.unmap_storage(lo, hi);
         }
-        ssi.note_retired(txn.id, rel, ranges);
+        ssi.note_retired(txn.id, rel, ranges.clone());
+        // §9.2: the durable, transactional retirement record (one row per
+        // DDL statement, the ranges exactly as `note_retired` received
+        // them).
+        let retired_row_id = self.alloc_oid(core)?;
+        core.insert_key(
+            txn,
+            &retired_key(retired_row_id),
+            None,
+            RetiredRow {
+                rel_oid: owner,
+                ranges,
+            }
+            .encode()?,
+            (*ctx).clone(),
+            UniqueRule::None,
+        )?;
         ssi.on_ddl_execute(txn.id, txn.isolation, rel)?;
         write_catalog_row(core, txn, ctx, &idx_key(idx_oid), RowOp::Delete)?;
         Ok(())
+    }
+
+    /// Deletes retired-storage row `id` through the §5 write path (§9.2),
+    /// in the caller's txn. **No relation lock**: the row is the cleanup
+    /// job's own marker, not a relation row, and by the time the row is
+    /// deleted the relation's AccessExclusive is long gone. A row the job
+    /// re-deletes after a crash reads absent at its snapshot, so the
+    /// delete's skip is an invariant (it would mean a resurrected row).
+    pub fn delete_retired<K: OrderedKv>(
+        core: &Core<K>,
+        txn: &Txn,
+        ctx: &StmtCtx,
+        id: u64,
+    ) -> Result<(), TxnError> {
+        write_catalog_row(core, txn, ctx, &retired_key(id), RowOp::Delete)
     }
 
     // ---- latest-committed catalog reads (§6) --------------------------------
