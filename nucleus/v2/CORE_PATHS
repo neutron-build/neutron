@@ -2,6 +2,7 @@
 # Enforced by scripts/check-core-paths.sh in CI.
 docs/C-T0-txn-protocol.md
 docs/C-Q3s-types-ordering.md
+docs/C-T6-rows-schema-indexes.md
 crates/nucleus-kv/
 crates/nucleus-txn/
 crates/nucleus-g0/

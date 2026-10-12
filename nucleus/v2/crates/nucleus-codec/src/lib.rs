@@ -5,11 +5,16 @@
 //! equal keys encode to identical bytes (P-EQ), and every encoding is
 //! prefix-free (P-PREFIX). Any change to the bytes produced here fails the
 //! golden corpus and needs a format version bump (C-K4).
+//!
+//! Row payloads (C-T6 §2) live in [`row`]: the lossless per-type value
+//! bytes and the row byte format that `/t/` version payloads use — unlike
+//! the key encoding they round-trip value representations (C-Q3s §8.1).
 
 mod decode;
 mod encode;
 pub mod kernels;
 pub mod registry;
+pub mod row;
 mod value;
 
 pub use kernels::{
