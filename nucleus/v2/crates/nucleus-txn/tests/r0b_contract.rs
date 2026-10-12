@@ -16,7 +16,7 @@
 
 use std::ops::Bound;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use nucleus_kv::{Batch, Durability, MemKv};
@@ -632,10 +632,16 @@ fn refused_wait_records_no_hook_events() {
     }
     impl WaitHook for Rec {
         fn on_wait_start(&self, waiter: TxnId, target: TxnId) {
-            self.starts.lock().unwrap().push((waiter, target));
+            self.starts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((waiter, target));
         }
         fn on_wait_end(&self, waiter: TxnId, target: TxnId) {
-            self.ends.lock().unwrap().push((waiter, target));
+            self.ends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((waiter, target));
         }
     }
 
@@ -654,11 +660,17 @@ fn refused_wait_records_no_hook_events() {
     // its `on_wait_end` (what a check placed after the hook loop would
     // produce) is an unbalanced observation.
     assert!(
-        rec.starts.lock().unwrap().is_empty(),
+        rec.starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
         "the refused wait fired no on_wait_start"
     );
     assert!(
-        rec.ends.lock().unwrap().is_empty(),
+        rec.ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
         "the refused wait fired no on_wait_end"
     );
     assert!(
