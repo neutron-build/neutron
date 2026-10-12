@@ -174,15 +174,15 @@ fn array(elem: &KeyType, a: &Array, out: &mut Vec<u8>) -> Result<(), ValueError>
     if matches!(elem, KeyType::Array(_)) {
         return Err(ValueError::Corrupt("array of array type"));
     }
-    let ndims = u8::try_from(a.dims.len())
-        .map_err(|_| ValueError::Corrupt("too many array dimensions"))?;
+    let ndims =
+        u8::try_from(a.dims.len()).map_err(|_| ValueError::Corrupt("too many array dimensions"))?;
     out.push(ndims);
     for d in &a.dims {
         out.extend_from_slice(&d.len.to_be_bytes());
         out.extend_from_slice(&d.lower.to_be_bytes());
     }
-    let nelems = u32::try_from(a.elems.len())
-        .map_err(|_| ValueError::Corrupt("too many array elements"))?;
+    let nelems =
+        u32::try_from(a.elems.len()).map_err(|_| ValueError::Corrupt("too many array elements"))?;
     out.extend_from_slice(&nelems.to_be_bytes());
     let mut nullmap = vec![0u8; nullmap_len(a.elems.len())];
     for (i, e) in a.elems.iter().enumerate() {
@@ -343,7 +343,10 @@ impl<'a> ValueReader<'a> {
         self.pos == self.b.len()
     }
     fn u8(&mut self) -> Result<u8, ValueError> {
-        let &b = self.b.get(self.pos).ok_or(ValueError::Corrupt("truncated value"))?;
+        let &b = self
+            .b
+            .get(self.pos)
+            .ok_or(ValueError::Corrupt("truncated value"))?;
         self.pos += 1;
         Ok(b)
     }
@@ -367,7 +370,8 @@ impl<'a> ValueReader<'a> {
     }
     fn take_array<const N: usize>(&mut self) -> Result<[u8; N], ValueError> {
         let s = self.take(N)?;
-        s.try_into().map_err(|_| ValueError::Corrupt("truncated value"))
+        s.try_into()
+            .map_err(|_| ValueError::Corrupt("truncated value"))
     }
     /// The rest of the value: text and bytea are delimited by the datum
     /// header, not by their bytes.

@@ -343,9 +343,16 @@ fn header(r: &mut RowReader<'_>) -> Result<RowHeader, RowError> {
     if magic != ROW_MAGIC {
         return Err(RowError::Corrupt("row magic"));
     }
-    let schema_version = r.u32be().map_err(|_| RowError::Corrupt("truncated row header"))?;
-    let natts = r.u16be().map_err(|_| RowError::Corrupt("truncated row header"))?;
-    Ok(RowHeader { schema_version, natts })
+    let schema_version = r
+        .u32be()
+        .map_err(|_| RowError::Corrupt("truncated row header"))?;
+    let natts = r
+        .u16be()
+        .map_err(|_| RowError::Corrupt("truncated row header"))?;
+    Ok(RowHeader {
+        schema_version,
+        natts,
+    })
 }
 
 fn read_datum(attnum: u16, ty: &KeyType, r: &mut RowReader<'_>) -> Result<Datum, RowError> {
@@ -371,7 +378,11 @@ fn read_toast(r: &mut RowReader<'_>) -> Result<ToastPointer, RowError> {
     let id = r.take_array::<20>().map_err(short)?;
     let raw_len = r.u32be().map_err(short)?;
     let chunks = r.u32be().map_err(short)?;
-    Ok(ToastPointer { id, raw_len, chunks })
+    Ok(ToastPointer {
+        id,
+        raw_len,
+        chunks,
+    })
 }
 
 fn skip_datum(r: &mut RowReader<'_>) -> Result<(), RowError> {
@@ -413,7 +424,10 @@ impl<'a> RowReader<'a> {
         self.pos == self.b.len()
     }
     fn u8(&mut self) -> Result<u8, RowError> {
-        let &b = self.b.get(self.pos).ok_or(RowError::Corrupt("truncated row"))?;
+        let &b = self
+            .b
+            .get(self.pos)
+            .ok_or(RowError::Corrupt("truncated row"))?;
         self.pos += 1;
         Ok(b)
     }
