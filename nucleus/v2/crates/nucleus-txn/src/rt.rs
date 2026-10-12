@@ -4,8 +4,11 @@
 //!
 //! Every `nucleus-txn` entry point that can block falls into one of four
 //! classes ([`Blocking`]). The check ([`check`]) sits where every blocking
-//! call must pass — the KV access funnels in `Core`, the park funnels in
-//! `wait.rs`, and the entry points whose fast path does no I/O — and a
+//! call must pass — the KV access funnels in `Core` and the registry
+//! (`Registry::open_view` for opening a view, and the `ViewGuard::get` /
+//! `scan` / `as_snap` read funnel for reading through one that is already
+//! open, wherever it was opened), the park funnels in `wait.rs`, and the
+//! entry points whose fast path does no I/O — and a
 //! thread marked as an **executor thread** that reaches one panics before
 //! the call changes any state. Unmarked threads behave exactly as before:
 //! that covers every existing test, the commit thread, the simulator and
@@ -15,7 +18,11 @@
 //!
 //! - **R1**: executor threads may call only non-blocking ("N") entry
 //!   points. Everything else — KvIo, Fsync, Park, Join — is a bug in the
-//!   caller, and [`check`] turns it into a panic at the boundary.
+//!   caller, and [`check`] turns it into a panic at the boundary. A
+//!   refused [`Core::commit`](crate::boot::Core::commit) consumes and
+//!   leaks the `Txn` (it stays `Pending`, with its intents and locks,
+//!   until restart), so the facade must not rely on a refused commit
+//!   being recoverable.
 //! - **R2**: Park-class calls never occupy a bounded pool. The facade runs
 //!   statements on a pool with at least one thread per active statement,
 //!   or drives the step API with a waker-backed [`Parker`](crate::wait::Parker).
@@ -41,19 +48,29 @@
 //!
 //! | Class | Entry points |
 //! |---|---|
-//! | N | `Core::begin`; `Txn::*` (`next_seq`, `seq`, `log_write`, `queue_event`, `take_events`, `cancel_handle`); `CancelHandle::*`; `Core::visible_ts` / `epoch` / `ts_hwm`; `Registry::take_snapshot` / `register_at` / `published_w`; `Core::commit_submit`; `CommitTicket::try_ack`; `CommitTicket::wait` on an already-answered ticket; `Core::abort`; `Core::wait_begin` / `wait_poll` / `wait_deadlock_check` / `wait_end` / `bump_and_wake`; `lock_relation` / `advisory_xact_lock` with `LockWait::NoWait` or `SkipLocked`; in-memory `Ssi` hooks (`map_storage`, `unmap_storage`, `note_retired`, `check_doomed`) |
-//! | KvIo | `Core::open_view` / `Registry::open_view`; `Core::latest_get`; `Core::write(_, No)`; `Core::truncate_status`; `read::read_key` / `scan`; `Ssi::read_key` / `scan`; `removal::*`; `rollback_to`; `Resolver::run_once`; catalog reads (`read_rel`, `read_idx`, `scan_*`) |
-//! | Fsync | `Core::open`; `Core::write(_, Yes)`; `Core::sync_wal`; `Core::commit`; `CommitTicket::wait` (unanswered); `Core::seq_next`; `Catalog::alloc_oid` / `alloc_storage_id`; `Catalog::open`; `GcJob::publish` / `run_once`; `CommitPipeline::process_group` (commit thread only) |
+//! | N | `Core::begin`; `Txn::*` (`next_seq`, `seq`, `log_write`, `queue_event`, `take_events`, `cancel_handle`); `CancelHandle::*`; `Core::visible_ts` / `epoch` / `ts_hwm`; `Registry::take_snapshot` / `register_at` / `published_w`; `Core::commit_submit`; `CommitTicket::try_ack`; `CommitTicket::wait` on an already-answered ticket; `Core::abort`; `Core::wait_begin` / `wait_poll` / `wait_deadlock_check` / `wait_end` / `bump_and_wake`; `lock_relation` / `advisory_xact_lock` with `LockWait::NoWait` or `SkipLocked`; in-memory `Ssi` hooks (`map_storage`, `unmap_storage`, `note_retired`, `check_doomed`); `Ssi::begin`; `spawn_commit_thread`; `CommitPipeline::new`; `Ssi::install` / `LockManager::install` |
+//! | KvIo | `Core::open_view` / `Registry::open_view`; `ViewGuard::get` / `scan` / `as_snap` (reading through a held view, wherever it was opened); `Core::latest_get`; `Core::write(_, No)`; `Core::truncate_status`; `read::read_key` / `scan`; `Ssi::read_key` / `scan`; `removal::*`; `rollback_to` (KvIo when the txn has layers at `seq >= s`, else N); `Resolver::run_once`; catalog reads (`read_rel`, `read_idx`, `scan_*`); `Catalog::open` (the `rebuild_storage_map` scan; it writes and syncs nothing); the step API's `RowOpTask::step` / `KeyOpTask::step` / `DeferrableCheckTask::step` (one latch section each; a step returns its waits as values, it never parks) |
+//! | Fsync | `Core::open`; `Core::write(_, Yes)`; `Core::sync_wal`; `Core::commit`; `CommitTicket::wait` (unanswered); `Core::seq_next`; `Catalog::alloc_oid` / `alloc_storage_id`; `GcJob::publish` / `run_once`; `CommitPipeline::process_group` (commit thread only) |
 //! | Park | `wait_on` / `wait_on_any` / `wait_on_any_deadline`; `WaitHandle::park`; `row_op`, `insert_key`, `update_pk`, `insert_on_conflict`, `fk_check_child`, `fk_check_parent`, `check_deferrable_unique`; `lock_relation` / `advisory_xact_lock` with `LockWait::Block`; `catalog_*` DDL (Park and Fsync) |
 //! | Join | `CommitThreadHandle::shutdown` / `Drop`; resolver, GC and retention handle `stop` / `Drop` (wired by C-B1) |
 //!
-//! Rows KvIo through Join are enforced transitively: each entry point in
-//! them funnels through a checked site (a KV access in `Core`, a park in
-//! `wait.rs` or `locks.rs`, a join in `commit.rs`), except the entry
-//! points whose fast path does no I/O — `Core::commit`,
-//! `CommitTicket::wait` and `Core::seq_next` — which carry their own entry
-//! check so misuse is detected deterministically, not only when the KV
-//! actually blocks.
+//! Rows KvIo through Join are enforced transitively, each class through
+//! its own funnel. **KvIo reads:** every KV read outside a latch passes
+//! two checked sites — the view open
+//! ([`Registry::open_view`](crate::registry::Registry::open_view), which
+//! covers opening the view on an executor thread) and then the view-read
+//! funnel `ViewGuard::get` / `scan` / `as_snap`, which covers the rest of
+//! the M-1 hole: a view opened off-executor or on another thread and then
+//! read on an executor thread refuses at the read, because every read
+//! path (`read::read_key`, `read::scan`, `Ssi::read_key` / `scan`, the
+//! catalog reads) reaches the KV through the guard. Writes with
+//! `Durability::No` and the removals funnel through `Core::write` and
+//! `Core::latest_get`. **Park** rows funnel through the park sites in
+//! `wait.rs` and `locks.rs`. **Join** rows through `commit.rs`. The
+//! exception is the entry points whose fast path does no I/O —
+//! `Core::commit`, `CommitTicket::wait` and `Core::seq_next` — which
+//! carry their own entry check so misuse is detected deterministically,
+//! not only when the KV actually blocks.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -129,6 +146,9 @@ pub const VIOLATION: &str = "nucleus-txn C-R0b: blocking call on an executor thr
 /// `{VIOLATION}: {kind:?} at {site}` **before** the call does anything
 /// else; on an unmarked thread it does nothing. Always on, in release
 /// builds too — this is a caller-contract violation, not a debug aid.
+/// `#[track_caller]` makes the panic report point at the offending call
+/// site, not at this function (L-6).
+#[track_caller]
 pub fn check(kind: Blocking, site: &'static str) {
     if is_executor_thread() {
         panic!("{VIOLATION}: {kind:?} at {site}");

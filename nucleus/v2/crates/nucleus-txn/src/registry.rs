@@ -267,10 +267,18 @@ impl<'a, S: Snapshot> ViewGuard<'a, S> {
     /// The underlying KV snapshot, for read paths that take a
     /// [`Snapshot`] directly.
     pub fn as_snap(&self) -> &S {
+        // C-R0bFIX (M-1): the read funnel for a view opened elsewhere —
+        // `read::read_key` and every other `Snapshot`-taking path reach
+        // the KV through here, so a held view refuses on an executor
+        // thread at this site.
+        crate::rt::check(crate::rt::Blocking::KvIo, "ViewGuard::as_snap");
         &self.snap
     }
 
     pub fn get(&self, key: &[u8]) -> nucleus_kv::Result<Option<Value>> {
+        // C-R0bFIX (M-1): a read through a held view is KvIo wherever the
+        // view was opened — the `open_view` check covers only opening it.
+        crate::rt::check(crate::rt::Blocking::KvIo, "ViewGuard::get");
         self.snap.get(key)
     }
 
@@ -279,6 +287,9 @@ impl<'a, S: Snapshot> ViewGuard<'a, S> {
         range: (Bound<&[u8]>, Bound<&[u8]>),
         reverse: bool,
     ) -> Box<dyn Iterator<Item = nucleus_kv::Result<(Key, Value)>> + '_> {
+        // C-R0bFIX (M-1): as `get`, for scans — the check fires when the
+        // scan is created through the guard (e.g. inside `read::scan`).
+        crate::rt::check(crate::rt::Blocking::KvIo, "ViewGuard::scan");
         self.snap.scan(range, reverse)
     }
 }
