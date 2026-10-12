@@ -343,7 +343,7 @@ impl Lat {
                 let mut sorted = self.samples.clone();
                 sorted.sort_unstable();
                 // ceil(p·n / 100), at least 1, at most n.
-                let rank = ((p * n + 99) / 100).clamp(1, n);
+                let rank = (p * n).div_ceil(100).clamp(1, n);
                 sorted[rank - 1]
             }
         }

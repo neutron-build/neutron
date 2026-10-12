@@ -173,7 +173,11 @@ fn load_commit_on(
         }
         n += 1;
     }
-    let _ = tx.send(Report { name: "L2", lat, err });
+    let _ = tx.send(Report {
+        name: "L2",
+        lat,
+        err,
+    });
 }
 
 /// L3: a bare `sync_wal` loop — the purest fsync load, no seq or commit
@@ -225,7 +229,9 @@ fn probe_read(tx: mpsc::Sender<Report>, core: Arc<Core<SlowSyncKv>>, stop: Arc<A
         match (read, aborted) {
             (Ok(Some(v)), Ok(())) if v == b"v" => lat.record(dt),
             (Ok(other), Ok(())) => {
-                err = Some(format!("P1 read of /t/pre returned {other:?}, wanted Some(b\"v\")"));
+                err = Some(format!(
+                    "P1 read of /t/pre returned {other:?}, wanted Some(b\"v\")"
+                ));
                 break;
             }
             (Err(e), _) => {
@@ -238,7 +244,11 @@ fn probe_read(tx: mpsc::Sender<Report>, core: Arc<Core<SlowSyncKv>>, stop: Arc<A
             }
         }
     }
-    let _ = tx.send(Report { name: "P1", lat, err });
+    let _ = tx.send(Report {
+        name: "P1",
+        lat,
+        err,
+    });
 }
 
 /// P2 write_abort: `begin`, `insert_key` on a fresh key, `abort` — the
@@ -268,7 +278,11 @@ fn probe_write_abort(
         }
         n += 1;
     }
-    let _ = tx.send(Report { name: "P2", lat, err });
+    let _ = tx.send(Report {
+        name: "P2",
+        lat,
+        err,
+    });
 }
 
 /// P3 seq_cached: `seq_next(1)`. The sample is recorded **only when no
@@ -297,7 +311,11 @@ fn probe_seq_cached(tx: mpsc::Sender<Report>, core: Arc<Core<SlowSyncKv>>, stop:
             lat.record(dt);
         }
     }
-    let _ = tx.send(Report { name: "P3", lat, err });
+    let _ = tx.send(Report {
+        name: "P3",
+        lat,
+        err,
+    });
 }
 
 /// P4 commit_off: `insert_key` on a fresh key, then `commit(Off)`. The
@@ -327,7 +345,11 @@ fn probe_commit_off(
         }
         n += 1;
     }
-    let _ = tx.send(Report { name: "P4", lat, err });
+    let _ = tx.send(Report {
+        name: "P4",
+        lat,
+        err,
+    });
 }
 
 // ---- the phases -------------------------------------------------------------
@@ -428,7 +450,8 @@ fn lat_of<'a>(reports: &'a [Report], name: &str) -> &'a Lat {
 }
 
 /// Asserts every thread left its error slot empty.
-fn assert_no_errors(tag: &str, reports: &[Report]) {    for r in reports {
+fn assert_no_errors(tag: &str, reports: &[Report]) {
+    for r in reports {
         if let Some(e) = &r.err {
             panic!("phase {tag}: {} failed mid-window: {e}", r.name);
         }
@@ -477,7 +500,11 @@ fn latency_under_fsync_load() {
     let pre = core.begin(Isolation::ReadCommitted);
     ok(insert_fresh(&core, &pre, b"t/pre"));
     ok(core.commit(pre, SyncCommit::On));
-    assert_eq!(ok(core.seq_next(1)), 1, "boot id 1 and hand out its first value");
+    assert_eq!(
+        ok(core.seq_next(1)),
+        1,
+        "boot id 1 and hand out its first value"
+    );
     kv.arm();
 
     // Phase A: L1 + L3 only — fsync load with no sync commits anywhere.
