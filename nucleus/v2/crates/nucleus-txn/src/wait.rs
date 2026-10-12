@@ -372,6 +372,8 @@ impl WaitHandle {
     /// stand-in for the blocking wait's park. Returns `true` when unparked
     /// (a wake of §6), `false` on timeout.
     pub fn park(&self, timeout: Duration) -> bool {
+        // C-R0b: a park — Park-class (the step API's blocking step).
+        crate::rt::check(crate::rt::Blocking::Park, "WaitHandle::park");
         self.inner.parker.park(timeout)
     }
 }
@@ -494,6 +496,9 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
         targets: &[(TxnId, u64)],
         deadline: Option<Instant>,
     ) -> WaitOutcome {
+        // C-R0b: the blocking wait parks — Park, before the hooks and any
+        // registration, so a refused call registers nothing.
+        crate::rt::check(crate::rt::Blocking::Park, "Core::wait_on_any_deadline");
         debug_assert!(
             !targets.is_empty(),
             "wait_on_any with no targets: there is nothing to wait on"

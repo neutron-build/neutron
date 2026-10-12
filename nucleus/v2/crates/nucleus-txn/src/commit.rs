@@ -16,7 +16,8 @@
 //!    is set** (§8.5's writer map; C-T3's hook, [`NoObserver`] default);
 //! 4. the `synchronous_commit=off` prefix up to the first `on` request: set
 //!    status, advance `visible_ts`, ack; then one `sync_wal` (never on a
-//!    caller thread); then the rest in order (I-VIS, I-ACK);
+//!    caller thread, never on an executor thread (`rt`)); then the rest in
+//!    order (I-VIS, I-ACK);
 //! 5. for each committed txn, after `visible_ts >= commit_ts`:
 //!    `ReleaseHook::release_all`, bump the wake generation and wake waiters,
 //!    queue for resolution, mark released.
@@ -177,6 +178,11 @@ impl CommitTicket {
         if let Some(r) = seen.take() {
             return r;
         }
+        // C-R0b: an unanswered ticket blocks on `recv` for an ack whose
+        // duration includes the group's fsync — Fsync. Placed after the
+        // `pre` and `seen` early returns, so an already-answered ticket
+        // waits without a check (N).
+        crate::rt::check(crate::rt::Blocking::Fsync, "CommitTicket::wait");
         match rx.recv() {
             Ok(r) => Ok(r?),
             Err(RecvError) => Err(TxnError::Invariant(
@@ -403,6 +409,10 @@ impl<K: OrderedKv> Core<K> {
     /// in PostgreSQL where a read-only txn gets no xid. Its release hook
     /// still runs (a lock-only txn may hold shared locks, §6).
     pub fn commit(&self, txn: Txn, sync: SyncCommit) -> Result<Ts, TxnError> {
+        // C-R0b: the blocking commit waits for an ack whose duration
+        // includes the group's fsync — Fsync, even for a read-only txn, so
+        // misuse is detected deterministically.
+        crate::rt::check(crate::rt::Blocking::Fsync, "Core::commit");
         self.commit_submit(txn, sync)?.wait()
     }
 
@@ -901,6 +911,8 @@ impl CommitThreadHandle {
     /// the stop request, then joins it. A panic inside the thread (e.g. a
     /// panicking fail-stop hook) surfaces here.
     pub fn shutdown(mut self) -> Result<(), TxnError> {
+        // C-R0b: shutdown joins the commit thread — Join.
+        crate::rt::check(crate::rt::Blocking::Join, "CommitThreadHandle::shutdown");
         if let Some(stop) = self.stop_tx.take() {
             let _ = stop.send(CommitMsg::Stop);
         }
@@ -917,6 +929,12 @@ impl Drop for CommitThreadHandle {
     fn drop(&mut self) {
         // Not shutting down explicitly would park the thread forever on
         // recv; stop it even when the handle is dropped unused.
+        // C-R0b: the implicit shutdown joins — Join, but never checked
+        // while panicking (a refusal here would abort the process
+        // instead of unwinding), and only when there is a thread.
+        if self.thread.is_some() && !std::thread::panicking() {
+            crate::rt::check(crate::rt::Blocking::Join, "CommitThreadHandle::drop");
+        }
         if let Some(stop) = self.stop_tx.take() {
             let _ = stop.send(CommitMsg::Stop);
         }

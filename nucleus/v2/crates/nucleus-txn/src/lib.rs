@@ -65,6 +65,13 @@
 //! resolver (commit step 5, abort and the no-write commit all wake it, so
 //! it no longer polls). The old `spawn_background`/`spawn_gc`/
 //! `spawn_retention` helpers remain, now one-job `jobs::runner::JobSet`s.
+//!
+//! Card C-R0ba adds the blocking contract (`rt`): every entry point that
+//! can block is classified KvIo / Fsync / Park / Join, and a thread marked
+//! as an executor thread ([`rt::enter_executor`]) that reaches one panics
+//! before the call changes any state — the checked form of §3 step 4's
+//! "fsync never on a tokio worker". Unmarked threads (every existing test,
+//! the commit thread, the simulator, the background jobs) are unaffected.
 
 pub mod boot;
 pub mod commit;
@@ -96,6 +103,9 @@ pub mod catalog;
 
 // C-B1a, appended the same way (its own group at the end).
 pub mod jobs;
+
+// C-R0ba, likewise appended (the blocking-contract module).
+pub mod rt;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

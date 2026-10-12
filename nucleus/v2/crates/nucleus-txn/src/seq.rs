@@ -168,6 +168,10 @@ impl<K: OrderedKv> Core<K> {
     /// no 22003-style variant yet; the SQL layer maps it when it gains
     /// one.)
     pub fn seq_next(&self, id: u64) -> Result<i64, TxnError> {
+        // C-R0b: the block reservation is a durable write — Fsync. The
+        // cached path does no KV call, so the entry check is what catches
+        // an executor thread.
+        crate::rt::check(crate::rt::Blocking::Fsync, "Core::seq_next");
         let mut m = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
         let block = m.block;
         let st = match m.seqs.entry(id) {
