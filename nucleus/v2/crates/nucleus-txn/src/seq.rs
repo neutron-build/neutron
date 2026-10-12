@@ -68,23 +68,38 @@
 //!
 //! # Concurrency
 //!
-//! One mutex (the `Core` field) guards the module. It is a leaf: no
-//! latch, registry or SSI/graph mutex is taken while it is held — only KV
-//! reads/writes, which take no crate locks. The block reservation's sync
-//! runs **inside** the seq mutex: releasing the mutex between observing
-//! `c == H` and finishing the synced write would let a second caller
-//! re-observe `c == H` and start the *same* `H + B` reservation
-//! concurrently (two syncs of one `H`, then overlapping values handed out
-//! of one block), and ruling that out without holding the mutex means
-//! parking later callers on in-flight reservations — wait machinery on a
-//! path §3 keeps off the commit thread and that syncs once per [`BLOCK`]
-//! values. Holding the leaf mutex across one fsync per block cannot
-//! deadlock; concurrent callers serialise behind it, which the concurrency
-//! test observes as exactly one reservation per block and gap-free
-//! distinct values.
+//! Two levels (C-R0bb):
+//!
+//! - the **module mutex** (the `Core` field) only maps id → slot. It is a
+//!   leaf held for a `HashMap` lookup and nothing else: no latch, registry
+//!   or SSI/graph mutex is taken while it is held, and — the C-R0bb fix —
+//!   **no KV call ever runs under it**, so it is never held across an
+//!   fsync.
+//! - the **per-id slot mutex** (`Mutex<Option<SeqState>>` per id) guards
+//!   that one sequence's boot and cursor. It is the leaf the module mutex
+//!   was before C-R0bb, and the old argument for holding it across the
+//!   sync still holds, per id: releasing the slot between observing
+//!   `c == H` and finishing the synced write would let a second caller of
+//!   the **same id** re-observe `c == H` and start the *same* `H + B`
+//!   reservation concurrently (two syncs of one `H`, then overlapping
+//!   values handed out of one block), and ruling that out without holding
+//!   the mutex means parking later callers on in-flight reservations —
+//!   wait machinery on a path §3 keeps off the commit thread and that
+//!   syncs once per [`BLOCK`] values. Holding the leaf slot mutex across
+//!   at most one fsync per block cannot deadlock; concurrent callers of
+//!   one id serialise behind it, which the concurrency test observes as
+//!   exactly one reservation per block and gap-free distinct values.
+//!
+//! The cross-id consequence is rule R3 (`rt.rs`): only callers of the
+//! same id can wait on a slot mutex, and a slot mutex is held across at
+//! most one fsync per block — so a cached or first-use `nextval` of any
+//! **other** id takes the module mutex for a lookup and its own slot, and
+//! never waits on an fsync another session's sequence started.
+//! `tests/r0b_seq_isolation.rs` and `tests/r0b_fsync_gate.rs` (card
+//! C-R0bb) gate this.
 
 use std::collections::HashMap;
-use std::sync::PoisonError;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nucleus_kv::{Batch, Durability, Key, OrderedKv};
 
@@ -134,9 +149,13 @@ struct SeqState {
 /// `Core`'s `seq` field (C-T7r2), so a core has exactly one for its whole
 /// lifetime — see the module docs. Crate-private for the same reason:
 /// only `Core` owns it.
+///
+/// C-R0bb: the states are per-id slots (`Arc<Mutex<Option<SeqState>>>`)
+/// so the module mutex never serialises different ids behind one
+/// fsync — see the "Concurrency" section of the module docs.
 pub(crate) struct SeqModule {
     block: u64,
-    seqs: HashMap<u64, SeqState>,
+    seqs: HashMap<u64, Arc<Mutex<Option<SeqState>>>>,
 }
 
 impl SeqModule {
@@ -172,44 +191,67 @@ impl<K: OrderedKv> Core<K> {
         // cached path does no KV call, so the entry check is what catches
         // an executor thread.
         crate::rt::check(crate::rt::Blocking::Fsync, "Core::seq_next");
-        let mut m = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
-        let block = m.block;
-        let st = match m.seqs.entry(id) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                // First use of id on this core = its boot (the card's
-                // boot rule, loaded lazily per id): H present → cursor at
-                // H (the reserved block's unopened remainder is lost:
-                // skips allowed); H absent → create the sequence at
-                // H = 0, synced, before any value returns. A latest-state
-                // read is safe without a latch: /sys/seq/* never carries
-                // an intent (no §7.3 removal race exists), and this
-                // module is the key's only writer, under this mutex.
-                let hwm = match self.latest_get(&sys_seq_key(id))? {
-                    Some(v) => decode_hwm(id, &v)?,
-                    None => {
-                        let mut batch = Batch::default();
-                        batch.put(sys_seq_key(id), 0u64.to_be_bytes().to_vec());
-                        self.write(batch, Durability::Yes)?;
-                        0
-                    }
-                };
-                e.insert(SeqState {
-                    hwm,
-                    cursor: hwm,
-                    reservations: 0,
-                })
+        // C-R0bb's two levels (module docs, Concurrency): under the module
+        // mutex only read `block` and clone the id's slot (inserting the
+        // empty default when absent), then release it — the module mutex
+        // is never held across I/O. Everything below runs under the
+        // per-id slot mutex alone, so no caller of another id can wait on
+        // this call's fsync (R3).
+        let (block, slot) = {
+            let mut m = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
+            let slot = Arc::clone(
+                m.seqs
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(Mutex::new(None))),
+            );
+            (m.block, slot)
+        };
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            // First use of id on this core = its boot (the card's
+            // boot rule, loaded lazily per id): H present → cursor at
+            // H (the reserved block's unopened remainder is lost:
+            // skips allowed); H absent → create the sequence at
+            // H = 0, synced, before any value returns. A latest-state
+            // read is safe without a latch: /sys/seq/* never carries
+            // an intent (no §7.3 removal race exists), and the slot
+            // mutex makes this caller the key's only writer while it
+            // runs. A failed boot leaves the slot `None`: both `?`s
+            // below return before any state is inserted.
+            let hwm = match self.latest_get(&sys_seq_key(id))? {
+                Some(v) => decode_hwm(id, &v)?,
+                None => {
+                    let mut batch = Batch::default();
+                    batch.put(sys_seq_key(id), 0u64.to_be_bytes().to_vec());
+                    self.write(batch, Durability::Yes)?;
+                    0
+                }
+            };
+            *guard = Some(SeqState {
+                hwm,
+                cursor: hwm,
+                reservations: 0,
+            });
+        }
+        // Unreachable after the boot above (which just inserted the
+        // state), but reported, never unwrapped.
+        let st = match guard.as_mut() {
+            Some(st) => st,
+            None => {
+                return Err(TxnError::Invariant(format!(
+                    "sequence {id}: slot empty after its boot"
+                )))
             }
         };
         if st.cursor == st.hwm {
             // Reserve the next block, persist-before-advance (§10): the
             // synced write of `new_hwm` must return Ok BEFORE `hwm` and
             // `cursor` take it — the handout follows the sync (I-ACK
-            // style), inside the seq mutex (module docs, Concurrency).
-            // The `?` on the write returns while `st` still holds the
-            // pre-call values: a failed reservation leaves the in-memory
-            // state exactly as it was, so no later call can hand out a
-            // value that the durable H does not cover.
+            // style), inside the per-id slot mutex (module docs,
+            // Concurrency). The `?` on the write returns while `st` still
+            // holds the pre-call values: a failed reservation leaves the
+            // in-memory state exactly as it was, so no later call can
+            // hand out a value that the durable H does not cover.
             let new_hwm = st.hwm.checked_add(block).ok_or_else(|| {
                 TxnError::Invariant(format!("sequence {id}: high-water mark exhausted u64"))
             })?;
@@ -248,8 +290,15 @@ impl<K: OrderedKv> Core<K> {
     /// this core. `None` before the first `seq_next(id)`.
     #[doc(hidden)]
     pub fn seq_reservations_for_tests(&self, id: u64) -> Option<u64> {
-        let m = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
-        m.seqs.get(&id).map(|st| st.reservations)
+        // C-R0bb: clone the slot under the module mutex, release that
+        // mutex, then read the slot — the module mutex is never held
+        // while taking a slot mutex.
+        let slot = {
+            let m = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
+            m.seqs.get(&id).map(Arc::clone)
+        }?;
+        let st = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        st.as_ref().map(|st| st.reservations)
     }
 }
 
