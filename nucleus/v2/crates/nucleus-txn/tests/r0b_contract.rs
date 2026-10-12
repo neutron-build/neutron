@@ -54,10 +54,7 @@ fn assert_blocked<R>(r: Result<R, String>, kind: Blocking, site: &str) {
         Err(msg) => msg,
         Ok(_) => panic!("expected a {kind:?} refusal at {site}, got a normal return"),
     };
-    assert!(
-        msg.contains(rt::VIOLATION),
-        "not a C-R0b refusal: {msg:?}"
-    );
+    assert!(msg.contains(rt::VIOLATION), "not a C-R0b refusal: {msg:?}");
     assert!(
         msg.contains(&format!("{kind:?} at")),
         "wrong class in {msg:?}, wanted {kind:?}"
@@ -236,9 +233,7 @@ fn park_funnels_refuse_on_executor() {
         "LockManager::lock_relation",
     );
     assert_blocked(
-        on_executor(|| {
-            mgr.advisory_xact_lock(&core2, &t, 9, false, LockWait::Block, None)
-        }),
+        on_executor(|| mgr.advisory_xact_lock(&core2, &t, 9, false, LockWait::Block, None)),
         Blocking::Park,
         "LockManager::advisory_xact_lock",
     );

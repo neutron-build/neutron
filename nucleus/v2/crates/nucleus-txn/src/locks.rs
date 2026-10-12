@@ -420,10 +420,7 @@ impl LockManager {
         // C-R0b: only the blocking policy parks — the try forms never
         // reach a park.
         if matches!(wait, LockWait::Block) {
-            crate::rt::check(
-                crate::rt::Blocking::Park,
-                "LockManager::advisory_xact_lock",
-            );
+            crate::rt::check(crate::rt::Blocking::Park, "LockManager::advisory_xact_lock");
         }
         let deadline = lock_timeout.map(|t| Instant::now() + t);
         loop {
