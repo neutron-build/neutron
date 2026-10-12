@@ -6,7 +6,8 @@
 mod common;
 
 use common::{parse_row, type_for};
-use nucleus_codec::row::{decode_row, encode_row, value_repr_eq, ColumnDef, Datum};
+use nucleus_codec::row::{decode_row, decode_row_raw, encode_row, value_repr_eq, ColumnDef, Datum};
+use nucleus_codec::{KeyType, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -57,6 +58,133 @@ fn col(ty: nucleus_codec::KeyType) -> ColumnDef {
         not_null: false,
         dropped: false,
         missing: None,
+    }
+}
+
+struct WideLine {
+    natts: usize,
+    lit: String,
+    hex: Vec<u8>,
+    dropped: usize,
+}
+
+fn load_wide() -> Vec<WideLine> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden_row/wide.tsv");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    text.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|line| {
+            let mut f = line.split('\t');
+            let stem = f
+                .next()
+                .unwrap_or_else(|| panic!("{line}: natts"))
+                .to_string();
+            let lit = f
+                .next()
+                .unwrap_or_else(|| panic!("{line}: literal"))
+                .to_string();
+            let hex = f
+                .next()
+                .unwrap_or_else(|| panic!("{line}: hex (run row_gen)"));
+            let dropped = f.next().unwrap_or_else(|| panic!("{line}: dropped attnum"));
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or_else(|e| panic!("{line}: {e}"))
+                })
+                .collect();
+            WideLine {
+                natts: stem["wide".len()..]
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{stem}: {e}")),
+                lit,
+                hex: bytes,
+                dropped: dropped
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{line}: dropped: {e}")),
+            }
+        })
+        .collect()
+}
+
+/// The wide rows of the corpus: (columns, live values) of one line —
+/// bool columns, the dropped attnum (always > 8) excluded from live.
+fn wide_row(line: &WideLine) -> (Vec<ColumnDef>, Vec<Option<Datum>>) {
+    let entries: Vec<&str> = line.lit.split(',').collect();
+    assert_eq!(line.natts, entries.len(), "{}", line.lit);
+    let cols: Vec<ColumnDef> = (0..line.natts)
+        .map(|i| ColumnDef {
+            attnum: i as u16 + 1,
+            name: format!("c{}", i + 1),
+            ty: KeyType::Bool,
+            not_null: false,
+            dropped: i + 1 == line.dropped,
+            missing: None,
+        })
+        .collect();
+    let live: Vec<Option<Datum>> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i + 1 != line.dropped)
+        .map(|(_, e)| match *e {
+            "t" => Some(Datum::Inline(Value::Bool(true))),
+            "f" => Some(Datum::Inline(Value::Bool(false))),
+            "NULL" => None,
+            other => panic!("{}: bad wide entry {other}", line.lit),
+        })
+        .collect();
+    (cols, live)
+}
+
+/// Wide-row golden conformance (card C-T6a2, C-T6a1 gate follow-up
+/// F1): rows of 9, 16 and 17 bool columns — NULLs at attnums 8, 9, 16
+/// and 17 and a dropped attnum above 8 — pin the nullmap's second and
+/// third bytes (byte `(a-1)/8`, LSB first, C-T6 §2).
+#[test]
+fn wide_rows_golden() {
+    let lines = load_wide();
+    assert!(!lines.is_empty(), "no wide rows in the corpus");
+    let stems: Vec<usize> = lines.iter().map(|l| l.natts).collect();
+    assert_eq!(
+        vec![9, 16, 17],
+        stems,
+        "the corpus must pin natts 9, 16 and 17"
+    );
+    for line in &lines {
+        assert!(
+            line.natts > 8,
+            "natts {} does not cross a nullmap byte",
+            line.natts
+        );
+        assert!(line.dropped > 8, "the dropped attnum must be above 8");
+        // NULLs at the boundary attnums the line covers.
+        for a in [8usize, 9, 16, 17] {
+            if a <= line.natts && a != line.dropped {
+                assert_eq!(
+                    "NULL",
+                    line.lit
+                        .split(',')
+                        .nth(a - 1)
+                        .unwrap_or_else(|| panic!("{}", line.lit)),
+                    "attnum {a} must be NULL in {}",
+                    line.lit
+                );
+            }
+        }
+        let (cols, live) = wide_row(line);
+        let bytes =
+            encode_row(1, &cols, &live).unwrap_or_else(|e| panic!("natts {}: {e}", line.natts));
+        assert_eq!(
+            line.hex, bytes,
+            "natts {}: bytes drifted (row_gen rewrites only the hex column)",
+            line.natts
+        );
+        assert_eq!(Ok(live.clone()), decode_row(1, &cols, &line.hex));
+        let (header, raw) =
+            decode_row_raw(&line.hex).unwrap_or_else(|e| panic!("natts {}: {e}", line.natts));
+        assert_eq!(1, header.schema_version);
+        assert_eq!(line.natts, usize::from(header.natts));
+        assert_eq!(line.natts, raw.len());
     }
 }
 

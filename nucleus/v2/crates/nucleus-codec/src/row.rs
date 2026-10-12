@@ -16,18 +16,20 @@
 //! (C-Q3s §8.1) they round-trip value representations. Trailing bytes,
 //! short datums, unknown tags, undecodable values, or a NULL bit on a
 //! live NOT NULL attnum `<= natts` are an error, never a panic (XX001).
-//! The encoded table definition around [`ColumnDef`] (§3) is C-T6a2; the
-//! decode rule implemented here is §3's, against a plain column list.
+//! [`TableSchema`] (§3, [`schema`]) is the definition these decode
+//! against: its bytes, the pinned §3.1 type tags and the pure DDL
+//! helpers that evolve it.
 
+mod schema;
 mod value;
 
+pub use self::schema::TableSchema;
 pub use self::value::{decode_value, encode_value, ValueError};
 
 use crate::value::{Jsonb, KeyType, Value};
 
-/// One column of a table definition (C-T6 §3). The encoded `def` (and the
-/// DDL rules that maintain it) are C-T6a2; rows are decoded against this
-/// minimal list.
+/// One column of a table definition (C-T6 §3); [`TableSchema`] holds
+/// the list, encodes it and evolves it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     /// 1-based; attnums are never reused, so a list is `1..=n` in order.
@@ -110,6 +112,12 @@ fn set_null_bit(map: &mut [u8], i: usize) {
 /// The null bit of 0-based position `i` (LSB first, §2).
 fn is_null_bit(map: &[u8], i: usize) -> bool {
     map[i / 8] & (1 << (i % 8)) != 0
+}
+
+/// §2: nullmap bits past `n` positions are 0. Enforced on decode; the
+/// encoder zeroes them.
+fn padding_bits_clear(map: &[u8], n: usize) -> bool {
+    (n..8 * map.len()).all(|i| map[i / 8] & (1 << (i % 8)) == 0)
 }
 
 /// Encodes one row (§2). `live` holds one entry per non-dropped column, in
@@ -217,12 +225,17 @@ pub fn decode_row(
     let nullmap = r
         .take(nullmap_len(natts))
         .map_err(|_| RowError::Corrupt("truncated nullmap"))?;
+    if !padding_bits_clear(nullmap, natts) {
+        return Err(RowError::Corrupt("nullmap padding bits set"));
+    }
     let mut out = Vec::with_capacity(cols.iter().filter(|c| !c.dropped).count());
     for col in cols {
         let attnum = usize::from(col.attnum);
         if col.dropped {
-            // Not returned, but a stray datum (a corrupt row: the writer
-            // NULLs dropped attnums) is still consumed to keep position.
+            // Not returned, but a stray datum is still consumed to keep
+            // position: a row written before the drop holds one there
+            // (lazy upgrade, §3: no DDL rewrites rows), which is why
+            // `decode_row_raw` exists for toast-pointer sweeps (§5).
             if attnum <= natts && !is_null_bit(nullmap, attnum - 1) {
                 skip_datum(&mut r)?;
             }
@@ -253,6 +266,9 @@ pub fn decode_row_raw(bytes: &[u8]) -> Result<(RowHeader, Vec<Option<RawDatum>>)
     let nullmap = r
         .take(nullmap_len(natts))
         .map_err(|_| RowError::Corrupt("truncated nullmap"))?;
+    if !padding_bits_clear(nullmap, natts) {
+        return Err(RowError::Corrupt("nullmap padding bits set"));
+    }
     let mut out = Vec::with_capacity(natts);
     for attnum in 1..=natts {
         if is_null_bit(nullmap, attnum - 1) {
