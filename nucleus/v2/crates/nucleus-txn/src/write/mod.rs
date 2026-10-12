@@ -2,8 +2,9 @@
 //! steps** (one latch section per step, never parks) plus blocking drivers,
 //! intent layers (§2.1), row ops and exclusive/shared lock requests, key
 //! existence ops and unique checks (§5.3, deferrable included), primary-key
-//! change (§5.0–§5.2), RC EvalPlanQual (§5.2), own-row rules (§5.4) and
-//! savepoints with `ROLLBACK TO` (§5.5).
+//! change (§5.0–§5.2), entry deletes (§5.0 draft 7.8:
+//! [`Core::delete_entry`](crate::boot::Core::delete_entry)), RC EvalPlanQual
+//! (§5.2), own-row rules (§5.4) and savepoints with `ROLLBACK TO` (§5.5).
 //!
 //! Steps exist so tests and the deterministic simulator (C-SIM) can
 //! interleave txns on one thread: a [`RowOpTask`]/[`KeyOpTask`] consumes at
@@ -11,6 +12,7 @@
 //! wait, EPQ) and never parks. The blocking drivers
 //! ([`Core::row_op`](crate::boot::Core::row_op),
 //! [`Core::insert_key`](crate::boot::Core::insert_key),
+//! [`Core::delete_entry`](crate::boot::Core::delete_entry),
 //! [`Core::update_pk`](crate::boot::Core::update_pk),
 //! [`Core::check_deferrable_unique`](crate::boot::Core::check_deferrable_unique))
 //! loop the steps, parking through

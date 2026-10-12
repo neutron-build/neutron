@@ -399,6 +399,75 @@ impl LockManager {
         }
     }
 
+    /// §6 draft 7.8 `wait_for_lockers(rel, mode)` (PostgreSQL
+    /// `WaitForLockers`), for the online index build (C-T6 §7): wait until
+    /// every holder of `rel_oid` other than `txn` whose held mode conflicts
+    /// with `mode` and that is live has ended. It acquires nothing.
+    ///
+    /// One relation-table mutex section collects those holders (one entry
+    /// per txn, with the wake generations read in the same section); the
+    /// mutex is released before any wait. The loop then re-reads each
+    /// remaining holder through [`live_holder`] before **every** wait —
+    /// dropping ended ones and taking its **current** wake generation —
+    /// and parks through the wait-for graph, bounded by `lock_timeout`. A
+    /// `GenChanged` outcome (a bump by a holder that has not ended) just
+    /// re-loops; re-reading the generation is what keeps that from
+    /// becoming a spin. It never re-scans the table, so it never waits for
+    /// a holder that acquired after the collection. Error mapping as
+    /// [`LockManager::lock_relation`]: 55P03 on an expired `lock_timeout`,
+    /// 57014 when cancelled, 40P01 when the wait's deadlock check fired.
+    pub fn wait_for_lockers<K: OrderedKv>(
+        &self,
+        core: &Core<K>,
+        txn: &Txn,
+        rel_oid: u64,
+        mode: RelLockMode,
+        lock_timeout: Option<Duration>,
+    ) -> Result<(), TxnError> {
+        // C-R0ba: this can park on other txns — Park, at the entry, before
+        // anything registers.
+        crate::rt::check(crate::rt::Blocking::Park, "LockManager::wait_for_lockers");
+        // §6: the one table scan — the holders this call ever waits for.
+        // Later acquirers are invisible to it.
+        let mut holders: Vec<(TxnId, u64)> = {
+            let rel = self.lock_relations();
+            let mut seen = BTreeSet::new();
+            let mut holders: Vec<(TxnId, u64)> = Vec::new();
+            if let Some(acs) = rel.get(&rel_oid) {
+                for a in acs {
+                    if a.txn == txn.id || !a.mode.conflicts_with(mode) || !seen.insert(a.txn) {
+                        continue;
+                    }
+                    // §6: ended holders never conflict; a live one carries
+                    // its wake generation for the wait.
+                    if let Some(gen) = live_holder(core, a.txn) {
+                        holders.push((a.txn, gen));
+                    }
+                }
+            }
+            holders
+        };
+        let deadline = lock_timeout.map(|t| Instant::now() + t);
+        while !holders.is_empty() {
+            // §6: re-read each remaining holder before every wait (drop
+            // ended ones, take the current generation) — a bump by a
+            // holder that has not ended must not turn the wait into a
+            // spin.
+            holders = holders
+                .iter()
+                .filter_map(|(h, _)| live_holder(core, *h).map(|g| (*h, g)))
+                .collect();
+            if holders.is_empty() {
+                return Ok(());
+            }
+            map_wait(core.wait_on_any_deadline(txn, &holders, deadline))?;
+            // Ended, aborted, committed and generation-bumped holders all
+            // just re-loop: the holder set was fixed at collection time;
+            // only liveness and generations change.
+        }
+        Ok(())
+    }
+
     /// §6 `pg_advisory_xact_lock` / `pg_try_advisory_xact_lock`
     /// (transaction scope only; session scope is §12 Q5). Exclusive
     /// (`shared = false`) conflicts with any other txn's lock on `key`;
