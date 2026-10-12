@@ -11,17 +11,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nucleus_kv::fault::Fault;
-use nucleus_kv::{Batch, Durability, GcFilter, Key, KvError, MemKv, OrderedKv, Result, Value};
+use nucleus_kv::{
+    Batch, Durability, GcFilter, Key, KvError, MemKv, OrderedKv, Result, Snapshot, Value,
+};
 use nucleus_txn::boot::Core;
-use nucleus_txn::commit::{CommitPipeline, CommitRequest, FailStop, SyncCommit};
+use nucleus_txn::catalog::{Catalog, Ddl, IdxStorage, RelKind, RetiredRow};
+use nucleus_txn::commit::{
+    spawn_commit_thread_with, CommitConfig, CommitPipeline, CommitRequest, CommitThreadHandle,
+    FailStop, SyncCommit,
+};
 use nucleus_txn::encoding::{
-    decode_intent, encode_intent, intent_key, parse_key, sys_txn_prefix, sys_txn_prefix_end, Entry,
+    encode_intent, intent_key, parse_key, sys_txn_prefix, sys_txn_prefix_end, Entry,
 };
 use nucleus_txn::jobs::{Job, JobCtx, JobKind, JobOutcome, JobPoint, JobProbe};
+use nucleus_txn::locks::LockManager;
 use nucleus_txn::read::{read_key, NoSsi};
 use nucleus_txn::resolver::Resolver;
+use nucleus_txn::ssi::Ssi;
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
+use nucleus_txn::write::StmtCtx;
 use nucleus_txn::{Ts, TxnError, TxnId};
 
 pub fn ok<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> T {
@@ -314,6 +323,11 @@ pub struct Model {
     pub aborted_keys: Vec<Key>,
     /// Every key the workload touched (writes, deletes, aborts).
     pub all_keys: Vec<Key>,
+    /// Every retired `[lo, hi)` range the workload's DDL recorded (C-B1b:
+    /// I8 checks these raw-empty after recovery; the value checks skip
+    /// keys inside them — a dropped relation's data is deleted, not
+    /// read-back).
+    pub retired_ranges: Vec<(Key, Key)>,
 }
 
 impl Model {
@@ -511,6 +525,7 @@ pub fn build_workload() -> Workload {
             txns,
             aborted_keys,
             all_keys,
+            retired_ranges: Vec::new(),
         },
     }
 }
@@ -538,6 +553,16 @@ fn surviving_records<K: OrderedKv>(core: &Core<K>) -> std::collections::HashSet<
     out
 }
 
+/// Whether `key` falls inside one of the model's retired ranges (I8's
+/// subject; such keys are skipped by the value checks — the cleanup
+/// deletes them by design).
+fn in_retired_range(model: &Model, key: &[u8]) -> bool {
+    model
+        .retired_ranges
+        .iter()
+        .any(|(lo, hi)| lo.as_slice() <= key && key < hi.as_slice())
+}
+
 /// The card's `check_after_reopen(model, core, kv)`:
 /// - (I1) every acked `On` commit's keys read their value at
 ///   `visible_ts` (the value the surviving history implies — a surviving
@@ -547,6 +572,12 @@ fn surviving_records<K: OrderedKv>(core: &Core<K>) -> std::collections::HashSet<
 /// - (I3) the aborted txn's writes are never visible;
 /// - (I5) the reopened `/sys/gc_w` is ≥ every watermark the KV was handed
 ///   before the crash (the `KillKv` recording).
+///
+/// Keys inside the model's `retired_ranges` are skipped in the value and
+/// all-or-nothing checks (C-B1b: their relation was dropped/truncated, so
+/// the cleanup deletes the data — I8 checks the ranges raw-empty after
+/// recovery instead); a txn all of whose keys are retired is skipped
+/// wholesale.
 ///
 /// "Surviving" is in the **data** sense: a txn whose `/sys/txn` record is
 /// absent may still have survived — the drive may have resolved and
@@ -606,6 +637,9 @@ pub fn check_after_reopen<K: OrderedKv>(model: &Model, core: &Core<K>, kv: &Kill
     // surviving key a0 is thereby attributed correctly, not as its writer
     // being "lost".
     for key in &model.all_keys {
+        if in_retired_range(model, key) {
+            continue; // a retired range's data: I8's subject, not a value
+        }
         let expected = model.expected_at(key, &surviving);
         let got = read_at(core, key, visible, reader);
         assert_eq!(
@@ -615,13 +649,21 @@ pub fn check_after_reopen<K: OrderedKv>(model: &Model, core: &Core<K>, kv: &Kill
         );
     }
     for txn in &model.txns {
+        let live_ops: Vec<&(Key, Option<Vec<u8>>)> = txn
+            .ops
+            .iter()
+            .filter(|(k, _)| !in_retired_range(model, k))
+            .collect();
+        if live_ops.is_empty() {
+            continue; // an all-retired txn: I8 covers its data
+        }
         let survived = surviving.contains(&txn.id);
         let without: std::collections::HashSet<TxnId> = {
             let mut s = surviving.clone();
             s.remove(&txn.id);
             s
         };
-        for (k, _) in &txn.ops {
+        for (k, _) in &live_ops {
             let implied = if survived {
                 model.expected_at(k, &surviving)
             } else {
@@ -667,43 +709,26 @@ pub fn check_after_reopen<K: OrderedKv>(model: &Model, core: &Core<K>, kv: &Kill
 
 // ---- recovery and the post-recover checks (I4, I6, I7) -----------------------
 
-/// The card's `recover(core)`: C-B1a has no boot sweep, so every
-/// older-epoch intent is removed by hand with `remove_intent` (the mode
-/// from `lookup_for_intent`), then `record_sweep`, two resolver rounds
-/// and one GC round. After it: I4 (no intent remains anywhere), I6 (no
-/// `/sys/txn` record remains) and I7 (I-GC-QUIESCE: no logical key's
-/// newest version `<= W` is a tombstone).
+/// The card's `recover(core)`: the boot sweep (C-B1b's `BootSweep`,
+/// replacing C-B1a's hand-written removal walk) to `Finished`, two resolver
+/// rounds and one GC round, then the quiescence checks below.
 pub fn recover<K: OrderedKv>(core: &Arc<Core<K>>, gc: &nucleus_txn::gc::GcJob<K>) {
-    // The hand sweep: collect the intents through one view, then remove
-    // each outside it (remove_intent re-reads under the latch).
-    let plan: Vec<(Key, TxnId, nucleus_txn::removal::RemovalMode)> = {
-        let view = core.open_view();
-        let mut plan = Vec::new();
-        for row in view.scan((Bound::Unbounded, Bound::Unbounded), false) {
-            let (stored, value) = ok(row);
-            let Some((logical, Entry::Intent)) = parse_key(&stored) else {
-                continue;
-            };
-            let intent = decode_intent(&value).expect("intent decodes");
-            let mode = match ok(core.status.lookup_for_intent(intent.txn)) {
-                nucleus_txn::TxnStatus::Committed(_) => nucleus_txn::removal::RemovalMode::Resolve,
-                nucleus_txn::TxnStatus::Aborted => nucleus_txn::removal::RemovalMode::Discard,
-                other => panic!("older-epoch intent owner reads {other:?}"),
-            };
-            plan.push((logical.to_vec(), intent.txn, mode));
-        }
-        plan
-    };
-    for (key, owner, mode) in &plan {
-        ok(nucleus_txn::removal::remove_intent(
-            core, key, None, *owner, *mode,
-        ));
+    let mut sweep = nucleus_txn::jobs::BootSweep::new(Arc::clone(core));
+    while ok(sweep.run_once()) != nucleus_txn::jobs::JobOutcome::Finished {
+        // The sweep advances every step; `Finished` ends it.
     }
-    core.registry.record_sweep();
     ok(Resolver::run_once(core));
     ok(Resolver::run_once(core));
     ok(gc.run_once(0));
+    check_quiesced(core);
+}
 
+/// The post-recovery checks (I4, I6, I7):
+/// - (I4) no intent remains anywhere;
+/// - (I6) no `/sys/txn` record remains;
+/// - (I7, I-GC-QUIESCE) no logical key's newest version `<= W` is a
+///   tombstone or moved-tombstone.
+pub fn check_quiesced<K: OrderedKv>(core: &Core<K>) {
     // (I4) No intent remains anywhere.
     {
         let view = core.open_view();
@@ -777,4 +802,542 @@ pub fn recover<K: OrderedKv>(core: &Arc<Core<K>>, gc: &nucleus_txn::gc::GcJob<K>
             );
         }
     }
+}
+
+// ---- the C-B1b DDL rig over KillKv -------------------------------------------
+
+/// The full stack the C-B1b tests drive: a `KillKv<MemKv>` (crash +
+/// reopen), `Ssi` + `LockManager` + `Catalog` (DDL writes retired rows),
+/// and a **spawned commit thread** — the drop-cleanup job commits its
+/// marker delete through `Core::commit`, so it needs a live pipeline
+/// (§9.3: the job stops before the commit thread at shutdown). All DDL
+/// commits are `SyncCommit::On` (a retired row the crash lost would leave
+/// a retirement nobody cleans; the lost-DDL case is the C-B1a matrix's
+/// business, not this rig's).
+pub struct B1Rig {
+    pub kv: KillKv<MemKv>,
+    pub core: Arc<Core<KillKv<MemKv>>>,
+    pub ssi: Arc<Ssi>,
+    pub locks: Arc<LockManager>,
+    pub catalog: Catalog,
+    pub commit: CommitThreadHandle,
+    pub hook: Arc<RecFailStop>,
+}
+
+impl B1Rig {
+    pub fn new() -> B1Rig {
+        B1Rig::over(KillKv::new(Fault::new(MemKv::new(), || Ok(MemKv::new()))))
+    }
+
+    pub fn over(kv: KillKv<MemKv>) -> B1Rig {
+        let core = Arc::new(ok(Core::open(kv.clone())));
+        let ssi = Ssi::install(&core);
+        let locks = LockManager::install(&core);
+        let catalog = ok(Catalog::open(&core, &ssi, &locks));
+        let hook = RecFailStop::new();
+        let commit = ok(spawn_commit_thread_with(
+            Arc::clone(&core),
+            CommitConfig::new().with_fail_stop(Arc::clone(&hook) as Arc<dyn FailStop>),
+        ));
+        B1Rig {
+            kv,
+            core,
+            ssi,
+            locks,
+            catalog,
+            commit,
+            hook,
+        }
+    }
+
+    /// A fresh RC txn (the DDL session).
+    pub fn rc(&self) -> Txn {
+        self.core.begin(Isolation::ReadCommitted)
+    }
+
+    /// The current statement snapshot (§4: RC re-takes per statement).
+    pub fn snap(&self) -> Ts {
+        self.core.visible_ts()
+    }
+
+    /// The blocking Ddl for `txn` at the current snapshot.
+    pub fn ddl<'c>(&'c self, txn: &'c Txn) -> Ddl<'c, KillKv<MemKv>> {
+        let seq = ok(txn.next_seq());
+        Ddl::new(&self.core, txn, StmtCtx::new(self.snap(), seq, seq))
+    }
+
+    pub fn create_table(&self, txn: &Txn, name: &[u8]) -> (u64, u64) {
+        ok(self
+            .catalog
+            .catalog_create_table(&self.ddl(txn), name, RelKind::Table, b""))
+    }
+
+    pub fn truncate_table(&self, txn: &Txn, oid: u64) -> u64 {
+        ok(self.catalog.catalog_truncate_table(&self.ddl(txn), oid))
+    }
+
+    pub fn drop_table(&self, txn: &Txn, oid: u64) {
+        ok(self.catalog.catalog_drop_table(&self.ddl(txn), oid));
+    }
+
+    /// CREATE INDEX with a fresh storage id; returns `(idx oid, sid)`.
+    pub fn create_index(&self, txn: &Txn, owning: u64) -> (u64, u64) {
+        let sid = ok(self.catalog.alloc_storage_id(&self.core));
+        let (oid, _) =
+            ok(self
+                .catalog
+                .catalog_create_index(&self.ddl(txn), owning, IdxStorage::Id(sid), b""));
+        (oid, sid)
+    }
+
+    pub fn drop_index(&self, txn: &Txn, idx_oid: u64) {
+        ok(self.catalog.catalog_drop_index(&self.ddl(txn), idx_oid));
+    }
+
+    /// Inserts `key = value` through the write path in `txn`.
+    pub fn insert(&self, txn: &Txn, key: &[u8], value: &[u8]) {
+        let seq = ok(txn.next_seq());
+        ok(self.core.insert_key(
+            txn,
+            key,
+            None,
+            value.to_vec(),
+            StmtCtx::new(self.snap(), seq, seq),
+            nucleus_txn::write::UniqueRule::None,
+        ));
+    }
+
+    /// The visible retired rows at `visible_ts` (§4 through a fresh view).
+    pub fn retired_rows(&self) -> Vec<(u64, RetiredRow)> {
+        let view = self.core.open_view();
+        let ctx = ReadCtx {
+            txn: reader_id(&self.core),
+            snapshot: self.core.visible_ts(),
+            stmt_seq: 1,
+        };
+        ok(Catalog::scan_retired(&self.core, &view, &ctx))
+    }
+
+    /// Whether `[lo, hi)` holds no raw entry at all (I8; reads pass
+    /// through the KillKv even while it is dead).
+    pub fn raw_range_empty(&self, lo: &[u8], hi: &[u8]) -> bool {
+        let snap = self.kv.snapshot();
+        let empty = snap
+            .scan((Bound::Included(lo), Bound::Excluded(hi)), false)
+            .next()
+            .is_none();
+        empty
+    }
+
+    /// A no-unique-check point read of `key` at snapshot `s`.
+    pub fn read_at(&self, key: &[u8], s: Ts) -> Option<Vec<u8>> {
+        let view = self.core.open_view();
+        let ctx = ReadCtx {
+            txn: reader_id(&self.core),
+            snapshot: s,
+            stmt_seq: 1,
+        };
+        ok(read_key(&self.core, &view, key, &ctx, &mut NoSsi))
+    }
+}
+
+/// Drops the rig's stack in dependency order and reopens a fresh one on
+/// the surviving store (new epoch, fresh SSI/lock/catalog state).
+pub fn reopen_rig(rig: B1Rig) -> B1Rig {
+    let B1Rig {
+        kv,
+        core,
+        ssi,
+        locks,
+        catalog,
+        commit,
+        hook: _,
+    } = rig;
+    drop(catalog);
+    let _ = commit.shutdown(); // may report the killed KV; expected
+    drop(ssi);
+    drop(locks);
+    drop(core);
+    kv.revive();
+    B1Rig::over(kv)
+}
+
+impl Default for B1Rig {
+    fn default() -> Self {
+        B1Rig::new()
+    }
+}
+
+/// A key inside storage `sid`'s table range (the be64 prefix
+/// `table_range` defines, plus a suffix).
+pub fn tkey(sid: u64, suffix: &str) -> Vec<u8> {
+    let (lo, _) = nucleus_txn::catalog::table_range(sid);
+    let mut k = lo;
+    k.extend_from_slice(suffix.as_bytes());
+    k
+}
+
+// ---- the C-B1b crash-matrix workload (C-B1a's + DROP and TRUNCATE) ------------
+
+/// Builds the extended workload: the C-B1a shape (three literal-key
+/// writers On/Off/On, a deleting txn, an aborted txn holding intents)
+/// plus DDL — CREATE TABLE A (+ index), data in A's old storage, TRUNCATE
+/// A (retires the old table + index ranges), data in the new storage,
+/// CREATE TABLE B, data, DROP B (retires its range) — and two never-
+/// committed txns holding intents (a DDL and a data write). Deterministic
+/// and single-threaded: every commit is a blocking `Core::commit`.
+///
+/// Returns the rig (the workload's core keeps its in-memory queue; the
+/// drive phase happens after a crash) and the model, `retired_ranges`
+/// included for I8.
+pub fn build_ddl_workload() -> (B1Rig, Model) {
+    let rig = B1Rig::new();
+    let core = &rig.core;
+    assert!(
+        rig.hook.errors().is_empty(),
+        "the workload itself never fails"
+    );
+
+    let mut txns = Vec::new();
+    let mut all_keys = Vec::new();
+    // Three writers of two literal keys each: On, Off, On.
+    for i in 0..3u64 {
+        let ka = format!("/t/1/a{i}").into_bytes();
+        let kb = format!("/t/1/b{i}").into_bytes();
+        let va = format!("v{i}a").into_bytes();
+        let vb = format!("v{i}b").into_bytes();
+        let txn = core.begin(Isolation::ReadCommitted);
+        let id = txn.id;
+        place_write(core, &txn, &ka, &va);
+        place_write(core, &txn, &kb, &vb);
+        let sync = if i % 2 == 0 {
+            SyncCommit::On
+        } else {
+            SyncCommit::Off
+        };
+        let ts = ok(core.commit(txn, sync));
+        txns.push(ModTxn {
+            id,
+            ts,
+            on: sync == SyncCommit::On,
+            ops: vec![(ka.clone(), Some(va)), (kb.clone(), Some(vb))],
+        });
+        all_keys.push(ka);
+        all_keys.push(kb);
+    }
+    // The deleting txn (On): deletes a0, so resolving it leaves a
+    // tombstone for GC.
+    let del = core.begin(Isolation::ReadCommitted);
+    let del_id = del.id;
+    place_delete(core, &del, b"/t/1/a0");
+    let del_ts = ok(core.commit(del, SyncCommit::On));
+    txns.push(ModTxn {
+        id: del_id,
+        ts: del_ts,
+        on: true,
+        ops: vec![(b"/t/1/a0".to_vec(), None)],
+    });
+    // One aborted txn holding intents (fresh keys, never visible).
+    let mut aborted_keys = Vec::new();
+    let aborted = core.begin(Isolation::ReadCommitted);
+    place_write(core, &aborted, b"/t/1/ax", b"doomed-a");
+    place_write(core, &aborted, b"/t/1/bx", b"doomed-b");
+    ok(core.abort(aborted));
+    aborted_keys.push(b"/t/1/ax".to_vec());
+    aborted_keys.push(b"/t/1/bx".to_vec());
+    all_keys.extend(aborted_keys.iter().cloned());
+    all_keys.push(b"/t/1/a0".to_vec());
+
+    // The DDL half. CREATE TABLE A (durable), data in its old storage
+    // (committed, unresolved), CREATE INDEX (durable), TRUNCATE (retires
+    // the old table + index ranges), data in the new storage (an Off
+    // commit), CREATE TABLE B (durable), data, DROP B (retires it).
+    let mut retired_ranges = Vec::new();
+    let t1 = rig.rc();
+    let t1_id = t1.id;
+    let (oid_a, sid_a0) = rig.create_table(&t1, b"A");
+    let t1_ts = ok(core.commit(t1, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t1_id,
+        ts: t1_ts,
+        on: true,
+        ops: vec![],
+    });
+
+    let t2 = rig.rc();
+    let t2_id = t2.id;
+    let r0 = tkey(sid_a0, "r0");
+    let r1 = tkey(sid_a0, "r1");
+    place_write(core, &t2, &r0, b"old-a");
+    place_write(core, &t2, &r1, b"old-b");
+    let t2_ts = ok(core.commit(t2, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t2_id,
+        ts: t2_ts,
+        on: true,
+        ops: vec![
+            (r0.clone(), Some(b"old-a".to_vec())),
+            (r1.clone(), Some(b"old-b".to_vec())),
+        ],
+    });
+    all_keys.push(r0);
+    all_keys.push(r1);
+
+    let t3 = rig.rc();
+    let t3_id = t3.id;
+    let (_oid_ix, _sid_ix0) = rig.create_index(&t3, oid_a);
+    let t3_ts = ok(core.commit(t3, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t3_id,
+        ts: t3_ts,
+        on: true,
+        ops: vec![],
+    });
+
+    let t4 = rig.rc();
+    let t4_id = t4.id;
+    let sid_a1 = rig.truncate_table(&t4, oid_a);
+    let t4_ts = ok(core.commit(t4, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t4_id,
+        ts: t4_ts,
+        on: true,
+        ops: vec![],
+    });
+    retired_ranges.push(nucleus_txn::catalog::table_range(sid_a0));
+    for r in nucleus_txn::catalog::index_ranges(_sid_ix0) {
+        retired_ranges.push(r);
+    }
+
+    let t5 = rig.rc();
+    let t5_id = t5.id;
+    let s0 = tkey(sid_a1, "s0");
+    place_write(core, &t5, &s0, b"new-a");
+    let t5_ts = ok(core.commit(t5, SyncCommit::Off));
+    txns.push(ModTxn {
+        id: t5_id,
+        ts: t5_ts,
+        on: false,
+        ops: vec![(s0.clone(), Some(b"new-a".to_vec()))],
+    });
+    all_keys.push(s0);
+
+    let t6 = rig.rc();
+    let t6_id = t6.id;
+    let (oid_b, sid_b) = rig.create_table(&t6, b"B");
+    let t6_ts = ok(core.commit(t6, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t6_id,
+        ts: t6_ts,
+        on: true,
+        ops: vec![],
+    });
+
+    let t7 = rig.rc();
+    let t7_id = t7.id;
+    let b0 = tkey(sid_b, "b0");
+    let b1 = tkey(sid_b, "b1");
+    place_write(core, &t7, &b0, b"bee0");
+    place_write(core, &t7, &b1, b"bee1");
+    let t7_ts = ok(core.commit(t7, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t7_id,
+        ts: t7_ts,
+        on: true,
+        ops: vec![
+            (b0.clone(), Some(b"bee0".to_vec())),
+            (b1.clone(), Some(b"bee1".to_vec())),
+        ],
+    });
+    all_keys.push(b0);
+    all_keys.push(b1);
+
+    let t8 = rig.rc();
+    let t8_id = t8.id;
+    rig.drop_table(&t8, oid_b);
+    let t8_ts = ok(core.commit(t8, SyncCommit::On));
+    txns.push(ModTxn {
+        id: t8_id,
+        ts: t8_ts,
+        on: true,
+        ops: vec![],
+    });
+    retired_ranges.push(nucleus_txn::catalog::table_range(sid_b));
+
+    // Two never-committed txns: a pending CREATE TABLE (its catalog-row
+    // intent is an older-epoch intent under /sys/catalog/ after the
+    // crash) and a pending data write. Their Txns are simply dropped.
+    let t9 = rig.rc();
+    let _ = rig.create_table(&t9, b"C");
+    drop(t9);
+    let t10 = rig.rc();
+    place_write(core, &t10, b"/t/1/px", b"pend");
+    drop(t10);
+
+    let model = Model {
+        txns,
+        aborted_keys,
+        all_keys,
+        retired_ranges,
+    };
+    (rig, model)
+}
+
+// ---- the C-B1b recovery driver ------------------------------------------------
+
+/// One recovery drive to quiescence over a reopened core (§7.2, §9.2,
+/// §9.3): the boot sweep to `Finished`, then rounds of resolver, GC and
+/// drop-cleanup. When a round leaves retired rows eligible-but-gated
+/// (their remembered snapshot equals the durable `W` — `W` only passes a
+/// snapshot when `visible_ts` does), the driver commits one heartbeat
+/// write so the next publish opens the gate; a live system's own commits
+/// do this job. `state`, when given, is the armed crash probe: a drive
+/// error after the probe fired is the crash; one before it fired is a
+/// determinism break and panics (the C-B1a gate's M3 rule).
+pub fn drive_recovery<K: OrderedKv>(
+    core: &Arc<Core<K>>,
+    gc: &Arc<nucleus_txn::gc::GcJob<K>>,
+    state: Option<&CrashState>,
+    heartbeat: usize,
+) {
+    let fired = || state.is_some_and(|s| s.fired());
+    let mut sweep = nucleus_txn::jobs::BootSweep::new(Arc::clone(core));
+    let mut cleanup = nucleus_txn::jobs::DropCleanup::new(Arc::clone(core), Arc::clone(gc));
+    let mut sweep_done = false;
+    for round in 0..40usize {
+        if !sweep_done {
+            loop {
+                match sweep.run_once() {
+                    Ok(nucleus_txn::jobs::JobOutcome::Finished) => {
+                        sweep_done = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if fired() {
+                            return;
+                        }
+                        panic!("drive: the sweep errored before the probe fired: {e:?}");
+                    }
+                }
+            }
+        }
+        if fired() {
+            return;
+        }
+        let resolved = Resolver::run_once(core);
+        if let Err(e) = resolved {
+            if fired() {
+                return;
+            }
+            panic!("drive: the resolver errored before the probe fired: {e:?}");
+        }
+        if let Err(e) = gc.run_once(0) {
+            if fired() {
+                return;
+            }
+            panic!("drive: the GC errored before the probe fired: {e:?}");
+        }
+        if fired() {
+            return;
+        }
+        let cleaned = cleanup.run_once();
+        if let Err(e) = cleaned {
+            if fired() {
+                return;
+            }
+            panic!("drive: the drop cleanup errored before the probe fired: {e:?}");
+        }
+        if fired() {
+            return;
+        }
+        let idle = matches!(cleaned, Ok(nucleus_txn::jobs::JobOutcome::Idle));
+        let rows_left = !core_retired_rows::<K>(core).is_empty();
+        if idle && !rows_left {
+            // Settle (I4 as the condition): a commit's cleanup enqueue
+            // legally lands after its ack (§3 steps 4→5), so drain until
+            // no intent remains anywhere and the queue is empty — every
+            // intent is placed before its commit, so this is exactly the
+            // work left. Bounded: a stuck intent hangs here loudly.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                ok(Resolver::run_once(core));
+                ok(gc.run_once(0));
+                if no_intents(core) && core.resolve_queue_len() == 0 {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drive: recovery did not settle (intents or queue left)"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        if idle && rows_left && round + 1 < 40 {
+            // Retired rows are gated at S == W: advance visible_ts past
+            // their snapshot with one heartbeat write (a live system's
+            // own commits play this part).
+            let txn = core.begin(Isolation::ReadCommitted);
+            place_write(
+                core,
+                &txn,
+                format!("/t/1/hb{heartbeat}-{round}").as_bytes(),
+                b"hb",
+            );
+            ok(core.commit(txn, SyncCommit::On));
+        }
+    }
+    panic!("drive: recovery did not quiesce within 40 rounds");
+}
+
+/// The visible retired rows at `visible_ts` through a fresh view.
+fn core_retired_rows<K: OrderedKv>(core: &Core<K>) -> Vec<(u64, RetiredRow)> {
+    let view = core.open_view();
+    let ctx = ReadCtx {
+        txn: reader_id(core),
+        snapshot: core.visible_ts(),
+        stmt_seq: 1,
+    };
+    ok(Catalog::scan_retired(core, &view, &ctx))
+}
+
+/// Whether no stored intent remains anywhere (the drive's settle
+/// condition and I4's subject).
+fn no_intents<K: OrderedKv>(core: &Core<K>) -> bool {
+    let view = core.open_view();
+    for row in view.scan((Bound::Unbounded, Bound::Unbounded), false) {
+        let (stored, _) = ok(row);
+        if matches!(parse_key(&stored), Some((_, Entry::Intent))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// (I8) Every retired range is raw-empty and no retired row remains.
+pub fn check_retired_cleaned<K: OrderedKv>(core: &Core<K>, kv: &KillKv<MemKv>, model: &Model) {
+    for (lo, hi) in &model.retired_ranges {
+        let snap = kv.snapshot();
+        let left: Vec<Key> = snap
+            .scan(
+                (
+                    std::ops::Bound::Included(lo.as_slice()),
+                    std::ops::Bound::Excluded(hi.as_slice()),
+                ),
+                false,
+            )
+            .map(ok)
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            left.is_empty(),
+            "I8: retired range {lo:?}..{hi:?} still holds {left:?}"
+        );
+    }
+    let rows = core_retired_rows(core);
+    assert!(
+        rows.is_empty(),
+        "I8: retired rows remain after recovery: {:?}",
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
 }
