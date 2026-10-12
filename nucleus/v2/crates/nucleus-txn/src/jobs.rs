@@ -7,8 +7,10 @@
 //! every other job is told to stop, and the fail-stop hook runs.
 //!
 //! - [`JobKind`] names the seven slots (merge, analyze, drop_cleanup,
-//!   resolver, boot_sweep, gc, ssi_retention). `DropCleanup` and
-//!   `BootSweep` are declared here and get bodies in C-B1b.
+//!   resolver, boot_sweep, gc, ssi_retention). Merge and analyze stay
+//!   reserved; C-B1b gives `DropCleanup` and `BootSweep` their bodies
+//!   (`jobs::sweep`, `jobs::drop_cleanup`), alongside a
+//!   [`LatchKeySource`] seam both use for §7.3 latch keys.
 //! - [`Job`] is the body: `step` does bounded work and returns
 //!   [`JobOutcome::Progress`] (more work is ready), [`JobOutcome::Idle`]
 //!   (nothing to do; the runner parks on the job's wake for
@@ -37,6 +39,9 @@ pub mod metrics;
 pub mod runner;
 mod wake;
 
+mod drop_cleanup;
+mod sweep;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -44,8 +49,44 @@ use std::time::Duration;
 use crate::boot::Core;
 use crate::TxnError;
 
+pub use drop_cleanup::DropCleanup;
 pub use runner::{JobSet, ShutdownStep, SHUTDOWN_ORDER};
+pub use sweep::BootSweep;
 pub use wake::{Wake, WakeResult};
+
+/// §7.3 SD2b (draft 7.7): the seam the schema-less intent removers — the
+/// boot sweep (§7.2) and retired-prefix cleanup (§9.2) — obtain
+/// `latch_key(k)`'s deferrable prefix from. They hold only raw keys, so
+/// they cannot know which `/i/{idx}/{key}{pk}` entries belong to a
+/// deferrable unique constraint; the layer that defines those constraints
+/// installs a source that does. Owner decision D2: until any deferrable
+/// constraint can exist, the default [`NoDeferrableKeys`] answers `None`
+/// and every key latches itself.
+///
+/// Install it (through [`Core::set_latch_key_source`]) **before starting
+/// the boot sweep or the drop-cleanup job**: both read the source while
+/// planning each removal. The source must answer for every key that can
+/// hold an intent, including the ranges of dropped indexes and intents
+/// placed by older epochs (§12 Q8) — an answer of `None` for a
+/// deferrable entry would make the removal take a finer latch than the
+/// §5.1 placement did.
+pub trait LatchKeySource: Send + Sync {
+    /// The deferrable-prefix length of `key` (§5.0): `Some(n)` when `key`
+    /// is an `/i/{idx}/{key}{pk}` entry of a deferrable unique constraint
+    /// (`latch_key(key) = &key[..n]`), `None` when the key latches itself.
+    fn deferrable_prefix(&self, key: &[u8]) -> Option<usize>;
+}
+
+/// The default [`LatchKeySource`] (D2): no deferrable unique constraints
+/// exist, so every key latches itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDeferrableKeys;
+
+impl LatchKeySource for NoDeferrableKeys {
+    fn deferrable_prefix(&self, _key: &[u8]) -> Option<usize> {
+        None
+    }
+}
 
 /// The seven job slots of §9.3. `DropCleanup` and `BootSweep` have no body
 /// in this crate yet (C-B1b); the slots, their config defaults and their
@@ -187,11 +228,23 @@ pub enum JobPoint {
     RetentionAfterPass,
     /// A merge/analyze slot job finished a step (test jobs).
     SlotStep,
+    /// After each successful intent removal in the boot sweep (C-B1b).
+    SweepAfterRemoval,
+    /// When the sweep's walk is exhausted, right before `record_sweep`.
+    SweepBeforeRecord,
+    /// After each retired range's `DeleteRange` batch write inside
+    /// `GcJob::retire_storage` (C-B1b).
+    RetireAfterRange,
+    /// After every range of a retired-storage row is retired, before the
+    /// row's own delete txn begins.
+    RetireBeforeMarkerDelete,
+    /// After the retired-storage row's delete txn committed.
+    RetireAfterMarkerDelete,
 }
 
 impl JobPoint {
     /// Every point.
-    pub const ALL: [JobPoint; 8] = [
+    pub const ALL: [JobPoint; 13] = [
         JobPoint::ResolverAfterRemoval,
         JobPoint::ResolverBeforeTruncation,
         JobPoint::ResolverAfterTruncation,
@@ -200,6 +253,11 @@ impl JobPoint {
         JobPoint::GcAfterTombstones,
         JobPoint::RetentionAfterPass,
         JobPoint::SlotStep,
+        JobPoint::SweepAfterRemoval,
+        JobPoint::SweepBeforeRecord,
+        JobPoint::RetireAfterRange,
+        JobPoint::RetireBeforeMarkerDelete,
+        JobPoint::RetireAfterMarkerDelete,
     ];
 
     /// The job whose body fires this point.
@@ -213,6 +271,11 @@ impl JobPoint {
             | JobPoint::GcAfterTombstones => JobKind::Gc,
             JobPoint::RetentionAfterPass => JobKind::SsiRetention,
             JobPoint::SlotStep => JobKind::Merge, // either slot; see the tests
+            JobPoint::SweepAfterRemoval | JobPoint::SweepBeforeRecord => JobKind::BootSweep,
+            JobPoint::RetireAfterRange => JobKind::Gc,
+            JobPoint::RetireBeforeMarkerDelete | JobPoint::RetireAfterMarkerDelete => {
+                JobKind::DropCleanup
+            }
         }
     }
 }
@@ -294,6 +357,9 @@ pub(crate) struct JobsShared {
     wakes: [Wake; 7],
     counters: [JobCounters; 7],
     probe: Mutex<Arc<dyn JobProbe>>,
+    /// The `nucleus_drop_cleanup_pending` gauge's value (§9.2): the
+    /// drop-cleanup job's `seen` map size, refreshed after each rescan.
+    drop_cleanup_pending: AtomicU64,
 }
 
 impl JobsShared {
@@ -310,11 +376,18 @@ impl JobsShared {
             ],
             counters: Default::default(),
             probe: Mutex::new(Arc::new(NoJobProbe)),
+            drop_cleanup_pending: AtomicU64::new(0),
         }
     }
 
     fn wake(&self, kind: JobKind) -> &Wake {
         &self.wakes[kind.index()]
+    }
+
+    /// The drop-cleanup pending gauge (§9.2): how many retired-storage
+    /// rows the job has seen and not yet cleaned.
+    pub(crate) fn drop_cleanup_pending(&self) -> u64 {
+        self.drop_cleanup_pending.load(Ordering::SeqCst)
     }
 
     /// Fires the probe at `point`: the Arc is cloned, the mutex released,
@@ -410,6 +483,14 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
     /// bodies use; `JobCtx::probe` forwards here).
     pub(crate) fn job_probe_at(&self, point: JobPoint) {
         self.jobs.probe_at(point);
+    }
+
+    /// Sets the `nucleus_drop_cleanup_pending` gauge (§9.2): the
+    /// drop-cleanup job reports its `seen` map size after each rescan.
+    pub(crate) fn set_drop_cleanup_pending(&self, n: usize) {
+        self.jobs
+            .drop_cleanup_pending
+            .store(n as u64, Ordering::SeqCst);
     }
 
     /// One job's counters (the per-kind metric source of C-O3).

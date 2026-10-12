@@ -94,6 +94,15 @@ impl<K: OrderedKv> GcJob<K> {
         })
     }
 
+    /// The **durable** W (§9.1): what `/sys/gc_w` holds, synced — the
+    /// value the filter and every GC step act on, and the gate
+    /// [`GcJob::retire_storage`] and the drop-cleanup job (§9.2) compare
+    /// against. Public since C-B1b: the cleanup job asks it when a
+    /// retired row's snapshot has been passed.
+    pub fn durable_w(&self) -> Ts {
+        Ts(self.durable_w.load(Ordering::SeqCst))
+    }
+
     /// Computes and publishes `W` (§9.1), in this order (seed 42):
     ///
     /// 1. With a retention window, the `/sys/ts_clock` floor: the largest
@@ -134,6 +143,10 @@ impl<K: OrderedKv> GcJob<K> {
             // durable slot the filter reads (§9.1; seed 42).
             self.core.set_kv_gc_watermark(w.0)?;
             self.durable_w.store(w.0, Ordering::SeqCst);
+            // §9.3 (C-B1b): the durable W rose — a retired row's gate may
+            // have opened. Wake the drop-cleanup job (harmless when none
+            // runs; its idle interval is only a backstop).
+            self.core.wake_job(JobKind::DropCleanup);
         }
         Ok(w)
     }
@@ -328,6 +341,10 @@ impl<K: OrderedKv> GcJob<K> {
         let mut batch = Batch::default();
         batch.delete_range(lo.to_vec(), hi.to_vec());
         self.core.write(batch, Durability::No)?;
+        // §9.3 probe (C-B1b): the range's DeleteRange batch is written
+        // (the registered view is closed; only this job's step serialiser
+        // may be held).
+        self.core.job_probe_at(JobPoint::RetireAfterRange);
         Ok(true)
     }
 
