@@ -11,10 +11,20 @@
 //!
 //! **Fail-stop** (§3, §9.3): a step's `Err` counts an error, is recorded
 //! as the set's first error if none was recorded yet, sets the stop flag
-//! of **every** job in the set and wakes them, runs the fail-stop hook
-//! (default: the core's), and exits. A panic is observed at join time and
-//! becomes `TxnError::Invariant("job <kind> panicked")`, recorded and
-//! reported to the hook the same way.
+//! of **every other** job in the set and wakes them, runs the fail-stop
+//! hook (default: the core's), and the failing job's own loop exits — it
+//! returns at once, so it never spins on a KV error. A panic is caught
+//! with `catch_unwind` around the step, recorded as
+//! `Invariant("job <kind> panicked")` and routed through the same
+//! fail-stop, so siblings stop and the hook runs immediately, not at
+//! `shutdown`.
+//!
+//! A job started into a set that has already failed is refused with the
+//! set's first error, and a sibling failing while `start` is still in
+//! flight still stops the new job: the slot (its stop flag) is pushed
+//! under the `slots` lock **before** the spawn call returns to the
+//! caller, holding the same lock `fail_the_set` stops jobs under — the
+//! two can never miss each other.
 //!
 //! **Shutdown order.** [`SHUTDOWN_ORDER`]: the jobs that commit txns
 //! (merge, analyze, drop cleanup) stop **before** the commit thread, so a
@@ -192,23 +202,21 @@ impl<K: OrderedKv> JobSet<K> {
     }
 
     /// Starts `job` on its own thread. One job per kind per set: a second
-    /// is an `Invariant` error. The first step runs immediately. A spawn
-    /// failure is recorded as the set's first error and reported to the
-    /// fail-stop hook before it is returned.
+    /// is an `Invariant` error, and so is starting into a set that has
+    /// already failed (the set's first error is returned — a failed set
+    /// accepts no new work). The first step runs immediately. The slot's
+    /// stop flag is created before spawning and pushed under the `slots`
+    /// lock before the spawn returns, so a sibling's fail-stop during the
+    /// start cannot slip between the spawn and the push (M1): the two run
+    /// under the same lock. A spawn failure is recorded as the set's first
+    /// error and reported to the fail-stop hook before it is returned.
     pub fn start(&mut self, job: Box<dyn Job>, config: JobConfig) -> Result<(), TxnError> {
         let kind = job.kind();
-        {
-            let slots = self
-                .shared
-                .slots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if slots.iter().any(|s| s.kind == kind) {
-                return Err(TxnError::Invariant(format!(
-                    "a {} job is already running in this set (C-T0 §9.3)",
-                    kind.name()
-                )));
-            }
+        if let Some(e) = self.first_error() {
+            // The set has failed: no new job may join it (§9.3 — every
+            // job in the set is told to stop, including one that would
+            // start now).
+            return Err(e);
         }
         let stop = Arc::new(AtomicBool::new(false));
         let body = job_thread_body(
@@ -220,19 +228,34 @@ impl<K: OrderedKv> JobSet<K> {
             self.fail_stop.clone(),
         );
         let name = format!("nucleus-job-{}", kind.name());
-        match self.spawner.spawn(name, Box::new(body)) {
-            Ok(joiner) => {
-                self.shared
-                    .slots
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(JobSlot { kind, stop, joiner });
-                Ok(())
+        // One critical section covers the duplicate check, the spawn and
+        // the push. `fail_the_set` stops jobs under this lock, so it can
+        // never run between the spawn and the push and miss the new job.
+        {
+            let mut slots = self
+                .shared
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if slots.iter().any(|s| s.kind == kind) {
+                return Err(TxnError::Invariant(format!(
+                    "a {} job is already running in this set (C-T0 §9.3)",
+                    kind.name()
+                )));
             }
-            Err(e) => {
-                self.record_error(&e);
-                self.hook().on_kv_error(&e);
-                Err(e)
+            match self.spawner.spawn(name, Box::new(body)) {
+                Ok(joiner) => {
+                    slots.push(JobSlot { kind, stop, joiner });
+                    Ok(())
+                }
+                Err(e) => {
+                    // Released before the report: `record_error` and the
+                    // hook take their own locks.
+                    drop(slots);
+                    self.record_error(&e);
+                    self.hook().on_kv_error(&e);
+                    Err(e)
+                }
             }
         }
     }
@@ -379,9 +402,21 @@ fn job_thread_body<K: OrderedKv>(
             // b1_jobs' `wake_during_step_is_not_lost`).
             core.take_job_wake(kind);
             core.count_job_round(kind);
+            // M2: a panic inside the step is fail-stop for the set right
+            // now — routed through `fail_the_set` — not a silently dead
+            // thread observed at join time.
             let outcome = {
                 let cx = JobCtx::new(&core.jobs, &stop, kind);
-                job.step(&cx)
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.step(&cx)))
+            };
+            let outcome = match outcome {
+                Ok(r) => r,
+                Err(_) => {
+                    let e = TxnError::Invariant(format!("job {} panicked", kind.name()));
+                    core.count_job_error(kind);
+                    fail_the_set(&core, &shared, e, fail_stop.as_ref(), Some(kind));
+                    return;
+                }
             };
             match outcome {
                 Ok(JobOutcome::Progress) => core.count_job_progress(kind),
@@ -395,7 +430,12 @@ fn job_thread_body<K: OrderedKv>(
                 Ok(JobOutcome::Finished) => return,
                 Err(e) => {
                     core.count_job_error(kind);
-                    fail_the_set(&core, &shared, e, fail_stop.as_ref());
+                    fail_the_set(&core, &shared, e, fail_stop.as_ref(), Some(kind));
+                    // The failing job's own loop stops here (L4): it never
+                    // spins on a KV error. Its own stop flag is not set —
+                    // `fail_the_set` stops every *other* job — so a mutant
+                    // that drops this return loops visibly instead of
+                    // being masked by the flag.
                     return;
                 }
             }
@@ -404,19 +444,25 @@ fn job_thread_body<K: OrderedKv>(
 }
 
 /// Fail-stop for the set (§3, §9.3): record the first error, stop every
-/// job and wake it, run the hook.
+/// **other** job in the set and wake it, run the hook. The failing job
+/// itself exits by returning from its body (the caller does that right
+/// after), which is what keeps a failed job from spinning on a KV error.
 fn fail_the_set<K: OrderedKv>(
     core: &Arc<Core<K>>,
     shared: &Arc<SetShared>,
     e: TxnError,
     fail_stop: Option<&Arc<dyn FailStop>>,
+    own_kind: Option<JobKind>,
 ) {
     record_first(shared, &e);
-    // Stop every job in the set and wake it: an idle job must leave its
-    // park now, not after its interval.
+    // Stop every other job in the set and wake it: an idle job must leave
+    // its park now, not after its interval.
     {
         let slots = shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
         for slot in slots.iter() {
+            if Some(slot.kind) == own_kind {
+                continue;
+            }
             slot.stop.store(true, Ordering::SeqCst);
             core.wake_job(slot.kind);
         }
