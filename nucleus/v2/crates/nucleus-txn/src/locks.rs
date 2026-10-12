@@ -351,6 +351,11 @@ impl LockManager {
         wait: LockWait,
         lock_timeout: Option<Duration>,
     ) -> Result<bool, TxnError> {
+        // C-R0b: only the blocking policy parks — NoWait/SkipLocked never
+        // reach a park.
+        if matches!(wait, LockWait::Block) {
+            crate::rt::check(crate::rt::Blocking::Park, "LockManager::lock_relation");
+        }
         let deadline = lock_timeout.map(|t| Instant::now() + t);
         loop {
             // One leaf critical section: the conflict scan, the
@@ -412,6 +417,14 @@ impl LockManager {
         wait: LockWait,
         lock_timeout: Option<Duration>,
     ) -> Result<bool, TxnError> {
+        // C-R0b: only the blocking policy parks — the try forms never
+        // reach a park.
+        if matches!(wait, LockWait::Block) {
+            crate::rt::check(
+                crate::rt::Blocking::Park,
+                "LockManager::advisory_xact_lock",
+            );
+        }
         let deadline = lock_timeout.map(|t| Instant::now() + t);
         loop {
             let blockers = {

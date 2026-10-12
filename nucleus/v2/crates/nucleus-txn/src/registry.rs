@@ -164,6 +164,11 @@ impl Registry {
     /// under the mutex, releases it, then opens the KV snapshot (§3.1,
     /// I-SNAP-ORDER). The view unregisters when the guard drops.
     pub fn open_view<K: OrderedKv>(&self, kv: &K) -> ViewGuard<'_, K::Snap> {
+        // C-R0b: every read outside a latch opens a view through here —
+        // the complete read funnel (§3.1) — and the KV snapshot it opens
+        // is KvIo. Covers `Core::open_view` too. Before the registry
+        // mutex, so a refused call registers nothing.
+        crate::rt::check(crate::rt::Blocking::KvIo, "Registry::open_view");
         let counter = {
             let mut st = self.lock();
             st.view_counter += 1;

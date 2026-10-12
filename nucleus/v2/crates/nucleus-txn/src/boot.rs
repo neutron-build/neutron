@@ -81,6 +81,8 @@ pub struct Core<K: OrderedKv> {
 impl<K: OrderedKv> Core<K> {
     /// Opens the store (§7.2). See the module docs for the boot order.
     pub fn open(kv: K) -> Result<Core<K>, TxnError> {
+        // C-R0b: boot writes the epoch with `Durability::Yes` — Fsync.
+        crate::rt::check(crate::rt::Blocking::Fsync, "Core::open");
         // Epoch first: increment and sync before anything else.
         let epoch0 = match kv.snapshot().get(&sys_epoch_key()).map_err(kv_err)? {
             Some(v) => {
@@ -199,18 +201,31 @@ impl<K: OrderedKv> Core<K> {
     /// resolution. Every read outside a latch section must go through
     /// [`Core::open_view`] instead.
     pub fn latest_get(&self, key: &[u8]) -> Result<Option<Value>, TxnError> {
+        // C-R0b: a latest-state KV read — KvIo.
+        crate::rt::check(crate::rt::Blocking::KvIo, "Core::latest_get");
         self.kv.get_latest(key).map_err(crate::kv_err)
     }
 
     /// Writes one atomic batch (§3 step 2). Ordering between concurrent
     /// writers is the caller's latch discipline, not this method.
     pub fn write(&self, batch: Batch, durability: Durability) -> Result<(), TxnError> {
+        // C-R0b: Fsync when durable, otherwise a plain KV write (KvIo).
+        crate::rt::check(
+            if durability == Durability::Yes {
+                crate::rt::Blocking::Fsync
+            } else {
+                crate::rt::Blocking::KvIo
+            },
+            "Core::write",
+        );
         self.kv.write(batch, durability).map_err(crate::kv_err)
     }
 
     /// fsyncs the WAL through everything written so far (§3; never on an
     /// async executor thread).
     pub fn sync_wal(&self) -> Result<(), TxnError> {
+        // C-R0b: the fsync funnel itself.
+        crate::rt::check(crate::rt::Blocking::Fsync, "Core::sync_wal");
         self.kv.sync_wal().map_err(crate::kv_err)
     }
 
@@ -227,6 +242,9 @@ impl<K: OrderedKv> Core<K> {
     /// the `/sys/txn` delete inside the same critical section. Returns
     /// whether the entry was removed.
     pub fn truncate_status(&self, id: TxnId) -> Result<bool, TxnError> {
+        // C-R0b: the /sys/txn delete is a KV write — KvIo, before the
+        // registry critical section.
+        crate::rt::check(crate::rt::Blocking::KvIo, "Core::truncate_status");
         self.registry.with_registry(|r| {
             if self
                 .status

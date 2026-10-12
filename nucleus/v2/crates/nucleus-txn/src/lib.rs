@@ -57,6 +57,13 @@
 //! The `/sys/catalog/` compaction-filter carve-out of §10 is **not** in:
 //! `TxnGcFilter` lives in `gc/filter.rs`, outside that card's file scope —
 //! see `catalog`'s module docs.
+//!
+//! Card C-R0ba adds the blocking contract (`rt`): every entry point that
+//! can block is classified KvIo / Fsync / Park / Join, and a thread marked
+//! as an executor thread ([`rt::enter_executor`]) that reaches one panics
+//! before the call changes any state — the checked form of §3 step 4's
+//! "fsync never on a tokio worker". Unmarked threads (every existing test,
+//! the commit thread, the simulator, the background jobs) are unaffected.
 
 pub mod boot;
 pub mod commit;
@@ -85,6 +92,9 @@ pub mod seq;
 
 // C-T5, likewise appended (rustfmt does not sort it back in).
 pub mod catalog;
+
+// C-R0ba, likewise appended (the blocking-contract module).
+pub mod rt;
 
 /// Commit timestamp (§1). Room to widen to an HLC later without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
