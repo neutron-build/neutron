@@ -42,6 +42,29 @@ fn pending_gauge<K: nucleus_kv::OrderedKv>(core: &Core<K>) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Whether no stored intent remains anywhere (the settle condition): a
+/// commit's cleanup enqueue legally lands after its ack (§3 steps 4→5),
+/// so the newest commit's intent can still be placed-and-unresolved when
+/// its caller returns. An intent is always placed before its commit, so
+/// "no intent anywhere" plus an empty resolve queue is exactly the state
+/// in which every enqueue has landed and been processed.
+fn no_intents<K: nucleus_kv::OrderedKv>(core: &Core<K>) -> bool {
+    let view = core.open_view();
+    for row in view.scan(
+        (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        false,
+    ) {
+        let (stored, _) = ok(row);
+        if matches!(
+            nucleus_txn::encoding::parse_key(&stored),
+            Some((_, nucleus_txn::encoding::Entry::Intent))
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 /// DC-RAW (the retired row written with a raw `core.write` instead of
 /// `insert_key`): a DROP's row commits with it (visible after the
 /// commit), an abort leaves none (the raw write would survive the
@@ -342,7 +365,32 @@ fn intents_in_a_retired_range_go_through_7_3_first() {
             // The sweep advances every step; `Finished` ends it.
         }
     }
-    ok(Resolver::run_once(&core2));
+    // Settle before asserting: a commit's cleanup enqueue legally lands
+    // after its ack (§3 steps 4→5), and the newest commit here is the
+    // cleanup job's own marker delete — its queue entry can still be in
+    // flight on the commit thread. Drain like the C-B1a harness does
+    // (until no intent remains anywhere and the queue is empty) instead
+    // of one round; bounded, so a stuck enqueue still fails loudly.
+    // Settle before asserting: a commit's cleanup enqueue legally lands
+    // after its ack (§3 steps 4→5), and the newest commit here is the
+    // cleanup job's own marker delete — its queue entry can still be in
+    // flight on the commit thread. Drain like the C-B1a harness does
+    // (until no intent remains anywhere and the queue is empty) instead
+    // of one round; bounded, so a stuck enqueue still fails loudly.
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            ok(Resolver::run_once(&core2));
+            if no_intents(&core2) && core2.resolve_queue_len() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resolver did not settle: an intent or a queued entry remains"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     assert!(
         core2.status.entry(aborted_id).is_none(),
         "the aborted txn truncated: its intent count reached 0 through §7.3"
