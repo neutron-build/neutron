@@ -228,6 +228,7 @@ pub(crate) fn place_step<K: OrderedKv>(
     ctx: &StmtCtx,
     base: Option<Ts>,
     arb_lock: bool,
+    entry_delete: bool,
 ) -> Result<StepOutcome, TxnError> {
     let lk = latch_bytes(key, latch_prefix);
     let latch = core.latches.lock(lk);
@@ -362,9 +363,11 @@ pub(crate) fn place_step<K: OrderedKv>(
             // Row op with no own intent (§5.1): the newer-version rule.
             // base = S, or after an EPQ pass the ts of the version it
             // evaluated, or (ON CONFLICT lock) v_r.ts (§5.3.1).
+            // §5.0 draft 7.8: an entry delete runs none of this — no
+            // 40001, no EPQ; blind.
             let base = base.unwrap_or_else(|| ctx.snapshot());
             let n = state.versions_above(base);
-            if !n.is_empty() {
+            if !entry_delete && !n.is_empty() {
                 if is_snapshot_iso(txn.isolation) {
                     // RR/SER: 40001. KEY SHARE: only if some version in N
                     // is a tombstone, moved-tombstone or key_changed write
@@ -488,6 +491,9 @@ pub struct RowOpTask {
     /// The ON CONFLICT arbiter lock (§5.3.1(3)): never EPQ — a non-empty N
     /// is a restart signal instead.
     arb_lock: bool,
+    /// §5.0 draft 7.8: an entry delete runs the §5.1 loop without the
+    /// newer-version rule and without EPQ (blind, never skipping).
+    entry: bool,
     /// The version remembered by the step that returned `Epq` (for
     /// `epq_result`'s `base = v.ts`).
     pending_epq: Option<CommittedVersion>,
@@ -503,6 +509,34 @@ impl RowOpTask {
             base: None,
             moved: false,
             arb_lock: false,
+            entry: false,
+            pending_epq: None,
+        }
+    }
+
+    /// §5.0 draft 7.8 (C-T6t1): an **entry delete** — the delete of a
+    /// secondary-index entry or a large-value chunk the same statement
+    /// derived from a row op on `/t/{rel}/{pk}` which returned `Applied`.
+    /// A `RowOp::Delete` with requested mode `Update` that runs the §5.1
+    /// loop **without the newer-version rule and without EPQ**: every
+    /// writer of an `/i/…‖pk` entry or a chunk also writes `/t/pk` (or the
+    /// row that owns the chunk), which the caller's intent now excludes,
+    /// and the row op already applied the newer-version rule. Blind: it
+    /// places a tombstone whether or not the key has a version; it never
+    /// skips and never raises 40001 by itself. Driven by
+    /// [`Core::delete_entry`](crate::boot::Core::delete_entry), which
+    /// forces `ctx.internal()` (§5.4's revisit/27000 rules do not apply:
+    /// the derived op never revisits).
+    pub fn entry_delete(key: &[u8], latch_prefix: Option<usize>, ctx: StmtCtx) -> RowOpTask {
+        RowOpTask {
+            key: key.to_vec(),
+            latch_prefix,
+            op: RowOp::Delete,
+            ctx,
+            base: None,
+            moved: false,
+            arb_lock: false,
+            entry: true,
             pending_epq: None,
         }
     }
@@ -561,6 +595,7 @@ impl RowOpTask {
             &self.ctx,
             self.base,
             self.arb_lock,
+            self.entry,
         )?;
         self.pending_epq = None;
         match outcome {
@@ -662,6 +697,7 @@ impl KeyOpTask {
             &action,
             &self.ctx,
             None,
+            false,
             false,
         )?;
         match outcome {
@@ -774,6 +810,66 @@ impl<K: OrderedKv> Core<K> {
                 Step::Restart => {
                     return Err(TxnError::Invariant(
                         "the public row-op driver never returns Restart (C-T2c drives it)".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// §5.0 draft 7.8 (C-T6t1): the blocking **entry-delete** driver — the
+    /// delete of a secondary-index entry or a large-value chunk the same
+    /// statement derived from a row op on `/t/{rel}/{pk}` which returned
+    /// `Applied`. Forces `ctx.internal()` (§5.4's revisit/27000 rules do
+    /// not apply: the derived op never revisits) and loops a
+    /// [`RowOpTask::entry_delete`] task like [`Core::row_op`]: cancel
+    /// check, `Wait` parks through
+    /// [`Core::wait_on_any_deadline`](crate::wait::Core::wait_on_any_deadline)
+    /// with the ctx's `lock_timeout` deadline, `Again` retries. Everything
+    /// else of §5.1 is the task's own: foreign visible-committed/aborted
+    /// intents are removed first, Pending conflicting intents and
+    /// conflicting shared holders are waited on, an own intent gets a new
+    /// layer, and the SSI writer-side check runs after placement.
+    ///
+    /// Why the newer-version rule and EPQ are absent (§5.0's argument):
+    /// every writer of an `/i/…‖pk` entry or a chunk also writes `/t/pk`
+    /// (or the row that owns the chunk), which the caller's intent now
+    /// excludes, and the row op on `/t/` already applied the newer-version
+    /// rule; a `/u/` slot cannot receive a foreign commit over the
+    /// caller's live entry (23505). It is blind: a tombstone is placed
+    /// whether or not the key has a version. So `Done(Applied)` → `Ok`,
+    /// and every other outcome (`Done(Skipped(..))`, `Epq`, `Restart`) is
+    /// an [`TxnError::Invariant`]: an entry delete never skips and never
+    /// EPQs.
+    pub fn delete_entry(
+        &self,
+        txn: &Txn,
+        key: &[u8],
+        latch_prefix: Option<usize>,
+        ctx: StmtCtx,
+    ) -> Result<(), TxnError> {
+        // C-R0ba: this can park on other txns — Park, at the entry, before
+        // anything registers.
+        crate::rt::check(crate::rt::Blocking::Park, "Core::delete_entry");
+        let deadline = ctx.lock_deadline();
+        let mut task = RowOpTask::entry_delete(key, latch_prefix, ctx.internal());
+        loop {
+            if txn.is_cancelled() {
+                return Err(TxnError::QueryCanceled);
+            }
+            match task.step(self, txn)? {
+                Step::Done(RowOutcome::Applied) => return Ok(()),
+                Step::Done(RowOutcome::Skipped(_)) => {
+                    return Err(TxnError::Invariant(
+                        "an entry delete skipped a row (§5.0 forbids it)".into(),
+                    ))
+                }
+                Step::Again => {}
+                Step::Wait(targets) => {
+                    map_wait_outcome(self.wait_on_any_deadline(txn, &targets, deadline))?;
+                }
+                Step::Epq(_) | Step::Restart => {
+                    return Err(TxnError::Invariant(
+                        "an entry delete asked to EPQ or restart (§5.0 forbids it)".into(),
                     ))
                 }
             }
