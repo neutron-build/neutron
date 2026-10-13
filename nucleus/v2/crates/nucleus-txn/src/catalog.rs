@@ -985,13 +985,35 @@ impl Catalog {
     /// inserted through the write path, and every entry range of the index
     /// mapped to the owner (§12 Q7). Returns `(index oid, the mapped
     /// ranges)`. No `on_ddl_execute`: nothing is retired and a new index's
-    /// ranges had no readers.
+    /// ranges had no readers. Delegates to
+    /// [`Catalog::catalog_create_index_with`] at the default mode.
     pub fn catalog_create_index<K: OrderedKv>(
         &self,
         ddl: &Ddl<'_, K>,
         owning_rel: u64,
         storage: IdxStorage,
         def: &[u8],
+    ) -> Result<(u64, Vec<KeyRange>), TxnError> {
+        self.catalog_create_index_with(ddl, owning_rel, storage, def, RelLockMode::AccessExclusive)
+    }
+
+    /// [`Catalog::catalog_create_index`] with the relation-lock mode as a
+    /// parameter: plain CREATE INDEX holds AccessExclusive, and the online
+    /// build's per-step txns (C-T6 §7) and born-public CREATE INDEX (§6.1)
+    /// drive the same body at weaker modes in later cards. Everything
+    /// else is the plain body: lock the **owning relation** in `mode`,
+    /// verify the owner exists at the latest committed catalog (§6
+    /// freshness), allocate the oid, map every entry range to the owner
+    /// (§12 Q7), insert the row through the write path. Returns
+    /// `(index oid, the mapped ranges)`. No `on_ddl_execute`: nothing is
+    /// retired and a new index's ranges had no readers.
+    pub fn catalog_create_index_with<K: OrderedKv>(
+        &self,
+        ddl: &Ddl<'_, K>,
+        owning_rel: u64,
+        storage: IdxStorage,
+        def: &[u8],
+        mode: RelLockMode,
     ) -> Result<(u64, Vec<KeyRange>), TxnError> {
         let Ddl {
             core,
@@ -1001,14 +1023,8 @@ impl Catalog {
             lock_timeout,
         } = ddl;
         let ssi = self.ssi()?;
-        self.locks()?.lock_relation(
-            core,
-            txn,
-            owning_rel,
-            RelLockMode::AccessExclusive,
-            *wait,
-            *lock_timeout,
-        )?;
+        self.locks()?
+            .lock_relation(core, txn, owning_rel, mode, *wait, *lock_timeout)?;
         let rel = rel_oid_of(owning_rel)?;
         // §6: after acquiring, the latest committed catalog decides — the
         // owner must exist.
@@ -1116,6 +1132,102 @@ impl Catalog {
         ssi.on_ddl_execute(txn.id, txn.isolation, rel)?;
         write_catalog_row(core, txn, ctx, &idx_key(idx_oid), RowOp::Delete)?;
         Ok(())
+    }
+
+    /// ALTER-shaped DDL on a relation's definition (C-T6b1): take
+    /// AccessExclusive **before** reading the def (§3), read the relation
+    /// row at the latest committed catalog (§6), and rewrite it with `def`
+    /// replaced through the §5 write path — transactional, so an abort and
+    /// a `ROLLBACK TO` restore the old row. **No SSI hook**: §3's ALTERs
+    /// keep every storage id, so nothing is retired or mapped (the §8.2
+    /// DDL-side check is DROP/TRUNCATE/rewrite only) and no retired-row
+    /// record is written (§9.2).
+    pub fn catalog_alter_rel_def<K: OrderedKv>(
+        &self,
+        ddl: &Ddl<'_, K>,
+        oid: u64,
+        def: &[u8],
+    ) -> Result<(), TxnError> {
+        let Ddl {
+            core,
+            txn,
+            ctx,
+            wait,
+            lock_timeout,
+        } = ddl;
+        self.locks()?.lock_relation(
+            core,
+            txn,
+            oid,
+            RelLockMode::AccessExclusive,
+            *wait,
+            *lock_timeout,
+        )?;
+        let row = Self::latest_rel_row(core, txn, ctx, oid)?
+            .ok_or_else(|| catalog_miss("relation", oid))?;
+        let altered = RelRow {
+            def: def.to_vec(),
+            ..row
+        };
+        write_catalog_row(
+            core,
+            txn,
+            ctx,
+            &rel_key(oid),
+            RowOp::Update {
+                value: altered.encode()?,
+                key_cols_changed: false,
+            },
+        )
+    }
+
+    /// ALTER-shaped DDL on an index definition: the owning relation comes
+    /// from the latest index row, `lock_relation(owner, mode)` runs first
+    /// (the mode is the caller's — plain ALTER holds AccessExclusive; the
+    /// online build's state rewrites, C-T6 §7, later drive this at
+    /// ShareUpdateExclusive), the row is re-read under the lock (§6
+    /// freshness: a concurrent DROP INDEX of the same index may have
+    /// committed while we waited — unlike
+    /// [`Catalog::catalog_drop_index`] that is an error here, an ALTER
+    /// cannot target a vanished index), and the def is replaced through
+    /// the §5 write path. No SSI hook: the entry storage is unchanged.
+    pub fn catalog_alter_idx_def<K: OrderedKv>(
+        &self,
+        ddl: &Ddl<'_, K>,
+        idx_oid: u64,
+        def: &[u8],
+        mode: RelLockMode,
+    ) -> Result<(), TxnError> {
+        let Ddl {
+            core,
+            txn,
+            ctx,
+            wait,
+            lock_timeout,
+        } = ddl;
+        let owner = match Self::latest_idx_row(core, txn, ctx, idx_oid)? {
+            Some(row) => row.owning_rel,
+            None => return Err(catalog_miss("index", idx_oid)),
+        };
+        self.locks()?
+            .lock_relation(core, txn, owner, mode, *wait, *lock_timeout)?;
+        let Some(row) = Self::latest_idx_row(core, txn, ctx, idx_oid)? else {
+            return Err(catalog_miss("index", idx_oid));
+        };
+        let altered = IdxRow {
+            def: def.to_vec(),
+            ..row
+        };
+        write_catalog_row(
+            core,
+            txn,
+            ctx,
+            &idx_key(idx_oid),
+            RowOp::Update {
+                value: altered.encode()?,
+                key_cols_changed: false,
+            },
+        )
     }
 
     /// Deletes retired-storage row `id` through the §5 write path (§9.2),

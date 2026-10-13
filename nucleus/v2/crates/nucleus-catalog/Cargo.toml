@@ -8,3 +8,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+nucleus-txn.workspace = true
+nucleus-kv.workspace = true
+nucleus-codec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The typed-layer tests run over MemKv behind the Fault crash wrapper
+# (the t5 rig pattern).
+nucleus-kv = { path = "../nucleus-kv", features = ["mem", "fault"] }
