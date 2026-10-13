@@ -174,8 +174,7 @@ fn def_cases() -> Vec<(&'static str, TableSchema)> {
     let mut flagged = cd(1, "c", KeyType::Int4);
     flagged.not_null = true;
     let mut dropped = cd(1, "c", KeyType::Int4);
-    dropped.dropped = true;
-    dropped.not_null = true; // §3: DROP COLUMN clears it; the def must show bit1 only
+    dropped.dropped = true; // DDL state: drop_column clears not_null (§3)
     let mut missing = cd(1, "c", KeyType::Int4);
     missing.missing = Some(Value::Int4(7));
     let mut missing_text = cd(1, "c", KeyType::Text(Collation::C));

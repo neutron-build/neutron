@@ -53,8 +53,10 @@ fn def_cases() -> Vec<(&'static str, &'static str, TableSchema)> {
     let mut flagged = cd(1, "c", KeyType::Int4);
     flagged.not_null = true;
     let mut dropped = cd(1, "c", KeyType::Int4);
+    // The DDL-producible state (drop_column clears not_null, §3). A
+    // hand-built not_null is canonicalized away by encode — pinned by
+    // encode_canonicalizes_dropped_not_null below (gate follow-up f2).
     dropped.dropped = true;
-    dropped.not_null = true; // §3: DROP COLUMN clears it; the def must show bit1 only
     let mut missing = cd(1, "c", KeyType::Int4);
     missing.missing = Some(Value::Int4(7));
     let mut missing_text = cd(1, "c", KeyType::Text(Collation::C));
@@ -224,6 +226,26 @@ fn def_truncation_at_every_offset() {
     }
 }
 
+/// Gate follow-up f2: `encode` canonicalizes the dropped state — a
+/// hand-built `dropped` + `not_null` column, impossible via DDL (DROP
+/// COLUMN clears `not_null`, §3), encodes with flags bit1 only, and
+/// bit0 does not survive the round trip.
+#[test]
+fn encode_canonicalizes_dropped_not_null() {
+    let mut hand = cd(1, "c", KeyType::Int4);
+    hand.dropped = true;
+    hand.not_null = true;
+    let bytes = sch(vec![hand], vec![])
+        .encode()
+        .unwrap_or_else(|e| panic!("encode: {e:?}"));
+    // 5401 | 00000001 | 01 | 0001 | 0001 | 00000001 | 63 'c' | 03 tag |
+    // flags | 0000 npk: the flags byte is byte 17.
+    assert_eq!(0x02, bytes[17], "a dropped column must show bit1 only");
+    let back = TableSchema::decode(&bytes).unwrap_or_else(|e| panic!("decode: {e:?}"));
+    assert!(back.columns[0].dropped);
+    assert!(!back.columns[0].not_null);
+}
+
 /// Hand-assembled §3 bytes, so the corrupt cases do not depend on the
 /// encoder. Each column is (attnum, name, tail) where the tail is the
 /// type bytes plus flags (and the missing value when bit2 is set).
@@ -260,6 +282,12 @@ fn def_decode_rejects() {
         TableSchema::decode(&bad_magic)
     );
 
+    // §3: version is 1 at CREATE TABLE, +1 per DDL — 0 is unproducible.
+    assert_eq!(
+        Err(RowError::Corrupt("definition version 0")),
+        TableSchema::decode(&raw_def(0, 0, &[(1, "a", INT8_TAIL)], &[1]))
+    );
+
     // hidden_rowid byte: only 0/1, and it must equal npk == 0.
     assert_eq!(
         Err(RowError::Corrupt("hidden_rowid byte")),
@@ -294,6 +322,28 @@ fn def_decode_rejects() {
     assert_eq!(
         Err(RowError::Corrupt("array of array type")),
         TableSchema::decode(&raw_def(1, 0, &[(1, "a", &[0x11, 0x11, 0x01, 0x00])], &[1]))
+    );
+    // Gate follow-up f1 (M-1): the second 0x11 is rejected *before*
+    // any recursion, so nesting depth cannot drive recursion. At 3
+    // nested tags and at 100,000 the result is the same Err — the
+    // deep one decoded on a small stack to prove no stack overflow.
+    assert_eq!(
+        Err(RowError::Corrupt("array of array type")),
+        TableSchema::decode(&raw_def(1, 0, &[(1, "a", &[0x11, 0x11, 0x11, 0x00])], &[1]))
+    );
+    let mut deep_tags = vec![0x11; 100_000];
+    deep_tags.push(0x00); // the flags byte
+    let deep = raw_def(1, 0, &[(1, "a", deep_tags.as_slice())], &[1]);
+    let decode_deep = move || TableSchema::decode(&deep).map(|_| ());
+    let small_stack = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(decode_deep)
+        .unwrap_or_else(|e| panic!("spawn: {e:?}"));
+    assert_eq!(
+        Err(RowError::Corrupt("array of array type")),
+        small_stack
+            .join()
+            .unwrap_or_else(|e| panic!("decode thread panicked: {e:?}"))
     );
     // A truncated type (the text tag without its collation byte) is
     // covered by def_truncation_at_every_offset over the `text` case.

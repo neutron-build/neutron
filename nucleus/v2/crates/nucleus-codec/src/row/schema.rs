@@ -10,9 +10,9 @@
 //! The §3.1 type tags are pinned as the const table below and on disk;
 //! they are never derived from `KeyType`'s discriminant order. Decode is
 //! total: an unknown tag, truncation, trailing bytes, attnums out of
-//! order, a pk entry naming a dropped or missing attnum, or a
-//! `hidden_rowid` byte that is not 0/1 or disagrees with `npk` are
-//! [`RowError::Corrupt`] (XX001), never a panic.
+//! order, a pk entry naming a dropped or missing attnum, a `version` of
+//! 0, or a `hidden_rowid` byte that is not 0/1 or disagrees with `npk`
+//! are [`RowError::Corrupt`] (XX001), never a panic.
 //!
 //! The DDL helpers are pure byte-level schema evolution: each returns
 //! the next version (`version + 1`, §3) and nothing else — locks,
@@ -142,10 +142,11 @@ impl TableSchema {
     }
 
     /// Parses a definition (§3). Total: every malformed input is an
-    /// `Err` ([`RowError::Corrupt`], XX001) — unknown type tags or
-    /// collations, truncation, trailing bytes, attnums out of order,
-    /// undecodable `missing` bytes, a pk entry naming a dropped or
-    /// missing attnum, unknown flag bits, or a `hidden_rowid` byte that
+    /// `Err` ([`RowError::Corrupt`], XX001) — a `version` of 0 (§3: 1
+    /// at CREATE, +1 per DDL), unknown type tags or collations,
+    /// truncation, trailing bytes, attnums out of order, undecodable
+    /// `missing` bytes, a pk entry naming a dropped or missing attnum,
+    /// unknown flag bits, or a `hidden_rowid` byte that
     /// is not 0/1 or disagrees with `npk`. Duplicate pk entries are not
     /// rejected (§3 does not forbid them; the writer never makes them).
     pub fn decode(bytes: &[u8]) -> Result<TableSchema, RowError> {
@@ -156,6 +157,9 @@ impl TableSchema {
             return Err(RowError::Corrupt("definition magic"));
         }
         let version = r.u32be().map_err(|_| short())?;
+        if version == 0 {
+            return Err(RowError::Corrupt("definition version 0"));
+        }
         let hidden_rowid = match r.u8().map_err(|_| short())? {
             0 => false,
             1 => true,
@@ -173,7 +177,7 @@ impl TableSchema {
             let name = std::str::from_utf8(name_bytes)
                 .map_err(|_| RowError::Corrupt("column name is not UTF-8"))?
                 .to_string();
-            let ty = decode_type(&mut r)?;
+            let ty = decode_type(&mut r, 0)?;
             let flags = r.u8().map_err(|_| short())?;
             if flags & !FLAG_KNOWN != 0 {
                 return Err(RowError::Corrupt("unknown definition flags"));
@@ -335,13 +339,16 @@ impl TableSchema {
     }
 }
 
+/// §3: DROP COLUMN sets `dropped` and clears `not_null`, so a dropped
+/// column never carries bit0. No DDL path can build the combination;
+/// `encode` canonicalizes a hand-built state rather than persist it.
 fn flag_bits(col: &ColumnDef) -> u8 {
+    if col.dropped {
+        return FLAG_DROPPED;
+    }
     let mut bits = 0u8;
     if col.not_null {
         bits |= FLAG_NOT_NULL;
-    }
-    if col.dropped {
-        bits |= FLAG_DROPPED;
     }
     bits
 }
@@ -399,9 +406,13 @@ fn encode_type(ty: &KeyType, out: &mut Vec<u8>) -> Result<(), RowError> {
     Ok(())
 }
 
-/// Reads the §3.1 type bytes; recursion stops at the second array level
-/// (an array of arrays is not a type, C-Q3s §7).
-fn decode_type(r: &mut super::RowReader<'_>) -> Result<KeyType, RowError> {
+/// Reads the §3.1 type bytes. `depth` is the array nesting level: a
+/// column's own tag is read at depth 0, an array's element at depth 1
+/// — the most the format allows (an array of arrays is not a type,
+/// C-Q3s §7). A `0x11` at depth ≥ 1 is rejected *before* any further
+/// recursion, so however deeply corrupt bytes nest array tags, decode
+/// consumes at most two frames, never one per input byte.
+fn decode_type(r: &mut super::RowReader<'_>, depth: u8) -> Result<KeyType, RowError> {
     let short = || RowError::Corrupt("truncated type");
     let tag = r.u8().map_err(|_| short())?;
     Ok(match tag {
@@ -425,11 +436,10 @@ fn decode_type(r: &mut super::RowReader<'_>) -> Result<KeyType, RowError> {
         TAG_UUID => KeyType::Uuid,
         TAG_JSONB => KeyType::Jsonb,
         TAG_ARRAY => {
-            let elem = decode_type(r)?;
-            if matches!(elem, KeyType::Array(_)) {
+            if depth > 0 {
                 return Err(RowError::Corrupt("array of array type"));
             }
-            KeyType::Array(Box::new(elem))
+            KeyType::Array(Box::new(decode_type(r, depth + 1)?))
         }
         _ => return Err(RowError::Corrupt("unknown type tag")),
     })
