@@ -24,10 +24,10 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use nucleus_codec::row::{value_repr_eq, Datum, RowError, TableSchema};
-use nucleus_codec::{encode_key, KeyColumn, KeyType, Value};
+use nucleus_codec::{decode_key_prefix, encode_key, KeyColumn, KeyType, Value};
 use nucleus_kv::{Key, OrderedKv};
 use nucleus_txn::boot::Core;
-use nucleus_txn::catalog::{table_range, Catalog, IdxStorage};
+use nucleus_txn::catalog::{index_ranges, table_range, Catalog, IdxStorage};
 use nucleus_txn::encoding::VersionValue;
 use nucleus_txn::locks::{LockManager, RelLockMode};
 use nucleus_txn::read::{read_key, scan, NoSsi};
@@ -39,7 +39,7 @@ use nucleus_txn::write::{
 };
 use nucleus_txn::{Seq, Ts, TxnError, TxnId};
 
-use crate::defs::IndexDef;
+use crate::defs::{IndexDef, IndexState};
 use crate::error::DbError;
 use crate::index::{self, IndexRow};
 
@@ -602,6 +602,219 @@ impl<K: OrderedKv> Db<K> {
         }
         Ok(out)
     }
+
+    /// A verified index scan (C-T6 §4, §6): every entry of index `idx_oid`
+    /// whose key value lies in `[lo, hi)` (one value per index column,
+    /// `None` = NULL, compared in the index's column order — P-ORDER), at
+    /// the statement's snapshot, with the row each entry names fetched and
+    /// verified: a fetched row not visible at the snapshot, or whose index
+    /// columns do not re-encode to the entry's key (§6's `index_scan`
+    /// verification), is [`RowError::Corrupt`] (XX001) — never a silently
+    /// wrong result. Returns `(row key, decoded row)` pairs in index order
+    /// (`/i/` entries before `/u/`, each in key order).
+    ///
+    /// The statement takes AccessShare on the owning relation (§4), reads
+    /// the index and relation rows at the latest committed catalog plus
+    /// its txn's earlier statements, and serves the read only if the index
+    /// is `Public` with `built_at <= st.snapshot` (§4: "an index serves a
+    /// read at `S` iff `Public` and `built_at <= S`"); anything else is
+    /// 0A000 ("index not usable at snapshot"). The entry range read goes
+    /// through `Ssi::scan` under SERIALIZABLE (the range SIREAD registers
+    /// before the scan's view, §8.1) and each row fetch through
+    /// `Ssi::read_key` (its SIREAD registered before its own view, §8.1
+    /// "index → heap fetch").
+    pub fn index_scan(
+        &self,
+        st: &Stmt<'_>,
+        idx_oid: u64,
+        lo: Bound<Vec<Option<Value>>>,
+        hi: Bound<Vec<Option<Value>>>,
+    ) -> Result<Vec<ScannedRow>, DbError> {
+        // Resolve the owner first (as the catalog's DROP INDEX does), then
+        // take §4's relation lock, then read the statement's catalog under
+        // it: a concurrent DROP INDEX that committed while we waited shows
+        // in the re-read.
+        let own = writer_ctx(st, self.core.visible_ts());
+        let owner = {
+            let view = self.core.open_view();
+            let row = Catalog::read_idx(&self.core, &view, &own, idx_oid).map_err(DbError::Txn)?;
+            let Some(row) = row else {
+                return Err(DbError::UndefinedObject);
+            };
+            row.owning_rel
+        };
+        self.locks
+            .lock_relation(
+                &self.core,
+                st.txn,
+                owner,
+                RelLockMode::AccessShare,
+                LockWait::Block,
+                None,
+            )
+            .map_err(DbError::Txn)?;
+        let idx = {
+            let view = self.core.open_view();
+            Catalog::read_idx(&self.core, &view, &own, idx_oid).map_err(DbError::Txn)?
+        };
+        let Some(idx) = idx else {
+            return Err(DbError::UndefinedObject);
+        };
+        let rel = {
+            let view = self.core.open_view();
+            Catalog::read_rel(&self.core, &view, &own, owner).map_err(DbError::Txn)?
+        };
+        let Some(rel) = rel else {
+            return Err(DbError::UndefinedTable);
+        };
+        let def = IndexDef::decode(&idx.def)?;
+        if def.state != IndexState::Public || def.built_at > st.snapshot().0 {
+            return Err(DbError::FeatureNotSupported("index not usable at snapshot"));
+        }
+        let IdxStorage::Id(isid) = idx.storage else {
+            return Err(DbError::FeatureNotSupported("index storage ranges: C-T6b2"));
+        };
+        let schema = TableSchema::decode(&rel.def)?;
+        let handle = IndexHandle {
+            oid: idx_oid,
+            storage_id: isid,
+            def,
+        };
+        let cols = index::key_columns(&schema, &handle)?;
+        let h = TableHandle {
+            txn: st.txn.id,
+            seq0: st.seq0,
+            lock: RelLockMode::AccessShare,
+            oid: owner,
+            storage_id: rel.storage_id,
+            schema: schema.clone(),
+            def_version: schema.version,
+            indexes: vec![handle.clone()],
+        };
+
+        // Encode the bounds once (P-ORDER: memcmp of encoded keys equals
+        // the SQL order of the key values). A bound narrows the scan of
+        // each entry range by `prefix ‖ enc(bound)`; the two half-open
+        // cases it cannot express exactly are filtered in memory below:
+        // an excluded lower bound must also drop the entries **equal** to
+        // it (their keys carry a row-key suffix past the bound, so the
+        // range start alone does not exclude them), and an included upper
+        // bound must drop the entries above it (the scan runs to the range
+        // end). P-PREFIX (no encoding is a prefix of another) makes both
+        // filters exact: within a scan that starts at `prefix ‖ enc(b)`,
+        // every entry's value part is `>= enc(b)`, and none is a proper
+        // prefix of it.
+        let enc = |vals: &Vec<Option<Value>>| -> Result<Vec<u8>, DbError> {
+            let mut out = Vec::new();
+            encode_key(&cols, vals, &mut out)
+                .map_err(|_| DbError::Row(RowError::Corrupt("index scan bound")))?;
+            Ok(out)
+        };
+        let (lo_bytes, drop_eq_lo) = match &lo {
+            Bound::Included(v) => (Some(enc(v)?), false),
+            Bound::Excluded(v) => (Some(enc(v)?), true),
+            Bound::Unbounded => (None, false),
+        };
+        let (hi_bytes, keep_le_hi) = match &hi {
+            Bound::Included(v) => (Some(enc(v)?), true),
+            Bound::Excluded(v) => (Some(enc(v)?), false),
+            Bound::Unbounded => (None, false),
+        };
+
+        let ctx = ReadCtx {
+            txn: st.txn.id,
+            snapshot: st.snapshot,
+            stmt_seq: st.seq0,
+        };
+        let ranges = index_ranges(isid);
+        let mut out: Vec<ScannedRow> = Vec::new();
+        // `/i/` sorts before `/u/`: scan it first so the result is in
+        // index order across both layouts of the storage.
+        let layouts = [(false, &ranges[1]), (true, &ranges[0])];
+        for (unique_range, (prefix, range_end)) in layouts {
+            let mut start = prefix.clone();
+            if let Some(b) = &lo_bytes {
+                start.extend_from_slice(b);
+            }
+            let end = match &hi_bytes {
+                Some(b) if !keep_le_hi => {
+                    let mut e = prefix.clone();
+                    e.extend_from_slice(b);
+                    e
+                }
+                _ => range_end.clone(),
+            };
+            let entries = match st.txn.isolation {
+                Isolation::Serializable => self
+                    .ssi
+                    .scan(&self.core, st.txn.id, &start, &end, &ctx)
+                    .map_err(DbError::Txn)?,
+                _ => {
+                    let view = self.core.open_view();
+                    scan(
+                        &self.core,
+                        &view,
+                        (
+                            Bound::Included(start.as_slice()),
+                            Bound::Excluded(end.as_slice()),
+                        ),
+                        &ctx,
+                        &mut NoSsi,
+                    )
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(DbError::Txn)?
+                }
+            };
+            for (key, payload) in entries {
+                let part = &key[prefix.len()..];
+                // Split the entry into its value part and the row key it
+                // names: a `/u/` entry carries the row key as its payload
+                // (§6), an `/i/` entry as the suffix past its value part.
+                let (value_part, row_key): (&[u8], Key) = if unique_range {
+                    (part, payload.clone())
+                } else {
+                    let (_, used) = decode_key_prefix(&cols, part)
+                        .map_err(|_| DbError::Row(RowError::Corrupt("index entry key")))?;
+                    (&part[..used], part[used..].to_vec())
+                };
+                if drop_eq_lo && lo_bytes.as_deref() == Some(value_part) {
+                    continue;
+                }
+                if keep_le_hi && hi_bytes.as_deref().is_some_and(|b| value_part > b) {
+                    continue;
+                }
+                // The row fetch (§8.1: the point SIREAD registers before
+                // the fetch's own view under SERIALIZABLE).
+                let bytes = match st.txn.isolation {
+                    Isolation::Serializable => self
+                        .ssi
+                        .read_key(&self.core, st.txn.id, &row_key, &ctx)
+                        .map_err(DbError::Txn)?,
+                    _ => {
+                        let view = self.core.open_view();
+                        read_key(&self.core, &view, &row_key, &ctx, &mut NoSsi)
+                            .map_err(DbError::Txn)?
+                    }
+                };
+                let Some(bytes) = bytes else {
+                    return Err(DbError::Row(RowError::Corrupt(
+                        "index entry names a row not visible at the snapshot",
+                    )));
+                };
+                let live = schema.decode_row(&bytes)?;
+                // §6: verify the fetched row — rebuild its entry and
+                // require byte equality with the scanned one.
+                let (want_key, want_value, _) = index::entry(&h, &handle, &row_key, &live)?;
+                if want_key != key || want_value != payload {
+                    return Err(DbError::Row(RowError::Corrupt(
+                        "index entry does not match its row",
+                    )));
+                }
+                out.push((row_key, live));
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ---- handle checks, keys-by-oid and the row-level EPQ (§5.2) ------------------
@@ -863,7 +1076,7 @@ pub fn table_lo(sid: u64) -> Key {
 /// `lo ‖ 0xFF`: the exclusive upper bound of a row scan (§5) — the first
 /// byte any large-value chunk of the storage starts with, and no encoded
 /// key ever starts with `0xFF` (C-Q3s §2 markers 0x00–0x02).
-fn chunk_prefix(lo: &[u8]) -> Key {
+pub(crate) fn chunk_prefix(lo: &[u8]) -> Key {
     let mut hi = lo.to_vec();
     hi.push(0xFF);
     hi
@@ -952,7 +1165,7 @@ fn pk_values(schema: &TableSchema, live: &[Option<Datum>]) -> Result<Vec<Option<
 /// `rebuild_storage_map`'s `n: 0`): the ghost of §4's own-writes-ignoring
 /// catalog read owns no intents, so the own-write branch of the read rule
 /// never fires for it.
-fn ghost_id<K: OrderedKv>(core: &Core<K>) -> TxnId {
+pub(crate) fn ghost_id<K: OrderedKv>(core: &Core<K>) -> TxnId {
     TxnId {
         epoch: core.epoch(),
         n: 0,
