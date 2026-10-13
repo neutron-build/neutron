@@ -370,3 +370,97 @@ impl Lat {
         )
     }
 }
+
+// ---- Lat unit tests (C-R0bbfix item 1) ---------------------------------------
+//
+// The percentile math every latency bound stands on was untested through
+// C-R0bb (gate finding M-1): a `Lat::p99` regression — the OM-2 mutant —
+// would make every `FAST`/`SPEC` assert in `r0b_fsync_gate.rs` silently
+// vacuous, because a too-low p99 passes those bounds. These pin the bag
+// on fixed vectors: no timing, no threads, exact values.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn empty_and_single_sample_bags() {
+        let empty = Lat::new();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.p99(), Duration::ZERO, "p99 of no samples");
+        assert_eq!(empty.min(), Duration::ZERO);
+        assert_eq!(empty.max(), Duration::ZERO);
+        assert_eq!(empty.summary("empty"), "empty: n=0 p99=0ns min=0ns max=0ns");
+
+        let mut one = Lat::new();
+        one.record(ms(7));
+        assert!(!one.is_empty());
+        assert_eq!(one.len(), 1);
+        // ceil(0.99·1) = 1: the only sample is every statistic.
+        assert_eq!(one.p99(), ms(7));
+        assert_eq!(one.min(), ms(7));
+        assert_eq!(one.max(), ms(7));
+        assert_eq!(one.summary("one"), "one: n=1 p99=7ms min=7ms max=7ms");
+    }
+
+    #[test]
+    fn fixed_vector_pins_len_min_max_p99_and_summary() {
+        let mut lat = Lat::new();
+        // Recorded out of order on purpose: percentiles must sort, not
+        // trust record order.
+        for i in [3, 1, 5, 2, 4] {
+            lat.record(ms(i));
+        }
+        assert_eq!(lat.len(), 5);
+        assert_eq!(lat.min(), ms(1));
+        assert_eq!(lat.max(), ms(5));
+        // n = 5 < 100: ceil(0.99·5) = 5 — the maximum.
+        assert_eq!(lat.p99(), ms(5), "n < 100 ⇒ p99 is the max");
+        assert_eq!(lat.summary("fixed"), "fixed: n=5 p99=5ms min=1ms max=5ms");
+    }
+
+    #[test]
+    fn p99_ceils_at_exact_ranks_and_is_not_always_the_max() {
+        // The rank is ceil(0.99·n): for n < 100 that is n (the max); at
+        // n = 100 and above the ceiling lands strictly inside the bag, so
+        // a p99 that just returns max(), floors its rank, or rounds the
+        // exact integer p·n/100 up to n is the wrong nearest-rank.
+
+        // n = 99: ceil(98.01) = 99 — still the max, the last such n.
+        let mut n99 = Lat::new();
+        for i in 1..=99u64 {
+            n99.record(ms(i));
+        }
+        assert_eq!(n99.p99(), ms(99), "n = 99 ⇒ the maximum");
+        assert_eq!(n99.max(), ms(99));
+
+        // n = 100: ceil(99) = 99 exactly — the 99th smallest, one below
+        // the max. The rank must not round up to n when p·n/100 is
+        // already an integer.
+        let mut n100 = Lat::new();
+        for i in 1..=100u64 {
+            n100.record(ms(i));
+        }
+        assert_eq!(n100.p99(), ms(99), "n = 100 ⇒ the 99th smallest");
+        assert_eq!(n100.max(), ms(100));
+
+        // n = 101: ceil(99.99) = 100 — the second-largest.
+        let mut n101 = Lat::new();
+        for i in 1..=101u64 {
+            n101.record(ms(i));
+        }
+        assert_eq!(n101.p99(), ms(100), "n = 101 ⇒ the second-largest");
+
+        // n = 200: ceil(198) = 198 — the third-largest.
+        let mut n200 = Lat::new();
+        for i in 1..=200u64 {
+            n200.record(ms(i));
+        }
+        assert_eq!(n200.p99(), ms(198), "n = 200 ⇒ the third-largest");
+    }
+}

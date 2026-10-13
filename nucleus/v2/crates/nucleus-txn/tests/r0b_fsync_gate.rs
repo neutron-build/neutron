@@ -58,8 +58,14 @@ use nucleus_txn::TxnError;
 
 use r0b_support::{ok, Lat, SlowSyncKv};
 
+/// The modelled fsync cost D, in milliseconds — the one number every
+/// bound below derives from (C-R0bbfix, gate N-1), so `FAST` and `SPEC`
+/// cannot drift from `D`. (`Duration`'s `/` and `*` are not const, so
+/// the derivation goes through `D_MS`.)
+const D_MS: u64 = 100;
+
 /// The modelled fsync cost, D.
-const D: Duration = Duration::from_millis(100);
+const D: Duration = Duration::from_millis(D_MS);
 
 /// One phase's load window, W.
 const W: Duration = Duration::from_secs(2);
@@ -71,11 +77,13 @@ const COLLECT: Duration = Duration::from_secs(30);
 /// The pause between probe ops.
 const PROBE_SLEEP: Duration = Duration::from_millis(1);
 
-/// The fast bound: a quarter of one fsync.
-const FAST: Duration = Duration::from_millis(25); // D/4
+/// The fast bound: a quarter of one fsync — `D / 4`, derived from
+/// [`D_MS`].
+const FAST: Duration = Duration::from_millis(D_MS / 4);
 
-/// The spec bound for P4 under sync-commit load: three fsyncs' worth.
-const SPEC: Duration = Duration::from_millis(300); // 3·D
+/// The spec bound for P4 under sync-commit load: three fsyncs' worth —
+/// `3 * D`, derived from [`D_MS`].
+const SPEC: Duration = Duration::from_millis(D_MS * 3);
 
 /// Samples each probe class needs per phase.
 const MIN_PROBE_SAMPLES: usize = 200;
@@ -555,4 +563,14 @@ fn latency_under_fsync_load() {
     );
 
     ok(commit_thread.shutdown());
+}
+
+/// C-R0bbfix (gate N-1): the bounds are derived from `D_MS` at compile
+/// time and pinned to `D` here at run time — reverting either bound to a
+/// plain literal that disagrees with `D` fails this, so the gate's p99
+/// checks can never silently test the wrong threshold.
+#[test]
+fn bounds_stay_tied_to_d() {
+    assert_eq!(FAST, D / 4, "FAST must be D/4");
+    assert_eq!(SPEC, 3 * D, "SPEC must be 3·D");
 }
