@@ -86,14 +86,16 @@
 //!   the mutex means parking later callers on in-flight reservations —
 //!   wait machinery on a path §3 keeps off the commit thread and that
 //!   syncs once per [`BLOCK`] values. Holding the leaf slot mutex across
-//!   at most one fsync per block cannot deadlock; concurrent callers of
-//!   one id serialise behind it, which the concurrency test observes as
-//!   exactly one reservation per block and gap-free distinct values.
+//!   at most one fsync per reservation, plus one creation write on first
+//!   use, cannot deadlock; concurrent callers of one id serialise behind
+//!   it, which the concurrency test observes as exactly one reservation
+//!   per block and gap-free distinct values.
 //!
 //! The cross-id consequence is rule R3 (`rt.rs`): only callers of the
 //! same id can wait on a slot mutex, and a slot mutex is held across at
-//! most one fsync per block — so a cached or first-use `nextval` of any
-//! **other** id takes the module mutex for a lookup and its own slot, and
+//! most one fsync per reservation, plus one creation write on first use
+//! — so a cached or first-use `nextval` of any **other** id takes the
+//! module mutex for a lookup and its own slot, and
 //! never waits on an fsync another session's sequence started.
 //! `tests/r0b_seq_isolation.rs` and `tests/r0b_fsync_gate.rs` (card
 //! C-R0bb) gate this.
@@ -299,6 +301,20 @@ impl<K: OrderedKv> Core<K> {
         }?;
         let st = slot.lock().unwrap_or_else(PoisonError::into_inner);
         st.as_ref().map(|st| st.reservations)
+    }
+
+    /// Test-only (card C-R0bbfix): whether the module map holds a slot
+    /// for `id` at all. [`Core::seq_reservations_for_tests`] reads the
+    /// slot's state and so cannot see an empty slot a refused call
+    /// inserted; this can — the C-R0ba entry check is `seq_next`'s
+    /// first statement, so a refusal must have inserted nothing.
+    #[doc(hidden)]
+    pub fn seq_slot_exists_for_tests(&self, id: u64) -> bool {
+        self.seq
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seqs
+            .contains_key(&id)
     }
 }
 
