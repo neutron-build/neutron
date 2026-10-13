@@ -72,6 +72,22 @@
 //! before the call changes any state — the checked form of §3 step 4's
 //! "fsync never on a tokio worker". Unmarked threads (every existing test,
 //! the commit thread, the simulator, the background jobs) are unaffected.
+//!
+//! Card C-B1b gives the last two §9.3 slots their bodies. The **boot
+//! sweep** (`jobs::sweep`, §7.2) walks the keyspace outside `/sys/` plus
+//! `/sys/catalog/` in bounded chunks through registered views and removes
+//! every older-epoch intent through §7.3 (`Resolve` for a persisted
+//! record, `Discard` otherwise), recording `sweep_counter` only after the
+//! last removal (§7.4 condition 1) — so older-epoch `/sys/txn` records
+//! finally truncate and stop piling up across reboots. The
+//! **drop-cleanup** job (`jobs::drop_cleanup`, §9.2) reads the
+//! transactional `/sys/catalog/retired/` rows the catalog's DDL now
+//! writes, and once the durable `W` passes the snapshot that saw a row,
+//! retires each of its ranges (`GcJob::retire_storage`: intents out
+//! through §7.3 first, then the `DeleteRange`) and deletes the row in its
+//! own txn. Both hold only raw keys, so they take `latch_key(k)` from the
+//! [`LatchKeySource`](jobs::LatchKeySource) seam (§7.3 SD2b), installed
+//! before either job starts and defaulting to "no deferrable keys".
 
 pub mod boot;
 pub mod commit;

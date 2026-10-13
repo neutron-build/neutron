@@ -618,3 +618,258 @@ fn spawner_seam_is_used() {
     assert_eq!(names, vec!["nucleus-job-resolver".to_string()]);
     ok(set.shutdown());
 }
+
+/// M1 (a job started after (or racing with) a sibling's error is not
+/// stopped, and `start` accepts it): starting into a failed set returns
+/// the set's first error, and a sibling failing while `start` is still
+/// in flight stops the new job — the slot's stop flag is pushed under
+/// the `slots` lock before the spawn returns, so `fail_the_set` (which
+/// stops jobs under the same lock) can never miss it. The racing window
+/// is made deterministic with a spawner that parks inside `spawn` until
+/// the test says so.
+///
+/// Mutant F3 (the slot pushed after the spawn; the runner's stop check
+/// removed): part 1's `start` returns `Ok`, and part 2's job keeps
+/// running — its rounds counter never freezes.
+#[test]
+fn fail_stop_reaches_jobs_started_later() {
+    // ---- part 1: starting into a failed set returns the first error.
+    let core = Arc::new(ok(Core::open(RecKv::new())));
+    let hook = RecFailStop::new();
+    let mut set = JobSet::new(Arc::clone(&core))
+        .with_fail_stop(Arc::clone(&hook) as Arc<dyn nucleus_txn::commit::FailStop>);
+    ok(set.start(
+        Box::new(SlotJob::new(JobKind::Merge, |_cx: &JobCtx| {
+            Err(TxnError::Invariant("boom".into()))
+        })),
+        idle(3600),
+    ));
+    wait_until(5, "the failing job's error reached the hook", || {
+        !hook.errors().is_empty()
+    });
+    let r = set.start(
+        Box::new(SlotJob::new(JobKind::Analyze, |_cx: &JobCtx| {
+            Ok(JobOutcome::Idle)
+        })),
+        idle(3600),
+    );
+    let err = r.expect_err("starting into a failed set is refused");
+    assert!(
+        matches!(&err, TxnError::Invariant(m) if m.contains("boom")),
+        "the set's first error returns: {err:?}"
+    );
+    assert!(
+        set.shutdown().is_err(),
+        "the first error returns from shutdown too"
+    );
+
+    // ---- part 2: a sibling failing during `start` stops the new job.
+    let core2 = Arc::new(ok(Core::open(RecKv::new())));
+    let hook2 = RecFailStop::new();
+
+    /// A spawner whose next `spawn` parks between the test's signals:
+    /// the new job's thread is not started until `proceed`, so the test
+    /// can fail a sibling inside the window `start` spends spawning.
+    /// (The channel ends live behind mutexes: they are `Send` but not
+    /// `Sync`, and `Spawner` must be both.)
+    struct GatedSpawner {
+        armed: AtomicBool,
+        spawned: Mutex<std::sync::mpsc::Sender<()>>,
+        proceed: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Spawner for GatedSpawner {
+        fn spawn(
+            &self,
+            name: String,
+            body: Box<dyn FnOnce() + Send>,
+        ) -> std::result::Result<Box<dyn nucleus_txn::jobs::runner::Joiner>, TxnError> {
+            if self.armed.load(Ordering::SeqCst) {
+                self.spawned
+                    .lock()
+                    .expect("spawned")
+                    .send(())
+                    .expect("spawned signal");
+                self.proceed
+                    .lock()
+                    .expect("proceed")
+                    .recv()
+                    .expect("proceed signal");
+            }
+            StdThreadSpawner.spawn(name, body)
+        }
+    }
+    let (spawned_tx, spawned_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let spawner = Arc::new(GatedSpawner {
+        armed: AtomicBool::new(false),
+        spawned: Mutex::new(spawned_tx),
+        proceed: Mutex::new(proceed_rx),
+    });
+
+    let set2 = Arc::new(std::sync::Mutex::new(
+        JobSet::new(Arc::clone(&core2))
+            .with_fail_stop(Arc::clone(&hook2) as Arc<dyn nucleus_txn::commit::FailStop>)
+            .with_spawner(Arc::clone(&spawner) as Arc<dyn Spawner>),
+    ));
+
+    // The sibling: fails once `fail` is set (a 20 ms idle interval, so it
+    // is alive and parked when the race begins).
+    let fail = Arc::new(AtomicBool::new(false));
+    {
+        let fail = Arc::clone(&fail);
+        let core2 = Arc::clone(&core2);
+        ok(set2.lock().expect("set2").start(
+            Box::new(SlotJob::new(JobKind::Merge, move |_cx: &JobCtx| {
+                if fail.load(Ordering::SeqCst) {
+                    Err(TxnError::Kv("injected".into()))
+                } else {
+                    // Touch the core so the job is observably alive.
+                    let _ = core2.visible_ts();
+                    Ok(JobOutcome::Idle)
+                }
+            })),
+            nucleus_txn::jobs::JobConfig {
+                idle_interval: Duration::from_millis(20),
+            },
+        ));
+    }
+    wait_until(5, "the sibling ran a round", || {
+        core2.job_stats(JobKind::Merge).rounds >= 1
+    });
+
+    // Arm the gate and start the new job on another thread: its `spawn`
+    // parks. Fail the sibling while the spawn is parked.
+    spawner.armed.store(true, Ordering::SeqCst);
+    let starter = {
+        let set2 = Arc::clone(&set2);
+        std::thread::spawn(move || {
+            set2.lock().expect("set2").start(
+                Box::new(SlotJob::new(JobKind::Analyze, |_cx: &JobCtx| {
+                    Ok(JobOutcome::Progress)
+                })),
+                idle(3600),
+            )
+        })
+    };
+    spawned_rx.recv().expect("the gated spawn began");
+    fail.store(true, Ordering::SeqCst);
+    core2.wake_job(JobKind::Merge);
+    // The sibling's error is counted before its fail-stop runs (which is
+    // blocked behind the `slots` lock `start` holds) — waiting on the
+    // set's `first_error()` here would deadlock on the set mutex the
+    // parked `start` still holds.
+    wait_until(5, "the sibling's error is counted", || {
+        core2.job_stats(JobKind::Merge).errors >= 1
+    });
+    proceed_tx.send(()).expect("proceed");
+    ok(starter.join().expect("starter"));
+
+    // The new job must stop: its rounds freeze once the fail-stop reaches
+    // it. (Under F3 the job never sees a stop and `Progress` never
+    // parks, so the counter keeps moving.)
+    wait_until(5, "the fail-stop hook saw the sibling's error", || {
+        !hook2.errors().is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let rounds = core2.job_stats(JobKind::Analyze).rounds;
+    std::thread::sleep(Duration::from_millis(300));
+    // Leak the set before any assertion can unwind into its Drop: a job
+    // that refuses to stop (the mutant) would hang the join, not fail
+    // the test.
+    std::mem::forget(set2);
+    assert_eq!(
+        core2.job_stats(JobKind::Analyze).rounds,
+        rounds,
+        "the job started during the sibling's failure was stopped by it"
+    );
+}
+
+/// M2 (a panic is not fail-stop until `shutdown`): a panicking job stops
+/// a running resolver within the observation window, and the hook sees
+/// the error before `shutdown` — the panic is caught around the step and
+/// routed through `fail_the_set` at once.
+///
+/// Mutant F4 (no `catch_unwind`): the hook stays empty until the join at
+/// `shutdown`, so the "before shutdown" wait fails.
+#[test]
+fn panicking_job_fails_the_set_at_once() {
+    let core = Arc::new(ok(Core::open(RecKv::new())));
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
+    let hook = RecFailStop::new();
+    let mut set = JobSet::new(Arc::clone(&core))
+        .with_fail_stop(Arc::clone(&hook) as Arc<dyn nucleus_txn::commit::FailStop>);
+    ok(set.start(
+        Box::new(ResolverJob::new(Arc::clone(&core))),
+        nucleus_txn::jobs::JobConfig::default_for(JobKind::Resolver),
+    ));
+    wait_until(5, "the resolver ran its first step", || {
+        core.job_stats(JobKind::Resolver).rounds >= 1
+    });
+
+    ok(set.start(
+        Box::new(SlotJob::new(JobKind::Analyze, |_cx: &JobCtx| {
+            panic!("injected immediate panic")
+        })),
+        idle(3600),
+    ));
+    // The hook sees the panic BEFORE any shutdown call.
+    wait_until(
+        2,
+        "the panicking job reached the hook before shutdown",
+        || {
+            hook.errors()
+                .iter()
+                .any(|e| matches!(e, TxnError::Invariant(m) if m.contains("panicked")))
+        },
+    );
+
+    // The resolver stopped with it: its rounds freeze.
+    let rounds = core.job_stats(JobKind::Resolver).rounds;
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        core.job_stats(JobKind::Resolver).rounds,
+        rounds,
+        "the resolver stopped when the sibling panicked"
+    );
+    assert!(set.shutdown().is_err(), "the panic returns from shutdown");
+    ok(handle.shutdown());
+}
+
+/// L4 (a failed job's own loop keeps spinning on a KV error): a job
+/// whose step always errors runs exactly one step and reports exactly
+/// one error. The failing job's own stop flag is never set
+/// (`fail_the_set` stops every *other* job), so a mutant that drops the
+/// post-error return loops visibly: the rounds and error counters grow.
+///
+/// Mutant F5 (the failed job keeps looping): rounds and errors grow
+/// past one within the window.
+#[test]
+fn a_failed_job_runs_exactly_one_step() {
+    let core = Arc::new(ok(Core::open(RecKv::new())));
+    let hook = RecFailStop::new();
+    let mut set = JobSet::new(Arc::clone(&core))
+        .with_fail_stop(Arc::clone(&hook) as Arc<dyn nucleus_txn::commit::FailStop>);
+    ok(set.start(
+        Box::new(SlotJob::new(JobKind::Merge, |_cx: &JobCtx| {
+            Err(TxnError::Kv("always fails".into()))
+        })),
+        idle(1),
+    ));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        core.job_stats(JobKind::Merge).rounds,
+        1,
+        "the failed job ran exactly one step"
+    );
+    assert_eq!(
+        core.job_stats(JobKind::Merge).errors,
+        1,
+        "exactly one error was counted"
+    );
+    assert_eq!(
+        hook.errors().len(),
+        1,
+        "the fail-stop hook ran exactly once (a spinning job would re-report)"
+    );
+    assert!(set.shutdown().is_err());
+}

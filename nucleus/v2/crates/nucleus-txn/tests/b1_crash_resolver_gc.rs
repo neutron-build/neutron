@@ -82,21 +82,29 @@ fn scenario(point: JobPoint, occurrence: u64, keep: usize, fired_any: &mut bool)
     let retention = RetentionJob::new(Arc::clone(&core), Arc::clone(&ssi));
 
     // Drive: one resolver round, one GC round, one retention pass per
-    // iteration, all on this thread. Errors mean the KV is dead — the
-    // kill already fired.
+    // iteration, all on this thread. Errors after the kill fired are the
+    // crash; an error with the probe not yet fired is a determinism break
+    // that silently truncates the matrix (the C-B1a gate's M3): it
+    // panics instead of returning NeverFired.
     for _ in 0..ROUNDS {
-        let resolved = Resolver::run_once(&core);
-        if state.fired() {
-            break;
-        }
-        if resolved.is_err() {
-            break;
-        }
-        if gc.run_once(0).is_err() {
-            break;
+        if let Err(e) = Resolver::run_once(&core) {
+            if state.fired() {
+                break;
+            }
+            panic!(
+                "drive error at {point:?} occurrence {occurrence} before the probe fired: {e:?}"
+            );
         }
         if state.fired() {
             break;
+        }
+        if let Err(e) = gc.run_once(0) {
+            if state.fired() {
+                break;
+            }
+            panic!(
+                "drive error at {point:?} occurrence {occurrence} before the probe fired: {e:?}"
+            );
         }
         retention.run_once();
         if state.fired() {

@@ -81,6 +81,10 @@ pub struct Core<K: OrderedKv> {
     /// Reached by the runner threads through their `Arc<Core>` and by the
     /// job bodies through `Core::job_probe_at`/`Core::wake_job`.
     pub(crate) jobs: crate::jobs::JobsShared,
+    /// The latch-key source (§7.3 SD2b, C-B1b): the seam the boot sweep
+    /// and retired-prefix cleanup read `latch_key(k)`'s deferrable prefix
+    /// from. Default [`NoDeferrableKeys`] (owner decision D2).
+    pub(crate) latch_key_source: Mutex<Arc<dyn crate::jobs::LatchKeySource>>,
 }
 
 impl<K: OrderedKv> Core<K> {
@@ -170,6 +174,7 @@ impl<K: OrderedKv> Core<K> {
             resolve_q: Mutex::new(VecDeque::new()),
             seq: Mutex::new(crate::seq::SeqModule::new()),
             jobs: crate::jobs::JobsShared::new(),
+            latch_key_source: Mutex::new(Arc::new(crate::jobs::NoDeferrableKeys)),
         })
     }
 
@@ -333,6 +338,31 @@ impl<K: OrderedKv> Core<K> {
             }
             other => crate::kv_err(other),
         })
+    }
+
+    /// Installs the latch-key source (§7.3 SD2b): the seam the boot sweep
+    /// (§7.2) and the drop-cleanup job (§9.2) read `latch_key(k)`'s
+    /// deferrable prefix from when they remove intents with only raw keys
+    /// in hand. Install it **before starting either job**; the source must
+    /// answer for every key that can hold an intent, including dropped
+    /// indexes and older epochs (§12 Q8). The default is
+    /// [`NoDeferrableKeys`] (owner decision D2: no deferrable keys yet).
+    pub fn set_latch_key_source(&self, source: Arc<dyn crate::jobs::LatchKeySource>) {
+        *self
+            .latch_key_source
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = source;
+    }
+
+    /// The installed latch-key source (§7.3 SD2b). Crate-private: the
+    /// sweep and drop-cleanup bodies are the only readers.
+    pub(crate) fn latch_key_source(&self) -> Arc<dyn crate::jobs::LatchKeySource> {
+        Arc::clone(
+            &self
+                .latch_key_source
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 }
 

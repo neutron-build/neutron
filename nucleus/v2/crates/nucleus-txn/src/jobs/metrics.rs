@@ -1,9 +1,10 @@
 //! The job metric surface (§9.3) — the counters and gauges C-O3 exports
 //! through [`Core::job_metrics`](crate::boot::Core::job_metrics). One
-//! counter block per [`JobKind`](crate::jobs::JobKind), plus four gauges:
+//! counter block per [`JobKind`](crate::jobs::JobKind), plus five gauges:
 //! the GC watermark lag (`visible_ts − published W`, §9.1: a long-running
 //! snapshot holds `W` back and is exported), the resolver's queue length,
-//! the status-table population and whether the boot sweep finished.
+//! the status-table population, whether the boot sweep finished, and the
+//! drop-cleanup job's pending retired rows.
 
 use nucleus_kv::OrderedKv;
 
@@ -47,6 +48,8 @@ pub const METRIC_RESOLVE_QUEUE_LEN: &str = "nucleus_resolve_queue_len";
 pub const METRIC_STATUS_ENTRIES: &str = "nucleus_status_entries";
 /// `nucleus_boot_sweep_done` (gauge, 0/1)
 pub const METRIC_BOOT_SWEEP_DONE: &str = "nucleus_boot_sweep_done";
+/// `nucleus_drop_cleanup_pending` (gauge, C-B1b §9.2)
+pub const METRIC_DROP_CLEANUP_PENDING: &str = "nucleus_drop_cleanup_pending";
 
 fn counter(name: &'static str, job: JobKind, value: u64) -> Metric {
     Metric {
@@ -77,14 +80,15 @@ impl<K: OrderedKv> Core<K> {
     }
 
     /// Every job counter and gauge (the surface C-O3 exports): the six
-    /// counters below once per [`JobKind`], then the four gauges.
+    /// counters below once per [`JobKind`], then the five gauges.
     ///
     /// - `nucleus_job_rounds_total`, `nucleus_job_progress_rounds_total`,
     ///   `nucleus_job_idle_waits_total`, `nucleus_job_wakeups_total`,
     ///   `nucleus_job_errors_total`, `nucleus_job_items_total` — one per
     ///   kind;
     /// - `nucleus_gc_watermark_lag`, `nucleus_resolve_queue_len`,
-    ///   `nucleus_status_entries`, `nucleus_boot_sweep_done` — gauges.
+    ///   `nucleus_status_entries`, `nucleus_boot_sweep_done`,
+    ///   `nucleus_drop_cleanup_pending` — gauges.
     pub fn job_metrics(&self) -> Vec<Metric> {
         let mut out = Vec::new();
         for kind in JobKind::ALL {
@@ -118,6 +122,11 @@ impl<K: OrderedKv> Core<K> {
             METRIC_BOOT_SWEEP_DONE,
             Some(JobKind::BootSweep),
             u64::from(self.registry.sweep_counter().is_some()),
+        ));
+        out.push(gauge(
+            METRIC_DROP_CLEANUP_PENDING,
+            Some(JobKind::DropCleanup),
+            self.jobs.drop_cleanup_pending(),
         ));
         out
     }
