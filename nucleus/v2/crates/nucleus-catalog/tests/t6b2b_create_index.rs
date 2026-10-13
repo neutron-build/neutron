@@ -126,9 +126,10 @@ fn born_public_on_empty_preexisting_rollback_and_abort_leave_nothing() {
         ok(rig.db.insert_with(&st, &h, &[i32_d(1), text_d("a")]));
         let st2 = rig.stmt(&t, s);
         let idx_oid = ok(rig.db.create_index(&st2, oid, &any_state_def(true)));
-        assert!(
-            !raw_entry_trace(&rig).is_empty(),
-            "the own row had its entry"
+        assert_eq!(
+            raw_entry_trace(&rig).len(),
+            1,
+            "the one own row got exactly one entry"
         );
         rig.abort_txn(t);
         assert_eq!(rig.idx_row(idx_oid), None, "abort leaves no idx row");
