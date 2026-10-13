@@ -9,15 +9,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nucleus_catalog::{Db, Stmt};
+use nucleus_catalog::{table_lo, Db, IndexColumn, IndexDef, IndexState, Stmt};
 use nucleus_codec::row::{ColumnDef, Datum, RowError, TableSchema};
-use nucleus_codec::{KeyType, Value};
+use nucleus_codec::{encode_key, Direction, KeyColumn, KeyType, Nulls, Value};
 use nucleus_kv::fault::Fault;
 use nucleus_kv::{Key, MemKv, OrderedKv};
 use nucleus_txn::boot::Core;
-use nucleus_txn::catalog::{Catalog, Ddl, IdxRow, RelRow};
+use nucleus_txn::catalog::{Catalog, Ddl, IdxRow, IdxStorage, RelRow};
 use nucleus_txn::commit::{CommitConfig, CommitPipeline};
-use nucleus_txn::locks::LockManager;
+use nucleus_txn::locks::{LockManager, RelLockMode};
 use nucleus_txn::registry::SnapshotGuard;
 use nucleus_txn::resolver::Resolver;
 use nucleus_txn::ssi::Ssi;
@@ -254,6 +254,104 @@ impl Rig {
     pub fn wait_edges(&self) -> Vec<(TxnId, TxnId)> {
         self.core().wait_edges()
     }
+
+    // ---- C-T6b2a: index setup and entry inspection (§6) ----------------
+
+    /// Creates an index (`catalog_create_index` at AccessExclusive, fresh
+    /// storage id) and commits. Returns `(index oid, storage id)`.
+    pub fn add_index(&self, owner: u64, def: &IndexDef) -> (u64, u64) {
+        let isid = ok(self.catalog().alloc_storage_id(self.core()));
+        let t = self.rc();
+        let s = self.core().visible_ts();
+        let (idx_oid, _) = ok(self.catalog().catalog_create_index(
+            &self.ddl(&t, s),
+            owner,
+            IdxStorage::Id(isid),
+            &ok(def.encode()),
+        ));
+        ok(self.commit_rc(t));
+        (idx_oid, isid)
+    }
+
+    /// Rewrites an index's def (`catalog_alter_idx_def` at
+    /// AccessExclusive — e.g. the state ladder a build drives) and
+    /// commits.
+    pub fn set_index_def(&self, idx_oid: u64, def: IndexDef) {
+        let t = self.rc();
+        let s = self.core().visible_ts();
+        ok(self.catalog().catalog_alter_idx_def(
+            &self.ddl(&t, s),
+            idx_oid,
+            &ok(def.encode()),
+            RelLockMode::AccessExclusive,
+        ));
+        ok(self.commit_rc(t));
+    }
+
+    /// The visible entries of index storage `isid` at `visible_ts`
+    /// (§4, through `read::scan` over both entry ranges — the oracle an
+    /// index range read sees).
+    pub fn scan_entries(&self, isid: u64) -> Vec<(Key, Vec<u8>)> {
+        let ctx = ReadCtx {
+            txn: ghost_id(self.core()),
+            snapshot: self.core().visible_ts(),
+            stmt_seq: 1,
+        };
+        let mut out = Vec::new();
+        for (lo, hi) in nucleus_txn::catalog::index_ranges(isid) {
+            let view = self.core().open_view();
+            let rows = ok(nucleus_txn::read::scan(
+                self.core(),
+                &view,
+                (
+                    std::ops::Bound::Included(lo.as_slice()),
+                    std::ops::Bound::Excluded(hi.as_slice()),
+                ),
+                &ctx,
+                &mut nucleus_txn::read::NoSsi,
+            )
+            .collect::<Result<Vec<_>, _>>());
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// Every raw stored entry of index storage `isid`, both ranges:
+    /// `(logical key, version ts — None for an intent, header byte,
+    /// payload past the header)` in stored order. A tombstone's header is
+    /// `0x02` (or `0x03`, moved), a live row's `0x00`/`0x01`.
+    pub fn raw_entry_versions(&self, isid: u64) -> Vec<(Key, Option<Ts>, u8, Vec<u8>)> {
+        use nucleus_kv::{OrderedKv as _, Snapshot as _};
+        let mut out = Vec::new();
+        for (lo, hi) in nucleus_txn::catalog::index_ranges(isid) {
+            let snap = self.kv.snapshot();
+            for entry in snap.scan(
+                (
+                    std::ops::Bound::Included(lo.as_slice()),
+                    std::ops::Bound::Excluded(hi.as_slice()),
+                ),
+                false,
+            ) {
+                let (stored, value) = ok(entry);
+                let (logical, kind) = match nucleus_txn::encoding::parse_key(&stored) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+                let ts = match kind {
+                    nucleus_txn::encoding::Entry::Version(ts) => Some(ts),
+                    nucleus_txn::encoding::Entry::Intent => None,
+                };
+                let header = value.first().copied().unwrap_or(0xFF);
+                out.push((
+                    logical.to_vec(),
+                    ts,
+                    header,
+                    value[1.min(value.len())..].to_vec(),
+                ));
+            }
+        }
+        out
+    }
 }
 
 impl Default for Rig {
@@ -377,4 +475,63 @@ pub fn decode_def(def: &[u8]) -> TableSchema {
         Err(RowError::InvalidDdl(m)) => panic!("invalid def: {m}"),
         Err(e) => panic!("def decode: {e:?}"),
     }
+}
+
+// ---- C-T6b2a: §6 key oracles (hand-built, independent of the src) ----------
+
+/// An index definition (§6 bytes) on one column.
+pub fn idx_def(attnum: u16, unique: bool, state: IndexState) -> IndexDef {
+    IndexDef {
+        columns: vec![IndexColumn {
+            attnum,
+            dir: Direction::Asc,
+            nulls: Nulls::Last,
+        }],
+        unique,
+        nulls_not_distinct: false,
+        concurrently: false,
+        state,
+        built_at: 0,
+    }
+}
+
+/// The row key of pk values in table storage `sid` (§3):
+/// `table_lo ‖ encode_key(pk ASC NULLS LAST)` — the independent oracle
+/// for `pk_key`.
+pub fn row_key_of(sid: u64, schema: &TableSchema, pk: &[Option<Value>]) -> Key {
+    let cols: Vec<_> = schema
+        .pk
+        .iter()
+        .map(|&attnum| {
+            let col = schema
+                .columns
+                .iter()
+                .find(|c| c.attnum == attnum)
+                .expect("pk attnum");
+            KeyColumn::asc(col.ty.clone())
+        })
+        .collect();
+    let mut key = table_lo(sid);
+    encode_key(&cols, pk, &mut key).expect("pk encodes");
+    key
+}
+
+/// The `/u/{sid}/`-based entry logical key of `vals` (§6).
+pub fn u_entry_key(isid: u64, cols: &[KeyColumn], vals: &[Option<Value>]) -> Key {
+    let mut key = nucleus_txn::catalog::index_ranges(isid).remove(0).0;
+    encode_key(cols, vals, &mut key).expect("index key encodes");
+    key
+}
+
+/// The `/i/{sid}/`-based entry logical key of `vals` and its row key (§6).
+pub fn i_entry_key(isid: u64, cols: &[KeyColumn], vals: &[Option<Value>], row_key: &[u8]) -> Key {
+    let mut key = nucleus_txn::catalog::index_ranges(isid).remove(1).0;
+    encode_key(cols, vals, &mut key).expect("index key encodes");
+    key.extend_from_slice(row_key);
+    key
+}
+
+/// One `(attnum, value)` assignment of an UPDATE's `set`.
+pub fn set_col(attnum: u16, datum: Option<Datum>) -> (u16, Option<Datum>) {
+    (attnum, datum)
 }

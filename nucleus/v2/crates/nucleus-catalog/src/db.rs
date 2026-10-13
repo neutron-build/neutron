@@ -1,8 +1,13 @@
 //! The typed table layer over `nucleus-txn` (C-T6 §2-§4): the [`Db`]
 //! handle, one statement's position ([`Stmt`], the §3 ordinal counter),
-//! `open_table` with the §4 relation rule, and the first DML/reads —
-//! insert (hidden-rowid keys, the §3 2704-byte key limit), point get and
-//! scan (§5's `[table_lo, table_lo ‖ 0xFF)` bound, toast chunks excluded).
+//! `open_table` with the §4 relation rule, and the DML/reads — insert
+//! (hidden-rowid keys, the §3 2704-byte key limit), update and delete
+//! (row-level EPQ, PK changes through `update_pk`), point get and scan
+//! (§5's `[table_lo, table_lo ‖ 0xFF)` bound, toast chunks excluded).
+//! Index maintenance is C-T6 §6's: every index of the statement's handle
+//! is maintained according to its state, with entries computed from the
+//! row version the row op acted on (its EPQ base) — see the private
+//! `index` module and C-T6 §7.3 for why a stale handle is legal.
 //!
 //! The caller owns snapshot registration (§3.1): an RR/SER txn's snapshot
 //! must have been taken (and stay registered) before its statements run —
@@ -15,21 +20,25 @@ use std::cell::Cell;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use nucleus_codec::row::{Datum, RowError, TableSchema};
+use nucleus_codec::row::{value_repr_eq, Datum, RowError, TableSchema};
 use nucleus_codec::{encode_key, KeyColumn, KeyType, Value};
 use nucleus_kv::{Key, OrderedKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::catalog::{table_range, Catalog, IdxStorage};
+use nucleus_txn::encoding::VersionValue;
 use nucleus_txn::locks::{LockManager, RelLockMode};
 use nucleus_txn::read::{read_key, scan, NoSsi};
 use nucleus_txn::ssi::Ssi;
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
-use nucleus_txn::write::{LockWait, StmtCtx, UniqueRule};
+use nucleus_txn::write::{
+    CommittedVersion, Epq, EpqDecision, LockWait, RowOp, RowOutcome, StmtCtx, UniqueRule,
+};
 use nucleus_txn::{Seq, Ts, TxnError, TxnId};
 
 use crate::defs::IndexDef;
 use crate::error::DbError;
+use crate::index::{self, IndexRow};
 
 /// The encoded primary key is limited to this many bytes (§3); the insert
 /// that exceeds it fails with 54000 ([`DbError::ProgramLimitExceeded`]).
@@ -38,6 +47,12 @@ pub const KEY_LIMIT: usize = 2704;
 /// A table opened by [`Db::open_table`]: the catalog as this statement sees
 /// it (§4: the latest committed catalog plus the txn's own earlier
 /// statements), pinned for the statement's DML and reads.
+///
+/// **Handle reuse:** a `TableHandle` is single-statement — the `_with` DML
+/// entry points accept it only in the `(txn, seq0)` statement whose
+/// `open_table` made it (a handle from another txn or a later statement is
+/// `TxnError::Invariant`, and a handle older than a concurrent index-state
+/// commit is the legal stale statement of C-T6 §7.3, never an error).
 #[derive(Debug, Clone)]
 pub struct TableHandle {
     /// The txn that opened the table (its rowids are drawn from it).
@@ -166,19 +181,7 @@ impl<K: OrderedKv> Db<K> {
             let view = self.core.open_view();
             Catalog::scan_idxs_of_rel(&self.core, &view, &own, oid).map_err(DbError::Txn)?
         };
-        let mut indexes = Vec::with_capacity(idxs.len());
-        for idx in idxs {
-            match idx.storage {
-                IdxStorage::Id(storage_id) => indexes.push(IndexHandle {
-                    oid: idx.oid,
-                    storage_id,
-                    def: IndexDef::decode(&idx.def)?,
-                }),
-                IdxStorage::Range(_, _) => {
-                    return Err(DbError::FeatureNotSupported("index storage ranges: C-T6b2"))
-                }
-            }
-        }
+        let indexes = index_handles(idxs)?;
         let schema = TableSchema::decode(&rel.def)?;
         let def_version = schema.version;
         Ok(TableHandle {
@@ -195,29 +198,223 @@ impl<K: OrderedKv> Db<K> {
 
     // ---- DML and reads (§4: the statement's relation lock first) --------
 
-    /// INSERT: RowExclusive on the relation (§4), the row encoded under
+    /// INSERT (§4/§6): RowExclusive on the relation, the row encoded under
     /// the handle's (latest) definition, then a key-existence insert of
-    /// the row key with the primary-key unique rule. A table with any
-    /// index on the handle refuses with 0A000 — index maintenance is
-    /// C-T6b2a. Hidden-rowid tables draw `ord` from the statement's
-    /// counter ([`Stmt::next_ord`]), so two inserts of one statement can
-    /// never collide.
+    /// the row key with the primary-key unique rule. Every WriteOnly or
+    /// Public index of the handle's list gets the new row's entry
+    /// (index maintenance); a DeleteOnly index gets nothing.
+    /// Hidden-rowid tables draw `ord` from the statement's counter
+    /// ([`Stmt::next_ord`]), so two inserts of one statement can never
+    /// collide.
     ///
-    /// §4 expects the writing statement's catalog read to happen under
-    /// RowExclusive or stronger: under the RowExclusive just taken, the
-    /// relation row is re-read at the latest committed catalog plus this
-    /// txn's earlier statements, and a handle whose `storage_id` or
-    /// `def_version` no longer matches it is refused with 55000
-    /// (`"stale table handle"`) — an own TRUNCATE in a later statement
-    /// must never key a row into a retired storage range, and a def
-    /// change since the opening must never encode a row under a stale
-    /// `natts`. Open a fresh handle in the writing statement instead.
+    /// The handle may come from another statement or txn (the C-T6b1
+    /// contract: it is re-validated below and its index list is never
+    /// trusted — the relation row is re-read under the RowExclusive just
+    /// taken at the latest committed catalog plus this txn's earlier
+    /// statements, a handle whose `storage_id` or `def_version` no longer
+    /// matches it is refused with 55000 `"stale table handle"`, and the
+    /// **index rows are re-scanned at the same read** so a CREATE INDEX
+    /// committed since the opening is maintained, never silently missed).
+    /// For a statement-scoped handle use [`Db::insert_with`].
     pub fn insert(
         &self,
         st: &Stmt<'_>,
         t: &TableHandle,
         live: &[Option<Datum>],
     ) -> Result<(), DbError> {
+        self.lock_and_validate(st, t)?;
+        // §4/M-3: the writer's catalog read covers the index rows too; a
+        // possibly-stale handle's list is never used to maintain.
+        let own = writer_ctx(st, self.core.visible_ts());
+        let indexes = self.scan_index_handles(&own, t.oid)?;
+        self.write_insert(st, t, live, indexes)
+    }
+
+    /// [`Db::insert`] for a statement-scoped handle (item 4a): the handle
+    /// must be the one this very statement's `open_table(RowExclusive..)`
+    /// made — its RowExclusive was taken before its catalog read, and no
+    /// `ROLLBACK TO` runs inside a statement, so the lock is held
+    /// throughout. Anything else is `TxnError::Invariant` **before any
+    /// catalog read**: a cross-statement or cross-txn handle is a caller
+    /// bug (the pre-CREATE-INDEX, pre-DROP and pre-TRUNCATE stale-handle
+    /// paths of the C-T6b1-fix gate's follow-ups all die here). The
+    /// handle's own index list is the statement's catalog read, so it is
+    /// exactly what this statement maintains — a concurrent SUE-mode
+    /// index-state commit makes the handle legally stale (C-T6 §7.3), and
+    /// the handle is never compared with the current catalog.
+    pub fn insert_with(
+        &self,
+        st: &Stmt<'_>,
+        t: &TableHandle,
+        live: &[Option<Datum>],
+    ) -> Result<(), DbError> {
+        check_handle(st, t)?;
+        self.lock_and_validate(st, t)?;
+        self.write_insert(st, t, live, t.indexes.clone())
+    }
+
+    /// UPDATE by primary key (§5/§6): `open_table(RowExclusive)` then
+    /// [`Db::update_with`]. Returns whether a row was updated.
+    pub fn update(
+        &self,
+        st: &Stmt<'_>,
+        oid: u64,
+        pk: &[Option<Value>],
+        set: &[(u16, Option<Datum>)],
+    ) -> Result<bool, DbError> {
+        let t = self.open_table(st, oid, RelLockMode::RowExclusive)?;
+        self.update_with(st, &t, pk, set)
+    }
+
+    /// UPDATE by primary key through a statement-scoped handle (item 4a,
+    /// same contract as [`Db::insert_with`]): read the row at the
+    /// statement's snapshot (SER registers its SIREAD); absent →
+    /// `Ok(false)`. The new row is `set` re-applied to the base the row
+    /// op actually acted on — under RC EPQ (§5.2) that is the newest
+    /// committed version, and the callback returns `Apply(Update)` for it
+    /// (a tombstone skips); without EPQ it is the read row. `set`
+    /// assignments name 1-based attnums; an unknown attnum is 42703. A
+    /// primary-key change goes through `update_pk` (§5.0; the §3 key
+    /// limit applies to the new key). After `Applied`, every index of the
+    /// handle is maintained per its state with the old entries computed
+    /// from the EPQ base (index maintenance); `Skipped` →
+    /// `Ok(false)`.
+    pub fn update_with(
+        &self,
+        st: &Stmt<'_>,
+        t: &TableHandle,
+        pk: &[Option<Value>],
+        set: &[(u16, Option<Datum>)],
+    ) -> Result<bool, DbError> {
+        check_handle(st, t)?;
+        if t.schema.hidden_rowid {
+            return Err(DbError::FeatureNotSupported("rowid updates"));
+        }
+        let key = pk_key(t.storage_id, &t.schema, pk)?;
+        let Some(read) = self.read_row_bytes(st, &key)? else {
+            return Ok(false);
+        };
+        // No EPQ yet: the base is the read row, and `set` applies to it.
+        let mut epq = UpdateEpq::new(t, set, read)?;
+        let outcome = if pks_differ(pk, &epq.last.new_pk) {
+            let new_key = pk_key(t.storage_id, &t.schema, &epq.last.new_pk)?;
+            self.core
+                .update_pk(
+                    st.txn,
+                    &key,
+                    &new_key,
+                    epq.last.new_bytes.clone(),
+                    st.ctx(),
+                    &mut epq,
+                )
+                .map_err(DbError::Txn)?
+        } else {
+            self.core
+                .row_op(
+                    st.txn,
+                    &key,
+                    None,
+                    RowOp::Update {
+                        value: epq.last.new_bytes.clone(),
+                        key_cols_changed: epq.last.key_cols_changed,
+                    },
+                    st.ctx(),
+                    &mut epq,
+                )
+                .map_err(DbError::Txn)?
+        };
+        if let Some(err) = epq.error.take() {
+            return Err(err);
+        }
+        match outcome {
+            RowOutcome::Applied => {}
+            RowOutcome::Skipped(_) => return Ok(false),
+        }
+        let base_live = t.schema.decode_row(&epq.base_bytes)?;
+        let new_key = if pks_differ(pk, &epq.last.new_pk) {
+            pk_key(t.storage_id, &t.schema, &epq.last.new_pk)?
+        } else {
+            key.clone()
+        };
+        let new_live = t.schema.decode_row(&epq.last.new_bytes)?;
+        index::maintain_update(
+            &self.core,
+            st.txn,
+            &st.ctx(),
+            t,
+            &t.indexes,
+            IndexRow {
+                key: &key,
+                live: &base_live,
+            },
+            IndexRow {
+                key: &new_key,
+                live: &new_live,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// DELETE by primary key (§5/§6): `open_table(RowExclusive)` then
+    /// [`Db::delete_with`]. Returns whether a row was deleted.
+    pub fn delete(&self, st: &Stmt<'_>, oid: u64, pk: &[Option<Value>]) -> Result<bool, DbError> {
+        let t = self.open_table(st, oid, RelLockMode::RowExclusive)?;
+        self.delete_with(st, &t, pk)
+    }
+
+    /// DELETE by primary key through a statement-scoped handle (item 4a,
+    /// same contract as [`Db::insert_with`]): the same read/EPQ pattern
+    /// as [`Db::update_with`] with `RowOp::Delete`; after `Applied`,
+    /// every entry of the base version is deleted in **every** index
+    /// state, blindly through `Core::delete_entry` (§5.0) — so the delete
+    /// never skips and never raises 40001 (§6).
+    pub fn delete_with(
+        &self,
+        st: &Stmt<'_>,
+        t: &TableHandle,
+        pk: &[Option<Value>],
+    ) -> Result<bool, DbError> {
+        check_handle(st, t)?;
+        if t.schema.hidden_rowid {
+            return Err(DbError::FeatureNotSupported("rowid deletes"));
+        }
+        let key = pk_key(t.storage_id, &t.schema, pk)?;
+        let Some(read) = self.read_row_bytes(st, &key)? else {
+            return Ok(false);
+        };
+        let mut epq = DeleteEpq { base_bytes: read };
+        let outcome = self
+            .core
+            .row_op(st.txn, &key, None, RowOp::Delete, st.ctx(), &mut epq)
+            .map_err(DbError::Txn)?;
+        match outcome {
+            RowOutcome::Applied => {}
+            RowOutcome::Skipped(_) => return Ok(false),
+        }
+        let base_live = t.schema.decode_row(&epq.base_bytes)?;
+        index::maintain_delete(
+            &self.core,
+            st.txn,
+            &st.ctx(),
+            t,
+            &t.indexes,
+            IndexRow {
+                key: &key,
+                live: &base_live,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// The §4 writer's read of [`Db::insert`]: RowExclusive, then the
+    /// relation row re-read at the latest committed catalog plus the txn's
+    /// earlier statements — a handle the catalog has moved under is
+    /// refused with 55000, an absent row with 42P01 (never write into a
+    /// dropped or retired storage). Belt-and-braces for
+    /// [`Db::insert_with`] too: a statement-scoped handle's relation row
+    /// cannot move (every rel-row DDL holds AccessExclusive, which
+    /// conflicts with the statement's own RowExclusive).
+    fn lock_and_validate(&self, st: &Stmt<'_>, t: &TableHandle) -> Result<(), DbError> {
         self.locks
             .lock_relation(
                 &self.core,
@@ -228,25 +425,11 @@ impl<K: OrderedKv> Db<K> {
                 None,
             )
             .map_err(DbError::Txn)?;
-        // §4: a statement that writes a relation reads its catalog rows
-        // only while holding RowExclusive or stronger. The handle's read
-        // was made by its opening statement — possibly under a weaker
-        // lock, possibly before the catalog moved. Re-read the relation
-        // row under the RowExclusive just taken, at the latest committed
-        // catalog plus this txn's earlier statements, and refuse a
-        // handle the catalog has moved under.
+        let own = writer_ctx(st, self.core.visible_ts());
         let rel = {
-            let own = ReadCtx {
-                txn: st.txn.id,
-                snapshot: self.core.visible_ts(),
-                stmt_seq: st.seq0,
-            };
             let view = self.core.open_view();
             Catalog::read_rel(&self.core, &view, &own, t.oid).map_err(DbError::Txn)?
         };
-        // An absent row can only follow an own DROP in a later statement
-        // or a foreign DROP committed since the opening: refuse exactly
-        // as `open_table` does, never write into a dropped storage.
         let Some(rel) = rel else {
             return Err(DbError::UndefinedTable);
         };
@@ -254,9 +437,30 @@ impl<K: OrderedKv> Db<K> {
         if rel.storage_id != t.storage_id || def_version != t.def_version {
             return Err(DbError::ObjectNotInPrerequisiteState("stale table handle"));
         }
-        if !t.indexes.is_empty() {
-            return Err(DbError::FeatureNotSupported("index maintenance: C-T6b2a"));
-        }
+        Ok(())
+    }
+
+    /// The index rows of relation `oid` at the writer's read of `own`
+    /// (§4): the statement's catalog read covers them too.
+    fn scan_index_handles(&self, own: &ReadCtx, oid: u64) -> Result<Vec<IndexHandle>, DbError> {
+        let idxs = {
+            let view = self.core.open_view();
+            Catalog::scan_idxs_of_rel(&self.core, &view, own, oid).map_err(DbError::Txn)?
+        };
+        index_handles(idxs)
+    }
+
+    /// The shared body of [`Db::insert`] and [`Db::insert_with`]: the row
+    /// key, the key-existence insert, then index maintenance for `indexes`
+    /// (the statement's own list for `_with`, the fresh scan for the
+    /// legacy path).
+    fn write_insert(
+        &self,
+        st: &Stmt<'_>,
+        t: &TableHandle,
+        live: &[Option<Datum>],
+        indexes: Vec<IndexHandle>,
+    ) -> Result<(), DbError> {
         let value = t.schema.encode_row(live)?;
         let key = if t.schema.hidden_rowid {
             let ord = st.next_ord()?;
@@ -275,7 +479,33 @@ impl<K: OrderedKv> Db<K> {
                 UniqueRule::Unique { same_row: None },
             )
             .map_err(DbError::Txn)?;
+        index::maintain_insert(
+            &self.core,
+            st.txn,
+            &st.ctx(),
+            t,
+            &indexes,
+            IndexRow { key: &key, live },
+        )?;
         Ok(())
+    }
+
+    /// The row bytes of `key` at the statement's snapshot (§4): SER
+    /// registers the SIREAD (§8.1); other levels read through a plain
+    /// registered view. `None` = not found (including tombstones).
+    fn read_row_bytes(&self, st: &Stmt<'_>, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
+        let ctx = st.read_ctx();
+        let found = match st.txn.isolation {
+            Isolation::Serializable => self
+                .ssi
+                .read_key(&self.core, st.txn.id, key, &ctx)
+                .map_err(DbError::Txn)?,
+            _ => {
+                let view = self.core.open_view();
+                read_key(&self.core, &view, key, &ctx, &mut NoSsi).map_err(DbError::Txn)?
+            }
+        };
+        Ok(found)
     }
 
     /// Point read of the primary-key row `pk` (one value per pk column,
@@ -366,6 +596,192 @@ impl<K: OrderedKv> Db<K> {
         }
         Ok(out)
     }
+}
+
+// ---- handle checks, keys-by-oid and the row-level EPQ (§5.2) ------------------
+
+/// The writer's §4 read ctx: the latest committed catalog plus this txn's
+/// earlier statements (`seq < seq0`).
+fn writer_ctx(st: &Stmt<'_>, visible_ts: Ts) -> ReadCtx {
+    ReadCtx {
+        txn: st.txn.id,
+        snapshot: visible_ts,
+        stmt_seq: st.seq0,
+    }
+}
+
+/// Item 4a's statement-scoped handle contract: the `_with` DML entry
+/// points accept a handle only from the `(txn, seq0)` statement whose
+/// `open_table` made it — one statement, so the RowExclusive was taken
+/// before the handle's catalog read and is held throughout (no
+/// `ROLLBACK TO` runs inside a statement). A handle from another txn or a
+/// later statement is `TxnError::Invariant` **before any catalog read**
+/// (the C-T6b1-fix gate's cross-statement stale-handle paths all die
+/// here). The handle is never compared with the current catalog: a handle
+/// older than a concurrent index-state commit is the legal stale
+/// statement of C-T6 §7.3.
+fn check_handle(st: &Stmt<'_>, t: &TableHandle) -> Result<(), DbError> {
+    if t.txn != st.txn.id || t.seq0 != st.seq0 {
+        return Err(DbError::Txn(TxnError::Invariant(format!(
+            "table handle opened by txn {:?} stmt {} used in txn {:?} stmt {}: open a fresh handle per statement",
+            t.txn, t.seq0, st.txn.id, st.seq0
+        ))));
+    }
+    // §4: a statement that writes a relation reads its catalog rows only
+    // while holding RowExclusive or stronger — a handle opened at a read
+    // mode is not a writer's catalog read.
+    if !matches!(
+        t.lock,
+        RelLockMode::RowExclusive | RelLockMode::Exclusive | RelLockMode::AccessExclusive
+    ) {
+        return Err(DbError::Txn(TxnError::Invariant(format!(
+            "table handle of relation {} opened at {:?}: DML needs a handle opened at RowExclusive or stronger (§4)",
+            t.oid, t.lock
+        ))));
+    }
+    Ok(())
+}
+
+/// Decodes the index rows a catalog scan returned into handles (§4). An
+/// index with an explicit entry range has no storage id the typed layer
+/// can name: 0A000 (C-T6b2).
+fn index_handles(idxs: Vec<nucleus_txn::catalog::IdxRow>) -> Result<Vec<IndexHandle>, DbError> {
+    let mut indexes = Vec::with_capacity(idxs.len());
+    for idx in idxs {
+        match idx.storage {
+            IdxStorage::Id(storage_id) => indexes.push(IndexHandle {
+                oid: idx.oid,
+                storage_id,
+                def: IndexDef::decode(&idx.def)?,
+            }),
+            IdxStorage::Range(_, _) => {
+                return Err(DbError::FeatureNotSupported("index storage ranges: C-T6b2"))
+            }
+        }
+    }
+    Ok(indexes)
+}
+
+/// `set` applied to one base row (§3 lazy upgrade at the current version):
+/// the encoded new row, its pk values and the caller's `key_cols_changed`
+/// verdict.
+struct Applied {
+    new_bytes: Vec<u8>,
+    new_pk: Vec<Option<Value>>,
+    key_cols_changed: bool,
+}
+
+fn apply_set(
+    t: &TableHandle,
+    set: &[(u16, Option<Datum>)],
+    base_bytes: &[u8],
+) -> Result<Applied, DbError> {
+    let base = t.schema.decode_row(base_bytes)?;
+    let mut live = base.clone();
+    for &(attnum, ref datum) in set {
+        let Some(pos) = t.schema.live_columns().position(|c| c.attnum == attnum) else {
+            return Err(DbError::UndefinedColumn);
+        };
+        live[pos] = datum.clone();
+    }
+    let key_cols_changed = index::key_cols_changed(&t.schema, &t.indexes, set, &base);
+    let new_bytes = t.schema.encode_row(&live)?;
+    let new_pk = pk_values(&t.schema, &live)?;
+    Ok(Applied {
+        new_bytes,
+        new_pk,
+        key_cols_changed,
+    })
+}
+
+/// The UPDATE row-level EPQ (§5.2): re-evaluate the statement against the
+/// newest committed version — decode it, re-apply `set`, `Apply(Update)`
+/// (a tombstone is `Skip`) — and remember the base, which is where entry
+/// maintenance is computed from. With no EPQ pass the base stays the read
+/// row.
+struct UpdateEpq<'a> {
+    t: &'a TableHandle,
+    set: &'a [(u16, Option<Datum>)],
+    /// The base version of the last pass (the read row until a pass
+    /// re-bases on a newer committed version).
+    base_bytes: Vec<u8>,
+    /// The new row of the last pass.
+    last: Applied,
+    /// An error a `recheck` could not report through the `Epq` trait
+    /// (the trait has no `Result`); surfaced by the caller.
+    error: Option<DbError>,
+}
+
+impl<'a> UpdateEpq<'a> {
+    fn new(
+        t: &'a TableHandle,
+        set: &'a [(u16, Option<Datum>)],
+        read_bytes: Vec<u8>,
+    ) -> Result<UpdateEpq<'a>, DbError> {
+        let last = apply_set(t, set, &read_bytes)?;
+        Ok(UpdateEpq {
+            t,
+            set,
+            base_bytes: read_bytes,
+            last,
+            error: None,
+        })
+    }
+}
+
+impl Epq for UpdateEpq<'_> {
+    fn recheck(&mut self, newest: &CommittedVersion) -> EpqDecision {
+        let payload = match &newest.value {
+            VersionValue::Live { payload, .. } => payload.clone(),
+            // §5.2: the row is gone; §5.1's pre-rules usually answer
+            // before the callback runs, this is the same verdict.
+            VersionValue::Tombstone { .. } => return EpqDecision::Skip,
+        };
+        self.base_bytes = payload;
+        match apply_set(self.t, self.set, &self.base_bytes) {
+            Ok(applied) => {
+                let decision = EpqDecision::Apply(RowOp::Update {
+                    value: applied.new_bytes.clone(),
+                    key_cols_changed: applied.key_cols_changed,
+                });
+                self.last = applied;
+                decision
+            }
+            Err(err) => {
+                self.error = Some(err);
+                EpqDecision::Skip
+            }
+        }
+    }
+}
+
+/// The DELETE row-level EPQ: the newest committed version is the base the
+/// row op (and entry maintenance) acts on; a tombstone skips.
+struct DeleteEpq {
+    base_bytes: Vec<u8>,
+}
+
+impl Epq for DeleteEpq {
+    fn recheck(&mut self, newest: &CommittedVersion) -> EpqDecision {
+        match &newest.value {
+            VersionValue::Live { payload, .. } => {
+                self.base_bytes = payload.clone();
+                EpqDecision::Apply(RowOp::Delete)
+            }
+            VersionValue::Tombstone { .. } => EpqDecision::Skip,
+        }
+    }
+}
+
+/// Whether two pk value lists name different rows (representation-faithful
+/// for floats, NULL-aware).
+fn pks_differ(a: &[Option<Value>], b: &[Option<Value>]) -> bool {
+    a.len() != b.len()
+        || a.iter().zip(b).any(|(x, y)| match (x, y) {
+            (Some(x), Some(y)) => !value_repr_eq(x, y),
+            (None, None) => false,
+            _ => true,
+        })
 }
 
 /// One statement's position (§4, §5): the txn, its snapshot and the
