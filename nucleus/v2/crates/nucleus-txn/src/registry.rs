@@ -290,7 +290,36 @@ impl<'a, S: Snapshot> ViewGuard<'a, S> {
         // C-R0bFIX (M-1): as `get`, for scans — the check fires when the
         // scan is created through the guard (e.g. inside `read::scan`).
         crate::rt::check(crate::rt::Blocking::KvIo, "ViewGuard::scan");
-        self.snap.scan(range, reverse)
+        // C-R0bFIX-2 (L-A): a scan's KV reads happen in `next()`, which
+        // runs wherever the caller pulls the iterator — possibly after a
+        // mark transition (created in a blocking section, iterated back
+        // on the executor). The creation check stays (it refuses before
+        // the first pull); every `next()` re-checks, closing that hole.
+        Box::new(CheckingScan {
+            inner: self.snap.scan(range, reverse),
+        })
+    }
+}
+
+/// The iterator [`ViewGuard::scan`] returns (C-R0bFIX-2, L-A): the KV
+/// snapshot's scan iterator with the executor-thread check repeated on
+/// every `next()`. A scan is consumed lazily, so it can be created while
+/// the thread is unmarked (off-executor, or inside
+/// [`allow_blocking`](crate::rt::allow_blocking)) and pulled once the
+/// thread is marked; the creation-time check alone cannot see that
+/// transition — the per-`next()` check can. Private, and `!Send` like the
+/// iterator it wraps, so it never crosses threads itself.
+struct CheckingScan<'b> {
+    inner: Box<dyn Iterator<Item = nucleus_kv::Result<(Key, Value)>> + 'b>,
+}
+
+impl Iterator for CheckingScan<'_> {
+    type Item = nucleus_kv::Result<(Key, Value)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Before the KV read, so a refusal leaves the iterator usable.
+        crate::rt::check(crate::rt::Blocking::KvIo, "ViewGuard::scan");
+        self.inner.next()
     }
 }
 
