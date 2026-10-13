@@ -5,9 +5,10 @@
 //! dimensions. Canonicalisation is the type input function's job; a row
 //! stores what it was given.
 
-use super::{is_null_bit, nullmap_len, set_null_bit};
-use crate::encode::MAX_JSONB_DEPTH;
+use super::{is_null_bit, nullmap_len, padding_bits_clear, set_null_bit};
+use crate::encode::{check_dims, MAX_ARRAY_DIMS, MAX_JSONB_DEPTH};
 use crate::value::{Array, ArrayDim, Decimal, Interval, Jsonb, KeyType, Numeric, Value};
+use crate::CodecError;
 
 /// Value-level failure of the §2.1 bytes: either the value's variant does
 /// not match the declared type (the row level adds the attnum,
@@ -174,6 +175,9 @@ fn array(elem: &KeyType, a: &Array, out: &mut Vec<u8>) -> Result<(), ValueError>
     if matches!(elem, KeyType::Array(_)) {
         return Err(ValueError::Corrupt("array of array type"));
     }
+    // Shape is structure: the same rule the key codec enforces
+    // (C-Q3s §7), so an unshapely array is refused before any byte.
+    check_dims(a).map_err(shape_error)?;
     let ndims =
         u8::try_from(a.dims.len()).map_err(|_| ValueError::Corrupt("too many array dimensions"))?;
     out.push(ndims);
@@ -316,7 +320,14 @@ fn array_dec(elem: &KeyType, r: &mut ValueReader<'_>) -> Result<Array, ValueErro
         dims.push(ArrayDim { len, lower });
     }
     let nelems = r.u32be()? as usize;
+    // The shape is checked before any element is parsed (the encode-side
+    // rule, mirrored over the on-disk nelems), so a bogus dims/nelems
+    // pair cannot drive parsing.
+    check_dims_at(&dims, nelems)?;
     let nullmap = r.take(nullmap_len(nelems))?;
+    if !padding_bits_clear(nullmap, nelems) {
+        return Err(ValueError::Corrupt("nullmap padding bits set"));
+    }
     let mut elems = Vec::new();
     for i in 0..nelems {
         if is_null_bit(nullmap, i) {
@@ -327,7 +338,46 @@ fn array_dec(elem: &KeyType, r: &mut ValueReader<'_>) -> Result<Array, ValueErro
             elems.push(Some(decode_value(elem, bytes)?));
         }
     }
-    Ok(Array { dims, elems })
+    let a = Array { dims, elems };
+    // And the literal `check_dims` on the parsed array: it must agree
+    // with the pre-parse rule above.
+    check_dims(&a).map_err(shape_error)?;
+    Ok(a)
+}
+
+/// Maps the key codec's shape verdict (`check_dims`) onto the value
+/// error type.
+fn shape_error(e: CodecError) -> ValueError {
+    match e {
+        CodecError::InvalidValue(msg) => ValueError::Corrupt(msg),
+        _ => ValueError::Corrupt("invalid array shape"),
+    }
+}
+
+/// The decode-side shape rule: `check_dims` mirrored over
+/// `(dims, nelems)`, run before the elements are parsed. Keep in sync
+/// with `crate::encode::check_dims`; the post-parse call in
+/// [`array_dec`] fails loudly if they drift.
+fn check_dims_at(dims: &[ArrayDim], nelems: usize) -> Result<(), ValueError> {
+    if dims.len() > MAX_ARRAY_DIMS {
+        return Err(ValueError::Corrupt("too many array dimensions"));
+    }
+    if dims.is_empty() != (nelems == 0) {
+        return Err(ValueError::Corrupt("empty array must have no dimensions"));
+    }
+    let mut n: i64 = 1;
+    for d in dims {
+        if i64::from(d.len) < 1 || i64::from(d.lower) + i64::from(d.len) - 1 > i64::from(i32::MAX) {
+            return Err(ValueError::Corrupt("array dimension out of range"));
+        }
+        n = n.saturating_mul(i64::from(d.len));
+    }
+    if !dims.is_empty() && n != nelems as i64 {
+        return Err(ValueError::Corrupt(
+            "array dimensions do not match element count",
+        ));
+    }
+    Ok(())
 }
 
 struct ValueReader<'a> {

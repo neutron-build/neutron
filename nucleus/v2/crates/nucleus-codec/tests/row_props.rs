@@ -34,13 +34,15 @@ fn cfg() -> ProptestConfig {
 }
 
 /// One column of the encoding definition: a type, the value written (a
-/// NOT NULL column always gets one), and the flags.
+/// NOT NULL column always gets one), the flags, and whether the column
+/// is dropped after the write (the read definition then skips it).
 #[derive(Debug)]
 struct Spec {
     ty: KeyType,
     val: Option<Value>,
     not_null: bool,
     dropped: bool,
+    drop_after: bool,
 }
 
 fn spec() -> BoxedStrategy<Spec> {
@@ -51,16 +53,18 @@ fn spec() -> BoxedStrategy<Spec> {
                 typed_value(ty.clone()),
                 any::<bool>(),
                 any::<bool>(),
+                any::<bool>(),
             )
-                .prop_map(move |(opt, fallback, not_null, dropped)| {
+                .prop_map(move |(opt, fallback, not_null, dropped, drop_after)| {
                     // §3: DROP COLUMN clears not_null; a NOT NULL column is
                     // never written NULL.
-                    let not_null = not_null && !dropped;
+                    let not_null = not_null && !dropped && !drop_after;
                     Spec {
                         val: if not_null { Some(fallback) } else { opt },
                         ty: ty.clone(),
                         not_null,
                         dropped,
+                        drop_after,
                     }
                 })
         })
@@ -81,7 +85,9 @@ fn extra() -> BoxedStrategy<ExtraCol> {
 type RowCase = (u32, Vec<Spec>, Vec<ExtraCol>);
 
 fn row_case() -> BoxedStrategy<RowCase> {
-    (1u32..=1000, vec(spec(), 0..=6), vec(extra(), 0..=2)).boxed()
+    // Up to 20 columns, so the second and third nullmap bytes are
+    // exercised (C-T6a1 gate follow-up F1).
+    (1u32..=1000, vec(spec(), 0..=20), vec(extra(), 0..=2)).boxed()
 }
 
 fn def_of(specs: &[Spec], extras: &[ExtraCol]) -> Vec<ColumnDef> {
@@ -110,6 +116,20 @@ fn def_of(specs: &[Spec], extras: &[ExtraCol]) -> Vec<ColumnDef> {
     cols
 }
 
+/// The read-side definition: the write definition plus the extras, with
+/// the post-write drops applied (§3: DROP COLUMN sets `dropped` and
+/// clears `not_null`; the row's bytes stay as written).
+fn read_def_of(specs: &[Spec], extras: &[ExtraCol]) -> Vec<ColumnDef> {
+    let mut cols = def_of(specs, extras);
+    for (col, s) in cols.iter_mut().zip(specs) {
+        if s.drop_after {
+            col.dropped = true;
+            col.not_null = false;
+        }
+    }
+    cols
+}
+
 fn live_of(specs: &[Spec]) -> Vec<Option<Datum>> {
     specs
         .iter()
@@ -122,15 +142,17 @@ proptest! {
     #![proptest_config(cfg())]
 
     /// Random column lists and values round-trip by representation, and
-    /// the encoding is deterministic. Decoding under a definition with
-    /// extra columns serves `missing` (else NULL) for attnums past the
-    /// row's `natts` (§3 decode rule).
+    /// the encoding is deterministic. Decoding under a definition that
+    /// has since grown serves `missing` (else NULL) for attnums past
+    /// the row's `natts` (§3 decode rule), and one that has since
+    /// dropped columns skips them (C-T6a1 gate follow-up F2).
     #[test]
     fn rows_round_trip((version, specs, extras) in row_case()) {
         // Written under the original definition, read under one that has
-        // since grown (§3 decode rule: attnums past natts get `missing`).
+        // since grown (§3 decode rule: attnums past natts get `missing`)
+        // and dropped some of its columns after the write.
         let write_def = def_of(&specs, &[]);
-        let read_def = def_of(&specs, &extras);
+        let read_def = read_def_of(&specs, &extras);
         let live = live_of(&specs);
         let bytes = encode_row(version, &write_def, &live)
             .unwrap_or_else(|e| panic!("encode: {e:?}"));
@@ -142,7 +164,7 @@ proptest! {
             .unwrap_or_else(|e| panic!("decode: {e:?}"));
         let want: Vec<Option<Datum>> = specs
             .iter()
-            .filter(|s| !s.dropped)
+            .filter(|s| !s.dropped && !s.drop_after)
             .map(|s| s.val.clone().map(Datum::Inline))
             .chain(
                 // Columns beyond natts: the missing default, else NULL.

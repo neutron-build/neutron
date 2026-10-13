@@ -1,0 +1,12 @@
+# Wide-row golden corpus (card C-T6a2, C-T6a1 gate follow-up F1):
+# rows with more than 8 columns, so the nullmap's second (and third)
+# byte is pinned — byte (a-1)/8, bit (a-1)%8, LSB first (C-T6 §2).
+# Format: wide<natts> <TAB> literal <TAB> hex <TAB> dropped_attnum,
+# where the literal is one t/f/NULL entry per attnum 1..=natts and the
+# dropped attnum (always > 8) is written NULL and excluded from the
+# live list. Regenerate the hex column only with:
+#   cargo test -p nucleus-codec --test row_gen -- --ignored
+# natts	literal	hex	dropped
+wide9	t,f,t,t,t,f,t,NULL,NULL	52010000000100098001000000000101000000000100000000000101000000000101000000000101000000000100000000000101	9
+wide16	t,f,t,t,t,f,t,NULL,NULL,t,f,t,t,f,t,NULL	52010000000100108083000000000101000000000100000000000101000000000101000000000101000000000100000000000101000000000100000000000101000000000101000000000100000000000101	10
+wide17	t,f,t,t,t,f,t,NULL,NULL,t,f,t,t,f,t,NULL,NULL	5201000000010011808501000000000101000000000100000000000101000000000101000000000101000000000100000000000101000000000101000000000101000000000101000000000100000000000101	11

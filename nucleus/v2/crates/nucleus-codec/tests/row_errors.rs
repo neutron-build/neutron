@@ -6,7 +6,7 @@
 
 use nucleus_codec::row::{
     decode_row, decode_row_raw, decode_value, encode_row, encode_value, ColumnDef, Datum, RawDatum,
-    RowError, ToastPointer,
+    RowError, ToastPointer, ValueError,
 };
 use nucleus_codec::{Collation, Decimal, KeyType, Numeric, Value};
 
@@ -452,11 +452,286 @@ fn invalid_definitions() {
     );
 }
 
+/// F2 (C-T6a1 gate M-2): a pre-drop row with a toast pointer at an
+/// attnum that is later dropped, followed by a live inline column.
+/// `decode_row` returns the live value and skips the pointer;
+/// `decode_row_raw` keeps it (the §5 old-pointer sweep); truncation
+/// inside the skipped pointer is an error, never a misparse.
+#[test]
+fn dropped_toasted_column() {
+    let before = cols_def(&[KeyType::Text(Collation::C), KeyType::Int8]);
+    let ptr = ToastPointer {
+        id: [7u8; 20],
+        raw_len: 100_000,
+        chunks: 13,
+    };
+    let live: Vec<Option<Datum>> = vec![
+        Some(Datum::Toast(ptr)),
+        Some(Datum::Inline(Value::Int8(-9))),
+    ];
+    let bytes = encode_row(3, &before, &live).unwrap_or_else(|e| panic!("encode: {e:?}"));
+
+    let mut after = cols_def(&[KeyType::Text(Collation::C), KeyType::Int8]);
+    after[0].dropped = true;
+    assert_eq!(
+        Ok(vec![Some(Datum::Inline(Value::Int8(-9)))]),
+        decode_row(3, &after, &bytes),
+        "decode_row must return the live value past the dropped pointer"
+    );
+    let (_, raw) = decode_row_raw(&bytes).unwrap_or_else(|e| panic!("raw: {e:?}"));
+    assert_eq!(
+        vec![
+            Some(RawDatum::Toast(ptr)),
+            Some(RawDatum::Inline((-9i64).to_be_bytes().to_vec()))
+        ],
+        raw
+    );
+
+    // Truncation anywhere inside the skipped pointer is an error for
+    // the typed decode too (it must stay in sync with the raw one).
+    let ptr_at = 8 + 1; // header, nullmap
+    for cut in ptr_at + 1..bytes.len() {
+        assert!(
+            decode_row(3, &after, &bytes[..cut]).is_err(),
+            "decode_row accepted cut {cut}"
+        );
+    }
+}
+
+/// F3 (C-T6a1 gate M-3): array shape is validated on both sides of the
+/// row value bytes — the key codec's `check_dims` rules (C-Q3s §7):
+/// at most 6 dimensions, lengths >= 1, no dimensions iff empty, and the
+/// dims product must equal the element count.
+#[test]
+fn array_shape_rejected() {
+    use nucleus_codec::{Array, ArrayDim};
+    let arr = KeyType::Array(Box::new(KeyType::Int4));
+
+    // One 1-dim int4 array value bytes: ndims, (len, lower), nelems,
+    // nullmap, length-prefixed elements.
+    fn array_bytes(dims: &[(i32, i32)], nelems: usize, nullmap: u8, elems: &[i32]) -> Vec<u8> {
+        let mut b = vec![dims.len() as u8];
+        for &(len, lower) in dims {
+            b.extend_from_slice(&len.to_be_bytes());
+            b.extend_from_slice(&lower.to_be_bytes());
+        }
+        b.extend_from_slice(&(nelems as u32).to_be_bytes());
+        b.push(nullmap);
+        for &e in elems {
+            b.extend_from_slice(&4u32.to_be_bytes());
+            b.extend_from_slice(&e.to_be_bytes());
+        }
+        b
+    }
+
+    // Decode side.
+    let seven_dims = [(1i32, 1i32); 7];
+    assert_eq!(
+        Err(ValueError::Corrupt("too many array dimensions")),
+        decode_value(&arr, &array_bytes(&seven_dims, 7, 0, &[7; 1]))
+    );
+    assert_eq!(
+        Err(ValueError::Corrupt("array dimension out of range")),
+        decode_value(&arr, &array_bytes(&[(-1, 1)], 1, 0, &[1]))
+    );
+    assert_eq!(
+        Err(ValueError::Corrupt(
+            "array dimensions do not match element count"
+        )),
+        decode_value(&arr, &array_bytes(&[(5, 1)], 1, 0, &[1]))
+    );
+    assert_eq!(
+        Err(ValueError::Corrupt("empty array must have no dimensions")),
+        decode_value(&arr, &array_bytes(&[], 2, 0, &[1, 2]))
+    );
+    // The same errors through a full row (the datum frames the bytes).
+    let cols = cols_def(&[KeyType::Array(Box::new(KeyType::Int4))]);
+    let mut row = Vec::new();
+    row.extend_from_slice(&[0x52, 0x01, 0, 0, 0, 1, 0, 1, 0]);
+    row.push(0x00); // tag inline
+    let vb = array_bytes(&[(5, 1)], 1, 0, &[1]);
+    row.extend_from_slice(&(vb.len() as u32).to_be_bytes());
+    row.extend_from_slice(&vb);
+    assert_eq!(
+        Err(RowError::Corrupt(
+            "array dimensions do not match element count"
+        )),
+        dec(&cols, &row)
+    );
+
+    // Encode side: shape is refused before any byte is written.
+    let shaped = |dims: Vec<ArrayDim>, elems: Vec<Option<Value>>| {
+        encode_value(&arr, &Value::Array(Array { dims, elems }), &mut Vec::new())
+    };
+    // The positive control first: a well-shaped array still encodes
+    // (and decodes).
+    assert_eq!(
+        Ok(()),
+        shaped(
+            vec![ArrayDim { len: 2, lower: 1 }],
+            vec![Some(Value::Int4(1)), None]
+        )
+    );
+    assert!(decode_value(&arr, &array_bytes(&[(2, 1)], 2, 0b10, &[1])).is_ok());
+    // 7 dimensions.
+    assert_eq!(
+        Err(ValueError::Corrupt("too many array dimensions")),
+        shaped(
+            vec![ArrayDim { len: 1, lower: 1 }; 7],
+            vec![Some(Value::Int4(1))]
+        )
+    );
+    // A negative dimension length.
+    assert_eq!(
+        Err(ValueError::Corrupt("array dimension out of range")),
+        shaped(
+            vec![ArrayDim { len: -1, lower: 1 }],
+            vec![Some(Value::Int4(1))]
+        )
+    );
+    // The dims product must equal the element count.
+    assert_eq!(
+        Err(ValueError::Corrupt(
+            "array dimensions do not match element count"
+        )),
+        shaped(
+            vec![ArrayDim { len: 5, lower: 1 }],
+            vec![Some(Value::Int4(1))]
+        )
+    );
+    // Dimensions without elements.
+    assert_eq!(
+        Err(ValueError::Corrupt("empty array must have no dimensions")),
+        shaped(vec![ArrayDim { len: 1, lower: 1 }], vec![])
+    );
+    // And through a full row.
+    let mut cols = cols_def(&[KeyType::Array(Box::new(KeyType::Int4))]);
+    cols[0].not_null = false;
+    assert_eq!(
+        Err(RowError::Corrupt(
+            "array dimensions do not match element count"
+        )),
+        encode_row(
+            1,
+            &cols,
+            &[Some(Datum::Inline(Value::Array(Array {
+                dims: vec![ArrayDim { len: 5, lower: 1 }],
+                elems: vec![Some(Value::Int4(1))],
+            })))],
+        )
+    );
+}
+
+/// F4 (C-T6a1 gate L-1): the jsonb depth cap — 1000 nesting levels
+/// decode (and encode) fine, 1001 and 1,000,000 are errors, and
+/// nothing aborts.
+#[test]
+fn jsonb_depth_cap() {
+    use nucleus_codec::Jsonb;
+    // k nested one-element arrays around a null scalar: the scalar sits
+    // at depth k, the cap rejects depth > 1000.
+    fn nested_jsonb(k: usize) -> Jsonb {
+        let mut j = Jsonb::Null;
+        for _ in 0..k {
+            j = Jsonb::Array(vec![j]);
+        }
+        j
+    }
+    fn nested_bytes(k: usize) -> Vec<u8> {
+        let mut b = Vec::with_capacity(5 * k + 1);
+        for _ in 0..k {
+            b.push(0x05); // array tag
+            b.extend_from_slice(&1u32.to_be_bytes());
+        }
+        b.push(0x00); // null
+        b
+    }
+
+    let deep = Value::Jsonb(nested_jsonb(1000));
+    let mut vb = Vec::new();
+    encode_value(&KeyType::Jsonb, &deep, &mut vb)
+        .unwrap_or_else(|e| panic!("1000 levels must encode: {e:?}"));
+    assert_eq!(
+        nested_bytes(1000),
+        vb,
+        "the bytes are k array headers + null"
+    );
+    assert!(decode_value(&KeyType::Jsonb, &vb).is_ok());
+
+    let too_deep = Value::Jsonb(nested_jsonb(1001));
+    assert_eq!(
+        Err(ValueError::Corrupt("jsonb nesting too deep")),
+        encode_value(&KeyType::Jsonb, &too_deep, &mut Vec::new())
+    );
+    assert_eq!(
+        Err(ValueError::Corrupt("jsonb nesting too deep")),
+        decode_value(&KeyType::Jsonb, &nested_bytes(1001))
+    );
+    // A crafted million-level value errors without unwinding the stack.
+    assert_eq!(
+        Err(ValueError::Corrupt("jsonb nesting too deep")),
+        decode_value(&KeyType::Jsonb, &nested_bytes(1_000_000))
+    );
+}
+
+/// F4 (C-T6a1 gate L-3): §2's "bits past natts are 0" is enforced for
+/// the row nullmap and the array nullmap alike.
+#[test]
+fn nullmap_padding_rejected() {
+    use nucleus_codec::{Array, ArrayDim};
+
+    // Row: a 1-column NULL row (nullmap 01); bit 1 is padding.
+    let cols = cols_def(&[KeyType::Int4]);
+    let bytes = enc(&cols, &inline(vec![None]));
+    let mut bad = bytes.clone();
+    bad[8] = 0x03;
+    assert_eq!(
+        Err(RowError::Corrupt("nullmap padding bits set")),
+        dec(&cols, &bad)
+    );
+    assert_eq!(
+        Err(RowError::Corrupt("nullmap padding bits set")),
+        decode_row_raw(&bad).map(|_| ())
+    );
+
+    // Row: 9 columns, all NULL. Valid padding (byte 1 = 0x01, bit 8)
+    // decodes; bit 9 (0x02) is padding and rejected.
+    let nine: Vec<KeyType> = (0..9).map(|_| KeyType::Int4).collect();
+    let cols9 = cols_def(&nine);
+    let wide = enc(&cols9, &vec![None; 9]);
+    assert_eq!(&[0xFF, 0x01], &wide[8..10], "the valid nullmap");
+    assert!(dec(&cols9, &wide).is_ok());
+    let mut bad_wide = wide.clone();
+    bad_wide[9] = 0x03;
+    assert_eq!(
+        Err(RowError::Corrupt("nullmap padding bits set")),
+        dec(&cols9, &bad_wide)
+    );
+
+    // Array: {1, NULL} (nelems 2, nullmap 0b10); bit 2 is padding.
+    let arr = KeyType::Array(Box::new(KeyType::Int4));
+    let good = Value::Array(Array {
+        dims: vec![ArrayDim { len: 2, lower: 1 }],
+        elems: vec![Some(Value::Int4(1)), None],
+    });
+    let mut vb = Vec::new();
+    encode_value(&arr, &good, &mut vb).unwrap_or_else(|e| panic!("{e:?}"));
+    // ndims(1) + dim(8) + nelems(4) + nullmap(1) + one element (4 + 4).
+    assert_eq!(Some(&0b10u8), vb.get(vb.len() - 9), "the nullmap byte");
+    assert!(decode_value(&arr, &vb).is_ok());
+    let mut bad_arr = vb.clone();
+    let nullmap_at = bad_arr.len() - 9;
+    bad_arr[nullmap_at] = 0b110;
+    assert_eq!(
+        Err(ValueError::Corrupt("nullmap padding bits set")),
+        decode_value(&arr, &bad_arr)
+    );
+}
+
 /// §2.1 value-level failures: structurally broken byte sequences are
 /// errors, including truncation at every offset for the framed types.
 #[test]
 fn value_bytes_errors() {
-    use nucleus_codec::row::ValueError;
     let err = |ty: &KeyType, bytes: &[u8]| decode_value(ty, bytes).is_err();
     assert!(err(&KeyType::Bool, &[0x02]));
     assert!(err(&KeyType::Bool, &[]));
