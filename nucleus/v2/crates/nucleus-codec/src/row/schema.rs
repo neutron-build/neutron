@@ -339,13 +339,16 @@ impl TableSchema {
     }
 }
 
+/// §3: DROP COLUMN sets `dropped` and clears `not_null`, so a dropped
+/// column never carries bit0. No DDL path can build the combination;
+/// `encode` canonicalizes a hand-built state rather than persist it.
 fn flag_bits(col: &ColumnDef) -> u8 {
+    if col.dropped {
+        return FLAG_DROPPED;
+    }
     let mut bits = 0u8;
     if col.not_null {
         bits |= FLAG_NOT_NULL;
-    }
-    if col.dropped {
-        bits |= FLAG_DROPPED;
     }
     bits
 }

@@ -53,8 +53,10 @@ fn def_cases() -> Vec<(&'static str, &'static str, TableSchema)> {
     let mut flagged = cd(1, "c", KeyType::Int4);
     flagged.not_null = true;
     let mut dropped = cd(1, "c", KeyType::Int4);
+    // The DDL-producible state (drop_column clears not_null, §3). A
+    // hand-built not_null is canonicalized away by encode — pinned by
+    // encode_canonicalizes_dropped_not_null below (gate follow-up f2).
     dropped.dropped = true;
-    dropped.not_null = true; // §3: DROP COLUMN clears it; the def must show bit1 only
     let mut missing = cd(1, "c", KeyType::Int4);
     missing.missing = Some(Value::Int4(7));
     let mut missing_text = cd(1, "c", KeyType::Text(Collation::C));
@@ -222,6 +224,26 @@ fn def_truncation_at_every_offset() {
             );
         }
     }
+}
+
+/// Gate follow-up f2: `encode` canonicalizes the dropped state — a
+/// hand-built `dropped` + `not_null` column, impossible via DDL (DROP
+/// COLUMN clears `not_null`, §3), encodes with flags bit1 only, and
+/// bit0 does not survive the round trip.
+#[test]
+fn encode_canonicalizes_dropped_not_null() {
+    let mut hand = cd(1, "c", KeyType::Int4);
+    hand.dropped = true;
+    hand.not_null = true;
+    let bytes = sch(vec![hand], vec![])
+        .encode()
+        .unwrap_or_else(|e| panic!("encode: {e:?}"));
+    // 5401 | 00000001 | 01 | 0001 | 0001 | 00000001 | 63 'c' | 03 tag |
+    // flags | 0000 npk: the flags byte is byte 17.
+    assert_eq!(0x02, bytes[17], "a dropped column must show bit1 only");
+    let back = TableSchema::decode(&bytes).unwrap_or_else(|e| panic!("decode: {e:?}"));
+    assert!(back.columns[0].dropped);
+    assert!(!back.columns[0].not_null);
 }
 
 /// Hand-assembled §3 bytes, so the corrupt cases do not depend on the
