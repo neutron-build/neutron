@@ -19,6 +19,10 @@ pub enum DbError {
     /// 42P01.
     #[error("relation does not exist")]
     UndefinedTable,
+    /// 42704 (an index the catalog has no row for at the statement's
+    /// read).
+    #[error("object does not exist")]
+    UndefinedObject,
     /// 42703.
     #[error("column does not exist")]
     UndefinedColumn,
@@ -74,6 +78,7 @@ impl DbError {
             DbError::Row(RowError::Arity { .. }) => "XX000",
             DbError::Row(RowError::InvalidDdl(_)) => "XX000",
             DbError::UndefinedTable => "42P01",
+            DbError::UndefinedObject => "42704",
             DbError::UndefinedColumn => "42703",
             DbError::DuplicateColumn => "42701",
             DbError::NotNullViolation => "23502",
@@ -96,6 +101,7 @@ mod tests {
     #[test]
     fn sqlstates_are_pinned() {
         assert_eq!(DbError::UndefinedTable.sqlstate(), "42P01");
+        assert_eq!(DbError::UndefinedObject.sqlstate(), "42704");
         assert_eq!(DbError::UndefinedColumn.sqlstate(), "42703");
         assert_eq!(DbError::DuplicateColumn.sqlstate(), "42701");
         assert_eq!(

@@ -7,11 +7,12 @@
 //! on top of `nucleus-txn`, which stays normative for every
 //! transactional rule.
 //!
-//! Not here yet: CREATE INDEX and index scans (C-T6b2b), ALTER TABLE's
-//! validating scans and rewrites (C-T6b3a/C-T6r), large values (§5
-//! chunks) — and a unique index born DeleteOnly/WriteOnly cannot exist
-//! through the SQL layer in 2.0 (§6: the online path never builds unique
-//! indexes).
+//! Not here yet: ALTER TABLE's validating scans and rewrites
+//! (C-T6b3a/C-T6r), large values (§5 chunks) and the online index build
+//! ladder (§7, C-T6e) — CREATE INDEX itself is C-T6 §6.1's born-public
+//! path ([`Db::create_index`]), and a unique index born DeleteOnly or
+//! WriteOnly cannot exist through the SQL layer in 2.0 (§6: the online
+//! path never builds unique indexes).
 
 pub mod db;
 pub mod ddl;

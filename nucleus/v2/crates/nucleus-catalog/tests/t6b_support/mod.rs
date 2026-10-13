@@ -360,6 +360,169 @@ impl Default for Rig {
     }
 }
 
+// ---- C-T6b2b: a rig with a live commit thread + raw entry inspection ---
+
+/// A rig whose commit pipeline runs on a real background thread
+/// ([`spawn_commit_thread_with`]) instead of the hand-driven channel: for
+/// entry points that begin, run and commit a txn by themselves and block
+/// for the ack ([`create_index_own_txn`](nucleus_catalog::ddl::create_index_own_txn)).
+/// Call [`ThreadedRig::shutdown`] when done (Drop only detaches the
+/// thread).
+pub struct ThreadedRig {
+    pub db: Db<SharedFault>,
+    pub kv: Arc<Fault<MemKv>>,
+    commit: nucleus_txn::commit::CommitThreadHandle,
+}
+
+impl ThreadedRig {
+    pub fn new() -> ThreadedRig {
+        let kv = Arc::new(Fault::new(MemKv::new(), || Ok(MemKv::new())));
+        let core = Arc::new(ok(Core::open(SharedFault(kv.clone()))));
+        let ssi = Ssi::install(&core);
+        let locks = LockManager::install(&core);
+        let catalog = ok(Catalog::open(&core, &ssi, &locks));
+        let db = Db::new(core.clone(), ssi.clone(), locks.clone(), catalog);
+        let commit = ok(nucleus_txn::commit::spawn_commit_thread_with(
+            Arc::clone(&core),
+            CommitConfig::new().with_observer(ssi.commit_observer()),
+        ));
+        ThreadedRig { db, kv, commit }
+    }
+
+    pub fn core(&self) -> &Arc<Core<SharedFault>> {
+        &self.db.core
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.db.catalog
+    }
+
+    /// A fresh RC txn.
+    pub fn rc(&self) -> Txn {
+        self.core().begin(Isolation::ReadCommitted)
+    }
+
+    /// A fresh statement for `txn` at snapshot `s`.
+    pub fn stmt<'t>(&self, txn: &'t Txn, s: Ts) -> Stmt<'t> {
+        ok(Stmt::new(txn, s))
+    }
+
+    /// Resolves every queued intent (§7.3 through the resolver).
+    pub fn settle(&self) {
+        ok(Resolver::run_once(self.core()));
+    }
+
+    /// Submit through the running commit thread, wait for the ack,
+    /// resolve — for a plain (non-SER) txn.
+    pub fn commit_rc(&self, txn: Txn) -> Result<Ts, TxnError> {
+        let ts = self
+            .core()
+            .commit(txn, nucleus_txn::commit::SyncCommit::On)?;
+        self.settle();
+        Ok(ts)
+    }
+
+    /// §7.1 abort + cleanup, for a plain (non-SER) txn.
+    pub fn abort_txn(&self, txn: Txn) {
+        ok(self.core().abort(txn));
+        self.settle();
+    }
+
+    /// Index `oid`'s catalog row at `visible_ts`.
+    pub fn idx_row(&self, idx_oid: u64) -> Option<IdxRow> {
+        let view = self.core().open_view();
+        let ctx = ReadCtx {
+            txn: TxnId {
+                epoch: self.core().epoch(),
+                n: u64::MAX,
+            },
+            snapshot: self.core().visible_ts(),
+            stmt_seq: 1,
+        };
+        ok(Catalog::read_idx(self.core(), &view, &ctx, idx_oid))
+    }
+
+    /// The visible entries of index storage `isid` at `visible_ts`
+    /// (both entry ranges — the same oracle [`Rig::scan_entries`] is).
+    pub fn scan_entries(&self, isid: u64) -> Vec<(Key, Vec<u8>)> {
+        let ctx = ReadCtx {
+            txn: TxnId {
+                epoch: self.core().epoch(),
+                n: u64::MAX,
+            },
+            snapshot: self.core().visible_ts(),
+            stmt_seq: 1,
+        };
+        let mut out = Vec::new();
+        for (lo, hi) in nucleus_txn::catalog::index_ranges(isid) {
+            let view = self.core().open_view();
+            let rows = ok(nucleus_txn::read::scan(
+                self.core(),
+                &view,
+                (
+                    std::ops::Bound::Included(lo.as_slice()),
+                    std::ops::Bound::Excluded(hi.as_slice()),
+                ),
+                &ctx,
+                &mut nucleus_txn::read::NoSsi,
+            )
+            .collect::<Result<Vec<_>, _>>());
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// Stops the commit thread (processing what precedes the stop) and
+    /// joins it. A hang is a failure, never a pass.
+    pub fn shutdown(self) {
+        ok(self.commit.shutdown());
+    }
+}
+
+impl Default for ThreadedRig {
+    fn default() -> Self {
+        ThreadedRig::new()
+    }
+}
+
+/// Every stored entry (intent or version, any index storage) under the
+/// `/i/` and `/u/` keyspaces: the "no entry anywhere survived" oracle for
+/// an aborted or rolled-back CREATE INDEX whose storage id was never
+/// committed and so cannot be named.
+pub fn raw_entry_trace(rig: &Rig) -> Vec<Key> {
+    use nucleus_kv::{OrderedKv as _, Snapshot as _};
+    let mut out = Vec::new();
+    let snap = rig.kv.snapshot();
+    for (lo, hi) in [
+        (b"/i/".to_vec(), b"/i0".to_vec()),
+        (b"/u/".to_vec(), b"/u0".to_vec()),
+    ] {
+        for entry in snap.scan(
+            (
+                std::ops::Bound::Included(lo.as_slice()),
+                std::ops::Bound::Excluded(hi.as_slice()),
+            ),
+            false,
+        ) {
+            let (stored, _) = ok(entry);
+            out.push(stored);
+        }
+    }
+    out
+}
+
+/// Plants a raw **live version** at logical key `k` with commit ts `ts`
+/// and payload `payload` (`ingest_sorted`, C-T0 §10's primitive — the
+/// amcheck-free way to give an index a stale entry no maintenance wrote).
+pub fn plant_live_version(rig: &Rig, k: &[u8], ts: Ts, payload: &[u8]) {
+    use nucleus_txn::encoding::version_key;
+    let stored = version_key(k, ts);
+    let mut value = Vec::with_capacity(1 + payload.len());
+    value.push(0x00); // §2.2 header: live
+    value.extend_from_slice(payload);
+    ok(rig.kv.ingest_sorted(&mut std::iter::once((stored, value))));
+}
+
 /// A reader id that owns nothing and is never allocated (status ids start
 /// at 1).
 fn ghost_id(core: &Core<SharedFault>) -> TxnId {

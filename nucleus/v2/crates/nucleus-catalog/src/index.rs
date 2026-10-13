@@ -42,7 +42,10 @@ fn i_lo(sid: u64) -> Key {
 
 /// The key columns of `idx` under `schema`, in index order (§6): each
 /// indexed attnum must name a live column of the definition.
-fn key_columns(schema: &TableSchema, idx: &IndexHandle) -> Result<Vec<KeyColumn>, DbError> {
+pub(crate) fn key_columns(
+    schema: &TableSchema,
+    idx: &IndexHandle,
+) -> Result<Vec<KeyColumn>, DbError> {
     let mut cols = Vec::with_capacity(idx.def.columns.len());
     for col in &idx.def.columns {
         let Some(found) = schema
