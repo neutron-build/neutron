@@ -11,6 +11,12 @@
 //! `wait_on_any_deadline` fires no wait-hook events (O9), and dropping a
 //! live commit handle refuses (O2).
 //!
+//! C-R0bFIX-2 adds: a scan iterator created off-executor refusing at the
+//! first `next()` on an executor thread (L-A), and an unmarked thread
+//! panicking while holding a live commit handle still stopping and
+//! joining the pipeline — the pre-C-R0bFIX behaviour the M-2 early
+//! return must not touch (L-B).
+//!
 //! Setup discipline: every `Core`, txn and pipeline is set up off-executor;
 //! `on_executor` marks the thread only around the call under test.
 
@@ -689,4 +695,108 @@ fn commit_handle_drop_refuses_on_executor() {
         Blocking::Join,
         "CommitThreadHandle::drop",
     );
+}
+
+// (o) — L-A: a scan iterator is checked on every `next()`, not only at
+// creation.
+#[test]
+fn scan_iter_refuses_on_executor() {
+    let core = fresh_core();
+    let mut batch = Batch::default();
+    batch.put(b"o/k".to_vec(), b"v".to_vec());
+    ok(core.write(batch, Durability::No));
+
+    // The iterator is created off-executor (this thread is unmarked,
+    // like every setup here), so the creation check passes; the first
+    // pull happens on the executor. This is the L-A shape: a scan opened
+    // in a blocking section, iterated after the executor mark returns.
+    let view = core.open_view();
+    let mut iter = view.scan(
+        (Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])),
+        false,
+    );
+    assert_blocked(
+        on_executor(|| iter.next()),
+        Blocking::KvIo,
+        "ViewGuard::scan",
+    );
+
+    // The refusal must not poison the iterator: it fired before any KV
+    // read, so off-executor the iterator still yields its row.
+    match iter.next() {
+        Some(Ok((stored, _))) => assert!(
+            stored.starts_with(b"o"),
+            "the scan yields its row, got {stored:?}"
+        ),
+        other => panic!("the scan iterator still works off-executor, got {other:?}"),
+    }
+    assert!(iter.next().is_none(), "exactly one row is in range");
+
+    // The exact async-misuse shape L-A described: on a marked thread,
+    // open the view and the scan inside `allow_blocking`, then iterate
+    // once the guard has restored the mark. Creation passes (the section
+    // unmarks); the first pull refuses.
+    let view2;
+    let mut iter2;
+    {
+        let _marked = rt::enter_executor();
+        {
+            let _blocking = rt::allow_blocking();
+            view2 = core.open_view();
+            iter2 = view2.scan(
+                (Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])),
+                false,
+            );
+        }
+        assert!(rt::is_executor_thread(), "the executor mark is restored");
+        assert_blocked(
+            on_executor(|| iter2.next()),
+            Blocking::KvIo,
+            "ViewGuard::scan",
+        );
+    }
+    assert!(
+        iter2.next().is_some(),
+        "the second iterator still works off-executor"
+    );
+}
+
+// (p) — L-B pin: an unmarked thread panicking while holding a live
+// commit handle still stops and joins the pipeline.
+#[test]
+fn unmarked_panicking_drop_stops_pipeline() {
+    let core = Arc::new(fresh_core());
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
+
+    // This thread is unmarked (the test thread never enters the
+    // executor). The panic unwinds through the handle's drop: the M-2
+    // early return must not fire here — it is keyed on the executor
+    // refusal unwind, not on any panic — so the drop sends Stop and
+    // joins, the pre-C-R0bFIX behaviour on unmarked threads.
+    let boom = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _held = handle;
+        panic!("boom while holding the commit handle");
+    }));
+    assert!(boom.is_err(), "the closure panicked as arranged");
+
+    // The pipeline is stopped: a subsequent write commit returns the
+    // stopped error, never a commit ts. (Under the G3 mutant — the early
+    // return keyed on panicking() alone — the handle would be leaked
+    // instead of stopped, and this commit would succeed.)
+    let txn = core.begin(Isolation::ReadCommitted);
+    let seq = ok(txn.next_seq());
+    txn.log_write(seq, b"p/k", None);
+    let stopped = match core.commit_submit(txn, SyncCommit::On) {
+        Err(e) => e,
+        Ok(ticket) => match ticket.wait() {
+            Err(e) => e,
+            Ok(ts) => panic!(
+                "the pipeline must be stopped after the unmarked panic-drop, committed {ts:?}"
+            ),
+        },
+    };
+    match &stopped {
+        TxnError::Invariant(msg) if msg.contains("stopped") => {}
+        other => panic!("expected the pipeline-stopped error, got {other:?}"),
+    }
 }

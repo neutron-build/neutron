@@ -63,7 +63,12 @@
 //! the M-1 hole: a view opened off-executor or on another thread and then
 //! read on an executor thread refuses at the read, because every read
 //! path (`read::read_key`, `read::scan`, `Ssi::read_key` / `scan`, the
-//! catalog reads) reaches the KV through the guard. Writes with
+//! catalog reads) reaches the KV through the guard. The scan arm holds
+//! for iteration too (C-R0bFIX-2): a scan iterator is consumed lazily,
+//! so [`ViewGuard::scan`](crate::registry::ViewGuard::scan) checks at
+//! creation **and on every `next()`** — an iterator created off-executor
+//! (or inside `allow_blocking`) and pulled on an executor thread refuses
+//! at the first pull (L-A). Writes with
 //! `Durability::No` and the removals funnel through `Core::write` and
 //! `Core::latest_get`. **Park** rows funnel through the park sites in
 //! `wait.rs` and `locks.rs`. **Join** rows through `commit.rs`. The
