@@ -9,6 +9,13 @@
 //! Deterministic: the gate parks the parked caller, the assertions stand
 //! on the gate's counters and `recv_timeout`s, and every failure path
 //! releases the gate first, so the test never hangs.
+//!
+//! C-R0bbfix adds the module-over-slot pin (gate OM-3/L-2): a thread
+//! blocked in `seq_reservations_for_tests(5)` — parked on id 5's slot,
+//! exactly where it belongs — must hold no module mutex while it waits,
+//! so a cached `seq_next` of another id still answers. Under the OM-3
+//! shape the parked probe holds the module mutex and the other id
+//! starves.
 
 mod r0b_support;
 
@@ -61,7 +68,37 @@ fn paused_reservation_blocks_only_its_own_id() {
         panic!("thread A never parked inside id 5's creation write");
     }
 
-    // A cached nextval of another id must complete while A is parked.
+    // C-R0bbfix (gate OM-3/L-2): pin that nothing takes the module mutex
+    // across a slot mutex. This thread calls `seq_reservations_for_tests(5)`,
+    // which must block on id 5's slot (A holds it mid-fsync) — correct,
+    // same-id waiting. Under the OM-3 shape (the module mutex taken and
+    // held across the slot lock) this thread parks holding the module
+    // mutex, and the cached `seq_next(9)` below then starves on the
+    // module mutex and fails its 5 s bound.
+    let (tx_r, rx_r) = mpsc::channel::<()>();
+    let core_r = Arc::clone(&core);
+    let handle_r = thread::spawn(move || {
+        // Sent immediately before the call: proof the thread is running,
+        // leaving only a function prologue before it reaches the module
+        // mutex.
+        let _ = tx_r.send(());
+        core_r.seq_reservations_for_tests(5)
+    });
+    match rx_r.recv_timeout(RECV_TIMEOUT) {
+        Ok(()) => {}
+        Err(_) => {
+            kv.release();
+            panic!("the reservations probe never started within {RECV_TIMEOUT:?}");
+        }
+    }
+    // A scheduling margin only — never the synchronisation (the C-T7r3
+    // rule): it gives the probe thread time to reach (and, under OM-3,
+    // park on) the module mutex before the seq_next(9) thread is spawned.
+    // The assertion itself is the bounded probe below.
+    thread::sleep(MARGIN);
+
+    // A cached nextval of another id must complete while A is parked and
+    // the reservations probe is blocked.
     let (tx9, rx9) = mpsc::channel();
     let core9 = Arc::clone(&core);
     let handle9 = thread::spawn(move || {
@@ -73,11 +110,22 @@ fn paused_reservation_blocks_only_its_own_id() {
             kv.release();
             panic!(
                 "cached seq_next(9) did not answer within {RECV_TIMEOUT:?} while id 5's \
-                 creation write was parked: a lock it needs is held across an fsync (R3)"
+                  creation write was parked: a lock it needs is held across an fsync (R3), \
+                  or the module mutex is held across a slot mutex (OM-3)"
             );
         }
     };
     assert_eq!(v9, 2, "id 9's second value is cached, not reserved");
+
+    // The reservations probe must still be parked on id 5's slot: it
+    // cannot have completed while A holds the slot, so its waiting — not
+    // some other read of the map — is what the seq_next(9) above had to
+    // get past.
+    assert!(
+        !handle_r.is_finished(),
+        "seq_reservations_for_tests(5) returned while id 5's slot was held mid-fsync: \
+          it did not wait on the slot"
+    );
 
     // A fresh id whose own writes are not gated must boot and answer.
     let (tx11, rx11) = mpsc::channel();
@@ -127,5 +175,12 @@ fn paused_reservation_blocks_only_its_own_id() {
         core.seq_reservations_for_tests(5),
         Some(1),
         "one reservation covers both values of id 5's first block"
+    );
+    // The reservations probe, released with everything else: it read id
+    // 5's slot through the per-id mutex and saw the one reservation.
+    assert_eq!(
+        handle_r.join().expect("reservations probe"),
+        Some(1),
+        "the parked reservations probe read one reservation after the release"
     );
 }

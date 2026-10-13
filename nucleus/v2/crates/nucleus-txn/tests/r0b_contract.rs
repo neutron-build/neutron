@@ -17,6 +17,10 @@
 //! joining the pipeline — the pre-C-R0bFIX behaviour the M-2 early
 //! return must not touch (L-B).
 //!
+//! C-R0bbFIX adds: a refused `seq_next` on a fresh id inserts no per-id
+//! slot (OM-5) — the entry check is `seq_next`'s first statement, before
+//! the module section.
+//!
 //! Setup discipline: every `Core`, txn and pipeline is set up off-executor;
 //! `on_executor` marks the thread only around the call under test.
 
@@ -513,6 +517,16 @@ fn refusal_happens_before_state_change() {
         core.seq_reservations_for_tests(fresh),
         None,
         "no reservation was counted after the refusal"
+    );
+    // C-R0bbfix (gate OM-5/L-3): the refusal also inserted no per-id
+    // slot. The entry check is the first statement of `seq_next`, before
+    // the module section; the two pins above cannot see the empty slot a
+    // check placed after it would leave (`seq_reservations_for_tests`
+    // would still answer `None` — the slot exists but has no state).
+    assert!(
+        !core.seq_slot_exists_for_tests(fresh),
+        "the refused seq_next({fresh}) inserted a per-id slot: the entry check \
+          ran after the module section"
     );
 }
 
