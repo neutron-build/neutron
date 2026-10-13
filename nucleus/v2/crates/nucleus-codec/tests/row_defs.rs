@@ -260,6 +260,12 @@ fn def_decode_rejects() {
         TableSchema::decode(&bad_magic)
     );
 
+    // §3: version is 1 at CREATE TABLE, +1 per DDL — 0 is unproducible.
+    assert_eq!(
+        Err(RowError::Corrupt("definition version 0")),
+        TableSchema::decode(&raw_def(0, 0, &[(1, "a", INT8_TAIL)], &[1]))
+    );
+
     // hidden_rowid byte: only 0/1, and it must equal npk == 0.
     assert_eq!(
         Err(RowError::Corrupt("hidden_rowid byte")),

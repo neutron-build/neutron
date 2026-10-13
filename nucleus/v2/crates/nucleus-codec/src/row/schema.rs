@@ -10,9 +10,9 @@
 //! The §3.1 type tags are pinned as the const table below and on disk;
 //! they are never derived from `KeyType`'s discriminant order. Decode is
 //! total: an unknown tag, truncation, trailing bytes, attnums out of
-//! order, a pk entry naming a dropped or missing attnum, or a
-//! `hidden_rowid` byte that is not 0/1 or disagrees with `npk` are
-//! [`RowError::Corrupt`] (XX001), never a panic.
+//! order, a pk entry naming a dropped or missing attnum, a `version` of
+//! 0, or a `hidden_rowid` byte that is not 0/1 or disagrees with `npk`
+//! are [`RowError::Corrupt`] (XX001), never a panic.
 //!
 //! The DDL helpers are pure byte-level schema evolution: each returns
 //! the next version (`version + 1`, §3) and nothing else — locks,
@@ -142,10 +142,11 @@ impl TableSchema {
     }
 
     /// Parses a definition (§3). Total: every malformed input is an
-    /// `Err` ([`RowError::Corrupt`], XX001) — unknown type tags or
-    /// collations, truncation, trailing bytes, attnums out of order,
-    /// undecodable `missing` bytes, a pk entry naming a dropped or
-    /// missing attnum, unknown flag bits, or a `hidden_rowid` byte that
+    /// `Err` ([`RowError::Corrupt`], XX001) — a `version` of 0 (§3: 1
+    /// at CREATE, +1 per DDL), unknown type tags or collations,
+    /// truncation, trailing bytes, attnums out of order, undecodable
+    /// `missing` bytes, a pk entry naming a dropped or missing attnum,
+    /// unknown flag bits, or a `hidden_rowid` byte that
     /// is not 0/1 or disagrees with `npk`. Duplicate pk entries are not
     /// rejected (§3 does not forbid them; the writer never makes them).
     pub fn decode(bytes: &[u8]) -> Result<TableSchema, RowError> {
@@ -156,6 +157,9 @@ impl TableSchema {
             return Err(RowError::Corrupt("definition magic"));
         }
         let version = r.u32be().map_err(|_| short())?;
+        if version == 0 {
+            return Err(RowError::Corrupt("definition version 0"));
+        }
         let hidden_rowid = match r.u8().map_err(|_| short())? {
             0 => false,
             1 => true,
