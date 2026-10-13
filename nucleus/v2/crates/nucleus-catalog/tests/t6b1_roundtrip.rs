@@ -196,14 +196,11 @@ fn pk_over_the_2704_byte_limit_is_54000() {
     ok(rig.commit_rc(t2));
 }
 
-/// §4/C-T6 §6: insert on a table whose index is DeleteOnly **writes no
-/// entry** (§6: an insert is not a DeleteOnly index's business) — the
-/// C-T6b1 placeholder pin ("0A000 until C-T6b2a") became this when
-/// C-T6b2a landed maintenance. The index def itself is the §6 bytes of
-/// [`nucleus_catalog::IndexDef`]; both entry ranges stay empty, so the
-/// write is never a silent missing-maintenance one.
+/// §4/C-T6 §6: DML on a table with an index is 0A000 until C-T6b2a —
+/// never a silent missing-maintenance write. The index def itself is the
+/// §6 bytes of [`nucleus_catalog::IndexDef`].
 #[test]
-fn insert_on_a_delete_only_indexed_table_writes_no_entry() {
+fn insert_on_an_indexed_table_is_refused() {
     let rig = Rig::new();
     let t0 = rig.rc();
     let s0 = rig.core().visible_ts();
@@ -239,22 +236,16 @@ fn insert_on_a_delete_only_indexed_table_writes_no_entry() {
     let st2 = rig.stmt(&t, s);
     let h = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
     assert_eq!(h.indexes.len(), 1, "the handle lists the index");
-    ok(rig.db.insert(&st2, &h, &[i32_d(1), text_d("x")]));
-    ok(rig.commit_rc(t));
-
-    // DeleteOnly: the insert maintained nothing — both entry ranges of
-    // the index's storage are empty, and the row itself is there.
-    assert!(
-        rig.raw_entry_versions(isid).is_empty(),
-        "a DeleteOnly index gets no entry from an insert"
-    );
-
-    let t2 = rig.rc();
-    let s2 = rig.core().visible_ts();
-    let st3 = rig.stmt(&t2, s2);
-    let h3 = ok(rig.db.open_table(&st3, oid, RelLockMode::AccessShare));
-    assert_eq!(ok(rig.db.scan(&st3, &h3)).len(), 1, "the row was written");
-    ok(rig.commit_rc(t2));
+    let err = rig
+        .db
+        .insert(&st2, &h, &[i32_d(1), text_d("x")])
+        .expect_err("DML on an indexed table");
+    assert_eq!(err.sqlstate(), "0A000");
+    match err {
+        DbError::FeatureNotSupported(what) => assert_eq!(what, "index maintenance: C-T6b2a"),
+        other => panic!("wrong error: {other:?}"),
+    }
+    rig.abort_txn(t);
 }
 
 /// An index with an explicit entry range ([`IdxStorage::Range`]) has no

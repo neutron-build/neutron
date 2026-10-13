@@ -249,14 +249,14 @@ fn rr_reader_continues_after_a_same_storage_def_change() {
 
 /// Mutant G2 (M-1): the index rows read at `st.snapshot` instead of the
 /// latest committed catalog — a handle whose `S` predates a committed
-/// CREATE INDEX would list no index, so C-T6b2a's maintenance would be
-/// silently skippable by the same one-line regression. §4: the
-/// statement's catalog read — relation and index rows alike — is at the
-/// latest committed state plus the txn's own earlier statements. The
-/// insert half of the C-T6b1 placeholder pin ("0A000 until C-T6b2a")
-/// became the DeleteOnly no-entry pin when C-T6b2a landed maintenance.
+/// CREATE INDEX would list no index, so `insert`'s 0A000 guard (the
+/// "never a silent missing-maintenance write") would be bypassable, and
+/// C-T6b2a's maintenance silently skippable by the same one-line
+/// regression. §4: the statement's catalog read — relation and index rows
+/// alike — is at the latest committed state plus the txn's own earlier
+/// statements.
 #[test]
-fn rr_lists_an_index_committed_after_s_and_insert_writes_no_entry() {
+fn rr_lists_an_index_committed_after_s_and_insert_refuses() {
     let rig = Rig::new();
     let t0 = rig.rc();
     let s0 = rig.core().visible_ts();
@@ -289,14 +289,18 @@ fn rr_lists_an_index_committed_after_s_and_insert_writes_no_entry() {
     );
     assert_eq!(h.indexes[0].oid, idx_oid);
 
-    // DeleteOnly (§6): the insert maintains nothing — both entry ranges
-    // stay empty.
-    ok(rig.db.insert(&st, &h, &[i32_d(1), text_d("x")]));
-    ok(rig.commit_rc(r));
-    assert!(
-        rig.raw_entry_versions(isid).is_empty(),
-        "a DeleteOnly index gets no entry from an insert"
-    );
+    // So insert refuses 0A000 — never a silent missing-maintenance write.
+    let st2 = ok(Stmt::new(&r, s));
+    let err = rig
+        .db
+        .insert(&st2, &h, &[i32_d(1), text_d("x")])
+        .expect_err("insert on a table the latest catalog says is indexed");
+    assert_eq!(err.sqlstate(), "0A000");
+    match err {
+        DbError::FeatureNotSupported(what) => assert_eq!(what, "index maintenance: C-T6b2a"),
+        other => panic!("wrong error: {other:?}"),
+    }
+    rig.abort_txn(r);
 }
 
 /// Item 2 (M-2), the own-DDL half, mutant DEL-CHK: the handle validation

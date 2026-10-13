@@ -2,7 +2,8 @@
 //! definitions in `RelRow.def` (the C-Q3s/codec §3 bytes), index
 //! definitions in `IdxRow.def` (§6), the [`Db`] handle, `open_table` with
 //! the C-T0 §4 relation rule, CREATE TABLE, insert/update/delete with
-//! C-T6 §6 index maintenance by state (`index`), point get and scan — all
+//! C-T6 §6 index maintenance by state (`index`, driven by the
+//! statement-scoped `_with` DML entry points), point get and scan — all
 //! on top of `nucleus-txn`, which stays normative for every
 //! transactional rule.
 //!

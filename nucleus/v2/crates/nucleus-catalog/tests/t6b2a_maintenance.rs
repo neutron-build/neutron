@@ -59,8 +59,8 @@ fn writeonly_and_public_entries_stay_exact() {
     let s = rig.core().visible_ts();
     let st = rig.stmt(&t, s);
     let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st, &h, &[i32_d(1), text_d("a")]));
-    ok(rig.db.insert(&st, &h, &[i32_d(2), text_d("b")]));
+    ok(rig.db.insert_with(&st, &h, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st, &h, &[i32_d(2), text_d("b")]));
     let ts_insert = ok(rig.commit_rc(t));
 
     let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
@@ -169,7 +169,7 @@ fn delete_only_gets_tombstones_and_nothing_on_insert() {
     let s = rig.core().visible_ts();
     let st = rig.stmt(&t, s);
     let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st, &h, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st, &h, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(t));
     assert!(
         rig.raw_entry_versions(do_sid).is_empty(),
@@ -196,7 +196,7 @@ fn delete_only_gets_tombstones_and_nothing_on_insert() {
     let s3 = rig.core().visible_ts();
     let st3 = rig.stmt(&t3, s3);
     let h3 = ok(rig.db.open_table(&st3, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st3, &h3, &[i32_d(2), text_d("b")]));
+    ok(rig.db.insert_with(&st3, &h3, &[i32_d(2), text_d("b")]));
     ok(rig.commit_rc(t3));
     let t4 = rig.rc();
     let s4 = rig.core().visible_ts();
@@ -244,7 +244,7 @@ fn pk_change_moves_entries() {
     let s = rig.core().visible_ts();
     let st = rig.stmt(&t, s);
     let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st, &h, &[i32_d(1), text_d("b")]));
+    ok(rig.db.insert_with(&st, &h, &[i32_d(1), text_d("b")]));
     let ts_insert = ok(rig.commit_rc(t));
 
     // pk 1 → 5, payload unchanged.
@@ -333,7 +333,7 @@ fn unique_writeonly_and_public_reject_duplicates() {
         let st = rig.stmt(&t, s);
         let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
         let row = vec![i32_d(id), payload.map(text_d).unwrap_or(None)];
-        let r = rig.db.insert(&st, &h, &row);
+        let r = rig.db.insert_with(&st, &h, &row);
         if r.is_err() {
             rig.abort_txn(t);
         } else {
@@ -422,7 +422,7 @@ fn oversize_row_deletable_with_writeonly_index() {
     let h = ok(rig.db.open_table(&st3, oid, RelLockMode::RowExclusive));
     let err = rig
         .db
-        .insert(&st3, &h, &[i32_d(2), text_d(&"y".repeat(3000))])
+        .insert_with(&st3, &h, &[i32_d(2), text_d(&"y".repeat(3000))])
         .expect_err("an oversize index key is 54000");
     assert_eq!(err.sqlstate(), "54000");
     rig.abort_txn(t2);

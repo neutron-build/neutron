@@ -194,7 +194,7 @@ fn stale_handle_across_t0_accepted() {
     let (oid, _sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
     let st2 = rig.stmt(&t0, s0);
     let h0 = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st2, &h0, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st2, &h0, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(t0));
 
     let (opened_tx, opened_rx) = mpsc::channel::<()>();
@@ -297,7 +297,7 @@ fn key_column_update_blocks_on_a_keyshare_holder() {
     let s1 = rig.core().visible_ts();
     let st1 = rig.stmt(&t1, s1);
     let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st1, &h1, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(t1));
 
     // The row's /t/ key (the §3 bytes, built independently).

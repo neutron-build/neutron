@@ -57,7 +57,7 @@ fn rc_epq_maintenance_follows_the_epq_base() {
     let s1 = rig.core().visible_ts();
     let st1 = rig.stmt(&t1, s1);
     let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st1, &h1, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(1), text_d("a")]));
     let ts_a = ok(rig.commit_rc(t1));
 
     // The second txn's statement takes its snapshot BEFORE X commits.
@@ -132,7 +132,7 @@ fn entry_delete_over_newer_tombstone() {
     let s1 = rig.core().visible_ts();
     let st1 = rig.stmt(&t1, s1);
     let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st1, &h1, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(t1));
 
     // The statement: RC, its snapshot taken before X's delete.
@@ -153,7 +153,7 @@ fn entry_delete_over_newer_tombstone() {
     let s_y = rig.core().visible_ts();
     let st_y = rig.stmt(&y, s_y);
     let h_y = ok(rig.db.open_table(&st_y, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st_y, &h_y, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st_y, &h_y, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(y));
 
     // The statement deletes pk 1: the row op EPQs onto Y's live row,
@@ -193,7 +193,7 @@ fn rr_delete_after_ingest_at_s() {
     let s1 = rig.core().visible_ts();
     let st1 = rig.stmt(&t1, s1);
     let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st1, &h1, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(t1));
     rig.set_index_def(wo, idx_def(2, false, IndexState::WriteOnly));
     assert!(
@@ -260,7 +260,7 @@ fn update_set_names_columns_and_missing_rows_are_false() {
     let s1 = rig.core().visible_ts();
     let st2 = rig.stmt(&t1, s1);
     let h = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert(&st2, &h, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st2, &h, &[i32_d(1), text_d("a")]));
     ok(rig.commit_rc(t1));
 
     // Missing row: Ok(false) for update and delete, nothing maintained.
