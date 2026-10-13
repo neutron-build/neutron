@@ -927,6 +927,16 @@ impl CommitThreadHandle {
 
 impl Drop for CommitThreadHandle {
     fn drop(&mut self) {
+        // C-R0bFIX (M-2): unwinding a refusal on an executor thread must
+        // have no side effects. Sending Stop or joining here would run
+        // the blocking Join the check just refused, on the executor
+        // thread, during the unwind — and stop the whole commit pipeline
+        // as a side effect of the panic. Returning detaches the thread
+        // instead: the pipeline stays attached and running, and the
+        // process is already reporting the contract violation.
+        if std::thread::panicking() && crate::rt::is_executor_thread() {
+            return;
+        }
         // Not shutting down explicitly would park the thread forever on
         // recv; stop it even when the handle is dropped unused.
         // C-R0b: the implicit shutdown joins — Join, but never checked

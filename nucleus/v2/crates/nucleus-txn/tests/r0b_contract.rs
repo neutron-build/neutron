@@ -4,11 +4,19 @@
 //! executor thread, `allow_blocking` reopening them, and the refusal
 //! firing before any state change.
 //!
+//! C-R0bFIX adds: reads through a held view refusing on the executor
+//! (M-1), a refused shutdown leaving the pipeline running and a later
+//! off-executor shutdown succeeding (M-2), and the ordering pins — a
+//! refused `open_view` registers nothing (O1), a refused
+//! `wait_on_any_deadline` fires no wait-hook events (O9), and dropping a
+//! live commit handle refuses (O2).
+//!
 //! Setup discipline: every `Core`, txn and pipeline is set up off-executor;
 //! `on_executor` marks the thread only around the call under test.
 
+use std::ops::Bound;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use nucleus_kv::{Batch, Durability, MemKv};
@@ -16,10 +24,12 @@ use nucleus_kv::{Batch, Durability, MemKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::commit::{spawn_commit_thread, CommitPipeline, SyncCommit};
 use nucleus_txn::locks::{LockManager, RelLockMode};
+use nucleus_txn::read::{read_key, scan, NoSsi};
 use nucleus_txn::rt::{self, Blocking};
 use nucleus_txn::seq::sys_seq_key;
 use nucleus_txn::txn::Isolation;
-use nucleus_txn::wait::WaitBegin;
+use nucleus_txn::visibility::ReadCtx;
+use nucleus_txn::wait::{WaitBegin, WaitHook};
 use nucleus_txn::write::{LockWait, StmtCtx, UniqueRule};
 use nucleus_txn::{Ts, TxnError, TxnId};
 
@@ -497,5 +507,186 @@ fn refusal_happens_before_state_change() {
         core.seq_reservations_for_tests(fresh),
         None,
         "no reservation was counted after the refusal"
+    );
+}
+
+// (j) — M-1: the held-view read funnel.
+#[test]
+fn held_view_reads_refuse_on_executor() {
+    let core = fresh_core();
+    // The view is opened off-executor (opening one there is already
+    // refused); every read below happens on the executor thread. This is
+    // the async misuse shape: open in a blocking section, read on the
+    // executor.
+    let view = core.open_view();
+    let ctx = ReadCtx {
+        txn: TxnId {
+            epoch: core.epoch(),
+            n: 0,
+        },
+        snapshot: core.visible_ts(),
+        stmt_seq: 0,
+    };
+    assert_blocked(
+        on_executor(|| view.get(b"m/k")),
+        Blocking::KvIo,
+        "ViewGuard::get",
+    );
+    // `read::read_key` reaches the KV through `view.as_snap()`.
+    assert_blocked(
+        on_executor(|| read_key(&core, &view, b"m/k", &ctx, &mut NoSsi)),
+        Blocking::KvIo,
+        "ViewGuard::as_snap",
+    );
+    // `read::scan` opens its iterator through `view.scan(..)`; the panic
+    // fires while the scan is being built, before `.next()` runs.
+    assert_blocked(
+        on_executor(|| {
+            scan(
+                &core,
+                &view,
+                (Bound::Included(&b"m"[..]), Bound::Excluded(&b"n"[..])),
+                &ctx,
+                &mut NoSsi,
+            )
+            .next()
+        }),
+        Blocking::KvIo,
+        "ViewGuard::scan",
+    );
+    // Off-executor, the same held view reads normally: a refusal must
+    // not poison the guard.
+    assert!(
+        matches!(view.get(b"m/k"), Ok(None)),
+        "the held view still reads off-executor"
+    );
+}
+
+// (k) — M-2: a refused shutdown has no side effects.
+#[test]
+fn refused_shutdown_leaves_pipeline_running() {
+    let core = Arc::new(fresh_core());
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
+
+    // The refused shutdown panics at its check; the unwind drops the
+    // consumed handle. That drop must neither send Stop nor join —
+    // otherwise the blocking Join the check refused runs anyway, on the
+    // executor thread, and the pipeline is stopped as a side effect of
+    // the panic.
+    assert_blocked(
+        on_executor(move || handle.shutdown()),
+        Blocking::Join,
+        "CommitThreadHandle::shutdown",
+    );
+
+    // The pipeline is still attached and running: a write txn commits
+    // (before the fix, the unwind's Stop had stopped it and this
+    // returned `Invariant("commit pipeline stopped")`).
+    let txn = core.begin(Isolation::ReadCommitted);
+    let seq = ok(txn.next_seq());
+    txn.log_write(seq, b"n/k", None);
+    let ts = ok(core.commit(txn, SyncCommit::On));
+    assert!(ts > Ts::ZERO, "the pipeline committed the write txn");
+
+    // An off-executor shutdown then succeeds. The refused handle was
+    // consumed by the unwind and one core carries one pipeline, so this
+    // must be a fresh pipeline; what it pins is that the refusal left
+    // the shutdown path itself working on this thread.
+    let core2 = Arc::new(fresh_core());
+    let handle2 = ok(spawn_commit_thread(Arc::clone(&core2)));
+    ok(handle2.shutdown());
+}
+
+// (l) — O1 pin: the open_view check is before the registration.
+#[test]
+fn refused_open_view_registers_nothing() {
+    let core = fresh_core();
+    assert_eq!(
+        core.registry.min_view_counter(),
+        u64::MAX,
+        "no view is open on a fresh core"
+    );
+    assert_blocked(
+        on_executor(|| core.open_view()),
+        Blocking::KvIo,
+        "Registry::open_view",
+    );
+    // A refused open must not leave a registered view behind: a leaked
+    // counter would pin `min_view_counter` and hold back GC's W (§9.1)
+    // forever.
+    assert_eq!(
+        core.registry.min_view_counter(),
+        u64::MAX,
+        "the refused open_view registered no view"
+    );
+}
+
+// (m) — O9 pin: the wait check is before the hooks.
+#[test]
+fn refused_wait_records_no_hook_events() {
+    /// Records every `on_wait_start` / `on_wait_end` pair.
+    #[derive(Default)]
+    struct Rec {
+        starts: Mutex<Vec<(TxnId, TxnId)>>,
+        ends: Mutex<Vec<(TxnId, TxnId)>>,
+    }
+    impl WaitHook for Rec {
+        fn on_wait_start(&self, waiter: TxnId, target: TxnId) {
+            self.starts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((waiter, target));
+        }
+        fn on_wait_end(&self, waiter: TxnId, target: TxnId) {
+            self.ends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((waiter, target));
+        }
+    }
+
+    let core = fresh_core();
+    let target = core.begin(Isolation::ReadCommitted);
+    let waiter = core.begin(Isolation::ReadCommitted);
+    let g = gen_of(&core, target.id);
+    let rec = Arc::new(Rec::default());
+    core.waits.set_hook(Arc::clone(&rec) as Arc<dyn WaitHook>);
+    assert_blocked(
+        on_executor(|| core.wait_on_any_deadline(&waiter, &[(target.id, g)], None)),
+        Blocking::Park,
+        "Core::wait_on_any_deadline",
+    );
+    // A refused wait must fire no hook events: an `on_wait_start` without
+    // its `on_wait_end` (what a check placed after the hook loop would
+    // produce) is an unbalanced observation.
+    assert!(
+        rec.starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
+        "the refused wait fired no on_wait_start"
+    );
+    assert!(
+        rec.ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
+        "the refused wait fired no on_wait_end"
+    );
+    assert!(
+        core.wait_edges().is_empty(),
+        "the refused wait inserted no edge"
+    );
+}
+
+// (n) — O2 pin: the drop check.
+#[test]
+fn commit_handle_drop_refuses_on_executor() {
+    let core = Arc::new(fresh_core());
+    let handle = ok(spawn_commit_thread(Arc::clone(&core)));
+    assert_blocked(
+        on_executor(move || drop(handle)),
+        Blocking::Join,
+        "CommitThreadHandle::drop",
     );
 }
