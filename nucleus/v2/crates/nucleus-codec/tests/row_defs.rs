@@ -295,6 +295,28 @@ fn def_decode_rejects() {
         Err(RowError::Corrupt("array of array type")),
         TableSchema::decode(&raw_def(1, 0, &[(1, "a", &[0x11, 0x11, 0x01, 0x00])], &[1]))
     );
+    // Gate follow-up f1 (M-1): the second 0x11 is rejected *before*
+    // any recursion, so nesting depth cannot drive recursion. At 3
+    // nested tags and at 100,000 the result is the same Err — the
+    // deep one decoded on a small stack to prove no stack overflow.
+    assert_eq!(
+        Err(RowError::Corrupt("array of array type")),
+        TableSchema::decode(&raw_def(1, 0, &[(1, "a", &[0x11, 0x11, 0x11, 0x00])], &[1]))
+    );
+    let mut deep_tags = vec![0x11; 100_000];
+    deep_tags.push(0x00); // the flags byte
+    let deep = raw_def(1, 0, &[(1, "a", deep_tags.as_slice())], &[1]);
+    let decode_deep = move || TableSchema::decode(&deep).map(|_| ());
+    let small_stack = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(decode_deep)
+        .unwrap_or_else(|e| panic!("spawn: {e:?}"));
+    assert_eq!(
+        Err(RowError::Corrupt("array of array type")),
+        small_stack
+            .join()
+            .unwrap_or_else(|e| panic!("decode thread panicked: {e:?}"))
+    );
     // A truncated type (the text tag without its collation byte) is
     // covered by def_truncation_at_every_offset over the `text` case.
 

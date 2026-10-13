@@ -173,7 +173,7 @@ impl TableSchema {
             let name = std::str::from_utf8(name_bytes)
                 .map_err(|_| RowError::Corrupt("column name is not UTF-8"))?
                 .to_string();
-            let ty = decode_type(&mut r)?;
+            let ty = decode_type(&mut r, 0)?;
             let flags = r.u8().map_err(|_| short())?;
             if flags & !FLAG_KNOWN != 0 {
                 return Err(RowError::Corrupt("unknown definition flags"));
@@ -399,9 +399,13 @@ fn encode_type(ty: &KeyType, out: &mut Vec<u8>) -> Result<(), RowError> {
     Ok(())
 }
 
-/// Reads the §3.1 type bytes; recursion stops at the second array level
-/// (an array of arrays is not a type, C-Q3s §7).
-fn decode_type(r: &mut super::RowReader<'_>) -> Result<KeyType, RowError> {
+/// Reads the §3.1 type bytes. `depth` is the array nesting level: a
+/// column's own tag is read at depth 0, an array's element at depth 1
+/// — the most the format allows (an array of arrays is not a type,
+/// C-Q3s §7). A `0x11` at depth ≥ 1 is rejected *before* any further
+/// recursion, so however deeply corrupt bytes nest array tags, decode
+/// consumes at most two frames, never one per input byte.
+fn decode_type(r: &mut super::RowReader<'_>, depth: u8) -> Result<KeyType, RowError> {
     let short = || RowError::Corrupt("truncated type");
     let tag = r.u8().map_err(|_| short())?;
     Ok(match tag {
@@ -425,11 +429,10 @@ fn decode_type(r: &mut super::RowReader<'_>) -> Result<KeyType, RowError> {
         TAG_UUID => KeyType::Uuid,
         TAG_JSONB => KeyType::Jsonb,
         TAG_ARRAY => {
-            let elem = decode_type(r)?;
-            if matches!(elem, KeyType::Array(_)) {
+            if depth > 0 {
                 return Err(RowError::Corrupt("array of array type"));
             }
-            KeyType::Array(Box::new(elem))
+            KeyType::Array(Box::new(decode_type(r, depth + 1)?))
         }
         _ => return Err(RowError::Corrupt("unknown type tag")),
     })
