@@ -711,7 +711,10 @@ fn scan_iter_refuses_on_executor() {
     // pull happens on the executor. This is the L-A shape: a scan opened
     // in a blocking section, iterated after the executor mark returns.
     let view = core.open_view();
-    let mut iter = view.scan((Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])), false);
+    let mut iter = view.scan(
+        (Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])),
+        false,
+    );
     assert_blocked(
         on_executor(|| iter.next()),
         Blocking::KvIo,
@@ -740,7 +743,10 @@ fn scan_iter_refuses_on_executor() {
         {
             let _blocking = rt::allow_blocking();
             view2 = core.open_view();
-            iter2 = view2.scan((Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])), false);
+            iter2 = view2.scan(
+                (Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])),
+                false,
+            );
         }
         assert!(rt::is_executor_thread(), "the executor mark is restored");
         assert_blocked(
