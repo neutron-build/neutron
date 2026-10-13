@@ -204,10 +204,14 @@ impl<K: OrderedKv> Db<K> {
     /// never collide.
     ///
     /// §4 expects the writing statement's catalog read to happen under
-    /// RowExclusive or stronger: open the handle with
-    /// [`RelLockMode::RowExclusive`] in the same statement. The RowExclusive
-    /// taken here upgrades a weaker handle's lock too, but the handle's
-    /// catalog read is the one its statement made.
+    /// RowExclusive or stronger: under the RowExclusive just taken, the
+    /// relation row is re-read at the latest committed catalog plus this
+    /// txn's earlier statements, and a handle whose `storage_id` or
+    /// `def_version` no longer matches it is refused with 55000
+    /// (`"stale table handle"`) — an own TRUNCATE in a later statement
+    /// must never key a row into a retired storage range, and a def
+    /// change since the opening must never encode a row under a stale
+    /// `natts`. Open a fresh handle in the writing statement instead.
     pub fn insert(
         &self,
         st: &Stmt<'_>,
@@ -224,6 +228,32 @@ impl<K: OrderedKv> Db<K> {
                 None,
             )
             .map_err(DbError::Txn)?;
+        // §4: a statement that writes a relation reads its catalog rows
+        // only while holding RowExclusive or stronger. The handle's read
+        // was made by its opening statement — possibly under a weaker
+        // lock, possibly before the catalog moved. Re-read the relation
+        // row under the RowExclusive just taken, at the latest committed
+        // catalog plus this txn's earlier statements, and refuse a
+        // handle the catalog has moved under.
+        let rel = {
+            let own = ReadCtx {
+                txn: st.txn.id,
+                snapshot: self.core.visible_ts(),
+                stmt_seq: st.seq0,
+            };
+            let view = self.core.open_view();
+            Catalog::read_rel(&self.core, &view, &own, t.oid).map_err(DbError::Txn)?
+        };
+        // An absent row can only follow an own DROP in a later statement
+        // or a foreign DROP committed since the opening: refuse exactly
+        // as `open_table` does, never write into a dropped storage.
+        let Some(rel) = rel else {
+            return Err(DbError::UndefinedTable);
+        };
+        let def_version = TableSchema::decode(&rel.def)?.version;
+        if rel.storage_id != t.storage_id || def_version != t.def_version {
+            return Err(DbError::ObjectNotInPrerequisiteState("stale table handle"));
+        }
         if !t.indexes.is_empty() {
             return Err(DbError::FeatureNotSupported("index maintenance: C-T6b2a"));
         }
