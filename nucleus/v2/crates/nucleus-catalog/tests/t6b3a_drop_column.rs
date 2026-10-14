@@ -8,6 +8,13 @@
 //! `drop_column_vs_concurrent_index` pins the lock-first rule (mutant
 //! N18: an index a concurrent txn committed while the drop waited for its
 //! AccessExclusive is dropped too).
+//!
+//! The C-T6b3a gate's follow-ups: `drop_column_drops_own_created_index`
+//! pins that the dependent-index enumeration sees the txn's **own**
+//! uncommitted CREATE INDEX (§6.1 case (b)) — the own-write read of the
+//! enumeration, gate mutant M-ghost-enum — and the pk-refusal block of
+//! `drop_column_refusals` pins that the 0A000 check precedes any
+//! dependent-index drop (gate mutant M-order).
 
 mod t6b_support;
 
@@ -17,7 +24,8 @@ use std::thread;
 use std::time::Duration;
 
 use t6b_support::{
-    decode_def, i32_d, i32_v, idx_def, ok, pk_schema, set_col, text_d, wait_until, Rig,
+    decode_def, i32_d, i32_v, idx_def, ok, pk_schema, raw_entry_trace, set_col, text_d, wait_until,
+    Rig,
 };
 
 use nucleus_catalog::{IndexState, Stmt};
@@ -149,6 +157,82 @@ fn drop_column_drops_dependent_index_in_txn() {
     }
 }
 
+/// FU-1 (C-T6b3a gate F-1, mutant M-ghost-enum): the dependent-index
+/// enumeration in `drop_column` reads the latest committed catalog
+/// **plus the txn's own earlier statements**, so the index a §6.1
+/// case-(b) `Db::create_index` created earlier in the same txn — still
+/// uncommitted — is enumerated and dropped with the column. A ghost-ctx
+/// enumeration (committed state only) would leave the txn's own index
+/// alive over a dropped column and commit exactly that corruption. The
+/// insert between the two DDLs maintains the born index, so the dropped
+/// index really held an entry.
+#[test]
+fn drop_column_drops_own_created_index() {
+    let rig = Rig::new();
+    let (oid, _sid) = mk_table(&rig, b"ownidx");
+
+    // Abort twin: the txn's CREATE INDEX, its entry and its drop all
+    // vanish together; the committed def is restored untouched.
+    {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        let def = idx_def(2, false, IndexState::DeleteOnly);
+        let idx_oid = ok(rig.db.create_index(&st, oid, &def));
+        let st2 = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
+        ok(rig.db.insert_with(&st2, &h, &[i32_d(1), text_d("a")]));
+        let st3 = rig.stmt(&t, s);
+        ok(rig.db.drop_column(&st3, oid, 2));
+        rig.abort_txn(t);
+        assert_eq!(
+            rig.idx_row(idx_oid),
+            None,
+            "the aborted CREATE INDEX leaves no idx row"
+        );
+        assert!(raw_entry_trace(&rig).is_empty(), "no entry survives");
+        let def = decode_def(&rig.rel_row(oid).expect("rel row").def);
+        assert_eq!(def.version, 1, "the abort restores the def");
+        assert!(!def.columns[1].dropped);
+    }
+
+    // Commit half: the enumeration must see the own uncommitted index
+    // and drop it (a ghost-ctx enumeration commits it alive over the
+    // dropped column).
+    {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        let def = idx_def(2, false, IndexState::DeleteOnly);
+        let idx_oid = ok(rig.db.create_index(&st, oid, &def));
+        let st2 = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
+        ok(rig.db.insert_with(&st2, &h, &[i32_d(1), text_d("a")]));
+        assert_eq!(
+            raw_entry_trace(&rig).len(),
+            1,
+            "the insert maintained the born index"
+        );
+        let st3 = rig.stmt(&t, s);
+        ok(rig.db.drop_column(&st3, oid, 2));
+        let st4 = rig.stmt(&t, s);
+        let h4 = ok(rig.db.open_table(&st4, oid, RelLockMode::AccessShare));
+        assert_eq!(
+            h4.indexes.len(),
+            0,
+            "a later statement of the dropping txn sees the own index gone"
+        );
+        ok(rig.commit_rc(t));
+        assert_eq!(
+            rig.idx_row(idx_oid),
+            None,
+            "the own index is dropped with the column (FU-1)"
+        );
+        let def = decode_def(&rig.rel_row(oid).expect("rel row").def);
+        assert!(def.columns[1].dropped);
+    }
+}
+
 /// §3/§9.4: a primary-key column is refused with 0A000; an unknown or
 /// already-dropped attnum is 42703 (also for SET/DROP NOT NULL); a
 /// `set` that names a dropped column is 42703.
@@ -157,8 +241,14 @@ fn drop_column_refusals() {
     let rig = Rig::new();
     let (oid, _sid) = mk_table(&rig, b"ref");
     add_row(&rig, oid, 1, Some("a"));
+    // FU-2: an index on the pk column, created up front — the refused
+    // pk drop must leave it untouched.
+    let (pk_idx, _) = rig.add_index(oid, &idx_def(1, false, IndexState::Public));
 
-    // The primary-key column: 0A000, nothing written.
+    // The primary-key column: 0A000, nothing written — the refusal
+    // precedes any dependent-index drop, so a later statement of this
+    // txn still sees the pk index (mutant M-order drops it in txn
+    // before checking) and the abort leaves it present.
     {
         let t = rig.rc();
         let s = rig.core().visible_ts();
@@ -172,7 +262,18 @@ fn drop_column_refusals() {
             err,
             nucleus_catalog::DbError::FeatureNotSupported(_)
         ));
+        let st2 = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st2, oid, RelLockMode::AccessShare));
+        assert_eq!(
+            h.indexes.len(),
+            1,
+            "the refused drop leaves the pk index in place (FU-2)"
+        );
         rig.abort_txn(t);
+        assert!(
+            rig.idx_row(pk_idx).is_some(),
+            "the pk index is present after the abort"
+        );
     }
     assert_eq!(
         decode_def(&rig.rel_row(oid).expect("rel row").def).version,
