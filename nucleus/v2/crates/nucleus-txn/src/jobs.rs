@@ -88,9 +88,11 @@ impl LatchKeySource for NoDeferrableKeys {
     }
 }
 
-/// The seven job slots of §9.3. `DropCleanup` and `BootSweep` have no body
-/// in this crate yet (C-B1b); the slots, their config defaults and their
-/// counters exist so later cards only add bodies.
+/// The seven job slots of §9.3. `DropCleanup` and `BootSweep` got their
+/// bodies in C-B1b ([`jobs::drop_cleanup`](self::drop_cleanup),
+/// [`jobs::sweep`](self::sweep)); merge and analyze stay reserved — their
+/// slots, config defaults and counters exist so a later card only adds
+/// the bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JobKind {
     Merge,
