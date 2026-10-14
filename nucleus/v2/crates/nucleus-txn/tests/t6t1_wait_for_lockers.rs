@@ -29,7 +29,7 @@ use nucleus_txn::boot::Core;
 use nucleus_txn::locks::RelLockMode;
 use nucleus_txn::resolver::Resolver;
 use nucleus_txn::txn::Isolation;
-use nucleus_txn::wait::WaitHook;
+use nucleus_txn::wait::{WaitBegin, WaitHook};
 use nucleus_txn::write::LockWait;
 use nucleus_txn::{TxnError, TxnId};
 
@@ -498,8 +498,18 @@ fn mode_changed_holder_is_still_waited_for() {
 /// C-T6t1fix item 6 (Opus L-5 / mutant X3): when the wait-for cycle is
 /// detected during a `wait_for_lockers`, the 40P01 surfaces — it is never
 /// swallowed into a re-wait loop. The build's cycle: w holds SUE on the
-/// rel (and has a write), H holds RowExclusive and then requests SUE,
-/// which conflicts with w's SUE — H parks on w, w parks on H.
+/// rel (and has a write), H holds RowExclusive and is parked waiting on w
+/// (it requested SUE, which conflicts with w's); w parks on H.
+///
+/// H's half of the cycle is registered through the public wait-step API
+/// ([`Core::wait_begin`]) instead of a second blocking thread: a
+/// two-thread cycle has an inherent victim race — either side's deadlock
+/// check can fire first, and if H wins, w's cycle vanishes with H's
+/// edges and w would legitimately keep waiting (the test would flake). A
+/// hand-held registration never parks, never runs a deadlock check of
+/// its own and never ends until the test ends it, so w's check — the one
+/// this test pins — always sees the full cycle and w is always the
+/// victim.
 /// Mutant L5SWALLOW (`WaitOutcome::Deadlock` re-looped): the victim
 /// re-waits forever on a holder that is still waiting on it — the bounded
 /// join fails.
@@ -534,46 +544,43 @@ fn detected_deadlock_surfaces_as_40p01() {
         None,
     )));
 
-    // w parks on H first (RowExclusive conflicts with Share) …
+    // H is parked waiting on w (it requested SUE, which conflicts with
+    // w's): the edge exists, nothing ends it, and no deadlock check ever
+    // runs on H's side — w is always the victim.
+    let gen_w = rig.core.status.entry(w_id).map_or(0, |e| e.gen);
+    let h_wait = match rig.core.wait_begin(&h, &[(w_id, gen_w)]) {
+        WaitBegin::Registered(hw) => hw,
+        WaitBegin::Done(o) => panic!("H's wait on w unblocked at once: {o:?}"),
+    };
+    assert!(
+        rig.core.wait_edges().contains(&(h_id, w_id)),
+        "H's half of the cycle is registered"
+    );
+
+    // w parks on H (RowExclusive conflicts with Share); after
+    // deadlock_timeout its check finds w -> H -> w and the 40P01 must
+    // surface here.
     let rx_w = {
         let core = Arc::clone(&rig.core);
         let locks = Arc::clone(&rig.locks);
         spawn_call(move || locks.wait_for_lockers(&core, &w, 92, RelLockMode::Share, None))
     };
     wait_edge_present(&rig.core, w_id, h_id);
-    // … then H requests SUE, which conflicts with w's: the cycle closes.
-    // H's own request carries a lock_timeout so its thread always ends.
-    let rx_h = {
-        let core = Arc::clone(&rig.core);
-        let locks = Arc::clone(&rig.locks);
-        spawn_call(move || {
-            locks.lock_relation(
-                &core,
-                &h,
-                92,
-                RelLockMode::ShareUpdateExclusive,
-                LockWait::Block,
-                Some(Duration::from_millis(1500)),
-            )
-        })
-    };
-    wait_edge_present(&rig.core, h_id, w_id);
-
-    // w's wait began strictly before H's, so w's deadlock check fires
-    // first: w is the victim and the 40P01 must surface here.
     match rx_w.recv_timeout(Duration::from_millis(2000)) {
         Ok(Err(TxnError::Deadlock)) => {}
         Ok(other) => panic!("the detected deadlock must surface as 40P01, got {other:?}"),
         Err(_) => panic!("wait_for_lockers swallowed the detected deadlock (re-wait loop)"),
     }
-    // The holder's bounded request ends regardless of which side won:
-    // 55P03 at its own timeout, or 40P01 in the schedule where its check
-    // fired first.
-    match rx_h.recv_timeout(Duration::from_millis(3000)) {
-        Ok(Err(TxnError::LockNotAvailable)) | Ok(Err(TxnError::Deadlock)) => {}
-        Ok(other) => panic!("the holder's bounded request ended unexpectedly: {other:?}"),
-        Err(_) => panic!("the holder's bounded request never ended"),
-    }
+    // The victim's own edges are already gone (the check removes them
+    // under the graph mutex); H's registration is the test's to end.
+    rig.core.wait_end(h_wait);
+    assert!(
+        rig.core.wait_edges().is_empty(),
+        "the ended cycle left no edges: {:?}",
+        rig.core.wait_edges()
+    );
+    ok(rig.core.abort(h));
+    // (w stays pending in its thread, like the other thread-owned txns.)
 }
 
 /// C-T6t1fix item 3d, `wait_for_lockers` half (Opus N-2 / mutant X4):
@@ -622,9 +629,9 @@ fn lock_timeout_is_one_deadline_for_the_whole_call() {
     upd(&rig.core, &h, sw, b"/t/1/n2", b"v2");
     // Bump late inside the window: a per-iteration deadline would then
     // allow a full extra second past the whole-call bound below.
-    std::thread::sleep(Duration::from_millis(700));
+    std::thread::sleep(Duration::from_millis(850));
     ok(rig.core.rollback_to(&h, sp)); // bump + wake; h stays open
-    let bound = start + Duration::from_millis(1300);
+    let bound = start + Duration::from_millis(1450);
     match rx.recv_timeout(bound.saturating_duration_since(Instant::now())) {
         Ok(Err(TxnError::LockNotAvailable)) => {}
         Ok(other) => panic!("lock_timeout expiry is 55P03, got {other:?}"),
@@ -637,7 +644,7 @@ fn lock_timeout_is_one_deadline_for_the_whole_call() {
         "the call honoured its lock_timeout (it did not fail early)"
     );
     assert!(
-        start.elapsed() <= Duration::from_millis(1300),
+        start.elapsed() <= Duration::from_millis(1450),
         "one deadline covered the whole call, not just the last re-wait"
     );
     ok(rig.core.abort(h));

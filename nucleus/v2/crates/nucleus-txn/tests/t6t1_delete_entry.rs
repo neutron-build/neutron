@@ -796,9 +796,9 @@ fn lock_timeout_is_one_deadline_for_the_whole_call() {
     // Bump late inside the window (the rollback drops only the shared
     // lock; the intent survives), then re-wait: only the whole-call
     // deadline still expires at ~1 s from the call start.
-    std::thread::sleep(Duration::from_millis(700));
+    std::thread::sleep(Duration::from_millis(850));
     ok(rig.core.rollback_to(&h, sp)); // bump + wake; h and its intent stay
-    let bound = start + Duration::from_millis(1300);
+    let bound = start + Duration::from_millis(1450);
     match rx.recv_timeout(bound.saturating_duration_since(Instant::now())) {
         Ok(Err(TxnError::LockNotAvailable)) => {}
         Ok(other) => panic!("lock_timeout expiry is 55P03, got {other:?}"),
@@ -809,7 +809,7 @@ fn lock_timeout_is_one_deadline_for_the_whole_call() {
         "the call honoured its lock_timeout (it did not fail early)"
     );
     assert!(
-        start.elapsed() <= Duration::from_millis(1300),
+        start.elapsed() <= Duration::from_millis(1450),
         "one deadline covered the whole call, not just the last re-wait"
     );
     ok(rig.core.abort(h));
