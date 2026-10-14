@@ -49,7 +49,7 @@
 //! | Class | Entry points |
 //! |---|---|
 //! | N | `Core::begin`; `Txn::*` (`next_seq`, `seq`, `log_write`, `queue_event`, `take_events`, `cancel_handle`); `CancelHandle::*`; `Core::visible_ts` / `epoch` / `ts_hwm`; `Registry::take_snapshot` / `register_at` / `published_w`; `Core::commit_submit`; `CommitTicket::try_ack`; `CommitTicket::wait` on an already-answered ticket; `Core::abort`; `Core::wait_begin` / `wait_poll` / `wait_deadlock_check` / `wait_end` / `bump_and_wake`; `lock_relation` / `advisory_xact_lock` with `LockWait::NoWait` or `SkipLocked`; in-memory `Ssi` hooks (`map_storage`, `unmap_storage`, `note_retired`, `check_doomed`); `Ssi::begin`; `spawn_commit_thread`; `CommitPipeline::new`; `Ssi::install` / `LockManager::install` |
-//! | KvIo | `Core::open_view` / `Registry::open_view`; `ViewGuard::get` / `scan` / `as_snap` (reading through a held view, wherever it was opened); `Core::latest_get`; `Core::write(_, No)`; `Core::truncate_status`; `read::read_key` / `scan`; `Ssi::read_key` / `scan`; `removal::*`; `rollback_to` (KvIo when the txn has layers at `seq >= s`, else N); `Resolver::run_once`; catalog reads (`read_rel`, `read_idx`, `scan_*`); `Catalog::open` (the `rebuild_storage_map` scan; it writes and syncs nothing); the step API's `RowOpTask::step` / `KeyOpTask::step` / `DeferrableCheckTask::step` (one latch section each; a step returns its waits as values, it never parks) |
+//! | KvIo | `Core::open_view` / `Registry::open_view`; `ViewGuard::get` / `scan` / `as_snap` (reading through a held view, wherever it was opened; `as_snap` is `pub(crate)` — the raw snapshot stays in the crate, so no unchecked `Snapshot::scan` iterator is reachable from outside); `Core::latest_get`; `Core::write(_, No)`; `Core::truncate_status`; `read::read_key` / `scan`; `Ssi::read_key` / `scan`; `removal::*`; `rollback_to` (KvIo when the txn has layers at `seq >= s`, else N); `Resolver::run_once`; catalog reads (`read_rel`, `read_idx`, `scan_*`); `Catalog::open` (the `rebuild_storage_map` scan; it writes and syncs nothing); the step API's `RowOpTask::step` / `KeyOpTask::step` / `DeferrableCheckTask::step` (one latch section each; a step returns its waits as values, it never parks) |
 //! | Fsync | `Core::open`; `Core::write(_, Yes)`; `Core::sync_wal`; `Core::commit`; `CommitTicket::wait` (unanswered); `Core::seq_next`; `Catalog::alloc_oid` / `alloc_storage_id`; `GcJob::publish` / `run_once`; `CommitPipeline::process_group` (commit thread only) |
 //! | Park | `wait_on` / `wait_on_any` / `wait_on_any_deadline`; `WaitHandle::park`; `row_op`, `delete_entry`, `insert_key`, `update_pk`, `insert_on_conflict`, `fk_check_child`, `fk_check_parent`, `check_deferrable_unique`; `lock_relation` / `advisory_xact_lock` with `LockWait::Block`; `wait_for_lockers`; `catalog_*` DDL (Park and Fsync) |
 //! | Join | `CommitThreadHandle::shutdown` / `Drop`; resolver, GC and retention handle `stop` / `Drop` (wired by C-B1) |
@@ -68,7 +68,15 @@
 //! so [`ViewGuard::scan`](crate::registry::ViewGuard::scan) checks at
 //! creation **and on every `next()`** — an iterator created off-executor
 //! (or inside `allow_blocking`) and pulled on an executor thread refuses
-//! at the first pull (L-A). Writes with
+//! at the first pull (L-A). The `as_snap` arm is closed by visibility
+//! (C-R0bFIX-3, L-1): `ViewGuard::as_snap` is `pub(crate)`, so the raw
+//! snapshot — and with it an unwrapped lazy `Snapshot::scan` iterator,
+//! whose pulls no in-crate check could see — never leaves the crate.
+//! The only lazy scans reachable from outside are
+//! [`ViewGuard::scan`](crate::registry::ViewGuard::scan) and
+//! [`read::scan`](crate::read::scan) (which pulls through it), both
+//! per-`next()` checked; the eager point-read path through `as_snap`
+//! (`read::read_key`) keeps its creation-time check. Writes with
 //! `Durability::No` and the removals funnel through `Core::write` and
 //! `Core::latest_get`. **Park** rows funnel through the park sites in
 //! `wait.rs` and `locks.rs`. **Join** rows through `commit.rs`. The
