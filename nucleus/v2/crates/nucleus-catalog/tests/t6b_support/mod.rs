@@ -17,6 +17,7 @@ use nucleus_kv::{Key, MemKv, OrderedKv};
 use nucleus_txn::boot::Core;
 use nucleus_txn::catalog::{Catalog, Ddl, IdxRow, IdxStorage, RelRow};
 use nucleus_txn::commit::{CommitConfig, CommitPipeline};
+use nucleus_txn::jobs::{BootSweep, JobOutcome};
 use nucleus_txn::locks::{LockManager, RelLockMode};
 use nucleus_txn::registry::SnapshotGuard;
 use nucleus_txn::resolver::Resolver;
@@ -521,6 +522,54 @@ pub fn plant_live_version(rig: &Rig, k: &[u8], ts: Ts, payload: &[u8]) {
     value.push(0x00); // §2.2 header: live
     value.extend_from_slice(payload);
     ok(rig.kv.ingest_sorted(&mut std::iter::once((stored, value))));
+}
+
+/// Plants a raw stored version at logical key `k` with commit ts `ts`
+/// through `Core::write` itself (C-T0's raw batch primitive — the
+/// injection path the C-T6b3b amcheck tests use: no maintenance runs,
+/// no intent exists, only the stored bytes appear). `header` is the §2.2
+/// version header (`0x00`/`0x01` live, `0x02` tombstone); a tombstone
+/// carries no payload.
+pub fn core_plant_version(rig: &Rig, k: &[u8], ts: Ts, header: u8, payload: &[u8]) {
+    use nucleus_kv::{Batch, Durability};
+    use nucleus_txn::encoding::version_key;
+    let mut value = Vec::with_capacity(1 + payload.len());
+    value.push(header);
+    value.extend_from_slice(payload);
+    let mut batch = Batch::default();
+    batch.put(version_key(k, ts), value);
+    ok(rig.core().write(batch, Durability::No));
+}
+
+/// [`Rig::commit_rc`] with `synchronous_commit = off` (C-T0 §3 step 4's
+/// off-prefix): the group is processed and acked with **no** `sync_wal`,
+/// so the txn's intents and commit record stay in the fault's unsynced
+/// tail — the crash-matrix primitive (a `Fault::crash(keep)` cut then
+/// lands between them).
+pub fn commit_off(rig: &Rig, txn: Txn) -> Ts {
+    let ticket = ok(rig
+        .core()
+        .commit_submit(txn, nucleus_txn::commit::SyncCommit::Off));
+    let n = rig.process();
+    assert_eq!(n, 1, "one request per group in the hand-driven rig");
+    ok(ticket.wait())
+}
+
+/// §7.2 resolve after a crash-reopen: drives the boot sweep to
+/// `Finished` (it removes every older-epoch intent — `Resolve` for a
+/// persisted `Committed` record, `Discard` otherwise — and records
+/// `sweep_counter`), then one resolver pass for anything it queued.
+pub fn sweep(rig: &Rig) {
+    let mut sweep = BootSweep::new(Arc::clone(rig.core()));
+    // The walk is over a finite store; a bound only turns a livelock
+    // into a test failure.
+    for _ in 0..100_000 {
+        match ok(sweep.run_once()) {
+            JobOutcome::Finished => break,
+            JobOutcome::Progress | JobOutcome::Idle => continue,
+        }
+    }
+    ok(Resolver::run_once(rig.core()));
 }
 
 /// A reader id that owns nothing and is never allocated (status ids start

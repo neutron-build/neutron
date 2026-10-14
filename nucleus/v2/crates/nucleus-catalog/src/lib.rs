@@ -14,7 +14,10 @@
 //! itself is C-T6 §6.1's born-public path ([`Db::create_index`]), and a
 //! unique index born DeleteOnly or WriteOnly cannot exist through the
 //! SQL layer in 2.0 (§6: the online path never builds unique indexes).
+//! amcheck-lite (C-T6 §8: I-ROWFMT, I-IDX/I-UNIQUE, I-IDX-WO, I-IDX-DO
+//! at a registered snapshot) is the [`amcheck`] module's checker.
 
+pub mod amcheck;
 pub mod db;
 pub mod ddl;
 pub mod defs;
