@@ -110,14 +110,18 @@ fn build_scene(alter: Alter) -> (Rig, u64, Option<u64>) {
 }
 
 /// One matrix cell: the scene, the crash keeping `keep` unsynced
-/// batches, the reopen and the §7.2 resolve, then the assertions.
-/// Returns the def version the reopened catalog settled on (1 = the DDL
-/// was lost, 2 = it committed).
-fn cell(alter: Alter, keep: usize) -> u32 {
+/// batches, the reopen and the §7.2 resolve, then the assertions. `n` is
+/// the unsynced tail length the probe measured for this ALTER (FU-2/F-4:
+/// the scene is deterministic, so the cell's own tail must equal it — a
+/// divergence would mean `Fault::crash`'s clamp silently widened or
+/// narrowed the cut). Returns the def version the reopened catalog
+/// settled on (1 = the DDL was lost, 2 = it committed).
+fn cell(alter: Alter, keep: usize, n: usize) -> u32 {
     let (rig, oid, idx_oid) = build_scene(alter);
-    assert!(
-        rig.kv.unsynced_len() > 0,
-        "the scene must have an unsynced tail to cut"
+    assert_eq!(
+        rig.kv.unsynced_len(),
+        n,
+        "{alter:?}: the cell scene built the same unsynced tail the probe measured"
     );
 
     // Crash keeping `keep` of the tail; reopen the whole stack on the
@@ -170,7 +174,12 @@ fn cell(alter: Alter, keep: usize) -> u32 {
 /// The matrix: the scene is deterministic, so the tail length is
 /// measured once per ALTER kind on a probe build, and every `keep` in
 /// `0..=n` then runs its own cell. Both def outcomes must occur across
-/// the sweep (`keep = 0` loses the DDL, `keep = n` keeps it).
+/// the sweep (`keep = 0` loses the DDL, `keep = n` keeps it), and the
+/// keep→def map must be exactly a monotone split (FU-2: `old` for
+/// `0..=k`, `new` for `k+1..=n`, every keep exactly once — an
+/// off-by-one at either end of the loop, a duplicated cell, or a
+/// scene/probe divergence breaks the key-set assert; a non-monotone
+/// map breaks the split assert).
 #[test]
 fn crash_mid_alter_matrix() {
     for alter in [Alter::AddColumn, Alter::DropColumn, Alter::SetNotNull] {
@@ -181,14 +190,34 @@ fn crash_mid_alter_matrix() {
 
         let mut saw_old = false;
         let mut saw_new = false;
+        let mut outcomes: Vec<(usize, u32)> = Vec::with_capacity(n + 1);
         for keep in 0..=n {
-            let v = cell(alter, keep);
+            let v = cell(alter, keep, n);
             saw_old |= v == 1;
             saw_new |= v == 2;
+            outcomes.push((keep, v));
         }
         assert!(
             saw_old && saw_new,
             "{alter:?}: the matrix must reach both def outcomes (n = {n})"
         );
+
+        // Every prefix keep exactly once: no hole, no duplicate.
+        let mut keeps: Vec<usize> = outcomes.iter().map(|(k, _)| *k).collect();
+        keeps.sort_unstable();
+        assert_eq!(
+            keeps,
+            (0..=n).collect::<Vec<_>>(),
+            "{alter:?}: every prefix keep exactly once (n = {n})"
+        );
+        // And the map is a monotone split: every `old` outcome precedes
+        // every `new` one (the DDL's commit record sits at one fixed
+        // place in the tail, so keeping a longer prefix cannot lose it).
+        for w in outcomes.windows(2) {
+            assert!(
+                w[0].1 <= w[1].1,
+                "{alter:?}: the keep→def map must split monotonically (old then new): {outcomes:?}"
+            );
+        }
     }
 }

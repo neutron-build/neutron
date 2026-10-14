@@ -11,6 +11,15 @@
 //! latest (mutant N23's catcher: a def change committed after `at`
 //! must not change the verdict taken at `at`). Raw versions are planted
 //! through `Core::write` (`core_plant_version`).
+//!
+//! The C-T6b3bfix follow-ups: the data-side visibility-cut battery (rows,
+//! entries and index states are each read at `at` — a key-changing update
+//! and a ladder step committed after the snapshot must not leak into the
+//! pinned verdict, and a DeleteOnly-era violation must survive a
+//! post-`at` ladder to `Public`), and the `IdxStorage::Range`
+//! conservative-direction pin (a Range index is never falsely clean; the
+//! distinct report class itself is a src-side change outside this card's
+//! Touch-only files).
 
 mod t6b_support;
 
@@ -489,6 +498,160 @@ fn catalog_is_read_at_at_not_the_latest() {
     assert_ne!(at, Ts(0));
 }
 
+/// FU-1 (the C-T6b3b gate's F-1): amcheck's **data-side** reads — rows and
+/// entries — happen at `at`, not at the latest state. The snapshot is
+/// taken, then a key-changing update of the indexed column and an
+/// index-state ladder step (DeleteOnly→WriteOnly, §7 steps 1-2) commit
+/// after it. At the pinned snapshot the pre-update rows and entries must
+/// still agree (clean); a fresh snapshot sees the entry moved — also
+/// clean. An amcheck that reads rows at the latest (M-vis-row) or entries
+/// at the latest (M-vis-entry) mixes the two sides of I-IDX on the
+/// updated entry and reports a false violation at `at`.
+#[test]
+fn rows_and_entries_are_read_at_at_not_the_latest() {
+    let rig = Rig::new();
+    // One txn: the table, two rows, and the born-public unique index
+    // (§6.1 case (a): the relation is the txn's own, `built_at = 0`).
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st, b"vis", &pk_schema()));
+    let st2 = rig.stmt(&t0, s0);
+    let h = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st2, &h, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st2, &h, &[i32_d(2), text_d("b")]));
+    let st3 = rig.stmt(&t0, s0);
+    let u_idx = ok(rig
+        .db
+        .create_index(&st3, oid, &idx_def(2, true, IndexState::DeleteOnly)));
+    ok(rig.commit_rc(t0));
+
+    // A ladder index on the same column, DeleteOnly at `at` (so the
+    // ladder step after `at` changes the index catalog the check reads).
+    let (nu_idx, _nu_isid) = rig.add_index(oid, &idx_def(2, false, IndexState::DeleteOnly));
+
+    // The snapshot the verdict is taken at.
+    let guard = rig.core().registry.take_snapshot();
+    let at = guard.ts();
+
+    // After `at`: (a) a key-changing update of the indexed column …
+    {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        assert!(ok(rig.db.update(
+            &st,
+            oid,
+            &[i32_v(1)],
+            &[t6b_support::set_col(2, text_d("aa"))]
+        )));
+        ok(rig.commit_rc(t));
+    }
+    // … and (b) the ladder step DeleteOnly→WriteOnly.
+    rig.set_index_def(nu_idx, idx_def(2, false, IndexState::WriteOnly));
+    assert!(
+        rig.core().visible_ts() > at,
+        "both post-`at` commits are really after the snapshot"
+    );
+
+    // At `at`: row 1 is still ‖a with its original /u/ entry, and the
+    // ladder index is still DeleteOnly with no entry — clean.
+    let pinned = ok(check_table(&rig.db, oid, &guard));
+    assert!(
+        pinned.is_clean(),
+        "M-vis-row/M-vis-entry: rows and entries are read at `at`, not the latest: {:?}",
+        pinned.violations
+    );
+
+    // A fresh snapshot: clean too, with the entry moved — the pinned
+    // verdict really was the one at `at`.
+    let u_isid = isid_of(&rig, u_idx);
+    let old = u_entry_key(u_isid, &[text_col()], &[text_v("a".into())]);
+    let new = u_entry_key(u_isid, &[text_col()], &[text_v("aa".into())]);
+    let live: Vec<_> = rig
+        .scan_entries(u_isid)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        !live.contains(&old),
+        "the pre-update entry is gone at latest"
+    );
+    assert!(
+        live.contains(&new),
+        "the post-update entry is there at latest"
+    );
+    let fresh = check_now(&rig, oid);
+    assert!(fresh.is_clean(), "{:?}", fresh.violations);
+}
+
+/// FU-1's violation-judged twin (the gate's F-1, M-vis-idx): the **index
+/// defs** are read at `at` too. An entry is planted under an index that is
+/// DeleteOnly at `at`; the index is laddered `Public` after `at` (§7
+/// step 7's shape: `built_at` above `at`). At `at` the planted entry is an
+/// I-IDX-DO violation and must still be reported — an amcheck reading the
+/// index catalog at the latest would see `Public` with `built_at > at`:
+/// not its business at `at` (§4), unchecked, clean. At a fresh snapshot
+/// the index is `Public` with `built_at <= now`, the planted entry is the
+/// computed entry of the row, and the store is clean.
+#[test]
+fn index_state_is_read_at_at_not_the_latest() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st, b"vis2", &pk_schema()));
+    ok(rig.commit_rc(t0));
+    add_row(&rig, oid, 1, "a"); // before the index exists: no entry, ever
+
+    // The ladder index, DeleteOnly at `at`.
+    let (do_idx, do_isid) = rig.add_index(oid, &idx_def(2, false, IndexState::DeleteOnly));
+
+    // … except this one: planted raw (`Core::write`), no maintenance ran.
+    let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+    let entry = i_entry_key(do_isid, &[text_col()], &[text_v("a".into())], &key1);
+    core_plant_version(&rig, &entry, rig.core().visible_ts(), HEADER_LIVE, &[]);
+
+    // The snapshot the verdict is taken at.
+    let guard = rig.core().registry.take_snapshot();
+    let at = guard.ts();
+
+    // After `at`: the ladder completes (§7 step 7) — `Public`, `built_at`
+    // one past `at`, the earliest ts a later build's `S` could take.
+    let mut public = idx_def(2, false, IndexState::Public);
+    public.built_at = at.0 + 1;
+    rig.set_index_def(do_idx, public);
+    assert!(
+        rig.core().visible_ts() > at,
+        "the ladder step is really after the snapshot"
+    );
+
+    // At `at` the index is DeleteOnly with a visible entry: I-IDX-DO.
+    let pinned = ok(check_table(&rig.db, oid, &guard));
+    assert!(
+        !pinned.is_clean(),
+        "M-vis-idx: the index state is read at `at`, not the latest: {:?}",
+        pinned.violations
+    );
+    assert_eq!(pinned.violations.len(), 1, "{:?}", pinned.violations);
+    assert!(
+        pinned.violations[0].starts_with(&format!("I-IDX-DO: index {do_idx} of relation {oid}")),
+        "{}",
+        pinned.violations[0]
+    );
+    assert!(
+        pinned.violations[0].contains(&format!("e.g. {entry:?}")),
+        "{}",
+        pinned.violations[0]
+    );
+
+    // A fresh snapshot: `Public` with `built_at <= now` — the planted
+    // entry is exactly the computed entry of row 1, so the store is
+    // clean: the verdict really was the one at `at`.
+    let fresh = check_now(&rig, oid);
+    assert!(fresh.is_clean(), "{:?}", fresh.violations);
+}
+
 /// A hidden-rowid table (§3): the rowid is in the key only, never a
 /// column — clean rows re-encode, and a row planted at a key whose value
 /// part is not a canonical bytea encoding flags I-ROWFMT.
@@ -538,4 +701,49 @@ fn missing_relation_is_42p01() {
     let err = check_table(&rig.db, 999, &guard).expect_err("no such relation");
     assert!(matches!(err, nucleus_catalog::DbError::UndefinedTable));
     assert_eq!(err.sqlstate(), "42P01");
+}
+
+/// The C-T6b3b gate's F-5, the half pinnable from this card's Touch-only
+/// files: an index with explicit entry ranges (C-T6b2) is conservatively
+/// **not clean** — exactly one finding, naming the index — under
+/// whichever report class the checker emits (FU-4a's distinct
+/// "unchecked" class is a src-side change outside this card's Touch-only
+/// list; recorded as this card's ESCALATE note). The conservative
+/// direction (never a false negative) is the property that matters.
+#[test]
+fn a_range_index_is_conservatively_not_clean() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st, b"rng", &pk_schema()));
+    ok(rig.commit_rc(t0));
+    add_row(&rig, oid, 1, "a");
+
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let (idx_oid, _) = ok(rig.catalog().catalog_create_index(
+        &rig.ddl(&t1, s1),
+        oid,
+        IdxStorage::Range(b"/i/x/".to_vec(), b"/i/x0".to_vec()),
+        &ok(idx_def(2, false, IndexState::Public).encode()),
+    ));
+    ok(rig.commit_rc(t1));
+
+    let report = check_now(&rig, oid);
+    assert!(
+        !report.is_clean(),
+        "conservative: a Range index keeps the report unclean"
+    );
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    assert!(
+        report.violations[0].contains(&format!("index {idx_oid} of relation {oid}")),
+        "the finding names the Range index: {}",
+        report.violations[0]
+    );
+    assert!(
+        report.violations[0].contains("not checkable"),
+        "{}",
+        report.violations[0]
+    );
 }
