@@ -2,25 +2,97 @@
 //! aborts and rolls back with its DDL, the cleanup waits for the durable
 //! `W` to pass the snapshot that saw the row, TRUNCATE and DROP INDEX
 //! retire their ranges (and the new storage is untouched), and intents
-//! inside a retired range go through §7.3 before the `DeleteRange`. Each
-//! test's doc names the mutant it kills (card item 7).
+//! inside a retired range go through §7.3 before the `DeleteRange`. The
+//! C-B1bfix follow-ups add: DROP TABLE of a table **with an index**
+//! retires every noted range (L-1), and the job's `JobSet` wiring — the
+//! W-rise wake (L-2) and the shutdown order around an in-flight marker
+//! delete (L-3). Each test's doc names the mutant it kills.
 
 mod b1_support;
 
+use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use b1_support::{ok, place_write, reopen_rig, tkey, B1Rig};
+use b1_support::{ok, place_write, reopen_rig, tkey, B1Rig, KillKv};
+use nucleus_kv::{MemKv, OrderedKv, Snapshot};
 use nucleus_txn::boot::Core;
-use nucleus_txn::catalog::{table_range, RetiredRow};
-use nucleus_txn::commit::SyncCommit;
-use nucleus_txn::gc::{GcConfig, GcJob};
+use nucleus_txn::catalog::{table_range, Catalog, RetiredRow};
+use nucleus_txn::commit::{FailStop, SyncCommit, SystemClock};
+use nucleus_txn::gc::{GcConfig, GcJob, GcRunner};
 use nucleus_txn::jobs::metrics::METRIC_DROP_CLEANUP_PENDING;
-use nucleus_txn::jobs::{DropCleanup, JobOutcome};
+use nucleus_txn::jobs::{
+    DropCleanup, JobConfig, JobKind, JobOutcome, JobPoint, JobProbe, JobSet, ShutdownStep,
+    SHUTDOWN_ORDER,
+};
 use nucleus_txn::resolver::Resolver;
+use nucleus_txn::visibility::ReadCtx;
+use nucleus_txn::TxnId;
 
 /// Installs the GC job (the cleanup retires through it).
 fn gc<K: nucleus_kv::OrderedKv>(core: &Arc<Core<K>>) -> Arc<GcJob<K>> {
     Arc::new(ok(GcJob::install(core, GcConfig::default())))
+}
+
+/// A job config with a `secs`-seconds idle interval.
+fn idle(secs: u64) -> JobConfig {
+    JobConfig {
+        idle_interval: Duration::from_secs(secs),
+    }
+}
+
+/// Polls `f` every 2 ms until it answers true, failing after
+/// `deadline_secs`.
+fn wait_until(deadline_secs: u64, what: &str, mut f: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !f() {
+        assert!(
+            start.elapsed() < Duration::from_secs(deadline_secs),
+            "{what} did not happen within {deadline_secs}s"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The visible retired rows at `visible_ts` (the rig-free form of
+/// `B1Rig::retired_rows`, for use once the rig's commit thread has been
+/// attached to a `JobSet` — a partial move of the rig).
+fn retired_rows_now(core: &Core<KillKv<MemKv>>) -> Vec<(u64, RetiredRow)> {
+    let view = core.open_view();
+    let ctx = ReadCtx {
+        txn: TxnId {
+            epoch: core.epoch(),
+            n: u64::MAX,
+        },
+        snapshot: core.visible_ts(),
+        stmt_seq: 1,
+    };
+    ok(Catalog::scan_retired(core, &view, &ctx))
+}
+
+/// Whether `[lo, hi)` holds no raw entry at all (the rig-free form of
+/// `B1Rig::raw_range_empty`; reads pass through the KillKv).
+fn raw_empty(kv: &KillKv<MemKv>, lo: &[u8], hi: &[u8]) -> bool {
+    let snap = kv.snapshot();
+    let empty = snap
+        .scan((Bound::Included(lo), Bound::Excluded(hi)), false)
+        .next()
+        .is_none();
+    empty
+}
+
+/// The `SHUTDOWN_ORDER` steps the JobSet tests run, in order: the
+/// cleanup, the commit thread, then the GC.
+fn expected_jobset_log() -> Vec<ShutdownStep> {
+    SHUTDOWN_ORDER
+        .iter()
+        .copied()
+        .filter(|s| match s {
+            ShutdownStep::Job(k) => matches!(k, JobKind::DropCleanup | JobKind::Gc),
+            ShutdownStep::CommitThread => true,
+        })
+        .collect()
 }
 
 /// Advances `visible_ts` by one durable write so the next publish raises
@@ -303,6 +375,105 @@ fn truncate_and_drop_index_retire_their_ranges() {
     drop(gc);
 }
 
+/// DT-IDXRANGES (DROP TABLE's retired row omits the index ranges — only
+/// `retired[0]`): a table **with** an Id index, data under all three
+/// ranges, is DROPped; the row's ranges must equal the noted set exactly
+/// — the table range plus both index ranges, the order `note_retired`
+/// received them — and every one of them must go raw-empty once the
+/// cleanup passes the durable-W gate (C-B1b gate L-1: leaked index
+/// storage is otherwise invisible forever). The filler relation keeps
+/// `rel_oid` off 0 (N-2: the oid assertion must not be vacuous) and its
+/// surviving storage proves the emptiness is the cleanup's doing.
+#[test]
+fn drop_table_with_an_index_retires_every_range() {
+    let rig = B1Rig::new();
+    let core = &rig.core;
+
+    // A filler relation first: the dropped table's oid is non-zero, and
+    // the filler's own data proves the cleanup's emptiness is not global.
+    let t0 = rig.rc();
+    let (_oid_f, sid_f) = rig.create_table(&t0, b"F");
+    ok(core.commit(t0, SyncCommit::On));
+    let tf = rig.rc();
+    place_write(core, &tf, &tkey(sid_f, "f0"), b"filler");
+    ok(core.commit(tf, SyncCommit::On));
+
+    let t1 = rig.rc();
+    let (oid_t, sid_t) = rig.create_table(&t1, b"T");
+    ok(core.commit(t1, SyncCommit::On));
+    let t2 = rig.rc();
+    let (_oid_ix, sid_ix) = rig.create_index(&t2, oid_t);
+    ok(core.commit(t2, SyncCommit::On));
+
+    // Data under the table range and both index ranges (committed,
+    // unresolved — the retire path removes the intents through §7.3
+    // first).
+    let t3 = rig.rc();
+    let kr = tkey(sid_t, "r0");
+    let (u_lo, _) = nucleus_txn::catalog::index_ranges(sid_ix)[0].clone();
+    let (i_lo, _) = nucleus_txn::catalog::index_ranges(sid_ix)[1].clone();
+    let mut ku = u_lo.clone();
+    ku.extend_from_slice(b"e0");
+    let mut ki = i_lo.clone();
+    ki.extend_from_slice(b"e0");
+    place_write(core, &t3, &kr, b"r");
+    place_write(core, &t3, &ku, b"u");
+    place_write(core, &t3, &ki, b"i");
+    ok(core.commit(t3, SyncCommit::On));
+
+    // DROP TABLE: one row, its ranges exactly the noted set.
+    let t4 = rig.rc();
+    rig.drop_table(&t4, oid_t);
+    ok(core.commit(t4, SyncCommit::On));
+    let rows = rig.retired_rows();
+    assert_eq!(rows.len(), 1, "one retired row per DDL statement: {rows:?}");
+    let RetiredRow { rel_oid, ranges } = rows[0].1.clone();
+    assert_eq!(rel_oid, oid_t, "the row names the dropped relation");
+    assert_ne!(
+        rel_oid, 0,
+        "not the first-ever relation, so the oid check is not vacuous (N-2)"
+    );
+    let mut expected = vec![table_range(sid_t)];
+    expected.extend(nucleus_txn::catalog::index_ranges(sid_ix));
+    assert_eq!(
+        ranges, expected,
+        "the row carries the table range and both index ranges"
+    );
+
+    // Drive the cleanup to quiescence: scan, heartbeat, publish, clean.
+    let gc = gc(&rig.core);
+    let mut cleanup = DropCleanup::new(Arc::clone(core), Arc::clone(&gc));
+    ok(cleanup.run_once()); // scan at S; gated (S == W)
+    heartbeat(&rig.core, b"/t/1/hb3");
+    ok(gc.publish(0));
+    ok(cleanup.run_once()); // the row
+    assert!(matches!(ok(cleanup.run_once()), JobOutcome::Idle));
+
+    // Every noted range is raw-empty afterwards...
+    for (lo, hi) in &expected {
+        assert!(
+            rig.raw_range_empty(lo, hi),
+            "the retired range {lo:?}..{hi:?} is cleaned"
+        );
+    }
+    // ...the filler's storage is not (its committed write survives; the
+    // emptiness is the cleanup's doing, not the workload's)...
+    let (flo, fhi) = table_range(sid_f);
+    assert!(
+        !rig.raw_range_empty(&flo, &fhi),
+        "the filler relation's storage is untouched"
+    );
+    assert_eq!(
+        rig.read_at(&tkey(sid_f, "f0"), core.visible_ts()),
+        Some(b"filler".to_vec()),
+        "the filler's data reads"
+    );
+    // ...and the marker row is gone.
+    assert!(rig.retired_rows().is_empty(), "the marker row is deleted");
+    drop(cleanup);
+    drop(gc);
+}
+
 /// Intents inside a retired range go through §7.3 first (§9.2): an
 /// aborted txn's uncleaned intent (its cleanup still queued) and an
 /// older-epoch committed intent under the dropped range are removed with
@@ -412,4 +583,172 @@ fn intents_in_a_retired_range_go_through_7_3_first() {
     assert!(matches!(ok(cleanup.run_once()), JobOutcome::Idle));
     drop(cleanup);
     drop(gc);
+}
+
+/// NOWAKE (the `wake_job(DropCleanup)` on the durable-W rise removed):
+/// the cleanup runs in a real `JobSet` with the GC runner and the commit
+/// thread, at a 3600 s idle interval — the wake inside
+/// `GcJob::publish`'s W-rose branch is then the only thing that can run
+/// it again. One heartbeat lifts `visible_ts` past the row's remembered
+/// snapshot; the row must be cleaned within a bounded window, with no
+/// poke from the test (C-B1b gate L-2: without the wake only the idle
+/// interval remains, a latency-only backstop).
+#[test]
+fn jobset_cleanup_cleans_once_w_rises_without_a_poke() {
+    let rig = B1Rig::new();
+    let core = &rig.core;
+    // One dropped table with data under its range.
+    let t0 = rig.rc();
+    let (oid_a, sid_a) = rig.create_table(&t0, b"A");
+    ok(core.commit(t0, SyncCommit::On));
+    let t1 = rig.rc();
+    let ka = tkey(sid_a, "a0");
+    place_write(core, &t1, &ka, b"va");
+    ok(core.commit(t1, SyncCommit::On));
+    let t2 = rig.rc();
+    rig.drop_table(&t2, oid_a);
+    ok(core.commit(t2, SyncCommit::On));
+    let (lo, hi) = table_range(sid_a);
+    let kv = rig.kv.clone();
+
+    let gc = gc(&rig.core);
+    let mut set = JobSet::new(Arc::clone(&rig.core))
+        .with_fail_stop(Arc::clone(&rig.hook) as Arc<dyn FailStop>);
+    // 3600 s idle: without the W-rise wake the job never runs again
+    // inside the window below.
+    ok(set.start(
+        Box::new(DropCleanup::new(Arc::clone(&rig.core), Arc::clone(&gc))),
+        idle(3600),
+    ));
+    // The GC runner publishes every 20 ms: once the heartbeat lifts
+    // visible_ts, its next publish raises the durable W past the row's
+    // remembered snapshot — and wakes the cleanup.
+    ok(set.start(
+        Box::new(GcRunner::new(Arc::clone(&gc), Arc::new(SystemClock))),
+        JobConfig {
+            idle_interval: Duration::from_millis(20),
+        },
+    ));
+    set.attach_commit_thread(rig.commit);
+
+    // The first step (immediate at start) scanned the row and parked:
+    // gated at S == W (W only passes a snapshot when visible_ts does).
+    wait_until(5, "the cleanup saw the retired row", || {
+        pending_gauge(&rig.core) == 1
+    });
+    // The W rise itself: one heartbeat commit. No poke of the cleanup.
+    heartbeat(&rig.core, b"/t/1/hb1");
+
+    // The row is cleaned within the window — by the wake, not the
+    // interval.
+    wait_until(5, "the retired row was cleaned after W rose", || {
+        retired_rows_now(&rig.core).is_empty() && raw_empty(&kv, &lo, &hi)
+    });
+    assert_eq!(pending_gauge(&rig.core), 0, "nothing is pending anymore");
+
+    ok(set.shutdown());
+    assert!(
+        rig.hook.errors().is_empty(),
+        "a clean run reports nothing: {:?}",
+        rig.hook.errors()
+    );
+    assert_eq!(set.shutdown_log(), expected_jobset_log());
+}
+
+/// SHUT-ORDER (`DropCleanup` moved after `CommitThread` in
+/// `SHUTDOWN_ORDER`): a probe parks the cleanup's step 300 ms at
+/// `RetireBeforeMarkerDelete` — its marker delete is genuinely in flight
+/// — while the test calls `set.shutdown()`. In the prescribed order the
+/// job stops **before** the commit thread: the join waits out the park
+/// and the in-flight delete is acked by the still-running pipeline, so
+/// the shutdown is clean. With the mutant the commit thread dies first
+/// and the delete fails, fail-stopping the set (C-B1b gate L-3).
+#[test]
+fn jobset_shutdown_acks_an_inflight_marker_delete() {
+    let rig = B1Rig::new();
+    let core = &rig.core;
+    // One dropped table with data under its range.
+    let t0 = rig.rc();
+    let (oid_a, sid_a) = rig.create_table(&t0, b"A");
+    ok(core.commit(t0, SyncCommit::On));
+    let t1 = rig.rc();
+    let ka = tkey(sid_a, "a0");
+    place_write(core, &t1, &ka, b"va");
+    ok(core.commit(t1, SyncCommit::On));
+    let t2 = rig.rc();
+    rig.drop_table(&t2, oid_a);
+    ok(core.commit(t2, SyncCommit::On));
+    let (lo, hi) = table_range(sid_a);
+    let kv = rig.kv.clone();
+
+    /// Counts `RetireAfterRange` hits and parks 300 ms at the first
+    /// `RetireBeforeMarkerDelete`, so the marker delete overlaps the
+    /// shutdown call deterministically.
+    struct ParkAtMarkerDelete {
+        ranges: AtomicU64,
+        parked: AtomicBool,
+    }
+    impl JobProbe for ParkAtMarkerDelete {
+        fn at(&self, point: JobPoint) {
+            match point {
+                JobPoint::RetireAfterRange => {
+                    self.ranges.fetch_add(1, Ordering::SeqCst);
+                }
+                JobPoint::RetireBeforeMarkerDelete if !self.parked.swap(true, Ordering::SeqCst) => {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                _ => {}
+            }
+        }
+    }
+    let probe = Arc::new(ParkAtMarkerDelete {
+        ranges: AtomicU64::new(0),
+        parked: AtomicBool::new(false),
+    });
+    rig.core
+        .set_job_probe(Arc::clone(&probe) as Arc<dyn JobProbe>);
+
+    let gc = gc(&rig.core);
+    let mut set = JobSet::new(Arc::clone(&rig.core))
+        .with_fail_stop(Arc::clone(&rig.hook) as Arc<dyn FailStop>);
+    ok(set.start(
+        Box::new(DropCleanup::new(Arc::clone(&rig.core), Arc::clone(&gc))),
+        idle(3600),
+    ));
+    ok(set.start(
+        Box::new(GcRunner::new(Arc::clone(&gc), Arc::new(SystemClock))),
+        JobConfig {
+            idle_interval: Duration::from_millis(20),
+        },
+    ));
+    set.attach_commit_thread(rig.commit);
+
+    // The row is seen and gated; the heartbeat lifts visible_ts past its
+    // remembered snapshot and the next publish wakes the cleanup.
+    wait_until(5, "the cleanup saw the retired row", || {
+        pending_gauge(&rig.core) == 1
+    });
+    heartbeat(&rig.core, b"/t/1/hb2");
+    // The woken step wrote the range's DeleteRange batch (the probe
+    // counted it) and is now parked at the marker-delete probe.
+    wait_until(5, "the retired range was deleted", || {
+        probe.ranges.load(Ordering::SeqCst) >= 1
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    // The ordered shutdown: DropCleanup stops (the join waits out the
+    // park; the in-flight delete is acked) before the commit thread.
+    ok(set.shutdown());
+    assert!(
+        rig.hook.errors().is_empty(),
+        "the in-flight marker delete was acked, not failed: {:?}",
+        rig.hook.errors()
+    );
+    // The in-flight work landed: the row is gone and the range is empty.
+    assert!(
+        retired_rows_now(&rig.core).is_empty(),
+        "the marker row is deleted"
+    );
+    assert!(raw_empty(&kv, &lo, &hi), "the retired range is raw-empty");
+    assert_eq!(set.shutdown_log(), expected_jobset_log());
 }
