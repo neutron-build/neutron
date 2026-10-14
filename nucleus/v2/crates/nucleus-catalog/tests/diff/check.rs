@@ -1164,9 +1164,23 @@ impl Effects {
                         if let Some(w) = at_s.t_prov.get(pk) {
                             add(*w, r.uid, "wr", r.snap, &mut edges);
                         }
-                    }
-                    if let Some(w) = self.last_t_write.get(pk) {
-                        add(r.uid, *w, "rw", r.snap, &mut edges);
+                        // The final writer wrote a version after the one
+                        // read; whether it updated or deleted the key,
+                        // ordering it before the reader would change what
+                        // the reader saw.
+                        if let Some(w) = self.last_t_write.get(pk) {
+                            add(r.uid, *w, "rw", r.snap, &mut edges);
+                        }
+                    } else if model.final_state.t.contains_key(pk) {
+                        // Absent at S but live at the end: its final
+                        // writer is an inserter that cannot precede the
+                        // read. (A final tombstone could — a delete
+                        // before the reader also reads absent — so an
+                        // absent read over a finally-dead key adds no
+                        // edge.)
+                        if let Some(w) = self.last_t_write.get(pk) {
+                            add(r.uid, *w, "rw", r.snap, &mut edges);
+                        }
                     }
                 }
                 Scope::ScanT { pks } => {
@@ -1196,9 +1210,15 @@ impl Effects {
                         if let Some(w) = at_s.u_prov.get(a) {
                             add(*w, r.uid, "wr", r.snap, &mut edges);
                         }
-                    }
-                    if let Some(w) = self.last_u_write.get(a) {
-                        add(r.uid, *w, "rw", r.snap, &mut edges);
+                        if let Some(w) = self.last_u_write.get(a) {
+                            add(r.uid, *w, "rw", r.snap, &mut edges);
+                        }
+                    } else if model.final_state.u.contains_key(a) {
+                        // As PkT: only a finally-live row's inserter is
+                        // forced after an absent read.
+                        if let Some(w) = self.last_u_write.get(a) {
+                            add(r.uid, *w, "rw", r.snap, &mut edges);
+                        }
                     }
                 }
                 Scope::ScanU { ids } => {
