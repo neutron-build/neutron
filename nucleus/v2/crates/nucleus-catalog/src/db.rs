@@ -618,7 +618,14 @@ impl<K: OrderedKv> Db<K> {
     /// its txn's earlier statements, and serves the read only if the index
     /// is `Public` with `built_at <= st.snapshot` (§4: "an index serves a
     /// read at `S` iff `Public` and `built_at <= S`"); anything else is
-    /// 0A000 ("index not usable at snapshot"). The entry range read goes
+    /// 0A000 ("index not usable at snapshot"). Under RR/SER the §4
+    /// relation rule runs too, exactly as
+    /// [`Db::open_table`](Db::open_table) runs it for every other
+    /// relation access: the relation row read at the statement's snapshot
+    /// and at the latest committed state (both through a ghost reader),
+    /// present at the snapshot with a different storage id — a foreign
+    /// TRUNCATE or rewrite committed after it — is 40001, never a silent
+    /// serve of pre-rewrite data. The entry range read goes
     /// through `Ssi::scan` under SERIALIZABLE (the range SIREAD registers
     /// before the scan's view, §8.1) and each row fetch through
     /// `Ssi::read_key` (its SIREAD registered before its own view, §8.1
@@ -667,6 +674,40 @@ impl<K: OrderedKv> Db<K> {
         let Some(rel) = rel else {
             return Err(DbError::UndefinedTable);
         };
+        // §4's RR/SER relation rule, as `open_table` runs it for every
+        // other relation access: the relation row at the statement's
+        // snapshot and at the latest committed state, both through a
+        // ghost reader (a `TxnId` this process never allocates), so the
+        // txn's own writes are ignored on both sides — present at the
+        // snapshot with a different storage id (a foreign TRUNCATE or
+        // rewrite committed after it) is 40001; absent at the snapshot →
+        // proceed (§4). A storage id installed by the txn's own DDL can
+        // never differ from itself on these reads.
+        if matches!(
+            st.txn.isolation,
+            Isolation::RepeatableRead | Isolation::Serializable
+        ) {
+            let ghost = |snapshot: Ts| ReadCtx {
+                txn: ghost_id(&self.core),
+                snapshot,
+                stmt_seq: 0,
+            };
+            let at_s = {
+                let view = self.core.open_view();
+                Catalog::read_rel(&self.core, &view, &ghost(st.snapshot), owner)
+                    .map_err(DbError::Txn)?
+            };
+            let latest = {
+                let view = self.core.open_view();
+                Catalog::read_rel(&self.core, &view, &ghost(self.core.visible_ts()), owner)
+                    .map_err(DbError::Txn)?
+            };
+            if let (Some(at_s), Some(latest)) = (at_s, latest) {
+                if at_s.storage_id != latest.storage_id {
+                    return Err(DbError::Txn(TxnError::SerializationFailure));
+                }
+            }
+        }
         let def = IndexDef::decode(&idx.def)?;
         if def.state != IndexState::Public || def.built_at > st.snapshot().0 {
             return Err(DbError::FeatureNotSupported("index not usable at snapshot"));

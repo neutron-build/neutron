@@ -6,22 +6,39 @@
 //! or its key no longer re-encodes (mutant N21); and §6.1(b)'s own-rows
 //! scan runs at `S_e`, never at the statement's older snapshot (mutant
 //! N16, the born-public-after-concurrent-delete schedule).
+//!
+//! C-T6b2bfix follow-ups (gate findings F-1..F-8): the RR snapshot pin
+//! (FU-1/M1), the same-txn own-entries pin (FU-2/M13), the §4 RR/SER
+//! relation rule in `index_scan` (FU-3), the born-public key limit
+//! (FU-4/K-LIM), the DROP-INDEX fence (FU-5) and the `built_at == S`
+//! boundary (FU-6/B-EDGE) — plus one ESCALATE-marked reproduction of the
+//! fencing gap found while writing FU-5.
 
 mod t6b_support;
 
 use std::ops::Bound;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use t6b_support::{
-    i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, plant_live_version, row_key_of, set_col,
-    text_d, text_v, u_entry_key, Rig,
+    i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, plant_live_version, raw_entry_trace,
+    row_key_of, set_col, text_d, text_v, u_entry_key, wait_until, Rig,
 };
 
-use nucleus_catalog::{DbError, IndexState, Stmt};
+use nucleus_catalog::{DbError, IndexDef, IndexState, Stmt, KEY_LIMIT};
 use nucleus_codec::row::Datum;
 use nucleus_codec::{Collation, KeyColumn, KeyType, Value};
 use nucleus_kv::Key;
-use nucleus_txn::catalog::IdxStorage;
+use nucleus_txn::catalog::{Catalog, IdxStorage};
 use nucleus_txn::locks::RelLockMode;
+use nucleus_txn::visibility::ReadCtx;
+use nucleus_txn::{Ts, TxnError, TxnId};
+
+/// Everything a thread may wait on is bounded by this; the joins use it
+/// too (a hang is a failure, not a pass).
+const BOUND: Duration = Duration::from_secs(30);
 
 fn text_col() -> KeyColumn {
     KeyColumn::asc(KeyType::Text(Collation::C))
@@ -421,4 +438,461 @@ fn born_public_after_concurrent_delete() {
     ok(rig.commit_rc(t5));
     assert_eq!(rows.len(), 1, "the new row is the only entry");
     assert_eq!(rows[0].1, vec![i32_d(2), text_d("k")]);
+}
+
+// ---- C-T6b2bfix: the gate's follow-ups (FU-1..FU-6) --------------------------
+
+/// `CREATE TABLE t (id int4 PRIMARY KEY, payload text)`, committed.
+fn mk_table(rig: &Rig, name: &[u8]) -> (u64, u64) {
+    let t = rig.rc();
+    let s = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t, s));
+    let r = ok(rig.db.create_table(&st, name, &pk_schema()));
+    ok(rig.commit_rc(t));
+    r
+}
+
+/// An empty pre-existing table that gets one own row and a born-public
+/// index in a single committed txn (§6.1 case (b): the row is the txn's
+/// own write, invisible to the emptiness scan's ghost reader). Returns
+/// `(relation oid, index oid)`.
+fn born_index_after_own_row(rig: &Rig, name: &[u8], id: i32, payload: &str) -> (u64, u64) {
+    let (oid, _sid) = mk_table(rig, name);
+    let t = rig.rc();
+    let s = rig.core().visible_ts();
+    let st = rig.stmt(&t, s);
+    let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st, &h, &[i32_d(id), text_d(payload)]));
+    let st2 = rig.stmt(&t, s);
+    let idx_oid = ok(rig
+        .db
+        .create_index(&st2, oid, &idx_def(2, false, IndexState::Public)));
+    ok(rig.commit_rc(t));
+    (oid, idx_oid)
+}
+
+/// The index rows of relation `oid` at `visible_ts`, through a reader id
+/// this process never allocates (the "abort leaves no idx row" oracle —
+/// the failing creation never returns its oid to count directly).
+fn idx_rows_of(rig: &Rig, oid: u64) -> Vec<nucleus_txn::catalog::IdxRow> {
+    let view = rig.core().open_view();
+    let ctx = ReadCtx {
+        txn: TxnId {
+            epoch: rig.core().epoch(),
+            n: u64::MAX,
+        },
+        snapshot: rig.core().visible_ts(),
+        stmt_seq: 1,
+    };
+    ok(Catalog::scan_idxs_of_rel(rig.core(), &view, &ctx, oid))
+}
+
+/// FU-1 (F-1's M1): `index_scan`'s read ctx runs at the statement's
+/// snapshot, never at `visible_ts` — an RR txn whose snapshot precedes a
+/// foreign insert's commit sees exactly its snapshot's rows through the
+/// index. Under the mutant the entry scan (and the row fetch) run at
+/// `visible_ts` and the post-snapshot row leaks in: two rows, silently.
+#[test]
+fn index_scan_reads_at_the_rr_snapshot() {
+    let rig = Rig::new();
+    // One txn: the table, one own row, the born-public index (§6.1 (a)),
+    // committed.
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st0, b"rrsnap", &pk_schema()));
+    let st1 = rig.stmt(&t0, s0);
+    let h = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st1, &h, &[i32_d(1), text_d("a")]));
+    let st2 = rig.stmt(&t0, s0);
+    let idx_oid = ok(rig
+        .db
+        .create_index(&st2, oid, &idx_def(2, false, IndexState::Public)));
+    ok(rig.commit_rc(t0));
+
+    // The RR txn begins and takes its registered snapshot S; its
+    // statement exists before the foreign insert commits (§3.1: the
+    // caller owns the registration).
+    let (rr, guard, s) = rig.rr();
+    let st = rig.stmt(&rr, s);
+
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let st3 = rig.stmt(&t1, s1);
+    let h1 = ok(rig.db.open_table(&st3, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st3, &h1, &[i32_d(2), text_d("b")]));
+    ok(rig.commit_rc(t1));
+
+    // §4: the RR statement reads at S — exactly the one row committed at
+    // or below S, never the post-S insert.
+    let rows = ok(rig
+        .db
+        .index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(
+        rows.len(),
+        1,
+        "the RR statement sees only its snapshot's row"
+    );
+    assert_eq!(rows[0].1, vec![i32_d(1), text_d("a")]);
+    rig.abort_txn(rr);
+    drop(guard);
+}
+
+/// FU-2 (F-2's M13): a later statement of the creating txn reads its own
+/// born-index entries — the `stmt_seq` half of the own-intent read rule
+/// (I-HALLOWEEN's boundary: own writes of *earlier* statements are
+/// visible). Under the mutant (`stmt_seq: 0`) the scan misses the txn's
+/// own entry: zero rows. Both §6.1 cases, the own-table (a) and the
+/// pre-existing (b) twin (insert, savepoint, create, scan).
+#[test]
+fn index_scan_serves_the_creating_txns_own_entries() {
+    let rig = Rig::new();
+    // (a) the txn's own relation: CREATE TABLE; INSERT; CREATE INDEX; a
+    // later statement of the same txn scans through the index.
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st0, b"ownscan", &pk_schema()));
+    let st1 = rig.stmt(&t0, s0);
+    let h = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st1, &h, &[i32_d(1), text_d("a")]));
+    let st2 = rig.stmt(&t0, s0);
+    let idx_oid = ok(rig
+        .db
+        .create_index(&st2, oid, &idx_def(2, false, IndexState::Public)));
+    let st3 = rig.stmt(&t0, s0);
+    let rows = ok(rig
+        .db
+        .index_scan(&st3, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(
+        rows.len(),
+        1,
+        "the creating txn's later statement sees its own row"
+    );
+    assert_eq!(rows[0].1, vec![i32_d(1), text_d("a")]);
+    ok(rig.commit_rc(t0));
+
+    // (b) the twin on a pre-existing relation: INSERT; SAVEPOINT; CREATE
+    // INDEX; a later statement of the same txn scans (the savepoint
+    // between them is the case-(b) shape; nothing rolls back).
+    let (oid_b, _sid_b) = mk_table(&rig, b"prescan");
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let st = rig.stmt(&t1, s1);
+    let hb = ok(rig.db.open_table(&st, oid_b, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st, &hb, &[i32_d(1), text_d("k")]));
+    let _sp = ok(t1.savepoint());
+    let st2 = rig.stmt(&t1, s1);
+    let idx_b = ok(rig
+        .db
+        .create_index(&st2, oid_b, &idx_def(2, false, IndexState::Public)));
+    let st3 = rig.stmt(&t1, s1);
+    let rows = ok(rig
+        .db
+        .index_scan(&st3, idx_b, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(rows.len(), 1, "the case-(b) twin sees its own row too");
+    assert_eq!(rows[0].1, vec![i32_d(1), text_d("k")]);
+    ok(rig.commit_rc(t1));
+}
+
+/// FU-3 (F-3): `index_scan` runs §4's RR/SER relation rule, as
+/// `open_table` runs it for every other relation access — the relation
+/// row read at the statement's snapshot and at the latest committed
+/// state, a storage-id difference (a foreign TRUNCATE committed after
+/// the snapshot) is 40001, never a silent serve of pre-rewrite data.
+/// The typed layer has no TRUNCATE yet, so the rewrite is driven through
+/// the catalog-level DDL (`catalog_truncate_table`: new table storage
+/// id, the Id-storage index re-allocated with it).
+#[test]
+fn rr_index_scan_refuses_a_relation_rewritten_after_its_snapshot() {
+    let rig = Rig::new();
+    let (oid, idx_oid) = born_index_after_own_row(&rig, b"rrtrunc", 1, "a");
+
+    // The RR txn's snapshot S precedes the foreign rewrite.
+    let (rr, guard, s) = rig.rr();
+    let st = rig.stmt(&rr, s);
+
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    ok(rig.catalog().catalog_truncate_table(&rig.ddl(&t1, s1), oid));
+    ok(rig.commit_rc(t1));
+
+    // §4: the storage id moved after S → 40001 (mutant FU3-DEL deletes
+    // the check and the scan serves the rewrite's empty new index
+    // instead).
+    let err = rig
+        .db
+        .index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded)
+        .expect_err("a relation rewritten after the snapshot is refused");
+    assert!(matches!(err, DbError::Txn(TxnError::SerializationFailure)));
+    assert_eq!(err.sqlstate(), "40001");
+
+    // The same rule every other relation access runs: `open_table` on
+    // the same statement agrees.
+    let err = rig
+        .db
+        .open_table(&st, oid, RelLockMode::AccessShare)
+        .expect_err("open_table refuses the rewritten relation too");
+    assert_eq!(err.sqlstate(), "40001");
+    rig.abort_txn(rr);
+    drop(guard);
+}
+
+/// FU-4 (F-4's K-LIM): §6's born-public key limit at the creation's
+/// own-rows call site — an own row whose encoded entry key exceeds 2704
+/// bytes fails the creation with 54000 and the abort leaves no idx row
+/// and no entry anywhere. An exactly-at-limit key still creates (the
+/// limit is a `>` bound).
+#[test]
+fn born_public_creation_enforces_the_key_limit() {
+    let rig = Rig::new();
+    let (oid, _sid) = mk_table(&rig, b"keylim");
+
+    // A text of KEY_LIMIT - 2 bytes encodes (marker + bytes + the 2-byte
+    // terminator) to KEY_LIMIT + 1: over the §6 limit.
+    let over = "a".repeat(KEY_LIMIT - 2);
+    let t = rig.rc();
+    let s = rig.core().visible_ts();
+    let st = rig.stmt(&t, s);
+    let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st, &h, &[i32_d(1), text_d(&over)]));
+    let st2 = rig.stmt(&t, s);
+    let err = rig
+        .db
+        .create_index(&st2, oid, &idx_def(2, false, IndexState::Public))
+        .expect_err("the over-limit own row refuses the creation");
+    assert!(matches!(err, DbError::ProgramLimitExceeded));
+    assert_eq!(err.sqlstate(), "54000");
+    rig.abort_txn(t);
+    assert!(
+        raw_entry_trace(&rig).is_empty(),
+        "no entry of the refused creation survived"
+    );
+    assert!(
+        idx_rows_of(&rig, oid).is_empty(),
+        "no idx row of the refused creation survived"
+    );
+
+    // Exactly at the limit (KEY_LIMIT - 3 bytes encode to KEY_LIMIT):
+    // the creation succeeds and the entry is served.
+    let fits = "a".repeat(KEY_LIMIT - 3);
+    let t2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st3 = rig.stmt(&t2, s2);
+    let h2 = ok(rig.db.open_table(&st3, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st3, &h2, &[i32_d(2), text_d(&fits)]));
+    let st4 = rig.stmt(&t2, s2);
+    let idx_oid = ok(rig
+        .db
+        .create_index(&st4, oid, &idx_def(2, false, IndexState::Public)));
+    let st5 = rig.stmt(&t2, s2);
+    let rows = ok(rig
+        .db
+        .index_scan(&st5, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(rows.len(), 1, "the at-limit entry is created and served");
+    ok(rig.commit_rc(t2));
+}
+
+/// FU-5 (F-5/F-6): the DROP-INDEX fence, threaded and bounded (the N20
+/// pattern). A DROP INDEX holds the owner's AccessExclusive — the scan
+/// parks at its AccessShare and completes only after the DDL ends (the
+/// lock is what orders reader and DDL; a scan that discarded it would
+/// never park, caught by the bounded wait), and an aborted drop leaves a
+/// live index the scan then serves. A **committed** DROP INDEX is never
+/// served: a later scan reports 42704.
+#[test]
+fn index_scan_fences_against_a_drop_index() {
+    let rig = Arc::new(Rig::new());
+    let (_oid, idx_oid) = born_index_after_own_row(&rig, b"dropix", 1, "a");
+
+    // (1) The dropper holds AccessExclusive with its txn open; the scan
+    // must park and must not complete under it.
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let rig_b = Arc::clone(&rig);
+    let b = thread::spawn(move || {
+        let t = rig_b.rc();
+        let s = rig_b.core().visible_ts();
+        ok(rig_b
+            .catalog()
+            .catalog_drop_index(&rig_b.ddl(&t, s), idx_oid));
+        held_tx.send(()).expect("held signal");
+        release_rx.recv_timeout(BOUND).expect("release signal");
+        rig_b.abort_txn(t);
+    });
+    held_rx
+        .recv_timeout(BOUND)
+        .expect("the dropper holds AccessExclusive");
+
+    let (res_tx, res_rx) = mpsc::channel::<Result<usize, String>>();
+    let rig_a = Arc::clone(&rig);
+    let a = thread::spawn(move || {
+        let t = rig_a.rc();
+        let s = rig_a.core().visible_ts();
+        let st = rig_a.stmt(&t, s);
+        let r = rig_a
+            .db
+            .index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded);
+        let out = match r {
+            Ok(rows) => Ok(rows.len()),
+            Err(e) => Err(e.sqlstate().to_string()),
+        };
+        res_tx.send(out).expect("res signal");
+        rig_a.abort_txn(t);
+    });
+    wait_until(BOUND, || !rig.wait_edges().is_empty());
+    assert!(
+        res_rx.try_recv().is_err(),
+        "the scan must not complete under the DDL's AccessExclusive"
+    );
+
+    // The dropper aborts: the scan wakes and serves the still-live
+    // index.
+    release_tx.send(()).expect("release");
+    match res_rx.recv_timeout(BOUND).expect("the scan completed") {
+        Ok(n) => assert_eq!(n, 1, "the aborted drop leaves a live index, served"),
+        Err(sqlstate) => panic!("an aborted drop must not fail the scan: {sqlstate}"),
+    }
+    b.join().expect("dropper join");
+    a.join().expect("scanner join");
+
+    // (2) A committed DROP INDEX is never served: the scan's unlocked
+    // owner read already misses the row → 42704.
+    let d = rig.rc();
+    let sd = rig.core().visible_ts();
+    ok(rig.catalog().catalog_drop_index(&rig.ddl(&d, sd), idx_oid));
+    ok(rig.commit_rc(d));
+    let t2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st2 = rig.stmt(&t2, s2);
+    let err = rig
+        .db
+        .index_scan(&st2, idx_oid, Bound::Unbounded, Bound::Unbounded)
+        .expect_err("a dropped index is not served");
+    assert_eq!(err.sqlstate(), "42704");
+    ok(rig.commit_rc(t2));
+}
+
+/// FU-6 (F-8's M3): the `built_at == S` boundary of §4's servability
+/// rule — after a case-(b) creation commits (born at `S_e`), a statement
+/// whose snapshot is **exactly** `built_at` (`register_at`, §3.1's AS OF
+/// primitive) is served, not refused (the refusal bound is `built_at >
+/// S`; flipping it to `>=` — the mutant — refuses a legal read).
+#[test]
+fn built_at_equal_to_the_snapshot_is_served() {
+    let rig = Rig::new();
+    let (oid, _sid) = mk_table(&rig, b"edge");
+
+    // Born public on the empty pre-existing table (case (b)).
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = rig.stmt(&t0, s0);
+    let idx_oid = ok(rig
+        .db
+        .create_index(&st0, oid, &idx_def(2, false, IndexState::Public)));
+    ok(rig.commit_rc(t0));
+    let row = rig.idx_row(idx_oid).expect("the idx row committed");
+    let def = ok(IndexDef::decode(&row.def));
+    assert_eq!(def.state, IndexState::Public);
+    let built_at = def.built_at;
+    assert!(built_at > 0, "case (b): born at its own S_e");
+
+    // A row committed after the creation (its entry is invisible at
+    // `built_at`).
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let st1 = rig.stmt(&t1, s1);
+    let h = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st1, &h, &[i32_d(1), text_d("a")]));
+    ok(rig.commit_rc(t1));
+
+    // The boundary statement: snapshot exactly `built_at`.
+    let t2 = rig.rc();
+    let guard = ok(rig.core().registry.register_at(Ts(built_at)));
+    let st2 = ok(Stmt::new(&t2, Ts(built_at)));
+    let rows = ok(rig
+        .db
+        .index_scan(&st2, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(
+        rows.len(),
+        0,
+        "the boundary snapshot is served — and sees the table as it was at built_at"
+    );
+    ok(rig.commit_rc(t2));
+    drop(guard);
+
+    // A present statement sees the later row (the read really ran).
+    let t3 = rig.rc();
+    let s3 = rig.core().visible_ts();
+    let st3 = rig.stmt(&t3, s3);
+    let rows = ok(rig
+        .db
+        .index_scan(&st3, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(rows.len(), 1);
+    ok(rig.commit_rc(t3));
+}
+
+/// ESCALATE (found while writing FU-5; the gate's F-5 said "code is
+/// correct" — it is not): `index_scan` captures `visible_ts` **before**
+/// `lock_relation` parks, so the post-lock re-read of the idx row runs
+/// at the pre-wait snapshot and a DROP INDEX that commits while the
+/// scanner waits for its AccessShare is invisible to it (§4 reads the
+/// catalog at the latest committed state; the method's own doc claims
+/// the drop "shows in the re-read"). The scan then serves the dropped
+/// index's pre-drop snapshot instead of reporting 42704. The re-read is
+/// observably identical to the pre-lock read in every reachable state,
+/// so the FENCE mutant (re-read deleted) is UNCAUGHT. Fixing it is out
+/// of this card's Touch-only scope; run with `--ignored` to reproduce —
+/// today this fails with "the dropped index was served".
+#[test]
+#[ignore = "ESCALATE: index_scan's post-lock idx-row re-read runs at the pre-wait visible_ts; a DROP INDEX committing during the AccessShare wait is served at the old snapshot instead of 42704"]
+fn drop_committing_during_the_scan_wait_is_not_served() {
+    let rig = Arc::new(Rig::new());
+    let (_oid, idx_oid) = born_index_after_own_row(&rig, b"escl", 1, "a");
+
+    // The dropper holds AccessExclusive; the scanner parks; the drop
+    // then COMMITS under the wait.
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let rig_b = Arc::clone(&rig);
+    let b = thread::spawn(move || {
+        let t = rig_b.rc();
+        let s = rig_b.core().visible_ts();
+        ok(rig_b
+            .catalog()
+            .catalog_drop_index(&rig_b.ddl(&t, s), idx_oid));
+        held_tx.send(()).expect("held signal");
+        release_rx.recv_timeout(BOUND).expect("release signal");
+        ok(rig_b.commit_rc(t));
+    });
+    held_rx
+        .recv_timeout(BOUND)
+        .expect("the dropper holds AccessExclusive");
+
+    let (res_tx, res_rx) = mpsc::channel::<Result<usize, String>>();
+    let rig_a = Arc::clone(&rig);
+    let a = thread::spawn(move || {
+        let t = rig_a.rc();
+        let s = rig_a.core().visible_ts();
+        let st = rig_a.stmt(&t, s);
+        let r = rig_a
+            .db
+            .index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded);
+        let out = match r {
+            Ok(rows) => Ok(rows.len()),
+            Err(e) => Err(e.sqlstate().to_string()),
+        };
+        res_tx.send(out).expect("res signal");
+        rig_a.abort_txn(t);
+    });
+    wait_until(BOUND, || !rig.wait_edges().is_empty());
+    release_tx.send(()).expect("release");
+
+    // §4: the committed drop must be seen → 42704, never a serve.
+    match res_rx.recv_timeout(BOUND).expect("the scan completed") {
+        Err(sqlstate) => assert_eq!(sqlstate, "42704", "the committed drop is reported"),
+        Ok(n) => panic!("the dropped index was served: {n} row(s)"),
+    }
+    b.join().expect("dropper join");
+    a.join().expect("scanner join");
 }
