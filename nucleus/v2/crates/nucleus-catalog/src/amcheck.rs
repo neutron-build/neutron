@@ -64,7 +64,6 @@ use crate::error::DbError;
 use crate::index;
 use crate::toast::{chunk_key, TOAST_CHUNK, TOAST_MARK};
 
-
 /// The amcheck report: every invariant violation found, as strings each
 /// prefixed with the invariant's name (`"I-ROWFMT: …"`, `"I-IDX: …"`,
 /// …) so a harness can assert on the class of a finding.
@@ -425,7 +424,8 @@ fn check_toast<K: OrderedKv>(
                     continue;
                 };
                 let last = i + 1 == p.chunks;
-                let shape_ok = len <= TOAST_CHUNK && if last { len > 0 } else { len == TOAST_CHUNK };
+                let shape_ok =
+                    len <= TOAST_CHUNK && if last { len > 0 } else { len == TOAST_CHUNK };
                 if !shape_ok && !shape_bad {
                     shape_bad = true;
                     report.push(format!(

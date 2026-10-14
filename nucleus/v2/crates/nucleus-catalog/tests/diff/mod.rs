@@ -493,21 +493,38 @@ pub enum PDdl {
     Truncate,
     /// `DROP COLUMN big`, by name (C-T6d2); a no-big-live table refuses.
     DropBig,
-    /// `ADD COLUMN big text` — the re-add (C-T6d2).
+    /// `ADD COLUMN big text` — the re-add (C-T6d2). The generator pairs
+    /// the drop and the re-add on adjacent DDL indices (see [`gen_ddl`]).
     AddBig,
 }
 
 /// The DDL program of `(seed, index)`: one DDL statement, its own txn.
+///
+/// The big pair is a **drop followed by its re-add on the very next
+/// index**: a draw that lands `DropBig` at `i` forces `AddBig` at
+/// `i + 1`, so `big` is never absent for more than a txn or two of the
+/// stream. Without the forcing, a drop's re-add comes only when a later
+/// draw and parity both say so, and the column can stay dropped for a
+/// long stretch — starving the large-value DML ops on scheduling
+/// rather than on the seed.
 pub fn gen_ddl(seed: u64, index: u32) -> PDdl {
+    if index > 0 && matches!(gen_ddl_draw(seed, index - 1), PDdl::DropBig) {
+        return PDdl::AddBig;
+    }
+    gen_ddl_draw(seed, index)
+}
+
+/// The seeded draw of one DDL index (the big pair draws only the drop;
+/// [`gen_ddl`] supplies the re-add).
+fn gen_ddl_draw(seed: u64, index: u32) -> PDdl {
     let mut rng = Rng::new(seed ^ 0x_dd11 ^ (u64::from(index) << 8));
     const W_ADD: u64 = 30;
     const W_DROP: u64 = 12;
     const W_SNN: u64 = 14;
     const W_DNN: u64 = 14;
     const W_TRUNC: u64 = 30;
-    const W_DROP_BIG: u64 = 8;
-    const W_ADD_BIG: u64 = 8;
-    let mut r = rng.below(W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC + W_DROP_BIG + W_ADD_BIG);
+    const W_DROP_BIG: u64 = 4;
+    let mut r = rng.below(W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC + W_DROP_BIG);
     if r < W_ADD {
         return PDdl::AddColumn(rng.below(2) == 0);
     }
@@ -527,11 +544,10 @@ pub fn gen_ddl(seed: u64, index: u32) -> PDdl {
     if r < W_TRUNC {
         return PDdl::Truncate;
     }
-    r -= W_TRUNC;
-    if r < W_DROP_BIG {
-        return PDdl::DropBig;
-    }
-    PDdl::AddBig
+    // The fallthrough covers the big-cycle draw: the drop. Its re-add is
+    // the forced successor; a drop over an absent column is a no-op
+    // refusal, so the pairing is self-correcting.
+    PDdl::DropBig
 }
 
 // ----- write constants ------------------------------------------------------

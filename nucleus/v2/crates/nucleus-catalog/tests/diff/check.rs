@@ -825,7 +825,9 @@ impl Effects {
                 self.check_row_write(model, state, txn, idx, op, own, *pk, *applied, ts);
                 if *applied {
                     let value = Some(super::big_blob(*tag, *len as usize));
-                    self.recompute_effect(where_, op, own, state, model, *pk, attnum, &value, new_row);
+                    self.recompute_effect(
+                        where_, op, own, state, model, *pk, attnum, &value, new_row,
+                    );
                     self.last_t_write.insert(*pk, txn.uid);
                 }
             }
@@ -841,7 +843,9 @@ impl Effects {
                 self.check_row_write(model, state, txn, idx, op, own, *pk, *applied, ts);
                 if *applied {
                     let value = None;
-                    self.recompute_effect(where_, op, own, state, model, *pk, attnum, &value, new_row);
+                    self.recompute_effect(
+                        where_, op, own, state, model, *pk, attnum, &value, new_row,
+                    );
                     self.last_t_write.insert(*pk, txn.uid);
                 }
             }

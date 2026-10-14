@@ -79,12 +79,7 @@ fn wide_pk_schema() -> TableSchema {
     ok(TableSchema::new(
         vec![
             col(1, "id", KeyType::Int4, true),
-            col(
-                2,
-                "payload",
-                KeyType::Text(Collation::C),
-                false,
-            ),
+            col(2, "payload", KeyType::Text(Collation::C), false),
             col(3, "big", KeyType::Text(Collation::C), false),
         ],
         vec![1],

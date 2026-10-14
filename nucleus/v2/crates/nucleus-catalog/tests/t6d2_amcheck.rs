@@ -74,11 +74,9 @@ fn add_row(rig: &Rig, oid: u64, id: i32, a: &str, big: &str) {
     let s = rig.core().visible_ts();
     let st = rig.stmt(&t, s);
     let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
-    ok(rig.db.insert_with(
-        &st,
-        &h,
-        &[i32_d(id), text_d(a), text_d(big)],
-    ));
+    ok(rig
+        .db
+        .insert_with(&st, &h, &[i32_d(id), text_d(a), text_d(big)]));
     ok(rig.commit_rc(t));
 }
 
@@ -184,7 +182,13 @@ fn detects_an_injected_orphan_chunk() {
     // The orphan: a live chunk at a foreign id, visible at any snapshot
     // at or above the plant.
     let orphan = chunk_key(sid, &[0xAB; 20], 0);
-    core_plant_version(&rig, &orphan, rig.core().visible_ts(), HEADER_LIVE, b"orphan");
+    core_plant_version(
+        &rig,
+        &orphan,
+        rig.core().visible_ts(),
+        HEADER_LIVE,
+        b"orphan",
+    );
 
     let report = check_now(&rig, oid);
     assert!(!report.is_clean(), "the orphan chunk went unnoticed");
@@ -252,12 +256,7 @@ fn detects_an_injected_short_chunk() {
 
     let report = check_now(&rig, oid);
     assert!(!report.is_clean(), "the short chunk went unnoticed");
-    assert_eq!(
-        report.violations.len(),
-        1,
-        "{:?}",
-        report.violations
-    );
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
     assert!(
         report.violations[0].starts_with(&format!(
             "I-TOAST: relation {oid} row {:?}: chunk 1 of pointer {:?} is 100 bytes, not the §5 shape",
@@ -289,7 +288,11 @@ fn clean_after_d1_scenarios() {
     ok(rig.db.insert_by_oid(
         &st,
         oid,
-        &[i32_d(1), text_d("a"), text_d(&blob(10, TOAST_THRESHOLD - 1))],
+        &[
+            i32_d(1),
+            text_d("a"),
+            text_d(&blob(10, TOAST_THRESHOLD - 1)),
+        ],
     ));
     ok(rig.db.insert_by_oid(
         &st,
@@ -299,7 +302,11 @@ fn clean_after_d1_scenarios() {
     ok(rig.db.insert_by_oid(
         &st,
         oid,
-        &[i32_d(3), text_d("a"), text_d(&blob(12, TOAST_THRESHOLD + 1))],
+        &[
+            i32_d(3),
+            text_d("a"),
+            text_d(&blob(12, TOAST_THRESHOLD + 1)),
+        ],
     ));
     ok(rig.commit_rc(t));
     assert_eq!(visible_chunk_keys(&rig, sid).len(), 1, "one chunk (row 3)");
@@ -323,12 +330,22 @@ fn clean_after_d1_scenarios() {
         4,
         "the old 3 are gone, the new 3 are live"
     );
-    assert!(check_now(&rig, oid).is_clean(), "the replace leaves no orphan");
+    assert!(
+        check_now(&rig, oid).is_clean(),
+        "the replace leaves no orphan"
+    );
 
     // A delete removes the row and its chunks.
     delete(&rig, oid, 4);
-    assert_eq!(visible_chunk_keys(&rig, sid).len(), 1, "row 4's chunks died");
-    assert!(check_now(&rig, oid).is_clean(), "the delete leaves no orphan");
+    assert_eq!(
+        visible_chunk_keys(&rig, sid).len(),
+        1,
+        "row 4's chunks died"
+    );
+    assert!(
+        check_now(&rig, oid).is_clean(),
+        "the delete leaves no orphan"
+    );
 
     // The EPQ skip (T7): an update of a concurrently deleted row writes
     // no chunk.
@@ -408,14 +425,9 @@ fn dropped_toasted_column_stays_clean_across_drop_sweep_and_readd() {
         let t = rig.rc();
         let s = rig.core().visible_ts();
         let st = rig.stmt(&t, s);
-        ok(rig.db.add_column(
-            &st,
-            oid,
-            "big",
-            KeyType::Text(Collation::C),
-            false,
-            None,
-        ));
+        ok(rig
+            .db
+            .add_column(&st, oid, "big", KeyType::Text(Collation::C), false, None));
         ok(rig.commit_rc(t));
     }
     update(&rig, oid, 1, 4, &blob(21, 20_000));

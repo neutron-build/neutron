@@ -888,8 +888,22 @@ impl<'r> Session<'r> {
             .db
             .update_with(st, &h, &[Some(Value::Int8(pk))], &set)?;
         if applied {
+            // The read-back runs at `visible_ts` at RC (a legal RC
+            // statement position; the txn's own intent shadows any
+            // foreign version of the row): an EPQ re-base can have
+            // carried a `big` pointer from a version committed **above**
+            // the statement's snapshot, whose chunks are invisible at
+            // that snapshot (§5) — reading back at S would report XX001
+            // the engine never committed. At RR/SER the base cannot sit
+            // above S (a newer version is 40001 there), so the read-back
+            // stays at the statement's snapshot.
             let txn = self.txn.as_ref().expect("the txn is alive");
-            let st2 = Stmt::new(txn, st.snapshot()).expect("the read-back statement");
+            let snap = if self.level == Level::ReadCommitted {
+                self.rig.db.core.visible_ts()
+            } else {
+                st.snapshot()
+            };
+            let st2 = Stmt::new(txn, snap).expect("the read-back statement");
             let row = self.rig.db.get(&st2, &h, &[Some(Value::Int8(pk))])?;
             if let OpDetail::UpdateSet { new_row, .. } = &mut op.detail {
                 *new_row = row.as_deref().map(|d| self.record_t_row(&h, d));
@@ -939,8 +953,7 @@ impl<'r> Session<'r> {
             .open_table(st, self.rig.t_oid, RelLockMode::RowExclusive)?;
         op.def_version = Some(h.def_version);
         op.sid = Some(h.storage_id);
-        let attnum =
-            big_attnum(&h).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
+        let attnum = big_attnum(&h).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
         let len = super::BIG_LENS[choice as usize % super::BIG_LENS.len()];
         let value = super::big_blob(tag, len);
         op.detail = OpDetail::SetBig {
@@ -976,19 +989,16 @@ impl<'r> Session<'r> {
             .open_table(st, self.rig.t_oid, RelLockMode::RowExclusive)?;
         op.def_version = Some(h.def_version);
         op.sid = Some(h.storage_id);
-        let attnum =
-            big_attnum(&h).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
+        let attnum = big_attnum(&h).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
         op.detail = OpDetail::NullBig {
             pk,
             attnum,
             new_row: None,
         };
-        let applied = self.rig.db.update_with(
-            st,
-            &h,
-            &[Some(Value::Int8(pk))],
-            &[(attnum, None)],
-        )?;
+        let applied =
+            self.rig
+                .db
+                .update_with(st, &h, &[Some(Value::Int8(pk))], &[(attnum, None)])?;
         if applied {
             self.read_back_big(st, &h, op, pk)?;
         }
@@ -997,8 +1007,12 @@ impl<'r> Session<'r> {
     }
 
     /// The post-write read-back a SetBig/NullBig records (`new_row`) —
-    /// `update_set`'s shape: errors propagate, so a read-back failure
-    /// aborts the txn exactly as it would there.
+    /// `update_set`'s shape and snapshot rule: at RC a fresh statement
+    /// at `visible_ts` (the own-intent row shadows any foreign version,
+    /// and the statement's own chunk intents are visible to a later
+    /// statement at any position), at RR/SER the statement's snapshot.
+    /// Errors propagate, so a read-back failure aborts the txn exactly
+    /// as it would there.
     fn read_back_big(
         &self,
         st: &Stmt<'_>,
@@ -1007,10 +1021,14 @@ impl<'r> Session<'r> {
         pk: i64,
     ) -> Result<(), nucleus_catalog::DbError> {
         let txn = self.txn.as_ref().expect("the txn is alive");
-        let st2 = Stmt::new(txn, st.snapshot()).expect("the read-back statement");
+        let snap = if self.level == Level::ReadCommitted {
+            self.rig.db.core.visible_ts()
+        } else {
+            st.snapshot()
+        };
+        let st2 = Stmt::new(txn, snap).expect("the read-back statement");
         let row = self.rig.db.get(&st2, h, &[Some(Value::Int8(pk))])?;
-        if let OpDetail::SetBig { new_row, .. } | OpDetail::NullBig { new_row, .. } =
-            &mut op.detail
+        if let OpDetail::SetBig { new_row, .. } | OpDetail::NullBig { new_row, .. } = &mut op.detail
         {
             *new_row = row.as_deref().map(|d| self.record_t_row(h, d));
         }
@@ -1345,14 +1363,8 @@ fn run_prog(
                 s.delete_u(st, op, choice).map(|_| ())
             }),
             POp::SetBig(pk, choice) => {
-                let tag = derive_const(
-                    seed,
-                    session,
-                    prog_idx,
-                    attempt,
-                    pos,
-                    super::TAG_T_BIG,
-                ) as u8;
+                let tag =
+                    derive_const(seed, session, prog_idx, attempt, pos, super::TAG_T_BIG) as u8;
                 s.exec(pos, kind_of(pop), move |s, st, op| {
                     s.set_big(st, op, pk, choice, tag).map(|_| ())
                 })
