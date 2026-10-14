@@ -642,7 +642,12 @@ impl<K: OrderedKv> Db<K> {
     /// its txn's earlier statements, and serves the read only if the index
     /// is `Public` with `built_at <= st.snapshot` (§4: "an index serves a
     /// read at `S` iff `Public` and `built_at <= S`"); anything else is
-    /// 0A000 ("index not usable at snapshot"). Under RR/SER the §4
+    /// 0A000 ("index not usable at snapshot"). The post-lock catalog
+    /// reads run at a fresh post-lock `visible_ts()`, `open_table`'s
+    /// lock-then-read shape (the pre-lock read only resolves the owner to
+    /// lock): a DROP INDEX or DROP TABLE that committed while the
+    /// statement waited for its AccessShare is 42704 / 42P01 — never a
+    /// serve of the pre-drop state. Under RR/SER the §4
     /// relation rule runs too, exactly as
     /// [`Db::open_table`](Db::open_table) runs it for every other
     /// relation access: the relation row read at the statement's snapshot
@@ -662,13 +667,15 @@ impl<K: OrderedKv> Db<K> {
         hi: Bound<Vec<Option<Value>>>,
     ) -> Result<Vec<ScannedRow>, DbError> {
         // Resolve the owner first (as the catalog's DROP INDEX does), then
-        // take §4's relation lock, then read the statement's catalog under
-        // it: a concurrent DROP INDEX that committed while we waited shows
-        // in the re-read.
-        let own = writer_ctx(st, self.core.visible_ts());
+        // take §4's relation lock. The pre-lock ctx (`pre`) serves only
+        // that owner resolution; every post-lock catalog read below runs
+        // at a fresh `visible_ts()` — a concurrent DROP INDEX or DROP
+        // TABLE that committed while we waited shows in those reads
+        // (42704 / 42P01), never a serve of the pre-drop state.
+        let pre = writer_ctx(st, self.core.visible_ts());
         let owner = {
             let view = self.core.open_view();
-            let row = Catalog::read_idx(&self.core, &view, &own, idx_oid).map_err(DbError::Txn)?;
+            let row = Catalog::read_idx(&self.core, &view, &pre, idx_oid).map_err(DbError::Txn)?;
             let Some(row) = row else {
                 return Err(DbError::UndefinedObject);
             };
@@ -684,13 +691,13 @@ impl<K: OrderedKv> Db<K> {
                 None,
             )
             .map_err(DbError::Txn)?;
-        let idx = {
-            let view = self.core.open_view();
-            Catalog::read_idx(&self.core, &view, &own, idx_oid).map_err(DbError::Txn)?
-        };
-        let Some(idx) = idx else {
-            return Err(DbError::UndefinedObject);
-        };
+        // §4: the statement's catalog read, under the lock and at a fresh
+        // post-lock `visible_ts()` — everything that committed while the
+        // statement waited for its AccessShare is visible in it (a ctx
+        // frozen before the lock would serve the pre-wait state). The
+        // relation row is read first, `open_table`'s shape: a table
+        // dropped under the wait is 42P01 here.
+        let own = writer_ctx(st, self.core.visible_ts());
         let rel = {
             let view = self.core.open_view();
             Catalog::read_rel(&self.core, &view, &own, owner).map_err(DbError::Txn)?
@@ -732,6 +739,16 @@ impl<K: OrderedKv> Db<K> {
                 }
             }
         }
+        // The index row re-read, same fresh post-lock ctx: an index
+        // dropped under the wait is 42704 here (the pre-lock ctx would
+        // still see it).
+        let idx = {
+            let view = self.core.open_view();
+            Catalog::read_idx(&self.core, &view, &own, idx_oid).map_err(DbError::Txn)?
+        };
+        let Some(idx) = idx else {
+            return Err(DbError::UndefinedObject);
+        };
         let def = IndexDef::decode(&idx.def)?;
         if def.state != IndexState::Public || def.built_at > st.snapshot().0 {
             return Err(DbError::FeatureNotSupported("index not usable at snapshot"));
