@@ -264,9 +264,20 @@ impl<'a, S: Snapshot> ViewGuard<'a, S> {
         self.counter
     }
 
-    /// The underlying KV snapshot, for read paths that take a
-    /// [`Snapshot`] directly.
-    pub fn as_snap(&self) -> &S {
+    /// The underlying KV snapshot, for in-crate read paths that take a
+    /// [`Snapshot`] directly. Crate-only (C-R0bFIX-3, L-1): the raw
+    /// snapshot never leaves the crate, so no unwrapped lazy
+    /// `Snapshot::scan` iterator is reachable from a view — the L-1
+    /// door (a scan created off-executor and `.next()`-ed on an
+    /// executor thread ran unchecked; `Snapshot::scan` is nucleus-kv's
+    /// and cannot be wrapped from here without changing its return
+    /// type) is closed by unreachability. Every in-crate caller is an
+    /// eager loop that completes inside this already-checked call
+    /// (`read::read_key`'s `collect_entries`); code outside the crate
+    /// reads through the checked [`ViewGuard::get`] /
+    /// [`ViewGuard::scan`] funnels instead (the latter per-`next()`
+    /// checked, C-R0bFIX-2).
+    pub(crate) fn as_snap(&self) -> &S {
         // C-R0bFIX (M-1): the read funnel for a view opened elsewhere —
         // `read::read_key` and every other `Snapshot`-taking path reach
         // the KV through here, so a held view refuses on an executor

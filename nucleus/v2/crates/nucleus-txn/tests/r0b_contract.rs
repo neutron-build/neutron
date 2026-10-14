@@ -21,6 +21,12 @@
 //! slot (OM-5) — the entry check is `seq_next`'s first statement, before
 //! the module section.
 //!
+//! C-R0bFIX-3 adds: the L-1 follow-through — `ViewGuard::as_snap` is
+//! `pub(crate)`, so the raw `Snapshot::scan` iterator is unreachable
+//! from outside the crate, and the public lazy read surface that
+//! remains (`read::scan`, pulling through `ViewGuard::scan`) refuses
+//! at the first pull on an executor thread when created off-executor.
+//!
 //! Setup discipline: every `Core`, txn and pipeline is set up off-executor;
 //! `on_executor` marks the thread only around the call under test.
 
@@ -813,4 +819,63 @@ fn unmarked_panicking_drop_stops_pipeline() {
         TxnError::Invariant(msg) if msg.contains("stopped") => {}
         other => panic!("expected the pipeline-stopped error, got {other:?}"),
     }
+}
+
+// (q) — C-R0bFIX-3, L-1: the door `as_snap` opened is closed by
+// visibility (`pub(crate)`), so the public lazy read surface a facade
+// can pull is `read::scan` — whose every pull goes through
+// `ViewGuard::scan`'s checked iterator. This pins that surface in the
+// L-A/W5 shape: the iterator created off-executor, the first pull on
+// the executor, refused; the iterator unpoisoned off-executor.
+#[test]
+fn read_scan_iter_refuses_on_executor() {
+    let core = fresh_core();
+    // One visible version of one logical key: `q/k` at ts 0, live value
+    // `v` (a raw KV put of the encoded version; nothing here marks the
+    // thread, like every setup in this file).
+    let mut batch = Batch::default();
+    let value = nucleus_txn::encoding::encode_version(&nucleus_txn::LayerData::Write {
+        value: b"v".to_vec(),
+        key_changed: false,
+    })
+    .expect("a live write layer encodes a version");
+    batch.put(nucleus_txn::encoding::version_key(b"q/k", Ts(0)), value);
+    ok(core.write(batch, Durability::No));
+
+    let ctx = ReadCtx {
+        txn: TxnId {
+            epoch: core.epoch(),
+            n: 0,
+        },
+        snapshot: core.visible_ts(),
+        stmt_seq: 0,
+    };
+
+    // The scan is created off-executor (this thread is unmarked), so the
+    // creation check passes; the first pull happens on the executor.
+    let view = core.open_view();
+    let mut observer = NoSsi;
+    let mut rows = scan(
+        &core,
+        &view,
+        (Bound::Included(&b"q"[..]), Bound::Excluded(&b"r"[..])),
+        &ctx,
+        &mut observer,
+    );
+    assert_blocked(
+        on_executor(|| rows.next()),
+        Blocking::KvIo,
+        "ViewGuard::scan",
+    );
+
+    // The refusal fired before any KV read, so off-executor the iterator
+    // still yields its row and then ends (the same recovery pin as (o)).
+    match rows.next() {
+        Some(Ok((logical, value))) => {
+            assert_eq!(logical, b"q/k".to_vec(), "the scan yields its row");
+            assert_eq!(value, b"v".to_vec(), "the row carries its value");
+        }
+        other => panic!("the read scan still works off-executor, got {other:?}"),
+    }
+    assert!(rows.next().is_none(), "exactly one row is in range");
 }
