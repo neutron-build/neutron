@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use nucleus_catalog::amcheck::{check_table, Report};
 use nucleus_catalog::{Db, Stmt, TableHandle};
-use nucleus_codec::row::{Datum, RowError, TableSchema};
+use nucleus_codec::row::{value_repr_eq, Datum, RowError, TableSchema};
 use nucleus_codec::{decode_key_prefix, Collation, KeyColumn, KeyType, Value};
 use nucleus_kv::MemKv;
 use nucleus_txn::boot::Core;
@@ -56,6 +56,58 @@ use super::{
 
 /// The DDL session's id (DML sessions are `1..=threads`).
 pub const DDL_SESSION: u16 = 5;
+
+// ----- C-T6c2: harness-level injected bugs (G2's `Bug` pattern) ---------------
+
+/// A harness-level defect injected into a session (C-T6c2 item 1, G2's
+/// `Bug` pattern): the engine is never edited — each variant changes
+/// only what the *harness* does, and the unchanged checker
+/// (`diff::check`) must flag the recorded history. The proof of life
+/// (`t6c_injected`) runs each bug's deterministic script over its fixed
+/// seed set (5 of 5 runs reported) and the same scripts bug-free (clean).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bug {
+    None,
+    /// **B1** — rows decoded with the schema at `S` instead of the
+    /// reported `def_version`. The harness's stand-in for the schema at
+    /// the txn's snapshot is the live definition its ghost read returned
+    /// when the txn began (no locks held: the read races nothing in the
+    /// deterministic scripts). A statement whose handle reports a newer
+    /// definition — a DDL committed between the txn's begin and its
+    /// first `t` statement — records its rows rendered at the older one,
+    /// so the new columns vanish from the record and the model's render
+    /// at the reported version mismatches.
+    DecodeAtSeenSchema,
+    /// **B2** — a session claiming RR takes a fresh snapshot per
+    /// statement. The engine statement runs at the fresh snapshot (RC
+    /// behaviour, which is why it commits where honest RR raises 40001),
+    /// while the record keeps the txn's claimed snapshot — the lie the
+    /// REPEATABLE READ label tells. A foreign commit landing between two
+    /// statements of the txn then reads back a row the model cannot have
+    /// at the claimed snapshot.
+    RrPerStmtSnapshot,
+    /// **B3** — the harness records a write txn as committed but runs it
+    /// in a txn it aborts. The abort is real (nothing leaks, amcheck
+    /// stays clean) but the record claims `Committed` at the current
+    /// visible ts, so the model applies a write the engine never made
+    /// and every later reader and the final scan see the phantom.
+    AbortedAsCommitted,
+    /// **B4** — UpdateSet computed in the harness from the snapshot row
+    /// and written as a full-row update. The session remembers the last
+    /// row it read of `t` (its "snapshot row") and writes every column
+    /// of that row back with the set applied, instead of the one set
+    /// column — the application-level lost update: whatever a foreign
+    /// txn committed in between is silently clobbered, and the
+    /// write-effect oracle's recompute (base at the commit position plus
+    /// the recorded set) no longer equals the read-back.
+    FullRowUpdateFromRead,
+    /// **B5** — the harness renders the missing default as NULL. A
+    /// decoded value equal to its column's ADD COLUMN default is
+    /// recorded as NULL — the harness twin of the E1 codec mutant (a
+    /// decode rule that ignores `missing`): old rows lose their default
+    /// in the record where the model renders it.
+    MissingDefaultAsNull,
+}
 
 /// The `ddl_index` of the end-of-run amcheck records (distinct from every
 /// mid-run point's index, which is `< ddl_txns`).
@@ -444,10 +496,17 @@ pub struct Session<'r> {
     prog: u32,
     attempt: u32,
     level: Level,
+    bug: Bug,
     txn: Option<Txn>,
     guard: Option<SnapshotGuard<'r>>,
     /// Rowids this txn's earlier ScanU statements saw (DeleteU targets).
     u_seen: RefCell<Vec<Vec<u8>>>,
+    /// B1's stand-in for "the schema at S": the live definition of `t`
+    /// the ghost read returned when the txn began.
+    begin_schema: RefCell<Option<TableSchema>>,
+    /// B4's stand-in for "the snapshot row": the last row of `t` this
+    /// txn read, by pk.
+    t_read: RefCell<BTreeMap<i64, RowVals>>,
     rec: TxnRec,
     done: bool,
 }
@@ -462,6 +521,20 @@ fn iso(level: Level) -> Isolation {
 
 impl<'r> Session<'r> {
     pub fn begin(rig: &'r Rig, session: u16, prog: u32, attempt: u32, level: Level) -> Session<'r> {
+        Session::begin_with(rig, session, prog, attempt, level, Bug::None)
+    }
+
+    /// [`Session::begin`] with an injected [`Bug`] (C-T6c2); the soak's
+    /// sessions all run `Bug::None`, and no bug changes what a bug-free
+    /// session records.
+    pub fn begin_with(
+        rig: &'r Rig,
+        session: u16,
+        prog: u32,
+        attempt: u32,
+        level: Level,
+        bug: Bug,
+    ) -> Session<'r> {
         let uid = rig.rec.next_uid();
         let start = rig.rec.tick();
         let txn = rig.db.core.begin(iso(level));
@@ -476,15 +549,23 @@ impl<'r> Session<'r> {
             ),
         };
         let txn_snap = guard.as_ref().map(|g| g.ts().0);
+        // B1's snapshot-schema read: no statement has run, so the txn
+        // holds no relation lock and the ghost read races nothing in the
+        // deterministic scripts.
+        let begin_schema = (bug == Bug::DecodeAtSeenSchema)
+            .then(|| live_schema(rig).expect("the live schema at begin"));
         Session {
             rig,
             session,
             prog,
             attempt,
             level,
+            bug,
             txn: Some(txn),
             guard,
             u_seen: RefCell::new(Vec::new()),
+            begin_schema: RefCell::new(begin_schema),
+            t_read: RefCell::new(BTreeMap::new()),
             rec: TxnRec {
                 uid,
                 session,
@@ -522,6 +603,16 @@ impl<'r> Session<'r> {
             self.finish(Fate::Failed(code.clone()));
             return Err(code);
         };
+        if self.bug == Bug::AbortedAsCommitted {
+            // B3: the txn really aborts (nothing leaks, amcheck stays
+            // clean) while the record claims a commit at the current
+            // visible ts — a phantom the model applies and no reader can
+            // ever observe.
+            self.rig.db.core.abort(txn).expect("abort the B3 txn");
+            let ts = self.rig.db.core.visible_ts().0;
+            self.finish(Fate::Committed(ts));
+            return Ok(ts);
+        }
         match self.rig.db.core.commit(txn, SyncCommit::On) {
             Ok(ts) => {
                 self.finish(Fate::Committed(ts.0));
@@ -576,17 +667,26 @@ impl<'r> Session<'r> {
             }
         }
         // RC: a fresh registered snapshot per statement, held for the
-        // statement. RR/SER: the txn's.
+        // statement. RR/SER: the txn's. B2: an RR session whose
+        // statements each take a fresh snapshot (RC behaviour under an
+        // RR claim) — the engine statement runs at the fresh one, the
+        // record keeps the txn's claimed snapshot.
+        let claimed = self.guard.as_ref().map(|g| g.ts().0);
+        let b2 = self.bug == Bug::RrPerStmtSnapshot && self.level == Level::RepeatableRead;
         let rc_guard;
         let snapshot = match self.guard.as_ref() {
-            Some(g) => g.ts(),
-            None => {
+            Some(g) if !b2 => g.ts(),
+            _ => {
                 rc_guard = self.rig.db.core.registry.take_snapshot();
                 rc_guard.ts()
             }
         };
         let st = Stmt::new(txn, snapshot).expect("a fresh statement");
-        op.snap = snapshot.0;
+        op.snap = if b2 {
+            claimed.unwrap_or(snapshot.0)
+        } else {
+            snapshot.0
+        };
         let r = body(self, &st, &mut op);
         op.end = self.rig.rec.tick();
         match r {
@@ -606,6 +706,47 @@ impl<'r> Session<'r> {
 
     // ---- op bodies ---------------------------------------------------------
 
+    /// Records a decoded row of `t` as the injected bugs direct
+    /// (C-T6c2): B1 renders it with the schema the txn's ghost read saw
+    /// at begin — the harness's stand-in for "the schema at S" — instead
+    /// of the handle's reported definition, so columns a DDL added after
+    /// the txn began vanish from the record; B5 renders a decoded value
+    /// equal to its column's ADD COLUMN default as NULL — the harness's
+    /// stand-in for a decode rule that ignored `missing`. A bug-free
+    /// session renders at the handle's definition, exactly as the engine
+    /// decoded the row.
+    fn record_t_row(&self, h: &TableHandle, datums: &[Option<Datum>]) -> RowVals {
+        let schema = match self.bug {
+            Bug::DecodeAtSeenSchema => self
+                .begin_schema
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| h.schema.clone()),
+            _ => h.schema.clone(),
+        };
+        let mut row = pairs(&schema, datums);
+        if self.bug == Bug::MissingDefaultAsNull {
+            for (col, slot) in schema.live_columns().zip(row.iter_mut()) {
+                if let Some(missing) = &col.missing {
+                    let is_default = slot.1.as_ref().is_some_and(|v| value_repr_eq(v, missing));
+                    if is_default {
+                        slot.1 = None;
+                    }
+                }
+            }
+        }
+        row
+    }
+
+    /// B4 remembers the last row of `t` the txn read (its "snapshot
+    /// row"); B5/B1 never combine with it, and honest sessions cache
+    /// nothing.
+    fn note_t_read(&self, pk: i64, row: &RowVals) {
+        if self.bug == Bug::FullRowUpdateFromRead {
+            self.t_read.borrow_mut().insert(pk, row.clone());
+        }
+    }
+
     /// `SELECT * FROM t WHERE pk = ..`.
     fn get(&self, st: &Stmt<'_>, op: &mut OpRec, pk: i64) -> Result<(), nucleus_catalog::DbError> {
         let h = self
@@ -616,7 +757,11 @@ impl<'r> Session<'r> {
         op.def_version = Some(h.def_version);
         op.sid = Some(h.storage_id);
         let row = self.rig.db.get(st, &h, &[Some(Value::Int8(pk))])?;
-        op.out = OpOut::Row(row.as_deref().map(|d| pairs(&h.schema, d)));
+        let recorded = row.as_deref().map(|d| self.record_t_row(&h, d));
+        if let Some(r) = &recorded {
+            self.note_t_read(pk, r);
+        }
+        op.out = OpOut::Row(recorded);
         Ok(())
     }
 
@@ -635,7 +780,9 @@ impl<'r> Session<'r> {
             let pk = pk_of_key(h.storage_id, key).ok_or(nucleus_catalog::DbError::Row(
                 RowError::Corrupt("a t row key does not decode"),
             ))?;
-            out.push((pk, pairs(&h.schema, datums)));
+            let row = self.record_t_row(&h, datums);
+            self.note_t_read(pk, &row);
+            out.push((pk, row));
         }
         op.out = OpOut::RowsT(out);
         Ok(())
@@ -701,7 +848,22 @@ impl<'r> Session<'r> {
         op.sid = Some(h.storage_id);
         let attnum = resolve_col(&h, choice).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
         let value = if col_is_text(&h, attnum) { tv } else { av };
-        let set = vec![(attnum, Some(Datum::Inline(value.clone())))];
+        let mut set = vec![(attnum, Some(Datum::Inline(value.clone())))];
+        if self.bug == Bug::FullRowUpdateFromRead {
+            // B4: the whole row is computed from the row the txn last
+            // read (its "snapshot row") and written back as a full-row
+            // update — the application-level lost update. With no cached
+            // row the bug is inert (the plain set column alone).
+            if let Some(base) = self.t_read.borrow().get(&pk).cloned() {
+                set = base
+                    .iter()
+                    .map(|(a, v)| (*a, v.clone().map(Datum::Inline)))
+                    .collect();
+                if let Some(slot) = set.iter_mut().find(|(a, _)| *a == attnum) {
+                    slot.1 = Some(Datum::Inline(value.clone()));
+                }
+            }
+        }
         op.detail = OpDetail::UpdateSet {
             pk,
             attnum,
@@ -717,7 +879,7 @@ impl<'r> Session<'r> {
             let st2 = Stmt::new(txn, st.snapshot()).expect("the read-back statement");
             let row = self.rig.db.get(&st2, &h, &[Some(Value::Int8(pk))])?;
             if let OpDetail::UpdateSet { new_row, .. } = &mut op.detail {
-                *new_row = row.as_deref().map(|d| pairs(&h.schema, d));
+                *new_row = row.as_deref().map(|d| self.record_t_row(&h, d));
             }
         }
         op.out = OpOut::Applied(applied);
@@ -849,6 +1011,59 @@ impl<'r> Session<'r> {
         let applied = outcome == RowOutcome::Applied;
         op.out = OpOut::Applied(applied);
         Ok(applied)
+    }
+
+    // ---- C-T6c2: the scripted-op surface the injected suite drives ---------
+
+    /// A recorded `SELECT * FROM t WHERE pk = ..` (the observed row lands
+    /// in the history; the script does not need it back) with explicit
+    /// statement position 0 (the scripts name their own constants; `pos`
+    /// only labels the hang diagnostic).
+    pub fn op_get(&mut self, pk: i64) -> Result<(), String> {
+        self.exec(0, OpKind::Get, |s, st, op| s.get(st, op, pk))
+    }
+
+    /// A recorded `INSERT INTO t VALUES (pk, ..)` with explicit values.
+    pub fn op_insert_t(&mut self, pk: i64, a: Value, b: Option<Value>) -> Result<(), String> {
+        self.exec(0, OpKind::InsertT, move |s, st, op| {
+            s.insert_t(st, op, pk, a.clone(), b.clone()).map(|_| ())
+        })
+    }
+
+    /// A recorded `UPDATE t SET col = const WHERE pk = ..` (`choice`
+    /// picks the live non-pk column; `av`/`tv` the int8/text constant).
+    pub fn op_update_set(
+        &mut self,
+        pk: i64,
+        choice: u32,
+        av: Value,
+        tv: Value,
+    ) -> Result<bool, String> {
+        self.exec(0, OpKind::UpdateSet, move |s, st, op| {
+            s.update_set(st, op, pk, choice, av.clone(), tv.clone())
+        })
+    }
+
+    /// A recorded `ALTER TABLE t ADD COLUMN name int8 [DEFAULT d]` — the
+    /// DDL session's own RC txn (the soak's DDL pattern), so the model
+    /// learns the definition change.
+    pub fn op_add_column(&mut self, name: &str, default: Option<i64>) -> Result<(), String> {
+        self.exec(0, OpKind::AddColumn, |s, st, rec| {
+            rec.detail = OpDetail::AddColumn {
+                name: name.to_string(),
+                default,
+            };
+            s.rig.db.add_column(
+                st,
+                s.rig.t_oid,
+                name,
+                KeyType::Int8,
+                false,
+                default.map(Value::Int8),
+            )?;
+            rec.out = OpOut::Ok;
+            Ok(())
+        })
     }
 }
 

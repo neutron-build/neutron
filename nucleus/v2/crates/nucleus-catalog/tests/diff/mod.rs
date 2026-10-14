@@ -7,11 +7,13 @@
 //! reference model replayed in commit-ts order (C-T6 DECISION 1, the
 //! substitute for the PLAN "Concurrent DDL + DML differential" gate).
 //!
-//! Shared by the `t6c_soak` and `t6c_regress` test binaries, which reach
-//! for different halves of it (the soak drives `run_workload`; the
-//! regressions drive `Rig` directly and the synthetic-history checks
-//! never run the engine at all) — the `t6b_support` pattern, so like it
-//! this module tree allows dead code per binary.
+//! Shared by the `t6c_soak`, `t6c_regress`, `t6c_injected` and
+//! `t6c_crash` test binaries, which reach for different parts of it
+//! (the soak drives `run_workload`; the regressions and the injected
+//! suite drive `Rig`/`Session` directly and the synthetic-history
+//! checks never run the engine at all; the crash matrix drives the
+//! `t6b_support` rig through `crash`) — the `t6b_support` pattern, so
+//! like it this module tree allows dead code per binary.
 #![allow(dead_code)]
 #![allow(unused_imports)]
 //!
@@ -38,6 +40,10 @@
 mod check;
 mod model;
 pub mod runner;
+
+/// C-T6c2's DDL crash-matrix helpers (the `t6b_support` hand-driven Rig
+/// over `Fault<MemKv>`, driven by the `t6c_crash` binary).
+pub mod crash;
 
 pub use check::{check, Verdict};
 pub use runner::run_workload;
