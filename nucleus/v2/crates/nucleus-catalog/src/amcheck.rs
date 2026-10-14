@@ -57,10 +57,8 @@ use crate::error::DbError;
 use crate::index;
 
 /// The amcheck report: every invariant violation found, as strings each
-/// prefixed with the class of the finding — the invariant's name
-/// (`"I-ROWFMT: …"`, `"I-IDX: …"`, …) for a violation, `"UNCHECKED: …"`
-/// for a surface the checker cannot check yet (a `IdxStorage::Range`
-/// index, C-T6b2) — so a harness can assert on the class of a finding.
+/// prefixed with the invariant's name (`"I-ROWFMT: …"`, `"I-IDX: …"`,
+/// …) so a harness can assert on the class of a finding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     pub violations: Vec<String>,
