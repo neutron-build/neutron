@@ -14,6 +14,7 @@ use t6b_support::{
 };
 
 use nucleus_catalog::{IndexState, Stmt};
+use nucleus_codec::row::{ColumnDef, TableSchema};
 use nucleus_codec::{Collation, KeyColumn, KeyType};
 use nucleus_kv::{Batch, Durability, OrderedKv};
 use nucleus_txn::encoding::version_key;
@@ -22,6 +23,41 @@ use nucleus_txn::Ts;
 
 fn text_col() -> KeyColumn {
     KeyColumn::asc(KeyType::Text(Collation::C))
+}
+
+/// `CREATE TABLE t (id int4 PRIMARY KEY, a text, b text)` — the 3-column
+/// table the EPQ value-side pin needs (a column a concurrent txn can
+/// change that the statement's `set` never touches).
+fn wide_schema() -> TableSchema {
+    ok(TableSchema::new(
+        vec![
+            ColumnDef {
+                attnum: 1,
+                name: "id".into(),
+                ty: KeyType::Int4,
+                not_null: true,
+                dropped: false,
+                missing: None,
+            },
+            ColumnDef {
+                attnum: 2,
+                name: "a".into(),
+                ty: KeyType::Text(Collation::C),
+                not_null: false,
+                dropped: false,
+                missing: None,
+            },
+            ColumnDef {
+                attnum: 3,
+                name: "b".into(),
+                ty: KeyType::Text(Collation::C),
+                not_null: false,
+                dropped: false,
+                missing: None,
+            },
+        ],
+        vec![1],
+    ))
 }
 
 /// The raw stored versions (ts desc, header) of one entry logical key.
@@ -109,6 +145,75 @@ fn rc_epq_maintenance_follows_the_epq_base() {
     );
 }
 
+/// Mutant O7 (M-1): the EPQ re-apply's **value side** — the twin of N3
+/// above, which pins only maintenance. §5.2: "compute the update from
+/// `v`": the written row is `set` re-applied to the base the row op
+/// acted on. A 3-column table: Y's statement takes its snapshot before X
+/// commits a change to the column Y's `set` does not touch; Y updates
+/// the other column → the committed row carries X's value from the base
+/// (under O7, which returns the pre-EPQ `Apply(Update)` value, the
+/// written row keeps the snapshot's old column and X's commit is
+/// silently lost).
+#[test]
+fn rc_epq_reapply_carries_a_concurrent_commit_into_the_written_row() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st, b"wide", &wide_schema()));
+    ok(rig.commit_rc(t0));
+
+    // Row (1, x, y) exists.
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let st1 = rig.stmt(&t1, s1);
+    let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig
+        .db
+        .insert_with(&st1, &h1, &[i32_d(1), text_d("x"), text_d("y")]));
+    ok(rig.commit_rc(t1));
+
+    // The statement: RC, its snapshot taken BEFORE X commits.
+    let y = rig.rc();
+    let s_y = rig.core().visible_ts();
+    let st_y = ok(Stmt::new(&y, s_y));
+
+    // X commits b := y2 — a column Y's set never touches.
+    let x = rig.rc();
+    let s_x = rig.core().visible_ts();
+    let st_x = rig.stmt(&x, s_x);
+    assert!(ok(rig.db.update(
+        &st_x,
+        oid,
+        &[i32_v(1)],
+        &[set_col(3, text_d("y2"))]
+    )),);
+    ok(rig.commit_rc(x));
+
+    // Y updates a := x2: its read sees (1, x, y) at s_y, the row op
+    // meets X's version above s_y, RC EPQ re-applies the set to it.
+    assert!(ok(rig.db.update(
+        &st_y,
+        oid,
+        &[i32_v(1)],
+        &[set_col(2, text_d("x2"))]
+    )),);
+    ok(rig.commit_rc(y));
+
+    // The committed row is recomputed from the EPQ base: (1, x2, y2) —
+    // X's y2 survives (under O7 it would be (1, x2, y)).
+    let t2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st2 = rig.stmt(&t2, s2);
+    let h2 = ok(rig.db.open_table(&st2, oid, RelLockMode::AccessShare));
+    assert_eq!(
+        ok(rig.db.get(&st2, &h2, &[i32_v(1)])),
+        Some(vec![i32_d(1), text_d("x2"), text_d("y2")]),
+        "the written row carries X's commit from the EPQ base (O7)"
+    );
+    ok(rig.commit_rc(t2));
+}
+
 /// Mutant N9 (§5.0's blind entry delete): a DeleteOnly index; the RC
 /// statement's snapshot predates X's delete; X deletes pk 1 (its DeleteOnly
 /// maintenance tombstones the entry), Y re-inserts (1, a) (DeleteOnly:
@@ -167,6 +272,90 @@ fn entry_delete_over_newer_tombstone() {
         vec![(Some(ts_d), 0x02), (Some(ts_x), 0x02)],
         "the statement's tombstone at its own commit ts, over X's (N9)"
     );
+}
+
+/// Mutant O12 (M-4): the DELETE path's EPQ base — the twin of N3, which
+/// mutates only `UpdateEpq`. `DeleteEpq::recheck` must rebase the
+/// maintenance base onto the newest committed version, so the entry
+/// delete tombstones the entry of the version the row op acted on. A
+/// WriteOnly index; X deletes (1, a); Y re-inserts pk 1 as (1, b) —
+/// with a **different** payload, so the base's entry key differs from
+/// the snapshot row's; the RC statement (snapshot before X) deletes pk 1
+/// → the tombstone lands on `‖b` at the statement's commit ts and no
+/// live entry remains (under O12 the tombstone lands on `‖a` again and
+/// `‖b` stays live forever pointing at a deleted row).
+#[test]
+fn rc_delete_epq_rebases_the_maintenance_base() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
+    ok(rig.commit_rc(t0));
+
+    let (wo, wo_sid) = rig.add_index(oid, &idx_def(2, false, IndexState::DeleteOnly));
+    rig.set_index_def(wo, idx_def(2, false, IndexState::WriteOnly));
+    let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+
+    // Row (1, a) under the WriteOnly index: entry ‖a live.
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let st1 = rig.stmt(&t1, s1);
+    let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(1), text_d("a")]));
+    let ts_a = ok(rig.commit_rc(t1));
+
+    // The statement: RC, its snapshot taken BEFORE X's delete.
+    let d = rig.rc();
+    let s_d = rig.core().visible_ts();
+    let st_d = ok(Stmt::new(&d, s_d));
+
+    // X deletes pk 1 and commits: a tombstone on the entry ‖a.
+    let x = rig.rc();
+    let s_x = rig.core().visible_ts();
+    let st_x = rig.stmt(&x, s_x);
+    assert!(ok(rig.db.delete(&st_x, oid, &[i32_v(1)])));
+    let ts_x = ok(rig.commit_rc(x));
+
+    // Y re-inserts pk 1 as (1, b) and commits: the row is live again,
+    // and the WriteOnly insert maintained the entry ‖b.
+    let y = rig.rc();
+    let s_y = rig.core().visible_ts();
+    let st_y = rig.stmt(&y, s_y);
+    let h_y = ok(rig.db.open_table(&st_y, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st_y, &h_y, &[i32_d(1), text_d("b")]));
+    let ts_y = ok(rig.commit_rc(y));
+
+    // The statement deletes pk 1: the row op EPQs onto Y's live (1, b),
+    // applies, and the maintenance base is that version — the entry
+    // delete tombstones ‖b, the base's entry.
+    assert!(ok(rig.db.delete(&st_d, oid, &[i32_v(1)])));
+    let ts_d = ok(rig.commit_rc(d));
+
+    let e_a = i_entry_key(wo_sid, &[text_col()], &[text_v("a".into())], &key1);
+    let e_b = i_entry_key(wo_sid, &[text_col()], &[text_v("b".into())], &key1);
+    assert_eq!(
+        versions_of(&rig, wo_sid, &e_b),
+        vec![(Some(ts_d), 0x02), (Some(ts_y), 0x00)],
+        "the statement's tombstone landed on the EPQ base's entry ‖b at its own commit ts (O12)"
+    );
+    assert_eq!(
+        versions_of(&rig, wo_sid, &e_a),
+        vec![(Some(ts_x), 0x02), (Some(ts_a), 0x00)],
+        "‖a carries only X's delete tombstone — the statement's went to ‖b, not back to ‖a (O12)"
+    );
+    assert!(
+        rig.scan_entries(wo_sid).is_empty(),
+        "no live entry remains (under O12, ‖b would stay live naming a deleted row)"
+    );
+
+    // And the row itself is gone.
+    let t2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st2 = rig.stmt(&t2, s2);
+    let h2 = ok(rig.db.open_table(&st2, oid, RelLockMode::AccessShare));
+    assert_eq!(ok(rig.db.scan(&st2, &h2)).len(), 0);
+    ok(rig.commit_rc(t2));
 }
 
 /// Mutant N9b (§5.0 again, the RR half): an entry version written raw at

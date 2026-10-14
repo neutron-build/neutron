@@ -1,14 +1,17 @@
 //! C-T6b1 item 9: create/insert/get/scan round-trips — a pk table, a
 //! no-PK table (hidden rowids distinct within a statement, across txns
-//! and across a crash + reopen), the §3 2704-byte key limit, insert
-//! refused on an indexed table (0A000, C-T6b2a) and `open_table` refused
+//! and across a crash + reopen), the §3 2704-byte key limit, the
+//! deprecated handle-based insert's 0A000 on an indexed table next to
+//! `insert_by_oid` maintaining it (C-T6b2afix), and `open_table` refused
 //! on an explicit-range index. Every test names the mutant it kills.
 
 mod t6b_support;
 
 use std::collections::BTreeSet;
 
-use t6b_support::{i32_d, i32_v, ok, pk_schema, rowid_schema, text_d, text_pk_schema, Rig};
+use t6b_support::{
+    i32_d, i32_v, ok, pk_schema, row_key_of, rowid_schema, text_d, text_pk_schema, u_entry_key, Rig,
+};
 
 use nucleus_catalog::{DbError, Stmt};
 use nucleus_codec::Value;
@@ -196,16 +199,21 @@ fn pk_over_the_2704_byte_limit_is_54000() {
     ok(rig.commit_rc(t2));
 }
 
-/// §4/C-T6 §6: DML on a table with an index is 0A000 until C-T6b2a —
-/// never a silent missing-maintenance write. The index def itself is the
+/// §4/C-T6 §6, C-T6b2afix item 5 (mutant L1: the oid-based wrapper
+/// reverting to the legacy refusal): the **deprecated** handle-based
+/// [`Db::insert`] refuses an indexed table with 0A000 — permanently (its
+/// handle may come from any statement, so a stale index list is exactly
+/// the silent missing-maintenance write) — while [`Db::insert_by_oid`]
+/// opens its own handle at the latest committed catalog and maintains:
+/// the WriteOnly index's `/u/` entry lands. The index def itself is the
 /// §6 bytes of [`nucleus_catalog::IndexDef`].
 #[test]
-fn insert_on_an_indexed_table_is_refused() {
+fn insert_on_an_indexed_table_legacy_refuses_and_insert_by_oid_maintains() {
     let rig = Rig::new();
     let t0 = rig.rc();
     let s0 = rig.core().visible_ts();
     let st = ok(Stmt::new(&t0, s0));
-    let (oid, _sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
+    let (oid, sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
     ok(rig.commit_rc(t0));
 
     let t1 = rig.rc();
@@ -223,13 +231,22 @@ fn insert_on_an_indexed_table_is_refused() {
         built_at: 0,
     };
     let isid = ok(rig.catalog().alloc_storage_id(rig.core()));
-    let (_idx_oid, _ranges) = ok(rig.catalog().catalog_create_index(
+    let (idx_oid, _ranges) = ok(rig.catalog().catalog_create_index(
         &rig.ddl(&t1, s1),
         oid,
         IdxStorage::Id(isid),
         &ok(def.encode()),
     ));
     ok(rig.commit_rc(t1));
+    // Driven to WriteOnly (the online ladder's T1), so an insert that
+    // maintains is observable by its entry.
+    rig.set_index_def(
+        idx_oid,
+        nucleus_catalog::IndexDef {
+            state: nucleus_catalog::IndexState::WriteOnly,
+            ..def.clone()
+        },
+    );
 
     let t = rig.rc();
     let s = rig.core().visible_ts();
@@ -239,13 +256,32 @@ fn insert_on_an_indexed_table_is_refused() {
     let err = rig
         .db
         .insert(&st2, &h, &[i32_d(1), text_d("x")])
-        .expect_err("DML on an indexed table");
+        .expect_err("the deprecated handle-based insert on an indexed table");
     assert_eq!(err.sqlstate(), "0A000");
     match err {
-        DbError::FeatureNotSupported(what) => assert_eq!(what, "index maintenance: C-T6b2a"),
+        DbError::FeatureNotSupported(what) => assert_eq!(
+            what,
+            "index maintenance: deprecated handle-based insert (use insert_by_oid/insert_with)"
+        ),
         other => panic!("wrong error: {other:?}"),
     }
-    rig.abort_txn(t);
+
+    // The oid-based insert maintains: Ok, and the row's /u/ entry lands
+    // in the WriteOnly index (L1 would refuse this with the same 0A000).
+    ok(rig.db.insert_by_oid(&st2, oid, &[i32_d(1), text_d("x")]));
+    ok(rig.commit_rc(t));
+
+    let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+    let u_1 = u_entry_key(
+        isid,
+        &[nucleus_codec::KeyColumn::asc(nucleus_codec::KeyType::Int4)],
+        &[i32_v(1)],
+    );
+    assert_eq!(
+        rig.scan_entries(isid),
+        vec![(u_1, key1)],
+        "insert_by_oid maintained the WriteOnly index (unique /u/ entry, payload = the row key)"
+    );
 }
 
 /// An index with an explicit entry range ([`IdxStorage::Range`]) has no

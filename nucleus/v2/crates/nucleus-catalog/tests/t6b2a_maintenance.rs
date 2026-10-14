@@ -382,6 +382,66 @@ fn unique_writeonly_and_public_reject_duplicates() {
     assert_eq!(nulls.len(), 2, "two unchecked NULL entries under /i/");
 }
 
+/// Mutant O3 (M-2): the update path's `/u/` unique rule — the duplicate
+/// test above drives only `insert_with`/`maintain_insert`; this pins
+/// that an **update** moving a row onto another row's unique value is
+/// checked too (the rule flows from `entry_for_insert` through
+/// `maintain_update`'s re-insert). Two rows under a unique WriteOnly and
+/// a unique Public index: updating row 2's key column onto row 1's value
+/// is 23505, and the failed statement's abort leaves every entry exactly
+/// as it was (under O3, inserting with `UniqueRule::None`, the update
+/// would silently leave two live rows with one `/u/` value). An own-row
+/// pk change still resolves — `pk_change_moves_entries` pins that.
+#[test]
+fn update_onto_another_rows_unique_value_is_23505() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
+    ok(rig.commit_rc(t0));
+
+    // A unique WriteOnly and a unique Public index on `payload`.
+    let (wo, wo_sid) = rig.add_index(oid, &idx_def(2, true, IndexState::DeleteOnly));
+    rig.set_index_def(wo, idx_def(2, true, IndexState::WriteOnly));
+    let (pu, pu_sid) = rig.add_index(oid, &idx_def(2, true, IndexState::DeleteOnly));
+    rig.set_index_def(pu, idx_def(2, true, IndexState::Public));
+
+    // Two rows, one per distinct value.
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let st1 = rig.stmt(&t1, s1);
+    let h1 = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st1, &h1, &[i32_d(2), text_d("b")]));
+    ok(rig.commit_rc(t1));
+
+    let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+    let key2 = row_key_of(sid, &pk_schema(), &[i32_v(2)]);
+
+    // Updating row 2's key column onto row 1's unique value: 23505.
+    let t2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st2 = rig.stmt(&t2, s2);
+    let err = rig
+        .db
+        .update(&st2, oid, &[i32_v(2)], &[set_col(2, text_d("a"))])
+        .expect_err("an update onto another row's unique value");
+    assert_eq!(err.sqlstate(), "23505");
+    rig.abort_txn(t2);
+
+    // The abort left both indexes exactly as they were.
+    for isid in [wo_sid, pu_sid] {
+        let u_a = u_entry_key(isid, &[text_col()], &[text_v("a".into())]);
+        let u_b = u_entry_key(isid, &[text_col()], &[text_v("b".into())]);
+        assert_eq!(
+            rig.scan_entries(isid),
+            vec![(u_a, key1.clone()), (u_b, key2.clone())],
+            "the failed update moved no entry (isid {isid})"
+        );
+    }
+}
+
 /// §6 key limit (mutant N17: the limit applied to deletes): a row with a
 /// 3000-byte indexed value inserted before the index exists is deletable
 /// once the index is WriteOnly (the oversize entry delete is skipped), a

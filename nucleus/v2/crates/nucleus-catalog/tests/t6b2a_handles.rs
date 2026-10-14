@@ -122,6 +122,52 @@ fn handle_rejected_in_later_statement() {
     rig.abort_txn(t);
 }
 
+/// Mutant O5 (M-3): `check_handle`'s lock-mode guard. A handle opened at
+/// AccessShare passes the `(txn, seq0)` ownership check — it is this
+/// very statement's handle — but §4: "a catalog read made under a weaker
+/// lock or in another txn is never used to maintain indexes": the `_with`
+/// DML entry points refuse it with `TxnError::Invariant`. The guard is
+/// load-bearing for §7.3: an AccessShare opener is not collected by the
+/// build's `wait_for_lockers(rel, Share)` (the modes do not conflict),
+/// so a read-mode statement that maintained would write for an index the
+/// builder believes every writer saw.
+#[test]
+fn read_mode_handle_is_refused_by_the_with_dml() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
+    ok(rig.commit_rc(t0));
+
+    // This statement's own handle — but opened at AccessShare.
+    let t = rig.rc();
+    let s = rig.core().visible_ts();
+    let st1 = rig.stmt(&t, s);
+    let h = ok(rig.db.open_table(&st1, oid, RelLockMode::AccessShare));
+
+    for name in ["insert_with", "update_with", "delete_with"] {
+        let err = match name {
+            "insert_with" => rig
+                .db
+                .insert_with(&st1, &h, &[i32_d(1), text_d("x")])
+                .map(|_| ()),
+            "update_with" => rig
+                .db
+                .update_with(&st1, &h, &[i32_v(1)], &[set_col(2, text_d("x"))])
+                .map(|_| ()),
+            _ => rig.db.delete_with(&st1, &h, &[i32_v(1)]).map(|_| ()),
+        }
+        .expect_err(name);
+        assert_eq!(err.sqlstate(), "XX000", "{name}");
+        assert!(
+            matches!(err, DbError::Txn(TxnError::Invariant(_))),
+            "{name}: {err:?}"
+        );
+    }
+    rig.abort_txn(t);
+}
+
 /// Gate rider 2 (M-4's data-loss path, dead under the new contract): a
 /// handle from statement 1, an own `catalog_drop_table` in statement 2,
 /// then `insert_with`/`insert` through the old handle in statement 3 —

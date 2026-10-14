@@ -8,8 +8,10 @@
 //!
 //! C-T6b1-fix, the gate's follow-up pins: the **index** rows of the
 //! handle's read are at the latest committed state too (mutant G2: read
-//! at `S` — the 0A000 guard of `insert` would be bypassable); `insert`
-//! re-validates its handle under the RowExclusive it takes (mutant
+//! at `S` — the 0A000 guard of the deprecated legacy `insert` would be
+//! bypassable, and `insert_by_oid`'s maintenance silently skippable, by
+//! the same one-line regression); `insert` re-validates its handle under
+//! the RowExclusive it takes (mutant
 //! DEL-CHK: an own TRUNCATE would key rows into the retired storage
 //! range, a foreign def change would encode under a stale `natts`); and
 //! the own-writes bound of the catalog read is `seq < seq0` (mutant G3:
@@ -19,7 +21,7 @@ mod t6b_support;
 
 use std::ops::Bound;
 
-use t6b_support::{i32_d, i32_v, ok, pk_schema, text_d, Rig};
+use t6b_support::{i32_d, i32_v, i_entry_key, ok, pk_schema, row_key_of, text_d, Rig};
 
 use nucleus_catalog::{DbError, IndexColumn, IndexDef, IndexState, Stmt};
 use nucleus_codec::{Direction, Nulls};
@@ -249,24 +251,26 @@ fn rr_reader_continues_after_a_same_storage_def_change() {
 
 /// Mutant G2 (M-1): the index rows read at `st.snapshot` instead of the
 /// latest committed catalog — a handle whose `S` predates a committed
-/// CREATE INDEX would list no index, so `insert`'s 0A000 guard (the
-/// "never a silent missing-maintenance write") would be bypassable, and
-/// C-T6b2a's maintenance silently skippable by the same one-line
-/// regression. §4: the statement's catalog read — relation and index rows
-/// alike — is at the latest committed state plus the txn's own earlier
-/// statements.
+/// CREATE INDEX would list no index, so the deprecated legacy `insert`'s
+/// 0A000 guard (the "never a silent missing-maintenance write") would be
+/// bypassable, and `insert_by_oid`'s maintenance silently skippable by
+/// the same one-line regression. §4: the statement's catalog read —
+/// relation and index rows alike — is at the latest committed state plus
+/// the txn's own earlier statements. C-T6b2afix item 5 (mutant L1): the
+/// oid-based insert maintains through that same latest-state read.
 #[test]
 fn rr_lists_an_index_committed_after_s_and_insert_refuses() {
     let rig = Rig::new();
     let t0 = rig.rc();
     let s0 = rig.core().visible_ts();
     let st = ok(Stmt::new(&t0, s0));
-    let (oid, _sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
+    let (oid, sid) = ok(rig.db.create_table(&st, b"pk", &pk_schema()));
     ok(rig.commit_rc(t0));
 
     let (r, _guard, s) = rig.rr();
 
-    // A foreign CREATE INDEX commits after the reader's S.
+    // A foreign CREATE INDEX commits after the reader's S, and is driven
+    // to WriteOnly (the online ladder's T1) so maintenance is observable.
     let t1 = rig.rc();
     let s1 = rig.core().visible_ts();
     let isid = ok(rig.catalog().alloc_storage_id(rig.core()));
@@ -277,6 +281,13 @@ fn rr_lists_an_index_committed_after_s_and_insert_refuses() {
         &ok(idx_def().encode()),
     ));
     ok(rig.commit_rc(t1));
+    rig.set_index_def(
+        idx_oid,
+        IndexDef {
+            state: IndexState::WriteOnly,
+            ..idx_def()
+        },
+    );
 
     // The reader's open_table lists the index: the index rows are read at
     // the latest committed catalog, not at the reader's S.
@@ -289,18 +300,42 @@ fn rr_lists_an_index_committed_after_s_and_insert_refuses() {
     );
     assert_eq!(h.indexes[0].oid, idx_oid);
 
-    // So insert refuses 0A000 — never a silent missing-maintenance write.
+    // So the deprecated legacy insert refuses 0A000 — never a silent
+    // missing-maintenance write.
     let st2 = ok(Stmt::new(&r, s));
     let err = rig
         .db
         .insert(&st2, &h, &[i32_d(1), text_d("x")])
-        .expect_err("insert on a table the latest catalog says is indexed");
+        .expect_err("the legacy insert on a table the latest catalog says is indexed");
     assert_eq!(err.sqlstate(), "0A000");
     match err {
-        DbError::FeatureNotSupported(what) => assert_eq!(what, "index maintenance: C-T6b2a"),
+        DbError::FeatureNotSupported(what) => assert_eq!(
+            what,
+            "index maintenance: deprecated handle-based insert (use insert_by_oid/insert_with)"
+        ),
         other => panic!("wrong error: {other:?}"),
     }
-    rig.abort_txn(r);
+
+    // The oid-based insert of the same RR txn reads the latest committed
+    // catalog under its own RowExclusive and maintains: the WriteOnly
+    // index's entry lands (G2: a snapshot-fed read would list no index
+    // and maintain nothing; L1: the wrapper would refuse 0A000).
+    let st3 = ok(Stmt::new(&r, s));
+    ok(rig.db.insert_by_oid(&st3, oid, &[i32_d(1), text_d("x")]));
+    ok(rig.commit_rc(r));
+
+    let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+    let e_1 = i_entry_key(
+        isid,
+        &[nucleus_codec::KeyColumn::asc(nucleus_codec::KeyType::Int4)],
+        &[i32_v(1)],
+        &key1,
+    );
+    assert_eq!(
+        rig.scan_entries(isid),
+        vec![(e_1, Vec::new())],
+        "insert_by_oid maintained the index committed after S"
+    );
 }
 
 /// Item 2 (M-2), the own-DDL half, mutant DEL-CHK: the handle validation

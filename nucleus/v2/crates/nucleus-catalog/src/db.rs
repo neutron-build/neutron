@@ -4,13 +4,14 @@
 //! (hidden-rowid keys, the §3 2704-byte key limit), update and delete
 //! (row-level EPQ, PK changes through `update_pk`), point get and scan
 //! (§5's `[table_lo, table_lo ‖ 0xFF)` bound, toast chunks excluded).
-//! Index maintenance is C-T6 §6's, driven by the statement-scoped
-//! `_with` entry points (`insert_with` and the `update`/`delete` that
+//! Index maintenance is C-T6 §6's, driven by the statement-scoped entry
+//! points (`insert_with` and the `insert_by_oid`/`update`/`delete` that
 //! open their own handle): every index of the statement's handle is
 //! maintained according to its state, with entries computed from the row
 //! version the row op acted on (its EPQ base) — see C-T6 §7.3 for why a
-//! stale handle is legal. The legacy [`Db::insert`] keeps refusing
-//! indexed tables with 0A000 (its handle may predate the index).
+//! stale handle is legal. The deprecated legacy [`Db::insert`] (through
+//! a possibly cross-statement handle) keeps refusing indexed tables with
+//! 0A000: its handle may predate the index, so it never maintains.
 //!
 //! The caller owns snapshot registration (§3.1): an RR/SER txn's snapshot
 //! must have been taken (and stay registered) before its statements run —
@@ -201,19 +202,37 @@ impl<K: OrderedKv> Db<K> {
 
     // ---- DML and reads (§4: the statement's relation lock first) --------
 
-    /// INSERT through a possibly cross-statement handle (the C-T6b1
-    /// contract, pinned by the `t6b1_*` tests): RowExclusive, the
-    /// relation row re-read under it (a handle the catalog moved under is
-    /// 55000, an absent row 42P01), the **index rows re-scanned at the
-    /// same read** — and a table the latest catalog says is indexed
-    /// refuses with 0A000, exactly as before this card: this entry point
-    /// accepts handles from any statement, so it can never know which
-    /// index states its own statement saw, and a stale list is exactly
-    /// the silent missing-maintenance write. Statement-scoped inserts —
-    /// the ones that maintain — go through [`Db::insert_with`].
+    /// INSERT by relation oid (§5/§6): `open_table(RowExclusive)` then
+    /// [`Db::insert_with`] — the symmetric sibling of [`Db::update`] and
+    /// [`Db::delete`]: the statement opens its own handle, so its
+    /// catalog read (made under the RowExclusive it holds, §4) is exactly
+    /// the index list it maintains — every WriteOnly/Public index of it
+    /// gets the new row's entry, a DeleteOnly index gets nothing (§6).
     /// Hidden-rowid tables draw `ord` from the statement's counter
     /// ([`Stmt::next_ord`]), so two inserts of one statement can never
     /// collide.
+    pub fn insert_by_oid(
+        &self,
+        st: &Stmt<'_>,
+        oid: u64,
+        live: &[Option<Datum>],
+    ) -> Result<(), DbError> {
+        let t = self.open_table(st, oid, RelLockMode::RowExclusive)?;
+        self.insert_with(st, &t, live)
+    }
+
+    /// **Deprecated** legacy INSERT through a possibly cross-statement
+    /// handle (the C-T6b1 contract, pinned by the `t6b1_*` tests) — use
+    /// [`Db::insert_by_oid`] (by oid, maintains) or [`Db::insert_with`]
+    /// (statement-scoped handle, maintains) instead. RowExclusive, the
+    /// relation row re-read under it (a handle the catalog moved under is
+    /// 55000, an absent row 42P01), the **index rows re-scanned at the
+    /// same read** — and a table the latest catalog says is indexed
+    /// refuses with 0A000 naming this legacy handle-based path as the
+    /// deprecated one: this entry point accepts handles from any
+    /// statement, so it can never know which index states its own
+    /// statement saw, and a stale list is exactly the silent
+    /// missing-maintenance write.
     pub fn insert(
         &self,
         st: &Stmt<'_>,
@@ -226,13 +245,16 @@ impl<K: OrderedKv> Db<K> {
         let own = writer_ctx(st, self.core.visible_ts());
         let indexes = self.scan_index_handles(&own, t.oid)?;
         if !indexes.is_empty() {
-            return Err(DbError::FeatureNotSupported("index maintenance: C-T6b2a"));
+            return Err(DbError::FeatureNotSupported(
+                "index maintenance: deprecated handle-based insert (use insert_by_oid/insert_with)",
+            ));
         }
         self.write_insert(st, t, live, indexes)
     }
 
-    /// The statement-scoped INSERT (item 4a/4): like [`Db::insert`], but
-    /// the handle must be the one this very statement's
+    /// The statement-scoped INSERT (item 4a/4): like the deprecated
+    /// legacy [`Db::insert`], but the handle must be the one this very
+    /// statement's
     /// `open_table(RowExclusive..)` made — its RowExclusive was taken
     /// before its catalog read, and no `ROLLBACK TO` runs inside a
     /// statement, so the lock is held throughout. Anything else is
@@ -411,13 +433,14 @@ impl<K: OrderedKv> Db<K> {
         Ok(true)
     }
 
-    /// The §4 writer's read of [`Db::insert`]: RowExclusive, then the
-    /// relation row re-read at the latest committed catalog plus the txn's
-    /// earlier statements — a handle the catalog has moved under is
-    /// refused with 55000, an absent row with 42P01 (never write into a
-    /// dropped or retired storage). Belt-and-braces for
-    /// [`Db::insert_with`] too: a statement-scoped handle's relation row
-    /// cannot move (every rel-row DDL holds AccessExclusive, which
+    /// The §4 writer's read of the deprecated legacy [`Db::insert`]:
+    /// RowExclusive, then the relation row re-read at the latest
+    /// committed catalog plus the txn's earlier statements — a handle the
+    /// catalog has moved under is refused with 55000, an absent row with
+    /// 42P01 (never write into a dropped or retired storage).
+    /// Belt-and-braces for [`Db::insert_with`] (and so for
+    /// [`Db::insert_by_oid`]) too: a statement-scoped handle's relation
+    /// row cannot move (every rel-row DDL holds AccessExclusive, which
     /// conflicts with the statement's own RowExclusive).
     fn lock_and_validate(&self, st: &Stmt<'_>, t: &TableHandle) -> Result<(), DbError> {
         self.locks
@@ -455,11 +478,12 @@ impl<K: OrderedKv> Db<K> {
         index_handles(idxs)
     }
 
-    /// The shared row-write body of [`Db::insert`] and [`Db::insert_with`]:
-    /// the row key, the key-existence insert, then index maintenance for
-    /// `indexes` — the statement's own list for `insert_with` (the only
-    /// path that reaches here with a non-empty list; the legacy `insert`
-    /// refuses indexed tables before this).
+    /// The shared row-write body of the insert entry points: the row key,
+    /// the key-existence insert, then index maintenance for `indexes` —
+    /// the statement's own list for `insert_with` and
+    /// [`Db::insert_by_oid`] (the only paths that reach here with a
+    /// non-empty list; the deprecated legacy `insert` refuses indexed
+    /// tables before this).
     fn write_insert(
         &self,
         st: &Stmt<'_>,
