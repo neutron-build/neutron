@@ -15,6 +15,7 @@
 //! `t6b_support` rig through `crash`) — the `t6b_support` pattern, so
 //! like it this module tree allows dead code per binary.
 #![allow(dead_code)]
+#![allow(unused_imports)]
 //!
 //! **Determinism.** A program is a pure function of
 //! `(seed, session, index)` ([`gen_prog`], [`gen_ddl`]); the checker
@@ -36,13 +37,16 @@
 //! handle read against the new storage id a TRUNCATE allocated, which is
 //! exact without any ordering argument (see `check.rs`).
 
-pub mod check;
+mod check;
 mod model;
 pub mod runner;
 
 /// C-T6c2's DDL crash-matrix helpers (the `t6b_support` hand-driven Rig
 /// over `Fault<MemKv>`, driven by the `t6c_crash` binary).
 pub mod crash;
+
+pub use check::{check, Verdict};
+pub use runner::run_workload;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -267,8 +271,8 @@ pub struct History {
 }
 
 /// Append-only, thread-safe recorder: the uid and tick counters are one
-/// atomic each (ticks order trace records only — never a verdict input;
-/// see the module docs).
+/// atomic each; ticks give the logical total order the TRUNCATE-window
+/// check relies on (see `check.rs`).
 #[derive(Debug, Default)]
 pub struct Recorder {
     txns: Mutex<Vec<TxnRec>>,

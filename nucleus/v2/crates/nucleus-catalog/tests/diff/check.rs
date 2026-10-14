@@ -1,12 +1,9 @@
 //! The t6c checks (C-T6c1a item 4): every successful read equals the
 //! model at the statement's snapshot `S` plus the txn's own writes,
 //! rendered with the schema of the reported `def_version`; an RR/SER
-//! access — read or completed write — that *succeeded* although a
-//! foreign TRUNCATE committed in `(S, access]` is a violation (C-T0
-//! §4's relation rule: the engine must answer 40001, never the
-//! post-truncate storage; the write leg is c1b's FU-B: an in-window
-//! insert is data-consistent with the model, so only the window check
-//! can flag it); the final full scans
+//! read that *succeeded* although a foreign TRUNCATE committed in
+//! `(S, read]` is a violation (C-T0 §4's relation rule: the engine must
+//! answer 40001, never the post-truncate storage); the final full scans
 //! equal the model; amcheck is clean at the end and at each mid-run
 //! snapshot; and no intent leaks once the resolver drains.
 //!
@@ -26,9 +23,9 @@
 //! before the catalog read). Such a statement answers from the
 //! post-truncate storage at its snapshot `S`, where every foreign row
 //! has ts `> T > S`: its read is its own writes alone
-//! ([`truncate_window`]). RR/SER accesses get no such window — §4's
+//! ([`truncate_window`]). RR/SER reads get no such window — §4's
 //! relation rule must answer 40001 there — which is what the dedicated
-//! check asserts, for reads and completed writes alike.
+//! check asserts.
 //!
 //! Write-effect and SERIALIZABLE checks are C-T6c1b's ([`Effects`]):
 //! every committed write is re-derived at its commit position, SET NOT
@@ -61,13 +58,6 @@ pub struct Stats {
     /// `committed`/`failed`).
     pub retryable_failures: usize,
     pub reads_checked: usize,
-    /// The level split of `reads_checked` (c1a FU-5 / c1b FU-C): pins
-    /// that successful reads happen at **every** level, so an
-    /// over-refusing engine that 40001'd all RR/SER reads fails the
-    /// soak instead of passing on RC reads alone.
-    pub reads_rc: usize,
-    pub reads_rr: usize,
-    pub reads_ser: usize,
     pub writes: usize,
     pub ddl: usize,
     pub truncates_committed: usize,
@@ -191,9 +181,8 @@ fn committed_truncates(h: &History) -> Vec<(u64, u64, u16)> {
 /// grant and the txn's end; the swap can only have happened before the
 /// grant. Such a statement legitimately answers from the new storage at
 /// `S`, where every foreign row has ts `> T > S`: its read is its own
-/// writes alone. (RR/SER accesses get no such window: §4's relation
-/// rule must answer 40001 there — reads and completed writes alike —
-/// which is what the dedicated check asserts.)
+/// writes alone. (RR/SER reads get no such window: §4's relation rule
+/// must answer 40001 there, which is what the dedicated check asserts.)
 fn truncate_window(truncates: &[(u64, u64, u16)], txn: &TxnRec, op_index: usize) -> bool {
     let op = &txn.ops[op_index];
     let Some(sid) = op.sid else {
@@ -242,17 +231,6 @@ fn rows_eq(a: &[(u16, Option<Value>)], b: &[(u16, Option<Value>)]) -> bool {
 
 fn diff(a: &[(u16, Option<Value>)], b: &[(u16, Option<Value>)]) -> String {
     format!("{a:?} != {b:?}")
-}
-
-/// Counts one checked read — the total and the level split (the split
-/// pins that reads succeed at every level; see [`Stats::reads_rc`]).
-fn note_read(stats: &mut Stats, level: Level) {
-    stats.reads_checked += 1;
-    match level {
-        Level::ReadCommitted => stats.reads_rc += 1,
-        Level::RepeatableRead => stats.reads_rr += 1,
-        Level::Serializable => stats.reads_ser += 1,
-    }
 }
 
 /// The read checks: for every successful read op of every txn (committed
@@ -319,7 +297,7 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                             exp
                         )),
                     }
-                    note_read(&mut v.stats, txn.level);
+                    v.stats.reads_checked += 1;
                 }
                 (OpDetail::ScanT, OpOut::RowsT(obs)) => {
                     let Some(ver) = op.def_version else {
@@ -378,7 +356,7 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                             (None, None) => {}
                         }
                     }
-                    note_read(&mut v.stats, txn.level);
+                    v.stats.reads_checked += 1;
                 }
                 // ---- reads on u ----------------------------------------
                 (OpDetail::ScanU, OpOut::RowsU(obs)) => {
@@ -431,7 +409,7 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                             (None, None) => {}
                         }
                     }
-                    note_read(&mut v.stats, txn.level);
+                    v.stats.reads_checked += 1;
                 }
                 // ---- a read that failed with something no read raises ----
                 (OpDetail::Get { .. } | OpDetail::ScanT | OpDetail::ScanU, OpOut::Err(code)) => {
@@ -475,19 +453,14 @@ fn u_identity_of(row: &[(u16, Option<Value>)]) -> Option<i64> {
     }
 }
 
-/// The TRUNCATE-window check: an RR/SER access of `t` that *succeeded*
+/// The TRUNCATE-window check: an RR/SER read of `t` that *succeeded*
 /// although it answered from the storage a foreign TRUNCATE installed
 /// after its snapshot `S` — the engine must have answered 40001 (C-T0
-/// §4, C-T6 §4), never the post-truncate rows. Reads and completed
-/// writes alike: §4's relation rule obliges the refusal for *any* such
-/// access, and an in-window write is data-consistent with the model (it
-/// commits after the truncate, so the model's clear-then-write ordering
-/// agrees) — only this check can flag it. Writes on `u` are exempt:
-/// `u` is never truncated. The statement's recorded `sid` against the
-/// truncate's recorded `new_sid` is the exact test (see
-/// [`truncate_window`]): equality means the catalog read the statement
-/// made under its relation lock named the post-truncate storage, i.e.
-/// the truncate committed inside `(S, access]`.
+/// §4, C-T6 §4), never the post-truncate rows. The statement's recorded
+/// `sid` against the truncate's recorded `new_sid` is the exact test
+/// (see [`truncate_window`]): equality means the catalog read the
+/// statement made under its relation lock named the post-truncate
+/// storage, i.e. the truncate committed inside `(S, read]`.
 fn check_truncate_windows(h: &History, truncates: &[(u64, u64, u16)], v: &mut Verdict) {
     for txn in &h.txns {
         if !matches!(txn.level, Level::RepeatableRead | Level::Serializable) {
@@ -498,38 +471,24 @@ fn check_truncate_windows(h: &History, truncates: &[(u64, u64, u16)], v: &mut Ve
                 (&op.detail, &op.out),
                 (OpDetail::Get { .. }, OpOut::Row(_)) | (OpDetail::ScanT, OpOut::RowsT(_))
             );
-            // The write leg (c1b FU-B): a completed write — an insert,
-            // an update or delete whether or not it matched a row — is
-            // an access like any other; `InsertU`/`DeleteU` never appear
-            // here because `u` is never truncated (its storage id can
-            // never equal a truncate's `new_sid` for `t`).
-            let successful_write = matches!(
-                (&op.detail, &op.out),
-                (OpDetail::InsertT { .. }, OpOut::Ok)
-                    | (OpDetail::UpdateSet { .. }, OpOut::Applied(_))
-                    | (OpDetail::DeleteT { .. }, OpOut::Applied(_))
-            );
-            if !(successful_read || successful_write) || !truncate_window(truncates, txn, idx) {
-                continue;
+            if successful_read && truncate_window(truncates, txn, idx) {
+                let ts = truncates
+                    .iter()
+                    .find(|(ts, new_sid, session)| {
+                        op.snap < *ts
+                            && *new_sid == op.sid.unwrap_or(u64::MAX)
+                            && *session != txn.session
+                    })
+                    .map(|(ts, _, _)| ts)
+                    .expect("truncate_window found one");
+                v.violations.push(format!(
+                    "{}: a successful {} read at S={} answered from the storage a \
+                     foreign TRUNCATE committed at ts {ts} inside (S, read] — 40001 was required",
+                    where_op(txn, idx),
+                    op.kind.tag(),
+                    op.snap
+                ));
             }
-            let ts = truncates
-                .iter()
-                .find(|(ts, new_sid, session)| {
-                    op.snap < *ts
-                        && *new_sid == op.sid.unwrap_or(u64::MAX)
-                        && *session != txn.session
-                })
-                .map(|(ts, _, _)| ts)
-                .expect("truncate_window found one");
-            let what = if successful_read { "read" } else { "write" };
-            v.violations.push(format!(
-                "{}: a successful {} {} at S={} answered from the storage a \
-                 foreign TRUNCATE committed at ts {ts} inside (S, {what}] — 40001 was required",
-                where_op(txn, idx),
-                op.kind.tag(),
-                what,
-                op.snap
-            ));
         }
     }
 }

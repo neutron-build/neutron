@@ -37,10 +37,11 @@
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
 mod t6b_support;
+// This card's test-side checker extensions (the write half of the
+// TRUNCATE-window rule, the per-level read split).
+mod t6c_support;
 
-use diff::check::{check, Verdict};
-use diff::runner::run_workload;
-use diff::{gen_ddl, gen_prog, Config, PDdl, Run};
+use diff::{check, gen_ddl, gen_prog, run_workload, Config, PDdl, Run, Verdict};
 
 /// The soak's three fixed seeds.
 const SEEDS: [u64; 3] = [0x7c1a_0001, 0x7c1a_0002, 0x7c1a_0003];
@@ -56,7 +57,9 @@ fn run_seed(seed: u64) -> (Run, Verdict) {
     let t0 = std::time::Instant::now();
     let run = run_workload(&cfg);
     let t1 = std::time::Instant::now();
-    let verdict = check(&run);
+    // The merged checker's every check, plus this card's write-side
+    // TRUNCATE-window pass (c1b FU-B).
+    let verdict = t6c_support::check_with_write_windows(&run);
     // Reported, never asserted: no wall-clock verdicts.
     println!(
         "t6c soak seed {seed:#x}: run {:?}, check {:?}, leaked {}",
@@ -67,8 +70,9 @@ fn run_seed(seed: u64) -> (Run, Verdict) {
     (run, verdict)
 }
 
-fn summary(seed: u64, v: &Verdict) {
+fn summary(seed: u64, v: &Verdict, run: &Run) {
     let s = &v.stats;
+    let lv = t6c_support::read_levels(&run.history);
     println!(
         "t6c soak seed {seed:#x}: {} txns ({} committed, {} failed, {} retried); \
          {} reads checked (RC {}, RR {}, SER {}); {} writes; {} DDL ({} truncates committed); \
@@ -80,9 +84,9 @@ fn summary(seed: u64, v: &Verdict) {
         s.failed,
         s.retryable_failures,
         s.reads_checked,
-        s.reads_rc,
-        s.reads_rr,
-        s.reads_ser,
+        lv.rc,
+        lv.rr,
+        lv.ser,
         s.writes,
         s.ddl,
         s.truncates_committed,
@@ -114,7 +118,7 @@ fn assert_clean(seed: u64, verdict: &Verdict) {
 fn t6c_soak() {
     for seed in SEEDS {
         let (run, verdict) = run_seed(seed);
-        summary(seed, &verdict);
+        summary(seed, &verdict, &run);
         assert_clean(seed, &verdict);
         let s = &verdict.stats;
         // The workload actually exercised the surfaces under test: reads
@@ -125,9 +129,10 @@ fn t6c_soak() {
         // happen at every level — an over-refusing engine that 40001'd
         // all RR/SER reads starves two of the three counters (refused
         // txns leave no effects, so nothing else would notice).
-        assert!(s.reads_rc > 50, "too few RC reads checked: {s:?}");
-        assert!(s.reads_rr > 50, "too few RR reads checked: {s:?}");
-        assert!(s.reads_ser > 50, "too few SER reads checked: {s:?}");
+        let lv = t6c_support::read_levels(&run.history);
+        assert!(lv.rc > 50, "too few RC reads checked: {lv:?} of {s:?}");
+        assert!(lv.rr > 50, "too few RR reads checked: {lv:?} of {s:?}");
+        assert!(lv.ser > 50, "too few SER reads checked: {lv:?} of {s:?}");
         assert!(s.truncates_committed > 3, "too few truncates: {s:?}");
         assert!(s.ddl > 30, "too little DDL: {s:?}");
         assert!(
@@ -156,7 +161,7 @@ fn t6c_soak_long() {
     for i in 0..LONG_SEEDS {
         let seed = LONG_BASE + i;
         let (run, verdict) = run_seed(seed);
-        summary(seed, &verdict);
+        summary(seed, &verdict, &run);
         assert_clean(seed, &verdict);
         assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
     }
@@ -317,21 +322,7 @@ fn t6c_checker_flags_a_corrupted_read() {
     // truncate committed after its snapshot (`snap < ts` and the
     // session difference are preserved by the rewrite — only the
     // outcome and the storage id lie).
-    let truncates: Vec<(u64, u64, u16)> = run
-        .history
-        .txns
-        .iter()
-        .filter_map(|t| match t.fate {
-            diff::Fate::Committed(ts) => {
-                let new_sid = t.ops.iter().find_map(|op| match (&op.detail, &op.out) {
-                    (diff::OpDetail::Truncate { new_sid }, diff::OpOut::Ok) => Some(*new_sid),
-                    _ => None,
-                })?;
-                Some((ts, new_sid, t.session))
-            }
-            _ => None,
-        })
-        .collect();
+    let truncates = t6c_support::committed_truncates(&run.history);
     let mut corrupted = run.history.clone();
     let mut rewritten = false;
     'find: for txn in corrupted.txns.iter_mut() {

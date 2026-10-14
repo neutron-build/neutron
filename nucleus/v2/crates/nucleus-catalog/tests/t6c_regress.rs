@@ -44,14 +44,16 @@
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
 mod t6b_support;
+// This card's test-side checker extensions (the write half of the
+// TRUNCATE-window rule).
+mod t6c_support;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use diff::check::check;
 use diff::runner::{t_schema, Rig, DDL_SESSION};
-use diff::{Fate, History, Level, OpDetail, OpKind, OpOut, OpRec, RowVals, Run, TxnRec};
+use diff::{check, Fate, History, Level, OpDetail, OpKind, OpOut, OpRec, RowVals, Run, TxnRec};
 
 use nucleus_catalog::table_lo;
 use nucleus_catalog::Stmt;
@@ -1000,9 +1002,11 @@ fn t6c_regress_flags_a_ser_phantom_skew() {
 /// catalog read names a post-`S` storage — a write included. An
 /// in-window insert is data-consistent with the model (it commits after
 /// the truncate, so the model's clear-then-insert ordering agrees): no
-/// data check can flag it, only the window check's write leg can. The
-/// same shape at RC is legal (the relation rule is RR/SER-only) and
-/// stays clean — the over-eagerness guard.
+/// data check can flag it, only the write-side window pass
+/// (`t6c_support::check_with_write_windows`, this card's test-side
+/// extension of the merged checker) can. The same shape at RC is legal
+/// (the relation rule is RR/SER-only) and stays clean — the
+/// over-eagerness guard.
 #[test]
 fn t6c_regress_flags_an_in_window_rr_write() {
     /// The setup every variant starts from: pk1 @ts1, then the DDL
@@ -1063,7 +1067,8 @@ fn t6c_regress_flags_an_in_window_rr_write() {
     history
         .txns
         .push(in_window_insert(3, Level::RepeatableRead));
-    let verdict = check(&run_of(history, vec![(7, row3(7, 700, Some("w")))]));
+    let verdict =
+        t6c_support::check_with_write_windows(&run_of(history, vec![(7, row3(7, 700, Some("w")))]));
     assert!(
         verdict
             .violations
@@ -1076,7 +1081,8 @@ fn t6c_regress_flags_an_in_window_rr_write() {
     // effect is model-consistent.
     let mut history = setup_and_truncate();
     history.txns.push(in_window_insert(3, Level::ReadCommitted));
-    let verdict = check(&run_of(history, vec![(7, row3(7, 700, Some("w")))]));
+    let verdict =
+        t6c_support::check_with_write_windows(&run_of(history, vec![(7, row3(7, 700, Some("w")))]));
     assert!(verdict.is_clean(), "{}", verdict.report());
 }
 
