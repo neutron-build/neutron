@@ -87,6 +87,16 @@ pub struct Stats {
     /// antidependency (`rw`).
     pub ser_wr_edges: usize,
     pub ser_rw_edges: usize,
+    // ---- C-T6d2: the large-value surface ------------------------------
+    /// Committed SetBig/NullBig write ops.
+    pub big_writes: usize,
+    /// Committed SetBigs per [`BIG_LENS`] class (inline / one chunk /
+    /// three chunks).
+    pub big_lens: [usize; 3],
+    /// Committed DropBig DDLs.
+    pub big_drops: usize,
+    /// Committed AddBig DDLs.
+    pub big_adds: usize,
 }
 
 /// The verdict: every violation found, plus the stats.
@@ -427,10 +437,40 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                             | OpKind::DeleteT
                             | OpKind::InsertU
                             | OpKind::DeleteU
+                            | OpKind::SetBig
+                            | OpKind::NullBig
                     ) {
                         v.stats.writes += 1;
+                        // C-T6d2: the large-value surface must actually
+                        // have run — committed SetBigs at every length
+                        // class the card names.
+                        if matches!(op.out, OpOut::Applied(true))
+                            && matches!(txn.fate, Fate::Committed(_))
+                            && matches!(op.kind, OpKind::SetBig | OpKind::NullBig)
+                        {
+                            v.stats.big_writes += 1;
+                        }
+                        if let (OpDetail::SetBig { len, .. }, OpOut::Applied(true)) =
+                            (&op.detail, &op.out)
+                        {
+                            if matches!(txn.fate, Fate::Committed(_)) {
+                                if let Some(class) =
+                                    super::BIG_LENS.iter().position(|l| *l == *len as usize)
+                                {
+                                    v.stats.big_lens[class] += 1;
+                                }
+                            }
+                        }
                     } else if super::model::is_ddl(op.kind) {
                         v.stats.ddl += 1;
+                        let committed =
+                            matches!(txn.fate, Fate::Committed(_)) && matches!(op.out, OpOut::Ok);
+                        if committed && op.kind == OpKind::DropBig {
+                            v.stats.big_drops += 1;
+                        }
+                        if committed && op.kind == OpKind::AddBig {
+                            v.stats.big_adds += 1;
+                        }
                         if op.kind == OpKind::Truncate && matches!(op.out, OpOut::Ok) {
                             v.stats.truncates_committed += match txn.fate {
                                 Fate::Committed(_) => 1,
@@ -768,6 +808,47 @@ impl Effects {
                     self.last_t_write.insert(*pk, txn.uid);
                 }
             }
+            // C-T6d2: the large-value writes get the same oracle — the
+            // applied effect is the base at the commit position with the
+            // derived value (or NULL) set on the resolved attnum.
+            (
+                OpDetail::SetBig {
+                    pk,
+                    len,
+                    tag,
+                    attnum,
+                    new_row,
+                },
+                OpOut::Applied(applied),
+            ) => {
+                self.stats.writes_checked += 1;
+                self.check_row_write(model, state, txn, idx, op, own, *pk, *applied, ts);
+                if *applied {
+                    let value = Some(super::big_blob(*tag, *len as usize));
+                    self.recompute_effect(
+                        where_, op, own, state, model, *pk, attnum, &value, new_row,
+                    );
+                    self.last_t_write.insert(*pk, txn.uid);
+                }
+            }
+            (
+                OpDetail::NullBig {
+                    pk,
+                    attnum,
+                    new_row,
+                },
+                OpOut::Applied(applied),
+            ) => {
+                self.stats.writes_checked += 1;
+                self.check_row_write(model, state, txn, idx, op, own, *pk, *applied, ts);
+                if *applied {
+                    let value = None;
+                    self.recompute_effect(
+                        where_, op, own, state, model, *pk, attnum, &value, new_row,
+                    );
+                    self.last_t_write.insert(*pk, txn.uid);
+                }
+            }
             (OpDetail::DeleteT { pk }, OpOut::Applied(applied)) => {
                 self.stats.writes_checked += 1;
                 self.check_row_write(model, state, txn, idx, op, own, *pk, *applied, ts);
@@ -1045,6 +1126,10 @@ impl Effects {
                 },
             }),
             OpDetail::UpdateSet { pk, .. } | OpDetail::DeleteT { pk } => Some(Scope::PkT {
+                pk: *pk,
+                seen: base_t(*pk),
+            }),
+            OpDetail::SetBig { pk, .. } | OpDetail::NullBig { pk, .. } => Some(Scope::PkT {
                 pk: *pk,
                 seen: base_t(*pk),
             }),

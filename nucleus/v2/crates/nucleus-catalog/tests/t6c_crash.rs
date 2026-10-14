@@ -49,6 +49,11 @@ fn t6c_crash_ddl_matrix() {
         Scenario::Truncate,
         Scenario::CreateIndex,
         Scenario::InsertU,
+        // C-T6d2: the large-value scene — its chunks join the unsynced
+        // tail with the row intents, so the cuts land between a row and
+        // its chunks, across tombstones and across the concurrent `Off`
+        // large insert, and no orphan or dangling chunk may survive.
+        Scenario::LargeValues,
     ];
     for (i, scenario) in scenarios.iter().enumerate() {
         for (j, b_sync) in [SyncCommit::On, SyncCommit::Off].iter().enumerate() {

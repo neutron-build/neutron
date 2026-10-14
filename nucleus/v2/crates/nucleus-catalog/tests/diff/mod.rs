@@ -112,6 +112,12 @@ pub enum OpKind {
     /// `DELETE FROM u WHERE rowid = ..` (a rowid an earlier ScanU of the
     /// same txn saw)
     DeleteU,
+    /// `UPDATE t SET big = <BIG_LENS[..]-byte text> WHERE pk = ..`
+    /// (C-T6d2: the large-value op — the column is resolved by name at
+    /// execution, so a DropBig/AddBig cycle moves its attnum).
+    SetBig,
+    /// `UPDATE t SET big = NULL WHERE pk = ..`
+    NullBig,
     /// `ALTER TABLE t ADD COLUMN cN int8 [DEFAULT const]`
     AddColumn,
     /// `ALTER TABLE t DROP COLUMN ..` (a live non-pk column)
@@ -122,6 +128,12 @@ pub enum OpKind {
     DropNotNull,
     /// `TRUNCATE t`
     Truncate,
+    /// `ALTER TABLE t DROP COLUMN big` (C-T6d2: by name, recorded as a
+    /// DropColumn of the resolved attnum).
+    DropBig,
+    /// `ALTER TABLE t ADD COLUMN big text` (C-T6d2: the re-add —
+    /// attnums are never reused, so it lands on a fresh one).
+    AddBig,
 }
 
 impl OpKind {
@@ -135,11 +147,15 @@ impl OpKind {
             OpKind::InsertU => "Iu",
             OpKind::ScanU => "Su",
             OpKind::DeleteU => "Du",
+            OpKind::SetBig => "Sb",
+            OpKind::NullBig => "Nb",
             OpKind::AddColumn => "ADD",
             OpKind::DropColumn => "DROP",
             OpKind::SetNotNull => "SNN",
             OpKind::DropNotNull => "DNN",
             OpKind::Truncate => "TRUNC",
+            OpKind::DropBig => "DROPB",
+            OpKind::AddBig => "ADDB",
         }
     }
 }
@@ -193,6 +209,23 @@ pub enum OpDetail {
     },
     DropColumn {
         attnum: u16,
+    },
+    /// C-T6d2's large-value ops (§5): `big`'s attnum is resolved by name
+    /// at execution (a DropBig/AddBig cycle moves it); `len` is the
+    /// value's byte length and `tag` its letter, so the value itself is
+    /// [`big_blob`]`(tag, len)`; `new_row` is the row a post-write
+    /// read-back observed, exactly as UpdateSet's.
+    SetBig {
+        pk: i64,
+        len: u32,
+        tag: u8,
+        attnum: u16,
+        new_row: Option<RowVals>,
+    },
+    NullBig {
+        pk: i64,
+        attnum: u16,
+        new_row: Option<RowVals>,
     },
     SetNotNull {
         attnum: u16,
@@ -350,6 +383,10 @@ pub enum POp {
     ScanU,
     /// (choice index into the rowids this txn has seen)
     DeleteU(u32),
+    /// (pk, choice index into [`BIG_LENS`]) — C-T6d2's large value.
+    SetBig(i64, u32),
+    /// (pk)
+    NullBig(i64),
 }
 
 /// A DML program: a fixed level and 1-4 fixed statements, independent of
@@ -363,6 +400,16 @@ pub struct Prog {
 /// The pk domain of `t` (the card's `pk ∈ 0..8`).
 pub const PKS: i64 = 9;
 
+/// The `big` lengths the card names (C-T6d2): 100 stays inline, 3000 is
+/// one chunk, 20000 is three.
+pub const BIG_LENS: [usize; 3] = [100, 3000, 20_000];
+
+/// The `big` value of `(tag, len)`: one ASCII letter repeated — distinct
+/// per tag, one byte per char, so the byte length is the char count.
+pub fn big_blob(tag: u8, len: usize) -> Value {
+    Value::Text(char::from(b'a' + (tag % 26)).to_string().repeat(len))
+}
+
 /// The program of `(seed, session, index)`: a level and 1-4 ops over the
 /// mix below. Pure: same triple, same program, whatever the interleavings.
 pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
@@ -373,7 +420,8 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
         _ => Level::Serializable,
     };
     let n = 1 + rng.below(4) as usize;
-    // Percent-like mix weights (relative): reads on t, writes on t, ops on u.
+    // Percent-like mix weights (relative): reads on t, writes on t, ops
+    // on u, and the large-value pair on t's `big` column.
     const W_GET: u64 = 18;
     const W_SCAN: u64 = 12;
     const W_INSERT: u64 = 14;
@@ -382,8 +430,18 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
     const W_INSERT_U: u64 = 9;
     const W_SCAN_U: u64 = 8;
     const W_DELETE_U: u64 = 9;
-    const TOTAL: u64 =
-        W_GET + W_SCAN + W_INSERT + W_UPDATE + W_DELETE + W_INSERT_U + W_SCAN_U + W_DELETE_U;
+    const W_SET_BIG: u64 = 10;
+    const W_NULL_BIG: u64 = 4;
+    const TOTAL: u64 = W_GET
+        + W_SCAN
+        + W_INSERT
+        + W_UPDATE
+        + W_DELETE
+        + W_INSERT_U
+        + W_SCAN_U
+        + W_DELETE_U
+        + W_SET_BIG
+        + W_NULL_BIG;
     let mut ops = Vec::with_capacity(n + 1);
     for _ in 0..n {
         let pk = rng.below(PKS as u64) as i64;
@@ -410,8 +468,12 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
             ops.push(POp::InsertU(rng.below(8) == 0));
         } else if pick(W_SCAN_U) {
             ops.push(POp::ScanU);
-        } else {
+        } else if pick(W_DELETE_U) {
             ops.push(POp::DeleteU(rng.next() as u32));
+        } else if pick(W_SET_BIG) {
+            ops.push(POp::SetBig(pk, rng.next() as u32));
+        } else {
+            ops.push(POp::NullBig(pk));
         }
     }
     Prog { level, ops }
@@ -429,17 +491,40 @@ pub enum PDdl {
     /// A live non-pk column, resolved at execution.
     DropNotNull,
     Truncate,
+    /// `DROP COLUMN big`, by name (C-T6d2); a no-big-live table refuses.
+    DropBig,
+    /// `ADD COLUMN big text` — the re-add (C-T6d2). The generator pairs
+    /// the drop and the re-add on adjacent DDL indices (see [`gen_ddl`]).
+    AddBig,
 }
 
 /// The DDL program of `(seed, index)`: one DDL statement, its own txn.
+///
+/// The big pair is a **drop followed by its re-add on the very next
+/// index**: a draw that lands `DropBig` at `i` forces `AddBig` at
+/// `i + 1`, so `big` is never absent for more than a txn or two of the
+/// stream. Without the forcing, a drop's re-add comes only when a later
+/// draw and parity both say so, and the column can stay dropped for a
+/// long stretch — starving the large-value DML ops on scheduling
+/// rather than on the seed.
 pub fn gen_ddl(seed: u64, index: u32) -> PDdl {
+    if index > 0 && matches!(gen_ddl_draw(seed, index - 1), PDdl::DropBig) {
+        return PDdl::AddBig;
+    }
+    gen_ddl_draw(seed, index)
+}
+
+/// The seeded draw of one DDL index (the big pair draws only the drop;
+/// [`gen_ddl`] supplies the re-add).
+fn gen_ddl_draw(seed: u64, index: u32) -> PDdl {
     let mut rng = Rng::new(seed ^ 0x_dd11 ^ (u64::from(index) << 8));
     const W_ADD: u64 = 30;
     const W_DROP: u64 = 12;
     const W_SNN: u64 = 14;
     const W_DNN: u64 = 14;
     const W_TRUNC: u64 = 30;
-    let mut r = rng.below(W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC);
+    const W_DROP_BIG: u64 = 4;
+    let mut r = rng.below(W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC + W_DROP_BIG);
     if r < W_ADD {
         return PDdl::AddColumn(rng.below(2) == 0);
     }
@@ -455,7 +540,14 @@ pub fn gen_ddl(seed: u64, index: u32) -> PDdl {
     if r < W_DNN {
         return PDdl::DropNotNull;
     }
-    PDdl::Truncate
+    r -= W_DNN;
+    if r < W_TRUNC {
+        return PDdl::Truncate;
+    }
+    // The fallthrough covers the big-cycle draw: the drop. Its re-add is
+    // the forced successor; a drop over an absent column is a no-op
+    // refusal, so the pairing is self-correcting.
+    PDdl::DropBig
 }
 
 // ----- write constants ------------------------------------------------------
@@ -468,6 +560,8 @@ pub const TAG_T_SET: u8 = 2;
 pub const TAG_U_A: u8 = 3;
 pub const TAG_U_B: u8 = 4;
 pub const TAG_DDL: u8 = 5;
+/// The `big` letter of a SetBig (C-T6d2).
+pub const TAG_T_BIG: u8 = 6;
 
 /// A unique-per-write constant (the card's "constants unique per
 /// write"): a pure function of the program position and role. Distinct

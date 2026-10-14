@@ -1,7 +1,7 @@
-//! amcheck-lite (C-T6 §8, card C-T6b3b): the consistency checker a
-//! harness runs against one table at a **registered snapshot** —
-//! I-ROWFMT, I-IDX (with I-UNIQUE for unique indexes), I-IDX-WO and
-//! I-IDX-DO. I-TOAST arrives with the large-value layout (§5, C-T6d2).
+//! amcheck-lite (C-T6 §8, cards C-T6b3b and C-T6d2): the consistency
+//! checker a harness runs against one table at a **registered
+//! snapshot** — I-ROWFMT, I-IDX (with I-UNIQUE for unique indexes),
+//! I-IDX-WO, I-IDX-DO and I-TOAST (§5, both directions).
 //!
 //! [`check_table`] reads the catalog at `at.ts()` (never the latest
 //! catalog: a def change committed after `at` must not change a verdict
@@ -36,25 +36,33 @@
 //! - **I-IDX-DO**: each `DeleteOnly` index whose idx row is visible at
 //!   `at` (every one the catalog scan at `at` returns) has **no** visible
 //!   entry: a DeleteOnly index never inserts.
+//! - **I-TOAST** (§5, C-T6d2): every pointer of every visible row — read
+//!   with [`decode_row_raw`], so pointers in **dropped** attnums count
+//!   (no DDL rewrites rows, §3; a dropped column's chunks must not leak)
+//!   — names chunks `0..chunk_count` visible at `at` with lengths
+//!   summing to `raw_len`, and every visible chunk of the storage is
+//!   named by such a pointer. A missing or short chunk is a dangling
+//!   pointer; an unnamed chunk is an orphan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
-use nucleus_codec::row::{Datum, TableSchema};
+use nucleus_codec::row::{decode_row_raw, Datum, RawDatum, TableSchema, ToastPointer};
 use nucleus_codec::{decode_key_prefix, encode_key, KeyColumn, KeyType, Value};
 use nucleus_kv::{Key, OrderedKv};
 use nucleus_txn::boot::Core;
-use nucleus_txn::catalog::{index_ranges, Catalog, IdxStorage};
+use nucleus_txn::catalog::{index_ranges, table_range, Catalog, IdxStorage};
 use nucleus_txn::locks::RelLockMode;
 use nucleus_txn::read::{scan, NoSsi};
 use nucleus_txn::registry::SnapshotGuard;
 use nucleus_txn::visibility::ReadCtx;
-use nucleus_txn::TxnError;
+use nucleus_txn::{Ts, TxnError};
 
 use crate::db::{chunk_prefix, ghost_id, table_lo, Db, IndexHandle, TableHandle};
 use crate::defs::{IndexDef, IndexState};
 use crate::error::DbError;
 use crate::index;
+use crate::toast::{chunk_key, TOAST_CHUNK, TOAST_MARK};
 
 /// The amcheck report: every invariant violation found, as strings each
 /// prefixed with the invariant's name (`"I-ROWFMT: …"`, `"I-IDX: …"`,
@@ -116,11 +124,11 @@ pub fn check_table<K: OrderedKv>(
 
     let rows = visible_rows(&db.core, rel.storage_id, &ctx)?;
     let mut decoded: Vec<(Key, Vec<Option<Datum>>)> = Vec::with_capacity(rows.len());
-    for (key, bytes) in rows {
-        match schema.decode_row(&bytes) {
+    for (key, bytes) in &rows {
+        match schema.decode_row(bytes) {
             Ok(live) => {
-                check_row_key(&mut report, oid, &schema, rel.storage_id, &key, &live);
-                decoded.push((key, live));
+                check_row_key(&mut report, oid, &schema, rel.storage_id, key, &live);
+                decoded.push((key.clone(), live));
             }
             Err(e) => report.push(format!(
                 "I-ROWFMT: relation {oid} row {key:?} does not decode under the def (version {}) at {:?}: {e}",
@@ -252,6 +260,18 @@ pub fn check_table<K: OrderedKv>(
             }
         }
     }
+
+    // ---- I-TOAST (§5) ------------------------------------------------------
+
+    check_toast(
+        &mut report,
+        &db.core,
+        oid,
+        rel.storage_id,
+        &rows,
+        &ctx,
+        at.ts(),
+    )?;
     Ok(report)
 }
 
@@ -310,6 +330,140 @@ fn visible_entries<K: OrderedKv>(
         out.extend(rows);
     }
     Ok(out)
+}
+
+// ---- I-TOAST (§5) --------------------------------------------------------------
+
+/// The §5 sizes of the large-value chunks of storage `sid` visible at
+/// `ctx.snapshot`: everything from `table_lo ‖ 0xFF` (the mark no encoded
+/// key starts with, so it is exactly where rows end) to the table
+/// range's end, through the same §4 read path every reader uses.
+fn visible_chunk_sizes<K: OrderedKv>(
+    core: &Core<K>,
+    sid: u64,
+    ctx: &ReadCtx,
+) -> Result<BTreeMap<Key, usize>, TxnError> {
+    let mut lo = table_lo(sid);
+    lo.push(TOAST_MARK);
+    let hi = table_range(sid).1;
+    let view = core.open_view();
+    let mut out = BTreeMap::new();
+    for (key, payload) in scan(
+        core,
+        &view,
+        (
+            Bound::Included(lo.as_slice()),
+            Bound::Excluded(hi.as_slice()),
+        ),
+        ctx,
+        &mut NoSsi,
+    )
+    .collect::<Result<Vec<_>, _>>()?
+    {
+        out.insert(key, payload.len());
+    }
+    Ok(out)
+}
+
+/// §5 I-TOAST, both directions at the check's snapshot:
+///
+/// - every pointer of every visible row — collected with
+///   [`decode_row_raw`], which returns every attnum `<= natts` of the
+///   row's own definition, **dropped included** (§3: no DDL rewrites
+///   rows, so a pre-drop row still names its chunks there and a
+///   live-columns decode would orphan them) — names chunks
+///   `0..chunk_count` visible at the snapshot, each [`TOAST_CHUNK`]
+///   bytes but a shorter non-empty last, summing to `raw_len`;
+/// - every visible chunk of the storage is named by such a pointer.
+///
+/// A row that does not even raw-decode is skipped: I-ROWFMT has already
+/// reported it, and its pointers are unknowable. Violations are named
+/// `"I-TOAST: …"`.
+fn check_toast<K: OrderedKv>(
+    report: &mut Report,
+    core: &Core<K>,
+    oid: u64,
+    sid: u64,
+    rows: &[(Key, Vec<u8>)],
+    ctx: &ReadCtx,
+    at: Ts,
+) -> Result<(), TxnError> {
+    let chunks = visible_chunk_sizes(core, sid, ctx)?;
+    // Every chunk key a visible row's pointer names (§5's second half).
+    let mut named: BTreeSet<Key> = BTreeSet::new();
+    for (key, bytes) in rows {
+        let Ok((_, raw)) = decode_row_raw(bytes) else {
+            continue;
+        };
+        for p in raw.iter().flatten().filter_map(pointer_of) {
+            if p.chunks == 0 || p.raw_len == 0 {
+                report.push(format!(
+                    "I-TOAST: relation {oid} row {key:?}: pointer {:?} names no chunk",
+                    p.id
+                ));
+                continue;
+            }
+            if u64::from(p.chunks) * (TOAST_CHUNK as u64) < u64::from(p.raw_len) {
+                // Even `chunks` full chunks cannot reach `raw_len`: the
+                // pointer is corrupt, and iterating it cannot be bounded
+                // by the store (a planted huge count would spin).
+                report.push(format!(
+                    "I-TOAST: relation {oid} row {key:?}: pointer {:?} counts {} chunks, which cannot sum to raw_len {}",
+                    p.id, p.chunks, p.raw_len
+                ));
+                continue;
+            }
+            let mut missing: Option<u32> = None;
+            let mut shape_bad = false;
+            let mut sum: u64 = 0;
+            for i in 0..p.chunks {
+                let ck = chunk_key(sid, &p.id, i);
+                named.insert(ck.clone());
+                let Some(&len) = chunks.get(&ck) else {
+                    missing = missing.or(Some(i));
+                    continue;
+                };
+                let last = i + 1 == p.chunks;
+                let shape_ok =
+                    len <= TOAST_CHUNK && if last { len > 0 } else { len == TOAST_CHUNK };
+                if !shape_ok && !shape_bad {
+                    shape_bad = true;
+                    report.push(format!(
+                        "I-TOAST: relation {oid} row {key:?}: chunk {i} of pointer {:?} is {len} bytes, not the §5 shape",
+                        p.id
+                    ));
+                }
+                sum += len as u64;
+            }
+            if let Some(i) = missing {
+                report.push(format!(
+                    "I-TOAST: relation {oid} row {key:?}: chunk {i} of pointer {:?} is not visible at {at:?} (dangling pointer)",
+                    p.id
+                ));
+            } else if !shape_bad && sum != u64::from(p.raw_len) {
+                report.push(format!(
+                    "I-TOAST: relation {oid} row {key:?}: the chunks of pointer {:?} sum to {sum}, raw_len says {}",
+                    p.id, p.raw_len
+                ));
+            }
+        }
+    }
+    for ck in chunks.keys() {
+        if !named.contains(ck) {
+            report.push(format!(
+                "I-TOAST: relation {oid}: visible chunk {ck:?} is named by no pointer of a visible row (orphan)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The toast pointers of one raw-decoded row.
+fn pointer_of(d: &RawDatum) -> Option<&ToastPointer> {
+    match d {
+        RawDatum::Toast(p) => Some(p),
+        RawDatum::Inline(_) => None,
+    }
 }
 
 /// I-ROWFMT's key half for one decoded row: a pk table's pk columns

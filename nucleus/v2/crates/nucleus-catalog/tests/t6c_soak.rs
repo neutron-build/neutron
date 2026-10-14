@@ -1,14 +1,16 @@
-//! C-T6c1a's soak, carrying C-T6c1b's checks: seeded multi-session
-//! histories over `nucleus-catalog::Db` on `Core<MemKv>` — 4 DML sessions
-//! at RC/RR/SER over `t(pk int8 PK, a int8, b text)` (pk ∈ 0..8) and
-//! `u(a int8, b text)` with its hidden rowid, plus a DDL session issuing
-//! ADD COLUMN, DROP COLUMN, SET/DROP NOT NULL and TRUNCATE each in its
-//! own txn — checked against the sequential reference model
-//! (`tests/diff/`): every read at its snapshot plus own writes (c1a),
-//! every write effect re-derived at its commit position, duplicates
-//! refused, SET NOT NULL outcomes validated, the committed SERIALIZABLE
-//! sub-history's serialization graph acyclic (c1b), amcheck at three
-//! mid-run snapshots and at the end, and final-state scans.
+//! C-T6c1a's soak, carrying C-T6c1b's checks and C-T6d2's large-value
+//! surface: seeded multi-session histories over `nucleus-catalog::Db` on
+//! `Core<MemKv>` — 4 DML sessions at RC/RR/SER over `t(pk int8 PK, a
+//! int8, b text, big text)` (pk ∈ 0..8; `big` takes 100/3000/20000-byte
+//! values and NULLs, C-T6d2 §5) and `u(a int8, b text)` with its hidden
+//! rowid, plus a DDL session issuing ADD COLUMN, DROP COLUMN, SET/DROP
+//! NOT NULL, TRUNCATE, DROP COLUMN big and its re-add, each in its own
+//! txn — checked against the sequential reference model (`tests/diff/`):
+//! every read at its snapshot plus own writes (c1a), every write effect
+//! re-derived at its commit position, duplicates refused, SET NOT NULL
+//! outcomes validated, the committed SERIALIZABLE sub-history's
+//! serialization graph acyclic (c1b), amcheck — I-TOAST included (d2) —
+//! at three mid-run snapshots and at the end, and final-state scans.
 //!
 //! The size is an iteration count (3 fixed seeds × 200 txns per session),
 //! never a wall-clock bound; timings are printed, not asserted. The
@@ -69,7 +71,8 @@ fn summary(seed: u64, v: &Verdict) {
          {} reads checked; {} writes; {} DDL ({} truncates committed); \
          {} amcheck points; c1b: {} writes checked ({} effects recomputed, \
          {} RC carve-outs), {} SET NOT NULL verified ({} skipped), \
-         {} SER txns / {} reads / {} wr + {} rw edges; violations: {}",
+         {} SER txns / {} reads / {} wr + {} rw edges; c1d2: {} big writes \
+         (lens {}/{}/{}), {} big drops / {} adds; violations: {}",
         s.txns,
         s.committed,
         s.failed,
@@ -88,6 +91,12 @@ fn summary(seed: u64, v: &Verdict) {
         s.ser_reads,
         s.ser_wr_edges,
         s.ser_rw_edges,
+        s.big_writes,
+        s.big_lens[0],
+        s.big_lens[1],
+        s.big_lens[2],
+        s.big_drops,
+        s.big_adds,
         v.violations.len()
     );
 }
@@ -104,6 +113,12 @@ fn assert_clean(seed: u64, verdict: &Verdict) {
 
 #[test]
 fn t6c_soak() {
+    // C-T6d2's coverage bars are taken over the three seeds together:
+    // how many of a run's SetBig ops land depends on scheduling (a pk
+    // the truncate-heavy mix leaves absent, a 40001 that exhausts the
+    // retry budget), so per-seed floors would flake on interleavings,
+    // while the aggregate floor is many times the bar.
+    let mut big = diff::Verdict::default().stats;
     for seed in SEEDS {
         let (run, verdict) = run_seed(seed);
         summary(seed, &verdict);
@@ -126,7 +141,25 @@ fn t6c_soak() {
         // makes ~a third of the 800 programs SERIALIZABLE).
         assert!(s.writes_checked > 100, "too few writes checked: {s:?}");
         assert!(s.ser_txns > 5, "too few committed SER txns: {s:?}");
+        // The aggregate of the large-value surface (Stats is Copy; the
+        // per-field sums are what the bars below run on).
+        big.big_writes += s.big_writes;
+        for (agg, one) in big.big_lens.iter_mut().zip(s.big_lens) {
+            *agg += one;
+        }
+        big.big_drops += s.big_drops;
+        big.big_adds += s.big_adds;
     }
+    // C-T6d2's surface: large-value writes committed at every length
+    // class the card names (inline / one chunk / three chunks), and the
+    // drop/re-add cycle of the column they land on.
+    assert!(big.big_writes > 12, "too few big writes: {big:?}");
+    assert!(
+        big.big_lens.iter().all(|&n| n > 0),
+        "every big length class (100/3000/20000) must commit: {big:?}"
+    );
+    assert!(big.big_drops > 0, "no committed DropBig: {big:?}");
+    assert!(big.big_adds > 0, "no committed AddBig: {big:?}");
 }
 
 /// The long variant: 50 seeds, `#[ignore]`d (the card's item 5).
@@ -181,9 +214,15 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
             PDdl::Truncate => {
                 kinds.insert("trunc");
             }
+            PDdl::DropBig => {
+                kinds.insert("dropbig");
+            }
+            PDdl::AddBig => {
+                kinds.insert("addbig");
+            }
         }
     }
-    assert_eq!(kinds.len(), 5, "every DDL kind appears: {kinds:?}");
+    assert_eq!(kinds.len(), 7, "every DDL kind appears: {kinds:?}");
 }
 
 // ----- the checker can fail ---------------------------------------------------

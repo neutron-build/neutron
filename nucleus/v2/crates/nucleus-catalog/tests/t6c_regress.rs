@@ -417,11 +417,14 @@ fn txn(uid: u32, session: u16, level: Level, snap: u64, fate: Fate, ops: Vec<OpR
     }
 }
 
+/// A row over `t`'s initial definition (v1: pk, a, b, big — `big` NULL in
+/// every synthetic history, which never writes one).
 fn row3(pk: i64, a: i64, b: Option<&str>) -> RowVals {
     vec![
         (1, Some(Value::Int8(pk))),
         (2, Some(Value::Int8(a))),
         (3, b.map(|s| Value::Text(s.to_string()))),
+        (4, None),
     ]
 }
 
@@ -621,6 +624,7 @@ fn t6c_regress_flags_a_wrong_update_effect() {
         (1, Some(Value::Int8(1))),
         (2, Some(Value::Int8(555))),
         (3, Some(Value::Text("claimed".to_string()))),
+        (4, None),
     ];
     let up = txn(
         2,

@@ -58,7 +58,8 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// `t(pk int8 PK, a int8, b text)`, version 1 (CREATE TABLE).
+    /// `t(pk int8 PK, a int8, b text, big text)`, version 1 (CREATE
+    /// TABLE) — C-T6d2's fourth column carries the large values.
     pub fn initial() -> Schema {
         Schema {
             version: 1,
@@ -77,6 +78,12 @@ impl Schema {
                 },
                 SchemaCol {
                     attnum: 3,
+                    not_null: false,
+                    dropped: false,
+                    missing: None,
+                },
+                SchemaCol {
+                    attnum: 4,
                     not_null: false,
                     dropped: false,
                     missing: None,
@@ -219,6 +226,24 @@ impl Model {
             }
             (
                 OpDetail::UpdateSet {
+                    pk,
+                    new_row: Some(row),
+                    ..
+                },
+                OpOut::Applied(true),
+            ) => {
+                state.t.insert(*pk, to_mrow(row));
+            }
+            // C-T6d2: the large-value writes carry their full read-back
+            // rows, exactly as UpdateSet does — the model stores the
+            // whole value, never just its length.
+            (
+                OpDetail::SetBig {
+                    pk,
+                    new_row: Some(row),
+                    ..
+                }
+                | OpDetail::NullBig {
                     pk,
                     new_row: Some(row),
                     ..
@@ -475,6 +500,21 @@ impl OwnWrites {
             ) => {
                 self.t.insert(*pk, Overlay::Row(to_mrow(row)));
             }
+            (
+                OpDetail::SetBig {
+                    pk,
+                    new_row: Some(row),
+                    ..
+                }
+                | OpDetail::NullBig {
+                    pk,
+                    new_row: Some(row),
+                    ..
+                },
+                OpOut::Applied(true),
+            ) => {
+                self.t.insert(*pk, Overlay::Row(to_mrow(row)));
+            }
             (OpDetail::DeleteT { pk }, OpOut::Applied(true)) => {
                 self.t.insert(*pk, Overlay::Gone);
             }
@@ -539,5 +579,7 @@ pub fn is_ddl(kind: OpKind) -> bool {
             | OpKind::SetNotNull
             | OpKind::DropNotNull
             | OpKind::Truncate
+            | OpKind::DropBig
+            | OpKind::AddBig
     )
 }
