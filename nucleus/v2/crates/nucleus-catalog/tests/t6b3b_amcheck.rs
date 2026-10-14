@@ -566,9 +566,19 @@ fn rows_and_entries_are_read_at_at_not_the_latest() {
     let u_isid = isid_of(&rig, u_idx);
     let old = u_entry_key(u_isid, &[text_col()], &[text_v("a".into())]);
     let new = u_entry_key(u_isid, &[text_col()], &[text_v("aa".into())]);
-    let live: Vec<_> = rig.scan_entries(u_isid).into_iter().map(|(k, _)| k).collect();
-    assert!(!live.contains(&old), "the pre-update entry is gone at latest");
-    assert!(live.contains(&new), "the post-update entry is there at latest");
+    let live: Vec<_> = rig
+        .scan_entries(u_isid)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        !live.contains(&old),
+        "the pre-update entry is gone at latest"
+    );
+    assert!(
+        live.contains(&new),
+        "the post-update entry is there at latest"
+    );
     let fresh = check_now(&rig, oid);
     assert!(fresh.is_clean(), "{:?}", fresh.violations);
 }
