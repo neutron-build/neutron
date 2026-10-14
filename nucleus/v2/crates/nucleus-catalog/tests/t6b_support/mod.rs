@@ -408,6 +408,13 @@ impl ThreadedRig {
         ok(Stmt::new(txn, s))
     }
 
+    /// The blocking Ddl for `txn` at snapshot `s` (§6 default wait) —
+    /// the threaded twin of [`Rig::ddl`].
+    pub fn ddl<'c>(&'c self, txn: &'c Txn, s: Ts) -> Ddl<'c, SharedFault> {
+        let seq = ok(txn.next_seq());
+        Ddl::new(self.core(), txn, StmtCtx::new(s, seq, seq))
+    }
+
     /// Resolves every queued intent (§7.3 through the resolver).
     pub fn settle(&self) {
         ok(Resolver::run_once(self.core()));
