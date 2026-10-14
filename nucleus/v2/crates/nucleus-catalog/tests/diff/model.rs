@@ -1,16 +1,17 @@
-//! The sequential reference model (C-T6c1a item 3): a `BTreeMap<Ts,
-//! State>` with `t`'s rows keyed by pk and `u`'s by their unique `a`
-//! constant, plus `t`'s schema history by version. Committed txns are
-//! replayed in `commit-ts` order; a replaying txn carries a per-txn
-//! own-writes overlay so its statements can be checked at their statement
-//! snapshots (state at `S` + overlay).
+//! The sequential reference model (C-T6c1a item 3, extended by C-T6c1b):
+//! a `BTreeMap<Ts, State>` with `t`'s rows keyed by pk and `u`'s by their
+//! unique `a` constant, plus `t`'s schema history by version. Committed
+//! txns are replayed in `commit-ts` order; a replaying txn carries a
+//! per-txn own-writes overlay so its statements can be checked at their
+//! statement snapshots (state at `S` + overlay).
 //!
 //! Effects are taken from what the runner recorded the engine apply —
 //! updates record a post-write read-back, so an RC statement whose row op
 //! re-based on a newer committed version through EPQ (§5.2) still models
 //! what later statements and the final state actually see. Whether a
-//! write *should* have applied is C-T6c1b's write-effect oracle, not this
-//! card's; C-T6c1a feeds the model.
+//! write *should* have applied is C-T6c1b's write-effect oracle
+//! (`check.rs::Effects`), which runs off [`Model::build_with`]'s replay
+//! hook; C-T6c1a's checks are unchanged.
 //!
 //! DDL follows C-T6 §3 exactly: ADD COLUMN appends attnum `ncols + 1`
 //! with the evaluated constant as `missing` (or none → NULL), and no row
@@ -35,7 +36,7 @@ use std::collections::BTreeMap;
 
 use nucleus_codec::Value;
 
-use super::{Fate, History, OpDetail, OpKind, OpOut, RowVals, TxnRec};
+use super::{Fate, History, OpDetail, OpKind, OpOut, OpRec, RowVals, TxnRec};
 
 /// One column of `t`'s definition as the model evolves it.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +110,13 @@ pub struct State {
     pub u: BTreeMap<i64, MRow>,
     /// `t`'s current definition.
     pub schema: Schema,
+    /// C-T6c1b: the uid of the txn whose committed write produced each
+    /// live row (the read-from side of the SERIALIZABLE serialization
+    /// graph). A row deleted or truncated has no entry — its last writer
+    /// is tracked by the checker's own `last_write` maps instead.
+    pub t_prov: BTreeMap<i64, u32>,
+    /// The same, for `u`'s rows by their `a` value.
+    pub u_prov: BTreeMap<i64, u32>,
 }
 
 impl State {
@@ -117,6 +125,8 @@ impl State {
             t: BTreeMap::new(),
             u: BTreeMap::new(),
             schema: Schema::initial(),
+            t_prov: BTreeMap::new(),
+            u_prov: BTreeMap::new(),
         }
     }
 }
@@ -141,8 +151,25 @@ pub struct Model {
 }
 
 impl Model {
-    /// Replays every committed txn of the history in commit-ts order.
-    pub fn build(h: &History) -> Model {
+    /// Replays every committed txn of the history in commit-ts order,
+    /// calling `hook` for every op of every committed txn **at its commit
+    /// position**: `state` is the model state built from every txn that
+    /// committed before this one (all earlier commit ts applied), `own`
+    /// the txn's own-writes overlay as of just before this op, so the
+    /// hook observes exactly what a statement that re-executed here would
+    /// see. The hook runs before the op's effect is applied to `state`,
+    /// `own` and the model; returning without mutating anything keeps the
+    /// replay pure (C-T6c1b's write-effect, SET NOT NULL and
+    /// SERIALIZABLE checks run here; nothing they do feeds back into the
+    /// model).
+    ///
+    /// The replay also maintains the per-row provenance
+    /// (`State::t_prov`/`u_prov`) and, per txn, the own-writes overlay.
+    #[allow(clippy::type_complexity)] // the hook sees exactly the replay's per-op context
+    pub fn build_with(
+        h: &History,
+        hook: &mut dyn FnMut(&Model, &State, &TxnRec, usize, &OpRec, &OwnWrites),
+    ) -> Model {
         let mut model = Model {
             snaps: BTreeMap::new(),
             schemas: vec![Schema::initial()],
@@ -163,8 +190,12 @@ impl Model {
             .collect();
         ordered.sort_by_key(|(ts, uid, _)| (*ts, *uid));
         for (ts, _, txn) in ordered {
-            for op in &txn.ops {
+            let mut own = OwnWrites::default();
+            for (idx, op) in txn.ops.iter().enumerate() {
+                hook(&model, &state, txn, idx, op, &own);
                 model.apply(&mut state, txn, op);
+                note_provenance(&mut state, txn, op, &model.u_bind);
+                own.apply(op, &model.u_bind);
             }
             model.snaps.insert(ts, state.clone());
         }
@@ -362,6 +393,52 @@ fn to_mrow(row: &RowVals) -> MRow {
     row.iter().map(|(a, v)| (*a, v.clone())).collect()
 }
 
+/// Records `op`'s commit-position provenance in `state` (C-T6c1b), right
+/// after [`Model::apply`] merges the op's rows — the same resolution rules
+/// (a DeleteU's target comes from the rowid bindings the model has
+/// learned). A delete removes the row's provenance; a TRUNCATE clears the
+/// table's (the DDL session here is never SERIALIZABLE, so its uid could
+/// never name a graph node).
+fn note_provenance(
+    state: &mut State,
+    txn: &TxnRec,
+    op: &super::OpRec,
+    bind: &BTreeMap<Vec<u8>, i64>,
+) {
+    match (&op.detail, &op.out) {
+        (super::OpDetail::InsertT { pk, .. }, super::OpOut::Ok) => {
+            state.t_prov.insert(*pk, txn.uid);
+        }
+        (
+            super::OpDetail::UpdateSet {
+                pk,
+                new_row: Some(_),
+                ..
+            },
+            super::OpOut::Applied(true),
+        ) => {
+            state.t_prov.insert(*pk, txn.uid);
+        }
+        (super::OpDetail::DeleteT { pk }, super::OpOut::Applied(true)) => {
+            state.t_prov.remove(pk);
+        }
+        (super::OpDetail::InsertU { row }, super::OpOut::Ok) => {
+            if let Some(a) = u_identity(row) {
+                state.u_prov.insert(a, txn.uid);
+            }
+        }
+        (super::OpDetail::DeleteU { key: Some(key) }, super::OpOut::Applied(true)) => {
+            if let Some(a) = bind.get(key) {
+                state.u_prov.remove(a);
+            }
+        }
+        (super::OpDetail::Truncate { .. }, super::OpOut::Ok) => {
+            state.t_prov.clear();
+        }
+        _ => {}
+    }
+}
+
 /// A txn-local overlay entry: the row a statement wrote, or a deletion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
@@ -422,6 +499,16 @@ impl OwnWrites {
             Some(Overlay::Row(row)) => Some(row),
             Some(Overlay::Gone) => None,
             None => base.t.get(&pk),
+        }
+    }
+
+    /// The `u` row a read at the statement's snapshot should see for the
+    /// row of identity `a` (overlay first, then the base state).
+    pub fn u_row<'a>(&'a self, base: &'a State, a: i64) -> Option<&'a MRow> {
+        match self.u.get(&a) {
+            Some(Overlay::Row(row)) => Some(row),
+            Some(Overlay::Gone) => None,
+            None => base.u.get(&a),
         }
     }
 

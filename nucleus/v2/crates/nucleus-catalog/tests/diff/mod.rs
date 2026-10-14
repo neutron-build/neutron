@@ -7,6 +7,14 @@
 //! reference model replayed in commit-ts order (C-T6 DECISION 1, the
 //! substitute for the PLAN "Concurrent DDL + DML differential" gate).
 //!
+//! Shared by the `t6c_soak` and `t6c_regress` test binaries, which reach
+//! for different halves of it (the soak drives `run_workload`; the
+//! regressions drive `Rig` directly and the synthetic-history checks
+//! never run the engine at all) — the `t6b_support` pattern, so like it
+//! this module tree allows dead code per binary.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+//!
 //! **Determinism.** A program is a pure function of
 //! `(seed, session, index)` ([`gen_prog`], [`gen_ddl`]); the checker
 //! depends only on the recorded history, never on scheduling. Write
@@ -29,7 +37,7 @@
 
 mod check;
 mod model;
-mod runner;
+pub mod runner;
 
 pub use check::{check, Verdict};
 pub use runner::run_workload;

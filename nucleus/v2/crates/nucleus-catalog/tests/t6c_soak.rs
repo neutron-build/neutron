@@ -1,27 +1,38 @@
-//! C-T6c1a, the soak: seeded multi-session histories over
-//! `nucleus-catalog::Db` on `Core<MemKv>` — 4 DML sessions at RC/RR/SER
-//! over `t(pk int8 PK, a int8, b text)` (pk ∈ 0..8) and `u(a int8, b
-//! text)` with its hidden rowid, plus a DDL session issuing ADD COLUMN,
-//! DROP COLUMN, SET/DROP NOT NULL and TRUNCATE each in its own txn —
-//! checked against the sequential reference model (`tests/diff/`), with
-//! amcheck at three mid-run snapshots and at the end, and final-state
-//! scans.
+//! C-T6c1a's soak, carrying C-T6c1b's checks: seeded multi-session
+//! histories over `nucleus-catalog::Db` on `Core<MemKv>` — 4 DML sessions
+//! at RC/RR/SER over `t(pk int8 PK, a int8, b text)` (pk ∈ 0..8) and
+//! `u(a int8, b text)` with its hidden rowid, plus a DDL session issuing
+//! ADD COLUMN, DROP COLUMN, SET/DROP NOT NULL and TRUNCATE each in its
+//! own txn — checked against the sequential reference model
+//! (`tests/diff/`): every read at its snapshot plus own writes (c1a),
+//! every write effect re-derived at its commit position, duplicates
+//! refused, SET NOT NULL outcomes validated, the committed SERIALIZABLE
+//! sub-history's serialization graph acyclic (c1b), amcheck at three
+//! mid-run snapshots and at the end, and final-state scans.
 //!
 //! The size is an iteration count (3 fixed seeds × 200 txns per session),
 //! never a wall-clock bound; timings are printed, not asserted. The
 //! `#[ignore]`d long variant runs 50 seeds.
 //!
-//! Mutation evidence (binding, card item 6): the two card-named mutants
-//! are each caught by this soak failing in 5 of 5 runs —
+//! Mutation evidence (binding, card item 5): the four card-named mutants
+//! are each caught —
 //!
 //! - **E1** — `decode_row` ignoring `missing` (nucleus-codec): every
 //!   read of a row older than an ADD COLUMN with a default renders NULL
-//!   where the model renders the default → a Get/ScanT mismatch.
+//!   where the model renders the default → a Get/ScanT mismatch. Caught
+//!   by this soak failing in 5 of 5 runs.
 //! - **E2** — `open_table` skipping the RR storage-id check
 //!   (nucleus-catalog): a successful RR/SER read over the post-TRUNCATE
 //!   storage returns rows the model at `S` does not have (or misses the
 //!   ones it does) → a mismatch, plus the explicit TRUNCATE-window
-//!   violation.
+//!   violation. Caught by this soak failing in 5 of 5 runs.
+//! - **E3** — `catalog_alter_rel_def` locking RowExclusive instead of
+//!   AccessExclusive (nucleus-txn): a writer no longer blocks behind an
+//!   in-flight ALTER and encodes at the stale definition. Caught
+//!   deterministically by `t6c_regress`'s parked-DDL schedule.
+//! - **E4** — writes encoding at `version - 1` (the row header's
+//!   schema_version): caught deterministically by `t6c_regress`'s
+//!   single-thread ADD COLUMN → insert → decode check.
 
 mod diff;
 
@@ -54,7 +65,9 @@ fn summary(seed: u64, v: &Verdict) {
     println!(
         "t6c soak seed {seed:#x}: {} txns ({} committed, {} failed, {} retried); \
          {} reads checked; {} writes; {} DDL ({} truncates committed); \
-         {} amcheck points; violations: {}",
+         {} amcheck points; c1b: {} writes checked ({} effects recomputed, \
+         {} RC carve-outs), {} SET NOT NULL verified ({} skipped), \
+         {} SER txns / {} reads / {} wr + {} rw edges; violations: {}",
         s.txns,
         s.committed,
         s.failed,
@@ -64,6 +77,15 @@ fn summary(seed: u64, v: &Verdict) {
         s.ddl,
         s.truncates_committed,
         s.amcheck_points,
+        s.writes_checked,
+        s.effects_recomputed,
+        s.rc_window_carveouts,
+        s.snn_checked,
+        s.snn_23502_skipped,
+        s.ser_txns,
+        s.ser_reads,
+        s.ser_wr_edges,
+        s.ser_rw_edges,
         v.violations.len()
     );
 }
@@ -97,6 +119,11 @@ fn t6c_soak() {
         );
         assert!(s.committed > 200, "too few commits: {s:?}");
         assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
+        // C-T6c1b's surfaces were exercised too: the write oracle ran,
+        // and the serialization graph had SER txns to bite on (the mix
+        // makes ~a third of the 800 programs SERIALIZABLE).
+        assert!(s.writes_checked > 100, "too few writes checked: {s:?}");
+        assert!(s.ser_txns > 5, "too few committed SER txns: {s:?}");
     }
 }
 
