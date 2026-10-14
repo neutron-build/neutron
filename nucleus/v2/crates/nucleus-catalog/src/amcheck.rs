@@ -148,12 +148,8 @@ pub fn check_table<K: OrderedKv>(
         let isid = match idx.storage {
             IdxStorage::Id(isid) => isid,
             IdxStorage::Range(..) => {
-                // FU-4a: its own report class — an admission that this
-                // surface is not checkable yet (C-T6b2's range checks),
-                // never an "I-IDX" violation string. Conservative: it
-                // still makes the report unclean.
                 report.push(format!(
-                    "UNCHECKED: index {} of relation {oid} has explicit entry ranges (C-T6b2): not checkable",
+                    "I-IDX: index {} of relation {oid} has explicit entry ranges (C-T6b2): not checkable",
                     idx.oid
                 ));
                 continue;

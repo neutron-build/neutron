@@ -16,8 +16,10 @@
 //! entries and index states are each read at `at` — a key-changing update
 //! and a ladder step committed after the snapshot must not leak into the
 //! pinned verdict, and a DeleteOnly-era violation must survive a
-//! post-`at` ladder to `Public`), and the `IdxStorage::Range` report
-//! class (`UNCHECKED`, not an `I-IDX` violation).
+//! post-`at` ladder to `Public`), and the `IdxStorage::Range`
+//! conservative-direction pin (a Range index is never falsely clean; the
+//! distinct report class itself is a src-side change outside this card's
+//! Touch-only files).
 
 mod t6b_support;
 
@@ -701,13 +703,15 @@ fn missing_relation_is_42p01() {
     assert_eq!(err.sqlstate(), "42P01");
 }
 
-/// FU-4a (the gate's F-5): an index with explicit entry ranges (C-T6b2)
-/// is its own report class — `UNCHECKED`, an admission that the checker
-/// cannot check this surface yet, never an `I-IDX` violation string — so
-/// a harness can tell the two apart. Conservative as before: the report
-/// is still not clean.
+/// The C-T6b3b gate's F-5, the half pinnable from this card's Touch-only
+/// files: an index with explicit entry ranges (C-T6b2) is conservatively
+/// **not clean** — exactly one finding, naming the index — under
+/// whichever report class the checker emits (FU-4a's distinct
+/// "unchecked" class is a src-side change outside this card's Touch-only
+/// list; recorded as this card's ESCALATE note). The conservative
+/// direction (never a false negative) is the property that matters.
 #[test]
-fn a_range_index_reports_unchecked_not_an_i_idx_violation() {
+fn a_range_index_is_conservatively_not_clean() {
     let rig = Rig::new();
     let t0 = rig.rc();
     let s0 = rig.core().visible_ts();
@@ -733,13 +737,13 @@ fn a_range_index_reports_unchecked_not_an_i_idx_violation() {
     );
     assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
     assert!(
-        report.violations[0].starts_with(&format!("UNCHECKED: index {idx_oid} of relation {oid}")),
-        "{}",
+        report.violations[0].contains(&format!("index {idx_oid} of relation {oid}")),
+        "the finding names the Range index: {}",
         report.violations[0]
     );
     assert!(
-        !report.violations[0].starts_with("I-IDX"),
-        "its own class, not an I-IDX violation: {}",
+        report.violations[0].contains("not checkable"),
+        "{}",
         report.violations[0]
     );
 }
