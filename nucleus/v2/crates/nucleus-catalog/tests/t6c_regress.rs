@@ -37,6 +37,8 @@
 //! produced.
 
 mod diff;
+// diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
+mod t6b_support;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

@@ -35,6 +35,8 @@
 //!   single-thread ADD COLUMN → insert → decode check.
 
 mod diff;
+// diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
+mod t6b_support;
 
 use diff::{check, gen_ddl, gen_prog, run_workload, Config, PDdl, Run, Verdict};
 
