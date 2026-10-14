@@ -43,6 +43,7 @@ use nucleus_txn::{Seq, Ts, TxnError, TxnId};
 use crate::defs::{IndexDef, IndexState};
 use crate::error::DbError;
 use crate::index::{self, IndexRow};
+use crate::toast;
 
 /// The encoded primary key is limited to this many bytes (§3); the insert
 /// that exceeds it fails with 54000 ([`DbError::ProgramLimitExceeded`]).
@@ -302,10 +303,13 @@ impl<K: OrderedKv> Db<K> {
     /// (a tombstone skips); without EPQ it is the read row. `set`
     /// assignments name 1-based attnums; an unknown attnum is 42703. A
     /// primary-key change goes through `update_pk` (§5.0; the §3 key
-    /// limit applies to the new key). After `Applied`, every index of the
-    /// handle is maintained per its state with the old entries computed
-    /// from the EPQ base (index maintenance); `Skipped` →
-    /// `Ok(false)`.
+    /// limit applies to the new key). After `Applied`: the §5 chunks of
+    /// every value the statement moved out of line are written, every
+    /// old raw pointer the new row no longer carries (dropped attnums
+    /// included) has its chunks deleted through `Core::delete_entry`,
+    /// and every index of the handle is maintained per its state with
+    /// both rows detoasted — the old entries computed from the EPQ base;
+    /// `Skipped` → `Ok(false)` (and no chunk is written).
     pub fn update_with(
         &self,
         st: &Stmt<'_>,
@@ -322,7 +326,7 @@ impl<K: OrderedKv> Db<K> {
             return Ok(false);
         };
         // No EPQ yet: the base is the read row, and `set` applies to it.
-        let mut epq = UpdateEpq::new(t, set, read)?;
+        let mut epq = UpdateEpq::new(t, st, pk, set, read)?;
         let outcome = if pks_differ(pk, &epq.last.new_pk) {
             let new_key = pk_key(t.storage_id, &t.schema, &epq.last.new_pk)?;
             self.core
@@ -357,13 +361,29 @@ impl<K: OrderedKv> Db<K> {
             RowOutcome::Applied => {}
             RowOutcome::Skipped(_) => return Ok(false),
         }
-        let base_live = t.schema.decode_row(&epq.base_bytes)?;
+        // §5, after `Applied`: the new chunks first, then every old raw
+        // pointer (dropped attnums included) the new row does not carry.
+        toast::write_chunks(
+            &self.core,
+            st.txn,
+            &st.ctx(),
+            t.storage_id,
+            &epq.last.new_toasts,
+        )?;
+        toast::delete_stale_chunks(
+            &self.core,
+            st.txn,
+            &st.ctx(),
+            t.storage_id,
+            &epq.base_bytes,
+            &epq.last.new_bytes,
+        )?;
+        let (base_live, new_live) = self.update_maintenance_rows(st, t, &epq)?;
         let new_key = if pks_differ(pk, &epq.last.new_pk) {
             pk_key(t.storage_id, &t.schema, &epq.last.new_pk)?
         } else {
             key.clone()
         };
-        let new_live = t.schema.decode_row(&epq.last.new_bytes)?;
         index::maintain_update(
             &self.core,
             st.txn,
@@ -392,9 +412,11 @@ impl<K: OrderedKv> Db<K> {
     /// DELETE by primary key through a statement-scoped handle (item 4a,
     /// same contract as [`Db::insert_with`]): the same read/EPQ pattern
     /// as [`Db::update_with`] with `RowOp::Delete`; after `Applied`,
+    /// every raw pointer of the base version (dropped attnums included)
+    /// has its chunks deleted through `Core::delete_entry` (§5), and
     /// every entry of the base version is deleted in **every** index
-    /// state, blindly through `Core::delete_entry` (§5.0) — so the delete
-    /// never skips and never raises 40001 (§6).
+    /// state, blindly through [`Core::delete_entry`] (§5.0) — so the
+    /// delete never skips and never raises 40001 (§6).
     pub fn delete_with(
         &self,
         st: &Stmt<'_>,
@@ -409,7 +431,10 @@ impl<K: OrderedKv> Db<K> {
         let Some(read) = self.read_row_bytes(st, &key)? else {
             return Ok(false);
         };
-        let mut epq = DeleteEpq { base_bytes: read };
+        let mut epq = DeleteEpq {
+            base_bytes: read,
+            base_ts: None,
+        };
         let outcome = self
             .core
             .row_op(st.txn, &key, None, RowOp::Delete, st.ctx(), &mut epq)
@@ -418,7 +443,11 @@ impl<K: OrderedKv> Db<K> {
             RowOutcome::Applied => {}
             RowOutcome::Skipped(_) => return Ok(false),
         }
-        let base_live = t.schema.decode_row(&epq.base_bytes)?;
+        // §5, after `Applied`: nothing carries the base's pointers
+        // onward, so every chunk of every raw pointer goes.
+        toast::delete_row_chunks(&self.core, st.txn, &st.ctx(), t.storage_id, &epq.base_bytes)?;
+        let mut base_live = t.schema.decode_row(&epq.base_bytes)?;
+        self.detoast_base(st, t, &mut base_live, epq.base_ts)?;
         index::maintain_delete(
             &self.core,
             st.txn,
@@ -431,6 +460,63 @@ impl<K: OrderedKv> Db<K> {
             },
         )?;
         Ok(true)
+    }
+
+    /// Detoasts a base row for maintenance (§5): at the commit ts of the
+    /// version an EPQ pass re-based on (`register_at(v.ts)`), else at the
+    /// statement's read position — where the txn's own earlier intents
+    /// resolve too.
+    fn detoast_base(
+        &self,
+        st: &Stmt<'_>,
+        t: &TableHandle,
+        live: &mut [Option<Datum>],
+        base_ts: Option<Ts>,
+    ) -> Result<(), DbError> {
+        match base_ts {
+            Some(ts) => {
+                toast::detoast_row_at_version(&self.core, &t.schema, t.storage_id, live, ts)
+            }
+            None => {
+                toast::detoast_row_at(&self.core, &t.schema, t.storage_id, live, &st.read_ctx())
+            }
+        }
+    }
+
+    /// The detoasted maintenance rows of an applied update (§5): the base
+    /// resolved at its read position, and the new row with the
+    /// statement's own toasted values in hand and its carried pointers
+    /// taken from the resolved base (a carried pointer's chunks are the
+    /// base's, read exactly once).
+    fn update_maintenance_rows(
+        &self,
+        st: &Stmt<'_>,
+        t: &TableHandle,
+        epq: &UpdateEpq<'_>,
+    ) -> Result<DetoastedPair, DbError> {
+        let mut base_live = t.schema.decode_row(&epq.base_bytes)?;
+        self.detoast_base(st, t, &mut base_live, epq.base_ts)?;
+        let mut new_live = t.schema.decode_row(&epq.last.new_bytes)?;
+        for (pos, datum) in new_live.iter_mut().enumerate() {
+            let Some(Datum::Toast(p)) = datum.as_ref() else {
+                continue;
+            };
+            if let Some(d) = epq.last.new_toasts.iter().find(|d| d.id == p.id) {
+                // The statement's own value, in hand.
+                *datum = Some(Datum::Inline(d.value.clone()));
+            } else {
+                // A pointer carried from the base: its resolved value.
+                match base_live.get(pos) {
+                    Some(Some(Datum::Inline(v))) => *datum = Some(Datum::Inline(v.clone())),
+                    _ => {
+                        return Err(DbError::Row(RowError::Corrupt(
+                            "out-of-line datum with no chunks to read",
+                        )))
+                    }
+                }
+            }
+        }
+        Ok((base_live, new_live))
     }
 
     /// The §4 writer's read of the deprecated legacy [`Db::insert`]:
@@ -479,8 +565,8 @@ impl<K: OrderedKv> Db<K> {
     }
 
     /// The shared row-write body of the insert entry points: the row key,
-    /// the key-existence insert, then index maintenance for `indexes` —
-    /// the statement's own list for `insert_with` and
+    /// the key-existence insert, then the §5 chunks and the index
+    /// maintenance — the statement's own list for `insert_with` and
     /// [`Db::insert_by_oid`] (the only paths that reach here with a
     /// non-empty list; the deprecated legacy `insert` refuses indexed
     /// tables before this).
@@ -491,11 +577,17 @@ impl<K: OrderedKv> Db<K> {
         live: &[Option<Datum>],
         indexes: Vec<IndexHandle>,
     ) -> Result<(), DbError> {
-        let value = t.schema.encode_row(live)?;
+        // §5: over-threshold values go out of line — ids assigned while
+        // the new row value is built, the row storing the pointers and
+        // the statement holding the bytes for the chunks.
+        let toasted = toast::build_row(st, &t.schema, live)?;
+        let value = t.schema.encode_row(&toasted.live)?;
         let key = if t.schema.hidden_rowid {
             let ord = st.next_ord()?;
             rowid_key(t.storage_id, st.txn, st.seq0, ord)?
         } else {
+            // The pk key encodes the caller's inline values (a pk column
+            // may itself be out of line in the stored row).
             let pk = pk_values(&t.schema, live)?;
             pk_key(t.storage_id, &t.schema, &pk)?
         };
@@ -509,12 +601,18 @@ impl<K: OrderedKv> Db<K> {
                 UniqueRule::Unique { same_row: None },
             )
             .map_err(DbError::Txn)?;
+        // §5: the chunks land only after the row op returned `Applied`
+        // (`Ok` here — a key-existence op never skips), in the same
+        // statement, so an aborted or refused insert writes none.
+        toast::write_chunks(&self.core, st.txn, &st.ctx(), t.storage_id, &toasted.new)?;
         index::maintain_insert(
             &self.core,
             st.txn,
             &st.ctx(),
             t,
             &indexes,
+            // §5: index keys of a toasted column use the detoasted
+            // value — the caller's inline datums are exactly that.
             IndexRow { key: &key, live },
         )?;
         Ok(())
@@ -540,9 +638,11 @@ impl<K: OrderedKv> Db<K> {
 
     /// Point read of the primary-key row `pk` (one value per pk column,
     /// `None` = NULL) at the statement's snapshot, decoded under the
-    /// handle's definition. SERIALIZABLE registers its SIREAD
-    /// (§8.1); other levels read through a plain registered view.
-    /// A hidden-rowid table has no callable key: 0A000 (scan it instead).
+    /// handle's definition and **detoasted** (§5: chunks read at the
+    /// statement's snapshot through a fresh view, no SIREAD). SERIALIZABLE
+    /// registers its SIREAD on the row key (§8.1); other levels read
+    /// through a plain registered view. A hidden-rowid table has no
+    /// callable key: 0A000 (scan it instead).
     pub fn get(
         &self,
         st: &Stmt<'_>,
@@ -575,16 +675,22 @@ impl<K: OrderedKv> Db<K> {
             }
         };
         match bytes {
-            Some(b) => Ok(Some(t.schema.decode_row(&b)?)),
+            Some(b) => {
+                let mut live = t.schema.decode_row(&b)?;
+                toast::detoast_row_at(&self.core, &t.schema, t.storage_id, &mut live, &ctx)?;
+                Ok(Some(live))
+            }
             None => Ok(None),
         }
     }
 
     /// Every row of the table at the statement's snapshot, in key order,
-    /// decoded under the handle's definition. The scan is bounded to
-    /// `[table_lo, table_lo ‖ 0xFF)` (§5): `0xFF` never starts an encoded
-    /// key, so large-value chunks (`/t/{sid}/0xFF…`) are never rows.
-    /// SERIALIZABLE registers the range SIREAD (§8.1).
+    /// decoded under the handle's definition and **detoasted** (§5: each
+    /// row's chunks read at the statement's snapshot, no SIREAD). The
+    /// scan is bounded to `[table_lo, table_lo ‖ 0xFF)` (§5): `0xFF`
+    /// never starts an encoded key, so large-value chunks
+    /// (`/t/{sid}/0xFF…`) are never rows. SERIALIZABLE registers the
+    /// range SIREAD (§8.1).
     pub fn scan(&self, st: &Stmt<'_>, t: &TableHandle) -> Result<Vec<ScannedRow>, DbError> {
         self.locks
             .lock_relation(
@@ -622,7 +728,9 @@ impl<K: OrderedKv> Db<K> {
         };
         let mut out = Vec::with_capacity(rows.len());
         for (key, bytes) in rows {
-            out.push((key, t.schema.decode_row(&bytes)?));
+            let mut live = t.schema.decode_row(&bytes)?;
+            toast::detoast_row_at(&self.core, &t.schema, t.storage_id, &mut live, &ctx)?;
+            out.push((key, live));
         }
         Ok(out)
     }
@@ -883,7 +991,11 @@ impl<K: OrderedKv> Db<K> {
                         "index entry names a row not visible at the snapshot",
                     )));
                 };
-                let live = schema.decode_row(&bytes)?;
+                let mut live = schema.decode_row(&bytes)?;
+                // §5: an indexed toasted column's entry is computed from
+                // the detoasted value — the chunks read at the scan's
+                // snapshot, no SIREAD.
+                toast::detoast_row_at(&self.core, &schema, rel.storage_id, &mut live, &ctx)?;
                 // §6: verify the fetched row — rebuild its entry and
                 // require byte equality with the scanned one.
                 let (want_key, want_value, _) = index::entry(&h, &handle, &row_key, &live)?;
@@ -963,17 +1075,27 @@ fn index_handles(idxs: Vec<nucleus_txn::catalog::IdxRow>) -> Result<Vec<IndexHan
     Ok(indexes)
 }
 
+/// A maintenance read's two detoasted rows: the EPQ base and the new
+/// version (§5 — index entries are computed from detoasted values).
+type DetoastedPair = (Vec<Option<Datum>>, Vec<Option<Datum>>);
+
 /// `set` applied to one base row (§3 lazy upgrade at the current version):
 /// the encoded new row, its pk values and the caller's `key_cols_changed`
-/// verdict.
+/// verdict. §5: values over the threshold go out of line while the new
+/// row value is built — ids from the statement's ordinal counter, the
+/// bytes held for the chunks the statement writes iff the row op applies.
 struct Applied {
     new_bytes: Vec<u8>,
     new_pk: Vec<Option<Value>>,
     key_cols_changed: bool,
+    /// The values this pass moved out of line (id, bytes, value).
+    new_toasts: Vec<toast::ToastDatum>,
 }
 
 fn apply_set(
     t: &TableHandle,
+    st: &Stmt<'_>,
+    caller_pk: &[Option<Value>],
     set: &[(u16, Option<Datum>)],
     base_bytes: &[u8],
 ) -> Result<Applied, DbError> {
@@ -986,26 +1108,35 @@ fn apply_set(
         live[pos] = datum.clone();
     }
     let key_cols_changed = index::key_cols_changed(&t.schema, &t.indexes, set, &base);
-    let new_bytes = t.schema.encode_row(&live)?;
-    let new_pk = pk_values(&t.schema, &live)?;
+    let new_pk = pk_values_resolved(&t.schema, &live, caller_pk)?;
+    // §5: over-threshold values go out of line (a datum already out of
+    // line — a column `set` does not name — carries its pointer).
+    let toasted = toast::build_row(st, &t.schema, &live)?;
+    let new_bytes = t.schema.encode_row(&toasted.live)?;
     Ok(Applied {
         new_bytes,
         new_pk,
         key_cols_changed,
+        new_toasts: toasted.new,
     })
 }
 
 /// The UPDATE row-level EPQ (§5.2): re-evaluate the statement against the
 /// newest committed version — decode it, re-apply `set`, `Apply(Update)`
 /// (a tombstone is `Skip`) — and remember the base, which is where entry
-/// maintenance is computed from. With no EPQ pass the base stays the read
-/// row.
+/// maintenance and the §5 old-pointer sweep are computed from. With no
+/// EPQ pass the base stays the read row.
 struct UpdateEpq<'a> {
     t: &'a TableHandle,
+    st: &'a Stmt<'a>,
+    pk: &'a [Option<Value>],
     set: &'a [(u16, Option<Datum>)],
     /// The base version of the last pass (the read row until a pass
     /// re-bases on a newer committed version).
     base_bytes: Vec<u8>,
+    /// The commit ts of the version an EPQ pass re-based on; `None`
+    /// while the base is the read row.
+    base_ts: Option<Ts>,
     /// The new row of the last pass.
     last: Applied,
     /// An error a `recheck` could not report through the `Epq` trait
@@ -1016,14 +1147,19 @@ struct UpdateEpq<'a> {
 impl<'a> UpdateEpq<'a> {
     fn new(
         t: &'a TableHandle,
+        st: &'a Stmt<'a>,
+        pk: &'a [Option<Value>],
         set: &'a [(u16, Option<Datum>)],
         read_bytes: Vec<u8>,
     ) -> Result<UpdateEpq<'a>, DbError> {
-        let last = apply_set(t, set, &read_bytes)?;
+        let last = apply_set(t, st, pk, set, &read_bytes)?;
         Ok(UpdateEpq {
             t,
+            st,
+            pk,
             set,
             base_bytes: read_bytes,
+            base_ts: None,
             last,
             error: None,
         })
@@ -1039,7 +1175,8 @@ impl Epq for UpdateEpq<'_> {
             VersionValue::Tombstone { .. } => return EpqDecision::Skip,
         };
         self.base_bytes = payload;
-        match apply_set(self.t, self.set, &self.base_bytes) {
+        self.base_ts = Some(newest.ts);
+        match apply_set(self.t, self.st, self.pk, self.set, &self.base_bytes) {
             Ok(applied) => {
                 let decision = EpqDecision::Apply(RowOp::Update {
                     value: applied.new_bytes.clone(),
@@ -1060,6 +1197,9 @@ impl Epq for UpdateEpq<'_> {
 /// row op (and entry maintenance) acts on; a tombstone skips.
 struct DeleteEpq {
     base_bytes: Vec<u8>,
+    /// The commit ts of the version a pass re-based on; `None` while the
+    /// base is the read row.
+    base_ts: Option<Ts>,
 }
 
 impl Epq for DeleteEpq {
@@ -1067,6 +1207,7 @@ impl Epq for DeleteEpq {
         match &newest.value {
             VersionValue::Live { payload, .. } => {
                 self.base_bytes = payload.clone();
+                self.base_ts = Some(newest.ts);
                 EpqDecision::Apply(RowOp::Delete)
             }
             VersionValue::Tombstone { .. } => EpqDecision::Skip,
@@ -1232,6 +1373,45 @@ fn pk_values(schema: &TableSchema, live: &[Option<Datum>]) -> Result<Vec<Option<
                     "primary-key column is out of line",
                 )))
             }
+            None => {
+                return Err(DbError::Row(RowError::Arity {
+                    expected: schema.live_columns().count(),
+                    got: live.len(),
+                }))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`pk_values`] for a row whose pk column may be **carried** out of line
+/// (§5: the row's stored form points at its chunks, but the key does not
+/// change). The row at that key encodes exactly the caller's pk values
+/// (§3 — I-ROWFMT's own check), so a carried pointer resolves to them;
+/// the value the caller read the row by is the value the new row keeps.
+fn pk_values_resolved(
+    schema: &TableSchema,
+    live: &[Option<Datum>],
+    caller_pk: &[Option<Value>],
+) -> Result<Vec<Option<Value>>, DbError> {
+    if caller_pk.len() != schema.pk.len() {
+        return Err(DbError::Row(RowError::Arity {
+            expected: schema.pk.len(),
+            got: caller_pk.len(),
+        }));
+    }
+    let mut out = Vec::with_capacity(schema.pk.len());
+    for (i, &attnum) in schema.pk.iter().enumerate() {
+        let pos = schema.live_columns().position(|c| c.attnum == attnum);
+        let Some(pos) = pos else {
+            return Err(DbError::Row(RowError::Corrupt(
+                "primary key names a dropped column",
+            )));
+        };
+        match live.get(pos) {
+            Some(None) => out.push(None),
+            Some(Some(Datum::Inline(v))) => out.push(Some(v.clone())),
+            Some(Some(Datum::Toast(_))) => out.push(caller_pk[i].clone()),
             None => {
                 return Err(DbError::Row(RowError::Arity {
                     expected: schema.live_columns().count(),
