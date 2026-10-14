@@ -8,12 +8,14 @@
 //! `/sys/catalog/` subtree (the one `/sys/` family §10 makes versioned
 //! table data, so DDL intents live there). No other `/sys/` key is ever
 //! decoded — several of them end in bytes `parse_key` would happily read
-//! as an intent suffix. Each step opens one registered view, examines at
-//! most `chunk` stored entries (default 1024), decides each older-epoch
-//! intent's removal mode **inside the view** (I-TRUNC keeps the owner's
-//! entry alive as long as the view can see the intent), records the
-//! resume key just past the last examined entry, drops the view, and only
-//! then removes. `remove_intent` re-reads under the latch and no-ops on a
+//! as an intent suffix — and a skipped entry still costs the step its
+//! budget and advances the resume key exactly like an examined one, so a
+//! long contiguous `/sys/` span cannot inflate one step's walk. Each
+//! step opens one registered view, examines at most `chunk` stored
+//! entries (default 1024), decides each older-epoch intent's removal
+//! mode **inside the view** (I-TRUNC keeps the owner's entry alive as
+//! long as the view can see the intent), records the resume key just
+//! past the last consumed entry, drops the view, and only then removes. `remove_intent` re-reads under the latch and no-ops on a
 //! re-owned intent, so the sweep runs concurrently with writers: no
 //! older-epoch intent is created after boot, so a key-ordered walk sees
 //! every one that still exists, whatever a current-epoch writer does to
@@ -33,7 +35,6 @@ use crate::catalog::SYS_CATALOG_PREFIX;
 use crate::encoding::{decode_intent, parse_key, Entry, SYS_PREFIX};
 use crate::jobs::{Job, JobCtx, JobKind, JobOutcome, JobPoint};
 use crate::kv_err;
-use crate::latch::latch_prefix_of;
 use crate::removal::{remove_intent, RemovalMode, RemovalOutcome};
 use crate::{TxnError, TxnId, TxnStatus};
 
@@ -58,9 +59,10 @@ struct PlannedRemoval {
 pub struct BootSweep<K: OrderedKv> {
     core: Arc<Core<K>>,
     chunk: usize,
-    /// The stored key of the last entry the walk examined: the next step
-    /// resumes just past it (`Bound::Excluded`; stored keys are unique,
-    /// so no entry is skipped or re-examined).
+    /// The stored key of the last entry the walk consumed — examined, or
+    /// skipped as non-catalog `/sys/`: the next step resumes just past it
+    /// (`Bound::Excluded`; stored keys are unique, so no entry is skipped
+    /// or re-examined).
     resume: Option<Vec<u8>>,
 }
 
@@ -73,18 +75,19 @@ impl<K: OrderedKv> BootSweep<K> {
         }
     }
 
-    /// Examines at most `chunk` entries per step (tests); a 0 is clamped
-    /// to 1 so the walk always advances.
+    /// Consumes at most `chunk` stored entries per step — examined or
+    /// skipped (tests); a 0 is clamped to 1 so the walk always advances.
     pub fn with_chunk(mut self, chunk: usize) -> BootSweep<K> {
         self.chunk = chunk.max(1);
         self
     }
 
-    /// One step (§7.2): scan up to `chunk` examined entries from the
-    /// resume key, plan every older-epoch intent's removal with the mode
-    /// decided inside the view, record the resume key, drop the view,
-    /// remove. When the walk is exhausted: `SweepBeforeRecord`, then
-    /// `record_sweep()` (§7.4), then `Finished`.
+    /// One step (§7.2): scan up to `chunk` stored entries from the resume
+    /// key (skipped non-catalog `/sys/` keys included), plan every
+    /// older-epoch intent's removal with the mode decided inside the
+    /// view, record the resume key, drop the view, remove. When the walk
+    /// is exhausted: `SweepBeforeRecord`, then `record_sweep()` (§7.4),
+    /// then `Finished`.
     pub fn run_once(&mut self) -> Result<JobOutcome, TxnError> {
         let source = self.core.latch_key_source();
         let epoch = self.core.epoch();
@@ -99,13 +102,21 @@ impl<K: OrderedKv> BootSweep<K> {
             };
             for entry in view.scan((lo, Bound::Unbounded), false) {
                 let (stored, value) = entry.map_err(kv_err)?;
-                // §7.2: everything outside /sys/ plus /sys/catalog/. The
-                // rest of /sys/ is skipped whole — never decoded.
-                if stored.starts_with(SYS_PREFIX) && !stored.starts_with(SYS_CATALOG_PREFIX) {
-                    continue;
-                }
                 if examined == self.chunk {
                     break;
+                }
+                // §7.2: everything outside /sys/ plus /sys/catalog/. The
+                // rest of /sys/ is skipped whole — never decoded — but a
+                // skipped entry still costs the step its budget and still
+                // advances the resume key (C-B1b gate L-5): one step's
+                // iterator work stays bounded by `chunk` stored entries
+                // however long the contiguous /sys/ span is, and the
+                // next step resumes past the skipped span instead of
+                // re-walking it.
+                if stored.starts_with(SYS_PREFIX) && !stored.starts_with(SYS_CATALOG_PREFIX) {
+                    examined += 1;
+                    last = Some(stored);
+                    continue;
                 }
                 if let Some((logical, Entry::Intent)) = parse_key(&stored) {
                     let intent = decode_intent(&value)?;
@@ -127,8 +138,22 @@ impl<K: OrderedKv> BootSweep<K> {
                                 )))
                             }
                         };
-                        let prefix = latch_prefix_of(logical, source.deferrable_prefix(logical))
-                            .map(|p| p.to_vec());
+                        // An over-long prefix from the source is a
+                        // misbehaving source, not a shorter latch: loud,
+                        // like `GcJob::retire_locked` (C-B1b gate N-5).
+                        let prefix = match source.deferrable_prefix(logical) {
+                            Some(len) => match logical.get(..len) {
+                                Some(p) => Some(p.to_vec()),
+                                None => {
+                                    return Err(TxnError::Invariant(format!(
+                                        "sweep: the latch key source returned prefix length {len} \
+                                         for key {logical:?} of length {} (C-T0 §7.2)",
+                                        logical.len()
+                                    )))
+                                }
+                            },
+                            None => None,
+                        };
                         plan.push(PlannedRemoval {
                             key: logical.to_vec(),
                             prefix,
