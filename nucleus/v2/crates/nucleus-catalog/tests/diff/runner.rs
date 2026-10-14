@@ -1023,6 +1023,14 @@ impl<'r> Session<'r> {
         self.exec(0, OpKind::Get, |s, st, op| s.get(st, op, pk))
     }
 
+    /// A recorded `SELECT * FROM t` (the scripted twin of [`Self::op_get`],
+    /// with explicit statement position 0) — drives the shared
+    /// [`Session::record_t_row`] path's scan arm, which the Get scripts
+    /// alone leave unexercised (C-T6c2's FU-C).
+    pub fn op_scan_t(&mut self) -> Result<(), String> {
+        self.exec(0, OpKind::ScanT, |s, st, op| s.scan_t(st, op).map(|_| ()))
+    }
+
     /// A recorded `INSERT INTO t VALUES (pk, ..)` with explicit values.
     pub fn op_insert_t(&mut self, pk: i64, a: Value, b: Option<Value>) -> Result<(), String> {
         self.exec(0, OpKind::InsertT, move |s, st, op| {

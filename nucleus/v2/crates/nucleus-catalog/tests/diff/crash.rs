@@ -51,7 +51,7 @@ use crate::t6b_support::{
 };
 
 use nucleus_catalog::amcheck::check_table;
-use nucleus_catalog::{IndexDef, IndexState, Stmt};
+use nucleus_catalog::{IndexDef, IndexState};
 use nucleus_codec::row::{value_repr_eq, Datum};
 use nucleus_codec::{Collation, KeyColumn, KeyType, Value};
 use nucleus_txn::catalog::IdxStorage;

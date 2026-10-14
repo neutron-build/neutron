@@ -6,8 +6,9 @@
 //!   AccessExclusive (nucleus-txn): the ALTER's AccessExclusive is what
 //!   keeps writers out of a relation whose definition is changing. The
 //!   test drives `catalog_alter_rel_def` directly (the mutant's site),
-//!   parks the DDL thread on a barrier **right after the call returns**
-//!   (the lock is held to the txn's end), and proves three things about
+//!   parks the DDL thread on a channel handoff **right after the call
+//!   returns** (the lock is held to the txn's end), and proves three
+//!   things about
 //!   a concurrent insert: it *blocks* (a wait-for edge appears while the
 //!   insert is unfinished — a deterministic observation, never a
 //!   wall-clock one), it proceeds only after the DDL commits, and it
@@ -34,18 +35,23 @@
 //! row" over a live row, a wrong update effect, a SET NOT NULL success
 //! over a NULL, and a write-skew cycle among committed SERIALIZABLE
 //! txns — is flagged when hand-built into a history the engine never
-//! produced.
+//! produced. The follow-up pins refine both directions: the absent-read
+//! rw refinement stays legal on a finally-dead key yet flags a phantom
+//! write-skew (c1b FU-A), an in-window RR write is flagged while its RC
+//! twin stays clean (FU-B), and the RC re-insert carve-out keeps a
+//! legal EPQ-skip history clean (FU-D).
 
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
 mod t6b_support;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use diff::runner::{t_schema, Rig};
-use diff::{check, Fate, History, Level, OpDetail, OpKind, OpOut, OpRec, RowVals, Run, TxnRec};
+use diff::check::check;
+use diff::runner::{t_schema, Rig, DDL_SESSION};
+use diff::{Fate, History, Level, OpDetail, OpKind, OpOut, OpRec, RowVals, Run, TxnRec};
 
 use nucleus_catalog::table_lo;
 use nucleus_catalog::Stmt;
@@ -94,13 +100,16 @@ fn t6c_regress_e3_alter_rel_def_excludes_writers() {
     let insert_version = Arc::new(AtomicU32::new(0));
     let ddl_ts = Arc::new(Mutex::new(None));
     // The DDL thread parks here, the def rewritten and the lock held;
-    // the orchestrating thread releases it.
-    let park = Arc::new(Barrier::new(2));
+    // the orchestrating thread releases it. A channel, not a Barrier
+    // (c1b FU-E): when any earlier step fails and unwinds, the sender
+    // drops, the recv returns and the DDL thread finishes — the test
+    // fails cleanly instead of wedging the runner on a join that can
+    // never happen while the DDL thread waits at a Barrier forever.
+    let (release, park) = mpsc::channel::<()>();
 
     std::thread::scope(|sc| {
         sc.spawn({
-            let (altered, park, ddl_ts) =
-                (Arc::clone(&altered), Arc::clone(&park), Arc::clone(&ddl_ts));
+            let (altered, park, ddl_ts) = (Arc::clone(&altered), park, Arc::clone(&ddl_ts));
             move || {
                 let txn = rig.db.core.begin(Isolation::ReadCommitted);
                 let guard = rig.db.core.registry.take_snapshot();
@@ -120,9 +129,11 @@ fn t6c_regress_e3_alter_rel_def_excludes_writers() {
                     )
                     .expect("the alter");
                 // The call returned: the AccessExclusive is held to this
-                // txn's end. Park.
+                // txn's end. Park until released (a dropped sender on a
+                // failure upstream releases too, so this thread always
+                // finishes and the scope can join).
                 altered.store(true, Ordering::SeqCst);
-                park.wait();
+                let _ = park.recv();
                 drop(guard);
                 let ts = rig
                     .db
@@ -185,7 +196,9 @@ fn t6c_regress_e3_alter_rel_def_excludes_writers() {
 
         // Release the DDL: it commits, and only then may the insert go
         // through.
-        park.wait();
+        release
+            .send(())
+            .expect("the parked DDL thread holds the receiver");
         spin_until("the DDL commit ts", || {
             ddl_ts.lock().expect("the ddl ts slot").is_some()
         });
@@ -817,5 +830,343 @@ fn t6c_regress_flags_a_ser_write_skew_cycle() {
             .any(|v| v.contains("not serializable")),
         "{}",
         verdict.report()
+    );
+}
+
+// ----- c1b FU-A: the absent-read rw refinement, both directions ---------------
+
+/// The refinement must not bite legal histories (kills M-ser-add-all,
+/// the pre-refinement shape that added an rw edge for *every* absent
+/// point read). I (RC) inserts pk5 @ts1; D (SER, snap 1) reads pk6
+/// absent and deletes pk5 @ts2; R (SER, snap 0 — before the setup even
+/// committed) reads pk5 absent and inserts pk6 @ts3. The serial order
+/// I, D, R is legal: R's absent read of pk5 is over a **finally-dead**
+/// key — D's tombstone can be ordered before the read — so it must add
+/// no rw edge. The verdict is clean; the add-all shape instead reports
+/// the false cycle T_D -> T_R -> T_D.
+#[test]
+fn t6c_regress_ser_absent_read_refinement_stays_legal() {
+    let history = History {
+        txns: vec![
+            // I: RC insert pk5 @ts1.
+            txn(
+                1,
+                0,
+                Level::ReadCommitted,
+                0,
+                Fate::Committed(1),
+                vec![op(
+                    OpKind::InsertT,
+                    OpDetail::InsertT {
+                        pk: 5,
+                        row: row3(5, 500, Some("i")),
+                    },
+                    OpOut::Ok,
+                    0,
+                )],
+            ),
+            // D: SER, snap 1 — Get pk6 absent, DeleteT pk5 applied @ts2.
+            txn(
+                2,
+                1,
+                Level::Serializable,
+                1,
+                Fate::Committed(2),
+                vec![
+                    op(OpKind::Get, OpDetail::Get { pk: 6 }, OpOut::Row(None), 1),
+                    op(
+                        OpKind::DeleteT,
+                        OpDetail::DeleteT { pk: 5 },
+                        OpOut::Applied(true),
+                        1,
+                    ),
+                ],
+            ),
+            // R: SER, snap 0 — Get pk5 absent, InsertT pk6 @ts3.
+            txn(
+                3,
+                2,
+                Level::Serializable,
+                0,
+                Fate::Committed(3),
+                vec![
+                    op(OpKind::Get, OpDetail::Get { pk: 5 }, OpOut::Row(None), 0),
+                    op(
+                        OpKind::InsertT,
+                        OpDetail::InsertT {
+                            pk: 6,
+                            row: row3(6, 600, Some("r")),
+                        },
+                        OpOut::Ok,
+                        0,
+                    ),
+                ],
+            ),
+        ],
+    };
+    let run = run_of(history, vec![(6, row3(6, 600, Some("r")))]);
+    let verdict = check(&run);
+    assert!(verdict.is_clean(), "{}", verdict.report());
+}
+
+/// The refinement must still bite: a phantom write-skew — two committed
+/// SER txns at snap 1, each reading absent the key the other then
+/// inserts (kills M-ser-add-none, the shape that added no rw edge for
+/// any absent point read). Both keys are live at the end, so both final
+/// writers are forced after the other's read: the rw cycle is real and
+/// the checker must report it.
+#[test]
+fn t6c_regress_flags_a_ser_phantom_skew() {
+    // setup: RC insert pk1 @ts1 (the state snap 1 reads).
+    let setup = txn(
+        1,
+        0,
+        Level::ReadCommitted,
+        0,
+        Fate::Committed(1),
+        vec![op(
+            OpKind::InsertT,
+            OpDetail::InsertT {
+                pk: 1,
+                row: row3(1, 100, Some("x")),
+            },
+            OpOut::Ok,
+            0,
+        )],
+    );
+    // R1: SER snap 1 — Get pk5 absent, InsertT pk6 @ts5.
+    let r1 = txn(
+        2,
+        1,
+        Level::Serializable,
+        1,
+        Fate::Committed(5),
+        vec![
+            op(OpKind::Get, OpDetail::Get { pk: 5 }, OpOut::Row(None), 1),
+            op(
+                OpKind::InsertT,
+                OpDetail::InsertT {
+                    pk: 6,
+                    row: row3(6, 600, Some("r1")),
+                },
+                OpOut::Ok,
+                1,
+            ),
+        ],
+    );
+    // R2: SER snap 1 — Get pk6 absent, InsertT pk5 @ts6.
+    let r2 = txn(
+        3,
+        2,
+        Level::Serializable,
+        1,
+        Fate::Committed(6),
+        vec![
+            op(OpKind::Get, OpDetail::Get { pk: 6 }, OpOut::Row(None), 1),
+            op(
+                OpKind::InsertT,
+                OpDetail::InsertT {
+                    pk: 5,
+                    row: row3(5, 500, Some("r2")),
+                },
+                OpOut::Ok,
+                1,
+            ),
+        ],
+    );
+    let history = History {
+        txns: vec![setup, r1, r2],
+    };
+    let final_rows = vec![
+        (1, row3(1, 100, Some("x"))),
+        (5, row3(5, 500, Some("r2"))),
+        (6, row3(6, 600, Some("r1"))),
+    ];
+    let verdict = check(&run_of(history, final_rows));
+    assert!(
+        verdict
+            .violations
+            .iter()
+            .any(|v| v.contains("not serializable")),
+        "{}",
+        verdict.report()
+    );
+}
+
+// ----- c1b FU-B: the write side of the TRUNCATE window ------------------------
+
+/// §4's relation rule obliges 40001 for *any* RR/SER access whose
+/// catalog read names a post-`S` storage — a write included. An
+/// in-window insert is data-consistent with the model (it commits after
+/// the truncate, so the model's clear-then-insert ordering agrees): no
+/// data check can flag it, only the window check's write leg can. The
+/// same shape at RC is legal (the relation rule is RR/SER-only) and
+/// stays clean — the over-eagerness guard.
+#[test]
+fn t6c_regress_flags_an_in_window_rr_write() {
+    /// The setup every variant starts from: pk1 @ts1, then the DDL
+    /// session's truncate installs storage 2 @ts2.
+    fn setup_and_truncate() -> History {
+        History {
+            txns: vec![
+                txn(
+                    1,
+                    0,
+                    Level::ReadCommitted,
+                    0,
+                    Fate::Committed(1),
+                    vec![op(
+                        OpKind::InsertT,
+                        OpDetail::InsertT {
+                            pk: 1,
+                            row: row3(1, 100, Some("x")),
+                        },
+                        OpOut::Ok,
+                        0,
+                    )],
+                ),
+                txn(
+                    2,
+                    DDL_SESSION,
+                    Level::ReadCommitted,
+                    1,
+                    Fate::Committed(2),
+                    vec![op(
+                        OpKind::Truncate,
+                        OpDetail::Truncate { new_sid: 2 },
+                        OpOut::Ok,
+                        1,
+                    )],
+                ),
+            ],
+        }
+    }
+    // W: began at snap 1 (before the truncate committed), opens the
+    // table after it, and the insert lands in the new storage — the
+    // recorded `sid` says so.
+    let in_window_insert = |uid: u32, level: Level| {
+        let mut write = op(
+            OpKind::InsertT,
+            OpDetail::InsertT {
+                pk: 7,
+                row: row3(7, 700, Some("w")),
+            },
+            OpOut::Ok,
+            1,
+        );
+        write.sid = Some(2);
+        txn(uid, 1, level, 1, Fate::Committed(3), vec![write])
+    };
+    // RR: the engine must have answered 40001 — flagged.
+    let mut history = setup_and_truncate();
+    history
+        .txns
+        .push(in_window_insert(3, Level::RepeatableRead));
+    let verdict = check(&run_of(history, vec![(7, row3(7, 700, Some("w")))]));
+    assert!(
+        verdict
+            .violations
+            .iter()
+            .any(|v| { v.contains("a successful It write") && v.contains("40001 was required") }),
+        "{}",
+        verdict.report()
+    );
+    // RC: legal — the relation rule is RR/SER-only, and the write's
+    // effect is model-consistent.
+    let mut history = setup_and_truncate();
+    history.txns.push(in_window_insert(3, Level::ReadCommitted));
+    let verdict = check(&run_of(history, vec![(7, row3(7, 700, Some("w")))]));
+    assert!(verdict.is_clean(), "{}", verdict.report());
+}
+
+// ----- c1b FU-D: the RC carve-out ---------------------------------------------
+
+/// An RC "no row" verdict over a row that was live at `S`, deleted
+/// inside `(S, commit]`, and re-inserted before the commit position —
+/// the §5.2 EPQ skip shape the carve-out exists for. The history is
+/// legal and must check clean (kills M-carveout-blind, `carved = false`
+/// in `check_row_write`, which would flag it as a vanishing row).
+#[test]
+fn t6c_regress_rc_reinsert_carveout_stays_clean() {
+    // setup: pk1 @ts1.
+    let setup = txn(
+        1,
+        0,
+        Level::ReadCommitted,
+        0,
+        Fate::Committed(1),
+        vec![op(
+            OpKind::InsertT,
+            OpDetail::InsertT {
+                pk: 1,
+                row: row3(1, 100, Some("x")),
+            },
+            OpOut::Ok,
+            0,
+        )],
+    );
+    // W1: RC, snap 1 — deletes pk1 @ts2.
+    let w1 = txn(
+        2,
+        1,
+        Level::ReadCommitted,
+        1,
+        Fate::Committed(2),
+        vec![op(
+            OpKind::DeleteT,
+            OpDetail::DeleteT { pk: 1 },
+            OpOut::Applied(true),
+            1,
+        )],
+    );
+    // W2: RC, snap 2 — re-inserts pk1 @ts3.
+    let w2 = txn(
+        3,
+        2,
+        Level::ReadCommitted,
+        2,
+        Fate::Committed(3),
+        vec![op(
+            OpKind::InsertT,
+            OpDetail::InsertT {
+                pk: 1,
+                row: row3(1, 111, Some("again")),
+            },
+            OpOut::Ok,
+            2,
+        )],
+    );
+    // V: RC, snap 1 — the row it reads at S was deleted and re-inserted
+    // inside (S, commit]; the verdict "no row" is the legal EPQ skip.
+    let v = txn(
+        4,
+        3,
+        Level::ReadCommitted,
+        1,
+        Fate::Committed(4),
+        vec![op(
+            OpKind::UpdateSet,
+            OpDetail::UpdateSet {
+                pk: 1,
+                attnum: 2,
+                value: Some(Value::Int8(9)),
+                new_row: None,
+            },
+            OpOut::Applied(false),
+            1,
+        )],
+    );
+    let history = History {
+        txns: vec![setup, w1, w2, v],
+    };
+    let run = run_of(history, vec![(1, row3(1, 111, Some("again")))]);
+    let verdict = check(&run);
+    assert!(verdict.is_clean(), "{}", verdict.report());
+    // The carve-out is the path that kept it clean — it fired, and was
+    // needed: blind (`carved = false`) the same history is flagged.
+    assert!(
+        verdict.stats.rc_window_carveouts >= 1,
+        "the carve-out did not fire: {:?}",
+        verdict.stats
     );
 }
