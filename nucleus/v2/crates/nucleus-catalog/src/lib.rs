@@ -9,13 +9,20 @@
 //! and scan — all on top of `nucleus-txn`, which stays normative for
 //! every transactional rule.
 //!
-//! Not here yet: rewrite-requiring ALTERs (C-T6r), large values (§5
-//! chunks) and the online index build ladder (§7, C-T6e) — CREATE INDEX
-//! itself is C-T6 §6.1's born-public path ([`Db::create_index`]), and a
-//! unique index born DeleteOnly or WriteOnly cannot exist through the
-//! SQL layer in 2.0 (§6: the online path never builds unique indexes).
+//! Large values (§5) are the [`toast`] module's: over-threshold datums
+//! become MVCC chunk rows inside the table's storage range, written by
+//! the statement whose row op applied, deleted through
+//! [`Core::delete_entry`](nucleus_txn::boot::Core::delete_entry) and
+//! detoasted at the version's commit ts (never under a SIREAD).
+//!
+//! Not here yet: rewrite-requiring ALTERs (C-T6r) and the online index
+//! build ladder (§7, C-T6e) — CREATE INDEX itself is C-T6 §6.1's
+//! born-public path ([`Db::create_index`]), and a unique index born
+//! DeleteOnly or WriteOnly cannot exist through the SQL layer in 2.0
+//! (§6: the online path never builds unique indexes).
 //! amcheck-lite (C-T6 §8: I-ROWFMT, I-IDX/I-UNIQUE, I-IDX-WO, I-IDX-DO
-//! at a registered snapshot) is the [`amcheck`] module's checker.
+//! at a registered snapshot) is the [`amcheck`] module's checker
+//! (I-TOAST is C-T6d2's).
 
 pub mod amcheck;
 pub mod db;
@@ -23,8 +30,10 @@ pub mod ddl;
 pub mod defs;
 pub mod error;
 mod index;
+pub mod toast;
 
 pub use db::{table_lo, Db, IndexHandle, ScannedRow, Stmt, TableHandle, KEY_LIMIT};
 pub use ddl::{refuse_rewrite, RewriteKind};
 pub use defs::{IndexColumn, IndexDef, IndexState};
 pub use error::DbError;
+pub use toast::{chunk_key, toast_id, TOAST_CHUNK, TOAST_MARK, TOAST_THRESHOLD};

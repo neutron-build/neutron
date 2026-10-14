@@ -303,7 +303,7 @@ impl<K: OrderedKv> Db<K> {
             Catalog::read_rel(&self.core, &view, &ghost, rel_oid).map_err(DbError::Txn)?
         };
 
-        let (rel, built_at, mode, own_rows) = match (own_rel, ghost_rel) {
+        let (rel, built_at, mode, own_rows, own_ctx) = match (own_rel, ghost_rel) {
             (Some(rel), None) => {
                 // (a) the txn's own relation: the committed row is absent,
                 // the own row present.
@@ -313,7 +313,7 @@ impl<K: OrderedKv> Db<K> {
                     stmt_seq: st.seq0(),
                 };
                 let rows = scan_rows_at(&self.core, rel.storage_id, &ctx)?;
-                (rel, 0, RelLockMode::AccessExclusive, rows)
+                (rel, 0, RelLockMode::AccessExclusive, rows, ctx)
             }
             (Some(_), Some(_)) => {
                 // (b) pre-existing: Share first (§6.1: the emptiness check
@@ -357,7 +357,7 @@ impl<K: OrderedKv> Db<K> {
                     stmt_seq: st.seq0(),
                 };
                 let rows = scan_rows_at(&self.core, rel.storage_id, &own_at)?;
-                (rel, s_e.0, RelLockMode::Share, rows)
+                (rel, s_e.0, RelLockMode::Share, rows, own_at)
             }
             // Neither read sees a row: the relation does not exist for
             // this statement (a committed row implies the own read sees it
@@ -389,6 +389,9 @@ impl<K: OrderedKv> Db<K> {
 
         // The entries of the txn's own rows, through this statement's
         // write path (§6.1: they commit and abort with the index row).
+        // §5: a toasted column of an own row detoasts through the txn's
+        // own ctx — its chunks are the txn's own intents of earlier
+        // statements, and an index key uses the detoasted value.
         let schema = TableSchema::decode(&rel.def)?;
         let handle = IndexHandle {
             oid: idx_oid,
@@ -406,7 +409,8 @@ impl<K: OrderedKv> Db<K> {
             indexes: vec![handle.clone()],
         };
         for (row_key, bytes) in own_rows {
-            let live = schema.decode_row(&bytes)?;
+            let mut live = schema.decode_row(&bytes)?;
+            crate::toast::detoast_row_at(&self.core, &schema, rel.storage_id, &mut live, &own_ctx)?;
             let (key, value, rule) = index::entry_for_insert(&h, &handle, &row_key, &live)?;
             self.core
                 .insert_key(st.txn(), &key, None, value, st.ctx(), rule)
