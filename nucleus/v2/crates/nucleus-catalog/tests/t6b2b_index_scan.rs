@@ -13,6 +13,13 @@
 //! (FU-4/K-LIM), the DROP-INDEX fence (FU-5) and the `built_at == S`
 //! boundary (FU-6/B-EDGE) — plus one ESCALATE-marked reproduction of the
 //! fencing gap found while writing FU-5.
+//!
+//! C-T6b2bfix2 (the gate's binding FU-A): the fencing gap is fixed —
+//! `index_scan`'s post-lock catalog reads run at a fresh post-lock
+//! `visible_ts()` — and the reproduction is un-ignored, now pinning both
+//! during-wait drops: a DROP INDEX is 42704, a DROP TABLE (the ghost
+//! pair's `(Some, None)` shape, closed by the fresh post-lock rel read
+//! as `open_table` closes it) is 42P01 — neither is ever served.
 
 mod t6b_support;
 
@@ -832,20 +839,19 @@ fn built_at_equal_to_the_snapshot_is_served() {
     ok(rig.commit_rc(t3));
 }
 
-/// ESCALATE (found while writing FU-5; the gate's F-5 said "code is
-/// correct" — it is not): `index_scan` captures `visible_ts` **before**
-/// `lock_relation` parks, so the post-lock re-read of the idx row runs
-/// at the pre-wait snapshot and a DROP INDEX that commits while the
-/// scanner waits for its AccessShare is invisible to it (§4 reads the
-/// catalog at the latest committed state; the method's own doc claims
-/// the drop "shows in the re-read"). The scan then serves the dropped
-/// index's pre-drop snapshot instead of reporting 42704. The re-read is
-/// observably identical to the pre-lock read in every reachable state,
-/// so the FENCE mutant (re-read deleted) is UNCAUGHT. Fixing it is out
-/// of this card's Touch-only scope; run with `--ignored` to reproduce —
-/// today this fails with "the dropped index was served".
+/// C-T6b2bfix2 (the C-T6b2bfix gate's F-1, its binding FU-A): the
+/// fencing gap the FU-5 work found, fixed and pinned. `index_scan`'s
+/// post-lock catalog reads run at a fresh post-lock `visible_ts()` (the
+/// pre-lock read only resolves the owner to lock), so a DROP INDEX that
+/// COMMITS while the scanner waits for its AccessShare is reported as
+/// 42704 — never served at the pre-drop snapshot. The second leg is the
+/// gate's F-5 `(Some, None)` ghost-pair shape: a DROP TABLE committing
+/// under the same wait leaves the relation row present at the RR
+/// statement's snapshot and absent at the latest committed state, and
+/// the fresh post-lock rel read closes the shape as 42P01 — exactly as
+/// `open_table` closes it — where the defect's stale pre-lock ctx
+/// served the dropped table's index.
 #[test]
-#[ignore = "ESCALATE: index_scan's post-lock idx-row re-read runs at the pre-wait visible_ts; a DROP INDEX committing during the AccessShare wait is served at the old snapshot instead of 42704"]
 fn drop_committing_during_the_scan_wait_is_not_served() {
     let rig = Arc::new(Rig::new());
     let (_oid, idx_oid) = born_index_after_own_row(&rig, b"escl", 1, "a");
@@ -895,4 +901,59 @@ fn drop_committing_during_the_scan_wait_is_not_served() {
     }
     b.join().expect("dropper join");
     a.join().expect("scanner join");
+
+    // F-5: the `(Some, None)` ghost-pair shape — a DROP TABLE commits
+    // under the same wait. The relation row is present at the RR
+    // statement's snapshot and absent at the latest committed state;
+    // the fresh post-lock rel read closes the shape as 42P01 (exactly
+    // as `open_table` closes it), where the defect's stale pre-lock ctx
+    // served the dropped table's index. The re-read running at a stale
+    // ctx (REL-STALE) would reach the fresh idx re-read instead and
+    // report 42704 — the wrong error for a gone relation.
+    let (oid2, idx_oid2) = born_index_after_own_row(&rig, b"escl2", 1, "a");
+    let (held2_tx, held2_rx) = mpsc::channel::<()>();
+    let (release2_tx, release2_rx) = mpsc::channel::<()>();
+    let rig_b2 = Arc::clone(&rig);
+    let b2 = thread::spawn(move || {
+        let t = rig_b2.rc();
+        let s = rig_b2.core().visible_ts();
+        ok(rig_b2
+            .catalog()
+            .catalog_drop_table(&rig_b2.ddl(&t, s), oid2));
+        held2_tx.send(()).expect("held signal");
+        release2_rx.recv_timeout(BOUND).expect("release signal");
+        ok(rig_b2.commit_rc(t));
+    });
+    held2_rx
+        .recv_timeout(BOUND)
+        .expect("the dropper holds AccessExclusive");
+
+    let (res2_tx, res2_rx) = mpsc::channel::<Result<usize, String>>();
+    let rig_a2 = Arc::clone(&rig);
+    let a2 = thread::spawn(move || {
+        let (t, guard, s) = rig_a2.rr();
+        let st = rig_a2.stmt(&t, s);
+        let r = rig_a2
+            .db
+            .index_scan(&st, idx_oid2, Bound::Unbounded, Bound::Unbounded);
+        let out = match r {
+            Ok(rows) => Ok(rows.len()),
+            Err(e) => Err(e.sqlstate().to_string()),
+        };
+        res2_tx.send(out).expect("res signal");
+        rig_a2.abort_txn(t);
+        drop(guard);
+    });
+    wait_until(BOUND, || !rig.wait_edges().is_empty());
+    release2_tx.send(()).expect("release");
+
+    // §4: the committed drop of the owning table must be seen → 42P01
+    // (the `(Some, None)` shape is closed by the fresh post-lock read),
+    // never a serve.
+    match res2_rx.recv_timeout(BOUND).expect("the scan completed") {
+        Err(sqlstate) => assert_eq!(sqlstate, "42P01", "the dropped table is reported"),
+        Ok(n) => panic!("the dropped table's index was served: {n} row(s)"),
+    }
+    b2.join().expect("dropper join");
+    a2.join().expect("scanner join");
 }
