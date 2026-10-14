@@ -397,13 +397,15 @@ struct FinalScan {
 
 // ----- schemas, keys, rows ----------------------------------------------------
 
-/// `t(pk int8 PK, a int8, b text)`.
+/// `t(pk int8 PK, a int8, b text, big text)` — C-T6d2's fourth column
+/// carries the large values ([`super::BIG_LENS`], [`super::big_blob`]).
 pub fn t_schema() -> TableSchema {
     schema_of(
         vec![
             ("pk", KeyType::Int8, true),
             ("a", KeyType::Int8, false),
             ("b", KeyType::Text(Collation::C), false),
+            ("big", KeyType::Text(Collation::C), false),
         ],
         true,
     )
@@ -418,6 +420,17 @@ pub fn u_schema() -> TableSchema {
         ],
         false,
     )
+}
+
+/// The live attnum of `t`'s `big` column as this handle's definition has
+/// it (`None` = dropped — a DropBig/AddBig cycle moves the attnum, so
+/// the ops resolve it by name at execution, exactly as a UPDATE naming
+/// the column would).
+fn big_attnum(h: &TableHandle) -> Option<u16> {
+    h.schema
+        .live_columns()
+        .find(|c| c.name == "big")
+        .map(|c| c.attnum)
 }
 
 fn schema_of(cols: Vec<(&str, KeyType, bool)>, with_pk: bool) -> TableSchema {
@@ -905,6 +918,105 @@ impl<'r> Session<'r> {
         Ok(applied)
     }
 
+    /// C-T6d2's `UPDATE t SET big = <len-byte text> WHERE pk = ..` (§5):
+    /// the value is [`big_blob`]`(tag, len)`, the column resolved by name
+    /// against the live definition (a dropped `big` is the 42703 the
+    /// statement deserves). The read-back is `update_set`'s: a second
+    /// statement of the same txn at the same snapshot, so `new_row` is
+    /// the effect the engine applied — the full detoasted value, EPQ
+    /// re-base included.
+    fn set_big(
+        &self,
+        st: &Stmt<'_>,
+        op: &mut OpRec,
+        pk: i64,
+        choice: u32,
+        tag: u8,
+    ) -> Result<bool, nucleus_catalog::DbError> {
+        let h = self
+            .rig
+            .db
+            .open_table(st, self.rig.t_oid, RelLockMode::RowExclusive)?;
+        op.def_version = Some(h.def_version);
+        op.sid = Some(h.storage_id);
+        let attnum =
+            big_attnum(&h).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
+        let len = super::BIG_LENS[choice as usize % super::BIG_LENS.len()];
+        let value = super::big_blob(tag, len);
+        op.detail = OpDetail::SetBig {
+            pk,
+            len: len as u32,
+            tag,
+            attnum,
+            new_row: None,
+        };
+        let applied = self.rig.db.update_with(
+            st,
+            &h,
+            &[Some(Value::Int8(pk))],
+            &[(attnum, Some(Datum::Inline(value)))],
+        )?;
+        if applied {
+            self.read_back_big(st, &h, op, pk)?;
+        }
+        op.out = OpOut::Applied(applied);
+        Ok(applied)
+    }
+
+    /// C-T6d2's `UPDATE t SET big = NULL WHERE pk = ..`.
+    fn null_big(
+        &self,
+        st: &Stmt<'_>,
+        op: &mut OpRec,
+        pk: i64,
+    ) -> Result<bool, nucleus_catalog::DbError> {
+        let h = self
+            .rig
+            .db
+            .open_table(st, self.rig.t_oid, RelLockMode::RowExclusive)?;
+        op.def_version = Some(h.def_version);
+        op.sid = Some(h.storage_id);
+        let attnum =
+            big_attnum(&h).ok_or(nucleus_catalog::DbError::UndefinedColumn)?;
+        op.detail = OpDetail::NullBig {
+            pk,
+            attnum,
+            new_row: None,
+        };
+        let applied = self.rig.db.update_with(
+            st,
+            &h,
+            &[Some(Value::Int8(pk))],
+            &[(attnum, None)],
+        )?;
+        if applied {
+            self.read_back_big(st, &h, op, pk)?;
+        }
+        op.out = OpOut::Applied(applied);
+        Ok(applied)
+    }
+
+    /// The post-write read-back a SetBig/NullBig records (`new_row`) —
+    /// `update_set`'s shape: errors propagate, so a read-back failure
+    /// aborts the txn exactly as it would there.
+    fn read_back_big(
+        &self,
+        st: &Stmt<'_>,
+        h: &TableHandle,
+        op: &mut OpRec,
+        pk: i64,
+    ) -> Result<(), nucleus_catalog::DbError> {
+        let txn = self.txn.as_ref().expect("the txn is alive");
+        let st2 = Stmt::new(txn, st.snapshot()).expect("the read-back statement");
+        let row = self.rig.db.get(&st2, h, &[Some(Value::Int8(pk))])?;
+        if let OpDetail::SetBig { new_row, .. } | OpDetail::NullBig { new_row, .. } =
+            &mut op.detail
+        {
+            *new_row = row.as_deref().map(|d| self.record_t_row(h, d));
+        }
+        Ok(())
+    }
+
     /// `INSERT INTO u VALUES (..)` — hidden rowid (§3): the key comes
     /// from the statement's ordinal counter, the row from `a` and `b`.
     fn insert_u(
@@ -1138,6 +1250,8 @@ fn kind_of(pop: &POp) -> OpKind {
         POp::InsertU(_) => OpKind::InsertU,
         POp::ScanU => OpKind::ScanU,
         POp::DeleteU(_) => OpKind::DeleteU,
+        POp::SetBig(..) => OpKind::SetBig,
+        POp::NullBig(_) => OpKind::NullBig,
     }
 }
 
@@ -1230,6 +1344,22 @@ fn run_prog(
             POp::DeleteU(choice) => s.exec(pos, kind_of(pop), |s, st, op| {
                 s.delete_u(st, op, choice).map(|_| ())
             }),
+            POp::SetBig(pk, choice) => {
+                let tag = derive_const(
+                    seed,
+                    session,
+                    prog_idx,
+                    attempt,
+                    pos,
+                    super::TAG_T_BIG,
+                ) as u8;
+                s.exec(pos, kind_of(pop), move |s, st, op| {
+                    s.set_big(st, op, pk, choice, tag).map(|_| ())
+                })
+            }
+            POp::NullBig(pk) => s.exec(pos, kind_of(pop), |s, st, op| {
+                s.null_big(st, op, pk).map(|_| ())
+            }),
         };
         if let Err(code) = r {
             return if super::retryable(&code) {
@@ -1254,6 +1384,8 @@ fn run_ddl(rig: &Rig, index: u32, attempt: u32, op: &PDdl, seed: u64) -> Outcome
         PDdl::SetNotNull => OpKind::SetNotNull,
         PDdl::DropNotNull => OpKind::DropNotNull,
         PDdl::Truncate => OpKind::Truncate,
+        PDdl::DropBig => OpKind::DropBig,
+        PDdl::AddBig => OpKind::AddBig,
     };
     let mut s = Session::begin(rig, DDL_SESSION, index, attempt, Level::ReadCommitted);
     let r = s.exec(0, kind, |s, st, rec| {
@@ -1342,6 +1474,40 @@ fn run_ddl_op(
             rec.out = OpOut::Ok;
             Ok(())
         }
+        // C-T6d2: DROP COLUMN big by name / its re-add. Both reuse the
+        // AddColumn/DropColumn details (the model evolves through them),
+        // the drop resolving the live attnum at execution.
+        PDdl::DropBig => {
+            let schema = live_schema(rig)?;
+            let attnum = schema
+                .live_columns()
+                .find(|c| c.name == "big")
+                .map(|c| c.attnum)
+                .ok_or(nucleus_catalog::DbError::FeatureNotSupported(
+                    "no live big column to drop",
+                ))?;
+            rec.detail = OpDetail::DropColumn { attnum };
+            rig.db.drop_column(st, rig.t_oid, attnum)?;
+            rec.out = OpOut::Ok;
+            Ok(())
+        }
+        PDdl::AddBig => {
+            let name = "big".to_string();
+            rec.detail = OpDetail::AddColumn {
+                name: name.clone(),
+                default: None,
+            };
+            rig.db.add_column(
+                st,
+                rig.t_oid,
+                &name,
+                KeyType::Text(Collation::C),
+                false,
+                None,
+            )?;
+            rec.out = OpOut::Ok;
+            Ok(())
+        }
     }
 }
 
@@ -1364,16 +1530,17 @@ fn live_schema(rig: &Rig) -> Result<TableSchema, nucleus_catalog::DbError> {
     Ok(TableSchema::decode(&rel.def)?)
 }
 
-/// DROP COLUMN's target: a live **added** column (attnum ≥ 4) — the
-/// highest, so the workload's own `a` and `b` stay live and the DML mix
-/// keeps exercising them. With none, the op is a legal 0A000 refusal
-/// (the card names the target class "non-pk live"; which one the harness
-/// picks is its own choice, and dropping only added columns keeps the
-/// run's write surface from collapsing to a pk-only table).
+/// DROP COLUMN's target: a live **added** column (attnum ≥ 5 — `big` is
+/// the fixture's attnum 4 and C-T6d2's DropBig owns it) — the highest, so
+/// the workload's own `a`, `b` and `big` stay live and the DML mix keeps
+/// exercising them. With none, the op is a legal 0A000 refusal (the card
+/// names the target class "non-pk live"; which one the harness picks is
+/// its own choice, and dropping only added columns keeps the run's write
+/// surface from collapsing to the fixture's columns).
 fn drop_target(schema: &TableSchema, _rng: &mut super::Rng) -> Option<u16> {
     schema
         .live_columns()
-        .filter(|c| !schema.pk.contains(&c.attnum) && c.attnum >= 4)
+        .filter(|c| !schema.pk.contains(&c.attnum) && c.attnum >= 5)
         .map(|c| c.attnum)
         .last()
 }
