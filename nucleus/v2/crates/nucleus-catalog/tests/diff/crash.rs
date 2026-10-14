@@ -46,21 +46,57 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use crate::t6b_support::{
-    commit_off, decode_def, i32_d, i_entry_key, idx_def, ok, pk_schema, row_key_of, rowid_schema,
-    sweep, text_d, Rig,
+    commit_off, decode_def, i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, row_key_of,
+    rowid_schema, set_col, sweep, text_d, Rig,
 };
 
 use nucleus_catalog::amcheck::check_table;
-use nucleus_catalog::{IndexDef, IndexState, Stmt};
-use nucleus_codec::row::{value_repr_eq, Datum};
+use nucleus_catalog::{IndexDef, IndexState, Stmt, TOAST_CHUNK, TOAST_MARK, TOAST_THRESHOLD};
+use nucleus_codec::row::{value_repr_eq, Datum, TableSchema};
 use nucleus_codec::{Collation, KeyColumn, KeyType, Value};
-use nucleus_txn::catalog::IdxStorage;
+use nucleus_txn::catalog::{table_range, IdxStorage};
 use nucleus_txn::commit::SyncCommit;
 use nucleus_txn::locks::RelLockMode;
+use nucleus_txn::read::{scan, NoSsi};
+use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::{Ts, TxnId, TxnStatus};
 
 /// The ADD COLUMN default the AddColumn scene plants (int4).
 const ADD_DEFAULT: i32 = 77;
+
+/// `CREATE TABLE mx_t (id int4 PRIMARY KEY, payload text, big text)` —
+/// the LargeValues scene's wide table (C-T6d2 §5).
+fn wide_pk_schema() -> TableSchema {
+    use nucleus_codec::row::ColumnDef;
+    let col = |attnum: u16, name: &str, ty: KeyType, not_null: bool| ColumnDef {
+        attnum,
+        name: name.into(),
+        ty,
+        not_null,
+        dropped: false,
+        missing: None,
+    };
+    ok(TableSchema::new(
+        vec![
+            col(1, "id", KeyType::Int4, true),
+            col(
+                2,
+                "payload",
+                KeyType::Text(Collation::C),
+                false,
+            ),
+            col(3, "big", KeyType::Text(Collation::C), false),
+        ],
+        vec![1],
+    ))
+}
+
+/// One large text of `len` bytes, all the letter `'a' + tag % 26` — the
+/// scene's `big` values, one byte per char so the length is the byte
+/// length (t6d_toast's `blob`).
+fn big_text(tag: u8, len: usize) -> String {
+    char::from(b'a' + (tag % 26)).to_string().repeat(len)
+}
 
 /// Which scene the matrix crashes inside (card item 2's list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +112,11 @@ pub enum Scenario {
     CreateIndex,
     /// A plain insert into the no-PK (hidden-rowid) table.
     InsertU,
+    /// C-T6d2: the large-value scene (§5) — the action txn does a large
+    /// insert, a large update (a replace: the old chunks tombstone) and
+    /// a large delete over rows whose `big` values are chunked, with the
+    /// concurrent DML txn committing a large insert of its own.
+    LargeValues,
 }
 
 /// Where one cell crashes: an explicit prefix of the unsynced tail, or
@@ -125,6 +166,22 @@ fn add_row_on(rig: &Rig, oid: u64, id: i32, payload: &str) -> (TxnId, Ts) {
     (txn_id, ts)
 }
 
+/// One committed `on` wide row `(id, payload, big)` in its own txn — the
+/// LargeValues scene's baseline writer.
+fn add_big_row_on(rig: &Rig, oid: u64, id: i32, payload: &str, tag: u8, len: usize) -> (TxnId, Ts) {
+    let t = rig.rc();
+    let txn_id = t.id;
+    let st = rig.stmt(&t, rig.core().visible_ts());
+    let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(
+        &st,
+        &h,
+        &[i32_d(id), text_d(payload), text_d(&big_text(tag, len))],
+    ));
+    let ts = ok(rig.commit_rc(t));
+    (txn_id, ts)
+}
+
 /// Builds one matrix scene (see the module docs for the shape).
 pub fn build_scene(scenario: Scenario, b_sync: SyncCommit) -> (Rig, Scene) {
     let rig = Rig::new();
@@ -146,7 +203,11 @@ pub fn build_scene(scenario: Scenario, b_sync: SyncCommit) -> (Rig, Scene) {
         let t = rig.rc();
         let txn_id = t.id;
         let st = rig.stmt(&t, rig.core().visible_ts());
-        let (oid, sid) = ok(rig.db.create_table(&st, b"mx_t", &pk_schema()));
+        let schema = match scenario {
+            Scenario::LargeValues => wide_pk_schema(),
+            _ => pk_schema(),
+        };
+        let (oid, sid) = ok(rig.db.create_table(&st, b"mx_t", &schema));
         let ts = ok(rig.commit_rc(t));
         acked_on.push((txn_id, ts));
         (oid, sid)
@@ -158,6 +219,12 @@ pub fn build_scene(scenario: Scenario, b_sync: SyncCommit) -> (Rig, Scene) {
     match scenario {
         Scenario::AddColumn => {
             acked_on.push(add_row_on(&rig, t_oid, 1, "base"));
+        }
+        Scenario::LargeValues => {
+            // Two toasted baseline rows (3 chunks each): the update's
+            // and the delete's targets.
+            acked_on.push(add_big_row_on(&rig, t_oid, 1, "one", 0, 20_000));
+            acked_on.push(add_big_row_on(&rig, t_oid, 2, "two", 1, 20_000));
         }
         Scenario::DropColumn => {
             // The dependent Public index on the column about to be
@@ -216,6 +283,16 @@ pub fn build_scene(scenario: Scenario, b_sync: SyncCommit) -> (Rig, Scene) {
             Scenario::InsertU => {
                 let h = ok(rig.db.open_table(&st, t_oid, RelLockMode::RowExclusive));
                 ok(rig.db.insert_with(&st, &h, &[i32_d(9), text_d("bee")]));
+            }
+            // C-T6d2: B's own large insert — a one-chunk value, so the
+            // scene's surviving set is legible chunk-wise at every cut.
+            Scenario::LargeValues => {
+                let h = ok(rig.db.open_table(&st, t_oid, RelLockMode::RowExclusive));
+                ok(rig.db.insert_with(
+                    &st,
+                    &h,
+                    &[i32_d(3), text_d("bee"), text_d(&big_text(2, 3000))],
+                ));
             }
             _ => {
                 let h = ok(rig.db.open_table(&st, t_oid, RelLockMode::RowExclusive));
@@ -299,6 +376,28 @@ pub fn build_scene(scenario: Scenario, b_sync: SyncCommit) -> (Rig, Scene) {
             ));
             ok(rig.db.insert_with(&st, &h, &[i32_d(801)]));
         }
+        // C-T6d2: the large insert, update and delete of one txn — the
+        // insert's 3 chunks are written with the row, the update
+        // replaces row 1's value (a fresh id; the old 3 chunks
+        // tombstone), and the delete kills row 2 with its 3.
+        Scenario::LargeValues => {
+            let st = rig.stmt(&a_txn, rig.core().visible_ts());
+            let h = ok(rig.db.open_table(&st, t_oid, RelLockMode::RowExclusive));
+            ok(rig.db.insert_with(
+                &st,
+                &h,
+                &[i32_d(4), text_d("four"), text_d(&big_text(3, 20_000))],
+            ));
+            let st2 = rig.stmt(&a_txn, rig.core().visible_ts());
+            assert!(ok(rig.db.update(
+                &st2,
+                t_oid,
+                &[i32_v(1)],
+                &[set_col(3, text_d(&big_text(4, 20_000)))]
+            )));
+            let st3 = rig.stmt(&a_txn, rig.core().visible_ts());
+            assert!(ok(rig.db.delete(&st3, t_oid, &[i32_v(2)])));
+        }
     }
     let (a_id, a_ts) = (a_txn.id, commit_off(&rig, a_txn));
     // The resolver's writes (intent removals, version puts) join the
@@ -340,6 +439,25 @@ fn u_row(v: i32) -> MRow {
     vec![Some(Value::Int4(v))]
 }
 
+/// A wide row of the LargeValues scene, carrying its full `big` value
+/// (the model stores whole values — the scan comparison detoasts).
+fn wide_row(id: i32, payload: &str, tag: u8, len: usize) -> MRow {
+    vec![
+        Some(Value::Int4(id)),
+        Some(Value::Text(payload.into())),
+        Some(Value::Text(big_text(tag, len))),
+    ]
+}
+
+/// The §5 chunk count a `big` value occupies (over the threshold →
+/// `ceil(len / TOAST_CHUNK)`; else inline, no chunk).
+fn chunks_of_big(v: &Value) -> usize {
+    match v {
+        Value::Text(s) if s.len() > TOAST_THRESHOLD => s.len().div_ceil(TOAST_CHUNK),
+        _ => 0,
+    }
+}
+
 /// The state the surviving committed set implies: `t`'s and `u`'s rows
 /// by identity, the surviving definition's shape, and a born index's
 /// expected visible entries.
@@ -353,6 +471,9 @@ pub struct CrashModel {
     payload_dropped: bool,
     /// The born-public index committed: its one entry, by key.
     entries: Vec<nucleus_kv::Key>,
+    /// The LargeValues scene: `t` is the wide 3-column table whose
+    /// definition never changes, so rows render as stored.
+    wide: bool,
 }
 
 /// The model of exactly the scene txns whose `/sys/txn` records the
@@ -363,6 +484,11 @@ pub fn model_of(scene: &Scene, a_in: bool, b_in: bool) -> CrashModel {
     match scene.scenario {
         Scenario::AddColumn => {
             m.t.insert(1, t_row(1, "base"));
+        }
+        Scenario::LargeValues => {
+            m.wide = true;
+            m.t.insert(1, wide_row(1, "one", 0, 20_000));
+            m.t.insert(2, wide_row(2, "two", 1, 20_000));
         }
         Scenario::Truncate => {
             m.t.insert(1, t_row(1, "r1"));
@@ -378,6 +504,9 @@ pub fn model_of(scene: &Scene, a_in: bool, b_in: bool) -> CrashModel {
             Scenario::InsertU => {
                 m.t.insert(9, t_row(9, "bee"));
             }
+            Scenario::LargeValues => {
+                m.t.insert(3, wide_row(3, "bee", 2, 3000));
+            }
             _ => {
                 m.t.insert(5, t_row(5, "bee"));
             }
@@ -389,6 +518,13 @@ pub fn model_of(scene: &Scene, a_in: bool, b_in: bool) -> CrashModel {
             Scenario::DropColumn => m.payload_dropped = true,
             Scenario::SetNotNull => {}
             Scenario::Truncate => m.t.clear(),
+            Scenario::LargeValues => {
+                // The replace moves row 1 to a fresh value, the insert
+                // adds row 4, the delete removes row 2.
+                m.t.insert(1, wide_row(1, "one", 4, 20_000));
+                m.t.insert(4, wide_row(4, "four", 3, 20_000));
+                m.t.remove(&2);
+            }
             Scenario::CreateIndex => {
                 m.t.insert(7, t_row(7, "own"));
                 let isid = scene.idx_isid.expect("the scene captured the storage id");
@@ -413,6 +549,11 @@ impl CrashModel {
     /// surviving definition (§3's decode rule: a column the row's writer
     /// never had reads `missing`, else NULL).
     fn rendered_t(&self) -> BTreeMap<i32, MRow> {
+        if self.wide {
+            // The LargeValues definition never changes: rows render as
+            // stored, `big` values whole.
+            return self.t.iter().map(|(id, row)| (*id, row.clone())).collect();
+        }
         self.t
             .iter()
             .map(|(id, row)| {
@@ -431,6 +572,21 @@ impl CrashModel {
     /// The rows a full scan of `u` must return, by their `v` identity.
     fn rendered_u(&self) -> BTreeMap<i32, MRow> {
         self.u.iter().map(|(v, row)| (*v, row.clone())).collect()
+    }
+
+    /// The number of large-value chunks the surviving rows' `big`
+    /// pointers must name (C-T6d2: the no-orphan/no-dangling oracle's
+    /// count form — amcheck's I-TOAST checks the same set exactly).
+    pub fn chunks_expected(&self) -> usize {
+        self.t
+            .values()
+            .map(|row| {
+                row.get(2)
+                    .and_then(|v| v.as_ref())
+                    .map(chunks_of_big)
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 }
 
@@ -633,6 +789,13 @@ pub fn cell(scenario: Scenario, b_sync: SyncCommit, at: CrashAt) -> bool {
             }
         }
         Scenario::InsertU => assert_eq!(def.version, 1, "{where_}: no DDL in this scene"),
+        Scenario::LargeValues => {
+            assert_eq!(def.version, 1, "{where_}: no DDL in this scene");
+            assert_eq!(
+                rel.storage_id, scene.old_sid,
+                "{where_}: the storage never moves"
+            );
+        }
     }
 
     // amcheck at a fresh snapshot of the reopened state: every row
@@ -673,5 +836,50 @@ pub fn cell(scenario: Scenario, b_sync: SyncCommit, at: CrashAt) -> bool {
             "{where_}: the born index's visible entries must be exactly the model's"
         );
     }
+    // C-T6d2: the LargeValues scene's no-orphan/no-dangling oracle, in
+    // count form — every visible chunk of the storage belongs to a
+    // surviving row's pointer, and every surviving row's pointer has its
+    // chunks (amcheck's I-TOAST, run above, checks the same set exactly;
+    // this counts it against the model independently of the checker).
+    if scenario == Scenario::LargeValues {
+        let want = model.chunks_expected();
+        assert!(want > 0, "{where_}: every cut keeps a toasted row");
+        let got = visible_chunk_count(&rig2, rel.storage_id);
+        assert_eq!(
+            got, want,
+            "{where_}: visible chunks vs the surviving rows' pointers"
+        );
+    }
     a_in
+}
+
+/// The number of §5 chunks of storage `sid` visible at a fresh snapshot
+/// of the reopened store, through the same read path amcheck uses.
+fn visible_chunk_count(rig: &Rig, sid: u64) -> usize {
+    let (lo, hi) = table_range(sid);
+    let mut clo = lo.clone();
+    clo.push(TOAST_MARK);
+    let guard = rig.core().registry.take_snapshot();
+    let ctx = ReadCtx {
+        txn: TxnId {
+            epoch: rig.core().epoch(),
+            n: u64::MAX,
+        },
+        snapshot: guard.ts(),
+        stmt_seq: 0,
+    };
+    let view = rig.core().open_view();
+    let n = ok(scan(
+        rig.core(),
+        &view,
+        (
+            Bound::Included(clo.as_slice()),
+            Bound::Excluded(hi.as_slice()),
+        ),
+        &ctx,
+        &mut NoSsi,
+    )
+    .collect::<Result<Vec<_>, _>>())
+    .len();
+    n
 }
