@@ -99,15 +99,16 @@ fn t6c_regress_e3_alter_rel_def_excludes_writers() {
     let inserted = Arc::new(AtomicBool::new(false));
     let insert_version = Arc::new(AtomicU32::new(0));
     let ddl_ts = Arc::new(Mutex::new(None));
-    // The DDL thread parks here, the def rewritten and the lock held;
-    // the orchestrating thread releases it. A channel, not a Barrier
-    // (c1b FU-E): when any earlier step fails and unwinds, the sender
-    // drops, the recv returns and the DDL thread finishes — the test
-    // fails cleanly instead of wedging the runner on a join that can
-    // never happen while the DDL thread waits at a Barrier forever.
-    let (release, park) = mpsc::channel::<()>();
 
     std::thread::scope(|sc| {
+        // The DDL thread parks here, the def rewritten and the lock
+        // held; the orchestrating thread releases it. A channel, not a
+        // Barrier (c1b FU-E) — and the sender lives **inside** the
+        // scope, so a panic anywhere below unwinds it before the scope
+        // joins: the recv returns, the DDL thread finishes, and the
+        // test fails cleanly instead of wedging the runner on a join
+        // that can never happen while the DDL thread waits forever.
+        let (release, park) = mpsc::channel::<()>();
         sc.spawn({
             let (altered, park, ddl_ts) = (Arc::clone(&altered), park, Arc::clone(&ddl_ts));
             move || {
