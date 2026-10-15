@@ -81,7 +81,9 @@ fn summary(seed: u64, v: &Verdict, run: &Run) {
          {} amcheck points; c1b: {} writes checked ({} effects recomputed, \
          {} RC carve-outs), {} SET NOT NULL verified ({} skipped), \
          {} SER txns / {} reads / {} wr + {} rw edges; c1d2: {} big writes \
-         (lens {}/{}/{}), {} big drops / {} adds; violations: {}",
+         (lens {}/{}/{}), {} big drops / {} adds; c1e3: {} builds ok / {} failed, \
+         {} resumes ({} no-op), {} drops, {} index scans ({} served, {} refused, \
+         {} absent, {} no-target), sights DO {}/WO {}; violations: {}",
         s.txns,
         s.committed,
         s.failed,
@@ -109,6 +111,18 @@ fn summary(seed: u64, v: &Verdict, run: &Run) {
         s.big_lens[2],
         s.big_drops,
         s.big_adds,
+        s.idx_builds_ok,
+        s.idx_builds_failed,
+        s.idx_resumes,
+        s.idx_resumes_noop,
+        s.idx_drops,
+        s.idx_scans,
+        s.idx_scans_served,
+        s.idx_scans_refused,
+        s.idx_scans_absent,
+        s.idx_scans_noop,
+        s.idx_sights_delete_only,
+        s.idx_sights_write_only,
         v.violations.len()
     );
 }
@@ -169,6 +183,18 @@ fn t6c_soak() {
         }
         big.big_drops += s.big_drops;
         big.big_adds += s.big_adds;
+        // The same for C-T6e3's online-build surface (the c1d2 pattern:
+        // per-seed floors would flake on interleavings — a build's fate
+        // depends on which truncate or drop raced it — while the
+        // aggregate floor is many times the bar).
+        big.idx_builds_ok += s.idx_builds_ok;
+        big.idx_builds_failed += s.idx_builds_failed;
+        big.idx_resumes += s.idx_resumes;
+        big.idx_drops += s.idx_drops;
+        big.idx_scans_served += s.idx_scans_served;
+        big.idx_scans_refused += s.idx_scans_refused;
+        big.idx_sights_delete_only += s.idx_sights_delete_only;
+        big.idx_sights_write_only += s.idx_sights_write_only;
         // c1b FU-D: the SET NOT NULL surface stays exercised — a
         // workload or engine change that quietly stopped producing
         // successful SET NOT NULLs (or witnessed 23502s) would zero
@@ -185,6 +211,41 @@ fn t6c_soak() {
     );
     assert!(big.big_drops > 0, "no committed DropBig: {big:?}");
     assert!(big.big_adds > 0, "no committed AddBig: {big:?}");
+    // C-T6e3's surface: builds published and failed (the seeded
+    // sabotage's 55000s), unfinished ones were resumed and dropped, and
+    // the DML scans both served through a published index and were
+    // refused by the ladder's mid-states — an engine that never
+    // published, or one that never refused, starves one of each pair
+    // (the served side is also the rows-equality oracle's only bite).
+    assert!(
+        big.idx_builds_ok > 3,
+        "too few published online builds: {big:?}"
+    );
+    assert!(
+        big.idx_builds_failed > 0,
+        "no failed online build (the seeded sabotage never bit): {big:?}"
+    );
+    assert!(big.idx_resumes > 0, "no resume ran on a target: {big:?}");
+    assert!(big.idx_drops > 0, "no committed DROP INDEX: {big:?}");
+    assert!(
+        big.idx_scans_served > 10,
+        "too few served index scans: {big:?}"
+    );
+    assert!(
+        big.idx_scans_refused > 0,
+        "no justified index-scan refusal (the ladder's mid-states were \
+         never seen mid-flight): {big:?}"
+    );
+    // The bracketed sights saw the ladder's first two states somewhere
+    // in the run — the states amcheck's I-IDX-DO/I-IDX-WO arms check.
+    assert!(
+        big.idx_sights_delete_only > 0,
+        "no DeleteOnly sight: {big:?}"
+    );
+    assert!(
+        big.idx_sights_write_only > 0,
+        "no WriteOnly sight: {big:?}"
+    );
 }
 
 /// The long variant: 50 seeds, `#[ignore]`d (the card's item 5).
@@ -245,9 +306,23 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
             PDdl::AddBig => {
                 kinds.insert("addbig");
             }
+            // C-T6e3: both CONCURRENTLY modes of the online build, and
+            // its cleanup pair.
+            PDdl::CreateIndex(true) => {
+                kinds.insert("cidx_c");
+            }
+            PDdl::CreateIndex(false) => {
+                kinds.insert("cidx_p");
+            }
+            PDdl::DropIndex => {
+                kinds.insert("didx");
+            }
+            PDdl::ResumeBuild => {
+                kinds.insert("rsmb");
+            }
         }
     }
-    assert_eq!(kinds.len(), 7, "every DDL kind appears: {kinds:?}");
+    assert_eq!(kinds.len(), 11, "every DDL kind appears: {kinds:?}");
 }
 
 // ----- the checker can fail ---------------------------------------------------

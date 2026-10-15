@@ -14,6 +14,18 @@
 //! checks never run the engine at all; the crash matrix drives the
 //! `t6b_support` rig through `crash`) — the `t6b_support` pattern, so
 //! like it this module tree allows dead code per binary.
+//!
+//! **C-T6e3** extends the mix with the online build's surface (§7): the
+//! DDL session gains `CreateIndex(a, …)` (driven through
+//! `create_index_online` on the DDL thread — the ladder runs its own
+//! RC txns, so these ops are recorded outside the `Session` machinery),
+//! `DropIndex` and `ResumeBuild`; the DML mix gains `IndexScan(a
+//! range)` over whatever index the catalog currently holds on `a`. The
+//! runner brackets every index scan with its own catalog reads of the
+//! target's def (before and after the engine call, under the statement's
+//! AccessShare — see `runner::Session::index_scan`), so the checker can
+//! decide §4's "serves iff Public and built_at <= S" exactly, never from
+//! scheduling.
 #![allow(dead_code)]
 #![allow(unused_imports)]
 //!
@@ -134,6 +146,16 @@ pub enum OpKind {
     /// `ALTER TABLE t ADD COLUMN big text` (C-T6d2: the re-add —
     /// attnums are never reused, so it lands on a fresh one).
     AddBig,
+    /// `CREATE INDEX [CONCURRENTLY] ON t (a)` (C-T6e3: §7's online
+    /// path, non-unique, on the DDL thread).
+    CreateIndex,
+    /// `DROP INDEX` (C-T6e3).
+    DropIndex,
+    /// `ALTER INDEX … RESUME` (C-T6e3: `resume_build`).
+    ResumeBuild,
+    /// `SELECT * FROM t WHERE a BETWEEN .. AND ..` served by an index
+    /// (C-T6e3: `Db::index_scan`).
+    IndexScan,
 }
 
 impl OpKind {
@@ -156,6 +178,10 @@ impl OpKind {
             OpKind::Truncate => "TRUNC",
             OpKind::DropBig => "DROPB",
             OpKind::AddBig => "ADDB",
+            OpKind::CreateIndex => "CIDX",
+            OpKind::DropIndex => "DIDX",
+            OpKind::ResumeBuild => "RSMB",
+            OpKind::IndexScan => "Ixa",
         }
     }
 }
@@ -240,6 +266,75 @@ pub enum OpDetail {
     Truncate {
         new_sid: u64,
     },
+    // ---- C-T6e3: the online-build surface (§7) -------------------------
+    /// `CREATE INDEX [CONCURRENTLY] ON t (a)` through `create_index_online`
+    /// on the DDL thread: the ladder runs its own RC txns (T0..T3), so
+    /// the op is recorded as its own pseudo-txn, not through a `Session`.
+    /// `built_at` is the snapshot the driver registered in T3 (captured
+    /// by the `after_register` hook) when the build published; `None`
+    /// when it failed (or never reached T3). Index DDL never changes a
+    /// row, so the model applies no effect — the checker's index-scan
+    /// arm and amcheck are its oracle.
+    CreateIndex {
+        concurrently: bool,
+        built_at: Option<u64>,
+    },
+    /// `DROP INDEX` of `oid` in the DDL session's own RC txn (`None`:
+    /// no live index existed — the no-op record).
+    DropIndex {
+        oid: Option<u64>,
+    },
+    /// `ALTER INDEX … RESUME` of `oid` through `resume_build` (its own
+    /// txns, like CreateIndex); `built_at` is the resumed publish's
+    /// registered snapshot, `None` when it failed or there was nothing
+    /// non-Public to resume.
+    ResumeBuild {
+        oid: Option<u64>,
+        built_at: Option<u64>,
+    },
+    /// `SELECT * FROM t WHERE a BETWEEN lo AND hi` through `Db::index_scan`
+    /// on `oid` — `None` bounds are unbounded. `pre`/`post` are the
+    /// runner's own catalog reads of the target's def, taken under the
+    /// statement's AccessShare **before and after** the engine call (see
+    /// `runner::Session::index_scan` for why both, and why the bracket
+    /// is exact): they record what the engine's own def read could and
+    /// could not have seen, which is how the checker decides §4's
+    /// "serves iff Public and built_at <= S" without a scheduling
+    /// argument. `post` is `None` when the engine call failed before the
+    /// post read (the refusal arm needs only `pre`); both sights are
+    /// `Absent` for the no-target no-op (`oid` is `None`).
+    IndexScan {
+        oid: Option<u64>,
+        lo: Option<i64>,
+        hi: Option<i64>,
+        pre: IdxSight,
+        post: Option<IdxSight>,
+    },
+}
+
+/// What a catalog read of one index's def saw (C-T6e3): absent, or its
+/// state and `built_at` (§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdxSight {
+    Absent,
+    Seen {
+        state: nucleus_catalog::IndexState,
+        built_at: u64,
+    },
+}
+
+impl IdxSight {
+    /// §4: whether an index this sight describes may serve a read at
+    /// snapshot `s` — `Public` and `built_at <= s`.
+    pub fn serves(self, s: u64) -> bool {
+        match self {
+            IdxSight::Seen {
+                state: nucleus_catalog::IndexState::Public,
+                built_at,
+            } => built_at <= s,
+            _ => false,
+        }
+    }
 }
 
 /// What the engine answered.
@@ -387,6 +482,30 @@ pub enum POp {
     SetBig(i64, u32),
     /// (pk)
     NullBig(i64),
+    /// (choice index into the live indexes on `a`, seeded range pick) —
+    /// C-T6e3's index scan. The range pick resolves to its bounds purely
+    /// ([`a_range`]): a quarter of the picks scan the whole index, the
+    /// rest a bounded window over the setup's `a = A_BASE + pk` domain.
+    IndexScan(u32, u32),
+}
+
+/// The `a`-range of a seeded index-scan pick (C-T6e3): `(None, None)` is
+/// unbounded (a full scan, NULLs included); otherwise the inclusive
+/// `[lo, hi]` window over `a`, `lo <= hi`. Pure — the same pick always
+/// resolves to the same range, and the recorded detail carries the
+/// resolution so the checker never re-derives it.
+pub fn a_range(pick: u32) -> (Option<i64>, Option<i64>) {
+    if pick % 4 == 3 {
+        return (None, None);
+    }
+    let span = pick / 4;
+    let lo = A_BASE + i64::from(span % 9);
+    let hi = A_BASE + i64::from((span / 9) % 9);
+    if lo <= hi {
+        (Some(lo), Some(hi))
+    } else {
+        (Some(hi), Some(lo))
+    }
 }
 
 /// A DML program: a fixed level and 1-4 fixed statements, independent of
@@ -399,6 +518,12 @@ pub struct Prog {
 
 /// The pk domain of `t` (the card's `pk ∈ 0..8`).
 pub const PKS: i64 = 9;
+
+/// The setup writes `a = A_BASE + pk` (runner::Rig::setup_rows), so the
+/// seeded index-scan windows ([`a_range`]) land on the surviving setup
+/// rows' `a` values; every other write's `a` is a fresh derived constant
+/// far outside the domain, so a window's match set is legible.
+pub const A_BASE: i64 = 1000;
 
 /// The `big` lengths the card names (C-T6d2): 100 stays inline, 3000 is
 /// one chunk, 20000 is three.
@@ -432,6 +557,7 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
     const W_DELETE_U: u64 = 9;
     const W_SET_BIG: u64 = 10;
     const W_NULL_BIG: u64 = 4;
+    const W_INDEX_SCAN: u64 = 12;
     const TOTAL: u64 = W_GET
         + W_SCAN
         + W_INSERT
@@ -441,7 +567,8 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
         + W_SCAN_U
         + W_DELETE_U
         + W_SET_BIG
-        + W_NULL_BIG;
+        + W_NULL_BIG
+        + W_INDEX_SCAN;
     let mut ops = Vec::with_capacity(n + 1);
     for _ in 0..n {
         let pk = rng.below(PKS as u64) as i64;
@@ -472,6 +599,8 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
             ops.push(POp::DeleteU(rng.next() as u32));
         } else if pick(W_SET_BIG) {
             ops.push(POp::SetBig(pk, rng.next() as u32));
+        } else if pick(W_INDEX_SCAN) {
+            ops.push(POp::IndexScan(rng.next() as u32, rng.next() as u32));
         } else {
             ops.push(POp::NullBig(pk));
         }
@@ -496,6 +625,16 @@ pub enum PDdl {
     /// `ADD COLUMN big text` — the re-add (C-T6d2). The generator pairs
     /// the drop and the re-add on adjacent DDL indices (see [`gen_ddl`]).
     AddBig,
+    /// `CREATE INDEX [CONCURRENTLY] ON t (a)` (C-T6e3: §7's online path,
+    /// non-unique — `create_index_online` on the DDL thread; the flag
+    /// seeds CONCURRENTLY).
+    CreateIndex(bool),
+    /// `DROP INDEX` (C-T6e3: one of the live indexes on `a`, resolved at
+    /// execution; a no-op record when none exists).
+    DropIndex,
+    /// `ALTER INDEX … RESUME` (C-T6e3: `resume_build` of a non-Public
+    /// index, resolved at execution; a no-op record when none exists).
+    ResumeBuild,
 }
 
 /// The DDL program of `(seed, index)`: one DDL statement, its own txn.
@@ -522,9 +661,21 @@ fn gen_ddl_draw(seed: u64, index: u32) -> PDdl {
     const W_DROP: u64 = 12;
     const W_SNN: u64 = 14;
     const W_DNN: u64 = 14;
-    const W_TRUNC: u64 = 30;
+    // Kept at the pre-C-T6e3 *share* of the stream (the new index ops
+    // dilute a constant weight, which the checker-can-fail mini run's
+    // refused-read-plus-truncate shape notices).
+    const W_TRUNC: u64 = 38;
     const W_DROP_BIG: u64 = 4;
-    let mut r = rng.below(W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC + W_DROP_BIG);
+    // C-T6e3: the online-build surface. CREATE INDEX (plain or
+    // CONCURRENTLY, seeded) joins the stream often enough that builds
+    // overlap DML reliably; RESUME and DROP INDEX clean up after them.
+    const W_CREATE_IDX: u64 = 16;
+    const W_RESUME: u64 = 8;
+    const W_DROP_IDX: u64 = 8;
+    let mut r = rng.below(
+        W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC + W_DROP_BIG + W_CREATE_IDX + W_RESUME
+            + W_DROP_IDX,
+    );
     if r < W_ADD {
         return PDdl::AddColumn(rng.below(2) == 0);
     }
@@ -543,6 +694,18 @@ fn gen_ddl_draw(seed: u64, index: u32) -> PDdl {
     r -= W_DNN;
     if r < W_TRUNC {
         return PDdl::Truncate;
+    }
+    r -= W_TRUNC;
+    if r < W_CREATE_IDX {
+        return PDdl::CreateIndex(rng.below(2) == 0);
+    }
+    r -= W_CREATE_IDX;
+    if r < W_RESUME {
+        return PDdl::ResumeBuild;
+    }
+    r -= W_RESUME;
+    if r < W_DROP_IDX {
+        return PDdl::DropIndex;
     }
     // The fallthrough covers the big-cycle draw: the drop. Its re-add is
     // the forced successor; a drop over an absent column is a no-op

@@ -97,6 +97,44 @@ pub struct Stats {
     pub big_drops: usize,
     /// Committed AddBig DDLs.
     pub big_adds: usize,
+    // ---- C-T6e3: the online-build surface (§7) ------------------------
+    /// `CREATE INDEX` driver calls that published (returned Ok).
+    pub idx_builds_ok: usize,
+    /// `CREATE INDEX` driver calls that failed (55000s from the seeded
+    /// sabotage, or anything else).
+    pub idx_builds_failed: usize,
+    /// `RESUME` driver calls that ran on a target (published or failed);
+    /// no-target no-ops are counted by `idx_resumes_noop`.
+    pub idx_resumes: usize,
+    /// `RESUME` no-target no-ops (nothing non-Public existed).
+    pub idx_resumes_noop: usize,
+    /// Committed `DROP INDEX` statements that named a target.
+    pub idx_drops: usize,
+    /// Index-scan statements that ran against a target (the no-target
+    /// no-ops are `idx_scans_noop`).
+    pub idx_scans: usize,
+    /// Index scans the engine served (`index_scan` returned rows); each
+    /// was checked against the model at its snapshot.
+    pub idx_scans_served: usize,
+    /// Served scans whose post-sight was not Public with `built_at <= S`
+    /// — impossible per the bracket, a violation.
+    pub idx_scans_served_bad: usize,
+    /// Refusals (0A000) whose pre-sight already served at the statement's
+    /// snapshot — the engine refused an index §4 obliges it to serve, a
+    /// violation.
+    pub idx_scans_refused_bad: usize,
+    /// Refusals (0A000) justified by the recorded sights (non-Public, or
+    /// Public with `built_at > S`).
+    pub idx_scans_refused: usize,
+    /// 42704 refusals (the target absent at the engine's read).
+    pub idx_scans_absent: usize,
+    /// No-target no-op index scans (no live index existed).
+    pub idx_scans_noop: usize,
+    /// Recorded sights (pre or post) of a DeleteOnly index — the soak's
+    /// coverage bar for the ladder's first state (I-IDX-DO's subject).
+    pub idx_sights_delete_only: usize,
+    /// The same for WriteOnly (I-IDX-WO's subject).
+    pub idx_sights_write_only: usize,
 }
 
 /// The verdict: every violation found, plus the stats.
@@ -274,6 +312,24 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
             } else {
                 model.state_at(op.snap)
             };
+            // C-T6e3: every index-scan record's bracketed sights feed the
+            // ladder-state coverage counters (I-IDX-DO/I-IDX-WO's
+            // subjects must actually have been seen mid-run).
+            if let OpDetail::IndexScan { pre, post, .. } = &op.detail {
+                for sight in [*pre].into_iter().chain(*post) {
+                    match sight {
+                        super::IdxSight::Seen {
+                            state: nucleus_catalog::IndexState::DeleteOnly,
+                            ..
+                        } => v.stats.idx_sights_delete_only += 1,
+                        super::IdxSight::Seen {
+                            state: nucleus_catalog::IndexState::WriteOnly,
+                            ..
+                        } => v.stats.idx_sights_write_only += 1,
+                        _ => {}
+                    }
+                }
+            }
             match (&op.detail, &op.out) {
                 // ---- reads on t ----------------------------------------
                 (OpDetail::Get { pk }, OpOut::Row(obs)) => {
@@ -421,6 +477,169 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                     }
                     v.stats.reads_checked += 1;
                 }
+                // ---- C-T6e3: an index scan of t (§4, §7) -----------------
+                // The no-target no-op (no live index existed).
+                (OpDetail::IndexScan { oid: None, .. }, OpOut::Ok) => {
+                    v.stats.idx_scans_noop += 1;
+                }
+                (OpDetail::IndexScan { oid: Some(oid), lo, hi, post, .. }, OpOut::RowsT(obs)) => {
+                    v.stats.idx_scans += 1;
+                    // Served: §4's rule at the statement's snapshot, from
+                    // the bracket's post-sight (the engine's own def read
+                    // sits at or below it in publicness; a DROP cannot
+                    // intervene under the statement's AccessShare).
+                    let Some(post) = *post else {
+                        v.violations.push(format!(
+                            "{}: a served index scan of {oid} recorded no post-sight",
+                            where_op(txn, idx)
+                        ));
+                        continue;
+                    };
+                    if !post.serves(op.snap) {
+                        v.stats.idx_scans_served_bad += 1;
+                        v.violations.push(format!(
+                            "{}: index_scan of {oid} served a read at S={} although the \
+                             post-sight is {:?} — not Public with built_at <= S",
+                            where_op(txn, idx),
+                            op.snap,
+                            post
+                        ));
+                    }
+                    let Some(ver) = op.def_version else {
+                        v.violations.push(format!(
+                            "{}: an index scan recorded no def version",
+                            where_op(txn, idx)
+                        ));
+                        continue;
+                    };
+                    // Exactly the ScanT expectation, filtered by the
+                    // recorded `a`-range: the model at the statement's
+                    // snapshot plus own writes (an RC statement whose
+                    // window contains a foreign TRUNCATE answers from the
+                    // post-truncate storage, where every foreign row has
+                    // ts > S — the empty floor), rendered at the reported
+                    // def version.
+                    let mut expected: BTreeMap<i64, Vec<(u16, Option<Value>)>> = base
+                        .t
+                        .iter()
+                        .map(|(pk, row)| (*pk, model.render(ver, row)))
+                        .collect();
+                    for (pk, ov) in &own.t {
+                        match ov {
+                            super::model::Overlay::Row(row) => {
+                                expected.insert(*pk, model.render(ver, row));
+                            }
+                            super::model::Overlay::Gone => {
+                                expected.remove(pk);
+                            }
+                        }
+                    }
+                    expected.retain(|_, row| in_a_range(row, *lo, *hi));
+                    let mut got: BTreeMap<i64, &Vec<(u16, Option<Value>)>> =
+                        obs.iter().map(|(pk, r)| (*pk, r)).collect();
+                    if got.len() != obs.len() {
+                        v.violations.push(format!(
+                            "{}: the index scan returned a duplicate pk",
+                            where_op(txn, idx)
+                        ));
+                    }
+                    let mut pks: Vec<i64> = expected.keys().copied().collect();
+                    pks.extend(got.keys().copied().filter(|pk| !expected.contains_key(pk)));
+                    for pk in pks {
+                        match (got.remove(&pk), expected.get(&pk)) {
+                            (Some(g), Some(e)) => {
+                                if !rows_eq(g, e) {
+                                    v.violations.push(format!(
+                                        "{}: index scan pk {pk}: {}",
+                                        where_op(txn, idx),
+                                        diff(g, e)
+                                    ));
+                                }
+                            }
+                            (Some(g), None) => v.violations.push(format!(
+                                "{}: the index scan returned pk {pk} the model does not have \
+                                 (a-range {:?}..{:?}): {:?}",
+                                where_op(txn, idx),
+                                lo,
+                                hi,
+                                g
+                            )),
+                            (None, Some(e)) => v.violations.push(format!(
+                                "{}: the index scan missed pk {pk} (a-range {:?}..{:?}): \
+                                 model has {:?}",
+                                where_op(txn, idx),
+                                lo,
+                                hi,
+                                e
+                            )),
+                            (None, None) => {}
+                        }
+                    }
+                    v.stats.idx_scans_served += 1;
+                    v.stats.reads_checked += 1;
+                }
+                (OpDetail::IndexScan { oid: Some(oid), pre, .. }, OpOut::Err(code)) => {
+                    v.stats.idx_scans += 1;
+                    match code.as_str() {
+                        // §4's refusal: the engine found the def
+                        // non-Public or `built_at > S`. Sound against the
+                        // pre-sight (the engine's own def read sits at or
+                        // above it in publicness): if the pre-sight
+                        // already served, the engine's read did too and
+                        // the refusal was wrong.
+                        "0A000" => {
+                            if pre.serves(op.snap) {
+                                v.stats.idx_scans_refused_bad += 1;
+                                v.violations.push(format!(
+                                    "{}: index_scan of {oid} refused with 0A000 at S={} although \
+                                     the pre-sight is {:?} — Public with built_at <= S must serve",
+                                    where_op(txn, idx),
+                                    op.snap,
+                                    pre
+                                ));
+                            } else {
+                                v.stats.idx_scans_refused += 1;
+                            }
+                        }
+                        // The engine's catalog read found no index row;
+                        // the pre-sight must agree (a DROP cannot
+                        // intervene under the statement's AccessShare, and
+                        // an oid is never re-created).
+                        "42704" => {
+                            if *pre != super::IdxSight::Absent {
+                                v.violations.push(format!(
+                                    "{}: index_scan of {oid} answered 42704 although the \
+                                     pre-sight is {:?}",
+                                    where_op(txn, idx),
+                                    pre
+                                ));
+                            }
+                            v.stats.idx_scans_absent += 1;
+                        }
+                        // The RR/SER relation rule's answer, like every
+                        // other read of `t`.
+                        "40001" | "40P01" => {}
+                        _ => {
+                            v.violations.push(format!(
+                                "{}: an index scan failed with {code}",
+                                where_op(txn, idx)
+                            ));
+                        }
+                    }
+                }
+                // A shape the runner never records.
+                (OpDetail::IndexScan { oid: None, .. }, _) => {
+                    v.violations.push(format!(
+                        "{}: a no-target index scan recorded an outcome",
+                        where_op(txn, idx)
+                    ));
+                }
+                (OpDetail::IndexScan { oid: Some(_), .. }, OpOut::Ok) => {
+                    v.violations.push(format!(
+                        "{}: a targeted index scan recorded no rows and no error",
+                        where_op(txn, idx)
+                    ));
+                }
                 // ---- a read that failed with something no read raises ----
                 (OpDetail::Get { .. } | OpDetail::ScanT | OpDetail::ScanU, OpOut::Err(code)) => {
                     if code != "40001" && code != "40P01" {
@@ -471,6 +690,36 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                         if committed && op.kind == OpKind::AddBig {
                             v.stats.big_adds += 1;
                         }
+                        // C-T6e3's per-kind index-DDL counters (a failed
+                        // CreateIndex is the seeded sabotage's 55000, or
+                        // a genuine engine refusal).
+                        match op.kind {
+                            OpKind::CreateIndex => {
+                                if matches!(txn.fate, Fate::Committed(_)) {
+                                    v.stats.idx_builds_ok += 1;
+                                } else {
+                                    v.stats.idx_builds_failed += 1;
+                                }
+                            }
+                            OpKind::ResumeBuild => {
+                                if matches!(
+                                    &op.detail,
+                                    OpDetail::ResumeBuild { oid: None, .. }
+                                ) {
+                                    v.stats.idx_resumes_noop += 1;
+                                } else {
+                                    v.stats.idx_resumes += 1;
+                                }
+                            }
+                            OpKind::DropIndex => {
+                                if committed
+                                    && matches!(&op.detail, OpDetail::DropIndex { oid: Some(_) })
+                                {
+                                    v.stats.idx_drops += 1;
+                                }
+                            }
+                            _ => {}
+                        }
                         if op.kind == OpKind::Truncate && matches!(op.out, OpOut::Ok) {
                             v.stats.truncates_committed += match txn.fate {
                                 Fate::Committed(_) => 1,
@@ -493,6 +742,27 @@ fn u_identity_of(row: &[(u16, Option<Value>)]) -> Option<i64> {
     }
 }
 
+/// The attnum of the fixture's `a` column (t's second column) — the
+/// indexed column the recorded a-ranges filter on. The workload's DDL
+/// never drops it (DROP COLUMN targets only added columns, and DropBig
+/// owns `big`'s attnum 4).
+const A_ATTNUM: u16 = 2;
+
+/// Whether a rendered row of `t` falls inside an index scan's recorded
+/// `a`-range: `[lo, hi]` inclusive over the int8 value, with NULL (or a
+/// non-int8 value, which no write of this workload produces) excluded —
+/// NULLs sort last in the index key, so no bounded range reaches them.
+/// An unbounded scan (`None` bounds) keeps everything.
+fn in_a_range(row: &[(u16, Option<Value>)], lo: Option<i64>, hi: Option<i64>) -> bool {
+    let (Some(lo), Some(hi)) = (lo, hi) else {
+        return true;
+    };
+    match row.iter().find(|(a, _)| *a == A_ATTNUM) {
+        Some((_, Some(Value::Int8(v)))) => lo <= *v && *v <= hi,
+        _ => false,
+    }
+}
+
 /// The TRUNCATE-window check: an RR/SER read of `t` that *succeeded*
 /// although it answered from the storage a foreign TRUNCATE installed
 /// after its snapshot `S` — the engine must have answered 40001 (C-T0
@@ -509,7 +779,9 @@ fn check_truncate_windows(h: &History, truncates: &[(u64, u64, u16)], v: &mut Ve
         for (idx, op) in txn.ops.iter().enumerate() {
             let successful_read = matches!(
                 (&op.detail, &op.out),
-                (OpDetail::Get { .. }, OpOut::Row(_)) | (OpDetail::ScanT, OpOut::RowsT(_))
+                (OpDetail::Get { .. }, OpOut::Row(_))
+                    | (OpDetail::ScanT, OpOut::RowsT(_))
+                    | (OpDetail::IndexScan { oid: Some(_), .. }, OpOut::RowsT(_))
             );
             if successful_read && truncate_window(truncates, txn, idx) {
                 let ts = truncates
@@ -1140,6 +1412,25 @@ impl Effects {
                     a,
                     seen: !own.u.contains_key(&a) && at_s.u.contains_key(&a),
                 }),
+            // C-T6e3: an index scan read exactly the rows it returned —
+            // the entry-range SIREAD needs no phantom edges (a row
+            // outside the a-range was never read), so each returned base
+            // row contributes its own PkT (read-from its version's
+            // writer, antidependency to the key's final writer), which is
+            // exactly what the row fetch's point read forces.
+            OpDetail::IndexScan { oid: Some(_), .. } => {
+                if let OpOut::RowsT(rows) = &op.out {
+                    for (pk, _) in rows.iter().filter(|(pk, _)| base_t(*pk)) {
+                        self.stats.ser_reads += 1;
+                        self.ser_reads.push(SerRead {
+                            uid: txn.uid,
+                            snap: op.snap,
+                            scope: Scope::PkT { pk: *pk, seen: true },
+                        });
+                    }
+                }
+                return;
+            }
             _ => None,
         };
         if let Some(scope) = read {
