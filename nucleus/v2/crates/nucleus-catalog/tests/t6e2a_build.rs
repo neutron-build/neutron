@@ -32,6 +32,14 @@
 //!   the guard dropped before the ingest — a resurrected entry).
 //! - `index_scan_matches_scan_and_old_snapshot_refused`: a reader at
 //!   `S' < built_at` is 0A000.
+//! - `mid_step_drop_is_55000`: a DROP INDEX racing **inside** a step's
+//!   open window (`before_t1_commit`) surfaces as the build's 55000, not
+//!   XX000 — the step's entry ShareUpdateExclusive parks it out of the
+//!   window (the C-T6e2a gate's M-2).
+//! - `concurrent_second_build_same_index`: a CONCURRENTLY build parked
+//!   mid-T3 plus a concurrent `resume_build` serialize — the resume
+//!   parks on the parked build's SUE and, once the publish lands, fails
+//!   the build's own 55000 (the gate's M-1 interleaving, now ordered).
 
 mod t6b_support;
 
@@ -43,7 +51,9 @@ use std::thread;
 use std::time::Duration;
 
 use t6b_support::build_rig::{table_with_rows, BuildRig};
-use t6b_support::{i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, row_key_of, text_d, text_v};
+use t6b_support::{
+    i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, row_key_of, text_d, text_v, wait_until,
+};
 
 use nucleus_catalog::ddl::create_index_concurrently_in_block;
 use nucleus_catalog::{create_index_online, resume_build, BuildHooks, Db, IndexState, BUILD_CHUNK};
@@ -824,5 +834,172 @@ fn index_scan_matches_scan_and_old_snapshot_refused() {
         })
         .collect();
     assert_eq!(ids, vec![1, 2, 3], "index order (payload a, b, c)");
+    rig.shutdown();
+}
+
+/// A DROP INDEX racing **inside** a step's open window — begun while T1
+/// is between its re-read and its catalog write (`before_t1_commit`) —
+/// must surface as the build's 55000, never XX000 (the C-T6e2a gate's
+/// M-2). With §7's restored ordering T1 holds ShareUpdateExclusive from
+/// its entry: the drop's AccessExclusive parks on it, the drop lands
+/// only after T1's commit, and T2's `find`/`reread` is the 55000. With
+/// the entry lock removed (mutant ORDER-DROP) the drop commits inside
+/// the window and T1's own catalog write misses the row — XX000.
+#[test]
+fn mid_step_drop_is_55000() {
+    let rig = BuildRig::new();
+    let oid = table_with_rows(&rig, b"msd", &[(1, "a")]);
+
+    // The DROP INDEX thread. Under the restored ordering it parks
+    // acquiring AccessExclusive against T1's ShareUpdateExclusive — a
+    // wait-for edge appears while T1 is still inside its window; with
+    // the entry lock gone it commits straight away and sets `done`. The
+    // `before_t1_commit` hook returns once either is observed — never
+    // waiting for the park to clear, which under the restored ordering
+    // cannot happen before T1's own commit (that would be a
+    // self-deadlock). `after_t1` then holds the ladder in the gap until
+    // the drop has landed, so the next step observes it deterministically.
+    let done = Arc::new(AtomicBool::new(false));
+    let dropper: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let mut hooks = BuildHooks::default();
+    {
+        let done_h = Arc::clone(&done);
+        let dropper_h = Arc::clone(&dropper);
+        let db_h = Arc::clone(&rig.db);
+        hooks.before_t1_commit = Some(Box::new(move || {
+            let db_t = Arc::clone(&db_h);
+            let done_t = Arc::clone(&done_h);
+            let handle = thread::spawn(move || {
+                let idx_oid = only_idx_of(&db_t, oid);
+                let t = db_t.core.begin(Isolation::ReadCommitted);
+                let st = ok(nucleus_catalog::Stmt::new(&t, db_t.core.visible_ts()));
+                let ddl = Ddl::new(&db_t.core, &t, st.ctx());
+                ok(db_t.catalog.catalog_drop_index(&ddl, idx_oid));
+                ok(db_t.core.commit(t, SyncCommit::On));
+                ok(Resolver::run_once(&db_t.core));
+                done_t.store(true, Ordering::SeqCst);
+            });
+            *dropper_h.lock().expect("dropper") = Some(handle);
+            wait_until(BOUND, || {
+                done_h.load(Ordering::SeqCst) || !db_h.core.wait_edges().is_empty()
+            });
+        }));
+    }
+    {
+        let done_h = Arc::clone(&done);
+        hooks.after_t1 = Some(Box::new(move || {
+            // T1's txn is gone (its SUE released it): the drop that
+            // parked on it now runs to its commit before T2 begins.
+            wait_until(BOUND, || done_h.load(Ordering::SeqCst));
+        }));
+    }
+
+    let err = create_index_online(&rig.db, oid, &payload_def(), false, &hooks)
+        .expect_err("a drop inside the step's window fails the build");
+    assert_eq!(err.sqlstate(), "55000", "{err:?}");
+    // The drop really landed (after T1's commit, under the restored
+    // ordering); the failure path's own drop is the documented no-op.
+    assert!(rig.idxs_of(oid).is_empty(), "no index row survived");
+    // The dropper completed (the build observed the row gone); join it
+    // before the rig shuts its commit thread down.
+    let handle = dropper.lock().expect("dropper").take().expect("spawned");
+    handle.join().expect("dropper thread");
+    rig.shutdown();
+}
+
+/// The gate's M-1 interleaving, now serialized: a live CONCURRENTLY build
+/// parked mid-T3 (after its ingest, at `before_publish`) plus a
+/// concurrent `resume_build` on the same index. With §7's restored
+/// ordering the parked build's T3 holds ShareUpdateExclusive, the
+/// resume's first step parks acquiring its own SUE (observed as a
+/// wait-for edge) until the publish commits; its re-read then finds
+/// `Public` where it expected `WriteOnly` and fails the build's own
+/// 55000. The published `built_at` stays the parked build's `S` — no
+/// second scan, no regression. Mutant ORDER-DROP (the entry lock
+/// removed): the resume never parks, runs its whole ladder under the
+/// parked build and returns `Ok`. Mutant ORDER-SWAP (the lock taken
+/// after the re-read): the resume parks, but its state check already
+/// passed before the wait — it clobbers the publish back to `WriteOnly`
+/// and also returns `Ok`.
+#[test]
+fn concurrent_second_build_same_index() {
+    let rig = BuildRig::new();
+    let oid = table_with_rows(&rig, b"csb", &[(1, "a"), (2, "b")]);
+
+    // Build A: CONCURRENTLY, parked inside T3 right before its publish
+    // (its S registered, its entries ingested, its txn — and therefore
+    // its ShareUpdateExclusive — still open). The release latch is an
+    // `AtomicBool` (a hook must be `Sync`, and an mpsc receiver is not).
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let release = Arc::new(AtomicBool::new(false));
+    let release_h = Arc::clone(&release);
+    let s_a: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+    let s_hook = Arc::clone(&s_a);
+    let hooks_a = BuildHooks {
+        after_register: Some(Box::new(move |s| {
+            *s_hook.lock().expect("s_a") = Some(s);
+        })),
+        before_publish: Some(Box::new(move || {
+            let _ = parked_tx.send(());
+            // Bounded even if the release never comes (a hang is a
+            // failure, never a pass).
+            wait_until(BOUND, || release_h.load(Ordering::SeqCst));
+        })),
+        ..Default::default()
+    };
+    let db_a = Arc::clone(&rig.db);
+    let build_a =
+        spawn_run(move || create_index_online(&db_a, oid, &payload_def(), true, &hooks_a));
+    match parked_rx.recv_timeout(BOUND) {
+        Ok(()) => {}
+        Err(_) => panic!("build A never parked mid-T3"),
+    }
+
+    // The second build: `resume_build` on the same parked index.
+    let idx_oid = only_idx_of(&rig.db, oid);
+    let r_done = Arc::new(AtomicBool::new(false));
+    let r_done_w = Arc::clone(&r_done);
+    let db_r = Arc::clone(&rig.db);
+    let resume = spawn_run(move || {
+        let out = resume_build(&db_r, idx_oid, &BuildHooks::default());
+        r_done_w.store(true, Ordering::SeqCst);
+        out
+    });
+
+    // The serialized shape: the resume is parked on A's open T3 (the
+    // wait-for edge) and has not finished when A is released. Under the
+    // mutants no edge ever appears — the resume runs past the parked
+    // build and finishes on its own.
+    wait_until(BOUND, || {
+        !rig.core().wait_edges().is_empty() || r_done.load(Ordering::SeqCst)
+    });
+    let serialized = !rig.core().wait_edges().is_empty();
+    release.store(true, Ordering::SeqCst);
+
+    // A completes and publishes its own S.
+    let idx = match build_a.recv_timeout(BOUND) {
+        Ok(Ok(idx)) => idx,
+        Ok(Err(e)) => panic!("build A failed: {e:?}"),
+        Err(_) => panic!("build A never finished"),
+    };
+    // The resume: serialized to the build's own 55000.
+    let err = match resume.recv_timeout(BOUND) {
+        Ok(r) => r.expect_err("the second build must not run past the parked one"),
+        Err(_) => panic!("the resume never finished"),
+    };
+    assert_eq!(err.sqlstate(), "55000", "{err:?}");
+    assert!(
+        serialized,
+        "the resume parked on A's ShareUpdateExclusive before A was released"
+    );
+
+    // The publish is A's and only A's: Public at A's own S, amcheck clean.
+    let def = rig.def_of(idx);
+    assert_eq!(def.state, IndexState::Public);
+    let s_a = s_a.lock().expect("s_a").expect("A registered S");
+    assert_eq!(def.built_at, s_a.0, "built_at is A's S, never rewritten");
+    assert!(def.concurrently);
+    let report = rig.amcheck(oid);
+    assert!(report.is_clean(), "{report:?}");
     rig.shutdown();
 }
