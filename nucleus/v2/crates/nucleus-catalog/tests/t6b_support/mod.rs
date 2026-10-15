@@ -6,6 +6,8 @@
 //! never a pass.
 #![allow(dead_code)]
 
+pub mod build_rig;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

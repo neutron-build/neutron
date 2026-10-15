@@ -15,16 +15,19 @@
 //! [`Core::delete_entry`](nucleus_txn::boot::Core::delete_entry) and
 //! detoasted at the version's commit ts (never under a SIREAD).
 //!
-//! Not here yet: rewrite-requiring ALTERs (C-T6r) and the online index
-//! build ladder (§7, C-T6e) — CREATE INDEX itself is C-T6 §6.1's
-//! born-public path ([`Db::create_index`]), and a unique index born
-//! DeleteOnly or WriteOnly cannot exist through the SQL layer in 2.0
-//! (§6: the online path never builds unique indexes).
+//! Not here yet: rewrite-requiring ALTERs (C-T6r). The online index
+//! build ladder (§7) is the [`build`] module's driver
+//! ([`create_index_online`](build::create_index_online)) — CREATE INDEX
+//! inside a block stays §6.1's born-public path ([`Db::create_index`]),
+//! and a unique index born DeleteOnly or WriteOnly cannot exist through
+//! the SQL layer in 2.0 (§6: the online path never builds unique
+//! indexes).
 //! amcheck-lite (C-T6 §8: I-ROWFMT, I-IDX/I-UNIQUE, I-IDX-WO, I-IDX-DO
 //! at a registered snapshot) is the [`amcheck`] module's checker
 //! (I-TOAST is C-T6d2's).
 
 pub mod amcheck;
+pub mod build;
 pub mod db;
 pub mod ddl;
 pub mod defs;
@@ -32,8 +35,9 @@ pub mod error;
 mod index;
 pub mod toast;
 
+pub use build::{create_index_online, resume_build, BuildHooks, BUILD_CHUNK};
 pub use db::{table_lo, Db, IndexHandle, ScannedRow, Stmt, TableHandle, KEY_LIMIT};
-pub use ddl::{refuse_rewrite, RewriteKind};
+pub use ddl::{create_index_concurrently_in_block, refuse_rewrite, RewriteKind};
 pub use defs::{IndexColumn, IndexDef, IndexState};
 pub use error::DbError;
 pub use toast::{chunk_key, toast_id, TOAST_CHUNK, TOAST_MARK, TOAST_THRESHOLD};
