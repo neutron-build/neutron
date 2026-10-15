@@ -4,11 +4,14 @@
 //! storage and no index entry.
 //!
 //! [`Db::create_index`] is C-T6 §6.1's **born-public** CREATE INDEX — the
-//! only in-transaction build 2.0 has (the online ladder of §7 is later
-//! cards' work; a non-empty pre-existing relation inside a transaction is
-//! 0A000, §9.1). It never leaves the caller's txn: the entries for the
-//! txn's own rows are written through the same statement's write path, so
-//! an abort discards index and entries together.
+//! only in-transaction build 2.0 has (a non-empty pre-existing relation
+//! inside a transaction is 0A000, §9.1; the online ladder of §7 is the
+//! [`crate::build`] driver, run outside a block, and CREATE INDEX
+//! CONCURRENTLY inside a block is
+//! [`create_index_concurrently_in_block`]'s 25001). It never leaves the
+//! caller's txn: the entries for the txn's own rows are written through
+//! the same statement's write path, so an abort discards index and
+//! entries together.
 //!
 //! The §3 schema-evolution entry points ([`Db::add_column`],
 //! [`Db::drop_column`], [`Db::set_not_null`]) are PostgreSQL's
@@ -447,6 +450,15 @@ pub fn create_index_own_txn<K: OrderedKv>(
             Err(e)
         }
     }
+}
+
+/// CREATE INDEX CONCURRENTLY inside a transaction block (§9.1): 25001,
+/// always — the online driver
+/// ([`create_index_online`](crate::build::create_index_online)) owns its
+/// txns, so it can never run inside the caller's. The SQL layer routes
+/// every in-block CONCURRENTLY here instead of ever calling the driver.
+pub fn create_index_concurrently_in_block() -> Result<u64, DbError> {
+    Err(DbError::ActiveSqlTransaction)
 }
 
 /// The rewrite-requiring ALTERs (C-T6 §9.3-§9.4): each stays 0A000 until
