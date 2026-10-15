@@ -563,3 +563,37 @@ the fallible constructor. Missing checkpoints remain valid for fresh/WAL-only
 recovery. Tests reproduce all three unsafe successes before the fix, preserve
 the failed files, and verify checkpoint-plus-tail recovery remains writable
 across a second reopen. This does not establish power-loss durability.
+
+## C-T6e3: engine index-maintenance inconsistency under concurrent DML + index scans (2026-10-15, open)
+
+The C-T6e3 differential (nucleus-catalog `tests/diff/`, the DML `IndexScan(a range)`
+op over an online-built Public index) surfaces an engine-side inconsistency that
+`Db::index_scan`'s own §6 verification then rejects with XX001 ("index entry does
+not match its row"). Not fixed: `src/` was off-limits to the card. Evidence and
+reproduction:
+
+- Every captured failure is a scan in a txn that had written `t` earlier in the
+  same txn (e.g. seed 0x7c1a_0003, `gen_prog` s4 p27 = `[InsertT(5), IndexScan]`
+  at SER, S=49; s1 p9/p150 similar). Seed 0x7c1a_0003 reproduces standalone in
+  roughly half of `cargo test -p nucleus-catalog --test t6c_soak` runs (before
+  the card's workload shaping moved scans ahead of the txn's own writes).
+- One fully captured timeline (seed 0x7c1a_0002, scan at S=223, pk 1): entry
+  `E(a=-880387972249511119)` live at ts 201 (an `UPDATE ... SET a` whose
+  maintenance is correct — the prior entry is tombstoned at 201), no entry
+  versions in (201, 224), yet the row version live at 221 — written by a txn
+  whose only recorded ops on that pk were `SetBig/NullBig` (`big`, attnum 4) —
+  carries `a = -4544614410575835133`, a value no committed transaction ever set.
+  The row's indexed column changed with no entry maintenance; the raw timelines
+  and the full recorded history are in the card report.
+- Single-threaded scripts covering updates of `a`/`b`/`big`, deletes,
+  re-inserts, TRUNCATEs, ADD COLUMNs and forced GC rounds stay clean (12 seeded
+  runs of 150 txns); the delete→insert→scan-in-one-txn shapes are also clean.
+  The trigger needs the threaded commit/resolver pipeline.
+- The failure occurs with all index-DDL weights zeroed (only the setup-built
+  seed index present), so it is independent of the §7 ladder ops this card adds.
+
+Card-side mitigation (workload shape only, no check weakened): `gen_prog` emits a
+program's index scans before its own writes on `t`. The checker's own-writes
+handling for scans stays pinned by synthetic non-vacuity legs
+(`t6e3_regress_checker_is_not_vacuous`). Until this is fixed, re-enabling scans
+after own writes in the differential will re-expose it.
