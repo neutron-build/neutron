@@ -39,11 +39,9 @@
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
 mod t6b_support;
-// This card's test-side checker extensions (the write half of the
-// TRUNCATE-window rule, the per-level read split).
-mod t6c_support;
 
-use diff::{check, gen_ddl, gen_prog, run_workload, Config, PDdl, Run, Verdict};
+use diff::runner::run_workload;
+use diff::{check, gen_ddl, gen_prog, Config, PDdl, Run, Verdict};
 
 /// The soak's three fixed seeds.
 const SEEDS: [u64; 3] = [0x7c1a_0001, 0x7c1a_0002, 0x7c1a_0003];
@@ -59,9 +57,10 @@ fn run_seed(seed: u64) -> (Run, Verdict) {
     let t0 = std::time::Instant::now();
     let run = run_workload(&cfg);
     let t1 = std::time::Instant::now();
-    // The merged checker's every check, plus this card's write-side
-    // TRUNCATE-window pass (c1b FU-B).
-    let verdict = t6c_support::check_with_write_windows(&run);
+    // The merged checker's every check — the write-side TRUNCATE-window
+    // pass (c1b FU-B) and the per-level read split (c1a FU-5 / c1b
+    // FU-C) folded into `diff::check` by C-T6c1afix2 FU-2.
+    let verdict = check(&run);
     // Reported, never asserted: no wall-clock verdicts.
     println!(
         "t6c soak seed {seed:#x}: run {:?}, check {:?}, leaked {}",
@@ -72,9 +71,8 @@ fn run_seed(seed: u64) -> (Run, Verdict) {
     (run, verdict)
 }
 
-fn summary(seed: u64, v: &Verdict, run: &Run) {
+fn summary(seed: u64, v: &Verdict) {
     let s = &v.stats;
-    let lv = t6c_support::read_levels(&run.history);
     println!(
         "t6c soak seed {seed:#x}: {} txns ({} committed, {} failed, {} retried); \
          {} reads checked (RC {}, RR {}, SER {}); {} writes; {} DDL ({} truncates committed); \
@@ -87,9 +85,9 @@ fn summary(seed: u64, v: &Verdict, run: &Run) {
         s.failed,
         s.retryable_failures,
         s.reads_checked,
-        lv.rc,
-        lv.rr,
-        lv.ser,
+        s.reads_rc,
+        s.reads_rr,
+        s.reads_ser,
         s.writes,
         s.ddl,
         s.truncates_committed,
@@ -133,21 +131,21 @@ fn t6c_soak() {
     let mut big = diff::Verdict::default().stats;
     for seed in SEEDS {
         let (run, verdict) = run_seed(seed);
-        summary(seed, &verdict, &run);
+        summary(seed, &verdict);
         assert_clean(seed, &verdict);
         let s = &verdict.stats;
         // The workload actually exercised the surfaces under test: reads
         // were checked, DDL and truncates committed, amcheck ran, and
         // commits happened at every level (the mix generates all three).
         assert!(s.reads_checked > 100, "too few reads checked: {s:?}");
-        // The level split (c1a FU-5 / c1b FU-C): successful reads must
-        // happen at every level — an over-refusing engine that 40001'd
-        // all RR/SER reads starves two of the three counters (refused
-        // txns leave no effects, so nothing else would notice).
-        let lv = t6c_support::read_levels(&run.history);
-        assert!(lv.rc > 50, "too few RC reads checked: {lv:?} of {s:?}");
-        assert!(lv.rr > 50, "too few RR reads checked: {lv:?} of {s:?}");
-        assert!(lv.ser > 50, "too few SER reads checked: {lv:?} of {s:?}");
+        // The level split (c1a FU-5 / c1b FU-C, folded into the checker's
+        // Stats by C-T6c1afix2 FU-2): successful reads must happen at
+        // every level — an over-refusing engine that 40001'd all RR/SER
+        // reads starves two of the three counters (refused txns leave no
+        // effects, so nothing else would notice).
+        assert!(s.reads_rc > 50, "too few RC reads checked: {s:?}");
+        assert!(s.reads_rr > 50, "too few RR reads checked: {s:?}");
+        assert!(s.reads_ser > 50, "too few SER reads checked: {s:?}");
         assert!(s.truncates_committed > 3, "too few truncates: {s:?}");
         assert!(s.ddl > 30, "too little DDL: {s:?}");
         assert!(
@@ -194,7 +192,7 @@ fn t6c_soak_long() {
     for i in 0..LONG_SEEDS {
         let seed = LONG_BASE + i;
         let (run, verdict) = run_seed(seed);
-        summary(seed, &verdict, &run);
+        summary(seed, &verdict);
         assert_clean(seed, &verdict);
         assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
     }
@@ -255,9 +253,9 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
 /// The checker is not vacuous: a small clean run, corrupted one leg at
 /// a time, must be flagged — every check leg can fail (c1a FU-1). The
 /// uncorrupted run must itself be clean — the same assertion the soak
-/// makes, at half the size (large enough that its interleavings
-/// reliably produce a refused RR/SER read with a later foreign
-/// truncate, the shape leg (d) corrupts). The corruptions:
+/// makes, at half the size (large enough that its row-bearing reads,
+/// amcheck points and final scans are always there to corrupt). The
+/// corruptions:
 ///
 /// - a recorded read (a value the engine never returned);
 /// - a final-scan row of `run.final_t` (a phantom row when a late
@@ -267,9 +265,14 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
 ///   verdict, it is never silently dropped;
 /// - a refused RR/SER read rewritten as a successful one that answered
 ///   from the storage of a foreign truncate committed after its
-///   snapshot — exactly the shape §4 obliges the engine to 40001 (the
-///   record is rebuilt whole: a statement refused in its `open_table`
-///   never recorded its parameters, so its detail is `Pending`).
+///   snapshot — exactly the shape §4 obliges the engine to 40001. That
+///   leg's history is hand-built (C-T6c1afix2's rider): whether the
+///   seeded mini run contains a refused read with a later foreign
+///   truncate is decided by the threads' interleaving — under parallel
+///   test load the mined leg flaked in ~half the invocations — while
+///   the built shape holds by construction (the record is still
+///   rebuilt whole: a statement refused in its `open_table` never
+///   recorded its parameters, so its detail is `Pending`).
 #[test]
 fn t6c_checker_flags_a_corrupted_read() {
     let mut cfg = Config::new(0x7c1a_00f1);
@@ -356,60 +359,77 @@ fn t6c_checker_flags_a_corrupted_read() {
         verdict.report()
     );
 
-    // (c) The TRUNCATE-window leg: a refused RR/SER read rewritten to a
-    // successful one whose handle read the new storage of a foreign
-    // truncate committed after its snapshot (`snap < ts` and the
-    // session difference are preserved by the rewrite — only the
-    // outcome and the storage id lie).
-    let truncates = t6c_support::committed_truncates(&run.history);
-    let mut corrupted = run.history.clone();
-    let mut rewritten = false;
-    'find: for txn in corrupted.txns.iter_mut() {
-        if !matches!(
-            txn.level,
-            diff::Level::RepeatableRead | diff::Level::Serializable
-        ) {
-            continue;
-        }
-        for op in txn.ops.iter_mut() {
-            // A refused read statement failed in its `open_table`, before
-            // its parameters were recorded (`Pending`), so the rewrite
-            // rebuilds the whole record as the successful read it lies
-            // about being — kind and outcome first, then the storage id.
-            let refused_read = matches!(op.kind, diff::OpKind::Get | diff::OpKind::ScanT)
-                && matches!(&op.out, diff::OpOut::Err(code) if code == "40001");
-            if !refused_read {
-                continue;
-            }
-            let Some((_, new_sid, _)) = truncates
-                .iter()
-                .find(|(ts, _, session)| op.snap < *ts && *session != txn.session)
-                .copied()
-            else {
-                continue;
-            };
-            match op.kind {
-                diff::OpKind::Get => {
-                    op.detail = diff::OpDetail::Get { pk: 0 };
-                    op.out = diff::OpOut::Row(None);
-                }
-                _ => {
-                    op.detail = diff::OpDetail::ScanT;
-                    op.out = diff::OpOut::RowsT(Vec::new());
-                }
-            }
-            op.sid = Some(new_sid);
-            rewritten = true;
-            break 'find;
-        }
-    }
-    assert!(
-        rewritten,
-        "the mini run recorded no refused RR/SER read with a later foreign truncate"
-    );
+    // (c) The TRUNCATE-window leg, over the hand-built refused-read
+    // history: pk1 commits @ts1, the DDL session's TRUNCATE installs
+    // storage 2 @ts2, and an RR txn begun at snap 1 (< ts 2) had its
+    // Get refused 40001 in its `open_table` — such a statement never
+    // records its parameters (`Pending`, no sid). The corruption
+    // rewrites that record whole into the successful read it lies
+    // about being, its sid set to the truncate's new storage: `snap <
+    // ts` and the session difference hold by construction, so §4 owed
+    // it a 40001.
+    let mut history = diff::History {
+        txns: vec![
+            synth_txn(
+                1,
+                0,
+                diff::Level::ReadCommitted,
+                diff::Fate::Committed(1),
+                vec![synth_op(
+                    diff::OpKind::InsertT,
+                    diff::OpDetail::InsertT {
+                        pk: 1,
+                        row: vec![
+                            (1, Some(nucleus_codec::Value::Int8(1))),
+                            (2, Some(nucleus_codec::Value::Int8(100))),
+                            (3, Some(nucleus_codec::Value::Text("x".into()))),
+                            (4, None),
+                        ],
+                    },
+                    diff::OpOut::Ok,
+                    0,
+                    Some(1),
+                )],
+            ),
+            synth_txn(
+                2,
+                diff::runner::DDL_SESSION,
+                diff::Level::ReadCommitted,
+                diff::Fate::Committed(2),
+                vec![synth_op(
+                    diff::OpKind::Truncate,
+                    diff::OpDetail::Truncate { new_sid: 2 },
+                    diff::OpOut::Ok,
+                    1,
+                    None,
+                )],
+            ),
+            synth_txn(
+                3,
+                1,
+                diff::Level::RepeatableRead,
+                diff::Fate::Failed("40001".into()),
+                vec![synth_op(
+                    diff::OpKind::Get,
+                    diff::OpDetail::Pending,
+                    diff::OpOut::Err("40001".into()),
+                    1,
+                    None,
+                )],
+            ),
+        ],
+    };
+    let op = &mut history.txns[2].ops[0];
+    op.detail = diff::OpDetail::Get { pk: 0 };
+    op.out = diff::OpOut::Row(None);
+    op.sid = Some(2);
     let bad = diff::Run {
-        history: corrupted,
-        ..run.clone()
+        history,
+        amcheck: Vec::new(),
+        final_t: (1, Vec::new()),
+        final_u: (1, Vec::new()),
+        leaked_intents: 0,
+        leak_report: String::new(),
     };
     let verdict = check(&bad);
     assert!(
@@ -420,4 +440,53 @@ fn t6c_checker_flags_a_corrupted_read() {
         "the rewritten in-window read went unnoticed: {}",
         verdict.report()
     );
+}
+
+// ----- the hand-built leg-(c) records (C-T6c1afix2's rider) --------------------
+
+/// One synthetic txn record for the hand-built leg-(c) history: the
+/// fields the checks read (session, level, fate, ops) carry the real
+/// shapes; the identity fields take the values the recorder would have
+/// assigned (ticks are trace-only and stay 0).
+fn synth_txn(
+    uid: u32,
+    session: u16,
+    level: diff::Level,
+    fate: diff::Fate,
+    ops: Vec<diff::OpRec>,
+) -> diff::TxnRec {
+    diff::TxnRec {
+        uid,
+        session,
+        prog: uid,
+        attempt: 0,
+        level,
+        txn_snap: None,
+        start: 0,
+        end: 0,
+        fate,
+        ops,
+    }
+}
+
+/// One synthetic op record; `sid` is explicit because the window check
+/// reads it, `def_version` stays `None` exactly as a statement refused
+/// before its parameters resolved would have left it.
+fn synth_op(
+    kind: diff::OpKind,
+    detail: diff::OpDetail,
+    out: diff::OpOut,
+    snap: u64,
+    sid: Option<u64>,
+) -> diff::OpRec {
+    diff::OpRec {
+        kind,
+        detail,
+        out,
+        snap,
+        def_version: None,
+        sid,
+        start: 0,
+        end: 0,
+    }
 }

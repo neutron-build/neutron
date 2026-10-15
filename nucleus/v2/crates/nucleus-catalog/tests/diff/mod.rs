@@ -15,7 +15,6 @@
 //! `t6b_support` rig through `crash`) — the `t6b_support` pattern, so
 //! like it this module tree allows dead code per binary.
 #![allow(dead_code)]
-#![allow(unused_imports)]
 //!
 //! **Determinism.** A program is a pure function of
 //! `(seed, session, index)` ([`gen_prog`], [`gen_ddl`]); the checker
@@ -43,10 +42,19 @@ pub mod runner;
 
 /// C-T6c2's DDL crash-matrix helpers (the `t6b_support` hand-driven Rig
 /// over `Fault<MemKv>`, driven by the `t6c_crash` binary).
+// The tree-level `#![allow(unused_imports)]` C-T6c1afix2 FU-1 dropped
+// masked an unused `Stmt` here (C-T6d2's rewrite of this file left the
+// import); the file is outside that card's Touch list, so the allow
+// stays scoped to this module alone.
+#[allow(unused_imports)]
 pub mod crash;
 
+// The re-export serves the binaries that check runs (`t6c_soak`,
+// `t6c_regress`, `t6c_injected`); `t6c_crash` imports nothing of it and
+// is outside C-T6c1afix2's Touch list, so the per-name allow stands in
+// for the tree-level one FU-1 removed.
+#[allow(unused_imports)]
 pub use check::{check, Verdict};
-pub use runner::run_workload;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -304,8 +312,8 @@ pub struct History {
 }
 
 /// Append-only, thread-safe recorder: the uid and tick counters are one
-/// atomic each; ticks give the logical total order the TRUNCATE-window
-/// check relies on (see `check.rs`).
+/// atomic each (ticks order trace records only — never a verdict input;
+/// see the module docs).
 #[derive(Debug, Default)]
 pub struct Recorder {
     txns: Mutex<Vec<TxnRec>>,

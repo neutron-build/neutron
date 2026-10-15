@@ -1153,6 +1153,16 @@ impl<'r> Session<'r> {
         self.exec(0, OpKind::Get, |s, st, op| s.get(st, op, pk))
     }
 
+    /// A recorded `SELECT * FROM t` (C-T6c1afix2 FU-3, closing c2 FU-C's
+    /// letter): the statement runs the runner's real scan call-site —
+    /// the same `scan_t` a workload `POp::ScanT` drives, every row
+    /// rendered through the shared `record_t_row` path — so a script
+    /// can pin the checker's scan arm without reshaping a Get after
+    /// the fact.
+    pub fn op_scan_t(&mut self) -> Result<(), String> {
+        self.exec(0, OpKind::ScanT, |s, st, op| s.scan_t(st, op).map(|_| ()))
+    }
+
     /// A recorded `INSERT INTO t VALUES (pk, ..)` with explicit values.
     pub fn op_insert_t(&mut self, pk: i64, a: Value, b: Option<Value>) -> Result<(), String> {
         self.exec(0, OpKind::InsertT, move |s, st, op| {
