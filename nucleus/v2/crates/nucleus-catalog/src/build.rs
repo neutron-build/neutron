@@ -1,10 +1,14 @@
 //! C-T6 §7's online (non-unique) index build driver: `CREATE INDEX`
 //! outside a transaction block and `CREATE INDEX CONCURRENTLY`. Each step
 //! is its own ReadCommitted txn holding `ShareUpdateExclusive` on the
-//! relation (never SERIALIZABLE), every re-read runs at the latest
-//! committed catalog, and a step that finds the index row absent or in
-//! another state than it expects fails the build with 55000 ("index was
-//! dropped or changed concurrently").
+//! relation from its entry to its catalog write (§7: the lock is taken
+//! right after `find` names the owner, so the re-read, the wait, the scan
+//! and the ingest all run under it — the catalog call's own SUE
+//! re-acquisition is a re-entrant no-op for the same txn; never
+//! SERIALIZABLE), every re-read runs at the latest committed catalog, and
+//! a step that finds the index row absent or in another state than it
+//! expects fails the build with 55000 ("index was dropped or changed
+//! concurrently").
 //!
 //! The ladder ([`create_index_online`]):
 //!
@@ -66,6 +70,7 @@ use nucleus_txn::locks::RelLockMode;
 use nucleus_txn::read::{scan, NoSsi};
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
+use nucleus_txn::write::LockWait;
 use nucleus_txn::Ts;
 
 use crate::db::{chunk_prefix, ghost_id, table_lo, Db, IndexHandle, Stmt, TableHandle};
@@ -275,11 +280,14 @@ fn t0<K: OrderedKv>(
 
 /// T1: re-read at the latest committed catalog (expect `DeleteOnly`), wait
 /// the old lockers out at `Share`, rewrite the state to `WriteOnly`.
+/// §7's step ordering: the ShareUpdateExclusive is taken at the step's
+/// entry (right after `find`) and held to the catalog write below.
 fn t1<K: OrderedKv>(db: &Db<K>, idx_oid: u64, hooks: &BuildHooks) -> Result<(), DbError> {
     let txn = db.core.begin(Isolation::ReadCommitted);
     let body = (|| -> Result<(), DbError> {
         let st = Stmt::new(&txn, db.core.visible_ts())?;
         let owner = find(db, idx_oid)?.0;
+        lock_sue(db, &txn, owner)?;
         let (_, def, _) = reread(db, &st, owner, idx_oid, IndexState::DeleteOnly)?;
         run(&hooks.before_t1_wait);
         db.locks
@@ -310,11 +318,14 @@ fn t1<K: OrderedKv>(db: &Db<K>, idx_oid: u64, hooks: &BuildHooks) -> Result<(), 
 /// the row with its def unchanged; the commit ts is `f`. T3's snapshot is
 /// taken after this call's ack returned, so `S >= f` — the §7.3 argument
 /// that every txn committed at `S` is WriteOnly-aware rests on it.
+/// §7's step ordering: the ShareUpdateExclusive is taken at the step's
+/// entry (right after `find`) and held to the catalog write below.
 fn t2<K: OrderedKv>(db: &Db<K>, idx_oid: u64, hooks: &BuildHooks) -> Result<(), DbError> {
     let txn = db.core.begin(Isolation::ReadCommitted);
     let body = (|| -> Result<(), DbError> {
         let st = Stmt::new(&txn, db.core.visible_ts())?;
         let owner = find(db, idx_oid)?.0;
+        lock_sue(db, &txn, owner)?;
         let (_, def, _) = reread(db, &st, owner, idx_oid, IndexState::WriteOnly)?;
         run(&hooks.before_fence_wait);
         db.locks
@@ -340,11 +351,15 @@ fn t2<K: OrderedKv>(db: &Db<K>, idx_oid: u64, hooks: &BuildHooks) -> Result<(), 
 
 /// T3: the scan at `S`, the chunked ingest, the publish. See the module
 /// docs; the S guard stays registered until the last ingest returned.
+/// §7's step ordering: the ShareUpdateExclusive is taken at the step's
+/// entry (right after `find`), so the re-read that captures the storage
+/// ids, the scan and the ingest all run under it, through the publish.
 fn t3<K: OrderedKv>(db: &Db<K>, idx_oid: u64, hooks: &BuildHooks) -> Result<(), DbError> {
     let txn = db.core.begin(Isolation::ReadCommitted);
     let body = (|| -> Result<(), DbError> {
         let st = Stmt::new(&txn, db.core.visible_ts())?;
         let owner = find(db, idx_oid)?.0;
+        lock_sue(db, &txn, owner)?;
         // The current storage ids: a TRUNCATE between steps
         // re-allocated them, and the scan must use the new ones.
         let (rel, def, isid) = reread(db, &st, owner, idx_oid, IndexState::WriteOnly)?;
@@ -404,6 +419,29 @@ fn t3<K: OrderedKv>(db: &Db<K>, idx_oid: u64, hooks: &BuildHooks) -> Result<(), 
 }
 
 // ---- the pieces every step shares ------------------------------------------
+
+/// §7's step entry: take `ShareUpdateExclusive` on the owning relation
+/// for the step's txn, blocking (no timeout). Held to the step's catalog
+/// write: the re-read, the wait, the scan and the ingest all run under
+/// it, so a concurrent DROP INDEX or another build's step on the same
+/// relation cannot land inside the step's window — it parks, and the
+/// next step's `find`/`reread` turns it into the 55000. The step's
+/// catalog call re-acquires SUE re-entrantly (a no-op for the same
+/// txn), and the lock releases with the txn (commit §3 step 5 / the
+/// §7.1 abort).
+fn lock_sue<K: OrderedKv>(db: &Db<K>, txn: &Txn, owner: u64) -> Result<(), DbError> {
+    db.locks
+        .lock_relation(
+            &db.core,
+            txn,
+            owner,
+            RelLockMode::ShareUpdateExclusive,
+            LockWait::Block,
+            None,
+        )
+        .map(|_| ())
+        .map_err(DbError::Txn)
+}
 
 /// Commits `txn` (`SyncCommit::On`, waiting for the ack) when the body
 /// succeeded, aborts it (§7.1) when it failed. The ack is what makes the
