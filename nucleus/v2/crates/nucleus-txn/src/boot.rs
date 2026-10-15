@@ -14,15 +14,17 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use nucleus_kv::{Batch, Durability, OrderedKv, Snapshot, Value};
+use nucleus_kv::{Batch, Durability, Key, OrderedKv, Snapshot, Value};
 
 use crate::commit::{AbortFailStop, CommitMsg, FailStop, ReleaseHook};
 use crate::encoding::{
-    parse_sys_txn_key, sys_epoch_key, sys_gc_w_key, sys_log_key, sys_ts_hwm_key, sys_txn_key,
-    sys_txn_prefix, sys_txn_prefix_end,
+    decode_intent, end_key, intent_key, parse_key, parse_sys_txn_key, sys_epoch_key, sys_gc_w_key,
+    sys_log_key, sys_ts_hwm_key, sys_txn_key, sys_txn_prefix, sys_txn_prefix_end, version_key,
+    Entry, HEADER_LIVE,
 };
 use crate::latch::Latches;
-use crate::registry::Registry;
+use crate::registry::{Registry, SnapshotGuard};
+use crate::removal::{remove_intent, RemovalMode};
 use crate::status::StatusTable;
 use crate::wait::Waits;
 use crate::write::{NoRowLocks, NoSsiHook, RowLocks, SsiHook};
@@ -238,6 +240,132 @@ impl<K: OrderedKv> Core<K> {
         // C-R0b: the fsync funnel itself.
         crate::rt::check(crate::rt::Blocking::Fsync, "Core::sync_wal");
         self.kv.sync_wal().map_err(crate::kv_err)
+    }
+
+    /// C-T0 §10 bulk ingest (the C-T6 §7 step-6 primitive): writes every
+    /// entry as a committed version at `snap.ts()` — no intents, no
+    /// write-set log, no status record.
+    ///
+    /// Preconditions (the caller's guarantees, not checked here): `snap` is
+    /// registered and stays registered until this returns (so `W <= S` and
+    /// GC never removes an ingested version); the `ranges` are the storage
+    /// ranges of a **non-public** index; the C-T6 §7 fence (step 3) has
+    /// committed at or below `S`.
+    ///
+    /// Steps, in order:
+    /// 1. Collect and validate every entry before any I/O: each logical key
+    ///    inside one of `ranges`, logical keys strictly ascending. A
+    ///    violation is [`TxnError::Invariant`] and writes nothing.
+    /// 2. Through one registered view, plan the removal of every intent in
+    ///    `[intent_key(first), end_key(last))` as `gc`'s `retire_locked`
+    ///    plans (the owner's status looked up under the view, I-TRUNC):
+    ///    `Resolve` for a visible commit at or below `S`, `Discard` for an
+    ///    `Aborted` owner, and the rest left in place — §4 step 1 returns a
+    ///    committed intent's data without reading versions, so an
+    ///    unresolved one would shadow the ingested entry. Each removal
+    ///    runs through [`remove_intent`] (§7.3, latch prefix `None`:
+    ///    online indexes are never deferrable).
+    /// 3. Sync the WAL, so no ingested entry is durable before the commits
+    ///    and resolutions it was derived from (I-WAL-ORDER).
+    /// 4. One [`OrderedKv::ingest_sorted`] of every entry as
+    ///    `version_key(L, S)` with a live header and the payload.
+    pub fn ingest_versions(
+        &self,
+        snap: &SnapshotGuard<'_>,
+        ranges: &[(Key, Key)],
+        entries: &mut dyn Iterator<Item = (Key, Vec<u8>)>,
+    ) -> Result<(), TxnError> {
+        // C-R0ba: the call's wait includes the WAL sync of step 3 — Fsync.
+        crate::rt::check(crate::rt::Blocking::Fsync, "Core::ingest_versions");
+
+        // Step 1: collect and validate everything before any I/O.
+        let mut collected: Vec<(Key, Value)> = Vec::new();
+        for (logical, payload) in entries {
+            if !ranges.iter().any(|(lo, hi)| {
+                logical.as_slice() >= lo.as_slice() && logical.as_slice() < hi.as_slice()
+            }) {
+                return Err(TxnError::Invariant(format!(
+                    "ingest_versions: entry key {logical:?} outside every range of {ranges:?}"
+                )));
+            }
+            if collected.last().is_some_and(|(prev, _)| logical <= *prev) {
+                return Err(TxnError::Invariant(format!(
+                    "ingest_versions: entry keys not strictly ascending ({logical:?} after {:?})",
+                    collected.last().map(|(k, _)| k),
+                )));
+            }
+            collected.push((logical, payload));
+        }
+        let (first, last) = match (collected.first(), collected.last()) {
+            (Some((f, _)), Some((l, _))) => (f.clone(), l.clone()),
+            // An empty chunk: nothing to ingest, no span to resolve.
+            _ => return Ok(()),
+        };
+
+        // Step 2: plan the span's removals under one registered view, then
+        // run them (the `retire_locked` pattern: the status is looked up
+        // while the view is open, so the plan cannot hit the §7.4 window;
+        // `remove_intent` re-reads under the latch and no-ops if the async
+        // resolver won the race).
+        struct PlannedRemoval {
+            key: Key,
+            owner: TxnId,
+            mode: RemovalMode,
+        }
+        let view = self.open_view();
+        let mut plan: Vec<PlannedRemoval> = Vec::new();
+        let span_lo = intent_key(&first);
+        let span_hi = end_key(&last);
+        for entry in view.scan(
+            (
+                Bound::Included(span_lo.as_slice()),
+                Bound::Excluded(span_hi.as_slice()),
+            ),
+            false,
+        ) {
+            let (stored, value) = entry.map_err(kv_err)?;
+            let Some((logical, Entry::Intent)) = parse_key(&stored) else {
+                continue; // versions of keys in the span
+            };
+            let intent = decode_intent(&value)?;
+            let owner = intent.txn;
+            let mode = match self.status.lookup_for_intent(owner)? {
+                // A commit at or below S is a visible commit (S itself was
+                // admitted at or below visible_ts, §3.1).
+                TxnStatus::Committed(c) if c <= snap.ts() => RemovalMode::Resolve,
+                TxnStatus::Aborted => RemovalMode::Discard,
+                // Pending, or a commit above S: left in place (§10 resolves
+                // only commits at or below S; a Pending intent does not
+                // shadow — §4 step 1 falls through to versions).
+                _ => continue,
+            };
+            plan.push(PlannedRemoval {
+                key: logical.to_vec(),
+                owner,
+                mode,
+            });
+        }
+        drop(view);
+        for r in &plan {
+            remove_intent(self, &r.key, None, r.owner, r.mode)?;
+        }
+
+        // Step 3: the WAL sync before the ingest (§10).
+        self.sync_wal()?;
+
+        // Step 4: one ingest, every entry at S with a live header.
+        let ts = snap.ts();
+        let mut stored: Vec<(Key, Value)> = Vec::with_capacity(collected.len());
+        for (logical, payload) in collected {
+            let mut value = Vec::with_capacity(1 + payload.len());
+            value.push(HEADER_LIVE);
+            value.extend_from_slice(&payload);
+            stored.push((version_key(&logical, ts), value));
+        }
+        self.kv
+            .ingest_sorted(&mut stored.into_iter())
+            .map_err(kv_err)?;
+        Ok(())
     }
 
     /// Gives up the KV store: the shutdown/reopen path (§7.2 boot, §3). The

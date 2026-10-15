@@ -2,11 +2,17 @@
 //!
 //! Every write reaches the live inner store at once, so it is visible as in a
 //! real engine. A `Durability::No` write is also queued as unsynced. A
-//! `Durability::Yes` write, `sync_wal` or `ingest_sorted` (a durability barrier
-//! here, like an engine's ingest with its manifest sync) makes the whole queue
-//! durable. `crash` rebuilds the inner store from its base plus the durable log
-//! plus a prefix of the queue: it drops a suffix of unsynced batches, never a
-//! gap and never part of a batch (C-T0 I-WAL-ORDER).
+//! `Durability::Yes` write or `sync_wal` makes the whole queue durable.
+//! `ingest_sorted` is durable on return but is **not** a barrier for earlier
+//! unsynced writes: it is appended to the durable log without syncing the
+//! queue, faithful to RocksDB's ingest (the ingested file is synced; earlier
+//! WAL writes behind it are not), so a test can observe a missing sync
+//! (C-T6e1, C-T0 §10). `crash` rebuilds the inner store from its base plus, in
+//! original order, every durable op (synced writes and ingests) and a prefix
+//! of the unsynced writes — each kept write replayed at its position relative
+//! to the ingests (an ingest replaces a same-key entry: newest wins). It drops
+//! a suffix of unsynced batches, never a gap and never part of a batch (C-T0
+//! I-WAL-ORDER).
 //!
 //! The registered GC filter and watermark are re-installed on the rebuilt
 //! store. Compaction is not logged: data a filter dropped may come back after a
@@ -26,15 +32,31 @@ pub struct Fault<K: OrderedKv> {
 
 struct State<K> {
     live: K,
-    durable: Vec<Logged>,
-    unsynced: Vec<Batch>,
+    /// Every logged op in call order: writes (marked durable or not) and
+    /// ingests (always durable). One log, not a durable list plus a queue,
+    /// is what lets `crash` replay each kept unsynced write at its
+    /// original position relative to the ingests.
+    log: Vec<Logged>,
     gc: Option<Arc<dyn GcFilter>>,
     watermark: Option<u64>,
 }
 
 enum Logged {
-    Write(Batch),
+    /// A write batch. `durable` is set by a `Durability::Yes` write, a
+    /// `sync_wal`, or the replay of a crash that kept it.
+    Write { batch: Batch, durable: bool },
+    /// An ingest: durable on return, never a barrier for the writes above.
     Ingest(Vec<(Key, Value)>),
+}
+
+impl<K: OrderedKv> State<K> {
+    /// Unsolicited writes a crash may still drop.
+    fn unsynced_len(&self) -> usize {
+        self.log
+            .iter()
+            .filter(|e| matches!(e, Logged::Write { durable: false, .. }))
+            .count()
+    }
 }
 
 impl<K: OrderedKv> Fault<K> {
@@ -45,8 +67,7 @@ impl<K: OrderedKv> Fault<K> {
             rebuild: Box::new(rebuild),
             st: Mutex::new(State {
                 live: initial,
-                durable: Vec::new(),
-                unsynced: Vec::new(),
+                log: Vec::new(),
                 gc: None,
                 watermark: None,
             }),
@@ -59,7 +80,7 @@ impl<K: OrderedKv> Fault<K> {
 
     /// Unsynced batches a crash may drop.
     pub fn unsynced_len(&self) -> usize {
-        self.lock().unsynced.len()
+        self.lock().unsynced_len()
     }
 
     /// Runs `f` on the live inner store (backend-specific ops such as compaction).
@@ -72,7 +93,7 @@ impl<K: OrderedKv> Fault<K> {
     /// On error the store is unchanged.
     pub fn crash(&self, keep: usize) -> Result<usize> {
         let mut st = self.lock();
-        let keep = keep.min(st.unsynced.len());
+        let keep = keep.min(st.unsynced_len());
         let fresh = (self.rebuild)()?;
         if let Some(f) = &st.gc {
             fresh.set_gc_filter(Box::new(SharedFilter(Arc::clone(f))));
@@ -80,20 +101,47 @@ impl<K: OrderedKv> Fault<K> {
         if let Some(w) = st.watermark {
             fresh.set_gc_watermark(w)?;
         }
-        for entry in &st.durable {
+        // Replay in original order: every durable op (synced writes and
+        // ingests) and, at their original positions relative to the
+        // ingests, the first `keep` unsynced writes. Replay into `new_log`
+        // first so an error leaves the store (state and live) unchanged.
+        let mut new_log: Vec<Logged> = Vec::with_capacity(st.log.len());
+        let mut kept = 0usize;
+        let mut replay = Ok(());
+        for entry in &st.log {
             match entry {
-                Logged::Write(b) => fresh.write(b.clone(), Durability::No)?,
-                Logged::Ingest(e) => fresh.ingest_sorted(&mut e.iter().cloned())?,
+                Logged::Ingest(entries) => {
+                    replay = fresh.ingest_sorted(&mut entries.iter().cloned());
+                    if replay.is_err() {
+                        break;
+                    }
+                    new_log.push(Logged::Ingest(entries.clone()));
+                }
+                Logged::Write { batch, durable } => {
+                    // A durable write always replays; an unsynced one only
+                    // while it is inside the kept prefix.
+                    if !*durable && kept >= keep {
+                        continue; // a dropped suffix write
+                    }
+                    replay = fresh.write(batch.clone(), Durability::No);
+                    if replay.is_err() {
+                        break;
+                    }
+                    if !*durable {
+                        kept += 1;
+                    }
+                    new_log.push(Logged::Write {
+                        batch: batch.clone(),
+                        durable: true,
+                    });
+                }
             }
         }
-        for b in &st.unsynced[..keep] {
-            fresh.write(b.clone(), Durability::No)?;
-        }
+        replay?;
         fresh.sync_wal()?;
-        let kept: Vec<Batch> = st.unsynced.drain(..).take(keep).collect();
-        st.durable.extend(kept.into_iter().map(Logged::Write));
+        st.log = new_log;
         st.live = fresh;
-        Ok(keep)
+        Ok(kept)
     }
 
     /// `crash` with the kept count drawn deterministically from `seed`,
@@ -111,10 +159,16 @@ impl<K: OrderedKv> OrderedKv for Fault<K> {
         let mut st = self.lock();
         st.live.write(batch.clone(), sync)?;
         match sync {
-            Durability::No => st.unsynced.push(batch),
+            Durability::No => st.log.push(Logged::Write {
+                batch,
+                durable: false,
+            }),
             Durability::Yes => {
                 make_durable(&mut st);
-                st.durable.push(Logged::Write(batch));
+                st.log.push(Logged::Write {
+                    batch,
+                    durable: true,
+                });
             }
         }
         Ok(())
@@ -139,8 +193,10 @@ impl<K: OrderedKv> OrderedKv for Fault<K> {
         let entries: Vec<(Key, Value)> = entries.collect();
         let mut st = self.lock();
         st.live.ingest_sorted(&mut entries.iter().cloned())?;
-        make_durable(&mut st);
-        st.durable.push(Logged::Ingest(entries));
+        // Durable on return, but **not** a barrier: the unsynced queue
+        // stays unsynced (RocksDB's ingest syncs the file, not the WAL
+        // behind it; C-T6e1). Only its own entries become durable.
+        st.log.push(Logged::Ingest(entries));
         Ok(())
     }
 
@@ -165,8 +221,11 @@ impl<K: OrderedKv> OrderedKv for Fault<K> {
 }
 
 fn make_durable<K>(st: &mut State<K>) {
-    let queued = std::mem::take(&mut st.unsynced);
-    st.durable.extend(queued.into_iter().map(Logged::Write));
+    for entry in &mut st.log {
+        if let Logged::Write { durable, .. } = entry {
+            *durable = true;
+        }
+    }
 }
 
 struct SharedFilter(Arc<dyn GcFilter>);
