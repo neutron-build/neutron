@@ -28,7 +28,8 @@ use nucleus_codec::row::{value_repr_eq, Datum, RowError, TableSchema};
 use nucleus_codec::{decode_key_prefix, encode_key, KeyColumn, KeyType, Value};
 use nucleus_kv::{Key, OrderedKv};
 use nucleus_txn::boot::Core;
-use nucleus_txn::catalog::{index_ranges, table_range, Catalog, IdxStorage};
+use nucleus_txn::catalog::{index_ranges, table_range, Catalog, Ddl, IdxStorage};
+use nucleus_txn::commit::SyncCommit;
 use nucleus_txn::encoding::VersionValue;
 use nucleus_txn::locks::{LockManager, RelLockMode};
 use nucleus_txn::read::{read_key, scan, NoSsi};
@@ -115,6 +116,83 @@ impl<K: OrderedKv> Db<K> {
             locks,
             catalog,
         }
+    }
+
+    /// Opens the handle the way a boot does (C-T6 §7, §9.5): assembles it
+    /// as [`Db::new`] and runs [`Db::cleanup_unfinished_builds`]
+    /// **before returning it** — every non-`Public` index whose def says a
+    /// plain (non-`CONCURRENTLY`) build is dropped, so no statement can
+    /// see a crashed plain build's half-built index. A CONCURRENTLY
+    /// build's non-public index is left (§7 Failure) for
+    /// [`resume_build`](crate::build::resume_build) or DROP INDEX.
+    ///
+    /// The core must have a commit pipeline running (or be driven by
+    /// one): the cleanup commits each drop and waits for its ack.
+    pub fn open(
+        core: Arc<Core<K>>,
+        ssi: Arc<Ssi>,
+        locks: Arc<LockManager>,
+        catalog: Catalog,
+    ) -> Result<Db<K>, DbError> {
+        let db = Db::new(core, ssi, locks, catalog);
+        db.cleanup_unfinished_builds()?;
+        Ok(db)
+    }
+
+    /// Drops every non-`Public` index of the committed catalog whose def
+    /// has `concurrently == false`, each in its own RC txn (§7 Failure:
+    /// a plain build that crashed leaves its index to the next open, not
+    /// to the crash). A drop that finds the row already gone is the
+    /// no-op `catalog_drop_index` makes it (a concurrent DROP INDEX won
+    /// the race); any other failure fails the open.
+    pub fn cleanup_unfinished_builds(&self) -> Result<(), DbError> {
+        // The committed catalog, read through a ghost ctx at visible_ts:
+        // at open nothing else runs.
+        let ctx = ReadCtx {
+            txn: ghost_id(&self.core),
+            snapshot: self.core.visible_ts(),
+            stmt_seq: 0,
+        };
+        let rels = {
+            let view = self.core.open_view();
+            Catalog::scan_rels(&self.core, &view, &ctx).map_err(DbError::Txn)?
+        };
+        let mut doomed: Vec<u64> = Vec::new();
+        for (oid, _) in rels {
+            let idxs = {
+                let view = self.core.open_view();
+                Catalog::scan_idxs_of_rel(&self.core, &view, &ctx, oid).map_err(DbError::Txn)?
+            };
+            for idx in idxs {
+                let def = IndexDef::decode(&idx.def)?;
+                if def.state != IndexState::Public && !def.concurrently {
+                    doomed.push(idx.oid);
+                }
+            }
+        }
+        for idx_oid in doomed {
+            let txn = self.core.begin(Isolation::ReadCommitted);
+            let body = (|| -> Result<(), DbError> {
+                let st = Stmt::new(&txn, self.core.visible_ts())?;
+                let ddl = Ddl::new(&self.core, &txn, st.ctx());
+                self.catalog
+                    .catalog_drop_index(&ddl, idx_oid)
+                    .map_err(DbError::Txn)?;
+                Ok(())
+            })();
+            match body {
+                Ok(()) => {
+                    self.core
+                        .commit(txn, SyncCommit::On)
+                        .map_err(DbError::Txn)?;
+                }
+                Err(e) => {
+                    self.core.abort(txn).map_err(DbError::Txn)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// §4's statement entry: take the relation lock in `mode` (a conflict
