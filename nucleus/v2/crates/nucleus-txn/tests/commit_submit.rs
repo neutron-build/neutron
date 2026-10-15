@@ -419,11 +419,15 @@ fn failed_pre_commit_aborts_the_txn_and_wakes_waiters() {
     assert_eq!(&*ssi.aborts.lock().expect("aborts"), &[t1_id]);
 
     // The waiter woke, retried past the aborted intent, and placed.
-    match rx.recv_timeout(Duration::from_millis(100)) {
+    // The 1 s bounds (C-R0bFIX-4, parent gate N-3): wake deadlines
+    // only, never correctness bounds — correct code answers in
+    // microseconds, but 100 ms proved flake-shaped under full-crate
+    // parallel test load.
+    match rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(nucleus_txn::write::RowOutcome::Applied)) => {}
         other => panic!("the waiter was not woken and placed after the abort: {other:?}"),
     }
-    assert!(rx2.recv_timeout(Duration::from_millis(100)).is_ok());
+    assert!(rx2.recv_timeout(Duration::from_secs(1)).is_ok());
 
     // Both cleanups were queued (T1's by the abort inside commit_submit,
     // T2's by its own abort): one resolver round, then no intent remains.

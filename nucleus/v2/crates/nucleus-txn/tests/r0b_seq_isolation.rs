@@ -16,6 +16,11 @@
 //! so a cached `seq_next` of another id still answers. Under the OM-3
 //! shape the parked probe holds the module mutex and the other id
 //! starves.
+//!
+//! C-R0bFIX-4 adds the probe's positive direction: after the release,
+//! with id 5's slot demonstrably in the module map, the existence probe
+//! must answer true — the pin that keeps every negative
+//! `seq_slot_exists_for_tests` assertion honest.
 
 mod r0b_support;
 
@@ -175,6 +180,17 @@ fn paused_reservation_blocks_only_its_own_id() {
         core.seq_reservations_for_tests(5),
         Some(1),
         "one reservation covers both values of id 5's first block"
+    );
+    // C-R0bFIX-4 (the C-R0bbfix follow-up-1 rider, re-carded): pin the
+    // probe's positive direction. A slot for id 5 demonstrably exists
+    // here — the reservation count above just read it — so the probe
+    // must answer true. Without this, a probe hardwired `false` passes
+    // every "no slot after a refusal" pin (r0b_contract (i)) while the
+    // module map keeps whatever a moved entry check inserted, and the
+    // negative pin dissolves silently.
+    assert!(
+        core.seq_slot_exists_for_tests(5),
+        "the probe sees a slot that exists",
     );
     // The reservations probe, released with everything else: it read id
     // 5's slot through the per-id mutex and saw the one reservation.
