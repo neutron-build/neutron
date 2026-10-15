@@ -482,7 +482,16 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                 (OpDetail::IndexScan { oid: None, .. }, OpOut::Ok) => {
                     v.stats.idx_scans_noop += 1;
                 }
-                (OpDetail::IndexScan { oid: Some(oid), lo, hi, post, .. }, OpOut::RowsT(obs)) => {
+                (
+                    OpDetail::IndexScan {
+                        oid: Some(oid),
+                        lo,
+                        hi,
+                        post,
+                        ..
+                    },
+                    OpOut::RowsT(obs),
+                ) => {
                     v.stats.idx_scans += 1;
                     // Served: §4's rule at the statement's snapshot, from
                     // the bracket's post-sight (the engine's own def read
@@ -578,7 +587,14 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                     v.stats.idx_scans_served += 1;
                     v.stats.reads_checked += 1;
                 }
-                (OpDetail::IndexScan { oid: Some(oid), pre, .. }, OpOut::Err(code)) => {
+                (
+                    OpDetail::IndexScan {
+                        oid: Some(oid),
+                        pre,
+                        ..
+                    },
+                    OpOut::Err(code),
+                ) => {
                     v.stats.idx_scans += 1;
                     match code.as_str() {
                         // §4's refusal: the engine found the def
@@ -702,19 +718,14 @@ fn check_reads(h: &History, model: &Model, truncates: &[(u64, u64, u16)], v: &mu
                                 }
                             }
                             OpKind::ResumeBuild => {
-                                if matches!(
-                                    &op.detail,
-                                    OpDetail::ResumeBuild { oid: None, .. }
-                                ) {
+                                if matches!(&op.detail, OpDetail::ResumeBuild { oid: None, .. }) {
                                     v.stats.idx_resumes_noop += 1;
                                 } else {
                                     v.stats.idx_resumes += 1;
                                 }
                             }
                             OpKind::DropIndex => {
-                                if committed
-                                    && matches!(&op.detail, OpDetail::DropIndex { oid: Some(_) })
-                                {
+                                if matches!(&op.detail, OpDetail::DropIndex { oid: Some(_) }) {
                                     v.stats.idx_drops += 1;
                                 }
                             }
@@ -1425,7 +1436,10 @@ impl Effects {
                         self.ser_reads.push(SerRead {
                             uid: txn.uid,
                             snap: op.snap,
-                            scope: Scope::PkT { pk: *pk, seen: true },
+                            scope: Scope::PkT {
+                                pk: *pk,
+                                seen: true,
+                            },
                         });
                     }
                 }

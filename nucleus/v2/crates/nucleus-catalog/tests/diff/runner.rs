@@ -1695,13 +1695,7 @@ fn built_at_hook(slot: &Arc<Mutex<Option<u64>>>) -> BuildHooks {
 /// I-IDX-WO stays clean, and — when the build was CONCURRENTLY — the
 /// non-Public index stays for a later `ResumeBuild` (§7's remedy) or
 /// `DropIndex`, which is what makes those ops live in the soak.
-fn run_create_index(
-    rig: &Rig,
-    index: u32,
-    attempt: u32,
-    concurrently: bool,
-    seed: u64,
-) -> Outcome {
+fn run_create_index(rig: &Rig, index: u32, attempt: u32, concurrently: bool, seed: u64) -> Outcome {
     // A seeded half of the builds are sabotaged (see the module docs):
     // enough that an unfinished index is usually live, so the DML scans'
     // prefer-unfinished pick reliably meets the ladder's mid-states

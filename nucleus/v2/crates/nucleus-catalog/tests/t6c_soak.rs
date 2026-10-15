@@ -242,10 +242,7 @@ fn t6c_soak() {
         big.idx_sights_delete_only > 0,
         "no DeleteOnly sight: {big:?}"
     );
-    assert!(
-        big.idx_sights_write_only > 0,
-        "no WriteOnly sight: {big:?}"
-    );
+    assert!(big.idx_sights_write_only > 0, "no WriteOnly sight: {big:?}");
 }
 
 /// The long variant: 50 seeds, `#[ignore]`d (the card's item 5).
@@ -349,8 +346,11 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
 fn t6c_checker_flags_a_corrupted_read() {
     let mut cfg = Config::new(0x7c1a_00f1);
     cfg.threads = 4;
-    cfg.progs = 100;
-    cfg.ddl_txns = 100;
+    // The soak's size (C-T6e3): the index DDL the stream now carries
+    // slows it enough that a smaller mini run's refused-read-plus-later
+    // truncate shape no longer lands reliably.
+    cfg.progs = 200;
+    cfg.ddl_txns = 200;
     let run = run_workload(&cfg);
     let verdict = check(&run);
     assert!(verdict.is_clean(), "{}", verdict.report());
@@ -435,7 +435,11 @@ fn t6c_checker_flags_a_corrupted_read() {
     // successful one whose handle read the new storage of a foreign
     // truncate committed after its snapshot (`snap < ts` and the
     // session difference are preserved by the rewrite — only the
-    // outcome and the storage id lie).
+    // outcome, the snapshot and the storage id lie; C-T6e3 also moves
+    // the snapshot itself under the chosen truncate, so the leg no
+    // longer depends on the organic window landing — the index DDL the
+    // stream now carries slowed it enough that a smaller mini run's
+    // shape no longer did).
     let truncates = t6c_support::committed_truncates(&run.history);
     let mut corrupted = run.history.clone();
     let mut rewritten = false;
@@ -450,15 +454,16 @@ fn t6c_checker_flags_a_corrupted_read() {
             // A refused read statement failed in its `open_table`, before
             // its parameters were recorded (`Pending`), so the rewrite
             // rebuilds the whole record as the successful read it lies
-            // about being — kind and outcome first, then the storage id.
+            // about being — kind and outcome first, then the snapshot
+            // and the storage id.
             let refused_read = matches!(op.kind, diff::OpKind::Get | diff::OpKind::ScanT)
                 && matches!(&op.out, diff::OpOut::Err(code) if code == "40001");
             if !refused_read {
                 continue;
             }
-            let Some((_, new_sid, _)) = truncates
+            let Some((ts, new_sid, _)) = truncates
                 .iter()
-                .find(|(ts, _, session)| op.snap < *ts && *session != txn.session)
+                .find(|(ts, _, session)| *ts > 1 && *session != txn.session)
                 .copied()
             else {
                 continue;
@@ -473,6 +478,7 @@ fn t6c_checker_flags_a_corrupted_read() {
                     op.out = diff::OpOut::RowsT(Vec::new());
                 }
             }
+            op.snap = ts - 1;
             op.sid = Some(new_sid);
             rewritten = true;
             break 'find;

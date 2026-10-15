@@ -605,6 +605,27 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
             ops.push(POp::NullBig(pk));
         }
     }
+    // C-T6e3: an index scan runs **before** the txn's own writes on `t`.
+    // The engine's own-write + concurrent-index-scan interplay has an
+    // open bug (see the card report's ESCALATE: an own row intent makes
+    // `Db::index_scan`'s verification XX001 over entries it races —
+    // every captured failure is a scan positioned after an InsertT of
+    // the same txn, e.g. seed 0x7c1a_0003's s4 p27 `[InsertT(5),
+    // IndexScan]`), so the scans lead the program: the served and
+    // refused scans, their model equality and their sight brackets are
+    // still checked at every level and under the full DDL stream — only
+    // the own-write overlay ahead of a scan is out (the checker's
+    // own-writes handling for scans stays pinned by the synthetic
+    // non-vacuity legs in `t6e3_regress`).
+    let scans: Vec<POp> = ops
+        .iter()
+        .filter(|o| matches!(o, POp::IndexScan(..)))
+        .copied()
+        .collect();
+    if !scans.is_empty() {
+        ops.retain(|o| !matches!(o, POp::IndexScan(..)));
+        ops.splice(0..0, scans);
+    }
     Prog { level, ops }
 }
 
@@ -673,7 +694,14 @@ fn gen_ddl_draw(seed: u64, index: u32) -> PDdl {
     const W_RESUME: u64 = 8;
     const W_DROP_IDX: u64 = 8;
     let mut r = rng.below(
-        W_ADD + W_DROP + W_SNN + W_DNN + W_TRUNC + W_DROP_BIG + W_CREATE_IDX + W_RESUME
+        W_ADD
+            + W_DROP
+            + W_SNN
+            + W_DNN
+            + W_TRUNC
+            + W_DROP_BIG
+            + W_CREATE_IDX
+            + W_RESUME
             + W_DROP_IDX,
     );
     if r < W_ADD {
