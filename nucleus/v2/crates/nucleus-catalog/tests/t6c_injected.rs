@@ -22,9 +22,11 @@
 //! ignoring `missing`), B2 of G2's `PerStmtSnapshot`, B4 of G2's
 //! application-level lost update — none of them needs an engine edit,
 //! which is the point: a differential that cannot fail proves nothing.
-//! B1 also has a scan-shape twin (c2's FU-C): the same schedule, its
-//! recorded Gets reshaped into a ScanT, so the read check's scan arm —
-//! the arm ScanT and the UpdateSet read-back share — is pinned too.
+//! B1 also has a scan-shape twin (c2's FU-C, driven through the
+//! runner's scripted `ScanT` since C-T6c1afix2 FU-3): the same
+//! schedule ending in a real `SELECT * FROM t`, so the read check's
+//! scan arm — the arm ScanT and the UpdateSet read-back share — is
+//! pinned through the runner's own scan call-site.
 
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
@@ -274,52 +276,46 @@ fn t6c_injected_b5_missing_default_as_null() {
 
 // ----- B1's scan twin: the read check's scan arm (c2 FU-C) -------------------
 
-/// The scan-shape twin of B1 (c2 FU-C): the same begin/ADD COLUMN/
-/// first-statements schedule, ending in a record whose rows flow
-/// through the read check's *scan* arm. The merged runner's scripted-op
-/// surface offers no ScanT (Get/Insert/Update/AddColumn only, and the
-/// runner itself is outside this card's enforced scope), so the script
-/// runs the real B1 bug over a Get of every pk — `record_t_row` renders
-/// each row at the begin-time v1 schema, the added column vanishing
-/// from every record — and then reshapes the txn's first recorded Get
-/// into the ScanT a real scan statement would have recorded, carrying
-/// every row the Gets returned. The scan arm must flag each buggy row
-/// for the decode rule's own reason; bug-free, the reshaped scan (and
-/// the remaining Gets) check clean.
+/// The scan-shape twin of B1 (c2 FU-C, on the runner's real scan
+/// call-site since C-T6c1afix2 FU-3): the same begin/ADD COLUMN/first-
+/// statement schedule, ending in one scripted `SELECT * FROM t`
+/// ([`Session::op_scan_t`] — the statement drives the same `scan_t` a
+/// workload `POp::ScanT` does, every row rendered through the shared
+/// `record_t_row` path). B1 renders each row at the begin-time v1
+/// schema, the added column vanishing from every record, and the scan
+/// arm must flag each buggy row for the decode rule's own reason;
+/// bug-free, the scan checks clean. The shape pin at the end asserts
+/// the record is exactly the one op the runner's scan recorded — a
+/// script reverted to the old Get-plus-reshape workaround fails it.
 fn b1_scan(bug: Bug, seed: u64) -> Run {
     let rig = rig();
     let d = derive_const(seed, DDL_SESSION, 0, 0, 0, TAG_DDL);
     let mut a = Session::begin_with(&rig, 1, 0, 0, Level::RepeatableRead, bug);
     // The DDL commits between the txn's begin and its first statement.
     add_column(&rig, "c9", d);
-    for pk in 0..9 {
-        a.op_get(pk)
-            .unwrap_or_else(|e| panic!("the get of pk {pk} failed: {e}"));
-    }
+    a.op_scan_t()
+        .unwrap_or_else(|e| panic!("the scan failed: {e}"));
     a.commit()
         .unwrap_or_else(|e| panic!("the commit failed: {e}"));
-    let mut run = rig.finish();
-    // Reshape: the txn's first Get becomes a ScanT over all the rows
-    // the Gets returned (the rows a full scan of the nine-row table
-    // returns); the other Gets stay as they are.
-    for txn in run.history.txns.iter_mut() {
-        if txn.session != 1 {
-            continue;
-        }
-        let rows: Vec<(i64, _)> = txn
-            .ops
-            .iter()
-            .filter_map(|op| match (&op.detail, &op.out) {
-                (OpDetail::Get { pk }, OpOut::Row(Some(row))) => Some((*pk, row.clone())),
-                _ => None,
-            })
-            .collect();
-        if let Some(op) = txn.ops.iter_mut().find(|op| op.kind == OpKind::Get) {
-            op.kind = OpKind::ScanT;
-            op.detail = OpDetail::ScanT;
-            op.out = OpOut::RowsT(rows);
-        }
-    }
+    let run = rig.finish();
+    // The scan-site pin: the txn's record is exactly one op — the
+    // ScanT the runner's scan call-site recorded (kind, detail and the
+    // nine rows) — never a Get reshaped into one after the fact (the
+    // pre-FU-3 workaround left the txn's eight other Gets recorded
+    // beside the reshaped op).
+    let scan = run
+        .history
+        .txns
+        .iter()
+        .find(|t| t.session == 1)
+        .expect("the script's scan txn is recorded");
+    assert_eq!(scan.ops.len(), 1, "the scan txn must record one op");
+    assert_eq!(scan.ops[0].kind, OpKind::ScanT);
+    assert!(matches!(scan.ops[0].detail, OpDetail::ScanT));
+    assert!(
+        matches!(&scan.ops[0].out, OpOut::RowsT(rows) if rows.len() == 9),
+        "the scan must return the fixture's nine rows"
+    );
     run
 }
 
