@@ -119,6 +119,7 @@ macro_rules! kv_conformance_tests {
             scan_all_bounds,
             ingest_sorted_visible_and_isolated,
             ingest_sorted_rejects_unsorted_atomically,
+            ingest_sorted_overwrites_existing_keys,
             checkpoint_round_trip,
             crash_keeps_durable_and_drops_suffix,
             crash_seeded_is_prefix,
@@ -545,6 +546,31 @@ pub fn ingest_sorted_rejects_unsorted_atomically<H: Harness>(h: &H) {
     assert_eq!(get(&kv, "u/9"), Some(k("v")));
 }
 
+/// Ingest replaces existing entries with the same key (newest wins), over
+/// a durable write and over a key an unsynced batch wrote, and the ingested
+/// values read back; under `Fault` the ingested entries survive `crash(k)`
+/// for every `k` (each kept unsynced write replays at its position before
+/// the ingest, so the ingest still wins).
+pub fn ingest_sorted_overwrites_existing_keys<H: Harness>(h: &H) {
+    let f = fault_over(h);
+    write(&f, vec![Op::Put(k("o/a"), k("old"))], Durability::Yes);
+    put(&f, "o/b", "old");
+    assert_eq!(f.unsynced_len(), 1);
+    let entries = vec![(k("o/a"), k("new")), (k("o/b"), k("new"))];
+    ok(f.ingest_sorted(&mut entries.clone().into_iter()), "ingest");
+    let model: Model = [(k("o/a"), k("new")), (k("o/b"), k("new"))]
+        .into_iter()
+        .collect();
+    assert_state(&f, &model, "ingest overwrites existing keys");
+    let unsynced = f.unsynced_len();
+    for keep in 0..=unsynced {
+        let before = f.unsynced_len();
+        let kept = ok(f.crash(keep), "crash");
+        assert_eq!(kept, keep.min(before));
+        assert_state(&f, &model, "ingested entries survive crash");
+    }
+}
+
 // ---- checkpoint ----
 
 /// A checkpoint reopens to exactly the state at checkpoint time, independent
@@ -683,8 +709,11 @@ pub fn crash_seeded_is_prefix<H: Harness>(h: &H) {
     }
 }
 
-/// `sync_wal`, a `Durability::Yes` write and `ingest_sorted` each make every
-/// earlier write durable; repeated crashes keep what was durable.
+/// `sync_wal` and a `Durability::Yes` write each make every earlier write
+/// durable; an ingest does **not** (C-T6e1: durable on return, no promise
+/// about earlier unsynced writes) — the ingested key survives a crash and
+/// an earlier unsynced write may not; repeated crashes keep what was
+/// durable.
 pub fn sync_covers_earlier_writes<H: Harness>(h: &H) {
     let f = fault_over(h);
     put(&f, "a", "1");
@@ -707,10 +736,10 @@ pub fn sync_covers_earlier_writes<H: Harness>(h: &H) {
         f.ingest_sorted(&mut vec![(k("h"), k("1"))].into_iter()),
         "ingest",
     );
+    assert_eq!(f.unsynced_len(), 1, "the ingest must not sync the queue");
     ok(f.crash(0), "crash");
-    model.insert(k("g"), k("1"));
     model.insert(k("h"), k("1"));
-    assert_state(&f, &model, "after ingest barrier");
+    assert_state(&f, &model, "after ingest: durable, unsynced g dropped");
 }
 
 // ---- GC filter ----

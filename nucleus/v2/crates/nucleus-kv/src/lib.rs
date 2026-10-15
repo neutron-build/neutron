@@ -136,7 +136,11 @@ pub trait OrderedKv: Send + Sync + 'static {
     /// Latest-state point read (no snapshot). Used under the C-T0 §5 latch.
     fn get_latest(&self, key: &[u8]) -> Result<Option<Value>>;
     /// Bulk-ingest pre-sorted, non-overlapping-with-live-writes data (online
-    /// index build, restore). Atomic.
+    /// index build, restore). Atomic. Durable on return. Replaces any
+    /// existing entry with the same key (newest wins). Promises nothing
+    /// about earlier unsynced writes. Whether a concurrent same-key write
+    /// is equivalent is the caller's guarantee (C-T0 §10), not checked
+    /// here.
     fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()>;
     /// Consistent on-disk checkpoint at `dir` (hard links where possible).
     /// `dir` must not exist yet. Includes every completed write.
