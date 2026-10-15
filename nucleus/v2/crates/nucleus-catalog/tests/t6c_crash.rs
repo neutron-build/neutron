@@ -75,7 +75,9 @@ fn t6c_crash_ddl_matrix() {
             drop(probe);
             let mut saw_new = false;
             let mut saw_old = false;
+            let mut cells = 0usize;
             for keep in 0..=n {
+                cells += 1;
                 if cell(*scenario, *b_sync, CrashAt::Keep(keep)) {
                     saw_new = true;
                 } else {
@@ -83,8 +85,22 @@ fn t6c_crash_ddl_matrix() {
                 }
             }
             for s in 0..8u64 {
+                cells += 1;
                 cell(*scenario, *b_sync, CrashAt::Seeded(seed_of(i, j, s)));
             }
+            // The enumeration itself is pinned (c2 FU-A): every keep in
+            // 0..=n plus the 8 seeded draws, n + 1 + 8 cells per variant.
+            // A trimmed sweep — a stride, {0, n} only, an off-by-one
+            // bound — keeps both outcome classes (keep=1 already loses
+            // the action's record, keep=n-1 already keeps it) and would
+            // otherwise silently lose the interior keeps the binding
+            // mutants die on.
+            assert_eq!(
+                cells,
+                n + 1 + 8,
+                "{scenario:?} / DML {b_sync:?}: the sweep must run every keep in 0..={n} \
+                 plus the 8 seeded draws"
+            );
             assert!(
                 saw_new && saw_old,
                 "{scenario:?} / DML {b_sync:?}: the sweep (n = {n}) must reach both \

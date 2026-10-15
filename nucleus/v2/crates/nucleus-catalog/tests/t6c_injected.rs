@@ -22,6 +22,9 @@
 //! ignoring `missing`), B2 of G2's `PerStmtSnapshot`, B4 of G2's
 //! application-level lost update — none of them needs an engine edit,
 //! which is the point: a differential that cannot fail proves nothing.
+//! B1 also has a scan-shape twin (c2's FU-C): the same schedule, its
+//! recorded Gets reshaped into a ScanT, so the read check's scan arm —
+//! the arm ScanT and the UpdateSet read-back share — is pinned too.
 
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
@@ -29,7 +32,10 @@ mod t6b_support;
 
 use diff::check;
 use diff::runner::{Bug, Rig, Session, DDL_SESSION};
-use diff::{derive_const, derive_text, Level, Run, Verdict, TAG_DDL, TAG_T_A, TAG_T_B, TAG_T_SET};
+use diff::{
+    derive_const, derive_text, Level, OpDetail, OpKind, OpOut, Run, Verdict, TAG_DDL, TAG_T_A,
+    TAG_T_B, TAG_T_SET,
+};
 use nucleus_codec::Value;
 
 /// The five fixed seeds every bug's script runs over.
@@ -180,7 +186,15 @@ fn b3(bug: Bug, seed: u64) -> Run {
 #[test]
 fn t6c_injected_b3_aborted_as_committed() {
     for seed in SEEDS {
-        reported(b3, Bug::AbortedAsCommitted, seed, "the model has");
+        // The tightened needle (c2 FU-B): the read no-row arm
+        // specifically — "the model has" alone also matches the write
+        // and final-state arms.
+        reported(
+            b3,
+            Bug::AbortedAsCommitted,
+            seed,
+            "returned no row; the model has",
+        );
         clean(b3, seed);
     }
 }
@@ -258,6 +272,65 @@ fn t6c_injected_b5_missing_default_as_null() {
     }
 }
 
+// ----- B1's scan twin: the read check's scan arm (c2 FU-C) -------------------
+
+/// The scan-shape twin of B1 (c2 FU-C): the same begin/ADD COLUMN/
+/// first-statements schedule, ending in a record whose rows flow
+/// through the read check's *scan* arm. The merged runner's scripted-op
+/// surface offers no ScanT (Get/Insert/Update/AddColumn only, and the
+/// runner itself is outside this card's enforced scope), so the script
+/// runs the real B1 bug over a Get of every pk — `record_t_row` renders
+/// each row at the begin-time v1 schema, the added column vanishing
+/// from every record — and then reshapes the txn's first recorded Get
+/// into the ScanT a real scan statement would have recorded, carrying
+/// every row the Gets returned. The scan arm must flag each buggy row
+/// for the decode rule's own reason; bug-free, the reshaped scan (and
+/// the remaining Gets) check clean.
+fn b1_scan(bug: Bug, seed: u64) -> Run {
+    let rig = rig();
+    let d = derive_const(seed, DDL_SESSION, 0, 0, 0, TAG_DDL);
+    let mut a = Session::begin_with(&rig, 1, 0, 0, Level::RepeatableRead, bug);
+    // The DDL commits between the txn's begin and its first statement.
+    add_column(&rig, "c9", d);
+    for pk in 0..9 {
+        a.op_get(pk)
+            .unwrap_or_else(|e| panic!("the get of pk {pk} failed: {e}"));
+    }
+    a.commit()
+        .unwrap_or_else(|e| panic!("the commit failed: {e}"));
+    let mut run = rig.finish();
+    // Reshape: the txn's first Get becomes a ScanT over all the rows
+    // the Gets returned (the rows a full scan of the nine-row table
+    // returns); the other Gets stay as they are.
+    for txn in run.history.txns.iter_mut() {
+        if txn.session != 1 {
+            continue;
+        }
+        let rows: Vec<(i64, _)> = txn
+            .ops
+            .iter()
+            .filter_map(|op| match (&op.detail, &op.out) {
+                (OpDetail::Get { pk }, OpOut::Row(Some(row))) => Some((*pk, row.clone())),
+                _ => None,
+            })
+            .collect();
+        if let Some(op) = txn.ops.iter_mut().find(|op| op.kind == OpKind::Get) {
+            op.kind = OpKind::ScanT;
+            op.detail = OpDetail::ScanT;
+            op.out = OpOut::RowsT(rows);
+        }
+    }
+    run
+}
+
+#[test]
+fn t6c_injected_b1_scan_arm() {
+    for seed in SEEDS {
+        reported(b1_scan, Bug::DecodeAtSeenSchema, seed, "ScanT pk 0");
+        clean(b1_scan, seed);
+    }
+}
+
 // ----- the whole suite, one verdict at a time ----------------------------------
 
 /// Every script over every seed in one place: the 5-of-5 split of each
@@ -271,7 +344,12 @@ fn t6c_injected_summary() {
     let suites: [Suite; 5] = [
         ("B1", b1, Bug::DecodeAtSeenSchema, "Get pk 0 returned"),
         ("B2", b2, Bug::RrPerStmtSnapshot, "Get pk 0 returned"),
-        ("B3", b3, Bug::AbortedAsCommitted, "the model has"),
+        (
+            "B3",
+            b3,
+            Bug::AbortedAsCommitted,
+            "returned no row; the model has",
+        ),
         (
             "B4",
             b4,
