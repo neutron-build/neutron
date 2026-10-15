@@ -27,6 +27,11 @@
 //! remains (`read::scan`, pulling through `ViewGuard::scan`) refuses
 //! at the first pull on an executor thread when created off-executor.
 //!
+//! C-R0bFIX-4 adds: the scan creation-time check pinned on its own
+//! (parent gate N-1) — a scan created on the executor without a pull
+//! refuses at once, at the creation site, where no per-`next()`
+//! re-check exists to mask a deleted creation check.
+//!
 //! Setup discipline: every `Core`, txn and pipeline is set up off-executor;
 //! `on_executor` marks the thread only around the call under test.
 
@@ -751,6 +756,22 @@ fn scan_iter_refuses_on_executor() {
         other => panic!("the scan iterator still works off-executor, got {other:?}"),
     }
     assert!(iter.next().is_none(), "exactly one row is in range");
+
+    // C-R0bFIX-4 (parent gate N-1, follow-up 3): the creation-time
+    // check fires on the creation call itself. This scan is never
+    // pulled, so no per-`next()` re-check exists to catch the thread —
+    // only the check in `ViewGuard::scan`'s body can refuse here,
+    // pinning its timing (at creation, before any pull).
+    assert_blocked(
+        on_executor(|| {
+            view.scan(
+                (Bound::Included(&b"o"[..]), Bound::Excluded(&b"p"[..])),
+                false,
+            )
+        }),
+        Blocking::KvIo,
+        "ViewGuard::scan",
+    );
 
     // The exact async-misuse shape L-A described: on a marked thread,
     // open the view and the scan inside `allow_blocking`, then iterate
