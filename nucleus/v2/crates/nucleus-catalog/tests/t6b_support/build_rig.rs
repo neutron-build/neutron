@@ -121,13 +121,23 @@ impl BuildRig {
     /// Relation `oid`'s catalog row at `visible_ts` (a ghost reader).
     pub fn rel_row(&self, oid: u64) -> Option<RelRow> {
         let view = self.core().open_view();
-        ok(Catalog::read_rel(self.core(), &view, &self.ghost_ctx(), oid))
+        ok(Catalog::read_rel(
+            self.core(),
+            &view,
+            &self.ghost_ctx(),
+            oid,
+        ))
     }
 
     /// Index `oid`'s catalog row at `visible_ts`.
     pub fn idx_row(&self, idx_oid: u64) -> Option<IdxRow> {
         let view = self.core().open_view();
-        ok(Catalog::read_idx(self.core(), &view, &self.ghost_ctx(), idx_oid))
+        ok(Catalog::read_idx(
+            self.core(),
+            &view,
+            &self.ghost_ctx(),
+            idx_oid,
+        ))
     }
 
     /// Every visible index row of relation `oid` at `visible_ts`.
@@ -239,11 +249,9 @@ pub fn table_with_rows(rig: &BuildRig, name: &[u8], rows: &[(i32, &str)]) -> u64
         let t = rig.rc();
         let s = rig.core().visible_ts();
         let st = rig.stmt(&t, s);
-        let h = ok(rig.db.open_table(
-            &st,
-            oid,
-            nucleus_txn::locks::RelLockMode::RowExclusive,
-        ));
+        let h = ok(rig
+            .db
+            .open_table(&st, oid, nucleus_txn::locks::RelLockMode::RowExclusive));
         ok(rig.db.insert_with(&st, &h, &[i32_d(id), text_d(payload)]));
         ok(rig.commit_rc(t));
     }

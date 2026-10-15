@@ -46,9 +46,7 @@ use t6b_support::build_rig::{table_with_rows, BuildRig};
 use t6b_support::{i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, row_key_of, text_d, text_v};
 
 use nucleus_catalog::ddl::create_index_concurrently_in_block;
-use nucleus_catalog::{
-    create_index_online, resume_build, BuildHooks, Db, IndexState, BUILD_CHUNK,
-};
+use nucleus_catalog::{create_index_online, resume_build, BuildHooks, Db, IndexState, BUILD_CHUNK};
 use nucleus_codec::row::Datum;
 use nucleus_codec::Value;
 use nucleus_codec::{Collation, KeyColumn, KeyType};
@@ -156,21 +154,30 @@ fn builds_online_amcheck_clean_with_concurrent_writers() {
     let oid = table_with_rows(
         &rig,
         b"cw",
-        &[(1, "p1"), (2, "p2"), (3, "p3"), (4, "p4"), (5, "p5"), (6, "p6")],
+        &[
+            (1, "p1"),
+            (2, "p2"),
+            (3, "p3"),
+            (4, "p4"),
+            (5, "p5"),
+            (6, "p6"),
+        ],
     );
 
     // One committed insert forced after `S` and before the ingest
     // (deterministic: its entry must come from the writer at its own ts,
     // never from the build's scan at S).
     let s_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
-    let mut hooks = BuildHooks::default();
     let s_for_hook = Arc::clone(&s_slot);
     let db_for_hook = Arc::clone(&rig.db);
-    hooks.after_register = Some(Box::new(move |s| {
-        *s_for_hook.lock().expect("s") = Some(s);
-        insert_row(&db_for_hook, oid, 200, "postS");
-    }));
-    hooks.chunk = Some(3);
+    let hooks = BuildHooks {
+        after_register: Some(Box::new(move |s| {
+            *s_for_hook.lock().expect("s") = Some(s);
+            insert_row(&db_for_hook, oid, 200, "postS");
+        })),
+        chunk: Some(3),
+        ..Default::default()
+    };
 
     // The three writer threads: fixed workloads over distinct rows (no
     // writer-writer conflicts; RowExclusive never conflicts with the
@@ -208,7 +215,13 @@ fn builds_online_amcheck_clean_with_concurrent_writers() {
         })
     };
 
-    let idx_oid = ok(create_index_online(&rig.db, oid, &payload_def(), false, &hooks));
+    let idx_oid = ok(create_index_online(
+        &rig.db,
+        oid,
+        &payload_def(),
+        false,
+        &hooks,
+    ));
 
     for (name, rx) in [("ins", ins), ("upd", upd), ("del", del)] {
         match rx.recv_timeout(BOUND) {
@@ -233,7 +246,9 @@ fn builds_online_amcheck_clean_with_concurrent_writers() {
     // and returns rows in index order.
     let t = rig.rc();
     let st = rig.stmt(&t, rig.core().visible_ts());
-    let via_idx = ok(rig.db.index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    let via_idx = ok(rig
+        .db
+        .index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded));
     let h = ok(rig.db.open_table(&st, oid, RelLockMode::AccessShare));
     let via_scan = ok(rig.db.scan(&st, &h));
     ok(rig.commit_rc(t));
@@ -272,20 +287,27 @@ fn fence_orders_s() {
     let x_id = x.id;
     let x_slot = Arc::new(Mutex::new(Some(x)));
 
-    let mut hooks = BuildHooks::default();
+    let s_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+    let s_hook = Arc::clone(&s_slot);
     let x_open = Arc::clone(&x_slot);
     let db_open = Arc::clone(&rig.db);
-    hooks.before_t1_commit = Some(Box::new(move || {
-        let mut slot = x_open.lock().expect("x");
-        let x = slot.as_mut().expect("X still open");
-        let st = ok(nucleus_catalog::Stmt::new(x, db_open.core.visible_ts()));
-        let h = ok(db_open.open_table(&st, oid, RelLockMode::RowExclusive));
-        // The DeleteOnly read the whole test is about: X's statement
-        // maintains deletes only, so its insert writes no entry.
-        assert_eq!(h.indexes.len(), 1);
-        assert_eq!(h.indexes[0].def.state, IndexState::DeleteOnly);
-        ok(db_open.insert_with(&st, &h, &[i32_d(5), text_d("1")]));
-    }));
+    let hooks = BuildHooks {
+        after_register: Some(Box::new(move |s| {
+            *s_hook.lock().expect("s") = Some(s);
+        })),
+        before_t1_commit: Some(Box::new(move || {
+            let mut slot = x_open.lock().expect("x");
+            let x = slot.as_mut().expect("X still open");
+            let st = ok(nucleus_catalog::Stmt::new(x, db_open.core.visible_ts()));
+            let h = ok(db_open.open_table(&st, oid, RelLockMode::RowExclusive));
+            // The DeleteOnly read the whole test is about: X's statement
+            // maintains deletes only, so its insert writes no entry.
+            assert_eq!(h.indexes.len(), 1);
+            assert_eq!(h.indexes[0].def.state, IndexState::DeleteOnly);
+            ok(db_open.insert_with(&st, &h, &[i32_d(5), text_d("1")]));
+        })),
+        ..Default::default()
+    };
 
     /// Commits X from `on_wait_start(_, X)` (the hook runs on the build
     /// thread before it parks, so X's commit — served by the separate
@@ -320,13 +342,13 @@ fn fence_orders_s() {
         .waits
         .set_hook(Arc::clone(&committer) as Arc<dyn WaitHook>);
 
-    let s_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
-    let s_hook = Arc::clone(&s_slot);
-    hooks.after_register = Some(Box::new(move |s| {
-        *s_hook.lock().expect("s") = Some(s);
-    }));
-
-    let idx_oid = ok(create_index_online(&rig.db, oid, &payload_def(), false, &hooks));
+    let idx_oid = ok(create_index_online(
+        &rig.db,
+        oid,
+        &payload_def(),
+        false,
+        &hooks,
+    ));
 
     let s = s_slot.lock().expect("s").expect("after_register fired");
     let c_x = committer
@@ -392,8 +414,10 @@ fn resume_after_crash_from_delete_only_and_write_only() {
         );
         assert!(def.concurrently, "the def carries the CONCURRENTLY flag");
 
-        let mut hooks = BuildHooks::default();
-        hooks.chunk = Some(2);
+        let hooks = BuildHooks {
+            chunk: Some(2),
+            ..Default::default()
+        };
         assert_eq!(ok(resume_build(&rig.db, idx_oid, &hooks)), idx_oid);
         let def = rig.def_of(idx_oid);
         assert_eq!(def.state, IndexState::Public);
@@ -483,19 +507,25 @@ fn db_open_drops_crashed_plain_build() {
     // Park both builds after T1's ack (state WriteOnly: the crashed
     // prefix ends there).
     let (tx_p, rx_p) = mpsc::channel();
-    let mut hooks_p = BuildHooks::default();
-    hooks_p.after_t1 = park_hook(tx_p);
+    let hooks_p = BuildHooks {
+        after_t1: park_hook(tx_p),
+        ..Default::default()
+    };
     let db_p = Arc::clone(&rig.db);
-    let build_p = spawn_run(move || create_index_online(&db_p, oid_p, &payload_def(), false, &hooks_p));
+    let build_p =
+        spawn_run(move || create_index_online(&db_p, oid_p, &payload_def(), false, &hooks_p));
     match rx_p.recv_timeout(BOUND) {
         Ok(()) => {}
         Err(_) => panic!("the plain build never parked"),
     }
     let (tx_c, rx_c) = mpsc::channel();
-    let mut hooks_c = BuildHooks::default();
-    hooks_c.after_t1 = park_hook(tx_c);
+    let hooks_c = BuildHooks {
+        after_t1: park_hook(tx_c),
+        ..Default::default()
+    };
     let db_c = Arc::clone(&rig.db);
-    let build_c = spawn_run(move || create_index_online(&db_c, oid_c, &payload_def(), true, &hooks_c));
+    let build_c =
+        spawn_run(move || create_index_online(&db_c, oid_c, &payload_def(), true, &hooks_c));
     match rx_c.recv_timeout(BOUND) {
         Ok(()) => {}
         Err(_) => panic!("the concurrently build never parked"),
@@ -611,12 +641,20 @@ fn ingest_ts_is_s() {
 
     let s_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
     let s_hook = Arc::clone(&s_slot);
-    let mut hooks = BuildHooks::default();
-    hooks.after_register = Some(Box::new(move |s| {
-        *s_hook.lock().expect("s") = Some(s);
-    }));
-    hooks.chunk = Some(2);
-    let idx_oid = ok(create_index_online(&rig.db, oid, &payload_def(), false, &hooks));
+    let hooks = BuildHooks {
+        after_register: Some(Box::new(move |s| {
+            *s_hook.lock().expect("s") = Some(s);
+        })),
+        chunk: Some(2),
+        ..Default::default()
+    };
+    let idx_oid = ok(create_index_online(
+        &rig.db,
+        oid,
+        &payload_def(),
+        false,
+        &hooks,
+    ));
 
     let s = s_slot.lock().expect("s").expect("after_register fired");
     let def = rig.def_of(idx_oid);
@@ -671,30 +709,43 @@ fn gc_guard() {
 
     // The GC job, installed before the build (one publisher per core) and
     // shared with the hook.
-    let gc = Arc::new(ok(GcJob::install(rig.core(), GcConfig { as_of_window_secs: None })));
+    let gc = Arc::new(ok(GcJob::install(
+        rig.core(),
+        GcConfig {
+            as_of_window_secs: None,
+        },
+    )));
 
     let s_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
-    let mut hooks = BuildHooks::default();
     let s_hook = Arc::clone(&s_slot);
-    hooks.after_register = Some(Box::new(move |s| {
-        *s_hook.lock().expect("s") = Some(s);
-    }));
     let writer_db = Arc::clone(&rig.db);
     let writer_gc = Arc::clone(&gc);
-    hooks.after_scan = Some(Box::new(move || {
-        // (a) a WriteOnly-aware delete of row 2, committed at c > S (the
-        // build's guard is registered; this txn is the next commit).
-        let t = writer_db.core.begin(Isolation::ReadCommitted);
-        let st = ok(nucleus_catalog::Stmt::new(&t, writer_db.core.visible_ts()));
-        ok(writer_db.delete(&st, oid, &[i32_v(2)]));
-        ok(writer_db.core.commit(t, SyncCommit::On));
-        ok(Resolver::run_once(&writer_db.core));
-        // (b) a full GC round: publish (W = min(S, visible_ts) = S while
-        // the guard is registered) + drop_tombstones.
-        ok(writer_gc.run_once(0));
-    }));
+    let hooks = BuildHooks {
+        after_register: Some(Box::new(move |s| {
+            *s_hook.lock().expect("s") = Some(s);
+        })),
+        after_scan: Some(Box::new(move || {
+            // (a) a WriteOnly-aware delete of row 2, committed at c > S (the
+            // build's guard is registered; this txn is the next commit).
+            let t = writer_db.core.begin(Isolation::ReadCommitted);
+            let st = ok(nucleus_catalog::Stmt::new(&t, writer_db.core.visible_ts()));
+            ok(writer_db.delete(&st, oid, &[i32_v(2)]));
+            ok(writer_db.core.commit(t, SyncCommit::On));
+            ok(Resolver::run_once(&writer_db.core));
+            // (b) a full GC round: publish (W = min(S, visible_ts) = S while
+            // the guard is registered) + drop_tombstones.
+            ok(writer_gc.run_once(0));
+        })),
+        ..Default::default()
+    };
 
-    let idx_oid = ok(create_index_online(&rig.db, oid, &payload_def(), false, &hooks));
+    let idx_oid = ok(create_index_online(
+        &rig.db,
+        oid,
+        &payload_def(),
+        false,
+        &hooks,
+    ));
     let s = s_slot.lock().expect("s").expect("after_register fired");
 
     // GC really ran, and was held at exactly S.
@@ -758,7 +809,9 @@ fn index_scan_matches_scan_and_old_snapshot_refused() {
     // A current reader: full agreement with the scan, in index order.
     let t = rig.rc();
     let st = rig.stmt(&t, rig.core().visible_ts());
-    let via_idx = ok(rig.db.index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded));
+    let via_idx = ok(rig
+        .db
+        .index_scan(&st, idx_oid, Bound::Unbounded, Bound::Unbounded));
     let h = ok(rig.db.open_table(&st, oid, RelLockMode::AccessShare));
     let via_scan = ok(rig.db.scan(&st, &h));
     ok(rig.commit_rc(t));
