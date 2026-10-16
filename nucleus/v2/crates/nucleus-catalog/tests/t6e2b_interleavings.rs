@@ -42,6 +42,25 @@
 //!   acquirer starting after the fence's re-read — the build's outcome
 //!   stays sound and the acquirer's commit lands at or above the fence's
 //!   `f`.
+//! - `scan_window_writer` (C-T6e2b gate M-1): a WriteOnly-aware writer
+//!   committing a fresh insert and a re-shaping update strictly above
+//!   `S` (from `after_register`) — the scan at `S` cannot cover its
+//!   versions, so only its own full maintenance can place the entries
+//!   (mutant IM-A: WriteOnly maintains deletes only — the published
+//!   index misses both rows).
+//! - `share_request_cycle_is_40p01` (e2afix gate L-2): a RowExclusive
+//!   holder whose in-txn CREATE INDEX requests Share while the fence
+//!   step holds the entry ShareUpdateExclusive and its wait collects the
+//!   holder — the entry lock's one deadlock-shaped cycle; 40P01 surfaces
+//!   on exactly one side, never a hang (mutant CYCLE-SWALLOW: the
+//!   detected deadlock retried — both sides park forever).
+//! - `crash_window_resume` / `crash_window_plain_dropped_at_reopen` (the
+//!   e2b gate's L-2): the crash-between-ingest-and-publish window — the
+//!   reopened CONCURRENTLY index resumes to Public **over its own stale
+//!   ingested entries** (two live generations per key, amcheck clean)
+//!   with the resumed `S'` strictly above every pre-resume commit
+//!   (mutants RESUME-DROP and CLOCK-FROZEN); the plain flag of the same
+//!   crash is dropped at the reopen.
 
 mod t6b_support;
 
@@ -53,13 +72,15 @@ use std::thread;
 use std::time::Duration;
 
 use t6b_support::build_rig::BuildRig;
-use t6b_support::{i32_d, i32_v, idx_def, ok, set_col, wait_until, SharedFault};
+use t6b_support::{
+    i32_d, i32_v, i_entry_key, idx_def, ok, row_key_of, set_col, wait_until, SharedFault,
+};
 
 use nucleus_catalog::{
-    create_index_online, BuildHooks, Db, IndexDef, IndexState, ScannedRow, Stmt,
+    create_index_online, resume_build, BuildHooks, Db, IndexDef, IndexState, ScannedRow, Stmt,
 };
 use nucleus_codec::row::{ColumnDef, Datum, TableSchema};
-use nucleus_codec::{KeyType, Value};
+use nucleus_codec::{KeyColumn, KeyType, Value};
 use nucleus_txn::catalog::{Catalog, Ddl, IdxStorage};
 use nucleus_txn::commit::SyncCommit;
 use nucleus_txn::jobs::{BootSweep, JobOutcome};
@@ -68,8 +89,8 @@ use nucleus_txn::resolver::Resolver;
 use nucleus_txn::txn::{Isolation, Txn};
 use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::wait::WaitHook;
-use nucleus_txn::write::StmtCtx;
-use nucleus_txn::{Ts, TxnId};
+use nucleus_txn::write::{LockWait, StmtCtx};
+use nucleus_txn::{Ts, TxnError, TxnId};
 
 /// Everything a thread may wait on is bounded by this; the joins use it
 /// too (a hang is a failure, never a pass).
@@ -1188,5 +1209,485 @@ fn late_sue_acquirer() {
     );
     // The second index is DeleteOnly (its own build is a later card's).
     assert_eq!(rig.idxs_of(oid).len(), 2);
+    rig.shutdown();
+}
+
+// ---- 7: the scan-window writer (the deterministic IM-A killer) --------------
+
+/// §7.3's central bullet in its dangerous direction: "every row version
+/// with ts > S was written by a WriteOnly-aware writer". R runs at
+/// `after_register` — S is already registered, so R's commit lands
+/// strictly above it and the scan at S can never cover R's versions; the
+/// entries can only come from R's own full maintenance (a fresh insert
+/// plus an update that re-shapes an existing row). The published index
+/// is exact. Mutant IM-A (WriteOnly maintains deletes only — the
+/// insert-halves skipped): neither entry is written, R's update
+/// tombstones the ingested `E(1)@S` and nothing replaces it, and both
+/// the amcheck and the `index_scan == scan` verdicts fail on the missing
+/// entries.
+#[test]
+fn scan_window_writer() {
+    let rig = BuildRig::new();
+    let oid = table_a(&rig, b"sww", &[(1, 1)]);
+
+    let s_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+    let c_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+
+    let hooks = BuildHooks {
+        after_register: {
+            let db = Arc::clone(&rig.db);
+            let s_slot = Arc::clone(&s_slot);
+            let c_slot = Arc::clone(&c_slot);
+            Some(Box::new(move |s| {
+                *s_slot.lock().expect("s") = Some(s);
+                // R: WriteOnly-aware (T1's ack preceded T3), committing
+                // strictly above S — the scan at S cannot see its versions.
+                let t = db.core.begin(Isolation::ReadCommitted);
+                let st = ok(Stmt::new(&t, db.core.visible_ts()));
+                let h = ok(db.open_table(&st, oid, RelLockMode::RowExclusive));
+                assert_eq!(h.indexes.len(), 1, "R sees the index");
+                assert_eq!(
+                    h.indexes[0].def.state,
+                    IndexState::WriteOnly,
+                    "R is WriteOnly-aware"
+                );
+                ok(db.insert_with(&st, &h, &[i32_d(2), i32_d(9)]));
+                ok(db.update_with(&st, &h, &[i32_v(1)], &[set_col(2, i32_d(8))]));
+                let c = commit_and_settle(&db, t);
+                *c_slot.lock().expect("c") = Some(c);
+            }))
+        },
+        ..Default::default()
+    };
+
+    let idx_oid = ok(create_index_online(&rig.db, oid, &a_def(), false, &hooks));
+
+    // R really is the scan-window writer: its commit is strictly above S
+    // (deterministic — S is a committed ts and every later commit
+    // reserves a strictly higher one).
+    let s = s_slot.lock().expect("s").expect("after_register fired");
+    let c = c_slot.lock().expect("c").expect("R committed");
+    assert!(c > s, "R's commit ({c:?}) is strictly above S ({s:?})");
+
+    let def = rig.def_of(idx_oid);
+    assert_eq!(def.state, IndexState::Public, "the ladder published");
+    assert_eq!(def.built_at, s.0, "built_at is the registered snapshot");
+
+    // The exact index: R's insert and R's re-shaped row are both there —
+    // from R's own maintenance, never from the scan — and amcheck agrees.
+    let report = rig.amcheck(oid);
+    assert!(report.is_clean(), "amcheck: {report:?}");
+    assert_eq!(
+        iscan_all(&rig, idx_oid),
+        vec![(1, 8), (2, 9)],
+        "index_scan holds R's versions"
+    );
+    assert_eq!(
+        iscan_all(&rig, idx_oid),
+        scan_a(&rig, oid),
+        "index_scan == scan"
+    );
+    rig.shutdown();
+}
+
+// ---- 8: the entry-SUE deadlock cycle (40P01 on one side, never a hang) ------
+
+/// The entry ShareUpdateExclusive's one deadlock-shaped interleaving
+/// (the e2afix gate's L-2): P — a writer mid-txn holding RowExclusive —
+/// requests Share (a born-public CREATE INDEX inside its txn, §6.1)
+/// while the fence step holds the relation's ShareUpdateExclusive and
+/// its `wait_for_lockers(Share)` collects P. Share conflicts with
+/// ShareUpdateExclusive and with RowExclusive, so the two waits form a
+/// real cycle through the one wait-for graph; its detector fires after
+/// `deadlock_timeout` and exactly one side surfaces 40P01 — the other
+/// side then proceeds (the victim's abort releases it). The surviving
+/// state must be sound either way. Mutant CYCLE-SWALLOW (the detected
+/// deadlock mapped to a retry): nobody is the victim, both sides park
+/// forever, and the bounded joins fail — a hang is a failure, never a
+/// pass.
+#[test]
+fn share_request_cycle_is_40p01() {
+    let rig = BuildRig::new();
+    let oid = table_a(&rig, b"cyc", &[(1, 1)]);
+
+    // P: released inside the fence's window (the step holds its entry
+    // ShareUpdateExclusive, its re-read done, its wait not yet run). P's
+    // Share request parks on that SUE; the fence's wait then parks on
+    // P's RowExclusive — the cycle.
+    let (p_go_tx, p_go_rx) = mpsc::channel::<()>();
+    let (p_re_tx, p_re_rx) = mpsc::channel::<()>();
+    let (p_out_tx, p_out_rx) = mpsc::channel::<Result<bool, TxnError>>();
+    // The ack receiver lives behind a mutex (a Receiver is !Sync, and a
+    // hook must be `Fn() + Send + Sync`).
+    let p_re_rx = Arc::new(Mutex::new(p_re_rx));
+    let p_db = Arc::clone(&rig.db);
+    let p = spawn_run(move || {
+        match p_go_rx.recv_timeout(BOUND) {
+            Ok(()) => {}
+            Err(_) => panic!("P was never released into the fence's window"),
+        }
+        let t = p_db.core.begin(Isolation::ReadCommitted);
+        let st = ok(Stmt::new(&t, p_db.core.visible_ts()));
+        let h = ok(p_db.open_table(&st, oid, RelLockMode::RowExclusive));
+        assert_eq!(h.indexes.len(), 1, "P sees the index");
+        assert_eq!(
+            h.indexes[0].def.state,
+            IndexState::WriteOnly,
+            "P is WriteOnly-aware"
+        );
+        ok(p_db.insert_with(&st, &h, &[i32_d(2), i32_d(2)]));
+        let _ = p_re_tx.send(());
+        // The in-txn CREATE INDEX's Share request (§6.1's lock): parks on
+        // the fence step's ShareUpdateExclusive.
+        let out = p_db.locks.lock_relation(
+            &p_db.core,
+            &t,
+            oid,
+            RelLockMode::Share,
+            LockWait::Block,
+            None,
+        );
+        match out {
+            Ok(true) => {
+                ok(p_db.core.commit(t, SyncCommit::On));
+                ok(Resolver::run_once(&p_db.core));
+            }
+            Ok(false) => panic!("a blocking Share request never reports SkipLocked"),
+            Err(e) => {
+                // P is the victim: the abort releases the fence.
+                ok(p_db.core.abort(t));
+                let _ = p_out_tx.send(Err(e));
+                return;
+            }
+        }
+        let _ = p_out_tx.send(Ok(true));
+    });
+
+    let hooks = BuildHooks {
+        before_fence_wait: {
+            let p_go_tx = p_go_tx;
+            Some(Box::new(move || {
+                let _ = p_go_tx.send(());
+                // Hold the window open until P's RowExclusive is really
+                // held, so the fence's collection scan finds it.
+                match p_re_rx.lock().expect("p_re").recv_timeout(BOUND) {
+                    Ok(()) => {}
+                    Err(_) => panic!("P never acquired RowExclusive"),
+                }
+            }))
+        },
+        ..Default::default()
+    };
+
+    // The build runs on its own thread: even a wedged wait is a bounded
+    // test failure, never a hung one.
+    let build_db = Arc::clone(&rig.db);
+    let build = spawn_run(move || create_index_online(&build_db, oid, &a_def(), false, &hooks));
+    let build_out = match build.recv_timeout(BOUND) {
+        Ok(r) => r,
+        Err(_) => panic!("the build never finished: the cycle never resolved"),
+    };
+    let p_out = match p_out_rx.recv_timeout(BOUND) {
+        Ok(r) => r,
+        Err(_) => panic!("P never finished: the cycle never resolved"),
+    };
+    drop(p); // P's thread ends right after its outcome send
+
+    match (build_out, p_out) {
+        (Err(e), Ok(true)) => {
+            // The fence was the victim: its wait raised the 40P01, the
+            // plain failure path dropped the index, and P — woken by the
+            // victim's abort — acquired its Share and committed.
+            assert_eq!(e.sqlstate(), "40P01", "the build's failure: {e:?}");
+            assert!(
+                rig.idxs_of(oid).is_empty(),
+                "the plain failure path dropped its index"
+            );
+            let report = rig.amcheck(oid);
+            assert!(report.is_clean(), "amcheck: {report:?}");
+            assert_eq!(
+                scan_a(&rig, oid),
+                vec![(1, 1), (2, 2)],
+                "P's insert committed"
+            );
+        }
+        (Ok(idx_oid), Err(e)) => {
+            // P was the victim: its Share request raised the 40P01 and
+            // its abort released the fence, which published.
+            assert_eq!(e.sqlstate(), "40P01", "P's Share request: {e:?}");
+            let def = rig.def_of(idx_oid);
+            assert_eq!(def.state, IndexState::Public);
+            assert!(def.built_at > 0);
+            let report = rig.amcheck(oid);
+            assert!(report.is_clean(), "amcheck: {report:?}");
+            assert_eq!(
+                iscan_all(&rig, idx_oid),
+                scan_a(&rig, oid),
+                "index_scan == scan"
+            );
+            assert_eq!(scan_a(&rig, oid), vec![(1, 1)], "P's insert rolled back");
+        }
+        other => panic!("exactly one side of the cycle must surface the 40P01, got {other:?}"),
+    }
+    rig.shutdown();
+}
+
+// ---- 9: resume over the crash window's own stale ingested entries -----------
+
+/// The crash-between-ingest-and-publish window (the e2b gate's L-2): a
+/// CONCURRENTLY build's T3 registered S, ingested every entry at S and
+/// crashed before the publish; the reopen leaves the index WriteOnly
+/// with its **own stale ingested entries** in place. `resume_build`
+/// re-runs the fence and re-scans at its own S' — two live generations
+/// per entry key, the fresh one at S' strictly above every pre-resume
+/// commit (the resumed-fence clock-advance pin; mutant CLOCK-FROZEN:
+/// the resumed build registers S' at the pre-resume visible_ts) — and
+/// publishes Public over both. Mutant RESUME-DROP (the resume trusts
+/// the stale generation and skips the fresh ingest): nothing lands at
+/// S' and the two-generation pin fails.
+#[test]
+fn crash_window_resume() {
+    let rig = BuildRig::new();
+    let oid = table_a(&rig, b"cwr", &[(1, 1)]);
+
+    let s_old_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+    let c_w_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+    let (crashed_tx, crashed_rx) = mpsc::channel::<()>();
+    let kv_for_hook = Arc::clone(&rig.kv);
+
+    let hooks = BuildHooks {
+        after_register: {
+            let s_old_slot = Arc::clone(&s_old_slot);
+            Some(Box::new(move |s| {
+                *s_old_slot.lock().expect("s_old") = Some(s);
+            }))
+        },
+        after_fence: {
+            // W: the sync_off_crash writer — WriteOnly-aware, inserts
+            // (3, 7) with synchronous_commit = off and no resolver: only
+            // the ingest's WAL sync makes its commit durable.
+            let db = Arc::clone(&rig.db);
+            let c_w_slot = Arc::clone(&c_w_slot);
+            Some(Box::new(move || {
+                let t = db.core.begin(Isolation::ReadCommitted);
+                let st = ok(Stmt::new(&t, db.core.visible_ts()));
+                let h = ok(db.open_table(&st, oid, RelLockMode::RowExclusive));
+                assert_eq!(h.indexes.len(), 1);
+                assert_eq!(
+                    h.indexes[0].def.state,
+                    IndexState::WriteOnly,
+                    "W is WriteOnly-aware"
+                );
+                ok(db.insert_with(&st, &h, &[i32_d(3), i32_d(7)]));
+                let c = ok(db.core.commit(t, SyncCommit::Off));
+                *c_w_slot.lock().expect("c_w") = Some(c);
+            }))
+        },
+        before_publish: {
+            // The ingest has returned (its sync made W's commit and every
+            // resolution durable): crash, keeping the stale ingested
+            // entries, and park the build forever.
+            Some(Box::new(move || {
+                ok(kv_for_hook.crash(0));
+                let _ = crashed_tx.send(());
+                loop {
+                    thread::park();
+                }
+            }))
+        },
+        ..Default::default()
+    };
+
+    let db = Arc::clone(&rig.db);
+    let build = spawn_run(move || create_index_online(&db, oid, &a_def(), true, &hooks));
+    match crashed_rx.recv_timeout(BOUND) {
+        Ok(()) => {}
+        Err(_) => panic!("the build never crashed at before_publish"),
+    }
+    let s_old = s_old_slot
+        .lock()
+        .expect("s_old")
+        .expect("after_register fired");
+    let c_w = c_w_slot.lock().expect("c_w").expect("W committed");
+    assert!(
+        s_old >= c_w,
+        "W's commit ({c_w:?}) is visible at S ({s_old:?}) — the scan saw its row"
+    );
+
+    let rig = rig.crash_reopen(0);
+    sweep(&rig);
+    let idxs = rig.idxs_of(oid);
+    assert_eq!(idxs.len(), 1, "Db::open kept the CONCURRENTLY build");
+    let idx_oid = idxs[0].oid;
+    let def = rig.def_of(idx_oid);
+    assert_eq!(def.state, IndexState::WriteOnly, "the publish never ran");
+    assert!(def.concurrently);
+    assert_eq!(
+        scan_a(&rig, oid),
+        vec![(1, 1), (3, 7)],
+        "W's row survived because the ingest synced first"
+    );
+
+    // The clock-advance pin: every pre-resume commit (W's c_w, the whole
+    // crashed build's S, everything visible at the reopen) sits strictly
+    // below the resumed build's own S' — the resumed fence's commit
+    // intervenes, which is exactly what its re-run buys.
+    let pre = rig.core().visible_ts();
+    let s_new_slot: Arc<Mutex<Option<Ts>>> = Arc::new(Mutex::new(None));
+    let hooks = BuildHooks {
+        after_register: {
+            let s_new_slot = Arc::clone(&s_new_slot);
+            Some(Box::new(move |s| {
+                *s_new_slot.lock().expect("s_new") = Some(s);
+            }))
+        },
+        ..Default::default()
+    };
+    assert_eq!(ok(resume_build(&rig.db, idx_oid, &hooks)), idx_oid);
+    let s_new = s_new_slot
+        .lock()
+        .expect("s_new")
+        .expect("the resume registered its own S'");
+    assert!(
+        s_new > pre && s_new > s_old && s_new > c_w,
+        "the resumed S' ({s_new:?}) strictly exceeds every pre-resume commit \
+         (pre {pre:?}, S {s_old:?}, c_w {c_w:?})"
+    );
+
+    let def = rig.def_of(idx_oid);
+    assert_eq!(def.state, IndexState::Public, "the resume published");
+    assert_eq!(def.built_at, s_new.0, "built_at is the resumed S'");
+
+    // Sound over the stale generation: amcheck clean, index_scan == scan.
+    let report = rig.amcheck(oid);
+    assert!(report.is_clean(), "amcheck: {report:?}");
+    assert_eq!(scan_a(&rig, oid), vec![(1, 1), (3, 7)]);
+    assert_eq!(
+        iscan_all(&rig, idx_oid),
+        scan_a(&rig, oid),
+        "index_scan == scan"
+    );
+
+    // The two-generation shape: each surviving row's entry key is live at
+    // the stale S and at the fresh S' (E(7) also at W's resolved c_w),
+    // nothing else — no dangling intent, no tombstone.
+    let sid = rig.rel_row(oid).expect("rel row").storage_id;
+    let isid = rig.isid_of(idx_oid);
+    let col = [KeyColumn::asc(KeyType::Int4)];
+    let e1 = i_entry_key(
+        isid,
+        &col,
+        &[i32_v(1)],
+        &row_key_of(sid, &a_schema(), &[i32_v(1)]),
+    );
+    let e7 = i_entry_key(
+        isid,
+        &col,
+        &[i32_v(7)],
+        &row_key_of(sid, &a_schema(), &[i32_v(3)]),
+    );
+    let raw = rig.raw_idx_versions(isid);
+    let mut got: Vec<(Vec<u8>, Option<Ts>)> =
+        raw.iter().map(|(k, ts, _, _)| (k.clone(), *ts)).collect();
+    got.sort();
+    // E(7)'s pre-crash generation: W's resolved entry intent at c_w and
+    // the stale ingest at S — the same stored version key when
+    // c_w == S (W commits straight after the fence, nothing between),
+    // two keys when c_w < S.
+    let mut want = vec![
+        (e1.clone(), Some(s_old)),
+        (e1, Some(s_new)),
+        (e7.clone(), Some(s_new)),
+    ];
+    if c_w < s_old {
+        want.push((e7.clone(), Some(c_w)));
+        want.push((e7, Some(s_old)));
+    } else {
+        want.push((e7, Some(s_old)));
+    }
+    want.sort();
+    assert_eq!(
+        got, want,
+        "two live generations per key, the fresh one at S' (resumed clean)"
+    );
+    for (_, _, header, _) in &raw {
+        assert!(
+            *header <= 0x01,
+            "no tombstone or dangling intent survived the resume (header {header:#04x})"
+        );
+    }
+    drop(build); // the parked thread stays parked; its sender is gone
+    rig.shutdown();
+}
+
+// ---- 9a: the plain flag of the same crash window ----------------------------
+
+/// The plain-flag variant of the same crash window (L-2's second half):
+/// with `concurrently = false`, the crash between the ingest and the
+/// publish leaves the non-public index to `Db::open`'s
+/// `cleanup_unfinished_builds`, which drops it before the handle
+/// returns — at exactly this hook position (e2a's
+/// `db_open_drops_crashed_plain_build` pins the after_t1 one). W's row
+/// still survived (the ingest synced first), so the table is sound.
+#[test]
+fn crash_window_plain_dropped_at_reopen() {
+    let rig = BuildRig::new();
+    let oid = table_a(&rig, b"cwp", &[(1, 1)]);
+
+    let (crashed_tx, crashed_rx) = mpsc::channel::<()>();
+    let kv_for_hook = Arc::clone(&rig.kv);
+
+    let hooks = BuildHooks {
+        after_fence: {
+            // W: as in `crash_window_resume` — the crash window's
+            // sync-off writer.
+            let db = Arc::clone(&rig.db);
+            Some(Box::new(move || {
+                let t = db.core.begin(Isolation::ReadCommitted);
+                let st = ok(Stmt::new(&t, db.core.visible_ts()));
+                let h = ok(db.open_table(&st, oid, RelLockMode::RowExclusive));
+                assert_eq!(h.indexes.len(), 1);
+                assert_eq!(
+                    h.indexes[0].def.state,
+                    IndexState::WriteOnly,
+                    "W is WriteOnly-aware"
+                );
+                ok(db.insert_with(&st, &h, &[i32_d(3), i32_d(7)]));
+                ok(db.core.commit(t, SyncCommit::Off));
+            }))
+        },
+        before_publish: {
+            Some(Box::new(move || {
+                ok(kv_for_hook.crash(0));
+                let _ = crashed_tx.send(());
+                loop {
+                    thread::park();
+                }
+            }))
+        },
+        ..Default::default()
+    };
+
+    let db = Arc::clone(&rig.db);
+    let build = spawn_run(move || create_index_online(&db, oid, &a_def(), false, &hooks));
+    match crashed_rx.recv_timeout(BOUND) {
+        Ok(()) => {}
+        Err(_) => panic!("the build never crashed at before_publish"),
+    }
+
+    let rig = rig.crash_reopen(0);
+    sweep(&rig);
+    assert!(
+        rig.idxs_of(oid).is_empty(),
+        "Db::open dropped the crashed plain build at the before_publish position"
+    );
+    assert_eq!(
+        scan_a(&rig, oid),
+        vec![(1, 1), (3, 7)],
+        "W's row survived because the ingest synced first"
+    );
+    let report = rig.amcheck(oid);
+    assert!(report.is_clean(), "amcheck: {report:?}");
+    drop(build); // the parked thread stays parked; its sender is gone
     rig.shutdown();
 }
