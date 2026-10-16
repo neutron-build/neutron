@@ -32,12 +32,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nucleus_catalog::amcheck::{check_table, Report};
-use nucleus_catalog::{Db, Stmt, TableHandle};
+use nucleus_catalog::{
+    create_index_online, resume_build, BuildHooks, Db, IndexColumn, IndexDef, IndexState, Stmt,
+    TableHandle,
+};
 use nucleus_codec::row::{value_repr_eq, Datum, RowError, TableSchema};
-use nucleus_codec::{decode_key_prefix, Collation, KeyColumn, KeyType, Value};
-use nucleus_kv::MemKv;
+use nucleus_codec::{decode_key_prefix, Collation, Direction, KeyColumn, KeyType, Nulls, Value};
+use nucleus_kv::{MemKv, OrderedKv};
 use nucleus_txn::boot::Core;
-use nucleus_txn::catalog::{Catalog, Ddl};
+use nucleus_txn::catalog::{Catalog, Ddl, IdxRow};
 use nucleus_txn::commit::{spawn_commit_thread_with, CommitConfig, CommitThreadHandle, SyncCommit};
 use nucleus_txn::encoding::{parse_key, Entry, VersionValue};
 use nucleus_txn::locks::{LockManager, RelLockMode};
@@ -50,8 +53,8 @@ use nucleus_txn::visibility::ReadCtx;
 use nucleus_txn::write::{CommittedVersion, Epq, EpqDecision, RowOp, RowOutcome};
 
 use super::{
-    derive_const, derive_text, gen_ddl, gen_prog, AmcheckRec, Config, Fate, Level, OpDetail,
-    OpKind, OpOut, OpRec, PDdl, POp, Prog, Recorder, RowVals, Run, TxnRec,
+    a_range, derive_const, derive_text, gen_ddl, gen_prog, AmcheckRec, Config, Fate, IdxSight,
+    Level, OpDetail, OpKind, OpOut, OpRec, PDdl, POp, Prog, Recorder, RowVals, Run, TxnRec,
 };
 
 /// The DDL session's id (DML sessions are `1..=threads`).
@@ -115,12 +118,57 @@ pub const END_AMCHECK: u32 = u32::MAX;
 
 // ----- the rig ---------------------------------------------------------------
 
+/// A shared handle to one `MemKv` (the `t6b_support::SharedFault` pattern
+/// without the fault): the `Core` owns one clone of the `Arc`, the rig
+/// keeps another for the harness's own raw diagnostics.
+#[derive(Clone)]
+pub struct SharedMem(pub Arc<MemKv>);
+
+impl OrderedKv for SharedMem {
+    type Snap = <MemKv as OrderedKv>::Snap;
+
+    fn write(
+        &self,
+        batch: nucleus_kv::Batch,
+        sync: nucleus_kv::Durability,
+    ) -> nucleus_kv::Result<()> {
+        self.0.write(batch, sync)
+    }
+    fn sync_wal(&self) -> nucleus_kv::Result<()> {
+        self.0.sync_wal()
+    }
+    fn snapshot(&self) -> Self::Snap {
+        self.0.snapshot()
+    }
+    fn get_latest(&self, key: &[u8]) -> nucleus_kv::Result<Option<Vec<u8>>> {
+        self.0.get_latest(key)
+    }
+    fn ingest_sorted(
+        &self,
+        entries: &mut dyn Iterator<Item = (nucleus_kv::Key, Vec<u8>)>,
+    ) -> nucleus_kv::Result<()> {
+        self.0.ingest_sorted(entries)
+    }
+    fn checkpoint(&self, dir: &std::path::Path) -> nucleus_kv::Result<()> {
+        self.0.checkpoint(dir)
+    }
+    fn set_gc_filter(&self, filter: Box<dyn nucleus_kv::GcFilter>) {
+        self.0.set_gc_filter(filter);
+    }
+    fn set_gc_watermark(&self, watermark: u64) -> nucleus_kv::Result<()> {
+        self.0.set_gc_watermark(watermark)
+    }
+}
+
 /// The shared engine: one `Db` over `Core<MemKv>` with the catalog, the
 /// commit thread (SSI's writer-map observer), the resolver and retention
 /// threads, and the recorder. `t_oid` is the DDL target; `u_oid` keeps a
-/// fixed schema.
+/// fixed schema. The `Db` sits in an `Arc` (C-T6e3) so the §7 driver's
+/// `BuildHooks` — which are `'static` — can reach it from the DDL thread.
 pub struct Rig {
-    pub db: Db<MemKv>,
+    pub db: Arc<Db<SharedMem>>,
+    /// The rig's own handle on the underlying store (diagnostics).
+    pub kv: SharedMem,
     pub t_oid: u64,
     pub u_oid: u64,
     pub rec: Recorder,
@@ -135,11 +183,12 @@ pub struct Rig {
 impl Rig {
     /// A fresh rig with the commit pipeline running (the g2 pattern).
     pub fn new(deadlock_ms: u64) -> Rig {
-        let core = Arc::new(Core::open(MemKv::new()).expect("open the core"));
+        let kv = SharedMem(Arc::new(MemKv::new()));
+        let core = Arc::new(Core::open(kv.clone()).expect("open the core"));
         let ssi = Ssi::install(&core);
         let locks = LockManager::install(&core);
         let catalog = Catalog::open(&core, &ssi, &locks).expect("open the catalog");
-        let db = Db::new(core.clone(), ssi.clone(), locks.clone(), catalog);
+        let db = Arc::new(Db::new(core.clone(), ssi.clone(), locks.clone(), catalog));
         core.waits
             .set_deadlock_timeout(Duration::from_millis(deadlock_ms));
         let commit = spawn_commit_thread_with(
@@ -154,6 +203,7 @@ impl Rig {
             Duration::from_millis(2),
         );
         Rig {
+            kv,
             db,
             t_oid: 0,
             u_oid: 0,
@@ -214,6 +264,14 @@ impl Rig {
         self.t_oid = t_oid;
         self.u_oid = u_oid;
         self.setup_rows();
+        // C-T6e3: one online-built index on `a` before the workload
+        // starts, so the DML mix's index scans have a target from the
+        // first program on — the DML stream outruns the DDL stream, so
+        // without a seed index most scans would find no index at all.
+        // Unrecorded, like the CREATE TABLEs above: the row model never
+        // tracks indexes (their oracle is the scan arm and amcheck).
+        create_index_online(&self.db, t_oid, &a_def(), false, &BuildHooks::default())
+            .expect("the setup index build");
     }
 
     /// The setup's row inserts — one recorded RC txn (session 0, program
@@ -801,6 +859,123 @@ impl<'r> Session<'r> {
         Ok(())
     }
 
+    /// C-T6e3's `SELECT * FROM t WHERE a BETWEEN .. AND ..` through an
+    /// index (§4, `Db::index_scan`). The target is a seeded pick of the
+    /// live indexes on `t` (all on `a`), resolved at execution and
+    /// recorded; the range is the seeded pick's ([`a_range`]).
+    ///
+    /// **The bracket.** The statement opens its own table handle first
+    /// (AccessShare, held to the txn's end), then reads the target's def
+    /// **before** (`pre`) and **after** (`post`) the engine call, each at
+    /// `visible_ts` through a ghost reader. From that lock discipline the
+    /// checker derives §4's "serves iff Public and built_at <= S" with no
+    /// scheduling argument, only monotonicity:
+    ///
+    /// - a def-changing DDL or a DROP INDEX (AccessExclusive) cannot
+    ///   commit between the handle's open and the engine's own catalog
+    ///   read (the statement's AccessShare parks it), so the engine
+    ///   decodes rows under exactly the handle's reported definition and
+    ///   the row pairing below is exact;
+    /// - an index's state only ever advances DeleteOnly→WriteOnly→Public
+    ///   (the ladder's SUE steps do not conflict with AccessShare, so
+    ///   they *can* land inside the bracket — that is why there are two
+    ///   sights): `pre` bounds what the engine's read saw from below
+    ///   (pre-Public ⇒ the engine's later read saw at most the same
+    ///   publicness), `post` from above (the engine's read is ≤ post in
+    ///   publicness). A served scan therefore implies `post` serves at
+    ///   the statement's snapshot, and a refusal implies `pre` did not
+    ///   serve — one direction sound per sight, never both from one;
+    /// - `built_at` is write-once at the publish, so both sights (and the
+    ///   engine's own def read) name the same value whenever they see the
+    ///   index at all.
+    fn index_scan(
+        &self,
+        st: &Stmt<'_>,
+        op: &mut OpRec,
+        choice: u32,
+        pick: u32,
+    ) -> Result<(), nucleus_catalog::DbError> {
+        let h = self
+            .rig
+            .db
+            .open_table(st, self.rig.t_oid, RelLockMode::AccessShare)?;
+        op.def_version = Some(h.def_version);
+        op.sid = Some(h.storage_id);
+        let (lo, hi) = a_range(pick);
+        let idxs = live_idxs(&self.rig.db, self.rig.t_oid);
+        // The `drop_target` pattern: an unfinished index (the ladder's
+        // mid-state, or a sabotaged/crashed CONCURRENTLY leftover) is
+        // the interesting target, so the pick prefers those when one
+        // exists — the Public population dominates the rest of the time
+        // and the served arm keeps its rows oracle either way.
+        let pool: Vec<u64> = {
+            let unfinished: Vec<u64> = idxs
+                .iter()
+                .filter_map(|row| {
+                    let def = IndexDef::decode(&row.def).ok()?;
+                    (def.state != IndexState::Public).then_some(row.oid)
+                })
+                .collect();
+            if unfinished.is_empty() {
+                idxs.iter().map(|row| row.oid).collect()
+            } else {
+                unfinished
+            }
+        };
+        let target = pick_index(choice, pool.len()).map(|i| pool[i]);
+        let Some(oid) = target else {
+            // The DeleteU pattern: a legal no-op statement when there is
+            // nothing to scan.
+            op.detail = OpDetail::IndexScan {
+                oid: None,
+                lo,
+                hi,
+                pre: IdxSight::Absent,
+                post: None,
+            };
+            op.out = OpOut::Ok;
+            return Ok(());
+        };
+        let pre = idx_sight(&self.rig.db, oid)?;
+        // Recorded before the engine call, so a refusal (the §4 0A000, a
+        // 42704, an RR 40001) still carries its justifying sight — the
+        // checker's refusal arm reads `pre` alone.
+        op.detail = OpDetail::IndexScan {
+            oid: Some(oid),
+            lo,
+            hi,
+            pre,
+            post: None,
+        };
+        let rows = match (lo, hi) {
+            (Some(l), Some(h)) => self.rig.db.index_scan(
+                st,
+                oid,
+                Bound::Included(vec![Some(Value::Int8(l))]),
+                Bound::Included(vec![Some(Value::Int8(h))]),
+            )?,
+            _ => self
+                .rig
+                .db
+                .index_scan(st, oid, Bound::Unbounded, Bound::Unbounded)?,
+        };
+        let post = idx_sight(&self.rig.db, oid)?;
+        if let OpDetail::IndexScan { post: slot, .. } = &mut op.detail {
+            *slot = Some(post);
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for (key, datums) in &rows {
+            let pk = pk_of_key(h.storage_id, key).ok_or(nucleus_catalog::DbError::Row(
+                RowError::Corrupt("a t row key does not decode"),
+            ))?;
+            let row = self.record_t_row(&h, datums);
+            self.note_t_read(pk, &row);
+            out.push((pk, row));
+        }
+        op.out = OpOut::RowsT(out);
+        Ok(())
+    }
+
     /// `INSERT INTO t VALUES (pk, ..)`: one datum per live column of the
     /// handle's definition — the pk, fresh constants for `a` and `b`
     /// (`b` NULL when chosen), NULL for columns a DDL added.
@@ -1280,6 +1455,7 @@ fn kind_of(pop: &POp) -> OpKind {
         POp::DeleteU(_) => OpKind::DeleteU,
         POp::SetBig(..) => OpKind::SetBig,
         POp::NullBig(_) => OpKind::NullBig,
+        POp::IndexScan(..) => OpKind::IndexScan,
     }
 }
 
@@ -1382,6 +1558,9 @@ fn run_prog(
             POp::NullBig(pk) => s.exec(pos, kind_of(pop), |s, st, op| {
                 s.null_big(st, op, pk).map(|_| ())
             }),
+            POp::IndexScan(choice, pick) => s.exec(pos, kind_of(pop), |s, st, op| {
+                s.index_scan(st, op, choice, pick).map(|_| ())
+            }),
         };
         if let Err(code) = r {
             return if super::retryable(&code) {
@@ -1398,8 +1577,20 @@ fn run_prog(
     }
 }
 
-/// Runs one DDL program (its own RC txn).
+/// Runs one DDL program. The §7 driver ops (`CreateIndex`,
+/// `ResumeBuild`) run outside the `Session` machinery — the ladder
+/// manages its own RC txns and is recorded as a pseudo-txn whose fate is
+/// the driver call's own outcome; `DropIndex` and every ALTER are the
+/// usual one-txn Session statements.
 fn run_ddl(rig: &Rig, index: u32, attempt: u32, op: &PDdl, seed: u64) -> Outcome {
+    match op {
+        PDdl::CreateIndex(concurrently) => {
+            return run_create_index(rig, index, attempt, *concurrently, seed);
+        }
+        PDdl::ResumeBuild => return run_resume_build(rig, index, attempt, seed),
+        PDdl::DropIndex => return run_drop_index(rig, index, attempt),
+        _ => {}
+    }
     let kind = match op {
         PDdl::AddColumn(_) => OpKind::AddColumn,
         PDdl::DropColumn => OpKind::DropColumn,
@@ -1408,10 +1599,212 @@ fn run_ddl(rig: &Rig, index: u32, attempt: u32, op: &PDdl, seed: u64) -> Outcome
         PDdl::Truncate => OpKind::Truncate,
         PDdl::DropBig => OpKind::DropBig,
         PDdl::AddBig => OpKind::AddBig,
+        PDdl::CreateIndex(..) | PDdl::ResumeBuild | PDdl::DropIndex => unreachable!(),
     };
     let mut s = Session::begin(rig, DDL_SESSION, index, attempt, Level::ReadCommitted);
     let r = s.exec(0, kind, |s, st, rec| {
         run_ddl_op(s, st, rec, op, index, seed)
+    });
+    match r {
+        Err(code) if super::retryable(&code) => Outcome::Retry,
+        Err(_) => Outcome::Failed,
+        Ok(()) => match s.commit() {
+            Ok(_) => Outcome::Committed,
+            Err(code) if super::retryable(&code) => Outcome::Retry,
+            Err(_) => Outcome::Failed,
+        },
+    }
+}
+
+/// Records one DDL-thread op that runs outside the `Session` machinery
+/// (§7's driver manages its own txns: T0..T3 commit and ack before the
+/// call returns): a pseudo-txn at `Level::ReadCommitted` whose fate is
+/// the driver call's own outcome — `Committed` at the visible ts when it
+/// returned `Ok`, `Failed` with the driver's SQLSTATE when it did not.
+/// Index DDL changes no row, so the model applies no effect; the
+/// checker's index-scan arm and amcheck are its oracle. A driver failure
+/// is the build's own outcome (55000, XX001), never a 40001/40P01
+/// conflict, so nothing here retries.
+fn run_driver_ddl(
+    rig: &Rig,
+    index: u32,
+    attempt: u32,
+    kind: OpKind,
+    body: impl FnOnce(&mut OpDetail) -> Result<(), nucleus_catalog::DbError>,
+) -> Outcome {
+    let uid = rig.rec.next_uid();
+    let start = rig.rec.tick();
+    let mut rec = TxnRec {
+        uid,
+        session: DDL_SESSION,
+        prog: index,
+        attempt,
+        level: Level::ReadCommitted,
+        txn_snap: None,
+        start,
+        end: start,
+        fate: Fate::Failed("in-flight".into()),
+        ops: Vec::new(),
+    };
+    let mut op = OpRec {
+        kind,
+        detail: OpDetail::Pending,
+        out: OpOut::Ok,
+        snap: 0,
+        def_version: None,
+        sid: None,
+        start: rig.rec.tick(),
+        end: 0,
+    };
+    rig.note(DDL_SESSION, format!("T{uid} p{index}.{attempt} {kind:?}"));
+    let r = body(&mut op.detail);
+    op.end = rig.rec.tick();
+    match r {
+        Ok(()) => {
+            op.out = OpOut::Ok;
+            let ts = rig.db.core.visible_ts().0;
+            rec.ops.push(op);
+            rec.end = rig.rec.tick();
+            rec.fate = Fate::Committed(ts);
+            rig.rec.push(rec);
+            Outcome::Committed
+        }
+        Err(e) => {
+            op.out = OpOut::Err(e.sqlstate().to_string());
+            rec.ops.push(op);
+            rec.end = rig.rec.tick();
+            rec.fate = Fate::Failed(e.sqlstate().to_string());
+            rig.rec.push(rec);
+            Outcome::Failed
+        }
+    }
+}
+
+/// The `after_register` hook that captures the snapshot the driver
+/// registered in T3 — the index's `built_at` once the publish commits.
+fn built_at_hook(slot: &Arc<Mutex<Option<u64>>>) -> BuildHooks {
+    let slot = Arc::clone(slot);
+    BuildHooks {
+        after_register: Some(Box::new(move |ts| {
+            *slot.lock().expect("the built_at slot") = Some(ts.0);
+        })),
+        ..Default::default()
+    }
+}
+
+/// The DDL session's `CREATE INDEX [CONCURRENTLY] ON t (a)` (§7, on the
+/// DDL thread). A seeded half of the builds are **sabotaged** — a
+/// harness-level injection, the engine never edited (the `Bug` pattern):
+/// the `after_t0` hook rewrites the just-created index's state
+/// DeleteOnly→WriteOnly with the same `catalog_alter_idx_def` call T1
+/// itself makes, so the real T1's re-read finds WriteOnly where it
+/// expected DeleteOnly and fails the build with §7's own 55000
+/// ("changed concurrently"). The state is one a crash between T1's
+/// commit and any later step leaves legitimately, every writer still
+/// maintains it correctly (WriteOnly ⇒ full maintenance), amcheck's
+/// I-IDX-WO stays clean, and — when the build was CONCURRENTLY — the
+/// non-Public index stays for a later `ResumeBuild` (§7's remedy) or
+/// `DropIndex`, which is what makes those ops live in the soak.
+fn run_create_index(rig: &Rig, index: u32, attempt: u32, concurrently: bool, seed: u64) -> Outcome {
+    // A seeded half of the builds are sabotaged (see the module docs):
+    // enough that an unfinished index is usually live, so the DML scans'
+    // prefer-unfinished pick reliably meets the ladder's mid-states
+    // (a third left whole seeds without a single refusal in calibration).
+    let sabotage = super::Rng::new(seed ^ 0x51a0_0000 ^ (u64::from(index) << 8)).below(2) == 0;
+    let slot = Arc::new(Mutex::new(None));
+    let mut hooks = built_at_hook(&slot);
+    if sabotage {
+        let db = Arc::clone(&rig.db);
+        let t_oid = rig.t_oid;
+        hooks.after_t0 = Some(Box::new(move || {
+            // The just-created index: the only DeleteOnly one (the DDL
+            // thread is the only DDL writer and builds never overlap, and
+            // every leftover of an earlier sabotaged build is WriteOnly).
+            let Some((oid, def)) = live_idxs(&db, t_oid)
+                .into_iter()
+                .filter_map(|row| {
+                    let def = IndexDef::decode(&row.def).ok()?;
+                    (def.state == IndexState::DeleteOnly).then_some((row.oid, def))
+                })
+                .max_by_key(|(oid, _)| *oid)
+            else {
+                return; // nothing to jump (defensive; cannot happen)
+            };
+            let mut next = def;
+            next.state = IndexState::WriteOnly;
+            let txn = db.core.begin(Isolation::ReadCommitted);
+            let st = Stmt::new(&txn, db.core.visible_ts()).expect("the sabotage statement");
+            let ddl = Ddl::new(&db.core, &txn, st.ctx());
+            db.catalog
+                .catalog_alter_idx_def(
+                    &ddl,
+                    oid,
+                    &next.encode().expect("the jumped def encodes"),
+                    RelLockMode::AccessExclusive,
+                )
+                .expect("the state jump");
+            db.core
+                .commit(txn, SyncCommit::On)
+                .expect("the sabotage commit");
+        }));
+    }
+    run_driver_ddl(rig, index, attempt, OpKind::CreateIndex, |detail| {
+        let r = create_index_online(&rig.db, rig.t_oid, &a_def(), concurrently, &hooks);
+        *detail = OpDetail::CreateIndex {
+            concurrently,
+            built_at: slot.lock().expect("the built_at slot").take(),
+        };
+        r.map(|_| ())
+    })
+}
+
+/// The DDL session's `ALTER INDEX … RESUME` (§7): a seeded pick of the
+/// live **non-Public** indexes on `t` — the state a sabotaged or crashed
+/// CONCURRENTLY build leaves — driven through `resume_build`, which
+/// restarts the ladder from the committed state (`Public` is the no-op
+/// it returns; nothing to resume is the recorded no-op).
+fn run_resume_build(rig: &Rig, index: u32, attempt: u32, _seed: u64) -> Outcome {
+    let unfinished: Vec<u64> = live_idxs(&rig.db, rig.t_oid)
+        .into_iter()
+        .filter(|row| {
+            IndexDef::decode(&row.def)
+                .map(|d| d.state != IndexState::Public)
+                .unwrap_or(false)
+        })
+        .map(|row| row.oid)
+        .collect();
+    let target = pick_index(index, unfinished.len()).map(|i| unfinished[i]);
+    let slot = Arc::new(Mutex::new(None));
+    let hooks = built_at_hook(&slot);
+    run_driver_ddl(rig, index, attempt, OpKind::ResumeBuild, |detail| {
+        let r = target.map(|oid| resume_build(&rig.db, oid, &hooks));
+        *detail = OpDetail::ResumeBuild {
+            oid: target,
+            built_at: slot.lock().expect("the built_at slot").take(),
+        };
+        r.transpose().map(|_| ())
+    })
+}
+
+/// The DDL session's `DROP INDEX` — one of the live indexes on `t`, a
+/// seeded pick resolved at execution (recorded), dropped in the Session
+/// txn every other ALTER uses. Nothing to drop is the recorded no-op.
+fn run_drop_index(rig: &Rig, index: u32, attempt: u32) -> Outcome {
+    let idxs = live_idxs(&rig.db, rig.t_oid);
+    let target = pick_index(index, idxs.len()).map(|i| idxs[i].oid);
+    let mut s = Session::begin(rig, DDL_SESSION, index, attempt, Level::ReadCommitted);
+    let r = s.exec(0, OpKind::DropIndex, |s, st, rec| {
+        rec.detail = OpDetail::DropIndex { oid: target };
+        if let Some(oid) = target {
+            let ddl = Ddl::new(&s.rig.db.core, st.txn(), st.ctx());
+            s.rig
+                .db
+                .catalog
+                .catalog_drop_index(&ddl, oid)
+                .map_err(nucleus_catalog::DbError::Txn)?;
+        }
+        rec.out = OpOut::Ok;
+        Ok(())
     });
     match r {
         Err(code) if super::retryable(&code) => Outcome::Retry,
@@ -1496,6 +1889,9 @@ fn run_ddl_op(
             rec.out = OpOut::Ok;
             Ok(())
         }
+        // The §7 driver ops run outside the Session (run_ddl dispatches
+        // them before a Session begins); unreachable here.
+        PDdl::CreateIndex(..) | PDdl::DropIndex | PDdl::ResumeBuild => unreachable!(),
         // C-T6d2: DROP COLUMN big by name / its re-add. Both reuse the
         // AddColumn/DropColumn details (the model evolves through them),
         // the drop resolving the live attnum at execution.
@@ -1550,6 +1946,66 @@ fn live_schema(rig: &Rig) -> Result<TableSchema, nucleus_catalog::DbError> {
         .map_err(nucleus_catalog::DbError::Txn)?
         .ok_or(nucleus_catalog::DbError::UndefinedTable)?;
     Ok(TableSchema::decode(&rel.def)?)
+}
+
+// ---- C-T6e3: the online-build surface's helpers (§4, §7) ----------------------
+
+/// C-T6e3's index definition: non-unique on `a` (attnum 2), ASC, NULLS
+/// LAST (§6) — the driver overrides `state` and `built_at`.
+pub fn a_def() -> IndexDef {
+    IndexDef {
+        columns: vec![IndexColumn {
+            attnum: 2,
+            dir: Direction::Asc,
+            nulls: Nulls::Last,
+        }],
+        unique: false,
+        nulls_not_distinct: false,
+        concurrently: false,
+        state: IndexState::DeleteOnly,
+        built_at: 0,
+    }
+}
+
+/// A ghost reader's `ReadCtx` at `visible_ts` (the read a DDL statement's
+/// own target resolution makes; it owns nothing, so it sees exactly the
+/// committed state).
+fn ghost_ctx(db: &Db<SharedMem>) -> ReadCtx {
+    ReadCtx {
+        txn: nucleus_txn::TxnId {
+            epoch: db.core.epoch(),
+            n: 0,
+        },
+        snapshot: db.core.visible_ts(),
+        stmt_seq: 0,
+    }
+}
+
+/// Every index row the latest committed catalog has for `rel` — the
+/// pool the DDL session's DropIndex/ResumeBuild targets and the DML
+/// IndexScan picks from are resolved against (the choice is seeded, the
+/// resolution recorded).
+pub fn live_idxs(db: &Db<SharedMem>, rel: u64) -> Vec<IdxRow> {
+    let view = db.core.open_view();
+    Catalog::scan_idxs_of_rel(&db.core, &view, &ghost_ctx(db), rel).expect("scan the catalog")
+}
+
+/// The runner's own catalog read of index `oid`'s def at `visible_ts`:
+/// what a reader arriving now would be told (§4's def read).
+fn idx_sight(db: &Db<SharedMem>, oid: u64) -> Result<IdxSight, nucleus_catalog::DbError> {
+    let view = db.core.open_view();
+    let row = Catalog::read_idx(&db.core, &view, &ghost_ctx(db), oid)
+        .map_err(nucleus_catalog::DbError::Txn)?;
+    match row {
+        None => Ok(IdxSight::Absent),
+        Some(row) => {
+            let def = IndexDef::decode(&row.def)?;
+            Ok(IdxSight::Seen {
+                state: def.state,
+                built_at: def.built_at,
+            })
+        }
+    }
 }
 
 /// DROP COLUMN's target: a live **added** column (attnum ≥ 5 — `big` is

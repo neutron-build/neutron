@@ -340,6 +340,10 @@ impl Model {
             (OpDetail::Truncate { .. }, OpOut::Ok) => {
                 state.t.clear();
             }
+            // C-T6e3's index DDL (CREATE/DROP INDEX, RESUME) changes no
+            // row and no column of the definition the row model tracks:
+            // the state is unchanged and the ops' oracle is the
+            // index-scan arm of `check.rs` plus amcheck (§8).
             // Failed ops, reads, no-op writes: no effect.
             _ => {}
         }
@@ -581,5 +585,8 @@ pub fn is_ddl(kind: OpKind) -> bool {
             | OpKind::Truncate
             | OpKind::DropBig
             | OpKind::AddBig
+            | OpKind::CreateIndex
+            | OpKind::DropIndex
+            | OpKind::ResumeBuild
     )
 }
