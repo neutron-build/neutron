@@ -35,6 +35,26 @@ const providerJSONLimit = 64 << 20
 // Adapter is a Graph client bound to one mailbox.
 type Adapter struct {
 	http *http.Client
+
+	// PreferImmutableIds, when set, sends `Prefer: IdType="ImmutableId"` on
+	// this adapter's Graph GET requests — message and folder listings,
+	// delta pages, message and attachment fetches — asking Graph to
+	// identify items by their immutable form. It is the flip side of
+	// TranslateExchangeIds (identity.go): the header moves the mailbox to
+	// immutable ids; the translator converts the stored ones.
+	//
+	// BUILT, NOT ENABLED: the zero value is off and the wire bytes of
+	// every request this adapter already issues are unchanged with it
+	// unset. Enabling it on a mirror that holds mutable ids is a
+	// RE-IDENTIFICATION event — item ids Graph returns change format, and
+	// per the consumer's reviewed diagnosis (docs/identity-stability.md
+	// §3) that re-identification reaches stored folder ids too, which are
+	// embedded in delta cursors, sync-state keys and membership rows: the
+	// first post-flip stale sweep razes the mirror unless a
+	// TranslateExchangeIds migration of every retained id precedes any
+	// live use. Set it once, immediately after New, before the first
+	// request — the same host-opts-in shape as mail.Engine.FetchBodies.
+	PreferImmutableIds bool
 }
 
 // New wraps an HTTP client that already applies authentication.
@@ -100,6 +120,9 @@ func (a *Adapter) get(ctx context.Context, endpoint string, out any) error {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	if a.PreferImmutableIds {
+		req.Header.Set("Prefer", `IdType="ImmutableId"`)
+	}
 
 	resp, err := a.http.Do(req)
 	if err != nil {
