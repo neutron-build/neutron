@@ -796,6 +796,7 @@ fn in_a_range(row: &[(u16, Option<Value>)], lo: Option<i64>, hi: Option<i64>) ->
     }
 }
 
+/// The TRUNCATE-window check: an RR/SER read of `t` that *succeeded*
 /// The TRUNCATE-window check: an RR/SER access of `t` that *succeeded*
 /// although it answered from the storage a foreign TRUNCATE installed
 /// after its snapshot `S` — the engine must have answered 40001 (C-T0
