@@ -845,6 +845,7 @@ fn index_scan_matches_scan_and_old_snapshot_refused() {
 /// only after T1's commit, and T2's `find`/`reread` is the 55000. With
 /// the entry lock removed (mutant ORDER-DROP) the drop commits inside
 /// the window and T1's own catalog write misses the row — XX000.
+/// Joint kill (e2afix L-1): with `concurrent_second_build_same_index`, the pair kills both ORDER-SWAP placements — the after-the-wait one dies only here.
 #[test]
 fn mid_step_drop_is_55000() {
     let rig = BuildRig::new();
@@ -921,6 +922,7 @@ fn mid_step_drop_is_55000() {
 /// after the re-read): the resume parks, but its state check already
 /// passed before the wait — it clobbers the publish back to `WriteOnly`
 /// and also returns `Ok`.
+/// Joint kill (e2afix L-1): with `mid_step_drop_is_55000`, the pair kills both ORDER-SWAP placements — the after-the-reread one dies only here.
 #[test]
 fn concurrent_second_build_same_index() {
     let rig = BuildRig::new();
