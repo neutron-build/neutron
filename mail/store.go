@@ -565,7 +565,17 @@ func (s *PgStore) DeleteMessages(ctx context.Context, acct AccountID, ids []Mess
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return err
 	}
+	if err := deleteMessagesTx(ctx, tx, acct, ids); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// deleteMessagesTx is the retire shared by the plain delete path and
+// identity replacement, so both remove rows with identical semantics
+// inside a caller-owned transaction. It is idempotent: an absent id
+// deletes nothing.
+func deleteMessagesTx(ctx context.Context, tx pgx.Tx, acct AccountID, ids []MessageID) error {
 	for _, id := range ids {
 		for _, stmt := range []string{
 			`DELETE FROM mail_message_mailboxes WHERE account_id = $1 AND message_id = $2`,
@@ -577,7 +587,7 @@ func (s *PgStore) DeleteMessages(ctx context.Context, acct AccountID, ids []Mess
 			}
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // RemoveFromMailbox drops mailbox membership without deleting the message.
@@ -633,11 +643,144 @@ func (s *PgStore) RemoveFromMailbox(ctx context.Context, acct AccountID, box Mai
 }
 
 // ---------------------------------------------------------------------------
+// Identity hooks (the identity contract; see hooks.go)
+// ---------------------------------------------------------------------------
+
+var _ IdentityReplaceStore = (*PgStore)(nil)
+var _ ReferenceAwareStore = (*PgStore)(nil)
+
+// ReplaceIdentities performs every identity replacement in ONE
+// transaction, in the order the identity contract fixes: advisory lock
+// first, then AdmitIdentityWrite, then every replacement envelope and
+// membership (plus body copies), then RemapIdentity with all pairs, then
+// the retire of the old identities. Any failure anywhere — a hook
+// included — rolls back everything, leaving the old record readable and
+// the unit retryable. Envelope upserts and old-id deletes are
+// idempotent, so a retry after a rollback converges. A nil hooks value
+// skips the callbacks; the writes and the retire still share the one
+// transaction.
+func (s *PgStore) ReplaceIdentities(ctx context.Context, acct AccountID, reps []IdentityReplacement, hooks IdentityHooks) error {
+	if len(reps) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("mail: replace identities: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
+		return err
+	}
+	hookTx := pgxHookTx{tx: tx}
+	if hooks != nil {
+		if err := hooks.AdmitIdentityWrite(ctx, hookTx, acct); err != nil {
+			return fmt.Errorf("mail: admit identity write: %w", err)
+		}
+	}
+
+	envs := make([]Envelope, len(reps))
+	var bodies []*Body
+	var pairs []IdentityPair
+	for i := range reps {
+		envs[i] = reps[i].Envelope
+		if reps[i].Body != nil {
+			bodies = append(bodies, reps[i].Body)
+		}
+		if reps[i].OldID != "" && reps[i].OldID != reps[i].Envelope.ID {
+			pairs = append(pairs, IdentityPair{OldID: reps[i].OldID, NewID: reps[i].Envelope.ID})
+		}
+	}
+	if err := putEnvelopesTx(ctx, tx, acct, envs); err != nil {
+		return err
+	}
+	for _, b := range bodies {
+		if err := putBodyTx(ctx, tx, acct, b); err != nil {
+			return err
+		}
+	}
+	if hooks != nil && len(pairs) > 0 {
+		if err := hooks.RemapIdentity(ctx, hookTx, acct, pairs); err != nil {
+			return fmt.Errorf("mail: remap identity: %w", err)
+		}
+	}
+
+	olds := make([]MessageID, 0, len(reps))
+	for i := range reps {
+		if reps[i].OldID != "" && reps[i].OldID != reps[i].Envelope.ID {
+			olds = append(olds, reps[i].OldID)
+		}
+	}
+	if err := deleteMessagesTx(ctx, tx, acct, olds); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// RemoveFromMailboxReferenced behaves as RemoveFromMailbox, but before
+// any last-membership message is deleted it calls ReferencesDropped with
+// exactly the ids that will lose their LAST membership — inside the same
+// transaction, after the advisory lock, with the rows still readable so
+// the product can snapshot them. A hook error aborts the whole unit:
+// memberships and messages stay exactly as they were. A nil hooks value
+// degrades to RemoveFromMailbox's semantics in this same transaction.
+func (s *PgStore) RemoveFromMailboxReferenced(ctx context.Context, acct AccountID, box MailboxID, ids []MessageID, hooks IdentityHooks) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("mail: remove from mailbox referenced: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
+		return err
+	}
+
+	var orphaned []MessageID
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM mail_message_mailboxes
+			  WHERE account_id = $1 AND message_id = $2 AND mailbox_id = $3`,
+			string(acct), string(id), string(box)); err != nil {
+			return fmt.Errorf("mail: unlink %s: %w", id, err)
+		}
+
+		var remaining int
+		if err := tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM mail_message_mailboxes
+			  WHERE account_id = $1 AND message_id = $2`,
+			string(acct), string(id)).Scan(&remaining); err != nil {
+			return fmt.Errorf("mail: count mailboxes for %s: %w", id, err)
+		}
+		if remaining == 0 {
+			orphaned = append(orphaned, id)
+		}
+	}
+
+	if hooks != nil && len(orphaned) > 0 {
+		if err := hooks.ReferencesDropped(ctx, pgxHookTx{tx: tx}, acct, orphaned); err != nil {
+			return fmt.Errorf("mail: references dropped: %w", err)
+		}
+	}
+
+	for _, id := range orphaned {
+		for _, stmt := range []string{
+			`DELETE FROM mail_bodies WHERE account_id = $1 AND message_id = $2`,
+			`DELETE FROM mail_messages WHERE account_id = $1 AND id = $2`,
+		} {
+			if _, err := tx.Exec(ctx, stmt, string(acct), string(id)); err != nil {
+				return fmt.Errorf("mail: delete orphan %s: %w", id, err)
+			}
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// ---------------------------------------------------------------------------
 // Bodies
 // ---------------------------------------------------------------------------
 
 func (s *PgStore) PutBody(ctx context.Context, acct AccountID, b *Body) error {
-	parts, _ := json.Marshal(b.Parts)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("mail: put body: %w", err)
@@ -646,6 +789,17 @@ func (s *PgStore) PutBody(ctx context.Context, acct AccountID, b *Body) error {
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return err
 	}
+	if err := putBodyTx(ctx, tx, acct, b); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// putBodyTx is the body upsert shared by the lazy cache path and
+// identity replacement, so both write with identical semantics inside a
+// caller-owned transaction.
+func putBodyTx(ctx context.Context, tx pgx.Tx, acct AccountID, b *Body) error {
+	parts, _ := json.Marshal(b.Parts)
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO mail_bodies (account_id, message_id, text_body, html_body, parts, fetched_at)
 		 VALUES ($1, $2, $3, $4, $5, $6)
@@ -654,7 +808,7 @@ func (s *PgStore) PutBody(ctx context.Context, acct AccountID, b *Body) error {
 		string(acct), string(b.MessageID), b.Text, b.HTML, string(parts), time.Now().UTC()); err != nil {
 		return fmt.Errorf("mail: put body: %w", err)
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s *PgStore) Body(ctx context.Context, acct AccountID, id MessageID) (*Body, error) {

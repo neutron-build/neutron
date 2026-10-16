@@ -47,6 +47,10 @@ type memStore struct {
 	// failPutEnvelopes makes the next PutEnvelopes fail, to simulate a
 	// crash between storing data and advancing the cursor.
 	failPutEnvelopes bool
+
+	// replaceCalls counts ReplaceIdentities units, so engine tests can
+	// tell the paired replacement path from the plain write/retire pair.
+	replaceCalls int
 }
 
 func newMemStore() *memStore {
