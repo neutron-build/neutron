@@ -418,7 +418,13 @@ func toEnvelope(m *gmail.Message) mail.Envelope {
 				}
 			}
 		}
-		env.HasAttachment = payloadHasAttachment(m.Payload)
+		// Envelopes are fetched with format=metadata, which omits the
+		// part tree: a walk over the payload would find no filenames
+		// even for a multipart message and report an absence that was
+		// never provable (audit GMAIL-03). Unknown is the honest claim;
+		// payloadHasAttachment stays for a fetch that genuinely sees
+		// the tree.
+		env.Attachment = mail.AttachmentUnknown
 	}
 
 	env.Fingerprint = mail.ComputeFingerprint(&env)

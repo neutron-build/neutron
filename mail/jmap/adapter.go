@@ -759,7 +759,7 @@ func decodeEmails(raw json.RawMessage) ([]mail.Envelope, error) {
 			Preview:            m.Preview,
 			Size:               m.Size,
 			ReceivedAt:         m.ReceivedAt,
-			HasAttachment:      m.HasAttachment,
+			Attachment:         mail.AttachmentFromBool(m.HasAttachment),
 			From:               addrs(m.From),
 			To:                 addrs(m.To),
 			Cc:                 addrs(m.Cc),

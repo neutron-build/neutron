@@ -408,7 +408,7 @@ func (m graphMessage) toEnvelope() mail.Envelope {
 		Preview:            m.BodyPreview,
 		ReceivedAt:         m.ReceivedDateTime,
 		SentAt:             m.SentDateTime,
-		HasAttachment:      m.HasAttachments,
+		Attachment:         mail.AttachmentFromBool(m.HasAttachments),
 		MessageIDHeader:    m.InternetMessageID,
 		To:                 recipients(m.ToRecipients),
 		Cc:                 recipients(m.CcRecipients),

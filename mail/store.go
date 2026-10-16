@@ -405,18 +405,18 @@ func putEnvelopesTx(ctx context.Context, tx pgx.Tx, acct AccountID, envs []Envel
 			`INSERT INTO mail_messages (
 				account_id, id, thread_id, fingerprint, subject,
 				sent_at, received_at, from_addrs, to_addrs, cc_addrs,
-				bcc_addrs, reply_to_addrs, keywords, has_attachment, size,
+				bcc_addrs, reply_to_addrs, keywords, attachment_state, size,
 				preview, message_id_header, in_reply_to, references_header)
 			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
 			 ON CONFLICT (account_id, id) DO UPDATE SET
 			   thread_id = $3, fingerprint = $4, subject = $5,
 			   sent_at = $6, received_at = $7, from_addrs = $8, to_addrs = $9,
 			   cc_addrs = $10, bcc_addrs = $11, reply_to_addrs = $12,
-			   keywords = $13, has_attachment = $14, size = $15, preview = $16,
+			   keywords = $13, attachment_state = $14, size = $15, preview = $16,
 			   message_id_header = $17, in_reply_to = $18, references_header = $19`,
 			string(acct), string(e.ID), string(e.ThreadID), string(e.Fingerprint), e.Subject,
 			nullTime(e.SentAt), nullTime(e.ReceivedAt), string(from), string(to), string(cc),
-			string(bcc), string(replyTo), string(kw), e.HasAttachment, e.Size,
+			string(bcc), string(replyTo), string(kw), int16(e.Attachment), e.Size,
 			e.Preview, e.MessageIDHeader, string(inReplyTo), string(refs))
 		if err != nil {
 			return fmt.Errorf("mail: put envelope %s: %w", e.ID, err)
@@ -444,17 +444,18 @@ func putEnvelopesTx(ctx context.Context, tx pgx.Tx, acct AccountID, envs []Envel
 
 const envelopeColumns = `id, thread_id, fingerprint, subject, sent_at, received_at,
 	from_addrs, to_addrs, cc_addrs, bcc_addrs, reply_to_addrs, keywords,
-	has_attachment, size, preview, message_id_header, in_reply_to, references_header`
+	attachment_state, size, preview, message_id_header, in_reply_to, references_header`
 
 func scanEnvelope(row pgx.Row) (*Envelope, error) {
 	var e Envelope
 	var threadID, fingerprint, subject, preview, msgIDHdr *string
 	var sentAt, receivedAt *time.Time
 	var from, to, cc, bcc, replyTo, kw, inReplyTo, refs *string
+	var attachmentState int16
 
 	err := row.Scan(&e.ID, &threadID, &fingerprint, &subject, &sentAt, &receivedAt,
 		&from, &to, &cc, &bcc, &replyTo, &kw,
-		&e.HasAttachment, &e.Size, &preview, &msgIDHdr, &inReplyTo, &refs)
+		&attachmentState, &e.Size, &preview, &msgIDHdr, &inReplyTo, &refs)
 	if err != nil {
 		return nil, err
 	}
@@ -470,6 +471,7 @@ func scanEnvelope(row pgx.Row) (*Envelope, error) {
 	e.Subject = deref(subject)
 	e.Preview = deref(preview)
 	e.MessageIDHeader = deref(msgIDHdr)
+	e.Attachment = AttachmentState(attachmentState)
 	if sentAt != nil {
 		e.SentAt = *sentAt
 	}

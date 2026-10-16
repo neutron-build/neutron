@@ -3,6 +3,7 @@ package mail
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func TestIntegrationEnvelopeRoundTrip(t *testing.T) {
 		SentAt:          sent,
 		ReceivedAt:      sent.Add(time.Minute),
 		Keywords:        Keywords{Seen: true, Flagged: true, Custom: []string{"project-x"}},
-		HasAttachment:   true,
+		Attachment:      AttachmentPresent,
 		Size:            4096,
 		Preview:         "Here are the figures",
 		MessageIDHeader: "<roundtrip@example.com>",
@@ -109,8 +110,44 @@ func TestIntegrationEnvelopeRoundTrip(t *testing.T) {
 	if !got.SentAt.Equal(sent) {
 		t.Errorf("SentAt = %v, want %v", got.SentAt, sent)
 	}
+	if got.Attachment != original.Attachment {
+		t.Errorf("Attachment = %d, want %d", got.Attachment, original.Attachment)
+	}
 	if got.Fingerprint == "" {
 		t.Error("fingerprint was not persisted")
+	}
+}
+
+// GMAIL-03: attachment knowledge is tri-state. Unknown (Gmail
+// format=metadata envelopes) must survive a write+read cycle as itself —
+// collapsing it to absent on the way through the store is exactly the
+// bug the column replace exists to prevent.
+func TestIntegrationAttachmentStateRoundTrip(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	acct := seedAccount(t, s)
+
+	states := []AttachmentState{AttachmentUnknown, AttachmentAbsent, AttachmentPresent}
+	envs := make([]Envelope, len(states))
+	for i, st := range states {
+		envs[i] = Envelope{
+			ID:         HeaderMessageID(fmt.Sprintf("<attach-%d@example.com>", i)),
+			MailboxIDs: []MailboxID{"INBOX"},
+			Attachment: st,
+		}
+	}
+	if err := s.PutEnvelopes(ctx, acct, envs); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	for i, want := range states {
+		got, err := s.Envelope(ctx, acct, envs[i].ID)
+		if err != nil {
+			t.Fatalf("get %d: %v", i, err)
+		}
+		if got.Attachment != want {
+			t.Errorf("envelope %d Attachment = %d, want %d", i, got.Attachment, want)
+		}
 	}
 }
 
