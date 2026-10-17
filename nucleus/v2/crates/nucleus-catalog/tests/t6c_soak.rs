@@ -50,6 +50,15 @@
 //! - **E4** — writes encoding at `version - 1` (the row header's
 //!   schema_version): caught deterministically by `t6c_regress`'s
 //!   single-thread ADD COLUMN → insert → decode check.
+//!
+//! C-T6e4fix (the gate's L-2): the redraw's fail-path is pinned by the
+//! `#[ignore]`d `t6c_soak_stab_fail_exhausts_draws_and_panics_with_the_list`
+//! — an unmeetable floor (one bar past the observed range, added to the
+//! real floors) must exhaust the 4 draws and panic with the full starved
+//! list, so a regression that makes starved floors stop failing cannot
+//! pass silently (STAB-DROP's catcher). The draw loop lives in
+//! `soak_draws`, shared by the soak and the leg; every bar, message and
+//! the draw bound are unchanged by the extraction.
 
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
@@ -290,8 +299,20 @@ fn aggregate_coverage_floors(v: &Verdict) -> Vec<String> {
     starved
 }
 
-#[test]
-fn t6c_soak() {
+/// The soak's draw driver (C-T6e4's stabilization, extracted by
+/// C-T6e4fix so the STAB-FAIL leg can inject its own floors): the
+/// DRAWS-loop over the three fixed seeds with the coverage floors
+/// injected by the caller — `t6c_soak` passes the real ones; the
+/// `#[ignore]`d STAB-FAIL leg passes the real ones plus one unmeetable
+/// bar to prove the fail-path. Everything else is the soak's own
+/// contract, unchanged by the extraction: correctness — `assert_clean`,
+/// leaked intents, the amcheck point count — asserts on EVERY draw and
+/// is never redrawn; an empty starved list returns; exhaustion panics
+/// with the last draw's full list.
+fn soak_draws(
+    seed_floors: &dyn Fn(u64, &Verdict) -> Vec<String>,
+    aggregate_floors: &dyn Fn(&Verdict) -> Vec<String>,
+) {
     // C-T6e4's draw loop. The coverage floors ride a racy threaded
     // workload: a scheduling draw can starve one while the engine stays
     // clean (violations: 0, no leaks, amcheck green) — the C-T6d2fix
@@ -334,7 +355,7 @@ fn t6c_soak() {
                 "3 mid-run points × 2 tables + the end: {:?}",
                 verdict.stats
             );
-            starved.extend(seed_coverage_floors(seed, &verdict));
+            starved.extend(seed_floors(seed, &verdict));
             // The aggregate of the large-value surface (Stats is Copy;
             // the per-field sums are what the bars below run on).
             let s = &verdict.stats;
@@ -358,7 +379,7 @@ fn t6c_soak() {
             acc.idx_sights_delete_only += s.idx_sights_delete_only;
             acc.idx_sights_write_only += s.idx_sights_write_only;
         }
-        starved.extend(aggregate_coverage_floors(&big));
+        starved.extend(aggregate_floors(&big));
         if starved.is_empty() {
             return;
         }
@@ -378,6 +399,11 @@ fn t6c_soak() {
     );
 }
 
+#[test]
+fn t6c_soak() {
+    soak_draws(&seed_coverage_floors, &aggregate_coverage_floors);
+}
+
 /// The long variant: 50 seeds, `#[ignore]`d (the card's item 5).
 #[test]
 #[ignore = "long: 50 seeds"]
@@ -389,6 +415,63 @@ fn t6c_soak_long() {
         assert_clean(seed, &verdict);
         assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
     }
+}
+
+/// C-T6e4fix (the gate's L-2): the redraw's fail-path, pinned. An
+/// unmeetable floor — one bar raised past the observed range, the
+/// STAB-FAIL shape (the C-T6e4 gate demonstrated it transiently; this
+/// leg commits it) — must exhaust the draws and panic with the full
+/// starved list, never silently pass. Without this leg a regression
+/// that makes starved floors stop failing (an early `return`, the
+/// starve-list check dropped, the panic removed) would convert a
+/// coverage floor into a suggestion — the exact weakening class the
+/// cards forbid — and nothing in-tree would notice (STAB-DROP's
+/// catcher).
+///
+/// `#[ignore]d` because it deliberately runs four full three-seed draws
+/// (~15 s) to reach the exhaustion; run it with `--ignored`. The
+/// unmeetable bar is **added** to the real floors, never raised in
+/// place — every real bar, value and message is untouched (the seed
+/// floors' own comment records the observed 60–117 big writes per seed;
+/// 100000 is past the range by construction).
+#[test]
+#[ignore = "STAB-FAIL demo: four deliberate draws, ~15 s; run with --ignored"]
+fn t6c_soak_stab_fail_exhausts_draws_and_panics_with_the_list() {
+    let stab_fail_seed_floors = |seed: u64, v: &Verdict| {
+        let mut starved = seed_coverage_floors(seed, v);
+        starved.push(format!(
+            "STAB-FAIL bar: big_writes {} of 100000",
+            v.stats.big_writes
+        ));
+        starved
+    };
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        soak_draws(&stab_fail_seed_floors, &aggregate_coverage_floors);
+    }));
+    let err = panicked.expect_err(
+        "the unmeetable floor was silently swallowed — starved floors \
+         must exhaust the draws and fail, never pass (the redraw's \
+         fail-path)",
+    );
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("4 draws"),
+        "the panic must name the draw exhaustion:\n{msg}"
+    );
+    assert!(
+        msg.contains("STAB-FAIL bar"),
+        "the panic must carry the starved list, the unmeetable bar in \
+         it:\n{msg}"
+    );
+    assert!(
+        msg.contains("not scheduling luck"),
+        "the panic must keep its meaning — an exhausted floor is a \
+         surface the workload no longer exercises:\n{msg}"
+    );
 }
 
 // ----- determinism ------------------------------------------------------------
