@@ -24,13 +24,8 @@ C-T0 §5 and every read through C-T0 §4 at a registered snapshot or view
   (dropped included); dropped attnums are written NULL.
 - `value_bytes` is lossless (§2.1), never compared bytewise.
   Canonicalisation (e.g. jsonb input) is the type input function's job.
-- Trailing bytes, short datums, unknown tags and undecodable values are
-  XX001, never a panic. The NULL clause is era-scoped: a NULL bit on a NOT
-  NULL attnum `<= natts` of the definition the row was encoded under (row
-  header `v == V`) is XX001 — `encode_row` refuses such a NULL, so a stray
-  one is corruption — while a NULL that was legal at the row's own era
-  (`v < V`: the attnum was nullable when the row was written, e.g. a NULL
-  committed before a SET NOT NULL) is served.
+- Trailing bytes, short datums, unknown tags, undecodable values, or a NULL
+  bit on a live NOT NULL attnum `<= natts` are XX001, never a panic.
 
 ### 2.1 Value bytes
 | type | bytes |
@@ -81,11 +76,7 @@ C-T0 §5 and every read through C-T0 §4 at a registered snapshot or view
 - **Decode rule.** Row header `(v, n)` under definition `D` (version `V`):
   `v > V` or `n > D.ncols` → XX001. For each live attnum of `D` in order:
   attnum `<= n` → the row's datum or NULL; attnum `> n` → `missing` if
-  present, else NULL. Dropped attnums are skipped. NOT NULL binds at
-  `v == V`: a NULL bit on a NOT NULL attnum of `D` is XX001 only when the
-  row was encoded under that flag; at `v < V` a NULL legal at the row's
-  own era is served (§2's era scoping — SET NOT NULL validated the latest
-  committed state, above, and rewrites nothing). `decode_row_raw` returns
+  present, else NULL. Dropped attnums are skipped. `decode_row_raw` returns
   every attnum `<= n` including dropped ones (used to find toast pointers).
 - **Lazy upgrade:** every write encodes at the current `version` with
   `natts = D.ncols`; no DDL rewrites rows.
@@ -322,11 +313,3 @@ At a registered snapshot `S`, catalog at `S`:
   XX001): the engine fix is card C-T6e3fix (`index_scan` verifies in the
   entry's own visibility regime); this restatement of §6's sentence, the
   differential's un-shaping and the corruption pin are card C-T6e3fix2.
-- 2026-10-17, the e4 escalation (a legal history — a row's pre-constraint
-  NULL still visible at a snapshot below a concurrent delete-or-update and
-  SET NOT NULL pair, whose validating scan saw the latest committed state —
-  came back XX001 from the NOT NULL decode on every read and write path):
-  the engine fix is card C-T6e4 (`decode_row_at_era`: the flags decode at
-  the row's own era, `v == V` keeps full strength); this era scoping of
-  §2's NULL clause, §3's decode rule's `v == V` condition and the in-suite
-  pins are card C-T6e4fix.

@@ -74,17 +74,23 @@
 //!   equals the definition's, carrying a NULL on its NOT NULL column,
 //!   still decodes XX001 (the carve-out is era-scoped, never a blanket
 //!   disarm).
-//! - `t6e4_spec_divergence_is_pinned`: the spec letter's tripwire. Its
-//!   interim form pinned the enforced-out divergence (the runner's docs
-//!   protection had reverted C-T6e4's spec-first edit, the C-T6e3fix2
-//!   precedent); C-T6e4fix landed the letter — §2's NULL clause
-//!   era-scoped, §3's decode rule's `v == V` condition, the changelog
-//!   line naming the e4 escalation — and the pin flipped with it (the
-//!   e3fix2→e3fix3 sequence): it now guards the landed letter in both
-//!   directions of drift (SPEC-REVERT's catcher).
+//! - `t6e4_spec_divergence_is_pinned`: the spec letter's tripwire, in
+//!   its interim form — the `nucleus/v2/docs/` tree is protected (the
+//!   C-T6e3fix2 precedent: the card's spec-first edit was reverted by
+//!   the runner; C-T6e4's and C-T6e4fix's landing attempts were
+//!   enforced out the same way — spec edits are author-level actions),
+//!   so C-T6 §2's NULL clause still carries the pre-fix unscoped
+//!   letter while the engine carves out the row's own era; the
+//!   divergence is pinned in-suite instead (SPEC-EDIT's catcher — the
+//!   future docs card that lands the era scoping flips this pin, the
+//!   e3fix2→e3fix3 sequence).
 //!
-//! C-T6e4fix additions — the gate's residuals (M-1's letter above, L-1,
-//! L-2's leg living in `t6c_soak.rs`):
+//! C-T6e4fix additions — the gate's residuals (L-1 and L-2 landed; the
+//! M-1 letter was authored — §2's NULL clause era-scoped, §3's decode
+//! rule's `v == V` condition, the changelog line — but enforced out by
+//! the runner's docs protection, the third time in this lineage, so it
+//! stays this card's ESCALATE and the tripwire above holds the
+//! divergence visible):
 //!
 //! - `t6e4_pre_constraint_null_row_deletes_clean_under_a_later_set_not_null`:
 //!   the delete leg (L-1) — the era family through `delete_with`'s
@@ -1296,18 +1302,19 @@ fn t6e4_pre_constraint_null_row_deletes_clean_under_a_later_set_not_null() {
     drop(g);
 }
 
-/// C-T6e4's spec letter, landed (the C-T6e4fix docs half) and pinned
-/// (SPEC-REVERT's catcher): the engine decodes NOT NULL flags at the
-/// row's own era (`decode_row_at_era`), and C-T6 §2/§3 license it — the
-/// NULL clause is era-scoped (a NULL bit on a NOT NULL attnum of the
-/// definition the row was encoded under, `v == V`, is XX001; a NULL
-/// legal at the row's era is served), §3's decode rule carries the
-/// `v == V` condition, and the changelog names the e4 escalation. This
-/// pin is the flipped form the interim tripwire's failure messages
-/// asked for (the e3fix2→e3fix3 sequence): it guards the landed letter
-/// in both directions — the pre-fix unscoped clause returning, the era
-/// scoping or the `v == V` condition dropping, or the changelog duty
-/// vanishing each fail here.
+/// C-T6e4's spec divergence, pinned in its interim form (SPEC-EDIT's
+/// catcher): the engine decodes NOT NULL flags at the row's own era
+/// (`decode_row_at_era`), but C-T6 §2's NULL clause still carries the
+/// pre-fix unscoped letter — the spec-first edits were reverted by the
+/// runner's `nucleus/v2/docs/` protection (the C-T6e3fix2 precedent;
+/// C-T6e4's attempt, and now C-T6e4fix's own landing of the era
+/// scoping, the `v == V` condition and the changelog line, were all
+/// enforced out the same way — spec edits are author-level actions).
+/// This pin keeps the divergence visible instead of silently forgetting
+/// it: a docs edit that lands the era scoping **must** also record the
+/// e4 escalation in the changelog and flip this test (the
+/// e3fix2→e3fix3 sequence), and an edit that lands the letter without
+/// the engine — or drops the changelog duty — fails here.
 #[test]
 fn t6e4_spec_divergence_is_pinned() {
     let src = std::fs::read_to_string(concat!(
@@ -1315,7 +1322,6 @@ fn t6e4_spec_divergence_is_pinned() {
         "/../../docs/C-T6-rows-schema-indexes.md"
     ))
     .expect("the C-T6 spec");
-    let flat = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
     // §2's NULL bullet: from its opening phrase to the §2.1 heading.
     let start = src
         .find("Trailing bytes, short datums")
@@ -1324,44 +1330,32 @@ fn t6e4_spec_divergence_is_pinned() {
         .find("### 2.1")
         .map(|i| start + i)
         .expect("the end of §2");
+    let flat = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
     let bullet = flat(&src[start..end]);
-    // The landed letter: era-scoped, and the pre-fix unscoped clause
-    // (which outlawed the carve-out the engine performs) is gone.
+    // The interim state: the pre-fix letter is still there (the docs
+    // card that lands the era scoping must flip this leg together with
+    // the ones below).
     assert!(
-        !bullet.contains("a NULL bit on a live NOT NULL attnum"),
-        "§2's pre-fix unscoped NULL clause returned — the era carve-out \
-         the engine performs is licensed by the era-scoped letter:\n{bullet}"
+        bullet.contains("a NULL bit on a live NOT NULL attnum"),
+        "§2's NULL clause is not the pre-fix letter — the docs card has \
+         landed; flip this pin to guard the era scoping instead:\n{bullet}"
     );
     assert!(
-        bullet.contains("era-scoped"),
-        "§2's NULL clause lost its era scoping — the C-T6e4 engine \
-         carve-out must stay licensed by the letter:\n{bullet}"
+        !bullet.contains("era-scoped"),
+        "§2's NULL clause gained era scoping without this pin flipping — \
+         the docs card must update `t6e4_spec_divergence_is_pinned` \
+         (the e3fix2→e3fix3 sequence):\n{bullet}"
     );
-    assert!(
-        bullet.contains("v == V"),
-        "§2's NULL clause must keep the `v == V` condition — the \
-         definition the row was encoded under:\n{bullet}"
-    );
-    // §3's decode rule carries the same condition.
-    let dstart = src.find("**Decode rule.**").expect("§3's decode rule");
-    let dend = src[dstart..]
-        .find("### 3.1")
-        .map(|i| dstart + i)
-        .expect("the end of §3");
-    let rule = flat(&src[dstart..dend]);
-    assert!(
-        rule.contains("v == V"),
-        "§3's decode rule lost the `v == V` condition — the NOT NULL \
-         flags bind at the row's own era:\n{rule}"
-    );
-    // The changelog exists and keeps naming the e4 escalation.
+    // The changelog exists and does not yet claim the e4 landing (it
+    // will when the docs card lands; this leg flips with the ones
+    // above).
     assert!(
         src.contains("## Changelog"),
-        "the spec's changelog vanished — keep it"
+        "the spec's changelog vanished — the docs card must keep it"
     );
     assert!(
-        src.contains("the e4 escalation"),
-        "the changelog no longer names the e4 escalation (C-T6e4's fix, \
-         C-T6e4fix's letter)"
+        !src.contains("the e4 escalation"),
+        "the changelog records the e4 escalation — the docs card has \
+         landed; flip this pin to guard the landed letter instead"
     );
 }
