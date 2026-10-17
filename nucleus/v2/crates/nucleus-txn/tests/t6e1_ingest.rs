@@ -15,6 +15,12 @@
 //!   sync-spy records `sync_wal` before `ingest_sorted`; `crash(0)` keeps
 //!   the commit's data and the ingested entry) — visible because the
 //!   Fault's ingest is durable on return but not a barrier.
+//! - `crash_prefix_pre_sync` / `crash_prefix_post_sync` (C-T6e1fix, the
+//!   gate's M-2): a hook-injected `crash(0)` immediately before the
+//!   step-3 sync (and immediately before the ingest after it) captures
+//!   the rebuilt store; every prefix is recoverable and consistent.
+//! - `empty_entries_is_noop` (C-T6e1fix L-3): an empty `entries` chunk is
+//!   `Ok(())` with no sync and no ingest in the spy log.
 
 mod common;
 
@@ -28,8 +34,8 @@ use nucleus_txn::boot::Core;
 use nucleus_txn::catalog::index_ranges;
 use nucleus_txn::commit::{CommitPipeline, SyncCommit};
 use nucleus_txn::encoding::{
-    decode_intent, encode_intent, intent_key, parse_key, version_key, Entry, HEADER_LIVE,
-    HEADER_TOMBSTONE,
+    decode_intent, encode_intent, intent_key, parse_key, sys_txn_key, version_key, Entry,
+    HEADER_LIVE, HEADER_TOMBSTONE,
 };
 use nucleus_txn::read::{read_key, NoSsi};
 use nucleus_txn::resolver::Resolver;
@@ -70,22 +76,42 @@ enum Call {
 /// An `OrderedKv` wrapper over `Arc<Fault<MemKv>>`: the fault stays
 /// reachable so a test can crash it while the core holds the wrapper, and
 /// every write / sync / ingest is recorded in call order (the sync spy).
+/// C-T6e1fix adds one-shot pre-hooks on `sync_wal` and `ingest_sorted`
+/// (the crash-prefix captures): unset, they change nothing.
 #[derive(Clone)]
 struct SpyKv {
     fault: Arc<Fault<MemKv>>,
     calls: Arc<Mutex<Vec<Call>>>,
+    pre_sync: Arc<Mutex<Option<Hook>>>,
+    pre_ingest: Arc<Mutex<Option<Hook>>>,
 }
+
+/// A one-shot hook, run before the wrapped call is forwarded to the fault.
+type Hook = Box<dyn FnOnce() + Send>;
 
 impl SpyKv {
     fn new() -> SpyKv {
         SpyKv {
             fault: Arc::new(Fault::new(MemKv::new(), || Ok(MemKv::new()))),
             calls: Arc::new(Mutex::new(Vec::new())),
+            pre_sync: Arc::new(Mutex::new(None)),
+            pre_ingest: Arc::new(Mutex::new(None)),
         }
     }
 
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().expect("spy calls").clone()
+    }
+
+    /// Arms the one-shot `sync_wal` pre-hook (the pre-sync crash prefix).
+    fn set_pre_sync(&self, hook: Hook) {
+        *self.pre_sync.lock().expect("pre_sync slot") = Some(hook);
+    }
+
+    /// Arms the one-shot `ingest_sorted` pre-hook (the post-sync crash
+    /// prefix).
+    fn set_pre_ingest(&self, hook: Hook) {
+        *self.pre_ingest.lock().expect("pre_ingest slot") = Some(hook);
     }
 }
 
@@ -101,6 +127,9 @@ impl OrderedKv for SpyKv {
 
     fn sync_wal(&self) -> Result<()> {
         self.calls.lock().expect("spy calls").push(Call::Sync);
+        if let Some(hook) = self.pre_sync.lock().expect("pre_sync slot").take() {
+            hook();
+        }
         self.fault.sync_wal()
     }
 
@@ -114,6 +143,9 @@ impl OrderedKv for SpyKv {
 
     fn ingest_sorted(&self, entries: &mut dyn Iterator<Item = (Key, Value)>) -> Result<()> {
         self.calls.lock().expect("spy calls").push(Call::Ingest);
+        if let Some(hook) = self.pre_ingest.lock().expect("pre_ingest slot").take() {
+            hook();
+        }
         self.fault.ingest_sorted(entries)
     }
 
@@ -204,9 +236,32 @@ fn place_delete(core: &Core<SpyKv>, txn: &Txn, key: &[u8]) {
 
 /// A whole-store raw dump (stored keys), for "nothing was written".
 fn raw_dump(kv: &SpyKv) -> Vec<(Key, Value)> {
-    let snap = kv.fault.snapshot();
+    fault_dump(&kv.fault)
+}
+
+/// A whole-store raw dump straight off the fault (the hook-side twin of
+/// `raw_dump`, usable from a closure holding only the `Arc<Fault>`).
+fn fault_dump(fault: &Fault<MemKv>) -> Vec<(Key, Value)> {
+    let snap = fault.snapshot();
     snap.scan((Bound::Unbounded, Bound::Unbounded), false)
         .map(ok)
+        .collect()
+}
+
+/// One key's value in a crash capture.
+fn cap_get(cap: &[(Key, Value)], key: &[u8]) -> Option<Value> {
+    cap.iter()
+        .find(|(k, _)| k.as_slice() == key)
+        .map(|(_, v)| v.clone())
+}
+
+/// Every stored key inside the index's `/i/` storage range, sorted.
+fn i_range_keys(cap: &[(Key, Value)]) -> Vec<Key> {
+    let (lo, hi) = idx_ranges().last().expect("two ranges").clone();
+    cap.iter()
+        .map(|(k, _)| k)
+        .filter(|k| k.as_slice() >= lo.as_slice() && k.as_slice() < hi.as_slice())
+        .cloned()
         .collect()
 }
 
@@ -491,4 +546,235 @@ fn sync_before_ingest() {
         None,
         "the source intent was resolved before the sync"
     );
+}
+
+// ---- C-T6e1fix: the crash-prefix pair and the empty chunk ---------------------
+
+/// A crash capture: the rebuilt store's whole contents, filled by a hook.
+type Capture = Arc<Mutex<Option<Vec<(Key, Value)>>>>;
+
+fn new_capture() -> Capture {
+    Arc::new(Mutex::new(None))
+}
+
+/// The crash-prefix pair's setup: an On-committed and an Off-committed
+/// source intent inside the span (both unresolved — the resolver never
+/// runs), then a filler commit so `S` lands strictly above every commit ts
+/// and the ingest's ts cannot collide with a resolution's ts.
+struct CrashPrefix {
+    ka: Key,
+    kb: Key,
+    c_on: Ts,
+    c_off: Ts,
+    on_id: TxnId,
+    off_id: TxnId,
+}
+
+fn crash_prefix_setup(rig: &mut Rig) -> CrashPrefix {
+    let ka = ikey("a-on"); // committed On: record and intent durable
+    let kb = ikey("b-off"); // committed Off: nothing durable
+    let on = rig.txn();
+    let on_id = on.id;
+    common::place_intent(&rig.core, &on, &ka, b"on-row");
+    let c_on = rig.commit(on, SyncCommit::On);
+    let off = rig.txn();
+    let off_id = off.id;
+    common::place_intent(&rig.core, &off, &kb, b"off-row");
+    let c_off = rig.commit(off, SyncCommit::Off);
+    // The filler pushes S strictly above both commit ts. It must be Off
+    // itself: an On filler would fsync and make the Off source's record
+    // durable before the ingest, and an all-Off group never fsyncs.
+    let fill = rig.txn();
+    common::place_intent(&rig.core, &fill, b"/t/1/x", b"fill");
+    let c_fill = rig.commit(fill, SyncCommit::Off);
+    assert!(c_fill > c_off && c_off > c_on);
+    CrashPrefix {
+        ka,
+        kb,
+        c_on,
+        c_off,
+        on_id,
+        off_id,
+    }
+}
+
+/// Crash immediately **before the ingest's step-3 sync** (the pre-sync
+/// hook) and capture the rebuilt store: the ingest's resolution batches
+/// are unsynced and drop, the On commit's record+intent stay durable (its
+/// own fsync covered them; boot re-resolves), the Off source vanishes
+/// whole, and nothing was ingested.
+#[test]
+fn crash_prefix_pre_sync() {
+    let mut rig = Rig::new();
+    let cp = crash_prefix_setup(&mut rig);
+    let snap = rig.core.registry.take_snapshot();
+    let s = snap.ts();
+    assert!(s > cp.c_off, "S is strictly above every commit ts");
+
+    let captured = new_capture();
+    {
+        let fault = Arc::clone(&rig.kv.fault);
+        let cell = Arc::clone(&captured);
+        rig.kv.set_pre_sync(Box::new(move || {
+            ok(fault.crash(0));
+            *cell.lock().expect("capture") = Some(fault_dump(&fault));
+        }));
+    }
+    ok(rig.core.ingest_versions(
+        &snap,
+        &idx_ranges(),
+        &mut vec![
+            (cp.ka.clone(), b"e-a".to_vec()),
+            (cp.kb.clone(), b"e-b".to_vec()),
+        ]
+        .into_iter(),
+    ));
+    let cap = captured
+        .lock()
+        .expect("capture")
+        .take()
+        .expect("the pre-sync crash ran");
+
+    // Resolutions dropped: the On source's intent is back and no resolved
+    // version exists.
+    assert!(
+        cap_get(&cap, &intent_key(&cp.ka)).is_some(),
+        "the On intent is back: the resolution batch dropped"
+    );
+    assert!(
+        cap_get(&cap, &version_key(&cp.ka, cp.c_on)).is_none(),
+        "no resolved version survived the pre-sync crash"
+    );
+    // The On commit's record is durable (its own fsync covered the batch);
+    // the intent above is the other half of "record+intent durable".
+    assert_eq!(
+        cap_get(&cap, &sys_txn_key(cp.on_id)),
+        Some(cp.c_on.0.to_be_bytes().to_vec()),
+        "the On commit's record is durable"
+    );
+    // The Off source is gone whole: record, intent and would-be version
+    // were all unsynced (an all-Off group never fsyncs).
+    assert!(
+        cap_get(&cap, &sys_txn_key(cp.off_id)).is_none(),
+        "the Off commit's record dropped"
+    );
+    assert!(
+        cap_get(&cap, &intent_key(&cp.kb)).is_none(),
+        "the Off intent dropped"
+    );
+    assert!(
+        cap_get(&cap, &version_key(&cp.kb, cp.c_off)).is_none(),
+        "no Off version exists"
+    );
+    // No ingest: nothing at S; the /i/ range holds exactly the On intent.
+    assert!(cap_get(&cap, &version_key(&cp.ka, s)).is_none());
+    assert!(cap_get(&cap, &version_key(&cp.kb, s)).is_none());
+    assert_eq!(
+        i_range_keys(&cap),
+        vec![intent_key(&cp.ka)],
+        "the /i/ range holds exactly the durable On intent"
+    );
+    drop(snap);
+}
+
+/// Crash immediately **before the ingest** (after the step-3 sync; the
+/// pre-ingest hook) and capture the rebuilt store: the resolutions and the
+/// Off source's row are durable through the sync, and still nothing was
+/// ingested. This is also the only in-run pin that the removals ran
+/// **before** the sync: a sync hoisted above them leaves the span
+/// resolutions unsynced at this point and the capture shows the intents
+/// back.
+#[test]
+fn crash_prefix_post_sync() {
+    let mut rig = Rig::new();
+    let cp = crash_prefix_setup(&mut rig);
+    let snap = rig.core.registry.take_snapshot();
+    let s = snap.ts();
+    assert!(s > cp.c_off);
+
+    let captured = new_capture();
+    {
+        let fault = Arc::clone(&rig.kv.fault);
+        let cell = Arc::clone(&captured);
+        rig.kv.set_pre_ingest(Box::new(move || {
+            ok(fault.crash(0));
+            *cell.lock().expect("capture") = Some(fault_dump(&fault));
+        }));
+    }
+    ok(rig.core.ingest_versions(
+        &snap,
+        &idx_ranges(),
+        &mut vec![
+            (cp.ka.clone(), b"e-a".to_vec()),
+            (cp.kb.clone(), b"e-b".to_vec()),
+        ]
+        .into_iter(),
+    ));
+    let cap = captured
+        .lock()
+        .expect("capture")
+        .take()
+        .expect("the pre-ingest crash ran");
+
+    // The resolutions are durable: both intents are gone, each source row
+    // resolved at its own commit ts (the removals preceded the sync).
+    assert!(
+        cap_get(&cap, &intent_key(&cp.ka)).is_none(),
+        "the On intent was resolved durably"
+    );
+    assert!(
+        cap_get(&cap, &intent_key(&cp.kb)).is_none(),
+        "the Off intent was resolved durably"
+    );
+    assert_eq!(
+        cap_get(&cap, &version_key(&cp.ka, cp.c_on)),
+        Some(live_value(b"on-row"))
+    );
+    assert_eq!(
+        cap_get(&cap, &version_key(&cp.kb, cp.c_off)),
+        Some(live_value(b"off-row")),
+        "the Off row is durable through the sync"
+    );
+    assert_eq!(
+        cap_get(&cap, &sys_txn_key(cp.off_id)),
+        Some(cp.c_off.0.to_be_bytes().to_vec()),
+        "the Off commit's record is durable through the sync"
+    );
+    // Still no ingest: nothing at S; the /i/ range holds exactly the two
+    // resolved source rows.
+    assert!(cap_get(&cap, &version_key(&cp.ka, s)).is_none());
+    assert!(cap_get(&cap, &version_key(&cp.kb, s)).is_none());
+    assert_eq!(
+        i_range_keys(&cap),
+        vec![version_key(&cp.ka, cp.c_on), version_key(&cp.kb, cp.c_off)],
+        "the /i/ range holds exactly the resolved rows, no ingest"
+    );
+    drop(snap);
+}
+
+/// An empty `entries` chunk returns `Ok(())` without any sync or ingest:
+/// there is no span to resolve and nothing to write (the early return
+/// before the span is computed).
+#[test]
+fn empty_entries_is_noop() {
+    let mut rig = Rig::new();
+    // One prior commit so a stray resolution/sync would be observable.
+    let w = rig.txn();
+    common::place_intent(&rig.core, &w, b"/t/1/src", b"row");
+    let _c = rig.commit(w, SyncCommit::On);
+    let snap = rig.core.registry.take_snapshot();
+    let calls_before = rig.kv.calls();
+
+    ok(rig.core.ingest_versions(
+        &snap,
+        &idx_ranges(),
+        &mut std::iter::empty::<(Key, Vec<u8>)>(),
+    ));
+
+    assert_eq!(
+        rig.kv.calls(),
+        calls_before,
+        "an empty chunk performs no write, sync or ingest"
+    );
+    drop(snap);
 }
