@@ -48,6 +48,40 @@
 //!   entry visible at S that no row at S re-encodes to, planted raw
 //!   beneath the txn's own re-insert, must XX001 (S-PAIR-DEAF's
 //!   catcher).
+//!
+//! C-T6e4 additions — the threaded-XX001 escalation of the same family
+//! through the row decode (`St`/`G` reads; `Ixa`'s row fetch), fixed in
+//! `db.rs` by `decode_row_at_era` (a row whose header version predates
+//! the handle's definition decodes with the NOT NULL flags of its own
+//! era — a pre-constraint NULL at a snapshot below the SET NOT NULL's
+//! commit is served, never XX001):
+//!
+//! - `t6e4_pre_constraint_null_row_reads_clean_under_a_later_set_not_null`:
+//!   the captured interleaving (the C-T6b3bfix2 gate's E-1, seed
+//!   0x7c1a0001, dump of 2026-10-17: RR at S; a concurrent DELETE
+//!   committing above S; SET NOT NULL validating the latest state —
+//!   where the row is a tombstone — and committing above it), pinned
+//!   single-threaded through `Db::get`, `Db::scan` and `Db::index_scan`:
+//!   the old NULL row is served, amcheck stays clean, and the abort
+//!   leaves the committed state untouched.
+//! - `t6e4_pre_constraint_null_row_updates_clean_under_a_later_set_not_null`:
+//!   the write-side crossing — an RC UPDATE whose statement snapshot
+//!   sits below a concurrent update-and-SET NOT NULL pair decodes the
+//!   pre-constraint NULL read row (then EPQ re-bases and applies);
+//!   before the fix the decode itself XX001'd the legal statement.
+//! - `t6e4_stray_null_on_a_current_def_row_is_still_xx001`: the fix's
+//!   strictly-stronger half — a raw-planted row whose header version
+//!   equals the definition's, carrying a NULL on its NOT NULL column,
+//!   still decodes XX001 (the carve-out is era-scoped, never a blanket
+//!   disarm).
+//! - `t6e4_spec_divergence_is_pinned`: the spec letter's tripwire, in
+//!   its interim form — the `nucleus/v2/docs/` tree is protected (the
+//!   C-T6e3fix2 precedent: the card's spec-first edit was reverted by
+//!   the runner), so C-T6 §2's NULL clause still carries the pre-fix
+//!   unscoped letter while the engine carves out the row's own era; the
+//!   divergence is pinned in-suite instead (SPEC-EDIT's catcher — the
+//!   future docs card that lands the era scoping flips this pin, the
+//!   e3fix2→e3fix3 sequence).
 
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
@@ -62,8 +96,8 @@ use nucleus_catalog::{DbError, IndexState, Stmt};
 use nucleus_codec::{Collation, KeyColumn, KeyType};
 use nucleus_txn::locks::RelLockMode;
 use t6b_support::{
-    i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, plant_live_version, row_key_of, text_d,
-    text_v, Rig,
+    i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, plant_live_version, row_key_of, set_col,
+    text_d, text_v, Rig,
 };
 
 /// The pinned seeds (item 4's table: the report's runs are these). The
@@ -778,4 +812,374 @@ fn t6e3fix2_corrupt_entry_beneath_own_reinsert_is_xx001() {
     // the committed state — the pin next door owns the clean scene).
     rig.abort_txn(rr);
     drop(sguard);
+}
+
+// ----- C-T6e4: the definition-era carve-out on the NOT NULL decode -------------
+
+/// The C-T6e4 fixture: `t(id int4 PRIMARY KEY, payload text)` — the
+/// payload column is the NULL carrier — with a born-public index on the
+/// pk column, so the pin can drive all three read paths (`get`, `scan`,
+/// `index_scan`'s row fetch) over the same row. Returns `(oid, sid,
+/// idx)`.
+fn t6e4_fixture(rig: &Rig) -> (u64, u64, u64) {
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st0, b"e4fix", &pk_schema()));
+    let st1 = rig.stmt(&t0, s0);
+    let idx = ok(rig
+        .db
+        .create_index(&st1, oid, &idx_def(1, false, IndexState::Public)));
+    ok(rig.commit_rc(t0));
+    (oid, sid, idx)
+}
+
+/// C-T6e4's escalated scene, read side. The captured history (the
+/// C-T6b3bfix2 gate's E-1, `St`/`G` shapes): a row version carrying
+/// `payload = NULL` is live below the reader's snapshot `S`; a
+/// concurrent DELETE commits above `S`; SET NOT NULL(payload) then
+/// validates the **latest** committed state — where the row is a
+/// tombstone, so the DDL legally commits — above it; the reader's
+/// handle decodes under the post-constraint definition. Correct: every
+/// read at `S` serves the old row with its NULL (the model at `S` plus
+/// own writes — here exactly `[Some(1), None]`), never XX001; amcheck
+/// is clean before and after; the abort leaves the committed state
+/// exactly as the helper pair left it. Before the fix `get`, `scan` and
+/// `index_scan` all fail with XX001 ("NULL bit on a NOT NULL column")
+/// — the regime crossing the e4 fix carved out (`decode_row_at_era`).
+#[test]
+fn t6e4_pre_constraint_null_row_reads_clean_under_a_later_set_not_null() {
+    let rig = Rig::new();
+    let (oid, _sid, idx) = t6e4_fixture(&rig);
+    // The NULL row, committed below every later snapshot.
+    let t1 = {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+        ok(rig.db.insert_with(&st, &h, &[i32_d(1), None]));
+        ok(rig.commit_rc(t))
+    };
+
+    // Amcheck clean before.
+    let g0 = rig.core().registry.take_snapshot();
+    assert!(
+        ok(check_table(&rig.db, oid, &g0)).is_clean(),
+        "amcheck before"
+    );
+    drop(g0);
+
+    // The RR reader takes S — the NULL row's commit at or below it.
+    let (rr, sguard, s) = rig.rr();
+    assert!(t1 <= s, "S={s:?} at or below the NULL row's commit {t1:?}");
+
+    // The concurrent pair above S, exactly the captured interleaving:
+    // the delete first (its tombstone is what SET NOT NULL's validating
+    // scan sees), then the DDL.
+    let hd = rig.rc();
+    let hs = rig.core().visible_ts();
+    let hstd = rig.stmt(&hd, hs);
+    assert!(
+        ok(rig.db.delete(&hstd, oid, &[i32_v(1)])),
+        "the row was live"
+    );
+    let t_del = ok(rig.commit_rc(hd));
+    assert!(
+        t_del > s,
+        "the delete commits above S (T={t_del:?}, S={s:?})"
+    );
+
+    let hsnn = rig.rc();
+    let hs2 = rig.core().visible_ts();
+    let stsnn = rig.stmt(&hsnn, hs2);
+    ok(rig.db.set_not_null(&stsnn, oid, 2, true));
+    let t_snn = ok(rig.commit_rc(hsnn));
+    assert!(t_snn > t_del, "the SET NOT NULL commits above the delete");
+
+    // The handle the reader's statements open decodes under the
+    // post-constraint definition (the catalog read is at visible_ts).
+    let hg = ok(rig
+        .db
+        .open_table(&rig.stmt(&rr, s), oid, RelLockMode::AccessShare));
+    assert_eq!(hg.def_version, 2, "the handle carries the post-SNN def");
+
+    // The committed entry state the abort must leave untouched.
+    let isid = {
+        let row = rig.idx_row(idx).expect("the idx row committed");
+        let nucleus_txn::catalog::IdxStorage::Id(isid) = row.storage else {
+            panic!("a born-public index has an id storage")
+        };
+        isid
+    };
+    let entries_before = rig.raw_entry_versions(isid);
+
+    // (1) The point read: the old row with its NULL.
+    let st_g = rig.stmt(&rr, s);
+    assert_eq!(
+        ok(rig.db.get(&st_g, &hg, &[i32_v(1)])),
+        Some(vec![i32_d(1), None]),
+        "the pre-constraint NULL row is served at S (the G shape)"
+    );
+    // (2) The table scan: exactly that row (the St shape).
+    let st_c = rig.stmt(&rr, s);
+    let rows = ok(rig.db.scan(&st_c, &hg));
+    assert_eq!(rows.len(), 1, "one row visible at S");
+    assert_eq!(
+        rows[0].1,
+        vec![i32_d(1), None],
+        "the NULL row, decoded at its era"
+    );
+    // (3) The index scan over the pk: the fetched row decodes clean (the
+    // Ixa shape — the crossing lived in the row fetch, not §6's
+    // verification).
+    let st_i = rig.stmt(&rr, s);
+    let irows = ok(rig.db.index_scan(
+        &st_i,
+        idx,
+        Bound::Included(vec![i32_v(1)]),
+        Bound::Unbounded,
+    ));
+    assert_eq!(irows.len(), 1, "the pk entry serves at S");
+    assert_eq!(
+        irows[0].1,
+        vec![i32_d(1), None],
+        "the fetched NULL row decodes clean"
+    );
+
+    // Nothing committed: the abort leaves the committed state exactly
+    // as the helper pair left it, and amcheck stays clean.
+    rig.abort_txn(rr);
+    drop(sguard);
+    assert_eq!(
+        rig.raw_entry_versions(isid),
+        entries_before,
+        "no entry version changed"
+    );
+    let t_scan = rig.rc();
+    let s_scan = rig.core().visible_ts();
+    let st_s = rig.stmt(&t_scan, s_scan);
+    let hs3 = ok(rig.db.open_table(&st_s, oid, RelLockMode::AccessShare));
+    assert!(
+        ok(rig.db.scan(&st_s, &hs3)).is_empty(),
+        "the committed table is the helper's empty table"
+    );
+    ok(rig.commit_rc(t_scan));
+    let g1 = rig.core().registry.take_snapshot();
+    assert!(
+        ok(check_table(&rig.db, oid, &g1)).is_clean(),
+        "amcheck after"
+    );
+    drop(g1);
+}
+
+/// C-T6e4's write-side crossing: an RC UPDATE whose statement snapshot
+/// sits below a concurrent update-and-SET NOT NULL pair. The read row
+/// (the statement's snapshot read, then the EPQ base) carries the
+/// pre-constraint NULL; `apply_set` decodes it under the post-constraint
+/// handle definition. Before the fix the decode itself XX001'd the legal
+/// statement (`UpdateEpq::new` → `apply_set`, before the row op even
+/// ran); correct: the decode succeeds, the row op EPQ re-bases on the
+/// concurrent non-NULL version and applies, and the committed effect is
+/// the caller's set on that base.
+#[test]
+fn t6e4_pre_constraint_null_row_updates_clean_under_a_later_set_not_null() {
+    let rig = Rig::new();
+    let (oid, _sid, _idx) = t6e4_fixture(&rig);
+    let t1 = {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+        ok(rig.db.insert_with(&st, &h, &[i32_d(1), None]));
+        ok(rig.commit_rc(t))
+    };
+
+    // The writer takes its statement snapshot below the concurrent pair.
+    let w = rig.rc();
+    let s_w = rig.core().visible_ts();
+    assert!(t1 <= s_w);
+
+    // The concurrent pair above S_w: the row updated to a non-NULL
+    // payload, then SET NOT NULL(payload) — its validating scan sees
+    // the non-NULL latest, so it commits.
+    let hu = rig.rc();
+    let hu_s = rig.core().visible_ts();
+    let hstu = rig.stmt(&hu, hu_s);
+    assert!(ok(rig.db.update(
+        &hstu,
+        oid,
+        &[i32_v(1)],
+        &[set_col(2, text_d("y"))]
+    )));
+    let t_upd = ok(rig.commit_rc(hu));
+    assert!(t_upd > s_w, "the concurrent update commits above S_w");
+
+    let hsnn = rig.rc();
+    let hs2 = rig.core().visible_ts();
+    let stsnn = rig.stmt(&hsnn, hs2);
+    ok(rig.db.set_not_null(&stsnn, oid, 2, true));
+    let t_snn = ok(rig.commit_rc(hsnn));
+    assert!(t_snn > t_upd);
+
+    // The writer's UPDATE at its own snapshot: the read row is the NULL
+    // version (the decode the fix carved out), the row op re-bases on
+    // the concurrent non-NULL version and applies.
+    let st_w = rig.stmt(&w, s_w);
+    let hw = ok(rig.db.open_table(&st_w, oid, RelLockMode::RowExclusive));
+    assert_eq!(hw.def_version, 2, "the writer's handle is the post-SNN def");
+    assert!(
+        ok(rig
+            .db
+            .update_with(&st_w, &hw, &[i32_v(1)], &[set_col(2, text_d("z"))])),
+        "the update applies (EPQ re-base on the concurrent version)"
+    );
+    let t_w = ok(rig.commit_rc(w));
+    assert!(t_w > t_snn);
+
+    // The committed effect: the set on the concurrent base.
+    let t_r = rig.rc();
+    let s_r = rig.core().visible_ts();
+    let st_r = rig.stmt(&t_r, s_r);
+    let hr = ok(rig.db.open_table(&st_r, oid, RelLockMode::AccessShare));
+    assert_eq!(
+        ok(rig.db.get(&st_r, &hr, &[i32_v(1)])),
+        Some(vec![i32_d(1), text_d("z")]),
+        "the committed effect is the set on the EPQ base"
+    );
+    ok(rig.commit_rc(t_r));
+    let g = rig.core().registry.take_snapshot();
+    assert!(
+        ok(check_table(&rig.db, oid, &g)).is_clean(),
+        "amcheck after"
+    );
+    drop(g);
+}
+
+/// C-T6e4's strictly-stronger half: the carve-out is era-scoped, never a
+/// blanket disarm. A row whose header version **equals** the
+/// definition's — the flags were in force for its own encoding, and
+/// `encode_row` refuses such a NULL, so a stray one is real corruption —
+/// still decodes XX001. The row is planted raw (the corruption oracle's
+/// primitive): encoded under the post-SNN definition with the flags
+/// cleared (the only way to produce the bytes), carrying the
+/// definition's own version in its header.
+#[test]
+fn t6e4_stray_null_on_a_current_def_row_is_still_xx001() {
+    let rig = Rig::new();
+    let (oid, sid, _idx) = t6e4_fixture(&rig);
+    let t1 = {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+        ok(rig.db.insert_with(&st, &h, &[i32_d(1), None]));
+        ok(rig.commit_rc(t))
+    };
+    // The row updated to a non-NULL payload, so SET NOT NULL validates
+    // and commits (the pre-constraint NULL version stays below it).
+    let hu = rig.rc();
+    let hu_s = rig.core().visible_ts();
+    let hstu = rig.stmt(&hu, hu_s);
+    assert!(ok(rig.db.update(
+        &hstu,
+        oid,
+        &[i32_v(1)],
+        &[set_col(2, text_d("y"))]
+    )));
+    let t_upd = ok(rig.commit_rc(hu));
+    assert!(t_upd > t1);
+    let hsnn = rig.rc();
+    let hs = rig.core().visible_ts();
+    let stsnn = rig.stmt(&hsnn, hs);
+    ok(rig.db.set_not_null(&stsnn, oid, 2, true));
+    let t_snn = ok(rig.commit_rc(hsnn));
+    assert!(t_snn > t_upd);
+
+    // The stray row: header version 2 (the current def), payload NULL —
+    // bytes no legal writer could produce, planted at the SNN's own ts.
+    let mut era = pk_schema();
+    era.version = 2;
+    for col in &mut era.columns {
+        col.not_null = false;
+    }
+    let bytes = ok(era.encode_row(&[i32_d(2), None]));
+    let row2 = row_key_of(sid, &pk_schema(), &[i32_v(2)]);
+    plant_live_version(&rig, &row2, t_snn, &bytes);
+
+    // The read refuses it: XX001, the v == V leg of §2's NULL clause.
+    let t_r = rig.rc();
+    let s_r = rig.core().visible_ts();
+    let st_r = rig.stmt(&t_r, s_r);
+    let hr = ok(rig.db.open_table(&st_r, oid, RelLockMode::AccessShare));
+    let err = rig
+        .db
+        .get(&st_r, &hr, &[i32_v(2)])
+        .expect_err("a stray NULL under the current def is corruption");
+    assert!(
+        matches!(
+            err,
+            DbError::Row(nucleus_codec::row::RowError::Corrupt(
+                "NULL bit on a NOT NULL column"
+            ))
+        ),
+        "the corruption signature, not {err:?}"
+    );
+    assert_eq!(err.sqlstate(), "XX001");
+    ok(rig.core().abort(t_r));
+}
+
+/// C-T6e4's spec divergence, pinned in its interim form (SPEC-EDIT's
+/// catcher): the engine decodes NOT NULL flags at the row's own era
+/// (`decode_row_at_era`), but C-T6 §2's NULL clause still carries the
+/// pre-fix unscoped letter — the card's spec-first edit was reverted by
+/// the runner's `nucleus/v2/docs/` protection (the C-T6e3fix2
+/// precedent; the amendment is this card's ESCALATE). This pin keeps
+/// the divergence visible instead of silently forgetting it: a docs
+/// edit that lands the era scoping **must** also record the e4
+/// escalation in the changelog and flip this test (the e3fix2→e3fix3
+/// sequence), and an edit that lands the letter without the engine — or
+/// drops the changelog duty — fails here.
+#[test]
+fn t6e4_spec_divergence_is_pinned() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/C-T6-rows-schema-indexes.md"
+    ))
+    .expect("the C-T6 spec");
+    // §2's NULL bullet: from its opening phrase to the §2.1 heading.
+    let start = src
+        .find("Trailing bytes, short datums")
+        .expect("§2's XX001 bullet");
+    let end = src[start..]
+        .find("### 2.1")
+        .map(|i| start + i)
+        .expect("the end of §2");
+    let flat = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+    let bullet = flat(&src[start..end]);
+    // The interim state: the pre-fix letter is still there (the docs
+    // card that lands the era scoping must flip this leg together with
+    // the ones below).
+    assert!(
+        bullet.contains("a NULL bit on a live NOT NULL attnum"),
+        "§2's NULL clause is not the pre-fix letter — the docs card has \
+         landed; flip this pin to guard the era scoping instead:\n{bullet}"
+    );
+    assert!(
+        !bullet.contains("era-scoped"),
+        "§2's NULL clause gained era scoping without this pin flipping — \
+         the docs card must update `t6e4_spec_divergence_is_pinned` \
+         (the e3fix2→e3fix3 sequence):\n{bullet}"
+    );
+    // The changelog exists and does not yet claim the e4 landing (it
+    // will when the docs card lands; this leg flips with the ones
+    // above).
+    assert!(
+        src.contains("## Changelog"),
+        "the spec's changelog vanished — the docs card must keep it"
+    );
+    assert!(
+        !src.contains("the e4 escalation"),
+        "the changelog records the e4 escalation — the docs card has \
+         landed; flip this pin to guard the landed letter instead"
+    );
 }
