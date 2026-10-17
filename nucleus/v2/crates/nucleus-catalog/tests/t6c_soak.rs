@@ -405,7 +405,9 @@ fn fu3_replace_big(rig: &diff::runner::Rig, pk: i64, tag: u8) {
             &[Some(nucleus_codec::Value::Int8(pk))],
             &[(
                 attnum,
-                Some(nucleus_codec::row::Datum::Inline(diff::big_blob(tag, 20_000))),
+                Some(nucleus_codec::row::Datum::Inline(diff::big_blob(
+                    tag, 20_000,
+                ))),
             )],
         )
         .expect("the replace applies");
@@ -441,9 +443,15 @@ fn t6c_rc_read_back_after_epq_carry() {
     let av = nucleus_codec::Value::Int8(0x5eed_0001);
     let mut s = diff::runner::Session::begin(rig, 1, 0, 0, diff::Level::ReadCommitted);
     let applied = s
-        .op_update_set_with_gap(0, 0, av.clone(), nucleus_codec::Value::Text("gap".into()), || {
-            fu3_replace_big(rig, 0, 9);
-        })
+        .op_update_set_with_gap(
+            0,
+            0,
+            av.clone(),
+            nucleus_codec::Value::Text("gap".into()),
+            || {
+                fu3_replace_big(rig, 0, 9);
+            },
+        )
         .expect("the update applies and the read-back returns the row");
     assert!(applied);
     s.commit().expect("the read-back left a committable txn");
@@ -507,9 +515,9 @@ fn t6c_rc_read_back_after_epq_carry() {
             &[Some(nucleus_codec::Value::Int8(1))],
             &[(
                 2,
-                Some(nucleus_codec::row::Datum::Inline(nucleus_codec::Value::Int8(
-                    0x5eed_0002,
-                ))),
+                Some(nucleus_codec::row::Datum::Inline(
+                    nucleus_codec::Value::Int8(0x5eed_0002),
+                )),
             )],
         )
         .expect("the update applies (the EPQ base detoasts at its own ts)");
@@ -523,7 +531,8 @@ fn t6c_rc_read_back_after_epq_carry() {
         .expect_err("the same read at S2 is XX001 by §5's read-at-t rule");
     assert_eq!(err.sqlstate(), "XX001", "{err:?}");
     // The read at `visible_ts`: the own row whole — the harness rule.
-    let st_v = nucleus_catalog::Stmt::new(&w, rig.db.core.visible_ts()).expect("the read-back stmt");
+    let st_v =
+        nucleus_catalog::Stmt::new(&w, rig.db.core.visible_ts()).expect("the read-back stmt");
     let row = rig
         .db
         .get(&st_v, &h, &[Some(nucleus_codec::Value::Int8(1))])
@@ -531,7 +540,9 @@ fn t6c_rc_read_back_after_epq_carry() {
         .expect("the row is there");
     assert_eq!(
         row[3],
-        Some(nucleus_codec::row::Datum::Inline(diff::big_blob(12, 20_000))),
+        Some(nucleus_codec::row::Datum::Inline(diff::big_blob(
+            12, 20_000
+        ))),
         "big is the carried pointer's whole value"
     );
     rig.db.core.abort(w).expect("abort the writer");

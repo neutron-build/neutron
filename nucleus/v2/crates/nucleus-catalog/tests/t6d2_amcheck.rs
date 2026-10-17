@@ -352,11 +352,7 @@ fn detects_an_injected_huge_chunk_count() {
         chunks: u32::MAX,
     };
     let key = row_key_of(sid, &wide_schema(), &[i32_v(1)]);
-    let bytes = ok(wide_schema().encode_row(&[
-        i32_d(1),
-        text_d("x"),
-        Some(Datum::Toast(huge)),
-    ]));
+    let bytes = ok(wide_schema().encode_row(&[i32_d(1), text_d("x"), Some(Datum::Toast(huge))]));
     core_plant_version(&rig, &key, now, HEADER_LIVE, &bytes);
 
     let report = check_now(&rig, oid);
