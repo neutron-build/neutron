@@ -137,11 +137,15 @@ fn assert_clean(seed: u64, verdict: &Verdict) {
 
 #[test]
 fn t6c_soak() {
-    // C-T6d2's coverage bars are taken over the three seeds together:
-    // how many of a run's SetBig ops land depends on scheduling (a pk
-    // the truncate-heavy mix leaves absent, a 40001 that exhausts the
-    // retry budget), so per-seed floors would flake on interleavings,
-    // while the aggregate floor is many times the bar.
+    // C-T6d2's index-build coverage bars are taken over the three seeds
+    // together: a build's fate depends on which truncate or drop raced
+    // it, so per-seed floors would flake on interleavings, while the
+    // aggregate floor is many times the bar. The large-value bars are
+    // per-seed again (C-T6d2fix FU-2, gate F-2): observed runs commit
+    // 60–117 big writes per seed and ≥ 9 per length class, so `> 25`
+    // and `> 3` hold with ≥ 3× margin — the C-T6d2 stabilization had
+    // moved them to the 3-seed aggregate, which a regression that
+    // zeroes one seed's big coverage passes silently.
     let mut big = diff::Verdict::default().stats;
     for seed in SEEDS {
         let (run, verdict) = run_seed(seed);
@@ -198,17 +202,42 @@ fn t6c_soak() {
         // successful SET NOT NULLs (or witnessed 23502s) would zero
         // this without failing anything else.
         assert!(s.snn_checked > 0, "no SET NOT NULL verified: {s:?}");
+        // C-T6d2fix FU-2 (gate F-2, recalibrated per the gate's H-1):
+        // the write side is scheduling-sensitive after all — depressed
+        // seeds under load commit as few as ~21 big writes and ~2 per
+        // class — so the floors sit at > 10 / > 1 (every demonstrated
+        // mutant catch survives with ~2x headroom: GA4 dies at 0, GA5's
+        // erosion lands far below 10); only the drop/re-add pair stays
+        // aggregate, below.
+        assert!(
+            s.big_writes > 10,
+            "too few big writes in seed {seed:#x}: {s:?}"
+        );
+        assert!(
+            s.big_lens.iter().all(|&n| n > 1),
+            "every big length class (100/3000/20000) must commit per seed \
+             {seed:#x}: {s:?}"
+        );
+        // The DropBig→AddBig pairing (every drop's next DDL index is
+        // the re-add) lands at least one committed AddBig per seed.
+        assert!(
+            s.big_adds >= 1,
+            "no committed AddBig in seed {seed:#x}: {s:?}"
+        );
     }
-    // C-T6d2's surface: large-value writes committed at every length
-    // class the card names (inline / one chunk / three chunks), and the
-    // drop/re-add cycle of the column they land on.
-    assert!(big.big_writes > 12, "too few big writes: {big:?}");
+    // C-T6d2's surface, aggregate side (FU-2): the drop/re-add cycle is
+    // the scheduling-exposed half (4–6 drops per seed observed — whether
+    // a given DropBig beats its DDL neighbours and commits is a race),
+    // so its bar runs over the three seeds: the pair must land ≥ 4
+    // times across them (every drop's forced re-add keeps the pair
+    // count even), with at least one real committed drop. The per-seed
+    // bars above carry the big-write, per-class and AddBig floors (each
+    // implies the aggregate form it replaced).
     assert!(
-        big.big_lens.iter().all(|&n| n > 0),
-        "every big length class (100/3000/20000) must commit: {big:?}"
+        big.big_drops + big.big_adds >= 4,
+        "too few DropBig/AddBig pairs across the seeds: {big:?}"
     );
     assert!(big.big_drops > 0, "no committed DropBig: {big:?}");
-    assert!(big.big_adds > 0, "no committed AddBig: {big:?}");
     // C-T6e3's surface: builds published and failed (the seeded
     // sabotage's 55000s), unfinished ones were resumed and dropped, and
     // the DML scans both served through a published index and were
@@ -318,6 +347,206 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
         }
     }
     assert_eq!(kinds.len(), 11, "every DDL kind appears: {kinds:?}");
+    // C-T6d2fix FU-1 (gate F-1/GA4): pin the generator's big-value
+    // sizes. The soak's bars count length classes by value-match
+    // (`BIG_LENS.iter().position(|l| *l == len)`), so any three
+    // distinct lens satisfy them — without this pin, a shrunk BIG_LENS
+    // (GA4's [100, 3000, 4096]) passes the whole suite with the
+    // 3-chunk class silently gone and the soak's amcheck never sees a
+    // multi-chunk pointer.
+    assert_eq!(
+        diff::BIG_LENS,
+        [100, 3000, 20_000],
+        "the soak's big-value classes are pinned"
+    );
+    // And the pinned sizes mean the chunk shapes the card names: 100
+    // stays inline (below the 2048 threshold), 3000 is one chunk,
+    // 20000 is three — the multi-chunk class the soak must keep
+    // generating.
+    assert_eq!(
+        diff::BIG_LENS.map(|len| {
+            if len <= nucleus_catalog::TOAST_THRESHOLD {
+                0
+            } else {
+                len.div_ceil(nucleus_catalog::TOAST_CHUNK)
+            }
+        }),
+        [0, 1, 3],
+        "the classes are the inline / one-chunk / three-chunk shapes"
+    );
+}
+
+// ----- C-T6d2fix: the RC read-back position (FU-3, gate F-3/GA5) ---------------
+
+/// One committed RC txn that replaces `big` of `pk` with a fresh 20 KB
+/// value (three chunks) through the same `Db` calls the harness's SetBig
+/// makes — the concurrent writer of the FU-3 shape.
+fn fu3_replace_big(rig: &diff::runner::Rig, pk: i64, tag: u8) {
+    use nucleus_txn::commit::SyncCommit;
+    use nucleus_txn::locks::RelLockMode;
+    use nucleus_txn::txn::Isolation;
+
+    let txn = rig.db.core.begin(Isolation::ReadCommitted);
+    let st = nucleus_catalog::Stmt::new(&txn, rig.db.core.visible_ts()).expect("the replace stmt");
+    let h = rig
+        .db
+        .open_table(&st, rig.t_oid, RelLockMode::RowExclusive)
+        .expect("open t for the replace");
+    let attnum = h
+        .schema
+        .live_columns()
+        .find(|c| c.name == "big")
+        .map(|c| c.attnum)
+        .expect("big is live");
+    let applied = rig
+        .db
+        .update_with(
+            &st,
+            &h,
+            &[Some(nucleus_codec::Value::Int8(pk))],
+            &[(
+                attnum,
+                Some(nucleus_codec::row::Datum::Inline(diff::big_blob(
+                    tag, 20_000,
+                ))),
+            )],
+        )
+        .expect("the replace applies");
+    assert!(applied);
+    rig.db
+        .core
+        .commit(txn, SyncCommit::On)
+        .expect("the replace commits");
+}
+
+/// C-T6d2fix FU-3 (gate F-3, mutant GA5): the RC read-back position,
+/// pinned in the harness's own shape. An RC UPDATE's statement snapshot
+/// is taken at S; a concurrent replace of a toasted value commits above
+/// S; the update's EPQ re-base carries the replace's `big` pointer into
+/// the txn's own row version. The harness's read-back — a second
+/// statement of the same txn at `visible_ts` — must return the own row
+/// whole (§5: the carried chunks are visible at `visible_ts`, and the
+/// own intent shadows every foreign version), which is exactly why the
+/// read-back sits there and not at the statement's snapshot: the same
+/// read at S is XX001 (§5's read-at-t rule — the carried chunks are
+/// invisible above S), pinned by the raw leg (b). Mutant GA5 (both RC
+/// read-backs reverted to `st.snapshot()`) fails leg (a): the read-back
+/// XX001s and aborts a legal txn the engine never corrupted.
+#[test]
+fn t6c_rc_read_back_after_epq_carry() {
+    let mut rig = diff::runner::Rig::new(5);
+    rig.setup();
+    let rig = &rig;
+
+    // (a) The harness leg: the scripted UPDATE of `a` (`choice` 0
+    // resolves to the first live non-pk column, an int8), with the gap
+    // landing the concurrent replace above the statement's snapshot.
+    let av = nucleus_codec::Value::Int8(0x5eed_0001);
+    let mut s = diff::runner::Session::begin(rig, 1, 0, 0, diff::Level::ReadCommitted);
+    let applied = s
+        .op_update_set_with_gap(
+            0,
+            0,
+            av.clone(),
+            nucleus_codec::Value::Text("gap".into()),
+            || {
+                fu3_replace_big(rig, 0, 9);
+            },
+        )
+        .expect("the update applies and the read-back returns the row");
+    assert!(applied);
+    s.commit().expect("the read-back left a committable txn");
+    // The recorded effect is the own row whole: `a` is the set constant
+    // and `big` is the concurrent replace's full 20 KB value, detoasted
+    // from the carried pointer's chunks.
+    let rec = rig
+        .rec
+        .drain()
+        .txns
+        .into_iter()
+        .find(|t| t.session == 1)
+        .expect("the session's record");
+    let op = rec
+        .ops
+        .iter()
+        .find(|o| o.kind == diff::OpKind::UpdateSet)
+        .expect("the UpdateSet record");
+    assert_eq!(op.out, diff::OpOut::Applied(true), "{:?}", op.out);
+    let diff::OpDetail::UpdateSet {
+        new_row: Some(row), ..
+    } = &op.detail
+    else {
+        panic!("the read-back recorded no row: {:?}", op.detail);
+    };
+    let big = row
+        .iter()
+        .find(|(attnum, _)| *attnum == 4)
+        .expect("big in the read-back row");
+    assert_eq!(big.1, Some(diff::big_blob(9, 20_000)), "the carried value");
+    let a = row
+        .iter()
+        .find(|(attnum, _)| *attnum == 2)
+        .expect("a in the read-back row");
+    assert_eq!(a.1, Some(av), "the set constant");
+
+    // (b) §5's rule, documented raw: the same shape hand-driven — an RC
+    // writer at S2, the concurrent replace committed above S2, the
+    // update's EPQ re-base carrying its pointer — and the reads split.
+    // At S2 the own intent carries a pointer whose chunks committed
+    // above S2, invisible there: XX001. At `visible_ts` the same
+    // statement reads the own row whole. That split is §5's read-at-t
+    // rule, and it is exactly the read the GA5 mutant would have the
+    // harness read-back make.
+    use nucleus_txn::locks::RelLockMode;
+    use nucleus_txn::txn::Isolation;
+
+    let w = rig.db.core.begin(Isolation::ReadCommitted);
+    let s2 = rig.db.core.visible_ts();
+    fu3_replace_big(rig, 1, 12);
+    let st = nucleus_catalog::Stmt::new(&w, s2).expect("the writer statement");
+    let h = rig
+        .db
+        .open_table(&st, rig.t_oid, RelLockMode::RowExclusive)
+        .expect("open t for the writer");
+    let applied = rig
+        .db
+        .update_with(
+            &st,
+            &h,
+            &[Some(nucleus_codec::Value::Int8(1))],
+            &[(
+                2,
+                Some(nucleus_codec::row::Datum::Inline(
+                    nucleus_codec::Value::Int8(0x5eed_0002),
+                )),
+            )],
+        )
+        .expect("the update applies (the EPQ base detoasts at its own ts)");
+    assert!(applied);
+    // The read at S2: corruption by §5 — a missing chunk, never a
+    // partial value.
+    let st_s = nucleus_catalog::Stmt::new(&w, s2).expect("the at-S statement");
+    let err = rig
+        .db
+        .get(&st_s, &h, &[Some(nucleus_codec::Value::Int8(1))])
+        .expect_err("the same read at S2 is XX001 by §5's read-at-t rule");
+    assert_eq!(err.sqlstate(), "XX001", "{err:?}");
+    // The read at `visible_ts`: the own row whole — the harness rule.
+    let st_v =
+        nucleus_catalog::Stmt::new(&w, rig.db.core.visible_ts()).expect("the read-back stmt");
+    let row = rig
+        .db
+        .get(&st_v, &h, &[Some(nucleus_codec::Value::Int8(1))])
+        .expect("the read-back returns the own row")
+        .expect("the row is there");
+    assert_eq!(
+        row[3],
+        Some(nucleus_codec::row::Datum::Inline(diff::big_blob(
+            12, 20_000
+        ))),
+        "big is the carried pointer's whole value"
+    );
+    rig.db.core.abort(w).expect("abort the writer");
 }
 
 // ----- the checker can fail ---------------------------------------------------

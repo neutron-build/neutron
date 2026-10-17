@@ -1,12 +1,14 @@
-//! C-T6d2: amcheck's I-TOAST half (§5, §8) — the three injected
+//! C-T6d2: amcheck's I-TOAST half (§5, §8) — the five injected
 //! corruptions (an orphan chunk no pointer names, a dangling pointer
-//! whose chunk is not visible, a short chunk of the wrong shape) are
-//! each reported, and the checker stays clean across C-T6d1's §5
-//! scenarios: the threshold boundary rows, a multi-chunk value, an
-//! update that carries a pointer, a replace and a delete that tombstone
-//! their chunks, a DROP COLUMN whose pre-drop rows still name live
-//! chunks through their raw pointers, the re-add of the column, and the
-//! EPQ skip that writes no chunk at all.
+//! whose chunk is not visible, a short chunk of the wrong shape, a
+//! shape-legal set of chunks that sums past `raw_len`, and a huge
+//! chunk count beyond the storage's visible chunks) are each reported,
+//! and the checker stays clean across C-T6d1's §5 scenarios: the
+//! threshold boundary rows, a multi-chunk value, an update that
+//! carries a pointer, a replace and a delete that tombstone their
+//! chunks, a DROP COLUMN whose pre-drop rows still name live chunks
+//! through their raw pointers, the re-add of the column, and the EPQ
+//! skip that writes no chunk at all.
 //!
 //! The dropped-column scenario is mutant T8's catcher: a checker that
 //! swept pointers with a live-columns `decode_row` (dropped attnums
@@ -23,8 +25,8 @@ use t6b_support::{
 };
 
 use nucleus_catalog::amcheck::{check_table, Report};
-use nucleus_catalog::{chunk_key, Stmt, TOAST_MARK, TOAST_THRESHOLD};
-use nucleus_codec::row::{ColumnDef, TableSchema, ToastPointer};
+use nucleus_catalog::{chunk_key, Stmt, TOAST_CHUNK, TOAST_MARK, TOAST_THRESHOLD};
+use nucleus_codec::row::{ColumnDef, Datum, TableSchema, ToastPointer};
 use nucleus_codec::{Collation, KeyType};
 use nucleus_txn::encoding::{HEADER_LIVE, HEADER_TOMBSTONE};
 use nucleus_txn::locks::RelLockMode;
@@ -203,7 +205,10 @@ fn detects_an_injected_orphan_chunk() {
 
 /// A pointer whose chunk is not visible (a tombstone planted above the
 /// chunk's live version) is dangling: exactly one I-TOAST violation,
-/// naming the row and the chunk index.
+/// naming the row and the chunk index. The second row's out-of-line
+/// value keeps the storage's visible-chunk count at the pointer's chunk
+/// count after the tombstone, so the per-index walk — not the
+/// count-above-visible bound — is the shape that reports it.
 #[test]
 fn detects_an_injected_missing_chunk() {
     let rig = Rig::new();
@@ -215,12 +220,19 @@ fn detects_an_injected_missing_chunk() {
     assert!(clean.is_clean(), "{:?}", clean.violations);
 
     // A second commit so `visible_ts` moves past the chunk's own ts,
-    // then a tombstone above chunk 1's live version hides it.
-    add_row(&rig, oid, 2, "y", "small");
+    // then a tombstone above chunk 1's live version hides it. The
+    // second row's `big` is out of line (one chunk), so the storage
+    // keeps a visible count of 3 — the bound's reach is a different
+    // fixture's business (C-T6d2fix FU-5).
+    add_row(&rig, oid, 2, "y", &blob(3, TOAST_THRESHOLD + 1));
     let now = rig.core().visible_ts();
     let k1 = chunk_key(sid, &p.id, 1);
     core_plant_version(&rig, &k1, now, HEADER_TOMBSTONE, b"");
-    assert_eq!(visible_chunk_keys(&rig, sid).len(), 2, "chunk 1 is gone");
+    assert_eq!(
+        visible_chunk_keys(&rig, sid).len(),
+        3,
+        "chunk 1 is gone; row 2's one chunk stays"
+    );
 
     let report = check_now(&rig, oid);
     assert!(!report.is_clean(), "the dangling pointer went unnoticed");
@@ -265,6 +277,93 @@ fn detects_an_injected_short_chunk() {
         )),
         "{}",
         report.violations[0]
+    );
+}
+
+/// A pointer whose chunks all keep the §5 shape but sum past `raw_len`
+/// — a full `TOAST_CHUNK`-byte live version planted above the real,
+/// shorter last chunk of a 20 KB value — is the sum check's own report:
+/// exactly one I-TOAST violation, naming the sum and the `raw_len`.
+/// C-T6d2fix FU-4 (gate F-4/GA6): the injected fixtures all trip the
+/// shape check or a miss first, so the sum arm — the only check that
+/// pins the last chunk's exact length (the shape rule allows any
+/// 1..=TOAST_CHUNK) — was unreachable defense-in-depth.
+#[test]
+fn detects_an_injected_overlong_last_chunk_sum() {
+    let rig = Rig::new();
+    let (oid, sid) = mk_wide(&rig);
+    add_row(&rig, oid, 1, "x", &blob(2, 20_000));
+    let p = row_pointers(&rig, sid, 1).remove(0);
+    assert_eq!(p.chunks, 3, "three chunks");
+    let clean = check_now(&rig, oid);
+    assert!(clean.is_clean(), "{:?}", clean.violations);
+
+    // A full TOAST_CHUNK-byte live version above the real last chunk
+    // (3616 bytes): the read path yields the newest version, so chunk 2
+    // is shape-legal — a last chunk may be 1..=TOAST_CHUNK bytes —
+    // while the sum passes raw_len: 8192·3 = 24576 ≠ 20000.
+    add_row(&rig, oid, 2, "y", "small");
+    let now = rig.core().visible_ts();
+    let k2 = chunk_key(sid, &p.id, 2);
+    core_plant_version(&rig, &k2, now, HEADER_LIVE, &[7u8; TOAST_CHUNK]);
+
+    let report = check_now(&rig, oid);
+    assert!(!report.is_clean(), "the overlong last chunk went unnoticed");
+    assert_eq!(
+        report.violations,
+        vec![format!(
+            "I-TOAST: relation {oid} row {:?}: the chunks of pointer {:?} sum to {}, raw_len says {}",
+            row_key_of(sid, &wide_schema(), &[i32_v(1)]),
+            p.id,
+            3 * TOAST_CHUNK,
+            p.raw_len
+        )],
+        "exactly the sum violation, naming the sum and the raw_len"
+    );
+}
+
+/// A pointer that counts more chunks than the storage has visible — a
+/// planted huge-but-self-consistent `ToastPointer` (u32::MAX chunks,
+/// raw_len u32::MAX, at an id no statement ever minted, over a row
+/// whose `big` was inline) — is reported by the visible-chunk bound,
+/// not iterated: exactly one I-TOAST violation, and the check returns
+/// (C-T6d2fix, gate F-5: the walk would otherwise run 2³² iterations,
+/// one `named` insert each — amcheck on such a corrupt store would spin
+/// instead of reporting; the cannot-reach guard above the bound cannot
+/// catch this shape, since u32::MAX chunks of 8192 bytes do reach a
+/// raw_len of u32::MAX).
+#[test]
+fn detects_an_injected_huge_chunk_count() {
+    let rig = Rig::new();
+    let (oid, sid) = mk_wide(&rig);
+    add_row(&rig, oid, 1, "x", "small");
+    assert!(visible_chunk_keys(&rig, sid).is_empty(), "big stays inline");
+    let clean = check_now(&rig, oid);
+    assert!(clean.is_clean(), "{:?}", clean.violations);
+
+    // The planted row version: the same row, its `big` the huge pointer
+    // (a fresh id, so nothing is orphaned — the row's real bytes named
+    // no chunks).
+    add_row(&rig, oid, 2, "y", "small");
+    let now = rig.core().visible_ts();
+    let huge = ToastPointer {
+        id: [0xB9; 20],
+        raw_len: u32::MAX,
+        chunks: u32::MAX,
+    };
+    let key = row_key_of(sid, &wide_schema(), &[i32_v(1)]);
+    let bytes = ok(wide_schema().encode_row(&[i32_d(1), text_d("x"), Some(Datum::Toast(huge))]));
+    core_plant_version(&rig, &key, now, HEADER_LIVE, &bytes);
+
+    let report = check_now(&rig, oid);
+    assert!(!report.is_clean(), "the huge chunk count went unnoticed");
+    assert_eq!(
+        report.violations,
+        vec![format!(
+            "I-TOAST: relation {oid} row {key:?}: pointer {:?} counts {} chunks, but the storage has {} visible (dangling at some index)",
+            huge.id, huge.chunks, 0
+        )],
+        "exactly the bound's report; the pointer is not walked"
     );
 }
 
