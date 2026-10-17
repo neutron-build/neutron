@@ -65,8 +65,10 @@ use crate::index;
 use crate::toast::{chunk_key, TOAST_CHUNK, TOAST_MARK};
 
 /// The amcheck report: every invariant violation found, as strings each
-/// prefixed with the invariant's name (`"I-ROWFMT: …"`, `"I-IDX: …"`,
-/// …) so a harness can assert on the class of a finding.
+/// prefixed with the class of the finding — the invariant's name
+/// (`"I-ROWFMT: …"`, `"I-IDX: …"`, …) for a violation, `"UNCHECKED: …"`
+/// for a surface the checker cannot check yet (a `IdxStorage::Range`
+/// index, C-T6b2) — so a harness can assert on the class of a finding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     pub violations: Vec<String>,
@@ -156,8 +158,12 @@ pub fn check_table<K: OrderedKv>(
         let isid = match idx.storage {
             IdxStorage::Id(isid) => isid,
             IdxStorage::Range(..) => {
+                // FU-4a: its own report class — an admission that this
+                // surface is not checkable yet (C-T6b2's range checks),
+                // never an "I-IDX" violation string. Conservative: it
+                // still makes the report unclean.
                 report.push(format!(
-                    "I-IDX: index {} of relation {oid} has explicit entry ranges (C-T6b2): not checkable",
+                    "UNCHECKED: index {} of relation {oid} has explicit entry ranges (C-T6b2): not checkable",
                     idx.oid
                 ));
                 continue;

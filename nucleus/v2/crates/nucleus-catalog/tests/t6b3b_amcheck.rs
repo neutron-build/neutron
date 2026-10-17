@@ -16,10 +16,12 @@
 //! entries and index states are each read at `at` — a key-changing update
 //! and a ladder step committed after the snapshot must not leak into the
 //! pinned verdict, and a DeleteOnly-era violation must survive a
-//! post-`at` ladder to `Public`), and the `IdxStorage::Range`
-//! conservative-direction pin (a Range index is never falsely clean; the
-//! distinct report class itself is a src-side change outside this card's
-//! Touch-only files).
+//! post-`at` ladder to `Public`), and the `IdxStorage::Range` report
+//! class (`UNCHECKED`, an admission — never an `I-IDX` violation string).
+//! The C-T6b3bfix2 follow-up pins the **joint** data-side cut: a row
+//! planted after the guard (no entry maintenance ran) is invisible at
+//! `at` and dirty at latest, so even a checker that moved rows AND
+//! entries to the latest together still cannot pass the pinned verdict.
 
 mod t6b_support;
 
@@ -585,6 +587,103 @@ fn rows_and_entries_are_read_at_at_not_the_latest() {
     assert!(fresh.is_clean(), "{:?}", fresh.violations);
 }
 
+/// FU-A (the C-T6b3bfix gate's L-1, this card's item 2): the FU-1
+/// battery pins each data side **individually** against the other at
+/// `at`; this test pins the **joint** cut — an amcheck that reads rows
+/// AND entries at the latest together still keeps the two sides of
+/// I-IDX consistent on the committed scene (that is why M-both passed
+/// the whole suite), so after the guard a corruption is planted that no
+/// committed write explains: a row version through `core_plant_version`
+/// whose entry maintenance never ran — invisible at `at`, dirty at
+/// latest. The pinned verdict must stay clean (the plant is not its
+/// business); a fresh snapshot must be dirty (row 9 is visible and its
+/// `/u/` entry is missing). Under M-both the pinned check reads the
+/// plant on the row side and misses it on the entry side — a false
+/// violation at `at`, exactly the survivor this kills.
+#[test]
+fn both_data_sides_are_read_at_at_not_the_latest_together() {
+    let rig = Rig::new();
+    // The FU-1 battery's scene: one txn with the table, two rows and the
+    // born-public unique index (§6.1 case (a), `built_at = 0`) …
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st, b"vis3", &pk_schema()));
+    let st2 = rig.stmt(&t0, s0);
+    let h = ok(rig.db.open_table(&st2, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st2, &h, &[i32_d(1), text_d("a")]));
+    ok(rig.db.insert_with(&st2, &h, &[i32_d(2), text_d("b")]));
+    let st3 = rig.stmt(&t0, s0);
+    let u_idx = ok(rig
+        .db
+        .create_index(&st3, oid, &idx_def(2, true, IndexState::DeleteOnly)));
+    ok(rig.commit_rc(t0));
+
+    // … a ladder index on the same column, DeleteOnly at `at` …
+    let (nu_idx, _nu_isid) = rig.add_index(oid, &idx_def(2, false, IndexState::DeleteOnly));
+
+    // … the snapshot the verdict is taken at …
+    let guard = rig.core().registry.take_snapshot();
+    let at = guard.ts();
+
+    // … and the existing post-`at` commits: the key-changing update and
+    // the ladder step DeleteOnly→WriteOnly.
+    {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        assert!(ok(rig.db.update(
+            &st,
+            oid,
+            &[i32_v(1)],
+            &[t6b_support::set_col(2, text_d("aa"))]
+        )));
+        ok(rig.commit_rc(t));
+    }
+    rig.set_index_def(nu_idx, idx_def(2, false, IndexState::WriteOnly));
+
+    // The plant: row 9 committed raw (HEADER_LIVE at the current ts) —
+    // no entry maintenance ran for it, so its `/u/` entry does not
+    // exist. Invisible at `at` (its ts is past the snapshot), dirty at
+    // latest.
+    let plant_ts = rig.core().visible_ts();
+    assert!(
+        plant_ts > at,
+        "the post-`at` commits and the plant are really after the snapshot"
+    );
+    let key9 = row_key_of(sid, &pk_schema(), &[i32_v(9)]);
+    let bytes = ok(pk_schema().encode_row(&[i32_d(9), text_d("zz")]));
+    core_plant_version(&rig, &key9, plant_ts, HEADER_LIVE, &bytes);
+    let u_isid = isid_of(&rig, u_idx);
+    let zz = u_entry_key(u_isid, &[text_col()], &[text_v("zz".into())]);
+    assert!(
+        !rig.scan_entries(u_isid).into_iter().any(|(k, _)| k == zz),
+        "the plant's entry maintenance never ran: /u/zz is missing at latest"
+    );
+
+    // At the guard the plant is invisible: the pinned verdict stays
+    // clean — M-both's checker reads it on the row side anyway and
+    // reports the missing entry as a false violation at `at`.
+    let pinned = ok(check_table(&rig.db, oid, &guard));
+    assert!(
+        pinned.is_clean(),
+        "M-both: rows and entries are read at `at` **together**, not at the latest: {:?}",
+        pinned.violations
+    );
+
+    // A fresh snapshot sees the planted row and its missing entry: the
+    // corruption is real, only invisible at `at` — exactly one finding.
+    let fresh = check_now(&rig, oid);
+    assert_eq!(
+        fresh.violations,
+        vec![format!(
+            "I-IDX: index {u_idx} of relation {oid}: entry {zz:?} computed from a visible row is missing at {:?}",
+            rig.core().visible_ts()
+        )],
+        "the fresh verdict is dirty on exactly the planted row's missing entry"
+    );
+}
+
 /// FU-1's violation-judged twin (the gate's F-1, M-vis-idx): the **index
 /// defs** are read at `at` too. An entry is planted under an index that is
 /// DeleteOnly at `at`; the index is laddered `Public` after `at` (§7
@@ -703,13 +802,13 @@ fn missing_relation_is_42p01() {
     assert_eq!(err.sqlstate(), "42P01");
 }
 
-/// The C-T6b3b gate's F-5, the half pinnable from this card's Touch-only
-/// files: an index with explicit entry ranges (C-T6b2) is conservatively
-/// **not clean** — exactly one finding, naming the index — under
-/// whichever report class the checker emits (FU-4a's distinct
-/// "unchecked" class is a src-side change outside this card's Touch-only
-/// list; recorded as this card's ESCALATE note). The conservative
-/// direction (never a false negative) is the property that matters.
+/// The C-T6b3b gate's F-5, the class-agnostic half: an index with
+/// explicit entry ranges (C-T6b2) is conservatively **not clean** —
+/// exactly one finding, naming the index — under whichever report class
+/// the checker emits (the distinct `UNCHECKED` class itself is pinned by
+/// its neighbor below, C-T6b3bfix2's restored FU-4a test). The
+/// conservative direction (never a false negative) is the property that
+/// matters.
 #[test]
 fn a_range_index_is_conservatively_not_clean() {
     let rig = Rig::new();
@@ -744,6 +843,49 @@ fn a_range_index_is_conservatively_not_clean() {
     assert!(
         report.violations[0].contains("not checkable"),
         "{}",
+        report.violations[0]
+    );
+}
+
+/// FU-4a (the gate's F-5): an index with explicit entry ranges (C-T6b2)
+/// is its own report class — `UNCHECKED`, an admission that the checker
+/// cannot check this surface yet, never an `I-IDX` violation string — so
+/// a harness can tell the two apart. Conservative as before: the report
+/// is still not clean.
+#[test]
+fn a_range_index_reports_unchecked_not_an_i_idx_violation() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st, b"rng", &pk_schema()));
+    ok(rig.commit_rc(t0));
+    add_row(&rig, oid, 1, "a");
+
+    let t1 = rig.rc();
+    let s1 = rig.core().visible_ts();
+    let (idx_oid, _) = ok(rig.catalog().catalog_create_index(
+        &rig.ddl(&t1, s1),
+        oid,
+        IdxStorage::Range(b"/i/x/".to_vec(), b"/i/x0".to_vec()),
+        &ok(idx_def(2, false, IndexState::Public).encode()),
+    ));
+    ok(rig.commit_rc(t1));
+
+    let report = check_now(&rig, oid);
+    assert!(
+        !report.is_clean(),
+        "conservative: a Range index keeps the report unclean"
+    );
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    assert!(
+        report.violations[0].starts_with(&format!("UNCHECKED: index {idx_oid} of relation {oid}")),
+        "{}",
+        report.violations[0]
+    );
+    assert!(
+        !report.violations[0].starts_with("I-IDX"),
+        "its own class, not an I-IDX violation: {}",
         report.violations[0]
     );
 }

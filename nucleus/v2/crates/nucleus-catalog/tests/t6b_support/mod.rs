@@ -571,13 +571,23 @@ pub fn commit_off(rig: &Rig, txn: Txn) -> Ts {
 pub fn sweep(rig: &Rig) {
     let mut sweep = BootSweep::new(Arc::clone(rig.core()));
     // The walk is over a finite store; a bound only turns a livelock
-    // into a test failure.
+    // into a test failure — and exhausting it without `Finished` is a
+    // failure too (C-T6b3bfix2, the parent gate's FU-4 second half): the
+    // sweep must terminate on its own terms, never by the bound.
+    let mut finished = false;
     for _ in 0..100_000 {
         match ok(sweep.run_once()) {
-            JobOutcome::Finished => break,
+            JobOutcome::Finished => {
+                finished = true;
+                break;
+            }
             JobOutcome::Progress | JobOutcome::Idle => continue,
         }
     }
+    assert!(
+        finished,
+        "the boot sweep must reach Finished, not just the bound"
+    );
     ok(Resolver::run_once(rig.core()));
 }
 
