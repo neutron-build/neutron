@@ -686,3 +686,23 @@ NULL flags**.
   (`t6e3_regress::t6e4_spec_divergence_is_pinned`, to be flipped by the
   docs card that lands the letter) and the amendment is that card's
   ESCALATE.
+- **Fix-tree verification (2026-10-17, this card's session).** 80
+  sequential soak runs at the fixed tree: 0 XX001-family failures. The
+  only failures (4/80) were the scheduling-sensitive **coverage
+  floors** — `big_writes > 10`, the per-seed big length class `> 1`,
+  and the DeleteOnly-sight `> 0` — each with `violations: 0` (engine
+  clean, coverage starved); they pre-date the card: 1/40 at the branch
+  point `cc6a8a7c` on the same machine the same session, and the
+  C-T6d2fix gate's H-1 census had already measured ~16% at its tree
+  (this card may not trim them; they ride as a workload-stability item
+  for the soak's owner). Mutation evidence: the core mutant (the era
+  condition forced off — the crossing restored) fails both era pins
+  deterministically with the exact pre-fix signature (`Row(Corrupt(
+  "NULL bit on a NOT NULL column"))`), and the soak catches it under
+  8-way parallel load — 4 catches in 720 invocations, all seed
+  `0x7c1a0003`, all the family signature (e.g. `txn 60 (session 1,
+  prog 22, attempt 0, RR) op 1 (St at S=41, def vSome(2)): a read
+  failed with XX001`); the literal captured seed `0x7c1a0001` did not
+  re-fire on this box (0/840 loaded invocations — which seed's history
+  draws the window is scheduler luck; the original seed-01 capture was
+  the gate machine's draw).
