@@ -42,7 +42,9 @@
 //!   — names chunks `0..chunk_count` visible at `at` with lengths
 //!   summing to `raw_len`, and every visible chunk of the storage is
 //!   named by such a pointer. A missing or short chunk is a dangling
-//!   pointer; an unnamed chunk is an orphan.
+//!   pointer; an unnamed chunk is an orphan; a pointer counting more
+//!   chunks than the storage has visible is reported dangling without
+//!   being walked (a planted huge count cannot spin the check).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -376,6 +378,11 @@ fn visible_chunk_sizes<K: OrderedKv>(
 ///   bytes but a shorter non-empty last, summing to `raw_len`;
 /// - every visible chunk of the storage is named by such a pointer.
 ///
+/// A pointer naming more chunks than the storage has visible is
+/// dangling at some index and is reported without being walked — the
+/// bound that keeps a planted huge-but-self-consistent chunk count from
+/// spinning the check (C-T6d2fix, gate F-5).
+///
 /// A row that does not even raw-decode is skipped: I-ROWFMT has already
 /// reported it, and its pointers are unknowable. Violations are named
 /// `"I-TOAST: …"`.
@@ -410,6 +417,19 @@ fn check_toast<K: OrderedKv>(
                 report.push(format!(
                     "I-TOAST: relation {oid} row {key:?}: pointer {:?} counts {} chunks, which cannot sum to raw_len {}",
                     p.id, p.chunks, p.raw_len
+                ));
+                continue;
+            }
+            if p.chunks as usize > chunks.len() {
+                // The pointer names more chunks than the storage has
+                // visible, so it is dangling at some index — reported
+                // without iterating it (C-T6d2fix, gate F-5: a planted
+                // huge-but-self-consistent count — u32::MAX chunks with
+                // raw_len u32::MAX — passes the guard above, and the
+                // walk below would insert into `named` once per index).
+                report.push(format!(
+                    "I-TOAST: relation {oid} row {key:?}: pointer {:?} counts {} chunks, but the storage has {} visible (dangling at some index)",
+                    p.id, p.chunks, chunks.len()
                 ));
                 continue;
             }
