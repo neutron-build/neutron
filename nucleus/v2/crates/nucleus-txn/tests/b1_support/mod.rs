@@ -1350,11 +1350,28 @@ pub fn drive_recovery<K: OrderedKv>(
             // legally lands after its ack (§3 steps 4→5), so drain until
             // no intent remains anywhere and the queue is empty — every
             // intent is placed before its commit, so this is exactly the
-            // work left. Bounded: a stuck intent hangs here loudly.
+            // work left. The probe can fire from inside these rounds
+            // too (the GC points fire inside `run_once`); a kill after
+            // it fired is the crash, so every error and the deadline are
+            // checked against `fired()` first. Bounded: a stuck intent
+            // hangs here loudly.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                ok(Resolver::run_once(core));
-                ok(gc.run_once(0));
+                if let Err(e) = Resolver::run_once(core) {
+                    if fired() {
+                        return;
+                    }
+                    panic!("drive: the resolver errored before the probe fired: {e:?}");
+                }
+                if let Err(e) = gc.run_once(0) {
+                    if fired() {
+                        return;
+                    }
+                    panic!("drive: the GC errored before the probe fired: {e:?}");
+                }
+                if fired() {
+                    return;
+                }
                 if no_intents(core) && core.resolve_queue_len() == 0 {
                     return;
                 }

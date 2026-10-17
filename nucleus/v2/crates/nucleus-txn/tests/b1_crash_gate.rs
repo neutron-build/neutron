@@ -100,19 +100,29 @@ fn scenario(
         // SlotStep belongs to no crate body: drive it with the §9.3 slot
         // test job on a real runner (the card's "via the test job"). The
         // probe fires every step; the kill lands inside the runner's
-        // step, exactly as for the hand-driven kinds.
+        // step, exactly as for the hand-driven kinds. The wait is on the
+        // STEP COUNT (not the probe): `occurrence + 2` steps guarantee
+        // the occurrence was hit if its probe call exists, so a deleted
+        // call surfaces as the gate's fired assertion, not this wait.
+        let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut set = JobSet::new(Arc::clone(&core2));
-        ok(set.start(
-            Box::new(SlotJob::new(JobKind::Merge, |cx: &JobCtx| {
-                cx.probe(JobPoint::SlotStep);
-                Ok(JobOutcome::Idle)
-            })),
-            nucleus_txn::jobs::JobConfig {
-                idle_interval: Duration::from_millis(1),
-                budget: None,
-            },
-        ));
-        wait_until(5, "the slot job hit its step point", || state.fired());
+        {
+            let steps = Arc::clone(&steps);
+            ok(set.start(
+                Box::new(SlotJob::new(JobKind::Merge, move |cx: &JobCtx| {
+                    steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    cx.probe(JobPoint::SlotStep);
+                    Ok(JobOutcome::Idle)
+                })),
+                nucleus_txn::jobs::JobConfig {
+                    idle_interval: Duration::from_millis(1),
+                    budget: None,
+                },
+            ));
+        }
+        wait_until(5, "the slot job ran its steps", || {
+            steps.load(std::sync::atomic::Ordering::SeqCst) >= occurrence + 2
+        });
         ok(set.shutdown());
     } else {
         let gc2 = Arc::new(ok(GcJob::install(&core2, GcConfig::default())));

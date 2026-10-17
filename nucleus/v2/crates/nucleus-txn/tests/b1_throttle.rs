@@ -255,11 +255,16 @@ fn stop_interrupts_a_throttled_job() {
 
 // ---- the bounded resolver -----------------------------------------------------
 
-/// A [`JobProbe`] counting hits of one point (the truncation gate of the
-/// bounded rounds).
+/// The bounded-round probe: counts one point's hits (the truncation
+/// gate) and, at its third removal, aborts a held txn **mid-round** — its
+/// cleanup entry lands at the back of the queue while the round holds the
+/// drained entries, which is what makes the requeue order observable.
 struct CountProbe {
     point: JobPoint,
     hits: AtomicU64,
+    removals: AtomicU64,
+    pending: Arc<Mutex<Option<nucleus_txn::txn::Txn>>>,
+    core: Arc<Core<MemKv>>,
 }
 
 impl JobProbe for CountProbe {
@@ -267,18 +272,32 @@ impl JobProbe for CountProbe {
         if point == self.point {
             self.hits.fetch_add(1, Ordering::SeqCst);
         }
+        if point == JobPoint::ResolverAfterRemoval
+            && self.removals.fetch_add(1, Ordering::SeqCst) == 2
+        {
+            let txn = self
+                .pending
+                .lock()
+                .expect("b1 throttle pending")
+                .take()
+                .expect("the probe aborts once");
+            ok(self.core.abort(txn));
+        }
     }
 }
 
 /// R-TAIL (the unfinished entry goes to the **back**) and R-DROP (the
-/// remainder is dropped): two committed txns queue one entry each — T1
-/// with 10 keys, then T2 with 1. A `run_bounded(3)` round removes
-/// exactly 3 keys of T1, requeues T1's remaining 7 keys **at the front**
-/// with T2 behind it, and runs no truncation pass. The next bounded
-/// round therefore removes T1's a3/a4/a5 and leaves T2's b0 untouched
-/// (under R-TAIL, T2 jumps the queue and b0 is gone). Draining to the
-/// end resolves every key (under R-DROP the dropped remainder lingers)
-/// and only then truncates.
+/// remainder is dropped): T1 (10 keys) and T2 (1 key) queue one entry
+/// each, and a third txn's cleanup entry is enqueued **mid-round** — the
+/// probe aborts it at the round's third removal, so the queue is
+/// non-empty when the round requeues its unfinished tail and
+/// front-vs-back is observable. A `run_bounded(3)` round removes exactly
+/// 3 keys of T1, requeues T1's remaining 7 keys at the **front** with T2
+/// and the aborted txn's cleanup behind it, and runs no truncation pass.
+/// The next bounded round therefore removes T1's a3/a4/a5 and leaves the
+/// later entries' keys untouched (under R-TAIL they jump the queue).
+/// Draining to the end resolves every key (under R-DROP the dropped
+/// remainder lingers) and only then truncates.
 #[test]
 fn resolver_steps_are_bounded() {
     let core = Arc::new(ok(Core::open(MemKv::new())));
@@ -308,12 +327,21 @@ fn resolver_steps_are_bounded() {
         t2,
         nucleus_txn::commit::SyncCommit::On,
     ));
+    // A pending txn holding one intent; the probe aborts it mid-round so
+    // its cleanup entry lands at the BACK of the queue while the round
+    // holds the drained entries.
+    let pending = core.begin(Isolation::ReadCommitted);
+    place_write(&core, &pending, b"/t/1/ax", b"doomed");
+    let pending = Arc::new(Mutex::new(Some(pending)));
     assert_eq!(core.resolve_queue_len(), 2, "one entry per txn, in order");
     drop(pipeline);
 
     let probe = Arc::new(CountProbe {
         point: JobPoint::ResolverBeforeTruncation,
         hits: AtomicU64::new(0),
+        removals: AtomicU64::new(0),
+        pending,
+        core: Arc::clone(&core),
     });
     core.set_job_probe(Arc::clone(&probe) as Arc<dyn JobProbe>);
 
@@ -329,7 +357,11 @@ fn resolver_steps_are_bounded() {
         0,
         "no truncation pass before the queue drains"
     );
-    assert_eq!(core.resolve_queue_len(), 2, "both entries stay queued");
+    assert_eq!(
+        core.resolve_queue_len(),
+        3,
+        "T1's remainder requeued, then T2 and the aborted txn's cleanup"
+    );
     for i in 0..3u64 {
         assert!(
             ok(core.latest_get(&intent_key(format!("/t/1/a{i}").as_bytes()))).is_none(),
@@ -347,13 +379,18 @@ fn resolver_steps_are_bounded() {
         "T2's key waits behind T1's remainder"
     );
 
-    // Round 2: the front entry continues first — a3/a4/a5, not b0.
+    // Round 2: the front entry continues first — a3/a4/a5, not the
+    // entries queued behind T1's remainder (T2's b0, the aborted ax).
     let r2 = ok(Resolver::run_bounded(&core, 3));
     assert_eq!(r2.keys, 3);
     assert_eq!(probe.hits.load(Ordering::SeqCst), 0, "still not drained");
     assert!(
         ok(core.latest_get(&intent_key(b"/t/1/b0"))).is_some(),
         "R-TAIL: T2 jumped T1's requeued remainder"
+    );
+    assert!(
+        ok(core.latest_get(&intent_key(b"/t/1/ax"))).is_some(),
+        "R-TAIL: the mid-round cleanup entry jumped T1's remainder"
     );
     for i in 3..6u64 {
         assert!(
@@ -369,7 +406,7 @@ fn resolver_steps_are_bounded() {
     }
 
     // Drain: only a fully drained round truncates, and every key ends
-    // resolved with both statuses truncated.
+    // resolved with the statuses truncated.
     let mut rounds = 0;
     loop {
         rounds += 1;
@@ -383,7 +420,10 @@ fn resolver_steps_are_bounded() {
         probe.hits.load(Ordering::SeqCst) >= 1,
         "a drained round ran the truncation pass"
     );
-    for key in t1_keys.iter().chain([b"/t/1/b0".to_vec()].iter()) {
+    for key in t1_keys
+        .iter()
+        .chain([b"/t/1/b0".to_vec(), b"/t/1/ax".to_vec()].iter())
+    {
         assert!(
             ok(core.latest_get(&intent_key(key))).is_none(),
             "{key:?} resolved in the end"
@@ -393,7 +433,7 @@ fn resolver_steps_are_bounded() {
     assert!(core.status.entry(t2_id).is_none(), "T2 truncated");
     assert_eq!(
         core.job_stats(JobKind::Resolver).units,
-        11,
+        12,
         "one charged unit per removal"
     );
 }
