@@ -122,15 +122,18 @@ fn budget_paces_a_job() {
     });
     let mut set = nucleus_txn::jobs::JobSet::new(Arc::clone(&core))
         .with_clock(clock.as_job_clock())
-        .with_spawner(Arc::new(InlineSpawner));
+        .with_spawner(Arc::new(InlineSpawner))
+        .with_budget(
+            JobKind::Merge,
+            Some(IoBudget {
+                units_per_sec: 1000,
+                burst: 100,
+            }),
+        );
     ok(set.start(
         Box::new(job),
         nucleus_txn::jobs::JobConfig {
             idle_interval: Duration::from_secs(3600),
-            budget: Some(IoBudget {
-                units_per_sec: 1000,
-                burst: 100,
-            }),
         },
     ));
     // `start` ran the whole loop inline; the set shuts down trivially.
@@ -152,8 +155,9 @@ fn budget_paces_a_job() {
     );
 }
 
-/// The unbudgeted complement: the same job with `budget: None` runs all
-/// 40 steps without a single pause (no bucket, no waits, no units owed).
+/// The unbudgeted complement: the same job on an unbudgeted kind runs
+/// all 40 steps without a single pause (no bucket, no waits, no units
+/// owed).
 #[test]
 fn unbudgeted_job_never_pauses() {
     let core = Arc::new(ok(Core::open(MemKv::new())));
@@ -171,12 +175,12 @@ fn unbudgeted_job_never_pauses() {
         });
         let mut set = nucleus_txn::jobs::JobSet::new(Arc::clone(&core))
             .with_clock(clock.as_job_clock())
-            .with_spawner(Arc::new(InlineSpawner));
+            .with_spawner(Arc::new(InlineSpawner))
+            .with_budget(JobKind::Merge, None);
         ok(set.start(
             Box::new(job),
             nucleus_txn::jobs::JobConfig {
                 idle_interval: Duration::from_secs(3600),
-                budget: None,
             },
         ));
         ok(set.shutdown());
@@ -203,7 +207,13 @@ fn stop_interrupts_a_throttled_job() {
     let core = Arc::new(ok(Core::open(MemKv::new())));
     let stepped = Arc::new((Mutex::new(0u64), Condvar::new()));
 
-    let mut set = nucleus_txn::jobs::JobSet::new(Arc::clone(&core));
+    let mut set = nucleus_txn::jobs::JobSet::new(Arc::clone(&core)).with_budget(
+        JobKind::Merge,
+        Some(IoBudget {
+            units_per_sec: 1,
+            burst: 1,
+        }),
+    );
     {
         let stepped = Arc::clone(&stepped);
         let job = SlotJob::new(JobKind::Merge, move |cx: &JobCtx| {
@@ -224,10 +234,6 @@ fn stop_interrupts_a_throttled_job() {
             Box::new(job),
             nucleus_txn::jobs::JobConfig {
                 idle_interval: Duration::from_secs(3600),
-                budget: Some(IoBudget {
-                    units_per_sec: 1,
-                    burst: 1,
-                }),
             },
         ));
     }

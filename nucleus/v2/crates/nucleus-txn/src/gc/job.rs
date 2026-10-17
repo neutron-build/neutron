@@ -635,13 +635,12 @@ pub fn spawn_gc<K: OrderedKv>(
     // A spawn failure is recorded by `start` and reported to the very
     // hook passed above before the error returns; the handle below then
     // carries it out of `stop`, exactly as the pre-C-B1a wrapper did.
-    // The config keeps D4's GC budget and takes only the interval from
-    // the caller.
+    // The interval is the caller's; the §9.3 budget comes from the set's
+    // D4 default for the Gc kind.
     let _spawn_failed = set.start(
         Box::new(runner),
         JobConfig {
             idle_interval: interval,
-            ..JobConfig::default_for(JobKind::Gc)
         },
     );
     GcHandle {

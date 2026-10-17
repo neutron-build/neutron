@@ -39,7 +39,6 @@ fn gc<K: nucleus_kv::OrderedKv>(core: &Arc<Core<K>>) -> Arc<GcJob<K>> {
 fn idle(secs: u64) -> JobConfig {
     JobConfig {
         idle_interval: Duration::from_secs(secs),
-        budget: None,
     }
 }
 
@@ -628,7 +627,6 @@ fn jobset_cleanup_cleans_once_w_rises_without_a_poke() {
         Box::new(GcRunner::new(Arc::clone(&gc), Arc::new(SystemClock))),
         JobConfig {
             idle_interval: Duration::from_millis(20),
-            budget: None,
         },
     ));
     set.attach_commit_thread(rig.commit);
@@ -721,7 +719,6 @@ fn jobset_shutdown_acks_an_inflight_marker_delete() {
         Box::new(GcRunner::new(Arc::clone(&gc), Arc::new(SystemClock))),
         JobConfig {
             idle_interval: Duration::from_millis(20),
-            budget: None,
         },
     ));
     set.attach_commit_thread(rig.commit);

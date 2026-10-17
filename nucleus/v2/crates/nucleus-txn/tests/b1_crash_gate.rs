@@ -116,7 +116,6 @@ fn scenario(
                 })),
                 nucleus_txn::jobs::JobConfig {
                     idle_interval: Duration::from_millis(1),
-                    budget: None,
                 },
             ));
         }

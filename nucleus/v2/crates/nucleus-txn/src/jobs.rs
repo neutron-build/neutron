@@ -36,7 +36,10 @@
 //! cleanup from the retired rows.
 //!
 //! C-B1c adds the §9.3 I/O budgets: a token bucket per budgeted job,
-//! refilled from an injectable [`JobClock`] (the default is the monotonic
+//! configured per job kind on the [`JobSet`](self::runner::JobSet)
+//! (D4's defaults via [`IoBudget::default_for`], override with
+//! [`JobSet::with_budget`](self::runner::JobSet::with_budget)), refilled
+//! from an injectable [`JobClock`] (the default is the monotonic
 //! [`SystemJobClock`]) and charged in the work units the job bodies
 //! report through [`JobCtx::charge`] / [`Core::job_units`](crate::boot::Core::job_units)
 //! (`nucleus_job_units_total`). Throttling only **delays** a step — it
@@ -74,9 +77,14 @@ pub use wake::{Wake, WakeResult};
 /// balance). A `units_per_sec` of `0` disables the budget — a bucket
 /// that never refills would park its job forever, which no caller wants.
 ///
-/// Throttling only delays steps and never changes their outcome (§9.3):
-/// the runner pauses in slices of at most 10 ms, checking stop between
-/// slices, so shutdown stays prompt however deep the deficit is.
+/// Budgets are configured **per job kind on the [`JobSet`](crate::jobs::runner::JobSet)**
+/// ([`JobSet::with_budget`](crate::jobs::runner::JobSet::with_budget));
+/// [`IoBudget::default_for`] holds D4's defaults (Gc, BootSweep and
+/// DropCleanup run on [`DEFAULT_JOB_BUDGET`]; the resolver, SSI
+/// retention, merge and analyze carry none). Throttling only delays
+/// steps and never changes their outcome (§9.3): the runner pauses in
+/// slices of at most 10 ms, checking stop between slices, so shutdown
+/// stays prompt however deep the deficit is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoBudget {
     pub units_per_sec: u64,
@@ -89,6 +97,19 @@ pub const DEFAULT_JOB_BUDGET: IoBudget = IoBudget {
     units_per_sec: 50_000,
     burst: 5_000,
 };
+
+impl IoBudget {
+    /// D4's per-kind default: Gc, BootSweep and DropCleanup run on
+    /// [`DEFAULT_JOB_BUDGET`]; the resolver, SSI retention, merge and
+    /// analyze carry no budget. A `JobSet` starts every kind on this and
+    /// `with_budget` overrides it.
+    pub fn default_for(kind: JobKind) -> Option<IoBudget> {
+        match kind {
+            JobKind::Gc | JobKind::BootSweep | JobKind::DropCleanup => Some(DEFAULT_JOB_BUDGET),
+            JobKind::Resolver | JobKind::SsiRetention | JobKind::Merge | JobKind::Analyze => None,
+        }
+    }
+}
 
 /// The clock the I/O budgets run on (§9.3): `now` is a monotonic
 /// timestamp the bucket refills from, `pause` waits. Injectable so
@@ -390,27 +411,22 @@ impl JobProbe for NoJobProbe {
     fn at(&self, _point: JobPoint) {}
 }
 
-/// Per-job runner configuration: the idle park interval and the optional
-/// §9.3 I/O budget (C-B1c) whose token bucket paces the job's steps.
-/// The budget only delays steps — a throttled step does exactly what an
-/// unthrottled one would, later.
+/// Per-job runner configuration: the idle park interval. The §9.3 I/O
+/// budget is configured per job kind on the [`JobSet`](crate::jobs::runner::JobSet)
+/// (D4 defaults via [`IoBudget::default_for`], override with
+/// [`JobSet::with_budget`](crate::jobs::runner::JobSet::with_budget)) —
+/// a budget only delays steps, never changes what they do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobConfig {
     /// How long the runner parks on the job's wake after an `Idle` step
     /// before running another round.
     pub idle_interval: Duration,
-    /// The §9.3 I/O budget: a token bucket charged in the units the body
-    /// reports ([`JobCtx::charge`]). `None` (the resolver, SSI retention
-    /// and the reserved slots by default) never throttles.
-    pub budget: Option<IoBudget>,
 }
 
 impl JobConfig {
-    /// The defaults of one job kind (D4): the resolver parks 50 ms (every
-    /// release wakes it, so the interval is only a backstop), SSI
-    /// retention 100 ms, the rest 1 s; Gc, BootSweep and DropCleanup run
-    /// on [`DEFAULT_JOB_BUDGET`], the resolver, SSI retention, merge and
-    /// analyze carry no budget.
+    /// The default interval of one job kind: the resolver parks 50 ms
+    /// (every release wakes it, so the interval is only a backstop), SSI
+    /// retention 100 ms, and the rest 1 s.
     pub fn default_for(kind: JobKind) -> JobConfig {
         let idle_interval = match kind {
             JobKind::Resolver => Duration::from_millis(50),
@@ -421,14 +437,7 @@ impl JobConfig {
             | JobKind::BootSweep
             | JobKind::Gc => Duration::from_secs(1),
         };
-        let budget = match kind {
-            JobKind::Gc | JobKind::BootSweep | JobKind::DropCleanup => Some(DEFAULT_JOB_BUDGET),
-            JobKind::Resolver | JobKind::SsiRetention | JobKind::Merge | JobKind::Analyze => None,
-        };
-        JobConfig {
-            idle_interval,
-            budget,
-        }
+        JobConfig { idle_interval }
     }
 }
 

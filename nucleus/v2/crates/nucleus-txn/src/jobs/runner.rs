@@ -258,7 +258,9 @@ struct SetShared {
 /// A set of background jobs over one core (§9.3), plus the optional commit
 /// thread whose shutdown the set orders. Create with [`JobSet::new`],
 /// install jobs with [`JobSet::start`], and shut everything down with
-/// [`JobSet::shutdown`] (or just drop it).
+/// [`JobSet::shutdown`] (or just drop it). Every kind starts on D4's
+/// I/O-budget default ([`IoBudget::default_for`](crate::jobs::IoBudget::default_for));
+/// [`JobSet::with_budget`] overrides one kind's.
 pub struct JobSet<K: OrderedKv> {
     core: Arc<Core<K>>,
     spawner: Arc<dyn Spawner>,
@@ -269,6 +271,9 @@ pub struct JobSet<K: OrderedKv> {
     /// The clock the set's I/O budgets run on (§9.3; C-B1c). Shared by
     /// every budgeted job of the set.
     clock: Arc<dyn JobClock>,
+    /// The §9.3 I/O budget of each kind (D4's defaults; `with_budget`
+    /// overrides). Read once when a job starts.
+    budgets: [Option<crate::jobs::IoBudget>; 7],
     commit_thread: Option<CommitThreadHandle>,
     shared: Arc<SetShared>,
 }
@@ -276,13 +281,19 @@ pub struct JobSet<K: OrderedKv> {
 impl<K: OrderedKv> JobSet<K> {
     /// An empty set over `core`, spawning std threads, reporting errors to
     /// the core's fail-stop hook (read at error time), pacing budgeted
-    /// jobs on the monotonic [`SystemJobClock`].
+    /// jobs on the monotonic [`SystemJobClock`] with D4's per-kind
+    /// budgets.
     pub fn new(core: Arc<Core<K>>) -> JobSet<K> {
+        let mut budgets = [None; 7];
+        for kind in JobKind::ALL {
+            budgets[kind.index()] = crate::jobs::IoBudget::default_for(kind);
+        }
         JobSet {
             core,
             spawner: Arc::new(StdThreadSpawner),
             fail_stop: None,
             clock: Arc::new(SystemJobClock::new()),
+            budgets,
             commit_thread: None,
             shared: Arc::new(SetShared {
                 slots: Mutex::new(Vec::new()),
@@ -298,6 +309,23 @@ impl<K: OrderedKv> JobSet<K> {
     pub fn with_clock(mut self, clock: Arc<dyn JobClock>) -> JobSet<K> {
         self.clock = clock;
         self
+    }
+
+    /// Sets one kind's §9.3 I/O budget for this set (`None` unbudgets it),
+    /// overriding D4's default. Must run before the kind's job starts —
+    /// a job reads its bucket once, at `start`.
+    pub fn with_budget(
+        mut self,
+        kind: JobKind,
+        budget: Option<crate::jobs::IoBudget>,
+    ) -> JobSet<K> {
+        self.budgets[kind.index()] = budget;
+        self
+    }
+
+    /// The budget `kind`'s jobs run on in this set.
+    pub fn budget_of(&self, kind: JobKind) -> Option<crate::jobs::IoBudget> {
+        self.budgets[kind.index()]
     }
 
     /// Uses this spawner for every job the set starts (C-R0b's seam).
@@ -343,8 +371,8 @@ impl<K: OrderedKv> JobSet<K> {
             return Err(e);
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let throttle = config
-            .budget
+        let throttle = self
+            .budget_of(kind)
             .filter(|b| b.units_per_sec > 0)
             .map(|b| Throttle {
                 bucket: TokenBucket::new(b),
