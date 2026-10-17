@@ -5,6 +5,12 @@
 //! TRUNCATE retiring chunks with the table range, and the dropped-column
 //! raw-pointer sweep. Every test names the mutant it kills (T1–T10 of the
 //! card's binding list; the card names no T8).
+//!
+//! C-T6d1fix: the gate follow-ups (F-1/F-3) — the same detoast read
+//! rules pinned through the lenses the card's tests left silent
+//! (`Db::scan`, `Db::index_scan`, an EPQ base above which a writer
+//! committed: mutants G2, G9) and the sum-against-`raw_len` oracle of
+//! `read_pointer` (G10).
 
 mod t6b_support;
 
@@ -602,6 +608,46 @@ fn rr_reader_reads_the_old_value_after_a_concurrent_replace() {
     drop(guard);
 }
 
+/// G2 (the C-T6d1 gate's F-1): the T3 shape through `Db::scan` — the
+/// same RR reader at `S`, the same concurrent replace, but the rows come
+/// back through the scan path, whose detoast is its own site (a row
+/// read at `S` detoasts at `S`, whatever `visible_ts` says). Detoasting
+/// at `visible_ts` instead would hit the old chunks' tombstones (placed
+/// by the replace) and report XX001 rather than the old value.
+#[test]
+fn rr_scan_reads_the_old_value_after_a_concurrent_replace() {
+    let rig = Rig::new();
+    let (oid, _sid) = mk_wide(&rig);
+    add_wide_row(&rig, oid, 1, "x", &blob(52, 20_000));
+
+    let (r, guard, s) = rig.rr();
+
+    let w2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st2 = rig.stmt(&w2, s2);
+    assert!(ok(rig.db.update(
+        &st2,
+        oid,
+        &[i32_v(1)],
+        &[set_col(3, text_d(&blob(53, 20_000)))]
+    )));
+    let ts2 = ok(rig.commit_rc(w2));
+    assert!(ts2 > s, "the replace commits after the reader's snapshot");
+
+    let st_r = ok(Stmt::new(&r, s));
+    let h = ok(rig.db.open_table(&st_r, oid, RelLockMode::AccessShare));
+    let rows = ok(rig.db.scan(&st_r, &h));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1,
+        vec![i32_d(1), text_d("x"), text_d(&blob(52, 20_000))],
+        "the RR scan detoasts the old value at its snapshot (G2)"
+    );
+    ok(rig.core().abort(r));
+    rig.settle();
+    drop(guard);
+}
+
 /// T4: an EPQ base detoasted at `S` — an RC delete of a row with a
 /// **toasted indexed** column after a concurrent replace (the EPQ base's
 /// commit ts is above `S`): the old index entry is computed from the base
@@ -678,6 +724,168 @@ fn rc_delete_toasted_indexed_column_after_concurrent_replace() {
         visible_chunk_keys(&rig, sid).is_empty(),
         "the base's chunks died with the row"
     );
+}
+
+/// G9 (the C-T6d1 gate's F-1): the T4 shape with a writer above the EPQ
+/// base — the base's chunks carry a tombstone that is visible at
+/// `visible_ts` but not at the base's own commit ts, so the base detoast
+/// must read them at `register_at(v.ts)` and nowhere else. The tombstone
+/// above the base is planted raw (`core_plant_version`, the corruption
+/// oracle's primitive): a legal history cannot produce one — any writer
+/// that tombstones the base's chunks first writes a newer row version,
+/// which the row op's EPQ would take as its base instead — but the read
+/// rule is what keeps the base's detoast immune to everything above
+/// `v.ts`, a planted tombstone included. (Reading at `visible_ts` — the
+/// gate's G9 — hits the planted tombstone: XX001, the delete fails.
+/// Reading at the reader's `S` is T4's own mutant.)
+#[test]
+fn rc_delete_epq_base_detoasts_at_the_base_ts_above_a_later_writer() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st0, b"pk", &pk_schema()));
+    ok(rig.commit_rc(t0));
+    // A Public /i/ index on the payload column.
+    let (_ix, isid) = rig.add_index(oid, &idx_def(2, false, IndexState::Public));
+
+    let ts1 = {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        ok(rig
+            .db
+            .insert_by_oid(&st, oid, &[i32_d(1), text_d(&blob(62, 2100))]));
+        ok(rig.commit_rc(t))
+    };
+    let key1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+    let text_col = [nucleus_codec::KeyColumn::asc(KeyType::Text(Collation::C))];
+    let e1 = t6b_support::i_entry_key(isid, &text_col, &[Some(Value::Text(blob(62, 2100)))], &key1);
+
+    // The deleter's snapshot, taken before the replace.
+    let d = rig.rc();
+    let s_d = rig.core().visible_ts();
+    let st_d = ok(Stmt::new(&d, s_d));
+
+    // The replace: a fresh id and entry; the EPQ base is its version.
+    let ts2 = {
+        let w = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&w, s);
+        assert!(ok(rig.db.update(
+            &st,
+            oid,
+            &[i32_v(1)],
+            &[set_col(2, text_d(&blob(63, 2100)))]
+        )));
+        ok(rig.commit_rc(w))
+    };
+    let e2 = t6b_support::i_entry_key(isid, &text_col, &[Some(Value::Text(blob(63, 2100)))], &key1);
+    assert!(ts2 > s_d, "the replace committed above the deleter's S");
+
+    // The writer above the EPQ base: a commit on another table moves
+    // `visible_ts` past `ts2` (the discriminator the T4 fixture lacks),
+    // and a raw-planted tombstone on the base's chunks at that ts is
+    // visible at `visible_ts` but not at `register_at(ts2)`.
+    let ts3 = {
+        let hb = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&hb, s);
+        ok(rig.db.create_table(&st, b"hb", &pk_schema()).map(|_| ()));
+        ok(rig.commit_rc(hb))
+    };
+    assert!(ts3 > ts2, "the heartbeat committed above the EPQ base");
+    let base = row_pointers(&rig, sid, &pk_schema(), 1).remove(0);
+    assert_eq!(base.chunks, 1, "the 2100-byte payload is one chunk");
+    for i in 0..base.chunks {
+        core_plant_version(&rig, &chunk_key(sid, &base.id, i), ts3, 0x02, b"");
+    }
+
+    // The delete: Ok(true) — no XX001 at `visible_ts` (G9), none at `S`
+    // (T4's mutant); the base's entry is computed from the base
+    // detoasted at `register_at(ts2)`, where its chunks still live.
+    assert!(
+        ok(rig.db.delete(&st_d, oid, &[i32_v(1)])),
+        "the delete detoasts the EPQ base at the base's own ts (G9)"
+    );
+    let ts_del = ok(rig.commit_rc(d));
+
+    assert!(
+        rig.scan_entries(isid).is_empty(),
+        "no stale entry remains (the base's entry was deleted)"
+    );
+    assert_eq!(
+        idx_versions_of(&rig, isid, &e1),
+        vec![(Some(ts2), 0x02), (Some(ts1), 0x00)],
+        "the replace tombstoned the insert's entry"
+    );
+    assert_eq!(
+        idx_versions_of(&rig, isid, &e2),
+        vec![(Some(ts_del), 0x02), (Some(ts2), 0x00)],
+        "the delete tombstoned the EPQ base's entry, computed from the base at its own ts (G9)"
+    );
+    assert!(
+        visible_chunk_keys(&rig, sid).is_empty(),
+        "the base's chunks died with the row"
+    );
+}
+
+/// FU-1c (the C-T6d1 gate's F-1, optional leg): the same T3 shape
+/// through `Db::index_scan` — an RR reader at `S` over an index on the
+/// toasted column itself, after a concurrent replace committed. The
+/// entries, the row fetches and the §6 rebuild-verify all run at `S`, so
+/// the old value's entry verifies and the scan returns the old value. A
+/// detoast that read chunks at `visible_ts` here fails loudly: the
+/// fetched row's chunks are tombstoned there, and the §6 re-encode of
+/// the detoasted value no longer matches the entry (XX001).
+#[test]
+fn rr_index_scan_reads_the_old_value_after_a_concurrent_replace() {
+    let rig = Rig::new();
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = ok(Stmt::new(&t0, s0));
+    let (oid, _sid) = ok(rig.db.create_table(&st0, b"pk", &pk_schema()));
+    ok(rig.commit_rc(t0));
+    // A Public /i/ index on the payload column — the toasted one.
+    let (ix, _isid) = rig.add_index(oid, &idx_def(2, false, IndexState::Public));
+
+    {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        ok(rig
+            .db
+            .insert_by_oid(&st, oid, &[i32_d(1), text_d(&blob(64, 2100))]));
+        ok(rig.commit_rc(t));
+    }
+
+    let (r, guard, s) = rig.rr();
+
+    let w2 = rig.rc();
+    let s2 = rig.core().visible_ts();
+    let st2 = rig.stmt(&w2, s2);
+    assert!(ok(rig.db.update(
+        &st2,
+        oid,
+        &[i32_v(1)],
+        &[set_col(2, text_d(&blob(65, 2100)))]
+    )));
+    let ts2 = ok(rig.commit_rc(w2));
+    assert!(ts2 > s, "the replace commits after the reader's snapshot");
+
+    let st_r = ok(Stmt::new(&r, s));
+    let rows = ok(rig
+        .db
+        .index_scan(&st_r, ix, Bound::Unbounded, Bound::Unbounded));
+    assert_eq!(rows.len(), 1, "only the snapshot-visible entry serves");
+    assert_eq!(
+        rows[0].1,
+        vec![i32_d(1), text_d(&blob(64, 2100))],
+        "the RR index scan detoasts the old value at its snapshot (FU-1c)"
+    );
+    ok(rig.core().abort(r));
+    rig.settle();
+    drop(guard);
 }
 
 /// T5: old pointers from a live-columns decode — DROP COLUMN of a toasted
@@ -1074,6 +1282,39 @@ fn corrupt_chunks_are_xx001() {
         wide_row_sqlstate(&rig, oid, 1),
         "XX001",
         "a missing chunk is corruption"
+    );
+
+    // (c) A lying pointer (G10): a third row whose real 20000-byte value
+    // lives as two full chunks and a shorter last one, but whose planted
+    // row version says `raw_len = 10_000` over the same three chunks.
+    // Every per-chunk length check passes — the chunks are the row's own,
+    // untouched — and only the sum (8192 + 8192 + 3616 = 20000, not
+    // 10000) trips: XX001 via "chunks do not sum to raw_len".
+    let ts_row3 = {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        ok(rig.db.insert_by_oid(
+            &st,
+            oid,
+            &[i32_d(3), text_d("z"), text_d(&blob(131, 20_000))],
+        ));
+        ok(rig.commit_rc(t))
+    };
+    let p3 = row_pointers(&rig, sid, &wide_schema(), 3).remove(0);
+    assert_eq!(p3.chunks, 3, "three real chunks");
+    let lying = ToastPointer {
+        id: p3.id,
+        raw_len: 10_000,
+        chunks: p3.chunks,
+    };
+    let row3 = row_key_of(sid, &wide_schema(), &[i32_v(3)]);
+    let bytes = ok(wide_schema().encode_row(&[i32_d(3), text_d("z"), Some(Datum::Toast(lying))]));
+    plant_live_version(&rig, &row3, ts_row3, &bytes);
+    assert_eq!(
+        wide_row_sqlstate(&rig, oid, 3),
+        "XX001",
+        "chunks that do not sum to raw_len are corruption (G10)"
     );
 }
 
