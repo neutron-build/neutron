@@ -627,3 +627,62 @@ detection of this class (the splice lives in `tests/diff/mod.rs`, outside
 the card's Touch-only list — the card named `runner.rs`; deleting it is
 escalated as the gate's M-1 follow-up, so the deterministic pin is the
 only in-tree detector until then).
+
+## C-T6e4: spurious XX001 from the row decode's NOT NULL flags under a concurrent SET NOT NULL (2026-10-16 surfaced as the C-T6b3bfix2 gate's E-1; fixed 2026-10-17, card C-T6e4)
+
+The C-T6b3bfix2 gate's E-1 follow-up — `t6c_soak` intermittently drawing
+XX001 on legal threaded histories through `St` (`Db::scan`'s decode path)
+and `G`, plus `Ixa` through `index_scan`'s row fetch — is the same family
+as the closed C-T6e3 entry but a different crossing: not the §6
+verification and not the toast/detoast reads, but the **row decode's NOT
+NULL flags**.
+
+- **Mechanism.** A row version legally carrying `NULL` in a column
+  (written while the column was nullable) is still visible at a snapshot
+  `S`; a concurrent DELETE (or an update to non-NULL) commits above `S`;
+  `SET NOT NULL` then validates the **latest** committed state — where
+  that row is a tombstone or non-NULL, so the DDL legally commits
+  (§3: latest-state validation, no rewrite) — above it. The reader's
+  handle reads the definition at `visible_ts` (post-constraint), so
+  `Db::get`/`Db::scan`/`Db::index_scan` decode the snapshot-visible NULL
+  row under a definition whose `not_null` flag postdates it, and the §2
+  decode rule ("a NULL bit on a live NOT NULL attnum is XX001") fires:
+  `Row(Corrupt("NULL bit on a NOT NULL column"))`, sqlstate XX001, on a
+  legal concurrent history. The same crossing sat in the write path's
+  row-regime decodes (`apply_set`, `update_maintenance_rows`,
+  `delete_with`'s base), aborting legal RC/RR statements the same way.
+- **Severity.** Spurious corruption report (XX001) on legal concurrent
+  histories; **committed data never wrong** in any capture — the old NULL
+  version is exactly what its writer wrote under the pre-constraint
+  definition (the timeline proves it: raw-KV dump of 2026-10-17, seed
+  `0x7c1a0001`, txn 677 op 1 — the row's NULL predates the DDL, the
+  delete and the DDL commit above `S=370`, amcheck clean at every point
+  including the failing run's own points). `encode_row` refuses a NULL on
+  a NOT NULL column of the definition it encodes under, so no genuine
+  corruption is masked by the fix: a NULL under the definition's own
+  version (`v == V`) is still XX001 (pinned by
+  `t6e4_stray_null_on_a_current_def_row_is_still_xx001`).
+- **Repro (at the unfixed tree).** `cd nucleus/v2 && cargo test -q -p
+  nucleus-catalog --test t6c_soak` in a loop under load: 6/67 at the
+  C-T6b3bfix2 tip (all `St`, both captures SERIALIZABLE), 3/81 at its
+  base; ~150 sequential unloaded runs at the C-T6d2fix-era tip drew 0 —
+  the family is scheduling-sensitive (AUDIT_OPEN's C-T6e3 entry records
+  this swinging ~50% on unrelated changes); a parallel-load hunt (8
+  concurrent binaries) captured it in round 19 (~1/152 runs at that tip).
+  Deterministic single-threaded scene: `t6e3_regress::
+  t6e4_pre_constraint_null_row_reads_clean_under_a_later_set_not_null`.
+- **Fix.** Card C-T6e4: `decode_row_at_era` in `nucleus-catalog/src/db.rs`
+  (every row-regime decode call site) decodes with the NOT NULL flags of
+  the row's own era — a row whose header `schema_version` is below the
+  handle's `def_version` predates the constraint, so its NULL is served;
+  at `v == V` the check keeps full strength. The spec amendment (C-T6
+  §2's NULL clause era-scoped, §3's decode rule gaining the `v == V`
+  condition, changelog entry) was written spec-first but reverted by the
+  runner's `nucleus/v2/docs/` protection (the C-T6e3fix2 precedent) —
+  the pre-fix §2 letter makes the engine's old behaviour spec-correct
+  while §4's "a definition change that keeps the storage id is not an
+  error" makes the same history legal, which is the definition of a
+  spec/code conflict; the divergence is pinned in-suite
+  (`t6e3_regress::t6e4_spec_divergence_is_pinned`, to be flipped by the
+  docs card that lands the letter) and the amendment is that card's
+  ESCALATE.
