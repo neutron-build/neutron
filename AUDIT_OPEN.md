@@ -564,36 +564,66 @@ recovery. Tests reproduce all three unsafe successes before the fix, preserve
 the failed files, and verify checkpoint-plus-tail recovery remains writable
 across a second reopen. This does not establish power-loss durability.
 
-## C-T6e3: engine index-maintenance inconsistency under concurrent DML + index scans (2026-10-15, open)
+## C-T6e3: spurious XX001 from index_scan's own-overlay verification (2026-10-15; corrected and fixed 2026-10-16, card C-T6e3fix)
 
 The C-T6e3 differential (nucleus-catalog `tests/diff/`, the DML `IndexScan(a range)`
-op over an online-built Public index) surfaces an engine-side inconsistency that
-`Db::index_scan`'s own §6 verification then rejects with XX001 ("index entry does
-not match its row"). Not fixed: `src/` was off-limits to the card. Evidence and
-reproduction:
+op over an online-built Public index) surfaced an engine-side defect in
+`Db::index_scan`'s §6 verification. This entry as first recorded misdiagnosed
+it as an index-maintenance inconsistency ("a row's indexed column acquiring a
+value no committed transaction ever set", "possible SetBig/NullBig
+cross-column contamination"); the C-T6e3 gate's raw-KV assessment (entries
+and rows decoded straight from `MemKv`, independent of the recorder)
+disproved those specifics, and the record is corrected here:
 
-- Every captured failure is a scan in a txn that had written `t` earlier in the
-  same txn (e.g. seed 0x7c1a_0003, `gen_prog` s4 p27 = `[InsertT(5), IndexScan]`
-  at SER, S=49; s1 p9/p150 similar). Seed 0x7c1a_0003 reproduces standalone in
-  roughly half of `cargo test -p nucleus-catalog --test t6c_soak` runs (before
-  the card's workload shaping moved scans ahead of the txn's own writes).
-- One fully captured timeline (seed 0x7c1a_0002, scan at S=223, pk 1): entry
-  `E(a=-880387972249511119)` live at ts 201 (an `UPDATE ... SET a` whose
-  maintenance is correct — the prior entry is tombstoned at 201), no entry
-  versions in (201, 224), yet the row version live at 221 — written by a txn
-  whose only recorded ops on that pk were `SetBig/NullBig` (`big`, attnum 4) —
-  carries `a = -4544614410575835133`, a value no committed transaction ever set.
-  The row's indexed column changed with no entry maintenance; the raw timelines
-  and the full recorded history are in the card report.
-- Single-threaded scripts covering updates of `a`/`b`/`big`, deletes,
-  re-inserts, TRUNCATEs, ADD COLUMNs and forced GC rounds stay clean (12 seeded
-  runs of 150 txns); the delete→insert→scan-in-one-txn shapes are also clean.
-  The trigger needs the threaded commit/resolver pipeline.
-- The failure occurs with all index-DDL weights zeroed (only the setup-built
-  seed index present), so it is independent of the §7 ladder ops this card adds.
+- **Mechanism (corrected).** The verification compared each scanned entry
+  against the row fetched **with the txn's own-intent overlay**, crossing
+  visibility regimes. The legal C-T0 §5.3 history — an RR/SER txn at
+  snapshot S; a concurrent DELETE of a pk committing above S; the txn
+  re-inserting the same pk (accepted: the unique check reads current
+  state, where the tombstone sits, "not live → proceed, whatever its
+  ts"); the txn index-scanning a range covering the pk's OLD entry, still
+  live at S — fetched the txn's own new row under the old committed entry
+  and reported XX001 ("index entry does not match its row") on consistent
+  state. The value the original record attributed to no committed
+  transaction (`-4544614410575835133`, and its second capture's analogue)
+  was the failing txn's own recorded InsertT constant — the `derive_const`
+  of the very op that wrote the intent, present exactly once in the raw
+  KV as that op's parameter: an uncommitted own intent, not a committed
+  row version. No committed row/entry pair disagreed in any capture, and
+  no cross-column contamination exists (the indexed column is
+  byte-stable across every big-write chain).
+- **Severity (corrected).** A spurious corruption report (XX001) on legal
+  histories; every captured failure was a scan positioned after an own
+  write of the same txn (e.g. seed 0x7c1a_0003's `[InsertT(5), IndexScan]`
+  shapes), firing in roughly half of the pre-shaping soak runs and never
+  single-threaded — the trigger needs one commit above S, which the
+  threaded pipeline supplied. Committed data was never wrong; every
+  `I-*` invariant held in every capture (amcheck clean at every point,
+  all live entries matching their rows at every entry timestamp; the
+  failure was independent of the §7 ladder ops, occurring with the
+  index-DDL weights zeroed). The recorder was exonerated: every recorded
+  value is an engine-returned read or a harness constant recorded with
+  its op, and the raw KV agrees with the recorded history everywhere.
+- **The dead reference (dropped).** The original entry pointed to "the
+  card report" for the raw timelines; no such file exists anywhere
+  accessible (the timeline values appear in no transcript and no file
+  outside this entry itself), so the pointer is removed rather than
+  landed: the scene is now pinned deterministically by
+  `t6e3_regress::t6e3fix_reinsert_over_concurrent_delete_scans_clean`
+  (single-threaded — the test thread parks the RR txn between its
+  statements; no raw dump is needed to reproduce it).
 
-Card-side mitigation (workload shape only, no check weakened): `gen_prog` emits a
-program's index scans before its own writes on `t`. The checker's own-writes
-handling for scans stays pinned by synthetic non-vacuity legs
-(`t6e3_regress_checker_is_not_vacuous`). Until this is fixed, re-enabling scans
-after own writes in the differential will re-expose it.
+Fixed in the engine by card C-T6e3fix: `Db::index_scan` verifies each entry
+in its own visibility regime (the txn's own entries against the
+own-overlaid row; foreign entries against the row at the snapshot, fetched
+without the overlay), pinned deterministically by
+`t6e3_regress::t6e3fix_reinsert_over_concurrent_delete_scans_clean`
+(single-threaded — no raw dump is needed to reproduce the scene). Two
+follow-ups remain, both outside that card's enforced scope: C-T6 §6's
+verification sentence still carries the old letter (the `nucleus/v2/docs/`
+tree is protected — the spec amendment is escalated), and `gen_prog`'s
+scans-to-front workload shaping still suppresses the differential's
+detection of this class (the splice lives in `tests/diff/mod.rs`, outside
+the card's Touch-only list — the card named `runner.rs`; deleting it is
+escalated as the gate's M-1 follow-up, so the deterministic pin is the
+only in-tree detector until then).
