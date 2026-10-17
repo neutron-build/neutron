@@ -817,10 +817,16 @@ impl<K: OrderedKv> Db<K> {
     /// whose key value lies in `[lo, hi)` (one value per index column,
     /// `None` = NULL, compared in the index's column order — P-ORDER), at
     /// the statement's snapshot, with the row each entry names fetched and
-    /// verified: a fetched row not visible at the snapshot, or whose index
-    /// columns do not re-encode to the entry's key (§6's `index_scan`
-    /// verification), is [`RowError::Corrupt`] (XX001) — never a silently
-    /// wrong result. Returns `(row key, decoded row)` pairs in index order
+    /// verified in the entry's own visibility regime (§6): a fetched row
+    /// not visible in that regime, or whose index columns do not re-encode
+    /// to the entry's key, is [`RowError::Corrupt`] (XX001) — never a
+    /// silently wrong result. A snapshot-visible entry the txn did not
+    /// write is verified against the row at the snapshot (fetched without
+    /// the txn's own overlay); an entry the txn itself wrote, against the
+    /// own-overlaid row. A snapshot entry whose row the txn has since
+    /// overwritten is skipped — its row is the txn's own write now, served
+    /// (iff in range) through the txn's own entry. Returns
+    /// `(row key, decoded row)` pairs in index order
     /// (`/i/` entries before `/u/`, each in key order).
     ///
     /// The statement takes AccessShare on the owning relation (§4), reads
@@ -1052,7 +1058,10 @@ impl<K: OrderedKv> Db<K> {
                     continue;
                 }
                 // The row fetch (§8.1: the point SIREAD registers before
-                // the fetch's own view under SERIALIZABLE).
+                // the fetch's own view under SERIALIZABLE) runs at the
+                // reader's regime: the txn's own intents overlay the
+                // snapshot (§4 step 1), so this is the row the statement
+                // must return whenever the entry survives verification.
                 let bytes = match st.txn.isolation {
                     Isolation::Serializable => self
                         .ssi
@@ -1074,15 +1083,98 @@ impl<K: OrderedKv> Db<K> {
                 // the detoasted value — the chunks read at the scan's
                 // snapshot, no SIREAD.
                 toast::detoast_row_at(&self.core, &schema, rel.storage_id, &mut live, &ctx)?;
-                // §6: verify the fetched row — rebuild its entry and
-                // require byte equality with the scanned one.
-                let (want_key, want_value, _) = index::entry(&h, &handle, &row_key, &live)?;
-                if want_key != key || want_value != payload {
-                    return Err(DbError::Row(RowError::Corrupt(
-                        "index entry does not match its row",
-                    )));
+                // §6: verify the entry against the row **in the entry's
+                // own visibility regime** (C-T6e3fix). A ghost reader at
+                // the statement's snapshot — an id this process never
+                // allocates, so the own-overlay branch of §4 step 1 never
+                // fires for it — tells the two regimes of the enumerated
+                // entry apart: a committed version visible at the
+                // snapshot, or the txn's own intent. Each is verified
+                // against the row read in the same regime. The old form
+                // compared every entry against the own-overlaid fetch,
+                // crossing regimes: the legal §5.3 history where a
+                // concurrent DELETE commits above the snapshot and the
+                // txn re-inserts the same pk (the old entry stays live at
+                // the snapshot; its row is the txn's own write now) was
+                // reported XX001 on consistent state.
+                let ghost = ReadCtx {
+                    txn: ghost_id(&self.core),
+                    snapshot: st.snapshot,
+                    stmt_seq: 0,
+                };
+                let entry_at_s = {
+                    let view = self.core.open_view();
+                    read_key(&self.core, &view, &key, &ghost, &mut NoSsi).map_err(DbError::Txn)?
+                };
+                let rebuild_matches = |row: &[Option<Datum>]| -> Result<bool, DbError> {
+                    let (want_key, want_value, _) = index::entry(&h, &handle, &row_key, row)?;
+                    Ok(want_key == key && want_value == payload)
+                };
+                if entry_at_s.as_deref() == Some(payload.as_slice()) {
+                    // A committed entry visible at the snapshot: verify
+                    // against the row at the snapshot, without the own
+                    // overlay (the same regime that makes the entry
+                    // visible).
+                    let s_bytes = {
+                        let view = self.core.open_view();
+                        read_key(&self.core, &view, &row_key, &ghost, &mut NoSsi)
+                            .map_err(DbError::Txn)?
+                    };
+                    let Some(s_bytes) = s_bytes else {
+                        return Err(DbError::Row(RowError::Corrupt(
+                            "index entry names a row not visible at the snapshot",
+                        )));
+                    };
+                    if bytes == s_bytes {
+                        // No own write shadows the row: the regimes agree,
+                        // one verification and one row out.
+                        if !rebuild_matches(&live)? {
+                            return Err(DbError::Row(RowError::Corrupt(
+                                "index entry does not match its row",
+                            )));
+                        }
+                        out.push((row_key, live));
+                    } else {
+                        // The txn has overwritten the row (§4 step 1: an
+                        // own intent shadows it). The snapshot pair must
+                        // still re-encode — maintenance wrote this entry;
+                        // a mismatch is real corruption. What the entry
+                        // serves is decided in the reader's regime: the
+                        // own row re-encodes to this same entry only when
+                        // the own write kept it (its entry intent sits on
+                        // this very key), and then this entry carries the
+                        // own row out; otherwise the entry is skipped —
+                        // its row is the txn's own write now, served (iff
+                        // its value is in range) through the txn's own
+                        // entry for the new row.
+                        let mut s_live = schema.decode_row(&s_bytes)?;
+                        toast::detoast_row_at(
+                            &self.core,
+                            &schema,
+                            rel.storage_id,
+                            &mut s_live,
+                            &ghost,
+                        )?;
+                        if !rebuild_matches(&s_live)? {
+                            return Err(DbError::Row(RowError::Corrupt(
+                                "index entry does not match its row",
+                            )));
+                        }
+                        if rebuild_matches(&live)? {
+                            out.push((row_key, live));
+                        }
+                    }
+                } else {
+                    // The txn's own entry (no committed version at the
+                    // snapshot matches it): verify against the
+                    // own-overlaid fetch — the regime that produced it.
+                    if !rebuild_matches(&live)? {
+                        return Err(DbError::Row(RowError::Corrupt(
+                            "index entry does not match its row",
+                        )));
+                    }
+                    out.push((row_key, live));
                 }
-                out.push((row_key, live));
             }
         }
         Ok(out)
