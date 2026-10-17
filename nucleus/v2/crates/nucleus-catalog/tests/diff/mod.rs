@@ -613,27 +613,18 @@ pub fn gen_prog(seed: u64, session: u16, index: u32) -> Prog {
             ops.push(POp::NullBig(pk));
         }
     }
-    // C-T6e3: an index scan runs **before** the txn's own writes on `t`.
-    // The engine's own-write + concurrent-index-scan interplay has an
-    // open bug (see the card report's ESCALATE: an own row intent makes
-    // `Db::index_scan`'s verification XX001 over entries it races —
-    // every captured failure is a scan positioned after an InsertT of
-    // the same txn, e.g. seed 0x7c1a_0003's s4 p27 `[InsertT(5),
-    // IndexScan]`), so the scans lead the program: the served and
-    // refused scans, their model equality and their sight brackets are
-    // still checked at every level and under the full DDL stream — only
-    // the own-write overlay ahead of a scan is out (the checker's
-    // own-writes handling for scans stays pinned by the synthetic
-    // non-vacuity legs in `t6e3_regress`).
-    let scans: Vec<POp> = ops
-        .iter()
-        .filter(|o| matches!(o, POp::IndexScan(..)))
-        .copied()
-        .collect();
-    if !scans.is_empty() {
-        ops.retain(|o| !matches!(o, POp::IndexScan(..)));
-        ops.splice(0..0, scans);
-    }
+    // C-T6e3 shaped this: every IndexScan was spliced to the front of
+    // the program, ahead of the txn's own writes on `t`, because the
+    // engine's verification had the crossing-regimes bug — an own row
+    // intent made `Db::index_scan` XX001 over entries it raced (the e3
+    // escalation, roughly half the soak runs pre-shaping). C-T6e3fix
+    // fixed the engine (each entry verified in its own visibility
+    // regime) and C-T6e3fix2 deleted the shaping: scans keep the seed's
+    // order, so a scan after the txn's own writes — the escalated class
+    // — is generated and checked again (the checker's own-writes
+    // overlay for index scans on the real mix, not just the synthetic
+    // non-vacuity legs in `t6e3_regress`; the adjacency is pinned
+    // deterministically by `t6e3fix2_scans_keep_the_seeds_order`).
     Prog { level, ops }
 }
 
