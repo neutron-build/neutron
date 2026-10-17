@@ -202,18 +202,19 @@ fn t6c_soak() {
         // successful SET NOT NULLs (or witnessed 23502s) would zero
         // this without failing anything else.
         assert!(s.snn_checked > 0, "no SET NOT NULL verified: {s:?}");
-        // C-T6d2fix FU-2 (gate F-2): the large-value bars, per seed.
-        // The write side of the mix is scheduling-insensitive — SetBig
-        // and NullBig draws are a fixed share of every program stream —
-        // so per-seed floors hold with ≥ 3× margin (60–117 big writes
-        // and 9–35 per class observed per seed); only the drop/re-add
-        // pair stays aggregate, below.
+        // C-T6d2fix FU-2 (gate F-2, recalibrated per the gate's H-1):
+        // the write side is scheduling-sensitive after all — depressed
+        // seeds under load commit as few as ~21 big writes and ~2 per
+        // class — so the floors sit at > 10 / > 1 (every demonstrated
+        // mutant catch survives with ~2x headroom: GA4 dies at 0, GA5's
+        // erosion lands far below 10); only the drop/re-add pair stays
+        // aggregate, below.
         assert!(
-            s.big_writes > 25,
+            s.big_writes > 10,
             "too few big writes in seed {seed:#x}: {s:?}"
         );
         assert!(
-            s.big_lens.iter().all(|&n| n > 3),
+            s.big_lens.iter().all(|&n| n > 1),
             "every big length class (100/3000/20000) must commit per seed \
              {seed:#x}: {s:?}"
         );
