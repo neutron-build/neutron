@@ -688,21 +688,32 @@ NULL flags**.
   ESCALATE.
 - **Fix-tree verification (2026-10-17, this card's session).** 80
   sequential soak runs at the fixed tree: 0 XX001-family failures. The
-  only failures (4/80) were the scheduling-sensitive **coverage
-  floors** — `big_writes > 10`, the per-seed big length class `> 1`,
-  and the DeleteOnly-sight `> 0` — each with `violations: 0` (engine
-  clean, coverage starved); they pre-date the card: 1/40 at the branch
-  point `cc6a8a7c` on the same machine the same session, and the
-  C-T6d2fix gate's H-1 census had already measured ~16% at its tree
-  (this card may not trim them; they ride as a workload-stability item
-  for the soak's owner). Mutation evidence: the core mutant (the era
+  only failures (4/80, plus 2/40 in the runner's own rerun) were the
+  scheduling-sensitive **coverage floors** — `big_writes > 10`, the
+  per-seed big length class `> 1`, and the DeleteOnly-sight `> 0` —
+  each with `violations: 0` (engine clean, coverage starved); they
+  pre-date the card: 1/40 at the branch point `cc6a8a7c` on the same
+  machine the same session, and the C-T6d2fix gate's H-1 census had
+  already measured ~16% at its tree. The floors may not be lowered, so
+  the card STABILIZED the driver instead (commit 86d0c011): `t6c_soak`
+  redraws a starved draw — same seeds (programs are a pure function of
+  the seed), fresh interleaving, at most 4 draws — while correctness
+  (`assert_clean`, leaked intents, the amcheck point count) asserts on
+  every draw and is never redrawn. Every bar value and message is
+  unchanged; an unmeetable floor still fails with the full list
+  (demonstrated), and 48 8-way loaded invocations drew 0 failures with
+  4 redraws firing on exactly the pre-stabilization shapes. Mutation
+  evidence, re-verified at the final tree: the core mutant (the era
   condition forced off — the crossing restored) fails both era pins
   deterministically with the exact pre-fix signature (`Row(Corrupt(
-  "NULL bit on a NOT NULL column"))`), and the soak catches it under
-  8-way parallel load — 4 catches in 720 invocations, all seed
-  `0x7c1a0003`, all the family signature (e.g. `txn 60 (session 1,
-  prog 22, attempt 0, RR) op 1 (St at S=41, def vSome(2)): a read
-  failed with XX001`); the literal captured seed `0x7c1a0001` did not
-  re-fire on this box (0/840 loaded invocations — which seed's history
+  "NULL bit on a NOT NULL column"))`), and the soak catches it as an
+  `assert_clean` violation on draw 1 — at the pre-stabilization tree 4
+  catches in 720 8-way-loaded invocations (all seed `0x7c1a0003`, the
+  family signature, e.g. `txn 60 (session 1, prog 22, attempt 0, RR)
+  op 1 (St at S=41, def vSome(2)): a read failed with XX001`); at the
+  final tree the 7th loaded invocation (`txn 698 (session 3, prog 162,
+  attempt 0, SER) op 2 (St at S=395, def vSome(9))`). The literal
+  captured seed `0x7c1a0001` did not re-fire on this box (0/840 loaded
+  invocations at the pre-stabilization tree — which seed's history
   draws the window is scheduler luck; the original seed-01 capture was
   the gate machine's draw).
