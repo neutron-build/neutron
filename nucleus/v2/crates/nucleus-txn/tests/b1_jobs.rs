@@ -32,6 +32,7 @@ use nucleus_txn::{Ts, TxnError};
 fn idle(sec: u64) -> nucleus_txn::jobs::JobConfig {
     nucleus_txn::jobs::JobConfig {
         idle_interval: Duration::from_secs(sec),
+        budget: None,
     }
 }
 
@@ -265,6 +266,7 @@ fn job_error_is_fail_stop_for_the_set() {
         )),
         nucleus_txn::jobs::JobConfig {
             idle_interval: Duration::from_millis(20),
+            budget: None,
         },
     ));
     wait_until(5, "the GC ran a round", || {
@@ -730,6 +732,7 @@ fn fail_stop_reaches_jobs_started_later() {
             })),
             nucleus_txn::jobs::JobConfig {
                 idle_interval: Duration::from_millis(20),
+                budget: None,
             },
         ));
     }

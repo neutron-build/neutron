@@ -554,6 +554,8 @@ pub fn spawn_retention<K: OrderedKv>(
         Box::new(job),
         crate::jobs::JobConfig {
             idle_interval: interval,
+            // D4: SSI retention carries no I/O budget.
+            budget: None,
         },
     ) {
         core.fail_stop().on_kv_error(&e);

@@ -88,7 +88,7 @@ fn scenario(
     core2.set_job_probe(Arc::new(probe));
 
     let gc2 = Arc::new(ok(GcJob::install(&core2, GcConfig::default())));
-    drive_recovery(&core2, &gc2, Some(&state), cell);
+    drive_recovery(&core2, &gc2, None, Some(&state), cell);
     drop(gc2);
     if !state.fired() {
         // The recovery quiesced without reaching this occurrence; the
@@ -112,7 +112,7 @@ fn scenario(
     let core3: Arc<Core<KillKv<MemKv>>> = Arc::clone(&rig3.core);
     check_after_reopen(&model, &core3, &kv);
     let gc3 = Arc::new(ok(GcJob::install(&core3, GcConfig::default())));
-    drive_recovery(&core3, &gc3, None, cell + 1000);
+    drive_recovery(&core3, &gc3, None, None, cell + 1000);
     check_quiesced(&core3);
     check_retired_cleaned(&core3, &kv, &model);
     drop(gc3);

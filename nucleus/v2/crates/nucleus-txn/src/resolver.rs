@@ -1,8 +1,12 @@
 //! A minimal C-B1: async resolution of committed txns' intents, abort
 //! cleanup, and §7.4 status truncation. Both run step by step through
-//! [`Resolver::run_once`]; the C-B1a job framework runs them as the
+//! [`Resolver::run_bounded`] (bounded: at most `max_keys` keys per round,
+//! the unfinished work requeued at the **front**); the unbounded
+//! [`Resolver::run_once`] is a `run_bounded` over the whole queue, as
+//! before C-B1c. The C-B1a job framework runs them as the
 //! [`ResolverJob`] background job (§9.3), woken on enqueue by commit step
-//! 5, abort and the no-write fast path instead of polling.
+//! 5, abort and the no-write fast path instead of polling, one bounded
+//! round (4096 keys) per step so a budget can bite.
 //!
 //! Resolution of a committed T runs only after T is a visible commit — the
 //! commit thread queues it in §3 step 5, which follows visibility — so no
@@ -13,9 +17,9 @@
 //!
 //! The [`JobPoint`](crate::jobs::JobPoint) probes
 //! (`ResolverAfterRemoval`/`ResolverBeforeTruncation`/
-//! `ResolverAfterTruncation`) fire inside `run_once`, so hand-driven
-//! callers (the simulator, tests) hit them too; they run with no latch and
-//! no registry mutex held (§9.3's probe contract).
+//! `ResolverAfterTruncation`) fire inside the round, so hand-driven callers
+//! (the simulator, tests) hit them too; they run with no latch and no
+//! registry mutex held (§9.3's probe contract).
 
 use std::sync::Arc;
 
@@ -26,6 +30,30 @@ use crate::commit::ResolveEntry;
 use crate::jobs::{Job, JobConfig, JobCtx, JobKind, JobOutcome, JobSet};
 use crate::removal::{remove_intent, RemovalOutcome};
 use crate::TxnError;
+
+/// Keys per [`ResolverJob`] step (§9.3 bounded steps, C-B1c): a step
+/// removes at most this many keys before requeueing the rest.
+pub const RESOLVER_BATCH: usize = 4096;
+
+/// What one resolver round did (the bounded `run_bounded` report; the
+/// unbounded [`Resolver::run_once`] exposes the entry count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoundReport {
+    /// Queue entries the round fully processed.
+    pub entries: usize,
+    /// Keys the round worked on — one §7.3 removal attempt each, whether
+    /// or not an intent was still there (the attempt is the work; the
+    /// I/O-budget unit is charged per key).
+    pub keys: u64,
+    /// Keys whose removal actually wrote a batch.
+    pub removed: u64,
+    /// Status entries the truncation pass removed.
+    pub truncated: u64,
+    /// Whether the queue was fully drained this round — the §7.4
+    /// truncation pass runs only then (an entry still in flight may
+    /// still hold a count).
+    pub drained: bool,
+}
 
 /// The resolution and truncation job (§9.3's resolver slot).
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,24 +72,35 @@ impl Resolver {
     /// unprocessed entry after it are requeued (in order) before the error
     /// is returned, and the truncation pass is skipped that round.
     pub fn run_once<K: OrderedKv>(core: &Core<K>) -> Result<usize, TxnError> {
-        Resolver::run_once_detailed(core).map(|(entries, _work)| entries)
+        Resolver::run_bounded(core, usize::MAX).map(|r| r.entries)
     }
 
-    /// [`Resolver::run_once`] plus the work it did (successful intent
-    /// removals + entries truncated), which the job maps to
-    /// `Progress`/`Idle` and counts in the `items` metric.
-    pub(crate) fn run_once_detailed<K: OrderedKv>(
+    /// One bounded resolver round (§9.3's bounded steps, C-B1c): removes
+    /// intents for at most `max_keys` keys, in queue order. The first
+    /// entry the round did not finish — the one the bound cut into, or the
+    /// one whose removal failed — goes back at the **front** of the queue
+    /// with its not-yet-attempted keys only, in order, followed by every
+    /// unprocessed entry after it; nothing is dropped. The truncation pass
+    /// runs only when the queue was fully drained this round (entries
+    /// still in flight may hold counts; `drained` says which it was).
+    pub fn run_bounded<K: OrderedKv>(
         core: &Core<K>,
-    ) -> Result<(usize, u64), TxnError> {
+        max_keys: usize,
+    ) -> Result<RoundReport, TxnError> {
         let entries: Vec<ResolveEntry> = core.drain_resolve_queue();
-        let n = entries.len();
-        let mut keys_removed: u64 = 0;
+        let mut report = RoundReport::default();
         let mut first_err: Option<TxnError> = None;
-        let mut i = 0;
-        while i < entries.len() {
-            let e = &entries[i];
-            let mut failed: Option<TxnError> = None;
-            for (key, prefix) in &e.keys {
+        // Where the round stopped: `(entry idx, key idx)` — the key at
+        // `key idx` was not successfully processed (not attempted, or its
+        // removal failed and must be retried).
+        let mut stopped: Option<(usize, usize)> = None;
+        'round: for (ei, e) in entries.iter().enumerate() {
+            for (ki, (key, prefix)) in e.keys.iter().enumerate() {
+                if report.keys >= max_keys as u64 {
+                    // The bound: this key was not attempted.
+                    stopped = Some((ei, ki));
+                    break 'round;
+                }
                 match remove_intent(
                     core,
                     key,
@@ -70,55 +109,80 @@ impl Resolver {
                     e.mode,
                 ) {
                     Ok(RemovalOutcome::Removed) => {
-                        keys_removed += 1;
+                        report.removed += 1;
                         // §9.3 probe: latch and registry mutex both
                         // released by `remove_intent` already.
                         core.job_probe_at(crate::jobs::JobPoint::ResolverAfterRemoval);
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        failed = Some(err);
-                        break;
+                        first_err = Some(err);
+                        // The failing key is re-attempted next round.
+                        stopped = Some((ei, ki));
+                        break 'round;
                     }
                 }
+                report.keys += 1;
+                // §9.3 I/O budget: one unit per removal.
+                core.job_units(JobKind::Resolver, 1);
             }
-            if let Some(err) = failed {
-                first_err = Some(err);
-                break;
-            }
-            i += 1;
+            report.entries += 1;
         }
-        // Requeue the unprocessed tail, including the failing entry: an
-        // error must not drop cleanup work (the intents would linger and
+        let drained = stopped.is_none();
+        // Requeue the unfinished tail: the cut-into (or failing) entry
+        // first with its not-yet-done keys only, in order, then every
+        // entry after it — all at the FRONT, so the next round (a bounded
+        // job step) retries them before anything enqueued later. An error
+        // must not drop cleanup work either (the intents would linger and
         // the counts would stay up forever).
-        {
+        if let Some((ei, ki)) = stopped {
             let mut q = core.lock_resolve_queue();
-            for e in entries.iter().skip(i) {
-                q.push_back(e.clone());
+            let tail: Vec<ResolveEntry> = entries
+                .iter()
+                .enumerate()
+                .skip(ei)
+                .map(|(idx, e)| {
+                    if idx == ei {
+                        ResolveEntry {
+                            txn: e.txn,
+                            keys: e.keys[ki..].to_vec(),
+                            mode: e.mode,
+                        }
+                    } else {
+                        e.clone()
+                    }
+                })
+                .filter(|e| !e.keys.is_empty())
+                .collect();
+            for e in tail.into_iter().rev() {
+                q.push_front(e);
             }
         }
         if let Some(err) = first_err {
             return Err(err);
         }
-        core.job_probe_at(crate::jobs::JobPoint::ResolverBeforeTruncation);
-        let mut truncated: u64 = 0;
-        for id in core.status.truncation_candidates() {
-            if core.truncate_status(id)? {
-                truncated += 1;
-                core.job_probe_at(crate::jobs::JobPoint::ResolverAfterTruncation);
+        if drained {
+            core.job_probe_at(crate::jobs::JobPoint::ResolverBeforeTruncation);
+            for id in core.status.truncation_candidates() {
+                if core.truncate_status(id)? {
+                    report.truncated += 1;
+                    core.job_probe_at(crate::jobs::JobPoint::ResolverAfterTruncation);
+                }
             }
         }
-        let work = keys_removed + truncated;
+        let work = report.removed + report.truncated;
         if work > 0 {
             core.job_items(JobKind::Resolver, work);
         }
-        Ok((n, work))
+        report.drained = drained;
+        Ok(report)
     }
 }
 
-/// The resolver as a §9.3 background job: one `step` is one
-/// [`Resolver::run_once`]. `Ok(entries == 0)` with no removals and no
-/// truncations is `Idle` (the runner parks on the wake until the next
+/// The resolver as a §9.3 background job: one `step` is one bounded
+/// [`Resolver::run_bounded`] round of [`RESOLVER`] keys. A round that
+/// drained the queue and did nothing (`entries == 0`, no removals, no
+/// truncations) is `Idle` (the runner parks on the wake until the next
 /// release wakes it); anything else is `Progress`.
 pub struct ResolverJob<K: OrderedKv> {
     core: Arc<Core<K>>,
@@ -136,8 +200,8 @@ impl<K: OrderedKv> Job for ResolverJob<K> {
     }
 
     fn step(&mut self, _cx: &JobCtx) -> Result<JobOutcome, TxnError> {
-        let (entries, work) = Resolver::run_once_detailed(&self.core)?;
-        Ok(if entries == 0 && work == 0 {
+        let r = Resolver::run_bounded(&self.core, RESOLVER_BATCH)?;
+        Ok(if r.entries == 0 && r.removed == 0 && r.truncated == 0 {
             JobOutcome::Idle
         } else {
             JobOutcome::Progress

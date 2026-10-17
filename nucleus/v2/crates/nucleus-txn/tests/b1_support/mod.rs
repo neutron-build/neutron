@@ -553,6 +553,68 @@ fn surviving_records<K: OrderedKv>(core: &Core<K>) -> std::collections::HashSet<
     out
 }
 
+/// Whether any stored entry of `key`'s family (`[intent_key(k), end_key(k))`)
+/// is visible through a fresh view — a version (live or tombstone) or an
+/// intent.
+fn key_family_live<K: OrderedKv>(core: &Core<K>, key: &[u8]) -> bool {
+    let view = core.open_view();
+    let mut scan = view.scan(
+        (
+            Bound::Included(intent_key(key).as_slice()),
+            Bound::Excluded(nucleus_txn::encoding::end_key(key).as_slice()),
+        ),
+        false,
+    );
+    scan.next().is_some()
+}
+
+/// The txns of `model` whose data survived, as ids (C-B1c: extracted from
+/// `check_after_reopen` so the crash gate can observe the same
+/// classification — a lost `Off` commit is the I2 reachability record).
+///
+/// "Surviving" is in the **data** sense:
+/// - an `On` commit always survived (I-DURABLE: its record is synced at
+///   the ack, so an absent record means §7.4 truncated it — its data was
+///   resolved first);
+/// - an `Off` commit survived when its record is present, or when it left
+///   nothing behind **but its versions did** (resolved and truncated), or
+///   when its intents are still there (it committed; only the record was
+///   lost if they are gone and no version replaced them).
+pub fn surviving_txns<K: OrderedKv>(
+    model: &Model,
+    core: &Core<K>,
+) -> std::collections::HashSet<TxnId> {
+    let records = surviving_records(core);
+    model
+        .txns
+        .iter()
+        .filter(|t| {
+            records.contains(&t.id)
+                || t.on
+                || (t
+                    .ops
+                    .iter()
+                    .all(|(k, _)| ok(core.latest_get(&intent_key(k))).is_none())
+                    && t.ops.iter().any(|(k, _)| key_family_live(core, k)))
+        })
+        .map(|t| t.id)
+        .collect()
+}
+
+/// The model's `Off` commits that did not survive (the I2 lost-suffix
+/// subjects, in commit order) — the C-B1a M4 follow-up's observability
+/// hook: the crash gate records one cell where this is non-empty, so
+/// I2's lost-`Off` branch is shown reachable and checked.
+pub fn lost_off_txns<K: OrderedKv>(model: &Model, core: &Core<K>) -> Vec<TxnId> {
+    let surviving = surviving_txns(model, core);
+    model
+        .txns
+        .iter()
+        .filter(|t| !t.on && !surviving.contains(&t.id))
+        .map(|t| t.id)
+        .collect()
+}
+
 /// Whether `key` falls inside one of the model's retired ranges (I8's
 /// subject; such keys are skipped by the value checks — the cleanup
 /// deletes them by design).
@@ -579,36 +641,22 @@ fn in_retired_range(model: &Model, key: &[u8]) -> bool {
 /// recovery instead); a txn all of whose keys are retired is skipped
 /// wholesale.
 ///
-/// "Surviving" is in the **data** sense: a txn whose `/sys/txn` record is
-/// absent may still have survived — the drive may have resolved and
-/// §7.4-truncated it (the truncation delete is an unsynced batch a
-/// `keep` may legally keep; by I-WAL-ORDER keeping it implies keeping the
-/// resolution batch before it, so the data is intact). A record-absent
-/// txn therefore counts as surviving exactly when none of its intents
-/// remains (an unresolved txn's record can only be absent if the crash
-/// dropped it — the Off suffix case).
+/// "Surviving" (see [`surviving_txns`]) is in the **data** sense: an `On`
+/// commit always survived (I-DURABLE); an `Off` commit survived when its
+/// record survived, or when it was resolved-and-truncated (its versions
+/// are its data), or while any of its intents remains. A record-absent
+/// `Off` txn with no intents and no versions is the crash's lost suffix.
 pub fn check_after_reopen<K: OrderedKv>(model: &Model, core: &Core<K>, kv: &KillKv<MemKv>) {
     let visible = core.visible_ts();
     let reader = reader_id(core);
-    let records = surviving_records(core);
-    let surviving: std::collections::HashSet<TxnId> = model
-        .txns
-        .iter()
-        .filter(|t| {
-            records.contains(&t.id)
-                || t.ops
-                    .iter()
-                    .all(|(k, _)| ok(core.latest_get(&intent_key(k))).is_none())
-        })
-        .map(|t| t.id)
-        .collect();
+    let surviving = surviving_txns(model, core);
 
     // (I1 precondition / I-DURABLE) Every acked On commit's data survived.
     for txn in &model.txns {
         if txn.on {
             assert!(
                 surviving.contains(&txn.id),
-                "I-DURABLE/I1: acked On commit {:?} lost (records {records:?})",
+                "I-DURABLE/I1: acked On commit {:?} lost",
                 txn.id
             );
         }
@@ -762,7 +810,9 @@ pub fn check_quiesced<K: OrderedKv>(core: &Core<K>) {
         );
     }
     // (I7, I-GC-QUIESCE) No logical key's newest version <= W is a
-    // tombstone or moved-tombstone.
+    // tombstone or moved-tombstone — in §10's GC scope, so the catalog
+    // included (C-B1c): a dropped relation's catalog row must lose its
+    // tombstone too.
     {
         let w = {
             let view = core.open_view();
@@ -779,8 +829,10 @@ pub fn check_quiesced<K: OrderedKv>(core: &Core<K>) {
         let mut decided: Option<Key> = None;
         for row in view.scan((Bound::Unbounded, Bound::Unbounded), false) {
             let (stored, value) = ok(row);
-            if stored.starts_with(nucleus_txn::encoding::SYS_PREFIX) {
-                continue;
+            if stored.starts_with(nucleus_txn::encoding::SYS_PREFIX)
+                && !stored.starts_with(nucleus_txn::catalog::SYS_CATALOG_PREFIX)
+            {
+                continue; // every /sys/ key but the catalog is out of scope
             }
             let Some((logical, Entry::Version(ts))) = parse_key(&stored) else {
                 continue;
@@ -975,6 +1027,40 @@ pub fn tkey(sid: u64, suffix: &str) -> Vec<u8> {
     let mut k = lo;
     k.extend_from_slice(suffix.as_bytes());
     k
+}
+
+// ---- the C-B1c crash-gate workload --------------------------------------------
+
+/// Builds the full-gate workload (C-B1c item 5): the C-B1b DDL shape
+/// (data commits On/Off, a delete, an abort, a TRUNCATE, a DROP, retired
+/// ranges, two never-committed txns whose intents become older-epoch
+/// after the first crash) plus the C-B1a M4 tail — one `Off` commit
+/// **after the last `On`**, so its unsynced record is losable by the
+/// first crash and I2's lost-`Off`-suffix branch is reachable (see
+/// [`lost_off_txns`]).
+pub fn build_gate_workload() -> (B1Rig, Model) {
+    let (rig, mut model) = build_ddl_workload();
+    let core = &rig.core;
+    let tail = rig.rc();
+    let tail_id = tail.id;
+    let key = b"/t/1/tail0".to_vec();
+    place_write(core, &tail, &key, b"tail");
+    let tail_ts = ok(core.commit(tail, SyncCommit::Off));
+    model.txns.push(ModTxn {
+        id: tail_id,
+        ts: tail_ts,
+        on: false,
+        ops: vec![(key.clone(), Some(b"tail".to_vec()))],
+    });
+    model.all_keys.push(key);
+    (rig, model)
+}
+
+/// One full compaction of the live store behind `kv` with the registered
+/// filter (the gate's "GC + compaction" recovery step): returns the
+/// number of entries dropped.
+pub fn compact_all(kv: &KillKv<MemKv>) -> usize {
+    kv.fault.with_live(|m: &MemKv| m.compact_all())
 }
 
 // ---- the C-B1b crash-matrix workload (C-B1a's + DROP and TRUNCATE) ------------
@@ -1186,17 +1272,20 @@ pub fn build_ddl_workload() -> (B1Rig, Model) {
 // ---- the C-B1b recovery driver ------------------------------------------------
 
 /// One recovery drive to quiescence over a reopened core (§7.2, §9.2,
-/// §9.3): the boot sweep to `Finished`, then rounds of resolver, GC and
-/// drop-cleanup. When a round leaves retired rows eligible-but-gated
-/// (their remembered snapshot equals the durable `W` — `W` only passes a
-/// snapshot when `visible_ts` does), the driver commits one heartbeat
-/// write so the next publish opens the gate; a live system's own commits
-/// do this job. `state`, when given, is the armed crash probe: a drive
-/// error after the probe fired is the crash; one before it fired is a
-/// determinism break and panics (the C-B1a gate's M3 rule).
+/// §9.3): the boot sweep to `Finished`, then rounds of resolver, GC,
+/// SSI retention (C-B1c: `Some` runs one pass per round — the crash
+/// gate drives every job kind) and drop-cleanup. When a round leaves
+/// retired rows eligible-but-gated (their remembered snapshot equals the
+/// durable `W` — `W` only passes a snapshot when `visible_ts` does), the
+/// driver commits one heartbeat write so the next publish opens the
+/// gate; a live system's own commits do this job. `state`, when given,
+/// is the armed crash probe: a drive error after the probe fired is the
+/// crash; one before it fired is a determinism break and panics (the
+/// C-B1a gate's M3 rule).
 pub fn drive_recovery<K: OrderedKv>(
     core: &Arc<Core<K>>,
     gc: &Arc<nucleus_txn::gc::GcJob<K>>,
+    retention: Option<&nucleus_txn::ssi::RetentionJob<K>>,
     state: Option<&CrashState>,
     heartbeat: usize,
 ) {
@@ -1237,6 +1326,9 @@ pub fn drive_recovery<K: OrderedKv>(
                 return;
             }
             panic!("drive: the GC errored before the probe fired: {e:?}");
+        }
+        if let Some(retention) = retention {
+            retention.run_once();
         }
         if fired() {
             return;

@@ -39,10 +39,10 @@
 //! exactly as `note_retired` received them) — **is** in: the row commits,
 //! aborts and rolls back to a savepoint with the DDL, and the cleanup job
 //! reads it through §4, so a crash forgets no retirement. The
-//! `/sys/catalog/` compaction-filter carve-out of §10 is still open:
-//! `TxnGcFilter` lives in `gc/filter.rs`, which is outside this card's
-//! Touch-only scope, so the filter still keeps every `/sys/` key — see the
-//! note in [`crate::gc`].
+//! `/sys/catalog/` compaction-filter carve-out of §10 landed with C-B1c:
+//! `gc::gc_scope` (one predicate, used by `TxnGcFilter::drop_key` and the
+//! tombstone pass) makes the catalog subtree GC-able while every other
+//! `/sys/` key is kept whatever its bytes look like.
 //!
 //! **Boot rebuild** (§10, the card's item 6): [`Catalog::open`] scans the
 //! committed catalog at `visible_ts` and rebuilds the SSI storage map

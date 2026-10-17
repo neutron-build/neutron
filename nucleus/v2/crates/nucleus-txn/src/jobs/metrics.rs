@@ -40,6 +40,12 @@ pub const METRIC_WAKEUPS: &str = "nucleus_job_wakeups_total";
 pub const METRIC_ERRORS: &str = "nucleus_job_errors_total";
 /// `nucleus_job_items_total`
 pub const METRIC_ITEMS: &str = "nucleus_job_items_total";
+/// `nucleus_job_units_total` (§9.3 I/O budget, C-B1c)
+pub const METRIC_UNITS: &str = "nucleus_job_units_total";
+/// `nucleus_job_throttle_waits_total` (§9.3 I/O budget, C-B1c)
+pub const METRIC_THROTTLE_WAITS: &str = "nucleus_job_throttle_waits_total";
+/// `nucleus_job_throttled_micros_total` (§9.3 I/O budget, C-B1c)
+pub const METRIC_THROTTLED_MICROS: &str = "nucleus_job_throttled_micros_total";
 /// `nucleus_gc_watermark_lag` (gauge)
 pub const METRIC_GC_WATERMARK_LAG: &str = "nucleus_gc_watermark_lag";
 /// `nucleus_resolve_queue_len` (gauge)
@@ -79,13 +85,14 @@ impl<K: OrderedKv> Core<K> {
             .saturating_sub(self.registry.published_w().0)
     }
 
-    /// Every job counter and gauge (the surface C-O3 exports): the six
+    /// Every job counter and gauge (the surface C-O3 exports): the nine
     /// counters below once per [`JobKind`], then the five gauges.
     ///
     /// - `nucleus_job_rounds_total`, `nucleus_job_progress_rounds_total`,
     ///   `nucleus_job_idle_waits_total`, `nucleus_job_wakeups_total`,
-    ///   `nucleus_job_errors_total`, `nucleus_job_items_total` — one per
-    ///   kind;
+    ///   `nucleus_job_errors_total`, `nucleus_job_items_total`,
+    ///   `nucleus_job_units_total`, `nucleus_job_throttle_waits_total`,
+    ///   `nucleus_job_throttled_micros_total` — one per kind;
     /// - `nucleus_gc_watermark_lag`, `nucleus_resolve_queue_len`,
     ///   `nucleus_status_entries`, `nucleus_boot_sweep_done`,
     ///   `nucleus_drop_cleanup_pending` — gauges.
@@ -99,6 +106,9 @@ impl<K: OrderedKv> Core<K> {
                 wakeups,
                 errors,
                 items,
+                units,
+                throttle_waits,
+                throttled_micros,
             } = self.job_stats(kind);
             out.push(counter(METRIC_ROUNDS, kind, rounds));
             out.push(counter(METRIC_PROGRESS_ROUNDS, kind, progress_rounds));
@@ -106,6 +116,9 @@ impl<K: OrderedKv> Core<K> {
             out.push(counter(METRIC_WAKEUPS, kind, wakeups));
             out.push(counter(METRIC_ERRORS, kind, errors));
             out.push(counter(METRIC_ITEMS, kind, items));
+            out.push(counter(METRIC_UNITS, kind, units));
+            out.push(counter(METRIC_THROTTLE_WAITS, kind, throttle_waits));
+            out.push(counter(METRIC_THROTTLED_MICROS, kind, throttled_micros));
         }
         out.push(gauge(
             METRIC_GC_WATERMARK_LAG,
