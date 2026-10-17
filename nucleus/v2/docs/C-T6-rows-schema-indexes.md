@@ -166,9 +166,15 @@ C-T0 §5 and every read through C-T0 §4 at a registered snapshot or view
   `key_cols_changed` (C-T0 §1) counts the unique indexes in every state.
 - A unique index whose state was ever DeleteOnly or WriteOnly never uses
   `/u/` (none exists in 2.0: the online path never builds unique indexes).
-- `index_scan` verifies each fetched row: an entry whose row is not visible
-  at the scan's snapshot, or whose row's key columns do not re-encode to the
-  entry's key, is XX001.
+- `index_scan` verifies each fetched entry in the entry's own visibility
+  regime: a snapshot-visible entry the txn did not write (a foreign entry)
+  is verified against the row at the scan's snapshot, fetched without the
+  txn's own overlay (the regime that makes the entry visible); an entry the
+  txn itself wrote, against the own-overlaid row. An entry whose row is not
+  visible in its regime, or whose row's key columns do not re-encode to the
+  entry's key, is XX001. A snapshot entry whose row the txn has since
+  overwritten is skipped — its row is the txn's own write now, served
+  through the txn's own entry iff in range.
 
 ### 6.1 Born-public indexes
 CREATE INDEX (unique or not) inside a transaction, without §7, when either
@@ -300,3 +306,10 @@ At a registered snapshot `S`, catalog at `S`:
 6. Expression and partial indexes: 0A000.
 7. Builds sort in memory; spill is C-R0's.
 8. Column types are the C-Q3s key types only.
+
+## Changelog
+- 2026-10-16, the e3 escalation (a legal §5.3 history — a concurrent
+  delete committing above S, the txn re-inserting the same pk — came back
+  XX001): the engine fix is card C-T6e3fix (`index_scan` verifies in the
+  entry's own visibility regime); this restatement of §6's sentence, the
+  differential's un-shaping and the corruption pin are card C-T6e3fix2.
