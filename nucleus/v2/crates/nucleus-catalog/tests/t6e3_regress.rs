@@ -1156,7 +1156,8 @@ fn t6e4_stray_null_on_a_current_def_row_is_still_xx001() {
 /// asked for (the e3fix2→e3fix3 sequence): it guards the landed letter
 /// in both directions — the pre-fix unscoped clause returning, the era
 /// scoping or the `v == V` condition dropping, or the changelog duty
-/// vanishing each fail here.#[test]
+/// vanishing each fail here.
+#[test]
 fn t6e4_spec_divergence_is_pinned() {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
