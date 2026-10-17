@@ -717,3 +717,37 @@ NULL flags**.
   invocations at the pre-stabilization tree — which seed's history
   draws the window is scheduler luck; the original seed-01 capture was
   the gate machine's draw).
+
+## Open: nucleus-txn `jobset_cleanup_cleans_once_w_rises_without_a_poke` asserts pending-gauge 0 in the bookkeeping's wake window (2026-10-17, surfaced by card C-T6e4's acceptance rerun)
+
+`crates/nucleus-txn/tests/b1_drop_cleanup.rs:647` (card C-B1bfix lineage)
+flakes ~1.3% per invocation unloaded: the C-T6e4 chain rerun failed it,
+and a 300-run loop of the single test reproduced 4/300 with the identical
+assertion (`nothing is pending anymore`, left 1, right 0).
+
+- **Mechanism.** The test waits (5 s window) for the row's *data* effects
+  (`retired_rows_now` empty **and** the raw range empty) and then
+  immediately asserts the jobset's `pending_gauge == 0`. Those are two
+  different regimes: the cleanup job's data work commits before the job
+  itself transitions out of its pending registration, and the window
+  between them is scheduling-dependent. When the runner's process is
+  descheduled in that window, the gauge still reads 1 at the assert — a
+  TOCTOU in the test's own assertion, not an engine defect (the row is
+  provably cleaned; the jobset settles moments later; no fail-stop error
+  is reported).
+- **Severity.** Test-only flake (~1.3%/invocation unloaded, hit by a
+  workspace chain run); no data or engine implication. It makes the
+  workspace suite intermittently red independent of any change under
+  test (`nucleus-txn` does not depend on `nucleus-catalog`; the C-T6e4
+  diff is not even linked into the failing binary — verified: zero
+  `nucleus-catalog` occurrences in `cargo tree -p nucleus-txn`).
+- **Repro.** `cd nucleus/v2 && cargo test -q -p nucleus-txn --test
+  b1_drop_cleanup --no-run`, then loop the built test binary with
+  `--exact jobset_cleanup_cleans_once_w_rises_without_a_poke` — 4
+  failures / 300 sequential unloaded runs (captures: left 1, right 0,
+  always after the cleaned-row wait passed).
+- **Fix shape (owner: the B1 lineage / a nucleus-txn test card).** Wrap
+  the pending assertion in the same `wait_until` pattern (e.g. wait for
+  `pending_gauge(&rig.core) == 0` with the 5 s window) instead of
+  asserting it synchronously — one line, no invariant weakened. Not
+  done by C-T6e4: the file is outside that card's Touch-only list.
