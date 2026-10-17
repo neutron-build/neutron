@@ -29,6 +29,24 @@
 //!   doc comment states the regime rule (DOC-LINE's catcher — the
 //!   in-scope half of the card's spec-first item; the spec file itself
 //!   is protected, see the card's ESCALATE).
+//!
+//! C-T6e3fix2 additions — the gate follow-ups (M-1/M-2/M-3):
+//!
+//! - `t6e3fix2_scans_keep_the_seeds_order`: the differential's
+//!   scans-to-front splice is gone — over a fixed program space,
+//!   writes-on-`t`-then-IndexScan adjacency exists in numbers (the e3
+//!   escalation's class, which the shaping never generated; SPLICE-BACK
+//!   zeroes the count).
+//! - `t6e3fix2_spec_states_the_verification_regime`: C-T6 §6's
+//!   verification sentence states the regime the engine implements, and
+//!   the spec's changelog names the e3 escalation and C-T6e3fix
+//!   (SPEC-SKIP's catcher — the normative half the C-T6e3fix card was
+//!   enforced out of).
+//! - `t6e3fix2_corrupt_entry_beneath_own_reinsert_is_xx001`: the fix's
+//!   strictly-stronger half pinned by real corruption — a committed
+//!   entry visible at S that no row at S re-encodes to, planted raw
+//!   beneath the txn's own re-insert, must XX001 (S-PAIR-DEAF's
+//!   catcher).
 
 mod diff;
 // diff/crash.rs (pulled in by diff/mod.rs) drives the t6b crash rig.
@@ -37,11 +55,15 @@ mod t6b_support;
 use std::ops::Bound;
 
 use diff::runner::run_workload;
-use diff::{a_range, check, Config, Fate, IdxSight, OpDetail, OpOut, Run, Verdict};
+use diff::{a_range, check, gen_prog, Config, Fate, IdxSight, OpDetail, OpOut, POp, Run, Verdict};
 use nucleus_catalog::amcheck::check_table;
-use nucleus_catalog::{IndexState, Stmt};
+use nucleus_catalog::{DbError, IndexState, Stmt};
+use nucleus_codec::{Collation, KeyColumn, KeyType};
 use nucleus_txn::locks::RelLockMode;
-use t6b_support::{i32_d, i32_v, idx_def, ok, pk_schema, text_d, text_v, Rig};
+use t6b_support::{
+    i32_d, i32_v, i_entry_key, idx_def, ok, pk_schema, plant_live_version, row_key_of, text_d,
+    text_v, Rig,
+};
 
 /// The pinned seeds (item 4's table: the report's runs are these). The
 /// walk continues past them (still pinned, bounded) because two of the
@@ -532,4 +554,223 @@ fn t6e3fix_doc_line_states_the_verification_regime() {
         body.contains("verify the entry against the row **in the entry's own visibility regime**"),
         "the verification block's §6 comment states the regime"
     );
+}
+
+// ---- C-T6e3fix2: the gate follow-ups (M-1/M-2/M-3) -----------------------------
+
+/// C-T6e3fix2 (the gate's M-1/L-1): the differential's scans-to-front
+/// splice is gone from `gen_prog` — programs keep the seed's op order,
+/// so an index scan of `t` can sit **after** the txn's own writes on
+/// `t`: the e3 escalation's class, which the shaping never generated
+/// and which blinded the soak to the crossing-regimes bug (the C-T6e3fix
+/// gate measured the shaped soak blind at 0/14 under VER-CROSS, the
+/// un-shaped one firing 6/14). `gen_prog` is a pure function of
+/// `(seed, session, index)`, so the count over the fixed space below is
+/// deterministic: programs where a write on `t` (InsertT, UpdateSet,
+/// DeleteT, SetBig, NullBig) precedes an IndexScan exist in numbers.
+/// SPLICE-BACK (the splice re-added) moves every scan ahead of every
+/// write and zeroes the count.
+#[test]
+fn t6e3fix2_scans_keep_the_seeds_order() {
+    let writes_then_scan = |p: &diff::Prog| {
+        let write = p.ops.iter().position(|o| {
+            matches!(
+                o,
+                POp::InsertT(..)
+                    | POp::UpdateSet(..)
+                    | POp::DeleteT(..)
+                    | POp::SetBig(..)
+                    | POp::NullBig(..)
+            )
+        });
+        let scan = p.ops.iter().position(|o| matches!(o, POp::IndexScan(..)));
+        write.is_some_and(|w| scan.is_some_and(|c| w < c))
+    };
+    // The soak's DML sessions and program count over two of its seeds.
+    let mut programs = 0usize;
+    let mut scan_bearing = 0usize;
+    let mut adjacent = 0usize;
+    for seed in [0x7c1a_0001, 0x7c1a_0002] {
+        for session in 1..=4u16 {
+            for index in 0..200u32 {
+                let p = gen_prog(seed, session, index);
+                programs += 1;
+                if p.ops.iter().any(|o| matches!(o, POp::IndexScan(..))) {
+                    scan_bearing += 1;
+                }
+                if writes_then_scan(&p) {
+                    adjacent += 1;
+                }
+            }
+        }
+    }
+    assert!(scan_bearing > 0, "no program scans the index: {programs}");
+    assert!(
+        adjacent > 50,
+        "too few programs with a write on t before an index scan \
+         ({adjacent} of {programs}, {scan_bearing} scan-bearing)"
+    );
+}
+
+/// C-T6e3fix2 (the gate's M-2): C-T6 §6's verification sentence states
+/// the visibility regime the engine implements — the normative letter
+/// that lagged the C-T6e3fix engine fix while the docs tree was
+/// protected. `t6e3fix_doc_line_states_the_verification_regime` keeps
+/// the in-code half honest; this keeps the spec's half. SPEC-SKIP (the
+/// §6 sentence reverted to the pre-fix crossing-regimes letter, which
+/// outlawed the own-entry serve and licensed the fetch the fix removed)
+/// fails here, as does losing the changelog entry that names the e3
+/// escalation and the card that fixed it.
+#[test]
+fn t6e3fix2_spec_states_the_verification_regime() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/C-T6-rows-schema-indexes.md"
+    ))
+    .expect("the C-T6 spec");
+    // §6's verification bullet: from its opening phrase to §6.1's
+    // heading, read as flat text (the bullet is line-wrapped).
+    let start = src
+        .find("index_scan` verifies")
+        .expect("§6's verification sentence");
+    let end = src[start..]
+        .find("### 6.1")
+        .map(|i| start + i)
+        .expect("the end of §6");
+    let flat = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+    let sentence = flat(&src[start..end]);
+    assert!(
+        sentence.contains("entry's own visibility regime"),
+        "the sentence must name the regime:\n{sentence}"
+    );
+    assert!(
+        sentence.contains("fetched without the txn's own overlay"),
+        "the foreign-entry half of the regime rule:\n{sentence}"
+    );
+    assert!(
+        sentence.contains("own-overlaid row"),
+        "the own-entry half of the regime rule:\n{sentence}"
+    );
+    assert!(
+        sentence.contains("served through the txn's own entry iff in range"),
+        "the own-overwritten-row carve-out:\n{sentence}"
+    );
+    // The changelog the card required: a line naming the e3 escalation
+    // and C-T6e3fix.
+    let log_at = src.find("## Changelog").expect("the spec's changelog");
+    let log = flat(&src[log_at..]);
+    assert!(
+        log.contains("e3 escalation"),
+        "the changelog must name the e3 escalation:\n{log}"
+    );
+    assert!(
+        log.contains("C-T6e3fix"),
+        "the changelog must name C-T6e3fix:\n{log}"
+    );
+}
+
+/// C-T6e3fix2 (the gate's M-3): the C-T6e3fix verification's
+/// strictly-stronger half — the at-S verification of a shadowed foreign
+/// pair — pinned by real corruption. The deterministic pin's scene (a
+/// committed entry still live at S over a row the txn has re-inserted
+/// as its own write), plus one planted lie: a second committed entry,
+/// visible at S, whose value part (`"q"`) no row at S re-encodes to —
+/// planted straight into the KV beneath the txn's own re-insert
+/// (`plant_live_version`, the C-T6b3b amcheck injection path; no
+/// maintenance wrote it, the state is corrupt by hand). The scan at S
+/// must XX001: the planted entry is foreign (its committed version is
+/// the enumerated payload), the row fetch crosses into the shadowed
+/// branch (the own intent shadows the S row), and the S-pair check —
+/// the check the old code never ran correctly, the one that makes the
+/// fix strictly stronger — is the only thing standing between the
+/// corrupt entry and a silently missing row. S-PAIR-DEAF (that check
+/// deleted) makes this scan serve the own row and skip the lie; this
+/// leg is the failure.
+#[test]
+fn t6e3fix2_corrupt_entry_beneath_own_reinsert_is_xx001() {
+    let rig = Rig::new();
+    // The pin's fixture: t(pk int4, payload text), one row (1, "b"), a
+    // born-public index on payload (§6.1(a): the entry is committed at
+    // or below every later S).
+    let t0 = rig.rc();
+    let s0 = rig.core().visible_ts();
+    let st0 = ok(Stmt::new(&t0, s0));
+    let (oid, sid) = ok(rig.db.create_table(&st0, b"e3fix2", &pk_schema()));
+    let st1 = rig.stmt(&t0, s0);
+    let h = ok(rig.db.open_table(&st1, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st1, &h, &[i32_d(1), text_d("b")]));
+    let st2 = rig.stmt(&t0, s0);
+    let idx = ok(rig
+        .db
+        .create_index(&st2, oid, &idx_def(2, false, IndexState::Public)));
+    let t_setup = ok(rig.commit_rc(t0));
+
+    // The RR txn takes S (the setup at or below it); the helper's
+    // delete commits above it — the old entry stays live at S.
+    let (rr, sguard, s) = rig.rr();
+    assert!(
+        t_setup <= s,
+        "S={s:?} at or below the setup commit {t_setup:?}"
+    );
+    let htxn = rig.rc();
+    let hs = rig.core().visible_ts();
+    let hst = rig.stmt(&htxn, hs);
+    assert!(
+        ok(rig.db.delete(&hst, oid, &[i32_v(1)])),
+        "the row was live"
+    );
+    let t_del = ok(rig.commit_rc(htxn));
+    assert!(
+        t_del > s,
+        "the delete commits above S (T={t_del:?}, S={s:?})"
+    );
+
+    // §5.3: the txn re-inserts the same pk — its own row intent now
+    // shadows the row at S in the reader's regime.
+    let st_i = rig.stmt(&rr, s);
+    let hi = ok(rig.db.open_table(&st_i, oid, RelLockMode::RowExclusive));
+    ok(rig.db.insert_with(&st_i, &hi, &[i32_d(1), text_d("y")]));
+
+    // The corruption: a committed entry visible at S whose value part
+    // no row at S has — at the setup's ts (visible at S, above nothing
+    // that could shadow it, live forever in this rig), an `/i/` entry
+    // (empty payload) naming row 1 under `"q"`.
+    let isid = {
+        let row = rig.idx_row(idx).expect("the idx row committed");
+        let nucleus_txn::catalog::IdxStorage::Id(isid) = row.storage else {
+            panic!("a born-public index has an id storage")
+        };
+        isid
+    };
+    let row1 = row_key_of(sid, &pk_schema(), &[i32_v(1)]);
+    let col = KeyColumn::asc(KeyType::Text(Collation::C));
+    let bad = i_entry_key(isid, &[col], &[text_v("q".into())], &row1);
+    plant_live_version(&rig, &bad, t_setup, &[]);
+
+    // The full-range scan at S must refuse the corrupted state with the
+    // escalated error: the consistent old entry is skipped as the pin
+    // asserts, the own row would serve through its own entry, and the
+    // planted pair fails the S-row re-encode — XX001, never a silently
+    // missing row.
+    let st_c = rig.stmt(&rr, s);
+    let err = rig
+        .db
+        .index_scan(&st_c, idx, Bound::Unbounded, Bound::Unbounded)
+        .expect_err("a corrupt committed entry beneath the own re-insert is XX001");
+    assert!(
+        matches!(
+            err,
+            DbError::Row(nucleus_codec::row::RowError::Corrupt(
+                "index entry does not match its row"
+            ))
+        ),
+        "the escalated signature, not {err:?}"
+    );
+    assert_eq!(err.sqlstate(), "XX001");
+
+    // The corrupted rig is abandoned (the plant was a raw write; no
+    // abort could undo it, and this leg owns nothing to assert about
+    // the committed state — the pin next door owns the clean scene).
+    rig.abort_txn(rr);
+    drop(sguard);
 }
