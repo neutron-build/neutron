@@ -651,24 +651,26 @@ fn t6e3fix2_spec_divergence_is_pinned() {
         .expect("the end of §6");
     let flat = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
     let sentence = flat(&src[start..end]);
-    // The pinned divergence: the old letter is still there, the regime
-    // letter is still not, and the changelog the card required does not
-    // exist (the file ends at §9).
+    // The M-2 landing, pinned: the regime letter is the sentence, the
+    // pre-fix letter is gone, and the changelog names the escalation.
     assert!(
-        sentence.contains("an entry whose row is not visible"),
-        "§6's old verification sentence moved — if this is the M-2 card \
-         landing, flip this test to pin the regime letter (see its doc \
-         comment):\n{sentence}"
+        sentence.contains("entry's own visibility regime"),
+        "§6's verification sentence lost the regime letter — the C-T6e3fix3 \
+         docs card must keep it:\n{sentence}"
     );
     assert!(
-        !sentence.contains("entry's own visibility regime"),
-        "§6 gained regime wording outside a docs-scoped card — flip this \
-         test with it (see its doc comment):\n{sentence}"
+        !sentence.contains("an entry whose row is not visible"),
+        "§6's pre-fix verification letter returned — the C-T6e3fix3 docs \
+         card must keep the restated sentence:\n{sentence}"
     );
     assert!(
-        !src.contains("## Changelog"),
-        "the spec gained a changelog outside a docs-scoped card — flip \
-         this test with it (see its doc comment)"
+        src.contains("## Changelog"),
+        "the spec's changelog vanished — the C-T6e3fix3 docs card must \
+         keep it"
+    );
+    assert!(
+        src.contains("the e3 escalation"),
+        "the changelog no longer names the e3 escalation"
     );
 }
 
