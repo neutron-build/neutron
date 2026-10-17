@@ -627,3 +627,27 @@ detection of this class (the splice lives in `tests/diff/mod.rs`, outside
 the card's Touch-only list — the card named `runner.rs`; deleting it is
 escalated as the gate's M-1 follow-up, so the deterministic pin is the
 only in-tree detector until then).
+
+## C-T6e1fix: the card's IM-C mapping was structurally impossible; the catchers are the `t6e1_ingest` trio (corrected 2026-10-17, card C-T6e1fix2)
+
+The C-T6e1fix card's binding mutation mapping — "IM-C: the resolution pass
+skips one shadowing intent (`plan.iter().skip(1)`) → caught by item 1's
+no-leak assert" — was structurally impossible for item 1, and the record is
+corrected here. Item 1 runs a looping resolver precisely to race the
+ingest, and that resolver masks a skip-one-removal: every plan entry's
+owner is queued for async resolution at commit step 5, *before* the ingest
+begins, so the spinning resolver removes the skipped intent during the
+~10 ms slow scan (or before the snapshot outright) — the skip lands on an
+intent that is already gone by removal-loop time, and the no-leak assert
+sees nothing. Tallies: the worker 0/18 skip-first + 0/5 skip-last, the
+C-T6e1fix gate 0/3 (the analysis is in the gate report and the worker's
+transcript); card C-T6e1fix2 re-confirmed 0/3 by item 1 under the mutant.
+The mutant is nevertheless pinned in-tree, deterministically, by three
+pre-existing single-threaded `t6e1_ingest` tests (no resolver thread to
+mask the skip): `ingest_resolves_shadowing_intent` (the shadowed key reads
+back wrong), `invalid_input_writes_nothing` (a rejected ingest still
+removed an intent of the span), and `crash_prefix_post_sync` (the skipped
+removal leaves the intent unresolved in the crash capture) — under the
+mutant these three are the only failures in `-p nucleus-txn`. Correct
+mapping, recorded for future cards: **ingest-touching cards name
+`t6e1_ingest` (not `t6e1_race`) for skip-shape mutants.**
