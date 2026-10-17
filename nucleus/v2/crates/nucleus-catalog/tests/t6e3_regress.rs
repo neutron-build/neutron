@@ -37,11 +37,12 @@
 //!   writes-on-`t`-then-IndexScan adjacency exists in numbers (the e3
 //!   escalation's class, which the shaping never generated; SPLICE-BACK
 //!   zeroes the count).
-//! - `t6e3fix2_spec_states_the_verification_regime`: C-T6 §6's
-//!   verification sentence states the regime the engine implements, and
-//!   the spec's changelog names the e3 escalation and C-T6e3fix
-//!   (SPEC-SKIP's catcher — the normative half the C-T6e3fix card was
-//!   enforced out of).
+//! - `t6e3fix2_spec_divergence_is_pinned`: C-T6 §6's verification
+//!   sentence still carries the pre-fix letter — the card's Work 2
+//!   (restate it, add the spec's changelog) was reverted by the
+//!   runner's `nucleus/v2/docs/` protection, so the divergence is
+//!   pinned in-suite instead (SPEC-EDIT's catcher; the in-code doc
+//!   line stays pinned by the DOC-LINE test above).
 //! - `t6e3fix2_corrupt_entry_beneath_own_reinsert_is_xx001`: the fix's
 //!   strictly-stronger half pinned by real corruption — a committed
 //!   entry visible at S that no row at S re-encodes to, planted raw
@@ -612,17 +613,28 @@ fn t6e3fix2_scans_keep_the_seeds_order() {
     );
 }
 
-/// C-T6e3fix2 (the gate's M-2): C-T6 §6's verification sentence states
-/// the visibility regime the engine implements — the normative letter
-/// that lagged the C-T6e3fix engine fix while the docs tree was
-/// protected. `t6e3fix_doc_line_states_the_verification_regime` keeps
-/// the in-code half honest; this keeps the spec's half. SPEC-SKIP (the
-/// §6 sentence reverted to the pre-fix crossing-regimes letter, which
-/// outlawed the own-entry serve and licensed the fetch the fix removed)
-/// fails here, as does losing the changelog entry that names the e3
-/// escalation and the card that fixed it.
+/// C-T6e3fix2 (the gate's M-2, adapted): the spec/code divergence is
+/// pinned, not silent. The card's Work 2 — restate §6's verification
+/// sentence and add the spec's changelog — was reverted by the runner's
+/// `nucleus/v2/docs/` protection (the same hard-rule-over-Touch-only
+/// conflict the C-T6e3fix card hit; see the revert commit), so the
+/// normative letter still lags the engine: §6 licenses the
+/// crossing-regimes fetch the C-T6e3fix fix removed and outlaws the
+/// own-entry serve the engine performs, while `index_scan`'s doc
+/// comment (pinned by `t6e3fix_doc_line_states_the_verification_regime`)
+/// carries the regime. This test reads the spec and pins **exactly**
+/// that enforced-out state — the old sentence, no changelog — so the
+/// divergence stays visible in the suite and any edit to either half
+/// (including the correct one, when a card with docs scope finally
+/// lands M-2) trips it deliberately: that card replaces these
+/// assertions with the regime letter (foreign entries verified against
+/// the row at the snapshot fetched without the txn's own overlay; own
+/// entries against the own-overlaid row; an own-overwritten row served
+/// through the txn's own entry iff in range) and a changelog line
+/// naming the e3 escalation and C-T6e3fix. SPEC-EDIT (the §6 sentence
+/// touched in any direction) fails here.
 #[test]
-fn t6e3fix2_spec_states_the_verification_regime() {
+fn t6e3fix2_spec_divergence_is_pinned() {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/C-T6-rows-schema-indexes.md"
@@ -639,33 +651,24 @@ fn t6e3fix2_spec_states_the_verification_regime() {
         .expect("the end of §6");
     let flat = |s: &str| s.lines().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
     let sentence = flat(&src[start..end]);
+    // The pinned divergence: the old letter is still there, the regime
+    // letter is still not, and the changelog the card required does not
+    // exist (the file ends at §9).
     assert!(
-        sentence.contains("entry's own visibility regime"),
-        "the sentence must name the regime:\n{sentence}"
+        sentence.contains("an entry whose row is not visible"),
+        "§6's old verification sentence moved — if this is the M-2 card \
+         landing, flip this test to pin the regime letter (see its doc \
+         comment):\n{sentence}"
     );
     assert!(
-        sentence.contains("fetched without the txn's own overlay"),
-        "the foreign-entry half of the regime rule:\n{sentence}"
+        !sentence.contains("entry's own visibility regime"),
+        "§6 gained regime wording outside a docs-scoped card — flip this \
+         test with it (see its doc comment):\n{sentence}"
     );
     assert!(
-        sentence.contains("own-overlaid row"),
-        "the own-entry half of the regime rule:\n{sentence}"
-    );
-    assert!(
-        sentence.contains("served through the txn's own entry iff in range"),
-        "the own-overwritten-row carve-out:\n{sentence}"
-    );
-    // The changelog the card required: a line naming the e3 escalation
-    // and C-T6e3fix.
-    let log_at = src.find("## Changelog").expect("the spec's changelog");
-    let log = flat(&src[log_at..]);
-    assert!(
-        log.contains("e3 escalation"),
-        "the changelog must name the e3 escalation:\n{log}"
-    );
-    assert!(
-        log.contains("C-T6e3fix"),
-        "the changelog must name C-T6e3fix:\n{log}"
+        !src.contains("## Changelog"),
+        "the spec gained a changelog outside a docs-scoped card — flip \
+         this test with it (see its doc comment)"
     );
 }
 
