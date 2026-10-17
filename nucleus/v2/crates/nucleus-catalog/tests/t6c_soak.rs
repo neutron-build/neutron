@@ -16,6 +16,21 @@
 //! never a wall-clock bound; timings are printed, not asserted. The
 //! `#[ignore]`d long variant runs 50 seeds.
 //!
+//! C-T6e4 stabilization — the coverage floors (the bars over the
+//! checker's Stats below) ride the racy threaded workload, and a
+//! scheduling draw can starve one while the engine stays clean
+//! (violations: 0, no leaks): the C-T6d2fix gate's H-1 census measured
+//! ~16% of runs starving a bar on a loaded box, and this card's
+//! acceptance loop caught the DeleteOnly-sight floor starving with all
+//! three seeds at 0 on a legal history. The floors keep their values
+//! and messages; `t6c_soak` instead REDRAWS a starved draw — same
+//! seeds (programs are a pure function of the seed), fresh
+//! interleaving, at most 4 draws — while correctness (`assert_clean`,
+//! leaked intents, the amcheck point count) asserts on EVERY draw and
+//! is never redrawn: the XX001 families fail on draw 1, and a
+//! deterministic coverage regression starves every draw and fails with
+//! the list.
+//!
 //! Mutation evidence (binding, card item 5): the four card-named mutants
 //! are each caught —
 //!
@@ -135,96 +150,90 @@ fn assert_clean(seed: u64, verdict: &Verdict) {
     }
 }
 
-#[test]
-fn t6c_soak() {
-    // C-T6d2's index-build coverage bars are taken over the three seeds
-    // together: a build's fate depends on which truncate or drop raced
-    // it, so per-seed floors would flake on interleavings, while the
-    // aggregate floor is many times the bar. The large-value bars are
-    // per-seed again (C-T6d2fix FU-2, gate F-2): observed runs commit
-    // 60–117 big writes per seed and ≥ 9 per length class, so `> 25`
-    // and `> 3` hold with ≥ 3× margin — the C-T6d2 stabilization had
-    // moved them to the 3-seed aggregate, which a regression that
-    // zeroes one seed's big coverage passes silently.
-    let mut big = diff::Verdict::default().stats;
-    for seed in SEEDS {
-        let (run, verdict) = run_seed(seed);
-        summary(seed, &verdict);
-        assert_clean(seed, &verdict);
-        let s = &verdict.stats;
-        // The workload actually exercised the surfaces under test: reads
-        // were checked, DDL and truncates committed, amcheck ran, and
-        // commits happened at every level (the mix generates all three).
-        assert!(s.reads_checked > 100, "too few reads checked: {s:?}");
-        // The level split (c1a FU-5 / c1b FU-C, folded into the checker's
-        // Stats by C-T6c1afix2 FU-2): successful reads must happen at
-        // every level — an over-refusing engine that 40001'd all RR/SER
-        // reads starves two of the three counters (refused txns leave no
-        // effects, so nothing else would notice).
-        assert!(s.reads_rc > 50, "too few RC reads checked: {s:?}");
-        assert!(s.reads_rr > 50, "too few RR reads checked: {s:?}");
-        assert!(s.reads_ser > 50, "too few SER reads checked: {s:?}");
-        assert!(s.truncates_committed > 3, "too few truncates: {s:?}");
-        assert!(s.ddl > 30, "too little DDL: {s:?}");
-        assert!(
-            s.amcheck_points == 8,
-            "3 mid-run points × 2 tables + the end: {s:?}"
-        );
-        assert!(s.committed > 200, "too few commits: {s:?}");
-        assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
-        // C-T6c1b's surfaces were exercised too: the write oracle ran,
-        // and the serialization graph had SER txns to bite on (the mix
-        // makes ~a third of the 800 programs SERIALIZABLE).
-        assert!(s.writes_checked > 100, "too few writes checked: {s:?}");
-        assert!(s.ser_txns > 5, "too few committed SER txns: {s:?}");
-        // The aggregate of the large-value surface (Stats is Copy; the
-        // per-field sums are what the bars below run on).
-        big.big_writes += s.big_writes;
-        for (agg, one) in big.big_lens.iter_mut().zip(s.big_lens) {
-            *agg += one;
-        }
-        big.big_drops += s.big_drops;
-        big.big_adds += s.big_adds;
-        // The same for C-T6e3's online-build surface (the c1d2 pattern:
-        // per-seed floors would flake on interleavings — a build's fate
-        // depends on which truncate or drop raced it — while the
-        // aggregate floor is many times the bar).
-        big.idx_builds_ok += s.idx_builds_ok;
-        big.idx_builds_failed += s.idx_builds_failed;
-        big.idx_resumes += s.idx_resumes;
-        big.idx_drops += s.idx_drops;
-        big.idx_scans_served += s.idx_scans_served;
-        big.idx_scans_refused += s.idx_scans_refused;
-        big.idx_sights_delete_only += s.idx_sights_delete_only;
-        big.idx_sights_write_only += s.idx_sights_write_only;
-        // c1b FU-D: the SET NOT NULL surface stays exercised — a
-        // workload or engine change that quietly stopped producing
-        // successful SET NOT NULLs (or witnessed 23502s) would zero
-        // this without failing anything else.
-        assert!(s.snn_checked > 0, "no SET NOT NULL verified: {s:?}");
-        // C-T6d2fix FU-2 (gate F-2, recalibrated per the gate's H-1):
-        // the write side is scheduling-sensitive after all — depressed
-        // seeds under load commit as few as ~21 big writes and ~2 per
-        // class — so the floors sit at > 10 / > 1 (every demonstrated
-        // mutant catch survives with ~2x headroom: GA4 dies at 0, GA5's
-        // erosion lands far below 10); only the drop/re-add pair stays
-        // aggregate, below.
-        assert!(
-            s.big_writes > 10,
-            "too few big writes in seed {seed:#x}: {s:?}"
-        );
-        assert!(
-            s.big_lens.iter().all(|&n| n > 1),
+/// The per-seed coverage floors, as messages (empty = this seed's draw
+/// exercised every surface). The bars and their messages are unchanged
+/// from the C-T6c1a/c1b/d2/d2fix/e3 cards; what C-T6e4 changed is only
+/// who evaluates them — a starved floor no longer fails the run
+/// outright, it redraws the draw (`t6c_soak`'s loop, module docs).
+/// Correctness is NOT here: `assert_clean`, leaked intents and the
+/// amcheck point count assert on every draw and are never redrawn.
+fn seed_coverage_floors(seed: u64, v: &Verdict) -> Vec<String> {
+    let s = &v.stats;
+    let mut starved = Vec::new();
+    // The workload actually exercised the surfaces under test: reads
+    // were checked, DDL and truncates committed, and commits happened
+    // at every level (the mix generates all three).
+    if s.reads_checked <= 100 {
+        starved.push(format!("too few reads checked: {s:?}"));
+    }
+    // The level split (c1a FU-5 / c1b FU-C, folded into the checker's
+    // Stats by C-T6c1afix2 FU-2): successful reads must happen at every
+    // level — an over-refusing engine that 40001'd all RR/SER reads
+    // starves two of the three counters (refused txns leave no
+    // effects, so nothing else would notice).
+    if s.reads_rc <= 50 {
+        starved.push(format!("too few RC reads checked: {s:?}"));
+    }
+    if s.reads_rr <= 50 {
+        starved.push(format!("too few RR reads checked: {s:?}"));
+    }
+    if s.reads_ser <= 50 {
+        starved.push(format!("too few SER reads checked: {s:?}"));
+    }
+    if s.truncates_committed <= 3 {
+        starved.push(format!("too few truncates: {s:?}"));
+    }
+    if s.ddl <= 30 {
+        starved.push(format!("too little DDL: {s:?}"));
+    }
+    if s.committed <= 200 {
+        starved.push(format!("too few commits: {s:?}"));
+    }
+    // C-T6c1b's surfaces were exercised too: the write oracle ran, and
+    // the serialization graph had SER txns to bite on (the mix makes
+    // ~a third of the 800 programs SERIALIZABLE).
+    if s.writes_checked <= 100 {
+        starved.push(format!("too few writes checked: {s:?}"));
+    }
+    if s.ser_txns <= 5 {
+        starved.push(format!("too few committed SER txns: {s:?}"));
+    }
+    // c1b FU-D: the SET NOT NULL surface stays exercised — a workload
+    // or engine change that quietly stopped producing successful SET
+    // NOT NULLs (or witnessed 23502s) would zero this without failing
+    // anything else.
+    if s.snn_checked == 0 {
+        starved.push(format!("no SET NOT NULL verified: {s:?}"));
+    }
+    // C-T6d2fix FU-2 (gate F-2, recalibrated per the gate's H-1): the
+    // write side is scheduling-sensitive after all — depressed seeds
+    // under load commit as few as ~21 big writes and ~2 per class — so
+    // the floors sit at > 10 / > 1 (every demonstrated mutant catch
+    // survives with ~2x headroom: GA4 dies at 0, GA5's erosion lands
+    // far below 10); only the drop/re-add pair stays aggregate, below.
+    if s.big_writes <= 10 {
+        starved.push(format!("too few big writes in seed {seed:#x}: {s:?}"));
+    }
+    if !s.big_lens.iter().all(|&n| n > 1) {
+        starved.push(format!(
             "every big length class (100/3000/20000) must commit per seed \
              {seed:#x}: {s:?}"
-        );
-        // The DropBig→AddBig pairing (every drop's next DDL index is
-        // the re-add) lands at least one committed AddBig per seed.
-        assert!(
-            s.big_adds >= 1,
-            "no committed AddBig in seed {seed:#x}: {s:?}"
-        );
+        ));
     }
+    // The DropBig→AddBig pairing (every drop's next DDL index is the
+    // re-add) lands at least one committed AddBig per seed.
+    if s.big_adds < 1 {
+        starved.push(format!("no committed AddBig in seed {seed:#x}: {s:?}"));
+    }
+    starved
+}
+
+/// The three-seed aggregate coverage floors, as messages (empty = the
+/// draw exercised every aggregate surface). Same bars and messages as
+/// before the C-T6e4 draw loop; see `seed_coverage_floors`.
+fn aggregate_coverage_floors(v: &Verdict) -> Vec<String> {
+    let big = &v.stats;
+    let mut starved = Vec::new();
     // C-T6d2's surface, aggregate side (FU-2): the drop/re-add cycle is
     // the scheduling-exposed half (4–6 drops per seed observed — whether
     // a given DropBig beats its DDL neighbours and commits is a race),
@@ -233,43 +242,140 @@ fn t6c_soak() {
     // count even), with at least one real committed drop. The per-seed
     // bars above carry the big-write, per-class and AddBig floors (each
     // implies the aggregate form it replaced).
-    assert!(
-        big.big_drops + big.big_adds >= 4,
-        "too few DropBig/AddBig pairs across the seeds: {big:?}"
-    );
-    assert!(big.big_drops > 0, "no committed DropBig: {big:?}");
+    if big.big_drops + big.big_adds < 4 {
+        starved.push(format!(
+            "too few DropBig/AddBig pairs across the seeds: {big:?}"
+        ));
+    }
+    if big.big_drops == 0 {
+        starved.push(format!("no committed DropBig: {big:?}"));
+    }
     // C-T6e3's surface: builds published and failed (the seeded
     // sabotage's 55000s), unfinished ones were resumed and dropped, and
     // the DML scans both served through a published index and were
     // refused by the ladder's mid-states — an engine that never
     // published, or one that never refused, starves one of each pair
     // (the served side is also the rows-equality oracle's only bite).
-    assert!(
-        big.idx_builds_ok > 3,
-        "too few published online builds: {big:?}"
-    );
-    assert!(
-        big.idx_builds_failed > 0,
-        "no failed online build (the seeded sabotage never bit): {big:?}"
-    );
-    assert!(big.idx_resumes > 0, "no resume ran on a target: {big:?}");
-    assert!(big.idx_drops > 0, "no committed DROP INDEX: {big:?}");
-    assert!(
-        big.idx_scans_served > 10,
-        "too few served index scans: {big:?}"
-    );
-    assert!(
-        big.idx_scans_refused > 0,
-        "no justified index-scan refusal (the ladder's mid-states were \
-         never seen mid-flight): {big:?}"
-    );
+    if big.idx_builds_ok <= 3 {
+        starved.push(format!("too few published online builds: {big:?}"));
+    }
+    if big.idx_builds_failed == 0 {
+        starved.push(format!(
+            "no failed online build (the seeded sabotage never bit): {big:?}"
+        ));
+    }
+    if big.idx_resumes == 0 {
+        starved.push(format!("no resume ran on a target: {big:?}"));
+    }
+    if big.idx_drops == 0 {
+        starved.push(format!("no committed DROP INDEX: {big:?}"));
+    }
+    if big.idx_scans_served <= 10 {
+        starved.push(format!("too few served index scans: {big:?}"));
+    }
+    if big.idx_scans_refused == 0 {
+        starved.push(format!(
+            "no justified index-scan refusal (the ladder's mid-states were \
+             never seen mid-flight): {big:?}"
+        ));
+    }
     // The bracketed sights saw the ladder's first two states somewhere
     // in the run — the states amcheck's I-IDX-DO/I-IDX-WO arms check.
-    assert!(
-        big.idx_sights_delete_only > 0,
-        "no DeleteOnly sight: {big:?}"
+    if big.idx_sights_delete_only == 0 {
+        starved.push(format!("no DeleteOnly sight: {big:?}"));
+    }
+    if big.idx_sights_write_only == 0 {
+        starved.push(format!("no WriteOnly sight: {big:?}"));
+    }
+    starved
+}
+
+#[test]
+fn t6c_soak() {
+    // C-T6e4's draw loop. The coverage floors ride a racy threaded
+    // workload: a scheduling draw can starve one while the engine stays
+    // clean (violations: 0, no leaks, amcheck green) — the C-T6d2fix
+    // gate's H-1 census measured ~16% of runs starving a bar at its
+    // tree, and this card's acceptance loop watched the DeleteOnly-sight
+    // floor starve with all three seeds at DO 0 on a legal history.
+    // The floors may not be lowered (this card's limits), so the
+    // stability mechanism is REDRAW: correctness — `assert_clean`,
+    // leaked intents, the amcheck point count — asserts on EVERY draw
+    // and is never redrawn (the XX001 families this lineage hunts die
+    // there, on draw 1, never in a coverage floor), while a starved
+    // floor redraws the whole three-seed soak — same seeds, same
+    // programs (a pure function of the seed), a fresh interleaving —
+    // up to DRAWS draws. A deterministic coverage regression (a
+    // generator or engine change that genuinely stops exercising a
+    // surface — the BAR-LOOSE / RANGE-SILENT / GA4 / GA5 class) starves
+    // every draw and fails with the full list.
+    const DRAWS: usize = 4;
+    // C-T6d2's index-build coverage bars are taken over the three seeds
+    // together: a build's fate depends on which truncate or drop raced
+    // it, so per-seed floors would flake on interleavings, while the
+    // aggregate floor is many times the bar. The large-value bars are
+    // per-seed again (C-T6d2fix FU-2, gate F-2): observed runs commit
+    // 60–117 big writes per seed and ≥ 9 per length class, so `> 10`
+    // and `> 1` hold with margin — the C-T6d2 stabilization had moved
+    // them to the 3-seed aggregate, which a regression that zeroes one
+    // seed's big coverage passes silently.
+    let mut starved_last: Vec<String> = Vec::new();
+    for draw in 0..DRAWS {
+        let mut big = diff::Verdict::default();
+        let mut starved: Vec<String> = Vec::new();
+        for seed in SEEDS {
+            let (run, verdict) = run_seed(seed);
+            summary(seed, &verdict);
+            // Correctness — never redrawn.
+            assert_clean(seed, &verdict);
+            assert_eq!(run.leaked_intents, 0, "{}", run.leak_report);
+            assert!(
+                verdict.stats.amcheck_points == 8,
+                "3 mid-run points × 2 tables + the end: {:?}",
+                verdict.stats
+            );
+            starved.extend(seed_coverage_floors(seed, &verdict));
+            // The aggregate of the large-value surface (Stats is Copy;
+            // the per-field sums are what the bars below run on).
+            let s = &verdict.stats;
+            let acc = &mut big.stats;
+            acc.big_writes += s.big_writes;
+            for (agg, one) in acc.big_lens.iter_mut().zip(s.big_lens) {
+                *agg += one;
+            }
+            acc.big_drops += s.big_drops;
+            acc.big_adds += s.big_adds;
+            // The same for C-T6e3's online-build surface (the c1d2
+            // pattern: per-seed floors would flake on interleavings —
+            // a build's fate depends on which truncate or drop raced it
+            // — while the aggregate floor is many times the bar).
+            acc.idx_builds_ok += s.idx_builds_ok;
+            acc.idx_builds_failed += s.idx_builds_failed;
+            acc.idx_resumes += s.idx_resumes;
+            acc.idx_drops += s.idx_drops;
+            acc.idx_scans_served += s.idx_scans_served;
+            acc.idx_scans_refused += s.idx_scans_refused;
+            acc.idx_sights_delete_only += s.idx_sights_delete_only;
+            acc.idx_sights_write_only += s.idx_sights_write_only;
+        }
+        starved.extend(aggregate_coverage_floors(&big));
+        if starved.is_empty() {
+            return;
+        }
+        if draw + 1 < DRAWS {
+            println!(
+                "t6c soak draw {} of {DRAWS}: coverage starved (engine \
+                 clean — violations 0, no leak), redrawing: {starved:#?}",
+                draw + 1
+            );
+        }
+        starved_last = starved;
+    }
+    panic!(
+        "t6c soak: coverage floors starved on all {DRAWS} draws — not \
+         scheduling luck but a surface the workload no longer exercises:\n\
+         {starved_last:#?}"
     );
-    assert!(big.idx_sights_write_only > 0, "no WriteOnly sight: {big:?}");
 }
 
 /// The long variant: 50 seeds, `#[ignore]`d (the card's item 5).
