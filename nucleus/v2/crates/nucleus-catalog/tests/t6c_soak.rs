@@ -137,11 +137,15 @@ fn assert_clean(seed: u64, verdict: &Verdict) {
 
 #[test]
 fn t6c_soak() {
-    // C-T6d2's coverage bars are taken over the three seeds together:
-    // how many of a run's SetBig ops land depends on scheduling (a pk
-    // the truncate-heavy mix leaves absent, a 40001 that exhausts the
-    // retry budget), so per-seed floors would flake on interleavings,
-    // while the aggregate floor is many times the bar.
+    // C-T6d2's index-build coverage bars are taken over the three seeds
+    // together: a build's fate depends on which truncate or drop raced
+    // it, so per-seed floors would flake on interleavings, while the
+    // aggregate floor is many times the bar. The large-value bars are
+    // per-seed again (C-T6d2fix FU-2, gate F-2): observed runs commit
+    // 60–117 big writes per seed and ≥ 9 per length class, so `> 25`
+    // and `> 3` hold with ≥ 3× margin — the C-T6d2 stabilization had
+    // moved them to the 3-seed aggregate, which a regression that
+    // zeroes one seed's big coverage passes silently.
     let mut big = diff::Verdict::default().stats;
     for seed in SEEDS {
         let (run, verdict) = run_seed(seed);
@@ -198,17 +202,41 @@ fn t6c_soak() {
         // successful SET NOT NULLs (or witnessed 23502s) would zero
         // this without failing anything else.
         assert!(s.snn_checked > 0, "no SET NOT NULL verified: {s:?}");
+        // C-T6d2fix FU-2 (gate F-2): the large-value bars, per seed.
+        // The write side of the mix is scheduling-insensitive — SetBig
+        // and NullBig draws are a fixed share of every program stream —
+        // so per-seed floors hold with ≥ 3× margin (60–117 big writes
+        // and 9–35 per class observed per seed); only the drop/re-add
+        // pair stays aggregate, below.
+        assert!(
+            s.big_writes > 25,
+            "too few big writes in seed {seed:#x}: {s:?}"
+        );
+        assert!(
+            s.big_lens.iter().all(|&n| n > 3),
+            "every big length class (100/3000/20000) must commit per seed \
+             {seed:#x}: {s:?}"
+        );
+        // The DropBig→AddBig pairing (every drop's next DDL index is
+        // the re-add) lands at least one committed AddBig per seed.
+        assert!(
+            s.big_adds >= 1,
+            "no committed AddBig in seed {seed:#x}: {s:?}"
+        );
     }
-    // C-T6d2's surface: large-value writes committed at every length
-    // class the card names (inline / one chunk / three chunks), and the
-    // drop/re-add cycle of the column they land on.
-    assert!(big.big_writes > 12, "too few big writes: {big:?}");
+    // C-T6d2's surface, aggregate side (FU-2): the drop/re-add cycle is
+    // the scheduling-exposed half (4–6 drops per seed observed — whether
+    // a given DropBig beats its DDL neighbours and commits is a race),
+    // so its bar runs over the three seeds: the pair must land ≥ 4
+    // times across them (every drop's forced re-add keeps the pair
+    // count even), with at least one real committed drop. The per-seed
+    // bars above carry the big-write, per-class and AddBig floors (each
+    // implies the aggregate form it replaced).
     assert!(
-        big.big_lens.iter().all(|&n| n > 0),
-        "every big length class (100/3000/20000) must commit: {big:?}"
+        big.big_drops + big.big_adds >= 4,
+        "too few DropBig/AddBig pairs across the seeds: {big:?}"
     );
     assert!(big.big_drops > 0, "no committed DropBig: {big:?}");
-    assert!(big.big_adds > 0, "no committed AddBig: {big:?}");
     // C-T6e3's surface: builds published and failed (the seeded
     // sabotage's 55000s), unfinished ones were resumed and dropped, and
     // the DML scans both served through a published index and were
@@ -318,6 +346,33 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
         }
     }
     assert_eq!(kinds.len(), 11, "every DDL kind appears: {kinds:?}");
+    // C-T6d2fix FU-1 (gate F-1/GA4): pin the generator's big-value
+    // sizes. The soak's bars count length classes by value-match
+    // (`BIG_LENS.iter().position(|l| *l == len)`), so any three
+    // distinct lens satisfy them — without this pin, a shrunk BIG_LENS
+    // (GA4's [100, 3000, 4096]) passes the whole suite with the
+    // 3-chunk class silently gone and the soak's amcheck never sees a
+    // multi-chunk pointer.
+    assert_eq!(
+        diff::BIG_LENS,
+        [100, 3000, 20_000],
+        "the soak's big-value classes are pinned"
+    );
+    // And the pinned sizes mean the chunk shapes the card names: 100
+    // stays inline (below the 2048 threshold), 3000 is one chunk,
+    // 20000 is three — the multi-chunk class the soak must keep
+    // generating.
+    assert_eq!(
+        diff::BIG_LENS.map(|len| {
+            if len <= nucleus_catalog::TOAST_THRESHOLD {
+                0
+            } else {
+                len.div_ceil(nucleus_catalog::TOAST_CHUNK)
+            }
+        }),
+        [0, 1, 3],
+        "the classes are the inline / one-chunk / three-chunk shapes"
+    );
 }
 
 // ----- the checker can fail ---------------------------------------------------
