@@ -1146,6 +1146,156 @@ fn t6e4_stray_null_on_a_current_def_row_is_still_xx001() {
     ok(rig.core().abort(t_r));
 }
 
+/// C-T6e4fix (the gate's L-1): the delete leg of the era carve-out —
+/// `delete_with`'s EPQ-base decode, the one converted site no C-T6e4 pin
+/// drove (the write pin updates, the read pin's helper delete runs
+/// pre-SNN). Two legs, because the card scene's literal shape and the
+/// decode drive are different histories:
+///
+/// (a) **The read pin's scene, deleting** — the card's literal shape: the
+/// RR txn at `S` below the pair (the helper's DELETE of pk 1, then the
+/// SET NOT NULL whose validating scan sees the tombstone) issues its own
+/// DELETE of pk 1 at `S`. The legal outcome is §5.1's 40001: the
+/// newer-version rule gives an RR row op no EPQ (only RC re-evaluates),
+/// and the pair's tombstone sits above `S` — the row op refuses before
+/// any decode runs. Pinned as the boundary it is (a refactor that made
+/// this delete *apply* would be a §5.1 regression, not a fix).
+///
+/// (b) **The decode drive** — what "the EPQ-base decode must apply
+/// cleanly (pre-fix it XX001s)" needs. `delete_with` decodes its base
+/// only after the row op applied, and the base is the recheck's newest
+/// committed version (an RC delete over the pair) or the statement's
+/// read row; after a SET NOT NULL commits, no key's latest committed
+/// version can legally carry the column's NULL (the DDL validated the
+/// latest state under AccessExclusive, which every writer's
+/// RowExclusive — held to its txn's end — must precede, and a later
+/// writer encodes under the constrained def and refuses the NULL). The
+/// one deterministic shape that puts era bytes under the delete's base
+/// is the corruption oracle's primitive, the raw plant — here a v1-era
+/// `(2, NULL)` row planted at the SNN's own ts, byte-identical to a
+/// legal era row (under the landed §2 letter it is served, not
+/// corruption — the read side's indistinguishability is the e4 gate's
+/// N-4 note). A fresh RR txn above the plant deletes pk 2: nothing sits
+/// above its snapshot, so the row op applies with the read row as the
+/// EPQ base, the base decodes at its own era, the delete applies,
+/// commits, and the committed effect is an empty, amcheck-clean table.
+/// Before the fix — and under DELETE-DEAF, the site alone reverted to
+/// `schema.decode_row` — the decode XX001s the legal statement.
+#[test]
+fn t6e4_pre_constraint_null_row_deletes_clean_under_a_later_set_not_null() {
+    let rig = Rig::new();
+    let (oid, sid, _idx) = t6e4_fixture(&rig);
+
+    // ---- (a) the read pin's scene, the RR txn deleting pk 1 -----------
+
+    // The NULL row, committed below every later snapshot (the read pin's
+    // fixture).
+    let t1 = {
+        let t = rig.rc();
+        let s = rig.core().visible_ts();
+        let st = rig.stmt(&t, s);
+        let h = ok(rig.db.open_table(&st, oid, RelLockMode::RowExclusive));
+        ok(rig.db.insert_with(&st, &h, &[i32_d(1), None]));
+        ok(rig.commit_rc(t))
+    };
+    // The RR txn takes S — the NULL row's commit at or below it.
+    let (rr, sguard, s) = rig.rr();
+    assert!(t1 <= s, "S={s:?} at or below the NULL row's commit {t1:?}");
+    // The concurrent pair above S, exactly the read pin's interleaving:
+    // the delete first (its tombstone is what SET NOT NULL's validating
+    // scan sees), then the DDL.
+    let hd = rig.rc();
+    let hs = rig.core().visible_ts();
+    let hstd = rig.stmt(&hd, hs);
+    assert!(
+        ok(rig.db.delete(&hstd, oid, &[i32_v(1)])),
+        "the row was live"
+    );
+    let t_del = ok(rig.commit_rc(hd));
+    assert!(
+        t_del > s,
+        "the delete commits above S (T={t_del:?}, S={s:?})"
+    );
+    let hsnn = rig.rc();
+    let hs2 = rig.core().visible_ts();
+    let stsnn = rig.stmt(&hsnn, hs2);
+    ok(rig.db.set_not_null(&stsnn, oid, 2, true));
+    let t_snn = ok(rig.commit_rc(hsnn));
+    assert!(t_snn > t_del, "the SET NOT NULL commits above the delete");
+
+    // The RR txn's own DELETE of pk 1 at S: the pair's tombstone sits
+    // above S and an RR row op never EPQs (§5.1's newer-version rule),
+    // so the statement is refused 40001 before any decode — the legal
+    // boundary, not the crossing.
+    let st_d = rig.stmt(&rr, s);
+    let err = rig
+        .db
+        .delete(&st_d, oid, &[i32_v(1)])
+        .expect_err("the RR delete over the pair's tombstone is 40001");
+    assert!(
+        matches!(
+            err,
+            DbError::Txn(nucleus_txn::TxnError::SerializationFailure)
+        ),
+        "the §5.1 verdict, not {err:?}"
+    );
+    assert_eq!(err.sqlstate(), "40001");
+    rig.abort_txn(rr);
+    drop(sguard);
+
+    // ---- (b) the decode drive: era bytes under the delete's base ------
+
+    // The planted era row: encoded under the fixture's v1 def (payload
+    // nullable — the only producer of such bytes), NULL on the SNN'd
+    // column, planted raw at the SNN's own ts (visible at every later
+    // snapshot, live forever in this rig).
+    let era_bytes = ok(pk_schema().encode_row(&[i32_d(2), None]));
+    let row2 = row_key_of(sid, &pk_schema(), &[i32_v(2)]);
+    plant_live_version(&rig, &row2, t_snn, &era_bytes);
+
+    // A fresh RR txn at or above the plant: its handle carries the
+    // post-SNN definition, its snapshot sees the planted row, and
+    // nothing sits above it — the row op applies with the read row as
+    // the EPQ base, unre-based.
+    let (rr2, sguard2, s2) = rig.rr();
+    assert!(s2 >= t_snn, "S2={s2:?} at or above the plant {t_snn:?}");
+    let st_d2 = rig.stmt(&rr2, s2);
+    let h2 = ok(rig.db.open_table(&st_d2, oid, RelLockMode::RowExclusive));
+    assert_eq!(h2.def_version, 2, "the handle carries the post-SNN def");
+    assert!(
+        ok(rig.db.delete_with(&st_d2, &h2, &[i32_v(2)])),
+        "the pre-constraint NULL base decodes at its own era and the \
+         delete applies"
+    );
+    let t_del2 = ok(rig.commit_rc(rr2));
+    drop(sguard2);
+    assert!(t_del2 > t_snn, "the delete commits above the plant");
+
+    // The committed effect, as in the write pin: a fresh reader finds
+    // the table empty (the pair removed pk 1, this delete removed the
+    // planted pk 2), and amcheck is clean.
+    let t_r = rig.rc();
+    let s_r = rig.core().visible_ts();
+    let st_r = rig.stmt(&t_r, s_r);
+    let hr = ok(rig.db.open_table(&st_r, oid, RelLockMode::AccessShare));
+    assert!(
+        ok(rig.db.scan(&st_r, &hr)).is_empty(),
+        "the committed table is empty"
+    );
+    assert_eq!(
+        ok(rig.db.get(&st_r, &hr, &[i32_v(2)])),
+        None,
+        "the planted row is gone"
+    );
+    ok(rig.commit_rc(t_r));
+    let g = rig.core().registry.take_snapshot();
+    assert!(
+        ok(check_table(&rig.db, oid, &g)).is_clean(),
+        "amcheck after"
+    );
+    drop(g);
+}
+
 /// C-T6e4's spec letter, landed (the C-T6e4fix docs half) and pinned
 /// (SPEC-REVERT's catcher): the engine decodes NOT NULL flags at the
 /// row's own era (`decode_row_at_era`), and C-T6 §2/§3 license it — the
