@@ -4,11 +4,16 @@
 //! in the window).
 //!
 //! - `resolver_vs_ingest_race`: a resolver thread looping
-//!   `Resolver::run_once` races `Core::ingest_versions`'s resolution pass
-//!   while the plan scan itself is slow (the `SpyKv` snapshot sleeps ~2 ms
-//!   between scan items), so the resolver interleaves **inside** the plan
-//!   scan. Per round: no intent leaked, every key reads back at `S`, every
-//!   owner's `intent_count == 0` (I-COUNT exact; §7.3 + I-TRUNC).
+//!   `Resolver::run_once` races `Core::ingest_versions`'s resolution pass.
+//!   A start-gate parks the resolver's next KV write until the plan scan
+//!   has captured its snapshot (so the plan is exactly the round's M
+//!   intents), and the slowed scan — ~2 ms between items — then holds the
+//!   scan's registered view open while the resolver removes those intents
+//!   and §7.4-truncates their owners: the truncation lands inside the
+//!   scan. Per round: the scan yields exactly its M intents (the
+//!   span-yield counter — a vacuous round fails), no intent leaked, every
+//!   key reads back at `S`, every owner's `intent_count == 0` (I-COUNT
+//!   exact; §7.3 + I-TRUNC).
 //! - `commit_between_sync_and_ingest_{on,off}`: the spy's `ingest_sorted`
 //!   runs a pre-hook that commits through the real commit thread and waits
 //!   for its ack, so an On (phase 1) or Off (phase 2) commit strictly lands
@@ -21,8 +26,8 @@ mod common;
 
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use nucleus_kv::fault::Fault;
@@ -64,16 +69,100 @@ fn ikey(suffix: &str) -> Key {
 /// A one-shot hook, run before the wrapped call is forwarded to the fault.
 type Hook = Box<dyn FnOnce() + Send>;
 
+// ---- the start-gate (the C-T6e1fix gate's M-1) --------------------------------
+
+/// The resolver thread's name: the start-gate parks exactly this thread's
+/// writes. The main thread's intent placements and the commit thread's
+/// batches (`nucleus-commit`) run through the same `SpyKv::write` seam and
+/// must never park.
+const RESOLVER_THREAD: &str = "t6e1-race-resolver";
+
+/// The start-gate's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    /// Writes pass: before the first arming, and after the release.
+    Open,
+    /// Armed (before a round's commits): the resolver's next write parks.
+    Armed,
+    /// `set_slow(true)` ran: the parked write is released by the next KV
+    /// snapshot the spy takes — the ingest's plan-scan state capture — so
+    /// a released write can never land inside the state that snapshot
+    /// reads.
+    ReleaseAtSnapshot,
+}
+
+/// A one-shot pause on the resolver's next KV write (its removal batches
+/// go through the spy). Armed before each round's commits, it keeps the
+/// hot-spinning resolver from draining the round's intents before the
+/// ingest's plan scan captures its snapshot — without it the resolver
+/// wins that start in almost every round, the plan comes up empty, and
+/// the §7.4 window never opens (the C-T6e1fix gate's M-1: the IM-B kill
+/// was 3/5, not deterministic). `set_slow(true)` hands the gate its
+/// release and the capture fires it; from there the resolver's removals
+/// and §7.4 truncations land inside the open scan window.
+struct StartGate {
+    st: Mutex<GateState>,
+    open: Condvar,
+}
+
+impl StartGate {
+    fn new() -> StartGate {
+        StartGate {
+            st: Mutex::new(GateState::Open),
+            open: Condvar::new(),
+        }
+    }
+
+    /// Parks the resolver's next write until the release.
+    fn arm(&self) {
+        *self.st.lock().expect("start gate") = GateState::Armed;
+    }
+
+    /// `set_slow(true)`: the ingest step begins, so every resolver write
+    /// parks until the next snapshot the spy takes. Unconditional, so a
+    /// resolver write arriving in the µs between `set_slow(true)` and the
+    /// capture parks too (an `Armed`-only transition would leave that
+    /// gap open).
+    fn release_at_next_snapshot(&self) {
+        *self.st.lock().expect("start gate") = GateState::ReleaseAtSnapshot;
+    }
+
+    /// Runs inside `SpyKv::snapshot`, strictly after the state capture:
+    /// opens the gate. Between `set_slow(true)` and here the resolver (if
+    /// it reached its write) stays parked, so the capture always sees all
+    /// of the round's intents.
+    fn release_if_pending(&self) {
+        let mut st = self.st.lock().expect("start gate");
+        if *st == GateState::ReleaseAtSnapshot {
+            *st = GateState::Open;
+            drop(st);
+            self.open.notify_all();
+        }
+    }
+
+    /// `SpyKv::write` on the resolver thread: park while the gate holds.
+    fn park(&self) {
+        let mut st = self.st.lock().expect("start gate");
+        while *st != GateState::Open {
+            st = self.open.wait(st).expect("start gate");
+        }
+    }
+}
+
 /// An `OrderedKv` wrapper over `Arc<Fault<MemKv>>` (the `t6e1_ingest.rs`
 /// spy, slimmed to this file's seams): a `slow` flag that makes every
-/// snapshot's scans sleep between items (the resolver race), and a one-shot
+/// snapshot's scans sleep between items (the resolver race), a one-shot
 /// pre-hook on `ingest_sorted` (the commit that lands in the
-/// sync→ingest window). Test-local; `nucleus-kv` is untouched.
+/// sync→ingest window), and — C-T6e1fix2 — the start-gate that parks the
+/// resolver's next write plus the span-yield counter the race test
+/// asserts. Test-local; `nucleus-kv` is untouched.
 #[derive(Clone)]
 struct SpyKv {
     fault: Arc<Fault<MemKv>>,
     slow: Arc<AtomicBool>,
     pre_ingest: Arc<Mutex<Option<Hook>>>,
+    gate: Arc<StartGate>,
+    span_yields: Arc<AtomicUsize>,
 }
 
 impl SpyKv {
@@ -82,11 +171,33 @@ impl SpyKv {
             fault: Arc::new(Fault::new(MemKv::new(), || Ok(MemKv::new()))),
             slow: Arc::new(AtomicBool::new(false)),
             pre_ingest: Arc::new(Mutex::new(None)),
+            gate: Arc::new(StartGate::new()),
+            span_yields: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// Sets the slow flag. Setting it also begins the ingest step: the
+    /// start-gate's release is handed to the next snapshot the spy takes
+    /// (the plan scan's state capture) and the span-yield counter is
+    /// zeroed for the round.
     fn set_slow(&self, slow: bool) {
         self.slow.store(slow, Ordering::SeqCst);
+        if slow {
+            self.gate.release_at_next_snapshot();
+            self.span_yields.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Arms the start-gate: the resolver's next write parks until the
+    /// release. Item 1 does this before each round's commits.
+    fn arm_start_gate(&self) {
+        self.gate.arm();
+    }
+
+    /// Intent-shaped items yielded by slowed scans since the last
+    /// `set_slow(true)` — the plan scan's span for the round.
+    fn span_yields(&self) -> usize {
+        self.span_yields.load(Ordering::SeqCst)
     }
 
     fn set_pre_ingest(&self, hook: Hook) {
@@ -98,6 +209,16 @@ impl OrderedKv for SpyKv {
     type Snap = SlowSnap;
 
     fn write(&self, batch: Batch, sync: Durability) -> Result<()> {
+        // The start-gate parks only the resolver thread's writes; every
+        // other writer (the main thread's placements, the commit thread's
+        // batches) passes — arming happens before the round's commits, so
+        // a parked removal always holds a key this round is done with.
+        if std::thread::current()
+            .name()
+            .is_some_and(|n| n == RESOLVER_THREAD)
+        {
+            self.gate.park();
+        }
         self.fault.write(batch, sync)
     }
 
@@ -106,9 +227,16 @@ impl OrderedKv for SpyKv {
     }
 
     fn snapshot(&self) -> Self::Snap {
+        let inner = self.fault.snapshot();
+        // The armed start-gate opens here, strictly after the state
+        // capture: the resolver's parked write cannot land inside the
+        // snapshot the plan scan is about to read, so every round's plan
+        // is exactly its M intents.
+        self.gate.release_if_pending();
         SlowSnap {
-            inner: self.fault.snapshot(),
+            inner,
             slow: Arc::clone(&self.slow),
+            span_yields: Arc::clone(&self.span_yields),
         }
     }
 
@@ -139,10 +267,12 @@ impl OrderedKv for SpyKv {
 /// A snapshot whose scans sleep between items while the `slow` flag is set
 /// (point reads are never slowed): the ingest's plan scan holds the view
 /// open for ~2 ms per span item, which is the window the resolver thread
-/// interleaves in.
+/// interleaves in. While slowed, intent-shaped items a scan yields are
+/// counted in the spy's span-yield counter.
 struct SlowSnap {
     inner: <MemKv as OrderedKv>::Snap,
     slow: Arc<AtomicBool>,
+    span_yields: Arc<AtomicUsize>,
 }
 
 impl Snapshot for SlowSnap {
@@ -158,6 +288,7 @@ impl Snapshot for SlowSnap {
         Box::new(SlowScan {
             inner: self.inner.scan(range, reverse),
             slow: Arc::clone(&self.slow),
+            span_yields: Arc::clone(&self.span_yields),
             yielded: false,
         })
     }
@@ -165,9 +296,14 @@ impl Snapshot for SlowSnap {
 
 /// The scan iterator that sleeps between two items while `slow` is set (the
 /// flag is re-read at every gap, so clearing it unslows a scan mid-flight).
+/// Intent-shaped items yielded under the flag are counted: the plan scan's
+/// span is exactly the round's M intents, and a round whose span came up
+/// short (or empty — a vacuous round) must fail the test, not pass
+/// silently.
 struct SlowScan<'a> {
     inner: Box<dyn Iterator<Item = Result<(Key, Value)>> + 'a>,
     slow: Arc<AtomicBool>,
+    span_yields: Arc<AtomicUsize>,
     yielded: bool,
 }
 
@@ -176,10 +312,18 @@ impl Iterator for SlowScan<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let item = self.inner.next()?;
-        if self.yielded && self.slow.load(Ordering::SeqCst) {
+        let slow = self.slow.load(Ordering::SeqCst);
+        if slow && self.yielded {
             std::thread::sleep(SCAN_SLEEP);
         }
         self.yielded = true;
+        if slow {
+            if let Ok((key, _)) = &item {
+                if matches!(parse_key(key), Some((_, Entry::Intent))) {
+                    self.span_yields.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
         Some(item)
     }
 }
@@ -254,8 +398,8 @@ fn intent_keys(dump: &[(Key, Value)]) -> Vec<Key> {
 
 // ---- item 1: the resolver-vs-ingest race --------------------------------------
 
-/// Fresh intents per round, per owner (`intent_count` exactness needs more
-/// than one intent racing both removers).
+/// One fresh intent per owner, M owners per round (`intent_count`
+/// exactness needs more than one intent racing both removers).
 const M: usize = 6;
 
 /// Rounds of: commit M fresh intents (On), take `S`, ingest them with the
@@ -277,7 +421,7 @@ fn resolver_vs_ingest_race() {
         let stop = Arc::clone(&stop);
         let err = Arc::clone(&resolver_err);
         ok(std::thread::Builder::new()
-            .name("t6e1-race-resolver".into())
+            .name(RESOLVER_THREAD.into())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     if let Err(e) = Resolver::run_once(&core) {
@@ -295,6 +439,12 @@ fn resolver_vs_ingest_race() {
         if let Some(e) = resolver_err.lock().expect("resolver err slot").take() {
             panic!("round {round}: the resolver failed: {e:?}");
         }
+        // Park the resolver's next KV write before the round's commits:
+        // without the start-gate the hot-spinning resolver drains the
+        // round's queue before `take_snapshot`, the plan scan then has an
+        // empty span and the §7.4 window never opens (the C-T6e1fix
+        // gate's M-1).
+        rig.kv.arm_start_gate();
         // M fresh intents, committed On; fresh keys per round so every
         // round's span holds exactly its own M intents.
         let mut keys: Vec<Key> = Vec::with_capacity(M);
@@ -334,6 +484,16 @@ fn resolver_vs_ingest_race() {
         if let Some(e) = resolver_err.lock().expect("resolver err slot").take() {
             panic!("round {round}: the resolver failed during the ingest: {e:?}");
         }
+
+        // The span-yield counter: the plan scan yielded exactly the
+        // round's M intents. A vacuous round — the resolver draining the
+        // span before the capture, the old silent-pass mode — fails here
+        // instead.
+        assert_eq!(
+            rig.kv.span_yields(),
+            M,
+            "round {round}: the plan scan's span must be exactly the round's M intents"
+        );
 
         // No intent leaked: the ingest's resolution pass and the async
         // resolver together removed every intent of the round, exactly once.
