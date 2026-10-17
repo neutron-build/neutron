@@ -375,6 +375,168 @@ fn t6c_programs_are_a_pure_function_of_the_seed() {
     );
 }
 
+// ----- C-T6d2fix: the RC read-back position (FU-3, gate F-3/GA5) ---------------
+
+/// One committed RC txn that replaces `big` of `pk` with a fresh 20 KB
+/// value (three chunks) through the same `Db` calls the harness's SetBig
+/// makes — the concurrent writer of the FU-3 shape.
+fn fu3_replace_big(rig: &diff::runner::Rig, pk: i64, tag: u8) {
+    use nucleus_txn::commit::SyncCommit;
+    use nucleus_txn::locks::RelLockMode;
+    use nucleus_txn::txn::Isolation;
+
+    let txn = rig.db.core.begin(Isolation::ReadCommitted);
+    let st = nucleus_catalog::Stmt::new(&txn, rig.db.core.visible_ts()).expect("the replace stmt");
+    let h = rig
+        .db
+        .open_table(&st, rig.t_oid, RelLockMode::RowExclusive)
+        .expect("open t for the replace");
+    let attnum = h
+        .schema
+        .live_columns()
+        .find(|c| c.name == "big")
+        .map(|c| c.attnum)
+        .expect("big is live");
+    let applied = rig
+        .db
+        .update_with(
+            &st,
+            &h,
+            &[Some(nucleus_codec::Value::Int8(pk))],
+            &[(
+                attnum,
+                Some(nucleus_codec::row::Datum::Inline(diff::big_blob(tag, 20_000))),
+            )],
+        )
+        .expect("the replace applies");
+    assert!(applied);
+    rig.db
+        .core
+        .commit(txn, SyncCommit::On)
+        .expect("the replace commits");
+}
+
+/// C-T6d2fix FU-3 (gate F-3, mutant GA5): the RC read-back position,
+/// pinned in the harness's own shape. An RC UPDATE's statement snapshot
+/// is taken at S; a concurrent replace of a toasted value commits above
+/// S; the update's EPQ re-base carries the replace's `big` pointer into
+/// the txn's own row version. The harness's read-back — a second
+/// statement of the same txn at `visible_ts` — must return the own row
+/// whole (§5: the carried chunks are visible at `visible_ts`, and the
+/// own intent shadows every foreign version), which is exactly why the
+/// read-back sits there and not at the statement's snapshot: the same
+/// read at S is XX001 (§5's read-at-t rule — the carried chunks are
+/// invisible above S), pinned by the raw leg (b). Mutant GA5 (both RC
+/// read-backs reverted to `st.snapshot()`) fails leg (a): the read-back
+/// XX001s and aborts a legal txn the engine never corrupted.
+#[test]
+fn t6c_rc_read_back_after_epq_carry() {
+    let mut rig = diff::runner::Rig::new(5);
+    rig.setup();
+    let rig = &rig;
+
+    // (a) The harness leg: the scripted UPDATE of `a` (`choice` 0
+    // resolves to the first live non-pk column, an int8), with the gap
+    // landing the concurrent replace above the statement's snapshot.
+    let av = nucleus_codec::Value::Int8(0x5eed_0001);
+    let mut s = diff::runner::Session::begin(rig, 1, 0, 0, diff::Level::ReadCommitted);
+    let applied = s
+        .op_update_set_with_gap(0, 0, av.clone(), nucleus_codec::Value::Text("gap".into()), || {
+            fu3_replace_big(rig, 0, 9);
+        })
+        .expect("the update applies and the read-back returns the row");
+    assert!(applied);
+    s.commit().expect("the read-back left a committable txn");
+    // The recorded effect is the own row whole: `a` is the set constant
+    // and `big` is the concurrent replace's full 20 KB value, detoasted
+    // from the carried pointer's chunks.
+    let rec = rig
+        .rec
+        .drain()
+        .txns
+        .into_iter()
+        .find(|t| t.session == 1)
+        .expect("the session's record");
+    let op = rec
+        .ops
+        .iter()
+        .find(|o| o.kind == diff::OpKind::UpdateSet)
+        .expect("the UpdateSet record");
+    assert_eq!(op.out, diff::OpOut::Applied(true), "{:?}", op.out);
+    let diff::OpDetail::UpdateSet {
+        new_row: Some(row), ..
+    } = &op.detail
+    else {
+        panic!("the read-back recorded no row: {:?}", op.detail);
+    };
+    let big = row
+        .iter()
+        .find(|(attnum, _)| *attnum == 4)
+        .expect("big in the read-back row");
+    assert_eq!(big.1, Some(diff::big_blob(9, 20_000)), "the carried value");
+    let a = row
+        .iter()
+        .find(|(attnum, _)| *attnum == 2)
+        .expect("a in the read-back row");
+    assert_eq!(a.1, Some(av), "the set constant");
+
+    // (b) §5's rule, documented raw: the same shape hand-driven — an RC
+    // writer at S2, the concurrent replace committed above S2, the
+    // update's EPQ re-base carrying its pointer — and the reads split.
+    // At S2 the own intent carries a pointer whose chunks committed
+    // above S2, invisible there: XX001. At `visible_ts` the same
+    // statement reads the own row whole. That split is §5's read-at-t
+    // rule, and it is exactly the read the GA5 mutant would have the
+    // harness read-back make.
+    use nucleus_txn::locks::RelLockMode;
+    use nucleus_txn::txn::Isolation;
+
+    let w = rig.db.core.begin(Isolation::ReadCommitted);
+    let s2 = rig.db.core.visible_ts();
+    fu3_replace_big(rig, 1, 12);
+    let st = nucleus_catalog::Stmt::new(&w, s2).expect("the writer statement");
+    let h = rig
+        .db
+        .open_table(&st, rig.t_oid, RelLockMode::RowExclusive)
+        .expect("open t for the writer");
+    let applied = rig
+        .db
+        .update_with(
+            &st,
+            &h,
+            &[Some(nucleus_codec::Value::Int8(1))],
+            &[(
+                2,
+                Some(nucleus_codec::row::Datum::Inline(nucleus_codec::Value::Int8(
+                    0x5eed_0002,
+                ))),
+            )],
+        )
+        .expect("the update applies (the EPQ base detoasts at its own ts)");
+    assert!(applied);
+    // The read at S2: corruption by §5 — a missing chunk, never a
+    // partial value.
+    let st_s = nucleus_catalog::Stmt::new(&w, s2).expect("the at-S statement");
+    let err = rig
+        .db
+        .get(&st_s, &h, &[Some(nucleus_codec::Value::Int8(1))])
+        .expect_err("the same read at S2 is XX001 by §5's read-at-t rule");
+    assert_eq!(err.sqlstate(), "XX001", "{err:?}");
+    // The read at `visible_ts`: the own row whole — the harness rule.
+    let st_v = nucleus_catalog::Stmt::new(&w, rig.db.core.visible_ts()).expect("the read-back stmt");
+    let row = rig
+        .db
+        .get(&st_v, &h, &[Some(nucleus_codec::Value::Int8(1))])
+        .expect("the read-back returns the own row")
+        .expect("the row is there");
+    assert_eq!(
+        row[3],
+        Some(nucleus_codec::row::Datum::Inline(diff::big_blob(12, 20_000))),
+        "big is the carried pointer's whole value"
+    );
+    rig.db.core.abort(w).expect("abort the writer");
+}
+
 // ----- the checker can fail ---------------------------------------------------
 
 /// The checker is not vacuous: a small clean run, corrupted one leg at

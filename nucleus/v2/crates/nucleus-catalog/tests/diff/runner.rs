@@ -708,6 +708,23 @@ impl<'r> Session<'r> {
         kind: OpKind,
         body: impl FnOnce(&Session<'r>, &Stmt<'_>, &mut OpRec) -> Result<T, nucleus_catalog::DbError>,
     ) -> Result<T, String> {
+        self.exec_with_gap(pos, kind, || {}, body)
+    }
+
+    /// [`Session::exec`]'s shape with a `gap` run after the statement's
+    /// snapshot is pinned and before the op body — the one interleaving
+    /// point a deterministic test must control to reproduce what the
+    /// soak's threads produce by scheduling (C-T6d2fix FU-3: a commit
+    /// landing above an RC statement's snapshot, between the snapshot
+    /// and the row op that EPQs onto it). A no-op gap changes nothing:
+    /// no bookkeeping observes it.
+    fn exec_with_gap<T>(
+        &mut self,
+        pos: usize,
+        kind: OpKind,
+        gap: impl FnOnce(),
+        body: impl FnOnce(&Session<'r>, &Stmt<'_>, &mut OpRec) -> Result<T, nucleus_catalog::DbError>,
+    ) -> Result<T, String> {
         assert!(!self.done, "statement on a finished session");
         let mut op = OpRec {
             kind,
@@ -758,6 +775,10 @@ impl<'r> Session<'r> {
         } else {
             snapshot.0
         };
+        // The FU-3 gap: the statement's snapshot is pinned, the body
+        // has not run — where a test lands a concurrent commit above
+        // the snapshot, before the row op reads.
+        gap();
         let r = body(self, &st, &mut op);
         op.end = self.rig.rec.tick();
         match r {
@@ -1355,6 +1376,27 @@ impl<'r> Session<'r> {
         tv: Value,
     ) -> Result<bool, String> {
         self.exec(0, OpKind::UpdateSet, move |s, st, op| {
+            s.update_set(st, op, pk, choice, av.clone(), tv.clone())
+        })
+    }
+
+    /// C-T6d2fix FU-3 (gate F-3/GA5): `op_update_set` with a **gap** — a
+    /// callback run between the statement's registered snapshot and the
+    /// op body, where the test lands a concurrent replace of a toasted
+    /// value committed above the statement's snapshot (the interleaving
+    /// the soak's threads produce by scheduling). The op is the real
+    /// `update_set`, read-back included, so the RC read-back position
+    /// (`visible_ts`, never the statement's snapshot) is pinned through
+    /// the exact call-site the workload uses.
+    pub fn op_update_set_with_gap(
+        &mut self,
+        pk: i64,
+        choice: u32,
+        av: Value,
+        tv: Value,
+        gap: impl FnOnce(),
+    ) -> Result<bool, String> {
+        self.exec_with_gap(0, OpKind::UpdateSet, gap, move |s, st, op| {
             s.update_set(st, op, pk, choice, av.clone(), tv.clone())
         })
     }
