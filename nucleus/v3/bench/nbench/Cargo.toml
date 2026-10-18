@@ -1,0 +1,15 @@
+[package]
+name = "nbench"
+description = "NBench harness: orchestrates competitor baselines, digest checks, stats and reports (PLAN-v3 §5, card B-0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# No dependencies by design (card B-0 names none): everything below is std-only,
+# so the harness cannot grow transitive licence surface of its own.
+[dependencies]
+
+[lints]
+workspace = true

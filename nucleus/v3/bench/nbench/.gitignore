@@ -1,0 +1,6 @@
+# Runtime artifacts, never evidence:
+work/
+data/
+# Transient smoke outputs and their recorded first-run digests:
+results/smoke/
+workloads/*/expected/*-smoke.txt

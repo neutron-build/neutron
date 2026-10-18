@@ -1,0 +1,4 @@
+# Pinned competitor images (card B-0). Recorded 2026-10-17 via
+# `podman inspect --format '{{index .RepoDigests 0}}'`.
+# `latest` was resolved on 2026-10-17; the digest pin below is what runs.
+docker.io/qdrant/qdrant:latest@sha256:0e8273b9130ca3b0dd9dcfaa8f55342066711f8aaeb2aa072e53344c42ecf57f

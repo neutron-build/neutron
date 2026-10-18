@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Every podman call made by nbench scripts goes through this wrapper.
+#
+# Agent sessions run under T3 Code with NoNewPrivs set, which breaks the
+# setuid helpers plain rootless podman needs; running podman through the
+# user systemd manager avoids the flag entirely (card B-0 environment
+# note, verified 2026-10-17).
+exec systemd-run --user --wait --pipe --quiet podman "$@"
