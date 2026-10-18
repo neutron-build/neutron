@@ -95,7 +95,14 @@ export class SandboxExecutor implements AgentExecutor {
       this.#options,
       "POST",
       `/v1/runs/${this.runId}/exec`,
-      JSON.stringify({ cmd: command, timeoutSec, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}) }),
+      JSON.stringify({
+        cmd: command,
+        timeoutSec,
+        ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+        // The daemon applies it to the command through a private env-file;
+        // omitting it made ExecOptions.env a silent no-op on this executor.
+        ...(options.env !== undefined ? { env: options.env } : {}),
+      }),
       { "content-type": "application/json" },
       requestTimeoutMs,
     );

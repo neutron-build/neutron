@@ -455,3 +455,23 @@ test("a malformed exit frame surfaces as a problem, not a raw SyntaxError", asyn
     },
   );
 });
+
+test("SandboxExecutor.exec forwards per-exec env in the request body", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response("event: exit\ndata: {\"exitCode\":0}\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as typeof globalThis.fetch;
+  const sandbox = SandboxExecutor.attach("01RUN", { baseURL: "http://127.0.0.1:7070", token: "secret", fetch });
+
+  await sandbox.exec("test -n \"$PREVIEW_URL\"", { env: { PREVIEW_URL: "http://preview.example.com/" } });
+  assert.deepEqual(bodies[0]?.env, { PREVIEW_URL: "http://preview.example.com/" });
+  assert.equal(bodies[0]?.cmd, "test -n \"$PREVIEW_URL\"");
+
+  // No env option: no env field, the body every earlier exec sent.
+  await sandbox.exec("true");
+  assert.equal("env" in (bodies[1] ?? {}), false);
+});
