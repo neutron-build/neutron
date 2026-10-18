@@ -36,6 +36,7 @@ fn cd(attnum: u16, name: &str, ty: KeyType) -> ColumnDef {
         name: name.to_string(),
         ty,
         not_null: false,
+        not_null_since: 0,
         dropped: false,
         missing: None,
     }
@@ -492,12 +493,16 @@ fn col_spec() -> BoxedStrategy<ColumnDef> {
                 vec(any::<char>(), 0..=6),
             )
                 .prop_map(move |(missing, not_null, dropped, name)| {
-                    // §3: DROP COLUMN clears not_null.
+                    // §3: DROP COLUMN clears not_null. `not_null_since`
+                    // is normalized by `TableSchema::new` (the create
+                    // version, 1) — the DDL helpers own every other
+                    // value.
                     ColumnDef {
                         attnum: 0, // assigned 1..=n below
                         name: name.into_iter().collect(),
                         ty: ty.clone(),
                         not_null: not_null && !dropped,
+                        not_null_since: 0,
                         dropped,
                         missing,
                     }

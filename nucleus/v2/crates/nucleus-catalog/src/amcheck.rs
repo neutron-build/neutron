@@ -17,7 +17,13 @@
 //!
 //! - **I-ROWFMT**: each row visible at `at` decodes under the def at
 //!   `at` — which includes `schema_version <= def.version` (the §3
-//!   decode rule) — and its key re-encodes: the pk columns of a pk table
+//!   decode rule) and §2/§3's era-scoped NOT NULL clause: the decode
+//!   runs through [`TableSchema::decode_row`], the same single code
+//!   path the DML/EPQ reads use (`decode_row_at_era` in `db.rs`), so a
+//!   pre-constraint NULL (a row whose header version is below the
+//!   installing DDL's `not_null_since`) is as legal here as it is on
+//!   the read path, and a NULL at or after it is a violation here too —
+//!   and its key re-encodes: the pk columns of a pk table
 //!   (§3), or the rowid of a hidden-rowid table (in the key only, never
 //!   a column, re-encoded from the key itself).
 //! - **I-IDX**: each `Public` index with `built_at <= at`: the visible
@@ -126,6 +132,10 @@ pub fn check_table<K: OrderedKv>(
 
     // ---- I-ROWFMT ---------------------------------------------------------
 
+    // §8 through §4's decode: `TableSchema::decode_row` is the one rule
+    // (the NOT NULL era clause included — a shared helper, never a
+    // second copy), so amcheck's verdict on a row can never drift from
+    // the read path's.
     let rows = visible_rows(&db.core, rel.storage_id, &ctx)?;
     let mut decoded: Vec<(Key, Vec<Option<Datum>>)> = Vec::with_capacity(rows.len());
     for (key, bytes) in &rows {

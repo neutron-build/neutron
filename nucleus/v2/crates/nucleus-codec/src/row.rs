@@ -14,11 +14,16 @@
 //! written under, dropped included; dropped attnums are written NULL.
 //! Value bytes are lossless (§2.1, [`value`]): unlike the key encoding
 //! (C-Q3s §8.1) they round-trip value representations. Trailing bytes,
-//! short datums, unknown tags, undecodable values, or a NULL bit on a
-//! live NOT NULL attnum `<= natts` are an error, never a panic (XX001).
-//! [`TableSchema`] (§3, [`schema`]) is the definition these decode
-//! against: its bytes, the pinned §3.1 type tags and the pure DDL
-//! helpers that evolve it.
+//! short datums, unknown tags and undecodable values are an error,
+//! never a panic (XX001). So is a NULL bit on an attnum that is NOT
+//! NULL **and** was already NOT NULL when the row was encoded: the
+//! constraint binds per column from `not_null_since` (§3), and
+//! `encode_row` refuses such a NULL, so a stray one at a row header
+//! version `>= not_null_since` is corruption — while a NULL that was
+//! legal at the row's own era (the header version is below the version
+//! that installed the constraint) is served. [`TableSchema`] (§3,
+//! [`schema`]) is the definition these decode against: its bytes, the
+//! pinned §3.1 type tags and the pure DDL helpers that evolve it.
 
 mod schema;
 mod value;
@@ -37,6 +42,16 @@ pub struct ColumnDef {
     pub name: String,
     pub ty: KeyType,
     pub not_null: bool,
+    /// The def version at which the constraint (last) came into force:
+    /// 1 for a CREATE TABLE NOT NULL column, the DDL's new version for
+    /// ADD COLUMN ... NOT NULL and SET NOT NULL, reset to 0 by DROP NOT
+    /// NULL (a re-SET after a drop takes the newer version — rows
+    /// written while the constraint was dropped may legally carry a
+    /// NULL). The decode rule's era marker: a NULL bit on this column
+    /// of a row whose header version is `>= not_null_since` is XX001;
+    /// below it the NULL predates the constraint and is served. `0`
+    /// whenever `not_null` is false; never above the def's `version`.
+    pub not_null_since: u32,
     pub dropped: bool,
     /// `ADD COLUMN` default, evaluated once at DDL time; served for rows
     /// written before the attnum existed (§3 decode rule).
@@ -204,6 +219,15 @@ pub fn row_header(bytes: &[u8]) -> Result<RowHeader, RowError> {
 /// when it does not. Dropped attnums are skipped (their bytes, if any,
 /// stay consumed). One entry per live column is returned, mirroring
 /// `encode_row`'s `live`.
+///
+/// The NOT NULL check is era-scoped per column (§2/§3): a NULL bit on
+/// attnum `a` is [`RowError::Corrupt`] iff `a.not_null` **and** the row's
+/// header version `v >= a.not_null_since` — rows written at or after the
+/// version that installed the constraint went through `encode_row`'s
+/// refusal, so a stray NULL there is real corruption; a row from before
+/// it may legally carry the pre-constraint NULL. This one function is
+/// the rule's single home: the DML/EPQ read paths (`decode_row_at_era`
+/// in `nucleus-catalog`) and amcheck's I-ROWFMT both decode through it.
 pub fn decode_row(
     version: u32,
     cols: &[ColumnDef],
@@ -244,7 +268,9 @@ pub fn decode_row(
         if attnum > natts {
             out.push(col.missing.clone().map(Datum::Inline));
         } else if is_null_bit(nullmap, attnum - 1) {
-            if col.not_null {
+            // §2's era rule: the constraint binds this row only from
+            // the version that installed it (`v >= not_null_since`).
+            if col.not_null && header.schema_version >= col.not_null_since {
                 return Err(RowError::Corrupt("NULL bit on a NOT NULL column"));
             }
             out.push(None);

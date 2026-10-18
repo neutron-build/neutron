@@ -56,6 +56,7 @@ fn col(ty: nucleus_codec::KeyType) -> ColumnDef {
         name: "c".to_string(),
         ty,
         not_null: false,
+        not_null_since: 0,
         dropped: false,
         missing: None,
     }
@@ -118,6 +119,7 @@ fn wide_row(line: &WideLine) -> (Vec<ColumnDef>, Vec<Option<Datum>>) {
             name: format!("c{}", i + 1),
             ty: KeyType::Bool,
             not_null: false,
+            not_null_since: 0,
             dropped: i + 1 == line.dropped,
             missing: None,
         })

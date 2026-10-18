@@ -21,6 +21,7 @@ fn col(ty: KeyType) -> ColumnDef {
         name: "c".to_string(),
         ty,
         not_null: false,
+        not_null_since: 0,
         dropped: false,
         missing: None,
     }
