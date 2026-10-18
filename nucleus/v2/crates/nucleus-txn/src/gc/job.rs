@@ -430,9 +430,11 @@ impl<K: OrderedKv> GcJob<K> {
         drop(view);
         // §9.3 I/O budget: one unit per stored entry scanned (the intent
         // plan) and one per planned removal (each writes a batch keyed on
-        // its intent).
+        // its intent). Charged to the drop-cleanup job — the only driver
+        // of retirement (C-B1b) — so its D4 budget pays for its own work
+        // (the card's "drop-cleanup intent plan" charge site).
         self.core
-            .job_units(JobKind::Gc, scanned + plan.len() as u64);
+            .job_units(JobKind::DropCleanup, scanned + plan.len() as u64);
         for r in &plan {
             remove_intent(&self.core, &r.key, r.prefix.as_deref(), r.owner, r.mode)?;
         }
@@ -441,8 +443,9 @@ impl<K: OrderedKv> GcJob<K> {
         let mut batch = Batch::default();
         batch.delete_range(lo.to_vec(), hi.to_vec());
         self.core.write(batch, Durability::No)?;
-        // One unit per DeleteRange (§9.3 charge sites).
-        self.core.job_units(JobKind::Gc, 1);
+        // One unit per DeleteRange (§9.3 charge sites; the drop-cleanup
+        // job's budget, as above).
+        self.core.job_units(JobKind::DropCleanup, 1);
         // §9.3 probe (C-B1b): the range's DeleteRange batch is written
         // (the registered view is closed; only this job's step serialiser
         // may be held).
