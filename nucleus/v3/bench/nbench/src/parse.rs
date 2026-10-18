@@ -16,7 +16,8 @@ use std::path::Path;
 pub struct ParsedRun {
     /// Named numeric metrics (tps, p99_ms, ...).
     pub metrics: Vec<(String, f64)>,
-    /// Optional digest the tool itself printed (speedtest1 `--sha3`).
+    /// Optional digest the tool itself printed (speedtest1's
+    /// `--verify` Verification Hash line).
     pub digest: Option<String>,
 }
 

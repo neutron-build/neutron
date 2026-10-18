@@ -52,7 +52,8 @@ implement card B-0 Work item 3 exactly.
 3. Digest: `workloads/<row>/digest.sh` hashes a result set; the first
    run records the expectation, later runs must match or the row is
    VOID (rule 4). Tools that self-report content digests (speedtest1
-   `--sha3`) are additionally cross-checked run-to-run.
+   `--verify` Verification Hash) are additionally cross-checked
+   run-to-run.
 4. Stats: median + deterministic 95% bootstrap CI over the warm runs
    (rule 5), seeds derived from row+series+metric identities.
 5. Provenance: host, image digests, container limits, versions, params

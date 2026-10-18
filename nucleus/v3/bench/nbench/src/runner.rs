@@ -687,7 +687,8 @@ pub fn run_row(
     stop_system(system);
 
     // Cross-run digest equality: when the tool itself prints a per-run
-    // content digest (speedtest1 --sha3), every run of a series must show
+    // content digest (speedtest1 --verify Verification Hash), every run
+    // of a series must show
     // the same digest, or the row is void (§5.2 rule 4).
     for (series, _mode, runs) in &executions {
         let digests: Vec<&str> = runs.iter().filter_map(|r| r.digest.as_deref()).collect();

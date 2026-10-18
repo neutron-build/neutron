@@ -23,7 +23,7 @@ pub enum Parser {
     Sysbench,
     /// memtier_benchmark (Totals block).
     Memtier,
-    /// SQLite speedtest1 (TOTAL wall time, --sha3 digest line).
+    /// SQLite speedtest1 (TOTAL wall time, --verify hash line).
     Speedtest1,
     /// Vector search helper output (already JSON metrics).
     VectorSearch,
