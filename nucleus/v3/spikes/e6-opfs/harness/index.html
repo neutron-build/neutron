@@ -1,0 +1,140 @@
+<!doctype html>
+<!-- E6 OPFS spike page (card X-6; PLAN-v3 §4 E6). Served by run.mjs over
+     http://127.0.0.1 and driven with page.evaluate. Exposes window.e6:
+     a thin bridge to a per-database worker (worker.js), plus the Web Lock
+     session API used by T4. The lock is held on the main thread (available
+     in all three engines) while the storage lives in the worker. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>E6 OPFS spike</title>
+  </head>
+  <body>
+    <script type="module">
+      const workers = new Map(); // db name -> Worker
+      const releasers = new Map(); // db name -> () => void (releases the held Web Lock)
+      let next_id = 0;
+
+      function rpc(worker, t, args) {
+        return new Promise((resolve, reject) => {
+          const id = next_id++;
+          worker.addEventListener('message', function on_msg(ev) {
+            if (ev.data.id !== id) return;
+            worker.removeEventListener('message', on_msg);
+            if (ev.data.ok) resolve(ev.data.result);
+            else reject(new Error(ev.data.error));
+          });
+          worker.postMessage({ id, t, ...args });
+        });
+      }
+
+      function worker_for(name) {
+        let worker = workers.get(name);
+        if (!worker) {
+          worker = new Worker('/worker.js', { type: 'module' });
+          workers.set(name, worker);
+        }
+        return worker;
+      }
+
+      async function drop_worker(name) {
+        const worker = workers.get(name);
+        if (worker) {
+          worker.terminate();
+          workers.delete(name);
+        }
+      }
+
+      window.e6 = {
+        // -- storage bridge (worker.js owns the OPFS handles) --
+        async open(name) {
+          return rpc(worker_for(name), 'open', { name });
+        },
+        // Handle release after a tab/process kill is asynchronous on the
+        // browser side, so the first open in a fresh tab can transiently
+        // fail. Everything in the harness opens through this.
+        async open_retry(name, tries = 12, delay_ms = 250) {
+          let last_error;
+          for (let i = 0; i < tries; i++) {
+            try {
+              return await window.e6.open(name);
+            } catch (error) {
+              last_error = error;
+              await new Promise((resolve) => setTimeout(resolve, delay_ms));
+            }
+          }
+          throw last_error;
+        },
+        async close(name) {
+          try {
+            await rpc(worker_for(name), 'close', {});
+          } finally {
+            await drop_worker(name);
+          }
+        },
+        async hard_drop(name) {
+          await drop_worker(name); // kill the worker WITHOUT closing handles
+        },
+        async write_pages(name, from, to) {
+          return rpc(worker_for(name), 'write_pages', { from, to });
+        },
+        async read_check(name, from, to) {
+          return rpc(worker_for(name), 'read_check', { from, to });
+        },
+        async flush(name) {
+          return rpc(worker_for(name), 'flush', {});
+        },
+        async append_wal(name, text) {
+          return rpc(worker_for(name), 'append_wal', { text });
+        },
+        async wal_len(name) {
+          return rpc(worker_for(name), 'wal_len', {});
+        },
+        async read_wal(name) {
+          return rpc(worker_for(name), 'read_wal', {});
+        },
+        async bench_write(name, iters) {
+          return rpc(worker_for(name), 'bench_write', { iters });
+        },
+        async bench_flush(name, iters) {
+          return rpc(worker_for(name), 'bench_flush', { iters });
+        },
+
+        // -- Web Locks session (T4): the lock names the database; a tab
+        //    holds it while its worker has the database open. --
+        async locks_supported() {
+          return !!(navigator.locks && navigator.locks.request);
+        },
+        async hold_lock(name) {
+          if (!navigator.locks || !navigator.locks.request) {
+            throw new Error('Web Locks API not available');
+          }
+          if (releasers.has(name)) throw new Error('lock already held by this page');
+          let granted;
+          let release;
+          const granted_promise = new Promise((resolve) => {
+            granted = resolve;
+          });
+          // The callback's returned promise resolves when WE decide to
+          // release; request() itself settles only after that.
+          navigator.locks.request('e6db-' + name, () =>
+            new Promise((resolve) => {
+              granted(Date.now());
+              release = resolve;
+            }),
+          );
+          await granted_promise;
+          releasers.set(name, release);
+          return { held_since: Date.now() };
+        },
+        async release_lock(name) {
+          const release = releasers.get(name);
+          if (!release) throw new Error('lock not held by this page');
+          releasers.delete(name);
+          release();
+          return { released_at: Date.now() };
+        },
+      };
+    </script>
+  </body>
+</html>
