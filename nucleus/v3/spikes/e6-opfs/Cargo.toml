@@ -1,0 +1,31 @@
+[package]
+name = "e6-opfs"
+description = "E6 OPFS spike (PLAN-v3 §4 E6, §3.2 OpfsEnv): wasm32 page file + WAL over OPFS sync access handles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# A cdylib so `wasm-bindgen --target web` (run by harness/run.mjs) produces
+# the JS glue the browser harness loads.
+[lib]
+crate-type = ["cdylib"]
+
+# Deps are exactly the card's list (card X-6 "Work" 1). All MIT/Apache-2.0.
+# wasm-bindgen is pinned to the CLI version installed for this card
+# (0.2.129); js-sys/web-sys are the matching releases.
+[dependencies]
+wasm-bindgen = "=0.2.129"
+js-sys = "0.3.106"
+web-sys = { version = "0.3.106", features = [
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemReadWriteOptions",
+    "FileSystemSyncAccessHandle",
+    "LockManager",
+    "StorageManager",
+] }
+
+[lints]
+workspace = true
