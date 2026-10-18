@@ -576,3 +576,14 @@ mod tests {
         assert_eq!(num_prefix("-1.5e3x"), Some("-1.5e3"));
     }
 }
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+    #[test]
+    fn probe_real_failing_log() {
+        let log = include_str!("fixtures/memtier-run2.txt");
+        let parsed = parse_memtier(log);
+        assert!(parsed.is_ok(), "probe failed: {:?}", parsed.err());
+    }
+}

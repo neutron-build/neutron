@@ -11,12 +11,24 @@ cpu_model: 13th Gen Intel(R) Core(TM) i5-13500H
 cpus: 16
 mem_total: 38.8 GiB
 root_fs: Size  Used Avail
- 1.8T  1.2T  482G
+ 1.8T  1.2T  475G
 podman: podman version 5.4.2
 container_runtime_note: rootless podman via systemd-run --user (PLAN-v3 §5.2 rule 1; card B-0 environment note)
 ```
 
 ## Rows
+
+<!-- source: kv-memtier-valkey8.json -->
+### kv-memtier-valkey8 — valkey8
+
+memtier GET/SET 1:10 against Valkey 8, pipeline 1/16, AOF always/everysec
+
+Status: ok
+
+| config | run | ops_sec | p50_ms | p99_ms | kb_per_sec | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| appendfsync=always pipeline=1 | cold | 106236 | 0.543 | 1.375 | 4507 | n/a | n/a |
+| appendfsync=always pipeline=1 | warm (n=1) | 100397 [100397, 100397] | 0.551 [0.551, 0.551] | 1.703 [1.703, 1.703] | 4260 [4260, 4260] | n/a | n/a |
 
 <!-- source: oltp-pgbench-pg17.json -->
 ### oltp-pgbench-pg17 — postgres17
@@ -27,18 +39,34 @@ Status: ok
 
 | config | run | tps | latency_avg_ms | p50_us | p99_us | p999_us | Nucleus ratio | label |
 |---|---|---|---|---|---|---|---|---|
-| synchronous_commit=on clients=1 | cold | 1538 | 0.647 | 700.0 | 1730 | 5763 | n/a | n/a |
-| synchronous_commit=on clients=1 | warm (n=5) | 2234 [2174, 2543] | 0.446 [0.392, 0.458] | 299.0 [288.0, 321.0] | 1381 [1073, 2221] | 3566 [1857, 5365] | n/a | n/a |
-| synchronous_commit=on clients=16 | cold | 11400 | 1.397 | 1266 | 3902 | 9388 | n/a | n/a |
-| synchronous_commit=on clients=16 | warm (n=5) | 12211 [8928, 12870] | 1.303 [1.236, 1.784] | 1231 [1171, 1587] | 2994 [2699, 4950] | 6619 [5132, 15454] | n/a | n/a |
-| synchronous_commit=on clients=64 | cold | 9227 | 6.918 | 5914 | 19165 | 27589 | n/a | n/a |
-| synchronous_commit=on clients=64 | warm (n=5) | 9643 [8121, 10247] | 6.616 [6.227, 7.864] | 5647 [5261, 6767] | 18223 [17814, 22261] | 26503 [25446, 32666] | n/a | n/a |
-| synchronous_commit=off clients=1 | cold | 1495 | 0.665 | 669.0 | 1101 | 1673 | n/a | n/a |
-| synchronous_commit=off clients=1 | warm (n=5) | 1706 [1580, 1823] | 0.583 [0.546, 0.628] | 580.0 [556.0, 597.0] | 1046 [921.0, 1517] | 1544 [1447, 3124] | n/a | n/a |
-| synchronous_commit=off clients=16 | cold | 15662 | 1.015 | 762.0 | 4728 | 7630 | n/a | n/a |
-| synchronous_commit=off clients=16 | warm (n=5) | 16884 [13926, 17335] | 0.941 [0.916, 1.142] | 748.0 [708.0, 927.0] | 3675 [3556, 4230] | 5678 [5593, 6560] | n/a | n/a |
-| synchronous_commit=off clients=64 | cold | 12797 | 4.989 | 3980 | 15494 | 24114 | n/a | n/a |
-| synchronous_commit=off clients=64 | warm (n=5) | 14399 [13803, 16153] | 4.435 [3.951, 4.625] | 3515 [3153, 3724] | 13846 [12358, 14049] | 21693 [19924, 22650] | n/a | n/a |
+| synchronous_commit=on clients=1 | cold | 2921 | 0.341 | 254.0 | 1178 | 2902 | n/a | n/a |
+| synchronous_commit=on clients=1 | warm (n=5) | 3278 [3135, 3339] | 0.304 [0.299, 0.318] | 245.0 [241.0, 248.0] | 991.0 [947.0, 1076] | 1945 [1710, 2078] | n/a | n/a |
+| synchronous_commit=on clients=16 | cold | 15167 | 1.050 | 939.0 | 2444 | 9889 | n/a | n/a |
+| synchronous_commit=on clients=16 | warm (n=5) | 14579 [14149, 14703] | 1.092 [1.082, 1.125] | 1034 [1026, 1036] | 2578 [2486, 3512] | 5087 [4534, 9178] | n/a | n/a |
+| synchronous_commit=on clients=64 | cold | 14912 | 4.280 | 3752 | 10922 | 19752 | n/a | n/a |
+| synchronous_commit=on clients=64 | warm (n=5) | 15083 [14910, 15170] | 4.233 [4.206, 4.279] | 3762 [3747, 3789] | 10400 [10311, 10856] | 15286 [14661, 23522] | n/a | n/a |
+| synchronous_commit=off clients=1 | cold | 7674 | 0.130 | 124.0 | 318.0 | 568.6 | n/a | n/a |
+| synchronous_commit=off clients=1 | warm (n=5) | 8100 [7837, 8302] | 0.123 [0.120, 0.127] | 116.0 [115.0, 121.0] | 346.0 [206.0, 362.0] | 560.0 [490.9, 653.0] | n/a | n/a |
+| synchronous_commit=off clients=16 | cold | 23174 | 0.685 | 643.0 | 1482 | 1965 | n/a | n/a |
+| synchronous_commit=off clients=16 | warm (n=5) | 22542 [21781, 22639] | 0.704 [0.701, 0.729] | 677.0 [670.0, 695.0] | 1519 [1499, 1603] | 2078 [1950, 2207] | n/a | n/a |
+| synchronous_commit=off clients=64 | cold | 20681 | 3.087 | 2530 | 8323 | 11860 | n/a | n/a |
+| synchronous_commit=off clients=64 | warm (n=5) | 20345 [19397, 20530] | 3.138 [3.110, 3.291] | 2594 [2548, 2706] | 8388 [8183, 8852] | 11787 [11111, 13098] | n/a | n/a |
+
+<!-- source: oltp-sysbench-pg17.json -->
+### oltp-sysbench-pg17 — postgres17
+
+sysbench oltp_read_write + oltp_point_select on PG17, threads 1/16/64
+
+Status: **VOID (digest mismatch)**
+
+| config | run | tps | qps | latency_avg_ms | p99_ms | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| workload=oltp_read_write threads=1 | warm (n=0) | - | - | - | - | n/a | n/a |
+| workload=oltp_read_write threads=16 | warm (n=0) | - | - | - | - | n/a | n/a |
+| workload=oltp_read_write threads=64 | warm (n=0) | - | - | - | - | n/a | n/a |
+| workload=oltp_point_select threads=1 | warm (n=0) | - | - | - | - | n/a | n/a |
+| workload=oltp_point_select threads=16 | warm (n=0) | - | - | - | - | n/a | n/a |
+| workload=oltp_point_select threads=64 | warm (n=0) | - | - | - | - | n/a | n/a |
 
 ## Nucleus comparison
 

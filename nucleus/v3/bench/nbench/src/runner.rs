@@ -452,9 +452,13 @@ fn run_digest(
         .join(row.id)
         .join("expected")
         .join(format!("{name}.txt"));
+    // A missing *or blank* expectation counts as not-yet-recorded: the
+    // first run records it, later runs compare (blanking a file is how a
+    // changed digest protocol re-records after a workload change).
     let expected = std::fs::read_to_string(&expected_path)
         .ok()
-        .map(|s| s.trim().to_string());
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let matched = match &expected {
         Some(exp) => exp == &value,
         None => {
