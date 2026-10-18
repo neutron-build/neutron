@@ -439,32 +439,26 @@ fn cmd_list() -> Result<()> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Subcommand errors are printed, never swallowed: a silent exit 1
+    // inside a driver pipeline hides the cause (seen during B-0 bring-up).
     let code = match argv.first().map(String::as_str) {
-        Some("list") => cmd_list().is_ok(),
-        Some("run") => cmd_run(&argv[1..]).is_ok(),
-        Some("report") => cmd_report(&argv[1..]).is_ok(),
+        Some("list") => ok_or_print(cmd_list()),
+        Some("run") => ok_or_print(cmd_run(&argv[1..])),
+        Some("report") => ok_or_print(cmd_report(&argv[1..])),
         Some("cleanup") => {
             runner::cleanup();
             true
         }
-        Some("host-info") => match host::collect() {
-            Ok(v) => {
-                match json::to_string(&v) {
-                    Ok(s) => println!("{s}"),
-                    Err(e) => eprintln!("{e}"),
-                }
-                true
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                false
-            }
-        },
-        Some("vec-qdrant-load") => cmd_vec_qdrant_load(&argv[1..]).is_ok(),
-        Some("vec-qdrant-search") => cmd_vec_qdrant_search(&argv[1..]).is_ok(),
-        Some("vec-qdrant-digest") => cmd_vec_qdrant_digest(&argv[1..]).is_ok(),
-        Some("vec-pg-copy") => cmd_vec_pg_copy(&argv[1..]).is_ok(),
-        Some("vec-pg-search") => cmd_vec_pg_search(&argv[1..]).is_ok(),
+        Some("host-info") => ok_or_print(host::collect().and_then(|v| {
+            json::to_string(&v).map(|s| {
+                println!("{s}");
+            })
+        })),
+        Some("vec-qdrant-load") => ok_or_print(cmd_vec_qdrant_load(&argv[1..])),
+        Some("vec-qdrant-search") => ok_or_print(cmd_vec_qdrant_search(&argv[1..])),
+        Some("vec-qdrant-digest") => ok_or_print(cmd_vec_qdrant_digest(&argv[1..])),
+        Some("vec-pg-copy") => ok_or_print(cmd_vec_pg_copy(&argv[1..])),
+        Some("vec-pg-search") => ok_or_print(cmd_vec_pg_search(&argv[1..])),
         _ => {
             eprint!("{USAGE}");
             std::process::exit(2);
@@ -472,5 +466,16 @@ fn main() {
     };
     if !code {
         std::process::exit(1);
+    }
+}
+
+/// Print a subcommand error and report failure.
+fn ok_or_print(r: Result<()>) -> bool {
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("nbench: {e}");
+            false
+        }
     }
 }

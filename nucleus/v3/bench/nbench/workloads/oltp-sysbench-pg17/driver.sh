@@ -25,7 +25,7 @@ COMMON=(
 )
 
 case ${NB_MODE:?} in
-  init)
+  init|reinit)
     nb-podman exec "$C" postgres --version > "${NB_OUT}/versions.txt"
     nb-podman run --rm --network host "$IMG" \
       sysbench --version >> "${NB_OUT}/versions.txt" 2>&1

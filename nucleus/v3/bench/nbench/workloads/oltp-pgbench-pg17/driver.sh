@@ -15,7 +15,7 @@ C=${NB_CONTAINER:?}
 PSQL="psql -U postgres -d ${NB_DB:?} -q"
 
 case ${NB_MODE:?} in
-  init)
+  init|reinit)
     {
       nb-podman exec "$C" postgres --version
       nb-podman exec "$C" pgbench --version

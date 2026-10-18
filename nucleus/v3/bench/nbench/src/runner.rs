@@ -116,26 +116,18 @@ fn stop_system(system: &SystemDef) {
 fn start_system(root: &Path, system: &SystemDef, image: &str, variant: Option<&str>) -> Result<()> {
     stop_system(system);
     // pgvector needs its extension-creation SQL in the image's init dir;
-    // ship it through a dedicated read-only named volume.
+    // bind-mount the tracked file read-only (the image honours
+    // /docker-entrypoint-initdb.d on first initdb only).
+    let mut pgvec_init_mount: Option<String> = None;
     if system.name == "pgvector17" {
-        podman::try_podman(&["volume", "create", "nbench-pgvec-init"]);
-        let src = root
-            .join("systems")
-            .join("pgvector17")
-            .join("init")
-            .join("00-vector.sql");
-        if !src.exists() {
+        let src = root.join("systems").join("pgvector17").join("init");
+        if !src.join("00-vector.sql").exists() {
             return Err(Error::Usage(format!(
                 "missing pgvector init script {}",
-                src.display()
+                src.join("00-vector.sql").display()
             )));
         }
-        let out = podman::podman(&[
-            "cp",
-            &src.to_string_lossy(),
-            "nbench-pgvec-init:/00-vector.sql",
-        ])?;
-        let _ = out.stdout.len();
+        pgvec_init_mount = Some(format!("{}:/docker-entrypoint-initdb.d:ro", src.display()));
     }
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -153,6 +145,10 @@ fn start_system(root: &Path, system: &SystemDef, image: &str, variant: Option<&s
     ];
     for extra in system.run_extra {
         args.push((*extra).to_string());
+    }
+    if let Some(mount) = pgvec_init_mount {
+        args.push("-v".into());
+        args.push(mount);
     }
     args.push(image.to_string());
     for a in system.base_args {
@@ -310,9 +306,9 @@ fn exec_driver(
             stderr_tail: crate::podman::stderr_tail(&out.stderr),
         });
     }
-    if mode == "init" {
-        // Init logs describe dataset construction, not a measurement;
-        // their evidence is the digest step that follows.
+    if mode == "init" || mode == "reinit" {
+        // Init/reinit logs describe dataset construction, not a
+        // measurement; their evidence is the digest step that follows.
         return Ok(ParsedRun::default());
     }
     parse_result(row, &log, &metrics_file)

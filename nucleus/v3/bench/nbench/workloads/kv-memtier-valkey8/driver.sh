@@ -12,10 +12,10 @@ set -euo pipefail
 C=${NB_CONTAINER:?}
 PORT=${NB_PORT:?}
 CLI=valkey-cli
-IMG=${NB_IMAGE:?}
+IMG=$(grep -v '^#' "${NB_HARNESS:?}/systems/memtiercli/image.txt" | head -1)
 
 case ${NB_MODE:?} in
-  init)
+  init|reinit)
     nb-podman exec "$C" "$CLI" -p "$PORT" FLUSHALL > /dev/null
     {
       nb-podman exec "$C" sh -c "$CLI -p $PORT INFO server | grep -E '^redis_version|^valkey_version'"

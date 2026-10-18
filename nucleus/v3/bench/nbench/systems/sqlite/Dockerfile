@@ -9,17 +9,19 @@
 # upstream release coordinates.
 FROM docker.io/library/alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
 
-RUN apk add --no-cache build-base wget unzip
+RUN apk add --no-cache build-base wget unzip openssl
 
 ARG SQLITE_YEAR=2026
 ARG SQLITE_VER=3540100
-ARG SQLITE_SHA256=877c6f4996ce7adb368686bce21638de9e3d91534832ad3d9d119037d1bc22ad
+# sqlite.org's download page publishes SHA3-256 hashes (not SHA-256);
+# verified against `openssl dgst -sha3-256` on 2026-10-18.
+ARG SQLITE_SHA3=877c6f4996ce7adb368686bce21638de9e3d91534832ad3d9d119037d1bc22ad
 
 RUN mkdir -p /opt/nb /tmp/build \
  && cd /tmp/build \
  && wget -q "https://sqlite.org/${SQLITE_YEAR}/sqlite-src-${SQLITE_VER}.zip" \
- && echo "${SQLITE_SHA256}  sqlite-src-${SQLITE_VER}.zip" > checksum.txt \
- && sha256sum -c checksum.txt \
+ && echo "${SQLITE_SHA3}  sqlite-src-${SQLITE_VER}.zip" > checksum.txt \
+ && openssl dgst -sha3-256 -r sqlite-src-${SQLITE_VER}.zip | diff - checksum.txt \
  && unzip -q "sqlite-src-${SQLITE_VER}.zip" \
  && cd "sqlite-src-${SQLITE_VER}" \
  && cc -O2 -o /opt/nb/speedtest1 tool/speedtest1.c sqlite3.c \

@@ -128,6 +128,12 @@ pub struct RowDef {
     pub strict_init_digest: bool,
     /// Compare the final digest against the committed expectation.
     pub strict_final_digest: bool,
+    /// Re-create the dataset at the start of every config point, so each
+    /// series is measured from the same known state (§5.2 fairness: no
+    /// order-dependent drift between durability variants or client
+    /// counts). False for rows whose dataset is immutable (vector) or
+    /// private to each run (sqlite).
+    pub reinit_per_series: bool,
 }
 
 fn kv_pair(k: &str, v: String) -> (String, String) {
@@ -218,7 +224,7 @@ macro_rules! row {
         $id:literal, $system:literal, $parser:ident, $desc:literal,
         [$($metric:literal => $dir:ident),* $(,)?],
         $sweep:ident, $variant:ident,
-        init: $init:literal, final: $final:literal
+        init: $init:literal, final: $final:literal, reinit: $reinit:literal
     ) => {
         RowDef {
             id: $id,
@@ -230,6 +236,7 @@ macro_rules! row {
             variant_of: $variant,
             strict_init_digest: $init,
             strict_final_digest: $final,
+            reinit_per_series: $reinit,
         }
     };
 }
@@ -243,47 +250,47 @@ pub const ROWS: &[RowDef] = &[
         ["tps" => HigherIsBetter, "latency_avg_ms" => LowerIsBetter,
          "p50_us" => LowerIsBetter, "p99_us" => LowerIsBetter,
          "p999_us" => LowerIsBetter],
-        sweep_pgbench, variant_pgbench, init: true, final: false
+        sweep_pgbench, variant_pgbench, init: true, final: false, reinit: true
     ),
     row!(
         "oltp-sysbench-pg17", "postgres17", Sysbench,
         "sysbench oltp_read_write + oltp_point_select on PG17, threads 1/16/64",
         ["tps" => HigherIsBetter, "qps" => HigherIsBetter,
          "latency_avg_ms" => LowerIsBetter, "p99_ms" => LowerIsBetter],
-        sweep_sysbench, no_variant, init: true, final: false
+        sweep_sysbench, no_variant, init: true, final: false, reinit: true
     ),
     row!(
         "kv-memtier-valkey8", "valkey8", Memtier,
         "memtier GET/SET 1:10 against Valkey 8, pipeline 1/16, AOF always/everysec",
         ["ops_sec" => HigherIsBetter, "p50_ms" => LowerIsBetter,
          "p99_ms" => LowerIsBetter, "kb_per_sec" => HigherIsBetter],
-        sweep_kv, variant_kv, init: true, final: true
+        sweep_kv, variant_kv, init: true, final: true, reinit: true
     ),
     row!(
         "kv-memtier-redis7", "redis7", Memtier,
         "memtier GET/SET 1:10 against Redis 7, pipeline 1/16, AOF always/everysec",
         ["ops_sec" => HigherIsBetter, "p50_ms" => LowerIsBetter,
          "p99_ms" => LowerIsBetter, "kb_per_sec" => HigherIsBetter],
-        sweep_kv, variant_kv, init: true, final: true
+        sweep_kv, variant_kv, init: true, final: true, reinit: true
     ),
     row!(
         "vector-sift1m-qdrant", "qdrant", VectorSearch,
         "ann-benchmarks SIFT1M (HNSW m=16, ef_construction=200), recall@10 vs QPS",
         ["qps" => HigherIsBetter, "recall_at_10" => HigherIsBetter,
          "p50_ms" => LowerIsBetter, "p99_ms" => LowerIsBetter],
-        sweep_ef, no_variant, init: true, final: true
+        sweep_ef, no_variant, init: true, final: true, reinit: false
     ),
     row!(
         "vector-sift1m-pgvector", "pgvector17", VectorSearch,
         "ann-benchmarks SIFT1M via pgvector HNSW (m=16, ef_construction=200), recall@10 vs QPS",
         ["qps" => HigherIsBetter, "recall_at_10" => HigherIsBetter],
-        sweep_ef, no_variant, init: true, final: true
+        sweep_ef, no_variant, init: true, final: true, reinit: false
     ),
     row!(
         "embedded-sqlite-speedtest1", "sqlite", Speedtest1,
         "SQLite speedtest1 from the amalgamation (in container)",
         ["wall_s" => LowerIsBetter, "user_s" => LowerIsBetter, "sys_s" => LowerIsBetter],
-        sweep_single, no_variant, init: true, final: true
+        sweep_single, no_variant, init: true, final: true, reinit: false
     ),
 ];
 
@@ -359,8 +366,6 @@ pub const SYSTEMS: &[SystemDef] = &[
             "POSTGRES_PASSWORD=postgres",
             "-e",
             "POSTGRES_DB=nbench",
-            "-v",
-            "nbench-pgvec-init:/docker-entrypoint-initdb.d:ro",
         ],
     },
     SystemDef {
@@ -490,6 +495,12 @@ pub enum Step {
 }
 
 /// Build the full ordered plan for a row (the §5.2 sequencing, in one place).
+///
+/// Per config point: restart into the durability variant, re-create the
+/// dataset (`reinit`) when the row asks for it, digest-check that fresh
+/// state, then one cold run, warmup runs and `>= 5` warm runs. The
+/// reinit digest uses the same expectation as the init digest: a
+/// deterministic dataset reproduces it, and a mismatch voids the run.
 pub fn plan(row: &RowDef, p: &Params) -> Vec<Step> {
     let mut steps = Vec::new();
     if let Some(sys) = SystemDef::find(row.system)
@@ -502,17 +513,26 @@ pub fn plan(row: &RowDef, p: &Params) -> Vec<Step> {
         series: Vec::new(),
         index: 0,
     });
-    if row.strict_init_digest || true {
-        // The init digest is always recorded; strictness only controls
-        // whether a mismatch voids the run (handled by the runner).
-        steps.push(Step::Digest {
-            phase: "init",
-            strict: row.strict_init_digest,
-        });
-    }
+    // The init digest is always recorded; strictness only controls
+    // whether a mismatch voids the run (handled by the runner).
+    steps.push(Step::Digest {
+        phase: "init",
+        strict: row.strict_init_digest,
+    });
     for series in (row.sweep)(p) {
         let variant = (row.variant_of)(&series).map(|v| v.to_string());
         steps.push(Step::Start { variant });
+        if row.reinit_per_series {
+            steps.push(Step::Exec {
+                mode: "reinit",
+                series: series.clone(),
+                index: 0,
+            });
+            steps.push(Step::Digest {
+                phase: "init",
+                strict: row.strict_init_digest,
+            });
+        }
         for i in 0..p.cold_runs.max(1) {
             steps.push(Step::Exec {
                 mode: "cold",
@@ -557,15 +577,59 @@ mod tests {
                 .filter(|s| matches!(s, Step::Exec { mode: "run", .. }))
                 .count();
             assert!(warm >= 5, "{} has {warm} warm runs", row.id);
-            // Every cold execution must directly follow a Start (fresh process).
+            // Every cold execution must run against a freshly started
+            // container: the step right before it is a Start (rows
+            // without reinit) or the digest of a reinit that itself
+            // directly follows a Start.
             for (i, s) in steps.iter().enumerate() {
                 if let Step::Exec { mode: "cold", .. } = s {
-                    let prev = steps
-                        .get(i.wrapping_sub(1))
-                        .map(|s| matches!(s, Step::Start { .. }))
-                        .unwrap_or(false);
-                    assert!(prev, "{}: cold run not preceded by a restart", row.id);
+                    let prev_ok = match steps.get(i.wrapping_sub(1)) {
+                        Some(Step::Start { .. }) => true,
+                        Some(Step::Digest { .. }) => {
+                            // find the preceding reinit and check it follows a Start
+                            let mut j = i;
+                            let mut ok = false;
+                            while j > 0 {
+                                j -= 1;
+                                match &steps[j] {
+                                    Step::Exec { mode: "reinit", .. } => {
+                                        ok = matches!(
+                                            steps.get(j.wrapping_sub(1)),
+                                            Some(Step::Start { .. })
+                                        );
+                                        break;
+                                    }
+                                    Step::Start { .. } => break,
+                                    _ => {}
+                                }
+                            }
+                            ok
+                        }
+                        _ => false,
+                    };
+                    assert!(prev_ok, "{}: cold run not on a fresh container", row.id);
                 }
+            }
+            // Reinit rows re-create the dataset before every cold run and
+            // digest-check it; immutable-dataset rows never reinit.
+            let reinits = steps
+                .iter()
+                .filter(|s| matches!(s, Step::Exec { mode: "reinit", .. }))
+                .count();
+            let colds = steps
+                .iter()
+                .filter(|s| matches!(s, Step::Exec { mode: "cold", .. }))
+                .count();
+            if row.reinit_per_series {
+                assert_eq!(
+                    reinits,
+                    (row.sweep)(&p).len(),
+                    "{}: missing reinits",
+                    row.id
+                );
+            } else {
+                assert_eq!(reinits, 0, "{}: unexpected reinits", row.id);
+                let _ = colds;
             }
             // An init digest runs before any measurement (§5.2 rule 4).
             let first_digest = steps

@@ -115,7 +115,8 @@ pub fn recall_at_k(results: &[Vec<i64>], truth: &[Vec<i32>], k: usize) -> Result
 
 // ---- Qdrant REST ----
 
-/// Create the collection with the card's HNSW parameters.
+/// Create the collection with the card's HNSW parameters, deleting any
+/// previous collection of the same name first (idempotent reinit).
 pub fn qdrant_create(
     host: &str,
     port: u16,
@@ -124,6 +125,34 @@ pub fn qdrant_create(
     m: u64,
     ef_construct: u64,
 ) -> Result<()> {
+    // 404 (not found) is the expected answer on a fresh volume.
+    let existing = http::request(
+        host,
+        port,
+        "GET",
+        &format!("/collections/{collection}"),
+        b"",
+        Duration::from_secs(30),
+    );
+    if let Ok(resp) = &existing
+        && resp.status == 200
+    {
+        let del = http::request(
+            host,
+            port,
+            "DELETE",
+            &format!("/collections/{collection}"),
+            b"",
+            Duration::from_secs(120),
+        )?;
+        if del.status != 200 {
+            return Err(Error::Command {
+                name: format!("qdrant delete collection (HTTP {})", del.status),
+                status: del.status as i32,
+                stderr_tail: String::from_utf8_lossy(&del.body).to_string(),
+            });
+        }
+    }
     let body = json::to_string(&Value::obj(vec![
         (
             "vectors",
@@ -170,7 +199,8 @@ fn points_batch_json(ids: impl Iterator<Item = usize>, vecs: &[Vec<f32>]) -> Res
     json::to_string(&Value::obj(vec![("points", Value::Arr(points))]))
 }
 
-/// Upload a batch of points with `wait=true`.
+/// Upload a batch of points with `wait=true` (PUT upsert: newer Qdrant
+/// rejects POST for this body shape).
 pub fn qdrant_upload(
     host: &str,
     port: u16,
@@ -182,7 +212,7 @@ pub fn qdrant_upload(
     let resp = http::request(
         host,
         port,
-        "POST",
+        "PUT",
         &format!("/collections/{collection}/points?wait=true"),
         body.as_bytes(),
         Duration::from_secs(300),
@@ -247,7 +277,15 @@ pub fn qdrant_search(
     Ok(ids)
 }
 
-/// Poll the collection until it is `green` with all points indexed.
+/// Poll the collection until it is `green` with all points present.
+///
+/// `indexed_vectors_count` only reaches `points_count` when the
+/// collection is large enough to cross Qdrant's `indexing_threshold`
+/// (default 10k vectors); tiny collections stay exact-brute-force by
+/// design, so for small datasets the points count alone is the
+/// readiness signal. For a benchmark-sized collection, an HNSW index is
+/// required — anything below the threshold that should have one is an
+/// error, not a wait condition.
 pub fn qdrant_wait_green(
     host: &str,
     port: u16,
@@ -255,6 +293,9 @@ pub fn qdrant_wait_green(
     expected_points: usize,
     timeout: Duration,
 ) -> Result<()> {
+    /// Qdrant's default `indexing_threshold`, below which no HNSW graph
+    /// is built (collections under it answer by exact scan).
+    const QDRANT_INDEXING_THRESHOLD: usize = 10_000;
     let deadline = Instant::now() + timeout;
     loop {
         let resp = http::request(
@@ -267,24 +308,34 @@ pub fn qdrant_wait_green(
         )?;
         if resp.status == 200 {
             let v = json::parse(&String::from_utf8_lossy(&resp.body))?;
-            let status = v
-                .get("result")
-                .and_then(|r| r.get("status"))
+            let result = v.get("result").cloned().unwrap_or(Value::Null);
+            let status = result
+                .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let points = v
-                .get("result")
-                .and_then(|r| r.get("points_count"))
+            let points = result
+                .get("points_count")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0) as usize;
-            let indexed = v
-                .get("result")
-                .and_then(|r| r.get("indexed_vectors_count"))
+            let indexed = result
+                .get("indexed_vectors_count")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0) as usize;
-            if status == "green" && points == expected_points && indexed == expected_points {
+            let index_ready = indexed == points || points < QDRANT_INDEXING_THRESHOLD;
+            if status == "green" && points == expected_points && index_ready {
+                eprintln!("collection green: {points} points, {indexed} indexed vectors");
                 return Ok(());
+            }
+            if status == "green" && points == expected_points && !index_ready {
+                return Err(Error::Command {
+                    name: "qdrant wait green".into(),
+                    status: 1,
+                    stderr_tail: format!(
+                        "collection stable at {points} points but only {indexed} \
+                         indexed: HNSW build did not complete"
+                    ),
+                });
             }
         }
         if Instant::now() > deadline {
