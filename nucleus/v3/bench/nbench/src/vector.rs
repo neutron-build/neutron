@@ -518,10 +518,10 @@ pub fn parse_pg_search_output(text: &str, expected: usize) -> Result<Vec<Vec<i64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Spawn a one-connection-per-thread TCP server that plays a scripted
     /// sequence of behaviors, one per accepted connection: `Drop` closes
@@ -555,9 +555,7 @@ mod tests {
                 }
                 if let Some(code) = behavior.strip_prefix("Status:") {
                     let status: u16 = code.parse().expect("status code");
-                    let resp = format!(
-                        "HTTP/1.1 {status} x\r\nContent-Length: 2\r\n\r\nok"
-                    );
+                    let resp = format!("HTTP/1.1 {status} x\r\nContent-Length: 2\r\n\r\nok");
                     let _ = conn.write_all(resp.as_bytes());
                 }
             }
