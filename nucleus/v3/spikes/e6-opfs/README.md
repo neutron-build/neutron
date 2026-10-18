@@ -98,7 +98,10 @@ Details worth keeping:
   worker, pattern generation excluded). Chromium's flush p50 of ~0.3 ms
   matches this machine's fsync floor; Firefox/WebKit flushes and all
   sub-ms writes round to 0.0 at ms resolution — treat them as
-  "sub-millisecond", not as literal zeros.
+  "sub-millisecond", not as literal zeros. p99 is jitter-prone: a second
+  full run reproduced every p50 within 0.1 ms but put Chromium's flush
+  p99 at 8.4 ms (a single outlier among 200 samples); p50, not p99, is
+  the stable comparison point at this sample size.
 
 ## Per-browser durability semantics (documented per the decision rule)
 
