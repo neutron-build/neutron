@@ -12,7 +12,7 @@ gate=0
 step() {
   local name=$1
   shift
-  "$@"
+  "$@" 2>&1
   local rc=$?
   echo "STEP $name EXIT=$rc"
   [ "$rc" -eq 0 ] || gate=1
@@ -28,5 +28,6 @@ step fmt cargo fmt --all -- --check
 step deny cargo deny --log-level error check
 step wasm32 cargo build -q --target wasm32-unknown-unknown "${wasm_crates[@]}"
 step core-paths-selftest bash scripts/check-core-paths.sh --self-test
+step enforcement-tests bash scripts/test-enforcement.sh
 echo "GATE EXIT=$gate"
 exit "$gate"

@@ -3,7 +3,6 @@
 # audit (scripts/audit-merges.sh) re-checks every merge in CI.
 # Entry forms: dir/ prefix, exact file, or glob (see scripts/core-paths-lib.sh).
 docs/
-verdicts/
 scripts/
 tools/
 CORE_PATHS
@@ -13,3 +12,5 @@ clippy.toml
 rust-toolchain.toml
 crates/nucleus-store/
 crates/nucleus-env/
+# verdicts/ is protected from workers by the runner; enforce-lib.sh lets a card
+# change only its own verdicts/<ID>.md.

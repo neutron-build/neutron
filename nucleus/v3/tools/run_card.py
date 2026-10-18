@@ -42,7 +42,8 @@ PROTECTED = [
     "nucleus/v2/",
     "nucleus/src/",
 ]
-GATE_CMD = "scripts/gate.sh"
+GATE_CMD = "cd nucleus/v3 && bash scripts/gate.sh"
+GATE_PASS = "GATE EXIT=0"
 OPENCODE_CONFIG = {
     "$schema": "https://opencode.ai/config.json",
     "permission": {
@@ -90,6 +91,23 @@ def parse_card(path):
     touch = [m.strip().strip("`") for m in re.findall(r"^- (.+)$", section("Touch only"), re.M)]
     accept = re.findall(r"^- `([^`]+)`", section("Acceptance"), re.M)
     return card_id, touch, accept
+
+
+def validate_card(touch, accept):
+    """The card-shape rules (PLAN-v3 §7.2). Returns an error string, or None."""
+    if not touch:
+        return "needs a Touch only list"
+    if not accept:
+        return "needs backticked Acceptance commands"
+    if accept[-1].strip() != GATE_CMD:
+        return f"the last Acceptance command must be exactly `{GATE_CMD}`"
+    return None
+
+
+def gate_passed(rc, out):
+    """A gate run passes only with exit 0 AND a last line of exactly `GATE EXIT=0` (§7.6.4)."""
+    lines = out.rstrip("\n").splitlines()
+    return rc == 0 and bool(lines) and lines[-1].strip() == GATE_PASS
 
 
 def in_scope(path, touch):
@@ -155,10 +173,9 @@ def main():
     card_path = pathlib.Path(args.card)
     card_path = card_path if card_path.is_absolute() else (pathlib.Path.cwd() / card_path).resolve()
     card_id, touch, accept = parse_card(card_path)
-    if not touch or not accept:
-        sys.exit(f"card {card_id}: needs Touch only and Acceptance sections")
-    if GATE_CMD not in accept[-1]:
-        sys.exit(f"card {card_id}: the last Acceptance command must run {GATE_CMD} (PLAN-v3 §7.2)")
+    err = validate_card(touch, accept)
+    if err:
+        sys.exit(f"card {card_id}: {err} (PLAN-v3 §7.2)")
 
     wt = WT_ROOT / card_id
     branch = f"card/v3-{card_id}"
@@ -258,8 +275,8 @@ def main():
         failures = []
         for c in accept:
             rc, out = run(c, wt, env=env, timeout=60 * 60)
-            if rc == 0 and GATE_CMD in c and not re.search(r"^GATE EXIT=0$", out, re.M):
-                rc, out = 1, out + "\nthe gate did not print GATE EXIT=0"
+            if c.strip() == GATE_CMD and not gate_passed(rc, out):
+                rc, out = 1, out + "\nthe gate's last line was not GATE EXIT=0"
             if rc == 0 and "cargo test" in c and sum(int(n) for n in re.findall(r"test result: ok\. (\d+) passed", out)) == 0:
                 rc, out = 1, out + "\nno tests ran: a cargo test acceptance command must run at least one test"
             print(f"[{card_id}] {'PASS' if rc == 0 else 'FAIL'}: {c}", flush=True)

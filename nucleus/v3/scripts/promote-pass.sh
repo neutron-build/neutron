@@ -3,20 +3,26 @@
 #
 #   promote-pass.sh scratch/passN
 #
-# Runs the full gate on scratch/passN, requires `GATE EXIT=0`, runs the merge
-# audit, then fast-forwards nucleus/v3-scaffold and pushes it. Never forces.
+# Requires a clean worktree on scratch/passN; runs the full gate and requires
+# its LAST line to be `GATE EXIT=0`; runs queue-check and the merge audit;
+# requires a fast-forward of origin/nucleus/v3-scaffold; pushes; then
+# fast-forwards the local branch. Never forces.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here/.."
 pass=${1:?usage: promote-pass.sh scratch/passN}
-[ "$(git rev-parse --abbrev-ref HEAD)" = "$pass" ] || { echo "promote-pass: check out $pass first" >&2; exit 1; }
+die() { echo "promote-pass: $*" >&2; exit 1; }
+[ "$(git rev-parse --abbrev-ref HEAD)" = "$pass" ] || die "check out $pass first"
+[ -z "$(git status --porcelain)" ] || die "worktree is not clean"
 log=$(mktemp)
-bash scripts/gate.sh 2>&1 | tee "$log" || true
-grep -qx 'GATE EXIT=0' "$log" || { echo "promote-pass: gate is red; not promoting" >&2; exit 1; }
-bash scripts/audit-merges.sh "$pass"
+bash scripts/gate.sh >"$log" 2>&1 || true
+cat "$log"
+[ "$(tail -n 1 "$log")" = "GATE EXIT=0" ] || die "gate is red (last line: $(tail -n 1 "$log")); not promoting"
+bash scripts/queue-check.sh || die "queue-check failed"
+bash scripts/audit-merges.sh "$pass" || die "merge audit failed"
 git fetch -q origin nucleus/v3-scaffold 2>/dev/null || true
 if git rev-parse -q --verify origin/nucleus/v3-scaffold >/dev/null; then
-  git merge-base --is-ancestor origin/nucleus/v3-scaffold "$pass" || { echo "promote-pass: $pass is not a fast-forward of origin/nucleus/v3-scaffold" >&2; exit 1; }
+  git merge-base --is-ancestor origin/nucleus/v3-scaffold "$pass" || die "$pass is not a fast-forward of origin/nucleus/v3-scaffold"
 fi
 git push -q origin "$pass:nucleus/v3-scaffold"
 # Move the local branch too: fast-forward the checkout that has it, if any,

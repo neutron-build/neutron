@@ -1,7 +1,8 @@
 name: Nucleus v3
 
-# PLAN-v3 §6.1 and §7.6. The gate is scripts/gate.sh; on the scaffold the merge
-# audit re-checks that every card merge carries a qualifying verdict.
+# PLAN-v3 §6.1 and §7.6. The gate is scripts/gate.sh (it includes the
+# enforcement scenario tests). On the scaffold, the merge audit re-checks every
+# change to nucleus/v3 against the merge rules (scripts/enforce-lib.sh).
 
 on:
   push:
@@ -45,13 +46,6 @@ jobs:
 
       - name: Gate
         run: bash scripts/gate.sh
-
-      - name: Docs only via spec cards (card branches)
-        if: startsWith(github.head_ref || github.ref_name, 'card/v3-')
-        run: |
-          bash scripts/check-core-paths.sh --docs origin/nucleus/v3-scaffold HEAD \
-            && echo "no docs/ changes" \
-            || echo "::warning::docs/ changed: merge-card.sh will require Class: spec and a P verdict"
 
       - name: Merge audit (scaffold)
         if: (github.head_ref || github.ref_name) == 'nucleus/v3-scaffold'
