@@ -1,0 +1,25 @@
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 100%, 60 secs]  0 threads  4 conns:     5281395 ops,   83040 (avg:   88022) ops/sec, 3.44MB/sec (avg:  3.65MB/sec),  0.77 (avg:  0.73) msec latency
+
+warning: GET miss rate 99.97% above target 1.00% (4799913 misses / 4801240 ops)
+
+CPU Utilization Summary
+  Total CPU time:   107.642s  (user 35.530s, sys 72.113s)
+  Wall time:        60.002s
+  Cores used:       1.794   (avg 11.2% across 16 worker threads)
+  Peak utilization: 213.6%
+16        Threads
+4         Connections per thread
+60        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec
+----------------------------------------------------------------------------------------------------------------------------
+Sets         8002.49          ---          ---         0.73359         0.64700         1.74300         4.76700       616.47
+Gets        80019.77        22.12     79997.65         0.72566         0.63900         1.73500         4.54300      3117.95
+Waits           0.00          ---          ---             ---             ---             ---             ---          ---
+Totals      88022.26        22.12     79997.65         0.72638         0.63900         1.73500         4.60700      3734.42

@@ -368,15 +368,27 @@ fn parse_result(row: &RowDef, log: &Path, metrics_file: &Path) -> Result<ParsedR
     }
 }
 
+/// Context for one digest invocation (keeps the argument list small).
+struct DigestCtx<'a> {
+    root: &'a Path,
+    row: &'a RowDef,
+    system: &'a SystemDef,
+    params: &'a Params,
+    workdir: &'a Path,
+    tag_is_smoke: bool,
+}
+
 fn run_digest(
-    root: &Path,
-    row: &RowDef,
-    system: &SystemDef,
+    ctx: &DigestCtx<'_>,
     phase: &str,
     strict: bool,
-    tag_is_smoke: bool,
-    workdir: &Path,
 ) -> Result<(String, Option<String>, bool)> {
+    let root = ctx.root;
+    let row = ctx.row;
+    let system = ctx.system;
+    let params = ctx.params;
+    let workdir = ctx.workdir;
+    let tag_is_smoke = ctx.tag_is_smoke;
     let script = root.join("workloads").join(row.id).join("digest.sh");
     if !script.exists() {
         return Err(Error::Usage(format!(
@@ -385,8 +397,8 @@ fn run_digest(
         )));
     }
     let exe = std::env::current_exe().map_err(Error::Io)?;
-    let out = Command::new("bash")
-        .arg(&script)
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script)
         .env("NB_HARNESS", root)
         .env("NB_ROW", row.id)
         .env("NB_SYSTEM", system.name)
@@ -405,9 +417,13 @@ fn run_digest(
                 root.join("bin").display(),
                 std::env::var("PATH").unwrap_or_default()
             ),
-        )
-        .output()
-        .map_err(Error::Io)?;
+        );
+    // digest scripts see the same parameters as drivers (dataset shape
+    // determines the digest)
+    for (k, v) in params.to_pairs() {
+        cmd.env(format!("NB_P_{}", k.to_uppercase()), v);
+    }
+    let out = cmd.output().map_err(Error::Io)?;
     if !out.status.success() {
         return Err(Error::Command {
             name: format!("digest {} [{phase}]", row.id),
@@ -620,8 +636,15 @@ pub fn run_row(
                 }
             }
             Step::Digest { phase, strict } => {
-                let (value, expected, matched) =
-                    run_digest(root, row, system, phase, strict, smoke, &workdir)?;
+                let digest_ctx = DigestCtx {
+                    root,
+                    row,
+                    system,
+                    params,
+                    workdir: &workdir,
+                    tag_is_smoke: smoke,
+                };
+                let (value, expected, matched) = run_digest(&digest_ctx, phase, strict)?;
                 digest_records.push((
                     phase.to_string(),
                     Value::obj(vec![

@@ -211,33 +211,59 @@ pub fn parse_sysbench(log: &str) -> Result<ParsedRun> {
     })
 }
 
-/// Parse a memtier_benchmark "Totals" block.
-///
-/// ```text
-/// Totals
-/// ------------------------------------------------------------
-/// Number of Hits:              5000000
-/// Number of Misses:            0
-/// Number of Updates:           500000
-/// ...
-/// Throughput:                  83333.33 ops/sec
-/// Throughput:                  2666.67 MB/sec
-/// ...
-/// Latency Distribution
-/// ------------------------------------------------------------
-/// 50.000% <= 1.234 milliseconds
-/// 99.900% <= 5.678 milliseconds
-/// ```
-///
-/// Newer memtier (2.x) prints `Throughput (ops/sec)` and percentile lines
-/// like `p50.000% [  1.234 ms]`; both shapes are accepted.
+/// Parse a memtier_benchmark "ALL STATS" table (2.5.2 format): a header
+/// row (`Type Ops/sec Hits/sec ... KB/sec`) followed by per-command rows
+/// and a `Totals` row whose columns are, in order: ops/sec, hits/sec,
+/// misses/sec, avg latency (ms), p50 (ms), p99 (ms), p99.9 (ms), KB/sec.
+/// Older labelled output shapes (`Throughput: N ops/sec`,
+/// `50.000% <= X milliseconds`) are accepted as a fallback.
 pub fn parse_memtier(log: &str) -> Result<ParsedRun> {
+    if let Some(section) = log.rfind("ALL STATS") {
+        let lines: Vec<&str> = log[section..].lines().collect();
+        let mut totals: Option<Vec<f64>> = None;
+        for line in &lines {
+            let t = line.trim();
+            if t.starts_with("Totals") {
+                let nums: Vec<f64> = t
+                    .split_whitespace()
+                    .skip(1)
+                    .filter_map(|tok| num_prefix(tok).and_then(|n| n.parse::<f64>().ok()))
+                    .collect();
+                totals = Some(nums);
+            }
+        }
+        if let Some(nums) = totals {
+            // columns: ops/sec, hits/sec, misses/sec, avg, p50, p99, p99.9, KB/sec
+            let ops = *nums.first().ok_or_else(|| Error::Parse {
+                what: "memtier ops/sec",
+                line: "Totals row has no numbers".into(),
+            })?;
+            let mut out = vec![("ops_sec".to_string(), ops)];
+            if let Some(kb) = nums.get(7) {
+                out.push(("kb_per_sec".to_string(), *kb));
+            }
+            if let Some(p50) = nums.get(4) {
+                out.push(("p50_ms".to_string(), *p50));
+            }
+            if let Some(p99) = nums.get(5) {
+                out.push(("p99_ms".to_string(), *p99));
+            }
+            if let Some(avg) = nums.get(3) {
+                out.push(("latency_avg_ms".to_string(), *avg));
+            }
+            return Ok(ParsedRun {
+                metrics: out,
+                digest: None,
+            });
+        }
+    }
+
+    // Fallback: older labelled format.
     let totals_start = log.rfind("Totals").ok_or_else(|| Error::Parse {
         what: "memtier",
         line: "no Totals block".into(),
     })?;
-    let section = &log[totals_start..];
-    let lines: Vec<&str> = section.lines().collect();
+    let lines: Vec<&str> = log[totals_start..].lines().collect();
 
     // ops/sec: "Throughput: 83333.33 ops/sec" or "Throughput (ops/sec): 83333.33"
     let mut ops = None;
@@ -463,7 +489,27 @@ mod tests {
     }
 
     #[test]
-    fn memtier_totals_both_shapes() {
+    fn memtier_totals_table_real_format() {
+        // Real captured output (memtier 2.5.2, card B-0 run), trimmed of
+        // the per-second progress line.
+        let log = include_str!("fixtures/memtier-run.txt");
+        let p = parse_memtier(log).expect("parse");
+        let get = |p: &ParsedRun, k: &str| {
+            p.metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get(&p, "ops_sec"), 88022.26);
+        assert_eq!(get(&p, "p50_ms"), 0.639);
+        assert_eq!(get(&p, "p99_ms"), 1.735);
+        assert_eq!(get(&p, "kb_per_sec"), 3734.42);
+        assert_eq!(get(&p, "latency_avg_ms"), 0.72638);
+    }
+
+    #[test]
+    fn memtier_older_labelled_format_still_parses() {
         let v1 = "Totals\n-----\nThroughput: 83333.33 ops/sec\n\
                   Throughput: 2666.67 MB/sec\n\
                   50.000% <= 1.234 milliseconds\n99.900% <= 5.678 milliseconds\n";
@@ -490,6 +536,8 @@ mod tests {
     #[test]
     fn memtier_without_totals_errors() {
         assert!(parse_memtier("Client-side output\n").is_err());
+        // a Totals row with no numbers is an error, not a zero
+        assert!(parse_memtier("ALL STATS\nTotals --- --- ---\n").is_err());
     }
 
     #[test]
