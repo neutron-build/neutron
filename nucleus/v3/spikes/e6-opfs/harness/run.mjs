@@ -12,15 +12,23 @@
 //       exclusive-handle probe; final integrity check
 //   T5  latency of flush() and of 8 KiB page writes (p50/p99)
 //
+// The WAL is verified byte-for-byte (read_wal vs the expected records) in
+// T1/T2/T4, never by length alone. "Kill" means SIGKILL of the processes
+// whose /proc cmdline references the run's unique profile directory —
+// Playwright's launchPersistentContext exposes no browser PID in any
+// engine (verdict X-6 R1) — and every kill records { pids, signaled,
+// remaining, killed } in results.json; a kill scenario where nothing was
+// killed is recorded as an error, not a pass.
+//
 // Usage:
 //   node run.mjs [--quick] [--engines=chromium,firefox,webkit]
 //                [--out=results.json] [--step-timeout-ms=N]
 //
 // --quick shrinks the datasets (used by the card's acceptance line); the
 // full run produces the card's reported numbers. Every scenario runs
-// under a hard timeout; on timeout the browser process is SIGKILLed and
-// the scenario is recorded as 'timeout'. The HTTP server is always
-// stopped, including on failure or Ctrl-C.
+// under a hard timeout; on timeout the browser is SIGKILLed by the same
+// PID scan and the scenario is recorded as 'timeout'. The HTTP server is
+// always stopped, including on failure or Ctrl-C.
 //
 // Exit code: 0 when every requested engine produced a record for every
 // test (regardless of pass/fail — a browser failing durability is an
@@ -30,7 +38,7 @@
 process.env.PLAYWRIGHT_BROWSERS_PATH ||= `${process.env.HOME}/.cache/nv3-target/playwright/browsers`;
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -203,14 +211,50 @@ function stopServer() {
 
 // --------------------------------------------------------- browser control
 
-let live = null; // { context, engine }
+let live = null; // { context, engine, profile } while a scenario runs
 
-function browserProcessOf(context) {
-  try {
-    return context.browser()?.process?.() ?? null;
-  } catch {
-    return null;
+// Browser PIDs whose command line references `profile`. Rationale
+// (verdict X-6 R1): `context.browser()?.process?.()` is null for
+// `launchPersistentContext` in all three engines, so Playwright cannot
+// hand us the PID — but every engine puts the profile directory in the
+// browser's argv (Chromium/Firefox `--user-data-dir=`/`-profile`; WebKit
+// both its `pw_run.sh` wrapper and MiniBrowser), and the profile path is
+// unique per run and scenario. Zombie processes have empty cmdlines and
+// never match. Synchronous on purpose: also used from process exit.
+function pidsForProfile(profile) {
+  const pids = [];
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const args = readFileSync(`/proc/${entry}/cmdline`, 'utf8').split('\0');
+      if (args.some((a) => a.includes(profile))) pids.push(Number(entry));
+    } catch {
+      /* raced with process exit; not ours */
+    }
   }
+  return pids.sort((a, b) => a - b);
+}
+
+// SIGKILLs every pid; returns per-pid outcomes (a pid may exit between
+// scan and signal — `sent: false` with ESRCH, which still counts as dead).
+function killPids(pids) {
+  return pids.map((pid) => {
+    try {
+      process.kill(pid, 'SIGKILL');
+      return { pid, sent: true };
+    } catch (error) {
+      return { pid, sent: false, error: String(error.code || error.message) };
+    }
+  });
+}
+
+// True once no live process references the profile (zombies excluded).
+async function waitForProfileGone(profile, ms) {
+  const deadline = Date.now() + ms;
+  while (pidsForProfile(profile).length > 0 && Date.now() < deadline) {
+    await sleep(50);
+  }
+  return pidsForProfile(profile).length === 0;
 }
 
 async function launch(engineName, scenario) {
@@ -221,50 +265,61 @@ async function launch(engineName, scenario) {
     60_000,
     `${engineName} launch (${scenario})`,
   );
-  live = { context, engine: engineName };
+  live = { context, engine: engineName, profile };
   return context;
 }
 
+// Graceful close with a PID-sweep backstop: if the context close fails or
+// leaves processes behind (this card's environment has seen WebKit hang
+// on close), SIGKILL whatever still references the profile. The sweep
+// result is recorded on the scenario so a backstop firing is visible.
 async function closeBrowser() {
-  if (!live) return;
-  const { context } = live;
+  if (!live) return { leftover_pids: [] };
+  const { context, profile } = live;
   live = null;
   try {
     await Promise.race([context.close(), sleep(10_000)]);
   } catch {
-    /* best effort; SIGKILL below is the backstop */
+    /* fall through to the sweep */
   }
-  const proc = browserProcessOf(context);
-  if (proc && proc.exitCode === null) {
-    try {
-      proc.kill('SIGKILL');
-    } catch {
-      /* already gone */
-    }
-  }
+  const leftover_pids = pidsForProfile(profile);
+  if (leftover_pids.length > 0) killPids(leftover_pids);
+  return { leftover_pids };
 }
 
-// Hard kill: SIGKILL the browser process (as close to a crash as a
-// harness gets), then let the context tear down.
+// Hard kill, as close to a crash as a harness gets: SIGKILL every process
+// whose command line references the scenario's profile directory, wait
+// for them to leave /proc, then let Playwright tear the context down.
+// The record is returned verbatim into results.json; killed=false means
+// the "kill" scenario did not actually kill, and the scenario is then
+// recorded as an error (verdict X-6 R1).
 async function sigkillBrowser() {
-  if (!live) return false;
-  const { context } = live;
-  live = null;
-  const proc = browserProcessOf(context);
-  let killed = false;
-  if (proc && proc.exitCode === null) {
-    try {
-      killed = proc.kill('SIGKILL');
-    } catch {
-      killed = false;
-    }
+  const rec = { pids: [], signaled: 0, remaining: [], killed: false };
+  if (!live) {
+    rec.reason = 'no live context';
+    return rec;
   }
+  const { context, profile } = live;
+  live = null;
+  rec.pids = pidsForProfile(profile);
+  if (rec.pids.length === 0) {
+    rec.reason = 'no process command line references the profile directory';
+    try {
+      await Promise.race([context.close(), sleep(5_000)]);
+    } catch {
+      /* nothing more to do */
+    }
+    return rec;
+  }
+  rec.signaled = killPids(rec.pids).filter((outcome) => outcome.sent).length;
+  rec.killed = await waitForProfileGone(profile, 5_000);
+  if (!rec.killed) rec.remaining = pidsForProfile(profile);
   try {
     await Promise.race([context.close(), sleep(5_000)]);
   } catch {
     /* expected after SIGKILL */
   }
-  return killed;
+  return rec;
 }
 
 // ------------------------------------------------------------------ pages
@@ -298,11 +353,35 @@ function verifyPage(page, db, pages) {
       await window.e6.open_retry(db);
       const check = await window.e6.read_check(db, 0, pages);
       const wal_len = await window.e6.wal_len(db);
+      const wal_bytes = await window.e6.read_wal(db);
       await window.e6.close(db);
-      return { check, wal_len };
+      return { check, wal_len, wal_bytes };
     },
     { db, pages },
   );
+}
+
+// Expected WAL bytes: the records' UTF-8 encodings concatenated in append
+// order. The WAL is append-only and the frontier is seeded from the file
+// size at open, so the surviving file must be exactly a prefix of this —
+// checked byte-for-byte, never by length alone (verdict X-6 R3: a WAL of
+// the right length full of zeros is a failure).
+function walCheck(bytes, texts) {
+  const expected = [];
+  for (const text of texts) {
+    for (const byte of Buffer.from(text, 'utf8')) expected.push(byte);
+  }
+  if (!Array.isArray(bytes)) return { ok: false, reason: 'no WAL bytes read back' };
+  const stop = Math.min(bytes.length, expected.length);
+  for (let i = 0; i < stop; i++) {
+    if (bytes[i] !== expected[i]) {
+      return { ok: false, first_bad: i, len: bytes.length, expected_len: expected.length };
+    }
+  }
+  if (bytes.length !== expected.length) {
+    return { ok: false, first_bad: stop, len: bytes.length, expected_len: expected.length };
+  }
+  return { ok: true, len: bytes.length };
 }
 
 const intact = (check) =>
@@ -312,27 +391,29 @@ const intact = (check) =>
 
 async function t1_persistence(engineName, url) {
   const db = `t1-${STAMP}`;
+  const walTexts = Array(T1_WAL_RECORDS).fill(WAL_TEXT);
   const context = await launch(engineName, 't1');
   const page = await newPage(context, url);
 
-  await writeAndFlush(page, db, T1_PAGES, Array(T1_WAL_RECORDS).fill(WAL_TEXT));
+  await writeAndFlush(page, db, T1_PAGES, walTexts);
   const walBeforeReload = await page.evaluate((db) => window.e6.wal_len(db), db);
 
   // Reload the page (its workers die with it), reopen the database in a
-  // fresh worker, read every page and the WAL length back.
+  // fresh worker, read every page and the WAL back.
   await page.reload({ waitUntil: 'load', timeout: 30_000 });
   const verify = await verifyPage(page, db, T1_PAGES);
 
-  const expectedWal = T1_WAL_RECORDS * WAL_TEXT.length;
+  const wal = walCheck(verify.wal_bytes, walTexts);
   return {
-    ok: intact(verify.check) && verify.wal_len === expectedWal,
+    ok: intact(verify.check) && wal.ok,
     detail: {
       db,
       pages: T1_PAGES,
       missing: verify.check.missing,
       corrupt: verify.check.corrupt.slice(0, 20),
+      wal, // byte-for-byte WAL content (verdict X-6 R3)
       wal_len: verify.wal_len,
-      expected_wal_len: expectedWal,
+      expected_wal_len: T1_WAL_RECORDS * WAL_TEXT.length,
       wal_len_before_reload: walBeforeReload,
     },
   };
@@ -341,12 +422,12 @@ async function t1_persistence(engineName, url) {
 async function t2_durability(engineName, url) {
   const db = `t2-${STAMP}`;
   const profile = `${engineName}-t2`; // reused across the browser kill
-  const expectedWal = WAL_TEXT.length;
+  const walTexts = [WAL_TEXT];
 
   // Phase 1: write + flush, then kill the TAB with handles still open.
   let context = await launch(engineName, profile);
   let page = await newPage(context, url);
-  await writeAndFlush(page, db, T2_PAGES, [WAL_TEXT]);
+  await writeAndFlush(page, db, T2_PAGES, walTexts);
   await page.close({ runBeforeUnload: false }); // tab kill, no unload
 
   // Phase 2: a new tab in the same context reads it back.
@@ -354,31 +435,43 @@ async function t2_durability(engineName, url) {
   const afterTabKill = await verifyPage(page, db, T2_PAGES);
 
   // Phase 3: reopen mid-session (handles open, nothing new written),
-  // SIGKILL the whole browser, relaunch on the same profile, read back.
+  // SIGKILL the whole browser by PID (verdict X-6 R1), relaunch on the
+  // same profile, read back.
   await page.evaluate((db) => window.e6.open_retry(db), db);
-  await sigkillBrowser();
+  const kill = await sigkillBrowser();
   context = await launch(engineName, profile);
   page = await newPage(context, url);
   const afterBrowserKill = await verifyPage(page, db, T2_PAGES);
 
+  const tabKill = {
+    ok: intact(afterTabKill.check) && walCheck(afterTabKill.wal_bytes, walTexts).ok,
+    missing: afterTabKill.check.missing.length,
+    corrupt: afterTabKill.check.corrupt.length,
+    wal: walCheck(afterTabKill.wal_bytes, walTexts),
+    wal_len: afterTabKill.wal_len,
+  };
+  const browserKill = {
+    ok:
+      intact(afterBrowserKill.check) &&
+      walCheck(afterBrowserKill.wal_bytes, walTexts).ok &&
+      kill.killed,
+    missing: afterBrowserKill.check.missing.length,
+    corrupt: afterBrowserKill.check.corrupt.length,
+    wal: walCheck(afterBrowserKill.wal_bytes, walTexts),
+    wal_len: afterBrowserKill.wal_len,
+    kill, // real PID evidence: { pids, signaled, remaining, killed }
+  };
   return {
-    ok: intact(afterTabKill.check) && intact(afterBrowserKill.check),
+    ok: tabKill.ok && browserKill.ok,
+    method_error: kill.killed
+      ? null
+      : `browser SIGKILL did not happen: ${kill.reason || `pids [${kill.remaining}] survived SIGKILL`}`,
     detail: {
       db,
       pages: T2_PAGES,
-      expected_wal_len: expectedWal,
-      tab_kill: {
-        ok: intact(afterTabKill.check) && afterTabKill.wal_len === expectedWal,
-        missing: afterTabKill.check.missing.length,
-        corrupt: afterTabKill.check.corrupt.length,
-        wal_len: afterTabKill.wal_len,
-      },
-      browser_kill: {
-        ok: intact(afterBrowserKill.check) && afterBrowserKill.wal_len === expectedWal,
-        missing: afterBrowserKill.check.missing.length,
-        corrupt: afterBrowserKill.check.corrupt.length,
-        wal_len: afterBrowserKill.wal_len,
-      },
+      expected_wal_len: WAL_TEXT.length,
+      tab_kill: tabKill,
+      browser_kill: browserKill,
     },
   };
 }
@@ -386,19 +479,20 @@ async function t2_durability(engineName, url) {
 async function t3_unflushed_kill(engineName, url) {
   const db = `t3-${STAMP}`;
   const profile = `${engineName}-t3`; // reused across the kill
+  const walTexts = ['unflushed-wal-record'];
 
   let context = await launch(engineName, profile);
   let page = await newPage(context, url);
   await page.evaluate(
-    async ({ db, pages }) => {
+    async ({ db, pages, walText }) => {
       await window.e6.open_retry(db);
       await window.e6.write_pages(db, 0, pages);
-      await window.e6.append_wal(db, 'unflushed-wal-record');
+      await window.e6.append_wal(db, walText);
       // deliberately NO flush and NO close
     },
-    { db, pages: T3_PAGES },
+    { db, pages: T3_PAGES, walText: walTexts[0] },
   );
-  await sigkillBrowser();
+  const kill = await sigkillBrowser();
 
   context = await launch(engineName, profile);
   page = await newPage(context, url);
@@ -407,14 +501,19 @@ async function t3_unflushed_kill(engineName, url) {
   const intactPages = T3_PAGES - verify.check.missing.length - verify.check.corrupt.length;
   return {
     ok: null, // informational: the decision rule only covers flushed data
+    method_error: kill.killed
+      ? null
+      : `browser SIGKILL did not happen: ${kill.reason || `pids [${kill.remaining}] survived SIGKILL`}`,
     detail: {
       db,
       pages_written: T3_PAGES,
+      kill,
       intact_pages_after_kill: intactPages,
       missing_pages: verify.check.missing.length,
       corrupt_pages: verify.check.corrupt.length,
       wal_len_after_kill: verify.wal_len,
-      wal_len_if_fully_persisted: 'unflushed-wal-record'.length,
+      wal_content_after_kill: walCheck(verify.wal_bytes, walTexts),
+      wal_len_if_fully_persisted: walTexts[0].length,
       note: 'no flush before the kill; anything surviving is best-effort',
     },
   };
@@ -489,6 +588,7 @@ async function t4_web_locks(engineName, url) {
   const pageC = await newPage(context, url);
   const final = await verifyPage(pageC, db, half * 2);
 
+  const finalWal = walCheck(final.wal_bytes, [WAL_TEXT_A, WAL_TEXT_B]);
   const expectedWal = WAL_TEXT_A.length + WAL_TEXT_B.length;
   const grantAfterRelease = grantedToB.held_since >= releasedByA.released_at - 5; // 5ms clock tolerance
   return {
@@ -497,7 +597,7 @@ async function t4_web_locks(engineName, url) {
       grantAfterRelease &&
       intact(handoff.first) &&
       intact(final.check) &&
-      final.wal_len === expectedWal,
+      finalWal.ok,
     detail: {
       db,
       pages_per_tab: half,
@@ -514,6 +614,7 @@ async function t4_web_locks(engineName, url) {
       final_check: {
         missing: final.check.missing.length,
         corrupt: final.check.corrupt.length,
+        wal: finalWal,
         wal_len: final.wal_len,
         expected_wal_len: expectedWal,
       },
@@ -560,23 +661,43 @@ const SCENARIOS = [
 
 async function runScenario(engineName, [name, fn], url) {
   const started = Date.now();
+  let record;
   try {
     const out = await withTimeout(fn(engineName, url), SCENARIO_MS, `${engineName} ${name}`);
-    const status = out.ok === null ? 'info' : out.ok ? 'pass' : 'fail';
-    return { status, ms: Date.now() - started, detail: out.detail };
+    if (out.method_error) {
+      // The scenario's method did not run as specified (e.g. the kill
+      // scenarios found nothing to kill, verdict X-6 R1): the record is
+      // invalid — an error — rather than a pass or fail.
+      record = {
+        status: 'error',
+        ms: Date.now() - started,
+        detail: { method_error: out.method_error, ...out.detail },
+      };
+    } else {
+      const status = out.ok === null ? 'info' : out.ok ? 'pass' : 'fail';
+      record = { status, ms: Date.now() - started, detail: out.detail };
+    }
   } catch (error) {
     if (error && error.isTimeout) {
-      await sigkillBrowser();
-      return { status: 'timeout', ms: Date.now() - started, detail: { error: error.message } };
+      // Kill for real before recording: a hung browser must not leak into
+      // the next scenario (verdict X-6 R1b).
+      const kill = await sigkillBrowser();
+      record = {
+        status: 'timeout',
+        ms: Date.now() - started,
+        detail: { error: error.message, kill },
+      };
+    } else {
+      record = {
+        status: 'error',
+        ms: Date.now() - started,
+        detail: { error: String((error && error.message) || error) },
+      };
     }
-    return {
-      status: 'error',
-      ms: Date.now() - started,
-      detail: { error: String((error && error.message) || error) },
-    };
-  } finally {
-    await closeBrowser();
   }
+  const cleanup = await closeBrowser();
+  if (cleanup.leftover_pids.length > 0) record.cleanup_kill = cleanup;
+  return record;
 }
 
 async function main() {
@@ -593,6 +714,8 @@ async function main() {
       node: process.version,
       playwright: '1.64.1 (by absolute path)',
       scenario_timeout_ms: SCENARIO_MS,
+      kill_method:
+        'SIGKILL by /proc cmdline scan on the unique per-run profile directory (verdict X-6 R1)',
       datasets: {
         t1_pages: T1_PAGES,
         t2_pages: T2_PAGES,
@@ -644,10 +767,20 @@ async function main() {
       t2?.detail?.tab_kill?.ok === true &&
       t2?.detail?.browser_kill?.ok === true;
     decision = decision && survives === true;
+    // WAL byte-for-byte content across every test that checks it (R3).
+    const walOk =
+      t1?.detail?.wal?.ok === true &&
+      t2?.detail?.tab_kill?.wal?.ok === true &&
+      t2?.detail?.browser_kill?.wal?.ok === true &&
+      t4?.detail?.final_check?.wal?.ok === true;
+    const browserKill = t2?.detail?.browser_kill?.kill;
     console.log(
       `${engineName}: T1=${t1?.status} T2(tab)=${t2?.detail?.tab_kill?.ok} T2(browser)=${t2?.detail?.browser_kill?.ok}` +
+        ` (killed=${browserKill?.killed} pids=[${browserKill?.pids ?? []}])` +
         ` T3 survived=${t3?.detail?.intact_pages_after_kill}/${t3?.detail?.pages_written}` +
-        ` T4=${t4?.status} T5 flush p50/p99=${t5?.detail?.flush?.p50_ms}/${t5?.detail?.flush?.p99_ms}ms` +
+        ` (killed=${t3?.detail?.kill?.killed} pids=[${t3?.detail?.kill?.pids ?? []}])` +
+        ` T4=${t4?.status} WAL(content)=${walOk}` +
+        ` T5 flush p50/p99=${t5?.detail?.flush?.p50_ms}/${t5?.detail?.flush?.p99_ms}ms` +
         ` write p50/p99=${t5?.detail?.write?.p50_ms}/${t5?.detail?.write?.p99_ms}ms`,
     );
   }
@@ -658,14 +791,13 @@ async function main() {
 }
 
 process.on('exit', () => {
+  // Synchronous on purpose (exit handlers cannot await): a last-resort
+  // PID sweep so no browser outlives the harness (verdict X-6 R1c).
   if (live) {
-    const proc = browserProcessOf(live.context);
-    if (proc && proc.exitCode === null) {
-      try {
-        proc.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
+    try {
+      killPids(pidsForProfile(live.profile));
+    } catch {
+      /* best effort at exit */
     }
   }
   if (server) {
@@ -679,6 +811,13 @@ process.on('exit', () => {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     stopServer();
+    if (live) {
+      try {
+        killPids(pidsForProfile(live.profile));
+      } catch {
+        /* best effort */
+      }
+    }
     process.exit(130);
   });
 }
