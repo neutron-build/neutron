@@ -9,7 +9,7 @@
 # upstream release coordinates.
 FROM docker.io/library/alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
 
-RUN apk add --no-cache build-base wget zip
+RUN apk add --no-cache build-base wget unzip
 
 ARG SQLITE_YEAR=2026
 ARG SQLITE_VER=3540100
@@ -30,7 +30,6 @@ RUN mkdir -p /opt/nb /tmp/build \
       -I. -DSQLITE_THREADSAFE=0 -DSQLITE_ENABLE_SHA3 \
       -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_OMIT_LOAD_EXTENSION \
       -lm \
- && /opt/nb/speedtest1 --version \
  && rm -rf /tmp/build
 
 # The workload driver runs the binary from the shared volume this image
