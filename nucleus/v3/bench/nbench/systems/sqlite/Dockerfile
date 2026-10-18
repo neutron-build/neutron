@@ -21,7 +21,7 @@ RUN mkdir -p /opt/nb /tmp/build \
  && cd /tmp/build \
  && wget -q "https://sqlite.org/${SQLITE_YEAR}/sqlite-src-${SQLITE_VER}.zip" \
  && echo "${SQLITE_SHA3}  sqlite-src-${SQLITE_VER}.zip" > checksum.txt \
- && openssl dgst -sha3-256 -r sqlite-src-${SQLITE_VER}.zip | diff - checksum.txt \
+ && test "$(openssl dgst -sha3-256 -r sqlite-src-${SQLITE_VER}.zip | cut -d' ' -f1)" = "${SQLITE_SHA3}" \
  && unzip -q "sqlite-src-${SQLITE_VER}.zip" \
  && cd "sqlite-src-${SQLITE_VER}" \
  && cc -O2 -o /opt/nb/speedtest1 tool/speedtest1.c sqlite3.c \

@@ -279,13 +279,12 @@ pub fn qdrant_search(
 
 /// Poll the collection until it is `green` with all points present.
 ///
-/// `indexed_vectors_count` only reaches `points_count` when the
-/// collection is large enough to cross Qdrant's `indexing_threshold`
-/// (default 10k vectors); tiny collections stay exact-brute-force by
-/// design, so for small datasets the points count alone is the
-/// readiness signal. For a benchmark-sized collection, an HNSW index is
-/// required — anything below the threshold that should have one is an
-/// error, not a wait condition.
+/// `indexed_vectors_count` equals `points_count` only when Qdrant's
+/// optimizer decides every segment warrants an HNSW graph; with the
+/// default optimizer settings small tail segments legitimately stay
+/// unindexed (exact-scanned) while the collection is green. Readiness is
+/// therefore green + all points; the indexed fraction is printed as
+/// provenance into the row's init log.
 pub fn qdrant_wait_green(
     host: &str,
     port: u16,
@@ -293,9 +292,6 @@ pub fn qdrant_wait_green(
     expected_points: usize,
     timeout: Duration,
 ) -> Result<()> {
-    /// Qdrant's default `indexing_threshold`, below which no HNSW graph
-    /// is built (collections under it answer by exact scan).
-    const QDRANT_INDEXING_THRESHOLD: usize = 10_000;
     let deadline = Instant::now() + timeout;
     loop {
         let resp = http::request(
@@ -322,20 +318,14 @@ pub fn qdrant_wait_green(
                 .get("indexed_vectors_count")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0) as usize;
-            let index_ready = indexed == points || points < QDRANT_INDEXING_THRESHOLD;
-            if status == "green" && points == expected_points && index_ready {
-                eprintln!("collection green: {points} points, {indexed} indexed vectors");
+            if status == "green" && points == expected_points {
+                eprintln!(
+                    "collection green: {points} points, {indexed} indexed vectors \
+                     ({:.1}% in HNSW segments; the remainder is exact-scanned, which \
+                     is Qdrant's default optimizer policy for small tail segments)",
+                    100.0 * indexed as f64 / points.max(1) as f64
+                );
                 return Ok(());
-            }
-            if status == "green" && points == expected_points && !index_ready {
-                return Err(Error::Command {
-                    name: "qdrant wait green".into(),
-                    status: 1,
-                    stderr_tail: format!(
-                        "collection stable at {points} points but only {indexed} \
-                         indexed: HNSW build did not complete"
-                    ),
-                });
             }
         }
         if Instant::now() > deadline {

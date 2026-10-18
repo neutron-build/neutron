@@ -64,8 +64,9 @@ pub const AOF_EVERYSEC: &str = "aof-everysec";
 /// Readiness probe for a server system.
 #[derive(Clone, Copy, Debug)]
 pub enum Ready {
-    /// `pg_isready -U postgres -d <db>` via podman exec.
-    PgIsready { db: &'static str },
+    /// `pg_isready -U postgres -d <db> -p <port>` via podman exec (the
+    /// port must match the server's configured port).
+    PgIsready { db: &'static str, port: u16 },
     /// `<cli> ping` expecting PONG via podman exec.
     RespPing { cli: &'static str },
     /// HTTP GET /healthz expecting 200 (Qdrant).
@@ -326,7 +327,10 @@ pub const SYSTEMS: &[SystemDef] = &[
             (SYNC_ON, &["-c", "synchronous_commit=on"]),
             (SYNC_OFF, &["-c", "synchronous_commit=off"]),
         ],
-        ready: Ready::PgIsready { db: "nbench" },
+        ready: Ready::PgIsready {
+            db: "nbench",
+            port: 5432,
+        },
         run_extra: &[
             "-e",
             "POSTGRES_USER=postgres",
@@ -358,7 +362,10 @@ pub const SYSTEMS: &[SystemDef] = &[
             "maintenance_work_mem=2GB",
         ],
         variants: &[],
-        ready: Ready::PgIsready { db: "nbench" },
+        ready: Ready::PgIsready {
+            db: "nbench",
+            port: 5433,
+        },
         run_extra: &[
             "-e",
             "POSTGRES_USER=postgres",

@@ -21,6 +21,10 @@ case ${NB_MODE:?} in
       nb-podman exec "$C" psql -U postgres -d "$NB_DB" -q -t -A \
         -c "SELECT 'pgvector ' || extversion FROM pg_extension WHERE extname='vector'"
     } > "${NB_OUT}/versions.txt" 2>&1
+    # idempotent: covers a volume whose entrypoint init was interrupted
+    nb-podman exec "$C" psql -U postgres -d "$NB_DB" -q \
+      -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+      >> "${NB_LOG:?}" 2>&1
 
     nb-podman exec "$C" psql -U postgres -d "$NB_DB" -q \
       -c "DROP TABLE IF EXISTS items;" \

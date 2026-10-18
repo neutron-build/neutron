@@ -174,10 +174,18 @@ fn start_system(root: &Path, system: &SystemDef, image: &str, variant: Option<&s
 fn wait_ready(system: &SystemDef, _root: &Path) -> Result<()> {
     match system.ready {
         Ready::None => Ok(()),
-        Ready::PgIsready { db } => {
+        Ready::PgIsready { db, port } => {
             let ok = podman::wait_until_exec_ok(
                 &system.container(),
-                &["pg_isready", "-U", "postgres", "-d", db],
+                &[
+                    "pg_isready",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    db,
+                    "-p",
+                    &port.to_string(),
+                ],
                 Duration::from_secs(300),
             );
             ok.then_some(()).ok_or_else(|| Error::Command {
