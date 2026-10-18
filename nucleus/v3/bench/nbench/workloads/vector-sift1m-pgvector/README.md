@@ -28,3 +28,9 @@ ground truth, 128 dimensions, Euclidean distance.
   result recording stay inside this harness. Qdrant is driven over its
   REST API; pgvector through a single psql session (per-query latencies
   are therefore recorded for Qdrant only; QPS is the compared metric).
+- Load-path robustness: collection create/delete, point upserts and
+  status polls are idempotent and re-sent with bounded backoff on
+  transient transport failures (one dropped response at ~564k/1M points
+  voided the 2026-10-18 qdrant load with the server healthy). Timed
+  search passes never retry — a transient failure there fails the row
+  instead of hiding inside the measurement.

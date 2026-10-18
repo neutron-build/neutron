@@ -54,7 +54,16 @@ pub struct Params {
     pub ef: Vec<u64>,
     /// Vector search: number of queries per run (the SIFT1M query set size).
     pub queries: u64,
-    /// speedtest1 --size multiplier.
+    /// speedtest1 --size multiplier. The default (10000 = 100x the
+    /// speedtest1 default of 100) is bounded by test 140: its
+    /// `group_concat(c)` accumulates one `z1` number-name per matching
+    /// row, and `z1` holds `5 * size` rows (speedtest1.c testset_main)
+    /// of at most ~75 bytes each — at 10000 even a match-everything
+    /// concatenation stays ~3x under SQLite's documented default
+    /// `SQLITE_MAX_LENGTH` of 1e9. At 100000 (50M rows) the run of
+    /// 2026-10-18 died in test 140 with `string or blob too big`
+    /// (SQLITE_LIMIT_LENGTH, error 18). The bound is pinned by a unit
+    /// test in this file.
     pub st_size: u64,
 }
 
@@ -82,7 +91,7 @@ impl Default for Params {
             ef_construction: 200,
             ef: vec![16, 32, 64, 128, 256],
             queries: 10_000,
-            st_size: 100_000,
+            st_size: 10_000,
         }
     }
 }
@@ -187,6 +196,16 @@ mod tests {
         assert_eq!(p.ef_construction, 200);
         assert!(p.runs >= 5);
         assert!(!p.ef.is_empty());
+        // speedtest1 test 140 bound: z1 holds 5*st_size number-names of
+        // <= ~75 bytes plus a separator each; the concatenation must
+        // stay under SQLite's documented default SQLITE_MAX_LENGTH (1e9)
+        // even if every row matches the LIKE, or the suite aborts with
+        // error 18 (observed at st_size=100000 on 2026-10-18).
+        assert!(
+            p.st_size * 5 * 76 < 1_000_000_000,
+            "st_size {} can overflow SQLITE_MAX_LENGTH in test 140",
+            p.st_size
+        );
     }
 
     #[test]

@@ -115,6 +115,81 @@ pub fn recall_at_k(results: &[Vec<i64>], truth: &[Vec<i32>], k: usize) -> Result
 
 // ---- Qdrant REST ----
 
+/// Attempts for one idempotent load-path request before giving up.
+const LOAD_RETRY_ATTEMPTS: usize = 5;
+
+/// Backoff before load-path retry `attempt` (0-based): 1s, 2s, 4s, 8s.
+fn load_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(3))
+}
+
+/// A status the server may recover from on an idempotent re-send.
+fn is_transient_status(status: u16) -> bool {
+    status >= 500 || status == 429
+}
+
+/// Perform one Qdrant request with bounded retries, for the *load path
+/// only* (collection create/delete, point upserts, status polls — all
+/// idempotent by construction).
+///
+/// Invariant owned here: measurement requests never retry. Transports
+/// hiccup during long bulk loads — the 2026-10-18 SIFT1M upload lost one
+/// response mid-stream at ~564k/1M points with the server healthy
+/// (client saw `no header terminator`) — and an hour of loading must not
+/// be voided by one dropped connection. But [`qdrant_search`] is a timed
+/// measurement pass: a transient failure there must surface as an error
+/// (the row is re-run), never hide inside a re-send that the clock does
+/// not account for.
+fn request_with_retry(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<crate::http::Response> {
+    request_with_retry_attempts(host, port, method, path, body, timeout, LOAD_RETRY_ATTEMPTS)
+}
+
+/// Same as [`request_with_retry`] with an explicit attempt budget, so
+/// the give-up path is testable in milliseconds instead of the full
+/// production backoff.
+fn request_with_retry_attempts(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timeout: Duration,
+    attempts: usize,
+) -> Result<crate::http::Response> {
+    let mut last_err: Option<Error> = None;
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            let wait = load_retry_backoff(attempt - 1);
+            eprintln!(
+                "qdrant {method} {path}: attempt {}/{} failed ({}), retrying in {wait:?}",
+                attempt,
+                attempts,
+                last_err.as_ref().map(|e| e.to_string()).unwrap_or_default()
+            );
+            std::thread::sleep(wait);
+        }
+        match http::request(host, port, method, path, body, timeout) {
+            Ok(resp) if !is_transient_status(resp.status) => return Ok(resp),
+            Ok(resp) => {
+                last_err = Some(Error::Command {
+                    name: format!("qdrant {method} (HTTP {})", resp.status),
+                    status: resp.status as i32,
+                    stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
+                });
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| Error::Usage("retry loop made no attempts".into())))
+}
+
 /// Create the collection with the card's HNSW parameters, deleting any
 /// previous collection of the same name first (idempotent reinit).
 pub fn qdrant_create(
@@ -137,7 +212,7 @@ pub fn qdrant_create(
     if let Ok(resp) = &existing
         && resp.status == 200
     {
-        let del = http::request(
+        let del = request_with_retry(
             host,
             port,
             "DELETE",
@@ -169,7 +244,7 @@ pub fn qdrant_create(
             ]),
         ),
     ]))?;
-    let resp = http::request(
+    let resp = request_with_retry(
         host,
         port,
         "PUT",
@@ -200,7 +275,8 @@ fn points_batch_json(ids: impl Iterator<Item = usize>, vecs: &[Vec<f32>]) -> Res
 }
 
 /// Upload a batch of points with `wait=true` (PUT upsert: newer Qdrant
-/// rejects POST for this body shape).
+/// rejects POST for this body shape). Idempotent, so it uses the
+/// load-path retry: a dropped connection re-sends the same batch.
 pub fn qdrant_upload(
     host: &str,
     port: u16,
@@ -209,7 +285,7 @@ pub fn qdrant_upload(
     vecs: &[Vec<f32>],
 ) -> Result<()> {
     let body = points_batch_json(start_id..start_id + vecs.len(), vecs)?;
-    let resp = http::request(
+    let resp = request_with_retry(
         host,
         port,
         "PUT",
@@ -294,7 +370,9 @@ pub fn qdrant_wait_green(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let resp = http::request(
+        // Status polls are pure reads: retry transient transport errors
+        // so a long wait is not voided by one dropped poll response.
+        let resp = request_with_retry(
             host,
             port,
             "GET",
@@ -440,6 +518,119 @@ pub fn parse_pg_search_output(text: &str, expected: usize) -> Result<Vec<Vec<i64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Spawn a one-connection-per-thread TCP server that plays a scripted
+    /// sequence of behaviors, one per accepted connection: `Drop` closes
+    /// without responding (the observed 2026-10-18 failure shape), and
+    /// `Status(u16)` answers with that status and a two-byte body.
+    /// Returns the port and a connection counter.
+    fn flaky_server(script: Vec<&'static str>) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for behavior in script {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Drain the request until 100ms of quiet so the socket
+                // never closes with unread data queued (that turns the
+                // close into an RST and races the client's read).
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 512];
+                loop {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                if behavior == "Drop" {
+                    continue; // close without any response
+                }
+                if let Some(code) = behavior.strip_prefix("Status:") {
+                    let status: u16 = code.parse().expect("status code");
+                    let resp = format!(
+                        "HTTP/1.1 {status} x\r\nContent-Length: 2\r\n\r\nok"
+                    );
+                    let _ = conn.write_all(resp.as_bytes());
+                }
+            }
+        });
+        (port, count)
+    }
+
+    #[test]
+    fn load_retry_survives_dropped_connections() {
+        // Two dropped responses, then a good one: the load path must
+        // recover (this is the 2026-10-18 upload failure, replayed).
+        let (port, count) = flaky_server(vec!["Drop", "Drop", "Status:200"]);
+        let resp = request_with_retry_attempts(
+            "127.0.0.1",
+            port,
+            "PUT",
+            "/points?wait=true",
+            b"{}",
+            Duration::from_secs(5),
+            5,
+        )
+        .expect("retry succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn load_retry_gives_up_after_the_budget() {
+        let (port, count) = flaky_server(vec!["Drop", "Drop", "Drop"]);
+        let r = request_with_retry_attempts(
+            "127.0.0.1",
+            port,
+            "PUT",
+            "/points?wait=true",
+            b"{}",
+            Duration::from_secs(5),
+            2,
+        );
+        assert!(r.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn client_errors_are_not_retried() {
+        // A 400 is the server's answer, not a hiccup: exactly one
+        // connection, and the caller sees the status to report it.
+        let (port, count) = flaky_server(vec!["Status:400"]);
+        let resp = request_with_retry_attempts(
+            "127.0.0.1",
+            port,
+            "PUT",
+            "/points",
+            b"{}",
+            Duration::from_secs(5),
+            5,
+        )
+        .expect("response returned without retry");
+        assert_eq!(resp.status, 400);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transient_status_classification() {
+        for s in [200u16, 301, 400, 404, 418] {
+            assert!(!is_transient_status(s), "{s} must not retry");
+        }
+        for s in [429u16, 500, 502, 503, 504] {
+            assert!(is_transient_status(s), "{s} must retry");
+        }
+        assert_eq!(load_retry_backoff(0), Duration::from_secs(1));
+        assert_eq!(load_retry_backoff(1), Duration::from_secs(2));
+        assert_eq!(load_retry_backoff(9), Duration::from_secs(8));
+    }
 
     fn write_tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("nbench-tests");

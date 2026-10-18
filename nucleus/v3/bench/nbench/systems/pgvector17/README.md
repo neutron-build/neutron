@@ -22,7 +22,12 @@ workload; the index build runs with default durability).
 ## Limits
 
 `--memory 24g --cpus 16`, `--network host`, volume `nbench-pgvec-data`
-plus read-only `nbench-pgvec-init` for `init/00-vector.sql`.
+plus read-only `nbench-pgvec-init` for `init/00-vector.sql`, and
+`--shm-size 8g`: parallel HNSW builds coordinate through POSIX shared
+memory and podman's default `/dev/shm` is 64MB (the postgres image docs
+direct shared-memory-heavy workloads to raise it; without it the index
+build failed with "could not resize shared memory segment ... No space
+left on device", 2026-10-18).
 
 ## Licence / benchmark-publication check
 

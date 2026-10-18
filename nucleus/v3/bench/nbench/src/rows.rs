@@ -376,6 +376,16 @@ pub const SYSTEMS: &[SystemDef] = &[
             "POSTGRES_PASSWORD=postgres",
             "-e",
             "POSTGRES_DB=nbench",
+            // Parallel HNSW index builds coordinate through POSIX shared
+            // memory, which podman caps at 64MB by default (the postgres
+            // image docs tell heavy-shared-memory workloads to raise
+            // --shm-size). Without it the 2026-10-18 init failed with
+            // "could not resize shared memory segment ... to 2144374272
+            // bytes: No space left on device". 8g covers the 2GB
+            // maintenance_work_mem build with headroom; it is container
+            // plumbing, not engine tuning.
+            "--shm-size",
+            "8g",
         ],
     },
     SystemDef {
