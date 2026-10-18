@@ -84,8 +84,8 @@ writes a dirty victim back and reads the new page in.
 
 ```bash
 cd nucleus/v3
-cargo test -q -p e0-btree --release                       # the test suite
-cargo run --release -p e0-btree --features sqlite --bin e0-bench -- \
+cargo test -q -p e0-storage --release                       # the test suite
+cargo run --release -p e0-storage --features sqlite --bin e0-bench -- \
     --keys 1000000 --out e0-result.json                   # the benchmark
 ```
 

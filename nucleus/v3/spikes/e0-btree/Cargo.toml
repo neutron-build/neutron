@@ -1,14 +1,23 @@
 # E0 micro-spike (card X-0; PLAN-v3 §4 E0). Not production code: this crate
 # exists to measure a safe-Rust slotted-page B+tree against SQLite, and is
 # the substrate for E1′ (X-1a…X-3) and E4 (X-5).
+#
+# Card X-0-F1 renamed the *package* to `e0-storage` (its acceptance command
+# is `cargo test -q -p e0-storage`); the lib target keeps the historical
+# name `e0_btree` so imports and the merged X-0 references stay valid.
 [package]
-name = "e0-btree"
+name = "e0-storage"
 description = "E0 micro-spike: slotted-page B+tree on a simple buffer pool (card X-0)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[lib]
+# The historical lib name (all `use e0_btree::…` imports, including the
+# merged X-0 tests, keep working under the renamed package).
+name = "e0_btree"
 
 [features]
 # SQLite is the E0 baseline; the C build is confined to the benchmark feature.
