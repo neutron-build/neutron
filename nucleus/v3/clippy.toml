@@ -1,0 +1,4 @@
+# Tests may unwrap/expect/panic; the engine may not (PLAN-v3 §6.1).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

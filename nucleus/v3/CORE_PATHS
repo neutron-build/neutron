@@ -1,0 +1,15 @@
+# P-tier paths (PLAN-v3 §7.1, §7.6). A card branch that changes any of these
+# merges only with a P-tier verdict (scripts/merge-card.sh), and the scaffold
+# audit (scripts/audit-merges.sh) re-checks every merge in CI.
+# Entry forms: dir/ prefix, exact file, or glob (see scripts/core-paths-lib.sh).
+docs/
+verdicts/
+scripts/
+tools/
+CORE_PATHS
+Cargo.toml
+deny.toml
+clippy.toml
+rust-toolchain.toml
+crates/nucleus-store/
+crates/nucleus-env/

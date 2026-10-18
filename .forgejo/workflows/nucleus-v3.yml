@@ -1,0 +1,58 @@
+name: Nucleus v3
+
+# PLAN-v3 §6.1 and §7.6. The gate is scripts/gate.sh; on the scaffold the merge
+# audit re-checks that every card merge carries a qualifying verdict.
+
+on:
+  push:
+    paths:
+      - "nucleus/v3/**"
+      - ".forgejo/workflows/nucleus-v3.yml"
+  pull_request:
+    paths:
+      - "nucleus/v3/**"
+      - ".forgejo/workflows/nucleus-v3.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nucleus-v3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  CARGO_HOME: /var/cache/forgejo-runner/cargo
+  CARGO_TARGET_DIR: /var/cache/forgejo-runner/target/nucleus-v3
+
+jobs:
+  v3:
+    name: Gate and merge audit
+    runs-on: nucleus-lab
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: nucleus/v3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tools
+        run: |
+          rustup show active-toolchain
+          cargo deny --version >/dev/null 2>&1 || cargo install cargo-deny --locked
+
+      - name: Gate
+        run: bash scripts/gate.sh
+
+      - name: Docs only via spec cards (card branches)
+        if: startsWith(github.head_ref || github.ref_name, 'card/v3-')
+        run: |
+          bash scripts/check-core-paths.sh --docs origin/nucleus/v3-scaffold HEAD \
+            && echo "no docs/ changes" \
+            || echo "::warning::docs/ changed: merge-card.sh will require Class: spec and a P verdict"
+
+      - name: Merge audit (scaffold)
+        if: (github.head_ref || github.ref_name) == 'nucleus/v3-scaffold'
+        run: bash scripts/audit-merges.sh HEAD
