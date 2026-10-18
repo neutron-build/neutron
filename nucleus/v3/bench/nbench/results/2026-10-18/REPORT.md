@@ -18,6 +18,24 @@ container_runtime_note: rootless podman via systemd-run --user (PLAN-v3 §5.2 ru
 
 ## Rows
 
+<!-- source: kv-memtier-redis7.json -->
+### kv-memtier-redis7 — redis7
+
+memtier GET/SET 1:10 against Redis 7, pipeline 1/16, AOF always/everysec
+
+Status: ok
+
+| config | run | ops_sec | p50_ms | p99_ms | kb_per_sec | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| appendfsync=always pipeline=1 | cold | 39187 | 1.415 | 5.535 | 1663 | n/a | n/a |
+| appendfsync=always pipeline=1 | warm (n=5) | 40205 [33633, 47095] | 1.519 [1.399, 1.647] | 3.695 [3.007, 6.367] | 1706 [1427, 1998] | n/a | n/a |
+| appendfsync=always pipeline=16 | cold | 382808 | 2.623 | 6.175 | 16256 | n/a | n/a |
+| appendfsync=always pipeline=16 | warm (n=5) | 351784 [338923, 454719] | 2.783 [2.287, 2.815] | 6.047 [4.863, 7.359] | 14960 [14414, 19332] | n/a | n/a |
+| appendfsync=everysec pipeline=1 | cold | 72005 | 0.687 | 2.079 | 3055 | n/a | n/a |
+| appendfsync=everysec pipeline=1 | warm (n=5) | 66355 [50808, 82049] | 0.983 [0.527, 1.263] | 2.415 [2.175, 2.975] | 2816 [2156, 3482] | n/a | n/a |
+| appendfsync=everysec pipeline=16 | cold | 554652 | 1.759 | 5.023 | 23566 | n/a | n/a |
+| appendfsync=everysec pipeline=16 | warm (n=5) | 437660 [262702, 578000] | 2.095 [1.799, 2.703] | 7.071 [3.951, 12.6] | 18627 [11180, 24598] | n/a | n/a |
+
 <!-- source: kv-memtier-valkey8.json -->
 ### kv-memtier-valkey8 — valkey8
 
@@ -27,8 +45,14 @@ Status: ok
 
 | config | run | ops_sec | p50_ms | p99_ms | kb_per_sec | Nucleus ratio | label |
 |---|---|---|---|---|---|---|---|
-| appendfsync=always pipeline=1 | cold | 106236 | 0.543 | 1.375 | 4507 | n/a | n/a |
-| appendfsync=always pipeline=1 | warm (n=1) | 100397 [100397, 100397] | 0.551 [0.551, 0.551] | 1.703 [1.703, 1.703] | 4260 [4260, 4260] | n/a | n/a |
+| appendfsync=always pipeline=1 | cold | 97044 | 0.575 | 2.063 | 4117 | n/a | n/a |
+| appendfsync=always pipeline=1 | warm (n=5) | 97930 [94477, 100460] | 0.591 [0.575, 0.591] | 1.487 [1.327, 1.663] | 4156 [4010, 4264] | n/a | n/a |
+| appendfsync=always pipeline=16 | cold | 840661 | 1.055 | 2.751 | 35749 | n/a | n/a |
+| appendfsync=always pipeline=16 | warm (n=5) | 820780 [817547, 856904] | 1.055 [1.047, 1.063] | 2.671 [2.447, 2.815] | 34995 [34857, 36531] | n/a | n/a |
+| appendfsync=everysec pipeline=1 | cold | 170863 | 0.367 | 0.743 | 7251 | n/a | n/a |
+| appendfsync=everysec pipeline=1 | warm (n=5) | 168673 [167904, 169099] | 0.367 [0.367, 0.367] | 0.743 [0.735, 0.743] | 7162 [7130, 7180] | n/a | n/a |
+| appendfsync=everysec pipeline=16 | cold | 1233733 | 0.751 | 1.527 | 52528 | n/a | n/a |
+| appendfsync=everysec pipeline=16 | warm (n=5) | 1209506 [1201988, 1220976] | 0.751 [0.751, 0.759] | 1.575 [1.543, 1.623] | 51682 [51361, 52173] | n/a | n/a |
 
 <!-- source: oltp-pgbench-pg17.json -->
 ### oltp-pgbench-pg17 — postgres17
@@ -57,16 +81,22 @@ Status: ok
 
 sysbench oltp_read_write + oltp_point_select on PG17, threads 1/16/64
 
-Status: **VOID (digest mismatch)**
+Status: ok
 
 | config | run | tps | qps | latency_avg_ms | p99_ms | Nucleus ratio | label |
 |---|---|---|---|---|---|---|---|
-| workload=oltp_read_write threads=1 | warm (n=0) | - | - | - | - | n/a | n/a |
-| workload=oltp_read_write threads=16 | warm (n=0) | - | - | - | - | n/a | n/a |
-| workload=oltp_read_write threads=64 | warm (n=0) | - | - | - | - | n/a | n/a |
-| workload=oltp_point_select threads=1 | warm (n=0) | - | - | - | - | n/a | n/a |
-| workload=oltp_point_select threads=16 | warm (n=0) | - | - | - | - | n/a | n/a |
-| workload=oltp_point_select threads=64 | warm (n=0) | - | - | - | - | n/a | n/a |
+| workload=oltp_read_write threads=1 | cold | 1265 | 25292 | 0.790 | 1.960 | n/a | n/a |
+| workload=oltp_read_write threads=1 | warm (n=5) | 1200 [1143, 1209] | 23991 [22862, 24188] | 0.830 [0.830, 0.870] | 2.180 [2.070, 2.970] | n/a | n/a |
+| workload=oltp_read_write threads=16 | cold | 3919 | 78403 | 4.080 | 6.550 | n/a | n/a |
+| workload=oltp_read_write threads=16 | warm (n=5) | 3577 [3557, 3582] | 71552 [71145, 71660] | 4.470 [4.460, 4.490] | 6.790 [6.670, 7.430] | n/a | n/a |
+| workload=oltp_read_write threads=64 | cold | 4064 | 81363 | 15.7 | 38.9 | n/a | n/a |
+| workload=oltp_read_write threads=64 | warm (n=5) | 3761 [3739, 3802] | 75304 [74860, 76123] | 17.0 [16.8, 17.1] | 41.9 [41.1, 41.9] | n/a | n/a |
+| workload=oltp_point_select threads=1 | cold | 58858 | 58858 | 0.020 | 0.050 | n/a | n/a |
+| workload=oltp_point_select threads=1 | warm (n=5) | 60332 [59791, 60700] | 60332 [59791, 60700] | 0.020 [0.020, 0.020] | 0.030 [0.030, 0.030] | n/a | n/a |
+| workload=oltp_point_select threads=16 | cold | 254085 | 254085 | 0.060 | 0.120 | n/a | n/a |
+| workload=oltp_point_select threads=16 | warm (n=5) | 242314 [240521, 242700] | 242314 [240521, 242700] | 0.070 [0.070, 0.070] | 0.120 [0.120, 0.120] | n/a | n/a |
+| workload=oltp_point_select threads=64 | cold | 194950 | 194950 | 0.330 | 0.890 | n/a | n/a |
+| workload=oltp_point_select threads=64 | warm (n=5) | 191975 [190935, 194421] | 191975 [190935, 194421] | 0.330 [0.330, 0.330] | 0.920 [0.840, 0.970] | n/a | n/a |
 
 ## Nucleus comparison
 
