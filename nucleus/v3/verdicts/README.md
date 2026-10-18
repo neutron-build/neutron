@@ -25,3 +25,9 @@ Followups: <card ids, comma-separated> | none
 Rules: an orchestrator never gates a card it authored, nor any spec edit; a P
 card needs a P verdict; REWORK and ESCALATE verdicts are committed too (they
 block the merge and keep the history).
+
+**Trust limit.** Verdict authorship is not cryptographically authenticated: a
+verdict file written by an orchestrator that claims `Gate-tier: P` is detectable
+only by review (the `Gate-session` id must match a real T3 task or agent run).
+In audit mode `Card-gate` is taken from the verdict, because cards are
+local-only. Periodic Opus reviews spot-check `Gate-session` ids against T3.

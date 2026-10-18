@@ -32,4 +32,4 @@ while IFS= read -r f; do
   [ -n "$f" ] || continue
   rel=${f#"$v3"/}
   if e=$(is_core "$rel" "$entries"); then echo "CORE $rel ($e)"; fi
-done < <(git diff --name-only "$base...$head" -- ":/$v3")
+done < <(git diff --no-renames --name-only "$base...$head" -- ":/$v3")

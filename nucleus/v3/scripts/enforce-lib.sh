@@ -10,7 +10,9 @@ V3=nucleus/v3
 vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed 's/[[:space:]]*$//'; }
 
 # changed BASE HEAD [pathspec...]: changed paths, repository-relative.
-changed() { local b=$1 h=$2; shift 2; git diff --name-only "$b...$h" -- "$@"; }
+# --no-renames: a rename must report its source path too, or moving a CORE file
+# out of a protected directory would look like an ordinary new file.
+changed() { local b=$1 h=$2; shift 2; git diff --no-renames --name-only "$b...$h" -- "$@"; }
 
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
@@ -54,7 +56,11 @@ check_merge() {
       *) [ "$tier" = P ] || errs+=("$f is outside $V3 and needs a P verdict"); continue ;;
     esac
     case $rel in
+      # The format description is P-tier infrastructure; other verdicts are off limits.
+      verdicts/README.md) [ "$tier" = P ] || errs+=("$f needs a P verdict"); continue ;;
       verdicts/*) errs+=("$f: a card may change only its own verdict file"); continue ;;
+      # The specs index is P-tier infrastructure; specs themselves need a spec card.
+      docs/README.md) [ "$tier" = P ] || errs+=("$f needs a P verdict"); continue ;;
       docs/*) { [ "$tier" = P ] && [ "$vclass" = spec ]; } || errs+=("$f: docs/ changes need Class: spec and a P verdict") ;;
     esac
     if [ "$tier" != P ] && is_core "$rel" "$core_entries" >/dev/null; then errs+=("$f is under CORE_PATHS and needs a P verdict"); fi
@@ -71,3 +77,16 @@ check_merge() {
   if [ ${#errs[@]} -gt 0 ]; then printf '%s\n' "${errs[@]}"; return 1; fi
   return 0
 }
+
+# clean_merge SHA: the merge commit's tree must equal the clean merge of its two
+# parents, so nothing was edited inside the merge itself ("evil merge"). A card
+# that does not merge cleanly is rebased and re-gated; conflicts are never
+# resolved inside a merge commit.
+clean_merge() {
+  local sha=$1 t
+  t=$(git merge-tree --write-tree "$sha^1" "$sha^2" 2>/dev/null) || { echo "the parents do not merge cleanly (conflicts must be fixed on the card branch and re-gated)"; return 1; }
+  [ "$(printf '%s\n' "$t" | head -1)" = "$(git rev-parse "$sha^{tree}")" ] || { echo "the merge commit's tree differs from the clean merge of its parents (edited inside the merge)"; return 1; }
+}
+
+# The paths whose every change the audit walks.
+AUDIT_PATHS=(":/$V3" ":/.forgejo/workflows/nucleus-v3.yml")

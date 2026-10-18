@@ -115,8 +115,10 @@ def in_scope(path, touch):
 
 
 def changed_files(wt, base):
-    _, committed = run(["git", "diff", "--name-only", f"{base}...HEAD"], wt)
-    _, out = run("git status --porcelain --untracked-files=all", wt)
+    # --no-renames: a rename must report its source path, or a protected file
+    # could be moved out of a protected directory unnoticed.
+    _, committed = run(["git", "diff", "--no-renames", "--name-only", f"{base}...HEAD"], wt)
+    _, out = run("git status --porcelain --no-renames --untracked-files=all", wt)
     files = set(committed.split())
     for line in out.splitlines():
         f = line[3:].strip().strip('"')

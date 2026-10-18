@@ -15,7 +15,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/core-paths-lib.sh"
 # shellcheck source=enforce-lib.sh
 . "$here/enforce-lib.sh"
-cd "$here/.."
+# Operate on the repository of the current directory (the scratch worktree);
+# the rules come from this script's own directory, so the very first merge of
+# nucleus/v3 (S-0) can run before the scratch branch contains any v3 files.
+cd "$(git rev-parse --show-toplevel)"
 # Cards are local-only (never committed); they live in the v3 checkout.
 cards=${NV3_CARDS:-$HOME/Workspace/neutron-v3/nucleus/v3/cards}
 id=${1:?usage: merge-card.sh <CARD-ID>}

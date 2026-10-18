@@ -4,10 +4,11 @@
 #
 #   audit-merges.sh [REF]     (default HEAD)
 #
-# Every first-parent commit on REF that changes nucleus/v3 must be a merge titled
-# "nucleus v3: merge card/v3-<ID> (...)" whose second parent passes the same
-# rules merge-card.sh applies (enforce-lib.sh, audit mode). A direct commit, or a
-# merge with another title, fails the audit.
+# Every first-parent commit on REF that changes nucleus/v3 or the v3 CI workflow
+# must be a merge titled "nucleus v3: merge card/v3-<ID> (...)" whose second
+# parent passes the rules merge-card.sh applies (enforce-lib.sh, audit mode) and
+# whose own tree is exactly the clean merge of its parents. A direct commit, a
+# merge with another title, or an edit made inside a merge fails the audit.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=core-paths-lib.sh
@@ -27,10 +28,14 @@ while read -r sha; do
     bad=1
     continue
   fi
+  if ! errs=$(clean_merge "$sha"); then
+    printf 'audit: %s (%s): %s\n' "$id" "$(git rev-parse --short "$sha")" "$errs"
+    bad=1
+  fi
   if ! errs=$(check_merge "$id" "$sha^1" "$sha^2" audit); then
     printf 'audit: %s (%s):\n%s\n' "$id" "$(git rev-parse --short "$sha")" "$errs"
     bad=1
   fi
-done < <(git rev-list --first-parent "$ref" -- ":/$V3")
+done < <(git rev-list --first-parent "$ref" -- "${AUDIT_PATHS[@]}")
 [ "$bad" -eq 0 ] && echo "audit: ok ($n commits)"
 exit $bad
