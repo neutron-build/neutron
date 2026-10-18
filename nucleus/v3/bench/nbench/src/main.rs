@@ -51,10 +51,12 @@ USAGE:
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == name {
+        // accept "-tag v", "--tag v" and "--tag=v"
+        let bare = a.trim_start_matches('-');
+        if bare == name {
             return it.next().cloned();
         }
-        if let Some(rest) = a.strip_prefix(&format!("{name}=")) {
+        if let Some(rest) = a.strip_prefix(&format!("--{name}=")) {
             return Some(rest.to_string());
         }
     }
@@ -67,9 +69,17 @@ fn required(args: &[String], name: &str) -> Result<String> {
 
 fn collect_sets(args: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for a in args {
-        if let Some(rest) = a.strip_prefix("--set")
-            && let Some(kv) = rest.strip_prefix('=')
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        // accept both "--set k=v" and "--set=k=v"
+        let value = if let Some(kv) = a.strip_prefix("--set=") {
+            Some(kv.to_string())
+        } else if a == "--set" {
+            it.next().cloned()
+        } else {
+            None
+        };
+        if let Some(kv) = value
             && let Some((k, v)) = kv.split_once('=')
         {
             out.push((k.trim().to_string(), v.trim().to_string()));

@@ -83,10 +83,12 @@ pub fn try_podman(args: &[&str]) -> i32 {
 /// Start a long-running server container as user unit `<unit>`.
 ///
 /// `--collect` makes systemd garbage-collect the unit when it stops; no
-/// `--wait` so the call returns as soon as the container is launched.
+/// `--wait` and no `--pipe` — card B-0's environment note: both would
+/// block until the server exits — so this returns as soon as systemd
+/// accepts the unit, and the runner polls readiness separately.
 pub fn unit_start(unit: &str, args: &[&str]) -> Result<()> {
     let status = Command::new("systemd-run")
-        .args(["--user", "--unit", unit, "--collect", "--pipe", "--quiet"])
+        .args(["--user", "--unit", unit, "--collect", "--quiet"])
         .arg("podman")
         .args(args)
         .status()

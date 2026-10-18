@@ -14,8 +14,8 @@ set -euo pipefail
 
 C=${NB_CONTAINER:?}
 nb-podman exec "$C" psql -U postgres -d "${NB_DB:?}" -q -t -A -c "
-  SELECT 'branches', count(*), sum(balance) FROM pgbench_branches;
-  SELECT 'tellers', count(*), sum(abalance) FROM pgbench_tellers;
+  SELECT 'branches', count(*), sum(bbalance) FROM pgbench_branches;
+  SELECT 'tellers', count(*), sum(tbalance) FROM pgbench_tellers;
   SELECT 'accounts', count(*), sum(abalance) FROM pgbench_accounts;
   SELECT 'history', count(*) FROM pgbench_history;
 " | sha256sum | cut -d' ' -f1

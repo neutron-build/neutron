@@ -380,6 +380,7 @@ mod tests {
 
     #[test]
     fn pgbench_summary_real_format() {
+        // Real captured output (PG 17.11, card B-0 smoke run).
         let log = include_str!("fixtures/pgbench-run.txt");
         let parsed = parse_pgbench_summary(log).expect("parse");
         let tps = parsed
@@ -388,14 +389,14 @@ mod tests {
             .find(|(k, _)| k == "tps")
             .map(|(_, v)| *v)
             .expect("tps");
-        assert!(tps > 1000.0 && tps < 2000.0, "unexpected tps {tps}");
+        assert!((tps - 1908.815189).abs() < 1e-6, "unexpected tps {tps}");
         let avg = parsed
             .metrics
             .iter()
             .find(|(k, _)| k == "latency_avg_ms")
             .map(|(_, v)| *v)
             .expect("avg");
-        assert!(avg > 10.0 && avg < 15.0, "unexpected avg {avg}");
+        assert!((avg - 0.522).abs() < 1e-9, "unexpected avg {avg}");
     }
 
     #[test]

@@ -310,6 +310,11 @@ fn exec_driver(
             stderr_tail: crate::podman::stderr_tail(&out.stderr),
         });
     }
+    if mode == "init" {
+        // Init logs describe dataset construction, not a measurement;
+        // their evidence is the digest step that follows.
+        return Ok(ParsedRun::default());
+    }
     parse_result(row, &log, &metrics_file)
 }
 
