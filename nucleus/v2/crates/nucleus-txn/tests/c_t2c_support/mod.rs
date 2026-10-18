@@ -338,6 +338,16 @@ pub fn assert_count_exact(core: &Core<MemKv>, txn: &Txn) {
         false,
     ) {
         let (k, v) = ok(row);
+        // C-DIAG1fix: this unbounded scan walks `/sys/` too, and `parse_key`
+        // splits from the right, so a `/sys/ts_clock/{ts}` sample at
+        // ts ≡ 0 (mod 256) parses as an intent key whose be64 wall-clock
+        // value fails `decode_intent` — the one-shot
+        // `Corrupt("intent value: bad magic")`. Skip the internal span
+        // before parsing, the same exclusion `count_intents` below applies
+        // ("rework item 3").
+        if k.starts_with(nucleus_txn::encoding::SYS_PREFIX) {
+            continue;
+        }
         if let Some((logical, nucleus_txn::encoding::Entry::Intent)) =
             nucleus_txn::encoding::parse_key(&k)
         {
