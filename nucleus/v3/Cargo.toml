@@ -1,0 +1,29 @@
+# Nucleus v3 workspace (PLAN-v3 §3.1, card S-0).
+# P0 experiments live under spikes/ and may depend on the v2 crates by path
+# (../v2/crates/*); the kept v2 crates move into crates/ at the start of Phase B.
+[workspace]
+resolver = "3"
+members = ["crates/*", "spikes/*", "bench/*"]
+
+[workspace.package]
+version = "3.0.0-dev"
+edition = "2024"
+license = "BUSL-1.1"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+thiserror = "2"
+
+# New-crate lint set (PLAN-v3 §6.1). Crates opt into the stricter
+# `indexing_slicing` at crate level (store, env, codec).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"

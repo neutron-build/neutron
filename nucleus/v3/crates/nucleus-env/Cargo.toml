@@ -1,0 +1,11 @@
+[package]
+name = "nucleus-env"
+description = "I/O, clock and randomness abstraction (PLAN-v3 §3.2); implemented in card A-1a/A-1b"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
