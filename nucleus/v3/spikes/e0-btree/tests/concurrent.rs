@@ -31,7 +31,7 @@ impl Sm {
         Sm(seed)
     }
     /// Next value in the stream.
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -63,8 +63,8 @@ fn concurrent_writers_and_readers() {
     let tree = Arc::new(BTree::new(store, 512).unwrap());
     let barrier = Arc::new(Barrier::new((WRITERS + READERS as u64) as usize));
     let stop = Arc::new(AtomicBool::new(false));
-    let models: Arc<Mutex<Vec<BTreeMap<Vec<u8>, Vec<u8>>>>> =
-        Arc::new(Mutex::new((0..WRITERS).map(|_| BTreeMap::new()).collect()));
+    type Models = Arc<Mutex<Vec<BTreeMap<Vec<u8>, Vec<u8>>>>>;
+    let models: Models = Arc::new(Mutex::new((0..WRITERS).map(|_| BTreeMap::new()).collect()));
 
     let mut writer_handles = Vec::new();
     let mut reader_handles = Vec::new();
@@ -82,7 +82,7 @@ fn concurrent_writers_and_readers() {
             let mut my_keys: Vec<u64> = (0..KEY_SPACE).filter(|k| k % WRITERS == t).collect();
             // insert in a per-thread random order
             for i in (1..my_keys.len()).rev() {
-                let j = (rng.next() as usize) % (i + 1);
+                let j = (rng.next_u64() as usize) % (i + 1);
                 my_keys.swap(i, j);
             }
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -105,7 +105,7 @@ fn concurrent_writers_and_readers() {
             for round in 0..3u64 {
                 let mut round_keys = my_keys.clone();
                 for i in (1..round_keys.len()).rev() {
-                    let j = (rng.next() as usize) % (i + 1);
+                    let j = (rng.next_u64() as usize) % (i + 1);
                     round_keys.swap(i, j);
                 }
                 for (r2, k) in round_keys.iter().enumerate() {
@@ -113,10 +113,10 @@ fn concurrent_writers_and_readers() {
                         eprintln!("w{t} mixed r{round} at {r2}");
                     }
                     let key = k.to_be_bytes();
-                    let pick = rng.next() % 3;
+                    let pick = rng.next_u64() % 3;
                     if pick == 0 || round == 0 && k % 3 == 0 {
                         let old = tree.delete(&key).unwrap();
-                        let expected = model.remove(&key.to_vec());
+                        let expected = model.remove(key.as_slice());
                         assert_eq!(old, expected, "writer {t} delete {k}");
                     } else if pick == 1 {
                         seq += 1;
@@ -126,7 +126,7 @@ fn concurrent_writers_and_readers() {
                         assert_eq!(old, expected, "writer {t} upsert {k}");
                     } else {
                         let got = tree.get(&key).unwrap();
-                        let expected = model.get(&key.to_vec()).cloned();
+                        let expected = model.get(key.as_slice()).cloned();
                         assert_eq!(got, expected, "writer {t} get {k}");
                     }
                 }
@@ -146,17 +146,14 @@ fn concurrent_writers_and_readers() {
             barrier.wait();
             let mut scans = 0usize;
             while !stop.load(Ordering::Relaxed) {
-                let lo = (rng.next() % KEY_SPACE).to_be_bytes();
-                let width = 1 + rng.next() % 1_000;
-                let hi = ((rng.next() % KEY_SPACE) + width).min(u64::MAX).to_be_bytes();
-                let scan: Vec<(Vec<u8>, Vec<u8>)> = match tree
-                    .range(&lo, &hi)
-                    .unwrap()
-                    .collect::<Result<_, _>>()
-                {
-                    Ok(v) => v,
-                    Err(e) => panic!("reader scan failed: {e}"),
-                };
+                let lo = (rng.next_u64() % KEY_SPACE).to_be_bytes();
+                let width = 1 + rng.next_u64() % 1_000;
+                let hi = ((rng.next_u64() % KEY_SPACE) + width).to_be_bytes();
+                let scan: Vec<(Vec<u8>, Vec<u8>)> =
+                    match tree.range(&lo, &hi).unwrap().collect::<Result<_, _>>() {
+                        Ok(v) => v,
+                        Err(e) => panic!("reader scan failed: {e}"),
+                    };
                 for w in scan.windows(2) {
                     assert!(w[0].0 < w[1].0, "reader saw unsorted keys");
                 }
@@ -199,8 +196,7 @@ fn concurrent_writers_and_readers() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    let want: Vec<(Vec<u8>, Vec<u8>)> =
-        union.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let want: Vec<(Vec<u8>, Vec<u8>)> = union.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(scan.len(), want.len(), "union size");
     assert_eq!(scan, want, "tree equals the union of the writer models");
 

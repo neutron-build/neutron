@@ -17,7 +17,10 @@ fn smoke_insert_get_range_check() {
     }
     for i in 0u64..5000 {
         let k = i.to_be_bytes();
-        assert_eq!(tree.get(&k).unwrap().as_deref(), Some(&model[&k.to_vec()][..]));
+        assert_eq!(
+            tree.get(&k).unwrap().as_deref(),
+            Some(&model[k.as_slice()][..])
+        );
     }
     let scan: Vec<_> = tree
         .range(&1000u64.to_be_bytes(), &2000u64.to_be_bytes())
@@ -36,13 +39,13 @@ fn smoke_insert_get_range_check() {
     // delete half, then verify
     for i in (0u64..5000).step_by(2) {
         let k = i.to_be_bytes();
-        assert_eq!(tree.delete(&k).unwrap(), model.remove(&k.to_vec()));
+        assert_eq!(tree.delete(&k).unwrap(), model.remove(k.as_slice()));
     }
     for i in 0u64..5000 {
         let k = i.to_be_bytes();
         assert_eq!(
             tree.get(&k).unwrap(),
-            model.get(&k.to_vec()).cloned(),
+            model.get(k.as_slice()).cloned(),
             "key {i}"
         );
     }

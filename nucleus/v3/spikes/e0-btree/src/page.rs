@@ -440,12 +440,10 @@ pub fn leaf_insert(
             .ok_or_else(|| corrupt("cell write out of bounds"))?;
         u16_wr(cell, 0, key.len() as u16)?;
         u32_wr(cell, 2, value.len() as u32)?;
-        cell
-            .get_mut(LEAF_HDR..LEAF_HDR + key.len())
+        cell.get_mut(LEAF_HDR..LEAF_HDR + key.len())
             .ok_or_else(|| corrupt("key write out of bounds"))?
             .copy_from_slice(key);
-        cell
-            .get_mut(LEAF_HDR + key.len()..)
+        cell.get_mut(LEAF_HDR + key.len()..)
             .ok_or_else(|| corrupt("value write out of bounds"))?
             .copy_from_slice(value);
     }
@@ -483,8 +481,7 @@ pub fn inner_insert(
             .ok_or_else(|| corrupt("cell write out of bounds"))?;
         u16_wr(cell, 0, sep.len() as u16)?;
         u64_wr(cell, 2, child.0)?;
-        cell
-            .get_mut(INNER_HDR..)
+        cell.get_mut(INNER_HDR..)
             .ok_or_else(|| corrupt("separator write out of bounds"))?
             .copy_from_slice(sep);
     }
@@ -772,7 +769,8 @@ where
         {
             return Err(corrupt("inner rebuild out of order"));
         }
-        last = Some(sep.clone());        let pos = header(buf)?.nslots;
+        last = Some(sep.clone());
+        let pos = header(buf)?.nslots;
         if !inner_insert(buf, pos, *child, sep)? {
             return Err(corrupt("inner rebuild overflow"));
         }

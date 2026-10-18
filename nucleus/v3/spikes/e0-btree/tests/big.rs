@@ -17,7 +17,7 @@ impl Sm {
         Sm(seed)
     }
     /// Next value in the stream.
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -26,9 +26,7 @@ impl Sm {
     }
     /// A value of 0–300 bytes for the workload.
     pub fn value(&mut self, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|_| self.next() as u8)
-            .collect()
+        (0..len).map(|_| self.next_u64() as u8).collect()
     }
 }
 
@@ -45,9 +43,9 @@ fn big_insert_delete_scan() {
 
     // 200k random 8-byte keys with random 0–300 byte values, in random
     // order (the splitmix stream is shuffled by construction).
-    let keys: Vec<[u8; 8]> = (0..INSERTS).map(|_| rng.next().to_be_bytes()).collect();
+    let keys: Vec<[u8; 8]> = (0..INSERTS).map(|_| rng.next_u64().to_be_bytes()).collect();
     for k in keys.iter() {
-        let vlen = (rng.next() % 301) as usize;
+        let vlen = (rng.next_u64() % 301) as usize;
         let v = rng.value(vlen);
         let old = tree.insert(k, &v).unwrap();
         let expected = model.insert(k.to_vec(), v);
@@ -57,9 +55,9 @@ fn big_insert_delete_scan() {
 
     // 50k deletes of randomly chosen inserted keys.
     for _ in 0..DELETES {
-        let k = keys[(rng.next() as usize) % INSERTS];
+        let k = keys[(rng.next_u64() as usize) % INSERTS];
         let old = tree.delete(&k).unwrap();
-        let expected = model.remove(&k.to_vec());
+        let expected = model.remove(k.as_slice());
         assert_eq!(old, expected);
     }
 
@@ -69,20 +67,18 @@ fn big_insert_delete_scan() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    let want: Vec<(Vec<u8>, Vec<u8>)> =
-        model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(scan.len(), want.len());
     assert_eq!(scan, want);
 
     // Spot point lookups on both survivors and deleted keys.
-    for i in 0..INSERTS {
+    for (i, k) in keys.iter().enumerate() {
         if i % 997 != 0 {
             continue;
         }
-        let k = keys[i];
         assert_eq!(
-            tree.get(&k).unwrap(),
-            model.get(&k.to_vec()).cloned(),
+            tree.get(k).unwrap(),
+            model.get(k.as_slice()).cloned(),
             "key {k:?}"
         );
     }

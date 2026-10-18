@@ -14,8 +14,8 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Identifier of one page of a [`PageStore`].
 ///
@@ -123,9 +123,7 @@ impl PageStore for MemStore {
             .pages
             .lock()
             .map_err(|e| StoreError::Poisoned(e.to_string()))?;
-        let page = pages
-            .get(id.0 as usize)
-            .ok_or(StoreError::OutOfRange(id))?;
+        let page = pages.get(id.0 as usize).ok_or(StoreError::OutOfRange(id))?;
         let src = page
             .get(..)
             .ok_or_else(|| StoreError::Corrupt("short page in MemStore".into()))?;
@@ -237,8 +235,7 @@ impl PageStore for FileStore {
 
     fn write(&self, id: PageId, buf: &[u8]) -> Result<(), StoreError> {
         use std::os::unix::fs::FileExt;
-        self.file
-            .write_at(buf, id.0 * self.page_size as u64)?;
+        self.file.write_at(buf, id.0 * self.page_size as u64)?;
         Ok(())
     }
 

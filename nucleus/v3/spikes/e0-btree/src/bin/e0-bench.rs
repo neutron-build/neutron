@@ -118,7 +118,11 @@ mod e0_bench {
     // ---- our side -------------------------------------------------------
 
     /// Fresh tree over `store`, W-insert timed, then the other workloads.
-    fn ours_full<S: PageStore>(store: S, capacity: usize, keys: &[[u8; 8]]) -> Result<Work, String> {
+    fn ours_full<S: PageStore>(
+        store: S,
+        capacity: usize,
+        keys: &[[u8; 8]],
+    ) -> Result<Work, String> {
         let tree = BTree::new(store, capacity).map_err(|e| e.to_string())?;
         let b0 = Instant::now();
         for k in keys {
@@ -215,8 +219,7 @@ mod e0_bench {
     const URI: &str = "file:e0benchmt?mode=memory&cache=shared";
 
     fn sqlite_pragmas(conn: &Connection) -> Result<(), String> {
-        let _ = conn
-            .query_row("PRAGMA journal_mode=OFF", [], |_| Ok(()))
+        conn.query_row("PRAGMA journal_mode=OFF", [], |_| Ok(()))
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "OFF")
             .map_err(|e| e.to_string())?;
@@ -375,7 +378,9 @@ mod e0_bench {
             }
             let mut total = 0usize;
             for h in hs {
-                let v = h.join().map_err(|_| "sqlite mt thread panicked".to_string())??;
+                let v = h
+                    .join()
+                    .map_err(|_| "sqlite mt thread panicked".to_string())??;
                 total += v;
             }
             Ok(total)
@@ -511,7 +516,8 @@ mod e0_bench {
         }
         let _ = std::fs::remove_file(&file_path);
 
-        let med = |get: fn(&Work) -> f64, a: &Work, b: &Work, c: &Work| median3([get(a), get(b), get(c)]);
+        let med =
+            |get: fn(&Work) -> f64, a: &Work, b: &Work, c: &Work| median3([get(a), get(b), get(c)]);
         let g_ins = |w: &Work| w.insert_ns;
         let g_pt = |w: &Work| w.point_ns;
         let g_rg = |w: &Work| w.range_ns;

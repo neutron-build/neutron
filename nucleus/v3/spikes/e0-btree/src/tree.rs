@@ -215,7 +215,12 @@ impl<S: PageStore> BTree<S> {
                     }
                     PageKind::Leaf => {
                         return self.leaf_insert_step(
-                            guard, nid, &mut path, &mut guards, key, value,
+                            guard,
+                            nid,
+                            &mut path,
+                            &mut guards,
+                            key,
+                            value,
                         );
                     }
                 }
@@ -307,7 +312,10 @@ impl<S: PageStore> BTree<S> {
                     PageKind::Inner => {
                         let (ci, child) = page::inner_route(&cur, lo)?;
                         let next = self.pool.fetch_read(child)?;
-                        stack.push(CursorEntry { guard: cur, idx: ci });
+                        stack.push(CursorEntry {
+                            guard: cur,
+                            idx: ci,
+                        });
                         cur = next;
                     }
                 }
@@ -376,9 +384,7 @@ impl<S: PageStore> BTree<S> {
                         if let Some(p) = prev.as_deref()
                             && p >= k
                         {
-                            return Err(format!(
-                                "page {id:?}: keys out of order at slot {i}"
-                            ));
+                            return Err(format!("page {id:?}: keys out of order at slot {i}"));
                         }
                         if let Some(l) = lo.as_deref()
                             && k < l
@@ -395,9 +401,7 @@ impl<S: PageStore> BTree<S> {
                     match leaf_depth {
                         None => leaf_depth = Some(depth),
                         Some(d) if d != depth => {
-                            return Err(format!(
-                                "leaves at different depths: {d} and {depth}"
-                            ));
+                            return Err(format!("leaves at different depths: {d} and {depth}"));
                         }
                         _ => {}
                     }
@@ -448,7 +452,8 @@ impl<S: PageStore> BTree<S> {
         })
     }
 
-    fn bump_root_tries(tries: &mut u32) -> Result<(), StoreError> {        *tries += 1;
+    fn bump_root_tries(tries: &mut u32) -> Result<(), StoreError> {
+        *tries += 1;
         if *tries >= ROOT_RETRIES {
             return Err(StoreError::Corrupt(format!(
                 "the root changed under us {ROOT_RETRIES} times"
@@ -481,9 +486,7 @@ impl<S: PageStore> BTree<S> {
                 // compacting insert cannot fit it: split. The key is
                 // currently absent from the leaf (removed above), so the
                 // split's pending insert reinstates it.
-                self.split_and_propagate(
-                    leaf, leaf_id, path, guards, key, value, Some(old),
-                )
+                self.split_and_propagate(leaf, leaf_id, path, guards, key, value, Some(old))
             }
             Err(pos) => {
                 if page::leaf_insert(&mut leaf, pos, key, value)? {
@@ -548,10 +551,6 @@ impl<S: PageStore> BTree<S> {
                     if left_id == self.root_id()? {
                         None
                     } else {
-                        eprintln!(
-                            "FIND_PARENT invoked: left={left_id:?} sep_len={}",
-                            sep.len()
-                        );
                         drop(child_guard.take());
                         Some(self.find_parent(left_id, &sep)?)
                     }

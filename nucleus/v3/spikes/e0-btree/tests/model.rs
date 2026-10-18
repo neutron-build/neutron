@@ -7,7 +7,7 @@
 //! DIRTY-LOST, SPLIT-OFF-BY-ONE, SEP-NOT-UPDATED and RANGE-SKIPS-BOUNDARY
 //! mutations of the card's evidence list.
 
-use e0_btree::{BTree, MemStore, StoreError};
+use e0_btree::{BTree, MemStore};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -60,15 +60,6 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Panic on a store error inside a property (tests may panic; the store
-/// never may).
-fn unwrap<T>(r: Result<T, StoreError>) -> T {
-    match r {
-        Ok(v) => v,
-        Err(e) => panic!("unexpected store error: {e}"),
-    }
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -82,23 +73,25 @@ proptest! {
         for (i, op) in ops.iter().enumerate() {
             match op {
                 Op::Insert { k, v } => {
-                    let old = unwrap(tree.insert(k, v));
+                    let old = tree.insert(k, v).unwrap();
                     let expected = model.insert(k.clone(), v.clone());
                     prop_assert_eq!(old, expected, "insert");
                 }
                 Op::Delete { k } => {
-                    let old = unwrap(tree.delete(k));
+                    let old = tree.delete(k).unwrap();
                     let expected = model.remove(k);
                     prop_assert_eq!(old, expected, "delete");
                 }
                 Op::Get { k } => {
-                    let got = unwrap(tree.get(k));
+                    let got = tree.get(k).unwrap();
                     let expected = model.get(k).cloned();
                     prop_assert_eq!(got, expected, "get");
                 }
                 Op::Range { lo, hi } => {
-                    let got: Vec<(Vec<u8>, Vec<u8>)> =
-                        unwrap(tree.range(lo, hi)).collect::<Result<_, _>>()
+                    let got: Vec<(Vec<u8>, Vec<u8>)> = tree
+                        .range(lo, hi)
+                        .unwrap()
+                        .collect::<Result<_, _>>()
                         .map_err(|e| TestCaseError::fail(e.to_string()))?;
                     if lo <= hi {
                         let want: Vec<(Vec<u8>, Vec<u8>)> = model
@@ -112,10 +105,10 @@ proptest! {
                     }
                 }
             }
-            if (i + 1) % 100 == 0 {
-                if let Err(msg) = tree.check() {
-                    prop_assert!(false, "check failed: {}", msg);
-                }
+            if (i + 1) % 100 == 0
+                && let Err(msg) = tree.check()
+            {
+                prop_assert!(false, "check failed: {}", msg);
             }
         }
     }
