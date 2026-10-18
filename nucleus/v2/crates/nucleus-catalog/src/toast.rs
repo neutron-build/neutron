@@ -350,6 +350,7 @@ mod tests {
             name: format!("c{attnum}"),
             ty: nucleus_codec::KeyType::Text(nucleus_codec::Collation::C),
             not_null: false,
+            not_null_since: 0,
             dropped,
             missing: None,
         };

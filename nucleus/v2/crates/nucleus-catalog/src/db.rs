@@ -24,7 +24,7 @@ use std::cell::Cell;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use nucleus_codec::row::{row_header, value_repr_eq, Datum, RowError, TableSchema};
+use nucleus_codec::row::{value_repr_eq, Datum, RowError, TableSchema};
 use nucleus_codec::{decode_key_prefix, encode_key, KeyColumn, KeyType, Value};
 use nucleus_kv::{Key, OrderedKv};
 use nucleus_txn::boot::Core;
@@ -524,7 +524,7 @@ impl<K: OrderedKv> Db<K> {
         // §5, after `Applied`: nothing carries the base's pointers
         // onward, so every chunk of every raw pointer goes.
         toast::delete_row_chunks(&self.core, st.txn, &st.ctx(), t.storage_id, &epq.base_bytes)?;
-        let mut base_live = decode_row_at_era(&t.schema, t.def_version, &epq.base_bytes)?;
+        let mut base_live = decode_row_at_era(&t.schema, &epq.base_bytes)?;
         self.detoast_base(st, t, &mut base_live, epq.base_ts)?;
         index::maintain_delete(
             &self.core,
@@ -572,9 +572,9 @@ impl<K: OrderedKv> Db<K> {
         t: &TableHandle,
         epq: &UpdateEpq<'_>,
     ) -> Result<DetoastedPair, DbError> {
-        let mut base_live = decode_row_at_era(&t.schema, t.def_version, &epq.base_bytes)?;
+        let mut base_live = decode_row_at_era(&t.schema, &epq.base_bytes)?;
         self.detoast_base(st, t, &mut base_live, epq.base_ts)?;
-        let mut new_live = decode_row_at_era(&t.schema, t.def_version, &epq.last.new_bytes)?;
+        let mut new_live = decode_row_at_era(&t.schema, &epq.last.new_bytes)?;
         for (pos, datum) in new_live.iter_mut().enumerate() {
             let Some(Datum::Toast(p)) = datum.as_ref() else {
                 continue;
@@ -718,8 +718,9 @@ impl<K: OrderedKv> Db<K> {
     /// `None` = NULL) at the statement's snapshot, decoded under the
     /// handle's definition and **detoasted** (§5: chunks read at the
     /// statement's snapshot through a fresh view, no SIREAD). NOT NULL
-    /// flags decode at the row's own era (`decode_row_at_era`: a
-    /// pre-constraint NULL is served, never XX001). SERIALIZABLE
+    /// binds per column from `not_null_since`
+    /// (`decode_row_at_era`: a pre-constraint NULL is served, a stray
+    /// one at or after the constraint's version is XX001). SERIALIZABLE
     /// registers its SIREAD on the row key (§8.1); other levels read
     /// through a plain registered view. A hidden-rowid table has no
     /// callable key: 0A000 (scan it instead).
@@ -756,7 +757,7 @@ impl<K: OrderedKv> Db<K> {
         };
         match bytes {
             Some(b) => {
-                let mut live = decode_row_at_era(&t.schema, t.def_version, &b)?;
+                let mut live = decode_row_at_era(&t.schema, &b)?;
                 toast::detoast_row_at(&self.core, &t.schema, t.storage_id, &mut live, &ctx)?;
                 Ok(Some(live))
             }
@@ -767,8 +768,9 @@ impl<K: OrderedKv> Db<K> {
     /// Every row of the table at the statement's snapshot, in key order,
     /// decoded under the handle's definition and **detoasted** (§5: each
     /// row's chunks read at the statement's snapshot, no SIREAD). NOT
-    /// NULL flags decode at the row's own era (`decode_row_at_era`: a
-    /// pre-constraint NULL is served, never XX001). The
+    /// NULL binds per column from `not_null_since`
+    /// (`decode_row_at_era`: a pre-constraint NULL is served, a stray
+    /// one at or after the constraint's version is XX001). The
     /// scan is bounded to `[table_lo, table_lo ‖ 0xFF)` (§5): `0xFF`
     /// never starts an encoded key, so large-value chunks
     /// (`/t/{sid}/0xFF…`) are never rows. SERIALIZABLE registers the
@@ -810,7 +812,7 @@ impl<K: OrderedKv> Db<K> {
         };
         let mut out = Vec::with_capacity(rows.len());
         for (key, bytes) in rows {
-            let mut live = decode_row_at_era(&t.schema, t.def_version, &bytes)?;
+            let mut live = decode_row_at_era(&t.schema, &bytes)?;
             toast::detoast_row_at(&self.core, &t.schema, t.storage_id, &mut live, &ctx)?;
             out.push((key, live));
         }
@@ -1082,7 +1084,7 @@ impl<K: OrderedKv> Db<K> {
                         "index entry names a row not visible at the snapshot",
                     )));
                 };
-                let mut live = decode_row_at_era(&schema, h.def_version, &bytes)?;
+                let mut live = decode_row_at_era(&schema, &bytes)?;
                 // §5: an indexed toasted column's entry is computed from
                 // the detoasted value — the chunks read at the scan's
                 // snapshot, no SIREAD.
@@ -1151,7 +1153,7 @@ impl<K: OrderedKv> Db<K> {
                         // its row is the txn's own write now, served (iff
                         // its value is in range) through the txn's own
                         // entry for the new row.
-                        let mut s_live = decode_row_at_era(&schema, h.def_version, &s_bytes)?;
+                        let mut s_live = decode_row_at_era(&schema, &s_bytes)?;
                         toast::detoast_row_at(
                             &self.core,
                             &schema,
@@ -1188,38 +1190,20 @@ impl<K: OrderedKv> Db<K> {
 // ---- handle checks, keys-by-oid and the row-level EPQ (§5.2) ------------------
 
 /// Decodes one row version read at a snapshot or re-based by EPQ, under
-/// the handle's (latest committed) definition with C-T0 §4's
-/// definition-era carve-out on the NOT NULL flags (the C-T6e4 fix): the
-/// column list, `missing` defaults and dropped positions are the latest
-/// definition's — §4 "rows decode under the latest definition" — but
-/// the flags are evaluated against the definition the row was **encoded
-/// under**. A row whose header version is below the handle's
-/// `def_version` predates at least one DDL, and a NULL it carries on a
-/// now-NOT NULL column predates the SET NOT NULL that installed the
-/// constraint: that DDL validated the *latest* committed state (§3 —
-/// where this row may since have been deleted or updated to non-NULL;
-/// no rewrite happens), so the NULL is the row's legal value at
-/// snapshots below the DDL's commit, never corruption. `encode_row`
-/// refuses a NULL on a NOT NULL column of the definition it encodes
-/// under, so when the header version equals `def_version` the flags
-/// were in force for the row's own encoding and the decode check keeps
-/// its full strength (a stray NULL there is real corruption, XX001).
-fn decode_row_at_era(
-    schema: &TableSchema,
-    def_version: u32,
-    bytes: &[u8],
-) -> Result<Vec<Option<Datum>>, DbError> {
-    if row_header(bytes).map_err(DbError::Row)?.schema_version < def_version
-        && schema.columns.iter().any(|c| c.not_null)
-    {
-        let mut era = schema.clone();
-        for col in &mut era.columns {
-            col.not_null = false;
-        }
-        era.decode_row(bytes).map_err(DbError::Row)
-    } else {
-        schema.decode_row(bytes).map_err(DbError::Row)
-    }
+/// the handle's (latest committed) definition with C-T6 §2/§3's
+/// era-scoped NOT NULL rule: the column list, `missing` defaults and
+/// dropped positions are the latest definition's — §4 "rows decode
+/// under the latest definition" — and a NULL bit on attnum `a` is
+/// corruption (XX001) iff `a.not_null && v >= a.not_null_since`, the
+/// def version at which that column's constraint (last) came into
+/// force. The rule itself lives in one code path,
+/// [`TableSchema::decode_row`](nucleus_codec::row::TableSchema::decode_row):
+/// this is the DML/EPQ seam over it, and amcheck's I-ROWFMT decodes
+/// through the same function, never a second copy. The marker arrives
+/// exact through the def bytes (§3's flags-gated `be32` word), so the
+/// per-column era survives every reopen and every unrelated later DDL.
+fn decode_row_at_era(schema: &TableSchema, bytes: &[u8]) -> Result<Vec<Option<Datum>>, DbError> {
+    schema.decode_row(bytes).map_err(DbError::Row)
 }
 
 /// The writer's §4 read ctx: the latest committed catalog plus this txn's
@@ -1308,7 +1292,7 @@ fn apply_set(
     set: &[(u16, Option<Datum>)],
     base_bytes: &[u8],
 ) -> Result<Applied, DbError> {
-    let base = decode_row_at_era(&t.schema, t.def_version, base_bytes)?;
+    let base = decode_row_at_era(&t.schema, base_bytes)?;
     let mut live = base.clone();
     for &(attnum, ref datum) in set {
         let Some(pos) = t.schema.live_columns().position(|c| c.attnum == attnum) else {

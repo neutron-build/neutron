@@ -501,6 +501,7 @@ fn schema_of(cols: Vec<(&str, KeyType, bool)>, with_pk: bool) -> TableSchema {
             name: name.into(),
             ty,
             not_null,
+            not_null_since: u32::from(not_null),
             dropped: false,
             missing: None,
         })

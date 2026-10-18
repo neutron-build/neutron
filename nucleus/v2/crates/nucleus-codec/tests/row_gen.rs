@@ -67,6 +67,7 @@ fn gen_rows() {
             name: "c".to_string(),
             ty: type_for(stem),
             not_null: false,
+            not_null_since: 0,
             dropped: false,
             missing: None,
         };
@@ -134,6 +135,7 @@ fn wide_row(stem: &str, lit: &str, dropped_field: &str) -> (Vec<ColumnDef>, Vec<
             name: format!("c{}", i + 1),
             ty: KeyType::Bool,
             not_null: false,
+            not_null_since: 0,
             dropped: i + 1 == dropped,
             missing: None,
         })
@@ -158,6 +160,7 @@ fn cd(attnum: u16, name: &str, ty: KeyType) -> ColumnDef {
         name: name.to_string(),
         ty,
         not_null: false,
+        not_null_since: 0,
         dropped: false,
         missing: None,
     }

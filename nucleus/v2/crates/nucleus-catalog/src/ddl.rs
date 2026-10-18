@@ -113,7 +113,8 @@ impl<K: OrderedKv> Db<K> {
     /// under the lock; any row → 23502) — a non-NULL `default` needs no
     /// scan, old rows read it as `missing` (PostgreSQL's fast default).
     /// `NOT NULL` with a default, or plain nullable ADD COLUMN, never
-    /// scans. The def rewrite goes through
+    /// scans. The column's `not_null_since` era marker (§2/§3) starts at
+    /// this DDL's new version. The def rewrite goes through
     /// [`Catalog::catalog_alter_rel_def`]; no row is rewritten (§3 lazy
     /// upgrade), no storage id moves, and the column's attnum is
     /// `ncols + 1` (attnums are never reused).
@@ -198,9 +199,13 @@ impl<K: OrderedKv> Db<K> {
     /// SET NOT NULL is a **validating scan** of the latest committed
     /// state plus the txn's own writes under the lock: any NULL — stored
     /// or a NULL `missing` (the §3 decode rule yields both as `None`) —
-    /// is 23502; only then is the flag set. DROP NOT NULL is the def
-    /// rewrite alone (§3: no scan). Either way no row is rewritten and
-    /// the storage id stays.
+    /// is 23502; only then is the flag set, with `not_null_since` = the
+    /// DDL's new version (§2/§3's era marker: rows written before it may
+    /// legally carry the pre-constraint NULL; a re-SET after a DROP NOT
+    /// NULL takes the newer version, a SET on an already-constrained
+    /// column keeps its original era). DROP NOT NULL is the def rewrite
+    /// alone (§3: no scan): it clears the flag and resets the marker to
+    /// 0. Either way no row is rewritten and the storage id stays.
     pub fn set_not_null(
         &self,
         st: &Stmt<'_>,

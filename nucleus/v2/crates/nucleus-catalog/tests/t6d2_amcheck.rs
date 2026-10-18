@@ -41,6 +41,7 @@ fn wide_schema() -> TableSchema {
         name: name.into(),
         ty,
         not_null: attnum == 1,
+        not_null_since: u32::from(attnum == 1),
         dropped: false,
         missing: None,
     };

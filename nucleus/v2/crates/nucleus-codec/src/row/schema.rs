@@ -3,10 +3,40 @@
 //! ```text
 //! def   = 0x54 0x01 be32(version) u8(hidden_rowid) be16(ncols) col*
 //!         be16(npk) be16(pk_attnum)*
-//! col   = be16(attnum) be32(namelen) name type flags(1) [be32(len) value_bytes]
-//! flags = bit0 not_null, bit1 dropped, bit2 has_missing
+//! col   = be16(attnum) be32(namelen) name type flags(1)
+//!         [be32(not_null_since)] [be32(len) value_bytes]
+//! flags = bit0 not_null, bit1 dropped, bit2 has_missing,
+//!         bit4 has_not_null_since
 //! ```
 //!
+//! `not_null_since` (§2/§3's NOT NULL era marker: the def version at
+//! which the column's constraint (last) came into force, read by
+//! `decode_row`'s per-column era rule) persists as a `be32` word right
+//! after the flags byte, present exactly when it **deviates from the
+//! re-derivation** — `version` for a NOT NULL column, 0 for a nullable
+//! one. Every def a DDL helper can produce round-trips exactly: a
+//! marker born at the def's own version (CREATE TABLE, ADD COLUMN ...
+//! NOT NULL, the SET NOT NULL that just bumped the version) equals the
+//! re-derivation and is elided, and the first later DDL — which keeps
+//! the marker and bumps the version — writes the word. The elision is
+//! what keeps the golden def corpus (`tests/golden_row/defs.tsv`, all
+//! version-1 defs, markers 0/1) byte-identical: that corpus is outside
+//! C-T6e4fix2's Touch-only list and cannot be regenerated, while an
+//! unconditional word would change every pinned hex. The format tag
+//! stays `0x54 0x01`: no persisted datadir exists before the first
+//! release (C-K4 owns format versioning from then). The presence bit
+//! is bit4 (not the free bit3) because the def-decode totality pin
+//! (`tests/row_defs.rs`) holds flags byte `0x08` unknown, and that
+//! file's assertions are outside this card's limits.
+//!
+//! Because the word is only absent when the re-derivation is exact,
+//! a hand-broken in-memory marker on a **live** column (a nonzero
+//! `not_null_since` on a nullable one, a zero or above-version one on
+//! a NOT NULL one) is **written faithfully** and rejected on decode
+//! (XX001) rather than silently canonicalized away — the three
+//! rejections below. The dropped state is the one mask: encode
+//! canonicalizes it wholesale (flags bit1 only), and a dropped column
+//! carries no era.
 //! The §3.1 type tags are pinned as the const table below and on disk;
 //! they are never derived from `KeyType`'s discriminant order. Decode is
 //! total: an unknown tag, truncation, trailing bytes, attnums out of
@@ -54,7 +84,10 @@ const COLLATION_C: u8 = 0x01;
 const FLAG_NOT_NULL: u8 = 1 << 0;
 const FLAG_DROPPED: u8 = 1 << 1;
 const FLAG_MISSING: u8 = 1 << 2;
-const FLAG_KNOWN: u8 = FLAG_NOT_NULL | FLAG_DROPPED | FLAG_MISSING;
+/// The `be32(not_null_since)` era-marker word follows the flags byte
+/// (§3; see the module docs for the elision rule and the bit4 choice).
+const FLAG_SINCE: u8 = 1 << 4;
+const FLAG_KNOWN: u8 = FLAG_NOT_NULL | FLAG_DROPPED | FLAG_MISSING | FLAG_SINCE;
 
 const DEF_MAGIC: [u8; 2] = [0x54, 0x01];
 
@@ -79,10 +112,17 @@ pub struct TableSchema {
 impl TableSchema {
     /// CREATE TABLE: version 1. `pk` entries must name live columns of
     /// `columns` (which must be attnums `1..=n` in order);
-    /// `hidden_rowid` is derived from `pk.is_empty()`.
+    /// `hidden_rowid` is derived from `pk.is_empty()`. A NOT NULL
+    /// column gets `not_null_since = 1` — the create version, the era
+    /// its constraint came into force (pk columns included); a nullable
+    /// one gets 0.
     pub fn new(columns: Vec<ColumnDef>, pk: Vec<u16>) -> Result<TableSchema, RowError> {
         check_attnums(&columns)?;
         check_pk(&columns, &pk)?;
+        let mut columns = columns;
+        for col in &mut columns {
+            col.not_null_since = u32::from(col.not_null);
+        }
         Ok(TableSchema {
             version: 1,
             hidden_rowid: pk.is_empty(),
@@ -94,7 +134,11 @@ impl TableSchema {
     /// Serialises the definition (§3). The struct invariants are checked
     /// first, so a broken in-memory schema is an [`RowError::InvalidDdl`]
     /// rather than broken bytes: attnums `1..=n` in order, `hidden_rowid
-    /// == pk.is_empty()`, every pk attnum live and in range.
+    /// == pk.is_empty()`, every pk attnum live and in range. The
+    /// `not_null_since` era marker persists as the flags-gated `be32`
+    /// word of §3's `col` layout (elided exactly when it equals the
+    /// re-derivation — see the module docs), so every DDL-producible
+    /// schema round-trips through the bytes with its markers exact.
     pub fn encode(&self) -> Result<Vec<u8>, RowError> {
         check_attnums(&self.columns)?;
         check_pk(&self.columns, &self.pk)?;
@@ -120,18 +164,39 @@ impl TableSchema {
             out.extend_from_slice(col.name.as_bytes());
             encode_type(&col.ty, &mut out)?;
             let mut flags = flag_bits(col);
+            // §3's era-marker word: present exactly when the marker
+            // deviates from the re-derivation (`version` for a NOT NULL
+            // column, 0 otherwise) — see the module docs. Keyed on the
+            // canonical flags bit, so a hand-broken marker on a live
+            // nullable column (a stale `not_null_since` no DDL can
+            // produce) is written faithfully and rejected on decode,
+            // never silently canonicalized away. The one mask is the
+            // dropped state, which encode canonicalizes wholesale
+            // (bit1 only — the `encode_canonicalizes_dropped_not_null`
+            // pin): a dropped column has no era to carry.
+            let derived = if flags & FLAG_NOT_NULL != 0 {
+                self.version
+            } else {
+                0
+            };
+            if !col.dropped && col.not_null_since != derived {
+                flags |= FLAG_SINCE;
+            }
             let mut value_bytes = Vec::new();
             if let Some(v) = &col.missing {
                 flags |= FLAG_MISSING;
                 encode_value(&col.ty, v, &mut value_bytes)
                     .map_err(|e| value_error(col.attnum, e))?;
+            }
+            out.push(flags);
+            if flags & FLAG_SINCE != 0 {
+                out.extend_from_slice(&col.not_null_since.to_be_bytes());
+            }
+            if flags & FLAG_MISSING != 0 {
                 let len = u32::try_from(value_bytes.len())
                     .map_err(|_| RowError::Corrupt("missing value too large"))?;
-                out.push(flags);
                 out.extend_from_slice(&len.to_be_bytes());
                 out.extend_from_slice(&value_bytes);
-            } else {
-                out.push(flags);
             }
         }
         out.extend_from_slice(&npk.to_be_bytes());
@@ -149,6 +214,14 @@ impl TableSchema {
     /// unknown flag bits, or a `hidden_rowid` byte that
     /// is not 0/1 or disagrees with `npk`. Duplicate pk entries are not
     /// rejected (§3 does not forbid them; the writer never makes them).
+    ///
+    /// The `not_null_since` era marker is read from the `be32` word when
+    /// flag bit4 is set and re-derived otherwise (`version` for a NOT
+    /// NULL column, 0 for a nullable one — exact whenever elided, see
+    /// the module docs). The three inconsistent encodings are corruption:
+    /// a marker word on a column whose `not_null` bit is clear (a
+    /// nullable or dropped column carries no era), a word of 0 on a NOT
+    /// NULL column, and a word above the def's own `version`.
     pub fn decode(bytes: &[u8]) -> Result<TableSchema, RowError> {
         let short = || RowError::Corrupt("truncated definition");
         let mut r = super::RowReader::new(bytes);
@@ -182,6 +255,28 @@ impl TableSchema {
             if flags & !FLAG_KNOWN != 0 {
                 return Err(RowError::Corrupt("unknown definition flags"));
             }
+            let not_null = flags & FLAG_NOT_NULL != 0;
+            let not_null_since = if flags & FLAG_SINCE != 0 {
+                let since = r.u32be().map_err(|_| short())?;
+                if !not_null {
+                    return Err(RowError::Corrupt(
+                        "not_null_since word on a nullable column",
+                    ));
+                }
+                if since == 0 {
+                    return Err(RowError::Corrupt(
+                        "not_null_since of zero on a NOT NULL column",
+                    ));
+                }
+                if since > version {
+                    return Err(RowError::Corrupt("not_null_since above the version"));
+                }
+                since
+            } else if not_null {
+                version
+            } else {
+                0
+            };
             let missing = if flags & FLAG_MISSING != 0 {
                 let len = r.u32be().map_err(|_| short())? as usize;
                 let value_bytes = r.take(len).map_err(|_| short())?;
@@ -193,7 +288,8 @@ impl TableSchema {
                 attnum,
                 name,
                 ty,
-                not_null: flags & FLAG_NOT_NULL != 0,
+                not_null,
+                not_null_since,
                 dropped: flags & FLAG_DROPPED != 0,
                 missing,
             });
@@ -232,7 +328,8 @@ impl TableSchema {
     /// name may be reused. A `missing` default (a non-volatile one,
     /// evaluated once by the caller at DDL time) must encode under `ty`;
     /// volatile defaults and the NOT NULL emptiness scan are the
-    /// caller's (§3, §9).
+    /// caller's (§3, §9). A NOT NULL column's era starts here:
+    /// `not_null_since` is the DDL's new version.
     pub fn add_column(
         &self,
         name: &str,
@@ -253,22 +350,24 @@ impl TableSchema {
             encode_value(&ty, v, &mut scratch).map_err(|e| value_error(attnum, e))?;
         }
         let mut next = self.bumped()?;
+        let not_null_since = if not_null { next.version } else { 0 };
         next.columns.push(ColumnDef {
             attnum,
             name: name.to_string(),
             ty,
             not_null,
+            not_null_since,
             dropped: false,
             missing,
         });
         Ok(next)
     }
 
-    /// DROP COLUMN (§3): sets `dropped` and clears `not_null`; attnums
-    /// are never reused, so the column stays listed forever. Refused for
-    /// a primary-key column (0A000, §9) and for an unknown or already
-    /// dropped attnum. Dropping the indexes that use the column is the
-    /// caller's (same txn, §3).
+    /// DROP COLUMN (§3): sets `dropped` and clears `not_null` (and its
+    /// era marker); attnums are never reused, so the column stays listed
+    /// forever. Refused for a primary-key column (0A000, §9) and for an
+    /// unknown or already dropped attnum. Dropping the indexes that use
+    /// the column is the caller's (same txn, §3).
     pub fn drop_column(&self, attnum: u16) -> Result<TableSchema, RowError> {
         let col = self.live_column(attnum)?;
         if self.pk.contains(&attnum) {
@@ -278,17 +377,29 @@ impl TableSchema {
         let col = &mut next.columns[usize::from(col.attnum) - 1];
         col.dropped = true;
         col.not_null = false;
+        col.not_null_since = 0;
         Ok(next)
     }
 
     /// SET NOT NULL / DROP NOT NULL (§3): sets or clears the flag, no
     /// rewrite, version `+ 1`. The validating scan (any NULL, including
     /// a NULL `missing`, → 23502) is the caller's. Refused for an
-    /// unknown or dropped attnum.
+    /// unknown or dropped attnum. The era marker moves with the flag: a
+    /// SET that (re-)arms the constraint takes the DDL's new version —
+    /// rows written while it was dropped may legally carry a NULL, and
+    /// a re-SET after a DROP must stay lenient for them — while a SET on
+    /// a column already under the constraint keeps the era it came into
+    /// force (the constraint never lapsed); a DROP resets it to 0.
     pub fn set_not_null(&self, attnum: u16, not_null: bool) -> Result<TableSchema, RowError> {
         self.live_column(attnum)?;
         let mut next = self.bumped()?;
-        next.columns[usize::from(attnum) - 1].not_null = not_null;
+        let col = &mut next.columns[usize::from(attnum) - 1];
+        col.not_null_since = match (not_null, col.not_null) {
+            (true, false) => next.version,
+            (true, true) => col.not_null_since,
+            (false, _) => 0,
+        };
+        col.not_null = not_null;
         Ok(next)
     }
 

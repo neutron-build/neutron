@@ -99,6 +99,7 @@ fn def_of(specs: &[Spec], extras: &[ExtraCol]) -> Vec<ColumnDef> {
             name: format!("c{}", i + 1),
             ty: s.ty.clone(),
             not_null: s.not_null,
+            not_null_since: u32::from(s.not_null),
             dropped: s.dropped,
             missing: None,
         })
@@ -109,6 +110,7 @@ fn def_of(specs: &[Spec], extras: &[ExtraCol]) -> Vec<ColumnDef> {
             name: format!("c{}", specs.len() + i + 1),
             ty: ty.clone(),
             not_null: false,
+            not_null_since: 0,
             dropped: false,
             missing: missing.clone(),
         });

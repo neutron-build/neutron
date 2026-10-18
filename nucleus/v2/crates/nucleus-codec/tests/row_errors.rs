@@ -16,6 +16,7 @@ fn col(attnum: u16, ty: KeyType) -> ColumnDef {
         name: format!("c{attnum}"),
         ty,
         not_null: false,
+        not_null_since: 0,
         dropped: false,
         missing: None,
     }
