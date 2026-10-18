@@ -6,8 +6,13 @@
 //! against a ~100-page tree: this file is the named catcher for the
 //! DIRTY-LOST, SPLIT-OFF-BY-ONE, SEP-NOT-UPDATED and RANGE-SKIPS-BOUNDARY
 //! mutations of the card's evidence list.
+//!
+//! Card X-0-F1 adds the coupling pin
+//! ([`split_without_retained_ancestor_is_corrupt`]): with the
+//! `find_parent` fallback deleted, this file also catches the
+//! G-SAFE-LAX-class mutants it used to mask.
 
-use e0_btree::{BTree, MemStore};
+use e0_btree::{BTree, MemStore, StoreError};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -111,5 +116,48 @@ proptest! {
                 prop_assert!(false, "check failed: {}", msg);
             }
         }
+    }
+}
+
+/// Card X-0-F1 pin: the deleted `find_parent` fallback used to re-derive —
+/// and thereby mask — splits whose ancestor latches had been released
+/// early, which is exactly the state the G-SAFE-LAX and
+/// COUPLING-EARLY-RELEASE mutants produce. With the fallback gone, the
+/// same descent must surface [`StoreError::Corrupt`] naming the broken
+/// invariant instead of succeeding. The mutant shape is planted through
+/// [`BTree::insert_early_release`], the test-only descent that reports
+/// every child safe; if the fallback is ever restored, this test fails
+/// because the insert silently returns `Ok`.
+#[test]
+fn split_without_retained_ancestor_is_corrupt() {
+    let store = MemStore::new(8192).expect("fresh MemStore");
+    let tree = BTree::new(store, 16).expect("fresh tree");
+    // 2,000-byte values make a leaf hold at most four cells (cost 2,012
+    // bytes each against 8,176 free), so twelve sequential inserts grow a
+    // two-level tree whose right-most leaf sits one cell over capacity:
+    // the next insert into it must split. The insert sequence itself uses
+    // the normal coupled descent, so the tree is consistent here.
+    for i in 0u16..12 {
+        tree.insert(&i.to_be_bytes(), &vec![0u8; 2000])
+            .expect("normal coupled insert");
+    }
+    let stats = tree.check().expect("tree consistent before the pin");
+    assert!(
+        stats.height >= 2,
+        "pin needs a non-root leaf, height was {}",
+        stats.height
+    );
+    // Key 0xff_f0 routes to the right-most leaf; the chaos descent
+    // releases the root, the full leaf splits, and `propagate_split`
+    // finds no retained parent.
+    let err = tree
+        .insert_early_release(&[0xff, 0xf0], &vec![0u8; 2000])
+        .expect_err("a split with no retained ancestor must be Corrupt");
+    match err {
+        StoreError::Corrupt(msg) => assert!(
+            msg.contains("find_parent fallback: separator descent lost the child"),
+            "unexpected corrupt message: {msg}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
     }
 }

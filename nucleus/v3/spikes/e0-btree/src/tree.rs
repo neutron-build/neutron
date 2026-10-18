@@ -15,7 +15,12 @@
 //!   worst-case cell (card X-0 Work 5). While any node below is unsafe,
 //!   every ancestor stays latched, so a split always finds its parent's
 //!   latch already held, in top-down order; the root page id lives in a
-//!   `RwLock<PageId>` for root splits.
+//!   `RwLock<PageId>` for root splits. A split that arrives at a non-root
+//!   node with no ancestor still latched is therefore proof the coupling
+//!   discipline was broken somewhere, and returns `Corrupt` — card X-0-F1
+//!   deleted the `find_parent` re-derivation fallback that silently
+//!   repaired (and so masked) that state, since in correct code it is
+//!   unreachable dead code (PLAN-v3 §6.1 "no dead code").
 //! - T-ROOT: readers re-check the root id after latching the root and
 //!   restart if a root split raced them; a page latched as a stale root is
 //!   still a consistent half-tree, but restarting keeps single-key
@@ -172,6 +177,45 @@ impl<S: PageStore> BTree<S> {
     /// [`StoreError::KeyTooLarge`] / [`StoreError::ValueTooLarge`] for
     /// oversized inputs; any pool/store error otherwise.
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.insert_descend(key, value, false)
+    }
+
+    /// Test-only chaos hook (card X-0-F1): [`Self::insert`], except the
+    /// descent treats **every** child as safe and releases each ancestor's
+    /// latch as soon as the child is latched — the exact shape of the
+    /// G-SAFE-LAX and COUPLING-EARLY-RELEASE mutants of the card's
+    /// evidence list. A split of a non-root leaf then reaches
+    /// [`Self::propagate_split`] with an empty retained stack, which must
+    /// surface as [`StoreError::Corrupt`] now that the `find_parent`
+    /// fallback is gone (before X-0-F1 the fallback silently repaired this
+    /// state and masked those mutants). Never call outside tests; the tree
+    /// is left damaged when this returns the error.
+    ///
+    /// # Errors
+    /// Same as [`Self::insert`]; plus [`StoreError::Corrupt`] naming the
+    /// broken coupling invariant when a split loses its parent.
+    #[doc(hidden)]
+    pub fn insert_early_release(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.insert_descend(key, value, true)
+    }
+
+    /// The shared descent of [`Self::insert`] and its test chaos hook:
+    /// with `early_release` set, the [`page::is_safe`] test is skipped and
+    /// every child is reported safe (see [`Self::insert_early_release`]).
+    ///
+    /// # Errors
+    /// [`StoreError::KeyTooLarge`] / [`StoreError::ValueTooLarge`] for
+    /// oversized inputs; any pool/store error otherwise.
+    fn insert_descend(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        early_release: bool,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
         if key.len() > page::MAX_KEY {
             return Err(StoreError::KeyTooLarge(key.len()));
         }
@@ -198,7 +242,7 @@ impl<S: PageStore> BTree<S> {
                         // decides whether the ancestors may be released. A
                         // safe child cannot split, so nothing can propagate
                         // above it.
-                        let safe = page::is_safe(&child)?;
+                        let safe = early_release || page::is_safe(&child)?;
                         let parent = guard;
                         if safe {
                             for g in guards.drain(..) {
@@ -526,15 +570,18 @@ impl<S: PageStore> BTree<S> {
     /// By T-COUPLING every ancestor of an unsafe node is still latched in
     /// `guards`, in top-down acquisition order, so the parent latch is
     /// always already held — except for the root, which is split under the
-    /// `root` lock. If a parent is missing for a non-root node, the
-    /// ancestors were released early (the COUPLING-EARLY-RELEASE mutation
-    /// of the card's evidence list): the child latch is dropped and the
-    /// parent re-derived by a fresh descent, which is deliberately *not* a
-    /// repair — racing writers make the re-derived parent stale, and the
-    /// resulting misrouting is what the concurrency tests must catch. The
-    /// child latch is always released before any upward latch is taken:
-    /// latches are ordered top-down only, and holding a child while
-    /// blocking on an ancestor can deadlock.
+    /// `root` lock. A non-root node that arrives here with no ancestor
+    /// latched is proof the coupling discipline was broken (the
+    /// COUPLING-EARLY-RELEASE and G-SAFE-LAX mutation shapes) and returns
+    /// [`StoreError::Corrupt`]: card X-0-F1 deleted the `find_parent`
+    /// fallback that re-derived the parent by a fresh descent, because in
+    /// correct code that path is unreachable dead code (PLAN-v3 §6.1) and
+    /// in incorrect code it silently repaired — and so masked — the bug: a
+    /// racing writer makes a re-derived parent stale, and the resulting
+    /// misrouting is exactly what the model and concurrency tests must be
+    /// able to catch. The child latch is always released before any upward
+    /// latch is taken: latches are ordered top-down only, and holding a
+    /// child while blocking on an ancestor can deadlock.
     fn propagate_split<'s>(
         &'s self,
         mut left_id: PageId,
@@ -551,8 +598,15 @@ impl<S: PageStore> BTree<S> {
                     if left_id == self.root_id()? {
                         None
                     } else {
-                        drop(child_guard.take());
-                        Some(self.find_parent(left_id, &sep)?)
+                        // T-COUPLING broken: the separator descent must
+                        // always find this child's parent latched in
+                        // `guards`; no correct execution reaches a
+                        // non-root split without it (card X-0-F1).
+                        return Err(StoreError::Corrupt(
+                            "find_parent fallback: separator descent lost \
+                             the child — tree is inconsistent"
+                                .into(),
+                        ));
                     }
                 }
                 (g, id) => {
@@ -642,48 +696,6 @@ impl<S: PageStore> BTree<S> {
             left_id = pid;
             right_id = pr_id;
             sep = up;
-        }
-    }
-
-    /// Re-derive the current parent of `target` by descending from the
-    /// root along `key` (which routes into `target`'s subtree) until a
-    /// node's routed child is `target`. Returns that node latched
-    /// exclusive with its id. Holding no other latches, this descent is
-    /// deadlock-free (top-down order).
-    fn find_parent(
-        &self,
-        target: PageId,
-        key: &[u8],
-    ) -> Result<(PageId, WriteGuard<'_, S>), StoreError> {
-        let mut tries = 0u32;
-        loop {
-            let rid = self.root_id()?;
-            let mut guard = self.pool.fetch_write(rid)?;
-            if rid != self.root_id()? {
-                Self::bump_root_tries(&mut tries)?;
-                continue;
-            }
-            let mut nid = rid;
-            loop {
-                match page::kind(&guard)? {
-                    PageKind::Leaf => {
-                        return Err(StoreError::Corrupt(format!(
-                            "page {target:?} is not on the path of key; the tree was \
-                             restructured under a released ancestor latch"
-                        )));
-                    }
-                    PageKind::Inner => {
-                        let (_, child) = page::inner_route(&guard, key)?;
-                        if child == target {
-                            return Ok((nid, guard));
-                        }
-                        let next = self.pool.fetch_write(child)?;
-                        drop(guard);
-                        guard = next;
-                        nid = child;
-                    }
-                }
-            }
         }
     }
 }
