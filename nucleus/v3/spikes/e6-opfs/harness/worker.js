@@ -20,6 +20,7 @@ import init, {
   read_page,
   append_wal,
   wal_len,
+  read_wal,
   page_pattern,
   check_page,
 } from './pkg/e6_opfs.js';
@@ -59,6 +60,10 @@ async function dispatch(t, args) {
       return null;
     case 'wal_len':
       return wal_len();
+    case 'read_wal':
+      // Plain array (not Uint8Array) so it clones cleanly through the
+      // page bridge and Playwright's serialization.
+      return Array.from(read_wal());
     case 'write_pages':
       return write_pages(args.from, args.to);
     case 'read_check':

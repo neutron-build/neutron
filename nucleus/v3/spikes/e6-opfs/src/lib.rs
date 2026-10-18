@@ -16,8 +16,12 @@
 //!   offset `n * PAGE_SIZE` of the `pages` file, so any reader — including
 //!   one in another tab after a kill — can find it without metadata.
 //! * **Flush boundary.** [`flush`] pushes both files towards durable
-//!   storage. Data written before a *successful* `flush` is not guaranteed
-//!   to survive a kill; E6 T3 measures what actually survives per browser.
+//!   storage. Only data written before a *successful* `flush` is
+//!   *guaranteed* to survive a kill; unflushed data is best-effort, and E6
+//!   T3 measures what actually survives per browser. A harness kill is
+//!   process death, which the OS page cache survives — so even T3's
+//!   benign outcome cannot show that flushing is load-bearing; the README's
+//!   decision section says so explicitly (verdict X-6 R4).
 //! * **WAL append-only.** Each [`append_wal`] lands at the byte frontier
 //!   observed at [`open`] plus everything appended since, so the WAL is a
 //!   strictly sequential, prefix-truncatable log; [`wal_len`] is that
@@ -39,6 +43,11 @@ use web_sys::{FileSystemReadWriteOptions, FileSystemSyncAccessHandle};
 
 /// Page size of the spike's page file: the format default of PLAN-v3 §3.3.
 pub const PAGE_SIZE: usize = 8192;
+
+/// Upper bound on a [`read_wal`] allocation. The spike's WALs are a few
+/// hundred bytes, so a frontier larger than this is a bug or a foreign
+/// file, and the error is worth more than the attempted allocation.
+const WAL_READ_CAP: usize = 8 * 1024 * 1024;
 
 /// Magic header of a pattern page (see [`pattern_page`]).
 const PAGE_MAGIC: [u8; 8] = *b"E6PAGE00";
@@ -330,6 +339,49 @@ pub fn append_wal(bytes: &[u8]) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn wal_len() -> Result<f64, JsValue> {
     with_store("wal_len()", |store| Ok(store.wal_cursor.frontier()))
+}
+
+/// Reads the WAL's contents — byte 0 through the current frontier — so
+/// the harness can verify WAL *content* after a reopen, not just length
+/// (verdict X-6 R3: a WAL of the right length full of zeros must fail).
+///
+/// `open` seeds the frontier from the file's size, so this is exactly
+/// the log that survived; a torn file shorter than the frontier returns
+/// only the bytes present, and the harness's byte-for-byte comparison
+/// reports the first difference. Reads never cross the frontier: bytes
+/// beyond it are not part of the log this process sees.
+#[wasm_bindgen]
+pub fn read_wal() -> Result<js_sys::Uint8Array, JsValue> {
+    with_store("read_wal()", |store| {
+        let frontier = store.wal_cursor.frontier();
+        if !frontier.is_finite() || frontier < 0.0 {
+            return Err(error(&format!(
+                "read_wal() on {}: non-finite frontier ({frontier})",
+                store.name
+            )));
+        }
+        if frontier > WAL_READ_CAP as f64 {
+            return Err(error(&format!(
+                "read_wal() on {}: frontier {frontier} exceeds the {} byte read cap",
+                store.name, WAL_READ_CAP
+            )));
+        }
+        let mut buffer = vec![0_u8; frontier as usize];
+        let options = FileSystemReadWriteOptions::new();
+        options.set_at(0.0);
+        let got = store
+            .wal
+            .read_with_u8_array_and_options(&mut buffer, &options)
+            .map_err(|e| error(&format!("read_wal() on {}: failed: {e:?}", store.name)))?;
+        if !got.is_finite() || got < 0.0 {
+            return Err(error(&format!(
+                "read_wal() on {}: non-finite byte count ({got})",
+                store.name
+            )));
+        }
+        buffer.truncate(got.min(frontier) as usize);
+        Ok(js_sys::Uint8Array::from(buffer.as_slice()))
+    })
 }
 
 /// Generates the deterministic pattern page `n` (see [`pattern_page`]),

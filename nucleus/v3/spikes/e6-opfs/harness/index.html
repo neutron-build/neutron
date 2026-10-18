@@ -90,6 +90,9 @@
         async wal_len(name) {
           return rpc(worker_for(name), 'wal_len', {});
         },
+        async read_wal(name) {
+          return rpc(worker_for(name), 'read_wal', {});
+        },
         async bench_write(name, iters) {
           return rpc(worker_for(name), 'bench_write', { iters });
         },
