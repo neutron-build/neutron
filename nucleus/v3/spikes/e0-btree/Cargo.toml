@@ -1,0 +1,29 @@
+# E0 micro-spike (card X-0; PLAN-v3 §4 E0). Not production code: this crate
+# exists to measure a safe-Rust slotted-page B+tree against SQLite, and is
+# the substrate for E1′ (X-1a…X-3) and E4 (X-5).
+[package]
+name = "e0-btree"
+description = "E0 micro-spike: slotted-page B+tree on a simple buffer pool (card X-0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# SQLite is the E0 baseline; the C build is confined to the benchmark feature.
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+thiserror = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "e0-bench"
+path = "src/bin/e0-bench.rs"
