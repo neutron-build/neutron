@@ -9,8 +9,12 @@
 #        therefore "cold data" by construction; the cold/warm
 #        distinction here is process/page-cache warmth)
 #
-# --sha3 makes the run self-verifying: the harness compares the printed
-# SHA3 digest across all runs (see runner).
+# `--verify` makes the run self-verifying: speedtest1 prints a
+# "Verification Hash" line (an accumulator plus a 24-byte hash over all
+# query results — there is no --sha3 option in 3.54.1); the harness
+# compares that line across all runs and any disagreement voids the row
+# (PLAN-v3 §5.2 rule 4). busybox `time` supplies user/sys CPU seconds
+# (§5.1 efficiency metrics); speedtest1's own TOTAL is the wall metric.
 set -euo pipefail
 . "${NB_HARNESS}/lib/nb-lib.sh"
 
@@ -25,8 +29,8 @@ run_speedtest() {
   nb-podman run --rm --network host \
     --memory 24g --cpus 16 \
     -v "$VOL:/opt/nb:Z" -v "$DATA_VOL:/data:Z" \
-    "$IMG" /opt/nb/speedtest1 \
-      --size "$SIZE" --sha3 \
+    "$IMG" /usr/bin/time /opt/nb/speedtest1 \
+      --size "$SIZE" --verify \
       "$db" 2>&1
 }
 

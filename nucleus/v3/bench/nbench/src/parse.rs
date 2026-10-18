@@ -350,54 +350,88 @@ pub fn parse_memtier(log: &str) -> Result<ParsedRun> {
     })
 }
 
-/// Parse speedtest1 output: the final timing table row `TOTAL` plus the
-/// `SHA3 Digest:` line when `--sha3` was passed.
+/// Parse speedtest1 output as printed by SQLite 3.54.1:
 ///
 /// ```text
-///   ...
-///   Totals:
-///              12.342 seconds
-///   TOTAL          10.111   0.222   10.333   10.334   1287090816
-///   SHA3 Digest: 8f14e45fceea167a5a36dedd4bea2543f...
+///    17 - 100 SELECTs without an index.................     0.715s
+///           TOTAL.......................................    12.345s
+///    Verification Hash: 15286278048446160954 8f14e45f...
+///    real    0m 12.90s
+///    user    0m 11.01s
+///    sys     0m  0.88s
 /// ```
 ///
-/// The exact column layout varies by SQLite version; the first four
-/// numbers on the TOTAL line are user / system / total / wall seconds.
+/// - `TOTAL` is the sum of per-test elapsed time — the number SQLite
+///   itself reports for a speedtest1 run (wall seconds).
+/// - `Verification Hash:` is printed by `--verify`: an accumulator plus
+///   a 24-byte hash over every query result, so two runs of the same
+///   dataset must print the identical line or something changed
+///   (PLAN-v3 §5.2 rule 4). There is no `--sha3` option in 3.54.1.
+/// - `user`/`sys` come from the busybox `time` wrapper the driver runs
+///   (CPU seconds; §5.1 efficiency metrics); `real` is ignored in
+///   favour of speedtest1's own TOTAL.
 pub fn parse_speedtest1(log: &str) -> Result<ParsedRun> {
-    let mut total_line = None;
-    let mut digest = None;
+    let mut total_line: Option<&str> = None;
+    let mut digest: Option<String> = None;
+    let mut user_s: Option<f64> = None;
+    let mut sys_s: Option<f64> = None;
     for line in log.lines() {
         let t = line.trim();
         if t.starts_with("TOTAL") && total_line.is_none() {
-            total_line = Some(t.to_string());
+            total_line = Some(t);
         }
-        if t.starts_with("SHA3 Digest:") {
-            digest = t.get("SHA3 Digest:".len()..).map(|s| s.trim().to_string());
+        if let Some(rest) = t.strip_prefix("Verification Hash:")
+            && !rest.trim().is_empty()
+        {
+            digest = Some(rest.trim().to_string());
+        }
+        // busybox `time` lines: `user\t0m 11.01s`, `sys\t0m  0.88s`
+        if t.starts_with("user\t") {
+            user_s = parse_busybox_time_seconds(t);
+        }
+        if t.starts_with("sys\t") {
+            sys_s = parse_busybox_time_seconds(t);
         }
     }
     let line = total_line.ok_or_else(|| Error::Parse {
         what: "speedtest1",
         line: "no TOTAL line".into(),
     })?;
-    let nums: Vec<f64> = line
+    let wall = line
         .split_whitespace()
         .skip(1)
         .filter_map(|tok| num_prefix(tok).and_then(|n| n.parse::<f64>().ok()))
-        .collect();
-    if nums.len() < 4 {
-        return Err(Error::Parse {
+        .next()
+        .ok_or_else(|| Error::Parse {
             what: "speedtest1 TOTAL",
-            line,
-        });
-    }
+            line: line.to_string(),
+        })?;
+    let user = user_s.ok_or_else(|| Error::Parse {
+        what: "speedtest1",
+        line: "no busybox `user` timing line".into(),
+    })?;
+    let sys = sys_s.ok_or_else(|| Error::Parse {
+        what: "speedtest1",
+        line: "no busybox `sys` timing line".into(),
+    })?;
     Ok(ParsedRun {
         metrics: vec![
-            ("user_s".to_string(), nums[0]),
-            ("sys_s".to_string(), nums[1]),
-            ("wall_s".to_string(), nums[3]),
+            ("wall_s".to_string(), wall),
+            ("user_s".to_string(), user),
+            ("sys_s".to_string(), sys),
         ],
         digest,
     })
+}
+
+/// Parse a busybox `time` line (`user\t0m 11.01s`, minutes may exceed 9)
+/// into seconds.
+fn parse_busybox_time_seconds(line: &str) -> Option<f64> {
+    let rest = line.trim_start_matches(|c: char| !c.is_whitespace()).trim();
+    let (mins, secs) = rest.split_once('m')?;
+    let minutes: f64 = mins.trim().parse().ok()?;
+    let seconds: f64 = secs.trim().trim_end_matches('s').trim().parse().ok()?;
+    Some(minutes * 60.0 + seconds)
 }
 
 #[cfg(test)]
@@ -542,9 +576,9 @@ mod tests {
 
     #[test]
     fn speedtest1_total_and_digest() {
-        let log = "...lots of output...\n\
-                   TOTAL         10.111   0.222   10.333   10.334   1287090816\n\
-                   SHA3 Digest: 8f14e45fceea167a5a36dedd4bea2543f\n";
+        // Real captured output (SQLite 3.54.1 speedtest1 --verify, card
+        // B-0 run; the file's first line names the exact build).
+        let log = include_str!("fixtures/speedtest1-run.txt");
         let parsed = parse_speedtest1(log).expect("parse");
         let get = |k: &str| {
             parsed
@@ -554,18 +588,63 @@ mod tests {
                 .map(|(_, v)| *v)
                 .expect("metric")
         };
-        assert_eq!(get("user_s"), 10.111);
-        assert_eq!(get("sys_s"), 0.222);
-        assert_eq!(get("wall_s"), 10.334);
-        assert_eq!(
-            parsed.digest.as_deref(),
-            Some("8f14e45fceea167a5a36dedd4bea2543f")
+        // spot values are asserted against the fixture file itself
+        assert!(get("wall_s") > 0.0);
+        assert!(get("user_s") > 0.0);
+        assert!(get("sys_s") >= 0.0);
+        // the Verification Hash line must be captured whole (accumulator
+        // plus hex digest) — it is the row's per-run content fingerprint
+        let d = parsed.digest.as_deref().expect("digest");
+        let parts: Vec<&str> = d.split_whitespace().collect();
+        assert_eq!(parts.len(), 2, "hash line: {d}");
+        assert!(
+            parts[1].len() == 48 && parts[1].chars().all(|c| c.is_ascii_hexdigit()),
+            "hash hex: {d}"
         );
     }
 
     #[test]
-    fn speedtest1_without_total_errors() {
+    fn speedtest1_synthetic_shapes() {
+        let log = "   1 - 100000 INSERTs........................     1.234s\n\
+                   \x20\x20\x20\x20\x20\x20\x20TOTAL..................................    12.345s\n\
+                   Verification Hash: 15286278048446160954 8f14e45fceea167a5a36dedd4bea2543f8f14e45fceea167a5a36dedd\n\
+                   real\t0m 12.90s\n\
+                   user\t0m 11.01s\n\
+                   sys\t0m  0.88s\n";
+        let parsed = parse_speedtest1(log).expect("parse");
+        let get = |k: &str| {
+            parsed
+                .metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get("wall_s"), 12.345);
+        assert_eq!(get("user_s"), 11.01);
+        assert_eq!(get("sys_s"), 0.88);
+        // minutes > 9 keep parsing
+        let long = "TOTAL....  677.378s\nuser\t12m 05.67s\nsys\t1m 02.00s\n";
+        let p2 = parse_speedtest1(long).expect("parse long");
+        let get2 = |k: &str| {
+            p2.metrics
+                .iter()
+                .find(|(m, _)| m == k)
+                .map(|(_, v)| *v)
+                .expect("metric")
+        };
+        assert_eq!(get2("user_s"), 725.67);
+        assert_eq!(get2("sys_s"), 62.0);
+    }
+
+    #[test]
+    fn speedtest1_missing_pieces_error() {
+        // no TOTAL at all
         assert!(parse_speedtest1("run started\nTime: 1.0 s\n").is_err());
+        // TOTAL but no busybox CPU lines (driver forgot the time wrapper)
+        assert!(parse_speedtest1("TOTAL....  1.000s\n").is_err());
+        // TOTAL with no number on the line
+        assert!(parse_speedtest1("TOTAL....\nuser\t0m 1.00s\nsys\t0m 0.10s\n").is_err());
     }
 
     #[test]

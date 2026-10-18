@@ -45,7 +45,7 @@ USAGE:
   nbench vec-qdrant-search --base F --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F]
   nbench vec-qdrant-digest --host H --port P [--collection C]
   nbench vec-pg-copy       --base F
-  nbench vec-pg-search     --container C --query F --truth F --ef N [--limit K] [--metrics-out F]
+  nbench vec-pg-search     --container C --query F --truth F --ef N [--limit K] [--port P] [--metrics-out F]
 ";
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -216,15 +216,23 @@ fn cmd_vec_qdrant_digest(args: &[String]) -> Result<()> {
     let count = vector::qdrant_count(&host, port, &collection)?;
     // Deterministic sample: ids divisible by 997, capped at 128 points.
     let sample_ids: Vec<usize> = (0..count).filter(|i| i % 997 == 0).take(128).collect();
-    let ids_json = json::to_string(&Value::Arr(
-        sample_ids.iter().map(|i| Value::n(*i as f64)).collect(),
-    ))?;
+    // Point-get request shape per the Qdrant REST docs: an object with
+    // `ids` and explicit `with_vector` (the pinned image rejects a bare
+    // id array with 400, probed 2026-10-17).
+    let body = json::to_string(&Value::obj(vec![
+        (
+            "ids",
+            Value::Arr(sample_ids.iter().map(|i| Value::n(*i as f64)).collect()),
+        ),
+        ("with_vector", Value::Bool(true)),
+        ("with_payload", Value::Bool(false)),
+    ]))?;
     let resp = http::request(
         &host,
         port,
         "POST",
         &format!("/collections/{collection}/points"),
-        ids_json.as_bytes(),
+        body.as_bytes(),
         Duration::from_secs(30),
     )?;
     if resp.status != 200 {
@@ -290,6 +298,12 @@ fn cmd_vec_pg_search(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| "10".into())
         .parse()
         .map_err(|_| Error::Usage("bad limit".into()))?;
+    // The pgvector server runs on a non-default port (5433) so it can
+    // coexist with the postgres17 system; psql must be told explicitly.
+    let port: u16 = arg_value(args, "port")
+        .unwrap_or_else(|| "5432".into())
+        .parse()
+        .map_err(|_| Error::Usage("bad port".into()))?;
     let metrics_out = arg_value(args, "metrics-out");
 
     let queries = vector::read_fvecs(&PathBuf::from(&query_path))?;
@@ -300,8 +314,24 @@ fn cmd_vec_pg_search(args: &[String]) -> Result<()> {
 
     let mut child = Command::new("systemd-run")
         .args([
-            "--user", "--wait", "--pipe", "--quiet", "podman", "exec", "-i", &container, "psql",
-            "-q", "-t", "-A", "-U", "postgres", "-d", "nbench",
+            "--user",
+            "--wait",
+            "--pipe",
+            "--quiet",
+            "podman",
+            "exec",
+            "-i",
+            &container,
+            "psql",
+            "-q",
+            "-t",
+            "-A",
+            "-p",
+            &port.to_string(),
+            "-U",
+            "postgres",
+            "-d",
+            "nbench",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

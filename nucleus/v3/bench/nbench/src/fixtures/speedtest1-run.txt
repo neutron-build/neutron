@@ -1,0 +1,85 @@
+SQLite 3.54.1 speedtest1 (sqlite-amalgamation-3540100, built per systems/sqlite/Dockerfile), --size 1 --verify, busybox time
+3.54.1 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76 (64-bit)
+-- Speedtest1 for SQLite 3.54.1 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b
+ 100 - 500 INSERTs into table with no index........................    0.003s
+ 110 - 500 ordered INSERTS with one index/PK.......................    0.003s
+ 120 - 500 unordered INSERTS with one index/PK.....................    0.005s
+ 130 - 25 SELECTS, numeric BETWEEN, unindexed......................    0.002s
+ 140 - 10 SELECTS, LIKE, unindexed.................................    0.003s
+ 142 - 10 SELECTS w/ORDER BY, unindexed............................    0.005s
+ 145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................    0.004s
+ 150 - CREATE INDEX five times.....................................    0.008s
+ 160 - 100 SELECTS, numeric BETWEEN, indexed.......................    0.001s
+ 161 - 100 SELECTS, numeric BETWEEN, PK............................    0.001s
+ 170 - 100 SELECTS, text BETWEEN, indexed..........................    0.001s
+ 180 - 500 INSERTS with three indexes..............................    0.007s
+ 190 - DELETE and REFILL one table.................................    0.006s
+ 200 - VACUUM......................................................    0.008s
+ 210 - ALTER TABLE ADD COLUMN, and query...........................    0.004s
+ 230 - 100 UPDATES, numeric BETWEEN, indexed.......................    0.003s
+ 240 - 500 UPDATES of individual rows..............................    0.002s
+ 250 - One big UPDATE of the whole 500-row table...................    0.002s
+ 260 - Query added column after filling............................    0.001s
+ 270 - 100 DELETEs, numeric BETWEEN, indexed.......................    0.003s
+ 280 - 500 DELETEs of individual rows..............................    0.003s
+ 290 - Refill two 500-row tables using REPLACE.....................    0.010s
+ 300 - Refill a 500-row table using (b&1)==(a&1)...................    0.007s
+ 310 - 100 four-ways joins.........................................    0.004s
+ 320 - subquery in result set......................................    0.000s
+ 400 - 700 REPLACE ops on an IPK...................................    0.004s
+ 410 - 700 SELECTS on an IPK.......................................    0.011s
+ 500 - 700 REPLACE on TEXT PK......................................    0.004s
+ 510 - 700 SELECTS on a TEXT PK....................................    0.006s
+ 520 - 700 SELECT DISTINCT.........................................    0.001s
+ 980 - PRAGMA integrity_check......................................    0.003s
+ 990 - ANALYZE.....................................................    0.003s
+ 999 - Reset the database..........................................    0.017s
+       Begin testset "orm"
+ 100 - Fill 250 rows...............................................    0.013s
+ 110 - Query 250 rows by rowid.....................................    0.015s
+ 999 - Reset the database..........................................    0.002s
+       Begin testset "cte"
+ 100 - Sudoku with recursive 'digits'..............................    0.037s
+ 200 - Sudoku with VALUES 'digits'.................................    0.036s
+ 300 - Mandelbrot Set with spacing=5.000000........................    0.002s
+ 400 - EXCEPT operator on 10000-element tables.....................    0.012s
+ 999 - Reset the database..........................................    0.000s
+       Begin testset "json"
+ 100 - table J1 is 5 rows of JSONB.................................    0.024s
+ 110 - table J2 is 1 rows from J1 converted to text................    0.005s
+ 120 - create indexes on JSON expressions on J1....................    0.006s
+ 130 - create indexes on JSON expressions on J2....................    0.006s
+ 140 - queries against J1..........................................    0.008s
+ 141 - queries involving json_type()...............................    0.005s
+ 150 - json_insert()/set()/remove() on every row of J1.............    0.010s
+ 160 - json_insert()/set()/remove() on every row of J2.............    0.011s
+ 999 - Reset the database..........................................    0.006s
+       Begin testset "fp"
+ 100 - Fill a table with 10000 FP values...........................    0.019s
+ 110 - 2 range queries.............................................    0.005s
+ 120 - CREATE INDEX three times....................................    0.028s
+ 130 - 2 indexed range queries.....................................    0.000s
+ 140 - 5000 calls to round().......................................    0.004s
+ 150 - 20000 printf() calls........................................    0.012s
+ 999 - Reset the database..........................................    0.007s
+       Begin testset "parsenumber"
+ 100 - parsing 100 small integers..................................    0.001s
+ 110 - parsing 100 large integers..................................    0.001s
+ 200 - parsing 100 small reals.....................................    0.001s
+ 210 - parsing 100 large reals.....................................    0.000s
+ 999 - Reset the database..........................................    0.000s
+       Begin testset "star"
+ 100 - Create a fact table with 50 entries.........................    0.005s
+ 110 - Create indexes on all attributes columns....................    0.014s
+ 120 - Create dimension tables.....................................    0.051s
+ 130 - Star query over the entire fact table.......................    0.001s
+ 140 - Star query with LEFT JOINs..................................    0.001s
+ 999 - Reset the database..........................................    0.019s
+       Begin testset "app"
+ 100 - Generate a Fossil-like database schema......................    0.021s
+ 110 - Open and use the database 3 times...........................    0.009s
+       TOTAL.......................................................    0.542s
+Verification Hash: 519829 defa1b12567c85697a6d65b6877c82c932e9ee2cdb8cdea3
+real	0m 0.54s
+user	0m 0.28s
+sys	0m 0.12s

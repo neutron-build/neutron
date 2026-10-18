@@ -171,6 +171,13 @@ fn start_system(root: &Path, system: &SystemDef, image: &str, variant: Option<&s
     wait_ready(system, root)
 }
 
+/// Shell snippet that pings a RESP server and succeeds only on PONG.
+/// Kept pure for a unit test: the probe must carry the server's port
+/// (Valkey 6379, Redis 6380 share the host network).
+fn resp_ping_probe(cli: &str, port: u16) -> String {
+    format!("{cli} -p {port} ping | grep -q PONG")
+}
+
 fn wait_ready(system: &SystemDef, _root: &Path) -> Result<()> {
     match system.ready {
         Ready::None => Ok(()),
@@ -194,10 +201,11 @@ fn wait_ready(system: &SystemDef, _root: &Path) -> Result<()> {
                 stderr_tail: "not ready after 300s".into(),
             })
         }
-        Ready::RespPing { cli } => {
+        Ready::RespPing { cli, port } => {
+            let probe = resp_ping_probe(cli, port);
             let ok = podman::wait_until_exec_ok(
                 &system.container(),
-                &["sh", "-c", &format!("{cli} ping | grep -q PONG")],
+                &["sh", "-c", &probe],
                 Duration::from_secs(120),
             );
             ok.then_some(()).ok_or_else(|| Error::Command {
@@ -864,6 +872,20 @@ mod tests {
             ("mode".to_string(), "on".to_string()),
         ];
         assert_eq!(series_string(&s), "clients=16,mode=on");
+    }
+
+    #[test]
+    fn resp_ping_probe_targets_the_configured_port() {
+        // Valkey shares the host network with Redis; a probe without the
+        // port would hit whatever listens on 6379 (card B-0 regression).
+        assert_eq!(
+            resp_ping_probe("redis-cli", 6380),
+            "redis-cli -p 6380 ping | grep -q PONG"
+        );
+        assert_eq!(
+            resp_ping_probe("valkey-cli", 6379),
+            "valkey-cli -p 6379 ping | grep -q PONG"
+        );
     }
 
     #[test]

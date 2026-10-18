@@ -357,9 +357,24 @@ pub fn qdrant_count(host: &str, port: u16, collection: &str) -> Result<usize> {
         });
     }
     let v = json::parse(&String::from_utf8_lossy(&resp.body))?;
-    Ok(v.get("result")
-        .and_then(Value::as_f64)
-        .ok_or_else(|| Error::Missing("count".into()))? as usize)
+    parse_count_response(&v)
+}
+
+/// Parse a Qdrant count response body.
+///
+/// Current Qdrant wraps the number: `{"result": {"count": N}, ...}`;
+/// versions before ~1.13 printed the bare number `{"result": N}`. Both
+/// are accepted so a Qdrant upgrade changes the digest value, not the
+/// harness (a shape change here is loud: `Missing("count")`).
+pub fn parse_count_response(v: &Value) -> Result<usize> {
+    let result = v
+        .get("result")
+        .ok_or_else(|| Error::Missing("count".into()))?;
+    let n = result
+        .as_f64()
+        .or_else(|| result.get("count").and_then(Value::as_f64))
+        .ok_or_else(|| Error::Missing("count".into()))?;
+    Ok(n as usize)
 }
 
 // ---- pgvector ----
@@ -517,5 +532,20 @@ mod tests {
         let pts = v.get("points").and_then(Value::as_arr).expect("points");
         assert_eq!(pts.len(), 2);
         assert_eq!(pts[0].get("id").and_then(Value::as_f64), Some(5.0));
+    }
+
+    #[test]
+    fn count_response_accepts_both_documented_shapes() {
+        // Current Qdrant (pinned image, probed 2026-10-17) wraps the count
+        // in an object; older versions printed the bare number.
+        let wrapped =
+            json::parse(r#"{"result":{"count":1000000},"status":"ok"}"#).expect("wrapped json");
+        assert_eq!(parse_count_response(&wrapped).expect("wrapped"), 1_000_000);
+        let bare = json::parse(r#"{"result":1000000,"status":"ok"}"#).expect("bare json");
+        assert_eq!(parse_count_response(&bare).expect("bare"), 1_000_000);
+        // anything else is a loud error, never a guess
+        let bad = json::parse(r#"{"result":{"exact":true}}"#).expect("bad json");
+        assert!(parse_count_response(&bad).is_err());
+        assert!(parse_count_response(&Value::Null).is_err());
     }
 }

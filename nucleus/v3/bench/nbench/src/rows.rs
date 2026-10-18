@@ -67,8 +67,11 @@ pub enum Ready {
     /// `pg_isready -U postgres -d <db> -p <port>` via podman exec (the
     /// port must match the server's configured port).
     PgIsready { db: &'static str, port: u16 },
-    /// `<cli> ping` expecting PONG via podman exec.
-    RespPing { cli: &'static str },
+    /// `<cli> -p <port> ping` expecting PONG via podman exec. The port is
+    /// part of the probe because Redis and Valkey coexist on the host
+    /// network with distinct ports (6379/6380); a probe that ignores the
+    /// configured port pings the wrong (or no) server.
+    RespPing { cli: &'static str, port: u16 },
     /// HTTP GET /healthz expecting 200 (Qdrant).
     Http { port: u16 },
     /// Transient system: nothing to wait for.
@@ -400,7 +403,10 @@ pub const SYSTEMS: &[SystemDef] = &[
             (AOF_ALWAYS, &["--appendfsync", "always"]),
             (AOF_EVERYSEC, &["--appendfsync", "everysec"]),
         ],
-        ready: Ready::RespPing { cli: "valkey-cli" },
+        ready: Ready::RespPing {
+            cli: "valkey-cli",
+            port: 6379,
+        },
         run_extra: &[],
     },
     SystemDef {
@@ -428,7 +434,10 @@ pub const SYSTEMS: &[SystemDef] = &[
             (AOF_ALWAYS, &["--appendfsync", "always"]),
             (AOF_EVERYSEC, &["--appendfsync", "everysec"]),
         ],
-        ready: Ready::RespPing { cli: "redis-cli" },
+        ready: Ready::RespPing {
+            cli: "redis-cli",
+            port: 6380,
+        },
         run_extra: &[],
     },
     SystemDef {
@@ -766,6 +775,27 @@ mod tests {
         for s in SYSTEMS {
             if s.kind == SystemKind::Server {
                 assert!(seen.insert(s.port()), "duplicate port for {}", s.name);
+            }
+        }
+    }
+
+    #[test]
+    fn resp_probes_carry_their_configured_port() {
+        // Regression (card B-0 bring-up): the redis7 readiness probe once
+        // ran `redis-cli ping` against the default port 6379 while the
+        // server was configured for 6380, so the row never became ready.
+        // A RESP system's probe port must equal the port in its base args
+        // (its SystemDef::port()).
+        for s in SYSTEMS {
+            if let Ready::RespPing { port, .. } = s.ready {
+                assert_eq!(
+                    port,
+                    s.port(),
+                    "{}: RESP probe port {} != server port {}",
+                    s.name,
+                    port,
+                    s.port()
+                );
             }
         }
     }

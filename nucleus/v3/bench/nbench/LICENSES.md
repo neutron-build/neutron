@@ -14,7 +14,7 @@ published (§5.2 rule 9).
 | Valkey 8 | `docker.io/valkey/valkey:8` | BSD-3-Clause | Permitted |
 | Redis 7 | `docker.io/library/redis:7` | Dual RSALv2 / SSPLv1 | Permitted — both licences restrict *offering the software as a managed service*, not publishing benchmarks of it; factual trademark use |
 | Qdrant | `docker.io/qdrant/qdrant` | Apache-2.0 | Permitted |
-| SQLite 3.54.1 | sqlite.org source tarball | Public domain | Permitted |
+| SQLite 3.54.1 | sqlite.org amalgamation + src tarballs | Public domain | Permitted |
 | sysbench 1.0.20 | Alpine community package | GPL-2.0 | Tool, run unmodified and standalone; GPL restricts distribution of the *tool's* code, not benchmark results of the database |
 | memtier_benchmark 2.5.2 | `docker.io/redislabs/memtier_benchmark` | GPL-2.0 (upstream) / RSALv2 (Redis fork parts) | Tool, run unmodified; same reasoning as sysbench |
 | ann-benchmarks SIFT1M dataset | ann-benchmarks.com hdf5 | Dataset distributed by the ann-benchmarks project for benchmarking; original TEXMEX corpus is research-use | Using and publishing results on it is the dataset's purpose; ann-benchmarks publishes such results itself |
