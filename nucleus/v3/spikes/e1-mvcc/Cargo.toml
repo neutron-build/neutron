@@ -1,0 +1,25 @@
+# E1′ harness (card X-1a; PLAN-v3 §4 E1′, §2 N2/N3, §3.4). Not production
+# code: this crate builds everything the two E1′ arms share — the binding
+# TxnEngine trait, the shared txn components, the reference engine and the
+# behaviour suite — so that arms (b) (card X-2) and (c) (card X-3), which
+# run on the X-0 tree, differ only in their version layout.
+[package]
+name = "e1-mvcc"
+description = "E1′ MVCC harness (card X-1a): TxnEngine trait, shared txn components, reference engine, behaviour suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+# The arms (X-2, X-3) run on the X-0 B+tree; the card names the dependency
+# here. This card's reference engine deliberately uses no tree (card Work 4).
+e0-btree = { path = "../e0-btree" }
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true
