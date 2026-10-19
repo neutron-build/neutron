@@ -98,16 +98,30 @@ in the spike; the production `OpfsEnv` must not do this.
 
 ## Results (full run, 2026-10-18, x64 linux, 16 cpus, Node v24.22.0)
 
-Command: `node run.mjs` (no `--quick`), datasets: T1 1000 pages, T2/T3/T4
-300 pages, T5 200 samples. Raw JSON: `harness/results.json` — note any
-later run (including the acceptance `--quick`) overwrites it; the table
-below is the committed record of the full run.
+Command (from `harness/`): `PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/nv3-target/playwright/browsers
+timeout 3600 node run.mjs --out=../results/full-2026-10-18.json` (no
+`--quick`), datasets: T1 1000 pages, T2/T3/T4 300 pages, T5 200 samples
+(`meta.datasets`, `meta.quick: false`). Raw JSON:
+**[`results/full-2026-10-18.json`](results/full-2026-10-18.json)** —
+written by `run.mjs`, committed verbatim and never hand-edited; the table
+below is rebuilt from that file, so no later run (including the
+acceptance `--quick`, which still writes `harness/results.json`) can
+overwrite the record. `meta.date` is `2026-10-19T03:29:11Z` = 2026-10-18
+20:29 local; the file name carries the local date.
+
+This table replaces the X-6 worker's full run of the same date, whose raw
+JSON was not kept (`harness/results.json` is gitignored and every run
+overwrote it — verdict X-6 finding N2). The verdict's reproduction had
+matched that run in every engine except Chromium's flush p99 (7.7 ms
+there).
 
 | | T1 persist 1000 pages + reload | T2 tab kill | T2 browser SIGKILL (real PIDs) | T3 unflushed, then SIGKILL (real PIDs) | T4 second tab waits | WAL content | flush p50/p99 | 8 KiB write p50/p99 |
 |---|---|---|---|---|---|---|---|---|
-| **Chromium** (headless shell 156) | pass | ok | ok, killed 1 pid | 300/300 pages + WAL record, killed 1 pid | yes (432 ms), granted +1 ms after release | exact (T1 525 B, T2 21 B, T4 34 B) | 0.3 / 1.1 ms | 0.0 / 0.2 ms |
-| **Firefox** (157) | pass | ok | ok, killed 1 pid | 300/300 pages + WAL record, killed 1 pid | yes (453 ms), granted +1 ms after release | exact | 0.0 / 2 ms | 0.0 / 1 ms |
-| **WebKit** (27.2) | pass | ok | ok, killed 2 pids | 300/300 pages + WAL record, killed 2 pids | yes (423 ms), granted +1 ms after release | exact | 0.0 / 1 ms | 0.0 / 1 ms |
+| **Chromium** (headless shell 156) | pass | ok | ok, killed 1 pid | 300/300 pages + WAL record, killed 1 pid | yes (465 ms), granted +6 ms after release | exact (T1 525 B, T2 21 B, T4 34 B) | 0.2 / 0.4 ms | 0 / 0.2 ms |
+| **Firefox** (157) | pass | ok | ok, killed 1 pid | 300/300 pages + WAL record, killed 1 pid | yes (470 ms), granted +1 ms after release | exact (T1 525 B, T2 21 B, T4 34 B) | 0 / 2 ms | 0 / 1 ms |
+| **WebKit** (27.2) | pass | ok | ok, killed 2 pids | 300/300 pages + WAL record, killed 2 pids | yes (423 ms), granted +1 ms after release | exact (T1 525 B, T2 21 B, T4 34 B) | 0 / 1 ms | 0 / 1 ms |
+
+Legend — the JSON field behind every column, in `results/full-2026-10-18.json` under `engines.<engine>.tests`: T1 `t1.status` (pages `t1.detail.pages`); T2 tab `t2.detail.tab_kill.ok`; T2 browser `t2.detail.browser_kill.ok` with `…kill.pids` and `…kill.killed`; T3 `t3.detail.intact_pages_after_kill`/`t3.detail.pages_written`, WAL `t3.detail.wal_content_after_kill.ok`, pids `t3.detail.kill.pids`; T4 wait `t4.detail.b_wait_ms`, grant `t4.detail.release_to_grant_ms`; WAL content `t1.detail.wal`, `t2.detail.tab_kill.wal`, `t2.detail.browser_kill.wal`, `t4.detail.final_check.wal` (each `{ok, len}`); flush `t5.detail.flush.p50_ms`/`p99_ms`; 8 KiB write `t5.detail.write.p50_ms`/`p99_ms`.
 
 Details worth keeping:
 
@@ -128,18 +142,19 @@ Details worth keeping:
   another open Access Handle…"), Firefox ("No modification allowed"),
   WebKit ("The object is in an invalid state"). With the Web Lock held by
   A, B's `hold_lock` did not settle within the 400 ms probe (waited
-  423–453 ms); it was granted 0–1 ms after A released. B then read A's
+  423–470 ms); it was granted 1–6 ms after A released. B then read A's
   flushed half intact (0 missing / 0 corrupt of 150), wrote its own half,
   and a fresh tab verified all 300 pages and the **byte-exact** WAL
   (34 B: A's record then B's).
 * **T5** measures only the wasm→browser call (`performance.now()` in the
-  worker, pattern generation excluded). Chromium's flush p50 of ~0.3 ms
-  matches this machine's fsync floor; Firefox/WebKit flushes and all
-  sub-ms writes round to 0.0 at ms resolution — treat them as
-  "sub-millisecond", not as literal zeros. p99 is jitter-prone (a
-  previous full run put Chromium's flush p99 at 8.4 ms on a single
-  outlier); p50, not p99, is the stable comparison point at this sample
-  size.
+  worker, pattern generation excluded). Chromium's flush p50 of 0.2–0.3 ms
+  across this harness's full runs matches this machine's fsync floor;
+  Firefox/WebKit flushes and all sub-ms writes round to 0 at ms
+  resolution — treat them as "sub-millisecond", not as literal zeros.
+  p99 is jitter-prone — the committed record above shows 0.4 ms, and
+  earlier full runs put Chromium's flush p99 at 1.1 ms, 7.7 ms (the X-6
+  gate's reproduction) and 8.4 ms (that one a single outlier); p50, not
+  p99, is the stable comparison point at this sample size.
 
 ## Oracles and mutation evidence
 

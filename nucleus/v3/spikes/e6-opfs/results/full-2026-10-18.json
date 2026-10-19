@@ -1,0 +1,446 @@
+{
+  "meta": {
+    "date": "2026-10-19T03:29:11.562Z",
+    "quick": false,
+    "hardware": "x64 linux; 16 cpus",
+    "node": "v24.22.0",
+    "playwright": "1.64.1 (by absolute path)",
+    "scenario_timeout_ms": 300000,
+    "kill_method": "SIGKILL by /proc cmdline scan on the unique per-run profile directory (verdict X-6 R1)",
+    "datasets": {
+      "t1_pages": 1000,
+      "t2_pages": 300,
+      "t3_pages": 300,
+      "t4_pages": 300,
+      "latency_samples": 200,
+      "wal_record_bytes": 21
+    }
+  },
+  "engines": {
+    "chromium": {
+      "engine": "chromium",
+      "tests": {
+        "t1": {
+          "status": "pass",
+          "ms": 643,
+          "detail": {
+            "db": "t1-2026-10-19T03-29-10-968Z",
+            "pages": 1000,
+            "missing": [],
+            "corrupt": [],
+            "wal": {
+              "ok": true,
+              "len": 525
+            },
+            "wal_len": 525,
+            "expected_wal_len": 525,
+            "wal_len_before_reload": 525
+          }
+        },
+        "t2": {
+          "status": "pass",
+          "ms": 751,
+          "detail": {
+            "db": "t2-2026-10-19T03-29-10-968Z",
+            "pages": 300,
+            "expected_wal_len": 21,
+            "tab_kill": {
+              "ok": true,
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 21
+              },
+              "wal_len": 21
+            },
+            "browser_kill": {
+              "ok": true,
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 21
+              },
+              "wal_len": 21,
+              "kill": {
+                "pids": [
+                  1696200
+                ],
+                "signaled": 1,
+                "remaining": [],
+                "killed": true
+              }
+            }
+          }
+        },
+        "t3": {
+          "status": "info",
+          "ms": 559,
+          "detail": {
+            "db": "t3-2026-10-19T03-29-10-968Z",
+            "pages_written": 300,
+            "kill": {
+              "pids": [
+                1696531
+              ],
+              "signaled": 1,
+              "remaining": [],
+              "killed": true
+            },
+            "intact_pages_after_kill": 300,
+            "missing_pages": 0,
+            "corrupt_pages": 0,
+            "wal_len_after_kill": 20,
+            "wal_content_after_kill": {
+              "ok": true,
+              "len": 20
+            },
+            "wal_len_if_fully_persisted": 20,
+            "note": "no flush before the kill; anything surviving is best-effort"
+          }
+        },
+        "t4": {
+          "status": "pass",
+          "ms": 1357,
+          "detail": {
+            "db": "t4-2026-10-19T03-29-10-968Z",
+            "pages_per_tab": 150,
+            "second_tab_waited_while_held": true,
+            "grant_after_release": true,
+            "a_held_since": 1792380554142,
+            "a_released_at": 1792380554631,
+            "b_requested_at": 1792380554172,
+            "b_granted_at": 1792380554637,
+            "b_wait_ms": 465,
+            "release_to_grant_ms": 6,
+            "first_half_intact": true,
+            "first_half": {
+              "missing": 0,
+              "corrupt": 0
+            },
+            "final_check": {
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 34
+              },
+              "wal_len": 34,
+              "expected_wal_len": 34
+            },
+            "exclusive_probe": {
+              "contested": true,
+              "error": "Failed to execute 'createSyncAccessHandle' on 'FileSystemFileHandle': Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file."
+            }
+          }
+        },
+        "t5": {
+          "status": "pass",
+          "ms": 338,
+          "detail": {
+            "page_bytes": 8192,
+            "write": {
+              "n": 200,
+              "min_ms": 0,
+              "p50_ms": 0,
+              "p99_ms": 0.2,
+              "max_ms": 2.1
+            },
+            "flush": {
+              "n": 200,
+              "min_ms": 0.1,
+              "p50_ms": 0.2,
+              "p99_ms": 0.4,
+              "max_ms": 3.7
+            }
+          }
+        }
+      }
+    },
+    "firefox": {
+      "engine": "firefox",
+      "tests": {
+        "t1": {
+          "status": "pass",
+          "ms": 5001,
+          "detail": {
+            "db": "t1-2026-10-19T03-29-10-968Z",
+            "pages": 1000,
+            "missing": [],
+            "corrupt": [],
+            "wal": {
+              "ok": true,
+              "len": 525
+            },
+            "wal_len": 525,
+            "expected_wal_len": 525,
+            "wal_len_before_reload": 525
+          }
+        },
+        "t2": {
+          "status": "pass",
+          "ms": 8906,
+          "detail": {
+            "db": "t2-2026-10-19T03-29-10-968Z",
+            "pages": 300,
+            "expected_wal_len": 21,
+            "tab_kill": {
+              "ok": true,
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 21
+              },
+              "wal_len": 21
+            },
+            "browser_kill": {
+              "ok": true,
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 21
+              },
+              "wal_len": 21,
+              "kill": {
+                "pids": [
+                  1697688
+                ],
+                "signaled": 1,
+                "remaining": [],
+                "killed": true
+              }
+            }
+          }
+        },
+        "t3": {
+          "status": "info",
+          "ms": 7062,
+          "detail": {
+            "db": "t3-2026-10-19T03-29-10-968Z",
+            "pages_written": 300,
+            "kill": {
+              "pids": [
+                1703355
+              ],
+              "signaled": 1,
+              "remaining": [],
+              "killed": true
+            },
+            "intact_pages_after_kill": 300,
+            "missing_pages": 0,
+            "corrupt_pages": 0,
+            "wal_len_after_kill": 20,
+            "wal_content_after_kill": {
+              "ok": true,
+              "len": 20
+            },
+            "wal_len_if_fully_persisted": 20,
+            "note": "no flush before the kill; anything surviving is best-effort"
+          }
+        },
+        "t4": {
+          "status": "pass",
+          "ms": 4978,
+          "detail": {
+            "db": "t4-2026-10-19T03-29-10-968Z",
+            "pages_per_tab": 150,
+            "second_tab_waited_while_held": true,
+            "grant_after_release": true,
+            "a_held_since": 1792380582398,
+            "a_released_at": 1792380582934,
+            "b_requested_at": 1792380582465,
+            "b_granted_at": 1792380582935,
+            "b_wait_ms": 470,
+            "release_to_grant_ms": 1,
+            "first_half_intact": true,
+            "first_half": {
+              "missing": 0,
+              "corrupt": 0
+            },
+            "final_check": {
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 34
+              },
+              "wal_len": 34,
+              "expected_wal_len": 34
+            },
+            "exclusive_probe": {
+              "contested": true,
+              "error": "No modification allowed"
+            }
+          }
+        },
+        "t5": {
+          "status": "pass",
+          "ms": 3199,
+          "detail": {
+            "page_bytes": 8192,
+            "write": {
+              "n": 200,
+              "min_ms": 0,
+              "p50_ms": 0,
+              "p99_ms": 1,
+              "max_ms": 2
+            },
+            "flush": {
+              "n": 200,
+              "min_ms": 0,
+              "p50_ms": 0,
+              "p99_ms": 2,
+              "max_ms": 4
+            }
+          }
+        }
+      }
+    },
+    "webkit": {
+      "engine": "webkit",
+      "tests": {
+        "t1": {
+          "status": "pass",
+          "ms": 1091,
+          "detail": {
+            "db": "t1-2026-10-19T03-29-10-968Z",
+            "pages": 1000,
+            "missing": [],
+            "corrupt": [],
+            "wal": {
+              "ok": true,
+              "len": 525
+            },
+            "wal_len": 525,
+            "expected_wal_len": 525,
+            "wal_len_before_reload": 525
+          }
+        },
+        "t2": {
+          "status": "pass",
+          "ms": 1979,
+          "detail": {
+            "db": "t2-2026-10-19T03-29-10-968Z",
+            "pages": 300,
+            "expected_wal_len": 21,
+            "tab_kill": {
+              "ok": true,
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 21
+              },
+              "wal_len": 21
+            },
+            "browser_kill": {
+              "ok": true,
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 21
+              },
+              "wal_len": 21,
+              "kill": {
+                "pids": [
+                  1705995,
+                  1706001
+                ],
+                "signaled": 2,
+                "remaining": [],
+                "killed": true
+              }
+            }
+          }
+        },
+        "t3": {
+          "status": "info",
+          "ms": 1590,
+          "detail": {
+            "db": "t3-2026-10-19T03-29-10-968Z",
+            "pages_written": 300,
+            "kill": {
+              "pids": [
+                1706469,
+                1706475
+              ],
+              "signaled": 2,
+              "remaining": [],
+              "killed": true
+            },
+            "intact_pages_after_kill": 300,
+            "missing_pages": 0,
+            "corrupt_pages": 0,
+            "wal_len_after_kill": 20,
+            "wal_content_after_kill": {
+              "ok": true,
+              "len": 20
+            },
+            "wal_len_if_fully_persisted": 20,
+            "note": "no flush before the kill; anything surviving is best-effort"
+          }
+        },
+        "t4": {
+          "status": "pass",
+          "ms": 1740,
+          "detail": {
+            "db": "t4-2026-10-19T03-29-10-968Z",
+            "pages_per_tab": 150,
+            "second_tab_waited_while_held": true,
+            "grant_after_release": true,
+            "a_held_since": 1792380594004,
+            "a_released_at": 1792380594441,
+            "b_requested_at": 1792380594019,
+            "b_granted_at": 1792380594442,
+            "b_wait_ms": 423,
+            "release_to_grant_ms": 1,
+            "first_half_intact": true,
+            "first_half": {
+              "missing": 0,
+              "corrupt": 0
+            },
+            "final_check": {
+              "missing": 0,
+              "corrupt": 0,
+              "wal": {
+                "ok": true,
+                "len": 34
+              },
+              "wal_len": 34,
+              "expected_wal_len": 34
+            },
+            "exclusive_probe": {
+              "contested": true,
+              "error": "The object is in an invalid state."
+            }
+          }
+        },
+        "t5": {
+          "status": "pass",
+          "ms": 831,
+          "detail": {
+            "page_bytes": 8192,
+            "write": {
+              "n": 200,
+              "min_ms": 0,
+              "p50_ms": 0,
+              "p99_ms": 1,
+              "max_ms": 2
+            },
+            "flush": {
+              "n": 200,
+              "min_ms": 0,
+              "p50_ms": 0,
+              "p99_ms": 1,
+              "max_ms": 3
+            }
+          }
+        }
+      }
+    }
+  }
+}
