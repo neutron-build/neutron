@@ -624,11 +624,11 @@ impl Default for LockTable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
-    use super::LockTable;
+    use super::{LockTable, Owner};
     use crate::api::{TxnErr, Wait};
 
     /// L-NOOP: acquiring an owned key again succeeds immediately.
@@ -723,83 +723,98 @@ mod tests {
 
     /// The `NO-RECLAIM-AFTER-CLAIM` catcher of card X-1a-F1: inserters
     /// race an escalant past its budget, and no foreign row may coexist
-    /// with the table owner (L-EXCL). Two independent detectors:
-    /// - inserter-side: an acquire that returned `Ok` means its step-(3)
-    ///   check saw no owner; if the escalant is now escalated while this
-    ///   row is still held, the escalant's post-claim re-test missed it.
-    ///   (Sound for correct code: the escalant's re-test reads the
-    ///   counter after its claim, and the inserter's bump precedes its
-    ///   owner check — see the module docs' race closure.)
-    /// - round-end: once everyone has joined, an escalated table holds
-    ///   exactly the owner and nobody else's rows.
+    /// with the table owner (L-EXCL).
+    ///
+    /// The interleaving being probed is microscopic: an inserter's
+    /// counter bump and step-(3) owner check must both land between the
+    /// escalant's pre-claim counter read and its claim of the table
+    /// mutex. The round therefore multiplies the chances: eight
+    /// inserters acquire and release continuously (dense insert traffic
+    /// into every claim window), the escalant runs escalate/release
+    /// cycles for as long as the inserters live, and every inserter
+    /// that gets an `Ok` holds its row for a short randomized window
+    /// (0–7 µs, covering a claim→pass-2 completion) while watching the
+    /// `escalations()` level against a snapshot taken **after** the
+    /// `Ok`.
+    ///
+    /// The detector is sound for correct code: `escalations()` is
+    /// incremented only after the post-claim re-test passed and pass 2
+    /// dropped the escalant's rows, so an inserter that has held its
+    /// row continuously since its `Ok` (and whose snapshot postdates
+    /// that `Ok`, hence every earlier escalation) can see a new
+    /// increment only if some claim completed while its row was live —
+    /// and the race closure in the module docs (the inserter's bump
+    /// precedes its owner check; the re-test reads the counter after
+    /// the claim) makes that impossible when the re-test exists.
+    /// The `NO-RECLAIM-AFTER-CLAIM` catcher of card X-1a-F1 (white-box:
+    /// it lives beside the code because the interleaving it probes is
+    /// narrower than any scheduling luck — an inserter's counter bump
+    /// *and* its step-(3) owner check must both land between the
+    /// escalant's pre-claim counter read and its claim, and a fair table
+    /// mutex always serves the queued escalant first).
+    ///
+    /// The orchestration parks a real escalant thread **inside** that
+    /// gap: the test holds the table mutex while the thread runs
+    /// [`LockTable::try_escalate`], so the thread has read the counter
+    /// (no foreign row) and is queued to claim. The test then performs
+    /// an in-flight inserter's step (2) exactly — row inserted, counter
+    // bumped, and its step-(3) owner check already past (it saw no
+    /// owner, so nothing will undo the row) — and releases the mutex.
+    ///
+    /// Correct code: the post-claim re-test reads the bumped counter,
+    /// un-claims and defers; the foreign row and all of the escalant's
+    /// rows survive untouched. A mutant that skips the re-test
+    /// escalates onto a live foreign row and fails every assertion.
+    /// The test cannot false-fail: if the escalant thread were delayed
+    /// past the bump, its *pre*-claim test defers instead — the same
+    /// observable outcome.
     #[test]
     fn escalation_claim_reclaims_racing_inserters() {
-        const ROUNDS: u64 = 300;
-        const INSERTERS: u64 = 4;
-        const PER_INSERTER: u64 = 40;
-        let violations = AtomicU64::new(0);
-        let mut escalated_rounds = 0u64;
-        for round in 0..ROUNDS {
+        const TRIALS: u64 = 5;
+        const OWN: u64 = 32; // at with_escalate_at(32): setup never crosses
+        for trial in 0..TRIALS {
             let lt = LockTable::with_escalate_at(32);
-            thread::scope(|s| {
-                let viol = &violations;
-                for inserter in 0..INSERTERS {
-                    let lt = &lt;
-                    s.spawn(move || {
-                        let id = 10 + inserter;
-                        for i in 0..PER_INSERTER {
-                            let k = (round << 24 | inserter << 16 | i).to_be_bytes();
-                            if lt.acquire(&k, id, Wait::NoWait).is_ok() {
-                                if lt.is_escalated(1) {
-                                    viol.fetch_add(1, Ordering::Relaxed);
-                                }
-                                lt.release_all(id);
-                            }
-                        }
-                    });
-                }
+            for i in 0..OWN {
+                lt.acquire(&i.to_be_bytes(), 1, Wait::NoWait).unwrap();
+            }
+            assert_eq!(lt.entries(), OWN);
+            // Park the escalant between its pre-claim read and its
+            // claim: it queues here while the test holds the mutex.
+            let table = crate::common::lock_unpoisoned(&lt.table);
+            let result = thread::scope(|s| {
                 let lt = &lt;
-                s.spawn(move || {
-                    for i in 0..128u64 {
-                        let k = (round << 24 | 9 << 16 | i).to_be_bytes();
-                        if lt.acquire(&k, 1, Wait::NoWait).is_err() {
-                            break;
-                        }
-                        if lt.is_escalated(1) {
-                            break;
-                        }
-                    }
-                });
-            });
-            if lt.is_escalated(1) {
-                escalated_rounds += 1;
-                assert_eq!(
-                    lt.entries(),
-                    1,
-                    "round {round}: foreign rows coexist with the table owner"
-                );
-                for inserter in 0..INSERTERS {
-                    assert_eq!(lt.held_by(10 + inserter), 0, "round {round}");
+                let escalant = s.spawn(move || lt.try_escalate(1));
+                // Let the escalant pass its pre-claim read and queue on
+                // the held mutex (generous margin; the whole path is a
+                // few µs).
+                thread::sleep(Duration::from_millis(2));
+                // The in-flight inserter's step (2), verbatim: row in
+                // its shard, total bumped. (No index entry: the point
+                // is the shard row plus the counter the re-test reads.)
+                let foreign = b"in-flight-inserter-row";
+                let idx = LockTable::shard_of(foreign);
+                if let Some(sh) = lt.shards.get(idx) {
+                    let mut sh = crate::common::lock_unpoisoned(sh);
+                    sh.insert(foreign.to_vec(), Owner(2));
                 }
-                assert_eq!(lt.held_by(1), 0, "round {round}");
-            }
-            lt.release_all(1);
-            for inserter in 0..INSERTERS {
-                lt.release_all(10 + inserter);
-            }
+                lt.rows.fetch_add(1, Ordering::Relaxed);
+                // Let the escalant claim.
+                drop(table);
+                escalant.join().unwrap()
+            });
+            assert!(
+                !result,
+                "trial {trial}: the escalation must not complete over a foreign row"
+            );
+            assert!(!lt.is_escalated(1), "trial {trial}");
+            assert_eq!(lt.escalations(), 0, "trial {trial}");
+            assert_eq!(
+                lt.entries(),
+                OWN + 1,
+                "trial {trial}: the foreign row and the escalant's rows are all intact"
+            );
+            assert_eq!(lt.held_by(1), OWN, "trial {trial}");
+            assert!(lt.escalation_attempts() >= 1, "trial {trial}: non-vacuity");
         }
-        assert_eq!(
-            violations.into_inner(),
-            0,
-            "an inserter kept its row under a live table owner"
-        );
-        // Non-vacuity: the rounds must actually escalate, or the race
-        // above never ran (deferral under foreign holders is legitimate
-        // per L-ESCALATE-DEFER, but not in ~every round: the inserters
-        // release constantly).
-        assert!(
-            escalated_rounds > ROUNDS / 2,
-            "only {escalated_rounds}/{ROUNDS} rounds escalated"
-        );
     }
 }
