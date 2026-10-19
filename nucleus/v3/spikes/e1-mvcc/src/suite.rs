@@ -1618,9 +1618,17 @@ pub fn s12_long_reader<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
     f
 }
 
-/// S13: 500 seeded schedules, each interleaving 4 open txns
-/// single-threaded with NoWait ops. Every op result and every commit/
-/// abort outcome must equal [`RefEngine`]'s on the same schedule.
+/// S13: 500 seeded schedules, each interleaving 4 txn slots
+/// single-threaded with NoWait ops. Card X-1a-F2: 1–3 slots start closed
+/// (seeded) and are re-opened mid-schedule by `Begin` ops, so snapshots
+/// span other txns' commits the ways a mid-schedule begin produces (for
+/// example an RR txn whose snapshot sits between two commits on the same
+/// key); and schedule-level `Gc` ops run `gc()` on the engine under test
+/// only — the reference replays every `Gc` as a no-op, because GC must
+/// be semantically invisible (no snapshot may observe it). Every op
+/// result and every commit/abort outcome must equal [`RefEngine`]'s on
+/// the same schedule; on `RefEngine` itself S13 is therefore also a
+/// metamorphic check of R-GC and the shared watermark.
 pub fn s13_differential<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
     let mut f = Vec::new();
     for seed in 0..500u64 {
@@ -1703,7 +1711,10 @@ struct SlotOp {
 }
 
 /// The operation vocabulary of S13 (NoWait only, so every schedule is
-/// deterministic single-threaded).
+/// deterministic single-threaded). Card X-1a-F2 adds the two schedule
+/// level ops: [`ScheduleOp::Gc`] is not tied to a slot (its `SlotOp`
+/// slot is ignored), and [`ScheduleOp::Begin`] re-opens a slot whose txn
+/// has ended.
 #[derive(Clone, Debug)]
 enum ScheduleOp {
     Get(Vec<u8>),
@@ -1717,6 +1728,16 @@ enum ScheduleOp {
     Rollback(SavepointId),
     Commit,
     Abort,
+    /// A schedule-level `gc()` on the engine under test (card X-1a-F2
+    /// Work 1). Both sides record [`Out::Unit`], so op indices stay
+    /// aligned; the engine's return value differs per engine by design
+    /// and is not compared.
+    Gc,
+    /// Open a fresh txn in a slot whose previous txn ended (card X-1a-F2
+    /// Work 2). Both sides record [`Out::Unit`]. The slot's savepoint
+    /// numbering restarts from 1 (the [`crate::common::WriteSet`]
+    /// numbers savepoints per txn from 1).
+    Begin(Isolation),
 }
 
 /// The comparable outcome of one scheduled op.
@@ -1802,56 +1823,136 @@ fn sched_val(rng: &mut Rng) -> Vec<u8> {
     rng.byte_vec(len)
 }
 
+/// One isolation level of the S13 txn space (50/50 RC/RR), used for the
+/// initial begins and for every mid-schedule [`ScheduleOp::Begin`].
+fn sched_iso(rng: &mut Rng) -> Isolation {
+    if rng.below(2) == 0 {
+        Isolation::ReadCommitted
+    } else {
+        Isolation::RepeatableRead
+    }
+}
+
+/// Upper bound on txns per S13 schedule (card X-1a-F2 Work 2): slots are
+/// reusable, so the cap keeps a schedule's txn count bounded. Card says
+/// "e.g. 12" for the original 60–199-op schedules; with the mid-schedule
+/// turnover this card adds, the cap scales with the schedule length.
+const S13_TXN_CAP: u64 = 24;
+
 /// Generate one schedule from a seed (keys in a 16-key space, values of
 /// 1–8 bytes, savepoints and rollbacks interleaved; every op NoWait).
-fn gen_schedule(seed: u64) -> (Vec<Isolation>, Vec<SlotOp>) {
+/// Card X-1a-F2: about 5% of ops are schedule-level `Gc`s; 1–3 of the 4
+/// slots start **closed** (seeded, `None` in the returned isos) so their
+/// first txn begins only mid-schedule via a `Begin` op, emitted for
+/// closed slots at about 8% of ops while the [`S13_TXN_CAP`] budget
+/// lasts. A `Begin` re-opens the slot with fresh savepoint numbering
+/// (from 1) and no live savepoints, matching the per-txn `WriteSet`.
+///
+/// Two rates were rebalanced for card X-1a-F2's coverage pins (the
+/// judgment call is recorded in the card RESULT): txns end at about 11%
+/// of ops (Commit 8%, Abort 3%, up from 5% in X-1a) and RC statement
+/// boundaries at 6% (up from 5%) — the turnover feeds the `Begin`s and
+/// moves the GC watermark mid-schedule, so `gc()` has live snapshots to
+/// respect and superseded versions to reclaim; schedules run 100–299
+/// ops (up from 60–199) for the same reason. Reads stay ~31% of ops,
+/// writes ~47%, savepoints 3% and rollbacks 2%.
+fn gen_schedule(seed: u64) -> (Vec<Option<Isolation>>, Vec<SlotOp>) {
     let mut rng = Rng::new(seed);
-    let isos: Vec<Isolation> = (0..4)
-        .map(|_| {
-            if rng.below(2) == 0 {
-                Isolation::ReadCommitted
-            } else {
-                Isolation::RepeatableRead
-            }
-        })
-        .collect();
+    let isos: Vec<Isolation> = (0..4).map(|_| sched_iso(&mut rng)).collect();
+    // 1–3 of the 4 slots start closed (card Work 2): picked by seeded
+    // rejection so the choice is deterministic from the seed alone.
     let mut alive = [true; 4];
+    let mut to_close = 1 + rng.below(3);
+    while to_close > 0 {
+        let slot = rng.below(4) as usize;
+        if alive.get(slot).copied().unwrap_or(false) {
+            if let Some(a) = alive.get_mut(slot) {
+                *a = false;
+            }
+            to_close -= 1;
+        }
+    }
+    let isos: Vec<Option<Isolation>> = isos
+        .into_iter()
+        .zip(alive)
+        .map(|(iso, open)| if open { Some(iso) } else { None })
+        .collect();
     let mut live_sps: Vec<Vec<SavepointId>> = vec![Vec::new(); 4];
     // Savepoint ids start at 1 (era 0 is "before any savepoint"; the
-    // WriteSet numbers them the same way).
+    // WriteSet numbers them the same way), and restart at 1 on every
+    // Begin (the WriteSet is per txn).
     let mut sp_next = [1u32; 4];
-    let n_ops = 60 + rng.below(140);
+    // The txn budget counts the initial opens plus every later Begin.
+    let mut txn_budget = S13_TXN_CAP - alive.iter().filter(|a| !**a).count() as u64;
+    let n_ops = 100 + rng.below(200);
     let mut ops: Vec<SlotOp> = Vec::new();
     while ops.len() < n_ops as usize {
-        if !alive.iter().any(|a| *a) {
+        // With every slot closed the only forward op is a Begin, so the
+        // schedule ends once the budget is spent too.
+        if !alive.iter().any(|a| *a) && txn_budget == 0 {
             break;
+        }
+        let pick = rng.below(100);
+        if pick < 5 {
+            // Card Work 1: schedule-level GC at about 5% of ops. The
+            // slot is ignored by the replay loop.
+            ops.push(SlotOp {
+                slot: 0,
+                kind: ScheduleOp::Gc,
+            });
+            continue;
+        }
+        if pick < 13 {
+            // Card Work 2: re-open a closed slot at about 8% of ops.
+            let closed: Vec<usize> = (0..4)
+                .filter(|s| !alive.get(*s).copied().unwrap_or(false))
+                .collect();
+            if txn_budget > 0
+                && let Some(&slot) = closed.get(rng.below(closed.len() as u64) as usize)
+            {
+                if let Some(a) = alive.get_mut(slot) {
+                    *a = true;
+                }
+                txn_budget -= 1;
+                if let Some(s) = sp_next.get_mut(slot) {
+                    *s = 1;
+                }
+                if let Some(s) = live_sps.get_mut(slot) {
+                    s.clear();
+                }
+                ops.push(SlotOp {
+                    slot,
+                    kind: ScheduleOp::Begin(sched_iso(&mut rng)),
+                });
+            }
+            continue;
         }
         let slot = rng.below(4) as usize;
         if !alive.get(slot).copied().unwrap_or(false) {
             continue;
         }
         let pick = rng.below(100);
-        let kind = if pick < 25 {
+        let kind = if pick < 22 {
             ScheduleOp::Get(sched_key(&mut rng))
-        } else if pick < 35 {
+        } else if pick < 31 {
             ScheduleOp::Scan(
                 vec![rng.below(18) as u8],
                 vec![rng.below(18) as u8],
                 1 + rng.below(10) as usize,
             )
-        } else if pick < 55 {
+        } else if pick < 50 {
             let k = sched_key(&mut rng);
             ScheduleOp::Put(k, sched_val(&mut rng))
-        } else if pick < 67 {
+        } else if pick < 62 {
             ScheduleOp::Update(sched_key(&mut rng))
-        } else if pick < 75 {
+        } else if pick < 70 {
             let k = sched_key(&mut rng);
             ScheduleOp::InsUniq(k, sched_val(&mut rng))
-        } else if pick < 83 {
+        } else if pick < 78 {
             ScheduleOp::Del(sched_key(&mut rng))
-        } else if pick < 88 {
+        } else if pick < 84 {
             ScheduleOp::NextStmt
-        } else if pick < 92 {
+        } else if pick < 87 {
             let id = SavepointId(sp_next.get(slot).copied().unwrap_or(0));
             if let Some(c) = sp_next.get_mut(slot) {
                 *c += 1;
@@ -1860,7 +1961,7 @@ fn gen_schedule(seed: u64) -> (Vec<Isolation>, Vec<SlotOp>) {
                 s.push(id);
             }
             ScheduleOp::Savepoint
-        } else if pick < 95 {
+        } else if pick < 89 {
             match live_sps.get(slot).map(|s| s.len()) {
                 Some(n) if n > 0 => {
                     let target = rng.below(n as u64) as usize;
@@ -1877,7 +1978,7 @@ fn gen_schedule(seed: u64) -> (Vec<Isolation>, Vec<SlotOp>) {
                 }
                 _ => ScheduleOp::NextStmt,
             }
-        } else if pick < 98 {
+        } else if pick < 97 {
             if let Some(a) = alive.get_mut(slot) {
                 *a = false;
             }
@@ -1921,22 +2022,57 @@ fn exec_scheduled<E: TxnEngine>(e: &E, t: &mut E::Txn, kind: &ScheduleOp) -> Out
             Out::Unit
         }
         ScheduleOp::Savepoint => Out::Sp(e.savepoint(t).0),
-        // Commit/abort are handled by the replay loop (they consume).
         ScheduleOp::Rollback(sp) => {
             e.rollback_to(t, *sp);
             Out::Unit
         }
-        ScheduleOp::Commit | ScheduleOp::Abort => Out::Unit,
+        // Gc, Begin, Commit and Abort are schedule-level: the replay
+        // loop owns them (Gc takes no txn, Begin replaces the slot's
+        // txn, Commit/Abort consume it).
+        ScheduleOp::Commit | ScheduleOp::Abort | ScheduleOp::Gc | ScheduleOp::Begin(_) => Out::Unit,
     }
 }
 
 /// Replay a schedule on one engine, collecting every op's outcome and
 /// committing any leftover txn so the final states compare.
-fn replay_schedule<E: TxnEngine>(e: &E, isos: &[Isolation], ops: &[SlotOp]) -> Vec<Out> {
-    let mut txns: Vec<Option<E::Txn>> = isos.iter().map(|iso| Some(e.begin(*iso))).collect();
+///
+/// `run_gc` is the oracle rule decided by card X-1a-F2: GC must be
+/// semantically invisible — no snapshot may observe it — so the engine
+/// under test runs `gc()` on every `Gc` op while the oracle replays the
+/// same schedule with every `Gc` op as a no-op. Any GC that changes a
+/// visible result then shows up as a per-op or final-state diff; this
+/// holds even when the engine under test is `RefEngine` itself, making
+/// the run a metamorphic check of R-GC and the shared watermark.
+fn replay_schedule<E: TxnEngine>(
+    e: &E,
+    isos: &[Option<Isolation>],
+    ops: &[SlotOp],
+    run_gc: bool,
+) -> Vec<Out> {
+    let mut txns: Vec<Option<E::Txn>> = isos.iter().map(|iso| iso.map(|i| e.begin(i))).collect();
     let mut outs: Vec<Out> = Vec::with_capacity(ops.len());
     for op in ops {
         let out = match &op.kind {
+            // Card Work 1: only the engine under test runs gc(); the
+            // return value differs per engine by design and is not
+            // compared. Both sides record Unit so op indices align.
+            ScheduleOp::Gc => {
+                if run_gc {
+                    let _ = e.gc();
+                }
+                Out::Unit
+            }
+            // Card Work 2: re-open a slot whose txn ended. The generator
+            // emits Begin only for closed slots; a defensive no-op when
+            // the slot is somehow occupied keeps both sides aligned.
+            ScheduleOp::Begin(iso) => {
+                if let Some(t) = txns.get_mut(op.slot)
+                    && t.is_none()
+                {
+                    *t = Some(e.begin(*iso));
+                }
+                Out::Unit
+            }
             ScheduleOp::Commit => match txns.get_mut(op.slot).and_then(|t| t.take()) {
                 Some(t) => e.commit(t).into(),
                 None => Out::Unit,
@@ -1962,13 +2098,15 @@ fn replay_schedule<E: TxnEngine>(e: &E, isos: &[Isolation], ops: &[SlotOp]) -> V
 
 /// Run one seeded schedule on the engine under test and on the
 /// reference engine; every outcome and the final state must match.
+/// The engine under test runs `gc()` on every `Gc` op; the oracle side
+/// does not (card X-1a-F2's oracle rule — see [`replay_schedule`]).
 fn run_schedule<E: TxnEngine>(make: &dyn Fn() -> E, seed: u64) -> Vec<String> {
     let mut f = Vec::new();
     let (isos, ops) = gen_schedule(seed);
     let e = make();
     let oracle = RefEngine::new();
-    let outs = replay_schedule(&e, &isos, &ops);
-    let oracle_outs = replay_schedule(&oracle, &isos, &ops);
+    let outs = replay_schedule(&e, &isos, &ops, true);
+    let oracle_outs = replay_schedule(&oracle, &isos, &ops, false);
     for (i, (a, b)) in outs.iter().zip(oracle_outs.iter()).enumerate() {
         if a != b {
             let kind = ops
@@ -2024,4 +2162,317 @@ pub fn run_all<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
         }
     }
     fails
+}
+
+// -------------------------------------------------- S13 coverage pins
+
+#[cfg(test)]
+mod tests {
+    //! Coverage pins of the S13 generator (card X-1a-F2 Work 4).
+    //!
+    //! Snapshot ts are not on the [`crate::api::TxnEngine`] trait, so
+    //! these properties are computed by a test-only replay of every
+    //! generated schedule over [`RefEngine`] **with** `gc()` enabled,
+    //! tracking begin order and commit ts from `commit`'s return value
+    //! (the replay is single-threaded, so a txn's snapshot is exactly the
+    //! newest commit ts at its `begin`, and an RC txn's snapshot
+    //! refreshes at every `NextStmt`).
+    //!
+    //! The replay keeps a shadow write set per slot — the keys of write
+    //! ops that returned `Ok` — and folds it into a per-key
+    //! newest-commit-ts map at commit. The shadow ignores savepoint
+    //! rollbacks, so it can count a rolled-back key as committed; that
+    //! only ever **over**estimates the read pins (a read may be counted
+    //! as predating a later commit when no such commit exists) and never
+    //! underestimates them, and the thresholds below are calibrated
+    //! against the same shadow, so the pins stay regression-sensitive.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{Out, ScheduleOp, exec_scheduled, gen_schedule};
+    use crate::api::{Isolation, Ts, TxnEngine};
+    use crate::reference::RefEngine;
+
+    /// The seeds S13 generates (kept in sync with
+    /// [`super::s13_differential`]).
+    const SEEDS: u64 = 500;
+
+    // Pin thresholds, calibrated to about half of the counts measured
+    // over those 500 seeds with this generator (and never below the
+    // card's floors), so a generator regression fails loudly without
+    // the pins being brittle:
+    //   Gc ops while >= 2 distinct snapshot ts are open ..... 6171 measured
+    //   of those, gc() calls that reclaimed bytes ............  871 measured
+    //   reads issued by mid-schedule txns ................... 21033 measured
+    //   of those, RR reads predating the key's commit ........  1654 measured
+    //   stale-snapshot reads after a reclaiming gc ..........  4293 measured
+    const PIN_GC_TWO_SNAPS: u64 = 3000;
+    const PIN_GC_RECLAIMED: u64 = 430;
+    const PIN_MIDBEGIN_READS: u64 = 10_500;
+    const PIN_MIDBEGIN_RR_OLDKEY: u64 = 825;
+    const PIN_OLD_READ_AFTER_RECLAIM: u64 = 2140;
+
+    /// The measured coverage of one replayed schedule.
+    #[derive(Default)]
+    struct Cover {
+        /// `Gc` ops executed while at least two txns with distinct
+        /// snapshot ts were open.
+        gc_two_snaps: u64,
+        /// Of those, `gc()` calls that returned > 0 on the RefEngine
+        /// side (something was actually reclaimed).
+        gc_two_snaps_reclaimed: u64,
+        /// `Get`/`Scan` ops issued by a txn that began mid-schedule (a
+        /// `Begin` op, not the initial batch at op 0).
+        midbegin_reads: u64,
+        /// Of those, reads by an RR txn whose snapshot predates a
+        /// committed write to the key it reads.
+        midbegin_rr_oldkey: u64,
+        /// Reads at a snapshot older than the newest commit (`visible_ts`
+        /// at read time), issued after a `Gc` op reclaimed bytes.
+        old_read_after_reclaim: u64,
+        /// `Rollback` ops targeting a savepoint id the slot's current
+        /// txn never returned (always 0; SP-RESET-MISSING breaks it).
+        stale_rollback_targets: u64,
+    }
+
+    /// Whether the key of a `Get` has a committed version newer than
+    /// `snap` (the read selects an older version — the GC-relevant one).
+    fn reads_an_old_version(key_newest: &BTreeMap<Vec<u8>, Ts>, key: &[u8], snap: Ts) -> bool {
+        key_newest.get(key).copied().unwrap_or(0) > snap
+    }
+
+    /// Whether any key in a `Scan`'s `[lo, hi)` has a committed version
+    /// newer than `snap` (counted once per scan op, like a `Get`).
+    fn scan_reads_an_old_version(
+        key_newest: &BTreeMap<Vec<u8>, Ts>,
+        lo: &[u8],
+        hi: &[u8],
+        snap: Ts,
+    ) -> bool {
+        if lo >= hi {
+            return false;
+        }
+        key_newest
+            .range(lo.to_vec()..hi.to_vec())
+            .any(|(_, t)| *t > snap)
+    }
+
+    /// Fold one read op into the pins it satisfies. `stale` is the
+    /// pin-4 property (the reader's snapshot is older than the newest
+    /// commit, i.e. `visible_ts` at read time); `old` is the stricter
+    /// pin-3b property (a committed version newer than the snapshot
+    /// exists for the key the read covers).
+    fn count_read(
+        c: &mut Cover,
+        began_mid: bool,
+        rr: bool,
+        old: bool,
+        stale: bool,
+        after_reclaim: bool,
+    ) {
+        if began_mid {
+            c.midbegin_reads += 1;
+        }
+        if began_mid && rr && old {
+            c.midbegin_rr_oldkey += 1;
+        }
+        if stale && after_reclaim {
+            c.old_read_after_reclaim += 1;
+        }
+    }
+
+    /// Replay one generated schedule over a fresh `RefEngine` with
+    /// `gc()` enabled, measuring the coverage properties of the pins.
+    fn coverage_replay(seed: u64) -> Cover {
+        let (isos, ops) = gen_schedule(seed);
+        let e = RefEngine::new();
+        let mut txns: Vec<Option<<RefEngine as TxnEngine>::Txn>> = isos
+            .iter()
+            .map(|level| level.map(|level| e.begin(level)))
+            .collect();
+        // Shadow state (see the module docs). `visible` is the newest
+        // commit ts returned by `commit` so far; the initial opens take
+        // their snapshot at `visible_ts` = 0 (nothing is committed at
+        // op 0), exactly like the engine's registry.
+        let mut visible: Ts = 0;
+        let mut snap = [None::<Ts>; 4];
+        let mut iso = [None::<Isolation>; 4];
+        let mut began_mid = [false; 4];
+        for (s, level) in isos.iter().enumerate() {
+            if let Some(level) = level {
+                snap[s] = Some(0);
+                iso[s] = Some(*level);
+            }
+        }
+        let mut pending: Vec<BTreeSet<Vec<u8>>> = vec![BTreeSet::new(); 4];
+        let mut key_newest: BTreeMap<Vec<u8>, Ts> = BTreeMap::new();
+        let mut sp_returned: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); 4];
+        let mut reclaimed_yet = false;
+        let mut c = Cover::default();
+        for op in &ops {
+            match &op.kind {
+                ScheduleOp::Gc => {
+                    // Distinct live snapshot ts (the registry's view: an
+                    // RC txn's old ts leaves at its NextStmt refresh).
+                    let mut live: Vec<Ts> = snap.iter().copied().flatten().collect();
+                    live.sort_unstable();
+                    live.dedup();
+                    let reclaimed = e.gc();
+                    if live.len() >= 2 {
+                        c.gc_two_snaps += 1;
+                        if reclaimed > 0 {
+                            c.gc_two_snaps_reclaimed += 1;
+                        }
+                    }
+                    if reclaimed > 0 {
+                        reclaimed_yet = true;
+                    }
+                }
+                ScheduleOp::Begin(level) => {
+                    if let Some(t) = txns.get_mut(op.slot)
+                        && t.is_none()
+                    {
+                        *t = Some(e.begin(*level));
+                        snap[op.slot] = Some(visible);
+                        iso[op.slot] = Some(*level);
+                        began_mid[op.slot] = true;
+                        pending[op.slot].clear();
+                        sp_returned[op.slot].clear();
+                    }
+                }
+                ScheduleOp::Commit => {
+                    if let Some(t) = txns.get_mut(op.slot).and_then(|t| t.take())
+                        && let Ok(ts) = e.commit(t)
+                    {
+                        visible = visible.max(ts);
+                        for k in std::mem::take(&mut pending[op.slot]) {
+                            key_newest.insert(k, ts);
+                        }
+                    }
+                }
+                ScheduleOp::Abort => {
+                    if let Some(t) = txns.get_mut(op.slot).and_then(|t| t.take()) {
+                        e.abort(t);
+                    }
+                    pending[op.slot].clear();
+                }
+                kind => {
+                    let Some(t) = txns.get_mut(op.slot).and_then(|t| t.as_mut()) else {
+                        continue;
+                    };
+                    let out = exec_scheduled(&e, t, kind);
+                    let ok = !matches!(out, Out::Err(_));
+                    match kind {
+                        ScheduleOp::Put(k, _)
+                        | ScheduleOp::Update(k)
+                        | ScheduleOp::InsUniq(k, _)
+                        | ScheduleOp::Del(k) => {
+                            if ok {
+                                pending[op.slot].insert(k.clone());
+                            }
+                        }
+                        ScheduleOp::Get(k) => {
+                            if ok && let Some(s) = snap[op.slot] {
+                                let old = reads_an_old_version(&key_newest, k, s);
+                                count_read(
+                                    &mut c,
+                                    began_mid[op.slot],
+                                    iso[op.slot] == Some(Isolation::RepeatableRead),
+                                    old,
+                                    s < visible,
+                                    reclaimed_yet,
+                                );
+                            }
+                        }
+                        ScheduleOp::Scan(lo, hi, _) => {
+                            if ok && let Some(s) = snap[op.slot] {
+                                let old = scan_reads_an_old_version(&key_newest, lo, hi, s);
+                                count_read(
+                                    &mut c,
+                                    began_mid[op.slot],
+                                    iso[op.slot] == Some(Isolation::RepeatableRead),
+                                    old,
+                                    s < visible,
+                                    reclaimed_yet,
+                                );
+                            }
+                        }
+                        ScheduleOp::NextStmt => {
+                            if iso[op.slot] == Some(Isolation::ReadCommitted) {
+                                snap[op.slot] = Some(visible);
+                            }
+                        }
+                        ScheduleOp::Savepoint => {
+                            if let Out::Sp(id) = out {
+                                sp_returned[op.slot].insert(id);
+                            }
+                        }
+                        // SP-RESET-MISSING: the slot's numbering must
+                        // restart with the txn, so every rollback target
+                        // must be an id this incarnation's savepoints
+                        // actually returned.
+                        ScheduleOp::Rollback(sp) if !sp_returned[op.slot].contains(&sp.0) => {
+                            c.stale_rollback_targets += 1;
+                        }
+                        ScheduleOp::Rollback(_) => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
+        c
+    }
+
+    /// Card X-1a-F2 Work 4: the four coverage pins over the 500 seeds,
+    /// plus the savepoint-reset check that catches SP-RESET-MISSING.
+    #[test]
+    fn s13_generator_coverage_pins() {
+        let mut total = Cover::default();
+        for seed in 0..SEEDS {
+            let c = coverage_replay(seed);
+            total.gc_two_snaps += c.gc_two_snaps;
+            total.gc_two_snaps_reclaimed += c.gc_two_snaps_reclaimed;
+            total.midbegin_reads += c.midbegin_reads;
+            total.midbegin_rr_oldkey += c.midbegin_rr_oldkey;
+            total.old_read_after_reclaim += c.old_read_after_reclaim;
+            total.stale_rollback_targets += c.stale_rollback_targets;
+        }
+        assert!(
+            total.gc_two_snaps >= PIN_GC_TWO_SNAPS,
+            "Gc ops with >= 2 distinct live snapshots: {} < {} \
+             (generator regression: GEN-NO-GC?)",
+            total.gc_two_snaps,
+            PIN_GC_TWO_SNAPS,
+        );
+        assert!(
+            total.gc_two_snaps_reclaimed >= PIN_GC_RECLAIMED,
+            "reclaiming gc() calls with >= 2 distinct live snapshots: {} < {}",
+            total.gc_two_snaps_reclaimed,
+            PIN_GC_RECLAIMED,
+        );
+        assert!(
+            total.midbegin_reads >= PIN_MIDBEGIN_READS,
+            "reads by mid-schedule txns: {} < {} \
+             (generator regression: GEN-NO-MIDBEGIN?)",
+            total.midbegin_reads,
+            PIN_MIDBEGIN_READS,
+        );
+        assert!(
+            total.midbegin_rr_oldkey >= PIN_MIDBEGIN_RR_OLDKEY,
+            "RR reads predating the read key's later commit: {} < {}",
+            total.midbegin_rr_oldkey,
+            PIN_MIDBEGIN_RR_OLDKEY,
+        );
+        assert!(
+            total.old_read_after_reclaim >= PIN_OLD_READ_AFTER_RECLAIM,
+            "stale-snapshot reads after a reclaiming gc: {} < {}",
+            total.old_read_after_reclaim,
+            PIN_OLD_READ_AFTER_RECLAIM,
+        );
+        assert_eq!(
+            total.stale_rollback_targets, 0,
+            "a Rollback targeted a savepoint id the slot's current txn \
+             never returned (SP-RESET-MISSING)",
+        );
+    }
 }
