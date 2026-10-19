@@ -43,7 +43,10 @@ ground truth, 128 dimensions, Euclidean distance.
   ACK — measured at ~40 ms per query (p50 44.07 ms, 22.47 qps) while
   single-write probes of the same collection returned in 1.6–1.9 ms.
   A per-query **p50 sanity limit of 10 ms** fails the row loudly if a
-  pass ever regresses into that regime again.
+  warm pass ever regresses into that regime (cold passes are exempt —
+  engine warm-up after restart is what *cold* measures; the §5.2
+  published statistics are warm-run medians, which stay guarded;
+  missing/unknown pass kinds are enforced, fail-closed).
 - The full ann-benchmarks *framework* (Python harness with its own
   plotting/tuning loop) is not run; the dataset, parameters and metrics
   follow its protocol, implemented by `nbench vec-*` so digest checks and

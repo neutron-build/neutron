@@ -463,6 +463,21 @@ pub fn collection_ready(
 /// the row must fail loudly rather than publish those numbers.
 pub const QDRANT_P50_SANITY_LIMIT_MS: f64 = 10.0;
 
+/// Whether a search pass of this kind must pass the latency sanity
+/// check.
+///
+/// Cold passes are exempt: they are the first search after a container
+/// restart, so they measure Qdrant re-opening its storage and warming
+/// its caches by design (chain9 measured p50 15.37 ms cold on a
+/// load-12 host with the fixed client, against ~2 ms warm) — and the
+/// row's published §5.2 statistics are medians over **warm** runs,
+/// which stay fully guarded. The default for an unknown kind is to
+/// enforce (fail-closed): a missing marker can never silently disable
+/// the check.
+pub fn latency_sanity_enforced(pass_kind: &str) -> bool {
+    pass_kind != "cold"
+}
+
 /// Sanity-check the per-query p50 of a Qdrant search pass (verdict
 /// ddb00ba5 defect 1): `Ok` when the pass plausibly measured Qdrant, a
 /// loud error when it more likely measured the transport.

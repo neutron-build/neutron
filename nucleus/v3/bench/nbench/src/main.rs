@@ -43,7 +43,7 @@ USAGE:
   nbench cleanup
   nbench host-info
   nbench vec-qdrant-load   --base F --host H --port P [--collection C] [--m N] [--ef-construct N] [--batch N]
-  nbench vec-qdrant-search --base F --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F]
+  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run]
   nbench vec-qdrant-digest --host H --port P [--collection C]
   nbench vec-qdrant-version --host H --port P
   nbench vec-pg-copy       --base F
@@ -159,6 +159,55 @@ fn cmd_vec_qdrant_load(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The measured numbers of one Qdrant search pass.
+struct QdrantPassNumbers {
+    /// `hnsw_ef` the pass ran with.
+    ef: u64,
+    /// Top-k requested (`limit`).
+    limit: usize,
+    /// Query count of the pass.
+    queries: usize,
+    /// Queries per second over the whole pass.
+    qps: f64,
+    /// recall@limit against the dataset ground truth.
+    recall: f64,
+    /// Median per-query latency in milliseconds.
+    p50_ms: f64,
+    /// 99th percentile per-query latency in milliseconds.
+    p99_ms: f64,
+}
+
+/// Assemble the Qdrant pass metrics object, enforcing the per-query
+/// p50 sanity check first (verdict ddb00ba5 defect 1).
+///
+/// Extracted from `cmd_vec_qdrant_search` so the *wiring* — sanity
+/// before metrics, cold passes exempt, unknown kinds enforced — is a
+/// unit-tested seam (gate round-3 mutant G4 unwired the check inside
+/// the command and passed 92/92). A failed sanity check returns `Err`
+/// before any metrics exist, so a stalled pass can never record.
+fn qdrant_pass_metrics(pass_kind: &str, n: &QdrantPassNumbers) -> Result<Value> {
+    if vector::latency_sanity_enforced(pass_kind) {
+        vector::qdrant_latency_sanity(n.p50_ms)?;
+    }
+    Ok(Value::obj(vec![
+        ("qps", Value::n(n.qps)),
+        ("recall_at_10", Value::n(n.recall)),
+        ("queries", Value::n(n.queries as f64)),
+        ("p50_ms", Value::n(n.p50_ms)),
+        ("p99_ms", Value::n(n.p99_ms)),
+        ("ef_search", Value::n(n.ef as f64)),
+        (
+            "timing_note",
+            Value::s(
+                "one persistent connection (HTTP keep-alive, TCP_NODELAY, single write \
+                 per request) for the whole pass; warm-pass p50 sanity-checked at 10 ms",
+            ),
+        ),
+        ("pass_kind", Value::s(pass_kind)),
+        ("limit", Value::n(n.limit as f64)),
+    ]))
+}
+
 fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let query_path = required(args, "query")?;
     let truth_path = required(args, "truth")?;
@@ -175,6 +224,10 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
         .map_err(|_| Error::Usage("bad limit".into()))?;
     let collection = arg_value(args, "collection").unwrap_or_else(|| "nbench-sift".into());
     let metrics_out = arg_value(args, "metrics-out");
+    // The driver passes its NB_MODE (cold/warmup/run): cold passes are
+    // exempt from the p50 sanity limit (engine warm-up after restart is
+    // what cold measures); any missing or unknown kind is enforced.
+    let pass_kind = arg_value(args, "pass-kind").unwrap_or_default();
 
     let queries = vector::read_fvecs(&PathBuf::from(&query_path))?;
     let truth = vector::read_ivecs(&PathBuf::from(&truth_path))?;
@@ -199,26 +252,18 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let recall = vector::recall_at_k(&results, &truth, limit)?;
     lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p50 = percentile_of(&lat_ms, 0.5);
-    // Verdict ddb00ba5 defect 1: a per-query p50 in the tens of
-    // milliseconds means the pass measured TCP mechanics (Nagle +
-    // delayed-ACK), not Qdrant. Fail the row loudly; never record those
-    // numbers. NaN (broken measurement) is rejected by the same check.
-    vector::qdrant_latency_sanity(p50)?;
-    let v = Value::obj(vec![
-        ("qps", Value::n(qps)),
-        ("recall_at_10", Value::n(recall)),
-        ("queries", Value::n(queries.len() as f64)),
-        ("p50_ms", Value::n(p50)),
-        ("p99_ms", Value::n(percentile_of(&lat_ms, 0.99))),
-        ("ef_search", Value::n(ef as f64)),
-        (
-            "timing_note",
-            Value::s(
-                "one persistent connection (HTTP keep-alive, TCP_NODELAY, single write \
-                 per request) for the whole pass; p50 sanity-checked at 10 ms",
-            ),
-        ),
-    ]);
+    let v = qdrant_pass_metrics(
+        &pass_kind,
+        &QdrantPassNumbers {
+            ef,
+            limit,
+            queries: queries.len(),
+            qps,
+            recall,
+            p50_ms: p50,
+            p99_ms: percentile_of(&lat_ms, 0.99),
+        },
+    )?;
     write_metrics_json(metrics_out.as_deref(), &v)?;
     eprintln!(
         "ef={ef}: qps={qps:.1} recall@{limit}={recall:.4} p50={p50:.3}ms p99={:.3}ms",
@@ -558,5 +603,80 @@ fn ok_or_print(r: Result<()>) -> bool {
             eprintln!("nbench: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pass_metrics_enforce_the_sanity_on_warm_kinds() {
+        // Gate round-3 mutant G4 (sanity call unwired in the command)
+        // passed every test; the wiring is the seam now: a warm pass in
+        // the transport-stall regime must fail BEFORE metrics exist.
+        for kind in ["run", "warmup", "", "unknown"] {
+            let r = qdrant_pass_metrics(
+                kind,
+                &QdrantPassNumbers {
+                    ef: 16,
+                    limit: 10,
+                    queries: 10_000,
+                    qps: 22.0,
+                    recall: 0.94,
+                    p50_ms: 44.07,
+                    p99_ms: 49.0,
+                },
+            );
+            let err = r.expect_err(&format!("kind {kind:?} must be enforced"));
+            assert!(
+                format!("{err}").contains("latency sanity"),
+                "kind {kind:?}: {err}"
+            );
+            // the healthy regime records, with the measured p50 in it
+            let v = qdrant_pass_metrics(
+                kind,
+                &QdrantPassNumbers {
+                    ef: 16,
+                    limit: 10,
+                    queries: 10_000,
+                    qps: 500.0,
+                    recall: 0.94,
+                    p50_ms: 1.8,
+                    p99_ms: 2.4,
+                },
+            )
+            .expect("healthy warm pass records");
+            assert_eq!(v.get("p50_ms").and_then(Value::as_f64), Some(1.8));
+            assert_eq!(v.get("pass_kind").and_then(Value::as_str), Some(kind));
+        }
+    }
+
+    #[test]
+    fn pass_metrics_exempt_cold_passes_only() {
+        // Cold = first search after a container restart: engine warm-up
+        // is what cold measures (chain9: p50 15.37 ms cold, load-12
+        // host, fixed client), and §5.2 published statistics come from
+        // warm runs. The exemption records the slow p50 honestly
+        // instead of voiding the row.
+        let v = qdrant_pass_metrics(
+            "cold",
+            &QdrantPassNumbers {
+                ef: 16,
+                limit: 10,
+                queries: 10_000,
+                qps: 65.0,
+                recall: 0.94,
+                p50_ms: 15.37,
+                p99_ms: 40.0,
+            },
+        )
+        .expect("cold pass is exempt from the sanity limit");
+        assert_eq!(v.get("p50_ms").and_then(Value::as_f64), Some(15.37));
+        // the exemption is exactly one kind, not a range
+        assert!(!vector::latency_sanity_enforced("cold"));
+        assert!(vector::latency_sanity_enforced("run"));
+        assert!(vector::latency_sanity_enforced("warmup"));
+        assert!(vector::latency_sanity_enforced(""));
     }
 }

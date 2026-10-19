@@ -37,6 +37,7 @@ case ${NB_MODE:?} in
       --host "$HOST" --port "$PORT" \
       --collection nbench-sift \
       --ef "$ef" --limit 10 \
+      --pass-kind "${NB_MODE:?}" \
       --metrics-out "${NB_METRICS:?}" \
       2>&1 | tee "${NB_LOG}"
     ;;

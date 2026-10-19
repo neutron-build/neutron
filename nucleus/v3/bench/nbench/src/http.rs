@@ -154,8 +154,14 @@ pub fn request(
 /// reconnects or retries: a mid-measurement failure surfaces as an
 /// error so the row is re-run (the "measurement requests never retry"
 /// invariant in `vector.rs`).
-pub struct Connection {
-    stream: TcpStream,
+///
+/// The stream type is generic so tests can wrap the socket in a
+/// counting decorator and pin the transport invariants (one write per
+/// request — gate round-3 mutant G2, unwired at the call site, passed
+/// 92/92 before this seam); production code uses the default
+/// `TcpStream` via [`Connection::connect`].
+pub struct Connection<S: Read + Write = TcpStream> {
+    stream: S,
     host: String,
     port: u16,
     /// Bytes read past the current response frame (none in the
@@ -168,7 +174,7 @@ pub struct Connection {
     closed: bool,
 }
 
-impl Connection {
+impl Connection<TcpStream> {
     /// Open a keep-alive connection.
     ///
     /// The socket is opened with `TCP_NODELAY`: this connection carries
@@ -176,18 +182,27 @@ impl Connection {
     /// combined with the peer's delayed ACK measured ~40 ms per query
     /// (verdict ddb00ba5 defect 1). Pinned by
     /// `keepalive_socket_disables_nagle`.
-    pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Connection> {
+    pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Connection<TcpStream>> {
         let stream = TcpStream::connect((host, port)).map_err(Error::Io)?;
         stream.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
         stream.set_write_timeout(Some(timeout)).map_err(Error::Io)?;
         stream.set_nodelay(true).map_err(Error::Io)?;
-        Ok(Connection {
+        Ok(Connection::from_stream(stream, host, port))
+    }
+}
+
+impl<S: Read + Write> Connection<S> {
+    /// Wrap an already-connected stream (test seam; timeouts and socket
+    /// options are the caller's policy, [`Connection::connect`] sets
+    /// them for production sockets).
+    pub fn from_stream(stream: S, host: &str, port: u16) -> Connection<S> {
+        Connection {
             stream,
             host: host.to_string(),
             port,
             pending: Vec::new(),
             closed: false,
-        })
+        }
     }
 
     /// Perform one request on the open socket. Errors if the server
@@ -459,6 +474,103 @@ mod tests {
             conn.stream.nodelay().expect("nodelay readable"),
             "keep-alive socket must set TCP_NODELAY"
         );
+    }
+
+    /// A socket end that counts every `write` call made through it, so
+    /// a test can pin HOW a request leaves [`Connection::request`] —
+    /// one write, or a head/body split (gate round-3 mutant G2 split
+    /// the write at the call site and passed every test that only
+    /// checked the helper).
+    struct CountingStream {
+        inner: std::net::TcpStream,
+        write_calls: std::cell::Cell<usize>,
+        written: std::cell::RefCell<Vec<u8>>,
+    }
+
+    impl CountingStream {
+        fn new(inner: std::net::TcpStream) -> Self {
+            CountingStream {
+                inner,
+                write_calls: std::cell::Cell::new(0),
+                written: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Read for CountingStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for CountingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_calls.set(self.write_calls.get() + 1);
+            self.written.borrow_mut().extend_from_slice(buf);
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn connection_request_leaves_as_one_write() {
+        // Gate round-3 mutant G2: splitting `Connection::request` back
+        // into head and body writes (bypassing the tested helper) was
+        // UNCAUGHT. This drives the real request path over a real
+        // socket wrapped in a counting decorator: exactly one write
+        // call must carry head and body together.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            // read one full request, then answer one framed response
+            let mut got = Vec::new();
+            loop {
+                let n = conn.read(&mut buf).expect("read request");
+                got.extend_from_slice(&buf[..n]);
+                if find_subsequence(&got, b"\r\n\r\n").is_some() {
+                    let head_end = find_subsequence(&got, b"\r\n\r\n").expect("checked above") + 4;
+                    let need = got[..head_end]
+                        .split(|b| *b == b'\n')
+                        .find_map(|l| {
+                            let l = String::from_utf8_lossy(l);
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if got.len() >= head_end + need {
+                        break;
+                    }
+                }
+            }
+            let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        });
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut conn = Connection::from_stream(CountingStream::new(stream), "127.0.0.1", port);
+        let resp = conn
+            .request(
+                "POST",
+                "/collections/x/points/search",
+                b"{\"vector\":[1,2]}",
+            )
+            .expect("request");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
+        assert_eq!(
+            conn.stream.write_calls.get(),
+            1,
+            "Connection::request must send head and body as ONE write"
+        );
+        let written = conn.stream.written.borrow().clone();
+        assert!(written.ends_with(b"\r\n\r\n{\"vector\":[1,2]}"));
+        assert!(written.starts_with(b"POST /collections/x/points/search HTTP/1.1\r\n"));
     }
 
     #[test]
