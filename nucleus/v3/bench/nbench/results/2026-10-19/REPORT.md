@@ -34,6 +34,24 @@ Status: ok
 |  | cold | 2017 | 1452 | 510.1 | n/a | n/a |
 |  | warm (n=5) | 2019 [1968, 2024] | 1448 [1446, 1450] | 512.7 [507.5, 515.5] | n/a | n/a |
 
+<!-- source: kv-memtier-redis7.json -->
+### kv-memtier-redis7 — redis7
+
+memtier GET/SET 1:10 against Redis 7, pipeline 1/16, AOF always/everysec
+
+Status: ok
+
+| config | run | ops_sec | p50_ms | p99_ms | kb_per_sec | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| appendfsync=always pipeline=1 | cold | 101469 | 0.583 | 1.271 | 4305 | n/a | n/a |
+| appendfsync=always pipeline=1 | warm (n=5) | 103445 [102469, 103622] | 0.583 [0.583, 0.583] | 1.207 [1.207, 1.223] | 4391 [4349, 4398] | n/a | n/a |
+| appendfsync=always pipeline=16 | cold | 899369 | 0.991 | 2.399 | 38253 | n/a | n/a |
+| appendfsync=always pipeline=16 | warm (n=5) | 898065 [896210, 904506] | 0.991 [0.991, 0.999] | 2.367 [2.335, 2.415] | 38301 [38222, 38576] | n/a | n/a |
+| appendfsync=everysec pipeline=1 | cold | 170426 | 0.359 | 0.727 | 7233 | n/a | n/a |
+| appendfsync=everysec pipeline=1 | warm (n=5) | 171615 [170946, 172855] | 0.359 [0.359, 0.359] | 0.727 [0.719, 0.727] | 7287 [7259, 7340] | n/a | n/a |
+| appendfsync=everysec pipeline=16 | cold | 1294609 | 0.703 | 1.535 | 55128 | n/a | n/a |
+| appendfsync=everysec pipeline=16 | warm (n=5) | 1277356 [1262591, 1286664] | 0.719 [0.711, 0.727] | 1.487 [1.463, 1.551] | 54602 [53972, 55000] | n/a | n/a |
+
 <!-- source: kv-memtier-valkey8.json -->
 ### kv-memtier-valkey8 — valkey8
 
