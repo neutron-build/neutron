@@ -45,6 +45,49 @@
 //! `assert_count_exact` runs clean over it. With the skip removed (the
 //! C-DIAG1 rig), it fails with the exact acceptance message.
 //!
+//! ## C-DIAG1fix2 (this branch): the generic twin + the step-1c flake
+//!
+//! The C-DIAG1fix gate returned two follow-ups; this card does both.
+//!
+//! **M-2 — the generic twin.** `tests/common/mod.rs::assert_count_exact<K>`
+//! (consumers: `write_path`, `write_savepoint`, `t6t1_delete_entry`,
+//! `b1_sweep`) carried the identical pre-fix hole: an unbounded scan, no
+//! `/sys/` exclusion, `ok(decode_intent(&v))` on every key that parses as
+//! `Entry::Intent`. It now applies the byte-for-byte same skip, before
+//! `parse_key`, gated on `nucleus_txn::encoding::SYS_PREFIX`. The
+//! regression pin below extends the deterministic plant to the twin (step 3
+//! of the repro): the same ts-256 sample through the real
+//! `common::assert_count_exact`. With the twin's skip removed, that step
+//! fails with the same one-shot
+//! `unexpected error: Corrupt("intent value: bad magic")`.
+//!
+//! **M-1 — the step-1c residue.** The gate observed the new pin's step 1c
+//! fail **once** in ~1400 runs (`count_intents excludes /sys/ and sees no
+//! intent, left: 1, right: 0`): one **non-`/sys/`** key parsed as
+//! `Entry::Intent` after the 256-commit drain. Not reproduced since
+//! (8 + 30 + 40 cargo runs and 1200 raw-binary runs under CPU hogs, gate
+//! instrumentation never fired). Single-threaded sequencing says the
+//! residue is impossible, so either the engine very rarely leaks a
+//! committed txn's intent past a resolver drain, or the one observation was
+//! environmental. `diag1_step1c_residue_hunt` below re-runs the exact
+//! step-1c scene in a bounded loop with the residue evidence path built in
+//! (surviving key/value bytes, three extra `Resolver::run_once` rounds with
+//! a re-scan after each, the `/sys/txn` span, and the status-table entries
+//! of the txns the residue names). Tally (this card, this machine,
+//! CARGO_TARGET_DIR build, debug profile):
+//!
+//! - in-process hunt: 2600 scenes clean — 2000 plain (~27 ms/scene) +
+//!   600 under 6 CPU-hog threads (~75 ms/scene; per-run bound 30 s, never
+//!   approached);
+//! - external binary loop: 1000 runs of the real always-run pin (fresh
+//!   process each time: 500 plain + 500 under the `diag1_cpu_hogs` load),
+//!   all green.
+//!
+//! **Unreproduced-in-bounds → M-1 closed as such.** The pin keeps its
+//! determinism note and step 1c stays as written; if the residue ever
+//! reappears, the hunt prints the evidence bundle and fails — that is an
+//! engine intent-leak escalation, not a rig fix.
+//!
 //! ## Why rare, and why "under load"
 //!
 //! The failing test cycles ~1 commit per park for its 300 ms
@@ -73,16 +116,25 @@
 //!   a stepping `Clock` so the ts-256 sample lands on a multiple of 256,
 //!   pins that the offending `/sys/` key is present, then calls the rig's
 //!   real (fixed) `assert_count_exact` and asserts it does not panic.
+//!   Since C-DIAG1fix2 step 3 extends the same plant to the generic twin
+//!   `common::assert_count_exact` (M-2).
 //! - `diag1_natural_soak_under_load` (`#[ignore]`): the C-DIAG1 load
 //!   loop — CPU hogs in threads plus a fresh real-`SystemClock` world per
 //!   iteration whose commit stream mimics the failing test's parks,
 //!   recording every natural capture (key bytes, value bytes) without
 //!   panicking. Retained from the diagnosis for reruns; the fixed rig no
 //!   longer decodes what it captures.
+//! - `diag1_step1c_residue_hunt` (`#[ignore]`, C-DIAG1fix2): the M-1
+//!   flake hunt — the exact step-1c scene in a bounded loop (default 2000
+//!   iterations, 30 s per-run bound via a scene thread + `recv_timeout`,
+//!   optional CPU hogs), each scene checked for a surviving non-`/sys/`
+//!   intent; on the first residue it prints the evidence bundle and fails.
+//!   See the C-DIAG1fix2 section above for the tally.
 //! - `diag1_cpu_hogs` (`#[ignore]`): stand-alone load for looping the real
 //!   `c_t2c_deadline` binary externally (no system tools).
 
 mod c_t2c_support;
+mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -258,6 +310,23 @@ fn ts_clock_sample_values_fail_the_intent_magic() {
     }
 }
 
+/// Runs one rig's `assert_count_exact` on a spawned thread (a regression
+/// must surface the rig's own panic verbatim instead of unwinding this
+/// test) and, if it panics, fails with `what` plus that message.
+fn expect_clean_rig_scan(what: &str, scan: impl FnOnce() + Send + 'static) {
+    match std::thread::spawn(scan).join() {
+        Ok(()) => {}
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            panic!("{what}: {msg}");
+        }
+    }
+}
+
 // ---- The deterministic reproduction (C-DIAG1fix regression pin) -------------
 
 /// The smallest deterministic reproduction of the acceptance failure,
@@ -277,7 +346,13 @@ fn ts_clock_sample_values_fail_the_intent_magic() {
 ///    runs clean over the ts-256 sample. With the `SYS_PREFIX` skip
 ///    removed (the C-DIAG1 rig), the spawned thread panics with exactly
 ///    `unexpected error: Corrupt("intent value: bad magic")`, the
-///    one-shot acceptance message, and this test fails on it.
+///    one-shot acceptance message, and this test fails on it;
+/// 3. (C-DIAG1fix2, M-2) does the same through the generic twin
+///    `common::assert_count_exact` (`tests/common/mod.rs`), whose four
+///    consumer binaries (`write_path`, `write_savepoint`,
+///    `t6t1_delete_entry`, `b1_sweep`) inherit the same protection. With
+///    the twin's skip removed, this step fails with the same one-shot
+///    message.
 #[test]
 fn diag1_deterministic_repro_bad_magic_through_real_rig_scan() {
     let core = Arc::new(ok(Core::open(MemKv::new())));
@@ -331,24 +406,269 @@ fn diag1_deterministic_repro_bad_magic_through_real_rig_scan() {
     //    unwinding this test.
     let scan_core = Arc::clone(&core);
     let txn = core.begin(Isolation::ReadCommitted);
-    let joined = std::thread::spawn(move || {
-        c_t2c_support::assert_count_exact(&scan_core, &txn);
-    })
-    .join();
-    match joined {
-        Ok(()) => {
+    expect_clean_rig_scan(
+        "C-DIAG1 regression: assert_count_exact decoded the ts-256 \
+         /sys/ts_clock sample",
+        move || {
+            c_t2c_support::assert_count_exact(&scan_core, &txn);
             println!("DIAG1 regression holds: assert_count_exact skipped the ts-256 sample");
-        }
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
-            panic!(
-                "C-DIAG1 regression: assert_count_exact decoded the ts-256 \
-                 /sys/ts_clock sample: {msg}"
+        },
+    );
+
+    // 3. C-DIAG1fix2 (M-2): the generic twin `common::assert_count_exact`
+    //    over the same ts-256 sample — the deterministic plant extended to
+    //    a consumer rig. Same spawned-thread contract: with the twin's
+    //    skip removed this fails with the same one-shot message.
+    let twin_core = Arc::clone(&core);
+    let twin_txn = core.begin(Isolation::ReadCommitted);
+    expect_clean_rig_scan(
+        "C-DIAG1fix2 regression: common::assert_count_exact decoded the \
+         ts-256 /sys/ts_clock sample",
+        move || {
+            common::assert_count_exact(&twin_core, &twin_txn);
+            println!(
+                "DIAG1fix2 twin holds: common::assert_count_exact skipped \
+                 the ts-256 sample"
             );
+        },
+    );
+}
+
+// ---- The M-1 residue hunt (C-DIAG1fix2) --------------------------------------
+
+/// `c_t2c_support::count_intents`'s exact scan shape (the step-1c
+/// assertion), but capturing the survivors instead of counting: every
+/// **non-`/sys/`** key that parses as `Entry::Intent`, with its raw value.
+/// Never decodes — a capture is data.
+fn live_intents(core: &Arc<Core<MemKv>>) -> Vec<Pair> {
+    let view = core.open_view();
+    let mut out = Vec::new();
+    for row in view.scan(
+        (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        false,
+    ) {
+        let (k, v) = ok(row);
+        if k.starts_with(SYS_PREFIX) {
+            continue;
+        }
+        if parse_key(&k).is_some_and(|(_, e)| matches!(e, Entry::Intent)) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+/// One captured KV pair: raw key bytes, raw value bytes.
+type Pair = (Vec<u8>, Vec<u8>);
+
+/// One survivor of a drain: key, value, and `decode_intent`'s owner id
+/// (or the decode error — itself diagnostic).
+type Survivor = (
+    Vec<u8>,
+    Vec<u8>,
+    std::result::Result<nucleus_txn::TxnId, TxnError>,
+);
+
+/// One extra `Resolver::run_once` round: how much it resolved, and what
+/// still survives after it.
+type ExtraRound = (usize, Vec<Pair>);
+
+/// The M-1 evidence bundle: everything needed to classify a non-`/sys/`
+/// intent that survives a full resolver drain
+/// (`diag1_step1c_residue_hunt`).
+#[derive(Debug)]
+struct ResidueEvidence {
+    /// Each survivor: key bytes, raw value bytes, and `decode_intent`'s
+    /// owner id (or the decode error — itself diagnostic: a user-span
+    /// key that fails decode is a different bug than a leaked intent).
+    survivors: Vec<Survivor>,
+    /// Three extra `Resolver::run_once` rounds: how much each resolved,
+    /// and what still survives after it. A survivor cleared by an extra
+    /// round means the drain contract (`while run_once() > 0`) returned
+    /// early; one that survives all three is an intent-leak invariant
+    /// failure — ESCALATE either way.
+    extra_rounds: Vec<ExtraRound>,
+    /// The `/sys/txn` records still present at capture (the resolver's
+    /// own truncation state).
+    sys_txn_span: Vec<Pair>,
+    /// The status-table entries of the txns the survivors name:
+    /// (id, status, gen, released, intent_count, last_removal_counter).
+    status: Vec<(
+        nucleus_txn::TxnId,
+        Option<nucleus_txn::TxnStatus>,
+        u64,
+        bool,
+        i64,
+        u64,
+    )>,
+}
+
+/// Runs one exact step-1c scene (the repro above: fresh core, real
+/// pipeline under `StepClock`, insert + 255 blocker-style update commits,
+/// each followed by the full `resolve_all` drain) and returns the M-1
+/// evidence if any non-`/sys/` intent survives the drain, `None` if the
+/// scene is clean.
+fn hunt_one(row: &[u8]) -> Option<ResidueEvidence> {
+    let core = Arc::new(ok(Core::open(MemKv::new())));
+    core.set_row_locks(TestRowLocks::new());
+    let mut pipeline = ok(CommitPipeline::new(Arc::clone(&core)));
+    pipeline.set_clock(Arc::new(StepClock(AtomicU64::new(0))));
+    commit_insert(&core, &mut pipeline, row, &u64v(0));
+    for i in 1..=255u64 {
+        commit_update_row(&core, &mut pipeline, row, i);
+    }
+
+    let survivors = live_intents(&core);
+    if survivors.is_empty() {
+        return None;
+    }
+    // The M-1 residue: capture everything before touching anything else.
+    let decoded: Vec<Survivor> = survivors
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone(), decode_intent(v).map(|i| i.txn)))
+        .collect();
+    let mut extra_rounds = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let resolved = ok(Resolver::run_once(&core));
+        extra_rounds.push((resolved, live_intents(&core)));
+    }
+    let sys_txn_span = sys_span(&core)
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&sys_txn_prefix()))
+        .collect();
+    let mut ids: Vec<nucleus_txn::TxnId> = Vec::new();
+    for (_, _, id) in decoded.iter() {
+        if let Ok(id) = id {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+    }
+    let status = ids
+        .into_iter()
+        .map(|id| {
+            let e = core.status.entry(id);
+            (
+                id,
+                e.map(|e| e.status),
+                e.map_or(0, |e| e.gen),
+                e.is_some_and(|e| e.released),
+                e.map_or(0, |e| e.intent_count),
+                e.map_or(0, |e| e.last_removal_counter),
+            )
+        })
+        .collect();
+    Some(ResidueEvidence {
+        survivors: decoded,
+        extra_rounds,
+        sys_txn_span,
+        status,
+    })
+}
+
+/// The M-1 flake hunt (C-DIAG1fix2): the exact step-1c scene in a bounded
+/// loop, on the lookout for the gate's one-in-~1400 observation — one
+/// **non-`/sys/`** intent surviving the resolver drain
+/// (`count_intents == 1` after 256 commits). Each scene runs on its own
+/// thread under a `recv_timeout` per-run bound, so a stuck scene trips the
+/// bound instead of hanging the loop. On the first residue the hunt prints
+/// the [`ResidueEvidence`] bundle and fails: that is an engine escalation
+/// (intent leak past a drain, or a too-weak drain contract), not a rig
+/// fix. If the loop completes clean, the tally is the deliverable and M-1
+/// closes as unreproduced-in-bounds.
+///
+/// Knobs: `NUCLEUS_DIAG1_HUNT_ITERS` (default 2000),
+/// `NUCLEUS_DIAG1_HUNT_TIMEOUT_MS` (default 30 000),
+/// `NUCLEUS_DIAG1_HUNT_HOGS` (default 0; CPU-hog threads held for the
+/// whole loop, "under load" for cheap).
+#[test]
+#[ignore = "C-DIAG1fix2 flake hunt: bounded loop, minutes; run explicitly with the env knobs"]
+fn diag1_step1c_residue_hunt() {
+    let iters = env_usize("NUCLEUS_DIAG1_HUNT_ITERS", 2000);
+    let timeout_ms = env_usize("NUCLEUS_DIAG1_HUNT_TIMEOUT_MS", 30_000);
+    let hogs = env_usize("NUCLEUS_DIAG1_HUNT_HOGS", 0);
+    let per_run = Duration::from_millis(timeout_ms as u64);
+    let (stop, hog_handles) = spawn_hogs(hogs);
+    let row = b"/t/r/1".to_vec();
+    println!(
+        "DIAG1fix2 hunt: {iters} iterations, {timeout_ms} ms per-run bound, \
+         {hogs} hog threads"
+    );
+    let start = Instant::now();
+    for i in 0..iters {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let row = row.clone();
+        let scene = std::thread::spawn(move || {
+            let _ = tx.send(hunt_one(&row));
+        });
+        match rx.recv_timeout(per_run) {
+            Ok(None) => {}
+            Ok(Some(evidence)) => {
+                println!("M-1 RESIDUE at iteration {i}:");
+                for (k, v, owner) in &evidence.survivors {
+                    println!(
+                        "  survivor key={k:02x?} value={v:02x?} \
+                         decode_intent->txn: {owner:?}"
+                    );
+                }
+                for (n, (resolved, still)) in evidence.extra_rounds.iter().enumerate() {
+                    println!(
+                        "  extra round {}: resolved {resolved}, still \
+                         alive: {}",
+                        n + 1,
+                        still.len()
+                    );
+                    for (k, v) in still {
+                        println!(
+                            "    alive after round {}: key={k:02x?} \
+                             value={v:02x?}",
+                            n + 1
+                        );
+                    }
+                }
+                println!("  /sys/txn span at capture: {:02x?}", evidence.sys_txn_span);
+                println!("  status entries: {:?}", evidence.status);
+                stop.store(true, Ordering::Relaxed);
+                for h in hog_handles {
+                    if let Err(e) = h.join() {
+                        std::panic::resume_unwind(e);
+                    }
+                }
+                panic!(
+                    "M-1 reproduced at iteration {i} of {iters}: a non-/sys/ \
+                     intent survived the resolver drain — engine escalation, \
+                     evidence above"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                stop.store(true, Ordering::Relaxed);
+                println!(
+                    "M-1 hunt: iteration {i} blew the {timeout_ms} ms per-run \
+                     bound (scene thread stuck; evidence unavailable — the \
+                     bound is the finding)"
+                );
+                panic!("M-1 hunt: per-run bound exceeded at iteration {i}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                stop.store(true, Ordering::Relaxed);
+                // The scene thread died before reporting: surface its panic.
+                if let Err(p) = scene.join() {
+                    std::panic::resume_unwind(p);
+                }
+                panic!("M-1 hunt: iteration {i} ended without a result");
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "DIAG1fix2 hunt: {iters} clean scenes in {elapsed:.1?} ({}/iter, \
+         {hogs} hogs) — M-1 unreproduced in bounds",
+        elapsed.as_millis() / (iters as u128).max(1)
+    );
+    stop.store(true, Ordering::Relaxed);
+    for h in hog_handles {
+        if let Err(e) = h.join() {
+            std::panic::resume_unwind(e);
         }
     }
 }
