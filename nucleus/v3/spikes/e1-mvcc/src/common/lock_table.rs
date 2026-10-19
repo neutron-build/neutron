@@ -42,6 +42,53 @@ use std::time::Instant;
 
 use crate::api::{TxnErr, TxnId, Wait};
 
+/// Number of threads currently inside [`LockTable::acquire`]'s wait
+/// paths, process-wide (see [`waiting`]).
+static WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one parked waiter for as long as it lives (RAII, so every
+/// return path — timeout, engine error, clear — decrements).
+struct WaitingGuard;
+
+impl WaitingGuard {
+    fn new() -> Self {
+        WAITING.fetch_add(1, Ordering::AcqRel);
+        WaitingGuard
+    }
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        WAITING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The number of threads currently inside [`LockTable::acquire`]'s wait
+/// paths (shard or table-owner), across every lock table in the process.
+///
+/// This is test observability for the suite's blocked-path scenarios
+/// (verdict X-1a D1): a scenario spawns a waiter, waits until this
+/// count rises, and only then resolves the blocker. The barrier proves
+/// the waiter entered the wait path — and therefore ran everything the
+/// engine does before it, including any pre-acquire conflict checks —
+/// **while the blocker still held the lock**. Without it the waiter
+/// thread may not be scheduled until after the blocker's commit, and
+/// the check-after-wait re-check the scenario exists to exercise never
+/// runs (the verdict's O7 mutant then passes by scheduling luck).
+///
+/// Scenarios run sequentially inside `run_all` and join their threads
+/// before returning, so at a barrier the count is 0 until the scenario's
+/// own waiter parks. Like [`crate::common::commit::apply_gate`] the
+/// counter is process-global because the [`crate::api::TxnEngine`]
+/// trait exposes no per-engine hooks.
+///
+/// Cost: one atomic pair, taken only on paths that are about to park on
+/// a condvar — the uncontended acquire path (the common case) never
+/// touches it.
+pub fn waiting() -> u64 {
+    WAITING.load(Ordering::Acquire)
+}
+
 /// Number of independently latched key shards (card Work 3).
 pub const SHARDS: usize = 64;
 
@@ -344,6 +391,7 @@ impl LockTable {
             None => return Err(TxnErr::LockNotAvailable),
         };
         let mut t = self.lock_table()?;
+        let _waiting = WaitingGuard::new();
         loop {
             if t.owner != Some(owner) {
                 return Ok(());
@@ -391,6 +439,7 @@ impl LockTable {
             Ok(g) => g,
             Err(e) => return Err(TxnErr::Engine(crate::common::was_poisoned(&e))),
         };
+        let _waiting = WaitingGuard::new();
         loop {
             let clear = match sh.get(key) {
                 None => true,

@@ -29,15 +29,21 @@
 //!   committed version — never the snapshot (verdict mutant O1), a
 //!   committed tombstone is not live whatever its ts (verdict mutant
 //!   O5), and an own Delete is not live while an own Write is.
+//!
+//! Every blocked-path scenario (S4b–S4d, S6a, S6b) resolves its blocker
+//! only after [`wait_parked_waiter`] proves the waiter parked, so those
+//! scenarios are deterministic rather than dependent on the OS
+//! scheduling the waiter thread before the blocker's commit.
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::{Isolation, SavepointId, Ts, TxnEngine, TxnErr, Wait};
 use crate::common::commit::apply_gate;
+use crate::common::lock_table::waiting;
 use crate::common::lock_unpoisoned;
 use crate::reference::RefEngine;
 
@@ -45,6 +51,26 @@ use crate::reference::RefEngine;
 /// never waits near it, short enough that a broken one fails a test in
 /// seconds (there is no deadlock detector; card Work 3).
 const BLOCK: Wait = Wait::Block(Duration::from_secs(30));
+
+/// Barrier for the blocked-path scenarios (verdict D1): wait until at
+/// least one thread is inside `LockTable::acquire`'s wait paths, i.e.
+/// until this scenario's waiter has parked on the blocker's lock. Only
+/// then may the caller resolve the blocker — the waiter provably ran
+/// everything before its wait (including any pre-acquire checks) while
+/// the blocker still held the lock, so the post-wait re-check is
+/// exercised on every run, not by scheduling luck. Scenarios run
+/// sequentially and join their threads, so nothing else can be parked
+/// when this is called.
+fn wait_parked_waiter(fails: &mut Vec<String>, ctx: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while waiting() == 0 {
+        if Instant::now() >= deadline {
+            fails.push(format!("{ctx}: the waiter never parked on the lock"));
+            return;
+        }
+        thread::yield_now();
+    }
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -515,6 +541,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 };
                 let _ = tx.send(r);
             });
+            wait_parked_waiter(&mut f, "S4b");
             unit(&mut f, "S4b t1 commit", e.commit(t1), 2);
         });
         match rx.recv() {
@@ -570,6 +597,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                     .and_then(|_| e.commit(t2));
                 let _ = tx.send(r);
             });
+            wait_parked_waiter(&mut f, "S4c");
             unit(&mut f, "S4c t1 commit", e.commit(t1), 2);
         });
         match rx.recv() {
@@ -620,6 +648,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 };
                 let _ = tx.send(r);
             });
+            wait_parked_waiter(&mut f, "S4d");
             unit(&mut f, "S4d t1 commit", e.commit(t1), 2);
         });
         match rx.recv() {
@@ -726,6 +755,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 let _ = tx.send(e.insert_unique(&mut waiter, b"u", b"v2", BLOCK));
                 e.abort(waiter);
             });
+            wait_parked_waiter(&mut f, "S6a");
             unit(&mut f, "S6a holder commit", e.commit(holder), 1);
         });
         match rx.recv() {
@@ -758,6 +788,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 let r = r.and_then(|_| e.commit(waiter));
                 let _ = tx.send(r);
             });
+            wait_parked_waiter(&mut f, "S6b");
             e.abort(holder);
         });
         match rx.recv() {
