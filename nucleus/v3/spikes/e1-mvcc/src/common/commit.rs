@@ -66,8 +66,17 @@ where
 /// [`crate::suite::run_all`], so a process-global gate is safe there.
 /// Never used outside tests.
 pub mod apply_gate {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    /// Fast-path flag: `true` only while a gate is armed. The hook on
+    /// the commit path checks this **before** touching the mutex, so an
+    /// unarmed (i.e. every production) commit pays one relaxed-fail
+    /// atomic load instead of a process-global mutex — card X-1a-F1
+    /// Work 3, which exists because that mutex sat on every commit of
+    /// both E1′ arms and pulled their CPU ratio toward 1.
+    static ARMED: AtomicBool = AtomicBool::new(false);
 
     /// Gate state: `armed` selects the next arriving `commit_with`;
     /// `taken` records that it parked; `released` lets it proceed;
@@ -121,6 +130,15 @@ pub mod apply_gate {
         s.taken = false;
         s.released = false;
         s.parked = false;
+        drop(s);
+        // Publish the flag only after the state is set: a committer
+        // that loads `ARMED == true` and then takes the mutex is
+        // guaranteed to see `state.armed == true` (Release store here,
+        // Acquire load in [`maybe_park`]). Every test arms the gate
+        // **before** spawning the committing thread, so the thread's
+        // creation already orders the state before its first commit;
+        // the flag keeps the general case honest anyway.
+        ARMED.store(true, Ordering::Release);
         Arm { armed: true }
     }
 
@@ -151,11 +169,20 @@ pub mod apply_gate {
         s.armed = false;
         drop(s);
         CV.notify_all();
+        // Clear the flag after the state: a committer that already
+        // passed the fast path just before this store takes the mutex
+        // and then sees `armed == false` (or `released == true`) and
+        // returns without parking.
+        ARMED.store(false, Ordering::Release);
     }
 
     /// The hook [`crate::common::commit_with`] calls between ts
-    /// assignment and apply.
+    /// assignment and apply. Unarmed — the permanent state outside
+    /// tests — it returns after one atomic load, without locking.
     pub(super) fn maybe_park() {
+        if !ARMED.load(Ordering::Acquire) {
+            return;
+        }
         let mut s = lock();
         if !s.armed || s.taken {
             return;

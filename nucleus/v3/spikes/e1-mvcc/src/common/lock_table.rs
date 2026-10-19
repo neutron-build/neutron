@@ -1,4 +1,5 @@
-//! The in-memory lock table (card X-1a Work 3; PLAN-v3 §2 N2; C-T0 §6).
+//! The in-memory lock table (card X-1a Work 3, perf rework card X-1a-F1;
+//! PLAN-v3 §2 N2; C-T0 §6).
 //!
 //! Exclusive row locks live here as values-free owners: an entry names
 //! the owning txn and nothing else. Every key-existence or row operation
@@ -16,25 +17,53 @@
 //! - L-ESCALATE: past `escalate_at` row locks the txn's rows are replaced
 //!   by **one** table-wide exclusive owner held until release
 //!   (`escalations()` counts it). Escalation is attempted when the count
-//!   crosses the threshold and is deferred (not lost — the next acquire
-//!   retries) while any foreign txn still holds a row, because a
-//!   table-wide owner must exclude every row (L-EXCL). The claim/insert
-//!   handshake below keeps escalation atomic against concurrent inserts.
-//! - L-RELEASE: `release_all` wakes the waiters of every shard it freed
-//!   and of the table owner (C-T0 §6 "waking").
+//!   crosses the threshold and is deferred, not lost, while any foreign
+//!   txn still holds a row, because a table-wide owner must exclude
+//!   every row (L-EXCL). The claim/insert handshake below keeps
+//!   escalation atomic against concurrent inserts.
+//! - L-RELEASE: `release_all` costs O(the keys the txn itself holds),
+//!   takes at most `min(keys, SHARDS)` key-shard locks (counted by
+//!   `shard_visits()`), and wakes the waiters of every shard it freed
+//!   and of the table owner (C-T0 §6 "waking"). An escalated txn holds
+//!   no rows: its release clears the owner and touches no shard.
+//! - **L-ESCALATE-DEFER (decided in card X-1a-F1; S-2 decides the
+//!   production rule).** Escalation never *waits* on a foreign row
+//!   holder: a waiting escalant already holding a million rows
+//!   deadlocks against a foreign holder blocked on one of them, and
+//!   this lock table has no deadlock detector. Escalation is
+//!   **opportunistic**: it is attempted when a txn's row count first
+//!   passes `escalate_at`, and after a failed attempt it is retried
+//!   only after another *retry step* of acquires by the same txn —
+//!   `escalation_retry_step()` = `max(escalate_at / 8, 1)`. Each
+//!   attempt's foreign-row test is O(1): the table's total row-entry
+//!   counter minus the txn's own count — never a shard scan. Under
+//!   sustained foreign traffic a big txn may therefore never escalate;
+//!   that outcome is legitimate and is what W6 must report.
 //!
-//! Lock order (module docs, [`crate::common`]): table-owner mutex →
-//! per-txn index mutex → shard mutexes in index order. A thread waiting
-//! on a condvar holds **only** the condvar's mutex.
+//! Lock order (one order everywhere): **per-txn index shard → key
+//! shard.** The per-txn index is itself sharded by `TxnId`
+//! ([`IDX_SHARDS`]), so txns landing on different index shards never
+//! contend on acquire (the pre-F1 global index mutex serialized every
+//! acquire in the process). The only nested acquisition in the table is
+//! an index shard held across a key shard (acquire step (2) below). The
+//! table-owner mutex is always taken alone — never held across an
+//! index-shard or key-shard acquisition, and neither is held while
+//! taking it. A thread waiting on a condvar holds only that condvar's
+//! mutex.
 //!
-//! The escalation race (L-ESCALATE) and its closure: an inserter checks
-//! the table owner, inserts its row, then **re-checks** the owner; an
-//! escalant claims the owner, sweeps the shards, and only keeps the claim
-//! if no foreign row appeared. Whichever of the two acted first is seen
-//! by the other's second step, so the pair can never interleave into
-//! "escalant owns the table while an inserter keeps its row".
+//! The escalation race (L-ESCALATE) and its closure, re-derived for the
+//! counter layout: an inserter inserts its row and bumps the row
+//! counter, then re-checks the table owner, undoing the insert if an
+//! owner appeared; an escalant tests the counter (`total > own` =
+//! a foreign row exists), claims the owner, and re-tests the counter,
+//! un-claiming if a foreign row appeared. The inserter bumps the
+//! counter before its owner check, and the escalant reads the counter
+//! after releasing its claim's critical section, so whichever of the
+//! two acted first is seen by the other's second step through the
+//! table mutex — the pair can never interleave into "escalant owns the
+//! table while an inserter keeps its row".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -92,6 +121,11 @@ pub fn waiting() -> u64 {
 /// Number of independently latched key shards (card Work 3).
 pub const SHARDS: usize = 64;
 
+/// Number of independently latched per-txn index shards (card X-1a-F1
+/// Work 2). Index shards and key shards are unrelated lattices: the
+/// first is selected by `TxnId`, the second by key.
+const IDX_SHARDS: usize = 64;
+
 /// Default per-txn row-lock budget past which locks escalate to one
 /// table-wide owner (card Work 3; PLAN-v3 N2).
 pub const DEFAULT_ESCALATE_AT: usize = 1_000_000;
@@ -110,6 +144,11 @@ pub struct Owner(
 struct TxnLocks {
     keys: HashSet<Vec<u8>>,
     escalated: bool,
+    /// The key count at which the next escalation attempt is allowed
+    /// (L-ESCALATE-DEFER's retry step bookkeeping; 0 = attempt as soon
+    /// as the count passes `escalate_at`). Only the txn's own thread
+    /// reads and writes it, under its index shard's mutex.
+    retry_at: usize,
 }
 
 /// The table-wide exclusive owner slot (L-ESCALATE).
@@ -124,9 +163,15 @@ pub struct LockTable {
     cvs: Vec<Condvar>,
     table: Mutex<TableState>,
     table_cv: Condvar,
-    by_txn: Mutex<HashMap<TxnId, TxnLocks>>,
+    by_txn: Vec<Mutex<HashMap<TxnId, TxnLocks>>>,
+    /// Total row entries across all shards: the O(1) foreign-row test of
+    /// L-ESCALATE-DEFER is `rows > own count`. Maintained under the
+    /// shard mutex at every insert and removal.
+    rows: AtomicU64,
     escalate_at: usize,
     escalations: AtomicU64,
+    attempts: AtomicU64,
+    visits: AtomicU64,
 }
 
 impl LockTable {
@@ -144,9 +189,14 @@ impl LockTable {
             cvs: (0..SHARDS).map(|_| Condvar::new()).collect(),
             table: Mutex::new(TableState::default()),
             table_cv: Condvar::new(),
-            by_txn: Mutex::new(HashMap::new()),
+            by_txn: (0..IDX_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            rows: AtomicU64::new(0),
             escalate_at,
             escalations: AtomicU64::new(0),
+            attempts: AtomicU64::new(0),
+            visits: AtomicU64::new(0),
         }
     }
 
@@ -156,16 +206,37 @@ impl LockTable {
         (h.finish() as usize) % SHARDS
     }
 
+    fn idx_of(txn: TxnId) -> usize {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        txn.hash(&mut h);
+        (h.finish() as usize) % IDX_SHARDS
+    }
+
     fn lock_table(&self) -> Result<std::sync::MutexGuard<'_, TableState>, TxnErr> {
         self.table
             .lock()
             .map_err(|e| TxnErr::Engine(crate::common::was_poisoned(&e)))
     }
 
-    fn lock_by_txn(&self) -> Result<std::sync::MutexGuard<'_, HashMap<TxnId, TxnLocks>>, TxnErr> {
-        self.by_txn
-            .lock()
-            .map_err(|e| TxnErr::Engine(crate::common::was_poisoned(&e)))
+    /// Lock the per-txn index shard owning `txn`'s entry (lock order:
+    /// index shard → key shard; never the reverse).
+    fn lock_index(
+        &self,
+        txn: TxnId,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<TxnId, TxnLocks>>, TxnErr> {
+        match self.by_txn.get(Self::idx_of(txn)) {
+            Some(m) => m
+                .lock()
+                .map_err(|e| TxnErr::Engine(crate::common::was_poisoned(&e))),
+            None => Err(TxnErr::Engine("per-txn index shard unavailable".into())),
+        }
+    }
+
+    /// The escalation retry step of L-ESCALATE-DEFER: after a failed
+    /// attempt, the txn retries only once another this-many acquires
+    /// have happened. A per-table value: `max(escalate_at / 8, 1)`.
+    pub fn escalation_retry_step(&self) -> usize {
+        (self.escalate_at / 8).max(1)
     }
 
     /// Acquire `key` for `txn` (L-EXCL, L-NOOP, L-WAIT). An already-owned
@@ -189,11 +260,16 @@ impl LockTable {
                     continue;
                 }
             }
-            // (2) The row, under the per-txn index and the shard.
+            // (2) The row, under the per-txn index shard and the key
+            // shard, in that order. The counter bump is inside the
+            // shard's critical section and before step (3), so any
+            // escalant that claims after our insert sees our count
+            // (module docs, "the escalation race").
             let idx = Self::shard_of(key);
             let count;
+            let retry_at;
             {
-                let mut by = self.lock_by_txn()?;
+                let mut by = self.lock_index(txn)?;
                 let mut sh = match self.shards.get(idx).map(|m| m.lock()) {
                     Some(Ok(g)) => g,
                     Some(Err(e)) => return Err(TxnErr::Engine(crate::common::was_poisoned(&e))),
@@ -209,12 +285,12 @@ impl LockTable {
                     continue;
                 }
                 sh.insert(key.to_vec(), Owner(txn));
+                self.rows.fetch_add(1, Ordering::Relaxed);
+                let entry = by.entry(txn).or_default();
+                entry.keys.insert(key.to_vec());
+                count = entry.keys.len();
+                retry_at = entry.retry_at;
                 drop(sh);
-                count = {
-                    let entry = by.entry(txn).or_default();
-                    entry.keys.insert(key.to_vec());
-                    entry.keys.len()
-                };
                 drop(by);
             }
             // (3) Re-check the table owner: if an escalation claimed the
@@ -231,31 +307,66 @@ impl LockTable {
                     continue;
                 }
             }
-            // (4) Past the budget, replace our rows with the table owner.
-            if count > self.escalate_at {
-                let _ = self.try_escalate(txn);
+            // (4) Past the budget, replace our rows with the table
+            // owner — but only when the retry step allows a new
+            // attempt (L-ESCALATE-DEFER). A failed attempt defers the
+            // next one by one step of our own acquires.
+            if count > self.escalate_at && count >= retry_at {
+                if self.try_escalate(txn) {
+                    return Ok(());
+                }
+                let step = self.escalation_retry_step();
+                if let Ok(mut by) = self.lock_index(txn)
+                    && let Some(entry) = by.get_mut(&txn)
+                {
+                    entry.retry_at = count.saturating_add(step);
+                }
             }
             return Ok(());
         }
     }
 
     /// Release every lock `txn` holds (rows and a table-wide owner) and
-    /// wake its waiters (L-RELEASE).
+    /// wake its waiters (L-RELEASE), through the per-txn index: group
+    /// the txn's own keys by shard, and in each affected shard remove
+    /// only keys whose owner is `txn`. Cost O(keys held by `txn`) plus
+    /// at most `min(keys, SHARDS)` key-shard locks; an escalated txn
+    /// holds no rows, so it clears the owner and touches no shard.
     pub fn release_all(&self, txn: TxnId) {
+        // The table owner first (always alone): waiters on it wake as
+        // soon as it clears.
         if let Ok(mut t) = self.table.lock()
             && t.owner == Some(txn)
         {
             t.owner = None;
+            self.table_cv.notify_all();
         }
-        self.table_cv.notify_all();
-        if let Ok(mut by) = self.by_txn.lock() {
-            by.remove(&txn);
+        // Take the key set out of the index entry in one pass.
+        let keys = match self.lock_index(txn) {
+            Ok(mut by) => by.remove(&txn).map_or_else(HashSet::new, |l| l.keys),
+            Err(_) => return,
+        };
+        if keys.is_empty() {
+            return;
         }
-        for i in 0..SHARDS {
+        // Group our keys by shard, then remove only ours from each
+        // affected shard. Ascending shard order keeps the visit pattern
+        // (and `shard_visits`) deterministic for a given key set.
+        let mut grouped: BTreeMap<usize, Vec<Vec<u8>>> = BTreeMap::new();
+        for k in keys {
+            grouped.entry(Self::shard_of(&k)).or_default().push(k);
+        }
+        for (i, ks) in grouped {
             if let Some(sh) = self.shards.get(i)
                 && let Ok(mut sh) = sh.lock()
             {
-                sh.retain(|_, o| o.0 != txn);
+                self.visits.fetch_add(1, Ordering::Relaxed);
+                for k in &ks {
+                    if sh.get(k).is_some_and(|o| o.0 == txn) {
+                        sh.remove(k);
+                        self.rows.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
             }
             if let Some(cv) = self.cvs.get(i) {
                 cv.notify_all();
@@ -283,7 +394,7 @@ impl LockTable {
     /// Rows currently held by `txn` (0 once escalated; the table-wide
     /// owner covers every key).
     pub fn held_by(&self, txn: TxnId) -> u64 {
-        match self.by_txn.lock() {
+        match self.lock_index(txn) {
             Ok(by) => by.get(&txn).map_or(0, |l| l.keys.len() as u64),
             Err(_) => 0,
         }
@@ -291,7 +402,7 @@ impl LockTable {
 
     /// Whether `txn` holds the table-wide owner (L-ESCALATE).
     pub fn is_escalated(&self, txn: TxnId) -> bool {
-        match self.by_txn.lock() {
+        match self.lock_index(txn) {
             Ok(by) => by.get(&txn).is_some_and(|l| l.escalated),
             Err(_) => false,
         }
@@ -302,28 +413,61 @@ impl LockTable {
         self.escalations.load(Ordering::Relaxed)
     }
 
+    /// How many escalation attempts were made, successful or deferred
+    /// (L-ESCALATE-DEFER observability: with a foreign row held, this
+    /// grows by one per retry step, not one per acquire).
+    #[doc(hidden)]
+    pub fn escalation_attempts(&self) -> u64 {
+        self.attempts.load(Ordering::Relaxed)
+    }
+
+    /// Key-shard mutex acquisitions made by `release_all` and
+    /// `try_escalate` — the complexity observability of card X-1a-F1:
+    /// releasing a txn's locks touches only the shards its own keys map
+    /// to, and an escalation attempt that defers before claiming
+    /// touches none.
+    #[doc(hidden)]
+    pub fn shard_visits(&self) -> u64 {
+        self.visits.load(Ordering::Relaxed)
+    }
+
     /// Remove one row owned by `txn` (the escalation-race undo of step
-    /// (3), and `try_escalate`'s sweep).
+    /// (3)).
     fn remove_row(&self, key: &[u8], txn: TxnId) {
-        let idx = Self::shard_of(key);
-        if let Ok(mut by) = self.by_txn.lock() {
+        if let Ok(mut by) = self.lock_index(txn) {
             if let Some(lock) = by.get_mut(&txn) {
                 lock.keys.remove(key);
             }
             drop(by);
         }
+        let idx = Self::shard_of(key);
         if let Some(sh) = self.shards.get(idx)
             && let Ok(mut sh) = sh.lock()
+            && sh.get(key).is_some_and(|o| o.0 == txn)
         {
-            sh.retain(|k, o| !(k.as_slice() == key && o.0 == txn));
+            sh.remove(key);
+            self.rows.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Try to replace `txn`'s rows with the table-wide owner
-    /// (L-ESCALATE). Returns whether the escalation happened; a foreign
-    /// row or a foreign owner defers it to a later acquire without
-    /// dropping any of `txn`'s rows.
+    /// (L-ESCALATE, L-ESCALATE-DEFER). Returns whether the escalation
+    /// happened; a foreign row (O(1) counter test, before **and** after
+    /// the claim) or a foreign owner defers it to a later retry step
+    /// without dropping any of `txn`'s rows.
     fn try_escalate(&self, txn: TxnId) -> bool {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        // Our own row count. Stable during the attempt: only this txn's
+        // thread mutates its entry.
+        let own = match self.lock_index(txn) {
+            Ok(by) => by.get(&txn).map_or(0, |l| l.keys.len()),
+            Err(_) => return false,
+        } as u64;
+        // Pre-claim foreign test (O(1)): claiming only to un-claim
+        // would stall every other inserter on the owner slot.
+        if self.rows.load(Ordering::Acquire) > own {
+            return false;
+        }
         // Claim the owner slot: exactly one escalant can hold it.
         {
             let Ok(mut t) = self.table.lock() else {
@@ -334,18 +478,11 @@ impl LockTable {
             }
             t.owner = Some(txn);
         }
-        // Pass 1: a foreign row still held? Then un-claim and retry on a
-        // later acquire — a table owner must exclude every row (L-EXCL).
-        let mut foreign = false;
-        for sh in &self.shards {
-            if let Ok(sh) = sh.lock()
-                && sh.values().any(|o| o.0 != txn)
-            {
-                foreign = true;
-                break;
-            }
-        }
-        if foreign {
+        // Post-claim re-test. An inserter that raced its bump between
+        // the pre-claim test and the claim will un-do itself in acquire
+        // step (3) — but one whose step-(3) check ran before our claim
+        // does not, and only this re-test sees it (module docs).
+        if self.rows.load(Ordering::Acquire) > own {
             if let Ok(mut t) = self.table.lock()
                 && t.owner == Some(txn)
             {
@@ -354,22 +491,40 @@ impl LockTable {
             self.table_cv.notify_all();
             return false;
         }
-        // Pass 2: drop our rows. Inserts that raced the claim undo
-        // themselves in acquire step (3), so no new row can appear under
-        // the claim.
-        for (i, sh) in self.shards.iter().enumerate() {
-            if let Ok(mut sh) = sh.lock() {
-                sh.retain(|_, o| o.0 != txn);
+        // Pass 2: drop our rows, grouped from our own key set — not a
+        // scan of all shards.
+        let keys = match self.lock_index(txn) {
+            Ok(mut by) => match by.get_mut(&txn) {
+                Some(l) => std::mem::take(&mut l.keys),
+                None => HashSet::new(),
+            },
+            Err(_) => HashSet::new(),
+        };
+        let mut grouped: BTreeMap<usize, Vec<Vec<u8>>> = BTreeMap::new();
+        for k in keys {
+            grouped.entry(Self::shard_of(&k)).or_default().push(k);
+        }
+        for (i, ks) in grouped {
+            if let Some(sh) = self.shards.get(i)
+                && let Ok(mut sh) = sh.lock()
+            {
+                self.visits.fetch_add(1, Ordering::Relaxed);
+                for k in &ks {
+                    if sh.get(k).is_some_and(|o| o.0 == txn) {
+                        sh.remove(k);
+                        self.rows.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
             }
             if let Some(cv) = self.cvs.get(i) {
                 cv.notify_all();
             }
         }
-        if let Ok(mut by) = self.by_txn.lock()
-            && let Some(lock) = by.get_mut(&txn)
+        // Mark the txn escalated while it still holds the claim.
+        if let Ok(mut by) = self.lock_index(txn)
+            && let Some(l) = by.get_mut(&txn)
         {
-            lock.keys.clear();
-            lock.escalated = true;
+            l.escalated = true;
         }
         self.escalations.fetch_add(1, Ordering::Relaxed);
         true
@@ -469,10 +624,11 @@ impl Default for LockTable {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
-    use super::LockTable;
+    use super::{LockTable, Owner};
     use crate::api::{TxnErr, Wait};
 
     /// L-NOOP: acquiring an owned key again succeeds immediately.
@@ -563,5 +719,102 @@ mod tests {
         lt.acquire(b"d", 9, Wait::NoWait).unwrap();
         assert!(lt.is_escalated(9));
         assert_eq!(lt.escalations(), 1);
+    }
+
+    /// The `NO-RECLAIM-AFTER-CLAIM` catcher of card X-1a-F1: inserters
+    /// race an escalant past its budget, and no foreign row may coexist
+    /// with the table owner (L-EXCL).
+    ///
+    /// The interleaving being probed is microscopic: an inserter's
+    /// counter bump and step-(3) owner check must both land between the
+    /// escalant's pre-claim counter read and its claim of the table
+    /// mutex. The round therefore multiplies the chances: eight
+    /// inserters acquire and release continuously (dense insert traffic
+    /// into every claim window), the escalant runs escalate/release
+    /// cycles for as long as the inserters live, and every inserter
+    /// that gets an `Ok` holds its row for a short randomized window
+    /// (0–7 µs, covering a claim→pass-2 completion) while watching the
+    /// `escalations()` level against a snapshot taken **after** the
+    /// `Ok`.
+    ///
+    /// The detector is sound for correct code: `escalations()` is
+    /// incremented only after the post-claim re-test passed and pass 2
+    /// dropped the escalant's rows, so an inserter that has held its
+    /// row continuously since its `Ok` (and whose snapshot postdates
+    /// that `Ok`, hence every earlier escalation) can see a new
+    /// increment only if some claim completed while its row was live —
+    /// and the race closure in the module docs (the inserter's bump
+    /// precedes its owner check; the re-test reads the counter after
+    /// the claim) makes that impossible when the re-test exists.
+    /// The `NO-RECLAIM-AFTER-CLAIM` catcher of card X-1a-F1 (white-box:
+    /// it lives beside the code because the interleaving it probes is
+    /// narrower than any scheduling luck — an inserter's counter bump
+    /// *and* its step-(3) owner check must both land between the
+    /// escalant's pre-claim counter read and its claim, and a fair table
+    /// mutex always serves the queued escalant first).
+    ///
+    /// The orchestration parks a real escalant thread **inside** that
+    /// gap: the test holds the table mutex while the thread runs
+    /// [`LockTable::try_escalate`], so the thread has read the counter
+    /// (no foreign row) and is queued to claim. The test then performs
+    /// an in-flight inserter's step (2) exactly — row inserted, counter
+    // bumped, and its step-(3) owner check already past (it saw no
+    /// owner, so nothing will undo the row) — and releases the mutex.
+    ///
+    /// Correct code: the post-claim re-test reads the bumped counter,
+    /// un-claims and defers; the foreign row and all of the escalant's
+    /// rows survive untouched. A mutant that skips the re-test
+    /// escalates onto a live foreign row and fails every assertion.
+    /// The test cannot false-fail: if the escalant thread were delayed
+    /// past the bump, its *pre*-claim test defers instead — the same
+    /// observable outcome.
+    #[test]
+    fn escalation_claim_reclaims_racing_inserters() {
+        const TRIALS: u64 = 5;
+        const OWN: u64 = 32; // at with_escalate_at(32): setup never crosses
+        for trial in 0..TRIALS {
+            let lt = LockTable::with_escalate_at(32);
+            for i in 0..OWN {
+                lt.acquire(&i.to_be_bytes(), 1, Wait::NoWait).unwrap();
+            }
+            assert_eq!(lt.entries(), OWN);
+            // Park the escalant between its pre-claim read and its
+            // claim: it queues here while the test holds the mutex.
+            let table = crate::common::lock_unpoisoned(&lt.table);
+            let result = thread::scope(|s| {
+                let lt = &lt;
+                let escalant = s.spawn(move || lt.try_escalate(1));
+                // Let the escalant pass its pre-claim read and queue on
+                // the held mutex (generous margin; the whole path is a
+                // few µs).
+                thread::sleep(Duration::from_millis(2));
+                // The in-flight inserter's step (2), verbatim: row in
+                // its shard, total bumped. (No index entry: the point
+                // is the shard row plus the counter the re-test reads.)
+                let foreign = b"in-flight-inserter-row";
+                let idx = LockTable::shard_of(foreign);
+                if let Some(sh) = lt.shards.get(idx) {
+                    let mut sh = crate::common::lock_unpoisoned(sh);
+                    sh.insert(foreign.to_vec(), Owner(2));
+                }
+                lt.rows.fetch_add(1, Ordering::Relaxed);
+                // Let the escalant claim.
+                drop(table);
+                escalant.join().unwrap()
+            });
+            assert!(
+                !result,
+                "trial {trial}: the escalation must not complete over a foreign row"
+            );
+            assert!(!lt.is_escalated(1), "trial {trial}");
+            assert_eq!(lt.escalations(), 0, "trial {trial}");
+            assert_eq!(
+                lt.entries(),
+                OWN + 1,
+                "trial {trial}: the foreign row and the escalant's rows are all intact"
+            );
+            assert_eq!(lt.held_by(1), OWN, "trial {trial}");
+            assert!(lt.escalation_attempts() >= 1, "trial {trial}: non-vacuity");
+        }
     }
 }
