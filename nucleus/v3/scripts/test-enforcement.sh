@@ -129,6 +129,13 @@ scratch; expect_no "a late non-CORE commit after the verdict is refused" mc G2
 card G3 S standard; branch G3 nucleus/v3/spikes/g3.txt
 echo extra >>"$r/nucleus/v3/spikes/g3b.txt"; git -C "$r" add -A; verdict G3 S MERGE standard S
 scratch; expect_no "a verdict commit that also changes another file is refused" mc G3
+# A verdict re-committed over a late change: the tip is again verdict-only (the
+# tip-files check passes), but its Commit still names the old reviewed commit,
+# not tip^. Only the Commit = tip^ check can refuse this.
+card G4 S standard; branch G4 nucleus/v3/spikes/g4.txt; verdict G4 S MERGE standard S
+echo late >>"$r/nucleus/v3/spikes/g4.txt"; git -C "$r" commit -qam "nucleus v3: G4 late non-core change"
+sed -i 's/^Date: .*/Date: 2026-10-18/' "$v3/verdicts/G4.md"; git -C "$r" commit -qam "nucleus v3: G4 verdict MERGE (re-committed)"
+scratch; expect_no "a verdict re-committed over a late change (stale Commit) is refused" mc G4
 
 card R S standard
 git -C "$r" checkout -q -b card/v3-R nucleus/v3-scaffold
@@ -169,6 +176,9 @@ expect_no "audit rejects a direct commit to the v3 CI workflow" bash -c "cd '$v3
 git -C "$r" checkout -q -b scratch/rename scratch/pass2
 git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-R (MERGE, gate S/test-model)" card/v3-R
 expect_no "audit rejects a titled merge of a CORE rename with an S verdict" bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/rename"
+git -C "$r" checkout -q -b scratch/recommit scratch/pass2
+git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-G4 (MERGE, gate S/test-model)" card/v3-G4
+expect_no "audit rejects a titled merge whose verdict Commit is not tip^ (G4)" bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/recommit"
 
 # --- gate.sh ----------------------------------------------------------------
 gate_out() { local rc=0; (cd "$v3" && FAKE_FAIL=${1:-none} bash scripts/gate.sh) >"$t/gate" 2>&1 || rc=$?; echo "$rc" >"$t/gate.rc"; }
