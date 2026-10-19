@@ -603,6 +603,16 @@ pub fn assert_count_exact<K: OrderedKv>(
         false,
     ) {
         let (k, v) = ok(row);
+        // C-DIAG1fix2 (M-2): the generic twin of the C-DIAG1fix rig fix —
+        // this unbounded scan walks `/sys/` too, and a `/sys/ts_clock/{ts}`
+        // sample at ts ≡ 0 (mod 256) parses as an intent key whose be64
+        // wall-clock value fails `decode_intent` ("bad magic"). Skip the
+        // internal span before parsing, the same exclusion the
+        // `c_t2c_support` rig and its `count_intents` apply ("rework
+        // item 3").
+        if k.starts_with(nucleus_txn::encoding::SYS_PREFIX) {
+            continue;
+        }
         if let Some((logical, nucleus_txn::encoding::Entry::Intent)) =
             nucleus_txn::encoding::parse_key(&k)
         {
