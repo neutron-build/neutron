@@ -1,12 +1,16 @@
 //! C-T0 §9.2: the compaction filter for ts-in-key backends. See the
-//! [`gc`](crate::gc) module docs for how the durable W reaches it.
+//! [`gc`](crate::gc) module docs for how the durable W reaches it and
+//! §10 for the scope: data keys plus `/sys/catalog/` (the C-B1c
+//! carve-out), every other `/sys/` key kept whatever its bytes look
+//! like.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use nucleus_kv::{GcFilter, GcStream, Key};
 
-use crate::encoding::{parse_key, Entry, SYS_PREFIX};
+use crate::encoding::{parse_key, Entry};
+use crate::gc::gc_scope;
 
 /// The §9.2 compaction filter. It carries no drop state of its own: every
 /// stream built by [`GcFilter::begin`] keeps its own, so filter state never
@@ -56,11 +60,11 @@ impl GcStream for TxnGcStream {
     /// §9.2, on the raw key alone; `value` is not inspected (tombstones are
     /// protected by the newest-`<= W` rule, not by their bytes).
     fn drop_key(&mut self, key: &[u8], _value: &[u8]) -> bool {
-        // §10: every /sys/ key except the catalog is never dropped, even
-        // when its bytes match the version-key pattern. Catalog GC
-        // (`/sys/catalog/`, versioned like a table) is out of scope here:
-        // the catalog card adds it, so for now no /sys/ key qualifies.
-        if key.starts_with(SYS_PREFIX) {
+        // §10 (the C-B1c carve-out): every /sys/ key except the catalog's
+        // is never dropped, even when its bytes match the version-key
+        // pattern; the catalog is versioned table data and GC-able here
+        // like any table.
+        if !gc_scope(key) {
             return false;
         }
         match parse_key(key) {

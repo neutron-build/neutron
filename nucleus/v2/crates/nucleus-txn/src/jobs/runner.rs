@@ -1,13 +1,19 @@
-//! The job runner (§9.3): the per-job loop, the [`Spawner`] seam and the
-//! fixed shutdown order.
+//! The job runner (§9.3): the per-job loop, the §9.3 I/O budget's token
+//! bucket, the [`Spawner`] seam and the fixed shutdown order.
 //!
 //! **The loop.** Each job runs on its own thread: check the stop flag →
 //! take the wake's pending flag **before** the step (an enqueue during the
 //! step re-arms the wake, so it cannot be lost to the park that follows) →
-//! count the round → `step`. `Progress` loops at once; `Idle` parks on the
-//! wake for [`JobConfig`](crate::jobs::JobConfig)'s idle interval
-//! (`Woken` counts a wakeup, `TimedOut` an idle wait, `Stopped` exits);
-//! `Finished` exits Ok. The first step runs immediately at start.
+//! count the round → **throttle** (a budgeted job refills its token
+//! bucket from the set's [`JobClock`] and, while it cannot afford the
+//! next step, pauses in slices of at most 10 ms, checking stop between
+//! slices — throttling only delays the step, never changes it) → `step`,
+//! then charge the step's units (the delta of the kind's `units` counter)
+//! to the bucket. `Progress` loops at once; `Idle` parks on the wake for
+//! [`JobConfig`](crate::jobs::JobConfig)'s idle interval (`Woken` counts
+//! a wakeup, `TimedOut` an idle wait, `Stopped` exits); `Finished` exits
+//! Ok. The first step runs immediately at start (after the bucket starts
+//! full at `burst`).
 //!
 //! **Fail-stop** (§3, §9.3): a step's `Err` counts an error, is recorded
 //! as the set's first error if none was recorded yet, sets the stop flag
@@ -39,12 +45,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use nucleus_kv::OrderedKv;
 
 use crate::boot::Core;
 use crate::commit::{CommitThreadHandle, FailStop};
-use crate::jobs::{wake, Job, JobConfig, JobCtx, JobKind, JobOutcome};
+use crate::jobs::{wake, Job, JobClock, JobConfig, JobCtx, JobKind, JobOutcome, SystemJobClock};
 use crate::TxnError;
 
 /// Where a job's thread comes from (C-R0b's seam): the default is a named
@@ -129,6 +136,110 @@ pub const SHUTDOWN_ORDER: [ShutdownStep; 8] = [
     ShutdownStep::Job(JobKind::SsiRetention),
 ];
 
+/// One job thread's §9.3 token bucket. Tokens start at `burst`, refill
+/// from the set's [`JobClock`] (elapsed × rate, capped at `burst`, the
+/// sub-unit remainder carried), and are charged the step's units. A
+/// negative balance is a deficit: the runner waits it out in slices of at
+/// most [`TokenBucket::SLICE`], so no pause outruns a shutdown.
+///
+/// Integer arithmetic throughout: elapsed microseconds × rate, whole
+/// units only, the unused fraction of the elapsed time carried to the
+/// next refill (a double floor that under-refills by less than a
+/// microsecond's worth of units — conservative, and deterministic under
+/// a fake clock).
+struct TokenBucket {
+    rate: u64,
+    burst: u64,
+    tokens: i64,
+    /// Sub-unit refill remainder, in elapsed microseconds.
+    rem_micros: u64,
+    /// The clock value at the last refill (`None` until the first).
+    last: Option<Duration>,
+}
+
+impl TokenBucket {
+    /// The longest pause one throttle slice takes (§9.3: stop is checked
+    /// between slices).
+    const SLICE: Duration = Duration::from_millis(10);
+
+    fn new(budget: crate::jobs::IoBudget) -> TokenBucket {
+        TokenBucket {
+            rate: budget.units_per_sec,
+            burst: budget.burst,
+            tokens: budget.burst as i64,
+            rem_micros: 0,
+            last: None,
+        }
+    }
+
+    /// Refills from `now` (capped at `burst`). A clock that stands still
+    /// refills nothing — a fake clock only advances in `pause`.
+    fn refill(&mut self, now: Duration) {
+        if let Some(last) = self.last {
+            let elapsed = now.saturating_sub(last);
+            let micros = elapsed.as_micros() + self.rem_micros as u128;
+            let add = micros * self.rate as u128 / 1_000_000;
+            self.rem_micros = (micros - add * 1_000_000 / self.rate as u128) as u64;
+            if add > 0 {
+                self.tokens = self
+                    .tokens
+                    .saturating_add(i64::try_from(add).unwrap_or(i64::MAX))
+                    .min(self.burst as i64);
+            }
+        }
+        self.last = Some(now);
+    }
+
+    /// Charges `units` (a step's delta of the kind's `units` counter);
+    /// the balance may go negative.
+    fn charge(&mut self, units: u64) {
+        self.tokens = self
+            .tokens
+            .saturating_sub(i64::try_from(units).unwrap_or(i64::MAX));
+    }
+
+    /// How long to pause before re-checking the balance: the time the
+    /// current deficit still owes (at least one unit — a bucket at
+    /// exactly zero waits for its first), capped at one slice. At least
+    /// one microsecond, so a very high rate cannot make the slice zero
+    /// and the wait a spin.
+    fn wait_slice(&self) -> Duration {
+        let deficit = (-self.tokens).max(1) as u128;
+        let rate = self.rate as u128;
+        let need_micros = (deficit * 1_000_000) / rate;
+        let micros = need_micros.clamp(1, Self::SLICE.as_micros());
+        Duration::from_micros(micros as u64)
+    }
+}
+
+/// One job thread's throttle state: the bucket and the clock it refills
+/// from (§9.3). Owned by the thread's body, so hand-driven callers never
+/// see it — they charge the core's `units` counter, unthrottled.
+struct Throttle {
+    bucket: TokenBucket,
+    clock: Arc<dyn JobClock>,
+}
+
+impl Throttle {
+    /// Refills, then waits the deficit out in slices of at most
+    /// [`TokenBucket::SLICE`], checking `stop` between them (a throttled
+    /// shutdown stays prompt). Returns `false` when stop was seen — the
+    /// caller exits before running the step.
+    fn pace<K: OrderedKv>(&mut self, core: &Core<K>, kind: JobKind, stop: &AtomicBool) -> bool {
+        self.bucket.refill(self.clock.now());
+        while self.bucket.tokens <= 0 {
+            if stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            let slice = self.bucket.wait_slice();
+            self.clock.pause(slice);
+            core.count_job_throttle(kind, 1, slice.as_micros() as u64);
+            self.bucket.refill(self.clock.now());
+        }
+        true
+    }
+}
+
 /// One running job of a set.
 struct JobSlot {
     kind: JobKind,
@@ -147,7 +258,9 @@ struct SetShared {
 /// A set of background jobs over one core (§9.3), plus the optional commit
 /// thread whose shutdown the set orders. Create with [`JobSet::new`],
 /// install jobs with [`JobSet::start`], and shut everything down with
-/// [`JobSet::shutdown`] (or just drop it).
+/// [`JobSet::shutdown`] (or just drop it). Every kind starts on D4's
+/// I/O-budget default ([`IoBudget::default_for`](crate::jobs::IoBudget::default_for));
+/// [`JobSet::with_budget`] overrides one kind's.
 pub struct JobSet<K: OrderedKv> {
     core: Arc<Core<K>>,
     spawner: Arc<dyn Spawner>,
@@ -155,18 +268,32 @@ pub struct JobSet<K: OrderedKv> {
     /// core's current hook at each error, so a hook installed after the
     /// set (e.g. by `CommitPipeline::with_config`) still reports.
     fail_stop: Option<Arc<dyn FailStop>>,
+    /// The clock the set's I/O budgets run on (§9.3; C-B1c). Shared by
+    /// every budgeted job of the set.
+    clock: Arc<dyn JobClock>,
+    /// The §9.3 I/O budget of each kind (D4's defaults; `with_budget`
+    /// overrides). Read once when a job starts.
+    budgets: [Option<crate::jobs::IoBudget>; 7],
     commit_thread: Option<CommitThreadHandle>,
     shared: Arc<SetShared>,
 }
 
 impl<K: OrderedKv> JobSet<K> {
     /// An empty set over `core`, spawning std threads, reporting errors to
-    /// the core's fail-stop hook (read at error time).
+    /// the core's fail-stop hook (read at error time), pacing budgeted
+    /// jobs on the monotonic [`SystemJobClock`] with D4's per-kind
+    /// budgets.
     pub fn new(core: Arc<Core<K>>) -> JobSet<K> {
+        let mut budgets = [None; 7];
+        for kind in JobKind::ALL {
+            budgets[kind.index()] = crate::jobs::IoBudget::default_for(kind);
+        }
         JobSet {
             core,
             spawner: Arc::new(StdThreadSpawner),
             fail_stop: None,
+            clock: Arc::new(SystemJobClock::new()),
+            budgets,
             commit_thread: None,
             shared: Arc::new(SetShared {
                 slots: Mutex::new(Vec::new()),
@@ -174,6 +301,31 @@ impl<K: OrderedKv> JobSet<K> {
                 log: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Runs the set's I/O budgets on this clock (§9.3): a fake clock
+    /// advances virtual time only in `pause`, so a test paces a job
+    /// deterministically.
+    pub fn with_clock(mut self, clock: Arc<dyn JobClock>) -> JobSet<K> {
+        self.clock = clock;
+        self
+    }
+
+    /// Sets one kind's §9.3 I/O budget for this set (`None` unbudgets it),
+    /// overriding D4's default. Must run before the kind's job starts —
+    /// a job reads its bucket once, at `start`.
+    pub fn with_budget(
+        mut self,
+        kind: JobKind,
+        budget: Option<crate::jobs::IoBudget>,
+    ) -> JobSet<K> {
+        self.budgets[kind.index()] = budget;
+        self
+    }
+
+    /// The budget `kind`'s jobs run on in this set.
+    pub fn budget_of(&self, kind: JobKind) -> Option<crate::jobs::IoBudget> {
+        self.budgets[kind.index()]
     }
 
     /// Uses this spawner for every job the set starts (C-R0b's seam).
@@ -219,11 +371,19 @@ impl<K: OrderedKv> JobSet<K> {
             return Err(e);
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let throttle = self
+            .budget_of(kind)
+            .filter(|b| b.units_per_sec > 0)
+            .map(|b| Throttle {
+                bucket: TokenBucket::new(b),
+                clock: Arc::clone(&self.clock),
+            });
         let body = job_thread_body(
             Arc::clone(&self.core),
             job,
             Arc::clone(&stop),
             config,
+            throttle,
             Arc::clone(&self.shared),
             self.fail_stop.clone(),
         );
@@ -380,12 +540,16 @@ fn record_first(shared: &Arc<SetShared>, e: &TxnError) {
 }
 
 /// The per-job thread body (see the module docs for the loop and the
-/// fail-stop rules).
+/// fail-stop rules). A budgeted job throttles before each step (§9.3):
+/// refill from the clock, then pause in ≤ 10 ms slices — checking stop
+/// between slices — until the balance is positive; the step's units are
+/// charged after it returns.
 fn job_thread_body<K: OrderedKv>(
     core: Arc<Core<K>>,
     mut job: Box<dyn Job>,
     stop: Arc<AtomicBool>,
     config: JobConfig,
+    mut throttle: Option<Throttle>,
     shared: Arc<SetShared>,
     fail_stop: Option<Arc<dyn FailStop>>,
 ) -> impl FnOnce() {
@@ -402,6 +566,16 @@ fn job_thread_body<K: OrderedKv>(
             // b1_jobs' `wake_during_step_is_not_lost`).
             core.take_job_wake(kind);
             core.count_job_round(kind);
+            // §9.3 I/O budget: refill, then wait the deficit out in
+            // slices, stop between them. Throttling never changes the
+            // step, only delays it; an unbudgeted job skips this wholly.
+            if let Some(t) = throttle.as_mut() {
+                if !t.pace(&core, kind, &stop) {
+                    // Stopped mid-throttle: exit before the step runs.
+                    return;
+                }
+            }
+            let units_before = core.job_units_now(kind);
             // M2: a panic inside the step is fail-stop for the set right
             // now — routed through `fail_the_set` — not a silently dead
             // thread observed at join time.
@@ -409,6 +583,12 @@ fn job_thread_body<K: OrderedKv>(
                 let cx = JobCtx::new(&core.jobs, &stop, kind);
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.step(&cx)))
             };
+            // The step's charge (§9.3): the delta of the kind's `units`
+            // counter around the step, subtracted from the bucket.
+            if let Some(t) = throttle.as_mut() {
+                t.bucket
+                    .charge(core.job_units_now(kind).saturating_sub(units_before));
+            }
             let outcome = match outcome {
                 Ok(r) => r,
                 Err(_) => {

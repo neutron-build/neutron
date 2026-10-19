@@ -640,9 +640,14 @@ fn jobset_cleanup_cleans_once_w_rises_without_a_poke() {
     heartbeat(&rig.core, b"/t/1/hb1");
 
     // The row is cleaned within the window — by the wake, not the
-    // interval.
+    // interval. The gauge belongs in the condition too: `run_once`
+    // publishes the marker delete (which makes the row read absent)
+    // before it drains `seen` and zeroes the gauge, so observing the
+    // empty catalog is not yet observing the finished step.
     wait_until(5, "the retired row was cleaned after W rose", || {
-        retired_rows_now(&rig.core).is_empty() && raw_empty(&kv, &lo, &hi)
+        retired_rows_now(&rig.core).is_empty()
+            && raw_empty(&kv, &lo, &hi)
+            && pending_gauge(&rig.core) == 0
     });
     assert_eq!(pending_gauge(&rig.core), 0, "nothing is pending anymore");
 

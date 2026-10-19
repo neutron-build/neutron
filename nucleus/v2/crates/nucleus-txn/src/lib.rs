@@ -54,9 +54,10 @@
 //! (DDL is thereby transactional and takes AccessExclusive first), storage
 //! ids and oids from persisted block counters (never reused), and the
 //! boot-time rebuild of the SSI storage map from the committed catalog.
-//! The `/sys/catalog/` compaction-filter carve-out of §10 is **not** in:
-//! `TxnGcFilter` lives in `gc/filter.rs`, outside that card's file scope —
-//! see `catalog`'s module docs.
+//! The `/sys/catalog/` compaction-filter carve-out of §10 landed with
+//! C-B1c: one scope predicate (the `gc_scope` rule, in the filter and
+//! the tombstone pass) makes the catalog GC-able while every other
+//! `/sys/` key stays untouched.
 //!
 //! Card C-B1a adds the §9.3 background-job framework (`jobs`): the
 //! resolver, GC and SSI retention run as bounded-step jobs on std threads
@@ -88,6 +89,18 @@
 //! own txn. Both hold only raw keys, so they take `latch_key(k)` from the
 //! [`LatchKeySource`](jobs::LatchKeySource) seam (§7.3 SD2b), installed
 //! before either job starts and defaulting to "no deferrable keys".
+//!
+//! Card C-B1c finishes C-B1's plan row: per-job **I/O budgets** (§9.3) —
+//! a token bucket over an injectable [`JobClock`](jobs::JobClock),
+//! charged in the units the job bodies report
+//! (`nucleus_job_units_total`), that only ever delays a step — plus
+//! **bounded steps** so a budget can bite (the resolver takes
+//! `RESOLVER_BATCH` keys per round with the unfinished work requeued at
+//! the front; the GC tombstone pass walks the keyspace in
+//! logical-key-boundary chunks, one registered view and one durable `W`
+//! per chunk), and §10's `/sys/catalog/` GC carve-out (one scope
+//! predicate in the compaction filter and the tombstone pass, so catalog
+//! rows stop accumulating versions).
 
 pub mod boot;
 pub mod commit;

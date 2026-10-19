@@ -34,6 +34,21 @@
 //! Every job's persisted effects are idempotent across a crash (§9.3):
 //! resolution restarts from the boot sweep, GC from `/sys/gc_w`, drop
 //! cleanup from the retired rows.
+//!
+//! C-B1c adds the §9.3 I/O budgets: a token bucket per budgeted job,
+//! configured per job kind on the [`JobSet`](self::runner::JobSet)
+//! (D4's defaults via [`IoBudget::default_for`], override with
+//! [`JobSet::with_budget`](self::runner::JobSet::with_budget)), refilled
+//! from an injectable [`JobClock`] (the default is the monotonic
+//! [`SystemJobClock`]) and charged in the work units the job bodies
+//! report through [`JobCtx::charge`] / [`Core::job_units`](crate::boot::Core::job_units)
+//! (`nucleus_job_units_total`). Throttling only **delays** a step — it
+//! pauses in slices of at most 10 ms, checking stop between slices
+//! (`nucleus_job_throttle_waits_total`,
+//! `nucleus_job_throttled_micros_total`) — and never changes what the
+//! step does. Hand-driven callers (recovery harnesses, the simulator)
+//! charge the same counters without throttling: the bucket lives in the
+//! runner's thread.
 
 pub mod metrics;
 pub mod runner;
@@ -44,7 +59,7 @@ mod sweep;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::boot::Core;
 use crate::TxnError;
@@ -53,6 +68,92 @@ pub use drop_cleanup::DropCleanup;
 pub use runner::{JobSet, ShutdownStep, SHUTDOWN_ORDER};
 pub use sweep::BootSweep;
 pub use wake::{Wake, WakeResult};
+
+// ---- I/O budgets (§9.3, C-B1c) ------------------------------------------------
+
+/// A job's I/O budget (§9.3): a token bucket over [`JobClock`] time,
+/// charged in the work units the job bodies report. `units_per_sec` is
+/// the refill rate, `burst` the bucket capacity (and the starting
+/// balance). A `units_per_sec` of `0` disables the budget — a bucket
+/// that never refills would park its job forever, which no caller wants.
+///
+/// Budgets are configured **per job kind on the [`JobSet`](crate::jobs::runner::JobSet)**
+/// ([`JobSet::with_budget`](crate::jobs::runner::JobSet::with_budget));
+/// [`IoBudget::default_for`] holds D4's defaults (Gc, BootSweep and
+/// DropCleanup run on [`DEFAULT_JOB_BUDGET`]; the resolver, SSI
+/// retention, merge and analyze carry none). Throttling only delays
+/// steps and never changes their outcome (§9.3): the runner pauses in
+/// slices of at most 10 ms, checking stop between slices, so shutdown
+/// stays prompt however deep the deficit is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoBudget {
+    pub units_per_sec: u64,
+    pub burst: u64,
+}
+
+/// The budget D4 gives the budgeted kinds (Gc, BootSweep, DropCleanup):
+/// 50 000 units/s, burst 5 000.
+pub const DEFAULT_JOB_BUDGET: IoBudget = IoBudget {
+    units_per_sec: 50_000,
+    burst: 5_000,
+};
+
+impl IoBudget {
+    /// D4's per-kind default: Gc, BootSweep and DropCleanup run on
+    /// [`DEFAULT_JOB_BUDGET`]; the resolver, SSI retention, merge and
+    /// analyze carry no budget. A `JobSet` starts every kind on this and
+    /// `with_budget` overrides it.
+    pub fn default_for(kind: JobKind) -> Option<IoBudget> {
+        match kind {
+            JobKind::Gc | JobKind::BootSweep | JobKind::DropCleanup => Some(DEFAULT_JOB_BUDGET),
+            JobKind::Resolver | JobKind::SsiRetention | JobKind::Merge | JobKind::Analyze => None,
+        }
+    }
+}
+
+/// The clock the I/O budgets run on (§9.3): `now` is a monotonic
+/// timestamp the bucket refills from, `pause` waits. Injectable so
+/// tests pace a job on virtual time; the default is the monotonic
+/// [`SystemJobClock`].
+pub trait JobClock: Send + Sync {
+    /// A monotonic timestamp. Implementations must not go backwards.
+    fn now(&self) -> Duration;
+    /// Waits for `d`. Implementations that keep virtual time advance it
+    /// here (a budget's refill only ever observes time this way in the
+    /// tests).
+    fn pause(&self, d: Duration);
+}
+
+/// The default [`JobClock`]: `Instant::now` elapsed since the clock was
+/// made, `pause` a plain thread sleep.
+#[derive(Debug)]
+pub struct SystemJobClock {
+    start: Instant,
+}
+
+impl SystemJobClock {
+    pub fn new() -> SystemJobClock {
+        SystemJobClock {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemJobClock {
+    fn default() -> Self {
+        SystemJobClock::new()
+    }
+}
+
+impl JobClock for SystemJobClock {
+    fn now(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
 
 /// §7.3 SD2b (draft 7.7): the seam the schema-less intent removers — the
 /// boot sweep (§7.2) and retired-prefix cleanup (§9.2) — obtain
@@ -205,6 +306,17 @@ impl<'a> JobCtx<'a> {
             .items
             .fetch_add(n, Ordering::SeqCst);
     }
+
+    /// Adds `n` to this job's `units` counter (§9.3 I/O budget): the
+    /// work a step reports — stored entries scanned, keys written,
+    /// `DeleteRange`s — in whatever unit the body chooses. The runner
+    /// subtracts the step's delta from the job's token bucket; charging
+    /// never blocks and never changes what the step does.
+    pub fn charge(&self, n: u64) {
+        self.shared.counters[self.kind.index()]
+            .units
+            .fetch_add(n, Ordering::SeqCst);
+    }
 }
 
 /// The named crash points inside the job bodies (§9.3; the `Fault`/`CrashAt`
@@ -299,9 +411,11 @@ impl JobProbe for NoJobProbe {
     fn at(&self, _point: JobPoint) {}
 }
 
-/// Per-job runner configuration. Only the idle park interval so far
-/// (I/O budgets that throttle steps come in C-B1c and never change an
-/// outcome).
+/// Per-job runner configuration: the idle park interval. The §9.3 I/O
+/// budget is configured per job kind on the [`JobSet`](crate::jobs::runner::JobSet)
+/// (D4 defaults via [`IoBudget::default_for`], override with
+/// [`JobSet::with_budget`](crate::jobs::runner::JobSet::with_budget)) —
+/// a budget only delays steps, never changes what they do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobConfig {
     /// How long the runner parks on the job's wake after an `Idle` step
@@ -337,6 +451,12 @@ struct JobCounters {
     wakeups: AtomicU64,
     errors: AtomicU64,
     items: AtomicU64,
+    /// §9.3 I/O budget: the work units the body charged (runner-driven or
+    /// hand-driven — the counter is the core's, the bucket is the
+    /// runner's).
+    units: AtomicU64,
+    throttle_waits: AtomicU64,
+    throttled_micros: AtomicU64,
 }
 
 /// A snapshot of one job's counters (diagnostic; the metric surface C-O3
@@ -349,6 +469,12 @@ pub struct JobStats {
     pub wakeups: u64,
     pub errors: u64,
     pub items: u64,
+    /// §9.3: units charged by this job's bodies.
+    pub units: u64,
+    /// §9.3: throttle pause slices taken (each ≤ 10 ms).
+    pub throttle_waits: u64,
+    /// §9.3: total time spent paused by throttling, in microseconds.
+    pub throttled_micros: u64,
 }
 
 /// The per-`Core` shared state of the job framework: one [`Wake`] per
@@ -411,7 +537,16 @@ impl JobsShared {
             wakeups: c.wakeups.load(Ordering::SeqCst),
             errors: c.errors.load(Ordering::SeqCst),
             items: c.items.load(Ordering::SeqCst),
+            units: c.units.load(Ordering::SeqCst),
+            throttle_waits: c.throttle_waits.load(Ordering::SeqCst),
+            throttled_micros: c.throttled_micros.load(Ordering::SeqCst),
         }
+    }
+
+    /// The `units` counter of one kind (the runner measures a step's
+    /// charge as the delta around the step).
+    pub(crate) fn job_units_now(&self, kind: JobKind) -> u64 {
+        self.counters[kind.index()].units.load(Ordering::SeqCst)
     }
 }
 
@@ -505,5 +640,29 @@ impl<K: nucleus_kv::OrderedKv> Core<K> {
         self.jobs.counters[kind.index()]
             .items
             .fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Adds `n` to the `units` counter of `kind`'s job (§9.3 I/O budget):
+    /// the job-body path of [`JobCtx::charge`], for bodies that hold the
+    /// core (the sweep, the GC job, drop cleanup) instead of a `JobCtx`.
+    pub(crate) fn job_units(&self, kind: JobKind, n: u64) {
+        self.jobs.counters[kind.index()]
+            .units
+            .fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// The `units` counter of `kind`'s job (the runner measures a step's
+    /// charge as the delta around the step; hand-driven callers charge the
+    /// same counter, unthrottled).
+    pub(crate) fn job_units_now(&self, kind: JobKind) -> u64 {
+        self.jobs.job_units_now(kind)
+    }
+
+    /// Counts `waits` throttle pause slices of `micros` microseconds for
+    /// `kind`'s job (§9.3; the runner is the only caller).
+    pub(crate) fn count_job_throttle(&self, kind: JobKind, waits: u64, micros: u64) {
+        let c = &self.jobs.counters[kind.index()];
+        c.throttle_waits.fetch_add(waits, Ordering::SeqCst);
+        c.throttled_micros.fetch_add(micros, Ordering::SeqCst);
     }
 }

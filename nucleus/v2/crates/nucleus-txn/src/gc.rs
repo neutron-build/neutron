@@ -13,13 +13,11 @@
 //!   streams (seed 33). It drops a version only when a newer version
 //!   `<= W` of the same logical key passed by earlier in the same stream;
 //!   the newest version `<= W` is never dropped, tombstone or not
-//!   (seed 3). `/sys/` keys are never dropped (§10). **The
-//!   `/sys/catalog/` carve-out of §10 (catalog rows are versioned,
-//!   GC-able data) is not implemented**: `TxnGcFilter` lives in
-//!   `gc/filter.rs`, which is outside card C-T5's Touch-only scope, so
-//!   the filter still keeps every `/sys/` key, including the catalog's —
-//!   catalog rows accumulate versions until the filter is extended (the
-//!   C-T5 escalation; see `catalog`'s module docs).
+//!   (seed 3). §10's scope is [`gc_scope`]: every `/sys/` key except the
+//!   catalog's is never dropped, even when its bytes match the
+//!   version-key pattern; the catalog (`/sys/catalog/`, versioned table
+//!   data since C-T5) is GC-able like any table — the C-B1c carve-out
+//!   the C-T5 card escalated.
 //! - [`GcJob::install`] wires the filter into the KV. The durable W it
 //!   hands out comes from `/sys/gc_w` itself (read through a registered
 //!   view), never from `registry.published_w()`: a `publish_computed_w`
@@ -37,10 +35,18 @@
 //!   durable `W` stays unchanged (seed 42), and every GC step — the
 //!   filter, `drop_tombstones`, `retire_storage` — acts on that durable
 //!   slot only.
-//! - [`GcJob::drop_tombstones`] removes each logical key's newest-`<= W`
-//!   tombstone or moved-tombstone `k@t` with `DeleteRange
+//! - [`GcJob::drop_tombstones_chunk`] (C-B1c) removes each logical key's
+//!   newest-`<= W` tombstone or moved-tombstone `k@t` with `DeleteRange
 //!   [version_key(k, t), end_key(k))`, start inclusive (seed 34), walking
-//!   the keyspace through one registered view. Intents are never touched.
+//!   the keyspace through one registered view per chunk, at most
+//!   `max_entries` stored entries at a time, ending only at a
+//!   logical-key boundary (the next chunk resumes at the next key's
+//!   `intent_key`). [`GcJob::drop_tombstones`] loops the chunks to the
+//!   end of the keyspace. The walk covers [`gc_scope`] — data keys plus
+//!   `/sys/catalog/` (§10), so dropped catalog rows lose their tombstones
+//!   instead of accumulating versions forever. Intents are never touched.
+//!   Each step charges the §9.3 I/O budget one unit per stored entry
+//!   scanned and one per `DeleteRange` written.
 //! - [`GcJob::retire_storage`] (§9.2) is gated on `durable W > retired_at`;
 //!   through one registered view it plans every intent removal — the
 //!   owner's status is looked up **inside the scan, while the view is
@@ -70,3 +76,14 @@ mod job;
 
 pub use filter::TxnGcFilter;
 pub use job::{spawn_gc, GcConfig, GcHandle, GcJob, GcRunner};
+
+/// §10's GC scope, one predicate for the compaction filter's
+/// `drop_key` and the tombstone pass: data keys (everything outside
+/// `/sys/`) plus the catalog (`/sys/catalog/`, the one `/sys/` family
+/// §10 makes versioned table data). Every other `/sys/` key — `/sys/txn`,
+/// `/sys/gc_w`, `/sys/ts_clock`, the id counters — is never dropped,
+/// even when its bytes match the version-key pattern (§10).
+pub(crate) fn gc_scope(key: &[u8]) -> bool {
+    !key.starts_with(crate::encoding::SYS_PREFIX)
+        || key.starts_with(crate::catalog::SYS_CATALOG_PREFIX)
+}

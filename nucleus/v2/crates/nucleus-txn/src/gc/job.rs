@@ -14,8 +14,8 @@ use nucleus_kv::{Batch, Durability, Key, OrderedKv};
 use crate::boot::Core;
 use crate::commit::{Clock, FailStop};
 use crate::encoding::{
-    decode_intent, decode_version, end_key, parse_key, sys_gc_w_key, version_key, Entry,
-    VersionValue, SYS_PREFIX,
+    decode_intent, decode_version, end_key, intent_key, parse_key, sys_gc_w_key, version_key,
+    Entry, VersionValue, SYS_PREFIX,
 };
 use crate::jobs::{Job, JobConfig, JobCtx, JobKind, JobOutcome, JobPoint, JobSet};
 use crate::kv_err;
@@ -23,6 +23,12 @@ use crate::removal::{remove_intent, RemovalMode};
 use crate::{Ts, TxnError, TxnId, TxnStatus};
 
 use super::filter::TxnGcFilter;
+use super::gc_scope;
+
+/// Stored entries one [`GcRunner`] tombstone-chunk scans per step (the
+/// §9.3 bounded steps; tests drive smaller chunks directly through
+/// [`GcJob::drop_tombstones_chunk`]).
+pub const DEFAULT_TOMBSTONE_CHUNK: usize = 1024;
 
 /// Job configuration: only the AS OF retention window so far (§9.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -177,68 +183,155 @@ impl<K: OrderedKv> GcJob<K> {
         Ok(floor)
     }
 
-    /// Removes newest-`<= W` tombstones (§9.2): through one registered view,
-    /// walk every data key (skipping `/sys/`); for each logical key `L`
-    /// whose newest version `<= W` (the durable W) is a tombstone or
-    /// moved-tombstone at `t`, write one `DeleteRange [version_key(L, t),
-    /// end_key(L))` — start inclusive (seed 34). Because versions sort
-    /// newest first, that range covers `L@t` and every older version of
-    /// `L`; intents sort before it and are never touched. Returns the
-    /// number of ranges written.
+    /// Removes newest-`<= W` tombstones (§9.2), chunked (C-B1c): this is
+    /// the loop to the end of the keyspace — [`GcJob::drop_tombstones_chunk`]
+    /// does one chunk at a time. Returns the number of ranges written.
     pub fn drop_tombstones(&self) -> Result<usize, TxnError> {
         let _serial = self.lock_step();
-        self.drop_tombstones_locked()
+        let mut total = 0usize;
+        let mut resume: Option<Key> = None;
+        loop {
+            let (n, next) = self.drop_tombstones_chunk_locked(resume, DEFAULT_TOMBSTONE_CHUNK)?;
+            total += n;
+            match next {
+                Some(k) => resume = Some(k),
+                None => return Ok(total),
+            }
+        }
     }
 
-    fn drop_tombstones_locked(&self) -> Result<usize, TxnError> {
+    /// One chunk of the §9.2 tombstone pass (C-B1c): through **one**
+    /// registered view, walk at most `max_entries` stored entries from
+    /// `resume` (`None` starts at the beginning); for each logical key `L`
+    /// in scope ([`gc_scope`]: data keys plus `/sys/catalog/`) whose
+    /// newest version `<= W` (the durable W, read once per chunk) is a
+    /// tombstone or moved-tombstone at `t`, write one
+    /// `DeleteRange [version_key(L, t), end_key(L))` — start inclusive
+    /// (seed 34). Because versions sort newest first, that range covers
+    /// `L@t` and every older version of `L`; intents sort before it and
+    /// are never touched.
+    ///
+    /// A chunk ends only at a **logical-key boundary**: if the entry
+    /// budget runs out mid-key, the walk continues through that key's
+    /// remaining versions, and the returned resume key is the next
+    /// logical key's `intent_key` — so no chunk ever re-decides a key
+    /// another chunk already handled, and no key straddles a chunk
+    /// undecided. Returns `(ranges written, the next chunk's resume)`;
+    /// `None` means the pass reached the end of the keyspace.
+    ///
+    /// Charges the §9.3 I/O budget one unit per stored entry scanned and
+    /// one per `DeleteRange` written.
+    pub fn drop_tombstones_chunk(
+        &self,
+        resume: Option<Key>,
+        max_entries: usize,
+    ) -> Result<(usize, Option<Key>), TxnError> {
+        let _serial = self.lock_step();
+        self.drop_tombstones_chunk_locked(resume, max_entries)
+    }
+
+    fn drop_tombstones_chunk_locked(
+        &self,
+        resume: Option<Key>,
+        max_entries: usize,
+    ) -> Result<(usize, Option<Key>), TxnError> {
+        // The durable W, read once per chunk (§9.1).
         let w = self.durable_w.load(Ordering::SeqCst);
         let view = self.core.open_view();
+        let lo = match &resume {
+            Some(k) => Bound::Excluded(k.as_slice()),
+            None => Bound::Unbounded,
+        };
         // The logical keys already decided (their newest version <= W seen),
         // so an older version of a decided key is skipped without a decode.
         let mut decided: Option<Key> = None;
         // Deterministic order (BTreeMap): the ranges go out in one batch.
         let mut targets: BTreeMap<Key, Ts> = BTreeMap::new();
-        for entry in view.scan(
-            (Bound::<&[u8]>::Unbounded, Bound::<&[u8]>::Unbounded),
-            false,
-        ) {
+        let mut scanned: u64 = 0;
+        // Set once `max_entries` stored entries have been consumed: the
+        // walk then stops at the next logical-key boundary (for a
+        // version entry, a different logical key; anything else is its
+        // own boundary), recording where the next chunk resumes.
+        let mut at_limit = false;
+        let mut limit_key: Option<Key> = None;
+        let mut next_resume: Option<Key> = None;
+        for entry in view.scan((lo, Bound::<&[u8]>::Unbounded), false) {
             let (stored, value) = entry.map_err(kv_err)?;
-            if stored.starts_with(SYS_PREFIX) {
-                continue;
-            }
-            let Some((l, Entry::Version(ts))) = parse_key(&stored) else {
-                continue; // intents (never touched), end keys, foreign layouts
+            let parsed = if gc_scope(&stored) {
+                parse_key(&stored)
+            } else {
+                None // a kept /sys/ key: its own boundary, never decoded
             };
-            if decided.as_deref() == Some(l) {
-                continue; // an older version of an already-decided key
+            if at_limit {
+                // Is this entry still inside the logical key the limit
+                // fell into? Only same-key versions continue the walk.
+                let same_key = match (&limit_key, &parsed) {
+                    (Some(l), Some((l2, Entry::Version(_)))) => l == l2,
+                    _ => false,
+                };
+                if !same_key {
+                    next_resume = Some(match parsed {
+                        Some((l2, _)) => intent_key(l2),
+                        None => stored.clone(),
+                    });
+                    break;
+                }
             }
-            if ts.0 > w {
-                continue; // newer than W: keep scanning L's older versions
+            scanned += 1;
+            if let Some((l, entry_kind)) = parsed {
+                match entry_kind {
+                    // Intents are never touched by the pass (§9.2; only
+                    // §7.3 removes them): skipped like a foreign entry,
+                    // and their own boundary.
+                    Entry::Intent => {}
+                    Entry::Version(ts) => {
+                        if decided.as_deref() == Some(l) {
+                            // an older version of an already-decided key
+                        } else if ts.0 > w {
+                            // newer than W: keep scanning L's older versions
+                        } else {
+                            // The first version of `l` with ts <= W in
+                            // ascending order is its newest version <= W.
+                            decided = Some(l.to_vec());
+                            if matches!(decode_version(&value)?, VersionValue::Tombstone { .. }) {
+                                targets.insert(l.to_vec(), ts);
+                            }
+                        }
+                    }
+                }
             }
-            // The first version of `l` with ts <= W in ascending order is
-            // its newest version <= W.
-            decided = Some(l.to_vec());
-            if matches!(decode_version(&value)?, VersionValue::Tombstone { .. }) {
-                targets.insert(l.to_vec(), ts);
+            if scanned >= max_entries as u64 {
+                at_limit = true;
+                // A version entry might have older versions following:
+                // remember which key we are inside so the boundary test
+                // can continue through them. Any other entry (intent,
+                // kept /sys/, foreign layout) is its own boundary.
+                limit_key = match parsed {
+                    Some((l, Entry::Version(_))) => Some(l.to_vec()),
+                    _ => None,
+                };
             }
         }
         drop(view);
+        self.core.job_units(JobKind::Gc, scanned);
         if targets.is_empty() {
-            return Ok(0);
+            return Ok((0, next_resume));
         }
         let mut batch = Batch::default();
         for (l, t) in &targets {
             batch.delete_range(version_key(l, *t), end_key(l));
         }
         self.core.write(batch, Durability::No)?;
-        // §9.3 probe: after the tombstone batch write (the registered view
+        // One unit per DeleteRange written, on top of the scan charge.
+        self.core.job_units(JobKind::Gc, targets.len() as u64);
+        // §9.3 probe: after the chunk's batch write (the registered view
         // is closed; only the step serialiser may be held).
         self.core.job_probe_at(JobPoint::GcAfterTombstones);
         let n = targets.len();
         if n > 0 {
             self.core.job_items(JobKind::Gc, n as u64);
         }
-        Ok(n)
+        Ok((n, next_resume))
     }
 
     /// §9.2 retired-storage cleanup. Returns `Ok(false)` and does nothing
@@ -296,8 +389,10 @@ impl<K: OrderedKv> GcJob<K> {
         }
         let view = self.core.open_view();
         let mut plan: Vec<PlannedRemoval> = Vec::new();
+        let mut scanned: u64 = 0;
         for entry in view.scan((Bound::Included(lo), Bound::Excluded(hi)), false) {
             let (stored, value) = entry.map_err(kv_err)?;
+            scanned += 1;
             let Some((l, Entry::Intent)) = parse_key(&stored) else {
                 continue;
             };
@@ -333,6 +428,13 @@ impl<K: OrderedKv> GcJob<K> {
             });
         }
         drop(view);
+        // §9.3 I/O budget: one unit per stored entry scanned (the intent
+        // plan) and one per planned removal (each writes a batch keyed on
+        // its intent). Charged to the drop-cleanup job — the only driver
+        // of retirement (C-B1b) — so its D4 budget pays for its own work
+        // (the card's "drop-cleanup intent plan" charge site).
+        self.core
+            .job_units(JobKind::DropCleanup, scanned + plan.len() as u64);
         for r in &plan {
             remove_intent(&self.core, &r.key, r.prefix.as_deref(), r.owner, r.mode)?;
         }
@@ -341,6 +443,9 @@ impl<K: OrderedKv> GcJob<K> {
         let mut batch = Batch::default();
         batch.delete_range(lo.to_vec(), hi.to_vec());
         self.core.write(batch, Durability::No)?;
+        // One unit per DeleteRange (§9.3 charge sites; the drop-cleanup
+        // job's budget, as above).
+        self.core.job_units(JobKind::DropCleanup, 1);
         // §9.3 probe (C-B1b): the range's DeleteRange batch is written
         // (the registered view is closed; only this job's step serialiser
         // may be held).
@@ -348,12 +453,20 @@ impl<K: OrderedKv> GcJob<K> {
         Ok(true)
     }
 
-    /// One GC round: `publish(now_secs)`, then `drop_tombstones`.
+    /// One GC round: `publish(now_secs)`, then `drop_tombstones` — the
+    /// whole tombstone pass, chunk by chunk, in one call (the recovery
+    /// harnesses' driver; the runner paces the pass one chunk per step).
     pub fn run_once(&self, now_secs: u64) -> Result<(), TxnError> {
         let _serial = self.lock_step();
         self.publish_locked(now_secs)?;
-        self.drop_tombstones_locked()?;
-        Ok(())
+        let mut resume: Option<Key> = None;
+        loop {
+            let (_, next) = self.drop_tombstones_chunk_locked(resume, DEFAULT_TOMBSTONE_CHUNK)?;
+            match next {
+                Some(k) => resume = Some(k),
+                None => return Ok(()),
+            }
+        }
     }
 
     fn lock_step(&self) -> MutexGuard<'_, ()> {
@@ -450,17 +563,37 @@ fn decode_secs(value: &[u8]) -> Result<u64, TxnError> {
     Ok(u64::from_be_bytes(b))
 }
 
-/// The GC job as a §9.3 background job: one `step` is one
-/// `GcJob::run_once` at the clock's now, always `Idle` (the runner paces
-/// it with the idle interval, as the old interval sleep did).
+/// The GC job as a §9.3 background job (C-B1c bounded steps): one `step`
+/// publishes once per full pass (the first step of each pass, so `/sys/gc_w`
+/// leads every pass) and then walks **one chunk**
+/// ([`DEFAULT_TOMBSTONE_CHUNK`] stored entries) of the §9.2 tombstone pass,
+/// holding the resume key between steps — `Progress` until the pass
+/// reaches the end of the keyspace, then `Idle` (the runner paces it with
+/// the idle interval, as the old interval sleep did).
 pub struct GcRunner<K: OrderedKv> {
     job: Arc<GcJob<K>>,
     clock: Arc<dyn Clock>,
+    /// The pass's chunk cursor: `None` before a pass starts (the next
+    /// step publishes first), `Some(resume)` between chunks.
+    resume: Option<Key>,
+    /// Stored entries one tombstone step scans.
+    chunk: usize,
 }
 
 impl<K: OrderedKv> GcRunner<K> {
     pub fn new(job: Arc<GcJob<K>>, clock: Arc<dyn Clock>) -> GcRunner<K> {
-        GcRunner { job, clock }
+        GcRunner {
+            job,
+            clock,
+            resume: None,
+            chunk: DEFAULT_TOMBSTONE_CHUNK,
+        }
+    }
+
+    /// Scans at most `chunk` stored entries per tombstone step (tests).
+    pub fn with_chunk(mut self, chunk: usize) -> GcRunner<K> {
+        self.chunk = chunk.max(1);
+        self
     }
 }
 
@@ -470,8 +603,19 @@ impl<K: OrderedKv> Job for GcRunner<K> {
     }
 
     fn step(&mut self, _cx: &JobCtx) -> Result<JobOutcome, TxnError> {
-        self.job.run_once(self.clock.now_secs())?;
-        Ok(JobOutcome::Idle)
+        if self.resume.is_none() {
+            self.job.publish(self.clock.now_secs())?;
+        }
+        let (_, next) = self
+            .job
+            .drop_tombstones_chunk(self.resume.take(), self.chunk)?;
+        match next {
+            Some(k) => {
+                self.resume = Some(k);
+                Ok(JobOutcome::Progress)
+            }
+            None => Ok(JobOutcome::Idle),
+        }
     }
 }
 
@@ -494,6 +638,8 @@ pub fn spawn_gc<K: OrderedKv>(
     // A spawn failure is recorded by `start` and reported to the very
     // hook passed above before the error returns; the handle below then
     // carries it out of `stop`, exactly as the pre-C-B1a wrapper did.
+    // The interval is the caller's; the §9.3 budget comes from the set's
+    // D4 default for the Gc kind.
     let _spawn_failed = set.start(
         Box::new(runner),
         JobConfig {

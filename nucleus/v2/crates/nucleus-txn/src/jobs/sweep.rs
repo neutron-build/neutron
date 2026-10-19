@@ -170,6 +170,11 @@ impl<K: OrderedKv> BootSweep<K> {
         // (§7.2), before the view drops and before any removal runs.
         self.resume = last;
         let exhausted = examined < self.chunk;
+        // §9.3 I/O budget: one unit per stored entry scanned (examined or
+        // skipped) — the walk's iterator work — and one per planned
+        // removal (each writes a §7.3 batch keyed on its intent).
+        self.core
+            .job_units(JobKind::BootSweep, examined as u64 + plan.len() as u64);
         for r in &plan {
             if let RemovalOutcome::Removed =
                 remove_intent(&self.core, &r.key, r.prefix.as_deref(), r.owner, r.mode)?
