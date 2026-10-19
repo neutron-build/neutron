@@ -26,6 +26,56 @@ fn first_line_of(path: &str) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Current load averages (1/5/15) as a JSON object, from /proc/loadavg.
+/// Kept separate from [`collect`] so the runner can take a second
+/// reading at results-write time (gate nv3-B-0-gate-1 finding 4).
+pub fn loadavg_value() -> Value {
+    let raw: Vec<String> = std::fs::read_to_string("/proc/loadavg")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    let field = |i: usize| -> Value {
+        raw.get(i)
+            .map(|s| Value::s(s))
+            .unwrap_or_else(|| Value::s("unknown"))
+    };
+    Value::obj(vec![
+        ("load1", field(0)),
+        ("load5", field(1)),
+        ("load15", field(2)),
+    ])
+}
+
+/// Live `nbench-*` user units (competing nbench activity on this host).
+/// A plain `systemctl --user` query — the card's environment note only
+/// ever wraps *podman* in systemd-run.
+fn nbench_units() -> String {
+    let out = run_capture(
+        "systemctl",
+        &[
+            "--user",
+            "list-units",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "nbench-*",
+        ],
+    );
+    if out == "unknown" {
+        return out;
+    }
+    let names: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+        .collect();
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(",")
+    }
+}
+
 /// Collect host facts into a JSON object.
 pub fn collect() -> Result<Value> {
     let mem_total = std::fs::read_to_string("/proc/meminfo")
@@ -48,6 +98,7 @@ pub fn collect() -> Result<Value> {
     let podman_version = crate::podman::podman(&["--version"])
         .map(|o| o.stdout.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
+    let load = loadavg_value();
     Ok(Value::obj(vec![
         (
             "hostname",
@@ -60,6 +111,27 @@ pub fn collect() -> Result<Value> {
         ("cpu_model", Value::s(&cpu_model())),
         ("cpus", Value::s(&nproc)),
         ("mem_total", Value::s(&mem_total)),
+        // load at row start; the results file also carries
+        // provenance.load_at_end (finding 4: co-tenant opacity)
+        (
+            "load1",
+            load.get("load1")
+                .cloned()
+                .unwrap_or_else(|| Value::s("unknown")),
+        ),
+        (
+            "load5",
+            load.get("load5")
+                .cloned()
+                .unwrap_or_else(|| Value::s("unknown")),
+        ),
+        (
+            "load15",
+            load.get("load15")
+                .cloned()
+                .unwrap_or_else(|| Value::s("unknown")),
+        ),
+        ("nbench_units_live", Value::s(&nbench_units())),
         ("root_fs", Value::s(&disk_free)),
         ("podman", Value::s(&podman_version)),
         (
@@ -95,6 +167,10 @@ mod tests {
             "cpu_model",
             "cpus",
             "mem_total",
+            "load1",
+            "load5",
+            "load15",
+            "nbench_units_live",
             "root_fs",
             "podman",
             "container_runtime_note",
@@ -102,5 +178,27 @@ mod tests {
             let val = v.get(key).and_then(Value::as_str).expect(key);
             assert!(!val.is_empty(), "{key} empty");
         }
+    }
+
+    #[test]
+    fn loadavg_shape_is_three_numbers() {
+        let v = loadavg_value();
+        for key in ["load1", "load5", "load15"] {
+            let s = v.get(key).and_then(Value::as_str).expect(key);
+            // on a live host each field parses as f64 ("unknown" only
+            // when /proc/loadavg is unreadable, which no Linux host is)
+            assert!(
+                s.parse::<f64>().is_ok(),
+                "{key} = {s:?} is not a load average"
+            );
+        }
+    }
+
+    #[test]
+    fn nbench_units_reports_none_without_live_units() {
+        // no nbench server is running during `cargo test`; if one is
+        // (parallel test run), the value is still a non-empty string
+        let units = nbench_units();
+        assert!(!units.is_empty());
     }
 }

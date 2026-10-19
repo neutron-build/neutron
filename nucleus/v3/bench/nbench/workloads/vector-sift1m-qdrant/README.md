@@ -7,8 +7,13 @@ ground truth, 128 dimensions, Euclidean distance.
 
 - Source: `http://ann-benchmarks.com/sift-128-euclidean.hdf5` — the file
   the ann-benchmarks project itself uses for this benchmark (fetched by
-  `vector-sift1m-qdrant/prepare.sh`, sha256 recorded into
-  `data/sift/sha256.txt`).
+  `vector-sift1m-qdrant/prepare.sh`).
+- The download is verified against a **pinned reference** sha256 + byte
+  size inside `prepare.sh` (not trust-on-first-use); the recorded
+  checksum also lands in `data/sift/sha256.txt`. The pin's provenance:
+  this file converts to exactly 1M base / 10k query vectors of dim 128,
+  and its loaded content is independently pinned by the committed
+  pgvector init digest (`vector-sift1m-pgvector/expected/init.txt`).
 - The texmex original (`ftp.irisa.fr`) is unreachable from this network;
   the ann-benchmarks hdf5 carries the same vectors and neighbors.
 - Conversion to fvecs/ivecs happens inside a throwaway container
@@ -22,12 +27,21 @@ ground truth, 128 dimensions, Euclidean distance.
 - One search pass = the full 10k query set, sequential (single client),
   k=10; recall@10 computed against the ground-truth top-10; QPS =
   queries / wall time.
+- Qdrant readiness is `status=green` **with all points present**. With
+  Qdrant's default optimizer policy, small tail segments legitimately
+  stay unindexed (exact-scanned) while the collection is green, so
+  `indexed_vectors_count == points_count` is not the readiness bar; the
+  indexed fraction is printed into the init log as provenance.
+- Overhead matching (gate nv3-B-0-gate-1 finding 5): the pgvector arm
+  times one psql session, so the Qdrant pass uses **one persistent
+  HTTP connection (keep-alive)** for all 10k queries — per-query TCP
+  setup is not part of either arm's measured time.
 - The full ann-benchmarks *framework* (Python harness with its own
   plotting/tuning loop) is not run; the dataset, parameters and metrics
   follow its protocol, implemented by `nbench vec-*` so digest checks and
   result recording stay inside this harness. Qdrant is driven over its
-  REST API; pgvector through a single psql session (per-query latencies
-  are therefore recorded for Qdrant only; QPS is the compared metric).
+  REST API; per-query latencies are recorded for Qdrant only, QPS is
+  the compared metric across both arms.
 - Load-path robustness: collection create/delete, point upserts and
   status polls are idempotent and re-sent with bounded backoff on
   transient transport failures (one dropped response at ~564k/1M points

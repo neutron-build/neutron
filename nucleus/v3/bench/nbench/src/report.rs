@@ -90,6 +90,20 @@ fn render_row(out: &mut String, v: &Value) -> Result<()> {
             "ok"
         }
     );
+    // Operator-recorded anomalies (co-tenant load, host incidents) are
+    // part of the evidence and must survive into the published report
+    // (gate nv3-B-0-gate-1 finding 4), never silently dropped.
+    let empty = Vec::new();
+    let anomalies = v.get("anomalies").and_then(Value::as_arr).unwrap_or(&empty);
+    if !anomalies.is_empty() {
+        let _ = writeln!(out, "Anomalies:\n");
+        for a in anomalies {
+            if let Some(s) = a.as_str() {
+                let _ = writeln!(out, "- {s}");
+            }
+        }
+        let _ = writeln!(out);
+    }
 
     // metric column order from the registry
     let metrics: Vec<&str> = row
@@ -337,6 +351,30 @@ mod tests {
         let files = vec![("x.json".to_string(), voided)];
         let md = generate("2026-10-17", &files).expect("report");
         assert!(md.contains("**VOID (digest mismatch)**"));
+    }
+
+    #[test]
+    fn anomalies_are_published_not_dropped() {
+        let mut with_anomalies = fixture_results();
+        if let Value::Obj(top) = &mut with_anomalies {
+            top.retain(|(k, _)| k != "anomalies");
+            top.push((
+                "anomalies".into(),
+                Value::Arr(vec![
+                    Value::s("co-tenant cargo build at 18:27, load1 ~22"),
+                    Value::s("gate smoke ran beside this row"),
+                ]),
+            ));
+        }
+        let files = vec![("a.json".to_string(), with_anomalies)];
+        let md = generate("2026-10-17", &files).expect("report");
+        assert!(md.contains("Anomalies:"));
+        assert!(md.contains("- co-tenant cargo build at 18:27, load1 ~22"));
+        assert!(md.contains("- gate smoke ran beside this row"));
+        // and a row without anomalies gets no empty section
+        let md2 =
+            generate("2026-10-17", &[("b.json".to_string(), fixture_results())]).expect("report2");
+        assert!(!md2.contains("Anomalies:"));
     }
 
     #[test]

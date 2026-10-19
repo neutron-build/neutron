@@ -15,6 +15,7 @@ plus the HNSW build memory knob:
 | `maintenance_work_mem` | 2 GB | pgvector README: "increasing maintenance_work_mem ... can improve HNSW index build performance" |
 | port | 5433 | coexists with postgres17 on the host network |
 | HNSW index | `m=16, ef_construction=200` | card B-0 Work item 3; pgvector README documents the parameters |
+| distance operator | index `vector_l2_ops`, queries `ORDER BY v <-> q` | pgvector README: the ORDER BY operator must belong to the index's operator class. SIFT1M truth is Euclidean, so the index is L2 and the search must use `<->` (`<=>` is cosine: unservable by an L2 index — 1M-row seq scan — and ranked in the wrong space; gate nv3-B-0-gate-1 defect 1) |
 
 No variants: durability is not swept for this row (read-mostly search
 workload; the index build runs with default durability).

@@ -5,7 +5,10 @@
 //!   derived from the row definition, the pinned image file and the run
 //!   parameters, all recorded in the results JSON (rule 6).
 //! - A strict digest mismatch marks the run VOID and stops measurement
-//!   (rule 4); the results file keeps the evidence.
+//!   (rule 4); the results file keeps the evidence. The decision lives
+//!   in [`crate::digest`] (compare → decide → [`apply_digest`]), each
+//!   step unit-tested, so the rule cannot silently invert (gate
+//!   nv3-B-0-gate-1 defect 3).
 //! - Warm runs are aggregated as median + 95% bootstrap CI (rule 5) with
 //!   the deterministic seed from [`crate::stats`].
 //! - Competitors run rootless under `--network host` with a named volume
@@ -13,6 +16,7 @@
 //!   server start uses a *named durability variant*, never an ad-hoc flag
 //!   (rule 3).
 
+use crate::digest;
 use crate::error::{Error, Result};
 use crate::host;
 use crate::json::{self, Value};
@@ -383,20 +387,17 @@ struct DigestCtx<'a> {
     system: &'a SystemDef,
     params: &'a Params,
     workdir: &'a Path,
-    tag_is_smoke: bool,
 }
 
-fn run_digest(
-    ctx: &DigestCtx<'_>,
-    phase: &str,
-    strict: bool,
-) -> Result<(String, Option<String>, bool)> {
+/// Run the digest script for one phase and return the measured digest.
+/// The expectation decision (record / match / mismatch-voids) is
+/// [`digest::decide`], applied by [`apply_digest`] — both unit-tested.
+fn run_digest(ctx: &DigestCtx<'_>, phase: &str) -> Result<String> {
     let root = ctx.root;
     let row = ctx.row;
     let system = ctx.system;
     let params = ctx.params;
     let workdir = ctx.workdir;
-    let tag_is_smoke = ctx.tag_is_smoke;
     let script = root.join("workloads").join(row.id).join("digest.sh");
     if !script.exists() {
         return Err(Error::Usage(format!(
@@ -446,45 +447,38 @@ fn run_digest(
             line: "digest script printed nothing".into(),
         });
     }
-    // Expected digests are per (workload, phase, smoke tag): the first run
-    // of a strict phase *records* the expectation (loudly), later runs
-    // compare against it (PLAN-v3 §5.2 rule 4). Smoke runs record into
-    // separate, transient files so a smoke digest can never become the
-    // production expectation.
-    let mut name = phase.to_string();
-    if tag_is_smoke {
-        name.push_str("-smoke");
+    // The expectation comparison, first-run recording and void decision
+    // live in `crate::digest` (unit-tested there; §5.2 rule 4 seam —
+    // gate nv3-B-0-gate-1 defect 3). This function only produces the
+    // measured value.
+    Ok(value)
+}
+
+/// Apply one digest decision to the run state: append the evidence
+/// record, set `voided` when a **strict** mismatch occurred (§5.2
+/// rule 4), and return whether the plan loop must stop.
+///
+/// Unit-tested here so the void/stop wiring — not just the comparison —
+/// is a tested seam (gate nv3-B-0-gate-1 defect 3, mutant M2).
+fn apply_digest(
+    digest_records: &mut Vec<(String, Value)>,
+    voided: &mut bool,
+    phase: &str,
+    value: &str,
+    decision: &digest::Decision,
+    strict: bool,
+) -> bool {
+    digest_records.push((phase.to_string(), decision.evidence(value)));
+    if decision.voids_run() && strict {
+        *voided = true;
+        return true;
     }
-    let expected_path = root
-        .join("workloads")
-        .join(row.id)
-        .join("expected")
-        .join(format!("{name}.txt"));
-    // A missing *or blank* expectation counts as not-yet-recorded: the
-    // first run records it, later runs compare (blanking a file is how a
-    // changed digest protocol re-records after a workload change).
-    let expected = std::fs::read_to_string(&expected_path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let matched = match &expected {
-        Some(exp) => exp == &value,
-        None => {
-            if strict {
-                if let Some(dir) = expected_path.parent() {
-                    std::fs::create_dir_all(dir).map_err(Error::Io)?;
-                }
-                std::fs::write(&expected_path, &value).map_err(Error::Io)?;
-                eprintln!(
-                    "RECORDED initial {phase} digest for {} -> {}",
-                    row.id,
-                    expected_path.display()
-                );
-            }
-            true
-        }
-    };
-    Ok((value, expected, matched))
+    if decision.voids_run() {
+        // non-strict phases (e.g. the pgbench final digest after a
+        // destructive benchmark) keep the evidence but not the veto
+        eprintln!("digest mismatch at {phase} (non-strict): recorded, run continues");
+    }
+    false
 }
 
 /// Aggregate warm runs into median + bootstrap CI per metric.
@@ -584,6 +578,12 @@ pub fn run_row(
     let workdir = root.join("work").join(&date).join(&work_name);
     std::fs::create_dir_all(&workdir).map_err(Error::Io)?;
 
+    // Host snapshot at row start: load average and live nbench units
+    // are part of the environment the numbers are produced in (§5.2
+    // rule 1; gate nv3-B-0-gate-1 finding 4). The results document
+    // pairs this with a second load reading taken at write time.
+    let host_at_start = host::collect()?;
+
     // Optional one-time workload preparation (client images, datasets).
     let prep = root.join("workloads").join(row.id).join("prepare.sh");
     if prep.exists() {
@@ -654,31 +654,24 @@ pub fn run_row(
                     system,
                     params,
                     workdir: &workdir,
-                    tag_is_smoke: smoke,
                 };
-                let (value, expected, matched) = run_digest(&digest_ctx, phase, strict)?;
-                digest_records.push((
-                    phase.to_string(),
-                    Value::obj(vec![
-                        ("value", Value::s(&value)),
-                        (
-                            "expected",
-                            match &expected {
-                                Some(e) => Value::s(e),
-                                None => Value::Null,
-                            },
-                        ),
-                        ("match", Value::Bool(matched)),
-                    ]),
-                ));
-                if strict && !matched {
-                    voided = true;
-                    let mismatch = Error::DigestMismatch {
+                let value = run_digest(&digest_ctx, phase)?;
+                let path = digest::expectation_path(root, row.id, phase, smoke);
+                let decision = digest::decide(&path, &value, strict)?;
+                if apply_digest(
+                    &mut digest_records,
+                    &mut voided,
+                    phase,
+                    &value,
+                    &decision,
+                    strict,
+                ) {
+                    let report = Error::DigestMismatch {
                         phase: phase.to_string(),
-                        expected: expected.clone().unwrap_or_default(),
+                        expected: decision.expected().unwrap_or_default(),
                         got: value.clone(),
                     };
-                    eprintln!("{mismatch} — run VOIDED");
+                    eprintln!("{report} — run VOIDED");
                     break;
                 }
             }
@@ -754,7 +747,28 @@ pub fn run_row(
     }
 
     let versions_path = workdir.join("versions.txt");
-    let versions = std::fs::read_to_string(&versions_path).unwrap_or_default();
+    // Rule 6 provenance is mandatory, not best-effort: a driver that
+    // fails to write versions.txt used to vanish silently into an empty
+    // string (gate nv3-B-0-gate-1 finding 8) — absence is now loud.
+    let versions = std::fs::read_to_string(&versions_path).map_err(|e| {
+        Error::Missing(format!(
+            "versions.txt not written by the driver ({}): {e} — \
+             every row's init mode must record tool versions (§5.2 rule 6)",
+            versions_path.display()
+        ))
+    })?;
+
+    // Anomalies are operator observations the harness cannot measure:
+    // co-tenant load spikes, gate activity on the shared host, known
+    // host incidents during the run (gate nv3-B-0-gate-1 finding 4).
+    // Supplied as `NB_ANOMALIES`, one entry per line or separated by ';'.
+    let anomalies: Vec<Value> = std::env::var("NB_ANOMALIES")
+        .unwrap_or_default()
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Value::s)
+        .collect();
 
     let digest_obj = {
         let mut fields = digest_records.clone();
@@ -779,7 +793,14 @@ pub fn run_row(
         (
             "provenance",
             Value::obj(vec![
-                ("host", host::collect()?),
+                ("host", host_at_start),
+                (
+                    // load at results-write time complements the start
+                    // snapshot: a row measured through a load spike is
+                    // visible as start/end disagreement (finding 4)
+                    "load_at_end",
+                    host::loadavg_value(),
+                ),
                 (
                     "images",
                     Value::Obj(vec![(system.name.to_string(), Value::s(&image))]),
@@ -797,6 +818,7 @@ pub fn run_row(
             ]),
         ),
         ("digest", digest_obj),
+        ("anomalies", Value::Arr(anomalies)),
         ("series", Value::Arr(series_out)),
     ]);
 
@@ -856,6 +878,69 @@ pub fn cleanup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_mismatch_voids_and_stops() {
+        // The §5.2 rule 4 wiring this rework exists for: a strict
+        // mismatch sets `voided`, records the evidence, and stops the
+        // plan loop (gate nv3-B-0-gate-1 defect 3, previously-uncaught
+        // mutant M2: inverting this decision passed every test).
+        let mut records = Vec::new();
+        let mut voided = false;
+        let decision = digest::Decision::Mismatch {
+            expected: "recorded".into(),
+            got: "measured".into(),
+        };
+        let stop = apply_digest(
+            &mut records,
+            &mut voided,
+            "init",
+            "measured",
+            &decision,
+            true,
+        );
+        assert!(stop, "a strict mismatch must stop the plan loop");
+        assert!(voided, "a strict mismatch must void the run");
+        assert_eq!(records.len(), 1);
+        let (phase, ev) = &records[0];
+        assert_eq!(phase, "init");
+        assert_eq!(ev.get("expected").and_then(Value::as_str), Some("recorded"));
+        assert_eq!(ev.get("value").and_then(Value::as_str), Some("measured"));
+        assert_eq!(ev.get("match").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn non_strict_mismatch_records_but_neither_voids_nor_stops() {
+        let mut records = Vec::new();
+        let mut voided = false;
+        let decision = digest::Decision::Mismatch {
+            expected: "e".into(),
+            got: "g".into(),
+        };
+        let stop = apply_digest(&mut records, &mut voided, "final", "g", &decision, false);
+        assert!(!stop);
+        assert!(!voided, "non-strict phases keep the evidence, not the veto");
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn match_and_first_run_continue_the_plan() {
+        for decision in [
+            digest::Decision::Match,
+            digest::Decision::FirstRun { recorded: true },
+            digest::Decision::FirstRun { recorded: false },
+        ] {
+            let mut records = Vec::new();
+            let mut voided = false;
+            let stop = apply_digest(&mut records, &mut voided, "init", "v", &decision, true);
+            assert!(!stop, "{decision:?} must not stop the loop");
+            assert!(!voided);
+            assert_eq!(
+                records[0].1.get("match").and_then(Value::as_bool),
+                Some(true)
+            );
+        }
+    }
 
     #[test]
     fn civil_dates_match_known_days() {

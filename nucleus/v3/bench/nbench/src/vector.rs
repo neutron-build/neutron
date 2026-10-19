@@ -303,10 +303,14 @@ pub fn qdrant_upload(
     Ok(())
 }
 
-/// Search one vector; returns ids in rank order.
-pub fn qdrant_search(
-    host: &str,
-    port: u16,
+/// Search one vector over an existing keep-alive connection; returns
+/// ids in rank order. Used for the timed search pass so the whole pass
+/// shares one socket (gate nv3-B-0-gate-1 finding 5: per-query TCP
+/// setup made the Qdrant and pgvector arms overhead-unmatched).
+/// Measurement requests never retry: a transport failure here fails
+/// the row instead of hiding inside a re-send.
+pub fn qdrant_search_on(
+    conn: &mut crate::http::Connection,
     collection: &str,
     vec: &[f32],
     limit: usize,
@@ -321,13 +325,10 @@ pub fn qdrant_search(
         ("with_payload", Value::Bool(false)),
         ("params", Value::obj(vec![("hnsw_ef", Value::n(ef as f64))])),
     ]))?;
-    let resp = http::request(
-        host,
-        port,
+    let resp = conn.request(
         "POST",
         &format!("/collections/{collection}/points/search"),
         body.as_bytes(),
-        Duration::from_secs(120),
     )?;
     if resp.status != 200 {
         return Err(Error::Command {
@@ -336,7 +337,12 @@ pub fn qdrant_search(
             stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
         });
     }
-    let text = String::from_utf8_lossy(&resp.body).to_string();
+    parse_search_hits(&resp.body)
+}
+
+/// Parse a search response body into id lists.
+fn parse_search_hits(body: &[u8]) -> Result<Vec<i64>> {
+    let text = String::from_utf8_lossy(body).to_string();
     let v = json::parse(&text)?;
     let arr = v
         .get("result")
@@ -417,6 +423,32 @@ pub fn qdrant_wait_green(
     }
 }
 
+/// Fetch the server's own version string from `GET /` (Qdrant reports
+/// `{"title":..., "version":"1.x.y", ...}`). Used by the qdrant driver
+/// to fill `versions.txt` (§5.2 rule 6; gate nv3-B-0-gate-1 finding 8:
+/// the row previously shipped without any recorded version).
+pub fn qdrant_version(host: &str, port: u16) -> Result<String> {
+    let resp = http::request(host, port, "GET", "/", b"", Duration::from_secs(30))?;
+    if resp.status != 200 {
+        return Err(Error::Command {
+            name: format!("qdrant version probe (HTTP {})", resp.status),
+            status: resp.status as i32,
+            stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
+        });
+    }
+    parse_version_body(&resp.body)
+}
+
+/// Extract `qdrant <version>` from a `GET /` response body.
+fn parse_version_body(body: &[u8]) -> Result<String> {
+    let v = json::parse(&String::from_utf8_lossy(body))?;
+    let version = v
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Missing("qdrant version field".into()))?;
+    Ok(format!("qdrant {version}"))
+}
+
 /// Point count (for digests).
 pub fn qdrant_count(host: &str, port: u16, collection: &str) -> Result<usize> {
     let resp = http::request(
@@ -468,6 +500,13 @@ pub fn emit_pg_copy(base: &[Vec<f32>], out: &mut dyn Write) -> Result<()> {
 
 /// Build the SQL for one search pass: SET ef, then one top-k SELECT per
 /// query vector, each printing a comma-joined id list.
+///
+/// The ORDER BY uses `<->` (pgvector's **L2** operator) because the
+/// index is built `vector_l2_ops` and the SIFT1M ground truth is
+/// Euclidean. Gate nv3-B-0-gate-1 defect 1: this emitted `<=>` (cosine)
+/// for two commits — an operator the L2 index cannot serve, forcing a
+/// 1M-row seq scan per query (ef_search a no-op) and ranking in the
+/// wrong space against Euclidean truth. A unit test pins the operator.
 pub fn emit_pg_search_sql(
     queries: &[Vec<f32>],
     ef: u64,
@@ -480,7 +519,7 @@ pub fn emit_pg_search_sql(
         writeln!(
             out,
             "SELECT string_agg(id::text, ',') FROM \
-             (SELECT id FROM items ORDER BY v <=> '[{}]'::vector LIMIT {k}) s;",
+             (SELECT id FROM items ORDER BY v <-> '[{}]'::vector LIMIT {k}) s;",
             coords.join(",")
         )
         .map_err(Error::Io)?;
@@ -706,7 +745,13 @@ mod tests {
         emit_pg_search_sql(&base, 64, 10, &mut sql).expect("sql");
         let sql_text = String::from_utf8(sql).expect("utf8");
         assert!(sql_text.starts_with("SET hnsw.ef_search = 64;\n"));
-        assert!(sql_text.contains("ORDER BY v <=> '[1,2.5]'::vector LIMIT 10"));
+        // The operator must be L2 (`<->`): it must match the
+        // vector_l2_ops HNSW index and the Euclidean ground truth.
+        // `<=>` (cosine) forces a seq scan and ranks in the wrong
+        // space (gate nv3-B-0-gate-1 defect 1).
+        assert!(sql_text.contains("ORDER BY v <-> '[1,2.5]'::vector LIMIT 10"));
+        assert!(!sql_text.contains("<=>"), "cosine operator must not appear");
+        assert!(sql_text.contains("ORDER BY v <-> '[-3,4]'::vector LIMIT 10"));
 
         let parsed = parse_pg_search_output("0,1\n1,0\n\n", 2).expect("ids");
         assert_eq!(parsed, vec![vec![0, 1], vec![1, 0]]);
@@ -736,5 +781,25 @@ mod tests {
         let bad = json::parse(r#"{"result":{"exact":true}}"#).expect("bad json");
         assert!(parse_count_response(&bad).is_err());
         assert!(parse_count_response(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn version_probe_parses_the_root_document() {
+        // Shape captured from the pinned qdrant image's GET / output.
+        let body =
+            br#"{"title":"qdrant - vector search engine","version":"1.15.1","commit":"abc"}"#;
+        assert_eq!(parse_version_body(body).expect("version"), "qdrant 1.15.1");
+        // a body without a version field is a loud error, never a guess
+        assert!(parse_version_body(br#"{"title":"x"}"#).is_err());
+        assert!(parse_version_body(b"not json").is_err());
+    }
+
+    #[test]
+    fn search_parses_hits_and_rejects_bad_bodies() {
+        let hits = br#"{"result":[{"id":7,"score":1.0},{"id":3,"score":0.9}],"status":"ok"}"#;
+        assert_eq!(parse_search_hits(hits).expect("ids"), vec![7i64, 3]);
+        assert!(parse_search_hits(br#"{"result":{}}"#).is_err());
+        assert!(parse_search_hits(br#"{"result":[{"score":1.0}]}"#).is_err());
+        assert!(parse_search_hits(b"garbage").is_err());
     }
 }

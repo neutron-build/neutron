@@ -12,7 +12,14 @@ that matter for the row are per-collection, set at load time:
 | HNSW `m` | 16 | card B-0 Work item 3; Qdrant docs "HNSW" (default m=16) |
 | HNSW `ef_construct` | 200 | card B-0 Work item 3 |
 | distance | Euclid | SIFT1M ground truth is L2; ann-benchmarks uses euclidean for this dataset |
-| upload | `wait=true`, wait for `status=green` and `indexed_vectors_count == points_count` | Qdrant REST docs; keeps background indexing out of the measured QPS |
+| upload | `wait=true`, wait for `status=green` with all points present | Qdrant REST docs; keeps background indexing out of the measured QPS |
+
+Readiness is green + `points_count == expected`. It is deliberately
+**not** `indexed_vectors_count == points_count`: under Qdrant's default
+optimizer policy small tail segments stay unindexed (they are
+exact-scanned) while the collection is green — the indexed fraction is
+printed into the row's init log as provenance instead of gating
+readiness.
 
 No variants (durability is not swept for the vector row).
 

@@ -11,6 +11,7 @@
 //! Invariant owned here: argument parsing never panics and every usage
 //! mistake prints the usage text with exit code 2.
 
+mod digest;
 mod error;
 mod host;
 mod http;
@@ -44,6 +45,7 @@ USAGE:
   nbench vec-qdrant-load   --base F --host H --port P [--collection C] [--m N] [--ef-construct N] [--batch N]
   nbench vec-qdrant-search --base F --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F]
   nbench vec-qdrant-digest --host H --port P [--collection C]
+  nbench vec-qdrant-version --host H --port P
   nbench vec-pg-copy       --base F
   nbench vec-pg-search     --container C --query F --truth F --ef N [--limit K] [--port P] [--metrics-out F]
 ";
@@ -177,12 +179,18 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let queries = vector::read_fvecs(&PathBuf::from(&query_path))?;
     let truth = vector::read_ivecs(&PathBuf::from(&truth_path))?;
 
+    // One persistent connection for the whole pass (gate nv3-B-0-gate-1
+    // finding 5): the pgvector arm times a single psql session, so
+    // paying TCP setup per query here made the arms overhead-unmatched.
+    // The connection is opened *before* the clock starts; a transport
+    // failure mid-pass fails the row (measurement requests never retry).
+    let mut conn = crate::http::Connection::connect(&host, port, Duration::from_secs(120))?;
     let mut results: Vec<Vec<i64>> = Vec::with_capacity(queries.len());
     let mut lat_ms: Vec<f64> = Vec::with_capacity(queries.len());
     let start = Instant::now();
     for q in &queries {
         let t0 = Instant::now();
-        let ids = vector::qdrant_search(&host, port, &collection, q, limit, ef)?;
+        let ids = vector::qdrant_search_on(&mut conn, &collection, q, limit, ef)?;
         lat_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         results.push(ids);
     }
@@ -197,6 +205,10 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
         ("p50_ms", Value::n(percentile_of(&lat_ms, 0.5))),
         ("p99_ms", Value::n(percentile_of(&lat_ms, 0.99))),
         ("ef_search", Value::n(ef as f64)),
+        (
+            "timing_note",
+            Value::s("one persistent connection (HTTP keep-alive) for the whole pass"),
+        ),
     ]);
     write_metrics_json(metrics_out.as_deref(), &v)?;
     eprintln!(
@@ -204,6 +216,15 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
         percentile_of(&lat_ms, 0.5),
         percentile_of(&lat_ms, 0.99)
     );
+    Ok(())
+}
+
+fn cmd_vec_qdrant_version(args: &[String]) -> Result<()> {
+    let host = required(args, "host")?;
+    let port: u16 = required(args, "port")?
+        .parse()
+        .map_err(|_| Error::Usage("bad port".into()))?;
+    println!("{}", vector::qdrant_version(&host, port)?);
     Ok(())
 }
 
@@ -487,6 +508,7 @@ fn main() {
         Some("vec-qdrant-load") => ok_or_print(cmd_vec_qdrant_load(&argv[1..])),
         Some("vec-qdrant-search") => ok_or_print(cmd_vec_qdrant_search(&argv[1..])),
         Some("vec-qdrant-digest") => ok_or_print(cmd_vec_qdrant_digest(&argv[1..])),
+        Some("vec-qdrant-version") => ok_or_print(cmd_vec_qdrant_version(&argv[1..])),
         Some("vec-pg-copy") => ok_or_print(cmd_vec_pg_copy(&argv[1..])),
         Some("vec-pg-search") => ok_or_print(cmd_vec_pg_search(&argv[1..])),
         _ => {

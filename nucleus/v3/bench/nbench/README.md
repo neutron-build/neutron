@@ -51,20 +51,47 @@ implement card B-0 Work item 3 exactly.
    final digest. Sequencing is unit-tested in `rows.rs`.
 3. Digest: `workloads/<row>/digest.sh` hashes a result set; the first
    run records the expectation, later runs must match or the row is
-   VOID (rule 4). Tools that self-report content digests (speedtest1
-   `--verify` Verification Hash) are additionally cross-checked
-   run-to-run.
+   VOID (rule 4). The expectation decision (record / match /
+   mismatch-voids) lives in `src/digest.rs` with unit tests on every
+   arm, including smoke/production expectation isolation. Tools that
+   self-report content digests (speedtest1 `--verify` Verification
+   Hash) are additionally cross-checked run-to-run.
 4. Stats: median + deterministic 95% bootstrap CI over the warm runs
    (rule 5), seeds derived from row+series+metric identities.
-5. Provenance: host, image digests, container limits, versions, params
-   all land in `results/<date>/<row>.json` (rules 1, 6).
+5. Provenance: host (including **load average at row start**, live
+   `nbench-*` units, and a second load reading at results-write time),
+   image digests, container limits, versions, params and operator
+   anomalies all land in `results/<date>/<row>.json` (rules 1, 6).
+   `versions.txt` is **mandatory**: a driver that fails to write it
+   fails the row loudly instead of shipping empty version provenance.
 6. Report: `REPORT.md` per date with ratios and §5.3 labels; Nucleus
-   columns are `n/a` until they exist.
+   columns are `n/a` until they exist. Anomalies are printed per row.
 
 Cold = first run after a container restart (fresh process, empty caches
 of the engine); warm = after warmup. The host page cache cannot be
 dropped without root; this is the honest cold available to rootless
 containers and is stated in the report.
+
+## Co-tenant policy (shared measurement host)
+
+The benchmark host (n5000) is shared with other card sessions, so
+ambient load is part of the environment and is recorded, not assumed
+away:
+
+- **Exclusivity among nbench rows:** one `nbench run` at a time on the
+  host. The runner records live `nbench-*` units at row start; a row
+  measured while another nbench server unit was active notes it in
+  `anomalies`.
+- **Ambient load:** load1/5/15 at row start and at results-write time
+  are in every results file. A row measured while load1 exceeded the
+  host's CPU count, or through any obvious load spike, is flagged —
+  set `NB_ANOMALIES` (entries separated by `;` or newlines) when
+  running the row, e.g.
+  `NB_ANOMALIES='co-tenant cargo test running 18:20-18:40, load1 ~22' nbench run <row>`.
+  Anomalies are published in the row's report section, never dropped.
+- **Comparing runs:** cross-date comparisons read the load fields
+  first; the 2026-10-18 gate found a 1.8x spread between identical
+  smoke runs that only co-tenant load explains.
 
 ## Competitors and licences
 
