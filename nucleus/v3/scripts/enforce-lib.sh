@@ -9,10 +9,15 @@ V3=nucleus/v3
 # vfield TEXT KEY: the value of the first `KEY: value` line.
 vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed 's/[[:space:]]*$//'; }
 
-# changed BASE HEAD [pathspec...]: changed paths, repository-relative.
+# changed BASE HEAD [pathspec...]: changed paths, repository-relative, each
+# NUL-terminated (read with `read -r -d ''`).
 # --no-renames: a rename must report its source path too, or moving a CORE file
 # out of a protected directory would look like an ordinary new file.
-changed() { local b=$1 h=$2; shift 2; git diff --no-renames --name-only "$b...$h" -- "$@"; }
+# -z: without it git C-quotes any path with a non-ASCII byte, `"`, `\` or a
+# control character ("nucleus/v3/docs/\303\251.md"), and a quoted path no
+# longer matches nucleus/v3/* -- docs/é.md would pass as an outside-v3 file.
+# core.quotePath=false is not enough: it still quotes `"`, `\` and controls.
+changed() { local b=$1 h=$2; shift 2; git diff -z --no-renames --name-only "$b...$h" -- "$@"; }
 
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
@@ -39,16 +44,16 @@ check_merge() {
   if [ "$vgate" = P ] && [ "$tier" != P ]; then errs+=("card needs a P gate; verdict tier is $tier"); fi
 
   # The verdict must be the last commit, cover the commit before it, and touch only itself.
-  local tipfiles reviewed
-  tipfiles=$(git diff-tree --no-commit-id --name-only -r "$head" -- ':/')
-  [ "$tipfiles" = "$own" ] || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: $(echo $tipfiles)")
+  local tipfiles=() reviewed
+  mapfile -d '' -t tipfiles < <(git diff-tree -z --no-commit-id --name-only -r "$head" -- ':/')
+  { [ ${#tipfiles[@]} -eq 1 ] && [ "${tipfiles[0]}" = "$own" ]; } || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: ${tipfiles[*]}")
   reviewed=$(git rev-parse -q --verify "$vcommit^{commit}" 2>/dev/null || true)
   [ -n "$reviewed" ] && [ "$reviewed" = "$(git rev-parse "$head^")" ] || errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
 
   # What the card changed, excluding its own verdict file.
   local f rel core_entries
   core_entries=$(git show "$base:$V3/CORE_PATHS" 2>/dev/null | core_entries)
-  while IFS= read -r f; do
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     [ "$f" = "$own" ] && continue
     case $f in

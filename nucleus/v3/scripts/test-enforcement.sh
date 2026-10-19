@@ -94,6 +94,21 @@ scratch; expect_no "docs/ change by a non-spec card is refused" mc D
 card E P spec; branch E nucleus/v3/docs/Y.md; verdict E P MERGE spec P
 scratch; expect_ok "docs/ change by a P spec card merges" mc E
 
+# Paths git would C-quote ("nucleus/v3/docs/\303\251.md") must not slip past the
+# nucleus/v3/ rules as outside-v3 files: non-ASCII, and `"`, which
+# core.quotePath=false would still quote.
+card DU P core; branch DU "nucleus/v3/docs/é.md"; verdict DU P MERGE core P
+scratch; expect_no "docs/é.md by a P core (non-spec) card is refused" mc DU
+card DQ P core; branch DQ 'nucleus/v3/docs/a"b.md'; verdict DQ P MERGE core P
+scratch; expect_no 'docs/a"b.md by a P core (non-spec) card is refused' mc DQ
+card EU P spec; branch EU "nucleus/v3/docs/é.md"; verdict EU P MERGE spec P
+scratch; expect_ok "docs/é.md by a P spec card merges" mc EU
+card SU S standard; branch SU "nucleus/v3/scripts/é.sh"; verdict SU S MERGE standard S
+scratch; expect_no "S verdict on CORE scripts/é.sh is refused" mc SU
+card AU S standard; branch AU "nucleus/v3/spikes/ü.txt"; verdict AU S MERGE standard S
+scratch; expect_ok "S card adding spikes/ü.txt merges (seen as inside nucleus/v3)" mc AU
+expect_ok "check-core-paths lists CORE scripts/é.sh" bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-SU | grep -qxF 'CORE scripts/é.sh (scripts/)'"
+
 card F S standard; branch F nucleus/v3/spikes/f.txt; verdict F S MERGE standard S "GATE EXIT=1"
 scratch; expect_no "Gate-exit GATE EXIT=1 is refused" mc F
 
@@ -220,6 +235,22 @@ sys.exit(0 if any("nucleus/v3/docs/README.md" in b for b in bad) else 1)
 P
 }
 expect_ok "runner: moving a protected file out of docs/ is a scope violation" rs
+git -C "$r" checkout -q nucleus/v3-scaffold
+# runner_protected BRANCH PATH: scope_violations flags PATH as protected (not merely
+# "outside Touch only") on BRANCH, with the worktree as it stands.
+runner_protected() { git -C "$r" checkout -q "$1" && PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$2" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), "nucleus/v3-scaffold", ["nucleus/v3/spikes/"])
+print(bad)
+sys.exit(0 if sys.argv[3] + " (protected)" in bad else 1)
+P
+}
+expect_ok "runner: committed nucleus/v3/docs/é.md is protected" runner_protected card/v3-DU "nucleus/v3/docs/é.md"
+expect_ok 'runner: committed nucleus/v3/docs/a"b.md is protected' runner_protected card/v3-DQ 'nucleus/v3/docs/a"b.md'
+git -C "$r" checkout -q card/v3-AU && echo x >"$v3/tools/ü.py"
+expect_ok "runner: untracked nucleus/v3/tools/ü.py is protected" runner_protected card/v3-AU "nucleus/v3/tools/ü.py"
+rm -f "$v3/tools/ü.py"
 git -C "$r" checkout -q nucleus/v3-scaffold
 
 # --- promote-pass -----------------------------------------------------------
