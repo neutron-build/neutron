@@ -128,9 +128,23 @@ def changed_files(wt, base):
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
 
-def scope_violations(wt, base, touch):
+def gate_verdict(wt, base, f, card_id, pre_head):
+    """True if f is this card's verdict file as the gate left it. The gate
+    commits verdicts/<ID>.md on the card branch between rounds, so a
+    base...HEAD diff shows it, and X-6's round-2 worker reverted it to clear
+    the scope check. A commit subject alone proves nothing (a worker can write
+    one), so the file must also be untouched since this run began (pre_head)."""
+    if f != f"nucleus/v3/verdicts/{card_id}.md" or f in changed_files(wt, pre_head):
+        return False
+    _, subject = run(["git", "log", "-1", "--format=%s", f"{base}..{pre_head}", "--", f], wt)
+    return subject.startswith(f"nucleus v3: {card_id} verdict ")
+
+
+def scope_violations(wt, base, touch, card_id=None, pre_head=None):
     bad = []
     for f in changed_files(wt, base):
+        if pre_head and gate_verdict(wt, base, f, card_id, pre_head):
+            continue
         if any(f.startswith(p) for p in PROTECTED):
             bad.append(f + " (protected)")
         elif not in_scope(f, touch):
@@ -213,6 +227,9 @@ def main():
     prompt = (CARDS / "WORKER-PROMPT.local.md").read_text()
     prompt += f"\n\nYour card is `nucleus/v3/cards/{card_path.name}`. Base branch: `{args.base}`. Begin.\n"
 
+    # Anything on the branch before the first attempt was not written by this run's worker.
+    _, pre_head = run(["git", "rev-parse", "HEAD"], wt)
+    pre_head = pre_head.strip()
     session = None
     result = {"pass": False, "attempts": 0, "in": 0, "out": 0, "reasoning": 0, "scope": "n/a", "seconds": 0}
     t0 = time.time()
@@ -267,7 +284,7 @@ def main():
             result["scope"] = "OUTSIDE"
             print(f"[{card_id}] worker committed outside its worktree; stopping:\n" + "\n".join(stray), flush=True)
             break
-        bad = scope_violations(wt, args.base, touch)
+        bad = scope_violations(wt, args.base, touch, card_id, pre_head)
         if bad:
             result["scope"] = "FAIL"
             failure = "Scope violations (revert them):\n" + "\n".join(bad)

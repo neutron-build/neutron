@@ -238,6 +238,46 @@ git -C "$r" checkout -q -B scratch/pass4 card/v3-BOOT~1
 promote4() { (cd "$v3" && NV3_CARDS="$qa" bash scripts/promote-pass.sh scratch/pass4); }
 expect_no "promote: a non-fast-forward is refused" promote4
 
+# --- runner: the gate's verdict commit on a card branch (X-6-F1) ------------
+# A gate commits verdicts/<ID>.md on the card branch between rework rounds; the
+# runner must not report it as the worker's, or the worker reverts it (X-6 N1).
+git -C "$r" checkout -q -B card/v3-RV nucleus/v3-scaffold
+echo rv >"$v3/spikes/rv.txt" && git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: RV work"
+verdict RV P REWORK core P
+gate=$(git -C "$r" rev-parse HEAD)
+# rv CARD PRE_HEAD FLAGGED...: scope_violations must flag exactly FLAGGED ("none" for nothing).
+rv() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$@" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), "nucleus/v3-scaffold", ["nucleus/v3/spikes/"], sys.argv[3], sys.argv[4])
+got = sorted(b.split(" (")[0] for b in bad)
+want = sorted(w for w in sys.argv[5:] if w != "none")
+print("flagged:", got, "expected:", want)
+sys.exit(0 if got == want else 1)
+P
+}
+vf=nucleus/v3/verdicts/RV.md
+# rvfrom SHA: a fresh worker round starting at SHA.
+rvfrom() { git -C "$r" checkout -q -B rvtmp "$1"; }
+rvfrom "$gate"; echo more >>"$v3/spikes/rv.txt"; git -C "$r" commit -qam "nucleus v3: RV rework"
+expect_ok "runner: the gate's REWORK verdict on the card branch is not a violation" rv RV "$gate" none
+expect_ok "runner: another card's verdict file is a violation" rv OTHER "$gate" "$vf"
+rvfrom "$gate"; echo edit >>"$r/$vf"
+expect_ok "runner: an uncommitted worker edit of the verdict is a violation" rv RV "$gate" "$vf"
+git -C "$r" checkout -q -- "$vf"
+rvfrom "$gate"; echo edit >>"$r/$vf"; git -C "$r" commit -qam "nucleus v3: RV rework"
+expect_ok "runner: a committed worker edit of the verdict is a violation" rv RV "$gate" "$vf"
+rvfrom "$gate"; echo forged >>"$r/$vf"; git -C "$r" commit -qam "nucleus v3: RV verdict MERGE"
+expect_ok "runner: a worker commit forging the verdict subject is a violation" rv RV "$gate" "$vf"
+rvfrom "$gate"; echo reverted >"$r/$vf"; git -C "$r" commit -qam "nucleus v3: RV revert protected file"
+expect_ok "runner: a verdict last changed by a worker before this run is a violation" rv RV "$(git -C "$r" rev-parse HEAD)" "$vf"
+rvfrom "$gate"; echo x >"$v3/tools/extra.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: RV tools"
+expect_ok "runner: a worker edit to another protected path is still a violation" rv RV "$gate" nucleus/v3/tools/extra.py
+rvfrom "$gate~1"; echo o >"$v3/verdicts/OTHER.md"; echo y >"$v3/tools/extra2.py"; echo g >"$r/$vf"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: RV verdict REWORK"
+expect_ok "runner: a verdict commit exempts only the card's own verdict file" rv RV "$(git -C "$r" rev-parse HEAD)" nucleus/v3/tools/extra2.py nucleus/v3/verdicts/OTHER.md
+git -C "$r" checkout -q nucleus/v3-scaffold
+
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
 exit $(( fails > 0 ))
