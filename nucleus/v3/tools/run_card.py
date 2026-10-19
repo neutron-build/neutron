@@ -128,6 +128,16 @@ def changed_files(wt, base):
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
 
+def changed_since(wt, rev, f):
+    """True unless f in the worktree is exactly as in rev's tree (committed,
+    staged, unstaged or untracked). Diffs rev itself, not a merge-base, so an
+    amend or rebase that drops rev's commits cannot hide the change; any git
+    error counts as changed."""
+    rc, diff = run(["git", "diff", "--no-renames", "--name-only", rev, "--", f], wt)
+    rc2, untracked = run(["git", "ls-files", "--others", "--", f], wt)
+    return bool(rc or rc2 or diff.strip() or untracked.strip())
+
+
 def gate_committed(wt, base, f, card_id, pre_head):
     """True if the last commit before this run (pre_head) to touch f is the
     gate's verdict commit for this card. A subject alone proves nothing (a
@@ -147,7 +157,7 @@ def scope_violations(wt, base, touch, card_id=None, pre_head=None):
     own = f"nucleus/v3/verdicts/{card_id}.md"
     exempt = False
     if pre_head and card_id and gate_committed(wt, base, own, card_id, pre_head):
-        exempt = own not in changed_files(wt, pre_head)
+        exempt = not changed_since(wt, pre_head, own)
         if not exempt and own not in files:
             # Deleting it, or restoring the base version, leaves no base...HEAD change.
             bad.append(own + " (protected)")
