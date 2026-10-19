@@ -144,6 +144,20 @@ scratch; expect_no "a late non-CORE commit after the verdict is refused" mc G2
 card G3 S standard; branch G3 nucleus/v3/spikes/g3.txt
 echo extra >>"$r/nucleus/v3/spikes/g3b.txt"; git -C "$r" add -A; verdict G3 S MERGE standard S
 scratch; expect_no "a verdict commit that also changes another file is refused" mc G3
+# G3's extra file sorts before verdicts/G3.md, so the tip check's "first file is
+# the verdict" test refuses it on its own. An extra file sorting after the
+# verdict leaves the verdict first; only the "exactly one file" count refuses it.
+# zz/ and é.txt (0xC3 > 'v') are non-CORE, so no other rule refuses these.
+# tip_first ID: the verdict file is the first path the tip commit changes.
+tip_first() { [ "$(git -C "$r" diff-tree -z --no-commit-id --name-only -r "card/v3-$1" -- ':/' | tr '\0' '\n' | head -1)" = "nucleus/v3/verdicts/$1.md" ]; }
+card G5 S standard; branch G5 nucleus/v3/spikes/g5.txt
+mkdir -p "$v3/zz" && echo extra >>"$v3/zz/x.txt"; git -C "$r" add -A; verdict G5 S MERGE standard S
+expect_ok "premise: G5's tip lists verdicts/G5.md before zz/x.txt" tip_first G5
+scratch; expect_no "a verdict commit that also changes a file sorting after it (zz/x.txt) is refused" mc G5
+card G5U S standard; branch G5U nucleus/v3/spikes/g5u.txt
+echo extra >>"$v3/é.txt"; git -C "$r" add -A; verdict G5U S MERGE standard S
+expect_ok "premise: G5U's tip lists verdicts/G5U.md before é.txt" tip_first G5U
+scratch; expect_no "a verdict commit that also changes a non-ASCII file sorting after it (é.txt) is refused" mc G5U
 # A verdict re-committed over a late change: the tip is again verdict-only (the
 # tip-files check passes), but its Commit still names the old reviewed commit,
 # not tip^. Only the Commit = tip^ check can refuse this.
