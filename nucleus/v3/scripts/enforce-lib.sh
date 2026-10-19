@@ -17,6 +17,8 @@ vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed '
 # control character ("nucleus/v3/docs/\303\251.md"), and a quoted path no
 # longer matches nucleus/v3/* -- docs/é.md would pass as an outside-v3 file.
 # core.quotePath=false is not enough: it still quotes `"`, `\` and controls.
+# Callers must check its exit status: a failed listing (a bad BASE) prints
+# nothing, and `done < <(changed ...)` would read that as "nothing changed".
 changed() { local b=$1 h=$2; shift 2; git diff -z --no-renames --name-only "$b...$h" -- "$@"; }
 
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
@@ -51,8 +53,12 @@ check_merge() {
   [ -n "$reviewed" ] && [ "$reviewed" = "$(git rev-parse "$head^")" ] || errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
 
   # What the card changed, excluding its own verdict file.
-  local f rel core_entries
+  local f rel core_entries lst
   core_entries=$(git show "$base:$V3/CORE_PATHS" 2>/dev/null | core_entries)
+  # Through a file: process substitution drops git's exit status, and NUL-
+  # separated paths cannot be held in a variable.
+  lst=$(mktemp) || { echo "cannot create a temporary file for the path list"; return 1; }
+  changed "$base" "$head" ':/' >"$lst" || errs+=("cannot list paths changed in $base...$head (git diff failed)")
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     [ "$f" = "$own" ] && continue
@@ -69,7 +75,8 @@ check_merge() {
       docs/*) { [ "$tier" = P ] && [ "$vclass" = spec ]; } || errs+=("$f: docs/ changes need Class: spec and a P verdict") ;;
     esac
     if [ "$tier" != P ] && is_core "$rel" "$core_entries" >/dev/null; then errs+=("$f is under CORE_PATHS and needs a P verdict"); fi
-  done < <(changed "$base" "$head" ':/')
+  done <"$lst"
+  rm -f "$lst"
 
   if [ "$mode" = merge ] && [ "$verdict" = MERGE-WITH-FOLLOWUPS ]; then
     local fl; fl=$(vfield "$v" Followups | tr ',' ' ')
