@@ -1,17 +1,25 @@
-//! `check.rs` (card X-0-F3): hand-built trees that pin the two holes in
-//! `BTree::check()` named by the X-0 verdict's finding 3. Before this
-//! card, child 0 of an inner page inherited `None` as its lower bound
-//! instead of the parent's `lo`, and separators were never checked
-//! against the bounds inherited from above — so `check()` was weaker
-//! than its own T-ORDER doc promise, and X-1a…X-5 (plus the X-0-F2
-//! fault oracle) could not lean on it alone.
+//! `check.rs` (cards X-0-F3 and X-0-F3-F1): hand-built trees that pin
+//! the bounds rules of `BTree::check()`. X-0-F3 covered the two holes
+//! named by the X-0 verdict's finding 3: before it, child 0 of an
+//! inner page inherited `None` as its lower bound instead of the
+//! parent's `lo`, and separators were never checked against the bounds
+//! inherited from above — so `check()` was weaker than its own T-ORDER
+//! doc promise, and X-1a…X-5 (plus the X-0-F2 fault oracle) could not
+//! lean on it alone. X-0-F3-F1 adds the two follow-ups the X-0-F3 gate
+//! verdict asked for (its findings 1–2, mutants G-SEP-LO-SKIPPED and
+//! G-LO-PRECEDENCE): the `sep < lo` half of the separator rule and the
+//! "later children take the previous separator" precedence each had no
+//! e0-btree suite pinning them.
 //!
 //! The trees are built directly with the pub `page` builders over a
 //! [`MemStore`] and opened with [`BTree::open`], so each test corrupts
 //! exactly one bound and cannot be masked by insert-path repair. Both
-//! corrupted trees are accepted by the pre-card `check()` (recorded in
-//! the card's RESULT block); each rejection below can therefore fail
-//! only through the rule this card adds.
+//! X-0-F3 corrupted trees are accepted by the pre-X-0-F3 `check()`
+//! (recorded in that card's RESULT block); each rejection below can
+//! therefore fail only through the rule that card adds. The two
+//! X-0-F3-F1 trees are likewise accepted under their respective mutant
+//! (measured by the X-0-F3 gate and re-measured in this card's RESULT
+//! block), so each pin is non-vacuous.
 
 use e0_btree::page::{self, PageKind};
 use e0_btree::{BTree, MemStore, PageId, PageStore, StoreError};
@@ -168,4 +176,121 @@ fn check_rejects_separator_outside_inherited_bounds() {
             "a_last={a_last}: unexpected message: {err}"
         );
     }
+}
+
+/// The X-0-F3 gate's probe tree for its finding 1 (mutant
+/// G-SEP-LO-SKIPPED, which drops only the `sep < lo` half of the
+/// separator rule): inner page B whose **cell-0** separator sits below
+/// B's inherited `lo`:
+///
+/// ```text
+/// root (bounds open):     cell (A, 100), right = B
+/// A (bounds (-inf, 100)): cell (leaf0, 50), right = leaf1
+/// B (bounds [100, +inf)): cell (leaf_e, 90), cell (leaf95, 200), right = leaf_r
+/// leaf0: 10, 20           window (-inf, 50)
+/// leaf1: 60, 70           window [50, 100)
+/// leaf_e: (empty)         window [100, 90) — inverted, but keyless
+/// leaf95: 95, 120         window [90, 200)
+/// leaf_r: 200, 300        window [200, +inf)
+/// ```
+///
+/// Every key fits the window the separators immediately around it
+/// describe, so no child-level rule can reject anything: with the
+/// `sep < lo` rule gone, child 0 is an *empty* leaf (nothing to compare
+/// against its inherited `lo` of 100) and key 95 in child 1 lies inside
+/// `[sep, hi) = [90, 200)` — a key routed below the subtree bound of
+/// 100. Only the separator rule itself catches the page, which is why
+/// it needs its own pin (card X-0-F3-F1 Work 1). The gate measured this
+/// exact tree as `Err("page PageId(6): separator at cell 0 below the
+/// subtree bound")` on the real code and `Ok(height 3, 8 pages)` under
+/// the mutant (allocation order below makes B `PageId(6)`, as in the
+/// verdict).
+fn separator_below_lo_tree() -> Result<BTree<MemStore>, StoreError> {
+    let store = MemStore::new(8192)?;
+    let leaf0 = build_leaf(&store, &[10, 20])?;
+    let leaf1 = build_leaf(&store, &[60, 70])?;
+    let leaf_e = build_leaf(&store, &[])?;
+    let leaf95 = build_leaf(&store, &[95, 120])?;
+    let leaf_r = build_leaf(&store, &[200, 300])?;
+    let a = build_inner(&store, &[leaf0], &[50], leaf1)?;
+    let b = build_inner(&store, &[leaf_e, leaf95], &[90, 200], leaf_r)?;
+    let root = build_inner(&store, &[a], &[100], b)?;
+    BTree::open(store, 16, root)
+}
+
+/// Pin 3 (X-0-F3 verdict finding 1, mutant G-SEP-LO-SKIPPED): a
+/// separator below its page's inherited lower bound must be rejected on
+/// its own merits. The damage of such a separator is *widening* — the
+/// child after it inherits a window reaching below `lo` — so the
+/// child-level key checks are exactly what it subverts and cannot be
+/// counted on to catch it (card X-0-F3-F1 Work 1; the empty child 0 and
+/// the key in `[sep, lo)` in child 1 leave the separator rule as the
+/// only possible rejection).
+#[test]
+fn check_rejects_separator_below_inherited_bound() {
+    let tree = separator_below_lo_tree().expect("corrupted tree still builds");
+    let err = tree
+        .check()
+        .expect_err("B's cell-0 separator 90 is below B's inherited bound 100");
+    assert!(
+        err.contains("separator at cell 0 below the subtree bound"),
+        "unexpected message: {err}"
+    );
+}
+
+/// The probe tree for the X-0-F3 gate's finding 2 (mutant
+/// G-LO-PRECEDENCE, `lo.or(prev_sep)`, which hands cells 1.. of a
+/// non-root inner page the page's own `lo` instead of the previous
+/// separator): a key in a non-first child of a **non-root** inner page,
+/// below that child's previous separator but at or above the page's own
+/// `lo`:
+///
+/// ```text
+/// root (bounds open):     cell (A, 100), right = B
+/// A (bounds (-inf, 100)): cell (leaf0, 50), right = leaf1
+/// B (bounds [100, +inf)): cell (leaf3, 200), cell (leaf3b, 300), right = leaf4
+/// leaf0: 10, 20           window (-inf, 50)
+/// leaf1: 60, 70           window [50, 100)
+/// leaf3: 100, 120         window [100, 200)   (child 0: B's `lo`)
+/// leaf3b: 150             window [200, 300)   (child 1: previous separator)
+/// leaf4: 300, 400         window [300, +inf)
+/// ```
+///
+/// Key 150 in leaf3b is below the previous separator 200 — rejected
+/// only because later children take `prev_sep` — yet at or above B's
+/// own `lo` of 100, so `lo.or(prev_sep)` accepts the whole tree. B has
+/// to be non-root for the two operands to differ (the root's `lo` is
+/// open, which is also why the `A` side of the tree can never catch
+/// this mutant); A exists to give B a set `lo` via the root separator
+/// (card X-0-F3-F1 Work 2).
+fn key_below_previous_separator_tree() -> Result<BTree<MemStore>, StoreError> {
+    let store = MemStore::new(8192)?;
+    let leaf0 = build_leaf(&store, &[10, 20])?;
+    let leaf1 = build_leaf(&store, &[60, 70])?;
+    let leaf3 = build_leaf(&store, &[100, 120])?;
+    let leaf3b = build_leaf(&store, &[150])?;
+    let leaf4 = build_leaf(&store, &[300, 400])?;
+    let a = build_inner(&store, &[leaf0], &[50], leaf1)?;
+    let b = build_inner(&store, &[leaf3, leaf3b], &[200, 300], leaf4)?;
+    let root = build_inner(&store, &[a], &[100], b)?;
+    BTree::open(store, 16, root)
+}
+
+/// Pin 4 (X-0-F3 verdict finding 2, mutant G-LO-PRECEDENCE): cells 1..
+/// of an inner page take the *previous separator* as their child's
+/// lower bound, not the page's inherited `lo` — the two differ exactly
+/// when the page is non-root, and this tree's key 150 sits in the gap
+/// between them (card X-0-F3-F1 Work 2). This pins the operand order of
+/// the `prev_sep.clone().or_else(|| lo.clone())` line against the
+/// `.or()`-slip edits that working next to it invites.
+#[test]
+fn check_rejects_key_below_previous_separator_in_inner_page() {
+    let tree = key_below_previous_separator_tree().expect("corrupted tree still builds");
+    let err = tree
+        .check()
+        .expect_err("key 150 in leaf3b is below its previous separator 200");
+    assert!(
+        err.contains("key below the subtree bound"),
+        "unexpected message: {err}"
+    );
 }
