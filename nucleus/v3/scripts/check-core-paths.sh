@@ -30,8 +30,13 @@ head=${2:?HEAD}
 entries=$(git show "$base:$v3/CORE_PATHS" 2>/dev/null | core_entries) || entries=$(core_entries <CORE_PATHS)
 # -z: git would C-quote a non-ASCII path ("nucleus/v3/docs/\303\251.md"), which
 # then fails the nucleus/v3/ prefix strip and every CORE_PATHS match.
+# Through a file, not `< <(git diff ...)`: process substitution drops git's exit
+# status, so a failed diff (a bad BASE) would list nothing and exit 0.
+lst=$(mktemp)
+trap 'rm -f "$lst"' EXIT
+git diff -z --no-renames --name-only "$base...$head" -- ":/$v3" >"$lst" || { echo "check-core-paths: git diff $base...$head failed" >&2; exit 1; }
 while IFS= read -r -d '' f; do
   [ -n "$f" ] || continue
   rel=${f#"$v3"/}
   if e=$(is_core "$rel" "$entries"); then echo "CORE $rel ($e)"; fi
-done < <(git diff -z --no-renames --name-only "$base...$head" -- ":/$v3")
+done <"$lst"

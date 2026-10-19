@@ -83,6 +83,12 @@ mc() { (cd "$v3" && bash scripts/merge-card.sh "$1"); }
 # --- merge-card -------------------------------------------------------------
 card A S standard; branch A nucleus/v3/spikes/a.txt; verdict A S MERGE standard S
 scratch; expect_ok "S card, S verdict, spikes only: merges" mc A
+# check_merge as audit-merges.sh calls it: a base git cannot diff against is
+# refused by the path listing's own exit status, not read as "no paths".
+cm() { (cd "$v3" && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge A "$1" card/v3-A audit); }
+cm_refused() { local o rc=0; o=$(cm "$1" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "cannot list paths changed in $1...card/v3-A" <<<"$o"; }
+expect_ok "check_merge: a bogus base is refused" cm_refused no-such-ref
+expect_ok "check_merge: the same call with base nucleus/v3-scaffold passes" cm nucleus/v3-scaffold
 
 card B S standard; branch B nucleus/v3/scripts/gate.sh; verdict B S MERGE standard S
 scratch; expect_no "S verdict on a CORE change (scripts/) is refused" mc B
@@ -108,6 +114,8 @@ scratch; expect_no "S verdict on CORE scripts/é.sh is refused" mc SU
 card AU S standard; branch AU "nucleus/v3/spikes/ü.txt"; verdict AU S MERGE standard S
 scratch; expect_ok "S card adding spikes/ü.txt merges (seen as inside nucleus/v3)" mc AU
 expect_ok "check-core-paths lists CORE scripts/é.sh" bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-SU | grep -qxF 'CORE scripts/é.sh (scripts/)'"
+# A base git cannot diff against must fail the listing, not list nothing (S-0-F2-F2).
+expect_no "check-core-paths: a bogus base exits non-zero" bash -c "cd '$v3' && bash scripts/check-core-paths.sh no-such-ref card/v3-SU"
 
 card F S standard; branch F nucleus/v3/spikes/f.txt; verdict F S MERGE standard S "GATE EXIT=1"
 scratch; expect_no "Gate-exit GATE EXIT=1 is refused" mc F
@@ -276,6 +284,20 @@ git -C "$r" checkout -q card/v3-AU && echo x >"$v3/tools/ü.py"
 expect_ok "runner: untracked nucleus/v3/tools/ü.py is protected" runner_protected card/v3-AU "nucleus/v3/tools/ü.py"
 rm -f "$v3/tools/ü.py"
 git -C "$r" checkout -q nucleus/v3-scaffold
+# rb BASE WANT: scope_violations on the clean scaffold checkout; WANT "git-fail"
+# expects a violation naming the failed git listing, "none" expects nothing.
+rb() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$@" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), sys.argv[3], ["nucleus/v3/spikes/"])
+print(bad)
+if sys.argv[4] == "none":
+    sys.exit(0 if bad == [] else 1)
+sys.exit(0 if any("git diff" in b and "failed (exit" in b and "cannot list changed files" in b for b in bad) else 1)
+P
+}
+expect_ok "runner: a bogus base is a scope violation" rb no-such-ref git-fail
+expect_ok "runner: the same call with base nucleus/v3-scaffold flags nothing" rb nucleus/v3-scaffold none
 
 # --- promote-pass -----------------------------------------------------------
 git -C "$r" checkout -q -B scratch/pass3 nucleus/v3-scaffold

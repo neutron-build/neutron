@@ -116,12 +116,18 @@ def in_scope(path, touch):
 
 def git_paths(args, wt):
     """NUL-separated git path output. Without -z git C-quotes non-ASCII paths
-    ("nucleus/v3/docs/\\303\\251.md"), which then match no PROTECTED prefix."""
-    p = subprocess.run(["git", args[0], "-z", *args[1:]], cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    ("nucleus/v3/docs/\\303\\251.md"), which then match no PROTECTED prefix.
+    A failed git raises CalledProcessError: an empty listing would read as
+    "nothing changed" and pass every scope rule."""
+    cmd = ["git", args[0], "-z", *args[1:]]
+    p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
     return [f for f in p.stdout.split("\0") if f]
 
 
 def changed_files(wt, base):
+    # Raises (from git_paths) if either listing fails; never a partial set.
     # --no-renames: a rename must report its source path, or a protected file
     # could be moved out of a protected directory unnoticed.
     files = set(git_paths(["diff", "--no-renames", "--name-only", f"{base}...HEAD"], wt))
@@ -155,7 +161,12 @@ def scope_violations(wt, base, touch, card_id=None, pre_head=None):
     this check. That one file is exempt while it is exactly as the gate left
     it at pre_head (HEAD before this run's first attempt)."""
     bad = []
-    files = changed_files(wt, base)
+    try:
+        files = changed_files(wt, base)
+    except subprocess.CalledProcessError as e:
+        # A check that cannot see the diff refuses (PLAN-v3 §7.6).
+        why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
+        return [f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot list changed files)"]
     own = f"nucleus/v3/verdicts/{card_id}.md"
     exempt = False
     if pre_head and card_id and gate_committed(wt, base, own, card_id, pre_head):
