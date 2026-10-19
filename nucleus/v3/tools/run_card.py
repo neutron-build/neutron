@@ -128,9 +128,42 @@ def changed_files(wt, base):
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
 
-def scope_violations(wt, base, touch):
+def changed_since(wt, rev, f):
+    """True unless f in the worktree is exactly as in rev's tree (committed,
+    staged, unstaged or untracked). Diffs rev itself, not a merge-base, so an
+    amend or rebase that drops rev's commits cannot hide the change; any git
+    error counts as changed."""
+    rc, diff = run(["git", "diff", "--no-renames", "--name-only", rev, "--", f], wt)
+    rc2, untracked = run(["git", "ls-files", "--others", "--", f], wt)
+    return bool(rc or rc2 or diff.strip() or untracked.strip())
+
+
+def gate_committed(wt, base, f, card_id, pre_head):
+    """True if the last commit before this run (pre_head) to touch f is the
+    gate's verdict commit for this card. A subject alone proves nothing (a
+    worker can write one), so the caller also requires f untouched since."""
+    _, subject = run(["git", "log", "-1", "--format=%s", f"{base}..{pre_head}", "--", f], wt)
+    return subject.startswith(f"nucleus v3: {card_id} verdict ")
+
+
+def scope_violations(wt, base, touch, card_id=None, pre_head=None):
+    """Changed files outside the card's Touch only, or in a protected path.
+    The gate commits verdicts/<ID>.md on the card branch between rounds, so a
+    base...HEAD diff shows it, and X-6's round-2 worker reverted it to clear
+    this check. That one file is exempt while it is exactly as the gate left
+    it at pre_head (HEAD before this run's first attempt)."""
     bad = []
-    for f in changed_files(wt, base):
+    files = changed_files(wt, base)
+    own = f"nucleus/v3/verdicts/{card_id}.md"
+    exempt = False
+    if pre_head and card_id and gate_committed(wt, base, own, card_id, pre_head):
+        exempt = not changed_since(wt, pre_head, own)
+        if not exempt and own not in files:
+            # Deleting it, or restoring the base version, leaves no base...HEAD change.
+            bad.append(own + " (protected)")
+    for f in files:
+        if f == own and exempt:
+            continue
         if any(f.startswith(p) for p in PROTECTED):
             bad.append(f + " (protected)")
         elif not in_scope(f, touch):
@@ -213,6 +246,9 @@ def main():
     prompt = (CARDS / "WORKER-PROMPT.local.md").read_text()
     prompt += f"\n\nYour card is `nucleus/v3/cards/{card_path.name}`. Base branch: `{args.base}`. Begin.\n"
 
+    # Anything on the branch before the first attempt was not written by this run's worker.
+    _, pre_head = run(["git", "rev-parse", "HEAD"], wt)
+    pre_head = pre_head.strip()
     session = None
     result = {"pass": False, "attempts": 0, "in": 0, "out": 0, "reasoning": 0, "scope": "n/a", "seconds": 0}
     t0 = time.time()
@@ -267,7 +303,7 @@ def main():
             result["scope"] = "OUTSIDE"
             print(f"[{card_id}] worker committed outside its worktree; stopping:\n" + "\n".join(stray), flush=True)
             break
-        bad = scope_violations(wt, args.base, touch)
+        bad = scope_violations(wt, args.base, touch, card_id, pre_head)
         if bad:
             result["scope"] = "FAIL"
             failure = "Scope violations (revert them):\n" + "\n".join(bad)
