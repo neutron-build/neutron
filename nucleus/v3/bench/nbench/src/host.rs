@@ -89,9 +89,10 @@ pub fn collect() -> Result<Value> {
             })
         })
         .unwrap_or_else(|| "unknown".into());
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get().to_string())
-        .unwrap_or_else(|_| "unknown".into());
+    // one source for the recorded provenance and the load-anomaly rule
+    // (rework round 4 item a): the rule must be re-derivable from the
+    // `cpus` field the results file already carries
+    let nproc = cpu_count().to_string();
     let disk_free = run_capture("df", &["-h", "--output=size,used,avail", "/"]);
     // The runtime version goes through the same wrapper as every other
     // podman call (uniform provenance; the wrapper needs no privileges).
@@ -141,6 +142,21 @@ pub fn collect() -> Result<Value> {
             ),
         ),
     ]))
+}
+
+/// Host CPU count — the same value recorded as the provenance `cpus`
+/// field.
+///
+/// The end-of-row load-anomaly rule (runner, escalation
+/// nv3-B-0-esc-1 / rework round 4 item a) compares `load1` against
+/// this count, so a reader can re-derive the rule from the results
+/// file's own provenance. Falls back to 1 — every reading then looks
+/// anomalous — if the platform refuses to answer: the check fails
+/// loud, it is never silently disabled.
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 fn cpu_model() -> String {

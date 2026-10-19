@@ -15,6 +15,11 @@
 //!   and recorded CPU/memory limits (rule 1, card Work item 2), and every
 //!   server start uses a *named durability variant*, never an ad-hoc flag
 //!   (rule 3).
+//! - Host contention is recorded *and* flagged: provenance carries the
+//!   load at row start and at results-write time, and an end-of-row
+//!   `load1` above the host CPU count — the same comparison the chain
+//!   scripts apply at row start — is appended to the row's anomalies
+//!   (§5.2 rule 1; escalation nv3-B-0-esc-1, rework round 4 item a).
 
 use crate::digest;
 use crate::error::{Error, Result};
@@ -551,6 +556,45 @@ fn parsed_to_metrics_value(p: &ParsedRun) -> Value {
     )
 }
 
+/// The end-of-row load rule (escalation nv3-B-0-esc-1, rework round 4
+/// item a): `load1` at results-write time strictly above the host CPU
+/// count — the same comparison the chain scripts apply at row start —
+/// means the row's numbers were produced on a host busier than its own
+/// CPU budget (§5.2 rule 1), and the row is flagged.
+///
+/// The note quotes the `load1` reading exactly as recorded in
+/// `provenance.load_at_end`, so the anomaly is re-derivable from the
+/// results file alone. An unreadable or unparseable reading produces
+/// no anomaly: nothing was measured, so nothing is claimed.
+fn end_load_anomaly(load_at_end: &Value, host_cpus: usize) -> Option<String> {
+    let raw = load_at_end.get("load1").and_then(Value::as_str)?;
+    let load1 = raw.parse::<f64>().ok()?;
+    (load1 > host_cpus as f64).then(|| {
+        format!("load1 {raw} exceeded {host_cpus} (host cpus) at row end (provenance.load_at_end)")
+    })
+}
+
+/// Build the row's anomaly list: the operator's `NB_ANOMALIES` notes
+/// (one entry per line or separated by `;`), in order, then the
+/// harness's own end-of-row load anomaly when [`end_load_anomaly`]
+/// fires.
+///
+/// Kept as a pure seam so the wiring — operator notes preserved AND
+/// the end check applied — is unit-tested: the round-3 gate showed an
+/// unwired check passes every test silently (mutant G4).
+fn final_anomalies(env_value: &str, load_at_end: &Value, host_cpus: usize) -> Vec<Value> {
+    let mut out: Vec<Value> = env_value
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Value::s)
+        .collect();
+    if let Some(note) = end_load_anomaly(load_at_end, host_cpus) {
+        out.push(Value::s(&note));
+    }
+    out
+}
+
 /// Run one row end to end.
 pub fn run_row(
     root: &Path,
@@ -761,14 +805,17 @@ pub fn run_row(
     // Anomalies are operator observations the harness cannot measure:
     // co-tenant load spikes, gate activity on the shared host, known
     // host incidents during the run (gate nv3-B-0-gate-1 finding 4).
-    // Supplied as `NB_ANOMALIES`, one entry per line or separated by ';'.
-    let anomalies: Vec<Value> = std::env::var("NB_ANOMALIES")
-        .unwrap_or_default()
-        .split(['\n', ';'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(Value::s)
-        .collect();
+    // Supplied as `NB_ANOMALIES`, one entry per line or separated by
+    // ';'. The harness adds its own end-of-row load observation
+    // (rework round 4 item a) from the same reading that lands in
+    // provenance.load_at_end below — one reading, two roles, so the
+    // anomaly note and the provenance can never disagree.
+    let load_at_end = host::loadavg_value();
+    let anomalies = final_anomalies(
+        &std::env::var("NB_ANOMALIES").unwrap_or_default(),
+        &load_at_end,
+        host::cpu_count(),
+    );
 
     let digest_obj = {
         let mut fields = digest_records.clone();
@@ -797,9 +844,11 @@ pub fn run_row(
                 (
                     // load at results-write time complements the start
                     // snapshot: a row measured through a load spike is
-                    // visible as start/end disagreement (finding 4)
+                    // visible as start/end disagreement (finding 4),
+                    // and feeds the end-of-row load anomaly (rework
+                    // round 4 item a)
                     "load_at_end",
-                    host::loadavg_value(),
+                    load_at_end.clone(),
                 ),
                 (
                     "images",
@@ -940,6 +989,58 @@ mod tests {
                 Some(true)
             );
         }
+    }
+
+    #[test]
+    fn end_load_rule_fires_only_above_host_cpus() {
+        // Round 4 item (a): the same rule the chain scripts apply at
+        // row start — load1 strictly above the host CPU count — applied
+        // by the runner when the row finishes. The note must quote the
+        // reading exactly as provenance.load_at_end records it.
+        let load = |l1: &str| {
+            Value::obj(vec![
+                ("load1", Value::s(l1)),
+                ("load5", Value::s("1.00")),
+                ("load15", Value::s("1.00")),
+            ])
+        };
+        assert_eq!(
+            end_load_anomaly(&load("74.30"), 16),
+            Some(
+                "load1 74.30 exceeded 16 (host cpus) at row end (provenance.load_at_end)"
+                    .to_string()
+            )
+        );
+        // quiet host: nothing to flag
+        assert_eq!(end_load_anomaly(&load("2.92"), 16), None);
+        // exactly at the CPU count is not "exceeded" (strict rule)
+        assert_eq!(end_load_anomaly(&load("16.00"), 16), None);
+        // an unmeasured reading claims nothing
+        assert_eq!(end_load_anomaly(&load("unknown"), 16), None);
+    }
+
+    #[test]
+    fn final_anomalies_keep_operator_notes_and_apply_the_end_check() {
+        // The wiring seam (round-3 mutant G4 lesson: an unwired check
+        // passed 92/92): operator notes survive in order AND the
+        // end-of-row load anomaly lands as the last entry.
+        let high = Value::obj(vec![("load1", Value::s("67.92"))]);
+        let v = final_anomalies("co-tenant gate build at 09:20\nsecond note; ", &high, 16);
+        assert_eq!(v.len(), 3, "two notes plus the end-load anomaly");
+        assert_eq!(v[0].as_str(), Some("co-tenant gate build at 09:20"));
+        assert_eq!(v[1].as_str(), Some("second note"));
+        let note = v[2].as_str().expect("end-load anomaly appended");
+        assert!(
+            note.starts_with("load1 67.92 exceeded 16 (host cpus)"),
+            "note quotes the recorded reading and the rule: {note}"
+        );
+        // a quiet host keeps exactly the operator's notes
+        let quiet = Value::obj(vec![("load1", Value::s("1.06"))]);
+        assert!(final_anomalies("", &quiet, 16).is_empty());
+        assert_eq!(
+            final_anomalies("single note", &quiet, 16),
+            vec![Value::s("single note")]
+        );
     }
 
     #[test]
