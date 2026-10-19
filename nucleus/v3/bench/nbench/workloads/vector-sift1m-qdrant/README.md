@@ -36,6 +36,14 @@ ground truth, 128 dimensions, Euclidean distance.
   times one psql session, so the Qdrant pass uses **one persistent
   HTTP connection (keep-alive)** for all 10k queries — per-query TCP
   setup is not part of either arm's measured time.
+- Transport hygiene (gate verdict ddb00ba5 defect 1): each request on
+  that connection is **one buffered write** on a `TCP_NODELAY` socket.
+  Written as head + body writes, the head becomes its own small TCP
+  segment and Nagle's algorithm holds the body until the peer's delayed
+  ACK — measured at ~40 ms per query (p50 44.07 ms, 22.47 qps) while
+  single-write probes of the same collection returned in 1.6–1.9 ms.
+  A per-query **p50 sanity limit of 10 ms** fails the row loudly if a
+  pass ever regresses into that regime again.
 - The full ann-benchmarks *framework* (Python harness with its own
   plotting/tuning loop) is not run; the dataset, parameters and metrics
   follow its protocol, implemented by `nbench vec-*` so digest checks and

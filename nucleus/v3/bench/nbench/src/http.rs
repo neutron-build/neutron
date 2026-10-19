@@ -1,10 +1,21 @@
 //! Minimal HTTP/1.1 client for localhost JSON APIs (Qdrant REST).
 //!
-//! Invariant owned here: no TLS, no redirects, no compression — only what
+//! Invariants owned here: no TLS, no redirects, no compression — only what
 //! a same-host Qdrant needs. Response bodies may be length-delimited,
 //! connection-close delimited or chunked; all three are decoded, and a
 //! truncated response is an error (never a short silent body, which would
 //! corrupt vector-search results).
+//!
+//! Transport hygiene (gate verdict ddb00ba5 defect 1): every request
+//! leaves the client as **one** `write_all` on a socket with
+//! `TCP_NODELAY` set. Written as a head write plus a body write, the
+//! ~130-byte head becomes its own small TCP segment and Nagle's algorithm
+//! holds the body's segment until the peer's delayed ACK of the head —
+//! measured at ~40 ms per search query against Qdrant (pass p50
+//! 44.07 ms → 22.47 qps) while single-write probes of the same running
+//! collection returned in 1.6–1.9 ms. Both halves are pinned by unit
+//! tests: [`write_request`] is one write containing head and body, and
+//! [`Connection::connect`] sets `TCP_NODELAY`.
 
 use crate::error::{Error, Result};
 use std::io::{Read, Write};
@@ -63,6 +74,24 @@ fn parse_head(head_text: &str) -> Result<(u16, Framing)> {
     Ok((status, framing))
 }
 
+/// Serialize and send one full request — head plus body — as a single
+/// `write_all` call.
+///
+/// Invariant owned here (gate verdict ddb00ba5 defect 1): the request
+/// must reach the kernel as one buffered write. Two separate writes make
+/// the head its own small TCP segment; Nagle's algorithm (on by default)
+/// then delays the body's segment until the peer's delayed ACK of the
+/// head, stalling every request by a delayed-ACK interval (~40 ms
+/// observed against Qdrant; see the module docs). Pinned by
+/// `write_request_is_a_single_write_containing_head_and_body`, which
+/// counts the write calls.
+fn write_request<W: Write + ?Sized>(w: &mut W, head: &str, body: &[u8]) -> Result<()> {
+    let mut buf = Vec::with_capacity(head.len() + body.len());
+    buf.extend_from_slice(head.as_bytes());
+    buf.extend_from_slice(body);
+    w.write_all(&buf).map_err(Error::Io)
+}
+
 /// Perform one request. `body` may be empty for GET.
 pub fn request(
     host: &str,
@@ -75,15 +104,16 @@ pub fn request(
     let mut stream = TcpStream::connect((host, port)).map_err(Error::Io)?;
     stream.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
     stream.set_write_timeout(Some(timeout)).map_err(Error::Io)?;
+    // No delayed-ACK stalls on this (untimed, load-path) socket either;
+    // see the module docs for why nodelay plus one write is the rule.
+    stream.set_nodelay(true).map_err(Error::Io)?;
 
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\
          Content-Length: {}\r\nContent-Type: application/json\r\nAccept: */*\r\n\r\n",
         body.len()
     );
-    stream.write_all(head.as_bytes()).map_err(Error::Io)?;
-    stream.write_all(body).map_err(Error::Io)?;
-    stream.flush().map_err(Error::Io)?;
+    write_request(&mut stream, &head, body)?;
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).map_err(Error::Io)?;
@@ -140,10 +170,17 @@ pub struct Connection {
 
 impl Connection {
     /// Open a keep-alive connection.
+    ///
+    /// The socket is opened with `TCP_NODELAY`: this connection carries
+    /// the timed Qdrant search pass, and Nagle's small-segment hold-up
+    /// combined with the peer's delayed ACK measured ~40 ms per query
+    /// (verdict ddb00ba5 defect 1). Pinned by
+    /// `keepalive_socket_disables_nagle`.
     pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Connection> {
         let stream = TcpStream::connect((host, port)).map_err(Error::Io)?;
         stream.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
         stream.set_write_timeout(Some(timeout)).map_err(Error::Io)?;
+        stream.set_nodelay(true).map_err(Error::Io)?;
         Ok(Connection {
             stream,
             host: host.to_string(),
@@ -169,9 +206,10 @@ impl Connection {
             self.port,
             body.len()
         );
-        self.stream.write_all(head.as_bytes()).map_err(Error::Io)?;
-        self.stream.write_all(body).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
+        // One write, not head-then-body: two writes put the head in its
+        // own small segment and Nagle delays the body until the peer's
+        // delayed ACK (verdict ddb00ba5 defect 1; see module docs).
+        write_request(&mut self.stream, &head, body)?;
 
         let mut buf = std::mem::take(&mut self.pending);
         // Read until one complete response frame sits in `buf`.
@@ -347,6 +385,80 @@ mod tests {
         assert_eq!(find_subsequence(b"abc\r\n\r\ndef", b"\r\n\r\n"), Some(3));
         assert_eq!(find_subsequence(b"abc", b"\r\n\r\n"), None);
         assert_eq!(find_subsequence(b"abc", b""), None);
+    }
+
+    /// A `Write` sink that records every write call, so tests can pin
+    /// *how many* writes a request leaves in (verdict ddb00ba5 defect 1
+    /// is precisely a two-write bug that no byte-equality test sees).
+    struct CountingWriter {
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl CountingWriter {
+        fn new() -> Self {
+            CountingWriter { calls: Vec::new() }
+        }
+        /// The whole request as the peer would reassemble it.
+        fn joined(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for c in &self.calls {
+                out.extend_from_slice(c);
+            }
+            out
+        }
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_request_is_a_single_write_containing_head_and_body() {
+        // Verdict ddb00ba5 defect 1: the request head and body must be
+        // one write. Two writes made the head its own small TCP segment
+        // and Nagle + delayed-ACK stalled every Qdrant query ~40 ms
+        // (p50 44.07 ms → 22.47 qps; single-write probes 1.6–1.9 ms).
+        // Byte equality alone cannot tell one write from two — the call
+        // count is the assertion.
+        let mut w = CountingWriter::new();
+        let head = "POST /collections/nbench-sift/points/search HTTP/1.1\r\n\
+                    Host: 127.0.0.1:6333\r\nConnection: keep-alive\r\n\
+                    Content-Length: 7\r\n\r\n";
+        write_request(&mut w, head, b"{\"q\":1}").expect("write");
+        assert_eq!(w.calls.len(), 1, "request must be exactly one write");
+        let joined = w.joined();
+        assert!(joined.starts_with(b"POST /collections/nbench-sift/points/search"));
+        assert!(joined.ends_with(b"\r\n\r\n{\"q\":1}"));
+        // and the empty-body case is still one write
+        let mut w2 = CountingWriter::new();
+        write_request(&mut w2, "GET / HTTP/1.1\r\n\r\n", b"").expect("write");
+        assert_eq!(w2.calls.len(), 1);
+    }
+
+    #[test]
+    fn keepalive_socket_disables_nagle() {
+        // The timed search pass runs on this socket; TCP_NODELAY is half
+        // of the defect-1 fix (the single write in `write_request` is
+        // the other half). `nodelay()` reads the option back from the
+        // client's own socket, so the pin is exact. A real listener
+        // makes connect() succeed deterministically.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let conn = Connection::connect("127.0.0.1", port, Duration::from_secs(5))
+            .expect("connect against live listener");
+        assert!(
+            conn.stream.nodelay().expect("nodelay readable"),
+            "keep-alive socket must set TCP_NODELAY"
+        );
     }
 
     #[test]

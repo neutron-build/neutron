@@ -198,22 +198,30 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let qps = queries.len() as f64 / wall;
     let recall = vector::recall_at_k(&results, &truth, limit)?;
     lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = percentile_of(&lat_ms, 0.5);
+    // Verdict ddb00ba5 defect 1: a per-query p50 in the tens of
+    // milliseconds means the pass measured TCP mechanics (Nagle +
+    // delayed-ACK), not Qdrant. Fail the row loudly; never record those
+    // numbers. NaN (broken measurement) is rejected by the same check.
+    vector::qdrant_latency_sanity(p50)?;
     let v = Value::obj(vec![
         ("qps", Value::n(qps)),
         ("recall_at_10", Value::n(recall)),
         ("queries", Value::n(queries.len() as f64)),
-        ("p50_ms", Value::n(percentile_of(&lat_ms, 0.5))),
+        ("p50_ms", Value::n(p50)),
         ("p99_ms", Value::n(percentile_of(&lat_ms, 0.99))),
         ("ef_search", Value::n(ef as f64)),
         (
             "timing_note",
-            Value::s("one persistent connection (HTTP keep-alive) for the whole pass"),
+            Value::s(
+                "one persistent connection (HTTP keep-alive, TCP_NODELAY, single write \
+                 per request) for the whole pass; p50 sanity-checked at 10 ms",
+            ),
         ),
     ]);
     write_metrics_json(metrics_out.as_deref(), &v)?;
     eprintln!(
-        "ef={ef}: qps={qps:.1} recall@{limit}={recall:.4} p50={:.3}ms p99={:.3}ms",
-        percentile_of(&lat_ms, 0.5),
+        "ef={ef}: qps={qps:.1} recall@{limit}={recall:.4} p50={p50:.3}ms p99={:.3}ms",
         percentile_of(&lat_ms, 0.99)
     );
     Ok(())
