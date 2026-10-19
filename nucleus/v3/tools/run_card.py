@@ -114,17 +114,19 @@ def in_scope(path, touch):
     return any(fnmatch.fnmatch(path, pat) or path.startswith(pat.rstrip("*")) for pat in touch)
 
 
+def git_paths(args, wt):
+    """NUL-separated git path output. Without -z git C-quotes non-ASCII paths
+    ("nucleus/v3/docs/\\303\\251.md"), which then match no PROTECTED prefix."""
+    p = subprocess.run(["git", args[0], "-z", *args[1:]], cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    return [f for f in p.stdout.split("\0") if f]
+
+
 def changed_files(wt, base):
     # --no-renames: a rename must report its source path, or a protected file
     # could be moved out of a protected directory unnoticed.
-    _, committed = run(["git", "diff", "--no-renames", "--name-only", f"{base}...HEAD"], wt)
-    _, out = run("git status --porcelain --no-renames --untracked-files=all", wt)
-    files = set(committed.split())
-    for line in out.splitlines():
-        f = line[3:].strip().strip('"')
-        if " -> " in f:
-            f = f.split(" -> ")[1]
-        files.add(f)
+    files = set(git_paths(["diff", "--no-renames", "--name-only", f"{base}...HEAD"], wt))
+    # Porcelain -z entries are "XY <path>"; --no-renames means no "orig path" entries.
+    files.update(e[3:] for e in git_paths(["status", "--porcelain", "--no-renames", "--untracked-files=all"], wt))
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
 

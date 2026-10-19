@@ -28,8 +28,10 @@ fi
 base=${1:?BASE}
 head=${2:?HEAD}
 entries=$(git show "$base:$v3/CORE_PATHS" 2>/dev/null | core_entries) || entries=$(core_entries <CORE_PATHS)
-while IFS= read -r f; do
+# -z: git would C-quote a non-ASCII path ("nucleus/v3/docs/\303\251.md"), which
+# then fails the nucleus/v3/ prefix strip and every CORE_PATHS match.
+while IFS= read -r -d '' f; do
   [ -n "$f" ] || continue
   rel=${f#"$v3"/}
   if e=$(is_core "$rel" "$entries"); then echo "CORE $rel ($e)"; fi
-done < <(git diff --no-renames --name-only "$base...$head" -- ":/$v3")
+done < <(git diff -z --no-renames --name-only "$base...$head" -- ":/$v3")
