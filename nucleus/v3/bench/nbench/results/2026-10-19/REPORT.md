@@ -10,17 +10,29 @@ kernel: 6.12.111+deb13-amd64
 cpu_model: 13th Gen Intel(R) Core(TM) i5-13500H
 cpus: 16
 mem_total: 38.8 GiB
-load1: 0.92
-load5: 0.58
-load15: 1.21
+load1: 12.18
+load5: 7.82
+load15: 4.95
 nbench_units_live: none
 root_fs: Size  Used Avail
- 1.8T  1.2T  483G
+ 1.8T  1.2T  480G
 podman: podman version 5.4.2
 container_runtime_note: rootless podman via systemd-run --user (PLAN-v3 §5.2 rule 1; card B-0 environment note)
 ```
 
 ## Rows
+
+<!-- source: embedded-sqlite-speedtest1.json -->
+### embedded-sqlite-speedtest1 — sqlite
+
+SQLite speedtest1 from the amalgamation (in container)
+
+Status: ok
+
+| config | run | wall_s | user_s | sys_s | Nucleus ratio | label |
+|---|---|---|---|---|---|---|
+|  | cold | 2017 | 1452 | 510.1 | n/a | n/a |
+|  | warm (n=5) | 2019 [1968, 2024] | 1448 [1446, 1450] | 512.7 [507.5, 515.5] | n/a | n/a |
 
 <!-- source: vector-sift1m-pgvector.json -->
 ### vector-sift1m-pgvector — pgvector17
