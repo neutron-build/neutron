@@ -102,6 +102,38 @@ fn write_metrics_json(path: Option<&str>, v: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Feed `input` to the child's stdin from a helper thread while its
+/// output drains, then wait for exit.
+///
+/// Invariant owned here (2026-10-19 pgvector hang, latent since the row
+/// was first attempted): writing a large query stream on the caller
+/// thread *before* reading stdout deadlocks — the child (psql) stops
+/// reading stdin once its own stdout pipe fills (~64 KiB of id lines ≈
+/// 800 queries), backpressure seals the input relay, and both sides
+/// wait forever. The helper thread keeps the write side flowing while
+/// [`std::process::Child::wait_with_output`] drains stdout/stderr
+/// concurrently.
+fn feed_and_collect(mut child: std::process::Child, input: &[u8]) -> Result<std::process::Output> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Io(std::io::Error::other("no stdin")))?;
+    let payload = input.to_vec();
+    let feeder = std::thread::Builder::new()
+        .name("nbench-stdin-feed".into())
+        .spawn(move || stdin.write_all(&payload).map(|()| payload.len()))?;
+    let out = child.wait_with_output().map_err(Error::Io)?;
+    let fed = feeder
+        .join()
+        .map_err(|_| Error::Io(std::io::Error::other("stdin feeder panicked")))??;
+    if fed != input.len() {
+        return Err(Error::Io(std::io::Error::other(
+            "short write to child stdin",
+        )));
+    }
+    Ok(out)
+}
+
 fn percentile_of(sorted: &[f64], q: f64) -> f64 {
     stats::percentile_sorted(sorted, q)
 }
@@ -333,7 +365,7 @@ fn cmd_vec_pg_search(args: &[String]) -> Result<()> {
     let mut sql: Vec<u8> = Vec::new();
     vector::emit_pg_search_sql(&queries, ef, limit, &mut sql)?;
 
-    let mut child = Command::new("systemd-run")
+    let child = Command::new("systemd-run")
         .args([
             "--user",
             "--wait",
@@ -359,17 +391,13 @@ fn cmd_vec_pg_search(args: &[String]) -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(Error::Io)?;
-    // Time the whole search pass: writing the query stream and waiting for
-    // the results (server processes while the stream is still arriving).
+    // Time the whole search pass: the query stream is fed from a helper
+    // thread while the server processes and the results drain
+    // concurrently (write-then-read deadlocks once the result pipe
+    // fills — the 2026-10-19 pass hung on exactly that; see
+    // feed_and_collect).
     let start = Instant::now();
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Io(std::io::Error::other("no stdin")))?;
-        stdin.write_all(&sql).map_err(Error::Io)?;
-    }
-    let out = child.wait_with_output().map_err(Error::Io)?;
+    let out = feed_and_collect(child, &sql)?;
     let wall = start.elapsed().as_secs_f64();
     if !out.status.success() {
         return Err(Error::Command {
@@ -529,5 +557,60 @@ fn ok_or_print(r: Result<()>) -> bool {
             eprintln!("nbench: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// A child that amplifies its input (every line echoed twice) so its
+    /// stdout outruns its stdin: a caller that writes everything before
+    /// reading deadlocks once ~64 KiB of output backs up (the exact
+    /// 2026-10-19 pgvector hang). [`feed_and_collect`] must complete.
+    /// The test is timing-independent in the pass direction: the naive
+    /// shape hangs *forever* (it would time the test out), the fixed
+    /// shape finishes in well under a second.
+    #[test]
+    fn feed_and_collect_survives_output_backpressure() {
+        // ~1.6 MB of input lines -> ~3.2 MB of output, far past the
+        // pipe capacity; nothing about this completes unless stdin
+        // feeding and stdout draining run concurrently.
+        let input = b"0123456789abcdef\n".repeat(100_000);
+        // each 17-byte line (16 chars + \n) amplifies to 33 bytes
+        // (16+16 chars + one \n): 2x the payload, minus the undoubled
+        // newline — still far past the 64 KiB pipe capacity
+        let expected_out = input.len() * 2 - 100_000;
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("while IFS= read -r line; do printf '%s%s\\n' \"$line\" \"$line\"; done")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn amplifier");
+        let out = feed_and_collect(child, &input).expect("no deadlock");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), expected_out);
+        // every amplified line round-trips
+        assert!(
+            out.stdout
+                .starts_with(b"0123456789abcdef0123456789abcdef\n")
+        );
+    }
+
+    #[test]
+    fn feed_and_collect_reports_child_failure() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("cat > /dev/null; exit 3")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let out = feed_and_collect(child, b"payload\n").expect("collected");
+        assert_eq!(out.status.code(), Some(3));
     }
 }
