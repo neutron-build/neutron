@@ -56,6 +56,32 @@ Status: ok
 | synchronous_commit=off clients=64 | cold | 20753 | 3.076 | 2495 | 8292 | 11473 | n/a | n/a |
 | synchronous_commit=off clients=64 | warm (n=5) | 20677 [19842, 20727] | 3.088 [3.080, 3.218] | 2519 [2503, 2632] | 8315 [8222, 8829] | 11454 [11313, 12476] | n/a | n/a |
 
+<!-- source: oltp-sysbench-pg17.json -->
+### oltp-sysbench-pg17 — postgres17
+
+sysbench oltp_read_write + oltp_point_select on PG17, threads 1/16/64
+
+Status: ok
+
+Anomalies:
+
+- load1 74.30 exceeded 16 (host cpus) during this row (see provenance)
+
+| config | run | tps | qps | latency_avg_ms | p99_ms | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| workload=oltp_read_write threads=1 | cold | 1296 | 25916 | 0.770 | 1.790 | n/a | n/a |
+| workload=oltp_read_write threads=1 | warm (n=5) | 1224 [1210, 1234] | 24474 [24208, 24684] | 0.820 [0.810, 0.830] | 2.000 [1.890, 2.070] | n/a | n/a |
+| workload=oltp_read_write threads=16 | cold | 3983 | 79671 | 4.010 | 6.210 | n/a | n/a |
+| workload=oltp_read_write threads=16 | warm (n=5) | 3611 [3593, 3628] | 72235 [71879, 72562] | 4.430 [4.410, 4.450] | 6.550 [6.430, 6.670] | n/a | n/a |
+| workload=oltp_read_write threads=64 | cold | 4022 | 80513 | 15.9 | 40.4 | n/a | n/a |
+| workload=oltp_read_write threads=64 | warm (n=5) | 3754 [3740, 3813] | 75159 [74879, 76336] | 17.0 [16.8, 17.1] | 41.1 [40.4, 41.9] | n/a | n/a |
+| workload=oltp_point_select threads=1 | cold | 59330 | 59330 | 0.020 | 0.040 | n/a | n/a |
+| workload=oltp_point_select threads=1 | warm (n=5) | 59365 [58530, 59914] | 59365 [58530, 59914] | 0.020 [0.020, 0.020] | 0.030 [0.030, 0.050] | n/a | n/a |
+| workload=oltp_point_select threads=16 | cold | 258634 | 258634 | 0.060 | 0.120 | n/a | n/a |
+| workload=oltp_point_select threads=16 | warm (n=5) | 244306 [242844, 245541] | 244306 [242844, 245541] | 0.070 [0.060, 0.070] | 0.120 [0.120, 0.120] | n/a | n/a |
+| workload=oltp_point_select threads=64 | cold | 196355 | 196355 | 0.330 | 0.860 | n/a | n/a |
+| workload=oltp_point_select threads=64 | warm (n=5) | 193817 [193387, 194347] | 193817 [193387, 194347] | 0.330 [0.330, 0.330] | 0.920 [0.830, 0.920] | n/a | n/a |
+
 <!-- source: vector-sift1m-pgvector.json -->
 ### vector-sift1m-pgvector — pgvector17
 
