@@ -18,6 +18,17 @@
 //! - S11's gated sub-check ← `VISIBLE-JUMPS` (via
 //!   [`crate::common::commit::apply_gate`]),
 //! - S12 ← `GC-TOO-EAGER`.
+//!
+//! Rework round (gate verdict X-1a, 2026-10-18, D1/D2) adds:
+//! - S4's blocked variants (S4b–S4d) ← the conflict check must re-run
+//!   **after** the lock wait, not only before it (verdict mutant O7: an
+//!   RR waiter that checks first, then waits through the blocker's
+//!   commit, then applies `f` to its snapshot value is a lost update);
+//! - S6's fixed-order cases (S6c–S6e) ← C-T0 §5.3's current-state rule:
+//!   unique liveness comes from the own top-layer data or the newest
+//!   committed version — never the snapshot (verdict mutant O1), a
+//!   committed tombstone is not live whatever its ts (verdict mutant
+//!   O5), and an own Delete is not live while an own Write is.
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -393,8 +404,18 @@ pub fn s03_rc_next_statement<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> 
 }
 
 /// S4: write-write. RR → 40001 after the blocker commits (I-WW; the
-/// `RR-NO-CONFLICT` mutant catcher). RC → EPQ applies to the newest
+/// `RR-NO-CONFLICT` mutant catcher); RC → EPQ applies to the newest
 /// value, so the final value counts both increments (C-T0 §5.2).
+///
+/// The blocked variants (S4b–S4d, verdict D1) hold the blocker's lock
+/// uncommitted while the waiter — whose snapshot was taken before any of
+/// the blocker's effects — blocks inside the op; the blocker then
+/// commits and releases. The waiter's conflict decision must be made
+/// **after** the wait: an engine that checks for a newer version only
+/// before waiting ships an RR lost update (verdict mutant O7) and an RC
+/// stale-EPQ base. S4d runs the same blocked shape through `put` (the
+/// card: "put = update_with returning Some(value). Both RR conflict
+/// rules apply to it").
 pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
     let mut f = Vec::new();
     let e = make();
@@ -453,6 +474,172 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
         Some(be(5).as_slice()),
     );
     e.abort(r);
+    // S4b (verdict D1): the blocked RR waiter. T1 holds k's lock
+    // uncommitted while T2 — RR, snapshotted before T1 wrote — blocks
+    // inside update_with; T1 commits and releases; T2 must then get
+    // 40001. Checking the newer-version rule only before the wait (O7)
+    // returns Ok here and writes over the snapshot value.
+    {
+        let e = make();
+        {
+            let mut seed = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S4b seed",
+                e.put(&mut seed, b"k", &be(100), Wait::NoWait),
+                (),
+            );
+            unit(&mut f, "S4b seed commit", e.commit(seed), 1);
+        }
+        let mut t2 = e.begin(Isolation::RepeatableRead);
+        let mut t1 = e.begin(Isolation::ReadCommitted);
+        unit(
+            &mut f,
+            "S4b t1 write (holds the lock)",
+            e.put(&mut t1, b"k", &be(200), Wait::NoWait),
+            (),
+        );
+        let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        thread::scope(|s| {
+            let e = &e;
+            s.spawn(move || {
+                let mut inc = |o: Option<&[u8]>| Some(be(o.map_or(0, u64_of) + 1));
+                // A buggy Ok commits the lost update so the final-state
+                // check sees it too; the required 40001 aborts cleanly.
+                let r = match e.update_with(&mut t2, b"k", BLOCK, &mut inc) {
+                    Ok(()) => e.commit(t2),
+                    Err(err) => {
+                        e.abort(t2);
+                        Err(err)
+                    }
+                };
+                let _ = tx.send(r);
+            });
+            unit(&mut f, "S4b t1 commit", e.commit(t1), 2);
+        });
+        match rx.recv() {
+            Ok(r) => fails_with(
+                &mut f,
+                "S4b blocked RR waiter after the blocker commits",
+                r,
+                TxnErr::Serialization,
+            ),
+            Err(_) => f.push("S4b: the waiter thread never reported".into()),
+        }
+        let mut r = e.begin(Isolation::ReadCommitted);
+        got(
+            &mut f,
+            "S4b final value is T1's (the RR waiter wrote nothing)",
+            e.get(&mut r, b"k"),
+            Some(be(200).as_slice()),
+        );
+        e.abort(r);
+    }
+    // S4c (verdict D1): the blocked RC counterpart. The same shape, but
+    // the woken waiter's EPQ must read the blocker's committed value,
+    // so both increments are counted (a waiter that acquires before the
+    // commit is visible — RELEASE-BEFORE-VISIBLE — loses one).
+    {
+        let e = make();
+        {
+            let mut seed = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S4c seed",
+                e.put(&mut seed, b"k", &be(100), Wait::NoWait),
+                (),
+            );
+            unit(&mut f, "S4c seed commit", e.commit(seed), 1);
+        }
+        let mut t2 = e.begin(Isolation::ReadCommitted);
+        let mut t1 = e.begin(Isolation::ReadCommitted);
+        let mut inc1 = |o: Option<&[u8]>| Some(be(o.map_or(0, u64_of) + 1));
+        unit(
+            &mut f,
+            "S4c t1 increment (holds the lock)",
+            e.update_with(&mut t1, b"k", Wait::NoWait, &mut inc1),
+            (),
+        );
+        let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        thread::scope(|s| {
+            let e = &e;
+            s.spawn(move || {
+                let mut inc2 = |o: Option<&[u8]>| Some(be(o.map_or(0, u64_of) + 1));
+                let r = e
+                    .update_with(&mut t2, b"k", BLOCK, &mut inc2)
+                    .and_then(|_| e.commit(t2));
+                let _ = tx.send(r);
+            });
+            unit(&mut f, "S4c t1 commit", e.commit(t1), 2);
+        });
+        match rx.recv() {
+            Ok(r) => unit(&mut f, "S4c blocked RC waiter commits", r, 3),
+            Err(_) => f.push("S4c: the waiter thread never reported".into()),
+        }
+        let mut r = e.begin(Isolation::ReadCommitted);
+        got(
+            &mut f,
+            "S4c both increments counted",
+            e.get(&mut r, b"k"),
+            Some(be(102).as_slice()),
+        );
+        e.abort(r);
+    }
+    // S4d (verdict D1): the blocked RR shape through `put` — the RR
+    // conflict rule applies to put exactly as to update_with (card).
+    {
+        let e = make();
+        {
+            let mut seed = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S4d seed",
+                e.put(&mut seed, b"k", &be(100), Wait::NoWait),
+                (),
+            );
+            unit(&mut f, "S4d seed commit", e.commit(seed), 1);
+        }
+        let mut t2 = e.begin(Isolation::RepeatableRead);
+        let mut t1 = e.begin(Isolation::ReadCommitted);
+        unit(
+            &mut f,
+            "S4d t1 write (holds the lock)",
+            e.put(&mut t1, b"k", &be(200), Wait::NoWait),
+            (),
+        );
+        let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        thread::scope(|s| {
+            let e = &e;
+            s.spawn(move || {
+                let r = match e.put(&mut t2, b"k", &be(7), BLOCK) {
+                    Ok(()) => e.commit(t2),
+                    Err(err) => {
+                        e.abort(t2);
+                        Err(err)
+                    }
+                };
+                let _ = tx.send(r);
+            });
+            unit(&mut f, "S4d t1 commit", e.commit(t1), 2);
+        });
+        match rx.recv() {
+            Ok(r) => fails_with(
+                &mut f,
+                "S4d blocked RR put after the blocker commits",
+                r,
+                TxnErr::Serialization,
+            ),
+            Err(_) => f.push("S4d: the waiter thread never reported".into()),
+        }
+        let mut r = e.begin(Isolation::ReadCommitted);
+        got(
+            &mut f,
+            "S4d final value is T1's (the RR put wrote nothing)",
+            e.get(&mut r, b"k"),
+            Some(be(200).as_slice()),
+        );
+        e.abort(r);
+    }
     f
 }
 
@@ -507,10 +694,20 @@ pub fn s05_lost_updates<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
 }
 
 /// S6: unique — a waiter gets 23505 if the holder commits, and succeeds
-/// if the holder aborts (C-T0 §5.3 "concurrent duplicate insert").
+/// if the holder aborts (C-T0 §5.3 "concurrent duplicate insert"). Both
+/// waiters **begin before the holder resolves** (verdict D2), so their
+/// snapshots deterministically predate the holder's outcome. The
+/// fixed-order cases (S6c–S6e) pin §5.3's current-state rule exactly:
+/// liveness comes from the own top-layer data or the **newest committed
+/// version** — never the snapshot (verdict mutant O1); a committed
+/// tombstone is not live whatever its ts (verdict mutant O5); an own
+/// Delete is not live while an own Write is.
 pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
     let mut f = Vec::new();
-    // Holder commits.
+    // Holder commits. The waiter begins (and snapshots) strictly before
+    // the holder's commit, so an engine that reads unique liveness at
+    // the snapshot instead of the newest committed version cannot race
+    // its way past this check.
     {
         let e = make();
         let mut holder = e.begin(Isolation::ReadCommitted);
@@ -520,11 +717,11 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             e.insert_unique(&mut holder, b"u", b"v1", Wait::NoWait),
             (),
         );
+        let mut waiter = e.begin(Isolation::ReadCommitted);
         let (tx, rx) = mpsc::channel::<Result<(), TxnErr>>();
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
-                let mut waiter = e.begin(Isolation::ReadCommitted);
                 // Blocks on the holder's lock until its commit releases it.
                 let _ = tx.send(e.insert_unique(&mut waiter, b"u", b"v2", BLOCK));
                 e.abort(waiter);
@@ -541,7 +738,8 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             Err(_) => f.push("S6a: the waiter thread never reported".into()),
         }
     }
-    // Holder aborts.
+    // Holder aborts. The waiter again begins before the holder resolves,
+    // so its snapshot deterministically predates the (never-made) commit.
     {
         let e = make();
         let mut holder = e.begin(Isolation::ReadCommitted);
@@ -551,11 +749,11 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             e.insert_unique(&mut holder, b"u", b"v1", Wait::NoWait),
             (),
         );
+        let mut waiter = e.begin(Isolation::ReadCommitted);
         let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
-                let mut waiter = e.begin(Isolation::ReadCommitted);
                 let r = e.insert_unique(&mut waiter, b"u", b"v2", BLOCK);
                 let r = r.and_then(|_| e.commit(waiter));
                 let _ = tx.send(r);
@@ -563,7 +761,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             e.abort(holder);
         });
         match rx.recv() {
-            Ok(Ok(_)) => {}
+            Ok(Ok(1)) => {}
             other => f.push(format!("S6b waiter after holder aborts: {other:?}")),
         }
         let mut r = e.begin(Isolation::ReadCommitted);
@@ -572,6 +770,148 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             "S6b winner's value",
             e.get(&mut r, b"u"),
             Some(b"v2".as_slice()),
+        );
+        e.abort(r);
+    }
+    // S6c (verdict D2, fixed order): an RR txn whose snapshot predates a
+    // committed live insert still gets 23505 — the unique check reads
+    // the newest committed version, not the snapshot (C-T0 §5.3).
+    {
+        let e = make();
+        let mut rr = e.begin(Isolation::RepeatableRead);
+        {
+            let mut w = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S6c committed insert",
+                e.insert_unique(&mut w, b"u", b"v1", Wait::NoWait),
+                (),
+            );
+            unit(&mut f, "S6c committed insert commit", e.commit(w), 1);
+        }
+        fails_with(
+            &mut f,
+            "S6c RR insert over a live insert newer than its snapshot",
+            e.insert_unique(&mut rr, b"u", b"v2", Wait::NoWait),
+            TxnErr::UniqueViolation,
+        );
+        // The failed insert leaves no own write: the snapshot read still
+        // sees nothing at ts 0.
+        got(
+            &mut f,
+            "S6c rr read at its snapshot",
+            e.get(&mut rr, b"u"),
+            None,
+        );
+        e.abort(rr);
+        let mut r = e.begin(Isolation::ReadCommitted);
+        got(
+            &mut f,
+            "S6c committed value intact",
+            e.get(&mut r, b"u"),
+            Some(b"v1".as_slice()),
+        );
+        e.abort(r);
+    }
+    // S6d (verdict D2, fixed order): an insert over a committed
+    // tombstone proceeds whatever its ts — including a tombstone newer
+    // than the RR snapshot, whose read view still shows the deleted row
+    // live (C-T0 §5.3 "Not live ... whatever its ts"; I-UNIQUE's note
+    // that a txn's own view may show the row it inserts over).
+    {
+        let e = make();
+        {
+            let mut seed = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S6d seed",
+                e.put(&mut seed, b"u", b"v0", Wait::NoWait),
+                (),
+            );
+            unit(&mut f, "S6d seed commit", e.commit(seed), 1);
+        }
+        let mut rr = e.begin(Isolation::RepeatableRead);
+        {
+            let mut w = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S6d committed delete",
+                e.delete(&mut w, b"u", Wait::NoWait),
+                true,
+            );
+            unit(&mut f, "S6d committed delete commit", e.commit(w), 2);
+        }
+        got(
+            &mut f,
+            "S6d rr snapshot still sees the row it will insert over",
+            e.get(&mut rr, b"u"),
+            Some(b"v0".as_slice()),
+        );
+        unit(
+            &mut f,
+            "S6d insert over a tombstone newer than the snapshot",
+            e.insert_unique(&mut rr, b"u", b"v2", Wait::NoWait),
+            (),
+        );
+        got(
+            &mut f,
+            "S6d rr own write",
+            e.get(&mut rr, b"u"),
+            Some(b"v2".as_slice()),
+        );
+        unit(&mut f, "S6d rr commit", e.commit(rr), 3);
+        let mut r = e.begin(Isolation::ReadCommitted);
+        got(
+            &mut f,
+            "S6d reinserted value",
+            e.get(&mut r, b"u"),
+            Some(b"v2".as_slice()),
+        );
+        e.abort(r);
+    }
+    // S6e (verdict D2, fixed order): the own-intent half of §5.3's
+    // current state — delete then insert_unique in the same txn
+    // succeeds (an own Delete is not live), while a second insert over
+    // the own live write gets 23505 (an own Write is live).
+    {
+        let e = make();
+        {
+            let mut seed = e.begin(Isolation::ReadCommitted);
+            unit(
+                &mut f,
+                "S6e seed",
+                e.put(&mut seed, b"u", b"v0", Wait::NoWait),
+                (),
+            );
+            unit(&mut f, "S6e seed commit", e.commit(seed), 1);
+        }
+        let mut t = e.begin(Isolation::ReadCommitted);
+        unit(
+            &mut f,
+            "S6e delete",
+            e.delete(&mut t, b"u", Wait::NoWait),
+            true,
+        );
+        got(&mut f, "S6e own delete visible", e.get(&mut t, b"u"), None);
+        unit(
+            &mut f,
+            "S6e insert after own delete",
+            e.insert_unique(&mut t, b"u", b"v1", Wait::NoWait),
+            (),
+        );
+        fails_with(
+            &mut f,
+            "S6e second insert over the own live write",
+            e.insert_unique(&mut t, b"u", b"v1x", Wait::NoWait),
+            TxnErr::UniqueViolation,
+        );
+        unit(&mut f, "S6e commit", e.commit(t), 2);
+        let mut r = e.begin(Isolation::ReadCommitted);
+        got(
+            &mut f,
+            "S6e final value",
+            e.get(&mut r, b"u"),
+            Some(b"v1".as_slice()),
         );
         e.abort(r);
     }
