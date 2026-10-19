@@ -34,6 +34,28 @@ Status: ok
 |  | cold | 2017 | 1452 | 510.1 | n/a | n/a |
 |  | warm (n=5) | 2019 [1968, 2024] | 1448 [1446, 1450] | 512.7 [507.5, 515.5] | n/a | n/a |
 
+<!-- source: oltp-pgbench-pg17.json -->
+### oltp-pgbench-pg17 — postgres17
+
+pgbench TPC-B (scale 100), clients 1/16/64, synchronous_commit on/off
+
+Status: ok
+
+| config | run | tps | latency_avg_ms | p50_us | p99_us | p999_us | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|---|
+| synchronous_commit=on clients=1 | cold | 3461 | 0.288 | 246.0 | 877.0 | 1510 | n/a | n/a |
+| synchronous_commit=on clients=1 | warm (n=5) | 3346 [3248, 3383] | 0.298 [0.295, 0.307] | 242.0 [239.0, 245.0] | 952.0 [939.0, 1015] | 1646 [1571, 1703] | n/a | n/a |
+| synchronous_commit=on clients=16 | cold | 16111 | 0.988 | 963.0 | 1744 | 2614 | n/a | n/a |
+| synchronous_commit=on clients=16 | warm (n=5) | 14978 [14747, 14999] | 1.062 [1.061, 1.079] | 1037 [1034, 1048] | 1807 [1800, 1859] | 2846 [2608, 4838] | n/a | n/a |
+| synchronous_commit=on clients=64 | cold | 15245 | 4.187 | 3718 | 10358 | 15091 | n/a | n/a |
+| synchronous_commit=on clients=64 | warm (n=5) | 15278 [15247, 15318] | 4.179 [4.167, 4.187] | 3724 [3710, 3737] | 10184 [10164, 10217] | 14281 [14131, 16078] | n/a | n/a |
+| synchronous_commit=off clients=1 | cold | 7734 | 0.129 | 123.0 | 252.0 | 518.0 | n/a | n/a |
+| synchronous_commit=off clients=1 | warm (n=5) | 8254 [7926, 8306] | 0.121 [0.120, 0.126] | 115.0 [114.0, 121.0] | 274.0 [237.0, 339.0] | 523.0 [495.8, 550.0] | n/a | n/a |
+| synchronous_commit=off clients=16 | cold | 23008 | 0.690 | 653.0 | 1457 | 1901 | n/a | n/a |
+| synchronous_commit=off clients=16 | warm (n=5) | 22977 [22058, 23029] | 0.691 [0.689, 0.720] | 662.0 [655.0, 683.0] | 1493 [1462, 1587] | 1963 [1896, 2208] | n/a | n/a |
+| synchronous_commit=off clients=64 | cold | 20753 | 3.076 | 2495 | 8292 | 11473 | n/a | n/a |
+| synchronous_commit=off clients=64 | warm (n=5) | 20677 [19842, 20727] | 3.088 [3.080, 3.218] | 2519 [2503, 2632] | 8315 [8222, 8829] | 11454 [11313, 12476] | n/a | n/a |
+
 <!-- source: vector-sift1m-pgvector.json -->
 ### vector-sift1m-pgvector — pgvector17
 
