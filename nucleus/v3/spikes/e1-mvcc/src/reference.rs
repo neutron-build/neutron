@@ -11,13 +11,14 @@
 //! - R-ATOMIC: a commit's versions enter the map inside one critical
 //!   section, so every reader sees all of a txn's writes or none (PLAN-v3
 //!   §1.1 "atomic, committed prefix"; suite S11/S14).
-//! - R-LOCK-VISIBLE: while a txn holds a key's row lock, every committed
-//!   version of that key has ts `<= visible_ts` — writers release locks
-//!   only after [`crate::common::commit_with`] marked them applied
-//!   (C-COMMIT-ORDER). The write path therefore reads "the newest
-//!   version" and may treat it as the newest *visible* commit without a
-//!   second visibility filter (C-T0 §3.2's window is closed before the
-//!   lock can change hands).
+//! - R-LOCK-VISIBLE: the write path's "newest committed value" is the
+//!   newest version with ts `<= visible_ts` — a commit inside the
+//!   commit-visibility window (applied, not yet visible) counts as
+//!   Pending for every writer-side decision (C-T0 §3.2). Under
+//!   C-COMMIT-ORDER this equals the raw newest version whenever the
+//!   caller holds the key's lock, because locks change hands only after
+//!   `mark_applied`; limiting the read anyway is what makes a premature
+//!   `release_all` observable (the card's RELEASE-BEFORE-VISIBLE mutant).
 //! - R-EPQ: an RC updater's `f` sees that newest committed value (EPQ,
 //!   C-T0 §5.2); an RR updater instead fails with 40001 if a version
 //!   newer than its snapshot exists (C-T0 §5.1 I-WW).
@@ -85,11 +86,20 @@ impl RefEngine {
         }
     }
 
-    /// The newest committed version of `key` (R-LOCK-VISIBLE: the caller
-    /// holds the key's lock whenever this matters).
-    fn newest_committed(&self, key: &[u8]) -> Option<(Ts, Option<Vec<u8>>)> {
+    /// The newest **visible** committed version of `key`: the newest
+    /// version with ts `<= visible_ts`. A commit that has applied but not
+    /// yet reached `visible_ts` is in the commit-visibility window and
+    /// counts as Pending for every writer-side decision (C-T0 §3.2). In a
+    /// correctly ordered engine this equals the raw newest version
+    /// whenever the caller holds the key's lock (R-LOCK-VISIBLE); limiting
+    /// it anyway is what makes releasing locks before `mark_applied`
+    /// observable (the card's RELEASE-BEFORE-VISIBLE mutant).
+    fn newest_visible(&self, key: &[u8]) -> Option<(Ts, Option<Vec<u8>>)> {
+        let visible = self.seq.visible_ts();
         let data = lock_unpoisoned(&self.data);
-        data.get(key).and_then(|vs| vs.last()).cloned()
+        data.get(key)
+            .and_then(|vs| vs.iter().rev().find(|(t, _)| *t <= visible))
+            .cloned()
     }
 
     /// The newest version of `key` at or below `snap` (C-T0 §4 step 2).
@@ -205,9 +215,10 @@ impl TxnEngine for RefEngine {
             self.ws_set(t, key, new);
             return Ok(());
         }
-        // R-LOCK-VISIBLE: holding the lock, the newest version is the
-        // newest visible commit.
-        let newest = self.newest_committed(key);
+        // R-LOCK-VISIBLE limits the EPQ base to visible commits; in a
+        // correctly ordered engine, holding the lock already implies the
+        // newest version is visible.
+        let newest = self.newest_visible(key);
         if t.iso == Isolation::RepeatableRead
             && let Some((ts, _)) = newest.as_ref()
             && *ts > t.snap.ts()
@@ -215,7 +226,7 @@ impl TxnEngine for RefEngine {
             // I-WW (C-T0 §5.1): the row changed after our snapshot.
             return Err(TxnErr::Serialization);
         }
-        // R-EPQ: RC's `f` sees the newest committed value.
+        // R-EPQ: RC's `f` sees the newest visible committed value.
         let current = newest.map(|(_, v)| v);
         let current_ref = current.as_ref().and_then(|v| v.as_deref());
         let new = f(current_ref);
@@ -244,7 +255,7 @@ impl TxnEngine for RefEngine {
         // tombstone counts as not live; proceed).
         let live = match t.ws.get(key) {
             Some(own) => own.is_some(),
-            None => self.newest_committed(key).is_some_and(|(_, v)| v.is_some()),
+            None => self.newest_visible(key).is_some_and(|(_, v)| v.is_some()),
         };
         if live {
             return Err(TxnErr::UniqueViolation);
