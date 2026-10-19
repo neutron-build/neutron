@@ -34,6 +34,28 @@ Status: ok
 |  | cold | 2017 | 1452 | 510.1 | n/a | n/a |
 |  | warm (n=5) | 2019 [1968, 2024] | 1448 [1446, 1450] | 512.7 [507.5, 515.5] | n/a | n/a |
 
+<!-- source: kv-memtier-valkey8.json -->
+### kv-memtier-valkey8 — valkey8
+
+memtier GET/SET 1:10 against Valkey 8, pipeline 1/16, AOF always/everysec
+
+Status: ok
+
+Anomalies:
+
+- load1 67.92 exceeded 16 (host cpus) during this row (see provenance)
+
+| config | run | ops_sec | p50_ms | p99_ms | kb_per_sec | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| appendfsync=always pipeline=1 | cold | 103195 | 0.583 | 1.223 | 4379 | n/a | n/a |
+| appendfsync=always pipeline=1 | warm (n=5) | 103884 [103177, 103972] | 0.583 [0.583, 0.583] | 1.207 [1.199, 1.215] | 4409 [4379, 4413] | n/a | n/a |
+| appendfsync=always pipeline=16 | cold | 884656 | 1.023 | 2.351 | 37626 | n/a | n/a |
+| appendfsync=always pipeline=16 | warm (n=5) | 877819 [868853, 891714] | 1.031 [1.023, 1.031] | 2.367 [2.255, 2.463] | 37435 [37053, 38026] | n/a | n/a |
+| appendfsync=everysec pipeline=1 | cold | 172738 | 0.359 | 0.727 | 7331 | n/a | n/a |
+| appendfsync=everysec pipeline=1 | warm (n=5) | 171533 [170236, 172408] | 0.359 [0.359, 0.359] | 0.727 [0.719, 0.735] | 7284 [7229, 7321] | n/a | n/a |
+| appendfsync=everysec pipeline=16 | cold | 1233824 | 0.743 | 1.543 | 52531 | n/a | n/a |
+| appendfsync=everysec pipeline=16 | warm (n=5) | 1206573 [1180233, 1230285] | 0.751 [0.743, 0.759] | 1.583 [1.519, 1.695] | 51557 [50432, 52571] | n/a | n/a |
+
 <!-- source: oltp-pgbench-pg17.json -->
 ### oltp-pgbench-pg17 — postgres17
 
