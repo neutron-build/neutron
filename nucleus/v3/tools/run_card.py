@@ -128,22 +128,31 @@ def changed_files(wt, base):
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
 
-def gate_verdict(wt, base, f, card_id, pre_head):
-    """True if f is this card's verdict file as the gate left it. The gate
-    commits verdicts/<ID>.md on the card branch between rounds, so a
-    base...HEAD diff shows it, and X-6's round-2 worker reverted it to clear
-    the scope check. A commit subject alone proves nothing (a worker can write
-    one), so the file must also be untouched since this run began (pre_head)."""
-    if f != f"nucleus/v3/verdicts/{card_id}.md" or f in changed_files(wt, pre_head):
-        return False
+def gate_committed(wt, base, f, card_id, pre_head):
+    """True if the last commit before this run (pre_head) to touch f is the
+    gate's verdict commit for this card. A subject alone proves nothing (a
+    worker can write one), so the caller also requires f untouched since."""
     _, subject = run(["git", "log", "-1", "--format=%s", f"{base}..{pre_head}", "--", f], wt)
     return subject.startswith(f"nucleus v3: {card_id} verdict ")
 
 
 def scope_violations(wt, base, touch, card_id=None, pre_head=None):
+    """Changed files outside the card's Touch only, or in a protected path.
+    The gate commits verdicts/<ID>.md on the card branch between rounds, so a
+    base...HEAD diff shows it, and X-6's round-2 worker reverted it to clear
+    this check. That one file is exempt while it is exactly as the gate left
+    it at pre_head (HEAD before this run's first attempt)."""
     bad = []
-    for f in changed_files(wt, base):
-        if pre_head and gate_verdict(wt, base, f, card_id, pre_head):
+    files = changed_files(wt, base)
+    own = f"nucleus/v3/verdicts/{card_id}.md"
+    exempt = False
+    if pre_head and card_id and gate_committed(wt, base, own, card_id, pre_head):
+        exempt = own not in changed_files(wt, pre_head)
+        if not exempt and own not in files:
+            # Deleting it, or restoring the base version, leaves no base...HEAD change.
+            bad.append(own + " (protected)")
+    for f in files:
+        if f == own and exempt:
             continue
         if any(f.startswith(p) for p in PROTECTED):
             bad.append(f + " (protected)")
