@@ -63,8 +63,10 @@ pub struct TreeStats {
     pub fill_factor: f64,
 }
 
-/// One entry of the `check` DFS stack: a page to validate, the key bounds
-/// its subtree must respect (T-ORDER) and its depth.
+/// One entry of the `check` DFS stack: a page to validate, the key
+/// bounds `[lo, hi)` its whole subtree must respect — inherited
+/// unbroken from the separators above it, and open only at the root
+/// (T-ORDER, card X-0-F3) — and its depth.
 struct CheckEntry {
     id: PageId,
     lo: Option<Vec<u8>>,
@@ -367,11 +369,21 @@ impl<S: PageStore> BTree<S> {
         }
     }
 
-    /// Validate the whole tree and return its shape: keys sorted within
-    /// pages, separators bounding their subtrees (T-ORDER), every page
-    /// reachable exactly once, no cell overlaps, all leaves at the same
-    /// depth. Call it quiescently (tests do); under concurrency it may see
-    /// a torn multi-page view even when both interleavings are legal.
+    /// Validate the whole tree and return its shape, enforcing T-ORDER
+    /// end to end (tightened by card X-0-F3, X-0 verdict finding 3):
+    ///
+    /// * keys strictly ascending within each leaf, and every key inside
+    ///   the `[lo, hi)` bounds its page inherited — child 0 of an inner
+    ///   page inherits the parent's `lo` (it is **not** unbounded
+    ///   below), the right-most child inherits the parent's `hi`, and
+    ///   the bounds start open at the root;
+    /// * separators strictly ascending within each inner page, and every
+    ///   separator inside the page's own inherited `[lo, hi)`;
+    /// * every page reachable exactly once, no cell overlaps, and all
+    ///   leaves at the same depth.
+    ///
+    /// Call it quiescently (tests do); under concurrency it may see a
+    /// torn multi-page view even when both interleavings are legal.
     ///
     /// # Errors
     /// A human-readable description of the first violation found.
@@ -466,7 +478,35 @@ impl<S: PageStore> BTree<S> {
                                 "page {id:?}: separators out of order at cell {i}"
                             ));
                         }
-                        let child_lo = prev_sep.clone();
+                        // T-ORDER, tightened by card X-0-F3 (X-0 verdict
+                        // finding 3): a separator must also sit inside the
+                        // bounds this page inherited from its own parent.
+                        // One outside `[lo, hi)` misroutes every lookup
+                        // that passes through the page, and the child
+                        // bounds derived from it would hide the damage a
+                        // level further down.
+                        if let Some(l) = lo.as_deref()
+                            && sep < l
+                        {
+                            return Err(format!(
+                                "page {id:?}: separator at cell {i} below the subtree bound"
+                            ));
+                        }
+                        if let Some(hb) = hi.as_deref()
+                            && sep >= hb
+                        {
+                            return Err(format!(
+                                "page {id:?}: separator at cell {i} above the subtree bound"
+                            ));
+                        }
+                        // Child 0 has no separator to its left, so it
+                        // inherits the page's own lower bound (card X-0-F3
+                        // Work 1; before, it started at `None` and a key
+                        // below every ancestor separator passed). Later
+                        // children take the previous separator, whose
+                        // standing against `lo` the check above just
+                        // established.
+                        let child_lo = prev_sep.clone().or_else(|| lo.clone());
                         let child_hi = Some(sep.to_vec());
                         stack.push(CheckEntry {
                             id: child,
@@ -476,6 +516,10 @@ impl<S: PageStore> BTree<S> {
                         });
                         prev_sep = Some(sep.to_vec());
                     }
+                    // The right-most child keeps the last separator as its
+                    // lower bound: the checks above already proved that
+                    // separator `>= lo`, so taking the max with `lo` would
+                    // add nothing (card X-0-F3 Work 1).
                     stack.push(CheckEntry {
                         id: h.right_child,
                         lo: prev_sep,
