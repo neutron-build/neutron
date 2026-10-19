@@ -1,108 +1,85 @@
 Card: X-1a
 Class: experiment
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: claude-code-a17a4137-46d8-4853-9e84-cedba2bafe1b
+Gate-session: claude-code-x1a-gate-round2-2026-10-18
 Date: 2026-10-18
 Gate-exit: GATE EXIT=0
-Commit: 7b0598c0
-Mutants: RELEASE-BEFORE-VISIBLE -> S5 (final counter 205/820, want 1600; also S6a with a yield), RR-NO-CONFLICT -> S4, SP-ROLLBACK-PARTIAL -> S9 + write_set unit tests + model.rs, VISIBLE-JUMPS -> S11a gated sub-check + sequencer/commit unit tests + model.rs, GC-TOO-EAGER -> S12 + snapshots unit tests, O1-REF-UNIQUE-AT-SNAPSHOT (own: insert_unique checks liveness at the snapshot, not the newest committed version) -> UNCAUGHT, O2-REF-OWNROW-IGNORED (own: update_with ignores own writes) -> S1, O3-REF-GC-DROPS-NEWEST-LE (own: gc drains ..=newest_le) -> S12, O4-REF-EPQ-AT-SNAPSHOT (own: RC f sees the snapshot value) -> S4 + S5, O5-REF-UNIQUE-TOMBSTONE-LIVE (own: a committed tombstone counts as live) -> UNCAUGHT, O6-REF-RC-NO-NEXT-STMT (own: RC next_statement is a no-op) -> S3, O7-REF-RR-CHECK-BEFORE-LOCK (own: RR newer-version check runs before the lock wait only; f then applied to the snapshot value, i.e. an RR lost update) -> UNCAUGHT
-Followups: X-1a-F1, X-1a-F2
+Commit: 50061d35
+Mutants: RELEASE-BEFORE-VISIBLE -> S5 + S6a, RR-NO-CONFLICT -> S4 + S4b + S4d, SP-ROLLBACK-PARTIAL -> S9, VISIBLE-JUMPS -> S11a gated sub-check, GC-TOO-EAGER -> S12, O7-REF-RR-CHECK-BEFORE-LOCK (round-1 survivor: RR check before the lock wait only, f applied to the snapshot value) -> S4b + S4d (5/5 runs), O1-REF-UNIQUE-AT-SNAPSHOT (round-1 survivor) -> S6a + S6c + S6d, O5-REF-UNIQUE-TOMBSTONE-LIVE (round-1 survivor) -> S6d, O8-REF-OWN-DELETE-LIVE (own: an own Delete counts as live in insert_unique) -> S6e, O9-REF-RR-CHECK-GE (own: RR conflict uses ts >= snapshot) -> S4 + S11a, O7+NO-BARRIER (own: O7 with wait_parked_waiter made a no-op) -> UNCAUGHT 10/10 (expected; shows the barrier is load-bearing)
+Followups: X-1a-F1, X-1a-F2, X-1a-F3
 
 ## Findings
 
-**Gate run.** `GATE EXIT=0` on 7b0598c0, every STEP EXIT=0, run in the
-foreground with a 1500 s timeout (CARGO_TARGET_DIR=~/.cache/nv3-target/gate-X-1a,
-`~/.cargo/bin` on PATH, no per-package decomposition needed). The mutants ran
-in the scratch copy /tmp/opencode/x1agate with
-`cargo test -q --release -p e1-mvcc --no-fail-fast` (300 s timeout, about 15 s
-per run). Each one was reverted with `git checkout`. The card worktree is clean.
+Round 2 re-gate of the round-1 REWORK (bbd24734). The new work is d5a8964b
+and 50061d35, and it touches only `spikes/e1-mvcc/` (suite.rs, the
+`lock_table.rs` waiter counter, and a proptest regression seed).
 
-**Scope.** All 13 changed files are under `nucleus/v3/spikes/e1-mvcc/`. The
-workspace picks the crate up through `spikes/*`. Nothing touches a protected
-path. The dependencies are exactly the card's list.
+**Gate run.** `GATE EXIT=0` on 50061d35, every STEP EXIT=0. Run in the
+foreground with a 1500 s timeout and CARGO_TARGET_DIR=~/.cache/nv3-target/gate-X-1a.
+The mutants ran in the scratch copy /tmp/opencode/x1agate2 with
+`cargo test -q --release -p e1-mvcc --test reference` (300 s timeout per run)
+and were reverted with `git checkout`. The card worktree is clean.
 
-**Hygiene.** No `unsafe` and no `unwrap`/`expect`/`panic!` outside
-`#[cfg(test)]` (suite.rs included). Every pub item has docs.
+**Scope.** The full branch diff against nucleus/v3-scaffold is under
+`nucleus/v3/spikes/e1-mvcc/`, plus this verdict file. No protected path is
+touched and no dependencies were added.
 
-**Oracle judgment: clean.** `RefEngine` is derived from the spec. Each rule
-cites the C-T0 text, and I checked every citation against
-`nucleus/v2/docs/C-T0-txn-protocol.md`:
-- §3.2: commit-visibility window.
-- §4: read at the snapshot.
-- §5.1: I-WW, lock then check.
-- §5.2: EPQ on the newest committed version.
-- §5.3: unique liveness from the newest committed version, and an insert over
-  a tombstone proceeds whatever its ts.
-- §5.4: own-row rule, no newer-version check.
-- §9.2: keep every version above W plus the newest version at or below W.
+**Oracle (re-confirmed): clean.** The round-2 diff does not touch
+`reference.rs`. `RefEngine` is still spec-derived (C-T0 §3.2/§4/§5.1–5.4/§9.2)
+and shares no engine code.
 
-No candidate engine exists yet. The reference does not use `e0-btree`, and it
-shares no code with v2. It shares only the `common` components, which the
-card requires. So a bug in `common` would be mirrored in the oracle and is
-invisible to S13. The scenario tests cover that gap: all five card mutants
-are caught outside S13.
+**D1: fixed and real.** In S4b (RR update_with), S4c (RC update_with/EPQ) and
+S4d (RR put), the waiter begins before T1 writes, and T1 then takes the lock
+uncommitted with NoWait. The waiter is spawned and calls the op with a 30 s
+Block. `wait_parked_waiter` spins until the process-wide `WAITING` count is
+non-zero, and only then does T1 commit.
+- `WaitingGuard` is created inside both of `acquire`'s wait paths, after
+  every pre-acquire step the engine runs. So the barrier proves the waiter
+  ran its pre-checks while the blocker held the lock.
+- O7 is now caught in 5/5 runs.
+- With the barrier stubbed out, O7 survives 10/10 runs. The waiter thread is
+  not scheduled before T1's commit, so the barrier (50061d35) is necessary,
+  not decorative.
+- S4c expects 102 and commit ts 3.
 
-The one deviation from the bare spec is that `newest_visible` limits the
-write path to versions at or below `visible_ts`. It is justified by §3.2 and
-is equivalent under the commit order the code enforces (C-COMMIT-ORDER). It is
-not tuned toward any engine.
+**D2: fixed and real.** The three fixed-order cases:
+- S6c: the RR snapshot predates a committed insert, and the insert gets 23505.
+- S6d: an insert over a tombstone newer than the RR snapshot succeeds while
+  the snapshot still reads v0.
+- S6e: own delete then insert_unique succeeds, and a second insert over the
+  own write gets 23505.
 
-**Why REWORK.** S13 on `RefEngine` compares the reference with itself.
-Whatever the oracle does that S1–S12/S14 do not pin down becomes ground truth,
-and S13 will force the arms to match it. Three plausible oracle or arm bugs
-pass the entire suite.
+S6a and S6b now begin the waiter before the holder resolves, and S6b also
+pins the commit ts. O1 is caught by S6a, S6c and S6d. O5 is caught by S6d.
 
-1. **D1 (blocking): S4's blocked-RR shape is missing.** The card says "RR →
-   40001 *after the blocker commits*". S4 instead commits T1 before T2's
-   update, so it never waits. O7 checks for a newer version before the lock
-   wait and writes over the snapshot value after it. That is an RR lost update,
-   and it passes everything: S5 and S11 are RC, and S13 is NoWait. This is a
-   check-then-wait race an arm could easily ship. The card forbids weakening
-   scenarios.
-   - Fix: add an S4 variant where the RR waiter starts the update while T1
-     holds the lock, T1 commits, and the waiter must get 40001.
-   - Add the RC counterpart too: blocked, then EPQ, then both increments
-     counted.
-2. **D2 (blocking): the C-T0 §5.3 unique rules are not pinned.** O1 (liveness
-   read at the snapshot) and O5 (a tombstone counts as live) both survive. In
-   S6a the waiter's `begin` races the holder's commit, so the snapshot-versus-
-   newest distinction is never tested deterministically.
-   - Fix: add deterministic cases:
-     - an RR txn whose snapshot predates a committed live insert gets 23505;
-     - an insert over a committed tombstone succeeds, including a tombstone
-       newer than an RR snapshot;
-     - `delete` then `insert_unique` in the same txn succeeds.
-   - Begin S6's waiter before the holder commits. `Txn: Send` allows that.
+**Correctness.** Neither the counter nor the barrier changes engine
+semantics. The only extra work is two atomics on the path that is about to
+park. No new `unsafe`, `unwrap` or `expect` outside tests, and every pub item
+has docs. Clean runs were stable, 5/5 repeats.
 
-The rest is sound. I read through the sequencer prefix rule, refcounted
-snapshot registration under the registry mutex, the write-set undo log and
-`merge_scan`, the lock-table claim/insert/re-check escalation handshake, and
-the commit order with fail-stop poisoning, and found no defect.
+**Minor.** `tests/model.proptest-regressions` stores a seed that shrinks to
+the SP-ROLLBACK-PARTIAL shape. It is almost certainly an artifact of a worker
+mutant run. It is harmless and passes on the tip, so it is kept.
 
 ## Follow-ups
 
-**X-1a-F1: shared-component overhead skews the E1′ ratios.** These costs are
-the same for both arms, so they add a constant to each arm's cost. That
-pulls the arm (b)/(c) CPU ratio toward 1, which biases the ≥ 2× decision rule
-toward (b):
-- `release_all` runs `retain` over all 64 shards, so each commit costs
-  O(every lock held by every txn), even though `by_txn` already lists the
-  txn's keys.
-- Every `acquire` takes the global `by_txn` mutex.
-- Every `commit_with` takes the process-global `apply_gate` mutex, a test hook
-  that sits on the production path.
+**X-1a-F1, X-1a-F2.** Carried over unchanged from round 1 (shared-component
+overhead skews the E1′ ratios; S13 lacks `gc()` and mid-schedule begins). Both
+must land before X-2 or X-3 measure.
 
-Escalation also defers while any foreign row is held and then rescans every
-shard on each later acquire. Under concurrency, a 10M-row UPDATE therefore
-never escalates and pays O(N²). Fix all of this before X-2/X-3 measure:
-release through the per-txn index, put the gate behind an atomic fast path or
-a feature, and define escalation-under-foreign-holders (wait, or document
-no-escalate).
+**X-1a-F3: the suite's process-global hooks require one `run_all` per test
+binary.** `WAITING`, like `apply_gate`, is process-global. A second test that
+parks on a lock concurrently would satisfy `wait_parked_waiter` early and
+silently weaken S4b–S4d and S6a/S6b back to scheduling luck. Today that is
+safe: `run_all` is the only `#[test]` in `tests/reference.rs`, and the lib
+tests are a separate binary. But X-2 and X-3 will add arm test files. Fix
+either:
+- in the docs: each `run_all` call in its own test binary, or
+  `--test-threads=1`; or
+- in code: make the barrier per-LockTable, exposed through a
+  `#[doc(hidden)]` engine hook.
 
-**X-1a-F2: S13 coverage.** All four txns begin at the start of the schedule,
-and `gc()` is never called. Add `gc()` calls between ops and txns that begin
-mid-schedule. GC under several live snapshots across many keys is currently
-covered only by S12's one key and one reader.
+The barrier should also fail loudly if `waiting()` is non-zero on entry.
