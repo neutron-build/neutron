@@ -13,6 +13,11 @@ publish.workspace = true
 [features]
 # SQLite is the E0 baseline; the C build is confined to the benchmark feature.
 sqlite = ["dep:rusqlite"]
+# Non-default (card X-0-F1-F1): exposes the test-only chaos hook
+# `insert_early_release`, which exists solely so this crate's own tests can
+# pin T-COUPLING (X-0-F1 verdict, finding 1). Without the feature the hook
+# does not exist, so no ordinary caller of the crate can damage a tree.
+test-hooks = []
 
 [dependencies]
 thiserror = { workspace = true }
@@ -20,6 +25,13 @@ rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 proptest = "1.12"
+# Self dev-dependency (card X-0-F1-F1): cargo unifies its features into the
+# lib copy the integration tests link, so `tests/model.rs` sees
+# `insert_early_release` under the plain featureless `cargo test` the gate
+# runs. A dev-dependency only; it never reaches anyone depending on this
+# crate, and `required-features` on `[[test]] model` was rejected because it
+# would drop the whole model suite from the gate's featureless run.
+e0-btree = { path = ".", features = ["test-hooks"] }
 
 [lints]
 workspace = true

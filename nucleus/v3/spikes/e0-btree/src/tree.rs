@@ -182,21 +182,26 @@ impl<S: PageStore> BTree<S> {
         self.insert_descend(key, value, false)
     }
 
-    /// Test-only chaos hook (card X-0-F1): [`Self::insert`], except the
+    /// Test-only chaos hook (card X-0-F1; card X-0-F1-F1 gates it behind
+    /// the non-default `test-hooks` feature): [`Self::insert`], except the
     /// descent treats **every** child as safe and releases each ancestor's
     /// latch as soon as the child is latched — the exact shape of the
     /// G-SAFE-LAX and COUPLING-EARLY-RELEASE mutants of the card's
     /// evidence list. A split of a non-root leaf then reaches
-    /// [`Self::propagate_split`] with an empty retained stack, which must
+    /// `propagate_split` with an empty retained stack, which must
     /// surface as [`StoreError::Corrupt`] now that the `find_parent`
     /// fallback is gone (before X-0-F1 the fallback silently repaired this
     /// state and masked those mutants). Never call outside tests; the tree
-    /// is left damaged when this returns the error.
+    /// is left damaged when this returns the error. The `test-hooks`
+    /// feature exists only for this crate's own tests — it is enabled for
+    /// them by the self dev-dependency in `Cargo.toml`, and without it
+    /// this method does not exist in the public API at all, so no caller
+    /// of the crate can damage a tree with it.
     ///
     /// # Errors
     /// Same as [`Self::insert`]; plus [`StoreError::Corrupt`] naming the
     /// broken coupling invariant when a split loses its parent.
-    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
     pub fn insert_early_release(
         &self,
         key: &[u8],

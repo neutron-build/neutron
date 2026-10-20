@@ -127,7 +127,11 @@ proptest! {
 /// invariant instead of succeeding. The mutant shape is planted through
 /// [`BTree::insert_early_release`], the test-only descent that reports
 /// every child safe; if the fallback is ever restored, this test fails
-/// because the insert silently returns `Ok`.
+/// because the insert silently returns `Ok`. That hook exists only under
+/// the crate's non-default `test-hooks` feature (card X-0-F1-F1), which
+/// the self dev-dependency in `Cargo.toml` enables for these tests — so
+/// this pin still runs under the plain featureless `cargo test` that
+/// `scripts/gate.sh` executes.
 #[test]
 fn split_without_retained_ancestor_is_corrupt() {
     let store = MemStore::new(8192).expect("fresh MemStore");
