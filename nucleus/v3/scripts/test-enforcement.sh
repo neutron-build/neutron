@@ -149,6 +149,11 @@ scratch; expect_no "a REWORK verdict is refused" mc N
 card G2 S standard; branch G2 nucleus/v3/spikes/g2.txt; verdict G2 S MERGE standard S
 echo late >>"$r/nucleus/v3/spikes/g2.txt"; git -C "$r" commit -qam "nucleus v3: G2 late non-core change"
 scratch; expect_no "a late non-CORE commit after the verdict is refused" mc G2
+# The Commit rule refuses G2 too, so only the reason pins the tip check's
+# "first file is the verdict" test: a one-file tip that is not the verdict.
+# That test is not implied by Commit = tip^, since a verdict naming its own
+# 7-hex prefix is a 2^28 grind.
+scratch; expect_ok "G2's refusal names the tip rule (verdict is not the branch tip)" bash -c "cd '$v3' && rc=0 && o=\$(bash scripts/merge-card.sh G2 2>&1) || rc=\$?; echo \"\$o\"; [ \"\$rc\" -ne 0 ] && grep -qF 'the branch tip must be the verdict commit' <<<\"\$o\""
 card G3 S standard; branch G3 nucleus/v3/spikes/g3.txt
 echo extra >>"$r/nucleus/v3/spikes/g3b.txt"; git -C "$r" add -A; verdict G3 S MERGE standard S
 scratch; expect_no "a verdict commit that also changes another file is refused" mc G3
@@ -173,6 +178,35 @@ card G4 S standard; branch G4 nucleus/v3/spikes/g4.txt; verdict G4 S MERGE stand
 echo late >>"$r/nucleus/v3/spikes/g4.txt"; git -C "$r" commit -qam "nucleus v3: G4 late non-core change"
 sed -i 's/^Date: .*/Date: 2026-10-18/' "$v3/verdicts/G4.md"; git -C "$r" commit -qam "nucleus v3: G4 verdict MERGE (re-committed)"
 scratch; expect_no "a verdict re-committed over a late change (stale Commit) is refused" mc G4
+# G4 with a symbolic Commit: card/v3-ID~1 is re-evaluated at merge time, so it
+# names tip^ -- the unreviewed late change -- and passes both the tip check and
+# Commit = tip^. Only the hex-only rule can refuse it. ~0000001 is git's ~1
+# spelled with seven hex digits, so only an anchored match refuses G6Z.
+# symbolic ID COMMIT: verdict with Commit rewritten to COMMIT, then a late
+# change, then the verdict re-committed with a new Date.
+symbolic() {
+  card "$1" S standard; branch "$1" "nucleus/v3/spikes/${1,,}.txt"; verdict "$1" S MERGE standard S
+  sed -i "s|^Commit: .*|Commit: $2|" "$v3/verdicts/$1.md"; git -C "$r" commit -qam "nucleus v3: $1 verdict MERGE (symbolic Commit)"
+  echo late >>"$v3/spikes/${1,,}.txt"; git -C "$r" commit -qam "nucleus v3: $1 late non-core change"
+  sed -i 's/^Date: .*/Date: 2026-10-18/' "$v3/verdicts/$1.md"; git -C "$r" commit -qam "nucleus v3: $1 verdict MERGE (re-committed)"
+}
+# commit_is_tip_parent ID: the tip verdict's Commit resolves to card/v3-ID^.
+commit_is_tip_parent() {
+  local c; c=$(git -C "$r" show "card/v3-$1:nucleus/v3/verdicts/$1.md" | sed -n 's/^Commit: //p')
+  [ "$(git -C "$r" rev-parse -q --verify "$c^{commit}")" = "$(git -C "$r" rev-parse "card/v3-$1^")" ]
+}
+symbolic G6 'card/v3-G6~1'
+expect_ok "premise: G6's Commit card/v3-G6~1 resolves to tip^" commit_is_tip_parent G6
+scratch; expect_no "a symbolic verdict Commit (card/v3-G6~1) re-committed over a late change is refused" mc G6
+symbolic G6Z 'card/v3-G6Z~0000001'
+expect_ok "premise: G6Z's Commit card/v3-G6Z~0000001 resolves to tip^" commit_is_tip_parent G6Z
+scratch; expect_no "a verdict Commit with hex digits inside a revision (card/v3-G6Z~0000001) is refused" mc G6Z
+# The full 40-hex id is accepted (the short-hex scenarios are the 7+ control).
+card G6F S standard; branch G6F nucleus/v3/spikes/g6f.txt
+printf 'Card: %s\nClass: %s\nCard-gate: %s\nVerdict: %s\nGate-tier: %s\nGate-model: test-model\nGate-session: t\nDate: 2026-10-17\nGate-exit: %s\nCommit: %s\nMutants: n/a\nFollowups: %s\n' \
+  G6F standard S MERGE S "GATE EXIT=0" "$(git -C "$r" rev-parse HEAD)" none >"$v3/verdicts/G6F.md"
+git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: G6F verdict MERGE"
+scratch; expect_ok "a verdict with a full 40-hex Commit merges" mc G6F
 
 card R S standard
 git -C "$r" checkout -q -b card/v3-R nucleus/v3-scaffold
