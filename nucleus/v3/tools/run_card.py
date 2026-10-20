@@ -185,9 +185,17 @@ def scope_violations(wt, base, touch, card_id=None, pre_head=None):
 
 
 def stray_commits(card_id, branch, since):
-    """Commits naming this card on any branch but its own: the worker wrote outside its worktree."""
-    _, out = run(["git", "log", "--branches", "--not", branch, f"--since=@{int(since)}", "--format=%h %s"], ROOT)
-    return [l for l in out.splitlines() if card_id in l]
+    """Commits naming this card on any branch but its own: the worker wrote outside its worktree.
+    A failed git log is one entry naming the failure, never []: an empty listing
+    would read as "no stray commits" and the run would go on. stderr stays out
+    of the parsed lines (run() folds it in, which only by accident made an
+    "unknown revision 'card/v3-<ID>'" error match the card id)."""
+    cmd = ["git", "log", "--branches", "--not", branch, f"--since=@{int(since)}", "--format=%h %s"]
+    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
+        return [f"{' '.join(cmd)} failed (exit {p.returncode}): {why} (cannot list commits; treating as stray)"]
+    return [l for l in p.stdout.splitlines() if card_id in l]
 
 
 def parse_tokens(log_path):
@@ -314,7 +322,9 @@ def main():
         stray = stray_commits(card_id, branch, t0)
         if stray:
             result["scope"] = "OUTSIDE"
-            print(f"[{card_id}] worker committed outside its worktree; stopping:\n" + "\n".join(stray), flush=True)
+            # Listed commits start with a hash; only the failure entry starts with "git log ".
+            what = "cannot list commits to check for stray ones" if stray[0].startswith("git log ") else "worker committed outside its worktree"
+            print(f"[{card_id}] {what}; stopping:\n" + "\n".join(stray), flush=True)
             break
         bad = scope_violations(wt, args.base, touch, card_id, pre_head)
         if bad:

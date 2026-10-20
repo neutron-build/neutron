@@ -17,6 +17,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/enforce-lib.sh"
 cd "$here/.."
 ref=${1:-HEAD}
+# The commit list goes through a file, not `done < <(git rev-list ...)`:
+# process substitution drops git's exit status, so a bogus ref read as an empty
+# history and printed "audit: ok (0 commits)". An audit that cannot list refuses.
+lst=$(mktemp)
+trap 'rm -f "$lst"' EXIT
+git rev-list --first-parent "$ref" -- "${AUDIT_PATHS[@]}" >"$lst" || { echo "audit: cannot list commits on $ref (git rev-list failed)" >&2; exit 1; }
 bad=0 n=0
 while read -r sha; do
   n=$((n + 1))
@@ -36,6 +42,6 @@ while read -r sha; do
     printf 'audit: %s (%s):\n%s\n' "$id" "$(git rev-parse --short "$sha")" "$errs"
     bad=1
   fi
-done < <(git rev-list --first-parent "$ref" -- "${AUDIT_PATHS[@]}")
+done <"$lst"
 [ "$bad" -eq 0 ] && echo "audit: ok ($n commits)"
 exit $bad

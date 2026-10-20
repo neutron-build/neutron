@@ -250,6 +250,15 @@ expect_no "audit rejects a titled merge of a CORE rename with an S verdict" bash
 git -C "$r" checkout -q -b scratch/recommit scratch/pass2
 git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-G4 (MERGE, gate S/test-model)" card/v3-G4
 expect_no "audit rejects a titled merge whose verdict Commit is not tip^ (G4)" bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/recommit"
+# A bogus ref must fail, naming the failed rev-list: read through process
+# substitution it was an empty history, "audit: ok (0 commits)", exit 0.
+expect_no "audit: a bogus ref fails" bash -c "cd '$v3' && bash scripts/audit-merges.sh no-such-ref"
+audit_refused() { local o rc=0; o=$(cd "$v3" && bash scripts/audit-merges.sh "$1" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "cannot list commits on $1" <<<"$o"; }
+expect_ok "audit: a bogus ref names the failed rev-list" audit_refused no-such-ref
+# Control: a real ref with no v3 commits is still ok, not a listing failure.
+git -C "$r" branch -f scratch/prev3 "$(git -C "$r" rev-list --max-parents=0 nucleus/v3-scaffold)"
+audit_zero() { local o; o=$(cd "$v3" && bash scripts/audit-merges.sh "$1" 2>&1) || { echo "$o"; return 1; }; echo "$o"; grep -qxF "audit: ok (0 commits)" <<<"$o"; }
+expect_ok "audit: a ref with no v3 commits is ok (0 commits)" audit_zero scratch/prev3
 
 # --- gate.sh ----------------------------------------------------------------
 gate_out() { local rc=0; (cd "$v3" && FAKE_FAIL=${1:-none} bash scripts/gate.sh) >"$t/gate" 2>&1 || rc=$?; echo "$rc" >"$t/gate.rc"; }
@@ -332,6 +341,33 @@ P
 }
 expect_ok "runner: a bogus base is a scope violation" rb no-such-ref git-fail
 expect_ok "runner: the same call with base nucleus/v3-scaffold flags nothing" rb nucleus/v3-scaffold none
+# rsc CARD BRANCH SINCE WANT: stray_commits with ROOT at the test repo; SINCE
+# "now" is the current time. WANT "git-fail" expects an entry naming the failed
+# listing, "none" expects [], anything else an entry containing WANT.
+rsc() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$@" <<'P'
+import importlib.util, pathlib, sys, time
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rc.ROOT = pathlib.Path(sys.argv[2])
+got = rc.stray_commits(sys.argv[3], sys.argv[4], time.time() if sys.argv[5] == "now" else float(sys.argv[5]))
+print(got)
+want = sys.argv[6]
+if want == "none":
+    sys.exit(0 if got == [] else 1)
+if want == "git-fail":
+    sys.exit(0 if got and all("git log" in g and "failed (exit" in g for g in got) else 1)
+sys.exit(0 if any(want in g for g in got) else 1)
+P
+}
+# ZZ is not in "no-such-branch", so git's "unknown revision" stderr cannot match
+# the card id: before S-0-F2-F2-F1 this returned [] and the run went on.
+expect_ok "runner: a failed stray-commit listing stops the run" rsc ZZ no-such-branch now git-fail
+expect_ok "runner: a valid branch with no stray commits lists nothing" rsc RS card/v3-RS now none
+zs0=$(date +%s)
+git -C "$r" branch -f card/v3-ZS nucleus/v3-scaffold
+git -C "$r" checkout -q -B scratch/zs nucleus/v3-scaffold
+git -C "$r" commit -q --allow-empty -m "nucleus v3: ZS work"
+git -C "$r" checkout -q nucleus/v3-scaffold
+expect_ok "runner: a commit naming the card on another branch is stray" rsc ZS card/v3-ZS "$zs0" "nucleus v3: ZS work"
 
 # --- promote-pass -----------------------------------------------------------
 git -C "$r" checkout -q -B scratch/pass3 nucleus/v3-scaffold
