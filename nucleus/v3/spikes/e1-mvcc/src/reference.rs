@@ -371,4 +371,18 @@ impl TxnEngine for RefEngine {
             bytes_applied: self.bytes_applied.load(Ordering::Relaxed),
         }
     }
+
+    /// Card X-1a-F3: the engine's own shared table, for the suite's
+    /// per-engine parked-waiter barrier.
+    #[doc(hidden)]
+    fn lock_table(&self) -> &LockTable {
+        &self.locks
+    }
+
+    /// Card X-1a-F3: the engine's own sequencer, whose apply gate holds
+    /// only this engine's commits.
+    #[doc(hidden)]
+    fn sequencer(&self) -> &Sequencer {
+        &self.seq
+    }
 }

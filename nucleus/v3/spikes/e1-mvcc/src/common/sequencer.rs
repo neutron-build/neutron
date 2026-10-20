@@ -10,11 +10,16 @@
 //!   until every smaller ts has applied. A reader at a snapshot `S` thus
 //!   sees **all** commits `<= S` and **no** commit `> S` (C-T0 §3.1 "why
 //!   that is enough").
+//! - S-GATE-SCOPE (card X-1a-F3, C-GATE-SCOPE): the test-only apply gate
+//!   is **per-sequencer** state — arming it parks only commits whose
+//!   [`commit_with`](crate::common::commit_with) receives this
+//!   sequencer, never another engine's.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use crate::api::Ts;
+use crate::common::commit::apply_gate::ApplyGate;
 
 /// Interior state of [`Sequencer`].
 struct SeqState {
@@ -33,6 +38,10 @@ struct SeqState {
 /// Shared by every arm and by the reference engine (card Work 3).
 pub struct Sequencer {
     state: Mutex<SeqState>,
+    /// This sequencer's test-only apply gate (S-GATE-SCOPE, card
+    /// X-1a-F3): every `commit_with` on this sequencer consults it, and
+    /// no other engine's commit does.
+    gate: ApplyGate,
 }
 
 impl Sequencer {
@@ -44,7 +53,17 @@ impl Sequencer {
                 visible: 0,
                 pending: BTreeSet::new(),
             }),
+            gate: ApplyGate::new(),
         }
+    }
+
+    /// This sequencer's test-only apply gate (card X-1a-F3): the
+    /// per-engine instance `commit_with` consults, so the suite can
+    /// hold this engine's commits without parking any other engine's.
+    /// Test observability, not part of the commit semantics.
+    #[doc(hidden)]
+    pub fn apply_gate(&self) -> &ApplyGate {
+        &self.gate
     }
 
     /// The ts a reader opening a snapshot now must use: the current

@@ -201,4 +201,23 @@ pub trait TxnEngine: Send + Sync + 'static {
 
     /// The E1′ metric surface.
     fn stats(&self) -> EngineStats;
+
+    /// Test observability (card X-1a-F3): the engine's own shared
+    /// [`LockTable`](crate::common::LockTable), so the suite's
+    /// blocked-path barrier can watch **this engine's** parked waiters
+    /// without any process-global state a concurrent test could
+    /// satisfy. Required with no default body so an arm cannot silently
+    /// opt out — and returning the shared table is what ties every arm
+    /// to the suite's lock table (X-2/X-3: "do not implement your own
+    /// lock table").
+    #[doc(hidden)]
+    fn lock_table(&self) -> &crate::common::LockTable;
+
+    /// Test observability (card X-1a-F3): the engine's own shared
+    /// [`Sequencer`](crate::common::Sequencer), so the suite's apply
+    /// gate can hold **this engine's** commit without parking any other
+    /// engine's. Required with no default body for the same reason as
+    /// [`TxnEngine::lock_table`].
+    #[doc(hidden)]
+    fn sequencer(&self) -> &crate::common::Sequencer;
 }
