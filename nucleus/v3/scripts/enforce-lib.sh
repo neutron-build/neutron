@@ -61,8 +61,19 @@ check_merge() {
   fi
 
   # What the card changed, excluding its own verdict file.
-  local f rel core_entries lst
-  core_entries=$(git show "$base:$V3/CORE_PATHS" 2>/dev/null | core_entries)
+  local f rel core_entries lst crc=0 cerr creason
+  # A base that predates CORE_PATHS (exit 3) has no CORE paths; the bootstrap
+  # merge needs that. A failed read (exit 1) must not become that same empty
+  # list, which would let an S verdict through on scripts/: it is an error, and
+  # the other checks still run so every violation is reported.
+  cerr=$(mktemp) || { echo "cannot create a temporary file for the CORE_PATHS read"; return 1; }
+  core_entries=$(base_core_entries "$base" "$V3" 2>"$cerr") || crc=$?
+  creason=$(cat "$cerr")
+  rm -f "$cerr"
+  case $crc in
+    0 | 3) ;;
+    *) core_entries=; errs+=("cannot read CORE_PATHS from $base ($creason); refusing to judge CORE paths") ;;
+  esac
   # Through a file: process substitution drops git's exit status, and NUL-
   # separated paths cannot be held in a variable.
   lst=$(mktemp) || { echo "cannot create a temporary file for the path list"; return 1; }
