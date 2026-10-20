@@ -10,17 +10,35 @@ kernel: 6.12.111+deb13-amd64
 cpu_model: 13th Gen Intel(R) Core(TM) i5-13500H
 cpus: 16
 mem_total: 38.8 GiB
-load1: 0.53
-load5: 21.98
-load15: 27.67
+load1: 0.70
+load5: 21.14
+load15: 28.32
 nbench_units_live: none
 root_fs: Size  Used Avail
- 1.8T  1.3T  445G
+ 1.8T  1.3T  448G
 podman: podman version 5.4.2
 container_runtime_note: rootless podman via systemd-run --user (PLAN-v3 §5.2 rule 1; card B-0 environment note)
 ```
 
 ## Rows
+
+<!-- source: kv-memtier-valkey8.json -->
+### kv-memtier-valkey8 — valkey8
+
+memtier GET/SET 1:10 against Valkey 8, pipeline 1/16, AOF always/everysec
+
+Status: ok
+
+| config | run | ops_sec | p50_ms | p99_ms | kb_per_sec | Nucleus ratio | label |
+|---|---|---|---|---|---|---|---|
+| appendfsync=always pipeline=1 | cold | 109811 | 0.551 | 1.167 | 4659 | n/a | n/a |
+| appendfsync=always pipeline=1 | warm (n=5) | 103388 [102224, 103595] | 0.591 [0.583, 0.591] | 1.207 [1.207, 1.223] | 4389 [4339, 4397] | n/a | n/a |
+| appendfsync=always pipeline=16 | cold | 881214 | 1.031 | 2.383 | 37479 | n/a | n/a |
+| appendfsync=always pipeline=16 | warm (n=5) | 873543 [869242, 882792] | 1.031 [1.031, 1.031] | 2.447 [2.335, 2.463] | 37250 [37067, 37645] | n/a | n/a |
+| appendfsync=everysec pipeline=1 | cold | 172556 | 0.359 | 0.727 | 7323 | n/a | n/a |
+| appendfsync=everysec pipeline=1 | warm (n=5) | 170588 [167585, 171005] | 0.359 [0.359, 0.367] | 0.735 [0.727, 0.775] | 7244 [7116, 7261] | n/a | n/a |
+| appendfsync=everysec pipeline=16 | cold | 1233439 | 0.743 | 1.607 | 52515 | n/a | n/a |
+| appendfsync=everysec pipeline=16 | warm (n=5) | 1233629 [1217132, 1251565] | 0.743 [0.743, 0.751] | 1.527 [1.503, 1.599] | 52720 [52008, 53485] | n/a | n/a |
 
 <!-- source: oltp-sysbench-pg17.json -->
 ### oltp-sysbench-pg17 — postgres17
