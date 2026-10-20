@@ -15,7 +15,13 @@
 //!   held means no other thread holds or waits on that frame's latch, so
 //!   plain latch acquisition cannot deadlock (PLAN-v3 §3.3 "the evictor
 //!   uses try_latch and never blocks on a victim" — here the same guarantee
-//!   follows from the pin discipline rather than try-locking).
+//!   follows from the pin discipline rather than try-locking);
+//! - a store error never leaves the frame table inconsistent (card X-0-F2
+//!   Work 4): `locate` resets a frame whose read failed to an empty victim
+//!   after the old page's table entry is gone, and `release_new` hands an
+//!   unused pre-allocated page back the same way, so the table never maps
+//!   one page to two frames and no frame silently maps a page the table
+//!   no longer knows.
 //!
 //! Deadlock-freedom of the whole pool follows from one lock order: the
 //! page-table mutex is a leaf lock (never held while acquiring a frame
@@ -226,6 +232,13 @@ impl<S: PageStore> BufferPool<S> {
     /// Return the frame index of `id`, pinned. On a miss, evict a victim
     /// and load the page into it, all under the page-table mutex so two
     /// loaders cannot install the same page twice (or lose an eviction).
+    ///
+    /// A failed write-back or read leaves every structure exactly as it
+    /// was (card X-0-F2 Work 4): the write-back happens before the old
+    /// page's table entry is dropped, and a failed read resets the
+    /// victim frame to an empty victim, so no later eviction can write
+    /// stale bytes over the old page or remove another frame's mapping
+    /// for it.
     fn locate(&self, id: PageId) -> Result<usize, StoreError> {
         let mut table = self.lock_table()?;
         if let Some(&frame) = table.get(&id) {
@@ -239,18 +252,70 @@ impl<S: PageStore> BufferPool<S> {
             if let Some(old) = f.id {
                 // Dirty eviction: write the victim back before reuse
                 // (card X-0 Work 3; the DIRTY-LOST mutation removes this).
+                // A failure here returns with the frame still holding
+                // `old` and its table entry still present — the
+                // consistent pre-call state.
                 if f.dirty {
                     self.store.write(old, &f.data)?;
                 }
                 table.remove(&old);
             }
-            self.store.read(id, &mut f.data)?;
+            if let Err(e) = self.store.read(id, &mut f.data) {
+                // The old page's table entry is gone already, so the
+                // frame must stop claiming it too (card X-0-F2 Work 4).
+                // Pins are already zero — a victim is chosen with pin
+                // count zero and the new pin is only stored after a
+                // successful read — so resetting `id` and `dirty` makes
+                // this an empty victim. Left unreset, the frame would
+                // keep mapping `old` with no table entry: a later
+                // `locate(old)` installs the page in a second frame, and
+                // this frame's eventual eviction then writes its stale
+                // bytes over the page — and its `table.remove(&old)`
+                // can delete the fresh frame's mapping.
+                f.id = None;
+                f.dirty = false;
+                return Err(e);
+            }
             f.id = Some(id);
             f.dirty = false;
             slot.pins.store(1, Ordering::Release);
         }
         table.insert(id, frame);
         Ok(frame)
+    }
+
+    /// Return an unused pre-allocated page to the pool (card X-0-F2
+    /// Work 1): the frame is reset to an empty victim and the page's
+    /// table entry removed, so no later eviction can write the page or
+    /// drop another page's mapping. The store allocation is not undone
+    /// — [`PageStore::free`] is a no-op in this spike and ids must stay
+    /// dense — so the id stays allocated but unreachable, exactly like a
+    /// deleted leaf's (T-NOMERGE in `tree.rs`).
+    ///
+    /// Only for pages the caller never published into the tree: the
+    /// frame's bytes (zeroed by `new_page`) are dropped without a
+    /// write-back, which would lose data for a page someone still
+    /// references.
+    ///
+    /// # Errors
+    /// [`StoreError::Poisoned`] if the page-table mutex was poisoned.
+    /// The frame is reset before the table is touched, so even then the
+    /// pool stays consistent; the worst case is one stale table entry
+    /// for an id no one can look up again.
+    pub(crate) fn release_new(&self, mut guard: WriteGuard<'_, S>) -> Result<(), StoreError> {
+        let had = guard.inner.id;
+        // Reset under the frame latch the guard still holds: when the
+        // guard drops (pin 0), the frame is already an empty victim, so
+        // a racing victim pick can never mistake it for `had`'s frame.
+        guard.inner.id = None;
+        guard.inner.dirty = false;
+        guard.inner.data.fill(0);
+        drop(guard);
+        let mut table = self.lock_table()?;
+        if let Some(id) = had {
+            table.remove(&id);
+        }
+        Ok(())
     }
 
     /// Advance the clock hand to the next frame with pin count zero.
