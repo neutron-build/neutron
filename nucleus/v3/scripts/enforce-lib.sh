@@ -50,12 +50,41 @@ check_merge() {
   # expression (card/v3-X~1, HEAD^, <hex>~0) is re-evaluated at merge time, so it
   # follows the branch and "covers" whatever is under the verdict now, reviewed
   # or not. The class is spelled out so no locale reads a-f as a collation range.
-  local tipfiles=() reviewed
+  # Even a bare hex value never goes through a lookup: git resolves refs before
+  # short object ids, so a branch or tag named like the prefix would redirect the
+  # field to any commit. The value is compared as text with tip^'s full id, and
+  # must name no other commit: rev-parse refused an ambiguous prefix, and without
+  # that a late commit ground to share the reviewed prefix would reuse the verdict.
+  # Only commits count, as the ^{commit} peel ignored blobs and trees.
+  local tipfiles=()
   mapfile -d '' -t tipfiles < <(git diff-tree -z --no-commit-id --name-only -r "$head" -- ':/')
   { [ ${#tipfiles[@]} -eq 1 ] && [ "${tipfiles[0]}" = "$own" ]; } || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: ${tipfiles[*]}")
   if [[ $vcommit =~ ^[0123456789abcdef]{7,40}$ ]]; then
-    reviewed=$(git rev-parse -q --verify "$vcommit^{commit}" 2>/dev/null || true)
-    [ -n "$reviewed" ] && [ "$reviewed" = "$(git rev-parse "$head^")" ] || errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
+    local parent objs kinds ty name ncommit=0 mine=0 bad=0
+    # Through $(...) with the status checked: a failed listing prints nothing,
+    # which must not read as "no other commit".
+    if ! parent=$(git rev-parse -q --verify "$head^1^{commit}"); then
+      errs+=("cannot resolve the commit under the verdict ($head^1)")
+    elif [[ $parent != "$vcommit"* ]]; then
+      errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
+    elif ! objs=$(git rev-parse --disambiguate="$vcommit") || ! kinds=$(git cat-file --batch-check='%(objecttype) %(objectname)' <<<"$objs"); then
+      errs+=("cannot list the objects whose id starts with verdict Commit '$vcommit' (git failed)")
+    else
+      while read -r ty name; do
+        case $ty in
+          commit) ncommit=$((ncommit + 1)); [ "$name" = "$parent" ] && mine=1 ;;
+          tree | blob | tag) ;;
+          *) bad=1 ;; # "<id> missing", or an empty listing
+        esac
+      done <<<"$kinds"
+      if [ "$bad" -eq 1 ]; then
+        errs+=("cannot list the objects whose id starts with verdict Commit '$vcommit' (unreadable object)")
+      elif [ "$ncommit" -gt 1 ]; then
+        errs+=("verdict Commit '$vcommit' is ambiguous: $ncommit commits start with it; use a longer id")
+      elif [ "$mine" -ne 1 ]; then
+        errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
+      fi
+    fi
   else
     errs+=("verdict Commit '$vcommit' is not a hex commit id (7-40 lowercase hex digits; revision expressions are refused)")
   fi
