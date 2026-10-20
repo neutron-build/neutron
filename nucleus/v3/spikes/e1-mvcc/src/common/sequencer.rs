@@ -13,15 +13,13 @@
 //! - S-GATE-SCOPE (card X-1a-F3, C-GATE-SCOPE): the test-only apply gate
 //!   is **per-sequencer** state — arming it parks only commits whose
 //!   [`commit_with`](crate::common::commit_with) receives this
-//!   sequencer, never another engine's. (`Sequencer::new` also records
-//!   a `Weak` pointer for the free-function compatibility bridge of
-//!   [`commit::apply_gate`]; no engine path reads it.)
+//!   sequencer, never another engine's.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::api::Ts;
-use crate::common::commit::apply_gate::{self, ApplyGate};
+use crate::common::commit::apply_gate::ApplyGate;
 
 /// Interior state of [`Sequencer`].
 struct SeqState {
@@ -42,26 +40,21 @@ pub struct Sequencer {
     state: Mutex<SeqState>,
     /// This sequencer's test-only apply gate (S-GATE-SCOPE, card
     /// X-1a-F3): every `commit_with` on this sequencer consults it, and
-    /// no other engine's commit does. Shared ownership (`Arc`) so the
-    /// gate outlives any guard the free-function compatibility bridge
-    /// holds (see [`apply_gate`](crate::common::commit::apply_gate));
-    /// the engine path only ever reads through
-    /// [`Sequencer::apply_gate`].
-    gate: Arc<ApplyGate>,
+    /// no other engine's commit does. The engine path only ever reads
+    /// it through [`Sequencer::apply_gate`].
+    gate: ApplyGate,
 }
 
 impl Sequencer {
     /// A fresh sequencer with nothing committed: `visible_ts = 0`.
     pub fn new() -> Self {
-        let gate = Arc::new(ApplyGate::new());
-        apply_gate::register_latest(&gate);
         Self {
             state: Mutex::new(SeqState {
                 next_ts: 1,
                 visible: 0,
                 pending: BTreeSet::new(),
             }),
-            gate,
+            gate: ApplyGate::new(),
         }
     }
 
