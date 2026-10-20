@@ -178,16 +178,20 @@ pub mod apply_gate {
             s.taken = false;
             s.released = false;
             s.parked = false;
-            drop(s);
-            // Publish the flag only after the state is set: a committer
-            // that loads `armed == true` and then takes the mutex is
-            // guaranteed to see `state.armed == true` (Release store
-            // here, Acquire load in [`Self::maybe_park`]). Every test
-            // arms the gate **before** spawning the committing thread,
-            // so the thread's creation already orders the state before
-            // its first commit; the flag keeps the general case honest
-            // anyway.
+            // The fast-path flag `ARMED` (the `armed` atomic; card
+            // X-1a-F1-F3) changes only under the gate mutex, so a
+            // holder of the mutex always sees `ARMED == state.armed`:
+            // the store sits inside this critical section, after the
+            // state it mirrors. That keeps [`Self::maybe_park`]'s fast
+            // path correct — an unarmed load returns without locking
+            // (the gate was unarmed at that instant, and a commit that
+            // already passed the hook is not one a later arm selects);
+            // an armed load takes the mutex and re-checks
+            // `armed`/`taken`, which the invariant keeps consistent
+            // with the flag the load saw (a `release()` that ran in
+            // between changed both under the mutex).
             self.armed.store(true, Ordering::Release);
+            drop(s);
         }
 
         /// Block until the armed commit has parked, or `timeout` passes.
@@ -218,13 +222,24 @@ pub mod apply_gate {
             let mut s = self.lock();
             s.released = true;
             s.armed = false;
+            // The fast-path flag `ARMED` (the `armed` atomic; card
+            // X-1a-F1-F3) changes only under the gate mutex, so a
+            // holder of the mutex always sees `ARMED == state.armed`:
+            // the store sits inside this critical section, before
+            // unlocking. Stored after the unlock, it raced a fresh
+            // `arm()` on another thread: release cleared the state and
+            // unlocked, the arm set the state and stored
+            // `ARMED = true`, and only then did release's late
+            // `ARMED = false` land — erasing the new arm's flag, whose
+            // commit then took maybe_park's fast path out and never
+            // parked. Under the mutex the critical sections are strictly
+            // ordered, which keeps [`Self::maybe_park`]'s fast path
+            // correct: an unarmed load returns without locking; an
+            // armed load takes the mutex and re-checks
+            // `armed`/`taken`.
+            self.armed.store(false, Ordering::Release);
             drop(s);
             self.cv.notify_all();
-            // Clear the flag after the state: a committer that already
-            // passed the fast path just before this store takes the mutex
-            // and then sees `armed == false` (or `released == true`) and
-            // returns without parking.
-            self.armed.store(false, Ordering::Release);
         }
 
         /// The hook `commit_with` calls between ts assignment and apply.
