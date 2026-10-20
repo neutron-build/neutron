@@ -20,6 +20,13 @@
 //!   `load1` above the host CPU count — the same comparison the chain
 //!   scripts apply at row start — is appended to the row's anomalies
 //!   (§5.2 rule 1; escalation nv3-B-0-esc-1, rework round 4 item a).
+//! - A failed driver or digest reports the real reason. Drivers like
+//!   vector-sift1m-qdrant pipe the tool's output through
+//!   `2>&1 | tee "$NB_LOG"`, so their stderr is empty on failure and an
+//!   error built from stderr alone says nothing; the message tail is
+//!   [`failure_message_tail`] — stderr when it has content, otherwise
+//!   the last ~4000 bytes of the run's `NB_LOG` (card B-0-F6,
+//!   escalation nv3-B-0-esc-2).
 
 use crate::digest;
 use crate::error::{Error, Result};
@@ -258,6 +265,38 @@ fn series_string(series: &[(String, String)]) -> String {
         .join(",")
 }
 
+/// Message tail for a driver/digest command that exited non-zero
+/// (card B-0-F6 Work item 1).
+///
+/// Prefers the command's own stderr. When stderr carries no content,
+/// falls back to the last ~4000 bytes of the run's log file — drivers
+/// pipe the tool's output through `2>&1 | tee "$NB_LOG"`, so on failure
+/// the reason (a sanity refusal, a tool error) is in the log while
+/// stderr is empty and an error built from stderr alone prints as
+/// `exit 1): ` with nothing after it. A missing, unreadable or empty
+/// log is reported as such, never as an empty tail.
+fn failure_message_tail(stderr: &[u8], log: &Path) -> String {
+    let stderr_tail = crate::podman::stderr_tail(stderr);
+    if !stderr_tail.trim().is_empty() {
+        return stderr_tail;
+    }
+    match std::fs::read(log) {
+        Ok(bytes) => {
+            let log_tail = crate::podman::stderr_tail(&bytes);
+            if log_tail.trim().is_empty() {
+                format!("no stderr; log {} is empty", log.display())
+            } else {
+                format!(
+                    "no stderr; tail of {}:\n{}",
+                    log.display(),
+                    log_tail.trim_end()
+                )
+            }
+        }
+        Err(e) => format!("no stderr; log {} unreadable: {e}", log.display()),
+    }
+}
+
 /// Context for one driver execution (keeps the argument list small).
 struct ExecCtx<'a> {
     root: &'a Path,
@@ -328,7 +367,9 @@ fn exec_driver(
         return Err(Error::Command {
             name: format!("driver {} [{tag}]", row.id),
             status: out.status.code().unwrap_or(-1),
-            stderr_tail: crate::podman::stderr_tail(&out.stderr),
+            // The driver tees its tool's output into NB_LOG, so an
+            // empty stderr must not hide the reason (card B-0-F6).
+            stderr_tail: failure_message_tail(&out.stderr, &log),
         });
     }
     if mode == "init" || mode == "reinit" {
@@ -411,6 +452,10 @@ fn run_digest(ctx: &DigestCtx<'_>, phase: &str) -> Result<String> {
         )));
     }
     let exe = std::env::current_exe().map_err(Error::Io)?;
+    // Digest invocations get their own NB_LOG (like drivers do), so a
+    // failing script that tees or writes there is surfaced by the
+    // stderr-empty fallback (card B-0-F6 Work item 1).
+    let log = workdir.join(format!("digest-{phase}.log"));
     let mut cmd = Command::new("bash");
     cmd.arg(&script)
         .env("NB_HARNESS", root)
@@ -421,6 +466,7 @@ fn run_digest(ctx: &DigestCtx<'_>, phase: &str) -> Result<String> {
         .env("NB_DB", "nbench")
         .env("NB_PHASE", phase)
         .env("NB_OUT", workdir)
+        .env("NB_LOG", &log)
         .env("NB_BIN", &exe)
         .env("NB_IMAGE", "")
         .env("NBENCH_ROOT", root)
@@ -442,7 +488,9 @@ fn run_digest(ctx: &DigestCtx<'_>, phase: &str) -> Result<String> {
         return Err(Error::Command {
             name: format!("digest {} [{phase}]", row.id),
             status: out.status.code().unwrap_or(-1),
-            stderr_tail: crate::podman::stderr_tail(&out.stderr),
+            // Same fallback as drivers: an empty stderr must not hide
+            // the reason (card B-0-F6).
+            stderr_tail: failure_message_tail(&out.stderr, &log),
         });
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1110,5 +1158,118 @@ mod tests {
                 .and_then(|o| o.get("ci95"))
                 .cloned(),
         );
+    }
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("nbench-tests").join(format!(
+            "{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn empty_stderr_falls_back_to_the_log_tail() {
+        // Card B-0-F6 Work item 1, mutant STDERR-ONLY: the qdrant-style
+        // driver pipes its tool through `2>&1 | tee "$NB_LOG"`, so a
+        // failure (here: the sanity refusal that actually killed
+        // chain10) leaves stderr empty and the reason in the log. The
+        // message must surface the log's tail and say where it came
+        // from — never an empty "exit 1): " tail.
+        let dir = tmpdir("runner-fallback");
+        let log = dir.join("ef_search=16-run-0.log");
+        std::fs::write(
+            &log,
+            "uploaded 1000000 / 1000000\n\
+             collection green with 1000000 points in 432.1s total\n\
+             error: latency sanity refused the pass: p50 44.07 ms exceeds the 10 ms limit\n",
+        )
+        .expect("write log");
+        let msg = failure_message_tail(b"", &log);
+        assert!(
+            msg.contains("latency sanity refused the pass"),
+            "must quote the log's reason: {msg}"
+        );
+        assert!(
+            msg.contains(log.to_string_lossy().as_ref()),
+            "must name the log the tail came from: {msg}"
+        );
+        assert!(
+            msg.starts_with("no stderr; tail of"),
+            "must say stderr was empty: {msg}"
+        );
+    }
+
+    #[test]
+    fn stderr_with_content_wins_over_the_log() {
+        // The inverse direction: a command that did print to stderr
+        // reports its own stderr, and the log is not mixed in.
+        let dir = tmpdir("runner-stderr-wins");
+        let log = dir.join("run-0.log");
+        std::fs::write(&log, "log-only content\n").expect("write log");
+        let msg = failure_message_tail(b"psql: error: connection refused\n", &log);
+        assert!(
+            msg.contains("psql: error: connection refused"),
+            "stderr content is the message: {msg}"
+        );
+        assert!(
+            !msg.contains("log-only content"),
+            "the log must not leak into a stderr-backed message: {msg}"
+        );
+        // whitespace-only stderr is as empty as no stderr (it produces
+        // the same blank-after-colon error the card exists to fix)
+        let msg = failure_message_tail(b"  \n", &log);
+        assert!(
+            msg.contains("log-only content"),
+            "whitespace-only stderr falls back to the log: {msg}"
+        );
+    }
+
+    #[test]
+    fn log_tail_fallback_keeps_only_the_last_4000_bytes() {
+        // The fallback is bounded like every other harness tail: a log
+        // larger than 4000 bytes contributes its end, not all of it.
+        let dir = tmpdir("runner-fallback-trunc");
+        let log = dir.join("big.log");
+        let mut text = String::new();
+        for i in 0..2000 {
+            // "lineNNNN\n" — 9 bytes per line, 18000 bytes total
+            text.push_str(&format!("line{i:04}\n"));
+        }
+        std::fs::write(&log, &text).expect("write big log");
+        let msg = failure_message_tail(b"", &log);
+        assert!(
+            msg.contains("line1999\n") || msg.ends_with("line1999"),
+            "the end of the log is kept: {msg}"
+        );
+        assert!(
+            !msg.contains("line0000"),
+            "the head of a big log is dropped: {} bytes",
+            msg.len()
+        );
+        assert!(
+            msg.len() < 4200,
+            "message stays near the 4000-byte bound: {} bytes",
+            msg.len()
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_log_is_reported_not_swallowed() {
+        // When there is nothing to show, the message says so: an empty
+        // tail would recreate the silent "exit 1): " the card fixes.
+        let dir = tmpdir("runner-fallback-absent");
+        let missing = dir.join("never-written.log");
+        let msg = failure_message_tail(b"", &missing);
+        assert!(
+            msg.contains("no stderr") && msg.contains("unreadable"),
+            "a missing log is named: {msg}"
+        );
+        let empty = dir.join("empty.log");
+        std::fs::write(&empty, "").expect("write empty log");
+        let msg = failure_message_tail(b"", &empty);
+        assert_eq!(msg, format!("no stderr; log {} is empty", empty.display()));
     }
 }
