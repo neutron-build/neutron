@@ -7,9 +7,14 @@
 //! own user unit (`nbench-<system>`, `--collect`, no `--wait`) and are
 //! stopped with `systemctl --user stop`, so a crashed run never leaks a
 //! competitor container.
+//!
+//! Stopping a unit that is not loaded is *expected* — it happens before
+//! every row, successful or not — so [`unit_stop`] discards that
+//! chatter instead of printing "Failed to stop … Unit … not loaded."
+//! ahead of every result (card B-0-F6 Work item 2).
 
 use crate::error::{Error, Result};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Output of a finished foreground command (success implies exit 0).
@@ -33,7 +38,10 @@ fn tail(s: &str, max: usize) -> String {
     }
 }
 
-/// A short tail of a command's stderr, for error messages.
+/// A short tail of a command's output — its stderr, or an `NB_LOG`
+/// file the command wrote through `2>&1 | tee` — for error messages:
+/// the last 4000 bytes, cut at a character boundary (card B-0-F6 uses
+/// it for both stderr and the log-tail fallback).
 pub fn stderr_tail(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     let max = 4000;
@@ -104,9 +112,19 @@ pub fn unit_start(unit: &str, args: &[&str]) -> Result<()> {
 }
 
 /// Stop a user unit and wait until it is gone (bounded).
+///
+/// The stop call's output is discarded: stopping a unit that is not
+/// loaded is the normal first-stop case, and systemd's "Failed to stop
+/// … Unit … not loaded." would otherwise precede every row, successful
+/// or not, as noise the operator cannot act on (card B-0-F6 Work item
+/// 2). Real stop failures are surfaced by the unit failing to
+/// disappear, which the polling loop below bounds.
 pub fn unit_stop(unit: &str) {
     let _ = Command::new("systemctl")
         .args(["--user", "stop", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     // Wait for the unit to fully disappear so a restart cannot race the
     // old container's cgroup cleanup.
@@ -154,5 +172,45 @@ mod tests {
         // character boundary (the 'ö'), yielding its tail.
         assert_eq!(tail("héllo wörld", 5), "...örld");
         assert_eq!(tail("abcdefghij", 3), "...hij");
+    }
+
+    /// Child-mode marker for [`unit_stop_discards_expected_chatter`]:
+    /// set on a re-execution of this very test binary so only the
+    /// `unit_stop` call below runs, with its stdio inherited from the
+    /// child (the parent captures the child's stderr).
+    const UNIT_STOP_CHILD: &str = "NB_UNIT_STOP_SILENCE_CHILD";
+
+    #[test]
+    fn unit_stop_discards_expected_chatter() {
+        // Card B-0-F6 Work item 2, mutant MUTED-STOP: `systemctl --user
+        // stop` on a never-loaded unit prints "Failed to stop … Unit …
+        // not loaded." on stderr — expected before every row — and
+        // `unit_stop` must discard it. stdio config cannot be read back
+        // from a `Command`, so the assertion observes the real thing:
+        // the parent spawns this test binary (`--exact`, so only this
+        // test runs) with the child marker; the child performs one real
+        // `unit_stop` and exits; the parent asserts the child's stderr
+        // carries none of the chatter. Without the `Stdio::null()`
+        // redirection, the inherited stderr leaks the message and this
+        // test fails.
+        if std::env::var_os(UNIT_STOP_CHILD).is_some() {
+            unit_stop("nbench-silence-probe");
+            std::process::exit(0);
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = Command::new(&exe)
+            .args([
+                "--exact",
+                "podman::tests::unit_stop_discards_expected_chatter",
+                "--nocapture",
+            ])
+            .env(UNIT_STOP_CHILD, "1")
+            .output()
+            .expect("spawn child test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Failed to stop") && !stderr.contains("not loaded"),
+            "unit_stop leaked systemd chatter to stderr: {stderr:?}"
+        );
     }
 }
