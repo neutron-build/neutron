@@ -444,6 +444,16 @@ bash_deny=(
   'git stash push'
   'git push origin HEAD'
   'rm -rf target'
+  'git fetch . +HEAD:main'
+  'git fetch --update-head-ok . HEAD:x'
+  'git tag -f v1'
+  'git tag v1 HEAD~1'
+  'git reflog expire --all --expire=now'
+  'git pull . main'
+  'GIT_DIR=../../.git git commit -m x'
+  'env GIT_WORK_TREE=/tmp git add x'
+  'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x'
+  'git fast-import'
 )
 bash_allow=(
   'git status'
@@ -457,6 +467,10 @@ bash_allow=(
   'git branch --show-current'
   'cd nucleus/v3 && cargo test -q -p e1-mvcc'
   'cd nucleus/v3 && bash scripts/gate.sh'
+  'git log --oneline -3'
+  'git diff --stat HEAD~1'
+  'git show HEAD --stat'
+  'git commit -m "fix the tag parser"'
 )
 for c in "${bash_deny[@]}"; do expect_ok "runner: bash deny $c" bp deny "$c"; done
 for c in "${bash_allow[@]}"; do expect_ok "runner: bash allow $c" bp allow "$c"; done
@@ -605,6 +619,73 @@ rvfrom "$gate"; echo more >>"$v3/spikes/rv.txt"; git -C "$r" commit -qam "nucleu
 expect_ok "runner: a non-verdict commit after the gate's verdict, before this run, is not a violation" rv RV "$pre" none
 git -C "$r" checkout -q nucleus/v3-scaffold
 
+# --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
+# The ref store is shared by every worktree, so ref_violations refuses only ref
+# changes it can pin on this run (R1) or that touch a protected ref (R2), and
+# lets concurrent automation through. A template repository: nucleus/v3-scaffold
+# (two commits), main and tag t0 at its tip, nucleus/zz, another card branch
+# card/v3-ZZ, an origin ref, and card/v3-RF one worker commit past pre_head.
+rf0=$t/rf0
+git init -q -b nucleus/v3-scaffold "$rf0"
+git -C "$rf0" commit -q --allow-empty -m "rf base 0"
+git -C "$rf0" commit -q --allow-empty -m "rf base 1"
+git -C "$rf0" branch main && git -C "$rf0" tag t0 && git -C "$rf0" branch nucleus/zz && git -C "$rf0" branch card/v3-ZZ
+git -C "$rf0" update-ref refs/remotes/origin/nucleus/v3-scaffold nucleus/v3-scaffold
+git -C "$rf0" checkout -q -b card/v3-RF
+git -C "$rf0" commit -q --allow-empty -m "nucleus v3: RF work"
+# rf WANT CMD: in a fresh copy of the template, snapshot the refs, run CMD there,
+# and ref_violations (pre_head card/v3-RF~1) must name exactly the refs in WANT
+# (comma-separated; "none" for nothing).
+rf() { local d; d=$(mktemp -d "$t/rf.XXXX"); cp -a "$rf0/." "$d"; PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$d" "$@" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt = pathlib.Path(sys.argv[2])
+pre = subprocess.run(["git", "rev-parse", "card/v3-RF~1"], cwd=wt, capture_output=True, text=True, check=True).stdout.strip()
+before = rc.ref_snapshot(wt)
+subprocess.run(["bash", "-euc", sys.argv[4]], cwd=wt, check=True)
+bad = rc.ref_violations(wt, before, "card/v3-RF", pre)
+got = sorted({b.split(": ")[0] for b in bad})
+want = sorted(w for w in sys.argv[3].split(",") if w != "none")
+print("\n".join(bad))
+print("named:", got, "expected:", want)
+sys.exit(0 if got == want else 1)
+P
+}
+expect_ok "runner refs: RF1 nothing changed is no violation" rf none true
+expect_ok "runner refs: RF2 the card branch advancing is no violation" rf none 'git commit -q --allow-empty -m "nucleus v3: RF more"'
+expect_ok "runner refs: RF3 fetch +card:main is a violation" rf refs/heads/main 'git fetch -q . +card/v3-RF:main'
+expect_ok "runner refs: RF4 another card branch at this run's commit is a violation" rf refs/heads/card/v3-OTHER 'git branch card/v3-OTHER card/v3-RF'
+expect_ok "runner refs: RF5 tag -f to an old commit is a violation" rf refs/tags/t0 'git tag -f t0 nucleus/v3-scaffold~1'
+expect_ok "runner refs: RF6 a new tag at an old commit is a violation" rf refs/tags/t1 'git tag t1 nucleus/v3-scaffold~1'
+expect_ok "runner refs: RF7 rewinding nucleus/v3-scaffold is a violation" rf refs/heads/nucleus/v3-scaffold 'git update-ref refs/heads/nucleus/v3-scaffold nucleus/v3-scaffold~1'
+expect_ok "runner refs: RF8 deleting nucleus/zz is a violation" rf refs/heads/nucleus/zz 'git update-ref -d refs/heads/nucleus/zz'
+# RF9: what other runners, merge passes, pushes and sessions do meanwhile (REF-STRICT
+# refuses this, which is why the rule is attributable and not "any ref").
+rf9='o=$(git commit-tree "nucleus/v3-scaffold^{tree}" -p card/v3-ZZ -m "nucleus v3: ZZ work")
+git update-ref refs/heads/card/v3-ZZ "$o"; git update-ref refs/heads/scratch/passZ "$o"
+m=$(git commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold -p "$o" -m "nucleus v3: merge card/v3-ZZ")
+git update-ref refs/heads/nucleus/v3-scaffold "$m"; git update-ref refs/remotes/origin/nucleus/v3-scaffold "$m"; git update-ref refs/stash "$o"'
+expect_ok "runner refs: RF9 concurrent legitimate ref moves are no violation" rf none "$rf9"
+# RF10: a snapshot outside a repository raises, and a git failure in the check is
+# one entry: neither reads as "no changes" (REF-FAIL-OPEN).
+mkdir -p "$t/notrepo"
+rf10() { GIT_CEILING_DIRECTORIES=$t PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$t/notrepo" "$rf0" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+try:
+    snap = rc.ref_snapshot(pathlib.Path(sys.argv[2]))
+    print("snapshot outside a repository returned", snap)
+    raised = False
+except subprocess.CalledProcessError:
+    raised = True
+wt = pathlib.Path(sys.argv[3])
+bad = rc.ref_violations(wt, rc.ref_snapshot(wt), "card/v3-RF", "no-such-rev")
+print(bad)
+sys.exit(0 if raised and len(bad) == 1 and "failed (exit" in bad[0] and "cannot check refs" in bad[0] else 1)
+P
+}
+expect_ok "runner refs: RF10 a failed snapshot raises and a failed check is a violation" rf10
+
 # --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
 # The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
 # attempt accounting (nv3-B-0-esc-1) live in main()'s attempt loop, so these run
@@ -638,6 +719,13 @@ for a in ${inv[$i]}; do
     quota) echo '{"type":"error","sessionID":"ses_fake","error":{"name":"provider.quota"}}' ;;
     silent) echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":1234,"output":56,"reasoning":7}}}'; sleep 30; exit 0 ;;
     mute) sleep 30; exit 0 ;;
+    refmove) git fetch -q . +HEAD:refs/heads/main ;;
+    foreign) o=$(git commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold -m "nucleus v3: ZF work")
+      git update-ref refs/heads/card/v3-ZF "$o"; git update-ref refs/heads/scratch/passZ "$o"
+      m=$(git commit-tree "nucleus/v3-scaffold^{tree}" -p nucleus/v3-scaffold -p "$o" -m "nucleus v3: merge card/v3-ZF")
+      git update-ref refs/heads/nucleus/v3-scaffold "$m"; git update-ref refs/remotes/origin/nucleus/v3-scaffold "$m"; git update-ref refs/stash "$o" ;;
+    side) git update-ref "refs/heads/side-$id" "$(git commit-tree "HEAD^{tree}" -p HEAD -m "nucleus v3: $id side")" ;;
+    adopt) git merge -q --ff-only "side-$id" ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -782,6 +870,30 @@ export E2E_SIGTERM_AFTER=1 E2E_STALL_S=30
 e2e XK "forge silent" --attempts 1
 unset E2E_SIGTERM_AFTER E2E_STALL_S
 expect_ok "runner e2e: K: SIGTERM kills opencode and closes the ledger range" res XK "rc == 143 and dead() and $closed"
+# R: refs outside the card branch, moved from inside a run (X-6-F1-F3-F1).
+# refmove is `git fetch . +HEAD:main` (the fake binary is not under the deny list).
+main_at='subprocess.run(["git", "-C", repo, "rev-parse", "main"], capture_output=True, text=True).stdout.strip()'
+git -C "$r" branch -f main nucleus/v3-scaffold
+e2e XR1 "work refmove" --attempts 3
+expect_ok "runner e2e: RF1: moving main stops the run, prints the restore and does not run it" \
+  res XR1 "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and 'refs/heads/main: ' in out and 'git update-ref refs/heads/main ' in out and $main_at == H"
+# RF2: the move in a killed attempt 1 is caught by its own check (REF-SKIP-KILLED
+# would stop at attempt 2 instead).
+git -C "$r" branch -f main nucleus/v3-scaffold
+e2e XR2 "refmove silent;work" --attempts 3
+expect_ok "runner e2e: RF2: a ref moved in a killed attempt stops the run at that attempt" \
+  res XR2 "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and r['killed'][0]['reason'] == 'silence' and 'refs/heads/main: ' in out and 'attempt 2:' not in out"
+git -C "$r" branch -f main nucleus/v3-scaffold
+# RF4: a side ref made in attempt 1 carries this run's commit only once attempt 2
+# merges it, so only a snapshot taken once per run sees it (REF-SNAP-PER-ATTEMPT).
+e2e XR4 "side silent;adopt" --attempts 3
+expect_ok "runner e2e: RF4: a side ref adopted in a later attempt is caught against the run's snapshot" \
+  res XR4 "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 2 and 'refs/heads/side-XR4: (none) -> ' in out and \"carries this run's commit\" in out"
+# RF3 (control, last: it moves nucleus/v3-scaffold): concurrent legitimate moves
+# during a run let it pass (REF-STRICT refuses it).
+e2e XR3 "work foreign" --attempts 1
+expect_ok "runner e2e: RF3: concurrent legitimate ref moves during a run pass" \
+  res XR3 "rc == 0 and r['pass'] and r['scope'] == 'ok' and 'refs changed' not in out"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi

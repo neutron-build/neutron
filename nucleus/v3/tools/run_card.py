@@ -5,7 +5,7 @@ Usage: nucleus/v3/tools/run_card.py nucleus/v3/cards/<id>.local.md [--base <bran
        [--attempts 3] [--model zai-coding-plan/glm-5.3] [--keep [--trust-existing]]
 
 Flow: worktree on branch card/v3-<id> from --base -> copy card + worker prompt in (they are local-only)
--> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, curl, wget, brew, git push/reset/checkout/stash, history rewrites, git-state edits and git global options) -> scope guard (only the
+-> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, curl, wget, brew, git push/reset/checkout/stash, git fetch/pull/tag/reflog/fast-import, history rewrites, git-state edits, git global options and their GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_CONFIG* environment forms) -> scope guard (only the
 card's "Touch only" globs) -> acceptance commands -> up to N attempts with failure output fed back ->
 RUNLOG row. Every attempt first checks free disk. Nothing is merged here: a gate writes
 verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3, §7.6).
@@ -83,11 +83,27 @@ OPENCODE_CONFIG = {
         # bash_permission() models this for the scenarios. Each denial is listed at the
         # command's start, after a space ("GIT_DIR=x git reset", "xargs rm") and after
         # a "/" ("/usr/bin/git reset"). Workers run git from their cwd, so any global
-        # option before the verb (-C, -c, --git-dir, --work-tree) is denied outright.
+        # option before the verb (-C, -c, --git-dir, --work-tree) is denied outright, and
+        # so are its environment forms (GIT_DIR=, GIT_WORK_TREE=, GIT_COMMON_DIR=, and
+        # GIT_CONFIG*, which is -c and config redirection by another name). fetch, pull,
+        # tag, reflog and fast-import write refs outside the card branch; a worker never
+        # needs them, since the base is local and there is no network.
         # A guard-rail, not the enforcement: interpreters, `sh -c '...'`, eval, words
         # built from quotes or variables (g"it" reset, $G reset), combined short flags
-        # (git branch -qf) and scripts that run git all pass it. The post-hoc scope
-        # check, which diffs against the tree as it was before the run, catches them.
+        # (git branch -qf) and scripts that run git all pass it. So do:
+        # - whitespace the patterns do not normalise: `git  reset` (two spaces), a tab
+        #   between words, a backslash-newline continuation;
+        # - `export GIT_DIR=...` followed by `git ...`: tree-sitter parses `export` as a
+        #   declaration_command, not a command, so it is never checked;
+        # - plumbing ref writers not denied by name (`git send-pack .`, `git http-push`);
+        # - a non-fast-forward of another card branch (`git branch -f` through
+        #   indirection). It is not attributable, since runners reset card branches
+        #   with `worktree add -B`; merge-card.sh still refuses a card whose tip no
+        #   longer carries its verdict, so it fails loudly, not silently.
+        # The post-hoc scope check, which diffs against the tree as it was before the
+        # run, catches the file edits. The post-hoc ref check (ref_violations) catches
+        # every write of a ref that carries this run's commits or is protected,
+        # whatever the spelling.
         "bash": {
             "*": "allow",
             **{
@@ -96,6 +112,8 @@ OPENCODE_CONFIG = {
                     "rm *", "sudo *", "curl *", "wget *", "brew *",
                     "git -*",
                     "git push*", "git reset*", "git checkout*", "git stash*",
+                    "git fetch*", "git pull*", "git tag*", "git reflog*", "git fast-import*",
+                    "GIT_DIR=*", "GIT_WORK_TREE=*", "GIT_COMMON_DIR=*", "GIT_CONFIG*",
                     "git rebase*", "git commit *--amend*", "git update-ref*", "git switch*", "git restore*",
                     "git replace*", "git update-index*", "git config*", "git filter-branch*",
                     "git worktree*", "git symbolic-ref*", "git notes*",
@@ -343,6 +361,80 @@ def stray_commits(card_id, branch, since):
     return [l for l in p.stdout.splitlines() if card_id in l]
 
 
+def ref_snapshot(wt):
+    """{refname: oid} for every ref, read in the card worktree (which shares the
+    ref store with ROOT). A failed git raises, as git_paths does: an empty
+    snapshot would read as "nothing to compare". refs/stash is left out, because
+    other sessions on this machine push and drop it at any time. A refname
+    cannot hold a control character, so one line per ref with a NUL before the
+    oid parses every name."""
+    cmd = ["git", "for-each-ref", "--format=%(refname)%00%(objectname)"]
+    p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+    refs = dict(l.split("\0", 1) for l in p.stdout.splitlines() if l)
+    refs.pop("refs/stash", None)
+    return refs
+
+
+def ref_violations(wt, before, branch, pre_head):
+    """Ref changes since the snapshot `before` that the runner refuses: entries
+    "<ref>: <old|(none)> -> <new|(deleted)> <why>", one per ref and rule.
+
+    The literal rule, "any ref but refs/heads/<branch> changed", would refuse
+    most runs. This repository's ref store is shared by every worktree, and refs
+    move legitimately while a card runs: v2 and other v3 runners commit to their
+    card branches and reset them (`worktree add -B`), merge passes create
+    scratch/passN and fast-forward nucleus/v3-scaffold, pushes and fetches move
+    refs/remotes/origin/*, and other sessions push and drop refs/stash. So only
+    changes this run can be blamed for, or that no automation may make, count:
+    - R1 (taint): a ref whose new value reaches a commit this run's worker made,
+      i.e. one on the card branch now that pre_head does not reach;
+    - R2 (protected): any change to refs/heads/main, refs/tags/*, refs/notes/*
+      or refs/replace/*, and a deletion or non-fast-forward of refs/heads/nucleus/*.
+    A merge pass's fast-forward of nucleus/v3-scaffold passes both: it is a
+    fast-forward, and it cannot carry this card's commits before its gate.
+
+    This closes the accidental and rationalised ref writes and the plain verbs.
+    A worker with a shell can still write a ref that is neither attributable nor
+    protected (a non-fast-forward of another card branch, made at a commit it did
+    not make). Any git failure is one entry naming the command, never a pass."""
+    def git(*args):
+        cmd = ["git", *args]
+        p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if p.returncode not in ((0, 1) if args[0] == "merge-base" else (0,)):
+            raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+        return p
+
+    def reaches(a, b):  # merge-base --is-ancestor exits 0 (yes), 1 (no), or fails
+        return git("merge-base", "--is-ancestor", a, b).returncode == 0
+
+    own = f"refs/heads/{branch}"
+    bad = []
+    try:
+        after = ref_snapshot(wt)
+        # W is listed even when no ref moved, so a bad pre_head always fails here.
+        worker = git("rev-list", own, f"^{pre_head}", "--").stdout.split()
+        for ref in sorted(set(before) | set(after)):
+            old, new = before.get(ref), after.get(ref)
+            if old == new or ref == own:
+                continue
+            move = f"{ref}: {old or '(none)'} -> {new or '(deleted)'}"
+            hit = next((w for w in worker if reaches(w, new)), None) if new else None
+            if hit:
+                bad.append(f"{move} carries this run's commit {hit[:10]}")
+            if ref == "refs/heads/main" or ref.startswith(("refs/tags/", "refs/notes/", "refs/replace/")):
+                bad.append(f"{move} (protected: may not change)")
+            elif ref.startswith("refs/heads/nucleus/") and old and not new:
+                bad.append(f"{move} (protected: nucleus/* may not be deleted)")
+            elif ref.startswith("refs/heads/nucleus/") and old and not reaches(old, new):
+                bad.append(f"{move} (protected: nucleus/* may move only as a fast-forward)")
+    except subprocess.CalledProcessError as e:
+        why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
+        return [f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot check refs; treating as changed)"]
+    return bad
+
+
 def parse_tokens(log_path):
     tot = {"input": 0, "output": 0, "reasoning": 0}
     session = None
@@ -455,6 +547,34 @@ def main():
     # Anything on the branch before the first attempt was not written by this run's worker.
     _, pre_head = run(["git", "rev-parse", "HEAD"], wt)
     pre_head = pre_head.strip()
+    # Once per run, never per attempt: a ref an earlier (or killed) attempt moved
+    # must still differ at every later check.
+    try:
+        refs_before = ref_snapshot(wt)
+    except subprocess.CalledProcessError as e:
+        why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
+        sys.exit(f"[{card_id}] cannot snapshot refs: {' '.join(e.cmd)} failed (exit {e.returncode}): {why}")
+    refs_reported, refs_final = None, False
+
+    def refs_moved(header):
+        # Prints the operator's restore commands but never runs them: a concurrent
+        # legitimate update could be clobbered, and the operator decides.
+        nonlocal refs_reported
+        bad = ref_violations(wt, refs_before, branch, pre_head)
+        if bad and bad != refs_reported:
+            lines = [f"[{card_id}] {header}:"]
+            for i, v in enumerate(bad):
+                lines.append(v)
+                ref, _, rest = v.partition(": ")
+                if not ref.startswith("refs/") or (i + 1 < len(bad) and bad[i + 1].startswith(ref + ": ")):
+                    continue  # a git failure, or not this ref's last entry
+                old, new = rest.split(" ")[0], rest.split(" ")[2]
+                fix = f"git update-ref -d {ref} {new}" if old == "(none)" else f"git update-ref {ref} {old} {'0' * len(old)}" if new == "(deleted)" else f"git update-ref {ref} {old} {new}"
+                lines.append(f"  to restore (not run; check for a concurrent update first): {fix}")
+            print("\n".join(lines), flush=True)
+            refs_reported = bad
+        return bad
+
     session = None
     result = {"pass": False, "attempts": 0, "in": 0, "out": 0, "reasoning": 0, "scope": "n/a", "seconds": 0, "killed": []}
     t0 = time.time()
@@ -518,6 +638,11 @@ def main():
                 result["killed"].append({"attempt": attempt, "reason": killed, "silence_s": silence})
                 why = "of silence" if killed == "silence" else "(timed out or disk nearly full)"
                 print(f"[{card_id}] attempt {attempt}: opencode killed after {(silence if killed == 'silence' else waited) / 60:.0f} min {why} ({silence} s since its last output; {toks['input']}/{toks['output']} tokens this attempt)", flush=True)
+            # Every attempt, killed ones too: the worker cannot repair a ref outside
+            # its worktree, and a retry prompt would invite it to try.
+            if refs_moved("refs changed outside the card branch; stopping"):
+                result["scope"] = "OUTSIDE"
+                break
             if not finished:
                 continue
             stray = stray_commits(card_id, branch, t0)
@@ -557,7 +682,8 @@ def main():
         # The row reports the final tree, however the loop ended: a killed or
         # exhausted last attempt used to leave "scope n/a".
         bad = scope_violations(wt, args.base, touch, card_id, pre_head, ledger)
-        result["scope"] = "OUTSIDE" if stray_commits(card_id, branch, t0) else "FAIL" if bad else "ok"
+        refs_bad, refs_final = refs_moved("final ref check: refs changed outside the card branch"), True
+        result["scope"] = "OUTSIDE" if refs_bad or stray_commits(card_id, branch, t0) else "FAIL" if bad else "ok"
         if bad:
             print(f"[{card_id}] final scope FAIL: " + "; ".join(bad), flush=True)
         row = f"| {time.strftime('%Y-%m-%d %H:%M')} | {card_id} | {args.model.split('/')[-1]} | {result['attempts']} | {'yes' if result['pass'] else 'NO'} | {result['scope']} | {result['in']} | {result['out'] + result['reasoning']} | {result['seconds']}s |\n"
@@ -579,6 +705,8 @@ def main():
         _, head = run(["git", "rev-parse", "HEAD"], wt)
         head = head.strip()
         ledger_append(ledger, {"run": run_id, "end": head if re.fullmatch(r"[0-9a-f]{40}", head) else None, "t": time.time()})
+        if not refs_final:  # an exit that skipped the final check (quota, disk, exception, signal)
+            refs_moved("refs changed outside the card branch (at exit)")
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
     sys.exit(0 if result["pass"] else 1)
