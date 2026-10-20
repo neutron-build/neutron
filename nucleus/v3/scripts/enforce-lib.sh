@@ -46,11 +46,19 @@ check_merge() {
   if [ "$vgate" = P ] && [ "$tier" != P ]; then errs+=("card needs a P gate; verdict tier is $tier"); fi
 
   # The verdict must be the last commit, cover the commit before it, and touch only itself.
+  # Commit must be a literal hex id, matched before git sees it: a ref or revision
+  # expression (card/v3-X~1, HEAD^, <hex>~0) is re-evaluated at merge time, so it
+  # follows the branch and "covers" whatever is under the verdict now, reviewed
+  # or not. The class is spelled out so no locale reads a-f as a collation range.
   local tipfiles=() reviewed
   mapfile -d '' -t tipfiles < <(git diff-tree -z --no-commit-id --name-only -r "$head" -- ':/')
   { [ ${#tipfiles[@]} -eq 1 ] && [ "${tipfiles[0]}" = "$own" ]; } || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: ${tipfiles[*]}")
-  reviewed=$(git rev-parse -q --verify "$vcommit^{commit}" 2>/dev/null || true)
-  [ -n "$reviewed" ] && [ "$reviewed" = "$(git rev-parse "$head^")" ] || errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
+  if [[ $vcommit =~ ^[0123456789abcdef]{7,40}$ ]]; then
+    reviewed=$(git rev-parse -q --verify "$vcommit^{commit}" 2>/dev/null || true)
+    [ -n "$reviewed" ] && [ "$reviewed" = "$(git rev-parse "$head^")" ] || errs+=("verdict Commit '$vcommit' is not the commit under the verdict ($(git rev-parse --short "$head^"))")
+  else
+    errs+=("verdict Commit '$vcommit' is not a hex commit id (7-40 lowercase hex digits; revision expressions are refused)")
+  fi
 
   # What the card changed, excluding its own verdict file.
   local f rel core_entries lst

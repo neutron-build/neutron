@@ -17,7 +17,7 @@ Gate-model: <model id, e.g. claude-opus-5-5>
 Gate-session: <T3 task id / agent id of the gating session>
 Date: <YYYY-MM-DD>
 Gate-exit: GATE EXIT=0           (the literal last line of scripts/gate.sh on the branch tip)
-Commit: <card branch tip the verdict covers>
+Commit: <hex id (7-40) of the card commit the verdict covers, i.e. tip^>
 Mutants: <name -> catching test | UNCAUGHT>, ...   (or "n/a")
 Followups: <card ids, comma-separated> | none
 ```
