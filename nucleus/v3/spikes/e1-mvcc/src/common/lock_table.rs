@@ -39,6 +39,11 @@
 //!   counter minus the txn's own count — never a shard scan. Under
 //!   sustained foreign traffic a big txn may therefore never escalate;
 //!   that outcome is legitimate and is what W6 must report.
+//! - L-WAIT-OBS: the parked-waiter count ([`LockTable::waiting`]) is
+//!   **per-table** state (card X-1a-F3): it counts exactly the threads
+//!   inside this table's wait paths, so the suite's blocked-path
+//!   barrier observes one engine's waiters without any process-global
+//!   hook that a concurrent test could satisfy.
 //!
 //! Lock order (one order everywhere): **per-txn index shard → key
 //! shard.** The per-txn index is itself sharded by `TxnId`
@@ -71,51 +76,25 @@ use std::time::Instant;
 
 use crate::api::{TxnErr, TxnId, Wait};
 
-/// Number of threads currently inside [`LockTable::acquire`]'s wait
-/// paths, process-wide (see [`waiting`]).
-static WAITING: AtomicU64 = AtomicU64::new(0);
+/// Counts one parked waiter on one table for as long as it lives (RAII,
+/// so every return path — timeout, engine error, clear — decrements).
+/// Borrows the table so the count is per-table, never process-global
+/// (card X-1a-F3).
+struct WaitingGuard<'a> {
+    table: &'a LockTable,
+}
 
-/// Counts one parked waiter for as long as it lives (RAII, so every
-/// return path — timeout, engine error, clear — decrements).
-struct WaitingGuard;
-
-impl WaitingGuard {
-    fn new() -> Self {
-        WAITING.fetch_add(1, Ordering::AcqRel);
-        WaitingGuard
+impl<'a> WaitingGuard<'a> {
+    fn new(table: &'a LockTable) -> Self {
+        table.waiters.fetch_add(1, Ordering::AcqRel);
+        WaitingGuard { table }
     }
 }
 
-impl Drop for WaitingGuard {
+impl Drop for WaitingGuard<'_> {
     fn drop(&mut self) {
-        WAITING.fetch_sub(1, Ordering::AcqRel);
+        self.table.waiters.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-/// The number of threads currently inside [`LockTable::acquire`]'s wait
-/// paths (shard or table-owner), across every lock table in the process.
-///
-/// This is test observability for the suite's blocked-path scenarios
-/// (verdict X-1a D1): a scenario spawns a waiter, waits until this
-/// count rises, and only then resolves the blocker. The barrier proves
-/// the waiter entered the wait path — and therefore ran everything the
-/// engine does before it, including any pre-acquire conflict checks —
-/// **while the blocker still held the lock**. Without it the waiter
-/// thread may not be scheduled until after the blocker's commit, and
-/// the check-after-wait re-check the scenario exists to exercise never
-/// runs (the verdict's O7 mutant then passes by scheduling luck).
-///
-/// Scenarios run sequentially inside `run_all` and join their threads
-/// before returning, so at a barrier the count is 0 until the scenario's
-/// own waiter parks. Like [`crate::common::commit::apply_gate`] the
-/// counter is process-global because the [`crate::api::TxnEngine`]
-/// trait exposes no per-engine hooks.
-///
-/// Cost: one atomic pair, taken only on paths that are about to park on
-/// a condvar — the uncontended acquire path (the common case) never
-/// touches it.
-pub fn waiting() -> u64 {
-    WAITING.load(Ordering::Acquire)
 }
 
 /// Number of independently latched key shards (card Work 3).
@@ -168,6 +147,11 @@ pub struct LockTable {
     /// L-ESCALATE-DEFER is `rows > own count`. Maintained under the
     /// shard mutex at every insert and removal.
     rows: AtomicU64,
+    /// Threads currently inside [`LockTable::acquire`]'s wait paths on
+    /// **this** table (L-WAIT-OBS). Per-table state, so the suite's
+    /// blocked-path barrier observes one engine's waiters only (card
+    /// X-1a-F3).
+    waiters: AtomicU64,
     escalate_at: usize,
     escalations: AtomicU64,
     attempts: AtomicU64,
@@ -193,6 +177,7 @@ impl LockTable {
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
             rows: AtomicU64::new(0),
+            waiters: AtomicU64::new(0),
             escalate_at,
             escalations: AtomicU64::new(0),
             attempts: AtomicU64::new(0),
@@ -431,6 +416,36 @@ impl LockTable {
         self.visits.load(Ordering::Relaxed)
     }
 
+    /// The number of threads currently inside [`LockTable::acquire`]'s
+    /// wait paths (shard or table-owner) on **this table**.
+    ///
+    /// This is test observability for the suite's blocked-path scenarios
+    /// (verdict X-1a D1): a scenario spawns a waiter, waits until this
+    /// count rises on the engine's own table, and only then resolves the
+    /// blocker. The barrier proves the waiter entered the wait path —
+    /// and therefore ran everything the engine does before it, including
+    /// any pre-acquire conflict checks — **while the blocker still held
+    /// the lock**. Without it the waiter thread may not be scheduled
+    /// until after the blocker's commit, and the check-after-wait
+    /// re-check the scenario exists to exercise never runs (the
+    /// verdict's O7 mutant then passes by scheduling luck).
+    ///
+    /// The count is per-table (L-WAIT-OBS, card X-1a-F3): each engine
+    /// owns its lock table, reached through the `#[doc(hidden)]` hook of
+    /// [`crate::api::TxnEngine::lock_table`], so waiters parked by a
+    /// concurrent test or `run_all` on another engine can never satisfy
+    /// this table's barrier. A waiter already parked on this table when
+    /// the barrier is entered makes the 0→1 transition unattributable,
+    /// so the suite's barrier rejects that loudly instead of proceeding.
+    ///
+    /// Cost: one atomic pair per waiter, taken only on paths that are
+    /// about to park on a condvar — the uncontended acquire path (the
+    /// common case) never touches it.
+    #[doc(hidden)]
+    pub fn waiting(&self) -> u64 {
+        self.waiters.load(Ordering::Acquire)
+    }
+
     /// Remove one row owned by `txn` (the escalation-race undo of step
     /// (3)).
     fn remove_row(&self, key: &[u8], txn: TxnId) {
@@ -546,7 +561,7 @@ impl LockTable {
             None => return Err(TxnErr::LockNotAvailable),
         };
         let mut t = self.lock_table()?;
-        let _waiting = WaitingGuard::new();
+        let _waiting = WaitingGuard::new(self);
         loop {
             if t.owner != Some(owner) {
                 return Ok(());
@@ -594,7 +609,7 @@ impl LockTable {
             Ok(g) => g,
             Err(e) => return Err(TxnErr::Engine(crate::common::was_poisoned(&e))),
         };
-        let _waiting = WaitingGuard::new();
+        let _waiting = WaitingGuard::new(self);
         loop {
             let clear = match sh.get(key) {
                 None => true,

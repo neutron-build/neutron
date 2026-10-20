@@ -10,11 +10,18 @@
 //!   until every smaller ts has applied. A reader at a snapshot `S` thus
 //!   sees **all** commits `<= S` and **no** commit `> S` (C-T0 §3.1 "why
 //!   that is enough").
+//! - S-GATE-SCOPE (card X-1a-F3, C-GATE-SCOPE): the test-only apply gate
+//!   is **per-sequencer** state — arming it parks only commits whose
+//!   [`commit_with`](crate::common::commit_with) receives this
+//!   sequencer, never another engine's. (`Sequencer::new` also records
+//!   a `Weak` pointer for the free-function compatibility bridge of
+//!   [`commit::apply_gate`]; no engine path reads it.)
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::api::Ts;
+use crate::common::commit::apply_gate::{self, ApplyGate};
 
 /// Interior state of [`Sequencer`].
 struct SeqState {
@@ -33,18 +40,38 @@ struct SeqState {
 /// Shared by every arm and by the reference engine (card Work 3).
 pub struct Sequencer {
     state: Mutex<SeqState>,
+    /// This sequencer's test-only apply gate (S-GATE-SCOPE, card
+    /// X-1a-F3): every `commit_with` on this sequencer consults it, and
+    /// no other engine's commit does. Shared ownership (`Arc`) so the
+    /// gate outlives any guard the free-function compatibility bridge
+    /// holds (see [`apply_gate`](crate::common::commit::apply_gate));
+    /// the engine path only ever reads through
+    /// [`Sequencer::apply_gate`].
+    gate: Arc<ApplyGate>,
 }
 
 impl Sequencer {
     /// A fresh sequencer with nothing committed: `visible_ts = 0`.
     pub fn new() -> Self {
+        let gate = Arc::new(ApplyGate::new());
+        apply_gate::register_latest(&gate);
         Self {
             state: Mutex::new(SeqState {
                 next_ts: 1,
                 visible: 0,
                 pending: BTreeSet::new(),
             }),
+            gate,
         }
+    }
+
+    /// This sequencer's test-only apply gate (card X-1a-F3): the
+    /// per-engine instance `commit_with` consults, so the suite can
+    /// hold this engine's commits without parking any other engine's.
+    /// Test observability, not part of the commit semantics.
+    #[doc(hidden)]
+    pub fn apply_gate(&self) -> &ApplyGate {
+        &self.gate
     }
 
     /// The ts a reader opening a snapshot now must use: the current

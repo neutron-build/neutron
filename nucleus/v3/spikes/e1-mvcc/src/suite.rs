@@ -31,9 +31,14 @@
 //!   O5), and an own Delete is not live while an own Write is.
 //!
 //! Every blocked-path scenario (S4b–S4d, S6a, S6b) resolves its blocker
-//! only after [`wait_parked_waiter`] proves the waiter parked, so those
+//! only after the [`ParkedBarrier`] proves the waiter parked, so those
 //! scenarios are deterministic rather than dependent on the OS
-//! scheduling the waiter thread before the blocker's commit.
+//! scheduling the waiter thread before the blocker's commit. The
+//! barrier and the apply gate are **per-engine** state (card X-1a-F3),
+//! reached through the `#[doc(hidden)]` [`TxnEngine::lock_table`] and
+//! [`TxnEngine::sequencer`] hooks, so two `run_all`s racing in one test
+//! binary cannot satisfy each other's barriers or park each other's
+//! commits (`tests/hooks.rs` proves it).
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,8 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::api::{Isolation, SavepointId, Ts, TxnEngine, TxnErr, Wait};
-use crate::common::commit::apply_gate;
-use crate::common::lock_table::waiting;
+use crate::common::lock_table::LockTable;
 use crate::common::lock_unpoisoned;
 use crate::reference::RefEngine;
 
@@ -53,22 +57,77 @@ use crate::reference::RefEngine;
 const BLOCK: Wait = Wait::Block(Duration::from_secs(30));
 
 /// Barrier for the blocked-path scenarios (verdict D1): wait until at
-/// least one thread is inside `LockTable::acquire`'s wait paths, i.e.
-/// until this scenario's waiter has parked on the blocker's lock. Only
-/// then may the caller resolve the blocker — the waiter provably ran
-/// everything before its wait (including any pre-acquire checks) while
-/// the blocker still held the lock, so the post-wait re-check is
-/// exercised on every run, not by scheduling luck. Scenarios run
-/// sequentially and join their threads, so nothing else can be parked
-/// when this is called.
-fn wait_parked_waiter(fails: &mut Vec<String>, ctx: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while waiting() == 0 {
-        if Instant::now() >= deadline {
-            fails.push(format!("{ctx}: the waiter never parked on the lock"));
+/// least one thread is inside `LockTable::acquire`'s wait paths **on
+/// this engine's table**, i.e. until this scenario's waiter has parked
+/// on the blocker's lock. Only then may the caller resolve the
+/// blocker — the waiter provably ran everything before its wait
+/// (including any pre-acquire checks) while the blocker still held the
+/// lock, so the post-wait re-check is exercised on every run, not by
+/// scheduling luck.
+///
+/// Per-engine since card X-1a-F3: the table comes from
+/// [`TxnEngine::lock_table`] on the engine under test, so a waiter
+/// parked by a concurrent test or `run_all` on another engine can
+/// never satisfy this barrier.
+///
+/// Two phases, because the entry snapshot must be taken while the
+/// scenario is still single-threaded (card X-1a-F3): [`Self::enter`]
+/// runs **before** the waiter thread is spawned, and [`Self::wait`]
+/// after. A count already non-zero at `enter` cannot be this
+/// scenario's waiter (it does not exist yet): it is leftover state on
+/// this engine's table that would make the proof unattributable, and
+/// it fails loudly, naming the context. Taking the snapshot inside
+/// `wait` instead would race the scenario's own waiter — under load
+/// the waiter can park before its spawning thread reaches the barrier,
+/// and a literal check there false-fails a correct scenario (measured:
+/// concurrent `run_all`s hit that about once per 25 full-package runs
+/// before this shape was chosen).
+#[derive(Clone, Copy)]
+struct ParkedBarrier<'a> {
+    ctx: &'a str,
+    table: &'a LockTable,
+    /// Whether the entry snapshot was clean (zero). `false` means the
+    /// loud failure was already pushed; [`Self::wait`] then does
+    /// nothing.
+    entered_clean: bool,
+}
+
+impl<'a> ParkedBarrier<'a> {
+    /// Phase 1 — call before spawning the waiter. A waiter already
+    /// parked on this engine's table pushes a failure naming `ctx`
+    /// (the `NO-ENTRY-CHECK` catcher of card X-1a-F3), and the
+    /// returned barrier's [`Self::wait`] is a no-op.
+    fn enter(fails: &mut Vec<String>, ctx: &'a str, table: &'a LockTable) -> Self {
+        let entered_clean = table.waiting() == 0;
+        if !entered_clean {
+            fails.push(format!(
+                "{ctx}: a waiter was already parked on this engine's lock table at the barrier"
+            ));
+        }
+        Self {
+            ctx,
+            table,
+            entered_clean,
+        }
+    }
+
+    /// Phase 2 — call after spawning the waiter: spin until it parks on
+    /// this table (the only thread that can move a clean snapshot off
+    /// zero is the scenario's own waiter). The 30 s deadline mirrors
+    /// [`BLOCK`]: a correct engine parks in microseconds, a broken one
+    /// fails in seconds.
+    fn wait(&self, fails: &mut Vec<String>) {
+        if !self.entered_clean {
             return;
         }
-        thread::yield_now();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.table.waiting() == 0 {
+            if Instant::now() >= deadline {
+                fails.push(format!("{}: the waiter never parked on the lock", self.ctx));
+                return;
+            }
+            thread::yield_now();
+        }
     }
 }
 
@@ -526,6 +585,9 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             (),
         );
         let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        // The barrier's entry snapshot is taken before the waiter is
+        // spawned (single-threaded, card X-1a-F3).
+        let barrier = ParkedBarrier::enter(&mut f, "S4b", e.lock_table());
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
@@ -541,7 +603,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 };
                 let _ = tx.send(r);
             });
-            wait_parked_waiter(&mut f, "S4b");
+            barrier.wait(&mut f);
             unit(&mut f, "S4b t1 commit", e.commit(t1), 2);
         });
         match rx.recv() {
@@ -588,6 +650,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             (),
         );
         let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        let barrier = ParkedBarrier::enter(&mut f, "S4c", e.lock_table());
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
@@ -597,7 +660,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                     .and_then(|_| e.commit(t2));
                 let _ = tx.send(r);
             });
-            wait_parked_waiter(&mut f, "S4c");
+            barrier.wait(&mut f);
             unit(&mut f, "S4c t1 commit", e.commit(t1), 2);
         });
         match rx.recv() {
@@ -636,6 +699,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
             (),
         );
         let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        let barrier = ParkedBarrier::enter(&mut f, "S4d", e.lock_table());
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
@@ -648,7 +712,7 @@ pub fn s04_write_write<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 };
                 let _ = tx.send(r);
             });
-            wait_parked_waiter(&mut f, "S4d");
+            barrier.wait(&mut f);
             unit(&mut f, "S4d t1 commit", e.commit(t1), 2);
         });
         match rx.recv() {
@@ -748,6 +812,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
         );
         let mut waiter = e.begin(Isolation::ReadCommitted);
         let (tx, rx) = mpsc::channel::<Result<(), TxnErr>>();
+        let barrier = ParkedBarrier::enter(&mut f, "S6a", e.lock_table());
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
@@ -755,7 +820,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 let _ = tx.send(e.insert_unique(&mut waiter, b"u", b"v2", BLOCK));
                 e.abort(waiter);
             });
-            wait_parked_waiter(&mut f, "S6a");
+            barrier.wait(&mut f);
             unit(&mut f, "S6a holder commit", e.commit(holder), 1);
         });
         match rx.recv() {
@@ -781,6 +846,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
         );
         let mut waiter = e.begin(Isolation::ReadCommitted);
         let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
+        let barrier = ParkedBarrier::enter(&mut f, "S6b", e.lock_table());
         thread::scope(|s| {
             let e = &e;
             s.spawn(move || {
@@ -788,7 +854,7 @@ pub fn s06_unique_waiter<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
                 let r = r.and_then(|_| e.commit(waiter));
                 let _ = tx.send(r);
             });
-            wait_parked_waiter(&mut f, "S6b");
+            barrier.wait(&mut f);
             e.abort(holder);
         });
         match rx.recv() {
@@ -1361,7 +1427,7 @@ pub fn s11_atomic_visibility<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> 
             e.put(&mut t2, b"C", &be(1), Wait::NoWait),
             (),
         );
-        let gate = apply_gate::arm();
+        let gate = e.sequencer().apply_gate().arm();
         let (tx, rx) = mpsc::channel::<Result<Ts, TxnErr>>();
         thread::scope(|s| {
             let e = &e;
@@ -1370,7 +1436,11 @@ pub fn s11_atomic_visibility<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> 
                 // its apply does not run.
                 let _ = tx.send(e.commit(t1));
             });
-            if !apply_gate::wait_parked(Duration::from_secs(30)) {
+            if !e
+                .sequencer()
+                .apply_gate()
+                .wait_parked(Duration::from_secs(30))
+            {
                 f.push("S11a: the armed commit never parked".into());
             } else {
                 // t2 commits at ts 3 and applies, but the pending ts 2
@@ -2168,7 +2238,8 @@ pub fn run_all<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    //! Coverage pins of the S13 generator (card X-1a-F2 Work 4).
+    //! Coverage pins of the S13 generator (card X-1a-F2 Work 4), plus
+    //! the barrier entry check of card X-1a-F3 Work 4.
     //!
     //! Snapshot ts are not on the [`crate::api::TxnEngine`] trait, so
     //! these properties are computed by a test-only replay of every
@@ -2188,9 +2259,11 @@ mod tests {
     //! against the same shadow, so the pins stay regression-sensitive.
 
     use std::collections::{BTreeMap, BTreeSet};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::{Out, ScheduleOp, exec_scheduled, gen_schedule};
-    use crate::api::{Isolation, Ts, TxnEngine};
+    use super::{Out, ParkedBarrier, ScheduleOp, exec_scheduled, gen_schedule};
+    use crate::api::{Isolation, Ts, TxnEngine, Wait};
     use crate::reference::RefEngine;
 
     /// The seeds S13 generates (kept in sync with
@@ -2473,6 +2546,70 @@ mod tests {
             total.stale_rollback_targets, 0,
             "a Rollback targeted a savepoint id the slot's current txn \
              never returned (SP-RESET-MISSING)",
+        );
+    }
+
+    /// Card X-1a-F3 Work 4: the barrier must reject a table that
+    /// already has a parked waiter — loudly, naming the context —
+    /// instead of letting an unattributable count satisfy it (the
+    /// `NO-ENTRY-CHECK` catcher).
+    #[test]
+    fn barrier_rejects_preparked_waiter() {
+        let e = RefEngine::new();
+        thread::scope(|s| {
+            let e = &e;
+            let mut holder = e.begin(Isolation::ReadCommitted);
+            let _ = e.put(&mut holder, b"k", b"v", Wait::NoWait);
+            let mut waiter = e.begin(Isolation::ReadCommitted);
+            s.spawn(move || {
+                // Parks on the holder's lock for as long as it is held.
+                let _ = e.put(
+                    &mut waiter,
+                    b"k",
+                    b"w",
+                    Wait::Block(Duration::from_secs(30)),
+                );
+                e.abort(waiter);
+            });
+            // Park the waiter on the engine's own table first, then
+            // enter the barrier exactly as a scenario would: the
+            // already-parked count must fail loudly.
+            let table = e.lock_table();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while table.waiting() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the waiter never parked on the engine's table"
+                );
+                thread::yield_now();
+            }
+            let mut fails = Vec::new();
+            let barrier = ParkedBarrier::enter(&mut fails, "unit-ctx", table);
+            assert_eq!(
+                fails.len(),
+                1,
+                "the barrier must fail exactly once, got: {fails:?}"
+            );
+            assert!(
+                fails.first().is_some_and(|m| m.starts_with("unit-ctx:")),
+                "the failure must name the context, got: {fails:?}"
+            );
+            // After the loud rejection `wait` must do nothing: the
+            // unattributable count must not be spun on.
+            barrier.wait(&mut fails);
+            assert_eq!(
+                fails.len(),
+                1,
+                "wait must not add a failure after the entry rejection"
+            );
+            // Resolve the blocker so the parked thread ends and the
+            // scope can join it.
+            let _ = e.commit(holder);
+        });
+        assert_eq!(
+            e.lock_table().waiting(),
+            0,
+            "the parked waiter drained with the scenario"
         );
     }
 }
