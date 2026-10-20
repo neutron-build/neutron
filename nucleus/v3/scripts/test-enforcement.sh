@@ -295,11 +295,65 @@ checks = {
   "pass-real":   rc.gate_passed(0, "STEP x EXIT=0\nGATE EXIT=0\n"),
   "pass-lies":   not rc.gate_passed(0, "test prints GATE EXIT=0\nSTEP test EXIT=1\nGATE EXIT=1\n"),
   "pass-rc":     not rc.gate_passed(1, "GATE EXIT=0\n"),
+  # A note after the path makes the entry match nothing (X-6-F1-F3).
+  "touch-note":  rc.validate_card(["nucleus/v3/bench/nbench/ (the runner's driver-error construction)"], [G])
+                 == "Touch only entry 'nucleus/v3/bench/nbench/ (the runner's driver-error construction)' is not a bare path or glob (put notes under Limits:)",
+  "touch-dir":   rc.validate_card(["nucleus/v3/spikes/e1-mvcc/tests/"], [G]) is None,
+  "touch-glob":  rc.validate_card(["nucleus/v3/spikes/e1-mvcc/src/*.rs"], [G]) is None,
 }
 sys.exit(0 if checks[case] else 1)
 P
 }
-for c in gate-last no-gate fake-gate gate-middle no-touch pass-real pass-lies pass-rc; do expect_ok "runner: $c" py "$c"; done
+for c in gate-last no-gate fake-gate gate-middle no-touch pass-real pass-lies pass-rc touch-note touch-dir touch-glob; do expect_ok "runner: $c" py "$c"; done
+# bp WANT CMD: bash_permission on the copied runner's real bash map gives WANT.
+# The deny list is a guard-rail (the scope check is the enforcement), but a
+# worker should not spend attempts on a rewrite that fails its card anyway.
+bp() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$@" <<'P'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+got = rc.bash_permission(sys.argv[3])
+print("got:", got, "expected:", sys.argv[2])
+sys.exit(0 if got == sys.argv[2] else 1)
+P
+}
+bash_deny=(
+  'git rebase -i HEAD~2'
+  'git commit --amend --no-edit'
+  'git commit -q -a --amend'
+  'git update-ref HEAD HEAD~1'
+  'git switch -C card/v3-X HEAD~1'
+  'git restore --staged x'
+  'git -C . reset --hard'
+  'git -c core.hooksPath=/dev/null checkout x'
+  'git --git-dir=.git log'
+  'cd nucleus/v3 && git reset --soft HEAD~1'
+  'true; git rebase --abort'
+  '/usr/bin/git reset HEAD~1'
+  'GIT_INDEX_FILE=x git reset HEAD~1'
+  'git replace --graft HEAD HEAD~2'
+  'git update-index --skip-worktree nucleus/v3/verdicts/X.md'
+  'git update-index --assume-unchanged x'
+  'git config core.fsmonitor /tmp/x'
+  'git branch -f card/v3-X HEAD~1'
+  'git stash push'
+  'git push origin HEAD'
+  'rm -rf target'
+)
+bash_allow=(
+  'git status'
+  'git status --porcelain'
+  'git diff nucleus/v3-scaffold...HEAD --stat'
+  'git log --oneline -5'
+  'git add -A'
+  'git commit -m "nucleus v3: X-1 replace the reset path"'
+  'git show --stat HEAD'
+  'git rev-parse HEAD'
+  'git branch --show-current'
+  'cd nucleus/v3 && cargo test -q -p e1-mvcc'
+  'cd nucleus/v3 && bash scripts/gate.sh'
+)
+for c in "${bash_deny[@]}"; do expect_ok "runner: bash deny $c" bp deny "$c"; done
+for c in "${bash_allow[@]}"; do expect_ok "runner: bash allow $c" bp allow "$c"; done
 git -C "$r" checkout -q -b card/v3-RS nucleus/v3-scaffold
 git -C "$r" mv nucleus/v3/docs/README.md nucleus/v3/spikes/moved.md && git -C "$r" commit -qm "nucleus v3: RS move"
 rs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'

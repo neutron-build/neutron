@@ -5,7 +5,7 @@ Usage: nucleus/v3/tools/run_card.py nucleus/v3/cards/<id>.local.md [--base <bran
        [--attempts 3] [--model zai-coding-plan/glm-5.3] [--keep]
 
 Flow: worktree on branch card/v3-<id> from --base -> copy card + worker prompt in (they are local-only)
--> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, push, reset, checkout, curl, wget, brew) -> scope guard (only the
+-> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, curl, wget, brew, git push/reset/checkout/stash, history rewrites, git-state edits and git global options) -> scope guard (only the
 card's "Touch only" globs) -> acceptance commands -> up to N attempts with failure output fed back ->
 RUNLOG row. Every attempt first checks free disk. Nothing is merged here: a gate writes
 verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3, §7.6).
@@ -54,17 +54,41 @@ OPENCODE_CONFIG = {
             str(pathlib.Path.home() / ".cargo" / "registry") + "/*": "allow",
             str(TARGET_DIR) + "/*": "allow",
         },
+        # How opencode 2.0.32 applies this map, read from the installed binary
+        # (~/.opencode/bin/opencode; [names] are its bundled JS functions):
+        # - each key becomes a rule {action "shell", resource <key>}, in key order [yP, L$];
+        # - the command line is parsed (tree-sitter-bash) and every `command` node,
+        #   including those inside lists, pipes and $(...), is checked on its own text.
+        #   cd/pushd/popd/chdir nodes are not checked. One denied command denies the
+        #   whole call [wL, Nw, V];
+        # - a pattern matches the whole command text: `*` is any run of characters
+        #   (newlines too), `?` one character, and a trailing " *" is optional, so
+        #   "rm *" also matches a bare "rm" [rb];
+        # - the last matching rule wins [UC: findLast], so "*" must come first.
+        # bash_permission() models this for the scenarios. Each denial is listed at the
+        # command's start, after a space ("GIT_DIR=x git reset", "xargs rm") and after
+        # a "/" ("/usr/bin/git reset"). Workers run git from their cwd, so any global
+        # option before the verb (-C, -c, --git-dir, --work-tree) is denied outright.
+        # A guard-rail, not the enforcement: interpreters, `sh -c '...'`, eval, words
+        # built from quotes or variables (g"it" reset, $G reset), combined short flags
+        # (git branch -qf) and scripts that run git all pass it. The post-hoc scope
+        # check, which diffs against the tree as it was before the run, catches them.
         "bash": {
             "*": "allow",
-            "rm *": "deny",
-            "sudo *": "deny",
-            "git push*": "deny",
-            "git reset*": "deny",
-            "git checkout*": "deny",
-            "git stash*": "deny",
-            "curl *": "deny",
-            "wget *": "deny",
-            "brew *": "deny",
+            **{
+                pre + pat: "deny"
+                for pat in (
+                    "rm *", "sudo *", "curl *", "wget *", "brew *",
+                    "git -*",
+                    "git push*", "git reset*", "git checkout*", "git stash*",
+                    "git rebase*", "git commit *--amend*", "git update-ref*", "git switch*", "git restore*",
+                    "git replace*", "git update-index*", "git config*", "git filter-branch*",
+                    "git worktree*", "git symbolic-ref*", "git notes*",
+                    *(f"git branch{sep}{flag}*" for flag in ("-f", "-m", "-M", "-d", "-D", "-c", "-C") for sep in (" ", " * ")),
+                    "git branch *--force*", "git branch *--move*", "git branch *--delete*", "git branch *--copy*",
+                )
+                for pre in ("", "* ", "*/")
+            },
         },
     },
 }
@@ -97,11 +121,52 @@ def validate_card(touch, accept):
     """The card-shape rules (PLAN-v3 §7.2). Returns an error string, or None."""
     if not touch:
         return "needs a Touch only list"
+    for t in touch:
+        # A note after the path makes the entry match nothing, so every edit
+        # would be reported as outside Touch only.
+        if re.search(r"[\s(]", t):
+            return f"Touch only entry '{t}' is not a bare path or glob (put notes under Limits:)"
     if not accept:
         return "needs backticked Acceptance commands"
     if accept[-1].strip() != GATE_CMD:
         return f"the last Acceptance command must be exactly `{GATE_CMD}`"
     return None
+
+
+def bash_permission(cmd, rules=None):
+    """opencode's decision on a bash call, by the semantics recorded above
+    OPENCODE_CONFIG's bash map (rules defaults to that map). Only the scenarios
+    call it, so they test the real map. tree-sitter is approximated by a
+    quote-aware cut at control operators, parentheses and command substitutions;
+    the patterns also match after a space, so a part it leaves joined is still
+    denied. Returns "allow", "deny", or "ask" if no rule matches a part."""
+    rules = OPENCODE_CONFIG["permission"]["bash"] if rules is None else rules
+
+    def glob(pat):
+        rx = re.sub(r"[.+^${}()|[\]\\]", lambda m: "\\" + m.group(0), pat.replace("\\", "/"))
+        rx = rx.replace("*", ".*").replace("?", ".")
+        return rx[:-3] + "( .*)?" if rx.endswith(" .*") else rx
+
+    parts, cur, q, i = [], "", None, 0
+    while i < len(cmd):
+        c, nxt = cmd[i], cmd[i + 1 : i + 2]
+        redirect = (c in "&|" and cmd[i - 1 : i] in ("<", ">")) or c + nxt == "&>"  # 2>&1, >|, &>
+        if q == "'":  # nothing is special inside '...'
+            q = None if c == "'" else q
+        elif c == "\\":  # an escaped character never cuts
+            c, i = cmd[i : i + 2], i + 1
+        elif c + nxt == "$(" or c == "`" or (q is None and c in ";|&()\n" and not redirect):
+            parts.append(cur)
+            cur, i = "", i + (2 if c == "$" else 1)
+            continue
+        elif c in "'\"":
+            q = None if q == c else q or c
+        cur, i = cur + c, i + 1
+    parts.append(cur)
+    cmds = [p.strip().replace("\\", "/") for p in parts]
+    cmds = [p for p in cmds if p and p.split()[0] not in ("cd", "chdir", "popd", "pushd")]
+    found = [next((e for p, e in reversed(list(rules.items())) if re.fullmatch(glob(p), c, re.S)), "ask") for c in cmds]
+    return "deny" if "deny" in found else "ask" if "ask" in found else "allow"
 
 
 def gate_passed(rc, out):
