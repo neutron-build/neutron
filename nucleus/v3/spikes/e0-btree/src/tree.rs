@@ -193,10 +193,13 @@ impl<S: PageStore> BTree<S> {
     /// fallback is gone (before X-0-F1 the fallback silently repaired this
     /// state and masked those mutants). Never call outside tests; the tree
     /// is left damaged when this returns the error. The `test-hooks`
-    /// feature exists only for this crate's own tests — it is enabled for
-    /// them by the self dev-dependency in `Cargo.toml`, and without it
-    /// this method does not exist in the public API at all, so no caller
-    /// of the crate can damage a tree with it.
+    /// feature never reaches crates outside this workspace, nor any normal
+    /// (non-test) build — this crate's own tests get it via the self
+    /// dev-dependency in `Cargo.toml`. Under `cargo test --workspace`,
+    /// however, that feature is unified into the e0-btree copy that other
+    /// workspace crates' tests link, so a workspace crate's tests could
+    /// call this hook; no workspace crate other than e0-btree may
+    /// reference `insert_early_release`.
     ///
     /// # Errors
     /// Same as [`Self::insert`]; plus [`StoreError::Corrupt`] naming the
@@ -212,7 +215,8 @@ impl<S: PageStore> BTree<S> {
 
     /// The shared descent of [`Self::insert`] and its test chaos hook:
     /// with `early_release` set, the [`page::is_safe`] test is skipped and
-    /// every child is reported safe (see [`Self::insert_early_release`]).
+    /// every child is reported safe (see `insert_early_release`
+    /// (test-hooks only)).
     ///
     /// # Errors
     /// [`StoreError::KeyTooLarge`] / [`StoreError::ValueTooLarge`] for
