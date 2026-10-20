@@ -1,0 +1,3 @@
+# Pinned competitor images (card B-0). Recorded 2026-10-17 via
+# `podman inspect --format '{{index .RepoDigests 0}}'`.
+docker.io/library/redis:7@sha256:4fa24486b8bcca8eec45ee0eb166edc674795e53a2b53d1a9ef263eecebaac85
