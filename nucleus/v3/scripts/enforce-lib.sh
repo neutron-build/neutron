@@ -5,6 +5,11 @@
 # repository root (":/...") because callers run from nucleus/v3.
 
 V3=nucleus/v3
+# Every git call below runs with replace refs, grafts and fsmonitor off, even
+# for a caller that sources only this file (git-env.sh explains why). Callers
+# also run git_state_refuse, which names that state.
+# shellcheck source=git-env.sh
+. "$(dirname "${BASH_SOURCE[0]}")/git-env.sh"
 
 # vfield TEXT KEY: the value of the first `KEY: value` line.
 vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed 's/[[:space:]]*$//'; }

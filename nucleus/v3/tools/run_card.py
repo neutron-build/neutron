@@ -7,8 +7,11 @@ Usage: nucleus/v3/tools/run_card.py nucleus/v3/cards/<id>.local.md [--base <bran
 Flow: worktree on branch card/v3-<id> from --base -> copy card + worker prompt in (they are local-only)
 -> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, curl, wget, brew, git push/reset/checkout/stash, git fetch/pull/tag/reflog/fast-import, history rewrites, git-state edits, git global options and their GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_CONFIG* environment forms) -> scope guard (only the
 card's "Touch only" globs) -> acceptance commands -> up to N attempts with failure output fed back ->
-RUNLOG row. Every attempt first checks free disk. Nothing is merged here: a gate writes
-verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3, §7.6).
+RUNLOG row. Every attempt first checks free disk. Every git call runs with replace refs, grafts and
+fsmonitor off (GIT_ENV), and a repository carrying them, or index entries marked assume-unchanged or
+skip-worktree, is refused: before the first attempt, and by every scope check (git_state_problems).
+Nothing is merged here: a gate writes verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3,
+§7.6).
 
 Every run appends a start and an end record to the card's trust ledger, cards/logs/<id>.ledger.jsonl,
 outside the worktree (worker_commits()); the end is written on every exit, after the opencode child
@@ -58,6 +61,22 @@ PROTECTED = [
     "nucleus/src/",
 ]
 GATE_CMD = "cd nucleus/v3 && bash scripts/gate.sh"
+# Every git call here, and the opencode child, runs with replace refs, grafts and
+# fsmonitor off (X-6-F1-F2): each rewrites what git reports, from files every
+# worktree shares, so a committed tools/ edit can diff as nothing. The
+# GIT_CONFIG_* entries are appended after any the caller set (git_env());
+# advice.graftFileDeprecated=false silences the hint GIT_GRAFT_FILE makes git
+# print on every call, which run() would fold into what it parses. Identical to
+# scripts/git-env.sh, which explains each one.
+GIT_ENV = {
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_GRAFT_FILE": "/dev/null",
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+    "GIT_CONFIG_KEY_1": "advice.graftFileDeprecated",
+    "GIT_CONFIG_VALUE_1": "false",
+}
 GATE_PASS = "GATE EXIT=0"
 OPENCODE_CONFIG = {
     "$schema": "https://opencode.ai/config.json",
@@ -127,8 +146,32 @@ OPENCODE_CONFIG = {
 }
 
 
+def git_env(base=None, override=True):
+    """base (default os.environ) with GIT_ENV merged in. The caller's
+    GIT_CONFIG_* entries are kept and GIT_ENV's appended after them, unless
+    they are already the last ones (an environment that already has them).
+    override=False leaves GIT_ENV's config entries out, for the one read that
+    must see the configured value. A GIT_CONFIG_COUNT that is not a number is
+    left alone: git then refuses every call, which fails closed."""
+    env = dict(os.environ if base is None else base)
+    env.update({k: v for k, v in GIT_ENV.items() if not k.startswith("GIT_CONFIG_")})
+    n = env.get("GIT_CONFIG_COUNT") or "0"
+    if not (n.isascii() and n.isdigit()):
+        return env
+    n = int(n)
+    ours = [(GIT_ENV[f"GIT_CONFIG_KEY_{i}"], GIT_ENV[f"GIT_CONFIG_VALUE_{i}"]) for i in range(int(GIT_ENV["GIT_CONFIG_COUNT"]))]
+    if n >= len(ours) and [(env.get(f"GIT_CONFIG_KEY_{n - len(ours) + i}"), env.get(f"GIT_CONFIG_VALUE_{n - len(ours) + i}")) for i in range(len(ours))] == ours:
+        n -= len(ours)
+    if override:
+        for i, (key, val) in enumerate(ours):
+            env[f"GIT_CONFIG_KEY_{n + i}"], env[f"GIT_CONFIG_VALUE_{n + i}"] = key, val
+        n += len(ours)
+    env["GIT_CONFIG_COUNT"] = str(n)
+    return env
+
+
 def run(cmd, cwd, env=None, timeout=None):
-    p = subprocess.run(cmd, cwd=cwd, env=env, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout)
+    p = subprocess.run(cmd, cwd=cwd, env=git_env(env), shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout)
     return p.returncode, (p.stdout + p.stderr)
 
 
@@ -218,7 +261,7 @@ def git_paths(args, wt):
     A failed git raises CalledProcessError: an empty listing would read as
     "nothing changed" and pass every scope rule."""
     cmd = ["git", args[0], "-z", *args[1:]]
-    p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
     if p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
     return [f for f in p.stdout.split("\0") if f]
@@ -292,7 +335,7 @@ def worker_commits(wt, base, path):
         if not start:
             return None
         # rev-list END --not START BASE is base..END minus base..START.
-        p = subprocess.run(["git", "rev-list", ends.get(run_id) or "HEAD", "--not", start, base, "--"], cwd=wt, capture_output=True, text=True)
+        p = subprocess.run(["git", "rev-list", ends.get(run_id) or "HEAD", "--not", start, base, "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
         if p.returncode != 0:
             return None
         worker.update(p.stdout.split())
@@ -316,20 +359,62 @@ def gate_committed(wt, base, f, card_id, pre_head, ledger=None):
     return worker is not None and sha not in worker
 
 
+def git_state_problems(wt, index=True):
+    """One line per piece of git state in wt that hides changes, as
+    git_state_refuse in scripts/git-env.sh reports them: replace refs, a graft
+    file (common dir or this worktree's git dir), a core.fsmonitor that is set
+    and not false at any scope (read without GIT_ENV's override, which would
+    make it always read false), and, with index, entries marked
+    assume-unchanged (lowercase ls-files -v tag) or skip-worktree (S), which
+    status and diff skip. GIT_ENV neutralises the first three; nothing
+    neutralises the index flags. A git failure is one line, never [].
+    Nothing is cleared: the operator decides."""
+    def git(*args, override=True, ok=(0,)):
+        cmd = ["git", *args]
+        p = subprocess.run(cmd, cwd=wt, env=git_env(override=override), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+        if p.returncode not in ok:
+            raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+        return p
+
+    probs = []
+    try:
+        probs += [f"replace ref {ref}" for ref in git("for-each-ref", "--format=%(refname)", "refs/replace/").stdout.splitlines() if ref]
+        dirs = dict.fromkeys(git("rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir").stdout.splitlines())
+        probs += [f"graft file {d}/info/grafts" for d in dirs if d and os.path.lexists(f"{d}/info/grafts")]
+        p = git("config", "-z", "--show-origin", "--get-all", "core.fsmonitor", override=False, ok=(0, 1))
+        rec = p.stdout.split("\0") if p.returncode == 0 else []
+        for origin, val in zip(rec[0::2], rec[1::2]):
+            if val.lower() not in ("false", "no", "off", "0"):
+                probs.append(f"core.fsmonitor is '{val}' ({origin})")
+        if index:
+            for e in git("ls-files", "-v", "-z", "--full-name", "--", ":/").stdout.split("\0"):
+                tag, path = e[:1], e[2:]
+                if tag.islower():
+                    probs.append(f"{path} is marked assume-unchanged in the index (ls-files -v tag {tag})")
+                if tag in ("S", "s"):
+                    probs.append(f"{path} is marked skip-worktree in the index (ls-files -v tag {tag})")
+    except subprocess.CalledProcessError as e:
+        why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
+        probs.append(f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot check git state)")
+    return probs
+
+
 def scope_violations(wt, base, touch, card_id=None, pre_head=None, ledger=None):
     """Changed files outside the card's Touch only, or in a protected path.
     The gate commits verdicts/<ID>.md on the card branch between rounds, so a
     base...HEAD diff shows it, and X-6's round-2 worker reverted it to clear
     this check. That one file is exempt while it is exactly as the gate left
     it at pre_head (HEAD before this run's first attempt) and the ledger shows
-    no worker made the commit that wrote it (gate_committed)."""
-    bad = []
+    no worker made the commit that wrote it (gate_committed).
+    Git state that hides changes is a violation too (git_state_problems), so
+    every scope check names it; the checks below still run under GIT_ENV."""
+    bad = [f"{p} (git state hides changes)" for p in git_state_problems(wt)]
     try:
         files = changed_files(wt, base)
     except subprocess.CalledProcessError as e:
         # A check that cannot see the diff refuses (PLAN-v3 §7.6).
         why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
-        return [f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot list changed files)"]
+        return bad + [f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot list changed files)"]
     own = f"nucleus/v3/verdicts/{card_id}.md"
     exempt = False
     if pre_head and card_id and gate_committed(wt, base, own, card_id, pre_head, ledger):
@@ -354,7 +439,7 @@ def stray_commits(card_id, branch, since):
     of the parsed lines (run() folds it in, which only by accident made an
     "unknown revision 'card/v3-<ID>'" error match the card id)."""
     cmd = ["git", "log", "--branches", "--not", branch, f"--since=@{int(since)}", "--format=%h %s"]
-    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    p = subprocess.run(cmd, cwd=ROOT, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         why = (p.stderr.strip().splitlines() or ["no stderr"])[0]
         return [f"{' '.join(cmd)} failed (exit {p.returncode}): {why} (cannot list commits; treating as stray)"]
@@ -369,7 +454,7 @@ def ref_snapshot(wt):
     cannot hold a control character, so one line per ref with a NUL before the
     oid parses every name."""
     cmd = ["git", "for-each-ref", "--format=%(refname)%00%(objectname)"]
-    p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
     if p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
     refs = dict(l.split("\0", 1) for l in p.stdout.splitlines() if l)
@@ -401,7 +486,7 @@ def ref_violations(wt, before, branch, pre_head):
     not make). Any git failure is one entry naming the command, never a pass."""
     def git(*args):
         cmd = ["git", *args]
-        p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        p = subprocess.run(cmd, cwd=wt, env=git_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
         if p.returncode not in ((0, 1) if args[0] == "merge-base" else (0,)):
             raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
         return p
@@ -494,7 +579,8 @@ def main():
     if wt.exists() and not args.keep:
         run(["git", "worktree", "remove", "--force", str(wt)], ROOT)
         shutil.rmtree(wt, ignore_errors=True)
-    if not wt.exists():
+    kept = wt.exists()
+    if not kept:
         rc, out = run(["git", "worktree", "add", "-B", branch, str(wt), args.base], ROOT)
         if rc:
             sys.exit(out)
@@ -507,7 +593,13 @@ def main():
                 n += 1
                 aside = ledger.with_name(f"{card_id}.ledger.{stamp}-{n}.jsonl")
             ledger.rename(aside)
-    elif not ledger.exists():
+    # Before anything else reads or runs in the worktree, --trust-existing's
+    # inspection included: a run on a repository whose git state hides changes
+    # never starts (scope_violations would refuse every attempt anyway).
+    state = git_state_problems(wt)
+    if state:
+        sys.exit(f"[{card_id}] git state hides changes; not starting (nothing was cleared):\n" + "\n".join(state))
+    if kept and not ledger.exists():
         # A worktree from before the ledger: nothing says which of its commits a
         # worker made, so a verdict-subject commit on it cannot be told from a forgery.
         rc, subjects = run(["git", "log", "--format=%s", f"{args.base}..HEAD"], wt)
@@ -523,7 +615,7 @@ def main():
     # opencode takes its session directory from PWD, not the process cwd; without this the
     # worker runs in the checkout the runner was started from.
     # one target per card: concurrent cards on a shared target serialize on its lock
-    env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR / card_id), PWD=str(wt))
+    env = git_env(dict(os.environ, CARGO_TARGET_DIR=str(TARGET_DIR / card_id), PWD=str(wt)))
     # --keep resumes unfinished work, which need not be formatted yet
     rc, out = (0, "") if args.keep else run("cd nucleus/v3 && cargo fmt --all -- --check", wt, env=env)
     if rc:
