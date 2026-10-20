@@ -16,6 +16,10 @@ expect_ok() { local n=$1; shift; if "$@" >"$t/out" 2>&1; then pass "$n"; else fa
 expect_no() { local n=$1; shift; if "$@" >"$t/out" 2>&1; then fail "$n (was accepted)"; sed 's/^/     /' "$t/out"; else pass "$n"; fi; }
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+# The git-state scenarios (X-6-F1-F2) check that the runner and the scripts
+# switch off replace refs, grafts and fsmonitor themselves, so none of that may
+# come from the caller (the runner and git-env.sh export it to their children).
+unset GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_CONFIG_COUNT
 git init -q --bare "$t/origin.git"
 r=$t/repo
 git init -q -b nucleus/v3-scaffold "$r"
@@ -619,6 +623,151 @@ rvfrom "$gate"; echo more >>"$v3/spikes/rv.txt"; git -C "$r" commit -qam "nucleu
 expect_ok "runner: a non-verdict commit after the gate's verdict, before this run, is not a violation" rv RV "$pre" none
 git -C "$r" checkout -q nucleus/v3-scaffold
 
+# --- git state that hides changes (X-6-F1-F2) -------------------------------
+# Replace refs, grafts and an fsmonitor hook rewrite what git reports; index
+# flags hide worktree edits. The runner and the scripts run git with the first
+# three off (neutralise: the hidden file is still listed) and name all four
+# (refuse). All of it is shared by every branch of $r, so each case removes its
+# state and checks that it is gone (no_state).
+# plain ARGS...: git in $r with none of the protection, for the premises.
+plain() { env -u GIT_NO_REPLACE_OBJECTS -u GIT_GRAFT_FILE -u GIT_CONFIG_COUNT git -C "$r" "$@"; }
+no_state() { [ -z "$(git -C "$r" for-each-ref refs/replace/)" ] && [ ! -e "$r/.git/info/grafts" ] && ! git -C "$r" config core.fsmonitor && [ -z "$(git -C "$r" ls-files -v | grep -v '^H ')" ]; }
+expect_ok "git state: none in the test repository before these scenarios" no_state
+# gs BASE HIDDEN STATE [CARD PRE_HEAD]: scope_violations on $r as it stands lists
+# HIDDEN as protected ("-" skips that half) and a "(git state hides changes)"
+# line containing STATE ("-" skips that half, "none" requires no such line).
+gs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$@" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+base, hidden, state = sys.argv[3:6]
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), base, ["nucleus/v3/spikes/"], *sys.argv[6:8])
+print("\n".join(bad) or "(no violations)")
+st = [b for b in bad if b.endswith(" (git state hides changes)")]
+ok = hidden == "-" or hidden + " (protected)" in bad
+ok = ok and (state == "-" or (not st if state == "none" else any(state in b for b in st)))
+sys.exit(0 if ok else 1)
+P
+}
+# out_has WANT... -- CMD...: CMD exits non-zero and its output holds every WANT.
+out_has() { local w=() o rc=0; while [ "$1" != -- ]; do w+=("$1"); shift; done; shift; o=$("$@" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] || return 1; for x in "${w[@]}"; do grep -qF -- "$x" <<<"$o" || { echo "missing: $x"; return 1; }; done; }
+
+# One definition per language, kept identical; a caller's GIT_CONFIG_* entries
+# are appended to, never clobbered, and a nested source adds nothing.
+env_same() { local sh py; sh=$(cd "$v3" && env -i PATH="$PATH" bash -c '. scripts/git-env.sh; env' | grep '^GIT_' | sort)
+  py=$(env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("rc",sys.argv[1]); rc=importlib.util.module_from_spec(s); s.loader.exec_module(rc); [print(f"{k}={v}") for k,v in sorted(rc.git_env({}).items()) if k.startswith("GIT_")]' "$v3/tools/run_card.py" | sort)
+  echo "sh: $sh"; echo "py: $py"; [ -n "$sh" ] && [ "$sh" = "$py" ]; }
+expect_ok "git env: git-env.sh and run_card.py's GIT_ENV set the same variables" env_same
+cfg_sh() { (cd "$v3" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=nv3.probe GIT_CONFIG_VALUE_0=kept bash -c '. scripts/git-env.sh; . scripts/git-env.sh; echo "count $GIT_CONFIG_COUNT"; [ "$GIT_CONFIG_COUNT" = 3 ] && [ "$(git config nv3.probe)" = kept ] && [ "$(git config core.fsmonitor)" = false ]'); }
+expect_ok "git env: git-env.sh appends to a caller's GIT_CONFIG_COUNT entries" cfg_sh
+cfg_py() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
+import importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+caller = dict(os.environ, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="nv3.probe", GIT_CONFIG_VALUE_0="kept")
+env = rc.git_env(caller)
+got = [rc.run(["git", "config", k], sys.argv[2], env=caller)[1].strip() for k in ("nv3.probe", "core.fsmonitor")]
+print(got, env["GIT_CONFIG_COUNT"])
+sys.exit(0 if got == ["kept", "false"] and env["GIT_CONFIG_COUNT"] == "3" and rc.git_env(env) == env else 1)
+P
+}
+expect_ok "git env: run_card.py appends to a caller's GIT_CONFIG_COUNT entries" cfg_py
+
+# A card that would merge, made before any state exists.
+card GM S standard; branch GM nucleus/v3/spikes/gm.txt; verdict GM S MERGE standard S
+# R1 replace: a committed tools/ edit X, replaced by Y (same parent, the
+# parent's tree); the index and worktree follow the replaced HEAD.
+git -C "$r" checkout -q -B card/v3-GR1 nucleus/v3-scaffold
+echo x >"$v3/tools/gr1.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: GR1 work"
+gx=$(git -C "$r" rev-parse HEAD)
+git -C "$r" replace "$gx" "$(git -C "$r" commit-tree "$gx^^{tree}" -p "$gx^" -m "nucleus v3: GR1 work")"
+plain reset -q; rm -f "$v3/tools/gr1.py"
+r1_hidden() { [ -z "$(plain diff --name-only nucleus/v3-scaffold...HEAD)" ] && [ -z "$(plain status --porcelain)" ]; }
+expect_ok "premise: R1 replace: plain diff and status list nothing" r1_hidden
+expect_ok "runner: R1 replace: the committed tools/ file is still protected" gs nucleus/v3-scaffold nucleus/v3/tools/gr1.py -
+expect_ok "runner: R1 replace: the replace ref is named" gs nucleus/v3-scaffold - "replace ref refs/replace/$gx"
+scratch
+expect_ok "merge-card: refused while a replace ref exists, naming refs/replace" out_has "refused:" "refs/replace/$gx" -- mc GM
+expect_ok "audit: fails while a replace ref exists" out_has "audit: replace ref refs/replace/$gx" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/pass2"
+git -C "$r" replace -d "$gx" >/dev/null
+expect_ok "git state: R1's replace ref is gone" no_state
+scratch; expect_ok "merge-card: control: GM merges once the replace ref is gone" mc GM
+# The S-0-F2-F1-F1-F1-F1 case: G7C's reviewed X replaced by a blob, so a
+# replace-honouring cat-file sees one commit for the prefix, not two.
+git -C "$r" replace -f "$g7x" "$(echo blob | git -C "$r" hash-object -w --stdin)"
+expect_ok "premise: G7C: plain cat-file reports X as a blob" bash -c "[ \"\$(env -u GIT_NO_REPLACE_OBJECTS git -C '$r' cat-file -t $g7x)\" = blob ]"
+scratch; expect_ok "merge-card: G7C under a replace ref is still refused as ambiguous" out_has "verdict Commit '$g7c' is ambiguous" "refs/replace/$g7x" -- mc G7C
+git -C "$r" replace -d "$g7x" >/dev/null
+expect_ok "git state: G7C's replace ref is gone" no_state
+
+# R2 replace-graft-base: the base tip gr2base gains the card's commit X as a
+# parent, so base...HEAD's merge-base moves to X and hides X's change. (The
+# card branches from gr2base's parent: X under gr2base itself would be a cycle.)
+git -C "$r" checkout -q -B gr2base nucleus/v3-scaffold
+git -C "$r" commit -q --allow-empty -m "nucleus v3: GR2 base tip"
+git -C "$r" checkout -q -B card/v3-GR2 nucleus/v3-scaffold
+echo x >"$v3/tools/gr2.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: GR2 work"
+gx2=$(git -C "$r" rev-parse HEAD) gb2=$(git -C "$r" rev-parse gr2base)
+git -C "$r" replace --graft "$gb2" "$gb2^" "$gx2"
+r2_hidden() { [ -z "$(plain diff --name-only gr2base...HEAD 2>/dev/null)" ] && [ -z "$(plain status --porcelain)" ]; }
+expect_ok "premise: R2 replace --graft: plain diff and status list nothing" r2_hidden
+expect_ok "runner: R2 replace --graft: the committed tools/ file is still protected" gs gr2base nucleus/v3/tools/gr2.py -
+expect_ok "runner: R2 replace --graft: the replace ref is named" gs gr2base - "replace ref refs/replace/$gb2"
+expect_ok "check-core-paths: under R2 it still lists the hidden CORE file" bash -c "cd '$v3' && bash scripts/check-core-paths.sh gr2base card/v3-GR2 2>/dev/null | grep -qxF 'CORE tools/gr2.py (tools/)'"
+expect_ok "check-core-paths: under R2 it exits non-zero, naming the replace ref" out_has "replace ref refs/replace/$gb2 (git state hides changes)" -- bash -c "cd '$v3' && bash scripts/check-core-paths.sh gr2base card/v3-GR2"
+git -C "$r" replace -d "$gb2" >/dev/null
+expect_ok "git state: R2's replace ref is gone" no_state
+
+# R3 grafts: R2 through info/grafts, which GIT_NO_REPLACE_OBJECTS does not disable.
+echo "$gb2 $(git -C "$r" rev-parse "$gb2^") $gx2" >"$r/.git/info/grafts"
+r3_hidden() { [ -z "$(plain diff --name-only gr2base...HEAD 2>/dev/null)" ] && [ -z "$(GIT_NO_REPLACE_OBJECTS=1 plain diff --name-only gr2base...HEAD 2>/dev/null)" ]; }
+expect_ok "premise: R3 grafts: plain diff lists nothing, with GIT_NO_REPLACE_OBJECTS=1 too" r3_hidden
+expect_ok "runner: R3 grafts: the committed tools/ file is still protected" gs gr2base nucleus/v3/tools/gr2.py -
+expect_ok "runner: R3 grafts: the graft file is named" gs gr2base - "graft file $r/.git/info/grafts"
+expect_ok "check-core-paths: under R3 it still lists the hidden CORE file" bash -c "cd '$v3' && bash scripts/check-core-paths.sh gr2base card/v3-GR2 2>/dev/null | grep -qxF 'CORE tools/gr2.py (tools/)'"
+expect_ok "audit: fails while a graft file exists" out_has "audit: graft file $r/.git/info/grafts" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/pass2"
+rm -f "$r/.git/info/grafts"
+expect_ok "git state: R3's graft file is gone" no_state
+
+# R4/R5: an uncommitted edit of the gate's verdict, hidden by an index flag, which
+# no environment neutralises: only the refusal stops it.
+rvfrom "$gate"; echo edit >>"$r/$vf"; git -C "$r" update-index --skip-worktree "$vf"
+expect_ok "premise: R4 skip-worktree: plain status lists nothing" bash -c "[ -z \"\$(git -C '$r' status --porcelain)\" ]"
+expect_ok "runner: R4 skip-worktree: the flagged verdict file is named" gs nucleus/v3-scaffold - "$vf is marked skip-worktree in the index" RV "$gate"
+git -C "$r" update-index --no-skip-worktree "$vf"; git -C "$r" checkout -q -- "$vf"
+expect_ok "git state: R4's flag is gone" no_state
+rvfrom "$gate"; echo edit >>"$r/$vf"; git -C "$r" update-index --assume-unchanged "$vf"
+expect_ok "premise: R5 assume-unchanged: plain status lists nothing" bash -c "[ -z \"\$(git -C '$r' status --porcelain)\" ]"
+expect_ok "runner: R5 assume-unchanged: the flagged verdict file is named" gs nucleus/v3-scaffold - "$vf is marked assume-unchanged in the index" RV "$gate"
+git -C "$r" update-index --no-assume-unchanged "$vf"; git -C "$r" checkout -q -- "$vf"
+expect_ok "git state: R5's flag is gone" no_state
+
+# R6 fsmonitor: a hook giving the protocol-v2 empty reply ("tok\0") hides an
+# uncommitted tools/ edit. The premise runs first: a status with fsmonitor off
+# rewrites the index, after which the hook no longer hides anything.
+git -C "$r" checkout -q nucleus/v3-scaffold
+printf '#!/bin/sh\nprintf "tok\\0"\n' >"$t/fsm"; chmod +x "$t/fsm"
+git -C "$r" config core.fsmonitor "$t/fsm"; plain status --porcelain >/dev/null
+echo "# R6 edit" >>"$v3/tools/run_card.py"
+expect_ok "premise: R6 fsmonitor: plain status lists nothing" bash -c "[ -z \"\$(git -C '$r' status --porcelain)\" ]"
+expect_ok "runner: R6 fsmonitor: the uncommitted tools/ edit is still protected" gs nucleus/v3-scaffold nucleus/v3/tools/run_card.py -
+expect_ok "runner: R6 fsmonitor: the hook is named" gs nucleus/v3-scaffold - "core.fsmonitor is '$t/fsm'"
+git -C "$r" config --unset core.fsmonitor; git -C "$r" checkout -q -- nucleus/v3/tools/run_card.py
+expect_ok "git state: R6's hook is gone" no_state
+expect_ok "runner: control: a clean branch names no git state" gs nucleus/v3-scaffold - none
+
+# promote-pass reads its worktree: a skip-worktree-hidden dirty file stops the
+# push, after the gate, queue-check and the audit have run.
+git -C "$r" checkout -q -B scratch/pass5 nucleus/v3-scaffold
+(cd "$v3" && bash scripts/merge-card.sh E2) >/dev/null
+o5=$(git -C "$t/origin.git" rev-parse nucleus/v3-scaffold)
+echo dirty >>"$v3/spikes/base.txt"; git -C "$r" update-index --skip-worktree nucleus/v3/spikes/base.txt
+expect_ok "premise: promote: plain status lists nothing" bash -c "[ -z \"\$(git -C '$r' status --porcelain)\" ]"
+promote5() { (cd "$v3" && NV3_CARDS="$qa" bash scripts/promote-pass.sh scratch/pass5); }
+expect_ok "promote: a skip-worktree-hidden dirty file is refused after the checks ran" out_has "nucleus/v3/spikes/base.txt is marked skip-worktree" "GATE EXIT=0" "audit: ok" "not promoting" -- promote5
+expect_ok "promote: origin did not move" bash -c "[ \"\$(git -C '$t/origin.git' rev-parse nucleus/v3-scaffold)\" = '$o5' ]"
+git -C "$r" update-index --no-skip-worktree nucleus/v3/spikes/base.txt; git -C "$r" checkout -q -- nucleus/v3/spikes/base.txt
+expect_ok "git state: the promote scenario's flag is gone" no_state
+git -C "$r" checkout -q nucleus/v3-scaffold
+
 # --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
 # The ref store is shared by every worktree, so ref_violations refuses only ref
 # changes it can pin on this run (R1) or that touch a protected ref (R2), and
@@ -894,6 +1043,15 @@ expect_ok "runner e2e: RF4: a side ref adopted in a later attempt is caught agai
 e2e XR3 "work foreign" --attempts 1
 expect_ok "runner e2e: RF3: concurrent legitimate ref moves during a run pass" \
   res XR3 "rc == 0 and r['pass'] and r['scope'] == 'ok' and 'refs changed' not in out"
+# S: a replace ref in the repository stops main() before attempt 1 (X-6-F1-F2).
+# Both commits are unreachable, so nothing else in $r is rewritten meanwhile.
+xs=$(git -C "$r" commit-tree "e2e/base^{tree}" -m "nucleus v3: XS replaced")
+git -C "$r" replace "$xs" "$(git -C "$r" commit-tree "e2e/base^{tree}" -m "nucleus v3: XS replacement")"
+e2e XS work --attempts 1
+expect_ok "runner e2e: S: a replace ref stops the run before attempt 1, naming it" \
+  res XS "rc == 1 and 'git state hides changes; not starting' in out and 'replace ref refs/replace/$xs' in out and 'attempt 1:' not in out and not os.path.exists('$e/XS.n')"
+git -C "$r" replace -d "$xs" >/dev/null
+expect_ok "git state: XS's replace ref is gone" no_state
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi

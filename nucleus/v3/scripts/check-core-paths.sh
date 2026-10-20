@@ -8,6 +8,8 @@
 # Enforcement lives in enforce-lib.sh (used by merge-card.sh and audit-merges.sh).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=git-env.sh
+. "$here/git-env.sh"
 # shellcheck source=core-paths-lib.sh
 . "$here/core-paths-lib.sh"
 cd "$here/.."
@@ -25,6 +27,11 @@ if [ "${1:-}" = "--self-test" ]; then
   exit $ok
 fi
 
+# Git state that hides changes (git-env.sh) makes the listing exit non-zero.
+# The listing still runs, under the environment that neutralises it. (The
+# self-test above reads no git.)
+state=0
+git_state_refuse >&2 || state=1
 base=${1:?BASE}
 head=${2:?HEAD}
 # The list comes from BASE. The worktree's copy belongs to the branch under
@@ -52,3 +59,4 @@ while IFS= read -r -d '' f; do
   rel=${f#"$v3"/}
   if e=$(is_core "$rel" "$entries"); then echo "CORE $rel ($e)"; fi
 done <"$lst"
+exit "$state"

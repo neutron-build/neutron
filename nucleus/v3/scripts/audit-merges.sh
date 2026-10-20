@@ -11,11 +11,17 @@
 # merge with another title, or an edit made inside a merge fails the audit.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=git-env.sh
+. "$here/git-env.sh"
 # shellcheck source=core-paths-lib.sh
 . "$here/core-paths-lib.sh"
 # shellcheck source=enforce-lib.sh
 . "$here/enforce-lib.sh"
 cd "$here/.."
+# Git state that hides changes (git-env.sh) fails the audit; every commit is
+# still checked, under the environment that neutralises it.
+state=0
+git_state_refuse >/dev/null || { state=1; sed 's/^/audit: /' <<<"$GIT_STATE_PROBLEMS"; }
 ref=${1:-HEAD}
 # The commit list goes through a file, not `done < <(git rev-list ...)`:
 # process substitution drops git's exit status, so a bogus ref read as an empty
@@ -23,7 +29,7 @@ ref=${1:-HEAD}
 lst=$(mktemp)
 trap 'rm -f "$lst"' EXIT
 git rev-list --first-parent "$ref" -- "${AUDIT_PATHS[@]}" >"$lst" || { echo "audit: cannot list commits on $ref (git rev-list failed)" >&2; exit 1; }
-bad=0 n=0
+bad=$state n=0
 while read -r sha; do
   n=$((n + 1))
   subject=$(git log -1 --format=%s "$sha")
