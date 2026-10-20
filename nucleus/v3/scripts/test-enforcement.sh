@@ -240,6 +240,79 @@ printf 'Card: %s\nClass: %s\nCard-gate: %s\nVerdict: %s\nGate-tier: %s\nGate-mod
   G6F standard S MERGE S "GATE EXIT=0" "$(git -C "$r" rev-parse HEAD)" none >"$v3/verdicts/G6F.md"
 git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: G6F verdict MERGE"
 scratch; expect_ok "a verdict with a full 40-hex Commit merges" mc G6F
+# G4 again, plus a branch named with the verdict's short Commit pointing at the
+# late change. git resolves refs before short object ids, so a lookup of the
+# field follows the branch to tip^; only a ref-free compare refuses G7.
+card G7 S standard; branch G7 nucleus/v3/spikes/g7.txt; verdict G7 S MERGE standard S
+c7=$(sed -n 's/^Commit: //p' "$v3/verdicts/G7.md")
+echo late >>"$v3/spikes/g7.txt"; git -C "$r" commit -qam "nucleus v3: G7 late non-core change"
+sed -i 's/^Date: .*/Date: 2026-10-18/' "$v3/verdicts/G7.md"; git -C "$r" commit -qam "nucleus v3: G7 verdict MERGE (re-committed)"
+g7ref=$c7
+git -C "$r" branch "$g7ref" card/v3-G7^
+g7_shadows() { [ "$(git -C "$r" rev-parse -q --verify "$c7^{commit}")" = "$(git -C "$r" rev-parse card/v3-G7^)" ]; }
+expect_ok "premise: G7's Commit $c7 resolves through the ref to tip^" g7_shadows
+scratch; expect_no "a branch named after the reviewed commit's prefix does not cover a late change (G7)" mc G7
+git -C "$r" checkout -q -B scratch/g7 nucleus/v3-scaffold
+git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-G7 (MERGE, gate S/test-model)" card/v3-G7
+expect_no "audit rejects a titled merge whose short Commit a same-named branch redirects (G7)" bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/g7"
+expect_ok "G7's hex-named branch is deleted" git -C "$r" branch -D "$g7ref"
+# A ground prefix collision: X (reviewed) and Y (a late change) on the same
+# parent share a 7-hex prefix, so the short Commit names both. A prefix compare
+# alone would let Y reuse X's verdict. Birthday search: about 2^14 hashes a side.
+card G7C S standard; branch G7C nucleus/v3/spikes/g7c.txt
+g7tx=$(git -C "$r" rev-parse "HEAD^{tree}")
+echo late >>"$v3/spikes/g7c.txt"; git -C "$r" commit -qam "nucleus v3: G7C late non-core change"
+g7ty=$(git -C "$r" rev-parse "HEAD^{tree}")
+# collide TREE_X TREE_Y PARENT: prints "X_BODY_NONCE Y_BODY_NONCE X Y HASHES" for
+# two commit bodies whose ids share their first 7 hex digits.
+collide() { PYTHONDONTWRITEBYTECODE=1 python3 - "$@" <<'P'
+import hashlib, sys
+tx, ty, parent = sys.argv[1:4]
+def body(tree, side, n):
+    return (f"tree {tree}\nparent {parent}\nauthor t <t@t> 1700000000 +0000\n"
+            f"committer t <t@t> 1700000000 +0000\n\nG7C {side} {n}\n").encode()
+def oid(b):
+    return hashlib.sha1(b"commit %d\0" % len(b) + b).hexdigest()
+seen = {"X": {}, "Y": {}}
+for n in range(1 << 20):
+    for side, tree, other in (("X", tx, "Y"), ("Y", ty, "X")):
+        h = oid(body(tree, side, n))
+        seen[side].setdefault(h[:7], (n, h))
+        if h[:7] in seen[other]:
+            m, g = seen[other][h[:7]]
+            x, y = ((n, h), (m, g)) if side == "X" else ((m, g), (n, h))
+            print(x[0], y[0], x[1], y[1], 2 * n + 1 + (side == "Y"))
+            sys.exit(0)
+print("G7C: no 7-hex collision in 2^20 nonces a side", file=sys.stderr)
+sys.exit(1)
+P
+}
+g7out=$(collide "$g7tx" "$g7ty" "$(git -C "$r" rev-parse nucleus/v3-scaffold)") || { fail "G7C: the collision search failed"; exit 1; }
+read -r g7nx g7ny g7x g7y g7hashes <<<"$g7out"
+echo "     G7C: a 7-hex collision after $g7hashes hashes (X nonce $g7nx, Y nonce $g7ny)"
+g7body() { printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nG7C %s %s\n' "$1" "$(git -C "$r" rev-parse nucleus/v3-scaffold)" "$2" "$3"; }
+[ "$(g7body "$g7tx" X "$g7nx" | git -C "$r" hash-object -t commit -w --stdin)" = "$g7x" ] || fail "G7C: git's id for X differs from the computed one"
+[ "$(g7body "$g7ty" Y "$g7ny" | git -C "$r" hash-object -t commit -w --stdin)" = "$g7y" ] || fail "G7C: git's id for Y differs from the computed one"
+g7c=${g7x:0:7}
+g7c_verdict() {
+  printf 'Card: %s\nClass: %s\nCard-gate: %s\nVerdict: %s\nGate-tier: %s\nGate-model: test-model\nGate-session: t\nDate: 2026-10-17\nGate-exit: %s\nCommit: %s\nMutants: n/a\nFollowups: %s\n' \
+    "$1" standard S MERGE S "GATE EXIT=0" "$2" none >"$v3/verdicts/$1.md"
+  git -C "$r" add -A && git -C "$r" commit -qm "nucleus v3: $1 verdict MERGE"
+}
+# The verdict as reviewed (on X), then the same file committed on Y.
+git -C "$r" checkout -q -B card/v3-G7C "$g7x"; g7c_verdict G7C "$g7c"
+git -C "$r" checkout -q -B card/v3-G7C "$g7y"; g7c_verdict G7C "$g7c"
+g7c_premise() {
+  [ "$(git -C "$r" cat-file -t "$g7x")" = commit ] && [ "$(git -C "$r" cat-file -t "$g7y")" = commit ] &&
+    [ "$g7x" != "$g7y" ] && [[ $g7y == "$g7c"* ]] && [ "$(git -C "$r" rev-parse card/v3-G7C^)" = "$g7y" ]
+}
+expect_ok "premise: G7C's X and Y are distinct commits sharing the prefix" g7c_premise
+scratch; expect_no "a verdict whose short Commit also names a ground collision is refused as ambiguous (G7C)" mc G7C
+scratch; expect_ok "G7C's refusal names the ambiguity" bash -c "cd '$v3' && rc=0 && o=\$(bash scripts/merge-card.sh G7C 2>&1) || rc=\$?; echo \"\$o\"; [ \"\$rc\" -ne 0 ] && grep -qF \"verdict Commit '$g7c' is ambiguous\" <<<\"\$o\""
+# Control: the same Y under a full 40-hex Commit is unambiguous and merges.
+card G7D S standard
+git -C "$r" checkout -q -B card/v3-G7D "$g7y"; g7c_verdict G7D "$g7y"
+scratch; expect_ok "the same Y with a full 40-hex Commit merges (G7D)" mc G7D
 
 card R S standard
 git -C "$r" checkout -q -b card/v3-R nucleus/v3-scaffold
