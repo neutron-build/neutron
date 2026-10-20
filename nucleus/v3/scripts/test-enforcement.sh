@@ -492,7 +492,190 @@ expect_ok "runner: a worker edit to another protected path is still a violation"
 rvfrom "$gate~1"; echo o >"$v3/verdicts/OTHER.md"; echo f >"$v3/verdicts/RV-F1.md"; echo y >"$v3/tools/extra2.py"; echo g >"$r/$vf"
 git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: RV verdict REWORK"
 expect_ok "runner: a verdict commit exempts only the card's own verdict file" rv RV "$(git -C "$r" rev-parse HEAD)" nucleus/v3/tools/extra2.py nucleus/v3/verdicts/OTHER.md nucleus/v3/verdicts/RV-F1.md
+# A non-verdict commit between the gate's verdict commit and pre_head, the verdict
+# untouched: the log must follow the file, or the commit on top hides the gate's
+# (X-6-F1 F5; LOG-NO-PATH would report a valid verdict as protected, the X-6 N1 symptom).
+rvfrom "$gate"; echo more >>"$v3/spikes/rv.txt"; git -C "$r" commit -qam "nucleus v3: RV rework"; pre=$(git -C "$r" rev-parse HEAD)
+expect_ok "runner: a non-verdict commit after the gate's verdict, before this run, is not a violation" rv RV "$pre" none
 git -C "$r" checkout -q nucleus/v3-scaffold
+
+# --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
+# The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
+# attempt accounting (nv3-B-0-esc-1) live in main()'s attempt loop, so these run
+# main() itself: the copied runner with WT_ROOT, TARGET_DIR, CARDS and the
+# ledger repointed under $e, and the timing constants shrunk.
+e=$t/e2e; ewt=$e/wt
+mkdir -p "$e/cards/logs"
+printf 'worker prompt\n' >"$e/cards/WORKER-PROMPT.local.md"
+# The runner copies the card and prompt into the worktree and writes opencode.json
+# there. The real repository ignores those files, and so does this base.
+git -C "$r" checkout -q -B e2e/base nucleus/v3-scaffold
+printf '**/*.local.*\nopencode.json\n' >"$r/.gitignore"
+git -C "$r" add .gitignore && git -C "$r" commit -qm "e2e base: ignore local files"
+git -C "$r" checkout -q nucleus/v3-scaffold
+# The fake opencode, next to the fake cargo. FAKE_OC lists each invocation's
+# actions (';' between invocations, the last one repeating; ' ' between
+# actions). FAKE_OC_N counts invocations, FAKE_OC_N.pid holds the latest pid.
+# The card ID is the worktree's name.
+cat >"$t/bin/opencode" <<'F'
+#!/usr/bin/env bash
+set -euo pipefail
+n=$(( $(cat "$FAKE_OC_N" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$FAKE_OC_N"; echo $$ >"$FAKE_OC_N.pid"
+IFS=';' read -ra inv <<<"$FAKE_OC"
+i=$(( n < ${#inv[@]} ? n - 1 : ${#inv[@]} - 1 ))
+id=$(basename "$PWD")
+v=nucleus/v3/verdicts/$id.md
+for a in ${inv[$i]}; do
+  case $a in
+    forge) echo forged >"$v"; git add "$v"; git commit -qm "nucleus v3: $id verdict MERGE" ;;
+    work) echo "$n" >>"nucleus/v3/spikes/$id.txt"; git add nucleus/v3/spikes; git commit -qm "nucleus v3: $id work" ;;
+    quota) echo '{"type":"error","sessionID":"ses_fake","error":{"name":"provider.quota"}}' ;;
+    silent) echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":1234,"output":56,"reasoning":7}}}'; sleep 30; exit 0 ;;
+    mute) sleep 30; exit 0 ;;
+  esac
+done
+echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
+F
+chmod +x "$t/bin/opencode"
+# The driver: one main() call, stdout captured, SystemExit caught. Writes
+# OUT.out (stdout plus any exit message), OUT.rc and OUT.json (the result line).
+# E2E_SIGTERM_AFTER sends SIGTERM to the runner that many seconds in.
+cat >"$t/e2e.py" <<'P'
+import contextlib, importlib.util, io, os, pathlib, signal, sys, threading, traceback
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+out, e = pathlib.Path(sys.argv[2]), pathlib.Path(os.environ["E2E"])
+rc.WT_ROOT, rc.TARGET_DIR, rc.CARDS, rc.LEDGER_DIR = e / "wt", e / "target", e / "cards", e / "cards" / "logs"
+rc.NO_OUTPUT_S, rc.STALL_S = int(os.environ.get("E2E_NO_OUTPUT_S", 1)), int(os.environ.get("E2E_STALL_S", 1))
+rc.ATTEMPT_S, rc.POLL_S = 60, 0.1
+sys.argv = ["run_card.py", *sys.argv[3:], "--min-free-gb", "0"]
+term = os.environ.get("E2E_SIGTERM_AFTER")
+timer = threading.Timer(float(term), os.kill, (os.getpid(), signal.SIGTERM)) if term else None
+buf, code = io.StringIO(), 0
+with contextlib.redirect_stdout(buf):
+    if timer:
+        timer.start()
+    try:
+        rc.main()
+    except SystemExit as x:
+        code = x.code
+    except Exception:
+        code = "runner raised:\n" + traceback.format_exc()
+    finally:
+        if timer:
+            timer.cancel()
+if isinstance(code, str):
+    buf.write(code + "\n")
+    code = 1
+text = buf.getvalue()
+out.with_suffix(".out").write_text(text)
+out.with_suffix(".rc").write_text(f"{code or 0}\n")
+js = [l for l in text.splitlines() if l.startswith("{")]
+out.with_suffix(".json").write_text(js[-1] if js else "{}")
+P
+# ec ID: write the e2e card (Touch only spikes/, Acceptance `true` and the
+# gate) and print its path.
+ec() { printf '# CARD %s: e2e\n\nClass: test        Author: S (t)        Status: ready\nBase: e2e/base        Depends: —        Gate: S\n\n## Goal\nt\n\n## Touch only\n- nucleus/v3/spikes/\n\n## Acceptance\n- `true`\n- `cd nucleus/v3 && bash scripts/gate.sh`\n' "$1" >"$e/cards/$1.local.md"; echo "$e/cards/$1.local.md"; }
+# e2e NAME FAKE_OC ARGS...: one run of card ID (NAME up to its first "-") on
+# base e2e/base, with the fake opencode doing FAKE_OC.
+e2e() { local n=$1 oc=$2; shift 2; rm -f "$e/$n.n"
+  (cd "$r" && FAKE_OC=$oc FAKE_OC_N=$e/$n.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/$n" "$(ec "${n%%-*}")" --base e2e/base "$@") || true; }
+# res NAME EXPR: Python EXPR holds for the run's result JSON r, exit code rc
+# (None if the driver died), stdout out, the card's ledger records L (and
+# moved-aside ledgers A), the card branch's tip H, and dead() (the run's last
+# opencode was already gone). A live one is killed first, whatever EXPR says.
+res() { PYTHONDONTWRITEBYTECODE=1 python3 - "$e/$1" "$r" "$2" <<'P'
+import glob, json, os, pathlib, signal, subprocess, sys
+b, repo, expr = sys.argv[1:4]
+cid, e = pathlib.Path(b).name.split("-")[0], pathlib.Path(b).parent
+pidf, gone = pathlib.Path(b + ".n.pid"), True
+for kill in (os.killpg, os.kill) if pidf.exists() else ():  # os.kill: a child left in the runner's own group
+    try:
+        kill(int(pidf.read_text()), signal.SIGKILL)
+        gone = False
+    except ProcessLookupError:
+        pass
+dead = lambda: gone
+read = lambda suffix: pathlib.Path(b + suffix).read_text() if pathlib.Path(b + suffix).exists() else None
+r = json.loads(read(".json") or "{}")
+rc = int(read(".rc")) if read(".rc") else None
+out = read(".out") or ""
+recs = lambda p: [json.loads(l) for l in pathlib.Path(p).read_text().splitlines() if l.strip()]
+lp = e / "cards" / "logs" / f"{cid}.ledger.jsonl"
+L = recs(lp) if lp.exists() else []
+A = [recs(p) for p in sorted(glob.glob(str(e / "cards" / "logs" / f"{cid}.ledger.*.jsonl")))]
+H = subprocess.run(["git", "-C", repo, "rev-parse", f"card/v3-{cid}"], capture_output=True, text=True).stdout.strip()
+print(out)
+print("result:", r, "rc:", rc, "ledger:", L, "tip:", H)
+sys.exit(0 if eval(expr) else 1)
+P
+}
+# by_hand ID SUBJECT: a commit of verdicts/ID.md in ID's worktree, outside any run.
+by_hand() { (cd "$ewt/$1" && echo "$2" >"nucleus/v3/verdicts/$1.md" && git add "nucleus/v3/verdicts/$1.md" && git commit -qm "$2"); }
+# closed NAME: the ledger's last record ends the run its previous record started, at the branch tip.
+closed='L[-1].get("end") == H and L[-1]["run"] == L[-2]["run"] and "start" in L[-2]'
+flagged() { res "$1" "r['scope'] == 'FAIL' and not r['pass'] and 'nucleus/v3/verdicts/${1%%-*}.md (protected)' in out"; }
+
+# A: within one run, attempt 1 forges and attempt 2 does clean work (PREHEAD-PER-ATTEMPT).
+e2e XA "forge;work" --attempts 2
+expect_ok "runner e2e: A: a verdict forged in attempt 1 is still protected in attempt 2" \
+  res XA "rc == 1 and r['scope'] == 'FAIL' and 'nucleus/v3/verdicts/XA.md (protected)' in out.split('attempt 2:')[1].split('final scope')[0]"
+# B: across runs, run 1's scope failure ends it; the --keep rerun does clean work (ANCHOR-IGNORED).
+e2e XB-1 forge --attempts 1
+e2e XB-2 work --attempts 1 --keep
+expect_ok "runner e2e: B: a verdict forged in an earlier run is protected on --keep" flagged XB-2
+# C: run 1 forges and is killed for silence; its range must still close (END-NOT-ON-KILL).
+e2e XC-1 "forge silent" --attempts 1
+expect_ok "runner e2e: C: a run whose last attempt was killed closes its ledger range" res XC-1 "$closed and r['killed'][0]['reason'] == 'silence' and r['scope'] == 'FAIL'"
+e2e XC-2 work --attempts 1 --keep
+expect_ok "runner e2e: C: a verdict forged before a kill is protected on --keep" flagged XC-2
+# D: a start record with no end (SIGKILL), then the forge it left (OPEN-RANGE-TRUSTED).
+git -C "$r" worktree add -q -B card/v3-XD "$ewt/XD" e2e/base
+printf '{"run": "sigkilled", "start": "%s", "t": 0}\n' "$(git -C "$ewt/XD" rev-parse HEAD)" >"$e/cards/logs/XD.ledger.jsonl"
+by_hand XD "nucleus v3: XD verdict MERGE"
+e2e XD work --attempts 1 --keep
+expect_ok "runner e2e: D: a verdict committed inside an open (SIGKILLed) range is protected" flagged XD
+# E: the gate's REWORK verdict between runs is trusted (ANCHOR-OVERREACH; keeps the X-6 N1 fix).
+e2e XE-1 work --attempts 1
+expect_ok "runner e2e: E: premise: run 1 passes" res XE-1 "rc == 0 and r['pass'] and $closed"
+by_hand XE "nucleus v3: XE verdict REWORK"
+e2e XE-2 work --attempts 1 --keep
+expect_ok "runner e2e: E: the gate's verdict between runs is not a violation" res XE-2 "rc == 0 and r['pass'] and r['scope'] == 'ok' and '(protected)' not in out"
+# F: as E, with an orchestrator commit to spikes/ on top of the gate's verdict (LOG-NO-PATH).
+e2e XF-1 work --attempts 1
+by_hand XF "nucleus v3: XF verdict REWORK"
+(cd "$ewt/XF" && echo note >nucleus/v3/spikes/XF-note.txt && git add nucleus/v3/spikes && git commit -qm "nucleus v3: XF orchestrator note")
+e2e XF-2 work --attempts 1 --keep
+expect_ok "runner e2e: F: a commit on top of the gate's verdict between runs is not a violation" res XF-2 "rc == 0 and r['pass'] and r['scope'] == 'ok' and '(protected)' not in out"
+# G: a killed attempt's tokens count, and the kill names the silence (KILLED-TOKENS-DROPPED, SILENCE-MSG-GENERIC).
+e2e XG silent --attempts 1
+expect_ok "runner e2e: G: a killed attempt's tokens are counted and its silence reported" \
+  res XG "r['in'] == 1234 and r['out'] == 56 and r['reasoning'] == 7 and 'killed after' in out and 'of silence' in out and r['killed'][0]['reason'] == 'silence' and r['killed'][0]['silence_s'] >= 1"
+# G2: a fresh run moves the old ledger aside and starts a new one.
+e2e XG-2 quota --attempts 1
+expect_ok "runner e2e: G: a fresh run moves the old ledger aside" res XG-2 "len(A) == 1 and len(A[0]) == 2 and len(L) == 2 and A[0][0]['run'] != L[0]['run']"
+# H: no output at all is a provider stall, never "of silence".
+e2e XH mute --attempts 1
+expect_ok "runner e2e: H: no output at all is reported as such" \
+  res XH "'no output at all after' in out and 'of silence' not in out and [k['reason'] for k in r['killed']] == ['no-output'] * 3 and r['in'] == 0"
+# I: the quota sys.exit closes the range, and the forge before it stays protected.
+e2e XI-1 "forge quota" --attempts 1
+expect_ok "runner e2e: I: a quota exit closes the ledger range" res XI-1 "'provider usage limit reached' in out and $closed"
+e2e XI-2 work --attempts 1 --keep
+expect_ok "runner e2e: I: a verdict forged before a quota exit is protected on --keep" flagged XI-2
+# J: --keep on a pre-ledger worktree whose branch has a verdict-subject commit (NO-LEDGER-TRUSTED).
+git -C "$r" worktree add -q -B card/v3-XJ "$ewt/XJ" e2e/base
+by_hand XJ "nucleus v3: XJ verdict REWORK"
+e2e XJ-1 work --attempts 1 --keep
+expect_ok "runner e2e: J: --keep without a ledger refuses to start" \
+  res XJ-1 "rc == 1 and 'no trust ledger for XJ; rerun without --keep, or pass --trust-existing after inspecting the branch' in out and L == [] and 'attempt 1:' not in out"
+e2e XJ-2 work --attempts 1 --keep --trust-existing
+expect_ok "runner e2e: J: --trust-existing records the decision and starts" res XJ-2 "rc == 0 and r['pass'] and L[0].get('trust-existing') is True and L[1]['end'] == L[0]['start'] and $closed"
+# K: SIGTERM mid-attempt kills the child before the end record (CHILD-SURVIVES; C and I
+# cannot see it, since their child is already dead when main() exits).
+export E2E_SIGTERM_AFTER=1 E2E_STALL_S=30
+e2e XK "forge silent" --attempts 1
+unset E2E_SIGTERM_AFTER E2E_STALL_S
+expect_ok "runner e2e: K: SIGTERM kills opencode and closes the ledger range" res XK "rc == 143 and dead() and $closed"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
