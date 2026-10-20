@@ -17,7 +17,9 @@
 //! - S9 ← `SP-ROLLBACK-PARTIAL`,
 //! - S11's gated sub-check ← `VISIBLE-JUMPS` (via
 //!   [`crate::common::commit::apply_gate`]),
-//! - S12 ← `GC-TOO-EAGER`.
+//! - S12 ← `GC-TOO-EAGER`,
+//! - the test module's replay pin ← `G-REPLAY-GC-NEVER` and
+//!   `G-REPLAY-BEGIN-NOOP` (verdict X-1a-F2 finding 1, card X-1a-F2-F1).
 //!
 //! Rework round (gate verdict X-1a, 2026-10-18, D1/D2) adds:
 //! - S4's blocked variants (S4b–S4d) ← the conflict check must re-run
@@ -1903,10 +1905,16 @@ fn sched_iso(rng: &mut Rng) -> Isolation {
     }
 }
 
-/// Upper bound on txns per S13 schedule (card X-1a-F2 Work 2): slots are
-/// reusable, so the cap keeps a schedule's txn count bounded. Card says
-/// "e.g. 12" for the original 60–199-op schedules; with the mid-schedule
-/// turnover this card adds, the cap scales with the schedule length.
+/// The knob the S13 txn budget is derived from (card X-1a-F2 Work 2):
+/// slots are reusable, so the budget keeps a schedule's txn count
+/// bounded. The budget — how many `Begin` ops the schedule may still
+/// emit — is `S13_TXN_CAP − closed slots`, and a schedule opens
+/// `4 − closed` initial txns plus that budget, so it holds
+/// `20 + 2·open` txns: 22–26 for the 1–3 closed slots the generator
+/// picks. 24 is the knob, not the upper bound (card X-1a-F2-F1; verdict
+/// X-1a-F2 finding 2). The card said "e.g. 12" for the original
+/// 60–199-op schedules; with the mid-schedule turnover X-1a-F2 added,
+/// the cap scales with the schedule length.
 const S13_TXN_CAP: u64 = 24;
 
 /// Generate one schedule from a seed (keys in a 16-key space, values of
@@ -1952,7 +1960,11 @@ fn gen_schedule(seed: u64) -> (Vec<Option<Isolation>>, Vec<SlotOp>) {
     // WriteSet numbers them the same way), and restart at 1 on every
     // Begin (the WriteSet is per txn).
     let mut sp_next = [1u32; 4];
-    // The txn budget counts the initial opens plus every later Begin.
+    // The txn budget is how many `Begin` ops the schedule may still
+    // emit: cap − initially-closed slots (a closed slot's first txn
+    // comes from a `Begin` too, so it spends from the same budget).
+    // Total txns = initial opens (4 − closed) + budget = 22–26; see
+    // [`S13_TXN_CAP`].
     let mut txn_budget = S13_TXN_CAP - alive.iter().filter(|a| !**a).count() as u64;
     let n_ops = 100 + rng.below(200);
     let mut ops: Vec<SlotOp> = Vec::new();
@@ -2238,8 +2250,9 @@ pub fn run_all<E: TxnEngine>(make: &dyn Fn() -> E) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    //! Coverage pins of the S13 generator (card X-1a-F2 Work 4), plus
-    //! the barrier entry check of card X-1a-F3 Work 4.
+    //! Coverage pins of the S13 generator (card X-1a-F2 Work 4), the
+    //! replay-call pins of card X-1a-F2-F1, plus the barrier entry
+    //! check of card X-1a-F3 Work 4.
     //!
     //! Snapshot ts are not on the [`crate::api::TxnEngine`] trait, so
     //! these properties are computed by a test-only replay of every
@@ -2259,11 +2272,12 @@ mod tests {
     //! against the same shadow, so the pins stay regression-sensitive.
 
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Out, ParkedBarrier, ScheduleOp, exec_scheduled, gen_schedule};
-    use crate::api::{Isolation, Ts, TxnEngine, Wait};
+    use super::{Out, ParkedBarrier, ScheduleOp, exec_scheduled, gen_schedule, replay_schedule};
+    use crate::api::{EngineStats, Isolation, SavepointId, Ts, TxnEngine, TxnErr, Wait};
     use crate::reference::RefEngine;
 
     /// The seeds S13 generates (kept in sync with
@@ -2547,6 +2561,191 @@ mod tests {
             "a Rollback targeted a savepoint id the slot's current txn \
              never returned (SP-RESET-MISSING)",
         );
+    }
+
+    /// Card X-1a-F2-F1 (verdict X-1a-F2 finding 1): a test-only
+    /// [`TxnEngine`] shim that forwards every call to the wrapped engine
+    /// and counts exactly the two calls whose absence in
+    /// [`replay_schedule`] the gate found uncaught — `begin`
+    /// (G-REPLAY-BEGIN-NOOP) and `gc` (G-REPLAY-GC-NEVER). It lives in
+    /// this test module, so no production surface changes; the replay
+    /// it observes is S13's own [`replay_schedule`], not a twin.
+    struct CountingEngine<E: TxnEngine> {
+        inner: E,
+        begins: AtomicU64,
+        gcs: AtomicU64,
+    }
+
+    impl<E: TxnEngine> CountingEngine<E> {
+        /// Wrap `inner` with both counters at zero.
+        fn wrap(inner: E) -> Self {
+            Self {
+                inner,
+                begins: AtomicU64::new(0),
+                gcs: AtomicU64::new(0),
+            }
+        }
+
+        /// `begin()` calls seen so far.
+        fn begins(&self) -> u64 {
+            self.begins.load(Ordering::SeqCst)
+        }
+
+        /// `gc()` calls seen so far.
+        fn gcs(&self) -> u64 {
+            self.gcs.load(Ordering::SeqCst)
+        }
+    }
+
+    impl<E: TxnEngine> TxnEngine for CountingEngine<E> {
+        type Txn = E::Txn;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn begin(&self, iso: Isolation) -> Self::Txn {
+            self.begins.fetch_add(1, Ordering::SeqCst);
+            self.inner.begin(iso)
+        }
+
+        fn next_statement(&self, t: &mut Self::Txn) {
+            self.inner.next_statement(t);
+        }
+
+        fn get(&self, t: &mut Self::Txn, key: &[u8]) -> Result<Option<Vec<u8>>, TxnErr> {
+            self.inner.get(t, key)
+        }
+
+        fn scan(
+            &self,
+            t: &mut Self::Txn,
+            lo: &[u8],
+            hi: &[u8],
+            limit: usize,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TxnErr> {
+            self.inner.scan(t, lo, hi, limit)
+        }
+
+        fn update_with(
+            &self,
+            t: &mut Self::Txn,
+            key: &[u8],
+            wait: Wait,
+            f: &mut dyn FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
+        ) -> Result<(), TxnErr> {
+            self.inner.update_with(t, key, wait, f)
+        }
+
+        fn put(
+            &self,
+            t: &mut Self::Txn,
+            key: &[u8],
+            value: &[u8],
+            wait: Wait,
+        ) -> Result<(), TxnErr> {
+            self.inner.put(t, key, value, wait)
+        }
+
+        fn insert_unique(
+            &self,
+            t: &mut Self::Txn,
+            key: &[u8],
+            value: &[u8],
+            wait: Wait,
+        ) -> Result<(), TxnErr> {
+            self.inner.insert_unique(t, key, value, wait)
+        }
+
+        fn delete(&self, t: &mut Self::Txn, key: &[u8], wait: Wait) -> Result<bool, TxnErr> {
+            self.inner.delete(t, key, wait)
+        }
+
+        fn savepoint(&self, t: &mut Self::Txn) -> SavepointId {
+            self.inner.savepoint(t)
+        }
+
+        fn rollback_to(&self, t: &mut Self::Txn, sp: SavepointId) {
+            self.inner.rollback_to(t, sp);
+        }
+
+        fn commit(&self, t: Self::Txn) -> Result<Ts, TxnErr> {
+            self.inner.commit(t)
+        }
+
+        fn abort(&self, t: Self::Txn) {
+            self.inner.abort(t);
+        }
+
+        fn gc(&self) -> u64 {
+            self.gcs.fetch_add(1, Ordering::SeqCst);
+            self.inner.gc()
+        }
+
+        fn stats(&self) -> EngineStats {
+            self.inner.stats()
+        }
+
+        fn lock_table(&self) -> &crate::common::LockTable {
+            self.inner.lock_table()
+        }
+
+        fn sequencer(&self) -> &crate::common::Sequencer {
+            self.inner.sequencer()
+        }
+    }
+
+    /// Card X-1a-F2-F1 Work 1–2 (verdict X-1a-F2 findings 1–2): pin
+    /// what S13's **own** [`replay_schedule`] drives, measured through
+    /// [`CountingEngine`] rather than the coverage replay's twin logic.
+    /// For every generated schedule: with `run_gc = true` the replay
+    /// must call `gc()` exactly once per `Gc` op and `begin()` exactly
+    /// once per initial open plus once per `Begin` op; with
+    /// `run_gc = false` (the oracle side) it must call `gc()` never.
+    /// Catches G-REPLAY-GC-NEVER and G-REPLAY-BEGIN-NOOP, which kept
+    /// every pre-F1 test green.
+    #[test]
+    fn s13_replay_pins_gc_and_begin_calls() {
+        for seed in 0..SEEDS {
+            let (isos, ops) = gen_schedule(seed);
+            let want_begins = isos.iter().filter(|iso| iso.is_some()).count() as u64
+                + ops
+                    .iter()
+                    .filter(|op| matches!(op.kind, ScheduleOp::Begin(_)))
+                    .count() as u64;
+            let want_gcs = ops
+                .iter()
+                .filter(|op| matches!(op.kind, ScheduleOp::Gc))
+                .count() as u64;
+            // The engine side of S13: GC on, one gc() per Gc op.
+            let engine = CountingEngine::wrap(RefEngine::new());
+            let _ = replay_schedule(&engine, &isos, &ops, true);
+            assert_eq!(
+                engine.gcs(),
+                want_gcs,
+                "seed {seed}: gc() calls with run_gc=true (G-REPLAY-GC-NEVER?)",
+            );
+            assert_eq!(
+                engine.begins(),
+                want_begins,
+                "seed {seed}: begin() calls with run_gc=true \
+                 (G-REPLAY-BEGIN-NOOP?)",
+            );
+            // The oracle side of S13: GC off, so gc() never.
+            let oracle = CountingEngine::wrap(RefEngine::new());
+            let _ = replay_schedule(&oracle, &isos, &ops, false);
+            assert_eq!(
+                oracle.gcs(),
+                0,
+                "seed {seed}: gc() calls with run_gc=false (ORACLE-RUNS-GC?)",
+            );
+            assert_eq!(
+                oracle.begins(),
+                want_begins,
+                "seed {seed}: begin() calls with run_gc=false \
+                 (G-REPLAY-BEGIN-NOOP?)",
+            );
+        }
     }
 
     /// Card X-1a-F3 Work 4: the barrier must reject a table that
