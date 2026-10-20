@@ -15,8 +15,13 @@ publish.workspace = true
 sqlite = ["dep:rusqlite"]
 # Non-default (card X-0-F1-F1): exposes the test-only chaos hook
 # `insert_early_release`, which exists solely so this crate's own tests can
-# pin T-COUPLING (X-0-F1 verdict, finding 1). Without the feature the hook
-# does not exist, so no ordinary caller of the crate can damage a tree.
+# pin T-COUPLING (X-0-F1 verdict, finding 1). Reach (X-0-F1-F1 verdict,
+# finding 1): the feature never reaches crates outside this workspace, nor
+# any normal (non-test) build — but `cargo test --workspace` unifies it,
+# via the self dev-dependency below, into the e0-btree copy that other
+# workspace crates' tests link, so a workspace crate's tests could call the
+# hook. No workspace crate other than e0-btree may reference
+# `insert_early_release`.
 test-hooks = []
 
 [dependencies]
@@ -28,9 +33,15 @@ proptest = "1.12"
 # Self dev-dependency (card X-0-F1-F1): cargo unifies its features into the
 # lib copy the integration tests link, so `tests/model.rs` sees
 # `insert_early_release` under the plain featureless `cargo test` the gate
-# runs. A dev-dependency only; it never reaches anyone depending on this
-# crate, and `required-features` on `[[test]] model` was rejected because it
-# would drop the whole model suite from the gate's featureless run.
+# runs — this is what keeps the T-COUPLING pin in that featureless run. A
+# dev-dependency only, so it never reaches crates outside this workspace,
+# nor any normal (non-test) build. It does reach workspace test builds:
+# under `cargo test --workspace` the same unification gives other workspace
+# crates' tests an e0-btree copy that has the feature, so their tests could
+# call the hook — no workspace crate other than e0-btree may reference
+# `insert_early_release`. `required-features` on `[[test]] model` was
+# rejected because it would drop the whole model suite from the gate's
+# featureless run.
 e0-btree = { path = ".", features = ["test-hooks"] }
 
 [lints]
