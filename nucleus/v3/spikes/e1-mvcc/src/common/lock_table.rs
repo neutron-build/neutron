@@ -736,31 +736,6 @@ mod tests {
         assert_eq!(lt.escalations(), 1);
     }
 
-    /// The `NO-RECLAIM-AFTER-CLAIM` catcher of card X-1a-F1: inserters
-    /// race an escalant past its budget, and no foreign row may coexist
-    /// with the table owner (L-EXCL).
-    ///
-    /// The interleaving being probed is microscopic: an inserter's
-    /// counter bump and step-(3) owner check must both land between the
-    /// escalant's pre-claim counter read and its claim of the table
-    /// mutex. The round therefore multiplies the chances: eight
-    /// inserters acquire and release continuously (dense insert traffic
-    /// into every claim window), the escalant runs escalate/release
-    /// cycles for as long as the inserters live, and every inserter
-    /// that gets an `Ok` holds its row for a short randomized window
-    /// (0–7 µs, covering a claim→pass-2 completion) while watching the
-    /// `escalations()` level against a snapshot taken **after** the
-    /// `Ok`.
-    ///
-    /// The detector is sound for correct code: `escalations()` is
-    /// incremented only after the post-claim re-test passed and pass 2
-    /// dropped the escalant's rows, so an inserter that has held its
-    /// row continuously since its `Ok` (and whose snapshot postdates
-    /// that `Ok`, hence every earlier escalation) can see a new
-    /// increment only if some claim completed while its row was live —
-    /// and the race closure in the module docs (the inserter's bump
-    /// precedes its owner check; the re-test reads the counter after
-    /// the claim) makes that impossible when the re-test exists.
     /// The `NO-RECLAIM-AFTER-CLAIM` catcher of card X-1a-F1 (white-box:
     /// it lives beside the code because the interleaving it probes is
     /// narrower than any scheduling luck — an inserter's counter bump
@@ -773,7 +748,7 @@ mod tests {
     /// [`LockTable::try_escalate`], so the thread has read the counter
     /// (no foreign row) and is queued to claim. The test then performs
     /// an in-flight inserter's step (2) exactly — row inserted, counter
-    // bumped, and its step-(3) owner check already past (it saw no
+    /// bumped, and its step-(3) owner check already past (it saw no
     /// owner, so nothing will undo the row) — and releases the mutex.
     ///
     /// Correct code: the post-claim re-test reads the bumped counter,
