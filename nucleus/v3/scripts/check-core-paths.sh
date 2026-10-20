@@ -27,7 +27,19 @@ fi
 
 base=${1:?BASE}
 head=${2:?HEAD}
-entries=$(git show "$base:$v3/CORE_PATHS" 2>/dev/null | core_entries) || entries=$(core_entries <CORE_PATHS)
+# The list comes from BASE. The worktree's copy belongs to the branch under
+# check, so it stands in only when BASE predates CORE_PATHS (exit 3), never when
+# git failed to read it (exit 1): that refuses before the diff.
+err=$(mktemp)
+rc=0
+entries=$(base_core_entries "$base" "$v3" 2>"$err") || rc=$?
+reason=$(cat "$err")
+rm -f "$err"
+case $rc in
+  0) ;;
+  3) entries=$(core_entries <CORE_PATHS) ;;
+  *) echo "check-core-paths: cannot read CORE_PATHS from $base ($reason)" >&2; exit 1 ;;
+esac
 # -z: git would C-quote a non-ASCII path ("nucleus/v3/docs/\303\251.md"), which
 # then fails the nucleus/v3/ prefix strip and every CORE_PATHS match.
 # Through a file, not `< <(git diff ...)`: process substitution drops git's exit

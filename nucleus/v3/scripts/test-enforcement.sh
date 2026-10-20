@@ -116,6 +116,39 @@ scratch; expect_ok "S card adding spikes/ü.txt merges (seen as inside nucleus/v
 expect_ok "check-core-paths lists CORE scripts/é.sh" bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-SU | grep -qxF 'CORE scripts/é.sh (scripts/)'"
 # A base git cannot diff against must fail the listing, not list nothing (S-0-F2-F2).
 expect_no "check-core-paths: a bogus base exits non-zero" bash -c "cd '$v3' && bash scripts/check-core-paths.sh no-such-ref card/v3-SU"
+# CORE_PATHS is read from the base fail-closed (S-0-F2-F2-F1-F1): a read git
+# fails is refused, never replaced by the worktree's list or an empty one.
+# ccp_refused DIR BASE HEAD: check-core-paths in DIR fails and names the read.
+ccp_refused() { local o rc=0; o=$(cd "$1" && bash scripts/check-core-paths.sh "$2" "$3" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "check-core-paths: cannot read CORE_PATHS from $2 (" <<<"$o"; }
+expect_ok "check-core-paths: a bogus base is refused by the CORE_PATHS read" ccp_refused "$v3" no-such-ref card/v3-SU
+# The real exposure: a base git can diff (trees only) but whose CORE_PATHS blob
+# is gone. Built in a copy, so the deleted object cannot break later scenarios.
+mb=$t/mb
+cp -a "$r" "$mb"
+git -C "$mb" checkout -q -b mb-base nucleus/v3-scaffold
+echo '# mb-scenario' >>"$mb/nucleus/v3/CORE_PATHS"
+git -C "$mb" commit -qam "nucleus v3: mb-base CORE_PATHS"
+card MB S standard
+git -C "$mb" checkout -q -b card/v3-MB
+echo MB >"$mb/nucleus/v3/scripts/mb.sh"
+git -C "$mb" add -A && git -C "$mb" commit -qm "nucleus v3: MB work"
+printf 'Card: MB\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-10-20\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$mb" rev-parse --short HEAD)" >"$mb/nucleus/v3/verdicts/MB.md"
+git -C "$mb" add -A && git -C "$mb" commit -qm "nucleus v3: MB verdict MERGE"
+git -C "$mb" checkout -q nucleus/v3-scaffold
+mbblob=$(git -C "$mb" rev-parse mb-base:nucleus/v3/CORE_PATHS)
+rm -f "$mb/.git/objects/${mbblob:0:2}/${mbblob:2}"
+mb_diffs() { git -C "$mb" diff -z --name-only mb-base...card/v3-MB >"$t/mbl" && tr '\0' '\n' <"$t/mbl" | grep -qxF nucleus/v3/scripts/mb.sh; }
+expect_ok "premise: git diff mb-base...card/v3-MB succeeds and lists scripts/mb.sh" mb_diffs
+expect_no "premise: git show mb-base:nucleus/v3/CORE_PATHS fails (blob deleted)" git -C "$mb" show mb-base:nucleus/v3/CORE_PATHS
+expect_ok "check-core-paths: a base whose CORE_PATHS blob is missing is refused" ccp_refused "$mb/nucleus/v3" mb-base card/v3-MB
+cm_mb() { local o rc=0; o=$(cd "$mb/nucleus/v3" && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge MB mb-base card/v3-MB audit 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "cannot read CORE_PATHS from mb-base" <<<"$o"; }
+expect_ok "check_merge: a base whose CORE_PATHS blob is missing is refused" cm_mb
+# Control: a base that predates CORE_PATHS (the scratch root, "pre-v3 history")
+# still falls back to the worktree's list.
+root=$(git -C "$r" rev-list --max-parents=0 nucleus/v3-scaffold)
+root_absent() { local o; o=$(git -C "$r" ls-tree --full-tree "$root" -- nucleus/v3/CORE_PATHS) && [ -z "$o" ]; }
+expect_ok "premise: ls-tree of the root commit lists no CORE_PATHS" root_absent
+expect_ok "check-core-paths: a base that predates CORE_PATHS uses the worktree's list" bash -c "cd '$v3' && bash scripts/check-core-paths.sh '$root' card/v3-B | grep -qxF 'CORE scripts/gate.sh (scripts/)'"
 
 card F S standard; branch F nucleus/v3/spikes/f.txt; verdict F S MERGE standard S "GATE EXIT=1"
 scratch; expect_no "Gate-exit GATE EXIT=1 is refused" mc F
