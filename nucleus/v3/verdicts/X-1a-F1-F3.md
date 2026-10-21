@@ -1,0 +1,27 @@
+Card: X-1a-F1-F3
+Class: mechanical
+Card-gate: S
+Verdict: MERGE-WITH-FOLLOWUPS
+Gate-tier: S
+Gate-model: glm-5.3 (zai-coding-plan)
+Gate-session: nv3-X-1a-F1-F3-gate-1 (T3-delegated GLM gate subagent, gate round 1)
+Date: 2026-10-21
+Gate-exit: GATE EXIT=0
+Commit: 80834b90
+Mutants: m1-release-armed-store-moved-back-after-unlock (own) -> UNCAUGHT (cargo test -p e1-mvcc --lib, 17/17 green); m2-arm-armed-store-moved-before-lock (own) -> UNCAUGHT (cargo test -p e1-mvcc --lib, 17/17 green); m3-b1-expected-attempts-off-by-one (own) -> cost_profile (b1) assert (left 8, right 7); m4-b2-expected-attempts-1-to-2 (own) -> cost_profile (b2) assert (left 1, right 2). Card names no mutants (Class: mechanical).
+Followups: X-1a-F1-F3-F1
+
+## Findings
+
+- **Gate run.** `bash scripts/gate.sh` at tip 80834b90 (own `CARGO_TARGET_DIR`): every step exit 0, literal last line `GATE EXIT=0`. Card acceptance lines 1–3 re-verified: lib 17/17, `grep -nF "multiplies the chances"` no match, `--release --test cost_profile -- --ignored` 1/1.
+- **Scope.** `git diff nucleus/v3-scaffold...HEAD --stat` = exactly the 3 Touch files: `commit.rs` (+43/−20 comment+store-order only), `lock_table.rs` (comment-only), `cost_profile.rs`. The gate edit lives only in `commit.rs` (the card's "one of the two files"); `sequencer.rs` untouched. No protected paths.
+- **Doc comment (Work 1).** The 25-line first draft is deleted in full; the kept draft opens with what the test catches (NO-RECLAIM-AFTER-CLAIM, card X-1a-F1); the stray `//` is now `///`; the `lock_table.rs` hunks are comment bytes only — no code change, test body identical.
+- **ARMED under the mutex (Work 2).** `arm_now` stores `armed = true` inside the critical section after the state fields; `release` stores `armed = false` inside the section, before unlocking, then `notify_all`. `maybe_park`, `wait_parked`, `State` and the fast path's single Acquire load are untouched. Both comments state the required invariant ("`ARMED` changes only under the gate mutex, so a holder of the mutex always sees `ARMED == state.armed`") and why the fast path stays correct. No behaviour regression: the reordering only narrows the release/arm race; the parked-commit protocol is unchanged, and all existing gate tests (fast path, S11a, per-engine) are green unmodified.
+- **Deterministic (b) (Work 3).** Re-ran the measurement myself: (b1) escalations = 0, attempts = 8, formula prints `1 + (2000000 - 1000001) / 125000 = 8`; (b2) escalations = 1, attempts = 1 — identical counts to the RESULT (timings differ and are unasserted). The expected count is computed in-test from `escalation_retry_step()` and the closed form `1 + (N − (E+1))/step` is exact; both assertions bite (mutants m3, m4). (a)/(c)/(d) byte-identical; module doc keeps "nothing here asserts a threshold" and adds the (b) sentence as specified. No threshold, no tuning.
+- **UNCAUGHT mutants.** m1/m2 (reintroducing either out-of-mutex flag store) pass 17/17: the race is probabilistic and every existing gate test arms before spawning the committing thread, so thread creation already orders the flag. Expected for this class; the card's Notes assign the gate a textual check of the store positions, which passes. Not a defect of the card.
+- **Pre-existing rustdoc warnings.** `cargo doc -p e1-mvcc --no-deps` at tip emits exactly the 9 warnings the worker enumerated (7 unresolved links from X-1a-F3's rewording — `[ApplyGate]`, `[LATEST]`, `[arm]`, `[wait_parked]`, `[release]`, `[ApplyGate::arm]`, `[commit::apply_gate]` — plus private-item links `[IDX_SHARDS]`, `[ParkedBarrier]`). None originate in this card's edits; Work 1's "cargo doc stays warning-free" holds in the no-new-warnings sense (the crate was not warning-free at base). Fixes are outside the Touch list → follow-up below.
+- **Merge note (for the merger, not a defect).** `git merge-tree` vs the current scaffold conflicts textually in `commit.rs`: X-1a-F3-F1 (merged on scaffold, not in this branch's base) deleted the free-function bridge and folded `arm_now` back into a plain `arm`. The edits stand alone semantically: the scaffold's plain `arm()`/`release()` still store the flag outside the mutex (the race this card fixes is present there), and this card's store positions and comments apply to that shape unchanged. Resolution: keep scaffold's plain-`arm` structure with this card's in-mutex store order and comments.
+
+## Follow-up X-1a-F1-F3-F1
+
+`e1-mvcc` is not actually rustdoc-clean: `cargo doc -p e1-mvcc --no-deps` emits 9 warnings — seven unresolved intra-doc links introduced by X-1a-F3's rewording of the apply-gate docs (`[ApplyGate]` and `[LATEST]` in `commit.rs`, `[arm]`/`[wait_parked]`/`[release]`/`[ApplyGate::arm]` in the `apply_gate` module docs, `[commit::apply_gate]` in `sequencer.rs`) and two public-doc links to private items (`[IDX_SHARDS]` in `lock_table.rs`, `[ParkedBarrier]` in `suite.rs`). The set is byte-identical at this card's base, so no card in flight made it worse, but any future card whose check is "cargo doc stays warning-free" inherits the ambiguity this gate had to resolve. The follow-up fixes the nine links (resolve or de-link, without changing prose meaning), making `cargo doc -p e1-mvcc` exit warning-free so the check becomes literal again. Touch: `commit.rs`, `sequencer.rs`, `lock_table.rs`, `suite.rs` docs only; note it must be based on a scaffold that includes both X-1a-F3-F1 and this card, since the `[ApplyGate]`/bridge wording lands differently on each side of that merge.
