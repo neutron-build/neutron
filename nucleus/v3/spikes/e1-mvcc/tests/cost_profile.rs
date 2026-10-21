@@ -7,11 +7,13 @@
 //! cargo test --release -p e1-mvcc --test cost_profile -- --ignored --nocapture
 //! ```
 //!
-//! It uses **only the pre-card public API** (`LockTable::{new,
-//! with_escalate_at, acquire, release_all, escalations}`,
-//! `commit_with`), so the identical file runs on the base branch
-//! (`nucleus/v3-scaffold`) and on the card tip, and the two outputs are
-//! comparable. Nothing here asserts a threshold; the deterministic
+//! It uses the X-1a-F1 public API (`LockTable::{new, with_escalate_at,
+//! acquire, release_all, escalations, escalation_attempts,
+//! escalation_retry_step}`, `commit_with` — `escalation_attempts` and
+//! `escalation_retry_step` are on the scaffold since X-1a-F1), so the
+//! identical file still runs on base and tip, and the two outputs are
+//! comparable. Nothing here asserts a threshold; (b)'s counts are
+//! asserted because they are deterministic; the deterministic
 //! complexity bounds live in `tests/costs.rs`.
 
 use std::hint::black_box;
@@ -66,44 +68,86 @@ fn cost_profile() {
         );
     }
 
-    // (b) Total time for one txn to acquire 2M rows with
-    // escalate_at = 1M while a second thread holds and cycles one
-    // foreign row (the W6 head-of-line shape). Reports the elapsed time
-    // and `escalations()`: whether the big txn ever replaced its rows
-    // with the table-wide owner.
+    // (b) Escalation behaviour of one txn acquiring 2M rows with
+    // escalate_at = 1M, as two **fixed** variants (card X-1a-F1-F3
+    // Work 3). The pre-F3 cycling foreign row made whether the big txn
+    // escalates depend on whether the row happened to be free at an
+    // attempt instant — one sample of a race. Both variants are
+    // deterministic, so their counts are asserted: they are properties
+    // of L-ESCALATE-DEFER, not timings.
     {
-        const A_ROWS: u64 = 2_000_000;
-        let lt = LockTable::with_escalate_at(1_000_000);
-        let stop = AtomicBool::new(false);
-        let acquired = AtomicU64::new(0);
-        thread::scope(|s| {
-            let lt_f = &lt;
-            let stop = &stop;
-            s.spawn(move || {
-                let f = b"foreign-row";
-                while !stop.load(Ordering::Relaxed) {
-                    if lt_f.acquire(f, 42, Wait::NoWait).is_ok() {
-                        lt_f.release_all(42);
-                    } else {
-                        thread::yield_now();
-                    }
-                }
-            });
+        const B_ROWS: u64 = 2_000_000;
+        const ESCALATE_AT: u64 = 1_000_000;
+        // (b1) A foreign row held for the whole run: txn 42 acquires it
+        // before txn 1's first acquire and releases it after the last,
+        // so every escalation attempt defers (escalation never waits).
+        {
+            let lt = LockTable::with_escalate_at(ESCALATE_AT as usize);
+            lt.acquire(b"foreign-row", 42, Wait::NoWait).unwrap();
             let t0 = Instant::now();
-            for i in 0..A_ROWS {
+            for i in 0..B_ROWS {
                 lt.acquire(black_box(&k(i)), 1, Wait::NoWait).unwrap();
-                acquired.fetch_add(1, Ordering::Relaxed);
             }
             let elapsed = t0.elapsed();
-            stop.store(true, Ordering::Relaxed);
-            let n = acquired.load(Ordering::Relaxed);
+            lt.release_all(42);
+            // The L-ESCALATE-DEFER retry rule, computed (not
+            // hard-coded) from the table: the first attempt is at
+            // own-count `ESCALATE_AT + 1`, and each failed attempt
+            // defers the next by one retry step, so attempts land at
+            // `ESCALATE_AT + 1 + j·step` while that is `<= B_ROWS`.
+            let step = lt.escalation_retry_step() as u64;
+            let expected_attempts = 1 + (B_ROWS - (ESCALATE_AT + 1)) / step;
             println!(
-                "(b) {n} acquires by one txn, escalate_at = 1_000_000, one foreign \
-                 row cycling: elapsed = {elapsed:.3?}, {:.0} acquires/s, escalations = {}",
-                n as f64 / elapsed.as_secs_f64(),
+                "(b1) {B_ROWS} acquires by one txn, escalate_at = {ESCALATE_AT}, one \
+                 foreign row held for the whole run: elapsed = {elapsed:.3?}, {:.0} \
+                 acquires/s, escalations = {}, attempts = {} (retry rule: 1 + \
+                 ({B_ROWS} - {}) / {step} = {expected_attempts})",
+                B_ROWS as f64 / elapsed.as_secs_f64(),
                 lt.escalations(),
+                lt.escalation_attempts(),
+                ESCALATE_AT + 1,
             );
-        });
+            assert_eq!(
+                lt.escalations(),
+                0,
+                "(b1): a foreign row held across every attempt must defer them all"
+            );
+            assert_eq!(
+                lt.escalation_attempts(),
+                expected_attempts,
+                "(b1): attempts follow the L-ESCALATE-DEFER retry rule"
+            );
+            lt.release_all(1);
+        }
+        // (b2) No foreign holder: the first attempt escalates, and the
+        // remaining acquires are no-ops under the table owner.
+        {
+            let lt = LockTable::with_escalate_at(ESCALATE_AT as usize);
+            let t0 = Instant::now();
+            for i in 0..B_ROWS {
+                lt.acquire(black_box(&k(i)), 1, Wait::NoWait).unwrap();
+            }
+            let elapsed = t0.elapsed();
+            println!(
+                "(b2) {B_ROWS} acquires by one txn, escalate_at = {ESCALATE_AT}, no \
+                 foreign holder: elapsed = {elapsed:.3?}, {:.0} acquires/s, escalations \
+                 = {}, attempts = {}",
+                B_ROWS as f64 / elapsed.as_secs_f64(),
+                lt.escalations(),
+                lt.escalation_attempts(),
+            );
+            assert_eq!(
+                lt.escalations(),
+                1,
+                "(b2): with no foreign row the first attempt escalates"
+            );
+            assert_eq!(
+                lt.escalation_attempts(),
+                1,
+                "(b2): after the escalation every acquire is a no-op at step (1)"
+            );
+            lt.release_all(1);
+        }
     }
 
     // (c) `acquire` + `release_all` pairs per second for disjoint keys
