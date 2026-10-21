@@ -260,6 +260,11 @@ pub fn free_bytes(buf: &[u8]) -> Result<usize, StoreError> {
 
 /// Total hole bytes: cell-area bytes not covered by any live cell. Removed
 /// cells leave holes until [`compact`] reclaims them.
+///
+/// The subtraction is checked (card X-0-F4 Work 3): P-LAYOUT says cells
+/// never overlap, but corrupt bytes can say otherwise, and slots whose
+/// lengths sum past the cell area are [`StoreError::Corrupt`], never an
+/// arithmetic panic (P-PARSE).
 pub fn hole_bytes(buf: &[u8]) -> Result<usize, StoreError> {
     let h = header(buf)?;
     let mut live = 0usize;
@@ -267,7 +272,10 @@ pub fn hole_bytes(buf: &[u8]) -> Result<usize, StoreError> {
         let (_, len) = slot(buf, i)?;
         live += len;
     }
-    Ok(buf.len() - h.free_end - live)
+    buf.len()
+        .checked_sub(h.free_end)
+        .and_then(|area| area.checked_sub(live))
+        .ok_or_else(|| corrupt("live cells exceed the cell area"))
 }
 
 /// Right-most child of an inner page.
@@ -548,6 +556,10 @@ fn has_room(buf: &[u8], need: usize) -> Result<bool, StoreError> {
 
 /// Defragment: rewrite all cells contiguously at the page end, in slot
 /// order, and rebuild the slot array (card X-0 Work 4).
+///
+/// The running subtraction is checked (card X-0-F4 Work 3): overlapping
+/// slots can sum past the page size, which is [`StoreError::Corrupt`],
+/// never an arithmetic panic (P-PARSE). On error the page is unmodified.
 pub fn compact(buf: &mut [u8]) -> Result<(), StoreError> {
     let h = header(buf)?;
     let ps = buf.len();
@@ -560,7 +572,9 @@ pub fn compact(buf: &mut [u8]) -> Result<(), StoreError> {
     let mut scratch = vec![0u8; ps];
     let mut cur = ps;
     for &(off, len) in cells.iter() {
-        cur -= len;
+        cur = cur
+            .checked_sub(len)
+            .ok_or_else(|| corrupt("cells overflow the page during compaction"))?;
         let src = buf
             .get(off..off + len)
             .ok_or_else(|| corrupt("compaction source out of bounds"))?;
@@ -777,4 +791,59 @@ where
     }
     set_right_child(buf, rightmost)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // Corrupt-input arithmetic of `compact` and `hole_bytes` (card X-0-F4
+    // Work 3; X-0 finding 4). `cargo test` builds this module in debug,
+    // where the plain subtractions of the COMPACT-UNCHECKED and
+    // HOLE-UNCHECKED mutants panic instead of returning `Corrupt`.
+
+    use super::*;
+
+    /// A leaf page whose three slots alias the same 3000 bytes at the start
+    /// of the cell area: each cell is individually inside
+    /// `[free_end, len)`, so `slot` accepts it, but the lengths sum to
+    /// 9000 — past both the 8192-byte page (`compact`'s budget) and the
+    /// 4096-byte cell area (`hole_bytes`'s). Only bytes that violate
+    /// P-LAYOUT's "cells never overlap" can look like this.
+    fn overlapping_slots_page() -> Vec<u8> {
+        let mut buf = vec![0u8; 8192];
+        init(&mut buf, PageKind::Leaf).unwrap();
+        u16_wr(&mut buf, 2, 3).unwrap();
+        u16_wr(&mut buf, 4, (HEADER + 3 * SLOT) as u16).unwrap();
+        u16_wr(&mut buf, 6, 4096).unwrap();
+        for i in 0..3 {
+            u16_wr(&mut buf, HEADER + SLOT * i, 4096).unwrap();
+            u16_wr(&mut buf, HEADER + SLOT * i + 2, 3000).unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn compact_rejects_slots_summing_past_the_page() {
+        let mut buf = overlapping_slots_page();
+        let before = buf.clone();
+        match compact(&mut buf) {
+            Err(StoreError::Corrupt(msg)) => {
+                assert!(msg.contains("overflow"), "message was {msg:?}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        // A page `compact` rejects must come back unmodified: the failing
+        // subtraction happens before any byte is written through `buf`.
+        assert_eq!(buf, before, "compact modified a page it rejected");
+    }
+
+    #[test]
+    fn hole_bytes_rejects_slots_summing_past_the_cell_area() {
+        let buf = overlapping_slots_page();
+        match hole_bytes(&buf) {
+            Err(StoreError::Corrupt(msg)) => {
+                assert!(msg.contains("exceed"), "message was {msg:?}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
 }
