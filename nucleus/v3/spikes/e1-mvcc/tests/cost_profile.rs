@@ -15,6 +15,18 @@
 //! comparable. Nothing here asserts a threshold; (b)'s counts are
 //! asserted because they are deterministic; the deterministic
 //! complexity bounds live in `tests/costs.rs`.
+//!
+//! Card X-1a-F1-F2 Work 6 adds the **(c′)** variant after (c): (c)
+//! again, but with each thread's key **and** txn pre-selected so the 16
+//! threads land on 16 distinct key shards **and** 16 distinct index
+//! shards (probed through the `#[doc(hidden)]`
+//! `LockTable::{shard_of_key, shard_of_txn}` helpers, which exist only
+//! on the tip). (c)'s fixed keys collide on key shards often — with 64
+//! shards, P(no collision among 16) ≈ 0.15 — so (c) mixes whatever
+//! global per-acquire costs remain with shard collisions, while (c′)
+//! isolates the global ones. (c′) is tip-only; the (a), (b1/b2), (c)
+//! and (d) blocks above it are byte-for-byte the scaffold's, so base
+//! and tip outputs stay comparable.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -169,6 +181,70 @@ fn cost_profile() {
                         for _ in 0..PER_THREAD {
                             if lt.acquire(&key, 10 + t as u64, Wait::NoWait).is_ok() {
                                 lt.release_all(10 + t as u64);
+                                pairs.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            });
+            let elapsed = t0.elapsed();
+            let n = pairs.load(Ordering::Relaxed);
+            println!(
+                "    threads = {threads:2}: {n} pairs in {elapsed:.3?} = {:.0} pairs/s",
+                n as f64 / elapsed.as_secs_f64(),
+            );
+        }
+    }
+
+    // (c′) Card X-1a-F1-F2 Work 6: (c) with each thread's key and txn
+    // pre-selected so the 16 threads land on 16 distinct key shards
+    // and 16 distinct index shards, probed through the tip-only
+    // `#[doc(hidden)]` helpers. This separates the global per-acquire
+    // costs this card removes from shard collisions (module docs).
+    {
+        const THREAD_COUNTS: &[usize] = &[1, 4, 8, 16];
+        const PER_THREAD: u64 = 200_000;
+        const CP_THREADS: usize = 16;
+        // 16 keys in 16 distinct key shards ...
+        let mut keys: Vec<u64> = Vec::with_capacity(CP_THREADS);
+        let mut key_shards = std::collections::BTreeSet::new();
+        let mut j = 2_000_000u64;
+        while keys.len() < CP_THREADS {
+            if key_shards.insert(LockTable::shard_of_key(&k(j))) {
+                keys.push(j);
+            }
+            j += 1;
+        }
+        // ... and 16 txn ids in 16 distinct index shards, counting up
+        // from the same base (c) numbers its txns from.
+        let mut txns: Vec<u64> = Vec::with_capacity(CP_THREADS);
+        let mut idx_shards = std::collections::BTreeSet::new();
+        let mut t = 10u64;
+        while txns.len() < CP_THREADS {
+            if idx_shards.insert(LockTable::shard_of_txn(t)) {
+                txns.push(t);
+            }
+            t += 1;
+        }
+        println!(
+            "(c′) acquire + release_all pairs, disjoint keys in 16 distinct \
+             key shards and 16 distinct index shards (key shards \
+             {key_shards:?}, index shards {idx_shards:?}):"
+        );
+        for threads in THREAD_COUNTS {
+            let lt = LockTable::new();
+            let pairs = AtomicU64::new(0);
+            let t0 = Instant::now();
+            thread::scope(|s| {
+                for t in 0..*threads {
+                    let lt = &lt;
+                    let pairs = &pairs;
+                    let key = k(keys[t]);
+                    let txn = txns[t];
+                    s.spawn(move || {
+                        for _ in 0..PER_THREAD {
+                            if lt.acquire(&key, txn, Wait::NoWait).is_ok() {
+                                lt.release_all(txn);
                                 pairs.fetch_add(1, Ordering::Relaxed);
                             }
                         }

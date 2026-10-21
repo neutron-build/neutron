@@ -1,5 +1,5 @@
-//! The in-memory lock table (card X-1a Work 3, perf rework card X-1a-F1;
-//! PLAN-v3 §2 N2; C-T0 §6).
+//! The in-memory lock table (card X-1a Work 3, perf rework cards
+//! X-1a-F1 and X-1a-F1-F2; PLAN-v3 §2 N2; C-T0 §6).
 //!
 //! Exclusive row locks live here as values-free owners: an entry names
 //! the owning txn and nothing else. Every key-existence or row operation
@@ -24,8 +24,11 @@
 //! - L-RELEASE: `release_all` costs O(the keys the txn itself holds),
 //!   takes at most `min(keys, SHARDS)` key-shard locks (counted by
 //!   `shard_visits()`), and wakes the waiters of every shard it freed
-//!   and of the table owner (C-T0 §6 "waking"). An escalated txn holds
-//!   no rows: its release clears the owner and touches no shard.
+//!   and of the table owner (C-T0 §6 "waking"). The table mutex is
+//!   taken only when the txn is the escalated owner — the owner-word
+//!   fast path of card X-1a-F1-F2 — so a txn that never escalated
+//!   releases without touching it. An escalated txn holds no rows: its
+//!   release clears the owner and touches no shard.
 //! - **L-ESCALATE-DEFER (decided in card X-1a-F1; S-2 decides the
 //!   production rule).** Escalation never *waits* on a foreign row
 //!   holder: a waiting escalant already holding a million rows
@@ -35,10 +38,13 @@
 //!   passes `escalate_at`, and after a failed attempt it is retried
 //!   only after another *retry step* of acquires by the same txn —
 //!   `escalation_retry_step()` = `max(escalate_at / 8, 1)`. Each
-//!   attempt's foreign-row test is O(1): the table's total row-entry
-//!   counter minus the txn's own count — never a shard scan. Under
-//!   sustained foreign traffic a big txn may therefore never escalate;
-//!   that outcome is legitimate and is what W6 must report.
+//!   attempt's foreign-row test is **O(SHARDS)**: the sum of the
+//!   `SHARDS` per-key-shard row counters (card X-1a-F1-F2's striped
+//!   counters, one per key shard) minus the txn's own count — constant
+//!   and independent of the number of keys anyone holds, never a shard
+//!   scan. Under sustained foreign traffic a big txn may therefore
+//!   never escalate; that outcome is legitimate and is what W6 must
+//!   report.
 //! - L-WAIT-OBS: the parked-waiter count ([`LockTable::waiting`]) is
 //!   **per-table** state (card X-1a-F3): it counts exactly the threads
 //!   inside this table's wait paths, so the suite's blocked-path
@@ -51,22 +57,66 @@
 //! contend on acquire (the pre-F1 global index mutex serialized every
 //! acquire in the process). The only nested acquisition in the table is
 //! an index shard held across a key shard (acquire step (2) below). The
-//! table-owner mutex is always taken alone — never held across an
+//! table mutex is always taken alone — never held across an
 //! index-shard or key-shard acquisition, and neither is held while
-//! taking it. A thread waiting on a condvar holds only that condvar's
-//! mutex.
+//! taking it. Since card X-1a-F1-F2 it guards only the owner word's
+//! slow paths — **claim, clear and wait** — because the acquire and
+//! release fast paths read the owner word lock-free; it is still never
+//! held across another lock. A thread waiting on a condvar holds only
+//! that condvar's mutex.
 //!
 //! The escalation race (L-ESCALATE) and its closure, re-derived for the
-//! counter layout: an inserter inserts its row and bumps the row
-//! counter, then re-checks the table owner, undoing the insert if an
-//! owner appeared; an escalant tests the counter (`total > own` =
-//! a foreign row exists), claims the owner, and re-tests the counter,
-//! un-claiming if a foreign row appeared. The inserter bumps the
-//! counter before its owner check, and the escalant reads the counter
-//! after releasing its claim's critical section, so whichever of the
-//! two acted first is seen by the other's second step through the
-//! table mutex — the pair can never interleave into "escalant owns the
-//! table while an inserter keeps its row".
+//! owner-word + striped-counter layout of card X-1a-F1-F2. The two
+//! sides form a Dekker-style store→load pair, and all four of its
+//! operations are `SeqCst`:
+//!
+//! - an **inserter** does `fetch_add(stripe, SeqCst)` (acquire step
+//!   (2), inside the key-shard critical section) and then
+//!   `load(owner, SeqCst)` (step (3)), undoing its row if an owner
+//!   appeared;
+//! - an **escalant** does `compare_exchange(none → txn, SeqCst)` (the
+//!   claim, under the table mutex) and then loads every stripe
+//!   (`SeqCst`), un-claiming if the sum exceeds its own rows.
+//!
+//! In the single total order S of all SeqCst operations: either the
+//! inserter's owner load follows the escalant's CAS, in which case the
+//! last owner write before that load is the claim (no clear of it
+//! intervenes while the claim survives), so the inserter sees the owner
+//! and undoes its row; or the inserter's owner load — which read
+//! "none" — precedes the CAS, and the increment sequenced before that
+//! load precedes it too, while every escalant stripe load is sequenced
+//! after the CAS: the escalant's load of that stripe therefore reads a
+//! value that already counts the increment, the post-claim sum sees
+//! the row, and the escalant un-claims. The pair can never interleave
+//! into "escalant owns the table while an inserter keeps its row".
+//!
+//! Why the sum cannot under-report a foreign row that survives: a
+//! surviving row is precisely one whose inserter's step-(3) owner load
+//! read "none", which by the case above places that load — and with it
+//! the row's increment — before the CAS and hence before the escalant's
+//! stripe loads in S. Every decrement pairs with an earlier increment
+//! of the same row under the same shard mutex (rows enter and leave a
+//! shard only under that shard's mutex), and the escalant's own rows
+//! change only on its own thread, so `sum > own` holds whenever a
+//! foreign row is live across the attempt. A row being removed
+//! concurrently may instead make the sum read **high** — the
+//! conservative direction, an un-claim, never a missed foreign row.
+//!
+//! Acquire/Release is **not** enough for the handshake. Release stores
+//! and Acquire loads induce no total order and permit store→load
+//! reordering (the store-buffering litmus of the C++/Rust memory
+//! model): the inserter's increment could sit in its store buffer while
+//! its owner load reads "none", and the escalant's CAS could sit in
+//! its own while its stripe loads read pre-increment values — both
+//! sides miss each other, the claim survives beside a live foreign row,
+//! and L-EXCL is broken. Only SeqCst's total order forces at least one
+//! side to observe the other (C-T0 §5.1 I-LOCK).
+//!
+//! Waking is a separate, mutex-based handshake: a waiter re-checks the
+//! owner word while holding the table mutex, and every clearer stores
+//! "none" while holding it, so a clear either precedes the waiter's
+//! re-check (the waiter sees it and never parks) or its `notify_all`
+//! follows the waiter's park — a wakeup can never be lost.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -130,23 +180,57 @@ struct TxnLocks {
     retry_at: usize,
 }
 
-/// The table-wide exclusive owner slot (L-ESCALATE).
-#[derive(Default)]
-struct TableState {
-    owner: Option<TxnId>,
+/// The table-owner word's "no owner" encoding (card X-1a-F1-F2 Work 1).
+///
+/// The owner slot is one `AtomicU64` read lock-free on the acquire and
+/// release fast paths; "no owner" must be distinct from every live
+/// owner, and `TxnId = u64`, so `u64::MAX` is the reserved "none"
+/// value. Every other `TxnId` is representable verbatim; the one
+/// unrepresentable id is refused by [`LockTable::acquire`] with
+/// [`TxnErr::Engine`] before it can hold a row or a claim, and
+/// `release_all` treats it as a no-op (a refused txn never holds
+/// anything), so the reserved value can never be mistaken for a live
+/// owner. The boundary is pinned by the `owner_word_boundary` test.
+const OWNER_NONE: TxnId = TxnId::MAX;
+
+/// One striped row counter (card X-1a-F1-F2 Work 2): the count of row
+/// entries whose keys map to this key shard. A row's counter is its
+/// key shard's, so inserts and removals on disjoint shards touch
+/// disjoint counters instead of one process-wide cache line. The
+/// `#[repr(align(128))]` wrapper keeps neighbouring counters off one
+/// cache line (plain std, no new dependency); it exists for the
+/// alignment alone, which is why it holds nothing but the count.
+#[repr(align(128))]
+struct Stripe {
+    /// Row entries currently in this stripe's key shard, maintained
+    /// under that shard's mutex at every insert and removal. `SeqCst`:
+    /// part of the escalation handshake (module docs, "the escalation
+    /// race").
+    count: AtomicU64,
 }
 
 /// The sharded lock table (see the module docs).
 pub struct LockTable {
     shards: Vec<Mutex<HashMap<Vec<u8>, Owner>>>,
     cvs: Vec<Condvar>,
-    table: Mutex<TableState>,
+    /// The table-owner word (L-ESCALATE): [`OWNER_NONE`] or the owning
+    /// txn. The single source of truth for escalation, read lock-free
+    /// (`SeqCst`) on the acquire and release fast paths; the mutex
+    /// below is taken only to claim, clear or wait on it (card
+    /// X-1a-F1-F2 Work 1).
+    owner: AtomicU64,
+    /// The claim/clear/wait mutex for the owner word (slow paths only;
+    /// card X-1a-F1-F2 Work 1). Always taken alone — see the lock-order
+    /// section.
+    table: Mutex<()>,
     table_cv: Condvar,
     by_txn: Vec<Mutex<HashMap<TxnId, TxnLocks>>>,
-    /// Total row entries across all shards: the O(1) foreign-row test of
-    /// L-ESCALATE-DEFER is `rows > own count`. Maintained under the
-    /// shard mutex at every insert and removal.
-    rows: AtomicU64,
+    /// The striped row counters (card X-1a-F1-F2 Work 2), one per key
+    /// shard, each on its own cache line. They replace the single
+    /// global counter whose read-modify-write serialized every row
+    /// insert and removal in the process; the escalant's foreign-row
+    /// test sums them (L-ESCALATE-DEFER).
+    stripes: Vec<Stripe>,
     /// Threads currently inside [`LockTable::acquire`]'s wait paths on
     /// **this** table (L-WAIT-OBS). Per-table state, so the suite's
     /// blocked-path barrier observes one engine's waiters only (card
@@ -171,12 +255,17 @@ impl LockTable {
         Self {
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             cvs: (0..SHARDS).map(|_| Condvar::new()).collect(),
-            table: Mutex::new(TableState::default()),
+            owner: AtomicU64::new(OWNER_NONE),
+            table: Mutex::new(()),
             table_cv: Condvar::new(),
             by_txn: (0..IDX_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
-            rows: AtomicU64::new(0),
+            stripes: (0..SHARDS)
+                .map(|_| Stripe {
+                    count: AtomicU64::new(0),
+                })
+                .collect(),
             waiters: AtomicU64::new(0),
             escalate_at,
             escalations: AtomicU64::new(0),
@@ -197,10 +286,43 @@ impl LockTable {
         (h.finish() as usize) % IDX_SHARDS
     }
 
-    fn lock_table(&self) -> Result<std::sync::MutexGuard<'_, TableState>, TxnErr> {
+    fn lock_table(&self) -> Result<std::sync::MutexGuard<'_, ()>, TxnErr> {
         self.table
             .lock()
             .map_err(|e| TxnErr::Engine(crate::common::was_poisoned(&e)))
+    }
+
+    /// The key shard a key maps to — the same mapping the key shards
+    /// and striped row counters use. `#[doc(hidden)]` test
+    /// observability (card X-1a-F1-F2 Work 6): the cost profile's (c′)
+    /// selects 16 keys in 16 distinct key shards by probing with it.
+    #[doc(hidden)]
+    pub fn shard_of_key(key: &[u8]) -> usize {
+        Self::shard_of(key)
+    }
+
+    /// The per-txn index shard a txn maps to. `#[doc(hidden)]` test
+    /// observability (card X-1a-F1-F2 Work 6), as [`Self::shard_of_key`]:
+    /// the cost profile's (c′) selects 16 txns in 16 distinct index
+    /// shards with it.
+    #[doc(hidden)]
+    pub fn shard_of_txn(txn: TxnId) -> usize {
+        Self::idx_of(txn)
+    }
+
+    /// Sum of every stripe counter, read with `SeqCst` loads: the
+    /// escalant's foreign-row test (L-ESCALATE-DEFER). O(SHARDS) —
+    /// constant and independent of how many keys anyone holds — and
+    /// never a shard scan. `SeqCst` is part of the escalation
+    /// handshake: these loads must be ordered after the claim in the
+    /// single total order of SeqCst operations for the closure to hold
+    /// (module docs, "the escalation race").
+    fn stripe_sum(&self) -> u64 {
+        let mut n = 0u64;
+        for s in &self.stripes {
+            n += s.count.load(Ordering::SeqCst);
+        }
+        n
     }
 
     /// Lock the per-txn index shard owning `txn`'s entry (lock order:
@@ -228,28 +350,36 @@ impl LockTable {
     /// key is a no-op; a foreign table owner or row owner is resolved per
     /// `wait`.
     pub fn acquire(&self, key: &[u8], txn: TxnId, wait: Wait) -> Result<(), TxnErr> {
+        // The owner word reserves u64::MAX as "no owner" (Work 1), so
+        // that one txn id is unrepresentable and refused before it can
+        // hold a row or a claim.
+        if txn == OWNER_NONE {
+            return Err(TxnErr::Engine(format!(
+                "txn id {txn} is reserved as the lock table's no-owner word"
+            )));
+        }
         let deadline = match wait {
             Wait::Block(d) => Some(Instant::now() + d),
             Wait::NoWait => None,
         };
         loop {
-            // (1) The table-wide owner excludes every row.
-            {
-                let t = self.lock_table()?;
-                if let Some(owner) = t.owner {
-                    if owner == txn {
-                        return Ok(()); // we escalated: every key is ours
-                    }
-                    drop(t);
-                    self.wait_table_owner(owner, wait, deadline)?;
-                    continue;
+            // (1) The table-wide owner excludes every row. A SeqCst
+            // load of the owner word — no mutex: the uncontended fast
+            // path of card X-1a-F1-F2 Work 1. SeqCst pairs with the
+            // escalant's claim (module docs, "the escalation race").
+            let owner = self.owner.load(Ordering::SeqCst);
+            if owner != OWNER_NONE {
+                if owner == txn {
+                    return Ok(()); // we escalated: every key is ours
                 }
+                self.wait_table_owner(owner, wait, deadline)?;
+                continue;
             }
             // (2) The row, under the per-txn index shard and the key
-            // shard, in that order. The counter bump is inside the
-            // shard's critical section and before step (3), so any
-            // escalant that claims after our insert sees our count
-            // (module docs, "the escalation race").
+            // shard, in that order. The row counts in its key shard's
+            // stripe, inside the shard's critical section and before
+            // step (3), so any escalant that claims after our insert
+            // sees our count (module docs, "the escalation race").
             let idx = Self::shard_of(key);
             let count;
             let retry_at;
@@ -270,7 +400,7 @@ impl LockTable {
                     continue;
                 }
                 sh.insert(key.to_vec(), Owner(txn));
-                self.rows.fetch_add(1, Ordering::Relaxed);
+                self.stripes[idx].count.fetch_add(1, Ordering::SeqCst);
                 let entry = by.entry(txn).or_default();
                 entry.keys.insert(key.to_vec());
                 count = entry.keys.len();
@@ -278,19 +408,16 @@ impl LockTable {
                 drop(sh);
                 drop(by);
             }
-            // (3) Re-check the table owner: if an escalation claimed the
+            // (3) Re-check the owner word: if an escalation claimed the
             // table between (1) and the insert, undo the insert and take
-            // the wait path instead (L-ESCALATE's handshake).
-            {
-                let t = self.lock_table()?;
-                if let Some(owner) = t.owner
-                    && owner != txn
-                {
-                    drop(t);
-                    self.remove_row(key, txn);
-                    self.wait_table_owner(owner, wait, deadline)?;
-                    continue;
-                }
+            // the wait path instead (L-ESCALATE's handshake). A SeqCst
+            // load again — paired with (2)'s increment it is the
+            // inserter's half of the Dekker handshake (module docs).
+            let owner = self.owner.load(Ordering::SeqCst);
+            if owner != OWNER_NONE && owner != txn {
+                self.remove_row(key, txn);
+                self.wait_table_owner(owner, wait, deadline)?;
+                continue;
             }
             // (4) Past the budget, replace our rows with the table
             // owner — but only when the retry step allows a new
@@ -318,13 +445,23 @@ impl LockTable {
     /// at most `min(keys, SHARDS)` key-shard locks; an escalated txn
     /// holds no rows, so it clears the owner and touches no shard.
     pub fn release_all(&self, txn: TxnId) {
-        // The table owner first (always alone): waiters on it wake as
-        // soon as it clears.
-        if let Ok(mut t) = self.table.lock()
-            && t.owner == Some(txn)
+        // The table owner first (always alone). The fast path loads the
+        // owner word and takes the mutex only when this txn is the
+        // owner, so a txn that never escalated pays no table-mutex trip
+        // at all (card X-1a-F1-F2 Work 1). The reserved id can never
+        // own the word (acquire refuses it), so its release is a no-op.
+        if txn != OWNER_NONE
+            && self.owner.load(Ordering::SeqCst) == txn
+            && let Ok(_t) = self.table.lock()
         {
-            t.owner = None;
-            self.table_cv.notify_all();
+            // Re-checked and cleared under the mutex: clearers always
+            // clear under it, and the notify below can never be lost by
+            // a waiter that is deciding to park (module docs,
+            // "Waking").
+            if self.owner.load(Ordering::SeqCst) == txn {
+                self.owner.store(OWNER_NONE, Ordering::SeqCst);
+                self.table_cv.notify_all();
+            }
         }
         // Take the key set out of the index entry in one pass.
         let keys = match self.lock_index(txn) {
@@ -349,7 +486,7 @@ impl LockTable {
                 for k in &ks {
                     if sh.get(k).is_some_and(|o| o.0 == txn) {
                         sh.remove(k);
-                        self.rows.fetch_sub(1, Ordering::Relaxed);
+                        self.stripes[i].count.fetch_sub(1, Ordering::SeqCst);
                     }
                 }
             }
@@ -360,7 +497,8 @@ impl LockTable {
     }
 
     /// Total entries held: row entries plus one for a table-wide owner
-    /// (the `entries()` stat of card Work 3).
+    /// (the `entries()` stat of card Work 3). The owner half reads the
+    /// owner word (card X-1a-F1-F2).
     pub fn entries(&self) -> u64 {
         let mut n = 0u64;
         for sh in &self.shards {
@@ -368,9 +506,7 @@ impl LockTable {
                 n += sh.len() as u64;
             }
         }
-        if let Ok(t) = self.table.lock()
-            && t.owner.is_some()
-        {
+        if self.owner.load(Ordering::SeqCst) != OWNER_NONE {
             n += 1;
         }
         n
@@ -461,15 +597,15 @@ impl LockTable {
             && sh.get(key).is_some_and(|o| o.0 == txn)
         {
             sh.remove(key);
-            self.rows.fetch_sub(1, Ordering::Relaxed);
+            self.stripes[idx].count.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
     /// Try to replace `txn`'s rows with the table-wide owner
     /// (L-ESCALATE, L-ESCALATE-DEFER). Returns whether the escalation
-    /// happened; a foreign row (O(1) counter test, before **and** after
-    /// the claim) or a foreign owner defers it to a later retry step
-    /// without dropping any of `txn`'s rows.
+    /// happened; a foreign row (the O(SHARDS) stripe-sum test, before
+    /// **and** after the claim) or a foreign owner defers it to a later
+    /// retry step without dropping any of `txn`'s rows.
     fn try_escalate(&self, txn: TxnId) -> bool {
         self.attempts.fetch_add(1, Ordering::Relaxed);
         // Our own row count. Stable during the attempt: only this txn's
@@ -478,30 +614,43 @@ impl LockTable {
             Ok(by) => by.get(&txn).map_or(0, |l| l.keys.len()),
             Err(_) => return false,
         } as u64;
-        // Pre-claim foreign test (O(1)): claiming only to un-claim
-        // would stall every other inserter on the owner slot.
-        if self.rows.load(Ordering::Acquire) > own {
+        // Pre-claim foreign test (O(SHARDS), L-ESCALATE-DEFER):
+        // claiming only to un-claim would stall every other inserter
+        // on the owner word.
+        if self.stripe_sum() > own {
             return false;
         }
-        // Claim the owner slot: exactly one escalant can hold it.
+        // Claim the owner word: exactly one escalant can hold it. The
+        // SeqCst compare_exchange is the escalant's half of the
+        // handshake (module docs, "the escalation race"); the mutex
+        // serializes it against every other claim, clear and wait.
         {
-            let Ok(mut t) = self.table.lock() else {
+            let Ok(_t) = self.table.lock() else {
                 return false;
             };
-            if t.owner.is_some() {
+            if self
+                .owner
+                .compare_exchange(OWNER_NONE, txn, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
                 return false; // another txn owns the table: not now
             }
-            t.owner = Some(txn);
         }
-        // Post-claim re-test. An inserter that raced its bump between
-        // the pre-claim test and the claim will un-do itself in acquire
-        // step (3) — but one whose step-(3) check ran before our claim
-        // does not, and only this re-test sees it (module docs).
-        if self.rows.load(Ordering::Acquire) > own {
-            if let Ok(mut t) = self.table.lock()
-                && t.owner == Some(txn)
+        // Post-claim re-test: sum every stripe again — these loads are
+        // ordered after the claim in the SeqCst total order. An
+        // inserter that raced its increment between the pre-claim test
+        // and the claim will un-do itself in acquire step (3) — but one
+        // whose step-(3) owner load ran before our claim does not, and
+        // only this re-test sees it (module docs, "the escalation
+        // race").
+        if self.stripe_sum() > own {
+            // Un-claim under the mutex, then notify: waiters re-check
+            // the word under the same mutex, so the wakeup cannot be
+            // lost (module docs, "Waking").
+            if let Ok(_t) = self.table.lock()
+                && self.owner.load(Ordering::SeqCst) == txn
             {
-                t.owner = None;
+                self.owner.store(OWNER_NONE, Ordering::SeqCst);
             }
             self.table_cv.notify_all();
             return false;
@@ -527,7 +676,7 @@ impl LockTable {
                 for k in &ks {
                     if sh.get(k).is_some_and(|o| o.0 == txn) {
                         sh.remove(k);
-                        self.rows.fetch_sub(1, Ordering::Relaxed);
+                        self.stripes[i].count.fetch_sub(1, Ordering::SeqCst);
                     }
                 }
             }
@@ -547,6 +696,12 @@ impl LockTable {
 
     /// Wait until the table-wide `owner` is gone (L-WAIT). `Ok(())`
     /// means "something changed, retry the acquire loop".
+    ///
+    /// Takes the table mutex, re-checks the owner word under it, then
+    /// parks: every clearer stores "none" under the same mutex, so a
+    /// clear either precedes the re-check (no park) or its notify
+    /// follows the park — no wakeup can be lost (module docs,
+    /// "Waking"; card X-1a-F1-F2 Work 1).
     fn wait_table_owner(
         &self,
         owner: TxnId,
@@ -563,7 +718,7 @@ impl LockTable {
         let mut t = self.lock_table()?;
         let _waiting = WaitingGuard::new(self);
         loop {
-            if t.owner != Some(owner) {
+            if self.owner.load(Ordering::SeqCst) != owner {
                 return Ok(());
             }
             let now = Instant::now();
@@ -640,10 +795,11 @@ impl Default for LockTable {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
-    use super::{LockTable, Owner};
+    use super::{LockTable, Owner, SHARDS};
     use crate::api::{TxnErr, Wait};
 
     /// L-NOOP: acquiring an owned key again succeeds immediately.
@@ -740,21 +896,23 @@ mod tests {
     /// it lives beside the code because the interleaving it probes is
     /// narrower than any scheduling luck — an inserter's counter bump
     /// *and* its step-(3) owner check must both land between the
-    /// escalant's pre-claim counter read and its claim, and a fair table
+    /// escalant's pre-claim stripe sum and its claim, and a fair table
     /// mutex always serves the queued escalant first).
     ///
     /// The orchestration parks a real escalant thread **inside** that
     /// gap: the test holds the table mutex while the thread runs
-    /// [`LockTable::try_escalate`], so the thread has read the counter
-    /// (no foreign row) and is queued to claim. The test then performs
-    /// an in-flight inserter's step (2) exactly — row inserted, counter
-    /// bumped, and its step-(3) owner check already past (it saw no
-    /// owner, so nothing will undo the row) — and releases the mutex.
+    /// [`LockTable::try_escalate`], so the thread has summed the
+    /// stripes (no foreign row) and is queued to claim. The test then
+    /// performs an in-flight inserter's step (2) exactly — row inserted,
+    /// stripe counted, and its step-(3) owner check already past (it
+    /// saw no owner, so nothing will undo the row) — and releases the
+    /// mutex.
     ///
-    /// Correct code: the post-claim re-test reads the bumped counter,
-    /// un-claims and defers; the foreign row and all of the escalant's
-    /// rows survive untouched. A mutant that skips the re-test
-    /// escalates onto a live foreign row and fails every assertion.
+    /// Correct code: the post-claim re-test's stripe sum sees the
+    /// bumped stripe, un-claims and defers; the foreign row and all of
+    /// the escalant's rows survive untouched. A mutant that skips the
+    /// re-test escalates onto a live foreign row and fails every
+    /// assertion.
     /// The test cannot false-fail: if the escalant thread were delayed
     /// past the bump, its *pre*-claim test defers instead — the same
     /// observable outcome.
@@ -779,15 +937,16 @@ mod tests {
                 // few µs).
                 thread::sleep(Duration::from_millis(2));
                 // The in-flight inserter's step (2), verbatim: row in
-                // its shard, total bumped. (No index entry: the point
-                // is the shard row plus the counter the re-test reads.)
+                // its shard, counted in its shard's stripe. (No index
+                // entry: the point is the shard row plus the stripes
+                // the re-test sums.)
                 let foreign = b"in-flight-inserter-row";
                 let idx = LockTable::shard_of(foreign);
                 if let Some(sh) = lt.shards.get(idx) {
                     let mut sh = crate::common::lock_unpoisoned(sh);
                     sh.insert(foreign.to_vec(), Owner(2));
                 }
-                lt.rows.fetch_add(1, Ordering::Relaxed);
+                lt.stripes[idx].count.fetch_add(1, Ordering::SeqCst);
                 // Let the escalant claim.
                 drop(table);
                 escalant.join().unwrap()
@@ -806,5 +965,257 @@ mod tests {
             assert_eq!(lt.held_by(1), OWN, "trial {trial}");
             assert!(lt.escalation_attempts() >= 1, "trial {trial}: non-vacuity");
         }
+    }
+
+    /// Work 1: the acquire and release fast paths take no table mutex.
+    /// The test holds the mutex's guard for the whole watchdog while a
+    /// spawned txn that never escalated acquires a fresh key and
+    /// releases it; that must complete within 5 s — steps (1) and (3)
+    /// and `release_all`'s fast path are lock-free reads of the owner
+    /// word (card X-1a-F1-F2 mutants TABLE-MUTEX-STEP1,
+    /// TABLE-MUTEX-STEP3, RELEASE-TAKES-TABLE-MUTEX).
+    #[test]
+    fn acquire_takes_no_table_mutex() {
+        let lt = LockTable::new();
+        let (done, rx) = mpsc::channel::<()>();
+        thread::scope(|s| {
+            // Guard first, so the worker cannot slip past its first
+            // table-mutex acquisition before the guard is held.
+            let table = crate::common::lock_unpoisoned(&lt.table);
+            let worker = {
+                let lt = &lt;
+                let done = &done;
+                s.spawn(move || {
+                    lt.acquire(b"no-table-mutex-key", 42, Wait::NoWait).unwrap();
+                    lt.release_all(42);
+                    let _ = done.send(());
+                })
+            };
+            let recv = rx.recv_timeout(Duration::from_secs(5));
+            // Drop the guard before asserting (and before the scope's
+            // join), so a blocked worker can always finish and a failed
+            // run reports the mutant instead of wedging.
+            drop(table);
+            assert!(
+                recv.is_ok(),
+                "acquire + release_all of a never-escalated txn did not \
+                 complete within 5 s while the test held the table mutex"
+            );
+            assert!(worker.join().is_ok());
+        });
+        assert_eq!(lt.entries(), 0, "the worker released everything");
+    }
+
+    /// Work 1: a table-owner waiter is woken by the owner's release
+    /// promptly — within 5 s, far below its own 60 s `Block` deadline —
+    /// so a missing notify cannot pass by a late deadline re-check (the
+    /// G3 lesson of verdict X-1a-F1; card mutant NO-TABLE-NOTIFY).
+    #[test]
+    fn release_wakes_table_owner_waiter_promptly() {
+        let lt = LockTable::with_escalate_at(1);
+        lt.acquire(b"prompt-a1", 1, Wait::NoWait).unwrap();
+        lt.acquire(b"prompt-a2", 1, Wait::NoWait).unwrap();
+        assert!(lt.is_escalated(1), "two keys past the budget of one");
+        let (done, rx) = mpsc::channel::<()>();
+        thread::scope(|s| {
+            let waiter = {
+                let lt = &lt;
+                let done = &done;
+                s.spawn(move || {
+                    // Blocks at step (1) on the table owner — a fresh
+                    // key no row holds — with a deadline far above the
+                    // watchdog: only a notify, not a timeout re-check,
+                    // can return it this quickly.
+                    let r =
+                        lt.acquire(b"prompt-fresh-key", 2, Wait::Block(Duration::from_secs(60)));
+                    let _ = done.send(());
+                    r
+                })
+            };
+            // Barrier: the waiter is inside this table's wait path (card
+            // X-1a-F3's `waiting()`), so it has observed the owner and
+            // parked on the condvar before the release runs.
+            while lt.waiting() == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            lt.release_all(1);
+            let recv = rx.recv_timeout(Duration::from_secs(5));
+            let joined = waiter.join().is_ok_and(|r| r.is_ok());
+            assert!(
+                recv.is_ok() && joined,
+                "the table-owner waiter did not return within 5 s of the \
+                 owner's release (its own deadline was 60 s): the clear's \
+                 notify_all was lost"
+            );
+        });
+        assert_eq!(lt.held_by(2), 1, "the waiter took its key");
+        lt.release_all(2);
+    }
+
+    /// Work 2: rows are counted one per key shard — a row's counter is
+    /// its key shard's stripe (card mutant SINGLE-STRIPE).
+    #[test]
+    fn rows_are_striped_by_key_shard() {
+        let lt = LockTable::new();
+        // Two keys in two different shards, probed through the same
+        // mapping the table uses (bounded: the first ~100 u64 keys
+        // cover several shards).
+        let mut first: Option<(u64, usize)> = None;
+        let mut second: Option<(u64, usize)> = None;
+        let mut i = 0u64;
+        while (first.is_none() || second.is_none()) && i < 100_000u64 {
+            let shard = LockTable::shard_of(&i.to_be_bytes());
+            if first.is_none() {
+                first = Some((i, shard));
+            } else if shard != first.map_or(usize::MAX, |(_, s)| s) && second.is_none() {
+                second = Some((i, shard));
+            }
+            i += 1;
+        }
+        let (a, b) = (
+            first.expect("probe found a first key"),
+            second.expect("probe found a key in a different shard"),
+        );
+        assert_ne!(a.1, b.1, "the two keys must map to different shards");
+        lt.acquire(&a.0.to_be_bytes(), 1, Wait::NoWait).unwrap();
+        lt.acquire(&b.0.to_be_bytes(), 1, Wait::NoWait).unwrap();
+        assert_eq!(
+            lt.stripes[a.1].count.load(Ordering::SeqCst),
+            1,
+            "key a counts in its own shard's stripe"
+        );
+        assert_eq!(
+            lt.stripes[b.1].count.load(Ordering::SeqCst),
+            1,
+            "key b counts in its own shard's stripe"
+        );
+        assert_eq!(lt.stripe_sum(), 2, "the escalant's sum reads both");
+        lt.release_all(1);
+        assert_eq!(
+            lt.stripes[a.1].count.load(Ordering::SeqCst),
+            0,
+            "release decrements key a's stripe"
+        );
+        assert_eq!(
+            lt.stripes[b.1].count.load(Ordering::SeqCst),
+            0,
+            "release decrements key b's stripe"
+        );
+        assert_eq!(lt.stripe_sum(), 0);
+    }
+
+    /// Work 2: the escalant's foreign-row test sums **every** stripe —
+    /// a foreign row in any single shard defers the escalation (card
+    /// mutant STRIPE-SUM-SKIPS-LAST).
+    #[test]
+    fn escalation_sees_a_foreign_row_in_every_stripe() {
+        // One key per shard, found by brute force over u64 keys (a few
+        // hundred candidates cover all 64 shards; the bound is
+        // paranoia).
+        let mut shard_key: Vec<Option<u64>> = vec![None; SHARDS];
+        let mut i = 0u64;
+        while shard_key.iter().any(Option::is_none) && i < 200_000u64 {
+            let shard = LockTable::shard_of(&i.to_be_bytes());
+            if shard_key[shard].is_none() {
+                shard_key[shard] = Some(i);
+            }
+            i += 1;
+        }
+        assert!(
+            shard_key.iter().all(Option::is_some),
+            "one key per shard found within a bounded search"
+        );
+        // For every shard: a foreign txn holds one key there while the
+        // big txn crosses its budget with keys in other shards. The
+        // escalation must defer — the sum must read that stripe — and
+        // the big txn's rows must survive untouched.
+        for (target, foreign) in shard_key.iter().enumerate() {
+            let foreign = foreign.expect("probed above");
+            let lt = LockTable::with_escalate_at(4);
+            lt.acquire(&foreign.to_be_bytes(), 2, Wait::NoWait).unwrap();
+            let mut own = 0u64;
+            let mut j = 0u64;
+            while own < 5 && j < 200_000u64 {
+                let shard = LockTable::shard_of(&j.to_be_bytes());
+                if shard != target {
+                    lt.acquire(&j.to_be_bytes(), 1, Wait::NoWait).unwrap();
+                    own += 1;
+                }
+                j += 1;
+            }
+            assert_eq!(
+                own, 5,
+                "shard {target}: five own keys found in other shards"
+            );
+            assert_eq!(
+                lt.escalations(),
+                0,
+                "shard {target}: a foreign row in this stripe must defer \
+                 the escalation"
+            );
+            assert_eq!(
+                lt.escalation_attempts(),
+                1,
+                "shard {target}: the budget was crossed exactly once \
+                 (non-vacuity)"
+            );
+            assert!(!lt.is_escalated(1), "shard {target}");
+            assert_eq!(
+                lt.held_by(1),
+                5,
+                "shard {target}: the deferred escalation kept every row"
+            );
+            assert_eq!(
+                lt.entries(),
+                6,
+                "shard {target}: five own rows plus the foreign row"
+            );
+            lt.release_all(1);
+            lt.release_all(2);
+            assert_eq!(lt.entries(), 0, "shard {target}: quiescent");
+        }
+    }
+
+    /// Work 1: the owner word reserves `u64::MAX` as "no owner", so that
+    /// one txn id is refused with `Engine`, the adjacent id is
+    /// representable verbatim (it escalates and is released normally),
+    /// and the reserved id's release can never disturb a live owner.
+    #[test]
+    fn owner_word_boundary() {
+        let lt = LockTable::with_escalate_at(1);
+        // The reserved id is refused outright.
+        assert!(matches!(
+            lt.acquire(b"boundary", u64::MAX, Wait::NoWait),
+            Err(TxnErr::Engine(_))
+        ));
+        assert_eq!(lt.entries(), 0, "a refused txn holds nothing");
+        assert_eq!(lt.held_by(u64::MAX), 0);
+        assert!(!lt.is_escalated(u64::MAX));
+        // Every other id — including the one just below the sentinel —
+        // is representable, escalates, and is released normally.
+        let edge = u64::MAX - 1;
+        lt.acquire(b"boundary-a", edge, Wait::NoWait).unwrap();
+        lt.acquire(b"boundary-b", edge, Wait::NoWait).unwrap();
+        assert!(
+            lt.is_escalated(edge),
+            "the id adjacent to the sentinel escalates"
+        );
+        assert_eq!(lt.entries(), 1, "only the table-wide owner remains");
+        // The reserved id's release is a no-op: it can never own the
+        // word (acquire refuses it), so it must not clear a live owner.
+        lt.release_all(u64::MAX);
+        assert!(
+            lt.is_escalated(edge),
+            "release_all of the reserved id must not clear a live owner"
+        );
+        assert_eq!(
+            lt.acquire(b"boundary-fresh", 3, Wait::NoWait),
+            Err(TxnErr::LockNotAvailable),
+            "the owner is still live"
+        );
+        lt.release_all(edge);
+        assert!(lt.acquire(b"boundary-fresh", 3, Wait::NoWait).is_ok());
+        lt.release_all(3);
+        assert_eq!(lt.entries(), 0);
     }
 }
