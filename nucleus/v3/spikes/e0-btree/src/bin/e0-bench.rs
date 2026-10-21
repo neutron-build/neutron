@@ -12,7 +12,8 @@
 //! SQLite is the E0 baseline; the C build is confined to the benchmark
 //! feature (`sqlite`, off by default — binaries cannot use
 //! dev-dependencies). Output: a table of ns/op for both sides plus the
-//! ratio (SQLite time / ours: >1 means we are faster), and optional JSON.
+//! ratio (>1 means we are faster: sqlite time / ours for the ns/op rows,
+//! ours ops/s / sqlite ops/s for the W-mt rows), and optional JSON.
 //!
 //! No panics on any path: failures print to stderr and exit nonzero.
 
@@ -99,10 +100,15 @@ mod e0_bench {
         mt_ops: f64,
     }
 
-    fn median3(v: [f64; 3]) -> f64 {
-        let mut s = v;
+    /// Median of the run values. Card X-0-F4 Work 1: the median used to
+    /// assume exactly three runs and read the zero-initialized spare slots
+    /// of a `[Work; 3]` when `--runs` was 1 or 2, zeroing every output —
+    /// and `--runs` above 3 indexed out of bounds. It now medians exactly
+    /// the runs that happened; even counts take the upper middle value.
+    fn median(v: &[f64]) -> f64 {
+        let mut s = v.to_vec();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        s[1]
+        *s.get(s.len() / 2).unwrap_or(&0.0)
     }
 
     fn pick<'a>(keys: &'a [[u8; 8]], rng: &mut Sm) -> Result<&'a [u8; 8], String> {
@@ -166,7 +172,14 @@ mod e0_bench {
             }
         }
         let range = t0.elapsed();
-        if scanned + RANGE_KEYS * 10 < RANGE_OPS * RANGE_KEYS {
+        // Windows are random, so the scanned count fluctuates around
+        // RANGE_OPS * RANGE_KEYS (std ~3k keys over 100k windows). The old
+        // absolute slack of 1000 keys (0.01%) was tighter than that noise
+        // and failed spuriously at --keys 20000 (found by the X-0-F4 Work 1
+        // verification run); 0.5% absorbs ~15σ of noise and still trips on
+        // a systematic loss of one key per window (~143k keys, the
+        // RANGE-SKIPS-BOUNDARY shape, whose named catcher is model.rs).
+        if scanned + RANGE_OPS * RANGE_KEYS / 200 < RANGE_OPS * RANGE_KEYS {
             return Err(format!("range scans returned only {scanned} keys"));
         }
         // W-update: 500k upserts with different values.
@@ -433,6 +446,9 @@ mod e0_bench {
         if args.keys < 10_000 {
             return Err("--keys below 10_000 makes range windows meaningless".into());
         }
+        if args.runs < 1 {
+            return Err("--runs must be at least 1".into());
+        }
         Ok(args)
     }
 
@@ -496,17 +512,17 @@ mod e0_bench {
         );
         let file_path = std::env::temp_dir().join(format!("e0-bench-{}.pgs", std::process::id()));
 
-        let mut mem_ours = [Work::default(); 3];
-        let mut file_ours = [Work::default(); 3];
-        let mut sql = [Work::default(); 3];
+        let mut mem_ours: Vec<Work> = Vec::with_capacity(args.runs);
+        let mut file_ours: Vec<Work> = Vec::with_capacity(args.runs);
+        let mut sql: Vec<Work> = Vec::with_capacity(args.runs);
         for r in 0..args.runs {
             let t0 = Instant::now();
             let store = MemStore::new(8192).map_err(|e| e.to_string())?;
-            mem_ours[r] = ours_full(store, cap_mem, &keys)?;
+            mem_ours.push(ours_full(store, cap_mem, &keys)?);
             let _ = std::fs::remove_file(&file_path);
             let store = FileStore::open(&file_path, 8192).map_err(|e| e.to_string())?;
-            file_ours[r] = ours_full(store, cap_file, &keys)?;
-            sql[r] = sqlite_full(&keys)?;
+            file_ours.push(ours_full(store, cap_file, &keys)?);
+            sql.push(sqlite_full(&keys)?);
             println!(
                 "run {}/{} done in {:.1}s",
                 r + 1,
@@ -516,33 +532,35 @@ mod e0_bench {
         }
         let _ = std::fs::remove_file(&file_path);
 
+        // Median over exactly the runs that happened (card X-0-F4 Work 1):
+        // `--runs 1` and `--runs 2` must produce a table, not zeroes.
         let med =
-            |get: fn(&Work) -> f64, a: &Work, b: &Work, c: &Work| median3([get(a), get(b), get(c)]);
+            |ws: &[Work], get: fn(&Work) -> f64| median(&ws.iter().map(get).collect::<Vec<f64>>());
         let g_ins = |w: &Work| w.insert_ns;
         let g_pt = |w: &Work| w.point_ns;
         let g_rg = |w: &Work| w.range_ns;
         let g_up = |w: &Work| w.update_ns;
         let g_mt = |w: &Work| w.mt_ops;
         let mo = Work {
-            insert_ns: med(g_ins, &mem_ours[0], &mem_ours[1], &mem_ours[2]),
-            point_ns: med(g_pt, &mem_ours[0], &mem_ours[1], &mem_ours[2]),
-            range_ns: med(g_rg, &mem_ours[0], &mem_ours[1], &mem_ours[2]),
-            update_ns: med(g_up, &mem_ours[0], &mem_ours[1], &mem_ours[2]),
-            mt_ops: med(g_mt, &mem_ours[0], &mem_ours[1], &mem_ours[2]),
+            insert_ns: med(&mem_ours, g_ins),
+            point_ns: med(&mem_ours, g_pt),
+            range_ns: med(&mem_ours, g_rg),
+            update_ns: med(&mem_ours, g_up),
+            mt_ops: med(&mem_ours, g_mt),
         };
         let fo = Work {
-            insert_ns: med(g_ins, &file_ours[0], &file_ours[1], &file_ours[2]),
-            point_ns: med(g_pt, &file_ours[0], &file_ours[1], &file_ours[2]),
-            range_ns: med(g_rg, &file_ours[0], &file_ours[1], &file_ours[2]),
-            update_ns: med(g_up, &file_ours[0], &file_ours[1], &file_ours[2]),
-            mt_ops: med(g_mt, &file_ours[0], &file_ours[1], &file_ours[2]),
+            insert_ns: med(&file_ours, g_ins),
+            point_ns: med(&file_ours, g_pt),
+            range_ns: med(&file_ours, g_rg),
+            update_ns: med(&file_ours, g_up),
+            mt_ops: med(&file_ours, g_mt),
         };
         let so = Work {
-            insert_ns: med(g_ins, &sql[0], &sql[1], &sql[2]),
-            point_ns: med(g_pt, &sql[0], &sql[1], &sql[2]),
-            range_ns: med(g_rg, &sql[0], &sql[1], &sql[2]),
-            update_ns: med(g_up, &sql[0], &sql[1], &sql[2]),
-            mt_ops: med(g_mt, &sql[0], &sql[1], &sql[2]),
+            insert_ns: med(&sql, g_ins),
+            point_ns: med(&sql, g_pt),
+            range_ns: med(&sql, g_rg),
+            update_ns: med(&sql, g_up),
+            mt_ops: med(&sql, g_mt),
         };
 
         let mut tbl = String::new();
@@ -579,7 +597,11 @@ mod e0_bench {
             "(i) mem",
             format!("{:.0} ops/s", mo.mt_ops),
             format!("{:.0} ops/s", so.mt_ops),
-            so.mt_ops / mo.mt_ops
+            // ours ÷ SQLite (card X-0-F4 Work 1): >1 = we are faster, like
+            // every other row. The old SQLite ÷ ours read inverted under
+            // the legend; numerically ours ÷ SQLite ops/s equals SQLite
+            // time / ours time, so all rows share one legend.
+            mo.mt_ops / so.mt_ops
         );
         let _ = writeln!(
             tbl,
@@ -588,11 +610,12 @@ mod e0_bench {
             "(ii) 1/4",
             format!("{:.0} ops/s", fo.mt_ops),
             format!("{:.0} ops/s", so.mt_ops),
-            so.mt_ops / fo.mt_ops
+            fo.mt_ops / so.mt_ops
         );
         println!("{tbl}");
         println!(
-            "ratio = sqlite time / ours (>1 means we are faster). Decision rule \
+            "ratio = sqlite time / ours (>1 means we are faster); W-mt rows \
+             compute the same thing as ours ops/s / sqlite ops/s. Decision rule \
              (PLAN-v3 §4 E0): pass if ours >= 0.8x SQLite on W-point and W-range \
              in configuration (i), i.e. both ratios >= 0.8: point={:.3} range={:.3}.",
             so.point_ns / mo.point_ns,
@@ -631,10 +654,10 @@ mod e0_bench {
             );
             let _ = writeln!(
                 j,
-                "  \"ratios_sqlite_over_ours\": {{\"point_i\": {:.3}, \"range_i\": {:.3}, \"mt_i\": {:.3}}}\n}}",
+                "  \"ratios_sqlite_over_ours\": {{\"point_i\": {:.3}, \"range_i\": {:.3}}},\n  \"ours_over_sqlite\": {{\"mt_i\": {:.3}}}\n}}",
                 so.point_ns / mo.point_ns,
                 so.range_ns / mo.range_ns,
-                so.mt_ops / mo.mt_ops
+                mo.mt_ops / so.mt_ops
             );
             std::fs::write(&args.out, j).map_err(|e| e.to_string())?;
             println!("wrote {}", args.out);
