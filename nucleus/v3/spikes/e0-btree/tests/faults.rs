@@ -25,6 +25,18 @@
 //! `faults_pool_starved_mid_split` covers the pool-size failure mode
 //! the fault store cannot produce on its own: `PoolStarved` striking
 //! while an insert holds its split reservation.
+//!
+//! The X-0-F2 gate rework's **leak oracle** runs in both settings the
+//! gate named: every [`run_once`] and the long small-value run of
+//! `faults_no_page_leak_small_values` assert that the store's page
+//! count stays within `reachable + height + 8`. With the pool recycling
+//! released reservation ids and the tree reserving only for inserts
+//! that provably split, every allocated id is either a reachable tree
+//! page, in the pool's recycle list, or in flight; the recycle list
+//! never exceeds one maximal reservation (each `new_page` pops before
+//! the store is asked to allocate, and one insert releases at most `h`
+//! unused pages at once), and nothing is in flight in these
+//! single-threaded, quiescent checks.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -430,6 +442,15 @@ fn run_once(ops: &[Op], arm: Option<(Kind, u64)>) -> Result<([u64; 3], usize), S
     let store = tree.into_store();
     let reopened = BTree::open(store, CAPACITY, root).map_err(|m| format!("reopen: {m}"))?;
     assert_final_state(&reopened, &model, "after reopen")?;
+    // Leak oracle (X-0-F2 gate rework): checked on the faulted runs too —
+    // a failed reservation releases what it took, so even they must not
+    // grow the store beyond the tree.
+    let allocated = reopened
+        .into_store()
+        .inner
+        .page_count()
+        .map_err(|m| format!("page_count: {m}"))?;
+    assert_no_leak(stats.pages, stats.height, allocated, "after reopen");
     Ok((counts, stats.height))
 }
 
@@ -466,6 +487,26 @@ fn assert_final_state(
         ));
     }
     Ok(())
+}
+
+/// Slack over the exact bound `reachable + height + 1` (see the module
+/// doc): covers the pool's recycle list, which never holds more than one
+/// maximal reservation of `height + 1` ids, plus margin for rounding in
+/// the derivation.
+const LEAK_SLACK: usize = 8;
+
+/// The gate rework's leak oracle (card X-0-F2): the store must not grow
+/// beyond the tree it holds, beyond one maximal reservation's worth of
+/// ids. `allocated` is the store's page count, `pages`/`height` the
+/// tree's reachable pages and height from `check()`.
+fn assert_no_leak(pages: usize, height: usize, allocated: usize, phase: &str) {
+    let bound = pages + height + LEAK_SLACK;
+    assert!(
+        allocated <= bound,
+        "{phase}: store holds {allocated} pages for a tree of {pages} reachable \
+         pages at height {height} (bound {bound}) — split reservations are \
+         leaking ids (X-0-F2 gate rework)"
+    );
 }
 
 /// One `#[test]` per kind; each sweeps every call N of that kind.
@@ -511,6 +552,88 @@ fn fault_sweep_read() {
 #[test]
 fn fault_sweep_write() {
     fault_sweep(Kind::Write).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The leak oracle's long small-value leg (X-0-F2 gate rework)
+// ---------------------------------------------------------------------------
+
+/// Card X-0-F2 gate rework, second leg of the leak oracle: a long
+/// small-value workload must not grow the store's page count beyond the
+/// tree it holds. This is the shape the gate measured leaking 138,844
+/// allocated ids for 374 reachable pages (16-byte keys, 16-byte
+/// values): every leaf past half full fails `is_safe`, so before the
+/// rework nearly every insert reserved — and then released unused —
+/// pages whose ids nothing ever reused. Here: 12,000 sequential
+/// 16-byte keys with 16-byte values, small upserts and deletes
+/// interleaved, on the sweep's 16-frame pool (the run settles at height
+/// 3, inside the reservation minimum `2·h + 1 = 7 ≤ 16`), then the same
+/// end-of-run oracle as the sweep — `check()`, full-range equality with
+/// the model, flush + reopen — plus the leak bound.
+#[test]
+fn faults_no_page_leak_small_values() {
+    let store = MemStore::new(8192).expect("store");
+    let tree = BTree::new(store, CAPACITY).expect("tree");
+    let mut rng = Sm::new(0x5EED_0C2A);
+    let mut model: Model = BTreeMap::new();
+    let mut live: Vec<u16> = Vec::new();
+    for i in 0u16..12_000 {
+        let k = key(i, 16);
+        let v = value(&mut rng, 16);
+        let old = tree.insert(&k, &v).expect("insert");
+        let want = model.insert(k.clone(), v);
+        assert_eq!(old, want, "insert {i}: return value");
+        live.push(i);
+        if i >= 9 && i % 3 == 0 {
+            // Small upsert: a same-size replacement, always in place.
+            let j = live[(rng.next_u64() as usize) % live.len()];
+            let k = key(j, 16);
+            let v = value(&mut rng, 16);
+            let old = tree.insert(&k, &v).expect("upsert");
+            let want = model.insert(k.clone(), v);
+            assert_eq!(old, want, "upsert at {i}");
+        }
+        if i >= 15 && i % 5 == 0 {
+            let j = live[(rng.next_u64() as usize) % live.len()];
+            let k = key(j, 16);
+            let old = tree.delete(&k).expect("delete");
+            let want = model.remove(&k);
+            assert_eq!(old, want, "delete at {i}");
+        }
+    }
+    let stats = tree.check().expect("check after the run");
+    assert!(
+        stats.height >= 2,
+        "the run must grow the tree past a lone root (height {})",
+        stats.height
+    );
+    let needed = 2 * stats.height + 1;
+    assert!(
+        needed <= CAPACITY,
+        "height {} needs {needed} frames, pool is {CAPACITY}",
+        stats.height
+    );
+    let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = tree
+        .range(&[0x00], &[0xff; 17])
+        .expect("range")
+        .collect::<Result<_, _>>()
+        .expect("range item");
+    assert_eq!(scan, want, "full range vs model");
+    tree.flush_all().expect("flush");
+    let root = tree.root_page().expect("root");
+    let store = tree.into_store();
+    let allocated = store.page_count().expect("page count");
+    let reopened = BTree::open(store, CAPACITY, root).expect("reopen");
+    let rstats = reopened.check().expect("check after reopen");
+    assert_eq!(rstats.height, stats.height, "height across reopen");
+    let rscan: Vec<(Vec<u8>, Vec<u8>)> = reopened
+        .range(&[0x00], &[0xff; 17])
+        .expect("range after reopen")
+        .collect::<Result<_, _>>()
+        .expect("range item after reopen");
+    assert_eq!(rscan, want, "full range vs model after reopen");
+    assert_no_leak(stats.pages, stats.height, allocated, "small-value run");
 }
 
 // ---------------------------------------------------------------------------
