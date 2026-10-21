@@ -7,7 +7,14 @@
 # (queued|running|gating|blocked|waiting). Exit 1 lists the orphans.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=git-env.sh
+. "$here/git-env.sh"
 cd "$here/.."
+# The merged verdicts are read from nucleus/v3-scaffold's tree, which replace
+# refs and grafts can rewrite: that state (git-env.sh) fails the check, after
+# it has run under the environment that neutralises it.
+state=0
+git_state_refuse >&2 || state=1
 # Cards are local-only (never committed); they live in the v3 checkout.
 cards=${NV3_CARDS:-$HOME/Workspace/neutron-v3/nucleus/v3/cards}
 q="$cards/QUEUE.local.md"
@@ -22,5 +29,5 @@ for c in "$cards"/*.local.md; do
   echo "queue-check: orphan card $id (not merged, not in $q with a state)"
   orphans=1
 done
-[ "$orphans" -eq 0 ] && echo "queue-check: ok"
-exit $orphans
+[ "$orphans" -eq 0 ] && [ "$state" -eq 0 ] && echo "queue-check: ok"
+exit $((orphans | state))

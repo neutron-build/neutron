@@ -16,7 +16,6 @@ use std::thread;
 use std::time::Duration;
 
 use e1_mvcc::api::{TxnErr, Wait};
-use e1_mvcc::common::commit::apply_gate;
 use e1_mvcc::common::{LockTable, Sequencer, commit_with};
 
 /// Work 1: `release_all` of a 1-row txn touches only that row's shard
@@ -179,7 +178,7 @@ fn apply_gate_fast_path() {
             last
         });
         assert!(
-            !apply_gate::wait_parked(Duration::from_secs(2)),
+            !seq.apply_gate().wait_parked(Duration::from_secs(2)),
             "an unarmed gate parked a commit"
         );
         assert!(
@@ -191,14 +190,14 @@ fn apply_gate_fast_path() {
     // arm() — and a second commit arriving while the gate is taken
     // runs through without parking.
     {
-        let _gate = apply_gate::arm();
+        let _gate = seq.apply_gate().arm();
         let (seq2, locks2) = (Arc::clone(&seq), Arc::clone(&locks));
         let parked = thread::spawn(move || {
             let poison = AtomicBool::new(false);
             commit_with(&seq2, &locks2, &poison, 2, |_| Ok(()))
         });
         assert!(
-            apply_gate::wait_parked(Duration::from_secs(10)),
+            seq.apply_gate().wait_parked(Duration::from_secs(10)),
             "the armed commit, spawned after arm(), never parked"
         );
         let poison = AtomicBool::new(false);
@@ -206,7 +205,7 @@ fn apply_gate_fast_path() {
             commit_with(&seq, &locks, &poison, 3, |_| Ok(())).is_ok(),
             "the second armed-but-taken commit must not park"
         );
-        apply_gate::release();
+        seq.apply_gate().release();
         assert!(parked.join().is_ok_and(|r| r.is_ok()));
     }
 }

@@ -72,27 +72,12 @@ where
 /// [`ApplyGate`] instance owned by the [`Sequencer`]
 /// ([`Sequencer::apply_gate`]), which `commit_with` already receives,
 /// so arming a gate in one engine parks only that engine's commits and
-/// never another test's. Never used outside tests.
-///
-/// # Compatibility bridge
-///
-/// The free functions [`arm`], [`wait_parked`] and [`release`] are a
-/// bridge for test code written against the pre-F3 process-global gate
-/// — `tests/costs.rs` (card X-1a-F1 Work 6), which sits outside card
-/// X-1a-F3's Touch list and must keep compiling unchanged. They operate
-/// on the most recently created sequencer's gate (the [`LATEST`] `Weak`
-/// pointer); the gate state itself is per-sequencer, and `commit_with`
-/// never reads the pointer, so no engine path is process-global. The
-/// bridge is deterministic only in a test binary whose sequencer set is
-/// stable while it runs — true of `tests/costs.rs`, its only user,
-/// whose `apply_gate_fast_path` owns the single sequencer of that
-/// binary. New tests must use the per-engine methods
-/// ([`ApplyGate::arm`] and friends) instead.
+/// never another test's. Never used outside tests. The gate is
+/// reachable only through [`Sequencer::apply_gate`], so there is no
+/// process-global path to it.
 pub mod apply_gate {
-    use std::sync::Arc;
     use std::sync::Condvar;
     use std::sync::Mutex;
-    use std::sync::Weak;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -121,9 +106,8 @@ pub mod apply_gate {
     /// apply. Owned by a [`Sequencer`](crate::common::Sequencer) and
     /// reached through
     /// [`apply_gate`](crate::common::Sequencer::apply_gate), so each
-    /// engine's commits park only in its own gate. The API is the
-    /// pre-F3 free-function API turned into methods: [`Self::arm`],
-    /// [`Self::wait_parked`], [`Self::release`].
+    /// engine's commits park only in its own gate. The API:
+    /// [`Self::arm`], [`Self::wait_parked`], [`Self::release`].
     ///
     /// The `armed` field is the fast-path flag of card X-1a-F1 Work 3:
     /// `true` only while this gate is armed. The hook on the commit
@@ -162,17 +146,6 @@ pub mod apply_gate {
         /// apply. Dropping the guard releases the parked commit and
         /// disarms the gate.
         pub fn arm(&self) -> Arm<'_> {
-            self.arm_now();
-            Arm {
-                gate: self,
-                armed: true,
-            }
-        }
-
-        /// The state transition of [`Self::arm`] without its guard, so
-        /// the free-function compatibility bridge below can arm a gate
-        /// it holds by `Arc`.
-        fn arm_now(&self) {
             let mut s = self.lock();
             s.armed = true;
             s.taken = false;
@@ -192,6 +165,10 @@ pub mod apply_gate {
             // between changed both under the mutex).
             self.armed.store(true, Ordering::Release);
             drop(s);
+            Arm {
+                gate: self,
+                armed: true,
+            }
         }
 
         /// Block until the armed commit has parked, or `timeout` passes.
@@ -277,75 +254,6 @@ pub mod apply_gate {
         fn drop(&mut self) {
             if self.armed {
                 self.gate.release();
-            }
-        }
-    }
-
-    /// The gate of the most recently created sequencer, if that
-    /// sequencer is still alive. Set by
-    /// [`Sequencer::new`](crate::common::Sequencer::new) through
-    /// [`register_latest`]; read **only** by the free-function
-    /// compatibility bridge below — never by `commit_with` or any other
-    /// engine path (C-GATE-SCOPE).
-    static LATEST: Mutex<Option<Weak<ApplyGate>>> = Mutex::new(None);
-
-    /// Remember `gate` as the most recently created sequencer's gate
-    /// (see [`LATEST`]).
-    pub(crate) fn register_latest(gate: &Arc<ApplyGate>) {
-        *crate::common::lock_unpoisoned(&LATEST) = Some(Arc::downgrade(gate));
-    }
-
-    /// The most recently created sequencer's gate, if that sequencer is
-    /// still alive (see [`LATEST`]).
-    fn latest() -> Option<Arc<ApplyGate>> {
-        crate::common::lock_unpoisoned(&LATEST)
-            .as_ref()
-            .and_then(Weak::upgrade)
-    }
-
-    /// Arm the gate of the most recently created sequencer — the
-    /// free-function compatibility bridge (see [`arm`]).
-    pub fn arm() -> CompatArm {
-        let gate = latest();
-        if let Some(g) = gate.as_ref() {
-            g.arm_now();
-        }
-        CompatArm {
-            armed: gate.is_some(),
-            gate,
-        }
-    }
-
-    /// Block until the armed commit of the most recently created
-    /// sequencer has parked, or `timeout` passes — the free-function
-    /// compatibility bridge (see [`arm`]).
-    pub fn wait_parked(timeout: Duration) -> bool {
-        latest().is_some_and(|g| g.wait_parked(timeout))
-    }
-
-    /// Let the parked commit of the most recently created sequencer
-    /// proceed and disarm its gate — the free-function compatibility
-    /// bridge (see [`arm`]).
-    pub fn release() {
-        if let Some(g) = latest() {
-            g.release();
-        }
-    }
-
-    /// The guard of the free-function [`arm`] above. It owns the gate it
-    /// armed (so a later `Sequencer::new` cannot redirect its `Drop`),
-    /// and dropping it releases that gate.
-    pub struct CompatArm {
-        gate: Option<Arc<ApplyGate>>,
-        armed: bool,
-    }
-
-    impl Drop for CompatArm {
-        fn drop(&mut self) {
-            if self.armed
-                && let Some(g) = self.gate.as_ref()
-            {
-                g.release();
             }
         }
     }
