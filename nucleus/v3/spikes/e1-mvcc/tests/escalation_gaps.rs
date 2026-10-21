@@ -1,6 +1,10 @@
 //! Tests for the three escalation seams the X-1a-F1 gate found
 //! code-correct but unpinned (card X-1a-F1-F1; the mutant table and
-//! "Follow-ups" of `verdicts/X-1a-F1.md`; PLAN-v3 §2 N2).
+//! "Follow-ups" of `verdicts/X-1a-F1.md`; PLAN-v3 §2 N2), reworked per
+//! the REWORK items of `verdicts/X-1a-F1-F1.md`: R1 — the G1 detector
+//! must require a **live foreign owner**, not the `escalated` flag
+//! alone; R2 — a never-escalating regression must **fail** the test,
+//! not hang it; R3 — G3's residual must be stated plainly.
 //!
 //! Every test drives [`LockTable`] directly — no engine, no scheduler —
 //! the way `tests/costs.rs` does. The seams:
@@ -11,7 +15,15 @@
 //!   between the inserter's step (1) and the inserter's counter bump
 //!   must make the inserter undo its row and wait, never return `Ok`
 //!   with a live row under a foreign table owner (L-EXCL; module docs
-//!   of `lock_table`, "the escalation race").
+//!   of `lock_table`, "the escalation race"). The detector records a
+//!   round only when a **completed** escalation (the `escalated` flag)
+//!   coincides with a **live** table owner (a third txn's `NoWait`
+//!   probe of a fresh key): the flag alone is stale across
+//!   `release_all`'s owner-clear → index-removal gap (R1). A blocked
+//!   escalation path (inflated row counter) is caught by a quiesced
+//!   verification — the escalant parks the inserter and re-attempts
+//!   on a verifiably clean table — so it fails the test instead of
+//!   hanging it (R2).
 //! - **G4** (`G4-ESC-PASS2-KEEPS-COUNTER`): escalation pass 2 must
 //!   decrement the row counter for every row it drops. The counter is
 //!   private; an inflated value survives forever and defers every
@@ -22,12 +34,15 @@
 //! - **G3** (`RELEASE-SCANS-ALL-UNCOUNTED`): `release_all` and
 //!   escalation pass 2 must touch — and count — only the shards the
 //!   txn's own keys map to (L-RELEASE). `shard_visits` is
-//!   self-reported, so the expected count is derived independently
+//!   self-reported: the *expected* count is derived independently
 //!   from the key set through the same key→shard mapping the table
-//!   uses, and every expected per-shard state transition is observed
-//!   directly: each released key becomes acquirable, each foreign
-//!   sentinel key stays held. A full-shard scan fails the exact count
-//!   whether it counts itself (64 ≠ d) or not (0 ≠ d).
+//!   uses, but the *observed* value is the table's own counter, so
+//!   the exact equality catches a scan that **replaces** the targeted
+//!   loop — counted (64 ≠ d) or uncounted (0 ≠ d) — while an
+//!   *additional* uncounted scan beside a correct one would need a
+//!   test-only hook in `src/` that the card's Do-not clause forbids.
+//!   That residual is stated, not hidden (R3; see the G3 test's
+//!   docs).
 //!
 //! The card's Touch-only list is `tests/` alone, so nothing here can
 //! reach the table's private fields (the in-crate white-box tests in
@@ -84,36 +99,81 @@ fn shard_of(key: &[u8]) -> usize {
 /// the escalant accumulate more deferred rows, slowing pass 2 and with
 /// it the flag the detector waits for.
 ///
-/// **The detector polls, it does not sample once.** The `escalated`
-/// flag is set only at the *end* of the racing claim's pass 2, by
-/// which time the inserter is long past its `Ok`, so a single
-/// immediate sample sees only stale states. Instead the inserter,
-/// still holding its row, polls the flag for 600 µs before releasing:
+/// **The detector requires a live foreign owner, not the flag alone
+/// (R1).** The inserter, still holding its row, polls
+/// `is_escalated(ESCALANT)` for 600 µs after its `Ok`; a round is
+/// recorded only when the flag holds **and** a third txn's `NoWait`
+/// acquire of a fresh key — one no other txn ever holds, so only a
+/// live table owner can conflict with it — returns
+/// `LockNotAvailable`. The two requirements close the two windows
+/// that made the flag alone unsound under CPU oversubscription
+/// (verdict X-1a-F1-F1, finding 1: 15/15 false failures with 24 busy
+/// hogs on this 16-thread box):
 ///
-/// - *Sound on correct code.* While the inserter's row is live it is
-///   counted, so every escalation attempt — pre-claim or post-claim —
-///   sees `rows > own` and defers: no escalation can *complete* inside
-///   the poll. An escalation that completed before the bump either
-///   parked the inserter at step (1), or was undone by its step (3)
-///   and waited out; in both cases the `Ok` trails the escalant's
-///   release, whose flag drops microseconds after the owner clears —
-///   while the inserter's wake → retry → 16 KiB step (2) → `Ok` →
-///   first-poll path takes an order of magnitude longer. The flag is
-///   therefore false at every poll on correct code.
-/// - *Catches the mutant.* The row is never undone; the racing claim
-///   completes, sets the flag within one pass-2 of the claim, and
-///   holds it for the 600 µs hold — inside the poll window.
+/// - *A stale flag is not an owner.* `release_all` clears `t.owner`
+///   and notifies **before** it removes the index entry that carries
+///   `escalated`, so an escalant pre-empted inside `release_all`
+///   reports `is_escalated` for many inserter rounds with no owner
+///   live. The probe excludes exactly these rounds: with no owner
+///   the fresh-key acquire succeeds, and its key is released at once
+///   so it cannot defer the escalant.
+/// - *A doomed claim never sets the flag.* A claim whose post-claim
+///   re-test will un-claim it is transiently live in the owner slot,
+///   and the probe could fail against it — but `escalated` is set
+///   only after pass 2, i.e. only for a claim that survived its
+///   re-test, so requiring the flag first excludes that window.
+///
+/// *Sound on correct code:* while the inserter's row is live it is
+/// counted, so `rows > own` holds for every other txn and no claim
+/// can pass its pre-claim test, let alone complete. Conversely, a
+/// completed claim implies its post-claim re-test saw `rows ≤ own`,
+/// which places the claim before the inserter's counter bump, and
+/// therefore before the inserter's step (3) — which on correct code
+/// then sees the owner, undoes the row and waits instead of
+/// returning `Ok`. A round where the flag and a live owner are both
+/// observed while the inserter holds its `Ok` row is thus precisely
+/// the L-EXCL break the mutant creates: with step (3) gone the row
+/// is never undone, the racing claim completes (its re-test precedes
+/// the bump — that is the seam), the flag is set at pass-2 end and
+/// the owner stays live through the 600 µs hold, well inside the
+/// poll window.
+///
+/// **The escalant is bounded, observes `stop`, and turns a blocked
+/// escalation path into a deterministic failure (R2).** Both loops
+/// honour `stop`, and a claim cycle may cost at most 100 000 acquires
+/// or 5 s before the escalant runs a **quiesced verification**: it
+/// parks the inserter between rounds (the inserter drops its row and
+/// idles on a flag), re-checks that no claim landed meanwhile, and
+/// confirms the table is verifiably clean — `entries() ==
+/// held_by(ESCALANT)`: no foreign row, no owner — then makes exactly
+/// one more acquire. On correct code that attempt always claims: the
+/// O(1) foreign-row test reads `rows` on a quiesced table whose only
+/// entries are the escalant's own, so `rows == own` by construction.
+/// An attempt that defers against a verified-clean table — the G4
+/// mutant's inflated counter, or a `remove_row` that forgets the
+/// counter decrement — fails the stall assert below instead of
+/// spinning the claim loop forever and wedging the scope (verdict
+/// X-1a-F1-F1, finding 2). The bound itself must **not** be the
+/// failure: under CPU oversubscription this race can phase-lock
+/// (measured here with 24 busy hogs on 16 threads: whole cycles
+/// completed 0 claims in 100 000 attempts with the inserter's row
+/// live at every probe instant, because the inserter's between-rounds
+/// dead window is shorter than the attempt cadence), and a bare
+/// bound assert false-failed 3 of 18 such runs before the quiesced
+/// verification was added.
 ///
 /// Violations are recorded, not asserted on the spot: a panic inside
 /// `thread::scope` would unwind before `stop` is set, and the scope
-/// would then wait forever on the escalant, turning a caught mutant
-/// into a hang. The gap after every release (2 ms, far longer than one
-/// whole round) lets the inserter complete rounds without overlapping
-/// a claim, so the test terminates.
+/// would then wait on the escalant — bounded now by the cycle bounds
+/// above, but still long enough to muddy which round failed. The gap
+/// after every release (2 ms, far longer than one whole round) lets
+/// the inserter complete rounds without overlapping a claim, so the
+/// test terminates.
 #[test]
 fn inserter_recheck_yields_to_a_late_claim() {
     const ESCALANT: u64 = 7;
     const INSERTER: u64 = 9;
+    const PROBE: u64 = 11;
     const ROUNDS: usize = 512;
     const TEST_DEADLINE: Duration = Duration::from_secs(30);
     const ACQUIRE_WAIT: Duration = Duration::from_secs(30);
@@ -122,45 +182,162 @@ fn inserter_recheck_yields_to_a_late_claim() {
     const CLAIM_GAP: Duration = Duration::from_millis(2);
     const POLLS: usize = 12;
     const POLL_STEP: Duration = Duration::from_micros(50);
+    // R2: one claim cycle may cost at most this many acquires or this
+    // much time before the escalant runs a quiesced verification (see
+    // the doc comment above: the bound triggers the verification, it
+    // is not itself a failure — phase-locked correct runs hit it).
+    const CYCLE_ACQUIRE_BOUND: usize = 100_000;
+    const CYCLE_TIME_BOUND: Duration = Duration::from_secs(5);
+    // The inserter parks within one round of `pause` being set (its
+    // acquire budget dwarfs a round but no owner is live in a starved
+    // cycle, so rounds stay millisecond-scale); 10 s is ~1000× that.
+    const PARK_WAIT: Duration = Duration::from_secs(10);
+    const PARK_POLL: Duration = Duration::from_millis(1);
 
     let lt = LockTable::with_escalate_at(2);
     let inserter_key = vec![0x5bu8; KEY_LEN];
     let stop = AtomicBool::new(false);
+    let stalled = AtomicBool::new(false);
+    // The quiesced-verification handshake (R2): `pause` asks the
+    // inserter to park between rounds; `parked` says it has dropped
+    // its row and stopped touching the table.
+    let pause = AtomicBool::new(false);
+    let parked = AtomicBool::new(false);
     let deadline = Instant::now() + TEST_DEADLINE;
+    // Probe keys live in a u64 space nothing else touches (the
+    // escalant counts up from 0; the inserter key is 16 KiB of 0x5b),
+    // so a probe conflict can only be the table owner, never a row.
+    let mut probe_key = 0xdead_beef_0000_0000u64;
     let mut completed = 0usize;
-    let mut foreign_owner_oks = Vec::new();
+    let mut live_owner_oks = Vec::new();
     let mut held_anomalies = Vec::new();
 
     thread::scope(|s| {
         // The escalant: one claim cycle after another, each claim held
         // open long enough to span the inserter's sample, each gap
         // long enough for the inserter to complete a clean window.
+        // R2: both loops observe `stop`; a claim cycle that hits its
+        // bound triggers a quiesced verification (doc comment above),
+        // and only a deferral against a verified-clean table stalls.
         s.spawn(|| {
             let mut next_key = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                while !lt.is_escalated(ESCALANT) {
+            'cycles: while !stop.load(Ordering::Relaxed) {
+                let mut cycle_start = Instant::now();
+                let mut acquires = 0usize;
+                loop {
+                    if lt.is_escalated(ESCALANT) {
+                        break; // the claim completed: hold and release
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break 'cycles;
+                    }
+                    if acquires >= CYCLE_ACQUIRE_BOUND || cycle_start.elapsed() >= CYCLE_TIME_BOUND
+                    {
+                        // Quiesced verification: park the inserter so
+                        // the table's only possible contents are the
+                        // escalant's own rows, then settle the
+                        // escalation question deterministically.
+                        pause.store(true, Ordering::Relaxed);
+                        let park_start = Instant::now();
+                        while !parked.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                            if park_start.elapsed() >= PARK_WAIT {
+                                // One full round is milliseconds; not
+                                // parking within 10 s means the
+                                // inserter is wedged — a real break.
+                                stalled.store(true, Ordering::Relaxed);
+                                pause.store(false, Ordering::Relaxed);
+                                stop.store(true, Ordering::Relaxed);
+                                break 'cycles;
+                            }
+                            thread::sleep(PARK_POLL);
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            pause.store(false, Ordering::Relaxed);
+                            break 'cycles;
+                        }
+                        if lt.is_escalated(ESCALANT) {
+                            // A claim landed while pausing: treat the
+                            // cycle as completed.
+                            pause.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        let foreign = lt.entries().saturating_sub(lt.held_by(ESCALANT));
+                        if foreign == 0 {
+                            // Verifiably clean: the next attempt must
+                            // claim, or the escalation path is blocked.
+                            lt.acquire(&next_key.to_be_bytes(), ESCALANT, Wait::NoWait)
+                                .unwrap();
+                            next_key += 1;
+                            if !lt.is_escalated(ESCALANT) {
+                                stalled.store(true, Ordering::Relaxed);
+                                pause.store(false, Ordering::Relaxed);
+                                stop.store(true, Ordering::Relaxed);
+                                break 'cycles;
+                            }
+                            pause.store(false, Ordering::Relaxed);
+                            break; // claimed clean: hold and release
+                        }
+                        // Unexpected foreign state (the inserter is
+                        // parked and probe keys are always released,
+                        // so this should not happen): resume racing.
+                        pause.store(false, Ordering::Relaxed);
+                        cycle_start = Instant::now();
+                        acquires = 0;
+                        continue;
+                    }
                     lt.acquire(&next_key.to_be_bytes(), ESCALANT, Wait::NoWait)
                         .unwrap();
                     next_key += 1;
+                    acquires += 1;
                 }
                 thread::sleep(CLAIM_HOLD);
                 lt.release_all(ESCALANT);
                 thread::sleep(CLAIM_GAP);
             }
+            // Exit cleanup: drop whatever the interrupted cycle holds
+            // (the owner of a half-held claim, or a deferred cycle's
+            // accumulated rows) so the test can end quiescent.
+            lt.release_all(ESCALANT);
         });
         // The inserter: one widened-window acquire per round. A claim
         // landing inside the window is the G1 interleaving; the poll
-        // below is the detector. Violations are recorded here and
-        // asserted only after the join (see the doc comment above).
+        // plus probe below is the detector (R1). Violations are
+        // recorded here and asserted only after the join (see the doc
+        // comment above).
         for round in 0..ROUNDS {
-            if Instant::now() >= deadline {
+            if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 break;
+            }
+            // Quiesced-verification handshake (R2): when the escalant
+            // asks, park between rounds with no row held, so the
+            // table is verifiably the escalant's alone.
+            if pause.load(Ordering::Relaxed) {
+                lt.release_all(INSERTER);
+                parked.store(true, Ordering::Relaxed);
+                while pause.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    thread::sleep(PARK_POLL);
+                }
+                parked.store(false, Ordering::Relaxed);
+                continue;
             }
             let acquired = lt.acquire(&inserter_key, INSERTER, Wait::Block(ACQUIRE_WAIT));
             if acquired.is_ok() {
                 for _ in 0..POLLS {
                     if lt.is_escalated(ESCALANT) {
-                        foreign_owner_oks.push(round);
+                        // A completed escalation is flagged. Is its
+                        // owner still live? A fresh key only this
+                        // probe txn ever touches answers that: the
+                        // acquire fails iff a table owner is set.
+                        let key = probe_key.to_be_bytes();
+                        probe_key += 1;
+                        if lt.acquire(&key, PROBE, Wait::NoWait) == Err(TxnErr::LockNotAvailable) {
+                            live_owner_oks.push(round);
+                        } else {
+                            // Stale flag (release_all's window) — or a
+                            // claim that already dropped the owner.
+                            // Drop the probe's row at once either way.
+                            lt.release_all(PROBE);
+                        }
                         break;
                     }
                     thread::sleep(POLL_STEP);
@@ -179,19 +356,27 @@ fn inserter_recheck_yields_to_a_late_claim() {
     });
 
     assert!(
-        foreign_owner_oks.is_empty(),
-        "the inserter's acquire returned Ok and kept its row while a \
-         foreign table owner completed and held the table ({} of {} \
-         rounds, first {:?}): acquire step (3) did not undo the racing \
-         insert (L-EXCL)",
-        foreign_owner_oks.len(),
+        live_owner_oks.is_empty(),
+        "the inserter's acquire returned Ok while a completed escalation held \
+         the table live ({} of {} rounds, first {:?}): acquire step (3) must \
+         undo the racing insert and wait, never leave the txn believing it \
+         holds a row under a foreign owner (L-EXCL)",
+        live_owner_oks.len(),
         completed,
-        &foreign_owner_oks[..foreign_owner_oks.len().min(8)],
+        &live_owner_oks[..live_owner_oks.len().min(8)],
     );
     assert!(
         held_anomalies.is_empty(),
         "rounds {held_anomalies:?}: after a successful acquire the inserter \
          held something other than its one racing row"
+    );
+    assert!(
+        !stalled.load(Ordering::Relaxed),
+        "an escalation attempt deferred (or the inserter could not park) against \
+         a verified-clean, quiesced table: the escalation path is blocked — an \
+         inflated row counter (the G4 mutant) or a remove_row that forgets the \
+         decrement does exactly this; it must fail here, not hang (verdict \
+         X-1a-F1-F1, R2)"
     );
     assert!(
         lt.escalations() >= 1,
@@ -275,16 +460,32 @@ fn escalation_does_not_inflate_the_row_counter() {
 /// without the counter bump, which a `<=` bound on a self-reported
 /// counter can never see).
 ///
-/// Independent accounting: the expected visit count is computed from
-/// the key set with [`shard_of`] (the table's own mapping, replicated
-/// — see that fn's docs), and the **exact** equality is asserted on
-/// both sides at once: an uncounted full scan reports 0 ≠ d, a counted
-/// full scan reports 64 ≠ d. Each expected per-shard state transition
-/// is then observed directly: every key of the releasing txn becomes
-/// acquirable again, and a sentinel row in **every** other shard stays
-/// held. The escalation half pins the same property for pass 2, plus
-/// L-RELEASE's "an escalated txn holds no rows: its release touches no
-/// shard".
+/// **What is independent here, and what is not (R3).** The *expected*
+/// count is derived independently of the table — from the key set
+/// through [`shard_of`], the mapping `LockTable` uses — and every
+/// expected per-shard state transition is observed directly: each
+/// released key becomes acquirable again, each foreign sentinel key
+/// stays held. But the *observed* visit count is still the
+/// self-reported `shard_visits()`, and the state observations cannot
+/// see a scan that is owner-filtered and otherwise correct. The exact
+/// equality therefore catches a full scan that **replaces** the
+/// targeted loop — counted (64 ≠ d) or uncounted (0 ≠ d) — while an
+/// **additional** uncounted scan bolted on beside a correct targeted
+/// one (the gate's `OWN-EXTRA-SCAN` mutant) leaves every observable
+/// correct and survives. Catching that needs a test-only hook inside
+/// `release_all`/pass 2, which the card's Do-not clause forbids on
+/// `src/`; the residual is accepted and stated here rather than
+/// hidden (verdict X-1a-F1-F1, finding 3 / R3). The missing-notify
+/// gap the same verdict noted (`release_all` skipping the shard
+/// condvars) is follow-up card X-1a-F1-F1-F1's, not this test's.
+///
+/// Mechanics: the release half gives the releaser 6 keys across 5
+/// shards (multi-key shards must still be one visit) with a foreign
+/// sentinel row in every other shard, then asserts the exact visit
+/// count and the per-shard outcomes; a second release with a
+/// different key set measures again. The escalation half pins the
+/// same property for pass 2, plus L-RELEASE's "an escalated txn
+/// holds no rows: its release touches no shard".
 #[test]
 fn release_and_escalation_visit_only_own_shards_and_count_them() {
     // Two keys per shard, found by brute force over u64 keys (a few
