@@ -567,7 +567,7 @@ fn fault_sweep_write() {
 /// pages whose ids nothing ever reused. Here: 12,000 sequential
 /// 16-byte keys with 16-byte values, small upserts and deletes
 /// interleaved, on the sweep's 16-frame pool (the run settles at height
-/// 3, inside the reservation minimum `2·h + 1 = 7 ≤ 16`), then the same
+/// 2, inside the reservation minimum `2·h + 1 = 5 ≤ 16`), then the same
 /// end-of-run oracle as the sweep — `check()`, full-range equality with
 /// the model, flush + reopen — plus the leak bound.
 #[test]
