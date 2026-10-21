@@ -403,12 +403,24 @@ impl<S: PageStore> BufferPool<S> {
     /// Advance the clock hand to the next frame with pin count zero.
     /// Two full sweeps without a victim mean the pool is smaller than the
     /// working depth of its users (PLAN-v3 §3.3 minimum pool size).
+    ///
+    /// The chosen frame's pin count is re-asserted to be zero on return
+    /// (card X-0-F4 Work 5): a pinned victim would make the caller's plain
+    /// latch block on the pin holder — which itself waits on the table
+    /// mutex the caller holds — i.e. a hang, not an error (the X-0 gate's
+    /// G-EVICT-PINNED was caught only by a 600 s timeout). The assert is
+    /// debug-only, so release behaviour is unchanged.
     fn victim(&self, _table: &mut HashMap<PageId, usize>) -> Result<usize, StoreError> {
         let n = self.slots.len();
         for _ in 0..2 * n {
             let hand = self.clock.fetch_add(1, Ordering::Relaxed) % n;
             let slot = self.slot(hand)?;
-            if slot.pins.load(Ordering::Acquire) == 0 {
+            let pins = slot.pins.load(Ordering::Acquire);
+            if pins == 0 {
+                debug_assert_eq!(
+                    pins, 0,
+                    "frame {hand} chosen as a victim while pinned (pin discipline is broken)"
+                );
                 return Ok(hand);
             }
         }
