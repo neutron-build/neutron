@@ -137,12 +137,14 @@ fn concurrent_writers_and_readers() {
 
     // Readers: random windows; every scan must be sorted, every value must
     // decode to its key (no torn values), and no key may appear twice.
-    for _ in 0..READERS {
+    // Each reader seeds its own stream (card X-0-F4 Work 2): with the
+    // shared seed X-0 found, all four readers scanned identical ranges.
+    for r in 0..READERS {
         let tree = Arc::clone(&tree);
         let barrier = Arc::clone(&barrier);
         let stop = Arc::clone(&stop);
         reader_handles.push(thread::spawn(move || {
-            let mut rng = Sm::new(0xBEEF_0000 + WRITERS);
+            let mut rng = Sm::new(0xBEEF_0000 + WRITERS + r as u64);
             barrier.wait();
             let mut scans = 0usize;
             while !stop.load(Ordering::Relaxed) {
