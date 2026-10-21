@@ -27,8 +27,29 @@
 //!   read-your-writes for the owning thread.
 //! - T-NOMERGE: delete removes a cell in place; under-full and empty pages
 //!   remain (no merge in the spike, card X-0 Work 5). Pages are never
-//!   freed, so page ids stay valid forever — which is what makes the
-//!   cursor stack and stale-root reads safe.
+//!   freed *from the tree*, so every page id the tree has published stays
+//!   valid forever — which is what makes the cursor stack and stale-root
+//!   reads safe. (Pre-allocated pages a cascade did not consume are
+//!   recycled by the pool *before* ever becoming reachable — card X-0-F2
+//!   — so recycling cannot invalidate a published id.)
+//! - T-ATOMIC (card X-0-F2): an insert that returns an error other than
+//!   `Corrupt` has changed nothing visible — the old value of an upsert
+//!   stays readable, and every page is as it was. This holds because
+//!   whether the insert splits at all is decided first, on an owned copy
+//!   of the leaf running the exact page routines the real path will run
+//!   (the gate rework's fit test); only for an insert that provably
+//!   splits are the pages the cascade could need pre-allocated, before
+//!   the leaf's first mutation (Work 1). An upsert removes its old cell
+//!   only once those pages are held or the replacement is known to fit
+//!   (Work 2), and a page is marked dirty before its first mutation
+//!   (Work 3); from the reservation on, only `Corrupt` can be returned
+//!   (`Poisoned`, the one other error reachable that late, presupposes
+//!   another thread already panicked inside a lock and is fail-stop like
+//!   `Corrupt`). `delete` mutates only the leaf it
+//!   descends to and keeps no fallible call between that mutation and
+//!   `mark_dirty`. Unused reserved pages are recycled by the pool
+//!   (`BufferPool::release_new`), so a reservation that comes to nothing
+//!   does not grow the store.
 //!
 //! Known spike limits, on purpose: no merge, no overflow pages (values are
 //! capped at `page::MAX_VALUE`), no prefix truncation, no WAL.
@@ -174,6 +195,12 @@ impl<S: PageStore> BTree<S> {
     }
 
     /// Upsert: stores `value` under `key` and returns the previous value.
+    ///
+    /// Atomic (T-ATOMIC, card X-0-F2): an error other than `Corrupt`
+    /// leaves the tree exactly as it was, so the old value stays
+    /// readable after a failed upsert. `tests/faults.rs` pins this with
+    /// a fault-injecting store failing every `allocate`, `read` and
+    /// `write` call in turn.
     ///
     /// # Errors
     /// [`StoreError::KeyTooLarge`] / [`StoreError::ValueTooLarge`] for
@@ -560,7 +587,12 @@ impl<S: PageStore> BTree<S> {
     }
 
     /// The leaf step of [`Self::insert`]: upsert in place, or split the
-    /// leaf with the pending cell and repair the ancestors.
+    /// leaf with the pending cell and repair the ancestors. Card X-0-F2
+    /// makes the step atomic (T-ATOMIC): whether the insert splits is
+    /// decided first on an owned copy of the leaf (the gate rework's fit
+    /// test), only then are the pages the cascade could need reserved,
+    /// and from the reservation on only `Corrupt` (or a poisoned lock)
+    /// can be returned.
     #[allow(clippy::type_complexity)]
     fn leaf_insert_step<'s>(
         &'s self,
@@ -571,32 +603,174 @@ impl<S: PageStore> BTree<S> {
         key: &[u8],
         value: &[u8],
     ) -> Result<Option<Vec<u8>>, StoreError> {
+        // Work 1 (card X-0-F2) + the gate rework: reserve only when this
+        // insert really splits. A safe leaf fits any worst-case cell, so
+        // the owned-copy fit test is skipped for it; an unsafe leaf gets
+        // the exact test, so the reservation — and the eviction churn it
+        // costs — happens on genuine splits, not on every insert into a
+        // half-full leaf that merely fails `is_safe`.
+        let splits = if page::is_safe(&leaf)? {
+            false
+        } else {
+            Self::insert_splits(&leaf, key, value)?
+        };
+        let mut reserve = if splits {
+            self.reserve_split_pages(leaf_id, path)?
+        } else {
+            SplitReserve::empty()
+        };
+        // Work 3: every path below mutates the leaf — the in-place
+        // insert, the upsert's remove, or the split's rewrite — so mark
+        // it dirty before the first of those, and no error return can
+        // leave a modified page clean.
+        leaf.mark_dirty();
         match page::leaf_find(&leaf, key)? {
             Ok(i) => {
                 let old = page::leaf_cell(&leaf, i)?.1.to_vec();
+                // Work 2: the replacement may not fit once values grow,
+                // and removing the old cell first is safe only because
+                // the copy above already decided the question — either
+                // the replacement fits (`splits == false`: the insert
+                // below cannot be refused) or the split's pages are
+                // reserved (`splits == true`). (Before card X-0-F2 the
+                // remove came first with nothing held, and a failed
+                // `new_page` lost the key.)
                 page::leaf_remove(&mut leaf, i)?;
-                if page::leaf_insert(&mut leaf, i, key, value)? {
-                    leaf.mark_dirty();
+                if !splits {
+                    if !page::leaf_insert(&mut leaf, i, key, value)? {
+                        return Err(StoreError::Corrupt(
+                            "in-place upsert refused after the copy accepted it".into(),
+                        ));
+                    }
+                    reserve.release(&self.pool);
                     return Ok(Some(old));
                 }
-                // The replacement is larger than the old cell and even a
-                // compacting insert cannot fit it: split. The key is
-                // currently absent from the leaf (removed above), so the
-                // split's pending insert reinstates it.
-                self.split_and_propagate(leaf, leaf_id, path, guards, key, value, Some(old))
+                let out = self.split_and_propagate(
+                    leaf,
+                    leaf_id,
+                    path,
+                    guards,
+                    key,
+                    value,
+                    Some(old),
+                    &mut reserve,
+                );
+                reserve.release(&self.pool);
+                out
             }
             Err(pos) => {
-                if page::leaf_insert(&mut leaf, pos, key, value)? {
-                    leaf.mark_dirty();
+                if !splits {
+                    if !page::leaf_insert(&mut leaf, pos, key, value)? {
+                        return Err(StoreError::Corrupt(
+                            "in-place insert refused after the copy accepted it".into(),
+                        ));
+                    }
+                    reserve.release(&self.pool);
                     return Ok(None);
                 }
-                self.split_and_propagate(leaf, leaf_id, path, guards, key, value, None)
+                let out = self.split_and_propagate(
+                    leaf,
+                    leaf_id,
+                    path,
+                    guards,
+                    key,
+                    value,
+                    None,
+                    &mut reserve,
+                );
+                reserve.release(&self.pool);
+                out
             }
         }
     }
 
+    /// Does `(key, value)` fit in `leaf` without a split? (Card X-0-F2
+    /// gate rework, option (b): reserve only when the insert will really
+    /// split.)
+    ///
+    /// The answer is computed on an **owned copy** of the leaf by
+    /// running the exact page routines the real path will run — the
+    /// upsert's `leaf_remove` first, then `leaf_insert` — so the fit
+    /// decision cannot drift from the insert logic it gates: the real
+    /// insert is refused only if this copy's insert was refused, and a
+    /// refusal is exactly what makes the caller reserve and split. The
+    /// copy is invisible to the tree: nothing visible changes, whatever
+    /// it answers.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] if the leaf does not parse — the same
+    /// error the real path would return for the same bytes, and that
+    /// before any visible mutation.
+    fn insert_splits(
+        leaf: &WriteGuard<'_, S>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<bool, StoreError> {
+        let mut scratch = vec![0u8; leaf.len()];
+        scratch.copy_from_slice(leaf);
+        match page::leaf_find(&scratch, key)? {
+            Ok(i) => {
+                page::leaf_remove(&mut scratch, i)?;
+                Ok(!page::leaf_insert(&mut scratch, i, key, value)?)
+            }
+            Err(pos) => Ok(!page::leaf_insert(&mut scratch, pos, key, value)?),
+        }
+    }
+
+    /// Card X-0-F2 Work 1, option (a) — **pre-allocation**: acquire,
+    /// before the leaf's first mutation, every page the split cascade
+    /// could need in the worst case:
+    ///
+    /// * one page for the leaf's new right half;
+    /// * one page per retained ancestor in `path` (each may split and
+    ///   need a right half of its own);
+    /// * one page for a new root, if the cascade can reach the root —
+    ///   which it can exactly when the root is a retained ancestor, or
+    ///   the leaf itself is the root. A released ancestor below a safe
+    ///   child can never be reached again (T-COUPLING), so no root page
+    ///   is reserved for it.
+    ///
+    /// Called only for an insert that provably splits — the caller's
+    /// owned-copy fit test (gate rework on card X-0-F2, option (b))
+    /// decided that — so the reservation's cost in pinned frames and
+    /// evicted pages is paid on real splits, not on every insert into a
+    /// leaf that merely fails [`page::is_safe`]. Pages the cascade does
+    /// not consume are released and their ids recycled by the pool
+    /// ([`BufferPool::release_new`]), so reservations that come to
+    /// nothing do not grow the store.
+    ///
+    /// Reserving a frame per possible level raises the minimum pool
+    /// size (card X-0-F2): a fully cascading insert pins its whole
+    /// descent path (`h` frames on a tree of height `h`) plus the
+    /// reservation (`h + 1` at worst), so a single writer needs at
+    /// least `2·h + 1` frames — PLAN-v3 §3.3's
+    /// `threads × (tree height + 2)` becomes
+    /// `threads × (2·height + 1)` for inserts that may split.
+    ///
+    /// # Errors
+    /// [`StoreError::PoolStarved`], or any store error from
+    /// [`BufferPool::new_page`] — with the partial reservation already
+    /// released, so the pool and the tree are exactly as they were
+    /// (T-ATOMIC).
+    fn reserve_split_pages<'s>(
+        &'s self,
+        leaf_id: PageId,
+        path: &[PageId],
+    ) -> Result<SplitReserve<'s, S>, StoreError> {
+        let rid = self.root_id()?;
+        let root_in_path = path.first() == Some(&rid);
+        let leaf_is_root = leaf_id == rid;
+        let count = 1 + path.len() + usize::from(root_in_path || leaf_is_root);
+        SplitReserve::acquire(&self.pool, count)
+    }
+
     /// Split the full leaf (with the pending cell) and install the new
     /// right page in the leaf's parent, splitting upward as needed.
+    ///
+    /// The right page comes from `reserve` (card X-0-F2 Work 1): by the
+    /// time the leaf is rewritten, every page the whole cascade could
+    /// need is already held, so this step cannot fail with an
+    /// allocation error partway through.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn split_and_propagate<'s>(
         &'s self,
@@ -607,18 +781,35 @@ impl<S: PageStore> BTree<S> {
         key: &[u8],
         value: &[u8],
         old: Option<Vec<u8>>,
+        reserve: &mut SplitReserve<'s, S>,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let (right_id, mut right) = self.pool.new_page()?;
+        let (right_id, mut right) = reserve.take()?;
         let sep = page::leaf_split(&mut leaf, &mut right, (key, value))?;
-        leaf.mark_dirty();
-        right.mark_dirty();
+        // The leaf was marked dirty before its first mutation (Work 3);
+        // the fresh right page is installed dirty by `new_page`.
         drop(right);
-        self.propagate_split(leaf_id, right_id, sep, Some(leaf), path, guards)?;
+        self.propagate_split(leaf_id, right_id, sep, Some(leaf), path, guards, reserve)?;
         Ok(old)
     }
 
     /// Insert `(right_id, sep)` as the sibling pointer of `left_id` in its
     /// parent, cascading splits toward the root.
+    ///
+    /// **Reservation strategy (card X-0-F2 Work 1, option (a)):
+    /// pre-allocation.** Every page this cascade could need — the new
+    /// halves at each level and a new root if the cascade reaches the
+    /// root — was acquired before the leaf's first mutation and arrives
+    /// in `reserve`; nothing below allocates, so no pool or store error
+    /// can strike after a page has been mutated, and an insert that
+    /// returns a non-`Corrupt` error has changed nothing visible
+    /// (T-ATOMIC). The reservation was taken only because the caller's
+    /// owned-copy fit test proved this insert splits (gate rework,
+    /// option (b)); unused reserved pages are released and their ids
+    /// recycled by the pool afterwards. The cost is pin occupancy
+    /// rather than an error window: a fully cascading insert pins up to
+    /// `2·h + 1` frames on a tree of height `h`, which is the new
+    /// minimum pool size for one writer — see
+    /// [`Self::reserve_split_pages`].
     ///
     /// By T-COUPLING every ancestor of an unsafe node is still latched in
     /// `guards`, in top-down acquisition order, so the parent latch is
@@ -635,6 +826,7 @@ impl<S: PageStore> BTree<S> {
     /// able to catch. The child latch is always released before any upward
     /// latch is taken: latches are ordered top-down only, and holding a
     /// child while blocking on an ancestor can deadlock.
+    #[allow(clippy::too_many_arguments)]
     fn propagate_split<'s>(
         &'s self,
         mut left_id: PageId,
@@ -643,6 +835,7 @@ impl<S: PageStore> BTree<S> {
         mut child_guard: Option<WriteGuard<'s, S>>,
         path: &mut Vec<PageId>,
         guards: &mut Vec<WriteGuard<'s, S>>,
+        reserve: &mut SplitReserve<'s, S>,
     ) -> Result<(), StoreError> {
         loop {
             let parent = match (guards.pop(), path.pop()) {
@@ -671,8 +864,11 @@ impl<S: PageStore> BTree<S> {
                 }
             };
             let Some((pid, mut pg)) = parent else {
-                // Root split: a new root over (left_id, right_id).
-                let (new_id, mut new_root) = self.pool.new_page()?;
+                // Root split: a new root over (left_id, right_id), from
+                // the reservation (card X-0-F2 Work 1) — the allocation
+                // that used to happen here, after the child split, is
+                // what could fail and strand the halves.
+                let (new_id, mut new_root) = reserve.take()?;
                 page::init(&mut new_root, PageKind::Inner)?;
                 if !page::inner_insert(&mut new_root, 0, left_id, &sep)? {
                     return Err(StoreError::Corrupt(
@@ -680,7 +876,7 @@ impl<S: PageStore> BTree<S> {
                     ));
                 }
                 page::set_right_child(&mut new_root, right_id)?;
-                new_root.mark_dirty();
+                // Fresh from `new_page`, so already dirty.
                 drop(new_root);
                 let mut w = self
                     .root
@@ -691,6 +887,11 @@ impl<S: PageStore> BTree<S> {
                 drop(child_guard);
                 return Ok(());
             };
+            // Work 3 (card X-0-F2): the parent is mutated on every path
+            // from here — its right-most child is replaced or the left
+            // half's bound is lowered, and a full parent is itself split
+            // — so it is marked dirty before the first of those edits.
+            pg.mark_dirty();
             // A split of child `left_id` into (left_id, right_id) at
             // separator `sep` narrows `left_id`'s key range to end at
             // `sep`. Under this format's routing — cell (child, s) means
@@ -706,7 +907,6 @@ impl<S: PageStore> BTree<S> {
             let left_is_rightmost = page::right_child(&pg)? == left_id;
             let (cell_child, cell_sep) = if left_is_rightmost {
                 page::set_right_child(&mut pg, right_id)?;
-                pg.mark_dirty();
                 (left_id, sep.clone())
             } else {
                 let Some(lpos) = page::inner_child_index(&pg, left_id)? else {
@@ -721,7 +921,6 @@ impl<S: PageStore> BTree<S> {
                         "could not lower the left half's bound".into(),
                     ));
                 }
-                pg.mark_dirty();
                 (right_id, old_bound)
             };
             let pos = match page::inner_cell_position(&pg, &cell_sep)? {
@@ -733,22 +932,105 @@ impl<S: PageStore> BTree<S> {
                 }
             };
             if page::inner_insert(&mut pg, pos, cell_child, &cell_sep)? {
-                pg.mark_dirty();
                 drop(pg);
                 drop(child_guard);
                 return Ok(());
             }
             // The parent is full: split it with the pending cell and carry
-            // the middle separator upward.
-            let (pr_id, mut pr) = self.pool.new_page()?;
+            // the middle separator upward. The right half comes from the
+            // reservation (card X-0-F2 Work 1) — this mid-cascade
+            // allocation, after the bound was lowered and with the child
+            // below already split, is what used to be able to fail.
+            let (pr_id, mut pr) = reserve.take()?;
             let up = page::inner_split(&mut pg, &mut pr, (cell_child, &cell_sep))?;
-            pg.mark_dirty();
-            pr.mark_dirty();
+            // Both halves are mutated here; `pg` was marked dirty above
+            // and `pr` is fresh from `new_page`, so both are dirty.
             drop(pr);
             child_guard = Some(pg);
             left_id = pid;
             right_id = pr_id;
             sep = up;
+        }
+    }
+}
+
+/// The pages pre-allocated for one insert's split cascade (card X-0-F2
+/// Work 1, option (a) — pre-allocation; see
+/// [`BTree::reserve_split_pages`] for how many and what that does to the
+/// minimum pool size).
+///
+/// Held from before the leaf's first mutation until the insert returns;
+/// pages the cascade does not consume are released then, so they return
+/// to the pool as clean empty victims **and their ids are recycled**
+/// (gate rework on card X-0-F2): a reservation that came to nothing
+/// leaves the store's page count where it was. A `Corrupt` return
+/// bypasses the release — those guards then simply drop, leaving every
+/// frame with its table entry and its bytes intact, and their ids stay
+/// allocated but unreachable (never recycled: the tree is damaged
+/// already and T-ATOMIC exempts `Corrupt`), which is acceptable because
+/// `Corrupt` itself declares the tree unusable.
+struct SplitReserve<'s, S: PageStore> {
+    pages: Vec<(PageId, WriteGuard<'s, S>)>,
+}
+
+impl<'s, S: PageStore> SplitReserve<'s, S> {
+    /// A reserve holding nothing — for a leaf that passed
+    /// [`page::is_safe`] and so cannot split.
+    fn empty() -> Self {
+        Self { pages: Vec::new() }
+    }
+
+    /// Acquire `count` fresh pages, releasing everything acquired so far
+    /// if any allocation fails, so a failed reservation changes nothing
+    /// (T-ATOMIC, card X-0-F2 Work 1).
+    ///
+    /// # Errors
+    /// [`StoreError::PoolStarved`] or any store error from
+    /// [`BufferPool::new_page`], unchanged.
+    fn acquire(pool: &'s BufferPool<S>, count: usize) -> Result<Self, StoreError> {
+        let mut pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            match pool.new_page() {
+                Ok(page) => pages.push(page),
+                Err(e) => {
+                    for (_, guard) in pages.drain(..) {
+                        // Best-effort: release only fails on a poisoned
+                        // table mutex, and a dropped guard leaves the
+                        // pool consistent (see the type doc).
+                        let _ = pool.release_new(guard);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self { pages })
+    }
+
+    /// Take the next reserved page, in allocation order: the leaf's
+    /// right half first, then the ancestors' halves bottom-up, the new
+    /// root last. Cannot fail while the reservation count is right,
+    /// which [`BTree::reserve_split_pages`] derives from the descent
+    /// path — an exhausted reserve is an internal invariant break and
+    /// returns [`StoreError::Corrupt`].
+    fn take(&mut self) -> Result<(PageId, WriteGuard<'s, S>), StoreError> {
+        if self.pages.is_empty() {
+            return Err(StoreError::Corrupt(
+                "split cascade needed more pages than were reserved".into(),
+            ));
+        }
+        Ok(self.pages.remove(0))
+    }
+
+    /// Release the pages the cascade did not consume; the pool resets
+    /// their frames and recycles their ids (gate rework on card X-0-F2),
+    /// so an unused reservation leaves the store's page count unchanged.
+    /// Best-effort on purpose: a poisoned table mutex is ignored (a
+    /// dropped guard leaves the pool consistent, see the type doc),
+    /// because failing an insert that already mutated pages would
+    /// itself violate T-ATOMIC.
+    fn release(&mut self, pool: &BufferPool<S>) {
+        for (_, guard) in self.pages.drain(..) {
+            let _ = pool.release_new(guard);
         }
     }
 }
