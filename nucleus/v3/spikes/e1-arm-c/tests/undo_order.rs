@@ -131,10 +131,18 @@ fn readers_never_see_past_their_snapshot_during_apply() {
             samples.fetch_add(1, Ordering::Relaxed);
             thread::yield_now();
         }
+        // Report what the reader actually saw before how much it
+        // sampled: a violation breaks the loop early, and the violation
+        // is the finding, not the short sample run it caused.
+        let n_samples = samples.load(Ordering::Relaxed);
+        let found = violations.lock().unwrap().clone();
         assert!(
-            samples.load(Ordering::Relaxed) > 100,
-            "the reader sampled the window ({} samples)",
-            samples.load(Ordering::Relaxed)
+            found.is_empty(),
+            "violations: {found:#?} (after {n_samples} samples)"
+        );
+        assert!(
+            n_samples > 100,
+            "the reader sampled the window ({n_samples} samples)"
         );
     });
     let v = violations.lock().unwrap().clone();
