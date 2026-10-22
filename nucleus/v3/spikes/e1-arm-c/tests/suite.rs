@@ -1,6 +1,6 @@
 //! Card X-3 Work 10: the behaviour suite on arm (c).
 //!
-//! Three runs, separate `#[test]`s in one binary — safe since X-1a-F3
+//! Four runs, separate `#[test]`s in one binary — safe since X-1a-F3
 //! made the suite's hooks per-engine, which `tests/hooks.rs` of e1-mvcc
 //! proves for engines racing in one binary:
 //! - the suite with the default 64 MiB undo budget (no spill);
@@ -8,9 +8,15 @@
 //!   scenario that supersedes versions (S2, S4, S5, S8, S11b, S12, S13)
 //!   runs with spilled undo and reads through the spill file;
 //! - the S13 differential with a pool of **64 frames**, so the tree
-//!   itself runs through buffer-pool eviction.
+//!   itself runs through buffer-pool eviction;
+//! - the S13 differential again with the small pool **and** an undo
+//!   budget of **0** — every record spills on append (verdict X-3,
+//!   non-blocking note) — so the mid-schedule `gc()` of its `Gc` ops
+//!   runs over spilled records, closing the gap where an over-trim of
+//!   the spill index alone was caught only by S12 in the low-budget
+//!   `run_all` (per-seed S13 engines never cross a 4096-byte budget).
 //!
-//! A fourth, focused test pins non-vacuity: with the small budget the
+//! A fifth, focused test pins non-vacuity: with the small budget the
 //! log really spills, readers at old and mid snapshots read spilled
 //! records correctly, and `gc()` reclaims them once no snapshot needs
 //! them (the SPILL-LOSES catcher of the card's evidence list).
@@ -60,6 +66,22 @@ fn arm_c_passes_the_suite_with_spill() {
 fn arm_c_s13_differential_with_a_small_pool() {
     let dir = tmp_dir("s13");
     let failures = suite::s13_differential(&|| ArmC::new(64, 8192, 64 << 20, &dir));
+    assert!(failures.is_empty(), "failures: {failures:#?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Work 10, run 4 (verdict X-3, non-blocking note): the S13 differential
+/// with the 64-frame pool and an undo budget of **0** — every undo
+/// record spills to the file the moment it is appended — so the
+/// mid-schedule `gc()` of the `Gc` ops runs over spilled records: any
+/// trim that over-reaches the spill index while a snapshot still needs
+/// a spilled record surfaces as an engine-vs-reference mismatch (the
+/// differential's oracle closes the gap the low-budget `run_all` alone
+/// left: an index-only over-trim used to be caught by S12 only).
+#[test]
+fn arm_c_s13_differential_with_a_small_pool_and_spill() {
+    let dir = tmp_dir("s13-spill");
+    let failures = suite::s13_differential(&|| ArmC::new(64, 8192, 0, &dir));
     assert!(failures.is_empty(), "failures: {failures:#?}");
     let _ = std::fs::remove_dir_all(dir);
 }
