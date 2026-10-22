@@ -39,6 +39,11 @@
 //! - AC-GC: [`TxnEngine::gc`] trims the undo prefix and removes tree
 //!   tombstones exactly per Work 7, and is semantically invisible to
 //!   every snapshot at or above the watermark (the S13 oracle rule).
+//!   It is also safe to call concurrently — with writers and with
+//!   itself: each call deletes under a fresh lock-table identity, so
+//!   concurrent calls exclude each other through L-EXCL and one call's
+//!   release can never free a key another still deletes under
+//!   (`tests/gc_race.rs`).
 //!
 //! Test hooks follow X-1a-F3: they are **per-engine** state. The suite's
 //! [`TxnEngine::lock_table`] and [`TxnEngine::sequencer`] return this
@@ -67,11 +72,6 @@ use undo::{TAG_TOMBSTONE, TAG_VALUE, UndoLog};
 /// when the test hook of [`ArmC::arm_apply_yield`] is armed — long enough
 /// that a concurrent reader samples inside the window.
 const APPLY_YIELD: Duration = Duration::from_micros(300);
-
-/// The lock-table identity [`TxnEngine::gc`] removes tombstones under
-/// (Work 7). Txn ids start at 1, so 0 is free, and it is not the lock
-/// table's reserved owner word (`u64::MAX`).
-const GC_TXN: TxnId = 0;
 
 /// Names the spill files of successive engines of one process (a name,
 /// not engine state; the engine's own hooks are all per-instance).
@@ -622,6 +622,18 @@ impl TxnEngine for ArmC {
             Ok(c) => c,
             Err(_) => return 0,
         };
+        // Verdict X-3, rework item 1: gc() may run concurrently with
+        // itself, so every call deletes under a **fresh** identity drawn
+        // from the engine's txn counter. The previous fixed identity
+        // made one gc's `release_all` free a key another gc was still
+        // deleting under — re-acquire by the same owner is a no-op
+        // (L-NOOP), so the second gc never truly held it — and a writer
+        // that then acquired the key had its committed value deleted by
+        // that gc's stale re-check. Fresh ids make concurrent gc calls
+        // exclude each other through the lock table's own L-EXCL rule
+        // (one gc's release can never free another's key) without
+        // serializing gc behind an engine mutex.
+        let gc_id = self.next_txn.fetch_add(1, Ordering::Relaxed);
         let watermark = self.snaps.oldest(&self.seq);
         // Work 7: trim the undo prefix (U-TRIM-SAFE). A spill-file error
         // is fail-stop: poison and report what was already reclaimed.
@@ -657,10 +669,13 @@ impl TxnEngine for ArmC {
         // pass and the delete needed the lock, so it either landed first
         // (the re-read sees its live value and the delete is skipped) or
         // waits for ours and then applies over a correctly absent key
-        // (AC-PERKEY-ASC keeps its undo chain intact either way).
+        // (AC-PERKEY-ASC keeps its undo chain intact either way). The
+        // identity is this call's own (see above), so the lock is really
+        // held — and really ours to release — even while another gc()
+        // runs beside it.
         for key in candidates {
-            if self.locks.acquire(&key, GC_TXN, Wait::NoWait).is_err() {
-                continue; // a writer holds it; a later gc() reconsiders
+            if self.locks.acquire(&key, gc_id, Wait::NoWait).is_err() {
+                continue; // a writer (or another gc) holds it; a later gc() reconsiders
             }
             let still = core
                 .tree
@@ -676,7 +691,7 @@ impl TxnEngine for ArmC {
             {
                 reclaimed += key.len() as u64 + 1;
             }
-            self.locks.release_all(GC_TXN);
+            self.locks.release_all(gc_id);
         }
         reclaimed
     }
