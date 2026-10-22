@@ -704,7 +704,20 @@ impl TxnEngine for ArmC {
         let mut undo_bytes = 0u64;
         let mut undo_spilled_bytes = 0u64;
         if let Some(core) = &self.core {
-            let visible = self.seq.visible_ts();
+            // Verdict X-3, non-blocking note: the pass walks under a
+            // **registered** snapshot. A bare `visible_ts` read is not a
+            // registration, so a concurrent `gc()` could trim — against
+            // a watermark this pass does not hold back — a record a
+            // chain walk here needs, and the key's bytes would silently
+            // vanish from `logical_bytes`. A registered guard keeps the
+            // watermark at or below this snapshot for the pass's
+            // duration (C-SNAP-REG), and every record the walk consults
+            // has `superseded_at` above the snapshot (Work 4), so
+            // U-TRIM-SAFE keeps it alive; the guard drops with the pass.
+            // It is registered directly (not through `begin`), so the
+            // suite's S13 begin/gc call counters never see it.
+            let snap = self.snaps.register(&self.seq);
+            let visible = snap.ts();
             undo_bytes = core.undo.mem_bytes();
             undo_spilled_bytes = core.undo.spill_bytes();
             versions = core.undo.record_count();
@@ -713,10 +726,10 @@ impl TxnEngine for ArmC {
                 .page_count()
                 .map_or(0, |n| n as u64 * core.store.page_size() as u64);
             // One pass over the tree: entry count plus the live bytes of
-            // the newest version at or below visible_ts. The high bound
-            // sits above every legal key (the tree refuses longer keys),
-            // so the pass sees every entry; a pass error degrades the
-            // counts, never the engine.
+            // the newest version at or below the pass's snapshot. The
+            // high bound sits above every legal key (the tree refuses
+            // longer keys), so the pass sees every entry; a pass error
+            // degrades the counts, never the engine.
             let lo: &[u8] = &[];
             let hi = vec![0xFF; page::MAX_KEY + 1];
             if let Ok(iter) = core.tree.range(lo, &hi) {
