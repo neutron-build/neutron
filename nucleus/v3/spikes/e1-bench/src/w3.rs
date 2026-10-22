@@ -65,36 +65,36 @@ fn scan_pass<E: TxnEngine>(
     Ok(out)
 }
 
-/// Untimed verification pass (W3-TIMED): the old snapshot must read the
-/// preload values, the latest the final round's.
+/// Untimed verification pass (W3-TIMED): through the still-open `old`
+/// RR txn the values must be the preload's; at a fresh RC statement
+/// they must be the final round's. The old txn arrives as an argument —
+/// a freshly begun RR would see the latest state and prove nothing.
 fn verify_reads<E: TxnEngine>(
     engine: &E,
+    old: &mut E::Txn,
     keys: u64,
     versions: u64,
     value_len: usize,
 ) -> Result<bool, BenchError> {
     let mut latest = engine.begin(Isolation::ReadCommitted);
-    let mut old = engine.begin(Isolation::RepeatableRead);
-    // `old` re-registers nothing (RR keeps its snapshot); take a fresh RC
-    // statement for `latest`.
     engine.next_statement(&mut latest);
     let stride = usize::try_from((keys / 64).max(1)).unwrap_or(1);
     for i in (0..keys).step_by(stride) {
         let k = util::key_of(i);
         let want_old = util::value_of(i, 0, value_len);
         let want_new = util::value_of(i, versions - 1, value_len);
-        let got_old = engine.get(&mut old, &k).map_err(|e| err("W3 old get", e))?;
+        let got_old = engine.get(old, &k).map_err(|e| err("W3 old get", e))?;
         let got_new = engine
             .get(&mut latest, &k)
             .map_err(|e| err("W3 new get", e))?;
         if got_old.as_deref() != Some(want_old.as_slice())
             || got_new.as_deref() != Some(want_new.as_slice())
         {
+            engine.abort(latest);
             return Ok(false);
         }
     }
     engine.abort(latest);
-    engine.abort(old);
     Ok(true)
 }
 
@@ -118,7 +118,8 @@ pub fn run<E: TxnEngine>(
         preload(&engine, keys, cfg.preload_batch, cfg.value_len, round)?;
     }
 
-    // W3: timed scans at both snapshots.
+    // W3: timed scans at both snapshots, then the untimed verification
+    // while the old txn (and its snapshot) is still open (W3-TIMED).
     let mut old_ns = Vec::new();
     let mut new_ns = Vec::new();
     for _ in 0..cfg.w3_passes {
@@ -133,8 +134,8 @@ pub fn run<E: TxnEngine>(
         engine.abort(latest);
         old_ns.extend(scan_pass(&engine, &mut old, keys, cfg.w3_scan_rows, false)?);
     }
+    let verified = verify_reads(&engine, &mut old, keys, versions, cfg.value_len)?;
     engine.abort(old); // W4-ORDER: the old reader no longer pins anything
-    let verified = verify_reads(&engine, keys, versions, cfg.value_len)?;
 
     // W4: before / gc / after (W4-ORDER, W4-RATIO).
     let before = engine.stats();
