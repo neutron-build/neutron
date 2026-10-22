@@ -121,13 +121,89 @@ the one-process run carries those inflated values as-is.
 
 ## The full table
 
-Full-scale run (3 runs each; medians shown; the JSON carries min/max):
+Full-scale run, 2026-10-22, one process per workload group (`--out`
+JSONs; medians of 3 runs shown — the JSONs carry min/max). Both arms
+passed `e1_mvcc::suite::run_all` in this binary immediately before the
+campaign (`verify` block of `e1-bench-full-W1.json`). Hardware/software
+(meta of every JSON): `13th Gen Intel(R) Core(TM) i5-13500H`, 16 CPUs,
+rustc 1.99.0 (b940084d7 2026-09-28), git `d28582e8035811f37ccbb6bfd131e82eea80b69b`,
+page 8192 B, pool 65,536 frames (W6: 393,216), undo budget 64 MiB,
+values 100 B, 1M preloaded keys (W3/W4: 100k; W6: 10M), 3 runs each.
+Reproduce: the five commands above, in order (W1 first — it is the one
+that verifies).
 
-Hardware/software: see `meta` in each JSON —
-`13th Gen Intel(R) Core(TM) i5-13500H`, 16 CPUs, rustc 1.99.0
-(b940084d7 2026-09-28), git commit `<filled from the run>`.
+### W1 — single-row write mix (µs CPU per txn; bytes applied per txn; txns/s)
 
-<!-- TABLE: filled from the run below -->
+100k txns/thread per configuration (the mix is the card's; the count is
+the driver's, chosen for wall-clock budget — see `Config`).
+
+| threads | (a) v2 CPU/txn | (b) CPU/txn | (c) CPU/txn | (a) txns/s | (b) txns/s | (c) txns/s | (b) B/txn | (c) B/txn |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 56.6 | 4.0 | 3.8 | 28,197 | 251,482 | 264,914 | 124.07 | 108 |
+| 4 | 73.3 | 9.4 | 7.9 | 24,330 | 331,927 | 486,161 | 124.07 | 108 |
+| 8 | 120.4 | 15.7 | 19.5 | 15,128 | 287,277 | 300,001 | 124.07 | 108 |
+| 16 | 136.3 | 69.1 | 117.0 | 14,440 | 69,887 | 67,716 | 124.07 | 108 |
+
+(a) has no applied-bytes counter (null in the JSON). (b) counts encoded
+tree entries (~124 B), (c) logical key+value (108 B) — see the notes
+above. Both spike arms are 12–30× lighter on CPU than v2 today.
+
+### W2 — reads under writers (8 readers; ns/op p50/p99; reader ops/s)
+
+| writers | (b) p50 | (b) p99 | (c) p50 | (c) p99 | (b) ops/s | (c) ops/s | c/b ops |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 9,058 | 30,089 | 7,337 | 28,721 | 766,882 | 905,212 | 1.18× |
+| 10 | 157,688 | 328,107 | 107,765 | 256,051 | 53,942 | 74,413 | 1.38× |
+| 100 | 1,518,129 | 2,351,779 | 665,443 | 3,668,136 | 5,728 | 6,440 | 1.12× |
+
+Zero writer errors on either arm at any writer count.
+
+### W3 — 100-row range scans at 10 versions/key (ns/scan p50/p99)
+
+| snapshot | (b) p50 | (b) p99 | (c) p50 | (c) p99 |
+|---|---:|---:|---:|---:|
+| latest | 88,019 | 94,842 | 10,715 | 14,278 |
+| old (held before the updates) | 87,627 | 94,305 | 146,156 | 174,737 |
+
+`values_verified: true` on both arms and both snapshots.
+
+### W4 — space amplification after W3 (ratios; before GC → after GC)
+
+| arm | tree/logical | (tree+undo+spill)/logical |
+|---|---|---|
+| (b) | 20.11 → 20.11 | 20.11 → 20.11 |
+| (c) | 2.54 → 2.54 | 14.63 → 2.54 |
+
+(b)'s GC reclaims the old versions (versions 1.1M → 100k, 1.13 MB
+freed) but the E0 tree never returns pages, so tree bytes do not move;
+(c)'s undo trims completely (its tree was already minimal). Both arms
+end at their pre-update page counts plus the newest-version bytes.
+
+### W5 — long reader under 4 writers × 2M updates (64 MiB undo budget on (c))
+
+| arm | peak undo B (c) / versions (b) | peak tree B | peak RSS | reader reads originals | reader get p50/p99 ns |
+|---|---:|---:|---:|---|---|
+| (b) | 0 / 3,000,000 | 536,403,968 | 1,356 MiB | true | 2,554 / 4,279 |
+| (c) | 290,000,000 (64 MiB in memory + 226 MiB spilled) | 274,546,688 | 1,080 MiB | true | 2,919 / 6,363 |
+
+Both long readers stayed alive and read their original values; (c) was
+never aborted (no snapshot-too-old exists in the arm).
+
+### W6 — one txn UPDATEs 10M keys
+
+| arm | fill s | commit s | write-set B @commit | lock entries | escalations | head-of-line p50/p99 | RSS |
+|---|---:|---:|---:|---:|---:|---|---:|
+| (b) | 29.2 | 20.9 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 18.16 / 18.16 s | 13.8 GiB |
+| (c) | 20.5 | 23.8 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.0 / 21.50 s | 11.4 GiB |
+
+Both arms crossed the lock table's 1M-row escalation budget exactly
+once and replaced their rows with the table-wide owner (`lock_entries`
+reads 1 at commit). A 1-row txn arriving during the big commit waits out
+essentially the whole commit (head-of-line p99 ≈ commit time on both
+arms); arrivals during the fill wait up to 49.8 s (b) / 43.0 s (c).
+Hundreds of thousands of 1-row txns slip through the O(10M) release
+tail (`apply_slipped_txns`: 312,661 (b) / 480,904 (c)) — the release is
+not free, which S-2's design should account for.
 
 ## Decision rule (PLAN-v3 §4 E1′, applied verbatim)
 
@@ -136,4 +212,36 @@ Hardware/software: see `meta` in each JSON —
 > its undo spill keeps long readers alive with RSS within the N16
 > budget. Otherwise pick (b).
 
-<!-- RULE: filled from the run below -->
+Applied to the medians above:
+
+1. **"(c) passes every test"** — met: `e1_mvcc::suite::run_all` passed
+   on both arms in this binary before the campaign (verified in the
+   same process family), and every workload verified its invariants
+   (`values_verified`, `reader_reads_original_values`, zero writer
+   errors).
+2. **"beats (b) by ≥ 2× CPU per txn on single-row writes"** — NOT met:
+   the best (c) advantage on W1 is 1.05× (1 thread, 3.8 vs 4.0 µs);
+   at 16 threads (c) is 1.7× **slower** (117.0 vs 69.1 µs).
+3. **"or ≥ 2× on reads under writers"** — NOT met: reader throughput at
+   10 and 100 writers is 1.38× and 1.12× better. (The single number
+   that does cross 2× is the p50 at 100 writers, 2.28× — alongside a
+   p99 that is 1.56× worse and a 1.12× throughput gain; that is not a
+   2× win on the workload, and I do not read the rule as cherry-picking
+   one percentile. Judgment call, flagged for X-4.)
+4. **"its undo spill keeps long readers alive with RSS within the N16
+   budget"** — long readers: alive on (c), reading original values, no
+   aborts; (c)'s in-memory undo stayed at its configured 64 MiB budget
+   with 226 MiB spilled, peak RSS 1,080 MiB (vs (b) 1,356 MiB). N16's
+   numeric budget is not yet fixed anywhere (it is card R-1's deliverable),
+   so "within the N16 budget" can only be checked against the undo
+   budget the card names (64 MiB) — met. Judgment call, flagged for X-4.
+
+Clause 2 fails and clause 3 fails, so the conjunction fails regardless
+of clause 4. **The rule's "Otherwise" branch decides: pick (b).**
+
+Context X-4 may weigh (not the rule): (c) is 8× faster on
+latest-snapshot range scans and reaches 2.5× space amplification after
+GC where (b) stays at 20×; (c) is 1.7× slower on contended single-row
+writes and 1.7× slower on old-snapshot scans; W6 head-of-line delay is
+one commit-time on both arms. X-4 (Opus) makes the final call; this
+RESULT is the input.
