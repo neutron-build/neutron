@@ -151,29 +151,29 @@ fn real_main() -> Result<(), i32> {
                 if arm_b {
                     let r = w1::run(&make_b, &cfg, run, *threads)
                         .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                    entries.push(Entry {
-                        id: format!("W1[t={threads}]"),
-                        arm: "b".into(),
-                        report: with_arm(r, "b (ts-in-key)"),
-                    });
+                    record(
+                        &mut entries,
+                        format!("W1[t={threads}]"),
+                        "b",
+                        run,
+                        with_arm(r, "b (ts-in-key)"),
+                    );
                 }
                 if arm_c {
                     let r = w1::run(&make_c, &cfg, run, *threads)
                         .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                    entries.push(Entry {
-                        id: format!("W1[t={threads}]"),
-                        arm: "c".into(),
-                        report: with_arm(r, "c (newest+undo)"),
-                    });
+                    record(
+                        &mut entries,
+                        format!("W1[t={threads}]"),
+                        "c",
+                        run,
+                        with_arm(r, "c (newest+undo)"),
+                    );
                 }
                 if arm_a {
                     let r = arma::w1(&cfg, run, *threads)
                         .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                    entries.push(Entry {
-                        id: format!("W1[t={threads}]"),
-                        arm: "a".into(),
-                        report: r,
-                    });
+                    record(&mut entries, format!("W1[t={threads}]"), "a", run, r);
                 }
             }
         }
@@ -182,20 +182,24 @@ fn real_main() -> Result<(), i32> {
                 if arm_b {
                     let r = w2::run(&make_b, &cfg, run, *writers)
                         .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                    entries.push(Entry {
-                        id: format!("W2[w={writers}]"),
-                        arm: "b".into(),
-                        report: with_arm(r, "b (ts-in-key)"),
-                    });
+                    record(
+                        &mut entries,
+                        format!("W2[w={writers}]"),
+                        "b",
+                        run,
+                        with_arm(r, "b (ts-in-key)"),
+                    );
                 }
                 if arm_c {
                     let r = w2::run(&make_c, &cfg, run, *writers)
                         .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                    entries.push(Entry {
-                        id: format!("W2[w={writers}]"),
-                        arm: "c".into(),
-                        report: with_arm(r, "c (newest+undo)"),
-                    });
+                    record(
+                        &mut entries,
+                        format!("W2[w={writers}]"),
+                        "c",
+                        run,
+                        with_arm(r, "c (newest+undo)"),
+                    );
                 }
             }
         }
@@ -207,11 +211,7 @@ fn real_main() -> Result<(), i32> {
                     let id = workload_id(&r);
                     let wl = id_letter(&r);
                     if sel(&wl) {
-                        entries.push(Entry {
-                            id,
-                            arm: "b".into(),
-                            report: with_arm(r, "b (ts-in-key)"),
-                        });
+                        record(&mut entries, id, "b", run, with_arm(r, "b (ts-in-key)"));
                     }
                 }
             }
@@ -222,11 +222,7 @@ fn real_main() -> Result<(), i32> {
                     let id = workload_id(&r);
                     let wl = id_letter(&r);
                     if sel(&wl) {
-                        entries.push(Entry {
-                            id,
-                            arm: "c".into(),
-                            report: with_arm(r, "c (newest+undo)"),
-                        });
+                        record(&mut entries, id, "c", run, with_arm(r, "c (newest+undo)"));
                     }
                 }
             }
@@ -235,40 +231,48 @@ fn real_main() -> Result<(), i32> {
             if arm_b {
                 let r = w5::run(&make_b, &cfg, run)
                     .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                entries.push(Entry {
-                    id: "W5".into(),
-                    arm: "b".into(),
-                    report: with_arm(r, "b (ts-in-key)"),
-                });
+                record(
+                    &mut entries,
+                    "W5".into(),
+                    "b",
+                    run,
+                    with_arm(r, "b (ts-in-key)"),
+                );
             }
             if arm_c {
                 let r = w5::run(&make_c, &cfg, run)
                     .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                entries.push(Entry {
-                    id: "W5".into(),
-                    arm: "c".into(),
-                    report: with_arm(r, "c (newest+undo)"),
-                });
+                record(
+                    &mut entries,
+                    "W5".into(),
+                    "c",
+                    run,
+                    with_arm(r, "c (newest+undo)"),
+                );
             }
         }
         if sel("W6") {
             if arm_b {
                 let r = w6::run(&make_b, &cfg, run)
                     .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                entries.push(Entry {
-                    id: "W6".into(),
-                    arm: "b".into(),
-                    report: with_arm(r, "b (ts-in-key)"),
-                });
+                record(
+                    &mut entries,
+                    "W6".into(),
+                    "b",
+                    run,
+                    with_arm(r, "b (ts-in-key)"),
+                );
             }
             if arm_c {
                 let r = w6::run(&make_c, &cfg, run)
                     .map_err(|e| fatal(e, &report, out_path.as_deref()))?;
-                entries.push(Entry {
-                    id: "W6".into(),
-                    arm: "c".into(),
-                    report: with_arm(r, "c (newest+undo)"),
-                });
+                record(
+                    &mut entries,
+                    "W6".into(),
+                    "c",
+                    run,
+                    with_arm(r, "c (newest+undo)"),
+                );
             }
         }
         eprintln!("run {}/{} complete", run + 1, cfg.runs);
@@ -277,6 +281,17 @@ fn real_main() -> Result<(), i32> {
     push(&mut report, "results", summarize(&entries));
     print_report(&report, out_path.as_deref());
     Ok(())
+}
+
+/// Record one entry and keep the operator's progress feed alive (a
+/// full-scale W1 configuration can run for minutes without one).
+fn record(entries: &mut Vec<Entry>, id: String, arm: &str, run: u32, report: Json) {
+    eprintln!("{id} {arm} run {} recorded", run + 1);
+    entries.push(Entry {
+        id,
+        arm: arm.to_string(),
+        report,
+    });
 }
 
 /// Print the usage line and return exit code 1.
