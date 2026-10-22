@@ -68,6 +68,17 @@ pub fn key_of(i: u64) -> [u8; 8] {
     i.to_be_bytes()
 }
 
+/// A key's lowercase hex, the compact identity the integrity tests'
+/// op streams record (U-DET: two keys differ iff their hex differs).
+pub fn key_hex(key: &[u8]) -> String {
+    let mut s = String::with_capacity(key.len() * 2);
+    for b in key {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// The deterministic `len`-byte value of row `i` at version `salt`
 /// (U-DET): a splitmix64 stream over `(i, salt)`. Preloads use `salt 0`;
 /// later update rounds use later salts, so a stale read is detectable.
@@ -203,7 +214,8 @@ pub fn secs(d: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Rng, cpu_ticks, key_of, latencies_p50_p99, median, peak_rss_kib, percentile, value_of,
+        Rng, cpu_ticks, key_hex, key_of, latencies_p50_p99, median, peak_rss_kib, percentile,
+        value_of,
     };
 
     /// U-DET: identical seeds produce identical streams; different seeds
@@ -261,6 +273,8 @@ mod tests {
         assert_ne!(v0, v1);
         assert_eq!(v0.len(), 100);
         assert_eq!(key_of(1), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(key_hex(&key_of(1)), "0000000000000001");
+        assert_eq!(key_hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
     }
 
     /// U-PROC on Linux: the readers return something (the bench's own

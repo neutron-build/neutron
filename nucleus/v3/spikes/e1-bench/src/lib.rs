@@ -21,9 +21,14 @@
 //! The `E0` pool preallocates `frames × page_size` bytes, so the pool
 //! sizes are part of the configuration and are chosen per workload just
 //! large enough to hold the data ("pool large enough for the data unless
-//! stated otherwise"), identically for both arms.
+//! stated otherwise"), identically for both arms. The X-1b gate's rework
+//! (verdict 2026-10-22, defect 1) measured the old W5/W6 pools as exactly
+//! full for arm (b) — eviction inside its measured phase — so each
+//! workload now names a pool with measured headroom over (b)'s peak tree
+//! (the larger arm), and the README states the sizing evidence.
 
 pub mod arma;
+pub mod engines;
 pub mod json;
 pub mod util;
 pub mod verify;
@@ -73,9 +78,18 @@ pub struct Config {
     pub runs: u32,
     /// B+tree page size in bytes (identical on both arms).
     pub page_size: usize,
-    /// Buffer-pool frames for the 1M-key workloads (W1, W2, W3/W4, W5).
+    /// Buffer-pool frames for the W1/W2/W3+W4 workloads (1M preloaded
+    /// keys; W3/W4's range is smaller still).
     pub pool_frames: usize,
-    /// Buffer-pool frames for W6's 10M-key tree.
+    /// Buffer-pool frames for W5 (1M preloaded keys grown to ~3M versions
+    /// under a held snapshot). Sized to 2× arm (b)'s measured peak tree
+    /// (65,489 pages at the old, exactly-full 65,536-frame pool), so
+    /// neither arm evicts during the measured phase.
+    pub pool_frames_w5: usize,
+    /// Buffer-pool frames for W6's 10M-key tree. Sized over arm (b)'s
+    /// measured post-commit tree (5,323,112,448 B ≈ 649,843 pages) plus
+    /// the probe-written versions with ~20% headroom, so neither arm
+    /// evicts during the fill, the big commit or the release tail.
     pub pool_frames_big: usize,
     /// Arm (c)'s undo budget in bytes (card Work 2 W5 mandates 64 MiB;
     /// the same budget is used everywhere so no workload tunes it).
@@ -134,12 +148,22 @@ impl Config {
             quick: false,
             runs: 3,
             page_size: 8192,
-            // 512 MiB of frames: ~10× the ~15k pages a 1M-entry tree
-            // needs, so eviction never dominates (W5 grows to ~3M
-            // versions ≈ 45k pages and still fits).
+            // 512 MiB of frames for the W1/W2/W3 pool: ~10× the ~15k
+            // pages a 1M-entry tree needs at one version per key, so
+            // eviction never dominates (W1/W2 GC their old versions; W3
+            // tops out at ~1.4k pages per 100k-key round).
             pool_frames: 65_536,
-            // 3 GiB of frames for W6's ~300k pages after the big commit.
-            pool_frames_big: 393_216,
+            // W5's tree cannot GC (one RR snapshot is held throughout),
+            // so it grows to one version per update: arm (b) peaked at
+            // 65,489 pages = 536,469,504 B (gate measurement), exactly
+            // filling the old 65,536-frame pool. 2× that, 1 GiB.
+            pool_frames_w5: 131_072,
+            // W6: arm (b)'s tree after the 10M-row UPDATE measured
+            // 5,323,112,448 B ≈ 649,843 pages (both versions resident;
+            // no GC ran during the commit), plus the 1-row probe writes
+            // of the release tail. 786,432 frames = 6 GiB holds both
+            // with ~20% headroom (gate rework defect 1).
+            pool_frames_big: 786_432,
             undo_budget_bytes: 64 << 20,
             value_len: 100,
             preload_keys: 1_000_000,
@@ -171,11 +195,18 @@ impl Config {
 
     /// The `--quick` configuration: every data-sized parameter ÷
     /// [`QUICK_SCALE`] (thread counts and version depth stay — they are
-    /// the axes of the measurement, not its size; card Acceptance).
+    /// the axes of the measurement, not its size; card Acceptance). The
+    /// pool sizes are data-sized too (each is sized to its workload's
+    /// tree), so they scale as well — a quick run measures the same
+    /// no-eviction shape at 1/100th the data instead of preallocating
+    /// GiBs of frames it cannot fill.
     pub fn quick() -> Self {
         let mut c = Config::full();
         c.quick = true;
         c.preload_keys /= QUICK_SCALE;
+        c.pool_frames /= QUICK_SCALE as usize;
+        c.pool_frames_w5 /= QUICK_SCALE as usize;
+        c.pool_frames_big /= QUICK_SCALE as usize;
         c.w1_txns_per_thread /= QUICK_SCALE;
         c.w2_hot_keys /= QUICK_SCALE;
         c.w2_duration /= QUICK_SCALE as u32;
@@ -204,6 +235,14 @@ mod tests {
         let q = Config::quick();
         assert!(q.quick);
         assert_eq!(q.preload_keys * QUICK_SCALE, f.preload_keys);
+        // The pools scale by the same 100×, asserted in the forward
+        // direction: the full-scale sizes are tied to measured tree
+        // sizes (65,536 frames is the gate-re-measured W1/W2/W3 pool
+        // and must not move), so they are not round multiples of 100
+        // and the reverse product is not exact under integer division.
+        assert_eq!(q.pool_frames, f.pool_frames / QUICK_SCALE as usize);
+        assert_eq!(q.pool_frames_w5, f.pool_frames_w5 / QUICK_SCALE as usize);
+        assert_eq!(q.pool_frames_big, f.pool_frames_big / QUICK_SCALE as usize);
         assert_eq!(q.w1_txns_per_thread * QUICK_SCALE, f.w1_txns_per_thread);
         assert_eq!(q.w2_hot_keys * QUICK_SCALE, f.w2_hot_keys);
         assert_eq!(q.w3_keys * QUICK_SCALE, f.w3_keys);
@@ -218,5 +257,36 @@ mod tests {
         );
         // The sample must fit the shrunken preload.
         assert!(q.w5_sample_keys <= q.preload_keys);
+    }
+
+    /// The W5/W6 pools are sized over arm (b)'s measured peak trees with
+    /// headroom (the gate's defect 1: the old pools were exactly full for
+    /// (b), so it evicted inside its measured phase). A page is 8192 B.
+    #[test]
+    fn w5_and_w6_pools_cover_arm_b_peak_trees_with_headroom() {
+        let f = Config::full();
+        // (b)'s measured W5 peak tree: 536,469,504 B = 65,489 pages.
+        let w5_pages = 536_469_504 / f.page_size as u64;
+        assert!(
+            f.pool_frames_w5 as u64 >= w5_pages * 2,
+            "W5 pool {} frames < 2x arm (b)'s peak {} pages",
+            f.pool_frames_w5,
+            w5_pages
+        );
+        // (b)'s measured post-commit W6 tree: 5,323,112,448 B ≈ 649,843
+        // pages, plus the release tail's probe versions.
+        let w6_pages = 5_323_112_448 / f.page_size as u64;
+        assert!(
+            f.pool_frames_big as u64 >= w6_pages + w6_pages / 5,
+            "W6 pool {} frames < 1.2x arm (b)'s post-commit {} pages",
+            f.pool_frames_big,
+            w6_pages
+        );
+        // The quick pools scale down with the data, so a quick run still
+        // dwarfs its (1/100th) trees.
+        let q = Config::quick();
+        assert!(q.pool_frames >= 64);
+        assert!(q.pool_frames_w5 >= 1024);
+        assert!(q.pool_frames_big >= 4096);
     }
 }

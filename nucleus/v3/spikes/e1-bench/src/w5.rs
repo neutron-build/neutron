@@ -41,7 +41,7 @@ pub fn run<E: TxnEngine>(
     cfg: &Config,
     run: u32,
 ) -> Result<Json, BenchError> {
-    let engine = Arc::new(make(cfg.pool_frames)?);
+    let engine = Arc::new(make(cfg.pool_frames_w5)?);
     preload(
         &*engine,
         cfg.preload_keys,

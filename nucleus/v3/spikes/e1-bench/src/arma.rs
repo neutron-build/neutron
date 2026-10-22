@@ -23,10 +23,16 @@
 //! - A-V2: nothing here edits or wraps v2 — the adapter only calls v2's
 //!   public API (card Do-not: anything under `nucleus/v2/` is
 //!   read-only).
-//! - A-SAME: W1 runs with the same thread counts, key space, value
-//!   length and seeds as arms (b)/(c) (B-SAME); bytes-per-txn is not
-//!   reported because v2 exposes no applied-bytes counter — the report
-//!   carries `null` rather than an estimate.
+//! - A-SAME: W1 runs the **same** stream as arms (b)/(c), not merely a
+//!   statistically equivalent one: each worker draws from
+//!   [`rng_for`](crate::workload::rng_for)`(W_W1, run, tid, 0)` and
+//!   derives its values as `value_of(run ^ (n << 8), 1, len)` — the
+//!   exact code of [`crate::w1`] (B-SAME; the X-1b gate's rework
+//!   defect 3: the adapter used to re-seed an RNG from the stream's
+//!   first word, so its keys differed from (b)/(c)'s). Same thread
+//!   counts, key space, value length, window and CPU accounting;
+//!   bytes-per-txn is not reported because v2 exposes no applied-bytes
+//!   counter — the report carries `null` rather than an estimate.
 
 use std::sync::Arc;
 use std::thread;
@@ -158,18 +164,22 @@ impl V2 {
     }
 
     /// One W1 worker's loop: RC update txns on random preloaded keys
-    /// (A-SAME).
+    /// (A-SAME — the same key and value stream as [`crate::w1`]'s
+    /// worker: the caller supplies the worker's
+    /// [`rng_for`](crate::workload::rng_for) stream and the run number,
+    /// and the value salt is `run ^ (n << 8)` exactly as `w1` derives
+    /// it).
     fn w1_worker(
         &self,
+        run: u32,
         keys: u64,
         txns: u64,
         value_len: usize,
-        seed: u64,
+        rng: &mut util::Rng,
     ) -> Result<(), BenchError> {
-        let mut rng = util::Rng::new(seed);
         for n in 0..txns {
             let idx = rng.below(keys);
-            let value = util::value_of(idx, n.wrapping_add(1), value_len);
+            let value = util::value_of(u64::from(run) ^ (n << 8), 1, value_len);
             let t = self.core.begin(Isolation::ReadCommitted);
             let seq = t
                 .next_seq()
@@ -211,12 +221,15 @@ pub fn w1(cfg: &Config, run: u32, threads: usize) -> Result<Json, BenchError> {
         for tid in 0..threads {
             let core = &v2;
             handles.push(s.spawn(move || {
-                let seed = rng_for(W_W1, run, tid, 0).next_u64();
+                // A-SAME: the worker consumes the same stream w1's
+                // worker does for this (workload, run, thread).
+                let mut rng = rng_for(W_W1, run, tid, 0);
                 core.w1_worker(
+                    run,
                     cfg.preload_keys,
                     cfg.w1_txns_per_thread,
                     cfg.value_len,
-                    seed,
+                    &mut rng,
                 )
             }));
         }
@@ -268,13 +281,14 @@ mod tests {
     use nucleus_txn::visibility::ReadCtx;
 
     /// A-V2/A-SAME smoke: preload through the adapter, update through
-    /// the W1 shape, read back through v2's read path.
+    /// the W1 shape (the worker's own `rng_for` stream), read back
+    /// through v2's read path.
     #[test]
     fn arm_a_preload_update_read() {
         let v2 = V2::new().unwrap();
         v2.preload(16, 4, 24, 0).unwrap();
-        let seed = util::Rng::new(1).next_u64();
-        v2.w1_worker(16, 8, 24, seed).unwrap();
+        let mut rng = crate::workload::rng_for(crate::workload::W_W1, 0, 0, 0);
+        v2.w1_worker(0, 16, 8, 24, &mut rng).unwrap();
         v2.drain().unwrap();
         let snap = v2.core.registry.take_snapshot();
         let view = v2.core.open_view();

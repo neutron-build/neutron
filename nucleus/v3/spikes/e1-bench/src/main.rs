@@ -23,15 +23,11 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use e1_arm_b::ArmB;
-use e1_arm_c::ArmC;
 
 use e1_bench::json::{self, Json, obj};
 use e1_bench::util;
-use e1_bench::{Config, arma, verify, w1, w2, w3, w5, w6};
+use e1_bench::{Config, arma, engines, verify, w1, w2, w3, w5, w6};
 
 /// A run of one workload on one arm, collected for the summary.
 struct Entry {
@@ -118,13 +114,9 @@ fn real_main() -> Result<(), i32> {
                 return Err(2);
             }
         };
-        let passed = matches!(
-            (
-                json::field(&v, "arm_b_passed"),
-                json::field(&v, "arm_c_passed")
-            ),
-            (Some(Json::Bool(true)), Some(Json::Bool(true)))
-        );
+        // B-ABORT: the decision is the library's conjunction — main
+        // never second-guesses it (the gate's VERIFY-BYPASS mutant).
+        let passed = verify::report_passed(&v);
         push(&mut report, "verify", v);
         if !passed {
             eprintln!("an arm failed the behaviour suite; aborting the bench");
@@ -135,17 +127,12 @@ fn real_main() -> Result<(), i32> {
     }
 
     let mut entries: Vec<Entry> = Vec::new();
-    let make_b = |pool: usize| Ok(ArmB::new(pool, cfg.page_size));
-    let engine_n = AtomicU64::new(0);
-    let make_c = |pool: usize| {
-        let d = root.join(format!(
-            "armc-{}-{}",
-            std::process::id(),
-            engine_n.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&d).map_err(|e| e1_bench::BenchError::new("arm c spill dir", e))?;
-        Ok(ArmC::new(pool, cfg.page_size, cfg.undo_budget_bytes, &d))
-    };
+    // E-SAME (card Do-not "same pool, same page size"): both arms are
+    // built by the library factories, which forward the workload's pool
+    // and the shared config verbatim — no per-arm construction path a
+    // configuration could drift in (gate rework defect 2).
+    let make_b = engines::make_b(&cfg);
+    let make_c = engines::make_c(&cfg, &root);
 
     let sel = |w: &str| want_workloads.iter().any(|x| x == w);
     let arm_b = want_arms.iter().any(|a| a == "b");
@@ -385,6 +372,7 @@ fn push_meta(report: &mut Json, cfg: &Config, quick: bool) {
             ("runs_per_workload", cfg.runs.into()),
             ("page_size", cfg.page_size.into()),
             ("pool_frames_1m", cfg.pool_frames.into()),
+            ("pool_frames_w5", cfg.pool_frames_w5.into()),
             ("pool_frames_10m", cfg.pool_frames_big.into()),
             ("undo_budget_bytes", cfg.undo_budget_bytes.into()),
             ("value_len", cfg.value_len.into()),
