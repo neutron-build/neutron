@@ -24,7 +24,17 @@
 //! Invariants owned here:
 //! - B-ENC-ORDER: for any set of `(user key, ts)` pairs, sorting the
 //!   encoded keys equals sorting the pairs by `(key asc, ts desc)`
-//!   (pinned by the proptest below; card Work 2).
+//!   (pinned by the proptest below; card Work 2). Measured catchers of
+//!   the card's `TS-ASC` mutant (ts encoded ascending, decode kept
+//!   consistent so only the order flips): S13 — 994 failing assertions
+//!   across the 500 seeds — plus S1/S4/S5/S6/S8–S12 collaterally. S2
+//!   alone does **not** catch it: its RR reader registers its snapshot
+//!   immediately after the seed commit, so the snapshot ts equals the
+//!   only older version's ts and "oldest version >= S" and
+//!   "newest version <= S" coincide on that schedule; the mutant only
+//!   diverges when some version's ts falls strictly between the
+//!   reader's snapshot and a newer version, which the seeded
+//!   differential produces constantly and S2's fixed schedule never.
 //! - B-ENC-ROUNDTRIP: `decode_key(encode_key(k, ts)) == Some((k, ts))`
 //!   for every user key and ts, and `decode_value(encode_value(v)) ==
 //!   Some(v)` for every value — a decode failure is corruption, never
