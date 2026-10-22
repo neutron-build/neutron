@@ -145,7 +145,12 @@ impl Config {
             preload_keys: 1_000_000,
             preload_batch: 1_000,
             w1_threads: vec![1, 4, 8, 16],
-            w1_txns_per_thread: 500_000,
+            // 100k txns/thread: at 16 threads the contended mix costs
+            // ~50-60 µs CPU/txn, so this keeps every configuration well
+            // inside the driver's wall-clock budget while giving the
+            // 100 Hz process-CPU clock >= 40 ticks per single-thread
+            // configuration (card Work 2 fixes the mix, not the count).
+            w1_txns_per_thread: 100_000,
             w2_readers: 8,
             w2_writer_counts: vec![0, 10, 100],
             w2_hot_keys: 10_000,

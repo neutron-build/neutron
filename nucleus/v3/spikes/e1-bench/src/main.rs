@@ -6,13 +6,15 @@
 //!
 //! Usage:
 //! ```text
-//! e1-bench [--quick] [--verify] [--arm a,b,c] [--only W1,W2,W3,W4,W5,W6] [--out FILE]
+//! e1-bench [--quick] [--verify] [--no-verify] [--arm a,b,c] [--only W1,W2,W3,W4,W5,W6] [--out FILE]
 //! ```
 //! - `--quick` scales every workload down 100× (the acceptance shape).
 //! - `--verify` runs the arms' behaviour suite before measuring; a full
 //!   run always verifies (`B-ABORT`), `--verify` extends that to quick
 //!   runs — the acceptance command (`--verify --quick`) therefore
-//!   verifies **and** runs the quick matrix.
+//!   verifies **and** runs the quick matrix. `--no-verify` skips it for
+//!   focused re-measurement invocations of a campaign that already
+//!   verified.
 //! - `--arm` / `--only` select arms and workloads (default: all arms,
 //!   all workloads; arm (a) exists only in W1).
 //!
@@ -48,6 +50,7 @@ fn main() {
 fn real_main() -> Result<(), i32> {
     let mut quick = false;
     let mut verify_flag = false;
+    let mut no_verify = false;
     let mut arms = String::from("a,b,c");
     let mut only = String::from("W1,W2,W3,W4,W5,W6");
     let mut out_path: Option<PathBuf> = None;
@@ -56,6 +59,7 @@ fn real_main() -> Result<(), i32> {
         match a.as_str() {
             "--quick" => quick = true,
             "--verify" => verify_flag = true,
+            "--no-verify" => no_verify = true,
             "--arm" => match args.next() {
                 Some(v) => arms = v,
                 None => return usage("--arm needs a value"),
@@ -100,8 +104,11 @@ fn real_main() -> Result<(), i32> {
     push_meta(&mut report, &cfg, quick);
 
     // Verification (B-ABORT): every full run verifies; --verify extends
-    // it to quick runs (the acceptance command).
-    let must_verify = verify_flag || !quick;
+    // it to quick runs (the acceptance command). --no-verify skips it
+    // for focused re-measurement invocations of a campaign that already
+    // verified (the suite result does not change between invocations of
+    // one build).
+    let must_verify = (verify_flag || !quick) && !no_verify;
     if must_verify {
         eprintln!("verifying arms (e1_mvcc::suite::run_all) ...");
         let v = match verify::run(&root) {
@@ -297,7 +304,7 @@ fn record(entries: &mut Vec<Entry>, id: String, arm: &str, run: u32, report: Jso
 /// Print the usage line and return exit code 1.
 fn usage(msg: &str) -> Result<(), i32> {
     eprintln!(
-        "{msg}\nusage: e1-bench [--quick] [--verify] [--arm a,b,c] \
+        "{msg}\nusage: e1-bench [--quick] [--verify] [--no-verify] [--arm a,b,c] \
          [--only W1,W2,W3,W4,W5,W6] [--out FILE]"
     );
     Err(1)
