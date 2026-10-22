@@ -1,0 +1,20 @@
+# E1′ arm (c) (card X-3; PLAN-v3 §2 N3 arm (c), §4 E1′). Not production
+# code: the newest committed version in place on the X-0 B+tree, older
+# versions in an undo log that spills past a memory budget, on the shared
+# X-1a txn components.
+[package]
+name = "e1-arm-c"
+description = "E1′ arm (c) (card X-3): newest-in-place MVCC + undo log on the X-0 B+tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+e0-btree = { path = "../e0-btree" }
+e1-mvcc = { path = "../e1-mvcc" }
+
+[lints]
+workspace = true
