@@ -1,0 +1,23 @@
+# E1′ arm (b) (card X-2; PLAN-v3 §4 E1′, §2 N3 option (b)). Not production
+# code: this spike implements the E1′ `TxnEngine` with timestamp-in-key
+# versions on the X-0 B+tree, using e1-mvcc's shared txn components
+# unchanged so that only the version layout differs from arm (c).
+[package]
+name = "e1-arm-b"
+description = "E1′ arm (b): timestamp-in-key MVCC on the X-0 B+tree (card X-2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+e0-btree = { path = "../e0-btree" }
+e1-mvcc = { path = "../e1-mvcc" }
+
+[dev-dependencies]
+# The card's Work 2 unit test is a proptest of the encoded key order.
+proptest = "1.12"
+
+[lints]
+workspace = true
