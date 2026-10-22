@@ -24,12 +24,18 @@ cargo build -q --release -p e1-bench
 cargo run -q --release -p e1-bench -- --verify --quick
 
 # The real numbers (each workload group in its own process so peak RSS
-# is each workload's own; see "RSS accounting" below):
+# is each workload's own; see "RSS accounting" below). Original
+# campaign (W1 a+b+c in one process, W2, W3/W4 — the W1 (b)/(c), W2 and
+# W3/W4 rows below still carry it):
 cargo run -q --release -p e1-bench -- --arm a,b,c --only W1 --out w1.json
 cargo run -q --release -p e1-bench -- --arm b,c   --only W2 --out w2.json
 cargo run -q --release -p e1-bench -- --arm b,c   --only W3,W4 --out w34.json
-cargo run -q --release -p e1-bench -- --arm b,c   --only W5 --out w5.json
-cargo run -q --release -p e1-bench -- --arm b,c   --only W6 --out w6.json
+
+# Rework re-measurements (gate verdict 2026-10-22: W5/W6 pools, arm
+# (a)'s stream) — the W1 (a), W5 and W6 rows below:
+cargo run -q --release -p e1-bench -- --arm a   --only W1 --out w1a-rework.json
+cargo run -q --release -p e1-bench -- --arm b,c --only W5 --out w5-rework.json
+cargo run -q --release -p e1-bench -- --arm b,c --only W6 --out w6-rework.json
 ```
 
 A full run verifies first (a quick run verifies when `--verify` is
@@ -56,10 +62,17 @@ one JSON document on stdout (hand-rolled writer, no serde).
   (workload, run, thread) — arm (b) and arm (c) execute identical key
   streams. Arm (c) runs with an undo budget of **64 MiB** everywhere.
 - Pool sizes: the E0 pool **preallocates** `frames × page_size` bytes.
-  65,536 frames (512 MiB) for the 1M-key workloads (a 1M-version tree is
-  ~15k pages; W5 grows to ~3M versions ≈ 45k pages — no eviction), and
-  393,216 frames (3 GiB) for W6's ~300k-page tree. Identical on both
-  arms.
+  65,536 frames (512 MiB) for the W1/W2/W3+W4 workloads (a 1M-version
+  tree is ~15k pages); **131,072 frames (1 GiB) for W5** — 2× arm (b)'s
+  measured peak tree of 65,489 pages (536,469,504 B), which the gate
+  found exactly filling the old 65,536-frame pool; and **786,432 frames
+  (6 GiB) for W6** — ≥ 1.2× arm (b)'s measured post-commit tree of
+  5,323,112,448 B ≈ 649,843 pages, which the old 393,216-frame pool
+  made (b) evict through (the gate's rework defect 1; the README
+  previously — and wrongly — called that pool "~300k pages"). Identical
+  on both arms. `--quick` scales the pools down with the data (÷100),
+  so the acceptance shape stays no-eviction at 1/100th the size instead
+  of preallocating GiBs it cannot fill.
 - Arm (a) is driven exactly as v2's own tests drive it (the card's Read
   pointer: `ArbiterCycles::preload` / `Rig::update`): RC txns, one
   `row_op(Update)` with an always-apply EPQ per txn, `commit_submit` +
@@ -113,40 +126,59 @@ the one-process run carries those inflated values as-is.
   first locked key during the fill and would never arrive during the
   apply). `head_of_line_p50/p99/max` are the percentiles over
   apply-window probe txns delayed ≥ 1 ms — an uncontended 1-row txn
-  never reaches 1 ms (see W1/W2 in the same report) — and the 1-row
-  txns that slip through the O(keys) release tail are counted as
-  `apply_slipped_txns`, not as delayed. The mechanism (blocked through
-  the apply) is pinned deterministically by
+  never reaches 1 ms (see W1/W2 in the same report) — and **the sample
+  counts are tiny** (medians: 18 (b), 9 (c) delayed txns per run), so
+  the p99 is in effect the maximum; the counts are stated in the table.
+  The 1-row txns that slip through the O(keys) release tail are counted
+  as `apply_slipped_txns`, not as delayed. The mechanism (blocked
+  through the apply) is pinned deterministically by
   `tests/w6_head_of_line.rs` using the suite's apply gate.
 
 ## The full table
 
-Full-scale run, 2026-10-22, one process per workload group (`--out`
-JSONs; medians of 3 runs shown — the JSONs carry min/max). Both arms
-passed `e1_mvcc::suite::run_all` in this binary immediately before the
-campaign (`verify` block of `e1-bench-full-W1.json`). Hardware/software
+Full-scale runs, 2026-10-22, one process per workload group (`--out`
+JSONs; medians of 3 runs shown — the JSONs carry min/max). **Row
+provenance after the X-1b gate rework (verdict 2026-10-22):** the gate
+re-measured W1/W2/W3/W4 at the original campaign's commit `d28582e8`
+and found them sound (every cell within ~8%) — those rows keep the
+original campaign's numbers. The rework changed three things that touch
+numbers: the W5/W6 pools (defect 1), arm (a)'s key/value stream, now
+identical to (b)/(c)'s by code rather than statistically (defect 3),
+and the library factories (defect 2, construction-identical). W1 arm
+(a), W5 and W6 were therefore **re-measured at commit `c39656fd`**
+(JSONs `w1a-rework.json`, `w5-rework.json`, `w6-rework.json`, each
+carrying its own passing `verify` block). Both arms passed
+`e1_mvcc::suite::run_all` in this binary immediately before every
+campaign group (the `verify` block of each JSON). Hardware/software
 (meta of every JSON): `13th Gen Intel(R) Core(TM) i5-13500H`, 16 CPUs,
-rustc 1.99.0 (b940084d7 2026-09-28), git `d28582e8035811f37ccbb6bfd131e82eea80b69b`,
-page 8192 B, pool 65,536 frames (W6: 393,216), undo budget 64 MiB,
+rustc 1.99.0 (b940084d7 2026-09-28), git `c39656fd` (re-measured rows)
+/ `d28582e8` (original campaign), page 8192 B, pool 65,536 frames
+(W1/W2/W3/W4; W5: 131,072; W6: 786,432), undo budget 64 MiB,
 values 100 B, 1M preloaded keys (W3/W4: 100k; W6: 10M), 3 runs each.
-Reproduce: the five commands above, in order (W1 first — it is the one
-that verifies).
+Reproduce: the commands in "Reproduce" above — the original-campaign
+commands at the original code, the rework re-measurements at this
+commit.
 
 ### W1 — single-row write mix (µs CPU per txn; bytes applied per txn; txns/s)
 
 100k txns/thread per configuration (the mix is the card's; the count is
-the driver's, chosen for wall-clock budget — see `Config`).
+the driver's, chosen for wall-clock budget — see `Config`). Arm (a)
+re-measured at `c39656fd` after the stream-parity fix (defect 3); the
+reference numbers moved ≤ 5%, consistent with the gate's "statistically
+equivalent" reading of the old stream.
 
 | threads | (a) v2 CPU/txn | (b) CPU/txn | (c) CPU/txn | (a) txns/s | (b) txns/s | (c) txns/s | (b) B/txn | (c) B/txn |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 56.6 | 4.0 | 3.8 | 28,197 | 251,482 | 264,914 | 124.07 | 108 |
-| 4 | 73.3 | 9.4 | 7.9 | 24,330 | 331,927 | 486,161 | 124.07 | 108 |
-| 8 | 120.4 | 15.7 | 19.5 | 15,128 | 287,277 | 300,001 | 124.07 | 108 |
-| 16 | 136.3 | 69.1 | 117.0 | 14,440 | 69,887 | 67,716 | 124.07 | 108 |
+| 1 | 55.7 | 4.0 | 3.8 | 28,305 | 251,482 | 264,914 | 124.07 | 108 |
+| 4 | 76.6 | 9.4 | 7.9 | 20,710 | 331,927 | 486,161 | 124.07 | 108 |
+| 8 | 108.1 | 15.7 | 19.5 | 17,480 | 287,277 | 300,001 | 124.07 | 108 |
+| 16 | 137.1 | 69.1 | 117.0 | 14,020 | 69,887 | 67,716 | 124.07 | 108 |
 
-(a) has no applied-bytes counter (null in the JSON). (b) counts encoded
-tree entries (~124 B), (c) logical key+value (108 B) — see the notes
-above. Both spike arms are 12–30× lighter on CPU than v2 today.
+((b)/(c) columns: original campaign `d28582e8`, gate-re-measured; their
+code path is unchanged by the rework.) (a) has no applied-bytes counter
+(null in the JSON). (b) counts encoded tree entries (~124 B), (c)
+logical key+value (108 B) — see the notes above. Both spike arms are
+12–30× lighter on CPU than v2 today.
 
 ### W2 — reads under writers (8 readers; ns/op p50/p99; reader ops/s)
 
@@ -181,29 +213,88 @@ end at their pre-update page counts plus the newest-version bytes.
 
 ### W5 — long reader under 4 writers × 2M updates (64 MiB undo budget on (c))
 
+Re-measured at `c39656fd` with the corrected 131,072-frame (1 GiB)
+pool: (b)'s peak tree is 65,489 pages = 536,436,736 B — it exactly
+filled (and evicted inside) the old 512 MiB pool, and now fits with 2×
+headroom (`peak_tree_bytes ≤ pool` in every run). RSS grew by the
+larger preallocated pool (+512 MiB on (b), +512 MiB on (c)).
+
 | arm | peak undo B (c) / versions (b) | peak tree B | peak RSS | reader reads originals | reader get p50/p99 ns |
 |---|---:|---:|---:|---|---|
-| (b) | 0 / 3,000,000 | 536,403,968 | 1,356 MiB | true | 2,554 / 4,279 |
-| (c) | 290,000,000 (64 MiB in memory + 226 MiB spilled) | 274,546,688 | 1,080 MiB | true | 2,919 / 6,363 |
+| (b) | 0 / 3,000,000 | 536,436,736 | 1,874 MiB | true | 2,531 / 4,182 |
+| (c) | 290,000,000 (64 MiB in memory + 226 MiB spilled) | 274,546,688 | 1,594 MiB | true | 2,905 / 6,330 |
 
 Both long readers stayed alive and read their original values; (c) was
-never aborted (no snapshot-too-old exists in the arm).
+never aborted (no snapshot-too-old exists in the arm), and its
+in-memory undo stayed at the configured 64 MiB budget with the spill
+file taking the rest.
 
 ### W6 — one txn UPDATEs 10M keys
 
-| arm | fill s | commit s | write-set B @commit | lock entries | escalations | head-of-line p50/p99 | RSS |
-|---|---:|---:|---:|---:|---:|---|---:|
-| (b) | 29.2 | 20.9 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 18.16 / 18.16 s | 13.8 GiB |
-| (c) | 20.5 | 23.8 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.0 / 21.50 s | 11.4 GiB |
+Re-measured at `c39656fd` with the corrected 786,432-frame (6 GiB)
+pool: arm (b)'s post-commit tree measured 5,318,975,488–5,323,743,232 B
+= 649,044–649,626 pages, which the old 393,216-frame (3 GiB) pool made
+(b) evict through its fill and commit (the gate's defect 1); it now
+fits with ~20% headroom (`after_stats.tree_bytes ≤ pool` in every
+run). Identically sized on both arms.
+
+| arm | fill s | commit s | write-set B @commit | lock entries | escalations | HOL p50/p99 (delayed n) | apply-window txns | RSS |
+|---|---:|---:|---:|---:|---:|---|---:|---:|
+| (b) | 28.2 | 20.4 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.6 ms / 17.94 s (n=18) | 325,680 | 17.2 GiB |
+| (c) | 19.8 | 23.3 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.1 ms / 21.16 s (n=9) | 437,257 | 14.8 GiB |
+
+**Head-of-line sample counts** (gate rework defect 1): the p50/p99 are
+over the *delayed* apply-window probe txns only — a median of 18 (b)
+and 9 (c) samples per run (min/max 4–32 (b), 4–18 (c)); at those counts
+the nearest-rank p99 **is the maximum**, so read p99 as "the longest
+observed 1-row-txn delay", not a tail estimate. The delayed few wait
+out essentially the whole big commit (17.94 s vs a 20.4 s commit on
+(b); 21.16 s vs 23.3 s on (c)); arrivals during the fill wait up to
+48.4 s (b) / 42.7 s (c) (`locks_window_max_delayed_ns`, 2 delayed txns
+each run). Hundreds of thousands of 1-row txns slip through the
+O(10M)-key release tail (`apply_slipped_txns` medians: 325,676 (b) /
+437,253 (c)) — the release is not free, which S-2's design should
+account for. Arm (c)'s undo for the big txn sits at its 64 MiB in-memory
+budget with ~1.35 GiB spilled to the spill file; arm (b) carries both
+versions in the tree (20.3–20.5M versions after the commit on both
+arms).
 
 Both arms crossed the lock table's 1M-row escalation budget exactly
 once and replaced their rows with the table-wide owner (`lock_entries`
-reads 1 at commit). A 1-row txn arriving during the big commit waits out
-essentially the whole commit (head-of-line p99 ≈ commit time on both
-arms); arrivals during the fill wait up to 49.8 s (b) / 43.0 s (c).
-Hundreds of thousands of 1-row txns slip through the O(10M) release
-tail (`apply_slipped_txns`: 312,661 (b) / 480,904 (c)) — the release is
-not free, which S-2's design should account for.
+reads 1 at commit).
+
+## What the gate rework changed (verdict 2026-10-22, REWORK)
+
+1. **W5/W6 pools (defect 1).** The old pools were exactly full for arm
+   (b) — W5's tree hit 65,489 of 65,536 frames, W6's 649,843 of
+   393,216 — so (b) evicted inside its measured phase while (c) fit,
+   and this README wrongly described the W6 pool as "~300k pages". The
+   pools are now sized over (b)'s measured peaks (W5: 131,072 frames =
+   2×; W6: 786,432 frames ≈ 1.2×), identical on both arms, and every
+   re-measured run shows `tree_bytes ≤ pool`. W5 and W6 were re-run in
+   full (3 runs, medians above).
+2. **Measurement-integrity guards (defect 2).** The arm factories moved
+   into the library (`src/engines.rs`) forwarding the workload's pool
+   and the shared config verbatim; the B-ABORT decision became
+   `verify::{check_arm, report, report_passed}`; and
+   `tests/measurement_integrity.rs` pins the five mutants the gate
+   found uncaught: SEED-PER-ARM (two engine types through `w1::run` /
+   `w2::run` must issue identical op streams), POOL-PER-ARM (pool 1
+   must still build a working engine; the undo budget must not spill
+   below its configured size), VERIFY-BYPASS (a deliberately broken
+   engine must fail the decision), W5-ALIVE-OFF (a lying reader must
+   be reported dead) and CPU-WINDOW-INCLUDES-PRELOAD (W1's CPU window
+   covers the worker loop only). All five were applied, failed their
+   named test, and were reverted.
+3. **Arm (a)'s stream (defect 3).** The adapter re-seeded its RNG from
+   the stream's first word, so its key stream differed from (b)/(c)'s
+   while A-SAME claimed otherwise. It now consumes the same
+   `rng_for(W1, run, tid, 0)` stream and the same value derivation as
+   `w1`; the (a) column was re-measured (it moved ≤ 5%).
+
+W1 (b/c), W2 and W3/W4 were **not** re-run: their method, seeds and
+configurations are unchanged, and the gate re-measured them within ~8%
+at the original commit.
 
 ## Decision rule (PLAN-v3 §4 E1′, applied verbatim)
 
@@ -215,8 +306,8 @@ not free, which S-2's design should account for.
 Applied to the medians above:
 
 1. **"(c) passes every test"** — met: `e1_mvcc::suite::run_all` passed
-   on both arms in this binary before the campaign (verified in the
-   same process family), and every workload verified its invariants
+   on both arms in this binary before every campaign group (each JSON's
+   `verify` block), and every workload verified its invariants
    (`values_verified`, `reader_reads_original_values`, zero writer
    errors).
 2. **"beats (b) by ≥ 2× CPU per txn on single-row writes"** — NOT met:
@@ -231,10 +322,12 @@ Applied to the medians above:
 4. **"its undo spill keeps long readers alive with RSS within the N16
    budget"** — long readers: alive on (c), reading original values, no
    aborts; (c)'s in-memory undo stayed at its configured 64 MiB budget
-   with 226 MiB spilled, peak RSS 1,080 MiB (vs (b) 1,356 MiB). N16's
-   numeric budget is not yet fixed anywhere (it is card R-1's deliverable),
-   so "within the N16 budget" can only be checked against the undo
-   budget the card names (64 MiB) — met. Judgment call, flagged for X-4.
+   with 226 MiB spilled, peak RSS 1,594 MiB (vs (b) 1,874 MiB — both
+   re-measured on the corrected no-eviction pools, each preallocating
+   what its workload's pool sizes). N16's numeric budget is not yet
+   fixed anywhere (it is card R-1's deliverable), so "within the N16
+   budget" can only be checked against the undo budget the card names
+   (64 MiB) — met. Judgment call, flagged for X-4.
 
 Clause 2 fails and clause 3 fails, so the conjunction fails regardless
 of clause 4. **The rule's "Otherwise" branch decides: pick (b).**
