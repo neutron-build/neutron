@@ -1,87 +1,92 @@
 Card: X-1b
 Class: experiment
 Card-gate: P
-Verdict: REWORK
+Verdict: MERGE-WITH-FOLLOWUPS
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: claude-code review subagent, session 4e4af138-9125-4ec2-a2dc-5e9703cef3b4
-Date: 2026-10-22
+Gate-session: claude-code review subagent, session eb46019c-ae4f-48fa-84e7-b3d72b1d4ce6
+Date: 2026-10-23
 Gate-exit: GATE EXIT=0
-Commit: 4c1f0f86
-Mutants: SEED-PER-ARM (W1 rng salted by type_name::<E>()) -> UNCAUGHT, POOL-PER-ARM (make_c gets pool/4) -> UNCAUGHT, VERIFY-BYPASS (arm_c_passed forced true) -> UNCAUGHT, PCTL-OFF-BY-ONE (idx = rank, not rank-1) -> util::tests::percentiles_are_nearest_rank, W5-ALIVE-OFF (original never set false) -> UNCAUGHT, CPU-WINDOW-INCLUDES-PRELOAD (W1 cpu0 taken before make+preload) -> UNCAUGHT
-Followups: none
+Commit: 79886d0a
+Mutants: SEED-PER-ARM-W1 (rng salted by type_name::<E>()) -> w1_put_streams_are_identical_across_engine_types, SEED-PER-ARM-W2 (same, W2 reader) -> w2_reader_and_writer_streams_are_identical_across_engine_types, POOL-PER-ARM (make_c gets pool/4) -> factories_forward_their_pool_verbatim, VERIFY-BYPASS (report's arm_c_passed forced true) -> verify::tests::report_passed_requires_both_arms + verification_fails_a_broken_engine, W5-ALIVE-OFF (original never set false) -> w5_flags_a_reader_that_reads_wrong_values, W6-POOL-OLD (pool_frames_big back to 393,216) -> tests::w5_and_w6_pools_cover_arm_b_peak_trees_with_headroom, UNDO-BUDGET-HALF (make_c gets budget/2) -> arm_c_factory_forwards_the_undo_budget, SEED-BY-NAME (W1 rng salted by e.name().len()) -> UNCAUGHT, POOL-3/4 (make_c gets pool - pool/4) -> UNCAUGHT, VERIFY-BYPASS-RUN (verify::run replaces arm c's check with a pass) -> UNCAUGHT, W5-POOL-SHARED (w5 builds with cfg.pool_frames) -> UNCAUGHT, ARMA-RESEED (arm (a) re-seeds from the stream's first word) -> UNCAUGHT
+Followups: X-1b-F1, X-1b-F2
 
-## Findings
+## Findings (round 2, rework of verdict 7421fb37)
 
-**Gate run.** Every step EXIT=0, ending in `GATE EXIT=0`, on 4c1f0f86 with
-`CARGO_TARGET_DIR=~/.cache/nv3-target/gate-X-1b`.
+**Gate run.** `GATE EXIT=0` on 79886d0a (every step EXIT=0). Scope: the
+diff against `nucleus/v3-scaffold` touches only `nucleus/v3/spikes/e1-bench/`
+plus this file. No protected path, no `unsafe`, no non-test
+unwrap/expect/panic, and the pub items have docs. Every mutant was
+reverted, and `git status` was clean before this file was written.
 
-**Scope.** `git diff nucleus/v3-scaffold...HEAD --stat`: 15 files, all under
-`nucleus/v3/spikes/e1-bench/` (the workspace glob `spikes/*` picks the crate
-up; `Cargo.lock` is gitignored). No protected path is touched. There is no
-non-test `unwrap`/`expect`/`panic` and no `unsafe`. The pub items have docs.
-The measured commit is d28582e8; the only change after it (to 4c1f0f86) is
-the README.
+**Rework checklist.**
+1. W6 pool: met. It is 786,432 frames (6 GiB) on both arms. In the gate's
+   re-run, (b)'s post-commit tree peaked at 5,323,661,312 B (82.6% of the
+   pool) and (c)'s at 2,745,434,112 B (42.6%). W5 is 131,072 frames, and
+   (b) peaked at 50.0% of it. W5 and W6 were re-measured. The README now
+   states the head-of-line sample counts and says that p99 equals the max.
+2. Integrity tests: met for every round-1 mutant. The recording `Sim<TAG>`
+   engines run through `w1::run`/`w2::run`. A broken engine (its commit
+   always fails) runs through `check_arm`/`report_passed`. A lying engine
+   runs through W5. All four round-1 mutants, re-applied by the gate, fail
+   a named test. The guards are partial (see F1).
+3. Arm (a): met. The code now consumes `rng_for(W_W1, run, tid, 0)` and
+   `w1`'s value derivation, so the comment is true.
+4. W1/W2/W3 method and the decision-rule text are unchanged: `w1.rs`,
+   `w2.rs` and `w3.rs` have no diff since 7421fb37, the only `w5.rs`
+   change is the pool, and the rule quote is identical.
 
-**Fairness review (B-SAME).** Arms (b) and (c) run the same generic
-workload code with one `Config`. The seeds are derived from
-(workload, run, thread, purpose) only. Pages, pools, thread counts and the
-64 MiB undo budget are identical. Every configuration gets a fresh engine
-and preload, and the CPU window excludes the preload. Within a process,
-(b) always runs before (c); the gate re-ran W1 as separate processes in
-the order c then b and saw no order effect (t=16: c 117.3, b 71.6 µs).
-
-**Re-measurement.** Quiet host (load1 < 4 before each run), same binary
-built in release, 3 runs each, medians. Gate vs RESULT:
+**Re-measurement.** Same release binary, quiet host (load1 ≤ 3.0),
+3 runs each, medians. Gate vs RESULT:
 
 | metric | (b) gate / RESULT | (c) gate / RESULT |
 |---|---|---|
-| W1 CPU µs/txn t=1/4/8/16 | 4.0/8.7/15.7/67.3 vs 4.0/9.4/15.7/69.1 | 3.7/8.0/19.6/117.4 vs 3.8/7.9/19.5/117.0 |
-| W2 reader ops/s w=0/10/100 | 729k/56.4k/5.77k vs 767k/53.9k/5.73k | 953k/74.5k/6.37k vs 905k/74.4k/6.44k |
-| W2 p50 / p99 at w=100 (µs) | 1486 / 2271 vs 1518 / 2352 | 622 / 3775 vs 665 / 3668 |
-| W3 p50 latest / old (µs) | 88.3/88.2 vs 88.0/87.6 | 10.5/144.9 vs 10.7/146.2 |
-| W4 tree/logical after GC | 20.11 vs 20.11 | 2.54 vs 2.54 |
-| W5 peak RSS; reads originals | 1356 MiB; yes vs same | 1075 MiB; yes vs 1080 MiB; yes |
+| W6 fill / commit s | 28.0/20.4 vs 28.2/20.4 | 19.5/23.3 vs 19.8/23.3 |
+| W6 HOL p99 (= max) s | 17.73 vs 17.94 | 21.08 vs 21.16 |
+| W6 delayed n (min–max) | 14 (11–15) vs 18 (4–32) | 4 (4–10) vs 9 (4–18) |
+| W6 write-set / locks / escalations | 1.17e9 / 1 / 1, same | same |
+| W5 peak tree B | 536,412,160 vs 536,436,736 | 274,546,688, same |
+| W5 peak RSS MiB | 1,874 vs 1,874 | 1,728 vs 1,594 |
+| W5 originals / get p50 ns | yes / 2,507 vs yes / 2,531 | yes / 2,948 vs yes / 2,905 |
+| W1(a) CPU µs t=1/4/8/16 | 53.7/66.6/112.6/133.4 vs 55.7/76.6/108.1/137.1 | n/a |
 
-Every cell is within about 8%. In both measurements, (c)/(b) on W1 never
-reaches 2×. W2 throughput is 1.11–1.38× (c)/(b). The p50 at w=100 does
-cross 2× (2.39× in the gate's run, 2.28× in the RESULT). The worker read
-the rule's "≥ 2× on reads under writers" as a workload-level win and
-flagged that reading. The rule's wording does not settle it, so it is
-X-4's call; the gate did not change it. Whether "RSS within the N16
-budget" is met cannot be judged until R-1 sets a number; that is also
-flagged for X-4. Nothing was tuned.
+The headline numbers reproduce within about 2%. Three cells are noisier:
+- W5 (c) RSS is +8%: the gate's runs 2 and 3 came in at 1,770 MiB.
+- W1(a) at t=4 is −13%. Arm (a) is reference only.
+- **W6 head-of-line p50 is not reproducible.** The delayed set is bimodal
+  (about 2–5 ms, or about the whole commit). The gate's medians are
+  182 ms (b) and 20.8 s (c), against the README's 4.6 ms and 4.1 ms. Only
+  p99/max is stable.
 
-**Defects (REWORK):**
+The decision is unaffected: W1 and W2 drive it, the rule gives
+"Otherwise: pick (b)", and both flagged readings remain X-4's call.
 
-1. **The W6 pool is too small for arm (b), and the README says it is
-   not.** After the big commit, (b)'s tree is 5,323,112,448 B, about 650k
-   pages. The shared W6 pool is 393,216 frames = 3,221,225,472 B. So (b)
-   evicts during the fill and commit, while (c)'s 2.75 GB tree fits. The
-   card's default is "pool large enough for the data unless stated
-   otherwise", and this is not stated. The README claims a "~300k-page
-   tree" for W6, and for W5 "~45k pages — no eviction". In fact (b)'s W5
-   tree is 536,469,504 B, 99.9% of its 536,870,912 B pool. W6's commit
-   time and head-of-line delay feed §3.12's pre-apply trigger, and (b) is
-   the arm the RESULT picks.
-   - **Fix:** size the W6 pool, identically for both arms, to hold (b)'s
-     post-commit tree. The host has 38 GiB, so this fits. Give W5 real
-     headroom, re-run W5 and W6, and correct the README.
-   - **Also:** state the head-of-line sample count. The p99 is taken over
-     5 txns for (b) and 16 for (c), so it is in effect the max.
-2. **Nothing guards measurement integrity.** SEED-PER-ARM and POOL-PER-ARM
-   both pass every test, so one arm can be handed a different key stream
-   or configuration silently.
-   - **Fix:** add a test that fails when the arms' W1/W2 key streams or
-     engine configurations differ (for example, a recording `TxnEngine`
-     wrapper driven through `w1::run`/`w2::run` for both arm types).
-   - **Also:** cover the B-ABORT decision (VERIFY-BYPASS) and W5-ALIVE
-     with a deliberately broken engine.
-3. **Arm (a)'s seeds do not match its documentation.** A-SAME says arm (a)
-   uses "the same seeds", but it draws keys from
-   `Rng::new(rng_for(..).next_u64())` and derives values differently. Its
-   key stream therefore differs from (b)/(c)'s. This is reference only and
-   statistically equivalent, but either fix the code or fix the doc.
+**Non-blocking defects.**
+- The README's W6 RSS uses mixed units. KiB/1,024,000 is labelled GiB:
+  17.2 should read 16.8 GiB, and 14.8 should read 14.4 GiB.
+- The README's "65,489 pages = 536,436,736 B" should be 65,483.
+- In `measurement_integrity.rs`, `heavy_gate()` unwraps a poisonable
+  mutex, so a single failure cascades into the CPU-window test.
 
-Do not change the W1/W2/W3/W5 method or the decision-rule text in the
-rework. These have been re-measured and are sound.
+## Follow-ups
+
+**X-1b-F1 (test, S): harden the measurement-integrity guards.** Five gate
+mutants survive the tests:
+- SEED-BY-NAME: give the `Sim` tags distinct `name()`s.
+- POOL-3/4: make the pool forwarding observable, for example a pool
+  accessor or a recording check at pool > 1, instead of relying on 1→0.
+- VERIFY-BYPASS-RUN: smoke-test `verify::run` on the real arms, and test
+  main's abort path, for example by running the binary under a
+  broken-arm feature.
+- W5-POOL-SHARED, and the analogous W6 case: assert that each workload
+  calls its factory with its named pool.
+- ARMA-RESEED: add an arm (a) stream-parity test.
+
+Make `heavy_gate` poison-tolerant. Touch only
+`spikes/e1-bench/tests/` and test modules.
+
+**X-1b-F2 (mechanical, S): correct the README.** Fix the W6 RSS units
+(16.8 / 14.4 GiB) and the W5 page arithmetic. Mark the W6 head-of-line
+p50 as unstable: it is bimodal over n = 4–32 and the gate's re-run gave
+182 ms / 20.8 s, so X-4 should read only p99/max (≈ commit time). Note
+the W5 (c) RSS spread (1,592–1,770 MiB).
