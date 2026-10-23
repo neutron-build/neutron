@@ -83,11 +83,11 @@ pub struct Config {
     pub pool_frames: usize,
     /// Buffer-pool frames for W5 (1M preloaded keys grown to ~3M versions
     /// under a held snapshot). Sized to 2× arm (b)'s measured peak tree
-    /// (65,489 pages at the old, exactly-full 65,536-frame pool), so
+    /// (65,487 pages at the old, exactly-full 65,536-frame pool), so
     /// neither arm evicts during the measured phase.
     pub pool_frames_w5: usize,
     /// Buffer-pool frames for W6's 10M-key tree. Sized over arm (b)'s
-    /// measured post-commit tree (5,323,112,448 B ≈ 649,843 pages) plus
+    /// measured post-commit tree (5,323,112,448 B ≈ 649,794 pages) plus
     /// the probe-written versions with ~20% headroom, so neither arm
     /// evicts during the fill, the big commit or the release tail.
     pub pool_frames_big: usize,
@@ -155,11 +155,11 @@ impl Config {
             pool_frames: 65_536,
             // W5's tree cannot GC (one RR snapshot is held throughout),
             // so it grows to one version per update: arm (b) peaked at
-            // 65,489 pages = 536,469,504 B (gate measurement), exactly
+            // 65,487 pages = 536,469,504 B (gate measurement), exactly
             // filling the old 65,536-frame pool. 2× that, 1 GiB.
             pool_frames_w5: 131_072,
             // W6: arm (b)'s tree after the 10M-row UPDATE measured
-            // 5,323,112,448 B ≈ 649,843 pages (both versions resident;
+            // 5,323,112,448 B ≈ 649,794 pages (both versions resident;
             // no GC ran during the commit), plus the 1-row probe writes
             // of the release tail. 786,432 frames = 6 GiB holds both
             // with ~20% headroom (gate rework defect 1).
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn w5_and_w6_pools_cover_arm_b_peak_trees_with_headroom() {
         let f = Config::full();
-        // (b)'s measured W5 peak tree: 536,469,504 B = 65,489 pages.
+        // (b)'s measured W5 peak tree: 536,469,504 B = 65,487 pages.
         let w5_pages = 536_469_504 / f.page_size as u64;
         assert!(
             f.pool_frames_w5 as u64 >= w5_pages * 2,
@@ -273,7 +273,7 @@ mod tests {
             f.pool_frames_w5,
             w5_pages
         );
-        // (b)'s measured post-commit W6 tree: 5,323,112,448 B ≈ 649,843
+        // (b)'s measured post-commit W6 tree: 5,323,112,448 B ≈ 649,794
         // pages, plus the release tail's probe versions.
         let w6_pages = 5_323_112_448 / f.page_size as u64;
         assert!(
