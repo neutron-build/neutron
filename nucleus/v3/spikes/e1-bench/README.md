@@ -64,10 +64,10 @@ one JSON document on stdout (hand-rolled writer, no serde).
 - Pool sizes: the E0 pool **preallocates** `frames × page_size` bytes.
   65,536 frames (512 MiB) for the W1/W2/W3+W4 workloads (a 1M-version
   tree is ~15k pages); **131,072 frames (1 GiB) for W5** — 2× arm (b)'s
-  measured peak tree of 65,489 pages (536,469,504 B), which the gate
+  measured peak tree of 65,487 pages (536,469,504 B), which the gate
   found exactly filling the old 65,536-frame pool; and **786,432 frames
   (6 GiB) for W6** — ≥ 1.2× arm (b)'s measured post-commit tree of
-  5,323,112,448 B ≈ 649,843 pages, which the old 393,216-frame pool
+  5,323,112,448 B ≈ 649,794 pages, which the old 393,216-frame pool
   made (b) evict through (the gate's rework defect 1; the README
   previously — and wrongly — called that pool "~300k pages"). Identical
   on both arms. `--quick` scales the pools down with the data (÷100),
@@ -164,8 +164,11 @@ commit.
 100k txns/thread per configuration (the mix is the card's; the count is
 the driver's, chosen for wall-clock budget — see `Config`). Arm (a)
 re-measured at `c39656fd` after the stream-parity fix (defect 3); the
-reference numbers moved ≤ 5%, consistent with the gate's "statistically
-equivalent" reading of the old stream.
+reference numbers moved ≤ 5% on five of eight cells and at most ±16% on
+the rest (CPU/txn −10% at t=8, txns/s ±15% at t=4/8) — within the
+run-to-run spread the gate measured on this reference arm (−13% at
+t=4), and consistent with its "statistically equivalent" reading of the
+old stream.
 
 | threads | (a) v2 CPU/txn | (b) CPU/txn | (c) CPU/txn | (a) txns/s | (b) txns/s | (c) txns/s | (b) B/txn | (c) B/txn |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -178,7 +181,8 @@ equivalent" reading of the old stream.
 code path is unchanged by the rework.) (a) has no applied-bytes counter
 (null in the JSON). (b) counts encoded tree entries (~124 B), (c)
 logical key+value (108 B) — see the notes above. Both spike arms are
-12–30× lighter on CPU than v2 today.
+lighter on CPU than v2 today — 13.9× (b) / 14.7× (c) at 1 thread,
+falling to 2.0× (b) / 1.2× (c) at 16 threads.
 
 ### W2 — reads under writers (8 readers; ns/op p50/p99; reader ops/s)
 
@@ -214,7 +218,7 @@ end at their pre-update page counts plus the newest-version bytes.
 ### W5 — long reader under 4 writers × 2M updates (64 MiB undo budget on (c))
 
 Re-measured at `c39656fd` with the corrected 131,072-frame (1 GiB)
-pool: (b)'s peak tree is 65,489 pages = 536,436,736 B — it exactly
+pool: (b)'s peak tree is 65,483 pages = 536,436,736 B — it exactly
 filled (and evicted inside) the old 512 MiB pool, and now fits with 2×
 headroom (`peak_tree_bytes ≤ pool` in every run). RSS grew by the
 larger preallocated pool (+512 MiB on (b), +512 MiB on (c)).
@@ -233,21 +237,28 @@ file taking the rest.
 
 Re-measured at `c39656fd` with the corrected 786,432-frame (6 GiB)
 pool: arm (b)'s post-commit tree measured 5,318,975,488–5,323,743,232 B
-= 649,044–649,626 pages, which the old 393,216-frame (3 GiB) pool made
+= 649,289–649,871 pages, which the old 393,216-frame (3 GiB) pool made
 (b) evict through its fill and commit (the gate's defect 1); it now
 fits with ~20% headroom (`after_stats.tree_bytes ≤ pool` in every
 run). Identically sized on both arms.
 
 | arm | fill s | commit s | write-set B @commit | lock entries | escalations | HOL p50/p99 (delayed n) | apply-window txns | RSS |
 |---|---:|---:|---:|---:|---:|---|---:|---:|
-| (b) | 28.2 | 20.4 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.6 ms / 17.94 s (n=18) | 325,680 | 17.2 GiB |
-| (c) | 19.8 | 23.3 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.1 ms / 21.16 s (n=9) | 437,257 | 14.8 GiB |
+| (b) | 28.2 | 20.4 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.6 ms (unstable — see below) / 17.94 s (n=18) | 325,680 | 16.8 GiB |
+| (c) | 19.8 | 23.3 | 1,170,000,000 (117 B/key) | 1 | 1 (of 1 attempt) | 4.1 ms (unstable — see below) / 21.16 s (n=9) | 437,257 | 14.4 GiB |
 
 **Head-of-line sample counts** (gate rework defect 1): the p50/p99 are
 over the *delayed* apply-window probe txns only — a median of 18 (b)
 and 9 (c) samples per run (min/max 4–32 (b), 4–18 (c)); at those counts
 the nearest-rank p99 **is the maximum**, so read p99 as "the longest
-observed 1-row-txn delay", not a tail estimate. The delayed few wait
+observed 1-row-txn delay", not a tail estimate. **The p50 does not
+reproduce: it is bimodal** — the delayed samples sit either at a few ms
+or at about the whole big commit — over those sample counts (delayed n:
+min–max 4–32 (b), 4–18 (c) per run), so the median lands on whichever
+mode a run's handful of samples favours: the round-2 gate re-run's p50
+medians were 182 ms (b) and 20.8 s (c) against this campaign's 4.6 ms
+and 4.1 ms. Only the p99 (= max, ≈ one commit time) is stable; read
+p99/max only. The delayed few wait
 out essentially the whole big commit (17.94 s vs a 20.4 s commit on
 (b); 21.16 s vs 23.3 s on (c)); arrivals during the fill wait up to
 48.4 s (b) / 42.7 s (c) (`locks_window_max_delayed_ns`, 2 delayed txns
@@ -266,7 +277,7 @@ reads 1 at commit).
 ## What the gate rework changed (verdict 2026-10-22, REWORK)
 
 1. **W5/W6 pools (defect 1).** The old pools were exactly full for arm
-   (b) — W5's tree hit 65,489 of 65,536 frames, W6's 649,843 of
+   (b) — W5's tree hit 65,487 of 65,536 frames, W6's 649,794 of
    393,216 — so (b) evicted inside its measured phase while (c) fit,
    and this README wrongly described the W6 pool as "~300k pages". The
    pools are now sized over (b)'s measured peaks (W5: 131,072 frames =
@@ -290,7 +301,8 @@ reads 1 at commit).
    the stream's first word, so its key stream differed from (b)/(c)'s
    while A-SAME claimed otherwise. It now consumes the same
    `rng_for(W1, run, tid, 0)` stream and the same value derivation as
-   `w1`; the (a) column was re-measured (it moved ≤ 5%).
+   `w1`; the (a) column was re-measured (it moved ≤ 5% on five of eight
+   cells, at most ±16%).
 
 W1 (b/c), W2 and W3/W4 were **not** re-run: their method, seeds and
 configurations are unchanged, and the gate re-measured them within ~8%
