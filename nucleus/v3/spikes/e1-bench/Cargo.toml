@@ -1,0 +1,29 @@
+# E1′ measurement driver (card X-1b; PLAN-v3 §4 E1′). Not production
+# code: this spike drives arms (b) and (c) (and the v2 reference for the
+# single-row mix) under identical workloads and reports the numbers the
+# §4 E1′ decision rule consumes.
+[package]
+name = "e1-bench"
+description = "E1′ measurement driver (card X-1b): W1–W6 over arms (a), (b), (c)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+e0-btree = { path = "../e0-btree" }
+e1-mvcc = { path = "../e1-mvcc" }
+e1-arm-b = { path = "../e1-arm-b" }
+e1-arm-c = { path = "../e1-arm-c" }
+# Arm (a) is v2 today on MemKv (card Read: nucleus-txn / nucleus-kv by
+# path, `mem` feature on nucleus-kv).
+nucleus-txn = { path = "../../../v2/crates/nucleus-txn" }
+nucleus-kv = { path = "../../../v2/crates/nucleus-kv", features = ["mem"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "e1-bench"
+path = "src/main.rs"
