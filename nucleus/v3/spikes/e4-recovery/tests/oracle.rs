@@ -2,7 +2,10 @@
 //! P-written, binding: synthetic histories and recovered states, with no
 //! store. Six cases must pass, seventeen must fail, and the five
 //! instrumentation removals must each be load-bearing (the removed check
-//! lets a previously failing case pass).
+//! lets a previously failing case pass). Plus the gate REWORK (2026-10-23)
+//! additions: must-fail 18 (the (ii) completeness half) and 19 (a missing
+//! twin fails closed), and the pinned model and MISDIRECTED-landing-slot
+//! fixes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -839,6 +842,161 @@ fn mf17_ii_finding_outside_tainted_and_r_fails() {
             .contains("(ii) reported slot 12"),
         "got {:?}",
         v.o3_fail
+    );
+}
+
+/// Must fail (18, gate REWORK item 4): amcheck (ii) ran, a slot in
+/// `tainted_image_slots_ii` is not reported, everything else passes — the
+/// (ii) **completeness** half is load-bearing (the gate's G2 mutant was
+/// UNCAUGHT at verdict time).
+#[test]
+fn mf18_ii_missed_detection_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    // Amcheck (i) reports everything it must; amcheck (ii) ran and
+    // reported nothing at all.
+    ex.amcheck_ii.clear();
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "a fully missed (ii) detection must fail");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("(ii) tainted referenced slot 5 not reported"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must fail (19, gate REWORK item 5): an MP/MW round with XX001 and **no
+/// twin** is a harness defect — O-3 (c) fails closed, never open.
+#[test]
+fn mf19_missing_twin_fails() {
+    // MP: recovery failed with XX001 at open, no twin supplied.
+    let (m, mut s, mut ex, faults, _twin) = rollback_world(1);
+    ex.ok = false;
+    ex.xx001 = vec![XxSite::Open];
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, None);
+    assert!(!v.pass, "a missing twin must fail an MP round with XX001");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): MP/MW round with XX001 and no twin"),
+        "got {:?}",
+        v.o3_fail
+    );
+    // MW too (XX001 with no twin, no media faults at all).
+    let (m, mut s, mut ex, _faults, _twin) = rollback_world(1);
+    ex.ok = false;
+    ex.xx001 = vec![XxSite::Replay];
+    let v = run(
+        &m,
+        FaultClass::Mw,
+        &mut s,
+        &ex,
+        &FaultTargets::default(),
+        None,
+    );
+    assert!(!v.pass, "a missing twin must fail an MW round with XX001");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): MP/MW round with XX001 and no twin"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Gate REWORK item 3 (pinned): a load's entries are versions at `S_L` —
+/// a later Put on a loaded key wins at every `S ≥` the Put, and the load
+/// shows between `S_L` and the Put. The run-1 model applied load entries
+/// after all commit ops, so it agreed with a store that silently lost
+/// post-load updates.
+#[test]
+fn model_load_entries_are_versions_at_s_l() {
+    let mut m = base_model();
+    // Load tree 7's key "k" at S_L = 5 (before the publish at 10), then
+    // overwrite it with a logged Put at 20.
+    m.load(7, 5, vec![(b"k".to_vec(), b"loaded".to_vec())]);
+    m.commit(
+        20,
+        Mode::SyncOn,
+        vec![Op::Put {
+            tree: 7,
+            key: b"k".to_vec(),
+            value: b"put".to_vec(),
+        }],
+    );
+    m.mark_acked(20);
+    // Above the Put (the gate's probe): the Put wins, not the load.
+    let s30 = m.scan(7, 30);
+    assert_eq!(
+        s30.get(b"k".as_slice()),
+        Some(&Some(b"put".to_vec())),
+        "a Put at ts > S_L must beat the load entry"
+    );
+    // Between S_L and the Put: the load shows.
+    let s15 = m.scan(7, 15);
+    assert_eq!(s15.get(b"k".as_slice()), Some(&Some(b"loaded".to_vec())));
+    // Below S_L: nothing.
+    assert!(!m.scan(7, 3).contains_key(b"k".as_slice()));
+    // And a Delete at ts > S_L wins the same way.
+    let mut m2 = base_model();
+    m2.load(7, 5, vec![(b"k".to_vec(), b"loaded".to_vec())]);
+    m2.commit(
+        20,
+        Mode::SyncOn,
+        vec![Op::Delete {
+            tree: 7,
+            key: b"k".to_vec(),
+        }],
+    );
+    m2.mark_acked(20);
+    assert_eq!(m2.scan(7, 30).get(b"k".as_slice()), Some(&None));
+}
+
+/// Gate REWORK item 6b (pinned): a MISDIRECTED page fault targets its
+/// **landing slot** as well as its source — O-3 (c) must not call a
+/// detection caused by the stray bytes landing on a referenced slot a
+/// false positive.
+#[test]
+fn misdirected_landing_slot_is_a_fault_target() {
+    let fault = MediaFault {
+        inode: 0,
+        off: 3 * 4096,
+        len: 4096,
+        bytes: vec![1u8; 4096],
+        pre: vec![0u8; 4096],
+        kind: MediaKind::Misdirected { to_off: 5 * 4096 },
+    };
+    // The mapping itself: both the source and the landing slot.
+    let targets = FaultTargets::collect(&[fault.clone()], 0);
+    assert!(targets.page_slots.contains(&3), "the source slot targets");
+    assert!(
+        targets.page_slots.contains(&5),
+        "the landing slot targets too"
+    );
+    // And the O-3 (c) consequence: XX001 whose only fault's stray bytes
+    // land on a slot the twin's image references is not a false positive.
+    let m = base_model();
+    let mut s = state_at(&m, 10);
+    let mut ex = ex_for(&s, 10, &m);
+    ex.ok = false; // recovery failed with XX001 at open
+    ex.xx001 = vec![XxSite::Open];
+    let faults = FaultTargets::collect(&[fault], 0);
+    let mut image = BTreeSet::new();
+    image.insert(5u64);
+    let twin = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![],
+        image_slots: image,
+    };
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "the landing slot explains the detection, not a false positive: {:?}",
+        v
     );
 }
 

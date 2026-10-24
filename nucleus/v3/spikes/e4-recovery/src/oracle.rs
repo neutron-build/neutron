@@ -28,16 +28,20 @@
 //!   MP or MW, and counts as detection there; (c) in MP and MW, XX001 is a
 //!   false positive (a failure) if every media fault in the round targeted
 //!   a slot (or WAL range) that the twin run (2.5) shows was not read by
-//!   recovery and not referenced by the opened image; (d) in MP and MW, if
-//!   `res` is `Ok` and no XX001 occurred, O-1 and O-2 must hold in full
-//!   (silent damage is a failure); (e) in MP, amcheck (i)/(ii) must report
-//!   XX001 for every tainted slot the opened image references, and only
-//!   for those (X5-R2) — with exactly one exception, ruling X5-R5 (Work
-//!   2.7/2.8): findings may additionally name slots of the
-//!   harness-computed set `R` ([`Extracted::rollback_slots`]) when the
-//!   class is MP, the round's fault list has a page fault on meta slot
-//!   1 or 2 (condition 1, which the oracle checks itself, from the fault
-//!   list) and [`Extracted::meta_rollback`] holds (condition 2,
+//!   recovery and not referenced by the opened image — a MISDIRECTED
+//!   fault targets both its source and its landing slot (gate REWORK item
+//!   6b), and a missing twin in an MP/MW round that has XX001 is a
+//!   harness defect that fails the round, never an open pass (gate REWORK
+//!   item 5); (d) in MP and MW, if `res` is `Ok` and no XX001 occurred,
+//!   O-1 and O-2 must hold in full (silent damage is a failure); (e) in
+//!   MP, amcheck (i)/(ii) must report XX001 for every tainted slot the
+//!   opened image references, and only for those (X5-R2) — with exactly
+//!   one exception, ruling X5-R5 (Work 2.7/2.8): findings may
+//!   additionally name slots of the harness-computed set `R`
+//!   ([`Extracted::rollback_slots`]) when the class is MP, the round's
+//!   fault list has a page fault on meta slot 1 or 2 (condition 1, which
+//!   the oracle checks itself, from the fault list) and
+//!   [`Extracted::meta_rollback`] holds (condition 2,
 //!   harness-computed). A `rollback_slots` that is not a subset of the
 //!   image's untainted referenced slots fails the round with
 //!   `O-3(e): harness R set malformed` (the structural guard: a harness
@@ -219,7 +223,8 @@ pub struct OracleCfg {
 /// for O-3 (c), plus X5-R5's condition 1.
 #[derive(Debug, Clone, Default)]
 pub struct FaultTargets {
-    /// MP: page-file slots (`off / 4096`).
+    /// MP: page-file slots (`off / 4096`), including a MISDIRECTED
+    /// fault's landing slot (`to_off / 4096`, gate REWORK item 6b).
     pub page_slots: BTreeSet<u64>,
     /// MW: `(file, off, len)` WAL byte ranges.
     pub wal_ranges: Vec<(usize, u64, u64)>,
@@ -245,6 +250,15 @@ impl FaultTargets {
             if f.inode == page_file {
                 let slot = f.off / 4096;
                 page_slots.insert(slot);
+                // Gate REWORK item 6b: a MISDIRECTED fault also occupies
+                // its landing slot — the stray bytes are there, and a
+                // detection they cause on that referenced slot is not a
+                // false positive. (The `meta_slot_fault` doc below
+                // already counted the landing slot for condition 1; the
+                // O-3 (c) target set now matches it.)
+                if let MediaKind::Misdirected { to_off } = &f.kind {
+                    page_slots.insert(*to_off / 4096);
+                }
                 let on_meta = slot == 1
                     || slot == 2
                     || matches!(
@@ -390,40 +404,50 @@ pub fn check_round(
             detections = ex.xx001.clone();
         }
     }
-    if matches!(class, FaultClass::Mp | FaultClass::Mw)
-        && !ex.xx001.is_empty()
-        && !cfg.no_twin_rule
-        && let Some(t) = twin
+    if matches!(class, FaultClass::Mp | FaultClass::Mw) && !ex.xx001.is_empty() && !cfg.no_twin_rule
     {
         // O-3 (c): a false positive iff every media fault in the round
         // targeted a slot (or WAL range) that the twin shows was not read
-        // by recovery and not referenced by the opened image.
-        let mut any_fault = false;
-        let mut all_uncovered = true;
-        for slot in faults.page_slots.iter() {
-            any_fault = true;
-            let referenced = t.image_slots.contains(slot);
-            let read = t.recovery_reads.iter().any(|(f, off, len)| {
-                *f == t.page_file && *off < (slot + 1) * 4096 && off + len > slot * 4096
-            });
-            if referenced || read {
-                all_uncovered = false;
+        // by recovery and not referenced by the opened image. A missing
+        // twin in an MP/MW round that has XX001 is a harness defect and
+        // fails the round — the rule must never fail open (gate REWORK
+        // item 5; same principle as the R structural guard: a harness
+        // defect must never pass).
+        match twin {
+            Some(t) => {
+                let mut any_fault = false;
+                let mut all_uncovered = true;
+                for slot in faults.page_slots.iter() {
+                    any_fault = true;
+                    let referenced = t.image_slots.contains(slot);
+                    let read = t.recovery_reads.iter().any(|(f, off, len)| {
+                        *f == t.page_file && *off < (slot + 1) * 4096 && off + len > slot * 4096
+                    });
+                    if referenced || read {
+                        all_uncovered = false;
+                    }
+                }
+                for (f, off, len) in faults.wal_ranges.iter() {
+                    any_fault = true;
+                    let read = t
+                        .recovery_reads
+                        .iter()
+                        .any(|(rf, roff, rlen)| rf == f && *roff < off + len && roff + rlen > *off);
+                    if read {
+                        all_uncovered = false;
+                    }
+                }
+                if any_fault && all_uncovered {
+                    o3_fail = Some(
+                        "O-3(c): XX001 with every media fault on unread, unreferenced targets"
+                            .to_owned(),
+                    );
+                }
             }
-        }
-        for (f, off, len) in faults.wal_ranges.iter() {
-            any_fault = true;
-            let read = t
-                .recovery_reads
-                .iter()
-                .any(|(rf, roff, rlen)| rf == f && *roff < off + len && roff + rlen > *off);
-            if read {
-                all_uncovered = false;
+            None => {
+                o3_fail =
+                    Some("O-3(c): MP/MW round with XX001 and no twin (harness defect)".to_owned());
             }
-        }
-        if any_fault && all_uncovered {
-            o3_fail = Some(
-                "O-3(c): XX001 with every media fault on unread, unreferenced targets".to_owned(),
-            );
         }
     }
     if matches!(class, FaultClass::Mp | FaultClass::Mw) && ex.ok && ex.xx001.is_empty() {

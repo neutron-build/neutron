@@ -21,8 +21,11 @@
 //! Rounds: after round r recovers at `c_r`, the model is truncated to
 //! `c_r` — commits above it were never durable, and their ops disappear.
 //!
-//! `model.scan(t, S)`: for each user key, the newest op with `ts ≤ S` (a
-//! Delete reads as absent), plus load entries at `S_L ≤ S`.
+//! `model.scan(t, S)`: for each user key, the newest version with
+//! `ts ≤ S` (a Delete reads as absent), where a load's unlogged entries
+//! are versions at their `S_L` — a later logged op on a loaded key wins
+//! above `S_L`, and the load shows between `S_L` and that op (gate
+//! REWORK item 3).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -159,11 +162,23 @@ impl Model {
         self.loads.retain(|l| l.s_l <= c);
     }
 
-    /// The scan of tree `t` at snapshot `S`: per user key the newest op
-    /// with `ts ≤ S` (a Delete reads as absent), plus load entries at
-    /// `S_L ≤ S`.
+    /// The scan of tree `t` at snapshot `S`: per user key the newest
+    /// version with `ts ≤ S` (a Delete reads as absent), where a load's
+    /// unlogged entries are **versions at their `S_L`** (card 2.1: "a
+    /// load's entries are part of the model of tree `t` at ts `S_L`").
+    /// Gate REWORK item 3: the load entry competes by timestamp like any
+    /// other version, so a Put or Delete at `ts > S_L` on a loaded key
+    /// is *not* overwritten by the loaded value — the run-1 code applied
+    /// load entries after every commit op, which agreed with a store
+    /// that silently lost post-load updates. Ties (`S_L` equal to a
+    /// commit ts on the same key, which real histories never produce —
+    /// a loaded tree has no logged ops before its publish at `ts >
+    /// S_L`) go to the commit. Loads are recorded in increasing `S_L`
+    /// order by the harness.
     pub fn scan(&self, t: u64, s: u64) -> Scan {
         let mut out: Scan = BTreeMap::new();
+        // The newest version ts per user key seen so far.
+        let mut newest: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         for rec in self.commits.values() {
             if rec.ts > s {
                 continue;
@@ -172,18 +187,27 @@ impl Model {
                 match op {
                     Op::Put { tree, key, value } if *tree == t => {
                         out.insert(key.clone(), Some(value.clone()));
+                        newest.insert(key.clone(), rec.ts);
                     }
                     Op::Delete { tree, key } if *tree == t => {
                         out.insert(key.clone(), None);
+                        newest.insert(key.clone(), rec.ts);
                     }
                     _ => {}
                 }
             }
         }
         for l in &self.loads {
-            if l.tree == t && l.s_l <= s {
-                for (k, v) in &l.entries {
-                    out.insert(k.clone(), Some(v.clone()));
+            if l.tree != t || l.s_l > s {
+                continue;
+            }
+            for (k, v) in &l.entries {
+                match newest.get(k) {
+                    Some(&prev) if prev >= l.s_l => {}
+                    _ => {
+                        out.insert(k.clone(), Some(v.clone()));
+                        newest.insert(k.clone(), l.s_l);
+                    }
                 }
             }
         }
