@@ -1,8 +1,8 @@
 # C-T6 re-host: rows, large values, catalog trees and index builds (normative)
 
-Status: draft 1 (card S-3, 2026-10-23). This is a P-authored spec and needs a P gate before it is normative. The row-layer cards implement against this file: B-4a (catalog re-host), B-4b (row format and lazy upgrade), B-4c (TOAST), B-4d (online index build and the bulk-load rule), B-4e (DDL WAL ops), and B-6's drop cleanup. A change to an invariant (`I-*`, §12) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 2 (card S-3, 2026-10-23; the rework of `verdicts/S-3.md` at f19bb2b9). This is a P-authored spec and needs a P gate before it is normative. The row-layer cards implement against this file: B-4a (catalog re-host), B-4b (row format and lazy upgrade), B-4c (TOAST), B-4d (online index build and the bulk-load rule), B-4e (DDL WAL ops), and B-6's drop cleanup. A change to an invariant (`I-*`, §12) is made here first, then in the tests and mutants that pin it, and only then in code.
 
-**What this file is.** It re-hosts two v2 bodies of rules on S-STORE trees and C-T0 v8:
+**What this file is.** It re-hosts two v2 bodies of rules on S-STORE trees and C-T0 v8. "C-T0 v8" here means draft 8.1 (S-2-F1, merged at 5ff1bd06), whose names this file uses: the boot id and I-BOOT-ID, the snapshot registry, and §2.6's lock order. The two bodies are:
 - **C-T6** draft 1 (`nucleus/v2/docs/C-T6-rows-schema-indexes.md` at `nucleus/v2-scaffold` 2e4776fb), together with card C-T6e4fix2's NOT NULL era rule. That rule landed in code (`nucleus-codec/src/row/schema.rs`, 180f9503) but **not** in the v2 file's text, whose §2/§3 NULL clause still states the superseded e4 rule. §3.3 here is normative for it.
 - **The C-T5 catalog** as v7.8 §10 states it: catalog rows, storage ids, oids, sequences and the retired-storage record. C-T0 v8 hands every one of these to S-3 (§0.2 "`/sys/catalog/…` rows → catalog trees (S-3)"; §9.3 "its representation belongs to S-3"; §10 tree ids, sequences, catalog).
 
@@ -40,7 +40,7 @@ PLAN-v3 §3.5 asks for this addendum, and §9's S-3 row lists its deliverables: 
 | §7.2 Unique | §9.7 | Kept (0A000) |
 | §7.3 Correctness | §9.6 | Replaced. The lock and fence bullets are kept |
 | §8 amcheck | §11 | Kept with §0.2, plus I-CAT-TREES and I-TOAST-REGION |
-| §9 Open questions and divergences | §14 | Updated |
+| §9 Open questions and divergences | §14 | Updated. Items 1–6 are D1–D6. Item 7 (in-memory sort) is retired by §9 step 5's spill. Item 8 (column types) is kept as D10 |
 | v7.8 C-T0 §10: catalog, storage ids, sequences, large values | §5–§7 | Replaced |
 | v7.8 C-T0 §12: the C-T6 divergence items (moved here by C-T0 v8 §12) | §14 | Kept, updated |
 
@@ -76,13 +76,13 @@ C-T0 v8 §0.2 applies to every kept clause. In addition, kept C-T6 clauses read 
 | created-trees list | A txn's in-memory list of `(seq, tree id)` for each tree it created (§5.3). |
 | orphan | A directory tree of kind 2 or 3 that no committed catalog row names (§5.3). |
 | counter | A persisted, non-transactional `u64` allocator: tree ids, oids or a sequence (§6). |
-| `R`, `f`, `S` (in §9) | The build's pin, its fence commit ts, and its load ts, with `R < f ≤ S` (§9.2). |
+| `R`, `f`, `S` (in §9) | The build's pin, its fence commit ts, and its load ts. The load ts is the fence's ts: `R < f = S` (§9.2). |
 
 ---
 
 ## 2. Trees: what the row layer puts where
 
-The row layer addresses storage **only by tree id and user key**. It never sees an LPID, a slot or an entry key's ts suffix, except where §9 reads a version's ts through the scan.
+The row layer addresses storage **only by tree id and user key**. It never sees an LPID, a slot or an entry key's ts suffix.
 
 ### 2.1 Relation trees (kind 2)
 A relation tree holds two disjoint regions:
@@ -105,7 +105,7 @@ Here `key` is the C-Q3s encoding of the indexed columns, with their direction an
 
 **General-form entries are row-specific:** their user key contains the row key. §9.4 relies on this.
 
-Index entries are always inline: a unique-form value is a row key, which is bounded by §3.4.
+**Entry values are small but not necessarily inline.** A unique-form value is a row key, so it is below `K_MAX` (§3.4). S-STORE §3.2 derives `K_MAX` and `V_INLINE` separately and does not promise `V_INLINE ≥ K_MAX`, so the store may chain a long one (tag 4). Nothing in this file depends on index entries being inline.
 
 ### 2.3 System trees (kind 1)
 | Tree id | Name | User key | Value |
@@ -158,7 +158,8 @@ flags = bit0 not_null, bit1 dropped, bit2 has_missing, bit4 has_not_null_since
   - any unknown flag bit.
 - **Maintenance.**
   - CREATE TABLE sets since = 1 on each NOT NULL column, primary-key columns included.
-  - ADD COLUMN … NOT NULL and SET NOT NULL set it to the new version. A re-SET after a DROP takes the newer version.
+  - ADD COLUMN … NOT NULL sets it to the new version. So does SET NOT NULL on a nullable column, including a re-SET after a DROP NOT NULL.
+  - **SET NOT NULL on a column that is already NOT NULL keeps its original since.** The def version still goes +1, as for every def-changing DDL. This is v2's `(true, true)` arm of `TableSchema::set_not_null` (`schema.rs` at 2e4776fb; `nucleus-catalog/src/ddl.rs` "a SET on an already-constrained column keeps its original era"). Re-arming would be wrong: rows encoded between the old since and the new one went through `encode_row`, which refused NULL, so a NULL among them is corruption, and a re-armed since would serve it. Mutant **SET-REARMS-CONSTRAINED**: the redundant SET takes the new version.
   - DROP NOT NULL resets it to 0.
   - A dropped column carries no era: encode canonicalises it to flags bit1 only.
 
@@ -210,8 +211,8 @@ The result is deterministic in `(def, values)`.
 - **No compression in 2.0** (§14 D8).
 
 ### 4.2 Toast ids and chunks
-**Toast id.** `toast_id = be32(epoch) be64(n) be32(seq0) be32(ord)`: the inserting txn's `TxnId`, the statement's `seq0`, and `ord` from the statement's single ordinal counter. That counter is shared with the hidden rowid and is never reset per call (v2, kept).
-- **Uniqueness.** A toast id is unique forever, because `TxnId`s never repeat across boots (C-T0 v8 §2.5, I-EPOCH). The hidden rowid relies on the same fact.
+**Toast id.** `toast_id = be32(boot) be64(n) be32(seq0) be32(ord)`: the inserting txn's `TxnId` (its boot id and per-boot counter), the statement's `seq0`, and `ord` from the statement's single ordinal counter. That counter is shared with the hidden rowid and is never reset per call (v2, kept).
+- **Uniqueness.** A toast id is unique forever, because `TxnId`s never repeat across boots (C-T0 v8 §2.5, I-BOOT-ID). The hidden rowid relies on the same fact.
 
 **Chunks.** A value of `raw_len` bytes is split into `chunk_count = ⌈raw_len / toast_chunk⌉` chunks.
 - **Size.** `toast_chunk = 256 KiB`. Every chunk is full except the last, which is non-empty.
@@ -219,13 +220,18 @@ The result is deterministic in `(def, values)`.
 - **Storage.** The store keeps a chunk's bytes inline or in an overflow chain (S-STORE §6.7, tags 4 and 8). The row layer never addresses pages: "TOAST on overflow pages" (PLAN-v3 §3.5) means that every chunk is one entry, and the store places its bytes.
 
 ### 4.3 Why chunk at all (I-OP-BOUND)
-**Every op fits a record.** Every op the row layer writes must fit one WAL record. A record is at most `wal_seg_size / 4` bytes and never spans segments (S-STORE §12.2). A 1 GB datum stored as one entry would be one `Put` that no record can hold. With §4.1's bound and `toast_chunk`, every row-layer op is at most `ROW_LIMIT` plus its key and framing.
+**Every op fits a record.** Every op the row layer writes must fit one WAL record. A record is at most `wal_seg_size / 4` bytes and never spans segments (S-STORE §12.2). A 1 GB datum stored as one entry would be one `Put` that no record can hold. Every row-layer op is at most `ROW_LIMIT` plus its key and framing:
+- **row `Put`s**, by §4.1's bound;
+- **chunk `Put`s**, at most `toast_chunk`;
+- **catalog `Put`s:** RelRow and IdxRow by §5.1's cap; RetiredRow and the `Ddl` op by their split rules (§7.1, §5.5); a counter row is 8 bytes;
+- **index entries**, below `K_MAX` (§3.4);
+- **deletes**, which carry a key only.
 - **Requirement on file creation:** `wal_seg_size ≥ 8 MiB`, so that a 1 MiB op fits with room to spare. A-2/A-6a enforce it at file creation (§13.1 N3).
 - Mutants:
   - **ROW-LIMIT-OFF:** no step 2 in §4.1;
   - **CHUNK-UNBOUNDED:** one entry per value.
 
-**It bounds the chain free.** It also bounds S-STORE §6.7's chain free per entry to `toast_chunk / page_size` pages (32 at 8 KiB), so TOAST never needs §19 Q6's resumable free.
+**It bounds the chain free.** It also bounds S-STORE §6.7's chain free per entry. The bound is set by the largest entry value, which is a row or a catalog row of up to `ROW_LIMIT`, not by `toast_chunk`: a chain holds at most `ROW_LIMIT / page_size` pages (128 at 8 KiB, 256 at 4 KiB). A-5 measures the chain free at `ROW_LIMIT` at every allowed page size (S-STORE §6.7 asks it to measure "at the maximum value size"). If that holds the flip too long, A-5 proposes a resumable free (S-STORE §19 Q6) or this file lowers `ROW_LIMIT`; both are spec edits (§13.1 N4).
 
 ### 4.4 Writing (v2 §5 kept with §0.2)
 - **When chunks are written.** Toast ids are assigned when the new row value is built. The chunks are written in the row's statement, after the row op returned Applied, as key-existence ops with no unique rule (C-T0 v8 §5.0). A skipped row op writes none.
@@ -233,11 +239,13 @@ The result is deterministic in `(def, values)`.
 - **Carried pointers.** A carried pointer is reused as it is: an UPDATE that leaves a toasted column unchanged writes no chunk. Mutants:
   - **TOAST-CARRIED-DELETED:** a carried pointer's chunks are deleted;
   - **TOAST-OLD-KEPT:** a dropped pointer's chunks are kept.
-- **Locks.** Chunk writes lock their keys like every key-existence op and entry delete (C-T0 v8 §2.2). They are not exempt. They **never wait**, by this argument:
+- **Locks.** Chunk writes lock their keys like every key-existence op and entry delete (C-T0 v8 §2.2). They are not exempt. **No foreign txn holds an entry on a chunk key** that a txn is about to write, by this argument:
   - a chunk key is written by its inserter, whose `TxnId` it contains;
   - and by at most one later txn, the one that replaces the newest version carrying the pointer. That txn holds the row's exclusive lock;
   - pointers are never re-adopted, because a new value gets a new toast id;
-  - so row locks serialise the writers of one chunk key, and an acquire of a chunk key never meets a live foreign holder.
+  - so row locks serialise the writers of one chunk key.
+
+  **The one wait: inside a foreign escalated run.** A run covers the gaps between its owner's keys, including keys that do not exist yet (C-T0 v8 §6.2). If another txn `T′` has escalated over chunk keys on both sides of a new chunk key, the acquire meets `T′`'s run and waits for `T′`, as any acquire inside a run does ("What other txns see"). That wait is an ordinary lock wait: it is in the wait-for graph, and the deadlock detector, NOWAIT and `lock_timeout` apply to it (C-T0 v8 §6.3). So a chunk write never waits outside a foreign run, and inside one it waits like any acquire.
 
   A txn's chunk keys are contiguous, since they begin with its `TxnId`, so escalation (C-T0 v8 §6.2) coalesces them into few runs.
 - **Large txns.** A large txn's chunk writes materialise as provisional entries like any write (C-T0 v8 §3.2).
@@ -278,6 +286,10 @@ bytes(x) = be32(len) x
 - **`IdxStorage::Range`** (tag `0x02`) is not used in v3, because every index has a tree (§2.2). A decoded `0x02` is XX001. B-4a retires its callers, and B-5's RESULT lists any test retired with it.
 - **Keys.** The rows are keyed `be64(oid)` in `cat_rel` and `cat_idx` (§2.3).
 - **The `def` payloads** are §3.2's bytes (RelRow) and v2 §6's index def (IdxRow, kept).
+- **Size cap (I-OP-BOUND).** An encoded RelRow or IdxRow is at most `ROW_LIMIT` (§4.1). A DDL whose new row would exceed it gets 54000 when the row enters the write set, and nothing is written.
+  - **Why it is needed.** A RelRow's def carries each column's fast default (`missing`) inline, with no cap of its own. Without the cap, `ADD COLUMN … DEFAULT <large constant>`, or many such columns, would make one catalog `Put` larger than a WAL record (§4.3).
+  - **Why not TOAST `missing`.** That would put toast chunks in a system tree and make every def read a multi-entry read. A 1 MiB cap on a table's fast defaults is a divergence (§14 D11) with a trigger, not a gap.
+  - Mutant **CAT-ROW-UNBOUNDED**: the cap is not checked.
 
 ### 5.2 Catalog use (v7.8 §10 and v2 C-T6 §4, kept with §0.2)
 These are kept:
@@ -298,7 +310,11 @@ The tree is created eagerly because the txn's own reads, and a large txn's provi
 
 **`ROLLBACK TO s`.** Every tree created at `seq ≥ s` leaves the created-trees list and is dropped when the txn ends. A large txn's already-written `CreateTree` chunk may then recreate the tree at replay. That tree is an orphan, and the boot job below removes it.
 
-**Abort.** The cleanup continuation (C-T0 v8 §7.1) drops every tree on the created-trees list (S-STORE DropTree, without a WAL record), then finishes its own provisional-entry cleanup, then deregisters. Provisional entries inside a dropped tree are freed by the walk, and §7.5 explains why no reader needs them first. Mutant **ABORT-KEEPS-TREE**.
+**Abort.** Every aborting txn, small or large, drops every tree on its created-trees list (S-STORE DropTree, without a WAL record). Nothing outside the txn can name such a tree, because no committed catalog row does.
+- **A small txn** drops them in its abort itself, before it releases its locks. It has no provisional entries, so nothing else is needed.
+- **A large txn** drops them in its cleanup continuation (C-T0 v8 §7.1), then finishes its provisional-entry cleanup, then deregisters. Provisional entries inside a dropped tree are freed by the walk, and §7.5 explains why no reader needs them first.
+
+Mutant **ABORT-KEEPS-TREE**: an aborting txn leaves its created trees (caught for both sizes by `t_abort_drops_created_tree`).
 
 **Commit.** Created trees that committed catalog rows name live on. A tree created and dropped in one txn is retired through §7 like any other.
 
@@ -307,6 +323,16 @@ The tree is created eagerly because the txn's own reads, and a large txn's provi
 - no committed catalog row at `visible_ts` names it, that is, no current RelRow or IdxRow tree id and no RetiredRow.
 
 The **orphan boot job** (B-6) drops every orphan. It runs after recovery's dropping walks have resumed (S-STORE §14 step 6), and it may run concurrently with txns. Every id this boot allocates is at least `H_boot`, so a tree created by a running DDL is never mistaken for an orphan. Mutant **BOOT-NO-ORPHAN-SWEEP**.
+
+**The orphan job's order (S-3 gate, ruling 1 condition).** The job runs concurrently with drop cleanup (§7.4), so its steps are ordered:
+1. register a snapshot `S_o` and read the committed catalog at `S_o`;
+2. **only then** list the directory;
+3. skip every tree that is `dropping`, and every id `≥ H_boot`;
+4. drop each remaining tree that the catalog at `S_o` does not name.
+
+**Why this order.** Take a tree that a committed row names at `S_o`. It stops being named only through drop cleanup's commit, whose apply sets it `dropping` before that commit is visible at any snapshot. The listing comes after `S_o`, so it shows that tree either live and named, or `dropping` and skipped. So the job never drops a tree that drop cleanup owns. Listing first would let a drop-cleanup commit land between the listing and the snapshot: the job would then see the tree live in the listing and unnamed in the catalog, and would drop it a second time beside the walk. Mutant **ORPHAN-LIST-FIRST**.
+
+**Report-only mode (cfg(test)).** The job can run with its step 4 replaced by a report of the trees it would drop. §12.1's tests use it to observe orphans that a full sweep would hide.
 
 **Why the unlogged directory mutations are sound:**
 - **(a)** An image holds an uncommitted tree only as an orphan: it is empty, or holds only provisional entries, which are dead after recovery. The orphan job removes it.
@@ -332,7 +358,8 @@ S-STORE §12.3 leaves the `Ddl{bytes}` payload to the catalog. Its bytes are:
 ```
 Ddl = 0x01 be32(n) be64(oid)*      # the oids whose cat_rel or cat_idx rows this txn changes, ascending
 ```
-- **Who writes it.** Every txn that writes `cat_rel` or `cat_idx` writes exactly one. A small txn puts it in its `Commit` record. A large txn puts it in the last chunk written at step 1′ (C-T0 v8 §3.2).
+- **Who writes it.** Every txn that writes `cat_rel` or `cat_idx` lists every such oid exactly once, in one or more `Ddl` ops. A small txn puts them in its `Commit` record. A large txn puts them in the chunks written at step 1′ (C-T0 v8 §3.2).
+- **Split (I-OP-BOUND).** One `Ddl` op lists at most `DDL_OIDS = 65,536` oids (512 KiB), so a txn that changes more catalog rows writes several, in ascending oid order across them. One op is the common case. Consumers take the union of a txn's `Ddl` ops. Mutant **DDL-OP-UNBOUNDED**: one op for any number of oids.
 - **Recovery ignores it.** The catalog rows replay as ordinary `Put`s.
 - **Its consumers** are replicas and CDC (D-6, N14), which use it to invalidate catalog caches.
 - Mutant **DDL-OP-MISSING**, caught by a WAL-decode test (B-4e).
@@ -363,7 +390,13 @@ Replay of an op into an absent tree is therefore XX001. Mutant **CREATE-AFTER-PU
 - **Block sizes.** `B = 64` for tree ids and oids (v2 `ID_BLOCK`), and `B = 32` for sequences (v2 `seq::BLOCK`).
 - **Never repeat** (C-T0 v8 §10, v7.8 kept). Every value handed out is below an acked, sync-on `H`, which is durable (S-STORE I-REDO-COMPLETE). So across any crash, values may skip (an unused block is lost) and never repeat. That includes values whose caller never committed.
 - **Non-transactional.** The reservation txn is not the caller's txn. It commits even if the caller aborts, and it is outside the caller's write set, locks and SSI state.
-- **Lock order.** The per-counter mutex is held across the reservation commit, so it sits **above** every lock the commit pipeline takes. Nothing that holds a pipeline lock, a page latch or a lock-table partition calls `alloc()`. Only reservation txns lock a counter key, and only under its mutex, so a reservation never waits on another txn and cannot deadlock.
+- **Lock order, in C-T0 v8 §2.6's terms.** The per-counter mutex is held across the reservation commit. It slots into §2.6's list between levels 1 and 2, split as follows:
+  - **Above it:** the caller's own lock-table entries. A DDL or `nextval` caller holds those logically when it calls `alloc()`, and that is allowed.
+  - **Below it:** everything the reservation txn takes: its lock-table entry on the counter key, any txn wait, the settle stripe, the epoch gate, page latches, the leaf locks, and every short internal mutex (the sequencer critical section, the snapshot registry, the partition mutexes, the SSI mutex).
+  - **Never held when calling `alloc()`:** a stripe, the gate, a page latch, a leaf lock or a short mutex. A thread holds at most one counter mutex, and a reservation txn allocates nothing.
+
+  **No cycle.** Only reservation txns lock a counter key, and only under that counter's mutex, so the reservation's entry acquire never meets a live foreign holder. After step 1, a commit never waits on a lock (C-T0 v8 §3.1). The waits under the mutex are therefore the group sync and the ack, which wait on no lock. §13.2 asks C-T0 to add this level at its next edit.
+- **Cost (recorded for D-10b; S-3 gate, ruling 3).** Every `B` values cost one synchronous commit, which is one WAL fsync, possibly shared through group commit. For sequences that is one fsync per 32 `nextval` per sequence. PostgreSQL also WAL-logs a sequence every 32 values (`SEQ_LOG_VALS`), but its record becomes durable with the caller's commit, so it costs no extra fsync. D-10b measures `nextval` throughput against this. Trigger (§14 O3): an NBench row or C-12's ORM matrix is bound by sequence reservations. A P card then considers a larger `B` for hot sequences, or per-session caching (PostgreSQL's `CACHE`). Either keeps the synchronous reservation, because a value an aborted caller saw must still never repeat.
 - **Ranges.**
   - Tree ids start at 64 (1–63 are system trees, §2.3).
   - Oids start at 16384, PostgreSQL's `FirstNormalObjectId`. pg_catalog's fixed oids (C-11) stay below that.
@@ -382,7 +415,7 @@ Replay of an op into an absent tree is therefore XX001. Mutant **CREATE-AFTER-PU
 ```
 RetiredRow = 0x01 be64(rel_oid) be32(n) be64(tree_id)*      # v2's bytes, with ranges replaced by tree ids
 ```
-- **Where it lives.** It is in `cat_retired` under `be64(id)`, with `id` from the oid counter. There is one per retiring DDL statement.
+- **Where it lives.** It is in `cat_retired` under `be64(id)`, with `id` from the oid counter. A retiring DDL statement writes one, or more when it retires more than `RETIRE_TREES = 65,536` trees: each row lists at most that many (about 512 KiB, under `ROW_LIMIT`, I-OP-BOUND). The drop job treats each row on its own (§7.4).
 - **How it is written.** The DDL's own txn writes it, so it commits, aborts and rolls back to a savepoint with the DDL (C-T0 v8 §9.3).
 
 ### 7.2 What retires what
@@ -394,7 +427,7 @@ RetiredRow = 0x01 be64(rel_oid) be32(n) be64(tree_id)*      # v2's bytes, with r
 
 ### 7.3 TRUNCATE (S-STORE §12.8, "not an unlogged load")
 Under AccessExclusive, in one txn:
-1. allocate a tree id for the relation and for each of its indexes, and create each tree (§5.3: eagerly, with `CreateTree` logged in the commit);
+1. allocate a tree id for the relation and for each of its indexes, and create each tree (§5.3: eagerly, with `CreateTree` logged in the `Commit` record, or for a large txn in a `Chunk` at or before its first op on the tree);
 2. rewrite the RelRow and every IdxRow with the new tree ids;
 3. write the RetiredRow naming the old tree ids.
 
@@ -412,7 +445,7 @@ The drop-cleanup job reads committed RetiredRows at a registered snapshot `S`. F
 
 Mutants:
 - **DROP-BEFORE-W:** the drop runs at `W ≥ S`, or at `visible_ts`;
-- **DROP-SPLIT-COMMIT:** the row delete commits before the DropTree. A crash between the two leaks the trees (I-CAT-TREES).
+- **DROP-SPLIT-COMMIT:** the row delete commits in one commit and the DropTree ops in a later one. A crash between the two leaves trees that no committed row names and that are not `dropping`. The orphan job would reclaim them at the next open, which would hide the mutant from a test that runs the full boot. So `t_drop_commit_atomic` reopens with the orphan job in report-only mode (§5.3) and requires an empty report: every tree the drop job touched is either named by its RetiredRow or `dropping`. Under the mutant, the report names the retired trees. One record is what makes drop cleanup leave no orphan; the orphan job remains a backstop, not the mechanism.
 
 ### 7.5 Nothing races the DropTree walk
 Let `D` be the retiring DDL's commit ts, and `t` a retired tree.
@@ -446,25 +479,33 @@ Run by plain `CREATE INDEX` outside a transaction block and by `CREATE INDEX CON
 - **Concurrent change.** A step that finds the index row absent, or not in the state it expects, fails the build with 55000 (kept).
 
 ### 9.1 Steps
+Every step txn commits with `synchronous_commit=on`.
+
 1. **T0.** Insert the index row in state DeleteOnly, with a new tree (§5.3). Commit, and wait for the ack.
 2. **T1 (kept).** Expect DeleteOnly. `wait_for_lockers(rel, Share)`. Rewrite the state to WriteOnly. Commit, and wait for the ack.
 3. **T2, the fence.**
    1. Expect WriteOnly.
    2. `wait_for_lockers(rel, Share)`.
-   3. **Register the pin `R`**: a caller-chosen registration (C-T0 v8 §3.6) of `R := visible_ts`, taken under the registry mutex.
+   3. **Register the pin `R`**: a caller-chosen registration (C-T0 v8 §3.6) of `R := visible_ts`, taken under the snapshot registry mutex.
    4. Rewrite the index row with its def unchanged.
    5. Commit, and wait for the ack. Call its commit ts `f`.
 
-   `f > R`, because `R ≤ visible_ts`, and `visible_ts` is at most every ts already assigned, all of which are `< f`.
-4. **T3 begins.**
-   - Expect WriteOnly, and use the rows' **current** tree ids (a TRUNCATE between steps replaces them).
-   - Take an ordinary snapshot `S` (`S = visible_ts`, registered in one step). Then `S ≥ f > R`.
-   - T3 holds ShareUpdateExclusive until step 8, so no TRUNCATE, DROP or rewrite runs during steps 5–8.
-5. **Scan** the relation's row region at `S`, with the scan yielding each version's ts. For each row live at `S` **whose version has ts `< S`**:
+   Three facts about T2:
+   - **`f > R`.** `R ≤ visible_ts`, and `visible_ts` is at most every ts already assigned, all of which are `< f`.
+   - **T2 takes a ts.** Its rewrite is a `Put` into `cat_idx`. So T2 has a data layer even though the value is unchanged, and it commits through C-T0 v8 §3.1 steps 1–5. It is never a `Released(⊥)` commit (C-T0 v8 §3.1 step 0), and an optimisation that elides an unchanged `Put` must not apply to it.
+   - **T2 writes nothing else.** It writes no relation row and no index entry. So no version in the relation tree, and no logged entry in the index tree, has ts `f`. §9.4 and §9.6 rest on this.
+4. **T3 begins: the load ts and the fence check.**
+   1. Take ShareUpdateExclusive on the relation. T3 holds it until step 8, so no TRUNCATE, DROP or rewrite runs during steps 5–8.
+   2. **Register the load ts `S := f`**: a caller-chosen registration of `f`. It is admitted, because `W ≤ R < f ≤ visible_ts` once T2 has acked. That is S-STORE §10.1's "`S > R`".
+   3. Read the index row and the relation row at `S` and at the latest committed state (`visible_ts`). The latest index row must be WriteOnly (55000 otherwise, kept).
+   4. **Compare the tree ids** of the two rows at `S` with those of the latest rows. If either differs, a TRUNCATE committed between T2 and step 4.1. T3 then releases `S`, `R` and its lock, and the build restarts at step 3 with a fresh `R` and fence. If they match, no DDL that replaces trees committed after `f`, and the trees read at `S` are the current ones.
+
+   Draft 1 took its load ts after this lock, so it read the current catalog for free. The load ts `f` now precedes the lock, so the check is needed. Mutant **STALE-FENCE**: no comparison. A TRUNCATE between T2 and T3 then makes the load scan the old relation tree at `f` into the new index tree, and the published index names rows the TRUNCATE removed (I-IDX).
+5. **Scan** the relation's row region at `S`. For each row live at `S`:
    - compute its entry `E` per §8, detoasting indexed toasted columns at `S`;
    - if `E` exceeds §3.4's limit, fail the build with 54000.
 
-   Rows whose live version has ts `= S` are **skipped** (§9.4).
+   No row is skipped: no row version has ts `S` (step 3).
 
    Sort by user key:
    - in memory up to `build_mem` (R-1);
@@ -477,9 +518,9 @@ Run by plain `CREATE INDEX` outside a transaction block and by `CREATE INDEX CON
 ### 9.2 Why `R` comes before `S` (S-STORE §10.1 condition 2; S-1-F1)
 **The problem.** `W` is monotonic, and it equals `visible_ts` when no older ts is registered. A registration at `S − 1` made after `S` is picked therefore cannot hold `W` below `S`.
 
-**The fix.** Registering `R` before `f` is assigned gives `W ≤ R < f ≤ S` for the whole load. The fence supplies a ts above `R` without waiting on any foreign commit, because it is the build's own T2 commit.
+**The fix.** Registering `R` before `f` is assigned gives `W ≤ R < f = S` for the whole load. The fence supplies a ts above `R` without waiting on any foreign commit, because it is the build's own T2 commit.
 
-Mutant **PIN-AFTER-S**: `R` is registered after T3 takes `S`. It is caught only by §9.3's cfg(test) assertion, not by an observable read.
+Mutant **PIN-AFTER-S**: `R` is registered after `f` is assigned, or not at all (only `S` is registered). It is caught only by §9.3's cfg(test) assertion, not by an observable read.
 
 ### 9.3 Why the pin has no read-observable mutant (S-1 gate, ruling 1; recorded per S-STORE §17)
 - **What the load writes.** Only live entries, all at `S`, into an unpublished tree.
@@ -491,26 +532,35 @@ Mutant **PIN-AFTER-S**: `R` is registered after T3 takes `S`. It is caught only 
 So registering `S` (or nothing) instead of `R` is unobservable without a new hook. The condition stays because it is the formal precondition of S-STORE §10.4's carried state. B-4d therefore pins it with a cfg(test) assertion (`W < S` at every load insert, `t_build_pin_below_s`), not with a read-level mutant.
 
 ### 9.4 I-LOAD-DISJOINT: no loaded entry shares an entry key with a logged one
-**Proof.**
-- A logged write of `E` at ts `S` comes only from the txn that committed at `S`.
-- `E` is a general-form entry, so its key contains its row key (§2.2). That txn therefore wrote that row at `S`.
-- So either the row's live version at `S` has ts `S`, and the scan skipped it, or the row is not live at `S`, and no `E` was emitted.
+**Proof.** Every loaded entry key carries ts `f`. A logged entry at ts `f` could come only from the txn that committed at `f`, which is T2. T2 writes only its `cat_idx` row (§9.1 step 3). So the index tree holds no logged entry at `f`.
 
-**The skipped rows are covered anyway.** The writer at `S ≥ f` is WriteOnly-aware, so it wrote `E@S` itself through maintenance.
+**Why it matters.** S-STORE I-ENTRY-UNIQUE makes a different value at one entry key XX001, at load time or in a replay over an image that holds the load. A txn that deleted and re-inserted `E` at ts `u` (for example, an indexed column changed and changed back) wrote `E` with `key_changed`, which is tag 2 by C-T0 v7.8 §2.1's stickiness. A load at `u` would write tag 0 at the same entry key. v2's ingest tolerated the difference ("the header key_changed bit may differ"); v3's store does not.
 
-**Why it matters.** A txn at `S` that deleted and re-inserted `E` (for example, an indexed column changed and changed back) wrote `E` with `key_changed`, which is tag 2 by C-T0 v7.8 §2.1's stickiness. The load writes tag 0. S-STORE I-ENTRY-UNIQUE makes a different value at one entry key XX001, at load time or in a replay over an image that holds the load. v2's ingest tolerated the difference ("the header key_changed bit may differ"); v3's store does not.
+**Why not load at `visible_ts`** (draft 1; rejected by the S-3 gate, R-1 and ruling 2). A load at `S = visible_ts` meets whatever committed at `S`.
+- Without a skip, it collides as above.
+- Skipping rows whose version has ts `S` avoids the collision but loses coverage. An UPDATE at `S` of a non-indexed column leaves the row's entry unchanged, and v2's maintenance then writes nothing (`maintain_update` in `nucleus-catalog/src/index.rs` at 2e4776fb: "an unchanged entry is left alone"). A row that predates the index, updated that way at `S`, is published without `E`.
 
-Mutant **LOAD-EMITS-AT-S**: rows whose version has ts `S` are emitted too.
+Loading at the fence's own ts removes both problems, because nothing but T2 committed there.
+
+Mutants, both caught by `t_load_at_fence`:
+- **LOAD-AT-VISIBLE:** the load ts is `visible_ts` at step 4, with no skip. The scene's delete-and-reinsert at that ts gives XX001.
+- **SKIP-AT-S:** draft 1's rule, a load at `visible_ts` that skips versions at it. The scene's non-indexed UPDATE at that ts leaves the row without `E`, and I-IDX fails after publication.
 
 ### 9.5 Failure, crash and resume (v2 §7 kept with §0.2, plus the load)
 - **Failure.** A CONCURRENTLY build leaves the index non-public. Writers keep maintaining it, and readers never use it. A plain CREATE INDEX drops its own index on failure, through a DROP INDEX txn (§7).
 - **Crash before publication.** The index tree holds its logged maintenance writes plus whatever an image caught of the load (S-STORE §12.8.4).
   - **Plain build:** a boot job drops it through a DROP INDEX txn, before the open returns (flag bit2 clear; v2 `cleanup_unfinished_builds`). Mutant **BOOT-KEEPS-PLAIN**.
-  - **CONCURRENTLY build:** it is left non-public. A resume restarts at step 3, with a **fresh `R` and fence**. It never reuses the lost `S`, which `W` may already have passed. Mutant **RESUME-OLD-S**: the resume loads at the old `S`, so its scan reads a pruned state and I-BUILD-COVER fails.
+  - **CONCURRENTLY build:** it is left non-public. A resume restarts at step 3, with a **fresh `R` and fence**. It never reuses the lost load ts `S_old = f_old`.
+- **Why the old load ts is refused.** `W` may already have passed `f_old`, and then `register_at(f_old)` is refused with 72000 (C-T0 v8 §3.6). Mutant **RESUME-OLD-S**: the resume tries to load at `f_old`. `t_build_resume_after_crash` advances `W` past `f_old` after the reopen (commits with no registration held, then a GC sweep), and then resumes:
+  - the correct resume publishes, and I-IDX holds;
+  - under the mutant, the resume fails with 72000;
+  - a mutant that also bypasses the admission check scans a pruned state, and I-IDX fails after publication. The test catches either form.
 - **Leftover loaded entries are harmless.**
-  - Each was computed from a version live at `S_old`, with ts `< S_old`, and `S_old ≥ f_old`. So every later change to its row was made by a WriteOnly-aware writer, whose blind entry delete covers it.
-  - Re-loading at `S_new` adds a newer, equal version of each live entry, which GC folds.
-  - **No new commit can collide with a leftover.** A collision would need a new commit at ts `S_old` (§9.4). An image holds a leftover only if its flip followed the insert, and that checkpoint synced every commit `≤ S_old` (§9.6, durable derivation). So the recovered frontier is at least `S_old`, and no ts `≤ S_old` is reused (C-T0 v8 §3.7 steps 2 and 4).
+  - Each was computed from a version live at `f_old`, with ts `< f_old`. Every later change to its row has a commit ts `> f_old`, so it was made by a WriteOnly-aware writer (the fence argument), whose blind entry delete covers it.
+  - Re-loading at `f_new` adds a newer, equal version of each live entry, which GC folds.
+  - **No new commit can collide with a leftover.** A collision would need a logged entry at ts `f_old`.
+    - Before the crash, the only commit at `f_old` was T2, which wrote no entry (§9.4).
+    - After the crash, no commit takes `f_old` again. An image holds a leftover only if its flip followed the insert, and that checkpoint synced every record appended before its flip, T2's `Commit` included (§9.6, durable derivation). So the recovered frontier is at least `f_old`, and no ts `≤ f_old` is reused (C-T0 v8 §3.7 steps 2 and 4).
 - **Resume points.** From DeleteOnly, resume at step 2. From WriteOnly, resume at step 3 (kept).
 
 ### 9.6 Correctness (replaces v2 §7.3)
@@ -518,21 +568,26 @@ Mutant **LOAD-EMITS-AT-S**: rows whose version has ts `S` are emitted too.
   - the lock argument: after a state's ack, `wait_for_lockers` leaves only writers that read that state or a later one;
   - the fence argument: every txn with commit ts `≥ f` read WriteOnly or later;
   - "no inserted entry outlives the row version it was computed from".
-- **Coverage.** Every row version with ts `< S` that is live at `S` is covered by the load. Versions at ts `S` are covered by their writer's maintenance (§9.4), and so is every version above `S`.
+- **Coverage.** Take any row version.
+  - **ts `< f`, live at `f`:** the load covers it.
+  - **ts `> f`:** its txn read WriteOnly or later (the fence argument), so its maintenance covers it. An UPDATE that leaves the entry unchanged writes nothing and needs nothing: the row's entry came from the load or from an earlier maintenance write, and stays correct.
+  - **ts `= f`:** none exists (§9.1 step 3).
 - **No shadowing.** v3 has no intents, so v2's resolve-before-ingest pass retires.
-  - A large txn committed at `c < S` has its row and its entries either as provisional entries (read through C-T0 v8 §4) or as ordinary entries.
-  - The load's `E@S` sits above the writer's `E@c` as a newer version with the same live value.
-  - `c = S` is the skipped case.
+  - A large txn committed at `c < f` has its row and its entries either as provisional entries (read through C-T0 v8 §4) or as ordinary entries.
+  - The load's `E@f` sits above the writer's `E@c` as a newer version with the same live value.
+  - `c = f` is impossible for a row write.
 - **Durable derivation** (replaces v7.8's "syncs the WAL before the ingest"). No image ever holds a loaded entry without the commits it was derived from, `synchronous_commit=off` ones included, because:
-  - every commit `≤ S` was appended before the scan, since `S ≤ visible_ts`;
+  - every commit `≤ f` was appended before the scan, since `f ≤ visible_ts`;
   - every image whose flip follows an unlogged insert has synced every record appended before that flip (S-STORE §13 step 1).
 - **GC.** During the load `W ≤ R < S` (§9.2). Afterwards the tree is GC'd like any other.
 - **Readers.** No read uses the index before it is Public with `built_at = S`, and every such read has `S_R ≥` the publishing ts `> S`. AS OF at `t` uses the catalog at `t` (kept).
 
 **I-BUILD-COVER.** After publication, I-IDX holds at every `S' ≥ built_at` (§11). Mutants:
-- **NO-FENCE:** `S` is taken right after T1's wait, with no T2. This is v2 §7.3's counter-example: the last DeleteOnly-aware txn commits at `S`, and its row lacks `E`;
+- **NO-FENCE:** there is no T2, and the load ts is `visible_ts` right after T1's wait. This is v2 §7.3's counter-example: the last DeleteOnly-aware txn commits at that ts, and its row lacks `E`;
 - **MAINT-SKIP-WRITEONLY:** a WriteOnly index is not maintained;
-- **RESUME-OLD-S.**
+- **STALE-FENCE** (§9.1 step 4);
+- **SKIP-AT-S** (§9.4);
+- **RESUME-OLD-S** (§9.5).
 
 ### 9.7 Unique builds and in-block builds (v2 §7.2, §9 items 1–2, kept)
 - CREATE UNIQUE INDEX outside a block runs §8's born-public path, so it succeeds on an empty table and gives 0A000 on a non-empty pre-existing one.
@@ -563,7 +618,18 @@ The row layer needs no test of its own for this beyond A-4a/A-4b's.
 ## 11. amcheck (v2 §8 kept with §0.2; A-8 checks pages and trees, B-4a–e extend it)
 At a registered snapshot `S`, with the catalog at `S`:
 - **I-ROWFMT:** each visible row decodes under the def at `S` with §3.3's era rule, through the shared helper. `schema_version ≤ def.version`, and the primary-key columns (or the rowid) re-encode to the row's key.
-- **I-IDX, I-IDX-WO, I-IDX-DO:** v2 §8, kept.
+- **I-IDX, I-IDX-WO, I-IDX-DO:** v2 §8, kept, with these readings:
+  - "payload compared, header bit ignored" reads as: the entry's user key and value are compared, and tags 0 and 2 (the `key_changed` stickiness) count as equal;
+  - rows, entries, index states and the catalog are all read at `S`, never at the latest state (v2 C-T6b3bfix/fix2);
+  - v2's `IdxStorage::Range` report class (`UNCHECKED`) retires with the tag (§5.1).
+
+  Mutants of the checker, each caught by the ported `t6b3b_amcheck.rs` test named:
+  - **AMCHECK-NO-MISSING:** the Public check skips the rows → entries direction (`detects_an_injected_missing_entry`);
+  - **AMCHECK-NO-EXTRA:** it skips the entries → rows direction, for Public and WriteOnly (`detects_an_injected_extra_entry`, `writeonly_allows_missing_but_not_extra_entries`);
+  - **AMCHECK-WO-STRICT:** a WriteOnly index is checked as Public, so a legally missing entry is reported (`writeonly_allows_missing_but_not_extra_entries`);
+  - **AMCHECK-DO-SKIP:** no DeleteOnly check (`detects_a_visible_entry_under_a_deleteonly_index`, v2's N22);
+  - **AMCHECK-TAG-STRICT:** tags 0 and 2 are compared, so a delete and re-insert in one txn is reported (`clean_after_a_mixed_history`, v2's N14);
+  - **AMCHECK-AT-LATEST:** the catalog, rows, entries or index states are read at the latest state instead of `S` (`catalog_is_read_at_at_not_the_latest`, `rows_and_entries_are_read_at_at_not_the_latest`, `both_data_sides_are_read_at_at_not_the_latest_together`, `index_state_is_read_at_at_not_the_latest`; v2's N23).
 - **I-TOAST** (§4.6).
 - **I-TOAST-REGION:** every user key `≥ 0xFF` in a relation tree decodes as `0xFF ‖ 20 bytes ‖ be32`. Every key below `0xFF` decodes as a row key. Anything else is XX001.
 - **I-CAT-TREES** (§5.3), on a quiescent file.
@@ -577,70 +643,78 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | ID | Statement | Pinned by | Named mutants |
 |---|---|---|---|
 | I-ROWFMT | §3.1–§3.2, §11: rows and defs decode totally (XX001, never a panic) | B-4b (port `nucleus-codec`'s `row_golden`, `row_props`, `row_errors`, `row_defs`) | ROW-DECODE-PANIC |
-| I-ERA-NULL | §3.3: a NULL on a NOT NULL attnum is XX001 iff `v ≥ not_null_since`, on every decode path and in amcheck | B-4b (port `t6e4fix2_not_null_since.rs` and the e4 pins of `t6e3_regress.rs`) | CLEAR-ALL, SINCE-OFF-BY-ONE, NO-RESET, AMCHECK-OLD, E4-REGRESS |
+| I-ERA-NULL | §3.2–§3.3: a NULL on a NOT NULL attnum is XX001 iff `v ≥ not_null_since`, on every decode path and in amcheck; a redundant SET NOT NULL keeps the original since | B-4b (port `t6e4fix2_not_null_since.rs` and the e4 pins of `t6e3_regress.rs`) | CLEAR-ALL, SINCE-OFF-BY-ONE, NO-RESET, AMCHECK-OLD, E4-REGRESS, SET-REARMS-CONSTRAINED |
 | I-LAZY | §3.3: every write encodes at the current version with `natts = ncols`; no DDL rewrites | B-4b | ENCODE-AT-ROW-ERA |
 | I-KEY-LIMIT | §3.4: row and entry keys over `K_MAX` → 54000 at write-set entry; a build meeting one fails with 54000 | B-4b (rows), B-4d (builds) | SIZE-CHECK-OFF (S-STORE's), BUILD-SKIPS-LONG-KEY |
-| I-TOAST | §4.4–§4.6: pointers name exactly their visible chunks; carried pointers keep their chunks; dropped ones lose them | B-4c (port `t6d_toast.rs`) | TOAST-OLD-KEPT, TOAST-CARRIED-DELETED, TOAST-DECODED-NOT-RAW |
+| I-TOAST | §4.4–§4.6: pointers name exactly their visible chunks; carried pointers keep their chunks; dropped ones lose them | B-4c (port `t6d_toast.rs` and the amcheck half `t6d2_amcheck.rs`) | TOAST-OLD-KEPT, TOAST-CARRIED-DELETED, TOAST-DECODED-NOT-RAW |
 | I-TOAST-REGION | §2.1, §11: row scans stay in `[∅, 0xFF)`; toast keys have the chunk shape | B-4c | SCAN-INTO-TOAST |
-| I-OP-BOUND | §4.1, §4.3: every row-layer op is ≤ `ROW_LIMIT` (rows) or `toast_chunk` (chunks) plus framing, so it fits one WAL record | B-4c | ROW-LIMIT-OFF, CHUNK-UNBOUNDED |
-| I-CAT-TREES | §5.3: live kind-2/3 trees = trees named by committed catalog rows; named trees exist | B-4a (+ the B-6 orphan job) | ABORT-KEEPS-TREE, BOOT-NO-ORPHAN-SWEEP, CREATE-NOT-LOGGED |
+| I-OP-BOUND | §4.1, §4.3, §5.1, §5.5, §7.1: every row-layer op (rows, chunks, catalog rows, `Ddl` ops) is ≤ `ROW_LIMIT` plus framing, so it fits one WAL record | B-4c (rows, chunks), B-4a (catalog rows, RetiredRow), B-4e (`Ddl`) | ROW-LIMIT-OFF, CHUNK-UNBOUNDED, CAT-ROW-UNBOUNDED, DDL-OP-UNBOUNDED |
+| I-CAT-TREES | §5.3: live kind-2/3 trees = trees named by committed catalog rows; named trees exist; the orphan job reads the catalog before it lists the directory | B-4a (+ the B-6 orphan job) | ABORT-KEEPS-TREE, BOOT-NO-ORPHAN-SWEEP, CREATE-NOT-LOGGED, ORPHAN-LIST-FIRST |
 | I-DDL-WAL | §5.5–§5.6: create before use, drop after use, in and across records; one `Ddl` op per catalog-writing txn | B-4e | CREATE-AFTER-PUT, DDL-OP-MISSING |
 | I-SEQ-NO-REPEAT | §6: no counter value is handed out twice across crashes; no tree id named by the WAL or an image is reused | B-4a | HANDOUT-BEFORE-ACK, RESERVE-ASYNC |
 | I-RETIRE | §7.4–§7.5: retired trees are dropped only once `W >` the row's snapshot; the DropTree ops and the row delete commit together; no finalize races the walk | B-6 (+ B-4a) | DROP-BEFORE-W, DROP-SPLIT-COMMIT, W-ABOVE-M (C-T0's) |
-| I-LOAD-DISJOINT | §9.4: no loaded entry shares an entry key with a logged entry | B-4d | LOAD-EMITS-AT-S |
-| I-BUILD-PIN | §9.2–§9.3: `R` is registered before `f` is assigned and held through the last insert, so `W < S` during the load | B-4d (cfg(test) assertion; no read-observable mutant, §9.3) | PIN-AFTER-S (assertion only) |
-| I-BUILD-COVER | §9.6: after publication, I-IDX holds at every `S' ≥ built_at` | B-4d (port v2's build and interleaving tests; P-written) | NO-FENCE, MAINT-SKIP-WRITEONLY, RESUME-OLD-S |
+| I-LOAD-DISJOINT | §9.1, §9.4: the load ts is the fence's own ts `f`, at which no logged entry exists, so no loaded entry shares an entry key with a logged one | B-4d | LOAD-AT-VISIBLE |
+| I-BUILD-PIN | §9.2–§9.3: `R` is registered before `f` is assigned and held through the last insert, so `W ≤ R < f = S` during the load | B-4d (cfg(test) assertion; no read-observable mutant, §9.3) | PIN-AFTER-S (assertion only) |
+| I-BUILD-COVER | §9.6: after publication, I-IDX holds at every `S' ≥ built_at` | B-4d (port v2's build and interleaving tests; P-written) | NO-FENCE, MAINT-SKIP-WRITEONLY, STALE-FENCE, SKIP-AT-S, RESUME-OLD-S |
 | I-BUILD-RESUME | §9.5: a crashed plain build is gone after open; a crashed CONCURRENTLY build is non-public, maintained, unused, and resumable from the fence | B-4d | BOOT-KEEPS-PLAIN, RESUME-OLD-S |
 | I-BULK-PUBLISH | S-STORE §12.8, used by §9 steps 7–8 | B-4d | PUBLISH-BEFORE-META (S-STORE's) |
-| I-IDX, I-IDX-WO, I-IDX-DO | §11 (v2 §8, kept) | B-4d (port `t6d2_amcheck.rs`) | (v2's amcheck mutants, re-run) |
+| I-IDX, I-IDX-WO, I-IDX-DO | §11 (v2 §8, kept) | B-4d (port `t6b3b_amcheck.rs`) | AMCHECK-NO-MISSING, AMCHECK-NO-EXTRA, AMCHECK-WO-STRICT, AMCHECK-DO-SKIP, AMCHECK-TAG-STRICT, AMCHECK-AT-LATEST |
 
 ### 12.1 Test list
 Each test catches the mutants named in its row above.
 
 | Test | Invariants | Card |
 |---|---|---|
-| the ported codec suites; `t_era_null_audit_probe`, `t_era_null_drop_reset`, `t_era_null_e4_scene_after_add_column`; `t_lazy_upgrade_add_column_update` | I-ROWFMT, I-ERA-NULL, I-LAZY | B-4b |
+| the ported codec suites; `t_era_null_audit_probe`, `t_era_null_drop_reset`, `t_era_null_e4_scene_after_add_column`; `t_era_null_redundant_set` (SET NOT NULL at v2, ADD COLUMN at v3, SET NOT NULL on the first column again at v4, then a planted row encoded at v3 with a NULL on that column: the read must give XX001, and the def must still say since = 2); `t_lazy_upgrade_add_column_update` | I-ROWFMT, I-ERA-NULL, I-LAZY | B-4b |
 | `t_pk_over_kmax_54000` (at every allowed page size) | I-KEY-LIMIT | B-4b |
-| ported `t6d_toast.rs`; `t_toast_carry_unchanged` (an UPDATE of another column writes no chunk and keeps the old chunks visible at `S` below it); `t_toast_drop_column_raw` | I-TOAST | B-4c |
+| ported `t6d_toast.rs` and `t6d2_amcheck.rs`; `t_toast_carry_unchanged` (an UPDATE of another column writes no chunk and keeps the old chunks visible at `S` below it); `t_toast_drop_column_raw` | I-TOAST | B-4c |
 | `t_full_scan_skips_toast`; amcheck on a planted `0xFF` key of the wrong shape | I-TOAST-REGION | B-4c |
 | `t_value_over_record_limit` (a 64 MiB datum with `wal_seg_size = 8 MiB`, then a crash and replay); `t_wide_row_fits_record` (1,600 × 2,000-byte columns) | I-OP-BOUND | B-4c |
-| `t_abort_drops_created_tree`; `t_crash_orphan_swept` (CREATE TABLE in a large txn, a checkpoint, a crash before the marker); `t_create_logged_no_ckpt` (commit, crash before any checkpoint, read) | I-CAT-TREES | B-4a |
+| `t_cat_row_over_limit` (ADD COLUMN with a 2 MiB constant default gives 54000; so does the column whose 2,000-byte default pushes the RelRow past `ROW_LIMIT`; the file stays usable); `t_retired_row_split` (with `RETIRE_TREES` lowered under cfg(test): a DROP TABLE writes several RetiredRows and drop cleanup drops every tree) | I-OP-BOUND | B-4a |
+| `t_ddl_op_split` (with `DDL_OIDS` lowered under cfg(test): a large txn's oids span several `Ddl` ops, each within the cap, whose union is the oid set; WAL decode) | I-OP-BOUND | B-4e |
+| `t_abort_drops_created_tree` (a small and a large txn, each with CREATE TABLE then ROLLBACK); `t_orphan_vs_drop_cleanup` (a hook between the orphan job's steps 1 and 2, in which drop cleanup commits; the report-only job must report nothing); `t_crash_orphan_swept` (CREATE TABLE in a large txn, a checkpoint, a crash before the marker); `t_create_logged_no_ckpt` (commit, crash before any checkpoint, read) | I-CAT-TREES | B-4a |
 | `t_large_create_chunk_order` (WAL decode); `t_ddl_op_lists_oids` | I-DDL-WAL | B-4e |
 | `t_counter_crash_no_repeat` (record handed-out values, crash at every step of a reservation, reopen, allocate); `t_tree_id_not_reused_after_orphan` | I-SEQ-NO-REPEAT | B-4a |
-| `t_drop_waits_w` (an RR reader below the TRUNCATE keeps reading the old tree); `t_drop_commit_atomic` (crash after the drop commit, then reopen: the walk resumes and nothing leaks); `t_drop_waits_finalize` (a large txn's finalize parked, TRUNCATE, drop cleanup must not run until `M` passes) | I-RETIRE | B-6 |
-| `t_load_skips_version_at_s` (a txn committing at exactly `S` deletes and re-inserts its row's entry) | I-LOAD-DISJOINT | B-4d |
+| `t_drop_waits_w` (an RR reader below the TRUNCATE keeps reading the old tree); `t_drop_commit_atomic` (crash right after the drop commit, and again with a hook where DROP-SPLIT-COMMIT would split it; reopen with the orphan job in report-only mode: the report is empty, every retired tree is `dropping` or still named by its RetiredRow, and the walk resumes); `t_drop_waits_finalize` (a large txn's finalize parked, TRUNCATE, drop cleanup must not run until `M` passes) | I-RETIRE | B-6 |
+| `t_load_at_fence` (a hook after T2's ack: one txn deletes and re-inserts a row's entry, another updates a non-indexed column of a row that predates the index, and no other commit follows before step 4; the build publishes, I-IDX holds, and no XX001) | I-LOAD-DISJOINT, I-BUILD-COVER | B-4d |
 | `t_build_pin_below_s` (assertion at every insert) | I-BUILD-PIN | B-4d |
-| `t_build_fence` (v2's last-DeleteOnly-commit scene); `t_build_interleavings` (writers at every step boundary); `t_build_resume_after_crash` (crash mid-load and before publication, resume, I-IDX); `t_plain_build_dropped_at_open` | I-BUILD-COVER, I-BUILD-RESUME | B-4d |
+| `t_build_fence` (v2's last-DeleteOnly-commit scene); `t_build_interleavings` (writers at every step boundary); `t_build_resume_after_crash` (crash mid-load and before publication; reopen; advance `W` past `f_old`; resume; I-IDX); `t_build_truncate_before_load` (a TRUNCATE commits between T2 and T3's lock; the build restarts at step 3 and the published index matches the post-TRUNCATE rows); `t_plain_build_dropped_at_open` | I-BUILD-COVER, I-BUILD-RESUME | B-4d |
 | `t_publish_after_meta` (a hook between steps 6 and 7; the publishing commit must not be issued) | I-BULK-PUBLISH | B-4d |
+| ported `t6b3b_amcheck.rs` (its `IdxStorage::Range` tests retire, §5.1) | I-IDX, I-IDX-WO, I-IDX-DO | B-4d |
 
 ---
 
 ## 13. Boundaries and refinements
 
-### 13.1 Sentences S-STORE should gain at its next edit (S-2-F1 or later)
-These state what S-STORE already permits in substance. None changes an S-STORE invariant.
+### 13.1 Sentences S-STORE should gain at its next edit
+These state what S-STORE already permits in substance. None changes an S-STORE invariant. S-2-F1 (5ff1bd06) carried none of them.
+
+**N1 is a precondition (S-3 gate, ruling 1).** N1 must land in S-STORE before A-7c and B-4a implement. Its edit must also cover S-STORE §9.1 and §14 applying CreateTree and DropTree ops to such trees, and A-8 / I-LPID-EXACT treating such trees as legal.
 
 | # | S-STORE | Sentence | Why |
 |---|---|---|---|
 | N1 | §6.8 | "CreateTree and DropTree may run ahead of their logged op, or with none, on a tree no committed catalog row names; an image may hold such a tree, which the row layer reclaims (C-T6-rehost §5.3)." | The eager creation of §5.3 |
 | N2 | §6.8 | The `kind` values are the row layer's (C-T6-rehost §2.4) | They were unassigned |
 | N3 | §2.1 / §12.2 | `wal_seg_size ≥ 8 MiB` at creation | I-OP-BOUND (§4.3) |
-| N4 | §19 Q6 | TOAST values never need a resumable chain free: each chain is ≤ `toast_chunk` | §4.3 |
-| N5 | §8.3 | The scan can also yield the chosen version's ts, which is decoded from the entry key, or `c` for a provisional candidate | §9 step 5 needs it (I-LOAD-DISJOINT) |
+| N4 | §6.7 / §19 Q6 | The row layer's largest entry value is `ROW_LIMIT` (1 MiB), so a chain holds at most `ROW_LIMIT / page_size` pages; A-5 measures the free at that size | §4.3 |
+
+N5 of draft 1 (the scan yields each version's ts) is retired: the load at `f` skips nothing (§9.4).
 
 ### 13.2 Notes for C-T0 v8 (S-2a, which writes §5 and §7 in full)
 - **§5.0.** TOAST chunk writes are key-existence ops and entry deletes, and they lock their keys. There is no exemption (§4.4).
 - **§7.1.** Abort cleanup also drops the txn's created trees, and it skips provisional entries in `dropping` or absent trees. Deregistration does not wait for a DropTree walk (§7.5).
-- **§3.6.** The lifetime of a build pin is the build's own, from step 3 to step 6. It is not tied to a txn.
+- **§3.6.** The lifetime of a build pin is the build's own, from step 3 to step 6. It is not tied to a txn. The load ts is a second caller-chosen registration, of the fence's own commit ts `f`, from step 4 to step 6 (§9.1).
+- **§2.6.** Add the per-counter mutex between levels 1 and 2: below the caller's logically held lock-table entries, above the reservation txn's lock-table entry, txn waits, the stripe, the gate, page latches, the leaf locks and every short internal mutex. A thread holds at most one (§6).
+- **§3.1 step 0.** The build's fence T2 rewrites a row with an unchanged value. That `Put` is a data layer, so T2 takes a ts and is never `Released(⊥)` (§9.1 step 3).
 
 ### 13.3 Refinements of PLAN-v3 (for PL-1)
 | # | Plan text | Here | Why |
 |---|---|---|---|
 | P1 | §3.5 "a sorted bulk load into a new tree" | The tree is created at T0 and receives maintenance writes before the load. The load is sorted, unlogged inserts at `S` under the stable root (§9) | WriteOnly maintenance must land in the same tree; I-ROOT-STABLE |
-| P2 | §3.5 "a snapshot scan" | A pin `R` registered before the fence, then a snapshot `S ≥ f > R`, skipping versions at `S` (§9.2, §9.4) | S-STORE §10.1; I-ENTRY-UNIQUE |
+| P2 | §3.5 "a snapshot scan" | A pin `R` registered before the fence, then a scan at the fence's own ts `S = f > R`, after a check that no TRUNCATE replaced the trees since `f` (§9.1, §9.2, §9.4) | S-STORE §10.1; I-ENTRY-UNIQUE; coverage (S-3 gate R-1) |
 | P3 | §3.3 "TOAST on overflow pages" | 256 KiB chunks in the relation tree's toast region, each one store entry (§4) | Every op must fit one WAL record |
 | P4 | §9 B-4a–e, B-6 | Pin the §12 rows as listed. B-6 also gains the orphan job (§5.3) | — |
-| P5 | §3.8 "secondary B+tree: unique, partial, composite, INCLUDE" | Partial, expression and INCLUDE indexes are 0A000 here (§14 D6) | They need a spec and a card before D |
+| P5 | §3.8 "secondary B+tree: unique, partial, composite, INCLUDE" | Partial, expression and INCLUDE indexes are 0A000 until follow-on S-3c (§14 D6) | They need evaluation inside maintenance and builds, which this file does not specify. The plan's §3.8 list stands; S-3c delivers it |
 
 ---
 
@@ -652,22 +726,47 @@ These state what S-STORE already permits in substance. None changes an S-STORE i
 - **D3.** Rewrite-requiring ALTERs give 0A000: a non-binary-compatible ALTER COLUMN TYPE, a volatile ADD COLUMN default, and a `serial` or identity ADD COLUMN. Follow-on S-3a, required before 2.0.
 - **D4.** DROP COLUMN of a primary-key column, and ALTER TABLE … ADD PRIMARY KEY, give 0A000.
 - **D5.** A crashed CONCURRENTLY build leaves a non-public index, as in PostgreSQL. A crashed plain build is dropped at the next open. An index born public under a Share lock is not used by its creating RR/SER txn's own reads.
-- **D6.** Expression, partial and INCLUDE indexes give 0A000 (§13.3 P5).
+- **D6.** Expression, partial and INCLUDE indexes give 0A000 until follow-on S-3c (§13.3 P5).
 - **D7.** The key limit is `K_MAX(page_size)` after the escape (§3.4), not PostgreSQL's ~2704 bytes. At 8 KiB pages it is lower, and keys with many `0x00` bytes lose more. A-2 publishes the values.
 - **D8.** There is no TOAST compression (pglz/lz4). Trigger: an NBench space or document row misses target, and a profile attributes more than 20% of bytes to toasted values. An Opus card then adds a compression tag to the toast pointer, which is a format change (D-8).
 - **D9.** `natts ≤ 1600` with 54011, as in PostgreSQL (§3.1).
+- **D10.** Column types are the C-Q3s key types only (v2 §9 item 8, kept; PLAN-v3 N7). A type outside C-Q3s is 0A000 at CREATE TABLE and ADD COLUMN. New types arrive with their own cards as C-Q3s edits (for example jsonb in D-2a), and §3.1's type tags grow with them.
+- **D11.** A table's encoded definition, fast defaults included, is at most `ROW_LIMIT`, and a DDL past it gets 54000 (§5.1). PostgreSQL toasts `attmissingval`, so it has no such cap. Trigger: an import or ORM migration in G3 or C-12 hits the cap. A P card then moves large `missing` values out of line.
 
 **Open questions:**
 - **O1.** Build throughput: sorted inserts against a bottom-up build (§9.8 trigger).
 - **O2.** The build pin holds `W` for the whole build (§9.8). Trigger: a G9 soak or NBench operational row in which an index build's retention exhausts disk.
+- **O3.** A sequence costs one synchronous commit per 32 `nextval` (§6, "Cost"). D-10b measures it. Trigger: an NBench row or C-12's ORM matrix is bound by sequence reservations.
 
 **Follow-on cards** (P spec, each S–M, queued by the orchestrator):
 - **S-3a**: table-rewriting ALTER on v3. New trees as in TRUNCATE (§7.3), then a large-txn copy under AccessExclusive, with the old trees retired. It closes D3. It must land before the 2.0 parity rows (D-10).
-- **S-3b**: unique index builds on non-empty relations, plain and CONCURRENTLY. Unique-form keys are not row-specific, so §9.4's disjointness argument does not carry over, and a duplicate check against the build snapshot is needed. It closes D2. It must land before C-12's ORM matrix: migrations create unique indexes on populated tables.
+- **S-3b**: unique index builds on non-empty relations, plain and CONCURRENTLY. Unique-form keys are not row-specific, so the load needs a duplicate check against the build snapshot and against concurrent WriteOnly maintenance. It closes D2. It must land before C-12's ORM matrix: migrations create unique indexes on populated tables.
+- **S-3c**: partial, expression and INCLUDE indexes (PLAN-v3 §3.8). It closes D6. It must land before C-12's ORM matrix: migrations routinely create partial unique indexes (`… WHERE deleted_at IS NULL`) and expression indexes (`lower(email)`). It specifies:
+  - the index def bytes for a predicate, key expressions and INCLUDE columns;
+  - maintenance: an entry exists iff the predicate holds on the version, evaluated on both the EPQ base and the new version, so an UPDATE that flips the predicate inserts or deletes;
+  - the build: the scan evaluates the predicate and the expressions at `S`;
+  - INCLUDE payload in the entry value, which makes general-form values non-empty and changes §2.2's forms;
+  - which expressions qualify: immutable, deterministic and error-free on every stored row, or the build and maintenance error semantics when they are not.
+
+  It depends on an expression evaluator usable below the executor (C-2/C-4b) and, for partial unique indexes on populated tables, on S-3b.
 
 ---
 
 ## Changelog
+- **Draft 2** (2026-10-23, card S-3, the rework of `verdicts/S-3.md` at f19bb2b9; base now includes C-T0 v8 draft 8.1, 5ff1bd06):
+  - **R-1 (blocker), ruling 2.** §9 loads at the fence's own ts `S := f`. T2 writes only `cat_idx`, so nothing sits at `f`, no row is skipped, and I-LOAD-DISJOINT is trivial (§9.4). T2 must take a ts and is never `Released(⊥)` (§9.1 step 3). A new fence check at step 4 restarts the build when a TRUNCATE lands between T2 and T3 (mutant STALE-FENCE). Mutants LOAD-AT-VISIBLE and SKIP-AT-S, with test `t_load_at_fence`, replace LOAD-EMITS-AT-S and `t_load_skips_version_at_s`. §9.5's leftover argument uses `S_old = f_old`, and §9.6's coverage has no skipped case. N5 is retired. P2 is updated;
+  - **R-2.** §3.2: a redundant SET NOT NULL keeps the original since (v2's `(true, true)` arm), with mutant SET-REARMS-CONSTRAINED and test `t_era_null_redundant_set`;
+  - **R-3.** §5.1 caps RelRow and IdxRow at `ROW_LIMIT` (54000), §7.1 splits RetiredRows at `RETIRE_TREES`, and §5.5 splits `Ddl` ops at `DDL_OIDS`. §4.3's I-OP-BOUND lists every op kind. New mutants CAT-ROW-UNBOUNDED and DDL-OP-UNBOUNDED; new divergence D11;
+  - **R-4.** `t_drop_commit_atomic` reopens with the orphan job in report-only mode (§5.3), so DROP-SPLIT-COMMIT is observable (§7.4);
+  - **R-5.** C-T0 8.1 names: boot id and I-BOOT-ID (§4.2), the snapshot registry (§9.1). §6 places the counter mutex in C-T0 §2.6's lock order and records the one-fsync-per-32-`nextval` cost for D-10b (ruling 3; O3). §13.2 gains the §2.6 and §3.1 notes;
+  - **R-6.** §4.4: chunk-key acquires wait inside a foreign escalated run, and only there;
+  - **R-7.** §4.3 and N4: the chain-free bound is `ROW_LIMIT`, not `toast_chunk`;
+  - **R-8.** §2.2 no longer claims index entries are always inline;
+  - **R-9.** §11 names I-IDX's checker mutants against the ported `t6b3b_amcheck.rs`. Draft 1 cited `t6d2_amcheck.rs`, which is I-TOAST's amcheck half and now pins I-TOAST. §9.5 states RESUME-OLD-S's observable: 72000 at registration, or a pruned scan if the check is bypassed;
+  - **R-10.** §7.3 logs CreateTree per §5.3 (in a chunk for a large txn). §5.3: a small txn's abort also drops its created trees;
+  - **R-11.** §5.3: the orphan job registers its catalog snapshot before it lists the directory, and it skips `dropping` trees (mutant ORPHAN-LIST-FIRST, test `t_orphan_vs_drop_cleanup`). N1 is recorded as a precondition of A-7c and B-4a (ruling 1);
+  - **v2 §9 items 7–8.** Item 8 (column types) is kept as D10. Item 7 is retired by §9's spill;
+  - **P5/D6.** Follow-on S-3c is carved for partial, expression and INCLUDE indexes, required before C-12.
 - **Draft 1** (2026-10-23, card S-3). C-T6 and the C-T5 catalog re-hosted on S-STORE and C-T0 v8:
   - §0: clause status and substitutions for every v2 C-T6 section;
   - §2: relation trees (row and toast regions), index trees (unique and general forms), system trees, directory kinds;
