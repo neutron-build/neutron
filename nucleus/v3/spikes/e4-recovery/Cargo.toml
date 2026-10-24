@@ -1,0 +1,26 @@
+# E4 recovery spike (card X-5; PLAN-v3 §4 E4). Not production code: this
+# crate prototypes the S-STORE durability path (WAL + page map + CoW
+# checkpoint + replay) on a deterministic simulated disk with crash, tear,
+# lost-write and misdirected-write faults, and judges the result against the
+# P-written oracle of card X-5 Work 2.
+[package]
+name = "e4-recovery"
+description = "E4 recovery prototype: WAL + page map + CoW checkpoint + replay on a simulated disk (card X-5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "e4-campaign"
+path = "src/bin/e4-campaign.rs"
