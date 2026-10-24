@@ -254,9 +254,6 @@ impl Inode {
         out
     }
 
-    /// Is the read range tainted (differs from the last issued bytes
-    /// somewhere)? Gaps in the issued map were never issued, so they
-    /// cannot differ.
     fn taint_of(&self, off: u64, len: u64, view: &[u8]) -> bool {
         let end = off + len;
         let mut cursor = off;
@@ -312,6 +309,19 @@ impl Inode {
             self.issued.insert(k, v);
         }
         self.issued.insert(off, bytes.to_vec());
+    }
+
+    /// The durable bytes of a range (the observer's taint view).
+    fn durable_view(&self, off: u64, len: u64) -> Vec<u8> {
+        let mut out = vec![0u8; len as usize];
+        let start = (off as usize).min(self.durable.len());
+        let end = ((off + len) as usize).min(self.durable.len());
+        if start < end {
+            let src = self.durable.get(start..end).unwrap_or(&[]);
+            let dst = out.get_mut(0..end - start).unwrap_or(&mut []);
+            dst.copy_from_slice(src);
+        }
+        out
     }
 }
 
@@ -933,6 +943,16 @@ impl SimDisk {
         self.accepts.clear();
         self.served.clear();
         self.events.clear();
+    }
+
+    /// Observer (harness/monitors only): is the durable range tainted
+    /// (different from the last issued bytes)? Used for O-3 (e)'s tainted
+    /// referenced slots.
+    pub fn range_tainted(&self, id: FileId, off: u64, len: u64) -> bool {
+        match self.inodes.get(id) {
+            Some(i) => i.taint_of(off, len, &i.durable_view(off, len)),
+            None => false,
+        }
     }
 }
 

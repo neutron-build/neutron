@@ -27,3 +27,12 @@ pub mod model;
 pub mod oracle;
 pub mod rng;
 pub mod sim;
+// `store` (Work 3–4) is committed but NOT wired into the crate yet. It
+// compiled clean when wired (see the commit history), but its methods
+// yield — they park the OS thread at scheduler points — while callers
+// hold the world mutex, which would deadlock at runtime; the workload
+// driver that would exercise it is therefore also not compiled.
+// Converting the store's call flow to internal-lock primitives (each
+// atomic step locks and unlocks, owned page bytes travel between steps)
+// is the remaining X-5b work. See README "Status".
+// pub mod store;

@@ -1,102 +1,128 @@
-# E4 recovery spike (card X-5, stage 1–2 of the card's own split)
+# E4 recovery spike (card X-5, stages 1–2 of the card's own split)
 
-Status: **incomplete — the run was killed at the runner's 60-minute limit
-during stage 3 (the store).** What is here is verified and passing; what is
-missing is listed under "Scope" below. The card's Note ("Size") names the
-split for exactly this case; see the RESULT block of the card run.
+Status: **incomplete — two runner attempts were each killed at the
+60-minute limit.** Attempt 1 delivered the sim and the oracle (stages 1–2,
+green). Attempt 2 delivered the store as reviewed, compile-checked code
+(Work 3–4) plus a draft workload driver, but could not wire them: the
+store's methods yield — they park the OS thread at scheduler points —
+while callers hold the world mutex, which deadlocks at runtime; converting
+the call flow to internal-lock primitives is the remaining X-5b work. See
+"Status" below and the card run's RESULT.
 
 ## Scope
 
-Implemented and tested:
+Implemented, tested and green:
 
 - **Work 0 (crate)**: `e4-recovery`, deps `thiserror` only (`proptest`
   dev), workspace lints, `#![deny(clippy::indexing_slicing)]` in every
-  module under `src/sim/` (none exist under `src/store/` yet — the store
-  has not landed). CRC32C (table-driven; card vector
-  `"123456789" → 0xE3069283` passes) and the PRNG (splitmix64 seeding
-  xoshiro256**) are written in-crate. Determinism rules honoured: no wall
-  clock, no `HashMap`/`HashSet` iteration in schedule-visible decisions,
-  all namespace iteration over `BTreeMap`s.
+  module under `src/sim/`. CRC32C (card vector passes) and the PRNG
+  (splitmix64 seeding xoshiro256**) written in-crate. Determinism rules
+  honoured: no wall clock, no `HashMap`/`HashSet` iteration in
+  schedule-visible decisions, all namespace iteration over `BTreeMap`s.
 - **Work 1 (sim)**: the baton scheduler (`src/sim/sched.rs`) — every task
   an OS thread, one baton, PRNG handoffs at every yield point, Mesa-style
   keyed waits, `DEADLOCK` and crash delivery per 1.2; the simulated disk
-  (`src/sim/disk.rs`) with the 1.1 durability model (durable bytes +
-  length, volatile writes in issue order, per-range taint references kept
-  across lives), F-CRASH per-512-B-sector prefix resolution, the
-  directory-op prefix rule, F-MEDIA-PAGE/F-MEDIA-WAL (LOST / MISDIRECTED /
-  TORN with the ≥60 % referenced-slot bias), the accept hook and
-  served-corruption detection (1.4); `E4Env` (`src/sim/env.rs`), the
-  narrow trait every store-side I/O call will go through, each method a
-  yield point. The `nucleus-env` SimEnv (A-1a/A-1b) had not merged at
+  (`src/sim/disk.rs`) with the 1.1 durability model, F-CRASH per-512-B-
+  sector prefix resolution, the directory-op prefix rule,
+  F-MEDIA-PAGE/F-MEDIA-WAL (LOST / MISDIRECTED / TORN with the ≥60 %
+  referenced-slot bias), the accept hook and served-corruption detection
+  (1.4); `E4Env` (`src/sim/env.rs`), the narrow I/O trait, every method a
+  yield point. `nucleus-env`'s SimEnv (A-1a/A-1b) had not merged at
   launch, so this is the spike-local layer the card's "Substrate" clause
-  prescribes, shaped for a mechanical swap.
-- **Work 1.5**: all seven sim self-tests (`tests/sim.rs`), plus three
-  extras (armed-crash delivery, env-call crash, media LOST pre-image).
-- **Work 2 (model + oracle, P-written, binding)**: `src/model.rs` (commits
-  in ts order with `written`/`acked`, bulk loads at `S_L`, catalog = tree
-  1, `scan(t, S)`, round truncation, `lo`/`hi` bounds, the `samp` rule)
-  and `src/oracle.rs` (O-1 (a)–(d) with candidate `c` search, O-1f, O-2,
-  O-3 (a)–(e) with the twin rule and X5-R1's MW `lo := T`, `acked_lost`
-  reporting, `seed_passes`). The `OracleCfg` knobs exist only for the
-  instrumentation-removal demonstrations.
+  prescribes.
+- **Work 1.5**: all seven sim self-tests (`tests/sim.rs`) plus three
+  extras.
+- **Work 2 (model + oracle, P-written, binding)**: `src/model.rs` and
+  `src/oracle.rs` (O-1 (a)–(d), O-1f, O-2, O-3 (a)–(e) with the twin rule
+  and X5-R1's MW `lo := T`, `acked_lost` reporting, `seed_passes`).
 - **Work 2.6**: the five must-pass and eleven must-fail oracle self-tests
-  (`tests/oracle.rs`), plus the four instrumentation-removal
-  demonstrations (O-1 lower bound, O-1 (c), taint, twin rule) in
-  `instrumentation_removals_are_load_bearing`.
+  (`tests/oracle.rs`) plus the four instrumentation-removal demos.
 
-Not implemented (the run died here):
+Present and compile-checked, not wired (see "Status"):
 
-- **Work 3–4**: the store (`src/store/`), WAL, checkpoint, recovery,
-  amcheck, GC, monitors (M-*), the mutant enum and its sites.
-- **Work 6**: the directed tests D1–D18.
-- **Work 5, 7, 8**: workload, campaign `run`/`verify`, mutant sweep.
-- **Work 9**: the full README (design-to-code map, fault-model README
-  items, reproduction) and the campaign RESULT items 1–7.
+- **Work 3–4 (`src/store/`, compiled clean when `pub mod store;` was
+  enabled — see the commit history; it is unwired only because its runtime
+  call pattern deadlocks, not for compile reasons)**: the §2.1/§2.2/§3.1
+  page codec with §3.3's four checks as separate mutant sites; file
+  create/open with no-fallback meta selection and G3; the pool (§5) with
+  clock eviction, pins, dirty eviction to fresh slots (I-NO-INPLACE) and
+  the `write_guard` epoch-copy reserve (R_EPOCH); the epoch gate (§5.6)
+  with exclusive flips; the flat in-memory page map with first-touch image
+  overrides standing in for the §4.1 CoW radix (the persisted radix is
+  materialised at step 2 and parsed at open/amcheck — declared
+  simplification); slot/LPID allocators (§4.2, §4.4–§4.5); the B+tree with
+  the N3=(b) entry layout, stable roots, split and merge, the directory
+  (§6.8) with bounded DropTree walks, and the GC sweep (§10.2/§10.4); the
+  WAL (§12) with framing, group commit, §12.6 replay start and recycling;
+  checkpoint steps 0–6 with hooks (§13, G1); recovery's two passes with
+  G2 physical truncation; amcheck (3.8); the 27-mutant enum with single
+  sites.
+- **`src/workload.rs`**: the Work 5 round-engine draft (crash
+  specification, two-pass uniform crashes, nested recovery crashes, the
+  task bodies, written/acked derivation from disk events, the twin) — a
+  draft that does not compile until the store conversion lands; kept as
+  the X-5c starting point.
 
-`src/bin/e4-campaign.rs` and `src/campaign.rs` are honest stubs that exit
-non-zero and say so; `results/` contains nothing. No test is `#[ignore]`d
-and no check weakened — the missing parts are absent, not stubbed green.
+Not implemented: the monitors (M-*), the directed tests D1–D18, the
+campaign (`run`/`verify`/`mutants`), the coverage quotas, and the campaign
+RESULT items 1–7. `src/bin/e4-campaign.rs` and `src/campaign.rs` are
+honest stubs that exit non-zero; `results/` contains nothing. No test is
+`#[ignore]`d and no check weakened — the missing parts are absent, not
+stubbed green.
+
+## Status: the blocker found in attempt 2
+
+The baton design (Work 1.2) serialises tasks through one world mutex, and
+the card requires yields *inside* store operations (every `E4Env` call,
+every `write_guard`). Those two facts conflict in the straightforward
+implementation: a store method called under a held world guard parks its
+thread inside the guard at its first yield and the baton can never pass —
+a deadlock, in every store path. The fix is architectural, not local:
+store operations must be restructured so each atomic step locks the world,
+works, and unlocks (owned page bytes travel between steps — the pattern
+`src/store/prims.rs` already follows internally), and every multi-step
+operation (tree descent/split, checkpoint, recovery, GC) must hold its
+intermediate state in owned locals while re-borrowing the store between
+yields. That conversion, plus the workload, monitors, directed tests and
+campaign, is exactly the card's X-5b/X-5c split (card Note "Size"). A
+no-`unsafe` re-entrant world lock cannot express it: safe Rust has no way
+to lend `&mut World` across a park.
 
 ## Declared simplifications so far
 
-- **Sector size 512 B** for tearing (pessimistic for NVMe's usual 4 KiB
-  atomic unit) — per the card.
-- **Directory-op prefix rule** models ext4's ordered metadata journal on
-  n5000 — per the card's stated assumption.
-- **Taint gaps**: bytes never issued to cannot be tainted (nothing to
-  differ from); §3.3 still rejects stray bytes there because they cannot
-  match a reference (see `src/sim/disk.rs` module docs).
-- **F-CRASH knob mapping** (the card prescribes the knob values, not their
-  mapping): per sector, with `p_keep_latest` the sector takes its latest
-  volatile write; otherwise with `p_tear` a uniform earlier prefix
-  endpoint; otherwise the durable value. Directory prefixes: all ops with
-  `p_keep_latest`, else a uniform prefix length. A volatile length change
-  persists exactly as far as the surviving data requires.
+- **Sector size 512 B** for tearing; **directory-op prefix rule** models
+  ext4's ordered metadata journal on n5000 (both per the card).
+- **Taint gaps**: bytes never issued to cannot be tainted; §3.3 still
+  rejects stray bytes there (see `src/sim/disk.rs` docs).
+- **F-CRASH knob mapping**: per sector, `p_keep_latest` takes the latest
+  write; else with `p_tear` a uniform earlier prefix endpoint; else the
+  durable value. Directory prefixes: all with `p_keep_latest`, else a
+  uniform prefix length.
 - **MW MISDIRECTED** targets another 512-aligned offset of the same
-  segment (within `/wal/`, per the card; cross-segment targeting not
-  implemented).
-- **O-3 (e) reading** (X5-R2, "and only for those"): amcheck findings must
-  cover every tainted referenced slot, and may additionally name slots
-  whose §3.3 failure is a direct consequence of a lost-meta fault (the
-  opened image older than writes issued after its meta was synced — the
-  D10 shape). The `stale_ref_slots` set records these. This reading keeps
-  the check strict against genuine false positives while not failing
-  legitimate detection; it is a judgement call and is flagged as one in
-  the RESULT.
+  segment.
+- **O-3 (e) reading** (X5-R2 "and only for those"): findings must cover
+  every tainted referenced slot and may additionally name slots whose
+  §3.3 failure is a direct consequence of a lost-meta fault (the opened
+  image older than writes issued after its meta synced — the D10 shape).
+- **The in-memory page map is flat** with per-entry image overrides; the
+  persisted §4.1 radix is materialised at step 2 and parsed at open and by
+  amcheck. MapLeaf pool residency/pinning is not exercised.
+- **Per-tree sim mutex** replaces latch coupling (card 3.6); merge-only
+  (no inner redistribution); no overflow chains; 4 KiB pages only.
 
 ## Fault model summary
 
-F-CRASH at every crash; F-MEDIA-PAGE (class MP, 1–3 durable page-file
-writes still current) and F-MEDIA-WAL (class MW, 1–2) at the round's
-crash only, never on recovery crashes; taint references survive lives.
-See `src/sim/disk.rs` docs for the exact semantics.
+F-CRASH at every crash; F-MEDIA-PAGE (1–3 faults) and F-MEDIA-WAL (1–2)
+at the round's crash only, never on recovery crashes; taint references
+survive lives. See `src/sim/disk.rs` docs.
 
 ## How to reproduce
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # self-tests + oracle tests
+cargo test -q --release -p e4-recovery      # stages 1–2: sim + oracle suites
 cargo test -q -p e4-recovery                # same, debug
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
-  --results spikes/e4-recovery/results/campaign.json   # exits non-zero: not built
+  --results spikes/e4-recovery/results/campaign.json   # exits 2: not built
 ```
+
