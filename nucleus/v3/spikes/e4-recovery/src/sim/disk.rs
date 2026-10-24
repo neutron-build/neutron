@@ -34,11 +34,15 @@
 //! Taint (1.4): bytes returned by a read are **tainted** if they differ
 //! from the last bytes the store issued to that range in any life of this
 //! seed — including writes dropped by F-CRASH and bytes damaged by media
-//! faults. The store calls [`SimDisk::accepted`] exactly where it accepts
-//! bytes as valid; an accepted range that was tainted at read time is a
-//! served corruption (O-3 failure). Bytes never issued to cannot be
-//! tainted (nothing to differ from); §3.3 still rejects stray bytes there
-//! because they cannot match a reference.
+//! faults. Taint is computed per sub-range, and an issued interval that
+//! starts before the read's offset still counts (a read that begins
+//! mid-batch is judged over its whole extent; gate REWORK item 1). The
+//! store calls [`SimDisk::accepted`] exactly where it accepts bytes as
+//! valid; an accepted range that was tainted at read time — judged
+//! against the most recent read that covers it, at sub-range granularity
+//! (gate REWORK item 2) — is a served corruption (O-3 failure). Bytes
+//! never issued to cannot be tainted (nothing to differ from); §3.3
+//! still rejects stray bytes there because they cannot match a reference.
 //!
 //! Determinism: iteration is over `BTreeMap`s only; every random draw
 //! comes from the caller's [`Rng`] streams.
@@ -98,6 +102,11 @@ pub struct ReadRec {
     /// Bytes returned differ from the last issued bytes somewhere in the
     /// range (the taint flag, 1.4).
     pub tainted: bool,
+    /// The tainted sub-ranges of this read, as absolute file offsets
+    /// (1.4). The accept hook judges the **accepted sub-range** against
+    /// the most recent covering read, so the whole-read flag alone is
+    /// not enough (gate REWORK item 2).
+    pub tainted_ranges: Vec<(u64, u64)>,
 }
 
 /// A volatile directory operation in issue order.
@@ -254,15 +263,29 @@ impl Inode {
         out
     }
 
-    fn taint_of(&self, off: u64, len: u64, view: &[u8]) -> bool {
+    /// The tainted sub-ranges of `[off, off+len)` against the bytes the
+    /// read actually returned (`view`): the intervals where the two
+    /// differ (1.4). An issued interval that starts **before** `off` and
+    /// extends into the range is included — iterating `issued` from
+    /// `off` skips it, which is the gate REWORK item 1 bug: every read
+    /// that begins mid-batch (a WAL read starting inside a previously
+    /// issued 16 KiB batch) was blind to taint, and so was
+    /// [`SimDisk::range_tainted`].
+    fn taint_ranges(&self, off: u64, len: u64, view: &[u8]) -> Vec<(u64, u64)> {
         let end = off + len;
-        let mut cursor = off;
-        for (&fstart, fbytes) in self.issued.range(off..end) {
+        let mut out = Vec::new();
+        // Issued intervals are disjoint (`record_issued` splits the
+        // neighbours of every insert), so the only interval that can
+        // straddle `off` is the last one starting at or before it.
+        let mut first = off;
+        if let Some((&kstart, kbytes)) = self.issued.range(..=off).next_back()
+            && kstart + kbytes.len() as u64 > off
+        {
+            first = kstart;
+        }
+        for (&fstart, fbytes) in self.issued.range(first..end) {
             let fend = fstart + fbytes.len() as u64;
-            if fend <= cursor {
-                continue;
-            }
-            let s = cursor.max(fstart);
+            let s = off.max(fstart);
             let e = end.min(fend);
             if s >= e {
                 continue;
@@ -272,11 +295,15 @@ impl Inode {
             if let (Some(f), Some(v)) = (fseg, vseg)
                 && f != v
             {
-                return true;
+                out.push((s, e));
             }
-            cursor = e;
         }
-        false
+        out
+    }
+
+    /// Whether any part of the range is tainted (1.4).
+    fn taint_of(&self, off: u64, len: u64, view: &[u8]) -> bool {
+        !self.taint_ranges(off, len, view).is_empty()
     }
 
     fn record_issued(&mut self, off: u64, bytes: &[u8]) {
@@ -462,16 +489,19 @@ impl SimDisk {
         }
     }
 
-    /// Read the current view. Records the read with its taint flag.
+    /// Read the current view. Records the read with its taint flag and
+    /// its tainted sub-ranges.
     pub fn read_at(&mut self, id: FileId, off: u64, len: u64) -> Result<Vec<u8>, String> {
         let inode = self.inodes.get_mut(id).ok_or("bad file id")?;
         let view = inode.read_cur(off, len);
-        let tainted = inode.taint_of(off, len, &view);
+        let tainted_ranges = inode.taint_ranges(off, len, &view);
+        let tainted = !tainted_ranges.is_empty();
         self.reads.push(ReadRec {
             inode: id,
             off,
             len,
             tainted,
+            tainted_ranges,
         });
         Ok(view)
     }
@@ -573,15 +603,23 @@ impl SimDisk {
     }
 
     /// The accept hook (card 1.4). The store calls this exactly where it
-    /// accepts bytes as valid. If the most recent read of exactly this
-    /// range was tainted, this records a served corruption.
+    /// accepts bytes as valid — a page passing §3.3, the meta chosen at
+    /// open, page 0, a WAL record the reader yields. A served corruption
+    /// is recorded when the accepted range was tainted at read time,
+    /// judged against the **most recent read that covers it**: the store
+    /// reads in batches (e.g. 16 KiB of WAL) and accepts one record
+    /// inside, so matching only a read of exactly `(off, len)` could
+    /// never fire, and scanning every earlier read would judge stale
+    /// reads (gate REWORK item 2).
     pub fn accepted(&mut self, id: FileId, off: u64, len: u64) {
         self.accepts.push((id, off, len));
+        let end = off + len;
         let tainted = self
             .reads
             .iter()
             .rev()
-            .any(|r| r.inode == id && r.off == off && r.len == len && r.tainted);
+            .find(|r| r.inode == id && r.off <= off && r.off + r.len >= end)
+            .is_some_and(|r| r.tainted_ranges.iter().any(|(s, e)| *s < end && *e > off));
         if tainted {
             self.served.push((id, off, len));
         }
@@ -638,6 +676,12 @@ impl SimDisk {
             }
             // The current view collapses to the durable state; a volatile
             // length change persists only as far as the surviving data.
+            // Gate REWORK item 6a: a **synced** shrink must survive the
+            // crash too — `durable` is truncated to `durable_len`, so
+            // the stale bytes behind the smaller length are not readable
+            // afterwards (1.1: the file's durable length is the extent).
+            let dlen = inode.durable_len.min(inode.durable.len() as u64) as usize;
+            inode.durable.truncate(dlen);
             inode.cur = inode.durable.clone();
             if (inode.durable_len as usize) > inode.cur.len() {
                 inode.cur.resize(inode.durable_len as usize, 0);
@@ -711,9 +755,12 @@ impl SimDisk {
         self.record_media(faults)
     }
 
-    /// Apply F-MEDIA-WAL (class MW): the same, on 1–2 durable WAL writes;
-    /// MISDIRECTED stays within `/wal/` (the same segment; declared
-    /// simplification, see README).
+    /// Apply F-MEDIA-WAL (class MW): the same, on 1–2 durable WAL writes
+    /// drawn **uniformly over every segment's candidates** — the old
+    /// loop faulted only the lowest-id `/wal/` file that had candidates,
+    /// so in multi-segment seeds the active segment was never hit (gate
+    /// REWORK item 6c). MISDIRECTED stays within `/wal/` files (the same
+    /// segment; declared simplification, see README).
     pub fn apply_media_wal(&mut self, rng: &mut Rng) -> Vec<MediaFault> {
         let mut wal_ids: Vec<FileId> = self
             .cur_bindings
@@ -721,15 +768,134 @@ impl SimDisk {
             .map(|m| m.values().copied().collect())
             .unwrap_or_default();
         wal_ids.sort_unstable();
+        let mut cands: Vec<(FileId, DWrite)> = Vec::new();
         for id in wal_ids {
-            let n = 1 + rng.below(2);
-            let got = self.media_faults_common(rng, id, false, &BTreeSet::new(), n, n);
-            let got = self.record_media(got);
-            if !got.is_empty() {
-                return got;
+            cands.extend(
+                self.durable_candidates(id, false)
+                    .into_iter()
+                    .map(|w| (id, w)),
+            );
+        }
+        if cands.is_empty() {
+            return Vec::new();
+        }
+        // 1–2 distinct durable WAL writes, uniform over the pool.
+        let want = 1 + rng.below(2);
+        let mut faults: Vec<MediaFault> = Vec::new();
+        for _ in 0..want {
+            if cands.is_empty() {
+                break;
+            }
+            let idx = rng.below(cands.len() as u64) as usize;
+            let (id, w) = cands.remove(idx);
+            let kind = self.draw_media_kind(rng, id, &w, false);
+            faults.push(MediaFault {
+                inode: id,
+                off: w.off,
+                len: w.bytes.len() as u64,
+                bytes: w.bytes.clone(),
+                pre: w.pre.clone(),
+                kind,
+            });
+        }
+        self.record_media(faults)
+    }
+
+    /// The durable writes of `inode` whose bytes are still current
+    /// (media-fault candidates), in issue order. Page faults target only
+    /// slot-aligned whole-page writes.
+    fn durable_candidates(&self, inode: FileId, page_file: bool) -> Vec<DWrite> {
+        let mut cands = Vec::new();
+        let Some(i) = self.inodes.get(inode) else {
+            return cands;
+        };
+        for w in i.dwrites.iter() {
+            if page_file && (w.off % 4096 != 0 || w.bytes.len() != 4096) {
+                continue;
+            }
+            if i.durable
+                .get(w.off as usize..w.off as usize + w.bytes.len())
+                == Some(w.bytes.as_slice())
+            {
+                cands.push(w.clone());
             }
         }
-        Vec::new()
+        cands
+    }
+
+    /// Draw a fault kind for one candidate write (card 1.3): LOST, or
+    /// MISDIRECTED to another page slot (page file) or another
+    /// 512-aligned offset of the same segment (WAL), or TORN over a
+    /// random non-empty strict subset of the write's sectors.
+    fn draw_media_kind(
+        &self,
+        rng: &mut Rng,
+        inode: FileId,
+        w: &DWrite,
+        page_file: bool,
+    ) -> MediaKind {
+        match rng.below(3) {
+            0 => MediaKind::Lost,
+            1 => {
+                let target_off = if page_file {
+                    let slots = self
+                        .inodes
+                        .get(inode)
+                        .map(|i| i.durable_len / 4096)
+                        .unwrap_or(3);
+                    let t = if rng.below(10) == 0 {
+                        // A meta slot (1–2), with probability 0.1.
+                        1 + rng.below(2)
+                    } else {
+                        let hi = slots.max(3);
+                        1 + rng.below(hi - 1)
+                    };
+                    let mut t = t;
+                    if (t * 4096) == w.off {
+                        t += 1;
+                        if t >= slots.max(3) {
+                            t = 1;
+                        }
+                    }
+                    t * 4096
+                } else {
+                    // WAL: a 512-aligned offset inside this segment.
+                    let len = w.bytes.len() as u64;
+                    let dlen = self.inodes.get(inode).map(|i| i.durable_len).unwrap_or(0);
+                    if dlen > len {
+                        rng.below((dlen - len) / SECTOR + 1) * SECTOR
+                    } else {
+                        0
+                    }
+                };
+                MediaKind::Misdirected { to_off: target_off }
+            }
+            _ => {
+                let s0 = w.off / SECTOR;
+                let s1 = (w.off + w.bytes.len() as u64).div_ceil(SECTOR);
+                let total = (s1 - s0) as usize;
+                if total < 2 {
+                    MediaKind::Lost
+                } else {
+                    let mut set: Vec<u64> = Vec::new();
+                    for _tries in 0..64 {
+                        set.clear();
+                        for s in s0..s1 {
+                            if rng.coin() {
+                                set.push(s * SECTOR);
+                            }
+                        }
+                        if !set.is_empty() && set.len() < total {
+                            break;
+                        }
+                    }
+                    if set.is_empty() || set.len() >= total {
+                        set = vec![s0 * SECTOR];
+                    }
+                    MediaKind::Torn { sectors: set }
+                }
+            }
+        }
     }
 
     fn media_faults_common(
@@ -742,25 +908,7 @@ impl SimDisk {
         nmax: u64,
     ) -> Vec<MediaFault> {
         let want = nmin + rng.below(nmax - nmin + 1);
-        let dwrites = match self.inodes.get(inode) {
-            Some(i) => i.dwrites.clone(),
-            None => return Vec::new(),
-        };
-        // Candidates: durable writes whose bytes are still current. Page
-        // faults only target slot-aligned whole-page writes.
-        let mut cands: Vec<DWrite> = Vec::new();
-        for w in dwrites.iter() {
-            if page_file && (w.off % 4096 != 0 || w.bytes.len() != 4096) {
-                continue;
-            }
-            if let Some(i) = self.inodes.get(inode)
-                && i.durable
-                    .get(w.off as usize..w.off as usize + w.bytes.len())
-                    == Some(w.bytes.as_slice())
-            {
-                cands.push(w.clone());
-            }
-        }
+        let cands = self.durable_candidates(inode, page_file);
         if cands.is_empty() {
             return Vec::new();
         }
@@ -787,68 +935,7 @@ impl SimDisk {
             let Some(w) = cands.get(idx).cloned() else {
                 break;
             };
-            let kind = match rng.below(3) {
-                0 => MediaKind::Lost,
-                1 => {
-                    let target_off = if page_file {
-                        let slots = self
-                            .inodes
-                            .get(inode)
-                            .map(|i| i.durable_len / 4096)
-                            .unwrap_or(3);
-                        let t = if rng.below(10) == 0 {
-                            // A meta slot (1–2), with probability 0.1.
-                            1 + rng.below(2)
-                        } else {
-                            let hi = slots.max(3);
-                            1 + rng.below(hi - 1)
-                        };
-                        let mut t = t;
-                        if (t * 4096) == w.off {
-                            t += 1;
-                            if t >= slots.max(3) {
-                                t = 1;
-                            }
-                        }
-                        t * 4096
-                    } else {
-                        // WAL: a 512-aligned offset inside this segment.
-                        let len = w.bytes.len() as u64;
-                        let dlen = self.inodes.get(inode).map(|i| i.durable_len).unwrap_or(0);
-                        if dlen > len {
-                            rng.below((dlen - len) / SECTOR + 1) * SECTOR
-                        } else {
-                            0
-                        }
-                    };
-                    MediaKind::Misdirected { to_off: target_off }
-                }
-                _ => {
-                    let s0 = w.off / SECTOR;
-                    let s1 = (w.off + w.bytes.len() as u64).div_ceil(SECTOR);
-                    let total = (s1 - s0) as usize;
-                    if total < 2 {
-                        MediaKind::Lost
-                    } else {
-                        let mut set: Vec<u64> = Vec::new();
-                        for _tries in 0..64 {
-                            set.clear();
-                            for s in s0..s1 {
-                                if rng.coin() {
-                                    set.push(s * SECTOR);
-                                }
-                            }
-                            if !set.is_empty() && set.len() < total {
-                                break;
-                            }
-                        }
-                        if set.is_empty() || set.len() >= total {
-                            set = vec![s0 * SECTOR];
-                        }
-                        MediaKind::Torn { sectors: set }
-                    }
-                }
-            };
+            let kind = self.draw_media_kind(rng, inode, &w, page_file);
             faults.push(MediaFault {
                 inode,
                 off: w.off,

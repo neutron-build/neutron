@@ -1,14 +1,18 @@
 //! SimDisk and scheduler self-tests (card X-5 Work 1.5). P-written checks:
 //! per-sector prefix semantics, sync coverage per file, `sync_data` length
 //! growth, the directory-op prefix rule, taint across lives, scheduler
-//! determinism under a fixed seed, and deadlock detection.
+//! determinism under a fixed seed, and deadlock detection. Plus the gate
+//! REWORK (2026-10-23) pinned tests: taint over a read starting inside an
+//! issued range, the accept hook's covering-read sub-range rule, a synced
+//! shrink surviving the crash, and F-MEDIA-WAL drawing across all
+//! segments.
 
 use std::sync::Arc;
 
 use e4_recovery::rng::Rng;
 use e4_recovery::sim::{
     DiskEvent, E4Env, EnvRef, FaultKnobs, HARNESS, HasDisk, PAGE_FILE, ROOT_DIR, Sched, SchedCore,
-    SchedHost, SimDisk, SimFail, TaskId, WaitKey,
+    SchedHost, SimDisk, SimFail, TaskId, WAL_DIR, WaitKey,
 };
 
 /// A minimal world for these tests: just the scheduler core and the disk.
@@ -458,4 +462,171 @@ fn drop_all() -> FaultKnobs {
         keep_latest_pm: 0,
         tear_pm: 0,
     }
+}
+
+/// Gate REWORK item 1 (pinned): taint covers a read that **starts inside**
+/// an issued range. Write 8 KiB at 0 and sync it, issue 8 KiB again
+/// (dropped by the crash), crash: reading `[4096, 8192)` must be tainted —
+/// the issued interval starts at 0, before the read, and the run-1
+/// `issued.range(off..end)` walk skipped it. Every WAL read that begins
+/// mid-batch has this shape.
+#[test]
+fn taint_covers_read_starting_inside_issued_range() {
+    let mut rng = Rng::new(9);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[0x11u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    disk.write_at(f, 0, &[0x22u8; 8192]).unwrap(); // volatile, will drop
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    // The full range: tainted (the last issued bytes were the 0x22s).
+    let _ = disk.read_at(f, 0, 8192).unwrap();
+    assert!(disk.reads.last().unwrap().tainted);
+    // The second half, starting inside the issued range: tainted too.
+    let _ = disk.read_at(f, 4096, 4096).unwrap();
+    assert!(
+        disk.reads.last().unwrap().tainted,
+        "a read starting inside an issued range is tainted"
+    );
+    // The observer view agrees (O-3 (e)'s tainted referenced slots).
+    assert!(disk.range_tainted(f, 4096, 4096));
+}
+
+/// Gate REWORK item 2 (pinned): the accept hook judges the accepted
+/// sub-range against the **most recent read that covers it**. A tainted
+/// 8 KiB batch read followed by `accepted(f, 0, 100)` is a served
+/// corruption (an exact `(off, len)` match could never fire); after the
+/// store re-issues the bytes and re-reads, the same accept is clean.
+#[test]
+fn accept_hook_judges_subrange_of_covering_read() {
+    let mut rng = Rng::new(12);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    disk.write_at(f, 0, &[2u8; 8192]).unwrap(); // volatile, will drop
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    // A batched read of the whole range, tainted; the store accepts one
+    // record inside it.
+    let _ = disk.read_at(f, 0, 8192).unwrap();
+    disk.accepted(f, 0, 100);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "accepting a sub-range of a tainted covering read is served corruption"
+    );
+    // The most recent covering read governs: the store re-issues exactly
+    // the surviving bytes, reads again (clean), and the same accept is
+    // not served a second time.
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    let _ = disk.read_at(f, 0, 8192).unwrap();
+    assert!(!disk.reads.last().unwrap().tainted);
+    disk.accepted(f, 0, 100);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "an accept over a clean re-read is not served corruption"
+    );
+}
+
+/// Gate REWORK item 2 (pinned, sub-range granularity): only the tainted
+/// part of a covering read makes an accept served. The volatile write
+/// covers just the first sector, so after the drop-only crash exactly
+/// `[0, 512)` is tainted.
+#[test]
+fn accept_hook_subrange_taint_only() {
+    let mut rng = Rng::new(13);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    disk.write_at(f, 0, &[2u8; 512]).unwrap(); // volatile, will drop
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    let _ = disk.read_at(f, 0, 8192).unwrap();
+    assert_eq!(
+        disk.reads.last().unwrap().tainted_ranges,
+        vec![(0, 512)],
+        "exactly the first sector is tainted"
+    );
+    // Accepting bytes outside the tainted interval: not served.
+    disk.accepted(f, 4096, 512);
+    assert!(
+        disk.served.is_empty(),
+        "an accept outside the tainted interval is not served corruption"
+    );
+    // Accepting bytes inside it: served.
+    disk.accepted(f, 0, 100);
+    assert_eq!(disk.served.len(), 1);
+}
+
+/// Gate REWORK item 6a (pinned): a **synced shrink** survives the crash —
+/// after `set_len(4096)` + `sync_all` and a crash, the stale bytes behind
+/// the smaller durable length are gone (reading at 4096 yields zeros,
+/// card 1.1). The run-1 collapse set `cur = durable` without truncating
+/// to `durable_len`, so the old tail stayed readable.
+#[test]
+fn synced_shrink_survives_crash() {
+    let mut rng = Rng::new(17);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[0xABu8; 8192]).unwrap();
+    disk.sync_all(f).unwrap();
+    disk.set_len(f, 4096).unwrap();
+    disk.sync_all(f).unwrap();
+    disk.apply_crash(&mut rng, &drop_all());
+    assert_eq!(disk.durable_len(f), 4096);
+    assert_eq!(disk.read_at(f, 0, 16).unwrap(), vec![0xABu8; 16]);
+    assert_eq!(
+        disk.read_at(f, 4096, 64).unwrap(),
+        vec![0u8; 64],
+        "no stale bytes behind the durable length"
+    );
+    assert_eq!(
+        disk.read_at(f, 8128, 64).unwrap(),
+        vec![0u8; 64],
+        "no stale bytes at the old tail either"
+    );
+}
+
+/// Gate REWORK item 6c (pinned): F-MEDIA-WAL draws uniformly over every
+/// segment's candidates. With candidates in both `/wal/` segments, the
+/// higher-id (active) segment is hit for some seed — the run-1 loop
+/// faulted only the lowest-id segment that had candidates.
+#[test]
+fn media_wal_draws_across_all_segments() {
+    let mut hit_low = false;
+    let mut hit_high = false;
+    for seed in 0..64u64 {
+        let mut rng = Rng::new(300 + seed);
+        let mut disk = SimDisk::new();
+        let lo = disk.create("/wal/0001").unwrap();
+        let hi = disk.create("/wal/0002").unwrap();
+        disk.sync_dir(WAL_DIR).unwrap();
+        disk.write_at(lo, 0, &[0x11u8; 1024]).unwrap();
+        disk.sync_data(lo).unwrap();
+        disk.write_at(hi, 0, &[0x22u8; 1024]).unwrap();
+        disk.sync_data(hi).unwrap();
+        let faults = disk.apply_media_wal(&mut rng);
+        assert!(!faults.is_empty(), "seed {seed}: candidates exist");
+        for fault in &faults {
+            if fault.inode == lo {
+                hit_low = true;
+            }
+            if fault.inode == hi {
+                hit_high = true;
+            }
+        }
+    }
+    assert!(
+        hit_high,
+        "the active (higher-id) segment is faulted for some seed"
+    );
+    assert!(hit_low, "the low segment is faulted for some seed too");
 }
