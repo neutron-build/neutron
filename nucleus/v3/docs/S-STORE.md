@@ -1,6 +1,6 @@
 # S-STORE: Storage layer (normative)
 
-Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
 
 **Scope.** This file covers:
 - the file, the pages, the page map, the free set and the buffer manager;
@@ -329,7 +329,7 @@ Iterators are **streaming**: a range scan never materialises its range. The spik
 ### 6.7 Overflow chains
 An entry whose value exceeds `V_INLINE` stores a reference `(len u64, first LPID)` in its value, with tag 4 or 5 (§7.3). The chain is a list of Overflow pages.
 - **Immutability.** Chains are immutable once written (versions are immutable).
-- **Freeing.** A chain is freed **in the same gated operation** that deletes its entry (§10). **Exception:** a conversion of a tag-8 provisional entry (C-T0 v8 §2.4) moves the chain to the new tag-4 or tag-5 entry and deletes the provisional entry without freeing it. Both happen in one gated operation, so no image holds two references to one chain. A chain free therefore holds the flip for the chain's length. A-5 measures this at the maximum value size; if it is too long, A-5 proposes a resumable free, which is an edit of this file.
+- **Freeing.** A chain is freed **in the same gated operation** that deletes its entry (§10), or that replaces its entry's value: a provisional rewrite (C-T0 v8 §2.4) or a superseding replay op (§14), unless the new value is the same chain. **Exception:** a conversion of a tag-8 provisional entry (C-T0 v8 §2.4) moves the chain to the new tag-4 or tag-5 entry and deletes the provisional entry without freeing it. Both happen in one gated operation, so no image holds two references to one chain. A chain free therefore holds the flip for the chain's length. A-5 measures this at the maximum value size; if it is too long, A-5 proposes a resumable free, which is an edit of this file.
 - **Reading without the leaf latch.** A reader that holds a registered snapshot `S ≥ W` may read the chain after releasing the leaf latch. GC never deletes a version that is the newest `≤ S` for any registered `S` (I-GC-READEQ), so a version that a registered snapshot reads cannot lose its chain while the reader holds that registration.
 
 ### 6.8 Tree directory
@@ -500,7 +500,7 @@ A GC mutation on a tree with watermark `w` requires two things:
 1. `w ≤` the watermark C-T0 v8 published at the time of the mutation;
 2. **every insert of an entry with `ts ≤ w` into that tree has finished.**
 
-Condition 2 holds for apply, because `w ≤ visible_ts` and applies of later commits carry ts `> visible_ts`. It must also hold for bulk loads, which write entries at a ts `S` (§12.8). Registering `S` itself is not enough, because it gives only `W ≤ S`, and a GC at `w = S` could then run beside the load's unfinished inserts at `S`. So for the whole load, S-3 keeps a snapshot registered below `S`, which gives `W < S`.
+Condition 2 holds for apply and for provisional conversions, because `w ≤ W ≤ M`, the apply frontier (C-T0 v8 §3.5, §9.1): applies of later commits carry ts `> visible_ts ≥ M`, and a conversion inserts at the commit ts `c` of a large transaction that is not finalized, so `c > M`. Provisional entries (suffix `u64::MAX`) are not versions and are not inserts in this sense. It must also hold for bulk loads, which write entries at a ts `S` (§12.8). Registering `S` itself is not enough, because it gives only `W ≤ S`, and a GC at `w = S` could then run beside the load's unfinished inserts at `S`. So for the whole load, S-3 keeps a snapshot registered below `S`, which gives `W < S`.
 
 **The registration comes before `S` is chosen.** `W` is monotonic (§1), and it equals `visible_ts` when no older snapshot is registered. So `W` may already be `S` when `S` is picked, and a registration at `S − 1` made after that cannot hold `W` down. S-3 therefore:
 1. registers a snapshot at some `R` (normally the current `visible_ts`), which holds `W ≤ R` from then on;
@@ -622,7 +622,7 @@ When sweeps run, how often, and with what I/O budget is S-2/B-3's decision (back
 
 ### 10.5 The image's watermark (`gc_w`)
 - **What it records.** The store keeps `gc_w_used`, the largest `w` it has applied in any GC mutation. At open it starts at the recovered meta's `gc_w`, so a checkpoint taken before the first GC mutation (including the boot checkpoint, §14 step 8) still records the image's bound (mutant GCW-NOT-RECORDED). At the flip of checkpoint `k`, it records that value as meta `k`'s `gc_w`. While the flip holds the gate, no GC mutation is in flight, so `gc_w` bounds every GC mutation contained in image `k`.
-- **Bound.** `gc_w ≤ T` always: each `w` was `≤ visible_ts` at its use, and `visible_ts` at the flip is `T`. A violation at meta write is fail-stop.
+- **Bound.** `gc_w ≤ T` always. Each `w` was `≤ W` at its use (§10.1 condition 1), and `W ≤ M`, the apply frontier (C-T0 v8 §3.5, §9.1). `M` is monotonic, and the flip takes `T := M` (§13 step 0), so every `w` used before the flip is `≤ T`. At open, `gc_w_used` starts at the recovered `gc_w ≤` the recovered `T ≤` the recovered apply frontier. A violation at meta write is fail-stop.
 - **I-GCW.** Meta `k`'s `gc_w` is `≥` every `w` of a GC mutation in image `k`, and `≤ T`. Mutants:
   - **GCW-NOT-RECORDED:** the meta carries the previous `gc_w` or 0. After a restart, `W` can then start below the image's pruning, and a snapshot in that gap reads a pruned state;
   - **GCW-BOUND-SKIP:** the `gc_w ≤ T` check at meta write is removed.
@@ -675,7 +675,7 @@ len        u32  bytes of the whole record
 crc        u32  CRC32C of the bytes after this field, to the end of the record
 lsn        u64  this record's own start position
 kind       u8   1 Commit | 2 Chunk | 3 CommitMarker | 4 SegmentEnd
-txn        (u32 boot epoch, u64 n)   C-T0 TxnId
+txn        (u32 boot id, u64 n)      C-T0 TxnId
 commit_ts  u64  0 in Chunk and SegmentEnd
 payload
 ```
@@ -800,7 +800,7 @@ Pages created or mutated only after the flip are not part of the image.
 **I-CKPT-AT-T.** Image `k` is a consistent cut: every gated operation is wholly before or wholly after the flip. In image `k`:
 - **(a)** every commit with ts `≤ T` is wholly present, up to GC `≤ gc_w`. For every snapshot `S` with `gc_w ≤ S ≤ T`, reads on the image equal reads on the committed state at `T`;
 - **(b)** every entry with ts `> T` belongs to a commit `c > T` whose records are durable when meta `k` is written (step 1), so recovery replays `c` wholly;
-- **(c)** every ordinary entry belongs to a committed transaction (N2). An image may hold **provisional entries** (§7.3 tags 6–8) of any transaction, committed or not. After recovery every one of them is dead (C-T0 v8 §2.4: its epoch is not the new boot epoch), so none is ever read as data. A committed transaction's data is in the image as ordinary entries if its commit ts is `≤ T` (`T` is the apply frontier, C-T0 v8's `M`), and otherwise it is replayed from its durable chunks (§12.6, §14). Mutant CKPT-T-VISIBLE (`T` taken as `visible_ts`).
+- **(c)** every ordinary entry belongs to a committed transaction (N2). An image may hold **provisional entries** (§7.3 tags 6–8) of any transaction, committed or not. After recovery every one of them is dead (C-T0 v8 §2.4: its `txn.boot` is not the new boot id), so none is ever read as data. A committed transaction's data is in the image as ordinary entries if its commit ts is `≤ T` (`T` is the apply frontier, C-T0 v8's `M`), and otherwise it is replayed from its durable chunks (§12.6, §14). Mutant CKPT-T-VISIBLE (`T` taken as `visible_ts`).
 
 **Exception.** The unlogged entries of a §12.8 bulk load in a tree that is **not yet published** are exempt from (a)–(c):
 - they come from no commit;
@@ -826,11 +826,11 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 
    A chunk whose transaction has no marker is ignored. Records with `commit_ts ≤ T` are skipped: they are in the image.
 
-   **Chunk supersede (I-CHUNK-SUPERSEDE).** For a chunked transaction, each op inserts or replaces the entry `key@commit_ts`, and a `Delete{revert}` deletes it if present. So the last op per key wins, whatever the image already holds for that key at that ts. An op that inserts an entry identical to the present one is a no-op. Ops of a `Commit` record keep I-ENTRY-UNIQUE's XX001 for a different value. Mutant SUPERSEDE-AS-CONFLICT: a superseding op is treated as a conflict (XX001).
+   **Chunk supersede (I-CHUNK-SUPERSEDE).** For a chunked transaction, each op inserts or replaces the entry `key@commit_ts`, and a `Delete{revert}` deletes it if present. A replace or delete frees the replaced value's overflow chain in the same gated operation (§6.7). So the last op per key wins, whatever the image already holds for that key at that ts. An op that inserts an entry identical to the present one is a no-op. Ops of a `Commit` record keep I-ENTRY-UNIQUE's XX001 for a different value. Mutant SUPERSEDE-AS-CONFLICT: a superseding op is treated as a conflict (XX001).
 5. Truncate the WAL at the valid end.
 6. Resume the walks of every `dropping` directory entry (§6.8), as a B-6 boot job.
 7. Optionally run `amcheck` (A-8).
-8. Run the **boot checkpoint** (§13) before the first transaction starts. Its `ckpt_id` gives C-T0 v8's boot epoch (C-T0 v8 §2.5). Chunks of the previous boot that have no marker belong to transactions aborted before this flip, so they do not hold back `wal_start_lsn` (§12.6).
+8. Run the **boot checkpoint** (§13). It runs every step 0–6 and **always writes a new meta** (`ckpt_id` one above the recovered meta's), even when no page is dirty. No transaction starts until its step 5 has made that meta durable. Its `ckpt_id` gives C-T0 v8's **boot id** (C-T0 v8 §2.5), which is not the checkpoint epoch `e` (one higher after the flip). Chunks of the previous boot that have no marker belong to transactions aborted before this flip, so they do not hold back `wal_start_lsn` (§12.6). A **read-only open** (N11) skips this step and has no boot id; every provisional entry is dead to it.
 
 Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if nothing was replayed. C-T0 v8 restarts its sequencer and watermark from that value and from `gc_w` (C-T0 v8 §3.7). Provisional entries found in the image are dead and are ignored by every read (§8).
 
@@ -919,10 +919,10 @@ All numbers are from n5000 (i5-13500H, 16 CPUs), rustc 1.99.0, in memory, median
 ## 17. Boundaries
 
 **C-T0 v8 (card S-2) owns, and this file does not specify:**
-- **Watermark.** The computation, publication and monotonicity of `W`, and its floor after a restart (`≥` meta `gc_w`, §10.5). That `W ≤` every registered snapshot and `W ≤ visible_ts` is the precondition this file relies on (§10.1).
+- **Watermark.** The computation, publication and monotonicity of `W`, and its floor after a restart (`≥` meta `gc_w`, §10.5). That `W ≤` every registered snapshot and `W ≤ M`, the apply frontier (hence `W ≤ visible_ts`), is the precondition this file relies on (§10.1, §10.5).
 - **The write set and lock table:** own-write merge (I-HALLOWEEN), escalation, NOWAIT/SKIP LOCKED.
 - **The write-side rules:** the RR check after the lock wait, unique checks and ON CONFLICT, using §8.2.
-- **Commit-visibility semantics.** The commit ack waits for `visible_ts ≥ c` or a session floor (decision block, "Commit visibility").
+- **Commit-visibility semantics.** The commit ack waits for `visible_ts ≥ c` (decision block, "Commit visibility"). There is no session floor: C-T0 v8 §3.4 rejects it and says why.
 - **Pre-applying large transactions** as transaction-tagged provisional entries (decision block, "Large-txn head-of-line"). Specified in C-T0 v8 §2.4 and §3.2. This file holds the encoding (§7.1, §7.3 tags 6–8), the read rule (§8), chunk supersede (§12.7, §14) and the image rule (I-CKPT-AT-T (c)), from the S-2 co-edit.
 - **Lock release at commit cheaper than O(keys)** (325k–437k probes slipped through the release tail in W6): C-T0 v8 §3.3.
 - **Unrelated commits stalled** behind a big apply by the ts-ordered `visible_ts` advance: C-T0 v8 §3.1–§3.2.
@@ -977,6 +977,10 @@ This file wins over the plan (precedence above). The plan should be updated thro
 
 ## Changelog
 
+- **S-2-F1** (2026-10-23, card S-2-F1, with C-T0 v8 draft 8.1, per `verdicts/S-2.md`):
+  - **Frontiers (item 3).** §10.5's Bound argues from `W ≤ M`, `M` monotonic and `T := M`. §17 "Watermark" names `W ≤ M`. §17 "Commit-visibility" drops the session floor. §10.1 condition 2 argues from `w ≤ W ≤ M` and covers conversions.
+  - **Boot checkpoint (item 8).** Always a new meta, durable before the first transaction, skipped by read-only opens; its `ckpt_id` gives the **boot id**, renamed from "boot epoch" (§12.2, §13 (c), §14 step 8).
+  - **Chain free on replace (item 10).** A provisional rewrite and a superseding replay op free the replaced chain (§6.7, §14 step 4).
 - **S-2 co-edit** (2026-10-23, card S-2, with C-T0 v8 draft 8.0):
   - **Provisional entries.** Tags 6–8 at suffix `u64::MAX` (§7.1, §7.3); I-TAG-RESERVED restated; the provisional-head read rule and I-PROV-READ (§8); provisional entries are not versions to GC, and dead ones may be deleted (§10.2); the conversion's chain transfer (§6.7, §6.5).
   - **Apply frontier.** Now C-T0 v8's `M` (§1). I-CKPT-AT-T (c) covers images that hold provisional entries (§13).
