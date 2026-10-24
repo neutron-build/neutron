@@ -727,3 +727,91 @@ fn media_wal_draws_across_all_segments() {
     );
     assert!(hit_low, "the low segment is faulted for some seed too");
 }
+
+/// Card X-5b Work 11, rule 4 (pinned): an S-BATON violation is loud, not
+/// a hang. A task that holds an `acquire` guard of the world across a
+/// yield point gets `SimFail::Baton` naming the call site — at the yield
+/// (the run-1 deadlock shape) and at a re-entrant acquisition — and the
+/// world stays usable afterwards. Demonstrated by hand with a blocking
+/// `lock` replaced for `acquire`: the test then hangs and is killed (see
+/// the stage RESULT, instrumentation checks).
+#[test]
+fn baton_violation_is_reported() {
+    let sched = run_world(2, 4242, |sched, t| {
+        // Take the baton first (the protocol of every task's first call).
+        sched.yield_baton(t)?;
+        // (a) The run-1 shape: a world guard held across a yield. The
+        // yield refuses to park and names its site.
+        let g = sched
+            .acquire("test:hold")
+            .map_err(|_| SimFail::Internal("acquire failed"))?;
+        assert_eq!(
+            sched.yield_baton_at(t, "test:yield-under-guard"),
+            Err(SimFail::Baton("test:yield-under-guard")),
+            "a yield under a held world must report Baton, not park"
+        );
+        // (b) A wait under the guard is also refused.
+        assert_eq!(
+            sched.wait_for(t, WaitKey::Pin),
+            Err(SimFail::Baton("wait_for")),
+            "a wait under a held world must report Baton, not park"
+        );
+        // (c) A re-entrant acquisition is refused before it deadlocks.
+        assert!(
+            matches!(
+                sched.acquire("test:reentrant"),
+                Err(SimFail::Baton("test:reentrant"))
+            ),
+            "a re-entrant world acquisition must report Baton"
+        );
+        drop(g);
+        // The world is usable again: a plain yield succeeds.
+        sched.yield_baton(t)?;
+        Ok(())
+    });
+    let h = sched.lock();
+    assert!(!h.sched.deadlock, "no deadlock may be recorded");
+    assert!(!h.sched.crashed, "no crash may be recorded");
+}
+
+/// The B3 pin (card X-5b Work 14; X-5 round-3 verdict 42c6ad90's
+/// uncaught mutant B3): the accept hook judges each accepted byte against
+/// the most recent read that covers **that byte**, so a record whose tail
+/// was covered only by an older, tainted read is served corruption even
+/// when a newer, clean read covers the rest. Shaped like
+/// `accept_hook_judges_across_reassembly_reads` but with only the older
+/// read tainted.
+#[test]
+fn accept_hook_judges_older_tainted_read() {
+    let mut rng = Rng::new(23);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    // A volatile write inside the first read's tail only: the issued
+    // bytes of [4000, 4096) become 0x22 and the crash drops them.
+    disk.write_at(f, 4000, &[2u8; 96]).unwrap();
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    // (1) read [0, 4096): tainted inside [4000, 4096).
+    let _ = disk.read_at(f, 0, 4096).unwrap();
+    let r1 = disk.reads.last().cloned().unwrap();
+    assert!(r1.tainted, "the older read is tainted");
+    assert_eq!(r1.tainted_ranges.len(), 1, "exactly one tainted sub-range");
+    // (2) read [4096, 8192): clean (nothing was ever issued there that
+    // differs from the surviving bytes).
+    let _ = disk.read_at(f, 4096, 4096).unwrap();
+    assert!(
+        !disk.reads.last().unwrap().tainted,
+        "the newer read is clean"
+    );
+    // (3) `accepted(f, 4000, 200)`: served — the tainted byte was
+    // covered only by the older read.
+    disk.accepted(f, 4000, 200);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "an accept judged by an older tainted read is served corruption"
+    );
+}

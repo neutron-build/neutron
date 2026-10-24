@@ -1,19 +1,38 @@
 #![deny(clippy::indexing_slicing)]
 //! Checkpoint (S-STORE §13; card Work 4.6, hooks 4.8), recovery (§14;
-//! card 4.7, fills G2–G4), amcheck (card 3.8), and file open/create
-//! (§2; card 3.1, fills G1/G6).
+//! card 4.7, fills G2–G4), and file open/create (§2; card 3.1, fills
+//! G1/G6) — converted to the S-BATON step discipline (card X-5b Work 11).
 //!
 //! The checkpoint steps run in order, each step boundary a named hook
 //! (`CkptHook`); the scheduler can crash at any hook. Recovery follows
-//! §14's two passes with the `commit_ts > T` skip, truncates **physically**
-//! (G2: zero from the valid end, sync, `sync_dir`) and fails XX001 on a
-//! missing start segment (G3). Amcheck checks a quiescent image through
-//! SimDisk reads.
+//! §14's two passes with the `commit_ts > T` skip, truncates
+//! **physically** (G2: zero from the valid end, `sync_data`, `sync_dir`)
+//! and fails XX001 on a missing start segment (G3).
+//!
+//! Step 2's shape (with the Work 12 flat-map amendment): the data phase
+//! writes every dirty frame with content epoch ≤ k and every epoch copy
+//! out to fresh slots, resolving all `CopyPending` overrides; after it,
+//! the effective image is snapshot-stable (a later first-touch freeze
+//! records the same ref the image already follows — see
+//! [`crate::store::prims`]), so the map radix (CoW: only leaves whose
+//! content changed since image k−1) and the free set serialise exactly
+//! the same image, with the free set last (§13 step 2).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{page, Fail, Img, Mutant, StoreInner, Cx, WAL_SEG};
-use crate::sim::{E4Env, FileId, PAGE_FILE, ROOT_DIR, WAL_DIR};
+use super::page::{self, Ref};
+use super::prims;
+use super::tree;
+use super::wal::{self, K_CHUNK, K_COMMIT, K_MARKER, K_SEGEND};
+use super::{Cx, Fail, Img, Mutant, StoreCfg, StoreHost, StoreInner, WAL_SEG};
+use crate::sim::{E4Env, PAGE_FILE, ROOT_DIR, WAL_DIR};
+
+/// The bit index of LPID `l` in the persisted free-set bitmap: slot bits
+/// `[0, slot_count-3)` (slots `bit+3`), then one bit per LPID starting at
+/// `slot_count-3` for LPID 1 (§4.3's two bitmaps, serialised as one run).
+pub fn lpid_bit(slot_count: u64, l: u64) -> u64 {
+    (slot_count - 3) + l - 1
+}
 
 /// The checkpoint hooks (card 4.8), in `CKPT_HOOKS` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +43,8 @@ pub enum CkptHook {
     After0,
     /// After step 1.
     After1,
-    /// Inside step 2, after a seeded fraction of its writes.
+    /// Inside step 2: fired after **every** step-2 write; the harness
+    /// crashes at its seeded fraction of them.
     Mid2,
     /// After step 2.
     After2,
@@ -40,7 +60,7 @@ pub enum CkptHook {
     After6,
 }
 
-/// The hooks in card order (5.5 uses `(seed / 20) % 10` over this).
+/// The hooks in card order.
 pub const CKPT_HOOKS: [CkptHook; 10] = [
     CkptHook::Before0,
     CkptHook::After0,
@@ -54,1106 +74,1040 @@ pub const CKPT_HOOKS: [CkptHook; 10] = [
     CkptHook::After6,
 ];
 
-impl StoreInner {
-    // ---- open / create (§2) ----
+/// A checkpoint hook callback: `Err` aborts the checkpoint (a harness
+/// crash arms the scheduler's crash flag and returns `Crashed`).
+pub type Hooks<'a> = dyn FnMut(CkptHook) -> Result<(), Fail> + 'a;
 
-    /// Create the store (§2.3 + G6): page 0 + `sync_all`, image 0 (an
-    /// empty tree directory and an empty page map), meta 0 + `sync_all`,
-    /// with G1's directory syncs, all completing before the first crash
-    /// point.
-    pub fn create(cx: &Cx, cfg: super::StoreCfg, uuid: u128) -> Result<Self, Fail> {
-        let page_file = cx.env().create(PAGE_FILE).map_err(Fail::Sim)?;
-        // G1: sync_dir("/") after creating the page file and wal/.
-        cx.env().create("/wal/.keep").map_err(Fail::Sim)?;
-        cx.env().sync_dir(ROOT_DIR).map_err(Fail::Sim)?;
-        cx.env().sync_dir(WAL_DIR).map_err(Fail::Sim)?;
-        let p0 = page::build_page0(uuid);
-        cx.env().write_at(page_file, 0, &p0).map_err(Fail::Sim)?;
-        cx.env().sync_all(page_file).map_err(Fail::Sim)?;
-        // Build image 0 through the normal checkpoint path (§2.3): an
-        // empty tree directory (a root leaf) and an empty page map.
-        let mut st = StoreInner::empty(cfg, page_file);
-        st.alloc_slot_hinted(3);
-        let dir_root = st.alloc_lpid();
-        let leaf = page::build_leaf(dir_root, 1, &[]);
-        let slot = st.alloc_slot(cx)?;
-        cx.env()
-            .write_at(page_file, slot * page::PAGE as u64, &leaf)
-            .map_err(Fail::Sim)?;
-        st.map.cur.insert(
-            dir_root,
-            page::Ref {
-                slot,
-                epoch: 1,
-                crc: page::header_crc(&leaf),
-            },
-        );
-        st.slots.used_cur.insert(slot);
-        let meta = page::Meta {
-            ckpt_id: 0,
-            t: 0,
-            gc_w: 0,
-            epoch: 0,
-            map_root: page::Ref::default(),
-            free_root: page::Ref::default(),
-            dir_root,
-            next_lpid: st.meta.next_lpid,
-            slot_count: st.slots.slot_count,
-            wal_start_lsn: 0,
-        };
-        st.meta = meta;
-        st.write_meta(cx, &meta)?;
-        st.k = 0;
-        st.e = 1; // epoch 1 begins (§2.3)
-        st.slots.used_durable = st.image_slot_set();
-        st.slots.used_durable.insert(slot);
-        Ok(st)
-    }
+// ---- open / create (§2) ----
 
-    /// An empty store shell (no file content).
-    pub fn empty(cfg: super::StoreCfg, page_file: FileId) -> Self {
-        let mut pool = super::Pool {
-            frames: Vec::new(),
-            hand: 0,
-        };
-        for _ in 0..cfg.pool_frames {
-            pool.frames.push(super::Frame {
-                key: 0,
-                bytes: Vec::new(),
-                epoch: 0,
-                dirty: false,
-                pins: 0,
-                is_epoch_copy: false,
-                refed: false,
-            });
+/// Create the store (§2.3 + G6): page 0 + `sync_all`, image 0 (an empty
+/// tree directory and an empty page map), meta 0 + `sync_all`, with G1's
+/// directory syncs, all completing before the first crash point (the
+/// harness runs creation in its own pre-pass). Returns the store; the
+/// caller installs it in the host.
+///
+/// Image 0 is built with direct env writes (the store is not yet serving
+/// traffic): the directory root at slot 3, the map radix and the free
+/// set above it, exactly the byte layout step 2 produces later.
+pub fn create<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg, uuid: u128) -> Result<StoreInner, Fail> {
+    let page_file = cx.env().create(PAGE_FILE).map_err(Fail::Sim)?;
+    // G1/G6: `sync_dir("/")` after creating the page file and `wal/`.
+    cx.env().create("/wal/.keep").map_err(Fail::Sim)?;
+    cx.env().sync_dir(ROOT_DIR).map_err(Fail::Sim)?;
+    cx.env().sync_dir(WAL_DIR).map_err(Fail::Sim)?;
+    let p0 = page::build_page0(uuid, WAL_SEG as u32);
+    cx.env().write_at(page_file, 0, &p0).map_err(Fail::Sim)?;
+    cx.env().sync_all(page_file).map_err(Fail::Sim)?;
+
+    let mut probe = StoreInner::empty(cfg, page_file);
+    // The directory root: LPID 1 (a leaf; epoch 1), written to slot 3.
+    let dir_root = 1u64;
+    probe.meta.next_lpid = dir_root + 1;
+    let leaf = page::build_leaf(dir_root, 1, &[]);
+    cx.env()
+        .write_at(page_file, 3 * page::PAGE as u64, &leaf)
+        .map_err(Fail::Sim)?;
+    let dir_ref = Ref {
+        slot: 3,
+        epoch: page::header_epoch(&leaf),
+        crc: page::header_crc(&leaf),
+    };
+    probe.map.cur.insert(dir_root, dir_ref);
+    probe.slots.used_cur.insert(3);
+
+    // The map radix: one MapLeaf at slot 4 (LPID 1 mapped, the rest
+    // unmapped) — a single leaf covers `next_lpid = 2` at every cap.
+    let cap = probe.cfg.map_leaf_cap;
+    let entries: Vec<Option<Ref>> = {
+        let mut v = vec![None; cap as usize];
+        if let Some(e) = v.get_mut(1) {
+            *e = Some(dir_ref);
         }
-        let mut slots = super::SlotState::default();
-        slots.slot_count = 16; // grows on demand (card 3.3: max(16, n/16))
-        Self {
-            cfg,
-            page_file,
-            k: 0,
-            e: 1,
-            meta: page::Meta::default(),
-            dir: BTreeMap::new(),
-            map: super::MapState::default(),
-            slots,
-            pool,
-            gate: super::Gate::default(),
-            tree_mu: BTreeMap::new(),
-            seq: super::SeqState::default(),
-            gc_w_used: 0,
-            ckpt_done: 0,
-            flip_window: false,
-            ckpt_open: false,
-            ckpt_splits: 0,
-            ckpt_merges: 0,
-            epoch_exhausted: 0,
-            poisoned: None,
-            wal: super::wal::WalState::default(),
-            meta_durable_k: 0,
-            freeset_grew: false,
-            stale_seg_reads: 0,
-            chunk_open_crash: false,
-            chunk_marked_crash: false,
-            chunk_partial_crash: false,
-            drop_walk_crash: false,
-            load_unpublished_crash: false,
-            load_published_crash: false,
-            gc_advanced_flag: false,
+        v
+    };
+    let map_bytes = page::build_map_leaf(0, cap, &entries);
+    cx.env()
+        .write_at(page_file, 4 * page::PAGE as u64, &map_bytes)
+        .map_err(Fail::Sim)?;
+    let map_root = Ref {
+        slot: 4,
+        epoch: page::header_epoch(&map_bytes),
+        crc: page::header_crc(&map_bytes),
+    };
+    probe.slots.used_cur.insert(4);
+
+    // The free set: both bitmaps over the fresh file, one leaf at
+    // slot 5 (bits: slots 3–15 minus the used 3/4/5; LPID 1 mapped).
+    let bits = probe.cfg.freeset_leaf_bits;
+    let slot_count = 16u64;
+    let next_lpid = probe.meta.next_lpid;
+    let used: BTreeSet<u64> = BTreeSet::from([3, 4, 5]);
+    let fs_bytes = page::build_free_leaf(0, bits, &|bit: u64| {
+        if bit < slot_count - 3 {
+            !used.contains(&(bit + 3))
+        } else {
+            let lpid = bit - (slot_count - 3) + 1;
+            lpid >= next_lpid
         }
-    }
+    });
+    cx.env()
+        .write_at(page_file, 5 * page::PAGE as u64, &fs_bytes)
+        .map_err(Fail::Sim)?;
+    let free_root = Ref {
+        slot: 5,
+        epoch: page::header_epoch(&fs_bytes),
+        crc: page::header_crc(&fs_bytes),
+    };
+    probe.slots.used_cur.insert(5);
 
-    fn alloc_slot_hinted(&mut self, _floor: u64) {}
+    let meta = page::Meta {
+        ckpt_id: 0,
+        t: 0,
+        gc_w: 0,
+        epoch: 0,
+        map_root,
+        free_root,
+        dir_root,
+        next_lpid,
+        slot_count,
+        wal_start_lsn: 0,
+    };
+    let bytes = page::build_meta(&meta);
+    // §2.2: meta 0 goes to slot 1 + (0 mod 2) = 1.
+    cx.env()
+        .write_at(page_file, page::PAGE as u64, &bytes)
+        .map_err(Fail::Sim)?;
+    cx.env().sync_all(page_file).map_err(Fail::Sim)?;
 
-    /// Open the store: page 0, both metas, the highest valid `ckpt_id`
-    /// wins — **no fallback** (§2.2): the newest valid meta's image is the
-    /// durable image; if its walk fails, open fails XX001. G3: a missing
-    /// start segment is XX001, never an empty WAL.
-    pub fn open(cx: &Cx, cfg: super::StoreCfg) -> Result<(Self, page::Meta), Fail> {
-        let page_file = cx.env().open(PAGE_FILE).map_err(Fail::Sim)?;
-        let p0 = cx
-            .env()
-            .read_at(page_file, 0, page::PAGE as u64)
-            .map_err(Fail::Sim)?;
-        page::parse_page0(&p0).map_err(|()| Fail::Corrupt("page 0 invalid".into()))?;
-        cx.env().accepted(page_file, 0, page::PAGE as u64);
-        let m1 = cx
-            .env()
-            .read_at(page_file, page::PAGE as u64, page::PAGE as u64)
-            .map_err(Fail::Sim)?;
-        let m2 = cx
-            .env()
-            .read_at(page_file, 2 * page::PAGE as u64, page::PAGE as u64)
-            .map_err(Fail::Sim)?;
-        let c1 = page::parse_meta(&m1).ok();
-        let c2 = page::parse_meta(&m2).ok();
-        let best = match (c1, c2) {
-            (Some(a), Some(b)) => Some(if a.ckpt_id >= b.ckpt_id { a } else { b }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        let Some(meta) = best else {
-            return Err(Fail::Corrupt("no valid meta".into()));
-        };
-        // The accept hook: the meta chosen at open (not the losing one).
-        let chosen_slot = 1 + (meta.ckpt_id % 2);
-        cx.env().accepted(
-            page_file,
-            chosen_slot * page::PAGE as u64,
-            page::PAGE as u64,
-        );
-        let mut st = StoreInner::empty(cfg, page_file);
-        st.k = meta.ckpt_id;
-        st.e = meta.epoch.max(1);
-        st.meta = meta;
-        // Load the map and the free set from the durable bytes (§14 step 2).
-        st.load_image(cx, &meta)?;
-        // The directory.
-        st.dir = st.dir_load(cx)?;
-        // G3: the start segment must exist.
-        let start_seg = meta.wal_start_lsn - (meta.wal_start_lsn % WAL_SEG);
-        let name = format!("/wal/{start_seg:016x}.log");
-        if meta.wal_start_lsn > 0 && cx.env().open(&name).is_err() {
-            if matches!(st.cfg.mutant, Some(Mutant::StartSegmentMissingOk)) {
-                // The mutant treats the WAL as empty.
+    probe.k = 0;
+    probe.e = 1; // epoch 1 begins (§2.3)
+    probe.meta = meta;
+    probe.slots.slot_count = slot_count;
+    let mut durable = BTreeSet::from([0, 1, 3, 4, 5]);
+    durable.extend(probe.map.cur.values().map(|r| r.slot));
+    probe.slots.used_durable = durable;
+    probe
+        .map
+        .prev_leaves
+        .insert(0, (hash_bytes(&map_bytes), map_root));
+    probe.map.prev_root = Some(map_root);
+    Ok(probe)
+}
+
+/// Open the store: page 0, both metas, the highest valid `ckpt_id` wins —
+/// **no fallback** (§2.2): the newest valid meta's image is the durable
+/// image; if its walk fails, open fails XX001. G3: a missing start
+/// segment is XX001, never an empty WAL. Returns the store (not yet
+/// installed in the host) and the opened meta.
+pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, page::Meta), Fail> {
+    let page_file = cx.env().open(PAGE_FILE).map_err(Fail::Sim)?;
+    let p0 = cx
+        .env()
+        .read_at(page_file, 0, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
+    page::parse_page0(&p0).map_err(|()| Fail::Corrupt("page 0 invalid".into()))?;
+    cx.env().accepted(page_file, 0, page::PAGE as u64);
+    let m1 = cx
+        .env()
+        .read_at(page_file, page::PAGE as u64, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
+    let m2 = cx
+        .env()
+        .read_at(page_file, 2 * page::PAGE as u64, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
+    let c1 = page::parse_meta(&m1).ok();
+    let c2 = page::parse_meta(&m2).ok();
+    let best = match (c1, c2) {
+        (Some(a), Some(b)) => Some(if a.ckpt_id >= b.ckpt_id { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let Some(meta) = best else {
+        return Err(Fail::Corrupt("no valid meta".into()));
+    };
+    // The accept hook: the meta chosen at open (card 1.4), not the loser.
+    let chosen_slot = 1 + (meta.ckpt_id % 2);
+    cx.env().accepted(
+        page_file,
+        chosen_slot * page::PAGE as u64,
+        page::PAGE as u64,
+    );
+    let mut st = StoreInner::empty(cfg.clone(), page_file);
+    st.k = meta.ckpt_id;
+    st.e = meta.epoch.max(1);
+    st.meta = meta;
+    st.slots.slot_count = st.slots.slot_count.max(meta.slot_count);
+    // Load the map and the free set from the durable bytes (§14 step 2).
+    load_image(cx, &mut st, &meta)?;
+    // Install the opened store, so the directory load (and recovery's
+    // replay) reads through the loaded map.
+    cx.with("open:install", |c| {
+        *c.store() = st;
+        Ok(())
+    })?;
+    let dir = tree::dir_load(cx, meta.dir_root)?;
+    cx.with("open:dir", |c| {
+        c.store().dir = dir;
+        Ok(())
+    })?;
+    // G3: the segment holding `wal_start_lsn` must exist.
+    let start_seg = meta.wal_start_lsn - (meta.wal_start_lsn % WAL_SEG);
+    let name = format!("/wal/{start_seg:016x}.log");
+    if meta.wal_start_lsn > 0 && cx.env().open(&name).is_err() {
+        if matches!(meta_is_mutant(cx)?, Some(Mutant::StartSegmentMissingOk)) {
+            // The mutant treats the WAL as empty.
+            cx.with("open:mutwal", |c| {
+                let st = c.store();
                 st.wal.append = 0;
                 st.wal.durable = 0;
                 st.wal.written = 0;
-            } else {
-                return Err(Fail::Corrupt(format!(
-                    "start segment {name} missing (G3)"
-                )));
-            }
+                Ok(())
+            })?;
+        } else {
+            return Err(Fail::Corrupt(format!("start segment {name} missing (G3)")));
         }
-        Ok((st, meta))
     }
+    let out = cx.with("open:take", |c| Ok(c.store().clone()))?;
+    Ok((out, meta))
+}
 
-    /// Load the flat map and the durable slot set from the persisted radix
-    /// (walking refs with §3.3 checks).
-    pub fn load_image(&mut self, cx: &Cx, meta: &page::Meta) -> Result<(), Fail> {
-        let cap = self.cfg.map_leaf_cap;
-        let mut flat: BTreeMap<u64, page::Ref> = BTreeMap::new();
-        let mut used: BTreeSet<u64> = BTreeSet::new();
-        let mut map_pages: Vec<(u64, page::Ref)> = Vec::new();
-        if meta.map_root.slot != 0 {
-            Self::walk_radix(
-                cx,
-                self.page_file,
-                meta.map_root,
-                cap,
-                meta.next_lpid,
-                0,
-                &mut flat,
-                &mut used,
-                &mut map_pages,
-            )?;
+/// The host store's mutant (open's G3 check reads it after install).
+fn meta_is_mutant<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Option<Mutant>, Fail> {
+    cx.with("open:mut", |c| Ok(c.store().cfg.mutant))
+}
+
+/// Load the flat map and the durable slot set from the persisted radix
+/// (walking refs with §3.3 checks; malformed input is XX001, never a
+/// panic).
+pub fn load_image<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    st: &mut StoreInner,
+    meta: &page::Meta,
+) -> Result<(), Fail> {
+    let cap = st.cfg.map_leaf_cap;
+    let mutant = st.cfg.mutant;
+    let pf = st.page_file;
+    let mut flat: BTreeMap<u64, Ref> = BTreeMap::new();
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    if meta.map_root.slot != 0 {
+        walk_radix(cx, pf, meta.map_root, cap, 0, &mut flat, &mut used, mutant)?;
+    }
+    // The free set (both bitmaps; §4.3).
+    let mut free_bits: BTreeSet<u64> = BTreeSet::new();
+    let mut fs_used: BTreeSet<u64> = BTreeSet::new();
+    if meta.free_root.slot != 0 {
+        let total_bits = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
+        walk_freeset(
+            cx,
+            pf,
+            meta.free_root,
+            st.cfg.freeset_leaf_bits,
+            total_bits,
+            &mut free_bits,
+            &mut fs_used,
+            mutant,
+        )?;
+    }
+    used.extend(fs_used.iter().copied());
+    // The current free-LPID set: the LPID bitmap marks unmapped ones.
+    let mut free_lpids = BTreeSet::new();
+    for l in 1..meta.next_lpid {
+        if free_bits.contains(&lpid_bit(meta.slot_count, l)) {
+            free_lpids.insert(l);
         }
-        // The free set (both bitmaps; §4.3).
-        let mut free_bits: BTreeSet<u64> = BTreeSet::new();
-        let mut free_pages: Vec<(u64, page::Ref)> = Vec::new();
-        if meta.free_root.slot != 0 {
-            let total_bits = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
-            Self::walk_freeset(
-                cx,
-                self.page_file,
-                meta.free_root,
-                self.cfg.freeset_leaf_bits,
-                total_bits,
-                &mut free_bits,
-                &mut free_pages,
-            )?;
-        }
-        // The current free-LPID set: the LPID bitmap marks unmapped ones.
-        let mut free_lpids = BTreeSet::new();
-        for l in 1..meta.next_lpid {
-            if free_bits.contains(&(meta.slot_count - 3 + l)) {
-                free_lpids.insert(l);
+    }
+    st.map.cur = flat;
+    st.slots.used_cur = used.clone();
+    st.slots.used_durable = used;
+    st.slots.slot_count = st.slots.slot_count.max(meta.slot_count);
+    st.slots.free_lpids = free_lpids;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_radix<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    pf: crate::sim::FileId,
+    root: Ref,
+    cap: u64,
+    depth: u8,
+    flat: &mut BTreeMap<u64, Ref>,
+    used: &mut BTreeSet<u64>,
+    mutant: Option<Mutant>,
+) -> Result<(), Fail> {
+    if depth > 8 || root.slot == 0 {
+        return Ok(());
+    }
+    let bytes = cx
+        .env()
+        .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
+    let expect_id = page::header_id(&bytes);
+    page::check(&bytes, &root, expect_id, mutant)
+        .map_err(|()| Fail::Corrupt(format!("map page slot {}", root.slot)))?;
+    cx.env()
+        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
+    used.insert(root.slot);
+    let kind = page::header_kind(&bytes);
+    if kind == page::KIND_MAP_LEAF {
+        let base = expect_id;
+        let entries = page::parse_map_leaf(&bytes, base, cap, &root, mutant)
+            .map_err(|()| Fail::Corrupt("bad map leaf".into()))?;
+        for (i, e) in entries.iter().enumerate() {
+            if let Some(r) = e {
+                flat.insert(base + i as u64, *r);
+                used.insert(r.slot);
             }
         }
-        self.map.cur = flat;
-        self.slots.used_cur = used.clone();
-        self.slots.used_durable = used.clone();
-        self.slots.slot_count = self.slots.slot_count.max(meta.slot_count);
-        self.slots.free_lpids = free_lpids;
+        Ok(())
+    } else {
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let refs = page::parse_radix_inner(&bytes, expect_id, n as usize, &root, mutant)
+            .map_err(|()| Fail::Corrupt("bad map inner".into()))?;
+        for r in refs.into_iter().flatten() {
+            walk_radix(cx, pf, r, cap, depth + 1, flat, used, mutant)?;
+        }
         Ok(())
     }
+}
 
-    fn walk_radix(
-        cx: &Cx,
-        pf: FileId,
-        root: page::Ref,
-        cap: u64,
-        next_lpid: u64,
-        depth: u8,
-        flat: &mut BTreeMap<u64, page::Ref>,
-        used: &mut BTreeSet<u64>,
-        pages: &mut Vec<(u64, page::Ref)>,
-    ) -> Result<(), Fail> {
-        if depth > 8 || root.slot == 0 {
-            return Ok(());
-        }
-        let bytes = cx
-            .env()
-            .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
-            .map_err(Fail::Sim)?;
-        let id = if next_lpid > cap.pow(depth as u32 + 1) {
-            0
-        } else {
-            0
-        };
-        let _ = id;
-        // The expected id is the node's radix position; leaves carry their
-        // base, inners theirs.
-        let expect_id = page::header_id(&bytes);
-        page::check(&bytes, &root, expect_id, None)
-            .map_err(|()| Fail::Corrupt(format!("map page slot {}", root.slot)))?;
-        cx.env().accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
-        used.insert(root.slot);
-        pages.push((expect_id, root));
-        let kind = bytes.get(1).copied().unwrap_or(0);
-        if kind == page::KIND_MAP_LEAF {
-            let base = expect_id;
-            let entries = page::parse_map_leaf(&bytes, base, cap, &root)
-                .map_err(|()| Fail::Corrupt("bad map leaf".into()))?;
-            for (i, e) in entries.iter().enumerate() {
-                if let Some(r) = e {
-                    flat.insert(base + i as u64, *r);
-                    used.insert(r.slot);
-                }
-            }
-            Ok(())
-        } else {
-            let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-            let refs = page::parse_radix_inner(&bytes, expect_id, n as usize, &root)
-                .map_err(|()| Fail::Corrupt("bad map inner".into()))?;
-            let span = cap.pow(depth as u32 + 1);
-            for (_i, r) in refs.iter().enumerate() {
-                if let Some(r) = r {
-                    Self::walk_radix(
-                        cx,
-                        pf,
-                        *r,
-                        cap,
-                        next_lpid,
-                        depth + 1,
-                        flat,
-                        used,
-                        pages,
-                    )?;
-                    let _ = span;
-                }
-            }
-            Ok(())
-        }
+#[allow(clippy::too_many_arguments)]
+fn walk_freeset<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    pf: crate::sim::FileId,
+    root: Ref,
+    leaf_bits: u64,
+    _total_bits: u64,
+    set: &mut BTreeSet<u64>,
+    used: &mut BTreeSet<u64>,
+    mutant: Option<Mutant>,
+) -> Result<(), Fail> {
+    if root.slot == 0 {
+        return Ok(());
     }
-
-    fn walk_freeset(
-        cx: &Cx,
-        pf: FileId,
-        root: page::Ref,
-        leaf_bits: u64,
-        total_bits: u64,
-        set: &mut BTreeSet<u64>,
-        pages: &mut Vec<(u64, page::Ref)>,
-    ) -> Result<(), Fail> {
-        if root.slot == 0 {
-            return Ok(());
-        }
-        let bytes = cx
-            .env()
-            .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
-            .map_err(Fail::Sim)?;
-        let expect_id = page::header_id(&bytes);
-        page::check(&bytes, &root, expect_id, None)
-            .map_err(|()| Fail::Corrupt(format!("freeset page slot {}", root.slot)))?;
-        cx.env().accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
-        pages.push((expect_id, root));
-        let kind = bytes.get(1).copied().unwrap_or(0);
-        if kind == page::KIND_FREE_LEAF {
-            let bits = page::parse_free_leaf(&bytes, expect_id, leaf_bits, &root)
-                .map_err(|()| Fail::Corrupt("bad freeset leaf".into()))?;
-            for (i, b) in bits.iter().enumerate() {
-                if *b {
-                    set.insert(expect_id + i as u64);
-                }
+    let bytes = cx
+        .env()
+        .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
+    let expect_id = page::header_id(&bytes);
+    page::check(&bytes, &root, expect_id, mutant)
+        .map_err(|()| Fail::Corrupt(format!("freeset page slot {}", root.slot)))?;
+    cx.env()
+        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
+    used.insert(root.slot);
+    let kind = page::header_kind(&bytes);
+    if kind == page::KIND_FREE_LEAF {
+        let bits = page::parse_free_leaf(&bytes, expect_id, leaf_bits, &root, mutant)
+            .map_err(|()| Fail::Corrupt("bad freeset leaf".into()))?;
+        for (i, b) in bits.iter().enumerate() {
+            if *b {
+                set.insert(expect_id + i as u64);
             }
-            Ok(())
-        } else {
-            let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-            let refs = page::parse_radix_inner(&bytes, expect_id, n as usize, &root)
-                .map_err(|()| Fail::Corrupt("bad freeset inner".into()))?;
-            for (_i, r) in refs.iter().enumerate() {
-                if let Some(r) = r {
-                    Self::walk_freeset(cx, pf, *r, leaf_bits, total_bits, set, pages)?;
-                    let _ = total_bits;
-                }
-            }
-            Ok(())
         }
+        Ok(())
+    } else {
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let refs = page::parse_radix_inner(&bytes, expect_id, n as usize, &root, mutant)
+            .map_err(|()| Fail::Corrupt("bad freeset inner".into()))?;
+        for r in refs.into_iter().flatten() {
+            walk_freeset(cx, pf, r, leaf_bits, _total_bits, set, used, mutant)?;
+        }
+        Ok(())
     }
+}
 
-    // ---- checkpoint (§13) ----
+// ---- checkpoint (§13) ----
 
-    /// Run checkpoint `k+1` (steps 0–6) with the hooks. `crash_hook`, when
-    /// it matches, crashes the round at that hook (targeted crashes).
-    /// `mid2_frac` seeds the `Mid2` position.
-    pub fn checkpoint(
-        &mut self,
-        cx: &Cx,
-        hook: &mut dyn FnMut(&mut StoreInner, CkptHook) -> Result<(), Fail>,
-    ) -> Result<(), Fail> {
-        self.alive()?;
-        let k = self.k + 1;
-        self.ckpt_open = true;
-        self.ckpt_splits = 0;
-        self.ckpt_merges = 0;
-        hook(self, CkptHook::Before0)?;
-        // Step 0: the flip (§13 step 0).
-        self.gate_exclusive(cx)?;
-        let t = self.seq.visible_ts;
-        // I-GCW: `gc_w ≤ T` always; the meta write is fail-stop otherwise.
-        let mut gc_w = self.gc_w_used;
-        if gc_w > t {
-            if matches!(self.cfg.mutant, Some(Mutant::GcwBoundSkip)) {
-                // GCW-BOUND-SKIP: the check is removed.
-            } else {
-                self.gate_flip_release(cx);
-                self.poisoned = Some("gc_w > T at meta write".into());
-                return Err(Fail::Poisoned("gc_w > T".into()));
-            }
+/// The flip's outcome (one step's result).
+enum FlipOut {
+    /// The flip succeeded; the fields step 0 captured (§13 step 0.2).
+    Ok {
+        t: u64,
+        gc_w: u64,
+        enqueue_end: u64,
+        wal_start: u64,
+        k: u64,
+    },
+    /// The fail-stop abort (gc_w > T; the gate was taken).
+    Abort(Fail),
+}
+
+/// Run checkpoint `k+1` (steps 0–6, in order) with the hooks. The hooks
+/// fire at every step boundary and after every step-2 write (`Mid2`);
+/// `Err` from a hook aborts (the harness's crash hook arms the crash and
+/// returns `Crashed`).
+pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result<(), Fail> {
+    cx.with("ckpt:begin", |c| {
+        let st = c.store();
+        st.alive()?;
+        st.ckpt_open = true;
+        st.ckpt_splits = 0;
+        st.ckpt_merges = 0;
+        Ok(())
+    })?;
+    hooks(CkptHook::Before0)?;
+    // Step 0: the flip (§13 step 0): the gate exclusive, take `T`,
+    // `gc_w`, `wal_start_lsn`, set `e := k+1`, then release.
+    prims::gate_exclusive(cx)?;
+    let flip = cx.with("ckpt:flip", |c| {
+        let st = c.store();
+        let k = st.k + 1;
+        let t = st.seq.visible_ts;
+        // I-GCW: `gc_w ≤ T` always; the meta write is fail-stop otherwise
+        // (GCW-BOUND-SKIP removes the check; GCW-NOT-RECORDED zeroes it).
+        let mut gc_w = st.gc_w_used;
+        let over = gc_w > t;
+        let skip_bound = matches!(st.cfg.mutant, Some(Mutant::GcwBoundSkip));
+        if over && !skip_bound {
+            st.poisoned = Some("gc_w > T at meta write".into());
+            return Ok(FlipOut::Abort(Fail::Poisoned("gc_w > T".into())));
         }
-        if matches!(self.cfg.mutant, Some(Mutant::GcwNotRecorded)) {
+        if matches!(st.cfg.mutant, Some(Mutant::GcwNotRecorded)) {
             gc_w = 0; // the previous value or 0
         }
-        let enqueue_end = self.wal.append;
-        let open_chunks = self.wal.open_chunks.clone();
-        let wal_start = self.wal_start_lsn(t, &open_chunks);
-        self.e = k as u32 + 1;
-        self.flip_window = true;
-        self.gate_flip_release(cx);
-        hook(self, CkptHook::After0)?;
-        // Step 1: WAL through every record enqueued before the flip (G5).
-        self.wal_step1(cx, t, enqueue_end)?;
-        hook(self, CkptHook::After1)?;
-        // Step 2: the image. Dirty frames with content epoch ≤ k, epoch
-        // copies, then the map, then the free set last (§13 step 2).
-        {
-            let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
-            for i in 0..self.pool.frames.len() {
-                let (key, bytes, dirty, epoch, is_copy) = {
-                    let f = self
-                        .pool
-                        .frames
-                        .get(i)
-                        .ok_or_else(|| Fail::Invalid("frame".to_owned()))?;
-                    (f.key, f.bytes.clone(), f.dirty, f.epoch, f.is_epoch_copy)
-                };
-                if key != 0 && dirty && (is_copy || epoch <= k as u32) {
-                    writes.push((key, bytes));
-                }
-            }
-            let mut mid_fired = false;
-            for (key, bytes) in writes.iter() {
-                let r = self.write_page_out(cx, *key, bytes)?;
-                if self.map.img.get(key).copied() == Some(Img::CopyPending) {
-                    self.map.img.insert(*key, Img::At(r));
-                }
-                if !mid_fired {
-                    hook(self, CkptHook::Mid2)?;
-                    mid_fired = true;
-                }
-            }
+        let enqueue_end = st.wal.append;
+        let open_chunks = st.wal.open_chunks.clone();
+        let wal_start = wal::wal_start_lsn(st, t, &open_chunks);
+        st.e = k as u32 + 1;
+        st.flip_window = true;
+        st.wal.open_chunks.clear();
+        Ok(FlipOut::Ok {
+            t,
+            gc_w,
+            enqueue_end,
+            wal_start,
+            k,
+        })
+    })?;
+    let (t, gc_w, enqueue_end, wal_start, k) = match flip {
+        FlipOut::Ok {
+            t,
+            gc_w,
+            enqueue_end,
+            wal_start,
+            k,
+        } => (t, gc_w, enqueue_end, wal_start, k),
+        FlipOut::Abort(e) => {
+            prims::gate_flip_release(cx);
+            return Err(e);
         }
-        // Free the epoch-copy frames.
-        for f in self.pool.frames.iter_mut() {
+    };
+    prims::gate_flip_release(cx);
+    hooks(CkptHook::After0)?;
+    // Step 1: WAL through every record enqueued before the flip (G5).
+    wal::wal_step1(cx, t, enqueue_end)?;
+    hooks(CkptHook::After1)?;
+    // Step 2: the image. Data phase first (dirty frames with content
+    // epoch ≤ k, and epoch copies), then the map, then the free set last.
+    ckpt_step2_data(cx, hooks, k)?;
+    // Free the epoch-copy frames (written or adopted by the data phase).
+    cx.with("ckpt:freecopies", |c| {
+        let st = c.store();
+        for f in st.reserve_frames_mut() {
             if f.is_epoch_copy {
                 f.key = 0;
                 f.bytes = Vec::new();
                 f.dirty = false;
                 f.is_epoch_copy = false;
                 f.pins = 0;
+                f.evicting = false;
             }
         }
-        // The map radix (CoW diff of changed leaves, up to the root).
-        let map_root = self.write_map_radix(cx)?;
-        // The free set last, with its own slots marked used
-        // (BITMAP-OMITS-FREESET-PAGES omits them).
-        let free_root = self.write_free_set(cx, k)?;
-        hook(self, CkptHook::After2)?;
-        // Step 3.
-        if !matches!(self.cfg.mutant, Some(Mutant::MetaBeforeSync)) {
-            cx.env().sync_all(self.page_file).map_err(Fail::Sim)?;
-        }
-        hook(self, CkptHook::After3)?;
-        // Steps 4–5: the meta, then sync.
-        let meta = page::Meta {
-            ckpt_id: k,
-            t,
-            gc_w,
-            epoch: k as u32,
-            map_root,
-            free_root,
-            dir_root: self.meta.dir_root,
-            next_lpid: self.meta.next_lpid,
-            slot_count: self.slots.slot_count,
-            wal_start_lsn: wal_start,
-        };
-        // FREE-EARLY: the frees happen before step 5.
-        let mut image_slots = self.image_slot_set();
-        image_slots.insert(map_root.slot);
-        image_slots.insert(free_root.slot);
-        if matches!(self.cfg.mutant, Some(Mutant::FreeEarly)) {
-            let old = std::mem::take(&mut self.slots.used_durable);
-            self.slots.pending_free = old.difference(&image_slots).copied().collect();
-            self.slots.used_durable = image_slots.clone();
-        }
-        self.write_meta(cx, &meta)?;
-        hook(self, CkptHook::After4)?;
-        cx.env().sync_all(self.page_file).map_err(Fail::Sim)?;
-        // Step 5 done: meta k is durable.
-        self.k = k;
-        self.meta = meta;
-        self.meta_durable_k = k;
-        self.flip_window = false;
-        let old_durable = std::mem::take(&mut self.slots.used_durable);
-        self.slots.used_durable = image_slots.clone();
-        self.slots.pending_free = old_durable.difference(&image_slots).copied().collect();
-        self.map.img.clear();
-        cx.w.wake(crate::sim::WaitKey::MetaDurable);
-        hook(self, CkptHook::After5)?;
-        // Step 6: frees then recycling (Mid6 between).
-        self.slots.pending_free.clear();
-        hook(self, CkptHook::Mid6)?;
-        let _ = self.wal_recycle(cx, wal_start)?;
-        hook(self, CkptHook::After6)?;
-        self.ckpt_done += 1;
-        self.ckpt_open = false;
         Ok(())
+    })?;
+    let map_root = write_map_radix(cx)?;
+    let (free_root, img_slot_count, img_next_lpid) = write_free_set(cx)?;
+    hooks(CkptHook::After2)?;
+    // Step 3.
+    let skip3 = cx.with("ckpt:mut3", |c| {
+        Ok(matches!(c.store().cfg.mutant, Some(Mutant::MetaBeforeSync)))
+    })?;
+    if !skip3 {
+        let pf = cx.with("ckpt:pf", |c| Ok(c.store().page_file))?;
+        cx.env().sync_all(pf).map_err(Fail::Sim)?;
     }
-
-    /// Write the map radix for the image (changed leaves CoW, up to the
-    /// root). Returns the root ref.
-    fn write_map_radix(&mut self, cx: &Cx) -> Result<page::Ref, Fail> {
-        let cap = self.cfg.map_leaf_cap;
-        // The effective image entries.
-        let next_lpid = self.meta.next_lpid;
-        let n_leaves = (next_lpid + cap - 1) / cap;
-        let get_entry = |st: &StoreInner, l: u64| -> Option<page::Ref> {
-            let eff = st.map.img.get(&l).copied().unwrap_or(Img::Same);
-            match eff {
-                Img::Same => st.map.cur.get(&l).copied(),
-                Img::At(r) => Some(r),
-                Img::Free | Img::CopyPending | Img::Lost => None,
-            }
-        };
-        // Leaf level.
-        let mut leaf_refs: Vec<Option<page::Ref>> = Vec::new();
-        for j in 0..n_leaves {
-            let base = j * cap;
-            let mut entries: Vec<Option<page::Ref>> = Vec::with_capacity(cap as usize);
-            for i in 0..cap {
-                entries.push(get_entry(self, base + i));
-            }
-            let bytes = page::build_map_leaf(base, cap, &entries);
-            // CoW: write only if changed vs the previous image's leaf.
-            let changed = match self.map.prev_leaves.get(&j) {
-                Some((h, _)) => *h != hash_bytes(&bytes),
-                None => true,
-            };
-            if changed {
-                let r = self.write_page_out_map(cx, base, &bytes)?;
-                leaf_refs.push(Some(r));
-                self.map.prev_leaves.insert(j, (hash_bytes(&bytes), r));
-            } else {
-                let r = self
-                    .map
-                    .prev_leaves
-                    .get(&j)
-                    .map(|(_, r)| *r)
-                    .unwrap_or_default();
-                leaf_refs.push(if r.slot == 0 { None } else { Some(r) });
-            }
+    hooks(CkptHook::After3)?;
+    // Steps 4–5: the meta, then sync. The image's sizes are the frozen
+    // ones the free set actually covered (§13 step 2's convergence);
+    // `next_lpid` never shrinks below the live counter's floor for the
+    // *current* epoch (allocations after the freeze stay above it).
+    let dir_root = cx.with("ckpt:dirroot", |c| Ok(c.store().meta.dir_root))?;
+    let meta = page::Meta {
+        ckpt_id: k,
+        t,
+        gc_w,
+        epoch: k as u32,
+        map_root,
+        free_root,
+        dir_root,
+        next_lpid: img_next_lpid,
+        slot_count: img_slot_count,
+        wal_start_lsn: wal_start,
+    };
+    // The full referenced set of image k (data + map + free-set pages).
+    let image_slots = full_image_slots(cx)?;
+    // FREE-EARLY: the step-6 frees happen before step 5 (I-FREE-SAFE).
+    let free_early = cx.with("ckpt:freeearly", |c| {
+        Ok(matches!(c.store().cfg.mutant, Some(Mutant::FreeEarly)))
+    })?;
+    if free_early {
+        cx.with("ckpt:freeearly:apply", |c| {
+            let st = c.store();
+            let old = std::mem::take(&mut st.slots.used_durable);
+            st.slots.pending_free = old.difference(&image_slots).copied().collect();
+            st.slots.used_durable = image_slots.clone();
+            Ok(())
+        })?;
+    }
+    let pf = cx.with("ckpt:pf2", |c| Ok(c.store().page_file))?;
+    let bytes = page::build_meta(&meta);
+    cx.env()
+        .write_at(pf, (1 + (k % 2)) * page::PAGE as u64, &bytes)
+        .map_err(Fail::Sim)?;
+    hooks(CkptHook::After4)?;
+    cx.env().sync_all(pf).map_err(Fail::Sim)?;
+    // Step 5 done: meta k is durable. Resolve the image map into the new
+    // durable base; the step-6 frees become visible (§4.4's I-FREE-SAFE:
+    // they were protected by the old `used_durable` until here). The
+    // live `next_lpid`/`slot_count` counters keep any post-freeze growth
+    // (the next image's free set covers the then-current values).
+    cx.with("ckpt:post5", |c| {
+        let st = c.store();
+        let live_next = st.meta.next_lpid;
+        let live_sc = st.slots.slot_count;
+        st.k = k;
+        st.meta = meta;
+        if live_next > st.meta.next_lpid {
+            st.meta.next_lpid = live_next;
         }
-        // Inner levels up to a single root.
-        let mut level = leaf_refs;
-        let mut depth: u8 = 0;
-        while level.len() > 1 {
-            let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-            let mut up: Vec<Option<page::Ref>> = Vec::new();
-            for (bi, chunk) in level.chunks(n as usize).enumerate() {
-                let base = bi as u64 * n * cap.pow(depth as u32 + 1);
-                let bytes = page::build_radix_inner(base, page::KIND_MAP_INNER, chunk);
-                let key = (depth, bi as u64);
-                let changed = match self.map.prev_inners.get(&key) {
-                    Some((h, _)) => *h != hash_bytes(&bytes),
-                    None => true,
-                };
-                if changed {
-                    let r = self.write_page_out_map(cx, base, &bytes)?;
-                    up.push(Some(r));
-                    self.map.prev_inners.insert(key, (hash_bytes(&bytes), r));
-                } else {
-                    let r = self
-                        .map
-                        .prev_inners
-                        .get(&key)
-                        .map(|(_, r)| *r)
-                        .unwrap_or_default();
-                    up.push(if r.slot == 0 { None } else { Some(r) });
+        if live_sc > st.meta.slot_count {
+            st.meta.slot_count = live_sc;
+        }
+        st.meta_durable_k = k;
+        st.flip_window = false;
+        let old_durable = std::mem::take(&mut st.slots.used_durable);
+        st.slots.used_durable = image_slots;
+        st.slots.pending_free = old_durable
+            .difference(&st.slots.used_durable)
+            .copied()
+            .collect();
+        st.map.img.clear();
+        st.slots.image_refs.clear();
+        st.map.prev_root = Some(map_root);
+        Ok(())
+    })?;
+    cx.w.wake(crate::sim::WaitKey::MetaDurable);
+    hooks(CkptHook::After5)?;
+    // Step 6: frees then recycling (Mid6 between).
+    cx.with("ckpt:step6", |c| {
+        c.store().slots.pending_free.clear();
+        Ok(())
+    })?;
+    hooks(CkptHook::Mid6)?;
+    wal::wal_recycle(cx, wal_start)?;
+    hooks(CkptHook::After6)?;
+    cx.with("ckpt:end", |c| {
+        let st = c.store();
+        st.ckpt_done += 1;
+        st.ckpt_open = false;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Step 2's data phase: write every dirty frame with content epoch ≤ k
+/// and every epoch copy out, resolving `CopyPending` overrides; fire
+/// `Mid2` after every write. A frame that was mutated in epoch k+1 after
+/// the snapshot (its epoch-k content was frozen at the mutation's first
+/// touch) is written for the image only — the current home does not adopt
+/// it (§13 step 2).
+fn ckpt_step2_data<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    hooks: &mut Hooks<'_>,
+    k: u64,
+) -> Result<(), Fail> {
+    let mut idx = 0usize;
+    loop {
+        let target = cx.with("ckpt2:scan", |c| {
+            let st = c.store();
+            let n = st.pool.frames.len();
+            while idx < n {
+                let i = idx;
+                idx += 1;
+                if let Some(f) = st.pool.frames.get(i)
+                    && f.key != 0
+                    && f.dirty
+                    && !f.evicting
+                    && (f.is_epoch_copy || f.epoch <= k as u32)
+                {
+                    return Ok(Some((i, f.key, f.bytes.clone())));
                 }
             }
-            level = up;
-            depth += 1;
-        }
-        let root = level.first().copied().flatten().unwrap_or_default();
-        self.map.prev_root = Some(root);
-        Ok(root)
-    }
-
-    /// Write a map/freeset page to a fresh slot (physically addressed; the
-    /// LPID space does not apply — track in `used_cur` only).
-    fn write_page_out_map(&mut self, cx: &Cx, _base: u64, bytes: &[u8]) -> Result<page::Ref, Fail> {
-        let slot = self.alloc_slot(cx)?;
-        cx.env()
-            .write_at(self.page_file, slot * page::PAGE as u64, bytes)
-            .map_err(Fail::Sim)?;
-        let r = page::Ref {
-            slot,
-            epoch: page::header_epoch(bytes),
-            crc: page::header_crc(bytes),
+            Ok(None)
+        })?;
+        let Some((i, key, bytes)) = target else {
+            return Ok(());
         };
-        self.slots.used_cur.insert(slot);
-        Ok(r)
-    }
-
-    /// Serialise both bitmaps as a fresh FreeSet radix, its own slots
-    /// marked used (I-FREE-EXACT); sizing after growth converges in one
-    /// round (§13 step 2).
-    fn write_free_set(&mut self, cx: &Cx, _k: u64) -> Result<page::Ref, Fail> {
-        let leaf_bits = self.cfg.freeset_leaf_bits;
-        let before = self.slots.slot_count;
-        // The image's free slots (both bitmaps; I-FREE-EXACT).
-        let img_slots = self.image_slot_set();
-        let next_lpid = self.meta.next_lpid;
-        let omit = matches!(self.cfg.mutant, Some(Mutant::BitmapOmitsFreesetPages));
-        // Allocate the FreeSet leaves (growing the file first if needed).
-        let total_bits = |slot_count: u64| (slot_count - 3) + next_lpid;
-        let n_leaves = (total_bits(self.slots.slot_count) + leaf_bits - 1) / leaf_bits;
-        let mut fs_slots: Vec<u64> = Vec::new();
-        for _ in 0..n_leaves {
-            let s = self.alloc_slot(cx)?;
-            fs_slots.push(s);
-        }
-        // Growth may have changed slot_count: recompute (one convergence
-        // round, §13 step 2).
-        if self.slots.slot_count != before {
-            if self.slots.slot_count > before {
-                self.freeset_grew = true;
-            }
-            let n2 = (total_bits(self.slots.slot_count) + leaf_bits - 1) / leaf_bits;
-            while fs_slots.len() < n2 as usize {
-                if let Some(s) = self.alloc_slot(cx).ok() {
-                    fs_slots.push(s);
-                } else {
-                    break;
-                }
-            }
-        }
-        let sc = self.slots.slot_count;
-        let is_free = |bit: u64| -> bool {
-            if bit < sc - 3 {
-                let slot = bit + 3;
-                !img_slots.contains(&slot)
-                    && !fs_slots.contains(&slot)
-                    && !(omit && fs_slots.contains(&slot))
-                    && !fs_slots.contains(&slot)
-            } else {
-                let lpid = bit - (sc - 3) + 1;
-                lpid >= 1 && lpid < next_lpid && {
-                    let eff = self.map.img.get(&lpid).copied().unwrap_or(Img::Same);
-                    match eff {
-                        Img::Free => true,
-                        Img::Same => !self.map.cur.contains_key(&lpid),
-                        _ => false,
+        let r = prims::write_fresh(cx, &bytes)?;
+        cx.with("ckpt2:record", |c| {
+            let st = c.store();
+            let is_copy = st
+                .pool
+                .frames
+                .get(i)
+                .map(|f| f.is_epoch_copy)
+                .unwrap_or(false);
+            let pending = st.map.img.get(&key).copied() == Some(Img::CopyPending);
+            if is_copy || pending {
+                st.map.img.insert(key, Img::At(r));
+                st.slots.image_refs.insert(r.slot);
+            } else if let Some(f) = st.pool.frames.get_mut(i) {
+                // Not superseded: adopt the new slot as the current home
+                // and clean the frame (§13 step 2).
+                if f.key == key && f.dirty && f.epoch <= k as u32 {
+                    if let Some(old) = st.map.cur.insert(key, r) {
+                        st.slots.used_cur.remove(&old.slot);
                     }
+                    st.slots.used_cur.insert(r.slot);
+                    f.dirty = false;
                 }
             }
-        };
-        let mut refs: Vec<Option<page::Ref>> = Vec::new();
-        for (j, &slot) in fs_slots.iter().enumerate() {
-            let base = j as u64 * leaf_bits;
-            let bytes = page::build_free_leaf(base, leaf_bits, &is_free);
-            cx.env()
-                .write_at(self.page_file, slot * page::PAGE as u64, &bytes)
-                .map_err(Fail::Sim)?;
-            let r = page::Ref {
-                slot,
-                epoch: page::header_epoch(&bytes),
-                crc: page::header_crc(&bytes),
-            };
-            self.slots.used_cur.insert(slot);
-            refs.push(Some(r));
+            Ok(())
+        })?;
+        hooks(CkptHook::Mid2)?;
+    }
+}
+
+/// The map radix for the image (changed leaves CoW, up to the root;
+/// unchanged leaves keep their image k−1 slots and are shared between the
+/// two images — Work 12's condition 2). Returns the root ref.
+fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
+    let (cap, next_lpid) = cx.with("mapradix:cap", |c| {
+        let st = c.store();
+        Ok((st.cfg.map_leaf_cap, st.meta.next_lpid))
+    })?;
+    let n_leaves = next_lpid.div_ceil(cap);
+    // Leaf level.
+    let mut leaf_refs: Vec<Option<Ref>> = Vec::new();
+    for j in 0..n_leaves {
+        let base = j * cap;
+        let bytes = cx.with("mapradix:leaf", |c| {
+            let st = c.store();
+            let mut entries: Vec<Option<Ref>> = Vec::with_capacity(cap as usize);
+            for i in 0..cap {
+                entries.push(prims::img_entry(st, base + i));
+            }
+            Ok(page::build_map_leaf(base, cap, &entries))
+        })?;
+        let h = hash_bytes(&bytes);
+        let unchanged = cx.with("mapradix:prev", |c| {
+            let st = c.store();
+            Ok(st
+                .map
+                .prev_leaves
+                .get(&j)
+                .map(|(ph, _)| *ph == h)
+                .unwrap_or(false))
+        })?;
+        if unchanged {
+            let r = cx.with("mapradix:keep", |c| {
+                Ok(c.store().map.prev_leaves.get(&j).map(|(_, r)| *r))
+            })?;
+            leaf_refs.push(r);
+        } else {
+            let r = prims::write_fresh(cx, &bytes)?;
+            cx.with("mapradix:upd", |c| {
+                let st = c.store();
+                if let Some((_, or)) = st.map.prev_leaves.insert(j, (h, r)) {
+                    st.slots.used_cur.remove(&or.slot);
+                }
+                st.slots.used_cur.insert(r.slot);
+                Ok(())
+            })?;
+            leaf_refs.push(Some(r));
         }
-        // Inner levels.
-        let mut level = refs;
-        let mut depth: u8 = 0;
-        while level.len() > 1 {
-            let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-            let mut up: Vec<Option<page::Ref>> = Vec::new();
-            for (bi, chunk) in level.chunks(n as usize).enumerate() {
-                let base = bi as u64 * n * leaf_bits * (2u64).pow(depth as u32);
-                let bytes = page::build_radix_inner(base, page::KIND_FREE_INNER, chunk);
-                let r = self.write_page_out_map(cx, base, &bytes)?;
+    }
+    // Inner levels up to a single root.
+    let mut level = leaf_refs;
+    let mut depth: u8 = 0;
+    while level.len() > 1 {
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let mut up: Vec<Option<Ref>> = Vec::new();
+        for (bi, chunk) in level.chunks(n as usize).enumerate() {
+            let base = bi as u64 * n * cap.pow(depth as u32 + 1);
+            let bytes = page::build_radix_inner(base, page::KIND_MAP_INNER, chunk);
+            let key = (depth, bi as u64);
+            let h = hash_bytes(&bytes);
+            let unchanged = cx.with("mapradix:previnner", |c| {
+                let st = c.store();
+                Ok(st
+                    .map
+                    .prev_inners
+                    .get(&key)
+                    .map(|(ph, _)| *ph == h)
+                    .unwrap_or(false))
+            })?;
+            if unchanged {
+                let r = cx.with("mapradix:keepinner", |c| {
+                    Ok(c.store().map.prev_inners.get(&key).map(|(_, r)| *r))
+                })?;
+                up.push(r);
+            } else {
+                let r = prims::write_fresh(cx, &bytes)?;
+                cx.with("mapradix:updinner", |c| {
+                    let st = c.store();
+                    if let Some((_, or)) = st.map.prev_inners.insert(key, (h, r)) {
+                        st.slots.used_cur.remove(&or.slot);
+                    }
+                    st.slots.used_cur.insert(r.slot);
+                    Ok(())
+                })?;
                 up.push(Some(r));
             }
-            level = up;
-            depth += 1;
         }
-        Ok(level.first().copied().flatten().unwrap_or_default())
+        level = up;
+        depth += 1;
     }
+    let root = level.first().copied().flatten().unwrap_or_default();
+    Ok(root)
+}
 
-    /// Write a meta to its slot (§2.2: slot `1 + (k mod 2)`).
-    fn write_meta(&mut self, cx: &Cx, m: &page::Meta) -> Result<(), Fail> {
-        let bytes = page::build_meta(m);
-        let slot = 1 + (m.ckpt_id % 2);
+/// Serialise both bitmaps as a fresh FreeSet radix, its own slots marked
+/// used (I-FREE-EXACT; BITMAP-OMITS-FREESET-PAGES omits them), with the
+/// §13 step-2 sizing and growth convergence. Returns
+/// `(root, slot_count, next_lpid)` — the frozen image sizes the bitmap
+/// actually covers.
+fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail> {
+    let leaf_bits = cx.with("fs:bits", |c| Ok(c.store().cfg.freeset_leaf_bits))?;
+    let img_next_lpid = cx.with("fs:nlp", |c| Ok(c.store().meta.next_lpid))?;
+    // The image's referenced data and map slots (snapshot-stable after
+    // the data phase).
+    let mut used = cx.with("fs:used", |c| {
+        let st = c.store();
+        let mut used = prims::image_slot_set(st);
+        for (_, r) in st.map.prev_leaves.values() {
+            used.insert(r.slot);
+        }
+        for (_, r) in st.map.prev_inners.values() {
+            used.insert(r.slot);
+        }
+        Ok(used)
+    })?;
+    // The LPID bitmap bits: one snapshot of the image's mapped set.
+    let img_lpids_mapped: BTreeSet<u64> = cx.with("fs:lpids", |c| {
+        let st = c.store();
+        Ok(prims::img_lpids(st)
+            .into_iter()
+            .filter(|l| prims::img_entry(st, *l).is_some())
+            .collect())
+    })?;
+    // Allocate the free-set pages with the convergence loop (§13 step
+    // 2's sizing note): after growth, recompute and allocate the
+    // difference.
+    let mut fs_slots: Vec<u64> = Vec::new();
+    let mut rounds = 0u32;
+    let fan = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+    let mut slot_count;
+    loop {
+        rounds += 1;
+        if rounds > 8 {
+            return Err(Fail::Invalid("freeset sizing did not converge".into()));
+        }
+        let sc = cx.with("fs:sc", |c| Ok(c.store().slots.slot_count))?;
+        slot_count = sc;
+        let total_bits = (sc - 3) + img_next_lpid;
+        let mut pages = total_bits.div_ceil(leaf_bits);
+        let mut lvl = total_bits.div_ceil(leaf_bits);
+        while lvl > 1 {
+            lvl = lvl.div_ceil(fan);
+            pages += lvl;
+        }
+        while (fs_slots.len() as u64) < pages {
+            fs_slots.push(prims::alloc_slot(cx)?);
+        }
+        let sc2 = cx.with("fs:sc2", |c| Ok(c.store().slots.slot_count))?;
+        if sc2 == slot_count {
+            break;
+        }
+        // The file grew: mark it (Q17) and loop to allocate the
+        // difference the growth requires.
+        cx.with("fs:grew", |c| {
+            c.store().freeset_grew = true;
+            Ok(())
+        })?;
+    }
+    // Mark the free-set pages used (the mutant omits them: the bitmap
+    // then marks the free set's own slots free — I-FREE-EXACT).
+    let omit = cx.with("fs:mut", |c| {
+        Ok(matches!(
+            c.store().cfg.mutant,
+            Some(Mutant::BitmapOmitsFreesetPages)
+        ))
+    })?;
+    let fs_slots_set: BTreeSet<u64> = fs_slots.iter().copied().collect();
+    if !omit {
+        used.extend(fs_slots_set.iter().copied());
+    }
+    // Serialise the leaves (bit index → free). The `used` and mapped sets
+    // are the frozen snapshot; no step inside reads the live store.
+    let frozen_sc = slot_count;
+    let pf = cx.with("fs:pf", |c| Ok(c.store().page_file))?;
+    let mut leaf_refs: Vec<Option<Ref>> = Vec::new();
+    for (j, &slot) in fs_slots.iter().enumerate() {
+        let base = j as u64 * leaf_bits;
+        let used_ref = &used;
+        let mapped_ref = &img_lpids_mapped;
+        let bytes = page::build_free_leaf(base, leaf_bits, &|bit: u64| {
+            if bit < frozen_sc - 3 {
+                !used_ref.contains(&(bit + 3))
+            } else {
+                let lpid = bit - (frozen_sc - 3) + 1;
+                !mapped_ref.contains(&lpid)
+            }
+        });
         cx.env()
-            .write_at(self.page_file, slot * page::PAGE as u64, &bytes)
+            .write_at(pf, slot * page::PAGE as u64, &bytes)
             .map_err(Fail::Sim)?;
-        Ok(())
+        cx.with("fs:mark", |c| {
+            c.store().slots.used_cur.insert(slot);
+            Ok(())
+        })?;
+        leaf_refs.push(Some(Ref {
+            slot,
+            epoch: page::header_epoch(&bytes),
+            crc: page::header_crc(&bytes),
+        }));
     }
+    // Inner levels.
+    let mut level = leaf_refs;
+    let mut depth: u8 = 0;
+    while level.len() > 1 {
+        let mut up: Vec<Option<Ref>> = Vec::new();
+        for (bi, chunk) in level.chunks(fan as usize).enumerate() {
+            let base = bi as u64 * fan * leaf_bits * (1u64 << depth.min(30));
+            let bytes = page::build_radix_inner(base, page::KIND_FREE_INNER, chunk);
+            let r = prims::write_fresh(cx, &bytes)?;
+            cx.with("fs:markinner", |c| {
+                c.store().slots.used_cur.insert(r.slot);
+                Ok(())
+            })?;
+            up.push(Some(r));
+        }
+        level = up;
+        depth += 1;
+    }
+    let root = level.first().copied().flatten().unwrap_or_default();
+    Ok((root, frozen_sc, img_next_lpid))
+}
 
-    // ---- recovery (§14) ----
+/// The full set of slots image k references (data + map + free-set pages
+/// plus the fixed slots), for the step-5 durable set.
+fn full_image_slots<H: StoreHost>(cx: &Cx<'_, H>) -> Result<BTreeSet<u64>, Fail> {
+    cx.with("full_slots", |c| {
+        let st = c.store();
+        let mut out = prims::image_slot_set(st);
+        for (_, r) in st.map.prev_leaves.values() {
+            out.insert(r.slot);
+        }
+        for (_, r) in st.map.prev_inners.values() {
+            out.insert(r.slot);
+        }
+        out.insert(0);
+        out.insert(1);
+        out.insert(2);
+        Ok(out)
+    })
+}
 
-    /// Recover: two passes, skip `ts ≤ T`, chunks only of transactions
-    /// with a marker > T, physical truncation (G2), resume `dropping`
-    /// walks. Returns the frontier (the largest replayed ts, or `T`).
-    pub fn recover(cx: &Cx, cfg: super::StoreCfg) -> Result<(Self, u64), Fail> {
-        let (mut st, meta) = Self::open(cx, cfg)?;
-        st.seq.next_ts = meta.t + 1;
-        st.seq.visible_ts = meta.t;
-        // Pass 1 + pass 2 walk the WAL from wal_start_lsn (§14 steps 3–4;
-        // §12.5's stop rules: bad magic/CRC, `lsn` ≠ expected, `len` past
-        // the segment end, and SegmentEnd hops).
-        let mut replay: Vec<super::wal::Rec> = Vec::new();
-        let mut valid_end = meta.wal_start_lsn;
-        let mut lsn = meta.wal_start_lsn;
-        let mut markers: BTreeMap<(u32, u64), u64> = BTreeMap::new();
-        'outer: loop {
-            let seg = lsn - (lsn % WAL_SEG);
-            let name = format!("/wal/{seg:016x}.log");
-            let fid = match cx.env().open(&name) {
-                Ok(f) => f,
-                Err(_) => break 'outer,
-            };
-            let mut off = lsn - seg;
-            while off + 16 <= WAL_SEG {
-                let want = (WAL_SEG - off).min(16 * 1024 + 16);
-                let bytes = cx
-                    .env()
-                    .read_at(fid, off, want)
-                    .map_err(Fail::Sim)?;
-                match super::wal::dec_record_with_lsn_check(
-                    &bytes,
-                    lsn,
-                    seg + WAL_SEG,
-                    st.cfg.mutant,
-                ) {
-                    Ok(Some(rec)) => {
-                        let len = rec_len(&rec);
-                        // Accept the record the reader yields (card 1.4).
-                        cx.env().accepted(fid, off, len);
-                        if rec.kind == super::wal::K_SEGEND {
-                            lsn = seg + WAL_SEG;
-                            continue 'outer;
-                        }
-                        if rec.kind == super::wal::K_MARKER {
-                            markers.insert(rec.txn, rec.ts);
-                        }
-                        replay.push(rec);
-                        valid_end = lsn + len;
-                        lsn += len;
-                        off += len;
+// ---- recovery (§14) ----
+
+/// Recover: two passes, skip `ts ≤ T`, chunks only of transactions with a
+/// marker > T, physical truncation (G2), resume `dropping` walks.
+/// Returns the store (installed back out of the host) and the frontier
+/// (the largest replayed ts, or `T`).
+pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, u64), Fail> {
+    let (mut st, meta) = open(cx, cfg)?;
+    st.seq.next_ts = meta.t + 1;
+    st.seq.visible_ts = meta.t;
+    // Passes 1+2 (§14 steps 3–4): the walk collects records and markers
+    // (pass 1), then applies in LSN order (pass 2). §12.5's stop rules:
+    // bad magic/CRC, `lsn` ≠ expected, `len` past the segment end, and
+    // SegmentEnd hops.
+    let mut replay: Vec<wal::Rec> = Vec::new();
+    let mut valid_end = meta.wal_start_lsn;
+    let mut lsn = meta.wal_start_lsn;
+    let mut markers: BTreeMap<(u32, u64), u64> = BTreeMap::new();
+    let mutant = st.cfg.mutant;
+    'outer: loop {
+        let seg = wal::seg_of(lsn);
+        let name = format!("/wal/{seg:016x}.log");
+        let fid = match cx.env().open(&name) {
+            Ok(f) => f,
+            Err(_) => break 'outer,
+        };
+        let mut off = lsn - seg;
+        while off + 16 <= WAL_SEG {
+            let want = (WAL_SEG - off).min(16 * 1024 + 16);
+            let bytes = cx.env().read_at(fid, off, want).map_err(Fail::Sim)?;
+            match wal::dec_record_with_lsn_check(&bytes, lsn, seg + WAL_SEG, mutant) {
+                Ok(Some(rec)) => {
+                    let len = rec.len();
+                    // Accept the record the reader yields (card 1.4).
+                    cx.env().accepted(fid, off, len);
+                    if rec.kind == K_SEGEND {
+                        lsn = seg + WAL_SEG;
+                        continue 'outer;
                     }
-                    Ok(None) => {
-                        break 'outer;
+                    if rec.kind == K_MARKER {
+                        markers.insert(rec.txn, rec.ts);
                     }
-                    Err(()) => break 'outer,
+                    replay.push(rec);
+                    valid_end = lsn + len;
+                    lsn += len;
+                    off += len;
+                }
+                Ok(None) | Err(()) => break 'outer,
+            }
+        }
+        break 'outer;
+    }
+    // Pass 2: install the opened store, then apply in LSN order through
+    // the gated insert path (§9.1's identical-entry no-op makes it
+    // idempotent).
+    cx.with("recover:install", |c| {
+        *c.store() = st;
+        Ok(())
+    })?;
+    let mut frontier = meta.t;
+    for rec in replay.iter() {
+        match rec.kind {
+            K_COMMIT if rec.ts > meta.t => {
+                for op in wal::rec_ops(rec) {
+                    apply_op(cx, &op, rec.ts, false)?;
+                }
+                cx.with("recover:applied", |c| {
+                    c.store().seq.applied.insert(rec.ts);
+                    Ok(())
+                })?;
+                frontier = frontier.max(rec.ts);
+            }
+            K_CHUNK => {
+                if let Some(ts) = markers.get(&rec.txn).copied()
+                    && ts > meta.t
+                {
+                    for op in wal::rec_ops(rec) {
+                        apply_op(cx, &op, ts, true)?;
+                    }
+                    cx.with("recover:applied2", |c| {
+                        c.store().seq.applied.insert(ts);
+                        Ok(())
+                    })?;
+                    frontier = frontier.max(ts);
                 }
             }
-            break 'outer;
+            _ => {}
         }
-        // Pass 2 semantics: apply in LSN order.
-        let mut frontier = meta.t;
-        for rec in replay.iter() {
-            match rec.kind {
-                super::wal::K_COMMIT if rec.ts > meta.t => {
-                    for op in super::wal::rec_ops(rec) {
-                        st.apply_op(cx, &op, rec.ts)?;
-                    }
-                    st.seq.applied.insert(rec.ts);
-                    frontier = frontier.max(rec.ts);
-                }
-                super::wal::K_CHUNK => {
-                    if let Some(ts) = markers.get(&rec.txn).copied()
-                        && ts > meta.t
-                    {
-                        for op in super::wal::rec_ops(rec) {
-                            st.apply_op(cx, &op, ts)?;
-                        }
-                        st.seq.applied.insert(ts);
-                        frontier = frontier.max(ts);
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Advance visible_ts through contiguous applied commits.
+    }
+    // Advance visible_ts through contiguous applied commits.
+    cx.with("recover:visible", |c| {
+        let st = c.store();
         while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
             st.seq.visible_ts += 1;
         }
         st.seq.next_ts = st.seq.visible_ts + 1;
-        // G2: physical truncation before returning (and before any new
-        // append): zero from the valid end to the segment end and every
-        // later segment's content, sync each, then sync_dir.
-        if !matches!(st.cfg.mutant, Some(Mutant::TruncateLogicalOnly)) {
-            st.truncate_wal(cx, valid_end)?;
-        } else {
-            st.wal.append = valid_end; // logical only
-            st.wal.buf.clear();
-        }
-        // The WAL writer state restarts at the valid end.
+        Ok(())
+    })?;
+    // G2: physical truncation before returning (and before any new
+    // append): zero from the valid end to the end of its segment and
+    // every later segment's content, `sync_data` each, then `sync_dir`.
+    // TRUNCATE-LOGICAL-ONLY moves the append position only (the mutant).
+    let logical_only = cx.with("recover:mut", |c| {
+        Ok(matches!(
+            c.store().cfg.mutant,
+            Some(Mutant::TruncateLogicalOnly)
+        ))
+    })?;
+    if !logical_only {
+        truncate_wal(cx, valid_end)?;
+    }
+    // The WAL writer state restarts at the valid end.
+    cx.with("recover:walreset", |c| {
+        let st = c.store();
         st.wal.append = valid_end;
         st.wal.durable = valid_end;
         st.wal.written = valid_end;
         st.wal.buf.clear();
         st.wal.buf_tags.clear();
-        // Step 6: resume dropping walks.
-        st.resume_drops(cx)?;
-        Ok((st, frontier))
-    }
-
-    fn stale_stop(&mut self, _b: &[u8], _lsn: u64) -> bool {
-        // Counted where a stale first record stopped the walk; the
-        // reader's lsn check above reports it via dec_record's error.
-        false
-    }
-
-    /// Apply one op at `ts` (the gated insert path; §9).
-    pub fn apply_op(&mut self, cx: &Cx, op: &super::wal::WOp, ts: u64) -> Result<(), Fail> {
-        match op {
-            super::wal::WOp::CreateTree { tree } => self.dir_create_tree(cx, *tree).map(|_| ()),
-            super::wal::WOp::DropTree { tree } => self.dir_drop_tree(cx, *tree).map(|_| ()),
-            super::wal::WOp::Put { tree, key, value } => {
-                let root = self.dir_root_of(*tree)?;
-                let ekey = super::tree::enc_ekey(key, ts);
-                let mut v = vec![0u8];
-                v.extend_from_slice(value);
-                self.tree_insert(cx, *tree, root, &ekey, &v).map(|_| ())
-            }
-            super::wal::WOp::Delete { tree, key } => {
-                let root = self.dir_root_of(*tree)?;
-                let ekey = super::tree::enc_ekey(key, ts);
-                self.tree_insert(cx, *tree, root, &ekey, &[1u8]).map(|_| ())
-            }
-        }
-    }
-
-    /// A tree's root (XX001 if the directory lacks it and the op needs it).
-    pub fn dir_root_of(&self, tree: u64) -> Result<u64, Fail> {
-        self.dir
-            .get(&tree)
-            .map(|e| e.root)
-            .ok_or_else(|| Fail::Corrupt(format!("tree {tree} missing in directory")))
-    }
-
-    /// G2: zero from the valid end through the rest of its segment and
-    /// every later segment; `sync_data` each; `sync_dir`.
-    pub fn truncate_wal(&mut self, cx: &Cx, valid_end: u64) -> Result<(), Fail> {
-        let mut seg = valid_end - (valid_end % WAL_SEG);
-        loop {
-            let name = format!("/wal/{seg:016x}.log");
-            let Ok(f) = cx.env().open(&name) else {
-                break;
-            };
-            let off = if seg == valid_end - (valid_end % WAL_SEG) {
-                valid_end - seg
-            } else {
-                0
-            };
-            if off < WAL_SEG {
-                let zeros = vec![0u8; (WAL_SEG - off) as usize];
-                cx.env().write_at(f, off, &zeros).map_err(Fail::Sim)?;
-            }
-            cx.env().sync_data(f).map_err(Fail::Sim)?;
-            seg += WAL_SEG;
-        }
-        cx.env().sync_dir(WAL_DIR).map_err(Fail::Sim)?;
+        st.wal.open_chunks.clear();
         Ok(())
-    }
+    })?;
+    // §14 step 6: resume `dropping` walks.
+    tree::resume_drops(cx)?;
+    let out = cx.with("recover:take", |c| Ok(c.store().clone()))?;
+    Ok((out, frontier))
+}
 
-    // ---- amcheck (card 3.8) ----
-
-    /// Amcheck a quiescent image read through SimDisk: §3.3 on every
-    /// referenced page, tree order and bounds, entry decodes and tags,
-    /// LPID exactness, free-set exactness, meta bounds. Returns findings.
-    pub fn amcheck(cx: &Cx, cfg: &super::StoreCfg) -> Vec<crate::oracle::Finding> {
-        let mut out = Vec::new();
-        let pf = match cx.env().open(PAGE_FILE) {
-            Ok(f) => f,
-            Err(_) => {
-                out.push(crate::oracle::Finding {
-                    slot: None,
-                    what: "open failed".into(),
-                });
-                return out;
-            }
-        };
-        let m1 = cx.env().read_at(pf, page::PAGE as u64, page::PAGE as u64);
-        let m2 = cx
-            .env()
-            .read_at(pf, 2 * page::PAGE as u64, page::PAGE as u64);
-        let (meta, meta_slot) = match (m1, m2) {
-            (Ok(a), Ok(b)) => {
-                let pa = page::parse_meta(&a).ok();
-                let pb = page::parse_meta(&b).ok();
-                match (pa, pb) {
-                    (Some(x), Some(y)) => {
-                        if x.ckpt_id >= y.ckpt_id {
-                            (x, 1)
-                        } else {
-                            (y, 2)
-                        }
-                    }
-                    (Some(x), None) => (x, 1),
-                    (None, Some(y)) => (y, 2),
-                    (None, None) => {
-                        out.push(crate::oracle::Finding {
-                            slot: Some(1),
-                            what: "no valid meta".into(),
-                        });
-                        return out;
-                    }
-                }
-            }
-            _ => {
-                out.push(crate::oracle::Finding {
-                    slot: None,
-                    what: "meta read failed".into(),
-                });
-                return out;
-            }
-        };
-        let _ = meta_slot;
-        // Meta bounds.
-        if meta.gc_w > meta.t {
-            out.push(crate::oracle::Finding {
-                slot: Some(meta_slot as u64),
-                what: "gc_w > T".into(),
-            });
+/// Apply one op at `ts` (the gated insert path; §9). `chunked` marks a
+/// chunked transaction's superseding replay ops (§14: the last op per key
+/// wins — a replace, not a conflict).
+pub fn apply_op<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    op: &wal::WOp,
+    ts: u64,
+    chunked: bool,
+) -> Result<(), Fail> {
+    match op {
+        wal::WOp::CreateTree { tree } => {
+            tree::dir_create_tree(cx, *tree)?;
+            Ok(())
         }
-        // Load the map (findings on integrity failures).
-        let mut probe = StoreInner::empty(cfg.clone(), pf);
-        if let Err(e) = probe.load_image(cx, &meta) {
-            out.push(crate::oracle::Finding {
-                slot: None,
-                what: format!("image walk: {e:?}"),
-            });
-            return out;
+        wal::WOp::DropTree { tree } => {
+            tree::dir_drop_tree(cx, *tree)?;
+            Ok(())
         }
-        // LPID exactness: the mapped LPIDs equal the reachable pages from
-        // the directory roots plus the directory's own pages.
-        let mut reachable: BTreeSet<u64> = BTreeSet::new();
-        let dir_root = meta.dir_root;
-        if dir_root != 0 {
-            Self::amcheck_tree(cx, &probe, dir_root, &mut reachable, &mut out, "dir");
+        wal::WOp::Put { tree, key, value } => {
+            if key.len() > page::K_MAX || value.len() > page::V_INLINE {
+                return Err(Fail::Invalid("oversize key or value".into()));
+            }
+            let root = tree::dir_root_of(cx, *tree)?;
+            let ekey = tree::enc_ekey(key, ts);
+            let mut v = vec![0u8];
+            v.extend_from_slice(value);
+            tree::tree_insert(cx, *tree, root, &ekey, &v, chunked)?;
+            Ok(())
         }
-        for (id, entry) in probe.dir.iter() {
-            if id != &super::DIR_TREE {
-                Self::amcheck_tree(cx, &probe, entry.root, &mut reachable, &mut out, "tree");
-            }
-        }
-        for lpid in probe.map.cur.keys() {
-            if !reachable.contains(lpid) && *lpid != dir_root {
-                out.push(crate::oracle::Finding {
-                    slot: probe.map.cur.get(lpid).map(|r| r.slot),
-                    what: format!("mapped lpid {lpid} unreachable"),
-                });
-            }
-        }
-        for lpid in reachable.iter() {
-            if !probe.map.cur.contains_key(lpid) {
-                out.push(crate::oracle::Finding {
-                    slot: None,
-                    what: format!("reachable lpid {lpid} unmapped"),
-                });
-            }
-        }
-        // Free-set exactness.
-        let mut free_bits: BTreeSet<u64> = BTreeSet::new();
-        if meta.free_root.slot != 0 {
-            let total_bits = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
-            let mut pages = Vec::new();
-            if let Err(e) = Self::walk_freeset(
-                cx,
-                pf,
-                meta.free_root,
-                cfg.freeset_leaf_bits,
-                total_bits,
-                &mut free_bits,
-                &mut pages,
-            ) {
-                out.push(crate::oracle::Finding {
-                    slot: Some(meta.free_root.slot),
-                    what: format!("free set walk: {e:?}"),
-                });
-            }
-        }
-        let referenced: BTreeSet<u64> = probe.slots.used_cur;
-        for bit in free_bits.iter() {
-            if *bit < meta.slot_count - 3 {
-                let slot = bit + 3;
-                if referenced.contains(&slot) {
-                    out.push(crate::oracle::Finding {
-                        slot: Some(slot),
-                        what: "free bitmap marks a referenced slot".into(),
-                    });
-                }
-            }
-        }
-        for slot in referenced.iter() {
-            if *slot >= 3 && *slot < meta.slot_count && !free_bits.contains(&(*slot - 3)) {
-                out.push(crate::oracle::Finding {
-                    slot: Some(*slot),
-                    what: "referenced slot not marked used".into(),
-                });
-            }
-        }
-        if meta.next_lpid <= *probe.map.cur.keys().max().unwrap_or(&0) {
-            out.push(crate::oracle::Finding {
-                slot: Some(meta_slot as u64),
-                what: "next_lpid not above every mapped lpid".into(),
-            });
-        }
-        out
-    }
-
-    fn amcheck_tree(
-        cx: &Cx,
-        probe: &StoreInner,
-        root: u64,
-        reachable: &mut BTreeSet<u64>,
-        out: &mut Vec<crate::oracle::Finding>,
-        what: &str,
-    ) {
-        // Walk through probe's refs (durable reads, §3.3 via load).
-        let mut stack: Vec<u64> = vec![root];
-        while let Some(l) = stack.pop() {
-            if !reachable.insert(l) {
-                out.push(crate::oracle::Finding {
-                    slot: probe.map.cur.get(&l).map(|r| r.slot),
-                    what: format!("{what}: lpid {l} reachable more than once"),
-                });
-                continue;
-            }
-            let Some(r) = probe.map.cur.get(&l) else { continue };
-            let bytes = match cx.env().read_at(probe.page_file, r.slot * page::PAGE as u64, page::PAGE as u64) {
-                Ok(b) => b,
-                Err(_) => {
-                    out.push(crate::oracle::Finding {
-                        slot: Some(r.slot),
-                        what: format!("{what}: read failed"),
-                    });
-                    continue;
-                }
-            };
-            if page::check(&bytes, r, l, None).is_err() {
-                out.push(crate::oracle::Finding {
-                    slot: Some(r.slot),
-                    what: format!("{what}: §3.3 fail on lpid {l}"),
-                });
-                continue;
-            }
-            cx.env().accepted(probe.page_file, r.slot * page::PAGE as u64, page::PAGE as u64);
-            let kind = bytes.get(1).copied().unwrap_or(0);
-            if kind == page::KIND_LEAF {
-                if let Ok(cells) = super::tree::leaf_cells_pub(&bytes) {
-                    let mut prev: Option<Vec<u8>> = None;
-                    for (k, v) in cells {
-                        if let Some(p) = &prev
-                            && p >= &k
-                        {
-                            out.push(crate::oracle::Finding {
-                                slot: Some(r.slot),
-                                what: format!("{what}: leaf keys out of order"),
-                            });
-                        }
-                        prev = Some(k.clone());
-                        let tag = v.first().copied().unwrap_or(255);
-                        if what != "dir" {
-                            match super::tree::dec_ekey(&k) {
-                                Some((_, ts)) if ts != 0 && ts != u64::MAX && tag <= 1 => {}
-                                _ => out.push(crate::oracle::Finding {
-                                    slot: Some(r.slot),
-                                    what: format!("{what}: entry decode/tag fail"),
-                                }),
-                            }
-                        }
-                    }
-                }
-            } else if let Ok((seps, right)) = super::tree::inner_seps_pub(&bytes) {
-                let mut prev: Option<Vec<u8>> = None;
-                for (c, s) in seps {
-                    if let Some(p) = &prev
-                        && p >= &s
-                    {
-                        out.push(crate::oracle::Finding {
-                            slot: Some(r.slot),
-                            what: format!("{what}: separators out of order"),
-                        });
-                    }
-                    prev = Some(s.clone());
-                    stack.push(c);
-                }
-                stack.push(right);
-            }
+        wal::WOp::Delete { tree, key } => {
+            let root = tree::dir_root_of(cx, *tree)?;
+            let ekey = tree::enc_ekey(key, ts);
+            tree::tree_insert(cx, *tree, root, &ekey, &[1u8], chunked)?;
+            Ok(())
         }
     }
 }
 
-fn cx_open_chunks(_cx: &Cx) -> BTreeMap<(u32, u64), u64> {
-    BTreeMap::new()
-}
-
-#[allow(dead_code)]
-fn unused_open_chunks() {}
-
-fn rec_len(rec: &super::wal::Rec) -> u64 {
-    // The record's own length: header + body (derived from the payload).
-    (rec.payload.len() + 45) as u64
+/// G2: zero from the valid end through the rest of its segment and every
+/// later segment; `sync_data` each; `sync_dir`.
+pub fn truncate_wal<H: StoreHost>(cx: &Cx<'_, H>, valid_end: u64) -> Result<(), Fail> {
+    let first = wal::seg_of(valid_end);
+    let mut seg = first;
+    loop {
+        let name = format!("/wal/{seg:016x}.log");
+        let Ok(f) = cx.env().open(&name) else {
+            break;
+        };
+        let off = if seg == first { valid_end - seg } else { 0 };
+        if off < WAL_SEG {
+            let zeros = vec![0u8; (WAL_SEG - off) as usize];
+            cx.env().write_at(f, off, &zeros).map_err(Fail::Sim)?;
+        }
+        cx.env().sync_data(f).map_err(Fail::Sim)?;
+        seg += WAL_SEG;
+    }
+    cx.env().sync_dir(WAL_DIR).map_err(Fail::Sim)?;
+    Ok(())
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
     crate::crc::crc32c(0, b) as u64
 }
-
-impl StoreInner {
-    /// Used by the harness's bulk-load publish wait (§12.8).
-    pub fn wait_meta_durable(&mut self, cx: &Cx, k: u64) -> Result<(), Fail> {
-        loop {
-            let ok = self.meta_durable_k >= k;
-            cx.yield_now()?;
-            if ok {
-                return Ok(());
-            }
-            if matches!(self.cfg.mutant, Some(Mutant::PublishBeforeMeta)) {
-                return Ok(());
-            }
-            cx.wait_for(crate::sim::WaitKey::MetaDurable)?;
-        }
-    }
-}
-
-/// Extra: a version of `dec_record` with the LSN-CHECK-SKIP mutant hook.
-pub fn dec_record_with_lsn_check_unused() {}

@@ -91,6 +91,11 @@ pub struct DWrite {
     pub pre: Vec<u8>,
     /// Which inode (file) the write belongs to.
     pub inode: FileId,
+    /// Whether the graduating sync was a `sync_all` (card X-5b Work 13:
+    /// X5-R5's `meta_rollback` and the set `R` key on "a completed
+    /// `sync_all` covering a meta write"; the durable-write list itself
+    /// already restricts membership to writes a completed sync covered).
+    pub all: bool,
 }
 
 /// A recorded read (for the accept hook and the twin's read sets).
@@ -233,7 +238,7 @@ pub enum DiskEvent {
 }
 
 /// One file's state.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Inode {
     /// Current bytes (the volatile-inclusive view). Length tracks the
     /// current length; writes beyond it extend it.
@@ -356,7 +361,9 @@ impl Inode {
 }
 
 /// The simulated disk. All namespace iteration is over `BTreeMap`s.
-#[derive(Debug, Default)]
+/// `Clone` snapshots the whole disk for the harness's pass re-runs, twin
+/// runs and deterministic fault-plan retries (card X-5b Work 13).
+#[derive(Debug, Default, Clone)]
 pub struct SimDisk {
     inodes: Vec<Inode>,
     cur_bindings: BTreeMap<String, BTreeMap<String, FileId>>,
@@ -572,7 +579,7 @@ impl SimDisk {
             .max();
         let ws = std::mem::take(&mut inode.volatile);
         for w in ws {
-            graduate(inode, &w, id);
+            graduate(inode, &w, id, false);
         }
         if let Some(e) = maxend {
             let needed = e.min(inode.cur.len() as u64);
@@ -597,7 +604,7 @@ impl SimDisk {
         let cur_len = inode.cur.len() as u64;
         let ws = std::mem::take(&mut inode.volatile);
         for w in ws {
-            graduate(inode, &w, id);
+            graduate(inode, &w, id, true);
         }
         if cur_len > inode.durable.len() as u64 {
             inode.durable.resize(cur_len as usize, 0);
@@ -1041,6 +1048,26 @@ impl SimDisk {
 
     // ---- observer accessors (harness and monitors only) ----
 
+    /// The durable writes of a file, in issue order, across all lives of
+    /// the seed (harness/monitor history query, card X-5b Work 13: X5-R5's
+    /// `meta_rollback`, the set `R` and M-NOINPLACE read this; the store
+    /// never may).
+    pub fn dwrites_of(&self, id: FileId) -> &[DWrite] {
+        match self.inodes.get(id) {
+            Some(i) => i.dwrites.as_slice(),
+            None => &[],
+        }
+    }
+
+    /// Apply one specific media fault (card X-5b Work 6/D17, D10b: the
+    /// directed tests fault named targets deterministically). The fault
+    /// must describe a durable write (the caller builds it from
+    /// [`SimDisk::dwrites_of`]); the effect is exactly what the drawn
+    /// faults of `apply_media_page`/`apply_media_wal` do.
+    pub fn apply_one_media_fault(&mut self, f: &MediaFault) {
+        self.record_media(vec![f.clone()]);
+    }
+
     /// The durable bytes of a range (observer view; no taint recording).
     pub fn durable_read(&self, id: FileId, off: u64, len: u64) -> Vec<u8> {
         let mut out = vec![0u8; len as usize];
@@ -1101,7 +1128,7 @@ impl SimDisk {
 }
 
 /// Move a volatile write into the durable bytes and the durable-write log.
-fn graduate(inode: &mut Inode, w: &VWrite, id: FileId) {
+fn graduate(inode: &mut Inode, w: &VWrite, id: FileId, all: bool) {
     let end = w.off + w.bytes.len() as u64;
     if end > inode.durable.len() as u64 {
         inode.durable.resize(end as usize, 0);
@@ -1114,6 +1141,7 @@ fn graduate(inode: &mut Inode, w: &VWrite, id: FileId) {
         bytes: w.bytes.clone(),
         pre: w.pre.clone(),
         inode: id,
+        all,
     });
 }
 
