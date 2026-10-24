@@ -411,6 +411,26 @@ impl<H: SchedHost> Sched<H> {
         Ok(())
     }
 
+    /// Deliver a crash now (card X-5b Work 13's hook and task-yield crash
+    /// points): mark the world crashed, make every waiter runnable and
+    /// broadcast, so each task unwinds with `Crashed` at its next
+    /// scheduler call instead of parking forever.
+    pub fn deliver_crash(&self) {
+        let mut host = self.lock();
+        let cvs: Vec<&Condvar> = self.cvs.iter().collect();
+        {
+            let core = host.sched_mut();
+            core.crashed = true;
+            core.running = None;
+            for w in core.waiting.iter_mut() {
+                *w = None;
+            }
+        }
+        for cv in cvs {
+            cv.notify_all();
+        }
+    }
+
     /// Wake every task parked on `key` (their condition may have changed).
     /// They become candidates for the next handoff; no signal is needed
     /// (see the module's wakeup protocol).

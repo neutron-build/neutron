@@ -1,0 +1,1861 @@
+//! The round harness (card X-5 Work 13; the round-engine parts of X-5's
+//! `workload.rs` draft, finished under the S-BATON discipline).
+//!
+//! One round: a **scripted** workload (the seeded generator is X-5c's),
+//! the crash, the round's media faults, recovery with nested recovery
+//! crashes, the Work 2.3 extraction through the recovered store's own
+//! read paths, the P-written oracle, the monitors, and the harness
+//! checkpoint. Every oracle input comes from SimDisk state, parsed disk
+//! bytes, or the store's read paths — never store memory (the one
+//! exception the card names: the flip's reported enqueue position for
+//! M-CKPT-T, Work 3.10).
+//!
+//! Determinism (S-DET): the schedule is a pure function of the seed; the
+//! same inputs give a byte-identical digest (`tests/harness.rs`).
+//!
+//! Style: the step closures keep their nested conditionals un-collapsed
+//! (each level names one event-bookkeeping decision).
+
+#![allow(clippy::collapsible_if, clippy::collapsible_match)]
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::model::{CATALOG, LoadRec, Mode, Model, Op, PUBLIC, Scan, to_be64};
+use crate::oracle::{
+    Extracted, FaultTargets, Finding, OracleCfg, RawEntry, ReadFail, StateReader, TwinInfo, XxSite,
+    check_round,
+};
+use crate::rng::{Rng, derive};
+use crate::sim::{
+    DiskEvent, FaultClass, FaultKnobs, HARNESS, MediaFault, Sched, SchedCore, SchedHost, SimDisk,
+    SimFail, TaskId, WaitKey,
+};
+use crate::store::ckpt::{self, CkptHook};
+use crate::store::tree;
+use crate::store::wal::{self, K_CHUNK, K_COMMIT, K_MARKER};
+use crate::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims};
+
+/// Stream tags (independent splitmix64 derivations per concern).
+const S_SCHED: u64 = 1;
+const S_CRASH: u64 = 4;
+const S_SAMPLE: u64 = 6;
+
+/// One scripted operation of a task (card Work 13, "Workload").
+#[derive(Debug, Clone)]
+pub enum ScriptOp {
+    /// A small logged transaction.
+    Commit {
+        /// Durability mode.
+        sync_on: bool,
+        /// The ops.
+        ops: Vec<Op>,
+    },
+    /// A chunked transaction (§12.7): chunks first, then the marker.
+    Chunked {
+        /// Durability mode of the marker's ack.
+        sync_on: bool,
+        /// The ops.
+        ops: Vec<Op>,
+    },
+    /// An unlogged bulk load into an unpublished tree (§12.8), with the
+    /// pre-registration of §10.1 and publication after the forced
+    /// checkpoint's meta is durable (I-BULK-PUBLISH).
+    BulkLoad {
+        /// The tree id.
+        tree: u64,
+        /// The entries.
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// A GC sweep over a tree (the §10.2 rule at the given watermark;
+    /// `None` = the harness watermark: min(registered snapshots,
+    /// visible_ts), never below the recovered gc_w).
+    Gc {
+        /// The tree.
+        tree: u64,
+        /// The watermark.
+        w: Option<u64>,
+    },
+    /// Request a checkpoint and wait for it to complete.
+    Checkpoint,
+    /// Set a named park point's budget (the D5 split parking).
+    Park {
+        /// The park point.
+        name: &'static str,
+        /// Yields to burn there.
+        budget: u64,
+    },
+    /// Burn `n` yields.
+    Yields(u64),
+    /// Wait until visible_ts ≥ t.
+    WaitVisible(u64),
+}
+
+/// One task's script.
+#[derive(Debug, Clone)]
+pub struct ScriptTask {
+    /// The ops, in order.
+    pub ops: Vec<ScriptOp>,
+}
+
+/// The crash specification of a round (Work 13, "Crash").
+#[derive(Debug, Clone)]
+pub enum CrashSpec {
+    /// Crash at `hook` of the checkpoint with index `ckpt_index`
+    /// (0-based, in completion order).
+    Hook {
+        /// Which checkpoint.
+        ckpt_index: u64,
+        /// Which hook.
+        hook: CkptHook,
+    },
+    /// Crash at the n-th yield point of a named task (script-level yield
+    /// points: before every op and inside every park budget).
+    TaskYield(TaskId, u64),
+}
+
+/// The round's script: tasks, service tasks, the crash and the nested
+/// recovery crashes.
+#[derive(Debug, Clone)]
+pub struct Script {
+    /// The scripted tasks (task ids 1..=len).
+    pub tasks: Vec<ScriptTask>,
+    /// Run a WAL writer task.
+    pub writer: bool,
+    /// Run a background evictor task.
+    pub evictor: bool,
+    /// Run a checkpointer task (every n commits and on force).
+    pub checkpointer_every: Option<u64>,
+    /// The crash point (None = no crash this round).
+    pub crash: Option<CrashSpec>,
+    /// Nested recovery crashes, each at a yield point inside recovery.
+    pub nested: Vec<u64>,
+}
+
+impl Script {
+    /// The total task count (script tasks + service tasks + harness).
+    pub fn ntasks(&self) -> usize {
+        1 + self.tasks.len()
+            + usize::from(self.writer)
+            + usize::from(self.evictor)
+            + usize::from(self.checkpointer_every.is_some())
+    }
+}
+
+/// The per-seed harness state (the world's harness slice): the model
+/// hooks of Work 2.1 and the coordination flags the task bodies share.
+#[derive(Debug, Default)]
+pub struct HarnessState {
+    /// The reference model.
+    pub model: Model,
+    /// Commit ts → (sync_on, record end lsn) — recorded at the enqueue.
+    pub wal_commits: BTreeMap<u64, (bool, u64)>,
+    /// The txn counter (ids).
+    pub txn_counter: u64,
+    /// Registered snapshots (long readers).
+    pub snapshots: BTreeSet<u64>,
+    /// Published trees.
+    pub published: BTreeSet<u64>,
+    /// Bulk loads seen.
+    pub loads: Vec<LoadRec>,
+    /// The flips' reported enqueue positions (M-CKPT-T's hook, Work
+    /// 3.10; copied into the outcome after the round).
+    pub flip_enqueue_pos: Vec<u64>,
+    /// Commits completed (the checkpoint trigger's counter).
+    pub commits_done: u64,
+    /// The scripted tasks are done.
+    pub workload_done: bool,
+    /// A forced checkpoint is pending (bulk load).
+    pub force_ckpt: bool,
+    /// A DEADLOCK was observed.
+    pub deadlock: bool,
+    /// A `SimFail::Baton` was observed.
+    pub baton: bool,
+    /// A task panicked.
+    pub panicked: bool,
+}
+
+/// The world of a harness round: the store's `Core` slices plus the
+/// harness slice.
+pub struct RoundWorld {
+    /// Scheduling slice.
+    pub sched: SchedCore,
+    /// Disk slice.
+    pub disk: SimDisk,
+    /// Store slice.
+    pub st: StoreInner,
+    /// Harness slice.
+    pub h: HarnessState,
+}
+
+impl crate::sim::SchedHost for RoundWorld {
+    fn sched_mut(&mut self) -> &mut SchedCore {
+        &mut self.sched
+    }
+}
+
+impl crate::sim::HasDisk for RoundWorld {
+    fn disk(&mut self) -> &mut SimDisk {
+        &mut self.disk
+    }
+}
+
+impl crate::store::HasStore for RoundWorld {
+    fn store(&mut self) -> &mut StoreInner {
+        &mut self.st
+    }
+}
+
+impl RoundWorld {
+    /// The harness slice.
+    pub fn h(&mut self) -> &mut HarnessState {
+        &mut self.h
+    }
+}
+
+/// Clone a model field-by-field (`model.rs` is frozen; its fields are
+/// public and its records are `Clone`).
+pub fn clone_model(m: &Model) -> Model {
+    let mut out = Model::new();
+    out.commits = m.commits.clone();
+    out.loads = m.loads.clone();
+    out
+}
+
+/// Build a round world from a durable disk + store state.
+pub fn round_world(seed: u64, disk: SimDisk, st: StoreInner) -> Sched<RoundWorld> {
+    let host = RoundWorld {
+        sched: SchedCore::new(1, seed),
+        disk,
+        st,
+        h: HarnessState::default(),
+    };
+    Sched::new(host)
+}
+
+/// The store's create pre-pass (§2.3 + G6): one task, no crash points.
+pub fn create_store(cfg: StoreCfg, seed: u64, uuid: u128) -> Result<(SimDisk, StoreInner), Fail> {
+    let host = RoundWorld {
+        sched: SchedCore::new(1, seed),
+        disk: SimDisk::new(),
+        st: StoreInner::empty(cfg.clone(), 0),
+        h: HarnessState::default(),
+    };
+    let sched = Sched::new(host);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    let st = ckpt::create(&cx, cfg, uuid)?;
+    cx.with("h:create:install", |c| {
+        *c.store() = st;
+        Ok(())
+    })?;
+    let g = sched.lock();
+    Ok((g.disk.clone(), g.st.clone()))
+}
+
+// ---- the commit path (Work 4.3) ----
+
+/// The commit critical section (ts + enqueue, I-WAL-TS-ORDER), the
+/// group-commit ack (§12.4), apply entry by entry as gated inserts, and
+/// `mark_applied` (visible_ts advances in ts order). Chunked
+/// transactions write their chunks first and apply after the marker's
+/// group sync (§12.7). Returns the commit ts.
+pub fn commit_txn(
+    cx: &Cx<'_, RoundWorld>,
+    ops: &[Op],
+    sync_on: bool,
+    chunked: bool,
+) -> Result<u64, Fail> {
+    let txn = cx.with("h:txn", |c| {
+        let h = c.h();
+        h.txn_counter += 1;
+        Ok((1u32, h.txn_counter))
+    })?;
+    if chunked {
+        let mut rest = ops.to_vec();
+        while !rest.is_empty() {
+            let take = 20.min(rest.len());
+            let chunk: Vec<Op> = rest.drain(..take).collect();
+            let mut payload = Vec::new();
+            for op in &chunk {
+                wal::enc_op(&to_wop(op), &mut payload);
+            }
+            let (lsn, _len) = wal::wal_enqueue(cx, K_CHUNK, txn, 0, &payload)?;
+            cx.with("h:openchunk", |c| {
+                c.store().wal.open_chunks.insert(txn, lsn);
+                Ok(())
+            })?;
+        }
+    }
+    // The critical section: take the flag, assign the ts, enqueue the
+    // record at its LSN, release the flag (one critical section;
+    // TS-AFTER-APPEND ends it after the ts assignment).
+    let ts_after_append = cx.with("h:mut", |c| {
+        Ok(matches!(c.store().cfg.mutant, Some(Mutant::TsAfterAppend)))
+    })?;
+    loop {
+        let taken = cx.with("h:cs", |c| {
+            let st = c.store();
+            if st.seq.commit_cs {
+                Ok(false)
+            } else {
+                st.seq.commit_cs = true;
+                Ok(true)
+            }
+        })?;
+        if taken {
+            break;
+        }
+        cx.wait_for(WaitKey::Applied)?;
+    }
+    let ts = cx.with("h:ts", |c| {
+        let st = c.store();
+        let t = st.seq.next_ts;
+        st.seq.next_ts += 1;
+        Ok(t)
+    })?;
+    if ts_after_append && !chunked {
+        // The mutant: the critical section ends here, a yield happens,
+        // and another committer can take a higher ts at a lower LSN.
+        cx.with("h:cs2", |c| {
+            c.store().seq.commit_cs = false;
+            Ok(())
+        })?;
+        cx.w.wake(WaitKey::Applied);
+        cx.yield_now("h:ts-after-append")?;
+        loop {
+            let taken = cx.with("h:cs3", |c| {
+                let st = c.store();
+                if st.seq.commit_cs {
+                    Ok(false)
+                } else {
+                    st.seq.commit_cs = true;
+                    Ok(true)
+                }
+            })?;
+            if taken {
+                break;
+            }
+            cx.wait_for(WaitKey::Applied)?;
+        }
+    }
+    let mut payload = Vec::new();
+    if chunked {
+        let nchunks = ops.len().div_ceil(20) as u32;
+        payload.extend_from_slice(&nchunks.to_le_bytes());
+    } else {
+        for op in ops {
+            wal::enc_op(&to_wop(op), &mut payload);
+        }
+    }
+    let kind = if chunked { K_MARKER } else { K_COMMIT };
+    let (lsn, len) = wal::wal_enqueue(cx, kind, txn, ts, &payload)?;
+    let end_lsn = lsn + len;
+    let sync_flag = sync_on;
+    if chunked {
+        // The marker is enqueued: the transaction is no longer open
+        // (§12.6 counts only marker-less or marker-above-T transactions).
+        cx.with("h:closechunk", |c| {
+            c.store().wal.open_chunks.remove(&txn);
+            Ok(())
+        })?;
+    }
+    if chunked {
+        // §12.7: a chunked transaction applies after its marker's group
+        // sync — wait for durability first.
+        if sync_flag {
+            wal::wal_wait_durable(cx, end_lsn)?;
+        } else {
+            wal::wal_wait_written(cx, end_lsn)?;
+        }
+    }
+    // Release the critical section.
+    cx.with("h:cs4", |c| {
+        c.store().seq.commit_cs = false;
+        Ok(())
+    })?;
+    cx.w.wake(WaitKey::Applied);
+    // Record the commit for the model (2.1).
+    let mode = if sync_on { Mode::SyncOn } else { Mode::SyncOff };
+    cx.with("h:model", |c| {
+        let h = c.h();
+        h.model.commit(ts, mode, ops.to_vec());
+        h.wal_commits.insert(ts, (sync_on, end_lsn));
+        h.commits_done += 1;
+        Ok(())
+    })?;
+    // The ack (§12.4): SyncOn at the covering sync, SyncOff at the write.
+    if sync_flag {
+        wal::wal_wait_durable(cx, end_lsn)?;
+    } else {
+        wal::wal_wait_written(cx, end_lsn)?;
+    }
+    // Apply: entry by entry, as gated inserts, in ascending user-key
+    // order per tree (§9.1).
+    let mut ordered: Vec<&Op> = ops.iter().collect();
+    ordered.sort_by_key(|op| match op {
+        Op::Put { tree, key, .. } | Op::Delete { tree, key } => (*tree, key.clone()),
+        _ => (0, Vec::new()),
+    });
+    for op in ordered {
+        ckpt::apply_op(cx, &to_wop(op), ts, false)?;
+    }
+    mark_applied(cx, ts)?;
+    Ok(ts)
+}
+
+/// `mark_applied`: visible_ts advances in ts order; a committer waits
+/// for its turn to pass (§12.4's visibility rule).
+fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
+    cx.with("h:applied", |c| {
+        c.store().seq.applied.insert(ts);
+        Ok(())
+    })?;
+    loop {
+        let advanced = cx.with("h:vis", |c| {
+            let st = c.store();
+            let mut advanced = false;
+            while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
+                st.seq.visible_ts += 1;
+                advanced = true;
+            }
+            Ok(advanced)
+        })?;
+        if advanced {
+            cx.w.wake(WaitKey::Applied);
+        }
+        let vis = cx.with("h:vis2", |c| Ok(c.store().seq.visible_ts))?;
+        if vis >= ts {
+            return Ok(());
+        }
+        cx.wait_for(WaitKey::Applied)?;
+    }
+}
+
+/// `Op` → `WOp`.
+pub fn to_wop(op: &Op) -> wal::WOp {
+    match op {
+        Op::CreateTree { tree } => wal::WOp::CreateTree { tree: *tree },
+        Op::DropTree { tree } => wal::WOp::DropTree { tree: *tree },
+        Op::Put { tree, key, value } => wal::WOp::Put {
+            tree: *tree,
+            key: key.clone(),
+            value: value.clone(),
+        },
+        Op::Delete { tree, key } => wal::WOp::Delete {
+            tree: *tree,
+            key: key.clone(),
+        },
+    }
+}
+
+// ---- the task bodies ----
+
+/// Run the workload tasks of `script` under the baton; returns when all
+/// end (crash or completion). Records DEADLOCK/Baton/panic in the host.
+pub fn run_script(sched: &Sched<RoundWorld>, script: &Script, seed: u64) {
+    let ntasks = script.ntasks();
+    {
+        let mut g = sched.lock();
+        g.sched = SchedCore::new(ntasks, derive(seed, S_SCHED));
+        g.sched.ntasks = ntasks;
+    }
+    let panicked = std::sync::atomic::AtomicBool::new(false);
+    let mut deadlock = false;
+    let crash = std::sync::Arc::new(script.crash.clone());
+    let checkpointer_every = script.checkpointer_every;
+    let crash_for_join = (*crash).clone();
+    let nscript = script.tasks.len();
+    let writer = script.writer;
+    let evictor = script.evictor;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for t in 1..ntasks {
+            let sched_ref = sched;
+            let p = &panicked;
+            let tasks = script.tasks.clone();
+            let crash = std::sync::Arc::clone(&crash);
+            handles.push(scope.spawn(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_task(
+                        sched_ref,
+                        t,
+                        tasks,
+                        nscript,
+                        writer,
+                        evictor,
+                        checkpointer_every,
+                        &crash,
+                    )
+                }));
+                if r.is_err() {
+                    p.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                sched_ref.finish(t);
+            }));
+        }
+        let _ = sched.start();
+        for h in handles {
+            let _ = h.join();
+        }
+        let g = sched.lock();
+        if g.sched.deadlock {
+            deadlock = true;
+        }
+        if g.sched.crashed && crash_for_join.is_some() {
+            // A crash fired; expected for crashing rounds.
+        }
+    });
+    let mut g = sched.lock();
+    if deadlock {
+        g.h.deadlock = true;
+    }
+    if panicked.load(std::sync::atomic::Ordering::SeqCst) {
+        g.h.panicked = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_task(
+    sched: &Sched<RoundWorld>,
+    t: TaskId,
+    tasks: Vec<ScriptTask>,
+    nscript: usize,
+    writer: bool,
+    evictor: bool,
+    checkpointer_every: Option<u64>,
+    crash: &Option<CrashSpec>,
+) -> Result<(), SimFail> {
+    let cx = Cx { w: sched, t };
+    // The task's script-level yield counter (crash arming).
+    let mut yields = 0u64;
+    macro_rules! yld {
+        () => {{
+            if let Some(CrashSpec::TaskYield(want_t, want_n)) = crash
+                && *want_t == t
+                && *want_n == yields + 1
+            {
+                arm_crash(sched);
+                return Err(SimFail::Crashed);
+            }
+            yields += 1;
+            cx.yield_now("h:task").map_err(fail_of)?;
+        }};
+    }
+    // Script tasks.
+    if t <= nscript {
+        if let Some(task) = tasks.get(t - 1) {
+            for op in task.ops.iter() {
+                yld!();
+                script_op(&cx, op)?;
+            }
+        }
+        // The scripted tasks are done: the service tasks may end too.
+        cx.with("h:done", |c| {
+            c.h().workload_done = true;
+            Ok(())
+        })
+        .map_err(fail_of)?;
+        cx.w.wake(WaitKey::WalAcks);
+        cx.w.wake(WaitKey::MetaDurable);
+        cx.w.wake(WaitKey::Applied);
+        return Ok(());
+    }
+    let mut idx = t - nscript;
+    if writer {
+        if idx == 1 {
+            return writer_body(&cx);
+        }
+        idx -= 1;
+    }
+    if evictor {
+        if idx == 1 {
+            return evictor_body(&cx);
+        }
+        idx -= 1;
+    }
+    if let Some(every) = checkpointer_every
+        && idx == 1
+    {
+        return checkpointer_body(&cx, every, crash);
+    }
+    Ok(())
+}
+
+fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), SimFail> {
+    let r: Result<(), SimFail> = match op {
+        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false)
+            .map(|_| ())
+            .map_err(fail_of),
+        ScriptOp::Chunked { sync_on, ops } => commit_txn(cx, ops, *sync_on, true)
+            .map(|_| ())
+            .map_err(fail_of),
+        ScriptOp::Gc { tree, w } => gc_sweep(cx, *tree, *w).map_err(fail_of),
+        ScriptOp::Checkpoint => {
+            cx.with("h:force", |c| {
+                c.h().force_ckpt = true;
+                Ok(())
+            })
+            .map_err(fail_of)?;
+            wait_ckpt(cx).map_err(fail_of)
+        }
+        ScriptOp::Park { name, budget } => cx
+            .with("h:park", |c| {
+                c.store().parks.insert(name, *budget);
+                Ok(())
+            })
+            .map_err(fail_of),
+        ScriptOp::Yields(n) => {
+            for _ in 0..*n {
+                cx.yield_now("h:yields").map_err(fail_of)?;
+            }
+            Ok(())
+        }
+        ScriptOp::WaitVisible(v) => {
+            loop {
+                let vis = cx
+                    .with("h:waitv", |c| Ok(c.store().seq.visible_ts))
+                    .map_err(fail_of)?;
+                if vis >= *v {
+                    break;
+                }
+                cx.wait_for(WaitKey::Applied).map_err(fail_of)?;
+            }
+            Ok(())
+        }
+        ScriptOp::BulkLoad { tree, entries } => bulk_load(cx, *tree, entries).map_err(fail_of),
+    };
+    r
+}
+
+/// A full GC sweep over a tree (loop gc_step until done).
+pub fn gc_sweep(cx: &Cx<'_, RoundWorld>, t: u64, w: Option<u64>) -> Result<(), Fail> {
+    let w = match w {
+        Some(w) => w,
+        None => cx.with("h:gcw", |c| {
+            let (vis, gc_w) = {
+                let st = c.store();
+                (st.seq.visible_ts, st.meta.gc_w)
+            };
+            let snap = c.h().snapshots.iter().copied().min().unwrap_or(vis);
+            Ok(snap.min(vis).max(gc_w))
+        })?,
+    };
+    let mut resume = Vec::new();
+    loop {
+        let root = cx.with("h:gcroot", |c| Ok(c.store().dir.get(&t).map(|e| e.root)))?;
+        let Some(root) = root else {
+            return Ok(());
+        };
+        let next = tree::gc_step(cx, t, root, w, &resume)?;
+        if next.is_empty() {
+            return Ok(());
+        }
+        resume = next;
+        cx.yield_now("h:gcyield")?;
+    }
+}
+
+/// The unlogged bulk load (§12.8): CreateTree (logged), a snapshot
+/// registered below `S_L`, the unlogged inserts, the forced checkpoint,
+/// then publication.
+fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Fail> {
+    commit_txn(cx, &[Op::CreateTree { tree: t }], true, false)?;
+    // §10.1: register below S_L, then pick S_L.
+    let s_l = cx.with("h:sl", |c| {
+        let r = c.store().seq.visible_ts;
+        c.h().snapshots.insert(r);
+        let next = c.store().seq.next_ts.max(r + 1);
+        let t = next;
+        c.store().seq.next_ts = c.store().seq.next_ts.max(t + 1);
+        Ok(t)
+    })?;
+    let root = tree::dir_root_of(cx, t)?;
+    for (k, v) in entries {
+        let ekey = tree::enc_ekey(k, s_l);
+        let mut val = vec![0u8];
+        val.extend_from_slice(v);
+        tree::tree_insert(cx, t, root, &ekey, &val, false)?;
+    }
+    cx.with("h:load", |c| {
+        c.h().model.load(t, s_l, entries.to_vec());
+        c.h().loads.push(LoadRec {
+            tree: t,
+            s_l,
+            entries: entries.to_vec(),
+        });
+        c.h().force_ckpt = true;
+        Ok(())
+    })?;
+    wait_ckpt(cx)?;
+    // Publication (§12.8 step 3): after the forced meta is durable.
+    commit_txn(
+        cx,
+        &[Op::Put {
+            tree: CATALOG,
+            key: to_be64(t),
+            value: PUBLIC.to_vec(),
+        }],
+        true,
+        false,
+    )?;
+    cx.with("h:pub", |c| {
+        c.h().published.insert(t);
+        Ok(())
+    })
+}
+
+/// Wait for the pending forced checkpoint to complete (its meta durable).
+fn wait_ckpt(cx: &Cx<'_, RoundWorld>) -> Result<(), Fail> {
+    loop {
+        let (pending, open) = cx.with("h:ckptw", |c| {
+            let h = c.h();
+            Ok((h.force_ckpt, c.store().ckpt_open))
+        })?;
+        if !pending && !open {
+            return Ok(());
+        }
+        cx.wait_for(WaitKey::MetaDurable)?;
+    }
+}
+
+fn writer_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
+    loop {
+        let any = cx
+            .with("h:writer", |c| {
+                if c.sched_mut().crashed {
+                    return Ok(false);
+                }
+                Ok(!c.store().wal.buf.is_empty())
+            })
+            .map_err(fail_of)?;
+        if any {
+            wal::wal_writer_step(cx).map_err(fail_of)?;
+        } else {
+            let done = cx
+                .with("h:writer2", |c| Ok(c.h().workload_done))
+                .map_err(fail_of)?;
+            if done {
+                return Ok(());
+            }
+            cx.yield_now("h:writer").map_err(fail_of)?;
+        }
+    }
+}
+
+fn evictor_body(cx: &Cx<'_, RoundWorld>) -> Result<(), SimFail> {
+    loop {
+        let crashed = cx
+            .with("h:ev", |c| Ok(c.sched_mut().crashed))
+            .map_err(fail_of)?;
+        if crashed {
+            return Ok(());
+        }
+        if let Err(e) = prims::evict_one(cx, false) {
+            return match e {
+                Fail::Sim(s) => Err(s),
+                _ => Ok(()),
+            };
+        }
+        let done = cx
+            .with("h:ev2", |c| Ok(c.h().workload_done))
+            .map_err(fail_of)?;
+        if done {
+            return Ok(());
+        }
+        cx.yield_now("h:evictor").map_err(fail_of)?;
+    }
+}
+
+fn checkpointer_body(
+    cx: &Cx<'_, RoundWorld>,
+    every: u64,
+    crash: &Option<CrashSpec>,
+) -> Result<(), SimFail> {
+    let mut idx = 0u64;
+    loop {
+        let (trigger, final_ckpt) = cx
+            .with("h:ck", |c| {
+                if c.sched_mut().crashed {
+                    return Ok((true, true));
+                }
+                let h = c.h();
+                let by_commits = h.commits_done >= (idx + 1) * every || h.force_ckpt;
+                Ok((
+                    by_commits || h.workload_done,
+                    h.workload_done && !by_commits,
+                ))
+            })
+            .map_err(fail_of)?;
+        if trigger {
+            cx.with("h:ck2", |c| {
+                let (f, n) = {
+                    let h = c.h();
+                    (h.force_ckpt, h.commits_done)
+                };
+                let _ = n;
+                c.h().force_ckpt = false;
+                let _ = f;
+                Ok(())
+            })
+            .map_err(fail_of)?;
+            let fire_at = match crash {
+                Some(CrashSpec::Hook { ckpt_index, hook }) if *ckpt_index == idx => Some(*hook),
+                _ => None,
+            };
+            let mut hooks = |hook: CkptHook| -> Result<(), Fail> {
+                if Some(hook) == fire_at {
+                    arm_crash(cx.w);
+                    return Err(Fail::Sim(SimFail::Crashed));
+                }
+                Ok(())
+            };
+            idx += 1;
+            let r = ckpt::checkpoint(cx, &mut hooks);
+            match r {
+                Err(Fail::Sim(SimFail::Crashed)) => return Ok(()),
+                Err(Fail::Sim(s)) => return Err(s),
+                Err(_) => return Ok(()),
+                Ok(()) => {}
+            }
+            if final_ckpt {
+                return Ok(());
+            }
+        } else {
+            let done = cx
+                .with("h:ck3", |c| Ok(c.h().workload_done))
+                .map_err(fail_of)?;
+            if done {
+                return Ok(());
+            }
+            cx.yield_now("h:ckpt").map_err(fail_of)?;
+        }
+    }
+}
+
+/// Deliver the crash to the world (Work 13's hook and task-yield crash
+/// points): every task unwinds with `Crashed` at its next scheduler call.
+pub fn arm_crash(w: &Sched<RoundWorld>) {
+    w.deliver_crash();
+}
+
+fn fail_of(f: Fail) -> SimFail {
+    match f {
+        Fail::Sim(s) => s,
+        _ => SimFail::Crashed,
+    }
+}
+
+// ---- the round outcome and engine ----
+
+/// A directed media fault the round applies after F-CRASH (Work 6's
+/// deterministic targets: D9's dropped rename uses the crash, D10b/D17
+/// apply named faults).
+pub type DirectedFault = MediaFault;
+
+/// What one round produced (the Work 7 per-round record fields that exist
+/// at this stage, plus the twin's).
+#[derive(Debug, Clone)]
+pub struct RoundOutcome {
+    /// The matched cut `c`, or the O-1 failure text.
+    pub o1: Result<u64, String>,
+    /// O-1f: the frontier is one of the satisfying cuts.
+    pub o1f_ok: bool,
+    /// O-2 failure.
+    pub o2_fail: Option<String>,
+    /// O-3 failure.
+    pub o3_fail: Option<String>,
+    /// The round passes.
+    pub pass: bool,
+    /// `lo` (Work 2.2).
+    pub lo: u64,
+    /// `hi` (Work 2.2).
+    pub hi: u64,
+    /// The recovered frontier.
+    pub frontier: u64,
+    /// The opened meta's `gc_w`.
+    pub gc_w: u64,
+    /// The opened meta's `T`.
+    pub opened_t: u64,
+    /// XX001 detection sites.
+    pub detections: Vec<&'static str>,
+    /// Monitor hits.
+    pub monitors: Vec<&'static str>,
+    /// Acked commits lost above the cut (reported).
+    pub acked_lost: Vec<(u64, bool)>,
+    /// Amcheck (i) findings.
+    pub amcheck_i: Vec<Finding>,
+    /// Amcheck (ii) findings.
+    pub amcheck_ii: Vec<Finding>,
+    /// X5-R5: the opened meta is a rollback.
+    pub meta_rollback: bool,
+    /// X5-R5: the exception set R.
+    pub rollback_slots: BTreeSet<u64>,
+    /// The durable disk at the round's end (after recovery + the harness
+    /// checkpoint).
+    pub end_disk: SimDisk,
+    /// The recovered store's state (for the next round).
+    pub end_store: Option<StoreInner>,
+    /// The truncation cut for the model (`c`).
+    pub cut: u64,
+    /// Whether the round was judged class C / MP / MW (for the record).
+    pub class: FaultClass,
+    /// A DEADLOCK occurred.
+    pub deadlock: bool,
+    /// A SimFail::Baton was observed (RoundOutcome).
+    pub baton: bool,
+    /// A task panicked.
+    pub panicked: bool,
+    /// The digest of the canonical record (byte-identical for the same
+    /// inputs; `tests/harness.rs`).
+    pub digest: u64,
+}
+
+impl Default for RoundOutcome {
+    fn default() -> Self {
+        Self {
+            o1: Err("unset".to_owned()),
+            o1f_ok: false,
+            o2_fail: None,
+            o3_fail: None,
+            pass: false,
+            lo: 0,
+            hi: 0,
+            frontier: 0,
+            gc_w: 0,
+            opened_t: 0,
+            detections: Vec::new(),
+            monitors: Vec::new(),
+            acked_lost: Vec::new(),
+            amcheck_i: Vec::new(),
+            amcheck_ii: Vec::new(),
+            meta_rollback: false,
+            rollback_slots: BTreeSet::new(),
+            end_disk: SimDisk::new(),
+            end_store: None,
+            cut: 0,
+            class: FaultClass::C,
+            deadlock: false,
+            baton: false,
+            panicked: false,
+            digest: 0,
+        }
+    }
+}
+
+impl RoundOutcome {
+    /// The canonical digest input.
+    fn digest_input(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}",
+            self.o1,
+            self.o2_fail,
+            self.o3_fail,
+            self.detections,
+            self.lo,
+            self.hi,
+            self.frontier,
+            self.gc_w,
+            self.pass
+        ));
+        s.push_str(&format!(
+            "|{:?}|{:?}|{}|{}|{}",
+            self.monitors, self.acked_lost, self.meta_rollback, self.deadlock, self.baton
+        ));
+        s
+    }
+}
+
+/// The round's fault configuration.
+#[derive(Debug, Clone)]
+pub struct RoundFaults {
+    /// The class (C rounds apply F-CRASH only).
+    pub class: FaultClass,
+    /// F-CRASH knobs.
+    pub knobs: FaultKnobs,
+    /// Directed media faults applied after F-CRASH (empty for random
+    /// draws; X-5c's generator draws them itself).
+    pub directed: Vec<DirectedFault>,
+}
+
+/// Run one round: workload → crash → faults → recovery (nested crashes)
+/// → extraction → oracle → monitors → the harness checkpoint. Returns
+/// the outcome; the end state feeds the next round.
+#[allow(clippy::too_many_arguments)]
+pub fn run_round(
+    seed: u64,
+    round: u32,
+    script: &Script,
+    faults: &RoundFaults,
+    cfg: StoreCfg,
+    start_disk: SimDisk,
+    start_store: StoreInner,
+    model: &Model,
+    c_prev: u64,
+    mut twin: Option<&mut Vec<(usize, u64, u64)>>,
+) -> RoundOutcome {
+    // ---- the workload pass ----
+    let ntasks = script.ntasks();
+    let sched = {
+        let host = RoundWorld {
+            sched: SchedCore::new(ntasks, derive(seed * 1_000_003 + round as u64, S_SCHED)),
+            disk: start_disk.clone(),
+            st: start_store.clone(),
+            h: HarnessState {
+                model: clone_model(model),
+                ..HarnessState::default()
+            },
+        };
+        Sched::new(host)
+    };
+    run_script(&sched, script, seed);
+    let (mut disk, mut model, flip_pos, flags, wal_commits, events) = {
+        let g = sched.lock();
+        (
+            g.disk.clone(),
+            clone_model(&g.h.model),
+            g.st.wal.flip_enqueue_pos.clone(),
+            (g.h.deadlock, g.h.baton, g.h.panicked),
+            g.h.wal_commits.clone(),
+            g.disk.events.clone(),
+        )
+    };
+    // Work 2.1: written/acked from the disk events — the write carrying
+    // the commit record's last byte returned, and (SyncOn) a WAL sync
+    // covering it returned / (SyncOff) the write returned.
+    let (written_ts, acked_ts) = derive_written_acked(&events, &wal_commits);
+    for ts in written_ts {
+        model.mark_written(ts);
+    }
+    for ts in acked_ts {
+        model.mark_acked(ts);
+    }
+
+    // ---- the crash and the faults ----
+    if script.crash.is_some() {
+        let mut frng = Rng::new(derive(seed * 100 + round as u64, S_CRASH));
+        let _ = disk.apply_crash(&mut frng, &faults.knobs);
+        for f in faults.directed.iter() {
+            disk.apply_one_media_fault(f);
+        }
+        disk.new_round();
+    }
+    let media_targets = if faults.directed.is_empty() {
+        FaultTargets::default()
+    } else {
+        let pf = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
+        FaultTargets::collect(&disk.media.clone(), pf)
+    };
+
+    // ---- amcheck (i): on the crashed image, before recovery ----
+    let (amcheck_i, image_slots, meta_i) = durable_image(&disk, &cfg);
+    let pf = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
+    let tainted_slots: BTreeSet<u64> = image_slots
+        .iter()
+        .copied()
+        .filter(|s| disk.range_tainted(pf, s * 4096, 4096))
+        .collect();
+
+    // ---- recovery with nested crashes ----
+    let mut nested_fired = 0u32;
+    let mut recovery_disk = disk.clone();
+    let mut recovery_reads: Vec<(usize, u64, u64)> = Vec::new();
+    let recovery = loop {
+        let world = round_world(
+            seed,
+            recovery_disk.clone(),
+            StoreInner::empty(cfg.clone(), 0),
+        );
+        let cx = Cx {
+            w: &world,
+            t: HARNESS,
+        };
+        let arm = (nested_fired as usize) < script.nested.len();
+        if arm {
+            let at = script
+                .nested
+                .get(nested_fired as usize)
+                .copied()
+                .unwrap_or(0);
+            cx.with("h:nest", |c| {
+                c.sched_mut().crash_at_yield = Some(at);
+                Ok(())
+            })
+            .ok();
+        }
+        let reads_before = world.lock().disk.reads.len();
+        match ckpt::recover(&cx, cfg.clone()) {
+            Ok((st, frontier)) => {
+                let reads: Vec<(usize, u64, u64)> = {
+                    let g = world.lock();
+                    g.disk
+                        .reads
+                        .iter()
+                        .skip(reads_before)
+                        .map(|r| (r.inode, r.off, r.len))
+                        .collect()
+                };
+                if let Some(t) = twin.as_mut() {
+                    t.extend(reads.iter().copied());
+                    let _ = &recovery_reads;
+                }
+                recovery_reads = reads;
+                let end = world.lock().disk.clone();
+                if let Err(e) = cx.with("h:recinstall", |c| {
+                    *c.store() = st.clone();
+                    Ok(())
+                }) {
+                    break Err(e);
+                }
+                break Ok((st, frontier, end));
+            }
+            Err(Fail::Sim(SimFail::Crashed)) if arm => {
+                // A nested recovery crash: F-CRASH only (never media),
+                // then retry.
+                nested_fired += 1;
+                let mut frng = Rng::new(derive(seed * 100 + 50 + nested_fired as u64, S_CRASH));
+                let mut g = world.lock();
+                let _ = g.disk.apply_crash(&mut frng, &faults.knobs);
+                recovery_disk = g.disk.clone();
+                continue;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    // (The opened meta and frontier are read from the end state below.)
+
+    // ---- X5-R5: meta_rollback and R, from the durable-write history ----
+    let (meta_rollback, rollback_slots) = match &meta_i {
+        Some(opened) => {
+            let rb = meta_rollback_of(&disk, pf, opened.ckpt_id);
+            let r = exception_set_r(&disk, pf, opened.ckpt_id, &image_slots, &tainted_slots);
+            (rb, r)
+        }
+        None => (false, BTreeSet::new()),
+    };
+
+    // ---- the extraction and the oracle ----
+    let mut sample_rng = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
+    let mut outcome = RoundOutcome {
+        class: faults.class,
+        deadlock: flags.0,
+        baton: flags.1,
+        panicked: flags.2,
+        ..Default::default()
+    };
+    match recovery {
+        Ok((st, frontier, end_disk)) => {
+            let (opened_meta, _opened_xx) = read_opened_meta(&end_disk);
+            let opened_t = opened_meta.as_ref().map(|m| m.t).unwrap_or(0);
+            let gc_w = opened_meta.as_ref().map(|m| m.gc_w).unwrap_or(0);
+            let world = round_world(seed, end_disk.clone(), st.clone());
+            let cx = Cx {
+                w: &world,
+                t: HARNESS,
+            };
+            let mut reader = StoreReader { w: &world };
+            let mut ex = Extracted {
+                ok: true,
+                frontier,
+                gc_w,
+                opened_t,
+                amcheck_i: amcheck_i.clone(),
+                amcheck_i_ran: true,
+                image_slots: image_slots.clone(),
+                tainted_image_slots: tainted_slots.clone(),
+                meta_rollback,
+                rollback_slots: rollback_slots.clone(),
+                ..Default::default()
+            };
+            // The published set (a catalog scan at the frontier, 2.3).
+            match reader.published(frontier) {
+                Ok(p) => ex.published = p,
+                Err(_) => ex.xx001.push(XxSite::Read23),
+            }
+            // The served corruption check (with the R-taint, X5-R5: every
+            // slot in R counts as tainted from open until the store next
+            // writes it).
+            {
+                let g = world.lock();
+                let r_taint = g.disk.accepts.iter().any(|(f, off, len)| {
+                    rollback_slots
+                        .iter()
+                        .any(|s| *f == pf && *off < (s + 1) * 4096 && off + len > s * 4096)
+                });
+                ex.served = !g.disk.served.is_empty() || r_taint;
+            }
+            // The class MP/MW twin supply.
+            let twin_info = TwinInfo {
+                page_file: pf,
+                recovery_reads: recovery_reads.clone(),
+                image_slots: image_slots.clone(),
+            };
+            // Directed tests supply the twin's reads through the
+            // caller's collector (Work 13's twin half; a class MP/MW
+            // round without one fails closed in the oracle, as X-5a
+            // round 1 ruled).
+            let twin_ref = twin.as_ref().map(|_| &twin_info);
+            let verdict = check_round(
+                &model,
+                faults.class,
+                c_prev,
+                &ex,
+                &mut reader,
+                &media_targets,
+                twin_ref,
+                &mut sample_rng,
+                &OracleCfg::default(),
+            );
+            // The harness checkpoint (O-2 (ii) and the next round's
+            // base), then amcheck (ii).
+            let ck = ckpt::checkpoint(&cx, &mut |_| Ok(()));
+            let findings_ii = amcheck::amcheck(&cx, &cfg);
+            let (end_disk2, end_store) = {
+                let g = world.lock();
+                (g.disk.clone(), g.st.clone())
+            };
+            let _ = ck;
+            outcome.o1 = verdict.o1.clone();
+            outcome.o1f_ok = verdict.o1f_ok;
+            outcome.o2_fail = verdict.o2_fail.clone();
+            outcome.o3_fail = verdict.o3_fail.clone();
+            outcome.pass = verdict.pass;
+            outcome.lo = model.lower_bound(c_prev);
+            outcome.hi = model.upper_bound(outcome.lo);
+            outcome.frontier = frontier;
+            outcome.gc_w = gc_w;
+            outcome.opened_t = opened_t;
+            outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();
+            outcome.acked_lost = verdict.acked_lost.clone();
+            outcome.amcheck_ii = findings_ii;
+            outcome.cut = verdict.o1.clone().unwrap_or(outcome.lo);
+            outcome.end_disk = end_disk2.clone();
+            outcome.end_store = Some(end_store.clone());
+        }
+        Err(_) => {
+            // Recovery failed: XX001 at Open (class C fails O-3 (b); in
+            // MP/MW it is a detection).
+            let mut ex = Extracted {
+                ok: false,
+                xx001: vec![XxSite::Open],
+                served: {
+                    let g2 = sched.lock();
+                    !g2.disk.served.is_empty()
+                },
+                amcheck_i: amcheck_i.clone(),
+                amcheck_i_ran: meta_i.is_some(),
+                image_slots: image_slots.clone(),
+                tainted_image_slots: tainted_slots.clone(),
+                meta_rollback,
+                rollback_slots: rollback_slots.clone(),
+                ..Default::default()
+            };
+            let _ = &mut ex;
+            let mut nop = NopReader;
+            let twin_info = TwinInfo {
+                page_file: pf,
+                recovery_reads: Vec::new(),
+                image_slots: image_slots.clone(),
+            };
+            let verdict = check_round(
+                &model,
+                faults.class,
+                c_prev,
+                &ex,
+                &mut nop,
+                &media_targets,
+                if faults.class == FaultClass::C {
+                    None
+                } else {
+                    Some(&twin_info)
+                },
+                &mut sample_rng,
+                &OracleCfg::default(),
+            );
+            outcome.o1 = verdict.o1.clone();
+            outcome.o1f_ok = verdict.o1f_ok;
+            outcome.o2_fail = verdict.o2_fail.clone();
+            outcome.o3_fail = verdict.o3_fail.clone();
+            outcome.pass = verdict.pass;
+            outcome.lo = model.lower_bound(c_prev);
+            outcome.hi = model.upper_bound(outcome.lo);
+            outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();
+            outcome.cut = outcome.lo;
+            outcome.end_disk = disk.clone();
+        }
+    }
+    // ---- the monitors (3.10), from disk events and parsed WAL bytes ----
+    {
+        let g = sched.lock();
+        let events_end = g.disk.events.clone();
+        let mcfg = crate::monitor::MonitorCfg {
+            map_leaf_cap: cfg.map_leaf_cap,
+            freeset_leaf_bits: cfg.freeset_leaf_bits,
+        };
+        outcome.monitors = crate::monitor::run(&events_end, &flip_pos, &mcfg);
+    }
+    outcome.digest = crate::crc::crc32c(0, outcome.digest_input().as_bytes()) as u64;
+    outcome
+}
+
+/// Work 2.1's durability flags from the round's disk events: for each
+/// commit ts, the WAL write carrying its record's last byte returned
+/// (`written`), and its ack — a covering WAL sync returned (SyncOn) or
+/// the write itself (SyncOff). The commit records' (lsn, ts) pairs are
+/// parsed from the write events' bytes; a WAL file's writes parse as NWAL
+/// batches, the page file's never do.
+fn derive_written_acked(
+    events: &[DiskEvent],
+    wal_commits: &BTreeMap<u64, (bool, u64)>,
+) -> (Vec<u64>, Vec<u64>) {
+    // ts → (inode, record end lsn) from the parsed batches.
+    let mut ts_pos: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
+    let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut durable_end: BTreeMap<usize, u64> = BTreeMap::new();
+    for e in events {
+        match e {
+            DiskEvent::WriteIssued { inode, bytes, .. } => {
+                let parsed = parse_wal_batch(bytes);
+                for (lsn, kind, ts) in parsed {
+                    if kind == K_COMMIT || kind == K_MARKER {
+                        let len = record_len(bytes, lsn);
+                        ts_pos.insert(ts, (*inode, lsn + len));
+                    }
+                }
+            }
+            DiskEvent::WriteReturned { inode, off, len } => {
+                if has_wal_writes(*inode, events) {
+                    let w = returned_end.entry(*inode).or_default();
+                    *w = (*w).max(off + len);
+                }
+            }
+            DiskEvent::SyncReturned { inode, .. } => {
+                if has_wal_writes(*inode, events) {
+                    let d = durable_end.entry(*inode).or_default();
+                    let w = returned_end.get(inode).copied().unwrap_or(0);
+                    *d = (*d).max(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut written = Vec::new();
+    let mut acked = Vec::new();
+    for (ts, (sync_on, _end)) in wal_commits.iter() {
+        let Some((inode, end)) = ts_pos.get(ts).copied() else {
+            continue;
+        };
+        let w = returned_end.get(&inode).copied().unwrap_or(0);
+        let d = durable_end.get(&inode).copied().unwrap_or(0);
+        if w >= end {
+            written.push(*ts);
+            let acked_now = if *sync_on { d >= end } else { true };
+            if acked_now {
+                acked.push(*ts);
+            }
+        }
+    }
+    (written, acked)
+}
+
+/// Parse the `(lsn, kind, ts)` triples of a write batch (its bytes).
+fn parse_wal_batch(bytes: &[u8]) -> Vec<(u64, u8, u64)> {
+    crate::monitor::parse_batch_pub(bytes)
+}
+
+/// A record's whole length, located by its lsn inside the batch.
+fn record_len(bytes: &[u8], lsn: u64) -> u64 {
+    for (l, _kind, _ts) in parse_wal_batch(bytes) {
+        if l == lsn {
+            // The record's own length: recompute from the batch walk.
+            let mut off = 0usize;
+            while off + 16 <= bytes.len() {
+                let len = {
+                    let s = bytes.get(off + 4..off + 8).unwrap_or(&[]);
+                    let mut b = [0u8; 4];
+                    if s.len() == 4 {
+                        b.copy_from_slice(s);
+                    }
+                    u32::from_le_bytes(b) as usize
+                };
+                if len < 16 || off + len > bytes.len() {
+                    return 0;
+                }
+                let this_lsn = bytes
+                    .get(off + 16..off + 24)
+                    .map(|s| {
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(s);
+                        u64::from_le_bytes(a)
+                    })
+                    .unwrap_or(u64::MAX);
+                if this_lsn == lsn {
+                    return len as u64;
+                }
+                off += len;
+            }
+            return 0;
+        }
+    }
+    0
+}
+
+/// Whether an inode received parses-as-WAL writes in this event stream.
+fn has_wal_writes(inode: usize, events: &[DiskEvent]) -> bool {
+    events.iter().any(|e| match e {
+        DiskEvent::WriteIssued {
+            inode: i,
+            bytes,
+            off,
+        } if *i == inode && *off > 0 => !crate::monitor::parse_batch_pub(bytes).is_empty(),
+        _ => false,
+    })
+}
+
+fn site_name(d: XxSite) -> &'static str {
+    match d {
+        XxSite::Open => "open",
+        XxSite::Replay => "replay",
+        XxSite::Read23 => "read23",
+        XxSite::AmcheckI => "amcheck_i",
+        XxSite::AmcheckIi => "amcheck_ii",
+    }
+}
+
+// ---- the durable-image walk (harness-side, from durable bytes) ----
+
+/// Parse the newest valid durable meta and walk its referenced slots.
+pub fn durable_image(
+    disk: &SimDisk,
+    cfg: &StoreCfg,
+) -> (
+    Vec<Finding>,
+    BTreeSet<u64>,
+    Option<crate::store::page::Meta>,
+) {
+    let mut out = Vec::new();
+    let pf = match disk.stat(crate::sim::PAGE_FILE) {
+        Some(f) => f,
+        None => {
+            return (
+                vec![Finding {
+                    slot: None,
+                    what: "open failed".into(),
+                }],
+                BTreeSet::new(),
+                None,
+            );
+        }
+    };
+    let m1 = disk.durable_read(pf, 4096, 4096);
+    let m2 = disk.durable_read(pf, 8192, 4096);
+    let (meta, _slot) = match (
+        crate::store::page::parse_meta(&m1),
+        crate::store::page::parse_meta(&m2),
+    ) {
+        (Ok(a), Ok(b)) => {
+            if a.ckpt_id >= b.ckpt_id {
+                (a, 1)
+            } else {
+                (b, 2)
+            }
+        }
+        (Ok(a), Err(())) => (a, 1),
+        (Err(()), Ok(b)) => (b, 2),
+        (Err(()), Err(())) => {
+            return (
+                vec![Finding {
+                    slot: Some(1),
+                    what: "no valid meta".into(),
+                }],
+                BTreeSet::new(),
+                None,
+            );
+        }
+    };
+    // Walk the map radix and the free set from the durable bytes.
+    let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    if meta.map_root.slot != 0 {
+        walk_map_disk(
+            disk,
+            pf,
+            meta.map_root,
+            cfg.map_leaf_cap,
+            0,
+            &mut flat,
+            &mut used,
+            &mut out,
+        );
+    }
+    let mut free_bits: BTreeSet<u64> = BTreeSet::new();
+    if meta.free_root.slot != 0 {
+        let total = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
+        walk_free_disk(
+            disk,
+            pf,
+            meta.free_root,
+            cfg.freeset_leaf_bits,
+            total,
+            &mut free_bits,
+            &mut used,
+            &mut out,
+        );
+    }
+    // The trees, from the directory entries.
+    if meta.dir_root != 0
+        && let Some(r) = flat.get(&meta.dir_root).copied()
+    {
+        let entries = dir_entries_disk(disk, pf, meta.dir_root, r, &flat);
+        used.insert(r.slot);
+        for (_id, root) in entries {
+            if let Some(rr) = flat.get(&root).copied() {
+                walk_tree_disk(disk, pf, root, rr, &flat, &mut used);
+            }
+        }
+    }
+    used.insert(0);
+    used.insert(1);
+    used.insert(2);
+    (out, used, Some(meta))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_map_disk(
+    disk: &SimDisk,
+    pf: usize,
+    root: crate::store::page::Ref,
+    cap: u64,
+    depth: u8,
+    flat: &mut BTreeMap<u64, crate::store::page::Ref>,
+    used: &mut BTreeSet<u64>,
+    out: &mut Vec<Finding>,
+) {
+    if depth > 8 || root.slot == 0 {
+        return;
+    }
+    let b = disk.durable_read(pf, root.slot * 4096, 4096);
+    if crate::store::page::check(&b, &root, crate::store::page::header_id(&b), None).is_err() {
+        out.push(Finding {
+            slot: Some(root.slot),
+            what: "§3.3 fail on map page".into(),
+        });
+    }
+    used.insert(root.slot);
+    let kind = crate::store::page::header_kind(&b);
+    if kind == crate::store::page::KIND_MAP_LEAF {
+        if let Ok(entries) = crate::store::page::parse_map_leaf(
+            &b,
+            crate::store::page::header_id(&b),
+            cap,
+            &root,
+            None,
+        ) {
+            for (i, e) in entries.iter().enumerate() {
+                if let Some(r) = e {
+                    flat.insert(crate::store::page::header_id(&b) + i as u64, *r);
+                    used.insert(r.slot);
+                }
+            }
+        }
+    } else if let Ok(refs) = crate::store::page::parse_radix_inner(
+        &b,
+        crate::store::page::header_id(&b),
+        (4096 - 24) / 16,
+        &root,
+        None,
+    ) {
+        for r in refs.into_iter().flatten() {
+            walk_map_disk(disk, pf, r, cap, depth + 1, flat, used, out);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_free_disk(
+    disk: &SimDisk,
+    pf: usize,
+    root: crate::store::page::Ref,
+    bits: u64,
+    _total: u64,
+    set: &mut BTreeSet<u64>,
+    used: &mut BTreeSet<u64>,
+    out: &mut Vec<Finding>,
+) {
+    if root.slot == 0 {
+        return;
+    }
+    let b = disk.durable_read(pf, root.slot * 4096, 4096);
+    if crate::store::page::check(&b, &root, crate::store::page::header_id(&b), None).is_err() {
+        out.push(Finding {
+            slot: Some(root.slot),
+            what: "§3.3 fail on free-set page".into(),
+        });
+    }
+    used.insert(root.slot);
+    let kind = crate::store::page::header_kind(&b);
+    if kind == crate::store::page::KIND_FREE_LEAF {
+        if let Ok(bs) = crate::store::page::parse_free_leaf(
+            &b,
+            crate::store::page::header_id(&b),
+            bits,
+            &root,
+            None,
+        ) {
+            for (i, set_bit) in bs.iter().enumerate() {
+                if *set_bit {
+                    set.insert(crate::store::page::header_id(&b) + i as u64);
+                }
+            }
+        }
+    } else if let Ok(refs) = crate::store::page::parse_radix_inner(
+        &b,
+        crate::store::page::header_id(&b),
+        (4096 - 24) / 16,
+        &root,
+        None,
+    ) {
+        for r in refs.into_iter().flatten() {
+            walk_free_disk(disk, pf, r, bits, _total, set, used, out);
+        }
+    }
+}
+
+fn dir_entries_disk(
+    disk: &SimDisk,
+    pf: usize,
+    _dir_root: u64,
+    root_ref: crate::store::page::Ref,
+    flat: &BTreeMap<u64, crate::store::page::Ref>,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root_ref];
+    while let Some(r) = stack.pop() {
+        let b = disk.durable_read(pf, r.slot * 4096, 4096);
+        if crate::store::page::check(&b, &r, 0, None).is_err() {
+            continue;
+        }
+        let kind = crate::store::page::header_kind(&b);
+        if kind == crate::store::page::KIND_LEAF {
+            if let Ok(cells) = tree::leaf_cells(&b) {
+                for (k, v) in cells {
+                    if k.len() != 8 || v.len() != 9 {
+                        continue;
+                    }
+                    let mut rb = [0u8; 8];
+                    if let Some(s) = v.get(0..8) {
+                        rb.copy_from_slice(s);
+                    }
+                    if let Ok(id) = k.try_into() {
+                        out.push((u64::from_be_bytes(id), u64::from_le_bytes(rb)));
+                    }
+                }
+            }
+        } else if let Ok((seps, right)) = tree::inner_seps(&b) {
+            for (c, _) in seps {
+                if let Some(cr) = flat.get(&c) {
+                    stack.push(*cr);
+                }
+            }
+            if let Some(rr) = flat.get(&right) {
+                stack.push(*rr);
+            }
+        }
+    }
+    out
+}
+
+fn walk_tree_disk(
+    disk: &SimDisk,
+    pf: usize,
+    lpid: u64,
+    root_ref: crate::store::page::Ref,
+    flat: &BTreeMap<u64, crate::store::page::Ref>,
+    used: &mut BTreeSet<u64>,
+) {
+    let mut stack = vec![(lpid, root_ref)];
+    while let Some((l, r)) = stack.pop() {
+        if !used.insert(r.slot) {
+            continue;
+        }
+        let b = disk.durable_read(pf, r.slot * 4096, 4096);
+        if crate::store::page::check(&b, &r, l, None).is_err() {
+            continue;
+        }
+        if crate::store::page::header_kind(&b) == crate::store::page::KIND_INNER
+            && let Ok((seps, right)) = tree::inner_seps(&b)
+        {
+            for (c, _) in seps {
+                if let Some(cr) = flat.get(&c).copied() {
+                    stack.push((c, cr));
+                }
+            }
+            if let Some(rr) = flat.get(&right).copied() {
+                stack.push((right, rr));
+            }
+        }
+    }
+}
+
+/// The opened meta of a disk (durable bytes).
+pub fn read_opened_meta(disk: &SimDisk) -> (Option<crate::store::page::Meta>, ()) {
+    let pf = match disk.stat(crate::sim::PAGE_FILE) {
+        Some(f) => f,
+        None => return (None, ()),
+    };
+    let m1 = disk.durable_read(pf, 4096, 4096);
+    let m2 = disk.durable_read(pf, 8192, 4096);
+    let best = match (
+        crate::store::page::parse_meta(&m1),
+        crate::store::page::parse_meta(&m2),
+    ) {
+        (Ok(a), Ok(b)) => Some(if a.ckpt_id >= b.ckpt_id { a } else { b }),
+        (Ok(a), Err(())) => Some(a),
+        (Err(()), Ok(b)) => Some(b),
+        (Err(()), Err(())) => None,
+    };
+    (best, ())
+}
+
+/// X5-R5 condition 2: a meta write **covered by a completed sync_all**
+/// (a durable write) carries a ckpt_id above the opened one (the opened
+/// meta is a rollback). From the durable-write history only.
+pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
+    let mut max_k = 0u64;
+    for w in disk.dwrites_of(pf) {
+        if w.all
+            && (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
+        {
+            max_k = max_k.max(m.ckpt_id);
+        }
+    }
+    max_k > opened_k
+}
+
+/// X5-R5's set R: slots the opened image references that are not tainted,
+/// written after the first completed `sync_all` covering a meta newer
+/// than the opened one. From the durable-write history.
+pub fn exception_set_r(
+    disk: &SimDisk,
+    pf: usize,
+    opened_k: u64,
+    image_slots: &BTreeSet<u64>,
+    tainted: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut newer_graduation: Option<usize> = None;
+    let dw = disk.dwrites_of(pf);
+    for (i, w) in dw.iter().enumerate() {
+        if w.all
+            && (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
+            && m.ckpt_id > opened_k
+        {
+            newer_graduation = Some(i);
+            break;
+        }
+    }
+    let Some(g) = newer_graduation else {
+        return BTreeSet::new();
+    };
+    let mut out = BTreeSet::new();
+    for (i, w) in dw.iter().enumerate() {
+        if i <= g {
+            continue;
+        }
+        let slot = w.off / 4096;
+        if image_slots.contains(&slot) && !tainted.contains(&slot) {
+            out.insert(slot);
+        }
+    }
+    out
+}
+
+// ---- the 2.3 reader over the recovered store ----
+
+/// Reads the recovered state for the oracle through the store's own read
+/// paths (2.3).
+pub struct StoreReader<'a> {
+    /// The single-task world holding the recovered store.
+    pub w: &'a Sched<RoundWorld>,
+}
+
+impl StoreReader<'_> {
+    /// The published set at the frontier (a catalog scan, 2.3).
+    pub fn published(&mut self, frontier: u64) -> Result<BTreeSet<u64>, ReadFail> {
+        let cx = Cx {
+            w: self.w,
+            t: HARNESS,
+        };
+        let root = cx
+            .with("r:cat", |c| Ok(tree::catalog_root(c.store())))
+            .map_err(|_| ReadFail)?;
+        if root == 0 {
+            return Ok(BTreeSet::new());
+        }
+        let scan = tree::tree_scan(&cx, root, frontier).map_err(|_| ReadFail)?;
+        let mut out = BTreeSet::new();
+        for (k, v) in scan {
+            if v.as_deref() == Some(PUBLIC) && k.len() == 8 {
+                let mut b = [0u8; 8];
+                if let Some(sl) = k.get(0..8) {
+                    b.copy_from_slice(sl);
+                }
+                out.insert(u64::from_be_bytes(b));
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl StateReader for StoreReader<'_> {
+    fn scan(&mut self, tree: u64, s: u64) -> Result<Scan, ReadFail> {
+        let cx = Cx {
+            w: self.w,
+            t: HARNESS,
+        };
+        let root = cx
+            .with("r:root", |c| Ok(c.store().dir.get(&tree).map(|e| e.root)))
+            .map_err(|_| ReadFail)?
+            .ok_or(ReadFail)?;
+        tree::tree_scan(&cx, root, s).map_err(|_| ReadFail)
+    }
+
+    fn raw(&mut self, tree: u64) -> Result<Vec<RawEntry>, ReadFail> {
+        let cx = Cx {
+            w: self.w,
+            t: HARNESS,
+        };
+        let root = cx
+            .with("r:root2", |c| Ok(c.store().dir.get(&tree).map(|e| e.root)))
+            .map_err(|_| ReadFail)?
+            .ok_or(ReadFail)?;
+        let raw = tree::tree_raw(&cx, root).map_err(|_| ReadFail)?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(k, tag, v)| {
+                tree::dec_ekey(&k).map(|(key, ts)| RawEntry {
+                    key,
+                    ts,
+                    tag,
+                    value: v,
+                })
+            })
+            .collect())
+    }
+}
+
+/// A no-op reader for failed-recovery rounds.
+pub struct NopReader;
+
+impl StateReader for NopReader {
+    fn scan(&mut self, _tree: u64, _s: u64) -> Result<Scan, ReadFail> {
+        Err(ReadFail)
+    }
+    fn raw(&mut self, _tree: u64) -> Result<Vec<RawEntry>, ReadFail> {
+        Err(ReadFail)
+    }
+}

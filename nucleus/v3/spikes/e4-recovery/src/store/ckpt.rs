@@ -181,6 +181,7 @@ pub fn create<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg, uuid: u128) -> Result
 
     probe.k = 0;
     probe.e = 1; // epoch 1 begins (§2.3)
+    probe.seq.next_ts = 1; // ts 0 is reserved (§7.1)
     probe.meta = meta;
     probe.slots.slot_count = slot_count;
     let mut durable = BTreeSet::from([0, 1, 3, 4, 5]);
@@ -467,6 +468,7 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
             gc_w = 0; // the previous value or 0
         }
         let enqueue_end = st.wal.append;
+        st.wal.flip_enqueue_pos.push(enqueue_end);
         let open_chunks = st.wal.open_chunks.clone();
         let wal_start = wal::wal_start_lsn(st, t, &open_chunks);
         st.e = k as u32 + 1;

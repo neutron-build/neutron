@@ -176,10 +176,11 @@ pub fn dec_op(b: &[u8]) -> Option<(WOp, usize)> {
     }
 }
 
-/// Encode a whole record (the lsn field is patched by the enqueuer).
-pub fn enc_record(kind: u8, txn: (u32, u64), ts: u64, payload: &[u8]) -> Vec<u8> {
+/// Encode a whole record at `lsn` (§12.2: the crc covers the body,
+/// lsn included — the enqueuer knows the position before it builds).
+pub fn enc_record(kind: u8, txn: (u32, u64), ts: u64, payload: &[u8], lsn: u64) -> Vec<u8> {
     let mut body = Vec::with_capacity(payload.len() + 29);
-    wr_u64(&mut body, 0); // lsn patched by the enqueuer
+    wr_u64(&mut body, lsn);
     body.push(kind);
     wr_u32(&mut body, txn.0);
     wr_u64(&mut body, txn.1);
@@ -252,7 +253,8 @@ pub fn dec_record(b: &[u8], lsn: u64, seg_end: u64) -> Result<Option<Rec>, ()> {
         // The §12.5 stale check (LSN-CHECK-SKIP removes it).
         return Err(());
     }
-    let kind = *body.first().ok_or(())?;
+    // Body layout: lsn u64, kind u8, txn (u32, u64), commit_ts u64.
+    let kind = *body.get(8).ok_or(())?;
     let txn = (rd_u32(body, 9).ok_or(())?, rd_u64(body, 13).ok_or(())?);
     let ts = rd_u64(body, 21).ok_or(())?;
     let payload = body.get(29..).unwrap_or(&[]).to_vec();
@@ -321,6 +323,9 @@ pub struct WalState {
     pub seg_needs_dirsync: Vec<u64>,
     /// Open chunked transactions: txn → first chunk LSN (§12.6).
     pub open_chunks: BTreeMap<(u32, u64), u64>,
+    /// The flips' enqueue positions, in flip order (M-CKPT-T's hook: the
+    /// card names this supply, Work 3.10; read only by the monitors).
+    pub flip_enqueue_pos: Vec<u64>,
 }
 
 /// The first LSN of the segment containing `lsn`.
@@ -344,22 +349,19 @@ pub fn wal_enqueue<H: StoreHost>(
         let st = c.store();
         st.alive()?;
         let lsn0 = st.wal.append;
-        let mut rec = enc_record(kind, txn, ts, payload);
+        // The record's own lsn depends on the room left in the segment;
+        // the encoder needs it up front (the crc covers the lsn).
+        let probe = REC_FIXED + payload.len() as u64;
         let seg = seg_of(lsn0);
         let room = seg + WAL_SEG - lsn0;
-        let rec_lsn = if (rec.len() as u64) <= room {
-            lsn0
-        } else {
-            seg + WAL_SEG
-        };
-        patch_lsn(&mut rec, rec_lsn);
+        let rec_lsn = if probe <= room { lsn0 } else { seg + WAL_SEG };
+        let rec = enc_record(kind, txn, ts, payload, rec_lsn);
         let rec_len = rec.len() as u64;
         let mut placed: Vec<u8> = Vec::new();
         if rec_lsn != lsn0 {
             // A record that does not fit the rest of its segment is
             // preceded by SegmentEnd (§12.2).
-            let mut se = enc_record(K_SEGEND, (0, 0), 0, &[]);
-            patch_lsn(&mut se, lsn0);
+            let se = enc_record(K_SEGEND, (0, 0), 0, &[], lsn0);
             placed.extend_from_slice(&se);
         }
         placed.extend_from_slice(&rec);
