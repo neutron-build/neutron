@@ -1,7 +1,8 @@
 # E4 recovery spike (card X-5, stage X-5a of three)
 
-Status: **stage X-5a complete and green** — the crate, the sim, the model
-and the P-written oracle (Work 0–2, including Work 2.7 / ruling X5-R5)
+Status: **stage X-5a complete and green, including the gate's 2026-10-23
+REWORK round** — the crate, the sim, the model and the P-written oracle
+(Work 0–2, Work 2.7 / ruling X5-R5, and the six gate-REWORK fixes below)
 build, test and gate clean. This claims nothing about E4 itself: no
 campaign exists until X-5c, and Opus judges E4 only on X-5c's RESULT.
 
@@ -27,6 +28,55 @@ The substrate stays spike-local for the whole chain (the card's
 store-side I/O call goes through the narrow `E4Env` trait. No swap
 mid-experiment.
 
+## Gate REWORK fixes (2026-10-23 verdict, all six applied)
+
+The P gate's verdict on stage X-5a (commit 1ca7ac34) was REWORK with six
+items; all are fixed, each pinned by a new test that fails when the fix
+is reverted (verified mutant-style, recorded in the stage RESULT):
+
+1. **Taint over mid-batch reads.** `Inode::taint_ranges`
+   (`src/sim/disk.rs:274`) now includes the issued interval that starts
+   before the read's offset; run 1's `issued.range(off..end)` walk
+   skipped it, blinding O-3 (a) to every read that begins inside an
+   issued range (and `range_tainted`). Pin:
+   `taint_covers_read_starting_inside_issued_range`.
+2. **The accept hook judges sub-ranges.** `SimDisk::accepted`
+   (`src/sim/disk.rs:614`) judges the accepted range against the most
+   recent read that **covers** it, at sub-range granularity (`ReadRec`
+   carries `tainted_ranges`); run 1 matched only an exact `(off, len)`
+   read, which the WAL reader shape (read 16 KiB, accept one record)
+   could never hit, and scanned all earlier reads instead of the most
+   recent one. Pins: `accept_hook_judges_subrange_of_covering_read`,
+   `accept_hook_subrange_taint_only`.
+3. **Loads are versions at `S_L`.** `Model::scan` (`src/model.rs:178`)
+   applies a load's entries at their `S_L`: a Put or Delete at
+   `ts > S_L` on a loaded key wins above it, and the load shows between
+   `S_L` and that op. Run 1 applied loads after every commit op, so the
+   model agreed with a store that silently lost post-load updates. Pin:
+   `model_load_entries_are_versions_at_s_l`.
+4. **The (ii) completeness half is pinned.** Must-fail 18
+   (`mf18_ii_missed_detection_fails`): amcheck (ii) ran, a slot in
+   `tainted_image_slots_ii` is not reported, everything else passes. The
+   gate's G2 mutant (removing that half) was UNCAUGHT at verdict time;
+   it is caught now.
+5. **O-3 (c) fails closed.** A missing twin in an MP/MW round that has
+   XX001 fails the round as a harness defect (`src/oracle.rs:449`); run 1
+   skipped the false-positive rule, failing open. Pin:
+   `mf19_missing_twin_fails`.
+6. **Sim/oracle minutiae.** (a) a synced shrink survives the crash:
+   `apply_crash` truncates `durable` to `durable_len`
+   (`src/sim/disk.rs:684`), pin `synced_shrink_survives_crash`;
+   (b) a MISDIRECTED page fault targets its landing slot as well as its
+   source (`FaultTargets::collect`, `src/oracle.rs:260`), pin
+   `misdirected_landing_slot_is_a_fault_target`; (c) F-MEDIA-WAL draws
+   1–2 candidates uniformly over **every** `/wal/` segment
+   (`src/sim/disk.rs:764`), pin `media_wal_draws_across_all_segments`
+   (run 1 faulted only the lowest-id segment with candidates, so the
+   active segment was never hit).
+
+The verdict's re-gate mutant table (R1–R5, G1–G4) was re-applied in
+full; every mutant is caught by its named test, including G2.
+
 ## Implemented, tested and green (X-5a)
 
 - **Work 0 (crate)**: `e4-recovery`, deps `thiserror` only (`proptest`
@@ -44,14 +94,16 @@ mid-experiment.
   referenced-slot bias), the accept hook and served-corruption detection
   (1.4); `E4Env` (`src/sim/env.rs`), the narrow I/O trait, every method a
   yield point.
-- **Work 1.5**: the seven sim self-tests of the card plus three extras
-  (`tests/sim.rs`, 10 tests).
+- **Work 1.5**: the seven sim self-tests of the card, three extras, and
+  the four gate-REWORK pins (`tests/sim.rs`, 15 tests).
 - **Work 2 (model + oracle, P-written, binding)**: `src/model.rs` and
   `src/oracle.rs` (O-1 (a)–(d), O-1f, O-2, O-3 (a)–(e) with the twin rule
   and X5-R1's MW `lo := T`, `acked_lost` reporting, `seed_passes`).
-- **Work 2.6**: the six must-pass and seventeen must-fail oracle
-  self-tests (`tests/oracle.rs`, 24 tests including the
-  instrumentation-removal demo) and the five instrumentation removals.
+- **Work 2.6**: the six must-pass and nineteen must-fail oracle
+  self-tests (must-fail 18–19 are the gate-REWORK additions) plus the
+  model and MISDIRECTED-landing-slot pins (`tests/oracle.rs`, 28 tests
+  including the instrumentation-removal demo) and the five
+  instrumentation removals.
 - **Work 2.7 (X5-R5, this stage's addition)**: the exception set `R` with
   its two conditions (condition 1 — a page-file media fault on meta slot
   1 or 2 — derived by the oracle itself from the fault list, `FaultTargets`
@@ -129,7 +181,8 @@ kept verbatim from run 1.
   durable value. Directory prefixes: all with `p_keep_latest`, else a
   uniform prefix length.
 - **MW MISDIRECTED** targets another 512-aligned offset of the same
-  segment.
+  segment; F-MEDIA-WAL candidates are pooled over every `/wal/` segment
+  and drawn uniformly (gate REWORK item 6c).
 - **O-3 (e)** is X5-R2's strict rule ("every tainted referenced slot is
   reported, and only those") with exactly one exception, ruling X5-R5
   (card Work 2.7/2.8): amcheck findings may additionally name slots of
@@ -156,47 +209,47 @@ F-CRASH at every crash; F-MEDIA-PAGE (1–3 faults) and F-MEDIA-WAL (1–2)
 at the round's crash only, never on recovery crashes; taint references
 survive lives. See `src/sim/disk.rs` docs.
 
-## Oracle map (Work 2, with 2.7)
+## Oracle map (Work 2, with 2.7 and the gate REWORK)
 
-Every check of card Work 2, with its file:line (commit of stage X-5a;
-`src/oracle.rs` unless noted):
+Every check of card Work 2, with its file:line (stage X-5a plus the
+2026-10-23 REWORK round; `src/oracle.rs` unless noted):
 
 | Check (card) | Where |
 |---|---|
-| 2.1 commit recording, `written`/`acked` flags | `src/model.rs:76` (`TxnRec`), `:136` (`mark_written`), `:143` (`mark_acked`) |
-| 2.1 bulk loads, `model.scan(t, S)` | `src/model.rs:92` (`LoadRec`), `:165` (`Model::scan`) |
-| 2.1 published set, drop = Delete+DropTree, rounds truncation | `src/model.rs:195` (`published_at`), `:157` (`truncate`) |
-| 2.2 `lo` (`c_0 = 0`, max acked SyncOn) | `src/model.rs:214`, applied `src/oracle.rs:318` |
-| 2.2 `hi` (max written) | `src/model.rs:226`, applied `src/oracle.rs:319` |
-| 2.2 MW `lo := T` of the opened meta (X5-R1) | `src/oracle.rs:320`–`322` |
-| O-1 candidate set `{lo} ∪ {ts ∈ H : lo < ts ≤ hi}` | `src/oracle.rs:324`–`356` |
-| O-1 (a) published set equality | `src/oracle.rs:568`–`575` |
-| O-1 (b) `scan(c)` equality | `src/oracle.rs:578`–`587` |
-| O-1 (c) raw ts cut | `src/oracle.rs:588`–`595` (knob `no_raw_cut` `:206`) |
-| O-1 (d) history equality on `samp([gc_w, c])` (X5-R4) | `src/oracle.rs:596`–`605`; `samp` at `src/model.rs:240` |
-| O-1f frontier ∈ satisfying `c` (reported apart) | `src/oracle.rs:357`–`358` |
-| O-2 amcheck clean in class C, (i) and (ii) | `src/oracle.rs:360`–`378` |
-| O-3 (a) served corruption | `src/oracle.rs:380`–`385` (knob `no_taint` `:208`) |
-| O-3 (b) XX001 only in MP/MW (detection) | `src/oracle.rs:386`–`393` |
-| O-3 (c) twin false-positive rule | `src/oracle.rs:394`–`428` (knob `no_twin_rule` `:210`) |
-| O-3 (d) silent `Ok` requires O-1 and O-2 | `src/oracle.rs:429`–`438` |
-| O-1 lower bound `c ≥ lo` | `src/oracle.rs:326`–`331` (knob `no_lower_bound` `:204`) |
-| O-3 (e) exception conditions (class, 1, 2) | `src/oracle.rs:439`–`451`; condition 1 derived from the fault list at `src/oracle.rs:240`–`267` (`FaultTargets::collect`, field `:234`; knob `no_meta_slot_cond` `:215`) |
-| O-3 (e) structural guard on `R` (2.7) | `src/oracle.rs:455`–`461` |
-| O-3 (e) completeness half, the completeness fix (2.7) | `src/oracle.rs:462`–`476` (gated by `amcheck_i_ran`, `Extracted` field `src/oracle.rs:154`) |
-| O-3 (e) exactness half, tainted ∪ active `R` (2.7) | `src/oracle.rs:477`–`490` |
-| O-3 (e) applied to amcheck (ii) (2.7) | `src/oracle.rs:491`–`515` (fields `image_slots_ii` `:166`, `tainted_image_slots_ii` `:169`) |
-| X5-R5 harness-facing fields (`meta_rollback`, `rollback_slots`, …) | `src/oracle.rs:114`–`170` (`Extracted`) |
-| Acked commits lost above the cut (reported, not judged) | `src/oracle.rs:521`–`529` |
-| Round pass / seed pass (no DEADLOCK, no PANIC) | `src/oracle.rs:531`–`542`, `seed_passes` `:556` |
+| 2.1 commit recording, `written`/`acked` flags | `src/model.rs:79` (`TxnRec`), `:139` (`mark_written`), `:146` (`mark_acked`) |
+| 2.1 bulk loads, `model.scan(t, S)` — loads are versions at `S_L` (REWORK 3) | `src/model.rs:95` (`LoadRec`), `:178` (`Model::scan`) |
+| 2.1 published set, drop = Delete+DropTree, rounds truncation | `src/model.rs:219` (`published_at`), `:160` (`truncate`) |
+| 2.2 `lo` (`c_0 = 0`, max acked SyncOn) | `src/model.rs:238`, applied `src/oracle.rs:332` |
+| 2.2 `hi` (max written) | `src/model.rs:250`, applied `src/oracle.rs:333` |
+| 2.2 MW `lo := T` of the opened meta (X5-R1) | `src/oracle.rs:334`–`336` |
+| O-1 candidate set `{lo} ∪ {ts ∈ H : lo < ts ≤ hi}` | `src/oracle.rs:338`–`353` |
+| O-1 (a) published set equality | `src/oracle.rs:593`–`600` |
+| O-1 (b) `scan(c)` equality | `src/oracle.rs:602`–`612` |
+| O-1 (c) raw ts cut | `src/oracle.rs:614`–`620` (knob `no_raw_cut` `:210`) |
+| O-1 (d) history equality on `samp([gc_w, c])` (X5-R4) | `src/oracle.rs:621`–`630`; `samp` at `src/model.rs:264` |
+| O-1f frontier ∈ satisfying `c` (reported apart) | `src/oracle.rs:372` |
+| O-2 amcheck clean in class C, (i) and (ii) | `src/oracle.rs:375`–`393` |
+| O-3 (a) served corruption | `src/oracle.rs:395`–`399` (knob `no_taint` `:212`) |
+| O-3 (b) XX001 only in MP/MW (detection) | `src/oracle.rs:401`–`405` |
+| O-3 (c) twin false-positive rule; MISDIRECTED landing slot is a target (REWORK 6b), and a missing twin fails closed (REWORK 5) | `src/oracle.rs:407`–`452` (landing slot `:259`–`261`, missing twin `:447`–`451`; knob `no_twin_rule` `:214`) |
+| O-3 (d) silent `Ok` requires O-1 and O-2 | `src/oracle.rs:454`–`462` |
+| O-1 lower bound `c ≥ lo` | `src/oracle.rs:341`–`349` (knob `no_lower_bound` `:208`) |
+| O-3 (e) exception conditions (class, 1, 2) | `src/oracle.rs:464`–`475`; condition 1 derived from the fault list at `src/oracle.rs:245`–`275` (`FaultTargets::collect`, field `:239`; knob `no_meta_slot_cond` `:219`) |
+| O-3 (e) structural guard on `R` (2.7) | `src/oracle.rs:479`–`485` |
+| O-3 (e) completeness half, the completeness fix (2.7) | `src/oracle.rs:487`–`499` (gated by `amcheck_i_ran`, `Extracted` field `src/oracle.rs:158`; pinned for (ii) by must-fail 18, REWORK 4) |
+| O-3 (e) exactness half, tainted ∪ active `R` (2.7) | `src/oracle.rs:501`–`516` |
+| O-3 (e) applied to amcheck (ii) (2.7) | `src/oracle.rs:517`–`542` (fields `image_slots_ii` `:170`, `tainted_image_slots_ii` `:173`) |
+| X5-R5 harness-facing fields (`meta_rollback`, `rollback_slots`, …) | `src/oracle.rs:118`–`175` (`Extracted`) |
+| Acked commits lost above the cut (reported, not judged) | `src/oracle.rs:546`–`553` |
+| Round pass / seed pass (no DEADLOCK, no PANIC) | `src/oracle.rs:555`–`566`, `seed_passes` `:580` |
 
 ## How to reproduce
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # stage X-5a: sim + oracle suites (41 tests)
-cargo test -q -p e4-recovery --test oracle  # the 2.6 + 2.7 self-tests (24)
-cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests (10)
+cargo test -q --release -p e4-recovery      # stage X-5a: sim + oracle suites (50 tests)
+cargo test -q -p e4-recovery --test oracle  # the 2.6 + 2.7 + REWORK self-tests (28)
+cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests + REWORK pins (15)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
   --results spikes/e4-recovery/results/campaign.json   # exits 2: not built (X-5c)
 ```
