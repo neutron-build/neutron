@@ -1,7 +1,8 @@
-//! Oracle self-tests (card X-5 Work 2.6). P-written, binding: synthetic
-//! histories and recovered states, with no store. Five cases must pass,
-//! eleven must fail, and the four instrumentation removals must each be
-//! load-bearing (the removed check lets a previously failing case pass).
+//! Oracle self-tests (card X-5 Work 2.6, with the 2.7 additions).
+//! P-written, binding: synthetic histories and recovered states, with no
+//! store. Six cases must pass, seventeen must fail, and the five
+//! instrumentation removals must each be load-bearing (the removed check
+//! lets a previously failing case pass).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,7 +12,7 @@ use e4_recovery::oracle::{
     check_round, seed_passes,
 };
 use e4_recovery::rng::Rng;
-use e4_recovery::sim::FaultClass;
+use e4_recovery::sim::{FaultClass, MediaFault, MediaKind};
 
 /// A synthetic recovered state: per-tree scans and raw entries.
 /// Per tree: a list of `(ts, key, val/tomb)` versions.
@@ -160,7 +161,11 @@ fn ex_for(_synth: &Synth, c: u64, model: &Model) -> Extracted {
         amcheck_ii: vec![],
         image_slots: BTreeSet::new(),
         tainted_image_slots: BTreeSet::new(),
-        stale_ref_slots: BTreeSet::new(),
+        meta_rollback: false,
+        amcheck_i_ran: false,
+        rollback_slots: BTreeSet::new(),
+        image_slots_ii: BTreeSet::new(),
+        tainted_image_slots_ii: BTreeSet::new(),
     }
 }
 
@@ -620,8 +625,226 @@ fn mf11_deadlock_seed_fails() {
     assert!(!seed_passes(&[], false, true), "a PANIC seed fails");
 }
 
-/// The four instrumentation removals are load-bearing: each removed check
-/// lets a previously failing case pass (card "Instrumentation checks").
+/// The X5-R5 shape (Work 2.7): class MP, a LOST page fault on meta slot
+/// `fault_slot` (slot 1 for the condition-1 cases, an ordinary data slot
+/// otherwise), a meta rollback, image slots {5, 8, 9} with tainted {5},
+/// R = {8, 9}, and amcheck (i) reporting 5, 8 and 9 — legal only while
+/// the exception is active. Amcheck (ii) ran and reports exactly the
+/// tainted (ii) slot. Everything else (O-1 at c = 10, O-3 (b)/(c)) is
+/// arranged to pass, so the verdict isolates O-3 (e).
+fn rollback_world(fault_slot: u64) -> (Model, Synth, Extracted, FaultTargets, TwinInfo) {
+    let m = base_model();
+    let s = state_at(&m, 10);
+    let mut ex = ex_for(&s, 10, &m);
+    ex.frontier = 10;
+    ex.ok = true;
+    ex.xx001 = vec![XxSite::AmcheckI, XxSite::AmcheckIi];
+    ex.amcheck_i_ran = true;
+    let mut image = BTreeSet::new();
+    image.insert(5u64);
+    image.insert(8u64);
+    image.insert(9u64);
+    ex.image_slots = image.clone();
+    ex.image_slots_ii = image;
+    let mut tainted = BTreeSet::new();
+    tainted.insert(5u64);
+    ex.tainted_image_slots = tainted.clone();
+    ex.tainted_image_slots_ii = tainted;
+    let mut rset = BTreeSet::new();
+    rset.insert(8u64);
+    rset.insert(9u64);
+    ex.rollback_slots = rset;
+    ex.meta_rollback = true;
+    ex.amcheck_i = vec![
+        Finding {
+            slot: Some(5),
+            what: "crc mismatch".to_owned(),
+        },
+        Finding {
+            slot: Some(8),
+            what: "stale reference after meta rollback".to_owned(),
+        },
+        Finding {
+            slot: Some(9),
+            what: "stale reference after meta rollback".to_owned(),
+        },
+    ];
+    ex.amcheck_ii_ran = true;
+    ex.amcheck_ii = vec![Finding {
+        slot: Some(5),
+        what: "crc mismatch".to_owned(),
+    }];
+    // A durable LOST page fault at `fault_slot`'s offset, collected the
+    // way the harness does (the oracle derives condition 1 itself).
+    let fault = MediaFault {
+        inode: 0,
+        off: fault_slot * 4096,
+        len: 4096,
+        bytes: vec![1u8; 4096],
+        pre: vec![0u8; 4096],
+        kind: MediaKind::Lost,
+    };
+    let faults = FaultTargets::collect(&[fault], 0);
+    let mut twin = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![],
+        image_slots: BTreeSet::new(),
+    };
+    twin.image_slots.insert(fault_slot);
+    twin.image_slots.insert(5u64);
+    (m, s, ex, faults, twin)
+}
+
+/// Must pass (6): MP, a LOST fault on slot 1, `meta_rollback`, amcheck
+/// (i) reporting every tainted referenced slot plus some slots of `R`
+/// (X5-R5's exception, Work 2.7).
+#[test]
+fn mp6_meta_rollback_exception() {
+    let (m, mut s, ex, faults, twin) = rollback_world(1);
+    assert!(
+        faults.meta_slot_fault,
+        "a LOST fault on slot 1 is a meta-slot fault"
+    );
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "the X5-R5 exception must accept the R findings: {:?}",
+        v
+    );
+    assert!(v.o1.is_ok());
+}
+
+/// Must fail (12): the same findings with `meta_rollback` false —
+/// condition 2 of X5-R5 is load-bearing; `R` is ignored and the strict
+/// X5-R2 reading fails the R findings.
+#[test]
+fn mf12_no_meta_rollback_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    ex.meta_rollback = false;
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "without a meta rollback the R findings must fail");
+    assert!(v.o3_fail.clone().unwrap_or_default().contains("O-3(e)"));
+}
+
+/// Must fail (13): the same findings with `meta_rollback` true but no
+/// fault on slot 1 or 2 — condition 1 of X5-R5 is load-bearing (checked
+/// by the oracle itself, from the fault list).
+#[test]
+fn mf13_no_meta_slot_fault_fails() {
+    let (m, mut s, ex, faults, twin) = rollback_world(5);
+    assert!(
+        !faults.meta_slot_fault,
+        "a fault on slot 5 is not a meta-slot fault"
+    );
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        !v.pass,
+        "without a meta-slot fault the R findings must fail"
+    );
+    assert!(v.o3_fail.clone().unwrap_or_default().contains("O-3(e)"));
+}
+
+/// Must fail (14): a meta rollback with a meta-slot fault, and amcheck
+/// reporting a slot outside (tainted ∪ `R`).
+#[test]
+fn mf14_finding_outside_tainted_and_r_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    ex.amcheck_i.push(Finding {
+        slot: Some(12),
+        what: "crc mismatch".to_owned(),
+    });
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "a finding outside tainted and R must fail");
+    assert!(v.o3_fail.clone().unwrap_or_default().contains("O-3(e)"));
+}
+
+/// Must fail (15): `rollback_slots` holding a tainted slot, or a slot the
+/// image does not reference — the structural guard (a harness defect
+/// must never pass).
+#[test]
+fn mf15_malformed_r_fails() {
+    // (a) R holds a tainted slot.
+    {
+        let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+        ex.rollback_slots.insert(5u64);
+        let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+        assert!(!v.pass, "R holding a tainted slot must fail");
+        assert!(
+            v.o3_fail
+                .clone()
+                .unwrap_or_default()
+                .contains("harness R set malformed"),
+            "got {:?}",
+            v.o3_fail
+        );
+    }
+    // (b) R holds a slot the image does not reference.
+    {
+        let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+        ex.rollback_slots.insert(99u64);
+        let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+        assert!(!v.pass, "R holding an unreferenced slot must fail");
+        assert!(
+            v.o3_fail
+                .clone()
+                .unwrap_or_default()
+                .contains("harness R set malformed"),
+            "got {:?}",
+            v.o3_fail
+        );
+    }
+}
+
+/// Must fail (16): MP, a tainted referenced slot, amcheck (i) ran and
+/// reported nothing, XX001 at open — the completeness fix (run 1 gated
+/// the completeness half on findings existing, letting a fully missed
+/// detection pass beside another XX001 of the round).
+#[test]
+fn mf16_fully_missed_detection_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    // Amcheck (i) ran and found nothing at all; the taint remains.
+    ex.amcheck_i.clear();
+    ex.amcheck_ii_ran = false;
+    ex.amcheck_ii.clear();
+    // Recovery failed with XX001 at open (another XX001 in the round).
+    ex.ok = false;
+    ex.xx001 = vec![XxSite::Open];
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "a fully missed detection must fail");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("tainted referenced slot 5 not reported"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must fail (17): the same as must-pass 6, but on amcheck (ii) — (ii)
+/// reports a slot outside (tainted (ii) ∪ `R`).
+#[test]
+fn mf17_ii_finding_outside_tainted_and_r_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    ex.amcheck_ii.push(Finding {
+        slot: Some(12),
+        what: "crc mismatch".to_owned(),
+    });
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "an (ii) finding outside tainted and R must fail");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("(ii) reported slot 12"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// The five instrumentation removals are load-bearing: each removed check
+/// lets a previously failing case pass (card "Instrumentation checks",
+/// with the 2.7 addition of X5-R5's meta-slot-fault condition).
 #[test]
 fn instrumentation_removals_are_load_bearing() {
     let mut rng = Rng::new(1);
@@ -751,5 +974,30 @@ fn instrumentation_removals_are_load_bearing() {
             &cfg,
         );
         assert!(v.pass, "without the twin rule the false positive passes");
+    }
+    // (5) X5-R5's meta-slot-fault condition (condition 1): must-fail 13's
+    // world — meta rollback, findings on R slots, no fault on slot 1 or
+    // 2 — now passes.
+    {
+        let (m, mut s, ex, faults, twin) = rollback_world(5);
+        let cfg = OracleCfg {
+            no_meta_slot_cond: true,
+            ..Default::default()
+        };
+        let v = check_round(
+            &m,
+            FaultClass::Mp,
+            0,
+            &ex,
+            &mut s,
+            &faults,
+            Some(&twin),
+            &mut rng,
+            &cfg,
+        );
+        assert!(
+            v.pass,
+            "without condition 1 the R findings without a meta-slot fault pass"
+        );
     }
 }

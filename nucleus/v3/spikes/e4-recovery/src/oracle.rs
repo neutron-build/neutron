@@ -32,7 +32,18 @@
 //!   `res` is `Ok` and no XX001 occurred, O-1 and O-2 must hold in full
 //!   (silent damage is a failure); (e) in MP, amcheck (i)/(ii) must report
 //!   XX001 for every tainted slot the opened image references, and only
-//!   for those (X5-R2).
+//!   for those (X5-R2) — with exactly one exception, ruling X5-R5 (Work
+//!   2.7/2.8): findings may additionally name slots of the
+//!   harness-computed set `R` ([`Extracted::rollback_slots`]) when the
+//!   class is MP, the round's fault list has a page fault on meta slot
+//!   1 or 2 (condition 1, which the oracle checks itself, from the fault
+//!   list) and [`Extracted::meta_rollback`] holds (condition 2,
+//!   harness-computed). A `rollback_slots` that is not a subset of the
+//!   image's untainted referenced slots fails the round with
+//!   `O-3(e): harness R set malformed` (the structural guard: a harness
+//!   defect must never pass). The completeness half runs whenever
+//!   amcheck (i) ran and tainted referenced slots exist, whatever
+//!   amcheck reported (the X5-R5 completeness fix).
 //!
 //! Pass (2.4): a round passes iff O-1, O-2 and O-3 hold as the class
 //! requires. A seed passes iff every round passes and no `DEADLOCK` or
@@ -47,14 +58,17 @@
 //! Instrumentation-removal knobs ([`OracleCfg`]) exist **only** to
 //! demonstrate that each check is load-bearing (card "Instrumentation
 //! checks"): the campaign always runs with them all off. Removing O-1's
-//! lower bound, O-1 (c), the taint comparison or the twin false-positive
-//! rule must make the corresponding self-test of Work 2.6 fail.
+//! lower bound, O-1 (c), the taint comparison, the twin false-positive
+//! rule or X5-R5's meta-slot-fault condition from the check itself lets
+//! Work 2.6's must-fail cases 1, 4, 7, 9 and 13 pass; the knob demos in
+//! `tests/oracle.rs` (`instrumentation_removals_are_load_bearing`) show
+//! exactly that, each removal turning its red case green.
 
 use std::collections::BTreeSet;
 
 use crate::model::{CATALOG, Model, Scan};
 use crate::rng::Rng;
-use crate::sim::{FaultClass, MediaFault};
+use crate::sim::{FaultClass, MediaFault, MediaKind};
 
 /// Where an XX001 was observed in the round (O-3 (b)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,17 +134,39 @@ pub struct Extracted {
     pub amcheck_ii_ran: bool,
     /// Amcheck (ii) findings.
     pub amcheck_ii: Vec<Finding>,
-    /// The slots the opened image references (harness walk; O-3 (e)).
+    /// The slots the opened image references at the amcheck (i) point
+    /// (harness walk; O-3 (e)). X5-R5: the (ii) point has its own set,
+    /// [`Extracted::image_slots_ii`].
     pub image_slots: BTreeSet<u64>,
     /// The opened image's referenced slots that are tainted at the amcheck
-    /// (i) point (harness walk; O-3 (e)).
+    /// (i) point (harness walk; O-3 (e)). X5-R5: the (ii) point has its
+    /// own set, [`Extracted::tainted_image_slots_ii`].
     pub tainted_image_slots: BTreeSet<u64>,
-    /// Slots amcheck flagged whose §3.3 failure stems from the opened
-    /// image being older than writes issued after its meta was synced
-    /// (the lost-meta stale-ref case, a direct consequence of a media
-    /// fault; see README "O-3 (e) reading"). O-3 (e)'s "only for those"
-    /// accepts these beside tainted slots.
-    pub stale_ref_slots: BTreeSet<u64>,
+    /// X5-R5 condition 2 (harness-computed, from SimDisk history only):
+    /// the opened meta's `ckpt_id` is lower than that of some meta write
+    /// covered by a completed `sync_all`, in any life of this seed — open
+    /// selected a meta older than the newest synced one (a meta
+    /// rollback).
+    pub meta_rollback: bool,
+    /// X5-R5: whether amcheck (i) ran at all. False only when no meta is
+    /// valid (open fails with XX001, there is no opened image, and O-3
+    /// (e) is vacuous). Gates the completeness half.
+    pub amcheck_i_ran: bool,
+    /// X5-R5: the exception set `R` — slots the opened image references,
+    /// not tainted at amcheck (i), written after the first completed
+    /// `sync_all` covering a meta newer than the opened one, with no
+    /// M-NOINPLACE hit. Computed by the harness from SimDisk history
+    /// only; it is honoured only when the exception's conditions hold
+    /// (class MP, a page fault on meta slot 1 or 2 — the oracle checks
+    /// that itself — and `meta_rollback`), and must be a subset of the
+    /// image's untainted referenced slots (the structural guard).
+    pub rollback_slots: BTreeSet<u64>,
+    /// X5-R5: the slots the image references at the amcheck (ii) point
+    /// (after recovery plus the harness checkpoint).
+    pub image_slots_ii: BTreeSet<u64>,
+    /// X5-R5: the image's referenced slots that are tainted at the
+    /// amcheck (ii) point.
+    pub tainted_image_slots_ii: BTreeSet<u64>,
 }
 
 /// Reads the recovered state for the oracle: the harness implements this
@@ -172,16 +208,30 @@ pub struct OracleCfg {
     pub no_taint: bool,
     /// Remove the twin false-positive rule (O-3 (c) never fires).
     pub no_twin_rule: bool,
+    /// Remove X5-R5's condition 1 (the oracle's own check, from the fault
+    /// list, that a page-file media fault damaged meta slot 1 or 2). The
+    /// exception then honours `rollback_slots` in MP whenever
+    /// `meta_rollback` holds; must turn must-fail 13 green.
+    pub no_meta_slot_cond: bool,
 }
 
 /// The media faults of the round, mapped to page-file slots or WAL ranges
-/// for O-3 (c).
+/// for O-3 (c), plus X5-R5's condition 1.
 #[derive(Debug, Clone, Default)]
 pub struct FaultTargets {
     /// MP: page-file slots (`off / 4096`).
     pub page_slots: BTreeSet<u64>,
     /// MW: `(file, off, len)` WAL byte ranges.
     pub wal_ranges: Vec<(usize, u64, u64)>,
+    /// X5-R5 condition 1, computed here from the raw fault list (the
+    /// oracle checks it itself, never from harness-supplied state): at
+    /// least one page-file media fault damaged a meta slot. That is a
+    /// fault whose written range sits on slot 1 or 2 (LOST / TORN, or a
+    /// MISDIRECTED's source) **or** a MISDIRECTED whose stray bytes land
+    /// on slot 1 or 2 (the card's "target" of a misdirected write, 1.3).
+    /// Both leave slot 1–2 with non-issued or reverted bytes, which is
+    /// the only way a media fault can force open onto an older meta.
+    pub meta_slot_fault: bool,
 }
 
 impl FaultTargets {
@@ -190,9 +240,21 @@ impl FaultTargets {
     pub fn collect(faults: &[MediaFault], page_file: usize) -> Self {
         let mut page_slots = BTreeSet::new();
         let mut wal_ranges = Vec::new();
+        let mut meta_slot_fault = false;
         for f in faults {
             if f.inode == page_file {
-                page_slots.insert(f.off / 4096);
+                let slot = f.off / 4096;
+                page_slots.insert(slot);
+                let on_meta = slot == 1
+                    || slot == 2
+                    || matches!(
+                        &f.kind,
+                        MediaKind::Misdirected { to_off }
+                            if *to_off / 4096 == 1 || *to_off / 4096 == 2
+                    );
+                if on_meta {
+                    meta_slot_fault = true;
+                }
             } else {
                 wal_ranges.push((f.inode, f.off, f.len));
             }
@@ -200,6 +262,7 @@ impl FaultTargets {
         Self {
             page_slots,
             wal_ranges,
+            meta_slot_fault,
         }
     }
 }
@@ -373,28 +436,85 @@ pub fn check_round(
             o3_fail = Some("O-3(d): silent Ok with amcheck(ii) findings".to_owned());
         }
     }
-    if class == FaultClass::Mp && !ex.amcheck_i.is_empty() {
-        // O-3 (e): amcheck must report exactly the tainted referenced
-        // slots (X5-R2) — every tainted referenced slot is reported, and
-        // nothing else beyond the stale-ref consequences of a media fault.
-        for slot in ex.tainted_image_slots.iter() {
-            let reported = ex.amcheck_i.iter().any(|f| f.slot == Some(*slot));
-            if !reported {
-                o3_fail = Some(format!(
-                    "O-3(e): tainted referenced slot {slot} not reported"
-                ));
+    if class == FaultClass::Mp {
+        // O-3 (e) under X5-R2 with exactly one exception, X5-R5 (Work
+        // 2.7): amcheck must report every tainted slot its image
+        // references, and only those, except that findings may
+        // additionally name slots of the harness-computed set `R` when
+        // the exception's conditions hold: class MP (checked above),
+        // condition 1 (a page-file media fault damaged meta slot 1 or 2,
+        // checked here from the fault list, never from harness state)
+        // and condition 2 (`meta_rollback`, harness-computed). Otherwise
+        // `rollback_slots` is ignored and the strict X5-R2 reading
+        // applies unchanged.
+        let cond1 = cfg.no_meta_slot_cond || faults.meta_slot_fault;
+        let r_active = ex.meta_rollback && cond1;
+        // The first (e) failure is the reported one (deterministic
+        // diagnosis); it never overwrites an (a)-(d) failure.
+        let mut o3e: Option<String> = None;
+        // Structural guard (X5-R5): R must be a subset of the image's
+        // untainted referenced slots. A harness defect must never pass.
+        for slot in ex.rollback_slots.iter() {
+            if !ex.image_slots.contains(slot) || ex.tainted_image_slots.contains(slot) {
+                o3e.get_or_insert_with(|| format!("O-3(e): harness R set malformed (slot {slot})"));
             }
         }
+        // Completeness half, the X5-R5 completeness fix: run it whenever
+        // amcheck (i) ran and tainted referenced slots exist, whatever
+        // amcheck reported. (Run 1 gated it on findings existing, which
+        // let a fully missed detection pass beside any other XX001 of
+        // the round.)
+        if ex.amcheck_i_ran && !ex.tainted_image_slots.is_empty() {
+            for slot in ex.tainted_image_slots.iter() {
+                let reported = ex.amcheck_i.iter().any(|f| f.slot == Some(*slot));
+                if !reported {
+                    o3e.get_or_insert_with(|| {
+                        format!("O-3(e): tainted referenced slot {slot} not reported")
+                    });
+                }
+            }
+        }
+        // Exactness half (X5-R2's "and only for those", with X5-R5's R).
         for f in ex.amcheck_i.iter() {
             if let Some(slot) = f.slot {
                 let tainted = ex.tainted_image_slots.contains(&slot);
-                let stale = ex.stale_ref_slots.contains(&slot);
-                if !tainted && !stale {
-                    o3_fail = Some(format!(
-                        "O-3(e): amcheck reported slot {slot} that is neither tainted nor a stale-ref consequence"
-                    ));
+                let in_r = r_active && ex.rollback_slots.contains(&slot);
+                if !tainted && !in_r {
+                    o3e.get_or_insert_with(|| {
+                        format!(
+                            "O-3(e): amcheck reported slot {slot} that is neither tainted nor in R"
+                        )
+                    });
                 }
             }
+        }
+        // X5-R5: (e) applies to amcheck (ii) as well whenever it ran,
+        // against the (ii) sets, with the same R.
+        if ex.amcheck_ii_ran {
+            for slot in ex.tainted_image_slots_ii.iter() {
+                let reported = ex.amcheck_ii.iter().any(|f| f.slot == Some(*slot));
+                if !reported {
+                    o3e.get_or_insert_with(|| {
+                        format!("O-3(e): (ii) tainted referenced slot {slot} not reported")
+                    });
+                }
+            }
+            for f in ex.amcheck_ii.iter() {
+                if let Some(slot) = f.slot {
+                    let tainted = ex.tainted_image_slots_ii.contains(&slot);
+                    let in_r = r_active && ex.rollback_slots.contains(&slot);
+                    if !tainted && !in_r {
+                        o3e.get_or_insert_with(|| {
+                            format!(
+                                "O-3(e): (ii) reported slot {slot} that is neither tainted nor in R"
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        if o3_fail.is_none() {
+            o3_fail = o3e;
         }
     }
 
