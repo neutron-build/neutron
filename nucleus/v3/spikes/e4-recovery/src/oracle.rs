@@ -30,9 +30,9 @@
 //!   a slot (or WAL range) that the twin run (2.5) shows was not read by
 //!   recovery and not referenced by the opened image — a MISDIRECTED
 //!   fault targets both its source and its landing slot (gate REWORK item
-//!   6b), and a missing twin in an MP/MW round that has XX001 is a
-//!   harness defect that fails the round, never an open pass (gate REWORK
-//!   item 5); (d) in MP and MW, if `res` is `Ok` and no XX001 occurred,
+//!   6b) or landing range (gate REWORK round 2, item A), and a missing
+//!   twin in an MP/MW round that has XX001 is a harness defect that fails
+//!   the round, never an open pass (gate REWORK item 5); (d) in MP and MW, if `res` is `Ok` and no XX001 occurred,
 //!   O-1 and O-2 must hold in full (silent damage is a failure); (e) in
 //!   MP, amcheck (i)/(ii) must report XX001 for every tainted slot the
 //!   opened image references, and only for those (X5-R2) — with exactly
@@ -226,7 +226,11 @@ pub struct FaultTargets {
     /// MP: page-file slots (`off / 4096`), including a MISDIRECTED
     /// fault's landing slot (`to_off / 4096`, gate REWORK item 6b).
     pub page_slots: BTreeSet<u64>,
-    /// MW: `(file, off, len)` WAL byte ranges.
+    /// MW: `(file, off, len)` WAL byte ranges, including a MISDIRECTED
+    /// fault's landing range (`to_off`, its `len`) — the stray bytes are
+    /// there, and a detection they cause on a range recovery read is not
+    /// a false positive (gate REWORK round 2, item A; the page-file side
+    /// got the same fix in round 1, item 6b).
     pub wal_ranges: Vec<(usize, u64, u64)>,
     /// X5-R5 condition 1, computed here from the raw fault list (the
     /// oracle checks it itself, never from harness-supplied state): at
@@ -271,6 +275,15 @@ impl FaultTargets {
                 }
             } else {
                 wal_ranges.push((f.inode, f.off, f.len));
+                // Gate REWORK round 2, item A: a WAL MISDIRECTED fault
+                // also occupies its landing range — the stray bytes sit
+                // there, and an XX001 they cause on a range the twin's
+                // recovery read is a detection, not a false positive.
+                // (Run 1 collected only the source range on the WAL
+                // side; the page side landed with round 1, item 6b.)
+                if let MediaKind::Misdirected { to_off } = &f.kind {
+                    wal_ranges.push((f.inode, *to_off, f.len));
+                }
             }
         }
         Self {

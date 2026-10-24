@@ -5,7 +5,8 @@
 //! lets a previously failing case pass). Plus the gate REWORK (2026-10-23)
 //! additions: must-fail 18 (the (ii) completeness half) and 19 (a missing
 //! twin fails closed), and the pinned model and MISDIRECTED-landing-slot
-//! fixes.
+//! fixes. And the gate REWORK round 2 (2026-10-24) pin: a WAL
+//! MISDIRECTED's landing range is a fault target (item A).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -996,6 +997,57 @@ fn misdirected_landing_slot_is_a_fault_target() {
     assert!(
         v.pass,
         "the landing slot explains the detection, not a false positive: {:?}",
+        v
+    );
+}
+
+/// Gate REWORK round 2, item A (pinned): a WAL MISDIRECTED fault targets
+/// its **landing range** as well as its source — the twin's recovery
+/// read of the landing range explains the XX001, so O-3 (c) must not
+/// call it a false positive (run 1 collected only the source range on
+/// the WAL side; the page side got its landing slot in round 1, item
+/// 6b). The gate probe: in MW, a MISDIRECTED fault moves `[0,512)` of
+/// file 3 to offset 8192, the twin's recovery read `[8192,8704)`, XX001
+/// at Replay — the round-1 oracle returned a false-positive O-3 (c)
+/// failure.
+#[test]
+fn mw_misdirected_landing_range_is_a_fault_target() {
+    let fault = MediaFault {
+        inode: 3,
+        off: 0,
+        len: 512,
+        bytes: vec![1u8; 512],
+        pre: vec![0u8; 512],
+        kind: MediaKind::Misdirected { to_off: 8192 },
+    };
+    // The mapping itself: both the source range and the landing range.
+    let targets = FaultTargets::collect(std::slice::from_ref(&fault), 0);
+    assert!(
+        targets.wal_ranges.contains(&(3, 0, 512)),
+        "the source range targets"
+    );
+    assert!(
+        targets.wal_ranges.contains(&(3, 8192, 512)),
+        "the landing range targets too"
+    );
+    // And the O-3 (c) consequence: MW XX001 whose only fault's stray
+    // bytes landed inside a range the twin's recovery read is not a
+    // false positive.
+    let m = base_model();
+    let mut s = state_at(&m, 10);
+    let mut ex = ex_for(&s, 10, &m);
+    ex.ok = false; // recovery failed with XX001 at replay
+    ex.xx001 = vec![XxSite::Replay];
+    let faults = FaultTargets::collect(&[fault], 0);
+    let twin = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![(3, 8192, 512)], // the landing range
+        image_slots: BTreeSet::new(),
+    };
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "the landing range explains the detection, not a false positive: {:?}",
         v
     );
 }
