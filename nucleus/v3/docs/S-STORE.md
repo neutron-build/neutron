@@ -1,6 +1,6 @@
 # S-STORE: Storage layer (normative)
 
-Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace) + the S-2-F2 fixes (2026-10-24: the boot id in §7.3 and §8, `Released(⊥)` chunks in §12.6, the read-only open in §14.1). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
 
 **Scope.** This file covers:
 - the file, the pages, the page map, the free set and the buffer manager;
@@ -397,7 +397,7 @@ One tag byte, then a tag-specific body:
 | 3 | moved-tombstone (an UPDATE moved the row to a new primary key) | none | header 0x03 |
 | 4 | live value in an overflow chain | `len u64, first LPID u64` | (overflow, §6.7) |
 | 5 | live value in an overflow chain, `key_changed` | as tag 4 | (overflow) |
-| 6 | provisional live value | `txn (u32 epoch, u64 n), seq u32, data_seq u32, flags u8` (bit 0 = `key_changed`), then the value bytes | (C-T0 v8 §2.4) |
+| 6 | provisional live value | `txn (u32 boot id, u64 n), seq u32, data_seq u32, flags u8` (bit 0 = `key_changed`), then the value bytes | (C-T0 v8 §2.4) |
 | 7 | provisional tombstone | `txn, seq, data_seq, flags` (bit 0 = `moved`) | (C-T0 v8 §2.4) |
 | 8 | provisional live value in an overflow chain | `txn, seq, data_seq, flags, len u64, first LPID u64` | (C-T0 v8 §2.4) |
 | 9–255 | **reserved** | — | — |
@@ -425,7 +425,7 @@ Every read below runs on one tree. The write set merge (a transaction's own writ
 **Provisional heads (C-T0 v8 §2.4, §4).** A group's first entry may be a provisional entry `e` (§7.3 tags 6–8). Every read in §8.1–§8.3 takes from C-T0 a **resolver** for `e`. The resolver returns *ignore* (dead, `Open`, `Aborted`, or the reader's own entry) or *a version at `c`*. It is called **while the leaf holding `e` is still latched** (C-T0 v8 I-PROV-LOOKUP). Then:
 - **Head first.** The head is examined before the group's ordinary entries (I-PROV-READ). A conversion inserts `k@c` before it deletes `e` (C-T0 v8 I-PROV-CONVERT-ORDER), so a reader that finds no `e` finds `k@c`. Mutant ORDINARY-FIRST.
 - **Candidate rule.** If the resolver yields a version at `c`, the read's answer is the newer of `(c, e's data)` and the ordinary answer below. Both may be at `c`, during a conversion; they are then the same version.
-- **Fast path.** When the caller states that no current-epoch provisional entry exists in the tree (C-T0 v8 §4's per-tree count is 0), §8.1 skips the head check and is exactly one descent. Dead entries never affect §8.1 at `S < u64::MAX`, because `seek(k, S)` lands after them.
+- **Fast path.** When the caller states that no current-boot provisional entry exists in the tree (C-T0 v8 §4's per-tree count is 0), §8.1 skips the head check and is exactly one descent. "Current-boot" means `txn.boot` equals C-T0 v8's boot id (§12.2), never the checkpoint epoch `e` (§1), which changes at every checkpoint. Dead entries never affect §8.1 at `S < u64::MAX`, because `seek(k, S)` lands after them.
 - **Provisional data** is decoded like the matching ordinary tag (6 like 0 or 2, 7 like 1 or 3, 8 like 4 or 5, by the flags).
 
 ### 8.1 Point read at S (I-SEEK)
@@ -721,7 +721,7 @@ At the flip of checkpoint `k`, `wal_start_lsn` is the minimum of:
 
 **Why the marked case counts.** A chunked transaction `c` can have its chunks at LSN 100–200 and its marker at LSN 400, with a small commit `≤ T` at LSN 300 between them. If `c`'s apply had not finished at the flip, then `T < c`. The first term alone gives 400, so pass 2 (§14) would never see the chunks, and step 6 could recycle them. `c` would be lost although acked. Counting `c`'s first chunk puts the start at 100.
 
-A transaction that aborted before the flip does not count, and neither does one whose marker has `commit_ts ≤ T`, which is wholly in the image. After a crash, an open transaction's chunks are ignored, because no marker follows them. **A segment wholly below the durable meta's `wal_start_lsn` may be recycled** (§13 step 6). This is PLAN-v3's chunk rule ("segments holding chunks of a txn whose marker isn't yet below T are never recycled"), stated as a replay-start position.
+A transaction that aborted before the flip does not count, and neither does one whose marker has `commit_ts ≤ T`, which is wholly in the image. **Nor does a transaction that committed with no ts** before the flip (C-T0 v8 `Released(⊥)`, §3.1 step 0: a large transaction whose `ROLLBACK TO` left it no data). It writes no marker, ever, so recovery ignores its chunks exactly as it ignores an aborted transaction's, and nothing durable depends on them. After a crash, an open transaction's chunks are ignored, because no marker follows them. **A segment wholly below the durable meta's `wal_start_lsn` may be recycled** (§13 step 6). This is PLAN-v3's chunk rule ("segments holding chunks of a txn whose marker isn't yet below T are never recycled"), stated as a replay-start position.
 
 ### 12.7 Large transactions
 A transaction is chunked **iff** it is large (C-T0 v8 §2.1). Its `Chunk` records are written before commit, as it materialises its writes (C-T0 v8 §3.2), and the commit is the `CommitMarker`, written in ts order (I-WAL-TS-ORDER).
@@ -830,7 +830,7 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 5. Truncate the WAL at the valid end.
 6. Resume the walks of every `dropping` directory entry (§6.8), as a B-6 boot job.
 7. Optionally run `amcheck` (A-8).
-8. Run the **boot checkpoint** (§13). It runs every step 0–6 and **always writes a new meta** (`ckpt_id` one above the recovered meta's), even when no page is dirty. No transaction starts until its step 5 has made that meta durable. Its `ckpt_id` gives C-T0 v8's **boot id** (C-T0 v8 §2.5), which is not the checkpoint epoch `e` (one higher after the flip). Chunks of the previous boot that have no marker belong to transactions aborted before this flip, so they do not hold back `wal_start_lsn` (§12.6). A **read-only open** (N11) skips this step and has no boot id; every provisional entry is dead to it.
+8. Run the **boot checkpoint** (§13). It runs every step 0–6 and **always writes a new meta** (`ckpt_id` one above the recovered meta's), even when no page is dirty. No transaction starts until its step 5 has made that meta durable. Its `ckpt_id` gives C-T0 v8's **boot id** (C-T0 v8 §2.5), which is not the checkpoint epoch `e` (one higher after the flip). Chunks of the previous boot that have no marker belong to transactions that ended without one (aborted, cut off by the crash, or committed with no ts), all ended before this flip, so they do not hold back `wal_start_lsn` (§12.6). A **read-only open** (N11) skips this step and has no boot id; every provisional entry is dead to it (§14.1).
 
 Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if nothing was replayed. C-T0 v8 restarts its sequencer and watermark from that value and from `gc_w` (C-T0 v8 §3.7). Provisional entries found in the image are dead and are ignored by every read (§8).
 
@@ -845,6 +845,35 @@ The double-crash test (A-7d) is the test that runs recovery twice. It is not a m
 - **START-LSN-MARKED-CHUNK:** the replay start counts only transactions with no marker. Its test is §12.6's case: a chunked transaction whose marker (`commit_ts > T`) lies after a commit `≤ T`, with its apply unfinished at the flip, then a crash after step 6. The transaction must be recovered whole.
 
 **E4's oracle.** The recovered state equals the model at some commit `c`, with max acked sync-on commit `≤ c ≤` last WAL-written commit (PLAN-v3 §4 E4). That follows from I-REDO-COMPLETE, I-CKPT-AT-T, I-REPLAY-IDEM and I-WAL-TS-ORDER: the durable commits form a ts-prefix.
+
+### 14.1 Read-only open (N11)
+N11 makes read-only opens optional. A build that offers them meets this subsection; a build that does not refuses a read-only open. A read-only open recovers exactly the state a read-write open recovers, but keeps it in memory and writes nothing.
+
+**No writer.** While a read-only open is open, no read-write open of the file runs: it takes N11's file lock (through `Env`) in a mode that excludes a read-write open, and it fails rather than wait when a writer holds the lock. Why: a writer recycles WAL segments and reuses slots after every checkpoint (§13 step 6), so the reader's image and WAL span would change under it. Whether several read-only opens may share the file is the lock mode's choice; nothing here depends on it, because none of them writes.
+
+**What it replays.** Steps 1–4, unchanged: the same winning meta (§2.2), the same image, the same valid end (§12.5), the same two passes, and the same ops, with I-CHUNK-SUPERSEDE.
+- So its state equals the state a read-write open of the same files has after step 4, before its boot checkpoint.
+- The apply frontier is fixed as after step 4 (the largest replayed `commit_ts`, or `T`), and `W` starts at the meta's `gc_w` (C-T0 v8 §3.7 steps 2–3). Neither advances, because nothing commits.
+- Skipping pass 2 would serve image `k` alone and silently lose every acked commit above `T` (mutant **RO-NO-REPLAY**).
+
+**Where the replay lives: in the pool, unwritten.** Pass 2's mutations, including its splits and the LPIDs they allocate, exist only in memory.
+- **Eviction.** A dirty frame is never evicted, because §5.2's dirty-victim write is a write. Clean frames are evicted as usual.
+- **Pool budget.** The evictable part of the pool (`F` minus the dirty frames) must meet §5.4's minimum, both during pass 2 and after it. When it would not, the open fails with 53200, having written nothing.
+- **The remedy** is a read-write open, whose boot checkpoint makes the replay durable. A read-only open of the files it leaves replays nothing.
+- **Replay is the only mutation.** No GC mutation (§10), page-local prune, LPID free, directory change or checkpoint runs.
+
+**What it skips.**
+- **Step 5:** the WAL is not truncated. The torn tail stays on disk, every walk stops at the same valid end (§12.5), and the next read-write open truncates it.
+- **Step 6:** `dropping` walks do not resume. Each such tree is in the state a read-write open has before its B-6 job runs.
+- **Step 7:** amcheck may run, because it only reads.
+- **Step 8:** the boot checkpoint does not run, and there is no boot id. Every provisional entry, from any boot, is dead (C-T0 v8 §2.4), and every read ignores it from its bytes, with no lookup (§8). The live-txn registry stays empty.
+
+**What it refuses.**
+- **Every write through `Env`** on the page file or `wal/`: no write, sync, rename, truncate, preallocation, segment recycling or creation. A missing file fails the open, since §2.3's creation is a write. Mutant **RO-WRITES**: the open truncates the WAL (step 5), writes an evicted replayed frame, resumes a drop walk, or checkpoints.
+- **Every write transaction.** Every transaction is READ ONLY, and a write gets 25006 (C-T0 v8 §2.5).
+- **A corrupt image or meta** fails as it does for a read-write open (XX001, §2.2, §3.3).
+
+**No trace.** Closing or crashing a read-only open leaves every file byte-identical. A later read-write open recovers the same state it would have recovered without it.
 
 ---
 
@@ -885,6 +914,7 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-META-ATOMIC | §13: a meta never points at unwritten pages | A-7c (crash between every step) | META-BEFORE-SYNC |
 | I-CKPT-AT-T | §13: the image is a consistent cut; (a)–(c), with `T` = the apply frontier `M` | A-7a/A-7c (splits and packs during a checkpoint; async mix), B-1d (a checkpoint during a finalize) | FLIP-NO-GATE, WAL-SYNC-T-ONLY, CKPT-T-VISIBLE |
 | I-REDO-COMPLETE | §14: every acked sync commit is in the image or replayed | A-6d, A-7d | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK |
+| I-RO-OPEN | §14.1: a read-only open writes nothing through `Env`, and its reads at every registered `S` equal those of a read-write open of the same files after step 4. Test `t_ro_open`, with a SimEnv that fails every write, sync, rename and truncate. Its fixture is a crashed file with a torn WAL tail, small commits above `T`, a marked chunked txn whose marker lies after a commit `≤ T`, unmarked chunks, a `dropping` entry, provisional entries in the image, and replay splits. The test compares the reads with a read-write open of a copy, checks the files are byte-identical after close, and checks that a pool too small for the replay gives 53200 with nothing written | A-7d | RO-NO-REPLAY, RO-WRITES |
 | I-WAL-STALE | §12.5: the reader stops at the first bad magic/CRC, wrong `lsn` or over-long `len`; recovery truncates there | A-6b | LSN-CHECK-SKIP |
 | I-WAL-TS-ORDER | §12.4: commit_ts strictly increases with LSN | A-6c, B-1c | TS-AFTER-APPEND |
 | I-BULK-PUBLISH | §12.8: unlogged writes only into unpublished trees; publish after the forced meta | B-4d | PUBLISH-BEFORE-META |
@@ -977,6 +1007,10 @@ This file wins over the plan (precedence above). The plan should be updated thro
 
 ## Changelog
 
+- **S-2-F2** (2026-10-24, card S-2-F2, with C-T0 v8 draft 8.2, per `verdicts/S-2-F1.md` MERGE-WITH-FOLLOWUPS):
+  - **Boot id (F2-a).** §7.3 tag 6's `txn` is `(u32 boot id, u64 n)`, as in §12.2, and §8's fast path says "current-boot". Read as the checkpoint epoch `e`, both would have made live provisional entries dead at the next checkpoint.
+  - **`Released(⊥)` (F2-c).** A transaction that committed with no ts writes no marker, so its chunks do not hold back `wal_start_lsn` (§12.6, §14 step 8).
+  - **Read-only open (the verdict's N11 observation).** New §14.1: it replays steps 1–4 into the pool, never writes (no dirty eviction, no truncate, no drop walk, no checkpoint), fails with 53200 when the replay does not fit, has no boot id, and excludes a writer. New row I-RO-OPEN, mutants RO-NO-REPLAY and RO-WRITES, test `t_ro_open` (A-7d).
 - **S-2-F1** (2026-10-23, card S-2-F1, with C-T0 v8 draft 8.1, per `verdicts/S-2.md`):
   - **Frontiers (item 3).** §10.5's Bound argues from `W ≤ M`, `M` monotonic and `T := M`. §17 "Watermark" names `W ≤ M`. §17 "Commit-visibility" drops the session floor. §10.1 condition 2 argues from `w ≤ W ≤ M` and covers conversions.
   - **Boot checkpoint (item 8).** Always a new meta, durable before the first transaction, skipped by read-only opens; its `ckpt_id` gives the **boot id**, renamed from "boot epoch" (§12.2, §13 (c), §14 step 8).
