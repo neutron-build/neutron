@@ -1,6 +1,6 @@
 # S-STORE: Storage layer (normative)
 
-Status: draft 3 (card S-1-F1, 2026-10-23). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
 
 **Scope.** This file covers:
 - the file, the pages, the page map, the free set and the buffer manager;
@@ -42,12 +42,13 @@ It covers **what must hold**; the reference implementations show one way to meet
 | durable image | The image of the newest meta whose CRC is valid on disk. |
 | `U` | Usable bytes of a B+tree page: `page_size` minus the page header (§3.1) and the B+tree header. `used(p)` = the bytes of p's live cells plus its slot array. |
 | user key | The C-K1 memcomparable encoding (N7) of a row's primary key or of an index key, within one tree. Opaque bytes here. |
-| entry | One B+tree cell `(entry key, entry value)`. Under N3 = (b), an entry is **one version** of one user key (§7). |
+| entry | One B+tree cell `(entry key, entry value)`. Under N3 = (b), an entry is **one version** of one user key (§7), or a **provisional entry** (below). |
+| provisional entry | A large transaction's own data for one key, at the head of the key's group: ts suffix `u64::MAX`, tags 6–8 (§7.3). It is not a version until C-T0 v8 §2.4 says so. A **dead** provisional entry is one from a previous boot. |
 | group | The contiguous run of entries of one user key, ordered newest first (§7.2). |
 | `ts` | A commit timestamp (C-T0 `Ts`, `u64`). `0` and `u64::MAX` are never commit timestamps (§7.1). |
 | `S` | A snapshot ts. A read at `S` sees, per user key, the newest version with `ts ≤ S`. |
-| `W` | The GC watermark (C-T0 v8): `W ≤` every registered snapshot, `W ≤ visible_ts`, and monotonic (§17). |
-| apply frontier | The largest ts such that every commit with ts ≤ it has finished its apply to the trees. It equals C-T0's `visible_ts` while `visible_ts` advances eagerly (C-T0 §3). |
+| `W` | The GC watermark (C-T0 v8 §9.1): `W ≤` every registered snapshot, `W ≤` the apply frontier `≤ visible_ts`, and monotonic (§17). |
+| apply frontier | The largest ts such that every commit with ts ≤ it has its versions in the trees as **ordinary entries** (tags 0–5). It is C-T0 v8's materialized frontier `M` (C-T0 v8 §3.5). It equals `visible_ts` except while a large transaction finalizes: its provisional entries are already readable as versions, so it is visible, but it is not yet applied in this sense. |
 | gated operation | A mutation that holds the **epoch gate** shared from its first page mutation to its last (§5.6). |
 | SMO | Structure modification: a split, a pack step (§6.5), a root split or a root collapse. |
 
@@ -316,7 +317,7 @@ With `F_PACK = 0.85`, the step does one of three things:
 - **Inner pages** whose `used` falls below `U/4` after a pack removed a child are packed under their parent, by a **re-descent** that latches the parent first. Nothing ever latches a parent after its child (I-LATCH). After a delete, they pack the same way as the leaf (the right neighbour, or the left one for a rightmost child). **The sweep uses its own rule instead** (§10.4 step 5): an inner page packs only with its right neighbour, and a junction walk follows. A left pack would make the left neighbour's former last child, which was exempt and may be underfull, a middle child beside a page the sweep has already passed, and nothing would pack the two again, so I-SPACE would fail (§11).
 - **The root** collapses when it is an inner page with one child (§6.3).
 
-Under N3 = (b), **logical deletes are tombstone inserts** (§7). Only GC, DropTree and overflow freeing ever remove entries or pages.
+Under N3 = (b), **logical deletes are tombstone inserts** (§7). Only GC, DropTree, overflow freeing and provisional-entry settling (C-T0 v8 §2.4) ever remove entries or pages.
 
 ### 6.6 Cursors (I-CURSOR)
 - **Holding latches.** A cursor holds shared latches on its root-to-leaf stack while it is positioned (E0's design), so no SMO can change the path it holds.
@@ -328,7 +329,7 @@ Iterators are **streaming**: a range scan never materialises its range. The spik
 ### 6.7 Overflow chains
 An entry whose value exceeds `V_INLINE` stores a reference `(len u64, first LPID)` in its value, with tag 4 or 5 (§7.3). The chain is a list of Overflow pages.
 - **Immutability.** Chains are immutable once written (versions are immutable).
-- **Freeing.** A chain is freed **in the same gated operation** that deletes its entry (§10). A chain free therefore holds the flip for the chain's length. A-5 measures this at the maximum value size; if it is too long, A-5 proposes a resumable free, which is an edit of this file.
+- **Freeing.** A chain is freed **in the same gated operation** that deletes its entry (§10). **Exception:** a conversion of a tag-8 provisional entry (C-T0 v8 §2.4) moves the chain to the new tag-4 or tag-5 entry and deletes the provisional entry without freeing it. Both happen in one gated operation, so no image holds two references to one chain. A chain free therefore holds the flip for the chain's length. A-5 measures this at the maximum value size; if it is too long, A-5 proposes a resumable free, which is an edit of this file.
 - **Reading without the leaf latch.** A reader that holds a registered snapshot `S ≥ W` may read the chain after releasing the leaf latch. GC never deletes a version that is the newest `≤ S` for any registered `S` (I-GC-READEQ), so a version that a registered snapshot reads cannot lose its chain while the reader holds that registration.
 
 ### 6.8 Tree directory
@@ -359,8 +360,8 @@ At open, every `dropping` entry's walk resumes (the B-6 boot job; C-B1 "drop cle
 Decided by X-4 (PLAN-v3 §4, "E1′ decision") from the e1-bench evidence (§16). The layout is X-2's (`spikes/e1-arm-b/src/encode.rs`), pinned by its proptest. S-1 owns it (decision block, "Consequences").
 
 ### 7.1 Timestamps
-- **Reserved values.** `ts = 0` and `ts = u64::MAX` are never commit timestamps. C-T0 already reserves `Ts::ZERO`. This file reserves `u64::MAX` for S-2: §7.3 and §19 Q4.
-- **Uniqueness.** One commit writes at most one version per user key per tree, at its own unique ts, so **entry keys are unique** (I-ENTRY-UNIQUE).
+- **Reserved values.** `ts = 0` and `ts = u64::MAX` are never commit timestamps. C-T0 already reserves `Ts::ZERO`. The suffix `u64::MAX` marks a **provisional entry** (§7.3 tags 6–8; C-T0 v8 §2.4): `entry_key(k, u64::MAX) = seek_newest(k)`, the head of k's group.
+- **Uniqueness.** One commit writes at most one version per user key per tree, at its own unique ts, so **entry keys are unique** (I-ENTRY-UNIQUE). A tree holds at most one provisional entry per user key.
 
 ### 7.2 Entry key
 ```
@@ -396,16 +397,21 @@ One tag byte, then a tag-specific body:
 | 3 | moved-tombstone (an UPDATE moved the row to a new primary key) | none | header 0x03 |
 | 4 | live value in an overflow chain | `len u64, first LPID u64` | (overflow, §6.7) |
 | 5 | live value in an overflow chain, `key_changed` | as tag 4 | (overflow) |
-| 6–255 | **reserved** (S-2 provisional entries, §19 Q4) | — | — |
+| 6 | provisional live value | `txn (u32 epoch, u64 n), seq u32, data_seq u32, flags u8` (bit 0 = `key_changed`), then the value bytes | (C-T0 v8 §2.4) |
+| 7 | provisional tombstone | `txn, seq, data_seq, flags` (bit 0 = `moved`) | (C-T0 v8 §2.4) |
+| 8 | provisional live value in an overflow chain | `txn, seq, data_seq, flags, len u64, first LPID u64` | (C-T0 v8 §2.4) |
+| 9–255 | **reserved** | — | — |
 
 **Why these tags.**
 - Tags 0 and 1 are the spike's (`encode.rs:50`, `:53`).
 - Tags 2 and 3 carry the C-T0 behaviour that needs them (the KEY SHARE rule, and moved rows under RC EPQ), whose physical clauses C-T0 v8 replaces with references to this file (PLAN-v3 §3.4). C-T0 v8 owns what they mean.
-- *Tombstone* below means tag 1 or 3; *live* means tags 0, 2, 4 and 5.
+- Tags 6–8 are C-T0 v8 §2.4's provisional entries, assigned by card S-2. They occur only with the ts suffix `u64::MAX`.
+- *Tombstone* below means tag 1 or 3; *live* means tags 0, 2, 4 and 5. *Ordinary* means tags 0–5.
 
-**I-TAG-RESERVED.** Until S-2 assigns them in an edit of this file, the following are XX001 on every read path and are never served:
-- a reserved tag;
-- an entry whose suffix encodes ts `0` or `u64::MAX`.
+**I-TAG-RESERVED.** The following are XX001 on every read path and are never served:
+- a reserved tag (9–255);
+- an entry whose suffix encodes ts `0`;
+- an ordinary tag (0–5) with the suffix `u64::MAX`, or a provisional tag (6–8) with any other suffix.
 
 ### 7.4 Size accounting
 An inline version costs `|k| + zeros(k) + 10` key bytes, plus `1 +` value bytes, plus the cell and slot overhead. The escape's cost is measured: W1's 8-byte keys `i.to_be_bytes()` for `i < 2^20` (`spikes/e1-bench/src/util.rs:67`) always carry five `0x00` bytes, and W1 measured **124.07 B applied per txn** for a 100-byte value. That is 101 value bytes + 10 + 13.07 escaped key bytes (`spikes/e1-bench/README.md` §W1, "(b) B/txn"). The escape cost is accepted as part of X-2's pinned layout; leaf prefix compression is an open mitigation (§19 Q2).
@@ -416,18 +422,24 @@ An inline version costs `|k| + zeros(k) + 10` key bytes, plus `1 +` value bytes,
 
 Every read below runs on one tree. The write set merge (a transaction's own writes) is S-2's (C-T0 v8, I-HALLOWEEN); this section is the committed-data half.
 
+**Provisional heads (C-T0 v8 §2.4, §4).** A group's first entry may be a provisional entry `e` (§7.3 tags 6–8). Every read in §8.1–§8.3 takes from C-T0 a **resolver** for `e`. The resolver returns *ignore* (dead, `Open`, `Aborted`, or the reader's own entry) or *a version at `c`*. It is called **while the leaf holding `e` is still latched** (C-T0 v8 I-PROV-LOOKUP). Then:
+- **Head first.** The head is examined before the group's ordinary entries (I-PROV-READ). A conversion inserts `k@c` before it deletes `e` (C-T0 v8 I-PROV-CONVERT-ORDER), so a reader that finds no `e` finds `k@c`. Mutant ORDINARY-FIRST.
+- **Candidate rule.** If the resolver yields a version at `c`, the read's answer is the newer of `(c, e's data)` and the ordinary answer below. Both may be at `c`, during a conversion; they are then the same version.
+- **Fast path.** When the caller states that no current-epoch provisional entry exists in the tree (C-T0 v8 §4's per-tree count is 0), §8.1 skips the head check and is exactly one descent. Dead entries never affect §8.1 at `S < u64::MAX`, because `seek(k, S)` lands after them.
+- **Provisional data** is decoded like the matching ordinary tag (6 like 0 or 2, 7 like 1 or 3, 8 like 4 or 5, by the flags).
+
 ### 8.1 Point read at S (I-SEEK)
 `get(k, S)`:
 1. descend once to `seek(k, S)`;
 2. take the first entry `e ≥ seek(k, S)`. If the seek lands at the end of a leaf, the cursor stack moves to the next leaf (§6.6);
 3. if `e` does not start with `prefix(k)`: no version of `k` is `≤ S`, so the result is **absent**;
-4. otherwise decode `e`'s value: live → the value (reading the chain for tags 4 and 5); tombstone → **absent**; reserved → XX001.
+4. otherwise decode `e`'s value: live → the value (reading the chain for tags 4 and 5); tombstone → **absent**; reserved → XX001. A provisional head is handled by the rule above, before this step.
 
 There is one descent and no per-version stepping (`engine.rs:238` `version_at`). Mutants: TS-ASC, SEEK-NO-PREFIX-CHECK, TOMBSTONE-AS-VALUE.
 
 ### 8.2 Newest probe (I-NEWEST)
-`newest(k)` = the first entry at or after `seek_newest(k)` that starts with `prefix(k)`, as `(ts, live value | tombstone)`, or none (`engine.rs:266`).
-- **Precondition, owned by S-2.** The caller holds `k`'s lock, and locks are released only after the holder's commit is visible (C-COMMIT-ORDER). Then no apply to `k` is in flight, and the newest entry is the newest committed version.
+`newest(k)` = the first entry at or after `seek_newest(k)` that starts with `prefix(k)`, as `(ts, live value | tombstone)`, or none (`engine.rs:266`). If that entry is provisional, the provisional-head rule applies: `newest(k)` is the newer of its resolved version (if any) and the next entry of the group.
+- **Precondition, owned by S-2.** The caller holds `k`'s lock, and locks are released only after the holder's commit is visible (C-COMMIT-ORDER). Then no apply to `k` is in flight, and the newest entry is the newest committed version. The one exception is a conversion of an already-visible provisional entry, which the head-first rule makes unobservable (C-T0 v8 §5.1).
 - **Who uses it.** S-2's RR conflict rule (40001 iff `ts > S`, checked **after** the lock wait, `engine.rs:430–435`) and its liveness rule (a tombstone is not live, `engine.rs:465`).
 - **GC cannot change the answer.** GC never deletes the newest entry of a group, except a tombstone with nothing older (§10.2). For both rules, that tombstone and no entry give the same answer (`verdicts/X-2.md`, "GC safety holds").
 
@@ -446,6 +458,7 @@ There is one descent and no per-version stepping (`engine.rs:238` `version_at`).
 Using `upper(hi)` for an excluded `hi` is the SCAN-HI-INCL mutant (`verdicts/X-2.md`). Using `prefix(hi)` for an included one drops `hi`'s group.
 
 **Per group:**
+0. apply the provisional-head rule to the group's head;
 1. skip the entries with `ts > S`;
 2. take the first entry with `ts ≤ S`;
 3. continue at `upper(k)`.
@@ -463,11 +476,13 @@ Steps 1 and 3 **should be seeks** (a binary search within the leaf, or a re-desc
 ### 9.1 What apply does
 - Apply turns each write of a commit at `ts = c` into **one entry insert**: `Put` → `entry_key(k, c)` with tag 0, 2, 4 or 5; `Delete` → tag 1 or 3. Each insert is a gated operation.
 - **Order.** A commit inserts its entries in ascending user-key order, tree by tree (`engine.rs:495`).
-- **When.** C-T0 v8 decides when apply runs, and how `visible_ts` and lock release follow it.
+- **When.** C-T0 v8 decides when apply runs, and how `visible_ts` and lock release follow it (C-T0 v8 §3.1). A large transaction does not apply at commit: its provisional entries become readable at its flip, and its finalize converts them (C-T0 v8 §3.2).
 
-**I-ENTRY-UNIQUE / I-REPLAY-IDEM.** Inserting an entry whose key already exists:
-- with **byte-identical** value: a no-op. This happens only in replay (§14);
-- with a **different** value: XX001. Two commits cannot share a ts.
+**I-ENTRY-UNIQUE / I-REPLAY-IDEM.** Inserting an ordinary entry whose key already exists:
+- with an **identical** value: a no-op. This happens only in replay (§14) and in a provisional conversion that another settler already made (C-T0 v8 §2.4). *Identical* means the same tag and the same value bytes. For tags 4 and 5 it means the same `len` and the same chain bytes: the chain is compared, not its LPID. A chain built for the re-insert is then freed in the same gated operation;
+- with a **different** value: XX001. Two commits cannot share a ts. **Exception:** the replay of a chunked transaction's superseded ops (§14).
+
+**Provisional entries** are inserted, replaced and deleted only through C-T0 v8 §2.4: by their owner, or by a settler. Replacing a provisional entry's value is not an I-ENTRY-UNIQUE conflict.
 
 ### 9.2 Failure (I-FAIL-STOP)
 - **No logical failures.** Apply cannot fail logically: key size is checked when the write enters the write set (§3.2), and entries are unique.
@@ -503,6 +518,8 @@ For each user key, with `w` fixed:
 - **keep** every version with `ts > w`;
 - **keep** the newest version with `ts ≤ w`. Exception: when it is a tombstone, **elide** it, provided every older version of the key is deleted, and the tombstone is deleted **last** (I-GC-ORDER). This holds whether or not versions above `w` exist (X-2-F1, correcting the spike's `above_w == 0` condition at `engine.rs:585`). An elided tombstone still counts as the key's newest `≤ w` version, so every older version is deleted and none becomes the kept one;
 - **delete** every older version, freeing its overflow chain in the same gated operation (§6.7).
+
+**Provisional entries are not versions here.** No GC mutation counts, keeps or prunes a provisional entry as a version, or lets one change the carried state of §10.4. A GC mutation may delete a **dead** provisional entry (C-T0 v8 §2.4 (c)). Readers ignore dead entries, so that is read-equivalent. Because `W ≤` the apply frontier (C-T0 v8 §3.5), no conversion ever inserts an entry with `ts ≤ w`, and §10.1's condition 2 holds.
 
 **Two departures from the spike's `gc`:**
 - **The elision condition.** The spike elides only when `above_w == 0` (`engine.rs:585`); this file elides in every case (X-2-F1).
@@ -604,7 +621,7 @@ A-4b catches all three with small-page trees of height ≥ 4, asserting I-SPACE 
 When sweeps run, how often, and with what I/O budget is S-2/B-3's decision (background jobs, C-B1 semantics).
 
 ### 10.5 The image's watermark (`gc_w`)
-- **What it records.** The store keeps `gc_w_used`, the largest `w` it has applied in any GC mutation. At the flip of checkpoint `k`, it records that value as meta `k`'s `gc_w`. While the flip holds the gate, no GC mutation is in flight, so `gc_w` bounds every GC mutation contained in image `k`.
+- **What it records.** The store keeps `gc_w_used`, the largest `w` it has applied in any GC mutation. At open it starts at the recovered meta's `gc_w`, so a checkpoint taken before the first GC mutation (including the boot checkpoint, §14 step 8) still records the image's bound (mutant GCW-NOT-RECORDED). At the flip of checkpoint `k`, it records that value as meta `k`'s `gc_w`. While the flip holds the gate, no GC mutation is in flight, so `gc_w` bounds every GC mutation contained in image `k`.
 - **Bound.** `gc_w ≤ T` always: each `w` was `≤ visible_ts` at its use, and `visible_ts` at the flip is `T`. A violation at meta write is fail-stop.
 - **I-GCW.** Meta `k`'s `gc_w` is `≥` every `w` of a GC mutation in image `k`, and `≤ T`. Mutants:
   - **GCW-NOT-RECORDED:** the meta carries the previous `gc_w` or 0. After a restart, `W` can then start below the image's pruning, and a snapshot in that gap reads a pruned state;
@@ -674,11 +691,12 @@ payload
 ```
 CreateTree{tree_id, kind}   DropTree{tree_id}   Ddl{bytes}        # first within a record (opaque Ddl bytes are catalog-owned)
 Put{tree_id, key, flags, value, before?}                          # flags: key_changed
-Delete{tree_id, key, flags, before?}                              # flags: moved
+Delete{tree_id, key, flags, before?}                              # flags: moved | revert (Chunk only)
 ```
 - **Keys.** `key` is the **user key**, not the entry key. The version entry is formed at apply time with the commit's ts (§9). The WAL therefore carries no LPID, no slot and no N3 detail.
 - **Index entries** are logged explicitly and never re-derived.
 - **`before`** is N14's optional before-image, written when the catalog enables it for the tree.
+- **`revert`** (only in `Chunk` records) means the transaction no longer writes `key`. It cancels the transaction's earlier ops on that key (§12.7, §14).
 - **Bytes.** Card A-6a pins the op encoding and fuzzes it.
 
 ### 12.4 Group commit and order (I-WAL-TS-ORDER)
@@ -706,7 +724,9 @@ At the flip of checkpoint `k`, `wal_start_lsn` is the minimum of:
 A transaction that aborted before the flip does not count, and neither does one whose marker has `commit_ts ≤ T`, which is wholly in the image. After a crash, an open transaction's chunks are ignored, because no marker follows them. **A segment wholly below the durable meta's `wal_start_lsn` may be recycled** (§13 step 6). This is PLAN-v3's chunk rule ("segments holding chunks of a txn whose marker isn't yet below T are never recycled"), stated as a replay-start position.
 
 ### 12.7 Large transactions
-Chunks are written before commit. The commit is the marker, written in ts order (I-WAL-TS-ORDER). Apply follows the group sync. C-T0 v8 owns everything about pre-applying large transactions (§17).
+A transaction is chunked **iff** it is large (C-T0 v8 §2.1). Its `Chunk` records are written before commit, as it materialises its writes (C-T0 v8 §3.2), and the commit is the `CommitMarker`, written in ts order (I-WAL-TS-ORDER).
+- **Supersede.** Within one transaction's chunks, a later op on the same `(tree_id, key)` **supersedes** the earlier one. That happens on a rewrite of the key and on `ROLLBACK TO`. A `Delete{revert}` cancels the key altogether. Replay applies the last op per key (§14). C-T0 v8 I-PROV-WAL keeps every provisional entry equal to its key's last op.
+- **No apply at commit.** A large transaction's data becomes readable at its flip, through its provisional entries, and its finalize converts them into ordinary entries. Until then the apply frontier stays below its commit ts (C-T0 v8 §3.5), so a crash replays it from these chunks.
 
 ### 12.8 Bulk loads (the rule PLAN-v3 §3.3 asks S-1 to pick)
 **S-1 picks: force a checkpoint before the result is published. Page images are not WAL-logged.**
@@ -780,7 +800,7 @@ Pages created or mutated only after the flip are not part of the image.
 **I-CKPT-AT-T.** Image `k` is a consistent cut: every gated operation is wholly before or wholly after the flip. In image `k`:
 - **(a)** every commit with ts `≤ T` is wholly present, up to GC `≤ gc_w`. For every snapshot `S` with `gc_w ≤ S ≤ T`, reads on the image equal reads on the committed state at `T`;
 - **(b)** every entry with ts `> T` belongs to a commit `c > T` whose records are durable when meta `k` is written (step 1), so recovery replays `c` wholly;
-- **(c)** no entry belongs to an uncommitted transaction (N2: trees hold only committed data; §19 Q4 for S-2's provisional entries).
+- **(c)** every ordinary entry belongs to a committed transaction (N2). An image may hold **provisional entries** (§7.3 tags 6–8) of any transaction, committed or not. After recovery every one of them is dead (C-T0 v8 §2.4: its epoch is not the new boot epoch), so none is ever read as data. A committed transaction's data is in the image as ordinary entries if its commit ts is `≤ T` (`T` is the apply frontier, C-T0 v8's `M`), and otherwise it is replayed from its durable chunks (§12.6, §14). Mutant CKPT-T-VISIBLE (`T` taken as `visible_ts`).
 
 **Exception.** The unlogged entries of a §12.8 bulk load in a tree that is **not yet published** are exempt from (a)–(c):
 - they come from no commit;
@@ -805,13 +825,16 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
    - every `Chunk` of a transaction in pass 1's set, at that set's `commit_ts`.
 
    A chunk whose transaction has no marker is ignored. Records with `commit_ts ≤ T` are skipped: they are in the image.
+
+   **Chunk supersede (I-CHUNK-SUPERSEDE).** For a chunked transaction, each op inserts or replaces the entry `key@commit_ts`, and a `Delete{revert}` deletes it if present. So the last op per key wins, whatever the image already holds for that key at that ts. An op that inserts an entry identical to the present one is a no-op. Ops of a `Commit` record keep I-ENTRY-UNIQUE's XX001 for a different value. Mutant SUPERSEDE-AS-CONFLICT: a superseding op is treated as a conflict (XX001).
 5. Truncate the WAL at the valid end.
 6. Resume the walks of every `dropping` directory entry (§6.8), as a B-6 boot job.
 7. Optionally run `amcheck` (A-8).
+8. Run the **boot checkpoint** (§13) before the first transaction starts. Its `ckpt_id` gives C-T0 v8's boot epoch (C-T0 v8 §2.5). Chunks of the previous boot that have no marker belong to transactions aborted before this flip, so they do not hold back `wal_start_lsn` (§12.6).
 
-Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if nothing was replayed. C-T0 v8 restarts its sequencer and watermark from that value and from `gc_w`.
+Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if nothing was replayed. C-T0 v8 restarts its sequencer and watermark from that value and from `gc_w` (C-T0 v8 §3.7). Provisional entries found in the image are dead and are ignored by every read (§8).
 
-**I-REPLAY-IDEM.** Replay is idempotent, so recovering twice, including a crash during recovery, gives the same state. Under (b), every op inserts a uniquely keyed entry (I-ENTRY-UNIQUE). Re-inserting an identical entry is a no-op, so partial applies already in the image (I-CKPT-AT-T (b)) are completed rather than duplicated. CreateTree and DropTree are idempotent (§6.8). The final state is the set union of the entries, independent of insertion order. Pass 2 still runs in LSN order, so tree creation and drop ops come before and after the writes that depend on them. Mutants (one per direction of I-ENTRY-UNIQUE):
+**I-REPLAY-IDEM.** Replay is idempotent, so recovering twice, including a crash during recovery, gives the same state. Under (b), every op inserts a uniquely keyed entry (I-ENTRY-UNIQUE). Re-inserting an identical entry is a no-op, so partial applies already in the image (I-CKPT-AT-T (b)) are completed rather than duplicated. A chunked transaction's superseded ops replace one another in LSN order, so each pass ends with the last op per key (I-CHUNK-SUPERSEDE). CreateTree and DropTree are idempotent (§6.8). The final state is the set union of the entries, independent of insertion order. Pass 2 still runs in LSN order, so tree creation and drop ops come before and after the writes that depend on them. Mutants (one per direction of I-ENTRY-UNIQUE):
 - **REPLAY-DUP-CONFLICT:** an identical re-insert is treated as a conflict (XX001);
 - **DUP-DIFFERENT-ACCEPTED:** a re-insert with a different value is accepted (overwritten or ignored) instead of XX001.
 
@@ -833,7 +856,8 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 |---|---|---|---|
 | I-ENC-ORDER | §7.2: entry-key order = (user key asc, ts desc); `upper(k)` separates groups | A-4a (port X-2's proptest + directed cases) | TS-ASC, ESCAPE-OFF |
 | I-ENC-ROUNDTRIP | §7.2–7.3: decode∘encode = id; undecodable → XX001, never a panic | A-4a, fuzz | TOMBSTONE-AS-VALUE, DECODE-PANIC |
-| I-TAG-RESERVED | §7.3: reserved tags and ts suffixes 0/MAX → XX001 on every read path | A-4e | RESERVED-AS-VALUE |
+| I-TAG-RESERVED | §7.3: reserved tags (9–255), suffix 0, an ordinary tag with suffix MAX and a provisional tag without it → XX001 on every read path | A-4e | RESERVED-AS-VALUE |
+| I-PROV-READ | §8: provisional head first, resolver called under the leaf latch, candidate rule; dead entries never served | B-1d (C-T0 v8 §11.2 owns the txn side) | ORDINARY-FIRST, DEAD-AS-LIVE |
 | I-SEEK | §8.1: one descent; newest version ≤ S; prefix-checked | A-4e | TS-ASC, SEEK-NO-PREFIX-CHECK |
 | I-NEWEST | §8.2: newest entry of the group, ts and liveness | B-1c | NEWEST-SKIPS-TOMB, UNIQUE-TOMB-LIVE |
 | I-SCAN | §8.3: bounds table; one version per key; tombstones omitted; streaming | A-4e | SCAN-NO-SKIP, SCAN-HI-INCL, SCAN-TOMB-EMIT |
@@ -842,7 +866,8 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-LATCH | §5.3/§6.2: coupling and (depth, left-to-right) order | A-4c (loom/shuttle) | COUPLING-EARLY-RELEASE, PACK-RIGHT-FIRST |
 | I-ROOT-STABLE | §6.3: a tree's root LPID never changes | A-4a/A-4b (reopen test) | ROOT-MOVES |
 | I-PACK | §6.5: entries preserved; merge iff it fits in `F_PACK·U`; never splits | A-4b | PACK-DROP-LAST, PACK-OVERFILL |
-| I-ENTRY-UNIQUE / I-REPLAY-IDEM | §9.1, §14: identical re-insert is a no-op, a different one XX001; recovering twice gives the same state | B-1c, A-7d (incl. the double-crash test) | REPLAY-DUP-CONFLICT, DUP-DIFFERENT-ACCEPTED |
+| I-ENTRY-UNIQUE / I-REPLAY-IDEM | §9.1, §14: identical re-insert (chains compared by content) is a no-op, a different one XX001; recovering twice gives the same state | B-1c, A-7d (incl. the double-crash test; an overflow value in a partially applied commit) | REPLAY-DUP-CONFLICT, DUP-DIFFERENT-ACCEPTED, CHAIN-LPID-COMPARED |
+| I-CHUNK-SUPERSEDE | §12.7, §14: within one chunked transaction the last op per key wins, `revert` deletes; replay twice gives the same state | A-7d, B-1d | SUPERSEDE-AS-CONFLICT |
 | I-KEY-SIZE | §3.2: an entry key over `K_MAX` is refused with 54000 at write-set entry; apply never sees one | A-2 (formula and values), B-1a (the write path calls the check) | SIZE-CHECK-OFF |
 | I-FAIL-STOP | §9.2: no mutation after a poisoning error | B-1c, A-3c | POISON-IGNORED |
 | I-GC-READEQ | §10.2: every GC mutation is read-equivalent at every S ≥ the published W | B-3 (+ G0 re-point, B-7) | GC-DROPS-VISIBLE, G-WATERMARK+1, G-RESURRECT |
@@ -858,7 +883,7 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-FREE-SAFE | §4.4/§13 step 6: no reuse before the freeing meta is synced | A-3c, A-7c | FREE-EARLY |
 | I-FREE-EXACT | §4.3: the persisted bitmaps are exact | A-7b, A-8 | BITMAP-OMITS-FREESET-PAGES |
 | I-META-ATOMIC | §13: a meta never points at unwritten pages | A-7c (crash between every step) | META-BEFORE-SYNC |
-| I-CKPT-AT-T | §13: the image is a consistent cut; (a)–(c) | A-7a/A-7c (splits and packs during a checkpoint; async mix) | FLIP-NO-GATE, WAL-SYNC-T-ONLY |
+| I-CKPT-AT-T | §13: the image is a consistent cut; (a)–(c), with `T` = the apply frontier `M` | A-7a/A-7c (splits and packs during a checkpoint; async mix), B-1d (a checkpoint during a finalize) | FLIP-NO-GATE, WAL-SYNC-T-ONLY, CKPT-T-VISIBLE |
 | I-REDO-COMPLETE | §14: every acked sync commit is in the image or replayed | A-6d, A-7d | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK |
 | I-WAL-STALE | §12.5: the reader stops at the first bad magic/CRC, wrong `lsn` or over-long `len`; recovery truncates there | A-6b | LSN-CHECK-SKIP |
 | I-WAL-TS-ORDER | §12.4: commit_ts strictly increases with LSN | A-6c, B-1c | TS-AFTER-APPEND |
@@ -898,9 +923,9 @@ All numbers are from n5000 (i5-13500H, 16 CPUs), rustc 1.99.0, in memory, median
 - **The write set and lock table:** own-write merge (I-HALLOWEEN), escalation, NOWAIT/SKIP LOCKED.
 - **The write-side rules:** the RR check after the lock wait, unique checks and ON CONFLICT, using §8.2.
 - **Commit-visibility semantics.** The commit ack waits for `visible_ts ≥ c` or a session floor (decision block, "Commit visibility").
-- **Pre-applying large transactions** as transaction-tagged provisional entries (decision block, "Large-txn head-of-line"). This file only **reserves** encoding space: tags 6–255 and ts `u64::MAX` (§7.1, §7.3, §19 Q4). Any use of that space, and how images and recovery treat provisional entries (I-CKPT-AT-T (c)), is an edit of this file made with S-2.
-- **Lock release at commit cheaper than O(keys)** (325k–437k probes slipped through the release tail in W6).
-- **Unrelated commits stalled** behind a big apply by the ts-ordered `visible_ts` advance.
+- **Pre-applying large transactions** as transaction-tagged provisional entries (decision block, "Large-txn head-of-line"). Specified in C-T0 v8 §2.4 and §3.2. This file holds the encoding (§7.1, §7.3 tags 6–8), the read rule (§8), chunk supersede (§12.7, §14) and the image rule (I-CKPT-AT-T (c)), from the S-2 co-edit.
+- **Lock release at commit cheaper than O(keys)** (325k–437k probes slipped through the release tail in W6): C-T0 v8 §3.3.
+- **Unrelated commits stalled** behind a big apply by the ts-ordered `visible_ts` advance: C-T0 v8 §3.1–§3.2.
 - **SSI** without intents.
 - **GC policy:** when sweeps run, their budgets, and DDL retirement timing (C-T0 v7.8 §9.2–9.3).
 - **Bounds on disk growth under long readers.** Whether on-disk version growth under long readers needs a bound is S-2/B-3's call (decision block, ruling R2 "Not R-1's call"). This file only guarantees that the growth costs disk, not RAM (§5.5).
@@ -915,7 +940,7 @@ All numbers are from n5000 (i5-13500H, 16 CPUs), rustc 1.99.0, in memory, median
 
 ## 18. Refinements of PLAN-v3 §3.3
 
-This file wins over the plan (precedence above). The plan should be updated through an Opus card to match these. R10 refines the §4 decision block rather than §3.3:
+This file wins over the plan (precedence above). The plan should be updated through an Opus card to match these. R10 refines the §4 decision block rather than §3.3. R11 comes from the S-2 co-edit:
 
 | # | Plan text | Here | Why |
 |---|---|---|---|
@@ -929,6 +954,7 @@ This file wins over the plan (precedence above). The plan should be updated thro
 | R8 | "split and merge" (no merge rule) | The pack step with `F_PACK = 0.85`, driven by the GC sweep (§6.5, §10.4); I-SPACE (§11) | The decision block requires GC to return space; B-3's 1.5× acceptance |
 | R9 | §3.4 GC "prunes versions below the watermark during page writes and splits" | Page-local prune (required at splits, optional at eviction) **plus** a whole-tree sweep (§10.3–10.4) | Page-local pruning cannot see groups that span leaves, so alone it cannot meet I-GC-COMPLETE or B-3's bound |
 | R10 | §4 decision block, "Space amplification": "after-GC tree bytes" (undefined) | Tree bytes = reachable pages × `page_size` (§11) | The file never shrinks (§4.5), so a file-length or allocated-page reading stays at the post-update peak and B-3 could never pass |
+| R11 | Step 0: "T = the apply frontier (every commit ≤ T is fully applied to the trees; under N2, trees hold only committed data)" | `T` = C-T0 v8's `M`; trees may also hold provisional entries, which are never data after recovery (§1, §13 (c)) | X-4 fired the pre-apply trigger; C-T0 v8 §3.2 |
 
 ---
 
@@ -938,7 +964,7 @@ This file wins over the plan (precedence above). The plan should be updated thro
 1. **File shrinking.** GC returns space to the free set, not to the filesystem (§4.5). Trigger for a tail-truncation step (at step 6, of free tail slots only) or an offline compaction: a browser quota (E6/D-5) or a user report of a file that does not shrink after a mass delete.
 2. **Leaf prefix compression within groups.** Every version repeats its full escaped key, so a 10-version group of W1-sized keys spends about 117 B on repeated key bytes. A-4d covers inner nodes only. Trigger: NBench space rows, or I-SPACE met but B-3's bytes measured close to 1.5×.
 3. **Optimistic latches and pointer swizzling** (N8/N9): only on the E0/E7 triggers (PLAN-v3 §3.12).
-4. **Provisional entries.** Reserved space only (§7.1, §7.3, §17). S-2 must specify their key placement (ts `u64::MAX` sorts first in a group, like v7.8's intent), their value tag, how §8 reads treat them, and I-CKPT-AT-T (c) for images that contain them.
+4. ~~**Provisional entries.**~~ Closed by the S-2 co-edit: §7.1, §7.3 tags 6–8, §8, §12.7, I-CKPT-AT-T (c), §14 (C-T0 v8 §2.4).
 5. **PITR and replicas across a §12.8 bulk load** (D-6).
 6. **Resumable overflow-chain free** if A-5 measures the flip hold as too long (§6.7).
 
@@ -951,6 +977,13 @@ This file wins over the plan (precedence above). The plan should be updated thro
 
 ## Changelog
 
+- **S-2 co-edit** (2026-10-23, card S-2, with C-T0 v8 draft 8.0):
+  - **Provisional entries.** Tags 6–8 at suffix `u64::MAX` (§7.1, §7.3); I-TAG-RESERVED restated; the provisional-head read rule and I-PROV-READ (§8); provisional entries are not versions to GC, and dead ones may be deleted (§10.2); the conversion's chain transfer (§6.7, §6.5).
+  - **Apply frontier.** Now C-T0 v8's `M` (§1). I-CKPT-AT-T (c) covers images that hold provisional entries (§13).
+  - **WAL.** Chunked ⇔ large; chunk supersede and `Delete{revert}` (§12.3, §12.7); I-CHUNK-SUPERSEDE in replay (§14).
+  - **Boot.** The boot checkpoint (§14 step 8); `gc_w_used` starts at the recovered `gc_w` (§10.5).
+  - **I-ENTRY-UNIQUE.** "Identical" compares overflow chains by content, not LPID (§9.1; mutant CHAIN-LPID-COMPARED). Before this, a replayed commit with a large value that was partly applied in the image would have hit XX001.
+  - §17 and §19 Q4 updated.
 - **Draft 3** (2026-10-23, card S-1-F1, per `verdicts/S-1.md` MERGE-WITH-FOLLOWUPS):
   - **Sweep cascade (F1 item 1).** In the sweep, an inner page packs only with its right neighbour, and a rightmost child is exempt. `finish` recurses to every ancestor whose subtree has ended, and a junction walk re-checks the pages that stop being rightmost children (§10.4 step 5, §6.5, §11). New mutants: SWEEP-PACK-LEFT, CASCADE-ONE-LEVEL and JUNCTION-SKIP (§15 I-SPACE).
   - **Bulk-load pin (F1 item 2).** S-3 registers `R` before it picks `S > R`. The section records ruling 1's reasoning for having no mutant (§10.1, §17).
