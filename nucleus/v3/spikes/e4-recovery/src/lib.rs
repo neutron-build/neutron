@@ -23,5 +23,7 @@
 
 pub mod campaign;
 pub mod crc;
+pub mod model;
+pub mod oracle;
 pub mod rng;
 pub mod sim;
