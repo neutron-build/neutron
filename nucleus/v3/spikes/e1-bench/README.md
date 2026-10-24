@@ -228,6 +228,12 @@ larger preallocated pool (+512 MiB on (b), +512 MiB on (c)).
 | (b) | 0 / 3,000,000 | 536,436,736 | 1,874 MiB | true | 2,531 / 4,182 |
 | (c) | 290,000,000 (64 MiB in memory + 226 MiB spilled) | 274,546,688 | 1,594 MiB | true | 2,905 / 6,330 |
 
+Arm (c)'s peak-RSS cell is this campaign's median; the measured
+spread across the campaign and the X-1b gate's re-run of W5 is
+**1,592–1,770 MiB** — the gate's median was 1,728 MiB (+8%), its runs
+2 and 3 at 1,770 MiB. The raw `--out` JSONs were never committed;
+verdict `X-1b` is the record.
+
 Both long readers stayed alive and read their original values; (c) was
 never aborted (no snapshot-too-old exists in the arm), and its
 in-memory undo stayed at the configured 64 MiB budget with the spill

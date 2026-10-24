@@ -1,6 +1,6 @@
 # S-STORE: Storage layer (normative)
 
-Status: draft 2 + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
 
 **Scope.** This file covers:
 - the file, the pages, the page map, the free set and the buffer manager;
@@ -299,8 +299,10 @@ A leaf that cannot take an insert first runs the **page-local prune** (§10.3). 
 
 With `F_PACK = 0.85`, the step does one of three things:
 1. **Merge.** If `used(L) + used(R) ≤ F_PACK·U` (for inner pages, plus the cell of the separator between them, which is pulled down into `L` first), move all of `R`'s cells into `L`. Remove `R`'s separator and child pointer from `P`, then free `R`'s LPID (§4.2). A merge only shrinks `P`, so it can always run.
-2. **Redistribute.** Otherwise, if `R`'s first cell fits in `L` with `used(L)` staying `≤ F_PACK·U`, move the **longest prefix** of `R`'s cells that keeps `used(L) ≤ F_PACK·U`. Replace the separator in `P` with a new shortest separator. For inner pages, rotate through `P`.
-3. **Full.** Otherwise, do nothing: `L` already holds more than `F_PACK·U − C_max` (§11).
+2. **Redistribute.** Otherwise, if the **first cell that would enter `L`** fits with `used(L)` staying `≤ F_PACK·U`, move the **longest prefix** that keeps `used(L) ≤ F_PACK·U`.
+   - **Leaves.** The cell that enters `L` is `R`'s first cell, and the move is a prefix of `R`'s cells. Replace the separator in `P` with a new shortest separator.
+   - **Inner pages (a rotation through `P`).** The cell that enters `L` is **`P`'s separator** between `L` and `R`, not `R`'s first cell. It comes down with `R`'s first child pointer. Moving `k` children brings down `P`'s separator and `R`'s first `k − 1` separators, together with `R`'s first `k` child pointers. `R`'s `k`-th separator rises into `P` in its place. The fits test is on `P`'s separator.
+3. **Full.** Otherwise, do nothing. The cell that would enter `L` first (`R`'s first cell for a leaf, `P`'s separator for an inner page) is at most `C_max` and does not fit, so `L` already holds more than `F_PACK·U − C_max` (§11).
 
 **Parent-overflow skip.** A redistribute whose new separator is longer than the old one by more than `P`'s free space is **skipped** instead, and nothing changes. A pack step never splits. The caller counts the skip (the sweep reports it, §10.4), and I-SPACE excludes the skipped `L` (§11). The next sweep retries it. A skip needs `P` within one separator's growth of full, so it is rare once merges have removed separators from `P`. Mutant: SKIP-UNCOUNTED, a skip left out of the count. It is caught by forcing a skip (a nearly full parent and long separators) and asserting I-SPACE with the reported count.
 
@@ -312,7 +314,7 @@ With `F_PACK = 0.85`, the step does one of three things:
 - **The GC sweep** packs systematically, left to right (§10.4).
 - **A delete that descends from the root under latch coupling** (a directory removal) may pack the affected leaf with its right neighbour, or its left neighbour if it is the rightmost child, when `used < U/4`, while it still holds the parent. The two leaves are latched left to right: to pack with the left neighbour, it releases the leaf and, still holding the parent exclusively, latches the neighbour and then the leaf.
 - **A delete made while holding only a leaf** (the page-local prune, §10.3, including at eviction) never packs. Taking the parent's latch from below would break I-LATCH. It leaves the page for the next sweep.
-- **Inner pages** whose `used` falls below `U/4` after a pack removed a child are packed the same way under their parent, by a **re-descent** that latches the parent first. Nothing ever latches a parent after its child (I-LATCH).
+- **Inner pages** whose `used` falls below `U/4` after a pack removed a child are packed under their parent, by a **re-descent** that latches the parent first. Nothing ever latches a parent after its child (I-LATCH). After a delete, they pack the same way as the leaf (the right neighbour, or the left one for a rightmost child). **The sweep uses its own rule instead** (§10.4 step 5): an inner page packs only with its right neighbour, and a junction walk follows. A left pack would make the left neighbour's former last child, which was exempt and may be underfull, a middle child beside a page the sweep has already passed, and nothing would pack the two again, so I-SPACE would fail (§11).
 - **The root** collapses when it is an inner page with one child (§6.3).
 
 Under N3 = (b), **logical deletes are tombstone inserts** (§7). Only GC, DropTree, overflow freeing and provisional-entry settling (C-T0 v8 §2.4) ever remove entries or pages.
@@ -498,7 +500,18 @@ A GC mutation on a tree with watermark `w` requires two things:
 1. `w ≤` the watermark C-T0 v8 published at the time of the mutation;
 2. **every insert of an entry with `ts ≤ w` into that tree has finished.**
 
-Condition 2 holds for apply, because `w ≤ visible_ts` and applies of later commits carry ts `> visible_ts`. It must also hold for bulk loads, which write entries at a ts `S` (§12.8). Registering `S` itself is not enough, because it gives only `W ≤ S`, and a GC at `w = S` could then run beside the load's unfinished inserts at `S`. So for the whole load, S-3 keeps a snapshot registered at **`S − 1`**, which gives `W ≤ S − 1 < S`. Under these conditions, **the set of entries with `ts ≤ w` changes only through GC**, which is what makes carrying state across leaves sound (§10.4).
+Condition 2 holds for apply, because `w ≤ visible_ts` and applies of later commits carry ts `> visible_ts`. It must also hold for bulk loads, which write entries at a ts `S` (§12.8). Registering `S` itself is not enough, because it gives only `W ≤ S`, and a GC at `w = S` could then run beside the load's unfinished inserts at `S`. So for the whole load, S-3 keeps a snapshot registered below `S`, which gives `W < S`.
+
+**The registration comes before `S` is chosen.** `W` is monotonic (§1), and it equals `visible_ts` when no older snapshot is registered. So `W` may already be `S` when `S` is picked, and a registration at `S − 1` made after that cannot hold `W` down. S-3 therefore:
+1. registers a snapshot at some `R` (normally the current `visible_ts`), which holds `W ≤ R` from then on;
+2. picks the load's `S > R`, for example `S = R + 1` once `visible_ts > R`;
+3. keeps `R` registered until the load's last insert has finished.
+
+That gives `W ≤ R ≤ S − 1 < S` for the whole load.
+
+**No mutant for this condition (S-1 gate, ruling 1).** The load writes only live entries, all at `S`, into an unpublished tree. Suppose a GC with `w = S` races those inserts. Each loaded entry lands either behind the sweep's position, where it is newer than everything that GC kept, or ahead of it, where it is the newest `≤ w` and is kept. The worst outcome is under-pruning, and no read at any `S' ≥ W` changes. A mutant that registers `S` instead of `R` is therefore unobservable without a new hook. Condition 2 stays as a formal precondition, because it is what the proof of §10.4's carried state uses.
+
+Under these conditions, **the set of entries with `ts ≤ w` changes only through GC**, which is what makes carrying state across leaves sound (§10.4).
 
 ### 10.2 The rule
 For each user key, with `w` fixed:
@@ -568,14 +581,38 @@ The page-local prune is incomplete by design: a group that spans leaves keeps it
 4. **Pack.** If `R` exists, run `pack(P, L, R)` (§6.5), and add any parent-overflow skip to the token's count. This is how GC returns pages.
 5. **Advance.**
    - **If `R` existed,** the resume position becomes "after `R`'s last entry key". The pack preserves entries, so the next descent lands on the page that now holds that key (the merged `L`, or `R`), and the sweep packs that page with its right sibling.
-   - **If `L` was `P`'s rightmost child,** `P`'s children are done. First the sweep runs the cascade:
-     - if `P` is a non-root inner page with `used < U/4`, pack it with its neighbour under its own parent, by a fresh descent that latches the parent first (§6.5);
-     - collapse the root if it has one child (§6.3).
+   - **If `L` was `P`'s rightmost child,** `P`'s children are done, and the sweep runs the **cascade** `finish(P)` before it moves on.
+     - **Addressing.** Let `x` be `L`'s last entry key, and count levels from the leaves (a leaf is level 1). Each page of the cascade is addressed by `x` and its level: the page at that level on the path to `x`, or that page's right sibling.
+     - **Latching.** Each pack is its own gated operation, reached by a fresh descent toward `x` that latches the parent first (§6.5).
+
+     `finish(X)` runs on an inner page `X` whose children are all done:
+     1. **Root.** If `X` is the root, collapse it while it is an inner page with one child (§6.3). Stop.
+     2. **Rightmost child: go up.** If `X` is its parent `G`'s rightmost child, `X` is exempt (§11). `G`'s children are now done too, so run `finish(G)`.
+     3. **Otherwise, pack right.** If `used(X) < U/4`, run `pack(G, X, X_r)`, where `X_r` is `X`'s **right** neighbour (never its left one, §6.5), and add any skip to the token's count. If the pack moved cells from `X_r` into `X` (a merge or a redistribute), run the **junction walk** from `X`. Then stop: `X_r`'s children, or what is left of them, are not done, so `G`'s children are not done either.
+   - **The junction walk** from an inner page `X` that has just gained cells from its right neighbour.
+     - **The problem.** `X`'s former rightmost child `c` is now a middle child, and its new right sibling `c_r` came from the neighbour and has not been swept. `c` was exempt as a rightmost child, so it may be underfull.
+     - If `c` is the leaf `L`, stop. The leaf step that follows packs `L` with `c_r` (see below).
+     - If `c` is an inner page with `used(c) < U/4`, run `pack(X, c, c_r)` and count any skip. If that pack moved cells into `c`, continue the walk from `c`, one level down.
+     - Otherwise, stop. `c`'s own rightmost child has not moved, so it is still exempt.
    - **After the cascade,** the next step depends on `L`:
-     - if `L` now has a right sibling under its parent (`P` merged with its right neighbour), the position stays "after `L`'s last entry key", so the next step packs `L` with that sibling;
+     - if `L` now has a right sibling under its parent (the junction walk reached `L`), the position stays "after `x`", so the next step packs `L` with that sibling;
      - otherwise the position becomes "from `f`".
 
-     The token records that this parent's cascade has run, so a resumed sweep does not repeat it.
+     The token records the cascade's progress (`x`, the current level, and whether a junction walk is under way), so a resumed sweep continues the cascade instead of starting it again. Each check reads the current pages, so a repeated check would only cost work.
+
+**Why the cascade reaches every page, at every height.**
+- **Only unswept pages shrink.** In every pack, the right page has not yet been swept. Left pages and parents only grow, except a parent whose own `finish` is still to come. So a page the sweep has passed never drops below its clause again.
+- **Exemptions are re-checked.** A passed page loses its rightmost-child exemption only when its parent gains cells from the right. That is exactly the junction walk, which re-checks the page.
+- **Every inner page is finished after its last change.** Step 2 recurses through rightmost children, so `finish` reaches every ancestor whose subtree has just ended, not only `L`'s parent. A page that gains unswept children from a merge or redistribute runs `finish` again when those children are done.
+
+At the end of a complete sweep, therefore, every non-root inner page has been checked against `U/4` after its last change, and every leaf has been packed with its final right sibling. Both I-SPACE clauses then hold at every height (§11).
+
+Mutants:
+- **SWEEP-PACK-LEFT:** the sweep packs a rightmost-child inner page with its left neighbour. The leaf clause then fails at the junction.
+- **CASCADE-ONE-LEVEL:** the cascade checks only `L`'s parent, so step 2 does not recurse. The inner clause then fails at height ≥ 4.
+- **JUNCTION-SKIP:** no junction walk after an inner pack. The inner clause then fails at height ≥ 4.
+
+A-4b catches all three with small-page trees of height ≥ 4, asserting I-SPACE after a complete sweep.
 
 **Sweep report.** A complete sweep returns `done` together with its count of parent-overflow skips, which I-SPACE and B-3 read (§11).
 
@@ -603,7 +640,7 @@ The decision block requires that GC actually return space. "S-1/A-4b's merge and
 
 **I-SPACE (quiescent).** Take a complete sweep (§10.4) of a tree with `w` fixed and no concurrent inserts, which reports `skips` parent-overflow skips (§6.5). After it:
 - **leaves:** every leaf has `used > F_PACK·U − C_max`, where `C_max` is the largest cell in the tree, with two exceptions: the rightmost child of each inner page, and the at most `skips` leaves whose pack step was skipped. A pack step leaves `L` short of that only by merging, and `L` then takes part in the next step;
-- **inner pages:** no non-root inner page has `used < U/4`, except the rightmost child of each inner page and the at most `skips` pages whose pack was skipped;
+- **inner pages:** no non-root inner page has `used < U/4`, except the rightmost child of each inner page and the at most `skips` pages whose pack was skipped. This holds at every tree height: the sweep's cascade recurses to every ancestor, and its junction walk re-checks a page that has stopped being a rightmost child (§10.4 step 5);
 - **root:** the root is a leaf, or has at least 2 children;
 - **LPIDs:** every LPID removed from the tree is freed (I-LPID-EXACT).
 
@@ -732,7 +769,19 @@ At most one checkpoint runs at a time. Its triggers (WAL bytes, dirty volume, ti
 - then the epoch-`k` MapLeaf and MapInner pages that changed since image `k−1`, written copy-on-write up to the root;
 - then the free set **last**: allocate the slots for the FreeSet pages first (growing the file first if needed), then serialise both bitmaps of image `k`, with those slots marked used (I-FREE-EXACT).
   - **Sizing.** The bitmap size depends only on `slot_count` and `next_lpid`. If allocating the FreeSet slots grows the file, `slot_count` changes, so the checkpointer recomputes the number of FreeSet pages after the growth and allocates the difference.
-  - **Convergence.** This needs at most one growth. A growth adds `g ≥ 16` slots (§4.5: 1 MiB at the largest page size). Covering `g` more slots needs at most `⌈g / (8·(page_size − 24))⌉` more FreeSetLeaf pages plus one page per radix level, which is fewer than `g`, so they fit in the new slots. Growth does not change `next_lpid`, because FreeSet pages are physically addressed.
+  - **Convergence: the condition.** Say the original allocation needs `n` FreeSet pages but finds only `f < n` free slots.
+    - The growth adds `g ≥ 16` slots (§4.5: 1 MiB at the largest page size).
+    - The rest of the original allocation, `r = n − f` pages, lands in those new slots.
+    - Covering the `g` new slots needs `extra` more pages: at most `⌈g / (8·(page_size − 24))⌉` FreeSetLeaf pages plus one page per radix level. These must land in the new slots too.
+
+    One growth is therefore enough exactly when **`r + extra ≤ g`**. `extra < g` alone is not enough.
+  - **Convergence: why it holds.** `r ≤ n`, the whole FreeSet:
+    - while the file is at most 16 MiB, `g` is at its 1 MiB floor and the FreeSet is a handful of pages;
+    - above that, `g = file_len / 16` slots, while the FreeSet is about `(slot_count + next_lpid) / (8·(page_size − 24))` pages, under 1/30,000 of that sum even at 4 KiB, the smallest page size.
+
+    So `n + extra ≤ g` unless `next_lpid` exceeds `slot_count` by orders of magnitude.
+  - **Convergence: the check.** The checkpointer still checks `r + extra ≤ g` after the growth. If the check fails, it grows again and repeats the check. Each further growth places at least `g − extra > 0` of the outstanding pages, so the repetition ends.
+  - Growth does not change `next_lpid`, because FreeSet pages are physically addressed.
 
 Pages created or mutated only after the flip are not part of the image.
 
@@ -825,7 +874,7 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-GC-ORDER | §10.2/§10.4: an elided tombstone is deleted after every older version of its key | B-3 (a group spanning leaves, read between sweep steps or across a checkpoint and crash) | G-TOMB-FIRST |
 | I-GC-COMPLETE | §10.2: after a quiescent sweep, at most one version ≤ w per key, and it is live | B-3 (the §10.2 directed test, with a reader) | GC-KEEPS-TOMB |
 | I-GC-LOCAL | §10.3: page-local prune acts only on what the leaf proves | B-3 | PRUNE-FIRST-ENTRY |
-| I-SPACE | §11: quiescent fill bound, except rightmost children and the reported `skips`; B-3's W4-shape acceptance ≤ 1.5× in tree bytes (reachable pages × `page_size`) | A-4b (bound), B-3 (acceptance) | PACK-OFF, SKIP-UNCOUNTED |
+| I-SPACE | §11: quiescent fill bound at every height, except rightmost children and the reported `skips`; B-3's W4-shape acceptance ≤ 1.5× in tree bytes (reachable pages × `page_size`) | A-4b (bound, incl. trees of height ≥ 4), B-3 (acceptance) | PACK-OFF, SKIP-UNCOUNTED, SWEEP-PACK-LEFT, CASCADE-ONE-LEVEL, JUNCTION-SKIP |
 | I-GCW | §10.5: meta `gc_w` bounds the image's GC and is `≤ T` | A-7c, B-3 (restart floor) | GCW-NOT-RECORDED, GCW-BOUND-SKIP |
 | I-LPID-EXACT | §6.8: mapped LPIDs = reachable pages; no leak on pack, drop or chain free | A-8 amcheck, A-4b, B-6 | LEAK-ON-PACK, DROP-ROOT-FIRST |
 | I-POOL-BOUND | §5.1/§5.5: the pool never grows; a dirty set of 4× the pool completes | A-3b/A-3c (E4 shape) | POOL-GROW, EVICT-SKIP-DIRTY |
@@ -881,7 +930,7 @@ All numbers are from n5000 (i5-13500H, 16 CPUs), rustc 1.99.0, in memory, median
 - **GC policy:** when sweeps run, their budgets, and DDL retirement timing (C-T0 v7.8 §9.2–9.3).
 - **Bounds on disk growth under long readers.** Whether on-disk version growth under long readers needs a bound is S-2/B-3's call (decision block, ruling R2 "Not R-1's call"). This file only guarantees that the growth costs disk, not RAM (§5.5).
 
-**S-3 owns:** the row format, TOAST semantics over §6.7's chains, and the online index build's steps under the §12.8 rule. That includes keeping a snapshot registered at `S − 1` for the whole load (§10.1), and how an unfinished build is restarted.
+**S-3 owns:** the row format, TOAST semantics over §6.7's chains, and the online index build's steps under the §12.8 rule. That includes registering a snapshot at `R` **before** picking the load's `S > R` and keeping it registered for the whole load (§10.1), and how an unfinished build is restarted. S-3 should also record §10.1's reasoning for why this condition has no mutant.
 
 **R-1 owns:** the numeric budgets per mode, `F`, `R_EPOCH`, and the per-consumer accounting of §5.7.
 
@@ -935,6 +984,11 @@ This file wins over the plan (precedence above). The plan should be updated thro
   - **Boot.** The boot checkpoint (§14 step 8); `gc_w_used` starts at the recovered `gc_w` (§10.5).
   - **I-ENTRY-UNIQUE.** "Identical" compares overflow chains by content, not LPID (§9.1; mutant CHAIN-LPID-COMPARED). Before this, a replayed commit with a large value that was partly applied in the image would have hit XX001.
   - §17 and §19 Q4 updated.
+- **Draft 3** (2026-10-23, card S-1-F1, per `verdicts/S-1.md` MERGE-WITH-FOLLOWUPS):
+  - **Sweep cascade (F1 item 1).** In the sweep, an inner page packs only with its right neighbour, and a rightmost child is exempt. `finish` recurses to every ancestor whose subtree has ended, and a junction walk re-checks the pages that stop being rightmost children (§10.4 step 5, §6.5, §11). New mutants: SWEEP-PACK-LEFT, CASCADE-ONE-LEVEL and JUNCTION-SKIP (§15 I-SPACE).
+  - **Bulk-load pin (F1 item 2).** S-3 registers `R` before it picks `S > R`. The section records ruling 1's reasoning for having no mutant (§10.1, §17).
+  - **FreeSet convergence (F1 item 3).** The condition is `r + extra ≤ g`, with a re-check (§13 step 2).
+  - **Inner redistribute (F1 item 4).** The cell that enters `L` is `P`'s separator. The fits test and the Full claim use it (§6.5).
 - **Draft 2** (2026-10-23, card S-1 rework, per `verdicts/S-1.md` REWORK):
   - **Replay start (R-1).** §12.6 counts every chunked transaction whose marker is not yet below `T`; mutant START-LSN-MARKED-CHUNK.
   - **Tree bytes (R-2).** Defined as reachable pages × `page_size` (§11, §19 T2, §18 R10).
