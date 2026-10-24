@@ -971,7 +971,7 @@ fn misdirected_landing_slot_is_a_fault_target() {
         kind: MediaKind::Misdirected { to_off: 5 * 4096 },
     };
     // The mapping itself: both the source and the landing slot.
-    let targets = FaultTargets::collect(&[fault.clone()], 0);
+    let targets = FaultTargets::collect(std::slice::from_ref(&fault), 0);
     assert!(targets.page_slots.contains(&3), "the source slot targets");
     assert!(
         targets.page_slots.contains(&5),
