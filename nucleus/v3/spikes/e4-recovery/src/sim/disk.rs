@@ -38,11 +38,14 @@
 //! starts before the read's offset still counts (a read that begins
 //! mid-batch is judged over its whole extent; gate REWORK item 1). The
 //! store calls [`SimDisk::accepted`] exactly where it accepts bytes as
-//! valid; an accepted range that was tainted at read time — judged
-//! against the most recent read that covers it, at sub-range granularity
-//! (gate REWORK item 2) — is a served corruption (O-3 failure). Bytes
-//! never issued to cannot be tainted (nothing to differ from); §3.3
-//! still rejects stray bytes there because they cannot match a reference.
+//! valid; an accepted range that was tainted at read time — judged per
+//! accepted byte against the most recent read that covers that byte, at
+//! sub-range granularity (gate REWORK item 2 and round 2, item B) — is a
+//! served corruption (O-3 failure), and accepted bytes no read ever
+//! covered fail closed the same way (accepted unread: a harness or store
+//! defect, never an open pass). Bytes never issued to cannot be tainted
+//! (nothing to differ from); §3.3 still rejects stray bytes there
+//! because they cannot match a reference.
 //!
 //! Determinism: iteration is over `BTreeMap`s only; every random draw
 //! comes from the caller's [`Rng`] streams.
@@ -366,6 +369,11 @@ pub struct SimDisk {
     /// Served corruptions this round: accepted ranges tainted at read time
     /// (O-3 (a)).
     pub served: Vec<(FileId, u64, u64)>,
+    /// Accepts whose range (partly) no read of this round covered (gate
+    /// REWORK round 2, item B): the store accepted bytes it never read —
+    /// a harness or store defect. Each is also recorded in `served`, so
+    /// O-3 (a) fails the round; this list exists for diagnosis.
+    pub uncovered_accepts: Vec<(FileId, u64, u64)>,
     /// Media faults applied so far (all rounds).
     pub media: Vec<MediaFault>,
     /// Disk events this round (for the model and the monitors).
@@ -606,20 +614,68 @@ impl SimDisk {
     /// accepts bytes as valid — a page passing §3.3, the meta chosen at
     /// open, page 0, a WAL record the reader yields. A served corruption
     /// is recorded when the accepted range was tainted at read time,
-    /// judged against the **most recent read that covers it**: the store
-    /// reads in batches (e.g. 16 KiB of WAL) and accepts one record
-    /// inside, so matching only a read of exactly `(off, len)` could
-    /// never fire, and scanning every earlier read would judge stale
-    /// reads (gate REWORK item 2).
+    /// judged **per accepted byte, against the most recent read that
+    /// covers that byte** (gate REWORK round 2, item B): the store reads
+    /// in batches (e.g. 16 KiB of WAL) and accepts one record inside, so
+    /// matching only a read of exactly `(off, len)` could never fire,
+    /// scanning every earlier read would judge stale reads (gate REWORK
+    /// item 2), and a single covering read is blind to a record
+    /// reassembled across two batch reads (the round-2 gate probe: two
+    /// tainted reads `[0,4096)` and `[4096,8192)`, `accepted(f, 4000,
+    /// 200)`). Accepted bytes **no read of this round covered** were
+    /// accepted unread — a harness or store defect — and fail closed:
+    /// recorded in `served` (so O-3 (a) fails the round whatever the
+    /// harness does) and in `uncovered_accepts` (for diagnosis).
     pub fn accepted(&mut self, id: FileId, off: u64, len: u64) {
         self.accepts.push((id, off, len));
+        if len == 0 {
+            // Zero bytes accepted: nothing to judge, nothing uncovered.
+            return;
+        }
         let end = off + len;
-        let tainted = self
-            .reads
-            .iter()
-            .rev()
-            .find(|r| r.inode == id && r.off <= off && r.off + r.len >= end)
-            .is_some_and(|r| r.tainted_ranges.iter().any(|(s, e)| *s < end && *e > off));
+        // Walk the reads most-recent first: the first read to cover a
+        // byte is the most recent one that does, so each accepted byte is
+        // judged exactly once, by its own covering read. `uncovered`
+        // holds the sub-ranges not yet judged; what survives every read
+        // was never read.
+        let mut uncovered: Vec<(u64, u64)> = vec![(off, end)];
+        let mut tainted = false;
+        for r in self.reads.iter().rev() {
+            if uncovered.is_empty() {
+                break;
+            }
+            if r.inode != id {
+                continue;
+            }
+            let rend = r.off + r.len;
+            let mut next: Vec<(u64, u64)> = Vec::new();
+            for &(s, e) in uncovered.iter() {
+                let lo = s.max(r.off);
+                let hi = e.min(rend);
+                if lo < hi {
+                    // This read is the most recent one covering
+                    // `[lo, hi)`: judge it, at sub-range granularity.
+                    if r.tainted_ranges.iter().any(|&(ts, te)| ts < hi && te > lo) {
+                        tainted = true;
+                    }
+                    // Parts of the interval outside this read stay for
+                    // earlier reads.
+                    if s < r.off {
+                        next.push((s, r.off));
+                    }
+                    if e > rend {
+                        next.push((rend, e));
+                    }
+                } else {
+                    next.push((s, e));
+                }
+            }
+            uncovered = next;
+        }
+        if !uncovered.is_empty() {
+            self.uncovered_accepts.push((id, off, len));
+            tainted = true;
+        }
         if tainted {
             self.served.push((id, off, len));
         }
@@ -1022,13 +1078,14 @@ impl SimDisk {
     }
 
     /// Begin a new round: clear the per-round logs (reads, accepts,
-    /// served-corruption findings, events). Taint references and
-    /// durable-write history survive, per 1.4 ("in any life of this
-    /// seed").
+    /// served-corruption findings, uncovered accepts, events). Taint
+    /// references and durable-write history survive, per 1.4 ("in any
+    /// life of this seed").
     pub fn new_round(&mut self) {
         self.reads.clear();
         self.accepts.clear();
         self.served.clear();
+        self.uncovered_accepts.clear();
         self.events.clear();
     }
 

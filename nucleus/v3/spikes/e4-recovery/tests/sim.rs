@@ -5,7 +5,9 @@
 //! REWORK (2026-10-23) pinned tests: taint over a read starting inside an
 //! issued range, the accept hook's covering-read sub-range rule, a synced
 //! shrink surviving the crash, and F-MEDIA-WAL drawing across all
-//! segments.
+//! segments. And the gate REWORK round 2 (2026-10-24) pins: the accept
+//! hook judging a record reassembled across batch reads, and the accept
+//! hook failing closed without a covering read.
 
 use std::sync::Arc;
 
@@ -592,6 +594,101 @@ fn synced_shrink_survives_crash() {
         disk.read_at(f, 8128, 64).unwrap(),
         vec![0u8; 64],
         "no stale bytes at the old tail either"
+    );
+}
+
+/// Gate REWORK round 2, item B (pinned): the accept hook judges each
+/// accepted byte against the most recent read that covers **that byte**.
+/// Two tainted reads `[0,4096)` and `[4096,8192)` cover an accept of
+/// `[4000,4200)` — a record reassembled across batch reads — which the
+/// single-covering-read implementation could never see (the gate probe
+/// gave `served = 0`).
+#[test]
+fn accept_hook_judges_across_reassembly_reads() {
+    let mut rng = Rng::new(21);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    disk.write_at(f, 0, &[2u8; 8192]).unwrap(); // volatile, will drop
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    // Two batch reads covering [0, 8192); both tainted (the last issued
+    // bytes were the 0x22s, the surviving bytes are the 0x11s).
+    let _ = disk.read_at(f, 0, 4096).unwrap();
+    assert!(disk.reads.last().unwrap().tainted);
+    let _ = disk.read_at(f, 4096, 4096).unwrap();
+    assert!(disk.reads.last().unwrap().tainted);
+    // A record straddling the boundary of the two reads: served.
+    disk.accepted(f, 4000, 200);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "an accept reassembled from two tainted reads is served corruption"
+    );
+    // The most recent covering reads govern: the store re-issues the
+    // surviving bytes, reads again (clean), and the same accept is not
+    // served a second time.
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    let _ = disk.read_at(f, 0, 4096).unwrap();
+    let _ = disk.read_at(f, 4096, 4096).unwrap();
+    assert!(
+        disk.reads.iter().rev().take(2).all(|r| !r.tainted),
+        "the re-reads are clean"
+    );
+    disk.accepted(f, 4000, 200);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "the same accept over clean re-reads is not served corruption"
+    );
+}
+
+/// Gate REWORK round 2, item B (pinned): the accept hook fails closed —
+/// accepted bytes **no read of the round covered** were accepted unread
+/// (a harness or store defect) and are recorded as served corruption
+/// (run 1 recorded nothing, failing open). Both shapes from the gate
+/// probe: an accept with no read at all, and an accept only partly
+/// covered by a read.
+#[test]
+fn accept_hook_fails_closed_without_covering_read() {
+    let mut rng = Rng::new(22);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 256]).unwrap();
+    disk.sync_data(f).unwrap();
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    // (a) An accept with no read at all in the round: fails closed.
+    disk.accepted(f, 0, 64);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "an accept with no preceding read fails closed"
+    );
+    assert_eq!(disk.uncovered_accepts, vec![(f, 0, 64)]);
+    // (b) An accept only partly covered: [100, 200) was never read
+    // (the read is clean, so this is not taint — it is uncoverage).
+    let _ = disk.read_at(f, 0, 100).unwrap();
+    assert!(!disk.reads.last().unwrap().tainted);
+    disk.accepted(f, 0, 200);
+    assert_eq!(
+        disk.served.len(),
+        2,
+        "an accept past the read's end fails closed"
+    );
+    assert_eq!(disk.uncovered_accepts, vec![(f, 0, 64), (f, 0, 200)]);
+    // A fully covered clean accept is not served, and clears nothing it
+    // should not: still exactly the two fail-closed records.
+    let _ = disk.read_at(f, 0, 200).unwrap();
+    assert!(!disk.reads.last().unwrap().tainted);
+    disk.accepted(f, 0, 200);
+    assert_eq!(
+        disk.served.len(),
+        2,
+        "a fully covered clean accept is not served corruption"
     );
 }
 
