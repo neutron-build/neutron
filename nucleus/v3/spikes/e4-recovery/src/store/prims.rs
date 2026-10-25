@@ -163,14 +163,10 @@ pub fn gate_exclusive<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
         Ok(matches!(st.cfg.mutant, Some(Mutant::FlipNoGate)))
     })?;
     if no_gate {
-        let holders = cx.with("gate_exclusive:nogate", |c| {
-            let st = c.store();
-            st.gate.exclusive = true;
-            Ok(st.gate.holders)
+        cx.with("gate_exclusive:nogate", |c| {
+            c.store().gate.exclusive = true;
+            Ok(())
         })?;
-        if std::env::var_os("E4_TRACE").is_some() {
-            eprintln!("[trace] flip-no-gate takes exclusive with holders={holders}");
-        }
         return Ok(());
     }
     cx.w.wake(WaitKey::GateShared);

@@ -174,6 +174,10 @@ pub struct HarnessState {
     pub baton: bool,
     /// A task panicked.
     pub panicked: bool,
+    /// A script task ended with a failure (a store or env error): the
+    /// round must fail loudly — never a silent early exit that leaves
+    /// the service tasks spinning.
+    pub task_error: Option<String>,
 }
 
 /// The world of a harness round: the store's `Core` slices plus the
@@ -450,8 +454,7 @@ fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
 }
 
 /// `Op` → `WOp`.
-pub fn to_wop(op: &Op) -> wal::WOp {
-    match op {
+pub fn to_wop(op: &Op) -> wal::WOp {    match op {
         Op::CreateTree { tree } => wal::WOp::CreateTree { tree: *tree },
         Op::DropTree { tree } => wal::WOp::DropTree { tree: *tree },
         Op::Put { tree, key, value } => wal::WOp::Put {
@@ -568,7 +571,25 @@ fn run_task(
         if let Some(task) = tasks.get(t - 1) {
             for op in task.ops.iter() {
                 yld!();
-                script_op(&cx, op)?;
+                if let Err(e) = script_op(&cx, op) {
+                    // A failed script op is a round failure, recorded
+                    // and reported — never a silent early exit (the
+                    // service tasks would spin on a workload that can
+                    // no longer finish).
+                    cx.with("h:taskerr", |c| {
+                        let h = c.h();
+                        if h.task_error.is_none() {
+                            h.task_error = Some(format!("{e:?}"));
+                        }
+                        h.workload_done = true;
+                        Ok(())
+                    })
+                    .ok();
+                    cx.w.wake(WaitKey::WalAcks);
+                    cx.w.wake(WaitKey::MetaDurable);
+                    cx.w.wake(WaitKey::Applied);
+                    return Err(e);
+                }
             }
         }
         // This script task is done. `workload_done` means *all* script
@@ -579,7 +600,7 @@ fn run_task(
         cx.with("h:done", |c| {
             let h = c.h();
             h.tasks_left = h.tasks_left.saturating_sub(1);
-            h.workload_done = h.tasks_left == 0;
+            h.workload_done = h.tasks_left == 0 || h.task_error.is_some();
             Ok(())
         })
         .map_err(fail_of)?;
@@ -937,6 +958,8 @@ pub struct RoundOutcome {
     pub baton: bool,
     /// A task panicked.
     pub panicked: bool,
+    /// A script task failed (store/env error); the round fails.
+    pub task_error: Option<String>,
     /// The digest of the canonical record (byte-identical for the same
     /// inputs; `tests/harness.rs`).
     pub digest: u64,
@@ -969,6 +992,7 @@ impl Default for RoundOutcome {
             deadlock: false,
             baton: false,
             panicked: false,
+            task_error: None,
             digest: 0,
         }
     }
@@ -991,8 +1015,8 @@ impl RoundOutcome {
             self.pass
         ));
         s.push_str(&format!(
-            "|{:?}|{:?}|{}|{}|{}",
-            self.monitors, self.acked_lost, self.meta_rollback, self.deadlock, self.baton
+            "|{:?}|{:?}|{}|{}|{}|{:?}",
+            self.monitors, self.acked_lost, self.meta_rollback, self.deadlock, self.baton, self.task_error
         ));
         s
     }
@@ -1041,16 +1065,13 @@ pub fn run_round(
         Sched::new(host)
     };
     run_script(&sched, script, seed);
-    if std::env::var_os("E4_TRACE").is_some() {
-        eprintln!("[trace] workload pass done");
-    }
     let (mut disk, mut model, flip_pos, flags, wal_commits, events) = {
         let g = sched.lock();
         (
             g.disk.clone(),
             clone_model(&g.h.model),
             g.st.wal.flip_enqueue_pos.clone(),
-            (g.h.deadlock, g.h.baton, g.h.panicked),
+            (g.h.deadlock, g.h.baton, g.h.panicked, g.h.task_error.clone()),
             g.h.wal_commits.clone(),
             g.disk.events.clone(),
         )
@@ -1102,9 +1123,6 @@ pub fn run_round(
     // extraction's accepts).
     let mut recovery_served: Vec<(usize, u64, u64)> = Vec::new();
     let recovery = loop {
-        if std::env::var_os("E4_TRACE").is_some() {
-            eprintln!("[trace] recovery attempt {nested_fired}");
-        }
         let world = round_world(
             seed,
             recovery_disk.clone(),
@@ -1193,6 +1211,7 @@ pub fn run_round(
         deadlock: flags.0,
         baton: flags.1,
         panicked: flags.2,
+        task_error: flags.3,
         ..Default::default()
     };
     match recovery {
@@ -1269,13 +1288,7 @@ pub fn run_round(
             );
             // The harness checkpoint (O-2 (ii) and the next round's
             // base), then amcheck (ii).
-            if std::env::var_os("E4_TRACE").is_some() {
-                eprintln!("[trace] harness checkpoint begin");
-            }
             let ck = ckpt::checkpoint(&cx, &mut |_| Ok(()));
-            if std::env::var_os("E4_TRACE").is_some() {
-                eprintln!("[trace] harness checkpoint done ({ck:?})");
-            }
             let findings_ii = amcheck::amcheck(&cx, &cfg);
             let (end_disk2, end_store) = {
                 let g = world.lock();
@@ -1286,7 +1299,7 @@ pub fn run_round(
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
-            outcome.pass = verdict.pass;
+            outcome.pass = verdict.pass && outcome.task_error.is_none();
             outcome.lo = model.lower_bound(c_prev);
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.frontier = frontier;
@@ -1343,7 +1356,7 @@ pub fn run_round(
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
-            outcome.pass = verdict.pass;
+            outcome.pass = verdict.pass && outcome.task_error.is_none();
             outcome.lo = model.lower_bound(c_prev);
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();

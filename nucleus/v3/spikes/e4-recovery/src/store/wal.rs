@@ -408,14 +408,29 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
             match existing {
                 Some(f) => f,
                 None => {
-                    // Create + preallocate + G1.
+                    // Create + preallocate + G1. Two tasks can reach
+                    // here for the same segment (the writer task and a
+                    // committer's help call, S-BATON interleaving at
+                    // every env call): the loser's create fails with
+                    // "exists" and falls back to opening the winner's
+                    // file, re-running the same bind and dirsync (G1 is
+                    // idempotent — a second sync_dir of "/wal/" is a
+                    // no-op ordering-wise, and durability of this
+                    // segment's records is never counted before at
+                    // least one completed dirsync).
                     let name = format!("/wal/{seg:016x}.log");
-                    let f = cx.env().create(&name).map_err(Fail::Sim)?;
+                    let created = cx.env().create(&name);
+                    let f = match created {
+                        Ok(f) => f,
+                        Err(_) => cx.env().open(&name).map_err(Fail::Sim)?,
+                    };
                     cx.env().set_len(f, WAL_SEG).map_err(Fail::Sim)?;
                     cx.with("wal_writer:bind", |c| {
                         let st = c.store();
                         st.wal.segs.insert(seg, f);
-                        st.wal.seg_needs_dirsync.push(seg);
+                        if !st.wal.seg_needs_dirsync.contains(&seg) {
+                            st.wal.seg_needs_dirsync.push(seg);
+                        }
                         Ok(())
                     })?;
                     if !cx.with("wal_writer:mut", |c| {
@@ -426,7 +441,8 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
                     })? {
                         cx.env().sync_dir("/wal/").map_err(Fail::Sim)?;
                         cx.with("wal_writer:dirsynced", |c| {
-                            c.store().wal.seg_needs_dirsync.clear();
+                            let st = c.store();
+                            st.wal.seg_needs_dirsync.retain(|s| *s != seg);
                             Ok(())
                         })?;
                     }
