@@ -17,7 +17,7 @@ Gate-model: <model id, e.g. claude-opus-5-5>
 Gate-session: <T3 task id / agent id of the gating session>
 Date: <YYYY-MM-DD>
 Gate-exit: GATE EXIT=0           (the literal last line of scripts/gate.sh on the branch tip)
-Commit: <hex id (7-40) of the card commit the verdict covers, i.e. tip^>
+Commit: <hex id of the card commit the verdict covers, i.e. tip^: full 40-hex preferred; 7-39 accepted>
 Mutants: <name -> catching test | UNCAUGHT>, ...   (or "n/a")
 Followups: <card ids, comma-separated> | none
 ```
@@ -31,3 +31,15 @@ verdict file written by an orchestrator that claims `Gate-tier: P` is detectable
 only by review (the `Gate-session` id must match a real T3 task or agent run).
 In audit mode `Card-gate` is taken from the verdict, because cards are
 local-only. Periodic Opus reviews spot-check `Gate-session` ids against T3.
+
+**Short Commit ids are judged against the local object store.** A short
+`Commit` must name exactly one commit among those present where the check runs.
+At merge time that is the shared store, which still holds the reviewed commit,
+so a commit ground to share its prefix is refused as ambiguous (test-enforcement
+G7C). A fresh CI clone holds only what the scaffold reaches. If the card branch
+was rewritten after review, the reviewed commit is absent there, and
+`audit-merges.sh` would accept a ground commit under a genuine verdict. This is
+accepted (PLAN-v3 §8.1, C4 decision 3). Such a merge must first bypass
+`merge-card.sh`, and whoever can do that can equally commit a verdict that
+names the ground commit's full id, which is the authorship limit above. Gates
+write the full 40-hex id, which cannot collide.
