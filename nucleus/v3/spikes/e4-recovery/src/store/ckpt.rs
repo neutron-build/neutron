@@ -471,9 +471,20 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         st.wal.flip_enqueue_pos.push(enqueue_end);
         let open_chunks = st.wal.open_chunks.clone();
         let wal_start = wal::wal_start_lsn(st, t, &open_chunks);
+        // §12.6 retention: drop exactly the entries whose markers this
+        // flip's `T` covers (wholly in the image, chunks disposable at
+        // the next recycle); every other entry survives so the next
+        // flip can still cover its chunks.
+        st.wal.open_chunks = open_chunks
+            .iter()
+            .filter(|(txn, first)| match wal::chunk_txn_marker(st, txn, first) {
+                Some(ts) => ts > t,
+                None => true,
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect();
         st.e = k as u32 + 1;
         st.flip_window = true;
-        st.wal.open_chunks.clear();
         Ok(FlipOut::Ok {
             t,
             gc_w,
@@ -1033,7 +1044,11 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
     if !logical_only {
         truncate_wal(cx, valid_end)?;
     }
-    // The WAL writer state restarts at the valid end.
+    // The WAL writer state restarts at the valid end. The replayed
+    // records' tags and the chunk bookkeeping survive the restart
+    // (§12.6): a post-recovery flip must still cover the chunks of a
+    // transaction whose marker is above its `T`, or the next recycle
+    // could eat them before a later crash's replay (I-REPLAY-IDEM).
     cx.with("recover:walreset", |c| {
         let st = c.store();
         st.wal.append = valid_end;
@@ -1042,6 +1057,28 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
         st.wal.buf.clear();
         st.wal.buf_tags.clear();
         st.wal.open_chunks.clear();
+        for rec in replay.iter() {
+            if rec.kind == K_COMMIT || rec.kind == K_MARKER || rec.kind == K_CHUNK {
+                st.wal
+                    .buf_tags
+                    .insert(rec.lsn, (rec.ts, rec.kind == K_MARKER, rec.txn));
+                if rec.kind == K_CHUNK {
+                    st.wal
+                        .open_chunks
+                        .entry(rec.txn)
+                        .or_insert(rec.lsn);
+                }
+            }
+        }
+        // Entries whose markers the opened image covers are droppable
+        // right away; the rest must stay until a flip covers them.
+        let t = meta.t;
+        st.wal.open_chunks.retain(|txn, _| {
+            markers
+                .get(txn)
+                .map(|ts| *ts > t)
+                .unwrap_or(true)
+        });
         Ok(())
     })?;
     // §14 step 6: resume `dropping` walks.

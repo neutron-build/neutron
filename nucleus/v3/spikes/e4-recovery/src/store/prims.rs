@@ -108,8 +108,17 @@ impl StoreInner {
 /// Acquire the gate shared. Blocks behind a pending flip (the flip waits
 /// for holders; new acquisitions queue). The acquire attempt is a yield
 /// point (card 1.2).
+///
+/// Wakeup discipline (no lost wakeups): the predicate is checked in a
+/// `with` step and the park follows **without an intervening yield** —
+/// while this task holds the baton no other task can change the gate or
+/// fire the wake, so a `wake(GateShared)` either sees us parked or
+/// happens before our check. A yield between check and park loses the
+/// wake that freed the gate (the task parks on a predicate that is
+/// already true, and nothing wakes it again).
 pub fn gate_shared<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     loop {
+        cx.yield_now("gate_shared")?;
         let wait = cx.with("gate_shared", |c| {
             let st = c.store();
             if st.gate.exclusive || st.gate.flip_pending {
@@ -119,7 +128,6 @@ pub fn gate_shared<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
                 Ok(false)
             }
         })?;
-        cx.yield_now("gate_shared")?;
         if !wait {
             return Ok(());
         }
@@ -163,8 +171,11 @@ pub fn gate_exclusive<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
     }
     cx.w.wake(WaitKey::GateShared);
     loop {
-        let ready = cx.with("gate_exclusive:wait", |c| Ok(c.store().gate.holders == 0))?;
+        // Yield first, then check while holding the baton, then park
+        // without an intervening yield (the wakeup discipline of
+        // `gate_shared`; a yield between check and park loses the wake).
         cx.yield_now("gate_exclusive")?;
+        let ready = cx.with("gate_exclusive:wait", |c| Ok(c.store().gate.holders == 0))?;
         if ready {
             cx.with("gate_exclusive:take", |c| {
                 c.store().gate.exclusive = true;
@@ -190,9 +201,12 @@ pub fn gate_flip_release<H: StoreHost>(cx: &Cx<'_, H>) {
 
 // The per-tree sim mutex (card 3.6)
 //
-/// Acquire tree `t`'s sim mutex, held for one gated operation.
+/// Acquire tree `t`'s sim mutex, held for one gated operation. The same
+/// wakeup discipline as `gate_shared`: check while holding the baton,
+/// park without an intervening yield.
 pub fn tree_lock<H: StoreHost>(cx: &Cx<'_, H>, t: u64) -> Result<(), Fail> {
     loop {
+        cx.yield_now("tree_lock")?;
         let busy = cx.with("tree_lock", |c| {
             let st = c.store();
             let busy = st
@@ -206,7 +220,6 @@ pub fn tree_lock<H: StoreHost>(cx: &Cx<'_, H>, t: u64) -> Result<(), Fail> {
             }
             Ok(busy)
         })?;
-        cx.yield_now("tree_lock")?;
         if !busy {
             return Ok(());
         }

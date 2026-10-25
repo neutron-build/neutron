@@ -321,7 +321,11 @@ pub struct WalState {
     pub written: u64,
     /// Per-segment created-but-unsynced-dir flags (G1 bookkeeping).
     pub seg_needs_dirsync: Vec<u64>,
-    /// Open chunked transactions: txn → first chunk LSN (§12.6).
+    /// Chunked transactions: txn → first chunk LSN (§12.6). An entry
+    /// lives from its first chunk until a flip whose `T` covers its
+    /// marker (`marker_ts ≤ T` — wholly in the image); a marker's
+    /// enqueue does **not** remove it, because the flip still needs the
+    /// first-chunk LSN while the marker is above `T` (the marked case).
     pub open_chunks: BTreeMap<(u32, u64), u64>,
     /// The flips' enqueue positions, in flip order (M-CKPT-T's hook: the
     /// card names this supply, Work 3.10; read only by the monitors).
@@ -469,23 +473,37 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
 /// Wait until the WAL is durable through `lsn` (a SyncOn ack). Waiting
 /// tasks help drain the writer queue cooperatively first (§12.4's
 /// embedded mode), so single-task worlds (recovery, directed tests)
-/// cannot starve.
+/// cannot starve. Helping is only legal when this task can make
+/// progress itself — the buffer is non-empty, or the records are
+/// written but unsynced. A batch taken but not yet written by another
+/// task (S-BATON: `wal_writer_step` holds the taken bytes across its
+/// env yields) is invisible here: waiting on it without parking would
+/// spin without yielding the baton, so the holder could never run —
+/// the wait parks on [`WaitKey::WalAcks`] instead and the holder's
+/// write wakes it (prototype deviation fixed in B5; see
+/// `tests/directed.rs` D4).
 pub fn wal_wait_durable<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fail> {
     loop {
-        let ok = cx.with("wal_durable:chk", |c| {
+        let (done, can_write, can_sync) = cx.with("wal_durable:chk", |c| {
             let st = c.store();
             st.alive()?;
-            Ok(st.wal.durable >= lsn)
+            Ok((
+                st.wal.durable >= lsn,
+                !st.wal.buf.is_empty(),
+                st.wal.durable < lsn && st.wal.written >= lsn,
+            ))
         })?;
-        if ok {
+        if done {
             return Ok(());
         }
-        let can_help = cx.with("wal_durable:help", |c| {
-            let st = c.store();
-            Ok(!st.wal.buf.is_empty() || st.wal.written < lsn)
-        })?;
-        if can_help {
+        if can_write {
             wal_writer_step(cx)?;
+            continue;
+        }
+        if can_sync {
+            // Written (by whoever) but not counted durable: sync the
+            // covering segments here and advance the accounting.
+            wal_sync_through(cx, lsn)?;
             continue;
         }
         cx.wait_for(crate::sim::WaitKey::WalAcks)?;
@@ -495,24 +513,53 @@ pub fn wal_wait_durable<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fa
 /// Wait until the WAL is written through `lsn` (a SyncOff ack).
 pub fn wal_wait_written<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fail> {
     loop {
-        let ok = cx.with("wal_written:chk", |c| {
+        let (done, can_write) = cx.with("wal_written:chk", |c| {
             let st = c.store();
             st.alive()?;
-            Ok(st.wal.written >= lsn)
+            Ok((st.wal.written >= lsn, !st.wal.buf.is_empty()))
         })?;
-        if ok {
+        if done {
             return Ok(());
         }
-        let can_help = cx.with("wal_written:help", |c| {
-            let st = c.store();
-            Ok(!st.wal.buf.is_empty())
-        })?;
-        if can_help {
+        if can_write {
             wal_writer_step(cx)?;
             continue;
         }
+        // An in-flight batch (another task) or nothing to do: park; the
+        // holder's write wakes WalAcks.
         cx.wait_for(crate::sim::WaitKey::WalAcks)?;
     }
+}
+
+/// `sync_data` every segment covering `[durable, lsn)` and advance the
+/// durable-through accounting to `written` (one step per segment, then
+/// one for the accounting). Only the segments the store has open are
+/// synced; a range the store never wrote cannot be made durable by
+/// syncing (G5: appending means enqueued, durable means synced where
+/// written).
+fn wal_sync_through<H: StoreHost>(cx: &Cx<'_, H>, lsn: u64) -> Result<(), Fail> {
+    let (d, w) = cx.with("wal_sync:range", |c| {
+        let st = c.store();
+        Ok((st.wal.durable, st.wal.written))
+    })?;
+    let mut seg = seg_of(d);
+    let last = seg_of(w.min(lsn).max(d));
+    while seg <= last {
+        let f = cx.with("wal_sync:fid", |c| {
+            Ok(c.store().wal.segs.get(&seg).copied())
+        })?;
+        if let Some(f) = f {
+            cx.env().sync_data(f).map_err(Fail::Sim)?;
+        }
+        seg += WAL_SEG;
+    }
+    cx.with("wal_sync:adv", |c| {
+        let st = c.store();
+        st.wal.durable = st.wal.durable.max(st.wal.written.min(lsn));
+        Ok(())
+    })?;
+    cx.w.wake(crate::sim::WaitKey::WalAcks);
+    Ok(())
 }
 
 /// Step 1: sync the WAL through every record enqueued before the flip
@@ -534,67 +581,29 @@ pub fn wal_step1<H: StoreHost>(cx: &Cx<'_, H>, t: u64, enqueue_end: u64) -> Resu
             Ok(enqueue_end)
         }
     })?;
-    let durable = cx.with("wal_step1:dur", |c| Ok(c.store().wal.durable))?;
-    if durable >= end {
-        return Ok(());
-    }
-    let has_buf = cx.with("wal_step1:buf", |c| Ok(!c.store().wal.buf.is_empty()))?;
-    if has_buf {
-        // Write and sync the buffered batch (which covers `end`).
-        wal_writer_step(cx)?;
-        let d2 = cx.with("wal_step1:dur2", |c| Ok(c.store().wal.durable))?;
-        if d2 < end {
-            return Err(Fail::Invalid(
-                "step 1 batch did not cover the flip end".to_owned(),
-            ));
-        }
-        return Ok(());
-    }
-    // Already written: sync the tail segments through `end`.
-    let mut seg = {
-        let d = cx.with("wal_step1:dur3", |c| Ok(c.store().wal.durable))?;
-        seg_of(d)
-    };
-    let last = seg_of(end);
-    while seg <= last {
-        let f = cx.with("wal_step1:fid", |c| {
-            Ok(c.store().wal.segs.get(&seg).copied())
-        })?;
-        if let Some(f) = f {
-            cx.env().sync_data(f).map_err(Fail::Sim)?;
-        }
-        seg += WAL_SEG;
-    }
-    cx.with("wal_step1:advance", |c| {
-        let st = c.store();
-        st.wal.durable = st.wal.durable.max(end);
-        Ok(())
-    })?;
-    Ok(())
+    wal_wait_durable(cx, end)
 }
 
-/// Compute `wal_start_lsn` at the flip (§12.6): the minimum of the first
-/// Commit/CommitMarker with `commit_ts > T` (or the append position if
-/// there is none), and the first Chunk LSN of every chunked transaction
-/// whose marker is not yet below `T`. START-LSN-MARKED-CHUNK drops the
-/// marked case; START-LSN-PAST-CHUNK drops the open-txn case.
+/// Compute `wal_start_lsn` at the flip (§12.6): the minimum of the
+/// LSN of the first **Commit or CommitMarker** with `commit_ts > T`
+/// (or the append position if there is none), and the first Chunk LSN
+/// of every chunked transaction whose marker is not yet below `T`.
+/// (Chunk records carry ts 0, reserved, so only the second term counts
+/// them; SegmentEnd fillers likewise never pull the start.)
+/// START-LSN-MARKED-CHUNK drops the marked case; START-LSN-PAST-CHUNK
+/// drops the open-txn case.
 pub fn wal_start_lsn(st: &StoreInner, t: u64, open_chunks: &BTreeMap<(u32, u64), u64>) -> u64 {
     let mut start = st.wal.append;
-    for (l, (ts, marker, _txn)) in st.wal.buf_tags.iter() {
-        if *marker && *ts > t {
+    for (l, (ts, _marker, _txn)) in st.wal.buf_tags.iter() {
+        if *ts > t {
             start = start.min(*l);
         }
     }
     let skip_marked = matches!(st.cfg.mutant, Some(Mutant::StartLsnMarkedChunk));
     let skip_open = matches!(st.cfg.mutant, Some(Mutant::StartLsnPastChunk));
     for (txn, first) in open_chunks.iter() {
-        // This txn's marker, if any.
-        let marker = st
-            .wal
-            .buf_tags
-            .iter()
-            .find(|(l, (_, m, tx))| *m && **l > *first && *tx == *txn)
-            .map(|(_, (ts, _, _))| *ts);
+        // This txn's marker, if any (enqueued after its first chunk).
+        let marker = chunk_txn_marker(st, txn, first);
         match marker {
             Some(ts) if ts <= t => continue, // wholly in the image
             Some(_) => {
@@ -612,6 +621,17 @@ pub fn wal_start_lsn(st: &StoreInner, t: u64, open_chunks: &BTreeMap<(u32, u64),
         }
     }
     start
+}
+
+/// The commit ts of `txn`'s CommitMarker (the marker enqueued after its
+/// first chunk LSN `first`), if it has one. Shared by the flip's
+/// second term and the entry-retention rule.
+pub fn chunk_txn_marker(st: &StoreInner, txn: &(u32, u64), first: &u64) -> Option<u64> {
+    st.wal
+        .buf_tags
+        .iter()
+        .find(|(l, (_, m, tx))| *m && **l > *first && *tx == *txn)
+        .map(|(_, (ts, _, _))| *ts)
 }
 
 /// Step 6's recycling (§12.1/§13): rename each segment wholly below

@@ -152,6 +152,9 @@ pub struct HarnessState {
     pub txn_counter: u64,
     /// Registered snapshots (long readers).
     pub snapshots: BTreeSet<u64>,
+    /// Script tasks still running (`workload_done` = this reaching 0):
+    /// the service tasks may only end once every script task has.
+    pub tasks_left: usize,
     /// Published trees.
     pub published: BTreeSet<u64>,
     /// Bulk loads seen.
@@ -282,10 +285,18 @@ pub fn commit_txn(
             }
             let (lsn, _len) = wal::wal_enqueue(cx, K_CHUNK, txn, 0, &payload)?;
             cx.with("h:openchunk", |c| {
-                c.store().wal.open_chunks.insert(txn, lsn);
+                let st = c.store();
+                st.wal
+                    .open_chunks
+                    .entry(txn)
+                    .or_insert(lsn);
                 Ok(())
             })?;
         }
+        // A named park point (Work 13): D3 holds the committer between
+        // its chunks and its marker, so a flip sees the transaction
+        // open and the marker lands later, before the crash.
+        cx.park("chunked:premark")?;
     }
     // The critical section: take the flag, assign the ts, enqueue the
     // record at its LSN, release the flag (one critical section;
@@ -352,14 +363,9 @@ pub fn commit_txn(
     let (lsn, len) = wal::wal_enqueue(cx, kind, txn, ts, &payload)?;
     let end_lsn = lsn + len;
     let sync_flag = sync_on;
-    if chunked {
-        // The marker is enqueued: the transaction is no longer open
-        // (§12.6 counts only marker-less or marker-above-T transactions).
-        cx.with("h:closechunk", |c| {
-            c.store().wal.open_chunks.remove(&txn);
-            Ok(())
-        })?;
-    }
+    // (§12.6: the marker's enqueue does not close the chunk bookkeeping
+    // — the entry lives until a flip whose T covers the marker, so the
+    // marked case still pulls wal_start below the chunks.)
     if chunked {
         // §12.7: a chunked transaction applies after its marker's group
         // sync — wait for durability first.
@@ -384,6 +390,13 @@ pub fn commit_txn(
         h.commits_done += 1;
         Ok(())
     })?;
+    if chunked {
+        // A named park point (Work 13): D2 holds the committer after
+        // its commit is recorded (the checkpoint trigger fires) but
+        // before its apply, so a flip lands with the marker above T —
+        // §12.6's marked case.
+        cx.park("chunked:preapply")?;
+    }
     // The ack (§12.4): SyncOn at the covering sync, SyncOff at the write.
     if sync_flag {
         wal::wal_wait_durable(cx, end_lsn)?;
@@ -470,6 +483,10 @@ pub fn run_script(sched: &Sched<RoundWorld>, script: &Script, seed: u64) {
     let evictor = script.evictor;
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
+        {
+            let mut g = sched.lock();
+            g.h.tasks_left = nscript;
+        }
         for t in 1..ntasks {
             let sched_ref = sched;
             let p = &panicked;
@@ -550,9 +567,15 @@ fn run_task(
                 script_op(&cx, op)?;
             }
         }
-        // The scripted tasks are done: the service tasks may end too.
+        // This script task is done. `workload_done` means *all* script
+        // tasks are: a service task that exits while another script
+        // task still holds a request (a forced checkpoint, a WAL batch)
+        // would strand it (the scheduler would report DEADLOCK — loud,
+        // but a harness defect all the same).
         cx.with("h:done", |c| {
-            c.h().workload_done = true;
+            let h = c.h();
+            h.tasks_left = h.tasks_left.saturating_sub(1);
+            h.workload_done = h.tasks_left == 0;
             Ok(())
         })
         .map_err(fail_of)?;
@@ -705,7 +728,11 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
     })
 }
 
-/// Wait for the pending forced checkpoint to complete (its meta durable).
+/// Wait for the pending forced checkpoint to complete (its meta
+/// durable). Parks on [`WaitKey::MetaDurable`]: every checkpoint's
+/// step-5 completion wakes it, and the checkpointer task never parks
+/// (it spin-yields), so a checkpoint that never comes surfaces as the
+/// scheduler's DEADLOCK, never a silent hang.
 fn wait_ckpt(cx: &Cx<'_, RoundWorld>) -> Result<(), Fail> {
     loop {
         let (pending, open) = cx.with("h:ckptw", |c| {
@@ -1061,6 +1088,12 @@ pub fn run_round(
     let mut nested_fired = 0u32;
     let mut recovery_disk = disk.clone();
     let mut recovery_reads: Vec<(usize, u64, u64)> = Vec::new();
+    // Served corruption seen by the recovery world(s) (O-3 (a): the
+    // accepts of every life of this round are judged — the recovery
+    // pass reads the crashed disk, so its accepts are where a served
+    // corruption shows; without this the harness would judge only the
+    // extraction's accepts).
+    let mut recovery_served: Vec<(usize, u64, u64)> = Vec::new();
     let recovery = loop {
         let world = round_world(
             seed,
@@ -1087,20 +1120,23 @@ pub fn run_round(
         let reads_before = world.lock().disk.reads.len();
         match ckpt::recover(&cx, cfg.clone()) {
             Ok((st, frontier)) => {
-                let reads: Vec<(usize, u64, u64)> = {
+                let (reads, served): (Vec<(usize, u64, u64)>, Vec<(usize, u64, u64)>) = {
                     let g = world.lock();
-                    g.disk
-                        .reads
-                        .iter()
-                        .skip(reads_before)
-                        .map(|r| (r.inode, r.off, r.len))
-                        .collect()
+                    (
+                        g.disk
+                            .reads
+                            .iter()
+                            .skip(reads_before)
+                            .map(|r| (r.inode, r.off, r.len))
+                            .collect(),
+                        g.disk.served.clone(),
+                    )
                 };
                 if let Some(t) = twin.as_mut() {
                     t.extend(reads.iter().copied());
-                    let _ = &recovery_reads;
                 }
                 recovery_reads = reads;
+                recovery_served.extend(served);
                 let end = world.lock().disk.clone();
                 if let Err(e) = cx.with("h:recinstall", |c| {
                     *c.store() = st.clone();
@@ -1116,11 +1152,16 @@ pub fn run_round(
                 nested_fired += 1;
                 let mut frng = Rng::new(derive(seed * 100 + 50 + nested_fired as u64, S_CRASH));
                 let mut g = world.lock();
+                recovery_served.extend(g.disk.served.clone());
                 let _ = g.disk.apply_crash(&mut frng, &faults.knobs);
                 recovery_disk = g.disk.clone();
                 continue;
             }
-            Err(e) => break Err(e),
+            Err(e) => {
+                let g = world.lock();
+                recovery_served.extend(g.disk.served.clone());
+                break Err(e);
+            }
         }
     };
     // (The opened meta and frontier are read from the end state below.)
@@ -1175,7 +1216,9 @@ pub fn run_round(
             }
             // The served corruption check (with the R-taint, X5-R5: every
             // slot in R counts as tainted from open until the store next
-            // writes it).
+            // writes it). Every life of this round contributes: the
+            // workload pass (the sched disk), the recovery pass(es) and
+            // this extraction's own accepts.
             {
                 let g = world.lock();
                 let r_taint = g.disk.accepts.iter().any(|(f, off, len)| {
@@ -1183,7 +1226,14 @@ pub fn run_round(
                         .iter()
                         .any(|s| *f == pf && *off < (s + 1) * 4096 && off + len > s * 4096)
                 });
-                ex.served = !g.disk.served.is_empty() || r_taint;
+                let workload_served = {
+                    let g2 = sched.lock();
+                    !g2.disk.served.is_empty()
+                };
+                ex.served = workload_served
+                    || !recovery_served.is_empty()
+                    || !g.disk.served.is_empty()
+                    || r_taint;
             }
             // The class MP/MW twin supply.
             let twin_info = TwinInfo {
@@ -1241,7 +1291,7 @@ pub fn run_round(
                 xx001: vec![XxSite::Open],
                 served: {
                     let g2 = sched.lock();
-                    !g2.disk.served.is_empty()
+                    !g2.disk.served.is_empty() || !recovery_served.is_empty()
                 },
                 amcheck_i: amcheck_i.clone(),
                 amcheck_i_ran: meta_i.is_some(),
@@ -1401,14 +1451,17 @@ fn record_len(bytes: &[u8], lsn: u64) -> u64 {
     0
 }
 
-/// Whether an inode received parses-as-WAL writes in this event stream.
+/// Whether an inode received parses-as-WAL writes in this event stream
+/// (the record magic decides; the page file's writes never parse as
+/// NWAL batches — including its write at offset 0, whose "NUCLEUS\0"
+/// page-0 bytes fail the record magic, so no offset guard is needed).
 fn has_wal_writes(inode: usize, events: &[DiskEvent]) -> bool {
     events.iter().any(|e| match e {
         DiskEvent::WriteIssued {
             inode: i,
             bytes,
-            off,
-        } if *i == inode && *off > 0 => !crate::monitor::parse_batch_pub(bytes).is_empty(),
+            ..
+        } if *i == inode => !crate::monitor::parse_batch_pub(bytes).is_empty(),
         _ => false,
     })
 }
