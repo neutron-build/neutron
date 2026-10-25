@@ -834,6 +834,9 @@ sys.exit(0 if raised and len(bad) == 1 and "failed (exit" in bad[0] and "cannot 
 P
 }
 expect_ok "runner refs: RF10 a failed snapshot raises and a failed check is a violation" rf10
+# RF11: R1 covers refs that existed before the run, not only new ones: an existing
+# card branch moved onto this run's commit (G-R1-CREATED-ONLY; RF4 only creates).
+expect_ok "runner refs: RF11 an existing card branch moved onto this run's commit is a violation" rf refs/heads/card/v3-ZZ 'git fetch -q . +card/v3-RF:card/v3-ZZ'
 
 # --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
 # The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
@@ -1026,6 +1029,11 @@ git -C "$r" branch -f main nucleus/v3-scaffold
 e2e XR1 "work refmove" --attempts 3
 expect_ok "runner e2e: RF1: moving main stops the run, prints the restore and does not run it" \
   res XR1 "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and 'refs/heads/main: ' in out and 'git update-ref refs/heads/main ' in out and $main_at == H"
+# The restore sets main back from the card tip to its old commit, old before new:
+# update-ref's compare-and-swap order (G-RESTORE-SWAPPED prints them swapped).
+main_old=$(git -C "$r" rev-parse nucleus/v3-scaffold)
+restore_main="'  to restore (not run; check for a concurrent update first): git update-ref refs/heads/main $main_old ' + H in out.splitlines()"
+expect_ok "runner e2e: RF1: the restore line is update-ref main <old> <new>, with the real commits" res XR1 "$restore_main"
 # RF2: the move in a killed attempt 1 is caught by its own check (REF-SKIP-KILLED
 # would stop at attempt 2 instead).
 git -C "$r" branch -f main nucleus/v3-scaffold
@@ -1038,6 +1046,13 @@ git -C "$r" branch -f main nucleus/v3-scaffold
 e2e XR4 "side silent;adopt" --attempts 3
 expect_ok "runner e2e: RF4: a side ref adopted in a later attempt is caught against the run's snapshot" \
   res XR4 "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 2 and 'refs/heads/side-XR4: (none) -> ' in out and \"carries this run's commit\" in out"
+# RF5: a quota exit skips the loop's check and the final one, so only the at-exit
+# check in main()'s finally reports the move (G-NO-EXIT-CHECK prints nothing).
+git -C "$r" branch -f main nucleus/v3-scaffold
+e2e XR5 "work refmove quota" --attempts 3
+expect_ok "runner e2e: RF5: a ref moved before a quota exit is reported at exit, with its restore" \
+  res XR5 "rc == 1 and 'provider usage limit reached' in out and '[XR5] refs changed outside the card branch (at exit):' in out.splitlines() and 'refs changed outside the card branch; stopping' not in out and 'final ref check' not in out and $restore_main"
+git -C "$r" branch -f main nucleus/v3-scaffold
 # RF3 (control, last: it moves nucleus/v3-scaffold): concurrent legitimate moves
 # during a run let it pass (REF-STRICT refuses it).
 e2e XR3 "work foreign" --attempts 1
