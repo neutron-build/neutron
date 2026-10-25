@@ -250,10 +250,14 @@ fn insert_locked<H: StoreHost>(
         .iter()
         .position(|(k, _)| k.as_slice() > ekey)
         .unwrap_or(all.len());
-    if pos < all.len() && all.get(pos).map(|c| c.0.as_slice()) == Some(ekey) {
+    // The equal entry, if any, sits just **below** `pos`: `pos` is the
+    // first strictly-greater position, so an existing copy of `ekey`
+    // is at `pos − 1` (checking `pos` instead let every identical
+    // replay insert a duplicate — prototype deviation fixed in B5).
+    if pos > 0 && all.get(pos - 1).map(|c| c.0.as_slice()) == Some(ekey) {
         // §9.1: identical → no-op; different → XX001 (or a superseding
         // replace for chunked replay).
-        let old = all.get(pos).map(|c| c.1.clone()).unwrap_or_default();
+        let old = all.get(pos - 1).map(|c| c.1.clone()).unwrap_or_default();
         if old == value {
             if matches!(mutant, Some(Mutant::ReplayDupConflict)) {
                 return Err(Fail::Corrupt("identical re-insert as conflict".into()));
@@ -261,7 +265,7 @@ fn insert_locked<H: StoreHost>(
             return Ok(false);
         }
         if replace {
-            if let Some(c) = all.get_mut(pos) {
+            if let Some(c) = all.get_mut(pos - 1) {
                 c.1 = value.to_vec();
             }
             store_page(
@@ -321,9 +325,11 @@ fn insert_locked<H: StoreHost>(
         .ok_or_else(|| Fail::Corrupt("empty right half".into()))?;
     if path.len() == 1 {
         // Root split (§6.3): the cells move into two new pages and the
-        // root is rewritten in place as an inner page.
+        // root is rewritten in place as an inner page. The park points
+        // sit between the page mutations (the D5 split parking, card
+        // Work 13): a flip requested mid-split waits (the gate is
+        // held).
         let l = alloc_lpid(cx)?;
-        cx.park("split:mid")?;
         let r = alloc_lpid(cx)?;
         store_page(cx, l, page::build_leaf(l, e, &cells_refs(&left)))?;
         pins.note(l);
@@ -336,6 +342,7 @@ fn insert_locked<H: StoreHost>(
             root,
             page::build_inner(root, e, &[(l, sep.as_slice())], r),
         )?;
+        cx.park("split:mid")?;
         count_split(cx)?;
         return Ok(true);
     }

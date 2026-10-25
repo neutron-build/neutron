@@ -396,6 +396,10 @@ pub fn commit_txn(
         // before its apply, so a flip lands with the marker above T —
         // §12.6's marked case.
         cx.park("chunked:preapply")?;
+    } else {
+        // The same hold for a small commit (D4's c1: recorded, acked at
+        // the write, apply pending at the flip).
+        cx.park("commit:preapply")?;
     }
     // The ack (§12.4): SyncOn at the covering sync, SyncOff at the write.
     if sync_flag {
@@ -1037,6 +1041,9 @@ pub fn run_round(
         Sched::new(host)
     };
     run_script(&sched, script, seed);
+    if std::env::var_os("E4_TRACE").is_some() {
+        eprintln!("[trace] workload pass done");
+    }
     let (mut disk, mut model, flip_pos, flags, wal_commits, events) = {
         let g = sched.lock();
         (
@@ -1095,6 +1102,9 @@ pub fn run_round(
     // extraction's accepts).
     let mut recovery_served: Vec<(usize, u64, u64)> = Vec::new();
     let recovery = loop {
+        if std::env::var_os("E4_TRACE").is_some() {
+            eprintln!("[trace] recovery attempt {nested_fired}");
+        }
         let world = round_world(
             seed,
             recovery_disk.clone(),
@@ -1259,7 +1269,13 @@ pub fn run_round(
             );
             // The harness checkpoint (O-2 (ii) and the next round's
             // base), then amcheck (ii).
+            if std::env::var_os("E4_TRACE").is_some() {
+                eprintln!("[trace] harness checkpoint begin");
+            }
             let ck = ckpt::checkpoint(&cx, &mut |_| Ok(()));
+            if std::env::var_os("E4_TRACE").is_some() {
+                eprintln!("[trace] harness checkpoint done ({ck:?})");
+            }
             let findings_ii = amcheck::amcheck(&cx, &cfg);
             let (end_disk2, end_store) = {
                 let g = world.lock();

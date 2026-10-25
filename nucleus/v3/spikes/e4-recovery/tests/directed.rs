@@ -202,11 +202,13 @@ fn d2_marked_chunk() {
 }
 
 /// D3 (open chunk at the flip, marker later): the committer parks
-/// between its chunks and its marker (`chunked:premark`), the flip sees
-/// the transaction open, the marker lands before the crash after step
-/// 6. The transaction is recovered whole. Mutant START-LSN-PAST-CHUNK
-/// drops the open-txn case: the replay start sits past the chunks and
-/// the marker commits a transaction whose data was never replayed.
+/// between its chunks and its marker (`chunked:premark`), a second
+/// task's checkpoint forces the flip while the transaction is open,
+/// the marker lands once the park expires, and the crash fires at the
+/// committer's next script yield. The transaction is recovered whole.
+/// Mutant START-LSN-PAST-CHUNK drops the open-txn case: the replay
+/// start sits past the chunks and the marker commits a transaction
+/// whose data was never replayed.
 #[test]
 fn d3_open_chunk() {
     let ops = vec![
@@ -219,27 +221,32 @@ fn d3_open_chunk() {
             ops: vec![put(1, 1)],
         },
         // The chunks go out first; the park holds the txn open across
-        // the flip; the marker lands while the checkpoint runs on.
+        // the forced flip; the marker lands once it expires.
         ScriptOp::Park {
             name: "chunked:premark",
-            budget: 12,
+            budget: 400,
         },
         ScriptOp::Chunked {
             sync_on: true,
             ops: (0..30).map(|i| put(50 + i, 4)).collect(),
         },
+        ScriptOp::Yields(1),
     ];
     let script = Script {
-        tasks: vec![ScriptTask { ops }],
+        tasks: vec![
+            ScriptTask { ops },
+            // The forced checkpoint: its flip sees the transaction open
+            // (chunks out, no marker) and completes before the park
+            // expires, so the crash opens its meta. The leading yields
+            // land the force inside the park window.
+            ScriptTask {
+                ops: vec![ScriptOp::Yields(60), ScriptOp::Checkpoint],
+            },
+        ],
         writer: true,
         evictor: false,
-        // The flip triggers on the two small commits (commits_done = 2)
-        // while the chunked txn sits parked before its marker.
-        checkpointer_every: Some(2),
-        crash: Some(CrashSpec::Hook {
-            ckpt_index: 0,
-            hook: CkptHook::After6,
-        }),
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 5)),
         nested: Vec::new(),
     };
     let clean = run(2002, &script, &faults(FaultClass::C, knobs(0, 0)), None);
@@ -260,15 +267,30 @@ fn d3_open_chunk() {
 }
 
 /// D4 (out-of-order apply with SyncOff): c1 < c2, c2 applied, c1
-/// half-applied at the flip, crash after step 5 with c1's record never
-/// synced except by step 1. c1 is recovered whole. Mutant
-/// WAL-SYNC-T-ONLY.
+/// recorded and acked at its write (SyncOff) but its apply parked at
+/// the flip; its record is written by the writer but held before its
+/// group sync (`writer:presync`), so step 1 is the only durability
+/// c1 ever gets. Crash after step 5 with all volatile writes dropped:
+/// c1 is recovered whole. Mutant WAL-SYNC-T-ONLY syncs only through
+/// the last `ts ≤ T` record, c1's write stays volatile, and c1 (acked,
+/// so above the cut) is lost — O-1 fails and M-CKPT-T fires.
 #[test]
 fn d4_wal_sync_t_only() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
             ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+        },
+        // Hold the committer after c1's record is enqueued and counted
+        // (apply pending at the flip: T = 1 < c1 = 2).
+        ScriptOp::Park {
+            name: "commit:preapply",
+            budget: 400,
+        },
+        // Hold the writer between c1's batch write and its sync.
+        ScriptOp::Park {
+            name: "writer:presync",
+            budget: 24,
         },
         // c1: SyncOff (never synced on its own).
         ScriptOp::Commit {
@@ -277,10 +299,25 @@ fn d4_wal_sync_t_only() {
         },
     ];
     let script = Script {
-        tasks: vec![ScriptTask { ops }],
+        tasks: vec![
+            ScriptTask { ops },
+            // c2 (> c1, SyncOn): commits and applies while c1 is parked
+            // — its data is in the tree above T, and only step 1 syncs
+            // its record too. The leading yields land it inside c1's
+            // park.
+            ScriptTask {
+                ops: vec![
+                    ScriptOp::Yields(40),
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: (20..30).map(|i| put(i, 5)).collect(),
+                    },
+                ],
+            },
+        ],
         writer: true,
         evictor: false,
-        checkpointer_every: Some(2),
+        checkpointer_every: Some(3),
         crash: Some(CrashSpec::Hook {
             ckpt_index: 0,
             hook: CkptHook::After5,
@@ -297,50 +334,73 @@ fn d4_wal_sync_t_only() {
         Some(Mutant::WalSyncTOnly),
     );
     assert!(
-        !m.pass || m.o1.is_err() || m.o1.clone().unwrap() < 2,
-        "D4 mutant: c1's record must be unsynced (o1={:?})",
-        m.o1
+        !m.pass
+            || m.o1.is_err()
+            || m.o1.clone().unwrap() < 2
+            || m.monitors.contains(&"M-CKPT-T"),
+        "D4 mutant: c1's record must be unsynced (o1={:?}, monitors={:?})",
+        m.o1,
+        m.monitors
     );
 }
 
-/// D5 (split straddling a flip): a park point holds the split between
-/// its page mutations while a flip is requested (the flip waits); crash
-/// after step 5: the oracle and amcheck pass. Mutant FLIP-NO-GATE tears
-/// the image.
+/// D5 (split straddling a flip): commit A fills the tree's leaf and is
+/// applied (visible, ≤ T); commit B's inserts split that leaf, and the
+/// `split:mid` park holds the split between its page mutations while a
+/// second task's forced checkpoint requests the flip; the flip waits
+/// for the gate, so the image is the consistent post-split state.
+/// Crash after step 5: the oracle and amcheck pass. Mutant FLIP-NO-GATE
+/// does not wait: the image mixes the half-split leaf (its epoch-k
+/// content, written as the current home) with the frozen pre-split
+/// parent, and A's visible data above the torn image is lost — A is
+/// below the cut and never replayed — so the oracle or amcheck fails.
 #[test]
 fn d5_split_straddling_flip() {
+    let big = |i: u64, v: u8| Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; 400],
+    };
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
             ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
         },
-        ScriptOp::Park {
-            name: "split:mid",
-            budget: 8,
-        },
-        // Enough inserts to split the leaf while parked.
+        // Commit A (ts 2): fills the single leaf, applied and visible.
         ScriptOp::Commit {
             sync_on: true,
-            ops: (0..60).map(|i| put(i, 1)).collect(),
+            ops: (0..5).map(|i| big(i, 1)).collect(),
+        },
+        // Hold every split between its page mutations while the forced
+        // flip below is requested.
+        ScriptOp::Park {
+            name: "split:mid",
+            budget: 500,
+        },
+        // Commit B (ts 3): overfills the leaf — its split repartitions
+        // A's visible data across two pages.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (5..12).map(|i| big(i, 1)).collect(),
         },
     ];
-    let mk = |crash_hook| Script {
-        tasks: vec![ScriptTask { ops: ops.clone() }],
+    let mk = |y2: u64| Script {
+        tasks: vec![
+            ScriptTask { ops: ops.clone() },
+            ScriptTask {
+                ops: vec![ScriptOp::Yields(y2), ScriptOp::Checkpoint],
+            },
+        ],
         writer: true,
-        evictor: true,
-        checkpointer_every: Some(1),
+        evictor: false,
+        checkpointer_every: Some(1000),
         crash: Some(CrashSpec::Hook {
             ckpt_index: 0,
-            hook: crash_hook,
+            hook: CkptHook::After5,
         }),
         nested: Vec::new(),
     };
-    let clean = run(
-        2004,
-        &mk(CkptHook::After5),
-        &faults(FaultClass::C, knobs(0, 0)),
-        None,
-    );
+    let clean = run(2004, &mk(100), &faults(FaultClass::C, knobs(0, 0)), None);
     assert!(clean.o1.is_ok(), "D5 clean O-1: {:?}", clean.o1);
     assert!(
         clean.amcheck_ii.is_empty(),
@@ -349,7 +409,7 @@ fn d5_split_straddling_flip() {
     );
     let m = run(
         2004,
-        &mk(CkptHook::After5),
+        &mk(100),
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::FlipNoGate),
     );
@@ -440,55 +500,68 @@ fn d7_zombie_tail() {
 }
 
 /// D8 (stale recycled segment, reader level): a renamed segment holding
-/// old records with no new ones: the valid end is its first LSN and no
-/// record is yielded. Mutant LSN-CHECK-SKIP replays the stale records.
+/// old records with no new ones — the reader meets a record whose magic
+/// and CRC are intact but whose own LSN is not the expected position:
+/// the valid end is its first LSN and no record is yielded. Mutant
+/// LSN-CHECK-SKIP removes §12.5's stale check and the record decodes.
+/// The end-to-end arm recycles real segments (a 130 KiB WAL) and the
+/// clean round passes; the end-to-end stale harm belongs to the
+/// campaign's multi-round seeds (the card's Q11 note: §14's
+/// `commit_ts > T` filter skips most stale records in a single round).
 #[test]
 fn d8_stale_recycled_segment() {
-    // Two checkpoints recycle segments below wal_start; the renamed
-    // segment's old records then sit at a new first LSN with no new
-    // records written there yet.
-    let ops = vec![
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
-        },
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (0..10).map(|i| put(i, 1)).collect(),
-        },
-        ScriptOp::Checkpoint,
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (10..20).map(|i| put(i, 2)).collect(),
-        },
-        ScriptOp::Checkpoint,
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (20..30).map(|i| put(i, 3)).collect(),
-        },
-    ];
-    let mut script = script_with_crash(None);
-    script.tasks[0].ops = ops;
-    script.checkpointer_every = Some(2);
-    script.crash = Some(CrashSpec::Hook {
-        ckpt_index: 1,
-        hook: CkptHook::After6,
-    });
-    let clean = run(2007, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D8 clean O-1: {:?}", clean.o1);
-    // Under the mutant, stale records replay: entries from a recycled
-    // segment appear and O-1's cut or the ts cut fails.
-    let m = run(
-        2007,
-        &script,
-        &faults(FaultClass::C, knobs(0, 0)),
-        Some(Mutant::LsnCheckSkip),
-    );
+    use e4_recovery::store::wal;
+    // A real Commit record, encoded at its own lsn 100.
+    let rec = wal::enc_record(wal::K_COMMIT, (1, 1), 5, &[1, 2, 3], 100);
+    let seg_end = 1 << 20;
+    // Clean: read at the wrong position (200) — no record yields.
+    let clean = wal::dec_record_with_lsn_check(&rec, 200, seg_end, None);
+    assert!(clean.is_err(), "D8 clean: the stale record must not yield ({clean:?})");
+    // Mutant: the stale check is gone — the record decodes as new.
+    let m = wal::dec_record_with_lsn_check(&rec, 200, seg_end, Some(Mutant::LsnCheckSkip));
     assert!(
-        !m.pass || m.o1.is_err(),
-        "D8 mutant: stale records must break the round (o1={:?})",
-        m.o1
+        matches!(&m, Ok(Some(r)) if r.ts == 5 && r.lsn == 200),
+        "D8 mutant: the stale record must decode as new ({m:?})"
     );
+    // End-to-end: enough WAL for a real recycle, two checkpoints, and a
+    // crash after the second one's step 6.
+    let big = |i: u64| Op::Put {
+        tree: 2,
+        key: (i % 40).to_be_bytes().to_vec(),
+        value: vec![1u8; 400],
+    };
+    let mut ops = vec![ScriptOp::Commit {
+        sync_on: true,
+        ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+    }];
+    // 8 chunked transactions of 40 ops ≈ 8 × 16.5 KiB ≈ 132 KiB > 2
+    // segments; segment 0 is recycled by the first checkpoint.
+    for c in 0..8 {
+        ops.push(ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..40).map(|i| big(c * 40 + i)).collect(),
+        });
+    }
+    ops.push(ScriptOp::Checkpoint);
+    ops.push(ScriptOp::Chunked {
+        sync_on: true,
+        ops: (0..20).map(big).collect(),
+    });
+    ops.push(ScriptOp::Checkpoint);
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(100),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 0,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let clean_e2e = run(2007, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(clean_e2e.o1.is_ok(), "D8 e2e clean O-1: {:?}", clean_e2e.o1);
+    assert!(clean_e2e.o3_fail.is_none(), "D8 e2e clean O-3: {:?}", clean_e2e.o3_fail);
 }
 
 /// D9 (dropped rename): a recycle rename, SyncOn commits acked in the

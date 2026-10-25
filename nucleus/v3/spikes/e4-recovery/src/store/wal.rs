@@ -197,15 +197,6 @@ pub fn enc_record(kind: u8, txn: (u32, u64), ts: u64, payload: &[u8], lsn: u64) 
 }
 
 /// Patch a record's own lsn field (body offset 0 → record offset 16).
-fn patch_lsn(rec: &mut [u8], lsn: u64) {
-    let l = lsn.to_le_bytes();
-    for (i, byte) in l.iter().enumerate() {
-        if let Some(dst) = rec.get_mut(16 + i) {
-            *dst = *byte;
-        }
-    }
-}
-
 /// A decoded record.
 #[derive(Debug, Clone)]
 #[allow(clippy::len_without_is_empty)]
@@ -230,11 +221,35 @@ impl Rec {
 }
 
 /// Decode a record at `lsn` from `b` (its bytes), validating magic, crc,
-/// len and the §12.5 stale check. `Err(())` = not a valid record — bad
+/// `len` and the §12.5 stale check. `Err(())` = not a valid record — bad
 /// magic or CRC (a torn tail or an unwritten preallocated region), `len`
 /// past the segment end, or the record's own lsn ≠ the expected position
 /// (a recycled segment's stale content).
 pub fn dec_record(b: &[u8], lsn: u64, seg_end: u64) -> Result<Option<Rec>, ()> {
+    dec_record_inner(b, lsn, seg_end, false)
+}
+
+/// The decode with the LSN-CHECK-SKIP hook: under the mutant the
+/// §12.5 stale check (the record's own lsn ≠ its expected position) is
+/// skipped, so a recycled segment's stale records — whose magic and CRC
+/// are intact — decode as if they were new. The CRC itself stays
+/// checked (patching the embedded lsn would break it and make the
+/// mutant self-defeating).
+pub fn dec_record_with_lsn_check(
+    b: &[u8],
+    lsn: u64,
+    seg_end: u64,
+    mutant: Option<Mutant>,
+) -> Result<Option<Rec>, ()> {
+    dec_record_inner(b, lsn, seg_end, matches!(mutant, Some(Mutant::LsnCheckSkip)))
+}
+
+fn dec_record_inner(
+    b: &[u8],
+    lsn: u64,
+    seg_end: u64,
+    skip_lsn_check: bool,
+) -> Result<Option<Rec>, ()> {
     if b.len() < 16 || b.get(0..4) != Some(&0x4C41574Eu32.to_le_bytes()) {
         return Err(());
     }
@@ -249,7 +264,7 @@ pub fn dec_record(b: &[u8], lsn: u64, seg_end: u64) -> Result<Option<Rec>, ()> {
         return Err(());
     }
     let rlsn = rd_u64(body, 0).ok_or(())?;
-    if rlsn != lsn {
+    if rlsn != lsn && !skip_lsn_check {
         // The §12.5 stale check (LSN-CHECK-SKIP removes it).
         return Err(());
     }
@@ -265,26 +280,6 @@ pub fn dec_record(b: &[u8], lsn: u64, seg_end: u64) -> Result<Option<Rec>, ()> {
         ts,
         payload,
     }))
-}
-
-/// Decode with the LSN-CHECK-SKIP mutant hook: under the mutant the
-/// record's own lsn is overwritten with the expected position before the
-/// check, so a recycled segment's stale records (whose magic and CRC are
-/// intact) decode as if they were new.
-pub fn dec_record_with_lsn_check(
-    b: &[u8],
-    lsn: u64,
-    seg_end: u64,
-    mutant: Option<Mutant>,
-) -> Result<Option<Rec>, ()> {
-    if matches!(mutant, Some(Mutant::LsnCheckSkip)) {
-        let mut b2 = b.to_vec();
-        if b2.len() >= 24 {
-            patch_lsn(&mut b2, lsn);
-        }
-        return dec_record(&b2, lsn, seg_end);
-    }
-    dec_record(b, lsn, seg_end)
 }
 
 /// The decoded ops of a record's payload.
@@ -452,6 +447,11 @@ pub fn wal_writer_step<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
         Ok(())
     })?;
     cx.w.wake(crate::sim::WaitKey::WalAcks);
+    // A named park point (card Work 13): D4 holds the writer between
+    // its batch write and its group sync, so a flip's step 1 is the
+    // only thing that can make the batch durable (G5's "except by step
+    // 1" shape).
+    cx.park("writer:presync")?;
     // One sync per touched segment (a batch's group commit).
     for seg in touched {
         let f = cx.with("wal_writer:fid", |c| {

@@ -500,7 +500,13 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
             enqueue_end,
             wal_start,
             k,
-        } => (t, gc_w, enqueue_end, wal_start, k),
+        } => {
+            if std::env::var_os("E4_TRACE").is_some() {
+                let parks = cx.with("flip:dbg", |c| Ok(c.store().parks.clone()))?;
+                eprintln!("[trace] flip k={k} t={t} wal_start={wal_start} enqueue_end={enqueue_end} parks={parks:?}");
+            }
+            (t, gc_w, enqueue_end, wal_start, k)
+        }
         FlipOut::Abort(e) => {
             prims::gate_flip_release(cx);
             return Err(e);
@@ -662,6 +668,18 @@ fn ckpt_step2_data<H: StoreHost>(
         let Some((i, key, bytes)) = target else {
             return Ok(());
         };
+        if std::env::var_os("E4_TRACE").is_some() {
+            let (ep, dirty, copy) = cx.with("ckpt2:dbg", |c| {
+                let st = c.store();
+                Ok(st
+                    .pool
+                    .frames
+                    .get(i)
+                    .map(|f| (f.epoch, f.dirty, f.is_epoch_copy))
+                    .unwrap_or((0, false, false)))
+            })?;
+            eprintln!("[trace] step2 writes frame idx={i} key={key} epoch={ep} dirty={dirty} copy={copy}");
+        }
         let r = prims::write_fresh(cx, &bytes)?;
         cx.with("ckpt2:record", |c| {
             let st = c.store();
