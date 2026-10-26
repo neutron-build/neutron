@@ -16,7 +16,15 @@ fn main() {
     for (i, r) in rec.rounds.iter().enumerate() {
         println!(
             "round {i}: crash {} fired {} pass {} dl {} te {:?} o1 {:?} o2 {:?} o3 {:?} monitors {:?}",
-            r.crash, r.fired, r.pass, r.deadlock, r.task_error, r.o1_fail, r.o2_fail, r.o3_fail, r.monitors
+            r.crash,
+            r.fired,
+            r.pass,
+            r.deadlock,
+            r.task_error,
+            r.o1_fail,
+            r.o2_fail,
+            r.o3_fail,
+            r.monitors
         );
     }
     println!("twin: {:?}", rec.twin);

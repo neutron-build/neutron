@@ -100,6 +100,15 @@ pub enum ScriptOp {
         /// Yields to hold the snapshot for.
         span: u64,
     },
+    /// Wait until every named tree exists in the store's directory (the
+    /// round-setup barrier: a scripted transaction may only enqueue
+    /// after the setup commit's `CreateTree` records are **applied**, so
+    /// replay — which is strictly LSN-ordered — never meets a tree's ops
+    /// before its creating record. W-SCRIPT's runtime half).
+    WaitTrees {
+        /// The trees to wait for.
+        trees: Vec<u64>,
+    },
     /// Burn `n` yields.
     Yields(u64),
     /// Wait until visible_ts ≥ t.
@@ -840,6 +849,33 @@ fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
             }
             Ok(())
         }
+        ScriptOp::WaitTrees { trees } => {
+            // The round-setup barrier (W-SCRIPT's runtime half): park
+            // until every named tree is installed in the directory.
+            // `Applied` is the wake key (a CreateTree apply is progress;
+            // the apply loop wakes it — Mesa re-check on wake). A
+            // malformed script (nothing can install the tree) fails
+            // loudly, exactly like the apply-path wait.
+            loop {
+                let (missing, left, failed) = cx.with("h:waittrees", |c| {
+                    let st = c.store();
+                    Ok((
+                        trees.iter().filter(|t| !st.dir.contains_key(t)).count(),
+                        c.h().tasks_left,
+                        c.h().task_error.is_some(),
+                    ))
+                })?;
+                if missing == 0 {
+                    return Ok(());
+                }
+                if failed || left <= 1 {
+                    return Err(Fail::Invalid(format!(
+                        "trees still missing for the round setup ({missing})"
+                    )));
+                }
+                cx.wait_for(WaitKey::Applied)?;
+            }
+        }
         ScriptOp::SnapshotHold { span } => {
             // A long reader (Work 5.1): register at the current
             // `visible_ts`, hold for `span` yields, release exactly that
@@ -1402,6 +1438,20 @@ pub struct TwinSupply {
     pub image_slots: BTreeSet<u64>,
 }
 
+/// One open chunked transaction at the crash (the Q5 observable's row).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenChunk {
+    /// The transaction id.
+    pub txn: (u32, u64),
+    /// Its first chunk's LSN.
+    pub first: u64,
+    /// Its marker's commit ts, when the marker was enqueued (`None` =
+    /// the open, no-marker case).
+    pub marker_ts: Option<u64>,
+    /// Its last chunk's LSN.
+    pub last: u64,
+}
+
 /// The workload pass's quota observables (card Work 5.6), snapshotted
 /// from the store and harness slices the moment the tasks end — the
 /// crash included: every field is the crash-time view.
@@ -1431,12 +1481,11 @@ pub struct WorkloadObs {
     /// Partial applies at the crash: `(ts, done, total, chunked)` (Q5's
     /// "marked and partially applied").
     pub partial_applies: Vec<(u64, u64, u64, bool)>,
-    /// Chunked transactions open at the crash (Q5): `(txn, first chunk
-    /// lsn, the marker's ts when its marker was enqueued, the last
-    /// chunk's lsn)`. A `None` marker ts is the open (no-marker) case; a
-    /// `Some` is the marked case (the marker sits above every flip that
-    /// has not covered it, or above the open flip's `T`).
-    pub open_chunks: Vec<((u32, u64), u64, Option<u64>, u64)>,
+    /// Chunked transactions open at the crash (Q5). A `None` marker ts
+    /// is the open (no-marker) case; a `Some` is the marked case (the
+    /// marker sits above every flip that has not covered it, or above
+    /// the open flip's `T`).
+    pub open_chunks: Vec<OpenChunk>,
     /// Bulk-load phases at the crash (Q6).
     pub load_phases: Vec<(u64, LoadPhase)>,
     /// A DropTree walk was in flight (Q7).
@@ -1504,11 +1553,16 @@ pub fn run_round(
                     }
                     if *is_marker {
                         marker = Some(*ts);
-                    } else if !*is_marker && *ts == 0 {
+                    } else if *ts == 0 {
                         last = (*lsn).max(last);
                     }
                 }
-                (*txn, *first, marker, last)
+                OpenChunk {
+                    txn: *txn,
+                    first: *first,
+                    marker_ts: marker,
+                    last,
+                }
             })
             .collect();
         let obs = WorkloadObs {
@@ -1686,7 +1740,10 @@ pub fn run_round(
         };
         let arm = (nested_fired as usize) < nested_points.len();
         if arm {
-            let at = nested_points.get(nested_fired as usize).copied().unwrap_or(0);
+            let at = nested_points
+                .get(nested_fired as usize)
+                .copied()
+                .unwrap_or(0);
             cx.with("h:nest", |c| {
                 c.sched_mut().crash_at_yield = Some(at);
                 Ok(())
@@ -2018,11 +2075,7 @@ pub fn run_round(
                 &ex,
                 &mut nop,
                 &media_targets,
-                if twin_on {
-                    Some(&twin_info)
-                } else {
-                    None
-                },
+                if twin_on { Some(&twin_info) } else { None },
                 &mut sample_rng,
                 &OracleCfg::default(),
             );

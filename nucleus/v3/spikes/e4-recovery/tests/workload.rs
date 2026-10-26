@@ -35,12 +35,21 @@ fn smoke_16_seeds() {
             );
         }
         assert!(rec.defect.is_none(), "seed {seed}: defect {:?}", rec.defect);
-        // The round count follows the knobs.
-        assert_eq!(
-            rec.rounds.len() as u32,
-            Knobs::derive(seed, 0).rounds,
-            "seed {seed}: round count"
+        // The round count follows the knobs, except an early stop (a
+        // failed round or a recovery without a store ends the chain —
+        // recorded, never hidden).
+        assert!(
+            rec.rounds.len() as u32 <= Knobs::derive(seed, 0).rounds,
+            "seed {seed}: round count {} over the knobs",
+            rec.rounds.len()
         );
+        if !rec.stopped_early {
+            assert_eq!(
+                rec.rounds.len() as u32,
+                Knobs::derive(seed, 0).rounds,
+                "seed {seed}: round count without an early stop"
+            );
+        }
         // The class follows seed % 10.
         let want = match seed % 10 {
             0..=6 => "C",
@@ -48,11 +57,15 @@ fn smoke_16_seeds() {
             _ => "MW",
         };
         assert_eq!(rec.class, want, "seed {seed}: class");
-        // The twin exists exactly for MP/MW.
+        // The twin runs in lockstep with the real rounds for MP/MW
+        // (none for C).
+        let want_twin = if want == "C" { 0 } else { rec.rounds.len() };
         assert_eq!(
-            rec.twin.len() as u32,
-            if want == "C" { 0 } else { Knobs::derive(seed, 0).rounds },
-            "seed {seed}: twin rounds"
+            rec.twin.len(),
+            want_twin,
+            "seed {seed}: twin rounds ({}) must match the real rounds ({})",
+            rec.twin.len(),
+            want_twin
         );
     }
     // Determinism: two runs of the same seed give the same digest, and a
@@ -74,7 +87,11 @@ fn smoke_16_seeds() {
 fn knobs_derive_in_range() {
     for seed in 0..200u64 {
         let k = Knobs::derive(seed, 0);
-        assert!((2..=4).contains(&k.committers), "committers {}", k.committers);
+        assert!(
+            (2..=4).contains(&k.committers),
+            "committers {}",
+            k.committers
+        );
         assert!((2..=4).contains(&k.trees), "trees {}", k.trees);
         assert!(
             (1200..=3000).contains(&k.keyspace),
@@ -205,10 +222,7 @@ fn chunked_txn_spans_two_segments() {
                         _ => 32,
                     })
                     .sum();
-                assert!(
-                    bytes >= 132 * 1024,
-                    "chunked txn too small ({bytes} bytes)"
-                );
+                assert!(bytes >= 132 * 1024, "chunked txn too small ({bytes} bytes)");
                 assert!(
                     ops.len() >= 300,
                     "chunked txn op count {} below the card's 300",
@@ -266,6 +280,92 @@ fn campaign_json_round_trips() {
     assert_eq!(back[0].first_seed, Some(3));
     assert_eq!(back[0].how, Some("O-3"));
     assert_eq!(back[0].directed_caught, Some(true));
+}
+
+/// The regression pin for the round-setup barrier (the seed-3
+/// development failure, with a literal config, not a seed number): a
+/// chunked transaction racing the setup commit — without the barrier,
+/// the chunk task's records reach the WAL **below** the setup's
+/// `CreateTree`, and LSN-ordered replay applies the marker's Puts
+/// against a directory without the tree ("tree 2 missing in directory",
+/// a task error); with `WaitTrees`, the chunked task waits and the
+/// round's recovery is whole.
+#[test]
+fn setup_barrier_guards_the_wal_order() {
+    use e4_recovery::harness::{self, MediaDraw, RoundFaults, Script, ScriptOp, ScriptTask};
+    use e4_recovery::model::Model;
+    use e4_recovery::sim::FaultClass;
+
+    // The hazard, demonstrated on the exact configuration that found it
+    // (the generated round-0 script of seed 3, the barrier stripped):
+    // the chunk task can win the enqueue race, and LSN-ordered replay
+    // applies the marker's Puts against a directory without the tree
+    // ("tree 2 missing in directory" through the recovery path). With
+    // the barrier in force — the generator's own output — the same seed
+    // recovers whole. (The barrier's presence is the literal variable;
+    // the generated script is reproduced byte-identically by
+    // `build_round`, so the pin does not depend on any code path beyond
+    // it.)
+    let knobs = Knobs::derive(3, 0);
+    let cfg3 = knobs.store_cfg(None);
+    let (script_b, _, _) = workload::build_round(3, 0, &knobs, &Model::new(), 0);
+    let strip = |s: &Script| Script {
+        tasks: s
+            .tasks
+            .iter()
+            .map(|t| ScriptTask {
+                ops: t
+                    .ops
+                    .iter()
+                    .filter(|o| !matches!(o, ScriptOp::WaitTrees { .. }))
+                    .cloned()
+                    .collect(),
+            })
+            .collect(),
+        writer: s.writer,
+        evictor: s.evictor,
+        checkpointer_every: s.checkpointer_every,
+        crash: s.crash.clone(),
+        nested: Vec::new(),
+    };
+    let faults3 = RoundFaults {
+        class: FaultClass::C,
+        knobs: knobs.fault,
+        directed: Vec::new(),
+        no_r_taint: false,
+        media: MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
+    };
+    let run3 = |s: &Script| {
+        let (disk, st) = harness::create_store(cfg3.clone(), 3, 3).expect("create");
+        harness::run_round(
+            3,
+            0,
+            s,
+            &faults3,
+            cfg3.clone(),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            None,
+        )
+    };
+    let out_b = run3(&script_b);
+    assert!(
+        out_b.pass && out_b.o1.is_ok() && out_b.task_error.is_none(),
+        "the barriered generator output must pass seed 3 (te={:?}, o1={:?}, o3={:?})",
+        out_b.task_error,
+        out_b.o1,
+        out_b.o3_fail
+    );
+    let out_nb = run3(&strip(&script_b));
+    assert!(
+        !out_nb.pass,
+        "the barrierless shape must fail visibly (te={:?}, o1={:?}, o3={:?})",
+        out_nb.task_error, out_nb.o1, out_nb.o3_fail
+    );
 }
 
 /// The directed-arms table names every mutant of the enum (the mutation

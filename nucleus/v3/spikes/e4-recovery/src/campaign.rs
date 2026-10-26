@@ -75,7 +75,10 @@ fn parse_seeds(args: &[String]) -> (u64, u64) {
     let mut hi = CAMPAIGN_SEEDS - 1;
     let mut i = 0usize;
     while i < args.len() {
-        if args[i] == "--seeds" && let Some(v) = args.get(i + 1) && let Some((a, b)) = v.split_once("..") {
+        if args[i] == "--seeds"
+            && let Some(v) = args.get(i + 1)
+            && let Some((a, b)) = v.split_once("..")
+        {
             lo = a.parse().unwrap_or(0);
             hi = b.parse().unwrap_or(lo);
         }
@@ -87,7 +90,9 @@ fn parse_seeds(args: &[String]) -> (u64, u64) {
 fn parse_threads(args: &[String]) -> usize {
     let mut i = 0usize;
     while i < args.len() {
-        if args[i] == "--threads" && let Some(v) = args.get(i + 1) {
+        if args[i] == "--threads"
+            && let Some(v) = args.get(i + 1)
+        {
             return v.parse().unwrap_or(1).max(1) as usize;
         }
         i += 1;
@@ -149,16 +154,18 @@ pub fn run_range(lo: u64, hi: u64, mutant: Option<Mutant>, threads: usize) -> Ve
     let out: std::sync::Mutex<Vec<SeedRec>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| loop {
-                let s = next.fetch_add(1, Ordering::SeqCst);
-                if s > hi {
-                    break;
-                }
-                let rec = workload::run_seed(s, mutant);
-                out.lock().map(|mut o| o.push(rec)).ok();
-                let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-                if d % 500 == 0 {
-                    eprintln!("e4-campaign: {d}/{total} seeds done");
+            scope.spawn(|| {
+                loop {
+                    let s = next.fetch_add(1, Ordering::SeqCst);
+                    if s > hi {
+                        break;
+                    }
+                    let rec = workload::run_seed(s, mutant);
+                    out.lock().map(|mut o| o.push(rec)).ok();
+                    let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    if d.is_multiple_of(500) {
+                        eprintln!("e4-campaign: {d}/{total} seeds done");
+                    }
                 }
             });
         }
@@ -240,8 +247,16 @@ fn cmd_verify(args: &[String]) -> i32 {
     // 1. The seed set is exactly the campaign's (0..9999).
     let n = recs.len();
     let want = CAMPAIGN_SEEDS as usize;
-    if n != want || recs.first().map(|r| r.seed) != Some(0) || recs.last().map(|r| r.seed) != Some(CAMPAIGN_SEEDS - 1) || recs.windows(2).any(|w| w[0].seed + 1 != w[1].seed) {
-        eprintln!("e4-campaign verify: the seed set is not exactly 0..{} ({} records)", CAMPAIGN_SEEDS - 1, n);
+    if n != want
+        || recs.first().map(|r| r.seed) != Some(0)
+        || recs.last().map(|r| r.seed) != Some(CAMPAIGN_SEEDS - 1)
+        || recs.windows(2).any(|w| w[0].seed + 1 != w[1].seed)
+    {
+        eprintln!(
+            "e4-campaign verify: the seed set is not exactly 0..{} ({} records)",
+            CAMPAIGN_SEEDS - 1,
+            n
+        );
         return 2;
     }
     // 2. The digests reproduce. A re-run of every seed in the file.
@@ -254,9 +269,7 @@ fn cmd_verify(args: &[String]) -> i32 {
             if bad < 10 {
                 eprintln!(
                     "e4-campaign verify: seed {} did not reproduce ({} vs {})",
-                    a.seed,
-                    a.digest,
-                    b.digest
+                    a.seed, a.digest, b.digest
                 );
             }
             bad += 1;
@@ -350,7 +363,11 @@ fn cmd_mutants(args: &[String]) -> i32 {
             r.oracle_rate,
             r.monitor_rate,
             r.directed_caught,
-            if r.directed_encoded { "" } else { " (arm not encoded this stage)" }
+            if r.directed_encoded {
+                ""
+            } else {
+                " (arm not encoded this stage)"
+            }
         );
     }
     0
@@ -377,7 +394,7 @@ pub fn sweep_mutant(
     for r in &recs {
         let mut how: Option<&'static str> = None;
         if r.rounds.iter().any(|x| x.o1_fail.is_some()) {
-            how = Some("O-1").into();
+            how = Some("O-1");
         }
         if r.rounds.iter().any(|x| x.o2_fail.is_some()) {
             how = how.or(Some("O-2"));
@@ -394,7 +411,10 @@ pub fn sweep_mutant(
         if r.panic {
             how = how.or(Some("panic"));
         }
-        if r.rounds.iter().any(|x| x.o1_fail.is_some() || x.o2_fail.is_some() || x.o3_fail.is_some() || !x.pass) {
+        if r.rounds
+            .iter()
+            .any(|x| x.o1_fail.is_some() || x.o2_fail.is_some() || x.o3_fail.is_some() || !x.pass)
+        {
             oracle_hits += 1;
         }
         if r.rounds.iter().any(|x| !x.monitors.is_empty()) {
@@ -413,8 +433,16 @@ pub fn sweep_mutant(
             directed_caught: caught,
             first_seed: first.map(|(s, _)| s),
             how: first.map(|(_, h)| h),
-            oracle_rate: if swept > 0 { oracle_hits as f64 / swept as f64 } else { 0.0 },
-            monitor_rate: if swept > 0 { monitor_hits as f64 / swept as f64 } else { 0.0 },
+            oracle_rate: if swept > 0 {
+                oracle_hits as f64 / swept as f64
+            } else {
+                0.0
+            },
+            monitor_rate: if swept > 0 {
+                monitor_hits as f64 / swept as f64
+            } else {
+                0.0
+            },
             swept,
         },
         recs,
@@ -564,8 +592,14 @@ pub mod directed_arms {
         (Mutant::MetaBeforeSync, "d1_every_boundary / d14_frees"),
         (Mutant::FlipNoGate, "d5_split_straddling_flip"),
         (Mutant::WalSyncTOnly, "d4_wal_sync_t"),
-        (Mutant::WriteGuardNoCopy, "d16 (argued uncaught directed; campaign Q10)"),
-        (Mutant::EvictSkipImageMap, "d16 (argued uncaught directed; campaign Q10)"),
+        (
+            Mutant::WriteGuardNoCopy,
+            "d16 (argued uncaught directed; campaign Q10)",
+        ),
+        (
+            Mutant::EvictSkipImageMap,
+            "d16 (argued uncaught directed; campaign Q10)",
+        ),
         (Mutant::StartLsnPastChunk, "d3_open_chunk"),
         (Mutant::StartLsnMarkedChunk, "d2_marked_chunk"),
         (Mutant::TsAfterAppend, "d18_ts_order"),
@@ -888,7 +922,10 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
             s.push_str(&format!(
                 "{{\"pass\":{},\"o1\":{}}}",
                 t.pass,
-                t.o1_fail.as_deref().map(esc).unwrap_or_else(|| "null".into()),
+                t.o1_fail
+                    .as_deref()
+                    .map(esc)
+                    .unwrap_or_else(|| "null".into()),
             ));
         }
         s.push_str("]}");
@@ -931,7 +968,10 @@ struct Jx<'a> {
 
 impl<'a> Jx<'a> {
     fn new(s: &'a str) -> Self {
-        Jx { b: s.as_bytes(), i: 0 }
+        Jx {
+            b: s.as_bytes(),
+            i: 0,
+        }
     }
     fn ws(&mut self) {
         while self.i < self.b.len() && (self.b[self.i] as char).is_ascii_whitespace() {
@@ -960,7 +1000,10 @@ impl<'a> Jx<'a> {
         self.ws();
         let s = self.i;
         while self.i < self.b.len()
-            && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+            && matches!(
+                self.b[self.i],
+                b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
+            )
         {
             self.i += 1;
         }
@@ -991,8 +1034,9 @@ impl<'a> Jx<'a> {
                         b'"' => out.push('"'),
                         b'\\' => out.push('\\'),
                         b'u' => {
-                            let hex = std::str::from_utf8(self.b.get(self.i..self.i + 4).ok_or("u eof")?)
-                                .map_err(|_| "utf8")?;
+                            let hex =
+                                std::str::from_utf8(self.b.get(self.i..self.i + 4).ok_or("u eof")?)
+                                    .map_err(|_| "utf8")?;
                             let v = u32::from_str_radix(hex, 16).map_err(|_| "hex")?;
                             self.i += 4;
                             out.push(char::from_u32(v).unwrap_or('?'));
@@ -1173,50 +1217,46 @@ fn parse_seed(j: &mut Jx<'_>) -> Result<SeedRec, String> {
             "defect" => r.defect = j.opt_string()?,
             "rounds" => {
                 j.eat(b'[')?;
-                if j.try_eat(b']') {
-                    continue;
-                }
-                loop {
-                    r.rounds.push(parse_round(j)?);
-                    if j.try_eat(b',') {
-                        continue;
+                if !j.try_eat(b']') {
+                    'r: loop {
+                        r.rounds.push(parse_round(j)?);
+                        if j.try_eat(b',') {
+                            continue 'r;
+                        }
+                        j.eat(b']')?;
+                        break;
                     }
-                    j.eat(b']')?;
-                    break;
                 }
             }
             "twin" => {
                 j.eat(b'[')?;
-                if j.try_eat(b']') {
-                    continue;
-                }
-                loop {
-                    j.eat(b'{')?;
-                    let mut pass = false;
-                    let mut o1 = None;
-                    loop {
-                        let tk = j.string()?;
-                        j.eat(b':')?;
-                        match tk.as_str() {
-                            "pass" => pass = j.boolv()?,
-                            "o1" => o1 = j.opt_string()?,
-                            _ => j.skip_value()?,
+                if !j.try_eat(b']') {
+                    't: loop {
+                        j.eat(b'{')?;
+                        let mut pass = false;
+                        let mut o1 = None;
+                        'to: loop {
+                            let tk = j.string()?;
+                            j.eat(b':')?;
+                            match tk.as_str() {
+                                "pass" => pass = j.boolv()?,
+                                "o1" => o1 = j.opt_string()?,
+                                _ => j.skip_value()?,
+                            }
+                            if j.try_eat(b',') {
+                                continue 'to;
+                            }
+                            j.eat(b'}')?;
+                            break;
                         }
+                        r.twin
+                            .push(crate::workload::TwinRound { pass, o1_fail: o1 });
                         if j.try_eat(b',') {
-                            continue;
+                            continue 't;
                         }
-                        j.eat(b'}')?;
+                        j.eat(b']')?;
                         break;
                     }
-                    r.twin.push(crate::workload::TwinRound {
-                        pass,
-                        o1_fail: o1,
-                    });
-                    if j.try_eat(b',') {
-                        continue;
-                    }
-                    j.eat(b']')?;
-                    break;
                 }
             }
             _ => j.skip_value()?,
@@ -1347,7 +1387,7 @@ pub fn parse_mutants(text: &str) -> Result<Vec<MutantRec>, String> {
                         match kk.as_str() {
                             "mutant" => r.mutant = j.string()?,
                             "first_seed" => r.first_seed = j.opt_int()?,
-                            "how" => r.how = j.opt_string().map(|o| o.map(leak))?  ,
+                            "how" => r.how = j.opt_string().map(|o| o.map(leak))?,
                             "oracle_rate" => r.oracle_rate = j.num()?,
                             "monitor_rate" => r.monitor_rate = j.num()?,
                             "swept" => r.swept = j.int()?,

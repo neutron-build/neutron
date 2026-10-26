@@ -29,8 +29,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::harness::{
-    self, CrashSpec, LoadPhase, MediaDraw, RoundFaults, RoundOutcome, Script, ScriptOp,
-    ScriptTask, TwinSupply,
+    self, CrashSpec, LoadPhase, MediaDraw, RoundFaults, RoundOutcome, Script, ScriptOp, ScriptTask,
+    TwinSupply,
 };
 use crate::model::{CATALOG, Model, Op, PUBLIC, to_be64};
 use crate::rng::{Rng, derive};
@@ -285,8 +285,27 @@ pub fn build_round(
         }
     }
     // ---- the committer tasks ----
+    // W-SCRIPT's runtime half: when a setup commit exists, every OTHER
+    // task first waits for the created trees — otherwise a concurrent
+    // committer (the chunked task above all: its chunks enqueue outside
+    // the commit critical section) could put its records below the
+    // setup's `CreateTree` in the WAL, and LSN-ordered replay would meet
+    // a tree's ops before its creating record (the seed-3 development
+    // failure: "tree 2 missing in directory" at the chunked marker).
+    let all_trees: Vec<u64> = (2..=knobs.trees + 1).collect();
+    let has_setup = !setup.is_empty();
+    let barrier = |ops: &mut Vec<ScriptOp>| {
+        if has_setup {
+            ops.insert(
+                0,
+                ScriptOp::WaitTrees {
+                    trees: all_trees.clone(),
+                },
+            );
+        }
+    };
     let mut committers: Vec<Vec<ScriptOp>> = vec![Vec::new(); knobs.committers];
-    if !setup.is_empty() {
+    if has_setup {
         committers[0].push(ScriptOp::Commit {
             sync_on: true,
             ops: setup,
@@ -301,7 +320,7 @@ pub fn build_round(
     // without replacement (one op per entry key per transaction —
     // I-ENTRY-UNIQUE, exactly like the small commits).
     let need = 132 * 1024u64;
-    let v_min = ((need.saturating_sub(24 * n)) + n - 1) / n;
+    let v_min = (need.saturating_sub(24 * n)).div_ceil(n);
     let v_lo = v_min.clamp(8, 400);
     let mut chunked_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut chunked_ops: Vec<Op> = Vec::new();
@@ -358,8 +377,14 @@ pub fn build_round(
     committers[knobs.committers - 1].push(ScriptOp::SnapshotHold {
         span: 4 + rng.below(16),
     });
+    // The setup barrier at the FRONT of every committer except the setup
+    // task itself (its own ops are task-ordered after the setup commit).
+    for ops in committers.iter_mut().skip(1) {
+        barrier(ops);
+    }
     // ---- the GC sweeper task: sweeps concurrent with checkpoints ----
     let mut gc_ops: Vec<ScriptOp> = Vec::new();
+    barrier(&mut gc_ops);
     for _ in 0..2 + rng.below(3) {
         let tree = 2 + rng.below(write_max - 1);
         gc_ops.push(ScriptOp::Yields(1 + rng.below(4)));
@@ -367,18 +392,14 @@ pub fn build_round(
     }
     // ---- the DDL/bulk task ----
     let mut ddl_ops: Vec<ScriptOp> = Vec::new();
+    barrier(&mut ddl_ops);
     if knobs.bulk_load {
         // §12.8's real `BulkLoad`: a fresh tree id (never a user tree),
         // 90–160 entries, values 8–200 B (≤ V_INLINE).
         let tree = 50 + round as u64;
         let n = 90 + rng.below(71);
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
-            .map(|i| {
-                (
-                    to_be64(i % (4 * knobs.keyspace / 5)),
-                    value_of(&mut rng, 8),
-                )
-            })
+            .map(|i| (to_be64(i % (4 * knobs.keyspace / 5)), value_of(&mut rng, 8)))
             .collect();
         ddl_ops.push(ScriptOp::Yields(1 + rng.below(3)));
         ddl_ops.push(ScriptOp::BulkLoad { tree, entries });
@@ -394,7 +415,9 @@ pub fn build_round(
                     tree: CATALOG,
                     key: to_be64(knobs.trees + 1),
                 },
-                Op::DropTree { tree: knobs.trees + 1 },
+                Op::DropTree {
+                    tree: knobs.trees + 1,
+                },
             ],
         });
     }
@@ -449,7 +472,7 @@ pub fn crash_spec(
     knobs: &Knobs,
     tasks: &[ScriptTask],
 ) -> (Option<CrashSpec>, String, String) {
-    if (seed / 10) % 2 == 0 {
+    if (seed / 10).is_multiple_of(2) {
         let hook = CKPT_HOOKS[((seed / 20) % 10) as usize];
         let idx = knobs.target_ckpt;
         (
@@ -644,8 +667,14 @@ impl SeedRec {
     pub fn finish(&mut self) {
         let mut s = format!(
             "{}|{}|{}|{}|{}|{}|{}|{:?}",
-            self.seed, self.class, self.knobs, self.stopped_early, self.deadlock, self.panic,
-            self.baton, self.defect
+            self.seed,
+            self.class,
+            self.knobs,
+            self.stopped_early,
+            self.deadlock,
+            self.panic,
+            self.baton,
+            self.defect
         );
         for r in &self.rounds {
             s.push_str(&format!(
@@ -851,12 +880,25 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         }
         match out.end_store.clone() {
             Some(st) => {
-                chain = Some(Chain {
-                    disk: out.end_disk.clone(),
-                    st,
-                    model: out.end_model,
-                    cut: out.cut,
-                });
+                // Judgment call (documented in the README): the chain
+                // continues only after a round that **passed** the
+                // oracle. A failed round is X5-R3's root-cause unit —
+                // running further rounds on its base would only stack
+                // fallout of the failure the ruling must judge first
+                // (the R6 case leaves a tainted referenced slot in the
+                // recovered image; the next round's workload then trips
+                // §3.3 as a task error). The failed round stays recorded
+                // and still fails the seed.
+                if out.pass {
+                    chain = Some(Chain {
+                        disk: out.end_disk.clone(),
+                        st,
+                        model: out.end_model,
+                        cut: out.cut,
+                    });
+                } else {
+                    rec.stopped_early = true;
+                }
             }
             None => {
                 // Recovery returned no store: 5.5's "the next round
@@ -934,9 +976,9 @@ fn round_rec(
     // still open (no flip has covered it — the marker sits above the
     // last flip's T). Partial: a chunked commit's apply interrupted
     // with ≥ 1 op applied.
-    for ((_, _txn), first, marker, last) in &obs.open_chunks {
-        if last - first >= WAL_SEG {
-            match marker {
+    for oc in &obs.open_chunks {
+        if oc.last - oc.first >= WAL_SEG {
+            match oc.marker_ts {
                 None => rr.q5_open = true,
                 Some(_) => rr.q5_marked = true,
             }
@@ -964,12 +1006,11 @@ fn round_rec(
     // Q10/Q11/Q17: the store counters at the crash or in the recovered
     // end state (the harness checkpoint and recovery run there too).
     let end = out.end_store.as_ref();
-    rr.q10_exhausted = obs.epoch_exhausted >= 1
-        || end.map(|s| s.epoch_exhausted >= 1).unwrap_or(false);
+    rr.q10_exhausted =
+        obs.epoch_exhausted >= 1 || end.map(|s| s.epoch_exhausted >= 1).unwrap_or(false);
     rr.q11_stale_seg =
         obs.stale_seg_reads >= 1 || end.map(|s| s.stale_seg_reads >= 1).unwrap_or(false);
-    rr.q17_freeset_grew =
-        obs.freeset_grew || end.map(|s| s.freeset_grew).unwrap_or(false);
+    rr.q17_freeset_grew = obs.freeset_grew || end.map(|s| s.freeset_grew).unwrap_or(false);
     // Q12: renames the F-CRASH directory draw dropped.
     rr.q12_dropped_rename = out.renames_dropped >= 1;
     // Q13/Q14: page faults on the (i)-point image's referenced slots,
@@ -1002,7 +1043,11 @@ fn round_rec(
     // leaf's cap) — read from the recovered meta, else the (i) walk's.
     let next_lpid = end
         .map(|s| s.meta.next_lpid)
-        .or_else(|| harness::durable_image(&out.crashed_disk, cfg).2.map(|m| m.next_lpid))
+        .or_else(|| {
+            harness::durable_image(&out.crashed_disk, cfg)
+                .2
+                .map(|m| m.next_lpid)
+        })
         .unwrap_or(0);
     rr.q16_map_depth2 = next_lpid > cfg.map_leaf_cap;
     // Q18: a GC sweep advanced past the previous gc_w inside an open
@@ -1148,30 +1193,144 @@ pub fn quotas(recs: &[SeedRec], expected_seeds: u64) -> Vec<QuotaRow> {
         });
     }
     rows.extend([
-        QuotaRow { id: "Q2", what: "seeds with ≥ 1 nested recovery crash".into(), achieved: q2, required: 2000 },
-        QuotaRow { id: "Q3", what: "seeds with 2 nested recovery crashes".into(), achieved: q3, required: 200 },
-        QuotaRow { id: "Q4", what: "interrupted ckpt with split and merge (steps 0–3)".into(), achieved: q4, required: 1000 },
-        QuotaRow { id: "Q5a", what: "crash with a ≥ 2-segment chunked txn open (no marker)".into(), achieved: q5o, required: 200 },
-        QuotaRow { id: "Q5b", what: "crash with a chunked txn marked above T at the flip".into(), achieved: q5m, required: 200 },
-        QuotaRow { id: "Q5c", what: "crash with a chunked txn marked and partially applied".into(), achieved: q5p, required: 200 },
-        QuotaRow { id: "Q6a", what: "crash between bulk load and publication".into(), achieved: q6u, required: 200 },
-        QuotaRow { id: "Q6b", what: "crash after publication with the load in the image".into(), achieved: q6p, required: 200 },
-        QuotaRow { id: "Q7", what: "crash during a DropTree walk".into(), achieved: q7, required: 200 },
-        QuotaRow { id: "Q8", what: "seeds with acked SyncOff commits lost".into(), achieved: q8, required: 100 },
-        QuotaRow { id: "Q9", what: "rounds whose image holds part of a commit > T".into(), achieved: q9, required: 500 },
-        QuotaRow { id: "Q10", what: "rounds with R_EPOCH exhausted".into(), achieved: q10, required: 500 },
-        QuotaRow { id: "Q11", what: "rounds with a stale record read at a renamed segment start".into(), achieved: q11, required: 100 },
-        QuotaRow { id: "Q12", what: "rounds with a G1 rename dropped by F-CRASH".into(), achieved: q12, required: 100 },
-        QuotaRow { id: "Q13a", what: "MP rounds with LOST on a referenced slot".into(), achieved: q13l, required: 300 },
-        QuotaRow { id: "Q13b", what: "MP rounds with MISDIRECTED on a referenced slot".into(), achieved: q13m, required: 300 },
-        QuotaRow { id: "Q13c", what: "MP rounds with TORN on a referenced slot".into(), achieved: q13t, required: 300 },
-        QuotaRow { id: "Q14", what: "MP rounds with a meta-slot fault".into(), achieved: q14, required: 50 },
-        QuotaRow { id: "Q15", what: "MW rounds with a LOST or TORN durable record".into(), achieved: q15, required: 300 },
-        QuotaRow { id: "Q16", what: "seeds with map depth ≥ 2 (50%)".into(), achieved: q16, required: expected_seeds / 2 },
-        QuotaRow { id: "Q17", what: "rounds where FreeSet allocation grew the file in step 2".into(), achieved: q17, required: 100 },
-        QuotaRow { id: "Q18", what: "rounds with GC past the previous gc_w inside a recovering image".into(), achieved: q18, required: 1000 },
-        QuotaRow { id: "SIZING", what: "rounds missing Work 5.3's ≥ 4·F dirtied LPIDs (harness defects)".into(), achieved: sizing_miss, required: 0 },
+        QuotaRow {
+            id: "Q2",
+            what: "seeds with ≥ 1 nested recovery crash".into(),
+            achieved: q2,
+            required: 2000,
+        },
+        QuotaRow {
+            id: "Q3",
+            what: "seeds with 2 nested recovery crashes".into(),
+            achieved: q3,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q4",
+            what: "interrupted ckpt with split and merge (steps 0–3)".into(),
+            achieved: q4,
+            required: 1000,
+        },
+        QuotaRow {
+            id: "Q5a",
+            what: "crash with a ≥ 2-segment chunked txn open (no marker)".into(),
+            achieved: q5o,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q5b",
+            what: "crash with a chunked txn marked above T at the flip".into(),
+            achieved: q5m,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q5c",
+            what: "crash with a chunked txn marked and partially applied".into(),
+            achieved: q5p,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q6a",
+            what: "crash between bulk load and publication".into(),
+            achieved: q6u,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q6b",
+            what: "crash after publication with the load in the image".into(),
+            achieved: q6p,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q7",
+            what: "crash during a DropTree walk".into(),
+            achieved: q7,
+            required: 200,
+        },
+        QuotaRow {
+            id: "Q8",
+            what: "seeds with acked SyncOff commits lost".into(),
+            achieved: q8,
+            required: 100,
+        },
+        QuotaRow {
+            id: "Q9",
+            what: "rounds whose image holds part of a commit > T".into(),
+            achieved: q9,
+            required: 500,
+        },
+        QuotaRow {
+            id: "Q10",
+            what: "rounds with R_EPOCH exhausted".into(),
+            achieved: q10,
+            required: 500,
+        },
+        QuotaRow {
+            id: "Q11",
+            what: "rounds with a stale record read at a renamed segment start".into(),
+            achieved: q11,
+            required: 100,
+        },
+        QuotaRow {
+            id: "Q12",
+            what: "rounds with a G1 rename dropped by F-CRASH".into(),
+            achieved: q12,
+            required: 100,
+        },
+        QuotaRow {
+            id: "Q13a",
+            what: "MP rounds with LOST on a referenced slot".into(),
+            achieved: q13l,
+            required: 300,
+        },
+        QuotaRow {
+            id: "Q13b",
+            what: "MP rounds with MISDIRECTED on a referenced slot".into(),
+            achieved: q13m,
+            required: 300,
+        },
+        QuotaRow {
+            id: "Q13c",
+            what: "MP rounds with TORN on a referenced slot".into(),
+            achieved: q13t,
+            required: 300,
+        },
+        QuotaRow {
+            id: "Q14",
+            what: "MP rounds with a meta-slot fault".into(),
+            achieved: q14,
+            required: 50,
+        },
+        QuotaRow {
+            id: "Q15",
+            what: "MW rounds with a LOST or TORN durable record".into(),
+            achieved: q15,
+            required: 300,
+        },
+        QuotaRow {
+            id: "Q16",
+            what: "seeds with map depth ≥ 2 (50%)".into(),
+            achieved: q16,
+            required: expected_seeds / 2,
+        },
+        QuotaRow {
+            id: "Q17",
+            what: "rounds where FreeSet allocation grew the file in step 2".into(),
+            achieved: q17,
+            required: 100,
+        },
+        QuotaRow {
+            id: "Q18",
+            what: "rounds with GC past the previous gc_w inside a recovering image".into(),
+            achieved: q18,
+            required: 1000,
+        },
+        QuotaRow {
+            id: "SIZING",
+            what: "rounds missing Work 5.3's ≥ 4·F dirtied LPIDs (harness defects)".into(),
+            achieved: sizing_miss,
+            required: 0,
+        },
     ]);
     rows
 }
-
