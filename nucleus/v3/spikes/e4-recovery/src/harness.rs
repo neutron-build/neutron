@@ -419,7 +419,46 @@ pub fn commit_txn(
         _ => (0, Vec::new()),
     });
     for op in ordered {
+        // A Put/Delete can race the apply of an **earlier commit's**
+        // CreateTree for its tree (applies finish out of ts order,
+        // §12.4): the directory entry is not installed yet, and the
+        // gated insert would fail "tree missing in directory" — a
+        // harness orchestration defect, not a store failure (recovery
+        // replays in LSN order and never sees it). The WAL guarantees
+        // that create's record precedes this one at a lower LSN, so its
+        // apply is pending in this workload: wait for it. A same-commit
+        // create applies first here (CreateTree sorts to the front of
+        // `ordered`).
+        if let Op::Put { tree, .. } | Op::Delete { tree, .. } = op {
+            loop {
+                let (present, left, failed) = cx.with("h:applydir", |c| {
+                    Ok((
+                        c.store().dir.contains_key(tree),
+                        c.h().tasks_left,
+                        c.h().task_error.is_some(),
+                    ))
+                })?;
+                if present {
+                    break;
+                }
+                if failed || left <= 1 {
+                    // No other committer can still install the tree:
+                    // a malformed script — fail the op loudly rather
+                    // than parking forever (the service tasks would
+                    // keep the baton circulating and the deadlock
+                    // detector would never fire).
+                    return Err(Fail::Invalid(format!("tree {tree} missing for apply")));
+                }
+                cx.wait_for(WaitKey::Applied)?;
+            }
+        }
         ckpt::apply_op(cx, &to_wop(op), ts, false)?;
+        if matches!(op, Op::CreateTree { .. }) {
+            // A freshly installed directory entry can release another
+            // committer's apply wait above: `Applied` is the wake key
+            // (a new entry is progress; Mesa re-check on wake).
+            cx.w.wake(WaitKey::Applied);
+        }
         // A named park point (Work 13): D6/D13 hold the committer
         // **between** apply entries, so a flip's step 2 images a
         // partially applied commit — recovery then replays the whole
@@ -598,9 +637,17 @@ fn run_task(
                     // A failed script op is a round failure, recorded
                     // and reported — never a silent early exit (the
                     // service tasks would spin on a workload that can
-                    // no longer finish). The crash delivery itself
-                    // (every task unwinds with `Crashed` once the world
-                    // crashes) is the round's normal end, not a failure.
+                    // no longer finish). The recorded message carries
+                    // the **original** failure: `script_op` returns the
+                    // store's `Fail` unchanged (the gate's N3 — the
+                    // draft's `fail_of` folded every non-sim store
+                    // error into `SimFail::Crashed`, so D18's clean
+                    // round recorded task_error="Crashed" and hid the
+                    // real "tree 2 missing in directory" behind a
+                    // phantom crash). The crash delivery itself (every
+                    // task unwinds with `Crashed` once the world
+                    // crashes) is the round's normal end, not a
+                    // failure.
                     let world_crashed = cx
                         .with("h:taskerr", |c| Ok(c.sched_mut().crashed))
                         .unwrap_or(true);
@@ -618,7 +665,10 @@ fn run_task(
                         cx.w.wake(WaitKey::MetaDurable);
                         cx.w.wake(WaitKey::Applied);
                     }
-                    return Err(e);
+                    return Err(match e {
+                        Fail::Sim(s) => s,
+                        _ => SimFail::Internal("script op failed"),
+                    });
                 }
             }
         }
@@ -660,50 +710,43 @@ fn run_task(
     Ok(())
 }
 
-fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), SimFail> {
-    let r: Result<(), SimFail> = match op {
-        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false)
-            .map(|_| ())
-            .map_err(fail_of),
-        ScriptOp::Chunked { sync_on, ops } => commit_txn(cx, ops, *sync_on, true)
-            .map(|_| ())
-            .map_err(fail_of),
-        ScriptOp::Gc { tree, w } => gc_sweep(cx, *tree, *w).map_err(fail_of),
+/// Run one scripted op. Returns the store's `Fail` unchanged (every
+/// `Cx` call already yields `Fail`): the task runner records the
+/// original error, never a masked one (the gate's N3).
+fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
+    match op {
+        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false).map(|_| ()),
+        ScriptOp::Chunked { sync_on, ops } => commit_txn(cx, ops, *sync_on, true).map(|_| ()),
+        ScriptOp::Gc { tree, w } => gc_sweep(cx, *tree, *w),
         ScriptOp::Checkpoint => {
             cx.with("h:force", |c| {
                 c.h().force_ckpt = true;
                 Ok(())
-            })
-            .map_err(fail_of)?;
-            wait_ckpt(cx).map_err(fail_of)
+            })?;
+            wait_ckpt(cx)
         }
-        ScriptOp::Park { name, budget } => cx
-            .with("h:park", |c| {
-                c.store().parks.insert(name, *budget);
-                Ok(())
-            })
-            .map_err(fail_of),
+        ScriptOp::Park { name, budget } => cx.with("h:park", |c| {
+            c.store().parks.insert(name, *budget);
+            Ok(())
+        }),
         ScriptOp::Yields(n) => {
             for _ in 0..*n {
-                cx.yield_now("h:yields").map_err(fail_of)?;
+                cx.yield_now("h:yields")?;
             }
             Ok(())
         }
         ScriptOp::WaitVisible(v) => {
             loop {
-                let vis = cx
-                    .with("h:waitv", |c| Ok(c.store().seq.visible_ts))
-                    .map_err(fail_of)?;
+                let vis = cx.with("h:waitv", |c| Ok(c.store().seq.visible_ts))?;
                 if vis >= *v {
                     break;
                 }
-                cx.wait_for(WaitKey::Applied).map_err(fail_of)?;
+                cx.wait_for(WaitKey::Applied)?;
             }
             Ok(())
         }
-        ScriptOp::BulkLoad { tree, entries } => bulk_load(cx, *tree, entries).map_err(fail_of),
-    };
-    r
+        ScriptOp::BulkLoad { tree, entries } => bulk_load(cx, *tree, entries),
+    }
 }
 
 /// A full GC sweep over a tree (loop gc_step until done).

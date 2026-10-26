@@ -2088,8 +2088,23 @@ fn d17_integrity() {
 }
 
 /// D18 (ts order): two committers, and under the mutant a yield between
-/// ts assignment and enqueue. Crash losing the lower-LSN record:
-/// M-WAL-ORDER fires and the oracle fails. Mutant TS-AFTER-APPEND.
+/// ts assignment and enqueue (I-WAL-TS-ORDER). Task A creates and
+/// publishes the tree, then races its SyncOn commit against task B's
+/// SyncOff commit; the crash lands at A's script yield right after the
+/// racing commit, dropping volatile writes. Clean: the critical section
+/// is atomic (ts and enqueue in one section), so `commit_ts` increases
+/// with `lsn`, M-WAL-ORDER stays silent and the oracle passes. Mutant
+/// TS-AFTER-APPEND: A's section ends after the ts assignment, B — parked
+/// at the section wait — takes the next ts and enqueues at the lower
+/// LSN, so A's lower-ts record lands above it; M-WAL-ORDER fires on the
+/// issued records and the oracle fails besides (the inversion also
+/// breaks the ack/replay agreement the extraction sees).
+///
+/// (The run-1 shape's clean arm was vacuous — `task_error="Crashed"`
+/// from `fail_of` masking a real "tree 2 missing in directory": task B's
+/// apply raced ahead of the create-commit's apply. The harness now (a)
+/// records the original failure and (b) waits for the creating commit's
+/// directory entry — applies finish out of ts order by design, §12.4.)
 #[test]
 fn d18_ts_order() {
     let ops_a = vec![
@@ -2101,13 +2116,15 @@ fn d18_ts_order() {
                 publish(2),
             ],
         },
+        ScriptOp::Yields(1),
         ScriptOp::Commit {
             sync_on: true,
             ops: (0..10).map(|i| put(i, 1)).collect(),
         },
+        ScriptOp::Yields(1),
     ];
     let ops_b = vec![ScriptOp::Commit {
-        sync_on: true,
+        sync_on: false,
         ops: (10..20).map(|i| put(i, 2)).collect(),
     }];
     let script = Script {
@@ -2115,25 +2132,34 @@ fn d18_ts_order() {
         writer: true,
         evictor: false,
         checkpointer_every: Some(100),
-        crash: Some(CrashSpec::TaskYield(1, 2)),
+        crash: Some(CrashSpec::TaskYield(1, 4)),
         nested: Vec::new(),
     };
-    let clean = run(2017, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D18 clean O-1: {:?}", clean.o1);
+    let clean = run(2023, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        clean.pass,
+        "D18 clean: the round must pass (o1={:?}, te={:?}, mon={:?})",
+        clean.o1, clean.task_error, clean.monitors
+    );
     assert!(
         !clean.monitors.contains(&"M-WAL-ORDER"),
         "D18 clean: M-WAL-ORDER fired"
     );
     let m = run(
-        2017,
+        2023,
         &script,
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::TsAfterAppend),
     );
     assert!(
-        m.monitors.contains(&"M-WAL-ORDER") || !m.pass || m.o1.is_err(),
-        "D18 mutant: M-WAL-ORDER or the oracle must fail (monitors={:?}, o1={:?})",
-        m.monitors,
-        m.o1
+        m.monitors.contains(&"M-WAL-ORDER"),
+        "D18 mutant: M-WAL-ORDER must fire on the inversion (monitors={:?})",
+        m.monitors
+    );
+    assert!(
+        !m.pass && m.o1.is_err(),
+        "D18 mutant: the oracle must fail too (o1={:?}, pass={})",
+        m.o1,
+        m.pass
     );
 }
