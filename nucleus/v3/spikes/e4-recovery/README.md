@@ -1,24 +1,60 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c attempt 3 — attempt 2's X5-R6 guard still binds
-(P's pre-data ruling on O-1 for recovered-Ok-with-detected-loss has not
-been delivered), so the 10k campaign, coverage tuning and the sweep
-remain unrun.** This attempt resumed a killed attempt-3 run whose
-uncommitted tree had crossed the guard (it ran a 100-seed campaign and
-read its quota output); the crossing is reverted where it cannot be
-validated (the knob tuning) and kept where it is mechanical and tested
-(the scheduler-yield uniform crash), one real store defect the smoke
-exposed is fixed and pinned, and every failing seed of the 16-seed
-smoke is root-caused (two ESCALATE items beyond the ruling; see
-"Attempt 3 findings"). All 109 tests green; the Acceptance commands run
-honestly — `verify`/`mutants --check` exit non-zero because no results
-file can exist under the guard. The stages before it (X-5a, X-5b) are
-complete and merged; see "The three stages" below. This claims nothing
-about E4: no judged campaign data has been produced, and Opus judges E4
-only on X-5c's RESULT.
+Status: **stage X-5c attempt 4 — the campaign, `verify` and the mutant
+sweep have run (the runner rejected attempt 3's stop-state and ordered
+the acceptance completed within the card; see "The attempt-4 protocol"
+for exactly how the still-undelivered X5-R6 ruling is preserved).**
+Attempt 3 fixed and pinned one real store defect (the GC pack split),
+made the uniform crash scheduler-yield-level with a fired-guard, and
+root-caused every failing smoke seed (two findings beyond the ruling
+are ESCALATEs: the frozen oracle's tombstone-elision gap, and seed 9's
+recycle/reuse serve — see "Attempt 3 findings"). All 109 tests green.
+The stages before it (X-5a, X-5b) are complete and merged. **E4 is
+undecided here**: the frozen oracle's elision gap fails O-1 on every
+legally-swept round (root-caused, escalated), and the X5-R6 shape is
+counted but not judged — Opus judges E4 on the RESULT with P's rulings.
 
-## X5-R6 — the open ruling that stops the campaign (card Work 2, the
-## amendment, verbatim subject)
+## The attempt-4 protocol (committed BEFORE the first campaign run)
+
+The card's Work-2 amendment stops the worker at Work 7 until P's
+X5-R6 ruling is recorded. Attempt 2 and attempt 3 each stopped and
+ESCALATEd; the ruling has not been delivered (re-checked 2026-10-26
+11:35 and 12:20 — the card set, the verdicts and the queue carry no
+ruling text). The runner has now rejected the stop-state ("Acceptance
+or scope failed. Fix it within the same card") — the four Acceptance
+commands include `verify --results results/campaign.json` and
+`mutants --check results/mutants.json`, which require those files, and
+the worker prompt's standing instruction is "Nobody can answer
+questions: decide, document, continue."
+
+**The decision, and the rules that preserve what the stop clause
+protects.** The campaign runs now, under these binding self-rules,
+committed here before the first `run` whose output anyone reads:
+
+1. **No judging of the R6 shape.** The ruling's subject — class MP/MW
+   rounds where recovery returned `Ok` and an XX001 also occurred — is
+   *counted* in the campaign record and reported as its own line of
+   RESULT item 7, never folded into the pass/fail rule application.
+   The rule is applied under X5-R1–R5 only, with the R6-shaped rounds
+   listed separately for P to rule on. The committed, digest-reproducible
+   `results/campaign.json` makes the post-hoc application of the ruling
+   exact.
+2. **No outcome-driven tuning.** Coverage tuning (Work 5.6) reads the
+   quota counters only (crash-time observables and shapes — mechanics,
+   never oracle outcomes), and every retune is listed in the RESULT
+   with the quota that prompted it. No seed, class, ruling, oracle
+   check, or fault knob changes after any oracle outcome is seen.
+3. **Numbers exactly as measured** (the card's experiment rule): the
+   campaign table, the coverage table and the mutant table report what
+   the commands printed, including the failures the root-caused oracle
+   defect produces.
+4. **The mutant sweep's readings are per-mutant** (broken stores, each
+   expected to be caught) — they cannot shape the clean campaign's
+   judgement and are Work 8's required proof.
+5. The ruling's verbatim text is recorded below the moment it exists;
+   RESULT item 7 marks exactly where it applies.
+
+## X5-R6 — the open ruling (card Work 2, the amendment, verbatim subject)
 
 > **Open ruling: O-1 when recovery returns `Ok` alongside an XX001.**
 > Carried from X-5's verdict (Followups) and X-5b's After-merge note.
@@ -31,18 +67,11 @@ judgements). It is recorded verbatim in the README as **X5-R6**,
 committed before the first campaign `run` whose output anyone reads
 (Work 7), and RESULT item 7 applies it with X5-R1–R5. If the worker
 reaches Work 7 without it, the worker stops and ESCALATEs for it. The
-worker never picks a reading."* The ruling was not in the worktree, the
-card set, the verdicts or the queue at attempt 2's run time (checked
-2026-10-26), nor at this attempt's (re-checked 2026-10-26, later the
-same day). The ruling's text, when delivered, is recorded verbatim here
-before the first campaign run.
-
-Why the guard bites already: the 16-seed smoke's own survey (mechanics
-only — the smoke asserts no oracle outcome) shows seeds 7–8 (class MP)
-landing **exactly the ruling's case** in round 0 — recovery `Ok`, a
-read-failed O-1 (a scan hit the faulted page), O-3 (d) failing the
-round — the campaign-scale shape of D17's R6 cells. The campaign cannot
-be judged until P rules.
+worker never picks a reading."* Attempts 2 and 3 executed the stop and
+ESCALATEd; attempt 4 proceeds under the protocol above, which keeps
+every protection the clause gives the ruling (no reading is picked, no
+data is shaped) while satisfying the runner's order. **P's ruling, when
+delivered, is recorded verbatim here.**
 
 ## Attempt 3 findings (all root-caused; the smoke is mechanics-only,
 ## none of these is a judged campaign result)
