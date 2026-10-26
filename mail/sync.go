@@ -52,6 +52,72 @@ type Engine struct {
 	Hooks IdentityHooks
 
 	accountLocks sync.Map // AccountID -> *sync.Mutex
+
+	// enumerated remembers, per account, which envelopes this process
+	// fetched since the account's last reset or rescan. A provider that
+	// lists each message once per mailbox (Gmail, once per label) would
+	// otherwise refetch the same envelope for every mailbox it appears in.
+	// It is memory only: a restart costs refetches, never correctness.
+	enumMu     sync.Mutex
+	enumerated map[AccountID]map[MessageID]struct{}
+}
+
+// maxEnumerated bounds one account's remembered set. Past it the set is
+// dropped and later enumerations simply fetch again.
+const maxEnumerated = 250_000
+
+// rememberEnumerated records the envelopes fetched for listing entries.
+// Delta fetches are not recorded: see forgetEnumeratedID.
+func (e *Engine) rememberEnumerated(acct AccountID, envs []Envelope, listed map[MessageID]bool) {
+	e.enumMu.Lock()
+	defer e.enumMu.Unlock()
+	if e.enumerated == nil {
+		e.enumerated = map[AccountID]map[MessageID]struct{}{}
+	}
+	set := e.enumerated[acct]
+	if set == nil || len(set)+len(envs) > maxEnumerated {
+		set = map[MessageID]struct{}{}
+		e.enumerated[acct] = set
+	}
+	for _, env := range envs {
+		if listed[env.ID] {
+			set[env.ID] = struct{}{}
+		}
+	}
+}
+
+// forgetEnumeratedID drops a message a delta reported. A message that
+// changed or moved since its listing fetch may have changed where no
+// delta this engine reads can see it (Gmail history is read per label),
+// so its next listing entry fetches it again.
+func (e *Engine) forgetEnumeratedID(acct AccountID, id MessageID) {
+	e.enumMu.Lock()
+	defer e.enumMu.Unlock()
+	delete(e.enumerated[acct], id)
+}
+
+// forgetEnumerated runs whenever an account's deltas stop covering what it
+// holds (an invalidated cursor, a requested rescan). Those enumerations
+// exist to refresh held messages, so nothing fetched earlier may be skipped.
+func (e *Engine) forgetEnumerated(acct AccountID) {
+	e.enumMu.Lock()
+	defer e.enumMu.Unlock()
+	delete(e.enumerated, acct)
+}
+
+// alreadyEnumerated reports whether a bare-ID listing entry can count as
+// seen without a fetch: this process fetched it for a listing since the
+// last reset, its envelope carried every mailbox it belonged to, and no
+// delta has reported it since. The mirror must also still hold it.
+func (e *Engine) alreadyEnumerated(ctx context.Context, acct AccountID, id MessageID) bool {
+	e.enumMu.Lock()
+	_, ok := e.enumerated[acct][id]
+	e.enumMu.Unlock()
+	if !ok {
+		return false
+	}
+	env, err := e.store.Envelope(ctx, acct, id)
+	return err == nil && env != nil
 }
 
 func (e *Engine) lockAccount(acct AccountID) func() {
@@ -197,6 +263,7 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 			if errors.Is(err, ErrCursorInvalid) && !resetUsed {
 				resetUsed = true
 				rep.Reset = true
+				e.forgetEnumerated(acct)
 				if scanCapable {
 					return e.beginScanAndRun(ctx, acct, box, ad, rep)
 				}
@@ -215,6 +282,7 @@ func (e *Engine) SyncMailbox(ctx context.Context, acct AccountID, box MailboxID,
 			}
 			resetUsed = true
 			rep.Reset = true
+			e.forgetEnumerated(acct)
 			e.log.InfoContext(ctx, "provider invalidated cursor, refetching mailbox",
 				"account", acct, "mailbox", box)
 			if scanCapable {
@@ -303,6 +371,7 @@ func (e *Engine) RequestRescanVersion(ctx context.Context, acct AccountID, ad Ad
 	if !ok {
 		return fmt.Errorf("mail: store %T cannot stage reconciliation scans", e.store)
 	}
+	e.forgetEnumerated(acct)
 	boxes, err := ad.Mailboxes(ctx)
 	if err != nil {
 		return e.classify(ctx, acct, err)
@@ -386,6 +455,7 @@ func (e *Engine) resumeScan(ctx context.Context, acct AccountID, box MailboxID, 
 				if errors.Is(err, ErrCursorInvalid) && !restarted {
 					restarted = true
 					rep.Reset = true
+					e.forgetEnumerated(acct)
 					fresh, berr := scans.BeginScanGeneration(ctx, acct, box, scan.Generation)
 					if berr != nil {
 						return nil, berr
@@ -402,6 +472,7 @@ func (e *Engine) resumeScan(ctx context.Context, acct AccountID, box MailboxID, 
 				}
 				restarted = true
 				rep.Reset = true
+				e.forgetEnumerated(acct)
 				fresh, berr := scans.BeginScanGeneration(ctx, acct, box, scan.Generation)
 				if berr != nil {
 					return nil, berr
@@ -535,17 +606,31 @@ type pageUpserts struct {
 func (e *Engine) prepareUpserts(ctx context.Context, acct AccountID, box MailboxID, ad Adapter, changes *Changes) (*pageUpserts, error) {
 	out := &pageUpserts{}
 	var fetch []MessageID
+	listed := map[MessageID]bool{}
 
 	for _, c := range changes.Changes {
+		if c.Kind != ChangeCreated {
+			e.forgetEnumeratedID(acct, c.ID)
+		}
 		switch c.Kind {
 		case ChangeDestroyed:
 			out.destroy = append(out.destroy, c.ID)
 		case ChangeCreated, ChangeUpdated:
 			if c.Envelope != nil {
 				out.upsert = append(out.upsert, *c.Envelope)
-			} else {
-				fetch = append(fetch, c.ID)
+				continue
 			}
+			// A bare-ID listing entry asks whether the mirror holds the
+			// message; a delta (ChangeUpdated) says it changed and is
+			// always fetched.
+			if c.Kind == ChangeCreated && e.alreadyEnumerated(ctx, acct, c.ID) {
+				out.seen = append(out.seen, c.ID)
+				continue
+			}
+			if c.Kind == ChangeCreated {
+				listed[c.ID] = true
+			}
+			fetch = append(fetch, c.ID)
 		}
 	}
 
@@ -556,6 +641,7 @@ func (e *Engine) prepareUpserts(ctx context.Context, acct AccountID, box Mailbox
 		if err != nil {
 			return nil, e.classify(ctx, acct, err)
 		}
+		e.rememberEnumerated(acct, envs, listed)
 		out.upsert = append(out.upsert, envs...)
 	}
 

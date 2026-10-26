@@ -250,16 +250,6 @@ func (a *Adapter) initialSync(ctx context.Context, box mail.MailboxID, pageToken
 		return nil, classify(err)
 	}
 
-	ids := make([]mail.MessageID, 0, len(res.Messages))
-	for _, m := range res.Messages {
-		ids = append(ids, mail.NativeMessageID(mail.ProviderGmail, m.Id))
-	}
-
-	envs, err := a.Envelopes(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-
 	changes := &mail.Changes{
 		More:             res.NextPageToken != "",
 		EnumerationStart: pageToken == "",
@@ -270,10 +260,11 @@ func (a *Adapter) initialSync(ctx context.Context, box mail.MailboxID, pageToken
 	} else {
 		changes.Next = mail.Cursor(strconv.FormatUint(historyID, 10))
 	}
-	for i := range envs {
-		e := envs[i]
+	// Bare IDs: Gmail lists a message under every label it carries, and
+	// the engine fetches only the ones it does not already hold.
+	for _, m := range res.Messages {
 		changes.Changes = append(changes.Changes, mail.Change{
-			Kind: mail.ChangeCreated, ID: e.ID, Envelope: &e,
+			Kind: mail.ChangeCreated, ID: mail.NativeMessageID(mail.ProviderGmail, m.Id),
 		})
 	}
 	return changes, nil
