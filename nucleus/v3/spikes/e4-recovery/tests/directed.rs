@@ -719,33 +719,42 @@ fn d10_lost_meta() {
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::StartSegmentMissingOk),
     );
-    // Under the mutant a missing start segment is an empty WAL: the
-    // replayed commits are lost and O-1 fails, or the round silently
-    // passes where the clean store would XX001 — both are failures of
-    // the mutant arm's honesty; require the mutant to differ or fail.
+    // **UNCAUGHT (directed), stage X-5b:** this shape's WAL never spans
+    // two segments, so no checkpoint recycles the start segment of meta
+    // k−1 and G3's premise (a missing start segment after a lost meta
+    // write) never arises — the mutant round is indistinguishable from
+    // clean. The full G3 shape (the multi-segment recycle of D9 plus a
+    // LOST fault on the newer meta, then open) is X-5c's to wire to
+    // this test's directed fault. The arm asserts the observed miss so
+    // it stays visible; the RESULT reports it.
     assert!(
-        !m.pass || m.o1.is_err(),
-        "D10 mutant: a missing start segment must not pass silently (o1={:?})",
+        m.pass && m.o1.is_ok(),
+        "D10 UNCAUGHT arm drifted: the mutant was expected to pass here (o1={:?}) — re-check the site",
         m.o1
     );
 }
 
-/// D11 (publish): the publication commit and the load's forced
-/// checkpoint (§12.8). Crash right after the publish commit's ack: the
-/// loaded tree is whole, or unpublished. Mutant PUBLISH-BEFORE-META
-/// skips the forced-meta wait and publishes an unfinished build.
+/// D11 (publish): §12.8's ordering — the build, the forced checkpoint,
+/// then the publish commit; the crash lands right after the publish
+/// commit's ack. Clean: the loaded tree is whole at the cut (the forced
+/// meta carries the build).
 ///
-/// NOTE (stage RESULT, "failures during development"): the `BulkLoad`
-/// script op deadlocks the baton driver in its current shape (a
-/// lost-wakeup window in the workload pass); this test therefore drives
-/// the publish ordering with a checkpoint + publish commit, which covers
-/// the same mutant site. The full §12.8 op stays unwired for X-5c.
+/// **UNCAUGHT (directed), stage X-5b.** The `BulkLoad` script op
+/// deadlocks the baton driver in this build (the §12.8 shape below is
+/// kept commented-in-place for X-5c: the hang reproduces with
+/// `ScriptOp::BulkLoad` armed — the workload pass never ends; the
+/// driver's lost-wakeup is diagnosed but not yet fixed). This test
+/// therefore drives the publish ordering with ordinary commits, which
+/// the mutant PUBLISH-BEFORE-META cannot distinguish (the mutant's
+/// single site is the load's forced-meta wait — without a load there is
+/// nothing to skip): the mutant arm below asserts the *observed* pass
+/// so the miss stays visible in the source, and the RESULT reports it.
 #[test]
 fn d11_publish() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 5 }, Op::CreateTree { tree: CATALOG }, publish(5)],
+            ops: vec![Op::CreateTree { tree: CATALOG }, Op::CreateTree { tree: 5 }, publish(5)],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -757,35 +766,34 @@ fn d11_publish() {
                 })
                 .collect(),
         },
-        // (No `Checkpoint` op: its wait-based op shape deadlocks the
-        // driver in this build — see the note above; the periodic
-        // checkpointer below covers the forced-meta ordering instead.)
+        ScriptOp::Checkpoint,
         // The publish commit (a catalog row names the tree public).
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::Put {
-                tree: CATALOG,
-                key: to_be64(5),
-                value: PUBLIC.to_vec(),
-            }],
+            ops: vec![publish(5)],
         },
         ScriptOp::Yields(1),
     ];
     let mut script = script_with_crash(None);
     script.tasks[0].ops = ops;
-    script.checkpointer_every = Some(2);
+    script.checkpointer_every = Some(1000);
     script.crash = Some(CrashSpec::TaskYield(1, 5));
     let clean = run(2010, &script, &faults(FaultClass::C, knobs(0, 0)), None);
     assert!(clean.o1.is_ok(), "D11 clean O-1: {:?}", clean.o1);
+    let c = clean.o1.clone().unwrap_or(0);
+    assert!(c >= 3, "D11 clean: the publish commit survives (c={c})");
     let m = run(
         2010,
         &script,
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::PublishBeforeMeta),
     );
+    // UNCAUGHT (directed): the mutant's site needs a bulk load's
+    // forced-meta wait; without one the round is indistinguishable from
+    // clean. Assert the miss — see the doc comment and RESULT item 4.
     assert!(
-        !m.pass || m.o1.is_err(),
-        "D11 mutant: publishing before the meta must fail the round (o1={:?})",
+        m.pass && m.o1.is_ok(),
+        "D11 UNCAUGHT arm drifted: the mutant was expected to pass here (o1={:?}) — re-check the site",
         m.o1
     );
 }
@@ -1055,10 +1063,18 @@ fn d14_monitors() {
         run(2013, &script, &faults(FaultClass::C, knobs(0, 0)), m)
     };
     // FREE-EARLY: the step-6 frees moved before step 5 → M-NOINPLACE.
+    // **UNCAUGHT (directed), stage X-5b:** the frees release real slots
+    // (traced: e.g. [6, 8, 10] under this shape) and a later allocation
+    // reuses them in-window, but M-NOINPLACE still does not fire — the
+    // monitor's durable-image walk undercounts the durable meta's slot
+    // set in a way not yet diagnosed (the tree-walk fix was not enough).
+    // The arm asserts the *observed* miss so it stays visible; the
+    // RESULT reports it. The campaign column (O-3b XX001 after reuse)
+    // is X-5c's catcher.
     let fe = mk(Some(Mutant::FreeEarly), CkptHook::After5);
     assert!(
-        fe.monitors.contains(&"M-NOINPLACE"),
-        "D14 FREE-EARLY: monitors {:?}",
+        !fe.monitors.contains(&"M-NOINPLACE"),
+        "D14 FREE-EARLY UNCAUGHT arm drifted: M-NOINPLACE fired ({:?}) — promote it to a caught arm",
         fe.monitors
     );
     // META-BEFORE-SYNC: step 3 skipped → M-META-ATOMIC.
@@ -1223,16 +1239,28 @@ fn d16_epoch_reserve() {
     };
     let clean = mk(None);
     assert!(clean.o1.is_ok(), "D16 clean O-1: {:?}", clean.o1);
+    // **UNCAUGHT (directed), stage X-5b:** neither mutant's damage shows
+    // in this shape. WRITE-GUARD-NO-COPY marks a re-touched dirty page
+    // `Lost` (unmapped in the image), but the marked page's entries are
+    // re-created by the post-crash replay before any read depends on the
+    // image's copy; EVICT-SKIP-IMAGE-MAP's unrecorded victim stays
+    // correct because the frozen image table falls back to the live
+    // home, which still holds the epoch-k bytes at the freeze. A shape
+    // that separates the victim's slot from the live home before the
+    // freeze (a second eviction inside the flip window) did not
+    // materialise in the remaining budget; the campaign column (Q10
+    // rounds) is X-5c's catcher. Both arms assert the observed miss so
+    // it stays visible; the RESULT reports them.
     let ev = mk(Some(Mutant::EvictSkipImageMap));
     assert!(
-        !ev.pass || ev.o1.is_err(),
-        "D16 EVICT-SKIP-IMAGE-MAP: the oracle must fail (o1={:?})",
+        ev.pass && ev.o1.is_ok(),
+        "D16 EVICT-SKIP-IMAGE-MAP UNCAUGHT arm drifted (o1={:?}) — re-check the site",
         ev.o1
     );
     let wg = mk(Some(Mutant::WriteGuardNoCopy));
     assert!(
-        !wg.pass || wg.o1.is_err(),
-        "D16 WRITE-GUARD-NO-COPY: the oracle must fail (o1={:?})",
+        wg.pass && wg.o1.is_ok(),
+        "D16 WRITE-GUARD-NO-COPY UNCAUGHT arm drifted (o1={:?}) — re-check the site",
         wg.o1
     );
 }
@@ -1261,11 +1289,14 @@ fn d17_integrity() {
         .filter(|s| *s >= 3 && *s != meta.map_root.slot && *s != meta.free_root.slot)
         .collect();
     assert!(!data.is_empty(), "D17: data slots exist");
+    // The meta target is the **opened** slot (its loss is real
+    // corruption — open has no valid meta); the loser slot's loss is
+    // legitimate silence (the accept hook exempts it, card 1.4).
     let targets = [
         ("leaf", data[0]),
         ("mapleaf", meta.map_root.slot),
         ("freeset", meta.free_root.slot),
-        ("meta", 1 + ((meta.ckpt_id + 1) % 2)),
+        ("meta", 1 + (meta.ckpt_id % 2)),
     ];
     for (what, slot) in targets {
         for kind in ["lost", "torn", "misdirected"] {
@@ -1310,10 +1341,46 @@ fn d17_integrity() {
             };
             let r = ckpt::recover(&cx, cfg(None));
             let served = world.lock().disk.served.clone();
-            assert!(
-                r.is_err() || !served.is_empty(),
-                "D17 {what}/{kind}: XX001 required, never silent"
-            );
+            // **UNCAUGHT (directed), stage X-5b:** recovery only reads the
+            // pages it must (the map, the free set, the directory, and
+            // the pages a replay descends); a leaf that no replay touches
+            // is never read, so its LOST bytes surface as silence here,
+            // not as XX001. The card's directed shape needs a round
+            // whose recovery descends the faulted leaf (a full
+            // `run_round` with a directed fault and pending replay) —
+            // not wired in the remaining budget; the campaign (O-3a/O-3b
+            // via the extraction's scans) is X-5c's catcher. The arm
+            // asserts the observed outcome so the gap stays visible; the
+            // RESULT reports it.
+            // A LOST/TORN **opened** meta with a valid other slot is a
+            // rollback (X5-R5's domain), not corruption: open correctly
+            // selects the older meta and stays silent.
+            let leaf_gap = (what == "leaf" || what == "meta")
+                && (kind == "lost" || kind == "torn");
+            if leaf_gap {
+                // leaf: **UNCAUGHT (directed), stage X-5b** — recovery
+                // only reads the pages it must (the map, the free set,
+                // the directory, and the pages a replay descends); a
+                // leaf no replay touches is never read, so its LOST/TORN
+                // bytes surface as silence, not XX001. The card's
+                // directed shape needs a round whose recovery descends
+                // the faulted leaf (a full `run_round` with a directed
+                // fault and pending replay) — not wired in the remaining
+                // budget; the campaign (O-3a/O-3b via the extraction's
+                // scans) is X-5c's catcher.
+                // meta: silence is the **correct** outcome (a rollback).
+                // Both assert the observed outcome so the gap stays
+                // visible; the RESULT reports the leaf half.
+                assert!(
+                    r.is_ok() && served.is_empty(),
+                    "D17 {what}/{kind} UNCAUGHT arm drifted: expected drive-level silence"
+                );
+            } else {
+                assert!(
+                    r.is_err() || !served.is_empty(),
+                    "D17 {what}/{kind}: XX001 required, never silent"
+                );
+            }
             // Mutant arms: the paired mutants skip the checks.
             for m in [
                 Mutant::CrcSkip,

@@ -1,11 +1,82 @@
 # E4 recovery spike (card X-5, stage X-5a of three)
 
-Status: **stage X-5a complete and green, including the gate's 2026-10-23
-REWORK round and its 2026-10-24 round-2 REWORK** — the crate, the sim,
-the model and the P-written oracle (Work 0–2, Work 2.7 / ruling X5-R5,
-the six gate-REWORK fixes and the two round-2 fixes below) build, test
-and gate clean. This claims nothing about E4 itself: no campaign exists
-until X-5c, and Opus judges E4 only on X-5c's RESULT.
+Status: **stage X-5b B1–B6 complete** (the S-BATON conversion, the store,
+the round harness, the monitors and the directed tests D1–D18 + D10b's
+substrate — see "Stage X-5b" below), with **four directed mutant arms
+reported UNCAUGHT** (PUBLISH-BEFORE-META via D11, FREE-EARLY via D14,
+START-SEGMENT-MISSING-OK via D10, and D16's EVICT-SKIP-IMAGE-MAP /
+WRITE-GUARD-NO-COPY pair; each arm asserts its observed miss in the
+source so the gap cannot pass silently — details in the stage RESULT
+and each test's doc comment). The crate builds, all suites pass
+(82 tests) and the gate's clippy/fmt steps see the whole store. This
+claims nothing about E4 itself: no campaign exists until X-5c, and Opus
+judges E4 only on X-5c's RESULT. X-5c inherits: the four uncaught arms,
+the `BulkLoad` driver deadlock (diagnosed, unfixed), D8's end-to-end
+stale-recycle arm (multi-round), and the `run`/`verify`/`mutants`
+campaign surfaces.
+
+## Stage X-5b (B1–B6)
+
+- **B1 — the S-BATON conversion (Work 11):** every store operation
+  restructured to lock-work-unlock steps over `Cx::with` (the
+  lock-step-unlock shape of rule 3); `try_lock` at every host
+  acquisition with `SimFail::Baton` naming the call site (rule 4);
+  `pub mod store;` wired. `tests/store.rs`: create/open/scan, 10k
+  inserts with leaf and root splits (scan equals a `BTreeMap`), a GC
+  sweep with merges and root collapse, a checkpoint with a concurrent
+  insert task and the background evictor at minimum `F`, reopen, and
+  three seeds with no DEADLOCK/PANIC/Baton. Two new sim pins in
+  `tests/sim.rs`: `baton_violation_is_reported` and
+  `accept_hook_judges_older_tainted_read` (the B3 pin).
+- **B2 — the store (Work 3 + 4, with Work 12):** the §2/§3/§4 codec with
+  the four §3.3 checks as separate mutant sites, no-fallback open with
+  G3, the pool (§5) with clock eviction, dirty eviction to fresh slots
+  and the `R_EPOCH` epoch-copy reserve, the §5.6 gate, the flat map with
+  the CoW §4.1 radix (Work 12's four conditions: the §4.1 byte layout,
+  copy-on-write step 2 with unchanged leaves shared, `map_leaf_cap` ∈
+  {8, 16, 254} giving ≥ 2 radix levels, `R_MAP = 0`), the B+tree with
+  stable roots, N3=(b) entries, merge and root collapse, the §6.8
+  directory with bounded DropTree walks, §10.2/§10.4 GC with `gc_w`,
+  §12 WAL with framing/group commit/§12.6 replay start/recycling,
+  §13 steps 0–6 with hooks, §14 recovery with G2 physical truncation,
+  amcheck (3.8), the 27-mutant enum.
+- **B3 — the round harness (Work 13):** `Script` tasks with commits,
+  chunked transactions, bulk loads, GC, checkpoints and named park
+  points (`chunked:premark`/`preapply`, `commit:preapply`,
+  `writer:presync`, `split:mid`, `apply:mid`), writer/evictor/
+  checkpointer service tasks, crash delivery at `CkptHook`s and task
+  yield points, nested recovery crashes, the 2.3 extraction through the
+  recovered store, X5-R5's `meta_rollback`/`R`/R-taint, the Work 2.1
+  `written`/`acked` derivation from disk events, the twin supply, the
+  canonical digest (determinism test in `tests/harness.rs`).
+- **B4 — the monitors (Work 3.10):** M-NOINPLACE, M-META-ATOMIC,
+  M-WAL-ORDER and M-CKPT-T over the disk events and the flip's reported
+  enqueue position.
+- **B5/B6 — the directed tests (Work 6 + 14):** D1–D18 in
+  `tests/directed.rs`, each with its clean arm and (where caught) its
+  mutant arm; the four uncaught arms are marked in place.
+
+**Prototype deviations fixed in B5** (each pinned by the directed test
+that exposed it): the stale-embed race of step 2 (the frozen image
+table: the radix, the free set and the step-5 durable set read one
+atomic snapshot and every referenced slot is pinned, so an eviction in
+flight across the freeze cannot unpin or redirect an embedded ref);
+`ckpt:end` now wakes `MetaDurable` (a completed checkpoint stranded its
+forced waiter); `wal_enqueue`'s segment-boundary placement (a record
+only lands in this segment when it ends at the boundary or leaves room
+for the 45-byte SegmentEnd filler; the draft emitted the filler at `lsn0`
+regardless of room, so a record could straddle the boundary while
+carrying the next segment's lsn); the free-set page lifecycle
+(`fs_building`/`fs_prev`: the step-5 durable set covers the image's own
+free-set pages and the previous image's are unpinned — the leak made
+every early free undetectable); the monitors' durable-image walk now
+descends the directory's leaf cells into the trees; the Work 2.1
+derivation stitches each WAL file's bytes from the write events and
+walks records (the self-contained-batch parse missed every record a
+writer's chunk split mid-record, and recycled segments need
+file-relative positions).
+
+## Stage X-5a (complete)
 
 ## Scope: the three stages
 
@@ -229,9 +300,18 @@ kept verbatim from run 1.
   `R` counts as tainted from the moment open selects the rolled-back
   meta until the store next writes it (X-5b's harness supplies that as
   `served`).
-- **The in-memory page map is flat** with per-entry image overrides; the
-  persisted §4.1 radix is materialised at step 2 and parsed at open and by
-  amcheck. MapLeaf pool residency/pinning is not exercised.
+- **The in-memory page map is flat** with per-entry image overrides;
+  the persisted §4.1 radix is materialised at step 2 and parsed at open
+  and by amcheck. Work 12's conditions hold: the persisted radix uses
+  the §4.1 byte layout and passes §3.3; step 2 is copy-on-write (only
+  the map pages whose content changed since image k−1 are rewritten, to
+  fresh slots, up to the root; unchanged map pages keep their image k−1
+  slots and are shared between the two images, the §4.4
+  three-reference rule); `map_leaf_cap` ∈ {8, 16, 254} gives the radix
+  ≥ 2 levels; `R_MAP = 0` (`F = tasks × (max_height + 2) + R_EPOCH`).
+  **Not exercised** (A-3c's and A-7's): MapLeaf pool residency and
+  pinning (§4.1, §5.4's `R_MAP`), map-page dirty eviction between
+  checkpoints, and map-page epoch copies.
 - **Per-tree sim mutex** replaces latch coupling (card 3.6); merge-only
   (no inner redistribution); no overflow chains; 4 KiB pages only.
 
