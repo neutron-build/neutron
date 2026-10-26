@@ -320,7 +320,18 @@ pub fn load_image<H: StoreHost>(
     if meta.map_root.slot != 0 {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
         let span = radix_child_span(cap, n, meta.next_lpid);
-        walk_radix(cx, pf, meta.map_root, 0, span, cap, 0, &mut flat, &mut used, mutant)?;
+        walk_radix(
+            cx,
+            pf,
+            meta.map_root,
+            0,
+            span,
+            cap,
+            0,
+            &mut flat,
+            &mut used,
+            mutant,
+        )?;
     }
     // The free set (both bitmaps; §4.3).
     let mut free_bits: BTreeSet<u64> = BTreeSet::new();
@@ -527,10 +538,7 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
     r
 }
 
-fn checkpoint_inner<H: StoreHost>(
-    cx: &Cx<'_, H>,
-    hooks: &mut Hooks<'_>,
-) -> Result<(), Fail> {
+fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result<(), Fail> {
     cx.with("ckpt:begin", |c| {
         let st = c.store();
         st.alive()?;
@@ -614,7 +622,12 @@ fn checkpoint_inner<H: StoreHost>(
     if free_early {
         cx.with("ckpt:freeearly:apply", |c| {
             let st = c.store();
-            let live: BTreeSet<u64> = st.slots.used_cur.union(&st.slots.image_refs).copied().collect();
+            let live: BTreeSet<u64> = st
+                .slots
+                .used_cur
+                .union(&st.slots.image_refs)
+                .copied()
+                .collect();
             let old = std::mem::take(&mut st.slots.used_durable);
             st.slots.pending_free = old.difference(&live).copied().collect();
             st.slots.used_durable = old.intersection(&live).copied().collect();

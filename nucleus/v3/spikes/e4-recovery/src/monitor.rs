@@ -337,7 +337,7 @@ fn shadow_refs(durable: &[u8], m: &page::Meta, cfg: &MonitorCfg) -> Vec<u64> {
     if m.free_root.slot != 0 {
         let total_bits = (m.slot_count.saturating_sub(3)) + m.next_lpid;
         let span = crate::store::ckpt::radix_child_span(cfg.freeset_leaf_bits, n, total_bits);
-        walk_shadow_free(durable, m.free_root, 0, span, cfg.freeset_leaf_bits, &mut out);
+        walk_shadow_free(durable, m.free_root, 0, span, &mut out);
     }
     // The trees from the directory: the directory's own pages first
     // (its root may be an inner page), then every tree root its leaf
@@ -411,6 +411,7 @@ fn shadow_refs(durable: &[u8], m: &page::Meta, cfg: &MonitorCfg) -> Vec<u64> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_shadow_map(
     durable: &[u8],
     r: page::Ref,
@@ -451,9 +452,13 @@ fn walk_shadow_map(
                 }
             }
         }
-    } else if let Ok(refs) =
-        page::parse_radix_inner(&b, base, (page::PAGE - page::HDR) / page::MAP_ENTRY, &r, None)
-    {
+    } else if let Ok(refs) = page::parse_radix_inner(
+        &b,
+        base,
+        (page::PAGE - page::HDR) / page::MAP_ENTRY,
+        &r,
+        None,
+    ) {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
         for (i, rr) in refs.into_iter().enumerate() {
             if let Some(rr) = rr {
@@ -474,7 +479,7 @@ fn walk_shadow_map(
     }
 }
 
-fn walk_shadow_free(durable: &[u8], r: page::Ref, base: u64, span: u64, bits: u64, out: &mut Vec<u64>) {
+fn walk_shadow_free(durable: &[u8], r: page::Ref, base: u64, span: u64, out: &mut Vec<u64>) {
     if r.slot == 0 {
         return;
     }
@@ -491,15 +496,19 @@ fn walk_shadow_free(durable: &[u8], r: page::Ref, base: u64, span: u64, bits: u6
     };
     out.push(r.slot);
     if page::header_kind(&b) == page::KIND_FREE_INNER {
-        if let Ok(refs) =
-            page::parse_radix_inner(&b, base, (page::PAGE - page::HDR) / page::MAP_ENTRY, &r, None)
-        {
+        if let Ok(refs) = page::parse_radix_inner(
+            &b,
+            base,
+            (page::PAGE - page::HDR) / page::MAP_ENTRY,
+            &r,
+            None,
+        ) {
             let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
             for (i, rr) in refs.into_iter().enumerate() {
                 if let Some(rr) = rr {
                     let child_span = (span / n).max(1);
                     let child_base = base + i as u64 * span;
-                    walk_shadow_free(durable, rr, child_base, child_span, bits, out);
+                    walk_shadow_free(durable, rr, child_base, child_span, out);
                 }
             }
         }

@@ -799,7 +799,10 @@ fn d10_lost_meta() {
         "D10 clean: G3 must give XX001 at open (det={:?})",
         clean.detections
     );
-    assert!(clean.meta_rollback, "D10 clean: the opened meta is a rollback");
+    assert!(
+        clean.meta_rollback,
+        "D10 clean: the opened meta is a rollback"
+    );
     assert!(
         !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
         "D10 clean: never served (o3={:?})",
@@ -816,12 +819,7 @@ fn d10_lost_meta() {
         Some(Mutant::StartSegmentMissingOk),
     );
     assert!(
-        !m.pass
-            && m.o1.is_err()
-            && m.o3_fail
-                .as_deref()
-                .unwrap_or("")
-                .contains("O-3(d)"),
+        !m.pass && m.o1.is_err() && m.o3_fail.as_deref().unwrap_or("").contains("O-3(d)"),
         "D10 mutant: the silent empty WAL must lose the acked commits (o1={:?}, o3={:?})",
         m.o1,
         m.o3_fail
@@ -1021,10 +1019,7 @@ fn d11_publish() {
     let clean = run(2011, &script, &faults(FaultClass::C, knobs(0, 0)), None);
     assert!(clean.o1.is_ok(), "D11 clean O-1: {:?}", clean.o1);
     let c = clean.o1.clone().unwrap_or(0);
-    assert!(
-        c >= 3,
-        "D11 clean: the publish commit survives (c={c})"
-    );
+    assert!(c >= 3, "D11 clean: the publish commit survives (c={c})");
     assert!(
         clean.task_error.is_none(),
         "D11 clean: no driver failure ({:?})",
@@ -1066,7 +1061,10 @@ fn d12b_gcw_bound() {
             ops: (0..10).map(|i| put(i, 1)).collect(),
         },
         // w above visible_ts (2): the fail-stop shape.
-        ScriptOp::Gc { tree: 2, w: Some(3) },
+        ScriptOp::Gc {
+            tree: 2,
+            w: Some(3),
+        },
         ScriptOp::Checkpoint,
         ScriptOp::Yields(3),
     ];
@@ -1537,7 +1535,10 @@ fn d16_epoch_reserve() {
     };
     let clean = mk(None);
     assert!(clean.o1.is_ok(), "D16 clean O-1: {:?}", clean.o1);
-    for m in [Some(Mutant::EvictSkipImageMap), Some(Mutant::WriteGuardNoCopy)] {
+    for m in [
+        Some(Mutant::EvictSkipImageMap),
+        Some(Mutant::WriteGuardNoCopy),
+    ] {
         let out = mk(m);
         assert!(
             out.task_error.is_none(),
@@ -1683,8 +1684,7 @@ fn d17_integrity() {
         clean.o1
     );
     assert!(
-        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)")
-            && clean.task_error.is_none(),
+        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)") && clean.task_error.is_none(),
         "D17 clean: never served (o3={:?})",
         clean.o3_fail
     );

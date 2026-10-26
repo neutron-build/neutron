@@ -651,7 +651,11 @@ impl SimDisk {
     /// harness does) and in `uncovered_accepts` (for diagnosis).
     pub fn accepted(&mut self, id: FileId, off: u64, len: u64) {
         self.accepts.push((id, off, len));
-        self.events.push(DiskEvent::Accepted { inode: id, off, len });
+        self.events.push(DiskEvent::Accepted {
+            inode: id,
+            off,
+            len,
+        });
         if len == 0 {
             // Zero bytes accepted: nothing to judge, nothing uncovered.
             return;

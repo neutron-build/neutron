@@ -905,7 +905,10 @@ fn dwrites_history_carries_pre_and_all() {
     assert_eq!(dw[1].off, 512);
     assert!(dw[1].all, "sync_all graduations are");
     assert_eq!(dw[0].pre.len(), 512, "the pre-image is the whole range");
-    assert!(dw[0].pre.iter().all(|&b| b == 0), "a fresh range's pre is zeros");
+    assert!(
+        dw[0].pre.iter().all(|&b| b == 0),
+        "a fresh range's pre is zeros"
+    );
     // The clone feeds the directed-fault construction (D17/D10b).
     let c = dw[1].clone();
     assert_eq!(c.bytes, vec![2u8; 512]);
@@ -935,7 +938,10 @@ fn apply_one_media_fault_lost_reverts_like_a_drawn_one() {
     });
     assert_eq!(disk.media.len(), 1, "the fault is recorded");
     let now = disk.durable_read(f, w.off, 4096);
-    assert!(now.iter().all(|&b| b == 0), "LOST reverted to the pre-image");
+    assert!(
+        now.iter().all(|&b| b == 0),
+        "LOST reverted to the pre-image"
+    );
     assert!(disk.range_tainted(f, w.off, 4096), "the range is tainted");
 }
 
@@ -949,8 +955,16 @@ fn r_taint_window_semantics() {
     use std::collections::BTreeSet;
     let pf = 0usize;
     let r: BTreeSet<u64> = [7u64].into_iter().collect();
-    let acc = |off: u64| DiskEvent::Accepted { inode: pf, off, len: 4096 };
-    let wr = |off: u64| DiskEvent::WriteIssued { inode: pf, off, bytes: vec![0u8; 4096] };
+    let acc = |off: u64| DiskEvent::Accepted {
+        inode: pf,
+        off,
+        len: 4096,
+    };
+    let wr = |off: u64| DiskEvent::WriteIssued {
+        inode: pf,
+        off,
+        bytes: vec![0u8; 4096],
+    };
     // (1) an accept in-window taints.
     assert!(r_taint_of(&[acc(7 * 4096)], pf, &r));
     // (2) the store's write before the accept closes the window (the
@@ -958,10 +972,18 @@ fn r_taint_window_semantics() {
     assert!(!r_taint_of(&[wr(7 * 4096), acc(7 * 4096)], pf, &r));
     // (3) a nested crash reopens it (a new life re-opens the rolled-back
     // meta and may re-accept the stale slot).
-    assert!(r_taint_of(&[wr(7 * 4096), DiskEvent::Crash, acc(7 * 4096)], pf, &r));
+    assert!(r_taint_of(
+        &[wr(7 * 4096), DiskEvent::Crash, acc(7 * 4096)],
+        pf,
+        &r
+    ));
     // (4) other files never count.
     assert!(!r_taint_of(
-        &[DiskEvent::Accepted { inode: 9, off: 7 * 4096, len: 4096 }],
+        &[DiskEvent::Accepted {
+            inode: 9,
+            off: 7 * 4096,
+            len: 4096
+        }],
         pf,
         &r
     ));

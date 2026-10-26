@@ -1876,13 +1876,9 @@ fn walk_map_disk(
                 }
             }
         }
-    } else if let Ok(refs) = crate::store::page::parse_radix_inner(
-        &b,
-        base,
-        (4096 - 24) / 16,
-        &root,
-        None,
-    ) {
+    } else if let Ok(refs) =
+        crate::store::page::parse_radix_inner(&b, base, (4096 - 24) / 16, &root, None)
+    {
         let n = ((crate::store::page::PAGE - crate::store::page::HDR)
             / crate::store::page::MAP_ENTRY) as u64;
         for (i, r) in refs.into_iter().enumerate() {
@@ -1890,7 +1886,16 @@ fn walk_map_disk(
                 let child_span = (span / n).max(1);
                 let child_base = base + i as u64 * span;
                 walk_map_disk(
-                    disk, pf, r, child_base, child_span, cap, depth + 1, flat, used, out,
+                    disk,
+                    pf,
+                    r,
+                    child_base,
+                    child_span,
+                    cap,
+                    depth + 1,
+                    flat,
+                    used,
+                    out,
                 );
             }
         }
@@ -1931,13 +1936,9 @@ fn walk_free_disk(
                 }
             }
         }
-    } else if let Ok(refs) = crate::store::page::parse_radix_inner(
-        &b,
-        base,
-        (4096 - 24) / 16,
-        &root,
-        None,
-    ) {
+    } else if let Ok(refs) =
+        crate::store::page::parse_radix_inner(&b, base, (4096 - 24) / 16, &root, None)
+    {
         let n = ((crate::store::page::PAGE - crate::store::page::HDR)
             / crate::store::page::MAP_ENTRY) as u64;
         for (i, r) in refs.into_iter().enumerate() {
