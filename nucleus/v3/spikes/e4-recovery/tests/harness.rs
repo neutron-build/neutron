@@ -224,3 +224,133 @@ fn pass_fold_flags_are_load_bearing() {
         true, None, false, false, false
     ));
 }
+
+/// §12.2's record cap (the gate's round-3 F1): `wal_enqueue` refuses a
+/// payload whose record exceeds `wal_seg_size / 4` — loudly, before any
+/// placement. The draft had no cap, and a 177-KiB `Commit` was spread
+/// across 64-KiB segments where §12.5's reader could never parse it; an
+/// acked commit then vanished from both the recovered state and the
+/// model, silently. Reverting the refusal (placing over-cap records
+/// again) fails this pin.
+#[test]
+fn wal_record_cap_is_refused() {
+    use e4_recovery::sim::HARNESS;
+    use e4_recovery::store::{Cx, Fail, HasStore, StoreInner, wal};
+    let cfgc = cfg(None);
+    let world = harness::round_world(
+        3210,
+        e4_recovery::sim::SimDisk::new(),
+        StoreInner::empty(cfgc.clone(), 0),
+    );
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    // At the cap: a record of exactly `REC_MAX` places (the boundary is
+    // inclusive).
+    let at_cap = (wal::REC_MAX - wal::REC_FIXED) as usize;
+    let r = wal::wal_enqueue(&cx, wal::K_COMMIT, (1, 1), 1, &vec![0u8; at_cap]);
+    assert!(r.is_ok(), "a record at the cap must place ({r:?})");
+    // One byte over: refused with `Fail::Invalid` (the loud path), and
+    // nothing was appended.
+    let over = at_cap + 1;
+    let r2 = wal::wal_enqueue(&cx, wal::K_COMMIT, (1, 2), 2, &vec![0u8; over]);
+    assert!(
+        matches!(r2, Err(Fail::Invalid(ref m)) if m.contains("cap")),
+        "an over-cap payload must be refused loudly ({r2:?})"
+    );
+    let appended = cx
+        .with("cap:chk", |c| Ok(c.store().wal.append))
+        .expect("check");
+    let (lsn, len) = r.expect("at-cap placement");
+    assert_eq!(
+        appended,
+        lsn + len,
+        "the refused enqueue must not have appended anything"
+    );
+}
+
+/// The Work 2.1 derivation's F1 half: a commit whose record header is
+/// present in a WAL file's issued writes at its segment-relative
+/// position, with its own lsn and a length past the segment end, is
+/// **written but unparsable** — reported in the third return so the
+/// harness fails the round, never a silent model drop (the round-3
+/// demonstration's exact shape: an over-cap record placed at a segment
+/// boundary). A parseable record and a never-written one stay silent.
+#[test]
+fn derivation_reports_written_unparsable_commits() {
+    use e4_recovery::sim::DiskEvent;
+    use e4_recovery::store::wal;
+    use std::collections::BTreeMap;
+    let inode = 4usize; // any non-page-file id
+    // An over-cap Commit encoded at lsn 0 (a segment boundary): its
+    // header parses, its length runs past the segment end — exactly the
+    // F1 shape (§12.5's reader stops; §12.2 would never place it).
+    let over_payload = vec![7u8; 70_000];
+    let rec = wal::enc_record(wal::K_COMMIT, (1, 1), 5, &over_payload, 0);
+    let events = vec![
+        DiskEvent::WriteIssued {
+            inode,
+            off: 0,
+            bytes: rec.clone(),
+        },
+        DiskEvent::WriteReturned {
+            inode,
+            off: 0,
+            len: rec.len() as u64,
+        },
+        DiskEvent::SyncIssued { inode, all: false },
+        DiskEvent::SyncReturned { inode, all: false },
+    ];
+    let rec_len = wal::REC_FIXED + over_payload.len() as u64;
+    let mut commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    commits.insert(5u64, (true, 0u64, rec_len));
+    let (written, _acked, unparsed) = harness::derive_written_acked(&events, &commits);
+    assert!(
+        written.is_empty(),
+        "an unparsable record never marks the commit written"
+    );
+    assert_eq!(
+        unparsed,
+        vec![5u64],
+        "the written-but-unparsable commit must be reported (F1)"
+    );
+    // A parseable record of the same commit is not reported: rebuild
+    // the events with a legal record at lsn 0.
+    let ok_payload = vec![7u8; 64];
+    let ok_rec = wal::enc_record(wal::K_COMMIT, (1, 1), 5, &ok_payload, 0);
+    let ok_events = vec![
+        DiskEvent::WriteIssued {
+            inode,
+            off: 0,
+            bytes: ok_rec.clone(),
+        },
+        DiskEvent::WriteReturned {
+            inode,
+            off: 0,
+            len: ok_rec.len() as u64,
+        },
+        DiskEvent::SyncIssued { inode, all: false },
+        DiskEvent::SyncReturned { inode, all: false },
+    ];
+    let ok_len = wal::REC_FIXED + ok_payload.len() as u64;
+    let mut ok_commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    ok_commits.insert(5u64, (true, 0u64, ok_len));
+    let (w2, a2, u2) = harness::derive_written_acked(&ok_events, &ok_commits);
+    assert_eq!(
+        u2,
+        Vec::<u64>::new(),
+        "a parseable record is never reported"
+    );
+    assert_eq!(w2, vec![5u64], "it marks the commit written");
+    assert_eq!(a2, vec![5u64], "and acked (the sync covered it)");
+    // A commit whose record was never written stays silent too.
+    let mut none_commits: BTreeMap<u64, (bool, u64, u64)> = BTreeMap::new();
+    none_commits.insert(6u64, (true, 65536u64, 128u64));
+    let (_, _, u3) = harness::derive_written_acked(&ok_events, &none_commits);
+    assert_eq!(
+        u3,
+        Vec::<u64>::new(),
+        "a never-written record is not a defect"
+    );
+}

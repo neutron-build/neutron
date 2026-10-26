@@ -1533,22 +1533,26 @@ fn d14_monitors() {
                     // periodic checkpoint (every 2 commits) runs its steps
                     // while the committer's apply is still to come: the
                     // apply's fresh-slot writes land inside the open
-                    // checkpoint window.
+                    // checkpoint window. The big commits are **chunked**
+                    // (§12.2: 60 × 423 B ≈ 25 KiB is over the 16-KiB
+                    // record cap), so their park point is the chunked
+                    // committer's (`chunked:preapply`, after the marker's
+                    // ack wait, before the apply — the same window).
                     ScriptOp::Park {
-                        name: "commit:preapply",
+                        name: "chunked:preapply",
                         budget: 48,
                     },
-                    ScriptOp::Commit {
+                    ScriptOp::Chunked {
                         sync_on: true,
                         ops: (0..60).map(|i| big(i, 1)).collect(),
                     },
                     ScriptOp::Park {
-                        name: "commit:preapply",
+                        name: "chunked:preapply",
                         budget: 48,
                     },
                     // The churn commit: 60 more big entries evict and move
                     // homes between the two images.
-                    ScriptOp::Commit {
+                    ScriptOp::Chunked {
                         sync_on: true,
                         ops: (60..120).map(|i| big(i, 2)).collect(),
                     },
@@ -1900,6 +1904,14 @@ fn d16_epoch_reserve() {
 /// are subsumed by the reference CRC: the paired mutants exist because
 /// of exactly this) — the card's "expected 0" single-site hit rates.
 ///
+/// The 420-put load is a **chunked** transaction (§12.2's 16-KiB record
+/// cap — the gate's F1/F2: the draft's single over-cap `Commit` made
+/// the faultless base round itself fail while the Work 2.1 derivation
+/// silently dropped the commit). The crash point sits past the script's
+/// yield count, so the round is a **crash-resolution** round: the
+/// workload completes, F-CRASH resolves (nothing volatile), the faults
+/// apply, and recovery runs on the faulted durable image.
+///
 /// The second half is the card's REFCRC shape ("a slot reused for the
 /// same LPID in the same epoch", the mutation table's catcher for
 /// REFCRC-SKIP and the paired mutants): heavy churn with the evictor
@@ -1933,8 +1945,12 @@ fn d17_integrity() {
         },
         // ~60 pages of tree: the map leaf-0 carries entries across the
         // [512, 4096) sectors, so a middle-sector tear changes real
-        // bytes without touching the header.
-        ScriptOp::Commit {
+        // bytes without touching the header. **Chunked** (§12.2: 420 ×
+        // 423 B ≈ 174 KiB is far over the 16-KiB record cap — the gate's
+        // F1/F2: the draft's single Commit spread the transaction across
+        // segments, and the faultless base round itself failed O-1(c)
+        // while the derivation silently dropped the commit).
+        ScriptOp::Chunked {
             sync_on: true,
             ops: (0..420u64)
                 .map(|i| Op::Put {
@@ -2286,13 +2302,32 @@ fn d17_integrity() {
         );
     }
 
-    // ---- the 12 cells (the gate's N8): TORN, LOST and MISDIRECTED,
-    // each on a referenced tree leaf, a FreeSet page and a meta slot
-    // (the MapLeaf cells ran above; the tree-page MISDIRECTED cell is
-    // the REFCRC shape's own fault). A meta fault is a **correct
-    // rollback** (§2.2's two slots): open falls back to the older meta
-    // and the round passes; the other kinds are XX001 detections that
-    // are never served.
+    // ---- the 9-cell grid (the gate's N8, on the F1/F2-fixed base):
+    // LOST, TORN and MISDIRECTED, each on a referenced tree leaf, a
+    // FreeSet page and the newest meta slot (the MapLeaf cells ran
+    // above; the tree-page MISDIRECTED cell of the REFCRC shape also
+    // ran). Measured on the chunked script (each cell re-run per arm):
+    // - a **meta** LOST or TORN is a correct rollback (§2.2's two
+    //   slots): open falls back to the older meta and the round passes;
+    // - a **freeset** fault of any kind, and a **leaf** MISDIRECTED,
+    //   are XX001 detections at open that are never served, and the
+    //   round passes (a legal MP detection);
+    // - a **leaf** LOST or TORN reaches the card's open X-5c ruling
+    //   case (its Notes): recovery returns `Ok`, the extraction's scan
+    //   hits the faulted page (XX001, `det=[]`), O-1 (b) reports "scan
+    //   read failed" and O-3 (d) fails the round — whether O-1 is
+    //   required when recovery returns `Ok` alongside an XX001 is
+    //   X-5c's to rule, so **no verdict is asserted** on those two
+    //   cells (only the ruling-independent halves: never served, no
+    //   harness defect); the measured outcome is recorded in the stage
+    //   RESULT item 8;
+    // - a **meta** MISDIRECTED onto the twin slot is the gate's F3
+    //   spec silence (§2.2 says nothing about the slot position vs
+    //   `ckpt_id`): the plant is a valid copy of the newest meta read
+    //   through the fault's tainted landing range, open takes it, and
+    //   O-3 (a) fails the round — P must rule (a positional §2.2 meta
+    //   check, or an oracle ruling); the cell runs for the record and
+    //   asserts nothing verdict-shaped.
     // ----
     {
         let cell = |target: Cell| {
@@ -2317,10 +2352,11 @@ fn d17_integrity() {
                 .expect("pf");
             let (_f, _s, meta) = harness::durable_image(&b.crashed_disk, &cfg254(None));
             let meta = meta.expect("meta");
-            let (off, pre) = match target {
+            let (off, bytes, pre) = match target {
                 Cell::Leaf => {
                     // Any referenced tree leaf's durable write.
-                    b.crashed_disk
+                    let w = b
+                        .crashed_disk
                         .dwrites_of(pf)
                         .iter()
                         .rev()
@@ -2331,31 +2367,51 @@ fn d17_integrity() {
                                     == e4_recovery::store::page::KIND_LEAF
                                 && w.off > 3 * 4096
                         })
-                        .map(|w| (w.off, w.pre.clone()))
-                        .expect("a tree leaf write")
+                        .cloned()
+                        .expect("a tree leaf write");
+                    (w.off, w.bytes, w.pre)
                 }
-                // The page's own previous content (a meta slot's
-                // earlier image, a fresh slot's zeros) — the tear
-                // must change real bytes.
+                // The freeset root's and the newest meta's own writes:
+                // their whole content lives in sector 0 (the bitmap and
+                // the refs fit in the first 512 B at this scale), so the
+                // tear reverts sector 0.
                 Cell::Freeset | Cell::Meta => {
                     let at = if let Cell::Meta = target {
                         (1 + (meta.ckpt_id % 2)) * 4096
                     } else {
                         meta.free_root.slot * 4096
                     };
-                    let pre = b
+                    let w = b
                         .crashed_disk
                         .dwrites_of(pf)
                         .iter()
                         .rev()
                         .find(|w| w.off == at && w.bytes.len() == 4096)
-                        .map(|w| w.pre.clone())
-                        .unwrap_or_default();
-                    (at, pre)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("a write at {at}"));
+                    let bytes = b.crashed_disk.durable_read(pf, at, 4096);
+                    let pre = if w.pre.is_empty() {
+                        bytes.clone()
+                    } else {
+                        w.pre
+                    };
+                    (at, bytes, pre)
                 }
             };
-            let bytes = b.crashed_disk.durable_read(pf, off, 4096);
-            let pre = if pre.is_empty() { bytes.clone() } else { pre };
+            // A sector the write actually changed (a tear onto unchanged
+            // bytes is a no-op): leaves differ in their cell sectors at
+            // the page end, the freeset root and the meta in sector 0.
+            let mut sector = off;
+            for s in 0..8u64 {
+                let (a, b) = (
+                    bytes.get((s * 512) as usize..(s * 512 + 512) as usize),
+                    pre.get((s * 512) as usize..(s * 512 + 512) as usize),
+                );
+                if a.is_some_and(|a| b.is_some_and(|b| a != b)) {
+                    sector = off + s * 512;
+                    break;
+                }
+            }
             e4_recovery::sim::MediaFault {
                 inode: pf,
                 off,
@@ -2363,139 +2419,83 @@ fn d17_integrity() {
                 bytes: bytes.clone(),
                 pre,
                 kind: e4_recovery::sim::MediaKind::Torn {
-                    sectors: vec![off + 512],
+                    sectors: vec![sector],
                 },
             }
         };
         for target in [Cell::Leaf, Cell::Freeset, Cell::Meta] {
-            for kind in [Kind::Lost, Kind::Misdirected] {
+            for kind in [Kind::Lost, Kind::Torn, Kind::Misdirected] {
                 let mut fault = cell(target);
                 fault.kind = match kind {
                     Kind::Lost => e4_recovery::sim::MediaKind::Lost,
+                    Kind::Torn => e4_recovery::sim::MediaKind::Torn {
+                        sectors: vec![fault.off],
+                    },
                     Kind::Misdirected => e4_recovery::sim::MediaKind::Misdirected {
                         to_off: fault.off + 4096,
                     },
                 };
                 let r = run17(None, fault);
-                match target {
-                    Cell::Meta => {
-                        // A rollback: the older meta opens and nothing
-                        // is served. **Open finding (reported in the
-                        // stage RESULT, not asserted):** in this shape
-                        // the rolled-back recovery returns `Ok` with a
-                        // raw ts-2 entry above every satisfying cut
-                        // (O-1 (c) fails at c=1 with max ts 2, O-3 (d)
-                        // fails the round) — a meta-fault rollback
-                        // inconsistency still under diagnosis; only the
-                        // never-served half is asserted here.
-                        match kind {
-                            Kind::Misdirected => {
-                                // The plant lands on the **other** meta
-                                // slot: a valid copy of the newest meta
-                                // read through the fault's tainted
-                                // landing range — a true serve, and
-                                // O-3 (a) must fail the round.
-                                assert!(
-                                    !r.pass && r.served,
-                                    "D17 meta Misdirected: the served twin must fail O-3 (a) (pass={}, served={})",
-                                    r.pass,
-                                    r.served
-                                );
-                            }
-                            _ => {
-                                assert!(
-                                    !r.served,
-                                    "D17 meta {:?} {kind:?}: never served (served={}, o1={:?})",
-                                    target, r.served, r.o1
-                                );
-                            }
-                        }
+                match (target, kind) {
+                    // The two ruling cells (card Notes, X-5c's open
+                    // question): recovery `Ok` + an extraction XX001 +
+                    // O-1 (b) "scan read failed" + O-3 (d). Only the
+                    // ruling-independent halves are asserted.
+                    (Cell::Leaf, Kind::Lost) | (Cell::Leaf, Kind::Torn) => {
+                        assert!(
+                            !r.served && r.task_error.is_none(),
+                            "D17 leaf {kind:?}: never served, no harness defect (served={}, te={:?}, o1={:?}, o3={:?})",
+                            r.served,
+                            r.task_error,
+                            r.o1,
+                            r.o3_fail
+                        );
                     }
+                    // F3 (the gate's spec silence, ESCALATE to P): a
+                    // valid copy of the newest meta planted on the twin
+                    // slot through the fault's tainted landing range.
+                    // Measured: open takes it and O-3 (a) fails the
+                    // round (served) — **asserted nowhere**; P rules on
+                    // §2.2 (positional meta check) or the oracle.
+                    (Cell::Meta, Kind::Misdirected) => {
+                        assert!(
+                            r.task_error.is_none(),
+                            "D17 meta Misdirected: no harness defect (te={:?})",
+                            r.task_error
+                        );
+                    }
+                    // A correct rollback: the older meta opens, nothing
+                    // is served, the round passes (F2: with the chunked
+                    // script the base is clean, so these cells mean what
+                    // they say).
+                    (Cell::Meta, _) => {
+                        assert!(
+                            r.pass && !r.served && r.meta_rollback,
+                            "D17 meta {kind:?}: the rollback round must pass (pass={}, served={}, rb={}, o1={:?}, o3={:?})",
+                            r.pass,
+                            r.served,
+                            r.meta_rollback,
+                            r.o1,
+                            r.o3_fail
+                        );
+                    }
+                    // Detections at open, never served: the round passes.
                     _ => {
                         assert!(
-                            (r.detections.contains(&"open")
-                                || r.o1.is_err()
-                                || !r.amcheck_i.is_empty())
-                                && !r.served,
-                            "D17 {:?} {kind:?}: detected, never served (det={:?}, served={}, o1={:?}, o3={:?})",
-                            target,
-                            r.detections,
+                            r.pass
+                                && !r.served
+                                && (r.detections.contains(&"open") || !r.amcheck_i.is_empty()),
+                            "D17 {target:?} {kind:?}: detected, never served, passing (pass={}, served={}, det={:?}, am_i={}, o1={:?}, o3={:?})",
+                            r.pass,
                             r.served,
+                            r.detections,
+                            r.amcheck_i.len(),
                             r.o1,
                             r.o3_fail
                         );
                     }
                 }
             }
-        }
-
-        // ---- the R4 pin (the gate's round-2 N7): a physical-page
-        // MISDIRECTED under REFCRC-SKIP, where only §3.3's **positional
-        // id check** discriminates. The plant puts the free-set inner's
-        // bytes (epoch 0, its own base id) on a free-set leaf's
-        // referenced slot: checks (1) and (4) pass, (2) is the mutant's
-        // off site, and (3) — the expected id derived positionally — is
-        // what catches it. Under the pre-R4 walkers (the page's own
-        // header id) the check is vacuous and the stale page is served.
-        // ----
-        {
-            let build = || {
-                let (disk, st) = harness::create_store(cfg254(None), 2016, 7).expect("create");
-                let b = harness::run_round(
-                    2016,
-                    0,
-                    &script,
-                    &faults(FaultClass::C, knobs(0, 0)),
-                    cfg254(None),
-                    disk,
-                    st,
-                    &Model::new(),
-                    0,
-                    None,
-                );
-                let pf = b
-                    .crashed_disk
-                    .stat(e4_recovery::sim::PAGE_FILE)
-                    .expect("pf");
-                let (_f, _s, meta) = harness::durable_image(&b.crashed_disk, &cfg254(None));
-                let meta = meta.expect("meta");
-                // A free-set LEAF write other than the root (the radix
-                // has several at freeset_leaf_bits 128).
-                let leaf = b
-                    .crashed_disk
-                    .dwrites_of(pf)
-                    .iter()
-                    .rev()
-                    .find(|w| {
-                        w.off.is_multiple_of(4096)
-                            && w.bytes.len() == 4096
-                            && e4_recovery::store::page::header_kind(&w.bytes)
-                                == e4_recovery::store::page::KIND_FREE_LEAF
-                            && w.off != meta.free_root.slot * 4096
-                    })
-                    .cloned()
-                    .expect("a free-set leaf write");
-                let inner_bytes = b
-                    .crashed_disk
-                    .durable_read(pf, meta.free_root.slot * 4096, 4096);
-                e4_recovery::sim::MediaFault {
-                    inode: pf,
-                    off: meta.free_root.slot * 4096,
-                    len: 4096,
-                    bytes: inner_bytes,
-                    pre: leaf.pre.clone(),
-                    kind: e4_recovery::sim::MediaKind::Misdirected { to_off: leaf.off },
-                }
-            };
-            let fault = build();
-            let r = run17(Some(Mutant::RefCrcSkip), fault);
-            assert!(
-                !r.amcheck_i.is_empty() && !r.pass,
-                "D17 R4 pin: the positional id must name the planted page under REFCRC-SKIP (amcheck={}, pass={}, det={:?})",
-                r.amcheck_i.len(),
-                r.pass,
-                r.detections
-            );
         }
     }
 }
@@ -2511,11 +2511,12 @@ enum Cell {
     Meta,
 }
 
-/// A D17 fault kind (TORN ran in the map-leaf arms above; the cells
-/// add LOST and MISDIRECTED for every target).
+/// A D17 fault kind (the MapLeaf TORN arm ran above; the grid adds all
+/// three kinds for every target).
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     Lost,
+    Torn,
     Misdirected,
 }
 

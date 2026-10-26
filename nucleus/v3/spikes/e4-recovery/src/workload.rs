@@ -1573,11 +1573,12 @@ fn to_wop(op: &Op) -> crate::store::wal::WOp {
     }
 }
 
-fn record_commit(cx: &Cx, ts: u64, sync_on: bool, ops: Vec<Op>, end_lsn: u64) {
+fn record_commit(cx: &Cx, ts: u64, sync_on: bool, ops: Vec<Op>, lsn: u64, len: u64) {
     let mut h = cx.w.lock();
     let mode = if sync_on { Mode::SyncOn } else { Mode::SyncOff };
     h.h.model_commits.insert(ts, (mode, ops));
-    h.h.wal_commits.insert(ts, (sync_on, end_lsn, end_lsn));
+    // (sync_on, record lsn, record len) — the harness's Work 2.1 extent.
+    h.h.wal_commits.insert(ts, (sync_on, lsn, len));
     h.h.txn_counter += 1;
 }
 

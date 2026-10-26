@@ -337,10 +337,20 @@ pub fn seg_of(lsn: u64) -> u64 {
     lsn - (lsn % WAL_SEG)
 }
 
+/// The maximum record size (§12.2: "a single record is at most
+/// `wal_seg_size / 4`; larger transactions are chunked"). An enqueue
+/// above it is refused loudly — never placed (the gate's round-3 F1: the
+/// draft had no cap, so a 177-KiB `Commit` was spread across 64-KiB
+/// segments, §12.5's reader stopped before it, and both recovery and the
+/// Work 2.1 derivation silently dropped the acked commit).
+pub const REC_MAX: u64 = WAL_SEG / 4;
+
 /// Enqueue a record at its LSN (the commit critical section's second
 /// half; I-WAL-TS-ORDER). Returns `(lsn, len)` of the record itself
 /// (excluding any `SegmentEnd` filler). A WAL enqueue is a yield point
-/// (card 1.2), then the whole placement is one step.
+/// (card 1.2), then the whole placement is one step. A payload whose
+/// record exceeds [`REC_MAX`] is refused with [`Fail::Invalid`] — the
+/// caller chunks the transaction (§12.2).
 pub fn wal_enqueue<H: StoreHost>(
     cx: &Cx<'_, H>,
     kind: u8,
@@ -349,6 +359,14 @@ pub fn wal_enqueue<H: StoreHost>(
     payload: &[u8],
 ) -> Result<(u64, u64), Fail> {
     cx.yield_now("wal_enqueue")?;
+    if REC_FIXED + payload.len() as u64 > REC_MAX {
+        return Err(Fail::Invalid(format!(
+            "record over the §12.2 cap: {} payload bytes ({} + fixed {} > {REC_MAX}) — chunk the transaction",
+            payload.len(),
+            payload.len(),
+            REC_FIXED
+        )));
+    }
     cx.with("wal_enqueue:place", |c| {
         let st = c.store();
         st.alive()?;

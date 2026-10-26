@@ -37,6 +37,9 @@ use crate::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, pr
 /// A read/serve record: `(file, offset, length)`.
 type Reads = Vec<(usize, u64, u64)>;
 
+/// A WAL file's stitched issued writes: offset → latest bytes.
+type FileWrites = BTreeMap<u64, Vec<u8>>;
+
 /// Stream tags (independent splitmix64 derivations per concern).
 const S_SCHED: u64 = 1;
 const S_CRASH: u64 = 4;
@@ -149,8 +152,11 @@ impl Script {
 pub struct HarnessState {
     /// The reference model.
     pub model: Model,
-    /// Commit ts → (sync_on, record end lsn) — recorded at the enqueue.
-    pub wal_commits: BTreeMap<u64, (bool, u64)>,
+    /// Commit ts → `(sync_on, record lsn, record len)` — recorded at the
+    /// enqueue, with the extent `wal_enqueue` returned (the Work 2.1
+    /// derivation's F1 fix: the extent lets it fail loudly when a
+    /// record's bytes were written yet can never parse).
+    pub wal_commits: BTreeMap<u64, (bool, u64, u64)>,
     /// The txn counter (ids).
     pub txn_counter: u64,
     /// Registered snapshots (long readers).
@@ -379,7 +385,7 @@ pub fn commit_txn(
     cx.with("h:model", |c| {
         let h = c.h();
         h.model.commit(ts, mode, ops.to_vec());
-        h.wal_commits.insert(ts, (sync_on, end_lsn));
+        h.wal_commits.insert(ts, (sync_on, lsn, len));
         h.commits_done += 1;
         Ok(())
     })?;
@@ -1232,12 +1238,22 @@ pub fn run_round(
     // Work 2.1: written/acked from the disk events — the write carrying
     // the commit record's last byte returned, and (SyncOn) a WAL sync
     // covering it returned / (SyncOff) the write returned.
-    let (written_ts, acked_ts) = derive_written_acked(&events, &wal_commits);
+    let (written_ts, acked_ts, unparsed_written) = derive_written_acked(&events, &wal_commits);
     for ts in written_ts {
         model.mark_written(ts);
     }
     for ts in acked_ts {
         model.mark_acked(ts);
+    }
+    // The F1 loud half: a commit whose record bytes were written yet can
+    // never parse is a harness/store defect (only an over-cap enqueue
+    // can produce it, and the cap refuses those) — the round fails,
+    // never a silent model drop.
+    let mut task_error = flags.3;
+    if !unparsed_written.is_empty() && task_error.is_none() {
+        task_error = Some(format!(
+            "wal_commits written but unparsable (record len past segment): {unparsed_written:?}"
+        ));
     }
 
     // ---- the crash and the faults ----
@@ -1385,7 +1401,7 @@ pub fn run_round(
         deadlock: flags.0,
         baton: flags.1,
         panicked: flags.2,
-        task_error: flags.3,
+        task_error,
         ..Default::default()
     };
     match recovery {
@@ -1648,12 +1664,20 @@ pub fn run_round(
 /// **file-relative** throughout (B5 fixes: split records across a
 /// writer's 4-KiB batch chunks, and recycled segments' file-relative
 /// positions; D9's renamed-segment shape pinned both).
+///
+/// The third return is the **loud** half of the gate's round-3 F1: every
+/// commit whose record header is present in some WAL file's issued
+/// writes at its segment-relative position with its own lsn, but whose
+/// `len` runs past the segment end — bytes written, never parseable
+/// (§12.2 never places such a record; only an over-cap enqueue ever
+/// could, and the cap now refuses it). The harness fails the round on
+/// any; dropping the entry silently let an acked commit vanish from the
+/// model while recovery lost it too (the F1 demonstration).
 pub fn derive_written_acked(
     events: &[DiskEvent],
-    wal_commits: &BTreeMap<u64, (bool, u64)>,
-) -> (Vec<u64>, Vec<u64>) {
+    wal_commits: &BTreeMap<u64, (bool, u64, u64)>,
+) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
     // inode → (off → latest issued bytes) and the return/sync extents.
-    type FileWrites = BTreeMap<u64, Vec<u8>>;
     let mut files: BTreeMap<usize, FileWrites> = BTreeMap::new();
     let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
     let mut durable_end: BTreeMap<usize, u64> = BTreeMap::new();
@@ -1757,8 +1781,21 @@ pub fn derive_written_acked(
     }
     let mut written = Vec::new();
     let mut acked = Vec::new();
-    for (ts, (sync_on, _end)) in wal_commits.iter() {
+    let mut unparsed_written = Vec::new();
+    for (ts, (sync_on, lsn, _len)) in wal_commits.iter() {
         let Some((inode, end)) = ts_pos.get(ts).copied() else {
+            // The walk never yielded this commit's record. If its header
+            // sits issued at the segment-relative position with its own
+            // lsn and a length past the segment end, the bytes were
+            // written but can never parse — report it (F1); the harness
+            // fails the round. A record simply never written (or torn
+            // mid-body, a normal crash outcome) has no full header or a
+            // length that fits, and stays silent.
+            if let Some(rec_len) = issued_header_len(&files, *lsn, seg)
+                && (*lsn % seg) + rec_len > seg
+            {
+                unparsed_written.push(*ts);
+            }
             continue;
         };
         let w = returned_end.get(&inode).copied().unwrap_or(0);
@@ -1771,7 +1808,37 @@ pub fn derive_written_acked(
             }
         }
     }
-    (written, acked)
+    (written, acked, unparsed_written)
+}
+
+/// The record length an issued NWAL header carries at `lsn % seg`, if
+/// some file's stitched writes hold a magic-correct header with exactly
+/// this lsn embedded (the F1 report's discriminator). `None` when no
+/// file's issued bytes hold such a header.
+fn issued_header_len(files: &BTreeMap<usize, FileWrites>, lsn: u64, seg: u64) -> Option<u64> {
+    let off = lsn % seg;
+    for writes in files.values() {
+        let hdr = stitched(writes, off, 24);
+        if hdr.len() < 24 || !magic_ok(&hdr) {
+            continue;
+        }
+        let embedded = {
+            let s = hdr.get(16..24)?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(s);
+            u64::from_le_bytes(a)
+        };
+        if embedded == lsn {
+            let len = {
+                let s = hdr.get(4..8)?;
+                let mut a = [0u8; 4];
+                a.copy_from_slice(s);
+                u32::from_le_bytes(a) as u64
+            };
+            return Some(len);
+        }
+    }
+    None
 }
 
 /// The NWAL record magic (§12.2, `enc_record`'s first word).
