@@ -1030,28 +1030,6 @@ fn d14_monitors() {
         key: i.to_be_bytes().to_vec(),
         value: vec![v; 400],
     };
-    let ops = vec![
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: vec![
-                Op::CreateTree { tree: 2 },
-                Op::CreateTree { tree: CATALOG },
-                publish(2),
-            ],
-        },
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (0..60).map(|i| big(i, 1)).collect(),
-        },
-        ScriptOp::Commit {
-            sync_on: false,
-            ops: (60..120).map(|i| big(i, 2)).collect(),
-        },
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (26..36).map(|i| big(i, 3)).collect(),
-        },
-    ];
     let mk = |m: Option<Mutant>, hook: CkptHook| {
         let script = Script {
             tasks: vec![ScriptTask {
