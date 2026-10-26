@@ -501,6 +501,247 @@ fn checkpoint_with_concurrent_insert_and_evictor() {
     }
 }
 
+/// `fetch_page`'s `Stale` re-validation (the gate's round-3 F5): a
+/// fetch's carried `(ref, bytes)` is in flight across the env yields of
+/// its read and accept — and a concurrent task can dirty-evict the very
+/// page in that window, moving its home to a fresh slot. Installing the
+/// carried bytes then silently drops every mutation between the two
+/// versions (the frame holds the old bytes as clean, and later reads
+/// hit it). The gate's probe (the re-validation removed) left the whole
+/// suite green; this pin holds it with a deterministic interleave.
+///
+/// The shape: a single-leaf tree whose page is resident nowhere (the
+/// pool is drained first). The scanner arms the `fetch:inflight` park
+/// and scans; the mutator waits for the scanner's `read_at` of the
+/// leaf's home to appear in the disk's read log — then, inside the
+/// in-flight window and without touching `fetch_page` itself, writes
+/// the page's next version directly (`store_page` on built bytes) and
+/// evicts it out to a fresh slot, superseding the carried ref. Clean:
+/// the install discards the carried bytes (`Stale`), re-loads the new
+/// home, and the scan sees the mutation. With the re-validation
+/// removed, the stale bytes are installed as a clean frame and the scan
+/// loses the entry.
+///
+/// (Coordination note: the mutator's poll reads the world under one
+/// guard per iteration — the flag board and the read log share it; a
+/// nested `sched.lock()` here self-deadlocks the non-reentrant mutex,
+/// which is how this pin's first draft hung.)
+#[test]
+fn fetch_page_revalidates_its_carried_ref() {
+    for seed in 1u64..=3 {
+        let cfg = tcfg(8, 10, 2);
+        let (disk, st) = create_store(cfg.clone(), seed, Some(8));
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        // One entry in a single-leaf tree, made durable, then the pool
+        // drained: the leaf is resident nowhere.
+        let root = tree::dir_root_of(&cx, 8).expect("root");
+        ins(&cx, 8, root, &1u64.to_be_bytes(), 1, &val(1, 1));
+        while prims::evict_one(&cx, false).expect("evict") {
+            cx.yield_now("test:drain").map_err(fail_of).expect("y");
+        }
+        let (disk2, st2) = {
+            let g = sched.lock();
+            (g.disk.clone(), g.st.clone())
+        };
+        let body = move |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            match t {
+                1 => {
+                    // The mutator: wait for the scanner's read of the
+                    // leaf's home (one guard per poll), then supersede
+                    // the carried ref inside the window.
+                    let pf = {
+                        let g = sched.lock();
+                        g.st.page_file
+                    };
+                    let mut polls = 0u32;
+                    loop {
+                        let seen = {
+                            let g = sched.lock();
+                            let home = g.st.map.cur.get(&root).copied();
+                            g.disk.reads.iter().any(|r| {
+                                r.inode == pf
+                                    && r.off == home.map(|r| r.slot * 4096).unwrap_or(u64::MAX)
+                            })
+                        };
+                        if seen {
+                            break;
+                        }
+                        polls += 1;
+                        assert!(polls < 100_000, "seed {seed}: the read never appeared");
+                        cx.yield_now("test:wait-read").map_err(fail_of)?;
+                    }
+                    // The page's next version: the old entry plus a new
+                    // one, built directly (no fetch — the park stays the
+                    // scanner's alone).
+                    let (home, epoch) = {
+                        let g = sched.lock();
+                        (g.st.map.cur.get(&root).copied().expect("home"), g.st.e)
+                    };
+                    let e1 = tree::enc_ekey(&1u64.to_be_bytes(), 1);
+                    let e2 = tree::enc_ekey(&2u64.to_be_bytes(), 2);
+                    let v1 = val(1, 1);
+                    let v2 = val(2, 1);
+                    let bytes = e4_recovery::store::page::build_leaf(
+                        root,
+                        epoch,
+                        &[
+                            (e1.as_slice(), v1.as_slice()),
+                            (e2.as_slice(), v2.as_slice()),
+                        ],
+                    );
+                    prims::store_page(&cx, root, bytes).map_err(fail_of)?;
+                    // Evict it out: the home moves to a fresh slot,
+                    // superseding the scanner's carried ref.
+                    let mut guard = 0u32;
+                    loop {
+                        let done = {
+                            let g = sched.lock();
+                            g.st.map.cur.get(&root).copied() != Some(home)
+                        };
+                        if done {
+                            break;
+                        }
+                        if !prims::evict_one(&cx, false).map_err(fail_of)? {
+                            cx.yield_now("test:evict-retry").map_err(fail_of)?;
+                        }
+                        guard += 1;
+                        assert!(guard < 10_000, "seed {seed}: the eviction loop");
+                    }
+                    Ok(())
+                }
+                2 => {
+                    // The scanner: arm the in-flight park, scan, disarm.
+                    cx.with("test:arm", |c| {
+                        c.store().parks.insert("fetch:inflight", 256);
+                        Ok(())
+                    })
+                    .map_err(fail_of)?;
+                    let scan = tree::tree_scan(&cx, root, u64::MAX).map_err(fail_of)?;
+                    cx.with("test:disarm", |c| {
+                        c.store().parks.remove("fetch:inflight");
+                        Ok(())
+                    })
+                    .map_err(fail_of)?;
+                    let got2 = scan.get(2u64.to_be_bytes().as_slice()).cloned().flatten();
+                    assert_eq!(
+                        got2,
+                        Some(val(2, 1)[1..].to_vec()),
+                        "seed {seed}: the scan must see the in-window mutation (Stale re-validation)"
+                    );
+                    assert_eq!(
+                        scan.get(1u64.to_be_bytes().as_slice()).cloned().flatten(),
+                        Some(val(1, 1)[1..].to_vec()),
+                        "seed {seed}: the older entry survives"
+                    );
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        };
+        let (_sched, report) = run_world(3, seed, disk2, st2, body);
+        report.assert_clean("fetch Stale pin");
+    }
+}
+
+/// The step-2 fixpoint re-scan (the gate's round-3 F5): a first-touch
+/// epoch copy installed into a **reserve** frame — the low indices the
+/// scan starts at — after the cursor has passed them leaves its
+/// `CopyPending` unresolved in a single pass; the frozen image then
+/// maps the LPID to nothing and the image loses the page outright. The
+/// gate's probe (the re-scan removed: a pass that wrote something still
+/// returns) left the whole suite green; this pin holds it.
+///
+/// The shape is deterministic: a checkpoint hook performs the
+/// first-touch **inside** step 2 — at the first `Mid2`, after the
+/// scan's first write (the directory's frame, the lowest dirty index),
+/// while the cursor sits past the reserve frames. The hook's insert
+/// into tree B freezes B's image state (a dirty page at the flip:
+/// `CopyPending`) and installs the epoch copy into reserve frame 0 —
+/// behind the cursor. The fixpoint's second pass writes the copy and
+/// resolves the override; without it, reopening the image loses tree
+/// B's page entirely (the scan of B fails "lpid unmapped").
+#[test]
+fn step2_fixpoint_writes_late_epoch_copies() {
+    for seed in 1u64..=3 {
+        let cfg = tcfg(8, 12, 2);
+        let (disk, st) = create_store(cfg.clone(), seed, None);
+        let sched = pass_world(1, seed, disk, st);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        // Tree A: one entry (its page occupies the first normal frame
+        // after the directory's).
+        tree::dir_create_tree(&cx, 6).expect("CreateTree A");
+        let root_a = tree::dir_root_of(&cx, 6).expect("root A");
+        ins(&cx, 6, root_a, &1u64.to_be_bytes(), 1, &val(1, 1));
+        // Tree B: one entry, created after A so its page sits at a
+        // higher frame index than the directory's and A's pages — the
+        // scan reaches it after its first write.
+        tree::dir_create_tree(&cx, 7).expect("CreateTree B");
+        let root_b = tree::dir_root_of(&cx, 7).expect("root B");
+        ins(&cx, 7, root_b, &1u64.to_be_bytes(), 1, &val(1, 1));
+        // The checkpoint: at the first Mid2 (after the scan's first
+        // write — the directory's frame, the lowest dirty index), the
+        // hook performs the first-touch of B mid-flip-window.
+        let mut fired = false;
+        let mut hooks = |hook: CkptHook| -> Result<(), Fail> {
+            if hook == CkptHook::Mid2 && !fired {
+                fired = true;
+                let cxh = Cx {
+                    w: &sched,
+                    t: HARNESS,
+                };
+                ins(&cxh, 7, root_b, &2u64.to_be_bytes(), 1, &val(2, 1));
+            }
+            Ok(())
+        };
+        ckpt::checkpoint(&cx, &mut hooks).expect("checkpoint");
+        assert!(fired, "seed {seed}: the hook's Mid2 fired");
+        // Reopen from the durable bytes: image k holds the flip-time
+        // state — B's first entry (the epoch copy the fixpoint wrote),
+        // never the hook's post-flip insert.
+        let g = sched.lock();
+        let disk_after = g.disk.clone();
+        drop(g);
+        let sched2 = pass_world(1, seed + 100, disk_after, StoreInner::empty(cfg.clone(), 0));
+        let cx2 = Cx {
+            w: &sched2,
+            t: HARNESS,
+        };
+        let (opened, meta) = ckpt::open(&cx2, cfg.clone()).expect("reopen");
+        assert_eq!(meta.ckpt_id, 1, "seed {seed}: meta 1 is the image");
+        cx2.with("fixpt:install", |c| {
+            *c.store() = opened;
+            Ok(())
+        })
+        .expect("install");
+        let root_b2 = tree::dir_root_of(&cx2, 7).expect("root B after reopen");
+        let scan_b = tree::tree_scan(&cx2, root_b2, 10).expect("scan B after reopen");
+        let want_b: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            [(1u64.to_be_bytes().to_vec(), Some(val(1, 1)[1..].to_vec()))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            scan_b, want_b,
+            "seed {seed}: image 1 holds B's flip-time entry (the fixpoint wrote the copy)"
+        );
+        let root_a2 = tree::dir_root_of(&cx2, 6).expect("root A after reopen");
+        let scan_a = tree::tree_scan(&cx2, root_a2, 10).expect("scan A after reopen");
+        assert_eq!(scan_a.len(), 1, "seed {seed}: A's entry survived");
+        let findings = amcheck::amcheck(&cx2, &cfg);
+        assert!(
+            findings.is_empty(),
+            "seed {seed}: reopened amcheck findings: {findings:?}"
+        );
+    }
+}
+
 /// G7's meta-selection semantics (P's ruling on the round-3 F3,
 /// 2026-10-26): the winner is the highest placed-valid meta; a
 /// misplaced valid meta that does not outrank it is a loser (ignored);

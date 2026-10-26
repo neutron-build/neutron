@@ -581,6 +581,13 @@ pub fn fetch_page<H: StoreHost>(
                     .accepted(f, off, page::PAGE as u64)
                     .map_err(Fail::Sim)?;
                 loaded = Some((r, bytes));
+                // A named park point (card Work 13): the window this
+                // fetch's carried `(ref, bytes)` is in flight — between
+                // the read and the re-validating install step — is where
+                // a concurrent eviction can supersede the ref (the
+                // `Stale` re-validation below). The directed tests hold
+                // a fetch here to place that interleave deterministically.
+                cx.park("fetch:inflight")?;
             }
             // `loaded` was taken and discarded: loop (the head re-derives
             // — a frame for `lpid`, or a fresh `Load` of the new home).

@@ -1899,6 +1899,215 @@ fn d16_epoch_reserve() {
     }
 }
 
+/// The R4 positional-id pin (the gate's round-3 F5): two **empty** map
+/// leaves — byte-identical except for the positional header id — are the
+/// only plant shape where §3.3's check (3) alone discriminates. The
+/// workload builds four trees so the radix holds two fully-unmapped
+/// middle leaves (trees B and C dropped, their LPID ranges freed), then
+/// a MISDIRECTED fault plants leaf 2's empty bytes on leaf 1's
+/// referenced slot under REFCRC-SKIP: checks (1) and (4) pass (a valid
+/// epoch-0 page), (2) is the mutant's off site, and the planted entries
+/// parse to exactly the same all-`None` leaf — identical semantics, so
+/// no structural check (LPID-exactness, free-set exactness, amcheck,
+/// the harness walks) can see the swap. Only the **positional id**
+/// (expected base 8, header 16) names the plant.
+///
+/// Clean (positional walkers): XX001 at open before any accept — an MP
+/// detection that passes, never served. Verified mutant-style against
+/// the gate's probe (positional → `header_id`), by hand: the
+/// **all-three** revert (store walkers, amcheck, harness walks) and the
+/// **store-walkers-only** revert both make this pin fail exactly as the
+/// design says — the check is vacuous, `open` accepts leaf 1's slot
+/// through the fault's tainted landing range, `served=true` and O-3 (a)
+/// fails the round. The **harness-walks-only** and **amcheck-only**
+/// reverts stay green, subsumed by construction: the harness walks
+/// check with `mutant = None`, and a plant whose reference CRC passes
+/// the harness's check (2) is byte-for-byte the referenced page, so its
+/// positional id passes too — a (2)-passing/(3)-failing plant is
+/// impossible there; and `open` walks the same radix with the same
+/// check and rejects the page before amcheck ever runs. The store's
+/// walkers — the one family that carries the round's mutant — are where
+/// the positional id is load-bearing, and that is what this pin holds.
+#[test]
+fn r4_positional_id_discriminates_the_empty_leaf_plant() {
+    let big = |tree: u64, i: u64| Op::Put {
+        tree,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![1u8; 400],
+    };
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 2 }],
+        },
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..20u64).map(|i| big(2, i)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 3 }],
+        },
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..40u64).map(|i| big(3, i)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 4 }],
+        },
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..40u64).map(|i| big(4, i)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 5 }],
+        },
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..20u64).map(|i| big(5, i)).collect(),
+        },
+        ScriptOp::Checkpoint,
+        // The drop frees every LPID of trees 3 and 4: the middle radix
+        // leaves become fully empty (all-`None` entries), byte-identical
+        // except for their positional ids.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::DropTree { tree: 3 }, Op::DropTree { tree: 4 }],
+        },
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 1,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let r4cfg = |mutant: Option<Mutant>| StoreCfg {
+        map_leaf_cap: 8,
+        freeset_leaf_bits: 128,
+        pool_frames: 24,
+        r_epoch: 2,
+        mutant,
+    };
+    // The faultless base supplies the crashed disk the plant is built
+    // from (the same schedule prefix, so the same slots).
+    let base = {
+        let (disk, st) = harness::create_store(r4cfg(None), 2077, 7).expect("create");
+        harness::run_round(
+            2077,
+            0,
+            &script,
+            &faults(FaultClass::C, knobs(0, 0)),
+            r4cfg(None),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            None,
+        )
+    };
+    assert!(
+        base.pass && base.o1.is_ok(),
+        "R4 base: the faultless round must pass (o1={:?}, te={:?})",
+        base.o1,
+        base.task_error
+    );
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("R4 page file");
+    let (_f, _s, meta) = harness::durable_image(&base.crashed_disk, &r4cfg(None));
+    let meta = meta.expect("R4: a valid meta");
+    // Walk the persisted radix (the test is harness-side: durable bytes
+    // only) and find two empty leaves with different bases.
+    let inner = base
+        .crashed_disk
+        .durable_read(pf, meta.map_root.slot * 4096, 4096);
+    let refs = e4_recovery::store::page::parse_radix_inner(&inner, 0, 254, &meta.map_root, None)
+        .expect("R4: the map inner parses");
+    let mut empties: Vec<(u64, u64)> = Vec::new(); // (base, slot)
+    for (i, r) in refs.iter().enumerate() {
+        if let Some(r) = r {
+            let b = base.crashed_disk.durable_read(pf, r.slot * 4096, 4096);
+            let entries = e4_recovery::store::page::parse_map_leaf(&b, (i as u64) * 8, 8, r, None)
+                .expect("R4: the leaf parses");
+            if entries.iter().all(|e| e.is_none()) {
+                empties.push(((i as u64) * 8, r.slot));
+            }
+        }
+    }
+    assert!(
+        empties.len() >= 2,
+        "R4: the radix must hold two empty leaves for the plant (found {empties:?})"
+    );
+    let (base_x, slot_x) = empties[0];
+    let (base_y, slot_y) = empties[1];
+    assert!(
+        base_y > base_x && slot_y != slot_x,
+        "R4: the two empty leaves must differ (found {empties:?})"
+    );
+    // The plant: leaf Y's bytes onto leaf X's referenced slot.
+    let y_bytes = base.crashed_disk.durable_read(pf, slot_y * 4096, 4096);
+    let x_pre = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| w.off == slot_x * 4096 && w.bytes.len() == 4096)
+        .map(|w| w.pre.clone())
+        .unwrap_or_default();
+    let fault = e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: slot_y * 4096,
+        len: 4096,
+        bytes: y_bytes,
+        pre: x_pre,
+        kind: e4_recovery::sim::MediaKind::Misdirected {
+            to_off: slot_x * 4096,
+        },
+    };
+    let run_r4 = |mutant: Option<Mutant>| {
+        let (disk, st) = harness::create_store(r4cfg(mutant), 2077, 7).expect("create");
+        let mut twin = Vec::new();
+        harness::run_round(
+            2077,
+            0,
+            &script,
+            &RoundFaults {
+                class: FaultClass::Mp,
+                knobs: knobs(0, 0),
+                directed: vec![fault.clone()],
+                no_r_taint: false,
+            },
+            r4cfg(mutant),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            Some(&mut twin),
+        )
+    };
+    let r = run_r4(Some(Mutant::RefCrcSkip));
+    assert!(
+        r.pass && !r.served && (r.detections.contains(&"open") || !r.amcheck_i.is_empty()),
+        "R4 pin: the positional id must name the planted empty leaf under REFCRC-SKIP (pass={}, served={}, det={:?}, am_i={}, o1={:?}, o3={:?})",
+        r.pass,
+        r.served,
+        r.detections,
+        r.amcheck_i.len(),
+        r.o1,
+        r.o3_fail
+    );
+}
+
 /// D17 (integrity): TORN, LOST and MISDIRECTED, each on a referenced
 /// page of the durable image; each is detected (XX001) and **never
 /// served**. The pinned case is the map leaf: with `map_leaf_cap` 254 a

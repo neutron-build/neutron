@@ -204,6 +204,54 @@ fn r_condition3_excludes_noinplace_hits() {
     );
 }
 
+/// X5-R5 condition 3 **at its call site** (the gate's round-3 F5): the
+/// exception-set computation `exception_set_r` must actually consult the
+/// M-NOINPLACE hit slots it is handed — the gate's probe (an empty hit
+/// set at the call site, equivalent to removing condition 3 there) left
+/// the whole suite green. A crafted durable-write history pins the
+/// wiring: a slot that otherwise fully qualifies (referenced by the
+/// opened image, untainted, written after the newer meta's graduation)
+/// is excluded from `R` exactly because its write drew an M-NOINPLACE
+/// hit — and qualifies the moment the hit set is empty.
+#[test]
+fn exception_set_r_consults_its_noinplace_hits() {
+    use e4_recovery::sim::SimDisk;
+    use e4_recovery::store::page::{self, Meta};
+    use std::collections::BTreeSet;
+    let mut disk = SimDisk::new();
+    let pf = disk.create("/pages").expect("create");
+    disk.sync_dir(e4_recovery::sim::ROOT_DIR).expect("dirsync");
+    // The newer meta (ckpt_id 2 > opened 1), graduated by a sync_all:
+    // the graduation point `g` of X5-R5's conditions.
+    let m2 = page::build_meta(&Meta {
+        ckpt_id: 2,
+        ..Meta::default()
+    });
+    disk.write_at(pf, 4096, &m2).expect("meta write");
+    disk.sync_all(pf).expect("meta sync");
+    // A later graduated write to slot 7: after `g`, referenced by the
+    // opened image, untainted — it qualifies for `R` on every condition
+    // except a monitor hit.
+    let w7 = page::build_leaf(7, 3, &[]);
+    disk.write_at(pf, 7 * 4096, &w7).expect("slot 7 write");
+    disk.sync_all(pf).expect("slot 7 sync");
+    let image: BTreeSet<u64> = [7u64].into_iter().collect();
+    let tainted: BTreeSet<u64> = BTreeSet::new();
+    let hits: BTreeSet<u64> = [7u64].into_iter().collect();
+    let r = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &hits);
+    assert!(
+        !r.contains(&7),
+        "condition 3 at the call site: a slot with an M-NOINPLACE hit must not enter R (R={r:?})"
+    );
+    let no_hits: BTreeSet<u64> = BTreeSet::new();
+    let r2 = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &no_hits);
+    assert_eq!(
+        r2,
+        BTreeSet::from([7u64]),
+        "the same slot without a hit qualifies (R={r2:?})"
+    );
+}
+
 /// The pass fold (the gate's N7 pin): every per-seed failure flag folds
 /// `pass` to false on its own — a verdict that passed the oracle is
 /// still a failed round under any flag.
