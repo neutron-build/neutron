@@ -815,3 +815,194 @@ fn accept_hook_judges_older_tainted_read() {
         "an accept judged by an older tainted read is served corruption"
     );
 }
+
+// ---- the X-5b REWORK additions (card Limit 3: every new sim surface
+// gets its own test here) ----
+
+/// The accept hook records `DiskEvent::Accepted` into the event stream,
+/// interleaved with the writes in issue order (the R-taint's history
+/// query: X5-R5's window — "from open until the store next writes it" —
+/// is an order judgement, so the accepts must sit between the writes
+/// they follow).
+#[test]
+fn accepted_events_interleave_in_order() {
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[7u8; 4096]).unwrap();
+    let _ = disk.read_at(f, 0, 4096).unwrap();
+    disk.accepted(f, 0, 4096);
+    disk.write_at(f, 4096, &[8u8; 4096]).unwrap();
+    disk.accepted(f, 4096, 4096);
+    let kinds: Vec<&str> = disk
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            DiskEvent::WriteIssued { .. } => Some("W"),
+            DiskEvent::Accepted { .. } => Some("A"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["W", "A", "W", "A"],
+        "accepts interleave with writes, in order"
+    );
+}
+
+/// Each resolved crash appends exactly one `DiskEvent::Crash` — the life
+/// boundary the R-taint's window restarts on.
+#[test]
+fn crash_event_marks_each_life() {
+    let mut rng = Rng::new(31);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 512]).unwrap();
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.write_at(f, 0, &[2u8; 512]).unwrap();
+    disk.apply_crash(&mut rng, &drop_all());
+    let crashes = disk
+        .events
+        .iter()
+        .filter(|e| matches!(e, DiskEvent::Crash))
+        .count();
+    assert_eq!(crashes, 2, "one Crash event per resolved crash");
+    // Each marker precedes the next life's effects: the event stream is
+    // [dir create, write 1, Crash, write 2, Crash] — the write of a life
+    // never precedes its boundary marker.
+    let seq: Vec<&str> = disk
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            DiskEvent::Crash => Some("C"),
+            DiskEvent::WriteIssued { .. } => Some("W"),
+            DiskEvent::DirOpIssued { .. } => Some("D"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seq, vec!["D", "W", "C", "W", "C"]);
+}
+
+/// `dwrites_of` history queries (X5-R5's `meta_rollback`, `R` and
+/// M-NOINPLACE read them): issue order preserved, `all` distinguishes
+/// `sync_all` graduations, and each `DWrite` carries the pre-image a
+/// LOST fault reverts to (and is `Clone` for the harness's fault
+/// construction).
+#[test]
+fn dwrites_history_carries_pre_and_all() {
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 512]).unwrap();
+    disk.sync_data(f).unwrap();
+    disk.write_at(f, 512, &[2u8; 512]).unwrap();
+    disk.sync_all(f).unwrap();
+    let dw = disk.dwrites_of(f);
+    assert_eq!(dw.len(), 2, "one durable write per graduated write");
+    assert_eq!(dw[0].off, 0);
+    assert!(!dw[0].all, "sync_data graduations are not all-syncs");
+    assert_eq!(dw[1].off, 512);
+    assert!(dw[1].all, "sync_all graduations are");
+    assert_eq!(dw[0].pre.len(), 512, "the pre-image is the whole range");
+    assert!(dw[0].pre.iter().all(|&b| b == 0), "a fresh range's pre is zeros");
+    // The clone feeds the directed-fault construction (D17/D10b).
+    let c = dw[1].clone();
+    assert_eq!(c.bytes, vec![2u8; 512]);
+}
+
+/// `apply_one_media_fault` (the directed tests' deterministic fault
+/// entry, card Work 6/D17/D10b) does exactly what a drawn fault of the
+/// same kind does: LOST reverts the durable range to its pre-image,
+/// records the fault in `media`, and leaves the range tainted (the
+/// durable bytes differ from the issued ones).
+#[test]
+fn apply_one_media_fault_lost_reverts_like_a_drawn_one() {
+    let mut disk = SimDisk::new();
+    let f = disk.create("/pages").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 3 * 4096, &[9u8; 4096]).unwrap();
+    disk.sync_all(f).unwrap();
+    let w = disk.dwrites_of(f)[0].clone();
+    disk.new_round();
+    disk.apply_one_media_fault(&e4_recovery::sim::MediaFault {
+        inode: f,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: e4_recovery::sim::MediaKind::Lost,
+    });
+    assert_eq!(disk.media.len(), 1, "the fault is recorded");
+    let now = disk.durable_read(f, w.off, 4096);
+    assert!(now.iter().all(|&b| b == 0), "LOST reverted to the pre-image");
+    assert!(disk.range_tainted(f, w.off, 4096), "the range is tainted");
+}
+
+/// The R-taint window (X5-R5, card Work 13): a slot in `R` counts as
+/// tainted from open until the store next writes it; each nested
+/// recovery crash restarts the window; non-page-file accepts are out of
+/// scope; slots below 3 are never page homes.
+#[test]
+fn r_taint_window_semantics() {
+    use e4_recovery::harness::r_taint_of;
+    use std::collections::BTreeSet;
+    let pf = 0usize;
+    let r: BTreeSet<u64> = [7u64].into_iter().collect();
+    let acc = |off: u64| DiskEvent::Accepted { inode: pf, off, len: 4096 };
+    let wr = |off: u64| DiskEvent::WriteIssued { inode: pf, off, bytes: vec![0u8; 4096] };
+    // (1) an accept in-window taints.
+    assert!(r_taint_of(&[acc(7 * 4096)], pf, &r));
+    // (2) the store's write before the accept closes the window (the
+    // bytes at the slot are the store's own now).
+    assert!(!r_taint_of(&[wr(7 * 4096), acc(7 * 4096)], pf, &r));
+    // (3) a nested crash reopens it (a new life re-opens the rolled-back
+    // meta and may re-accept the stale slot).
+    assert!(r_taint_of(&[wr(7 * 4096), DiskEvent::Crash, acc(7 * 4096)], pf, &r));
+    // (4) other files never count.
+    assert!(!r_taint_of(
+        &[DiskEvent::Accepted { inode: 9, off: 7 * 4096, len: 4096 }],
+        pf,
+        &r
+    ));
+    // (5) an empty R never taints.
+    assert!(!r_taint_of(&[acc(7 * 4096)], pf, &BTreeSet::new()));
+}
+
+/// The S-BATON detector's cross-thread arm (card Work 11 rule 4 and the
+/// card's instrumentation check): a world holder on **another** OS
+/// thread makes `Sched::acquire`'s `try_lock` loop exhaust and report
+/// [`SimFail::Baton`] naming the site — loudly, without hanging. If the
+/// `try_lock` is replaced by a blocking `lock`, this task parks its OS
+/// thread inside the world mutex and this test hangs (demonstrated by
+/// hand and recorded in the stage RESULT; the run is killed).
+#[test]
+fn baton_violation_cross_thread_holder_is_reported() {
+    let host = TestHost {
+        sched: SchedCore::new(2, 7),
+        disk: SimDisk::new(),
+    };
+    let sched = Arc::new(Sched::new(host));
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let sched2 = Arc::clone(&sched);
+    let holder = std::thread::spawn(move || {
+        let g = match sched2.acquire("test:holder") {
+            Ok(g) => g,
+            Err(e) => panic!("holder acquire failed: {e:?}"),
+        };
+        held_tx.send(()).unwrap();
+        // Hold until the acquirer has been refused.
+        release_rx.recv().unwrap();
+        drop(g);
+    });
+    held_rx.recv().unwrap();
+    let r = sched.acquire("test:cross-thread");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(
+        matches!(r, Err(SimFail::Baton("test:cross-thread"))),
+        "a cross-thread holder must be reported as Baton at the call site, not hung on: {:?}",
+        r.map(|_| ())
+    );
+}
