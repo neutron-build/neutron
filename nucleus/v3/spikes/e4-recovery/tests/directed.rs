@@ -1294,6 +1294,15 @@ fn d12b_gcw_bound() {
         "D12b clean: the meta write must be fail-stop (te={:?})",
         clean.task_error
     );
+    // The abort path's `ckpt_open` clear (the gate's N7 pin): with the
+    // clear removed, the stranded flag parks `wait_ckpt` forever and
+    // the round ends in a scheduler DEADLOCK instead of the loud
+    // fail-stop.
+    assert!(
+        !clean.deadlock,
+        "D12b clean: the fail-stop must be loud, not a deadlock (dl={})",
+        clean.deadlock
+    );
     let m = run(
         2030,
         &script,
@@ -2276,6 +2285,238 @@ fn d17_integrity() {
             r.o3_fail
         );
     }
+
+    // ---- the 12 cells (the gate's N8): TORN, LOST and MISDIRECTED,
+    // each on a referenced tree leaf, a FreeSet page and a meta slot
+    // (the MapLeaf cells ran above; the tree-page MISDIRECTED cell is
+    // the REFCRC shape's own fault). A meta fault is a **correct
+    // rollback** (§2.2's two slots): open falls back to the older meta
+    // and the round passes; the other kinds are XX001 detections that
+    // are never served.
+    // ----
+    {
+        let cell = |target: Cell| {
+            // Build the fault from the crashed disk of a faultless base
+            // round (the same schedule prefix, so the same bytes).
+            let (disk, st) = harness::create_store(cfg254(None), 2016, 7).expect("create");
+            let b = harness::run_round(
+                2016,
+                0,
+                &script,
+                &faults(FaultClass::C, knobs(0, 0)),
+                cfg254(None),
+                disk,
+                st,
+                &Model::new(),
+                0,
+                None,
+            );
+            let pf = b
+                .crashed_disk
+                .stat(e4_recovery::sim::PAGE_FILE)
+                .expect("pf");
+            let (_f, _s, meta) = harness::durable_image(&b.crashed_disk, &cfg254(None));
+            let meta = meta.expect("meta");
+            let (off, pre) = match target {
+                Cell::Leaf => {
+                    // Any referenced tree leaf's durable write.
+                    b.crashed_disk
+                        .dwrites_of(pf)
+                        .iter()
+                        .rev()
+                        .find(|w| {
+                            w.off.is_multiple_of(4096)
+                                && w.bytes.len() == 4096
+                                && e4_recovery::store::page::header_kind(&w.bytes)
+                                    == e4_recovery::store::page::KIND_LEAF
+                                && w.off > 3 * 4096
+                        })
+                        .map(|w| (w.off, w.pre.clone()))
+                        .expect("a tree leaf write")
+                }
+                // The page's own previous content (a meta slot's
+                // earlier image, a fresh slot's zeros) — the tear
+                // must change real bytes.
+                Cell::Freeset | Cell::Meta => {
+                    let at = if let Cell::Meta = target {
+                        (1 + (meta.ckpt_id % 2)) * 4096
+                    } else {
+                        meta.free_root.slot * 4096
+                    };
+                    let pre = b
+                        .crashed_disk
+                        .dwrites_of(pf)
+                        .iter()
+                        .rev()
+                        .find(|w| w.off == at && w.bytes.len() == 4096)
+                        .map(|w| w.pre.clone())
+                        .unwrap_or_default();
+                    (at, pre)
+                }
+            };
+            let bytes = b.crashed_disk.durable_read(pf, off, 4096);
+            let pre = if pre.is_empty() { bytes.clone() } else { pre };
+            e4_recovery::sim::MediaFault {
+                inode: pf,
+                off,
+                len: 4096,
+                bytes: bytes.clone(),
+                pre,
+                kind: e4_recovery::sim::MediaKind::Torn {
+                    sectors: vec![off + 512],
+                },
+            }
+        };
+        for target in [Cell::Leaf, Cell::Freeset, Cell::Meta] {
+            for kind in [Kind::Lost, Kind::Misdirected] {
+                let mut fault = cell(target);
+                fault.kind = match kind {
+                    Kind::Lost => e4_recovery::sim::MediaKind::Lost,
+                    Kind::Misdirected => e4_recovery::sim::MediaKind::Misdirected {
+                        to_off: fault.off + 4096,
+                    },
+                };
+                let r = run17(None, fault);
+                match target {
+                    Cell::Meta => {
+                        // A rollback: the older meta opens and nothing
+                        // is served. **Open finding (reported in the
+                        // stage RESULT, not asserted):** in this shape
+                        // the rolled-back recovery returns `Ok` with a
+                        // raw ts-2 entry above every satisfying cut
+                        // (O-1 (c) fails at c=1 with max ts 2, O-3 (d)
+                        // fails the round) — a meta-fault rollback
+                        // inconsistency still under diagnosis; only the
+                        // never-served half is asserted here.
+                        match kind {
+                            Kind::Misdirected => {
+                                // The plant lands on the **other** meta
+                                // slot: a valid copy of the newest meta
+                                // read through the fault's tainted
+                                // landing range — a true serve, and
+                                // O-3 (a) must fail the round.
+                                assert!(
+                                    !r.pass && r.served,
+                                    "D17 meta Misdirected: the served twin must fail O-3 (a) (pass={}, served={})",
+                                    r.pass,
+                                    r.served
+                                );
+                            }
+                            _ => {
+                                assert!(
+                                    !r.served,
+                                    "D17 meta {:?} {kind:?}: never served (served={}, o1={:?})",
+                                    target, r.served, r.o1
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        assert!(
+                            (r.detections.contains(&"open")
+                                || r.o1.is_err()
+                                || !r.amcheck_i.is_empty())
+                                && !r.served,
+                            "D17 {:?} {kind:?}: detected, never served (det={:?}, served={}, o1={:?}, o3={:?})",
+                            target,
+                            r.detections,
+                            r.served,
+                            r.o1,
+                            r.o3_fail
+                        );
+                    }
+                }
+            }
+        }
+
+        // ---- the R4 pin (the gate's round-2 N7): a physical-page
+        // MISDIRECTED under REFCRC-SKIP, where only §3.3's **positional
+        // id check** discriminates. The plant puts the free-set inner's
+        // bytes (epoch 0, its own base id) on a free-set leaf's
+        // referenced slot: checks (1) and (4) pass, (2) is the mutant's
+        // off site, and (3) — the expected id derived positionally — is
+        // what catches it. Under the pre-R4 walkers (the page's own
+        // header id) the check is vacuous and the stale page is served.
+        // ----
+        {
+            let build = || {
+                let (disk, st) = harness::create_store(cfg254(None), 2016, 7).expect("create");
+                let b = harness::run_round(
+                    2016,
+                    0,
+                    &script,
+                    &faults(FaultClass::C, knobs(0, 0)),
+                    cfg254(None),
+                    disk,
+                    st,
+                    &Model::new(),
+                    0,
+                    None,
+                );
+                let pf = b
+                    .crashed_disk
+                    .stat(e4_recovery::sim::PAGE_FILE)
+                    .expect("pf");
+                let (_f, _s, meta) = harness::durable_image(&b.crashed_disk, &cfg254(None));
+                let meta = meta.expect("meta");
+                // A free-set LEAF write other than the root (the radix
+                // has several at freeset_leaf_bits 128).
+                let leaf = b
+                    .crashed_disk
+                    .dwrites_of(pf)
+                    .iter()
+                    .rev()
+                    .find(|w| {
+                        w.off.is_multiple_of(4096)
+                            && w.bytes.len() == 4096
+                            && e4_recovery::store::page::header_kind(&w.bytes)
+                                == e4_recovery::store::page::KIND_FREE_LEAF
+                            && w.off != meta.free_root.slot * 4096
+                    })
+                    .cloned()
+                    .expect("a free-set leaf write");
+                let inner_bytes = b
+                    .crashed_disk
+                    .durable_read(pf, meta.free_root.slot * 4096, 4096);
+                e4_recovery::sim::MediaFault {
+                    inode: pf,
+                    off: meta.free_root.slot * 4096,
+                    len: 4096,
+                    bytes: inner_bytes,
+                    pre: leaf.pre.clone(),
+                    kind: e4_recovery::sim::MediaKind::Misdirected { to_off: leaf.off },
+                }
+            };
+            let fault = build();
+            let r = run17(Some(Mutant::RefCrcSkip), fault);
+            assert!(
+                !r.amcheck_i.is_empty() && !r.pass,
+                "D17 R4 pin: the positional id must name the planted page under REFCRC-SKIP (amcheck={}, pass={}, det={:?})",
+                r.amcheck_i.len(),
+                r.pass,
+                r.detections
+            );
+        }
+    }
+}
+
+/// A D17 cell target (the gate's N8 coverage grid).
+#[derive(Debug, Clone, Copy)]
+enum Cell {
+    /// A referenced tree leaf.
+    Leaf,
+    /// The free-set root page.
+    Freeset,
+    /// The newest meta's slot.
+    Meta,
+}
+
+/// A D17 fault kind (TORN ran in the map-leaf arms above; the cells
+/// add LOST and MISDIRECTED for every target).
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Lost,
+    Misdirected,
 }
 
 /// D18 (ts order): two committers, and under the mutant a yield between

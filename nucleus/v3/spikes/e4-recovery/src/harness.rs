@@ -1525,11 +1525,13 @@ pub fn run_round(
             // PANIC or an S-BATON violation is never a pass (card "Do
             // not"; the gate's minor finding: the draft ignored
             // `deadlock` and `panicked` here).
-            outcome.pass = verdict.pass
-                && outcome.task_error.is_none()
-                && !outcome.deadlock
-                && !outcome.panicked
-                && !outcome.baton;
+            outcome.pass = fold_pass(
+                verdict.pass,
+                outcome.task_error.as_deref(),
+                outcome.deadlock,
+                outcome.panicked,
+                outcome.baton,
+            );
             outcome.lo = model.lower_bound(c_prev);
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.frontier = frontier;
@@ -1600,11 +1602,13 @@ pub fn run_round(
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
             outcome.served = ex.served;
-            outcome.pass = verdict.pass
-                && outcome.task_error.is_none()
-                && !outcome.deadlock
-                && !outcome.panicked
-                && !outcome.baton;
+            outcome.pass = fold_pass(
+                verdict.pass,
+                outcome.task_error.as_deref(),
+                outcome.deadlock,
+                outcome.panicked,
+                outcome.baton,
+            );
             outcome.lo = model.lower_bound(c_prev);
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();
@@ -2265,14 +2269,39 @@ pub fn exception_set_r(
             continue;
         }
         let slot = w.off / 4096;
-        if image_slots.contains(&slot)
-            && !tainted.contains(&slot)
-            && !noinplace_hits.contains(&slot)
-        {
+        if r_slot_qualifies(slot, image_slots, tainted, noinplace_hits) {
             out.insert(slot);
         }
     }
     out
+}
+
+/// The pure conditions of X5-R5's R for one write's slot: the slot is
+/// referenced by the opened image, not tainted at amcheck (i), and —
+/// condition 3 — **never written with an M-NOINPLACE hit** (a slot the
+/// monitor flagged is named by the violation, never excused by the
+/// exception). Extracted for its pin (the gate's N7): removing any
+/// condition changes the result on the crafted input.
+pub fn r_slot_qualifies(
+    slot: u64,
+    image_slots: &BTreeSet<u64>,
+    tainted: &BTreeSet<u64>,
+    noinplace_hits: &BTreeSet<u64>,
+) -> bool {
+    image_slots.contains(&slot) && !tainted.contains(&slot) && !noinplace_hits.contains(&slot)
+}
+
+/// The per-round pass fold: a DEADLOCK, a PANIC, an S-BATON violation
+/// or a task error is never a pass, whatever the oracle said (card "Do
+/// not"). Extracted for its pin (the gate's N7).
+pub fn fold_pass(
+    verdict_pass: bool,
+    task_error: Option<&str>,
+    deadlock: bool,
+    panicked: bool,
+    baton: bool,
+) -> bool {
+    verdict_pass && task_error.is_none() && !deadlock && !panicked && !baton
 }
 
 /// X5-R5's R-taint (card Work 13): a slot in `R` counts as tainted from

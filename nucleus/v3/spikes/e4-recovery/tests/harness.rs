@@ -176,3 +176,51 @@ fn class_c_round_passes() {
     assert!(c >= 2, "the cut {c} lost the checkpointed prefix (ts 2)");
     assert!(outcome.amcheck_ii.is_empty(), "amcheck (ii) findings");
 }
+
+/// X5-R5's condition 3 (the gate's N7 pin): a slot whose writes hit
+/// M-NOINPLACE is never excused by the exception set, however much it
+/// otherwise qualifies; without the hit it qualifies. Removing the
+/// condition from `exception_set_r` (which routes through
+/// `r_slot_qualifies`) fails this pin.
+#[test]
+fn r_condition3_excludes_noinplace_hits() {
+    use std::collections::BTreeSet;
+    let image: BTreeSet<u64> = [7u64].into_iter().collect();
+    let tainted: BTreeSet<u64> = BTreeSet::new();
+    let hits: BTreeSet<u64> = [7u64].into_iter().collect();
+    assert!(
+        !e4_recovery::harness::r_slot_qualifies(7, &image, &tainted, &hits),
+        "a slot with an M-NOINPLACE hit must not qualify for R"
+    );
+    let no_hits: BTreeSet<u64> = BTreeSet::new();
+    assert!(
+        e4_recovery::harness::r_slot_qualifies(7, &image, &tainted, &no_hits),
+        "the same slot without a hit qualifies"
+    );
+    let taint: BTreeSet<u64> = [7u64].into_iter().collect();
+    assert!(
+        !e4_recovery::harness::r_slot_qualifies(7, &image, &taint, &no_hits),
+        "a tainted slot never qualifies"
+    );
+}
+
+/// The pass fold (the gate's N7 pin): every per-seed failure flag folds
+/// `pass` to false on its own — a verdict that passed the oracle is
+/// still a failed round under any flag.
+#[test]
+fn pass_fold_flags_are_load_bearing() {
+    for (name, te, dl, pan, bat) in [
+        ("task_error", Some("x"), false, false, false),
+        ("deadlock", None, true, false, false),
+        ("panicked", None, false, true, false),
+        ("baton", None, false, false, true),
+    ] {
+        assert!(
+            !e4_recovery::harness::fold_pass(true, te, dl, pan, bat),
+            "the {name} flag alone must fail the round"
+        );
+    }
+    assert!(e4_recovery::harness::fold_pass(
+        true, None, false, false, false
+    ));
+}
