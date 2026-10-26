@@ -34,6 +34,9 @@ use crate::store::tree;
 use crate::store::wal::{self, K_CHUNK, K_COMMIT, K_MARKER};
 use crate::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims};
 
+/// A read/serve record: `(file, offset, length)`.
+type Reads = Vec<(usize, u64, u64)>;
+
 /// Stream tags (independent splitmix64 derivations per concern).
 const S_SCHED: u64 = 1;
 const S_CRASH: u64 = 4;
@@ -1168,7 +1171,7 @@ pub fn run_round(
         let reads_before = world.lock().disk.reads.len();
         match ckpt::recover(&cx, cfg.clone()) {
             Ok((st, frontier)) => {
-                let (reads, served): (Vec<(usize, u64, u64)>, Vec<(usize, u64, u64)>) = {
+                let (reads, served): (Reads, Reads) = {
                     let g = world.lock();
                     (
                         g.disk
