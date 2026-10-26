@@ -1,19 +1,89 @@
 # E4 recovery spike (card X-5, stage X-5a of three)
 
-Status: **stage X-5b B1–B6 complete** (the S-BATON conversion, the store,
-the round harness, the monitors and the directed tests D1–D18 + D10b's
-substrate — see "Stage X-5b" below), with **four directed mutant arms
-reported UNCAUGHT** (PUBLISH-BEFORE-META via D11, FREE-EARLY via D14,
-START-SEGMENT-MISSING-OK via D10, and D16's EVICT-SKIP-IMAGE-MAP /
-WRITE-GUARD-NO-COPY pair; each arm asserts its observed miss in the
-source so the gap cannot pass silently — details in the stage RESULT
-and each test's doc comment). The crate builds, all suites pass
-(82 tests) and the gate's clippy/fmt steps see the whole store. This
-claims nothing about E4 itself: no campaign exists until X-5c, and Opus
-judges E4 only on X-5c's RESULT. X-5c inherits: the four uncaught arms,
-the `BulkLoad` driver deadlock (diagnosed, unfixed), D8's end-to-end
-stale-recycle arm (multi-round), and the `run`/`verify`/`mutants`
+Status: **stage X-5b B1–B6 complete, plus the 2026-10-25 gate-REWORK
+round applied** (R1–R7 and the minor items — see "Gate REWORK on
+stage X-5b" below): the S-BATON conversion, the store, the round
+harness, the monitors and the directed tests D1–D18 + D10b/D12b. The
+crate builds, all suites pass (89 tests) and the gate's clippy/fmt
+steps see the whole store. This claims nothing about E4 itself: no
+campaign exists until X-5c, and Opus judges E4 only on X-5c's RESULT.
+X-5c inherits: the three uncaught directed arms (D7's multi-round
+zombie, D10b's REFCRC-SKIP serve, D16's pair — each argued in its test
+doc comment, none assert-pass), and the `run`/`verify`/`mutants`
 campaign surfaces.
+
+## Gate REWORK on stage X-5b (2026-10-25 verdict, applied)
+
+- **R1/R2 (mutant arms).** Every inverted or vacuous arm is gone: D10
+  runs the real G3 shape (the recycle removes meta k−1's start segment,
+  a LOST fault on meta k forces the rollback open, and
+  START-SEGMENT-MISSING-OK's silent empty WAL loses the acked commits —
+  O-3 (d) fails the round); D11 drives the real `BulkLoad` with
+  PUBLISH-BEFORE-META's single site at the load's forced-meta wait
+  (caught); D14's FREE-EARLY site now frees **at the flip** (the
+  draft's just-before-step-5 window was two yields wide and no
+  allocation could enter it) — step 2's own allocations reuse
+  durable-referenced slots and M-NOINPLACE fires; D17 runs through
+  `run_round` with directed faults (a torn map leaf at `map_leaf_cap`
+  254, where one radix leaf's entries span past sector 0): clean XX001
+  never served, CRC-SKIP serves the tainted leaf and fails the round,
+  and the EPOCH/ID single sites stay subsumed (the expected-0 hit
+  rates, demonstrated in the test). D10b exists (below). D7's
+  multi-round arm and D16's pair are **reported** UNCAUGHT with
+  arguments in their doc comments — never asserted as passes.
+- **R3 (X5-R5's harness half).** `exception_set_r` implements all three
+  conditions (the third — no M-NOINPLACE hit on the slot's writes — via
+  the monitor's new per-write verdicts, `monitor::noinplace_slot_hits`);
+  the R-taint is computed from the interleaved write/accept history
+  (`DiskEvent::Accepted`, one `DiskEvent::Crash` per life) over every
+  post-crash life — recovery's own accepts included, each nested crash
+  restarting the window (`harness::r_taint_of`, pinned in
+  `tests/sim.rs`); D10b runs the rollback shape end to end. G4's
+  catcher is D17's recovery-world serve; G5's is D10b's clean arm
+  (composed with its REFCRC arm).
+- **R4 (the self-referential id check).** Every radix walk (open,
+  amcheck, the harness walks and the monitor's shadow walk) derives the
+  expected id **positionally** (`ckpt::radix_child_span`; the child of
+  an inner at base `b`, index `i`, span `s` expects id `b + i·s`), and
+  the builders' base formulas agree (the free-set inner's `2^depth`
+  understatement fixed to `fan^(depth+1)`).
+- **R5 (the BulkLoad deadlock).** Root cause: the S_L draw consumed a
+  ts from the commit sequencer without marking it applied, so
+  `visible_ts` stalled below every later commit forever (the publish
+  commit parked in `mark_applied` on a ts that never arrives). The
+  drawn ts is pre-marked applied; `ScriptOp::BulkLoad` runs (D11).
+- **R6 (the instrumentation check).** `baton_violation_is_reported`
+  gains a cross-thread arm (`baton_violation_cross_thread_holder_is_
+  reported`): a world holder on another OS thread makes `acquire`'s
+  `try_lock` loop report `Baton` at the call site. Demonstrated by
+  hand: with the `try_lock` replaced by a blocking `lock`, the test
+  hangs (the run was killed at 60 s with no result) and reverts clean.
+- **R7 (RESULT accuracy).** B1's `git diff --stat` (4b1e6068): 14 files,
+  +4935/−2702 ≈ 7.6k changed lines against the ~1.5k budget; the stage
+  RESULT's mutant table reports the arms as above, item 3 includes
+  D10b.
+- **Minor.** `RoundOutcome.pass` folds `deadlock`/`panicked`/`baton`
+  (the flag is now actually set — from task errors and from
+  `StoreInner::baton_fail`, which the release paths record instead of
+  swallowing); `EnvRef::accepted` propagates its acquisition failure
+  (fail-closed on an oracle input); D1's clean arm asserts the monitors
+  are empty; every new sim surface (`dwrites_of` history, `DWrite`
+  pre/`all`/`Clone`, `apply_one_media_fault`, the Accepted/Crash
+  events, the R-taint window) has its own test in `tests/sim.rs`
+  (`apply_one_media_fault` is Work 6/D17–D10b's deterministic fault
+  entry, the drawn-fault path's equal); the `WorldGuard` `Drop` comment
+  states the real order.
+
+**Failures found and fixed while reworking** (each pinned by the test
+that exposed it): the `ckpt_open` strand (a checkpoint that fails
+without a crash — the I-GCW fail-stop — left the flag set and parked
+`wait_ckpt` forever; D12b's hang); the checkpointer swallowed non-crash
+checkpoint failures (a poisoned round passed with no meta written —
+now `task_error`); `RoundOutcome` never carried `meta_rollback`,
+`rollback_slots`, `amcheck_i` or the crashed disk (the directed tests
+judged defaults); the monitor's shadow walk recursed with the parent's
+bytes, so `flat` never filled past one level and the durable slot set
+undercounted every tree page.
 
 ## Stage X-5b (B1–B6)
 
