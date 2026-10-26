@@ -725,7 +725,13 @@ fn ckpt_step2_data<H: StoreHost>(
             if is_copy || pinned {
                 st.map.img.insert(key, Img::At(r));
                 st.slots.image_refs.insert(r.slot);
-            } else if st.pool.frames.get(i).map(|f| f.key == key && f.dirty && f.epoch <= k as u32).unwrap_or(false) {
+            } else if st
+                .pool
+                .frames
+                .get(i)
+                .map(|f| f.key == key && f.dirty && f.epoch <= k as u32)
+                .unwrap_or(false)
+            {
                 let old = st.map.cur.insert(key, r);
                 if let Some(old) = old {
                     prims::unpin_home(st, old.slot);
@@ -752,9 +758,9 @@ fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
         let st = c.store();
         Ok((
             st.cfg.map_leaf_cap,
-            st.image_frozen.clone().ok_or_else(|| {
-                Fail::Invalid("map radix without a frozen image".to_owned())
-            })?,
+            st.image_frozen
+                .clone()
+                .ok_or_else(|| Fail::Invalid("map radix without a frozen image".to_owned()))?,
         ))
     })?;
     let n_leaves = frozen.next_lpid.div_ceil(cap);
@@ -883,45 +889,36 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
     // 2's sizing note): after growth, recompute and allocate the
     // difference.
     let mut fs_slots: Vec<u64> = Vec::new();
-    let mut rounds = 0u32;
     let fan = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
     let slot_count = frozen_sc;
-    loop {
-        rounds += 1;
-        if rounds > 8 {
-            return Err(Fail::Invalid("freeset sizing did not converge".into()));
+    let total_bits = (slot_count - 3) + img_next_lpid;
+    let mut pages = total_bits.div_ceil(leaf_bits);
+    let mut lvl = total_bits.div_ceil(leaf_bits);
+    while lvl > 1 {
+        lvl = lvl.div_ceil(fan);
+        pages += lvl;
+    }
+    while (fs_slots.len() as u64) < pages {
+        let s = prims::alloc_slot(cx)?;
+        fs_slots.push(s);
+    }
+    cx.with("fs:building", |c| {
+        let st = c.store();
+        for &s in fs_slots.iter() {
+            st.fs_building.insert(s);
         }
-        let total_bits = (slot_count - 3) + img_next_lpid;
-        let mut pages = total_bits.div_ceil(leaf_bits);
-        let mut lvl = total_bits.div_ceil(leaf_bits);
-        while lvl > 1 {
-            lvl = lvl.div_ceil(fan);
-            pages += lvl;
-        }
-        while (fs_slots.len() as u64) < pages {
-            let s = prims::alloc_slot(cx)?;
-            fs_slots.push(s);
-        }
-        cx.with("fs:building", |c| {
-            let st = c.store();
-            for &s in fs_slots.iter() {
-                st.fs_building.insert(s);
-            }
-            Ok(())
-        })?;
-        let sc2 = cx.with("fs:sc2", |c| Ok(c.store().slots.slot_count))?;
-        if sc2 <= slot_count {
-            break;
-        }
-        // The file grew (an fs allocation above the frozen span): mark
-        // it (Q17); the frozen bitmap span is unchanged, so one pass
-        // suffices — the growth's own accounting belongs to the next
-        // image (post 5 keeps the live counter).
+        Ok(())
+    })?;
+    let sc2 = cx.with("fs:sc2", |c| Ok(c.store().slots.slot_count))?;
+    if sc2 > slot_count {
+        // The file grew (an fs allocation above the frozen span): mark it
+        // (Q17); the frozen bitmap span is unchanged — the growth's own
+        // accounting belongs to the next image (post 5 keeps the live
+        // counter).
         cx.with("fs:grew", |c| {
             c.store().freeset_grew = true;
             Ok(())
         })?;
-        break;
     }
     // Mark the free-set pages used (the mutant omits them: the bitmap
     // then marks the free set's own slots free — I-FREE-EXACT).
@@ -1143,22 +1140,16 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     .buf_tags
                     .insert(rec.lsn, (rec.ts, rec.kind == K_MARKER, rec.txn));
                 if rec.kind == K_CHUNK {
-                    st.wal
-                        .open_chunks
-                        .entry(rec.txn)
-                        .or_insert(rec.lsn);
+                    st.wal.open_chunks.entry(rec.txn).or_insert(rec.lsn);
                 }
             }
         }
         // Entries whose markers the opened image covers are droppable
         // right away; the rest must stay until a flip covers them.
         let t = meta.t;
-        st.wal.open_chunks.retain(|txn, _| {
-            markers
-                .get(txn)
-                .map(|ts| *ts > t)
-                .unwrap_or(true)
-        });
+        st.wal
+            .open_chunks
+            .retain(|txn, _| markers.get(txn).map(|ts| *ts > t).unwrap_or(true));
         Ok(())
     })?;
     // §14 step 6: resume `dropping` walks.

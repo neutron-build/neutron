@@ -63,7 +63,11 @@ fn std_ops() -> Vec<ScriptOp> {
     vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -151,7 +155,11 @@ fn d2_marked_chunk() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -214,7 +222,11 @@ fn d3_open_chunk() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -279,7 +291,11 @@ fn d4_wal_sync_t_only() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         // Hold the committer after c1's record is enqueued and counted
         // (apply pending at the flip: T = 1 < c1 = 2).
@@ -334,10 +350,7 @@ fn d4_wal_sync_t_only() {
         Some(Mutant::WalSyncTOnly),
     );
     assert!(
-        !m.pass
-            || m.o1.is_err()
-            || m.o1.clone().unwrap() < 2
-            || m.monitors.contains(&"M-CKPT-T"),
+        !m.pass || m.o1.is_err() || m.o1.clone().unwrap() < 2 || m.monitors.contains(&"M-CKPT-T"),
         "D4 mutant: c1's record must be unsynced (o1={:?}, monitors={:?})",
         m.o1,
         m.monitors
@@ -364,7 +377,11 @@ fn d5_split_straddling_flip() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         // Commit A (ts 2): fills the single leaf, applied and visible.
         ScriptOp::Commit {
@@ -433,7 +450,11 @@ fn d6_double_crash_idempotent() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         // The committer parks 400 yields after c2's first apply entry,
         // so task 2's forced flip below lands with entry 0 applied at
@@ -500,7 +521,11 @@ fn d7_zombie_tail() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -552,7 +577,10 @@ fn d8_stale_recycled_segment() {
     let seg_end = 1 << 20;
     // Clean: read at the wrong position (200) — no record yields.
     let clean = wal::dec_record_with_lsn_check(&rec, 200, seg_end, None);
-    assert!(clean.is_err(), "D8 clean: the stale record must not yield ({clean:?})");
+    assert!(
+        clean.is_err(),
+        "D8 clean: the stale record must not yield ({clean:?})"
+    );
     // Mutant: the stale check is gone — the record decodes as new.
     let m = wal::dec_record_with_lsn_check(&rec, 200, seg_end, Some(Mutant::LsnCheckSkip));
     assert!(
@@ -593,7 +621,11 @@ fn d9_dropped_rename() {
     };
     let mut ops = vec![ScriptOp::Commit {
         sync_on: true,
-        ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+        ops: vec![
+            Op::CreateTree { tree: 2 },
+            Op::CreateTree { tree: CATALOG },
+            publish(2),
+        ],
     }];
     // 4 chunked transactions ≈ 66 KiB > one 64-KiB segment: segment 0 is
     // wholly below the flip's `wal_start_lsn` and is recycled.
@@ -643,7 +675,11 @@ fn d10_lost_meta() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -754,7 +790,11 @@ fn d11_publish() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: CATALOG }, Op::CreateTree { tree: 5 }, publish(5)],
+            ops: vec![
+                Op::CreateTree { tree: CATALOG },
+                Op::CreateTree { tree: 5 },
+                publish(5),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -805,7 +845,11 @@ fn d12_gcw() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -859,7 +903,11 @@ fn d13_entry_uniqueness() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         // The flip (every 2 commits) lands with c2 recorded (T = 1) and
         // its apply parked after the first entry: the image carries
@@ -985,7 +1033,11 @@ fn d14_monitors() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -1041,7 +1093,7 @@ fn d14_monitors() {
                     },
                     // Image k=2 fires at this enqueue while the apply
                     // waits: its step-6 frees (moved before step 5 by the
-                            // mutant) release real slots, and the apply's
+                    // mutant) release real slots, and the apply's
                     // allocations can take one while meta k−1 is still
                     // the durable one.
                     ScriptOp::Commit {
@@ -1132,7 +1184,11 @@ fn d15_droptree() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         // A multi-level tree (~20 leaves over inners), loaded as a
         // chunked transaction (§12.7: records stay under the 16-KiB
@@ -1187,7 +1243,11 @@ fn d16_epoch_reserve() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -1355,8 +1415,7 @@ fn d17_integrity() {
             // A LOST/TORN **opened** meta with a valid other slot is a
             // rollback (X5-R5's domain), not corruption: open correctly
             // selects the older meta and stays silent.
-            let leaf_gap = (what == "leaf" || what == "meta")
-                && (kind == "lost" || kind == "torn");
+            let leaf_gap = (what == "leaf" || what == "meta") && (kind == "lost" || kind == "torn");
             if leaf_gap {
                 // leaf: **UNCAUGHT (directed), stage X-5b** — recovery
                 // only reads the pages it must (the map, the free set,
@@ -1422,7 +1481,11 @@ fn d18_ts_order() {
     let ops_a = vec![
         ScriptOp::Commit {
             sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
         },
         ScriptOp::Commit {
             sync_on: true,

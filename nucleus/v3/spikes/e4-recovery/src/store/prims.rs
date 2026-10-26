@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::page::{self, Ref};
-use super::{Cx, Fail, FrozenImage, Frame, Img, Mutant, StoreHost, StoreInner};
+use super::{Cx, Fail, Frame, FrozenImage, Img, Mutant, StoreHost, StoreInner};
 use crate::sim::{E4Env, Sched, TaskId, WaitKey};
 
 /// The effective image-k entry of `lpid`: the override if frozen, else

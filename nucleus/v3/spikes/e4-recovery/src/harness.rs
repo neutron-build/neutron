@@ -290,10 +290,7 @@ pub fn commit_txn(
             let (lsn, _len) = wal::wal_enqueue(cx, K_CHUNK, txn, 0, &payload)?;
             cx.with("h:openchunk", |c| {
                 let st = c.store();
-                st.wal
-                    .open_chunks
-                    .entry(txn)
-                    .or_insert(lsn);
+                st.wal.open_chunks.entry(txn).or_insert(lsn);
                 Ok(())
             })?;
         }
@@ -459,7 +456,8 @@ fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
 }
 
 /// `Op` → `WOp`.
-pub fn to_wop(op: &Op) -> wal::WOp {    match op {
+pub fn to_wop(op: &Op) -> wal::WOp {
+    match op {
         Op::CreateTree { tree } => wal::WOp::CreateTree { tree: *tree },
         Op::DropTree { tree } => wal::WOp::DropTree { tree: *tree },
         Op::Put { tree, key, value } => wal::WOp::Put {
@@ -643,7 +641,8 @@ fn run_task(
 }
 
 fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), SimFail> {
-    let r: Result<(), SimFail> = match op {        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false)
+    let r: Result<(), SimFail> = match op {
+        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false)
             .map(|_| ())
             .map_err(fail_of),
         ScriptOp::Chunked { sync_on, ops } => commit_txn(cx, ops, *sync_on, true)
@@ -1027,7 +1026,12 @@ impl RoundOutcome {
         ));
         s.push_str(&format!(
             "|{:?}|{:?}|{}|{}|{}|{:?}",
-            self.monitors, self.acked_lost, self.meta_rollback, self.deadlock, self.baton, self.task_error
+            self.monitors,
+            self.acked_lost,
+            self.meta_rollback,
+            self.deadlock,
+            self.baton,
+            self.task_error
         ));
         s
     }
@@ -1082,7 +1086,12 @@ pub fn run_round(
             g.disk.clone(),
             clone_model(&g.h.model),
             g.st.wal.flip_enqueue_pos.clone(),
-            (g.h.deadlock, g.h.baton, g.h.panicked, g.h.task_error.clone()),
+            (
+                g.h.deadlock,
+                g.h.baton,
+                g.h.panicked,
+                g.h.task_error.clone(),
+            ),
             g.h.wal_commits.clone(),
             g.disk.events.clone(),
         )
@@ -1407,7 +1416,8 @@ pub fn derive_written_acked(
     wal_commits: &BTreeMap<u64, (bool, u64)>,
 ) -> (Vec<u64>, Vec<u64>) {
     // inode → (off → latest issued bytes) and the return/sync extents.
-    let mut files: BTreeMap<usize, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
+    type FileWrites = BTreeMap<u64, Vec<u8>>;
+    let mut files: BTreeMap<usize, FileWrites> = BTreeMap::new();
     let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
     let mut durable_end: BTreeMap<usize, u64> = BTreeMap::new();
     let mut sync_after: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
@@ -1463,7 +1473,7 @@ pub fn derive_written_acked(
                 }
                 u64::from_le_bytes(b)
             };
-            let len = (rd(4..8) & 0xFFFF_FFFF) as u64;
+            let len = rd(4..8) & 0xFFFF_FFFF;
             let lsn = rd(16..24);
             if len < 16 || off + len > seg || lsn % seg != off {
                 break;

@@ -241,7 +241,12 @@ pub fn dec_record_with_lsn_check(
     seg_end: u64,
     mutant: Option<Mutant>,
 ) -> Result<Option<Rec>, ()> {
-    dec_record_inner(b, lsn, seg_end, matches!(mutant, Some(Mutant::LsnCheckSkip)))
+    dec_record_inner(
+        b,
+        lsn,
+        seg_end,
+        matches!(mutant, Some(Mutant::LsnCheckSkip)),
+    )
 }
 
 fn dec_record_inner(
@@ -372,8 +377,8 @@ pub fn wal_enqueue<H: StoreHost>(
             // the filler, §12.5).
             let se = enc_record(K_SEGEND, (0, 0), 0, &[], lsn0);
             placed.extend_from_slice(&se);
-            let gap = (seg + WAL_SEG) - (lsn0 + se.len() as u64);
-            placed.extend(std::iter::repeat(0u8).take(gap as usize));
+            let gap = ((seg + WAL_SEG) - (lsn0 + se.len() as u64)) as usize;
+            placed.extend_from_slice(&vec![0u8; gap]);
         }
         placed.extend_from_slice(&rec);
         st.wal.buf_tags.insert(rec_lsn, (ts, kind == K_MARKER, txn));
