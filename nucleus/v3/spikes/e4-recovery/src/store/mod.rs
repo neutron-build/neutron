@@ -418,6 +418,13 @@ pub struct StoreInner {
     pub fs_prev: BTreeSet<u64>,
     /// Poison reason (I-FAIL-STOP).
     pub poisoned: Option<String>,
+    /// A world-acquisition failure observed on a release path (S-BATON
+    /// rule 4: loud, never swallowed). Release helpers (`gate_release`,
+    /// `tree_unlock`, `unpin`, the eviction ungate, the checkpoint's
+    /// keep/unfreeze steps) cannot propagate — several run in `Drop`
+    /// guards — so the first failure is recorded here and the harness
+    /// folds it into the round's `baton` flag; the round fails.
+    pub baton_fail: Option<&'static str>,
     /// The WAL state.
     pub wal: wal::WalState,
 }
@@ -475,6 +482,7 @@ impl StoreInner {
             fs_building: BTreeSet::new(),
             fs_prev: BTreeSet::new(),
             poisoned: None,
+            baton_fail: None,
             wal: wal::WalState::default(),
         }
     }

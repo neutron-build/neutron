@@ -32,7 +32,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::page::{self, Ref};
 use super::{Cx, Fail, Frame, FrozenImage, Img, Mutant, StoreHost, StoreInner};
-use crate::sim::{E4Env, Sched, TaskId, WaitKey};
+use crate::sim::{E4Env, Sched, SimFail, TaskId, WaitKey};
+
+/// Record a world-acquisition failure observed where it cannot be
+/// propagated (release helpers, `Drop` guards, best-effort keep-steps):
+/// S-BATON rule 4 keeps it loud — the harness folds the flag into the
+/// round's `baton` outcome and the round fails (the X-5b gate's minor
+/// finding: `.ok()`/`unwrap_or(false)` here swallowed
+/// [`SimFail::Baton`] silently).
+pub fn note_step_fail<H: StoreHost>(cx: &Cx<'_, H>, site: &'static str, e: Fail) {
+    if matches!(e, Fail::Sim(SimFail::Baton(_))) {
+        let _ = cx.with("baton_fail", |c| {
+            let st = c.store();
+            if st.baton_fail.is_none() {
+                st.baton_fail = Some(site);
+            }
+            Ok(())
+        });
+    }
+}
 
 /// The effective image-k entry of `lpid`: the override if frozen, else
 /// the current ref. `None` = the image leaves it unmapped.
@@ -185,13 +203,17 @@ pub fn gate_shared<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
 
 /// Release one shared hold.
 pub fn gate_release<H: StoreHost>(cx: &Cx<'_, H>) {
-    let wake_flip = cx
-        .with("gate_release", |c| {
-            let st = c.store();
-            st.gate.holders = st.gate.holders.saturating_sub(1);
-            Ok(st.gate.flip_pending && st.gate.holders == 0)
-        })
-        .unwrap_or(false);
+    let wake_flip = match cx.with("gate_release", |c| {
+        let st = c.store();
+        st.gate.holders = st.gate.holders.saturating_sub(1);
+        Ok(st.gate.flip_pending && st.gate.holders == 0)
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            note_step_fail(cx, "gate_release", e);
+            false
+        }
+    };
     if wake_flip {
         cx.w.wake(WaitKey::GateFlip);
     }
@@ -237,13 +259,14 @@ pub fn gate_exclusive<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(), Fail> {
 
 /// Release the exclusive hold (end of the flip's critical part).
 pub fn gate_flip_release<H: StoreHost>(cx: &Cx<'_, H>) {
-    cx.with("gate_flip_release", |c| {
+    if let Err(e) = cx.with("gate_flip_release", |c| {
         let st = c.store();
         st.gate.exclusive = false;
         st.gate.flip_pending = false;
         Ok(())
-    })
-    .ok();
+    }) {
+        note_step_fail(cx, "gate_flip_release", e);
+    }
     cx.w.wake(WaitKey::GateShared);
 }
 
@@ -277,11 +300,12 @@ pub fn tree_lock<H: StoreHost>(cx: &Cx<'_, H>, t: u64) -> Result<(), Fail> {
 
 /// Release tree `t`'s mutex.
 pub fn tree_unlock<H: StoreHost>(cx: &Cx<'_, H>, t: u64) {
-    cx.with("tree_unlock", |c| {
+    if let Err(e) = cx.with("tree_unlock", |c| {
         c.store().tree_mu.remove(&t);
         Ok(())
-    })
-    .ok();
+    }) {
+        note_step_fail(cx, "tree_unlock", e);
+    }
     cx.w.wake(WaitKey::Tree(t));
 }
 
@@ -525,7 +549,9 @@ pub fn fetch_page<H: StoreHost>(
                     Fail::Corrupt(format!("integrity fail lpid {lpid} slot {}", r.slot))
                 })?;
                 // Accept hook: a page passing §3.3 (card 1.4).
-                cx.env().accepted(f, off, page::PAGE as u64);
+                cx.env()
+                    .accepted(f, off, page::PAGE as u64)
+                    .map_err(Fail::Sim)?;
                 loaded = Some((r, bytes));
             }
         }
@@ -534,7 +560,7 @@ pub fn fetch_page<H: StoreHost>(
 
 /// Unpin every normal frame of `lpid` (one op's interest ends).
 pub fn unpin<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) {
-    cx.with("unpin", |c| {
+    if let Err(e) = cx.with("unpin", |c| {
         let st = c.store();
         for f in st.normal_frames_mut() {
             if f.key == lpid && !f.is_epoch_copy && f.pins > 0 {
@@ -542,8 +568,9 @@ pub fn unpin<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) {
             }
         }
         Ok(())
-    })
-    .ok();
+    }) {
+        note_step_fail(cx, "unpin", e);
+    }
     cx.w.wake(WaitKey::Pin);
 }
 
@@ -887,13 +914,17 @@ pub fn evict_one<H: StoreHost>(cx: &Cx<'_, H>, inside_op: bool) -> Result<bool, 
     })?;
     let _ = flip;
     if took_gate {
-        let wake_flip = cx
-            .with("evict:ungate", |c| {
-                let st = c.store();
-                st.gate.holders = st.gate.holders.saturating_sub(1);
-                Ok(st.gate.flip_pending && st.gate.holders == 0)
-            })
-            .unwrap_or(false);
+        let wake_flip = match cx.with("evict:ungate", |c| {
+            let st = c.store();
+            st.gate.holders = st.gate.holders.saturating_sub(1);
+            Ok(st.gate.flip_pending && st.gate.holders == 0)
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                note_step_fail(cx, "evict:ungate", e);
+                false
+            }
+        };
         if wake_flip {
             cx.w.wake(WaitKey::GateFlip);
         }

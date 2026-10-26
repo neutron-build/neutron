@@ -59,7 +59,10 @@ pub trait E4Env {
     fn sync_all(&mut self, f: FileId) -> Result<(), SimFail>;
     /// The accept hook (card 1.4): the store accepts the bytes it just
     /// read at this range as valid. Not an I/O op; not a yield point.
-    fn accepted(&mut self, f: FileId, off: u64, len: u64);
+    /// `Err` is a world-acquisition failure ([`SimFail::Baton`]) — the
+    /// caller must propagate it: an accept that silently fails to record
+    /// fails open on an oracle input (the X-5b gate's minor finding).
+    fn accepted(&mut self, f: FileId, off: u64, len: u64) -> Result<(), SimFail>;
 }
 
 /// A bound view of the world for one task: store code obtains it from its
@@ -153,11 +156,9 @@ impl<'a, H: SchedHost + HasDisk> E4Env for EnvRef<'a, H> {
         self.step("env:sync_all", |h| h.disk().sync_all(f))
     }
 
-    fn accepted(&mut self, f: FileId, off: u64, len: u64) {
-        let mut g = match self.sched.acquire("env:accepted") {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+    fn accepted(&mut self, f: FileId, off: u64, len: u64) -> Result<(), SimFail> {
+        let mut g = self.sched.acquire("env:accepted")?;
         g.disk().accepted(f, off, len);
+        Ok(())
     }
 }

@@ -518,8 +518,18 @@ pub fn run_script(sched: &Sched<RoundWorld>, script: &Script, seed: u64) {
                         &crash,
                     )
                 }));
-                if r.is_err() {
-                    p.store(true, std::sync::atomic::Ordering::SeqCst);
+                match r {
+                    Err(_) => {
+                        p.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(Err(SimFail::Baton(_))) => {
+                        // The detector fired (or a world acquisition
+                        // failed): a PANIC-class per-seed failure, never
+                        // a pass (card Work 11, rule 4).
+                        let mut g = sched_ref.lock();
+                        g.h.baton = true;
+                    }
+                    Ok(_) => {}
                 }
                 sched_ref.finish(t);
             }));
@@ -542,6 +552,13 @@ pub fn run_script(sched: &Sched<RoundWorld>, script: &Script, seed: u64) {
     }
     if panicked.load(std::sync::atomic::Ordering::SeqCst) {
         g.h.panicked = true;
+    }
+    // A `SimFail::Baton` seen by any task (the scheduler detector or a
+    // failed world acquisition on a store path) fails the round: fold it
+    // into the harness flag (the gate's minor finding: the flag existed
+    // but was never set).
+    if g.st.baton_fail.is_some() {
+        g.h.baton = true;
     }
 }
 
@@ -729,6 +746,13 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         let next = c.store().seq.next_ts.max(r + 1);
         let t = next;
         c.store().seq.next_ts = c.store().seq.next_ts.max(t + 1);
+        // `t` is drawn from the commit sequencer but is not a commit
+        // (§10.1's S_L): pre-mark it applied so `mark_applied`'s
+        // contiguous walk passes through it. Without this the ts is a
+        // hole — visible_ts stalls below every later commit forever and
+        // the round deadlocks (the driver hang the X-5b gate's R5
+        // reported; the drawn ts sat in `applied`'s way, unreachable).
+        c.store().seq.applied.insert(t);
         Ok(t)
     })?;
     let root = tree::dir_root_of(cx, t)?;
@@ -748,7 +772,21 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         c.h().force_ckpt = true;
         Ok(())
     })?;
-    wait_ckpt(cx)?;
+    // §12.8 step 3: publication waits for the forced checkpoint's meta
+    // to become durable (I-BULK-PUBLISH). **PUBLISH-BEFORE-META's single
+    // site**: the mutant skips the wait, so the publish commit can be
+    // acked while the unlogged build exists nowhere durable — a crash
+    // right after the ack leaves a published catalog row over an empty
+    // tree, and O-1 fails.
+    let publish_early = cx.with("h:pubmut", |c| {
+        Ok(matches!(
+            c.store().cfg.mutant,
+            Some(Mutant::PublishBeforeMeta)
+        ))
+    })?;
+    if !publish_early {
+        wait_ckpt(cx)?;
+    }
     // Publication (§12.8 step 3): after the forced meta is durable.
     commit_txn(
         cx,
@@ -919,8 +957,10 @@ fn fail_of(f: Fail) -> SimFail {
 pub type DirectedFault = MediaFault;
 
 /// What one round produced (the Work 7 per-round record fields that exist
-/// at this stage, plus the twin's).
-#[derive(Debug, Clone)]
+/// at this stage, plus the twin's). Not `Clone`: the end model is a
+/// `Model` (frozen, not `Clone`) — copy fields, or rebuild via
+/// [`clone_model`].
+#[derive(Debug)]
 pub struct RoundOutcome {
     /// The matched cut `c`, or the O-1 failure text.
     pub o1: Result<u64, String>,
@@ -973,6 +1013,11 @@ pub struct RoundOutcome {
     pub panicked: bool,
     /// A script task failed (store/env error); the round fails.
     pub task_error: Option<String>,
+    /// The round's end model — every commit of this round applied and
+    /// then **truncated at the cut `c`** (card Work 2.1: "rounds
+    /// truncate the model at c_r"), so the next round of a multi-round
+    /// seed starts from it (D7's zombie shape and X-5c's campaign).
+    pub end_model: Model,
     /// The digest of the canonical record (byte-identical for the same
     /// inputs; `tests/harness.rs`).
     pub digest: u64,
@@ -1006,6 +1051,7 @@ impl Default for RoundOutcome {
             baton: false,
             panicked: false,
             task_error: None,
+            end_model: Model::new(),
             digest: 0,
         }
     }
@@ -1145,6 +1191,9 @@ pub fn run_round(
     // corruption shows; without this the harness would judge only the
     // extraction's accepts).
     let mut recovery_served: Vec<(usize, u64, u64)> = Vec::new();
+    // The interleaved history of the failed lives (the Err branch's
+    // R-taint input).
+    let mut recovery_events: Vec<DiskEvent> = Vec::new();
     let recovery = loop {
         let world = round_world(
             seed,
@@ -1193,6 +1242,7 @@ pub fn run_round(
                     *c.store() = st.clone();
                     Ok(())
                 }) {
+                    recovery_events = world.lock().disk.events.clone();
                     break Err(e);
                 }
                 break Ok((st, frontier, end));
@@ -1204,6 +1254,7 @@ pub fn run_round(
                 let mut frng = Rng::new(derive(seed * 100 + 50 + nested_fired as u64, S_CRASH));
                 let mut g = world.lock();
                 recovery_served.extend(g.disk.served.clone());
+                recovery_events = g.disk.events.clone();
                 let _ = g.disk.apply_crash(&mut frng, &faults.knobs);
                 recovery_disk = g.disk.clone();
                 continue;
@@ -1211,6 +1262,7 @@ pub fn run_round(
             Err(e) => {
                 let g = world.lock();
                 recovery_served.extend(g.disk.served.clone());
+                recovery_events = g.disk.events.clone();
                 break Err(e);
             }
         }
@@ -1218,10 +1270,25 @@ pub fn run_round(
     // (The opened meta and frontier are read from the end state below.)
 
     // ---- X5-R5: meta_rollback and R, from the durable-write history ----
+    // Condition 3 needs M-NOINPLACE's per-write verdicts (Work 3.10):
+    // a slot written in violation is named by the monitor, never
+    // excused by the exception set.
+    let mcfg = crate::monitor::MonitorCfg {
+        map_leaf_cap: cfg.map_leaf_cap,
+        freeset_leaf_bits: cfg.freeset_leaf_bits,
+    };
+    let noinplace_hits = crate::monitor::noinplace_slot_hits(&events, &mcfg);
     let (meta_rollback, rollback_slots) = match &meta_i {
         Some(opened) => {
             let rb = meta_rollback_of(&disk, pf, opened.ckpt_id);
-            let r = exception_set_r(&disk, pf, opened.ckpt_id, &image_slots, &tainted_slots);
+            let r = exception_set_r(
+                &disk,
+                pf,
+                opened.ckpt_id,
+                &image_slots,
+                &tainted_slots,
+                &noinplace_hits,
+            );
             (rb, r)
         }
         None => (false, BTreeSet::new()),
@@ -1266,18 +1333,16 @@ pub fn run_round(
                 Ok(p) => ex.published = p,
                 Err(_) => ex.xx001.push(XxSite::Read23),
             }
-            // The served corruption check (with the R-taint, X5-R5: every
-            // slot in R counts as tainted from open until the store next
-            // writes it). Every life of this round contributes: the
-            // workload pass (the sched disk), the recovery pass(es) and
-            // this extraction's own accepts.
+            // The served corruption check. Every life of this round
+            // contributes: the workload pass (the sched disk), the
+            // recovery pass(es) and this extraction's own accepts, plus
+            // X5-R5's R-taint — every slot in `R` counts as tainted
+            // from open until the store next writes it, judged over the
+            // interleaved write/accept history (recovery's accepts
+            // included; the events walk of [`r_taint_of`]).
             {
                 let g = world.lock();
-                let r_taint = g.disk.accepts.iter().any(|(f, off, len)| {
-                    rollback_slots
-                        .iter()
-                        .any(|s| *f == pf && *off < (s + 1) * 4096 && off + len > s * 4096)
-                });
+                let r_taint = r_taint_of(&g.disk.events, pf, &rollback_slots);
                 let workload_served = {
                     let g2 = sched.lock();
                     !g2.disk.served.is_empty()
@@ -1322,7 +1387,15 @@ pub fn run_round(
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
-            outcome.pass = verdict.pass && outcome.task_error.is_none();
+            // `pass` folds every per-seed failure flag: a DEADLOCK, a
+            // PANIC or an S-BATON violation is never a pass (card "Do
+            // not"; the gate's minor finding: the draft ignored
+            // `deadlock` and `panicked` here).
+            outcome.pass = verdict.pass
+                && outcome.task_error.is_none()
+                && !outcome.deadlock
+                && !outcome.panicked
+                && !outcome.baton;
             outcome.lo = model.lower_bound(c_prev);
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.frontier = frontier;
@@ -1334,6 +1407,13 @@ pub fn run_round(
             outcome.cut = verdict.o1.clone().unwrap_or(outcome.lo);
             outcome.end_disk = end_disk2.clone();
             outcome.end_store = Some(end_store.clone());
+            // Work 2.1: the next round's model is this round's, truncated
+            // at the matched cut.
+            {
+                let mut m = clone_model(&model);
+                m.truncate(outcome.cut);
+                outcome.end_model = m;
+            }
         }
         Err(_) => {
             // Recovery failed: XX001 at Open (class C fails O-3 (b); in
@@ -1343,7 +1423,9 @@ pub fn run_round(
                 xx001: vec![XxSite::Open],
                 served: {
                     let g2 = sched.lock();
-                    !g2.disk.served.is_empty() || !recovery_served.is_empty()
+                    !g2.disk.served.is_empty()
+                        || !recovery_served.is_empty()
+                        || r_taint_of(&recovery_events, pf, &rollback_slots)
                 },
                 amcheck_i: amcheck_i.clone(),
                 amcheck_i_ran: meta_i.is_some(),
@@ -1379,22 +1461,27 @@ pub fn run_round(
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
-            outcome.pass = verdict.pass && outcome.task_error.is_none();
+            outcome.pass = verdict.pass
+                && outcome.task_error.is_none()
+                && !outcome.deadlock
+                && !outcome.panicked
+                && !outcome.baton;
             outcome.lo = model.lower_bound(c_prev);
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();
             outcome.cut = outcome.lo;
             outcome.end_disk = disk.clone();
+            {
+                let mut m = clone_model(&model);
+                m.truncate(outcome.cut);
+                outcome.end_model = m;
+            }
         }
     }
     // ---- the monitors (3.10), from disk events and parsed WAL bytes ----
     {
         let g = sched.lock();
         let events_end = g.disk.events.clone();
-        let mcfg = crate::monitor::MonitorCfg {
-            map_leaf_cap: cfg.map_leaf_cap,
-            freeset_leaf_bits: cfg.freeset_leaf_bits,
-        };
         outcome.monitors = crate::monitor::run(&events_end, &flip_pos, &mcfg);
     }
     outcome.digest = crate::crc::crc32c(0, outcome.digest_input().as_bytes()) as u64;
@@ -1626,10 +1713,15 @@ pub fn durable_image(
     let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
     let mut used: BTreeSet<u64> = BTreeSet::new();
     if meta.map_root.slot != 0 {
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        let span = ckpt::radix_child_span(cfg.map_leaf_cap, n, meta.next_lpid);
         walk_map_disk(
             disk,
             pf,
             meta.map_root,
+            0,
+            span,
             cfg.map_leaf_cap,
             0,
             &mut flat,
@@ -1640,10 +1732,15 @@ pub fn durable_image(
     let mut free_bits: BTreeSet<u64> = BTreeSet::new();
     if meta.free_root.slot != 0 {
         let total = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        let span = ckpt::radix_child_span(cfg.freeset_leaf_bits, n, total);
         walk_free_disk(
             disk,
             pf,
             meta.free_root,
+            0,
+            span,
             cfg.freeset_leaf_bits,
             total,
             &mut free_bits,
@@ -1674,6 +1771,8 @@ fn walk_map_disk(
     disk: &SimDisk,
     pf: usize,
     root: crate::store::page::Ref,
+    base: u64,
+    span: u64,
     cap: u64,
     depth: u8,
     flat: &mut BTreeMap<u64, crate::store::page::Ref>,
@@ -1684,7 +1783,8 @@ fn walk_map_disk(
         return;
     }
     let b = disk.durable_read(pf, root.slot * 4096, 4096);
-    if crate::store::page::check(&b, &root, crate::store::page::header_id(&b), None).is_err() {
+    // §3.3 with the positional expected id (the gate's R4).
+    if crate::store::page::check(&b, &root, base, None).is_err() {
         out.push(Finding {
             slot: Some(root.slot),
             what: "§3.3 fail on map page".into(),
@@ -1693,29 +1793,31 @@ fn walk_map_disk(
     used.insert(root.slot);
     let kind = crate::store::page::header_kind(&b);
     if kind == crate::store::page::KIND_MAP_LEAF {
-        if let Ok(entries) = crate::store::page::parse_map_leaf(
-            &b,
-            crate::store::page::header_id(&b),
-            cap,
-            &root,
-            None,
-        ) {
+        if let Ok(entries) = crate::store::page::parse_map_leaf(&b, base, cap, &root, None) {
             for (i, e) in entries.iter().enumerate() {
                 if let Some(r) = e {
-                    flat.insert(crate::store::page::header_id(&b) + i as u64, *r);
+                    flat.insert(base + i as u64, *r);
                     used.insert(r.slot);
                 }
             }
         }
     } else if let Ok(refs) = crate::store::page::parse_radix_inner(
         &b,
-        crate::store::page::header_id(&b),
+        base,
         (4096 - 24) / 16,
         &root,
         None,
     ) {
-        for r in refs.into_iter().flatten() {
-            walk_map_disk(disk, pf, r, cap, depth + 1, flat, used, out);
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        for (i, r) in refs.into_iter().enumerate() {
+            if let Some(r) = r {
+                let child_span = (span / n).max(1);
+                let child_base = base + i as u64 * span;
+                walk_map_disk(
+                    disk, pf, r, child_base, child_span, cap, depth + 1, flat, used, out,
+                );
+            }
         }
     }
 }
@@ -1725,6 +1827,8 @@ fn walk_free_disk(
     disk: &SimDisk,
     pf: usize,
     root: crate::store::page::Ref,
+    base: u64,
+    span: u64,
     bits: u64,
     _total: u64,
     set: &mut BTreeSet<u64>,
@@ -1735,7 +1839,8 @@ fn walk_free_disk(
         return;
     }
     let b = disk.durable_read(pf, root.slot * 4096, 4096);
-    if crate::store::page::check(&b, &root, crate::store::page::header_id(&b), None).is_err() {
+    // §3.3 with the positional expected id (the gate's R4).
+    if crate::store::page::check(&b, &root, base, None).is_err() {
         out.push(Finding {
             slot: Some(root.slot),
             what: "§3.3 fail on free-set page".into(),
@@ -1744,28 +1849,30 @@ fn walk_free_disk(
     used.insert(root.slot);
     let kind = crate::store::page::header_kind(&b);
     if kind == crate::store::page::KIND_FREE_LEAF {
-        if let Ok(bs) = crate::store::page::parse_free_leaf(
-            &b,
-            crate::store::page::header_id(&b),
-            bits,
-            &root,
-            None,
-        ) {
+        if let Ok(bs) = crate::store::page::parse_free_leaf(&b, base, bits, &root, None) {
             for (i, set_bit) in bs.iter().enumerate() {
                 if *set_bit {
-                    set.insert(crate::store::page::header_id(&b) + i as u64);
+                    set.insert(base + i as u64);
                 }
             }
         }
     } else if let Ok(refs) = crate::store::page::parse_radix_inner(
         &b,
-        crate::store::page::header_id(&b),
+        base,
         (4096 - 24) / 16,
         &root,
         None,
     ) {
-        for r in refs.into_iter().flatten() {
-            walk_free_disk(disk, pf, r, bits, _total, set, used, out);
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        for (i, r) in refs.into_iter().enumerate() {
+            if let Some(r) = r {
+                let child_span = (span / n).max(1);
+                let child_base = base + i as u64 * span;
+                walk_free_disk(
+                    disk, pf, r, child_base, child_span, bits, _total, set, used, out,
+                );
+            }
         }
     }
 }
@@ -1885,13 +1992,16 @@ pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
 
 /// X5-R5's set R: slots the opened image references that are not tainted,
 /// written after the first completed `sync_all` covering a meta newer
-/// than the opened one. From the durable-write history.
+/// than the opened one, **and never written with an M-NOINPLACE hit**
+/// (condition 3, the monitor's per-write verdicts). From the
+/// durable-write history.
 pub fn exception_set_r(
     disk: &SimDisk,
     pf: usize,
     opened_k: u64,
     image_slots: &BTreeSet<u64>,
     tainted: &BTreeSet<u64>,
+    noinplace_hits: &BTreeSet<u64>,
 ) -> BTreeSet<u64> {
     let mut newer_graduation: Option<usize> = None;
     let dw = disk.dwrites_of(pf);
@@ -1915,11 +2025,56 @@ pub fn exception_set_r(
             continue;
         }
         let slot = w.off / 4096;
-        if image_slots.contains(&slot) && !tainted.contains(&slot) {
+        if image_slots.contains(&slot)
+            && !tainted.contains(&slot)
+            && !noinplace_hits.contains(&slot)
+        {
             out.insert(slot);
         }
     }
     out
+}
+
+/// X5-R5's R-taint (card Work 13): a slot in `R` counts as tainted from
+/// the moment open selects the rolled-back meta until the store next
+/// writes it. The window covers **every post-crash life of the round**
+/// — recovery's own accepts included (the gate's R3: the draft judged
+/// only the extraction world's accept list, from any life) — and each
+/// nested recovery crash restarts it: a later life re-opens the
+/// rolled-back meta, and a slot an earlier life had written can be
+/// re-read and accepted stale again. Fixed slots 0–2 are out of scope:
+/// they are never page homes (§4.4), and the opened meta's own accept
+/// at open is the selection itself, not a serve.
+pub fn r_taint_of(events: &[DiskEvent], pf: usize, r_slots: &BTreeSet<u64>) -> bool {
+    if r_slots.is_empty() {
+        return false;
+    }
+    // Slots whose window has closed (written since the current life
+    // began — i.e. since the round's crash, or the last nested one).
+    let mut closed: BTreeSet<u64> = BTreeSet::new();
+    for e in events {
+        match e {
+            DiskEvent::Crash => closed.clear(),
+            DiskEvent::WriteIssued { inode, off, bytes } if *inode == pf && !bytes.is_empty() => {
+                let s0 = off / 4096;
+                let s1 = (off + bytes.len() as u64 - 1) / 4096;
+                for s in s0..=s1 {
+                    closed.insert(s);
+                }
+            }
+            DiskEvent::Accepted { inode, off, len } if *inode == pf && *len > 0 => {
+                let s0 = off / 4096;
+                let s1 = (off + len - 1) / 4096;
+                for s in s0..=s1 {
+                    if s >= 3 && r_slots.contains(&s) && !closed.contains(&s) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 // ---- the 2.3 reader over the recovered store ----

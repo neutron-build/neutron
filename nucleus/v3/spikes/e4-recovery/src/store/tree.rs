@@ -1261,11 +1261,12 @@ pub fn dir_root_of<H: StoreHost>(cx: &Cx<'_, H>, tree: u64) -> Result<u64, Fail>
 /// Install a directory entry in memory (open/recovery replay of
 /// CreateTree).
 pub fn dir_install<H: StoreHost>(cx: &Cx<'_, H>, id: u64, entry: super::DirEntry) {
-    cx.with("dir_install", |c| {
+    if let Err(e) = cx.with("dir_install", |c| {
         c.store().dir.insert(id, entry);
         Ok(())
-    })
-    .ok();
+    }) {
+        super::prims::note_step_fail(cx, "dir_install", e);
+    }
 }
 
 /// The catalog tree's root (tree id 1).

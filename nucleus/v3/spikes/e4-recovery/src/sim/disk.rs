@@ -235,6 +235,22 @@ pub enum DiskEvent {
         /// A stable description (for observers and diagnosis).
         what: String,
     },
+    /// An accept hook fired (card X-5b Work 13, the R-taint's history
+    /// query: the ruling's window — "from open until the store next
+    /// writes it" — needs accepts **interleaved with writes in order**,
+    /// which `SimDisk::accepts` alone cannot give).
+    Accepted {
+        /// File.
+        inode: FileId,
+        /// Offset.
+        off: u64,
+        /// Length.
+        len: u64,
+    },
+    /// A crash was resolved (F-CRASH): a life boundary. The R-taint's
+    /// window restarts at each new life's open — a slot a crashed life
+    /// had written can be re-accepted stale by the next life.
+    Crash,
 }
 
 /// One file's state.
@@ -635,6 +651,7 @@ impl SimDisk {
     /// harness does) and in `uncovered_accepts` (for diagnosis).
     pub fn accepted(&mut self, id: FileId, off: u64, len: u64) {
         self.accepts.push((id, off, len));
+        self.events.push(DiskEvent::Accepted { inode: id, off, len });
         if len == 0 {
             // Zero bytes accepted: nothing to judge, nothing uncovered.
             return;
@@ -694,6 +711,7 @@ impl SimDisk {
     /// and accept logs (1.4: "in any life of this seed"). Returns the
     /// number of dropped directory ops.
     pub fn apply_crash(&mut self, rng: &mut Rng, knobs: &FaultKnobs) -> u64 {
+        self.events.push(DiskEvent::Crash);
         let mut dropped_ops = 0u64;
         for inode in self.inodes.iter_mut() {
             if !inode.volatile.is_empty() {

@@ -20,7 +20,7 @@
 //! Hits are reported per round, apart from O-1/O-2/O-3.
 
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sim::{DiskEvent, PAGE_FILE, SimDisk, WAL_DIR};
 use crate::store::page::{self};
@@ -63,11 +63,23 @@ pub struct MonitorCfg {
 pub fn run(events: &[DiskEvent], flip_enqueue_pos: &[u64], cfg: &MonitorCfg) -> Vec<&'static str> {
     let mut hits: Vec<&'static str> = Vec::new();
     m_wal_order(events, &mut hits);
-    m_meta_atomic_and_noinplace(events, cfg, &mut hits);
+    m_meta_atomic_and_noinplace(events, cfg, &mut hits, &mut BTreeSet::new());
     m_ckpt_t(events, flip_enqueue_pos, &mut hits);
     hits.sort_unstable();
     hits.dedup();
     hits
+}
+
+/// X5-R5 condition 3 (card Work 3.10's "per-write verdicts"): the slots
+/// whose page writes drew an M-NOINPLACE hit this round. The harness
+/// excludes these from the exception set `R` (a slot written in
+/// violation of I-NO-INPLACE is a bug the monitor names, not a
+/// rollback consequence the exception may excuse).
+pub fn noinplace_slot_hits(events: &[DiskEvent], cfg: &MonitorCfg) -> BTreeSet<u64> {
+    let mut hits = Vec::new();
+    let mut slots = BTreeSet::new();
+    m_meta_atomic_and_noinplace(events, cfg, &mut hits, &mut slots);
+    slots
 }
 
 /// Public batch parser (the harness's written/acked derivation shares
@@ -160,6 +172,7 @@ fn m_meta_atomic_and_noinplace(
     events: &[DiskEvent],
     cfg: &MonitorCfg,
     hits: &mut Vec<&'static str>,
+    noinplace_slots: &mut BTreeSet<u64>,
 ) {
     let mut shadow = Shadow::default();
     let mut durable_meta: Option<page::Meta> = None;
@@ -187,11 +200,14 @@ fn m_meta_atomic_and_noinplace(
                 }
                 // M-NOINPLACE: writing a page home the durable meta
                 // still references. Slots 0–2 are fixed (never page
-                // homes, §4.4).
+                // homes, §4.4). Per-write verdicts: every hit also names
+                // its slot (X5-R5's condition 3, via
+                // [`noinplace_slot_hits`]).
                 if let Some(m) = &durable_meta {
                     let slot = off / 4096;
                     if slot >= 3 && durable_slots.contains(&slot) && m.map_root.slot != 0 {
                         hits.push("M-NOINPLACE");
+                        noinplace_slots.insert(slot);
                     }
                 }
                 shadow.write(*off, bytes);
@@ -306,17 +322,22 @@ fn shadow_refs(durable: &[u8], m: &page::Meta, cfg: &MonitorCfg) -> Vec<u64> {
     };
     // Map radix + free set.
     let mut flat: BTreeMap<u64, page::Ref> = BTreeMap::new();
+    let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+    let span = crate::store::ckpt::radix_child_span(cfg.map_leaf_cap, n, m.next_lpid);
     walk_shadow_map(
-        &read(m.map_root.slot),
+        durable,
         m.map_root,
+        0,
+        span,
         cfg.map_leaf_cap,
         0,
         &mut flat,
         &mut out,
-        cfg,
     );
     if m.free_root.slot != 0 {
-        walk_shadow_free(&read(m.free_root.slot), m.free_root, &mut out, cfg);
+        let total_bits = (m.slot_count.saturating_sub(3)) + m.next_lpid;
+        let span = crate::store::ckpt::radix_child_span(cfg.freeset_leaf_bits, n, total_bits);
+        walk_shadow_free(durable, m.free_root, 0, span, cfg.freeset_leaf_bits, &mut out);
     }
     // The trees from the directory: the directory's own pages first
     // (its root may be an inner page), then every tree root its leaf
@@ -391,43 +412,95 @@ fn shadow_refs(durable: &[u8], m: &page::Meta, cfg: &MonitorCfg) -> Vec<u64> {
 }
 
 fn walk_shadow_map(
-    b: &[u8],
+    durable: &[u8],
     r: page::Ref,
+    base: u64,
+    span: u64,
     cap: u64,
     depth: u8,
     flat: &mut BTreeMap<u64, page::Ref>,
     out: &mut Vec<u64>,
-    _cfg: &MonitorCfg,
 ) {
     if depth > 8 || r.slot == 0 {
         return;
     }
+    // Each page is read from the shadow's durable bytes **by its own
+    // ref** — the draft recursed with the parent's `b`, so with any
+    // multi-level radix `flat` never filled (the tree descent below died
+    // at the directory) and the durable slot set undercounted by every
+    // tree page (the gate's R1: FREE-EARLY's reuse was real but
+    // M-NOINPLACE stayed blind to it).
+    let b = {
+        let off = r.slot as usize * 4096;
+        let mut v = vec![0u8; 4096];
+        if off < durable.len() {
+            let end = (off + 4096).min(durable.len());
+            if let Some(src) = durable.get(off..end) {
+                v[..end - off].copy_from_slice(src);
+            }
+        }
+        v
+    };
     out.push(r.slot);
-    if page::header_kind(b) == page::KIND_MAP_LEAF {
-        if let Ok(entries) = page::parse_map_leaf(b, page::header_id(b), cap, &r, None) {
+    if page::header_kind(&b) == page::KIND_MAP_LEAF {
+        if let Ok(entries) = page::parse_map_leaf(&b, base, cap, &r, None) {
             for (i, e) in entries.iter().enumerate() {
                 if let Some(rr) = e {
-                    flat.insert(page::header_id(b) + i as u64, *rr);
+                    flat.insert(base + i as u64, *rr);
                     out.push(rr.slot);
                 }
             }
         }
     } else if let Ok(refs) =
-        page::parse_radix_inner(b, page::header_id(b), (4096 - 24) / 16, &r, None)
+        page::parse_radix_inner(&b, base, (page::PAGE - page::HDR) / page::MAP_ENTRY, &r, None)
     {
-        for rr in refs.into_iter().flatten() {
-            walk_shadow_map(b, rr, cap, depth + 1, flat, out, _cfg);
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        for (i, rr) in refs.into_iter().enumerate() {
+            if let Some(rr) = rr {
+                let child_span = (span / n).max(1);
+                let child_base = base + i as u64 * span;
+                walk_shadow_map(
+                    durable,
+                    rr,
+                    child_base,
+                    child_span,
+                    cap,
+                    depth + 1,
+                    flat,
+                    out,
+                );
+            }
         }
     }
 }
 
-fn walk_shadow_free(b: &[u8], r: page::Ref, out: &mut Vec<u64>, _cfg: &MonitorCfg) {
+fn walk_shadow_free(durable: &[u8], r: page::Ref, base: u64, span: u64, bits: u64, out: &mut Vec<u64>) {
+    if r.slot == 0 {
+        return;
+    }
+    let b = {
+        let off = r.slot as usize * 4096;
+        let mut v = vec![0u8; 4096];
+        if off < durable.len() {
+            let end = (off + 4096).min(durable.len());
+            if let Some(src) = durable.get(off..end) {
+                v[..end - off].copy_from_slice(src);
+            }
+        }
+        v
+    };
     out.push(r.slot);
-    if page::header_kind(b) == page::KIND_FREE_INNER {
-        if let Ok(refs) = page::parse_radix_inner(b, page::header_id(b), (4096 - 24) / 16, &r, None)
+    if page::header_kind(&b) == page::KIND_FREE_INNER {
+        if let Ok(refs) =
+            page::parse_radix_inner(&b, base, (page::PAGE - page::HDR) / page::MAP_ENTRY, &r, None)
         {
-            for rr in refs.into_iter().flatten() {
-                walk_shadow_free(b, rr, out, _cfg);
+            let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+            for (i, rr) in refs.into_iter().enumerate() {
+                if let Some(rr) = rr {
+                    let child_span = (span / n).max(1);
+                    let child_base = base + i as u64 * span;
+                    walk_shadow_free(durable, rr, child_base, child_span, bits, out);
+                }
             }
         }
     }

@@ -207,7 +207,9 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
         .read_at(page_file, 0, page::PAGE as u64)
         .map_err(Fail::Sim)?;
     page::parse_page0(&p0).map_err(|()| Fail::Corrupt("page 0 invalid".into()))?;
-    cx.env().accepted(page_file, 0, page::PAGE as u64);
+    cx.env()
+        .accepted(page_file, 0, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
     let m1 = cx
         .env()
         .read_at(page_file, page::PAGE as u64, page::PAGE as u64)
@@ -229,11 +231,13 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
     };
     // The accept hook: the meta chosen at open (card 1.4), not the loser.
     let chosen_slot = 1 + (meta.ckpt_id % 2);
-    cx.env().accepted(
-        page_file,
-        chosen_slot * page::PAGE as u64,
-        page::PAGE as u64,
-    );
+    cx.env()
+        .accepted(
+            page_file,
+            chosen_slot * page::PAGE as u64,
+            page::PAGE as u64,
+        )
+        .map_err(Fail::Sim)?;
     let mut st = StoreInner::empty(cfg.clone(), page_file);
     st.k = meta.ckpt_id;
     st.e = meta.epoch.max(1);
@@ -278,6 +282,28 @@ fn meta_is_mutant<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Option<Mutant>, Fail> 
     cx.with("open:mut", |c| Ok(c.store().cfg.mutant))
 }
 
+/// The child span of a radix root from the sizes its image covers: the
+/// number of leaves `n_items` implies, then the inner levels above them
+/// (fan `n`); an inner root's children each span `leaf_span * n^(lv−1)`.
+/// The expected id of every radix page is derived from its **position**
+/// this way (§3.3: "the expected id is known" from the parent reference —
+/// the base of the child), never from the page's own header field (the
+/// gate's R4: that check can never fail).
+pub fn radix_child_span(leaf_span: u64, n: u64, n_items: u64) -> u64 {
+    let leaves = n_items.div_ceil(leaf_span).max(1);
+    let mut lvl = leaves;
+    let mut inner = 0u32;
+    while lvl > 1 {
+        lvl = lvl.div_ceil(n);
+        inner += 1;
+    }
+    if inner == 0 {
+        return leaf_span;
+    }
+    let p = n.checked_pow(inner - 1).unwrap_or(u64::MAX);
+    leaf_span.saturating_mul(p)
+}
+
 /// Load the flat map and the durable slot set from the persisted radix
 /// (walking refs with §3.3 checks; malformed input is XX001, never a
 /// panic).
@@ -292,17 +318,23 @@ pub fn load_image<H: StoreHost>(
     let mut flat: BTreeMap<u64, Ref> = BTreeMap::new();
     let mut used: BTreeSet<u64> = BTreeSet::new();
     if meta.map_root.slot != 0 {
-        walk_radix(cx, pf, meta.map_root, cap, 0, &mut flat, &mut used, mutant)?;
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let span = radix_child_span(cap, n, meta.next_lpid);
+        walk_radix(cx, pf, meta.map_root, 0, span, cap, 0, &mut flat, &mut used, mutant)?;
     }
     // The free set (both bitmaps; §4.3).
     let mut free_bits: BTreeSet<u64> = BTreeSet::new();
     let mut fs_used: BTreeSet<u64> = BTreeSet::new();
     if meta.free_root.slot != 0 {
         let total_bits = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let span = radix_child_span(st.cfg.freeset_leaf_bits, n, total_bits);
         walk_freeset(
             cx,
             pf,
             meta.free_root,
+            0,
+            span,
             st.cfg.freeset_leaf_bits,
             total_bits,
             &mut free_bits,
@@ -331,6 +363,8 @@ fn walk_radix<H: StoreHost>(
     cx: &Cx<'_, H>,
     pf: crate::sim::FileId,
     root: Ref,
+    base: u64,
+    span: u64,
     cap: u64,
     depth: u8,
     flat: &mut BTreeMap<u64, Ref>,
@@ -344,15 +378,17 @@ fn walk_radix<H: StoreHost>(
         .env()
         .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
         .map_err(Fail::Sim)?;
-    let expect_id = page::header_id(&bytes);
+    // §3.3 with the positional expected id (R4): this page covers
+    // LPIDs [base, base + span·fan) — its own header must carry `base`.
+    let expect_id = base;
     page::check(&bytes, &root, expect_id, mutant)
         .map_err(|()| Fail::Corrupt(format!("map page slot {}", root.slot)))?;
     cx.env()
-        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
+        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
     used.insert(root.slot);
     let kind = page::header_kind(&bytes);
     if kind == page::KIND_MAP_LEAF {
-        let base = expect_id;
         let entries = page::parse_map_leaf(&bytes, base, cap, &root, mutant)
             .map_err(|()| Fail::Corrupt("bad map leaf".into()))?;
         for (i, e) in entries.iter().enumerate() {
@@ -364,10 +400,25 @@ fn walk_radix<H: StoreHost>(
         Ok(())
     } else {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-        let refs = page::parse_radix_inner(&bytes, expect_id, n as usize, &root, mutant)
+        let refs = page::parse_radix_inner(&bytes, base, n as usize, &root, mutant)
             .map_err(|()| Fail::Corrupt("bad map inner".into()))?;
-        for r in refs.into_iter().flatten() {
-            walk_radix(cx, pf, r, cap, depth + 1, flat, used, mutant)?;
+        for (i, r) in refs.into_iter().enumerate() {
+            if let Some(r) = r {
+                let child_span = (span / n).max(1);
+                let child_base = base + i as u64 * span;
+                walk_radix(
+                    cx,
+                    pf,
+                    r,
+                    child_base,
+                    child_span,
+                    cap,
+                    depth + 1,
+                    flat,
+                    used,
+                    mutant,
+                )?;
+            }
         }
         Ok(())
     }
@@ -378,6 +429,8 @@ fn walk_freeset<H: StoreHost>(
     cx: &Cx<'_, H>,
     pf: crate::sim::FileId,
     root: Ref,
+    base: u64,
+    span: u64,
     leaf_bits: u64,
     _total_bits: u64,
     set: &mut BTreeSet<u64>,
@@ -391,28 +444,45 @@ fn walk_freeset<H: StoreHost>(
         .env()
         .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
         .map_err(Fail::Sim)?;
-    let expect_id = page::header_id(&bytes);
+    // §3.3 with the positional expected id (R4): the bit index `base`.
+    let expect_id = base;
     page::check(&bytes, &root, expect_id, mutant)
         .map_err(|()| Fail::Corrupt(format!("freeset page slot {}", root.slot)))?;
     cx.env()
-        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
+        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
+        .map_err(Fail::Sim)?;
     used.insert(root.slot);
     let kind = page::header_kind(&bytes);
     if kind == page::KIND_FREE_LEAF {
-        let bits = page::parse_free_leaf(&bytes, expect_id, leaf_bits, &root, mutant)
+        let bits = page::parse_free_leaf(&bytes, base, leaf_bits, &root, mutant)
             .map_err(|()| Fail::Corrupt("bad freeset leaf".into()))?;
         for (i, b) in bits.iter().enumerate() {
             if *b {
-                set.insert(expect_id + i as u64);
+                set.insert(base + i as u64);
             }
         }
         Ok(())
     } else {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-        let refs = page::parse_radix_inner(&bytes, expect_id, n as usize, &root, mutant)
+        let refs = page::parse_radix_inner(&bytes, base, n as usize, &root, mutant)
             .map_err(|()| Fail::Corrupt("bad freeset inner".into()))?;
-        for r in refs.into_iter().flatten() {
-            walk_freeset(cx, pf, r, leaf_bits, _total_bits, set, used, mutant)?;
+        for (i, r) in refs.into_iter().enumerate() {
+            if let Some(r) = r {
+                let child_span = (span / n).max(1);
+                let child_base = base + i as u64 * span;
+                walk_freeset(
+                    cx,
+                    pf,
+                    r,
+                    child_base,
+                    child_span,
+                    leaf_bits,
+                    _total_bits,
+                    set,
+                    used,
+                    mutant,
+                )?;
+            }
         }
         Ok(())
     }
@@ -547,11 +617,12 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
                 (root, free_root, img_slot_count, img_next_lpid)
             }
             Err(e) => {
-                cx.with("ckpt:unfreeze", |c| {
+                if let Err(e2) = cx.with("ckpt:unfreeze", |c| {
                     c.store().image_frozen = None;
                     Ok(())
-                })
-                .ok();
+                }) {
+                    prims::note_step_fail(cx, "ckpt:unfreeze", e2);
+                }
                 cx.w.wake(crate::sim::WaitKey::Pin);
                 return Err(e);
             }
@@ -815,7 +886,10 @@ fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
         let mut up: Vec<Option<Ref>> = Vec::new();
         for (bi, chunk) in level.chunks(n as usize).enumerate() {
-            let base = bi as u64 * n * cap.pow(depth as u32 + 1);
+            // The level-(depth+1) page `bi` spans `cap · n^(depth+1)` LPIDs
+            // (positional id; the walker's R4 derivation must agree).
+            let p = n.checked_pow(depth as u32 + 1).unwrap_or(u64::MAX);
+            let base = (bi as u64).saturating_mul(cap.saturating_mul(p));
             let bytes = page::build_radix_inner(base, page::KIND_MAP_INNER, chunk);
             let key = (depth, bi as u64);
             let h = hash_bytes(&bytes);
@@ -967,7 +1041,12 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
     while level.len() > 1 {
         let mut up: Vec<Option<Ref>> = Vec::new();
         for (bi, chunk) in level.chunks(fan as usize).enumerate() {
-            let base = bi as u64 * fan * leaf_bits * (1u64 << depth.min(30));
+            // The level-(depth+1) page `bi` spans `leaf_bits · fan^(depth+1)`
+            // bits (positional id, §3.3 via the walker's R4 derivation):
+            // `2^depth` understated every level above the first whenever
+            // fan ≠ 2, which the positional check now rejects.
+            let p = fan.checked_pow(depth as u32 + 1).unwrap_or(u64::MAX);
+            let base = (bi as u64).saturating_mul(leaf_bits.saturating_mul(p));
             let bytes = page::build_radix_inner(base, page::KIND_FREE_INNER, chunk);
             let r = prims::write_fresh(cx, &bytes)?;
             cx.with("fs:markinner", |c| {
@@ -1044,7 +1123,7 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                 Ok(Some(rec)) => {
                     let len = rec.len();
                     // Accept the record the reader yields (card 1.4).
-                    cx.env().accepted(fid, off, len);
+                    cx.env().accepted(fid, off, len).map_err(Fail::Sim)?;
                     if rec.kind == K_SEGEND {
                         lsn = seg + WAL_SEG;
                         continue 'outer;

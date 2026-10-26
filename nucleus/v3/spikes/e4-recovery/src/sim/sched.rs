@@ -482,8 +482,9 @@ impl<H: SchedHost> Sched<H> {
 /// The world guard handed out by [`Sched::acquire`]: a `MutexGuard` that
 /// maintains the S-BATON thread-local held flag, so the parking entry
 /// points can detect a task about to park while holding the world. The
-/// flag clears in this type's own `Drop`, which runs after the inner
-/// guard has unlocked — no user code of this thread runs in between.
+/// flag clears in this type's own `Drop` body, which runs **before** the
+/// inner guard unlocks (field drops happen after `Drop::drop`) — the
+/// flag is already clear when the lock is free again.
 pub struct WorldGuard<'a, H: SchedHost> {
     g: MutexGuard<'a, H>,
 }

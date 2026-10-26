@@ -87,34 +87,42 @@ pub fn amcheck<H: StoreHost>(cx: &Cx<'_, H>, cfg: &StoreCfg) -> Vec<Finding> {
     let mutant = cfg.mutant;
     let mut flat: BTreeMap<u64, Ref> = BTreeMap::new();
     let mut used: BTreeSet<u64> = BTreeSet::new();
-    if meta.map_root.slot != 0
-        && let Err(e) = walk_map(
+    if meta.map_root.slot != 0 {
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let span = super::ckpt::radix_child_span(cap, n, meta.next_lpid);
+        if let Err(e) = walk_map(
             cx,
             pf,
             meta.map_root,
+            0,
+            span,
             cap,
             0,
             &mut flat,
             &mut used,
             mutant,
             &mut out,
-        )
-    {
-        out.push(Finding {
-            slot: Some(meta.map_root.slot),
-            what: format!("map walk: {e:?}"),
-        });
-        return out;
+        ) {
+            out.push(Finding {
+                slot: Some(meta.map_root.slot),
+                what: format!("map walk: {e:?}"),
+            });
+            return out;
+        }
     }
     // The free set.
     let mut free_bits: BTreeSet<u64> = BTreeSet::new();
     let mut fs_used: BTreeSet<u64> = BTreeSet::new();
     if meta.free_root.slot != 0 {
         let total_bits = (meta.slot_count.saturating_sub(3)) + meta.next_lpid;
+        let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
+        let span = super::ckpt::radix_child_span(cfg.freeset_leaf_bits, n, total_bits);
         if let Err(e) = walk_free(
             cx,
             pf,
             meta.free_root,
+            0,
+            span,
             cfg.freeset_leaf_bits,
             total_bits,
             &mut free_bits,
@@ -239,6 +247,8 @@ fn walk_map<H: StoreHost>(
     cx: &Cx<'_, H>,
     pf: crate::sim::FileId,
     root: Ref,
+    base: u64,
+    span: u64,
     cap: u64,
     depth: u8,
     flat: &mut BTreeMap<u64, Ref>,
@@ -253,22 +263,32 @@ fn walk_map<H: StoreHost>(
         .env()
         .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
         .map_err(Fail::Sim)?;
-    let expect_id = page::header_id(&bytes);
+    // §3.3 with the positional expected id (the gate's R4).
+    let expect_id = base;
     if page::check(&bytes, &root, expect_id, mutant).is_err() {
         out.push(Finding {
             slot: Some(root.slot),
             what: format!("§3.3 fail on map page (id {expect_id})"),
         });
     }
-    cx.env()
-        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
+    if let Err(e) = cx
+        .env()
+        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
+    {
+        // The accept hook could not record (a baton violation): a
+        // finding, never a silent drop of an oracle input.
+        out.push(Finding {
+            slot: Some(root.slot),
+            what: format!("accept hook failed: {e:?}"),
+        });
+    }
     used.insert(root.slot);
     let kind = page::header_kind(&bytes);
     if kind == page::KIND_MAP_LEAF {
-        if let Ok(entries) = page::parse_map_leaf(&bytes, expect_id, cap, &root, mutant) {
+        if let Ok(entries) = page::parse_map_leaf(&bytes, base, cap, &root, mutant) {
             for (i, e) in entries.iter().enumerate() {
                 if let Some(r) = e {
-                    flat.insert(expect_id + i as u64, *r);
+                    flat.insert(base + i as u64, *r);
                     used.insert(r.slot);
                 }
             }
@@ -276,9 +296,25 @@ fn walk_map<H: StoreHost>(
         Ok(())
     } else {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-        if let Ok(refs) = page::parse_radix_inner(&bytes, expect_id, n as usize, &root, mutant) {
-            for r in refs.into_iter().flatten() {
-                walk_map(cx, pf, r, cap, depth + 1, flat, used, mutant, out)?;
+        if let Ok(refs) = page::parse_radix_inner(&bytes, base, n as usize, &root, mutant) {
+            for (i, r) in refs.into_iter().enumerate() {
+                if let Some(r) = r {
+                    let child_span = (span / n).max(1);
+                    let child_base = base + i as u64 * span;
+                    walk_map(
+                        cx,
+                        pf,
+                        r,
+                        child_base,
+                        child_span,
+                        cap,
+                        depth + 1,
+                        flat,
+                        used,
+                        mutant,
+                        out,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -290,6 +326,8 @@ fn walk_free<H: StoreHost>(
     cx: &Cx<'_, H>,
     pf: crate::sim::FileId,
     root: Ref,
+    base: u64,
+    span: u64,
     leaf_bits: u64,
     _total_bits: u64,
     set: &mut BTreeSet<u64>,
@@ -304,31 +342,55 @@ fn walk_free<H: StoreHost>(
         .env()
         .read_at(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
         .map_err(Fail::Sim)?;
-    let expect_id = page::header_id(&bytes);
+    // §3.3 with the positional expected id (the gate's R4).
+    let expect_id = base;
     if page::check(&bytes, &root, expect_id, mutant).is_err() {
         out.push(Finding {
             slot: Some(root.slot),
             what: format!("§3.3 fail on free-set page (id {expect_id})"),
         });
     }
-    cx.env()
-        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64);
+    if let Err(e) = cx
+        .env()
+        .accepted(pf, root.slot * page::PAGE as u64, page::PAGE as u64)
+    {
+        out.push(Finding {
+            slot: Some(root.slot),
+            what: format!("accept hook failed: {e:?}"),
+        });
+    }
     used.insert(root.slot);
     let kind = page::header_kind(&bytes);
     if kind == page::KIND_FREE_LEAF {
-        if let Ok(bits) = page::parse_free_leaf(&bytes, expect_id, leaf_bits, &root, mutant) {
+        if let Ok(bits) = page::parse_free_leaf(&bytes, base, leaf_bits, &root, mutant) {
             for (i, b) in bits.iter().enumerate() {
                 if *b {
-                    set.insert(expect_id + i as u64);
+                    set.insert(base + i as u64);
                 }
             }
         }
         Ok(())
     } else {
         let n = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-        if let Ok(refs) = page::parse_radix_inner(&bytes, expect_id, n as usize, &root, mutant) {
-            for r in refs.into_iter().flatten() {
-                walk_free(cx, pf, r, leaf_bits, _total_bits, set, used, mutant, out)?;
+        if let Ok(refs) = page::parse_radix_inner(&bytes, base, n as usize, &root, mutant) {
+            for (i, r) in refs.into_iter().enumerate() {
+                if let Some(r) = r {
+                    let child_span = (span / n).max(1);
+                    let child_base = base + i as u64 * span;
+                    walk_free(
+                        cx,
+                        pf,
+                        r,
+                        child_base,
+                        child_span,
+                        leaf_bits,
+                        _total_bits,
+                        set,
+                        used,
+                        mutant,
+                        out,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -386,8 +448,16 @@ fn check_tree<H: StoreHost>(
             });
             continue;
         }
-        cx.env()
-            .accepted(pf, r.slot * page::PAGE as u64, page::PAGE as u64);
+        if let Err(e) = cx
+            .env()
+            .accepted(pf, r.slot * page::PAGE as u64, page::PAGE as u64)
+        {
+            out.push(Finding {
+                slot: Some(r.slot),
+                what: format!("{what}: accept hook failed: {e:?}"),
+            });
+            continue;
+        }
         let kind = page::header_kind(&bytes);
         if kind == page::KIND_LEAF {
             if let Ok(cells) = tree::leaf_cells(&bytes) {
