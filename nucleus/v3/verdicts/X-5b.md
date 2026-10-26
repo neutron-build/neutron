@@ -4,123 +4,143 @@ Card-gate: P
 Verdict: REWORK
 Gate-tier: P
 Gate-model: claude-opus-5-5
-Gate-session: claude-code-agent e0e23fc9-b7df-4d9c-aafb-e417c7ab8438
-Date: 2026-10-25
+Gate-session: claude-code-agent 8c7a09a1-e6d0-4430-a5dd-d8a90f0215fa
+Date: 2026-10-26
 Gate-exit: GATE EXIT=0
-Commit: aa263472c0212f7da7ae3535972ee27f5cc2c42e
-Mutants: B3 taint judged only on the most recent overlapping read -> accept_hook_judges_older_tainted_read, try_lock replaced by a blocking lock in Sched::acquire (card instrumentation check) -> UNCAUGHT, CRC-SKIP hard-coded in page::check -> UNCAUGHT, REFCRC-SKIP hard-coded -> UNCAUGHT, EPOCH-SKIP+REFCRC hard-coded -> UNCAUGHT, ID-SKIP+REFCRC hard-coded -> UNCAUGHT, TRUNCATE-LOGICAL-ONLY (D7 arm read) -> UNCAUGHT, FREE-EARLY / WRITE-GUARD-NO-COPY / EVICT-SKIP-IMAGE-MAP / PUBLISH-BEFORE-META / START-SEGMENT-MISSING-OK (arms read; they assert the mutant passes) -> UNCAUGHT, G1 S-BATON held-flag checks removed from yield_baton_at/wait_for -> baton_violation_is_reported (hangs; killed at 90 s), G2 gate_exclusive post-yield holders re-check always true -> d5_split_straddling_flip (+d17_integrity), G3 a yield inside a Cx::with step (gate_shared) -> d1..d18 (17 directed tests fail via task_error), G4 harness drops recovery-world served corruption from O-3(a) -> UNCAUGHT, G5 harness R-taint forced false -> UNCAUGHT
+Commit: 19fa14f52b451be94a05aee28535cea34ef603ad
+Mutants: G1 S-BATON held-flag checks removed -> baton_violation_is_reported (hangs; killed at 120 s), G2 gate_exclusive holders re-check always true -> d5_split_straddling_flip, G3 yield inside Cx::with (gate_shared) -> 19/20 directed tests, try_lock replaced by a blocking lock -> baton_violation_cross_thread_holder_is_reported (hangs; killed at 90 s), CRC-SKIP hard-coded -> d17_integrity, REFCRC-SKIP hard-coded -> d17_integrity, EPOCH-SKIP+REFCRC hard-coded -> d17_integrity, ID-SKIP+REFCRC hard-coded -> d17_integrity + d10b_rollback_exception, G4 recovery serves dropped from O-3(a) -> d17_integrity, G5 R-taint call sites forced false -> UNCAUGHT, X5-R5 condition 3 removed from exception_set_r -> UNCAUGHT, R4 positional expected id reverted to header_id in walk_radix/walk_freeset -> UNCAUGHT, BulkLoad S_L pre-mark removed -> d11_publish (hangs; killed at 300 s), checkpoint abort path keeps ckpt_open -> UNCAUGHT, R-taint window not restarted at Crash -> r_taint_window_semantics, radix_child_span flattened -> UNCAUGHT (equivalent at the tested depth <= 2), RoundOutcome.pass ignores deadlock/panicked/baton -> UNCAUGHT, TS-AFTER-APPEND (arm run) -> UNCAUGHT (d18 vacuous), ID-SKIP+REFCRC in D10b's own shape (probe) -> O-3(a) served via R-taint; silent once G5 is applied
 Followups: none
 
 ## Scope of this verdict
-Stage X-5b (B1–B6) at aa263472, base 266b8f4c (X-5a merged). The gate run was
-on the tip, in the foreground, with `CARGO_TARGET_DIR=~/.cache/nv3-target/gate-X-5b`.
-Every step printed EXIT=0, and the last line was `GATE EXIT=0`. That is necessary,
-not sufficient: several mutant arms that the gate runs assert the wrong
-thing (R1, R2).
+This is round 2 of the X-5b P gate, on tip 19fa14f5 (the REWORK commits C1–C4,
+the gate fixes and the verification round, all after verdict 98453395).
+- **Gate run.** It ran on the tip, in the foreground, with
+  `CARGO_TARGET_DIR=~/.cache/nv3-target/gate-X-5b`. Every step printed EXIT=0,
+  and the last line was `GATE EXIT=0`.
+- **Frozen files.** `src/oracle.rs`, `src/model.rs` and `tests/oracle.rs` are
+  byte-identical to base 266b8f4c. `tests/sim.rs` only gains tests. Every
+  changed file is under `spikes/e4-recovery/`, plus this verdict.
+- **Probes.** Every mutant and probe was applied by hand and reverted. A
+  temporary probe file was deleted. `git status` was clean before this file
+  was written.
 
-## What holds
-- **Scope.** All 19 changed files are under `spikes/e4-recovery/`. X-5's frozen
-  files (`src/oracle.rs`, `src/model.rs`, `tests/oracle.rs`) are unchanged, and
-  `tests/sim.rs` only gains the two new tests at the end. `e4-campaign` is still
-  a stub that exits 2. The drafts in `src/workload.rs` stay outside the module
-  tree. There is no `unsafe`, no non-test `unwrap`/`expect`/`panic`, no
-  `HashMap`, and no new dependencies. The README's flat-map bullet states Work 12's four
-  conditions and names A-3c/A-7.
-- **The B1 conversion (rule 1/2/4).** Store code takes the host in exactly one
-  place: `Cx::with` → `Sched::acquire` (`store/mod.rs:517`). The guard
-  is scoped to the closure, and every park goes through `yield_baton_at`/`wait_for`,
-  both of which check the thread-local held flag. The wait loops check their predicate
-  under the baton, then park with no yield in between. `scheduler_determinism` is
-  unchanged and green, and `yield_baton_at` delegates to `yield_baton`. My mutants
-  G1–G3 confirm that the detector and the gate re-validation work: a yield under a
-  guard is loud, not a hang, in all 17 directed shapes.
-- **Same-round reads (Work 13).** Every store accept site follows its own
-  `read_at` in the same function and the same round:
-  `ckpt.rs:210,232,351,398,1047`, `prims.rs:528` and
-  `amcheck.rs:264,315,390`. Frame hits are never re-accepted. The store is rebuilt
-  at every open, so nothing held from an earlier round gets accepted. The harness
-  calls `new_round` after the crash and the faults (`harness.rs:1120`).
-- **The B3 pin (Work 14).** `accept_hook_judges_older_tainted_read` is present,
-  passes on the merged `SimDisk::accepted`, and fails under B3, with only that
-  test failing.
+## Round-1 items
+- **R1 — partly met.**
+  - Real catching arms now:
+    - D10 applies its LOST fault. Clean gives XX001 at open plus
+      `meta_rollback`; the mutant gives O-3(d).
+    - D11 runs the real BulkLoad.
+    - D14 FREE-EARLY is caught by M-NOINPLACE.
+    - D17 asserts detection on the map leaf.
+    - D7 and D16 no longer assert that the mutant passes.
+  - New problem: D18 is vacuous (N3).
+  - The D7 argument is rejected (N6).
+- **R2 — met.**
+  - D17's clean arm asserts `!served`.
+  - The skip is now an `expect`.
+  - All four hard-coded §3.3 disables fail d17, and the G4 probe fails d17.
+- **R3 — partly met.**
+  - What exists:
+    - D10b, with R non-empty, O-3(e) and amcheck (i) ⊆ R.
+    - Condition 3 is implemented.
+    - The interleaved write/accept window is implemented, and
+      `r_taint_window_semantics` pins the function.
+  - What is missing:
+    - Condition 3 is unpinned.
+    - The R-taint call site is unpinned, although it is reachable (N5).
+- **R4 — implemented, unpinned.**
+  - The positional ids are in `ckpt.rs`, `amcheck.rs`, `harness.rs` and
+    `monitor.rs`.
+  - Reverting the store walkers to `header_id` passes the whole suite. The
+    reference CRC subsumes the id check.
+  - The pin is a map-page MISDIRECTED under REFCRC-SKIP. With the reference
+    CRC off and the epochs equal, only the id check discriminates.
+- **R5 — met.** BulkLoad runs. Without the S_L pre-mark, D11 hangs, which is a
+  test failure but not a named DEADLOCK.
+- **R6 — met.**
+  - The cross-thread test hangs under a blocking lock (killed after more than
+    60 s).
+  - The doc comment on `baton_violation_is_reported` still claims that hang
+    for itself.
+- **R7 — partly met.**
+  - B1's size is reported: 14 files, +4935/−2702, about 7.6k changed lines
+    against the ~1.5k budget.
+  - D10b is reported.
+  - TS-AFTER-APPEND is still misreported as caught by d18.
+- **Minors.**
+  - Done: `pass` folds the deadlock, panic and baton flags. `accepted`
+    propagates its error. The release paths call `note_step_fail`. There are
+    5 new sim tests. The WorldGuard comment is fixed.
+  - Unpinned: the `pass` fold.
 
-## Findings: REWORK
-**R1. Inverted and vacuous mutant arms (Work 14, "Do not weaken").** Work
-14 says "a mutant arm that passes is a test failure". Mutation evidence says
-"in this stage, every mutant must be caught by its directed test".
-Instead:
-- These arms assert that the mutant **passes**: D10 (`directed.rs:767`), D11 (`:835`),
-  D14's FREE-EARLY (`:1105`) and D16's two arms (`:1291,1297`).
-- D10 never applies its LOST fault. `out2` and `out3` are computed and then discarded, so the
-  G3 premise is never built.
-- D7's arm, `!m.pass || m.o1.is_ok()` (`:558`), cannot fail for any round
-  that is clean on O-1. It also lacks the card's "recover; commit shorter
-  records; crash" second round. TRUNCATE-LOGICAL-ONLY is therefore uncaught,
-  although the RESULT says "D7 ✓".
-- D17 asserts that leaf LOST/TORN is silent. The card wants XX001.
+## New findings: REWORK
+**N1. A store deviation from S-STORE §13 step 2: FreeSet sizing after growth (lines 770–784).**
+- `write_free_set` (`ckpt.rs:978`) sizes the FreeSet from the frozen
+  `slot_count`. When its own allocations grow the file, it only sets
+  `freeset_grew`. It does not recompute the page count and allocate the
+  difference.
+- So the meta records a `slot_count` below the free-set slots it references.
+  amcheck correctly reports "slot_count below a referenced slot".
+- The defect shows in clean class-C rounds. Shape: 60 puts with 200-byte
+  values, then SyncOff overwrites, `checkpointer_every` 3, crash at
+  After5/After6 of checkpoint 0. Amcheck (i) fails in 7 of 8 seeds, at every
+  `R_EPOCH`. The same shape gives amcheck (ii) findings at After4.
+- The committed tests already hit it:
+  - D17's REFCRC clean arm reports amcheck (i), and its `pass` is false.
+  - D9's clean arm reports amcheck (ii) and still passes (see N2).
 
-Rework these as real catching arms in the card's shapes (D10/D10b with a
-directed LOST on the newer meta after a recycle; D7 multi-round; D16 with an
-eviction inside the flip window; D14 with the M-NOINPLACE undercount
-diagnosed). Where a mutant is truly not reachable in a directed shape, argue it as
-an equivalent mutant in the RESULT, for the gate to confirm or reject. Never write it as an assert-pass.
+**N2. O-2 (ii) is never judged.**
+- The harness runs amcheck (ii) after `check_round` and never sets
+  `Extracted.amcheck_ii` or `amcheck_ii_ran`.
+- So O-2 (ii) and the (ii) half of O-3(e) are skipped for every round. That
+  weakens a Work 2 check, which the card's "Do not" forbids.
+- Fix: run the harness checkpoint and amcheck (ii) before the verdict (G4
+  orders the checkpoint after recovery, not after the judgement), or feed
+  their result into it.
 
-**R2. D17's clean arm accepts served corruption.** It checks
-`r.is_err() || !served.is_empty()` (`directed.rs:1409–1415`); the card says "XX001
-and never served". The mutant arm asserts only when the mutant is
-silent. With each of §3.3's checks hard-disabled in `page::check` (CRC,
-REFCRC, EPOCH+REFCRC and ID+REFCRC), **the whole crate suite stays green**.
-None of the four integrity mutants is demonstrated, although the RESULT claims all four.
-D17 also `continue`s past targets that have no matching durable write. That skip must
-be an assertion.
+**N3. D18 is vacuous.**
+- The clean round has `pass=false`. The cause is `task_error="Crashed"` while
+  the world is not marked crashed and no deadlock flag is set: a harness
+  defect in `h:taskerr`, with a two-task TaskYield crash.
+- The mutant round is identical: `o1=Ok(2)`, no M-WAL-ORDER. So
+  `|| !m.pass` makes the arm pass whatever happens.
+- TS-AFTER-APPEND is therefore uncaught, and the RESULT claims "d18
+  (M-WAL-ORDER + O-1)".
 
-**R3. D10b is missing, and the harness half of X5-R5 is untested and off-ruling.**
-- With the R-taint forced false (G5), every test still passes.
-- With recovery-world served corruption dropped from O-3(a) (G4), every test still passes.
-- `exception_set_r` (`harness.rs:1886`) omits X5-R5's third condition: no
-  write to `s` drew an M-NOINPLACE hit.
-- The R-taint (`:1272`) scans only the extraction world's accepts, from any life.
-  The ruling's window is "from open until the store next writes it", and that
-  window includes recovery's own accepts.
+**N4. Clean arms never assert `pass`.**
+- Work 14 says the clean arm is where "the oracle, monitors and amcheck
+  pass". Yet D17's clean2 and D18 fail the oracle and stay green.
+- Every clean arm must assert `pass`, except D12b's designed fail-stop.
+- Mutant arms must name their catcher, not `!m.pass`: D9, D11, D12, D15, D18
+  and D14's BITMAP arm.
 
-**R4. The §3.3 id check is self-referential on map and free-set pages.**
-`walk_radix`/`walk_freeset` (`ckpt.rs:346–348, 393–395`) and amcheck
-(`amcheck.rs:257, 308`) pass `expect_id = header_id(&bytes)`. That check can never fail.
-§3.3 says "the expected id is known" from the parent reference. Derive the expected
-id from the radix position, as the base of the child.
+**N5. G5 "UNCAUGHT-directed" is refuted.**
+- In D10b's own shape and seed (2020), the card's paired mutant ID-SKIP+REFCRC
+  serves a reused slot. The slot is in R, and the R-taint fails O-3(a).
+- With the R-taint call sites forced false, the same round passes silently.
+- Add that arm. It also pins the R-taint's positive case.
+- The REFCRC-SKIP-alone argument is confirmed: check (3) fires, and so does
+  EPOCH-SKIP+REFCRC. But arm 4's current assert is vacuous: `run()` without a
+  twin makes O-3(c) fail closed, so `!m.pass` always holds.
 
-**R5. The `BulkLoad` script op deadlocks the driver.** The RESULT says this is diagnosed but unfixed.
-Work 13 requires bulk loads with publication. D11, and PUBLISH-BEFORE-META with it,
-cannot run without them. A known DEADLOCK in a required path is a prototype
-defect to fix in this stage.
+**N6. The D7 equivalence argument is rejected.**
+- §12.5's position check makes a zombie a lining-up event, and a directed
+  test can force that line-up. In round 2, append a record whose byte length
+  equals the torn record's. The next read position is then the intact old
+  record, whose lsn equals that position.
+- "Not in the remaining budget" is not an equivalence.
+- D16: three post-flip SyncOff shapes of mine did not catch either mutant. The
+  argument is not refuted, and it may stand if restated precisely.
 
-**R6. The instrumentation check is not met.** If `acquire`'s `try_lock` is replaced
-by a blocking `lock`, `baton_violation_is_reported` still passes, and so does the
-full suite: detection rests entirely on the held flag. The test's doc comment claims
-a by-hand hang demonstration that this mutation does not reproduce, and the
-RESULT records no demonstration. Make the test fail under a blocking
-acquisition, for example a cross-thread holder case, and record the demonstration.
+**N7. Rework fixes that are unpinned** (each passes the whole suite when
+reverted):
+- condition 3;
+- R4;
+- the abort path's `ckpt_open` clear (D12b still passes);
+- the `pass` flag fold.
 
-**R7. RESULT accuracy.**
-- Item 2 does not give B1's `git diff --stat`. For 4b1e6068 it is 14 files,
-  +4935/−2702, about 7.6k changed lines against the ~1.5k budget, including new amcheck and tests.
-- Item 4's mutant table misreports caught arms (R1, R2).
-- Item 3 omits D10b.
+**N8. D17 coverage.** The card asks for TORN, LOST and MISDIRECTED, each on a
+tree leaf, a MapLeaf, a FreeSet page and a meta slot. That is 12 cells. Only
+the 3 MapLeaf cells and tree-page MISDIRECTED exist.
 
-**Minor (fold into the rework).**
-- `RoundOutcome.pass` (`harness.rs:1325,1382`) ignores `deadlock` and `panicked`.
-  The `baton` flag is never set anywhere. Fold all three into `pass`.
-- `EnvRef::accepted` silently drops the accept when `acquire` fails (`env.rs`).
-  That fails open on an oracle input.
-- Release paths swallow `SimFail::Baton`: `.ok()` and `.unwrap_or(false)` in
-  `gate_release`, `unpin` and the `ckpt.rs:714–829` sites.
-- Mutant arms accept `!m.pass` (any failure) where the card names the catcher.
-- D1's clean arm does not assert that the monitors are empty.
-- Limit 3: the `sim/disk.rs` additions (`dwrites_of`, `DWrite.all`, `Clone`,
-  `apply_one_media_fault`) lack new tests in `tests/sim.rs`, and
-  `apply_one_media_fault` is beyond the named additions. Justify it or test it.
-- The `WorldGuard` `Drop` comment has the order wrong: the flag clears before the
-  inner guard unlocks. This is harmless.
-
-No ESCALATE: nothing here is a spec conflict. All mutants were reverted, and
-`git diff` was clean before this file was written.
+No ESCALATE. N1 is a deviation from the spec as written, not a spec conflict.
