@@ -353,15 +353,27 @@ pub fn wal_enqueue<H: StoreHost>(
         let probe = REC_FIXED + payload.len() as u64;
         let seg = seg_of(lsn0);
         let room = seg + WAL_SEG - lsn0;
-        let rec_lsn = if probe <= room { lsn0 } else { seg + WAL_SEG };
+        // A record placed here must either end exactly at the segment
+        // boundary or leave room enough for a later SegmentEnd filler
+        // (§12.2: no record spans segments, and the reader hops segments
+        // only on a filler it can decode). B5 prototype-deviation fix:
+        // the draft compared only `probe ≤ room`, so a record could land
+        // with a tail the 45-byte filler cannot fill — the record then
+        // straddled the boundary while carrying the next segment's lsn,
+        // and §12.5's position check rejected its bytes on read.
+        let fits = probe <= room && (room - probe == 0 || room - probe >= REC_FIXED);
+        let rec_lsn = if fits { lsn0 } else { seg + WAL_SEG };
         let rec = enc_record(kind, txn, ts, payload, rec_lsn);
         let rec_len = rec.len() as u64;
         let mut placed: Vec<u8> = Vec::new();
-        if rec_lsn != lsn0 {
-            // A record that does not fit the rest of its segment is
-            // preceded by SegmentEnd (§12.2).
+        if !fits && lsn0 != seg + WAL_SEG {
+            // A SegmentEnd filler at lsn0, then the lsn space padded to
+            // the boundary (the reader never reads the pad: it hops on
+            // the filler, §12.5).
             let se = enc_record(K_SEGEND, (0, 0), 0, &[], lsn0);
             placed.extend_from_slice(&se);
+            let gap = (seg + WAL_SEG) - (lsn0 + se.len() as u64);
+            placed.extend(std::iter::repeat(0u8).take(gap as usize));
         }
         placed.extend_from_slice(&rec);
         st.wal.buf_tags.insert(rec_lsn, (ts, kind == K_MARKER, txn));

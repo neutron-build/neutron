@@ -1387,53 +1387,95 @@ pub fn run_round(
 /// Work 2.1's durability flags from the round's disk events: for each
 /// commit ts, the WAL write carrying its record's last byte returned
 /// (`written`), and its ack — a covering WAL sync returned (SyncOn) or
-/// the write itself (SyncOff). The commit records' (lsn, ts) pairs are
-/// parsed from the write events' bytes; a WAL file's writes parse as NWAL
-/// batches, the page file's never do. Record ends are tracked
-/// **file-relative** (a recycled segment's records sit at
-/// `lsn − segment_base` inside the renamed file, so absolute LSNs never
-/// compare against file offsets — B5 fix; D9's renamed-segment shape
-/// pinned it).
-fn derive_written_acked(
+/// the write itself (SyncOff). A WAL file's bytes are stitched from its
+/// write events (issue order, latest write per offset wins), then walked
+/// record by record from offset 0 (§12.5's alignment: a record lives at
+/// `lsn mod WAL_SEG` in whichever segment file holds it — a recycled
+/// segment's new life overwrites its old one from offset 0, so the walk
+/// sees exactly the latest life). The page file's stitched bytes fail
+/// the record magic immediately and contribute nothing. Record ends are
+/// **file-relative** throughout (B5 fixes: split records across a
+/// writer's 4-KiB batch chunks, and recycled segments' file-relative
+/// positions; D9's renamed-segment shape pinned both).
+pub fn derive_written_acked(
     events: &[DiskEvent],
     wal_commits: &BTreeMap<u64, (bool, u64)>,
 ) -> (Vec<u64>, Vec<u64>) {
-    // ts → (inode, the record's end offset **within its file**).
-    let mut ts_pos: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
+    // inode → (off → latest issued bytes) and the return/sync extents.
+    let mut files: BTreeMap<usize, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
     let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
     let mut durable_end: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut sync_after: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
     for e in events {
         match e {
             DiskEvent::WriteIssued { inode, off, bytes } => {
-                let parsed = parse_wal_batch(bytes);
-                let Some((l0, _, _)) = parsed.first().copied() else {
-                    continue;
-                };
-                for (lsn, kind, ts) in parsed {
-                    if kind == K_COMMIT || kind == K_MARKER {
-                        let len = record_len(bytes, lsn);
-                        // The batch is contiguous from its first record's
-                        // lsn: the record's file offset is `off + (lsn −
-                        // l0)`, its end adds the record length.
-                        let file_end = off + (lsn - l0) + len;
-                        ts_pos.insert(ts, (*inode, file_end));
-                    }
-                }
+                files.entry(*inode).or_default().insert(*off, bytes.clone());
             }
             DiskEvent::WriteReturned { inode, off, len } => {
-                if has_wal_writes(*inode, events) {
-                    let w = returned_end.entry(*inode).or_default();
-                    *w = (*w).max(off + len);
-                }
+                let w = returned_end.entry(*inode).or_default();
+                *w = (*w).max(off + len);
             }
             DiskEvent::SyncReturned { inode, .. } => {
-                if has_wal_writes(*inode, events) {
-                    let d = durable_end.entry(*inode).or_default();
-                    let w = returned_end.get(inode).copied().unwrap_or(0);
-                    *d = (*d).max(w);
-                }
+                // A sync makes durable everything the file had **through
+                // the then-returned extent**; record the event order by
+                // pairing it with the returned extent at this point.
+                let w = returned_end.get(inode).copied().unwrap_or(0);
+                sync_after.entry(*inode).or_default().push(w);
             }
             _ => {}
+        }
+    }
+    // Per sync event (in order), the durable extent ratchets: durable =
+    // max over syncs of the returned extent at sync time.
+    for (inode, exts) in sync_after.iter() {
+        let d = durable_end.entry(*inode).or_default();
+        for w in exts {
+            *d = (*d).max(*w);
+        }
+    }
+    // Walk each stitched file's records; ts → (inode, record end in-file).
+    // The header carries the record's own lsn; a record belongs at
+    // `lsn mod WAL_SEG` (§12.5's position rule), which is what ties a
+    // recycled file's latest life to its overwritten bytes.
+    let mut ts_pos: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
+    let seg = crate::store::WAL_SEG;
+    for (inode, writes) in files.iter() {
+        let mut off = 0u64;
+        loop {
+            if off >= seg {
+                break;
+            }
+            let hdr = stitched(writes, off, 24);
+            if hdr.len() < 24 || !magic_ok(&hdr) {
+                break;
+            }
+            let rd = |r: std::ops::Range<usize>| -> u64 {
+                let mut b = [0u8; 8];
+                if let Some(s) = hdr.get(r) {
+                    for (i, x) in s.iter().enumerate() {
+                        b[i] = *x;
+                    }
+                }
+                u64::from_le_bytes(b)
+            };
+            let len = (rd(4..8) & 0xFFFF_FFFF) as u64;
+            let lsn = rd(16..24);
+            if len < 16 || off + len > seg || lsn % seg != off {
+                break;
+            }
+            let whole = stitched(writes, off, len as usize);
+            if (whole.len() as u64) < len {
+                break;
+            }
+            match crate::store::wal::dec_record(&whole, lsn, lsn - off + seg) {
+                Ok(Some(rec)) => {
+                    if rec.kind == K_COMMIT || rec.kind == K_MARKER {
+                        ts_pos.insert(rec.ts, (*inode, off + len));
+                    }
+                    off += len;
+                }
+                _ => break,
+            }
         }
     }
     let mut written = Vec::new();
@@ -1455,61 +1497,50 @@ fn derive_written_acked(
     (written, acked)
 }
 
-/// Parse the `(lsn, kind, ts)` triples of a write batch (its bytes).
-fn parse_wal_batch(bytes: &[u8]) -> Vec<(u64, u8, u64)> {
-    crate::monitor::parse_batch_pub(bytes)
+/// The NWAL record magic (§12.2, `enc_record`'s first word).
+fn magic_ok(hdr: &[u8]) -> bool {
+    let mut b = [0u8; 4];
+    if let Some(s) = hdr.get(0..4) {
+        b.copy_from_slice(s);
+    }
+    u32::from_le_bytes(b) == 0x4C41_574E
 }
 
-/// A record's whole length, located by its lsn inside the batch.
-fn record_len(bytes: &[u8], lsn: u64) -> u64 {
-    for (l, _kind, _ts) in parse_wal_batch(bytes) {
-        if l == lsn {
-            // The record's own length: recompute from the batch walk.
-            let mut off = 0usize;
-            while off + 16 <= bytes.len() {
-                let len = {
-                    let s = bytes.get(off + 4..off + 8).unwrap_or(&[]);
-                    let mut b = [0u8; 4];
-                    if s.len() == 4 {
-                        b.copy_from_slice(s);
-                    }
-                    u32::from_le_bytes(b) as usize
-                };
-                if len < 16 || off + len > bytes.len() {
-                    return 0;
-                }
-                let this_lsn = bytes
-                    .get(off + 16..off + 24)
-                    .map(|s| {
-                        let mut a = [0u8; 8];
-                        a.copy_from_slice(s);
-                        u64::from_le_bytes(a)
-                    })
-                    .unwrap_or(u64::MAX);
-                if this_lsn == lsn {
-                    return len as u64;
-                }
-                off += len;
-            }
-            return 0;
+/// The `len` bytes at `off` of the stitched file, if fully present.
+fn stitched(writes: &BTreeMap<u64, Vec<u8>>, off: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    // Walk the issued write chunks covering [off, off+len): each write is
+    // a contiguous run at its own offset, and a run may **start before**
+    // the byte we want (records begin mid-chunk when the writer split a
+    // batch), so the covering run — the last one starting at or before
+    // the cursor — is picked first.
+    let mut cur = off;
+    while out.len() < len {
+        let cover = writes
+            .range(..=cur)
+            .next_back()
+            .filter(|(k, v)| **k + v.len() as u64 > cur)
+            .map(|(k, v)| (*k, v.clone()));
+        let ahead = writes.range(cur..).next().map(|(k, v)| (*k, v.clone()));
+        let Some((woff, bytes)) = cover.or(ahead) else {
+            break;
+        };
+        if woff > cur {
+            break;
+        }
+        let skip = (cur - woff) as usize;
+        let Some(take) = bytes.get(skip..) else {
+            break;
+        };
+        let need = len - out.len();
+        let take = &take[..take.len().min(need)];
+        out.extend_from_slice(take);
+        cur += take.len() as u64;
+        if take.is_empty() {
+            break;
         }
     }
-    0
-}
-
-/// Whether an inode received parses-as-WAL writes in this event stream
-/// (the record magic decides; the page file's writes never parse as
-/// NWAL batches — including its write at offset 0, whose "NUCLEUS\0"
-/// page-0 bytes fail the record magic, so no offset guard is needed).
-fn has_wal_writes(inode: usize, events: &[DiskEvent]) -> bool {
-    events.iter().any(|e| match e {
-        DiskEvent::WriteIssued {
-            inode: i,
-            bytes,
-            ..
-        } if *i == inode => !crate::monitor::parse_batch_pub(bytes).is_empty(),
-        _ => false,
-    })
+    out
 }
 
 fn site_name(d: XxSite) -> &'static str {
