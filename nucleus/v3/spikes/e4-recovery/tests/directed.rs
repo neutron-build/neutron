@@ -1091,18 +1091,39 @@ fn d14_monitors() {
     assert!(clean.o1.is_ok(), "D14 clean O-1: {:?}", clean.o1);
 }
 
-/// D15 (DropTree): crash at each walk step, then recover. The walk
-/// resumes and amcheck's LPID exactness holds. Mutant DROP-ROOT-FIRST.
+/// D15 (DropTree): a multi-level tree dropped after its catalog row is
+/// deleted; the crash lands right after the drop transaction, recovery
+/// replays it, and amcheck's LPID exactness holds. Mutant DROP-ROOT-FIRST
+/// frees the root first, stranding the children: the image maps pages no
+/// directory entry reaches.
+fn put2(i: u64) -> Op {
+    Op::Put {
+        tree: CATALOG,
+        key: (1000 + i).to_be_bytes().to_vec(),
+        value: vec![1u8; 8],
+    }
+}
+
+#[allow(clippy::needless_range_loop)]
+fn d15_unused() {}
 #[test]
 fn d15_droptree() {
+    let big = |i: u64| Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![1u8; 400],
+    };
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
             ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
         },
-        ScriptOp::Commit {
+        // A multi-level tree (~20 leaves over inners), loaded as a
+        // chunked transaction (§12.7: records stay under the 16-KiB
+        // cap): freeing the root first really does strand the children.
+        ScriptOp::Chunked {
             sync_on: true,
-            ops: (0..40).map(|i| put(i, 1)).collect(),
+            ops: (0..40).map(|i| big(i)).collect(),
         },
         ScriptOp::Commit {
             sync_on: true,
@@ -1114,10 +1135,14 @@ fn d15_droptree() {
                 Op::DropTree { tree: 2 },
             ],
         },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put2(0)],
+        },
     ];
     let mut script = script_with_crash(None);
     script.tasks[0].ops = ops;
-    script.crash = Some(CrashSpec::TaskYield(1, 3));
+    script.crash = Some(CrashSpec::TaskYield(1, 4));
     let clean = run(2014, &script, &faults(FaultClass::C, knobs(0, 0)), None);
     assert!(clean.o1.is_ok(), "D15 clean O-1: {:?}", clean.o1);
     assert!(
@@ -1131,6 +1156,7 @@ fn d15_droptree() {
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::DropRootFirst),
     );
+
     assert!(
         !m.amcheck_ii.is_empty() || m.o2_fail.is_some() || !m.pass,
         "D15 mutant: LPID exactness must fail (amcheck={})",
