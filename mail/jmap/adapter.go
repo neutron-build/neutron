@@ -775,7 +775,7 @@ func decodeEmails(raw json.RawMessage) ([]mail.Envelope, error) {
 			Preview:            m.Preview,
 			Size:               m.Size,
 			ReceivedAt:         m.ReceivedAt,
-			HasAttachment:      m.HasAttachment,
+			Attachment:         mail.AttachmentFromBool(m.HasAttachment),
 			From:               addrs(m.From),
 			To:                 addrs(m.To),
 			Cc:                 addrs(m.Cc),
@@ -797,10 +797,6 @@ func decodeEmails(raw json.RawMessage) ([]mail.Envelope, error) {
 			}
 		}
 		env.Keywords = keywordsFrom(m.Keywords)
-		env.AttachmentPresence = mail.AttachmentAbsent
-		if env.HasAttachment {
-			env.AttachmentPresence = mail.AttachmentPresent
-		}
 		env.Fingerprint = mail.ComputeFingerprint(&env)
 		envs = append(envs, env)
 	}

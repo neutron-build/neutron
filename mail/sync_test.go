@@ -39,14 +39,18 @@ type memStore struct {
 
 	// Staged scan state (audit SYNC-03): the double mirrors PgStore's
 	// mirror_scans/mirror_scan_seen, including the resume semantics.
-	scanSeq  int64
-	scans    map[AccountID]map[MailboxID]*Scan
+	scanSeq int64
+	scans   map[AccountID]map[MailboxID]*Scan
 	scanSeen map[ScanID]map[MessageID]bool
 	scanDone map[AccountID]map[int64]map[MailboxID]bool
 
 	// failPutEnvelopes makes the next PutEnvelopes fail, to simulate a
 	// crash between storing data and advancing the cursor.
 	failPutEnvelopes bool
+
+	// replaceCalls counts ReplaceIdentities units, so engine tests can
+	// tell the paired replacement path from the plain write/retire pair.
+	replaceCalls int
 }
 
 func newMemStore() *memStore {
@@ -59,7 +63,7 @@ func newMemStore() *memStore {
 		cursors:   map[AccountID]map[MailboxID]Cursor{},
 		scans:     map[AccountID]map[MailboxID]*Scan{},
 		scanSeen:  map[ScanID]map[MessageID]bool{},
-		scanDone:  map[AccountID]map[int64]map[MailboxID]bool{},
+		scanDone: map[AccountID]map[int64]map[MailboxID]bool{},
 	}
 }
 
@@ -357,6 +361,9 @@ type scriptedAdapter struct {
 	// bodyCalls counts fetches per message, so a test can tell "prefetched
 	// once" from "re-downloaded on every sync".
 	bodyCalls map[MessageID]int
+
+	// envelopeCalls counts envelope fetches per message.
+	envelopeCalls map[MessageID]int
 }
 
 func (a *scriptedAdapter) Provider() Provider { return ProviderIMAP }
@@ -382,8 +389,12 @@ func (a *scriptedAdapter) Sync(_ context.Context, _ MailboxID, cur Cursor) (*Cha
 }
 
 func (a *scriptedAdapter) Envelopes(_ context.Context, ids []MessageID) ([]Envelope, error) {
+	if a.envelopeCalls == nil {
+		a.envelopeCalls = map[MessageID]int{}
+	}
 	var out []Envelope
 	for _, id := range ids {
+		a.envelopeCalls[id]++
 		if e, ok := a.envelopes[id]; ok {
 			out = append(out, e)
 		}
@@ -423,6 +434,11 @@ func envelope(id string, box MailboxID) Envelope {
 
 func created(e Envelope) Change {
 	return Change{Kind: ChangeCreated, ID: e.ID, Envelope: &e}
+}
+
+// listed is a bare-ID listing entry, as Gmail reports an initial page.
+func listed(id string) Change {
+	return Change{Kind: ChangeCreated, ID: NativeMessageID(ProviderIMAP, id)}
 }
 
 func setup(t *testing.T) (*Engine, *memStore, AccountID) {
@@ -571,7 +587,7 @@ func TestCursorIsNotAdvancedWhenStoringFails(t *testing.T) {
 	}
 }
 
-func TestLegacyStoreRefusesNonAtomicPromotion(t *testing.T) {
+func TestPositionalIdentityIsUpgradedOnIngest(t *testing.T) {
 	eng, store, acct := setup(t)
 
 	pos := PositionalMessageID("INBOX", 1, 7)
@@ -584,12 +600,18 @@ func TestLegacyStoreRefusesNonAtomicPromotion(t *testing.T) {
 		pages: []*Changes{{Changes: []Change{{Kind: ChangeCreated, ID: pos, Envelope: &env}}, Next: "c1"}},
 	}
 
-	_, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
-	if !errors.Is(err, ErrIdentityTransactionRequired) {
-		t.Fatalf("promotion on legacy store = %v", err)
+	rep, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := store.Envelope(context.Background(), acct, HeaderMessageID("<real@example.com>")); !errors.Is(err, ErrNoStore) {
-		t.Fatal("refused promotion wrote replacement")
+	if rep.Upgraded != 1 {
+		t.Errorf("Upgraded = %d, want 1", rep.Upgraded)
+	}
+	if _, err := store.Envelope(context.Background(), acct, pos); !errors.Is(err, ErrNoStore) {
+		t.Error("superseded positional row survived the upgrade")
+	}
+	if _, err := store.Envelope(context.Background(), acct, HeaderMessageID("<real@example.com>")); err != nil {
+		t.Error("upgraded identity was not stored")
 	}
 }
 
@@ -1165,3 +1187,76 @@ func TestPrefetchDoesNotRefetchABodyItAlreadyHas(t *testing.T) {
 }
 
 func ptrEnvelope(e Envelope) *Envelope { return &e }
+
+// A provider that lists each message once per mailbox (Gmail, once per
+// label) used to cost one envelope fetch per appearance on import.
+func TestListingSkipsMessageFetchedForAnotherMailbox(t *testing.T) {
+	eng, store, acct := setup(t)
+	env := envelope("1", "INBOX")
+	env.MailboxIDs = []MailboxID{"INBOX", "Label_1"}
+	ad := &scriptedAdapter{
+		envelopes: map[MessageID]Envelope{env.ID: env},
+		pages: []*Changes{
+			{Changes: []Change{listed("1")}, Next: "inbox", EnumerationStart: true, Complete: true},
+			{Changes: []Change{listed("1")}, Next: "label", EnumerationStart: true, Complete: true},
+		},
+	}
+	for _, box := range []MailboxID{"INBOX", "Label_1"} {
+		if _, err := eng.SyncMailbox(context.Background(), acct, box, ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ad.envelopeCalls[env.ID]; got != 1 {
+		t.Fatalf("envelope fetched %d times, want 1", got)
+	}
+	boxes, err := store.MessageMailboxes(context.Background(), acct, env.ID)
+	if err != nil || len(boxes) != 2 {
+		t.Fatalf("memberships = %v, %v; want INBOX and Label_1", boxes, err)
+	}
+}
+
+// A delta means the held copy may be stale in ways the listing mailbox's
+// own deltas cannot see, so the next listing entry fetches again.
+func TestListingRefetchesMessageReportedByDelta(t *testing.T) {
+	eng, _, acct := setup(t)
+	env := envelope("1", "INBOX")
+	ad := &scriptedAdapter{
+		envelopes: map[MessageID]Envelope{env.ID: env},
+		pages: []*Changes{
+			{Changes: []Change{listed("1")}, Next: "inbox", EnumerationStart: true, Complete: true},
+			{Changes: []Change{{Kind: ChangeUpdated, ID: env.ID}}, Next: "inbox-2"},
+			{Changes: []Change{listed("1")}, Next: "label", EnumerationStart: true, Complete: true},
+		},
+	}
+	for _, box := range []MailboxID{"INBOX", "INBOX", "Label_1"} {
+		if _, err := eng.SyncMailbox(context.Background(), acct, box, ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ad.envelopeCalls[env.ID]; got != 3 {
+		t.Fatalf("envelope fetched %d times, want 3", got)
+	}
+}
+
+// A reset enumeration exists to refresh what the mirror holds; nothing
+// fetched before it may be skipped.
+func TestResetListingRefetchesEverything(t *testing.T) {
+	eng, _, acct := setup(t)
+	env := envelope("1", "INBOX")
+	ad := &scriptedAdapter{
+		envelopes: map[MessageID]Envelope{env.ID: env},
+		pages: []*Changes{
+			{Changes: []Change{listed("1")}, Next: "inbox", EnumerationStart: true, Complete: true},
+			{Reset: true},
+			{Changes: []Change{listed("1")}, Next: "inbox-2", EnumerationStart: true, Complete: true},
+		},
+	}
+	for range 2 {
+		if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ad.envelopeCalls[env.ID]; got != 2 {
+		t.Fatalf("envelope fetched %d times, want 2", got)
+	}
+}

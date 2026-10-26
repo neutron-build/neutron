@@ -250,16 +250,6 @@ func (a *Adapter) initialSync(ctx context.Context, box mail.MailboxID, pageToken
 		return nil, classify(err)
 	}
 
-	ids := make([]mail.MessageID, 0, len(res.Messages))
-	for _, m := range res.Messages {
-		ids = append(ids, mail.NativeMessageID(mail.ProviderGmail, m.Id))
-	}
-
-	envs, err := a.Envelopes(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-
 	changes := &mail.Changes{
 		More:             res.NextPageToken != "",
 		EnumerationStart: pageToken == "",
@@ -270,10 +260,11 @@ func (a *Adapter) initialSync(ctx context.Context, box mail.MailboxID, pageToken
 	} else {
 		changes.Next = mail.Cursor(strconv.FormatUint(historyID, 10))
 	}
-	for i := range envs {
-		e := envs[i]
+	// Bare IDs: Gmail lists a message under every label it carries, and
+	// the engine fetches only the ones it does not already hold.
+	for _, m := range res.Messages {
 		changes.Changes = append(changes.Changes, mail.Change{
-			Kind: mail.ChangeCreated, ID: e.ID, Envelope: &e,
+			Kind: mail.ChangeCreated, ID: mail.NativeMessageID(mail.ProviderGmail, m.Id),
 		})
 	}
 	return changes, nil
@@ -418,12 +409,13 @@ func toEnvelope(m *gmail.Message) mail.Envelope {
 				}
 			}
 		}
-		// Envelope requests use metadata: omission of parts proves nothing.
-		env.HasAttachment = payloadHasAttachment(m.Payload)
-		env.AttachmentPresence = mail.AttachmentUnknown
-		if env.HasAttachment {
-			env.AttachmentPresence = mail.AttachmentPresent
-		}
+		// Envelopes are fetched with format=metadata, which omits the
+		// part tree: a walk over the payload would find no filenames
+		// even for a multipart message and report an absence that was
+		// never provable (audit GMAIL-03). Unknown is the honest claim;
+		// payloadHasAttachment stays for a fetch that genuinely sees
+		// the tree.
+		env.Attachment = mail.AttachmentUnknown
 	}
 
 	env.Fingerprint = mail.ComputeFingerprint(&env)
@@ -480,9 +472,6 @@ func (a *Adapter) Body(ctx context.Context, id mail.MessageID) (*mail.Body, erro
 		return nil, classify(err)
 	}
 
-	if m.Payload == nil {
-		return nil, errors.New("gmail: full message omitted MIME payload")
-	}
 	body := &mail.Body{MessageID: id}
 	if m.Payload != nil {
 		if err := a.collectParts(ctx, nativeID(id), m.Payload, body); err != nil {
