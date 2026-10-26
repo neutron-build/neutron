@@ -318,9 +318,14 @@ fn shadow_refs(durable: &[u8], m: &page::Meta, cfg: &MonitorCfg) -> Vec<u64> {
     if m.free_root.slot != 0 {
         walk_shadow_free(&read(m.free_root.slot), m.free_root, &mut out, cfg);
     }
-    // The trees from the directory.
+    // The trees from the directory: the directory's own pages first
+    // (its root may be an inner page), then every tree root its leaf
+    // cells name (B5 fix: the draft stopped at the directory page, so
+    // the durable slot set missed every tree page — M-NOINPLACE was
+    // blind to writes the durable image still referenced).
     if let Some(r) = flat.get(&m.dir_root).copied() {
         let mut stack = vec![(m.dir_root, r)];
+        let mut roots: Vec<u64> = Vec::new();
         while let Some((l, r)) = stack.pop() {
             if out.contains(&r.slot) {
                 continue;
@@ -339,6 +344,44 @@ fn shadow_refs(durable: &[u8], m: &page::Meta, cfg: &MonitorCfg) -> Vec<u64> {
                     }
                     if let Some(rr) = flat.get(&right).copied() {
                         stack.push((right, rr));
+                    }
+                }
+            } else if let Ok(cells) = crate::store::tree::leaf_cells(&b) {
+                for (k, v) in cells {
+                    if k.len() != 8 || v.len() != 9 {
+                        continue;
+                    }
+                    let mut rb = [0u8; 8];
+                    if let Some(s) = v.get(0..8) {
+                        rb.copy_from_slice(s);
+                    }
+                    roots.push(u64::from_le_bytes(rb));
+                }
+            }
+        }
+        for root in roots {
+            if let Some(rr) = flat.get(&root).copied() {
+                stack.push((root, rr));
+                while let Some((l, r)) = stack.pop() {
+                    if out.contains(&r.slot) {
+                        continue;
+                    }
+                    out.push(r.slot);
+                    let b = read(r.slot);
+                    if page::check(&b, &r, l, None).is_err() {
+                        continue;
+                    }
+                    if page::header_kind(&b) == page::KIND_INNER {
+                        if let Ok((seps, right)) = crate::store::tree::inner_seps(&b) {
+                            for (c, _) in seps {
+                                if let Some(cr) = flat.get(&c).copied() {
+                                    stack.push((c, cr));
+                                }
+                            }
+                            if let Some(rr) = flat.get(&right).copied() {
+                                stack.push((right, rr));
+                            }
+                        }
                     }
                 }
             }

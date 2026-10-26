@@ -445,6 +445,7 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         st.ckpt_open = true;
         st.ckpt_splits = 0;
         st.ckpt_merges = 0;
+        st.fs_building.clear();
         Ok(())
     })?;
     hooks(CkptHook::Before0)?;
@@ -634,6 +635,14 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         st.map.img.clear();
         st.slots.image_refs.clear();
         st.map.prev_root = Some(map_root);
+        // B5: the previous image's free-set pages leave `used_cur` (the
+        // new image allocated its own); they stay pinned only if
+        // something still references them (the three-reference rule).
+        let old_fs = std::mem::take(&mut st.fs_prev);
+        for s in old_fs {
+            prims::unpin_home(st, s);
+        }
+        st.fs_prev = std::mem::take(&mut st.fs_building);
         Ok(())
     })?;
     cx.w.wake(crate::sim::WaitKey::MetaDurable);
@@ -893,6 +902,13 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
             let s = prims::alloc_slot(cx)?;
             fs_slots.push(s);
         }
+        cx.with("fs:building", |c| {
+            let st = c.store();
+            for &s in fs_slots.iter() {
+                st.fs_building.insert(s);
+            }
+            Ok(())
+        })?;
         let sc2 = cx.with("fs:sc2", |c| Ok(c.store().slots.slot_count))?;
         if sc2 <= slot_count {
             break;
@@ -987,6 +1003,9 @@ fn full_image_slots<H: StoreHost>(cx: &Cx<'_, H>) -> Result<BTreeSet<u64>, Fail>
         for (_, r) in st.map.prev_inners.values() {
             out.insert(r.slot);
         }
+        // The image's own free-set pages (B5: the durable set must cover
+        // everything meta k references, its free set included).
+        out.extend(st.fs_building.iter().copied());
         out.insert(0);
         out.insert(1);
         out.insert(2);

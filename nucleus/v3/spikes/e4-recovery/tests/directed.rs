@@ -421,17 +421,48 @@ fn d5_split_straddling_flip() {
     );
 }
 
-/// D6 (double crash): crash during pass 2, then recover; the final state
-/// equals an uncrashed recovery's (I-REPLAY-IDEM). The digest of a
-/// recovered-then-crashed-in-recovery round equals a plain round's.
+/// D6 (double crash): a flip images a partially applied commit (the
+/// `apply:mid` park); the crash after step 5 makes recovery replay the
+/// whole commit — its imaged entries are identical no-ops (I-REPLAY-IDEM
+/// through §9.1). A nested recovery crash (at a yield inside pass 2)
+/// must not change the outcome: the final cut, frontier and durable
+/// image equal a plain recovery's. Under REPLAY-DUP-CONFLICT the
+/// identical re-insert errors and the round fails.
 #[test]
 fn d6_double_crash_idempotent() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+        },
+        // The committer parks 400 yields after c2's first apply entry,
+        // so task 2's forced flip below lands with entry 0 applied at
+        // the current epoch (imaged) and the rest still to come.
+        ScriptOp::Park {
+            name: "apply:mid",
+            budget: 400,
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..20).map(|i| put(i, 1)).collect(),
+        },
+        ScriptOp::Yields(1),
+    ];
     let mut script = script_with_crash(None);
-    script.tasks[0].ops = std_ops();
-    script.crash = Some(CrashSpec::TaskYield(1, 3));
+    script.tasks = vec![
+        ScriptTask { ops },
+        ScriptTask {
+            ops: vec![ScriptOp::Yields(24), ScriptOp::Checkpoint],
+        },
+    ];
+    script.checkpointer_every = Some(1000);
+    script.crash = Some(CrashSpec::TaskYield(1, 4));
+    // The nested crash point: a yield inside recovery's pass 2 (the
+    // replay's gated inserts), mid-way through the records.
     let base = run(2005, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(base.o1.is_ok(), "D6 base O-1: {:?}", base.o1);
     let mut nested = script.clone();
-    nested.nested = vec![5];
+    nested.nested = vec![40];
     let twice = run(2005, &nested, &faults(FaultClass::C, knobs(0, 0)), None);
     assert_eq!(
         base.o1, twice.o1,
@@ -445,15 +476,20 @@ fn d6_double_crash_idempotent() {
         base.amcheck_ii, twice.amcheck_ii,
         "D6: a recovery crash changes the durable image"
     );
-    // Mutant REPLAY-DUP-CONFLICT: recovering twice must still be sound;
-    // under the mutant an identical re-insert errors and the round fails.
+    // Mutant REPLAY-DUP-CONFLICT: the identical re-insert (an imaged
+    // entry replayed) errors, recovery fails, the class-C round fails.
     let m = run(
         2005,
         &nested,
         &faults(FaultClass::C, knobs(0, 0)),
         Some(Mutant::ReplayDupConflict),
     );
-    assert!(!m.pass, "D6 mutant arm: REPLAY-DUP-CONFLICT must fail");
+    assert!(
+        !m.pass || m.o3_fail.is_some(),
+        "D6 mutant arm: REPLAY-DUP-CONFLICT must fail (o1={:?}, o3={:?})",
+        m.o1,
+        m.o3_fail
+    );
 }
 
 /// D7 (zombie tail): the valid end sits at a torn record followed by
@@ -523,81 +559,70 @@ fn d8_stale_recycled_segment() {
         matches!(&m, Ok(Some(r)) if r.ts == 5 && r.lsn == 200),
         "D8 mutant: the stale record must decode as new ({m:?})"
     );
-    // End-to-end: enough WAL for a real recycle, two checkpoints, and a
-    // crash after the second one's step 6.
-    let big = |i: u64| Op::Put {
+    // End-to-end: the card's end-to-end half ("Q11's shape") is the
+    // campaign's multi-round case (X-5c); in a single round §14's
+    // `commit_ts > T` filter skips most stale records, which the
+    // mutation table itself notes. A recycle smoke test lives in
+    // `tests/store.rs` (one checkpoint with a concurrent insert task).
+    let _ = knobs;
+}
+
+/// D9 (dropped rename): the WAL spans segments; a forced checkpoint
+/// recycles segment 0 by rename (G1's dirsync makes the new name
+/// durable); later SyncOn chunked commits are acked with records inside
+/// the renamed segment; the crash drops all volatile writes **and
+/// directory ops**. The acked commits survive. Mutant RENAME-NO-DIRSYNC
+/// leaves the rename (and the segment creates) volatile, so the crash
+/// can drop the renamed segment's binding: the walk stops at the missing
+/// name and the acked records past it are lost — O-1 fails.
+///
+/// The crash's directory-prefix draw is seeded (S_CRASH); the seed is
+/// fixed so the mutant arm's draw provably drops the rename (a draw that
+/// kept every volatile op would let the mutant pass — checked by the
+/// assertion, not assumed).
+#[test]
+fn d9_dropped_rename() {
+    let big = |i: u64, v: u8| Op::Put {
         tree: 2,
-        key: (i % 40).to_be_bytes().to_vec(),
-        value: vec![1u8; 400],
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; 400],
+    };
+    let chunked = |base: u64, v: u8| ScriptOp::Chunked {
+        sync_on: true,
+        ops: (0..40u64).map(|i| big(base + i, v)).collect(),
     };
     let mut ops = vec![ScriptOp::Commit {
         sync_on: true,
         ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
     }];
-    // 8 chunked transactions of 40 ops ≈ 8 × 16.5 KiB ≈ 132 KiB > 2
-    // segments; segment 0 is recycled by the first checkpoint.
-    for c in 0..8 {
-        ops.push(ScriptOp::Chunked {
-            sync_on: true,
-            ops: (0..40).map(|i| big(c * 40 + i)).collect(),
-        });
+    // 4 chunked transactions ≈ 66 KiB > one 64-KiB segment: segment 0 is
+    // wholly below the flip's `wal_start_lsn` and is recycled.
+    for c in 0..4 {
+        ops.push(chunked(c * 40, 1));
     }
+    ops.push(ScriptOp::WaitVisible(5));
     ops.push(ScriptOp::Checkpoint);
-    ops.push(ScriptOp::Chunked {
-        sync_on: true,
-        ops: (0..20).map(big).collect(),
-    });
-    ops.push(ScriptOp::Checkpoint);
+    // 4 more ≈ 66 KiB: the append crosses the recycled segment's new
+    // boundary and its records are acked inside the renamed file.
+    for c in 4..8 {
+        ops.push(chunked(c * 40, 2));
+    }
+    ops.push(ScriptOp::Yields(1));
     let script = Script {
         tasks: vec![ScriptTask { ops }],
         writer: true,
         evictor: false,
-        checkpointer_every: Some(100),
-        crash: Some(CrashSpec::Hook {
-            ckpt_index: 0,
-            hook: CkptHook::After6,
-        }),
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 12)),
         nested: Vec::new(),
     };
-    let clean_e2e = run(2007, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean_e2e.o1.is_ok(), "D8 e2e clean O-1: {:?}", clean_e2e.o1);
-    assert!(clean_e2e.o3_fail.is_none(), "D8 e2e clean O-3: {:?}", clean_e2e.o3_fail);
-}
-
-/// D9 (dropped rename): a recycle rename, SyncOn commits acked in the
-/// renamed segment, then a crash that drops volatile directory ops. The
-/// acked commits survive. Mutant RENAME-NO-DIRSYNC.
-#[test]
-fn d9_dropped_rename() {
-    let ops = vec![
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
-        },
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (0..10).map(|i| put(i, 1)).collect(),
-        },
-        ScriptOp::Checkpoint,
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (10..20).map(|i| put(i, 2)).collect(),
-        },
-    ];
-    let mut script = script_with_crash(None);
-    script.tasks[0].ops = ops;
-    script.checkpointer_every = Some(2);
-    // Crash after step 6 (the recycle), dropping all volatile dir ops.
-    script.crash = Some(CrashSpec::Hook {
-        ckpt_index: 0,
-        hook: CkptHook::After6,
-    });
     let clean = run(2008, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    let c = clean.o1.expect("D9 clean O-1");
+    let c = clean.o1.clone().expect("D9 clean O-1");
     assert!(
-        c >= 3,
-        "D9 clean: the acked commit after the rename survives (c={c})"
+        c >= 9,
+        "D9 clean: the acked commits in the renamed segment survive (c={c})",
     );
+    assert!(clean.o3_fail.is_none(), "D9 clean O-3: {:?}", clean.o3_fail);
     let m = run(
         2008,
         &script,
@@ -605,7 +630,7 @@ fn d9_dropped_rename() {
         Some(Mutant::RenameNoDirsync),
     );
     assert!(
-        !m.pass || m.o1.is_err() || m.o1.clone().unwrap() < 3,
+        !m.pass || m.o1.is_err() || m.o1.clone().unwrap_or(0) < 9,
         "D9 mutant: the acked commits must be lost (o1={:?})",
         m.o1
     );
@@ -815,30 +840,46 @@ fn d12_gcw() {
     );
 }
 
-/// D13 (entry uniqueness): an identical re-insert is a no-op; a
-/// different value is XX001. Mutants REPLAY-DUP-CONFLICT and
+/// D13 (entry uniqueness): a flip images a **partially applied** commit
+/// (the `apply:mid` park holds the committer between entries); a crash
+/// after step 5 leaves entry #1 in the image while recovery replays the
+/// whole commit — the identical re-insert must be a no-op; a different
+/// value at the same entry key is XX001. Mutants REPLAY-DUP-CONFLICT and
 /// DUP-DIFFERENT-ACCEPTED.
 #[test]
 fn d13_entry_uniqueness() {
-    // The identical case: replaying a commit twice (crash mid-apply, a
-    // checkpoint above, then recovery) hits the identical re-insert.
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
             ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+        },
+        // The flip (every 2 commits) lands with c2 recorded (T = 1) and
+        // its apply parked after the first entry: the image carries
+        // entry 0, recovery replays c2 whole.
+        ScriptOp::Park {
+            name: "apply:mid",
+            budget: 400,
         },
         ScriptOp::Commit {
             sync_on: true,
             ops: (0..20).map(|i| put(i, 1)).collect(),
         },
     ];
-    let mut script = script_with_crash(None);
-    script.tasks[0].ops = ops;
-    script.crash = Some(CrashSpec::TaskYield(1, 2));
-    let clean = run(2012, &script, &faults(FaultClass::C, knobs(1000, 0)), None);
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(2),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 0,
+            hook: CkptHook::After5,
+        }),
+        nested: Vec::new(),
+    };
+    let clean = run(2012, &script, &faults(FaultClass::C, knobs(0, 0)), None);
     assert!(clean.o1.is_ok(), "D13 clean O-1: {:?}", clean.o1);
-    // The different-value case drives the store directly: recover, then
-    // insert a different value at an existing entry key.
+    // Drive the store directly on the round's end state: recover, then
+    // insert the identical entry (a no-op) and a different value (XX001).
     use e4_recovery::sim::HARNESS;
     use e4_recovery::store::{Cx, HasStore, StoreInner, ckpt, tree};
     let world = harness::round_world(
@@ -922,18 +963,91 @@ fn d13_entry_uniqueness() {
     );
 }
 
-/// D14 (monitors on D1's workload): the mutants move or skip the named
-/// step and the named monitor fires.
+/// D14 (monitors on a churning workload): big values force dirty
+/// evictions (home moves) between checkpoints, so each image drops real
+/// slots — the step-6 frees have something to free. The mutants move or
+/// skip the named step and the named monitor (or amcheck) fires.
 #[test]
 fn d14_monitors() {
+    let big = |i: u64, v: u8| Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; 400],
+    };
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: 2 }, Op::CreateTree { tree: CATALOG }, publish(2)],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..60).map(|i| big(i, 1)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: false,
+            ops: (60..120).map(|i| big(i, 2)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (26..36).map(|i| big(i, 3)).collect(),
+        },
+    ];
     let mk = |m: Option<Mutant>, hook: CkptHook| {
         let script = Script {
-            tasks: vec![ScriptTask { ops: std_ops() }],
+            tasks: vec![ScriptTask {
+                ops: vec![
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![
+                            Op::CreateTree { tree: 2 },
+                            Op::CreateTree { tree: CATALOG },
+                            publish(2),
+                        ],
+                    },
+                    // Each commit parks briefly after its enqueue, so the
+                    // periodic checkpoint (every 2 commits) runs its steps
+                    // while the committer's apply is still to come: the
+                    // apply's fresh-slot writes land inside the open
+                    // checkpoint window.
+                    ScriptOp::Park {
+                        name: "commit:preapply",
+                        budget: 48,
+                    },
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: (0..60).map(|i| big(i, 1)).collect(),
+                    },
+                    ScriptOp::Park {
+                        name: "commit:preapply",
+                        budget: 48,
+                    },
+                    // The churn commit: 60 more big entries evict and move
+                    // homes between the two images.
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: (60..120).map(|i| big(i, 2)).collect(),
+                    },
+                    ScriptOp::Park {
+                        name: "commit:preapply",
+                        budget: 48,
+                    },
+                    // Image k=2 fires at this enqueue while the apply
+                    // waits: its step-6 frees (moved before step 5 by the
+                            // mutant) release real slots, and the apply's
+                    // allocations can take one while meta k−1 is still
+                    // the durable one.
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: (120..140).map(|i| big(i, 3)).collect(),
+                    },
+                    ScriptOp::Yields(1),
+                ],
+            }],
             writer: true,
             evictor: true,
-            checkpointer_every: Some(1),
+            checkpointer_every: Some(2),
             crash: Some(CrashSpec::Hook {
-                ckpt_index: 0,
+                ckpt_index: 1,
                 hook,
             }),
             nested: Vec::new(),
@@ -974,6 +1088,7 @@ fn d14_monitors() {
         "D14 clean: monitors fired: {:?}",
         clean.monitors
     );
+    assert!(clean.o1.is_ok(), "D14 clean O-1: {:?}", clean.o1);
 }
 
 /// D15 (DropTree): crash at each walk step, then recover. The walk

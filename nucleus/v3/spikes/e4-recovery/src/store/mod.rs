@@ -405,6 +405,17 @@ pub struct StoreInner {
     pub parks: BTreeMap<&'static str, u64>,
     /// The bulk-load publish waiters' last durable meta (§12.8).
     pub meta_durable_k: u64,
+    /// The free-set pages of the image **being built** (step 2's
+    /// serialisation): filled by `write_free_set`, consumed by the
+    /// step-5 resolution. B5 fix: the draft never tracked them, so the
+    /// step-5 durable set omitted the image's own free-set pages and
+    /// the **previous** image's pages were never unpinned — a slot leak
+    /// that made every early free undetectable (FREE-EARLY could not
+    /// fire M-NOINPLACE because nothing ever reused a freed slot).
+    pub fs_building: BTreeSet<u64>,
+    /// The free-set pages of the **last durable** image (unpinned at the
+    /// next checkpoint's step 5, when nothing references them anymore).
+    pub fs_prev: BTreeSet<u64>,
     /// Poison reason (I-FAIL-STOP).
     pub poisoned: Option<String>,
     /// The WAL state.
@@ -461,6 +472,8 @@ impl StoreInner {
             stale_seg_reads: 0,
             parks: BTreeMap::new(),
             meta_durable_k: 0,
+            fs_building: BTreeSet::new(),
+            fs_prev: BTreeSet::new(),
             poisoned: None,
             wal: wal::WalState::default(),
         }

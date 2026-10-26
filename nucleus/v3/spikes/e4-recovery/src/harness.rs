@@ -420,6 +420,11 @@ pub fn commit_txn(
     });
     for op in ordered {
         ckpt::apply_op(cx, &to_wop(op), ts, false)?;
+        // A named park point (Work 13): D6/D13 hold the committer
+        // **between** apply entries, so a flip's step 2 images a
+        // partially applied commit — recovery then replays the whole
+        // commit and its first entries are identical re-inserts (§9.1).
+        cx.park("apply:mid")?;
     }
     mark_applied(cx, ts)?;
     Ok(ts)
