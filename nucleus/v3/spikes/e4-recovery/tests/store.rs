@@ -501,6 +501,87 @@ fn checkpoint_with_concurrent_insert_and_evictor() {
     }
 }
 
+/// G7's meta-selection semantics (P's ruling on the round-3 F3,
+/// 2026-10-26): the winner is the highest placed-valid meta; a
+/// misplaced valid meta that does not outrank it is a loser (ignored);
+/// one that does is `MisplacedNewer` (XX001 at open, with the
+/// placed-valid winner as the fallback for the walks); the mutant's
+/// `skip_slot_check` (the store's open only) opens the misplaced copy
+/// from its own read slot.
+#[test]
+fn g7_meta_selection_semantics() {
+    use e4_recovery::store::page::{self, Meta, MetaPick};
+    let mk = |k: u64| {
+        let m = Meta {
+            ckpt_id: k,
+            t: k,
+            ..Meta::default()
+        };
+        page::build_meta(&m)
+    };
+    // Placed metas: slot 1 holds even ids, slot 2 odd.
+    let (a, b) = (mk(2), mk(1));
+    match page::select_meta(&a, &b, false) {
+        MetaPick::Win { meta, slot } => {
+            assert_eq!(meta.ckpt_id, 2, "the highest placed-valid meta wins");
+            assert_eq!(slot, 1, "and it was read from its own slot");
+        }
+        other => panic!("placed metas must Win ({other:?})"),
+    }
+    // A misplaced **older** meta is a loser: meta 0's bytes in slot 2
+    // (its own slot is 1) lose to the placed meta 2 in slot 1.
+    match page::select_meta(&a, &mk(0), false) {
+        MetaPick::Win { meta, slot } => {
+            assert_eq!(meta.ckpt_id, 2, "the misplaced older copy is ignored");
+            assert_eq!(slot, 1);
+        }
+        other => panic!("a misplaced older meta must lose ({other:?})"),
+    }
+    // Meta 2's bytes in slot 2: misplaced (their own slot is 1), and
+    // they outrank the placed meta 0 in slot 1 — MisplacedNewer with the
+    // fallback.
+    match page::select_meta(&mk(0), &a, false) {
+        MetaPick::MisplacedNewer {
+            meta,
+            slot,
+            fallback,
+        } => {
+            assert_eq!(meta.ckpt_id, 2, "the misplaced newer meta is named");
+            assert_eq!(slot, 2, "read from slot 2");
+            assert_eq!(
+                fallback.map(|m| m.ckpt_id),
+                Some(0),
+                "the placed-valid winner is the fallback"
+            );
+        }
+        other => panic!("the misplaced newer meta must be MisplacedNewer ({other:?})"),
+    }
+    // META-WRONG-SLOT (the store's open only): the same bytes select the
+    // misplaced copy — Win at its read slot (the accept names the bytes
+    // actually used).
+    match page::select_meta(&b, &a, true) {
+        MetaPick::Win { meta, slot } => {
+            assert_eq!(meta.ckpt_id, 2, "the mutant opens the misplaced copy");
+            assert_eq!(slot, 2, "accepted from the slot it was read from");
+        }
+        other => panic!("skip_slot_check must Win the highest parse-ok meta ({other:?})"),
+    }
+    // No valid meta anywhere.
+    assert!(matches!(
+        page::select_meta(&[0u8; 4096], &[0u8; 4096], false),
+        MetaPick::NoValid
+    ));
+    // A misplaced newer meta with no placed-valid one at all: still
+    // MisplacedNewer (open fails XX001 either way; no fallback).
+    match page::select_meta(&[0u8; 4096], &a, false) {
+        MetaPick::MisplacedNewer { meta, fallback, .. } => {
+            assert_eq!(meta.ckpt_id, 2);
+            assert!(fallback.is_none());
+        }
+        other => panic!("({other:?})"),
+    }
+}
+
 fn fail_of(f: Fail) -> SimFail {
     match f {
         Fail::Sim(s) => s,
@@ -564,7 +645,9 @@ fn map_radix_depth_and_reopen() {
 
 /// Guard against accidental mutant configuration in the clean tests: the
 /// enum exists and every variant is distinct (compile-time coverage of
-/// the 27 sites' names for the directed tests).
+/// the 28 sites' names for the directed tests — the 27 of the card's
+/// mutation table plus G7's META-WRONG-SLOT, P's ruling on the round-3
+/// F3).
 #[test]
 fn mutant_enum_is_complete() {
     let all = [
@@ -595,11 +678,12 @@ fn mutant_enum_is_complete() {
         Mutant::RenameNoDirsync,
         Mutant::TruncateLogicalOnly,
         Mutant::StartSegmentMissingOk,
+        Mutant::MetaWrongSlot,
     ];
     let mut seen: Vec<Mutant> = Vec::new();
     for m in all {
         assert!(!seen.contains(&m), "duplicate mutant {m:?}");
         seen.push(m);
     }
-    assert_eq!(seen.len(), 27, "the card's 27-mutant enum");
+    assert_eq!(seen.len(), 28, "the card's 27-mutant enum plus G7's");
 }

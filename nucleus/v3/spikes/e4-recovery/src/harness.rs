@@ -1284,6 +1284,10 @@ pub fn run_round(
     // ---- recovery with nested crashes ----
     let mut nested_fired = 0u32;
     let mut recovery_disk = disk.clone();
+    // Every exit of the loop below assigns this before it is read (the
+    // Ok arm and the final Err arm both collect the attempt's reads);
+    // the initializer only satisfies the borrow checker.
+    #[allow(unused_assignments)]
     let mut recovery_reads: Vec<(usize, u64, u64)> = Vec::new();
     // Served corruption seen by the recovery world(s) (O-3 (a): the
     // accepts of every life of this round are judged — the recovery
@@ -1361,6 +1365,18 @@ pub fn run_round(
             }
             Err(e) => {
                 let g = world.lock();
+                // The failed attempt's reads are the twin's too (the
+                // G7 clean shape: open **did** read both meta slots
+                // before failing — without this the twin under-reported
+                // them and O-3 (c) called the detection a false
+                // positive, failing the round the ruling says passes).
+                recovery_reads = g
+                    .disk
+                    .reads
+                    .iter()
+                    .skip(reads_before)
+                    .map(|r| (r.inode, r.off, r.len))
+                    .collect();
                 recovery_served.extend(g.disk.served.clone());
                 recovery_events = g.disk.events.clone();
                 break Err(e);
@@ -1595,7 +1611,11 @@ pub fn run_round(
             let mut nop = NopReader;
             let twin_info = TwinInfo {
                 page_file: pf,
-                recovery_reads: Vec::new(),
+                // The failed recovery's own reads (the G7 clean shape:
+                // open read both meta slots before failing — an empty
+                // set here made O-3 (c) call the detection a false
+                // positive).
+                recovery_reads: recovery_reads.clone(),
                 image_slots: image_slots.clone(),
             };
             let verdict = check_round(
@@ -1924,20 +1944,24 @@ pub fn durable_image(
     };
     let m1 = disk.durable_read(pf, 4096, 4096);
     let m2 = disk.durable_read(pf, 8192, 4096);
-    let (meta, _slot) = match (
-        crate::store::page::parse_meta(&m1),
-        crate::store::page::parse_meta(&m2),
-    ) {
-        (Ok(a), Ok(b)) => {
-            if a.ckpt_id >= b.ckpt_id {
-                (a, 1)
-            } else {
-                (b, 2)
-            }
+    // G7's shared selection, positional here unconditionally. A
+    // misplaced newer meta is never opened — no image is opened, so the
+    // walk reports the situation and offers no meta (O-3 (e) is then
+    // vacuous, exactly as the ruling's D17 clean arm expects).
+    let (meta, _slot) = match crate::store::page::select_meta(&m1, &m2, false) {
+        crate::store::page::MetaPick::Win { meta, slot } => (meta, slot),
+        crate::store::page::MetaPick::MisplacedNewer { .. } => {
+            return (
+                vec![Finding {
+                    slot: None,
+                    what: "no valid meta (G7: a misplaced valid meta outranks every placed one)"
+                        .into(),
+                }],
+                BTreeSet::new(),
+                None,
+            );
         }
-        (Ok(a), Err(())) => (a, 1),
-        (Err(()), Ok(b)) => (b, 2),
-        (Err(()), Err(())) => {
+        crate::store::page::MetaPick::NoValid => {
             return (
                 vec![Finding {
                     slot: Some(1),
@@ -2272,14 +2296,13 @@ pub fn read_opened_meta(disk: &SimDisk) -> (Option<crate::store::page::Meta>, ()
     };
     let m1 = disk.durable_read(pf, 4096, 4096);
     let m2 = disk.durable_read(pf, 8192, 4096);
-    let best = match (
-        crate::store::page::parse_meta(&m1),
-        crate::store::page::parse_meta(&m2),
-    ) {
-        (Ok(a), Ok(b)) => Some(if a.ckpt_id >= b.ckpt_id { a } else { b }),
-        (Ok(a), Err(())) => Some(a),
-        (Err(()), Ok(b)) => Some(b),
-        (Err(()), Err(())) => None,
+    // G7's shared selection, positional here unconditionally (the walk
+    // runs on disks whose recovery already succeeded, so `Win` is the
+    // expected case; a misplaced state yields None like the (i) walk).
+    let best = match crate::store::page::select_meta(&m1, &m2, false) {
+        crate::store::page::MetaPick::Win { meta, .. } => Some(meta),
+        crate::store::page::MetaPick::MisplacedNewer { fallback, .. } => fallback,
+        crate::store::page::MetaPick::NoValid => None,
     };
     (best, ())
 }

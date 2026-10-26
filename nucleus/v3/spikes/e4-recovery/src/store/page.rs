@@ -585,3 +585,90 @@ pub fn parse_page0(p: &[u8]) -> Result<(), ()> {
     }
     Ok(())
 }
+
+/// G7's meta selection (P's ruling on the round-3 F3, 2026-10-26): a
+/// meta is valid at open only if it also sits in its own slot,
+/// `1 + (ckpt_id mod 2)`; a misplaced valid meta newer than every
+/// placed-valid one is XX001 — never opened, never fallen back past
+/// (§2.2's no-fallback rationale: a valid meta j in the wrong slot
+/// proves meta j−1 was synced, and falling back past a synced meta is
+/// unsafe; only the rule keeps §2.2's torn-write guarantee under the
+/// misdirected-write fault class). A misplaced valid meta that does not
+/// outrank the placed-valid winner is a loser: ignored, never accepted,
+/// not XX001.
+///
+/// `skip_slot_check` is **META-WRONG-SLOT's single site**: the store's
+/// `open` passes it, so open alone falls back to "magic + CRC, highest
+/// `ckpt_id`" under the mutant; amcheck, the monitors and the harness
+/// walks select positionally always — the oracle's reference view must
+/// not move with the mutant (the lesson of R4).
+#[derive(Debug, Clone, Copy)]
+pub enum MetaPick {
+    /// The winning meta and the slot it was read from (its own slot,
+    /// under G7 — the accept site names the bytes actually used).
+    Win {
+        /// The winner.
+        meta: Meta,
+        /// The slot the winner was read from (1 or 2).
+        slot: u64,
+    },
+    /// Neither slot holds a placed-valid meta.
+    NoValid,
+    /// A misplaced valid meta (`meta`, read at `slot`) outranks every
+    /// placed-valid one: XX001 at open. `fallback` is the placed-valid
+    /// winner, if any — the durable image the disk actually offers to
+    /// the walks that need one; `open` ignores it and fails.
+    MisplacedNewer {
+        /// The misplaced meta.
+        meta: Meta,
+        /// The slot it was read from.
+        slot: u64,
+        /// The placed-valid winner, if any.
+        fallback: Option<Meta>,
+    },
+}
+
+/// Select the opened meta per G7 from the two slots' bytes.
+pub fn select_meta(b1: &[u8], b2: &[u8], skip_slot_check: bool) -> MetaPick {
+    let p1 = parse_meta(b1).ok();
+    let p2 = parse_meta(b2).ok();
+    let placed = |m: &Meta, slot: u64| skip_slot_check || 1 + (m.ckpt_id % 2) == slot;
+    let cand1 = p1.filter(|m| placed(m, 1));
+    let cand2 = p2.filter(|m| placed(m, 2));
+    // The winner: the highest ckpt_id among the placed-valid metas
+    // (slot 1 wins ties, as the draft's `>=` did).
+    let win = match (cand1, cand2) {
+        (Some(a), Some(b)) => {
+            if a.ckpt_id >= b.ckpt_id {
+                Some((a, 1))
+            } else {
+                Some((b, 2))
+            }
+        }
+        (Some(a), None) => Some((a, 1)),
+        (None, Some(b)) => Some((b, 2)),
+        (None, None) => None,
+    };
+    // The misplaced parse-ok metas (only when the positional test runs).
+    let misplaced = [
+        p1.filter(|m| !placed(m, 1)).map(|m| (m, 1u64)),
+        p2.filter(|m| !placed(m, 2)).map(|m| (m, 2u64)),
+    ];
+    let top_misplaced = misplaced
+        .into_iter()
+        .flatten()
+        .max_by_key(|(m, _)| m.ckpt_id);
+    match (win, top_misplaced) {
+        (Some((meta, slot)), None) => MetaPick::Win { meta, slot },
+        (Some((meta, slot)), Some((mm, _))) if mm.ckpt_id <= meta.ckpt_id => {
+            // The misplaced copy is a loser.
+            MetaPick::Win { meta, slot }
+        }
+        (w, Some((meta, slot))) => MetaPick::MisplacedNewer {
+            meta,
+            slot,
+            fallback: w.map(|(m, _)| m),
+        },
+        (None, None) => MetaPick::NoValid,
+    }
+}

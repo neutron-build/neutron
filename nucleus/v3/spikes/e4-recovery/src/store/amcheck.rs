@@ -47,18 +47,20 @@ pub fn amcheck<H: StoreHost>(cx: &Cx<'_, H>, cfg: &StoreCfg) -> Vec<Finding> {
     let m2 = cx
         .env()
         .read_at(pf, 2 * page::PAGE as u64, page::PAGE as u64);
+    // G7's shared selection, positional here unconditionally (the
+    // mutant's single site is the store's open).
     let (meta, meta_slot) = match (m1, m2) {
-        (Ok(a), Ok(b)) => match (page::parse_meta(&a).ok(), page::parse_meta(&b).ok()) {
-            (Some(x), Some(y)) => {
-                if x.ckpt_id >= y.ckpt_id {
-                    (x, 1)
-                } else {
-                    (y, 2)
-                }
+        (Ok(a), Ok(b)) => match page::select_meta(&a, &b, false) {
+            page::MetaPick::Win { meta, slot } => (meta, slot),
+            page::MetaPick::MisplacedNewer { slot, .. } => {
+                out.push(Finding {
+                    slot: Some(slot),
+                    what: "no valid meta (G7: a misplaced valid meta outranks every placed one)"
+                        .into(),
+                });
+                return out;
             }
-            (Some(x), None) => (x, 1),
-            (None, Some(y)) => (y, 2),
-            (None, None) => {
+            page::MetaPick::NoValid => {
                 out.push(Finding {
                     slot: Some(1),
                     what: "no valid meta".into(),
@@ -77,7 +79,7 @@ pub fn amcheck<H: StoreHost>(cx: &Cx<'_, H>, cfg: &StoreCfg) -> Vec<Finding> {
     // Meta bounds.
     if meta.gc_w > meta.t {
         out.push(Finding {
-            slot: Some(meta_slot as u64),
+            slot: Some(meta_slot),
             what: "gc_w > T".into(),
         });
     }
@@ -227,7 +229,7 @@ pub fn amcheck<H: StoreHost>(cx: &Cx<'_, H>, cfg: &StoreCfg) -> Vec<Finding> {
     }
     if meta.next_lpid <= flat.keys().copied().max().unwrap_or(0) {
         out.push(Finding {
-            slot: Some(meta_slot as u64),
+            slot: Some(meta_slot),
             what: "next_lpid not above every mapped lpid".into(),
         });
     }
@@ -235,7 +237,7 @@ pub fn amcheck<H: StoreHost>(cx: &Cx<'_, H>, cfg: &StoreCfg) -> Vec<Finding> {
         && m >= meta.slot_count
     {
         out.push(Finding {
-            slot: Some(meta_slot as u64),
+            slot: Some(meta_slot),
             what: "slot_count below a referenced slot".into(),
         });
     }

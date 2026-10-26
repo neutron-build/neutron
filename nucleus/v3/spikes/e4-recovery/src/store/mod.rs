@@ -118,6 +118,13 @@ pub enum Mutant {
     TruncateLogicalOnly,
     /// G3: a missing start segment is treated as an empty WAL.
     StartSegmentMissingOk,
+    /// G7 (P's ruling on the round-3 F3, 2026-10-26): the store's open
+    /// drops the positional meta-slot test, falling back to "magic +
+    /// CRC, highest `ckpt_id`" — a misplaced valid newer meta is opened
+    /// from the tainted landing slot instead of XX001. The single site
+    /// is `open`'s call to [`page::select_meta`]; amcheck, the monitors
+    /// and the harness walks keep the check unconditionally.
+    MetaWrongSlot,
 }
 
 /// Store configuration (card 3.3–3.4 with the Work 12 amendment, 4.1).

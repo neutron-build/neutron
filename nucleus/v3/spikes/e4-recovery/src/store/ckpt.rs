@@ -218,19 +218,30 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
         .env()
         .read_at(page_file, 2 * page::PAGE as u64, page::PAGE as u64)
         .map_err(Fail::Sim)?;
-    let c1 = page::parse_meta(&m1).ok();
-    let c2 = page::parse_meta(&m2).ok();
-    let best = match (c1, c2) {
-        (Some(a), Some(b)) => Some(if a.ckpt_id >= b.ckpt_id { a } else { b }),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    // G7 (P's ruling on the round-3 F3): one shared selection helper,
+    // positional at every site; META-WRONG-SLOT skips the positional
+    // test **here only** — the oracle's reference view (amcheck, the
+    // monitors, the harness walks) never moves with the mutant.
+    let skip_slot = matches!(cfg.mutant, Some(Mutant::MetaWrongSlot));
+    let (meta, chosen_slot) = match page::select_meta(&m1, &m2, skip_slot) {
+        page::MetaPick::Win { meta, slot } => (meta, slot),
+        page::MetaPick::NoValid => {
+            return Err(Fail::Corrupt("no valid meta".into()));
+        }
+        page::MetaPick::MisplacedNewer { .. } => {
+            // Before any meta bytes are accepted (the detection site is
+            // `open`): a misplaced valid meta outranking every
+            // placed-valid one is a misdirected write — never opened,
+            // never fallen back past (§2.2's no-fallback rationale).
+            return Err(Fail::Corrupt(
+                "misplaced newer meta (G7: a valid meta sits in the wrong slot)".into(),
+            ));
+        }
     };
-    let Some(meta) = best else {
-        return Err(Fail::Corrupt("no valid meta".into()));
-    };
-    // The accept hook: the meta chosen at open (card 1.4), not the loser.
-    let chosen_slot = 1 + (meta.ckpt_id % 2);
+    // The accept hook: the slot the winner **was read from** — the bytes
+    // actually used (card 1.4). Under G7 that is the winner's own slot;
+    // under META-WRONG-SLOT it can be the misplaced copy's slot, and the
+    // serve the hook records is then the true one.
     cx.env()
         .accepted(
             page_file,

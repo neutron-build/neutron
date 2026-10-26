@@ -48,6 +48,18 @@ fn put(i: u64, v: u64) -> Op {
     }
 }
 
+/// P's F4 ruling (2026-10-26): an `o1` error is acceptable in a D17
+/// cell only when its message is one of the read-failed forms — an
+/// XX001 that surfaced through O-1's own reads (X-5c's pre-registered
+/// X5-R6 case). Any other O-1 failure (a real scan mismatch) is silent
+/// damage and fails the test.
+fn is_read_failed(o1: &Result<u64, String>) -> bool {
+    matches!(o1, Err(m)
+        if m.starts_with("O-1(b): scan read failed")
+            || m.starts_with("O-1(c): raw read failed")
+            || m.starts_with("O-1(d): scan read failed"))
+}
+
 /// A put with an explicit value length (D7's record-length padding).
 fn putv(i: u64, v: u8, n: usize) -> Op {
     Op::Put {
@@ -2045,7 +2057,7 @@ fn d17_integrity() {
         clean.detections, clean.o1, clean.o3_fail
     );
     assert!(
-        clean.detections.contains(&"open") || clean.o1.is_err(),
+        clean.detections.contains(&"open") || is_read_failed(&clean.o1),
         "D17 clean: the torn map leaf must be detected (det={:?}, o1={:?})",
         clean.detections,
         clean.o1
@@ -2081,7 +2093,7 @@ fn d17_integrity() {
     for single in [Mutant::EpochSkip, Mutant::IdSkip] {
         let s = run17(Some(single), torn.clone());
         assert!(
-            s.detections.contains(&"open") || s.o1.is_err(),
+            s.detections.contains(&"open") || is_read_failed(&s.o1),
             "D17 {single:?}: the single site is not load-bearing — the detection must still fire (det={:?})",
             s.detections
         );
@@ -2095,9 +2107,11 @@ fn d17_integrity() {
     };
     let l = run17(None, lost);
     assert!(
-        (l.detections.contains(&"open") || l.o1.is_err())
-            && !l.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
-        "D17 LOST map leaf: detected, never served (det={:?}, o3={:?})",
+        l.pass
+            && (l.detections.contains(&"open") || is_read_failed(&l.o1) || !l.amcheck_i.is_empty())
+            && !l.o3_fail.as_deref().unwrap_or("").contains("O-3(a)")
+            && !l.served,
+        "D17 LOST map leaf: detected, never served, passing (det={:?}, o3={:?})",
         l.detections,
         l.o3_fail
     );
@@ -2109,9 +2123,11 @@ fn d17_integrity() {
     };
     let d = run17(None, mis);
     assert!(
-        (d.detections.contains(&"open") || d.o1.is_err())
-            && !d.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
-        "D17 MISDIRECTED map leaf: detected, never served (det={:?}, o3={:?})",
+        d.pass
+            && (d.detections.contains(&"open") || is_read_failed(&d.o1) || !d.amcheck_i.is_empty())
+            && !d.o3_fail.as_deref().unwrap_or("").contains("O-3(a)")
+            && !d.served,
+        "D17 MISDIRECTED map leaf: detected, never served, passing (det={:?}, o3={:?})",
         d.detections,
         d.o3_fail
     );
@@ -2330,138 +2346,195 @@ fn d17_integrity() {
     //   asserts nothing verdict-shaped.
     // ----
     {
-        let cell = |target: Cell| {
-            // Build the fault from the crashed disk of a faultless base
-            // round (the same schedule prefix, so the same bytes).
-            let (disk, st) = harness::create_store(cfg254(None), 2016, 7).expect("create");
-            let b = harness::run_round(
-                2016,
-                0,
-                &script,
-                &faults(FaultClass::C, knobs(0, 0)),
-                cfg254(None),
-                disk,
-                st,
-                &Model::new(),
-                0,
-                None,
-            );
-            let pf = b
-                .crashed_disk
-                .stat(e4_recovery::sim::PAGE_FILE)
-                .expect("pf");
-            let (_f, _s, meta) = harness::durable_image(&b.crashed_disk, &cfg254(None));
-            let meta = meta.expect("meta");
-            let (off, bytes, pre) = match target {
-                Cell::Leaf => {
-                    // Any referenced tree leaf's durable write.
-                    let w = b
-                        .crashed_disk
-                        .dwrites_of(pf)
-                        .iter()
-                        .rev()
-                        .find(|w| {
-                            w.off.is_multiple_of(4096)
-                                && w.bytes.len() == 4096
-                                && e4_recovery::store::page::header_kind(&w.bytes)
-                                    == e4_recovery::store::page::KIND_LEAF
-                                && w.off > 3 * 4096
-                        })
-                        .cloned()
-                        .expect("a tree leaf write");
-                    (w.off, w.bytes, w.pre)
-                }
-                // The freeset root's and the newest meta's own writes:
-                // their whole content lives in sector 0 (the bitmap and
-                // the refs fit in the first 512 B at this scale), so the
-                // tear reverts sector 0.
-                Cell::Freeset | Cell::Meta => {
-                    let at = if let Cell::Meta = target {
-                        (1 + (meta.ckpt_id % 2)) * 4096
-                    } else {
-                        meta.free_root.slot * 4096
-                    };
-                    let w = b
-                        .crashed_disk
-                        .dwrites_of(pf)
-                        .iter()
-                        .rev()
-                        .find(|w| w.off == at && w.bytes.len() == 4096)
-                        .cloned()
-                        .unwrap_or_else(|| panic!("a write at {at}"));
-                    let bytes = b.crashed_disk.durable_read(pf, at, 4096);
-                    let pre = if w.pre.is_empty() {
-                        bytes.clone()
-                    } else {
-                        w.pre
-                    };
-                    (at, bytes, pre)
-                }
-            };
-            // A sector the write actually changed (a tear onto unchanged
-            // bytes is a no-op): leaves differ in their cell sectors at
-            // the page end, the freeset root and the meta in sector 0.
-            let mut sector = off;
-            for s in 0..8u64 {
-                let (a, b) = (
-                    bytes.get((s * 512) as usize..(s * 512 + 512) as usize),
-                    pre.get((s * 512) as usize..(s * 512 + 512) as usize),
+        let cell =
+            |target: Cell| -> (e4_recovery::sim::MediaFault, e4_recovery::store::page::Meta) {
+                // Build the fault from the crashed disk of a faultless base
+                // round (the same schedule prefix, so the same bytes).
+                let (disk, st) = harness::create_store(cfg254(None), 2016, 7).expect("create");
+                let b = harness::run_round(
+                    2016,
+                    0,
+                    &script,
+                    &faults(FaultClass::C, knobs(0, 0)),
+                    cfg254(None),
+                    disk,
+                    st,
+                    &Model::new(),
+                    0,
+                    None,
                 );
-                if a.is_some_and(|a| b.is_some_and(|b| a != b)) {
-                    sector = off + s * 512;
-                    break;
+                let pf = b
+                    .crashed_disk
+                    .stat(e4_recovery::sim::PAGE_FILE)
+                    .expect("pf");
+                let (_f, _s, meta) = harness::durable_image(&b.crashed_disk, &cfg254(None));
+                let meta = meta.expect("meta");
+                let (off, bytes, pre) = match target {
+                    Cell::Leaf => {
+                        // Any referenced tree leaf's durable write.
+                        let w = b
+                            .crashed_disk
+                            .dwrites_of(pf)
+                            .iter()
+                            .rev()
+                            .find(|w| {
+                                w.off.is_multiple_of(4096)
+                                    && w.bytes.len() == 4096
+                                    && e4_recovery::store::page::header_kind(&w.bytes)
+                                        == e4_recovery::store::page::KIND_LEAF
+                                    && w.off > 3 * 4096
+                            })
+                            .cloned()
+                            .expect("a tree leaf write");
+                        (w.off, w.bytes, w.pre)
+                    }
+                    // The freeset root's and the newest meta's own writes:
+                    // their whole content lives in sector 0 (the bitmap and
+                    // the refs fit in the first 512 B at this scale), so the
+                    // tear reverts sector 0.
+                    Cell::Freeset | Cell::Meta => {
+                        let at = if let Cell::Meta = target {
+                            (1 + (meta.ckpt_id % 2)) * 4096
+                        } else {
+                            meta.free_root.slot * 4096
+                        };
+                        let w = b
+                            .crashed_disk
+                            .dwrites_of(pf)
+                            .iter()
+                            .rev()
+                            .find(|w| w.off == at && w.bytes.len() == 4096)
+                            .cloned()
+                            .unwrap_or_else(|| panic!("a write at {at}"));
+                        let bytes = b.crashed_disk.durable_read(pf, at, 4096);
+                        let pre = if w.pre.is_empty() {
+                            bytes.clone()
+                        } else {
+                            w.pre
+                        };
+                        (at, bytes, pre)
+                    }
+                };
+                // A sector the write actually changed (a tear onto unchanged
+                // bytes is a no-op): leaves differ in their cell sectors at
+                // the page end, the freeset root and the meta in sector 0.
+                let mut sector = off;
+                for s in 0..8u64 {
+                    let (a, b) = (
+                        bytes.get((s * 512) as usize..(s * 512 + 512) as usize),
+                        pre.get((s * 512) as usize..(s * 512 + 512) as usize),
+                    );
+                    if a.is_some_and(|a| b.is_some_and(|b| a != b)) {
+                        sector = off + s * 512;
+                        break;
+                    }
                 }
-            }
-            e4_recovery::sim::MediaFault {
-                inode: pf,
-                off,
-                len: 4096,
-                bytes: bytes.clone(),
-                pre,
-                kind: e4_recovery::sim::MediaKind::Torn {
-                    sectors: vec![sector],
-                },
-            }
-        };
+                (
+                    e4_recovery::sim::MediaFault {
+                        inode: pf,
+                        off,
+                        len: 4096,
+                        bytes: bytes.clone(),
+                        pre,
+                        kind: e4_recovery::sim::MediaKind::Torn {
+                            sectors: vec![sector],
+                        },
+                    },
+                    meta,
+                )
+            };
         for target in [Cell::Leaf, Cell::Freeset, Cell::Meta] {
             for kind in [Kind::Lost, Kind::Torn, Kind::Misdirected] {
-                let mut fault = cell(target);
-                fault.kind = match kind {
-                    Kind::Lost => e4_recovery::sim::MediaKind::Lost,
-                    Kind::Torn => e4_recovery::sim::MediaKind::Torn {
+                let (mut fault, base_meta) = cell(target);
+                fault.kind = match (target, kind) {
+                    // F3's G7 catching shape (P's ruling, 2026-10-26):
+                    // the plant lands on the **twin** meta slot — a
+                    // valid copy of the newest meta, misplaced there by
+                    // the fault, destroying the synced older meta the
+                    // twin held.
+                    (Cell::Meta, Kind::Misdirected) => {
+                        assert!(
+                            base_meta.ckpt_id >= 2,
+                            "D17 meta Misdirected: the base's newest meta must be ≥ 2 so the twin holds a synced older meta (k={})",
+                            base_meta.ckpt_id
+                        );
+                        e4_recovery::sim::MediaKind::Misdirected {
+                            to_off: (1 + ((base_meta.ckpt_id + 1) % 2)) * 4096,
+                        }
+                    }
+                    (Cell::Meta, Kind::Torn) => e4_recovery::sim::MediaKind::Torn {
                         sectors: vec![fault.off],
                     },
-                    Kind::Misdirected => e4_recovery::sim::MediaKind::Misdirected {
+                    (_, Kind::Lost) => e4_recovery::sim::MediaKind::Lost,
+                    (_, Kind::Torn) => e4_recovery::sim::MediaKind::Torn {
+                        sectors: vec![fault.off],
+                    },
+                    (_, Kind::Misdirected) => e4_recovery::sim::MediaKind::Misdirected {
                         to_off: fault.off + 4096,
                     },
                 };
-                let r = run17(None, fault);
                 match (target, kind) {
-                    // The two ruling cells (card Notes, X-5c's open
-                    // question): recovery `Ok` + an extraction XX001 +
-                    // O-1 (b) "scan read failed" + O-3 (d). Only the
-                    // ruling-independent halves are asserted.
+                    // The two R6 cells (P's F4 ruling; X-5c's
+                    // pre-registered X5-R6): recovery returned `Ok`, the
+                    // extraction's scan hit the faulted page (an XX001
+                    // that surfaced through O-1's own reads — hence the
+                    // read-failed message), and the frozen oracle's
+                    // strict reading fails the round through O-3 (d).
+                    // Whether that reading is right is X-5c's to rule:
+                    // assert neither `pass` nor `!pass`, only the
+                    // reading-independent facts.
                     (Cell::Leaf, Kind::Lost) | (Cell::Leaf, Kind::Torn) => {
+                        let r = run17(None, fault);
+                        assert!(
+                            r.end_store.is_some(),
+                            "D17 leaf {kind:?}: the R6 case needs a recovered-Ok round (o1={:?})",
+                            r.o1
+                        );
+                        assert!(
+                            is_read_failed(&r.o1),
+                            "D17 leaf {kind:?}: the o1 error must be a read-failed form — anything else is silent damage (o1={:?})",
+                            r.o1
+                        );
                         assert!(
                             !r.served && r.task_error.is_none(),
-                            "D17 leaf {kind:?}: never served, no harness defect (served={}, te={:?}, o1={:?}, o3={:?})",
+                            "D17 leaf {kind:?}: never served, no harness defect (served={}, te={:?})",
                             r.served,
-                            r.task_error,
-                            r.o1,
-                            r.o3_fail
+                            r.task_error
+                        );
+                        println!(
+                            "D17 [R6] leaf {kind:?}: o1={:?} o3={:?} pass={} (X-5c's X5-R6)",
+                            r.o1, r.o3_fail, r.pass
                         );
                     }
-                    // F3 (the gate's spec silence, ESCALATE to P): a
-                    // valid copy of the newest meta planted on the twin
-                    // slot through the fault's tainted landing range.
-                    // Measured: open takes it and O-3 (a) fails the
-                    // round (served) — **asserted nowhere**; P rules on
-                    // §2.2 (positional meta check) or the oracle.
+                    // G7's catching test (the F3 ruling): clean — the
+                    // misplaced newer meta is XX001 at open, never
+                    // served, never fallen back past; mutant
+                    // META-WRONG-SLOT (the positional test off at the
+                    // store's open only) — the misplaced copy is opened
+                    // from the tainted landing slot and served: O-3 (a)
+                    // fails the round.
                     (Cell::Meta, Kind::Misdirected) => {
+                        let r = run17(None, fault.clone());
                         assert!(
-                            r.task_error.is_none(),
-                            "D17 meta Misdirected: no harness defect (te={:?})",
-                            r.task_error
+                            r.pass
+                                && r.detections.contains(&"open")
+                                && !r.served
+                                && r.task_error.is_none(),
+                            "D17 meta Misdirected clean (G7): the misplaced newer meta must be XX001 at open, never served, the round passing (pass={}, det={:?}, served={}, o3={:?})",
+                            r.pass,
+                            r.detections,
+                            r.served,
+                            r.o3_fail
+                        );
+                        let m = run17(Some(Mutant::MetaWrongSlot), fault);
+                        assert!(
+                            !m.pass
+                                && m.served
+                                && m.o3_fail.as_deref().unwrap_or("").starts_with("O-3(a)"),
+                            "D17 META-WRONG-SLOT: the misplaced copy must be opened from the tainted landing slot and served (pass={}, served={}, o3={:?})",
+                            m.pass,
+                            m.served,
+                            m.o3_fail
                         );
                     }
                     // A correct rollback: the older meta opens, nothing
@@ -2469,6 +2542,7 @@ fn d17_integrity() {
                     // script the base is clean, so these cells mean what
                     // they say).
                     (Cell::Meta, _) => {
+                        let r = run17(None, fault);
                         assert!(
                             r.pass && !r.served && r.meta_rollback,
                             "D17 meta {kind:?}: the rollback round must pass (pass={}, served={}, rb={}, o1={:?}, o3={:?})",
@@ -2481,10 +2555,13 @@ fn d17_integrity() {
                     }
                     // Detections at open, never served: the round passes.
                     _ => {
+                        let r = run17(None, fault);
                         assert!(
                             r.pass
                                 && !r.served
-                                && (r.detections.contains(&"open") || !r.amcheck_i.is_empty()),
+                                && (r.detections.contains(&"open")
+                                    || is_read_failed(&r.o1)
+                                    || !r.amcheck_i.is_empty()),
                             "D17 {target:?} {kind:?}: detected, never served, passing (pass={}, served={}, det={:?}, am_i={}, o1={:?}, o3={:?})",
                             r.pass,
                             r.served,

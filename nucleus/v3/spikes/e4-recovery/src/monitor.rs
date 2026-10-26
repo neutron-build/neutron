@@ -297,11 +297,13 @@ fn durable_meta_now(durable: &[u8]) -> Option<page::Meta> {
         }
         v
     };
-    match (page::parse_meta(&read(1)), page::parse_meta(&read(2))) {
-        (Ok(a), Ok(b)) => Some(if a.ckpt_id >= b.ckpt_id { a } else { b }),
-        (Ok(a), Err(())) => Some(a),
-        (Err(()), Ok(b)) => Some(b),
-        (Err(()), Err(())) => None,
+    // G7's shared selection, positional here unconditionally: a
+    // misplaced newer meta is never followed — the shadow's durable
+    // image is the placed-valid fallback, if any.
+    match page::select_meta(&read(1), &read(2), false) {
+        page::MetaPick::Win { meta, .. } => Some(meta),
+        page::MetaPick::MisplacedNewer { fallback, .. } => fallback,
+        page::MetaPick::NoValid => None,
     }
 }
 
