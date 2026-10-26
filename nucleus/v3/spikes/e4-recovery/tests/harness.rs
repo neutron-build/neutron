@@ -32,6 +32,7 @@ fn round_faults() -> RoundFaults {
         class: FaultClass::C,
         knobs: drop_all(),
         directed: Vec::new(),
+        no_r_taint: false,
     }
 }
 

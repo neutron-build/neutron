@@ -36,6 +36,7 @@ fn faults(class: FaultClass, k: FaultKnobs) -> RoundFaults {
         class,
         knobs: k,
         directed: Vec::new(),
+        no_r_taint: false,
     }
 }
 
@@ -790,6 +791,7 @@ fn d10_lost_meta() {
             class: FaultClass::Mp,
             knobs: knobs(0, 0),
             directed: vec![fault.clone()],
+            no_r_taint: false,
         },
         cfg(None),
         disk,
@@ -819,6 +821,7 @@ fn d10_lost_meta() {
             class: FaultClass::Mp,
             knobs: knobs(0, 0),
             directed: vec![fault],
+            no_r_taint: false,
         },
         Some(Mutant::StartSegmentMissingOk),
     );
@@ -832,29 +835,35 @@ fn d10_lost_meta() {
 
 /// D10b (X5-R5's R and its R-taint, card Work 14): a rollback whose
 /// reused slots the exception must excuse.
-/// 1. One chunked load (the image spans ~90 pages), then three forced
-///    checkpoints with **no traffic between them**: k=1 images the load;
+/// 1. One chunked load (the image spans ~90 pages), then two forced
+///    checkpoints with **no traffic between them**: k=1 images the load,
 ///    k=2 rewrites the free set to fresh slots and its step 6 frees
-///    meta 1's free-set pages; k=3 crashes at After3 — its free set
-///    lands on exactly those freed slots (same bit bases, epoch 0), and
-///    the start segment of meta 1 is not recycled, so G3 does not fire.
+///    meta 1's free-set pages. A small SyncOn commit between k=2 and k=3
+///    allocates its split pages on exactly those freed slots (the
+///    lowest free) — epoch-stamped tree pages where meta 1's radix
+///    embeds epoch-0 free-set refs, so §3.3 rejects every reuse (the
+///    N1 rework: with no traffic at all, image 3's free set reuses the
+///    slots with **byte-identical** bitmaps — physically addressed
+///    pages stamp epoch 0 and positional ids, so the reuse passed §3.3
+///    and the clean arm served). k=3 crashes at After3; the start
+///    segment of meta 1 is not recycled, so G3 does not fire.
 /// 2. A directed LOST fault on meta 2's durable write makes open select
 ///    meta 1 — a meta rollback.
 /// 3. Clean: amcheck (i) reports the reused slots, the harness puts
 ///    them in `R`, O-3 (e) passes, and no reused slot is ever accepted.
-/// 4. REFCRC-SKIP: **UNCAUGHT in this shape, reported not asserted** —
-///    the arm needs the reuse to pair a slot with a page of the *same*
-///    radix position and epoch, but the store's allocation order (step
-///    2's data phase and the evictor take the lowest freed slots before
-///    the map phase) always hands them a page of another position
-///    (verified by inspection: meta 1's base-640 slot holds image 3's
-///    base-0 inner — id 0 ≠ 640 — so §3.3's check (3) fires alongside
-///    (2) and the mutant cannot produce a serve here). The mutant's
-///    directed catcher is D17's second half (a stale same-LPID
-///    same-epoch version planted on the referenced slot); this arm
-///    stays as the X5-R5-specific probe (the R-taint's positive case),
-///    whose catcher is the campaign's Q14 rounds. The arm below
-///    documents the observed outcome without asserting it a pass.
+/// 4. ID-SKIP+REFCRC (the card's paired mutant): with checks (2) and
+///    (3) off, a reused slot's page passes what is left — the accept is
+///    a **serve through the R-taint** (X5-R5: every slot in R counts as
+///    tainted from open until the store next writes it), O-3 (a) fails
+///    the round (the gate's N5: this refutes the run-1 "UNCAUGHT-
+///    directed" claim for the R-taint's wiring). REFCRC-SKIP alone
+///    stays a detection (the id check (3) fires on the reused tree
+///    pages) — the mutant's directed catcher is D17's second half.
+/// 5. The R-taint wiring pin (the gate's G5, call-site level): the same
+///    ID-SKIP+REFCRC round with the R-taint forced off (`no_r_taint`)
+///    **passes silently** — the serve goes unjudged. With the wiring in,
+///    the same round fails O-3 (a); the two arms together pin the call
+///    site (`r_taint_window_semantics` pins the function).
 #[test]
 fn d10b_rollback_exception() {
     let load: Vec<Op> = (0..1600u64)
@@ -880,6 +889,20 @@ fn d10b_rollback_exception() {
         ScriptOp::WaitVisible(2),
         ScriptOp::Checkpoint,
         ScriptOp::Checkpoint,
+        // The inter-image traffic (step 1): its split pages take the
+        // freed free-set slots, so the reuse pairs epoch-stamped tree
+        // pages with meta 1's epoch-0 free-set refs.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..20u64)
+                .map(|i| Op::Put {
+                    tree: 2,
+                    key: (5000 + i).to_be_bytes().to_vec(),
+                    value: vec![7u8; 400],
+                })
+                .collect(),
+        },
+        ScriptOp::WaitVisible(3),
         ScriptOp::Checkpoint,
         ScriptOp::Yields(3),
     ];
@@ -921,24 +944,28 @@ fn d10b_rollback_exception() {
         pre: w.pre.clone(),
         kind: e4_recovery::sim::MediaKind::Lost,
     };
-    let mut twin = Vec::new();
-    let (disk, st) = harness::create_store(cfg(None), 2020, 7).expect("create");
-    let clean = harness::run_round(
-        2020,
-        0,
-        &script,
-        &RoundFaults {
-            class: FaultClass::Mp,
-            knobs: knobs(0, 0),
-            directed: vec![fault.clone()],
-        },
-        cfg(None),
-        disk,
-        st,
-        &Model::new(),
-        0,
-        Some(&mut twin),
-    );
+    let mk = |m: Option<Mutant>, no_r_taint: bool| {
+        let (disk, st) = harness::create_store(cfg(m), 2020, 7).expect("create");
+        let mut twin = Vec::new();
+        harness::run_round(
+            2020,
+            0,
+            &script,
+            &RoundFaults {
+                class: FaultClass::Mp,
+                knobs: knobs(0, 0),
+                directed: vec![fault.clone()],
+                no_r_taint,
+            },
+            cfg(m),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            Some(&mut twin),
+        )
+    };
+    let clean = mk(None, false);
     assert!(clean.meta_rollback, "D10b: the opened meta is a rollback");
     assert!(
         !clean.rollback_slots.is_empty(),
@@ -949,9 +976,10 @@ fn d10b_rollback_exception() {
     // O-3 (e) verdict enforces it; assert it held and the named slots
     // really are the reused ones.
     assert!(
-        clean.o3_fail.is_none(),
-        "D10b clean: O-3 must pass with the exception (o3={:?})",
-        clean.o3_fail
+        clean.pass && clean.o3_fail.is_none(),
+        "D10b clean: the round must pass with the exception (o3={:?}, te={:?})",
+        clean.o3_fail,
+        clean.task_error
     );
     for f in &clean.amcheck_i {
         if let Some(slot) = f.slot {
@@ -965,34 +993,48 @@ fn d10b_rollback_exception() {
     // No reused slot was ever accepted: the serve flag never rises (the
     // reused pages fail §3.3 before any accept).
     assert!(
-        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)") && !clean.served,
+        !clean.served,
         "D10b clean: no reused slot may be served (o3={:?}, served={})",
-        clean.o3_fail,
-        clean.served
+        clean.o3_fail, clean.served
     );
     assert!(
         clean.detections.contains(&"open"),
         "D10b clean: the reused free-set pages give XX001 at open (det={:?})",
         clean.detections
     );
-    // Arm 4 (REFCRC-SKIP): observed UNCAUGHT in this shape — see the
-    // doc comment (the reuse never pairs same radix position + epoch;
-    // D17's second half is the mutant's directed catcher). The run must
-    // stay a detection (never a silent pass), which is all this
-    // asserts.
-    let m = run(
-        2020,
-        &script,
-        &RoundFaults {
-            class: FaultClass::Mp,
-            knobs: knobs(0, 0),
-            directed: vec![fault],
-        },
-        Some(Mutant::RefCrcSkip),
-    );
+    // Arm 4 (REFCRC-SKIP alone): the id check (3) still fires on every
+    // reused tree page — the round stays a detection and **never a
+    // serve** (the run-1 argument, confirmed by the gate's N5; an MP
+    // round with a legal detection passes — what is pinned is that the
+    // mutant cannot slip the reuse past the remaining checks).
+    let refcrc = mk(Some(Mutant::RefCrcSkip), false);
     assert!(
-        !m.pass || m.detections.contains(&"open") || m.o3_fail.is_some(),
-        "D10b REFCRC-SKIP: the round may not silently pass clean"
+        refcrc.detections.contains(&"open") && !refcrc.served,
+        "D10b REFCRC-SKIP: a detection, never served (det={:?}, served={}, o3={:?})",
+        refcrc.detections,
+        refcrc.served,
+        refcrc.o3_fail
+    );
+    // Arm 5 (ID-SKIP+REFCRC): the reused slot's page passes the
+    // disabled checks, the accept is a serve through the R-taint, and
+    // O-3 (a) fails the round (the gate's N5 refutation).
+    let idref = mk(Some(Mutant::IdSkipRefCrc), false);
+    assert!(
+        !idref.pass && idref.served,
+        "D10b ID-SKIP+REFCRC: the reused slot must be served via the R-taint (pass={}, served={}, o3={:?})",
+        idref.pass,
+        idref.served,
+        idref.o3_fail
+    );
+    // Arm 6 (the R-taint wiring pin, the gate's G5 at the call site):
+    // the same round with the R-taint forced off passes silently — the
+    // serve goes unjudged, which is exactly what the wiring exists to
+    // prevent.
+    let silent = mk(Some(Mutant::IdSkipRefCrc), true);
+    assert!(
+        silent.pass,
+        "D10b G5 pin: without the R-taint the served corruption must pass silently (pass={}, o3={:?})",
+        silent.pass, silent.o3_fail
     );
 }
 
@@ -1404,6 +1446,94 @@ fn d14_monitors() {
     assert!(clean.o1.is_ok(), "D14 clean O-1: {:?}", clean.o1);
 }
 
+/// N1 regression (the gate's 2026-10-26 round-2 verdict, finding 1): the
+/// free set's own allocations can grow the file past the frozen
+/// `slot_count`; §13 step 2's sizing note makes the checkpointer
+/// recompute the page count after the growth and allocate the difference,
+/// so the meta's `slot_count` covers every free-set slot it references.
+/// The defect's shape (the verdict's): 60 puts with 200-byte values, then
+/// SyncOff overwrites, a checkpoint every 3 commits, crash at After5 or
+/// After6 of checkpoint 0 — clean class-C rounds whose amcheck (i)
+/// reported "slot_count below a referenced slot" in 7 of 8 seeds at every
+/// `R_EPOCH`. With the convergence loop, every seed is clean and passes.
+#[test]
+fn freeset_growth_covers_its_own_slots() {
+    let big = |i: u64, v: u8| Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; 200],
+    };
+    for r_epoch in [1usize, 2, 4] {
+        for hook in [CkptHook::After5, CkptHook::After6] {
+            for seed in 2100u64..2108 {
+                let ops = vec![
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![
+                            Op::CreateTree { tree: 2 },
+                            Op::CreateTree { tree: CATALOG },
+                            publish(2),
+                        ],
+                    },
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: (0..60).map(|i| big(i, 1)).collect(),
+                    },
+                    // SyncOff overwrites: the evictions and the step-2
+                    // writes churn the file while the periodic
+                    // checkpoint images it.
+                    ScriptOp::Commit {
+                        sync_on: false,
+                        ops: (0..60).map(|i| big(i, 2)).collect(),
+                    },
+                    ScriptOp::Yields(1),
+                ];
+                let script = Script {
+                    tasks: vec![ScriptTask { ops }],
+                    writer: true,
+                    evictor: true,
+                    checkpointer_every: Some(3),
+                    crash: Some(CrashSpec::Hook {
+                        ckpt_index: 0,
+                        hook,
+                    }),
+                    nested: Vec::new(),
+                };
+                let c = StoreCfg {
+                    map_leaf_cap: 8,
+                    freeset_leaf_bits: 128,
+                    pool_frames: 16,
+                    r_epoch,
+                    mutant: None,
+                };
+                let (disk, st) = harness::create_store(c.clone(), seed, 7).expect("create");
+                let out = harness::run_round(
+                    seed,
+                    0,
+                    &script,
+                    &faults(FaultClass::C, knobs(0, 0)),
+                    c,
+                    disk,
+                    st,
+                    &Model::new(),
+                    0,
+                    None,
+                );
+                assert!(
+                    out.pass && out.o2_fail.is_none() && out.amcheck_i.is_empty(),
+                    "N1 r_epoch={r_epoch} {hook:?} seed={seed}: pass={} o2={:?} amcheck_i={:?} o1={:?} o3={:?} te={:?}",
+                    out.pass,
+                    out.o2_fail,
+                    out.amcheck_i,
+                    out.o1,
+                    out.o3_fail,
+                    out.task_error
+                );
+            }
+        }
+    }
+}
+
 /// D15 (DropTree): a multi-level tree dropped after its catalog row is
 /// deleted; the crash lands right after the drop transaction, recovery
 /// replays it, and amcheck's LPID exactness holds. Mutant DROP-ROOT-FIRST
@@ -1648,6 +1778,7 @@ fn d17_integrity() {
                 class: FaultClass::Mp,
                 knobs: knobs(0, 0),
                 directed: vec![fault],
+                no_r_taint: false,
             },
             cfg254(mutant),
             disk,
@@ -1914,6 +2045,7 @@ fn d17_integrity() {
                 class: FaultClass::Mp,
                 knobs: knobs(0, 0),
                 directed: vec![f],
+                no_r_taint: false,
             },
             cfg254(mutant),
             disk,

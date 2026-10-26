@@ -1124,6 +1124,12 @@ pub struct RoundFaults {
     /// Directed media faults applied after F-CRASH (empty for random
     /// draws; X-5c's generator draws them itself).
     pub directed: Vec<DirectedFault>,
+    /// Instrumentation-removal knob (the gate's round-2 G5, call-site
+    /// level): force X5-R5's R-taint to report nothing. D10b's arm 6
+    /// pins it — with the wiring in, a reused slot accepted through
+    /// image k−1's stale reference fails O-3 (a); forced off, the same
+    /// round passes silently. The campaign runs with it off (false).
+    pub no_r_taint: bool,
 }
 
 /// Run one round: workload → crash → faults → recovery (nested crashes)
@@ -1370,7 +1376,7 @@ pub fn run_round(
             // included; the events walk of [`r_taint_of`]).
             {
                 let g = world.lock();
-                let r_taint = r_taint_of(&g.disk.events, pf, &rollback_slots);
+                let r_taint = !faults.no_r_taint && r_taint_of(&g.disk.events, pf, &rollback_slots);
                 let workload_served = {
                     let g2 = sched.lock();
                     !g2.disk.served.is_empty()
@@ -1391,7 +1397,11 @@ pub fn run_round(
             // round without one fails closed in the oracle, as X-5a
             // round 1 ruled).
             let twin_ref = twin.as_ref().map(|_| &twin_info);
-            let verdict = check_round(
+            // The oracle check on the recovered image (the card's Work
+            // 13 order: extraction, oracle, harness checkpoint). The
+            // (ii) fields are unset in this pass — G4's harness
+            // checkpoint has not run yet.
+            let first = check_round(
                 &model,
                 faults.class,
                 c_prev,
@@ -1402,15 +1412,60 @@ pub fn run_round(
                 &mut sample_rng,
                 &OracleCfg::default(),
             );
-            // The harness checkpoint (O-2 (ii) and the next round's
-            // base), then amcheck (ii).
+            let _ = first;
+            // The harness checkpoint (G4: after the oracle check; it
+            // supplies O-2 (ii) and the next round's base), then
+            // amcheck (ii) — **fed into the verdict** (the gate's N2:
+            // the draft computed them after `check_round` and never set
+            // `Extracted.amcheck_ii`, so O-2 (ii) and the (ii) half of
+            // O-3 (e) were skipped for every round). A checkpoint that
+            // fails without a crash is a loud round failure, never a
+            // silent skip.
             let ck = ckpt::checkpoint(&cx, &mut |_| Ok(()));
+            if let Err(e) = &ck {
+                cx.with("h:ck2fail", |c| {
+                    let h = c.h();
+                    if h.task_error.is_none() {
+                        h.task_error = Some(format!("harness checkpoint failed: {e:?}"));
+                    }
+                    Ok(())
+                })
+                .ok();
+            }
             let findings_ii = amcheck::amcheck(&cx, &cfg);
             let (end_disk2, end_store) = {
                 let g = world.lock();
                 (g.disk.clone(), g.st.clone())
             };
-            let _ = ck;
+            // The (ii) image's referenced and tainted slots, from the
+            // durable bytes (the same walk as the (i) point).
+            let (ii_findings, image_slots_ii, _meta_ii) = durable_image(&end_disk2, &cfg);
+            let _ = ii_findings;
+            let tainted_slots_ii: BTreeSet<u64> = image_slots_ii
+                .iter()
+                .copied()
+                .filter(|s| end_disk2.range_tainted(pf, s * 4096, 4096))
+                .collect();
+            ex.amcheck_ii = findings_ii.clone();
+            ex.amcheck_ii_ran = ck.is_ok();
+            ex.image_slots_ii = image_slots_ii;
+            ex.tainted_image_slots_ii = tainted_slots_ii;
+            // The final verdict: the same extraction plus the (ii)
+            // fields, judged by the frozen oracle (a fresh sample rng,
+            // seeded identically — determinism is per schedule, not per
+            // call).
+            let mut sample_rng2 = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
+            let verdict = check_round(
+                &model,
+                faults.class,
+                c_prev,
+                &ex,
+                &mut reader,
+                &media_targets,
+                twin_ref,
+                &mut sample_rng2,
+                &OracleCfg::default(),
+            );
             outcome.o1 = verdict.o1.clone();
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
@@ -1458,7 +1513,7 @@ pub fn run_round(
                     let g2 = sched.lock();
                     !g2.disk.served.is_empty()
                         || !recovery_served.is_empty()
-                        || r_taint_of(&recovery_events, pf, &rollback_slots)
+                        || (!faults.no_r_taint && r_taint_of(&recovery_events, pf, &rollback_slots))
                 },
                 amcheck_i: amcheck_i.clone(),
                 amcheck_i_ran: meta_i.is_some(),

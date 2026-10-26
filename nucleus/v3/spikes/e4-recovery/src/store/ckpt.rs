@@ -662,6 +662,28 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         // cannot unpin or redirect an embedded ref. The table stays set
         // through steps 3–5 (the durable set reads it) and is cleared
         // by the post-5 resolution.
+        //
+        // Drain eviction latches first (the gate's N1 round-2 shape): a
+        // frame latched mid-eviction at the snapshot instant makes
+        // `img_entry` fall back to `cur` — the **pre-eviction home**,
+        // whose content is an older version of the page — while the
+        // eviction's own write and `record_image_at` land in `map.img`
+        // only after the snapshot, invisible to the frozen table. The
+        // image then references the stale home and loses every
+        // mutation between the two versions. Every eviction finishes
+        // in bounded steps (its write path never parks indefinitely),
+        // and between the last drain check and the freeze step there
+        // is no yield — the baton is held — so no new latch can
+        // appear.
+        loop {
+            let busy = cx.with("ckpt:freezewait", |c| {
+                Ok(c.store().pool.frames.iter().any(|f| f.evicting))
+            })?;
+            if !busy {
+                break;
+            }
+            cx.wait_for(crate::sim::WaitKey::Pin)?;
+        }
         cx.with("ckpt:freeze", |c| {
             prims::freeze_image(c.store());
             Ok(())
@@ -789,12 +811,22 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
 /// the snapshot (its epoch-k content was frozen at the mutation's first
 /// touch) is written for the image only — the current home does not adopt
 /// it (§13 step 2).
+///
+/// The scan is a **fixpoint loop** (the gate's N1 round-2 shape): a
+/// first-touch epoch copy can be installed into a reserve frame — which
+/// sit at the *low* indices — after the scan has already passed them,
+/// leaving its `CopyPending` unresolved; the freeze would then map the
+/// LPID to nothing and the image would lose the page outright. Each pass
+/// that writes something triggers one re-scan; every frame is written at
+/// most once (written frames go clean, and each LPID freezes at most one
+/// copy), so the repetition ends.
 fn ckpt_step2_data<H: StoreHost>(
     cx: &Cx<'_, H>,
     hooks: &mut Hooks<'_>,
     k: u64,
 ) -> Result<(), Fail> {
     let mut idx = 0usize;
+    let mut wrote_any = false;
     loop {
         let target = cx.with("ckpt2:scan", |c| {
             let st = c.store();
@@ -814,17 +846,46 @@ fn ckpt_step2_data<H: StoreHost>(
             Ok(None)
         })?;
         let Some((i, key, bytes)) = target else {
-            return Ok(());
+            if !wrote_any {
+                // A full pass wrote nothing: no late copy arrived behind
+                // the scan cursor. Done.
+                return Ok(());
+            }
+            // Re-scan from the start: the writes above may have raced
+            // first-touch copies the pass had already walked past.
+            idx = 0;
+            wrote_any = false;
+            continue;
         };
+        wrote_any = true;
         let r = prims::write_fresh(cx, &bytes)?;
         cx.with("ckpt2:record", |c| {
             let st = c.store();
-            let is_copy = st
+            // Work 11 rule 1 (re-validation after a yield): the write
+            // happened across yields (`write_fresh` parks), and the
+            // frame may no longer hold the scanned bytes — evicted
+            // (cleared, or reloaded), or mutated to content epoch
+            // `k+1` by a concurrent apply. The write is then an
+            // orphaned old version: recording it as the image ref
+            // would overwrite the correct state (a previous-epoch
+            // eviction's `Img::At` of the very same bytes, or a
+            // first-touch epoch copy) with stale bytes — the fetch
+            // bug's sibling, caught by the same N1 shape. Skip it: the
+            // image state for this LPID is owned elsewhere.
+            let still = st
                 .pool
                 .frames
                 .get(i)
-                .map(|f| f.is_epoch_copy)
+                .map(|f| {
+                    f.key == key
+                        && f.dirty
+                        && !f.evicting
+                        && (f.is_epoch_copy || f.epoch <= k as u32)
+                })
                 .unwrap_or(false);
+            if !still {
+                return Ok(());
+            }
             // Any image state for this LPID (a CopyPending freeze or an
             // `Img::At` a previous-epoch eviction recorded during the
             // window, §5.2) means the image's content is pinned
@@ -835,16 +896,24 @@ fn ckpt_step2_data<H: StoreHost>(
             // that overwrote a live page — prototype deviation fixed
             // in B5).
             let pinned = st.map.img.contains_key(&key);
-            if is_copy || pinned {
+            if pinned
+                || st
+                    .pool
+                    .frames
+                    .get(i)
+                    .map(|f| f.is_epoch_copy)
+                    .unwrap_or(false)
+            {
                 st.map.img.insert(key, Img::At(r));
                 st.slots.image_refs.insert(r.slot);
-            } else if st
-                .pool
-                .frames
-                .get(i)
-                .map(|f| f.key == key && f.dirty && f.epoch <= k as u32)
-                .unwrap_or(false)
-            {
+                // The frame's content is now durable at `r` (recorded
+                // for the image): clear it so the fixpoint re-scan
+                // treats the frame as written (each frame writes at
+                // most once).
+                if let Some(f) = st.pool.frames.get_mut(i) {
+                    f.dirty = false;
+                }
+            } else {
                 let old = st.map.cur.insert(key, r);
                 if let Some(old) = old {
                     prims::unpin_home(st, old.slot);
@@ -1002,21 +1071,45 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
     })?;
     let mut used = frozen_used;
     // Allocate the free-set pages with the convergence loop (§13 step
-    // 2's sizing note): after growth, recompute and allocate the
-    // difference.
+    // 2's sizing note): the bitmap span depends only on `slot_count`
+    // and `next_lpid`, so when the allocation grows the file, the page
+    // count is recomputed after the growth and the difference
+    // allocated, until the span covers every slot the free set itself
+    // references. Without this, the meta records a `slot_count` below
+    // the free-set slots it references (the gate's N1: amcheck's
+    // "slot_count below a referenced slot" on clean rounds). The
+    // convergence holds because each pass places at least
+    // `g − extra > 0` outstanding pages (§13's argument: growth adds
+    // `g ≥ 16` slots while covering them needs under `g/1000` pages at
+    // 4 KiB), so the repetition ends. The span also covers any growth
+    // by the map phase above (its pages are in `used`; a slot image k
+    // does not reference is correctly free in image k's bitmap,
+    // I-FREE-EXACT).
     let mut fs_slots: Vec<u64> = Vec::new();
     let fan = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-    let slot_count = frozen_sc;
-    let total_bits = (slot_count - 3) + img_next_lpid;
-    let mut pages = total_bits.div_ceil(leaf_bits);
-    let mut lvl = total_bits.div_ceil(leaf_bits);
-    while lvl > 1 {
-        lvl = lvl.div_ceil(fan);
-        pages += lvl;
-    }
-    while (fs_slots.len() as u64) < pages {
-        let s = prims::alloc_slot(cx)?;
-        fs_slots.push(s);
+    let mut slot_count = frozen_sc;
+    let mut grew = false;
+    loop {
+        let total_bits = (slot_count - 3) + img_next_lpid;
+        let mut pages = total_bits.div_ceil(leaf_bits);
+        let mut lvl = total_bits.div_ceil(leaf_bits);
+        while lvl > 1 {
+            lvl = lvl.div_ceil(fan);
+            pages += lvl;
+        }
+        while (fs_slots.len() as u64) < pages {
+            let s = prims::alloc_slot(cx)?;
+            fs_slots.push(s);
+        }
+        let live = cx.with("fs:live", |c| Ok(c.store().slots.slot_count))?;
+        if live <= slot_count {
+            break;
+        }
+        // The allocation grew the file (§4.5): the bitmap must cover
+        // the new span too — recompute and allocate the difference
+        // (§13's convergence re-check).
+        slot_count = live;
+        grew = true;
     }
     cx.with("fs:building", |c| {
         let st = c.store();
@@ -1025,12 +1118,11 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
         }
         Ok(())
     })?;
-    let sc2 = cx.with("fs:sc2", |c| Ok(c.store().slots.slot_count))?;
-    if sc2 > slot_count {
-        // The file grew (an fs allocation above the frozen span): mark it
-        // (Q17); the frozen bitmap span is unchanged — the growth's own
-        // accounting belongs to the next image (post 5 keeps the live
-        // counter).
+    if grew {
+        // The free set's own allocations (or the map phase's above it)
+        // grew the file past the frozen span (Q17): the growth's own
+        // accounting beyond the converged span belongs to the next
+        // image (post 5 keeps the live counter).
         cx.with("fs:grew", |c| {
             c.store().freeset_grew = true;
             Ok(())

@@ -471,6 +471,10 @@ enum FetchStep {
     NeedFrame,
     /// Load from `Ref`.
     Load(Ref),
+    /// The carried load's ref was superseded (the home moved while the
+    /// read was in flight): the bytes are discarded; the loop re-loads
+    /// from the current home.
+    Stale,
 }
 
 /// Find or load the frame of `lpid`, pinning it (§5.4). Loads go through
@@ -488,8 +492,8 @@ pub fn fetch_page<H: StoreHost>(
         let step = cx.with("fetch_page", |c| {
             let st = c.store();
             st.alive()?;
-            let normal = st.normal_frames_mut();
-            if let Some(f) = normal
+            if let Some(f) = st
+                .normal_frames_mut()
                 .iter_mut()
                 .find(|f| f.key == lpid && !f.is_epoch_copy && !f.evicting)
             {
@@ -497,13 +501,33 @@ pub fn fetch_page<H: StoreHost>(
                 f.refed = true;
                 return Ok(FetchStep::Hit(f.bytes.clone(), f.epoch));
             }
-            if normal.iter().any(|f| f.key == lpid && f.evicting) {
+            if st
+                .normal_frames()
+                .iter()
+                .any(|f| f.key == lpid && f.evicting)
+            {
                 return Ok(FetchStep::WaitEvict);
             }
             if let Some((r, bytes)) = loaded.take() {
+                // Work 11 rule 1 (re-validation after a yield): the
+                // home may have moved while these bytes were in
+                // flight — a dirty eviction (the evictor's, or this
+                // fetch's own `NeedFrame` eviction) writes the frame
+                // to a fresh slot and updates `cur`, superseding `r`.
+                // The carried bytes are then an old version of the
+                // page; installing them would silently drop every
+                // mutation between the two versions (the gate's N1
+                // shape lost an entry this way: the fetch's own
+                // eviction of the just-mutated frame, then the stale
+                // load's install). Discard them and re-load from the
+                // current home.
+                if st.map.cur.get(&lpid).copied() != Some(r) {
+                    return Ok(FetchStep::Stale);
+                }
                 // Install the previously loaded bytes (they passed §3.3
                 // against `r` when read).
-                if let Some(f) = normal
+                if let Some(f) = st
+                    .normal_frames_mut()
                     .iter_mut()
                     .find(|f| f.key == 0 && !f.is_epoch_copy && !f.evicting)
                 {
@@ -518,7 +542,11 @@ pub fn fetch_page<H: StoreHost>(
                 loaded = Some((r, bytes));
                 return Ok(FetchStep::NeedFrame);
             }
-            if !normal.iter().any(|f| f.key == 0 && !f.is_epoch_copy) {
+            if !st
+                .normal_frames()
+                .iter()
+                .any(|f| f.key == 0 && !f.is_epoch_copy)
+            {
                 return Ok(FetchStep::NeedFrame);
             }
             match st.map.cur.get(&lpid).copied() {
@@ -554,6 +582,9 @@ pub fn fetch_page<H: StoreHost>(
                     .map_err(Fail::Sim)?;
                 loaded = Some((r, bytes));
             }
+            // `loaded` was taken and discarded: loop (the head re-derives
+            // — a frame for `lpid`, or a fresh `Load` of the new home).
+            FetchStep::Stale => {}
         }
     }
 }
@@ -886,7 +917,8 @@ pub fn evict_one<H: StoreHost>(cx: &Cx<'_, H>, inside_op: bool) -> Result<bool, 
                 None => Some(write_fresh(cx, &bytes)?),
             }
         } else {
-            Some(write_fresh(cx, &bytes)?)
+            let wr = write_fresh(cx, &bytes)?;
+            Some(wr)
         }
     };
     // Finish: move the home, record previous-epoch victims in the image
