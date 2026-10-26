@@ -1,168 +1,136 @@
 package graph
 
+// Identity-stability machinery for the consumer's identity contract
+// (docs/identity-stability.md in the lullmail repo, §3 and Phase 4): a
+// verified mailbox key and a batched Exchange-ID translator, plus the
+// opt-in immutable-ID preference that makes the translator necessary.
+//
+// These are additional methods on Adapter, deliberately NOT part of
+// mail.Adapter: they are Graph-only capabilities a host probes for with a
+// type assertion — the same optional-capability shape as the engine's
+// IdentityReplaceStore (mail/hooks.go). The other three providers have no
+// equivalent, and the interface must keep compiling for adapters that
+// never grow one.
+
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/neutron-build/neutron/mail"
 )
 
-// NewWithIdentityFormat is for a resolver that read the durable account policy.
-// Never pass immutable mode based on credential presence or a global default.
-func NewWithIdentityFormat(hc *http.Client, format string) (*Adapter, error) {
-	if format != mail.GraphLegacyIDs && format != mail.GraphImmutableIDs {
-		return nil, errors.New("graph: invalid identity format")
-	}
-	a := newAdapter(hc)
-	clone := *a.http
-	base := clone.Transport
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	clone.Transport = identityTransport{base: base, format: format}
-	previous := clone.CheckRedirect
-	clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return errors.New("graph: too many redirects")
-		}
-		if _, err := graphEndpoint(baseURL, req.URL.String()); err != nil {
-			return err
-		}
-		if previous != nil {
-			return previous(req, via)
-		}
-		return nil
-	}
-	a.http = &clone
-	a.identityFormat = format
-	return a, nil
-}
-func (a *Adapter) GraphIdentityFormat() string {
-	if a.identityFormat == "" {
-		return mail.GraphLegacyIDs
-	}
-	return a.identityFormat
-}
-
-// WithIdentityPreference restricts the authenticated client to the Graph API
-// origin/path and merges Prefer. Do not use it for preauthenticated upload URLs.
-func WithIdentityPreference(base http.RoundTripper, format string) (http.RoundTripper, error) {
-	if format != mail.GraphLegacyIDs && format != mail.GraphImmutableIDs {
-		return nil, errors.New("graph: invalid identity format")
-	}
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	return identityTransport{base: base, format: format}, nil
-}
-
-type identityTransport struct {
-	base   http.RoundTripper
-	format string
-}
-
-func (t identityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if _, err := graphEndpoint(baseURL, req.URL.String()); err != nil {
-		return nil, err
-	}
-	copy := req.Clone(req.Context())
-	copy.Header = req.Header.Clone()
-	var preferences []string
-	for _, line := range copy.Header.Values("Prefer") {
-		for _, value := range strings.Split(line, ",") {
-			if value = strings.TrimSpace(value); value != "" && !strings.HasPrefix(strings.ToLower(value), "idtype=") {
-				preferences = append(preferences, value)
-			}
-		}
-	}
-	if t.format == mail.GraphImmutableIDs {
-		preferences = append(preferences, `IdType="ImmutableId"`)
-	}
-	copy.Header.Del("Prefer")
-	if len(preferences) > 0 {
-		copy.Header.Set("Prefer", strings.Join(preferences, ", "))
-	}
-	return t.base.RoundTrip(copy)
-}
-
+// GraphMailboxKey returns the raw /me id of the mailbox this adapter is
+// authenticated to — the verified mailbox key of the identity contract.
+// An email-derived key is not a mailbox identity (the address can be
+// reassigned), so binding verification asks the provider, authenticated,
+// to name the mailbox itself. A missing or empty id is an error: callers
+// refuse to bind on anything less.
 func (a *Adapter) GraphMailboxKey(ctx context.Context) (string, error) {
-	var result struct {
+	var out struct {
 		ID string `json:"id"`
 	}
-	if err := a.get(ctx, "/me?$select=id", &result); err != nil {
+	if err := a.get(ctx, "/me?$select=id", &out); err != nil {
 		return "", err
 	}
-	if result.ID == "" {
-		return "", errors.New("graph: missing authenticated mailbox ID")
+	if out.ID == "" {
+		return "", errors.New("graph: /me carried no mailbox id")
 	}
-	return result.ID, nil
+	return out.ID, nil
 }
-func (a *Adapter) TranslateGraphIDs(ctx context.Context, ids []mail.MessageID) ([]mail.IdentityPair, error) {
-	if len(ids) < 1 || len(ids) > 1000 {
-		return nil, errors.New("graph: translation batch must contain 1..1000 IDs")
+
+// translateBatchLimit is Microsoft's documented ceiling for one
+// translateExchangeIds request: the inputIds collection has a "Maximum
+// size of this collection is 1,000 strings". Batching here keeps every
+// request this package issues bounded, the same discipline as
+// providerJSONLimit and the 100-page pagination caps.
+const translateBatchLimit = 1000
+
+// TranslateExchangeIds converts mutable Graph REST ids (restId) into
+// immutable ones (restImmutableEntryId) for the mailbox this adapter is
+// authenticated to, POSTing /me/translateExchangeIds in batches of at most
+// translateBatchLimit. The caller wraps each batch with its own /me
+// verification (GraphMailboxKey) — the adapter provides the translation;
+// the migration protocol lives in the consumer.
+//
+// Every id comes back or the call fails: a conversion Microsoft reports
+// as failed (a convertIdResult carrying errorDetails instead of a
+// targetId) surfaces as an error naming that id, as does an id the
+// response omits entirely. A silently dropped translation would strand
+// every retained product reference to it, which is the exact loss this
+// machinery exists to prevent. All ids must belong to one mailbox
+// (Microsoft requires it) — one adapter is bound to one mailbox.
+func (a *Adapter) TranslateExchangeIds(ctx context.Context, ids []string) (map[string]string, error) {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
 	}
-	inputs := make([]string, len(ids))
-	wanted := map[string]mail.MessageID{}
-	for i, id := range ids {
-		if !strings.HasPrefix(string(id), "n:graph:") || nativeID(id) == "" {
-			return nil, errors.New("graph: translation requires Graph native IDs")
+	for start := 0; start < len(ids); start += translateBatchLimit {
+		end := min(start+translateBatchLimit, len(ids))
+		if err := a.translateExchangeIdsBatch(ctx, ids[start:end], out); err != nil {
+			return nil, err
 		}
-		native := nativeID(id)
-		if _, exists := wanted[native]; exists {
-			return nil, errors.New("graph: duplicate translation input")
-		}
-		inputs[i] = native
-		wanted[native] = id
 	}
-	raw, err := json.Marshal(map[string]any{"inputIds": inputs, "sourceIdType": "restId", "targetIdType": "restImmutableEntryId"})
+	return out, nil
+}
+
+func (a *Adapter) translateExchangeIdsBatch(ctx context.Context, batch []string, out map[string]string) error {
+	raw, err := json.Marshal(struct {
+		InputIDs     []string `json:"inputIds"`
+		SourceIDType string   `json:"sourceIdType"`
+		TargetIDType string   `json:"targetIdType"`
+	}{
+		InputIDs:     batch,
+		SourceIDType: "restId",
+		TargetIDType: "restImmutableEntryId",
+	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	endpoint, err := graphEndpoint(baseURL, "/me/translateExchangeIds")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		baseURL+"/me/translateExchangeIds", strings.NewReader(string(raw)))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
-	}
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("graph: request: %w", err)
 	}
 	defer resp.Body.Close()
 	if err := statusError(resp); err != nil {
-		return nil, err
+		return err
 	}
-	var out struct {
+	var page struct {
 		Value []struct {
-			SourceID string          `json:"sourceId"`
-			TargetID string          `json:"targetId"`
-			Error    json.RawMessage `json:"errorDetails"`
+			SourceID string `json:"sourceId"`
+			TargetID string `json:"targetId"`
+			// ErrorDetails is present exactly when the conversion
+			// failed (convertIdResult); any decodes to nil for both
+			// an absent and a null property.
+			ErrorDetails any `json:"errorDetails"`
 		} `json:"value"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, providerJSONLimit)).Decode(&out); err != nil {
-		return nil, err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, providerJSONLimit)).Decode(&page); err != nil {
+		return fmt.Errorf("graph: decode: %w", err)
 	}
-	if len(out.Value) != len(ids) {
-		return nil, errors.New("graph: incomplete translation response")
-	}
-	targets := map[string]bool{}
-	pairs := make([]mail.IdentityPair, 0, len(ids))
-	for _, v := range out.Value {
-		old, ok := wanted[v.SourceID]
-		if !ok || v.TargetID == "" || targets[v.TargetID] || len(v.Error) > 0 && string(v.Error) != "null" {
-			return nil, errors.New("graph: missing, duplicate or failed translation")
+
+	translated := make(map[string]bool, len(batch))
+	for _, entry := range page.Value {
+		if entry.ErrorDetails != nil || entry.TargetID == "" {
+			return fmt.Errorf("graph: translateExchangeIds could not translate id %q", entry.SourceID)
 		}
-		pairs = append(pairs, mail.IdentityPair{OldID: old, NewID: mail.NativeMessageID(mail.ProviderGraph, v.TargetID)})
-		delete(wanted, v.SourceID)
-		targets[v.TargetID] = true
+		out[entry.SourceID] = entry.TargetID
+		translated[entry.SourceID] = true
 	}
-	return pairs, nil
+	for _, id := range batch {
+		if !translated[id] {
+			return fmt.Errorf("graph: translateExchangeIds returned no translation for id %q", id)
+		}
+	}
+	return nil
 }

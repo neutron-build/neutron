@@ -70,10 +70,7 @@ type MessageLocator interface {
 
 // PgStore is the Nucleus-backed Store.
 type PgStore struct {
-	pool               *pgxpool.Pool
-	remap              IdentityRemapper
-	beforeAccountWrite BeforeAccountWrite
-	graphInventory     GraphReferenceInventory
+	pool *pgxpool.Pool
 
 	// advOnce probes advisory-lock support once per store (see
 	// lockAccountTx); Nucleus over pgwire has no pg_advisory_* family.
@@ -129,14 +126,6 @@ func (s *PgStore) advisoryReady() bool {
 // SYNC-04). Transaction-scoped: it releases at commit or rollback, and a
 // backend without advisory support (Nucleus) skips it after one probe.
 func (s *PgStore) lockAccountTx(ctx context.Context, tx pgx.Tx, acct AccountID) error {
-	if s.remap != nil && s.beforeAccountWrite == nil {
-		return ErrIdentityTransactionRequired
-	}
-	if s.beforeAccountWrite != nil {
-		if err := s.beforeAccountWrite(ctx, tx, acct); err != nil {
-			return fmt.Errorf("mail: product write admission: %w", err)
-		}
-	}
 	if !s.advisoryReady() {
 		return nil
 	}
@@ -235,9 +224,6 @@ func (s *PgStore) PutMailboxes(ctx context.Context, acct AccountID, boxes []Mail
 	}
 	defer tx.Rollback(ctx)
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
-		return err
-	}
-	if err := s.mirrorWriteReadyTx(ctx, tx, acct); err != nil {
 		return err
 	}
 
@@ -387,9 +373,6 @@ func (s *PgStore) PutEnvelopes(ctx context.Context, acct AccountID, envs []Envel
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return err
 	}
-	if err := s.mirrorWriteReadyTx(ctx, tx, acct); err != nil {
-		return err
-	}
 	if err := putEnvelopesTx(ctx, tx, acct, envs); err != nil {
 		return err
 	}
@@ -404,13 +387,6 @@ func putEnvelopesTx(ctx context.Context, tx pgx.Tx, acct AccountID, envs []Envel
 		e := &envs[i]
 		if err := e.ID.Validate(); err != nil {
 			return err
-		}
-		var retired bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM mail_identity_aliases WHERE account_id=$1 AND old_id=$2)`, string(acct), string(e.ID)).Scan(&retired); err != nil {
-			return err
-		}
-		if retired {
-			return ErrIdentityMigrationPending
 		}
 		if e.Fingerprint == "" {
 			e.Fingerprint = ComputeFingerprint(e)
@@ -429,22 +405,23 @@ func putEnvelopesTx(ctx context.Context, tx pgx.Tx, acct AccountID, envs []Envel
 			`INSERT INTO mail_messages (
 				account_id, id, thread_id, fingerprint, subject,
 				sent_at, received_at, from_addrs, to_addrs, cc_addrs,
-				bcc_addrs, reply_to_addrs, keywords, has_attachment, size,
-				preview, message_id_header, in_reply_to, references_header, attachment_presence)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+				bcc_addrs, reply_to_addrs, keywords, attachment_state, size,
+				preview, message_id_header, in_reply_to, references_header)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
 			 ON CONFLICT (account_id, id) DO UPDATE SET
 			   thread_id = $3, fingerprint = $4, subject = $5,
 			   sent_at = $6, received_at = $7, from_addrs = $8, to_addrs = $9,
 			   cc_addrs = $10, bcc_addrs = $11, reply_to_addrs = $12,
 			   keywords = $13,
-               has_attachment = CASE WHEN $20 = 'unknown' THEN mail_messages.has_attachment ELSE $14 END,
-               attachment_presence = CASE WHEN $20 = 'unknown' THEN mail_messages.attachment_presence ELSE $20 END,
-               size = $15, preview = $16,
+			   -- Unknown (0) is a metadata fetch that never saw the part
+			   -- tree; it must not erase evidence a fuller fetch recorded.
+			   attachment_state = CASE WHEN $14 = 0 THEN mail_messages.attachment_state ELSE $14 END,
+			   size = $15, preview = $16,
 			   message_id_header = $17, in_reply_to = $18, references_header = $19`,
 			string(acct), string(e.ID), string(e.ThreadID), string(e.Fingerprint), e.Subject,
 			nullTime(e.SentAt), nullTime(e.ReceivedAt), string(from), string(to), string(cc),
-			string(bcc), string(replyTo), string(kw), envelopePresence(e) == AttachmentPresent, e.Size,
-			e.Preview, e.MessageIDHeader, string(inReplyTo), string(refs), string(envelopePresence(e)))
+			string(bcc), string(replyTo), string(kw), int16(e.Attachment), e.Size,
+			e.Preview, e.MessageIDHeader, string(inReplyTo), string(refs))
 		if err != nil {
 			return fmt.Errorf("mail: put envelope %s: %w", e.ID, err)
 		}
@@ -471,17 +448,18 @@ func putEnvelopesTx(ctx context.Context, tx pgx.Tx, acct AccountID, envs []Envel
 
 const envelopeColumns = `id, thread_id, fingerprint, subject, sent_at, received_at,
 	from_addrs, to_addrs, cc_addrs, bcc_addrs, reply_to_addrs, keywords,
-	has_attachment, size, preview, message_id_header, in_reply_to, references_header, attachment_presence`
+	attachment_state, size, preview, message_id_header, in_reply_to, references_header`
 
 func scanEnvelope(row pgx.Row) (*Envelope, error) {
 	var e Envelope
 	var threadID, fingerprint, subject, preview, msgIDHdr *string
 	var sentAt, receivedAt *time.Time
 	var from, to, cc, bcc, replyTo, kw, inReplyTo, refs *string
+	var attachmentState int16
 
 	err := row.Scan(&e.ID, &threadID, &fingerprint, &subject, &sentAt, &receivedAt,
 		&from, &to, &cc, &bcc, &replyTo, &kw,
-		&e.HasAttachment, &e.Size, &preview, &msgIDHdr, &inReplyTo, &refs, &e.AttachmentPresence)
+		&attachmentState, &e.Size, &preview, &msgIDHdr, &inReplyTo, &refs)
 	if err != nil {
 		return nil, err
 	}
@@ -497,6 +475,7 @@ func scanEnvelope(row pgx.Row) (*Envelope, error) {
 	e.Subject = deref(subject)
 	e.Preview = deref(preview)
 	e.MessageIDHeader = deref(msgIDHdr)
+	e.Attachment = AttachmentState(attachmentState)
 	if sentAt != nil {
 		e.SentAt = *sentAt
 	}
@@ -522,10 +501,6 @@ func scanEnvelope(row pgx.Row) (*Envelope, error) {
 }
 
 func (s *PgStore) Envelope(ctx context.Context, acct AccountID, id MessageID) (*Envelope, error) {
-	id, err := s.ResolveIdentity(ctx, acct, id)
-	if err != nil {
-		return nil, err
-	}
 	row := s.pool.QueryRow(ctx,
 		`SELECT `+envelopeColumns+` FROM mail_messages WHERE account_id = $1 AND id = $2`,
 		string(acct), string(id))
@@ -596,7 +571,17 @@ func (s *PgStore) DeleteMessages(ctx context.Context, acct AccountID, ids []Mess
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return err
 	}
+	if err := deleteMessagesTx(ctx, tx, acct, ids); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// deleteMessagesTx is the retire shared by the plain delete path and
+// identity replacement, so both remove rows with identical semantics
+// inside a caller-owned transaction. It is idempotent: an absent id
+// deletes nothing.
+func deleteMessagesTx(ctx context.Context, tx pgx.Tx, acct AccountID, ids []MessageID) error {
 	for _, id := range ids {
 		for _, stmt := range []string{
 			`DELETE FROM mail_message_mailboxes WHERE account_id = $1 AND message_id = $2`,
@@ -608,7 +593,7 @@ func (s *PgStore) DeleteMessages(ctx context.Context, acct AccountID, ids []Mess
 			}
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // RemoveFromMailbox drops mailbox membership without deleting the message.
@@ -664,11 +649,144 @@ func (s *PgStore) RemoveFromMailbox(ctx context.Context, acct AccountID, box Mai
 }
 
 // ---------------------------------------------------------------------------
+// Identity hooks (the identity contract; see hooks.go)
+// ---------------------------------------------------------------------------
+
+var _ IdentityReplaceStore = (*PgStore)(nil)
+var _ ReferenceAwareStore = (*PgStore)(nil)
+
+// ReplaceIdentities performs every identity replacement in ONE
+// transaction, in the order the identity contract fixes: advisory lock
+// first, then AdmitIdentityWrite, then every replacement envelope and
+// membership (plus body copies), then RemapIdentity with all pairs, then
+// the retire of the old identities. Any failure anywhere — a hook
+// included — rolls back everything, leaving the old record readable and
+// the unit retryable. Envelope upserts and old-id deletes are
+// idempotent, so a retry after a rollback converges. A nil hooks value
+// skips the callbacks; the writes and the retire still share the one
+// transaction.
+func (s *PgStore) ReplaceIdentities(ctx context.Context, acct AccountID, reps []IdentityReplacement, hooks IdentityHooks) error {
+	if len(reps) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("mail: replace identities: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
+		return err
+	}
+	hookTx := pgxHookTx{tx: tx}
+	if hooks != nil {
+		if err := hooks.AdmitIdentityWrite(ctx, hookTx, acct); err != nil {
+			return fmt.Errorf("mail: admit identity write: %w", err)
+		}
+	}
+
+	envs := make([]Envelope, len(reps))
+	var bodies []*Body
+	var pairs []IdentityPair
+	for i := range reps {
+		envs[i] = reps[i].Envelope
+		if reps[i].Body != nil {
+			bodies = append(bodies, reps[i].Body)
+		}
+		if reps[i].OldID != "" && reps[i].OldID != reps[i].Envelope.ID {
+			pairs = append(pairs, IdentityPair{OldID: reps[i].OldID, NewID: reps[i].Envelope.ID})
+		}
+	}
+	if err := putEnvelopesTx(ctx, tx, acct, envs); err != nil {
+		return err
+	}
+	for _, b := range bodies {
+		if err := putBodyTx(ctx, tx, acct, b); err != nil {
+			return err
+		}
+	}
+	if hooks != nil && len(pairs) > 0 {
+		if err := hooks.RemapIdentity(ctx, hookTx, acct, pairs); err != nil {
+			return fmt.Errorf("mail: remap identity: %w", err)
+		}
+	}
+
+	olds := make([]MessageID, 0, len(reps))
+	for i := range reps {
+		if reps[i].OldID != "" && reps[i].OldID != reps[i].Envelope.ID {
+			olds = append(olds, reps[i].OldID)
+		}
+	}
+	if err := deleteMessagesTx(ctx, tx, acct, olds); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// RemoveFromMailboxReferenced behaves as RemoveFromMailbox, but before
+// any last-membership message is deleted it calls ReferencesDropped with
+// exactly the ids that will lose their LAST membership — inside the same
+// transaction, after the advisory lock, with the rows still readable so
+// the product can snapshot them. A hook error aborts the whole unit:
+// memberships and messages stay exactly as they were. A nil hooks value
+// degrades to RemoveFromMailbox's semantics in this same transaction.
+func (s *PgStore) RemoveFromMailboxReferenced(ctx context.Context, acct AccountID, box MailboxID, ids []MessageID, hooks IdentityHooks) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("mail: remove from mailbox referenced: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
+		return err
+	}
+
+	var orphaned []MessageID
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM mail_message_mailboxes
+			  WHERE account_id = $1 AND message_id = $2 AND mailbox_id = $3`,
+			string(acct), string(id), string(box)); err != nil {
+			return fmt.Errorf("mail: unlink %s: %w", id, err)
+		}
+
+		var remaining int
+		if err := tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM mail_message_mailboxes
+			  WHERE account_id = $1 AND message_id = $2`,
+			string(acct), string(id)).Scan(&remaining); err != nil {
+			return fmt.Errorf("mail: count mailboxes for %s: %w", id, err)
+		}
+		if remaining == 0 {
+			orphaned = append(orphaned, id)
+		}
+	}
+
+	if hooks != nil && len(orphaned) > 0 {
+		if err := hooks.ReferencesDropped(ctx, pgxHookTx{tx: tx}, acct, orphaned); err != nil {
+			return fmt.Errorf("mail: references dropped: %w", err)
+		}
+	}
+
+	for _, id := range orphaned {
+		for _, stmt := range []string{
+			`DELETE FROM mail_bodies WHERE account_id = $1 AND message_id = $2`,
+			`DELETE FROM mail_messages WHERE account_id = $1 AND id = $2`,
+		} {
+			if _, err := tx.Exec(ctx, stmt, string(acct), string(id)); err != nil {
+				return fmt.Errorf("mail: delete orphan %s: %w", id, err)
+			}
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// ---------------------------------------------------------------------------
 // Bodies
 // ---------------------------------------------------------------------------
 
 func (s *PgStore) PutBody(ctx context.Context, acct AccountID, b *Body) error {
-	parts, _ := json.Marshal(b.Parts)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("mail: put body: %w", err)
@@ -677,9 +795,17 @@ func (s *PgStore) PutBody(ctx context.Context, acct AccountID, b *Body) error {
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return err
 	}
-	if err := s.mirrorWriteReadyTx(ctx, tx, acct); err != nil {
+	if err := putBodyTx(ctx, tx, acct, b); err != nil {
 		return err
 	}
+	return tx.Commit(ctx)
+}
+
+// putBodyTx is the body upsert shared by the lazy cache path and
+// identity replacement, so both write with identical semantics inside a
+// caller-owned transaction.
+func putBodyTx(ctx context.Context, tx pgx.Tx, acct AccountID, b *Body) error {
+	parts, _ := json.Marshal(b.Parts)
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO mail_bodies (account_id, message_id, text_body, html_body, parts, fetched_at)
 		 VALUES ($1, $2, $3, $4, $5, $6)
@@ -688,25 +814,26 @@ func (s *PgStore) PutBody(ctx context.Context, acct AccountID, b *Body) error {
 		string(acct), string(b.MessageID), b.Text, b.HTML, string(parts), time.Now().UTC()); err != nil {
 		return fmt.Errorf("mail: put body: %w", err)
 	}
-	// The complete body tree and its badge evidence publish together.
-	presence := AttachmentAbsent
-	if len(b.Attachments()) > 0 {
-		presence = AttachmentPresent
+	// A fetched body carries the part tree. Attachments found are proof of
+	// presence; none found resolves only an Unknown, never overruling a
+	// provider's own definitive flag.
+	if _, err := tx.Exec(ctx,
+		`UPDATE mail_messages SET attachment_state = CASE
+		   WHEN $3 THEN $4::smallint
+		   WHEN attachment_state = $5::smallint THEN $6::smallint
+		   ELSE attachment_state END
+		  WHERE account_id = $1 AND id = $2`,
+		string(acct), string(b.MessageID), len(b.Attachments()) > 0,
+		int16(AttachmentPresent), int16(AttachmentUnknown), int16(AttachmentAbsent)); err != nil {
+		return fmt.Errorf("mail: put body attachment state: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE mail_messages SET has_attachment = $3, attachment_presence = $4 WHERE account_id = $1 AND id = $2`, string(acct), string(b.MessageID), presence == AttachmentPresent, string(presence)); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s *PgStore) Body(ctx context.Context, acct AccountID, id MessageID) (*Body, error) {
-	id, err := s.ResolveIdentity(ctx, acct, id)
-	if err != nil {
-		return nil, err
-	}
 	var b Body
 	var text, html, parts *string
-	err = s.pool.QueryRow(ctx,
+	err := s.pool.QueryRow(ctx,
 		`SELECT text_body, html_body, parts FROM mail_bodies
 		  WHERE account_id = $1 AND message_id = $2`,
 		string(acct), string(id)).Scan(&text, &html, &parts)
@@ -735,10 +862,6 @@ func (s *PgStore) Body(ctx context.Context, acct AccountID, id MessageID) (*Body
 // ---------------------------------------------------------------------------
 
 func (s *PgStore) MessageMailboxes(ctx context.Context, acct AccountID, id MessageID) ([]MailboxID, error) {
-	id, err := s.ResolveIdentity(ctx, acct, id)
-	if err != nil {
-		return nil, err
-	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT mailbox_id FROM mail_message_mailboxes
 		  WHERE account_id = $1 AND message_id = $2 ORDER BY mailbox_id`,
@@ -782,18 +905,7 @@ func (s *PgStore) Cursor(ctx context.Context, acct AccountID, box MailboxID) (Cu
 }
 
 func (s *PgStore) PutCursor(ctx context.Context, acct AccountID, box MailboxID, cur Cursor) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
-		return err
-	}
-	if err := s.mirrorWriteReadyTx(ctx, tx, acct); err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx,
+	_, err := s.pool.Exec(ctx,
 		`INSERT INTO mail_sync_state (account_id, mailbox_id, cursor, synced_at)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (account_id, mailbox_id) DO UPDATE SET cursor = $3, synced_at = $4`,
@@ -801,7 +913,7 @@ func (s *PgStore) PutCursor(ctx context.Context, acct AccountID, box MailboxID, 
 	if err != nil {
 		return fmt.Errorf("mail: put cursor: %w", err)
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 // ResetMailbox discards every message and the cursor for one mailbox,
@@ -953,9 +1065,6 @@ func (s *PgStore) BeginScanGeneration(ctx context.Context, acct AccountID, box M
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return nil, err
 	}
-	if err := s.mirrorWriteReadyTx(ctx, tx, acct); err != nil {
-		return nil, err
-	}
 	for _, stmt := range []string{
 		`DELETE FROM mirror_scan_seen WHERE scan_id IN
 		   (SELECT id FROM mirror_scans WHERE account_id = $1 AND mailbox_id = $2)`,
@@ -1066,9 +1175,6 @@ func (s *PgStore) ApplyFinalScanPage(ctx context.Context, scan ScanID, envs []En
 }
 
 func (s *PgStore) applyScanPage(ctx context.Context, scan ScanID, envs []Envelope, seen, destroyed []MessageID, next Cursor, final bool) (int, error) {
-	return s.applyScanPageWithIdentities(ctx, scan, envs, nil, seen, destroyed, next, final)
-}
-func (s *PgStore) applyScanPageWithIdentities(ctx context.Context, scan ScanID, envs []Envelope, pairs []IdentityPair, seen, destroyed []MessageID, next Cursor, final bool) (int, error) {
 	var acct AccountID
 	var box MailboxID
 	if err := s.pool.QueryRow(ctx,
@@ -1088,9 +1194,6 @@ func (s *PgStore) applyScanPageWithIdentities(ctx context.Context, scan ScanID, 
 	if err := s.lockAccountTx(ctx, tx, acct); err != nil {
 		return 0, err
 	}
-	if err := s.mirrorWriteReadyTx(ctx, tx, acct); err != nil {
-		return 0, err
-	}
 
 	// The scope lookup precedes the account lock. A replacement scan may
 	// have won that lock first; reject this stale page before writing any
@@ -1105,7 +1208,7 @@ func (s *PgStore) applyScanPageWithIdentities(ctx context.Context, scan ScanID, 
 		return 0, ErrNoStore
 	}
 
-	if err := s.identityUpsertsTx(ctx, tx, acct, envs, pairs); err != nil {
+	if err := putEnvelopesTx(ctx, tx, acct, envs); err != nil {
 		return 0, err
 	}
 
@@ -1251,16 +1354,4 @@ func finishScanTx(ctx context.Context, tx pgx.Tx, acct AccountID, box MailboxID,
 	}
 
 	return pruned, nil
-}
-
-func envelopePresence(e *Envelope) AttachmentPresence {
-	if e.HasAttachment {
-		return AttachmentPresent
-	}
-	switch e.AttachmentPresence {
-	case AttachmentPresent, AttachmentAbsent:
-		return e.AttachmentPresence
-	default:
-		return AttachmentUnknown
-	}
 }

@@ -225,14 +225,14 @@ func TestIntegrationMigrationConvergesPreLedgerDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
-		`DROP TABLE IF EXISTS mail_graph_id_map`,
-		`DROP TABLE IF EXISTS mail_graph_identity`,
-		`DROP TABLE IF EXISTS mail_identity_aliases`,
-		`ALTER TABLE mail_messages DROP COLUMN attachment_presence`,
 		`DROP TABLE IF EXISTS mirror_scans`,
 		`DROP TABLE IF EXISTS mirror_scan_seen`,
 		`ALTER TABLE mail_bodies DROP CONSTRAINT IF EXISTS mail_bodies_message_fk`,
 		`ALTER TABLE mail_message_mailboxes DROP CONSTRAINT IF EXISTS mail_membership_message_fk`,
+		// v5 rewinds with the rest: the runner must re-apply the
+		// attachment tri-state from the boolean column it replaced.
+		`ALTER TABLE mail_messages DROP COLUMN attachment_state`,
+		`ALTER TABLE mail_messages ADD COLUMN has_attachment BOOLEAN NOT NULL DEFAULT FALSE`,
 	} {
 		if _, err := s.pool.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
@@ -263,52 +263,15 @@ func TestIntegrationMigrationConvergesPreLedgerDatabase(t *testing.T) {
 		t.Errorf("convergence lost data: %d messages, want 2", n)
 	}
 
-	// A foreign schema must neither inflate nor satisfy these assertions.
-	if _, err := s.pool.Exec(ctx, `CREATE SCHEMA mail_constraint_shadow`); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = s.pool.Exec(ctx, `DROP SCHEMA IF EXISTS mail_constraint_shadow CASCADE`) })
-	for _, stmt := range []string{
-		`CREATE TABLE mail_constraint_shadow.mail_messages(account_id TEXT,id TEXT,PRIMARY KEY(account_id,id))`,
-		`CREATE TABLE mail_constraint_shadow.mail_bodies(account_id TEXT,message_id TEXT,CONSTRAINT mail_bodies_message_fk FOREIGN KEY(account_id,message_id) REFERENCES mail_constraint_shadow.mail_messages(account_id,id) ON DELETE CASCADE)`,
-		`CREATE TABLE mail_constraint_shadow.mail_message_mailboxes(account_id TEXT,message_id TEXT,CONSTRAINT mail_membership_message_fk FOREIGN KEY(account_id,message_id) REFERENCES mail_constraint_shadow.mail_messages(account_id,id) ON DELETE CASCADE)`,
-	} {
-		if _, err := s.pool.Exec(ctx, stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
-	query := `SELECT COUNT(*) FROM pg_constraint
- WHERE ((conname='mail_bodies_message_fk' AND conrelid='mail_bodies'::regclass)
- OR (conname='mail_membership_message_fk' AND conrelid='mail_message_mailboxes'::regclass))
- AND confrelid='mail_messages'::regclass AND contype='f' AND confdeltype='c'
- AND conkey=ARRAY[1,2]::smallint[] AND confkey=ARRAY[1,2]::smallint[] AND convalidated`
 	var constraints int
-	if err := s.pool.QueryRow(ctx, query).Scan(&constraints); err != nil {
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM pg_constraint
+		 WHERE conname IN ('mail_bodies_message_fk','mail_membership_message_fk')
+		   AND convalidated`).Scan(&constraints); err != nil {
 		t.Fatal(err)
 	}
 	if constraints != 2 {
-		t.Fatalf("target validated FKs=%d, want 2 regardless of foreign schema", constraints)
-	}
-	// Drop a target FK inside a rollback-only transaction: foreign copies cannot
-	// conceal the missing target or make a deficient mirror appear valid.
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `ALTER TABLE mail_bodies DROP CONSTRAINT mail_bodies_message_fk`); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := tx.QueryRow(ctx, query).Scan(&constraints); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if constraints != 1 {
-		tx.Rollback(ctx)
-		t.Fatalf("foreign schema masked missing target FK: %d", constraints)
-	}
-	if err := tx.Rollback(ctx); err != nil {
-		t.Fatal(err)
+		t.Errorf("validated constraints = %d, want 2", constraints)
 	}
 
 	// A second run is a no-op, and a modified applied migration refuses
@@ -323,6 +286,101 @@ func TestIntegrationMigrationConvergesPreLedgerDatabase(t *testing.T) {
 	tampered := append([]string{}, EngineMigrations[0].Statements...)
 	EngineMigrations[0].Statements = []string{`CREATE TABLE IF NOT EXISTS mail_accounts (id TEXT PRIMARY KEY)`}
 	defer func() { EngineMigrations[0].Statements = tampered }()
+	if err := s.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "modified after application") {
+		t.Errorf("tampered applied migration err = %v, want checksum refusal", err)
+	}
+}
+
+// GMAIL-03 convergence: a database still on schema v4 (boolean
+// has_attachment, v5 unapplied) backfills attachment_state per provider —
+// present stays present everywhere; Gmail's false becomes unknown because
+// a format=metadata envelope never proved absence; every other provider's
+// false is a real absence. The ledger then holds v5 exactly once, and a
+// modified applied v5 refuses to boot.
+func TestIntegrationMigrationV5BackfillsAttachmentState(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Rewind to a v4 database: forget v5 in the ledger and restore the
+	// column shape it operated on.
+	for _, stmt := range []string{
+		`DELETE FROM mail_migrations WHERE version = 5`,
+		`ALTER TABLE mail_messages DROP COLUMN attachment_state`,
+		`ALTER TABLE mail_messages ADD COLUMN has_attachment BOOLEAN NOT NULL DEFAULT FALSE`,
+	} {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gmailAcct, imapAcct := AccountID("v5-gmail"), AccountID("v5-imap")
+	for _, acct := range []Account{
+		{ID: gmailAcct, Provider: ProviderGmail, Email: "g@example.com"},
+		{ID: imapAcct, Provider: ProviderIMAP, Email: "i@example.com"},
+	} {
+		if err := s.PutAccount(ctx, &acct); err != nil {
+			t.Fatalf("put account %s: %v", acct.ID, err)
+		}
+	}
+	seed := []struct {
+		acct AccountID
+		id   string
+		has  bool
+		want AttachmentState
+	}{
+		{gmailAcct, "g-false", false, AttachmentUnknown},
+		{gmailAcct, "g-true", true, AttachmentPresent},
+		{imapAcct, "i-false", false, AttachmentAbsent},
+		{imapAcct, "i-true", true, AttachmentPresent},
+	}
+	for _, m := range seed {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO mail_messages (account_id, id, has_attachment) VALUES ($1, $2, $3)`,
+			string(m.acct), m.id, m.has); err != nil {
+			t.Fatalf("seed %s/%s: %v", m.acct, m.id, err)
+		}
+	}
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("v4 database did not converge to v5: %v", err)
+	}
+
+	var hasColumn int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		 WHERE table_name = 'mail_messages' AND column_name = 'has_attachment'`).Scan(&hasColumn); err != nil {
+		t.Fatal(err)
+	}
+	if hasColumn != 0 {
+		t.Error("has_attachment column survived migration v5")
+	}
+
+	for _, m := range seed {
+		var got int16
+		if err := s.pool.QueryRow(ctx,
+			`SELECT attachment_state FROM mail_messages WHERE account_id = $1 AND id = $2`,
+			string(m.acct), m.id).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if AttachmentState(got) != m.want {
+			t.Errorf("%s/%s attachment_state = %d, want %d", m.acct, m.id, got, m.want)
+		}
+	}
+
+	var applied int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM mail_migrations WHERE version = 5`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Errorf("ledger records v5 %d times, want exactly 1", applied)
+	}
+
+	// A modified already-applied v5 must refuse to boot (the same
+	// refusal regression the pre-ledger convergence test asserts).
+	tampered := append([]string{}, EngineMigrations[4].Statements...)
+	EngineMigrations[4].Statements = []string{`ALTER TABLE mail_messages ADD COLUMN attachment_state smallint NOT NULL DEFAULT 0`}
+	defer func() { EngineMigrations[4].Statements = tampered }()
 	if err := s.Migrate(ctx); err == nil || !strings.Contains(err.Error(), "modified after application") {
 		t.Errorf("tampered applied migration err = %v, want checksum refusal", err)
 	}

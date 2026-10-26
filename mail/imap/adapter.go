@@ -351,11 +351,10 @@ func (a *Adapter) parseFetch(box mail.MailboxID, items token) (mail.Envelope, bo
 		}
 	}
 	if bs, ok := items.find("BODYSTRUCTURE"); ok {
-		env.HasAttachment = bodyStructureHasAttachment(bs)
-		env.AttachmentPresence = mail.AttachmentAbsent
-		if env.HasAttachment {
-			env.AttachmentPresence = mail.AttachmentPresent
-		}
+		// fetchItems always asks for BODYSTRUCTURE, so its answer is
+		// definitive: a walk that finds nothing is a proven absence,
+		// not an unseen part tree.
+		env.Attachment = mail.AttachmentFromBool(bodyStructureHasAttachment(bs))
 	}
 
 	if e, ok := items.find("ENVELOPE"); ok {

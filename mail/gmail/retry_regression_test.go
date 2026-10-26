@@ -51,11 +51,23 @@ func TestInitialPageRecoversOneMetadataThrottle(t *testing.T) {
 	fakeReadClock(ad)
 	page, err := ad.Sync(context.Background(), "INBOX", "")
 	if err != nil || page == nil {
-		t.Fatalf("metadata throttle discarded page: page=%v err=%v", page, err)
+		t.Fatalf("listing failed: page=%v err=%v", page, err)
 	}
-	if lists != 1 || gets["a"] != 1 || gets["b"] != 2 || len(page.Changes) != 2 || !page.More {
+	envs, err := ad.Envelopes(context.Background(), pageIDs(page))
+	if err != nil {
+		t.Fatalf("metadata throttle discarded page: %v", err)
+	}
+	if lists != 1 || gets["a"] != 1 || gets["b"] != 2 || len(envs) != 2 || !page.More {
 		t.Fatalf("page=%+v lists=%d gets=%v", page, lists, gets)
 	}
+}
+
+func pageIDs(page *mail.Changes) []mail.MessageID {
+	ids := make([]mail.MessageID, 0, len(page.Changes))
+	for _, c := range page.Changes {
+		ids = append(ids, c.ID)
+	}
+	return ids
 }
 
 func fakeReadClock(ad *Adapter) (*time.Time, *[]time.Duration) {
@@ -112,8 +124,12 @@ func TestRepeatedThrottleNeverReturnsIncompletePage(t *testing.T) {
 	})
 	for range 2 {
 		page, err := ad.Sync(context.Background(), "INBOX", "")
-		if page != nil || !errors.Is(err, mail.ErrRateLimited) {
-			t.Fatalf("incomplete page escaped: %+v / %v", page, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		envs, err := ad.Envelopes(context.Background(), pageIDs(page))
+		if envs != nil || !errors.Is(err, mail.ErrRateLimited) {
+			t.Fatalf("incomplete page escaped: %+v / %v", envs, err)
 		}
 	}
 	if lists != 2 || gets["a"] != 2 || gets["b"] != 6 {
@@ -150,6 +166,9 @@ func TestPacedInitialPageFitsThirtySecondBudget(t *testing.T) {
 	page, err := ad.Sync(ctx, "INBOX", "")
 	if err != nil || page == nil || len(page.Changes) != 100 || !page.More {
 		t.Fatalf("bounded page failed budget: %+v %v", page, err)
+	}
+	if envs, err := ad.Envelopes(ctx, pageIDs(page)); err != nil || len(envs) != 100 {
+		t.Fatalf("bounded page metadata failed budget: %d %v", len(envs), err)
 	}
 	if elapsed := now.Sub(start); elapsed != 101*readSpacing {
 		t.Fatalf("virtual duration=%s requests=%d", elapsed, requests)
@@ -232,35 +251,29 @@ func TestReadDoesNotRetryForbiddenAndMutationDoesNotRetryThrottle(t *testing.T) 
 	}
 }
 
-func TestRepeatedLabelEnumerationRefetchesChangedMetadata(t *testing.T) {
-	label := ""
+// An initial page lists IDs only. Gmail lists a message under every label,
+// so fetching here charged one messages.get per appearance; the engine now
+// fetches what it does not already hold (and refetches after any delta).
+func TestInitialPageListsBareIDs(t *testing.T) {
 	gets := 0
 	ad := testReadAdapter(t, func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/gmail/v1/users/me/profile":
 			return retryResponse(200, `{"historyId":"42"}`), nil
 		case "/gmail/v1/users/me/messages":
-			label = r.URL.Query().Get("labelIds")
 			return retryResponse(200, `{"messages":[{"id":"a"}]}`), nil
 		default:
 			gets++
-			if label == "INBOX" {
-				return retryResponse(200, `{"id":"a","labelIds":["INBOX","UNREAD"]}`), nil
-			}
-			return retryResponse(200, `{"id":"a","labelIds":["INBOX","Label_1","STARRED"]}`), nil
+			return retryResponse(200, `{"id":"a","labelIds":["INBOX"]}`), nil
 		}
 	})
-	first, err := ad.Sync(context.Background(), "INBOX", "")
+	page, err := ad.Sync(context.Background(), "INBOX", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := ad.Sync(context.Background(), "Label_1", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	env := second.Changes[0].Envelope
-	if gets != 2 || first.Changes[0].Envelope.Keywords.Seen || !env.Keywords.Seen || !env.Keywords.Flagged || len(env.MailboxIDs) != 3 {
-		t.Fatalf("stale repeated-label metadata: gets=%d envelope=%+v", gets, env)
+	if gets != 0 || len(page.Changes) != 1 || page.Changes[0].Kind != mail.ChangeCreated ||
+		page.Changes[0].ID != "n:gmail:a" || page.Changes[0].Envelope != nil {
+		t.Fatalf("gets=%d page=%+v", gets, page)
 	}
 }
 

@@ -188,6 +188,26 @@ var ReferentialSchema = []string{
 	`ALTER TABLE mail_message_mailboxes VALIDATE CONSTRAINT mail_membership_message_fk`,
 }
 
+// AttachmentSchema replaces the has_attachment boolean with an honest
+// tri-state (GMAIL-03). Gmail envelope fetches use format=metadata,
+// which excludes the MIME part tree, so the old FALSE half of the column
+// was really "unknown" for Gmail rows: the adapter's part-tree walk over
+// a metadata payload always found nothing and recorded an absence that
+// was never provable. The backfill keeps present as present, recovers
+// Gmail's false to unknown, and leaves every other provider's false as
+// absent — IMAP BODYSTRUCTURE, Graph hasAttachments, and JMAP
+// hasAttachment are all definitive answers.
+var AttachmentSchema = []string{
+	`ALTER TABLE mail_messages ADD COLUMN attachment_state smallint NOT NULL DEFAULT 0`,
+	`UPDATE mail_messages SET attachment_state = CASE
+	   WHEN has_attachment THEN 2
+	   WHEN EXISTS (
+	     SELECT 1 FROM mail_accounts a
+	      WHERE a.id = mail_messages.account_id AND a.provider = 'gmail') THEN 0
+	   ELSE 1 END`,
+	`ALTER TABLE mail_messages DROP COLUMN has_attachment`,
+}
+
 // Account lock order (audit SYNC-04): every transaction that writes or
 // deletes mirror rows — PutEnvelopes, PutBody, DeleteMessages,
 // RemoveFromMailbox, PutMailboxes, scan staging and completion on the
@@ -203,9 +223,6 @@ var ReferentialSchema = []string{
 // rather than a test fixture: when a provider reports that a cursor is no
 // longer usable, discarding and refetching is the correct recovery.
 var DropSchema = []string{
-	`DROP TABLE IF EXISTS mail_graph_id_map`,
-	`DROP TABLE IF EXISTS mail_graph_identity`,
-	`DROP TABLE IF EXISTS mail_identity_aliases`,
 	`DROP TABLE IF EXISTS mail_scan_done`,
 	`DROP TABLE IF EXISTS mirror_scan_seen`,
 	`DROP TABLE IF EXISTS mirror_scans`,
@@ -216,17 +233,4 @@ var DropSchema = []string{
 	`DROP TABLE IF EXISTS mail_mailboxes`,
 	`DROP TABLE IF EXISTS mail_accounts`,
 	`DROP TABLE IF EXISTS mail_migrations`,
-}
-
-// Additive: never edit the shipped baseline/checksums. Old true is evidence;
-// old false could come from Gmail metadata and must become unknown.
-var AttachmentSchema = []string{
-	`ALTER TABLE mail_messages ADD COLUMN attachment_presence TEXT NOT NULL DEFAULT 'unknown'`,
-	`UPDATE mail_messages SET attachment_presence = 'present' WHERE has_attachment`,
-}
-
-var IdentitySchema = []string{
-	`CREATE TABLE mail_identity_aliases(account_id TEXT NOT NULL, old_id TEXT NOT NULL, new_id TEXT NOT NULL, PRIMARY KEY(account_id,old_id))`,
-	`CREATE TABLE mail_graph_identity(account_id TEXT PRIMARY KEY, mailbox_key TEXT NOT NULL, format TEXT NOT NULL)`,
-	`CREATE TABLE mail_graph_id_map(account_id TEXT NOT NULL, old_id TEXT NOT NULL, new_id TEXT, PRIMARY KEY(account_id,old_id), UNIQUE(account_id,new_id))`,
 }
