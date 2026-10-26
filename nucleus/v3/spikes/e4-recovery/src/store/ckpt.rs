@@ -529,8 +529,33 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         }
         Ok(())
     })?;
-    let map_root = write_map_radix(cx)?;
-    let (free_root, img_slot_count, img_next_lpid) = write_free_set(cx)?;
+    let (map_root, free_root, img_slot_count, img_next_lpid) = {
+        // The frozen image table: one atomic step (B5). The radix, the
+        // free set and the step-5 durable set read only it, and its
+        // slots are pinned, so evictions in flight across the freeze
+        // cannot unpin or redirect an embedded ref. The table stays set
+        // through steps 3–5 (the durable set reads it) and is cleared
+        // by the post-5 resolution.
+        cx.with("ckpt:freeze", |c| {
+            prims::freeze_image(c.store());
+            Ok(())
+        })?;
+        match write_map_radix(cx) {
+            Ok(root) => {
+                let (free_root, img_slot_count, img_next_lpid) = write_free_set(cx)?;
+                (root, free_root, img_slot_count, img_next_lpid)
+            }
+            Err(e) => {
+                cx.with("ckpt:unfreeze", |c| {
+                    c.store().image_frozen = None;
+                    Ok(())
+                })
+                .ok();
+                cx.w.wake(crate::sim::WaitKey::Pin);
+                return Err(e);
+            }
+        }
+    };
     hooks(CkptHook::After2)?;
     // Step 3.
     let skip3 = cx.with("ckpt:mut3", |c| {
@@ -599,6 +624,7 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         }
         st.meta_durable_k = k;
         st.flip_window = false;
+        st.image_frozen = None;
         let old_durable = std::mem::take(&mut st.slots.used_durable);
         st.slots.used_durable = image_slots;
         st.slots.pending_free = old_durable
@@ -626,6 +652,12 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
         st.ckpt_open = false;
         Ok(())
     })?;
+    // `wait_ckpt` (Work 13) polls `force_ckpt || ckpt_open`; the step-5
+    // wake fired while `ckpt_open` was still true, so a waiter re-parked
+    // and nothing woke it after the close. Wake here too — a checkpoint
+    // that completed is a checkpoint a forced waiter can pass (B5
+    // prototype-deviation fix; the directed D9 shape pinned it).
+    cx.w.wake(crate::sim::WaitKey::MetaDurable);
     Ok(())
 }
 
@@ -671,18 +703,26 @@ fn ckpt_step2_data<H: StoreHost>(
                 .get(i)
                 .map(|f| f.is_epoch_copy)
                 .unwrap_or(false);
-            let pending = st.map.img.get(&key).copied() == Some(Img::CopyPending);
-            if is_copy || pending {
+            // Any image state for this LPID (a CopyPending freeze or an
+            // `Img::At` a previous-epoch eviction recorded during the
+            // window, §5.2) means the image's content is pinned
+            // elsewhere: this write is **for the image only** — record
+            // it as the image ref and do not adopt it as the current
+            // home. Adopting anyway would unpin the eviction's slot
+            // while the radix still references it (a double allocation
+            // that overwrote a live page — prototype deviation fixed
+            // in B5).
+            let pinned = st.map.img.contains_key(&key);
+            if is_copy || pinned {
                 st.map.img.insert(key, Img::At(r));
                 st.slots.image_refs.insert(r.slot);
-            } else if let Some(f) = st.pool.frames.get_mut(i) {
-                // Not superseded: adopt the new slot as the current home
-                // and clean the frame (§13 step 2).
-                if f.key == key && f.dirty && f.epoch <= k as u32 {
-                    if let Some(old) = st.map.cur.insert(key, r) {
-                        st.slots.used_cur.remove(&old.slot);
-                    }
-                    st.slots.used_cur.insert(r.slot);
+            } else if st.pool.frames.get(i).map(|f| f.key == key && f.dirty && f.epoch <= k as u32).unwrap_or(false) {
+                let old = st.map.cur.insert(key, r);
+                if let Some(old) = old {
+                    prims::unpin_home(st, old.slot);
+                }
+                st.slots.used_cur.insert(r.slot);
+                if let Some(f) = st.pool.frames.get_mut(i) {
                     f.dirty = false;
                 }
             }
@@ -694,22 +734,34 @@ fn ckpt_step2_data<H: StoreHost>(
 
 /// The map radix for the image (changed leaves CoW, up to the root;
 /// unchanged leaves keep their image k−1 slots and are shared between the
-/// two images — Work 12's condition 2). Returns the root ref.
+/// two images — Work 12's condition 2). Reads **only the frozen table**
+/// (B5): the entries and the leaf span are the freeze step's snapshot,
+/// so concurrent evictions cannot change what a leaf already built
+/// embeds. Returns the root ref.
 fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
-    let (cap, next_lpid) = cx.with("mapradix:cap", |c| {
+    let (cap, frozen) = cx.with("mapradix:cap", |c| {
         let st = c.store();
-        Ok((st.cfg.map_leaf_cap, st.meta.next_lpid))
+        Ok((
+            st.cfg.map_leaf_cap,
+            st.image_frozen.clone().ok_or_else(|| {
+                Fail::Invalid("map radix without a frozen image".to_owned())
+            })?,
+        ))
     })?;
-    let n_leaves = next_lpid.div_ceil(cap);
+    let n_leaves = frozen.next_lpid.div_ceil(cap);
     // Leaf level.
     let mut leaf_refs: Vec<Option<Ref>> = Vec::new();
     for j in 0..n_leaves {
         let base = j * cap;
         let bytes = cx.with("mapradix:leaf", |c| {
             let st = c.store();
+            let frz = st
+                .image_frozen
+                .as_ref()
+                .ok_or_else(|| Fail::Invalid("frozen image gone".to_owned()))?;
             let mut entries: Vec<Option<Ref>> = Vec::with_capacity(cap as usize);
             for i in 0..cap {
-                entries.push(prims::img_entry(st, base + i));
+                entries.push(frz.entries.get(&(base + i)).copied().flatten());
             }
             Ok(page::build_map_leaf(base, cap, &entries))
         })?;
@@ -733,7 +785,7 @@ fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
             cx.with("mapradix:upd", |c| {
                 let st = c.store();
                 if let Some((_, or)) = st.map.prev_leaves.insert(j, (h, r)) {
-                    st.slots.used_cur.remove(&or.slot);
+                    prims::unpin_home(st, or.slot);
                 }
                 st.slots.used_cur.insert(r.slot);
                 Ok(())
@@ -771,7 +823,7 @@ fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
                 cx.with("mapradix:updinner", |c| {
                     let st = c.store();
                     if let Some((_, or)) = st.map.prev_inners.insert(key, (h, r)) {
-                        st.slots.used_cur.remove(&or.slot);
+                        prims::unpin_home(st, or.slot);
                     }
                     st.slots.used_cur.insert(r.slot);
                     Ok(())
@@ -788,48 +840,49 @@ fn write_map_radix<H: StoreHost>(cx: &Cx<'_, H>) -> Result<Ref, Fail> {
 
 /// Serialise both bitmaps as a fresh FreeSet radix, its own slots marked
 /// used (I-FREE-EXACT; BITMAP-OMITS-FREESET-PAGES omits them), with the
-/// §13 step-2 sizing and growth convergence. Returns
-/// `(root, slot_count, next_lpid)` — the frozen image sizes the bitmap
-/// actually covers.
+/// §13 step-2 sizing and growth convergence. Reads **only the frozen
+/// table** (B5): the referenced/mapped sets and both size spans are the
+/// freeze step's snapshot. Returns `(root, slot_count, next_lpid)` —
+/// the frozen image sizes the bitmap actually covers.
 fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail> {
     let leaf_bits = cx.with("fs:bits", |c| Ok(c.store().cfg.freeset_leaf_bits))?;
-    let img_next_lpid = cx.with("fs:nlp", |c| Ok(c.store().meta.next_lpid))?;
-    // The image's referenced data and map slots (snapshot-stable after
-    // the data phase).
-    let mut used = cx.with("fs:used", |c| {
+    // The frozen image sizes and sets (one step, with the map pages the
+    // radix just wrote).
+    let (frozen_used, img_lpids_mapped, img_next_lpid, frozen_sc) = cx.with("fs:used", |c| {
         let st = c.store();
-        let mut used = prims::image_slot_set(st);
+        let frz = st
+            .image_frozen
+            .as_ref()
+            .ok_or_else(|| Fail::Invalid("free set without a frozen image".to_owned()))?
+            .clone();
+        let mut used = prims::frozen_slot_set(&frz);
         for (_, r) in st.map.prev_leaves.values() {
             used.insert(r.slot);
         }
         for (_, r) in st.map.prev_inners.values() {
             used.insert(r.slot);
         }
-        Ok(used)
+        let mapped: BTreeSet<u64> = frz
+            .entries
+            .iter()
+            .filter_map(|(l, r)| r.map(|_| *l))
+            .collect();
+        Ok((used, mapped, frz.next_lpid, frz.slot_count))
     })?;
-    // The LPID bitmap bits: one snapshot of the image's mapped set.
-    let img_lpids_mapped: BTreeSet<u64> = cx.with("fs:lpids", |c| {
-        let st = c.store();
-        Ok(prims::img_lpids(st)
-            .into_iter()
-            .filter(|l| prims::img_entry(st, *l).is_some())
-            .collect())
-    })?;
+    let mut used = frozen_used;
     // Allocate the free-set pages with the convergence loop (§13 step
     // 2's sizing note): after growth, recompute and allocate the
     // difference.
     let mut fs_slots: Vec<u64> = Vec::new();
     let mut rounds = 0u32;
     let fan = ((page::PAGE - page::HDR) / page::MAP_ENTRY) as u64;
-    let mut slot_count;
+    let slot_count = frozen_sc;
     loop {
         rounds += 1;
         if rounds > 8 {
             return Err(Fail::Invalid("freeset sizing did not converge".into()));
         }
-        let sc = cx.with("fs:sc", |c| Ok(c.store().slots.slot_count))?;
-        slot_count = sc;
-        let total_bits = (sc - 3) + img_next_lpid;
+        let total_bits = (slot_count - 3) + img_next_lpid;
         let mut pages = total_bits.div_ceil(leaf_bits);
         let mut lvl = total_bits.div_ceil(leaf_bits);
         while lvl > 1 {
@@ -837,18 +890,22 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
             pages += lvl;
         }
         while (fs_slots.len() as u64) < pages {
-            fs_slots.push(prims::alloc_slot(cx)?);
+            let s = prims::alloc_slot(cx)?;
+            fs_slots.push(s);
         }
         let sc2 = cx.with("fs:sc2", |c| Ok(c.store().slots.slot_count))?;
-        if sc2 == slot_count {
+        if sc2 <= slot_count {
             break;
         }
-        // The file grew: mark it (Q17) and loop to allocate the
-        // difference the growth requires.
+        // The file grew (an fs allocation above the frozen span): mark
+        // it (Q17); the frozen bitmap span is unchanged, so one pass
+        // suffices — the growth's own accounting belongs to the next
+        // image (post 5 keeps the live counter).
         cx.with("fs:grew", |c| {
             c.store().freeset_grew = true;
             Ok(())
         })?;
+        break;
     }
     // Mark the free-set pages used (the mutant omits them: the bitmap
     // then marks the free set's own slots free — I-FREE-EXACT).
@@ -864,7 +921,6 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
     }
     // Serialise the leaves (bit index → free). The `used` and mapped sets
     // are the frozen snapshot; no step inside reads the live store.
-    let frozen_sc = slot_count;
     let pf = cx.with("fs:pf", |c| Ok(c.store().page_file))?;
     let mut leaf_refs: Vec<Option<Ref>> = Vec::new();
     for (j, &slot) in fs_slots.iter().enumerate() {
@@ -872,10 +928,10 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
         let used_ref = &used;
         let mapped_ref = &img_lpids_mapped;
         let bytes = page::build_free_leaf(base, leaf_bits, &|bit: u64| {
-            if bit < frozen_sc - 3 {
+            if bit < slot_count - 3 {
                 !used_ref.contains(&(bit + 3))
             } else {
-                let lpid = bit - (frozen_sc - 3) + 1;
+                let lpid = bit - (slot_count - 3) + 1;
                 !mapped_ref.contains(&lpid)
             }
         });
@@ -911,15 +967,20 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
         depth += 1;
     }
     let root = level.first().copied().flatten().unwrap_or_default();
-    Ok((root, frozen_sc, img_next_lpid))
+    Ok((root, slot_count, img_next_lpid))
 }
 
 /// The full set of slots image k references (data + map + free-set pages
-/// plus the fixed slots), for the step-5 durable set.
+/// plus the fixed slots), for the step-5 durable set. Reads the frozen
+/// table (B5): exactly the slots the radix and the free set embedded.
 fn full_image_slots<H: StoreHost>(cx: &Cx<'_, H>) -> Result<BTreeSet<u64>, Fail> {
     cx.with("full_slots", |c| {
         let st = c.store();
-        let mut out = prims::image_slot_set(st);
+        let frz = st
+            .image_frozen
+            .as_ref()
+            .ok_or_else(|| Fail::Invalid("full image slots without a frozen image".to_owned()))?;
+        let mut out = prims::frozen_slot_set(frz);
         for (_, r) in st.map.prev_leaves.values() {
             out.insert(r.slot);
         }

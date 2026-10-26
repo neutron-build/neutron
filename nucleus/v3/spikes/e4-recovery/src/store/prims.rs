@@ -28,10 +28,10 @@
 //!   epoch-copy reserve; normal pages never occupy them; exhaustion
 //!   writes the oldest copy out and reuses its frame.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::page::{self, Ref};
-use super::{Cx, Fail, Frame, Img, Mutant, StoreHost, StoreInner};
+use super::{Cx, Fail, FrozenImage, Frame, Img, Mutant, StoreHost, StoreInner};
 use crate::sim::{E4Env, Sched, TaskId, WaitKey};
 
 /// The effective image-k entry of `lpid`: the override if frozen, else
@@ -64,6 +64,23 @@ pub fn image_slot_set(st: &StoreInner) -> BTreeSet<u64> {
     out
 }
 
+/// Unpin a replaced home slot: it leaves `used_cur` only when the image
+/// being built no longer references it (an `Img::At` override, the
+/// frozen table's pins, or an `image_refs` entry — the three-reference
+/// rule of §4.4). Removing it unconditionally let a live image page be
+/// re-allocated and overwritten (prototype deviation fixed in B5).
+pub fn unpin_home(st: &mut StoreInner, slot: u64) {
+    let img_refs_it = st
+        .map
+        .img
+        .values()
+        .any(|i| matches!(i, Img::At(r) if r.slot == slot));
+    if img_refs_it || st.slots.image_refs.contains(&slot) {
+        return;
+    }
+    st.slots.used_cur.remove(&slot);
+}
+
 /// Record `lpid → r` in the image map (§5.2: a previous-epoch victim or
 /// an exhausted reserve copy "is also recorded in the epoch-k image
 /// map"). **EVICT-SKIP-IMAGE-MAP's single site.**
@@ -75,6 +92,37 @@ fn record_image_at(st: &mut StoreInner, lpid: u64, r: Ref) {
         st.map.img.insert(lpid, Img::At(r));
         st.slots.image_refs.insert(r.slot);
     }
+}
+
+/// Take the frozen image table (step 2's map phase, B5): every LPID's
+/// image ref and the two size counters, in one atomic step, pinning
+/// every referenced slot in `image_refs`. From this step until step 5
+/// resolves the image, the radix, the free set and the durable set read
+/// only this table — an eviction in flight across the freeze can move
+/// the live home (`cur`) but cannot unpin or redirect an embedded slot.
+pub fn freeze_image(st: &mut StoreInner) {
+    let mut entries = BTreeMap::new();
+    let mut pins = BTreeSet::new();
+    for lpid in img_lpids(st) {
+        if let Some(r) = img_entry(st, lpid) {
+            pins.insert(r.slot);
+            entries.insert(lpid, Some(r));
+        } else {
+            entries.insert(lpid, None);
+        }
+    }
+    st.image_frozen = Some(FrozenImage {
+        entries,
+        next_lpid: st.meta.next_lpid,
+        slot_count: st.slots.slot_count,
+    });
+    st.slots.image_refs.extend(pins);
+}
+
+/// The data-page slots the frozen image references (map and free-set
+/// pages excluded — the checkpointer adds its own).
+pub fn frozen_slot_set(frozen: &FrozenImage) -> BTreeSet<u64> {
+    frozen.entries.values().flatten().map(|r| r.slot).collect()
 }
 
 impl StoreInner {
@@ -659,6 +707,7 @@ fn record_image_copy<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64, bytes: Vec<u8>) ->
 /// the new ref. Pure placement (no map change) — callers decide adoption
 /// and image-map recording. Used by eviction, the reserve exhaustion path
 /// and checkpoint step 2.
+#[track_caller]
 pub fn write_fresh<H: StoreHost>(cx: &Cx<'_, H>, bytes: &[u8]) -> Result<Ref, Fail> {
     let slot = alloc_slot(cx)?;
     let (f, off) = cx.with("write_fresh:pf", |c| {
@@ -820,7 +869,7 @@ pub fn evict_one<H: StoreHost>(cx: &Cx<'_, H>, inside_op: bool) -> Result<bool, 
         if let Some(r) = r {
             let prev_epoch_victim = st.flip_window && epoch < st.e;
             if let Some(old) = st.map.cur.insert(key, r) {
-                st.slots.used_cur.remove(&old.slot);
+                unpin_home(st, old.slot);
             }
             st.slots.used_cur.insert(r.slot);
             if prev_epoch_victim {

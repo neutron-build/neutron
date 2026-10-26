@@ -262,6 +262,23 @@ pub struct MapState {
     pub prev_root: Option<page::Ref>,
 }
 
+/// The frozen image table of step 2's map phase (B5): taken in one
+/// atomic step after the data phase, read by the map radix, the free set
+/// and the step-5 durable set until step 5 resolves them. Every
+/// referenced slot is pinned in `SlotState::image_refs` in the same
+/// step, so concurrent evictions cannot unpin or redirect what the image
+/// embeds.
+#[derive(Debug, Clone, Default)]
+pub struct FrozenImage {
+    /// LPID → the image's ref (`None` = the image leaves it unmapped).
+    pub entries: BTreeMap<u64, Option<page::Ref>>,
+    /// The frozen `next_lpid` (the radix's leaf span and the free set's
+    /// LPID-bit span).
+    pub next_lpid: u64,
+    /// The frozen `slot_count` (the free set's slot-bit span).
+    pub slot_count: u64,
+}
+
 /// Slot bookkeeping (§4.4–§4.5).
 #[derive(Debug, Default, Clone)]
 pub struct SlotState {
@@ -358,6 +375,18 @@ pub struct StoreInner {
     /// A checkpoint's flip window is open (step 0 → step 5): first
     /// post-flip touches freeze image state.
     pub flip_window: bool,
+    /// The frozen image table (step 2's map phase, B5): built in one
+    /// atomic step when the data phase ends — every LPID's image ref
+    /// (`img_entry`: an `Img::At` override or the current home) plus the
+    /// two size counters the radix and the free set must agree on. The
+    /// map radix, the free set and the step-5 durable set read **only**
+    /// this table while it is set, and every slot it references is
+    /// pinned in `image_refs`, so an eviction that was already in flight
+    /// when the table was taken (picked before, finishing after) can
+    /// move the live home but not unpin or redirect anything the image
+    /// embeds — the stale-embed race this field closes (prototype
+    /// deviation fixed in B5; see the stage RESULT).
+    pub image_frozen: Option<FrozenImage>,
     /// A checkpoint is between steps 0 and 6 (the Q4 window).
     pub ckpt_open: bool,
     /// Splits inside the open checkpoint window (Q4).
@@ -423,6 +452,7 @@ impl StoreInner {
             gc_w_used: 0,
             ckpt_done: 0,
             flip_window: false,
+            image_frozen: None,
             ckpt_open: false,
             ckpt_splits: 0,
             ckpt_merges: 0,

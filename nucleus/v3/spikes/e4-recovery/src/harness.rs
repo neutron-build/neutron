@@ -575,19 +575,26 @@ fn run_task(
                     // A failed script op is a round failure, recorded
                     // and reported — never a silent early exit (the
                     // service tasks would spin on a workload that can
-                    // no longer finish).
-                    cx.with("h:taskerr", |c| {
-                        let h = c.h();
-                        if h.task_error.is_none() {
-                            h.task_error = Some(format!("{e:?}"));
-                        }
-                        h.workload_done = true;
-                        Ok(())
-                    })
-                    .ok();
-                    cx.w.wake(WaitKey::WalAcks);
-                    cx.w.wake(WaitKey::MetaDurable);
-                    cx.w.wake(WaitKey::Applied);
+                    // no longer finish). The crash delivery itself
+                    // (every task unwinds with `Crashed` once the world
+                    // crashes) is the round's normal end, not a failure.
+                    let world_crashed = cx
+                        .with("h:taskerr", |c| Ok(c.sched_mut().crashed))
+                        .unwrap_or(true);
+                    if !world_crashed {
+                        cx.with("h:taskerr2", |c| {
+                            let h = c.h();
+                            if h.task_error.is_none() {
+                                h.task_error = Some(format!("{e:?}"));
+                            }
+                            h.workload_done = true;
+                            Ok(())
+                        })
+                        .ok();
+                        cx.w.wake(WaitKey::WalAcks);
+                        cx.w.wake(WaitKey::MetaDurable);
+                        cx.w.wake(WaitKey::Applied);
+                    }
                     return Err(e);
                 }
             }
@@ -631,8 +638,7 @@ fn run_task(
 }
 
 fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), SimFail> {
-    let r: Result<(), SimFail> = match op {
-        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false)
+    let r: Result<(), SimFail> = match op {        ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false)
             .map(|_| ())
             .map_err(fail_of),
         ScriptOp::Chunked { sync_on, ops } => commit_txn(cx, ops, *sync_on, true)
@@ -1383,23 +1389,34 @@ pub fn run_round(
 /// (`written`), and its ack — a covering WAL sync returned (SyncOn) or
 /// the write itself (SyncOff). The commit records' (lsn, ts) pairs are
 /// parsed from the write events' bytes; a WAL file's writes parse as NWAL
-/// batches, the page file's never do.
+/// batches, the page file's never do. Record ends are tracked
+/// **file-relative** (a recycled segment's records sit at
+/// `lsn − segment_base` inside the renamed file, so absolute LSNs never
+/// compare against file offsets — B5 fix; D9's renamed-segment shape
+/// pinned it).
 fn derive_written_acked(
     events: &[DiskEvent],
     wal_commits: &BTreeMap<u64, (bool, u64)>,
 ) -> (Vec<u64>, Vec<u64>) {
-    // ts → (inode, record end lsn) from the parsed batches.
+    // ts → (inode, the record's end offset **within its file**).
     let mut ts_pos: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
     let mut returned_end: BTreeMap<usize, u64> = BTreeMap::new();
     let mut durable_end: BTreeMap<usize, u64> = BTreeMap::new();
     for e in events {
         match e {
-            DiskEvent::WriteIssued { inode, bytes, .. } => {
+            DiskEvent::WriteIssued { inode, off, bytes } => {
                 let parsed = parse_wal_batch(bytes);
+                let Some((l0, _, _)) = parsed.first().copied() else {
+                    continue;
+                };
                 for (lsn, kind, ts) in parsed {
                     if kind == K_COMMIT || kind == K_MARKER {
                         let len = record_len(bytes, lsn);
-                        ts_pos.insert(ts, (*inode, lsn + len));
+                        // The batch is contiguous from its first record's
+                        // lsn: the record's file offset is `off + (lsn −
+                        // l0)`, its end adds the record length.
+                        let file_end = off + (lsn - l0) + len;
+                        ts_pos.insert(ts, (*inode, file_end));
                     }
                 }
             }
