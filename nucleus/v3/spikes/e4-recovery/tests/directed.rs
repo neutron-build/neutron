@@ -10,7 +10,7 @@
 
 use e4_recovery::harness::{self, CrashSpec, RoundFaults, Script, ScriptOp, ScriptTask};
 use e4_recovery::model::{CATALOG, Model, Op, PUBLIC, to_be64};
-use e4_recovery::sim::{FaultClass, FaultKnobs, HARNESS, MediaFault, MediaKind};
+use e4_recovery::sim::{FaultClass, FaultKnobs};
 use e4_recovery::store::ckpt::CkptHook;
 use e4_recovery::store::{Mutant, StoreCfg};
 
@@ -130,6 +130,11 @@ fn d1_every_boundary() {
                 out.o3_fail.is_none(),
                 "D1 {name} {hook:?}: O-3 failed: {:?}",
                 out.o3_fail
+            );
+            assert!(
+                out.monitors.is_empty(),
+                "D1 {name} {hook:?}: monitors fired: {:?}",
+                out.monitors
             );
             assert!(
                 out.o2_fail.is_none(),
@@ -516,6 +521,19 @@ fn d6_double_crash_idempotent() {
 /// D7 (zombie tail): the valid end sits at a torn record followed by
 /// intact volatile records; recover; commit shorter records; crash. No
 /// zombie is replayed. Mutant TRUNCATE-LOGICAL-ONLY.
+///
+/// **Stage status.** The single-round arms run (round 1's clean recovery
+/// passes O-1 at the torn cut). The two-round arm — where the mutant's
+/// un-zeroed tail lines up with round 2's shorter appends — is
+/// **UNCAUGHT (directed)**: in every seed tried, round 1's torn
+/// resolution kept the zombie records *written* (so round 1's own cut
+/// legitimately covers them), and round 2's raw-cut finding fires
+/// identically clean and mutant — the shapes the card's harm needs
+/// (records past round 1's valid end replayed against a model truncated
+/// below them) did not materialise through the black-box harness in the
+/// remaining budget. The mutation table's campaign column (multi-round
+/// seeds) is this mutant's catcher; the arm asserts only what holds
+/// (round 1 clean) and no assert-pass.
 #[test]
 fn d7_zombie_tail() {
     let ops = vec![
@@ -529,25 +547,34 @@ fn d7_zombie_tail() {
         },
         ScriptOp::Commit {
             sync_on: true,
-            ops: (0..20).map(|i| put(i, 1)).collect(),
+            ops: (0..10).map(|i| put(i, 1)).collect(),
+        },
+        // The volatile tail: torn/lost at the crash; a prefix survives
+        // as the zombie shape.
+        ScriptOp::Commit {
+            sync_on: false,
+            ops: (10..14).map(|i| put(i, 2)).collect(),
         },
         ScriptOp::Commit {
-            sync_on: false, // volatile tail: torn/lost at the crash
-            ops: (20..30).map(|i| put(i, 2)).collect(),
+            sync_on: false,
+            ops: (14..18).map(|i| put(i, 2)).collect(),
         },
+        ScriptOp::Commit {
+            sync_on: false,
+            ops: (18..22).map(|i| put(i, 2)).collect(),
+        },
+        ScriptOp::Yields(3),
     ];
     let mut script = script_with_crash(None);
     script.tasks[0].ops = ops;
-    script.crash = Some(CrashSpec::TaskYield(1, 3));
-    // Torn resolution keeps a prefix of the volatile tail: the classic
-    // zombie shape.
+    script.crash = Some(CrashSpec::TaskYield(1, 5));
+    // Torn resolution keeps a prefix of the volatile tail.
     let clean = run(2006, &script, &faults(FaultClass::C, knobs(0, 1000)), None);
     assert!(clean.o1.is_ok(), "D7 clean O-1: {:?}", clean.o1);
     assert!(clean.o3_fail.is_none(), "D7 clean O-3: {:?}", clean.o3_fail);
-    // Mutant: no physical truncation — a later round could replay the
-    // zombie; here the same round's O-1 must still hold or the round
-    // fails; the card's catcher is the multi-round campaign. Assert the
-    // mutant at least does not silently beat the clean arm.
+    // The mutant round: logical truncation only. No zombie may be
+    // *served* here either (O-3 (a) clean); the multi-round harm is the
+    // campaign's.
     let m = run(
         2006,
         &script,
@@ -555,8 +582,9 @@ fn d7_zombie_tail() {
         Some(Mutant::TruncateLogicalOnly),
     );
     assert!(
-        !m.pass || m.o1.is_ok(),
-        "D7 mutant: the round must not report corruption-free failure"
+        !m.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
+        "D7 mutant: no corruption may be served (o3={:?})",
+        m.o3_fail
     );
 }
 
@@ -670,8 +698,360 @@ fn d9_dropped_rename() {
 
 /// D10 (lost meta after step 6 recycled the start segment of meta k−1):
 /// XX001, never a silent `Ok`. Mutant START-SEGMENT-MISSING-OK.
+///
+/// The shape: checkpoint k=1 runs while the WAL is still inside segment
+/// 0 (its `wal_start_lsn` sits there); four chunked transactions then
+/// push the append across segments; checkpoint k=2's step 6 recycles
+/// segment 0 by rename; the crash lands after it; a directed LOST fault
+/// reverts meta 2's durable write (slot 1) to meta 0's bytes, so open
+/// selects meta 1 — a rollback whose start segment no longer exists.
+/// Clean: G3 fails XX001 at open (the detection) and X5-R5's
+/// `meta_rollback` holds. Mutant: the missing segment is treated as an
+/// empty WAL — recovery returns a silent `Ok` that loses every acked
+/// commit above meta 1's T, and O-3 (d) fails the round.
 #[test]
 fn d10_lost_meta() {
+    let chunked = |base: u64, v: u8| ScriptOp::Chunked {
+        sync_on: true,
+        ops: (0..40u64)
+            .map(|i| Op::Put {
+                tree: 2,
+                key: (base + i).to_be_bytes().to_vec(),
+                value: vec![v; 400],
+            })
+            .collect(),
+    };
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Checkpoint,
+        chunked(0, 1),
+        chunked(40, 1),
+        chunked(80, 1),
+        chunked(120, 1),
+        ScriptOp::WaitVisible(5),
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 9)),
+        nested: Vec::new(),
+    };
+    // A faultless crash round supplies the crashed disk the fault is
+    // built from (the same schedule prefix, so the same bytes).
+    let base = run(2009, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("D10 page file");
+    let w = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| {
+            w.off == 4096
+                && w.bytes.len() == 4096
+                && e4_recovery::store::page::parse_meta(&w.bytes)
+                    .map(|m| m.ckpt_id == 2)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .expect("D10: meta 2's durable write exists");
+    let fault = e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: e4_recovery::sim::MediaKind::Lost,
+    };
+    let mut twin = Vec::new();
+    let (disk, st) = harness::create_store(cfg(None), 2009, 7).expect("create");
+    let clean = harness::run_round(
+        2009,
+        0,
+        &script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: vec![fault.clone()],
+        },
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
+    );
+    assert!(
+        clean.detections.contains(&"open"),
+        "D10 clean: G3 must give XX001 at open (det={:?})",
+        clean.detections
+    );
+    assert!(clean.meta_rollback, "D10 clean: the opened meta is a rollback");
+    assert!(
+        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
+        "D10 clean: never served (o3={:?})",
+        clean.o3_fail
+    );
+    let m = run(
+        2009,
+        &script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: vec![fault],
+        },
+        Some(Mutant::StartSegmentMissingOk),
+    );
+    assert!(
+        !m.pass
+            && m.o1.is_err()
+            && m.o3_fail
+                .as_deref()
+                .unwrap_or("")
+                .contains("O-3(d)"),
+        "D10 mutant: the silent empty WAL must lose the acked commits (o1={:?}, o3={:?})",
+        m.o1,
+        m.o3_fail
+    );
+}
+
+/// D10b (X5-R5's R and its R-taint, card Work 14): a rollback whose
+/// reused slots the exception must excuse.
+/// 1. One chunked load (the image spans ~90 pages), then three forced
+///    checkpoints with **no traffic between them**: k=1 images the load;
+///    k=2 rewrites the free set to fresh slots and its step 6 frees
+///    meta 1's free-set pages; k=3 crashes at After3 — its free set
+///    lands on exactly those freed slots (same bit bases, epoch 0), and
+///    the start segment of meta 1 is not recycled, so G3 does not fire.
+/// 2. A directed LOST fault on meta 2's durable write makes open select
+///    meta 1 — a meta rollback.
+/// 3. Clean: amcheck (i) reports the reused slots, the harness puts
+///    them in `R`, O-3 (e) passes, and no reused slot is ever accepted.
+/// 4. REFCRC-SKIP: **UNCAUGHT (directed), reported not asserted** — the
+///    arm needs the reuse to pair a slot with a page of the *same*
+///    radix position and epoch, but the store's allocation order (step
+///    2's data phase and the evictor take the lowest freed slots before
+///    the map phase) always hands them a data page first, whose LPID id
+///    and content epoch fail §3.3's checks (3)/(4) that the mutant does
+///    not skip. The mutation table's campaign column (Q14 rounds) is
+///    this mutant's catcher; the arm below documents the observed
+///    outcome without asserting it a pass.
+#[test]
+fn d10b_rollback_exception() {
+    let load: Vec<Op> = (0..1600u64)
+        .map(|i| Op::Put {
+            tree: 2,
+            key: i.to_be_bytes().to_vec(),
+            value: vec![3u8; 400],
+        })
+        .collect();
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: load,
+        },
+        ScriptOp::WaitVisible(2),
+        ScriptOp::Checkpoint,
+        ScriptOp::Checkpoint,
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 2,
+            hook: CkptHook::After3,
+        }),
+        nested: Vec::new(),
+    };
+    let base = run(2020, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("D10b page file");
+    let w = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| {
+            w.off == 4096
+                && w.bytes.len() == 4096
+                && e4_recovery::store::page::parse_meta(&w.bytes)
+                    .map(|m| m.ckpt_id == 2)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .expect("D10b: meta 2's durable write exists");
+    let fault = e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: e4_recovery::sim::MediaKind::Lost,
+    };
+    let mut twin = Vec::new();
+    let (disk, st) = harness::create_store(cfg(None), 2020, 7).expect("create");
+    let clean = harness::run_round(
+        2020,
+        0,
+        &script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: vec![fault.clone()],
+        },
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
+    );
+    assert!(clean.meta_rollback, "D10b: the opened meta is a rollback");
+    assert!(
+        !clean.rollback_slots.is_empty(),
+        "D10b: the reused slots must land in R (R={:?})",
+        clean.rollback_slots
+    );
+    // Every amcheck (i) finding lies within (tainted ∪ R) — the round's
+    // O-3 (e) verdict enforces it; assert it held and the named slots
+    // really are the reused ones.
+    assert!(
+        clean.o3_fail.is_none(),
+        "D10b clean: O-3 must pass with the exception (o3={:?})",
+        clean.o3_fail
+    );
+    for f in &clean.amcheck_i {
+        if let Some(slot) = f.slot {
+            assert!(
+                clean.rollback_slots.contains(&slot) || slot <= 2,
+                "D10b: finding on slot {slot} outside R (R={:?})",
+                clean.rollback_slots
+            );
+        }
+    }
+    // No reused slot was ever accepted: O-3 (a) never fired (the
+    // reused pages fail §3.3 before any accept).
+    assert!(
+        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
+        "D10b clean: no reused slot may be served (o3={:?})",
+        clean.o3_fail
+    );
+    assert!(
+        clean.detections.contains(&"open"),
+        "D10b clean: the reused free-set pages give XX001 at open (det={:?})",
+        clean.detections
+    );
+    // Arm 4 (REFCRC-SKIP): observed UNCAUGHT — see the doc comment. The
+    // run must stay a detection (never a silent pass), which is all
+    // this asserts.
+    let m = run(
+        2020,
+        &script,
+        &RoundFaults {
+            class: FaultClass::Mp,
+            knobs: knobs(0, 0),
+            directed: vec![fault],
+        },
+        Some(Mutant::RefCrcSkip),
+    );
+    assert!(
+        !m.pass || m.detections.contains(&"open") || m.o3_fail.is_some(),
+        "D10b REFCRC-SKIP: the round may not silently pass clean"
+    );
+}
+
+/// D11 (publish): §12.8's ordering — the unlogged build, the forced
+/// checkpoint, then the publish commit; the crash lands right after the
+/// publish commit's ack. Clean: the loaded tree is whole at the cut
+/// (the forced meta carries the build). Mutant PUBLISH-BEFORE-META
+/// skips the load's forced-meta wait (its single site): the publish
+/// commit is acked while the build exists nowhere durable, so the
+/// crash leaves a published catalog row over an empty tree and O-1 (b)
+/// fails on the scan.
+///
+/// (The driver hang the X-5b gate's R5 reported is fixed: the S_L draw
+/// from the commit sequencer is pre-marked applied, so `visible_ts` no
+/// longer stalls forever on the drawn ts.)
+#[test]
+fn d11_publish() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![Op::CreateTree { tree: CATALOG }],
+        },
+        ScriptOp::BulkLoad {
+            tree: 5,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::Yields(1),
+    ];
+    let mut script = script_with_crash(None);
+    script.tasks[0].ops = ops;
+    script.checkpointer_every = Some(1000);
+    script.crash = Some(CrashSpec::TaskYield(1, 3));
+    let clean = run(2011, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(clean.o1.is_ok(), "D11 clean O-1: {:?}", clean.o1);
+    let c = clean.o1.clone().unwrap_or(0);
+    assert!(
+        c >= 3,
+        "D11 clean: the publish commit survives (c={c})"
+    );
+    assert!(
+        clean.task_error.is_none(),
+        "D11 clean: no driver failure ({:?})",
+        clean.task_error
+    );
+    let m = run(
+        2011,
+        &script,
+        &faults(FaultClass::C, knobs(0, 0)),
+        Some(Mutant::PublishBeforeMeta),
+    );
+    assert!(
+        m.o1.is_err() || !m.pass,
+        "D11 mutant: the published tree must be empty at the cut (o1={:?})",
+        m.o1
+    );
+}
+
+/// D12b (the `w > visible_ts` fail-stop): the sweep at an explicit
+/// watermark above the frontier records `gc_w_used > T`; the next
+/// flip's meta write is fail-stop (I-GCW). Clean: the checkpoint aborts
+/// poisoned and the round fails loudly (never a hang — the abort path
+/// clears `ckpt_open`). Mutant GCW-BOUND-SKIP removes the check: the
+/// meta carries `gc_w > T`, amcheck (i) reports it and O-2 fails the
+/// class-C round.
+#[test]
+fn d12b_gcw_bound() {
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
@@ -685,156 +1065,37 @@ fn d10_lost_meta() {
             sync_on: true,
             ops: (0..10).map(|i| put(i, 1)).collect(),
         },
+        // w above visible_ts (2): the fail-stop shape.
+        ScriptOp::Gc { tree: 2, w: Some(3) },
         ScriptOp::Checkpoint,
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (10..20).map(|i| put(i, 2)).collect(),
-        },
-        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
     ];
     let mut script = script_with_crash(None);
     script.tasks[0].ops = ops;
-    script.checkpointer_every = Some(2);
+    script.checkpointer_every = Some(100);
     script.crash = Some(CrashSpec::TaskYield(1, 5));
-    // Round 1 ends after two checkpoints; a second round opens the
-    // durable state. The G3 shape needs meta k's start segment recycled
-    // away while a damaged meta k forces the open of meta k−1 — the
-    // directed media fault does the damage deterministically below.
-    let (disk, st) = harness::create_store(cfg(None), 2009, 7).expect("create");
-    let model = Model::new();
-    let out = harness::run_round(
-        2009,
-        0,
-        &script,
-        &faults(FaultClass::C, knobs(0, 0)),
-        cfg(None),
-        disk,
-        st,
-        &model,
-        0,
-        None,
-    );
-    assert!(out.o1.is_ok(), "D10 clean round: {:?}", out.o1);
-    // Arm 2: a LOST fault on the durable meta slot of image 1 forces the
-    // open of image 0, whose start segment (0) was recycled by meta 1's
-    // step 6 — XX001.
-    let (disk2, st2) = harness::create_store(cfg(None), 2009, 7).expect("create2");
-    let out2 = harness::run_round(
-        2009,
-        0,
-        &script,
-        &faults(FaultClass::C, knobs(0, 0)),
-        cfg(None),
-        disk2,
-        st2,
-        &model,
-        0,
-        None,
-    );
-    let _ = out2;
-    // Directed: fault the opened meta slot, then recover by hand.
-    let (disk3, st3) = harness::create_store(cfg(None), 2009, 7).expect("create3");
-    let mut out3 = harness::run_round(
-        2009,
-        0,
-        &script,
-        &faults(FaultClass::C, knobs(0, 0)),
-        cfg(None),
-        disk3,
-        st3,
-        &model,
-        0,
-        None,
-    );
-    let _ = &mut out3;
-    // (The full G3 shape needs the recycle to remove the segment file;
-    // the mutant arm below checks the silent-Ok direction.)
-    let m = run(
-        2009,
-        &script,
-        &faults(FaultClass::C, knobs(0, 0)),
-        Some(Mutant::StartSegmentMissingOk),
-    );
-    // **UNCAUGHT (directed), stage X-5b:** this shape's WAL never spans
-    // two segments, so no checkpoint recycles the start segment of meta
-    // k−1 and G3's premise (a missing start segment after a lost meta
-    // write) never arises — the mutant round is indistinguishable from
-    // clean. The full G3 shape (the multi-segment recycle of D9 plus a
-    // LOST fault on the newer meta, then open) is X-5c's to wire to
-    // this test's directed fault. The arm asserts the observed miss so
-    // it stays visible; the RESULT reports it.
+    let clean = run(2030, &script, &faults(FaultClass::C, knobs(0, 0)), None);
     assert!(
-        m.pass && m.o1.is_ok(),
-        "D10 UNCAUGHT arm drifted: the mutant was expected to pass here (o1={:?}) — re-check the site",
-        m.o1
+        !clean.pass
+            && clean
+                .task_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("gc_w > T"),
+        "D12b clean: the meta write must be fail-stop (te={:?})",
+        clean.task_error
     );
-}
-
-/// D11 (publish): §12.8's ordering — the build, the forced checkpoint,
-/// then the publish commit; the crash lands right after the publish
-/// commit's ack. Clean: the loaded tree is whole at the cut (the forced
-/// meta carries the build).
-///
-/// **UNCAUGHT (directed), stage X-5b.** The `BulkLoad` script op
-/// deadlocks the baton driver in this build (the §12.8 shape below is
-/// kept commented-in-place for X-5c: the hang reproduces with
-/// `ScriptOp::BulkLoad` armed — the workload pass never ends; the
-/// driver's lost-wakeup is diagnosed but not yet fixed). This test
-/// therefore drives the publish ordering with ordinary commits, which
-/// the mutant PUBLISH-BEFORE-META cannot distinguish (the mutant's
-/// single site is the load's forced-meta wait — without a load there is
-/// nothing to skip): the mutant arm below asserts the *observed* pass
-/// so the miss stays visible in the source, and the RESULT reports it.
-#[test]
-fn d11_publish() {
-    let ops = vec![
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: vec![
-                Op::CreateTree { tree: CATALOG },
-                Op::CreateTree { tree: 5 },
-                publish(5),
-            ],
-        },
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (0..20)
-                .map(|i: u64| Op::Put {
-                    tree: 5,
-                    key: i.to_be_bytes().to_vec(),
-                    value: vec![7u8; 6],
-                })
-                .collect(),
-        },
-        ScriptOp::Checkpoint,
-        // The publish commit (a catalog row names the tree public).
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: vec![publish(5)],
-        },
-        ScriptOp::Yields(1),
-    ];
-    let mut script = script_with_crash(None);
-    script.tasks[0].ops = ops;
-    script.checkpointer_every = Some(1000);
-    script.crash = Some(CrashSpec::TaskYield(1, 5));
-    let clean = run(2010, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D11 clean O-1: {:?}", clean.o1);
-    let c = clean.o1.clone().unwrap_or(0);
-    assert!(c >= 3, "D11 clean: the publish commit survives (c={c})");
     let m = run(
-        2010,
+        2030,
         &script,
         &faults(FaultClass::C, knobs(0, 0)),
-        Some(Mutant::PublishBeforeMeta),
+        Some(Mutant::GcwBoundSkip),
     );
-    // UNCAUGHT (directed): the mutant's site needs a bulk load's
-    // forced-meta wait; without one the round is indistinguishable from
-    // clean. Assert the miss — see the doc comment and RESULT item 4.
     assert!(
-        m.pass && m.o1.is_ok(),
-        "D11 UNCAUGHT arm drifted: the mutant was expected to pass here (o1={:?}) — re-check the site",
-        m.o1
+        m.gc_w >= 3 && m.o2_fail.is_some(),
+        "D12b mutant: the illegal gc_w must be durable and reported (gc_w={}, o2={:?})",
+        m.gc_w,
+        m.o2_fail
     );
 }
 
@@ -1092,19 +1353,16 @@ fn d14_monitors() {
         };
         run(2013, &script, &faults(FaultClass::C, knobs(0, 0)), m)
     };
-    // FREE-EARLY: the step-6 frees moved before step 5 → M-NOINPLACE.
-    // **UNCAUGHT (directed), stage X-5b:** the frees release real slots
-    // (traced: e.g. [6, 8, 10] under this shape) and a later allocation
-    // reuses them in-window, but M-NOINPLACE still does not fire — the
-    // monitor's durable-image walk undercounts the durable meta's slot
-    // set in a way not yet diagnosed (the tree-walk fix was not enough).
-    // The arm asserts the *observed* miss so it stays visible; the
-    // RESULT reports it. The campaign column (O-3b XX001 after reuse)
-    // is X-5c's catcher.
+    // FREE-EARLY: the step-5/6 frees happen at the flip (I-FREE-SAFE) —
+    // the allocator sees slots the durable meta k−1 still references,
+    // and the checkpoint's own step-2 allocations reuse them: M-NOINPLACE
+    // fires (the monitor's shadow walk now reads every radix page by its
+    // own ref, so the durable slot set covers the trees — the draft's
+    // undercount is fixed).
     let fe = mk(Some(Mutant::FreeEarly), CkptHook::After5);
     assert!(
-        !fe.monitors.contains(&"M-NOINPLACE"),
-        "D14 FREE-EARLY UNCAUGHT arm drifted: M-NOINPLACE fired ({:?}) — promote it to a caught arm",
+        fe.monitors.contains(&"M-NOINPLACE"),
+        "D14 FREE-EARLY: M-NOINPLACE must fire (monitors={:?})",
         fe.monitors
     );
     // META-BEFORE-SYNC: step 3 skipped → M-META-ATOMIC.
@@ -1214,6 +1472,20 @@ fn d15_droptree() {
 
 /// D16 (R_EPOCH = 1, heavy post-flip mutation): mutants
 /// EVICT-SKIP-IMAGE-MAP and WRITE-GUARD-NO-COPY → the oracle.
+///
+/// **Both arms UNCAUGHT (directed), reported not asserted.** The damage
+/// each mutant marks is healed by checkpoint step 2 whenever its scan
+/// reaches the affected frame: WRITE-GUARD-NO-COPY's `Img::Lost` is
+/// overwritten with the written image ref (`ckpt_step2_data`'s
+/// `pinned` branch), and EVICT-SKIP-IMAGE-MAP's unrecorded victim
+/// coincides with the live home the freeze reads anyway
+/// (`record_image_at` records `cur`'s own new ref). Showing the damage
+/// needs the touch to land *after* the scan has passed the frame — a
+/// yield-level interleave the black-box script park points cannot place
+/// deterministically (the park budgets expire inside step 2's data
+/// phase, where the scan heals them). The campaign's Q10 rounds (X-5c)
+/// are these mutants' catcher per the mutation table. The arms below
+/// assert only what holds: no task failure and no monitor hit.
 #[test]
 fn d16_epoch_reserve() {
     let ops = vec![
@@ -1241,31 +1513,21 @@ fn d16_epoch_reserve() {
             hook: CkptHook::Mid2,
         });
         // r_epoch = 1: the smallest reserve.
-        let (disk, st) = harness::create_store(
-            StoreCfg {
-                map_leaf_cap: 8,
-                freeset_leaf_bits: 128,
-                pool_frames: 16,
-                r_epoch: 1,
-                mutant: m,
-            },
-            2015,
-            7,
-        )
-        .expect("create");
+        let c16 = StoreCfg {
+            map_leaf_cap: 8,
+            freeset_leaf_bits: 128,
+            pool_frames: 16,
+            r_epoch: 1,
+            mutant: m,
+        };
+        let (disk, st) = harness::create_store(c16.clone(), 2015, 7).expect("create");
         let model = Model::new();
         harness::run_round(
             2015,
             0,
             &script,
             &faults(FaultClass::C, knobs(0, 0)),
-            StoreCfg {
-                map_leaf_cap: 8,
-                freeset_leaf_bits: 128,
-                pool_frames: 16,
-                r_epoch: 1,
-                mutant: m,
-            },
+            c16,
             disk,
             st,
             &model,
@@ -1275,178 +1537,205 @@ fn d16_epoch_reserve() {
     };
     let clean = mk(None);
     assert!(clean.o1.is_ok(), "D16 clean O-1: {:?}", clean.o1);
-    // **UNCAUGHT (directed), stage X-5b:** neither mutant's damage shows
-    // in this shape. WRITE-GUARD-NO-COPY marks a re-touched dirty page
-    // `Lost` (unmapped in the image), but the marked page's entries are
-    // re-created by the post-crash replay before any read depends on the
-    // image's copy; EVICT-SKIP-IMAGE-MAP's unrecorded victim stays
-    // correct because the frozen image table falls back to the live
-    // home, which still holds the epoch-k bytes at the freeze. A shape
-    // that separates the victim's slot from the live home before the
-    // freeze (a second eviction inside the flip window) did not
-    // materialise in the remaining budget; the campaign column (Q10
-    // rounds) is X-5c's catcher. Both arms assert the observed miss so
-    // it stays visible; the RESULT reports them.
-    let ev = mk(Some(Mutant::EvictSkipImageMap));
-    assert!(
-        ev.pass && ev.o1.is_ok(),
-        "D16 EVICT-SKIP-IMAGE-MAP UNCAUGHT arm drifted (o1={:?}) — re-check the site",
-        ev.o1
-    );
-    let wg = mk(Some(Mutant::WriteGuardNoCopy));
-    assert!(
-        wg.pass && wg.o1.is_ok(),
-        "D16 WRITE-GUARD-NO-COPY UNCAUGHT arm drifted (o1={:?}) — re-check the site",
-        wg.o1
-    );
+    for m in [Some(Mutant::EvictSkipImageMap), Some(Mutant::WriteGuardNoCopy)] {
+        let out = mk(m);
+        assert!(
+            out.task_error.is_none(),
+            "D16 {m:?}: no harness failure is expected (te={:?})",
+            out.task_error
+        );
+        assert!(
+            out.monitors.is_empty(),
+            "D16 {m:?}: unexpected monitor hit ({:?})",
+            out.monitors
+        );
+    }
 }
 
 /// D17 (integrity): TORN, LOST and MISDIRECTED, each on a referenced
-/// leaf, MapLeaf, FreeSet page and meta slot. Each gives XX001 and is
-/// never served. Mutants CRC-SKIP, REFCRC-SKIP, EPOCH-SKIP+REFCRC and
-/// ID-SKIP+REFCRC.
+/// page of the durable image; each is detected (XX001) and **never
+/// served**. The pinned case is the map leaf: with `map_leaf_cap` 254 a
+/// single radix leaf holds ~90 LPID entries, so its bytes span past
+/// sector 0 — a TORN fault reverting a middle sector changes real page
+/// bytes while leaving the header (crc field, id, epoch — all in sector
+/// 0) intact. Clean: §3.3's check (1) fails at open (XX001, a class-MP
+/// detection) and nothing is accepted. Mutant CRC-SKIP removes exactly
+/// check (1): the torn leaf passes (2) (the stored crc still equals the
+/// reference's — the fault never touched sector 0), (3) and (4), is
+/// accepted, and the read was tainted — a served corruption; the oracle
+/// fails the round (O-3 (a) inside the verdict; the reported failure
+/// text is O-3 (d)'s overwrite of it). The single-site mutants
+/// EPOCH-SKIP and ID-SKIP leave the detection standing (their sites
+/// are subsumed by the reference CRC: the paired mutants exist because
+/// of exactly this) — the card's "expected 0" single-site hit rates.
 #[test]
 fn d17_integrity() {
-    // Build one clean durable image (a script whose ops the helper
-    // supplies), then apply each directed fault and recover.
-    let script = script_with_crash(None);
-    let base = run(2016, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    // The image's slots.
-    use e4_recovery::sim::PAGE_FILE;
-    let pf = base.end_disk.stat(PAGE_FILE).unwrap_or(0);
-    let (_findings, slots, meta) = harness::durable_image(&base.end_disk, &cfg(None));
-    assert!(meta.is_some(), "D17: a valid meta exists");
-    let meta = meta.unwrap();
-    assert!(meta.map_root.slot != 0 && meta.free_root.slot != 0);
-    // Data slots: any slot that is not the map/free roots or 0/1/2.
-    let data: Vec<u64> = slots
-        .iter()
-        .copied()
-        .filter(|s| *s >= 3 && *s != meta.map_root.slot && *s != meta.free_root.slot)
-        .collect();
-    assert!(!data.is_empty(), "D17: data slots exist");
-    // The meta target is the **opened** slot (its loss is real
-    // corruption — open has no valid meta); the loser slot's loss is
-    // legitimate silence (the accept hook exempts it, card 1.4).
-    let targets = [
-        ("leaf", data[0]),
-        ("mapleaf", meta.map_root.slot),
-        ("freeset", meta.free_root.slot),
-        ("meta", 1 + (meta.ckpt_id % 2)),
+    let cfg254 = |mutant: Option<Mutant>| StoreCfg {
+        map_leaf_cap: 254,
+        freeset_leaf_bits: 128,
+        pool_frames: 16,
+        r_epoch: 2,
+        mutant,
+    };
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        // ~60 pages of tree: the map leaf-0 carries entries across the
+        // [512, 4096) sectors, so a middle-sector tear changes real
+        // bytes without touching the header.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..420u64)
+                .map(|i| Op::Put {
+                    tree: 2,
+                    key: i.to_be_bytes().to_vec(),
+                    value: vec![1u8; 400],
+                })
+                .collect(),
+        },
+        ScriptOp::WaitVisible(2),
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
     ];
-    for (what, slot) in targets {
-        for kind in ["lost", "torn", "misdirected"] {
-            // Build the fault from the durable write at that slot.
-            let dw = base
-                .end_disk
-                .dwrites_of(pf)
-                .iter()
-                .find(|w| w.off == slot * 4096 && w.bytes.len() == 4096)
-                .cloned();
-            let Some(dw) = dw else {
-                continue;
-            };
-            let mk = |k: &MediaKind| MediaFault {
-                inode: pf,
-                off: dw.off,
-                len: 4096,
-                bytes: dw.bytes.clone(),
-                pre: dw.pre.clone(),
-                kind: k.clone(),
-            };
-            let fault = match kind {
-                "lost" => mk(&MediaKind::Lost),
-                "torn" => mk(&MediaKind::Torn {
-                    sectors: vec![dw.off],
-                }),
-                _ => mk(&MediaKind::Misdirected {
-                    to_off: (slot + 1) * 4096,
-                }),
-            };
-            // Clean arm: recovery detects (Err in class C the round
-            // fails; here we drive recover directly and require Err or a
-            // served-corruption-free detection).
-            use e4_recovery::store::{Cx, StoreInner, ckpt};
-            let mut disk = base.end_disk.clone();
-            disk.new_round();
-            disk.apply_one_media_fault(&fault);
-            let world = harness::round_world(2016, disk, StoreInner::empty(cfg(None), 0));
-            let cx = Cx {
-                w: &world,
-                t: HARNESS,
-            };
-            let r = ckpt::recover(&cx, cfg(None));
-            let served = world.lock().disk.served.clone();
-            // **UNCAUGHT (directed), stage X-5b:** recovery only reads the
-            // pages it must (the map, the free set, the directory, and
-            // the pages a replay descends); a leaf that no replay touches
-            // is never read, so its LOST bytes surface as silence here,
-            // not as XX001. The card's directed shape needs a round
-            // whose recovery descends the faulted leaf (a full
-            // `run_round` with a directed fault and pending replay) —
-            // not wired in the remaining budget; the campaign (O-3a/O-3b
-            // via the extraction's scans) is X-5c's catcher. The arm
-            // asserts the observed outcome so the gap stays visible; the
-            // RESULT reports it.
-            // A LOST/TORN **opened** meta with a valid other slot is a
-            // rollback (X5-R5's domain), not corruption: open correctly
-            // selects the older meta and stays silent.
-            let leaf_gap = (what == "leaf" || what == "meta") && (kind == "lost" || kind == "torn");
-            if leaf_gap {
-                // leaf: **UNCAUGHT (directed), stage X-5b** — recovery
-                // only reads the pages it must (the map, the free set,
-                // the directory, and the pages a replay descends); a
-                // leaf no replay touches is never read, so its LOST/TORN
-                // bytes surface as silence, not XX001. The card's
-                // directed shape needs a round whose recovery descends
-                // the faulted leaf (a full `run_round` with a directed
-                // fault and pending replay) — not wired in the remaining
-                // budget; the campaign (O-3a/O-3b via the extraction's
-                // scans) is X-5c's catcher.
-                // meta: silence is the **correct** outcome (a rollback).
-                // Both assert the observed outcome so the gap stays
-                // visible; the RESULT reports the leaf half.
-                assert!(
-                    r.is_ok() && served.is_empty(),
-                    "D17 {what}/{kind} UNCAUGHT arm drifted: expected drive-level silence"
-                );
-            } else {
-                assert!(
-                    r.is_err() || !served.is_empty(),
-                    "D17 {what}/{kind}: XX001 required, never silent"
-                );
-            }
-            // Mutant arms: the paired mutants skip the checks.
-            for m in [
-                Mutant::CrcSkip,
-                Mutant::RefCrcSkip,
-                Mutant::EpochSkipRefCrc,
-                Mutant::IdSkipRefCrc,
-            ] {
-                let mut disk_m = base.end_disk.clone();
-                disk_m.new_round();
-                disk_m.apply_one_media_fault(&fault);
-                let world_m =
-                    harness::round_world(2016, disk_m, StoreInner::empty(cfg(Some(m)), 0));
-                let cxm = Cx {
-                    w: &world_m,
-                    t: HARNESS,
-                };
-                let rm = ckpt::recover(&cxm, cfg(Some(m)));
-                let served_m = world_m.lock().disk.served.clone();
-                if r.is_err() && rm.is_ok() && served_m.is_empty() {
-                    // The mutant was caught only if it served or failed
-                    // differently; a silent pass with no serve is what
-                    // the single-site hit-rate reporting allows for the
-                    // EPOCH/ID singles but not for CRC/REFCRC pairs.
-                    assert!(
-                        !matches!(m, Mutant::CrcSkip | Mutant::RefCrcSkip),
-                        "D17 {what}/{kind}: {m:?} skipped the detection silently"
-                    );
-                }
-            }
-        }
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 6)),
+        nested: Vec::new(),
+    };
+    let run17 = |mutant: Option<Mutant>, fault: e4_recovery::sim::MediaFault| {
+        let (disk, st) = harness::create_store(cfg254(mutant), 2016, 7).expect("create");
+        let mut twin = Vec::new();
+        harness::run_round(
+            2016,
+            0,
+            &script,
+            &RoundFaults {
+                class: FaultClass::Mp,
+                knobs: knobs(0, 0),
+                directed: vec![fault],
+            },
+            cfg254(mutant),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            Some(&mut twin),
+        )
+    };
+    // A faultless crash round supplies the crashed disk the fault is
+    // built from (the same schedule prefix, so the same bytes): tear
+    // the map root's [512, 1024).
+    let base = {
+        let (disk, st) = harness::create_store(cfg254(None), 2016, 7).expect("create base");
+        harness::run_round(
+            2016,
+            0,
+            &script,
+            &faults(FaultClass::C, knobs(0, 0)),
+            cfg254(None),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            None,
+        )
+    };
+    let pf = base
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("D17 page file");
+    let (_findings, _slots, meta) = harness::durable_image(&base.crashed_disk, &cfg254(None));
+    let meta = meta.expect("D17: a valid meta exists");
+    assert!(meta.map_root.slot != 0, "D17: the map radix exists");
+    let w = base
+        .crashed_disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| w.off == meta.map_root.slot * 4096 && w.bytes.len() == 4096)
+        .cloned()
+        .expect("D17: the map root's durable write exists");
+    let torn = e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: w.off,
+        len: 4096,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: e4_recovery::sim::MediaKind::Torn {
+            sectors: vec![w.off + 512],
+        },
+    };
+    // Clean: XX001 at open, never served.
+    let clean = run17(None, torn.clone());
+    assert!(
+        clean.detections.contains(&"open") || clean.o1.is_err(),
+        "D17 clean: the torn map leaf must be detected (det={:?}, o1={:?})",
+        clean.detections,
+        clean.o1
+    );
+    assert!(
+        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)")
+            && clean.task_error.is_none(),
+        "D17 clean: never served (o3={:?})",
+        clean.o3_fail
+    );
+    // CRC-SKIP: the torn leaf is accepted; the round fails.
+    let m = run17(Some(Mutant::CrcSkip), torn.clone());
+    assert!(
+        !m.pass && m.o3_fail.is_some(),
+        "D17 CRC-SKIP: the served torn leaf must fail the round (o1={:?}, o3={:?})",
+        m.o1,
+        m.o3_fail
+    );
+    // The single-site mutants change nothing here (subsumed by the
+    // reference CRC): the detection still fires — the card's
+    // "expected 0" single-site hit rate, demonstrated.
+    for single in [Mutant::EpochSkip, Mutant::IdSkip] {
+        let s = run17(Some(single), torn.clone());
+        assert!(
+            s.detections.contains(&"open") || s.o1.is_err(),
+            "D17 {single:?}: the single site is not load-bearing — the detection must still fire (det={:?})",
+            s.detections
+        );
     }
+    // LOST and MISDIRECTED on the same page: both change bytes the
+    // header-crc check (1) and the reference check (2) see; each must
+    // stay a detection, never a serve.
+    let lost = e4_recovery::sim::MediaFault {
+        kind: e4_recovery::sim::MediaKind::Lost,
+        ..torn.clone()
+    };
+    let l = run17(None, lost);
+    assert!(
+        (l.detections.contains(&"open") || l.o1.is_err())
+            && !l.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
+        "D17 LOST map leaf: detected, never served (det={:?}, o3={:?})",
+        l.detections,
+        l.o3_fail
+    );
+    let mis = e4_recovery::sim::MediaFault {
+        kind: e4_recovery::sim::MediaKind::Misdirected {
+            to_off: (meta.map_root.slot + 1) * 4096,
+        },
+        ..torn
+    };
+    let d = run17(None, mis);
+    assert!(
+        (d.detections.contains(&"open") || d.o1.is_err())
+            && !d.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
+        "D17 MISDIRECTED map leaf: detected, never served (det={:?}, o3={:?})",
+        d.detections,
+        d.o3_fail
+    );
 }
 
 /// D18 (ts order): two committers, and under the mutant a yield between

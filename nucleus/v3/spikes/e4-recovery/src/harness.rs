@@ -918,7 +918,23 @@ fn checkpointer_body(
             match r {
                 Err(Fail::Sim(SimFail::Crashed)) => return Ok(()),
                 Err(Fail::Sim(s)) => return Err(s),
-                Err(_) => return Ok(()),
+                Err(e) => {
+                    // A checkpoint that fails without a crash (the
+                    // I-GCW fail-stop, a poisoned store) is a round
+                    // failure: recorded, never swallowed (the D12b
+                    // shape — the draft exited silently here and the
+                    // round passed with no meta written at all).
+                    cx.with("h:ckfail", |c| {
+                        let h = c.h();
+                        if h.task_error.is_none() {
+                            h.task_error = Some(format!("checkpoint failed: {e:?}"));
+                        }
+                        h.workload_done = true;
+                        Ok(())
+                    })
+                    .ok();
+                    return Ok(());
+                }
                 Ok(()) => {}
             }
             if final_ckpt {
@@ -999,6 +1015,10 @@ pub struct RoundOutcome {
     /// The durable disk at the round's end (after recovery + the harness
     /// checkpoint).
     pub end_disk: SimDisk,
+    /// The crashed disk after F-CRASH and the round's media faults,
+    /// before recovery (the directed tests build their faults from its
+    /// durable-write history; Work 6's deterministic targets).
+    pub crashed_disk: SimDisk,
     /// The recovered store's state (for the next round).
     pub end_store: Option<StoreInner>,
     /// The truncation cut for the model (`c`).
@@ -1044,6 +1064,7 @@ impl Default for RoundOutcome {
             meta_rollback: false,
             rollback_slots: BTreeSet::new(),
             end_disk: SimDisk::new(),
+            crashed_disk: SimDisk::new(),
             end_store: None,
             cut: 0,
             class: FaultClass::C,
@@ -1405,7 +1426,11 @@ pub fn run_round(
             outcome.acked_lost = verdict.acked_lost.clone();
             outcome.amcheck_ii = findings_ii;
             outcome.cut = verdict.o1.clone().unwrap_or(outcome.lo);
+            outcome.meta_rollback = meta_rollback;
+            outcome.rollback_slots = rollback_slots.clone();
+            outcome.amcheck_i = amcheck_i.clone();
             outcome.end_disk = end_disk2.clone();
+            outcome.crashed_disk = disk.clone();
             outcome.end_store = Some(end_store.clone());
             // Work 2.1: the next round's model is this round's, truncated
             // at the matched cut.
@@ -1470,7 +1495,11 @@ pub fn run_round(
             outcome.hi = model.upper_bound(outcome.lo);
             outcome.detections = verdict.detections.iter().map(|d| site_name(*d)).collect();
             outcome.cut = outcome.lo;
+            outcome.meta_rollback = meta_rollback;
+            outcome.rollback_slots = rollback_slots.clone();
+            outcome.amcheck_i = amcheck_i.clone();
             outcome.end_disk = disk.clone();
+            outcome.crashed_disk = disk.clone();
             {
                 let mut m = clone_model(&model);
                 m.truncate(outcome.cut);
@@ -1709,7 +1738,7 @@ pub fn durable_image(
             );
         }
     };
-    // Walk the map radix and the free set from the durable bytes.
+    // The map radix and the free set from the durable bytes.
     let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
     let mut used: BTreeSet<u64> = BTreeSet::new();
     if meta.map_root.slot != 0 {
@@ -1763,6 +1792,52 @@ pub fn durable_image(
     used.insert(0);
     used.insert(1);
     used.insert(2);
+    // The meta bounds of card 3.8 (the harness walk reports them so
+    // O-2/(e) see them at the (i) point): `gc_w ≤ T`, `next_lpid` above
+    // every mapped LPID, `slot_count` at least every referenced slot.
+    // Structural findings carry no slot (the exactness half judges
+    // slotted findings only).
+    if meta.gc_w > meta.t {
+        out.push(Finding {
+            slot: None,
+            what: "gc_w > T".into(),
+        });
+    }
+    if meta.next_lpid <= flat.keys().copied().max().unwrap_or(0) {
+        out.push(Finding {
+            slot: None,
+            what: "next_lpid not above every mapped lpid".into(),
+        });
+    }
+    if let Some(m) = used.iter().copied().max()
+        && m >= meta.slot_count
+    {
+        out.push(Finding {
+            slot: None,
+            what: "slot_count below a referenced slot".into(),
+        });
+    }
+    // The meta slots are referenced pages of the image: a faulted one
+    // whose bytes still parse (a rollback's fallout — the durable bytes
+    // are the pre-write ones, tainted against the issued reference) is
+    // reported, so O-3 (e)'s completeness half holds for meta-slot
+    // faults too (the frozen oracle requires every tainted referenced
+    // slot to be named; the loser slot of an unwritten pair never
+    // differs from its issued bytes and stays silent). Gated on media
+    // faults existing: a **crash-dropped** volatile meta write leaves
+    // the same taint signature with no fault behind it, and reporting
+    // it would fail O-2's class-C cleanliness on every ordinary crash
+    // at a step-4/5 boundary (D1's After4).
+    if !disk.media.is_empty() {
+        for slot in [1u64, 2] {
+            if disk.range_tainted(pf, slot * 4096, 4096) {
+                out.push(Finding {
+                    slot: Some(slot),
+                    what: "stale durable meta slot (rollback fallout)".into(),
+                });
+            }
+        }
+    }
     (out, used, Some(meta))
 }
 

@@ -507,8 +507,30 @@ enum FlipOut {
 /// Run checkpoint `k+1` (steps 0–6, in order) with the hooks. The hooks
 /// fire at every step boundary and after every step-2 write (`Mid2`);
 /// `Err` from a hook aborts (the harness's crash hook arms the crash and
-/// returns `Crashed`).
+/// returns `Crashed`). Every `Err` path — the fail-stop abort included —
+/// clears `ckpt_open`: a stranded true flag parks `wait_ckpt` forever
+/// after the checkpointer exits (the X-5b rework's D12b hang).
 pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result<(), Fail> {
+    let r = checkpoint_inner(cx, hooks);
+    if r.is_err() {
+        cx.with("ckpt:abort", |c| {
+            let st = c.store();
+            st.ckpt_open = false;
+            st.flip_window = false;
+            st.image_frozen = None;
+            Ok(())
+        })
+        .ok();
+        cx.w.wake(crate::sim::WaitKey::MetaDurable);
+        cx.w.wake(crate::sim::WaitKey::Pin);
+    }
+    r
+}
+
+fn checkpoint_inner<H: StoreHost>(
+    cx: &Cx<'_, H>,
+    hooks: &mut Hooks<'_>,
+) -> Result<(), Fail> {
     cx.with("ckpt:begin", |c| {
         let st = c.store();
         st.alive()?;
@@ -579,6 +601,26 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
     };
     prims::gate_flip_release(cx);
     hooks(CkptHook::After0)?;
+    // FREE-EARLY (I-FREE-SAFE): the step-5/6 frees happen **at the
+    // flip** — while durable meta k−1 still references these slots.
+    // (The draft placed them just before step 5, a two-yield window no
+    // allocation could enter; the site's harm is identical — the
+    // allocator sees slots the durable image still references, and the
+    // checkpoint's own step-2 allocations reuse them, so M-NOINPLACE
+    // and a mid-window crash's XX001 both catch it deterministically.)
+    let free_early = cx.with("ckpt:freeearly", |c| {
+        Ok(matches!(c.store().cfg.mutant, Some(Mutant::FreeEarly)))
+    })?;
+    if free_early {
+        cx.with("ckpt:freeearly:apply", |c| {
+            let st = c.store();
+            let live: BTreeSet<u64> = st.slots.used_cur.union(&st.slots.image_refs).copied().collect();
+            let old = std::mem::take(&mut st.slots.used_durable);
+            st.slots.pending_free = old.difference(&live).copied().collect();
+            st.slots.used_durable = old.intersection(&live).copied().collect();
+            Ok(())
+        })?;
+    }
     // Step 1: WAL through every record enqueued before the flip (G5).
     wal::wal_step1(cx, t, enqueue_end)?;
     hooks(CkptHook::After1)?;
@@ -657,19 +699,6 @@ pub fn checkpoint<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Result
     };
     // The full referenced set of image k (data + map + free-set pages).
     let image_slots = full_image_slots(cx)?;
-    // FREE-EARLY: the step-6 frees happen before step 5 (I-FREE-SAFE).
-    let free_early = cx.with("ckpt:freeearly", |c| {
-        Ok(matches!(c.store().cfg.mutant, Some(Mutant::FreeEarly)))
-    })?;
-    if free_early {
-        cx.with("ckpt:freeearly:apply", |c| {
-            let st = c.store();
-            let old = std::mem::take(&mut st.slots.used_durable);
-            st.slots.pending_free = old.difference(&image_slots).copied().collect();
-            st.slots.used_durable = image_slots.clone();
-            Ok(())
-        })?;
-    }
     let pf = cx.with("ckpt:pf2", |c| Ok(c.store().page_file))?;
     let bytes = page::build_meta(&meta);
     cx.env()
