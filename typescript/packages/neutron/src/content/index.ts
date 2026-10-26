@@ -18,23 +18,7 @@ import { h } from "preact";
 import type * as preact from "preact";
 import * as preactJsxRuntime from "preact/jsx-runtime";
 import { renderToString } from "preact-render-to-string";
-import {
-  ZodArray,
-  ZodBoolean,
-  ZodDate,
-  ZodDefault,
-  ZodEffects,
-  ZodEnum,
-  ZodLiteral,
-  ZodNullable,
-  ZodNumber,
-  ZodObject,
-  ZodOptional,
-  ZodString,
-  ZodTypeAny,
-  ZodUnion,
-  z,
-} from "zod";
+import { z } from "zod";
 
 export { z };
 
@@ -1212,54 +1196,48 @@ async function toSerializableCollections(
   return result;
 }
 
-function schemaToTs(schema: ZodTypeAny): string {
-  if (schema instanceof ZodString) {
-    return "string";
-  }
-  if (schema instanceof ZodNumber) {
-    return "number";
-  }
-  if (schema instanceof ZodBoolean) {
-    return "boolean";
-  }
-  if (schema instanceof ZodDate) {
-    return "Date";
-  }
-  if (schema instanceof ZodArray) {
-    return `${schemaToTs(schema.element)}[]`;
-  }
-  if (schema instanceof ZodOptional) {
-    return `${schemaToTs(schema.unwrap())} | undefined`;
-  }
-  if (schema instanceof ZodNullable) {
-    return `${schemaToTs(schema.unwrap())} | null`;
-  }
-  if (schema instanceof ZodDefault) {
-    return schemaToTs(schema.removeDefault());
-  }
-  if (schema instanceof ZodEffects) {
-    return schemaToTs(schema.innerType());
-  }
-  if (schema instanceof ZodEnum) {
-    return (schema.options as string[]).map((v: string) => JSON.stringify(v)).join(" | ");
-  }
-  if (schema instanceof ZodLiteral) {
-    const val = schema.value;
-    return typeof val === "string" ? JSON.stringify(val) : String(val);
-  }
-  if (schema instanceof ZodUnion) {
-    return (schema.options as ZodTypeAny[]).map((o: ZodTypeAny) => schemaToTs(o)).join(" | ");
-  }
-  if (schema instanceof ZodObject) {
-    const shape = schema.shape;
-    const props = Object.entries(shape).map(([key, value]) => {
-      const field = value as ZodTypeAny;
-      if (field instanceof ZodOptional) {
-        return `${JSON.stringify(key)}?: ${schemaToTs(field.unwrap())};`;
-      }
-      return `${JSON.stringify(key)}: ${schemaToTs(field)};`;
-    });
-    return `{ ${props.join(" ")} }`;
+function schemaToTs(input: z.core.$ZodType): string {
+  const schema = input as z.core.$ZodTypes;
+  const def = schema._zod.def;
+  switch (def.type) {
+    case "string":
+      return "string";
+    case "number":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "date":
+      return "Date";
+    case "array":
+      return `${schemaToTs(def.element)}[]`;
+    case "optional":
+      return `${schemaToTs(def.innerType)} | undefined`;
+    case "nullable":
+      return `${schemaToTs(def.innerType)} | null`;
+    case "default":
+      return schemaToTs(def.innerType);
+    case "pipe":
+      // .transform() pipes into a transform (type the input); z.preprocess()
+      // pipes out of one (type the schema it feeds).
+      return schemaToTs((def.in as z.core.$ZodTypes)._zod.def.type === "transform" ? def.out : def.in);
+    case "enum":
+      return Object.values(def.entries)
+        .map((v) => (typeof v === "string" ? JSON.stringify(v) : String(v)))
+        .join(" | ");
+    case "literal":
+      return def.values.map((v) => (typeof v === "string" ? JSON.stringify(v) : String(v))).join(" | ");
+    case "union":
+      return def.options.map((o) => schemaToTs(o)).join(" | ");
+    case "object": {
+      const props = Object.entries(def.shape).map(([key, field]) => {
+        const fieldDef = (field as z.core.$ZodTypes)._zod.def;
+        if (fieldDef.type === "optional") {
+          return `${JSON.stringify(key)}?: ${schemaToTs(fieldDef.innerType)};`;
+        }
+        return `${JSON.stringify(key)}: ${schemaToTs(field)};`;
+      });
+      return `{ ${props.join(" ")} }`;
+    }
   }
   return "unknown";
 }

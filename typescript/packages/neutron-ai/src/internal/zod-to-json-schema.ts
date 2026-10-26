@@ -40,8 +40,11 @@ function fromV4(schema: AnyZod): Record<string, unknown> {
     case "string":
       return { type: "string" };
     case "number": {
-      const format = typeof def.format === "string" ? def.format : "";
-      return { type: format.includes("int") ? "integer" : "number" };
+      // z.int() carries the format on the def; z.number().int() carries it
+      // on a number_format check.
+      const formats = [def.format, ...(def.checks ?? []).map((c: AnyZod) => c?._zod?.def?.format)];
+      const isInt = formats.some((f) => typeof f === "string" && f.includes("int"));
+      return { type: isInt ? "integer" : "number" };
     }
     case "int":
       return { type: "integer" };

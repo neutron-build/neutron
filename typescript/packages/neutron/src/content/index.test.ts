@@ -105,6 +105,65 @@ describe("content collections", () => {
     expect(types).toContain('"summary"?: string;');
   });
 
+  it("declares a type for every schema construct it understands", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "neutron-content-types-"));
+    tempRoots.push(root);
+    await fs.mkdir(path.join(root, "src", "content", "things"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "src", "content", "config.js"),
+      `
+import { z } from "zod";
+
+export const collections = {
+  things: {
+    type: "data",
+    schema: z.object({
+      name: z.string(),
+      count: z.number(),
+      live: z.boolean().default(true),
+      at: z.date(),
+      tags: z.array(z.string()),
+      note: z.string().nullable(),
+      kind: z.enum(["a", "b"]),
+      exact: z.literal("x"),
+      either: z.union([z.string(), z.number()]),
+      slug: z.string().transform((v) => v.toLowerCase()),
+      parsed: z.preprocess((v) => Number(v), z.number()),
+      checked: z.string().refine((v) => v.length > 0),
+      nested: z.object({ deep: z.string().optional() }),
+      extra: z.any(),
+    }),
+  },
+};
+`,
+      "utf-8"
+    );
+    await prepareContentCollections({ rootDir: root });
+
+    const types = await fs.readFile(
+      path.join(root, "src", "content", ".neutron-content.d.ts"),
+      "utf-8"
+    );
+    for (const field of [
+      '"name": string;',
+      '"count": number;',
+      '"live": boolean;',
+      '"at": Date;',
+      '"tags": string[];',
+      '"note": string | null;',
+      '"kind": "a" | "b";',
+      '"exact": "x";',
+      '"either": string | number;',
+      '"slug": string;',
+      '"parsed": number;',
+      '"checked": string;',
+      '"nested": { "deep"?: string; };',
+      '"extra": unknown;',
+    ]) {
+      expect(types).toContain(field);
+    }
+  });
+
   it("surfaces contextual MDX compile errors on render", async () => {
     const root = await makeBrokenMdxFixtureProject();
     process.chdir(root);
