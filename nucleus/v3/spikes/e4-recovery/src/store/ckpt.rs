@@ -1111,6 +1111,7 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
         slot_count = live;
         grew = true;
     }
+    let total_bits = (slot_count - 3) + img_next_lpid;
     cx.with("fs:building", |c| {
         let st = c.store();
         for &s in fs_slots.iter() {
@@ -1142,9 +1143,13 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
     }
     // Serialise the leaves (bit index → free). The `used` and mapped sets
     // are the frozen snapshot; no step inside reads the live store.
+    // `fs_slots`'s first `n_leaves` entries are the leaves; the rest are
+    // the inner pages' pre-allocated slots (§13 step 2's "allocate the
+    // FreeSet pages first").
     let pf = cx.with("fs:pf", |c| Ok(c.store().page_file))?;
+    let n_leaves = total_bits.div_ceil(leaf_bits) as usize;
     let mut leaf_refs: Vec<Option<Ref>> = Vec::new();
-    for (j, &slot) in fs_slots.iter().enumerate() {
+    for (j, &slot) in fs_slots.iter().take(n_leaves).enumerate() {
         let base = j as u64 * leaf_bits;
         let used_ref = &used;
         let mapped_ref = &img_lpids_mapped;
@@ -1169,7 +1174,15 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
             crc: page::header_crc(&bytes),
         }));
     }
-    // Inner levels.
+    // Inner levels — at the **pre-allocated** slots (the gate's N2
+    // exposure: the draft built them with `write_fresh`, landing them on
+    // fresh slots the bitmap had never marked used — the free set then
+    // marked its own inner pages free, I-FREE-EXACT, and every
+    // amcheck-judged image failed "free bitmap marks a referenced
+    // slot"). §13 step 2: allocate the FreeSet pages first, then
+    // serialise — `fs_slots` holds every page of the radix, leaves
+    // first, then the inner levels in build order.
+    let mut fs_inner = n_leaves;
     let mut level = leaf_refs;
     let mut depth: u8 = 0;
     while level.len() > 1 {
@@ -1182,16 +1195,27 @@ fn write_free_set<H: StoreHost>(cx: &Cx<'_, H>) -> Result<(Ref, u64, u64), Fail>
             let p = fan.checked_pow(depth as u32 + 1).unwrap_or(u64::MAX);
             let base = (bi as u64).saturating_mul(leaf_bits.saturating_mul(p));
             let bytes = page::build_radix_inner(base, page::KIND_FREE_INNER, chunk);
-            let r = prims::write_fresh(cx, &bytes)?;
+            let Some(slot) = fs_slots.get(fs_inner).copied() else {
+                return Err(Fail::Invalid("free-set inner slot underflow".into()));
+            };
+            fs_inner += 1;
+            cx.env()
+                .write_at(pf, slot * page::PAGE as u64, &bytes)
+                .map_err(Fail::Sim)?;
             cx.with("fs:markinner", |c| {
-                c.store().slots.used_cur.insert(r.slot);
+                c.store().slots.used_cur.insert(slot);
                 Ok(())
             })?;
-            up.push(Some(r));
+            up.push(Some(Ref {
+                slot,
+                epoch: page::header_epoch(&bytes),
+                crc: page::header_crc(&bytes),
+            }));
         }
         level = up;
         depth += 1;
     }
+    debug_assert_eq!(fs_inner, fs_slots.len(), "every fs slot consumed");
     let root = level.first().copied().flatten().unwrap_or_default();
     Ok((root, slot_count, img_next_lpid))
 }

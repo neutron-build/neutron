@@ -48,6 +48,15 @@ fn put(i: u64, v: u64) -> Op {
     }
 }
 
+/// A put with an explicit value length (D7's record-length padding).
+fn putv(i: u64, v: u8, n: usize) -> Op {
+    Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; n],
+    }
+}
+
 /// The catalog publication of `tree` (O-1 judges published trees only,
 /// so every directed workload publishes the tree it writes).
 fn publish(tree: u64) -> Op {
@@ -143,6 +152,11 @@ fn d1_every_boundary() {
                 out.o2_fail
             );
             assert!(out.o1.is_ok(), "D1 {name} {hook:?}: O-1: {:?}", out.o1);
+            assert!(
+                out.pass,
+                "D1 {name} {hook:?}: the clean round must pass (te={:?}, dl={}, baton={})",
+                out.task_error, out.deadlock, out.baton
+            );
             n += 1;
         }
     }
@@ -198,8 +212,12 @@ fn d2_marked_chunk() {
     };
     // Clean: the chunked transaction survives whole.
     let clean = run(2001, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D2 clean O-1: {:?}", clean.o1);
-    let c = clean.o1.unwrap();
+    assert!(
+        clean.pass,
+        "D2 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
+    let c = clean.o1.clone().expect("D2 clean O-1");
     assert!(c >= 3, "D2 clean: the chunked txn (ts 3) is whole (c={c})");
     // Mutant: START-LSN-MARKED-CHUNK drops the marked case.
     let m = run(
@@ -209,9 +227,10 @@ fn d2_marked_chunk() {
         Some(Mutant::StartLsnMarkedChunk),
     );
     assert!(
-        !m.pass || m.o1.is_err() || m.o1.clone().unwrap() < 3,
-        "D2 mutant: the chunked txn must be lost (o1={:?})",
-        m.o1
+        m.o1.is_err() || m.o1.clone().unwrap_or(0) < 3,
+        "D2 mutant: the chunked txn must be lost — the named catcher, not any failure (o1={:?}, pass={})",
+        m.o1,
+        m.pass
     );
 }
 
@@ -268,8 +287,12 @@ fn d3_open_chunk() {
         nested: Vec::new(),
     };
     let clean = run(2002, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D3 clean O-1: {:?}", clean.o1);
-    let c = clean.o1.unwrap();
+    assert!(
+        clean.pass,
+        "D3 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
+    let c = clean.o1.clone().expect("D3 clean O-1");
     assert!(c >= 3, "D3 clean: the chunked txn (ts 3) is whole (c={c})");
     let m = run(
         2002,
@@ -278,9 +301,10 @@ fn d3_open_chunk() {
         Some(Mutant::StartLsnPastChunk),
     );
     assert!(
-        !m.pass || m.o1.is_err() || m.o1.clone().unwrap() < 3,
-        "D3 mutant: the chunked txn must be lost (o1={:?})",
-        m.o1
+        m.o1.is_err() || m.o1.clone().unwrap_or(0) < 3,
+        "D3 mutant: the chunked txn must be lost — the named catcher (o1={:?}, pass={})",
+        m.o1,
+        m.pass
     );
 }
 
@@ -347,7 +371,12 @@ fn d4_wal_sync_t_only() {
         nested: Vec::new(),
     };
     let clean = run(2003, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    let c = clean.o1.expect("D4 clean O-1");
+    assert!(
+        clean.pass,
+        "D4 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
+    let c = clean.o1.clone().expect("D4 clean O-1");
     assert!(c >= 2, "D4 clean: c1 recovered whole (c={c})");
     let m = run(
         2003,
@@ -356,8 +385,8 @@ fn d4_wal_sync_t_only() {
         Some(Mutant::WalSyncTOnly),
     );
     assert!(
-        !m.pass || m.o1.is_err() || m.o1.clone().unwrap() < 2 || m.monitors.contains(&"M-CKPT-T"),
-        "D4 mutant: c1's record must be unsynced (o1={:?}, monitors={:?})",
+        m.o1.is_err() || m.o1.clone().unwrap_or(0) < 2 || m.monitors.contains(&"M-CKPT-T"),
+        "D4 mutant: c1 must be lost or M-CKPT-T must fire — the named catchers (o1={:?}, monitors={:?})",
         m.o1,
         m.monitors
     );
@@ -424,6 +453,11 @@ fn d5_split_straddling_flip() {
         nested: Vec::new(),
     };
     let clean = run(2004, &mk(100), &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        clean.pass,
+        "D5 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
     assert!(clean.o1.is_ok(), "D5 clean O-1: {:?}", clean.o1);
     assert!(
         clean.amcheck_ii.is_empty(),
@@ -520,23 +554,33 @@ fn d6_double_crash_idempotent() {
 }
 
 /// D7 (zombie tail): the valid end sits at a torn record followed by
-/// intact volatile records; recover; commit shorter records; crash. No
-/// zombie is replayed. Mutant TRUNCATE-LOGICAL-ONLY.
-///
-/// **Stage status.** The single-round arms run (round 1's clean recovery
-/// passes O-1 at the torn cut). The two-round arm — where the mutant's
-/// un-zeroed tail lines up with round 2's shorter appends — is
-/// **UNCAUGHT (directed)**: in every seed tried, round 1's torn
-/// resolution kept the zombie records *written* (so round 1's own cut
-/// legitimately covers them), and round 2's raw-cut finding fires
-/// identically clean and mutant — the shapes the card's harm needs
-/// (records past round 1's valid end replayed against a model truncated
-/// below them) did not materialise through the black-box harness in the
-/// remaining budget. The mutation table's campaign column (multi-round
-/// seeds) is this mutant's catcher; the arm asserts only what holds
-/// (round 1 clean) and no assert-pass.
+/// an intact one; recover, append a record of the **same byte length**,
+/// crash again — §12.5's position check lines the zombie up with the
+/// new append (the gate's N6 construction). Round 1's tail records are
+/// tuned: seven 190-byte puts make each record exactly 1536 bytes
+/// (three sectors, at the §7.3 value cap), and the two padding commits
+/// (a 19-byte c2 and a 399-byte filler) make the first tail start
+/// sector-aligned at 1024 — so a directed TORN fault on tail 3's first
+/// sector (offset 4096) leaves tail 4 intact at exactly
+/// `valid_end + 1536`. (An in-place tear cannot be drawn
+/// from F-CRASH here: the writer syncs every batch, so each sector has
+/// a single volatile image and the draw is all-or-nothing per batch —
+/// the directed fault is the deterministic equal of the random tear.)
+/// Round 2 appends one 2560-byte commit at the valid end; the crash
+/// drops volatile writes.
+/// Clean: round 1's G2 physically zeroed the tail, so round 2's reader
+/// stops at the zeros — no zombie replayed, the round passes.
+/// Mutant TRUNCATE-LOGICAL-ONLY (recovery moves its append position
+/// only): the zombie's bytes survive with a matching lsn, round 2's
+/// recovery replays it, and the oracle fails O-1 on a commit round 2's
+/// model (truncated at round 1's cut) no longer has.
 #[test]
 fn d7_zombie_tail() {
+    let big = |i: u64, v: u8| Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; 190],
+    };
     let ops = vec![
         ScriptOp::Commit {
             sync_on: true,
@@ -546,46 +590,168 @@ fn d7_zombie_tail() {
                 publish(2),
             ],
         },
+        // The padding pair: c2 (10× 19-byte puts) and a 399-byte filler
+        // put land the first tail record exactly at offset 1024.
         ScriptOp::Commit {
             sync_on: true,
-            ops: (0..10).map(|i| put(i, 1)).collect(),
-        },
-        // The volatile tail: torn/lost at the crash; a prefix survives
-        // as the zombie shape.
-        ScriptOp::Commit {
-            sync_on: false,
-            ops: (10..14).map(|i| put(i, 2)).collect(),
+            ops: (0..10).map(|i| putv(i, 1, 19)).collect(),
         },
         ScriptOp::Commit {
-            sync_on: false,
-            ops: (14..18).map(|i| put(i, 2)).collect(),
+            sync_on: true,
+            ops: vec![putv(999, 5, 399)],
+        },
+        // Four 1536-byte tail records, sector-aligned.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..7).map(|i| big(10 + i, 2)).collect(),
         },
         ScriptOp::Commit {
-            sync_on: false,
-            ops: (18..22).map(|i| put(i, 2)).collect(),
+            sync_on: true,
+            ops: (0..7).map(|i| big(20 + i, 2)).collect(),
         },
-        ScriptOp::Yields(3),
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..7).map(|i| big(30 + i, 2)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..7).map(|i| big(40 + i, 2)).collect(),
+        },
+        ScriptOp::Yields(1),
     ];
-    let mut script = script_with_crash(None);
-    script.tasks[0].ops = ops;
-    script.crash = Some(CrashSpec::TaskYield(1, 5));
-    // Torn resolution keeps a prefix of the volatile tail.
-    let clean = run(2006, &script, &faults(FaultClass::C, knobs(0, 1000)), None);
-    assert!(clean.o1.is_ok(), "D7 clean O-1: {:?}", clean.o1);
-    assert!(clean.o3_fail.is_none(), "D7 clean O-3: {:?}", clean.o3_fail);
-    // The mutant round: logical truncation only. No zombie may be
-    // *served* here either (O-3 (a) clean); the multi-round harm is the
-    // campaign's.
-    let m = run(
-        2006,
-        &script,
-        &faults(FaultClass::C, knobs(0, 1000)),
-        Some(Mutant::TruncateLogicalOnly),
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 8)),
+        nested: Vec::new(),
+    };
+    // The torn sector: tail 3's first sector (offset 1024 + 2·2560),
+    // from the durable write covering it.
+    let base = run(2006, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass,
+        "D7 base: the faultless round passes (te={:?})",
+        base.task_error
+    );
+    let wf = base
+        .crashed_disk
+        .stat("/wal/0000000000000000.log")
+        .expect("D7: the WAL segment exists");
+    let torn_at = 1024 + 2 * 1536;
+    let w = base
+        .crashed_disk
+        .dwrites_of(wf)
+        .iter()
+        .rev()
+        .find(|w| w.off <= torn_at && torn_at < w.off + w.bytes.len() as u64)
+        .cloned()
+        .expect("D7: the write covering tail 3's first sector");
+    let fault = e4_recovery::sim::MediaFault {
+        inode: wf,
+        off: w.off,
+        len: w.bytes.len() as u64,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: e4_recovery::sim::MediaKind::Torn {
+            sectors: vec![torn_at],
+        },
+    };
+    let mk1 = |mutant: Option<Mutant>| {
+        let (disk, st) = harness::create_store(cfg(mutant), 2006, 7).expect("create");
+        let mut twin = Vec::new();
+        harness::run_round(
+            2006,
+            0,
+            &script,
+            &RoundFaults {
+                class: FaultClass::Mw,
+                knobs: knobs(0, 0),
+                directed: vec![fault.clone()],
+                no_r_taint: false,
+            },
+            cfg(mutant),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            Some(&mut twin),
+        )
+    };
+    // Round 1: the valid end sits at tail 3 (torn), tail 4 intact past
+    // it; both arms recover to the same cut (the zombie is unread
+    // behind the valid end either way).
+    let clean1 = mk1(None);
+    assert!(
+        clean1.pass && clean1.o1.is_ok(),
+        "D7 round-1 clean: the torn cut recovers (o1={:?}, te={:?})",
+        clean1.o1,
+        clean1.task_error
+    );
+    let m1 = mk1(Some(Mutant::TruncateLogicalOnly));
+    assert!(
+        m1.pass && m1.o1.is_ok(),
+        "D7 round-1 mutant: the single-round recovery still passes (o1={:?})",
+        m1.o1
     );
     assert!(
-        !m.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
-        "D7 mutant: no corruption may be served (o3={:?})",
-        m.o3_fail
+        !m1.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
+        "D7 round-1 mutant: no corruption may be served (o3={:?})",
+        m1.o3_fail
+    );
+
+    // Round 2: one 1536-byte commit (the same seven-put shape) appended
+    // at the valid end, then a crash dropping every volatile write.
+    let round2 = |mutant: Option<Mutant>| {
+        let r1 = mk1(mutant);
+        let script2 = Script {
+            tasks: vec![ScriptTask {
+                ops: vec![
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: (0..7).map(|i| big(50 + i, 9)).collect(),
+                    },
+                    ScriptOp::Yields(1),
+                ],
+            }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, 2)),
+            nested: Vec::new(),
+        };
+        harness::run_round(
+            2007,
+            1,
+            &script2,
+            &faults(FaultClass::C, knobs(0, 0)),
+            cfg(mutant),
+            r1.end_disk.clone(),
+            r1.end_store.clone().expect("D7 round-1 end store"),
+            &r1.end_model,
+            r1.cut,
+            None,
+        )
+    };
+    // Clean: G2's zeros — the reader stops where the zombie was; the
+    // round passes.
+    let clean2 = round2(None);
+    assert!(
+        clean2.pass && clean2.o1.is_ok(),
+        "D7 round-2 clean: the zeroed tail must not replay (o1={:?}, o3={:?}, te={:?})",
+        clean2.o1,
+        clean2.o3_fail,
+        clean2.task_error
+    );
+    // Mutant: the zombie lines up positionally and is replayed — the
+    // oracle fails on a commit round 2's model no longer has.
+    let m2 = round2(Some(Mutant::TruncateLogicalOnly));
+    assert!(
+        !m2.pass && m2.o1.is_err(),
+        "D7 round-2 mutant: the lined-up zombie must be replayed and fail O-1 (o1={:?}, pass={})",
+        m2.o1,
+        m2.pass
     );
 }
 
@@ -682,6 +848,11 @@ fn d9_dropped_rename() {
         nested: Vec::new(),
     };
     let clean = run(2008, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        clean.pass,
+        "D9 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
     let c = clean.o1.clone().expect("D9 clean O-1");
     assert!(
         c >= 9,
@@ -695,9 +866,10 @@ fn d9_dropped_rename() {
         Some(Mutant::RenameNoDirsync),
     );
     assert!(
-        !m.pass || m.o1.is_err() || m.o1.clone().unwrap_or(0) < 9,
-        "D9 mutant: the acked commits must be lost (o1={:?})",
-        m.o1
+        m.o1.is_err() || m.o1.clone().unwrap_or(0) < 9,
+        "D9 mutant: the acked commits must be lost — the named catcher (o1={:?}, pass={})",
+        m.o1,
+        m.pass
     );
 }
 
@@ -835,30 +1007,29 @@ fn d10_lost_meta() {
 
 /// D10b (X5-R5's R and its R-taint, card Work 14): a rollback whose
 /// reused slots the exception must excuse.
-/// 1. One chunked load (the image spans ~90 pages), then two forced
+/// 1. One chunked load (the image spans ~90 pages), then three forced
 ///    checkpoints with **no traffic between them**: k=1 images the load,
 ///    k=2 rewrites the free set to fresh slots and its step 6 frees
-///    meta 1's free-set pages. A small SyncOn commit between k=2 and k=3
-///    allocates its split pages on exactly those freed slots (the
-///    lowest free) — epoch-stamped tree pages where meta 1's radix
-///    embeds epoch-0 free-set refs, so §3.3 rejects every reuse (the
-///    N1 rework: with no traffic at all, image 3's free set reuses the
-///    slots with **byte-identical** bitmaps — physically addressed
-///    pages stamp epoch 0 and positional ids, so the reuse passed §3.3
-///    and the clean arm served). k=3 crashes at After3; the start
-///    segment of meta 1 is not recycled, so G3 does not fire.
+///    meta 1's free-set pages, and k=3's own free-set allocations reuse
+///    exactly those freed slots (the lowest free). The pairing is
+///    epoch-0 free-set page against epoch-0 free-set ref at a
+///    **different radix base** (the N1/fs-inner rework made image 3's
+///    free-set layout differ from image 1's: the pre-allocated inner
+///    slots shift every leaf), so §3.3's id check rejects the reuse
+///    while the epoch check alone would not. k=3 crashes at After3; the
+///    start segment of meta 1 is not recycled, so G3 does not fire.
 /// 2. A directed LOST fault on meta 2's durable write makes open select
 ///    meta 1 — a meta rollback.
 /// 3. Clean: amcheck (i) reports the reused slots, the harness puts
 ///    them in `R`, O-3 (e) passes, and no reused slot is ever accepted.
-/// 4. ID-SKIP+REFCRC (the card's paired mutant): with checks (2) and
-///    (3) off, a reused slot's page passes what is left — the accept is
-///    a **serve through the R-taint** (X5-R5: every slot in R counts as
-///    tainted from open until the store next writes it), O-3 (a) fails
-///    the round (the gate's N5: this refutes the run-1 "UNCAUGHT-
-///    directed" claim for the R-taint's wiring). REFCRC-SKIP alone
-///    stays a detection (the id check (3) fires on the reused tree
-///    pages) — the mutant's directed catcher is D17's second half.
+/// 4. REFCRC-SKIP (the card's own arm — the mutation table's
+///    instrumentation check): the reuse pairs the same radix base and
+///    epoch with different bitmap content, so the reference CRC is the
+///    only discriminator; with it off the reused page is accepted
+///    through the tainted read — the R-taint catches the serve and
+///    O-3 (a) fails the round. ID-SKIP+REFCRC (arm 5) serves identically
+///    (the gate's N5 refutation of the run-1 "UNCAUGHT-directed"
+///    claim); D17's second half remains the same-LPID tree-page shape.
 /// 5. The R-taint wiring pin (the gate's G5, call-site level): the same
 ///    ID-SKIP+REFCRC round with the R-taint forced off (`no_r_taint`)
 ///    **passes silently** — the serve goes unjudged. With the wiring in,
@@ -889,20 +1060,6 @@ fn d10b_rollback_exception() {
         ScriptOp::WaitVisible(2),
         ScriptOp::Checkpoint,
         ScriptOp::Checkpoint,
-        // The inter-image traffic (step 1): its split pages take the
-        // freed free-set slots, so the reuse pairs epoch-stamped tree
-        // pages with meta 1's epoch-0 free-set refs.
-        ScriptOp::Commit {
-            sync_on: true,
-            ops: (0..20u64)
-                .map(|i| Op::Put {
-                    tree: 2,
-                    key: (5000 + i).to_be_bytes().to_vec(),
-                    value: vec![7u8; 400],
-                })
-                .collect(),
-        },
-        ScriptOp::WaitVisible(3),
         ScriptOp::Checkpoint,
         ScriptOp::Yields(3),
     ];
@@ -1002,22 +1159,22 @@ fn d10b_rollback_exception() {
         "D10b clean: the reused free-set pages give XX001 at open (det={:?})",
         clean.detections
     );
-    // Arm 4 (REFCRC-SKIP alone): the id check (3) still fires on every
-    // reused tree page — the round stays a detection and **never a
-    // serve** (the run-1 argument, confirmed by the gate's N5; an MP
-    // round with a legal detection passes — what is pinned is that the
-    // mutant cannot slip the reuse past the remaining checks).
+    // Arm 4 (REFCRC-SKIP alone — the card's own arm, the mutation
+    // table's instrumentation check): the reuse pairs the same radix
+    // base and epoch with different bitmap content, so check (2) is
+    // the only discriminator; with it off, the reused page is accepted
+    // through the tainted read — a serve the R-taint catches (O-3 (a)
+    // fails the round).
     let refcrc = mk(Some(Mutant::RefCrcSkip), false);
     assert!(
-        refcrc.detections.contains(&"open") && !refcrc.served,
-        "D10b REFCRC-SKIP: a detection, never served (det={:?}, served={}, o3={:?})",
-        refcrc.detections,
+        !refcrc.pass && refcrc.served,
+        "D10b REFCRC-SKIP: the reused page must be served via the R-taint (pass={}, served={}, o3={:?})",
+        refcrc.pass,
         refcrc.served,
         refcrc.o3_fail
     );
-    // Arm 5 (ID-SKIP+REFCRC): the reused slot's page passes the
-    // disabled checks, the accept is a serve through the R-taint, and
-    // O-3 (a) fails the round (the gate's N5 refutation).
+    // Arm 5 (ID-SKIP+REFCRC, the gate's N5 refutation): the same serve
+    // with the id check off too.
     let idref = mk(Some(Mutant::IdSkipRefCrc), false);
     assert!(
         !idref.pass && idref.served,
@@ -1085,9 +1242,10 @@ fn d11_publish() {
         Some(Mutant::PublishBeforeMeta),
     );
     assert!(
-        m.o1.is_err() || !m.pass,
-        "D11 mutant: the published tree must be empty at the cut (o1={:?})",
-        m.o1
+        m.o1.is_err(),
+        "D11 mutant: the published tree must be empty at the cut — O-1 fails (o1={:?}, pass={})",
+        m.o1,
+        m.pass
     );
 }
 
@@ -1185,7 +1343,11 @@ fn d12_gcw() {
         hook: CkptHook::After5,
     });
     let clean = run(2011, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D12 clean O-1: {:?}", clean.o1);
+    assert!(
+        clean.pass,
+        "D12 clean: the round must pass (o1={:?})",
+        clean.o1
+    );
     assert!(
         clean.gc_w >= 2,
         "D12 clean: the recovered gc_w {} must be ≥ the swept w",
@@ -1198,8 +1360,8 @@ fn d12_gcw() {
         Some(Mutant::GcwNotRecorded),
     );
     assert!(
-        m.gc_w < 2 || !m.pass || m.o1.is_err(),
-        "D12 mutant: gc_w must not be recorded (gc_w={})",
+        m.gc_w < 2,
+        "D12 mutant: gc_w must not be recorded — the named catcher (gc_w={})",
         m.gc_w
     );
 }
@@ -1245,7 +1407,11 @@ fn d13_entry_uniqueness() {
         nested: Vec::new(),
     };
     let clean = run(2012, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D13 clean O-1: {:?}", clean.o1);
+    assert!(
+        clean.pass,
+        "D13 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
     // Drive the store directly on the round's end state: recover, then
     // insert the identical entry (a no-op) and a different value (XX001).
     use e4_recovery::sim::HARNESS;
@@ -1433,8 +1599,9 @@ fn d14_monitors() {
     // BITMAP-OMITS-FREESET-PAGES: amcheck (O-2).
     let bo = mk(Some(Mutant::BitmapOmitsFreesetPages), CkptHook::After6);
     assert!(
-        bo.o2_fail.is_some() || !bo.amcheck_ii.is_empty() || !bo.pass,
-        "D14 BITMAP-OMITS-FREESET-PAGES: amcheck must fail"
+        bo.o2_fail.is_some(),
+        "D14 BITMAP-OMITS-FREESET-PAGES: O-2 must fail on the bitmap (o2={:?})",
+        bo.o2_fail
     );
     // The clean arm: no monitor fires.
     let clean = mk(None, CkptHook::After6);
@@ -1443,7 +1610,11 @@ fn d14_monitors() {
         "D14 clean: monitors fired: {:?}",
         clean.monitors
     );
-    assert!(clean.o1.is_ok(), "D14 clean O-1: {:?}", clean.o1);
+    assert!(
+        clean.pass,
+        "D14 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
 }
 
 /// N1 regression (the gate's 2026-10-26 round-2 verdict, finding 1): the
@@ -1589,7 +1760,11 @@ fn d15_droptree() {
     script.tasks[0].ops = ops;
     script.crash = Some(CrashSpec::TaskYield(1, 4));
     let clean = run(2014, &script, &faults(FaultClass::C, knobs(0, 0)), None);
-    assert!(clean.o1.is_ok(), "D15 clean O-1: {:?}", clean.o1);
+    assert!(
+        clean.pass,
+        "D15 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
     assert!(
         clean.amcheck_ii.is_empty(),
         "D15 clean amcheck: {:?}",
@@ -1603,9 +1778,10 @@ fn d15_droptree() {
     );
 
     assert!(
-        !m.amcheck_ii.is_empty() || m.o2_fail.is_some() || !m.pass,
-        "D15 mutant: LPID exactness must fail (amcheck={})",
-        m.amcheck_ii.len()
+        !m.amcheck_ii.is_empty() || m.o2_fail.is_some(),
+        "D15 mutant: LPID exactness must fail amcheck — the named catcher (amcheck={}, o2={:?})",
+        m.amcheck_ii.len(),
+        m.o2_fail
     );
 }
 
@@ -1675,7 +1851,11 @@ fn d16_epoch_reserve() {
         )
     };
     let clean = mk(None);
-    assert!(clean.o1.is_ok(), "D16 clean O-1: {:?}", clean.o1);
+    assert!(
+        clean.pass,
+        "D16 clean: the round must pass (o1={:?}, te={:?})",
+        clean.o1, clean.task_error
+    );
     for m in [
         Some(Mutant::EvictSkipImageMap),
         Some(Mutant::WriteGuardNoCopy),
@@ -1831,8 +2011,14 @@ fn d17_integrity() {
             sectors: vec![w.off + 512],
         },
     };
-    // Clean: XX001 at open, never served.
+    // Clean: XX001 at open, never served; the round passes (a legal
+    // MP detection).
     let clean = run17(None, torn.clone());
+    assert!(
+        clean.pass,
+        "D17 clean: the detection round must pass (det={:?}, o1={:?}, o3={:?})",
+        clean.detections, clean.o1, clean.o3_fail
+    );
     assert!(
         clean.detections.contains(&"open") || clean.o1.is_err(),
         "D17 clean: the torn map leaf must be detected (det={:?}, o1={:?})",
@@ -2058,6 +2244,11 @@ fn d17_integrity() {
     // Clean: check (2) is the only discriminator — XX001 at open, never
     // served.
     let clean2 = run17b(None, fault2.clone());
+    assert!(
+        clean2.pass,
+        "D17 REFCRC clean: the detection round must pass (det={:?}, o1={:?}, o3={:?})",
+        clean2.detections, clean2.o1, clean2.o3_fail
+    );
     assert!(
         clean2.detections.contains(&"open") || clean2.o1.is_err(),
         "D17 REFCRC clean: the stale same-LPID page must be detected (det={:?}, o1={:?})",

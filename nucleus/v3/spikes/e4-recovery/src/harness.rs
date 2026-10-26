@@ -367,6 +367,22 @@ pub fn commit_txn(
     let (lsn, len) = wal::wal_enqueue(cx, kind, txn, ts, &payload)?;
     let end_lsn = lsn + len;
     let sync_flag = sync_on;
+    // Record the commit for the model (2.1) **at the enqueue** — where
+    // `HarnessState.wal_commits`'s own contract places it. The draft
+    // recorded it after the ack waits, so a committer that crashed
+    // mid-ack (its record already durable) never entered the model: the
+    // written/acked derivation then capped `hi` below the replayed
+    // record and O-1 (c) failed the round on a raw entry above every
+    // candidate cut (found by D7's round 2; the flags, not the
+    // recording, decide visibility).
+    let mode = if sync_on { Mode::SyncOn } else { Mode::SyncOff };
+    cx.with("h:model", |c| {
+        let h = c.h();
+        h.model.commit(ts, mode, ops.to_vec());
+        h.wal_commits.insert(ts, (sync_on, end_lsn));
+        h.commits_done += 1;
+        Ok(())
+    })?;
     // (§12.6: the marker's enqueue does not close the chunk bookkeeping
     // — the entry lives until a flip whose T covers the marker, so the
     // marked case still pulls wal_start below the chunks.)
@@ -385,15 +401,6 @@ pub fn commit_txn(
         Ok(())
     })?;
     cx.w.wake(WaitKey::Applied);
-    // Record the commit for the model (2.1).
-    let mode = if sync_on { Mode::SyncOn } else { Mode::SyncOff };
-    cx.with("h:model", |c| {
-        let h = c.h();
-        h.model.commit(ts, mode, ops.to_vec());
-        h.wal_commits.insert(ts, (sync_on, end_lsn));
-        h.commits_done += 1;
-        Ok(())
-    })?;
     if chunked {
         // A named park point (Work 13): D2 holds the committer after
         // its commit is recorded (the checkpoint trigger fires) but
@@ -1681,14 +1688,26 @@ pub fn derive_written_acked(
     let mut ts_pos: BTreeMap<u64, (usize, u64)> = BTreeMap::new();
     let seg = crate::store::WAL_SEG;
     for (inode, writes) in files.iter() {
-        let mut off = 0u64;
+        // A chained round's events hold only **this round's** writes (a
+        // prior round's records are below them, their flags already
+        // carried by the incoming model, Work 2.1): start at the round's
+        // own first write, and on a gap — a chunk boundary that begins
+        // mid-record — jump to the next write offset instead of stopping
+        // (records are self-delimiting through their `len`, and the
+        // position rule still validates each one). Single-round disks
+        // keep the from-zero walk: their first write is at 0.
+        let mut off = writes.keys().copied().min().unwrap_or(0);
         loop {
             if off >= seg {
                 break;
             }
             let hdr = stitched(writes, off, 24);
             if hdr.len() < 24 || !magic_ok(&hdr) {
-                break;
+                let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
+                    break;
+                };
+                off = next;
+                continue;
             }
             let rd = |r: std::ops::Range<usize>| -> u64 {
                 let mut b = [0u8; 8];
@@ -1702,11 +1721,19 @@ pub fn derive_written_acked(
             let len = rd(4..8) & 0xFFFF_FFFF;
             let lsn = rd(16..24);
             if len < 16 || off + len > seg || lsn % seg != off {
-                break;
+                let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
+                    break;
+                };
+                off = next;
+                continue;
             }
             let whole = stitched(writes, off, len as usize);
             if (whole.len() as u64) < len {
-                break;
+                let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
+                    break;
+                };
+                off = next;
+                continue;
             }
             match crate::store::wal::dec_record(&whole, lsn, lsn - off + seg) {
                 Ok(Some(rec)) => {
@@ -1715,7 +1742,12 @@ pub fn derive_written_acked(
                     }
                     off += len;
                 }
-                _ => break,
+                _ => {
+                    let Some(&next) = writes.range(off + 1..).next().map(|(k, _)| k) else {
+                        break;
+                    };
+                    off = next;
+                }
             }
         }
     }
@@ -1888,11 +1920,11 @@ pub fn durable_image(
     if meta.dir_root != 0
         && let Some(r) = flat.get(&meta.dir_root).copied()
     {
-        let entries = dir_entries_disk(disk, pf, meta.dir_root, r, &flat);
+        let entries = dir_entries_disk(disk, pf, meta.dir_root, r, &flat, &mut out);
         used.insert(r.slot);
         for (_id, root) in entries {
             if let Some(rr) = flat.get(&root).copied() {
-                walk_tree_disk(disk, pf, root, rr, &flat, &mut used);
+                walk_tree_disk(disk, pf, root, rr, &flat, &mut used, &mut out);
             }
         }
     }
@@ -2063,15 +2095,28 @@ fn walk_free_disk(
 fn dir_entries_disk(
     disk: &SimDisk,
     pf: usize,
-    _dir_root: u64,
+    dir_root: u64,
     root_ref: crate::store::page::Ref,
     flat: &BTreeMap<u64, crate::store::page::Ref>,
+    out: &mut Vec<Finding>,
 ) -> Vec<(u64, u64)> {
-    let mut out = Vec::new();
-    let mut stack = vec![root_ref];
-    while let Some(r) = stack.pop() {
+    let mut out_entries = Vec::new();
+    // `(lpid, ref)` — the §3.3 id check is positional: the page's header
+    // id must equal its LPID (the draft passed a hardcoded 0, which
+    // failed every directory page and was silently swallowed).
+    let mut stack = vec![(dir_root, root_ref)];
+    while let Some((l, r)) = stack.pop() {
         let b = disk.durable_read(pf, r.slot * 4096, 4096);
-        if crate::store::page::check(&b, &r, 0, None).is_err() {
+        if crate::store::page::check(&b, &r, l, None).is_err() {
+            // Report it (the gate's N4): the draft `continue`d silently,
+            // so a fault on the directory page — a leaf — left the
+            // tainted referenced slot unnamed and O-3 (e)'s completeness
+            // half failed the round (D17's second half found it: the
+            // planted stale page was the directory's own).
+            out.push(Finding {
+                slot: Some(r.slot),
+                what: "§3.3 fail on directory page".into(),
+            });
             continue;
         }
         let kind = crate::store::page::header_kind(&b);
@@ -2086,22 +2131,22 @@ fn dir_entries_disk(
                         rb.copy_from_slice(s);
                     }
                     if let Ok(id) = k.try_into() {
-                        out.push((u64::from_be_bytes(id), u64::from_le_bytes(rb)));
+                        out_entries.push((u64::from_be_bytes(id), u64::from_le_bytes(rb)));
                     }
                 }
             }
         } else if let Ok((seps, right)) = tree::inner_seps(&b) {
             for (c, _) in seps {
                 if let Some(cr) = flat.get(&c) {
-                    stack.push(*cr);
+                    stack.push((c, *cr));
                 }
             }
             if let Some(rr) = flat.get(&right) {
-                stack.push(*rr);
+                stack.push((right, *rr));
             }
         }
     }
-    out
+    out_entries
 }
 
 fn walk_tree_disk(
@@ -2111,14 +2156,26 @@ fn walk_tree_disk(
     root_ref: crate::store::page::Ref,
     flat: &BTreeMap<u64, crate::store::page::Ref>,
     used: &mut BTreeSet<u64>,
+    out: &mut Vec<Finding>,
 ) {
     let mut stack = vec![(lpid, root_ref)];
     while let Some((l, r)) = stack.pop() {
-        if !used.insert(r.slot) {
+        let b = disk.durable_read(pf, r.slot * 4096, 4096);
+        // §3.3 on a referenced tree page fails: report it (the gate's
+        // N4 — the draft `continue`d silently, and the map walk's
+        // slot-set collection pre-inserted every data slot into `used`,
+        // so the dedup below skipped the check entirely; O-3 (e)'s
+        // completeness half then failed rounds whose tainted tree slots
+        // the walk had walked past without naming). The check runs
+        // before the dedup for exactly that reason.
+        if crate::store::page::check(&b, &r, l, None).is_err() {
+            out.push(Finding {
+                slot: Some(r.slot),
+                what: "§3.3 fail on tree page".into(),
+            });
             continue;
         }
-        let b = disk.durable_read(pf, r.slot * 4096, 4096);
-        if crate::store::page::check(&b, &r, l, None).is_err() {
+        if !used.insert(r.slot) {
             continue;
         }
         if crate::store::page::header_kind(&b) == crate::store::page::KIND_INNER
