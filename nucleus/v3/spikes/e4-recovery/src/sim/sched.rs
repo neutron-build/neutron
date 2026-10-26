@@ -16,12 +16,33 @@
 //! waits (gate, tree mutex, pin, WAL ack) are all expressed through
 //! [`WaitKey`]s, never through OS blocking.
 //!
+//! **The S-BATON detector (card X-5b Work 11, rule 4).** The run-1 deadlock
+//! shape is a task that holds the world lock across a yield: it parks its
+//! OS thread inside the lock, and the baton can never pass — a hang. Two
+//! additions make that shape loud instead:
+//!
+//! - store- and harness-side acquisitions go through [`Sched::acquire`],
+//!   which `try_lock`s (a brief contention from a handoff in flight is
+//!   retried; a holder that never releases reports
+//!   [`SimFail::Baton`] naming the call site), and whose guard maintains a
+//!   thread-local *held* flag;
+//! - every entry point that parks ([`Sched::yield_baton_at`],
+//!   [`Sched::wait_for`]) checks that flag first: a task that is about to
+//!   park while still holding the world lock is exactly the run-1
+//!   violation, and gets [`SimFail::Baton`] naming the yield site instead
+//!   of hanging. The harness records it as a PANIC-class per-seed failure.
+//!
+//! [`Sched::lock`] stays a blocking acquisition for the scheduler's own
+//! internals (never called with the flag set by construction) and for
+//! X-5a's frozen tests, which never violate the discipline.
+//!
 //! Wakeup protocol (no lost wakeups): a parked task checks `running` under
 //! the world lock and then waits on its condvar, which releases the lock
 //! atomically. A handoff sets `running` and signals the picked task's
 //! condvar while holding the lock; `wake` only flips a waiter to runnable —
 //! every later handoff considers it, and signalling it then is correct.
 
+use std::cell::Cell;
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use crate::rng::Rng;
@@ -123,11 +144,32 @@ pub enum SimFail {
     /// All tasks were blocked; a per-seed failure (card 1.2).
     #[error("deadlock")]
     Deadlock,
+    /// An S-BATON violation (card X-5b Work 11, rule 4): a task tried to
+    /// park (or to re-acquire the world) while holding the world lock, or
+    /// the world lock was held by a task that stopped making progress.
+    /// The string names the call site. Recorded as a PANIC-class per-seed
+    /// failure by the harness — never a pass, never a hang.
+    #[error("baton violation at {0}")]
+    Baton(&'static str),
     /// An internal invariant of the spike was violated (a sizing or length
     /// assumption). Recorded as a PANIC-class per-seed failure by the
     /// harness — never a pass.
     #[error("internal: {0}")]
     Internal(&'static str),
+}
+
+// Whether the current OS thread holds the world lock through an
+// `Sched::acquire` guard (the S-BATON detector's flag). Plain
+// `Sched::lock` guards are not tracked: the scheduler's own internals
+// never park while holding one, and the frozen X-5a tests use `lock`
+// without violating the discipline.
+thread_local! {
+    static WORLD_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read the current thread's held flag (visible to tests for assertions).
+pub fn world_held_by_me() -> bool {
+    WORLD_HELD.with(|h| h.get())
 }
 
 /// The baton scheduler over host `H`.
@@ -157,6 +199,49 @@ impl<H: SchedHost> Sched<H> {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    /// Acquire the world for one atomic step, S-BATON rule 4 (card X-5b
+    /// Work 11): a `try_lock` that reports [`SimFail::Baton`] naming
+    /// `site` instead of blocking when the lock cannot be taken. Brief
+    /// contention from a baton handoff still in flight (the previous
+    /// holder finishing its own park) is retried; a holder that never
+    /// releases is a violation and is reported.
+    pub fn acquire(&self, site: &'static str) -> Result<WorldGuard<'_, H>, SimFail> {
+        if world_held_by_me() {
+            // Re-entrant acquisition by this thread: the run-1 deadlock
+            // shape, caught before it hangs.
+            return Err(SimFail::Baton(site));
+        }
+        // The handoff-in-flight window: the task that handed the baton to
+        // us may still hold the lock inside its own park for a moment.
+        // Retry with a bounded yield loop; a genuine violator never frees
+        // it and is reported rather than hung.
+        for _ in 0..1_000_000 {
+            match self.host.try_lock() {
+                Ok(g) => {
+                    WORLD_HELD.with(|h| h.set(true));
+                    return Ok(WorldGuard { g });
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(SimFail::Baton(site));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        Err(SimFail::Baton(site))
+    }
+
+    /// A plain yield point with a call-site name: gives up the baton, gets
+    /// it back. Checks the S-BATON held flag first (rule 4): a task that
+    /// parks while holding the world lock is the run-1 violation.
+    pub fn yield_baton_at(&self, me: TaskId, site: &'static str) -> Result<(), SimFail> {
+        if world_held_by_me() {
+            return Err(SimFail::Baton(site));
+        }
+        self.yield_baton(me)
     }
 
     /// Release the workload tasks after construction (they wait on
@@ -247,8 +332,11 @@ impl<H: SchedHost> Sched<H> {
     /// Park the current task on `key` and hand the baton to someone else.
     /// The caller must re-check its condition after this returns and park
     /// again if it still does not hold (condition variables here are
-    /// Mesa-style).
+    /// Mesa-style). Checks the S-BATON held flag first (rule 4).
     pub fn wait_for(&self, me: TaskId, key: WaitKey) -> Result<(), SimFail> {
+        if world_held_by_me() {
+            return Err(SimFail::Baton("wait_for"));
+        }
         self.park(me)?;
         let mut host = self.lock();
         {
@@ -323,6 +411,26 @@ impl<H: SchedHost> Sched<H> {
         Ok(())
     }
 
+    /// Deliver a crash now (card X-5b Work 13's hook and task-yield crash
+    /// points): mark the world crashed, make every waiter runnable and
+    /// broadcast, so each task unwinds with `Crashed` at its next
+    /// scheduler call instead of parking forever.
+    pub fn deliver_crash(&self) {
+        let mut host = self.lock();
+        let cvs: Vec<&Condvar> = self.cvs.iter().collect();
+        {
+            let core = host.sched_mut();
+            core.crashed = true;
+            core.running = None;
+            for w in core.waiting.iter_mut() {
+                *w = None;
+            }
+        }
+        for cv in cvs {
+            cv.notify_all();
+        }
+    }
+
     /// Wake every task parked on `key` (their condition may have changed).
     /// They become candidates for the next handoff; no signal is needed
     /// (see the module's wakeup protocol).
@@ -368,5 +476,34 @@ impl<H: SchedHost> Sched<H> {
             host.sched_mut().running = None;
             let _ = self.handoff_locked(&mut host);
         }
+    }
+}
+
+/// The world guard handed out by [`Sched::acquire`]: a `MutexGuard` that
+/// maintains the S-BATON thread-local held flag, so the parking entry
+/// points can detect a task about to park while holding the world. The
+/// flag clears in this type's own `Drop` body, which runs **before** the
+/// inner guard unlocks (field drops happen after `Drop::drop`) — the
+/// flag is already clear when the lock is free again.
+pub struct WorldGuard<'a, H: SchedHost> {
+    g: MutexGuard<'a, H>,
+}
+
+impl<H: SchedHost> Drop for WorldGuard<'_, H> {
+    fn drop(&mut self) {
+        WORLD_HELD.with(|h| h.set(false));
+    }
+}
+
+impl<H: SchedHost> std::ops::Deref for WorldGuard<'_, H> {
+    type Target = H;
+    fn deref(&self) -> &H {
+        &self.g
+    }
+}
+
+impl<H: SchedHost> std::ops::DerefMut for WorldGuard<'_, H> {
+    fn deref_mut(&mut self) -> &mut H {
+        &mut self.g
     }
 }

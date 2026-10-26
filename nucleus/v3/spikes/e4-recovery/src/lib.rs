@@ -17,22 +17,17 @@
 //! - [`sim`]: the disk, the baton scheduler, the fault model, `E4Env`;
 //! - [`model`]: the reference model;
 //! - [`oracle`]: Work 2's checks (P-written, binding);
-//! - `store`: the S-STORE subset under test;
+//! - [`store`]: the S-STORE subset under test (Work 3–4), converted to
+//!   the S-BATON step discipline of card X-5b Work 11;
 //! - `monitor`: the harness-side monitors (M-*, Work 3.10);
 //! - `workload`/`campaign`: the seed campaign, `verify`, `mutants`.
 
 pub mod campaign;
 pub mod crc;
+pub mod harness;
 pub mod model;
+pub mod monitor;
 pub mod oracle;
 pub mod rng;
 pub mod sim;
-// `store` (Work 3–4) is committed but NOT wired into the crate yet. It
-// compiled clean when wired (see the commit history), but its methods
-// yield — they park the OS thread at scheduler points — while callers
-// hold the world mutex, which would deadlock at runtime; the workload
-// driver that would exercise it is therefore also not compiled.
-// Converting the store's call flow to internal-lock primitives (each
-// atomic step locks and unlocks, owned page bytes travel between steps)
-// is the remaining X-5b work. See README "Status".
-// pub mod store;
+pub mod store;

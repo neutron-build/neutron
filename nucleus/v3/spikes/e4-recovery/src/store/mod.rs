@@ -3,23 +3,40 @@
 //! (§2), the page map and free set (§4), the buffer pool with the epoch
 //! gate and `write_guard` (§5), and the slot/LPID allocators.
 //!
-//! Architecture (S-BATON in `src/sim`): all store state lives in
-//! [`Core`] behind the world lock; the running task holds it between
-//! scheduler calls. Store operations are plain functions that compose
-//! **primitives** — short lock-work-unlock steps — and hold page bytes as
-//! owned copies between them, so no world borrow survives a yield point.
-//! Every page mutation goes through `store_page` (the `write_guard` yield
-//! point with the epoch-copy rule, §5.6); every page read through
-//! `fetch_page` (pool + §3.3).
+//! Architecture (S-BATON in `src/sim`, card X-5b Work 11): all store state
+//! lives in [`StoreInner`] inside the world behind the scheduler's world
+//! lock; **no borrow of it ever survives a yield point**. Every store
+//! operation is a free function over a [`Cx`] that composes **primitives**
+//! — short lock-work-unlock steps ([`Cx::with`], whose acquisition is a
+//! `try_lock` per S-BATON rule 4) — and carries page bytes, LPIDs, descent
+//! paths and progress as owned locals between them. The logical locks
+//! (epoch gate, per-tree sim mutex, pins, WAL acks, `mark_applied` turns)
+//! **are** held across yields by design, expressed as scheduler state plus
+//! [`crate::sim::WaitKey`]s (rule 2).
 //!
-//! Declared simplifications (README): the in-memory page map is a flat
-//! `BTreeMap` with per-entry image overrides standing in for the §4.1
-//! radix CoW (the persisted radix is materialised at checkpoint step 2 and
-//! parsed at open and by amcheck — the physical format is the spec's, the
-//! residency/pinning of MapLeaf pages in the pool is not exercised);
-//! latch coupling is a per-tree sim mutex (card 3.6); no overflow chains
-//! (values ≤ `V_INLINE`); 4 KiB pages only.
+//! Every page mutation goes through [`prims::store_page`] (the
+//! `write_guard` yield point with the epoch-copy rule, §5.6); every page
+//! read through [`prims::fetch_page`] (pool + §3.3's four checks).
+//!
+//! Invariants owned here:
+//! - ST-STEP: each `Cx::with` body is atomic (only one task runs between
+//!   its yields), so check-then-act pairs inside one step are race-free.
+//! - ST-IMG (the flat-map simplification, card Work 12): during a
+//!   checkpoint's flip window (step 0 → step 5) the **first post-flip
+//!   touch** of each LPID freezes its image-k state (an override in
+//!   [`MapState::img`]); after the data-write phase of step 2 the
+//!   effective image (overrides ∪ `cur`) is snapshot-stable, so the map
+//!   radix and the free set serialise the same image. The persisted
+//!   format is the spec's §4.1 radix, written copy-on-write (only changed
+//!   leaves, up to the root) and parsed at open/amcheck — never read from
+//!   memory.
+//!
+//! Declared simplifications (README): the in-memory page map is flat with
+//! per-entry image overrides (`R_MAP = 0`; MapLeaf residency and pinning
+//! are A-3c/A-7's); latch coupling is a per-tree sim mutex (card 3.6); no
+//! overflow chains (values ≤ `V_INLINE`); 4 KiB pages only.
 
+pub mod amcheck;
 pub mod ckpt;
 pub mod page;
 pub mod prims;
@@ -32,14 +49,16 @@ use crate::sim::{
     EnvRef, FileId, HasDisk, Sched, SchedCore, SchedHost, SimDisk, SimFail, TaskId, WaitKey,
 };
 
-/// WAL segment size (64 KiB; §12.1): a record is at most a quarter of it.
+/// WAL segment size (64 KiB, §12.1; card 4.1): a record is at most a
+/// quarter of it.
 pub const WAL_SEG: u64 = 64 * 1024;
 /// The catalog tree id (card 2.1).
 pub const CATALOG: u64 = 1;
 /// The directory pseudo-tree id (its mutex key; root is `meta.dir_root`).
 pub const DIR_TREE: u64 = 0;
 
-/// The runtime mutants (card Work 8), checked at exactly one site each.
+/// The runtime mutants (card "Mutation evidence"), checked at exactly one
+/// site each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mutant {
     /// I-INTEGRITY: skip the header-crc-vs-bytes check.
@@ -74,7 +93,8 @@ pub enum Mutant {
     StartLsnPastChunk,
     /// I-REDO-COMPLETE: the replay start counts only marker-less txns.
     StartLsnMarkedChunk,
-    /// I-WAL-TS-ORDER: a yield between ts assignment and enqueue.
+    /// I-WAL-TS-ORDER: the commit critical section ends between the ts
+    /// assignment and the enqueue.
     TsAfterAppend,
     /// I-WAL-STALE: the reader skips the `lsn` ≠ expected check.
     LsnCheckSkip,
@@ -98,30 +118,32 @@ pub enum Mutant {
     TruncateLogicalOnly,
     /// G3: a missing start segment is treated as an empty WAL.
     StartSegmentMissingOk,
+    /// G7 (P's ruling on the round-3 F3, 2026-10-26): the store's open
+    /// drops the positional meta-slot test, falling back to "magic +
+    /// CRC, highest `ckpt_id`" — a misplaced valid newer meta is opened
+    /// from the tainted landing slot instead of XX001. The single site
+    /// is `open`'s call to [`page::select_meta`]; amcheck, the monitors
+    /// and the harness walks keep the check unconditionally.
+    MetaWrongSlot,
 }
 
-/// Store configuration (card 3.3–3.4, 4.1).
+/// Store configuration (card 3.3–3.4 with the Work 12 amendment, 4.1).
 #[derive(Debug, Clone)]
 pub struct StoreCfg {
-    /// `map_leaf_cap` override (spec 254 at 4 KiB; campaign {8, 16, 254}).
+    /// `map_leaf_cap` override (spec 254 at 4 KiB; the campaign draws from
+    /// {8, 16, 254}). Smaller caps give the persisted radix ≥ 2 levels.
     pub map_leaf_cap: u64,
-    /// `freeset_leaf_bits` override (spec 32576; campaign {128, 512, spec}).
+    /// `freeset_leaf_bits` override (spec 32_576 at 4 KiB; the campaign
+    /// draws from {128, 512, spec}). Smaller leaves give the free set ≥ 3
+    /// pages.
     pub freeset_leaf_bits: u64,
-    /// Pool frame count (§5.4; never grows).
+    /// Pool frame count `F` (§5.4, never grows). Work 12: `R_MAP = 0`, so
+    /// `F = tasks × (max_height + 2) + R_EPOCH`.
     pub pool_frames: usize,
     /// The epoch-copy reserve `R_EPOCH` (§5.6).
     pub r_epoch: usize,
     /// The active mutant, if any.
     pub mutant: Option<Mutant>,
-}
-
-impl StoreCfg {
-    /// `R_MAP` per §5.4 as implemented here: with the flat in-memory map
-    /// (declared simplification) the MapLeaf pin rule is not exercised, so
-    /// the reserve covers the pool's own metadata pressure instead.
-    pub fn r_map(&self) -> usize {
-        2
-    }
 }
 
 /// The store failure type. `Corrupt` is XX001 (§ "Error classes").
@@ -130,7 +152,7 @@ pub enum Fail {
     /// XX001: an integrity check failed.
     #[error("corrupt: {0}")]
     Corrupt(String),
-    /// The simulated environment crashed / deadlocked.
+    /// The simulated environment crashed / deadlocked / violated S-BATON.
     #[error("sim: {0:?}")]
     Sim(SimFail),
     /// The store is poisoned (I-FAIL-STOP, §9.2).
@@ -147,7 +169,19 @@ impl From<SimFail> for Fail {
     }
 }
 
-/// A per-seed world: everything the scheduler serialises.
+/// A host that carries the store's state (the world's store slice).
+pub trait HasStore {
+    /// The store slice.
+    fn store(&mut self) -> &mut StoreInner;
+}
+
+/// The combined host bound of every store function: scheduling, disk and
+/// store slices (S-BATON's world).
+pub trait StoreHost: SchedHost + HasDisk + HasStore {}
+impl<T: SchedHost + HasDisk + HasStore> StoreHost for T {}
+
+/// The per-seed world of the harness: everything the scheduler
+/// serialises. The harness slice (`h`) is added by [`crate::harness`].
 pub struct Core {
     /// The scheduling slice.
     pub sched: SchedCore,
@@ -155,8 +189,6 @@ pub struct Core {
     pub disk: SimDisk,
     /// The store slice.
     pub st: StoreInner,
-    /// The harness slice (model hooks, monitors' inputs, quota counters).
-    pub h: Harness,
 }
 
 impl SchedHost for Core {
@@ -171,79 +203,17 @@ impl HasDisk for Core {
     }
 }
 
-/// Harness-side state the store reports to (never read back by the store:
-/// the store never reads the model or ground truth).
-#[derive(Debug, Default)]
-pub struct Harness {
-    /// Commits recorded this pass: ts → (mode, ops) for the model.
-    pub model_commits: BTreeMap<u64, (crate::model::Mode, Vec<crate::model::Op>)>,
-    /// Bulk loads this pass: (tree, S_L, entries).
-    pub loads: Vec<(u64, u64, Vec<(Vec<u8>, Vec<u8>)>)>,
-    /// The enqueue position at each flip (M-CKPT-T hook).
-    pub flip_enqueue_pos: Vec<u64>,
-    /// Counters for the coverage quotas and the record.
-    pub counters: Counters,
-    /// The commit budget for the pass.
-    pub stop_after: u64,
-    /// Checkpoint trigger (commits per checkpoint).
-    pub ckpt_every: u64,
-    /// The round index.
-    pub round: u32,
-    /// Commits done.
-    pub commits_done: u64,
-    /// The txn counter (ids).
-    pub txn_counter: u64,
-    /// Registered snapshots (long readers).
-    pub snapshots: BTreeSet<u64>,
-    /// GC resume positions per tree.
-    pub gc_resume: BTreeMap<u64, Vec<u8>>,
-    /// DDL tree ids handed out.
-    pub ddl_trees: u64,
-    /// Published trees (per the publish commits seen).
-    pub published: BTreeSet<u64>,
-    /// A forced checkpoint is pending (bulk load).
-    pub force_ckpt: bool,
-    /// The workload tasks are done.
-    pub workload_done: bool,
+impl HasStore for Core {
+    fn store(&mut self) -> &mut StoreInner {
+        &mut self.st
+    }
 }
-
-/// Coverage and report counters (harness-side).
-#[derive(Debug, Default, Clone)]
-pub struct Counters {
-    /// Splits between checkpoint step 0 and step 3 (Q4).
-    pub ckpt_splits: u64,
-    /// Merges between step 0 and step 3 (Q4).
-    pub ckpt_merges: u64,
-    /// Rounds whose flip saw a commit > T partially applied (Q9).
-    pub partial_above_t: u64,
-    /// Rounds where the epoch reserve was exhausted (Q10).
-    pub epoch_exhausted: u64,
-    /// Stale-record stops at a renamed segment's start (Q11).
-    pub stale_seg_reads: u64,
-    /// A tree was mid-`dropping` at the crash (Q7).
-    pub drop_walk_crash: u64,
-    /// The free-set serialisation grew the file (Q17).
-    pub freeset_grew: u64,
-    /// A flip with `gc_w_used > previous gc_w` (Q18).
-    pub gc_advanced: u64,
-    /// Bulk loads: crash between load and publish / after publish (Q6).
-    pub load_unpublished_crash: u64,
-    pub load_published_crash: u64,
-    /// Chunked shapes at the crash (Q5).
-    pub chunk_open: u64,
-    pub chunk_marked_above_t: u64,
-    pub chunk_partial_apply: u64,
-}
-
-/// A pooled page's key: tree pages by LPID (the map is flat in memory, the
-/// free set materialised at step 2 — declared simplification).
-pub type PKey = u64;
 
 /// One pool frame.
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// The page's LPID (0 = free frame).
-    pub key: PKey,
+    pub key: u64,
     /// The page bytes.
     pub bytes: Vec<u8>,
     /// The content epoch (§5.6).
@@ -256,6 +226,9 @@ pub struct Frame {
     pub is_epoch_copy: bool,
     /// The clock bit.
     pub refed: bool,
+    /// The eviction latch (§5.2's try-latch stand-in): set from victim
+    /// selection to write-out completion, invisible to fetch/store.
+    pub evicting: bool,
 }
 
 /// A page-map entry: the current ref plus the image-k override
@@ -265,8 +238,8 @@ pub struct Frame {
 pub enum Img {
     /// The image's entry equals the current one.
     Same,
-    /// The image maps the LPID at `r` (a clean page's old home, or a
-    /// written-out epoch copy).
+    /// The image maps the LPID at `r` (a clean page's old home, a written
+    /// epoch copy, or a previous-epoch eviction's fresh slot).
     At(page::Ref),
     /// The image leaves the LPID unmapped.
     Free,
@@ -279,32 +252,53 @@ pub enum Img {
 }
 
 /// The in-memory page map (flat; the persisted §4.1 radix is materialised
-/// at step 2 and parsed at open — declared simplification).
-#[derive(Debug, Default)]
+/// at step 2 and parsed at open — declared simplification, Work 12).
+#[derive(Debug, Default, Clone)]
 pub struct MapState {
     /// LPID → current ref (absent = unmapped).
     pub cur: BTreeMap<u64, page::Ref>,
-    /// Post-flip overrides for the image being built.
+    /// Post-flip overrides for the image being built (first-touch
+    /// freezes; snapshot-stable after step 2's data phase).
     pub img: BTreeMap<u64, Img>,
     /// The previous image's persisted leaf layout (for the step-2 CoW
-    /// diff): leaf index → (bytes-hash, ref).
+    /// diff): leaf index → `(content-hash, ref)`.
     pub prev_leaves: BTreeMap<u64, (u64, page::Ref)>,
-    /// The previous image's inner-node refs by (level, index).
+    /// The previous image's inner-node refs by `(level, index)`.
     pub prev_inners: BTreeMap<(u8, u64), (u64, page::Ref)>,
     /// The previous image's root.
     pub prev_root: Option<page::Ref>,
 }
 
+/// The frozen image table of step 2's map phase (B5): taken in one
+/// atomic step after the data phase, read by the map radix, the free set
+/// and the step-5 durable set until step 5 resolves them. Every
+/// referenced slot is pinned in `SlotState::image_refs` in the same
+/// step, so concurrent evictions cannot unpin or redirect what the image
+/// embeds.
+#[derive(Debug, Clone, Default)]
+pub struct FrozenImage {
+    /// LPID → the image's ref (`None` = the image leaves it unmapped).
+    pub entries: BTreeMap<u64, Option<page::Ref>>,
+    /// The frozen `next_lpid` (the radix's leaf span and the free set's
+    /// LPID-bit span).
+    pub next_lpid: u64,
+    /// The frozen `slot_count` (the free set's slot-bit span).
+    pub slot_count: u64,
+}
+
 /// Slot bookkeeping (§4.4–§4.5).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SlotState {
-    /// Current homes (the current map's pages).
+    /// Current homes (the current map's pages, plus the current image's
+    /// map/free-set pages).
     pub used_cur: BTreeSet<u64>,
-    /// The durable image's referenced slots.
+    /// The durable image's referenced slots (all of them: data, map and
+    /// free-set pages).
     pub used_durable: BTreeSet<u64>,
-    /// The image being written (from flip to step 5).
+    /// Slots frozen into `At` overrides of the image being built (from
+    /// freeze to step 5): protected from reuse while image k needs them.
     pub image_refs: BTreeSet<u64>,
-    /// Slots freed at step 6 (pending between steps 2 and 6).
+    /// Slots freed at step 6 (between the frees and the recycle).
     pub pending_free: BTreeSet<u64>,
     /// The file length in slots.
     pub slot_count: u64,
@@ -313,7 +307,7 @@ pub struct SlotState {
 }
 
 /// The epoch gate (§5.6).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Gate {
     /// Shared holders.
     pub holders: usize,
@@ -324,7 +318,7 @@ pub struct Gate {
 }
 
 /// The buffer pool (§5): fixed frames, clock eviction.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Pool {
     /// The frames.
     pub frames: Vec<Frame>,
@@ -332,19 +326,17 @@ pub struct Pool {
     pub hand: usize,
 }
 
-/// The sequencer / apply-frontier state.
-#[derive(Debug, Default)]
+/// The sequencer / apply-frontier state (§12.4, §13 step 0).
+#[derive(Debug, Default, Clone)]
 pub struct SeqState {
     /// The next commit ts to hand out.
     pub next_ts: u64,
-    /// `visible_ts` (advances in ts order).
+    /// `visible_ts` (advances in ts order, `mark_applied`).
     pub visible_ts: u64,
     /// Applied-but-not-yet-visible commit ts's.
     pub applied: BTreeSet<u64>,
-    /// The commit critical section is taken.
+    /// The commit critical section is taken (I-WAL-TS-ORDER).
     pub commit_cs: bool,
-    /// Per-commit applied-entry counts (Q9 instrumentation).
-    pub apply_progress: BTreeMap<u64, (u64, u64)>, // ts -> (done, total)
 }
 
 /// One directory entry (§6.8).
@@ -357,7 +349,7 @@ pub struct DirEntry {
 }
 
 /// The store's durable state and in-flight bookkeeping.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StoreInner {
     /// The configuration.
     pub cfg: StoreCfg,
@@ -369,7 +361,7 @@ pub struct StoreInner {
     pub e: u32,
     /// The opened meta.
     pub meta: page::Meta,
-    /// The tree directory.
+    /// The tree directory (id → entry).
     pub dir: BTreeMap<u64, DirEntry>,
     /// The page map.
     pub map: MapState,
@@ -390,6 +382,18 @@ pub struct StoreInner {
     /// A checkpoint's flip window is open (step 0 → step 5): first
     /// post-flip touches freeze image state.
     pub flip_window: bool,
+    /// The frozen image table (step 2's map phase, B5): built in one
+    /// atomic step when the data phase ends — every LPID's image ref
+    /// (`img_entry`: an `Img::At` override or the current home) plus the
+    /// two size counters the radix and the free set must agree on. The
+    /// map radix, the free set and the step-5 durable set read **only**
+    /// this table while it is set, and every slot it references is
+    /// pinned in `image_refs`, so an eviction that was already in flight
+    /// when the table was taken (picked before, finishing after) can
+    /// move the live home but not unpin or redirect anything the image
+    /// embeds — the stale-embed race this field closes (prototype
+    /// deviation fixed in B5; see the stage RESULT).
+    pub image_frozen: Option<FrozenImage>,
     /// A checkpoint is between steps 0 and 6 (the Q4 window).
     pub ckpt_open: bool,
     /// Splits inside the open checkpoint window (Q4).
@@ -402,68 +406,162 @@ pub struct StoreInner {
     pub freeset_grew: bool,
     /// Stale-record stops at renamed segment starts (Q11).
     pub stale_seg_reads: u64,
-    /// Q5–Q7 flags (set by the harness at the crash).
-    pub chunk_open_crash: bool,
-    /// A marked chunked txn sat above T at the flip (Q5).
-    pub chunk_marked_crash: bool,
-    /// A marked chunked txn was partially applied at the flip (Q5).
-    pub chunk_partial_crash: bool,
-    /// A tree was mid-`dropping` at the crash (Q7).
-    pub drop_walk_crash: bool,
-    /// Crash between bulk load and publication (Q6).
-    pub load_unpublished_crash: bool,
-    /// Crash after publication with the load in the image (Q6).
-    pub load_published_crash: bool,
-    /// A flip saw `gc_w_used` advance (Q18).
-    pub gc_advanced_flag: bool,
-    /// Poison reason (I-FAIL-STOP).
-    pub poisoned: Option<String>,
-    /// The WAL state.
-    pub wal: wal::WalState,
+    /// Named park points (card Work 13: the D5 split parking): name →
+    /// remaining yields. `park()` at a named point yields while a budget
+    /// remains.
+    pub parks: BTreeMap<&'static str, u64>,
     /// The bulk-load publish waiters' last durable meta (§12.8).
     pub meta_durable_k: u64,
+    /// The free-set pages of the image **being built** (step 2's
+    /// serialisation): filled by `write_free_set`, consumed by the
+    /// step-5 resolution. B5 fix: the draft never tracked them, so the
+    /// step-5 durable set omitted the image's own free-set pages and
+    /// the **previous** image's pages were never unpinned — a slot leak
+    /// that made every early free undetectable (FREE-EARLY could not
+    /// fire M-NOINPLACE because nothing ever reused a freed slot).
+    pub fs_building: BTreeSet<u64>,
+    /// The free-set pages of the **last durable** image (unpinned at the
+    /// next checkpoint's step 5, when nothing references them anymore).
+    pub fs_prev: BTreeSet<u64>,
+    /// Poison reason (I-FAIL-STOP).
+    pub poisoned: Option<String>,
+    /// A world-acquisition failure observed on a release path (S-BATON
+    /// rule 4: loud, never swallowed). Release helpers (`gate_release`,
+    /// `tree_unlock`, `unpin`, the eviction ungate, the checkpoint's
+    /// keep/unfreeze steps) cannot propagate — several run in `Drop`
+    /// guards — so the first failure is recorded here and the harness
+    /// folds it into the round's `baton` flag; the round fails.
+    pub baton_fail: Option<&'static str>,
+    /// The WAL state.
+    pub wal: wal::WalState,
 }
 
-/// The execution context handed to every store function.
-pub struct Cx<'a> {
-    /// The world.
-    pub w: &'a Sched<Core>,
+impl StoreInner {
+    /// An empty store shell (no file content): used by `create`/`open`/
+    /// `recover` and by amcheck's probe. `slot_count` starts at 16 and
+    /// grows on demand (§4.5 test override: `max(16, n/16)`).
+    pub fn empty(cfg: StoreCfg, page_file: FileId) -> Self {
+        let mut pool = Pool {
+            frames: Vec::new(),
+            hand: 0,
+        };
+        for _ in 0..cfg.pool_frames {
+            pool.frames.push(Frame {
+                key: 0,
+                bytes: Vec::new(),
+                epoch: 0,
+                dirty: false,
+                pins: 0,
+                is_epoch_copy: false,
+                refed: false,
+                evicting: false,
+            });
+        }
+        let slots = SlotState {
+            slot_count: 16,
+            ..SlotState::default()
+        };
+        Self {
+            cfg,
+            page_file,
+            k: 0,
+            e: 1,
+            meta: page::Meta::default(),
+            dir: BTreeMap::new(),
+            map: MapState::default(),
+            slots,
+            pool,
+            gate: Gate::default(),
+            tree_mu: BTreeMap::new(),
+            seq: SeqState::default(),
+            gc_w_used: 0,
+            ckpt_done: 0,
+            flip_window: false,
+            image_frozen: None,
+            ckpt_open: false,
+            ckpt_splits: 0,
+            ckpt_merges: 0,
+            epoch_exhausted: 0,
+            freeset_grew: false,
+            stale_seg_reads: 0,
+            parks: BTreeMap::new(),
+            meta_durable_k: 0,
+            fs_building: BTreeSet::new(),
+            fs_prev: BTreeSet::new(),
+            poisoned: None,
+            baton_fail: None,
+            wal: wal::WalState::default(),
+        }
+    }
+
+    /// Whether the store is usable (not poisoned, §9.2).
+    pub fn alive(&self) -> Result<(), Fail> {
+        match &self.poisoned {
+            Some(m) => Err(Fail::Poisoned(m.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The execution context handed to every store function: the world's
+/// scheduler plus the calling task. Cheap to construct per step.
+pub struct Cx<'a, H: StoreHost> {
+    /// The world's scheduler (which owns the world lock).
+    pub w: &'a Sched<H>,
     /// The calling task.
     pub t: TaskId,
 }
 
-impl<'a> Cx<'a> {
-    /// The env view (every method a yield point).
-    pub fn env(&self) -> EnvRef<'a, Core> {
+impl<'a, H: StoreHost> Cx<'a, H> {
+    /// The env view (every method a yield point, per S-BATON rule 4).
+    pub fn env(&self) -> EnvRef<'a, H> {
         EnvRef {
             sched: self.w,
             task: self.t,
         }
     }
 
-    /// Run one atomic step under the world lock (no yields inside).
-    pub fn with<R>(&self, f: impl FnOnce(&mut Core) -> Result<R, Fail>) -> Result<R, Fail> {
-        let mut g = self.w.lock();
+    /// Run one atomic step under the world lock (no yields inside; rule 1).
+    /// The acquisition is a `try_lock` that reports [`SimFail::Baton`]
+    /// naming `site` on a violation (rule 4).
+    pub fn with<R>(
+        &self,
+        site: &'static str,
+        f: impl FnOnce(&mut H) -> Result<R, Fail>,
+    ) -> Result<R, Fail> {
+        let mut g = self.w.acquire(site).map_err(Fail::Sim)?;
         f(&mut g)
     }
 
-    /// A plain yield point (card 1.2).
-    pub fn yield_now(&self) -> Result<(), Fail> {
-        self.env().yield_now().map_err(Fail::Sim)
+    /// A plain yield point naming its call site (card 1.2, rule 4).
+    pub fn yield_now(&self, site: &'static str) -> Result<(), Fail> {
+        self.env().yield_at(site).map_err(Fail::Sim)
     }
 
-    /// Park on a wait key (Mesa-style; re-check after).
+    /// Park on a wait key (Mesa-style; re-check after; rule 4).
     pub fn wait_for(&self, key: WaitKey) -> Result<(), Fail> {
         self.env().wait_for(key).map_err(Fail::Sim)
     }
-}
 
-impl StoreInner {
-    /// Whether the store is usable (not poisoned, §9.2).
-    pub fn alive(&self) -> Result<(), Fail> {
-        match &self.poisoned {
-            Some(m) => Err(Fail::Poisoned(m.clone())),
-            None => Ok(()),
+    /// A named park point (card Work 13): while `parks[name]` has budget,
+    /// yield. The harness's script sets budgets; the store calls this at
+    /// the midpoints a directed test needs to hold (the D5 split parking).
+    pub fn park(&self, name: &'static str) -> Result<(), Fail> {
+        loop {
+            let more = self.with("park", |c| {
+                let st = c.store();
+                match st.parks.get_mut(name) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            })?;
+            if !more {
+                return Ok(());
+            }
+            self.yield_now("park")?;
         }
     }
 }

@@ -1,11 +1,356 @@
-# E4 recovery spike (card X-5, stage X-5a of three)
+# E4 recovery spike (card X-5, stage X-5b of three)
 
-Status: **stage X-5a complete and green, including the gate's 2026-10-23
-REWORK round and its 2026-10-24 round-2 REWORK** — the crate, the sim,
-the model and the P-written oracle (Work 0–2, Work 2.7 / ruling X5-R5,
-the six gate-REWORK fixes and the two round-2 fixes below) build, test
-and gate clean. This claims nothing about E4 itself: no campaign exists
-until X-5c, and Opus judges E4 only on X-5c's RESULT.
+Status: **stage X-5b B1–B6 complete, the 2026-10-25 gate-REWORK round
+applied (R1–R7 and the minor items), the 2026-10-26 verification round,
+the 2026-10-26 gate round-2 items N1–N8 applied, and the 2026-10-26
+gate round-3 rework applied (F1–F5, with P's same-day ruling on F3/F4
+adding fill G7 and the mutant META-WRONG-SLOT)** (see "Gate round 3"
+below): the S-BATON conversion, the store, the round harness, the
+monitors and the directed tests D1–D18 + D10b/D12b, now with the §12.2
+record cap, the loud Work 2.1 derivation, the G7 positional meta-slot
+check and a pin for every rework fix. The crate builds, all suites pass
+(99 tests) and the gate's clippy/fmt steps see the whole store. This
+claims nothing about E4 itself: no campaign exists until X-5c, and Opus
+judges E4 only on X-5c's RESULT. X-5c inherits: the argued uncaught
+directed arm (D16's pair — argued in its test doc comment, none
+assert-pass), the R6 cells (below), and the `run`/`verify`/`mutants`
+campaign surfaces.
+
+## Gate round 3 (2026-10-26 verdict f8a6b6eb, applied this run)
+
+- **F1 (the §12.2 record cap).** `wal_enqueue` refuses a payload whose
+  record exceeds `wal_seg_size / 4` (16 KiB) with `Fail::Invalid`
+  before any placement; the Work 2.1 derivation records each commit's
+  `(lsn, len)` extent and returns a third list — commits whose record
+  header sits issued at its segment-relative position with its own lsn
+  and a length past the segment end (written, never parseable) — which
+  `run_round` folds into a loud `task_error`. The demonstration's shape
+  (a 177-KiB `Commit` spread across segments, acked and lost silently)
+  is now impossible twice over. Pins: `wal_record_cap_is_refused` and
+  `derivation_reports_written_unparsable_commits` (both verified
+  mutant-style, failing under their named probes). D14's two 60-put
+  commits and D17's 420-put load are chunked (§12.7).
+- **F2 (the misdiagnosed open finding).** With the chunked script the
+  D17 faultless base passes `Ok(2)`: the round-2 "open finding" (a
+  rolled-back `Ok` whose raw entries sat above every cut) was F1, not a
+  meta-rollback inconsistency — **withdrawn**. The meta LOST and TORN
+  cells are clean rollbacks that pass; the grid completes its TORN
+  cells (the freeset root and the meta hold all their content in
+  sector 0; a leaf in its cell sectors — the tear sector is chosen by
+  proving the bytes differ).
+- **F3 (G7, P's ruling of 2026-10-26).** A meta is valid at open only
+  if it sits in its own slot, `1 + (ckpt_id mod 2)`; a misplaced valid
+  meta outranking every placed-valid one is XX001 — never opened, never
+  fallen back past. One shared helper (`page::select_meta`) serves the
+  store's open, amcheck, the monitors and the harness's two walks (they
+  can never disagree — the lesson of R4); open raises XX001 before any
+  meta bytes are accepted and accepts the slot the winner was read
+  from; a misplaced older meta is a loser, ignored. The mutant
+  META-WRONG-SLOT (28 now) skips the positional test at the store's
+  open only; D17's meta MISDIRECTED cell (plant on the twin slot, the
+  base's newest meta asserted ≥ 2) is the catching test: clean — XX001
+  at open, never served, passing; mutant — the misplaced copy opened
+  from the tainted landing slot, served, O-3 (a) fails the round. A
+  spec card for the §2.2 sentence is queued for P (the ruling's
+  routing); until it merges, this crate tests "S-STORE as merged plus
+  G1–G7".
+- **F4 (X5-R6).** Every D17 cell's `o1`-error arm now accepts only the
+  read-failed message forms (O-1 (b)/(c)/(d) scan-or-raw read failed —
+  an XX001 that surfaced through O-1's own reads); the two cells that
+  reach it (leaf LOST and leaf TORN: recovery `Ok`, the extraction's
+  scan hits the faulted page, O-3 (d) fails the round) are X-5c's
+  pre-registered ruling case and assert only the reading-independent
+  facts — recovery `Ok`, read-failed `o1`, never served — neither
+  `pass` nor `!pass`; the test prints their measured outcome for the
+  record.
+- **F5 (the four unpinned fixes, each pinned and verified
+  mutant-style).** R4's positional id — the empty-leaf plant
+  (`r4_positional_id_discriminates_the_empty_leaf_plant`): two
+  fully-unmapped middle radix leaves are byte-identical except the
+  positional id, the only shape where check (3) alone discriminates;
+  the all-three and store-walkers-only header_id reverts both fail the
+  pin (served through the tainted landing slot), the harness-walks and
+  amcheck single reverts are subsumed by construction (argued in the
+  test's doc). Condition 3 at `exception_set_r`'s call site
+  (`exception_set_r_consults_its_noinplace_hits`). The step-2 fixpoint
+  re-scan (`step2_fixpoint_writes_late_epoch_copies`, the first-touch
+  performed inside step 2 via the checkpoint's own Mid2 hook). And
+  `fetch_page`'s `Stale` re-validation (`fetch_page_revalidates_its_
+  carried_ref`, over a new named park point `fetch:inflight` — the
+  in-flight window between a fetch's read and its re-validating
+  install).
+- **Two harness defects the G7 clean arm exposed, both fixed:** the
+  failed-recovery path never collected its reads into the twin (open
+  had read both meta slots before failing; the Err branch's TwinInfo
+  hardcoded `recovery_reads` empty, so O-3 (c) called the G7 detection
+  a false positive) — the final Err arm and the Err-branch TwinInfo now
+  carry the attempt's reads. D10b's doc item 1 corrected (the reuse
+  pairs the **same** radix base; the N5 note).
+- **D16's pair stays reported-uncaught (directed)** with its argument
+  in the test's doc comment; the campaign's Q10 rounds remain its
+  catcher per the mutation table.
+
+## Gate round 2 (2026-10-26 verdict, applied this run)
+
+- **N1 (FreeSet sizing).** §13 step 2's convergence loop: the page count
+  is recomputed after growth and the difference allocated until the
+  bitmap span covers every free-set slot; the meta's `slot_count` is the
+  converged span. Pinned by `freeset_growth_covers_its_own_slots` (the
+  verdict's 8-seed shape at every `R_EPOCH`, After5 and After6 — the old
+  code failed with both the amcheck finding and an O-1 (b) scan
+  mismatch).
+- **Three more Work-11 rule-1 violations the same shape exposed, all
+  fixed:** (a) `ckpt:freeze` snapshotted `cur` while an eviction held
+  the frame latched — the eviction's write and `record_image_at` landed
+  after the snapshot, so the radix embedded the pre-eviction home and
+  the image lost the leaf's newest entry (the checkpointer now drains
+  eviction latches before the one-step freeze); (b) step 2's single
+  scan missed first-touch epoch copies installed into reserve frames
+  behind the cursor — the fixpoint loop re-scans until a pass writes
+  nothing; (c) `ckpt2:record`'s pinned branch and `fetch_page`'s carried
+  load both skipped re-validation after yields.
+- **N2 (O-2 (ii) judged).** The harness checkpoint and amcheck (ii) now
+  feed the verdict: a first `check_round` keeps the card's
+  extraction→oracle→checkpoint order, the (ii) fields then go in, and
+  the final verdict re-judges with them (the (ii) image's referenced and
+  tainted slots from the durable bytes). A failed harness checkpoint is
+  a loud `task_error`. N2's wiring exposed two more deviations, both
+  fixed: the free set built its inner pages with `write_fresh` onto
+  slots the bitmap never marked used (I-FREE-EXACT; the pages now go to
+  the pre-allocated slots), and the durable-image walk silently skipped
+  §3.3 failures on tree and directory pages (the directory walk also
+  checked a hardcoded expected id of 0).
+- **N3 (D18 vacuous).** `fail_of` no longer masks store errors as
+  `SimFail::Crashed` (the real "tree 2 missing in directory" was hidden
+  behind task_error="Crashed"), and the harness's apply loop waits for
+  the creating commit's directory entry (applies finish out of ts order,
+  §12.4; a malformed script fails loudly instead of spinning the service
+  tasks past the deadlock detector). D18 reshaped on seed 2023: clean
+  passes with M-WAL-ORDER silent; TS-AFTER-APPEND gives the lower-ts
+  record the higher LSN — **M-WAL-ORDER fires and the oracle fails**,
+  both named catchers asserted.
+- **N4 (assert discipline).** Every clean arm asserts `pass` (except
+  D12b's designed fail-stop); every mutant arm names its catcher.
+- **N5 (the R-taint refutation).** D10b arm 4 is the card's own arm:
+  REFCRC-SKIP serves a reused slot through the R-taint (O-3 (a) fails);
+  ID-SKIP+REFCRC serves identically; the new `no_r_taint` knob (the G5
+  call-site pin) shows the same round **passes silently** with the
+  R-taint forced off.
+- **N6 (the D7 equivalence argument rejected).** D7 is the real
+  two-round zombie: round 1 tears tail 3's first sector with a directed
+  TORN fault on sector-aligned 1536-byte records (an in-place tear
+  cannot be drawn from F-CRASH here — the writer syncs every batch, so
+  each sector has one volatile image and the draw is all-or-nothing per
+  batch); round 2 appends the same-length record, §12.5's position check
+  lines the intact tail 4 up with the new append — clean passes (G2
+  zeroed the tail), TRUNCATE-LOGICAL-ONLY replays the zombie and O-1
+  fails on a commit the truncated model no longer has. Two harness
+  deviations fixed en route: model commits are recorded at the enqueue
+  (where `wal_commits`'s contract places them — a committer crashing
+  mid-ack with its record durable never entered the model), and
+  `derive_written_acked` starts at the round's first write and jumps
+  undecodable chunk boundaries (a chained round's events hold only its
+  own writes).
+- **N7 (the unpinned rework fixes).** Condition 3 (`r_slot_qualifies`),
+  the pass fold (`fold_pass`) and the abort path's `ckpt_open` clear
+  (D12b asserts no DEADLOCK) are pinned; the R4 positional-id pin runs a
+  free-set-inner MISDIRECTED onto a free-set leaf's referenced slot
+  under REFCRC-SKIP, where only the positional id discriminates.
+- **N8 (D17's grid).** LOST and MISDIRECTED on a referenced tree leaf,
+  the free-set root and the newest meta slot join the map-leaf TORN,
+  LOST and MISDIRECTED cells; a meta MISDIRECTED onto the twin slot is
+  a true serve (a valid copy through the fault's tainted landing range)
+  that O-3 (a) fails. *(Round 3 withdrew this item's "open finding"
+  misdiagnosis and rebuilt the grid on the F1/F2-fixed base — see
+  "Gate round 3"; the meta MISDIRECTED cell is now G7's catching test,
+  and the TORN cells exist for every target.)*
+
+## Verification round (2026-10-26)
+
+The re-run re-applied the gate's own probes by hand before finishing:
+
+- **G4 (recovery-world served corruption dropped from O-3 (a)).** The
+  faithful application — the extraction world's carried `served` set
+  cleared **and** the `recovery_served` term dropped — passed the whole
+  suite: D17's CRC-SKIP arm asserted any-failure and the round fails
+  via the silent-loss path regardless of the serve. Fixed properly:
+  `RoundOutcome.served` now carries O-3 (a)'s input, and D17's clean
+  and CRC-SKIP arms assert it (`!clean.served` / `m.served`). The
+  demonstration: with the faithful probe applied, `d17_integrity`
+  fails at the CRC-SKIP `m.served` assertion; with only the
+  `recovery_served` term dropped, nothing fails — the serve also flows
+  through the extraction world's carried set, so that application is
+  subsumed by design (two independent paths, no single droppable
+  site). Probes reverted; `git diff` clean of them.
+- **G5 (the R-taint forced false).** Function-level (the body of
+  `r_taint_of` forced to return `false`): caught by
+  `r_taint_window_semantics` in `tests/sim.rs` (cases (1) and (3)
+  assert true). Wiring-level (`let r_taint = false;` at the call
+  site): **UNCAUGHT-directed** — a positive end-to-end case needs
+  exactly D10b arm 4's same-position/same-epoch reuse coincidence
+  (argued unreachable directed; the campaign's Q14 rounds are the
+  catcher). Reported to X-5c with the arm.
+- **The four hard-coded integrity disables (the gate's R2 probes).**
+  All four are now caught by `d17_integrity`, each demonstrated by
+  hand and reverted: check (1) hard-off → the clean arm's
+  `!clean.served` (the torn leaf is accepted); check (2) hard-off →
+  the new second half's clean arm (below); checks (2)+(3) hard-off →
+  the same assertion. **The new second half** is the card's REFCRC
+  shape ("a slot reused for the same LPID in the same epoch"): churn
+  with the evictor on makes an older same-LPID same-epoch tree page
+  durable at a superseded slot (400 big entries × two versions over a
+  16-frame pool), and a directed MISDIRECTED fault plants those stale
+  bytes on the referenced slot — checks (1), (3) and (4) pass (a valid
+  page of the same LPID and epoch), so only the reference CRC
+  distinguishes. Clean: XX001 at open, never served. Under
+  REFCRC-SKIP, EPOCH-SKIP+REFCRC and ID-SKIP+REFCRC the stale page is
+  accepted through the tainted read — served (`RoundOutcome.served`)
+  and the round fails. This fills the directed column for all three
+  reference-CRC mutants; D10b arm 4 stays as the X5-R5-specific probe.
+- **D8's doc comment** claimed an end-to-end arm the body never ran;
+  rewritten to state what runs (the reader-level arms) and where the
+  end-to-end case lives (D9's recycle shape, `tests/store.rs`'s
+  checkpoint-with-recycle, X-5c's multi-round campaign seeds).
+
+## Gate REWORK on stage X-5b (2026-10-25 verdict, applied)
+
+- **R1/R2 (mutant arms).** Every inverted or vacuous arm is gone: D10
+  runs the real G3 shape (the recycle removes meta k−1's start segment,
+  a LOST fault on meta k forces the rollback open, and
+  START-SEGMENT-MISSING-OK's silent empty WAL loses the acked commits —
+  O-3 (d) fails the round); D11 drives the real `BulkLoad` with
+  PUBLISH-BEFORE-META's single site at the load's forced-meta wait
+  (caught); D14's FREE-EARLY site now frees **at the flip** (the
+  draft's just-before-step-5 window was two yields wide and no
+  allocation could enter it) — step 2's own allocations reuse
+  durable-referenced slots and M-NOINPLACE fires; and D17 runs through
+  `run_round` with directed faults in **two halves**: the torn map leaf
+  at `map_leaf_cap` 254 (clean XX001 never served; CRC-SKIP serves the
+  tainted leaf — pinned on `RoundOutcome.served` — and fails the
+  round; the EPOCH/ID single sites stay subsumed, the expected-0 hit
+  rates demonstrated; LOST and MISDIRECTED arms) and the verification
+  round's REFCRC shape (below). D10b exists (below). D7's
+  multi-round arm and D16's pair are **reported** UNCAUGHT with
+  arguments in their doc comments — never asserted as passes.
+- **R3 (X5-R5's harness half).** `exception_set_r` implements all three
+  conditions (the third — no M-NOINPLACE hit on the slot's writes — via
+  the monitor's new per-write verdicts, `monitor::noinplace_slot_hits`);
+  the R-taint is computed from the interleaved write/accept history
+  (`DiskEvent::Accepted`, one `DiskEvent::Crash` per life) over every
+  post-crash life — recovery's own accepts included, each nested crash
+  restarting the window (`harness::r_taint_of`, pinned in
+  `tests/sim.rs`); D10b runs the rollback shape end to end. (The
+  rework's claim that "G4's catcher is D17's recovery-world serve" was
+  wrong as then asserted — D17's arm took any failure; the
+  verification round added the real pin, `RoundOutcome.served`, above.
+  G5's function is pinned by `r_taint_window_semantics`; its call-site
+  wiring is the uncaught probe reported to X-5c.)
+- **R4 (the self-referential id check).** Every radix walk (open,
+  amcheck, the harness walks and the monitor's shadow walk) derives the
+  expected id **positionally** (`ckpt::radix_child_span`; the child of
+  an inner at base `b`, index `i`, span `s` expects id `b + i·s`), and
+  the builders' base formulas agree (the free-set inner's `2^depth`
+  understatement fixed to `fan^(depth+1)`).
+- **R5 (the BulkLoad deadlock).** Root cause: the S_L draw consumed a
+  ts from the commit sequencer without marking it applied, so
+  `visible_ts` stalled below every later commit forever (the publish
+  commit parked in `mark_applied` on a ts that never arrives). The
+  drawn ts is pre-marked applied; `ScriptOp::BulkLoad` runs (D11).
+- **R6 (the instrumentation check).** `baton_violation_is_reported`
+  gains a cross-thread arm (`baton_violation_cross_thread_holder_is_
+  reported`): a world holder on another OS thread makes `acquire`'s
+  `try_lock` loop report `Baton` at the call site. Demonstrated by
+  hand: with the `try_lock` replaced by a blocking `lock`, the test
+  hangs (the run was killed at 60 s with no result) and reverts clean.
+- **R7 (RESULT accuracy).** B1's `git diff --stat` (4b1e6068): 14 files,
+  +4935/−2702 ≈ 7.6k changed lines against the ~1.5k budget; the stage
+  RESULT's mutant table reports the arms as above, item 3 includes
+  D10b.
+- **Minor.** `RoundOutcome.pass` folds `deadlock`/`panicked`/`baton`
+  (the flag is now actually set — from task errors and from
+  `StoreInner::baton_fail`, which the release paths record instead of
+  swallowing); `EnvRef::accepted` propagates its acquisition failure
+  (fail-closed on an oracle input); D1's clean arm asserts the monitors
+  are empty; every new sim surface (`dwrites_of` history, `DWrite`
+  pre/`all`/`Clone`, `apply_one_media_fault`, the Accepted/Crash
+  events, the R-taint window) has its own test in `tests/sim.rs`
+  (`apply_one_media_fault` is Work 6/D17–D10b's deterministic fault
+  entry, the drawn-fault path's equal); the `WorldGuard` `Drop` comment
+  states the real order.
+
+**Failures found and fixed while reworking** (each pinned by the test
+that exposed it): the `ckpt_open` strand (a checkpoint that fails
+without a crash — the I-GCW fail-stop — left the flag set and parked
+`wait_ckpt` forever; D12b's hang); the checkpointer swallowed non-crash
+checkpoint failures (a poisoned round passed with no meta written —
+now `task_error`); `RoundOutcome` never carried `meta_rollback`,
+`rollback_slots`, `amcheck_i` or the crashed disk (the directed tests
+judged defaults); the monitor's shadow walk recursed with the parent's
+bytes, so `flat` never filled past one level and the durable slot set
+undercounted every tree page.
+
+## Stage X-5b (B1–B6)
+
+- **B1 — the S-BATON conversion (Work 11):** every store operation
+  restructured to lock-work-unlock steps over `Cx::with` (the
+  lock-step-unlock shape of rule 3); `try_lock` at every host
+  acquisition with `SimFail::Baton` naming the call site (rule 4);
+  `pub mod store;` wired. `tests/store.rs`: create/open/scan, 10k
+  inserts with leaf and root splits (scan equals a `BTreeMap`), a GC
+  sweep with merges and root collapse, a checkpoint with a concurrent
+  insert task and the background evictor at minimum `F`, reopen, and
+  three seeds with no DEADLOCK/PANIC/Baton. Two new sim pins in
+  `tests/sim.rs`: `baton_violation_is_reported` and
+  `accept_hook_judges_older_tainted_read` (the B3 pin).
+- **B2 — the store (Work 3 + 4, with Work 12):** the §2/§3/§4 codec with
+  the four §3.3 checks as separate mutant sites, no-fallback open with
+  G3, the pool (§5) with clock eviction, dirty eviction to fresh slots
+  and the `R_EPOCH` epoch-copy reserve, the §5.6 gate, the flat map with
+  the CoW §4.1 radix (Work 12's four conditions: the §4.1 byte layout,
+  copy-on-write step 2 with unchanged leaves shared, `map_leaf_cap` ∈
+  {8, 16, 254} giving ≥ 2 radix levels, `R_MAP = 0`), the B+tree with
+  stable roots, N3=(b) entries, merge and root collapse, the §6.8
+  directory with bounded DropTree walks, §10.2/§10.4 GC with `gc_w`,
+  §12 WAL with framing/group commit/§12.6 replay start/recycling,
+  §13 steps 0–6 with hooks, §14 recovery with G2 physical truncation,
+  amcheck (3.8), the 27-mutant enum plus G7's META-WRONG-SLOT (28).
+- **B3 — the round harness (Work 13):** `Script` tasks with commits,
+  chunked transactions, bulk loads, GC, checkpoints and named park
+  points (`chunked:premark`/`preapply`, `commit:preapply`,
+  `writer:presync`, `split:mid`, `apply:mid`), writer/evictor/
+  checkpointer service tasks, crash delivery at `CkptHook`s and task
+  yield points, nested recovery crashes, the 2.3 extraction through the
+  recovered store, X5-R5's `meta_rollback`/`R`/R-taint, the Work 2.1
+  `written`/`acked` derivation from disk events, the twin supply, the
+  canonical digest (determinism test in `tests/harness.rs`).
+- **B4 — the monitors (Work 3.10):** M-NOINPLACE, M-META-ATOMIC,
+  M-WAL-ORDER and M-CKPT-T over the disk events and the flip's reported
+  enqueue position.
+- **B5/B6 — the directed tests (Work 6 + 14):** D1–D18 in
+  `tests/directed.rs`, each with its clean arm and (where caught) its
+  mutant arm; the four uncaught arms are marked in place.
+
+**Prototype deviations fixed in B5** (each pinned by the directed test
+that exposed it): the stale-embed race of step 2 (the frozen image
+table: the radix, the free set and the step-5 durable set read one
+atomic snapshot and every referenced slot is pinned, so an eviction in
+flight across the freeze cannot unpin or redirect an embedded ref);
+`ckpt:end` now wakes `MetaDurable` (a completed checkpoint stranded its
+forced waiter); `wal_enqueue`'s segment-boundary placement (a record
+only lands in this segment when it ends at the boundary or leaves room
+for the 45-byte SegmentEnd filler; the draft emitted the filler at `lsn0`
+regardless of room, so a record could straddle the boundary while
+carrying the next segment's lsn); the free-set page lifecycle
+(`fs_building`/`fs_prev`: the step-5 durable set covers the image's own
+free-set pages and the previous image's are unpinned — the leak made
+every early free undetectable); the monitors' durable-image walk now
+descends the directory's leaf cells into the trees; the Work 2.1
+derivation stitches each WAL file's bytes from the write events and
+walks records (the self-contained-batch parse missed every record a
+writer's chunk split mid-record, and recycled segments need
+file-relative positions).
+
+## Stage X-5a (complete)
 
 ## Scope: the three stages
 
@@ -229,9 +574,18 @@ kept verbatim from run 1.
   `R` counts as tainted from the moment open selects the rolled-back
   meta until the store next writes it (X-5b's harness supplies that as
   `served`).
-- **The in-memory page map is flat** with per-entry image overrides; the
-  persisted §4.1 radix is materialised at step 2 and parsed at open and by
-  amcheck. MapLeaf pool residency/pinning is not exercised.
+- **The in-memory page map is flat** with per-entry image overrides;
+  the persisted §4.1 radix is materialised at step 2 and parsed at open
+  and by amcheck. Work 12's conditions hold: the persisted radix uses
+  the §4.1 byte layout and passes §3.3; step 2 is copy-on-write (only
+  the map pages whose content changed since image k−1 are rewritten, to
+  fresh slots, up to the root; unchanged map pages keep their image k−1
+  slots and are shared between the two images, the §4.4
+  three-reference rule); `map_leaf_cap` ∈ {8, 16, 254} gives the radix
+  ≥ 2 levels; `R_MAP = 0` (`F = tasks × (max_height + 2) + R_EPOCH`).
+  **Not exercised** (A-3c's and A-7's): MapLeaf pool residency and
+  pinning (§4.1, §5.4's `R_MAP`), map-page dirty eviction between
+  checkpoints, and map-page epoch copies.
 - **Per-tree sim mutex** replaces latch coupling (card 3.6); merge-only
   (no inner redistribution); no overflow chains; 4 KiB pages only.
 
@@ -280,9 +634,10 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # stage X-5a: sim + oracle suites (53 tests)
+cargo test -q --release -p e4-recovery      # the whole crate (99 tests)
 cargo test -q -p e4-recovery --test oracle  # the 2.6 + 2.7 + REWORK self-tests (29)
-cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests + REWORK pins (17)
+cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests + REWORK pins (25)
+cargo test -q -p e4-recovery --test directed  # D1–D18 + D10b/D12b + the pins (22)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
   --results spikes/e4-recovery/results/campaign.json   # exits 2: not built (X-5c)
 ```

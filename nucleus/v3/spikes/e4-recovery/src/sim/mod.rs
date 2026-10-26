@@ -33,4 +33,6 @@ pub use disk::{
     WAL_DIR as DISK_WAL_DIR,
 };
 pub use env::{E4Env, EnvRef, FileId, HasDisk, PAGE_FILE, ROOT_DIR, WAL_DIR};
-pub use sched::{HARNESS, Sched, SchedCore, SchedHost, SimFail, TaskId, WaitKey};
+pub use sched::{
+    HARNESS, Sched, SchedCore, SchedHost, SimFail, TaskId, WaitKey, WorldGuard, world_held_by_me,
+};
