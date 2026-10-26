@@ -136,6 +136,11 @@ pub enum CrashSpec {
     /// Crash at the n-th yield point of a named task (script-level yield
     /// points: before every op and inside every park budget).
     TaskYield(TaskId, u64),
+    /// Crash at the n-th **scheduler** yield of the round, any task (the
+    /// uniform draw's true address space: every yield point, including
+    /// the service tasks' and the checkpoint's internals). Armed before
+    /// the workload starts.
+    Yield(u64),
 }
 
 /// The round's script: tasks, service tasks, the crash and the nested
@@ -628,6 +633,13 @@ pub fn run_script(sched: &Sched<RoundWorld>, script: &Script, seed: u64) {
         let mut g = sched.lock();
         g.sched = SchedCore::new(ntasks, derive(seed, S_SCHED));
         g.sched.ntasks = ntasks;
+        // The scheduler-level uniform crash (`CrashSpec::Yield`) is
+        // armed on the fresh core: `run_script` owns the core's lifetime
+        // (the reset above), so the arm belongs here and only here —
+        // arming before `run_script` is silently wiped by the reset.
+        if let Some(CrashSpec::Yield(at)) = script.crash.as_ref() {
+            g.sched.crash_at_yield = Some(*at);
+        }
     }
     let panicked = std::sync::atomic::AtomicBool::new(false);
     let mut deadlock = false;
@@ -1278,6 +1290,10 @@ pub struct RoundOutcome {
     /// truncate the model at c_r"), so the next round of a multi-round
     /// seed starts from it (D7's zombie shape and X-5c's campaign).
     pub end_model: Model,
+    /// The workload pass's total scheduler yields (the uniform crash's
+    /// address-space count; the driver's counting pass reads it with the
+    /// crash disabled).
+    pub sched_yields: u64,
     /// The workload pass's quota observables (card Work 5.6), snapshotted
     /// at the crash.
     pub obs: WorkloadObs,
@@ -1330,6 +1346,7 @@ impl Default for RoundOutcome {
             panicked: false,
             task_error: None,
             end_model: Model::new(),
+            sched_yields: 0,
             obs: WorkloadObs::default(),
             nested_fired: 0,
             nested_points: Vec::new(),
@@ -1410,6 +1427,12 @@ pub struct RoundFaults {
     /// drawn point is uniform over this disk's recovery yield count
     /// (counted by a throwaway pass, so a point is always reachable).
     pub nested_draw: u32,
+    /// **Probe pass** (the uniform crash's counting pass): run the
+    /// workload only, skip the crash/faults/recovery/oracle — the
+    /// outcome carries `sched_yields` and the crash-time observables,
+    /// and nothing else is defined. The driver uses it to draw the
+    /// scheduler-level uniform crash point.
+    pub probe_pass: bool,
 }
 
 /// The round's seeded media draw kind (card Work 5.5 step 3; the class
@@ -1528,7 +1551,11 @@ pub fn run_round(
         };
         Sched::new(host)
     };
+    // The scheduler-level uniform crash (`CrashSpec::Yield`) is armed by
+    // `run_script` itself, on the core it resets to size the task set —
+    // see the arm there.
     run_script(&sched, script, seed);
+    let sched_yields_total = sched.lock().sched.yields;
     let (mut disk, mut model, flip_pos, flags, wal_commits, events, obs) = {
         let g = sched.lock();
         // The workload-pass observables, snapshotted the moment the tasks
@@ -1597,6 +1624,18 @@ pub fn run_round(
             obs,
         )
     };
+    if faults.probe_pass {
+        // The counting pass (the uniform crash's address-space measure):
+        // the workload's yield total and the crash-time observables are
+        // defined; everything downstream of the crash is skipped.
+        let mut outcome = RoundOutcome {
+            class: faults.class,
+            ..Default::default()
+        };
+        outcome.sched_yields = sched_yields_total;
+        outcome.obs = obs;
+        return outcome;
+    }
     // Work 2.1: written/acked from the disk events — the write carrying
     // the commit record's last byte returned, and (SyncOn) a WAL sync
     // covering it returned / (SyncOff) the write returned.
@@ -2108,6 +2147,7 @@ pub fn run_round(
         }
     }
     // ---- the new per-round record fields (both branches) ----
+    outcome.sched_yields = sched_yields_total;
     outcome.obs = obs;
     outcome.nested_fired = nested_fired;
     outcome.nested_points = nested_points;

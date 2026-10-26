@@ -699,7 +699,7 @@ fn gc_locked<H: StoreHost>(
     // gated operation): a group spanning the L/R boundary is decided as a
     // whole, so a deferred tombstone's older versions cannot survive
     // beside it (I-GC-ORDER, I-GC-COMPLETE).
-    let (sibling, n_left) = if path.len() >= 2 {
+    let (sibling, l_bound) = if path.len() >= 2 {
         match path.get(path.len() - 2) {
             Some((_p_lpid, p_bytes)) => {
                 let (seps, right) = inner_seps(p_bytes)?;
@@ -715,15 +715,27 @@ fn gc_locked<H: StoreHost>(
                                 }
                             }
                         };
-                        (r, cells.len())
+                        // The cell's upper bound (the separator the pair
+                        // split below): the kept entries are re-split
+                        // **by key** against it, never by origin count —
+                        // the prune may have deleted entries of L, so a
+                        // count-based split would move R's lowest
+                        // entries (≥ the bound) into L and break the
+                        // cell convention (§6.5; pinned by
+                        // `gc_pack_splits_kept_entries_at_the_separator`).
+                        let bound = seps
+                            .get(idx)
+                            .map(|(_, s)| s.clone())
+                            .ok_or_else(|| Fail::Corrupt("sep".into()))?;
+                        (r, bound)
                     }
-                    None => (None, cells.len()),
+                    None => (None, Vec::new()),
                 }
             }
-            None => (None, cells.len()),
+            None => (None, Vec::new()),
         }
     } else {
-        (None, cells.len())
+        (None, Vec::new())
     };
     let mut cells_all: Cells = cells.clone();
     let mut sibling_bytes = None;
@@ -811,11 +823,21 @@ fn gc_locked<H: StoreHost>(
     }
     // The pack step (§6.5 case 1): when the pair of kept halves fits in
     // `F_PACK·U`, L absorbs R's part and R is unlinked and freed;
-    // otherwise each page keeps its part.
+    // otherwise each page keeps its part — **split by key at the cell
+    // bound** (`l_bound`), so a group decided across the boundary lands
+    // back on its own side whatever the prune deleted.
     let (keep_l_part, keep_r_part): (Cells, Cells) = match sibling_bytes.as_ref() {
         Some(_) => {
-            let kl: Cells = keep.iter().take(n_left).cloned().collect();
-            let kr: Cells = keep.iter().skip(n_left).cloned().collect();
+            let kl: Cells = keep
+                .iter()
+                .filter(|(k, _)| k.as_slice() < l_bound.as_slice())
+                .cloned()
+                .collect();
+            let kr: Cells = keep
+                .iter()
+                .filter(|(k, _)| k.as_slice() >= l_bound.as_slice())
+                .cloned()
+                .collect();
             (kl, kr)
         }
         None => (keep.clone(), Vec::new()),

@@ -34,7 +34,7 @@ use crate::harness::{
 };
 use crate::model::{CATALOG, Model, Op, PUBLIC, to_be64};
 use crate::rng::{Rng, derive};
-use crate::sim::{FaultClass, FaultKnobs, MediaKind, TaskId};
+use crate::sim::{FaultClass, FaultKnobs, MediaKind};
 use crate::store::ckpt::CKPT_HOOKS;
 use crate::store::{Mutant, StoreCfg, WAL_SEG};
 
@@ -463,9 +463,13 @@ fn value_of(rng: &mut Rng, lo: u64) -> Vec<u8> {
 
 /// The round's crash point (5.5): targeted at hook
 /// `CKPT_HOOKS[(seed/20) % 10]` of a seeded checkpoint when
-/// `(seed/10) % 2 == 0`, else uniform over the script's yield points
-/// (one per op). Returns the spec, its description, and the targeted
-/// hook's name (empty for uniform).
+/// `(seed/10) % 2 == 0`, else uniform over the round's yield points.
+/// The uniform draw is **scheduler-yield-level**: the driver first
+/// counts the round's total yields (a counting pass with the crash
+/// disabled), then arms [`CrashSpec::Yield`] at `1 + below(count)` — so
+/// every yield point of every task (the service tasks' env calls, the
+/// checkpoint's internals, the rename/dirsync windows) is an address,
+/// which is what 5.5's "uniform over the round's yield points" says.
 pub fn crash_spec(
     seed: u64,
     round: u32,
@@ -484,26 +488,43 @@ pub fn crash_spec(
             format!("{hook:?}"),
         )
     } else {
-        // Uniform over (task, op index): k ∈ 1..=total ops.
         let mut rng = Rng::new(derive(seed * 100 + round as u64, S_CRASHP));
         let total: u64 = tasks.iter().map(|t| t.ops.len() as u64).sum();
         if total == 0 {
             return (None, "none".to_owned(), String::new());
         }
-        let mut k = 1 + rng.below(total);
-        for (i, t) in tasks.iter().enumerate() {
-            let n = t.ops.len() as u64;
-            if k <= n {
-                let tid = (i + 1) as TaskId;
-                return (
-                    Some(CrashSpec::TaskYield(tid, k)),
-                    format!("uniform@t{tid}:{k}"),
-                    String::new(),
-                );
-            }
-            k -= n;
-        }
-        (None, "none".to_owned(), String::new())
+        // A placeholder: the driver replaces it with the counted,
+        // scheduler-level point once the counting pass has run.
+        let k = 1 + rng.below(total);
+        (
+            Some(CrashSpec::TaskYield(1, k)),
+            format!("uniform@y:{k}"),
+            String::new(),
+        )
+    }
+}
+
+/// Draw the uniform crash's scheduler-yield point (5.5): `k` uniform in
+/// `1..=counted`, from the round's own stream.
+pub fn uniform_yield_point(seed: u64, round: u32, counted: u64) -> u64 {
+    let mut rng = Rng::new(derive(seed * 100 + round as u64, S_CRASHP));
+    1 + rng.below(counted.max(1))
+}
+
+/// A round whose crash spec never fired is a **harness defect** (5.5
+/// step 2: every round crashes). A silent no-crash round would leave
+/// every downstream field — faults, recovery, the oracle inputs —
+/// meaningless while still being judged, so the driver records this and
+/// fails the seed. The `TaskYield` draw could not miss (its address
+/// space is the script's own op count); the scheduler-level `Yield`
+/// draw can, if the counting pass and the real round ever diverge, and
+/// so can an untriggered targeted hook — both are defects, never
+/// passes.
+pub fn crash_fired_defect(out: &harness::RoundOutcome, crash_desc: &str) -> Option<String> {
+    if out.obs.crash_fired {
+        None
+    } else {
+        Some(format!("the crash spec never fired ({crash_desc})"))
     }
 }
 
@@ -779,19 +800,61 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         };
         let knobs = Knobs::derive(seed, round);
         let cfg = knobs.store_cfg(mutant);
-        let (base, crash_desc, crash_hook) = build_round(seed, round, &knobs, &ch.model, ch.cut);
-        // The twin round first (Work 2.5): the same script, class C, the
-        // faults removed. Its recovery reads and opened image supply the
-        // real round's O-3 (c); its drawn nested points are passed
-        // explicitly to the real round so both runs crash at the same
-        // points; its own chain advances on its own end state.
-        let mut supply = None;
-        let mut twin_points = Vec::new();
-        if let Some(tch) = twin_chain.take() {
-            let ts = Script {
+        let (base, _crash_desc, crash_hook) = build_round(seed, round, &knobs, &ch.model, ch.cut);
+        // The uniform crash is scheduler-yield-level: a counting pass on
+        // a throwaway clone of the round's start (the crash disabled)
+        // measures the total, then the real round — and its twin, which
+        // must crash at the same point (Work 2.5) — arm `Yield(k)` at a
+        // seeded point in `1..=count`.
+        let uniform = (seed / 10) % 2 == 1;
+        let (script_twin, script_real, crash_desc);
+        if uniform {
+            let probe = Script {
+                crash: None,
+                ..base.clone()
+            };
+            let out = harness::run_round(
+                seed,
+                round,
+                &probe,
+                &RoundFaults {
+                    class: FaultClass::C,
+                    knobs: knobs.fault,
+                    directed: Vec::new(),
+                    no_r_taint: false,
+                    media: MediaDraw::None,
+                    twin_supply: None,
+                    nested_draw: 0,
+                    probe_pass: true,
+                },
+                cfg.clone(),
+                ch.disk.clone(),
+                ch.st.clone(),
+                &ch.model,
+                ch.cut,
+                None,
+            );
+            let k = uniform_yield_point(seed, round, out.sched_yields.max(1));
+            script_twin = Script {
+                crash: Some(CrashSpec::Yield(k)),
+                ..base.clone()
+            };
+            script_real = Script {
+                crash: Some(CrashSpec::Yield(k)),
+                ..base
+            };
+            crash_desc = format!("uniform@y:{k}");
+        } else {
+            script_twin = Script {
                 nested: Vec::new(),
                 ..base.clone()
             };
+            script_real = base;
+            crash_desc = _crash_desc;
+        }
+        let mut supply = None;
+        let mut twin_points = Vec::new();
+        if let Some(tch) = twin_chain.take() {
             let tf = RoundFaults {
                 class: FaultClass::C,
                 knobs: knobs.fault,
@@ -800,12 +863,13 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 media: MediaDraw::None,
                 twin_supply: None,
                 nested_draw: nested_draw_for(seed, round),
+                probe_pass: false,
             };
             let mut reads = Vec::new();
             let out = harness::run_round(
                 seed,
                 round,
-                &ts,
+                &script_twin,
                 &tf,
                 cfg.clone(),
                 tch.disk,
@@ -814,6 +878,11 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 tch.cut,
                 Some(&mut reads),
             );
+            if let Some(d) = crash_fired_defect(&out, &crash_desc)
+                && rec.defect.is_none()
+            {
+                rec.defect = Some(format!("twin round {round}: {d}"));
+            }
             rec.twin.push(TwinRound {
                 pass: out.pass,
                 o1_fail: out.o1.clone().err(),
@@ -839,7 +908,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         // twin's nested points (class C draws its own).
         let script = Script {
             nested: twin_points,
-            ..base
+            ..script_real
         };
         let faults = RoundFaults {
             class,
@@ -857,6 +926,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             } else {
                 0
             },
+            probe_pass: false,
         };
         let out = harness::run_round(
             seed,
@@ -870,6 +940,11 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             ch.cut,
             None,
         );
+        if let Some(d) = crash_fired_defect(&out, &crash_desc)
+            && rec.defect.is_none()
+        {
+            rec.defect = Some(format!("round {round}: {d}"));
+        }
         let rr = round_rec(&knobs, &cfg, &out, &crash_desc, &crash_hook);
         rec.deadlock |= rr.deadlock;
         rec.panic |= rr.panic;

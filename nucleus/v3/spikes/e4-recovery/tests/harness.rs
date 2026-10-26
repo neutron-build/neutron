@@ -36,6 +36,7 @@ fn round_faults() -> RoundFaults {
         media: e4_recovery::harness::MediaDraw::None,
         twin_supply: None,
         nested_draw: 0,
+        probe_pass: false,
     }
 }
 

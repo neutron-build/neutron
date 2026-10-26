@@ -33,6 +33,7 @@ fn smoke_16_seeds() {
                 "seed {seed} round {i}: task error {:?}",
                 r.task_error
             );
+            assert!(r.fired, "seed {seed} round {i}: the crash never fired");
         }
         assert!(rec.defect.is_none(), "seed {seed}: defect {:?}", rec.defect);
         // The round count follows the knobs, except an early stop (a
@@ -73,12 +74,55 @@ fn smoke_16_seeds() {
     let a = workload::run_seed(7, None);
     let b = workload::run_seed(7, None);
     assert_eq!(a.digest, b.digest, "seed 7 digests differ across runs");
+    let u = workload::run_seed(12, None);
+    let u2 = workload::run_seed(12, None);
+    assert_eq!(
+        u.digest, u2.digest,
+        "seed 12 (uniform crash) digests differ across runs"
+    );
     let t1 = campaign::run_range(0, 5, None, 1);
     let t3 = campaign::run_range(0, 5, None, 3);
     for (x, y) in t1.iter().zip(t3.iter()) {
         assert_eq!(x.seed, y.seed);
         assert_eq!(x.digest, y.digest, "seed {} differs across threads", x.seed);
     }
+}
+
+/// The scheduler-level uniform crash (5.5's "uniform over the round's
+/// yield points"): the counting pass measures the round's true yield
+/// total, the drawn point is always reachable — every round of the
+/// uniform seeds fires, no silent no-crash round — and the draw is
+/// pure. A never-fired crash is a harness defect through
+/// [`workload::crash_fired_defect`], never a pass.
+#[test]
+fn uniform_crash_fires_at_the_counted_yield() {
+    // Seeds 10..15 are uniform ((seed/10) % 2 == 1): 10/12/14 class C,
+    // 11 MP, 13/15 MW. Every round must have fired its crash.
+    for seed in [10u64, 11, 12, 13, 14, 15] {
+        let rec = workload::run_seed(seed, None);
+        assert!(rec.defect.is_none(), "seed {seed}: {:?}", rec.defect);
+        assert!(!rec.rounds.is_empty(), "seed {seed}: no rounds");
+        for (i, r) in rec.rounds.iter().enumerate() {
+            assert!(r.fired, "seed {seed} round {i}: the crash never fired");
+        }
+    }
+    // The point draw is pure and stays inside the counted total (and a
+    // zero-yield round still addresses the first yield, never `0`).
+    let k1 = workload::uniform_yield_point(12, 0, 10_000);
+    let k2 = workload::uniform_yield_point(12, 0, 10_000);
+    assert_eq!(k1, k2, "the yield point draw is not pure");
+    assert!((1..=10_000).contains(&k1), "drawn point {k1} out of range");
+    assert_eq!(
+        workload::uniform_yield_point(12, 0, 0),
+        1,
+        "the empty round must still address yield 1"
+    );
+    // The defect rule: a never-fired crash is a defect whatever the
+    // description; a fired crash never is.
+    let mut out = e4_recovery::harness::RoundOutcome::default();
+    assert!(workload::crash_fired_defect(&out, "uniform@y:7").is_some());
+    out.obs.crash_fired = true;
+    assert!(workload::crash_fired_defect(&out, "uniform@y:7").is_none());
 }
 
 /// The knob derivation is total and in the card's ranges (5.1), and the
@@ -336,6 +380,7 @@ fn setup_barrier_guards_the_wal_order() {
         media: MediaDraw::None,
         twin_supply: None,
         nested_draw: 0,
+        probe_pass: false,
     };
     let run3 = |s: &Script| {
         let (disk, st) = harness::create_store(cfg3.clone(), 3, 3).expect("create");

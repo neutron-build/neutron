@@ -40,6 +40,7 @@ fn faults(class: FaultClass, k: FaultKnobs) -> RoundFaults {
         media: e4_recovery::harness::MediaDraw::None,
         twin_supply: None,
         nested_draw: 0,
+        probe_pass: false,
     }
 }
 
@@ -688,6 +689,7 @@ fn d7_zombie_tail() {
                 media: e4_recovery::harness::MediaDraw::None,
                 twin_supply: None,
                 nested_draw: 0,
+                probe_pass: false,
             },
             cfg(mutant),
             disk,
@@ -985,6 +987,7 @@ fn d10_lost_meta() {
             media: e4_recovery::harness::MediaDraw::None,
             twin_supply: None,
             nested_draw: 0,
+            probe_pass: false,
         },
         cfg(None),
         disk,
@@ -1018,6 +1021,7 @@ fn d10_lost_meta() {
             media: e4_recovery::harness::MediaDraw::None,
             twin_supply: None,
             nested_draw: 0,
+            probe_pass: false,
         },
         Some(Mutant::StartSegmentMissingOk),
     );
@@ -1141,6 +1145,7 @@ fn d10b_rollback_exception() {
                 media: e4_recovery::harness::MediaDraw::None,
                 twin_supply: None,
                 nested_draw: 0,
+                probe_pass: false,
             },
             cfg(m),
             disk,
@@ -1400,6 +1405,64 @@ fn d12_gcw() {
         m.gc_w < 2,
         "D12 mutant: gc_w must not be recorded — the named catcher (gc_w={})",
         m.gc_w
+    );
+}
+
+/// The X-5c stage pin (RESULT item 5, this stage's development
+/// failure): the GC pack step's kept-entry split. The sweep processes
+/// leaf L **and its right sibling R** as one gated step and re-splits
+/// the kept entries between them; the draft split them by L's
+/// pre-prune **count** (`keep.take(n_left)`), so every version the
+/// §10.2 rule pruned from L moved that many of R's lowest entries —
+/// keys at or above the parent separator — into L. The durable image
+/// then held a leaf with entries at or above its own subtree bound
+/// (seed 10 round 1's amcheck (ii): "entry above subtree bound", slots
+/// with an entry exactly equal to its bound). The split is by **key**
+/// against the cell bound (`l_bound`), which is §6.5's cell convention
+/// under any pruning. Literal config: 60 contiguous keys with one
+/// version each (the kept mass — the pair must not absorb), two of them
+/// re-Put above a checkpoint so the sweep prunes exactly their older
+/// versions from the leftmost pair, then a checkpoint that serialises
+/// the swept pages before the crash. Class C, no faults; amcheck must
+/// be clean and the round must pass.
+#[test]
+fn gc_pack_splits_kept_entries_at_the_separator() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: (0..60u64).map(|i| putv(i, 1, 180)).collect(),
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![putv(0, 2, 180), putv(1, 2, 180)],
+        },
+        ScriptOp::Gc { tree: 2, w: None },
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let mut script = script_with_crash(None);
+    script.tasks[0].ops = ops;
+    script.checkpointer_every = Some(1000);
+    script.crash = Some(CrashSpec::TaskYield(1, 6));
+    let clean = run(2012, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        clean.pass,
+        "the swept pair must stay bound-consistent (o1={:?}, o2={:?}, o3={:?}, te={:?})",
+        clean.o1, clean.o2_fail, clean.o3_fail, clean.task_error
+    );
+    assert!(
+        clean.amcheck_i.is_empty() && clean.amcheck_ii.is_empty(),
+        "amcheck must be clean on a legal sweep (i={:?}, ii={:?})",
+        clean.amcheck_i,
+        clean.amcheck_ii
     );
 }
 
@@ -2105,6 +2168,7 @@ fn r4_positional_id_discriminates_the_empty_leaf_plant() {
                 media: e4_recovery::harness::MediaDraw::None,
                 twin_supply: None,
                 nested_draw: 0,
+                probe_pass: false,
             },
             r4cfg(mutant),
             disk,
@@ -2227,6 +2291,7 @@ fn d17_integrity() {
                 media: e4_recovery::harness::MediaDraw::None,
                 twin_supply: None,
                 nested_draw: 0,
+                probe_pass: false,
             },
             cfg254(mutant),
             disk,
@@ -2507,6 +2572,7 @@ fn d17_integrity() {
                 media: e4_recovery::harness::MediaDraw::None,
                 twin_supply: None,
                 nested_draw: 0,
+                probe_pass: false,
             },
             cfg254(mutant),
             disk,

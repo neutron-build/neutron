@@ -279,11 +279,16 @@ fn cmd_verify(args: &[String]) -> i32 {
         eprintln!("e4-campaign verify: {bad} seeds did not reproduce");
         return 2;
     }
-    // 3. Every 5.6 quota is met (and Work 5.3's sizing assertion holds).
+    // 3. Every 5.6 quota is met (and Work 5.3's sizing assertion holds:
+    // its row's achieved counts **misses**, which must be zero).
     let rows = workload::quotas(&recs, CAMPAIGN_SEEDS);
     let mut missed = 0u64;
     for row in &rows {
-        let ok = row.achieved >= row.required;
+        let ok = if row.id == "SIZING" {
+            row.achieved == 0
+        } else {
+            row.achieved >= row.required
+        };
         println!(
             "QUOTA {} {:<62} achieved {:>6} required {:>6} {}",
             row.id,
@@ -643,6 +648,7 @@ pub mod directed_arms {
             media: MediaDraw::None,
             twin_supply: None,
             nested_draw: 0,
+            probe_pass: false,
         }
     }
 
