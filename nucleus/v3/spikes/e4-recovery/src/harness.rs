@@ -986,6 +986,12 @@ pub struct RoundOutcome {
     pub o2_fail: Option<String>,
     /// O-3 failure.
     pub o3_fail: Option<String>,
+    /// O-3 (a)'s input: some life of this round served corruption (the
+    /// workload pass, the recovery pass(es), the extraction's own
+    /// accepts, or X5-R5's R-taint). Pinned by D17's CRC-SKIP arm — the
+    /// reported `o3_fail` text can be overwritten by O-3 (b)–(d), so the
+    /// directed arm needs the flag itself.
+    pub served: bool,
     /// The round passes.
     pub pass: bool,
     /// `lo` (Work 2.2).
@@ -1050,6 +1056,7 @@ impl Default for RoundOutcome {
             o1f_ok: false,
             o2_fail: None,
             o3_fail: None,
+            served: false,
             pass: false,
             lo: 0,
             hi: 0,
@@ -1408,6 +1415,7 @@ pub fn run_round(
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
+            outcome.served = ex.served;
             // `pass` folds every per-seed failure flag: a DEADLOCK, a
             // PANIC or an S-BATON violation is never a pass (card "Do
             // not"; the gate's minor finding: the draft ignored
@@ -1486,6 +1494,7 @@ pub fn run_round(
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
+            outcome.served = ex.served;
             outcome.pass = verdict.pass
                 && outcome.task_error.is_none()
                 && !outcome.deadlock

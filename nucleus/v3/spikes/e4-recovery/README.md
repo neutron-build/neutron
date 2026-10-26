@@ -1,16 +1,65 @@
 # E4 recovery spike (card X-5, stage X-5a of three)
 
-Status: **stage X-5b B1–B6 complete, plus the 2026-10-25 gate-REWORK
-round applied** (R1–R7 and the minor items — see "Gate REWORK on
-stage X-5b" below): the S-BATON conversion, the store, the round
-harness, the monitors and the directed tests D1–D18 + D10b/D12b. The
-crate builds, all suites pass (89 tests) and the gate's clippy/fmt
-steps see the whole store. This claims nothing about E4 itself: no
-campaign exists until X-5c, and Opus judges E4 only on X-5c's RESULT.
-X-5c inherits: the three uncaught directed arms (D7's multi-round
-zombie, D10b's REFCRC-SKIP serve, D16's pair — each argued in its test
-doc comment, none assert-pass), and the `run`/`verify`/`mutants`
-campaign surfaces.
+Status: **stage X-5b B1–B6 complete, the 2026-10-25 gate-REWORK round
+applied (R1–R7 and the minor items — see "Gate REWORK on stage X-5b"
+below), and the 2026-10-26 verification round** (the re-run's own
+probes of the gate's G4/G5 harness mutants and the hard-coded
+integrity disables — see "Verification round" below): the S-BATON
+conversion, the store, the round harness, the monitors and the
+directed tests D1–D18 + D10b/D12b. The crate builds, all suites pass
+(89 tests) and the gate's clippy/fmt steps see the whole store. This
+claims nothing about E4 itself: no campaign exists until X-5c, and
+Opus judges E4 only on X-5c's RESULT. X-5c inherits: the two argued
+uncaught directed arms (D7's multi-round zombie and D16's pair — each
+argued in its test doc comment, none assert-pass), the R-taint wiring
+probe (below), and the `run`/`verify`/`mutants` campaign surfaces.
+
+## Verification round (2026-10-26, this run)
+
+The re-run re-applied the gate's own probes by hand before finishing:
+
+- **G4 (recovery-world served corruption dropped from O-3 (a)).** The
+  faithful application — the extraction world's carried `served` set
+  cleared **and** the `recovery_served` term dropped — passed the whole
+  suite: D17's CRC-SKIP arm asserted any-failure and the round fails
+  via the silent-loss path regardless of the serve. Fixed properly:
+  `RoundOutcome.served` now carries O-3 (a)'s input, and D17's clean
+  and CRC-SKIP arms assert it (`!clean.served` / `m.served`). The
+  demonstration: with the faithful probe applied, `d17_integrity`
+  fails at the CRC-SKIP `m.served` assertion; with only the
+  `recovery_served` term dropped, nothing fails — the serve also flows
+  through the extraction world's carried set, so that application is
+  subsumed by design (two independent paths, no single droppable
+  site). Probes reverted; `git diff` clean of them.
+- **G5 (the R-taint forced false).** Function-level (the body of
+  `r_taint_of` forced to return `false`): caught by
+  `r_taint_window_semantics` in `tests/sim.rs` (cases (1) and (3)
+  assert true). Wiring-level (`let r_taint = false;` at the call
+  site): **UNCAUGHT-directed** — a positive end-to-end case needs
+  exactly D10b arm 4's same-position/same-epoch reuse coincidence
+  (argued unreachable directed; the campaign's Q14 rounds are the
+  catcher). Reported to X-5c with the arm.
+- **The four hard-coded integrity disables (the gate's R2 probes).**
+  All four are now caught by `d17_integrity`, each demonstrated by
+  hand and reverted: check (1) hard-off → the clean arm's
+  `!clean.served` (the torn leaf is accepted); check (2) hard-off →
+  the new second half's clean arm (below); checks (2)+(3) hard-off →
+  the same assertion. **The new second half** is the card's REFCRC
+  shape ("a slot reused for the same LPID in the same epoch"): churn
+  with the evictor on makes an older same-LPID same-epoch tree page
+  durable at a superseded slot (400 big entries × two versions over a
+  16-frame pool), and a directed MISDIRECTED fault plants those stale
+  bytes on the referenced slot — checks (1), (3) and (4) pass (a valid
+  page of the same LPID and epoch), so only the reference CRC
+  distinguishes. Clean: XX001 at open, never served. Under
+  REFCRC-SKIP, EPOCH-SKIP+REFCRC and ID-SKIP+REFCRC the stale page is
+  accepted through the tainted read — served (`RoundOutcome.served`)
+  and the round fails. This fills the directed column for all three
+  reference-CRC mutants; D10b arm 4 stays as the X5-R5-specific probe.
+- **D8's doc comment** claimed an end-to-end arm the body never ran;
+  rewritten to state what runs (the reader-level arms) and where the
+  end-to-end case lives (D9's recycle shape, `tests/store.rs`'s
+  checkpoint-with-recycle, X-5c's multi-round campaign seeds).
 
 ## Gate REWORK on stage X-5b (2026-10-25 verdict, applied)
 
@@ -23,12 +72,13 @@ campaign surfaces.
   (caught); D14's FREE-EARLY site now frees **at the flip** (the
   draft's just-before-step-5 window was two yields wide and no
   allocation could enter it) — step 2's own allocations reuse
-  durable-referenced slots and M-NOINPLACE fires; D17 runs through
-  `run_round` with directed faults (a torn map leaf at `map_leaf_cap`
-  254, where one radix leaf's entries span past sector 0): clean XX001
-  never served, CRC-SKIP serves the tainted leaf and fails the round,
-  and the EPOCH/ID single sites stay subsumed (the expected-0 hit
-  rates, demonstrated in the test). D10b exists (below). D7's
+  durable-referenced slots and M-NOINPLACE fires; and D17 runs through
+  `run_round` with directed faults in **two halves**: the torn map leaf
+  at `map_leaf_cap` 254 (clean XX001 never served; CRC-SKIP serves the
+  tainted leaf — pinned on `RoundOutcome.served` — and fails the
+  round; the EPOCH/ID single sites stay subsumed, the expected-0 hit
+  rates demonstrated; LOST and MISDIRECTED arms) and the verification
+  round's REFCRC shape (below). D10b exists (below). D7's
   multi-round arm and D16's pair are **reported** UNCAUGHT with
   arguments in their doc comments — never asserted as passes.
 - **R3 (X5-R5's harness half).** `exception_set_r` implements all three
@@ -38,9 +88,12 @@ campaign surfaces.
   (`DiskEvent::Accepted`, one `DiskEvent::Crash` per life) over every
   post-crash life — recovery's own accepts included, each nested crash
   restarting the window (`harness::r_taint_of`, pinned in
-  `tests/sim.rs`); D10b runs the rollback shape end to end. G4's
-  catcher is D17's recovery-world serve; G5's is D10b's clean arm
-  (composed with its REFCRC arm).
+  `tests/sim.rs`); D10b runs the rollback shape end to end. (The
+  rework's claim that "G4's catcher is D17's recovery-world serve" was
+  wrong as then asserted — D17's arm took any failure; the
+  verification round added the real pin, `RoundOutcome.served`, above.
+  G5's function is pinned by `r_taint_window_semantics`; its call-site
+  wiring is the uncaught probe reported to X-5c.)
 - **R4 (the self-referential id check).** Every radix walk (open,
   amcheck, the harness walks and the monitor's shadow walk) derives the
   expected id **positionally** (`ckpt::radix_child_span`; the child of

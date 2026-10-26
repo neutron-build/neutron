@@ -592,11 +592,15 @@ fn d7_zombie_tail() {
 /// old records with no new ones — the reader meets a record whose magic
 /// and CRC are intact but whose own LSN is not the expected position:
 /// the valid end is its first LSN and no record is yielded. Mutant
-/// LSN-CHECK-SKIP removes §12.5's stale check and the record decodes.
-/// The end-to-end arm recycles real segments (a 130 KiB WAL) and the
-/// clean round passes; the end-to-end stale harm belongs to the
-/// campaign's multi-round seeds (the card's Q11 note: §14's
-/// `commit_ts > T` filter skips most stale records in a single round).
+/// LSN-CHECK-SKIP removes §12.5's stale check and the record decodes —
+/// caught here at the reader level (the named catcher, both arms
+/// asserted below). The card's second half ("the end-to-end case with
+/// Q11's shape") is a **multi-round** case: in a single round §14's
+/// `commit_ts > T` filter skips most stale records (the mutation
+/// table's own note), so the end-to-end harm is deferred to X-5c's
+/// campaign seeds; the single-round recycle machinery itself is
+/// exercised end to end by D9's rename shape and `tests/store.rs`'s
+/// checkpoint-with-recycle test.
 #[test]
 fn d8_stale_recycled_segment() {
     use e4_recovery::store::wal;
@@ -838,15 +842,19 @@ fn d10_lost_meta() {
 ///    meta 1 — a meta rollback.
 /// 3. Clean: amcheck (i) reports the reused slots, the harness puts
 ///    them in `R`, O-3 (e) passes, and no reused slot is ever accepted.
-/// 4. REFCRC-SKIP: **UNCAUGHT (directed), reported not asserted** — the
-///    arm needs the reuse to pair a slot with a page of the *same*
+/// 4. REFCRC-SKIP: **UNCAUGHT in this shape, reported not asserted** —
+///    the arm needs the reuse to pair a slot with a page of the *same*
 ///    radix position and epoch, but the store's allocation order (step
 ///    2's data phase and the evictor take the lowest freed slots before
-///    the map phase) always hands them a data page first, whose LPID id
-///    and content epoch fail §3.3's checks (3)/(4) that the mutant does
-///    not skip. The mutation table's campaign column (Q14 rounds) is
-///    this mutant's catcher; the arm below documents the observed
-///    outcome without asserting it a pass.
+///    the map phase) always hands them a page of another position
+///    (verified by inspection: meta 1's base-640 slot holds image 3's
+///    base-0 inner — id 0 ≠ 640 — so §3.3's check (3) fires alongside
+///    (2) and the mutant cannot produce a serve here). The mutant's
+///    directed catcher is D17's second half (a stale same-LPID
+///    same-epoch version planted on the referenced slot); this arm
+///    stays as the X5-R5-specific probe (the R-taint's positive case),
+///    whose catcher is the campaign's Q14 rounds. The arm below
+///    documents the observed outcome without asserting it a pass.
 #[test]
 fn d10b_rollback_exception() {
     let load: Vec<Op> = (0..1600u64)
@@ -954,21 +962,24 @@ fn d10b_rollback_exception() {
             );
         }
     }
-    // No reused slot was ever accepted: O-3 (a) never fired (the
+    // No reused slot was ever accepted: the serve flag never rises (the
     // reused pages fail §3.3 before any accept).
     assert!(
-        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)"),
-        "D10b clean: no reused slot may be served (o3={:?})",
-        clean.o3_fail
+        !clean.o3_fail.as_deref().unwrap_or("").contains("O-3(a)") && !clean.served,
+        "D10b clean: no reused slot may be served (o3={:?}, served={})",
+        clean.o3_fail,
+        clean.served
     );
     assert!(
         clean.detections.contains(&"open"),
         "D10b clean: the reused free-set pages give XX001 at open (det={:?})",
         clean.detections
     );
-    // Arm 4 (REFCRC-SKIP): observed UNCAUGHT — see the doc comment. The
-    // run must stay a detection (never a silent pass), which is all
-    // this asserts.
+    // Arm 4 (REFCRC-SKIP): observed UNCAUGHT in this shape — see the
+    // doc comment (the reuse never pairs same radix position + epoch;
+    // D17's second half is the mutant's directed catcher). The run must
+    // stay a detection (never a silent pass), which is all this
+    // asserts.
     let m = run(
         2020,
         &script,
@@ -1569,6 +1580,20 @@ fn d16_epoch_reserve() {
 /// EPOCH-SKIP and ID-SKIP leave the detection standing (their sites
 /// are subsumed by the reference CRC: the paired mutants exist because
 /// of exactly this) — the card's "expected 0" single-site hit rates.
+///
+/// The second half is the card's REFCRC shape ("a slot reused for the
+/// same LPID in the same epoch", the mutation table's catcher for
+/// REFCRC-SKIP and the paired mutants): heavy churn with the evictor
+/// on makes an **older same-LPID same-epoch version** of a tree page
+/// durable at a superseded slot; the directed MISDIRECTED fault plants
+/// those stale bytes on the referenced slot. Checks (1), (3) and (4)
+/// all pass — the bytes are a valid page of the same LPID and the same
+/// epoch — so **only check (2)**, the reference CRC, distinguishes the
+/// stale version from the referenced one. Clean: XX001 at open, never
+/// served. Under REFCRC-SKIP (and EPOCH-SKIP+REFCRC / ID-SKIP+REFCRC,
+/// whose extra skipped sites are no-ops here — the id and epoch match
+/// anyway) the stale page is accepted through a tainted read: served
+/// corruption, and the round fails.
 #[test]
 fn d17_integrity() {
     let cfg254 = |mutant: Option<Mutant>| StoreCfg {
@@ -1688,13 +1713,25 @@ fn d17_integrity() {
         "D17 clean: never served (o3={:?})",
         clean.o3_fail
     );
-    // CRC-SKIP: the torn leaf is accepted; the round fails.
+    assert!(
+        !clean.served,
+        "D17 clean: the rejected leaf must never be accepted (served flag)"
+    );
+    // CRC-SKIP: the torn leaf is accepted and SERVED — the `served` flag
+    // is the named catcher (the round also fails without it, through the
+    // silent-loss path, so the flag is what pins the serve wiring: the
+    // gate probe that drops recovery-world serves from O-3 (a) entirely
+    // makes this arm fail).
     let m = run17(Some(Mutant::CrcSkip), torn.clone());
     assert!(
         !m.pass && m.o3_fail.is_some(),
         "D17 CRC-SKIP: the served torn leaf must fail the round (o1={:?}, o3={:?})",
         m.o1,
         m.o3_fail
+    );
+    assert!(
+        m.served,
+        "D17 CRC-SKIP: the torn leaf is accepted through the disabled check — the serve itself must be flagged"
     );
     // The single-site mutants change nothing here (subsumed by the
     // reference CRC): the detection still fires — the card's
@@ -1736,6 +1773,186 @@ fn d17_integrity() {
         d.detections,
         d.o3_fail
     );
+
+    // ---- the REFCRC shape: a slot reused for the same LPID in the same
+    // epoch (the card's catcher for REFCRC-SKIP and the paired mutants)
+    // ----
+    let big = |i: u64, v: u8| Op::Put {
+        tree: 2,
+        key: i.to_be_bytes().to_vec(),
+        value: vec![v; 400],
+    };
+    let ops2 = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        // v1 of ~400 big entries (~44 pages over the 16-frame pool): the
+        // evictor makes v1 pages durable at superseded slots. Chunked
+        // (§12.7): the payload exceeds the 16-KiB record cap.
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..400u64).map(|i| big(i, 1)).collect(),
+        },
+        ScriptOp::WaitVisible(2),
+        // v2 of the same keys: same LPIDs, same epoch (no flip between
+        // the batches), different content.
+        ScriptOp::Chunked {
+            sync_on: true,
+            ops: (0..400u64).map(|i| big(i, 2)).collect(),
+        },
+        ScriptOp::WaitVisible(3),
+        ScriptOp::Checkpoint,
+        ScriptOp::Yields(3),
+    ];
+    let script2 = Script {
+        tasks: vec![ScriptTask { ops: ops2 }],
+        writer: true,
+        evictor: true,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::Hook {
+            ckpt_index: 0,
+            hook: CkptHook::After6,
+        }),
+        nested: Vec::new(),
+    };
+    let base2 = {
+        let (disk, st) = harness::create_store(cfg254(None), 2021, 7).expect("create base2");
+        harness::run_round(
+            2021,
+            0,
+            &script2,
+            &faults(FaultClass::C, knobs(0, 0)),
+            cfg254(None),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            None,
+        )
+    };
+    assert!(base2.o1.is_ok(), "D17 REFCRC base: {:?}", base2.o1);
+    let pf2 = base2
+        .crashed_disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("D17 REFCRC page file");
+    // Find an (id, epoch) pair with two different durable tree-page
+    // versions: the last write is the referenced version, an earlier
+    // one the stale same-LPID same-epoch bytes.
+    use e4_recovery::store::page;
+    let dw = base2.crashed_disk.dwrites_of(pf2);
+    let is_tree_page = |w: &e4_recovery::sim::DWrite| {
+        w.off.is_multiple_of(4096)
+            && w.bytes.len() == 4096
+            && matches!(
+                page::header_kind(&w.bytes),
+                page::KIND_LEAF | page::KIND_INNER
+            )
+            && page::header_crc(&w.bytes)
+                == e4_recovery::crc::crc32c(0, w.bytes.get(4..).unwrap_or(&[]))
+    };
+    // (index, id, epoch, crc) of every durable tree-page write.
+    let cands: Vec<(usize, u64, u32, u32)> = dw
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| is_tree_page(w))
+        .map(|(i, w)| {
+            (
+                i,
+                page::header_id(&w.bytes),
+                page::header_epoch(&w.bytes),
+                page::header_crc(&w.bytes),
+            )
+        })
+        .collect();
+    let mut pair: Option<(e4_recovery::sim::MediaFault, u64)> = None;
+    for &(i, id, ep, crc) in &cands {
+        // The referenced version is the LAST durable write of the id.
+        if cands.iter().any(|&(j, id2, _, _)| j > i && id2 == id) {
+            continue;
+        }
+        // An earlier same-(id, epoch) version at another slot with
+        // different content: the stale bytes to plant.
+        let stale = cands.iter().find(|&&(j, id2, ep2, crc2)| {
+            j < i
+                && id2 == id
+                && ep2 == ep
+                && crc2 != crc
+                && dw.get(j).map(|x| x.off).unwrap_or(0) != dw.get(i).map(|x| x.off).unwrap_or(0)
+        });
+        if let Some(&(j, ..)) = stale {
+            let (x, w) = match (dw.get(j), dw.get(i)) {
+                (Some(x), Some(w)) => (x, w),
+                _ => continue,
+            };
+            let fault = e4_recovery::sim::MediaFault {
+                inode: pf2,
+                off: x.off,
+                len: 4096,
+                bytes: x.bytes.clone(),
+                pre: x.pre.clone(),
+                kind: e4_recovery::sim::MediaKind::Misdirected { to_off: w.off },
+            };
+            pair = Some((fault, w.off / 4096));
+            break;
+        }
+    }
+    let (fault2, slot2) =
+        pair.expect("D17 REFCRC: a same-LPID same-epoch stale version must be durable");
+    let run17b = |mutant: Option<Mutant>, f: e4_recovery::sim::MediaFault| {
+        let (disk, st) = harness::create_store(cfg254(mutant), 2021, 7).expect("create");
+        let mut twin = Vec::new();
+        harness::run_round(
+            2021,
+            0,
+            &script2,
+            &RoundFaults {
+                class: FaultClass::Mp,
+                knobs: knobs(0, 0),
+                directed: vec![f],
+            },
+            cfg254(mutant),
+            disk,
+            st,
+            &Model::new(),
+            0,
+            Some(&mut twin),
+        )
+    };
+    // Clean: check (2) is the only discriminator — XX001 at open, never
+    // served.
+    let clean2 = run17b(None, fault2.clone());
+    assert!(
+        clean2.detections.contains(&"open") || clean2.o1.is_err(),
+        "D17 REFCRC clean: the stale same-LPID page must be detected (det={:?}, o1={:?})",
+        clean2.detections,
+        clean2.o1
+    );
+    assert!(
+        !clean2.served,
+        "D17 REFCRC clean: the stale page must never be served (slot {slot2})"
+    );
+    // REFCRC-SKIP and both paired mutants: the stale page is accepted
+    // through the tainted read — served corruption, the round fails.
+    for m in [
+        Mutant::RefCrcSkip,
+        Mutant::EpochSkipRefCrc,
+        Mutant::IdSkipRefCrc,
+    ] {
+        let r = run17b(Some(m), fault2.clone());
+        assert!(
+            !r.pass && r.served,
+            "D17 {m:?}: the stale same-LPID page must be served and fail the round (pass={}, served={}, o1={:?}, o3={:?})",
+            r.pass,
+            r.served,
+            r.o1,
+            r.o3_fail
+        );
+    }
 }
 
 /// D18 (ts order): two committers, and under the mutant a yield between
