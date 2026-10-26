@@ -1,6 +1,6 @@
 # S-STORE: Storage layer (normative)
 
-Status: draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace) + the S-2-F2 fixes (2026-10-24: the boot id in §7.3 and §8, `Released(⊥)` chunks in §12.6, the read-only open in §14.1) + the S-2-F2 rework (2026-10-24: the stopped store and its remedy in §14.1, a short segment in §12.5). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 4 (card S-1-F2, 2026-10-26: the meta own-slot rule in §2.2) on draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace) + the S-2-F2 fixes (2026-10-24: the boot id in §7.3 and §8, `Released(⊥)` chunks in §12.6, the read-only open in §14.1) + the S-2-F2 rework (2026-10-24: the stopped store and its remedy in §14.1, a short segment in §12.5). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
 
 **Scope.** This file covers:
 - the file, the pages, the page map, the free set and the buffer manager;
@@ -88,7 +88,7 @@ slot_count     u64   the file length in slots covered by image k's free set
 wal_start_lsn  u64   replay start (§12.6)
 crc            u32   CRC32C of the bytes above
 ```
-**At open**, the meta with the highest `ckpt_id` among those whose magic and CRC are valid wins. There is **no fallback** to the older meta when the newer one is valid but its image fails an integrity check. After meta `k` is synced, the slots of image `k−1` may be reused (§4.4), so falling back is unsafe. The open fails with XX001, and amcheck reports the failure.
+**At open**, the meta with the highest `ckpt_id` among those whose magic and CRC are valid wins. There is **no fallback** to the older meta when the newer one is valid but its image fails an integrity check. After meta `k` is synced, the slots of image `k−1` may be reused (§4.4), so falling back is unsafe. The open fails with XX001, and amcheck reports the failure. A meta is valid at open only if it also sits in its own slot, `1 + (ckpt_id mod 2)`; a meta with valid magic and CRC in the other slot is a misdirected write and is never opened, and if its `ckpt_id` exceeds that of every valid meta, the open fails with XX001, because the meta before it was synced before it was written and falling back past a synced meta is unsafe.
 
 ### 2.3 File creation
 Creation runs as one sequence:
@@ -912,6 +912,7 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-POOL-BOUND | §5.1/§5.5: the pool never grows; a dirty set of 4× the pool completes | A-3b/A-3c (E4 shape) | POOL-GROW, EVICT-SKIP-DIRTY |
 | I-NO-INPLACE | §4.4: a live home slot is never overwritten | A-3c, A-7b (SimEnv crash) | INPLACE-EVICT |
 | I-INTEGRITY | §3.3: CRC, id and epoch checked on every read, with XX001 | A-2, A-7d (SimEnv lost/misdirected/torn) | CRC-SKIP, EPOCH-SKIP, ID-SKIP |
+| I-META-SLOT | §2.2: the opened meta sits in slot `1 + (ckpt_id mod 2)`; a misplaced valid meta newer than every valid one is XX001, never opened and never fallen back past | A-7d (SimEnv misdirected meta) | META-WRONG-SLOT |
 | I-FREE-SAFE | §4.4/§13 step 6: no reuse before the freeing meta is synced | A-3c, A-7c | FREE-EARLY |
 | I-FREE-EXACT | §4.3: the persisted bitmaps are exact | A-7b, A-8 | BITMAP-OMITS-FREESET-PAGES |
 | I-META-ATOMIC | §13: a meta never points at unwritten pages | A-7c (crash between every step) | META-BEFORE-SYNC |
@@ -1010,6 +1011,8 @@ This file wins over the plan (precedence above). The plan should be updated thro
 
 ## Changelog
 
+- **Draft 4** (2026-10-26, card S-1-F2, per P's ruling on F3 of `verdicts/X-5b.md` at f8a6b6eb, branch card/v3-X-5b):
+  - **Meta own slot (F3).** §2.2's open rule adds a positional check: a meta is valid at open only in its own slot, `1 + (ckpt_id mod 2)`. A valid meta in the other slot is a misdirected write. It is never opened, and if it is newer than every valid meta the open fails with XX001. Before this, magic and CRC alone made a misplaced copy openable, which breaks §2.2's torn-write guarantee and is the fallback past a synced meta that §2.2 already forbids. New row I-META-SLOT (§15), mutant META-WRONG-SLOT, pinned by A-7d.
 - **S-2-F2 rework** (2026-10-24, card S-2-F2, per `verdicts/S-2-F2.md` REWORK; C4 decision 5's binding, PLAN-v3 §8.1):
   - **Stopped store (R1).** §14.1 states that a read-only open of a 53100-stopped store succeeds with zero free bytes and writes nothing. New test `t_ro_open_disk_full` (A-7d) in the I-RO-OPEN row.
   - **Remedy (R2).** The 53200 remedy includes a read-only open with a larger pool budget; on a full volume it is the only one.
