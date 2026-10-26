@@ -336,7 +336,10 @@ pub struct MutantRec {
 
 fn cmd_mutants(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("--check") {
-        return cmd_mutants_check(args);
+        // The card's acceptance form: `mutants --check <path>` (a bare
+        // positional; `--results <path>` also accepted).
+        let pos = args.get(1).filter(|s| !s.starts_with('-')).cloned();
+        return cmd_mutants_check(args, pos);
     }
     let Some(out) = parse_out(args) else {
         eprintln!("e4-campaign mutants: --out is required");
@@ -449,8 +452,9 @@ pub fn sweep_mutant(
     )
 }
 
-fn cmd_mutants_check(args: &[String]) -> i32 {
-    let Some(path) = parse_results(args) else {
+fn cmd_mutants_check(args: &[String], pos_path: Option<String>) -> i32 {
+    let path = pos_path.or_else(|| parse_results(args));
+    let Some(path) = path else {
         eprintln!("e4-campaign mutants --check: --results is required");
         return 2;
     };

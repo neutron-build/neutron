@@ -1,20 +1,144 @@
-# E4 recovery spike (card X-5, stage X-5b of three)
+# E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5b B1–B6 complete, the 2026-10-25 gate-REWORK round
-applied (R1–R7 and the minor items), the 2026-10-26 verification round,
-the 2026-10-26 gate round-2 items N1–N8 applied, and the 2026-10-26
-gate round-3 rework applied (F1–F5, with P's same-day ruling on F3/F4
-adding fill G7 and the mutant META-WRONG-SLOT)** (see "Gate round 3"
-below): the S-BATON conversion, the store, the round harness, the
-monitors and the directed tests D1–D18 + D10b/D12b, now with the §12.2
-record cap, the loud Work 2.1 derivation, the G7 positional meta-slot
-check and a pin for every rework fix. The crate builds, all suites pass
-(99 tests) and the gate's clippy/fmt steps see the whole store. This
-claims nothing about E4 itself: no campaign exists until X-5c, and Opus
-judges E4 only on X-5c's RESULT. X-5c inherits: the argued uncaught
-directed arm (D16's pair — argued in its test doc comment, none
-assert-pass), the R6 cells (below), and the `run`/`verify`/`mutants`
-campaign surfaces.
+Status: **stage X-5c attempt 2 — the seeded workload (Work 5), the
+campaign/verify/mutants machinery (Work 7–8) and the smoke are complete
+and green (107 tests); the campaign itself is STOPPED at the card's
+Work-2 amendment guard: P's pre-data ruling X5-R6 has not been
+delivered, and the card says the worker stops and ESCALATEs rather than
+run the first campaign whose output anyone reads** (see "X5-R6" below).
+The stages before it (X-5a, X-5b) are complete and merged; see "The
+three stages" below. This claims nothing about E4: no campaign data has
+been produced or read, and Opus judges E4 only on X-5c's RESULT.
+
+## X5-R6 — the open ruling that stops the campaign (card Work 2, the
+## amendment, verbatim subject)
+
+> **Open ruling: O-1 when recovery returns `Ok` alongside an XX001.**
+> Carried from X-5's verdict (Followups) and X-5b's After-merge note.
+> This card **must** rule it **before any campaign data is read**: in a
+> class MP or MW round where `res` is `Ok` and an XX001 also occurred
+> (recovered-Ok with detected loss), is O-1 required, and in what form?
+
+The card's stop clause: *"The ruling is P's (§7.1: experiment
+judgements). It is recorded verbatim in the README as **X5-R6**,
+committed before the first campaign `run` whose output anyone reads
+(Work 7), and RESULT item 7 applies it with X5-R1–R5. If the worker
+reaches Work 7 without it, the worker stops and ESCALATEs for it. The
+worker never picks a reading."* The ruling was not in the worktree, the
+card set, the verdicts or the queue at run time (checked 2026-10-26),
+so this attempt implements everything up to the guard, runs the
+Acceptance commands honestly (`verify` and `mutants --check` exit
+non-zero: no results file can exist), and ESCALATEs. The ruling's text,
+when delivered, is recorded verbatim here before the first campaign
+run.
+
+Why the guard bites already: the 16-seed smoke's own survey (mechanics
+only — the smoke asserts no oracle outcome) shows seeds 7–8 (class MP)
+landing **exactly the ruling's case** in round 0 — recovery `Ok`, a
+read-failed O-1 (a scan hit the faulted page), O-3 (d) failing the
+round — the campaign-scale shape of D17's R6 cells. The campaign cannot
+be judged until P rules.
+
+## What this stage built (attempt 2)
+
+- **Work 5 (`src/workload.rs`)**: the knob derivation (5.1: 2–4
+  committers + writer/checkpointer/GC/evictor/DDL, 2–4 user trees +
+  catalog, keys 0–3,000, values 8–400 B, commits 1–20 ops, SyncOff ∈
+  {0, .3, .7}, long readers as `SnapshotHold` spans), the feature mix
+  (5.2: one 320–700-op chunked txn per round spanning ≥ 2 segments by
+  value sizing, `BulkLoad` on 25% of rounds, `DropTree` of a published
+  tree, GC sweeps concurrent with checkpoints), the classes (5.4:
+  `seed % 10` → C/MP/MW = 7000/2000/1000), the rounds (5.5: 1–3 at
+  50/30/20, every round crashes; targeted at `CKPT_HOOKS[(seed/20)%10]`
+  of a seeded checkpoint when `(seed/10)%2 == 0`, else uniform over the
+  script's yield points; nested recovery crashes drawn 60/30/10 over
+  the recovery's **counted** yield length so a drawn point always
+  fires), the twins (Work 2.5: every MP/MW round runs its faultless
+  twin first — the same script, crash and F-CRASH resolutions, judged
+  as class C — supplying the real round's O-3 (c) read/referenced sets
+  and its nested points), and the per-seed driver with the canonical
+  digest. **Judgment call, documented:** the chain stops after a round
+  that failed the oracle (X5-R3's root-cause unit — continuing on a
+  failed round's base would stack fallout the R6 ruling must judge
+  first); recorded as `stopped_early`, never hidden.
+- **W-SCRIPT (the generator's invariant, pinned)**: a round's script
+  references only trees the model at the previous cut has, and every
+  non-setup task opens with `ScriptOp::WaitTrees` (the round-setup
+  barrier): the seed-3 smoke failure was the generator letting a
+  chunked txn's chunks **and marker** reach the WAL below the setup
+  commit's `CreateTree` — LSN-ordered replay then applied the marker's
+  Puts against a directory without the tree. Pinned by
+  `setup_barrier_guards_the_wal_order` (seed 3's generated script, the
+  barrier stripped vs in force).
+- **Work 7 (`src/campaign.rs`)**: `run --seeds A..B --threads N --out
+  results/campaign.json` (per-seed records, the final `E4 SEEDS=…`
+  line, byte-identical digests across thread counts — pinned), `verify
+  --results …` (re-runs every seed, checks digest reproduction, the
+  exact 0..9999 set and every 5.6 quota; exits non-zero **only** on
+  those three, never on oracle failures), `mutants --seeds 0..500 --out`
+  and `mutants --check` (the sweep, the directed column re-run, the
+  first-catch check). The JSON is hand-rolled (deps stay
+  `thiserror`+proptest); the round-trip is pinned.
+- **Work 8 (the directed column)**: `campaign::directed_arms::TABLE`
+  names every mutant's directed test (all 28, asserted complete); two
+  arms are ported and re-run in-process (D2's START-LSN-MARKED-CHUNK
+  and D17's CRC-SKIP first half, both asserted catching); the rest
+  record `directed_encoded: false` honestly — **the sweep attempt
+  completes the table before the final run** (the campaign column is
+  the Work-8 proof either way).
+- **The quota machinery (5.6)**: `workload::quotas` computes Q1–Q18
+  plus the Work-5.3 sizing assertion (`SIZING`, a miss is a harness
+  defect) from the per-round records; `verify` fails on any miss.
+  Coverage **tuning** has not run (it needs campaign output, which the
+  R6 guard stops) — the quotas are implemented, not yet achieved.
+
+## The mutant sites (Work 8's README list)
+
+One site each, in `src/store/`: CRC-SKIP `page.rs` check (1);
+REFCRC-SKIP check (2); EPOCH-SKIP check (3); ID-SKIP check (4);
+FREE-EARLY `ckpt.rs` (the frees at the flip); BITMAP-OMITS-FREESET-PAGES
+`ckpt.rs` `write_free_set`; META-BEFORE-SKIP `ckpt.rs` step 3's sync;
+FLIP-NO-GATE `prims.rs` gate_exclusive; WAL-SYNC-T-ONLY `wal.rs`
+`wal_step1`; WRITE-GUARD-NO-COPY / EVICT-SKIP-IMAGE-MAP `prims.rs`
+`store_page`'s freeze and `record_image_copy`; START-LSN-PAST-CHUNK /
+START-LSN-MARKED-CHUNK `wal.rs` `wal_start_lsn`; TS-AFTER-APPEND
+`harness.rs` `commit_txn`; LSN-CHECK-SKIP `wal.rs`
+`dec_record_with_lsn_check`; PUBLISH-BEFORE-META `harness.rs`
+`bulk_load`; GCW-NOT-RECORDED / GCW-BOUND-SKIP `ckpt.rs` the flip;
+REPLAY-DUP-CONFLICT / DUP-DIFFERENT-ACCEPTED `ckpt.rs` `apply_op`;
+INPLACE-EVICT `prims.rs` dirty eviction; DROP-ROOT-FIRST `tree.rs`
+`dir_drop_tree`; RENAME-NO-DIRSYNC `wal.rs` the dirsyncs;
+TRUNCATE-LOGICAL-ONLY `ckpt.rs` recovery's truncation;
+START-SEGMENT-MISSING-OK `ckpt.rs` open's G3 check; META-WRONG-SLOT
+`ckpt.rs` open's `select_meta` call.
+
+## What is NOT done this attempt (the guard, honestly)
+
+- The 10k campaign `run` (no `results/campaign.json` exists),
+  coverage tuning, the mutant sweep (`results/mutants.json`), the
+  RESULT items that need campaign numbers (2, 3, 4, 7's table), and
+  the ≤ 20-min wall verification (per-seed cost is measurable only by
+  running; the smoke's 16 seeds run in ~13 s single-threaded in the
+  debug test suite, which bounds nothing about the release campaign).
+- The instrumentation checks (the card's list) were re-run green on
+  the final code as ordinary suite members: O-1's lower bound, O-1
+  (c), the taint comparison and the twin false-positive rule
+  (`tests/oracle.rs`'s knob demos and must-fail table), X5-R5's
+  meta-slot-fault condition (must-fail 13), the D10b arm and the
+  S-BATON `try_lock` check (`tests/directed.rs`, `tests/sim.rs`).
+
+## Stage X-5b (complete, merged) — gate rounds and inheritance
+
+**X-5c inherits from X-5b's verdict (MERGE-WITH-FOLLOWUPS):** the R6
+cells (D17's leaf LOST/TORN: assert only the reading-independent
+facts, print the measured outcome — this stage's smoke survey is their
+campaign-scale echo), D16's argued uncaught directed pair (the
+campaign's Q10 rounds are its catcher per the mutation table), and the
+`run`/`verify`/`mutants` surfaces (implemented above). The verdict's
+non-blocking notes (dead TORN-sector code, the stale D17 comment, the
+`run_round` M-NOINPLACE pin, the REFCRC arm's any-error acceptance)
+fold into the sweep attempt's table completion.
+
 
 ## Gate round 3 (2026-10-26 verdict f8a6b6eb, applied this run)
 
@@ -521,12 +645,12 @@ stage and **not compiled**:
   `tainted_image_slots_ii`) and the O-3 (a) R-taint is X-5b's harness
   work.
 
-Not implemented anywhere yet: the monitors (M-*), the directed tests
-D1–D18, the campaign (`run`/`verify`/`mutants`), the coverage quotas, and
-the campaign RESULT items 1–7. `src/bin/e4-campaign.rs` and
-`src/campaign.rs` are honest stubs that exit non-zero; `results/`
-contains nothing. No test is `#[ignore]`d and no check weakened — the
-missing parts are absent, not stubbed green.
+Not implemented anywhere yet: the campaign's **execution** (`run` over
+seeds 0..10000, coverage tuning, the mutant sweep's records — the
+machinery exists in `src/campaign.rs`; the X5-R6 guard stops their
+first judged run), and the campaign RESULT items 2, 3, 4 and 7's
+numbers. No test is `#[ignore]`d and no check weakened — the missing
+parts are stopped at the card's own guard, not stubbed green.
 
 ## Status: the blocker found in attempt 2 (X-5b's input)
 
@@ -634,10 +758,10 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (99 tests)
-cargo test -q -p e4-recovery --test oracle  # the 2.6 + 2.7 + REWORK self-tests (29)
-cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests + REWORK pins (25)
-cargo test -q -p e4-recovery --test directed  # D1–D18 + D10b/D12b + the pins (22)
+cargo test -q --release -p e4-recovery      # the whole crate (107 tests)
+cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (8)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
-  --results spikes/e4-recovery/results/campaign.json   # exits 2: not built (X-5c)
+  --results spikes/e4-recovery/results/campaign.json   # exits 2: no campaign
+                                                       # exists (the X5-R6 guard)
 ```
+
