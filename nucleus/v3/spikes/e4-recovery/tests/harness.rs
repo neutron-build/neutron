@@ -33,6 +33,9 @@ fn round_faults() -> RoundFaults {
         knobs: drop_all(),
         directed: Vec::new(),
         no_r_taint: false,
+        media: e4_recovery::harness::MediaDraw::None,
+        twin_supply: None,
+        nested_draw: 0,
     }
 }
 

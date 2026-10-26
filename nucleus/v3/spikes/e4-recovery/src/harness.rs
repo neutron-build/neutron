@@ -43,6 +43,7 @@ type FileWrites = BTreeMap<u64, Vec<u8>>;
 /// Stream tags (independent splitmix64 derivations per concern).
 const S_SCHED: u64 = 1;
 const S_CRASH: u64 = 4;
+const S_MEDIA: u64 = 5;
 const S_SAMPLE: u64 = 6;
 
 /// One scripted operation of a task (card Work 13, "Workload").
@@ -88,6 +89,16 @@ pub enum ScriptOp {
         name: &'static str,
         /// Yields to burn there.
         budget: u64,
+    },
+    /// A long reader (card Work 5.1): register a snapshot at the current
+    /// `visible_ts`, hold it for `span` yields (the seeded span), then
+    /// release exactly that snapshot. Held snapshots hold back the GC
+    /// watermark (`gc_sweep`'s harness watermark is
+    /// `min(registered snapshots, visible_ts)`), which is their whole
+    /// effect: the model has no reader-visibility semantics to check.
+    SnapshotHold {
+        /// Yields to hold the snapshot for.
+        span: u64,
     },
     /// Burn `n` yields.
     Yields(u64),
@@ -187,6 +198,37 @@ pub struct HarnessState {
     /// round must fail loudly — never a silent early exit that leaves
     /// the service tasks spinning.
     pub task_error: Option<String>,
+    /// Card Work 5.6's Q6 observable: the bulk-load phases live at the
+    /// crash (`tree id → phase`).
+    pub load_phase: BTreeMap<u64, LoadPhase>,
+    /// Card Work 5.6's Q7 observable: a DropTree walk was in flight when
+    /// the world crashed (the task unwinds inside the walk and never
+    /// clears this).
+    pub drop_walk: Option<u64>,
+    /// Card Work 5.6's Q18 observable: a GC sweep ran with a watermark
+    /// above the previous `gc_w` while a checkpoint window was open.
+    pub gc_adv_in_window: bool,
+    /// The last checkpoint hook the checkpointer passed (0 = none): a
+    /// small position code for the Q4 window (1 = Before0 … 6 = After3;
+    /// 7+ are later hooks). Maintained by the checkpointer's hook
+    /// closure.
+    pub ckpt_step: u8,
+}
+
+/// The bulk-load phases of card Work 5.6's Q6 (crash between the load and
+/// the publication / after the publication with the load in the image).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// The unlogged entries are being inserted (a crash here interrupted
+    /// the load itself — not Q6's shape).
+    Loading,
+    /// The entries are in; the forced checkpoint (or its wait) is pending
+    /// — a crash here is Q6's "between bulk load and publication".
+    Loaded,
+    /// The publication commit is running — also "between".
+    Publishing,
+    /// The publication commit completed — Q6's "after publication".
+    Published,
 }
 
 /// The world of a harness round: the store's `Core` slices plus the
@@ -431,6 +473,16 @@ pub fn commit_txn(
         Op::Put { tree, key, .. } | Op::Delete { tree, key } => (*tree, key.clone()),
         _ => (0, Vec::new()),
     });
+    // The Q5/Q9 observable (store-side so the flip's counter is atomic
+    // with `T`): this commit's apply progress, removed when it completes.
+    // A crash mid-apply leaves the entry — the crash-time snapshot reads
+    // exactly the partial applies.
+    cx.with("h:aprog0", |c| {
+        c.store()
+            .apply_progress
+            .insert(ts, (0, ordered.len() as u64, chunked));
+        Ok(())
+    })?;
     for op in ordered {
         // A Put/Delete can race the apply of an **earlier commit's**
         // CreateTree for its tree (applies finish out of ts order,
@@ -465,7 +517,27 @@ pub fn commit_txn(
                 cx.wait_for(WaitKey::Applied)?;
             }
         }
+        // Q7's observable: the DropTree walk (§6.8, bounded) runs inside
+        // `apply_op`; a crash inside it leaves the flag set (the task
+        // unwinds past the clear).
+        let is_drop = matches!(op, Op::DropTree { .. });
+        if is_drop {
+            let tree = match op {
+                Op::DropTree { tree } => *tree,
+                _ => 0,
+            };
+            cx.with("h:dropwalk", |c| {
+                c.h().drop_walk = Some(tree);
+                Ok(())
+            })?;
+        }
         ckpt::apply_op(cx, &to_wop(op), ts, false)?;
+        if is_drop {
+            cx.with("h:dropdone", |c| {
+                c.h().drop_walk = None;
+                Ok(())
+            })?;
+        }
         if matches!(op, Op::CreateTree { .. }) {
             // A freshly installed directory entry can release another
             // committer's apply wait above: `Applied` is the wake key
@@ -477,7 +549,17 @@ pub fn commit_txn(
         // partially applied commit — recovery then replays the whole
         // commit and its first entries are identical re-inserts (§9.1).
         cx.park("apply:mid")?;
+        cx.with("h:aprog1", |c| {
+            if let Some(e) = c.store().apply_progress.get_mut(&ts) {
+                e.0 += 1;
+            }
+            Ok(())
+        })?;
     }
+    cx.with("h:aprog2", |c| {
+        c.store().apply_progress.remove(&ts);
+        Ok(())
+    })?;
     mark_applied(cx, ts)?;
     Ok(ts)
 }
@@ -758,6 +840,23 @@ fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
             }
             Ok(())
         }
+        ScriptOp::SnapshotHold { span } => {
+            // A long reader (Work 5.1): register at the current
+            // `visible_ts`, hold for `span` yields, release exactly that
+            // snapshot. The held set only holds back the GC watermark.
+            let at = cx.with("h:snapreg", |c| Ok(c.store().seq.visible_ts))?;
+            cx.with("h:snapins", |c| {
+                c.h().snapshots.insert(at);
+                Ok(())
+            })?;
+            for _ in 0..*span {
+                cx.yield_now("h:snapspan")?;
+            }
+            cx.with("h:naprel", |c| {
+                c.h().snapshots.remove(&at);
+                Ok(())
+            })
+        }
         ScriptOp::BulkLoad { tree, entries } => bulk_load(cx, *tree, entries),
     }
 }
@@ -775,6 +874,16 @@ pub fn gc_sweep(cx: &Cx<'_, RoundWorld>, t: u64, w: Option<u64>) -> Result<(), F
             Ok(snap.min(vis).max(gc_w))
         })?,
     };
+    // Q18's observable: this sweep's watermark is above the previous
+    // `gc_w` (the running `gc_w_used`) while a checkpoint window is open
+    // — a GC advancing the watermark inside an image. Read in one step.
+    cx.with("h:gcq18", |c| {
+        let st = c.store();
+        if w > st.gc_w_used && st.ckpt_open {
+            c.h().gc_adv_in_window = true;
+        }
+        Ok(())
+    })?;
     let mut resume = Vec::new();
     loop {
         let root = cx.with("h:gcroot", |c| Ok(c.store().dir.get(&t).map(|e| e.root)))?;
@@ -795,6 +904,10 @@ pub fn gc_sweep(cx: &Cx<'_, RoundWorld>, t: u64, w: Option<u64>) -> Result<(), F
 /// then publication.
 fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Fail> {
     commit_txn(cx, &[Op::CreateTree { tree: t }], true, false)?;
+    cx.with("h:loadph0", |c| {
+        c.h().load_phase.insert(t, LoadPhase::Loading);
+        Ok(())
+    })?;
     // §10.1: register below S_L, then pick S_L.
     let s_l = cx.with("h:sl", |c| {
         let r = c.store().seq.visible_ts;
@@ -826,6 +939,7 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
             entries: entries.to_vec(),
         });
         c.h().force_ckpt = true;
+        c.h().load_phase.insert(t, LoadPhase::Loaded);
         Ok(())
     })?;
     // §12.8 step 3: publication waits for the forced checkpoint's meta
@@ -844,6 +958,10 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
         wait_ckpt(cx)?;
     }
     // Publication (§12.8 step 3): after the forced meta is durable.
+    cx.with("h:loadph1", |c| {
+        c.h().load_phase.insert(t, LoadPhase::Publishing);
+        Ok(())
+    })?;
     commit_txn(
         cx,
         &[Op::Put {
@@ -856,6 +974,7 @@ fn bulk_load(cx: &Cx<'_, RoundWorld>, t: u64, entries: &[(Vec<u8>, Vec<u8>)]) ->
     )?;
     cx.with("h:pub", |c| {
         c.h().published.insert(t);
+        c.h().load_phase.insert(t, LoadPhase::Published);
         Ok(())
     })
 }
@@ -963,6 +1082,29 @@ fn checkpointer_body(
                 _ => None,
             };
             let mut hooks = |hook: CkptHook| -> Result<(), Fail> {
+                // Q4's position code (card Work 5.6): record the hook's
+                // step before any crash arm, so the crash-time snapshot
+                // names the window the crash landed in (1 = Before0 …
+                // 6 = After3 — the "between step 0 and step 3" window).
+                // Best-effort: on an already-crashed world the recording
+                // step fails and the checkpoint unwinds at its next
+                // yield regardless.
+                let step = match hook {
+                    CkptHook::Before0 => 1,
+                    CkptHook::After0 => 2,
+                    CkptHook::After1 => 3,
+                    CkptHook::Mid2 => 4,
+                    CkptHook::After2 => 5,
+                    CkptHook::After3 => 6,
+                    CkptHook::After4 => 7,
+                    CkptHook::After5 => 8,
+                    CkptHook::Mid6 => 9,
+                    CkptHook::After6 => 0,
+                };
+                let _ = cx.with("h:ckstep", |c| {
+                    c.h().ckpt_step = step;
+                    Ok(())
+                });
                 if Some(hook) == fire_at {
                     arm_crash(cx.w);
                     return Err(Fail::Sim(SimFail::Crashed));
@@ -1100,6 +1242,22 @@ pub struct RoundOutcome {
     /// truncate the model at c_r"), so the next round of a multi-round
     /// seed starts from it (D7's zombie shape and X-5c's campaign).
     pub end_model: Model,
+    /// The workload pass's quota observables (card Work 5.6), snapshotted
+    /// at the crash.
+    pub obs: WorkloadObs,
+    /// Nested recovery crashes that fired (Q2/Q3).
+    pub nested_fired: u32,
+    /// The nested points in force (the script's explicit list, or the
+    /// seeded draw when `nested_draw` produced them) — recorded so the
+    /// twin round can crash at the same points.
+    pub nested_points: Vec<u64>,
+    /// This round's media faults only (a chained round's disk carries the
+    /// prior rounds' media list; O-3 (c)'s targets and the quota flags
+    /// read exactly this slice).
+    pub media_faults: Vec<MediaFault>,
+    /// Recycle renames the F-CRASH directory draw dropped (Q12): rename
+    /// events whose from-name still resolves after the crash.
+    pub renames_dropped: u64,
     /// The digest of the canonical record (byte-identical for the same
     /// inputs; `tests/harness.rs`).
     pub digest: u64,
@@ -1136,6 +1294,11 @@ impl Default for RoundOutcome {
             panicked: false,
             task_error: None,
             end_model: Model::new(),
+            obs: WorkloadObs::default(),
+            nested_fired: 0,
+            nested_points: Vec::new(),
+            media_faults: Vec::new(),
+            renames_dropped: 0,
             digest: 0,
         }
     }
@@ -1166,6 +1329,14 @@ impl RoundOutcome {
             self.baton,
             self.task_error
         ));
+        s.push_str(&format!(
+            "|{:?}|{}|{:?}|{}|{:?}",
+            self.obs,
+            self.nested_fired,
+            self.media_faults.len(),
+            self.renames_dropped,
+            self.rollback_slots.len()
+        ));
         s
     }
 }
@@ -1186,6 +1357,96 @@ pub struct RoundFaults {
     /// image k−1's stale reference fails O-3 (a); forced off, the same
     /// round passes silently. The campaign runs with it off (false).
     pub no_r_taint: bool,
+    /// The seeded media draw (card Work 5.5 step 3): after F-CRASH, the
+    /// round draws its class's media faults from the crashed disk —
+    /// F-MEDIA-PAGE (1–3, ≥60% on the image's referenced slots) or
+    /// F-MEDIA-WAL (1–2). None for class C and the twin rounds. The
+    /// draw's stream is seeded by `(seed, round)`, so the twin (the same
+    /// crash resolutions, faults removed) stays schedule-identical.
+    pub media: MediaDraw,
+    /// A pre-supplied twin (card Work 2.5): the twin run's recovery
+    /// reads and opened image slots, for this round's O-3 (c). `None`
+    /// keeps X-5b's stand-in supply (this round's own reads and slots),
+    /// which the directed tests use.
+    pub twin_supply: Option<TwinSupply>,
+    /// Nested recovery crashes to **draw** (card Work 5.5 step 4): the
+    /// script's explicit `nested` points take precedence; otherwise each
+    /// drawn point is uniform over this disk's recovery yield count
+    /// (counted by a throwaway pass, so a point is always reachable).
+    pub nested_draw: u32,
+}
+
+/// The round's seeded media draw kind (card Work 5.5 step 3; the class
+/// MP/MW fault supply of the campaign).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaDraw {
+    /// No draw (class C, twin rounds, directed faults only).
+    #[default]
+    None,
+    /// F-MEDIA-PAGE: 1–3 page-file faults, ≥60% biased to the crashed
+    /// image's referenced slots (meta included).
+    Page,
+    /// F-MEDIA-WAL: 1–2 WAL faults, uniform over every segment's
+    /// candidates.
+    Wal,
+}
+
+/// A pre-supplied twin for O-3 (c) (card Work 2.5): what the twin run's
+/// recovery read and its opened image referenced — the same seed,
+/// schedule and F-CRASH resolutions with the media faults removed.
+#[derive(Debug, Clone, Default)]
+pub struct TwinSupply {
+    /// The twin recovery's reads `(file, offset, len)`.
+    pub recovery_reads: Vec<(usize, u64, u64)>,
+    /// The slots the twin's opened image referenced.
+    pub image_slots: BTreeSet<u64>,
+}
+
+/// The workload pass's quota observables (card Work 5.6), snapshotted
+/// from the store and harness slices the moment the tasks end — the
+/// crash included: every field is the crash-time view.
+#[derive(Debug, Clone, Default)]
+pub struct WorkloadObs {
+    /// The scripted crash fired during the workload (false: the crash
+    /// point was never reached — a degenerate end-of-workload F-CRASH).
+    pub crash_fired: bool,
+    /// Splits inside the open checkpoint window (Q4).
+    pub splits: u64,
+    /// Merges inside the open checkpoint window (Q4).
+    pub merges: u64,
+    /// R_EPOCH exhaustion count (Q10).
+    pub epoch_exhausted: u64,
+    /// The free-set serialisation grew the file (Q17).
+    pub freeset_grew: bool,
+    /// Stale-record stops at renamed segment starts (Q11).
+    pub stale_seg_reads: u64,
+    /// Flips whose image held part of a commit above `T` (Q9).
+    pub q9_partial_flips: u64,
+    /// LPIDs dirtied in the still-open interval (Work 5.3's crash-time
+    /// half; beside `dirty_max` for the completed ones).
+    pub dirty_now_len: u64,
+    /// The largest completed checkpoint interval's distinct dirtied LPIDs
+    /// (Work 5.3).
+    pub dirty_max: u64,
+    /// Partial applies at the crash: `(ts, done, total, chunked)` (Q5's
+    /// "marked and partially applied").
+    pub partial_applies: Vec<(u64, u64, u64, bool)>,
+    /// Chunked transactions open at the crash (Q5): `(txn, first chunk
+    /// lsn, the marker's ts when its marker was enqueued, the last
+    /// chunk's lsn)`. A `None` marker ts is the open (no-marker) case; a
+    /// `Some` is the marked case (the marker sits above every flip that
+    /// has not covered it, or above the open flip's `T`).
+    pub open_chunks: Vec<((u32, u64), u64, Option<u64>, u64)>,
+    /// Bulk-load phases at the crash (Q6).
+    pub load_phases: Vec<(u64, LoadPhase)>,
+    /// A DropTree walk was in flight (Q7).
+    pub drop_walk: Option<u64>,
+    /// A GC sweep advanced past the previous `gc_w` inside an open
+    /// checkpoint window (Q18).
+    pub gc_adv_in_window: bool,
+    /// The last checkpoint hook passed, as a position code (1 = Before0 …
+    /// 6 = After3 — Q4's window; 0 = none).
+    pub ckpt_step: u8,
 }
 
 /// Run one round: workload → crash → faults → recovery (nested crashes)
@@ -1219,12 +1480,58 @@ pub fn run_round(
         Sched::new(host)
     };
     run_script(&sched, script, seed);
-    let (mut disk, mut model, flip_pos, flags, wal_commits, events) = {
+    let (mut disk, mut model, flip_pos, flags, wal_commits, events, obs) = {
         let g = sched.lock();
+        // The workload-pass observables, snapshotted the moment the tasks
+        // ended (a crash mid-task leaves the partial-apply and walk flags
+        // exactly as the quota definitions read them).
+        let st = &g.st;
+        let partial_applies = st
+            .apply_progress
+            .iter()
+            .map(|(ts, (done, total, chunked))| (*ts, *done, *total, *chunked))
+            .collect();
+        let open_chunks = st
+            .wal
+            .open_chunks
+            .iter()
+            .map(|(txn, first)| {
+                let mut marker = None;
+                let mut last = *first;
+                for (lsn, (ts, is_marker, t)) in st.wal.buf_tags.iter() {
+                    if *t != *txn {
+                        continue;
+                    }
+                    if *is_marker {
+                        marker = Some(*ts);
+                    } else if !*is_marker && *ts == 0 {
+                        last = (*lsn).max(last);
+                    }
+                }
+                (*txn, *first, marker, last)
+            })
+            .collect();
+        let obs = WorkloadObs {
+            crash_fired: g.sched.crashed,
+            splits: st.ckpt_splits,
+            merges: st.ckpt_merges,
+            epoch_exhausted: st.epoch_exhausted,
+            freeset_grew: st.freeset_grew,
+            stale_seg_reads: st.stale_seg_reads,
+            q9_partial_flips: st.q9_partial_flips,
+            dirty_now_len: st.dirty_now.len() as u64,
+            dirty_max: st.dirty_max,
+            partial_applies,
+            open_chunks,
+            load_phases: g.h.load_phase.iter().map(|(t, p)| (*t, *p)).collect(),
+            drop_walk: g.h.drop_walk,
+            gc_adv_in_window: g.h.gc_adv_in_window,
+            ckpt_step: g.h.ckpt_step,
+        };
         (
             g.disk.clone(),
             clone_model(&g.h.model),
-            g.st.wal.flip_enqueue_pos.clone(),
+            st.wal.flip_enqueue_pos.clone(),
             (
                 g.h.deadlock,
                 g.h.baton,
@@ -1233,6 +1540,7 @@ pub fn run_round(
             ),
             g.h.wal_commits.clone(),
             g.disk.events.clone(),
+            obs,
         )
     };
     // Work 2.1: written/acked from the disk events — the write carrying
@@ -1257,20 +1565,64 @@ pub fn run_round(
     }
 
     // ---- the crash and the faults ----
+    // A chained round's disk carries the prior rounds' media list (taint
+    // references survive lives, 1.4); this round's faults are the slice
+    // appended from here on, and exactly that slice feeds O-3 (c) and the
+    // quota flags.
+    let media_base = disk.media.len();
     if script.crash.is_some() {
         let mut frng = Rng::new(derive(seed * 100 + round as u64, S_CRASH));
         let _ = disk.apply_crash(&mut frng, &faults.knobs);
         for f in faults.directed.iter() {
             disk.apply_one_media_fault(f);
         }
+        // The seeded draw (card Work 5.5 step 3): the campaign's class
+        // MP/MW faults, drawn from the crashed disk. The page draw's
+        // referenced-slot bias set is the harness walk of the crashed
+        // image (the meta slots included) — a harness input, never a
+        // check.
+        match faults.media {
+            MediaDraw::None => {}
+            MediaDraw::Page => {
+                let referenced = durable_image(&disk, &cfg).1;
+                let mut mrng = Rng::new(derive(seed * 100 + round as u64, S_MEDIA));
+                disk.apply_media_page(&mut mrng, &referenced);
+            }
+            MediaDraw::Wal => {
+                let mut mrng = Rng::new(derive(seed * 100 + round as u64, S_MEDIA));
+                disk.apply_media_wal(&mut mrng);
+            }
+        }
         disk.new_round();
     }
-    let media_targets = if faults.directed.is_empty() {
+    let round_media: Vec<MediaFault> = disk.media.get(media_base..).unwrap_or(&[]).to_vec();
+    let media_targets = if round_media.is_empty() {
         FaultTargets::default()
     } else {
-        let pf = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
-        FaultTargets::collect(&disk.media.clone(), pf)
+        let pf0 = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
+        FaultTargets::collect(&round_media, pf0)
     };
+    // Q12 (card Work 5.6): recycle renames the F-CRASH directory draw
+    // dropped — the workload's rename events (the event stream ends at
+    // the crash) whose **from**-name still resolves on the crashed disk
+    // (a survived rename leaves the from-name unbound).
+    let renames_dropped = events
+        .iter()
+        .filter_map(|e| match e {
+            DiskEvent::DirOpIssued { what, .. } if what.starts_with("rename /wal/") => {
+                let from = what
+                    .trim_start_matches("rename ")
+                    .split(" ->")
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                Some(from)
+            }
+            _ => None,
+        })
+        .filter(|from| disk.stat(from).is_some())
+        .count() as u64;
 
     // ---- amcheck (i): on the crashed image, before recovery ----
     let (amcheck_i, image_slots, meta_i) = durable_image(&disk, &cfg);
@@ -1282,6 +1634,30 @@ pub fn run_round(
         .collect();
 
     // ---- recovery with nested crashes ----
+    // The points in force: the script's explicit list (the directed
+    // tests), else the seeded draw — each point uniform over this disk's
+    // recovery yield count, counted by a throwaway pass on a clone (a
+    // blind draw past the recovery length would never fire). The points
+    // are recorded on the outcome so the twin round (the same F-CRASH
+    // resolutions) can crash at the same points.
+    let nested_points: Vec<u64> = if !script.nested.is_empty() {
+        script.nested.clone()
+    } else if faults.nested_draw > 0 {
+        let count_world = round_world(seed, disk.clone(), StoreInner::empty(cfg.clone(), 0));
+        let ccx = Cx {
+            w: &count_world,
+            t: HARNESS,
+        };
+        let y0 = count_world.lock().sched.yields;
+        let _ = ckpt::recover(&ccx, cfg.clone());
+        let total = count_world.lock().sched.yields - y0;
+        let mut nrng = Rng::new(derive(seed * 31 + round as u64, S_CRASH));
+        (0..faults.nested_draw)
+            .map(|_| 1 + nrng.below(total.max(1)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut nested_fired = 0u32;
     let mut recovery_disk = disk.clone();
     // Every exit of the loop below assigns this before it is read (the
@@ -1308,13 +1684,9 @@ pub fn run_round(
             w: &world,
             t: HARNESS,
         };
-        let arm = (nested_fired as usize) < script.nested.len();
+        let arm = (nested_fired as usize) < nested_points.len();
         if arm {
-            let at = script
-                .nested
-                .get(nested_fired as usize)
-                .copied()
-                .unwrap_or(0);
+            let at = nested_points.get(nested_fired as usize).copied().unwrap_or(0);
             cx.with("h:nest", |c| {
                 c.sched_mut().crash_at_yield = Some(at);
                 Ok(())
@@ -1468,17 +1840,26 @@ pub fn run_round(
                     || !g.disk.served.is_empty()
                     || r_taint;
             }
-            // The class MP/MW twin supply.
-            let twin_info = TwinInfo {
-                page_file: pf,
-                recovery_reads: recovery_reads.clone(),
-                image_slots: image_slots.clone(),
+            // The class MP/MW twin supply (card Work 2.5): the
+            // campaign's pre-supplied twin (the faultless run's recovery
+            // reads and opened image slots) when present; else this
+            // round's own reads and slots — X-5b's directed-test
+            // stand-in, collected through the caller's collector. A
+            // class MP/MW round with neither fails closed in the oracle,
+            // as X-5a round 1 ruled.
+            let twin_info = match &faults.twin_supply {
+                Some(t) => TwinInfo {
+                    page_file: pf,
+                    recovery_reads: t.recovery_reads.clone(),
+                    image_slots: t.image_slots.clone(),
+                },
+                None => TwinInfo {
+                    page_file: pf,
+                    recovery_reads: recovery_reads.clone(),
+                    image_slots: image_slots.clone(),
+                },
             };
-            // Directed tests supply the twin's reads through the
-            // caller's collector (Work 13's twin half; a class MP/MW
-            // round without one fails closed in the oracle, as X-5a
-            // round 1 ruled).
-            let twin_ref = twin.as_ref().map(|_| &twin_info);
+            let twin_ref = (twin.is_some() || faults.twin_supply.is_some()).then_some(&twin_info);
             // The oracle check on the recovered image (the card's Work
             // 13 order: extraction, oracle, harness checkpoint). The
             // (ii) fields are unset in this pass — G4's harness
@@ -1609,15 +1990,27 @@ pub fn run_round(
             };
             let _ = &mut ex;
             let mut nop = NopReader;
-            let twin_info = TwinInfo {
-                page_file: pf,
-                // The failed recovery's own reads (the G7 clean shape:
-                // open read both meta slots before failing — an empty
-                // set here made O-3 (c) call the detection a false
-                // positive).
-                recovery_reads: recovery_reads.clone(),
-                image_slots: image_slots.clone(),
+            // The failed-recovery twin supply: the pre-supplied twin when
+            // present (the G7 clean shape's reads come from the failed
+            // attempt otherwise — open did read the metas before failing).
+            let twin_info = match &faults.twin_supply {
+                Some(t) => TwinInfo {
+                    page_file: pf,
+                    recovery_reads: t.recovery_reads.clone(),
+                    image_slots: t.image_slots.clone(),
+                },
+                None => TwinInfo {
+                    page_file: pf,
+                    // The failed recovery's own reads (the G7 clean
+                    // shape: open read both meta slots before failing —
+                    // an empty set here made O-3 (c) call the detection
+                    // a false positive).
+                    recovery_reads: recovery_reads.clone(),
+                    image_slots: image_slots.clone(),
+                },
             };
+            let twin_on =
+                faults.class != FaultClass::C && (twin.is_some() || faults.twin_supply.is_some());
             let verdict = check_round(
                 &model,
                 faults.class,
@@ -1625,10 +2018,10 @@ pub fn run_round(
                 &ex,
                 &mut nop,
                 &media_targets,
-                if faults.class == FaultClass::C {
-                    None
-                } else {
+                if twin_on {
                     Some(&twin_info)
+                } else {
+                    None
                 },
                 &mut sample_rng,
                 &OracleCfg::default(),
@@ -1661,6 +2054,12 @@ pub fn run_round(
             }
         }
     }
+    // ---- the new per-round record fields (both branches) ----
+    outcome.obs = obs;
+    outcome.nested_fired = nested_fired;
+    outcome.nested_points = nested_points;
+    outcome.media_faults = round_media;
+    outcome.renames_dropped = renames_dropped;
     // ---- the monitors (3.10), from disk events and parsed WAL bytes ----
     {
         let g = sched.lock();

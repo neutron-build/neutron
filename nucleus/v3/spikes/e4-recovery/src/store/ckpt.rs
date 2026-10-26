@@ -557,6 +557,12 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
         st.ckpt_splits = 0;
         st.ckpt_merges = 0;
         st.fs_building.clear();
+        // Work 5.3's interval fold: the interval this checkpoint closes
+        // reached `dirty_now.len()` distinct dirtied LPIDs; the next
+        // interval starts empty.
+        let n = st.dirty_now.len() as u64;
+        st.dirty_max = st.dirty_max.max(n);
+        st.dirty_now.clear();
         Ok(())
     })?;
     hooks(CkptHook::Before0)?;
@@ -597,6 +603,19 @@ fn checkpoint_inner<H: StoreHost>(cx: &Cx<'_, H>, hooks: &mut Hooks<'_>) -> Resu
             .collect();
         st.e = k as u32 + 1;
         st.flip_window = true;
+        // Q9 (card X-5c Work 5.6), counted inside the flip so `T` and the
+        // apply-progress snapshot are atomic: this flip's image will hold
+        // part of a commit above `T` (an out-of-order apply at the flip)
+        // iff some tracked commit has `ts > T` with `1 ≤ done` (a partial
+        // apply). The counter is an observable only — it never gates
+        // behaviour.
+        if st
+            .apply_progress
+            .iter()
+            .any(|(ts, (done, _, _))| *done >= 1 && *ts > t)
+        {
+            st.q9_partial_flips += 1;
+        }
         Ok(FlipOut::Ok {
             t,
             gc_w,
