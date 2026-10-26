@@ -2,15 +2,93 @@
 
 Status: **stage X-5b B1–B6 complete, the 2026-10-25 gate-REWORK round
 applied (R1–R7 and the minor items), the 2026-10-26 verification round,
-and the 2026-10-26 gate round-2 verdict items N1–N8 applied** (see "Gate
-round 2" below): the S-BATON conversion, the store, the round harness,
-the monitors and the directed tests D1–D18 + D10b/D12b. The crate builds,
-all suites pass (92 tests) and the gate's clippy/fmt steps see the whole
-store. This claims nothing about E4 itself: no campaign exists until
-X-5c, and Opus judges E4 only on X-5c's RESULT. X-5c inherits: the
-argued uncaught directed arm (D16's pair — argued in its test doc
-comment, none assert-pass), the meta-rollback open finding (below), and
-the `run`/`verify`/`mutants` campaign surfaces.
+the 2026-10-26 gate round-2 items N1–N8 applied, and the 2026-10-26
+gate round-3 rework applied (F1–F5, with P's same-day ruling on F3/F4
+adding fill G7 and the mutant META-WRONG-SLOT)** (see "Gate round 3"
+below): the S-BATON conversion, the store, the round harness, the
+monitors and the directed tests D1–D18 + D10b/D12b, now with the §12.2
+record cap, the loud Work 2.1 derivation, the G7 positional meta-slot
+check and a pin for every rework fix. The crate builds, all suites pass
+(99 tests) and the gate's clippy/fmt steps see the whole store. This
+claims nothing about E4 itself: no campaign exists until X-5c, and Opus
+judges E4 only on X-5c's RESULT. X-5c inherits: the argued uncaught
+directed arm (D16's pair — argued in its test doc comment, none
+assert-pass), the R6 cells (below), and the `run`/`verify`/`mutants`
+campaign surfaces.
+
+## Gate round 3 (2026-10-26 verdict f8a6b6eb, applied this run)
+
+- **F1 (the §12.2 record cap).** `wal_enqueue` refuses a payload whose
+  record exceeds `wal_seg_size / 4` (16 KiB) with `Fail::Invalid`
+  before any placement; the Work 2.1 derivation records each commit's
+  `(lsn, len)` extent and returns a third list — commits whose record
+  header sits issued at its segment-relative position with its own lsn
+  and a length past the segment end (written, never parseable) — which
+  `run_round` folds into a loud `task_error`. The demonstration's shape
+  (a 177-KiB `Commit` spread across segments, acked and lost silently)
+  is now impossible twice over. Pins: `wal_record_cap_is_refused` and
+  `derivation_reports_written_unparsable_commits` (both verified
+  mutant-style, failing under their named probes). D14's two 60-put
+  commits and D17's 420-put load are chunked (§12.7).
+- **F2 (the misdiagnosed open finding).** With the chunked script the
+  D17 faultless base passes `Ok(2)`: the round-2 "open finding" (a
+  rolled-back `Ok` whose raw entries sat above every cut) was F1, not a
+  meta-rollback inconsistency — **withdrawn**. The meta LOST and TORN
+  cells are clean rollbacks that pass; the grid completes its TORN
+  cells (the freeset root and the meta hold all their content in
+  sector 0; a leaf in its cell sectors — the tear sector is chosen by
+  proving the bytes differ).
+- **F3 (G7, P's ruling of 2026-10-26).** A meta is valid at open only
+  if it sits in its own slot, `1 + (ckpt_id mod 2)`; a misplaced valid
+  meta outranking every placed-valid one is XX001 — never opened, never
+  fallen back past. One shared helper (`page::select_meta`) serves the
+  store's open, amcheck, the monitors and the harness's two walks (they
+  can never disagree — the lesson of R4); open raises XX001 before any
+  meta bytes are accepted and accepts the slot the winner was read
+  from; a misplaced older meta is a loser, ignored. The mutant
+  META-WRONG-SLOT (28 now) skips the positional test at the store's
+  open only; D17's meta MISDIRECTED cell (plant on the twin slot, the
+  base's newest meta asserted ≥ 2) is the catching test: clean — XX001
+  at open, never served, passing; mutant — the misplaced copy opened
+  from the tainted landing slot, served, O-3 (a) fails the round. A
+  spec card for the §2.2 sentence is queued for P (the ruling's
+  routing); until it merges, this crate tests "S-STORE as merged plus
+  G1–G7".
+- **F4 (X5-R6).** Every D17 cell's `o1`-error arm now accepts only the
+  read-failed message forms (O-1 (b)/(c)/(d) scan-or-raw read failed —
+  an XX001 that surfaced through O-1's own reads); the two cells that
+  reach it (leaf LOST and leaf TORN: recovery `Ok`, the extraction's
+  scan hits the faulted page, O-3 (d) fails the round) are X-5c's
+  pre-registered ruling case and assert only the reading-independent
+  facts — recovery `Ok`, read-failed `o1`, never served — neither
+  `pass` nor `!pass`; the test prints their measured outcome for the
+  record.
+- **F5 (the four unpinned fixes, each pinned and verified
+  mutant-style).** R4's positional id — the empty-leaf plant
+  (`r4_positional_id_discriminates_the_empty_leaf_plant`): two
+  fully-unmapped middle radix leaves are byte-identical except the
+  positional id, the only shape where check (3) alone discriminates;
+  the all-three and store-walkers-only header_id reverts both fail the
+  pin (served through the tainted landing slot), the harness-walks and
+  amcheck single reverts are subsumed by construction (argued in the
+  test's doc). Condition 3 at `exception_set_r`'s call site
+  (`exception_set_r_consults_its_noinplace_hits`). The step-2 fixpoint
+  re-scan (`step2_fixpoint_writes_late_epoch_copies`, the first-touch
+  performed inside step 2 via the checkpoint's own Mid2 hook). And
+  `fetch_page`'s `Stale` re-validation (`fetch_page_revalidates_its_
+  carried_ref`, over a new named park point `fetch:inflight` — the
+  in-flight window between a fetch's read and its re-validating
+  install).
+- **Two harness defects the G7 clean arm exposed, both fixed:** the
+  failed-recovery path never collected its reads into the twin (open
+  had read both meta slots before failing; the Err branch's TwinInfo
+  hardcoded `recovery_reads` empty, so O-3 (c) called the G7 detection
+  a false positive) — the final Err arm and the Err-branch TwinInfo now
+  carry the attempt's reads. D10b's doc item 1 corrected (the reuse
+  pairs the **same** radix base; the N5 note).
+- **D16's pair stays reported-uncaught (directed)** with its argument
+  in the test's doc comment; the campaign's Q10 rounds remain its
+  catcher per the mutation table.
 
 ## Gate round 2 (2026-10-26 verdict, applied this run)
 
@@ -80,16 +158,12 @@ the `run`/`verify`/`mutants` campaign surfaces.
   under REFCRC-SKIP, where only the positional id discriminates.
 - **N8 (D17's grid).** LOST and MISDIRECTED on a referenced tree leaf,
   the free-set root and the newest meta slot join the map-leaf TORN,
-  LOST and MISDIRECTED cells; a meta MISDIRECTED onto the twin slot is a
-  true serve (a valid copy through the fault's tainted landing range)
-  that O-3 (a) fails.
-- **Open finding (X-5c's input, not resolved in this stage):** in D17's
-  first-half shape a LOST/TORN meta fault rolls back to a recovered
-  `Ok` whose raw entries sit above every satisfying cut — O-1 (c) fails
-  at c=1 with max ts 2 and O-3 (d) fails the round. The never-served
-  half is asserted; the inconsistency is reported for the judgement
-  (minimal shape: D17's `script`, crash at `TaskYield(1, 6)`, a directed
-  LOST fault on the newest meta's slot).
+  LOST and MISDIRECTED cells; a meta MISDIRECTED onto the twin slot is
+  a true serve (a valid copy through the fault's tainted landing range)
+  that O-3 (a) fails. *(Round 3 withdrew this item's "open finding"
+  misdiagnosis and rebuilt the grid on the F1/F2-fixed base — see
+  "Gate round 3"; the meta MISDIRECTED cell is now G7's catching test,
+  and the TORN cells exist for every target.)*
 
 ## Verification round (2026-10-26)
 
@@ -239,7 +313,7 @@ undercounted every tree page.
   directory with bounded DropTree walks, §10.2/§10.4 GC with `gc_w`,
   §12 WAL with framing/group commit/§12.6 replay start/recycling,
   §13 steps 0–6 with hooks, §14 recovery with G2 physical truncation,
-  amcheck (3.8), the 27-mutant enum.
+  amcheck (3.8), the 27-mutant enum plus G7's META-WRONG-SLOT (28).
 - **B3 — the round harness (Work 13):** `Script` tasks with commits,
   chunked transactions, bulk loads, GC, checkpoints and named park
   points (`chunked:premark`/`preapply`, `commit:preapply`,
@@ -560,9 +634,10 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # stage X-5a: sim + oracle suites (53 tests)
+cargo test -q --release -p e4-recovery      # the whole crate (99 tests)
 cargo test -q -p e4-recovery --test oracle  # the 2.6 + 2.7 + REWORK self-tests (29)
-cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests + REWORK pins (17)
+cargo test -q -p e4-recovery --test sim     # the 1.5 self-tests + REWORK pins (25)
+cargo test -q -p e4-recovery --test directed  # D1–D18 + D10b/D12b + the pins (22)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
   --results spikes/e4-recovery/results/campaign.json   # exits 2: not built (X-5c)
 ```

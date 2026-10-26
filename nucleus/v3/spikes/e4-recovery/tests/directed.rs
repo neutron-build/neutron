@@ -1023,12 +1023,13 @@ fn d10_lost_meta() {
 ///    checkpoints with **no traffic between them**: k=1 images the load,
 ///    k=2 rewrites the free set to fresh slots and its step 6 frees
 ///    meta 1's free-set pages, and k=3's own free-set allocations reuse
-///    exactly those freed slots (the lowest free). The pairing is
-///    epoch-0 free-set page against epoch-0 free-set ref at a
-///    **different radix base** (the N1/fs-inner rework made image 3's
-///    free-set layout differ from image 1's: the pre-allocated inner
-///    slots shift every leaf), so §3.3's id check rejects the reuse
-///    while the epoch check alone would not. k=3 crashes at After3; the
+///    exactly those freed slots (the lowest free). The pairing is an
+///    epoch-0 free-set page against an epoch-0 free-set ref at the
+///    **same radix base and the same epoch with different bitmap
+///    content** — the id and epoch checks pass, and §3.3's reference
+///    CRC (check (2)) is what rejects the reuse in the clean arm (the
+///    gate's N5 note: an earlier doc claimed a different radix base,
+///    which would contradict arm 4's serve). k=3 crashes at After3; the
 ///    start segment of meta 1 is not recycled, so G3 does not fire.
 /// 2. A directed LOST fault on meta 2's durable write makes open select
 ///    meta 1 — a meta rollback.
