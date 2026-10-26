@@ -1172,8 +1172,6 @@ fn put2(i: u64) -> Op {
     }
 }
 
-#[allow(clippy::needless_range_loop)]
-fn d15_unused() {}
 #[test]
 fn d15_droptree() {
     let big = |i: u64| Op::Put {
@@ -1195,7 +1193,7 @@ fn d15_droptree() {
         // cap): freeing the root first really does strand the children.
         ScriptOp::Chunked {
             sync_on: true,
-            ops: (0..40).map(|i| big(i)).collect(),
+            ops: (0..40).map(big).collect(),
         },
         ScriptOp::Commit {
             sync_on: true,
