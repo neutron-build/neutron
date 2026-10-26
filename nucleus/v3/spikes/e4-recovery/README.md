@@ -1,20 +1,97 @@
-# E4 recovery spike (card X-5, stage X-5a of three)
+# E4 recovery spike (card X-5, stage X-5b of three)
 
 Status: **stage X-5b B1–B6 complete, the 2026-10-25 gate-REWORK round
-applied (R1–R7 and the minor items — see "Gate REWORK on stage X-5b"
-below), and the 2026-10-26 verification round** (the re-run's own
-probes of the gate's G4/G5 harness mutants and the hard-coded
-integrity disables — see "Verification round" below): the S-BATON
-conversion, the store, the round harness, the monitors and the
-directed tests D1–D18 + D10b/D12b. The crate builds, all suites pass
-(89 tests) and the gate's clippy/fmt steps see the whole store. This
-claims nothing about E4 itself: no campaign exists until X-5c, and
-Opus judges E4 only on X-5c's RESULT. X-5c inherits: the two argued
-uncaught directed arms (D7's multi-round zombie and D16's pair — each
-argued in its test doc comment, none assert-pass), the R-taint wiring
-probe (below), and the `run`/`verify`/`mutants` campaign surfaces.
+applied (R1–R7 and the minor items), the 2026-10-26 verification round,
+and the 2026-10-26 gate round-2 verdict items N1–N8 applied** (see "Gate
+round 2" below): the S-BATON conversion, the store, the round harness,
+the monitors and the directed tests D1–D18 + D10b/D12b. The crate builds,
+all suites pass (92 tests) and the gate's clippy/fmt steps see the whole
+store. This claims nothing about E4 itself: no campaign exists until
+X-5c, and Opus judges E4 only on X-5c's RESULT. X-5c inherits: the
+argued uncaught directed arm (D16's pair — argued in its test doc
+comment, none assert-pass), the meta-rollback open finding (below), and
+the `run`/`verify`/`mutants` campaign surfaces.
 
-## Verification round (2026-10-26, this run)
+## Gate round 2 (2026-10-26 verdict, applied this run)
+
+- **N1 (FreeSet sizing).** §13 step 2's convergence loop: the page count
+  is recomputed after growth and the difference allocated until the
+  bitmap span covers every free-set slot; the meta's `slot_count` is the
+  converged span. Pinned by `freeset_growth_covers_its_own_slots` (the
+  verdict's 8-seed shape at every `R_EPOCH`, After5 and After6 — the old
+  code failed with both the amcheck finding and an O-1 (b) scan
+  mismatch).
+- **Three more Work-11 rule-1 violations the same shape exposed, all
+  fixed:** (a) `ckpt:freeze` snapshotted `cur` while an eviction held
+  the frame latched — the eviction's write and `record_image_at` landed
+  after the snapshot, so the radix embedded the pre-eviction home and
+  the image lost the leaf's newest entry (the checkpointer now drains
+  eviction latches before the one-step freeze); (b) step 2's single
+  scan missed first-touch epoch copies installed into reserve frames
+  behind the cursor — the fixpoint loop re-scans until a pass writes
+  nothing; (c) `ckpt2:record`'s pinned branch and `fetch_page`'s carried
+  load both skipped re-validation after yields.
+- **N2 (O-2 (ii) judged).** The harness checkpoint and amcheck (ii) now
+  feed the verdict: a first `check_round` keeps the card's
+  extraction→oracle→checkpoint order, the (ii) fields then go in, and
+  the final verdict re-judges with them (the (ii) image's referenced and
+  tainted slots from the durable bytes). A failed harness checkpoint is
+  a loud `task_error`. N2's wiring exposed two more deviations, both
+  fixed: the free set built its inner pages with `write_fresh` onto
+  slots the bitmap never marked used (I-FREE-EXACT; the pages now go to
+  the pre-allocated slots), and the durable-image walk silently skipped
+  §3.3 failures on tree and directory pages (the directory walk also
+  checked a hardcoded expected id of 0).
+- **N3 (D18 vacuous).** `fail_of` no longer masks store errors as
+  `SimFail::Crashed` (the real "tree 2 missing in directory" was hidden
+  behind task_error="Crashed"), and the harness's apply loop waits for
+  the creating commit's directory entry (applies finish out of ts order,
+  §12.4; a malformed script fails loudly instead of spinning the service
+  tasks past the deadlock detector). D18 reshaped on seed 2023: clean
+  passes with M-WAL-ORDER silent; TS-AFTER-APPEND gives the lower-ts
+  record the higher LSN — **M-WAL-ORDER fires and the oracle fails**,
+  both named catchers asserted.
+- **N4 (assert discipline).** Every clean arm asserts `pass` (except
+  D12b's designed fail-stop); every mutant arm names its catcher.
+- **N5 (the R-taint refutation).** D10b arm 4 is the card's own arm:
+  REFCRC-SKIP serves a reused slot through the R-taint (O-3 (a) fails);
+  ID-SKIP+REFCRC serves identically; the new `no_r_taint` knob (the G5
+  call-site pin) shows the same round **passes silently** with the
+  R-taint forced off.
+- **N6 (the D7 equivalence argument rejected).** D7 is the real
+  two-round zombie: round 1 tears tail 3's first sector with a directed
+  TORN fault on sector-aligned 1536-byte records (an in-place tear
+  cannot be drawn from F-CRASH here — the writer syncs every batch, so
+  each sector has one volatile image and the draw is all-or-nothing per
+  batch); round 2 appends the same-length record, §12.5's position check
+  lines the intact tail 4 up with the new append — clean passes (G2
+  zeroed the tail), TRUNCATE-LOGICAL-ONLY replays the zombie and O-1
+  fails on a commit the truncated model no longer has. Two harness
+  deviations fixed en route: model commits are recorded at the enqueue
+  (where `wal_commits`'s contract places them — a committer crashing
+  mid-ack with its record durable never entered the model), and
+  `derive_written_acked` starts at the round's first write and jumps
+  undecodable chunk boundaries (a chained round's events hold only its
+  own writes).
+- **N7 (the unpinned rework fixes).** Condition 3 (`r_slot_qualifies`),
+  the pass fold (`fold_pass`) and the abort path's `ckpt_open` clear
+  (D12b asserts no DEADLOCK) are pinned; the R4 positional-id pin runs a
+  free-set-inner MISDIRECTED onto a free-set leaf's referenced slot
+  under REFCRC-SKIP, where only the positional id discriminates.
+- **N8 (D17's grid).** LOST and MISDIRECTED on a referenced tree leaf,
+  the free-set root and the newest meta slot join the map-leaf TORN,
+  LOST and MISDIRECTED cells; a meta MISDIRECTED onto the twin slot is a
+  true serve (a valid copy through the fault's tainted landing range)
+  that O-3 (a) fails.
+- **Open finding (X-5c's input, not resolved in this stage):** in D17's
+  first-half shape a LOST/TORN meta fault rolls back to a recovered
+  `Ok` whose raw entries sit above every satisfying cut — O-1 (c) fails
+  at c=1 with max ts 2 and O-3 (d) fails the round. The never-served
+  half is asserted; the inconsistency is reported for the judgement
+  (minimal shape: D17's `script`, crash at `TaskYield(1, 6)`, a directed
+  LOST fault on the newest meta's slot).
+
+## Verification round (2026-10-26)
 
 The re-run re-applied the gate's own probes by hand before finishing:
 

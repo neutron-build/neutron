@@ -732,9 +732,11 @@ fn media_wal_draws_across_all_segments() {
 /// a hang. A task that holds an `acquire` guard of the world across a
 /// yield point gets `SimFail::Baton` naming the call site — at the yield
 /// (the run-1 deadlock shape) and at a re-entrant acquisition — and the
-/// world stays usable afterwards. Demonstrated by hand with a blocking
-/// `lock` replaced for `acquire`: the test then hangs and is killed (see
-/// the stage RESULT, instrumentation checks).
+/// world stays usable afterwards. (The blocking-`lock` hang demonstration
+/// belongs to `baton_violation_cross_thread_holder_is_reported` below —
+/// the gate's R6 correction: with `acquire`'s `try_lock` replaced by a
+/// blocking `lock`, **that** test hangs and is killed, because the holder
+/// sits on another OS thread; this test's holder unwinds cooperatively.)
 #[test]
 fn baton_violation_is_reported() {
     let sched = run_world(2, 4242, |sched, t| {
