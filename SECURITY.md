@@ -10,44 +10,14 @@ not establish security support.
 
 ## Private reporting
 
-<<<<<<< Updated upstream
-GitHub private vulnerability reporting for this repository is currently disabled.
-A usable monitored private destination has not been approved or verified.
-Do not publish vulnerability details in a public issue. Maintainers must enable
-and verify a private reporting destination and delivery before advertising one.
-This policy currently makes no acknowledgment-time or monitoring guarantee.
-||||||| Stash base
-If you discover a security vulnerability in any Neutron or Nucleus component, please report it responsibly.
+Report vulnerabilities through GitHub private vulnerability reporting: the
+"Report a vulnerability" button on this repository's Security tab
+(`https://github.com/neutron-build/neutron/security/advisories/new`). It was
+enabled on 2026-10-08. Do not publish vulnerability details in a public issue.
 
-**Do not open a public issue.** Instead:
-
-1. Email **SOON** with a description of the vulnerability
-2. Include steps to reproduce, affected versions, and any potential impact
-3. Allow up to 72 hours for an initial response
-
-## What to Expect
-
-- **Acknowledgment** within 72 hours of your report
-- **Assessment** of severity and affected components within 1 week
-- **Fix and disclosure** coordinated with you before public release
-- **Credit** in the release notes (unless you prefer to remain anonymous)
-=======
-If you discover a security vulnerability in any Neutron or Nucleus component, please report it responsibly.
-
-**Do not open a public issue.** Instead:
-
-1. Use GitHub's **private vulnerability reporting** (enabled 2026-10-08): the "Report a vulnerability" button on the Security tab
-2. Email **SOON** with a description of the vulnerability
-2. Include steps to reproduce, affected versions, and any potential impact
-3. Allow up to 72 hours for an initial response
-
-## What to Expect
-
-- **Acknowledgment** within 72 hours of your report
-- **Assessment** of severity and affected components within 1 week
-- **Fix and disclosure** coordinated with you before public release
-- **Credit** in the release notes (unless you prefer to remain anonymous)
->>>>>>> Stashed changes
+Response commitments are currently disabled: no primary/backup responders,
+acknowledgment target or released-version support matrix have been verified,
+so this policy makes no acknowledgment-time or monitoring guarantee.
 
 ## Scope
 
@@ -57,14 +27,9 @@ and language SDKs. Report dependency vulnerabilities to their upstream projects.
 
 ## Maintainer activation procedure
 
-The route remains disabled until a maintainer completes these steps. In repository
-Settings → Code security → Private vulnerability reporting, enable reporting (or
-use `gh api --method PUT repos/neutron-build/neutron/private-vulnerability-reporting`
-with an authorized repository administrator). Verify the state with
-`gh api repos/neutron-build/neutron/private-vulnerability-reporting` and the private
-report form at `https://github.com/neutron-build/neutron/security/advisories/new`.
-
-Before replacing this disabled-route status, designate actual primary and backup
+The reporting route is enabled (verify with
+`gh api repos/neutron-build/neutron/private-vulnerability-reporting`). Before
+replacing the disabled response-commitment status above, designate actual primary and backup
 responders, confirm their private advisory access and notification delivery, and
 agree on a response target and a released-version support matrix. Submit an
 authorized non-sensitive private test report and retain private evidence of receipt
