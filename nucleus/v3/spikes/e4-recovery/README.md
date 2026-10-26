@@ -1,14 +1,21 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c attempt 2 — the seeded workload (Work 5), the
-campaign/verify/mutants machinery (Work 7–8) and the smoke are complete
-and green (107 tests); the campaign itself is STOPPED at the card's
-Work-2 amendment guard: P's pre-data ruling X5-R6 has not been
-delivered, and the card says the worker stops and ESCALATEs rather than
-run the first campaign whose output anyone reads** (see "X5-R6" below).
-The stages before it (X-5a, X-5b) are complete and merged; see "The
-three stages" below. This claims nothing about E4: no campaign data has
-been produced or read, and Opus judges E4 only on X-5c's RESULT.
+Status: **stage X-5c attempt 3 — attempt 2's X5-R6 guard still binds
+(P's pre-data ruling on O-1 for recovered-Ok-with-detected-loss has not
+been delivered), so the 10k campaign, coverage tuning and the sweep
+remain unrun.** This attempt resumed a killed attempt-3 run whose
+uncommitted tree had crossed the guard (it ran a 100-seed campaign and
+read its quota output); the crossing is reverted where it cannot be
+validated (the knob tuning) and kept where it is mechanical and tested
+(the scheduler-yield uniform crash), one real store defect the smoke
+exposed is fixed and pinned, and every failing seed of the 16-seed
+smoke is root-caused (two ESCALATE items beyond the ruling; see
+"Attempt 3 findings"). All 109 tests green; the Acceptance commands run
+honestly — `verify`/`mutants --check` exit non-zero because no results
+file can exist under the guard. The stages before it (X-5a, X-5b) are
+complete and merged; see "The three stages" below. This claims nothing
+about E4: no judged campaign data has been produced, and Opus judges E4
+only on X-5c's RESULT.
 
 ## X5-R6 — the open ruling that stops the campaign (card Work 2, the
 ## amendment, verbatim subject)
@@ -25,12 +32,10 @@ committed before the first campaign `run` whose output anyone reads
 (Work 7), and RESULT item 7 applies it with X5-R1–R5. If the worker
 reaches Work 7 without it, the worker stops and ESCALATEs for it. The
 worker never picks a reading."* The ruling was not in the worktree, the
-card set, the verdicts or the queue at run time (checked 2026-10-26),
-so this attempt implements everything up to the guard, runs the
-Acceptance commands honestly (`verify` and `mutants --check` exit
-non-zero: no results file can exist), and ESCALATEs. The ruling's text,
-when delivered, is recorded verbatim here before the first campaign
-run.
+card set, the verdicts or the queue at attempt 2's run time (checked
+2026-10-26), nor at this attempt's (re-checked 2026-10-26, later the
+same day). The ruling's text, when delivered, is recorded verbatim here
+before the first campaign run.
 
 Why the guard bites already: the 16-seed smoke's own survey (mechanics
 only — the smoke asserts no oracle outcome) shows seeds 7–8 (class MP)
@@ -39,7 +44,88 @@ read-failed O-1 (a scan hit the faulted page), O-3 (d) failing the
 round — the campaign-scale shape of D17's R6 cells. The campaign cannot
 be judged until P rules.
 
-## What this stage built (attempt 2)
+## Attempt 3 findings (all root-caused; the smoke is mechanics-only,
+## none of these is a judged campaign result)
+
+1. **The GC pack step's kept-entry split — a real store defect, fixed
+   and pinned** (`gc_pack_splits_kept_entries_at_the_separator`,
+   `tests/directed.rs`). Seed 10 round 1 failed O-2 with amcheck (ii)
+   "entry above subtree bound" (two slots, each holding an entry exactly
+   equal to its parent bound). Root cause: the §10.4 sweep processes
+   leaf L **and its right sibling R** as one gated step and re-split
+   the kept entries between the pair **by L's pre-prune count**
+   (`keep.take(n_left)`); every version the §10.2 rule pruned from L
+   moved that many of R's lowest entries (keys at or above the cell
+   separator) into L — the durable image then held a leaf with entries
+   at or above its own subtree bound. The split is now **by key**
+   against the cell bound (`l_bound`), §6.5's cell convention under any
+   pruning. Verified mutant-style: the count split restored by hand
+   fails the pin with the same two amcheck findings; reverted clean.
+   (Note for the sweep: amcheck (i) as wired through
+   `harness::durable_image` checks §3.3 but no bounds — the (i) walk
+   cannot see this class; the store's `amcheck::amcheck` (ii and the
+   pre-checkpoint probe) does.)
+2. **The frozen oracle cannot represent S-STORE §10.2's legal tombstone
+   elision — ESCALATE** (the oracle is Touch-only-frozen; a defect
+   found there is an ESCALATE, never a local fix). Seeds 10 r1 and
+   14 r0 (class C) fail O-1 (b)/(c) on keys the model holds as
+   `(key, None)` tombstones while the store's recovered scan omits
+   them: e.g. seed 14 round 0, tree 4, key `0000000000000211`, a
+   `Delete` at commit ts 2 (SyncOn, written, acked), elided by the
+   round's own GC sweep (w above 2, recorded gc_w 3 ≥ 2 — I-GCW
+   honoured), never re-materialised by replay (the delete's record is
+   below the opened image's replay start, as designed). S-STORE §10.2
+   **mandates** the elision, §8's `scan` **omits** tombstoned keys, and
+   the model's own doc says "a Delete reads as absent" — but
+   `Model::scan` encodes a held tombstone structurally as a present
+   `None` entry and O-1 (b)/(d) compare maps structurally, so any
+   round whose pre-crash GC elided a tombstone with ts ≤ the candidate
+   cut fails O-1 at **every** candidate although the state reads
+   identically at those cuts. Q18 (GC with w above the previous gc_w
+   inside an image that later recovers, minimum 1,000 rounds) makes
+   this the campaign's dominant shape, so the ruling-or-redesign
+   decision is P's/Opus's, not a worker fix. Deterministic repro:
+   `run_seed(14, None)` round 0 (class C, uniform crash at yield
+   11663), or `run_seed(10, None)` round 1.
+3. **Seed 9 round 1 (class MW): O-3 (a) served corruption with no
+   detection — root-caused to the recycle/reuse boundary, unresolved,
+   ESCALATE.** The served accept is `(WAL inode 3, off 7515, len 6816)`:
+   a complete, valid record image (magic, len 6816, CRC, rlsn 73051 ==
+   its exact position under the segment's name), byte-identical to the
+   last **synced** write covering the range (`dwrites_of(3)` diff 0).
+   The crashed disk's opened meta is `ckpt_id 1, t 3, wal_start 1571`,
+   so §12.6 replay **must** read this segment and this record. The
+   taint flag comes from later **issued-but-unsynced** writes over the
+   same inode offsets — the segment had been recycled (renamed toward
+   its next bound) and its storage reused for newer LSNs while the
+   round's crash reverted both the reuse writes and (or not) the rename
+   itself. The two candidate classifications, which this attempt could
+   not distinguish within its budget: (a) a **sim defect** — the taint
+   reference `issued` is per-(inode, offset) with no notion of segment
+   generation, so a rename-recycled file's reuse taints addresses whose
+   correct post-crash content is the old (pre-recycle) records, making
+   a correct replay read as a serve; or (b) a **store/spec defect** —
+   the reader legitimately or illegitimately reading a recycled name's
+   old content (Q11's shape) in a way S-STORE §12.5/§12.6/G2 must but
+   does not catch. Deterministic repro: the twin-chained seed-9
+   sequence (round 0 twin then real, round 1 twin then real) as
+   `run_seed(9, None)` performs it — round 1 fails O-3 (a) with
+   `detections=[]`.
+4. **Seeds 7–8 round 0 (class MP) — the X5-R6 case verbatim**, recorded
+   for the ruling, not judged: recovery `Ok`, O-1 read-failed (a scan
+   hit the faulted page), O-3 (d) failing the round, no other failure.
+
+**Attempt 3's guard crossing, honestly:** the killed attempt-3 run (the
+runner relaunched this worktree `--keep`) ran a 100-seed campaign at
+10:32 (`/tmp/opencode/camp100.json`, 63,119 bytes) and read its quota
+output, and tuned knobs against it — past the card's stop clause. This
+attempt did not use that data (the file is not read; the tuning is
+reverted to attempt 2's committed, gate-approved values); the crossing
+is reported in the RESULT's anomalies. What the killed run built that
+**is** kept, re-validated from scratch: the scheduler-yield-level
+uniform crash (below).
+
+## What this stage built (attempt 2, completed and carried by attempt 3)
 
 - **Work 5 (`src/workload.rs`)**: the knob derivation (5.1: 2–4
   committers + writer/checkpointer/GC/evictor/DDL, 2–4 user trees +
@@ -50,17 +136,38 @@ be judged until P rules.
   tree, GC sweeps concurrent with checkpoints), the classes (5.4:
   `seed % 10` → C/MP/MW = 7000/2000/1000), the rounds (5.5: 1–3 at
   50/30/20, every round crashes; targeted at `CKPT_HOOKS[(seed/20)%10]`
-  of a seeded checkpoint when `(seed/10)%2 == 0`, else uniform over the
-  script's yield points; nested recovery crashes drawn 60/30/10 over
-  the recovery's **counted** yield length so a drawn point always
-  fires), the twins (Work 2.5: every MP/MW round runs its faultless
-  twin first — the same script, crash and F-CRASH resolutions, judged
-  as class C — supplying the real round's O-3 (c) read/referenced sets
-  and its nested points), and the per-seed driver with the canonical
-  digest. **Judgment call, documented:** the chain stops after a round
-  that failed the oracle (X5-R3's root-cause unit — continuing on a
-  failed round's base would stack fallout the R6 ruling must judge
-  first); recorded as `stopped_early`, never hidden.
+  of a seeded checkpoint when `(seed/10)%2 == 0`, else uniform; nested
+  recovery crashes drawn 60/30/10 over the recovery's **counted** yield
+  length so a drawn point always fires), the twins (Work 2.5: every
+  MP/MW round runs its faultless twin first — the same script, crash
+  and F-CRASH resolutions, judged as class C — supplying the real
+  round's O-3 (c) read/referenced sets and its nested points), and the
+  per-seed driver with the canonical digest. **Judgment call,
+  documented:** the chain stops after a round that failed the oracle
+  (X5-R3's root-cause unit — continuing on a failed round's base would
+  stack fallout the R6 ruling must judge first); recorded as
+  `stopped_early`, never hidden.
+- **The uniform crash is scheduler-yield-level (attempt 3, kept from
+  the killed run, re-validated)**: 5.5's "uniform over the round's
+  yield points" reads on the **scheduler's** yield counter (every
+  `E4Env` call, every baton handoff — the service tasks' windows, the
+  checkpoint's internals, the rename/dirsync gaps), not only the script
+  tasks' op boundaries (attempt 2's `TaskYield` subset, which could not
+  address Q12's rename window at all). The driver runs a **counting
+  pass** (`RoundFaults::probe_pass`: the workload only, crash disabled,
+  the outcome carries `sched_yields` and the crash-time observables),
+  draws `k` uniform in `1..=counted` (`uniform_yield_point`), and arms
+  `CrashSpec::Yield(k)` — the same counted-pass pattern the card
+  prescribes for the nested draws. The arm lives in `run_script` (which
+  resets the scheduler core to size the task set; arming before it was
+  silently wiped — the defect the fired-guard caught immediately).
+  **The fired-guard** (`crash_fired_defect`): a round whose crash spec
+  never fired is a **harness defect** that fails the seed (5.5 step 2
+  requires the crash; a silent no-crash round would leave every
+  downstream field meaningless while still being judged) — wired for
+  both the twin and the real round, pinned by the smoke's `fired`
+  assertions and
+  `uniform_crash_fires_at_the_counted_yield`.
 - **W-SCRIPT (the generator's invariant, pinned)**: a round's script
   references only trees the model at the previous cut has, and every
   non-setup task opens with `ScriptOp::WaitTrees` (the round-setup
@@ -74,9 +181,10 @@ be judged until P rules.
   results/campaign.json` (per-seed records, the final `E4 SEEDS=…`
   line, byte-identical digests across thread counts — pinned), `verify
   --results …` (re-runs every seed, checks digest reproduction, the
-  exact 0..9999 set and every 5.6 quota; exits non-zero **only** on
-  those three, never on oracle failures), `mutants --seeds 0..500 --out`
-  and `mutants --check` (the sweep, the directed column re-run, the
+  exact 0..9999 set and every 5.6 quota — the SIZING row counts
+  **misses** and passes only at zero; exits non-zero **only** on those
+  three, never on oracle failures), `mutants --seeds 0..500 --out` and
+  `mutants --check` (the sweep, the directed column re-run, the
   first-catch check). The JSON is hand-rolled (deps stay
   `thiserror`+proptest); the round-trip is pinned.
 - **Work 8 (the directed column)**: `campaign::directed_arms::TABLE`
@@ -117,9 +225,9 @@ START-SEGMENT-MISSING-OK `ckpt.rs` open's G3 check; META-WRONG-SLOT
 - The 10k campaign `run` (no `results/campaign.json` exists),
   coverage tuning, the mutant sweep (`results/mutants.json`), the
   RESULT items that need campaign numbers (2, 3, 4, 7's table), and
-  the ≤ 20-min wall verification (per-seed cost is measurable only by
-  running; the smoke's 16 seeds run in ~13 s single-threaded in the
-  debug test suite, which bounds nothing about the release campaign).
+  the ≤ 20-min wall verification. Attempt 3's killed run produced a
+  100-seed quota file outside the crate; it is not used and no
+  campaign output exists in the worktree.
 - The instrumentation checks (the card's list) were re-run green on
   the final code as ordinary suite members: O-1's lower bound, O-1
   (c), the taint comparison and the twin false-positive rule
@@ -758,8 +866,8 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (107 tests)
-cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (8)
+cargo test -q --release -p e4-recovery      # the whole crate (109 tests)
+cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (9)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
   --results spikes/e4-recovery/results/campaign.json   # exits 2: no campaign
                                                        # exists (the X5-R6 guard)
