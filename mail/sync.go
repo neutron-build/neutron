@@ -29,6 +29,14 @@ type Engine struct {
 	// which is every message a person has not read yet.
 	FetchBodies bool
 
+	// FetchBodiesWithin, when positive, limits FetchBodies to messages
+	// received within this long before now. A body costs a provider request
+	// of its own (Gmail meters it like the envelope), so prefetching all of a
+	// large history doubles a first import for mail that is rarely opened.
+	// Older bodies are fetched when opened, as with FetchBodies off. A message
+	// with no date is prefetched. Zero prefetches every message.
+	FetchBodiesWithin time.Duration
+
 	// MaxPages bounds how many pages one Sync call will walk before
 	// returning. A mailbox with more changes than this resumes from its
 	// stored cursor on the next call, so progress is never lost — the bound
@@ -800,7 +808,14 @@ func (e *Engine) prefetchBodies(ctx context.Context, acct AccountID, ad Adapter,
 	if !e.FetchBodies {
 		return nil
 	}
+	var cutoff time.Time
+	if e.FetchBodiesWithin > 0 {
+		cutoff = time.Now().Add(-e.FetchBodiesWithin)
+	}
 	for i := range upsert {
+		if at := envelopeTime(upsert[i]); !cutoff.IsZero() && !at.IsZero() && at.Before(cutoff) {
+			continue
+		}
 		// A body never changes, and an envelope is upserted again for
 		// every flag change — a read receipt, a star, a move. Without this
 		// check the first sync after someone reads their mail re-downloads
@@ -827,6 +842,18 @@ func (e *Engine) prefetchBodies(ctx context.Context, acct AccountID, ad Adapter,
 		}
 	}
 	return nil
+}
+
+// envelopeTime is when a message arrived, falling back to its Date header.
+// The zero time means unknown.
+func envelopeTime(env Envelope) time.Time {
+	if !env.ReceivedAt.IsZero() {
+		return env.ReceivedAt
+	}
+	if !env.SentAt.IsZero() {
+		return env.SentAt
+	}
+	return time.Time{}
 }
 
 // stopPrefetch reports whether a body-fetch failure is account-wide: the
