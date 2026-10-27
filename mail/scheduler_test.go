@@ -234,17 +234,19 @@ func TestWakeDeduplicatesABurst(t *testing.T) {
 	s, _ := schedulerFixture(t, ad, Account{ID: "a1", Provider: ProviderIMAP, Email: "a@x.com"})
 	s.Interval = time.Hour
 
+	// The burst is queued before the loop runs. Fired while the loop is live,
+	// a wake landing after the pending set was drained is a new hint and
+	// rightly earns another sync, which made the count timing-dependent.
+	for i := 0; i < 5; i++ {
+		s.Wake("a1")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
-	// The immediate first pass is one sync; a burst of wakes must collapse
-	// into exactly one more.
-	waitFor(t, 500*time.Millisecond, func() bool { return ad.count() >= 1 })
-	for i := 0; i < 5; i++ {
-		s.Wake("a1")
-	}
+	// The immediate first pass is one sync; the burst collapses into exactly
+	// one more.
 	waitFor(t, time.Second, func() bool { return ad.count() == 2 })
 	time.Sleep(150 * time.Millisecond)
 	if got := ad.count(); got != 2 {
