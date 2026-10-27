@@ -180,7 +180,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
           cache-dependency-path: typescript/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile --filter '@neutron-build/nucleus' --filter '@neutron-build/data' --filter '@neutron-build/core'
+      - run: pnpm install --frozen-lockfile --filter '@neutron-build/sql' --filter '@neutron-build/nucleus' --filter '@neutron-build/data' --filter '@neutron-build/core'
         working-directory: typescript
       - uses: actions/setup-go@v5
         if: matrix.package == 'nucleus'

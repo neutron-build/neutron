@@ -33,9 +33,11 @@ const SNAPSHOT_PATH = join(process.cwd(), "scripts", "render-guards.snapshot.jso
 // Gzipped server-bundle ceiling. The server bundle is unminified. Vite 8's
 // Rolldown output is smaller raw than esbuild's (about 182 KB against 187 KB)
 // but tab-indented and region-commented, so it gzips about 7% larger (about
-// 50 KB against 46 KB). The ceiling leaves headroom for ordinary growth but
-// trips on a step-change regression.
-const BUNDLE_GZ_BUDGET_BYTES = 52 * 1024;
+// 50 KB against 46 KB). The cache-capture, response and data-layer hardening
+// of the 2026-10 audit passes brought it to about 57 KB. The ceiling leaves
+// headroom for ordinary growth but trips on a step-change regression, such as
+// build-time code (the route manifest's Babel parser) reaching the runtime.
+const BUNDLE_GZ_BUDGET_BYTES = 60 * 1024;
 
 const WRITE = process.argv.includes("--write");
 

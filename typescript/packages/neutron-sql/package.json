@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/sql",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Typed TypeScript SQL schema and query builder for PostgreSQL. Schema in code, no codegen.",
   "author": "Tyler",
   "license": "MIT",

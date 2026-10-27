@@ -2,6 +2,56 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.4.0, cli 0.4.0, create 0.1.10, sql 0.2.0, nucleus 0.3.0, data 0.3.0, ai 0.1.2, security 0.1.5, ops 0.1.4, otel 0.1.4] - 2026-10-26
+
+### Breaking
+
+- **zod 4.** `@neutron-build/core` and `@neutron-build/ai` move to zod 4
+  (closes GHSA-mrhx-c7xc-m3w5, which has no zod 3 fix). Content collection
+  schemas must be zod 4 schemas: import `z` from `"zod"` and use the zod 4 API
+  (`z.email()`, `z.url()`). `@neutron-build/ai` still converts zod 3 schemas
+  passed through `zod/v3`.
+- **Shared caching is opt-in per middleware.** Middleware and `headers()`
+  callbacks must declare `sharedCacheSafe: true` before a response passing
+  through them is stored in a shared cache; without it the response bypasses
+  shared caching (TS-F04/06/07/08).
+- Raw and mobile SELECT caching in the data layer defaults off and requires an
+  explicit pure-read assertion (TSD-05). Dispatched mutations and `BEGIN` are no
+  longer replayed automatically; ambiguous responses surface as `UnknownOutcome`
+  (TSD-06).
+
+### Fixed
+
+- Runtime (TS-F01..21): global middleware is gated in static and production
+  builds; the Docker adapter serves only declared public artifacts; cache
+  capture runs after the full middleware chain with byte-budgeted body capture;
+  `mutableResponse()` lets middleware set headers on immutable responses;
+  stream writers honor backpressure and abort; backslash path escapes are
+  blocked; body caps propagate cancellation; client data is fenced across async
+  boundaries and the client matcher implements server catch-all semantics;
+  returned loader Responses close their spans; MDX `sanitize: true` refuses a
+  custom render factory; ServerIsland props are JSON-escaped.
+- `mutableResponse()` copies only responses whose headers are immutable, and
+  the server reassigns Hono's response only when a copy was made. Copying on
+  every middleware layer had cut static and login throughput by about 40%.
+- The runtime router no longer imports the build-time route manifest, which
+  pulled `@babel/parser` and `node:fs` into every server bundle, edge presets
+  included (about 17 KB gzipped).
+- Security: rate-limit buckets survive quota reset, CSRF origin comparison is
+  scheme-aware, trusted-proxy mode ignores unverifiable vendor identity headers.
+- Data layer (TSD-01..14): cursor decode failures release their connection;
+  pinned-session capability probes no longer deadlock the pool; Postgres queue
+  claims are lease- and worker-fenced; unknown BullMQ jobs are deferred instead
+  of completed; cancellation drains on every outcome; HTTP deadlines cover body
+  parsing (30 s default); blob compensation no longer deletes a newer writer;
+  rollback preflights the whole frontier before DDL; listener close during
+  subscribe releases late subscriptions; Redis increment with expiry is atomic;
+  cron coalesces missed work after clock changes; legacy DDL defers cyclic
+  foreign keys.
+- `@neutron-build/ops` request-context middleware sets its header through
+  `mutableResponse()` and requires core 0.4.0. `@neutron-build/otel` ends
+  loader and action spans left open when their request ends.
+
 ## [core 0.3.2, cli 0.3.2, create-neutron 0.1.9] - 2026-10-07
 
 ### Fixed
