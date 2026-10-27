@@ -13,28 +13,29 @@ that a version has been published; check the registry before releasing.
 
 | Package | Version |
 |---|---|
-| `@neutron-build/sql` | 0.1.0 |
-| `@neutron-build/nucleus` | 0.2.1 |
-| `@neutron-build/data` | 0.2.1 |
+| `@neutron-build/sql` | 0.2.0 |
+| `@neutron-build/nucleus` | 0.3.0 |
+| `@neutron-build/data` | 0.3.0 |
 | `@neutron-build/agents` | 0.2.0 |
-| `@neutron-build/core` | 0.3.2 |
-| `@neutron-build/cli` | 0.3.2 |
-| `@neutron-build/create` | 0.1.9 |
+| `@neutron-build/core` | 0.4.0 |
+| `@neutron-build/cli` | 0.4.0 |
+| `@neutron-build/create` | 0.1.10 |
 | `@neutron-build/auth` | 0.1.5 |
 | `@neutron-build/cache-redis` | 0.2.0 |
-| `@neutron-build/security` | 0.1.4 |
-| `@neutron-build/ai` | 0.1.1 |
+| `@neutron-build/security` | 0.1.5 |
+| `@neutron-build/ai` | 0.1.2 |
 | `@neutron-build/mcp` | 0.1.1 |
 | `@neutron-build/workflow` | 0.1.1 |
+| `@neutron-build/ops` | 0.1.4 |
+| `@neutron-build/otel` | 0.1.4 |
 
-`@neutron-build/ops` (0.1.2), `@neutron-build/otel` (0.1.2) and
-`@neutron-build/mail` (0.1.0) are unchanged and stay on the registry as they are.
+`@neutron-build/mail` (0.1.0) is unchanged and stays on the registry as it is.
 What changed in each package is in `CHANGELOG.md`. Check the registry for what is
 live: `npm view <package> version`.
 
 The former unscoped `create-neutron` package is deprecated. Do not publish new
-versions under that name. Version 0.1.7 of `@neutron-build/create` is published;
-0.1.9 (with core 0.3.2 and cli 0.3.2) is prepared and must be published
+versions under that name. Version 0.1.9 of `@neutron-build/create` is published;
+0.1.10 (with core 0.4.0 and cli 0.4.0) is prepared and must be published
 together: `create` pins the `core`/`cli` pair, and the packed `cli`
 depends on `create`.
 
