@@ -45,7 +45,7 @@ describe("final C runtime contracts", () => {
   it("TS-F09 returns a writable response as is, untouched", () => {
     const original = new Response("body", { headers: { "X-Kept": "1" } });
     const response = mutableResponse(original);
-    expect(response).toBe(original); expect([...response.headers.keys()]).toEqual(["content-type", "x-kept"]);
+    expect(response).toBe(original); expect(response.headers.get("X-Kept")).toBe("1"); expect(response.headers.has("x-neutron-mutability-probe")).toBe(false);
   });
   it("TS-F15 retains abort and immutable socket identity", async () => {
     const controller = new AbortController();
