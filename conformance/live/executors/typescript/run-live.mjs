@@ -378,12 +378,13 @@ class Ops {
   }
 
   async timeseries_query(measurement, startMs, endMs) {
-    return this.c.timeseries.query(measurement, new Date(TS_BASE + startMs), new Date(TS_BASE + endMs));
-  }
-
-  async timeseries_query(measurement, startMs, endMs) {
     // TS_BASE is a NUMBER (Date.UTC), not a Date — the other arms add to it
     // directly. Calling .getTime() on it threw.
+    // TS_RANGE is admitted only after the client's write diagnostics prove
+    // it exact on this engine; they write to their own probe series, and
+    // the conformance engine is disposable.
+    this.tsProbe ??= this.c.timeseries.probeCapabilities({ allowPersistentProbeWrites: true });
+    await this.tsProbe;
     const pts = await this.c.timeseries.query(
       measurement,
       new Date(TS_BASE + startMs),
