@@ -42,6 +42,11 @@ describe("final C runtime contracts", () => {
     response.headers.append("Set-Cookie", "a=1"); response.headers.append("Set-Cookie", "b=2");
     expect(response.status).toBe(307); expect(response.headers.get("Location")).toContain("destination"); expect(response.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
   });
+  it("TS-F09 returns a writable response as is, untouched", () => {
+    const original = new Response("body", { headers: { "X-Kept": "1" } });
+    const response = mutableResponse(original);
+    expect(response).toBe(original); expect([...response.headers.keys()]).toEqual(["content-type", "x-kept"]);
+  });
   it("TS-F15 retains abort and immutable socket identity", async () => {
     const controller = new AbortController();
     const original = new Request("https://example.test/", { method: "POST", body: "body", signal: controller.signal });

@@ -19,7 +19,7 @@ import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import type { WebSocketServer } from "ws";
 import { compress } from "hono/compress";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
@@ -520,7 +520,7 @@ export async function createServer(
       requestIdHeader && requestIdHeader.length > 0 ? requestIdHeader : createRequestId();
     c.set("requestId", requestId);
     await next();
-    c.res = mutableResponse(c.res);
+    setMutableResponse(c);
     c.res.headers.set("x-request-id", requestId);
   });
 
@@ -549,7 +549,7 @@ export async function createServer(
       }
 
       await next();
-      c.res = mutableResponse(c.res);
+      setMutableResponse(c);
 
       if (corsOptions) {
         applyCorsHeaders(c.req.raw, c.res, corsOptions);
@@ -575,7 +575,7 @@ export async function createServer(
     // stored the uncompressed representation needs it just as much.
     app.use("*", async (c, next) => {
       await next();
-      c.res = mutableResponse(c.res);
+      setMutableResponse(c);
       const existing = c.res.headers.get("Vary");
       if (!existing) {
         c.res.headers.set("Vary", "Accept-Encoding");
@@ -618,7 +618,7 @@ export async function createServer(
   );
   app.use("/assets/*", async (c, next) => {
     await next();
-    c.res = mutableResponse(c.res);
+    setMutableResponse(c);
     if (
       c.res.status >= 200 &&
       c.res.status < 300 &&
@@ -1936,4 +1936,11 @@ export async function startServer(
   // Return the handle so realtime callers can attach `wss.on("connection", ...)` while
   // still getting startServer's signal-driven graceful shutdown.
   return running;
+}
+
+// Hono's `res` setter copies the response and every header, so reassign only
+// when mutableResponse() actually had to replace an immutable response.
+function setMutableResponse(c: Context): void {
+  const response = mutableResponse(c.res);
+  if (response !== c.res) c.res = response;
 }

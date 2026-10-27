@@ -31,6 +31,9 @@ All notable changes to this project are documented in this file.
   boundaries and the client matcher implements server catch-all semantics;
   returned loader Responses close their spans; MDX `sanitize: true` refuses a
   custom render factory; ServerIsland props are JSON-escaped.
+- `mutableResponse()` copies only responses whose headers are immutable, and
+  the server reassigns Hono's response only when a copy was made. Copying on
+  every middleware layer had cut static and login throughput by about 40%.
 - The runtime router no longer imports the build-time route manifest, which
   pulled `@babel/parser` and `node:fs` into every server bundle, edge presets
   included (about 17 KB gzipped).
