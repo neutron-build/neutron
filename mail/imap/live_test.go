@@ -236,6 +236,47 @@ func TestLiveFlagChangeIsObserved(t *testing.T) {
 	}
 }
 
+// Trash in a client is a move to the server's \Trash folder, not a delete:
+// the message leaves INBOX and arrives in Trash under the same identity, so
+// a mirror that syncs both folders sees one message change folder.
+func TestLiveMoveToTrashKeepsIdentity(t *testing.T) {
+	env := liveConfig(t)
+	ad := dialLive(t, env)
+
+	boxes, err := ad.Mailboxes(context.Background())
+	if err != nil {
+		t.Fatalf("mailboxes: %v", err)
+	}
+	var trash mail.MailboxID
+	for _, b := range boxes {
+		if b.Role == mail.RoleTrash {
+			trash = b.ID
+		}
+	}
+	if trash == "" {
+		t.Fatalf("no mailbox with the trash role in %+v", boxes)
+	}
+
+	msgID := fmt.Sprintf("<trashed-%d@test.local>", time.Now().UnixNano())
+	deliver(t, env, "trashed message", msgID, "body")
+	target := mail.HeaderMessageID(msgID)
+	if _, ok := providerState(t, ad, "INBOX")[target]; !ok {
+		t.Fatalf("delivered message %s was not synced", target)
+	}
+
+	if err := ad.Apply(context.Background(), mail.Operation{
+		Kind: mail.OpMove, IDs: []mail.MessageID{target}, Target: trash,
+	}); err != nil {
+		t.Fatalf("move to trash: %v", err)
+	}
+	if _, ok := providerState(t, ad, "INBOX")[target]; ok {
+		t.Error("message is still in INBOX after the move")
+	}
+	if _, ok := providerState(t, ad, trash)[target]; !ok {
+		t.Errorf("message %s did not arrive in %s under the same identity", target, trash)
+	}
+}
+
 func TestLiveDeletionIsDetected(t *testing.T) {
 	// Every read here starts from an empty cursor, so this exercises the
 	// complete-listing path — the one servers without QRESYNC (GreenMail)
