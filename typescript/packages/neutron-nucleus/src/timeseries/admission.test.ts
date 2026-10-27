@@ -4,7 +4,7 @@ import { createClient } from '../client.js';
 import { withTimeSeries, withTimeSeriesProfile } from './index.js';
 import type { Transport, NucleusFeatures } from '../types.js';
 const features = { isNucleus: true, hasTimeSeries: true, version: 'Nucleus r5' } as NucleusFeatures;
-function endpoint(options: { endpoint?: string; writes?: boolean; version?: string; features?: string; bucket?: 'echo' | 'constant' } = {}) {
+function endpoint(options: { endpoint?: string; writes?: boolean; version?: string; features?: string | null; bucket?: 'echo' | 'constant' } = {}) {
   let writes = 0; let disposed = false;
   const points: { t: number; v: number }[] = [];
   const transport: Transport = {
@@ -18,7 +18,10 @@ function endpoint(options: { endpoint?: string; writes?: boolean; version?: stri
       assert.equal(disposed, false);
       let value: unknown;
       if (sql === 'SELECT VERSION()') value = options.version ?? 'Nucleus r5';
-      else if (sql === 'SELECT NUCLEUS_FEATURES()') value = options.features ?? '{"timeseries":true,"kv":true}';
+      else if (sql === 'SELECT NUCLEUS_FEATURES()') {
+        if (options.features === null) throw new Error('unknown function: NUCLEUS_FEATURES');
+        value = options.features ?? '{"timeseries":true,"kv":true}';
+      }
       else if (sql.includes('TIME_BUCKET')) value = options.bucket === 'echo' ? params[1] : options.bucket === 'constant' ? 0 : Math.floor(Number(params[1]) / Number(params[0])) * Number(params[0]);
       else if (sql.includes('TS_RANGE_COUNT')) value = points.filter(p => p.t >= Number(params[1]) && p.t < Number(params[2])).length;
       else if (sql.includes('TS_RANGE_AVG')) value = 4;
@@ -88,4 +91,14 @@ test('failed diagnostic namespace disposal never publishes a profile or retries 
   await assert.rejects(() => model.admissionProfile({ disposeDiagnosticNamespace: async () => { disposals++; throw cause; } }), error => error === cause);
   await assert.rejects(() => model.admissionProfile({ disposeDiagnosticNamespace: diagnostic.disposeNamespace }), error => error === cause);
   assert.equal(disposals, 1);
+});
+
+test('an engine without NUCLEUS_FEATURES() runs in-process diagnostics but cannot export a handoff profile', async () => {
+  const diagnostic = endpoint({ writes: true, features: null });
+  const { timeseries } = withTimeSeries.init(diagnostic.transport, features);
+  const evidence = await timeseries.probeCapabilities({ allowPersistentProbeWrites: true });
+  assert.equal(evidence.rangeFetch, true);
+  assert.equal((await timeseries.query('probe-free', new Date(0), new Date(1))).length, 0);
+  await assert.rejects(() => timeseries.admissionProfile({ disposeDiagnosticNamespace: diagnostic.disposeNamespace }), /NUCLEUS_FEATURES/);
+  assert.equal(diagnostic.disposed(), false);
 });

@@ -210,8 +210,18 @@ async function admissionIdentity(transport: Transport) {
   const endpoint = await transport.capabilityEndpoint?.();
   if (!endpoint) throw new NucleusNotSupportedError('Diagnostic handoff needs an explicit endpoint/auth identity');
   const version = await transport.fetchval<unknown>('SELECT VERSION()', [], { readOnly: true });
-  const raw = await transport.fetchval<unknown>('SELECT NUCLEUS_FEATURES()', [], { readOnly: true });
-  if (typeof version !== 'string' || !version.includes('Nucleus') || typeof raw !== 'string')
+  if (typeof version !== 'string' || !version.includes('Nucleus'))
+    throw new NucleusNotSupportedError('Diagnostic identity/version could not be verified');
+  // Engines without NUCLEUS_FEATURES() still give an endpoint/version identity
+  // for in-process diagnostics; only a profile handoff needs the fingerprint.
+  let raw: unknown;
+  try {
+    raw = await transport.fetchval<unknown>('SELECT NUCLEUS_FEATURES()', [], { readOnly: true });
+  } catch (error) {
+    if (!/unknown function:? nucleus_features/i.test(String((error as Error)?.message))) throw error;
+    return Object.freeze({ endpoint, version, capabilities: UNREPORTED_CAPABILITIES });
+  }
+  if (typeof raw !== 'string')
     throw new NucleusNotSupportedError('Diagnostic identity/version/features could not be verified');
   const features = JSON.parse(raw) as Record<string, unknown>;
   if (!features || Array.isArray(features) || typeof features !== 'object' || features.timeseries !== true)
@@ -219,6 +229,7 @@ async function admissionIdentity(transport: Transport) {
   const canonical = JSON.stringify(Object.entries(features).sort(([a], [b]) => a.localeCompare(b)));
   return Object.freeze({ endpoint, version, capabilities: createHash('sha256').update(canonical).digest('hex') });
 }
+const UNREPORTED_CAPABILITIES = 'unreported';
 function freezeEvidence(evidence: TimeSeriesModelEvidence): TimeSeriesModelEvidence {
   return Object.freeze({ ...evidence, checks: Object.freeze(evidence.checks.map(check => Object.freeze({ ...check }))) });
 }
@@ -349,6 +360,8 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
     this.require();
     if (this.exportedProfile) return this.exportedProfile;
     if (!this.evidence || !this.measuredIdentity) throw new NucleusNotSupportedError('Qualify diagnostics against endpoint identity before exporting a profile');
+    if (this.measuredIdentity.capabilities === UNREPORTED_CAPABILITIES)
+      throw new NucleusNotSupportedError('Explicit time-series capability identity is required for handoff; this engine does not report NUCLEUS_FEATURES()');
     const validForMs = options.validForMs ?? 300_000;
     if (!Number.isInteger(validForMs) || validForMs < 1 || validForMs > 86_400_000) throw new RangeError('validForMs must be 1..86400000');
     const evidence = freezeEvidence(await this.evidence);
