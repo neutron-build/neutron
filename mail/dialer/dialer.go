@@ -28,9 +28,12 @@ import (
 // credential that permitted it.
 func New() mail.Resolver { return NewWithGmailRefresh(nil) }
 
-// GmailRefresh renews a rejected access token using the application-owned
+// Refresh renews a rejected access token using the application-owned
 // credential store. It must honor ctx and must not create new grants.
-type GmailRefresh func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error)
+type Refresh func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error)
+
+// GmailRefresh is the Refresh used for Gmail reads.
+type GmailRefresh = Refresh
 
 // NewWithGmailRefresh permits one refresh/retry of a rejected Gmail GET.
 // Mutations never use this recovery path.
@@ -42,6 +45,12 @@ type Policy struct {
 	// discovery origin (a provider's separate download host, for one).
 	// Session metadata cannot authorize an origin by itself.
 	JMAPAllowedOrigins func(context.Context, mail.AccountID, mail.Credential) ([]string, error)
+
+	// GraphRefresh permits one refresh/retry of a rejected Graph GET, as the
+	// GmailRefresh argument does for Gmail. Without it an access token that
+	// expires during a long import fails the run as ErrReauthRequired.
+	// Mutations never use this recovery path.
+	GraphRefresh Refresh
 }
 
 // NewWithPolicy is NewWithGmailRefresh plus product-owned dial policy.
@@ -69,7 +78,7 @@ func NewWithPolicy(refresh GmailRefresh, policy Policy) mail.Resolver {
 		case mail.ProviderGmail:
 			return dialGmailAccount(ctx, acct, cred, refresh)
 		case mail.ProviderGraph:
-			return dialGraph(cred)
+			return dialGraphAccount(acct, cred, policy.GraphRefresh)
 		default:
 			return nil, nil, fmt.Errorf("mail: unsupported provider %q", cred.Provider)
 		}
@@ -128,7 +137,8 @@ func dialGmailAccount(ctx context.Context, acct mail.AccountID, cred mail.Creden
 	limiter := gmailLimiterFor(acct)
 	client := bearerClient(cred.AccessToken, gmailAPIHost)
 	if refresh != nil {
-		client.Transport = &gmailRefreshTransport{acct: acct, cred: cred, refresh: refresh,
+		client.Transport = &refreshTransport{acct: acct, cred: cred, refresh: refresh,
+			provider: mail.ProviderGmail, host: gmailAPIHost,
 			base: http.DefaultTransport, limiter: limiter, gate: make(chan struct{}, 1)}
 	}
 	ad, err := gmail.NewWithReadLimiter(ctx, limiter,
@@ -139,8 +149,16 @@ func dialGmailAccount(ctx context.Context, acct mail.AccountID, cred mail.Creden
 	return ad, func() { _ = ad.Close() }, nil
 }
 
-func dialGraph(cred mail.Credential) (mail.Adapter, func(), error) {
-	ad := graph.New(bearerClient(cred.AccessToken, "graph.microsoft.com"))
+const graphAPIHost = "graph.microsoft.com"
+
+func dialGraphAccount(acct mail.AccountID, cred mail.Credential, refresh Refresh) (mail.Adapter, func(), error) {
+	client := bearerClient(cred.AccessToken, graphAPIHost)
+	if refresh != nil {
+		client.Transport = &refreshTransport{acct: acct, cred: cred, refresh: refresh,
+			provider: mail.ProviderGraph, host: graphAPIHost,
+			base: http.DefaultTransport, gate: make(chan struct{}, 1)}
+	}
+	ad := graph.New(client)
 	return ad, func() { _ = ad.Close() }, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // discardLogger keeps expected-failure paths from spraying the test output.
@@ -39,8 +40,8 @@ type memStore struct {
 
 	// Staged scan state (audit SYNC-03): the double mirrors PgStore's
 	// mirror_scans/mirror_scan_seen, including the resume semantics.
-	scanSeq int64
-	scans   map[AccountID]map[MailboxID]*Scan
+	scanSeq  int64
+	scans    map[AccountID]map[MailboxID]*Scan
 	scanSeen map[ScanID]map[MessageID]bool
 	scanDone map[AccountID]map[int64]map[MailboxID]bool
 
@@ -63,7 +64,7 @@ func newMemStore() *memStore {
 		cursors:   map[AccountID]map[MailboxID]Cursor{},
 		scans:     map[AccountID]map[MailboxID]*Scan{},
 		scanSeen:  map[ScanID]map[MessageID]bool{},
-		scanDone: map[AccountID]map[int64]map[MailboxID]bool{},
+		scanDone:  map[AccountID]map[int64]map[MailboxID]bool{},
 	}
 }
 
@@ -1187,6 +1188,31 @@ func TestPrefetchDoesNotRefetchABodyItAlreadyHas(t *testing.T) {
 }
 
 func ptrEnvelope(e Envelope) *Envelope { return &e }
+
+// A body costs a provider request of its own, so the server prefetches only
+// recent mail: an old message's body waits until it is opened, and a message
+// with no date is treated as recent.
+func TestPrefetchSkipsMessagesOlderThanTheWindow(t *testing.T) {
+	eng, _, acct := setup(t)
+	eng.FetchBodies = true
+	eng.FetchBodiesWithin = 30 * 24 * time.Hour
+	recent, old, sentOnly, undated := envelope("recent", "INBOX"), envelope("old", "INBOX"), envelope("sent", "INBOX"), envelope("undated", "INBOX")
+	recent.ReceivedAt = time.Now().Add(-time.Hour)
+	old.ReceivedAt = time.Now().Add(-90 * 24 * time.Hour)
+	sentOnly.SentAt = time.Now().Add(-60 * 24 * time.Hour)
+	ad := &scriptedAdapter{
+		boxes: []Mailbox{{ID: "INBOX", Name: "INBOX", Role: RoleInbox}},
+		pages: []*Changes{{Changes: []Change{created(recent), created(old), created(sentOnly), created(undated)}, Next: "c"}},
+	}
+	if _, err := eng.SyncMailbox(context.Background(), acct, "INBOX", ad); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[MessageID]int{recent.ID: 1, old.ID: 0, sentOnly.ID: 0, undated.ID: 1} {
+		if got := ad.bodyCalls[id]; got != want {
+			t.Errorf("%s: %d body fetches, want %d", id, got, want)
+		}
+	}
+}
 
 // A provider that lists each message once per mailbox (Gmail, once per
 // label) used to cost one envelope fetch per appearance on import.
