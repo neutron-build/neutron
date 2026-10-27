@@ -162,7 +162,7 @@ jobs:
         working-directory: typescript
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @neutron-build/nucleus build
+          pnpm --filter "@neutron-build/nucleus..." build
 
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.sdk == 'rust'
@@ -252,7 +252,7 @@ jobs:
         working-directory: typescript
         run: |
           pnpm install --frozen-lockfile
-          pnpm --filter @neutron-build/nucleus build
+          pnpm --filter "@neutron-build/nucleus..." build
 
       # Elixir was deliberately not installed here while Postgrex could not
       # complete a connection at all — running 42 cases that all fail at connect

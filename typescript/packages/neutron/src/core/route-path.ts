@@ -11,6 +11,8 @@
  * NA-07).
  */
 
+import type { Route } from "./types.js";
+
 export type PathSegment =
   | { type: "static"; value: string }
   | { type: "param"; value: string; suffix: string }
@@ -126,4 +128,74 @@ export function normalizePathname(pathname: string): string | null {
   }
 
   return decoded;
+}
+
+export interface NotFoundMatch {
+  route: Route;
+  /** The scope's parameters for this URL (NA-07): `/org/acme/missing` under a
+   * `/org/:orgId` scope binds `orgId = "acme"`. */
+  params: Record<string, string>;
+}
+
+/**
+ * The not-found page covering `urlPath`, selected structurally.
+ *
+ * A scope is matched by binding its tokens against the URL (a dynamic scope
+ * like `/org/:orgId` used to be compared as a literal prefix, so it could
+ * never match its own subtree), and the winner is chosen by route structure —
+ * deeper first, then static over parameter over wildcard at each position —
+ * never by the character length of the pattern, which let a longer parameter
+ * name look "more specific" than a shorter one (NA-07).
+ */
+export function findNotFoundMatch(routes: Route[], urlPath: string): NotFoundMatch | null {
+  const segments = urlPath.split("/").filter(Boolean);
+  const candidates: NotFoundMatch[] = [];
+  for (const route of routes) {
+    if (!route.isNotFound) continue;
+    const params = bindPathParams(route.path, segments, true);
+    if (params !== null) candidates.push({ route, params });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => compareScopeSpecificity(a.route, b.route));
+  return candidates[0];
+}
+
+/** The literal suffix of a dynamic token; static tokens have none. */
+function suffixOf(token: PathSegment): string {
+  return token.type === "static" ? "" : token.suffix;
+}
+
+/**
+ * Structural specificity between two not-found scopes: deeper scopes first;
+ * at equal depth, compare tokens left to right with static before parameter
+ * before wildcard, and a longer literal suffix before a shorter one. Equal
+ * structures tie-break stably by route id so selection never depends on
+ * discovery order or parameter-name spelling.
+ */
+function compareScopeSpecificity(a: Route, b: Route): number {
+  const aa = parsePath(a.path);
+  const bb = parsePath(b.path);
+  if (aa.length !== bb.length) return bb.length - aa.length;
+  const rank = { static: 3, param: 2, wildcard: 1 } as const;
+  for (let i = 0; i < aa.length; i++) {
+    const delta = rank[bb[i].type] - rank[aa[i].type];
+    if (delta) return delta;
+    const aSuffix = suffixOf(aa[i]);
+    const bSuffix = suffixOf(bb[i]);
+    if (aSuffix.length !== bSuffix.length) return bSuffix.length - aSuffix.length;
+  }
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * The not-found page covering `urlPath`: the deepest one whose directory is a
+ * prefix of the request.
+ *
+ * Deepest wins so a section can present its own 404 — a miss under `/admin`
+ * should look like the admin app, not like the marketing site — while the root
+ * page still catches everything else. Retained as the route-only view of
+ * `findNotFoundMatch` for existing callers.
+ */
+export function findNotFoundRoute(routes: Route[], urlPath: string): Route | undefined {
+  return findNotFoundMatch(routes, urlPath)?.route;
 }

@@ -31,6 +31,9 @@ All notable changes to this project are documented in this file.
   boundaries and the client matcher implements server catch-all semantics;
   returned loader Responses close their spans; MDX `sanitize: true` refuses a
   custom render factory; ServerIsland props are JSON-escaped.
+- The runtime router no longer imports the build-time route manifest, which
+  pulled `@babel/parser` and `node:fs` into every server bundle, edge presets
+  included (about 17 KB gzipped).
 - Security: rate-limit buckets survive quota reset, CSRF origin comparison is
   scheme-aware, trusted-proxy mode ignores unverifiable vendor identity headers.
 - Data layer (TSD-01..14): cursor decode failures release their connection;

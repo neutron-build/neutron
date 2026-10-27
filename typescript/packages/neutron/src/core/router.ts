@@ -1,5 +1,4 @@
-import { findNotFoundMatch } from "./manifest.js";
-import { parsePath, bindPathParams, parseUrlPath } from "./route-path.js";
+import { parsePath, bindPathParams, parseUrlPath, findNotFoundMatch } from "./route-path.js";
 import type { Route, RouteMatch } from "./types.js";
 
 interface TrieNode {
