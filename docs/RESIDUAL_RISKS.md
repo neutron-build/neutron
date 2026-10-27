@@ -267,6 +267,30 @@ and its proposed root cause was disproved.
 
 ---
 
+## 17. The engine has no `NUCLEUS_FEATURES()`, so time-series admission cannot be handed off
+
+The TypeScript SDK (`@neutron-build/nucleus` 0.3.0) admits `timeseries.query`
+only after write diagnostics prove `TS_RANGE` exact on the engine, and fences
+that evidence with an identity of endpoint, version and the engine's reported
+feature set. The engine does not implement `NUCLEUS_FEATURES()` (no match in
+`nucleus/src`; it answers `unknown function`). Since 2026-10-26 the SDK
+records the feature set as unreported in that case: in-process diagnostics
+work, but `admissionProfile()` refuses to export a handoff profile, so a
+diagnostic connection cannot qualify a separate read-only production one.
+Feature detection elsewhere (`features.ts`, the other SDKs) already treats the
+missing function as "all models enabled".
+
+Established by the live conformance run (`conformance/live`,
+`timeseries.range_query`) and
+`typescript/packages/neutron-nucleus/src/timeseries/admission.test.ts`.
+
+**If this matters to you:** run time-series diagnostics on the connection
+that will query, or implement `NUCLEUS_FEATURES()` in the engine (a JSON
+object of model flags, `timeseries` included), which lifts the refusal
+without SDK changes.
+
+---
+
 ## How to read the absence of an entry
 
 This register covers the areas that have been audited. It is not a proof that
