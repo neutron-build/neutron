@@ -230,6 +230,46 @@ function notFoundDocument(message: string): string {
 }
 
 /**
+ * True when the request's `Accept` header prefers an HTML response — the
+ * signal the SSR server uses to decide between an HTML page and a
+ * machine-readable error document for its default (no `not-found.tsx`) 404.
+ *
+ * An HTML type (`text/html`, `application/xhtml+xml`) must be accepted with a
+ * non-zero quality factor AND not be outranked by any other explicitly
+ * accepted type. A browser's Accept (HTML first, the catch-all wildcard at
+ * `q=0.8`) says yes; `application/json`, a wildcard-only Accept,
+ * `text/html;q=0` and a missing header all say no. Wildcard subtype ranges
+ * like `text/*` are deliberately not treated as HTML — only an explicit HTML
+ * preference earns the HTML page.
+ */
+export function acceptsHtml(request: Request): boolean {
+  const accept = request.headers.get("accept") || "";
+  let htmlQ = 0;
+  let otherMaxQ = 0;
+  for (const item of accept.split(",")) {
+    const [rawType, ...params] = item.split(";");
+    const type = rawType.trim().toLowerCase();
+    if (!type) {
+      continue;
+    }
+    let q = 1;
+    for (const param of params) {
+      const [key, ...rest] = param.trim().split("=");
+      if (key.trim().toLowerCase() === "q") {
+        const parsed = Number(rest.join("="));
+        q = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 1) : 0;
+      }
+    }
+    if (type === "text/html" || type === "application/xhtml+xml") {
+      htmlQ = Math.max(htmlQ, q);
+    } else {
+      otherMaxQ = Math.max(otherMaxQ, q);
+    }
+  }
+  return htmlQ > 0 && htmlQ >= otherMaxQ;
+}
+
+/**
  * True for any Fetch `Response`, whichever `Response` constructor made it.
  *
  * `instanceof Response` is not enough on Node: `@hono/node-server` replaces

@@ -17,7 +17,7 @@ import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
-import { isResponse } from "../core/response.js";
+import { isResponse, notFound, acceptsHtml } from "../core/response.js";
 import { createRouter } from "../core/router.js";
 import { installTransportPeer } from "./peer.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./health.js";
@@ -848,7 +848,7 @@ export async function createServer(
             });
           }
         }
-        return finalize(c.text("Not Found", 404));
+        return finalize(defaultNotFoundResponse(c.req.raw, originalPathname));
       }
 
       // A non-app route that reached here was not answered from dist, and
@@ -863,7 +863,10 @@ export async function createServer(
         match.route.file.includes("_layout") ||
         (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw) && !gated)
       ) {
-        return finalize(c.text("Not Found", 404), {
+        // Same content-negotiated default as an unmatched path: a static
+        // route whose file is missing from dist is still a 404 a human or a
+        // machine will read.
+        return finalize(defaultNotFoundResponse(c.req.raw, originalPathname), {
           routeId: match.route.id,
           routePath: match.route.path,
           routeMode: match.route.config.mode,
@@ -1974,6 +1977,29 @@ function createRequestId(): string {
 
   requestCounter += 1;
   return `req-${Date.now()}-${requestCounter}`;
+}
+
+/**
+ * The SSR catch-all's default 404 — what an unmatched path gets when the app
+ * ships no `not-found.tsx` (or that page failed to render). Content-negotiated:
+ *
+ * - HTML-preferring clients (`Accept: text/html`, i.e. browsers) get the same
+ *   minimal HTML shell `notFound()` has always served — a human-facing SSR app
+ *   answering "Not Found" as bare text/plain is not a page.
+ * - Everything else — JSON clients (`X-Neutron-Data`, `Accept:
+ *   application/json`), no preference at all, a wildcard-only Accept — gets
+ *   the RFC 7807 problem document in the exact shape api mode serves, so
+ *   machines see the contract error and the client router never receives
+ *   HTML it must parse.
+ *
+ * A user `not-found.tsx` still wins for every client: this runs only when
+ * there is nothing of the app's to render. FRAMEWORK_CONTRACT.md §2.
+ */
+function defaultNotFoundResponse(request: Request, pathname: string): Response {
+  if (!isJsonRequest(request) && acceptsHtml(request)) {
+    return notFound();
+  }
+  return notFoundError(`No route matches ${pathname}`).toResponse(pathname);
 }
 
 
