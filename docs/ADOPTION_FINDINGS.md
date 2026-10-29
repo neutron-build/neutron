@@ -856,6 +856,17 @@ configuration (`useChartWidth` -> `useContext` from `XAxisImpl`) and Preact's
 hooks require a current component. The workaround — render charts client-only,
 as an island — is in the row.
 
+**Correction, 2026-10-29.** The recharts diagnosis above was wrong, and the
+matrix now records the opposite. recharts 2.15.4 server-renders completely
+under preact/compat; the recorded failure was the harness loading two preact
+instances — recharts' CJS lib build required `react` through the shim's CJS
+entry, and hooks called on that second instance never see a component, which
+is what `useChartWidth`'s `useContext` was actually hitting. The recharts row
+was never evidence about recharts. `compat-matrix/node-hooks.mjs` now forces
+every preact resolution onto the one ESM instance (the guarantee a bundler
+gives implicitly); the same artifact had been failing `@tiptap/react` and
+`@xyflow/react` on `__H` of undefined until that fix.
+
 A row says yes only if the render produced the markup it should. Empty output
 counts as a failure, because that is how a compat problem usually hides; the
 harness caught exactly that on its first run, though that one turned out to be

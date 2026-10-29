@@ -31,7 +31,7 @@ export default defineConfig({
 | React component model (JSX, hooks, context, memo, refs) | Supported | Via `preact/compat` aliases. |
 | App routing/loaders/actions in Neutron | Supported | Same runtime APIs in both modes. |
 | Client navigation/forms/hydration | Supported | Covered by runtime-compat smoke lane. |
-| Common React libraries that depend on public React APIs | **Tested per package** | See the [compatibility matrix](./react-compat-matrix.md) — real packages, server-rendered, 12 of 13 currently render. |
+| Common React libraries that depend on public React APIs | **Tested per package** | See the [compatibility matrix](./react-compat-matrix.md) — real packages, server-rendered, 28 of 29 currently render. |
 | Libraries depending on private React internals | Not guaranteed | May fail with `preact/compat`. |
 | React Server Components / Next.js RSC model | Not supported | Out of scope for Neutron runtime. |
 
