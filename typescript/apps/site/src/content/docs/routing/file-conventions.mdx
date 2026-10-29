@@ -42,3 +42,31 @@ To match all remaining path segments, use the rest syntax `[...]`.
 ## Escaping
 
 If you need a route to actually include brackets in the URL, you likely need to rethink your URL structure, as this is reserved syntax.
+
+## Resource Routes
+
+A route module that exports HTTP method handlers instead of a component is served as an **endpoint**, not a page. This is how an SSR app carries JSON/REST/SSE endpoints in the same server and route table as its pages — no second process.
+
+```ts
+// src/routes/api/time.ts  →  GET /api/time
+export async function GET() {
+  return { now: new Date().toISOString() };
+}
+
+// src/routes/api/users/[id].ts  →  POST /api/users/123
+export async function POST({ params, request }) {
+  const body = await request.json();
+  return Response.json({ id: params.id, body }, { status: 201 });
+}
+```
+
+The rules:
+
+- **Exports**: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD` — and **no default component**. A module with both is a build error ("exports both a default component and HTTP method handlers"): the page pipeline renders the component and would never dispatch the handlers, so the framework refuses the ambiguity.
+- **Return values**: a `Response` is answered verbatim; any other value is serialized as JSON (`200`). Throwing a `ProblemError` or a `Response` works like it does in loaders.
+- **Method mismatch**: a request whose method has no handler gets `405` as RFC 7807 `application/problem+json` with an `Allow` header. `HEAD` is implicitly supported wherever `GET` is.
+- **Middleware**: route and layout `middleware` exports, plus the global `src/middleware.ts`, run around every request in the usual order — so an endpoint can be auth-gated, including through a parent layout. Loaders never run for resource routes.
+- **Never prerendered**: a resource route produces no static file at build time; it answers per request even in `mode: "static"` (the default). Because nothing is prebuilt, gating it is legal — unlike a gated static page, there is no prerendered file that could bypass the gate.
+- **Server-only**: handler code is stripped from the client build and resource routes are excluded from the client route table entirely — nothing an endpoint exports ships to the browser.
+
+Need a whole Hono sub-app (e.g. tRPC) at one prefix instead of per-file routes? Use the server's `mount` option.

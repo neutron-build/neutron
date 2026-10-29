@@ -53,3 +53,29 @@ export default defineConfig({
 | `vite` | `UserConfig` | Vite configuration object. Merged with Neutron's defaults. |
 | `routesDir` | `string` | Path to the routes directory. Default: `"src/routes"`. |
 | `features` | `object` | Toggle experimental features. |
+
+## Server
+
+`server` configures the production server (`createServer` in `@neutron-build/core/server`). `neutron-ts start` and `preview` forward it wholesale. Two options matter for apps that serve an API next to their pages:
+
+```ts
+import { defineConfig } from "@neutron-build/core";
+
+export default defineConfig({
+  server: {
+    // Mount a Hono sub-app at a prefix, in-process: REST, SSE, tRPC.
+    // Registered before the HTML catch-all and after the framework's own
+    // routes (/health, assets, …), so neither can shadow the other.
+    mount: {
+      "/api": myHonoApp, // any Hono instance
+    },
+
+    // Attach a WebSocket server to the same HTTP server (default off).
+    websocket: true,
+  },
+});
+```
+
+Mount prefixes are validated at startup: two mounts may not overlap, and a prefix may not cover a reserved framework path (`/health`, `/openapi.json`, `/docs`, `/_neutron/image`, `/__neutron_island`, `/assets`, `/public`) — the server refuses to start with an error naming the conflict. A request under a mounted prefix that the sub-app does not match falls through to the app's routes, so a mount adds endpoints without claiming the namespace.
+
+When your API is a handful of per-file endpoints rather than a sub-app, prefer [resource routes](/docs/routing/file-conventions#resource-routes) — route modules exporting `GET`/`POST`/… handlers, served through the same middleware chain as pages.
