@@ -6,6 +6,7 @@ import {
   isJsonRequest,
   isMutationMethod,
   toError,
+  type RouteRenderer,
 } from "../core/render-app-route.js";
 import * as path from "node:path";
 import { serve, type ServerType } from "@hono/node-server";
@@ -54,10 +55,12 @@ import {
   type NeutronOpenApiOptions,
 } from "./openapi.js";
 import { assertRenderedFragment, decodeChunkStart } from "../core/fragment-guard.js";
+import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
 import { neutronPlugin } from "../vite/plugin.js";
 import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
   type NeutronImageConfig,
   type NeutronRoutesConfig,
   type NeutronRuntime,
@@ -332,6 +335,14 @@ export interface NeutronServerHooks {
 
 interface SsrServer {
   ssrLoadModule: (id: string) => Promise<unknown>;
+  /**
+   * The renderer pair resolved through the SAME module graph as the route
+   * modules (see RouteRenderer in core/render-app-route.ts). Every render
+   * leg — streaming, buffered, error boundary, provider mounting — runs on
+   * this pair, so app hooks and the renderer always share one Preact
+   * `options` object.
+   */
+  renderer: RouteRenderer;
   close: () => Promise<void>;
 }
 
@@ -1237,7 +1248,9 @@ async function handleAppRouteRequest(
   }
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
-  // Vite SSR runtime, then hand the loaded map to the shared render core.
+  // Vite SSR runtime, then hand the loaded map to the shared render core —
+  // together with the runtime's renderer pair, resolved through the SAME
+  // graph so hooks and renderer share one Preact instance.
   const allRoutes = [...match.layouts, match.route];
   const routeModules = new Map<string, RouteModule>();
   await Promise.all(
@@ -1254,6 +1267,7 @@ async function handleAppRouteRequest(
     globalMiddleware,
     responseCache,
     loaderCacheFence,
+    renderer: ssrServer.renderer,
   });
 }
 
@@ -1867,6 +1881,13 @@ function tryReadStaticHtml(distDir: string, pathname: string): string | null {
   return null;
 }
 
+/**
+ * Deps that must stay EXTERNAL under the react-compat blanket
+ * `noExternal: true` — see {@link RUNTIME_RUNNER_CJS_EXTERNALS} in
+ * config.ts (single source; dev composes the same list).
+ */
+const RUNNER_CJS_EXTERNALS: readonly string[] = RUNTIME_RUNNER_CJS_EXTERNALS;
+
 async function createSsrServer(
   rootDir: string,
   routesDir: string,
@@ -1883,6 +1904,13 @@ async function createSsrServer(
     const userConfig = loadedConfig?.config || {};
     const runtimeAliases = resolveRuntimeAliases(runtime);
     const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
+    // One physical Preact graph for the SSR runner, app copy first: the
+    // aliases make preact-render-to-string (and its /stream subpath — a bare
+    // root alias would prefix-match it onto a non-file) resolvable even when
+    // the app declares only `preact`, and pin react-family ids onto absolute
+    // preact/compat files for react-compat. Same composition dev/build use.
+    const preactSsr = resolvePreactSsr(rootDir);
+    const preactAliases = vitePreactAliases(preactSsr, runtimeAliases);
     const viteServer = await vite.createServer(
       vite.mergeConfig(userConfig, {
         root: rootDir,
@@ -1891,25 +1919,28 @@ async function createSsrServer(
         // then clear one another's optimizer cache during concurrent startup.
         cacheDir: userConfig.cacheDir ?? path.join(rootDir, ".neutron", "vite-ssr"),
         plugins: [neutronPlugin({ routesDir })],
-        ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
+        resolve: { alias: preactAliases },
         // react-compat: process the whole APP dependency graph (see
         // resolveRuntimeNoExternal) — externalized deps natively resolve
-        // real React next to preact-render-to-string and crash at render.
-        // @neutron-build/core stays EXTERNAL (its pre-change status here):
-        // this production module-runner has no deps optimizer, and forcing
-        // core into the runner drags its CJS chain (mdx → acorn-jsx …)
-        // into ESM evaluation ("require is not defined"). External, core
-        // loads natively and shares the app's single preact copy.
+        // REAL React next to preact-render-to-string and crash at render.
+        // @neutron-build/core is no longer the exception it once was: core
+        // now runs IN the SSR graph with only its CJS-only deps (see
+        // RUNNER_CJS_EXTERNALS) kept native. Two reasons, same root cause —
+        // one Preact `options` object for the whole request render:
+        //   1. core's hooks (useLocation, useLoaderData, …) must come from
+        //      the app's graph, or they crash/see defaults under the
+        //      app-graph renderer (react hooks crash the other way around).
+        //   2. the renderer itself is loaded through the same graph below.
+        // `ssr.external` in vite.config.ts still opts individual deps back
+        // out (Vite checks external before noExternal).
         ...(runtimeNoExternal === true
           ? {
               ssr: {
                 noExternal: true,
-                external: ["@neutron-build/core"],
+                external: [...RUNNER_CJS_EXTERNALS],
               },
             }
-          : runtimeNoExternal.length > 0
-            ? { ssr: { noExternal: runtimeNoExternal } }
-            : {}),
+          : {}),
         server: {
           middlewareMode: true,
           // Production only loads modules through this instance. Without
@@ -1925,8 +1956,19 @@ async function createSsrServer(
       })
     );
 
+    const ssrLoadModule = (id: string) => viteServer.ssrLoadModule(id);
+    // Resolve the renderer THROUGH the runner, exactly the way route modules
+    // are loaded: same graph, same Preact instance. Under react-compat the
+    // preact family is runner-evaluated (blanket noExternal), so the renderer
+    // must be too; under preact the same legs return the externalized native
+    // modules the routes already share. A native fallback would bind a
+    // second options object and crash hooks with "reading '__H'" — the
+    // A-011 / Gap 5 split-graph bug class.
+    const renderer = await loadRunnerRenderer(ssrLoadModule);
+
     return {
-      ssrLoadModule: (id: string) => viteServer.ssrLoadModule(id),
+      ssrLoadModule,
+      renderer,
       close: () => viteServer.close(),
     };
   } catch (error) {
@@ -1938,9 +1980,76 @@ async function createSsrServer(
   }
 }
 
+/**
+ * Renderer pair from the Vite SSR graph: the same modules route components
+ * import, evaluated by the same runner. Includes the router provider mount
+ * (`withRouterProviders`) so providers and their consumers are created from
+ * one module instance — a Provider/consumer pair from two instances silently
+ * returns the context DEFAULT (A-011's wrong-branch failure mode).
+ */
+async function loadRunnerRenderer(
+  ssrLoadModule: (id: string) => Promise<unknown>
+): Promise<RouteRenderer> {
+  const preact = (await ssrLoadModule("preact")) as {
+    h?: RouteRenderer["h"];
+  };
+  const rts = (await ssrLoadModule("preact-render-to-string")) as {
+    renderToString?: RouteRenderer["renderToString"];
+    default?: { renderToString?: RouteRenderer["renderToString"] };
+  };
+  const renderToString = rts.renderToString ?? rts.default?.renderToString;
+  if (!preact.h || !renderToString) {
+    throw new Error(
+      "[Neutron] preact / preact-render-to-string not resolvable through the SSR graph. " +
+        "Ensure the start server applies resolvePreactSsr aliases."
+    );
+  }
 
+  // Streaming renderer — optional: an older preact-render-to-string without
+  // the subpath falls back to buffered rendering.
+  let renderToReadableStream: RouteRenderer["renderToReadableStream"];
+  try {
+    const streamModule = (await ssrLoadModule("preact-render-to-string/stream")) as {
+      renderToReadableStream?: RouteRenderer["renderToReadableStream"];
+      default?: { renderToReadableStream?: RouteRenderer["renderToReadableStream"] };
+    };
+    renderToReadableStream =
+      streamModule.renderToReadableStream ??
+      streamModule.default?.renderToReadableStream;
+  } catch {
+    renderToReadableStream = undefined;
+  }
 
+  // Provider mount from the app's graph (contexts match consumers by module
+  // instance, not by shape). Loaded via the ROOT package id: import-only
+  // subpaths in package "exports" fail the runner's external resolution
+  // (require conditions), and the root id loads in every runtime shape —
+  // native/external under preact, in-graph under react-compat.
+  let providers: RouteRenderer["withRouterProviders"];
+  try {
+    const client = (await ssrLoadModule("@neutron-build/core")) as {
+      withRouterProviders?: RouteRenderer["withRouterProviders"];
+    };
+    providers = client.withRouterProviders;
+  } catch {
+    providers = undefined;
+  }
+  if (!providers) {
+    console.warn(
+      "[Neutron] withRouterProviders not resolvable through the SSR graph; " +
+        "falling back to core's own provider mount. Context hooks " +
+        "(useLocation, useLoaderData, …) may read default values when core " +
+        "and the app do not share one module graph."
+    );
+  }
 
+  return {
+    h: preact.h,
+    renderToString,
+    renderToReadableStream,
+    ...(providers ? { withRouterProviders: providers } : {}),
+  };
+}
 
 
 

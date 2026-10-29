@@ -8,8 +8,15 @@ import { execFile } from "node:child_process";
 import { createServer as createViteServer, build as viteBuild } from "vite";
 import * as net from "node:net";
 import { resolvePreactSsr, vitePreactAliases } from "./preact-ssr.js";
-import { resolveRuntimeAliases, resolveRuntimeNoExternal } from "../config.js";
+import {
+  resolveRuntimeAliases,
+  resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
+} from "../config.js";
 import { createServer as createNeutronServer } from "../server/index.js";
+import { renderAppRoute } from "./render-app-route.js";
+import type { Route, RouteMatch, RouteModule } from "./types.js";
+import type { NeutronLoaderCacheStore } from "../server/cache-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -182,15 +189,10 @@ function makeStartShapeApp(): string {
   fs.mkdirSync(path.join(root, "src", "routes"), { recursive: true });
   // Plain h() (no JSX) so the fixture needs no tsconfig/jsx setup. The
   // route imports BOTH the react lib and @neutron-build/core's ROOT index:
-  // core's re-exports pull its CJS chain (content/mdx), which the
-  // production module-runner cannot evaluate — createSsrServer must keep
-  // core external while blanket-processing the app's react graph.
-  //
-  // The component itself is hook-free: `start`'s streaming renderer
-  // (core-side preact-render-to-string/stream) does not install a compat
-  // hooks context — a separate, pre-existing react-compat gap outside
-  // these fixes' scope (hooks render fine through dev and build, where
-  // the renderer is loaded through the same Vite graph).
+  // core runs IN the SSR graph (its CJS-only deps stay external — see
+  // RUNNER_CJS_EXTERNALS in server/index.ts), so core hooks share the app's
+  // Preact instance while the blanket-processed react graph stays aliased
+  // onto preact/compat.
   fs.writeFileSync(
     path.join(root, "src", "routes", "index.ts"),
     [
@@ -210,6 +212,51 @@ function makeStartShapeApp(): string {
       "export default function Page({ data }) {",
       "  return h(\"span\", { \"data-variant\": data.session ? \"app\" : \"marketing\" },",
       "    \"react:\" + data.react);",
+      "}",
+      "",
+    ].join("\n")
+  );
+  return root;
+}
+
+/**
+ * The start shape with HOOK-bearing components — the Gap 5 surface.
+ *
+ * `start`'s renderAppRoute renders with core-side preact /
+ * preact-render-to-string(stream) while react-compat route modules get their
+ * Preact through the app's SSR graph: two Preact instances, two `options`
+ * objects, so the renderer never installs a hooks context for the component's
+ * hooks — `useState` crashes with "reading '__H'" (same split-graph class as
+ * A-011; see core/preact-ssr.ts). One route uses a react hook, one a core
+ * hook (useLocation): both hook families must render through the same fix.
+ */
+function makeHooksStartShapeApp(): string {
+  const root = makeStartShapeApp();
+  fs.writeFileSync(
+    path.join(root, "src", "routes", "counter.ts"),
+    [
+      'import { createElement, useState } from "react";',
+      "",
+      'export const config = { mode: "app" };',
+      "",
+      "export default function Counter() {",
+      "  const [count] = useState(7);",
+      '  return createElement("span", { "data-hook": "counter" }, "count:" + count);',
+      "}",
+      "",
+    ].join("\n")
+  );
+  fs.writeFileSync(
+    path.join(root, "src", "routes", "location.ts"),
+    [
+      'import { createElement } from "react";',
+      'import { useLocation } from "@neutron-build/core";',
+      "",
+      'export const config = { mode: "app" };',
+      "",
+      "export default function Where() {",
+      "  const { pathname } = useLocation();",
+      '  return createElement("span", { "data-hook": "location" }, "at:" + pathname);',
       "}",
       "",
     ].join("\n")
@@ -247,7 +294,12 @@ function composeRuntimeSsrConfig(root: string) {
       alias: vitePreactAliases(preactSsr, runtimeAliases),
       dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
     },
-    ssr: { noExternal },
+    // Same externals createSsrServer composes under blanket noExternal:
+    // core runs IN the graph, its CJS-only subtree tops stay native.
+    ssr:
+      runtimeNoExternal === true
+        ? { noExternal, external: [...RUNTIME_RUNNER_CJS_EXTERNALS] }
+        : { noExternal },
   };
 }
 
@@ -387,7 +439,7 @@ describe("react-compat SSR through the Vite graph", () => {
     expect(html).toContain('data-echo="spike"');
   });
 
-  it("start shape: createServer renders a react lib + core-importing app route (core stays external)", async () => {
+  it("start shape: createServer renders a react lib + core-importing app route (core in-graph)", async () => {
     const root = makeStartShapeApp();
     const port = await getFreePort();
     const server = await createNeutronServer({
@@ -401,11 +453,11 @@ describe("react-compat SSR through the Vite graph", () => {
     const base = `http://127.0.0.1:${port}`;
 
     try {
-      // The route imports @neutron-build/core's ROOT index: if
-      // createSsrServer stops keeping core external under react-compat,
-      // Vite's production module-runner evaluates core's CJS chain
-      // (mdx → acorn-jsx) as ESM and this route 500s with
-      // "require is not defined".
+      // The route imports @neutron-build/core's ROOT index: core runs IN the
+      // Vite SSR graph under react-compat (only its CJS-only deps stay
+      // external, see RUNNER_CJS_EXTERNALS) — if that externals set drifts,
+      // the module-runner evaluates e.g. @mdx-js/mdx → style-to-js as ESM
+      // and this route 500s with "require is not defined".
       // The loader runs INSIDE the Vite graph, so reactVersion() reports
       // preact/compat's React-shaped version string ("18.3.1"), never the
       // real react the externals policy would hand it (19.2.4) — asserted
@@ -435,6 +487,157 @@ describe("react-compat SSR through the Vite graph", () => {
       });
       expect(data.status).toBe(200);
       expect(data.headers.get("content-type")).toContain("application/json");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("start shape: per-request SSR renders a react hook component (no '__H' split)", async () => {
+    const root = makeHooksStartShapeApp();
+    const port = await getFreePort();
+    const server = await createNeutronServer({
+      mode: "ssr",
+      runtime: "react-compat",
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      // Before the fix this 500s: the streaming renderer (core-side RTS) and
+      // the component's useState (app-graph compat hooks) bind two different
+      // Preact `options` objects, so getHookState reads currentComponent ===
+      // null and throws "Cannot read properties of null (reading '__H')".
+      const res = await fetch(`${base}/counter`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('data-hook="counter"');
+      expect(html).toContain("count:7");
+      expect(html).not.toContain("__H");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("start shape: core hooks (useLocation) render through the same per-request path", async () => {
+    const root = makeHooksStartShapeApp();
+    const port = await getFreePort();
+    const server = await createNeutronServer({
+      mode: "ssr",
+      runtime: "react-compat",
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      // useLocation comes from external core (native Preact hooks). Whatever
+      // graph the renderer resolves to, BOTH hook families — the app's react
+      // hooks and core's own context hooks — must land on the ONE options
+      // object the renderer drives, or one family crashes with the same
+      // "reading '__H'" class. A-011's providers must feed it, too.
+      const res = await fetch(`${base}/location`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('data-hook="location"');
+      expect(html).toContain("at:/location");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("start shape: buffered compose renders hook components when no streaming renderer resolves", async () => {
+    const root = makeHooksStartShapeApp();
+    const composed = composeRuntimeSsrConfig(root);
+    const server = await createViteServer({
+      configFile: false,
+      root,
+      logLevel: "error",
+      resolve: composed.resolve,
+      ssr: composed.ssr,
+      server: { middlewareMode: true, hmr: false, ws: false, fs: { strict: false } },
+      optimizeDeps: { noDiscovery: true },
+      appType: "custom",
+    });
+
+    const noopLoaderCache: NeutronLoaderCacheStore = {
+      async get() {
+        return null;
+      },
+      async set() {},
+      async deleteByPath() {},
+      async clear() {},
+    };
+    const route = {
+      id: "counter",
+      path: "/counter",
+      file: "src/routes/counter.ts",
+      config: { mode: "app" },
+    } as Route;
+    const match: RouteMatch = { route, params: {}, layouts: [] };
+
+    try {
+      const mod = (await server.ssrLoadModule(
+        path.join(root, "src", "routes", "counter.ts")
+      )) as RouteModule;
+      const runnerPreact = (await server.ssrLoadModule("preact")) as {
+        h: typeof import("preact").h;
+      };
+      const runnerRts = (await server.ssrLoadModule("preact-render-to-string")) as {
+        renderToString?: typeof import("preact-render-to-string").renderToString;
+        default?: {
+          renderToString?: typeof import("preact-render-to-string").renderToString;
+        };
+      };
+      const bufferedRender = runnerRts.renderToString ?? runnerRts.default?.renderToString;
+      expect(bufferedRender).toBeTypeOf("function");
+
+      // The provider mount must be resolvable through the same graph —
+      // contexts match consumers by module instance, not shape (A-011).
+      const runnerCore = (await server.ssrLoadModule("@neutron-build/core")) as {
+        withRouterProviders?: unknown;
+      };
+      expect(runnerCore.withRouterProviders).toBeTypeOf("function");
+
+      // Counterfactual — why the renderer opt exists: with core's own static
+      // pair (the pre-fix behavior for every host), the runner-loaded
+      // component's hooks never see a hooks context and the render 500s
+      // with the documented "__H" crash.
+      const split = await renderAppRoute(
+        new Request("http://start.test/counter"),
+        match,
+        new Map<string, RouteModule>([["counter", mod]]),
+        {
+          clientEntryScriptSrc: null,
+          loaderDataCache: noopLoaderCache,
+          requestTrace: { requestId: "t", method: "GET", pathname: "/counter" },
+        }
+      );
+      expect(split.status).toBe(500);
+      expect(await split.text()).toContain("__H");
+
+      // The buffered leg: same graph-resolved pair, no streaming renderer.
+      // renderAppRoute must fall back to the buffered compose ON THAT PAIR
+      // (not on core's static import) and render the hook component.
+      const response = await renderAppRoute(
+        new Request("http://start.test/counter"),
+        match,
+        new Map<string, RouteModule>([["counter", mod]]),
+        {
+          clientEntryScriptSrc: null,
+          loaderDataCache: noopLoaderCache,
+          requestTrace: { requestId: "t", method: "GET", pathname: "/counter" },
+          renderer: { h: runnerPreact.h, renderToString: bufferedRender! },
+        }
+      );
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain('data-hook="counter"');
+      expect(html).toContain("count:7");
     } finally {
       await server.close();
     }

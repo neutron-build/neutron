@@ -57,6 +57,15 @@ An app cannot narrow the default back to an array — Vite's `mergeConfig`
 collapses `ssr.noExternal` to `true` when either side is `true` — so
 `ssr.external` is the escape hatch.
 
+`dev` and `start` themselves use that escape hatch for a fixed set of
+framework deps: `@mdx-js/mdx`, `gray-matter`, `yaml` and `@babel/parser`
+(CommonJS-only subtree tops in `@neutron-build/core`'s import graph — the
+runner cannot evaluate them, see the limit below). Keeping exactly those
+native lets **`@neutron-build/core` itself run inside the SSR graph**, which
+is what puts the framework's own hooks (`useLocation`, `useLoaderData`, …)
+and your React hooks on one Preact instance during per-request SSR. Your own
+`ssr.external` entries merge with (do not replace) that list.
+
 One known limit, stated plainly: a **CommonJS-only** dependency cannot be
 processed by Vite's SSR module runner (`neutron-ts start`, and static
 prerendering) — it fails loudly with `require is not defined`. `dev` is

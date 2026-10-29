@@ -14,6 +14,7 @@ import {
   resolveRuntimeNoExternal,
   resolvePreactSsr,
   vitePreactAliases,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
 } from "@neutron-build/core";
 import { onShutdownSignal } from "@neutron-build/core/server";
 import { loadNeutronConfig } from "../lib/config.js";
@@ -118,14 +119,16 @@ export async function dev(): Promise<void> {
         // react-compat processes EVERYTHING else (`true`): an externalized
         // dep natively imports real React next to preact and crashes at
         // render (resolveRuntimeNoExternal documents the tradeoff + the
-        // ssr.external out). core is the deliberate exception under
-        // react-compat: blanket-true disables the dev deps optimizer, and
-        // core's CJS chain (content/mdx) then fails with "require is not
-        // defined"; external, core loads natively — the same shape the
-        // start server has always used.
+        // ssr.external out). core stays IN the graph there too — the same
+        // shape the start server composes — with only its CJS-only deps
+        // kept native (RUNTIME_RUNNER_CJS_EXTERNALS, single source in core's
+        // config.ts). That keeps core's context hooks (useLocation, …) on
+        // the app's Preact instance instead of a second native one.
         noExternal:
           runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
-        ...(runtimeNoExternal === true ? { external: ["@neutron-build/core"] } : {}),
+        ...(runtimeNoExternal === true
+          ? { external: [...RUNTIME_RUNNER_CJS_EXTERNALS] }
+          : {}),
       },
       optimizeDeps: {
         // Force the client optimizer to pre-bundle the same absolute entries
