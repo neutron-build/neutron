@@ -24,6 +24,47 @@ export default defineConfig({
 });
 ```
 
+## SSR and your dependency graph
+
+Under `react-compat`, every command that builds or serves an SSR graph —
+`dev`, `build` (static prerender and the runtime bundle) and `start` —
+processes **all** `node_modules` dependencies through Vite
+(`ssr.noExternal: true`), not just the `react*` alias targets. This is a
+correctness requirement, not a preference: an SSR-*externalized* dependency
+resolves its own `react` import through native Node, loading real React
+next to `preact-render-to-string` — hooks then crash at render time
+(observed with Radix: `Cannot read properties of null (reading 'useRef')`).
+Which dependencies import react cannot be predicted from package names, so
+the default covers all of them.
+
+The cost is real and accepted knowingly: the SSR runtime bundle inlines the
+whole reachable dependency graph (larger output, longer builds), and dev SSR
+transforms each dependency once on first request (cached afterwards). If
+you need a specific heavy package to stay external — a database driver that
+must not be bundled, for example — list it in your `vite.config.ts`:
+
+```ts
+export default {
+  ssr: {
+    // Checked before noExternal, so these stay external even under the
+    // blanket default. Do NOT list anything that imports react here.
+    external: ["pg"],
+  },
+};
+```
+
+An app cannot narrow the default back to an array — Vite's `mergeConfig`
+collapses `ssr.noExternal` to `true` when either side is `true` — so
+`ssr.external` is the escape hatch.
+
+One known limit, stated plainly: a **CommonJS-only** dependency cannot be
+processed by Vite's SSR module runner (`neutron-ts start`, and static
+prerendering) — it fails loudly with `require is not defined`. `dev` is
+unaffected (the dev optimizer pre-bundles it). A CJS React library should
+ship as a client-only island instead of server-rendering, the same advice
+the [compatibility matrix](./react-compat-matrix.md) gives for libraries
+that fail under `preact/compat` generally.
+
 ## Compatibility Matrix
 
 | Tier | Status | Notes |

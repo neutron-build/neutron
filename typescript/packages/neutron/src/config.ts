@@ -150,18 +150,39 @@ export function resolveRuntimeAliases(
   };
 }
 
-export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] {
+/**
+ * SSR externals policy for a runtime.
+ *
+ * `preact` needs nothing: the SSR graph is already Preact.
+ *
+ * `react-compat` returns `true` — process EVERY node_modules dependency
+ * through Vite's SSR graph. Under react-compat, any dependency that
+ * imports `react`/`react-dom` must be transformed by Vite for the
+ * react → preact/compat alias to reach it; an externalized dependency
+ * resolves `react` natively and loads REAL React next to
+ * preact-render-to-string, which crashes at render time (observed with
+ * Radix: "Cannot read properties of null (reading 'useRef')"). Which
+ * packages import react cannot be predicted from names — Fylun's graph
+ * is dozens (Radix families, sonner, cmdk, …) and includes transitive
+ * deps the app never lists — so the correct default is all of them.
+ * The previous `react*`-only list covered only the direct alias targets.
+ *
+ * Tradeoff, stated honestly: `noExternal: true` makes the SSR runtime
+ * bundle inline the whole reachable dependency graph and makes dev SSR
+ * transform each dependency once (cached after that). That is the price
+ * of a correct React-ecosystem graph. Opt specific dependencies back
+ * out with `ssr.external: [...]` in vite.config.ts — Vite checks
+ * `ssr.external` before `noExternal`, so named externals stay external
+ * even under a blanket `noExternal: true` (mergeConfig collapses
+ * `noExternal` to `true` when either side is `true`, so `ssr.external`
+ * — not a narrower `noExternal` array — is the escape hatch).
+ */
+export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] | true {
   if (runtime !== "react-compat") {
     return [];
   }
 
-  return [
-    "react",
-    "react-dom",
-    "react-dom/client",
-    "react-dom/server",
-    "react-dom/server.browser",
-  ];
+  return true;
 }
 
 /**

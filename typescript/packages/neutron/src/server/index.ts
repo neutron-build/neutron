@@ -625,6 +625,36 @@ export async function createServer(
     })
   );
 
+  // Root-URL public assets (dev/prod parity): Vite copies public/ into the
+  // dist ROOT (dist/favicon.svg), and `neutron-ts dev` serves those files at
+  // their root URLs — but production only served /assets/* and /public/*
+  // (which the build never writes), so an app's own /favicon.svg 404'd in
+  // production while working in dev. Serve any extension-bearing file that
+  // physically exists in dist; route rules still win, and extensionless
+  // names / directory paths fall through to the route pipeline below, which
+  // owns loaders, route rules, gating and the app cache.
+  const rootAssetStatic = serveStatic({
+    root: resolvedDistDir,
+    rewriteRequestPath: (p) => p,
+  });
+  app.use("*", async (c, next) => {
+    const pathname = normalizePathname(c.req.path);
+    if (pathname === null) {
+      return next();
+    }
+    // Redirect rules own the URL space even over physical files.
+    if (
+      resolveRouteRuleRedirect(compiledRouteRules, pathname, new URL(c.req.url).search)
+    ) {
+      return next();
+    }
+    const lastSegment = pathname.slice(pathname.lastIndexOf("/") + 1);
+    if (!lastSegment.includes(".")) {
+      return next();
+    }
+    return rootAssetStatic(c, next);
+  });
+
   app.get("/_neutron/image", async (c) => {
     const response = await handleImageRequest(c.req.raw, {
       publicDirs: [
@@ -1862,9 +1892,24 @@ async function createSsrServer(
         cacheDir: userConfig.cacheDir ?? path.join(rootDir, ".neutron", "vite-ssr"),
         plugins: [neutronPlugin({ routesDir })],
         ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
-        ...(runtimeNoExternal.length > 0
-          ? { ssr: { noExternal: runtimeNoExternal } }
-          : {}),
+        // react-compat: process the whole APP dependency graph (see
+        // resolveRuntimeNoExternal) — externalized deps natively resolve
+        // real React next to preact-render-to-string and crash at render.
+        // @neutron-build/core stays EXTERNAL (its pre-change status here):
+        // this production module-runner has no deps optimizer, and forcing
+        // core into the runner drags its CJS chain (mdx → acorn-jsx …)
+        // into ESM evaluation ("require is not defined"). External, core
+        // loads natively and shares the app's single preact copy.
+        ...(runtimeNoExternal === true
+          ? {
+              ssr: {
+                noExternal: true,
+                external: ["@neutron-build/core"],
+              },
+            }
+          : runtimeNoExternal.length > 0
+            ? { ssr: { noExternal: runtimeNoExternal } }
+            : {}),
         server: {
           middlewareMode: true,
           // Production only loads modules through this instance. Without

@@ -115,7 +115,17 @@ export async function dev(): Promise<void> {
       ssr: {
         // @neutron-build/core shares the SSR graph's preact too, so its inline
         // hook components (e.g. Link) don't crash dev SSR with "reading '__H'".
-        noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+        // react-compat processes EVERYTHING else (`true`): an externalized
+        // dep natively imports real React next to preact and crashes at
+        // render (resolveRuntimeNoExternal documents the tradeoff + the
+        // ssr.external out). core is the deliberate exception under
+        // react-compat: blanket-true disables the dev deps optimizer, and
+        // core's CJS chain (content/mdx) then fails with "require is not
+        // defined"; external, core loads natively — the same shape the
+        // start server has always used.
+        noExternal:
+          runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
+        ...(runtimeNoExternal === true ? { external: ["@neutron-build/core"] } : {}),
       },
       optimizeDeps: {
         // Force the client optimizer to pre-bundle the same absolute entries

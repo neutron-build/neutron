@@ -10,6 +10,7 @@ import {
   mergePreactAliases,
   importPreactSsr,
 } from "./preact-ssr.js";
+import { resolveRuntimeAliases } from "../config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -91,8 +92,86 @@ describe("resolvePreactSsr", () => {
       "react-dom/server": "preact-render-to-string",
     });
     const map = Object.fromEntries(aliases.map((a) => [a.find, a.replacement]));
-    expect(map.react).toBe(preact.paths["preact/compat"]);
+    // Bare react → the preact/compat package ROOT (directory), not the
+    // entry file — see the react-compat ordering test below for why.
+    expect(map.react).toBe(preact.packageRoots["preact/compat"]);
     expect(map["react-dom/server"]).toBe(preact.packageRoots["preact-render-to-string"]);
+  });
+
+  it("react-compat runtime aliases order subpaths before bare finds (Vite prefix-match safety)", () => {
+    const root = makeApp();
+    const preact = resolvePreactSsr(root);
+    const aliases = vitePreactAliases(preact, resolveRuntimeAliases("react-compat"));
+    const finds = aliases.map((a) => a.find);
+
+    // resolveRuntimeAliases deliberately lists bare `react`/`react-dom`
+    // FIRST. Vite string aliases are prefix-matched in array order
+    // (`react` matches `react/jsx-runtime`), so every subpath entry must be
+    // sorted ahead of its bare parent or the subpath import rewrites onto
+    // the bare replacement and the client build dies with "Not a directory
+    // (os error 20)" — the W4 web-spike build blocker.
+    const reactIdx = finds.indexOf("react");
+    const reactDomIdx = finds.indexOf("react-dom");
+    expect(reactIdx).toBeGreaterThanOrEqual(0);
+    expect(reactDomIdx).toBeGreaterThanOrEqual(0);
+    expect(finds.indexOf("react/jsx-runtime")).toBeLessThan(reactIdx);
+    expect(finds.indexOf("react/jsx-dev-runtime")).toBeLessThan(reactIdx);
+    expect(finds.indexOf("react-dom/client")).toBeLessThan(reactDomIdx);
+    expect(finds.indexOf("react-dom/server")).toBeLessThan(reactDomIdx);
+    expect(finds.indexOf("react-dom/server.browser")).toBeLessThan(reactDomIdx);
+    expect(finds.indexOf("react-dom/test-utils")).toBeLessThan(reactDomIdx);
+  });
+
+  it("react-compat aliases resolve every react import to a distinct, correct target", () => {
+    const root = makeApp();
+    const preact = resolvePreactSsr(root);
+    const aliases = vitePreactAliases(preact, resolveRuntimeAliases("react-compat"));
+
+    // Vite's actual matching semantics (@rollup/plugin-alias `matches` +
+    // prefix-join replacement), first entry wins.
+    const matchAlias = (id: string): string | null => {
+      for (const { find, replacement } of aliases) {
+        if (id === find || id.startsWith(find + "/")) {
+          return replacement + id.slice(find.length);
+        }
+      }
+      return null;
+    };
+
+    // Listed subpaths resolve to their own preact files — not onto the
+    // bare parent's replacement.
+    expect(matchAlias("react/jsx-runtime")).toBe(preact.paths["preact/jsx-runtime"]);
+    expect(matchAlias("react/jsx-dev-runtime")).toBe(
+      preact.paths["preact/jsx-dev-runtime"]
+    );
+    expect(matchAlias("react-dom/client")).toBe(preact.paths["preact/compat"]);
+    expect(matchAlias("react-dom/server")).toBe(
+      preact.packageRoots["preact-render-to-string"]
+    );
+    expect(matchAlias("react-dom/server.browser")).toBe(
+      preact.packageRoots["preact-render-to-string"]
+    );
+
+    // Bare react-family ids resolve to the preact/compat package ROOT (a
+    // directory with its own package.json), not the entry file, so an
+    // unlisted react/* subpath joins a real directory instead of a
+    // guaranteed ENOTDIR (`<compat.mjs>/<subpath>`).
+    const compatRoot = preact.packageRoots["preact/compat"];
+    expect(matchAlias("react")).toBe(compatRoot);
+    expect(matchAlias("react-dom")).toBe(compatRoot);
+    expect(fs.existsSync(path.join(compatRoot, "package.json"))).toBe(true);
+    // The latent case the spike flagged: an unlisted react/* subpath.
+    expect(matchAlias("react/unlisted-subpath")).toBe(
+      path.join(compatRoot, "unlisted-subpath")
+    );
+    // subpath targets stay distinct from each other and from the bare target
+    expect(matchAlias("react/jsx-runtime")).not.toBe(matchAlias("react"));
+    // (react/jsx-dev-runtime maps to the SAME file as react/jsx-runtime:
+    // preact points both exports at jsx-runtime/dist/jsxRuntime.mjs.)
+
+    // A package whose name merely starts with "react" is NOT captured:
+    // Vite requires the exact find or a `/` boundary.
+    expect(matchAlias("react-is")).toBeNull();
   });
 
   it("mergePreactAliases flat map still covers the ordered keys", () => {

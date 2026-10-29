@@ -35,14 +35,21 @@ export interface PreactSsrResolution {
     "preact-render-to-string": string;
   };
   /**
-   * Package roots for bare `preact` / `preact-render-to-string` (so Node/Vite
-   * can still honor package `"exports"` for unlisted subpaths like
-   * `preact/debug`). Prefer {@link vitePreactAliases} over this map when
-   * configuring Vite — order matters.
+   * Package roots for bare ids (so Node/Vite can still honor package
+   * `"exports"` for subpaths that are not explicitly file-aliased).
+   * `"preact/compat"` is the preact/compat package root (preact ships it
+   * as a nested package with its own `"exports"` map covering the React
+   * subpath surface: ./client, ./server, ./jsx-runtime, ./scheduler). If
+   * the installed preact does not ship a nested package.json there, it
+   * falls back to the compat entry FILE (alias ordering still applies;
+   * unlisted react/* subpaths then fail resolution as before). Prefer
+   * {@link vitePreactAliases} over this map when configuring Vite — order
+   * matters.
    */
   packageRoots: {
     preact: string;
     "preact-render-to-string": string;
+    "preact/compat": string;
   };
   /** Bare ids that must go through Vite's SSR graph (not native node). */
   noExternal: string[];
@@ -160,11 +167,23 @@ export function resolvePreactSsr(
     packageRootFromEntry(paths["preact-render-to-string"], "preact-render-to-string") ??
     path.dirname(paths["preact-render-to-string"]);
 
+  // preact/compat package root for BARE react/react-dom alias targets (see
+  // vitePreactAliases). Never let the walk land on the preact package root
+  // itself — aliasing react → <preact root> would silently give react apps
+  // plain preact's entry (no forwardRef/memo/createPortal). If compat has no
+  // nested package.json (layout change), fall back to the entry file, which
+  // keeps bare-react semantics at status quo.
+  const compatRoot = nearestPackageRoot(paths["preact/compat"]);
+
   return {
     paths,
     packageRoots: {
       preact: preactRoot ?? path.dirname(paths.preact),
       "preact-render-to-string": rtsRoot,
+      "preact/compat":
+        compatRoot && compatRoot !== preactRoot
+          ? compatRoot
+          : paths["preact/compat"],
     },
     noExternal: [
       "preact",
@@ -185,6 +204,15 @@ export function resolvePreactSsr(
  * first-match and treats a string find as a prefix (`preact` matches
  * `preact/hooks`); putting the bare package last is load-bearing for
  * `preact/jsx-dev-runtime` under the client optimizer.
+ *
+ * The same rule governs the react-compat (runtime) aliases: entries are
+ * sorted longest-find-first so every `react/*` / `react-dom/*` subpath
+ * precedes its bare parent. Bare react-family finds resolve to the
+ * preact/compat package ROOT rather than its entry file, mirroring bare
+ * `preact`: an unlisted react subpath (e.g. `react/client`, or one a newer
+ * React adds) then joins a real directory and resolves through compat's own
+ * `"exports"` map instead of dying on `<compat.mjs>/<subpath>` ("Not a
+ * directory", os error 20).
  */
 export function vitePreactAliases(
   resolution: PreactSsrResolution,
@@ -205,14 +233,30 @@ export function vitePreactAliases(
   }
 
   // 2. Runtime (react-compat) aliases, rewritten onto absolute preact paths.
+  //    Longest find FIRST: Vite matches string aliases by prefix in array
+  //    order, and `resolveRuntimeAliases` deliberately lists bare
+  //    `react`/`react-dom` before their subpaths — without the sort, every
+  //    subpath import (react/jsx-runtime above all: it is what automatic JSX
+  //    emits) is rewritten onto the bare entry's replacement and the client
+  //    build fails with ENOTDIR for every react-compat app.
   if (runtimeAliases) {
-    for (const [find, target] of Object.entries(runtimeAliases)) {
+    const runtimeEntries = Object.entries(runtimeAliases).sort(
+      (a, b) => b[0].length - a[0].length
+    );
+    for (const [find, target] of runtimeEntries) {
       if (target === "preact") {
         push(find, resolution.packageRoots.preact);
       } else if (target === "preact-render-to-string") {
         push(find, resolution.packageRoots["preact-render-to-string"]);
       } else if ((PREACT_SUBPATH_ALIASES as readonly string[]).includes(target)) {
-        push(find, resolution.paths[target as (typeof PREACT_SUBPATH_ALIASES)[number]]);
+        if (target === "preact/compat" && !find.includes("/")) {
+          // Bare react-family find → compat PACKAGE ROOT, not the entry
+          // file: prefix matches on unlisted react/* subpaths then join a
+          // real directory (see docblock).
+          push(find, resolution.packageRoots["preact/compat"]);
+        } else {
+          push(find, resolution.paths[target as (typeof PREACT_SUBPATH_ALIASES)[number]]);
+        }
       } else {
         push(find, target);
       }
@@ -351,6 +395,25 @@ function packageRootFromEntry(entryFile: string, name: string): string | null {
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Nearest ancestor directory of `entryFile` containing a package.json,
+ * regardless of the package name (preact/compat is a nested package whose
+ * name, "preact-compat", does not contain "preact/compat"). Null if the
+ * walk hits the filesystem root.
+ */
+function nearestPackageRoot(entryFile: string): string | null {
+  let dir = path.dirname(entryFile);
+  for (let i = 0; i < 8; i++) {
+    if (fs.existsSync(path.join(dir, "package.json"))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
     dir = parent;
   }
   return null;

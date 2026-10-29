@@ -102,7 +102,7 @@ Adapter types:
 ## Cookies + Sessions
 
 - `parseCookieHeader(cookieHeader)`
-- `getCookie(cookieHeader, name)`
+- `getCookie(request, name)`
 - `serializeCookie(name, value, options?)`
 - `createMemorySessionStorage(options?)`
 - `sessionMiddleware(options?)`

@@ -26,7 +26,11 @@ describe("runtime config", () => {
 
   it("returns noExternal dependencies for react-compat runtime", () => {
     expect(resolveRuntimeNoExternal("preact")).toEqual([]);
-    expect(resolveRuntimeNoExternal("react-compat")).toContain("react-dom/server");
+    // Blanket processing (`true`), not a react* allowlist: any externalized
+    // dependency natively resolves real React next to preact and crashes at
+    // render time. See the function's docblock for the tradeoff + the
+    // ssr.external escape hatch.
+    expect(resolveRuntimeNoExternal("react-compat")).toBe(true);
   });
 
   it("accepts global route rules in config", () => {
