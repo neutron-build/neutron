@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Breaking
+
+- **CORS is now opt-in.** `createServer` no longer enables CORS by default.
+  Previously, a server created with no `cors` option sent
+  `Access-Control-Allow-Origin: *` on every request that carried an `Origin`
+  header (plus `Vary: Origin` on every response and a 204 preflight
+  short-circuit), in all modes. A wildcard default is the wrong default for
+  credentialed apps — browsers refuse credentials against `*`, which masks the
+  misconfiguration until something switches to echo-mode. With no `cors`
+  option (or `cors: false`) a server in any mode — `ssr`, `api`, `raw` — now
+  sends no `Access-Control-*` headers and never short-circuits a preflight.
+  **Migration:** pass an explicit config to keep cross-origin access:
+  `createServer({ cors: { origin: ["https://app.example.com"], credentials: true } })`.
+  An allowlist echoes the allowed origin exactly; `credentials: true` with
+  `"*"` is refused at startup. `cors: {}` restores allow-all behavior
+  (`origin: "*"`, no credentials) if the old default is genuinely what you
+  want. Security headers stay on by default (`securityHeaders: false` to opt
+  out) and are unchanged by this flip.
+
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 
 ### Changed

@@ -150,7 +150,26 @@ export interface NeutronServerOptions {
   runtime?: NeutronRuntime;
   /** Version reported by GET /health (FRAMEWORK_CONTRACT.md). Defaults to "0.1.0". */
   version?: string;
+  /**
+   * CORS — **opt-in** (default off). Absent or `false`: no `Access-Control-*`
+   * headers are sent and preflights are never short-circuited, in every
+   * {@link mode}. Provide a config object to enable CORS: `origin` is a single
+   * string or an allowlist of origins (use an explicit list, not `"*"`, for
+   * credentialed apps — `credentials: true` with `"*"` is refused at
+   * startup). Also `methods`, `allowedHeaders`, `exposedHeaders`,
+   * `credentials`, `maxAge` (default 600). Enabled responses echo the allowed
+   * origin exactly and carry `Vary: Origin`.
+   */
   cors?: false | CorsOptions;
+  /**
+   * Security headers — **on by default** (opt-out). Every response gets
+   * `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+   * `Referrer-Policy: strict-origin-when-cross-origin`,
+   * `Cross-Origin-Opener-Policy: same-origin` and
+   * `Cross-Origin-Resource-Policy: same-origin` unless the response already
+   * set them. Pass `{ headers }` to override/extend individual values, or
+   * `false` to disable entirely. Unchanged by the CORS default-off flip.
+   */
   securityHeaders?: false | { headers?: Record<string, string> };
   /**
    * Serve an OpenAPI 3.1 document (FRAMEWORK_CONTRACT.md §4) generated from
@@ -184,8 +203,9 @@ export interface NeutronServerOptions {
    * - `"ssr"` — full Neutron: route discovery, Vite SSR runtime, asset/image/island
    *   routes, and the HTML catch-all. The canonical, unchanged behavior.
    * - `"api"` — JSON backend. No route discovery, no SSR, no asset serving. Keeps the
-   *   shared batteries (request-id, /health, CORS/security, compression) and answers a
-   *   clean JSON 404 for unmatched paths. Mount your own routes on the returned `app`.
+   *   shared batteries (request-id, /health, default security headers, opt-in
+   *   CORS, compression) and answers a clean JSON 404 for unmatched paths.
+   *   Mount your own routes on the returned `app`.
    * - `"raw"` — bare Hono with only the shared batteries. No catch-all; unmatched paths
    *   get Hono's default 404. Full control.
    *

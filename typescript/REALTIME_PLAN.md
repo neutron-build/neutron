@@ -31,10 +31,10 @@ mode?: "ssr" | "api" | "raw"   // default "ssr"
 | Mode | Route discovery + Vite SSR | Asset / image / island routes | HTML catch-all | 404 behavior |
 |------|---------------------------|-------------------------------|----------------|--------------|
 | `"ssr"` (default) | yes | yes | yes (renders HTML) | SSR/static pipeline |
-| `"api"` | **no** | **no** | **no** | `app.notFound` → clean JSON `{ error, path }` |
+| `"api"` | **no** | **no** | **no** | `app.notFound` → RFC 7807 `application/problem+json` (`{type,title,status,detail,instance}`) |
 | `"raw"` | **no** | **no** | **no** | Hono default (`404 Not Found`) |
 
-All three modes keep the **shared batteries**: the request-id middleware (FRAMEWORK_CONTRACT §5), `GET /health`, opt-in trusted-host / CORS / security headers, and opt-out compression. `api` and `raw` differ only in the 404 shape — `api` is the "batteries-included JSON backend," `raw` is "bare Hono, you own everything."
+All three modes keep the **shared batteries**: the request-id middleware (FRAMEWORK_CONTRACT §5), `GET /health`, default-on security headers (`securityHeaders: false` or a custom `headers` map to opt out), opt-in `trustedHosts`, **opt-in CORS** — with no `cors` config a server sends no `Access-Control-*` headers in any mode; pass `cors: { origin: ["https://app.example.com"], credentials: true }` to enable an allowlist — and opt-out compression. `api` and `raw` differ only in the 404 shape — `api` is the "batteries-included JSON backend," `raw` is "bare Hono, you own everything."
 
 ### Axis 2 — `websocket` (transport)
 
