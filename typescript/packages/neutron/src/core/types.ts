@@ -41,6 +41,21 @@ export interface Route {
    * which callers must treat as "yes".
    */
   hasAction?: boolean;
+  /**
+   * Whether the route source exports HTTP method handlers (`GET`, `POST`,
+   * `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`). Derived at discovery time
+   * like `hasLoader` — the client build strips these exports, so the route
+   * table is the only place the fact can live. Absent means unknown, which
+   * callers must treat as "no" (a page mis-served as an endpoint is worse
+   * than an endpoint mis-served as a 404).
+   */
+  hasMethodHandlers?: boolean;
+  /**
+   * Whether the route source has a default export (a component). Derived at
+   * discovery time; combined with `hasMethodHandlers` it decides resource
+   * route classification — see `isResourceRoute` in core/resource-routes.ts.
+   */
+  hasDefaultExport?: boolean;
   parentId: string | null;
   isLayout?: boolean;
   /**
@@ -69,6 +84,22 @@ export interface ActionArgs {
   params: Record<string, string>;
   context: AppContext;
 }
+
+/** Arguments handed to a resource route's HTTP method handlers. */
+export interface ResourceRouteHandlerArgs {
+  request: Request;
+  params: Record<string, string>;
+  context: AppContext;
+}
+
+/**
+ * One HTTP method handler on a resource route module. Return a `Response` to
+ * answer it verbatim, or any other value to answer it as JSON; throwing a
+ * `ProblemError` or a `Response` works exactly like it does in loaders.
+ */
+export type ResourceRouteHandler = (
+  args: ResourceRouteHandlerArgs
+) => Promise<Response | unknown> | Response | unknown;
 
 export interface HeadersArgs {
   request: Request;
@@ -138,6 +169,21 @@ export interface RouteModule {
   config?: RouteConfig;
   loader?: (args: LoaderArgs) => Promise<unknown>;
   action?: (args: ActionArgs) => Promise<unknown>;
+  /**
+   * HTTP method handlers for resource routes — route modules with method
+   * handlers and NO default component, served as endpoints rather than pages
+   * (see `isResourceRoute`). A `Response` (or a thrown Response/ProblemError)
+   * is answered as-is; any other return value is serialized as JSON.
+   * `HEAD` falls back to `GET` per RFC 9110 §9.3.2; an unsupported method
+   * answers 405 `application/problem+json` with an `Allow` header.
+   */
+  GET?: ResourceRouteHandler;
+  POST?: ResourceRouteHandler;
+  PUT?: ResourceRouteHandler;
+  PATCH?: ResourceRouteHandler;
+  DELETE?: ResourceRouteHandler;
+  OPTIONS?: ResourceRouteHandler;
+  HEAD?: ResourceRouteHandler;
   clientLoader?: (args: ClientLoaderArgs) => Promise<unknown>;
   clientAction?: (args: ClientActionArgs) => Promise<unknown>;
   headers?:

@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { discoverRoutes, parseRouteConfig } from "../core/manifest.js";
+import { discoverRoutes, parseRouteConfig, parseRouteFacts } from "../core/manifest.js";
+import { isResourceRoute } from "./resource-routes.js";
 
 const TEST_ROUTES_DIR = path.join(__dirname, "__test_routes__");
 
@@ -303,6 +304,50 @@ describe("manifest", () => {
 
     fs.unlinkSync(path.join(TEST_ROUTES_DIR, ".neutron-routes.d.ts"));
     fs.unlinkSync(path.join(TEST_ROUTES_DIR, ".hidden.tsx"));
+  });
+
+  it("derives resource-route facts: method handlers + no default component", () => {
+    const dir = makeScratchRoutes("resource-facts");
+    fs.mkdirSync(path.join(dir, "api"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "api", "time.ts"),
+      "export async function GET() { return { now: 1 }; }\nexport async function POST() { return {}; }"
+    );
+    fs.writeFileSync(
+      path.join(dir, "page.ts"),
+      "export default function Page() {}"
+    );
+
+    const routes = discoverRoutes({ routesDir: dir });
+    const time = routes.find((r) => r.path === "/api/time");
+    expect(time?.hasMethodHandlers).toBe(true);
+    expect(time?.hasDefaultExport).toBe(false);
+    expect(isResourceRoute(time!)).toBe(true);
+
+    const page = routes.find((r) => r.path === "/page");
+    expect(page?.hasMethodHandlers).toBe(false);
+    expect(page?.hasDefaultExport).toBe(true);
+    expect(isResourceRoute(page!)).toBe(false);
+
+    // A file with both shapes is a discovery ERROR (see the test below), but
+    // the facts themselves detect it — that is what the error is derived from.
+    const both = parseRouteFacts(
+      "export default function Page() {}\nexport async function GET() { return {}; }"
+    );
+    expect(both.hasMethodHandlers).toBe(true);
+    expect(both.hasDefaultExport).toBe(true);
+  });
+
+  it("rejects a route that exports both a component and method handlers", () => {
+    const dir = makeScratchRoutes("both-exports");
+    fs.writeFileSync(
+      path.join(dir, "bad.ts"),
+      "export default function Page() {}\nexport async function GET() { return {}; }"
+    );
+
+    expect(() => discoverRoutes({ routesDir: dir })).toThrow(
+      /exports both a default component and HTTP method handlers[\s\S]*Split the file/
+    );
   });
 });
 

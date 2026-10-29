@@ -1,6 +1,12 @@
 export { createRouter } from "./core/router.js";
 export { discoverRoutes, parseRouteConfig } from "./core/manifest.js";
 export {
+  isResourceRoute,
+  dispatchResourceHandler,
+  resourceRouteAllowedMethods,
+  RESOURCE_ROUTE_METHODS,
+} from "./core/resource-routes.js";
+export {
   renderSpeculationRules,
   renderStaticLinkSpeculationRules,
 } from "./core/speculation-rules.js";

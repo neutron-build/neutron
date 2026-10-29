@@ -19,6 +19,7 @@ import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { isResponse } from "../core/response.js";
 import { createRouter } from "../core/router.js";
+import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
 import { installTransportPeer } from "./peer.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./health.js";
 import { onShutdownSignal } from "./shutdown.js";
@@ -46,7 +47,7 @@ import {
 } from "./cache-store.js";
 import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
-import { isProblemError, notFoundError } from "../core/problem.js";
+import { internalError, isProblemError, notFoundError } from "../core/problem.js";
 import {
   appDefinesSpecRoute,
   serverOpenApiSpec,
@@ -82,6 +83,7 @@ import type {
   HeadersArgs,
   LoaderArgs,
   MiddlewareFn,
+  ResourceRouteHandler,
   Route,
   RouteMatch,
   RouteModule,
@@ -434,6 +436,11 @@ export async function createServer(
   const hasAppRoutes = routes.some(
     (route) => !route.file.includes("_layout") && route.config.mode === "app"
   );
+  // Resource routes load their handler modules through the SSR runtime like
+  // app routes do — an app whose routes are all endpoints still needs one.
+  const hasResourceRoutes = routes.some(
+    (route) => !route.file.includes("_layout") && isResourceRoute(route)
+  );
   // Global middleware is loaded THROUGH the SSR runtime, so the runtime has to
   // exist for it to run at all. Deciding to start one on `hasAppRoutes` alone
   // meant an app whose routes are all `mode: "static"` silently never loaded
@@ -443,7 +450,8 @@ export async function createServer(
   // The file is found with a plain fs check, which needs no runtime, so its
   // presence can be part of the decision to start one.
   const globalMiddlewareFile = isSsr ? findGlobalMiddlewareFile(resolvedRootDir) : null;
-  const needsSsrRuntime = hasAppRoutes || globalMiddlewareFile !== null;
+  const needsSsrRuntime =
+    hasAppRoutes || hasResourceRoutes || globalMiddlewareFile !== null;
   // Fail closed (TS-01): when the SSR runtime is required — app routes exist
   // or a global middleware file was found — a Vite initialization failure
   // must reject createServer, not silently downgrade the app to a static
@@ -775,6 +783,55 @@ export async function createServer(
       const effectivePathname = rewrite?.pathname || originalPathname;
 
       const match = router.match(effectivePathname);
+
+      // Resource route (method handlers, no component): an HTTP endpoint, not
+      // a page. Dispatched BEFORE the static fast path and the static-mode
+      // 404 — a prebuilt file at this path must never answer for an endpoint,
+      // and the resource route is the route table's authority for its path.
+      // Endpoints run per request, so their middleware (global + layout +
+      // route, FRAMEWORK_CONTRACT §5 order) runs every time: the A-020
+      // prerender/gate contradiction cannot arise because resource routes are
+      // never prerendered in the first place.
+      if (match && isResourceRoute(match.route)) {
+        if (!ssrServer) {
+          return finalize(
+            internalError("Resource route SSR runtime is unavailable").toResponse(
+              requestTrace.pathname
+            ),
+            { routeId: match.route.id, routePath: match.route.path }
+          );
+        }
+        if (isMutationMethod(requestTrace.method)) {
+          // A mutating endpoint can change what app pages show. Fence both
+          // windows like the app-route path does (TS-07): advance the epoch
+          // before AND after the handler, so a cacheable GET that started
+          // before or during the mutation cannot publish a stale fill.
+          appCacheEpoch++;
+          await appResponseCacheStore.deleteByPath(
+            encodeCacheInvalidationPath(effectivePathname)
+          );
+          await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        }
+        const response = await handleResourceRouteRequest(
+          c.req.raw,
+          match,
+          ssrServer,
+          routeModuleCache,
+          globalMiddleware
+        );
+        if (isMutationMethod(requestTrace.method)) {
+          appCacheEpoch++;
+          await appResponseCacheStore.deleteByPath(
+            encodeCacheInvalidationPath(effectivePathname)
+          );
+          await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        }
+        return finalize(response, {
+          routeId: match.route.id,
+          routePath: match.route.path,
+          routeMode: "app",
+        });
+      }
 
       // Static dist HTML may only answer when no non-static app route claims
       // the path. The pre-seeded cache (buildStaticHtmlCache walks dist/ at
@@ -1272,6 +1329,51 @@ async function handleAppRouteRequest(
     responseCache,
     loaderCacheFence,
   });
+}
+
+/**
+ * Serve one resource-route request: load the module chain through the SSR
+ * runtime, run middleware (global outermost, then layouts, then the route —
+ * the exact chain renderAppRoute assembles, so a gate on a parent layout
+ * covers endpoints in its subtree like it covers pages), and dispatch the
+ * method handler. Loaders never run for resource routes.
+ */
+async function handleResourceRouteRequest(
+  request: Request,
+  match: RouteMatch,
+  ssrServer: SsrServer,
+  moduleCache: Map<string, Promise<RouteModule>>,
+  globalMiddleware?: MiddlewareFn[]
+): Promise<Response> {
+  const allRoutes = [...match.layouts, match.route];
+  const routeModules = new Map<string, RouteModule>();
+  await Promise.all(
+    allRoutes.map(async (route) => {
+      routeModules.set(route.id, await loadRouteModule(ssrServer, route.file, moduleCache));
+    })
+  );
+
+  const middlewares: MiddlewareFn[] = [];
+  if (globalMiddleware && globalMiddleware.length > 0) {
+    middlewares.push(...globalMiddleware);
+  }
+  for (const route of allRoutes) {
+    const module = routeModules.get(route.id);
+    if (module?.middleware) {
+      middlewares.push(module.middleware);
+    }
+  }
+
+  const context: AppContext = {};
+  const module = routeModules.get(match.route.id);
+  return runMiddlewareChain(middlewares, request, context, async () =>
+    dispatchResourceHandler(
+      module as Partial<Record<ResourceRouteMethod, ResourceRouteHandler>>,
+      request,
+      match.params,
+      context
+    )
+  );
 }
 
 
