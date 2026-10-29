@@ -210,7 +210,35 @@ export interface NeutronServerOptions {
    * adapter cap; the input-limits middleware alone applies.
    */
   maxRequestBodyBytes?: number;
+  /**
+   * Mount Hono sub-apps at path prefixes, so an SSR (or api/raw) server can
+   * serve an in-process API alongside its pages — one server instead of two
+   * (tRPC's single mountable handler tree is the canonical shape:
+   * `mount: { "/api/trpc": trpcApp }`). Each sub-app is registered via
+   * `app.route(prefix, subApp)` AFTER the framework batteries (/health,
+   * /openapi.json, image/island/static routes) and BEFORE the HTML catch-all,
+   * so mounts can neither be shadowed by the catch-all nor shadow the
+   * batteries. Works in every {@link mode}; orthogonal to {@link websocket}.
+   *
+   * Prefixes are literal path prefixes (`/api`, `/api/trpc`) and are
+   * validated at startup: a prefix that duplicates/nests another mount's, or
+   * that covers a reserved framework path (/health, /openapi.json, /docs,
+   * /_neutron/image, /__neutron_island, and /assets//public in ssr mode),
+   * is a configuration error. A request under a prefix whose sub-app has no
+   * matching route falls through to the rest of the app (in ssr mode, the
+   * HTML catch-all) — mounting does not claim the prefix, it registers
+   * routes under it.
+   */
+  mount?: Record<string, NeutronMountApp>;
 }
+
+/**
+ * A Hono sub-app accepted by {@link NeutronServerOptions.mount}. Any Hono
+ * instance works (`new Hono()` with whatever bindings/variables it needs) —
+ * `any` generics keep user sub-apps assignable regardless of their own types.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type NeutronMountApp = Hono<any, any, any>;
 
 /** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
 export type NeutronServerMode = "ssr" | "api" | "raw";
@@ -367,6 +395,7 @@ export async function createServer(
     runtime = "preact",
     mode = "ssr",
     websocket,
+    mount,
     cors,
     securityHeaders,
     openapi,
@@ -594,6 +623,24 @@ export async function createServer(
     const spec = serverOpenApiSpec(routes, openapi, serverVersion);
     app.get("/openapi.json", (c) => c.json(spec));
     app.get("/docs", (c) => c.html(swaggerDocsHtml(openapi.title)));
+  }
+
+  // Caller-mounted sub-apps (in-process API routes: tRPC, REST, SSE). They are
+  // registered AFTER the framework batteries above and BEFORE the HTML
+  // catch-all below, so neither shadowing direction can happen:
+  //   - a mount cannot shadow /health & co. (registered earlier, and the
+  //     prefixes are validated to not cover reserved paths at all);
+  //   - the catch-all cannot shadow a mount (REALTIME_PLAN §5 records the
+  //     class: an "*" route swallows everything a later caller adds — the
+  //     mount is intentionally on the other side of it).
+  // A request under the prefix that the sub-app does not match falls through
+  // to whatever comes next (in ssr mode, the catch-all): mounting registers
+  // routes under a prefix, it does not claim the namespace.
+  if (mount) {
+    validateMountConfig(mount, isSsr);
+    for (const [prefix, subApp] of Object.entries(mount)) {
+      app.route(prefix, subApp);
+    }
   }
 
   // SSR-only routes: static assets, image optimization, server islands, and the HTML
@@ -1366,6 +1413,97 @@ export function normalizePathname(pathname: string): string | null {
   }
 
   return decoded;
+}
+
+// Framework paths a mount prefix must never take over. Batteries registered
+// before the mounts would keep answering anyway (Hono resolves in registration
+// order), so a mount that covers one would silently never see those requests —
+// refuse it up front instead. /assets and /public are ssr-mode static trees.
+const RESERVED_MOUNT_PATHS: Array<{ path: string; ssrOnly: boolean; what: string }> = [
+  { path: "/health", ssrOnly: false, what: "GET /health (FRAMEWORK_CONTRACT.md §7)" },
+  { path: "/openapi.json", ssrOnly: false, what: "GET /openapi.json (FRAMEWORK_CONTRACT.md §4)" },
+  { path: "/docs", ssrOnly: false, what: "GET /docs (FRAMEWORK_CONTRACT.md §4)" },
+  { path: "/_neutron/image", ssrOnly: true, what: "the image optimizer route" },
+  { path: "/__neutron_island", ssrOnly: true, what: "the server-islands route" },
+  { path: "/assets", ssrOnly: true, what: "the built-assets static route" },
+  { path: "/public", ssrOnly: true, what: "the public-dir static route" },
+];
+
+/** `"/api"` covers `"/api/anything"` — segment-boundary prefix, not substring. */
+function mountPrefixCovers(prefix: string, path: string): boolean {
+  if (prefix === path) return true;
+  return path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+}
+
+/**
+ * Fail fast on mount configurations whose behavior would be surprising.
+ * Every rule here encodes a shadowing/conflict case that would otherwise be
+ * resolved silently by registration order or Hono fall-through.
+ */
+function validateMountConfig(mount: Record<string, NeutronMountApp>, isSsr: boolean): void {
+  const prefixes = Object.keys(mount);
+
+  for (const prefix of prefixes) {
+    const subApp = mount[prefix];
+    if (typeof prefix !== "string" || prefix.length === 0 || !prefix.startsWith("/")) {
+      throw new Error(
+        `Neutron: mount prefix ${JSON.stringify(prefix)} is invalid — prefixes are absolute ` +
+          `path prefixes like "/api". For the site root use mode: "raw".`
+      );
+    }
+    if (prefix !== "/" && prefix.endsWith("/")) {
+      throw new Error(
+        `Neutron: mount prefix "${prefix}" must not end with "/" — write "${prefix.slice(0, -1)}".`
+      );
+    }
+    if (prefix.split("/").some((segment) => segment.includes("*") || segment.includes(":"))) {
+      throw new Error(
+        `Neutron: mount prefix "${prefix}" must be literal — dynamic segments are not ` +
+          `supported in mount prefixes (match inside the sub-app instead).`
+      );
+    }
+    if (
+      !subApp ||
+      typeof (subApp as unknown as { fetch?: unknown }).fetch !== "function" ||
+      typeof (subApp as unknown as { route?: unknown }).route !== "function"
+    ) {
+      throw new Error(
+        `Neutron: mount["${prefix}"] is not a Hono instance — pass the app itself ` +
+          `(e.g. new Hono()), not a handler or a fetch function.`
+      );
+    }
+
+    for (const reserved of RESERVED_MOUNT_PATHS) {
+      if (reserved.ssrOnly && !isSsr) continue;
+      if (mountPrefixCovers(prefix, reserved.path)) {
+        const hint =
+          prefix === "/"
+            ? ' Mounting at "/" is not supported — for a fully caller-owned router use mode: "raw".'
+            : " Choose a different prefix.";
+        throw new Error(
+          `Neutron: mount prefix "${prefix}" would take over ${reserved.what} — ` +
+            `reserved framework paths cannot be mounted over.${hint}`
+        );
+      }
+    }
+  }
+
+  // Pairwise: exact duplicates and nested prefixes. A sub-app that answers a
+  // path the outer prefix also reaches makes the winner an accident of object
+  // key order; say it once at startup instead.
+  for (let i = 0; i < prefixes.length; i++) {
+    for (let j = i + 1; j < prefixes.length; j++) {
+      const a = prefixes[i];
+      const b = prefixes[j];
+      if (mountPrefixCovers(a, b) || mountPrefixCovers(b, a)) {
+        throw new Error(
+          `Neutron: mount prefixes "${a}" and "${b}" overlap — nested/duplicate mount ` +
+            `prefixes are not supported (registration order would silently decide ` +
+            `which sub-app answers). Mount one sub-app and route the sub-prefix inside it.`
+        );
+      }
+    }
+  }
 }
 
 function applyRouteRuleHeadersToResponse(

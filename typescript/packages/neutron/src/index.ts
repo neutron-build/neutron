@@ -76,6 +76,7 @@ export {
   type NeutronServerOptions,
   type NeutronServerMode,
   type NeutronWebSocketOptions,
+  type NeutronMountApp,
   type NeutronServer,
   type NeutronServerHooks,
   type NeutronRequestStartEvent,
