@@ -163,7 +163,7 @@ afterAll(() => {
 
 describe("renderStatic and gated resource routes", () => {
   it("does not refuse a gated resource route — it never prerenders, so the gate runs per request", async () => {
-    const outDir = path.join(RESOURCE_DIR, "..", "__a020_resource_out__");
+    const outDir = path.join(__dirname, "__a020_resource_out__");
     fs.rmSync(outDir, { recursive: true, force: true });
 
     await expect(
@@ -174,5 +174,7 @@ describe("renderStatic and gated resource routes", () => {
     expect(fs.existsSync(path.join(outDir, "index.html"))).toBe(true);
     expect(fs.existsSync(path.join(outDir, "api", "stats"))).toBe(false);
     expect(fs.existsSync(path.join(outDir, "api", "bakeable"))).toBe(false);
+
+    fs.rmSync(outDir, { recursive: true, force: true });
   });
 });
