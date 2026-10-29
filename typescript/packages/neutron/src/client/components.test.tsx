@@ -2,6 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { h, render } from "preact";
 import { Form, NavLink, prefetch } from "./components.js";
+import { Island } from "./island.js";
 import { clearPrefetchCache, hasFreshPrefetch, takePrefetch } from "./prefetch-cache.js";
 
 const mountedContainers: HTMLDivElement[] = [];
@@ -200,5 +201,31 @@ describe("Form error state", () => {
     await flush();
     expect(document.querySelector(".state")?.textContent).toBe("ok");
     expect(form.hasAttribute("data-submit-error")).toBe(false);
+  });
+});
+
+// Preact-side counterpart of type-fixtures/react-island/: this file is
+// compiled by the package build (jsxImportSource: preact), so the JSX usage
+// below pins that the JSX-agnostic return type did not make <Island> less
+// usable — or less typed — on the preact side it was written for.
+describe("Island (preact JSX)", () => {
+  it("renders children through to the islanded component inside its marker", () => {
+    function Slot(props: { children?: preact.ComponentChildren }) {
+      return h("section", { "data-slot": "yes" }, props.children);
+    }
+
+    mount(
+      <Island component={Slot} client="load">
+        <p>fallback until hydration</p>
+      </Island>
+    );
+
+    const marker = document.querySelector("neutron-island");
+    expect(marker).not.toBeNull();
+    expect(marker!.getAttribute("data-client")).toBe("load");
+    expect(marker!.getAttribute("data-component")).toBe("Slot");
+    // Children are ordinary props: they render through the islanded component.
+    const slot = marker!.querySelector("section[data-slot='yes']");
+    expect(slot?.querySelector("p")?.textContent).toBe("fallback until hydration");
   });
 });
