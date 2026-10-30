@@ -25,6 +25,24 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **The control-flow components are usable from React-typed JSX.**
+  `<Show>`, `<For>`, `<Switch>`, `<Match>` and `<Index>` (exported from the
+  package root, `@neutron-build/core`) now have JSX-agnostic element returns,
+  completing the client component surface started by `Image`/`Picture`/
+  `Await`/`Island` and the navigation/form five: under
+  `runtime: "react-compat"`, apps typechecking against `@types/react`
+  (`jsxImportSource: "react"`) got TS2786 on every usage, because the
+  components return preact `VNode`s and React's `ReactNode` rejects that
+  shape. Diagnosed per component with tsc fixtures before designing: all
+  five fail at the return position only — the keyed render callbacks
+  (`(item) => …`, `(item, index) => …`, `(item: () => T, index) => …`),
+  `fallback` and `key` props needed no changes; React-authored elements and
+  callbacks flow through the untouched `ComponentChildren` prop types
+  unchanged. Props stay fully typed — mistyped props still fail under either
+  import source, pinned by `@ts-expect-error`s in both worlds:
+  `type-fixtures/react-control-flow/` (react side) and the preact-JSX
+  control-flow tests. `<ServerIsland>` (server-side, root entry) is the one
+  component that still returns a preact `VNode`; see `docs/react-compat.md`.
 - **The navigation/form components are usable from React-typed JSX.**
   `<Form>`, `<Link>`, `<NavLink>`, `<ViewTransitions>` and `<ScrollReveal>`
   now have JSX-agnostic element returns (the same treatment `Image`,

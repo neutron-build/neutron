@@ -123,18 +123,25 @@ Two coherent setups; mixing them per-file is fine (the pragma is per-module):
    The framework's client components are usable from React-typed JSX: their
    element returns are deliberately JSX-agnostic (`<Island>`, `<Form>`,
    `<Link>`, `<NavLink>`, `<ViewTransitions>`, `<ScrollReveal>`, `<Image>`,
-   `<Picture>`, `<Await>`), while their props stay fully typed — a mistyped
-   prop fails TS2322 against the same `FormProps`/`LinkProps` under either
-   import source. Both worlds are pinned by compiled fixtures in
-   `@neutron-build/core` (`src/client/type-fixtures/react-nav-form/` and
-   `react-island/`, compiled with `jsxImportSource: "react"` against
-   @types/react) and by the preact-JSX component tests in the package build.
+   `<Picture>`, `<Await>`, and the control-flow family `<Show>`, `<For>`,
+   `<Switch>`, `<Match>`, `<Index>`), while their props stay fully typed — a
+   mistyped prop fails TS2322 against the same prop interfaces under either
+   import source, and the control-flow render callbacks and `fallback` props
+   accept React-authored elements unchanged (preact's `ComponentChild`
+   includes `object`). Both worlds are pinned by compiled fixtures in
+   `@neutron-build/core` (`src/client/type-fixtures/react-nav-form/`,
+   `react-control-flow/` and `react-island/`, compiled with
+   `jsxImportSource: "react"` against @types/react — the fixtures carry
+   `@ts-expect-error` pins that fail the compile if prop checking regresses)
+   and by the preact-JSX component tests in the package build. Note the
+   import path split: the control-flow family is exported from the package
+   root (`@neutron-build/core`), unlike the client-entry components above.
 
-   One residual, stated plainly: the control-flow components (`Show`, `For`,
-   `Switch`, `Match`, `Index`) still return preact `VNode`s and fail TS2786
-   from React-typed JSX. Keep modules that use them Preact-typed (setup 1,
-   or the per-file pragma `/** @jsxImportSource preact */`) until they
-   receive the same treatment.
+   One residual, stated plainly: `<ServerIsland>` (the server-side island
+   component exported from the root entry) still returns a preact `VNode`
+   and fails TS2786 from React-typed JSX, verified the same way. Keep
+   modules that use it Preact-typed (setup 1, or the per-file pragma
+   `/** @jsxImportSource preact */`) until it receives the same treatment.
 
 3. **Children props shared by both worlds.** A component that *forwards*
    `children` in JSX cannot type that prop with either runtime's native
