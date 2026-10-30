@@ -1257,6 +1257,14 @@ export async function createServer(
     fetch: fetchFn,
     port,
     hostname: host,
+    // Left on, @hono/node-server replaces globalThis.Response and Request with
+    // its own classes for the process lifetime. A Response subclass defined
+    // before this call (a Next-compat NextResponse evaluated at import), and
+    // every Response.json()/redirect() result, then fail `instanceof Response`
+    // in app code. The lightweight classes only save allocations on simple
+    // bodies, which Neutron's header-writing pipeline mostly materializes
+    // anyway.
+    overrideGlobalObjects: false,
   });
 
   // Transport axis: attach a WebSocket server to the live HTTP server, independent of

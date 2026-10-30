@@ -136,6 +136,17 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Starting the server no longer replaces the global `Response` and
+  `Request`.** `@hono/node-server`'s `serve()` swaps both for its own
+  lightweight classes by default, for the whole process. A `Response`
+  subclass defined before `createServer`/`startServer` ran (a Next-compat
+  `NextResponse` evaluated at import, for instance) then failed
+  `instanceof Response` in app code, as did every `Response.json()` and
+  `Response.redirect()` result, so code that branched on `instanceof`
+  silently treated real responses as data. Neutron now passes
+  `overrideGlobalObjects: false`; `globalThis.Response` stays the native
+  class. The framework's own response detection already tolerated both
+  classes and is unchanged.
 - **Resource-route mutations honour `x-neutron-invalidate`.** A page action's
   response could name other paths to evict from the app-response and
   loader-data caches with the header; a `POST`/`PUT`/`PATCH`/`DELETE`

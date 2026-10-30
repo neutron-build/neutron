@@ -274,11 +274,14 @@ export function acceptsHtml(request: Request): boolean {
  *
  * `instanceof Response` is not enough on Node: `@hono/node-server` replaces
  * `globalThis.Response` with a lightweight class whose prototype chains to the
- * native one. `new Response()` then passes `instanceof`, but the inherited
- * static factories (`Response.json()`, `Response.redirect()`,
- * `Response.error()`) still return NATIVE instances, which fail `instanceof`
- * against the replacement — so a returned `Response.json(...)` was treated as
- * plain data. The `Symbol.toStringTag` brand is shared by both.
+ * native one unless `serve()` is told not to. Neutron's own server opts out
+ * (`overrideGlobalObjects: false`), but a server the app starts itself, or a
+ * second realm, can still hand over a Response from another constructor. With
+ * the replacement installed, the inherited static factories
+ * (`Response.json()`, `Response.redirect()`, `Response.error()`) return NATIVE
+ * instances, which fail `instanceof` against it — a returned
+ * `Response.json(...)` was treated as plain data. The `Symbol.toStringTag`
+ * brand is shared by both.
  */
 export function isResponse(value: unknown): value is Response {
   if (typeof Response !== "undefined" && value instanceof Response) return true;
