@@ -25,6 +25,34 @@ describe("route rules", () => {
     });
   });
 
+  it("merges the incoming query into a destination that has one; the destination wins per key", () => {
+    const compiled = compileRouteRules({
+      redirects: [
+        { source: "/old/:slug", destination: "/new/:slug?tab=info&ref=rule", permanent: false },
+        { source: "/frag", destination: "/target?a=1#top", permanent: false },
+        { source: "/empty", destination: "/target?", permanent: false },
+      ],
+    });
+
+    expect(
+      resolveRouteRuleRedirect(compiled, "/old/post", "?utm_source=mail&tab=comments&x=1&x=2")
+    ).toEqual({
+      location: "/new/post?tab=info&ref=rule&utm_source=mail&x=1&x=2",
+      status: 307,
+    });
+    // Only conflicting keys incoming: the destination stands as written.
+    expect(resolveRouteRuleRedirect(compiled, "/old/post", "?tab=x")?.location).toBe(
+      "/new/post?tab=info&ref=rule"
+    );
+    // No incoming query: unchanged.
+    expect(resolveRouteRuleRedirect(compiled, "/old/post", "")?.location).toBe(
+      "/new/post?tab=info&ref=rule"
+    );
+    // The query goes before a destination fragment.
+    expect(resolveRouteRuleRedirect(compiled, "/frag", "?b=2")?.location).toBe("/target?a=1&b=2#top");
+    expect(resolveRouteRuleRedirect(compiled, "/empty", "?b=2")?.location).toBe("/target?b=2");
+  });
+
   it("neutralizes an open redirect from a protocol-relative param value", () => {
     const compiled = compileRouteRules({
       redirects: [

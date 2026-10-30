@@ -105,6 +105,14 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Config redirects merge the incoming query into a destination that has
+  its own.** A `routes.redirects` rule kept the request's query only when the
+  destination had none, so `/old?utm_source=mail` → `/new?tab=info` dropped
+  `utm_source`. Incoming parameters are now appended, except keys the
+  destination sets — the destination wins per key and its query string is
+  kept as written (Next.js semantics); the query goes before any `#fragment`.
+  Destinations without a query behave as before. Applies to `start`, `dev`,
+  `preview` and the edge runtimes, which share the resolver.
 - **Framework components return `AnyJsxElement | null` instead of `any`.**
   `Form`, `Link`, `NavLink`, `ViewTransitions`, `ScrollReveal`, `Island`,
   `Image`, `Picture`, `ServerIsland` and `Show`/`For`/`Switch`/`Match`/

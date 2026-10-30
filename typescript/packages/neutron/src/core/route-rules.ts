@@ -68,15 +68,47 @@ export function resolveRouteRuleRedirect(
     }
 
     const destination = substituteDestination(rule.meta.destination, params);
-    const hasQuery = destination.includes("?");
-    const rawLocation = !hasQuery && search ? `${destination}${search}` : destination;
     return {
-      location: sanitizeRedirectLocation(rawLocation),
+      location: sanitizeRedirectLocation(mergeRedirectQuery(destination, search)),
       status: rule.meta.status,
     };
   }
 
   return null;
+}
+
+/**
+ * Carry the incoming query onto a redirect destination, as Next.js does: every
+ * incoming parameter is appended, except keys the destination's own query
+ * sets — the destination wins per key, and its query string is kept as
+ * written. A destination without a query takes the incoming one verbatim.
+ */
+function mergeRedirectQuery(destination: string, search: string): string {
+  const incoming = search.startsWith("?") ? search.slice(1) : search;
+  if (!incoming) {
+    return destination;
+  }
+  const hashIndex = destination.indexOf("#");
+  const hash = hashIndex === -1 ? "" : destination.slice(hashIndex);
+  const beforeHash = hashIndex === -1 ? destination : destination.slice(0, hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  if (queryIndex === -1) {
+    return `${beforeHash}?${incoming}${hash}`;
+  }
+  const destinationQuery = beforeHash.slice(queryIndex + 1);
+  const destinationKeys = new Set(new URLSearchParams(destinationQuery).keys());
+  const carried = new URLSearchParams();
+  for (const [key, value] of new URLSearchParams(incoming)) {
+    if (!destinationKeys.has(key)) {
+      carried.append(key, value);
+    }
+  }
+  const carriedQuery = carried.toString();
+  if (!carriedQuery) {
+    return destination;
+  }
+  const joined = destinationQuery ? `${destinationQuery}&${carriedQuery}` : carriedQuery;
+  return `${beforeHash.slice(0, queryIndex)}?${joined}${hash}`;
 }
 
 /**
