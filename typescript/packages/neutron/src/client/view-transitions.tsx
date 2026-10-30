@@ -1,4 +1,5 @@
 import { h, Fragment } from "preact";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 // Neutron uses browser-native view transitions for same-origin navigations so
 // the browser stays in charge of routing. That's what unlocks back/forward
@@ -88,13 +89,8 @@ const BOOTSTRAP = `
 })();
 `;
 
-/**
- * JSX-agnostic return type (like Image/Picture/Island): the element is a
- * preact VNode at runtime, which @types/react's ReactNode rejects (TS2786)
- * when a react-compat app typechecks with jsxImportSource: "react". Takes no
- * props, so only the element position is affected.
- */
-export function ViewTransitions(): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function ViewTransitions(): AnyJsxElement | null {
   return h(
     Fragment,
     null,

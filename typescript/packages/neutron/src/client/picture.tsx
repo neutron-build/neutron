@@ -1,4 +1,5 @@
 import { h } from "preact";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 const DEFAULT_WIDTHS = [320, 640, 960, 1200, 1600];
 const DEFAULT_FORMATS = ["avif", "webp"];
@@ -34,6 +35,7 @@ function buildSrcSet(src: string, widths: number[], format: string): string {
     .join(", ");
 }
 
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
 export function Picture({
   src,
   alt,
@@ -44,7 +46,7 @@ export function Picture({
   height,
   class: className,
   loading = "lazy",
-}: PictureProps): any {
+}: PictureProps): AnyJsxElement | null {
   const candidateWidths = widths || DEFAULT_WIDTHS;
 
   const sources = formats.map((fmt) =>

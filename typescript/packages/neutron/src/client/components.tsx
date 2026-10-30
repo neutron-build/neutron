@@ -6,6 +6,7 @@ import { setNavigationState } from "./hooks.js";
 import type { SubmitError } from "./hooks.js";
 import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 function toLocalUrl(url: string): string | null {
   const resolved = new URL(url, window.location.href);
@@ -104,15 +105,7 @@ export interface FormProps {
   onSubmit?: (event: Event) => void;
 }
 
-/**
- * The return type is deliberately `any` (like Image/Picture/Island): the
- * element is a preact VNode at runtime, which react-compat aliases to
- * preact/compat, but @types/react's ReactNode does not accept a
- * FunctionalComponent's `ComponentChildren` return (TS2786) — so a
- * preact-typed component annotation makes `<Form>` unusable from React-typed
- * JSX. `any` typechecks under both JSX runtimes; the props stay fully typed.
- * See src/client/type-fixtures/react-nav-form/.
- */
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
 export function Form({
   method = "post",
   action,
@@ -121,7 +114,7 @@ export function Form({
   onError,
   encType,
   ...props
-}: FormProps): any {
+}: FormProps): AnyJsxElement | null {
   const formRef = useRef<HTMLFormElement>(null);
   const submittingRef = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -276,12 +269,7 @@ export interface LinkProps {
   target?: string;
 }
 
-/**
- * JSX-agnostic return type, same as Form above (and Image/Picture/Island):
- * preact `FunctionalComponent` returns ComponentChildren, which React's
- * ReactNode rejects (TS2786). Props stay fully typed.
- * See src/client/type-fixtures/react-nav-form/.
- */
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
 export function Link({ 
   to, 
   replace, 
@@ -289,7 +277,7 @@ export function Link({
   target,
   children, 
   ...props 
-}: LinkProps): any {
+}: LinkProps): AnyJsxElement | null {
   const linkRef = useRef<HTMLAnchorElement>(null);
   const [prefetched, setPrefetched] = useState(false);
 
@@ -370,7 +358,7 @@ export interface NavLinkProps extends LinkProps {
   end?: boolean;
 }
 
-/** JSX-agnostic return type, same as Form above. See react-nav-form/. */
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
 export function NavLink({ 
   to, 
   activeClass,
@@ -378,7 +366,7 @@ export function NavLink({
   end,
   children,
   ...props 
-}: NavLinkProps): any {
+}: NavLinkProps): AnyJsxElement | null {
   const [isActive, setIsActive] = useState(false);
 
   useEffect(() => {

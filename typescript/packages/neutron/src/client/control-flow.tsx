@@ -8,6 +8,7 @@
 
 import { h, ComponentChildren, Fragment } from 'preact';
 import { useMemo } from 'preact/hooks';
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 /**
  * Conditional rendering with type narrowing
@@ -26,16 +27,8 @@ export interface ShowProps<T> {
   children: (item: NonNullable<T>) => ComponentChildren;
 }
 
-/**
- * The return type is deliberately `any` (like Form/Link/Island — see
- * components.tsx): the element is a preact VNode at runtime, which
- * @types/react's ReactNode rejects (TS2786), so a preact-typed return would
- * make `<Show>` unusable from React-typed JSX (react-compat apps compiling
- * with `jsxImportSource: "react"`). `any` typechecks under both JSX runtimes;
- * the props — including the keyed render callback and `fallback` — stay
- * fully typed. See src/client/type-fixtures/react-control-flow/.
- */
-export function Show<T>({ when, fallback, children }: ShowProps<T>): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Show<T>({ when, fallback, children }: ShowProps<T>): AnyJsxElement | null {
   if (when) {
     return <>{children(when as NonNullable<T>)}</>;
   }
@@ -60,8 +53,8 @@ export interface ForProps<T> {
   children: (item: T, index: () => number) => ComponentChildren;
 }
 
-/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
-export function For<T>({ each, fallback, children }: ForProps<T>): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function For<T>({ each, fallback, children }: ForProps<T>): AnyJsxElement | null {
   if (!each || each.length === 0) {
     return <>{fallback}</>;
   }
@@ -97,8 +90,8 @@ export interface SwitchProps {
   children: ComponentChildren;
 }
 
-/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
-export function Switch({ fallback, children }: SwitchProps): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Switch({ fallback, children }: SwitchProps): AnyJsxElement | null {
   // Find first matching child
   const childArray = Array.isArray(children) ? children : [children];
 
@@ -129,8 +122,8 @@ export interface MatchProps {
   children: ComponentChildren;
 }
 
-/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
-export function Match({ when, children }: MatchProps): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Match({ when, children }: MatchProps): AnyJsxElement | null {
   return when ? <>{children}</> : null;
 }
 
@@ -151,8 +144,8 @@ export interface IndexProps<T> {
   children: (item: () => T, index: number) => ComponentChildren;
 }
 
-/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
-export function Index<T>({ each, fallback, children }: IndexProps<T>): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Index<T>({ each, fallback, children }: IndexProps<T>): AnyJsxElement | null {
   if (!each || each.length === 0) {
     return <>{fallback}</>;
   }

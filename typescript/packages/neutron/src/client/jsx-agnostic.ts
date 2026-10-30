@@ -32,6 +32,15 @@
  * because preact's component types return `ComponentChildren`, which React's
  * own constructor signatures reject — the structural unions are the only
  * spelling both runtimes round-trip.
+ *
+ * It is also the return type of every framework component (`Form`, `Link`,
+ * `Show`, `Island`, `ServerIsland`, …, as `AnyJsxElement | null`). They
+ * return preact VNodes at runtime, and a preact return type (`VNode`,
+ * `ComponentChildren`) makes the component unusable from React-typed JSX:
+ * React's `ReactNode` rejects it (TS2786). This type passes both runtimes'
+ * JSX element checks while the props stay fully typed. Pinned by the
+ * `type-fixtures/react-*` compiles (react side) and the components' preact-JSX
+ * tests.
  */
 export type AnyJsxElement = {
   type: string | ((props: any) => any) | (new (props: any, context?: any) => any);

@@ -105,6 +105,16 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Framework components return `AnyJsxElement | null` instead of `any`.**
+  `Form`, `Link`, `NavLink`, `ViewTransitions`, `ScrollReveal`, `Island`,
+  `Image`, `Picture`, `ServerIsland` and `Show`/`For`/`Switch`/`Match`/
+  `Index` declared `any` as their element return so React-typed JSX could
+  use them. The exported structural `AnyJsxElement` passes both runtimes'
+  JSX checks too (the `type-fixtures/react-*` compiles are unchanged and
+  still pass), so the declarations are typed again. Runtime output is
+  unchanged. Code that assigned a component's return value to a preact
+  `VNode` needs a cast. `Await` stays `any`: it returns `children(data)` as
+  is, which can be a string or an array.
 - **The SSR server's default 404 is content-negotiated.** With no
   application `not-found.tsx`, an unmatched path used to answer bare
   `text/plain` "Not Found". HTML-preferring clients (`Accept: text/html`,

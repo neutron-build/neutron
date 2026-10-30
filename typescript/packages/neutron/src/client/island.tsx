@@ -1,4 +1,5 @@
 import { h } from "preact";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -32,12 +33,7 @@ const componentNameCounts = new Map<string, number>();
  * <Island component={Counter} client="load" count={0} />
  * ```
  *
- * The return type is deliberately `any` (like Image/Picture): the element is
- * a preact VNode at runtime, which react-compat aliases to preact/compat, but
- * @types/react's ReactNode does not accept a preact VNode (TS2786) — so a
- * strictly-preact return annotation makes `<Island>` unusable from
- * React-typed JSX. `any` typechecks under both JSX runtimes; the props stay
- * fully typed. See src/client/type-fixtures/react-island/.
+ * Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX.
  */
 export function Island({
   component: Component,
@@ -46,7 +42,7 @@ export function Island({
   media,
   __src,
   ...props
-}: IslandProps): any {
+}: IslandProps): AnyJsxElement | null {
   const islandId = `island-${islandCounter++}`;
   const componentId = resolveComponentId(Component, id);
   
