@@ -387,6 +387,55 @@ export async function GET({ context }) {
     expect(seen).toEqual(["route:api/time.ts:200", "route:api/users/[id].ts:200"]);
   });
 
+  it("extension-bearing resource paths dispatch as endpoints (dev parity)", async () => {
+    // /rss.xml and /feed.xml come from route modules (`rss[.]xml.ts`,
+    // `feed.xml/index.ts`). Production dispatches resource routes ahead of
+    // any static file path; this is the parity target for the dev server's
+    // static-asset bypass (see dev-contract.dev.test.ts).
+    root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-resource-"));
+    await fs.mkdir(path.join(root, "src", "routes", "feed.xml"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "src", "routes", "rss[.]xml.ts"),
+      `
+export async function GET() {
+  return { feed: "rss" };
+}
+`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(root, "src", "routes", "feed.xml", "index.ts"),
+      `
+export async function GET() {
+  return { feed: "atom" };
+}
+`,
+      "utf-8"
+    );
+
+    const port = await getFreePort();
+    running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    const base = `http://127.0.0.1:${port}`;
+
+    const rss = await fetch(`${base}/rss.xml`);
+    expect(rss.status).toBe(200);
+    expect(rss.headers.get("content-type")).toBe("application/json");
+    expect(await rss.json()).toEqual({ feed: "rss" });
+
+    const atom = await fetch(`${base}/feed.xml`);
+    expect(atom.status).toBe(200);
+    expect(await atom.json()).toEqual({ feed: "atom" });
+
+    const denied = await fetch(`${base}/rss.xml`, { method: "DELETE" });
+    expect(denied.status).toBe(405);
+    expect(denied.headers.get("allow")).toBe("GET, HEAD");
+  });
+
   it("refuses to boot when a route exports both a component and method handlers", async () => {
     root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-resource-"));
     await fs.mkdir(path.join(root, "src", "routes"), { recursive: true });

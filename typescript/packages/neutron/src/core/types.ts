@@ -1,5 +1,6 @@
 import type * as preact from "preact";
 import type { SeoMetaInput } from "./seo.js";
+import type { ResourceRouteMethod } from "./resource-routes.js";
 
 export interface RouteCacheConfig {
   maxAge?: number;
@@ -50,6 +51,14 @@ export interface Route {
    * than an endpoint mis-served as a 404).
    */
   hasMethodHandlers?: boolean;
+  /**
+   * Which HTTP method handlers the route source exports (`GET`, `POST`, …),
+   * derived at discovery. Present only where facts were derived; an absent
+   * value means unknown and callers must treat it as "none" — OpenAPI
+   * generation documents an operation per entry and fabricates nothing when
+   * the list is unavailable.
+   */
+  resourceMethods?: ResourceRouteMethod[];
   /**
    * Whether the route source has a default export (a component). Derived at
    * discovery time; combined with `hasMethodHandlers` it decides resource

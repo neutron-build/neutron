@@ -927,6 +927,99 @@ describe("static build path traversal (getStaticPaths params)", () => {
 
 import { extractClientEntryScriptSrc } from "./client-entry.js";
 
+// ---------------------------------------------------------------------------
+// Gated static routes (A-020) — imported from source, not mirrored.
+//
+// The production build refuses `mode: "static"` + middleware exactly as
+// core's renderStatic does. `gated-static.ts` is split out of build.ts
+// (which imports vite at load time) for the same reason static-paths.ts is.
+// ---------------------------------------------------------------------------
+
+import { findGatedStaticRoutes, gatedStaticRoutesError } from "./commands/gated-static.js";
+import type { Route } from "@neutron-build/core";
+
+/** Minimal Route factory — only the fields the gate reads. */
+function gateRoute(overrides: {
+  path: string;
+  id?: string;
+  file?: string;
+  mode?: "static" | "app";
+  parentId?: string | null;
+  hasMiddleware?: boolean;
+  hasMethodHandlers?: boolean;
+  hasDefaultExport?: boolean;
+}): Route {
+  return {
+    id: overrides.id ?? `route:${overrides.path}`,
+    path: overrides.path,
+    file: overrides.file ?? `/src/routes${overrides.path}.tsx`,
+    params: [],
+    config: { mode: overrides.mode ?? "static" },
+    parentId: overrides.parentId ?? null,
+    hasMiddleware: overrides.hasMiddleware,
+    hasMethodHandlers: overrides.hasMethodHandlers ?? false,
+    hasDefaultExport: overrides.hasDefaultExport ?? true,
+  };
+}
+
+describe("findGatedStaticRoutes (A-020 build-side gate)", () => {
+  it("flags a static route gated by its own middleware, naming the file", () => {
+    const gated = findGatedStaticRoutes([
+      gateRoute({ path: "/secret", file: "/src/routes/secret.tsx", hasMiddleware: true }),
+    ]);
+    assert.equal(gated.length, 1);
+    assert.equal(gated[0].route.path, "/secret");
+    assert.equal(gated[0].gate.id, gated[0].route.id);
+    assert.match(gatedStaticRoutesError(gated), /\/secret — \/src\/routes\/secret\.tsx exports `middleware`/);
+    assert.match(gatedStaticRoutesError(gated), /mode: "static"/);
+  });
+
+  it("flags a static route gated by an ancestor layout, naming the layout", () => {
+    const gated = findGatedStaticRoutes([
+      gateRoute({
+        id: "route:admin/_layout.tsx",
+        path: "/admin",
+        file: "/src/routes/admin/_layout.tsx",
+        hasMiddleware: true,
+      }),
+      gateRoute({
+        path: "/admin/report",
+        file: "/src/routes/admin/report.tsx",
+        parentId: "route:admin/_layout.tsx",
+      }),
+    ]);
+    assert.equal(gated.length, 1);
+    assert.equal(gated[0].route.path, "/admin/report");
+    assert.equal(gated[0].gate.file, "/src/routes/admin/_layout.tsx");
+    assert.match(gatedStaticRoutesError(gated), /\/admin\/report — its layout/);
+  });
+
+  it("does not flag ungated static routes or gated app routes", () => {
+    assert.deepEqual(
+      findGatedStaticRoutes([
+        gateRoute({ path: "/public" }),
+        gateRoute({ path: "/live", mode: "app", hasMiddleware: true }),
+      ]),
+      []
+    );
+  });
+
+  it("does not flag gated resource routes — they are never prerendered, gates run per request", () => {
+    assert.deepEqual(
+      findGatedStaticRoutes([
+        gateRoute({
+          path: "/api/stats",
+          file: "/src/routes/api/stats.ts",
+          hasMiddleware: true,
+          hasMethodHandlers: true,
+          hasDefaultExport: false,
+        }),
+      ]),
+      []
+    );
+  });
+});
+
 // `init.ts` is imported from source for the same reason client-entry.ts is:
 // it pulls in no build tooling (only the create-neutron scaffold library), so
 // the real parseInitArgs can be exercised instead of a mirror.

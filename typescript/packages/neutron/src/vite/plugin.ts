@@ -393,16 +393,6 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             return;
           }
 
-          // Static-asset bypass: only short-circuit if the LAST path segment
-          // looks like a real file extension (a single trailing `.ext` with
-          // alphanumeric characters). This preserves bypasses for things like
-          // `/styles.css`, `/foo.js`, `/img/logo.svg` while still routing
-          // dotted dynamic params such as Codex unit IDs `/u/03.09.02`, which
-          // are param values rather than file paths.
-          if (looksLikeStaticAsset(originalPathname)) {
-            return next();
-          }
-
           if (originalPathname === "/_neutron/image") {
             const imageRequest = new Request(url.toString(), {
               method: req.method || "GET",
@@ -451,6 +441,28 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             normalizePathname(originalPathname)
           );
           const pathname = rewrite?.pathname || normalizePathname(originalPathname);
+
+          // Static-asset bypass: only short-circuit if the LAST path segment
+          // looks like a real file extension (a single trailing `.ext` with
+          // alphanumeric characters). This preserves bypasses for things like
+          // `/styles.css`, `/foo.js`, `/img/logo.svg` while still routing
+          // dotted dynamic params such as Codex unit IDs `/u/03.09.02`, which
+          // are param values rather than file paths.
+          //
+          // One exception, resolved through the router: a path the route
+          // table claims as a RESOURCE route (`rss[.]xml.ts` → /rss.xml,
+          // `feed.xml/index.ts` → /feed.xml) is dispatched, never handed to
+          // Vite's static handler — production serves endpoints ahead of any
+          // static file path (server/index.ts dispatches resource routes
+          // before the dist fast path), and dev must answer the same. This
+          // sits after redirect/rewrite resolution for the same reason the
+          // match below waits: the rewritten path is the path that answers.
+          if (looksLikeStaticAsset(pathname)) {
+            const assetMatch = state.router.match(pathname);
+            if (!assetMatch || !isResourceRoute(assetMatch.route)) {
+              return next();
+            }
+          }
 
           const match = state.router.match(pathname);
           if (!match) {

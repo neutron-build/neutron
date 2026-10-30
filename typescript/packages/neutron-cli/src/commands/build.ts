@@ -28,6 +28,7 @@ import {
   isResponse,
   isResourceRoute,
 } from "@neutron-build/core";
+import { findGatedStaticRoutes, gatedStaticRoutesError } from "./gated-static.js";
 import type {
   NeutronConfig,
   NeutronAdapter,
@@ -595,6 +596,17 @@ export async function build(): Promise<void> {
   // getStaticPaths): a skip is a choice, a render error is a broken page, and
   // a build that shipped one must not report success.
   let renderErrorCount = 0;
+
+  // A-020 (build side): a prerendered file answers before middleware can
+  // run, so `mode: "static"` + middleware would publish a gated page. Core's
+  // renderStatic refuses the combination for its own renderer; the production
+  // build refuses it here, before prerendering any page. Resource routes are
+  // exempt — never prerendered, their gates run per request.
+  const gatedStatic = findGatedStaticRoutes(routes);
+  if (gatedStatic.length > 0) {
+    console.error(`\n${gatedStaticRoutesError(gatedStatic)}`);
+    process.exit(1);
+  }
 
   for (const route of staticRoutes) {
     // Resource routes (method handlers, no component) are endpoints served
