@@ -18,6 +18,7 @@ import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
+import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
 import { isResponse, notFound, acceptsHtml, withMutableHeaders } from "../core/response.js";
 import { createRouter } from "../core/router.js";
 import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
@@ -499,7 +500,7 @@ export async function createServer(
   // gate to a typo must not look like a working server.
   const globalMiddleware: MiddlewareFn[] =
     globalMiddlewareFile && ssrServer
-      ? await loadGlobalMiddleware(ssrServer, globalMiddlewareFile)
+      ? await loadGlobalMiddleware(ssrServer.ssrLoadModule, globalMiddlewareFile)
       : [];
 
   if (globalMiddlewareFile && !ssrServer) {
@@ -1505,72 +1506,6 @@ function isStaticRoute(match: RouteMatch): boolean {
  */
 function routeChainIsGated(match: RouteMatch): boolean {
   return [...match.layouts, match.route].some((route) => route.hasMiddleware !== false);
-}
-
-// Load an optional global middleware from <rootDir>/src/middleware.ts (or
-// .js/.tsx). Returns its default export if it is a function, else null. A
-// present-but-malformed file warns and is ignored rather than crashing boot.
-const GLOBAL_MIDDLEWARE_CANDIDATES = [
-  "src/middleware.ts",
-  "src/middleware.tsx",
-  "src/middleware.js",
-  "src/middleware.mjs",
-];
-
-/**
- * Absolute path of the app's global middleware file, or null.
- *
- * Split out from {@link loadGlobalMiddleware} because the answer is needed
- * BEFORE the SSR runtime is created — its presence is part of deciding whether
- * to create one at all. A plain fs check, so it costs nothing at boot. A-022.
- */
-function findGlobalMiddlewareFile(rootDir: string): string | null {
-  for (const rel of GLOBAL_MIDDLEWARE_CANDIDATES) {
-    const abs = path.join(rootDir, rel);
-    if (fs.existsSync(abs)) {
-      return abs;
-    }
-  }
-  return null;
-}
-
-async function loadGlobalMiddleware(
-  ssrServer: SsrServer,
-  absolutePath: string
-): Promise<MiddlewareFn[]> {
-  let mod: { default?: unknown; middleware?: unknown };
-  try {
-    mod = (await ssrServer.ssrLoadModule(absolutePath)) as {
-      default?: unknown;
-      middleware?: unknown;
-    };
-  } catch (error) {
-    // A file that exists but cannot be imported is a startup error (TS-01):
-    // continuing without it silently removes whatever gate it carried.
-    throw new Error(
-      `Failed to load global middleware ${path.basename(absolutePath)}: ${String(error)}`
-    );
-  }
-  // Documented form: `export const middleware: MiddlewareFn[]`. Also
-  // accept a single function (default or named) for ergonomics. An export
-  // that exists but is not usable is likewise a startup error.
-  const exported = mod.middleware ?? mod.default;
-  const list = normalizeMiddlewareExport(exported);
-  if (list.length === 0 || (Array.isArray(exported) && exported.length !== list.length)) {
-    throw new TypeError(
-      `Global middleware ${path.basename(absolutePath)}: expected \`middleware\` or default ` +
-        `export of a function or an array of functions (got ${typeof exported}).`
-    );
-  }
-  return list;
-}
-
-function normalizeMiddlewareExport(exported: unknown): MiddlewareFn[] {
-  if (typeof exported === "function") return [exported as MiddlewareFn];
-  if (Array.isArray(exported)) {
-    return exported.filter((f): f is MiddlewareFn => typeof f === "function");
-  }
-  return [];
 }
 
 function loadRouteModule(

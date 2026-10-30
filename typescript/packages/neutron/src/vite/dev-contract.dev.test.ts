@@ -398,3 +398,68 @@ export async function GET() {
     expect(await allowed.json()).toEqual({ classified: true });
   });
 });
+
+const GLOBAL_GATE = (marker: string) => `
+export const middleware = [
+  async (request, _context, next) => {
+    const path = new URL(request.url).pathname;
+    if (path !== "/public" && request.headers.get("x-token") !== "t") {
+      return Response.json({ gate: "${marker}", path }, { status: 401 });
+    }
+    return next();
+  },
+];
+`;
+
+const PAGE_ROUTE = `
+import { h } from "preact";
+export const config = { mode: "app" };
+export default function Page() {
+  return h("div", null, "page body");
+}
+`;
+
+describe("dev server: global middleware (src/middleware.ts) runs as in start", () => {
+  it("gates page routes, resource routes and unmatched paths, and follows edits", { timeout: 60_000 }, async () => {
+    const root = await makeApp({
+      "index.tsx": PAGE_ROUTE,
+      "public.tsx": PAGE_ROUTE,
+      "api/data.ts": `export async function GET() { return Response.json({ data: 1 }); }`,
+    });
+    const middlewareFile = path.join(root, "src", "middleware.ts");
+    await fs.writeFile(middlewareFile, GLOBAL_GATE("v1"), "utf-8");
+    const base = await boot(root);
+
+    for (const p of ["/", "/api/data", "/nowhere"]) {
+      const denied = await fetch(`${base}${p}`);
+      expect(denied.status, `GET ${p}`).toBe(401);
+      expect(await denied.json(), `GET ${p}`).toEqual({ gate: "v1", path: p });
+    }
+
+    const page = await fetch(`${base}/`, { headers: { "x-token": "t" } });
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("page body");
+    const data = await fetch(`${base}/api/data`, { headers: { "x-token": "t" } });
+    expect(await data.json()).toEqual({ data: 1 });
+    // Let through: Vite answers the unmatched path exactly as without a gate.
+    const unmatched = await fetch(`${base}/nowhere`, { headers: { "x-token": "t" } });
+    expect(unmatched.status).toBe(404);
+    const open = await fetch(`${base}/public`);
+    expect(open.status).toBe(200);
+
+    // An edit is picked up without restarting the dev server.
+    await fs.writeFile(middlewareFile, GLOBAL_GATE("v2"), "utf-8");
+    let gate: unknown;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      gate = await (await fetch(`${base}/api/data`)).json();
+      if ((gate as { gate?: string }).gate === "v2") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(gate).toEqual({ gate: "v2", path: "/api/data" });
+
+    // Deleting the file removes the gate.
+    await fs.rm(middlewareFile);
+    const ungated = await fetch(`${base}/api/data`);
+    expect(ungated.status).toBe(200);
+  });
+});

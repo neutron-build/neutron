@@ -9,6 +9,7 @@ import { discoverRoutes } from "../core/manifest.js";
 import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
 import { runMiddlewareChain } from "../core/middleware.js";
+import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
 import { isResponse, withMutableHeaders } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
 import {
@@ -162,6 +163,10 @@ function sanitizeHost(host: string | undefined): string {
   if (!/^[a-zA-Z0-9._-]+$/.test(hostname)) return 'localhost';
   return host;
 }
+
+// Marks the dev server's "let Vite answer" response for unmatched paths.
+const DEV_PASS_THROUGH_HEADER = "x-neutron-dev-pass-through";
+const devPassThroughToken = randomUUID();
 
 // Detects URL pathnames that look like file requests so the dev middleware can
 // bypass the router for static assets without also bypassing legitimate
@@ -354,6 +359,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             originalPathname.startsWith("/@") ||
             originalPathname.startsWith("/node_modules") ||
             originalPathname === "/__vite_ping" ||
+            originalPathname === "/__open-in-editor" ||
             originalPathname === "/favicon.ico"
           ) {
             return next();
@@ -464,9 +470,61 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             }
           }
 
+          // src/middleware.ts runs OUTERMOST for every routed request, as in
+          // production (FRAMEWORK_CONTRACT §5). Resolved per request through
+          // ssrLoadModule, so adding, editing or deleting the file takes effect
+          // on the next request. A present file that fails to load surfaces as
+          // an error rather than silently serving without its gate.
+          const globalMiddlewareFile = findGlobalMiddlewareFile(rootDir);
+          const globalMiddleware = globalMiddlewareFile
+            ? await loadGlobalMiddleware((id) => server.ssrLoadModule(id), globalMiddlewareFile)
+            : [];
+
           const match = state.router.match(pathname);
           if (!match) {
-            return next();
+            if (globalMiddleware.length === 0) {
+              return next();
+            }
+            // Unmatched: production answers through the global chain too. Here
+            // Vite answers instead (SPA fallback, proxy, 404), so the chain runs
+            // in front of it and Vite only proceeds when the chain does. The
+            // request carries no body: reading it would drain the stream a
+            // later Vite middleware (proxy) still needs.
+            // A middleware may rebuild the response it got from next() (to
+            // add headers), so the pass-through is recognised by a header the
+            // rebuild carries along, not only by identity.
+            const passThrough = new Response(null, {
+              headers: { [DEV_PASS_THROUGH_HEADER]: devPassThroughToken },
+            });
+            const gateResponse = await runMiddlewareChain(
+              globalMiddleware,
+              new Request(url.toString(), {
+                method: req.method || "GET",
+                headers: req.headers as HeadersInit,
+              }),
+              {},
+              async () => passThrough
+            );
+            if (
+              gateResponse === passThrough ||
+              gateResponse.headers.get(DEV_PASS_THROUGH_HEADER) === devPassThroughToken
+            ) {
+              return next();
+            }
+            const denied = withMutableHeaders(gateResponse);
+            applyRouteRuleHeadersToResponse(
+              denied,
+              resolveRouteRuleHeaders(compiledRouteRules, normalizePathname(originalPathname))
+            );
+            res.statusCode = denied.status;
+            denied.headers.forEach((value, key) => {
+              res.setHeader(key, value);
+            });
+            if (denied.body && req.method !== "HEAD") {
+              res.write(Buffer.from(await denied.arrayBuffer()));
+            }
+            res.end();
+            return;
           }
 
           const { route, params } = match;
@@ -483,8 +541,8 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             renderMs: undefined,
           };
 
-          // Collect middleware from layouts + route
-          const middlewares: MiddlewareFn[] = [];
+          // Collect middleware: global (outermost), then layouts + route
+          const middlewares: MiddlewareFn[] = [...globalMiddleware];
           for (const r of allRoutes) {
             const loaded = await server.ssrLoadModule(r.file);
             const module = loaded as RouteModule;

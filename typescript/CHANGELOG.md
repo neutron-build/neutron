@@ -128,6 +128,15 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`neutron-ts dev` runs `src/middleware.ts`.** The dev server never loaded
+  the app's global middleware, so auth gates ran under `start` and on no path
+  under `dev`. Dev now finds the same file (`src/middleware.{ts,tsx,js,mjs}`)
+  with the same export rules and runs it outermost (FRAMEWORK_CONTRACT §5)
+  for page routes, resource routes and unmatched paths; an unmatched request
+  it lets through is answered by Vite as before (the gate sees no request
+  body there). The file is resolved per request through Vite's module graph,
+  so edits, additions and deletions apply without a restart; a file that
+  fails to load is reported as a dev error instead of being skipped.
 - **The SSR server serves root-URL `public/` files in production, and only
   those.** Vite copies `public/` into the dist root, and `neutron-ts dev`
   serves it at root URLs (`/favicon.svg`), but `neutron-ts start` only served
