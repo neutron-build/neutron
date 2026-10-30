@@ -51,6 +51,12 @@ import { extractClientEntryScriptSrc } from "../client-entry.js";
 import { loadNeutronConfig } from "../lib/config.js";
 import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
 import { writePublicFilesMetadata } from "./public-files.js";
+import {
+  SERVER_BUNDLE_MANIFEST,
+  SERVER_BUNDLE_FORMAT,
+  findGlobalMiddlewareFile,
+  generateServerBundleEntry,
+} from "@neutron-build/core/server";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
@@ -973,6 +979,20 @@ export async function build(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 50));
   await server.close();
 
+  await buildStartServerBundle({
+    cwd,
+    outputDir,
+    routesDir,
+    routeRules: neutronConfig.routes,
+    routes,
+    userConfig,
+    runtimeAliases: preactAliases,
+    runtimeNoExternal:
+      runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
+    runtime,
+    oxc: oxcJsx,
+  });
+
   if (selectedAdapter) {
     console.log(`\nRunning adapter: ${selectedAdapter.name}`);
     await selectedAdapter.adapt({
@@ -1312,11 +1332,54 @@ async function buildRuntimeBundle(
   );
 
   const bundleOutDir = path.join(options.outputDir, "server", target);
+  await bundleServerEntry(options, {
+    entryPath,
+    outDir: bundleOutDir,
+    target: target === "worker" ? "webworker" : "node",
+    chunkFileNames: "chunks/[name]-[hash].js",
+  });
+
+  const entryRelativePath = path.relative(options.outputDir, path.join(bundleOutDir, "entry.js"));
+  return {
+    target,
+    outDir: bundleOutDir,
+    entryPath: path.join(bundleOutDir, "entry.js"),
+    entryRelativePath: entryRelativePath.split(path.sep).join("/"),
+  };
+}
+
+/**
+ * One SSR (Rolldown) build of a generated server entry, in the module graph
+ * every server bundle uses: the app's Vite config, the runtime's preact
+ * aliases, and preact + preact-render-to-string + @neutron-build/core
+ * processed INTO the bundle (react-compat: everything), so the renderer, the
+ * router providers and the routes' hooks are one Preact instance whatever
+ * the install shape.
+ */
+async function bundleServerEntry(
+  options: Pick<
+    RuntimeBundleBuilderOptions,
+    "cwd" | "routesDir" | "routeRules" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
+  > & { oxc?: unknown },
+  build: {
+    entryPath: string;
+    outDir: string;
+    target: "node" | "webworker";
+    chunkFileNames: string;
+    sourcemap?: boolean;
+    plugins?: unknown[];
+    external?: string[];
+  }
+): Promise<void> {
+  const entryPath = build.entryPath;
+  const bundleOutDir = build.outDir;
   await viteBuild(
     mergeConfig(options.userConfig, {
       configFile: false,
       root: options.cwd,
+      ...(options.oxc ? { oxc: options.oxc } : {}),
       plugins: [
+        ...(build.plugins ?? []),
         // Vite's SSR resolver does not honor the `exports` map for the
         // dynamic-import subpath `preact-render-to-string/stream` inside the
         // noExternal @neutron-build/core dep — it falls back to a raw
@@ -1360,7 +1423,8 @@ async function buildRuntimeBundle(
         dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
       },
       ssr: {
-        target: target === "worker" ? "webworker" : "node",
+        target: build.target,
+        ...(build.external ? { external: build.external } : {}),
         // Bundle @neutron-build/core with the same preact the renderer uses, so
         // inline hook components (e.g. Link) in app-mode routes don't hit the
         // two-preact-instance "__H" crash at runtime — matching the build/dev paths.
@@ -1383,24 +1447,236 @@ async function buildRuntimeBundle(
         ssr: entryPath,
         outDir: bundleOutDir,
         emptyOutDir: true,
+        ...(build.sourcemap ? { sourcemap: true } : {}),
         rolldownOptions: {
           output: {
             format: "esm",
             entryFileNames: "entry.js",
-            chunkFileNames: "chunks/[name]-[hash].js",
+            chunkFileNames: build.chunkFileNames,
             assetFileNames: "assets/[name]-[hash][extname]",
           },
         },
       },
     })
   );
+}
 
-  const entryRelativePath = path.relative(options.outputDir, path.join(bundleOutDir, "entry.js"));
+/**
+ * The `neutron-ts start` server bundle (F-P2-1). `createServer` otherwise
+ * builds a Vite SSR runtime at every boot and transforms each route module,
+ * layout and the global middleware on first use. This compiles exactly that
+ * set — every discovered route file, since any of them can be rendered at
+ * runtime (gated static routes, not-found pages, a static path missing from
+ * dist), plus src/middleware.* — into dist/server/start/, and records it in
+ * dist/.neutron-server-bundle.json, which createServer loads natively.
+ *
+ * Built only when the server would start an SSR runtime at all (app routes,
+ * resource routes or global middleware); a static-only site has nothing to
+ * load. A failure here does not fail the build: start then falls back to the
+ * Vite runtime, as it did before bundles existed, and says so at boot.
+ */
+async function buildStartServerBundle(
+  options: Pick<
+    RuntimeBundleBuilderOptions,
+    "cwd" | "outputDir" | "routesDir" | "routeRules" | "routes" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
+  > & { runtime: string; oxc: unknown }
+): Promise<void> {
+  const manifestPath = path.join(options.outputDir, SERVER_BUNDLE_MANIFEST);
+  fs.rmSync(manifestPath, { force: true });
+
+  const globalMiddlewareFile = findGlobalMiddlewareFile(options.cwd);
+  const pages = options.routes.filter((route) => !route.file.includes("_layout"));
+  const needsRuntime =
+    globalMiddlewareFile !== null ||
+    pages.some((route) => route.config.mode === "app" || isResourceRoute(route));
+  if (!needsRuntime) {
+    return;
+  }
+
+  const runtimeDir = path.join(options.cwd, ".neutron", "runtime");
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const entryPath = path.join(runtimeDir, "entry.start.ts");
+  const files = [
+    ...options.routes.map((route) => route.file),
+    ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
+  ];
+  fs.writeFileSync(
+    entryPath,
+    generateServerBundleEntry({
+      entryPath,
+      rootDir: options.cwd,
+      files,
+      runtime: options.runtime as "preact" | "react-compat",
+    }),
+    "utf-8"
+  );
+
+  const outDir = path.join(options.outputDir, "server", "start");
+  const externals = importerResolvedExternals(outDir);
+  console.log("\nBuilding server bundle...");
+  try {
+    await bundleServerEntry(options, {
+      entryPath,
+      outDir,
+      target: "node",
+      // Flat: every chunk sits in outDir, so a source file's location
+      // relative to the chunk that holds it is a build-time constant.
+      chunkFileNames: "[name]-[hash].js",
+      sourcemap: true,
+      plugins: [pinImportMetaPathsPlugin(outDir), externals.plugin],
+      // `vite` is reached only through core's Vite fallback (a dynamic import
+      // that never runs under a bundle). Under react-compat, core's CJS-only
+      // deps stay native exactly as in start's Vite runtime.
+      external: [
+        "vite",
+        ...(options.runtimeNoExternal === true ? RUNTIME_RUNNER_CJS_EXTERNALS : []),
+      ],
+    });
+  } catch (error) {
+    console.warn(
+      `\n  [warn] Server bundle failed to build; \`neutron-ts start\` will transform route ` +
+        `modules through Vite at boot instead.\n  ${String((error as Error)?.message ?? error)}\n`
+    );
+    return;
+  }
+  externals.link();
+
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify(
+      {
+        format: SERVER_BUNDLE_FORMAT,
+        entry: path.relative(options.outputDir, path.join(outDir, "entry.js")).split(path.sep).join("/"),
+        runtime: options.runtime,
+      },
+      null,
+      2
+    ),
+    "utf-8"
+  );
+  console.log(`  ${files.length} modules → ${path.relative(options.cwd, outDir)}/entry.js`);
+}
+
+/**
+ * Externals resolve from the module that imports them, as under Vite's SSR
+ * runtime and plain Node. A bundled module's bare import is emitted into a
+ * chunk under dist/server/start/, where Node resolves it from the APP ROOT —
+ * and under pnpm a bundled dependency's own dependencies (core's
+ * @mdx-js/mdx, shiki, …) are not visible from there, or resolve to the app's
+ * different version. Such an import is rewritten to a private alias
+ * (`@neutron-external/<name>-<hash>`) that a symlink in the bundle's own
+ * node_modules/ points at the package root the importer resolved. Node then
+ * applies that package's exports map with its usual conditions and loads the
+ * same file the server's native modules do. Imports the app root resolves
+ * identically stay bare.
+ */
+function importerResolvedExternals(outDir: string) {
+  const links = new Map<string, string>();
+  const rootOwnPackage = new Map<string, string | null>();
+
+  const packageRootFrom = (dir: string, name: string): string | null => {
+    for (let current = dir; ; current = path.dirname(current)) {
+      const candidate = path.join(current, "node_modules", name);
+      if (fs.existsSync(path.join(candidate, "package.json"))) {
+        return fs.realpathSync(candidate);
+      }
+      if (path.dirname(current) === current) return null;
+    }
+  };
+  const packageRootOf = (packageJsonPath: string, name: string): string | null => {
+    for (let dir = path.dirname(packageJsonPath); ; dir = path.dirname(dir)) {
+      const pkg = path.join(dir, "package.json");
+      if (fs.existsSync(pkg)) {
+        try {
+          if (JSON.parse(fs.readFileSync(pkg, "utf-8")).name === name) return fs.realpathSync(dir);
+        } catch {
+          // keep walking
+        }
+      }
+      if (path.dirname(dir) === dir) return null;
+    }
+  };
+
   return {
-    target,
-    outDir: bundleOutDir,
-    entryPath: path.join(bundleOutDir, "entry.js"),
-    entryRelativePath: entryRelativePath.split(path.sep).join("/"),
+    plugin: {
+      name: "neutron:importer-resolved-externals",
+      enforce: "pre" as const,
+      async resolveId(
+        this: {
+          resolve: (
+            id: string,
+            importer?: string,
+            options?: { skipSelf?: boolean }
+          ) => Promise<{ id: string; external?: boolean | string; packageJsonPath?: string } | null>;
+        },
+        id: string,
+        importer: string | undefined
+      ) {
+        if (!importer || id.startsWith(".") || id.startsWith("/") || id.startsWith("\0") || id.includes(":")) {
+          return null;
+        }
+        const resolved = await this.resolve(id, importer, { skipSelf: true });
+        if (!resolved || resolved.external !== true || !resolved.packageJsonPath) return null;
+        const parts = id.split("/");
+        const name = id.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+        const subpath = id.slice(name.length);
+        const target = packageRootOf(resolved.packageJsonPath, name);
+        if (!target) return null;
+        if (!rootOwnPackage.has(name)) rootOwnPackage.set(name, packageRootFrom(outDir, name));
+        if (rootOwnPackage.get(name) === target) return null;
+        const hash = createHash("sha256").update(target).digest("hex").slice(0, 8);
+        const alias = `@neutron-external/${name.replace(/^@/, "").replace(/\//g, "__")}-${hash}`;
+        links.set(alias, target);
+        return { id: alias + subpath, external: true };
+      },
+    },
+    /** Create the alias symlinks (relative, so the dist moves with node_modules). */
+    link(): void {
+      for (const [alias, target] of links) {
+        const linkPath = path.join(outDir, "node_modules", alias);
+        fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+        fs.rmSync(linkPath, { force: true, recursive: true });
+        fs.symlinkSync(path.relative(path.dirname(linkPath), target), linkPath, "dir");
+      }
+    },
+  };
+}
+
+/**
+ * Keep `import.meta.url` / `filename` / `dirname` pointing at each module's
+ * SOURCE file, as they do under Vite's SSR runtime and plain Node. Bundled,
+ * they would name the chunk instead, and code that resolves files next to
+ * itself (fonts, templates, a generated client's engine) reads the wrong
+ * directory. Rewritten relative to the chunk's own URL rather than as an
+ * absolute path, so the dist keeps working when the app root moves with it.
+ */
+function pinImportMetaPathsPlugin(outDir: string) {
+  const META = /\bimport\.meta\.(url|filename|dirname)\b/g;
+  return {
+    name: "neutron:pin-import-meta-paths",
+    enforce: "pre" as const,
+    transform(code: string, id: string) {
+      if (id.startsWith("\0") || !code.includes("import.meta.")) return null;
+      const file = id.split("?")[0];
+      if (!path.isAbsolute(file) || !fs.existsSync(file)) return null;
+      META.lastIndex = 0;
+      if (!META.test(code)) return null;
+      const rel = path.relative(outDir, file).split(path.sep).join("/");
+      const url = `new URL(${JSON.stringify(rel)}, import.meta.url)`;
+      let usesPath = false;
+      const replaced = code.replace(META, (_match, prop: string) => {
+        if (prop === "url") return `${url}.href`;
+        usesPath = true;
+        const filename = `__neutronFileURLToPath(${url})`;
+        return prop === "filename" ? filename : `__neutronDirname(${filename})`;
+      });
+      // Same line: the transform moves no code between lines (map: null).
+      const prefix = usesPath
+        ? 'import { fileURLToPath as __neutronFileURLToPath } from "node:url"; ' +
+          'import { dirname as __neutronDirname } from "node:path"; '
+        : "";
+      return { code: prefix + replaced, map: null };
+    },
   };
 }
 

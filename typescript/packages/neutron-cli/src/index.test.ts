@@ -1419,7 +1419,7 @@ describe("resolveListenAddress", () => {
 
 import { spawn, type ChildProcess } from "node:child_process";
 import * as net from "node:net";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CLI_PACKAGE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI_BIN = path.join(CLI_PACKAGE_DIR, "bin", "neutron-ts.mjs");
@@ -1743,6 +1743,136 @@ export default function Page() {
       await runBuild(dir);
       const html = fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8");
       assert.ok(html.includes("compat-path=/<"), html);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("neutron-ts build + start (process): prebuilt server bundle", () => {
+  it("serves every route kind from dist without constructing a Vite server", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "server-bundle-fixture", type: "module" }),
+      "neutron.config.ts": `export default { runtime: "react-compat" };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/middleware.ts": `
+export default async function middleware(request, context, next) {
+  if (new URL(request.url).pathname.startsWith("/private")) return new Response("denied", { status: 401 });
+  const response = await next();
+  response.headers.set("x-global", "ran");
+  return response;
+}
+`,
+      "src/routes/_layout.tsx": `
+import { useLocation } from "@neutron-build/core";
+export default function Layout({ children }) {
+  return <main><span>layout-path={useLocation().pathname}</span>{children}</main>;
+}
+`,
+      "src/routes/index.tsx": `
+import { useState, useMemo } from "react";
+export const config = { mode: "app" };
+export async function loader() { return { n: 41 }; }
+export default function Home({ data }) {
+  const [count] = useState(data.n + 1);
+  return <p>{useMemo(() => "hooks-count=" + count, [count])}</p>;
+}
+`,
+      "src/routes/about.tsx": `
+export const config = { mode: "static" };
+export default function About() { return <p>about-static</p>; }
+`,
+      "src/routes/not-found.tsx": `
+export const config = { mode: "app" };
+export default function NotFound() { return <p>custom-missing</p>; }
+`,
+      "src/routes/api/meta.ts": `
+export function GET() { return Response.json({ url: import.meta.url }); }
+`,
+      // Records every import of "vite" from core's server module: the only
+      // one is createSsrServer's, so the file stays empty unless a Vite
+      // server is constructed.
+      "probe/register.mjs": `import { register } from "node:module";
+register(new URL("./hooks.mjs", import.meta.url));
+`,
+      "probe/hooks.mjs": `import { appendFileSync } from "node:fs";
+export async function resolve(specifier, context, next) {
+  if (specifier === "vite" && context.parentURL?.endsWith("/dist/server/index.js")) {
+    appendFileSync(process.env.NEUTRON_VITE_PROBE, context.parentURL + "\\n");
+  }
+  return next(specifier, context);
+}
+`,
+    });
+    const probeLog = path.join(dir, "probe", "vite-imports.log");
+    fs.writeFileSync(probeLog, "");
+    const startEnv = {
+      NODE_OPTIONS: `--import ${path.join(dir, "probe", "register.mjs")}`,
+      NEUTRON_VITE_PROBE: probeLog,
+      NEUTRON_HOST: "127.0.0.1",
+    };
+    const startAndProbe = async () => {
+      const port = await freePort();
+      const proc = runCli("start", dir, { ...startEnv, NEUTRON_PORT: String(port) });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+        const get = async (p: string) => {
+          const res = await fetch(`http://127.0.0.1:${port}${p}`, { headers: { accept: "text/html" } });
+          return { status: res.status, global: res.headers.get("x-global"), body: await res.text() };
+        };
+        return {
+          home: await get("/"),
+          about: await get("/about"),
+          meta: await get("/api/meta"),
+          missing: await get("/nope"),
+          denied: await get("/private/x"),
+          output: proc.output(),
+        };
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+    };
+    try {
+      await runBuild(dir);
+      const manifest = path.join(dir, "dist", ".neutron-server-bundle.json");
+      assert.deepEqual(JSON.parse(fs.readFileSync(manifest, "utf-8")), {
+        format: 1,
+        entry: "server/start/entry.js",
+        runtime: "react-compat",
+      });
+
+      const bundled = await startAndProbe();
+      assert.match(bundled.output, /Modules: prebuilt server bundle/, bundled.output);
+      assert.equal(fs.readFileSync(probeLog, "utf-8"), "", "a Vite server was constructed");
+      assert.equal(bundled.home.status, 200);
+      assert.ok(bundled.home.body.includes("hooks-count=42"), bundled.home.body);
+      assert.ok(bundled.home.body.includes("layout-path=/<"), bundled.home.body);
+      assert.equal(bundled.home.global, "ran");
+      assert.equal(bundled.about.status, 200);
+      assert.ok(bundled.about.body.includes("about-static"), bundled.about.body);
+      assert.equal(bundled.meta.status, 200);
+      assert.equal(bundled.meta.global, "ran");
+      // import.meta.url still names the source module, as under Vite and Node.
+      assert.deepEqual(JSON.parse(bundled.meta.body), {
+        url: pathToFileURL(fs.realpathSync(path.join(dir, "src", "routes", "api", "meta.ts"))).href,
+      });
+      assert.equal(bundled.missing.status, 404);
+      assert.ok(bundled.missing.body.includes("custom-missing"), bundled.missing.body);
+      assert.equal(bundled.denied.status, 401);
+
+      // Without the manifest the same dist runs on the Vite runtime — and the
+      // probe sees it, so its silence above is meaningful.
+      fs.rmSync(manifest);
+      const viaVite = await startAndProbe();
+      assert.match(viaVite.output, /Modules: transformed through Vite/, viaVite.output);
+      assert.notEqual(fs.readFileSync(probeLog, "utf-8"), "");
+      assert.ok(viaVite.home.body.includes("hooks-count=42"), viaVite.home.body);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

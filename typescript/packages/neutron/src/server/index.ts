@@ -79,6 +79,7 @@ import {
 import { handleImageRequest } from "./image-optimizer.js";
 import { capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 import { handleIslandRequest } from "./server-islands.js";
+import { loadServerBundle, serverBundleKey, type LoadedServerBundle } from "./server-bundle.js";
 import type {
   ActionArgs,
   AppContext,
@@ -109,6 +110,13 @@ export type {
   MemoryLoaderCacheStoreOptions,
 } from "./cache-store.js";
 export { csrfMiddleware } from "./csrf.js";
+export { findGlobalMiddlewareFile } from "../core/global-middleware.js";
+export {
+  SERVER_BUNDLE_MANIFEST,
+  SERVER_BUNDLE_FORMAT,
+  generateServerBundleEntry,
+  type ServerBundleManifest,
+} from "./server-bundle.js";
 export {
   onShutdownSignal,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -264,6 +272,15 @@ export interface NeutronServerOptions {
    * `mount: { "/api/trpc": { app: trpcApp, globalMiddleware: false } }`.
    */
   mount?: Record<string, NeutronMountApp | NeutronMount>;
+  /**
+   * Load route modules, layouts and global middleware from the prebuilt
+   * server bundle `neutron-ts build` writes to dist (default `true`, used
+   * when the dist carries a current one). `false` always transforms them
+   * from source through a Vite SSR runtime — for a development server built
+   * on `createServer`, where a bundle left in dist by an earlier build would
+   * otherwise serve that build's code.
+   */
+  serverBundle?: boolean;
 }
 
 /** The object form of a {@link NeutronServerOptions.mount} entry. */
@@ -314,6 +331,13 @@ export interface NeutronServer {
   wss?: WebSocketServer;
   close: () => Promise<void>;
   url: string;
+  /**
+   * Where route modules, layouts and global middleware are loaded from:
+   * `"server-bundle"` (the dist's prebuilt bundle, no Vite at runtime),
+   * `"vite"` (transformed through a Vite SSR runtime — dev, or a dist without
+   * a current bundle), or `null` (nothing to load: static-only or api/raw).
+   */
+  moduleSource: "server-bundle" | "vite" | null;
 }
 
 export interface NeutronRequestStartEvent {
@@ -414,6 +438,13 @@ interface SsrServer {
    * `options` object.
    */
   renderer: RouteRenderer;
+  /**
+   * Server-island endpoint from the same graph as the routes: `<ServerIsland>`
+   * registers into its own module's registry and renders with its own Preact,
+   * so the endpoint must be that module's. Absent = core's own.
+   */
+  handleIslandRequest?: typeof handleIslandRequest;
+  source: "server-bundle" | "vite";
   close: () => Promise<void>;
 }
 
@@ -459,6 +490,7 @@ export async function createServer(
     routes: routeRules,
     hooks,
     version: serverVersion = DEFAULT_HEALTH_VERSION,
+    serverBundle: useServerBundle = true,
   } = options;
 
   const resolvedRootDir = path.resolve(rootDir);
@@ -509,9 +541,27 @@ export async function createServer(
   // must reject createServer, not silently downgrade the app to a static
   // server whose auth/tenant/CSRF middleware never runs. Static-only
   // serving is an explicitly selected mode, not an error fallback.
-  const ssrServer = needsSsrRuntime
-    ? await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime)
+  //
+  // `neutron-ts build` compiles everything this runtime would load into a
+  // server bundle; a dist that carries a current one is served from it with
+  // no Vite server at all (F-P2-1: transforming the app graph at every boot
+  // cost real apps tens of seconds of CPU and gigabytes of RSS).
+  const serverBundle = needsSsrRuntime && useServerBundle
+    ? await loadServerBundle({
+        rootDir: resolvedRootDir,
+        distDir: resolvedDistDir,
+        runtime,
+        requiredFiles: [
+          ...routes.map((route) => route.file),
+          ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
+        ],
+      })
     : null;
+  const ssrServer = !needsSsrRuntime
+    ? null
+    : serverBundle
+      ? await createBundledSsrServer(resolvedRootDir, serverBundle)
+      : await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime);
   // An optional src/middleware.ts (default export = a MiddlewareFn) runs
   // OUTERMOST, before any per-route middleware. Loaded once at startup through
   // the same SSR runtime as routes so it shares the module graph (hooks,
@@ -838,7 +888,10 @@ export async function createServer(
 
   app.get("/__neutron_island/:id", async (c) => {
     const islandId = c.req.param("id");
-    const html = await handleIslandRequest(islandId, c.req.query("t"));
+    const html = await (ssrServer?.handleIslandRequest ?? handleIslandRequest)(
+      islandId,
+      c.req.query("t")
+    );
     if (html === null) {
       return c.text("Not Found", 404);
     }
@@ -1443,6 +1496,7 @@ export async function createServer(
       }
       return `http://${host}:${port}`;
     })(),
+    moduleSource: ssrServer?.source ?? null,
   };
 }
 
@@ -2310,6 +2364,8 @@ async function createSsrServer(
     return {
       ssrLoadModule,
       renderer,
+      handleIslandRequest: await loadGraphIslandHandler(ssrLoadModule),
+      source: "vite",
       close: () => viteServer.close(),
     };
   } catch (error) {
@@ -2318,6 +2374,51 @@ async function createSsrServer(
     // serve correctly. Swallowing it produced a static-only server whose
     // gates never ran.
     throw new Error(`Failed to initialize Vite SSR runtime: ${String(error)}`);
+  }
+}
+
+/**
+ * SSR runtime backed by the dist's prebuilt server bundle. Module ids are the
+ * ones the Vite runtime receives — absolute source paths for route modules
+ * and global middleware, bare ids for the renderer — so everything above it
+ * (loadRouteModule, loadGlobalMiddleware, loadRunnerRenderer) is shared.
+ */
+async function createBundledSsrServer(
+  rootDir: string,
+  bundle: LoadedServerBundle
+): Promise<SsrServer> {
+  const ssrLoadModule = async (id: string): Promise<unknown> => {
+    if (Object.prototype.hasOwnProperty.call(bundle.renderer, id)) {
+      return bundle.renderer[id];
+    }
+    const load = bundle.modules[serverBundleKey(rootDir, id)];
+    if (!load) {
+      throw new Error(
+        `${path.relative(rootDir, id) || id} is not in the server bundle ` +
+          `${path.relative(rootDir, bundle.entryPath)}; rebuild with \`neutron-ts build\`.`
+      );
+    }
+    return load();
+  };
+  return {
+    ssrLoadModule,
+    renderer: await loadRunnerRenderer(ssrLoadModule),
+    handleIslandRequest: await loadGraphIslandHandler(ssrLoadModule),
+    source: "server-bundle",
+    close: async () => {},
+  };
+}
+
+async function loadGraphIslandHandler(
+  ssrLoadModule: (id: string) => Promise<unknown>
+): Promise<typeof handleIslandRequest | undefined> {
+  try {
+    const core = (await ssrLoadModule("@neutron-build/core")) as {
+      handleIslandRequest?: typeof handleIslandRequest;
+    };
+    return typeof core.handleIslandRequest === "function" ? core.handleIslandRequest : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -2503,8 +2604,17 @@ export async function startServer(
   const { url, close } = running;
 
   console.log(`\n  Neutron production server running:\n`);
-  console.log(`  Local:   ${url}\n`);
-  console.log(`  Press Ctrl+C to stop\n`);
+  console.log(`  Local:   ${url}`);
+  if (running.moduleSource) {
+    console.log(
+      `  Modules: ${
+        running.moduleSource === "server-bundle"
+          ? "prebuilt server bundle"
+          : "transformed through Vite (no current server bundle in dist)"
+      }`
+    );
+  }
+  console.log(`\n  Press Ctrl+C to stop\n`);
 
   // Graceful shutdown with a bounded drain (FRAMEWORK_CONTRACT.md §8: 30s).
   onShutdownSignal(close);

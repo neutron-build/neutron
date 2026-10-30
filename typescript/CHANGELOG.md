@@ -120,6 +120,33 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **`neutron-ts start` serves from a prebuilt server bundle instead of
+  transforming source through Vite.** `createServer` built a Vite SSR server
+  at every boot and transformed each route module, layout, `not-found`,
+  resource route and `src/middleware.ts` on first use, so production paid a
+  full transform per boot (a large app measured ~18 s CPU and ~2.3 GB RSS)
+  and needed Vite at runtime. `neutron-ts build` now compiles that set into
+  `dist/server/start/` (one module graph with preact,
+  preact-render-to-string and `@neutron-build/core`, so hooks, the renderer
+  and router providers share one Preact instance under both runtimes; route
+  modules stay lazily loaded) and records it in
+  `dist/.neutron-server-bundle.json`. `createServer` loads it natively when
+  present and constructs no Vite server. On the reference fixture
+  (react-compat page with hooks, layout, resource route, not-found, global
+  middleware) boot plus one request per route kind went from ~2.1 s to
+  ~0.8 s process CPU and ~200-237 MB to ~120 MB RSS. A dist without a
+  current bundle (older CLI, a route added since the build, another
+  `runtime`) still runs on the Vite runtime, with a warning when a bundle is
+  present but unusable; a bundle that fails to import is a startup error.
+  In the bundle, `import.meta.url`/`filename`/`dirname` keep naming each
+  module's source file, and dependencies of bundled packages resolve from
+  their importer (symlinked aliases under `dist/server/start/node_modules/`)
+  as they do under Vite and Node. New: `createServer({ serverBundle: false })`
+  forces the Vite runtime (for development servers built on `createServer`),
+  `NeutronServer.moduleSource` reports which one is in use, and the boot
+  banner prints it. Server islands are now answered by the `@neutron-build/core`
+  instance in the routes' module graph, where `<ServerIsland>` registered
+  them.
 - **Config redirects merge the incoming query into a destination that has
   its own.** A `routes.redirects` rule kept the request's query only when the
   destination had none, so `/old?utm_source=mail` → `/new?tab=info` dropped

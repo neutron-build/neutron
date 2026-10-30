@@ -19,6 +19,23 @@ The Node adapter ships inside `@neutron-build/core` and is selected at build tim
     node dist/server.mjs
     ```
 
+## `neutron-ts start`
+
+`neutron-ts build` also compiles everything the production server loads per
+request (route modules, layouts, `not-found`, resource routes and
+`src/middleware.ts`) into a server bundle at `dist/server/start/`, recorded
+in `dist/.neutron-server-bundle.json`. `neutron-ts start` (and
+`createServer`) loads it natively: no source is transformed at boot and no
+Vite server is created. The boot banner says which source it used
+(`Modules: prebuilt server bundle`). Externals still resolve from
+`node_modules`, so deploy `dist/` together with your installed dependencies.
+
+The bundle is the code as of the last build. When it cannot stand in for the
+source (built for another `runtime`, or missing a route added since), the
+server warns and transforms routes through Vite at runtime instead. A
+`createServer`-based development server should pass `serverBundle: false`
+so a bundle left in `dist/` by an earlier build does not serve stale code.
+
 ## `neutron-ts preview` vs. the production artifact
 
 `npx neutron-ts preview` starts a **local** preview server that runs SSR through the
@@ -26,7 +43,7 @@ dev toolchain (Vite + your `src/` files). It is convenient for a quick local
 check, but it is **not** the artifact you deploy:
 
 - **Preview** needs `src/` and your dev dependencies present, and pulls Vite
-  at runtime.
+  at runtime unless the build left a server bundle in `dist/`.
 - **The deployed artifact** is the preset-generated entry (e.g.
   `dist/server.mjs` from `--preset docker`), which bundles everything and ships
   **no Vite** — it runs from `dist/` alone.
