@@ -17,7 +17,7 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/nucleus` | 0.3.0 |
 | `@neutron-build/data` | 0.3.0 |
 | `@neutron-build/agents` | 0.2.0 |
-| `@neutron-build/core` | 0.4.0 |
+| `@neutron-build/core` | 0.4.1 |
 | `@neutron-build/cli` | 0.4.0 |
 | `@neutron-build/create` | 0.1.10 |
 | `@neutron-build/auth` | 0.1.5 |
@@ -34,10 +34,10 @@ What changed in each package is in `CHANGELOG.md`. Check the registry for what i
 live: `npm view <package> version`.
 
 The former unscoped `create-neutron` package is deprecated. Do not publish new
-versions under that name. Version 0.1.9 of `@neutron-build/create` is published;
-0.1.10 (with core 0.4.0 and cli 0.4.0) is prepared and must be published
-together: `create` pins the `core`/`cli` pair, and the packed `cli`
-depends on `create`.
+versions under that name. Version 0.1.10 of `@neutron-build/create` is published
+with core 0.4.0 and cli 0.4.0. `create` pins the `core`/`cli` pair (`^0.4.0`), and
+the packed `cli` depends on `create`; core 0.4.1 is a patch inside that range, so
+it publishes alone.
 
 ## Publish
 
