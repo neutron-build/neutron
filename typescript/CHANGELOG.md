@@ -128,6 +128,17 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **A static-only build no longer bundles server dependencies as browser
+  code.** With no app routes, `neutron-ts build` extracts CSS by bundling
+  every route module for the browser, so a static page whose imports reach a
+  server-only package (a native addon such as `isolated-vm`) failed the
+  build with `UNLOADABLE_DEPENDENCY`/`UNRESOLVED_IMPORT`. In that pass,
+  packages under `node_modules` are now external unless they resolve to a
+  stylesheet — `import "pkg/style.css"` and packages whose entry is CSS
+  (`@fontsource/*`) are still collected — and resource routes, which render
+  no page, are not imported at all. A stylesheet a dependency's own
+  JavaScript imports internally is no longer picked up by this pass; import
+  it from app code instead.
 - **`neutron-ts build` prerenders static pages inside the router
   providers.** The CLI's static prerender mounted no router context, so
   `useLocation()` returned `/` (and `useParams()`/`useLoaderData()` their

@@ -259,9 +259,11 @@ export async function build(): Promise<void> {
     // tree-shaken. Side-effect-only imports would keep `import "x.css"` lines but
     // drop value-imported CSS Modules (`import s from "x.module.css"`) once the
     // unused component that references them is shaken away.
+    // Resource routes are skipped: they render no page and carry no CSS, and
+    // their handlers are server code through and through.
     const importLines: string[] = [];
     const keepRefs: string[] = [];
-    routes.forEach((route, i) => {
+    routes.filter((route) => !isResourceRoute(route)).forEach((route, i) => {
       const abs = route.file.replace(/\\/g, "/");
       const rel = abs.startsWith(cwdFwd + "/") ? abs.slice(cwdFwd.length) : "/@fs" + abs;
       importLines.push(`import * as __r${i} from ${JSON.stringify(rel + "?" + CLIENT_ROUTE_QUERY)};`);
@@ -294,6 +296,25 @@ export async function build(): Promise<void> {
                 return fs.readFileSync(real, "utf-8");
               }
               return null;
+            },
+          },
+          {
+            // This pass bundles each page's import graph as BROWSER code only to
+            // find its CSS, and a static page may import server-only packages
+            // (a native addon cannot be bundled at all — F-P1-2). Dependencies
+            // are therefore external here, except modules that resolve to a
+            // stylesheet: `import "pkg/style.css"` and packages whose entry is
+            // CSS (`@fontsource/*`) are still collected. Nothing this pass
+            // emits as JS ships.
+            name: "neutron:css-pass-external-deps",
+            enforce: "pre" as const,
+            async resolveId(source: string, importer: string | undefined, options: Record<string, unknown>) {
+              if (!importer || source.startsWith("\0")) return null;
+              const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+              if (!resolved || resolved.external) return resolved;
+              const file = resolved.id.replace(/\?.*$/, "").replace(/\\/g, "/");
+              if (!file.includes("/node_modules/") || CSS_LANG_RE.test(file)) return resolved;
+              return { id: source, external: true };
             },
           },
           neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
@@ -966,6 +987,9 @@ export async function build(): Promise<void> {
  */
 
 /** Security gate for every param-derived static write: reject traversal. */
+// Vite's stylesheet languages (CSS_LANGS_RE in vite/src/node/constants.ts).
+const CSS_LANG_RE = /\.(css|less|sass|scss|styl|stylus|pcss|postcss|sss)$/;
+
 function assertSafeResolvedPath(routePath: string, resolvedPath: string): void {
   if (isUnsafeResolvedPath(resolvedPath)) {
     throw new Error(

@@ -1654,13 +1654,20 @@ describe("writePublicFilesMetadata", () => {
 // `neutron-ts build` as a real process.
 // ---------------------------------------------------------------------------
 
-function makeBuildFixture(files: Record<string, string>): string {
+// node_modules links every package the CLI resolves, so `files` can add fake
+// packages under node_modules/ next to them.
+function makeBuildFixture(files: Record<string, string | Buffer>): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-cli-build-"));
+  const cliModules = path.join(CLI_PACKAGE_DIR, "node_modules");
+  fs.mkdirSync(path.join(dir, "node_modules"));
+  for (const entry of fs.readdirSync(cliModules)) {
+    if (entry.startsWith(".")) continue;
+    fs.symlinkSync(path.join(cliModules, entry), path.join(dir, "node_modules", entry), "dir");
+  }
   for (const [name, source] of Object.entries(files)) {
     fs.mkdirSync(path.join(dir, path.dirname(name)), { recursive: true });
     fs.writeFileSync(path.join(dir, name), source);
   }
-  fs.symlinkSync(path.join(CLI_PACKAGE_DIR, "node_modules"), path.join(dir, "node_modules"), "dir");
   return dir;
 }
 
@@ -1707,6 +1714,57 @@ export function getStaticPaths() { return [{ params: { slug: "hello" } }]; }
         const html = read(file);
         assert.ok(html.includes(`page-path=${expected}<`), `${file}: ${html}`);
         assert.ok(html.includes(`layout-path=${expected}<`), `${file}: ${html}`);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("neutron-ts build (process): static CSS pass", () => {
+  it("does not bundle server-only dependencies, and still collects dependency CSS", { timeout: 180_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "css-pass-fixture", type: "module" }),
+      // Node loads this fine (the addon is only required when called); a
+      // browser bundle has to load the binary and cannot.
+      "node_modules/server-native/package.json": JSON.stringify({ name: "server-native", main: "index.js" }),
+      "node_modules/server-native/index.js": `exports.load = () => require("./out/addon");\n`,
+      "node_modules/server-native/out/addon.node": Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0xff, 0xfe, 0x00, 0x80]),
+      "node_modules/ui-kit/package.json": JSON.stringify({ name: "ui-kit", main: "index.js" }),
+      "node_modules/ui-kit/index.js": "exports.x = 1;\n",
+      "node_modules/ui-kit/style.css": ".from-ui-kit { color: blue; }\n",
+      "node_modules/css-main/package.json": JSON.stringify({ name: "css-main", main: "index.css" }),
+      "node_modules/css-main/index.css": ".from-css-main { color: green; }\n",
+      "src/routes/index.tsx": `
+import { h } from "preact";
+import { load } from "server-native";
+import "ui-kit/style.css";
+import "css-main";
+import "./page.css";
+export const config = { mode: "static" };
+export default function Page() {
+  return h("p", null, "loader is " + typeof load);
+}
+`,
+      "src/routes/page.css": ".from-page { color: red; }\n",
+      "src/routes/api/native.ts": `
+import { load } from "server-native";
+export function GET() { return Response.json({ kind: typeof load }); }
+`,
+    });
+    try {
+      await runBuild(dir);
+      assert.ok(
+        fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8").includes("loader is function")
+      );
+      const assets = path.join(dir, "dist", "assets");
+      const css = fs
+        .readdirSync(assets)
+        .filter((f) => f.endsWith(".css"))
+        .map((f) => fs.readFileSync(path.join(assets, f), "utf-8"))
+        .join("\n");
+      for (const rule of [".from-page", ".from-ui-kit", ".from-css-main"]) {
+        assert.ok(css.includes(rule), `${rule} missing from emitted CSS:\n${css}`);
       }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
