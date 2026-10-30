@@ -247,6 +247,7 @@ func TestSessionMiddlewareCustomCookieName(t *testing.T) {
 	mw := SessionMiddleware(store, WithCookieName("my_sess"))
 
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		SessionFromContext(r.Context()).Set("k", "v")
 		w.WriteHeader(200)
 	}))
 
@@ -912,5 +913,59 @@ func TestSessionFailedCommitCannotHijack(t *testing.T) {
 	}
 	if response.Code != http.StatusServiceUnavailable || response.called {
 		t.Fatalf("status %d hijacked %v", response.Code, response.called)
+	}
+}
+
+// A cookieless request whose handler never touches the session must not
+// write to the store or set a cookie: health probes, crawlers and asset
+// requests would otherwise each create a session.
+func TestSessionAnonymousUntouchedIsNotPersisted(t *testing.T) {
+	store := newMemoryStore()
+	handler := SessionMiddleware(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = SessionFromContext(r.Context()).Get("anything")
+		w.WriteHeader(200)
+	}))
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
+		if c := w.Header().Get("Set-Cookie"); c != "" {
+			t.Fatalf("untouched anonymous session set a cookie: %s", c)
+		}
+	}
+	if len(store.data) != 0 {
+		t.Fatalf("store holds %d sessions for untouched anonymous requests", len(store.data))
+	}
+
+	// Data set by the handler is persisted with a cookie, without an
+	// explicit Save.
+	w := httptest.NewRecorder()
+	SessionMiddleware(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		SessionFromContext(r.Context()).Set("cart", "x")
+	})).ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if len(store.data) != 1 || !strings.Contains(w.Header().Get("Set-Cookie"), "session_id=") {
+		t.Fatalf("session with data: store=%d cookie=%q", len(store.data), w.Header().Get("Set-Cookie"))
+	}
+}
+
+// A cookie naming a session the store no longer has is expired, not left
+// for the browser to keep presenting.
+func TestSessionStaleCookieIsExpired(t *testing.T) {
+	store := newMemoryStore()
+	handler := SessionMiddleware(store)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(&http.Cookie{Name: "session_id", Value: "revoked-id"})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	var cookie *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "session_id" {
+			cookie = c
+		}
+	}
+	if cookie == nil || cookie.MaxAge >= 0 || cookie.Value != "" {
+		t.Fatalf("stale cookie not expired: %+v", cookie)
+	}
+	if len(store.data) != 0 {
+		t.Fatal("stale cookie created a session")
 	}
 }

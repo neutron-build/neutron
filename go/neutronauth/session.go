@@ -64,6 +64,10 @@ type Session struct {
 	destroyed  bool
 	version    string
 	failure    error
+	// staleCookie: the request presented a session ID the store did not
+	// have (expired or revoked); the browser's cookie is expired unless a
+	// new session is persisted in its place.
+	staleCookie bool
 }
 
 // Get returns a session value.
@@ -222,18 +226,21 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 					version = loaded.Version
 				}
 			}
+			stale := false
 			if data == nil {
+				stale = sessionID != ""
 				sessionID = generateSessionID()
 				data = make(map[string]any)
 			}
 
 			sess := &Session{
-				ID:         sessionID,
-				Data:       data,
-				store:      store,
-				ttl:        o.ttl,
-				originalID: sessionID,
-				version:    version,
+				ID:          sessionID,
+				Data:        data,
+				store:       store,
+				ttl:         o.ttl,
+				originalID:  sessionID,
+				version:     version,
+				staleCookie: stale,
 			}
 
 			// The cookie is written when the response headers are committed,
@@ -281,6 +288,17 @@ func finalizeSession(ctx context.Context, r *http.Request, w http.ResponseWriter
 	}
 	if s.destroyed {
 		http.SetCookie(w, sessionCookieFor(o, "", -1))
+		return nil
+	}
+	// A new session the handler never put data in is not stored and gets no
+	// cookie. Persisting one for every cookieless request turned each health
+	// probe, crawler hit and asset fetch into a store write and a Set-Cookie
+	// (which also defeats shared caching), and let any client grow the store
+	// without bound.
+	if s.version == "" && s.ID == s.originalID && len(s.Data) == 0 {
+		if s.staleCookie {
+			http.SetCookie(w, sessionCookieFor(o, "", -1))
+		}
 		return nil
 	}
 	if s.ID != s.originalID || s.version == "" {

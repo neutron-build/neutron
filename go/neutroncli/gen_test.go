@@ -233,10 +233,10 @@ func writeTempFile(t *testing.T, content string) *os.File {
 // the real generated output, not just the import line.
 func TestGenerateStructsIncludesJSONImport(t *testing.T) {
 	cases := []struct {
-		name      string
-		tables    []sqlTable
-		wantJSON  bool
-		wantTime  bool
+		name     string
+		tables   []sqlTable
+		wantJSON bool
+		wantTime bool
 	}{
 		{
 			name: "jsonb column",
