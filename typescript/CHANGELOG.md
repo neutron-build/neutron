@@ -25,6 +25,24 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **`<ServerIsland>` is usable from React-typed JSX — the component surface
+  is fully JSX-agnostic.** The last residual named by the control-flow work:
+  the server-side deferred-rendering island (exported from the package root,
+  `@neutron-build/core`) returned a preact `VNode`, so every usage from a
+  module typechecking against `@types/react` (`jsxImportSource: "react"`)
+  failed TS2786. Diagnosed with the same tsc-fixture method before designing:
+  it fails at the return position only — `id`, `fallback` and `children`
+  (React-authored elements) all flow through the untouched
+  `ServerIslandProps`. The fix is the repo precedent (Image/Picture, Await,
+  Island, the nav/form five, the control-flow five): the element return is
+  deliberately `any`, props stay fully typed, pinned by `@ts-expect-error`s
+  in both worlds (`type-fixtures/react-server-island/` on the react side,
+  the preact-JSX ServerIsland tests on the other). With it, a final sweep of
+  the public exports closed the campaign: every component exported from the
+  package root or `@neutron-build/core/client` is JSX-agnostic — the
+  remaining ones not covered by a dedicated fixture family (`Await`,
+  `Image`, `Picture`) are compiled from React-typed JSX by
+  `type-fixtures/react-export-sweep/`, and none fails.
 - **The control-flow components are usable from React-typed JSX.**
   `<Show>`, `<For>`, `<Switch>`, `<Match>` and `<Index>` (exported from the
   package root, `@neutron-build/core`) now have JSX-agnostic element returns,

@@ -124,24 +124,27 @@ Two coherent setups; mixing them per-file is fine (the pragma is per-module):
    element returns are deliberately JSX-agnostic (`<Island>`, `<Form>`,
    `<Link>`, `<NavLink>`, `<ViewTransitions>`, `<ScrollReveal>`, `<Image>`,
    `<Picture>`, `<Await>`, and the control-flow family `<Show>`, `<For>`,
-   `<Switch>`, `<Match>`, `<Index>`), while their props stay fully typed — a
-   mistyped prop fails TS2322 against the same prop interfaces under either
-   import source, and the control-flow render callbacks and `fallback` props
-   accept React-authored elements unchanged (preact's `ComponentChild`
-   includes `object`). Both worlds are pinned by compiled fixtures in
-   `@neutron-build/core` (`src/client/type-fixtures/react-nav-form/`,
-   `react-control-flow/` and `react-island/`, compiled with
+   `<Switch>`, `<Match>`, `<Index>`, plus the server-side `<ServerIsland>`),
+   while their props stay fully typed — a mistyped prop fails TS2322 against
+   the same prop interfaces under either import source, and the control-flow
+   render callbacks and `fallback` props accept React-authored elements
+   unchanged (preact's `ComponentChild` includes `object`). Both worlds are
+   pinned by compiled fixtures in `@neutron-build/core`
+   (`src/client/type-fixtures/react-nav-form/`, `react-control-flow/`,
+   `react-island/` and `react-export-sweep/`, plus
+   `src/server/type-fixtures/react-server-island/`, compiled with
    `jsxImportSource: "react"` against @types/react — the fixtures carry
    `@ts-expect-error` pins that fail the compile if prop checking regresses)
    and by the preact-JSX component tests in the package build. Note the
-   import path split: the control-flow family is exported from the package
-   root (`@neutron-build/core`), unlike the client-entry components above.
+   import path split: the control-flow family, `<Await>` and
+   `<ServerIsland>` are exported from the package root
+   (`@neutron-build/core`), unlike the client-entry components above.
 
-   One residual, stated plainly: `<ServerIsland>` (the server-side island
-   component exported from the root entry) still returns a preact `VNode`
-   and fails TS2786 from React-typed JSX, verified the same way. Keep
-   modules that use it Preact-typed (setup 1, or the per-file pragma
-   `/** @jsxImportSource preact */`) until it receives the same treatment.
+   With `<ServerIsland>` fixed, that list is the whole sweep: every
+   component exported from the package root or `@neutron-build/core/client`
+   is JSX-agnostic — the export-sweep fixture compiles the remaining ones
+   (`Await`, `Image`, `Picture`) from React-typed JSX alongside the
+   dedicated families, so none is left failing TS2786.
 
 3. **Children props shared by both worlds.** A component that *forwards*
    `children` in JSX cannot type that prop with either runtime's native
