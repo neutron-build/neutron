@@ -8,6 +8,7 @@ import { neutronPlugin } from "./plugin.js";
 import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
 import { discoverRoutes } from "../core/manifest.js";
 import { serverOpenApiSpec, type NeutronOpenApiOptions } from "../server/openapi.js";
+import type { NeutronRoutesConfig } from "../config.js";
 
 /**
  * Dev/prod contract parity for the dev pipeline:
@@ -85,7 +86,12 @@ async function makeApp(files: Record<string, string>): Promise<string> {
   return root;
 }
 
-async function boot(root: string, version?: string, openapi?: NeutronOpenApiOptions): Promise<string> {
+async function boot(
+  root: string,
+  version?: string,
+  openapi?: NeutronOpenApiOptions,
+  routeRules?: NeutronRoutesConfig
+): Promise<string> {
   const port = await getFreePort();
   const preactSsr = resolvePreactSsr(root);
   const vite = await createViteServer({
@@ -98,6 +104,7 @@ async function boot(root: string, version?: string, openapi?: NeutronOpenApiOpti
         rootDir: root,
         version,
         openapi,
+        routeRules,
       }),
     ],
     resolve: { alias: vitePreactAliases(preactSsr) },
@@ -353,6 +360,27 @@ export async function GET() {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it("adds route-rule headers to a Response.redirect() like start does", { timeout: 30_000 }, async () => {
+    const base = await boot(
+      await makeApp({
+        "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+        "api/go.ts": `
+export async function GET() {
+  return Response.redirect("http://127.0.0.1/login", 307);
+}
+`,
+      }),
+      undefined,
+      undefined,
+      { headers: [{ source: "/api/go", headers: { "x-route-rule": "yes" } }] }
+    );
+
+    const res = await fetch(`${base}/api/go`, { redirect: "manual" });
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toBe("http://127.0.0.1/login");
+    expect(res.headers.get("x-route-rule")).toBe("yes");
   });
 
   it("runs route middleware around dev dispatch", { timeout: 30_000 }, async () => {

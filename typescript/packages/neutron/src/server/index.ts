@@ -18,7 +18,7 @@ import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
-import { isResponse, notFound, acceptsHtml } from "../core/response.js";
+import { isResponse, notFound, acceptsHtml, withMutableHeaders } from "../core/response.js";
 import { createRouter } from "../core/router.js";
 import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
 import { installTransportPeer } from "./peer.js";
@@ -651,6 +651,20 @@ export async function createServer(
     app.use("*", compress());
   }
 
+  // Innermost of the framework's response post-processors (request id,
+  // security headers, CORS, Vary, compression all set headers after next()).
+  // A handler or mounted sub-app may answer with an immutable-header Response
+  // — `Response.redirect()`, a fetched response — which Hono passes through
+  // as-is, so the first of those header writes threw and the response became
+  // a bare 500.
+  app.use("*", async (c, next) => {
+    await next();
+    const mutable = withMutableHeaders(c.res);
+    if (mutable !== c.res) {
+      c.res = mutable;
+    }
+  });
+
   // GET /health — contract shape { status, nucleus, version }. Registered before
   // the static/SSR routes so it always answers. The SSR server holds no Nucleus
   // pool (loaders connect per-request), so nucleus is "unconfigured" here.
@@ -796,6 +810,9 @@ export async function createServer(
       response: Response,
       routeMeta?: { routeId?: string; routePath?: string; routeMode?: "static" | "app" }
     ): Response => {
+      // Middleware, loaders, actions and resource routes may hand back an
+      // immutable-header Response; route-rule headers are set right below.
+      response = withMutableHeaders(response);
       const normalizedRequestPath = normalizePathname(requestTrace.pathname) || "/";
       applyRouteRuleHeadersToResponse(
         response,

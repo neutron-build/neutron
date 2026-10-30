@@ -142,6 +142,18 @@ All notable changes to this project are documented in this file.
   dev overlay under `neutron-ts dev`. `dispatchResourceHandler` takes an
   optional `{ onError }` for the same purpose. `ProblemError` and thrown
   `Response` handling is unchanged.
+- **`Response.redirect()` works wherever app code can return a Response.**
+  Global middleware, loaders (returned or thrown), actions, resource routes
+  and mounted sub-apps that answered with `Response.redirect()` got a bare
+  500 under `neutron-ts start`. Native `Response.redirect()` (like fetched
+  responses) has an immutable header list, and the server sets headers on
+  every response on the way out (`x-request-id`, security headers, CORS,
+  `Vary`, route-rule headers), so the first write threw `TypeError`. The
+  server now copies such a response into one with mutable headers before
+  touching it, keeping body, status and headers. `neutron-ts dev` did not
+  500 but silently dropped route-rule headers on these responses; it now
+  applies them like `start`. `new Response(null, { status: 307, headers: {
+  Location } })` and `redirect()` were never affected.
 
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 

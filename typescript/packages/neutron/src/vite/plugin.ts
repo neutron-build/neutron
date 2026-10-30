@@ -9,7 +9,7 @@ import { discoverRoutes } from "../core/manifest.js";
 import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
 import { runMiddlewareChain } from "../core/middleware.js";
-import { isResponse } from "../core/response.js";
+import { isResponse, withMutableHeaders } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
 import {
   compileRouteRules,
@@ -494,11 +494,15 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           }
 
           // Run middleware chain + final handler
-          const response = await runMiddlewareChain(
-            middlewares,
-            request,
-            context,
-            () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming)
+          // Same as start: an immutable-header Response (Response.redirect())
+          // still gets the route-rule headers below.
+          const response = withMutableHeaders(
+            await runMiddlewareChain(
+              middlewares,
+              request,
+              context,
+              () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming)
+            )
           );
           applyRouteRuleHeadersToResponse(
             response,
