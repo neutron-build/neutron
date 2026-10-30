@@ -107,9 +107,11 @@ function methodNotAllowed(
  * - `HEAD` falls back to `GET` (same headers, no body);
  * - an unsupported method answers 405 problem+json with `Allow`;
  * - a returned/thrown `Response` is answered as-is; a thrown `ProblemError`
- *   becomes its RFC 7807 response; any other thrown error becomes a 500
- *   problem (FRAMEWORK_CONTRACT.md §2 — this surface has no HTML error
- *   boundary to defer to);
+ *   becomes its RFC 7807 response; any other thrown error goes to
+ *   `options.onError` (the server's error hook, dev's terminal/overlay) and
+ *   is answered with a generic 500 problem that carries none of its text
+ *   (FRAMEWORK_CONTRACT.md §2 — this surface has no HTML error boundary to
+ *   defer to);
  * - a non-Response return value is answered as JSON (200), the ergonomic
  *   default for REST endpoints.
  */
@@ -117,7 +119,8 @@ export async function dispatchResourceHandler(
   module: Partial<Record<ResourceRouteMethod, ResourceRouteHandler>>,
   request: Request,
   params: Record<string, string>,
-  context: AppContext
+  context: AppContext,
+  options: { onError?: (error: unknown) => void } = {}
 ): Promise<Response> {
   const method = request.method.toUpperCase();
   const known = RESOURCE_ROUTE_METHODS.includes(method as ResourceRouteMethod)
@@ -153,7 +156,8 @@ export async function dispatchResourceHandler(
     if (isResponse(error)) {
       return error;
     }
-    return internalError(`Resource route handler threw: ${String(error)}`).toResponse(pathname);
+    options.onError?.(error);
+    return internalError("The resource route handler failed.").toResponse(pathname);
   }
 }
 

@@ -876,7 +876,17 @@ export async function createServer(
           match,
           ssrServer,
           routeModuleCache,
-          globalMiddleware
+          globalMiddleware,
+          (error) =>
+            emitHook(hooks?.onError, {
+              requestId: requestTrace.requestId,
+              method: requestTrace.method,
+              pathname: requestTrace.pathname,
+              source: "request",
+              routeId: match.route.id,
+              routePath: match.route.path,
+              error: toError(error),
+            })
         );
         if (isMutationMethod(requestTrace.method)) {
           appCacheEpoch++;
@@ -1410,7 +1420,8 @@ async function handleResourceRouteRequest(
   match: RouteMatch,
   ssrServer: SsrServer,
   moduleCache: Map<string, Promise<RouteModule>>,
-  globalMiddleware?: MiddlewareFn[]
+  globalMiddleware: MiddlewareFn[] | undefined,
+  onError: (error: unknown) => void
 ): Promise<Response> {
   const allRoutes = [...match.layouts, match.route];
   const routeModules = new Map<string, RouteModule>();
@@ -1438,7 +1449,8 @@ async function handleResourceRouteRequest(
       module as Partial<Record<ResourceRouteMethod, ResourceRouteHandler>>,
       request,
       match.params,
-      context
+      context,
+      { onError }
     )
   );
 }

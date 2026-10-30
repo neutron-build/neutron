@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createServer, type NeutronServer } from "./index.js";
+import { createServer, type NeutronErrorEvent, type NeutronServer } from "./index.js";
 
 async function getFreePort(): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
@@ -385,6 +385,51 @@ export async function GET({ context }) {
     await fetch(`http://127.0.0.1:${port}/api/time`);
     await fetch(`http://127.0.0.1:${port}/api/users/7`);
     expect(seen).toEqual(["route:api/time.ts:200", "route:api/users/[id].ts:200"]);
+  });
+
+  it("a handler's thrown error reaches the onError hook; the client gets a generic 500", async () => {
+    root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-neutron-resource-"));
+    await fs.mkdir(path.join(root, "src", "routes", "api"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "src", "routes", "api", "boom.ts"),
+      `
+export async function GET() {
+  throw new Error("connect ECONNREFUSED postgres://admin:hunter2@db");
+}
+`,
+      "utf-8"
+    );
+    const port = await getFreePort();
+    const errors: NeutronErrorEvent[] = [];
+    running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+      hooks: { onError: (event) => void errors.push(event) },
+    });
+
+    const res = await fetch(`http://127.0.0.1:${port}/api/boom`);
+    expect(res.status).toBe(500);
+    expect(res.headers.get("content-type")).toContain("application/problem+json");
+    const text = await res.text();
+    expect(text).not.toContain("hunter2");
+    expect(text).not.toContain("ECONNREFUSED");
+    expect(JSON.parse(text)).toMatchObject({
+      type: "https://neutron.dev/errors/internal",
+      status: 500,
+      instance: "/api/boom",
+    });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      source: "request",
+      method: "GET",
+      pathname: "/api/boom",
+      routeId: "route:api/boom.ts",
+      routePath: "/api/boom",
+    });
+    expect(errors[0].error.message).toContain("hunter2");
   });
 
   it("extension-bearing resource paths dispatch as endpoints (dev parity)", async () => {

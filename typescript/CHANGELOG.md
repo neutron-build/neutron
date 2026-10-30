@@ -131,6 +131,17 @@ All notable changes to this project are documented in this file.
   dist for exactly those paths. A dist without the list (built by an older
   CLI or other tooling) falls back to refusing any dot-segment path and
   anything under `server/`.
+- **A resource-route handler's unexpected error no longer reaches the
+  client, and is reported.** A handler that threw anything other than a
+  `ProblemError` or a `Response` answered a 500 whose `detail` was
+  `Resource route handler threw: <error text>` (connection strings, file
+  paths, SQL), and the error never reached the server's `onError` hook, so
+  nothing logged it. The 500 problem body is now generic, and the error goes
+  to `hooks.onError` (`source: "request"`, with the resource route's
+  `routeId`/`routePath`) under `neutron-ts start`, and to the terminal and
+  dev overlay under `neutron-ts dev`. `dispatchResourceHandler` takes an
+  optional `{ onError }` for the same purpose. `ProblemError` and thrown
+  `Response` handling is unchanged.
 
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 

@@ -959,12 +959,23 @@ async function handleRequest(
   // already run around this handler (see the middleware collection above), so
   // gating matches production; loaders never run.
   if (isResourceRoute(route)) {
-    return dispatchResourceHandler(
-      moduleCache.get(route.id)!,
-      request,
-      params,
-      context
-    );
+    return dispatchResourceHandler(moduleCache.get(route.id)!, request, params, context, {
+      // Same reporting as an uncaught page error in dev: terminal + overlay.
+      onError: (error) => {
+        console.error("Resource route error:", error);
+        server.ws.send({
+          type: "custom",
+          event: "neutron:dev-toolbar:error",
+          data: parseError(
+            error instanceof Error ? error : new Error(String(error)),
+            "unknown",
+            rootDir,
+            route.id,
+            request.url
+          ),
+        });
+      },
+    });
   }
 
   // Handle action for mutations

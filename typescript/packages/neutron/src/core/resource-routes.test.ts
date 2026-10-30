@@ -207,6 +207,44 @@ describe("dispatchResourceHandler", () => {
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.type).toBe("https://neutron.dev/errors/internal");
   });
+
+  it("a thrown error is reported to onError and never echoed to the client", async () => {
+    const reported: unknown[] = [];
+    const thrown = new Error("connect ECONNREFUSED postgres://admin:hunter2@db");
+    const response = await dispatchResourceHandler(
+      { GET: () => Promise.reject(thrown) },
+      request("GET"),
+      {},
+      {},
+      { onError: (error) => reported.push(error) }
+    );
+    expect(response.status).toBe(500);
+    const text = await response.text();
+    expect(text).not.toContain("hunter2");
+    expect(text).not.toContain("ECONNREFUSED");
+    expect(JSON.parse(text)).toMatchObject({ title: "Internal Server Error", status: 500 });
+    expect(reported).toEqual([thrown]);
+  });
+
+  it("ProblemError and thrown Response are answers, not errors to report", async () => {
+    const reported: unknown[] = [];
+    const onError = (error: unknown) => reported.push(error);
+    await dispatchResourceHandler(
+      { GET: () => Promise.reject(notFoundError("gone")) },
+      request("GET"),
+      {},
+      {},
+      { onError }
+    );
+    await dispatchResourceHandler(
+      { GET: () => Promise.reject(new Response(null, { status: 302 })) },
+      request("GET"),
+      {},
+      {},
+      { onError }
+    );
+    expect(reported).toEqual([]);
+  });
 });
 
 describe("parseRouteFacts: resource-route detection", () => {

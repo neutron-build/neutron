@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as http from "node:http";
 import * as net from "node:net";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { createServer as createViteServer } from "vite";
 import { neutronPlugin } from "./plugin.js";
 import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
@@ -328,6 +328,31 @@ describe("dev server: resource routes answer like the production server", () => 
     expect(css.status).toBe(200);
     expect(css.headers.get("content-type")).toContain("text/css");
     expect(await css.text()).toBe("body{margin:0}");
+  });
+
+  it("answers a handler's thrown error with the same generic 500 as start", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "api/boom.ts": `
+export async function GET() {
+  throw new Error("connect ECONNREFUSED postgres://admin:hunter2@db");
+}
+`,
+    }));
+
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await fetch(`${base}/api/boom`);
+      expect(res.status).toBe(500);
+      expect(res.headers.get("content-type")).toContain("application/problem+json");
+      const text = await res.text();
+      expect(text).not.toContain("hunter2");
+      expect(JSON.parse(text)).toMatchObject({ status: 500, instance: "/api/boom" });
+      // The detail goes to the developer's terminal instead.
+      expect(consoleError.mock.calls.flat().map(String).join(" ")).toContain("hunter2");
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("runs route middleware around dev dispatch", { timeout: 30_000 }, async () => {
