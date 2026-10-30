@@ -327,9 +327,21 @@ export async function build(): Promise<void> {
         build: {
           outDir: outputDir,
           emptyOutDir: true,
-          lib: { entry: cssEntryPath, formats: ["es"] as const },
+          // Not a lib build: lib mode inlines every url() asset as a data: URI
+          // regardless of assetsInlineLimit (F-P1-3: every font face base64'd
+          // into the one stylesheet). As a plain build, fonts and images are
+          // emitted under assets/ with hashed names, by the same inline limit
+          // as the app client build. The strict entry signature keeps each
+          // route's exports, so CSS Modules referenced only by components are
+          // not shaken away. JS lands at the top level for the cleanup below.
           rolldownOptions: {
-            output: { assetFileNames: "assets/[name]-[hash][extname]" },
+            input: { "neutron-css": cssEntryPath },
+            preserveEntrySignatures: "strict" as const,
+            output: {
+              entryFileNames: "[name].js",
+              chunkFileNames: "[name]-[hash].js",
+              assetFileNames: "assets/[name]-[hash][extname]",
+            },
           },
           cssCodeSplit: false,
           // This build imports every route to walk their CSS, so it emits a

@@ -1771,3 +1771,41 @@ export function GET() { return Response.json({ kind: typeof load }); }
     }
   });
 });
+
+describe("neutron-ts build (process): static CSS assets", () => {
+  it("emits url() fonts as hashed files instead of inlining them", { timeout: 180_000 }, async () => {
+    // Over the 4 KiB default inline limit, like any real font face.
+    const font = Buffer.alloc(16 * 1024, 7);
+    const dir = makeBuildFixture({
+      "src/routes/index.tsx": `
+import { h } from "preact";
+import "./fonts.css";
+export const config = { mode: "static" };
+export default function Page() { return h("p", null, "fonts"); }
+`,
+      "src/routes/fonts.css":
+        '@font-face { font-family: "Probe"; src: url("./probe.woff2") format("woff2"); }\n' +
+        "p { font-family: Probe; }\n",
+      "src/routes/probe.woff2": font,
+    });
+    try {
+      await runBuild(dir);
+      const assets = path.join(dir, "dist", "assets");
+      const files = fs.readdirSync(assets);
+      const fontFile = files.find((f) => /^probe-[\w-]+\.woff2$/.test(f));
+      assert.ok(fontFile, `no hashed woff2 emitted: ${files.join(", ")}`);
+      assert.deepEqual(fs.readFileSync(path.join(assets, fontFile)), font);
+      const css = files
+        .filter((f) => f.endsWith(".css"))
+        .map((f) => fs.readFileSync(path.join(assets, f), "utf-8"))
+        .join("\n");
+      assert.ok(css.includes(`url(/assets/${fontFile})`), css);
+      assert.ok(!css.includes("data:font"), "font inlined as a data: URI");
+      assert.ok(
+        fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8").includes('rel="stylesheet"')
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

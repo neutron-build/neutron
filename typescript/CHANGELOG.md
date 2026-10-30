@@ -128,6 +128,16 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Static-only builds emit fonts and images as files instead of inlining
+  them into the stylesheet.** The CSS-extraction pass ran as a Vite library
+  build, and library mode inlines every `url()` asset as a base64 `data:` URI
+  whatever `build.assetsInlineLimit` says — one reported stylesheet was 798 KB,
+  459 KB of it font faces, paid uncached on every first page load. The pass is
+  now a plain build: assets are written under `dist/assets/` with hashed names
+  and referenced by URL, under the same inline limit as the app client
+  build. The stylesheet itself is now `assets/style-<hash>.css` rather than
+  `assets/<package name>-<hash>.css`, and the pass no longer fails on a
+  project whose `package.json` has no `name`.
 - **A static-only build no longer bundles server dependencies as browser
   code.** With no app routes, `neutron-ts build` extracts CSS by bundling
   every route module for the browser, so a static page whose imports reach a
