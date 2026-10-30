@@ -526,6 +526,13 @@ export async function createServer(
   // invalidated the path in between advances the epoch and the stale fill is
   // dropped instead of published after the invalidation.
   let appCacheEpoch = 0;
+  // Advance the epoch, then evict the path from both caches (the deletes also
+  // bump the stores' generations, fencing remote fills).
+  const invalidateMutatedPath = async (pathname: string): Promise<void> => {
+    appCacheEpoch++;
+    await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(pathname));
+    await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(pathname));
+  };
 
   if (hasAppRoutes && !ssrServer) {
     // Unreachable for isSsr apps (needsSsrRuntime throws first) — kept for
@@ -860,17 +867,6 @@ export async function createServer(
             { routeId: match.route.id, routePath: match.route.path }
           );
         }
-        if (isMutationMethod(requestTrace.method)) {
-          // A mutating endpoint can change what app pages show. Fence both
-          // windows like the app-route path does (TS-07): advance the epoch
-          // before AND after the handler, so a cacheable GET that started
-          // before or during the mutation cannot publish a stale fill.
-          appCacheEpoch++;
-          await appResponseCacheStore.deleteByPath(
-            encodeCacheInvalidationPath(effectivePathname)
-          );
-          await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
-        }
         const response = await handleResourceRouteRequest(
           c.req.raw,
           match,
@@ -888,12 +884,12 @@ export async function createServer(
               error: toError(error),
             })
         );
+        // A mutating endpoint can change what app pages show: fence fills
+        // that were in flight while it ran (TS-07 completion fence). No
+        // pre-handler call: a resource route's own path holds no cache
+        // entries, and this bump already fences GETs that began earlier.
         if (isMutationMethod(requestTrace.method)) {
-          appCacheEpoch++;
-          await appResponseCacheStore.deleteByPath(
-            encodeCacheInvalidationPath(effectivePathname)
-          );
-          await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+          await invalidateMutatedPath(effectivePathname);
         }
         return finalize(response, {
           routeId: match.route.id,
@@ -1060,9 +1056,7 @@ export async function createServer(
         // Advance the invalidation epoch BEFORE deleting (TS-07): an
         // in-flight cacheable GET that started before this mutation must not
         // publish its (now stale) fill afterwards.
-        appCacheEpoch++;
-        await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
-        await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        await invalidateMutatedPath(effectivePathname);
       }
 
       const appCacheMaxAge = match.route.config.cache?.maxAge ?? 0;
@@ -1156,12 +1150,10 @@ export async function createServer(
         // post-pre-invalidation epoch, and its fill must not publish after
         // this final delete. The pre-mutation bump alone fenced only GETs
         // that began before the mutation.
-        appCacheEpoch++;
         // GETs may have published old data after the start invalidation while
         // the action was running. Evict those entries and fence remote fills
         // at completion even when the action emits no invalidation header.
-        await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
-        await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        await invalidateMutatedPath(effectivePathname);
         await applyMutationInvalidationFromResponse(
           appResponseCacheStore,
           effectivePathname,
