@@ -25,12 +25,19 @@ const componentNameCounts = new Map<string, number>();
 
 /**
  * Island component for progressive hydration
- * 
+ *
  * Usage:
  * ```tsx
  * import Counter from "./Counter.js";
  * <Island component={Counter} client="load" count={0} />
  * ```
+ *
+ * The return type is deliberately `any` (like Image/Picture): the element is
+ * a preact VNode at runtime, which react-compat aliases to preact/compat, but
+ * @types/react's ReactNode does not accept a preact VNode (TS2786) — so a
+ * strictly-preact return annotation makes `<Island>` unusable from
+ * React-typed JSX. `any` typechecks under both JSX runtimes; the props stay
+ * fully typed. See src/client/type-fixtures/react-island/.
  */
 export function Island({
   component: Component,
@@ -39,7 +46,7 @@ export function Island({
   media,
   __src,
   ...props
-}: IslandProps) {
+}: IslandProps): any {
   const islandId = `island-${islandCounter++}`;
   const componentId = resolveComponentId(Component, id);
   

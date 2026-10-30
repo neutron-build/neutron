@@ -854,6 +854,34 @@ describe("scaffoldProject (real export)", () => {
     }
   });
 
+  it("adds @types/react to devDependencies only under react-compat", async () => {
+    // react ships no types; the react-compat scaffold must not typecheck-fail
+    // on the first React-ecosystem import. preact scaffolds stay untouched.
+    const compatDir = scratchPath("compat-types");
+    const preactDir = scratchPath("preact-types");
+    try {
+      await scaffoldProject({ targetDir: compatDir, template: "basic", runtime: "react-compat" });
+      const compatPkg = JSON.parse(
+        fs.readFileSync(path.join(compatDir, "package.json"), "utf8"),
+      );
+      assert.match(compatPkg.devDependencies["@types/react"], /^\^19\./);
+      // The real react runtime package stays out: the vite plugin aliases it
+      // to preact/compat, and an installed-but-unaliased react is the
+      // two-copies hazard.
+      assert.equal(compatPkg.dependencies.react, undefined);
+      assert.equal(compatPkg.dependencies["react-dom"], undefined);
+
+      await scaffoldProject({ targetDir: preactDir, template: "basic", runtime: "preact" });
+      const preactPkg = JSON.parse(
+        fs.readFileSync(path.join(preactDir, "package.json"), "utf8"),
+      );
+      assert.equal(preactPkg.devDependencies["@types/react"], undefined);
+    } finally {
+      fs.rmSync(compatDir, { recursive: true, force: true });
+      fs.rmSync(preactDir, { recursive: true, force: true });
+    }
+  });
+
   it("pins the released dependency pair when scaffolding outside a workspace", async () => {
     // The external path is where every `latest`-floating site came from.
     const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "cn-external-"));

@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`<Island>` is usable from React-typed JSX.** The element `Island` returns
+  is now deliberately JSX-agnostic (like `Image`/`Picture`): under
+  `runtime: "react-compat"` an app that typechecks against `@types/react`
+  (`jsxImportSource: "react"`) can use `<Island …>` with children directly —
+  previously TS2786 rejected the preact `VNode` return against React's
+  `ReactNode`, forcing a hand-rolled facade per app. Props stay fully typed.
+  `<Form>`, `<Link>` and `<NavLink>` are not JSX-agnostic yet; see the new
+  TypeScript-setup section in `docs/react-compat.md`.
+- `docs/react-compat.md` documents the types setup for react-compat apps:
+  `react` ships no bundled types, so apps need `@types/react` (the bundler
+  never needs the real `react` package — the runtime aliases cover it), and
+  the two coherent `jsxImportSource` choices with their current limits.
+- `create-neutron --runtime react-compat` scaffolds with `@types/react` in
+  `devDependencies`. Previously the flag only substituted the config value,
+  leaving the scaffold unable to typecheck its first React-ecosystem import.
+
+### Changed
+
+- **The SSR server's default 404 is content-negotiated.** With no
+  application `not-found.tsx`, an unmatched path used to answer bare
+  `text/plain` "Not Found". HTML-preferring clients (`Accept: text/html`,
+  i.e. browsers) now get the same minimal HTML page `notFound()` serves;
+  every other client — `Accept: application/json`, `X-Neutron-Data`, no
+  preference, wildcard-only — gets the RFC 7807 `application/problem+json`
+  document in exactly the shape api mode serves (`No route matches <path>`).
+  An application `not-found.tsx` still answers for every client, and api
+  mode's JSON 404 is unchanged. FRAMEWORK_CONTRACT.md §2 states the
+  negotiation rule.
+
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 
 ### Changed
