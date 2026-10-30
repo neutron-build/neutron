@@ -319,14 +319,16 @@ export function renderDocumentHead(
     '<style>html{background:var(--neutron-bg,#0A0A0A);color-scheme:var(--neutron-color-scheme,dark)}</style>';
 
   // <neutron-island> (the hydration wrapper <Island> renders) is a custom
-  // element with no built-in styling, so browsers treat it as inline. Inside
-  // a flex container with non-stretch alignment (e.g. `align-items: center`),
-  // an inline/auto-sized flex item sizes via shrink-to-fit rather than a
-  // definite width, which breaks percentage widths on its children (they have
-  // no definite containing block to resolve against). Force a real, definite
-  // block box so island content sizes predictably in every layout context.
+  // element with no built-in styling, so browsers treat it as inline. Make it
+  // generate no box at all: its children then take part in the parent's
+  // layout exactly as if the wrapper were absent, so wrapping a component in
+  // <Island> never changes how it lays out (flex/grid items, percentage
+  // widths, margins). A sized box is wrong in some context either way: an
+  // inline one shrink-wraps inside centered flex columns, and the earlier
+  // `display:block;width:100%` made an island flex item eat the whole row,
+  // collapsing its `flex-1` siblings to 0px.
   const islandBaseStyle =
-    '<style>neutron-island{display:block;width:100%}</style>';
+    '<style>neutron-island{display:contents}</style>';
 
   return [
     '<meta charset="UTF-8">',

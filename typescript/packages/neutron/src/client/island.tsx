@@ -1,4 +1,5 @@
-import { h } from "preact";
+import { createContext, h } from "preact";
+import { useContext } from "preact/hooks";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -23,6 +24,10 @@ let islandCounter = 0;
 const componentIdMap = new WeakMap<preact.FunctionComponent<any>, string>();
 const componentNameCounts = new Map<string, number>();
 
+// True below an <Island>. The outer island's render (SSR and client) owns its
+// whole subtree, so a nested <Island> must not become a second hydration root.
+const InsideIsland = createContext(false);
+
 /**
  * Island component for progressive hydration
  * 
@@ -40,6 +45,12 @@ export function Island({
   __src,
   ...props
 }: IslandProps) {
+  // Nested island: render the component inline as part of the outer island.
+  // Emitting another marker would let the runtime hydrate it a second time.
+  if (useContext(InsideIsland)) {
+    return h(Component, props);
+  }
+
   const islandId = `island-${islandCounter++}`;
   const componentId = resolveComponentId(Component, id);
   
@@ -66,7 +77,7 @@ export function Island({
       ...(media ? { "data-media": media } : {}),
       ...(__src ? { "data-src": __src } : {}),
     },
-    h(Component, props)
+    h(InsideIsland.Provider, { value: true }, h(Component, props))
   );
 }
 
