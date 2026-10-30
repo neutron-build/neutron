@@ -10,6 +10,7 @@ import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { isResponse } from "../core/response.js";
+import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -941,6 +942,19 @@ async function handleRequest(
     moduleCache.set(r.id, loaded as RouteModule);
   }
 
+  // Resource route: dispatch the method handler, mirroring the production
+  // server (core/resource-routes.ts). The layout + route middleware chain has
+  // already run around this handler (see the middleware collection above), so
+  // gating matches production; loaders never run.
+  if (isResourceRoute(route)) {
+    return dispatchResourceHandler(
+      moduleCache.get(route.id)!,
+      request,
+      params,
+      context
+    );
+  }
+
   // Handle action for mutations
   if (isMutation) {
     const module = moduleCache.get(route.id)!;
@@ -1318,7 +1332,13 @@ ${clientScript}
 
 export function generateRoutesModule(routes: Route[]): string {
   const cwd = process.cwd().replace(/\\/g, "/");
-  const routeMap: string[] = routes.map((route) => {
+  // Resource routes are endpoints, not pages: excluded from the client route
+  // table entirely so no client chunk is ever emitted for them. Their method
+  // handlers are additionally stripped from any module that does reach the
+  // browser (stripServerOnlyRouteModule) — belt and braces, because handler
+  // code must never ship to the client.
+  const clientRoutes = routes.filter((route) => !isResourceRoute(route));
+  const routeMap: string[] = clientRoutes.map((route) => {
     const absPath = route.file.replace(/\\/g, "/");
     // Make path relative to project root so Vite can resolve it.
     // Absolute paths would produce "//Users/..." which browsers treat as protocol-relative URLs.
@@ -1341,7 +1361,7 @@ export function generateRoutesModule(routes: Route[]): string {
 ${routeMap.join(",\n")}
 };
 
-export const routeIds = ${JSON.stringify(routes.map((r) => r.id))};
+export const routeIds = ${JSON.stringify(clientRoutes.map((r) => r.id))};
 `;
 }
 

@@ -39,6 +39,7 @@ All frameworks MUST return errors as RFC 7807 Problem Details JSON:
 | 401 | `unauthorized` | Unauthorized |
 | 403 | `forbidden` | Forbidden |
 | 404 | `not-found` | Not Found |
+| 405 | `method-not-allowed` | Method Not Allowed |
 | 409 | `conflict` | Conflict |
 | 422 | `validation` | Validation Failed |
 | 429 | `rate-limited` | Rate Limited |

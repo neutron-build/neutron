@@ -79,6 +79,7 @@ async function makeApp(files: Record<string, string>): Promise<string> {
   roots.push(root);
   await fs.mkdir(path.join(root, "src", "routes"), { recursive: true });
   for (const [name, source] of Object.entries(files)) {
+    await fs.mkdir(path.join(root, "src", "routes", path.dirname(name)), { recursive: true });
     await fs.writeFile(path.join(root, "src", "routes", name), source, "utf-8");
   }
   return root;
@@ -230,4 +231,70 @@ describe("dev server: Responses from loaders and actions keep status and body", 
       expect(await loaded.json()).toEqual({ from: "loader" });
     });
   }
+});
+
+const RESOURCE_ROUTE = `
+export async function GET({ params }) {
+  return { endpoint: "dev", id: params.id ?? null };
+}
+export async function POST({ request }) {
+  return Response.json(await request.json(), { status: 201 });
+}
+`;
+
+const GATED_RESOURCE_ROUTE = `
+export async function middleware(request, context, next) {
+  if (!request.headers.get("x-token")) {
+    return new Response(JSON.stringify({ error: "denied" }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  return next();
+}
+export async function GET() {
+  return { classified: true };
+}
+`;
+
+describe("dev server: resource routes answer like the production server", () => {
+  it("dispatches method handlers with params and 405s identically", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "api/time.ts": RESOURCE_ROUTE,
+    }));
+
+    const got = await fetch(`${base}/api/time`);
+    expect(got.status).toBe(200);
+    expect(await got.json()).toEqual({ endpoint: "dev", id: null });
+
+    const posted = await fetch(`${base}/api/time`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: 1 }),
+    });
+    expect(posted.status).toBe(201);
+    expect(await posted.json()).toEqual({ ok: 1 });
+
+    // Same 405 problem+json + Allow shape as start (TS-27/A-024 parity).
+    const denied = await fetch(`${base}/api/time`, { method: "DELETE" });
+    expect(denied.status).toBe(405);
+    expect(denied.headers.get("content-type")).toContain("application/problem+json");
+    expect(denied.headers.get("allow")).toBe("GET, POST, HEAD");
+  });
+
+  it("runs route middleware around dev dispatch", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "api/secret.ts": GATED_RESOURCE_ROUTE,
+    }));
+
+    const denied = await fetch(`${base}/api/secret`);
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({ error: "denied" });
+
+    const allowed = await fetch(`${base}/api/secret`, { headers: { "x-token": "t" } });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual({ classified: true });
+  });
 });

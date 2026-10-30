@@ -26,6 +26,7 @@ import {
   assertRenderedFragment,
   renderSpeculationRules,
   isResponse,
+  isResourceRoute,
 } from "@neutron-build/core";
 import type {
   NeutronConfig,
@@ -596,6 +597,15 @@ export async function build(): Promise<void> {
   let renderErrorCount = 0;
 
   for (const route of staticRoutes) {
+    // Resource routes (method handlers, no component) are endpoints served
+    // per request — never prerendered, and never baked via a stray `loader`
+    // export (a resource route's loader never runs at serve time either, so
+    // a file baked from it could never be served).
+    if (isResourceRoute(route)) {
+      console.log(`  Skipping ${route.path} (resource route — served per request)`);
+      skippedCount++;
+      continue;
+    }
     try {
       const module = await loadRouteModule(route);
 

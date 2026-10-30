@@ -20,6 +20,7 @@ import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { isResponse } from "../core/response.js";
 import { createRouter } from "../core/router.js";
+import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
 import { installTransportPeer } from "./peer.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./health.js";
 import { onShutdownSignal } from "./shutdown.js";
@@ -47,7 +48,7 @@ import {
 } from "./cache-store.js";
 import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
-import { isProblemError, notFoundError } from "../core/problem.js";
+import { internalError, isProblemError, notFoundError } from "../core/problem.js";
 import {
   appDefinesSpecRoute,
   serverOpenApiSpec,
@@ -85,6 +86,7 @@ import type {
   HeadersArgs,
   LoaderArgs,
   MiddlewareFn,
+  ResourceRouteHandler,
   Route,
   RouteMatch,
   RouteModule,
@@ -213,7 +215,35 @@ export interface NeutronServerOptions {
    * adapter cap; the input-limits middleware alone applies.
    */
   maxRequestBodyBytes?: number;
+  /**
+   * Mount Hono sub-apps at path prefixes, so an SSR (or api/raw) server can
+   * serve an in-process API alongside its pages — one server instead of two
+   * (tRPC's single mountable handler tree is the canonical shape:
+   * `mount: { "/api/trpc": trpcApp }`). Each sub-app is registered via
+   * `app.route(prefix, subApp)` AFTER the framework batteries (/health,
+   * /openapi.json, image/island/static routes) and BEFORE the HTML catch-all,
+   * so mounts can neither be shadowed by the catch-all nor shadow the
+   * batteries. Works in every {@link mode}; orthogonal to {@link websocket}.
+   *
+   * Prefixes are literal path prefixes (`/api`, `/api/trpc`) and are
+   * validated at startup: a prefix that duplicates/nests another mount's, or
+   * that covers a reserved framework path (/health, /openapi.json, /docs,
+   * /_neutron/image, /__neutron_island, and /assets//public in ssr mode),
+   * is a configuration error. A request under a prefix whose sub-app has no
+   * matching route falls through to the rest of the app (in ssr mode, the
+   * HTML catch-all) — mounting does not claim the prefix, it registers
+   * routes under it.
+   */
+  mount?: Record<string, NeutronMountApp>;
 }
+
+/**
+ * A Hono sub-app accepted by {@link NeutronServerOptions.mount}. Any Hono
+ * instance works (`new Hono()` with whatever bindings/variables it needs) —
+ * `any` generics keep user sub-apps assignable regardless of their own types.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type NeutronMountApp = Hono<any, any, any>;
 
 /** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
 export type NeutronServerMode = "ssr" | "api" | "raw";
@@ -378,6 +408,7 @@ export async function createServer(
     runtime = "preact",
     mode = "ssr",
     websocket,
+    mount,
     cors,
     securityHeaders,
     openapi,
@@ -416,6 +447,11 @@ export async function createServer(
   const hasAppRoutes = routes.some(
     (route) => !route.file.includes("_layout") && route.config.mode === "app"
   );
+  // Resource routes load their handler modules through the SSR runtime like
+  // app routes do — an app whose routes are all endpoints still needs one.
+  const hasResourceRoutes = routes.some(
+    (route) => !route.file.includes("_layout") && isResourceRoute(route)
+  );
   // Global middleware is loaded THROUGH the SSR runtime, so the runtime has to
   // exist for it to run at all. Deciding to start one on `hasAppRoutes` alone
   // meant an app whose routes are all `mode: "static"` silently never loaded
@@ -425,7 +461,8 @@ export async function createServer(
   // The file is found with a plain fs check, which needs no runtime, so its
   // presence can be part of the decision to start one.
   const globalMiddlewareFile = isSsr ? findGlobalMiddlewareFile(resolvedRootDir) : null;
-  const needsSsrRuntime = hasAppRoutes || globalMiddlewareFile !== null;
+  const needsSsrRuntime =
+    hasAppRoutes || hasResourceRoutes || globalMiddlewareFile !== null;
   // Fail closed (TS-01): when the SSR runtime is required — app routes exist
   // or a global middleware file was found — a Vite initialization failure
   // must reject createServer, not silently downgrade the app to a static
@@ -607,6 +644,24 @@ export async function createServer(
     app.get("/docs", (c) => c.html(swaggerDocsHtml(openapi.title)));
   }
 
+  // Caller-mounted sub-apps (in-process API routes: tRPC, REST, SSE). They are
+  // registered AFTER the framework batteries above and BEFORE the HTML
+  // catch-all below, so neither shadowing direction can happen:
+  //   - a mount cannot shadow /health & co. (registered earlier, and the
+  //     prefixes are validated to not cover reserved paths at all);
+  //   - the catch-all cannot shadow a mount (REALTIME_PLAN §5 records the
+  //     class: an "*" route swallows everything a later caller adds — the
+  //     mount is intentionally on the other side of it).
+  // A request under the prefix that the sub-app does not match falls through
+  // to whatever comes next (in ssr mode, the catch-all): mounting registers
+  // routes under a prefix, it does not claim the namespace.
+  if (mount) {
+    validateMountConfig(mount, isSsr);
+    for (const [prefix, subApp] of Object.entries(mount)) {
+      app.route(prefix, subApp);
+    }
+  }
+
   // SSR-only routes: static assets, image optimization, server islands, and the HTML
   // catch-all. "api"/"raw" modes skip these entirely.
   if (isSsr) {
@@ -769,6 +824,55 @@ export async function createServer(
       const effectivePathname = rewrite?.pathname || originalPathname;
 
       const match = router.match(effectivePathname);
+
+      // Resource route (method handlers, no component): an HTTP endpoint, not
+      // a page. Dispatched BEFORE the static fast path and the static-mode
+      // 404 — a prebuilt file at this path must never answer for an endpoint,
+      // and the resource route is the route table's authority for its path.
+      // Endpoints run per request, so their middleware (global + layout +
+      // route, FRAMEWORK_CONTRACT §5 order) runs every time: the A-020
+      // prerender/gate contradiction cannot arise because resource routes are
+      // never prerendered in the first place.
+      if (match && isResourceRoute(match.route)) {
+        if (!ssrServer) {
+          return finalize(
+            internalError("Resource route SSR runtime is unavailable").toResponse(
+              requestTrace.pathname
+            ),
+            { routeId: match.route.id, routePath: match.route.path }
+          );
+        }
+        if (isMutationMethod(requestTrace.method)) {
+          // A mutating endpoint can change what app pages show. Fence both
+          // windows like the app-route path does (TS-07): advance the epoch
+          // before AND after the handler, so a cacheable GET that started
+          // before or during the mutation cannot publish a stale fill.
+          appCacheEpoch++;
+          await appResponseCacheStore.deleteByPath(
+            encodeCacheInvalidationPath(effectivePathname)
+          );
+          await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        }
+        const response = await handleResourceRouteRequest(
+          c.req.raw,
+          match,
+          ssrServer,
+          routeModuleCache,
+          globalMiddleware
+        );
+        if (isMutationMethod(requestTrace.method)) {
+          appCacheEpoch++;
+          await appResponseCacheStore.deleteByPath(
+            encodeCacheInvalidationPath(effectivePathname)
+          );
+          await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(effectivePathname));
+        }
+        return finalize(response, {
+          routeId: match.route.id,
+          routePath: match.route.path,
+          routeMode: "app",
+        });
+      }
 
       // Static dist HTML may only answer when no non-static app route claims
       // the path. The pre-seeded cache (buildStaticHtmlCache walks dist/ at
@@ -1271,6 +1375,51 @@ async function handleAppRouteRequest(
   });
 }
 
+/**
+ * Serve one resource-route request: load the module chain through the SSR
+ * runtime, run middleware (global outermost, then layouts, then the route —
+ * the exact chain renderAppRoute assembles, so a gate on a parent layout
+ * covers endpoints in its subtree like it covers pages), and dispatch the
+ * method handler. Loaders never run for resource routes.
+ */
+async function handleResourceRouteRequest(
+  request: Request,
+  match: RouteMatch,
+  ssrServer: SsrServer,
+  moduleCache: Map<string, Promise<RouteModule>>,
+  globalMiddleware?: MiddlewareFn[]
+): Promise<Response> {
+  const allRoutes = [...match.layouts, match.route];
+  const routeModules = new Map<string, RouteModule>();
+  await Promise.all(
+    allRoutes.map(async (route) => {
+      routeModules.set(route.id, await loadRouteModule(ssrServer, route.file, moduleCache));
+    })
+  );
+
+  const middlewares: MiddlewareFn[] = [];
+  if (globalMiddleware && globalMiddleware.length > 0) {
+    middlewares.push(...globalMiddleware);
+  }
+  for (const route of allRoutes) {
+    const module = routeModules.get(route.id);
+    if (module?.middleware) {
+      middlewares.push(module.middleware);
+    }
+  }
+
+  const context: AppContext = {};
+  const module = routeModules.get(match.route.id);
+  return runMiddlewareChain(middlewares, request, context, async () =>
+    dispatchResourceHandler(
+      module as Partial<Record<ResourceRouteMethod, ResourceRouteHandler>>,
+      request,
+      match.params,
+      context
+    )
+  );
+}
+
 
 
 
@@ -1410,6 +1559,97 @@ export function normalizePathname(pathname: string): string | null {
   }
 
   return decoded;
+}
+
+// Framework paths a mount prefix must never take over. Batteries registered
+// before the mounts would keep answering anyway (Hono resolves in registration
+// order), so a mount that covers one would silently never see those requests —
+// refuse it up front instead. /assets and /public are ssr-mode static trees.
+const RESERVED_MOUNT_PATHS: Array<{ path: string; ssrOnly: boolean; what: string }> = [
+  { path: "/health", ssrOnly: false, what: "GET /health (FRAMEWORK_CONTRACT.md §7)" },
+  { path: "/openapi.json", ssrOnly: false, what: "GET /openapi.json (FRAMEWORK_CONTRACT.md §4)" },
+  { path: "/docs", ssrOnly: false, what: "GET /docs (FRAMEWORK_CONTRACT.md §4)" },
+  { path: "/_neutron/image", ssrOnly: true, what: "the image optimizer route" },
+  { path: "/__neutron_island", ssrOnly: true, what: "the server-islands route" },
+  { path: "/assets", ssrOnly: true, what: "the built-assets static route" },
+  { path: "/public", ssrOnly: true, what: "the public-dir static route" },
+];
+
+/** `"/api"` covers `"/api/anything"` — segment-boundary prefix, not substring. */
+function mountPrefixCovers(prefix: string, path: string): boolean {
+  if (prefix === path) return true;
+  return path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+}
+
+/**
+ * Fail fast on mount configurations whose behavior would be surprising.
+ * Every rule here encodes a shadowing/conflict case that would otherwise be
+ * resolved silently by registration order or Hono fall-through.
+ */
+function validateMountConfig(mount: Record<string, NeutronMountApp>, isSsr: boolean): void {
+  const prefixes = Object.keys(mount);
+
+  for (const prefix of prefixes) {
+    const subApp = mount[prefix];
+    if (typeof prefix !== "string" || prefix.length === 0 || !prefix.startsWith("/")) {
+      throw new Error(
+        `Neutron: mount prefix ${JSON.stringify(prefix)} is invalid — prefixes are absolute ` +
+          `path prefixes like "/api". For the site root use mode: "raw".`
+      );
+    }
+    if (prefix !== "/" && prefix.endsWith("/")) {
+      throw new Error(
+        `Neutron: mount prefix "${prefix}" must not end with "/" — write "${prefix.slice(0, -1)}".`
+      );
+    }
+    if (prefix.split("/").some((segment) => segment.includes("*") || segment.includes(":"))) {
+      throw new Error(
+        `Neutron: mount prefix "${prefix}" must be literal — dynamic segments are not ` +
+          `supported in mount prefixes (match inside the sub-app instead).`
+      );
+    }
+    if (
+      !subApp ||
+      typeof (subApp as unknown as { fetch?: unknown }).fetch !== "function" ||
+      typeof (subApp as unknown as { route?: unknown }).route !== "function"
+    ) {
+      throw new Error(
+        `Neutron: mount["${prefix}"] is not a Hono instance — pass the app itself ` +
+          `(e.g. new Hono()), not a handler or a fetch function.`
+      );
+    }
+
+    for (const reserved of RESERVED_MOUNT_PATHS) {
+      if (reserved.ssrOnly && !isSsr) continue;
+      if (mountPrefixCovers(prefix, reserved.path)) {
+        const hint =
+          prefix === "/"
+            ? ' Mounting at "/" is not supported — for a fully caller-owned router use mode: "raw".'
+            : " Choose a different prefix.";
+        throw new Error(
+          `Neutron: mount prefix "${prefix}" would take over ${reserved.what} — ` +
+            `reserved framework paths cannot be mounted over.${hint}`
+        );
+      }
+    }
+  }
+
+  // Pairwise: exact duplicates and nested prefixes. A sub-app that answers a
+  // path the outer prefix also reaches makes the winner an accident of object
+  // key order; say it once at startup instead.
+  for (let i = 0; i < prefixes.length; i++) {
+    for (let j = i + 1; j < prefixes.length; j++) {
+      const a = prefixes[i];
+      const b = prefixes[j];
+      if (mountPrefixCovers(a, b) || mountPrefixCovers(b, a)) {
+        throw new Error(
+          `Neutron: mount prefixes "${a}" and "${b}" overlap — nested/duplicate mount ` +
+            `prefixes are not supported (registration order would silently decide ` +
+            `which sub-app answers). Mount one sub-app and route the sub-prefix inside it.`
+        );
+      }
+    }
+  }
 }
 
 function applyRouteRuleHeadersToResponse(

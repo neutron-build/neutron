@@ -125,3 +125,56 @@ describe("renderStatic refuses to prerender a gated route", () => {
     expect(message).toContain('mode: "static"');
   });
 });
+
+/**
+ * A-020's resource-route analogue — the refusal must NOT fire. Resource
+ * routes produce no prerendered file and are served per request through the
+ * middleware chain, so gating one is legal (the gate runs on every request);
+ * refusing it would break every authed endpoint. And never prerendering also
+ * means never baking one through a stray `loader` export.
+ */
+const RESOURCE_DIR = path.join(__dirname, "__a020_resource_routes__");
+
+beforeAll(() => {
+  fs.mkdirSync(path.join(RESOURCE_DIR, "api"), { recursive: true });
+  fs.writeFileSync(
+    path.join(RESOURCE_DIR, "index.tsx"),
+    `export const config = { mode: "static" };\nexport default function Home() { return null; }\n`
+  );
+  // Gated resource route: middleware + GET, no component.
+  fs.writeFileSync(
+    path.join(RESOURCE_DIR, "api", "stats.ts"),
+    `export const middleware = async (request, context, next) => next();
+export async function GET() { return new Response('{"stats":true}'); }
+`
+  );
+  // Resource route with a loader too: the loader must not bake a file.
+  fs.writeFileSync(
+    path.join(RESOURCE_DIR, "api", "bakeable.ts"),
+    `export async function loader() { return new Response('baked'); }
+export async function GET() { return new Response('live'); }
+`
+  );
+});
+
+afterAll(() => {
+  fs.rmSync(RESOURCE_DIR, { recursive: true, force: true });
+});
+
+describe("renderStatic and gated resource routes", () => {
+  it("does not refuse a gated resource route — it never prerenders, so the gate runs per request", async () => {
+    const outDir = path.join(__dirname, "__a020_resource_out__");
+    fs.rmSync(outDir, { recursive: true, force: true });
+
+    await expect(
+      renderStatic({ routesDir: RESOURCE_DIR, outputDir: outDir, appRoot: process.cwd() })
+    ).resolves.toBeUndefined();
+
+    // The page rendered; the endpoints produced no files.
+    expect(fs.existsSync(path.join(outDir, "index.html"))).toBe(true);
+    expect(fs.existsSync(path.join(outDir, "api", "stats"))).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "api", "bakeable"))).toBe(false);
+
+    fs.rmSync(outDir, { recursive: true, force: true });
+  });
+});
