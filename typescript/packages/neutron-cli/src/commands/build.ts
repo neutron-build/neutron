@@ -392,7 +392,9 @@ export async function build(): Promise<void> {
     clientCssFiles,
     userConfig,
     runtimeAliases: preactAliases,
-    runtimeNoExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+    // `true` for react-compat (blanket processing — see resolveRuntimeNoExternal).
+    runtimeNoExternal:
+      runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
   });
 
   // Create a Vite SSR server for rendering
@@ -412,8 +414,12 @@ export async function build(): Promise<void> {
       ssr: {
         // Process these through Vite's SSR graph (aliased + noExternal) instead
         // of native node resolution. @neutron-build/core MUST share this graph
-        // too: its inline components (e.g. Link) use hooks.
-        noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+        // too: its inline components (e.g. Link) use hooks. react-compat goes
+        // further and processes EVERYTHING (`true`): externalized deps resolve
+        // their own react imports natively — real React next to preact (see
+        // resolveRuntimeNoExternal).
+        noExternal:
+          runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
       },
       server: {
         middlewareMode: true,
@@ -1047,7 +1053,8 @@ interface RuntimeBundleBuilderOptions {
   clientCssFiles: string[];
   userConfig: Record<string, any>;
   runtimeAliases?: Array<{ find: string; replacement: string }> | Record<string, string>;
-  runtimeNoExternal?: string[];
+  /** `true` = process the whole dependency graph (react-compat). */
+  runtimeNoExternal?: string[] | true;
 }
 
 interface RuntimeBundleArtifact {
@@ -1239,13 +1246,20 @@ async function buildRuntimeBundle(
         // Bundle @neutron-build/core with the same preact the renderer uses, so
         // inline hook components (e.g. Link) in app-mode routes don't hit the
         // two-preact-instance "__H" crash at runtime — matching the build/dev paths.
-        noExternal: [
-          "preact",
-          "preact/hooks",
-          "preact-render-to-string",
-          "@neutron-build/core",
-          ...(options.runtimeNoExternal || []),
-        ],
+        // react-compat passes `true` here (resolveRuntimeNoExternal): every dep
+        // that imports react must be IN the bundle, or the bundle imports real
+        // React at runtime and SSR crashes. Escape hatch: ssr.external in the
+        // app's vite.config re-externalizes specific packages.
+        noExternal:
+          options.runtimeNoExternal === true
+            ? true
+            : [
+                "preact",
+                "preact/hooks",
+                "preact-render-to-string",
+                "@neutron-build/core",
+                ...(options.runtimeNoExternal || []),
+              ],
       },
       build: {
         ssr: entryPath,

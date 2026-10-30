@@ -118,6 +118,48 @@ describe("server modes", () => {
     expect((await fetch(`http://127.0.0.1:${port}/health`)).status).toBe(200);
   });
 
+  it("ssr mode serves root-URL public assets from dist (dev/prod parity)", async () => {
+    root = await emptyRoot();
+    // Post-build dist shape: Vite copies public/ to the dist ROOT, and
+    // prerendered static routes land at <route>/index.html. The production
+    // server used to serve only /assets/* and /public/*→dist/public/*, so
+    // the app template's own /favicon.svg link 404d while dev served it.
+    await fs.mkdir(path.join(root, "dist", "terms"), { recursive: true });
+    await fs.writeFile(path.join(root, "dist", "favicon.svg"), "<svg>spike</svg>");
+    await fs.writeFile(path.join(root, "dist", "terms", "index.html"), "<html>terms</html>");
+    await fs.mkdir(path.join(root, "dist", "icons"), { recursive: true });
+    await fs.writeFile(path.join(root, "dist", "icons", "logo.png"), "png-bytes");
+    const port = await getFreePort();
+    running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    const base = `http://127.0.0.1:${port}`;
+
+    const favicon = await fetch(`${base}/favicon.svg`);
+    expect(favicon.status).toBe(200);
+    expect(await favicon.text()).toContain("<svg>");
+    expect(favicon.headers.get("content-type")).toContain("image/svg");
+
+    // Nested public files too.
+    expect((await fetch(`${base}/icons/logo.png`)).status).toBe(200);
+
+    // Extensionless route URLs still belong to the route pipeline: the
+    // prerendered static page is served from dist HTML by the catch-all,
+    // not by the asset handler.
+    const terms = await fetch(`${base}/terms`);
+    expect(terms.status).toBe(200);
+    expect(await terms.text()).toContain("terms");
+    expect(terms.headers.get("content-type")).toContain("text/html");
+
+    // A missing file falls through to the route 404, and "/" never serves
+    // dist/index.html ahead of the router (an app route must own it).
+    expect((await fetch(`${base}/nope.png`)).status).toBe(404);
+    expect((await fetch(`${base}/`)).status).toBe(404);
+  });
+
   it("websocket: true attaches a wss that accepts any path and echoes", async () => {
     root = await emptyRoot();
     const port = await getFreePort();
