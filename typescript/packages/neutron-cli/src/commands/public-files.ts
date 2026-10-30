@@ -15,11 +15,13 @@ import * as path from "node:path";
 export function writePublicFilesMetadata(outputDir: string, publicDir: string | null): void {
   const files: string[] = [];
   const walk = (dir: string, prefix: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const urlPath = `${prefix}/${entry.name}`;
-      if (entry.isDirectory()) {
-        walk(path.join(dir, entry.name), urlPath);
-      } else if (entry.isFile() && fs.existsSync(path.join(outputDir, urlPath))) {
+    for (const name of fs.readdirSync(dir)) {
+      const urlPath = `${prefix}/${name}`;
+      // statSync follows symlinks, matching Vite's public/ copy.
+      const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false });
+      if (stat?.isDirectory()) {
+        walk(path.join(dir, name), urlPath);
+      } else if (stat?.isFile() && fs.existsSync(path.join(outputDir, urlPath))) {
         files.push(urlPath);
       }
     }

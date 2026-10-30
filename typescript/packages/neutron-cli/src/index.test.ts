@@ -1610,6 +1610,32 @@ describe("writePublicFilesMetadata", () => {
     }
   });
 
+  it("follows symlinked files and directories in public/, as Vite's copy does", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-public-files-"));
+    try {
+      const shared = path.join(root, "shared");
+      const publicDir = path.join(root, "public");
+      const dist = path.join(root, "dist");
+      fs.mkdirSync(path.join(shared, "img"), { recursive: true });
+      fs.writeFileSync(path.join(shared, "img", "hero.jpg"), "jpg");
+      fs.writeFileSync(path.join(shared, "robots.txt"), "");
+      fs.mkdirSync(publicDir, { recursive: true });
+      fs.symlinkSync(path.join(shared, "img"), path.join(publicDir, "img"));
+      fs.symlinkSync(path.join(shared, "robots.txt"), path.join(publicDir, "robots.txt"));
+      fs.mkdirSync(path.join(dist, "img"), { recursive: true });
+      fs.writeFileSync(path.join(dist, "img", "hero.jpg"), "jpg");
+      fs.writeFileSync(path.join(dist, "robots.txt"), "");
+
+      writePublicFilesMetadata(dist, publicDir);
+      const written = JSON.parse(
+        fs.readFileSync(path.join(dist, ".neutron-public-files.json"), "utf-8")
+      );
+      assert.deepEqual(written, { files: ["/img/hero.jpg", "/robots.txt"] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("writes an empty list when there is no public/ dir (the list still governs)", () => {
     const dist = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-public-files-"));
     try {
