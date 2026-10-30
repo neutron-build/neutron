@@ -25,6 +25,24 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **The control-flow components are usable from React-typed JSX.**
+  `<Show>`, `<For>`, `<Switch>`, `<Match>` and `<Index>` (exported from the
+  package root, `@neutron-build/core`) now have JSX-agnostic element returns,
+  completing the client component surface started by `Image`/`Picture`/
+  `Await`/`Island` and the navigation/form five: under
+  `runtime: "react-compat"`, apps typechecking against `@types/react`
+  (`jsxImportSource: "react"`) got TS2786 on every usage, because the
+  components return preact `VNode`s and React's `ReactNode` rejects that
+  shape. Diagnosed per component with tsc fixtures before designing: all
+  five fail at the return position only — the keyed render callbacks
+  (`(item) => …`, `(item, index) => …`, `(item: () => T, index) => …`),
+  `fallback` and `key` props needed no changes; React-authored elements and
+  callbacks flow through the untouched `ComponentChildren` prop types
+  unchanged. Props stay fully typed — mistyped props still fail under either
+  import source, pinned by `@ts-expect-error`s in both worlds:
+  `type-fixtures/react-control-flow/` (react side) and the preact-JSX
+  control-flow tests. `<ServerIsland>` (server-side, root entry) is the one
+  component that still returns a preact `VNode`; see `docs/react-compat.md`.
 - **The navigation/form components are usable from React-typed JSX.**
   `<Form>`, `<Link>`, `<NavLink>`, `<ViewTransitions>` and `<ScrollReveal>`
   now have JSX-agnostic element returns (the same treatment `Image`,
@@ -36,8 +54,6 @@ All notable changes to this project are documented in this file.
   typed — a mistyped prop still fails against the same `FormProps`/
   `LinkProps` under either import source, pinned in both worlds by
   `type-fixtures/react-nav-form/` (react) and the preact-JSX component tests.
-  The control-flow components (`Show`, `For`, `Switch`, `Match`, `Index`)
-  are not JSX-agnostic yet; see `docs/react-compat.md`.
 - **`JsxChildren` / `AnyJsxElement` exported from `@neutron-build/core/client`**
   (and the root entry): the structural element type both JSX runtimes
   produce and accept back, for `children` props on components that must
@@ -65,8 +81,8 @@ All notable changes to this project are documented in this file.
 - `docs/react-compat.md` documents the types setup for react-compat apps:
   `react` ships no bundled types, so apps need `@types/react` (the bundler
   never needs the real `react` package — the runtime aliases cover it), and
-  the `jsxImportSource` choices with their current limits (control-flow
-  components are the remaining preact-typed surface).
+  the `jsxImportSource` choices with their current limits (the server-side
+  `<ServerIsland>` is the remaining preact-typed surface).
 - `create-neutron --runtime react-compat` scaffolds with `@types/react` in
   `devDependencies`. Previously the flag only substituted the config value,
   leaving the scaffold unable to typecheck its first React-ecosystem import.

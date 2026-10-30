@@ -26,7 +26,16 @@ export interface ShowProps<T> {
   children: (item: NonNullable<T>) => ComponentChildren;
 }
 
-export function Show<T>({ when, fallback, children }: ShowProps<T>) {
+/**
+ * The return type is deliberately `any` (like Form/Link/Island — see
+ * components.tsx): the element is a preact VNode at runtime, which
+ * @types/react's ReactNode rejects (TS2786), so a preact-typed return would
+ * make `<Show>` unusable from React-typed JSX (react-compat apps compiling
+ * with `jsxImportSource: "react"`). `any` typechecks under both JSX runtimes;
+ * the props — including the keyed render callback and `fallback` — stay
+ * fully typed. See src/client/type-fixtures/react-control-flow/.
+ */
+export function Show<T>({ when, fallback, children }: ShowProps<T>): any {
   if (when) {
     return <>{children(when as NonNullable<T>)}</>;
   }
@@ -51,7 +60,8 @@ export interface ForProps<T> {
   children: (item: T, index: () => number) => ComponentChildren;
 }
 
-export function For<T>({ each, fallback, children }: ForProps<T>) {
+/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
+export function For<T>({ each, fallback, children }: ForProps<T>): any {
   if (!each || each.length === 0) {
     return <>{fallback}</>;
   }
@@ -87,7 +97,8 @@ export interface SwitchProps {
   children: ComponentChildren;
 }
 
-export function Switch({ fallback, children }: SwitchProps) {
+/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
+export function Switch({ fallback, children }: SwitchProps): any {
   // Find first matching child
   const childArray = Array.isArray(children) ? children : [children];
 
@@ -118,7 +129,8 @@ export interface MatchProps {
   children: ComponentChildren;
 }
 
-export function Match({ when, children }: MatchProps) {
+/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
+export function Match({ when, children }: MatchProps): any {
   return when ? <>{children}</> : null;
 }
 
@@ -139,7 +151,8 @@ export interface IndexProps<T> {
   children: (item: () => T, index: number) => ComponentChildren;
 }
 
-export function Index<T>({ each, fallback, children }: IndexProps<T>) {
+/** JSX-agnostic return type, same as Show above. See react-control-flow/. */
+export function Index<T>({ each, fallback, children }: IndexProps<T>): any {
   if (!each || each.length === 0) {
     return <>{fallback}</>;
   }
