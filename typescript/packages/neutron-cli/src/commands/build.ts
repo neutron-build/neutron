@@ -16,6 +16,7 @@ import {
   resolveRuntime,
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
   resolvePreactSsr,
   vitePreactAliases,
   mergeSeoMetaInput,
@@ -467,9 +468,15 @@ export async function build(): Promise<void> {
         // too: its inline components (e.g. Link) use hooks. react-compat goes
         // further and processes EVERYTHING (`true`): externalized deps resolve
         // their own react imports natively — real React next to preact (see
-        // resolveRuntimeNoExternal).
+        // resolveRuntimeNoExternal). Core's CJS-only deps stay native, as in
+        // dev and start: the runner cannot evaluate CommonJS, and a static
+        // page that reaches core's root entry otherwise dies with "require is
+        // not defined" (RUNTIME_RUNNER_CJS_EXTERNALS).
         noExternal:
           runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
+        ...(runtimeNoExternal === true
+          ? { external: [...RUNTIME_RUNNER_CJS_EXTERNALS] }
+          : {}),
       },
       server: {
         middlewareMode: true,

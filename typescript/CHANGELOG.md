@@ -151,6 +151,14 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`neutron-ts build` prerenders react-compat pages that import core.**
+  Under `runtime: "react-compat"` the prerender's Vite SSR server processes
+  every dependency, and it did not keep core's CommonJS-only dependencies
+  native the way `dev` and `start` do (`RUNTIME_RUNNER_CJS_EXTERNALS`), so a
+  static page whose imports reached `@neutron-build/core`'s root entry
+  (`useLocation`, `Link`, …) failed the build with `require is not defined`
+  (acorn-jsx, under `@mdx-js/mdx`). The prerender now composes the same
+  externals.
 - **Starting the server no longer replaces the global `Response` and
   `Request`.** `@hono/node-server`'s `serve()` swaps both for its own
   lightweight classes by default, for the whole process. A `Response`

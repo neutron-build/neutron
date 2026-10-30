@@ -1721,6 +1721,34 @@ export function getStaticPaths() { return [{ params: { slug: "hello" } }]; }
   });
 });
 
+describe("neutron-ts build (process): react-compat prerender", () => {
+  it("prerenders a static page that imports core under react-compat", { timeout: 180_000 }, async () => {
+    // react-compat processes every dependency through the prerender runner;
+    // core's CommonJS-only deps (acorn-jsx under @mdx-js/mdx) must stay
+    // native or the page dies with "require is not defined".
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "react-compat-prerender", type: "module" }),
+      "neutron.config.ts": `export default { runtime: "react-compat" };\n`,
+      "src/routes/index.tsx": `
+import { useMemo } from "react";
+import { useLocation } from "@neutron-build/core";
+export const config = { mode: "static" };
+export default function Page() {
+  const path = useLocation().pathname;
+  return <p>{useMemo(() => "compat-path=" + path, [path])}</p>;
+}
+`,
+    });
+    try {
+      await runBuild(dir);
+      const html = fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8");
+      assert.ok(html.includes("compat-path=/<"), html);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("neutron-ts build (process): static CSS pass", () => {
   it("does not bundle server-only dependencies, and still collects dependency CSS", { timeout: 180_000 }, async () => {
     const dir = makeBuildFixture({
