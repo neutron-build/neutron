@@ -4,6 +4,15 @@ All notable changes to the Neutron ecosystem will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2026-10-30]
+
+### Fixed
+
+- TypeScript core 0.4.1: island layout, nested-island and island import
+  resolution fixes.
+
+See [TypeScript release notes](typescript/CHANGELOG.md).
+
 ## [2026-10-26]
 
 ### Changed

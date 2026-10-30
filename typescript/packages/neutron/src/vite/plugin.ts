@@ -725,10 +725,19 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       let result: { code: string; map: ReturnType<MagicString["generateMap"]> } | null = null;
       if (!isPathOutsideSrc(cleanId, srcDir) && code.includes("<Island")) {
         const injected = injectIslandSources(code, cleanId, rootDir);
-        if (injected) {
-          for (const islandId of injected.ids) state.islandIds.add(islandId);
+        for (const islandId of injected.ids) state.islandIds.add(islandId);
+        if (injected.result) {
           result = injected.result;
           code = injected.result.code;
+        }
+        if (!options?.ssr) {
+          for (const name of injected.unresolved) {
+            this.warn(
+              `<Island component={${name}}> in ${cleanId}: could not resolve ${name} to a ` +
+                `project module, so its marker has no data-src and will not hydrate on ` +
+                `static pages. Import the component from its own file under src/.`
+            );
+          }
         }
       }
 
@@ -1403,10 +1412,15 @@ function injectIslandSources(
   code: string,
   cleanId: string,
   rootDir: string
-): { result: { code: string; map: ReturnType<MagicString["generateMap"]> }; ids: string[] } | null {
+): {
+  result: { code: string; map: ReturnType<MagicString["generateMap"]> } | null;
+  ids: string[];
+  unresolved: string[];
+} {
   ISLAND_TAG_RE.lastIndex = 0;
   const s = new MagicString(code);
   const ids: string[] = [];
+  const unresolved: string[] = [];
   let changed = false;
   let match: RegExpExecArray | null;
 
@@ -1418,7 +1432,16 @@ function injectIslandSources(
     if (/\b__src=/.test(tagSlice)) continue;
 
     const id = resolveImportSourceId(code, componentName, cleanId, rootDir);
-    if (!id) continue;
+    if (!id) {
+      // Package imports are legitimately path-less; anything else is a local
+      // component whose marker would ship without data-src (inert on static
+      // pages).
+      const specifier = findImportSpecifier(code, componentName);
+      if (!specifier || specifier.startsWith(".") || specifier.startsWith("/")) {
+        unresolved.push(componentName);
+      }
+      continue;
+    }
 
     // Insert the prop immediately after `<Island` so it survives whatever
     // attribute layout follows.
@@ -1428,10 +1451,10 @@ function injectIslandSources(
     changed = true;
   }
 
-  if (!changed) return null;
   return {
-    result: { code: s.toString(), map: s.generateMap({ hires: true }) },
+    result: changed ? { code: s.toString(), map: s.generateMap({ hires: true }) } : null,
     ids,
+    unresolved,
   };
 }
 
@@ -1447,15 +1470,8 @@ function resolveImportSourceId(
   importerCleanId: string,
   rootDir: string
 ): string | null {
-  const escaped = componentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // default import:  import Counter from "..."
-  // named import:    import { Counter } from "..."  /  import { X as Counter } from "..."
-  const importRe = new RegExp(
-    `import\\s+(?:${escaped}\\b|(?:[\\w$]+\\s*,\\s*)?\\{[^}]*\\b${escaped}\\b[^}]*\\})\\s*from\\s*["']([^"']+)["']`
-  );
-  const m = code.match(importRe);
-  if (!m) return null;
-  const specifier = m[1];
+  const specifier = findImportSpecifier(code, componentName);
+  if (!specifier) return null;
 
   // Only relative specifiers map to a project module id.
   if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
@@ -1477,6 +1493,46 @@ function resolveImportSourceId(
   const rootFwd = normalizePathForComparison(rootDir);
   if (!onDisk.startsWith(rootFwd + "/")) return null;
   return onDisk.slice(rootFwd.length); // leading slash retained, e.g. /src/...
+}
+
+const IMPORT_DECL_RE = /\bimport\s+([\w$*{][^;'"]*?)\s+from\s*["']([^"']+)["']/g;
+
+/**
+ * Find the module specifier a local binding is imported from. Handles every
+ * value-import clause shape: `import X`, `import { X }`, `import { Y as X }`,
+ * `import D, { X }`, `import X, { type T }`, `import X, * as ns`, multi-line
+ * clauses. Type-only imports (`import type ...`, `{ type X }`) never bind a
+ * runtime value, so they are skipped.
+ */
+export function findImportSpecifier(code: string, localName: string): string | null {
+  IMPORT_DECL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = IMPORT_DECL_RE.exec(code)) !== null) {
+    const clause = m[1].trim();
+    if (/^type\s/.test(clause)) continue;
+    if (importClauseBinds(clause, localName)) return m[2];
+  }
+  return null;
+}
+
+function importClauseBinds(clause: string, localName: string): boolean {
+  const braceStart = clause.indexOf("{");
+  const head = (braceStart === -1 ? clause : clause.slice(0, braceStart)).trim();
+  // Default binding and/or namespace: `X`, `X,`, `X, * as ns`, `* as ns`.
+  for (const part of head.split(",")) {
+    const binding = part.trim().replace(/^\*\s+as\s+/, "");
+    if (binding === localName) return true;
+  }
+  if (braceStart === -1) return false;
+  const braceEnd = clause.indexOf("}", braceStart);
+  const named = clause.slice(braceStart + 1, braceEnd === -1 ? undefined : braceEnd);
+  for (const raw of named.split(",")) {
+    const spec = raw.trim();
+    if (!spec || /^type\s/.test(spec)) continue;
+    const alias = spec.match(/\bas\s+([\w$]+)$/);
+    if ((alias ? alias[1] : spec) === localName) return true;
+  }
+  return false;
 }
 
 /**

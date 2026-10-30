@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.4.1] - 2026-10-30
+
+### Fixed
+
+- Islands: the `<neutron-island>` marker is `display: contents` instead of
+  `display: block; width: 100%`. As a flex item the old rule took the whole
+  row and collapsed `flex-1` siblings to 0px. `client="visible"` now observes
+  the marker's children.
+- Islands: an `<Island>` inside another island's component renders inline as
+  part of the outer island. It used to emit its own marker, which the
+  standalone runtime hydrated a second time (content rendered twice).
+- Islands: `<Island component={X}>` resolves `X` from every value-import shape,
+  including `import X, { type T } from` and `import X, * as ns from`. Those
+  shapes left the marker without `data-src`, so the island never hydrated on
+  static pages. The Vite plugin now warns when a local island component cannot
+  be resolved.
+
 ## [core 0.4.0, cli 0.4.0, create 0.1.10, sql 0.2.0, nucleus 0.3.0, data 0.3.0, ai 0.1.2, security 0.1.5, ops 0.1.4, otel 0.1.4] - 2026-10-26
 
 ### Breaking

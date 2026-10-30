@@ -140,17 +140,25 @@ function normalizeExportName(name: string): string {
 }
 
 function observeVisible(island: IslandElement) {
+  // The marker is `display: contents` (see core/seo.ts), so it has no box of
+  // its own and never intersects; watch its rendered children instead.
+  const targets = Array.from(island.children);
+  if (targets.length === 0) {
+    hydrateIsland(island);
+    return;
+  }
+
   const observer = new IntersectionObserver(
-    ([entry]) => {
-      if (entry.isIntersecting) {
-        hydrateIsland(island);
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
         observer.disconnect();
+        hydrateIsland(island);
       }
     },
     { threshold: 0.1 }
   );
 
-  observer.observe(island);
+  for (const target of targets) observer.observe(target);
 }
 
 function onIdle(callback: () => void) {
@@ -187,6 +195,10 @@ export function initIslands(manifest?: IslandManifest) {
 
   islands.forEach((island) => {
     if (island.__neutronHydrated) return;
+    // An island nested in another island belongs to the outer island's
+    // client render; hydrating it again would mount a second Preact root
+    // over DOM the outer root already owns (content renders twice).
+    if (island.parentElement?.closest("neutron-island")) return;
 
     const client = island.getAttribute("data-client") as ClientDirective | null;
     const media = island.getAttribute("data-media");

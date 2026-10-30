@@ -166,3 +166,78 @@ describe("router-owned islands", () => {
     expect(island.querySelectorAll("button").length).toBe(1);
   });
 });
+
+describe("nested islands", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    delete (window as any).__ISLAND_COMPONENTS__;
+  });
+
+  // Regression: an island inside another island is part of the outer island's
+  // client render. Hydrating it as well mounted a second Preact root over DOM
+  // the outer root owns, so its content rendered twice.
+  it("leaves a nested marker to the outer island", async () => {
+    const Inner = () => h("span", { class: "inner" }, "inner");
+    const Outer = () => h("div", null, h("neutron-island", { "data-client": "load" }, h(Inner, null)));
+    document.body.innerHTML =
+      '<neutron-island data-component="Outer" data-client="load" data-props="{}" data-src="/o.tsx">' +
+      '<div><neutron-island data-component="Inner" data-client="load" data-props="{}" data-src="/i.tsx">' +
+      '<span class="inner">inner</span></neutron-island></div></neutron-island>';
+
+    const inner = vi.fn(async () => ({ default: Inner }));
+    initIslands({ "/o.tsx": async () => ({ default: Outer }), "/i.tsx": inner });
+    await flush();
+    await flush();
+
+    expect(inner).not.toHaveBeenCalled();
+    expect(document.querySelectorAll("span.inner").length).toBe(1);
+  });
+});
+
+describe("client=visible", () => {
+  let observed: Element[];
+  let trigger: (entries: Partial<IntersectionObserverEntry>[]) => void;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    delete (window as any).__ISLAND_COMPONENTS__;
+    observed = [];
+    (globalThis as any).IntersectionObserver = class {
+      constructor(cb: (entries: Partial<IntersectionObserverEntry>[]) => void) {
+        trigger = cb;
+      }
+      observe(el: Element) {
+        observed.push(el);
+      }
+      disconnect() {}
+    };
+  });
+
+  // The marker is display:contents and has no box, so the observer must watch
+  // its rendered children rather than the marker itself.
+  it("observes the island's children and hydrates when one intersects", async () => {
+    document.body.innerHTML =
+      '<neutron-island data-component="Counter" data-client="visible" ' +
+      'data-props="{}" data-src="/c.tsx"><button>count:0</button></neutron-island>';
+    const importer = vi.fn(async () => ({ default: Counter }));
+    initIslands({ "/c.tsx": importer });
+
+    expect(observed.map((el) => el.tagName)).toEqual(["BUTTON"]);
+    expect(importer).not.toHaveBeenCalled();
+
+    trigger([{ isIntersecting: true }]);
+    await flush();
+    expect(importer).toHaveBeenCalledTimes(1);
+  });
+
+  it("hydrates immediately when there is nothing to observe", async () => {
+    document.body.innerHTML =
+      '<neutron-island data-component="Counter" data-client="visible" ' +
+      'data-props="{}" data-src="/c.tsx"></neutron-island>';
+    const importer = vi.fn(async () => ({ default: Counter }));
+    initIslands({ "/c.tsx": importer });
+    await flush();
+    expect(observed).toEqual([]);
+    expect(importer).toHaveBeenCalledTimes(1);
+  });
+});
