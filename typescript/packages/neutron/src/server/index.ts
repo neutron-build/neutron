@@ -528,11 +528,17 @@ export async function createServer(
   // dropped instead of published after the invalidation.
   let appCacheEpoch = 0;
   // Advance the epoch, then evict the path from both caches (the deletes also
-  // bump the stores' generations, fencing remote fills).
-  const invalidateMutatedPath = async (pathname: string): Promise<void> => {
+  // bump the stores' generations, fencing remote fills). Given the mutation's
+  // response, also evict what its `x-neutron-invalidate` header names — the
+  // same directive for page actions and resource-route handlers.
+  const invalidateMutatedPath = async (pathname: string, response?: Response): Promise<void> => {
     appCacheEpoch++;
     await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(pathname));
     await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(pathname));
+    if (response) {
+      await applyMutationInvalidationFromResponse(appResponseCacheStore, pathname, response);
+      await applyMutationInvalidationToLoaderDataCache(loaderDataCacheStore, pathname, response);
+    }
   };
 
   if (hasAppRoutes && !ssrServer) {
@@ -903,11 +909,12 @@ export async function createServer(
             })
         );
         // A mutating endpoint can change what app pages show: fence fills
-        // that were in flight while it ran (TS-07 completion fence). No
+        // that were in flight while it ran (TS-07 completion fence), and
+        // evict the pages its `x-neutron-invalidate` header names. No
         // pre-handler call: a resource route's own path holds no cache
         // entries, and this bump already fences GETs that began earlier.
         if (isMutationMethod(requestTrace.method)) {
-          await invalidateMutatedPath(effectivePathname);
+          await invalidateMutatedPath(effectivePathname, response);
         }
         return finalize(response, {
           routeId: match.route.id,
@@ -1182,17 +1189,7 @@ export async function createServer(
         // GETs may have published old data after the start invalidation while
         // the action was running. Evict those entries and fence remote fills
         // at completion even when the action emits no invalidation header.
-        await invalidateMutatedPath(effectivePathname);
-        await applyMutationInvalidationFromResponse(
-          appResponseCacheStore,
-          effectivePathname,
-          response
-        );
-        await applyMutationInvalidationToLoaderDataCache(
-          loaderDataCacheStore,
-          effectivePathname,
-          response
-        );
+        await invalidateMutatedPath(effectivePathname, response);
       }
 
       return finalize(response, {

@@ -136,6 +136,14 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Resource-route mutations honour `x-neutron-invalidate`.** A page action's
+  response could name other paths to evict from the app-response and
+  loader-data caches with the header; a `POST`/`PUT`/`PATCH`/`DELETE`
+  resource-route handler's response could not — the header was ignored, so
+  an API endpoint that changed what a cached page shows left it stale until
+  expiry. Both now go through the same invalidation helper (`self`, `*` and
+  explicit paths, as for actions). The edge runtimes do not serve resource
+  routes and are unchanged.
 - **A static-only build no longer records a deleted file as its client
   entry.** `dist/.neutron-client-entry.json` named the CSS-extraction pass's
   JS entry, which the build deletes right after that pass, so anything that
