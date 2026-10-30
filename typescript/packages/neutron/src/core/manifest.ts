@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Route, RouteConfig } from "./types.js";
 import { RESOURCE_ROUTE_METHODS } from "./resource-routes.js";
+import type { ResourceRouteMethod } from "./resource-routes.js";
 
 export interface DiscoverOptions {
   routesDir: string;
@@ -222,6 +223,7 @@ function createRoute(
       hasMiddleware: derived.hasMiddleware,
       hasAction: derived.hasAction,
       hasMethodHandlers: derived.hasMethodHandlers,
+      resourceMethods: derived.resourceMethods,
       hasDefaultExport: derived.hasDefaultExport,
       parentId,
       isLayout: true,
@@ -243,6 +245,7 @@ function createRoute(
       hasMiddleware: derived.hasMiddleware,
       hasAction: derived.hasAction,
       hasMethodHandlers: derived.hasMethodHandlers,
+      resourceMethods: derived.resourceMethods,
       hasDefaultExport: derived.hasDefaultExport,
       parentId,
       isLayout: false,
@@ -263,6 +266,7 @@ function createRoute(
     hasMiddleware: derived.hasMiddleware,
     hasAction: derived.hasAction,
     hasMethodHandlers: derived.hasMethodHandlers,
+    resourceMethods: derived.resourceMethods,
     hasDefaultExport: derived.hasDefaultExport,
     parentId,
     isLayout: false,
@@ -323,6 +327,13 @@ export interface RouteFacts {
    */
   hasMethodHandlers: boolean;
   /**
+   * Which HTTP method handlers the route source exports. Derived alongside
+   * `hasMethodHandlers` (which is `resourceMethods.length > 0`); carried in
+   * the route table because OpenAPI generation runs at boot from the table
+   * alone and cannot import the module. Empty when unknown — never guessed.
+   */
+  resourceMethods: ResourceRouteMethod[];
+  /**
    * Whether the route source has a default export (a component).
    */
   hasDefaultExport: boolean;
@@ -354,13 +365,14 @@ export function parseRouteFacts(fileContent: string): RouteFacts {
   const actionNamed = /export\s*\{[^}]*\baction\b[^}]*\}/.test(fileContent);
   // HTTP method handlers (resource routes). The word boundary after the name
   // keeps GETX/GET_DATA from matching; `export { GET }` covers re-exports.
-  const methodDeclared = RESOURCE_ROUTE_METHODS.some((method) =>
+  // Collect WHICH methods matched, not just that one did: the route table is
+  // the only place the fact can live (OpenAPI runs from the table, the client
+  // build strips the exports), and a method not listed would be undocumented.
+  const resourceMethods = RESOURCE_ROUTE_METHODS.filter((method) =>
     new RegExp(`export\\s+(?:async\\s+)?(?:function|const|let|var)\\s+${method}\\b`).test(
       fileContent
-    )
-  );
-  const methodNamed = RESOURCE_ROUTE_METHODS.some((method) =>
-    new RegExp(`export\\s*\\{[^}]*\\b${method}\\b[^}]*\\}`).test(fileContent)
+    ) ||
+      new RegExp(`export\\s*\\{[^}]*\\b${method}\\b[^}]*\\}`).test(fileContent)
   );
   // Any default-export form: `export default function/class/expr`.
   const hasDefault = /(^|\n)\s*export\s+default\b/.test(fileContent);
@@ -368,7 +380,8 @@ export function parseRouteFacts(fileContent: string): RouteFacts {
     hasLoader: declared || named,
     hasMiddleware: middlewareDeclared || middlewareNamed,
     hasAction: actionDeclared || actionNamed,
-    hasMethodHandlers: methodDeclared || methodNamed,
+    hasMethodHandlers: resourceMethods.length > 0,
+    resourceMethods,
     hasDefaultExport: hasDefault,
   };
 }
@@ -386,6 +399,7 @@ function readRouteFacts(filePath: string): RouteFacts {
       hasMiddleware: true,
       hasAction: true,
       hasMethodHandlers: false,
+      resourceMethods: [],
       hasDefaultExport: true,
     };
   }

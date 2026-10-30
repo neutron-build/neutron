@@ -323,6 +323,9 @@ describe("manifest", () => {
     expect(time?.hasMethodHandlers).toBe(true);
     expect(time?.hasDefaultExport).toBe(false);
     expect(isResourceRoute(time!)).toBe(true);
+    // Which methods the module answers, in RESOURCE_ROUTE_METHODS order —
+    // the fact OpenAPI generation documents one operation from.
+    expect(time?.resourceMethods).toEqual(["GET", "POST"]);
 
     const page = routes.find((r) => r.path === "/page");
     expect(page?.hasMethodHandlers).toBe(false);
@@ -336,6 +339,27 @@ describe("manifest", () => {
     );
     expect(both.hasMethodHandlers).toBe(true);
     expect(both.hasDefaultExport).toBe(true);
+  });
+
+  it("resourceMethods records every handler spelling and nothing else", () => {
+    const everySpelling = parseRouteFacts(
+      [
+        "export async function GET() {}",
+        "export const POST = async () => {};",
+        "let put = async () => {};",
+        "export { put as PUT };",
+        "export async function OPTIONS() {}",
+      ].join("\n")
+    );
+    expect(everySpelling.hasMethodHandlers).toBe(true);
+    expect(everySpelling.resourceMethods).toEqual(["GET", "POST", "PUT", "OPTIONS"]);
+
+    // The word boundary after the name keeps look-alikes from counting.
+    const lookAlikes = parseRouteFacts(
+      "export const GETX = () => {};\nconst GET_DATA = 1;\nexport default function Page() {}"
+    );
+    expect(lookAlikes.hasMethodHandlers).toBe(false);
+    expect(lookAlikes.resourceMethods).toEqual([]);
   });
 
   it("rejects a route that exports both a component and method handlers", () => {

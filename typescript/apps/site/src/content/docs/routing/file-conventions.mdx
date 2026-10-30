@@ -68,5 +68,6 @@ The rules:
 - **Middleware**: route and layout `middleware` exports, plus the global `src/middleware.ts`, run around every request in the usual order — so an endpoint can be auth-gated, including through a parent layout. Loaders never run for resource routes.
 - **Never prerendered**: a resource route produces no static file at build time; it answers per request even in `mode: "static"` (the default). Because nothing is prebuilt, gating it is legal — unlike a gated static page, there is no prerendered file that could bypass the gate.
 - **Server-only**: handler code is stripped from the client build and resource routes are excluded from the client route table entirely — nothing an endpoint exports ships to the browser.
+- **OpenAPI**: with `server.openapi` configured, each exported method appears in `/openapi.json` as an operation (operation id derived from method + path), with the route's path params. Request and response bodies are generic `object` placeholders — the spec is generated from the route table, which cannot see handler types — so supply real schemas per operation through the `openapi.paths` merge when you need them.
 
 Need a whole Hono sub-app (e.g. tRPC) at one prefix instead of per-file routes? Use the server's `mount` option.
