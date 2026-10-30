@@ -1,3 +1,4 @@
+import { resolveRuntimeAliases } from "../config.js";
 import { describe, it, expect, afterAll } from "vitest";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -53,6 +54,27 @@ describe("resolvePreactSsr", () => {
     expect(fs.existsSync(path.join(root, "node_modules", "preact-render-to-string"))).toBe(
       false
     );
+  });
+
+  // Vite string aliases match `find` or `find/…`, first match wins. Every
+  // react-compat import must land on its own target, not on a bare-package
+  // alias with the subpath glued to a file (`compat.mjs/jsx-runtime`).
+  it("react-compat runtime imports each resolve through their own alias", () => {
+    const root = makeApp();
+    const preact = resolvePreactSsr(root);
+    const runtime = resolveRuntimeAliases("react-compat")!;
+    const aliases = vitePreactAliases(preact, runtime);
+    const viteResolve = (id: string) => {
+      for (const a of aliases) {
+        if (id === a.find) return a.replacement;
+        if (id.startsWith(a.find + "/")) return a.replacement + id.slice(a.find.length);
+      }
+      return id;
+    };
+    for (const id of Object.keys(runtime)) {
+      const own = aliases.find((a) => a.find === id)!;
+      expect(viteResolve(id), id).toBe(own.replacement);
+    }
   });
 
   it("vitePreactAliases lists subpaths before bare preact (prefix-match safety)", () => {

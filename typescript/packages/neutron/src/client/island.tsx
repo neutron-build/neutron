@@ -28,16 +28,7 @@ const componentNameCounts = new Map<string, number>();
 // whole subtree, so a nested <Island> must not become a second hydration root.
 const InsideIsland = createContext(false);
 
-/**
- * Island component for progressive hydration
- * 
- * Usage:
- * ```tsx
- * import Counter from "./Counter.js";
- * <Island component={Counter} client="load" count={0} />
- * ```
- */
-export function Island({
+function IslandComponent({
   component: Component,
   client,
   id,
@@ -109,6 +100,23 @@ function safeSerializeProps(props: Record<string, unknown>): string {
     return "{}";
   }
 }
+
+/**
+ * Island component for progressive hydration
+ *
+ * Usage:
+ * ```tsx
+ * import Counter from "./Counter.js";
+ * <Island component={Counter} client="load" count={0} />
+ * ```
+ *
+ * Typed for both JSX runtimes the framework supports, `preact` and
+ * `react-compat`: the element an island renders is runtime-specific (a Preact
+ * VNode is not a React ReactNode, so React's JSX types rejected `<Island>`),
+ * the props are not. The return type is left open; the props stay strict.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const Island = IslandComponent as unknown as (props: IslandProps) => any;
 
 export type { ClientDirective };
 export type { IslandProps };

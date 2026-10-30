@@ -205,8 +205,13 @@ export function vitePreactAliases(
   }
 
   // 2. Runtime (react-compat) aliases, rewritten onto absolute preact paths.
+  // Most specific first: a string find also matches `find/…`, so bare
+  // `react` listed before `react/jsx-runtime` rewrote the latter to
+  // `…/compat.mjs/jsx-runtime` (not a directory) and every client-bundled
+  // React-typed island failed to build.
   if (runtimeAliases) {
-    for (const [find, target] of Object.entries(runtimeAliases)) {
+    const bySpecificity = Object.entries(runtimeAliases).sort(([a], [b]) => b.length - a.length);
+    for (const [find, target] of bySpecificity) {
       if (target === "preact") {
         push(find, resolution.packageRoots.preact);
       } else if (target === "preact-render-to-string") {

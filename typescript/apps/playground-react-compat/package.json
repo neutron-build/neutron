@@ -7,7 +7,8 @@
     "dev": "neutron-ts dev",
     "build": "neutron-ts build",
     "start": "neutron-ts start",
-    "preview": "neutron-ts preview"
+    "preview": "neutron-ts preview",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@neutron-build/core": "workspace:*",
@@ -18,7 +19,9 @@
   },
   "devDependencies": {
     "typescript": "^5.7.2",
-    "vite": "^8.3.2"
+    "vite": "^8.3.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3"
   },
   "peerDependencies": {}
 }

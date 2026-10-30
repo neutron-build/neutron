@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [core 0.4.2] - 2026-10-30
+
+### Fixed
+
+- `<Island>` type-checks under the `react-compat` runtime. It returned a
+  Preact VNode, which React's JSX types reject (TS2786 on every island). The
+  props stay strictly typed; the element type is left to the JSX runtime.
+  `apps/playground-react-compat` now runs `tsc` over an island route in CI.
+- react-compat builds: `react/jsx-runtime` (and `react-dom/client`,
+  `react-dom/server`) resolved through the bare `react`/`react-dom` alias
+  into `…/compat.mjs/jsx-runtime`, so the first client-bundled island with
+  React-typed JSX failed with "Not a directory" unless the app happened to
+  add `@preact/preset-vite`. Runtime aliases are now ordered most specific
+  first.
+
 ## [core 0.4.1] - 2026-10-30
 
 ### Fixed
