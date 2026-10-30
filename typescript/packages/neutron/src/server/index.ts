@@ -960,9 +960,11 @@ export async function createServer(
       // A GATED one is the exception: it got here precisely because it must not
       // be served from disk, and 404ing it would turn "this page is protected"
       // into "this page does not exist". Render it through the app path so its
-      // middleware actually runs and decides. `neutron build` refuses to
-      // produce this combination at all (render-static.ts), so in practice this
-      // is reached only with a dist built before the gate was added. A-020.
+      // middleware actually runs and decides. `neutron build`
+      // (neutron-cli/src/commands/build.ts) and core's renderStatic both
+      // refuse to prerender this combination, so in practice this is reached
+      // only with a dist built before the gate was added — or by files placed
+      // in dist by anything other than those two. A-020.
       if (
         match.route.file.includes("_layout") ||
         (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw) && !gated)
