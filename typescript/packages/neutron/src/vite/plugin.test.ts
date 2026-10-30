@@ -26,6 +26,11 @@ describe("content module client stub", () => {
     expect(src).toContain("export const getCollection");
     expect(src).toContain("export const getEntry");
     expect(src).toContain("export const defineCollection");
+    // renderEntry is re-exported by the package ROOT index (the documented
+    // import surface). A hydratable component importing any root API (e.g.
+    // useLocation) pulls the root index into the client graph; a stub without
+    // this name fails the whole client build with MISSING_EXPORT.
+    expect(src).toContain("export const renderEntry");
     expect(src).not.toContain("node:crypto");
     expect(src).not.toContain("node:fs");
   });

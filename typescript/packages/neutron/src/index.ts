@@ -93,6 +93,7 @@ export {
   resolveRuntimeAliases,
   resolveRuntimeJsx,
   resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
   type NeutronConfig,
   type NeutronImageConfig,
   type NeutronRedirectRule,
@@ -238,6 +239,10 @@ export type { Fetcher, FetcherState, FetcherSubmitOptions } from "./client/fetch
 // Client components
 export { Form, Link, NavLink, prefetch } from "./client/components.js";
 export type { FormProps, LinkProps, NavLinkProps } from "./client/components.js";
+
+// Router provider mount — used by the server renderers; exported so a host
+// can load the copy from the app's SSR graph (see RouteRenderer and A-011).
+export { withRouterProviders, type CreateElement, type RouterProviderValues } from "./core/router-providers.js";
 export { Island } from "./client/island.js";
 export { Image, defaultImageLoader } from "./client/image.js";
 export type { ImageProps, ImageLoader, ImageLoaderArgs } from "./client/image.js";

@@ -78,6 +78,7 @@ const serverOnly = (name) => () => {
 export const getCollection = serverOnly("getCollection");
 export const getEntry = serverOnly("getEntry");
 export const prepareContentCollections = serverOnly("prepareContentCollections");
+export const renderEntry = serverOnly("renderEntry");
 export const sanitizeHtml = serverOnly("sanitizeHtml");
 export const defineCollection = (config) => config;
 export const setActiveMarkdownConfig = () => {};

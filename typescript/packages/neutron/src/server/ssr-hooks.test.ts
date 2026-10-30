@@ -2,6 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import * as net from "node:net";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { createRequire } from "node:module";
@@ -145,6 +146,114 @@ export function ThemeToggle() {
     expect(fs.existsSync(path.join(root, "node_modules", "preact-render-to-string"))).toBe(
       false
     );
+  });
+});
+
+/**
+ * The same dual-preact crash class, through the production start path:
+ * `createServer` (mode "ssr") loads route modules through its own Vite SSR
+ * runner, so the renderer it hands to renderAppRoute must come from that
+ * same graph — not from core's static imports (Gap 5's react-compat variant
+ * is the sibling test in core/react-compat-ssr.test.ts; this one pins the
+ * default preact runtime).
+ */
+describe("SSR dual-preact graph through createServer (start shape)", () => {
+  const roots: string[] = [];
+
+  afterAll(async () => {
+    for (const root of roots) {
+      await fsp.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  function makeStartApp(): string {
+    const root = fs.mkdtempSync(path.join(__dirname, ".tmp-ssr-start-"));
+    roots.push(root);
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({
+        name: "ssr-start-fixture",
+        type: "module",
+        dependencies: { preact: "^10.25.4" },
+      })
+    );
+    const nm = path.join(root, "node_modules");
+    fs.mkdirSync(nm, { recursive: true });
+    const preactRoot = findPackageRoot(
+      createRequire(import.meta.url).resolve("preact"),
+      "preact"
+    );
+    fs.symlinkSync(preactRoot, path.join(nm, "preact"), "dir");
+    // The app installs core the way real consumers do, so routes can import
+    // framework APIs from their own node_modules.
+    fs.mkdirSync(path.join(nm, "@neutron-build"), { recursive: true });
+    fs.symlinkSync(
+      path.resolve(__dirname, "../.."),
+      path.join(nm, "@neutron-build", "core"),
+      "dir"
+    );
+
+    fs.mkdirSync(path.join(root, "src", "routes"), { recursive: true });
+    // useState + core's useLocation in one component: both hook sources
+    // (app preact, core) must land on the renderer's graph.
+    fs.writeFileSync(
+      path.join(root, "src", "routes", "index.ts"),
+      [
+        'import { h } from "preact";',
+        'import { useState } from "preact/hooks";',
+        'import { useLocation } from "@neutron-build/core";',
+        "",
+        'export const config = { mode: "app" };',
+        "",
+        "export default function Page() {",
+        '  const [count] = useState(5);',
+        "  const { pathname } = useLocation();",
+        '  return h("span", { "data-hook": "both" }, `count:${count} at:${pathname}`);',
+        "}",
+        "",
+      ].join("\n")
+    );
+    return root;
+  }
+
+  async function getFreePort(): Promise<number> {
+    return await new Promise<number>((resolve, reject) => {
+      const socket = net.createServer();
+      socket.listen(0, "127.0.0.1", () => {
+        const address = socket.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("Failed to resolve test port"));
+          return;
+        }
+        socket.close(() => resolve(address.port));
+        socket.on("error", reject);
+      });
+    });
+  }
+
+  it("renders preact + core hooks per request through the start runtime", async () => {
+    const { createServer: createNeutronServer } = await import("./index.js");
+    const root = makeStartApp();
+    const port = await getFreePort();
+    const server = await createNeutronServer({
+      mode: "ssr",
+      runtime: "preact",
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('data-hook="both"');
+      expect(html).toContain("count:5");
+      expect(html).toContain("at:/");
+      expect(html).not.toContain("__H");
+    } finally {
+      await server.close();
+    }
   });
 });
 

@@ -33,6 +33,13 @@ export interface PreactSsrResolution {
     "preact/jsx-dev-runtime": string;
     "preact/compat": string;
     "preact-render-to-string": string;
+    /**
+     * ESM entry of the streaming renderer (`renderToReadableStream`), or
+     * undefined when the resolved preact-render-to-string does not export
+     * `./stream` (older versions). Optional so `resolvePreactSsr` keeps
+     * working against packages that predate the subpath.
+     */
+    "preact-render-to-string/stream"?: string;
   };
   /**
    * Package roots for bare ids (so Node/Vite can still honor package
@@ -143,6 +150,14 @@ export function resolvePreactSsr(
       );
     }
     paths[id] = resolved;
+  }
+
+  // The streaming renderer is optional: resolved from the same roots, but a
+  // preact-render-to-string without the `./stream` export must not fail the
+  // whole resolution — callers fall back to the buffered renderer.
+  const streamEntry = resolveId("preact-render-to-string/stream", uniqueRoots);
+  if (streamEntry) {
+    paths["preact-render-to-string/stream"] = streamEntry;
   }
 
   // Pin every preact/* file to the app's preact package so RTS (often resolved
@@ -263,7 +278,16 @@ export function vitePreactAliases(
     }
   }
 
-  // 3. Renderer package root (pnpm: not hoisted to the app).
+  // 3. Renderer package root (pnpm: not hoisted to the app). The /stream
+  //    FILE alias must precede it: string aliases prefix-match, so the bare
+  //    root would rewrite the subpath onto `<rts root>/stream` (not a file)
+  //    and break every runner/bundler load of the streaming renderer.
+  if (resolution.paths["preact-render-to-string/stream"]) {
+    push(
+      "preact-render-to-string/stream",
+      resolution.paths["preact-render-to-string/stream"]
+    );
+  }
   push(
     "preact-render-to-string",
     resolution.packageRoots["preact-render-to-string"]
@@ -293,12 +317,27 @@ export function mergePreactAliases(
 }
 
 /**
+ * The streaming renderer signature shared by every load path (bundled
+ * import in render-app-route, {@link importPreactSsr}, and the Vite
+ * SSR-graph legs the start server uses).
+ */
+export type StreamRenderFn = (
+  element: import("preact").VNode
+) => ReadableStream<Uint8Array> & { allReady?: Promise<void> };
+
+/**
  * Dynamically import preact + preact-render-to-string from the resolved paths.
  * Used by non-Vite paths (renderStatic) so they share the app's preact.
+ *
+ * Also imports the streaming renderer (`./stream`) when the resolution has
+ * one; `renderToReadableStream` is undefined for preact-render-to-string
+ * builds without the subpath, and callers fall back to the buffered
+ * `renderToString`.
  */
 export async function importPreactSsr(resolution: PreactSsrResolution): Promise<{
   h: typeof import("preact").h;
   renderToString: typeof import("preact-render-to-string").renderToString;
+  renderToReadableStream?: StreamRenderFn;
   preact: typeof import("preact");
 }> {
   const preactHref = pathToFileURL(resolution.paths.preact).href;
@@ -324,7 +363,28 @@ export async function importPreactSsr(resolution: PreactSsrResolution): Promise<
   if (!preact.h || !renderToString) {
     throw new Error("[Neutron] Resolved preact / preact-render-to-string exports are incomplete.");
   }
-  return { h: preact.h, renderToString, preact };
+
+  let renderToReadableStream: StreamRenderFn | undefined;
+  const streamEntry = resolution.paths["preact-render-to-string/stream"];
+  if (streamEntry) {
+    try {
+      const streamModule = (await importEsm(
+        pathToFileURL(streamEntry).href,
+        streamEntry,
+        "preact-render-to-string/stream"
+      )) as {
+        renderToReadableStream?: StreamRenderFn;
+        default?: { renderToReadableStream?: StreamRenderFn };
+      };
+      renderToReadableStream =
+        streamModule.renderToReadableStream ??
+        streamModule.default?.renderToReadableStream;
+    } catch {
+      // Optional leg: buffered rendering stays available.
+    }
+  }
+
+  return { h: preact.h, renderToString, renderToReadableStream, preact };
 }
 
 async function importEsm(

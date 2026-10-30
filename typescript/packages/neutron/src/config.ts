@@ -186,6 +186,33 @@ export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] | tr
 }
 
 /**
+ * Deps that stay EXTERNAL under a runtime's blanket `ssr.noExternal: true`
+ * because Vite's SSR module-runner cannot evaluate them: CommonJS-only (or
+ * CommonJS at their resolved entry), each dies with `require is not
+ * defined` / `exports is not defined` when the runner inlines it. They are
+ * the tops of the CJS subtrees in @neutron-build/core's import graph:
+ *
+ * - `@mdx-js/mdx` — content/mdx; covers the hast/micromark/acorn-jsx and
+ *   style-to-js chains beneath it
+ * - `gray-matter` — content frontmatter (js-yaml/kind-of ride along)
+ * - `yaml` — config/route-rules parsing
+ * - `@babel/parser` — route type generation
+ *
+ * Keeping exactly these native lets CORE itself run in the SSR graph
+ * (dev and start compose this the same way), which is what unifies core's
+ * hooks (useLocation, useLoaderData, …) with the app's react-compat hooks
+ * on one Preact instance — see RouteRenderer in core/render-app-route.ts.
+ * A new CJS-only dependency fails loudly; the runner error names the
+ * module, and it gets added here.
+ */
+export const RUNTIME_RUNNER_CJS_EXTERNALS = [
+  "@mdx-js/mdx",
+  "gray-matter",
+  "yaml",
+  "@babel/parser",
+] as const;
+
+/**
  * esbuild JSX settings for a runtime.
  *
  * The runtime is declared once, in neutron.config.ts. Everything derivable
