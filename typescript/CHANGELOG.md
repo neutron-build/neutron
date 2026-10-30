@@ -154,6 +154,15 @@ All notable changes to this project are documented in this file.
   500 but silently dropped route-rule headers on these responses; it now
   applies them like `start`. `new Response(null, { status: 307, headers: {
   Location } })` and `redirect()` were never affected.
+- **Global middleware runs for unmatched paths whether or not the app has a
+  `not-found.tsx`.** `src/middleware.ts` ran for an unmatched path only when
+  a `not-found.tsx` existed (its render runs the chain); without one, the
+  framework's default 404 answered with the middleware skipped, so an auth
+  gate that must see every request (FRAMEWORK_CONTRACT §5: authentication
+  precedes the route handler) let unauthenticated clients probe the URL
+  space. The default 404, and the 404 for a static route missing from dist,
+  now answer through global middleware like the static fast path already
+  did; a response it returns (401, redirect) wins.
 
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 

@@ -931,7 +931,8 @@ export async function createServer(
       // app-level middleware — it is only passed into renderAppRoute — so
       // before this it did not run for static hits at all. Now it runs, and a
       // response it returns (a redirect, a 403) wins over the prebuilt file.
-      const serveStatic = async (respond: () => Response): Promise<Response> => {
+      // The framework's own 404s below run through it the same way.
+      const withGlobalMiddleware = async (respond: () => Response): Promise<Response> => {
         if (globalMiddleware.length === 0) {
           return respond();
         }
@@ -949,7 +950,7 @@ export async function createServer(
       ) {
         const cached = staticHtmlCache.get(effectivePathname);
         if (cached) {
-          const response = await serveStatic(() =>
+          const response = await withGlobalMiddleware(() =>
             createStaticHtmlResponse(
               cached,
               c.req.raw,
@@ -969,7 +970,7 @@ export async function createServer(
         if (html !== null) {
           const entry = createStaticHtmlEntry(html);
           staticHtmlCache.set(effectivePathname, entry);
-          const response = await serveStatic(() =>
+          const response = await withGlobalMiddleware(() =>
             createStaticHtmlResponse(
               entry,
               c.req.raw,
@@ -1033,8 +1034,15 @@ export async function createServer(
               error: toError(error),
             });
           }
+          // The not-found render already ran the global middleware chain.
+          return finalize(defaultNotFoundResponse(c.req.raw, originalPathname));
         }
-        return finalize(defaultNotFoundResponse(c.req.raw, originalPathname));
+        // FRAMEWORK_CONTRACT §5: global middleware (auth gates) runs for every
+        // request, matched or not — it used to run here only when the app had
+        // a not-found.tsx to render.
+        return finalize(
+          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname))
+        );
       }
 
       // A non-app route that reached here was not answered from dist, and
@@ -1051,14 +1059,17 @@ export async function createServer(
         match.route.file.includes("_layout") ||
         (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw) && !gated)
       ) {
-        // Same content-negotiated default as an unmatched path: a static
-        // route whose file is missing from dist is still a 404 a human or a
-        // machine will read.
-        return finalize(defaultNotFoundResponse(c.req.raw, originalPathname), {
-          routeId: match.route.id,
-          routePath: match.route.path,
-          routeMode: match.route.config.mode,
-        });
+        // Same content-negotiated default as an unmatched path, behind the
+        // same global middleware: a static route whose file is missing from
+        // dist is still a 404 a human or a machine will read.
+        return finalize(
+          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname)),
+          {
+            routeId: match.route.id,
+            routePath: match.route.path,
+            routeMode: match.route.config.mode,
+          }
+        );
       }
 
       if (!ssrServer) {
