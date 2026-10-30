@@ -21,5 +21,5 @@
     "jsxImportSource": "preact"
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "src/client/type-fixtures"]
+  "exclude": ["node_modules", "dist", "src/client/type-fixtures", "src/server/type-fixtures"]
 }

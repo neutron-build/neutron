@@ -56,8 +56,16 @@ function isValidIslandToken(provided: string | undefined, expected: string): boo
  * Server Island Component
  * On server: Returns fallback + script to fetch real content
  * On client: Just renders children
+ *
+ * The return type is deliberately `any` (like Show/For/… in control-flow.tsx
+ * and Form/Link/Island in components.tsx): the element is a preact VNode at
+ * runtime, which @types/react's ReactNode rejects (TS2786), so a preact-typed
+ * return would make `<ServerIsland>` unusable from React-typed JSX
+ * (react-compat apps compiling with `jsxImportSource: "react"`). `any`
+ * typechecks under both JSX runtimes; the props — `children`, `fallback`,
+ * `id` — stay fully typed. See src/server/type-fixtures/react-server-island/.
  */
-export function ServerIsland({ children, fallback, id }: ServerIslandProps) {
+export function ServerIsland({ children, fallback, id }: ServerIslandProps): any {
   // Client-side: just render children
   if (typeof window !== "undefined") {
     return <>{children}</>;
