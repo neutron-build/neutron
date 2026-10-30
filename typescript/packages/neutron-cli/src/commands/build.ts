@@ -373,7 +373,10 @@ export async function build(): Promise<void> {
     }
   }
 
-  const clientEntryScriptSrc = extractClientEntryScriptSrc(outputDir);
+  // Only the app client build produces a client entry. The static CSS pass's
+  // manifest also names a JS entry, but that file is deleted right after it is
+  // built, so recording it pointed pages at a 404.
+  const clientEntryScriptSrc = appRouteCount > 0 ? extractClientEntryScriptSrc(outputDir) : null;
   if (clientEntryScriptSrc) {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
   }

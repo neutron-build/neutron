@@ -128,6 +128,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **A static-only build no longer records a deleted file as its client
+  entry.** `dist/.neutron-client-entry.json` named the CSS-extraction pass's
+  JS entry, which the build deletes right after that pass, so anything that
+  injected the client entry pointed at a 404. With no app routes there is no
+  client entry, and the file is no longer written.
 - **Static-only builds emit fonts and images as files instead of inlining
   them into the stylesheet.** The CSS-extraction pass ran as a Vite library
   build, and library mode inlines every `url()` asset as a base64 `data:` URI

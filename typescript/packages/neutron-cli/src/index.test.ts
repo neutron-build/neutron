@@ -1801,6 +1801,8 @@ export default function Page() { return h("p", null, "fonts"); }
         .join("\n");
       assert.ok(css.includes(`url(/assets/${fontFile})`), css);
       assert.ok(!css.includes("data:font"), "font inlined as a data: URI");
+      // The pass's JS is deleted, so it must not be recorded as a client entry.
+      assert.equal(fs.existsSync(path.join(dir, "dist", ".neutron-client-entry.json")), false);
       assert.ok(
         fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8").includes('rel="stylesheet"')
       );
