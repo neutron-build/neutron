@@ -36,10 +36,29 @@ app := neutron.New(
 | `Recover` | Catches panics, returns 500 |
 | `RequestID` | Generates X-Request-Id header |
 | `CORS` | Cross-origin resource sharing |
-| `RateLimit` | Token bucket rate limiting |
+| `RateLimit` | Token bucket rate limiting, per client |
 | `Timeout` | Per-request deadline |
 | `Compress` | Gzip response compression |
 | `OTel` | OpenTelemetry trace context |
+
+## Rate limiting behind a proxy
+
+`RateLimit` keys each bucket on the TCP peer. Behind a reverse proxy every
+request comes from the proxy, so all clients would share one bucket. Name the
+proxies whose forwarded address you trust:
+
+```go
+neutron.RateLimit(10, 20, neutron.WithTrustedProxy(neutron.TrustedProxyOptions{
+    TrustedProxies:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+    ForwardedHeader: "X-Forwarded-For", // the default
+    TrustedHops:     1,                 // proxies between you and the client
+}))
+```
+
+Forwarding headers from any other peer are ignored, since clients can set
+them. `neutron.ClientIP(r, opts)` applies the same rule anywhere else, and
+`neutron.WithRateLimitKey(fn)` keys buckets on anything you choose (an API
+key id, a user id).
 
 ## Custom Middleware
 

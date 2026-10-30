@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -770,5 +771,52 @@ func TestPanicBeforeAnyByteStillAnswersInBand(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "unexpected error") {
 		t.Fatalf("body = %q, want the in-band 500 problem detail", w.Body.String())
+	}
+}
+
+func TestClientIPTrustsOnlyConfiguredProxies(t *testing.T) {
+	proxy := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	for _, c := range []struct {
+		name, remote, header, value string
+		opts                        TrustedProxyOptions
+		want                        string
+	}{
+		{"no proxy config: peer", "203.0.113.9:1", "X-Forwarded-For", "1.1.1.1", TrustedProxyOptions{}, "203.0.113.9"},
+		{"untrusted peer cannot forward", "203.0.113.9:1", "X-Forwarded-For", "1.1.1.1", TrustedProxyOptions{TrustedProxies: proxy}, "203.0.113.9"},
+		{"trusted peer, one hop", "10.1.2.3:1", "X-Forwarded-For", "8.8.8.8, 198.51.100.7", TrustedProxyOptions{TrustedProxies: proxy}, "198.51.100.7"},
+		{"two trusted hops", "10.1.2.3:1", "X-Forwarded-For", "198.51.100.7, 10.9.9.9", TrustedProxyOptions{TrustedProxies: proxy, TrustedHops: 2}, "198.51.100.7"},
+		{"custom single-value header", "10.1.2.3:1", "CF-Connecting-IP", "2001:db8::5", TrustedProxyOptions{TrustedProxies: proxy, ForwardedHeader: "CF-Connecting-IP"}, "2001:db8::5"},
+		{"malformed entry falls back to peer", "10.1.2.3:1", "X-Forwarded-For", "nope", TrustedProxyOptions{TrustedProxies: proxy}, "10.1.2.3"},
+		{"oversized chain falls back to peer", "10.1.2.3:1", "X-Forwarded-For", "1.1.1.1,1.1.1.2,1.1.1.3", TrustedProxyOptions{TrustedProxies: proxy, MaxForwardedIPs: 2}, "10.1.2.3"},
+		{"IPv6 peer", "[2001:db8::1]:1", "", "", TrustedProxyOptions{}, "2001:db8::1"},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = c.remote
+		if c.header != "" {
+			r.Header.Set(c.header, c.value)
+		}
+		if got := ClientIP(r, c.opts); got != c.want {
+			t.Errorf("%s: got %s want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRateLimitBehindTrustedProxyKeysOnClient(t *testing.T) {
+	h := RateLimit(1, 1, WithTrustedProxy(TrustedProxyOptions{
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+	}))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	hit := func(client string) int {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.2:5000"
+		r.Header.Set("X-Forwarded-For", client)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if hit("198.51.100.1") != 200 || hit("198.51.100.2") != 200 {
+		t.Fatal("distinct clients behind one proxy shared a bucket")
+	}
+	if hit("198.51.100.1") != http.StatusTooManyRequests {
+		t.Fatal("same client was not limited")
 	}
 }

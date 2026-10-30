@@ -14,6 +14,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"runtime/debug"
 	"strconv"
@@ -289,12 +290,111 @@ const rateLimitMaxBuckets = 100_000
 // trigger a full-map scan per request (GO-27).
 const rateLimitSweepInterval = 10 * time.Second
 
-// RateLimit returns middleware implementing a per-IP token-bucket rate limiter.
+// TrustedProxyOptions decides when forwarded client addresses are believed.
+// It mirrors @neutron-build/security's TrustedProxyOptions.
+type TrustedProxyOptions struct {
+	// TrustedProxies are the peers allowed to report the client address. A
+	// request from any other peer is keyed on the peer itself: forwarding
+	// headers are attacker-controlled unless a known proxy set them.
+	TrustedProxies []netip.Prefix
+	// ForwardedHeader carries the client address; default X-Forwarded-For.
+	// A header holding a single address (e.g. CF-Connecting-IP) works with
+	// TrustedHops 1.
+	ForwardedHeader string
+	// TrustedHops is how many trusted proxies sit between this server and
+	// the client: the client is read this many entries from the right, since
+	// left-most entries are attacker-controlled. Default 1.
+	TrustedHops int
+	// MaxForwardedIPs rejects (falls back to the peer for) longer chains.
+	// Default 5.
+	MaxForwardedIPs int
+}
+
+// ClientIP returns the address of the client behind r: the TCP peer, or,
+// when the peer is one of opts.TrustedProxies, the address it forwarded.
+// A malformed or oversized forwarded value falls back to the peer.
+func ClientIP(r *http.Request, opts TrustedProxyOptions) string {
+	peerStr := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(peerStr); err == nil {
+		peerStr = host
+	}
+	peer, err := netip.ParseAddr(peerStr)
+	if err != nil {
+		return peerStr
+	}
+	peer = peer.Unmap()
+	trusted := false
+	for _, p := range opts.TrustedProxies {
+		if p.Contains(peer) {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		return peer.String()
+	}
+	header := opts.ForwardedHeader
+	if header == "" {
+		header = "X-Forwarded-For"
+	}
+	hops := opts.TrustedHops
+	if hops < 1 {
+		hops = 1
+	}
+	maxIPs := opts.MaxForwardedIPs
+	if maxIPs < 1 {
+		maxIPs = 5
+	}
+	raw := strings.Join(r.Header.Values(header), ",")
+	if strings.TrimSpace(raw) == "" {
+		return peer.String()
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) < hops || len(parts) > maxIPs {
+		return peer.String()
+	}
+	addrs := make([]netip.Addr, len(parts))
+	for i, part := range parts {
+		a, err := netip.ParseAddr(strings.TrimSpace(part))
+		if err != nil {
+			return peer.String()
+		}
+		addrs[i] = a.Unmap()
+	}
+	return addrs[len(addrs)-hops].String()
+}
+
+// RateLimitOption configures [RateLimit].
+type RateLimitOption func(*rateLimitConfig)
+
+type rateLimitConfig struct {
+	key func(*http.Request) string
+}
+
+// WithRateLimitKey sets how requests are grouped into buckets (default: the
+// TCP peer address). Return a stable identity such as a client IP, an API
+// key id or a user id.
+func WithRateLimitKey(fn func(*http.Request) string) RateLimitOption {
+	return func(c *rateLimitConfig) { c.key = fn }
+}
+
+// WithTrustedProxy keys buckets on [ClientIP] with opts. Behind a reverse
+// proxy without it, every client shares the proxy's bucket.
+func WithTrustedProxy(opts TrustedProxyOptions) RateLimitOption {
+	return WithRateLimitKey(func(r *http.Request) string { return ClientIP(r, opts) })
+}
+
+// RateLimit returns middleware implementing a per-client token-bucket rate
+// limiter, keyed on the TCP peer address unless an option says otherwise.
 //
 // Configuration is validated at construction (GO-24): non-finite or
 // non-positive rates and non-positive bursts panic at stack-assembly time
 // rather than producing a limiter that never limits or divides by garbage.
-func RateLimit(rps float64, burst int) Middleware {
+func RateLimit(rps float64, burst int, opts ...RateLimitOption) Middleware {
+	cfg := rateLimitConfig{key: func(r *http.Request) string { return ClientIP(r, TrustedProxyOptions{}) }}
+	for _, o := range opts {
+		o(&cfg)
+	}
 	if math.IsNaN(rps) || math.IsInf(rps, 0) || rps <= 0 {
 		panic("neutron: rate must be finite and positive")
 	}
@@ -307,12 +407,7 @@ func RateLimit(rps float64, burst int) Middleware {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Standard host/port split (GO-24): the manual LastIndex(":")
-			// mangled IPv6 literal addresses.
-			ip := r.RemoteAddr
-			if host, _, err := net.SplitHostPort(ip); err == nil {
-				ip = host
-			}
+			ip := cfg.key(r)
 
 			mu.Lock()
 			b, ok := buckets[ip]
