@@ -13,25 +13,41 @@ row says yes only if the component produced markup containing what it should;
 rendering empty output counts as a failure, because that is how a compat
 problem usually hides.
 
-**12 of 13 render.** Generated from the versions in
+**28 of 29 render.** Generated from the versions in
 the table; a different major version can behave differently, which is the reason
 the version column exists.
 
 | Library | Version | Renders | Notes |
 |---|---|---|---|
-| `@radix-ui/react-dialog` | 1.1.4 | yes | Radix is the top of the adopter question list; Dialog is its controlled-state + context case. |
-| `@radix-ui/react-tabs` | 1.1.2 | yes | Roving-focus context and controlled state without a portal. |
-| `@radix-ui/react-tooltip` | 1.1.6 | yes | Provider + portal + presence, the combination that trips compat most often. |
-| `@radix-ui/react-popover` | 1.1.4 | yes | Same primitive family as Dialog, different anchor machinery. |
-| `@radix-ui/react-dropdown-menu` | 2.1.4 | yes | Menu semantics on top of the popper stack. |
-| `@radix-ui/react-select` | 2.1.4 | yes | The heaviest Radix primitive, and the one most likely to need DOM measurement. |
+| `@radix-ui/react-dialog` | 1.1.23 | yes | Radix is the top of the adopter question list; Dialog is its controlled-state + context case. |
+| `@radix-ui/react-tabs` | 1.1.21 | yes | Roving-focus context and controlled state without a portal. |
+| `@radix-ui/react-tooltip` | 1.2.16 | yes | Provider + portal + presence, the combination that trips compat most often. |
+| `@radix-ui/react-popover` | 1.1.23 | yes | Same primitive family as Dialog, different anchor machinery. |
+| `@radix-ui/react-dropdown-menu` | 2.1.24 | yes | Menu semantics on top of the popper stack. |
+| `@radix-ui/react-select` | 2.3.7 | yes | The heaviest Radix primitive, and the one most likely to need DOM measurement. |
 | `@tanstack/react-query` | 5.101.4 | yes | useSyncExternalStore and a context-bound client — the modern-hook case. |
 | `@tanstack/react-table` | 8.21.3 | yes | Headless, hook-heavy, no DOM — should be the easy case, and proves the harness is not trivially passing. |
 | `react-hook-form` | 7.85.0 | yes | Refs and uncontrolled inputs; the ref shape is where compat differs. |
 | `framer-motion` | 11.18.2 | yes | Reads React internals more than almost anything else in common use. |
-| `recharts` | 2.15.4 | **no** | SVG charting with children introspection (Children.map over element types). Known to fail: recharts invokes its axis components outside an active render to read their configuration (`useChartWidth` -> `useContext` from `XAxisImpl`), and Preact's hooks require a current component. Render charts client-only (an island) rather than server-rendering them.<br>**Fails:** Cannot read properties of undefined (reading 'context') |
+| `recharts` | 2.15.4 | yes | SVG charting with children introspection (Children.map over element types). Server-renders completely — wrapper, svg, axis, data points. This row was recorded as a hard failure from the matrix's first publication (`Cannot read properties of undefined (reading 'context')`) and diagnosed as recharts invoking axis components outside an active render; that was the harness's own artifact, not the library's: recharts ships a CJS lib build, and its `require("react")` loaded the shim's CJS entry — a second, CJS preact instance whose `useContext` never sees a component. With one preact instance (compat-matrix/node-hooks.mjs) the same version renders fine. |
 | `react-day-picker` | 9.14.0 | yes | Date grids, heavy per-cell rendering. |
 | `react-syntax-highlighter` | 15.6.6 | yes | Large render trees produced from a tokenizer; a common docs-site dependency. |
+| `@tiptap/react` | 3.30.1 | yes | Fylun's editor (@tiptap/react + @tiptap/pm + @tiptap/starter-kit, all 3.30.1). ProseMirror owns its DOM outside React, so a server render can only ever produce the mount point: with `immediatelyRender: false` (Tiptap's documented SSR mode — it logs its own SSR-detected notice) EditorContent renders exactly one wrapper div, and the document itself is created client-side. |
+| `@excalidraw/excalidraw` | 0.18.1 | **no** | Fylun's whiteboard. A bundled React application shipped as one component: the whole module graph loads under the react→preact/compat aliasing, but the package reads `window` during module evaluation (top-level code in dist/prod), so importing it in a server render throws `window is not defined` before any component runs — the same thing happens under React SSR. Browser-only at import time; mount it as a client-only island.<br>**Fails:** window is not defined |
+| `@xyflow/react` | 12.11.3 | yes | Fylun's node canvas (React Flow 12): d3-zoom, ResizeObserver and DOM measurement wrapped around a transformed node layer — all of it effect-side, so the wrapper, pane and nodes server-render. |
+| `@monaco-editor/react` | 4.7.0 | yes | Fylun's code editor. A thin wrapper: the server render legitimately produces only the wrapper section with its loading state — Monaco itself is fetched by @monaco-editor/loader on the client. The assertion targets that wrapper, which is all a correct server render of this component can produce. (No exports map: Node's CJS interop returns the whole exports object as `default`, hence the double `.default`.) |
+| `cmdk` | 1.1.1 | yes | Fylun's command palette (built on Radix Dialog internally), with input, list, empty state and item all in the tree. |
+| `sonner` | 2.0.8 | yes | Fylun's toasts. A correct server render is the live-region container itself (the labeled section with its aria attributes); toasts are client-side events, so the list is empty until hydration — that container is what the assertion checks. |
+| `react-markdown` | 10.1.0 | yes | Fylun's markdown rendering, with remark-gfm@4.0.1 in the plugin chain — the assertion asks for GFM output (a table and strikethrough), not just any markdown, so the plugin path is proven too. |
+| `lucide-react` | 0.562.0 | yes | Fylun's icon set; a `forwardRef` svg component per icon, mounted with an aria-label to check attribute passthrough. |
+| `qrcode.react` | 4.2.0 | yes | Fylun's QR codes; the SVG encoder produces the full module matrix server-side. |
+| `@radix-ui/react-checkbox` | 1.3.11 | yes | Fylun's checkbox at 1.3.11: controlled checked state with an Indicator child and the hidden native input fallback. |
+| `@radix-ui/react-switch` | 1.3.7 | yes | Fylun's switch at 1.3.7: same button-with-hidden-input shape as checkbox, thumb included. |
+| `@radix-ui/react-avatar` | 1.2.6 | yes | Fylun's avatar at 1.2.6: no image source in the tree, so the fallback text is the server render. |
+| `@radix-ui/react-label` | 2.1.15 | yes | Fylun's label at 2.1.15: a `forwardRef` around a native element. |
+| `@radix-ui/react-progress` | 1.1.16 | yes | Fylun's progress at 1.1.16: aria state derived from a controlled value, indicator child in the tree. |
+| `@radix-ui/react-separator` | 1.1.15 | yes | Fylun's separator at 1.1.15: non-decorative, so the accessibility role must be present in the server output. |
+| `@radix-ui/react-slot` | 1.3.3 | yes | Fylun's slot at 1.3.3 (the base of its design-system composition): the child element must come through with the slot's props merged onto it. |
 
 ## What this does and does not tell you
 
@@ -40,6 +56,12 @@ It covers **server rendering**, which is where most compat failures surface
 across the boundary, `forwardRef` shapes). It does not cover interaction:
 a library can render and still misbehave on click, focus, or animation frames.
 Treat a yes as "safe to adopt, still test your own flows", not as certification.
+
+Loading follows the Vite build's semantics, not raw Node's: one preact instance
+for CJS and ESM consumers, require-style path fallbacks, the `module` field
+for dependency-internal imports (`compat-matrix/node-hooks.mjs` implements and
+explains each). Those are bundler mechanics, not library compatibility — a
+library that still fails here fails for its own reasons, and the row says so.
 
 It also covers only the libraries listed. Adding one is a single entry in
 `compat-matrix/libraries.mjs` — a mount and an assertion — and a
