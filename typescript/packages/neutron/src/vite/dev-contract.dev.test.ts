@@ -283,6 +283,53 @@ describe("dev server: resource routes answer like the production server", () => 
     expect(denied.headers.get("allow")).toBe("GET, POST, HEAD");
   });
 
+  it("dispatches extension-bearing resource paths instead of bypassing to Vite", { timeout: 30_000 }, async () => {
+    // Both spellings that put an extension in a URL segment:
+    // - `rss[.]xml.ts` — the literal-dot filename escape → /rss.xml
+    // - `feed.xml/index.ts` — a directory whose name carries the extension
+    //   → /feed.xml
+    // The dev static-asset bypass used to hand both to Vite (404) before the
+    // router could dispatch them, while production answered 200 — dev must
+    // route what production routes. `sitemap-xml.ts` (no dot survives in the
+    // URL) is the control that always worked.
+    const root = await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "rss[.]xml.ts": RESOURCE_ROUTE,
+      "feed.xml/index.ts": RESOURCE_ROUTE,
+      "sitemap-xml.ts": RESOURCE_ROUTE,
+    });
+    // A real static asset: the bypass must keep working for files, so the
+    // fix cannot simply route every dotted path.
+    await fs.mkdir(path.join(root, "public"), { recursive: true });
+    await fs.writeFile(path.join(root, "public", "styles.css"), "body{margin:0}", "utf-8");
+    const base = await boot(root);
+
+    for (const path of ["/rss.xml", "/feed.xml", "/sitemap-xml"]) {
+      const res = await fetch(`${base}${path}`);
+      expect(res.status, `GET ${path}`).toBe(200);
+      expect(await res.json()).toEqual({ endpoint: "dev", id: null });
+    }
+
+    // POST and 405 flow through the same dispatch, not the bypass.
+    const posted = await fetch(`${base}/rss.xml`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: 1 }),
+    });
+    expect(posted.status).toBe(201);
+    expect(await posted.json()).toEqual({ ok: 1 });
+
+    const denied = await fetch(`${base}/rss.xml`, { method: "DELETE" });
+    expect(denied.status).toBe(405);
+    expect(denied.headers.get("allow")).toBe("GET, POST, HEAD");
+
+    // Real assets still bypass the router to Vite's static handler.
+    const css = await fetch(`${base}/styles.css`);
+    expect(css.status).toBe(200);
+    expect(css.headers.get("content-type")).toContain("text/css");
+    expect(await css.text()).toBe("body{margin:0}");
+  });
+
   it("runs route middleware around dev dispatch", { timeout: 30_000 }, async () => {
     const base = await boot(await makeApp({
       "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
