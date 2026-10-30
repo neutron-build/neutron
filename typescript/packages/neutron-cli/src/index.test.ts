@@ -1649,3 +1649,67 @@ describe("writePublicFilesMetadata", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// `neutron-ts build` as a real process.
+// ---------------------------------------------------------------------------
+
+function makeBuildFixture(files: Record<string, string>): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-cli-build-"));
+  for (const [name, source] of Object.entries(files)) {
+    fs.mkdirSync(path.join(dir, path.dirname(name)), { recursive: true });
+    fs.writeFileSync(path.join(dir, name), source);
+  }
+  fs.symlinkSync(path.join(CLI_PACKAGE_DIR, "node_modules"), path.join(dir, "node_modules"), "dir");
+  return dir;
+}
+
+async function runBuild(dir: string): Promise<string> {
+  const proc = runCli("build", dir, {});
+  const code = await proc.exited;
+  assert.equal(code, 0, proc.output());
+  return proc.output();
+}
+
+const LOCATION_PAGE = `
+import { h } from "preact";
+import { useLocation } from "@neutron-build/core";
+export const config = { mode: "static" };
+export default function Page() {
+  return h("p", { id: "page" }, "page-path=" + useLocation().pathname);
+}
+`;
+
+describe("neutron-ts build (process): prerendered router context", () => {
+  it("prerenders each static page with its own useLocation().pathname", { timeout: 180_000 }, async () => {
+    const dir = makeBuildFixture({
+      "src/routes/_layout.tsx": `
+import { h } from "preact";
+import { useLocation } from "@neutron-build/core";
+export default function Layout({ children }) {
+  return h("main", null, h("span", null, "layout-path=" + useLocation().pathname), children);
+}
+`,
+      "src/routes/index.tsx": LOCATION_PAGE,
+      "src/routes/about.tsx": LOCATION_PAGE,
+      "src/routes/posts/[slug].tsx": `${LOCATION_PAGE}
+export function getStaticPaths() { return [{ params: { slug: "hello" } }]; }
+`,
+    });
+    try {
+      await runBuild(dir);
+      const read = (rel: string) => fs.readFileSync(path.join(dir, "dist", rel), "utf-8");
+      for (const [file, expected] of [
+        ["index.html", "/"],
+        ["about/index.html", "/about"],
+        ["posts/hello/index.html", "/posts/hello"],
+      ] as const) {
+        const html = read(file);
+        assert.ok(html.includes(`page-path=${expected}<`), `${file}: ${html}`);
+        assert.ok(html.includes(`layout-path=${expected}<`), `${file}: ${html}`);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

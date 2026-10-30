@@ -128,6 +128,15 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`neutron-ts build` prerenders static pages inside the router
+  providers.** The CLI's static prerender mounted no router context, so
+  `useLocation()` returned `/` (and `useParams()`/`useLoaderData()` their
+  defaults) on every prerendered page, baking the home-route branch of any
+  pathname-dependent layout into every file. Prerendered pages now get the
+  same providers as SSR, with the real pathname, params (from
+  `getStaticPaths`) and loader data, resolved through the app's module graph
+  like the start server's. Layouts on param-less static routes are also
+  created with the app graph's `h` rather than the CLI's own copy.
 - **`neutron-ts dev` runs `src/middleware.ts`.** The dev server never loaded
   the app's global middleware, so auth gates ran under `start` and on no path
   under `dev`. Dev now finds the same file (`src/middleware.{ts,tsx,js,mjs}`)

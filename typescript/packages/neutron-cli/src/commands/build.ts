@@ -27,6 +27,8 @@ import {
   renderSpeculationRules,
   isResponse,
   isResourceRoute,
+  withRouterProviders,
+  type CreateElement,
 } from "@neutron-build/core";
 import { findGatedStaticRoutes, gatedStaticRoutesError } from "./gated-static.js";
 import type {
@@ -464,6 +466,37 @@ export async function build(): Promise<void> {
     );
   }
 
+  // Router providers from the SAME graph as the route modules, as the start
+  // server does (loadRunnerRenderer): a Provider and a consumer from two module
+  // instances silently read the context default — `useLocation()` reporting
+  // "/" on every prerendered page. Falls back to the CLI's own copy.
+  let appWithRouterProviders = withRouterProviders;
+  try {
+    const appCore = (await server.ssrLoadModule("@neutron-build/core")) as {
+      withRouterProviders?: typeof withRouterProviders;
+    };
+    if (appCore.withRouterProviders) appWithRouterProviders = appCore.withRouterProviders;
+  } catch {
+    // keep the fallback
+  }
+  // Same provider values the request-serving renderer mounts.
+  const mountRouterProviders = (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    element: any,
+    route: Route,
+    pathname: string,
+    params: Record<string, string>,
+    loaderData: Record<string, unknown>
+  ) =>
+    appWithRouterProviders(appH as CreateElement, element, {
+      routeId: route.id,
+      pathname,
+      search: "",
+      params,
+      loaderData,
+      actionData: undefined,
+    });
+
   // Get layouts map
   const layouts = new Map<string, Route>();
   for (const route of routes) {
@@ -735,6 +768,7 @@ export async function build(): Promise<void> {
             params,
           });
 
+          const loaderDataByRoute: Record<string, unknown> = { [route.id]: loaderData };
           for (const layoutRoute of layoutChain) {
             const layoutModule = await loadRouteModule(layoutRoute);
             // Call layout loaders so sidebars, nav trees, etc. are populated.
@@ -745,11 +779,13 @@ export async function build(): Promise<void> {
                 params,
                 context,
               } as LoaderArgs);
+              loaderDataByRoute[layoutRoute.id] = layoutData;
             }
             if (layoutModule?.default) {
               element = appH(layoutModule.default as any, { data: layoutData }, element);
             }
           }
+          element = mountRouterProviders(element, route, resolvedPath, params, loaderDataByRoute);
 
           const html = appRender(element);
           // Mounted inside the shell's `<div id="app">` (wrapHtml owns the
@@ -818,6 +854,8 @@ export async function build(): Promise<void> {
         params: {},
       });
 
+      const loaderDataByRoute: Record<string, unknown> =
+        loaderData !== undefined ? { [route.id]: loaderData } : {};
       for (const layoutRoute of layoutChain) {
         const layoutModule = await loadRouteModule(layoutRoute);
         let layoutData: unknown = {};
@@ -827,11 +865,13 @@ export async function build(): Promise<void> {
             params: {},
             context,
           } as LoaderArgs);
+          loaderDataByRoute[layoutRoute.id] = layoutData;
         }
         if (layoutModule?.default) {
-          element = h(layoutModule.default as any, { data: layoutData }, element);
+          element = appH(layoutModule.default as any, { data: layoutData }, element);
         }
       }
+      element = mountRouterProviders(element, route, route.path, {}, loaderDataByRoute);
 
       const html = appRender(element);
       // Mounted inside the shell's `<div id="app">` (wrapHtml owns the
