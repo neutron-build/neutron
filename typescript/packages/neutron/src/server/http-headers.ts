@@ -31,12 +31,22 @@ const DEFAULT_SECURITY_HEADERS: Record<string, string> = {
   "Cross-Origin-Resource-Policy": "same-origin",
 };
 
+/**
+ * Resolve the `cors` server option.
+ *
+ * Default is OFF: `undefined` (option absent) and `false` both yield `null`,
+ * so a server created without CORS config sends no `Access-Control-*` headers
+ * and never short-circuits a preflight. Pass a config object to opt in —
+ * an explicit `origin` allowlist for anything credentialed (`credentials: true`
+ * refuses the `"*"` origin). The old default (wildcard on) went out with the
+ * default-off flip; see CHANGELOG "CORS is now opt-in".
+ */
 export function resolveCorsOptions(options: false | CorsOptions | undefined): ResolvedCorsOptions | null {
-  if (options === false) {
+  if (!options) {
     return null;
   }
 
-  const origin = options?.origin ?? "*";
+  const origin = options.origin ?? "*";
   const credentials = Boolean(options?.credentials);
 
   if (credentials && origin === "*") {

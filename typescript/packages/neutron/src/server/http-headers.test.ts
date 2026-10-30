@@ -8,6 +8,23 @@ import {
 } from "./http-headers.js";
 
 describe("http headers helpers", () => {
+  it("resolves no CORS config to null (default off)", () => {
+    expect(resolveCorsOptions(undefined)).toBeNull();
+    expect(resolveCorsOptions(false)).toBeNull();
+  });
+
+  it("resolves an explicit config object to enabled options", () => {
+    const options = resolveCorsOptions({});
+    expect(options).toEqual({
+      origin: "*",
+      methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+      exposedHeaders: [],
+      credentials: false,
+      maxAge: 600,
+    });
+  });
+
   it("creates preflight response for allowed origins", () => {
     const options = resolveCorsOptions({
       origin: ["https://app.example.com"],
