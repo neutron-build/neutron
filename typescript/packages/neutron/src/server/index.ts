@@ -715,27 +715,25 @@ export async function createServer(
   // dist ROOT (dist/favicon.svg), and `neutron-ts dev` serves those files at
   // their root URLs — but production only served /assets/* and /public/*
   // (which the build never writes), so an app's own /favicon.svg 404'd in
-  // production while working in dev. Serve any extension-bearing file that
-  // physically exists in dist; route rules still win, and extensionless
-  // names / directory paths fall through to the route pipeline below, which
+  // production while working in dev. Only files that came from public/ are
+  // served: the dist root also holds the Vite manifest, build metadata and
+  // (node/docker presets) a server bundle under server/. Route rules still
+  // win, and anything else falls through to the route pipeline below, which
   // owns loaders, route rules, gating and the app cache.
   const rootAssetStatic = serveStatic({
     root: resolvedDistDir,
     rewriteRequestPath: (p) => p,
   });
+  const isRootPublicAsset = createRootPublicAssetFilter(resolvedDistDir);
   app.use("*", async (c, next) => {
     const pathname = normalizePathname(c.req.path);
-    if (pathname === null) {
+    if (pathname === null || !isRootPublicAsset(pathname)) {
       return next();
     }
     // Redirect rules own the URL space even over physical files.
     if (
       resolveRouteRuleRedirect(compiledRouteRules, pathname, new URL(c.req.url).search)
     ) {
-      return next();
-    }
-    const lastSegment = pathname.slice(pathname.lastIndexOf("/") + 1);
-    if (!lastSegment.includes(".")) {
       return next();
     }
     return rootAssetStatic(c, next);
@@ -2127,6 +2125,43 @@ async function maybeStoreAppResponse(
     expiresAt: Date.now() + effectiveMaxAge * 1000,
   }, generation);
 }
+
+/**
+ * Decide which root URLs the SSR server may answer from the dist root. `neutron
+ * build` records the URL of every file it copied from public/ in
+ * `.neutron-public-files.json`; only those are public. A dist without that
+ * metadata (built before it existed, or by other tooling) falls back to: the
+ * last segment carries an extension, no segment starts with "." (the Vite
+ * manifest, build metadata) and the path is not under server/ (preset server
+ * bundles).
+ */
+function createRootPublicAssetFilter(distDir: string): (pathname: string) => boolean {
+  const metadataPath = path.join(distDir, PUBLIC_FILES_METADATA);
+  if (fs.existsSync(metadataPath)) {
+    let files: unknown = [];
+    try {
+      files = (JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as { files?: unknown }).files;
+    } catch {
+      // Malformed metadata serves nothing rather than everything.
+    }
+    const allowed = new Set(
+      Array.isArray(files) ? files.filter((f): f is string => typeof f === "string") : []
+    );
+    return (pathname) => allowed.has(pathname);
+  }
+  return (pathname) => {
+    const segments = pathname.split("/").filter(Boolean);
+    if (segments.length === 0 || segments[0] === "server") {
+      return false;
+    }
+    if (segments.some((segment) => segment.startsWith("."))) {
+      return false;
+    }
+    return segments[segments.length - 1].includes(".");
+  };
+}
+
+const PUBLIC_FILES_METADATA = ".neutron-public-files.json";
 
 function tryReadStaticHtml(distDir: string, pathname: string): string | null {
   if (pathname === "/") {

@@ -1574,3 +1574,52 @@ describe("neutron-ts start (process)", () => {
     }
   });
 });
+
+// -- public-files.ts: the public/ list the SSR server serves root URLs from --
+// Split out of build.ts (vite at load time) for the same reason as
+// static-paths.ts. The server serves ONLY these paths from the dist root, so
+// the Vite manifest, build metadata and preset server bundles stay private.
+
+import { writePublicFilesMetadata } from "./commands/public-files.js";
+
+describe("writePublicFilesMetadata", () => {
+  it("lists every copied public/ file (nested) and none of the build output", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-public-files-"));
+    try {
+      const publicDir = path.join(root, "public");
+      const dist = path.join(root, "dist");
+      fs.mkdirSync(path.join(publicDir, "icons"), { recursive: true });
+      fs.writeFileSync(path.join(publicDir, "favicon.svg"), "<svg/>");
+      fs.writeFileSync(path.join(publicDir, "icons", "logo.png"), "png");
+      fs.mkdirSync(path.join(dist, "icons"), { recursive: true });
+      fs.mkdirSync(path.join(dist, ".vite"), { recursive: true });
+      fs.mkdirSync(path.join(dist, "server", "node"), { recursive: true });
+      fs.writeFileSync(path.join(dist, "favicon.svg"), "<svg/>");
+      fs.writeFileSync(path.join(dist, "icons", "logo.png"), "png");
+      fs.writeFileSync(path.join(dist, ".vite", "manifest.json"), "{}");
+      fs.writeFileSync(path.join(dist, ".neutron-client-entry.json"), "{}");
+      fs.writeFileSync(path.join(dist, "server", "node", "index.mjs"), "");
+
+      writePublicFilesMetadata(dist, publicDir);
+      const written = JSON.parse(
+        fs.readFileSync(path.join(dist, ".neutron-public-files.json"), "utf-8")
+      );
+      assert.deepEqual(written, { files: ["/favicon.svg", "/icons/logo.png"] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes an empty list when there is no public/ dir (the list still governs)", () => {
+    const dist = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-public-files-"));
+    try {
+      writePublicFilesMetadata(dist, null);
+      const written = JSON.parse(
+        fs.readFileSync(path.join(dist, ".neutron-public-files.json"), "utf-8")
+      );
+      assert.deepEqual(written, { files: [] });
+    } finally {
+      fs.rmSync(dist, { recursive: true, force: true });
+    }
+  });
+});

@@ -160,6 +160,68 @@ describe("server modes", () => {
     expect((await fetch(`${base}/`)).status).toBe(404);
   });
 
+  // Build output that is not from public/ lives in the same dist root: Vite's
+  // manifest, the build metadata, and (node/docker presets) a server bundle.
+  // None of it is a public asset.
+  async function writeBuildInternals(root: string): Promise<void> {
+    await fs.mkdir(path.join(root, "dist", ".vite"), { recursive: true });
+    await fs.writeFile(path.join(root, "dist", ".vite", "manifest.json"), "{}");
+    await fs.writeFile(
+      path.join(root, "dist", ".neutron-client-entry.json"),
+      JSON.stringify({ src: "/assets/index.js" })
+    );
+    await fs.mkdir(path.join(root, "dist", "server", "node"), { recursive: true });
+    await fs.writeFile(path.join(root, "dist", "server", "node", "index.mjs"), "secret()");
+  }
+
+  it("root asset handler serves only the build's public/ file list", async () => {
+    root = await emptyRoot();
+    await writeBuildInternals(root);
+    await fs.writeFile(path.join(root, "dist", "favicon.svg"), "<svg>spike</svg>");
+    await fs.mkdir(path.join(root, "dist", "icons"), { recursive: true });
+    await fs.writeFile(path.join(root, "dist", "icons", "logo.png"), "png-bytes");
+    // A dist file the build did not copy from public/ (e.g. a prerendered
+    // resource output) is not listed and must not be served by this handler.
+    await fs.writeFile(path.join(root, "dist", "feed.xml"), "<rss/>");
+    await fs.writeFile(
+      path.join(root, "dist", ".neutron-public-files.json"),
+      JSON.stringify({ files: ["/favicon.svg", "/icons/logo.png"] })
+    );
+    const port = await getFreePort();
+    running = await createServer({ host: "127.0.0.1", port, rootDir: root, compress: false });
+    const base = `http://127.0.0.1:${port}`;
+
+    expect((await fetch(`${base}/favicon.svg`)).status).toBe(200);
+    expect((await fetch(`${base}/icons/logo.png`)).status).toBe(200);
+    for (const internal of [
+      "/.vite/manifest.json",
+      "/.neutron-client-entry.json",
+      "/.neutron-public-files.json",
+      "/server/node/index.mjs",
+      "/feed.xml",
+    ]) {
+      expect((await fetch(`${base}${internal}`)).status, internal).toBe(404);
+    }
+  });
+
+  it("root asset handler without the public/ list refuses dot-segments and server/", async () => {
+    root = await emptyRoot();
+    await writeBuildInternals(root);
+    await fs.writeFile(path.join(root, "dist", "favicon.svg"), "<svg>spike</svg>");
+    const port = await getFreePort();
+    running = await createServer({ host: "127.0.0.1", port, rootDir: root, compress: false });
+    const base = `http://127.0.0.1:${port}`;
+
+    expect((await fetch(`${base}/favicon.svg`)).status).toBe(200);
+    for (const internal of [
+      "/.vite/manifest.json",
+      "/.neutron-client-entry.json",
+      "/server/node/index.mjs",
+    ]) {
+      expect((await fetch(`${base}${internal}`)).status, internal).toBe(404);
+    }
+  });
+
   it("websocket: true attaches a wss that accepts any path and echoes", async () => {
     root = await emptyRoot();
     const port = await getFreePort();

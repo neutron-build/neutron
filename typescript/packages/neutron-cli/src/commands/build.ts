@@ -47,6 +47,7 @@ import { createRequire } from "node:module";
 import { extractClientEntryScriptSrc } from "../client-entry.js";
 import { loadNeutronConfig } from "../lib/config.js";
 import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
+import { writePublicFilesMetadata } from "./public-files.js";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
@@ -341,6 +342,15 @@ export async function build(): Promise<void> {
   if (clientEntryScriptSrc) {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
   }
+  // The SSR server answers root URLs from dist only for files listed here.
+  writePublicFilesMetadata(
+    outputDir,
+    userConfig.publicDir === false
+      ? null
+      : userConfig.publicDir
+        ? path.resolve(cwd, String(userConfig.publicDir))
+        : path.join(cwd, "public")
+  );
 
   // Standalone islands entry: a SEPARATE Rolldown build (so the SPA/app client
   // bundle stays byte-identical). It imports only the island runtime + the

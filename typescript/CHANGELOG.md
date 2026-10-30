@@ -116,6 +116,22 @@ All notable changes to this project are documented in this file.
   mode's JSON 404 is unchanged. FRAMEWORK_CONTRACT.md §2 states the
   negotiation rule.
 
+### Fixed
+
+- **The SSR server serves root-URL `public/` files in production, and only
+  those.** Vite copies `public/` into the dist root, and `neutron-ts dev`
+  serves it at root URLs (`/favicon.svg`), but `neutron-ts start` only served
+  `/assets/*` and `/public/*`, so an app's own favicon 404'd in production.
+  The root-asset handler that closed that gap served any extension-bearing
+  file in the dist root, which also exposed `/.vite/manifest.json`,
+  `/.neutron-client-entry.json` and node/docker preset server bundles under
+  `dist/server/`, and let a prebuilt file shadow a resource route at the same
+  path. `neutron build` now records the files it copied from `public/` in
+  `dist/.neutron-public-files.json`, and the server answers root URLs from
+  dist for exactly those paths. A dist without the list (built by an older
+  CLI or other tooling) falls back to refusing any dot-segment path and
+  anything under `server/`.
+
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 
 ### Changed
