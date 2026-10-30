@@ -92,39 +92,59 @@ pnpm add -D @types/react
 place. The real `react`/`react-dom` runtime packages are deliberately **not**
 added: the aliases make them unnecessary, and an installed-but-unaliased
 React next to Preact is exactly the two-copies hazard the aliases exist to
-prevent.
+prevent. The react-compat scaffold also sets `jsxImportSource: "react"` in
+`tsconfig.json` (see below) and ships a `typecheck` script (`tsc --noEmit`),
+so its sources compile out of the box after install.
 
 ### Choosing how your JSX is typed
 
 Two coherent setups; mixing them per-file is fine (the pragma is per-module):
 
-1. **Preact-typed JSX (what the scaffold ships): `jsxImportSource:
-   "preact"`.** JSX in your own modules checks against Preact's types while
+1. **Preact-typed JSX (`jsxImportSource: "preact"`).** What a `preact`-runtime
+   scaffold ships. JSX in your own modules checks against Preact's types while
    React-ecosystem components you import still carry their React-typed
    props. This is the least-friction default; occasionally a React library's
    React-typed `children` prop disagrees with Preact's JSX types at the call
    site — wrap that usage in a small module of its own (see 2) rather than
    casting everywhere.
 
-2. **React-typed modules: `jsxImportSource: "react"`.** The setup for
+2. **React-typed modules (`jsxImportSource: "react"`).** The setup for
    migration-heavy ports (React-authored JSX everywhere, e.g. a Radix-heavy
-   app). Set it per-file with a pragma, or project-wide in `tsconfig.json`:
+   app). Set it per-file with a pragma, or project-wide in `tsconfig.json` —
+   which is what a `--runtime react-compat` scaffold now ships, using the
+   same runtime → import-source rule the Vite transform already applies
+   (`resolveRuntimeJsx`), so typechecking and bundling agree:
 
    ```tsx
    /** @jsxImportSource react */
-   import { Island } from "@neutron-build/core/client";
+   import { Form } from "@neutron-build/core/client";
    ```
 
-   Framework client components must then be usable from React-typed JSX.
-   `<Island>` is: its element return type is deliberately JSX-agnostic (the
-   runtime element is a Preact VNode either way, and React's `ReactNode`
-   rejects that shape — TS2786), while its props stay fully typed. `<Form>`,
-   `<Link>` and `<NavLink>` are **not yet** JSX-agnostic — they are declared
-   as Preact `FunctionalComponent`s with Preact-typed props, and relaxing
-   that without losing Preact-side prop checking is an open design task.
-   Until it lands, keep modules that use them Preact-typed (setup 1, or the
-   per-file pragma `/** @jsxImportSource preact */`) — a React-typed
-   component can still render them through a small Preact-typed wrapper.
+   The framework's client components are usable from React-typed JSX: their
+   element returns are deliberately JSX-agnostic (`<Island>`, `<Form>`,
+   `<Link>`, `<NavLink>`, `<ViewTransitions>`, `<ScrollReveal>`, `<Image>`,
+   `<Picture>`, `<Await>`), while their props stay fully typed — a mistyped
+   prop fails TS2322 against the same `FormProps`/`LinkProps` under either
+   import source. Both worlds are pinned by compiled fixtures in
+   `@neutron-build/core` (`src/client/type-fixtures/react-nav-form/` and
+   `react-island/`, compiled with `jsxImportSource: "react"` against
+   @types/react) and by the preact-JSX component tests in the package build.
+
+   One residual, stated plainly: the control-flow components (`Show`, `For`,
+   `Switch`, `Match`, `Index`) still return preact `VNode`s and fail TS2786
+   from React-typed JSX. Keep modules that use them Preact-typed (setup 1,
+   or the per-file pragma `/** @jsxImportSource preact */`) until they
+   receive the same treatment.
+
+3. **Children props shared by both worlds.** A component that *forwards*
+   `children` in JSX cannot type that prop with either runtime's native
+   type if the module must compile under both import sources: Preact's
+   `ComponentChildren` includes bare `object`, which React's `ReactNode`
+   rejects in the render position (TS2322), and a preact-only install has no
+   `ReactNode` to import. `@neutron-build/core/client` exports `JsxChildren`
+   for exactly that shape — the structural element type both runtimes
+   produce and accept back. The scaffolded root `_layout.tsx` uses it, so
+   the same source file typechecks under either scaffold runtime.
 
 ## Compatibility Matrix
 

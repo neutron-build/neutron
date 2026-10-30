@@ -174,7 +174,7 @@ document.querySelectorAll("[data-stagger-children]>*").forEach(function(el){el.s
  * <ScrollReveal injectCSS={false} />
  * ```
  */
-export function ScrollReveal(props: ScrollRevealProps = {}) {
+export function ScrollReveal(props: ScrollRevealProps = {}): any {
   return h("script", {
     dangerouslySetInnerHTML: { __html: buildBootstrap(props) },
   });

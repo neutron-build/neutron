@@ -88,7 +88,13 @@ const BOOTSTRAP = `
 })();
 `;
 
-export function ViewTransitions() {
+/**
+ * JSX-agnostic return type (like Image/Picture/Island): the element is a
+ * preact VNode at runtime, which @types/react's ReactNode rejects (TS2786)
+ * when a react-compat app typechecks with jsxImportSource: "react". Takes no
+ * props, so only the element position is affected.
+ */
+export function ViewTransitions(): any {
   return h(
     Fragment,
     null,

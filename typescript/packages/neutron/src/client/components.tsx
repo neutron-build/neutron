@@ -1,4 +1,4 @@
-import { h, FunctionalComponent } from "preact";
+import { h } from "preact";
 import { useState, useCallback, useRef, useEffect } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
 import { navigate } from "./navigate.js";
@@ -104,7 +104,16 @@ export interface FormProps {
   onSubmit?: (event: Event) => void;
 }
 
-export const Form: FunctionalComponent<FormProps> = ({
+/**
+ * The return type is deliberately `any` (like Image/Picture/Island): the
+ * element is a preact VNode at runtime, which react-compat aliases to
+ * preact/compat, but @types/react's ReactNode does not accept a
+ * FunctionalComponent's `ComponentChildren` return (TS2786) — so a
+ * preact-typed component annotation makes `<Form>` unusable from React-typed
+ * JSX. `any` typechecks under both JSX runtimes; the props stay fully typed.
+ * See src/client/type-fixtures/react-nav-form/.
+ */
+export function Form({
   method = "post",
   action,
   replace,
@@ -112,7 +121,7 @@ export const Form: FunctionalComponent<FormProps> = ({
   onError,
   encType,
   ...props
-}) => {
+}: FormProps): any {
   const formRef = useRef<HTMLFormElement>(null);
   const submittingRef = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -254,7 +263,7 @@ export const Form: FunctionalComponent<FormProps> = ({
         })
       : children
   );
-};
+}
 
 export interface LinkProps {
   to: RouteHref;
@@ -267,14 +276,20 @@ export interface LinkProps {
   target?: string;
 }
 
-export const Link: FunctionalComponent<LinkProps> = ({ 
+/**
+ * JSX-agnostic return type, same as Form above (and Image/Picture/Island):
+ * preact `FunctionalComponent` returns ComponentChildren, which React's
+ * ReactNode rejects (TS2786). Props stay fully typed.
+ * See src/client/type-fixtures/react-nav-form/.
+ */
+export function Link({ 
   to, 
   replace, 
   prefetch = "none",
   target,
   children, 
   ...props 
-}) => {
+}: LinkProps): any {
   const linkRef = useRef<HTMLAnchorElement>(null);
   const [prefetched, setPrefetched] = useState(false);
 
@@ -347,7 +362,7 @@ export const Link: FunctionalComponent<LinkProps> = ({
     },
     children
   );
-};
+}
 
 export interface NavLinkProps extends LinkProps {
   activeClass?: string;
@@ -355,14 +370,15 @@ export interface NavLinkProps extends LinkProps {
   end?: boolean;
 }
 
-export const NavLink: FunctionalComponent<NavLinkProps> = ({ 
+/** JSX-agnostic return type, same as Form above. See react-nav-form/. */
+export function NavLink({ 
   to, 
   activeClass,
   activeStyle,
   end,
   children,
   ...props 
-}) => {
+}: NavLinkProps): any {
   const [isActive, setIsActive] = useState(false);
 
   useEffect(() => {
@@ -402,7 +418,7 @@ export const NavLink: FunctionalComponent<NavLinkProps> = ({
     },
     children
   );
-};
+}
 
 function isRedirectResult(value: unknown): value is { redirect: string } {
   if (!value || typeof value !== "object") {

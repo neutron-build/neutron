@@ -25,18 +25,48 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **The navigation/form components are usable from React-typed JSX.**
+  `<Form>`, `<Link>`, `<NavLink>`, `<ViewTransitions>` and `<ScrollReveal>`
+  now have JSX-agnostic element returns (the same treatment `Image`,
+  `Picture` and `Await` already ship, and `<Island>` received above):
+  under `runtime: "react-compat"`, apps typechecking against `@types/react`
+  (`jsxImportSource: "react"`) get TS2786 on every usage otherwise, because
+  a preact `FunctionalComponent` returns `ComponentChildren` (which includes
+  bare `object`) and React's `ReactNode` rejects that. Props stay fully
+  typed — a mistyped prop still fails against the same `FormProps`/
+  `LinkProps` under either import source, pinned in both worlds by
+  `type-fixtures/react-nav-form/` (react) and the preact-JSX component tests.
+  The control-flow components (`Show`, `For`, `Switch`, `Match`, `Index`)
+  are not JSX-agnostic yet; see `docs/react-compat.md`.
+- **`JsxChildren` / `AnyJsxElement` exported from `@neutron-build/core/client`**
+  (and the root entry): the structural element type both JSX runtimes
+  produce and accept back, for `children` props on components that must
+  compile under both import sources — preact's `ComponentChildren` fails
+  React's render position (TS2322: `object` is not a `ReactNode`) and a
+  preact-only install cannot import `ReactNode` at all. The scaffolded root
+  `_layout.tsx` uses it.
+- **`create-neutron --runtime react-compat` scaffolds with
+  `jsxImportSource: "react"`.** The tsconfig now derives its import source
+  from the runtime token — the same rule the CLI's Vite transform already
+  applies (`resolveRuntimeJsx`) — instead of disagreeing with it. All four
+  runtime templates also typecheck their string `style` attributes into the
+  object form React 19's types require, import hooks from `react` under
+  react-compat (`preact/hooks` otherwise), and ship a `typecheck` script
+  (`tsc --noEmit`). A create-neutron test compiles every runtime template's
+  scaffolded sources under BOTH runtimes, so a scaffolded app typechecks
+  out of the box — the criterion that previously kept the scaffold on
+  `preact` (settings.tsx uses `<Form>`).
 - **`<Island>` is usable from React-typed JSX.** The element `Island` returns
   is now deliberately JSX-agnostic (like `Image`/`Picture`): under
   `runtime: "react-compat"` an app that typechecks against `@types/react`
   (`jsxImportSource: "react"`) can use `<Island …>` with children directly —
   previously TS2786 rejected the preact `VNode` return against React's
   `ReactNode`, forcing a hand-rolled facade per app. Props stay fully typed.
-  `<Form>`, `<Link>` and `<NavLink>` are not JSX-agnostic yet; see the new
-  TypeScript-setup section in `docs/react-compat.md`.
 - `docs/react-compat.md` documents the types setup for react-compat apps:
   `react` ships no bundled types, so apps need `@types/react` (the bundler
   never needs the real `react` package — the runtime aliases cover it), and
-  the two coherent `jsxImportSource` choices with their current limits.
+  the `jsxImportSource` choices with their current limits (control-flow
+  components are the remaining preact-typed surface).
 - `create-neutron --runtime react-compat` scaffolds with `@types/react` in
   `devDependencies`. Previously the flag only substituted the config value,
   leaving the scaffold unable to typecheck its first React-ecosystem import.

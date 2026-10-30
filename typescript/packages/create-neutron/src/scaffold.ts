@@ -34,6 +34,14 @@ export async function scaffoldProject(options: ScaffoldOptions): Promise<Scaffol
     PROJECT_NAME: projectName,
     PACKAGE_NAME: packageName,
     RUNTIME: options.runtime,
+    // Same rule as @neutron-build/core's resolveRuntimeJsx: the tsconfig the
+    // scaffold ships must agree with the import source the CLI's Vite
+    // transform already uses for the runtime. Hooks follow it: preact apps
+    // import "preact/hooks"; react-compat apps import "react" (types from the
+    // @types/react devDependency, runtime through the preact/compat alias —
+    // no react package is installed).
+    JSX_IMPORT_SOURCE: options.runtime === "react-compat" ? "react" : "preact",
+    HOOKS_IMPORT: options.runtime === "react-compat" ? "react" : "preact/hooks",
     NEUTRON_VERSION: dependencyVersions.neutron,
     NEUTRON_CLI_VERSION: dependencyVersions.neutronCli,
   });
