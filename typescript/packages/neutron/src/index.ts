@@ -259,6 +259,7 @@ export type { ErrorBoundaryFallbackProps } from "./client/error-boundary.js";
 export { ViewTransitions } from "./client/view-transitions.js";
 export { ScrollReveal } from "./client/scroll-reveal.js";
 export type { ScrollRevealProps } from "./client/scroll-reveal.js";
+export type { AnyJsxElement, JsxChild, JsxChildren } from "./client/jsx-agnostic.js";
 export { Await } from "./client/await.js";
 export type { AwaitProps } from "./client/await.js";
 export { Show, For, Switch, Match, Index, type ShowProps, type ForProps, type SwitchProps, type MatchProps, type IndexProps } from "./client/control-flow.js";

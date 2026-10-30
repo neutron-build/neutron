@@ -32,6 +32,11 @@ The `include` glob picks up Neutron's generated type files
 `neutron-ts dev` / `neutron-ts build`. Add path aliases under
 `compilerOptions.paths` if you want them — e.g. `"~/*": ["src/*"]`.
 
+Under `runtime: "react-compat"` the scaffold ships `"jsxImportSource":
+"react"` instead of `"preact"` — the same runtime-derived rule the Vite
+transform applies — with `@types/react` scaffolded as a devDependency, and a
+`typecheck` script (`tsc --noEmit`) that compiles the sources out of the box.
+
 ## Type Inference
 
 Neutron uses TypeScript inference to carry a loader's return type into the route component.
