@@ -78,6 +78,15 @@ export default defineConfig({
 
 Mount prefixes are validated at startup: two mounts may not overlap, and a prefix may not cover a reserved framework path (`/health`, `/openapi.json`, `/docs`, `/_neutron/image`, `/__neutron_island`, `/assets`, `/public`) — the server refuses to start with an error naming the conflict. A request under a mounted prefix that the sub-app does not match falls through to the app's routes, so a mount adds endpoints without claiming the namespace.
 
-**What mounts do not do.** A mounted sub-app runs outside the framework's page pipeline. Its handlers do not pass through route or layout `middleware` (gate access inside the sub-app), and — by design — mutations served by a mount neither fence nor evict the server's SSR caches: a `POST` answered by the sub-app does not invalidate a cached page or loader data, exactly as if the API ran in a separate process. If cached pages must reflect a mount's writes immediately, serve those mutations as [resource routes](/docs/routing/file-conventions#resource-routes) instead — resource-route mutations fence the cache epoch and evict the affected paths, like actions do.
+**Global middleware runs before mounts.** The app's `src/middleware.ts` runs ahead of every mounted sub-app, outermost, with the real request: an auth gate there covers mounted APIs like it covers pages and resource routes (FRAMEWORK_CONTRACT §5). A response the middleware returns without calling `next()` answers instead of the sub-app; a request the sub-app does not match falls through to the routes with the chain already run, so it runs once. A sub-app that enforces its own authentication can opt out per mount:
+
+```ts
+mount: {
+  "/api/trpc": { app: trpcApp, globalMiddleware: false }, // gates inside tRPC
+  "/api": restApp, // src/middleware.ts runs first
+},
+```
+
+**What mounts do not do.** A mounted sub-app runs outside the framework's page pipeline. Its handlers do not pass through route or layout `middleware` (only the global chain), and — by design — mutations served by a mount neither fence nor evict the server's SSR caches: a `POST` answered by the sub-app does not invalidate a cached page or loader data, exactly as if the API ran in a separate process. If cached pages must reflect a mount's writes immediately, serve those mutations as [resource routes](/docs/routing/file-conventions#resource-routes) instead — resource-route mutations fence the cache epoch and evict the affected paths, like actions do.
 
 When your API is a handful of per-file endpoints rather than a sub-app, prefer [resource routes](/docs/routing/file-conventions#resource-routes) — route modules exporting `GET`/`POST`/… handlers, served through the same middleware chain as pages.

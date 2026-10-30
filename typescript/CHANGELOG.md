@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file.
 
 ### Breaking
 
+- **Global middleware runs before `mount` sub-apps.** `src/middleware.ts`
+  never ran for requests a mounted sub-app answered, so an auth gate there
+  silently did not cover mounted APIs (tRPC, REST) — FRAMEWORK_CONTRACT §5
+  places authentication before every route handler. In ssr mode the global
+  chain now runs ahead of each mount, outermost, with the real request; a
+  response it returns without calling `next()` (401, redirect, thrown
+  `Response`, `ProblemError`) answers instead of the sub-app, and a response
+  it substitutes after `next()` replaces the sub-app's. A mount path the
+  sub-app does not match falls through to the routes with the chain run once,
+  not twice. **Migration:** middleware that assumed it only saw page traffic
+  now sees mount traffic too. A sub-app that enforces its own authentication
+  can opt out per mount with the new object form:
+  `mount: { "/api/trpc": { app: trpcApp, globalMiddleware: false } }`
+  (`NeutronMount`). api/raw servers load no global middleware and are
+  unchanged.
 - **CORS is now opt-in.** `createServer` no longer enables CORS by default.
   Previously, a server created with no `cors` option sent
   `Access-Control-Allow-Origin: *` on every request that carried an `Origin`

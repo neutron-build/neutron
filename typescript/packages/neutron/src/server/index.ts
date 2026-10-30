@@ -254,8 +254,28 @@ export interface NeutronServerOptions {
    * matching route falls through to the rest of the app (in ssr mode, the
    * HTML catch-all) — mounting does not claim the prefix, it registers
    * routes under it.
+   *
+   * In ssr mode the app's global middleware (`src/middleware.ts`) runs before
+   * every mounted sub-app, outermost, with the real request
+   * (FRAMEWORK_CONTRACT §5: authentication precedes the route handler, and a
+   * mount is a route handler). A response it returns without calling `next()`
+   * answers instead of the sub-app. A sub-app that gates itself and must not
+   * see the global chain opts out per mount:
+   * `mount: { "/api/trpc": { app: trpcApp, globalMiddleware: false } }`.
    */
-  mount?: Record<string, NeutronMountApp>;
+  mount?: Record<string, NeutronMountApp | NeutronMount>;
+}
+
+/** The object form of a {@link NeutronServerOptions.mount} entry. */
+export interface NeutronMount {
+  app: NeutronMountApp;
+  /**
+   * Run the app's global middleware (`src/middleware.ts`) before this
+   * sub-app. Default `true`. Set `false` only when the sub-app enforces its
+   * own authentication: the global chain (auth gates included) then does not
+   * see requests the sub-app answers.
+   */
+  globalMiddleware?: boolean;
 }
 
 /**
@@ -498,7 +518,7 @@ export async function createServer(
   // aliases). Absent file = none. A PRESENT file that fails to import or
   // exports something invalid is a startup error (TS-01): losing the auth
   // gate to a typo must not look like a working server.
-  const globalMiddleware: MiddlewareFn[] =
+  const appGlobalMiddleware: MiddlewareFn[] =
     globalMiddlewareFile && ssrServer
       ? await loadGlobalMiddleware(ssrServer.ssrLoadModule, globalMiddlewareFile)
       : [];
@@ -703,9 +723,45 @@ export async function createServer(
   // A request under the prefix that the sub-app does not match falls through
   // to whatever comes next (in ssr mode, the catch-all): mounting registers
   // routes under a prefix, it does not claim the namespace.
+  // Requests whose global middleware already ran ahead of a mount. A request
+  // under a prefix the sub-app does not match falls through to the catch-all,
+  // which must not run the chain a second time.
+  const globallyGatedRequests = new WeakSet<Request>();
   if (mount) {
     validateMountConfig(mount, isSsr);
-    for (const [prefix, subApp] of Object.entries(mount)) {
+    for (const [prefix, entry] of Object.entries(mount)) {
+      const { app: subApp, globalMiddleware: runGlobal = true } = normalizeMountEntry(entry);
+      if (runGlobal && appGlobalMiddleware.length > 0) {
+        app.use("*", async (c, next) => {
+          if (!mountPrefixCovers(prefix, c.req.path)) {
+            return next();
+          }
+          globallyGatedRequests.add(c.req.raw);
+          let result: Response;
+          try {
+            result = await runMiddlewareChain(appGlobalMiddleware, c.req.raw, {}, async () => {
+              await next();
+              return c.res;
+            });
+          } catch (error) {
+            // The catch-all's treatment of middleware throws: a thrown
+            // Response is a short-circuit, a ProblemError answers as 7807.
+            if (isResponse(error)) {
+              result = error;
+            } else if (isProblemError(error)) {
+              result = error.toResponse(c.req.path);
+            } else {
+              throw error;
+            }
+          }
+          if (result !== c.res) {
+            // Replace outright. Assigning over a finalized response would
+            // merge the sub-app's headers into the middleware's own answer.
+            c.res = undefined;
+            c.res = result;
+          }
+        });
+      }
       app.route(prefix, subApp);
     }
   }
@@ -797,6 +853,7 @@ export async function createServer(
   });
 
   app.all("*", async (c) => {
+    const globalMiddleware = globallyGatedRequests.has(c.req.raw) ? [] : appGlobalMiddleware;
     const requestTrace: RequestTraceContext = {
       requestId: c.get("requestId") ?? createRequestId(),
       method: c.req.method.toUpperCase(),
@@ -1581,11 +1638,27 @@ function mountPrefixCovers(prefix: string, path: string): boolean {
  * Every rule here encodes a shadowing/conflict case that would otherwise be
  * resolved silently by registration order or Hono fall-through.
  */
-function validateMountConfig(mount: Record<string, NeutronMountApp>, isSsr: boolean): void {
+function isHonoApp(value: unknown): value is NeutronMountApp {
+  return (
+    !!value &&
+    typeof (value as { fetch?: unknown }).fetch === "function" &&
+    typeof (value as { route?: unknown }).route === "function"
+  );
+}
+
+function normalizeMountEntry(entry: NeutronMountApp | NeutronMount): NeutronMount {
+  return isHonoApp(entry) ? { app: entry } : entry;
+}
+
+function validateMountConfig(
+  mount: Record<string, NeutronMountApp | NeutronMount>,
+  isSsr: boolean
+): void {
   const prefixes = Object.keys(mount);
 
   for (const prefix of prefixes) {
-    const subApp = mount[prefix];
+    const entry = mount[prefix];
+    const subApp = isHonoApp(entry) ? entry : (entry as NeutronMount | undefined)?.app;
     if (typeof prefix !== "string" || prefix.length === 0 || !prefix.startsWith("/")) {
       throw new Error(
         `Neutron: mount prefix ${JSON.stringify(prefix)} is invalid — prefixes are absolute ` +
@@ -1603,14 +1676,10 @@ function validateMountConfig(mount: Record<string, NeutronMountApp>, isSsr: bool
           `supported in mount prefixes (match inside the sub-app instead).`
       );
     }
-    if (
-      !subApp ||
-      typeof (subApp as unknown as { fetch?: unknown }).fetch !== "function" ||
-      typeof (subApp as unknown as { route?: unknown }).route !== "function"
-    ) {
+    if (!isHonoApp(subApp)) {
       throw new Error(
         `Neutron: mount["${prefix}"] is not a Hono instance — pass the app itself ` +
-          `(e.g. new Hono()), not a handler or a fetch function.`
+          `(e.g. new Hono()) or { app, globalMiddleware }, not a handler or a fetch function.`
       );
     }
 
