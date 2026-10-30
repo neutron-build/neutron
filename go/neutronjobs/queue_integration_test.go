@@ -539,7 +539,7 @@ func TestIntegrationStaleAttemptCannotMutateNewerClaim(t *testing.T) {
 
 	handler := func(context.Context, []byte) error { return nil }
 	// All four terminal paths, attempted by the stale claim A.
-	q.executeClaim(ctx, *a, handler)                       // success → completion write
+	q.executeClaim(ctx, *a, handler) // success → completion write
 	q.executeClaim(ctx, *a, func(context.Context, []byte) error {
 		return errors.New("stale failure")
 	}) // failure → retry write

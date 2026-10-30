@@ -2,6 +2,7 @@ package neutron
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"encoding/json"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,8 +43,8 @@ type App struct {
 	// still changes what /openapi.json serves (NA-05). Before, the bytes
 	// were marshaled once at Build time, so even a root-level route added
 	// afterwards never reached the wire.
-	openapiJSON   []byte
-	oaInfo        OpenAPIInfo
+	openapiJSON    []byte
+	oaInfo         OpenAPIInfo
 	nucleusChecker NucleusChecker
 	// built records that Build() has already registered the default routes, so
 	// Run() and Handler() can both call it without registering them twice.
