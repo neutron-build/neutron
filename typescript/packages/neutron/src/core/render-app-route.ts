@@ -26,7 +26,7 @@ import {
 import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
 import { isProblemError } from "./problem.js";
-import { isResponse } from "./response.js";
+import { isNotFoundSignal, isResponse } from "./response.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderToString } from "preact-render-to-string";
 import type { StreamRenderFn } from "./preact-ssr.js";
@@ -135,6 +135,44 @@ export interface RenderAppRouteOptions {
     generation?: string;
     stillValid: () => boolean;
   };
+  /**
+   * Renders the app's nearest not-found page for this request (F-P6-2), or
+   * resolves null when the app has none. Called when a page loader returns
+   * or throws a not-found signal (`notFound()`, a 404 `ProblemError`) on a
+   * document request, from inside this request's middleware chain — the
+   * host renders the not-found route with `middleware: false`. Absent, the
+   * loader's response is sent as is.
+   */
+  renderNotFound?: (request: Request) => Promise<Response | null>;
+  /**
+   * `false` skips the global and route middleware: the caller already ran
+   * the chain for this request (a not-found render nested in another
+   * route's). Default `true`.
+   */
+  middleware?: boolean;
+}
+
+/**
+ * The not-found page answering a loader's not-found signal: 404 when the
+ * page rendered (a redirect or error from its own loader passes through),
+ * with the signal response's headers — Set-Cookie and anything middleware
+ * added — carried over, except the body's own Content-Type/Length.
+ */
+export function asNotFoundResponse(page: Response, signal: Response | null): Response {
+  const headers = new Headers(page.headers);
+  if (signal) {
+    signal.headers.forEach((value, name) => {
+      const key = name.toLowerCase();
+      if (key === "content-type" || key === "content-length") return;
+      if (key === "set-cookie") headers.append(name, value);
+      else headers.set(name, value);
+    });
+  }
+  return new Response(page.body, {
+    status: page.status === 200 ? 404 : page.status,
+    statusText: page.status === 200 ? "Not Found" : page.statusText,
+    headers,
+  });
 }
 
 export function toError(value: unknown): Error {
@@ -869,6 +907,7 @@ export async function renderAppRoute(
     responseCache,
     loaderCacheFence,
     renderer,
+    renderNotFound,
   } = opts;
   const allRoutes = [...match.layouts, match.route];
   const clientTier = resolveClientTier(allRoutes);
@@ -879,10 +918,10 @@ export async function renderAppRoute(
   const h = renderer?.h ?? staticH;
   const mountProviders = renderer?.withRouterProviders ?? withRouterProviders;
   const middlewares: MiddlewareFn[] = [];
-  if (globalMiddleware && globalMiddleware.length > 0) {
+  if (opts.middleware !== false && globalMiddleware && globalMiddleware.length > 0) {
     middlewares.push(...globalMiddleware);
   }
-  for (const route of allRoutes) {
+  for (const route of opts.middleware === false ? [] : allRoutes) {
     const module = routeModules.get(route.id);
     if (module?.middleware) {
       middlewares.push(module.middleware);
@@ -1205,6 +1244,24 @@ export async function renderAppRoute(
 
     // Wait for ALL loaders to complete in parallel
     const loaderResults = await Promise.all(loaderPromises);
+
+    // A page loader's notFound() / 404 ProblemError on a document request:
+    // the app's not-found page answers, as for an unmatched path. Data
+    // requests keep the signal response; the client router reloads the URL
+    // as a document on a non-OK answer, which lands here.
+    if (renderNotFound && isReadMethod && !isJsonRequest(request)) {
+      for (const result of loaderResults) {
+        const response = (result as { response?: Response }).response;
+        if (!response && !("error" in result)) continue;
+        // The first loader that answered decides, as below.
+        const signal = response ?? (result as { error: unknown }).error;
+        if (isNotFoundSignal(signal)) {
+          const page = await renderNotFound(request);
+          if (page) return asNotFoundResponse(page, isResponse(signal) ? signal : null);
+        }
+        break;
+      }
+    }
 
     // Check for errors and build data map
     const loaderData: Record<string, unknown> = {};

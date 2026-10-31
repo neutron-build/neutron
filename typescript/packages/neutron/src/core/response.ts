@@ -1,4 +1,5 @@
 import { escapeHtml } from "./escape.js";
+import { isProblemError } from "./problem.js";
 
 /**
  * Validates that a URL is safe for redirection (relative or same-origin).
@@ -198,10 +199,35 @@ export function notFound(body?: string): Response {
   const trimmed = body?.trim() ?? "";
   const isFullDocument = /^<(!doctype|html)\b/i.test(trimmed);
   const html = isFullDocument ? trimmed : notFoundDocument(trimmed);
-  return new Response(html, {
+  const response = new Response(html, {
     status: 404,
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
+  // A page loader's notFound() renders the app's not-found.tsx when there is
+  // one (isNotFoundSignal); a full document of the caller's own is sent as is.
+  if (!isFullDocument) {
+    Object.defineProperty(response, NOT_FOUND_MARK, { value: true });
+  }
+  return response;
+}
+
+// Symbol.for, not a module-local symbol or WeakSet: route modules can load a
+// different instance of core than the server's (the Vite SSR runtime), and
+// the mark has to survive that.
+const NOT_FOUND_MARK = Symbol.for("neutron.notFound");
+
+/**
+ * True for a page loader's "this page does not exist": a `notFound()`
+ * response (without a document of its own) or a 404 `ProblemError`
+ * (`notFoundError()`), returned or thrown. The server answers a document
+ * request carrying one with the app's nearest `not-found.tsx`, status 404,
+ * as for an unmatched path. Any other 404 Response is sent as written.
+ */
+export function isNotFoundSignal(value: unknown): boolean {
+  if (isResponse(value)) {
+    return value.status === 404 && (value as unknown as Record<symbol, unknown>)[NOT_FOUND_MARK] === true;
+  }
+  return isProblemError(value) && value.status === 404;
 }
 
 /** Minimal, dependency-free 404 shell that respects the reader's colour scheme. */

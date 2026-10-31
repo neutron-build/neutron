@@ -10,9 +10,9 @@ import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
-import { isResponse, mutableResponse } from "../core/response.js";
+import { isNotFoundSignal, isResponse, mutableResponse, notFound } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
-import { declareRepresentationDimensions, resolveClientTier, resolveRouteHeaders } from "../core/render-app-route.js";
+import { asNotFoundResponse, declareRepresentationDimensions, resolveClientTier, resolveRouteHeaders } from "../core/render-app-route.js";
 import { transformSsrCommonJs } from "./ssr-cjs.js";
 import { toDataRedirectResponse } from "../core/data-redirect.js";
 import { applySecurityHeaders, resolveSecurityHeadersConfig } from "../server/http-headers.js";
@@ -690,6 +690,21 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           const request = mountRequest ?? (await createRequest(req, url));
           const context: AppContext = {};
 
+          // The app's nearest not-found page, status 404, for a 404 the page
+          // itself answers (a loader's notFound(), an ungenerated static
+          // param), rendered inside the chain already running: no middleware
+          // of its own. Its stylesheets replace the matched route's below.
+          let cssRoutes = allRoutes;
+          const renderNotFound = async (notFoundRequest: Request): Promise<Response | null> => {
+            const notFoundMatch = state.router.matchNotFound(pathname);
+            if (!notFoundMatch) return null;
+            const notFoundLayouts = getLayoutChain(notFoundMatch.route, state.routes);
+            const notFoundRoutes = [...notFoundLayouts, notFoundMatch.route];
+            const page = await handleRequest(server, notFoundMatch.route, notFoundMatch.params, notFoundLayouts, notFoundRoutes, notFoundRequest, {}, rootDir, clientEntry);
+            cssRoutes = notFoundRoutes;
+            return asNotFoundResponse(page, null);
+          };
+
           // Dev timing context
           const devTiming: DevTimingContext = {
             loaders: [],
@@ -716,7 +731,13 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
                 middlewares,
                 request,
                 context,
-                () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming)
+                async () =>
+                  // A static route asked for a param its getStaticPaths does
+                  // not list has no file in a build, so production answers
+                  // 404 there (the app's not-found page): dev does too.
+                  (await isUngeneratedStaticPath(server, route, params))
+                    ? ((await renderNotFound(request)) ?? notFound())
+                    : handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming, renderNotFound)
               )
             )
           );
@@ -741,7 +762,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
 
               // Collect CSS from Vite's module graph (populated by ssrLoadModule)
               // and inject <link> tags so CSS loads before content renders (prevents FOUC)
-              const cssUrls = collectCssFromModuleGraph(server, allRoutes.map((r) => r.file));
+              const cssUrls = collectCssFromModuleGraph(server, cssRoutes.map((r) => r.file));
               if (cssUrls.length > 0) {
                 // Deduplicate: keep only ?direct URLs (serve actual CSS, not JS modules)
                 const seen = new Set<string>();
@@ -1189,7 +1210,8 @@ async function handleRequest(
   context: AppContext,
   rootDir: string,
   clientEntry: string | null,
-  devTiming?: DevTimingContext
+  devTiming?: DevTimingContext,
+  renderNotFound?: (request: Request) => Promise<Response | null>
 ): Promise<Response> {
   // Load the renderer + preact through the dev server's module graph so they
   // share ONE preact instance with the route components (resolved via
@@ -1311,6 +1333,17 @@ async function handleRequest(
   });
 
   const loaderResults = await Promise.all(loaderPromises);
+
+  // A loader's notFound() / 404 ProblemError on a document request renders
+  // the app's not-found page, as production does (render-app-route).
+  if (renderNotFound && !wantsJson && !isMutation) {
+    const answered = loaderResults.find((r) => r.error || isResponse(r.data));
+    const signal = answered?.error ?? answered?.data;
+    if (answered && isNotFoundSignal(signal)) {
+      const page = await renderNotFound(request);
+      if (page) return asNotFoundResponse(page, isResponse(signal) ? signal : null);
+    }
+  }
 
   // A loader may RETURN a Response (redirect, custom status, JSON) — serve it
   // directly, as production does (render-app-route). Route order decides,
@@ -1804,6 +1837,45 @@ async function createRequest(req: import("http").IncomingMessage, url: URL): Pro
     headers: req.headers as HeadersInit,
     body: body && req.method !== "GET" && req.method !== "HEAD" ? body : undefined,
   });
+}
+
+const staticPathsByModule = new WeakMap<RouteModule, Promise<Array<Record<string, unknown>>>>();
+
+/**
+ * True when `route` is a static route whose `getStaticPaths` does not list
+ * `params`: a build writes no file for it, so `start` answers 404.
+ */
+async function isUngeneratedStaticPath(
+  server: ViteDevServer,
+  route: Route,
+  params: Record<string, string>
+): Promise<boolean> {
+  if (route.config.mode !== "static" || route.params.length === 0 || isResourceRoute(route)) return false;
+  const module = (await server.ssrLoadModule(route.file)) as RouteModule;
+  if (!module.getStaticPaths) return false;
+  let listed = staticPathsByModule.get(module);
+  if (!listed) {
+    listed = Promise.resolve(module.getStaticPaths()).then((result) =>
+      (Array.isArray(result) ? result : result.paths).map((entry) => entry.params as Record<string, unknown>)
+    );
+    staticPathsByModule.set(module, listed);
+  }
+  const asText = (value: unknown) => (Array.isArray(value) ? value.join("/") : String(value ?? ""));
+  return !(await listed).some((entry) =>
+    route.params.every((name) => {
+      const requested = params[name] ?? "";
+      const value = asText(entry[name]);
+      return value === requested || value === safeDecode(requested);
+    })
+  );
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function getLayoutChain(route: Route, allRoutes: Route[]): Route[] {

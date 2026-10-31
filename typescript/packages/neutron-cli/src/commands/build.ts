@@ -33,6 +33,7 @@ import {
   assertRenderedFragment,
   renderSpeculationRules,
   isResponse,
+  isProblemError,
   isResourceRoute,
   withRouterProviders,
   type CreateElement,
@@ -808,7 +809,29 @@ export async function build(): Promise<void> {
     process.exit(1);
   }
 
+  // A page loader that answers 404 (notFound(), notFoundError(), any 404
+  // Response) has no page to prerender: nothing is written, so the host
+  // answers the path with 404.html — what `start` renders for it.
+  const NOT_FOUND = Symbol("not-found");
+  async function runPrerenderLoader(module: RouteModule, args: LoaderArgs): Promise<unknown> {
+    const isNotFound = (value: unknown) => (isResponse(value) || isProblemError(value)) && value.status === 404;
+    try {
+      const data = await module.loader!(args);
+      return isNotFound(data) ? NOT_FOUND : data;
+    } catch (error) {
+      if (isNotFound(error)) return NOT_FOUND;
+      throw error;
+    }
+  }
+
   for (const route of staticRoutes) {
+    // A not-found page with a dynamic scope ([orgId]/not-found.tsx) has no
+    // single document to prerender; `start` renders it per request.
+    if (route.isNotFound && route.params.length > 0) {
+      console.log(`  Skipping ${route.path} not-found page (dynamic scope — rendered per request)`);
+      skippedCount++;
+      continue;
+    }
     // Resource routes (method handlers, no component) are endpoints served
     // per request — never prerendered, and never baked via a stray `loader`
     // export (a resource route's loader never runs at serve time either, so
@@ -912,11 +935,16 @@ export async function build(): Promise<void> {
           // getStaticPaths if there is no loader.
           let loaderData: unknown = props || {};
           if (module.loader) {
-            loaderData = await module.loader({
+            loaderData = await runPrerenderLoader(module, {
               request,
               params,
               context,
             } as LoaderArgs);
+            if (loaderData === NOT_FOUND) {
+              console.log(`  ${resolvedPath} → (loader answered 404, not written)`);
+              skippedCount++;
+              continue;
+            }
           }
 
           const layoutChain = getLayoutChain(route);
@@ -994,16 +1022,24 @@ export async function build(): Promise<void> {
         continue;
       }
 
-      // Static route without params
+      // Static route without params. A not-found page is written as its
+      // directory's 404.html (the file static hosts and `preview` answer
+      // unknown paths with), never at the directory's own path: its route
+      // path is the directory's, and it used to overwrite that index.html.
       const context: AppContext = {};
       const request = new Request("http://localhost" + route.path);
       let loaderData: unknown = undefined;
       if (module.loader) {
-        loaderData = await module.loader({
+        loaderData = await runPrerenderLoader(module, {
           request,
           params: {},
           context,
         } as LoaderArgs);
+        if (loaderData === NOT_FOUND) {
+          console.log(`  ${route.path} → (loader answered 404, not written)`);
+          skippedCount++;
+          continue;
+        }
       }
 
       const layoutChain = getLayoutChain(route);
@@ -1045,7 +1081,8 @@ export async function build(): Promise<void> {
         context,
         {},
         loaderData,
-        route.path
+        // A not-found page answers many paths; its own title is inferred as "404".
+        route.isNotFound ? "/404" : route.path
       );
       const fullHtml = wrapHtml(
         html,
@@ -1058,19 +1095,17 @@ export async function build(): Promise<void> {
         seo
       );
 
-      const outPath = getOutputPath(outputDir, route.path);
+      const outPath = route.isNotFound
+        ? path.join(outputDir, route.path.replace(/^\/+|\/+$/g, ""), "404.html")
+        : getOutputPath(outputDir, route.path);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, fullHtml);
       publicArtifacts.add(path.relative(outputDir, outPath).split(path.sep).join("/"));
 
-      const routeHeaders = await resolveRouteHeaders(
-        route,
-        layoutChain,
-        request,
-        context,
-        {},
-        loaderData
-      );
+      // Headers are recorded per served path; a not-found page has none.
+      const routeHeaders = route.isNotFound
+        ? {}
+        : await resolveRouteHeaders(route, layoutChain, request, context, {}, loaderData);
       if (Object.keys(routeHeaders).length > 0) {
         staticHeadersByRoute[route.path] = routeHeaders;
       }

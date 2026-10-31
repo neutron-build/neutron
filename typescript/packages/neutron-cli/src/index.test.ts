@@ -2990,3 +2990,102 @@ export default { websocket: { path: "/ws", attach(wss) { wss.on("connection", ()
     }
   });
 });
+
+describe("neutron-ts build + start + preview (process): the app's not-found page (F-P6-2)", () => {
+  it("prerenders not-found.tsx as 404.html and renders it for a page's 404s", { timeout: 240_000 }, async () => {
+    const previewPort = await freePort();
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "not-found-fixture", type: "module" }),
+      "neutron.config.ts": `export default { server: { port: ${previewPort} } };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/_layout.tsx": `
+import { h } from "preact";
+export default function Layout({ children }) { return h("main", null, h("nav", null, "site-chrome"), children); }
+`,
+      // Default (static) mode: prerendered, and rendered per request by start.
+      "src/routes/not-found.tsx": `
+import { h } from "preact";
+export function head() { return { title: "Missing page" }; }
+export default function NotFound() { return h("p", null, "custom-missing"); }
+`,
+      "src/routes/index.tsx": `
+import { h } from "preact";
+export default function Home() { return h("p", null, "home-page"); }
+`,
+      "src/routes/models/[id].tsx": `
+import { h } from "preact";
+import { notFound } from "@neutron-build/core";
+export async function getStaticPaths() { return { paths: [{ params: { id: "known" } }, { params: { id: "retired" } }] }; }
+export async function loader({ params }) {
+  if (params.id === "retired") throw notFound();
+  return { id: params.id };
+}
+export default function Model({ data }) { return h("p", null, "model " + data.id); }
+`,
+      "src/routes/items/[id].tsx": `
+import { h } from "preact";
+import { notFound } from "@neutron-build/core";
+export const config = { mode: "app" };
+export async function loader({ params }) {
+  if (params.id === "missing") throw notFound();
+  return { id: params.id };
+}
+export default function Item({ data }) { return h("p", null, "item " + data.id); }
+`,
+    });
+    const get = async (base: string, p: string) => {
+      const res = await fetch(`${base}${p}`, { headers: { accept: "text/html" } });
+      return { status: res.status, body: await res.text() };
+    };
+    const assertNotFoundPage = (page: { status: number; body: string }, label: string) => {
+      assert.equal(page.status, 404, `${label}: ${page.body.slice(0, 300)}`);
+      assert.ok(page.body.includes("custom-missing"), `${label}: ${page.body}`);
+      assert.ok(page.body.includes("site-chrome"), `${label}: ${page.body}`);
+      assert.ok(page.body.includes("<title>Missing page</title>"), `${label}: ${page.body}`);
+    };
+    try {
+      const output = await runBuild(dir);
+      // The not-found page is its directory's 404.html, not the page at "/".
+      const notFoundHtml = fs.readFileSync(path.join(dir, "dist", "404.html"), "utf-8");
+      assert.ok(notFoundHtml.includes("custom-missing") && notFoundHtml.includes("site-chrome"), notFoundHtml);
+      assert.ok(fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8").includes("home-page"));
+      assert.ok(fs.existsSync(path.join(dir, "dist", "models", "known", "index.html")));
+      // A prerender loader's notFound(): no page written, the host answers 404.html.
+      assert.ok(!fs.existsSync(path.join(dir, "dist", "models", "retired")), output);
+
+      const port = await freePort();
+      const start = runCli("start", dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+      try {
+        const base = `http://127.0.0.1:${port}`;
+        await waitForHealth(`${base}/health`, start);
+        assert.match(start.output(), /Modules: prebuilt server bundle/, start.output());
+        assertNotFoundPage(await get(base, "/models/unknown"), "start: ungenerated param");
+        assertNotFoundPage(await get(base, "/models/retired"), "start: prerender 404");
+        assertNotFoundPage(await get(base, "/items/missing"), "start: loader notFound()");
+        assertNotFoundPage(await get(base, "/no/such/page"), "start: unmatched");
+        assert.equal((await get(base, "/404")).status, 404, "404.html is not a page at /404");
+        assert.equal((await get(base, "/models/known")).status, 200);
+      } finally {
+        start.child.kill("SIGTERM");
+        await start.exited;
+      }
+
+      const preview = runCli("preview", dir, { NEUTRON_HOST: "127.0.0.1" });
+      try {
+        const base = `http://127.0.0.1:${previewPort}`;
+        await waitForHealth(`${base}/`, preview);
+        assertNotFoundPage(await get(base, "/models/unknown"), "preview: unknown path");
+      } finally {
+        preview.child.kill("SIGTERM");
+        await preview.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -428,6 +428,27 @@ the packages under Dependents in one step.
 
 ### Fixed
 
+- **The app's `not-found.tsx` answers a page's own 404s (F-P6-2).** It
+  rendered only for a path no route matched. A `getStaticPaths` route asked
+  for a param it did not generate got the framework's bare 404 (HTML or
+  problem+json), and a page loader's `notFound()` / `notFoundError()` sent
+  that standalone document, so an app had to rewrite 404s in middleware
+  (Fylun's `not-found-document.ts`). Both now render the nearest
+  `not-found.tsx` with its layouts, status 404, in `start` (server bundle
+  and Vite runtime) and dev; the global middleware runs once, and headers
+  on the loader's 404 (`Set-Cookie`) are kept. A loader's other 404
+  Responses, `notFound()` given a full document of its own, and data
+  requests (the client router reloads the URL as a document on a non-OK
+  answer) are unchanged. Dev now answers a static route's unlisted param
+  with 404, as a build does. `neutron-ts build` writes a static
+  `not-found.tsx` as its directory's `404.html` (a dynamic scope is
+  skipped) — it was prerendered at its directory's own path, the root one
+  colliding with `dist/index.html` — `start` no longer serves a `404.html` as a page
+  at `/404`, `neutron-ts preview` answers unknown paths with the nearest
+  `404.html`, and a prerender loader's 404 writes no page instead of
+  failing the build. **Migration:** none; an app may drop middleware that
+  swapped these 404s for its not-found page.
+
 - **`neutron-ts build` prerenders static pages behind `src/middleware.ts`
   for `neutron-ts start` again.** core/cli 0.4.0 refused any build with a
   global middleware and a `mode: "static"` route, because prebuilt files

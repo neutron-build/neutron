@@ -52,11 +52,13 @@ export async function loader({ params }: LoaderArgs) {
   const project = await getProject(params.id);
 
   if (!project) {
-    throw notFound(); // → 404 response, served as-is
+    throw notFound(); // → 404, rendered by the nearest not-found.tsx
   }
 
   return { project };
 }
 ```
+
+A page loader's `notFound()` (returned or thrown) and a thrown `notFoundError()` are the exception: when the app has a `not-found.tsx` covering the path, a browser request gets that page, with its layouts and status 404, as for a path no route matches. Headers the 404 carried (`Set-Cookie`, anything middleware added) are kept; the middleware chain runs once. A client-navigation data request keeps the plain 404, and the router then loads the URL as a document, which renders the page. Any other 404 `Response` (`new Response("…", { status: 404 })`, or `notFound("<!doctype html>…")` with a document of its own) is sent as written. The same page answers a static route asked for a param its `getStaticPaths` did not list, in `start` and in dev; `neutron-ts build` writes a static `not-found.tsx` as its directory's `404.html` for static hosts (and `neutron-ts preview`), and a prerender loader's `notFound()` writes no page for that path.
 
 Throwing (or letting propagate) an `Error` — rather than a `Response` — is what triggers the nearest `ErrorBoundary`.
