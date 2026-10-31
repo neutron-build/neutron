@@ -428,6 +428,24 @@ the packages under Dependents in one step.
 
 ### Fixed
 
+- **`client.unloadRouteStylesheets` unlinks every route stylesheet the
+  new route does not use, and only those (F-P6-3).** Two gaps made it
+  unusable for Fylun (84 theme-token differences over an 11-stop tour).
+  Vite's preload helper links a route chunk's CSS when the chunk loads,
+  unmarked and before the router links the route's list, so the router
+  added a second, marked link and unlinked only that one: the sheet stayed
+  for good. And a sheet static for one route (in its list) but loaded
+  lazily by the next (a dynamic import's CSS) was unlinked while the new
+  page used it — Vite links an href once per page life, so it never came
+  back. A route stylesheet is now any sheet the build's route-CSS table
+  names, recognised by href however it was linked; the router adopts the
+  link Vite made instead of adding one. `neutron-ts build` records each
+  route's lazy CSS (what its chain's dynamic imports bring in, route
+  modules excluded) as `lazy` in `.neutron-route-css.json`; `start`, the
+  adapter runtimes and the data payload (`__cssLazy__`) pass it on, and the
+  first page names it on the client entry tag (`data-neutron-css-lazy`).
+  Navigation keeps both lists, and relinks lazy sheets it unlinked earlier.
+  Dev is unchanged: CSS Vite injects as `<style>` there is not unlinked.
 - **The app's `not-found.tsx` answers a page's own 404s (F-P6-2).** It
   rendered only for a path no route matched. A `getStaticPaths` route asked
   for a param it did not generate got the framework's bare 404 (HTML or

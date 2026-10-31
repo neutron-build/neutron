@@ -97,6 +97,12 @@ export interface RenderHooks {
 export interface RenderAppRouteOptions {
   clientEntryScriptSrc: string | null;
   stylesheetHrefs?: string[];
+  /**
+   * Stylesheets the route's dynamic imports can bring in (the build's
+   * route-CSS table, `lazy`): not linked, but sent to the client router so
+   * `client.unloadRouteStylesheets` never unlinks one the page still uses.
+   */
+  lazyStylesheetHrefs?: string[];
   loaderDataCache: NeutronLoaderCacheStore;
   requestTrace: RenderRequestTrace;
   hooks?: RenderHooks;
@@ -629,7 +635,8 @@ function buildHtmlSuffix(
   clientEntryScriptSrc: string | null = null,
   includeClientRuntime: boolean = true,
   nonce?: string,
-  clientTier: "none" | "static" | "full" = "full"
+  clientTier: "none" | "static" | "full" = "full",
+  lazyStylesheetHrefs: string[] = []
 ): string {
   if (!includeClientRuntime) {
     return `</div>
@@ -650,8 +657,13 @@ function buildHtmlSuffix(
     Object.keys(allData).length > 0
       ? `<script${na}>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`
       : "";
+  // The page's lazy route CSS rides on the entry tag for the client router
+  // (hydrate.ts initLoadedStylesheets).
+  const lazyCss = lazyStylesheetHrefs.length > 0
+    ? ` data-neutron-css-lazy="${escapeHtml(lazyStylesheetHrefs.join(" "))}"`
+    : "";
   const clientScript = clientEntryScriptSrc
-    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"></script>`
+    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"${lazyCss}></script>`
     : "";
 
   // A static-tier document ships no router, so nothing intercepts its links.
@@ -689,7 +701,8 @@ function wrapHtml(
   nonce?: string,
   seo: SeoMetaInput | null = null,
   stylesheetHrefs: string[] = [],
-  clientTier: "none" | "static" | "full" = "full"
+  clientTier: "none" | "static" | "full" = "full",
+  lazyStylesheetHrefs: string[] = []
 ): string {
   return `${buildHtmlPrefix(pathname, headHtml, seo, stylesheetHrefs)}${content}${buildHtmlSuffix(
     loaderData,
@@ -697,7 +710,8 @@ function wrapHtml(
     clientEntryScriptSrc,
     includeClientRuntime,
     nonce,
-    clientTier
+    clientTier,
+    lazyStylesheetHrefs
   )}`;
 }
 
@@ -789,6 +803,7 @@ interface RenderAppRouteHtmlResponseArgs {
   actionData?: unknown;
   clientEntryScriptSrc: string | null;
   stylesheetHrefs: string[];
+  lazyStylesheetHrefs?: string[];
   includeClientRuntime: boolean;
   /** Which client runtime this document ships. See `resolveClientTier`. */
   clientTier?: "none" | "static" | "full";
@@ -825,7 +840,8 @@ async function renderAppRouteHtmlResponse(
       args.nonce,
       args.seo ?? null,
       args.stylesheetHrefs,
-      args.clientTier ?? "full"
+      args.clientTier ?? "full",
+      args.lazyStylesheetHrefs
     );
   };
 
@@ -846,7 +862,8 @@ async function renderAppRouteHtmlResponse(
     args.clientEntryScriptSrc,
     args.includeClientRuntime,
     args.nonce,
-    args.clientTier ?? "full"
+    args.clientTier ?? "full",
+    args.lazyStylesheetHrefs
   );
 
   let reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -900,6 +917,7 @@ export async function renderAppRoute(
   const {
     clientEntryScriptSrc,
     stylesheetHrefs = [],
+    lazyStylesheetHrefs = [],
     loaderDataCache,
     requestTrace,
     hooks,
@@ -1340,6 +1358,9 @@ export async function renderAppRoute(
       if (stylesheetHrefs.length > 0) {
         payload.__css__ = stylesheetHrefs;
       }
+      if (lazyStylesheetHrefs.length > 0) {
+        payload.__cssLazy__ = lazyStylesheetHrefs;
+      }
       routeHeaders.set("Content-Type", "application/json");
       return new Response(encodeSerializedPayloadAsJson(payload), {
         headers: routeHeaders,
@@ -1397,6 +1418,7 @@ export async function renderAppRoute(
         seo,
         clientEntryScriptSrc,
         stylesheetHrefs,
+        lazyStylesheetHrefs,
         includeClientRuntime,
         clientTier,
         headers: routeHeaders,

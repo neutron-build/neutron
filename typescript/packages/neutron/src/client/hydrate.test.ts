@@ -1149,3 +1149,128 @@ describe("hydrate — route stylesheets after navigation", () => {
     expect(await navigateToTarget(true)).toEqual(["/assets/shared.css", "/assets/target.css", "/fonts.css"]);
   });
 });
+
+/**
+ * F-P6-3: what a production build does to the document during client
+ * navigation, with `client.unloadRouteStylesheets`. Three routes each bring
+ * a theme sheet that redefines the same tokens; `modal.css` is static for /a
+ * (in its list) and lazy for /b (a dynamic import /b's page loads, listed in
+ * `__cssLazy__`). Route chunks and lazy modules load through a stand-in for
+ * Vite's preload helper with its real rules: it links a chunk's CSS
+ * unmarked, skips an href already linked, and never links an href twice in
+ * a page's life (its `seen` map). After A→B→C→A→C→B the document must hold
+ * exactly the current route's sheets: no other theme left behind (the
+ * cascade is then the same as on a fresh load), none of its own missing.
+ */
+describe("hydrate — route stylesheets across chunk-loaded routes (F-P6-3)", () => {
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const SHARED = "/assets/shared.css";
+  const MODAL = "/assets/modal.css";
+  const theme = (route: string) => `/assets/theme-${route}.css`;
+
+  // Vite's __vitePreload, CSS half (vite/src/node/plugins/importAnalysisBuild.ts).
+  const seen = new Set<string>();
+  function vitePreload(hrefs: string[]): void {
+    for (const href of hrefs) {
+      if (seen.has(href)) continue;
+      seen.add(href);
+      const linked = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')).some(
+        (link) => new URL(link.href, location.origin).pathname === href
+      );
+      if (linked) continue;
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.crossOrigin = "";
+      link.href = href;
+      document.head.appendChild(link);
+    }
+  }
+
+  const payloads: Record<string, Record<string, unknown>> = {
+    "/a": { "route:/a": {}, __css__: [SHARED, theme("a"), MODAL] },
+    "/b": { "route:/b": {}, __css__: [SHARED, theme("b")], __cssLazy__: [MODAL] },
+    "/c": { "route:/c": {}, __css__: [SHARED, theme("c")] },
+  };
+
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h, preactHooks } = deps;
+    const page = (name: string) => () => h("p", { class: "title" }, name);
+    // /b's page opens its lazily imported modal when it mounts.
+    function PageB() {
+      preactHooks.useEffect(() => vitePreload([MODAL]), []);
+      return h("p", { class: "title" }, "B");
+    }
+    const chunk = (css: string[], component: ComponentType) => async () => {
+      vitePreload(css);
+      return { default: component };
+    };
+    return {
+      "route:/a": { path: "/a", mode: "app", default: page("A"), load: chunk([SHARED, theme("a"), MODAL], page("A")) },
+      "route:/b": { path: "/b", mode: "app", default: PageB, load: chunk([SHARED, theme("b")], PageB) },
+      "route:/c": { path: "/c", mode: "app", default: page("C"), load: chunk([SHARED, theme("c")], page("C")) },
+    };
+  }
+
+  const sheets = () =>
+    Array.from(document.head.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]'))
+      .map((link) => new URL(link.href, location.origin).pathname)
+      .sort();
+
+  it("leaves exactly the current route's sheets after A→B→C→A→C→B", async () => {
+    seen.clear();
+    document.head.innerHTML = [SHARED, theme("a"), MODAL]
+      .map((href) => `<link rel="stylesheet" href="${href}" data-neutron-css>`)
+      .join("");
+    // No stylesheet server here (happy-dom's own fetch of a sheet fails and
+    // logs): report each linked sheet loaded.
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (node instanceof HTMLLinkElement) setTimeout(() => node.dispatchEvent(new Event("load")), 0);
+        });
+      }
+    });
+    observer.observe(document.head, { childList: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string) => jsonResponse(structuredClone(payloads[new URL(input, location.origin).pathname])))
+    );
+    const frames: FrameRequestCallback[] = [];
+    const booted = await bootRouter({ pathname: "/a", routeId: "route:/a", data: { "route:/a": {} }, routes });
+    (await import("./router-options.js")).configureRouter({ unloadRouteStylesheets: true });
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+
+    const go = async (to: string) => {
+      clickAnchor(addAnchor(to));
+      for (let i = 0; i < 8; i++) await flush();
+      expect(booted.app.querySelector(".title")?.textContent).toBe(to.slice(1).toUpperCase());
+      for (const frame of frames.splice(0)) frame(performance.now());
+      await flush();
+      return sheets();
+    };
+
+    try {
+      expect(await go("/b")).toEqual([MODAL, SHARED, theme("b")].sort());
+      expect(await go("/c")).toEqual([SHARED, theme("c")].sort());
+      expect(await go("/a")).toEqual([MODAL, SHARED, theme("a")].sort());
+      expect(await go("/c")).toEqual([SHARED, theme("c")].sort());
+      // /b's modal was imported before: Vite will not link its CSS again.
+      expect(await go("/b")).toEqual([MODAL, SHARED, theme("b")].sort());
+    } finally {
+      observer.disconnect();
+    }
+  });
+});

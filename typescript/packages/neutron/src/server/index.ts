@@ -107,6 +107,7 @@ import {
   ROUTE_CSS_MANIFEST,
   parseRouteCssManifest,
   routeStylesheetHrefs,
+  routeLazyStylesheetHrefs,
   type RouteCssManifest,
 } from "../core/route-css.js";
 import type {
@@ -161,6 +162,7 @@ export {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
   collectChunkCss,
+  collectDynamicChunkCss,
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
@@ -579,6 +581,7 @@ export async function createServer(
   const routeCss = loadRouteCssManifest(resolvedDistDir);
   const stylesheetsFor = (routeId: string) =>
     routeStylesheetHrefs(routeCss, routeId, allStylesheetHrefs);
+  const lazyStylesheetsFor = (routeId: string) => routeLazyStylesheetHrefs(routeCss, routeId);
   const staticRouteHeaders = loadStaticRouteHeaders(resolvedDistDir);
   const staticHtmlCache = buildStaticHtmlCache(resolvedDistDir);
   const corsOptions = resolveCorsOptions(cors);
@@ -1338,7 +1341,7 @@ export async function createServer(
             undefined,
             undefined,
             undefined,
-            { middleware: false }
+            { middleware: false, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id) }
           );
         } catch (error) {
           emitHook(hooks?.onError, {
@@ -1376,7 +1379,10 @@ export async function createServer(
               loaderDataCacheStore,
               requestTrace,
               hooks,
-              globalMiddleware
+              globalMiddleware,
+              undefined,
+              undefined,
+              { lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id) }
             );
             // The page renders as a normal route, which makes it a 200. The
             // status is the part that matters to crawlers and monitoring — but
@@ -1549,7 +1555,7 @@ export async function createServer(
           // loader result is committed, so a GET that began before a mutation
           // completed cannot republish the pre-mutation loader data.
           { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration },
-          { renderNotFound: renderNestedNotFound }
+          { renderNotFound: renderNestedNotFound, lazyStylesheetHrefs: lazyStylesheetsFor(match.route.id) }
         );
       } catch (error) {
         renderFailed = true;
@@ -1823,7 +1829,7 @@ async function handleAppRouteRequest(
     generation?: string;
     stillValid: () => boolean;
   },
-  notFound?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware">
+  extra?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware" | "lazyStylesheetHrefs">
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
   // Vite SSR runtime, then hand the loaded map to the shared render core —
@@ -1846,7 +1852,7 @@ async function handleAppRouteRequest(
     responseCache,
     loaderCacheFence,
     renderer: ssrServer.renderer,
-    ...notFound,
+    ...extra,
   });
 }
 

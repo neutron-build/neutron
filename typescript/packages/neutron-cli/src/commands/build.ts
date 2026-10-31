@@ -78,6 +78,7 @@ import {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
   collectChunkCss,
+  collectDynamicChunkCss,
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
@@ -1339,6 +1340,8 @@ function writeRouteCssManifest(
     }
   }
   const table: Record<string, string[]> = {};
+  const lazy: Record<string, string[]> = {};
+  const routeKeys = new Set(routes.map((route) => clientRouteManifestKey(cwd, route.file)));
   for (const route of routes) {
     if (route.isLayout || route.file.includes("_layout") || isResourceRoute(route)) continue;
     const manifest = cssPassRouteIds.has(route.id) ? cssPass : client;
@@ -1348,12 +1351,27 @@ function writeRouteCssManifest(
     for (const member of chain) {
       hrefs.push(...collectChunkCss(manifest, clientRouteManifestKey(cwd, member.file)));
     }
-    table[route.id] = [...new Set(hrefs.map((href) => alias.get(href) ?? href))];
+    const listed = [...new Set(hrefs.map((href) => alias.get(href) ?? href))];
+    table[route.id] = listed;
+    // CSS the chain's dynamic imports link when they load (Vite's preload):
+    // the client router must not unlink it while the page may use it.
+    const dynamic = collectDynamicChunkCss(
+      manifest,
+      chain.map((member) => clientRouteManifestKey(cwd, member.file)),
+      routeKeys
+    )
+      .map((href) => alias.get(href) ?? href)
+      .filter((href) => !listed.includes(href));
+    if (dynamic.length > 0) lazy[route.id] = [...new Set(dynamic)];
   }
   for (const duplicate of alias.keys()) {
     fs.rmSync(path.join(outputDir, duplicate), { force: true });
   }
-  const routeCss: RouteCssManifest = { format: ROUTE_CSS_MANIFEST_FORMAT, routes: table };
+  const routeCss: RouteCssManifest = {
+    format: ROUTE_CSS_MANIFEST_FORMAT,
+    routes: table,
+    ...(Object.keys(lazy).length > 0 ? { lazy } : {}),
+  };
   fs.writeFileSync(path.join(outputDir, ROUTE_CSS_MANIFEST), JSON.stringify(routeCss, null, 2));
   return routeCss;
 }
@@ -2283,7 +2301,7 @@ function serverEntryMounts() {
 `
     : "";
 
-  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse, applyRouteRuleHeaders, applySecurityHeaders, resolveSecurityHeadersConfig, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
+  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, routeLazyStylesheetHrefs, toDataRedirectResponse, applyRouteRuleHeaders, applySecurityHeaders, resolveSecurityHeadersConfig, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
 ${actionsImport}${imports.join("\n")}
 ${serverEntryDecl}
 const SECURITY_HEADERS = resolveSecurityHeadersConfig(${securityHeaders === undefined ? "undefined" : JSON.stringify(securityHeaders)});
@@ -2380,6 +2398,7 @@ async function handleRouteRequest(request, requestUrl, pathname, globalChainRan)
     {
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
       stylesheetHrefs: routeStylesheetHrefs(ROUTE_CSS, match.route.id, CLIENT_STYLESHEET_HREFS),
+      lazyStylesheetHrefs: routeLazyStylesheetHrefs(ROUTE_CSS, match.route.id),
       loaderDataCache: LOADER_DATA_CACHE,
       loaderCacheFence: { generation, stillValid: () => true },
       requestTrace: {

@@ -2398,11 +2398,30 @@ import { routes } from "virtual:neutron/routes";
 registerRoutes(routes);
 void init();
 `,
-      "src/routes/shop.tsx": sectionRoute("shop", "app"),
-      "src/routes/docs.tsx": sectionRoute("docs", "app"),
+      // modal.css: static for /shop, lazy for /docs (F-P6-3).
+      "src/styles/modal.css": ".from-modal { color: red; }\n",
+      "src/Modal.tsx": `import { h } from "preact";
+import "./styles/modal.css";
+export function Modal() { return h("dialog", { class: "from-modal" }, "modal"); }
+`,
+      "src/routes/shop.tsx": sectionRoute("shop", "app").replace(
+        'import { Shared } from "../Shared";',
+        'import { Shared } from "../Shared";\nimport { Modal } from "../Modal";\nexport const modal = Modal;'
+      ),
+      "src/routes/docs.tsx": `${sectionRoute("docs", "app")}export const openModal = () => import("../Modal");\n`,
     });
     try {
       await runBuild(dir);
+      const routeCss = JSON.parse(fs.readFileSync(path.join(dir, "dist", ".neutron-route-css.json"), "utf-8")) as {
+        routes: Record<string, string[]>;
+        lazy?: Record<string, string[]>;
+      };
+      const routeIdOf = (section: string) => Object.keys(routeCss.routes).find((id) => id.includes(section))!;
+      const isModal = (href: string) => fs.readFileSync(path.join(dir, "dist", href), "utf-8").includes(".from-modal");
+      assert.ok(routeCss.routes[routeIdOf("shop")].some(isModal), JSON.stringify(routeCss));
+      assert.ok(!routeCss.routes[routeIdOf("docs")].some(isModal), JSON.stringify(routeCss));
+      const docsLazy = routeCss.lazy?.[routeIdOf("docs")] ?? [];
+      assert.ok(docsLazy.length === 1 && isModal(docsLazy[0]), JSON.stringify(routeCss));
       const about = fs.readFileSync(path.join(dir, "dist", "about", "index.html"), "utf-8");
       assertSectionCss(linkedCss(dir, stylesheetLinks(about)), null, "static /about");
 
@@ -2422,6 +2441,10 @@ void init();
             await (await fetch(`http://127.0.0.1:${port}/${section}`, { headers: { accept: "application/json" } })).json()
           );
           assert.deepEqual(data.__css__, hrefs);
+          if (section === "docs") {
+            assert.deepEqual((data as { __cssLazy__?: string[] }).__cssLazy__, docsLazy);
+            assert.ok(html.includes(`data-neutron-css-lazy="${docsLazy[0]}"`), html);
+          }
         }
       } finally {
         proc.child.kill("SIGTERM");
