@@ -26,7 +26,7 @@
 //! stage on.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::store::Mutant;
 use crate::workload::{self, SeedRec};
@@ -122,6 +122,239 @@ fn parse_results(args: &[String]) -> Option<String> {
     None
 }
 
+// ---- the X5-R13 (c) memory self-check ----
+
+/// The default process memory limit (MiB) of the watchdog; override with
+/// the `E4_MEM_LIMIT_MIB` environment variable. X5-R13 (c), P ruling
+/// nv3-X-5c-esc-2: the watchdog is process-level only — it never feeds a
+/// record, a digest or a sim-visible decision, which is why its 1-second
+/// wall-clock sleep does not fall under the card's wall-clock ban (and
+/// only the watchdog is exempt).
+pub const E4_MEM_LIMIT_MIB_DEFAULT: u64 = 20_480;
+
+/// The trip check as a pure function of `(rss, limit)` — X5-R13 (c)'s
+/// pin: unit-tested on both sides of the limit. Trips strictly above.
+pub fn mem_trip(rss_mib: u64, limit_mib: u64) -> bool {
+    rss_mib > limit_mib
+}
+
+/// The memory limit in force: `E4_MEM_LIMIT_MIB` from the environment,
+/// else the default (20 GiB).
+pub fn mem_limit_mib() -> u64 {
+    std::env::var("E4_MEM_LIMIT_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(E4_MEM_LIMIT_MIB_DEFAULT)
+}
+
+/// Read `VmRSS` from `/proc/self/status` (KiB → MiB, std only). `None`
+/// when the file or the field is absent (a non-Linux host, say); the
+/// watchdog then never trips, which is the fail-open direction P's
+/// ruling accepts (the address-space `ulimit` backstop remains).
+pub fn rss_mib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kib: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kib / 1024);
+        }
+    }
+    None
+}
+
+/// The watchdog's shared state: the stop flag the dispatch loops honor,
+/// the trip record, and the latest RSS sample for the progress lines.
+/// The trip is set exactly once; `finished` retires the watchdog once
+/// the command completed normally, so a spurious last-instant sample
+/// cannot abort a finished run between its result write and its exit.
+#[derive(Debug)]
+pub struct Watch {
+    limit_mib: u64,
+    stop: AtomicBool,
+    tripped_rss: AtomicU64,
+    last_rss: AtomicU64,
+    finished: AtomicBool,
+}
+
+impl Watch {
+    /// A watchdog state over `limit_mib`.
+    pub fn new(limit_mib: u64) -> Self {
+        Self {
+            limit_mib,
+            stop: AtomicBool::new(false),
+            tripped_rss: AtomicU64::new(0),
+            last_rss: AtomicU64::new(0),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    /// The limit in force.
+    pub fn limit_mib(&self) -> u64 {
+        self.limit_mib
+    }
+
+    /// Dispatch must stop: the watchdog tripped.
+    pub fn stop(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// The RSS at trip, if tripped.
+    pub fn tripped(&self) -> Option<u64> {
+        match self.tripped_rss.load(Ordering::SeqCst) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// The latest sample (0 before the first).
+    pub fn rss(&self) -> u64 {
+        self.last_rss.load(Ordering::SeqCst)
+    }
+
+    /// Retire the watchdog: the command finished; a later sample may not
+    /// abort it.
+    pub fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
+
+    /// One sample: record the RSS, trip (once) when it is above the
+    /// limit. `force_trip` (tests) plants a trip without `/proc`.
+    fn sample(&self) {
+        let Some(rss) = rss_mib() else {
+            return;
+        };
+        self.record_and_maybe_trip(rss);
+    }
+
+    fn record_and_maybe_trip(&self, rss: u64) {
+        self.last_rss.store(rss, Ordering::SeqCst);
+        if self.tripped_rss.load(Ordering::SeqCst) == 0 && mem_trip(rss, self.limit_mib) {
+            self.tripped_rss.store(rss, Ordering::SeqCst);
+            // Stop dispatch before anything else (the ruling's order).
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Plant a trip at `rss` MiB (tests: the dispatch-stop path without
+    /// depending on the host's memory).
+    pub fn force_trip(&self, rss: u64) {
+        self.record_and_maybe_trip(rss.max(self.limit_mib + 1));
+    }
+}
+
+/// The dispatch counters the abort line reports: seeds handed to workers
+/// (`taken`), completed (`done`), and the sweep's total.
+#[derive(Debug)]
+pub struct Dispatch {
+    /// Seeds handed out (≈ `next − lo`).
+    pub taken: AtomicU64,
+    /// Seeds completed.
+    pub done: AtomicU64,
+    /// The sweep's seed total.
+    pub total: u64,
+}
+
+impl Dispatch {
+    /// Counters for a sweep of `total` seeds.
+    pub fn new(total: u64) -> Self {
+        Self {
+            taken: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            total,
+        }
+    }
+}
+
+/// What the watchdog writes to `<out>.partial` on a trip: the completed
+/// seed records (`run`) or the completed mutant records (`mutants`).
+/// `verify` and `mutants --check` carry no partial sink (the ruling
+/// names `<out>.partial` for the record-writing commands; their re-runs
+/// produce nothing worth persisting — a `.partial` file is diagnostic
+/// only either way).
+pub enum PartialSink {
+    /// The completed [`SeedRec`]s of a `run` (or a `verify` re-run, if
+    /// one ever carries a sink), sorted by seed.
+    Seeds {
+        /// The `<out>.partial` path.
+        path: String,
+        /// The live shared records.
+        recs: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>>,
+    },
+    /// The completed [`MutantRec`]s of a `mutants` sweep.
+    Mutants {
+        /// The `<out>.partial` path.
+        path: String,
+        /// The live shared records.
+        recs: std::sync::Arc<std::sync::Mutex<Vec<MutantRec>>>,
+    },
+}
+
+/// Write the partial file of a trip: the completed records, sorted by
+/// seed (`Seeds`), emitted with the same writer as the real output.
+pub fn write_partial_seeds(path: &str, recs: &[SeedRec]) -> std::io::Result<()> {
+    let mut sorted = recs.to_vec();
+    sorted.sort_unstable_by_key(|r| r.seed);
+    std::fs::write(path, emit_campaign(&sorted))
+}
+
+/// Write the partial file of a trip (the mutants form).
+pub fn write_partial_mutants(path: &str, recs: &[MutantRec]) -> std::io::Result<()> {
+    std::fs::write(path, emit_mutants(recs))
+}
+
+/// Start the watchdog thread (X5-R13 (c)): sample once per second; on a
+/// trip, write the partial file (if any), print the abort line and exit
+/// 3 — without writing `<out>` and without a final `E4` line. The thread
+/// is retired by [`Watch::finish`] when the command completes normally;
+/// it never feeds any sim-visible decision, so its wall-clock sleep is
+/// the one the ruling exempts from the card's wall-clock ban.
+pub fn start_watchdog(
+    watch: std::sync::Arc<Watch>,
+    dispatch: std::sync::Arc<Dispatch>,
+    partial: Option<std::sync::Arc<PartialSink>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        loop {
+            watch.sample();
+            if !watch.finished.load(Ordering::SeqCst)
+                && let Some(rss) = watch.tripped()
+            {
+                let done = dispatch.done.load(Ordering::SeqCst);
+                let taken = dispatch.taken.load(Ordering::SeqCst).min(dispatch.total);
+                if let Some(sink) = &partial {
+                    let r = match sink.as_ref() {
+                        PartialSink::Seeds { path, recs } => {
+                            let mut sorted = recs.lock().map(|m| m.clone()).unwrap_or_default();
+                            sorted.sort_unstable_by_key(|x| x.seed);
+                            std::fs::write(path, emit_campaign(&sorted))
+                        }
+                        PartialSink::Mutants { path, recs } => {
+                            let recs = recs.lock().map(|m| m.clone()).unwrap_or_default();
+                            std::fs::write(path, emit_mutants(&recs))
+                        }
+                    };
+                    if let Err(e) = r {
+                        // A real error (the abort line still goes out).
+                        eprintln!("e4-campaign: cannot write the partial file: {e}");
+                    }
+                }
+                eprintln!(
+                    "E4 ABORT rss={rss} limit={} done={}/{} inflight={}",
+                    watch.limit_mib(),
+                    done,
+                    dispatch.total,
+                    taken.saturating_sub(done)
+                );
+                std::process::exit(3);
+            }
+            if watch.finished.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    })
+}
+
 // ---- run ----
 
 fn cmd_run(args: &[String]) -> i32 {
@@ -135,7 +368,28 @@ fn cmd_run(args: &[String]) -> i32 {
         eprintln!("e4-campaign run: empty seed range {lo}..{hi}");
         return 2;
     }
-    let recs = run_range(lo, hi, None, threads);
+    // X5-R13 (c): the watchdog rides with the run — on a trip it stops
+    // dispatch, writes the completed records to `<out>.partial`, prints
+    // the abort line and exits 3, so this function never reaches its own
+    // writes. `WatchRetire` retires it the moment the run completes
+    // normally (a last-instant sample may not abort a finished run).
+    let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
+    let dispatch = std::sync::Arc::new(Dispatch::new(hi - lo + 1));
+    let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::new(PartialSink::Seeds {
+        path: format!("{out}.partial"),
+        recs: std::sync::Arc::clone(&shared),
+    });
+    let _wd = start_watchdog(
+        std::sync::Arc::clone(&watch),
+        std::sync::Arc::clone(&dispatch),
+        Some(sink),
+    );
+    run_range_into(&shared, lo, hi, None, threads, Some((&watch, &dispatch)));
+    let _retire = WatchRetire(std::sync::Arc::clone(&watch));
+    let mut recs = shared.lock().map(|m| m.clone()).unwrap_or_default();
+    recs.sort_unstable_by_key(|r| r.seed);
     let json = emit_campaign(&recs);
     if let Err(e) = std::fs::write(&out, json) {
         eprintln!("e4-campaign run: cannot write {out}: {e}");
@@ -145,34 +399,82 @@ fn cmd_run(args: &[String]) -> i32 {
     0
 }
 
+/// Retires a watchdog on drop (the command's own writes are about to
+/// happen; a last-instant sample may not abort them).
+struct WatchRetire(std::sync::Arc<Watch>);
+
+impl Drop for WatchRetire {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 /// Run `lo..=hi` over `threads` workers. Each seed is independent
 /// (S-DET); the records come back sorted by seed.
 pub fn run_range(lo: u64, hi: u64, mutant: Option<Mutant>, threads: usize) -> Vec<SeedRec> {
+    let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    run_range_into(&shared, lo, hi, mutant, threads, None);
+    let mut recs = shared.lock().map(|m| m.clone()).unwrap_or_default();
+    recs.sort_unstable_by_key(|r| r.seed);
+    recs
+}
+
+/// The dispatch loop behind [`run_range`]: workers pull seeds from
+/// `lo..=hi`, push records into `shared`, and honor the watchdog's stop
+/// flag (X5-R13 (c): a tripped watchdog stops dispatch — no worker takes
+/// a new seed; the abort itself is the watchdog's). Progress lines print
+/// every 500 completions with the latest RSS sample, `rss=<MiB>`.
+pub fn run_range_into(
+    shared: &std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>>,
+    lo: u64,
+    hi: u64,
+    mutant: Option<Mutant>,
+    threads: usize,
+    watch: Option<(&Watch, &Dispatch)>,
+) {
     let next = AtomicU64::new(lo);
     let done = AtomicU64::new(0);
     let total = hi - lo + 1;
-    let out: std::sync::Mutex<Vec<SeedRec>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
                 loop {
+                    if let Some((w, _)) = watch
+                        && w.stop()
+                    {
+                        // The watchdog tripped: stop dispatch. In-flight
+                        // seeds finish (the livelock budget bounds them),
+                        // their records land, and the watchdog's abort
+                        // path takes the process.
+                        break;
+                    }
                     let s = next.fetch_add(1, Ordering::SeqCst);
                     if s > hi {
                         break;
                     }
+                    if let Some((_, d)) = watch {
+                        d.taken.fetch_add(1, Ordering::SeqCst);
+                    }
                     let rec = workload::run_seed(s, mutant);
-                    out.lock().map(|mut o| o.push(rec)).ok();
+                    if let Ok(mut o) = shared.lock() {
+                        o.push(rec);
+                    }
                     let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some((_, disp)) = watch {
+                        disp.done.store(d, Ordering::SeqCst);
+                    }
                     if d.is_multiple_of(500) {
-                        eprintln!("e4-campaign: {d}/{total} seeds done");
+                        let rss = match watch {
+                            Some((w, _)) if w.rss() > 0 => w.rss(),
+                            _ => rss_mib().unwrap_or(0),
+                        };
+                        eprintln!("e4-campaign: {d}/{total} seeds done rss={rss}");
                     }
                 }
             });
         }
     });
-    let mut recs = out.into_inner().unwrap_or_default();
-    recs.sort_unstable_by_key(|r| r.seed);
-    recs
 }
 
 /// The livelock count inside `DEADLOCK` (X5-R13's RESULT item 2): seeds
@@ -268,8 +570,32 @@ fn cmd_verify(args: &[String]) -> i32 {
     }
     // 2. The digests reproduce. A re-run of every seed in the file.
     let threads = parse_threads(args).max(4);
-    eprintln!("e4-campaign verify: re-running {n} seeds at {threads} threads");
-    let rerun = run_range(0, CAMPAIGN_SEEDS - 1, None, threads);
+    let rss = rss_mib().unwrap_or(0);
+    eprintln!("e4-campaign verify: re-running {n} seeds at {threads} threads rss={rss}");
+    // X5-R13 (c): the watchdog rides with the re-run (no partial sink —
+    // a `.partial` file is diagnostic only, and the ruling names it for
+    // the record-writing commands; a trip still stops dispatch, prints
+    // the abort line and exits 3).
+    let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
+    let dispatch = std::sync::Arc::new(Dispatch::new(CAMPAIGN_SEEDS));
+    let _wd = start_watchdog(
+        std::sync::Arc::clone(&watch),
+        std::sync::Arc::clone(&dispatch),
+        None,
+    );
+    let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    run_range_into(
+        &shared,
+        0,
+        CAMPAIGN_SEEDS - 1,
+        None,
+        threads,
+        Some((&watch, &dispatch)),
+    );
+    let _retire = WatchRetire(std::sync::Arc::clone(&watch));
+    let mut rerun = shared.lock().map(|m| m.clone()).unwrap_or_default();
+    rerun.sort_unstable_by_key(|r| r.seed);
     let mut bad = 0u64;
     for (a, b) in recs.iter().zip(rerun.iter()) {
         if a.seed != b.seed || a.digest != b.digest {
@@ -359,19 +685,38 @@ fn cmd_mutants(args: &[String]) -> i32 {
     };
     let (lo, hi) = parse_seeds(args);
     let threads = parse_threads(args).max(4);
+    // X5-R13 (c): the watchdog rides with the whole sweep; its partial
+    // sink holds the completed mutant records (each mutant's seed sweep
+    // feeds the dispatch counters, so the abort line names the sweep in
+    // flight when the trip came).
+    let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
+    let dispatch = std::sync::Arc::new(Dispatch::new(hi - lo + 1));
     let mut recs = Vec::new();
+    let shared: std::sync::Arc<std::sync::Mutex<Vec<MutantRec>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::new(PartialSink::Mutants {
+        path: format!("{out}.partial"),
+        recs: std::sync::Arc::clone(&shared),
+    });
+    let _wd = start_watchdog(
+        std::sync::Arc::clone(&watch),
+        std::sync::Arc::clone(&dispatch),
+        Some(sink),
+    );
     for (m, test) in directed_arms::TABLE {
-        let (rec, _) = sweep_mutant(*m, test, lo, hi, threads);
+        let (rec, _) = sweep_mutant(*m, test, lo, hi, threads, (&watch, &dispatch), &shared);
         recs.push(rec);
     }
+    let _retire = WatchRetire(std::sync::Arc::clone(&watch));
     let json = emit_mutants(&recs);
     if let Err(e) = std::fs::write(&out, json) {
         eprintln!("e4-campaign mutants: cannot write {out}: {e}");
         return 2;
     }
     for r in &recs {
+        let rss = watch.rss();
         println!(
-            "MUTANT {:<28} first={:?} how={:?} oracle={:.3} monitor={:.3} directed={:?}{}",
+            "MUTANT {:<28} first={:?} how={:?} oracle={:.3} monitor={:.3} directed={:?}{} rss={rss}",
             r.mutant,
             r.first_seed,
             r.how,
@@ -389,20 +734,32 @@ fn cmd_mutants(args: &[String]) -> i32 {
 }
 
 /// Sweep one mutant over the seed range: the directed column first
-/// (X-5b's arm re-run), then the campaign column.
+/// (X-5b's arm re-run), then the campaign column. The completed record
+/// also lands in `shared_mutants` (the watchdog's partial sink, X5-R13
+/// (c)); `watch`/`dispatch` ride with the seed sweep.
 pub fn sweep_mutant(
     m: Mutant,
     test: &'static str,
     lo: u64,
     hi: u64,
     threads: usize,
+    watch: (&Watch, &Dispatch),
+    shared_mutants: &std::sync::Arc<std::sync::Mutex<Vec<MutantRec>>>,
 ) -> (MutantRec, Vec<SeedRec>) {
     let arm = directed_arms::run_arm(m);
     let (encoded, caught) = match arm {
         Some(r) => (true, Some(r)),
         None => (false, None),
     };
-    let recs = run_range(lo, hi, Some(m), threads);
+    // Each mutant's sweep restarts the dispatch counters (the abort
+    // line names the sweep in flight).
+    watch.1.taken.store(0, Ordering::SeqCst);
+    watch.1.done.store(0, Ordering::SeqCst);
+    let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    run_range_into(&shared, lo, hi, Some(m), threads, Some(watch));
+    let mut recs = shared.lock().map(|m| m.clone()).unwrap_or_default();
+    recs.sort_unstable_by_key(|r| r.seed);
     let mut first: Option<(u64, &'static str)> = None;
     let mut oracle_hits = 0u64;
     let mut monitor_hits = 0u64;
@@ -440,28 +797,29 @@ pub fn sweep_mutant(
         }
     }
     let swept = recs.len() as u64;
-    (
-        MutantRec {
-            mutant: format!("{m:?}"),
-            directed_test: test,
-            directed_encoded: encoded,
-            directed_caught: caught,
-            first_seed: first.map(|(s, _)| s),
-            how: first.map(|(_, h)| h),
-            oracle_rate: if swept > 0 {
-                oracle_hits as f64 / swept as f64
-            } else {
-                0.0
-            },
-            monitor_rate: if swept > 0 {
-                monitor_hits as f64 / swept as f64
-            } else {
-                0.0
-            },
-            swept,
+    let rec = MutantRec {
+        mutant: format!("{m:?}"),
+        directed_test: test,
+        directed_encoded: encoded,
+        directed_caught: caught,
+        first_seed: first.map(|(s, _)| s),
+        how: first.map(|(_, h)| h),
+        oracle_rate: if swept > 0 {
+            oracle_hits as f64 / swept as f64
+        } else {
+            0.0
         },
-        recs,
-    )
+        monitor_rate: if swept > 0 {
+            monitor_hits as f64 / swept as f64
+        } else {
+            0.0
+        },
+        swept,
+    };
+    if let Ok(mut m) = shared_mutants.lock() {
+        m.push(rec.clone());
+    }
+    (rec, recs)
 }
 
 fn cmd_mutants_check(args: &[String], pos_path: Option<String>) -> i32 {
@@ -489,6 +847,18 @@ fn cmd_mutants_check(args: &[String], pos_path: Option<String>) -> i32 {
     };
     let threads = 4usize.max(parse_threads(args));
     let _ = threads;
+    // X5-R13 (c): a process-level watchdog for the re-runs too (no
+    // dispatch to stop and no partial sink — its single-seed calls are
+    // bounded by the livelock budget; a trip still prints the abort
+    // line and exits 3).
+    let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
+    let dispatch = std::sync::Arc::new(Dispatch::new(0));
+    let _wd = start_watchdog(
+        std::sync::Arc::clone(&watch),
+        std::sync::Arc::clone(&dispatch),
+        None,
+    );
+    let _retire = WatchRetire(std::sync::Arc::clone(&watch));
     let mut failed = 0u64;
     for r in &recs {
         let Some(m) = mutant_by_name(&r.mutant) else {
@@ -1480,3 +1850,105 @@ fn leak(s: String) -> &'static str {
 // BTreeMap import kept for future per-class summary use.
 #[allow(dead_code)]
 type _Keep = BTreeMap<u64, u64>;
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// X5-R13 (c)'s ruled pin: the trip check is a function of
+    /// `(rss, limit)`, unit-tested on both sides of the limit — at the
+    /// limit it holds (the trip is strictly above), one MiB over it
+    /// trips, and the degenerate corners are stable.
+    #[test]
+    fn r13c_mem_trip_both_sides_of_the_limit() {
+        const LIMIT: u64 = 20_480;
+        assert!(
+            !mem_trip(LIMIT, LIMIT),
+            "at the limit the process lives (strictly above trips)"
+        );
+        assert!(mem_trip(LIMIT + 1, LIMIT), "one MiB above the limit trips");
+        assert!(!mem_trip(0, LIMIT), "an empty RSS never trips");
+        assert!(!mem_trip(0, 0), "limit 0: nothing is above 0");
+        assert!(mem_trip(1, 0), "any resident page over limit 0 trips");
+        // The default limit is P's ruling number.
+        assert_eq!(E4_MEM_LIMIT_MIB_DEFAULT, 20_480);
+    }
+
+    /// The host probe reads a real `VmRSS` on Linux (the watchdog's
+    /// input; when absent the watchdog never trips — fail-open by
+    /// design, with the `ulimit` backstop behind it).
+    #[test]
+    fn r13c_rss_probe_reads_proc_status() {
+        let rss = rss_mib();
+        assert!(rss.is_some(), "/proc/self/status must carry VmRSS here");
+        let v = rss.unwrap_or(0);
+        assert!(v > 0, "a resident process has nonzero VmRSS ({v})");
+    }
+
+    /// A tripped watchdog stops dispatch before the first seed: no
+    /// worker takes a seed, nothing runs, and the loop returns (never a
+    /// hang) — the abort actions themselves (partial write, abort line,
+    /// exit 3) belong to the watchdog thread, which the CLI starts only
+    /// in its own process.
+    #[test]
+    fn r13c_tripped_watch_stops_dispatch_before_the_first_seed() {
+        let watch = Watch::new(20_480);
+        watch.force_trip(99_999);
+        assert_eq!(watch.tripped(), Some(99_999));
+        assert!(watch.stop(), "dispatch must stop after the trip");
+        let dispatch = Dispatch::new(4);
+        let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_range_into(&shared, 0, 3, None, 2, Some((&watch, &dispatch)));
+        let n = shared.lock().map(|m| m.len()).unwrap_or(usize::MAX);
+        assert_eq!(n, 0, "a tripped watchdog must leave no seed run ({n})");
+        assert_eq!(dispatch.taken.load(Ordering::SeqCst), 0);
+    }
+
+    /// An untripped watchdog leaves the dispatch untouched: the same
+    /// range runs to completion beside it, byte-identical to a run
+    /// without one (the watchdog never feeds a record or a digest).
+    #[test]
+    fn r13c_untripped_watch_changes_nothing() {
+        let watch = Watch::new(20_480);
+        let dispatch = Dispatch::new(2);
+        let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_range_into(&shared, 10, 11, None, 2, Some((&watch, &dispatch)));
+        let with_watch = run_range(10, 11, None, 2);
+        let mut got = shared.lock().map(|m| m.clone()).unwrap_or_default();
+        got.sort_unstable_by_key(|r| r.seed);
+        assert_eq!(got.len(), 2);
+        for (a, b) in got.iter().zip(with_watch.iter()) {
+            assert_eq!(a.digest, b.digest, "seed {} digest", a.seed);
+        }
+        assert!(watch.tripped().is_none(), "never tripped at the default");
+        assert!(!watch.stop());
+    }
+
+    /// The partial writer records the completed records, sorted by seed
+    /// (X5-R13 (c): `<out>.partial` is diagnostic only, but it is
+    /// well-formed — the campaign's own emitter and parser).
+    #[test]
+    fn r13c_partial_file_round_trips() {
+        let mut recs: Vec<SeedRec> = (0..3u64).map(|s| workload::run_seed(s, None)).collect();
+        // Deliberately unsorted input, with seeds out of order.
+        recs.reverse();
+        let p = "/tmp/opencode/e4-r13c-partial-test.json";
+        write_partial_seeds(p, &recs).expect("write partial");
+        let text = std::fs::read_to_string(p).expect("read partial");
+        let back = parse_campaign(&text).expect("parse partial");
+        assert_eq!(
+            back.iter().map(|r| r.seed).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the partial file is sorted by seed"
+        );
+        let mut sorted_in = recs.clone();
+        sorted_in.sort_unstable_by_key(|r| r.seed);
+        for (a, b) in sorted_in.iter().zip(back.iter()) {
+            assert_eq!(a.digest, b.digest, "seed {} digest", a.seed);
+        }
+    }
+}

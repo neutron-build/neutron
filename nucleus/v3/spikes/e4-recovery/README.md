@@ -1,13 +1,17 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c — X5-R13 (a) and (b) landed (`YIELD_BUDGET` =
-1,000,000, the trip failing the world exactly as the deadlock path
-does, `SimFail::Livelock` naming the site, folded into the round and
-seed `deadlock` flags, in `campaign.json` and the digest; the directed
-pin `r13b_livelock_budget_trips_and_folds_into_deadlock`, verified
-mutant-style); X5-R13 is recorded verbatim below; (c) and (d), the
-10k campaign, `verify` and the mutant sweep follow in this attempt.**
-The stages before it (X-5a, X-5b) are complete and merged.
+Status: **stage X-5c — X5-R13 (a), (b) and (c) landed — (a) the
+TEMP-PROBE stderr line is gone and the ruling is recorded verbatim
+below; (b) `YIELD_BUDGET` = 1,000,000 with `SimFail::Livelock` naming
+the site, folded into the `deadlock` flags, `campaign.json` and the
+digest (pin `r13b_livelock_budget_trips_and_folds_into_deadlock`,
+verified mutant-style); (c) the memory watchdog (`E4_MEM_LIMIT_MIB`,
+default 20480; `VmRSS` once per second; on a trip: dispatch stops, the
+completed records go to `<out>.partial`, `E4 ABORT rss=… limit=… done=…
+/n inflight=…` on stderr, exit 3, no `<out>`, no final `E4` line —
+verified live: `E4 ABORT rss=2 limit=1 done=0/4 inflight=2`, exit 3);
+(d), the 10k campaign, `verify` and the mutant sweep follow in this
+attempt.** The stages before it (X-5a, X-5b) are complete and merged.
 Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
 fix).
 
