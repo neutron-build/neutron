@@ -317,6 +317,34 @@ scratch; expect_ok "G7C's refusal names the ambiguity" bash -c "cd '$v3' && rc=0
 card G7D S standard
 git -C "$r" checkout -q -B card/v3-G7D "$g7y"; g7c_verdict G7D "$g7y"
 scratch; expect_ok "the same Y with a full 40-hex Commit merges (G7D)" mc G7D
+# tip^'s own short id, spelled so git still resolves it to tip^ but the field is
+# not plain lowercase hex: <short>~0 (G6E) and the id in uppercase (G6U). The
+# text compare with tip^'s full id refuses both as well, so a refusal alone
+# cannot show the hex rule is there. The reason pins it: with the end anchor
+# dropped (^...{7,40}, no $) or A-F added to the class, the hex rule passes the
+# value and the refusal names the compare instead.
+# hexrule_refusal ID VALUE: merge-card refuses ID, naming VALUE under the hex rule.
+hexrule_refusal() { local o rc=0; o=$(mc "$1" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "verdict Commit '$2' is not a hex commit id" <<<"$o"; }
+card G6E S standard; branch G6E nucleus/v3/spikes/g6e.txt
+g6e="$(git -C "$r" rev-parse --short HEAD)~0"; g7c_verdict G6E "$g6e"
+expect_ok "premise: G6E's Commit $g6e resolves to tip^" commit_is_tip_parent G6E
+scratch; expect_no "a verdict Commit of tip^'s short id plus ~0 is refused (G6E)" mc G6E
+scratch; expect_ok "G6E's refusal names the hex rule (end anchor)" hexrule_refusal G6E "$g6e"
+# An id whose first seven digits are all 0-9 has no uppercase form there, and a
+# letter after them would let a dropped end anchor pass the value too (the
+# unanchored match reads only seven digits), so G6U would not be about case
+# alone. Add work commits until a letter falls in the first seven (about 1 id in
+# 27 lacks one).
+card G6U S standard; branch G6U nucleus/v3/spikes/g6u.txt
+g6un=0
+while [[ $(git -C "$r" rev-parse HEAD | cut -c1-7) != *[abcdef]* ]] && [ "$g6un" -lt 64 ]; do
+  echo "$g6un" >>"$v3/spikes/g6u.txt"; git -C "$r" commit -qam "nucleus v3: G6U work ($g6un)"; g6un=$((g6un + 1))
+done
+g6u=$(git -C "$r" rev-parse --short HEAD | tr abcdef ABCDEF); g7c_verdict G6U "$g6u"
+g6u_premise() { [[ ${g6u:0:7} == *[ABCDEF]* ]] && commit_is_tip_parent G6U; }
+expect_ok "premise: G6U's Commit $g6u has a letter in its first seven digits and resolves to tip^" g6u_premise
+scratch; expect_no "a verdict Commit of tip^'s short id in uppercase is refused (G6U)" mc G6U
+scratch; expect_ok "G6U's refusal names the hex rule (lowercase class)" hexrule_refusal G6U "$g6u"
 
 card R S standard
 git -C "$r" checkout -q -b card/v3-R nucleus/v3-scaffold
