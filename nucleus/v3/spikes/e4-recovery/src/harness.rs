@@ -1948,7 +1948,99 @@ pub fn run_round(
         .copied()
         .filter(|s| disk.range_tainted(pf, s * 4096, 4096))
         .collect();
-
+    // X5-R20 diagnostic (`E4_MPE_DIAG`, default off, stderr only, never
+    // a digest input): the round's fault list, the amcheck (i) findings
+    // and the sets O-3 (e) judges, plus the durable-write history of
+    // every slot a finding names or taint covers (the meta writes named
+    // by their ckpt_id, so a slot's last write can be placed against
+    // the graduation anchor).
+    if std::env::var("E4_MPE_DIAG").is_ok() {
+        eprintln!(
+            "MPE diag: === seed {seed} round {round} class {:?} crash {:?} ===",
+            faults.class, script.crash
+        );
+        for (i, f) in round_media.iter().enumerate() {
+            eprintln!(
+                "MPE diag: media[{i}] {:?} inode {} off {} len {} (page slot {})",
+                f.kind,
+                f.inode,
+                f.off,
+                f.len,
+                f.off / 4096
+            );
+        }
+        eprintln!(
+            "MPE diag: amcheck_i findings {:?} image_slots {:?} tainted {:?} meta_k {:?}",
+            amcheck_i,
+            image_slots,
+            tainted_slots,
+            meta_i.as_ref().map(|m| m.ckpt_id)
+        );
+        let mut interesting: BTreeSet<u64> = tainted_slots.clone();
+        interesting.extend(amcheck_i.iter().filter_map(|f| f.slot));
+        let dw = disk.dwrites_of(pf);
+        for slot in interesting.iter() {
+            for (i, w) in dw.iter().enumerate() {
+                if w.inode == pf
+                    && w.off < (slot + 1) * 4096
+                    && w.off + w.bytes.len() as u64 > slot * 4096
+                {
+                    let k = crate::store::page::parse_meta(&w.bytes)
+                        .ok()
+                        .map(|m| format!(" meta k={}", m.ckpt_id))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "MPE diag: slot {slot} dw[{i}] off {} len {} all={} pre_len {}{k}",
+                        w.off,
+                        w.bytes.len(),
+                        w.all,
+                        w.pre.len()
+                    );
+                }
+            }
+            eprintln!(
+                "MPE diag: slot {slot} range_tainted={}",
+                disk.range_tainted(pf, slot * 4096, 4096)
+            );
+        }
+        // The event-stream ordering R5's condition 3 keys on: every
+        // meta write, every completed sync_all, and every issued write
+        // to the interesting slots, by event index (the dwrites list
+        // only holds sync-covered writes; "issued" lives here).
+        for (i, e) in events.iter().enumerate() {
+            let note = match e {
+                DiskEvent::WriteIssued { inode, off, bytes }
+                    if *inode == pf && (*off == 4096 || *off == 8192) =>
+                {
+                    match crate::store::page::parse_meta(bytes) {
+                        Ok(m) => format!("meta k={} write", m.ckpt_id),
+                        Err(_) => format!("non-meta write at slot {}", off / 4096),
+                    }
+                }
+                DiskEvent::SyncReturned { inode, all: true } if *inode == pf => {
+                    "sync_all returned".to_owned()
+                }
+                _ => continue,
+            };
+            eprintln!("MPE diag: ev[{i}] {note}");
+        }
+        for slot in interesting.iter() {
+            for (i, e) in events.iter().enumerate() {
+                if let DiskEvent::WriteIssued { inode, off, bytes } = e {
+                    if *inode == pf
+                        && *off < (slot + 1) * 4096
+                        && *off + bytes.len() as u64 > slot * 4096
+                    {
+                        eprintln!(
+                            "MPE diag: ev[{i}] issued write slot {slot} id {} epoch {}",
+                            crate::store::page::header_id(bytes),
+                            crate::store::page::header_epoch(bytes),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // ---- recovery with nested crashes ----
     // The points in force: the script's explicit list (the directed
     // tests), else the seeded draw — each point uniform over this disk's
@@ -2286,6 +2378,12 @@ pub fn run_round(
                 .ok();
             }
             let findings_ii = amcheck::amcheck(&cx, &cfg);
+            if std::env::var("E4_MPE_DIAG").is_ok() {
+                eprintln!(
+                    "MPE diag: amcheck(ii) findings {:?} (store amcheck on the end disk)",
+                    findings_ii
+                );
+            }
             let (end_disk2, end_store) = {
                 let g = world.lock();
                 (g.disk.clone(), g.st.clone())
@@ -2756,6 +2854,20 @@ pub fn durable_image(
     };
     let m1 = disk.durable_read(pf, 4096, 4096);
     let m2 = disk.durable_read(pf, 8192, 4096);
+    // X5-R20 diagnostic (`E4_MPE_DIAG`, default off, stderr only, never
+    // a digest input): the amcheck (i) inputs — each meta slot's parse
+    // verdict and the pick, then every slotted §3.3/taint verdict below.
+    let mpe_diag = std::env::var("E4_MPE_DIAG").is_ok();
+    if mpe_diag {
+        let p1 = crate::store::page::parse_meta(&m1);
+        let p2 = crate::store::page::parse_meta(&m2);
+        eprintln!(
+            "MPE diag: durable_image meta slots: s1={:?} s2={:?} pick={:?}",
+            p1.as_ref().map(|m| m.ckpt_id).map_err(|_| "parse fail"),
+            p2.as_ref().map(|m| m.ckpt_id).map_err(|_| "parse fail"),
+            crate::store::page::select_meta(&m1, &m2, false),
+        );
+    }
     // G7's shared selection, positional here unconditionally. A
     // misplaced newer meta is never opened — no image is opened, so the
     // walk reports the situation and offers no meta (O-3 (e) is then
@@ -2774,9 +2886,27 @@ pub fn durable_image(
             );
         }
         crate::store::page::MetaPick::NoValid => {
+            // **X5-R20 shape A (P ruling nv3-X-5c-F1-esc-1): the
+            // finding is structural — it carries no slot.** With no
+            // valid meta there is no opened image, and X5-R5 says
+            // O-3 (e) is then *vacuous* ("If both metas are invalid,
+            // open fails with XX001 and O-3 (e) is vacuous (there is
+            // no opened image)"). The draft hardcoded `slot: Some(1)`
+            // here, and the frozen oracle's exactness half judges
+            // every slotted finding against tainted ∪ R — with no
+            // opened image both sets are empty, so 177 bc4f3bba
+            // rounds failed as "amcheck reported slot 1 that is
+            // neither tainted nor in R" (repro seeds 67/268 round 0:
+            // a Q14 LOST fault on the only meta write ever issued —
+            // the create's k=0 — leaves slot 1 unparseable and slot 2
+            // never written; the damage stays detected at `Open`,
+            // XX001 never served). A slot the store never opened is
+            // not a slot its amcheck reported: same convention as the
+            // `MisplacedNewer` arm and the bounds findings below
+            // ("structural findings carry no slot").
             return (
                 vec![Finding {
-                    slot: Some(1),
+                    slot: None,
                     what: "no valid meta".into(),
                 }],
                 BTreeSet::new(),
@@ -2802,6 +2932,7 @@ pub fn durable_image(
             &mut flat,
             &mut used,
             &mut out,
+            mpe_diag,
         );
     }
     let mut free_bits: BTreeSet<u64> = BTreeSet::new();
@@ -2821,6 +2952,7 @@ pub fn durable_image(
             &mut free_bits,
             &mut used,
             &mut out,
+            mpe_diag,
         );
     }
     // The pages the opened map references (X5-R11 (a), P ruling
@@ -2840,7 +2972,16 @@ pub fn durable_image(
     // positional — the gate's R4).
     for (lpid, r) in flat.iter() {
         let b = disk.durable_read(pf, r.slot * 4096, 4096);
-        if crate::store::page::check(b.as_slice(), r, *lpid, None).is_err() {
+        let chk = crate::store::page::check(b.as_slice(), r, *lpid, None);
+        if mpe_diag && (chk.is_err() || disk.range_tainted(pf, r.slot * 4096, 4096)) {
+            eprintln!(
+                "MPE diag: mapped lpid {lpid} slot {} §3.3={:?} tainted={}",
+                r.slot,
+                chk.is_ok(),
+                disk.range_tainted(pf, r.slot * 4096, 4096)
+            );
+        }
+        if chk.is_err() {
             out.push(Finding {
                 slot: Some(r.slot),
                 what: "§3.3 fail on mapped page".into(),
@@ -2855,24 +2996,13 @@ pub fn durable_image(
     // `used.insert(0)` made every fault on its range a "tainted
     // referenced slot not reported" (the 205 d2c8bba7 completeness
     // rounds, all recovery-`Err`; the ruling's repro seeds 47/118/198
-    // each name slot 0). The header is still read by
-    // open (a corrupt header fails open with XX001, a detection the
-    // oracle sees at `Open`); it just leaves the amcheck-referenced
-    // set. The meta slots (1, 2) stay: they carry slotted findings of
-    // their own ("no valid meta", the rollback fallout).
-    // **X5-R16 MP-E (completeness half, P ruling nv3-X-5c-esc-3): the
-    // referenced set is the image's own slots — not the file header.**
-    // Slot 0 is the §2.1 file header: §3.3's reference model has no
-    // reference for it (a page-map entry or a parent ref), so amcheck
-    // (i) can neither §3.3-check it nor report it, while the draft's
-    // `used.insert(0)` made every fault on its range a "tainted
-    // referenced slot not reported" (the 205 d2c8bba7 completeness
-    // rounds, all recovery-`Err`; the ruling's repro seeds 47/118/198
     // each name slot 0). The header is still read by open (a corrupt
     // header fails open with XX001, a detection the oracle sees at
     // `Open`); it just leaves the amcheck-referenced set. The meta
-    // slots (1, 2) stay: they carry slotted findings of their own
-    // ("no valid meta", the rollback fallout).
+    // slots (1, 2) stay referenced: a tainted one is named by the
+    // rollback-fallout loop below ("no valid meta" itself is a
+    // structural finding since X5-R20 shape A — no opened image, no
+    // slotted amcheck report, O-3 (e) vacuous per X5-R5).
     used.insert(1);
     used.insert(2);
     // The meta bounds of card 3.8 (the harness walk reports them so
@@ -2914,6 +3044,9 @@ pub fn durable_image(
     if !disk.media.is_empty() {
         for slot in [1u64, 2] {
             if disk.range_tainted(pf, slot * 4096, 4096) {
+                if mpe_diag {
+                    eprintln!("MPE diag: meta slot {slot} tainted (rollback fallout)");
+                }
                 out.push(Finding {
                     slot: Some(slot),
                     what: "stale durable meta slot (rollback fallout)".into(),
@@ -2936,13 +3069,23 @@ fn walk_map_disk(
     flat: &mut BTreeMap<u64, crate::store::page::Ref>,
     used: &mut BTreeSet<u64>,
     out: &mut Vec<Finding>,
+    diag: bool,
 ) {
     if depth > 8 || root.slot == 0 {
         return;
     }
     let b = disk.durable_read(pf, root.slot * 4096, 4096);
     // §3.3 with the positional expected id (the gate's R4).
-    if crate::store::page::check(&b, &root, base, None).is_err() {
+    let chk = crate::store::page::check(&b, &root, base, None);
+    if diag && (chk.is_err() || disk.range_tainted(pf, root.slot * 4096, 4096)) {
+        eprintln!(
+            "MPE diag: map page slot {} depth {depth} §3.3={:?} tainted={}",
+            root.slot,
+            chk.is_ok(),
+            disk.range_tainted(pf, root.slot * 4096, 4096)
+        );
+    }
+    if chk.is_err() {
         out.push(Finding {
             slot: Some(root.slot),
             what: "§3.3 fail on map page".into(),
@@ -2979,6 +3122,7 @@ fn walk_map_disk(
                     flat,
                     used,
                     out,
+                    diag,
                 );
             }
         }
@@ -2997,13 +3141,23 @@ fn walk_free_disk(
     set: &mut BTreeSet<u64>,
     used: &mut BTreeSet<u64>,
     out: &mut Vec<Finding>,
+    diag: bool,
 ) {
     if root.slot == 0 {
         return;
     }
     let b = disk.durable_read(pf, root.slot * 4096, 4096);
     // §3.3 with the positional expected id (the gate's R4).
-    if crate::store::page::check(&b, &root, base, None).is_err() {
+    let chk = crate::store::page::check(&b, &root, base, None);
+    if diag && (chk.is_err() || disk.range_tainted(pf, root.slot * 4096, 4096)) {
+        eprintln!(
+            "MPE diag: free-set page slot {} §3.3={:?} tainted={}",
+            root.slot,
+            chk.is_ok(),
+            disk.range_tainted(pf, root.slot * 4096, 4096)
+        );
+    }
+    if chk.is_err() {
         out.push(Finding {
             slot: Some(root.slot),
             what: "§3.3 fail on free-set page".into(),
@@ -3029,7 +3183,7 @@ fn walk_free_disk(
                 let child_span = (span / n).max(1);
                 let child_base = base + i as u64 * span;
                 walk_free_disk(
-                    disk, pf, r, child_base, child_span, bits, _total, set, used, out,
+                    disk, pf, r, child_base, child_span, bits, _total, set, used, out, diag,
                 );
             }
         }

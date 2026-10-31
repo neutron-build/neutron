@@ -675,3 +675,44 @@ fn r16_mpe_referenced_set_excludes_the_file_header() {
         );
     }
 }
+
+/// **X5-R20 shape A pin (P ruling nv3-X-5c-F1-esc-1; literal config =
+/// bc4f3bba's shape-A seeds 67/268, round 0 each).** Both carried
+/// "O-3(e): amcheck reported slot 1 that is neither tainted nor in R"
+/// with `mrb=false`, `rlen=0` and the recovery-`Err` default O-1 text:
+/// a Q14 page fault (seed 67: LOST on the create's meta k=0 write at
+/// slot 1 — the only meta write ever issued; seed 268: two MISDIRECTED
+/// faults with the same effect) left **no** valid meta anywhere, so
+/// open failed XX001, `durable_image` took its `NoValid` arm, and that
+/// arm's finding hardcoded `slot: Some(1)` — which the frozen oracle's
+/// exactness half (not gated on `amcheck_i_ran`) judged against empty
+/// taint and R sets. X5-R5: with both metas invalid there is no opened
+/// image and O-3 (e) is **vacuous**; the finding is structural now (no
+/// slot, like the `MisplacedNewer` arm), and the damage stays detected
+/// at `Open` (XX001, never served). On the reverted `slot: Some(1)`
+/// the exactness text reappears and the rounds fail.
+#[test]
+fn r20_mpe_no_opened_image_means_no_slotted_finding() {
+    for seed in [67u64, 268] {
+        let rec = workload::run_seed(seed, None);
+        let exactness = rec
+            .rounds
+            .iter()
+            .filter_map(|r| r.o3_fail.as_ref())
+            .any(|t| t.contains("neither tainted nor in R"));
+        assert!(
+            !exactness,
+            "seed {seed}: the no-opened-image slotted finding is back (O-3 (e) must be vacuous per X5-R5)"
+        );
+        // The rounds now pass: the XX001 at `Open` is a detection in
+        // MP (the plan's clause 3), and no O-3 clause fails.
+        assert!(
+            rec.rounds.iter().all(|r| r.pass),
+            "seed {seed}: a round fails beyond the removed defect: {:?}",
+            rec.rounds
+                .iter()
+                .map(|r| (&r.crash, &r.o3_fail, r.pass))
+                .collect::<Vec<_>>()
+        );
+    }
+}
