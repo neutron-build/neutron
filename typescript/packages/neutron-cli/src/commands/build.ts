@@ -47,6 +47,7 @@ import type {
 import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { extractClientEntryScriptSrc } from "../client-entry.js";
 import { loadNeutronConfig } from "../lib/config.js";
 import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
@@ -1539,7 +1540,7 @@ async function buildStartServerBundle(
   );
 
   const outDir = path.join(options.outputDir, "server", "start");
-  const externals = importerResolvedExternals(outDir);
+  const externals = importerResolvedExternals(outDir, corePackageRoots(options.cwd));
   console.log("\nBuilding server bundle...");
   try {
     await bundleServerEntry(options, {
@@ -1596,10 +1597,67 @@ async function buildStartServerBundle(
  * applies that package's exports map with its usual conditions and loads the
  * same file the server's native modules do. Imports the app root resolves
  * identically stay bare.
+ *
+ * `nativeDepsOf` names packages (by their real directory) whose OWN imports
+ * of other packages are never bundled: @neutron-build/core's shiki,
+ * @mdx-js/mdx, typescript, zod, hono, … share no module instance with app
+ * code, and under
+ * react-compat's `noExternal: true` they were inlined (tens of MB) — or
+ * failed to build: with `resolve.preserveSymlinks` the resolver stays on
+ * core's linked path, where pnpm's siblings of a dependency (shiki's
+ * @shikijs/*) are invisible. Their imports are resolved here from the
+ * importer's REAL path, as Node resolves them, and kept external. Only the
+ * renderer's graph (preact, preact-render-to-string, signals) stays bundled,
+ * because hooks and renderer must share one instance.
  */
-function importerResolvedExternals(outDir: string) {
+/**
+ * Real directories of @neutron-build/core: the copy the app resolves (what
+ * the bundle's routes import) and the CLI's own, when they differ.
+ */
+function corePackageRoots(cwd: string): string[] {
+  const roots = new Set<string>();
+  for (let dir = cwd; ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, "node_modules", "@neutron-build", "core");
+    if (fs.existsSync(path.join(candidate, "package.json"))) {
+      roots.add(fs.realpathSync(candidate));
+      break;
+    }
+    if (path.dirname(dir) === dir) break;
+  }
+  for (let dir = path.dirname(fileURLToPath(import.meta.resolve("@neutron-build/core/server"))); ; dir = path.dirname(dir)) {
+    const pkg = path.join(dir, "package.json");
+    if (fs.existsSync(pkg) && JSON.parse(fs.readFileSync(pkg, "utf-8")).name === "@neutron-build/core") {
+      roots.add(fs.realpathSync(dir));
+      break;
+    }
+    if (path.dirname(dir) === dir) break;
+  }
+  return [...roots];
+}
+
+const BUNDLED_WITH_APP = new Set(["preact", "preact-render-to-string", "@preact/signals-core"]);
+
+function importerResolvedExternals(outDir: string, nativeDepsOf: string[] = []) {
   const links = new Map<string, string>();
   const rootOwnPackage = new Map<string, string | null>();
+  const owners = nativeDepsOf.map((root) => {
+    const name = (JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf-8")) as { name?: string }).name;
+    return { root, name, nodeModules: path.join(root, "node_modules") };
+  });
+  const realImporters = new Map<string, string | null>();
+  const realPathOf = (importer: string): string | null => {
+    const file = importer.split("?")[0];
+    if (!realImporters.has(file)) {
+      let real: string | null = null;
+      try {
+        real = path.isAbsolute(file) ? fs.realpathSync(file) : null;
+      } catch {
+        real = null;
+      }
+      realImporters.set(file, real);
+    }
+    return realImporters.get(file) ?? null;
+  };
 
   const packageRootFrom = (dir: string, name: string): string | null => {
     for (let current = dir; ; current = path.dirname(current)) {
@@ -1642,15 +1700,33 @@ function importerResolvedExternals(outDir: string) {
         if (!importer || id.startsWith(".") || id.startsWith("/") || id.startsWith("\0") || id.includes(":")) {
           return null;
         }
-        const resolved = await this.resolve(id, importer, { skipSelf: true });
-        if (!resolved || resolved.external !== true || !resolved.packageJsonPath) return null;
         const parts = id.split("/");
         const name = id.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
         const subpath = id.slice(name.length);
-        const target = packageRootOf(resolved.packageJsonPath, name);
-        if (!target) return null;
+        let target: string | null = null;
+        const realImporter = owners.length > 0 ? realPathOf(importer) : null;
+        const owner = realImporter
+          ? owners.find(
+              (candidate) =>
+                name !== candidate.name &&
+                !BUNDLED_WITH_APP.has(name) &&
+                realImporter.startsWith(candidate.root + path.sep) &&
+                !realImporter.startsWith(candidate.nodeModules + path.sep)
+            )
+          : undefined;
+        if (owner) {
+          target = packageRootFrom(path.dirname(realImporter!), name);
+          // An optional peer that is not installed: external as written, so
+          // the runtime import fails (and is handled) as it does unbundled.
+          if (!target) return { id, external: true };
+        } else {
+          const resolved = await this.resolve(id, importer, { skipSelf: true });
+          if (!resolved || resolved.external !== true || !resolved.packageJsonPath) return null;
+          target = packageRootOf(resolved.packageJsonPath, name);
+          if (!target) return null;
+        }
         if (!rootOwnPackage.has(name)) rootOwnPackage.set(name, packageRootFrom(outDir, name));
-        if (rootOwnPackage.get(name) === target) return null;
+        if (rootOwnPackage.get(name) === target) return owner ? { id, external: true } : null;
         const hash = createHash("sha256").update(target).digest("hex").slice(0, 8);
         const alias = `@neutron-external/${name.replace(/^@/, "").replace(/\//g, "__")}-${hash}`;
         links.set(alias, target);

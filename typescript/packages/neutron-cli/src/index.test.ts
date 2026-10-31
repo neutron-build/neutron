@@ -1901,6 +1901,82 @@ export async function resolve(specifier, context, next) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // pnpm keeps core's own dependencies (shiki, @mdx-js/mdx, zod, …) as
+  // siblings of core's REAL directory. With resolve.preserveSymlinks the
+  // resolver stays on the linked path, from which those siblings' own deps
+  // (shiki → @shikijs/*) are invisible, so bundling them failed and start
+  // fell back to Vite. They stay external, resolved from core's real path.
+  it("builds with preserveSymlinks + pnpm-linked core and keeps core's own deps out of the bundle", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "server-bundle-symlinks-fixture", type: "module" }),
+      "neutron.config.ts": `export default { runtime: "react-compat" };\n`,
+      "vite.config.ts": `export default { resolve: { preserveSymlinks: true } };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/index.tsx": `
+import { useState } from "react";
+import { useLocation } from "@neutron-build/core";
+export const config = { mode: "app" };
+export default function Home() {
+  const [n] = useState(7);
+  return <p>{"linked-core-" + n + "-" + useLocation().pathname}</p>;
+}
+`,
+      // z is core's zod: not resolvable from this app root, so it can only
+      // load through the bundle's importer-resolved alias.
+      "src/routes/api/zod.ts": `
+import { z } from "@neutron-build/core";
+export function GET() { return Response.json({ parsed: z.object({ a: z.string() }).parse({ a: "zod-ok" }).a }); }
+`,
+    });
+    try {
+      const output = await runBuild(dir);
+      assert.doesNotMatch(output, /Server bundle failed to build/, output);
+      const manifest = path.join(dir, "dist", ".neutron-server-bundle.json");
+      assert.ok(fs.existsSync(manifest), output);
+
+      assertNoServerCodeInClientBuild(dir);
+
+      const outDir = path.join(dir, "dist", "server", "start");
+      const code = fs
+        .readdirSync(outDir)
+        .filter((file) => file.endsWith(".js"))
+        .map((file) => fs.readFileSync(path.join(outDir, file), "utf-8"))
+        .join("\n");
+      for (const marker of ["createHighlighterCore", "ZodError"]) {
+        assert.ok(!code.includes(marker), `core dependency code (${marker}) was bundled`);
+      }
+      // Imported by core, resolved from core's real directory (not from this
+      // app root, which cannot see them).
+      for (const alias of ["shiki", "mdx-js__mdx", "zod"]) {
+        assert.match(code, new RegExp(`"@neutron-external/${alias}-[0-9a-f]{8}"`));
+      }
+      assert.ok(code.length < 2_000_000, `server bundle is ${code.length} bytes`);
+
+      const port = await freePort();
+      const proc = runCli("start", dir, { NEUTRON_HOST: "127.0.0.1", NEUTRON_PORT: String(port) });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+        assert.match(proc.output(), /Modules: prebuilt server bundle/, proc.output());
+        const home = await fetch(`http://127.0.0.1:${port}/`, { headers: { accept: "text/html" } });
+        const html = await home.text();
+        assert.equal(home.status, 200, html);
+        assert.ok(html.includes("linked-core-7-/"), html);
+        const zod = await fetch(`http://127.0.0.1:${port}/api/zod`);
+        assert.deepEqual(await zod.json(), { parsed: "zod-ok" });
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("neutron-ts build (process): static CSS pass", () => {

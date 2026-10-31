@@ -178,6 +178,22 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **The server bundle builds when core is linked or pnpm-installed under
+  `resolve.preserveSymlinks`, and no longer inlines core's dependencies.**
+  Under react-compat (`ssr.noExternal: true`) the `start` bundle inlined
+  everything core imports — shiki, `@mdx-js/mdx`, `typescript`, zod, hono —
+  although none of it shares a module instance with app code. With
+  `resolve.preserveSymlinks: true` and core linked or installed by pnpm, the
+  resolver stayed on core's symlinked path, where pnpm's siblings of a
+  dependency are invisible, so the build failed
+  (`failed to resolve import "@shikijs/engine-oniguruma"`) and `start` fell
+  back to transforming routes through Vite. Core's own imports of other
+  packages are now resolved from core's real directory, as Node does, and
+  kept external (aliased under `dist/server/start/node_modules/` when the
+  app root resolves them differently); only preact,
+  preact-render-to-string and `@preact/signals-core` stay in the bundle's
+  graph. On a one-route fixture the bundle's JS went from 8.3 MB (7.8 MB of
+  it an inlined `typescript`) to 0.53 MB.
 - **Client builds no longer contain Vite, esbuild, shiki or other server
   code.** Route modules import `Link` and hooks from `@neutron-build/core`,
   whose root entry also re-exports the server, the adapters, content
