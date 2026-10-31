@@ -1223,9 +1223,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                     None,
                 );
             }
-        } else if !uniform
-            && let Some(CrashSpec::Hook { ckpt_index, hook }) = script.crash
-        {
+        } else if !uniform && let Some(CrashSpec::Hook { ckpt_index, hook }) = script.crash {
             crash_desc = format!("{hook:?}@{ckpt_index}");
         }
 
