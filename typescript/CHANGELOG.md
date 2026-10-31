@@ -329,6 +329,17 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`neutron-ts dev` sends every `Set-Cookie` of a response.** Dev copied
+  route responses onto the Node response one header entry at a time with
+  `setHeader`, which replaces, so of several `Set-Cookie` headers only the
+  last reached the browser. Better-Auth's sign-in sets the session token and
+  the session data, and only the data arrived, so nobody could sign in under
+  dev (F-B6-2). Resource routes, global middleware (after `next()`, answering
+  an unmatched path, or throwing a `Response`), route-rule redirects and the
+  image endpoint now send each cookie as its own header, as the mount path and
+  `start` already did. `start` (`@hono/node-server`) and the docker/vercel
+  handlers were checked and were correct.
+
 - **`--preset docker` builds under pnpm and ships a self-contained context.**
   With pnpm-linked core and `resolve.preserveSymlinks`, the docker runtime
   bundle failed to build: it bundled core's own dependencies, and

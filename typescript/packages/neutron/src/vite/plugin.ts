@@ -492,9 +492,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             });
 
             res.statusCode = imageResponse.status;
-            imageResponse.headers.forEach((value, key) => {
-              res.setHeader(key, value);
-            });
+            copyWebResponseHeaders(res, imageResponse.headers);
 
             if (imageResponse.body) {
               const reader = imageResponse.body.getReader();
@@ -522,9 +520,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             );
             applyResponseHeaders(answer, originalPathname);
             res.statusCode = answer.status;
-            answer.headers.forEach((value, key) => {
-              res.setHeader(key, value);
-            });
+            copyWebResponseHeaders(res, answer.headers);
             res.end();
             return;
           }
@@ -603,9 +599,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             );
             applyResponseHeaders(denied, originalPathname);
             res.statusCode = denied.status;
-            denied.headers.forEach((value, key) => {
-              res.setHeader(key, value);
-            });
+            copyWebResponseHeaders(res, denied.headers);
             if (denied.body && req.method !== "HEAD") {
               res.write(Buffer.from(await denied.arrayBuffer()));
             }
@@ -654,9 +648,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           applyResponseHeaders(response, originalPathname);
 
           // Send response
-          response.headers.forEach((value, key) => {
-            res.setHeader(key, value);
-          });
+          copyWebResponseHeaders(res, response.headers);
           res.statusCode = response.status;
 
           if (response.body) {
@@ -751,9 +743,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           // must answer with the same status and body, not 500 via next(err).
           if (isResponse(err)) {
             res.statusCode = err.status;
-            err.headers.forEach((value, key) => {
-              res.setHeader(key, value);
-            });
+            copyWebResponseHeaders(res, err.headers);
             if (err.body) {
               const reader = err.body.getReader();
               while (true) {
@@ -1558,17 +1548,26 @@ function createDevServerEntryState(
   };
 }
 
+/**
+ * Copy a Fetch response's headers onto a Node response. Headers iterates each
+ * Set-Cookie as its own entry and setHeader replaces, so copying entry by
+ * entry would keep only the last cookie; they are sent as one array instead.
+ */
+function copyWebResponseHeaders(res: import("http").ServerResponse, headers: Headers): void {
+  headers.forEach((value, key) => {
+    if (key.toLowerCase() !== "set-cookie") res.setHeader(key, value);
+  });
+  const cookies = headers.getSetCookie();
+  if (cookies.length > 0) res.setHeader("set-cookie", cookies);
+}
+
 async function sendWebResponse(
   req: import("http").IncomingMessage,
   res: import("http").ServerResponse,
   response: Response
 ): Promise<void> {
   res.statusCode = response.status;
-  response.headers.forEach((value, key) => {
-    if (key.toLowerCase() !== "set-cookie") res.setHeader(key, value);
-  });
-  const cookies = response.headers.getSetCookie();
-  if (cookies.length > 0) res.setHeader("set-cookie", cookies);
+  copyWebResponseHeaders(res, response.headers);
   if (response.body && req.method !== "HEAD") {
     const reader = response.body.getReader();
     while (true) {
