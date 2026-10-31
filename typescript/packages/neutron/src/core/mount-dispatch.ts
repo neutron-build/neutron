@@ -12,7 +12,8 @@ import { isResponse } from "./response.js";
 import { isProblemError } from "./problem.js";
 import type { MiddlewareFn } from "./types.js";
 
-type MountApp = { fetch: (request: Request, ...rest: unknown[]) => Response | Promise<Response> };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type MountApp = { fetch: (request: Request, ...rest: any[]) => Response | Promise<Response> };
 type MountEntry = MountApp | { app: MountApp; globalMiddleware?: boolean };
 
 export interface CompiledMount {

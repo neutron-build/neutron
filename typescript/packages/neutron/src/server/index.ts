@@ -361,12 +361,22 @@ export interface NeutronMount {
 }
 
 /**
- * A Hono sub-app accepted by {@link NeutronServerOptions.mount}. Any Hono
- * instance works (`new Hono()` with whatever bindings/variables it needs) —
- * `any` generics keep user sub-apps assignable regardless of their own types.
+ * A Hono sub-app accepted by {@link NeutronServerOptions.mount}: any Hono 4
+ * instance (`new Hono()` with whatever bindings/variables it needs).
+ *
+ * Typed structurally — the members Neutron routes a sub-app through — rather
+ * than as core's `Hono` class: an app whose `hono` is a different copy (a
+ * linked framework, another 4.x version) declares a different class, and
+ * TypeScript rejected its instances without a cast. `hono` is a peer
+ * dependency of core, so an installed app normally shares one copy anyway.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type NeutronMountApp = Hono<any, any, any>;
+export interface NeutronMountApp {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  fetch(request: Request, ...rest: any[]): Response | Promise<Response>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  route(path: string, app: any): unknown;
+  readonly routes: ReadonlyArray<{ readonly method: string; readonly path: string }>;
+}
 
 /** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
 export type NeutronServerMode = "ssr" | "api" | "raw";
@@ -1011,7 +1021,9 @@ export async function createServer(
           }
         });
       }
-      app.route(prefix, subApp);
+      // Hono.route reads only public members (routes, errorHandler), so a
+      // sub-app from another hono copy routes the same way.
+      app.route(prefix, subApp as unknown as Hono);
     }
   }
 

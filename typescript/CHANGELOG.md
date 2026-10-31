@@ -411,6 +411,21 @@ the packages under Dependents in one step.
   Destinations without a query behave as before. Applies to `start`, `dev`,
   `preview` and the edge runtimes, which share the resolver.
 
+- **`hono` is a peer dependency of core, and mounts are typed
+  structurally (F-P6-4).** Core depended on its own `hono`, so an app with
+  `hono` in its dependencies could run two copies (always, when core is
+  linked or the versions differ), and `NeutronMountApp` was core's `Hono`
+  class: a sub-app built with the app's copy failed to type-check (TS2322,
+  "Types of property 'get' are incompatible") until cast. `hono`
+  (`^4.12.23`) moved to `peerDependencies`, which is how Hono's own
+  middleware packages declare it, so an installed app and core share the
+  app's copy (npm and pnpm install the peer when the app does not list it).
+  `NeutronMountApp` is now the members Neutron routes a sub-app through
+  (`fetch`, `route`, `routes`), so a different copy still type-checks;
+  routing a foreign instance already worked and is now tested, from
+  `createServer` and the adapter runtime. **Migration:** none; drop
+  `as unknown as NeutronMountApp` casts.
+
 ### Fixed
 
 - **`neutron-ts build` prerenders static pages behind `src/middleware.ts`
