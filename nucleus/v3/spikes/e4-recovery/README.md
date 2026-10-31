@@ -1,20 +1,23 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
 Status: **stage X-5c-F1 (stacked on X-5c's branch; X5-R18's first
-card) — step 0 done: X5-R14–R19 recorded verbatim above, before any
-other change. Next: X5-R14 (the non-reproducing digests 180, 559,
-7474, 8832), X5-R15's reporting items, a fresh 10k triage campaign at
-the fixed code, and the instrumentation classes NEVER-FIRED, NO-TWIN,
-MP-E. Not this card: the store/design classes (C-XX, C-DIV,
-MP-LIVELOCK, MP-A, MW-ORPHAN, the twins), the retune (X5-R17), the
-sweep, the RESULT — X-5c-F2's and X-5c's. The base stage X-5c left:
-the first complete 10k campaign committed (d2c8bba7, triage data only
-per X5-R14), `E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=98 O3_FAIL=1029
-DEADLOCK=46 PANIC=0 O1F_FAIL=2722 MONITOR=0`, six failing classes +
-the seventh (non-reproducing digests), five quotas missed (Q4, Q7,
-Q11, Q12, SIZING), `cargo test` green (139 tests), the gate green at
-that code state.** The stages before it (X-5a, X-5b) are complete and
-merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R19.
+card) — **DONE**: steps 0–5 complete. X5-R14 root-caused (the S-DET
+gate and the deterministic unwind in `Sched::acquire`; both windows
+pinned, stress evidence 4 seeds × 25 loaded runs one digest each),
+X5-R15 (a)–(c)+(e) landed with pins, the fresh 10k triage campaign
+committed (exit 0, ~12 min, peak RSS 5.6 GiB): `E4 SEEDS=10000
+O1_FAIL=2711 O2_FAIL=101 O3_FAIL=850 DEADLOCK=41 PANIC=0
+O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1296
+FAILING_ROUNDS=1247 TWIN_FAILING_ROUNDS=102 DEFECT_SEEDS=0`,
+`verify --no-quotas` green on the digests and the seed set. The
+instrumentation classes: NEVER-FIRED 150→0, NO-TWIN 19→0, MP-E
+completeness 205→6 (residual to F2), MP-E exactness 199→222
+**ESCALATED** (C-XX's mechanism in Q14 rollback rounds — R5 not
+reopened, R not widened; see the class record and the ESCALATE list).
+Not this card (X-5c-F2's): C-XX, C-DIV, MP-LIVELOCK, MP-A, MW-ORPHAN,
+the twins, the retune (X5-R17), the sweep, the RESULT.** The stages
+before it (X-5a, X-5b) are complete and merged. Opus judges E4 on the
+RESULT with P's rulings X5-R1–R19.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -667,8 +670,89 @@ exactness escalated (commit 12b54965).**
   `O-3(e): amcheck reported slot 11 that is neither tainted nor in
   R`, `mrb=true rlen=0`, metas k=0@1, k=1@2, k=2@1 torn away).
 
+## The fresh 10k triage campaign (X-5c-F1's run, committed)
+
+`run --seeds 0..10000 --threads 16` at the fixed code (X5-R14's gate
+and unwind, X5-R15's reporting, NEVER-FIRED, NO-TWIN and MP-E's
+completeness half): **exit 0, ~12 min wall at 16 threads, peak RSS
+5.6 GiB** — the `rss=` progress lines rose steadily from 4,128 MiB at
+500 seeds to 5,632 MiB at 9,500 (about 150 KiB per seed; X5-R15 (d)'s
+recorded trend, not a blocker under X5-R13's 24 GiB budget). Final
+lines, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=850 DEADLOCK=41 PANIC=0 O1F_FAIL=2722 MONITOR=0
+E4 FOLD FAILING_SEEDS=1296 FAILING_ROUNDS=1247 TWIN_FAILING_ROUNDS=102 DEFECT_SEEDS=0
+```
+
+(d2c8bba7: `O1_FAIL=2712 O2_FAIL=98 O3_FAIL=1029 DEADLOCK=46 PANIC=0
+O1F_FAIL=2722 MONITOR=0`; the honest fold of that file was
+`FAILING_SEEDS=1598 … DEFECT_SEEDS=150`.) Rounds: C 11,781 / MP 2,180
+(+ 2,180 twins) / MW 1,415 (+ 1,415 twins).
+
+**`verify --no-quotas`** re-ran every seed at 16 workers: **the digests
+reproduce exactly and the seed set is exactly 0..9999** (the four
+X5-R14 seeds now stable); the quota table prints below without judging
+the run (X5-R15 (b) — the retune that would meet the missed quotas is
+X-5c-F2's, X5-R17).
+
+**Digest stability vs d2c8bba7 (X5-R14's pin 3):** 3,507 of 10,000
+digests changed, 6,493 are unchanged. The mechanism explains the shift
+uniformly, not seed by seed: every multi-task workload world previously
+contained window-A service reads (the host-mutation log shows them in
+every such world), and every crashed world contained window-B unwind
+steps, both interleaved by OS timing; the fix removes both, so every
+seed whose schedule depended on one changed. The unchanged 6,493 are
+the seeds whose service reads happened not to perturb the recorded
+outcome. The fresh file's digests reproduce across runs and thread
+counts (verify's re-run; the thread-count pin).
+
+**The instrumentation classes after the fixes (round counts before →
+after):**
+
+| Class | d2c8bba7 | this run |
+|---|---|---|
+| NEVER-FIRED (defect seeds) | 150 | **0** |
+| NO-TWIN (rounds) | 19 | **0** |
+| MP-E completeness (rounds) | 205 | **6** (residual: real slots 10/42/43/45 — seeds 1787, 5808, 6157, 8598, 9098, 9647; F2's triage) |
+| MP-E exactness (rounds) | 199 | 222 (ESCALATED: C-XX's mechanism in Q14 rollback rounds — see the class record) |
+
+**The hand-off for X-5c-F2** (counts in this file; two repro seeds
+each, `run --seeds N..N+1`):
+
+- **C-DIV** (class C scan-mismatch / raw-above-cut O-1): 334 scan
+  mismatch + 544 raw-above seeds — repros 21, 46 (unchanged from
+  d2c8bba7's list).
+- **C-XX** (class C amcheck/XX001 findings with no fault): 101 O-2
+  seeds + 127 O-3 seeds (overlapping sets) — repros 221, 66.
+- **MP-LIVELOCK** (DEADLOCK seeds, all MP round 1 after an R6 round):
+  41 — repros 987, 1108.
+- **MP-A** (served corruption): 7 seeds — repros 1897, 2437 (every one
+  a Q14 meta-fault round; P classifies).
+- **MW-ORPHAN** (MW raw-entry-above-the-cut with O-3): 439 — repros
+  39, 59.
+- **The twins**: 91 failing twin rounds (43 MP + 48 MW) — the classes
+  echo there.
+- **MP-E exactness** (this card's escalation): 222 rounds — repros 37,
+  38.
+
+No new class appeared on the fixed code beyond the residual MP-E
+completeness six above.
+
+**RESULT item 5, the interim reading (not E4's RESULT):** the rule
+applied verbatim to this file — "*Oracle:* the recovered state equals
+the model at some commit c, with (max acked sync-on commit) ≤ c ≤
+(last WAL-written commit); amcheck is clean; every corrupted page is
+detected (XX001, never served). Any failure means redesign before
+Phase A" — gives **n = FAILING_SEEDS = 1,296** (of 10,000), with
+1,247 failing primary rounds, 102 failing twin rounds and 0 defect
+seeds beside them. The failing classes are X-5c-F2's to root-cause or
+escalate; this card's instrumentation fixes removed 302 of d2c8bba7's
+1,598 failing seeds and made every remaining one a reproducible
+function of `(seed, mutant)`.
+
 ## The first complete 10k campaign (run 3 of the attempt, committed —
-## d2c8bba7, superseded as the triage file by X-5c-F1's run below)
+## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
 
 `run --seeds 0..10000 --threads 16` after the gc fix and X5-R13
 (a)–(d): **exit 0, ~13 min wall on a quiet host (16 threads), peak
