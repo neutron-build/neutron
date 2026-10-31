@@ -1941,7 +1941,9 @@ pub fn run_round(
         .count() as u64;
 
     // ---- amcheck (i): on the crashed image, before recovery ----
-    let (amcheck_i, image_slots, meta_i) = durable_image(&disk, &cfg);
+    // The fallout half is armed for the MP walk only (O-3 (e)'s class).
+    let (amcheck_i, image_slots, meta_i) =
+        durable_image_with_fallout(&disk, &cfg, faults.class == FaultClass::Mp);
     let pf = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
     let tainted_slots: BTreeSet<u64> = image_slots
         .iter()
@@ -2831,9 +2833,43 @@ fn site_name(d: XxSite) -> &'static str {
 // ---- the durable-image walk (harness-side, from durable bytes) ----
 
 /// Parse the newest valid durable meta and walk its referenced slots.
+///
+/// The `fallout` half of the **X5-R20 completeness residual fix (P
+/// ruling nv3-X-5c-F1-esc-1)** is armed by the MP amcheck (i) walk
+/// only — see [`durable_image_with_fallout`].
 pub fn durable_image(
     disk: &SimDisk,
     cfg: &StoreCfg,
+) -> (
+    Vec<Finding>,
+    BTreeSet<u64>,
+    Option<crate::store::page::Meta>,
+) {
+    durable_image_with_fallout(disk, cfg, false)
+}
+
+/// [`durable_image`] with the damage-fallout half armed. The frozen
+/// oracle's O-3 (e) completeness half (MP only) demands that amcheck
+/// (i) report **every tainted slot the opened image references** — but
+/// a slot whose durable bytes reverted to exactly the content the
+/// opened image references (a crash-dropped volatile write, or a
+/// LOST fault reverting to the graduation-time content) passes §3.3
+/// against that image's own reference, so the walk can never name it.
+/// The bc4f3bba residual (6 rounds, all `mrb=true`; repro seeds
+/// 1787/6157 round 0: slots 10/42 — §3.3 clean, tainted) is exactly
+/// that shape. The harness already reports ground-truth taint for the
+/// meta slots (the rollback-fallout loop, X5-R16); this half extends
+/// the same report to every tainted slot of the walked image's
+/// referenced set. Gated on media faults existing for the same reason
+/// the meta loop is: on a faultless disk (class C) a crash-dropped
+/// write must not fail O-2's cleanliness. Armed only by the MP (i)
+/// walk: the (ii) walk, the twin supply and the fault-draw bias keep
+/// the committed behavior (no residual was observed at (ii); if F2's
+/// triage finds one, it is this same fix one level on).
+pub fn durable_image_with_fallout(
+    disk: &SimDisk,
+    cfg: &StoreCfg,
+    fallout: bool,
 ) -> (
     Vec<Finding>,
     BTreeSet<u64>,
@@ -3052,6 +3088,25 @@ pub fn durable_image(
                     slot: Some(slot),
                     what: "stale durable meta slot (rollback fallout)".into(),
                 });
+            }
+        }
+        // **X5-R20 completeness residual**: every other tainted slot of
+        // the referenced set, same ground-truth report as the meta loop
+        // above, armed only for the MP amcheck (i) walk (`fallout`).
+        if fallout {
+            for slot in used.iter() {
+                if *slot <= 2 {
+                    continue;
+                }
+                if disk.range_tainted(pf, *slot * 4096, 4096) {
+                    if mpe_diag {
+                        eprintln!("MPE diag: referenced slot {slot} tainted (damage fallout)");
+                    }
+                    out.push(Finding {
+                        slot: Some(*slot),
+                        what: "stale referenced slot (damage fallout)".into(),
+                    });
+                }
             }
         }
     }

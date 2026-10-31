@@ -711,6 +711,44 @@ fn r16_mpe_referenced_set_excludes_the_file_header() {
 /// it now also consults the issued-write event stream (the same
 /// record R5's M-NOINPLACE guard reads). On the reverted event source
 /// `rlen` is 0 again and the exactness text reappears.
+/// **X5-R20 completeness-residual pin (P ruling nv3-X-5c-F1-esc-1;
+/// literal config = bc4f3bba's residual seeds 1787/6157, round 0
+/// each).** Both carried "O-3(e): tainted referenced slot 10/42 not
+/// reported" with `mrb=true`: the slot's durable bytes reverted to
+/// exactly the content the opened (rolled-back) image references — a
+/// crash-dropped volatile write (slot 10's last two writes dw[11],
+/// dw[22] are sync-covered; the dropped one was issued after them) —
+/// so §3.3 passes against the image's own reference and the walk can
+/// never name it, while the frozen oracle's completeness half demands
+/// every tainted referenced slot be reported. The harness's
+/// ground-truth fallout report (already committed for the meta slots,
+/// X5-R16) now covers every tainted slot of the referenced set, armed
+/// for the MP amcheck (i) walk. On the reverted arm the "not
+/// reported" text reappears.
+#[test]
+fn r20_mpe_damage_fallout_covers_every_referenced_slot() {
+    for seed in [1787u64, 6157] {
+        let rec = workload::run_seed(seed, None);
+        let not_reported = rec
+            .rounds
+            .iter()
+            .filter_map(|r| r.o3_fail.as_ref())
+            .any(|t| t.contains("not reported"));
+        assert!(
+            !not_reported,
+            "seed {seed}: the §3.3-clean reverted slot is unreported again"
+        );
+        assert!(
+            rec.rounds.iter().all(|r| r.pass),
+            "seed {seed}: a round fails beyond the removed defect: {:?}",
+            rec.rounds
+                .iter()
+                .map(|r| (&r.crash, &r.o3_fail, r.pass))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 #[test]
 fn r20_mpe_r_reads_the_issued_write_history() {
     for seed in [38u64, 137] {
