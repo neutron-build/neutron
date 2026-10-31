@@ -1,18 +1,20 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c — X5-R13 (a)–(d) landed (each pinned); the gc_step
-livelock fixed (pin `gc_sweep_crosses_subtree_boundaries`); the first
-complete 10k campaign committed (exit 0, ~13 min, RSS 5.1 GiB; see
-"The first complete 10k campaign" below): `E4 SEEDS=10000 O1_FAIL=2712
-O2_FAIL=98 O3_FAIL=1029 DEADLOCK=46 PANIC=0 O1F_FAIL=2722 MONITOR=0`,
-1,560 failing seeds in six recorded classes, five coverage quotas
-missed (Q4, Q7, Q11, Q12, SIZING) — **X5-R12's budget valve applied:
-the classes are recorded with deterministic repros, the file is
-committed, and the retune/final-run/mutant-sweep wait for P's
-triage.** `cargo test` green (139 tests); the gate green at this code
-state.** The stages before it (X-5a, X-5b) are complete and merged.
-Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
-fix).
+Status: **stage X-5c-F1 (stacked on X-5c's branch; X5-R18's first
+card) — step 0 done: X5-R14–R19 recorded verbatim above, before any
+other change. Next: X5-R14 (the non-reproducing digests 180, 559,
+7474, 8832), X5-R15's reporting items, a fresh 10k triage campaign at
+the fixed code, and the instrumentation classes NEVER-FIRED, NO-TWIN,
+MP-E. Not this card: the store/design classes (C-XX, C-DIV,
+MP-LIVELOCK, MP-A, MW-ORPHAN, the twins), the retune (X5-R17), the
+sweep, the RESULT — X-5c-F2's and X-5c's. The base stage X-5c left:
+the first complete 10k campaign committed (d2c8bba7, triage data only
+per X5-R14), `E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=98 O3_FAIL=1029
+DEADLOCK=46 PANIC=0 O1F_FAIL=2722 MONITOR=0`, six failing classes +
+the seventh (non-reproducing digests), five quotas missed (Q4, Q7,
+Q11, Q12, SIZING), `cargo test` green (139 tests), the gate green at
+that code state.** The stages before it (X-5a, X-5b) are complete and
+merged. Opus judges E4 on the RESULT with P's rulings X5-R1–R19.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -302,6 +304,173 @@ the worker landed (a) with this copy in the same commit, before the next
   - Item 2: the livelock count inside `DEADLOCK`.
   - Item 5: every (a)–(d) item (instrumentation), and seeds 36 and 148 with their root causes.
 - **Nothing else moves.** The oracle, the model, the classes, the quotas and X5-R1–R12 are unchanged. Recording a livelock as DEADLOCK tightens the rule (before, it was a hang); it loosens nothing. The README gets X5-R13 verbatim in the same commit as (a), before the next `run`.
+
+## P rulings X5-R14–R19, verbatim (nv3-X-5c-esc-3, 2026-10-31; binding)
+
+Copied verbatim from the card X-5c-F1 (its "Carried: X5-R14–R19" section, itself verbatim from the ruling) before any other change of this stage, per the card order step 0. The full record is `nucleus/v3/verdicts/X-5c-esc-3.md` in the main checkout.
+
+**P rulings on run 4's ESCALATE (nv3-X-5c-esc-3, 2026-10-31): binding, read before anything else.** The full record is `nucleus/v3/verdicts/X-5c-esc-3.md` in the main checkout. Everything binding is below. Run 4 committed the first complete 10k campaign (d2c8bba7), recorded its failing classes (a06e7ca4) and a seventh class, non-reproducing digests (66f33c32), and applied X5-R12's budget valve correctly. P triaged from the committed file, read-only (a latency measurement held the host). Every ruling below was made **after** seeing campaign data, so each one is an instrumentation fix, a reporting correction, a tightening, or a conditional design fill with its basis stated. None loosens X5-R1–R13, the oracle or the quotas.
+
+**X5-R14 (non-reproducing digests: an instrumentation defect that voids the campaign as a RESULT input).**
+- **The finding.** `verify` re-ran d2c8bba7's 10,000 seeds. Seeds 180, 559, 7474 and 8832 gave different digests. All four are multi-round seeds that passed every round in the committed file. Three of the four have nested recovery crashes.
+- **The ruling.** The digest is a pure function of `(seed, mutant)` (S-DET/W-DET, Work 7), and `verify` is an Acceptance command. A non-reproducing seed means that some sim-visible decision depends on OS timing. That decision can sit in any seed, not only in the four that showed it.
+  - So `results/campaign.json` at d2c8bba7 is **triage data only**. No RESULT count may come from it, except as development failures in RESULT item 5.
+  - This is fixed **first**, before any other fix is verified.
+- **Root-cause it; do not mask it.**
+  - **Method.** Re-run each of the four seeds repeatedly while a 16-thread `run` of other seeds loads the host, until two digests differ. Then compare the two runs' per-world schedule traces (`SchedCore.trace`) and a host-mutation log. The log is diagnostic only: never a digest input and never committed enabled. The first divergence names the cause.
+  - **P's leads (not a ruling of cause):**
+    - (a) **The release paths.** The crash, deadlock and livelock paths (`deliver_crash`, the crash and budget branches of `yield_baton_budget`, and `handoff_locked`'s deadlock branch) all release every task at once with `running = None`. From then on, the unwinding tasks run **concurrently**. Any host mutation on an unwind path happens in OS order. That includes store error-path cleanup, `finish`, harness records, and an `E4Env` call, because `Sched::acquire` does not check `crashed`.
+    - (b) **Nested recovery crashes**, which three of the four seeds have.
+    - (c) **Reads outside the baton.** Anything that reads `finished` or `waiting` outside the baton.
+- **The fix.** It makes every sim-visible decision a function of `(seed, mutant)`. One example is a deterministic unwind: the baton passes through the unwinding tasks in `TaskId` order. Another is refusing, loudly, every host mutation after `crashed` other than the scheduler's own. The worker chooses, and the README documents the choice.
+  - The fix may touch `src/sim/sched.rs` and `src/harness.rs`.
+  - `taint_ranges`, the oracle and the model stay frozen.
+- **Pins.**
+  1. **A structural test with a literal config** that fails deterministically on the pre-fix code. For example: two tasks whose unwind paths each perform a host mutation, and the test asserts their order, or the refusal. Revert the fix to show the test fail, then restore it.
+  2. **Stress evidence** (README, not `cargo test`): the four seeds re-run 25 times each at 16 threads under a concurrent 16-thread `run` load give one digest per seed.
+  3. **Digest stability.** Compare a fresh 10k `run` at the fixed code with d2c8bba7, seed by seed. List every seed whose digest changed, and explain each change by the fix's mechanism. A fix that shifts many digests without an explanation is not root-caused.
+- **Classification for RESULT item 5:** an instrumentation defect (sim scheduler or harness).
+
+**X5-R15 (counting, reporting and the record: corrections, not rule changes).**
+- **(a) The rule's n on its own line.**
+  - In d2c8bba7, the final line's `O1_FAIL=2712` counts every record that carries an O-1 text. That includes 1,315 MP rounds that **pass** under the frozen pass fold: they are recovery-`Err` rounds, carrying the Err branch's default O-1(a) text.
+  - Keep the Work 7 line exactly as it is. After it, print one more line: `E4 FOLD FAILING_SEEDS=<n> FAILING_ROUNDS=<n> TWIN_FAILING_ROUNDS=<n> DEFECT_SEEDS=<n>`. Its counts come from the pass fold and the seed-level `defect`/`deadlock`/`panic` flags.
+  - RESULT item 7's n is `FAILING_SEEDS`. The per-check round counts that the fold counts go beside it.
+- **(b) `verify` reports everything before it exits.** It always prints the outcome of all three checks before exiting non-zero: the seed set; the digests, with the list of non-reproducing seeds; and the full quota table.
+  - `verify --no-quotas` checks the seed set and the digests, and prints the quota table without failing on it. It exists only for X-5c-F1's Acceptance. X-5c's own Acceptance keeps plain `verify`.
+- **(c) The README must be accurate.**
+  - **The quota paragraph.** It says "the digests reproduce … the determinism pins hold". That is false: X5-R14. Correct it.
+  - **Every failing round belongs to a listed class.** The a06e7ca4 list left out three groups:
+    - MP O-3(a), **served corruption**: 9 rounds;
+    - O-3(c), XX001 with no damaged referenced slot: 25 MP and MW rounds;
+    - O-3(c), "no twin (harness defect)": 19 rounds.
+  - **The failing-seed count** is 1,598 once the seed-level `defect` seeds are included, not 1,560.
+- **(d) RSS.** In run 3, the progress lines' `rss=` rose steadily from 3.5 to 5.3 GiB, about 180 KiB per seed. RESULT item 1 reports this beside the peak. It is not a blocker under X5-R13's 24 GiB budget.
+- **(e) Scratch out of the crate.**
+  - Delete `restore_probe.local.py` (untracked).
+  - `examples/` keeps only what the README's "How to reproduce" uses. 823d4f51 called `examples/dbg-seed.rs` scratch, to be removed.
+
+**X5-R16 (the failing classes: P's provisional classification, the evidence, and the owner).** The repro seeds are d2c8bba7's. Before root-causing any class, confirm that its repro reproduces twice at the fixed code from X5-R14. If a fix moved a repro, re-derive it from the triage file. Each class is either root-caused (the cause at file:line plus the S-STORE § it deviates from, the classification, the fix, and a literal-config pin that fails on revert) or escalated with the evidence listed for it. Under X5-R3, the judgement classifies. The worker's classification is provisional until P's gate.
+- **NON-REPRO.** X5-R14 above.
+- **NEVER-FIRED (instrumentation: workload).**
+  - **The count.** 150 seeds carry the defect "the crash spec never fired": 110 class C, 35 twin rounds, 5 other MW rounds. 146 of the 150 target hook `Mid2`.
+  - **The cause.** The targeted checkpoint never reaches that hook. Its step 2 has too little to write.
+  - **The fix.** Make every targeted draw reach its hook, deterministically from the seed. A deterministic counting pass, like the uniform draw's, is allowed.
+  - **Pin and target.** A literal-config pin. The final file has `DEFECT_SEEDS=0`.
+- **NO-TWIN (instrumentation: harness).** 19 MP and MW rounds. The oracle's own text is "MP/MW round with XX001 and no twin (harness defect)". Supply the twin, pinned.
+- **MP-E: O-3(e) under page damage (provisionally instrumentation: harness).**
+  - **The data.**
+    - **Exactness.** 199 rounds report "amcheck reported slot … neither tainted nor in R" (4 of them from (ii)). Of these:
+      - 195 are in Q14 meta-fault rounds (33% of all Q14 rounds);
+      - **195 are recovery-`Err` rounds**;
+      - only 39 are meta rollbacks;
+      - **none has a non-empty R**.
+    - **Completeness.** 205 rounds report "tainted referenced slot … not reported", and **every one is a recovery-`Err` round**.
+  - **The lead.** The image that `harness::durable_image` and amcheck (i) analyse is not the image the store opened, or tried to open. Two candidates:
+    - meta selection when a meta slot is faulted;
+    - R11 (a)'s rewritten loop over the flat map.
+
+    The lead is not R5's text. R5 says that if open fails on both metas, O-3(e) is vacuous.
+  - **Seeds.** Exactness: 37, 38 and 67, each round 0. Completeness: 47, 118 and 198, each round 0.
+  - **The limit.** R5 is not reopened. Suppose a finding lies outside R5's **text** with R computed correctly. Then it is a failure. No worker widens R. ESCALATE with the round.
+- **C-XX: XX001 or amcheck findings in class C, with no fault at all (provisionally a prototype deviation; the gravest class).**
+  - **The data.**
+    - 133 class C rounds: O-3(b) at `Open` in 53, at `AmcheckIi` in 80.
+    - O-2 "amcheck not clean" in 98 class C rounds.
+    - 25 MP and MW rounds where an XX001 has no damaged referenced slot (O-3(c)).
+  - **What it means.** A referenced page fails §3.3 with no media fault. That violates I-FREE-SAFE, I-NO-INPLACE, I-META-ATOMIC or I-FREE-EXACT, or the sim's F-CRASH semantics.
+  - **The skew.** Q10 rounds (an epoch copy dirty-evicted into the image map) fail at 6× the base rate. That points at the write-guard and epoch-copy path.
+  - **Seeds.**
+    - 221, round 0: recovery returns `Err` at `Open` after `After0@1` with no fault, the simplest shape;
+    - 66, round 0;
+    - 252, round 0.
+  - **A root cause in the sim's crash or fault model** is ESCALATE. P fixes the sim, as with X5-R9.
+- **C-DIV: the recovered state differs from the model in class C (provisionally a prototype deviation or a harness defect).**
+  - **The data.** 474 class C rounds fail O-1:
+    - (b) scan mismatch: 262;
+    - (d): 58;
+    - (c): 93. In every (c) round the reported max ts is ≤ the frontier, which is `hi`. So (c) is the symptom reported for a lower candidate, not an orphan.
+  - **The rate by round index:** 1.7% for round 0, 2.6% for round 1, **20.2% for round 2**. So the lead is state that crosses rounds:
+    - the harness checkpoint between rounds;
+    - the carried model;
+    - X5-R10's sequencer restart;
+    - G2 truncation.
+  - **Seeds.** 21 round 0, 46 round 1, 36 round 2, 104 round 2.
+  - **The twins.** The faultless twins' failures (46 MP and 54 MW twin rounds; 4 of them carry no O-1 text and belong to NEVER-FIRED) are classified against C-DIV or C-XX, or as a class of their own.
+- **MP-LIVELOCK: 46 DEADLOCK/livelock rounds (lead: a gap in S-STORE §9.2; conditional fill G8).**
+  - **The data.**
+    - All 46 are MP, at round index 1. **Every one comes directly after an R6 round**, recovered `Ok` with a detected loss: 46 of the 128 MP rounds that follow an R6 round 0.
+    - None records a client XX001.
+    - Trip sites: `h:writer` 20, `h:ckpt` 16, `h:evictor` 10.
+  - **The lead.** The store keeps running on an image that holds an unreadable referenced page. An XX001 inside apply, eviction or a checkpoint does not poison the store: the prototype poisons only on `gc_w > T` (`ckpt.rs:582`). The failing task leaves, and the rest park forever behind the service spins.
+  - **Seeds.** 148, 987 and 2307, each round 1.
+  - **Conditional fill G8 (P's reading of I-FAIL-STOP).** It applies only if the root cause is confirmed as an XX001 inside apply, eviction or a checkpoint that does not poison the store. §9.2 names "an I/O error, 53100 or 53200" and does not name XX001. P's reading: a read that returns bytes failing §3.3 is a failed physical read, so XX001 there poisons the store.
+    - **What the harness does.** It treats a poisoned store as the end of the round's workload. It delivers the round's crash at once and records the crash point as `poison` (never as NEVER-FIRED). Then the faults, the recovery and the oracle run as usual.
+    - **Where it goes.** G8 is listed in RESULT item 6 and carried into S-STORE §9.2 by spec card S-1-F3.
+    - **Any other root cause.** Fix it if it is a prototype deviation; otherwise ESCALATE.
+- **MP-A: served corruption, 9 rounds (the plan's clause 3; P classifies).**
+  - **The rounds.** Seeds 998, 1897, 2927, 3777, 4327 and 5488 (round 0 each), plus three more in the file. Every one is a Q14 meta-fault round.
+  - **What to record, per round:**
+    - the slot;
+    - whether it is in R or is tainted;
+    - the reference that was accepted, and the bytes and CRC on disk;
+    - the read path.
+  - **Then:** fix a prototype deviation found here with a pin. Either way, **ESCALATE all 9 with this evidence.** The worker never classifies a served corruption as a non-failure.
+- **MW-ORPHAN: 437 MW rounds fail O-1(c) "raw entry above the cut" with O-3(d) (P's provisional classification: SPEC, an E4 finding against S-STORE §13/§14).**
+  - **The data.**
+    - In 422 of the 437, the orphan's max ts is above the recovered frontier, and every one is ≤ `hi`.
+    - 434 are Q9 rounds (the image holds part of a commit > T).
+  - **The mechanism.**
+    - I-CKPT-AT-T (b) rests on step 1's guarantee that every commit > T with entries in the image has a durable record.
+    - Class MW destroys a record after its sync, by construction.
+    - §14 replays up to the first damaged record (`ckpt.rs`: `break 'outer`). It has no rule for ordinary image entries above the recovered frontier.
+    - X5-R10 then restarts the sequencer at frontier + 1, inside the orphans' ts range: an I-ENTRY-UNIQUE hazard.
+  - **Why X5-R1 does not cover it.** X5-R1 makes lost acked commits a known cost. A non-prefix state is not a lost acked commit, so it stays a failure.
+  - **The worker does not fix it.** Any fix (making entries above the frontier dead, a sequencer floor above them) is a mechanism beyond G1–G7.
+  - **Evidence instead,** for seeds 39, 59 and 109 (round 0 each) and two more:
+    - T, the frontier, and every orphan entry (tree, key, ts);
+    - the commits and records that were damaged, with the fault kind and LSN;
+    - proof that replay stopped at the first invalid record, per §12.5 (no store deviation);
+    - whether a later round reissues an orphan's ts.
+  - **The other 15 rounds** (max ts ≤ the frontier) are root-caused as their own class.
+  - **On confirmation,** P opens S-1-F3.
+
+**X5-R17 (coverage, after the classes).**
+- **When.** Retune (Work 5.6) only after every X5-R16 class is fixed or escalated. A retune changes every seed's workload, and the repro seeds above hold only for d2c8bba7's workload.
+- **The targets:**
+  - **SIZING**, per seed, as Work 5.3 says: every seed reaches ≥ 4·F distinct dirtied LPIDs in at least one checkpoint interval. d2c8bba7 reached it in **362 of 10,000 seeds**, so the plan row's defining condition ("a dirty set of 4× the pool") is still untested. `verify`'s SIZING row counts seeds.
+  - **Q4:** 0 of 1,000. It is the plan row's "splits and merges during a checkpoint".
+  - **Q7:** 155 of 200.
+  - **Q11:** 0 of 100.
+  - **Q12:** 2 of 100.
+- **The pool stays at §5.4's formula, which is its minimum.** Reach 4·F with wider or longer checkpoint intervals, never with a smaller pool.
+- **The time budget.** Work 5.3's limit of 20 min becomes **≤ 40 min wall at 16 threads**, so that `verify` stays inside the runner's 60-min limit. This is a time budget, not a correctness rule.
+- **The record.** Every retune is listed in RESULT with the quota that prompted it.
+- **New classes.** A failing class that first appears on the retuned workload gets X5-R16's treatment.
+
+**X5-R18 (structure: split; this supersedes X5-R12's "do not split").**
+- **Why.** X5-R12 held because the remaining work was a known campaign. What remains now is diagnosis:
+  - one determinism defect;
+  - eight failing classes, at least one of them spec;
+  - a retune that the plan row's headline condition depends on;
+  - the sweep.
+
+  X-5c's Acceptance (`verify` and `mutants --check`) cannot pass until all of it is done. So every relaunch fails by construction and comes back to P.
+- **Two stacked cards**, each with an Acceptance it can pass and its own P gate:
+  - **X-5c-F1** (Base `card/v3-X-5c`): X5-R14, X5-R15, a fresh triage campaign, and the instrumentation classes (NEVER-FIRED, NO-TWIN, MP-E).
+  - **X-5c-F2** (Base `card/v3-X-5c` after F1 lands): the store and design classes (C-XX, C-DIV, MP-LIVELOCK, MP-A, MW-ORPHAN evidence, the twins), then X5-R17's retune and a full 10k `run` that `verify` passes.
+- **Advancing X-5c's branch.** After each stacked card's P gate returns MERGE, the orchestrator fast-forwards X-5c's branch to it: `git -C ~/.cache/nv3-cards/X-5c merge --ff-only card/v3-X-5c-F<n>`. Never a force, never a rebase.
+- **Then** X-5c is relaunched `--keep` for what is left:
+  - the final `run`, only if code changed after F2's committed file;
+  - `mutants`;
+  - the README and RESULT.
+- **Spec findings** go to **S-1-F3**: P-authored, S-STORE §9.2 (G8) and §13/§14 (MW-ORPHAN), opened by P on F1/F2's evidence. If S-STORE changes, the prototype implements the change and the **whole** campaign is re-run (X5-R3).
+
+**X5-R19 (stop clauses inside the stacked cards).**
+- **X5-R8 still governs a stop clause.** A worker who reaches one does not decide it.
+- **An escalation about one class does not end the attempt.** Record it in the README with its evidence, and continue with the next class.
+- **At the end of the attempt,** if any class is escalated, finish the attempt's remaining Work, then ESCALATE.
+- **Never** fix around an escalated class. Never exclude its seeds, retune to avoid it, or re-run only some seeds.
 
 ## The first complete 10k campaign (run 3 of the attempt, committed)
 
