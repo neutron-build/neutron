@@ -59,3 +59,38 @@ ground truth, 128 dimensions, Euclidean distance.
   voided the 2026-10-18 qdrant load with the server healthy). Timed
   search passes never retry — a transient failure there fails the row
   instead of hiding inside the measurement.
+
+## Card B-0-F7: client-vs-server attribution and index-state evidence
+
+Every timed query records the server's own `time` next to the
+client-measured latency: pass metrics carry `server_p50_ms` /
+`server_p99_ms`, `--latency-out F` writes the per-query
+`client_ms,server_ms` pairs, and `--ids-out F` writes the per-query
+result ids **before** the 10 ms sanity check, so a refused pass keeps
+its recall evidence (`nbench vec-recall --ids F --truth F` recomputes
+it). `--exact` swaps `hnsw_ef` for Qdrant brute force (a recall control
+against the live index; marked `exact:true`, exempt from the ANN sanity
+limit like cold passes — one explicit marker), and
+`nbench vec-qdrant-info` dumps the collection's `result` document
+(segment count, config, counts). The row's driver records
+`collection-info.json` at init and a `.latency.csv` beside every pass
+metrics file.
+
+`diagnose.sh` (one command per client build) applies all of the above
+under chain10's quiet-host window and classifies each pass with the
+card's pre-registered c−s rule via `nbench qdrant-latency-verdict` —
+the rule has exactly one, unit-tested, implementation. Its 2026-10-31
+run on the preserved chain10 collection (grey, 92 segments,
+`indexed_vectors_count` 3.86x points) measured c−s ≤ 1.54 ms with
+s ≈ 8.5 ms: **the refused ~10 ms passes were server-side**, a Qdrant
+configuration question for a P judgement (card Work 4 arm 2); see
+`results/2026-10-31/vector-sift1m-qdrant.diagnosis.md`.
+
+`remeasure.sh` is chain10's script with its row list cut to this row:
+the quiet-host window, then `nbench run vector-sift1m-qdrant`. **Run it
+with a release-built client** (`NB_BIN=target/release/nbench`): the
+runner hands its own executable to the driver, and the debug client's
+per-query JSON overhead (~0.4 ms measured) is harness time inside every
+measured latency — chain10's refused warmup (10.01 ms) was a 9.66 ms
+release-client pass plus that overhead. The sanity limit is unchanged;
+a refusal is escalated, never re-run.

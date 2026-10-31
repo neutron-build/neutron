@@ -18,6 +18,14 @@
 //!   [`QDRANT_P50_SANITY_LIMIT_MS`] (gate verdict ddb00ba5 defect 1 — a
 //!   Nagle + delayed-ACK stall measured 44 ms p50 / 22 qps where healthy
 //!   single-write probes return in 1.6–1.9 ms).
+//! - Every timed query records the server-side handling time reported
+//!   by Qdrant next to the client-side latency (card B-0-F7 Work 1), so
+//!   latency can be attributed: the pre-registered client-vs-server
+//!   rule ([`diagnose_client_server_latency`], card B-0-F7 Work 4)
+//!   decides whether a slow pass is a client/transport defect, a
+//!   Qdrant-side question, or within tolerances. A response without a
+//!   `time` field is a loud error — silently recording zeros would
+//!   empty the client-vs-server table (the card's first named mutant).
 
 use crate::error::{Error, Result};
 use crate::http;
@@ -311,28 +319,52 @@ pub fn qdrant_upload(
     Ok(())
 }
 
-/// Search one vector over an existing keep-alive connection; returns
-/// ids in rank order. Used for the timed search pass so the whole pass
-/// shares one socket (gate nv3-B-0-gate-1 finding 5: per-query TCP
-/// setup made the Qdrant and pgvector arms overhead-unmatched).
-/// Measurement requests never retry: a transport failure here fails
-/// the row instead of hiding inside a re-send.
-pub fn qdrant_search_on(
-    conn: &mut crate::http::Connection,
-    collection: &str,
-    vec: &[f32],
-    limit: usize,
-    ef: u64,
-) -> Result<Vec<i64>> {
-    let body = json::to_string(&Value::obj(vec![
+/// Build the JSON body of one search request (pure seam so the request
+/// shape is unit-testable — card B-0-F7 Work 1/Mutation evidence: the
+/// body must carry the pass's own `hnsw_ef`; a mutant that ignores `ef`
+/// mislabels the diagnosis and every recorded pass).
+///
+/// `exact` swaps the HNSW hint for Qdrant's brute-force `exact` search
+/// (card B-0-F7 recall control: an exact pass over the same collection
+/// must return the ground-truth neighbours, which validates the
+/// distance convention and the harness recall computation against the
+/// live index state instead of trusting it).
+pub fn search_request_body(vec: &[f32], limit: usize, ef: u64, exact: bool) -> Result<String> {
+    let params = if exact {
+        Value::obj(vec![("exact", Value::Bool(true))])
+    } else {
+        Value::obj(vec![("hnsw_ef", Value::n(ef as f64))])
+    };
+    json::to_string(&Value::obj(vec![
         (
             "vector",
             Value::Arr(vec.iter().map(|x| Value::n(*x as f64)).collect()),
         ),
         ("limit", Value::n(limit as f64)),
         ("with_payload", Value::Bool(false)),
-        ("params", Value::obj(vec![("hnsw_ef", Value::n(ef as f64))])),
-    ]))?;
+        ("params", params),
+    ]))
+}
+
+/// Search one vector over an existing keep-alive connection; returns
+/// ids in rank order and the server-measured handling time. Used for
+/// the timed search pass so the whole pass shares one socket (gate
+/// nv3-B-0-gate-1 finding 5: per-query TCP setup made the Qdrant and
+/// pgvector arms overhead-unmatched). Measurement requests never
+/// retry: a transport failure here fails the row instead of hiding
+/// inside a re-send.
+///
+/// Card B-0-F7 Work 1: the server's own `time` travels with the ids so
+/// the pass can attribute client-vs-server latency.
+pub fn qdrant_search_on(
+    conn: &mut crate::http::Connection,
+    collection: &str,
+    vec: &[f32],
+    limit: usize,
+    ef: u64,
+    exact: bool,
+) -> Result<SearchOutcome> {
+    let body = search_request_body(vec, limit, ef, exact)?;
     let resp = conn.request(
         "POST",
         &format!("/collections/{collection}/points/search"),
@@ -345,7 +377,40 @@ pub fn qdrant_search_on(
             stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
         });
     }
-    parse_search_hits(&resp.body)
+    parse_search_response(&resp.body)
+}
+
+/// One search response, with the server's own accounting of how long
+/// it took (card B-0-F7 Work 1).
+#[derive(Debug)]
+pub struct SearchOutcome {
+    /// Hit ids in rank order.
+    pub ids: Vec<i64>,
+    /// Qdrant's top-level `time` field, in **seconds** (e.g. the
+    /// live collection answered a status poll in `0.001054475`).
+    pub server_time_s: f64,
+}
+
+/// Parse a search response into ids plus the server-side time.
+///
+/// Invariant owned here (card B-0-F7 Work 1): the `time` field is
+/// **mandatory**. Qdrant puts it on every response; treating it as
+/// optional would record a silent 0 for the server column and the
+/// client-vs-server table would be empty — exactly the card's first
+/// named instrumentation mutant — so its absence is a loud error.
+pub fn parse_search_response(body: &[u8]) -> Result<SearchOutcome> {
+    let v = json::parse(&String::from_utf8_lossy(body))?;
+    let server_time_s = v.get("time").and_then(Value::as_f64).ok_or_else(|| {
+        Error::Missing(
+            "search response `time` field (card B-0-F7: server latency is recorded next \
+                 to every client latency; a missing field means attribution is impossible)"
+                .into(),
+        )
+    })?;
+    Ok(SearchOutcome {
+        ids: parse_search_hits(body)?,
+        server_time_s,
+    })
 }
 
 /// Parse a search response body into id lists.
@@ -449,6 +514,205 @@ pub fn collection_ready(
 ) -> bool {
     let _ = indexed;
     status == "green" && points == expected_points
+}
+
+/// Fetch a collection's info document (`GET /collections/{c}`) and
+/// return its `result` object verbatim — status, counts, segment
+/// count, config and optimizer state (card B-0-F7 Work 2).
+pub fn qdrant_collection_info(host: &str, port: u16, collection: &str) -> Result<Value> {
+    let resp = request_with_retry(
+        host,
+        port,
+        "GET",
+        &format!("/collections/{collection}"),
+        b"",
+        Duration::from_secs(30),
+    )?;
+    if resp.status != 200 {
+        return Err(Error::Command {
+            name: format!("qdrant collection info (HTTP {})", resp.status),
+            status: resp.status as i32,
+            stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
+        });
+    }
+    let v = json::parse(&String::from_utf8_lossy(&resp.body))?;
+    v.get("result")
+        .cloned()
+        .ok_or_else(|| Error::Missing("collection info result".into()))
+}
+
+/// The index-state facts a card B-0-F7 diagnosis needs from a
+/// collection info `result` document (Work 2), as a pure seam.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CollectionSummary {
+    /// Collection status as reported (`green`/`yellow`/`grey`/`red`).
+    pub status: &'static str,
+    /// `points_count`.
+    pub points: usize,
+    /// `indexed_vectors_count` (may exceed `points` mid-optimization:
+    /// merging segments builds the new HNSW index while the old ones
+    /// still count — the preserved chain10 collection reported
+    /// 3 861 632 indexed for 1 000 000 points).
+    pub indexed: usize,
+    /// `segments_count` — how many segments a search fans out to.
+    pub segments: usize,
+    /// `update_queue.length`.
+    pub update_queue: usize,
+}
+
+/// Classify a collection status string into the four values Qdrant
+/// reports (anything else is kept as `other`, never guessed).
+fn static_status(s: &str) -> &'static str {
+    match s {
+        "green" => "green",
+        "yellow" => "yellow",
+        "grey" => "grey",
+        "red" => "red",
+        _ => "other",
+    }
+}
+
+/// Read a dotted numeric field (`a.b`) from a nested object.
+fn nested_num(v: &Value, path: &[&str]) -> Result<usize> {
+    let mut cur = v;
+    for (i, key) in path.iter().enumerate() {
+        cur = cur
+            .get(key)
+            .ok_or_else(|| Error::Missing(path[..=i].join(".")))?;
+    }
+    cur.as_f64()
+        .map(|n| n as usize)
+        .ok_or_else(|| Error::Missing(path.join(".")))
+}
+
+/// Extract the diagnosis summary from a collection info `result`
+/// document. Pure; unit-tested against the live shape the preserved
+/// chain10 collection returned (grey, 92 segments).
+pub fn collection_summary(result: &Value) -> Result<CollectionSummary> {
+    let raw_status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Missing("collection status".into()))?;
+    let num = |k: &str| -> Result<usize> {
+        result
+            .get(k)
+            .and_then(Value::as_f64)
+            .map(|n| n as usize)
+            .ok_or_else(|| Error::Missing(k.into()))
+    };
+    Ok(CollectionSummary {
+        status: static_status(raw_status),
+        points: num("points_count")?,
+        indexed: num("indexed_vectors_count")?,
+        segments: num("segments_count")?,
+        update_queue: nested_num(result, &["update_queue", "length"])?,
+    })
+}
+
+/// Tolerated client-side excess over the server's own time (card
+/// B-0-F7 Work 4, pre-registered): `c − s` above this means the client
+/// or transport is adding real time — a harness defect to fix; the
+/// sanity limit stays.
+pub const CLIENT_EXCESS_TOLERANCE_MS: f64 = 2.0;
+
+/// Server p50 above which a pass — with the client within tolerance —
+/// is a Qdrant configuration question for a P judgement (card B-0-F7
+/// Work 4, pre-registered). Any sanity-limit change needs a P verdict
+/// with evidence.
+pub const SERVER_P50_QUESTION_MS: f64 = 5.0;
+
+/// The pre-registered client-vs-server rule (card B-0-F7 Work 4). The
+/// card's arms are ordered; the first that fires decides, which is
+/// what an if / else-if reading of the card prescribes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LatencyVerdict {
+    /// `c − s > 2 ms`: client or transport defect — fix it; the limit
+    /// stays.
+    ClientExcess {
+        /// Client-measured p50, ms.
+        client_p50_ms: f64,
+        /// Server-reported p50, ms.
+        server_p50_ms: f64,
+        /// `c − s`, ms.
+        excess_ms: f64,
+    },
+    /// `c − s ≤ 2 ms` and `s > 5 ms`: the time is Qdrant's — a
+    /// configuration question for a P judgement; any limit change
+    /// needs a P verdict with evidence.
+    ServerSide {
+        /// Client-measured p50, ms.
+        client_p50_ms: f64,
+        /// Server-reported p50, ms.
+        server_p50_ms: f64,
+        /// `c − s`, ms.
+        excess_ms: f64,
+    },
+    /// Neither arm fired: no defect indicated by this rule.
+    WithinTolerances {
+        /// Client-measured p50, ms.
+        client_p50_ms: f64,
+        /// Server-reported p50, ms.
+        server_p50_ms: f64,
+        /// `c − s`, ms.
+        excess_ms: f64,
+    },
+}
+
+impl LatencyVerdict {
+    /// The pass's `(client_p50_ms, server_p50_ms, excess_ms)`.
+    pub fn numbers(&self) -> (f64, f64, f64) {
+        match *self {
+            LatencyVerdict::ClientExcess {
+                client_p50_ms,
+                server_p50_ms,
+                excess_ms,
+            }
+            | LatencyVerdict::ServerSide {
+                client_p50_ms,
+                server_p50_ms,
+                excess_ms,
+            }
+            | LatencyVerdict::WithinTolerances {
+                client_p50_ms,
+                server_p50_ms,
+                excess_ms,
+            } => (client_p50_ms, server_p50_ms, excess_ms),
+        }
+    }
+}
+
+/// Apply the card B-0-F7 Work 4 rule to one pass's p50s. A NaN input
+/// is an error, never a verdict: a broken measurement must not
+/// classify itself.
+pub fn diagnose_client_server_latency(
+    client_p50_ms: f64,
+    server_p50_ms: f64,
+) -> Result<LatencyVerdict> {
+    if !client_p50_ms.is_finite() || !server_p50_ms.is_finite() {
+        return Err(Error::Usage(format!(
+            "latency diagnosis needs finite p50s, got client={client_p50_ms} server={server_p50_ms}"
+        )));
+    }
+    let excess_ms = client_p50_ms - server_p50_ms;
+    if excess_ms > CLIENT_EXCESS_TOLERANCE_MS {
+        Ok(LatencyVerdict::ClientExcess {
+            client_p50_ms,
+            server_p50_ms,
+            excess_ms,
+        })
+    } else if server_p50_ms > SERVER_P50_QUESTION_MS {
+        Ok(LatencyVerdict::ServerSide {
+            client_p50_ms,
+            server_p50_ms,
+            excess_ms,
+        })
+    } else {
+        Ok(LatencyVerdict::WithinTolerances {
+            client_p50_ms,
+            server_p50_ms,
+            excess_ms,
+        })
+    }
 }
 
 /// Per-query p50 upper bound for a healthy Qdrant search pass, in
@@ -923,5 +1187,173 @@ mod tests {
         assert!(parse_search_hits(br#"{"result":{}}"#).is_err());
         assert!(parse_search_hits(br#"{"result":[{"score":1.0}]}"#).is_err());
         assert!(parse_search_hits(b"garbage").is_err());
+    }
+
+    #[test]
+    fn search_response_records_the_server_time_next_to_the_ids() {
+        // Card B-0-F7 Work 1, and the card's first named mutant
+        // ("server-time not recorded -> the c−s table empty"): every
+        // Qdrant response carries a top-level `time` in seconds, and
+        // the parse must surface it beside the ids — or fail loudly
+        // when it is missing. A silent 0 would make every pass look
+        // like a pure client-side stall.
+        let body = br#"{"result":[{"id":7,"score":1.0},{"id":3,"score":0.9}],"status":"ok","time":0.00154225}"#;
+        let out = parse_search_response(body).expect("outcome");
+        assert_eq!(out.ids, vec![7i64, 3]);
+        assert!(
+            (out.server_time_s - 0.00154225).abs() < 1e-12,
+            "server time in seconds, full precision: {}",
+            out.server_time_s
+        );
+        // a response without `time` is a loud error, never 0.0
+        let no_time = br#"{"result":[{"id":7,"score":1.0}],"status":"ok"}"#;
+        let err = parse_search_response(no_time)
+            .expect_err("missing time field must fail the pass loudly");
+        assert!(
+            format!("{err}").contains("time"),
+            "error names the missing field: {err}"
+        );
+        assert!(parse_search_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn search_request_body_carries_the_pass_ef_and_the_exact_control() {
+        // Card B-0-F7 mutation evidence (the card's second named
+        // mutant, "recall recomputation ignoring ef"): the request the
+        // client sends must carry THIS pass's `hnsw_ef`. A body that
+        // ignores the requested ef mislabels every recorded pass —
+        // recall numbers would be attributed to the wrong point of the
+        // sweep, and the diagnosis table with them.
+        let body = search_request_body(&[0.5, -1.25], 10, 16, false).expect("body");
+        let v = json::parse(&body).expect("parse");
+        assert_eq!(
+            v.get("params")
+                .and_then(|p| p.get("hnsw_ef"))
+                .and_then(Value::as_f64),
+            Some(16.0),
+            "hnsw_ef must be the requested ef"
+        );
+        assert!(
+            v.get("params").and_then(|p| p.get("exact")).is_none(),
+            "a normal pass must not ask for exact"
+        );
+        let body64 = search_request_body(&[0.5], 10, 64, false).expect("body");
+        let v64 = json::parse(&body64).expect("parse");
+        assert_eq!(
+            v64.get("params")
+                .and_then(|p| p.get("hnsw_ef"))
+                .and_then(Value::as_f64),
+            Some(64.0),
+            "ef flows through per pass, not a constant"
+        );
+        // the exact control swaps the hint for brute force
+        let exact = search_request_body(&[0.5], 10, 16, true).expect("body");
+        let ve = json::parse(&exact).expect("parse");
+        assert_eq!(
+            ve.get("params")
+                .and_then(|p| p.get("exact"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            ve.get("params").and_then(|p| p.get("hnsw_ef")).is_none(),
+            "an exact control must not also pin hnsw_ef"
+        );
+    }
+
+    /// The `result` document the preserved chain10 collection returned
+    /// on 2026-10-31 (restart + idle): grey, 92 segments,
+    /// indexed_vectors_count 3.86x points_count, update_queue empty.
+    /// This is the live index-state shape the diagnosis recorded.
+    const CHAIN10_ERA_COLLECTION_INFO: &str = r#"{
+        "status":"grey","optimizer_status":"ok",
+        "indexed_vectors_count":3861632,"points_count":1000000,
+        "segments_count":92,
+        "config":{"params":{"vectors":{"size":128,"distance":"Euclid"},
+          "shard_number":1,"replication_factor":1},
+          "hnsw_config":{"m":16,"ef_construct":200,"full_scan_threshold":10000},
+          "optimizer_config":{"indexing_threshold":10000,"default_segment_number":0}},
+        "payload_schema":{},"update_queue":{"length":0}}"#;
+
+    #[test]
+    fn collection_summary_reads_the_live_chain10_era_shape() {
+        // Card B-0-F7 Work 2: the summary must read exactly what the
+        // server said — the 92-segment, 3.86x-indexed, grey state that
+        // answers the card's recall question is data, not narrative.
+        let v = json::parse(CHAIN10_ERA_COLLECTION_INFO).expect("fixture json");
+        let s = collection_summary(&v).expect("summary");
+        assert_eq!(s.status, "grey");
+        assert_eq!(s.points, 1_000_000);
+        assert_eq!(s.indexed, 3_861_632);
+        assert_eq!(s.segments, 92);
+        assert_eq!(s.update_queue, 0);
+        // a settled collection reads just as truthfully
+        let settled = json::parse(
+            r#"{"status":"green","indexed_vectors_count":985000,"points_count":1000000,
+                "segments_count":2,"update_queue":{"length":0}}"#,
+        )
+        .expect("settled json");
+        let s2 = collection_summary(&settled).expect("summary");
+        assert_eq!(s2.status, "green");
+        assert_eq!(s2.segments, 2);
+        // missing fields are loud errors, never zero-filled guesses
+        assert!(collection_summary(&json::parse("{}").expect("empty")).is_err());
+        assert!(
+            collection_summary(
+                &json::parse(r#"{"status":"green","points_count":1}"#).expect("partial")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_preregistered_client_server_rule_applies_verbatim() {
+        use super::LatencyVerdict::*;
+        // Arm order and boundaries, straight from card B-0-F7 Work 4:
+        // 1. c − s > 2 ms  -> client or transport defect (fix it; the
+        //    limit stays)
+        // 2. else s > 5 ms -> Qdrant configuration question for P
+        // 3. else          -> within tolerances
+        let v = diagnose_client_server_latency(10.01, 9.95).expect("verdict");
+        assert!(
+            matches!(v, ServerSide { excess_ms, .. } if (excess_ms - 0.06).abs() < 1e-9),
+            "chain10's refused warmup, if the server really took 9.95, is server-side: {v:?}"
+        );
+        // a 10 ms client p50 over a healthy 1.7 ms server is the client
+        let v2 = diagnose_client_server_latency(10.01, 1.7).expect("verdict");
+        assert!(
+            matches!(v2, ClientExcess { excess_ms, .. } if (excess_ms - 8.31).abs() < 1e-9),
+            "a slow client over a healthy server is client excess: {v2:?}"
+        );
+        // the tolerance boundary itself does not fire (strictly >)
+        let boundary = diagnose_client_server_latency(3.0, 1.0).expect("verdict");
+        assert!(matches!(boundary, WithinTolerances { .. }), "{boundary:?}");
+        // one tick above it does
+        let over = diagnose_client_server_latency(3.01, 1.0).expect("verdict");
+        assert!(matches!(over, ClientExcess { .. }), "{over:?}");
+        // arm 2: client within tolerance, server slow (boundary again
+        // strict: s == 5 is within tolerances)
+        let s5 = diagnose_client_server_latency(6.0, 5.0).expect("verdict");
+        assert!(matches!(s5, WithinTolerances { .. }), "{s5:?}");
+        let slow = diagnose_client_server_latency(10.0, 9.0).expect("verdict");
+        assert!(matches!(slow, ServerSide { .. }), "{slow:?}");
+        // when both arms' conditions hold, the card's first arm wins
+        // (its if/else order)
+        let both = diagnose_client_server_latency(12.0, 9.0).expect("verdict");
+        assert!(matches!(both, ClientExcess { .. }), "{both:?}");
+        // a healthy pass (chain7-era probes: c ≈ s ≈ 1.7) is within
+        let healthy = diagnose_client_server_latency(1.9, 1.6).expect("verdict");
+        assert!(matches!(healthy, WithinTolerances { .. }), "{healthy:?}");
+        // numbers travel with the verdict
+        let (c, s, d) = ClientExcess {
+            client_p50_ms: 10.0,
+            server_p50_ms: 2.0,
+            excess_ms: 8.0,
+        }
+        .numbers();
+        assert_eq!((c, s, d), (10.0, 2.0, 8.0));
+        // NaN never classifies
+        assert!(diagnose_client_server_latency(f64::NAN, 1.0).is_err());
+        assert!(diagnose_client_server_latency(1.0, f64::NAN).is_err());
     }
 }
