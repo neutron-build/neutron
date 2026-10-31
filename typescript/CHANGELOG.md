@@ -147,6 +147,22 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Default `Cross-Origin-Opener-Policy` is now `same-origin-allow-popups`**
+  (was `same-origin`). `same-origin` severs `window.opener` in popups a page
+  opens, which is the channel OAuth providers and payment sheets (Google/Apple
+  sign-in, PayPal, wallet popups) use to report back. Every app on the
+  defaults had those flows broken until it found and overrode the header.
+  `same-origin-allow-popups` keeps the protection COOP exists for: a
+  cross-origin page that opens yours gets no handle on it. What it gives up
+  is cross-origin isolation, which needs `Cross-Origin-Embedder-Policy` as
+  well and breaks third-party embeds, so it has to be configured where it is
+  needed anyway. Restore the old value with
+  `securityHeaders: { headers: { "Cross-Origin-Opener-Policy": "same-origin" } }`.
+  `X-Frame-Options: DENY` is unchanged: framing stays opt-in, and a CSP
+  `frame-ancestors` supersedes XFO in browsers that implement CSP 2. The new
+  "Security headers" section of the `neutron.config.ts` docs records both
+  decisions.
+
 - **`<neutron-island>` is `display: contents` by default, and
   `client="visible"` works without a marker box.** The document head styled
   the marker `display: block; width: 100%`, a box of its own that changed

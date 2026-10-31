@@ -90,3 +90,27 @@ mount: {
 **What mounts do not do.** A mounted sub-app runs outside the framework's page pipeline. Its handlers do not pass through route or layout `middleware` (only the global chain), and — by design — mutations served by a mount neither fence nor evict the server's SSR caches: a `POST` answered by the sub-app does not invalidate a cached page or loader data, exactly as if the API ran in a separate process. If cached pages must reflect a mount's writes immediately, serve those mutations as [resource routes](/docs/routing/file-conventions#resource-routes) instead — resource-route mutations fence the cache epoch and evict the affected paths, like actions do.
 
 When your API is a handful of per-file endpoints rather than a sub-app, prefer [resource routes](/docs/routing/file-conventions#resource-routes) — route modules exporting `GET`/`POST`/… handlers, served through the same middleware chain as pages.
+
+## Security headers
+
+`server.securityHeaders` is on by default. Every response gets these unless it already set the header itself:
+
+| Header | Default |
+| :--- | :--- |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Cross-Origin-Opener-Policy` | `same-origin-allow-popups` |
+| `Cross-Origin-Resource-Policy` | `same-origin` |
+
+```ts
+server: {
+  // Override or add values site-wide; `false` disables the defaults entirely.
+  securityHeaders: { headers: { "Cross-Origin-Opener-Policy": "same-origin" } },
+},
+```
+
+**Why COOP is `same-origin-allow-popups`.** A cross-origin page that opens yours still gets no handle on your window, which is the protection COOP is for. What `same-origin` adds on top is severing `window.opener` in popups your page opens, and that is how OAuth providers and payment sheets (Google and Apple sign-in, PayPal, wallet popups) report back to the page that opened them. Under `same-origin` those flows break. Full `same-origin` buys cross-origin isolation (`crossOriginIsolated`, `SharedArrayBuffer`) only together with `Cross-Origin-Embedder-Policy`, and COEP breaks third-party embeds, so it belongs on the routes that need it. If a popup flow returns to a callback page on your own origin, rather than the provider posting a message from its own page, that callback page needs `Cross-Origin-Opener-Policy: unsafe-none`. Otherwise the popup's switch back to your origin severs the opener.
+
+**Why `X-Frame-Options` stays `DENY`.** Clickjacking protection is on until a page opts out. `frame-ancestors` in a `Content-Security-Policy` supersedes XFO in every browser that implements CSP 2. If you send one, browsers ignore XFO, and XFO still covers the ones that don't. To allow framing, set `frame-ancestors` (and drop or relax XFO) on the routes that are framed.
+

@@ -194,7 +194,7 @@ export interface NeutronServerOptions {
    * Security headers — **on by default** (opt-out). Every response gets
    * `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
    * `Referrer-Policy: strict-origin-when-cross-origin`,
-   * `Cross-Origin-Opener-Policy: same-origin` and
+   * `Cross-Origin-Opener-Policy: same-origin-allow-popups` and
    * `Cross-Origin-Resource-Policy: same-origin` unless the response already
    * set them. Pass `{ headers }` to override/extend individual values, or
    * `false` to disable entirely. Unchanged by the CORS default-off flip.

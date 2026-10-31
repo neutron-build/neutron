@@ -127,4 +127,20 @@ describe("http headers helpers", () => {
     expect(response.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
     expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
   });
+
+  // A popup the page opens (OAuth provider, payment sheet) reports back
+  // through window.opener; COOP `same-origin` severed that for every app.
+  it("defaults COOP to same-origin-allow-popups and keeps it configurable", () => {
+    const response = new Response("ok");
+    applySecurityHeaders(response, resolveSecurityHeadersConfig(undefined)!);
+    expect(response.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin-allow-popups");
+    expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+
+    const strict = new Response("ok");
+    applySecurityHeaders(
+      strict,
+      resolveSecurityHeadersConfig({ headers: { "Cross-Origin-Opener-Policy": "same-origin" } })!
+    );
+    expect(strict.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
+  });
 });

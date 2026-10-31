@@ -23,11 +23,18 @@ export interface SecurityHeadersConfig {
 const DEFAULT_CORS_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 const DEFAULT_ALLOWED_HEADERS = ["Content-Type", "Authorization", "Accept"];
 
+// COOP `same-origin-allow-popups`, not `same-origin`: a cross-origin page that
+// opens this one still gets no handle on it, but popups this page opens keep
+// `window.opener` — the channel OAuth providers and payment sheets report back
+// on. `same-origin` broke every such flow by default, and buys only
+// cross-origin isolation, which also needs COEP and so has to be configured
+// per route anyway. XFO stays DENY: `frame-ancestors` in a CSP supersedes it
+// in every browser that implements CSP 2, and XFO covers the ones that don't.
 const DEFAULT_SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "strict-origin-when-cross-origin",
-  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
   "Cross-Origin-Resource-Policy": "same-origin",
 };
 
