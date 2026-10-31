@@ -17,27 +17,32 @@ that a version has been published; check the registry before releasing.
 | `@neutron-build/nucleus` | 0.3.0 |
 | `@neutron-build/data` | 0.3.0 |
 | `@neutron-build/agents` | 0.2.0 |
-| `@neutron-build/core` | 0.4.2 |
-| `@neutron-build/cli` | 0.4.0 |
-| `@neutron-build/create` | 0.1.10 |
-| `@neutron-build/auth` | 0.1.5 |
-| `@neutron-build/cache-redis` | 0.2.0 |
-| `@neutron-build/security` | 0.1.5 |
+| `@neutron-build/core` | 0.5.0 |
+| `@neutron-build/cli` | 0.5.0 |
+| `@neutron-build/create` | 0.1.11 |
+| `@neutron-build/auth` | 0.1.6 |
+| `@neutron-build/cache-redis` | 0.2.1 |
+| `@neutron-build/security` | 0.1.6 |
 | `@neutron-build/ai` | 0.1.2 |
 | `@neutron-build/mcp` | 0.1.1 |
 | `@neutron-build/workflow` | 0.1.1 |
-| `@neutron-build/ops` | 0.1.4 |
-| `@neutron-build/otel` | 0.1.4 |
+| `@neutron-build/ops` | 0.1.5 |
+| `@neutron-build/otel` | 0.1.5 |
 
 `@neutron-build/mail` (0.1.0) is unchanged and stays on the registry as it is.
 What changed in each package is in `CHANGELOG.md`. Check the registry for what is
 live: `npm view <package> version`.
 
 The former unscoped `create-neutron` package is deprecated. Do not publish new
-versions under that name. Version 0.1.10 of `@neutron-build/create` is published
-with core 0.4.0 and cli 0.4.0. `create` pins the `core`/`cli` pair (`^0.4.0`), and
-the packed `cli` depends on `create`; core 0.4.x patches stay inside that range, so
+versions under that name. Version 0.1.11 of `@neutron-build/create` is published
+with core 0.5.0 and cli 0.5.0. `create` pins the `core`/`cli` pair (`^0.5.0`), and
+the packed `cli` depends on `create`; core 0.5.x patches stay inside that range, so
 they publish alone.
+
+`auth`, `cache-redis`, `ops`, `otel` and `security` depend on `core` through
+`workspace:^`, which packs as `^<core version>`. When core moves to a new 0.x
+minor, republish them (patch bump) so their range admits it; otherwise an app on
+the new core installs a second copy of core under them.
 
 ## Publish
 

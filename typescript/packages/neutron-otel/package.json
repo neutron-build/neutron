@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/otel",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenTelemetry integration for Neutron. Automatic span and error tracing via server hooks.",
   "author": "Tyler",
   "license": "MIT",
