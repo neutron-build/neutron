@@ -1335,9 +1335,12 @@ async function handleRequest(
       return { routeId: r.id, data: undefined, module };
     }
 
+    // Every loader in the chain gets the matched params, as in production
+    // (render-app-route); layouts got {} here, so a layout loader keyed on
+    // a param behaved differently in dev.
     const loaderArgs: LoaderArgs = {
       request,
-      params: r.id === route.id ? params : {},
+      params: { ...params },
       context,
     };
 
@@ -1938,8 +1941,11 @@ function wrapHtml(
   }
 
   const dataScript = `<script>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`;
+  // The not-found page names itself for the client router (F-P6-5; as
+  // core/render-app-route.ts buildHtmlSuffix).
+  const notFoundAttr = route.isNotFound ? ` data-neutron-not-found="${escapeHtml(route.id)}"` : "";
   const clientScript = clientEntry
-    ? `<script type="module" src="${clientEntry}"></script>`
+    ? `<script type="module" src="${clientEntry}"${notFoundAttr}></script>`
     : "";
 
   const htmlTag = buildHtmlOpenTag(seo?.htmlAttrs);

@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A loader's `notFound()` page hydrates as the not-found page (F-P6-5).**
+  After a page or layout loader's `notFound()` / `notFoundError()`, or a
+  static route's ungenerated param, the server answers with the app's
+  `not-found.tsx` (status 404), but the URL still matches the page. The
+  client router booted by URL, hydrated that page without its loader data
+  over the 404 markup, and showed the error boundary instead. The document
+  now names the not-found route it rendered on the client entry's script
+  tag (`data-neutron-not-found`, in `start`, the adapter runtimes, dev and a
+  prerendered `404.html`), and the router hydrates that route, so the page
+  is interactive and client navigation away from it works. A client
+  navigation that hits a loader 404 still loads the URL as a document,
+  which now lands on the hydrated not-found page; an unmatched path's 404
+  page is hydrated too (the router did not start there before). Apps that
+  stripped the entry script from 404 documents as a workaround can drop it.
+  Also, dev passed layout loaders `{}` for `params`: they now get the
+  matched params, as in `start`.
+
 ## [core 0.5.0, cli 0.5.0, create 0.1.11, auth 0.1.6, cache-redis 0.2.1, ops 0.1.5, otel 0.1.5, security 0.1.6] - 2026-10-31
 
 Upgrading from core/cli 0.4.x: read Breaking first; each entry has a

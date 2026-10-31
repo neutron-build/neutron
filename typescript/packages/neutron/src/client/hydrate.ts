@@ -253,7 +253,7 @@ export async function init(): Promise<"static" | void> {
   // client module to hydrate it with: the router does not start, and the
   // caller boots the document as a static page — islands only, as a
   // prerendered page that never loads this module would be.
-  const initialRoute = findRoute(getCurrentPath());
+  const initialRoute = renderedNotFoundRoute() ?? findRoute(getCurrentPath());
   if (initialRoute && [...getLayoutChain(initialRoute), initialRoute].some((r) => r.clientModule === false)) {
     initialized = false;
     return "static";
@@ -267,7 +267,7 @@ export async function init(): Promise<"static" | void> {
   const pathname = getCurrentPath();
   currentUrl = pathname + getCurrentSearch();
   
-  const route = findRoute(pathname);
+  const route = initialRoute;
   if (!route) {
     console.warn("No route found for", pathname);
     return;
@@ -358,6 +358,20 @@ async function handleIncomingDataUpdate(data: LoaderData): Promise<void> {
   applyData(data);
 }
 
+/**
+ * The not-found route the server rendered this document with (F-P6-5), named
+ * on the client entry's script tag (`data-neutron-not-found`). The URL alone
+ * cannot say: after a page or layout loader's `notFound()`, or a static
+ * route's ungenerated param, it still matches the page — which `findRoute`
+ * would hydrate without its data, over the 404 markup. Only the first
+ * document carries it; client navigation matches by URL.
+ */
+function renderedNotFoundRoute(): RouteInfo | null {
+  const id = document.querySelector("script[data-neutron-not-found]")?.getAttribute("data-neutron-not-found");
+  if (!id) return null;
+  return routes.find((route) => route.id === id && route.isNotFound) ?? null;
+}
+
 function findRoute(pathname: string): RouteInfo | null {
   for (const route of [...routes].sort((a, b) => comparePathSpecificity(a.path, b.path))) {
     if (route.isLayout || route.isNotFound) continue;
@@ -435,7 +449,7 @@ function hydrateApp(data: LoaderData) {
   
   const pathname = getCurrentPath();
   const search = getCurrentSearch();
-  const params = extractParams(currentRoute.path, pathname);
+  const params = routeParams(currentRoute, pathname);
   
   const actionData = data.__action__;
   const loaderData = { ...data };
@@ -648,8 +662,13 @@ function safeDecodeSegment(segment: string | undefined): string {
   }
 }
 
-function extractParams(pattern: string, pathname: string): Record<string, string> {
-  try { return bindPathParams(pattern, parseUrlPath(decodeURIComponent(pathname))) ?? {}; } catch { return {}; }
+function extractParams(pattern: string, pathname: string, prefix = false): Record<string, string> {
+  try { return bindPathParams(pattern, parseUrlPath(decodeURIComponent(pathname)), prefix) ?? {}; } catch { return {}; }
+}
+
+/** A not-found route's path is its scope, bound as a prefix (server: findNotFoundMatch). */
+function routeParams(route: RouteInfo, pathname: string): Record<string, string> {
+  return extractParams(route.path, pathname, route.isNotFound);
 }
 
 // Redirects followed in a row by the client router; reset by any navigation
@@ -872,7 +891,7 @@ function buildRouteSnapshots(
 ): RouteSnapshot[] {
   // Server layout loaders receive the full matched leaf params. Comparing
   // layout patterns exactly to a longer URL silently produces empty params.
-  const params = chain.length ? extractParams(chain[chain.length - 1].path, pathname) : {};
+  const params = chain.length ? routeParams(chain[chain.length - 1], pathname) : {};
   return chain.map(route => ({ id: route.id, params: { ...params } }));
 }
 

@@ -985,6 +985,150 @@ describe("hydrate — a not-found route never shadows the page it covers", () =>
   });
 });
 
+describe("hydrate — a document the server answered with its not-found page (F-P6-5)", () => {
+  beforeEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    window.history.replaceState(null, "", "/");
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // A loader's notFound() (page or layout), or a static route's ungenerated
+  // param: the URL matches a page, but the server rendered not-found.tsx.
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h, hooks } = deps;
+    return {
+      "route:/_layout": {
+        path: "/",
+        isLayout: true,
+        mode: "app",
+        default: function Layout({ children }: { children?: ComponentChildren }) {
+          const data = hooks.useRouteLoaderData<{ site: string }>("route:/_layout");
+          return h("main", null, h("nav", null, data?.site ?? "no-site"), children);
+        },
+      } as RouteReg,
+      "route:/items/:id": {
+        path: "/items/:id",
+        parentId: "route:/_layout",
+        mode: "app",
+        hasLoader: true,
+        default: function Item() {
+          // Without its loader data this page throws — the error boundary
+          // F-P6-5 showed in place of the 404.
+          const data = hooks.useLoaderData<{ item: { name: string } }>();
+          return h("p", { class: "title" }, `item ${data!.item.name}`);
+        },
+      },
+      "route:/home": {
+        path: "/home",
+        parentId: "route:/_layout",
+        mode: "app",
+        hasLoader: true,
+        default: () => h("p", { class: "title" }, "home"),
+      },
+      "route:/not-found": {
+        path: "/",
+        parentId: "route:/_layout",
+        mode: "app",
+        isNotFound: true,
+        default: () => h("p", { class: "title" }, "four oh four"),
+      },
+    };
+  }
+
+  function markNotFound(routeId: string): void {
+    const script = document.createElement("script");
+    script.setAttribute("data-neutron-not-found", routeId);
+    document.body.appendChild(script);
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 6; i++) await flush();
+  }
+
+  it("hydrates the not-found route the server rendered, not the page the URL matches", async () => {
+    const { app } = await bootRouter({
+      pathname: "/items/missing",
+      routeId: "route:/not-found",
+      data: { "route:/_layout": { site: "site-chrome" } },
+      routes,
+      beforeInit: () => markNotFound("route:/not-found"),
+    });
+
+    expect(app.textContent).toContain("four oh four");
+    expect(app.textContent).toContain("site-chrome");
+    expect(app.textContent).not.toContain("Something went wrong");
+    expect(window.__NEUTRON_ACTIVE_ROUTE_IDS__).toEqual(["route:/_layout", "route:/not-found"]);
+  });
+
+  it("navigates away from it client-side, and reloads into it on a later loader 404", async () => {
+    let anchor: HTMLAnchorElement | null = null;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).startsWith("/home")) return jsonResponse({ "route:/home": {} });
+      return jsonResponse(null, { ok: false, status: 404 } as Partial<Response>);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const reload = vi.spyOn(window.location, "reload").mockImplementation(() => {});
+
+    const { app } = await bootRouter({
+      pathname: "/items/missing",
+      routeId: "route:/not-found",
+      data: { "route:/_layout": { site: "site-chrome" } },
+      routes,
+      beforeInit: () => {
+        markNotFound("route:/not-found");
+        anchor = addAnchor("/home");
+      },
+    });
+
+    expect(clickAnchor(anchor!)).toBe(false);
+    await settle();
+    expect(window.location.pathname).toBe("/home");
+    expect(app.querySelector(".title")?.textContent).toBe("home");
+    expect(app.textContent).toContain("site-chrome");
+    expect(window.__NEUTRON_ACTIVE_ROUTE_IDS__).toEqual(["route:/_layout", "route:/home"]);
+    expect(reload).not.toHaveBeenCalled();
+
+    // The data request for a loader 404 answers non-OK: the router loads the
+    // URL as a document, which the server answers with the not-found page
+    // (the case the first test boots).
+    const { navigate } = await import("./navigate.js");
+    navigate("/items/other");
+    await settle();
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(app.textContent).not.toContain("Something went wrong");
+  });
+
+  it("ignores a marker naming no registered not-found route", async () => {
+    const { app } = await bootRouter({
+      pathname: "/home",
+      routeId: "route:/home",
+      data: { "route:/_layout": { site: "site-chrome" }, "route:/home": {} },
+      routes,
+      beforeInit: () => markNotFound("route:/home"),
+    });
+    expect(app.querySelector(".title")?.textContent).toBe("home");
+    expect(window.__NEUTRON_ACTIVE_ROUTE_IDS__).toEqual(["route:/_layout", "route:/home"]);
+  });
+});
+
 describe("hydrate — static-tier page in an app (no client module)", () => {
   beforeEach(() => {
     // The suite above boots without cleanup: drop its click interceptor.

@@ -74,6 +74,25 @@ export async function loader({ params }) {
 }
 export default function Item({ data }) { return h("p", null, "item " + data.id); }
 `,
+  "src/routes/shops/[shop]/_layout.tsx": `
+import { h } from "preact";
+import { notFound } from "@neutron-build/core";
+export const config = { mode: "app" };
+export async function loader({ params }) {
+  if (params.shop === "closed") throw notFound();
+  return { shop: params.shop };
+}
+export default function Shop({ data, children }) { return h("section", null, "shop " + data.shop, children); }
+`,
+  "src/routes/shops/[shop]/index.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export default function ShopHome() { return h("p", null, "shop home"); }
+`,
+  // A client entry, so documents carry the entry script: src/main.tsx in
+  // dev, the build's entry metadata in start.
+  "src/main.tsx": "export {};\n",
+  "dist/.neutron-client-entry.json": JSON.stringify({ src: "/assets/entry.js" }),
   // What `neutron-ts build` writes for the static route: only the listed id.
   "dist/models/known/index.html": "<!doctype html><html><body><p>model known (prebuilt)</p></body></html>",
 };
@@ -142,6 +161,10 @@ async function expectNotFoundPage(base: string, pathname: string): Promise<Respo
   expect(body, pathname).toContain("custom-missing");
   expect(body, pathname).toContain("site-chrome");
   expect(body, pathname).toContain("<title>Missing page</title>");
+  // F-P6-5: the document names the not-found route it rendered, on the
+  // client entry, so the router hydrates that route and not the page the
+  // URL matches.
+  expect(body, pathname).toMatch(/<script type="module"[^>]* data-neutron-not-found="route:not-found\.tsx"[^>]*><\/script>/);
   return response;
 }
 
@@ -162,6 +185,8 @@ for (const [label, boot] of [["start (Vite runtime)", bootStart], ["dev", bootDe
       expect(thrown.headers.get("set-cookie")).toContain("seen=1");
       await expectNotFoundPage(base, "/items/returned");
       await expectNotFoundPage(base, "/items/problem");
+      // A layout loader's notFound() answers the same way.
+      await expectNotFoundPage(base, "/shops/closed");
 
       // A 404 Response of the loader's own making is sent as written.
       const custom = await fetch(`${base}/items/custom`, { headers: html });
@@ -170,10 +195,25 @@ for (const [label, boot] of [["start (Vite runtime)", bootStart], ["dev", bootDe
 
       const ok = await fetch(`${base}/items/present`, { headers: html });
       expect(ok.status).toBe(200);
-      expect(await ok.text()).toContain("item present");
+      const okBody = await ok.text();
+      expect(okBody).toContain("item present");
+      // Only a not-found render is marked.
+      expect(okBody).not.toContain("data-neutron-not-found");
+      const shop = await fetch(`${base}/shops/open`, { headers: html });
+      expect(shop.status).toBe(200);
+      const shopBody = await shop.text();
+      expect(shopBody).toContain("shop home");
+      expect(shopBody).not.toContain("data-neutron-not-found");
     });
   });
 }
+
+describe("app not-found page for an unmatched path — start", () => {
+  it("names the not-found route too", { timeout: 60_000 }, async () => {
+    const base = await bootStart();
+    await expectNotFoundPage(base, "/nowhere/at/all");
+  });
+});
 
 describe("app not-found page for page 404s — start, data requests", () => {
   it("keeps the loader's 404 for a client-navigation data request", { timeout: 60_000 }, async () => {

@@ -1112,7 +1112,8 @@ export async function build(): Promise<void> {
         headHtml,
         stylesheetsFor(route),
         islandsEntryScriptSrc,
-        seo
+        seo,
+        route.isNotFound ? route.id : undefined
       );
 
       const outPath = route.isNotFound
@@ -1229,7 +1230,8 @@ function wrapHtml(
   headHtml: string = renderDocumentHead(routePath, null),
   cssFiles: string[] = [],
   islandsEntryScriptSrc: string | null = null,
-  seo: SeoMetaInput | null = null
+  seo: SeoMetaInput | null = null,
+  notFoundRouteId?: string
 ): string {
   // Detect islands in content — only load client runtime if interactive islands exist
   const hasIslands = content.includes("<neutron-island");
@@ -1237,8 +1239,12 @@ function wrapHtml(
   // chunks) over the full 34KB SPA runtime. Fall back to the SPA runtime only
   // if no islands entry was emitted.
   const islandScriptSrc = islandsEntryScriptSrc || clientEntryScriptSrc;
+  // A 404.html answers URLs that may match a page (a static route's
+  // ungenerated param): it names its not-found route, so a client router
+  // loaded here hydrates that route rather than the page (F-P6-5).
+  const notFoundAttr = notFoundRouteId ? ` data-neutron-not-found="${escapeHtml(notFoundRouteId)}"` : "";
   const clientScript = hasIslands && islandScriptSrc
-    ? `<script type="module" src="${escapeHtml(islandScriptSrc)}"></script>`
+    ? `<script type="module" src="${escapeHtml(islandScriptSrc)}"${notFoundAttr}></script>`
     : "";
 
   const cssLinks = cssFiles
