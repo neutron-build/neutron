@@ -48,11 +48,6 @@ const S_GEN: u64 = 10;
 /// round's checkpoints actually reach).
 const S_HOOK: u64 = 11;
 
-/// X5-R16 NEVER-FIRED: does the per-index hook mask carry `hook`?
-fn ckpt_hook_reached(hook: crate::store::ckpt::CkptHook, mask: u16) -> bool {
-    crate::store::ckpt::hook_bit(hook) & mask != 0
-}
-
 /// The per-seed knobs (card Work 5.1, sized against the ≤ 20 min
 /// campaign budget of 5.3 — per-seed work shrinks, never the seed count).
 #[derive(Debug, Clone)]
@@ -469,6 +464,68 @@ fn value_of(rng: &mut Rng, lo: u64) -> Vec<u8> {
     v
 }
 
+/// X5-R16 NEVER-FIRED: derive a crash spec that the round's checkpoints
+/// actually reach, from the per-index hook masks of a round that ran its
+/// workload to completion (an unfired attempt — its checkpoints all
+/// completed, so the masks are complete). Keeps the drawn hook, moving
+/// its index to one that reaches it (the drawn index if it does, else
+/// the smallest); when the drawn hook is unreachable at every index
+/// (seed 660 round 0's shape: the tiny pool's evictor wrote every dirty
+/// page, so step 2 of every checkpoint wrote nothing and `Mid2` never
+/// fired — "its step 2 has too little to write"), falls to a hook the
+/// round does reach, drawn deterministically from `(seed, round)` over
+/// the union mask — the same adaptation the uniform draw makes to the
+/// counted yield total. The workload itself is untouched (no retune:
+/// X5-R17 is X-5c-F2's).
+pub fn reachable_hook_spec(
+    masks: &[u16],
+    hook: crate::store::ckpt::CkptHook,
+    drawn_idx: u64,
+    seed: u64,
+    round: u32,
+) -> (u64, crate::store::ckpt::CkptHook) {
+    let bit = crate::store::ckpt::hook_bit(hook);
+    let reached: Vec<u64> = masks
+        .iter()
+        .enumerate()
+        .filter(|(_, mask)| *mask & bit != 0)
+        .map(|(i, _)| i as u64)
+        .collect();
+    if let Some(first) = reached.first() {
+        let idx = if reached.contains(&drawn_idx) {
+            drawn_idx
+        } else {
+            *first
+        };
+        (idx, hook)
+    } else {
+        let union: u16 = masks.iter().fold(0u16, |a, m| a | m);
+        let mut hrng = Rng::new(derive(seed * 13 + round as u64, S_HOOK));
+        let mut pick = hook;
+        let mut left = 1 + hrng.below(10);
+        while left > 0 {
+            // Walk the reached hooks in `CKPT_HOOKS` order, `left`
+            // steps: deterministic, and lands on a reached hook (a
+            // completed checkpoint always reaches `Before0`).
+            for cand in crate::store::ckpt::CKPT_HOOKS {
+                if crate::store::ckpt::hook_bit(cand) & union != 0 {
+                    pick = cand;
+                    left -= 1;
+                    if left == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        let idx = masks
+            .iter()
+            .position(|m| crate::store::ckpt::hook_bit(pick) & *m != 0)
+            .map(|i| i as u64)
+            .unwrap_or(drawn_idx);
+        (idx, pick)
+    }
+}
+
 /// The round's crash point (5.5): targeted at hook
 /// `CKPT_HOOKS[(seed/20) % 10]` of a seeded checkpoint when
 /// `(seed/10) % 2 == 0`, else uniform over the round's yield points.
@@ -846,7 +903,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         // the fired-guard failed the seed ("the crash spec never
         // fired") — a harness defect, never a pass.
         let uniform = (seed / 10) % 2 == 1;
-        let (script_twin, script_real, crash_desc);
+        let (script_twin, mut script_real, mut crash_desc);
         if uniform {
             let probe = Script {
                 crash: None,
@@ -884,109 +941,24 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             };
             crash_desc = format!("uniform@y:{k}");
         } else {
-            let probe = Script {
-                crash: None,
-                nested: Vec::new(),
-                ..base.clone()
-            };
-            let out = harness::run_round(
-                seed,
-                round,
-                &probe,
-                &RoundFaults {
-                    class: FaultClass::C,
-                    knobs: knobs.fault,
-                    directed: Vec::new(),
-                    no_r_taint: false,
-                    media: MediaDraw::None,
-                    twin_supply: None,
-                    nested_draw: 0,
-                    probe_pass: true,
-                },
-                cfg.clone(),
-                ch.disk.clone(),
-                ch.st.clone(),
-                &ch.model,
-                ch.cut,
-                None,
-            );
-            let (hook, drawn_idx) = match base.crash.as_ref() {
-                Some(CrashSpec::Hook { ckpt_index, hook }) => (*hook, *ckpt_index),
-                _ => (crate::store::ckpt::CkptHook::Before0, 0),
-            };
-            let bit = crate::store::ckpt::hook_bit(hook);
-            let reached: Vec<u64> = out
-                .obs
-                .ckpt_hooks_hit
-                .iter()
-                .enumerate()
-                .filter(|(_, mask)| *mask & bit != 0)
-                .map(|(i, _)| i as u64)
-                .collect();
-            let (chosen, chosen_hook) = if let Some(first) = reached.first() {
-                // The drawn index if it reaches the drawn hook, else
-                // the smallest index that does.
-                let idx = if reached.contains(&drawn_idx) {
-                    drawn_idx
-                } else {
-                    *first
-                };
-                (idx, hook)
-            } else {
-                // **The drawn hook is unreachable in this round** (seed
-                // 660 round 0's shape: the tiny pool's evictor wrote
-                // every dirty page itself, so every checkpoint's step 2
-                // wrote nothing and `Mid2` never fired — "its step 2
-                // has too little to write"). The draw then falls to a
-                // hook the round's checkpoints DO reach, drawn
-                // deterministically from `(seed, round)` over the
-                // union mask — the same adaptation the uniform draw
-                // makes to the counted yield total. The workload
-                // itself is untouched (no retune: X5-R17 is X-5c-F2's).
-                let union: u16 = out.obs.ckpt_hooks_hit.iter().fold(0u16, |a, m| a | m);
-                let mut hrng = Rng::new(derive(seed * 13 + round as u64, S_HOOK));
-                let mut pick = hook;
-                let mut left = 1 + hrng.below(10);
-                while left > 0 {
-                    // Walk the reached hooks in `CKPT_HOOKS` order,
-                    // `left` steps: deterministic, and lands on a
-                    // reached hook (a completed checkpoint always
-                    // reaches `Before0`).
-                    for cand in crate::store::ckpt::CKPT_HOOKS {
-                        if ckpt_hook_reached(cand, union) {
-                            pick = cand;
-                            left -= 1;
-                            if left == 0 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let idx = out
-                    .obs
-                    .ckpt_hooks_hit
-                    .iter()
-                    .position(|m| ckpt_hook_reached(pick, *m))
-                    .map(|i| i as u64)
-                    .unwrap_or(drawn_idx);
-                (idx, pick)
-            };
+            // **X5-R16 NEVER-FIRED, the cheap form (P ruling
+            // nv3-X-5c-esc-3): no probe pass.** The drawn spec runs
+            // (the twin first for MP/MW — Work 2.5 pairs their crash
+            // points — the real round itself for class C); if it fires
+            // (the overwhelming majority of rounds) nothing extra
+            // happens. If it does not, the failed attempt's own
+            // observables carry the **complete** hook masks (an
+            // unfired crash means the workload ran to completion, so
+            // every checkpoint completed) and the round re-runs with
+            // [`reachable_hook_spec`]'s draw. Deterministic: the fired
+            // flag, the masks and the re-run are all functions of
+            // `(seed, mutant)`.
             script_twin = Script {
-                crash: Some(CrashSpec::Hook {
-                    ckpt_index: chosen,
-                    hook: chosen_hook,
-                }),
                 nested: Vec::new(),
                 ..base.clone()
             };
-            script_real = Script {
-                crash: Some(CrashSpec::Hook {
-                    ckpt_index: chosen,
-                    hook: chosen_hook,
-                }),
-                ..base
-            };
-            crash_desc = format!("{chosen_hook:?}@{chosen}");
+            script_real = base;
+            crash_desc = _crash_desc;
         }
         let mut supply = None;
         let mut twin_points = Vec::new();
@@ -1012,6 +984,14 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 cut: ch.cut,
             });
         }
+        // The targeted draw of a class C round retries on its own
+        // (no twin exists); keep the round's start for the re-run.
+        let mut ch_retry = (!uniform && class == FaultClass::C).then(|| Chain {
+            disk: ch.disk.clone(),
+            st: ch.st.clone(),
+            model: harness::clone_model(&ch.model),
+            cut: ch.cut,
+        });
         if let Some(tch) = twin_chain.take() {
             let tf = RoundFaults {
                 class: FaultClass::C,
@@ -1023,19 +1003,85 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 nested_draw: nested_draw_for(seed, round),
                 probe_pass: false,
             };
-            let mut reads = Vec::new();
-            let out = harness::run_round(
-                seed,
-                round,
-                &script_twin,
-                &tf,
-                cfg.clone(),
-                tch.disk,
-                tch.st,
-                &tch.model,
-                tch.cut,
-                Some(&mut reads),
-            );
+            // The twin's start, kept for a NEVER-FIRED re-run (the
+            // first attempt consumes the chain's parts).
+            let tch_retry = Chain {
+                disk: tch.disk.clone(),
+                st: tch.st.clone(),
+                model: harness::clone_model(&tch.model),
+                cut: tch.cut,
+            };
+            let mut script_twin_run = script_twin.clone();
+            let mut out = {
+                let mut reads = Vec::new();
+                let out = harness::run_round(
+                    seed,
+                    round,
+                    &script_twin_run,
+                    &tf,
+                    cfg.clone(),
+                    tch.disk,
+                    tch.st,
+                    &tch.model,
+                    tch.cut,
+                    Some(&mut reads),
+                );
+                (out, reads)
+            };
+            // **X5-R16 NEVER-FIRED**: a targeted twin whose crash never
+            // fired re-derives the spec from its own complete masks and
+            // re-runs; the failed attempt is discarded (its outcome
+            // would trip the fired-guard for a crash point no checkpoint
+            // reaches — a harness defect, never a pass).
+            if !uniform
+                && !out.0.obs.crash_fired
+                && let Some(CrashSpec::Hook { ckpt_index, hook }) = script_twin_run.crash
+            {
+                let (idx2, hook2) =
+                    reachable_hook_spec(&out.0.obs.ckpt_hooks_hit, hook, ckpt_index, seed, round);
+                script_twin_run = Script {
+                    crash: Some(CrashSpec::Hook {
+                        ckpt_index: idx2,
+                        hook: hook2,
+                    }),
+                    nested: Vec::new(),
+                    ..script_twin_run
+                };
+                // The real round follows the twin's fixed spec (Work
+                // 2.5: the same crash point).
+                script_real = Script {
+                    crash: Some(CrashSpec::Hook {
+                        ckpt_index: idx2,
+                        hook: hook2,
+                    }),
+                    ..script_real
+                };
+                crash_desc = format!("{hook2:?}@{idx2}");
+                let mut reads = Vec::new();
+                out = {
+                    let o = harness::run_round(
+                        seed,
+                        round,
+                        &script_twin_run,
+                        &tf,
+                        cfg.clone(),
+                        tch_retry.disk,
+                        tch_retry.st,
+                        &tch_retry.model,
+                        tch_retry.cut,
+                        Some(&mut reads),
+                    );
+                    (o, reads)
+                };
+            } else if !uniform {
+                crash_desc = match script_twin_run.crash {
+                    Some(CrashSpec::Hook { ckpt_index, hook }) => {
+                        format!("{hook:?}@{ckpt_index}")
+                    }
+                    _ => crash_desc,
+                };
+            }
+            let (out, reads) = out;
             if let Some(d) = crash_fired_defect(&out, &crash_desc)
                 && rec.defect.is_none()
             {
@@ -1087,7 +1133,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             },
             probe_pass: false,
         };
-        let out = harness::run_round(
+        let mut out = harness::run_round(
             seed,
             round,
             &script,
@@ -1099,6 +1145,46 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             ch.cut,
             None,
         );
+        // **X5-R16 NEVER-FIRED, the class C half** (no twin exists to
+        // carry the drawn spec first): a targeted round whose crash
+        // never fired re-derives the spec from its own complete masks
+        // and re-runs from the same start; the failed attempt is
+        // discarded (the fired-guard never records it).
+        if let (Some(retry), false, true, Some(crash)) = (
+            ch_retry.take(),
+            out.obs.crash_fired,
+            !uniform,
+            script.crash.clone(),
+        ) {
+            if let CrashSpec::Hook { ckpt_index, hook } = crash {
+                let (idx2, hook2) =
+                    reachable_hook_spec(&out.obs.ckpt_hooks_hit, hook, ckpt_index, seed, round);
+                let script2 = Script {
+                    crash: Some(CrashSpec::Hook {
+                        ckpt_index: idx2,
+                        hook: hook2,
+                    }),
+                    ..script
+                };
+                crash_desc = format!("{hook2:?}@{idx2}");
+                out = harness::run_round(
+                    seed,
+                    round,
+                    &script2,
+                    &faults,
+                    cfg.clone(),
+                    retry.disk,
+                    retry.st,
+                    &retry.model,
+                    retry.cut,
+                    None,
+                );
+            }
+        } else if !uniform {
+            if let Some(CrashSpec::Hook { ckpt_index, hook }) = script.crash {
+                crash_desc = format!("{hook:?}@{ckpt_index}");
+            }
+        }
 
         if let Some(d) = crash_fired_defect(&out, &crash_desc)
             && rec.defect.is_none()
