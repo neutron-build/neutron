@@ -132,6 +132,10 @@ pub struct SchedCore {
     /// Trace of `(yield_count, picked_task)` handoffs, for the determinism
     /// self-test and diagnosis; bounded so long rounds stay cheap.
     pub trace: Vec<(u64, TaskId)>,
+    /// Per-task yield counts (diagnosis only, X5-R13 (b)): which tasks
+    /// were spinning when the budget tripped. Never a record or a digest
+    /// input.
+    pub yld_per_task: Vec<u64>,
 }
 
 impl SchedCore {
@@ -157,6 +161,7 @@ impl SchedCore {
             livelock_site: "",
             livelock_parked: Vec::new(),
             trace: Vec::new(),
+            yld_per_task: vec![0; ntasks],
         }
     }
 }
@@ -329,6 +334,9 @@ impl<H: SchedHost> Sched<H> {
                 return Err(SimFail::Crashed);
             }
             core.yields += 1;
+            if let Some(y) = core.yld_per_task.get_mut(me) {
+                *y += 1;
+            }
             if let Some(t) = core.crash_at_yield
                 && t == core.yields
             {

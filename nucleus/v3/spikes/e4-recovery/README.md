@@ -344,16 +344,28 @@ the worker landed (a) with this copy in the same commit, before the next
     holds; the DEADLOCK/livelock half described the pre-(b) behavior
     (the hang P measured was the counting pass, which never
     terminated without a budget).
-- **Seed 148, root-caused (same class, confirmed after the fix
-  pending):** round 1 livelocked at `h:evictor` with a pre-trip park
-  table of **all tasks runnable** (the sched's trip snapshot,
-  `RoundOutcome.livelock_parked`) — the GC-task loop shape of seed 36
-  with the service tasks spinning behind it, plus a recovery-`Err`
-  round whose recorded O-1 text is the frozen oracle's Err-branch
-  default (an empty published set compared against the model — the
-  pass fold ignores O-1 for a recovery `Err` in MP; the round fails
-  through the deadlock fold). The gc fix is expected to clear it; the
-  campaign confirms.
+- **Seed 148, root-caused to its class (unresolved key → the budget
+  valve):** round 1 livelocks at `h:evictor` with the pre-trip park
+  table showing **every task runnable** — but the per-task yield
+  counters added for the diagnosis tell the real story:
+  `yields=[0, 16, 123, 20, 274, 86, 333778, 332263, 333441]` — the
+  three **service tasks** (writer, evictor, checkpointer) burn ~333k
+  yields each spinning for `workload_done`, while all five script
+  tasks are stuck with almost no yields: parked on conditions that
+  never arrive (the runnable park-table entries are the wake-storm
+  microstate — the spinners' wakes flip them; a single snapshot
+  cannot name the key). This is a **real deadlock hidden behind the
+  service spins**, exactly P's seed-148 diagnosis ("the checkpointer
+  spins at h:ckpt waiting for workload_done"): the spin masks the
+  DEADLOCK detector, the budget bounds it, and the seed fails as
+  DEADLOCK/livelock. The specific stuck wait is not yet identified
+  (the gc fix did not clear it — 148 still fails after it); the
+  deterministic repro is `run --seeds 148..149` (round 1, ~30 s).
+  Recorded here for the next attempt; X5-R12's budget valve applies.
+  The round's recovery-`Err` O-1 text ("published {} != model {2, 3,
+  4}") is the frozen oracle's Err-branch default (the pass fold
+  ignores O-1 for a recovery `Err` in MP; the round fails through the
+  deadlock fold).
 - **X5-R10** (commit 9488e1ed): `recover` restarts at the frontier
   (`visible_ts := frontier`, `next_ts := frontier + 1`, `applied`
   cleared); the model-commit guard makes a held-ts commit a loud
