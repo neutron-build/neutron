@@ -12,7 +12,7 @@ declare module "@neutron-build/core" {
     | "/desktop"
     | "/docs"
     | `/docs/${string}`
-    | `/docs/${string}`
+    | `/docs/${string}.md`
     | "/elixir"
     | "/go"
     | "/julia"
