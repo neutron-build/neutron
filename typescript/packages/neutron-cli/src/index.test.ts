@@ -3112,3 +3112,74 @@ export default function Item({ data }) { return h("p", null, "item " + data.id);
     }
   });
 });
+
+describe("neutron-ts build + start (process): index.html head in documents (F-P6-1)", () => {
+  it("records the built index.html head and renders it in prerendered and server-bundle pages", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "document-head-fixture", type: "module" }),
+      "index.html": `<!doctype html><html lang="en"><head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="white" />
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0a0a0a" />
+<meta name="google-site-verification" content="%VITE_SITE_VERIFICATION%" />
+<title>Fylun</title>
+</head><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>
+`,
+      ".env": "VITE_SITE_VERIFICATION=g-token\n",
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/index.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export function head() { return { title: "Home", themeColor: "#123456" }; }
+export default function Home() { return h("p", null, "home-page"); }
+`,
+      "src/routes/about.tsx": `
+import { h } from "preact";
+export function head() { return { openGraph: { siteName: "Fylun", locale: "en_US" } }; }
+export default function About() { return h("p", null, "about-page"); }
+`,
+    });
+    const headOf = (html: string) => /<head>([\s\S]*?)<\/head>/.exec(html)?.[1] ?? "";
+    const count = (html: string, pattern: RegExp) => html.match(pattern)?.length ?? 0;
+    try {
+      await runBuild(dir);
+      const recorded = fs.readFileSync(path.join(dir, "dist", ".neutron-document-head.json"), "utf-8");
+      // From the built index.html: Vite replaced the %ENV% placeholder.
+      assert.ok(recorded.includes("g-token") && !recorded.includes("%VITE_"), recorded);
+      assert.ok(!recorded.includes("<script"), recorded);
+
+      const about = headOf(fs.readFileSync(path.join(dir, "dist", "about", "index.html"), "utf-8"));
+      assert.equal(count(about, /name="viewport"/g), 1, about);
+      assert.ok(about.includes("interactive-widget=resizes-content"), about);
+      assert.equal(count(about, /name="theme-color"/g), 2, about);
+      assert.ok(about.includes('content="g-token"'), about);
+      assert.ok(about.includes("<title>Fylun</title>"), about);
+      assert.ok(about.includes('<meta property="og:site_name" content="Fylun">'), about);
+      assert.ok(about.includes('<meta property="og:locale" content="en_US">'), about);
+
+      const port = await freePort();
+      const start = runCli("start", dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, start);
+        assert.match(start.output(), /Modules: prebuilt server bundle/, start.output());
+        const home = headOf(await (await fetch(`http://127.0.0.1:${port}/`, { headers: { accept: "text/html" } })).text());
+        assert.equal(count(home, /<title>/g), 1, home);
+        assert.ok(home.includes("<title>Home</title>"), home);
+        assert.equal(count(home, /name="theme-color"/g), 1, home);
+        assert.ok(home.includes('<meta name="theme-color" content="#123456">'), home);
+        assert.ok(home.includes("interactive-widget=resizes-content"), home);
+        assert.ok(home.includes('content="g-token"'), home);
+      } finally {
+        start.child.kill("SIGTERM");
+        await start.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

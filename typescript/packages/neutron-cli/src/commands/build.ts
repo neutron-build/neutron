@@ -50,6 +50,7 @@ import type {
   HeadersArgs,
   HeadArgs,
   SeoMetaInput,
+  DocumentHeadTag,
   GetStaticPathsResult,
 } from "@neutron-build/core";
 import { renderToString } from "preact-render-to-string";
@@ -79,6 +80,9 @@ import {
   ROUTE_CSS_MANIFEST_FORMAT,
   collectChunkCss,
   collectDynamicChunkCss,
+  DOCUMENT_HEAD_FILE,
+  extractDocumentHead,
+  serializeDocumentHead,
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
@@ -439,6 +443,20 @@ export async function build(): Promise<void> {
   };
   if (publicSource) recordPublicSource(publicSource);
 
+  // index.html's head for server-rendered documents (core document-head.ts):
+  // read from the built dist/index.html (Vite replaced %ENV% placeholders and
+  // asset URLs there) before a prerendered "/" overwrites it, else from the
+  // source index.html (a static-only build runs no client HTML build).
+  const documentHead = (() => {
+    const built = path.join(outputDir, "index.html");
+    const source = path.join(cwd, "index.html");
+    const file = fs.existsSync(built) ? built : fs.existsSync(source) ? source : null;
+    return file ? extractDocumentHead(fs.readFileSync(file, "utf-8")) : [];
+  })();
+  if (documentHead.length > 0) {
+    fs.writeFileSync(path.join(outputDir, DOCUMENT_HEAD_FILE), serializeDocumentHead(documentHead));
+  }
+
   // Only the app client build produces a client entry. The static CSS pass's
   // manifest also names a JS entry, but that file is deleted right after it is
   // built, so recording it pointed pages at a 404.
@@ -530,6 +548,7 @@ export async function build(): Promise<void> {
     clientEntryScriptSrc,
     clientCssFiles,
     routeCss,
+    documentHead,
     serverActions,
     serverActionsOptions: neutronConfig.server?.serverActions,
     securityHeaders: neutronConfig.server?.securityHeaders,
@@ -762,7 +781,7 @@ export async function build(): Promise<void> {
     }
 
     return {
-      headHtml: renderDocumentHead(pathname, mergedSeo, headFragments),
+      headHtml: renderDocumentHead(pathname, mergedSeo, headFragments, undefined, documentHead),
       seo: mergedSeo,
     };
   }
@@ -1486,6 +1505,7 @@ interface RuntimeBundleBuilderOptions {
   clientEntryScriptSrc: string | null;
   clientCssFiles: string[];
   routeCss: RouteCssManifest | null;
+  documentHead: DocumentHeadTag[];
   serverActions: ServerActionsManifest | null;
   serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] };
   securityHeaders?: false | { headers?: Record<string, string> };
@@ -1634,7 +1654,8 @@ async function buildRuntimeBundle(
       options.serverActions,
       options.serverActionsOptions,
       options.securityHeaders,
-      findServerEntryFile(options.cwd)
+      findServerEntryFile(options.cwd),
+      options.documentHead
     ),
     "utf-8"
   );
@@ -2200,7 +2221,8 @@ export function generateRuntimeEntrySource(
   serverActions?: ServerActionsManifest | null,
   serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] },
   securityHeaders?: false | { headers?: Record<string, string> },
-  serverEntryPath?: string | null
+  serverEntryPath?: string | null,
+  documentHead: DocumentHeadTag[] = []
 ): string {
   const imports: string[] = [];
   const moduleEntries: string[] = [];
@@ -2315,6 +2337,7 @@ const SERVER_ACTIONS_OPTIONS = ${JSON.stringify({
   })};
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
+const DOCUMENT_HEAD = ${JSON.stringify(documentHead)};
 const CLIENT_STYLESHEET_HREFS = ${JSON.stringify(clientCssFiles)};
 const ROUTE_CSS = ${JSON.stringify(routeCss)};
 const ROUTE_RULES = compileRouteRules(${routeRulesJson});
@@ -2399,6 +2422,7 @@ async function handleRouteRequest(request, requestUrl, pathname, globalChainRan)
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
       stylesheetHrefs: routeStylesheetHrefs(ROUTE_CSS, match.route.id, CLIENT_STYLESHEET_HREFS),
       lazyStylesheetHrefs: routeLazyStylesheetHrefs(ROUTE_CSS, match.route.id),
+      documentHead: DOCUMENT_HEAD,
       loaderDataCache: LOADER_DATA_CACHE,
       loaderCacheFence: { generation, stillValid: () => true },
       requestTrace: {

@@ -28,15 +28,57 @@ export interface SeoMetaInput {
    */
   defaultTitle?: string;
   description?: string;
+  /** Emitted exactly as given (`https://example.com` stays without a slash). */
   canonical?: string;
+  /**
+   * `<meta name="robots" content="noindex">`. Shorthand for
+   * `robots: { index: false }`; `robots` wins when one head() sets both, and
+   * a route's either one replaces its layout's.
+   */
   noindex?: boolean;
+  /**
+   * `<meta name="robots">`: a string is sent as written; the object form
+   * (Next's `robots`) lists what is set, in this order —
+   * `{ index: true, follow: true }` → `index, follow`.
+   */
+  robots?: string | SeoRobots;
   keywords?: string[];
+  /**
+   * `<meta name="viewport">`, replacing the framework default
+   * (`width=device-width, initial-scale=1.0`). A string is sent as written;
+   * the object form is Next's `viewport` export.
+   * @example viewport: { width: "device-width", initialScale: 1, interactiveWidget: "resizes-content" }
+   */
+  viewport?: string | SeoViewport;
+  /**
+   * `<meta name="theme-color">`: one color, or one tag per entry with its
+   * `media` (Next's `themeColor`).
+   * @example themeColor: [{ media: "(prefers-color-scheme: light)", color: "white" }, { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" }]
+   */
+  themeColor?: string | SeoThemeColor | Array<string | SeoThemeColor>;
+  /** `<meta name="author">` per name, `<link rel="author">` per url (Next's `authors`). */
+  authors?: SeoAuthor | SeoAuthor[];
+  /** `<meta name="creator">`. */
+  creator?: string;
+  /**
+   * Site-ownership verification tags (Next's `verification`):
+   * `google` → `google-site-verification`, `yandex` → `yandex-verification`,
+   * `yahoo` → `y_key`, `me` → `me`, `other` → its own names.
+   */
+  verification?: SeoVerification;
   openGraph?: {
     title?: string;
     description?: string;
+    /** One image URL; `images` takes over when both are set. */
     image?: string;
+    /** og:image, each with its og:image:width/height/type/alt (Next's `openGraph.images`). */
+    images?: string | SeoOpenGraphImage | Array<string | SeoOpenGraphImage>;
     type?: string;
     url?: string;
+    /** og:locale, e.g. `en_US`. */
+    locale?: string;
+    /** og:site_name. */
+    siteName?: string;
   };
   twitter?: {
     card?: "summary" | "summary_large_image";
@@ -54,11 +96,73 @@ export interface SeoMetaInput {
    * @example link: { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }
    */
   link?: Record<string, string> | Record<string, string>[];
+  /**
+   * Any other <meta> tag, attributes escaped. An entry replaces every tag of
+   * its key (`name`, `property` or `httpEquiv`) the fields above would emit,
+   * and a route's entries replace its layouts' for the same key.
+   * @example meta: [{ name: "format-detection", content: "telephone=no" }, { httpEquiv: "x-ua-compatible", content: "IE=edge" }]
+   */
+  meta?: SeoMetaTag | SeoMetaTag[];
   /** Attributes to set on the <html> element. lang defaults to "en" if not specified. */
   htmlAttrs?: Record<string, string>;
   /** Attributes to set on the <body> element. */
   bodyAttrs?: Record<string, string>;
 }
+
+export interface SeoRobots {
+  index?: boolean;
+  follow?: boolean;
+  noarchive?: boolean;
+  nosnippet?: boolean;
+  noimageindex?: boolean;
+  nocache?: boolean;
+}
+
+export interface SeoViewport {
+  width?: string | number;
+  height?: string | number;
+  initialScale?: number;
+  minimumScale?: number;
+  maximumScale?: number;
+  userScalable?: boolean;
+  viewportFit?: "auto" | "cover" | "contain";
+  interactiveWidget?: "resizes-visual" | "resizes-content" | "overlays-content";
+}
+
+export interface SeoThemeColor {
+  color: string;
+  media?: string;
+}
+
+export interface SeoAuthor {
+  name?: string;
+  url?: string;
+}
+
+export interface SeoVerification {
+  google?: string | string[];
+  yandex?: string | string[];
+  yahoo?: string | string[];
+  me?: string | string[];
+  other?: Record<string, string | string[]>;
+}
+
+export interface SeoOpenGraphImage {
+  url: string;
+  width?: number | string;
+  height?: number | string;
+  type?: string;
+  alt?: string;
+}
+
+export type SeoMetaTag = {
+  content: string;
+  media?: string;
+} & (
+  | { name: string; property?: never; httpEquiv?: never }
+  | { property: string; name?: never; httpEquiv?: never }
+  | { httpEquiv: string; name?: never; property?: never }
+);
 
 export type SeoTag =
   | { tag: "title"; content: string }
@@ -76,6 +180,11 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
     tags.push({ tag: "title", content: resolvedTitle });
   }
 
+  const viewport = renderViewport(input.viewport);
+  if (viewport) {
+    tags.push({ tag: "meta", attrs: { name: "viewport", content: viewport } });
+  }
+
   if (input.description) {
     tags.push({ tag: "meta", attrs: { name: "description", content: input.description } });
   }
@@ -87,8 +196,41 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
     });
   }
 
+  for (const author of toList(input.authors)) {
+    pushMeta(tags, "name", "author", author.name);
+  }
+  pushMeta(tags, "name", "creator", input.creator);
+
+  for (const entry of toList(input.themeColor)) {
+    const { color, media } = typeof entry === "string" ? { color: entry, media: undefined } : entry;
+    if (color) {
+      tags.push({ tag: "meta", attrs: media ? { name: "theme-color", media, content: color } : { name: "theme-color", content: color } });
+    }
+  }
+
+  const robots = renderRobots(input.robots) ?? (input.noindex ? "noindex" : undefined);
+  pushMeta(tags, "name", "robots", robots);
+
+  const verification = input.verification;
+  if (verification) {
+    const names: Array<[string, string | string[] | undefined]> = [
+      ["google-site-verification", verification.google],
+      ["yandex-verification", verification.yandex],
+      ["y_key", verification.yahoo],
+      ["me", verification.me],
+      ...Object.entries(verification.other ?? {}),
+    ];
+    for (const [name, values] of names) {
+      for (const value of toList(values)) pushMeta(tags, "name", name, value);
+    }
+  }
+
   if (input.canonical) {
     tags.push({ tag: "link", attrs: { rel: "canonical", href: input.canonical } });
+  }
+
+  for (const author of toList(input.authors)) {
+    if (author.url) tags.push({ tag: "link", attrs: { rel: "author", href: author.url } });
   }
 
   if (input.link) {
@@ -98,17 +240,22 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
     }
   }
 
-  if (input.noindex) {
-    tags.push({ tag: "meta", attrs: { name: "robots", content: "noindex, nofollow" } });
-  }
-
+  const ogImages = openGraphImages(input.openGraph);
   if (input.openGraph) {
     const og = input.openGraph;
     pushMeta(tags, "property", "og:title", og.title || resolvedTitle);
     pushMeta(tags, "property", "og:description", og.description || input.description);
-    pushMeta(tags, "property", "og:image", og.image);
+    for (const image of ogImages) {
+      pushMeta(tags, "property", "og:image", image.url);
+      pushMeta(tags, "property", "og:image:width", image.width === undefined ? undefined : String(image.width));
+      pushMeta(tags, "property", "og:image:height", image.height === undefined ? undefined : String(image.height));
+      pushMeta(tags, "property", "og:image:type", image.type);
+      pushMeta(tags, "property", "og:image:alt", image.alt);
+    }
     pushMeta(tags, "property", "og:type", og.type || "website");
     pushMeta(tags, "property", "og:url", og.url || input.canonical);
+    pushMeta(tags, "property", "og:locale", og.locale);
+    pushMeta(tags, "property", "og:site_name", og.siteName);
   }
 
   if (input.twitter) {
@@ -116,10 +263,70 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
     pushMeta(tags, "name", "twitter:card", tw.card || "summary_large_image");
     pushMeta(tags, "name", "twitter:title", tw.title || resolvedTitle);
     pushMeta(tags, "name", "twitter:description", tw.description || input.description);
-    pushMeta(tags, "name", "twitter:image", tw.image || input.openGraph?.image);
+    pushMeta(tags, "name", "twitter:image", tw.image || ogImages[0]?.url);
   }
 
-  return dedupeMetaTags(tags);
+  // The escape hatch replaces whatever the fields above emitted for its key.
+  const extra = toList(input.meta).map(metaTagAttrs).filter((attrs): attrs is Record<string, string> => attrs !== null);
+  const replaced = new Set(extra.map((attrs) => headTagKey({ tag: "meta", attrs })));
+  const output = dedupeLinkTags(tags).filter((tag) => tag.tag !== "meta" || !replaced.has(headTagKey(tag)));
+  for (const attrs of extra) output.push({ tag: "meta", attrs });
+  return output;
+}
+
+function toList<T>(value: T | T[] | undefined | null): T[] {
+  if (value === undefined || value === null) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function renderViewport(viewport: SeoMetaInput["viewport"]): string | undefined {
+  if (viewport === undefined) return undefined;
+  if (typeof viewport === "string") return viewport || undefined;
+  const parts: string[] = [];
+  const add = (name: string, value: string | number | boolean | undefined) => {
+    if (value === undefined) return;
+    parts.push(`${name}=${typeof value === "boolean" ? (value ? "yes" : "no") : value}`);
+  };
+  add("width", viewport.width);
+  add("height", viewport.height);
+  add("initial-scale", viewport.initialScale);
+  add("minimum-scale", viewport.minimumScale);
+  add("maximum-scale", viewport.maximumScale);
+  add("user-scalable", viewport.userScalable);
+  add("viewport-fit", viewport.viewportFit);
+  add("interactive-widget", viewport.interactiveWidget);
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function renderRobots(robots: SeoMetaInput["robots"]): string | undefined {
+  if (robots === undefined) return undefined;
+  if (typeof robots === "string") return robots || undefined;
+  const parts: string[] = [];
+  if (robots.index !== undefined) parts.push(robots.index ? "index" : "noindex");
+  if (robots.follow !== undefined) parts.push(robots.follow ? "follow" : "nofollow");
+  for (const flag of ["noarchive", "nosnippet", "noimageindex", "nocache"] as const) {
+    if (robots[flag]) parts.push(flag);
+  }
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function openGraphImages(og: SeoMetaInput["openGraph"]): SeoOpenGraphImage[] {
+  if (!og) return [];
+  const images = og.images !== undefined ? toList(og.images) : og.image ? [og.image] : [];
+  return images
+    .map((image) => (typeof image === "string" ? { url: image } : image))
+    .filter((image) => Boolean(image?.url));
+}
+
+function metaTagAttrs(tag: SeoMetaTag): Record<string, string> | null {
+  const attrs: Record<string, string> = {};
+  if (tag.name) attrs.name = tag.name;
+  else if (tag.property) attrs.property = tag.property;
+  else if (tag.httpEquiv) attrs["http-equiv"] = tag.httpEquiv;
+  else return null;
+  if (tag.media) attrs.media = tag.media;
+  attrs.content = String(tag.content ?? "");
+  return attrs;
 }
 
 function pushMeta(
@@ -140,22 +347,48 @@ function pushMeta(
   });
 }
 
-function dedupeMetaTags(tags: SeoTag[]): SeoTag[] {
+// Links that name the document itself: one per head, the nearest layer wins.
+const SINGLE_LINK_RELS = new Set(["canonical", "manifest"]);
+
+/**
+ * The identity two head tags share when one replaces the other: the title;
+ * a meta by its name / property / http-equiv (so every `theme-color` of a
+ * layer replaces every one of the layer under it); a canonical or manifest
+ * link by its rel, any other link by rel and href.
+ */
+export function headTagKey(tag: SeoTag): string {
+  if (tag.tag === "title") return "title";
+  const attrs = lowerCaseKeys(tag.attrs);
+  if (tag.tag === "meta") {
+    if (attrs.charset !== undefined) return "meta:charset";
+    const kind = attrs.name !== undefined ? "name" : attrs.property !== undefined ? "property" : "http-equiv";
+    return `meta:${kind}:${(attrs[kind] ?? "").toLowerCase()}`;
+  }
+  const rel = (attrs.rel ?? "").toLowerCase().trim();
+  return SINGLE_LINK_RELS.has(rel) ? `link:${rel}` : `link:${rel}:${attrs.href ?? ""}`;
+}
+
+function lowerCaseKeys(attrs: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(attrs)) out[name.toLowerCase()] = value;
+  return out;
+}
+
+function dedupeLinkTags(tags: SeoTag[]): SeoTag[] {
   const seen = new Set<string>();
   const output: SeoTag[] = [];
 
   for (const tag of tags) {
-    let key = tag.tag;
-    if (tag.tag === "meta") {
-      key += `:${tag.attrs.name || tag.attrs.property || ""}`;
-    } else if (tag.tag === "link") {
+    // Repeated metas are deliberate (one theme-color per media, one og:image
+    // group per image, one author per name); links repeat by accident.
+    if (tag.tag === "link") {
       // Include href so multiple same-rel links (e.g. preconnect) aren't dropped.
-      key += `:${tag.attrs.rel || ""}:${tag.attrs.href || ""}`;
+      const key = `link:${tag.attrs.rel || ""}:${tag.attrs.href || ""}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
     }
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
     output.push(tag);
   }
 
@@ -258,6 +491,43 @@ export function mergeSeoMetaInput(
     delete merged.link;
   }
 
+  // robots and noindex are one tag: whichever the override sets replaces
+  // the other from the base.
+  if (override.noindex !== undefined && override.robots === undefined) {
+    delete merged.robots;
+  }
+  if (override.robots !== undefined && override.noindex === undefined) {
+    delete merged.noindex;
+  }
+
+  // meta: the override's entries replace the base's for the same key.
+  const overrideMeta = toList(override.meta);
+  const overrideKeys = new Set(
+    overrideMeta.map(metaTagAttrs).flatMap((attrs) => (attrs ? [headTagKey({ tag: "meta", attrs })] : []))
+  );
+  const allMeta = [
+    ...toList(base.meta).filter((entry) => {
+      const attrs = metaTagAttrs(entry);
+      return !attrs || !overrideKeys.has(headTagKey({ tag: "meta", attrs }));
+    }),
+    ...overrideMeta,
+  ];
+  if (allMeta.length > 0) {
+    merged.meta = allMeta;
+  } else {
+    delete merged.meta;
+  }
+
+  const mergedVerification = mergeSeoNested(
+    base.verification as Record<string, unknown> | undefined,
+    override.verification as Record<string, unknown> | undefined
+  );
+  if (mergedVerification) {
+    merged.verification = mergedVerification as SeoVerification;
+  } else {
+    delete merged.verification;
+  }
+
   // Merge htmlAttrs and bodyAttrs (route overrides layout per-attribute)
   const mergedHtmlAttrs = mergeSeoNested(base.htmlAttrs, override.htmlAttrs);
   if (mergedHtmlAttrs) {
@@ -284,26 +554,70 @@ export function inferPageTitle(pathname: string): string {
   return normalized.slice(1).replace(/\//g, " - ");
 }
 
+const DEFAULT_VIEWPORT = "width=device-width, initial-scale=1.0";
+
+/** One tag of the app's index.html head (document-head.ts): its key and markup. */
+export interface DocumentHeadTag {
+  key: string;
+  html: string;
+}
+
+/**
+ * The document `<head>`.
+ *
+ * Layers, lowest first: the framework's defaults (charset, viewport), the
+ * app's `index.html` head (`documentHead`, see document-head.ts), then the
+ * route chain's `head()` — structured tags and raw-string fragments. A layer
+ * replaces the tags of the layers under it that share a key (`headTagKey`):
+ * a page's `themeColor` replaces every theme-color index.html declares, its
+ * `title` the index.html title, its `viewport` the framework default.
+ */
 export function renderDocumentHead(
   pathname: string,
   seo: SeoMetaInput | null | undefined,
   headFragments: string[] = [],
-  nonce?: string
+  nonce?: string,
+  documentHead: ReadonlyArray<DocumentHeadTag> = []
 ): string {
   const seoTags = seo ? buildMetaTags(seo) : [];
-  const seoHtml = seoTags.length > 0 ? renderMetaTags(seoTags) : "";
   const extraHead = headFragments
     .map((fragment) => fragment.trim())
     .filter(Boolean)
     .join("\n");
 
+  // Keys the route chain sets, structured or in a raw fragment.
+  const fragmentKeys = new Set(scanHeadTags(extraHead).map(headTagKey));
+  const chainKeys = new Set([...seoTags.map(headTagKey), ...fragmentKeys]);
+  const baseTags = documentHead.filter((tag) => !chainKeys.has(tag.key) && tag.key !== "meta:charset");
+
+  // The viewport goes first, whichever layer set it.
+  const VIEWPORT = "meta:name:viewport";
+  const isViewport = (tag: SeoTag) => headTagKey(tag) === VIEWPORT;
+  const chainViewport = seoTags.find(isViewport);
+  const baseViewport = baseTags.find((tag) => tag.key === VIEWPORT);
+  const viewportHtml = chainViewport
+    ? renderMetaTags([chainViewport])
+    : baseViewport
+      ? baseViewport.html
+      : fragmentKeys.has(VIEWPORT)
+        ? ""
+        : `<meta name="viewport" content="${DEFAULT_VIEWPORT}">`;
+  // index.html's tags are the app's own markup, emitted as written (as Vite does).
+  const baseHtml = baseTags
+    .filter((tag) => tag.key !== VIEWPORT)
+    .map((tag) => tag.html)
+    .join("\n");
+  const seoHtml = renderMetaTags(seoTags.filter((tag) => !isViewport(tag)));
+
   const hasTitle =
     /<title(?:\s|>)/i.test(seoHtml) ||
+    baseTags.some((tag) => tag.key === "title") ||
     /<title(?:\s|>)/i.test(extraHead);
   let titleTag = "";
   // Last resort, reached only when the route chain declares neither a `title`
-  // nor a `defaultTitle`: HTML requires a <title>, and a document without one
-  // shows its bare URL in tabs, bookmarks and screen readers.
+  // nor a `defaultTitle`, and index.html has no <title>: HTML requires one,
+  // and a document without one shows its bare URL in tabs, bookmarks and
+  // screen readers.
   if (!hasTitle) {
     const inferred = inferPageTitle(pathname);
     const template = seo?.titleTemplate;
@@ -345,10 +659,11 @@ export function renderDocumentHead(
 
   return [
     '<meta charset="UTF-8">',
-    '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+    viewportHtml,
     antiFlashStyle,
     islandBaseStyle,
     titleTag,
+    baseHtml,
     seoHtml,
     extraHead,
     jsonLdHtml,
@@ -356,6 +671,55 @@ export function renderDocumentHead(
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+/**
+ * The `<title>`, `<meta>` and `<link>` tags of an HTML fragment, each with
+ * its markup as written and its attributes (the common entities decoded —
+ * enough to compute `headTagKey`). Comments,
+ * and the contents of `<script>`, `<style>`, `<noscript>` and `<template>`,
+ * are skipped. Tolerant, not a full HTML parser: it reads head markup.
+ */
+export function scanHeadTags(html: string): Array<SeoTag & { html: string }> {
+  const tags: Array<SeoTag & { html: string }> = [];
+  const source = html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(script|style|noscript|template)\b[\s\S]*?<\/\1\s*>/gi, "");
+  const pattern = /<title\b[^>]*>([\s\S]*?)<\/title\s*>|<(meta|link)\b((?:[^>"']|"[^"]*"|'[^']*')*)\/?>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(source)) !== null) {
+    if (match[1] !== undefined) {
+      tags.push({ tag: "title", content: decodeHtmlEntities(match[1].trim()), html: match[0] });
+      continue;
+    }
+    const attrs = parseTagAttributes(match[3] ?? "");
+    tags.push({ tag: match[2]!.toLowerCase() as "meta" | "link", attrs, html: match[0] });
+  }
+  return tags;
+}
+
+function parseTagAttributes(source: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const pattern = /([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(source)) !== null) {
+    const name = match[1]!.toLowerCase();
+    if (name in attrs) continue;
+    attrs[name] = decodeHtmlEntities(match[2] ?? match[3] ?? match[4] ?? "");
+  }
+  return attrs;
+}
+
+const NAMED_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0" };
+
+function decodeHtmlEntities(value: string): string {
+  return value.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (entity, body: string) => {
+    if (body[0] === "#") {
+      const code = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : entity;
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? entity;
+  });
 }
 
 /**
@@ -498,7 +862,18 @@ function cloneSeoMetaInput(input: SeoMetaInput): SeoMetaInput {
   return {
     ...input,
     ...(input.keywords ? { keywords: [...input.keywords] } : {}),
-    ...(input.openGraph ? { openGraph: { ...input.openGraph } } : {}),
+    ...(input.openGraph
+      ? {
+          openGraph: {
+            ...input.openGraph,
+            ...(Array.isArray(input.openGraph.images) ? { images: [...input.openGraph.images] } : {}),
+          },
+        }
+      : {}),
+    ...(Array.isArray(input.meta) ? { meta: [...input.meta] } : {}),
+    ...(Array.isArray(input.themeColor) ? { themeColor: [...input.themeColor] } : {}),
+    ...(Array.isArray(input.authors) ? { authors: [...input.authors] } : {}),
+    ...(input.verification ? { verification: { ...input.verification } } : {}),
     ...(input.twitter ? { twitter: { ...input.twitter } } : {}),
     ...(input.jsonLd ? { jsonLd: Array.isArray(input.jsonLd) ? [...input.jsonLd] : input.jsonLd } : {}),
     ...(input.headScripts ? { headScripts: Array.isArray(input.headScripts) ? [...input.headScripts] : input.headScripts } : {}),

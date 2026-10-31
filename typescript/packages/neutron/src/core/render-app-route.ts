@@ -22,6 +22,7 @@ import {
   buildHtmlOpenTag,
   buildBodyOpenTag,
   type SeoMetaInput,
+  type DocumentHeadTag,
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
@@ -103,6 +104,8 @@ export interface RenderAppRouteOptions {
    * `client.unloadRouteStylesheets` never unlinks one the page still uses.
    */
   lazyStylesheetHrefs?: string[];
+  /** The app's index.html head tags (document-head.ts), under the route chain's. */
+  documentHead?: DocumentHeadTag[];
   loaderDataCache: NeutronLoaderCacheStore;
   requestTrace: RenderRequestTrace;
   hooks?: RenderHooks;
@@ -1346,6 +1349,7 @@ export async function renderAppRoute(
         loaderData,
         actionData,
         nonce: cspNonce,
+        documentHead: opts.documentHead,
       }
     );
 

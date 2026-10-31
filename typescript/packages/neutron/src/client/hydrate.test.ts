@@ -1274,3 +1274,94 @@ describe("hydrate — route stylesheets across chunk-loaded routes (F-P6-3)", ()
     }
   });
 });
+
+/**
+ * F-P6-1: client navigation applies the page's whole resolved head
+ * (`__head__`): every managed <meta>/<link> the new head no longer has goes
+ * (a previous page's robots noindex, both theme-colors), each one it adds
+ * arrives, identical ones stay in place, and tags other code inserted at
+ * runtime are left alone. Entities in the title are decoded.
+ */
+describe("hydrate — head tags after navigation (F-P6-1)", () => {
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h } = deps;
+    return {
+      "route:/settings": { path: "/settings", mode: "app", default: () => h("p", { class: "title" }, "Settings") },
+      "route:/chat": { path: "/chat", mode: "app", default: () => h("p", { class: "title" }, "Chat") },
+    };
+  }
+
+  it("replaces the previous page's managed head tags with the new page's", async () => {
+    document.head.innerHTML = [
+      '<meta charset="UTF-8">',
+      '<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">',
+      "<title>Settings | Fylun</title>",
+      '<meta name="theme-color" media="(prefers-color-scheme: light)" content="#fff">',
+      '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000">',
+      '<meta name="robots" content="noindex">',
+      '<meta property="og:site_name" content="Fylun">',
+      '<link rel="canonical" href="https://fylun.ai/settings">',
+      '<link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml">',
+    ].join("");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          "route:/chat": {},
+          __head__: [
+            '<meta charset="UTF-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">',
+            "<title>Chat &amp; more | Fylun</title>",
+            '<meta name="theme-color" media="(prefers-color-scheme: light)" content="white">',
+            '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0a0a0a">',
+            '<meta property="og:site_name" content="Fylun">',
+            '<meta name="google-site-verification" content="g-token">',
+            '<link rel="canonical" href="https://fylun.ai">',
+            '<link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml">',
+            '<script type="application/ld+json">{}</script>',
+          ].join("\n"),
+        })
+      )
+    );
+    const booted = await bootRouter({ pathname: "/settings", routeId: "route:/settings", data: { "route:/settings": {} }, routes });
+    const siteName = document.head.querySelector('meta[property="og:site_name"]');
+    // Inserted at runtime by other code (an analytics snippet, say).
+    const foreign = document.createElement("meta");
+    foreign.setAttribute("name", "third-party");
+    foreign.setAttribute("content", "kept");
+    document.head.appendChild(foreign);
+
+    clickAnchor(addAnchor("/chat"));
+    for (let i = 0; i < 4; i++) await flush();
+    expect(booted.app.querySelector(".title")?.textContent).toBe("Chat");
+
+    expect(document.title).toBe("Chat & more | Fylun");
+    const metas = (selector: string) =>
+      Array.from(document.head.querySelectorAll(selector)).map((element) => element.getAttribute("content") ?? element.getAttribute("href"));
+    expect(metas('meta[name="theme-color"]').sort()).toEqual(["#0a0a0a", "white"]);
+    expect(metas('meta[name="robots"]')).toEqual([]);
+    expect(metas('meta[name="google-site-verification"]')).toEqual(["g-token"]);
+    expect(metas('link[rel="canonical"]')).toEqual(["https://fylun.ai"]);
+    expect(metas('meta[name="viewport"]')).toEqual(["width=device-width, initial-scale=1, interactive-widget=resizes-content"]);
+    expect(metas('link[rel="search"]')).toEqual(["/opensearch.xml"]);
+    expect(document.head.querySelectorAll("meta[charset]")).toHaveLength(1);
+    // Unchanged tags are the same elements; other code's are untouched.
+    expect(document.head.querySelector('meta[property="og:site_name"]')).toBe(siteName);
+    expect(foreign.isConnected).toBe(true);
+    expect(document.head.querySelector('script[type="application/ld+json"]')).toBeNull();
+  });
+});

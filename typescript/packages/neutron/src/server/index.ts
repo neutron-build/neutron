@@ -83,7 +83,9 @@ import {
   mergeSeoMetaInput,
   renderDocumentHead,
   type SeoMetaInput,
+  type DocumentHeadTag,
 } from "../core/seo.js";
+import { DOCUMENT_HEAD_FILE, parseDocumentHead } from "../core/document-head.js";
 import {
   encodeSerializedPayloadAsJson,
   serializeForInlineScript,
@@ -158,6 +160,11 @@ export {
   parseServerActionsManifest,
   type ServerActionsManifest,
 } from "../core/server-action-protocol.js";
+export {
+  DOCUMENT_HEAD_FILE,
+  extractDocumentHead,
+  serializeDocumentHead,
+} from "../core/document-head.js";
 export {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
@@ -582,6 +589,8 @@ export async function createServer(
   const stylesheetsFor = (routeId: string) =>
     routeStylesheetHrefs(routeCss, routeId, allStylesheetHrefs);
   const lazyStylesheetsFor = (routeId: string) => routeLazyStylesheetHrefs(routeCss, routeId);
+  // index.html's head, recorded by `neutron-ts build` (core/document-head.ts).
+  const documentHead = loadDocumentHead(resolvedDistDir);
   const staticRouteHeaders = loadStaticRouteHeaders(resolvedDistDir);
   const staticHtmlCache = buildStaticHtmlCache(resolvedDistDir);
   const corsOptions = resolveCorsOptions(cors);
@@ -1341,7 +1350,7 @@ export async function createServer(
             undefined,
             undefined,
             undefined,
-            { middleware: false, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id) }
+            { middleware: false, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
           );
         } catch (error) {
           emitHook(hooks?.onError, {
@@ -1382,7 +1391,7 @@ export async function createServer(
               globalMiddleware,
               undefined,
               undefined,
-              { lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id) }
+              { lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
             );
             // The page renders as a normal route, which makes it a 200. The
             // status is the part that matters to crawlers and monitoring — but
@@ -1555,7 +1564,7 @@ export async function createServer(
           // loader result is committed, so a GET that began before a mutation
           // completed cannot republish the pre-mutation loader data.
           { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration },
-          { renderNotFound: renderNestedNotFound, lazyStylesheetHrefs: lazyStylesheetsFor(match.route.id) }
+          { renderNotFound: renderNestedNotFound, lazyStylesheetHrefs: lazyStylesheetsFor(match.route.id), documentHead }
         );
       } catch (error) {
         renderFailed = true;
@@ -1829,7 +1838,7 @@ async function handleAppRouteRequest(
     generation?: string;
     stillValid: () => boolean;
   },
-  extra?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware" | "lazyStylesheetHrefs">
+  extra?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware" | "lazyStylesheetHrefs" | "documentHead">
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
   // Vite SSR runtime, then hand the loaded map to the shared render core —
@@ -2802,6 +2811,14 @@ function loadServerActionsManifest(distDir: string): ServerActionsManifest | nul
     );
   }
   return Object.keys(manifest.actions).length > 0 ? manifest : null;
+}
+
+function loadDocumentHead(distDir: string): DocumentHeadTag[] {
+  try {
+    return parseDocumentHead(fs.readFileSync(path.join(distDir, DOCUMENT_HEAD_FILE), "utf-8"));
+  } catch {
+    return [];
+  }
 }
 
 function loadRouteCssManifest(distDir: string): RouteCssManifest | null {

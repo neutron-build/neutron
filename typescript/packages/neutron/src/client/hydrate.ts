@@ -261,6 +261,7 @@ export async function init(): Promise<"static" | void> {
 
   window.__NEUTRON_ROUTER_ACTIVE__ = true;
   initLoadedStylesheets();
+  snapshotHeadTags();
 
   const data = readInitialLoaderData();
   const pathname = getCurrentPath();
@@ -565,85 +566,77 @@ function applyData(data: LoaderData): void {
   markStaticLinks();
 }
 
-/**
- * Apply server-rendered head HTML to the live document.
- * Updates <title>, <meta>, and <link rel="canonical"> tags.
- */
-function applyHeadHtml(headHtml: string): void {
-  // Parse title
-  const titleMatch = headHtml.match(/<title>([^<]*)<\/title>/);
-  if (titleMatch) {
-    document.title = titleMatch[1];
-  }
+// The head tags client navigation manages: the server-rendered document's
+// <meta> (name / property / http-equiv) and <link> (not stylesheets or
+// preloads) tags, and the ones navigation inserted since. Tags other code
+// adds at runtime are never touched.
+const managedHeadTags = new Set<Element>();
 
-  // Collect new meta tags from the head HTML
-  const metaPattern = /<meta\s+([^>]+)>/g;
-  const newMetas: Array<{ attrs: Record<string, string> }> = [];
-  let match: RegExpExecArray | null;
-  while ((match = metaPattern.exec(headHtml)) !== null) {
-    const attrs = parseHtmlAttributes(match[1]);
-    newMetas.push({ attrs });
+function isManagedHeadTag(element: Element): boolean {
+  const tag = element.tagName.toLowerCase();
+  if (tag === "meta") {
+    return (
+      !element.hasAttribute("charset") &&
+      (element.hasAttribute("name") || element.hasAttribute("property") || element.hasAttribute("http-equiv"))
+    );
   }
-
-  // Remove existing managed meta tags (name=, property=) that we'll replace
-  const managedSelectors = new Set<string>();
-  for (const meta of newMetas) {
-    if (meta.attrs.name) {
-      managedSelectors.add(`meta[name="${meta.attrs.name}"]`);
-    } else if (meta.attrs.property) {
-      managedSelectors.add(`meta[property="${meta.attrs.property}"]`);
-    }
+  if (tag === "link") {
+    const rel = (element.getAttribute("rel") || "").toLowerCase().split(/\s+/);
+    return !rel.includes("stylesheet") && !rel.includes("modulepreload") && !rel.includes("preload");
   }
-  for (const selector of managedSelectors) {
-    const existing = document.head.querySelector(selector);
-    if (existing) {
-      existing.remove();
-    }
-  }
-
-  // Insert new meta tags
-  for (const meta of newMetas) {
-    // Skip charset and viewport — these don't change per-page
-    if (meta.attrs.charset || meta.attrs.name === "viewport") continue;
-    const el = document.createElement("meta");
-    for (const [key, value] of Object.entries(meta.attrs)) {
-      el.setAttribute(key, value);
-    }
-    document.head.appendChild(el);
-  }
-
-  // Update canonical link (validate same-origin to prevent open redirects)
-  const canonicalMatch = headHtml.match(/<link\s+rel="canonical"\s+href="([^"]*)"[^>]*>/);
-  let canonical = document.head.querySelector('link[rel="canonical"]');
-  if (canonicalMatch) {
-    let isSameOrigin = false;
-    try {
-      const canonUrl = new URL(canonicalMatch[1], window.location.origin);
-      isSameOrigin = canonUrl.origin === window.location.origin;
-    } catch {
-      // ignore invalid URLs
-    }
-    if (isSameOrigin) {
-      if (!canonical) {
-        canonical = document.createElement("link");
-        canonical.setAttribute("rel", "canonical");
-        document.head.appendChild(canonical);
-      }
-      canonical.setAttribute("href", canonicalMatch[1]);
-    }
-  } else if (canonical) {
-    canonical.remove();
-  }
+  return false;
 }
 
-function parseHtmlAttributes(attrString: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
-  const pattern = /(\w[\w-]*)="([^"]*)"/g;
-  let m: RegExpExecArray | null;
-  while ((m = pattern.exec(attrString)) !== null) {
-    attrs[m[1]] = m[2];
+function snapshotHeadTags(): void {
+  document.head.querySelectorAll("meta, link").forEach((element) => {
+    if (isManagedHeadTag(element)) managedHeadTags.add(element);
+  });
+}
+
+function headTagSignature(element: Element): string {
+  const attrs = Array.from(element.attributes)
+    .map((attr) => `${attr.name.toLowerCase()}=${attr.value}`)
+    .sort();
+  return `${element.tagName.toLowerCase()} ${JSON.stringify(attrs)}`;
+}
+
+/**
+ * Apply server-rendered head HTML (`__head__`, the page's whole resolved
+ * head) to the live document: the title, and every managed <meta>/<link> —
+ * a tag the new head no longer has is removed, one it adds is inserted,
+ * identical ones stay. The HTML is parsed inertly (a <template>), and only
+ * attributes are copied onto fresh elements, never event handlers.
+ */
+function applyHeadHtml(headHtml: string): void {
+  const template = document.createElement("template");
+  template.innerHTML = headHtml;
+  const title = template.content.querySelector("title");
+  if (title) {
+    document.title = title.textContent ?? "";
   }
-  return attrs;
+
+  const incoming = new Map<string, Element>();
+  template.content.querySelectorAll("meta, link").forEach((element) => {
+    if (isManagedHeadTag(element)) incoming.set(headTagSignature(element), element);
+  });
+  for (const element of [...managedHeadTags]) {
+    const signature = headTagSignature(element);
+    if (element.isConnected && incoming.has(signature)) {
+      incoming.delete(signature);
+      continue;
+    }
+    element.remove();
+    managedHeadTags.delete(element);
+  }
+  for (const source of incoming.values()) {
+    const element = document.createElement(source.tagName.toLowerCase());
+    for (const attr of Array.from(source.attributes)) {
+      if (/^on/i.test(attr.name)) continue;
+      element.setAttribute(attr.name, attr.value);
+    }
+    document.head.appendChild(element);
+    managedHeadTags.add(element);
+  }
 }
 
 function safeDecodeSegment(segment: string | undefined): string {

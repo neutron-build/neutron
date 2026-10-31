@@ -94,7 +94,59 @@ export function head({ data }) {
 ```
 
 Supported fields: `title`, `titleTemplate` (e.g. `"%s — My Site"`, usually set on
-a layout so child routes inherit it), `description`, `canonical`, `keywords`,
-`noindex`, `openGraph`, `twitter`, `jsonLd`, `link`, `headScripts`, `htmlAttrs`,
-`bodyAttrs`. A layout's `head()` and a route's `head()` merge — the route wins
-per field, while `link`, `headScripts`, and `jsonLd` are concatenated.
+a layout so child routes inherit it), `defaultTitle`, `description`, `canonical`
+(sent exactly as given), `keywords`, `noindex`, `robots`, `viewport`,
+`themeColor`, `authors`, `creator`, `verification`, `openGraph`, `twitter`,
+`jsonLd`, `link`, `meta`, `headScripts`, `htmlAttrs`, `bodyAttrs`. A layout's
+`head()` and a route's `head()` merge — the route wins per field, while `link`,
+`headScripts`, and `jsonLd` are concatenated and `meta` entries replace the
+layout's with the same key. Every value is escaped.
+
+The fields Next's `Metadata` and `Viewport` exports have keep their shape, so
+they map one to one:
+
+```tsx
+// src/routes/_layout.tsx
+export function head() {
+  return {
+    titleTemplate: "%s | Fylun",
+    viewport: { width: "device-width", initialScale: 1, interactiveWidget: "resizes-content" },
+    themeColor: [
+      { media: "(prefers-color-scheme: light)", color: "white" },
+      { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
+    ],
+    authors: [{ name: "Fylun" }],
+    creator: "Fylun",
+    robots: { index: true, follow: true }, // or a string, sent as written
+    verification: { google: process.env.GOOGLE_SITE_VERIFICATION },
+    openGraph: {
+      locale: "en_US",
+      siteName: "Fylun",
+      images: [{ url: "https://fylun.ai/og.png", width: 1200, height: 630, type: "image/png", alt: "Fylun" }],
+    },
+    // Anything else: one entry per <meta>, by name, property or httpEquiv.
+    meta: [{ name: "format-detection", content: "telephone=no" }],
+  };
+}
+```
+
+`noindex: true` writes `<meta name="robots" content="noindex">`; a route's
+`noindex` or `robots` replaces its layout's. `viewport` replaces the default
+`width=device-width, initial-scale=1.0`.
+
+### `index.html`'s head
+
+Server-rendered documents — `start`, dev, prerendered pages and the adapter
+runtimes — carry the `<title>`, `<meta>` and `<link>` tags of the app's
+`index.html` `<head>`, as Vite does for a client-rendered app. They are the
+layer under the route chain: a `head()` tag with the same key replaces them —
+the same `name`, `property` or `http-equiv` (a page's `themeColor` replaces
+every `theme-color` in index.html), the title, a canonical or manifest link, or
+a link with the same `rel` and `href`. The framework's charset always wins;
+stylesheets, `modulepreload` links, `<script>` and `<style>` are not carried
+over (Neutron links each route's CSS and its client entry; put inline scripts in
+`headScripts`, which get the CSP nonce). `neutron-ts build` records the head of
+the built `dist/index.html`, after Vite replaced `%ENV%` placeholders and asset
+URLs, in `dist/.neutron-document-head.json`; dev reads `index.html` itself.
+Client navigation applies each page's whole head: tags the new page no longer
+has are removed.

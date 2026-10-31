@@ -45,7 +45,8 @@ import {
   findStaticInteractivity,
   formatStaticInteractivityWarning,
 } from "./static-interactivity-check.js";
-import { renderDocumentHead, mergeSeoMetaInput, buildHtmlOpenTag, buildBodyOpenTag } from "../core/seo.js";
+import { renderDocumentHead, mergeSeoMetaInput, buildHtmlOpenTag, buildBodyOpenTag, type DocumentHeadTag } from "../core/seo.js";
+import { extractDocumentHead } from "../core/document-head.js";
 import type { SeoMetaInput } from "../core/seo.js";
 import type { NeutronClientConfig, NeutronRoutesConfig } from "../config.js";
 import type { Route, RouteModule, AppContext, LoaderArgs, ActionArgs, HeadArgs, MiddlewareFn, ErrorBoundaryProps } from "../core/types.js";
@@ -1168,10 +1169,33 @@ function normalizePathname(pathname: string): string {
   return pathname;
 }
 
+/**
+ * The source index.html's head tags (core/document-head.ts), re-read when
+ * the file changes. Vite's transformIndexHtml runs over the whole document
+ * afterwards, as for the rest of dev's HTML.
+ */
+const devDocumentHeads = new Map<string, { mtimeMs: number; tags: DocumentHeadTag[] }>();
+function readDevDocumentHead(rootDir: string): DocumentHeadTag[] {
+  const file = path.join(rootDir, "index.html");
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(file).mtimeMs;
+  } catch {
+    devDocumentHeads.delete(file);
+    return [];
+  }
+  const cached = devDocumentHeads.get(file);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.tags;
+  const tags = extractDocumentHead(fs.readFileSync(file, "utf-8"));
+  devDocumentHeads.set(file, { mtimeMs, tags });
+  return tags;
+}
+
 async function resolveDevHeadHtml(
   allRoutes: Route[],
   moduleCache: Map<string, RouteModule>,
-  args: HeadArgs
+  args: HeadArgs,
+  documentHead: DocumentHeadTag[] = []
 ): Promise<{ headHtml: string; seo: SeoMetaInput | null }> {
   let mergedSeo: SeoMetaInput | null = null;
   const headFragments: string[] = [];
@@ -1195,7 +1219,7 @@ async function resolveDevHeadHtml(
   }
 
   return {
-    headHtml: renderDocumentHead(args.pathname, mergedSeo, headFragments),
+    headHtml: renderDocumentHead(args.pathname, mergedSeo, headFragments, undefined, documentHead),
     seo: mergedSeo,
   };
 }
@@ -1392,7 +1416,7 @@ async function handleRequest(
     loaderData,
     actionData,
     pathname,
-  });
+  }, readDevDocumentHead(rootDir));
 
   // For JSON requests (client-side navigation), return data + head + CSS
   if (wantsJson) {

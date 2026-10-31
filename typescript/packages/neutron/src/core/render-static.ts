@@ -16,6 +16,7 @@ import {
   type SeoMetaInput,
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
+import { extractDocumentHead } from "./document-head.js";
 import { isResponse } from "./response.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderSpeculationRules } from "./speculation-rules.js";
@@ -127,6 +128,8 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
   const { h, renderToString } = await importPreactSsr(preactSsr);
 
   const allRoutes = discoverRoutes({ routesDir });
+  const indexHtml = path.join(appRoot, "index.html");
+  const documentHead = fs.existsSync(indexHtml) ? extractDocumentHead(fs.readFileSync(indexHtml, "utf-8")) : [];
 
   const layouts = new Map<string, Route>();
   const pageRoutes: Route[] = [];
@@ -302,6 +305,7 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
           pathname: pageRoute.path,
           loaderData: loaderData !== undefined ? { [pageRoute.id]: loaderData } : {},
           // No nonce at build time — SSG runs no CSP-nonce middleware.
+          documentHead,
         }
       );
       const fullHtml = wrapHtml(html, pageRoute.path, headHtml, seo);

@@ -89,6 +89,13 @@ the packages under Dependents in one step.
   negotiation rule.
   **Migration:** a client or test that matched the bare `Not Found` text
   should check the status code, or the app should add a `not-found.tsx`.
+- **`noindex: true` writes `noindex`, not `noindex, nofollow` (F-P6-1).**
+  The head API emits the robots value an app asks for: Next's
+  `robots: { index: false }` (and Fylun's noindex pages) mean `noindex`,
+  and the framework added `nofollow`, so crawlers stopped following links
+  from those pages. **Migration:** a page that also must not pass link
+  equity sets `robots: "noindex, nofollow"` (or
+  `robots: { index: false, follow: false }`).
 - **`PUBLIC_*` environment variables are inlined into client code.**
   `PUBLIC_` was documented as the public prefix but nothing applied it; the
   new `env.publicPrefixes` (default `["PUBLIC_"]`, see Added) does, so a
@@ -102,6 +109,37 @@ the packages under Dependents in one step.
   key, must handle the RegExp entry.
 
 ### Added
+
+- **The head API covers Next's metadata, and documents carry index.html's
+  head (F-P6-1).** Server-rendered documents ignored the app's `index.html`
+  `<head>`, and `head()` had no way to write a viewport, theme-color or
+  verification tag, so the Fylun port could not emit its viewport
+  `interactive-widget=resizes-content` (the Android keyboard covered the
+  chat composer), both theme-colors, author/creator, `og:locale`,
+  `og:site_name`, og:image dimensions, robots `index, follow` or
+  `google-site-verification`. `SeoMetaInput` gains Next-shaped fields —
+  `viewport` (string or Next's `Viewport` object, replacing the default),
+  `themeColor` (string or `{ media, color }[]`), `authors`, `creator`,
+  `verification` (`google`, `yandex`, `yahoo`, `me`, `other`), `robots`
+  (string as written, or `{ index, follow, … }`), `openGraph.locale`,
+  `openGraph.siteName` and `openGraph.images` (`url`, `width`, `height`,
+  `type`, `alt`) — and a generic `meta` array (`name` / `property` /
+  `httpEquiv`, `content`, `media`) that replaces any field's tag of the same
+  key; `link` already took any link. All values are escaped. `index.html`'s
+  `<title>`, `<meta>` and `<link>` tags (not charset, stylesheets,
+  modulepreload, scripts or styles) are now the lowest head layer in
+  `start`, dev, prerendered pages, streamed responses and the adapter
+  runtimes, as in Vite: a route chain tag with the same key replaces them
+  (a page's `themeColor` replaces every index.html `theme-color`, its title
+  the index.html title, which in turn replaces the URL-guessed one).
+  `neutron-ts build` records the built `index.html` head (after Vite's
+  `%ENV%` and asset-URL rewriting) in `dist/.neutron-document-head.json`.
+  Client navigation now applies the page's whole head: it removed only the
+  first tag per name and never removed one the new page lacks (a previous
+  page's robots `noindex` stayed), skipped viewport changes, and showed
+  title entities (`&amp;`) literally. A `canonical` was and is sent exactly
+  as given (`https://fylun.ai`, no slash added). **Migration:** none, unless
+  index.html holds tags a page must not carry — move those into `head()`.
 
 - **`client.unloadRouteStylesheets`: route stylesheets no longer needed are
   unlinked after client navigation (opt-in, F-B5-1).** Client navigation kept
