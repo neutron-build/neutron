@@ -376,6 +376,17 @@ retune, which the card allows only before a final run). Q1 (all 10
 hooks), Q2, Q3, Q5a–c, Q6a/b, Q8, Q9, Q10, Q13a–c, Q14, Q15, Q16,
 Q17, Q18 are all met.
 
+7. **Four seeds do not reproduce across runs** (verify's digest
+   re-run: seeds 180, 559, 7474, 8832 — "did not reproduce", 4/10000).
+   A W-DET/S-DET violation: the digest is a pure function of
+   `(seed, mutant)` by construction, so some rare timing path leaks
+   into a sim-visible decision (a scheduler race, or an ordering the
+   record reads before it is canonical). Not root-caused here; the
+   deterministic-looking repro (`run --seeds 180..181` twice, compare
+   digests) is itself only sometimes reproducing — the class is
+   recorded as the seventh failure class, and it is also why
+   `verify` exits 2 before its quota checks print.
+
 **Where this leaves the stage (X5-R12's budget valve, applied
 verbatim):** the first full campaign shows failing seed classes this
 attempt cannot root-cause (classes 1–3 above; 1,560 seeds). The
