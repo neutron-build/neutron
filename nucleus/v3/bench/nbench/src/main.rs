@@ -44,9 +44,10 @@ USAGE:
   nbench cleanup
   nbench host-info
   nbench vec-qdrant-load   --base F --host H --port P [--collection C] [--m N] [--ef-construct N] [--batch N]
-  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run] [--latency-out F] [--exact] [--max-queries N] [--allow-debug-client]
+  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run] [--latency-out F] [--ids-out F] [--exact] [--max-queries N]
   nbench vec-qdrant-info   --host H --port P [--collection C]
   nbench qdrant-latency-verdict --client-p50-ms X --server-p50-ms Y
+  nbench vec-recall          --ids F --truth F [--k N]
   nbench vec-qdrant-digest --host H --port P [--collection C]
   nbench vec-qdrant-version --host H --port P
   nbench vec-pg-copy       --base F
@@ -278,6 +279,11 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let pass_kind = arg_value(args, "pass-kind").unwrap_or_default();
     // Card B-0-F7 Work 1: optional per-query client/server latency CSV.
     let latency_out = arg_value(args, "latency-out");
+    // Card B-0-F7: optional per-query result ids (JSONL, one array per
+    // query), written *before* the sanity check so a refused pass keeps
+    // its recall evidence — the diagnosis must be able to recompute
+    // recall from a pass the 10 ms limit refused.
+    let ids_out = arg_value(args, "ids-out");
     // Card B-0-F7 recall control: `exact` asks Qdrant for a brute-force
     // pass (no `hnsw_ef`), which must reproduce the ground truth on the
     // same collection; such a pass is a control, never a sanity-checked
@@ -331,11 +337,17 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     // mutant and is impossible here — a missing `time` field fails the
     // pass loudly inside `parse_search_response`.
     if let Some(path) = latency_out.as_deref() {
-        let mut csv = String::from("client_ms,server_ms\n");
-        for (c, s) in lat_ms.iter().zip(server_ms.iter()) {
-            let _ = writeln!(csv, "{c:.6},{s:.6}");
+        std::fs::write(path, latency_csv(&lat_ms, &server_ms)).map_err(Error::Io)?;
+    }
+    // Written before any sanity refusal: a refused pass still happened,
+    // and its recall evidence survives (card B-0-F7).
+    if let Some(path) = ids_out.as_deref() {
+        let mut jsonl = String::new();
+        for ids in &results {
+            let arr = Value::Arr(ids.iter().map(|i| Value::n(*i as f64)).collect());
+            let _ = writeln!(jsonl, "{}", json::to_string(&arr)?);
         }
-        std::fs::write(path, csv).map_err(Error::Io)?;
+        std::fs::write(path, jsonl).map_err(Error::Io)?;
     }
     lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     server_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -372,6 +384,70 @@ fn cmd_vec_qdrant_version(args: &[String]) -> Result<()> {
         .map_err(|_| Error::Usage("bad port".into()))?;
     println!("{}", vector::qdrant_version(&host, port)?);
     Ok(())
+}
+
+/// The per-query latency CSV (card B-0-F7 Work 1): `client_ms,server_ms`
+/// per query, in query order. Pure so the evidence format itself is
+/// pinned — the c−s table is built from this file, and a server column
+/// that is empty, zero-filled, or a copy of the client column would
+/// silently change the diagnosis.
+fn latency_csv(client_ms: &[f64], server_ms: &[f64]) -> String {
+    let mut csv = String::from("client_ms,server_ms\n");
+    for (c, s) in client_ms.iter().zip(server_ms.iter()) {
+        let _ = writeln!(csv, "{c:.6},{s:.6}");
+    }
+    csv
+}
+
+/// Recompute recall@k for an ids JSONL file (one JSON array of result
+/// ids per query) against the dataset ground truth (card B-0-F7: the
+/// recall of a pass the sanity limit refused stays recomputable from
+/// its `--ids-out` evidence; one implementation, the tested
+/// `vector::recall_at_k`).
+fn cmd_vec_recall(args: &[String]) -> Result<()> {
+    let ids_path = required(args, "ids")?;
+    let truth_path = required(args, "truth")?;
+    let k: usize = arg_value(args, "k")
+        .unwrap_or_else(|| "10".into())
+        .parse()
+        .map_err(|_| Error::Usage("bad k".into()))?;
+    let truth = vector::read_ivecs(&PathBuf::from(&truth_path))?;
+    let text = std::fs::read_to_string(&ids_path).map_err(Error::Io)?;
+    let mut results: Vec<Vec<i64>> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        results.push(parse_ids_line(line)?);
+    }
+    let recall = vector::recall_at_k(&results, &truth, k)?;
+    println!("{recall:.6}");
+    Ok(())
+}
+
+/// Parse one `--ids-out` line: a JSON array of point ids.
+fn parse_ids_line(line: &str) -> Result<Vec<i64>> {
+    let v = json::parse(line)?;
+    let arr = v
+        .as_arr()
+        .ok_or_else(|| Error::Parse {
+            what: "ids line",
+            line: line.to_string(),
+        })?
+        .to_vec();
+    let mut ids = Vec::with_capacity(arr.len());
+    for item in &arr {
+        ids.push(
+            item.as_f64()
+                .map(|n| n as i64)
+                .ok_or_else(|| Error::Parse {
+                    what: "ids line",
+                    line: line.to_string(),
+                })?,
+        );
+    }
+    Ok(ids)
 }
 
 /// Apply the pre-registered card B-0-F7 Work 4 rule to one pass's p50s
@@ -724,6 +800,7 @@ fn main() {
         Some("vec-qdrant-version") => ok_or_print(cmd_vec_qdrant_version(&argv[1..])),
         Some("vec-qdrant-info") => ok_or_print(cmd_vec_qdrant_info(&argv[1..])),
         Some("qdrant-latency-verdict") => ok_or_print(cmd_qdrant_latency_verdict(&argv[1..])),
+        Some("vec-recall") => ok_or_print(cmd_vec_recall(&argv[1..])),
         Some("vec-pg-copy") => ok_or_print(cmd_vec_pg_copy(&argv[1..])),
         Some("vec-pg-search") => ok_or_print(cmd_vec_pg_search(&argv[1..])),
         _ => {
@@ -802,6 +879,41 @@ mod tests {
             assert_eq!(v.get("server_p50_ms").and_then(Value::as_f64), Some(1.7));
             assert_eq!(v.get("server_p99_ms").and_then(Value::as_f64), Some(2.1));
         }
+    }
+
+    #[test]
+    fn latency_csv_keeps_query_order_and_both_columns() {
+        // Card B-0-F7 Work 1 evidence format: one row per query, the
+        // client and server numbers of THE SAME query side by side.
+        // Sorting would destroy the pairing; a duplicated column would
+        // fake a zero c−s delta.
+        let csv = latency_csv(&[10.5, 2.25, 7.0], &[1.5, 2.0, 6.75]);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "client_ms,server_ms");
+        assert_eq!(lines[1], "10.500000,1.500000");
+        assert_eq!(lines[2], "2.250000,2.000000");
+        assert_eq!(lines[3], "7.000000,6.750000");
+        assert_eq!(lines.len(), 4);
+        assert!(csv.ends_with('\n'));
+    }
+
+    #[test]
+    fn ids_jsonl_roundtrips_through_recall() {
+        // Card B-0-F7: a refused pass keeps its recall evidence as an
+        // ids JSONL; `parse_ids_line` + `vector::recall_at_k` must
+        // reproduce the pass's recall from that file alone.
+        let ids = vec![
+            parse_ids_line("[1,2,3,4,5,6,7,8,9,10]").expect("line 1"),
+            parse_ids_line("[5,6,7,8,9,10,11,12,13,14]").expect("line 2"),
+        ];
+        assert_eq!(ids[0], vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let truth = vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10i32]; 2];
+        let r = vector::recall_at_k(&ids, &truth, 10).expect("recall");
+        assert!((r - 0.8).abs() < 1e-12, "one perfect hit + one 6/10: {r}");
+        // not an array, or non-numeric members, are loud errors
+        assert!(parse_ids_line("{\"a\":1}").is_err());
+        assert!(parse_ids_line("[1,\"x\"]").is_err());
+        assert!(parse_ids_line("garbage").is_err());
     }
 
     #[test]
