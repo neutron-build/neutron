@@ -129,29 +129,43 @@ of a 0.34 ms p50, and the pgvector arm times a release binary — and
 every results JSON records `provenance.nbench_build.profile`. Build
 with `cargo build --release -p nbench`.
 
-**`reproduce.sh` a|b|verdict|check** runs the two-run protocol
-(card B-0-F7-F1b uses it; environment `NB_HARNESS` and `NB_BIN`, a
-release build):
+**`reproduce.sh` a|b|verdict|check|selftest** runs the two-run
+protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
+`NB_BIN`, a release build):
 
 - `a` / `b` — one fresh-build row each, on a quiet host (13
   consecutive 10 s samples with load1 < 4, no `cargo`/`rustc` process
-  and no live `nbench-*` user unit; deadline 30 min, then exit 3 "host
-  not quiet" — no run, not a refusal). Each run's results JSON,
-  `index-state-*.json`, `collection-info.json` and init log land in
-  `results/<date>/repro/`. A recorded or FAILED run is never re-run
-  (exit 4); a killed attempt is kept as `run-*.killed.log` (one retry).
-  Run B goes into the same `repro/` dir as run A. Run A is the row; run
-  B is evidence only; there is no third run.
+  and no **active** `nbench-*` user unit; deadline 30 min, then exit 3
+  "host not quiet" — no run, not a refusal, and nothing is created).
+  `NB_BIN`'s build profile is probed before anything starts: a debug
+  client is refused with nbench's own J5 message (exit 4). A run that
+  printed a `results:` line was **recorded** — on success or on VOID
+  (a digest mismatch writes the JSON and exits 1); its JSON,
+  `index-state-*.json`, `collection-info.json`, init log and every
+  settle transcript land in `results/<date>/repro/`, and it is never
+  re-run (exit 4 on retry). A FAILED run keeps its log and its
+  work-dir evidence is copied into `repro/run-<x>/` before the script
+  exits, so run B on the same UTC date cannot overwrite it. A killed
+  attempt is kept as `run-*.killed.log` (one retry). Run B goes into
+  the same `repro/` dir as run A, and refuses early if run A's
+  outcome (FAILED or VOID) already decides INVALID. Run A is the row;
+  run B is evidence only; there is no third run.
 - `verdict` — writes `repro/verdict.txt`: `nbench qdrant-repro-verdict
   --a F --b F` when both JSONs exist, or `REPRO VERDICT=INVALID (run X
-  refused: …)` for a failed run. On REPRODUCED only, run A's JSON is
-  copied back as `results/<date>/vector-sift1m-qdrant.json` and the
-  report regenerated.
+  refused/voided: …)` for a failed or voided run. On REPRODUCED only,
+  run A's JSON is copied back as
+  `results/<date>/vector-sift1m-qdrant.json` and the report
+  regenerated.
 - `check` — outcome-neutral re-derivation (the F1b Acceptance): the
   verdict recomputed from the committed files must equal verdict.txt's
   last line, REPRODUCED must hold exactly when the row file exists and
   is byte-identical to run-a.json, and exactly one `repro/` dir must
   exist.
+- `selftest` — the stub-driven protocol test (gate round 1 rework
+  acceptance): a fake `NB_BIN` replays `nbench run`'s success, VOID,
+  FAILED and debug-refusal outcomes against a throwaway root with the
+  quiet wait bypassed loudly; it needs no host, no podman and no
+  dataset, and passes when the protocol above behaves as written.
 
 **J6, the reproducibility rule (pre-registered, applied verbatim by
 `nbench qdrant-repro-verdict`):** two fresh-build runs, A then B, on a

@@ -1781,6 +1781,52 @@ warm-pass p50 sanity-checked at 10 ms\",\"pass_kind\":\"run\",\
         ])
     }
 
+    /// Gate round 1, finding R4 (mutant G6 was uncaught): a series
+    /// whose warm aggregate carries the three J6 medians but NOT the
+    /// index-state numbers (`index_segments`) — a pass without the
+    /// state metrics, which J6 must refuse as INVALID rather than
+    /// compare. Same shape as [`repro_series`] minus that one key.
+    fn repro_series_warm_without_state(ef: u64, qps: f64, p50: f64, recall: f64) -> Value {
+        let cold = Value::obj(vec![(
+            "metrics",
+            Value::obj(vec![
+                ("qps", Value::n(qps / 2.0)),
+                ("index_points", Value::n(1_000_000.0)),
+                ("index_indexed", Value::n(1_000_000.0)),
+                ("index_segments", Value::n(8.0)),
+            ]),
+        )]);
+        let med = |x: f64| {
+            Value::obj(vec![
+                ("samples", Value::Arr(vec![Value::n(x)])),
+                ("median", Value::n(x)),
+                ("ci95", Value::Arr(vec![Value::n(x), Value::n(x)])),
+            ])
+        };
+        let warm = Value::obj(vec![
+            ("runs", Value::n(1.0)),
+            (
+                "metrics",
+                Value::obj(vec![
+                    ("qps", med(qps)),
+                    ("p50_ms", med(p50)),
+                    ("recall_at_10", med(recall)),
+                ]),
+            ),
+        ]);
+        Value::obj(vec![
+            (
+                "config",
+                Value::Arr(vec![Value::Arr(vec![
+                    Value::s("ef_search"),
+                    Value::s(&ef.to_string()),
+                ])]),
+            ),
+            ("cold", cold),
+            ("warm", warm),
+        ])
+    }
+
     /// A results document with the J6 provenance fields.
     fn repro_run(profile: &str, voided: bool, series: Vec<Value>) -> Value {
         Value::obj(vec![
@@ -2017,6 +2063,26 @@ warm-pass p50 sanity-checked at 10 ms\",\"pass_kind\":\"run\",\
             v.lines
                 .iter()
                 .any(|l| l.contains("index_indexed") && l.contains("ef16")),
+            "{:?}",
+            v.lines
+        );
+
+        // a warm aggregate lacking index_segments → INVALID (gate
+        // round 1 finding R4: dropping this arm passed 130/130)
+        let nostate_b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series_warm_without_state(16, 2404.4, 0.34433, 0.9410),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let v = repro_verdict(&a3, &nostate_b);
+        assert_eq!(v.word, "INVALID");
+        assert!(
+            v.lines
+                .iter()
+                .any(|l| l.contains("index_segments") && l.contains("ef16")),
             "{:?}",
             v.lines
         );

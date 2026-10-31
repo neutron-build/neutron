@@ -55,6 +55,12 @@ series_tag() { printf '%s' "${NB_SERIES:?}" | tr -c 'A-Za-z0-9_.-' '_'; }
 # args ("" = the J2 window; "--window-s 0" = one poll), $2 = state
 # file path. The full window is used after a container restart; the
 # one-poll re-check between passes of the same series.
+#
+# The tee targets stderr, not stdout: the runner's failure message
+# prefers the driver's stderr, and on a J4 mismatch the both-states
+# diff must reach the run's FAILED line instead of dying in the
+# gitignored settle log (gate round 1, finding R3). Still outside the
+# search command's clock — cold-pass timing is unchanged.
 settle_pass() {
   local window_args=$1 state=$2
   # shellcheck disable=SC2086  # window_args is intentionally word-split
@@ -66,7 +72,7 @@ settle_pass() {
     --timeout-s 300 \
     --expect-state "${NB_OUT}/index-state-init.json" \
     --state-out "$state" \
-    2>&1 | tee "${NB_LOG%.log}.settle.log"
+    2>&1 | tee "${NB_LOG%.log}.settle.log" >&2
 }
 
 case ${NB_MODE:?} in
