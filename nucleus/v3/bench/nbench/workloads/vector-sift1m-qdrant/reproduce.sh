@@ -106,12 +106,13 @@ refuse() { echo "reproduce.sh: $*" >&2; exit 4; }
 # misleading, so it is removed instead when the dir holds no results
 # JSON — regenerate_report would otherwise write a header-only file).
 run_one() {
-  local x=$1 killed log json evidence_work
+  local x=$1 log json
   log="run-$x.log"
   json="$ROW.run-$x.json"
 
   # Protocol refusals: this run must not already exist (a recorded
   # JSON, or a log containing FAILED — a refused run is never re-run).
+  local d
   for d in $(all_repro_dirs); do
     [ -f "$d/$json" ] && refuse "$d/$json already exists (run $x was recorded; no re-runs)"
     if [ -f "$d/$log" ] && grep -q 'FAILED' "$d/$log"; then
@@ -130,11 +131,13 @@ run_one() {
 
   # Where this run's evidence lives. Run A opens today's repro dir; run
   # B must land in the SAME dir as run A (refuse if run A has not
-  # finished, or if more than one dir claims it).
-  local date dirs dir
+  # finished, or if more than one dir claims it). Note: a killed
+  # attempt that began before a UTC midnight keeps its .killed.log in
+  # the earlier date's repro dir; `check` will then (correctly) report
+  # more than one repro dir — run the protocol inside one UTC day.
+  local dirs dir
   if [ "$x" = a ]; then
-    date=$(date -u +%F)
-    REPRO="$ROOT/results/$date/repro"
+    REPRO="$ROOT/results/$(date -u +%F)/repro"
   else
     dirs=$(dir_of_run_a)
     dir=$(printf '%s\n' "$dirs" | head -n 1)
@@ -154,7 +157,7 @@ run_one() {
   # `nbench run` prints the results path on success; take the row's
   # JSON from that line (the date dir it names is authoritative — the
   # runner's own UTC date, which is also the date of the work dir).
-  local results_json date evidence_work
+  local results_json date evidence_work date_dir remaining
   results_json=$(grep '^results: ' "$REPRO/$log" | tail -n 1 | sed 's/^results: *//')
   [ -n "$results_json" ] || { echo "no 'results:' line in $REPRO/$log" >&2; exit 1; }
   mv "$results_json" "$REPRO/$json"
@@ -172,7 +175,6 @@ run_one() {
   # JSON at all — regenerate_report would then write a header-only
   # REPORT.md, which is removed instead (the row's committed home is
   # decided by `verdict`, not by this run).
-  local date_dir remaining
   date_dir=$(dirname "$results_json")
   remaining=$(find "$date_dir" -maxdepth 1 -name '*.json' -type f | wc -l)
   if [ "$remaining" -gt 0 ]; then
@@ -254,11 +256,14 @@ do_check() {
   fi
   word=$(tail -n 1 "$dir/verdict.txt" | sed 's/^REPRO VERDICT=//')
 
-  # Re-derive: same rules `verdict` applied, from the files alone.
+  # Re-derive: same rules `verdict` applied, from the files alone. The
+  # FAILED-line greps are guarded (`|| true`) so a missing log yields
+  # an empty reason and a mismatch report, not a silent set -e exit —
+  # check's job is to state inconsistencies, whatever they are.
   if [ ! -f "$dir/$ROW.run-a.json" ]; then
-    rederived="REPRO VERDICT=INVALID (run A refused: $(grep 'FAILED' "$dir/run-a.log" | tail -n 1))"
+    rederived="REPRO VERDICT=INVALID (run A refused: $(grep 'FAILED' "$dir/run-a.log" 2>/dev/null | tail -n 1 || true))"
   elif [ ! -f "$dir/$ROW.run-b.json" ]; then
-    rederived="REPRO VERDICT=INVALID (run B refused: $(grep 'FAILED' "$dir/run-b.log" | tail -n 1))"
+    rederived="REPRO VERDICT=INVALID (run B refused: $(grep 'FAILED' "$dir/run-b.log" 2>/dev/null | tail -n 1 || true))"
   else
     rederived=$("$BIN" qdrant-repro-verdict \
       --a "$dir/$ROW.run-a.json" --b "$dir/$ROW.run-b.json" | tail -n 1)
