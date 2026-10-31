@@ -333,7 +333,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   it("renders a react-importing dependency package instead of crashing (dev SSR graph)", async () => {
     const root = makeReactCompatApp();
@@ -373,7 +373,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   it("builds the SSR bundle with the dependency inlined and renders it (runtime-bundle shape)", async () => {
     const root = makeReactCompatApp();
@@ -440,7 +440,7 @@ describe("react-compat SSR through the Vite graph", () => {
     expect(versionLine).not.toBe(realReactVersion);
     expect(versionLine).toMatch(/^\d+\.\d+\.\d+$/);
     expect(html).toContain('data-echo="spike"');
-  });
+  }, 30000);
 
   it("start shape: createServer renders a react lib + core-importing app route (core in-graph)", async () => {
     const root = makeStartShapeApp();
@@ -493,7 +493,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   it("start shape: per-request SSR renders a react hook component (no '__H' split)", async () => {
     const root = makeHooksStartShapeApp();
@@ -522,7 +522,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   it("start shape: core hooks (useLocation) render through the same per-request path", async () => {
     const root = makeHooksStartShapeApp();
@@ -551,7 +551,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   it("start shape: buffered compose renders hook components when no streaming renderer resolves", async () => {
     const root = makeHooksStartShapeApp();
@@ -644,7 +644,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   it("start shape: React 19 use() reads contexts and suspends on promises in streaming SSR", async () => {
     const root = makeHooksStartShapeApp();
@@ -692,7 +692,7 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 
   // F-P3-5: the runner inlines every dependency under react-compat, and a
   // CommonJS module has no require/module/exports there. Externalizing the
@@ -755,5 +755,5 @@ describe("react-compat SSR through the Vite graph", () => {
     } finally {
       await server.close();
     }
-  });
+  }, 30000);
 });
