@@ -206,3 +206,59 @@ describe("nested islands", () => {
     expect(document.querySelectorAll("span").length).toBe(1);
   });
 });
+
+describe('client="visible"', () => {
+  // IntersectionObserver reports nothing for an element that generates no
+  // box — a `display: contents` marker, the default (seo.ts). The stub
+  // reports only boxed targets as intersecting, as browsers do.
+  let observed: Element[] = [];
+  let fire: () => void = () => {};
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    (window as any).__ISLAND_COMPONENTS__ = { Counter };
+    observed = [];
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(private callback: (entries: Array<{ target: Element; isIntersecting: boolean }>) => void) {
+          fire = () =>
+            this.callback(
+              observed.map((target) => ({
+                target,
+                isIntersecting: getComputedStyle(target).display !== "contents",
+              }))
+            );
+        }
+        observe(target: Element) {
+          observed.push(target);
+        }
+        disconnect() {}
+      }
+    );
+  });
+
+  it("hydrates a display: contents marker when its content scrolls into view", async () => {
+    document.body.innerHTML =
+      '<neutron-island style="display: contents" data-component="Counter" data-client="visible" data-props="{}">' +
+      "<button>count:0</button></neutron-island>";
+    initIslands();
+    expect(observed.map((target) => target.tagName)).toEqual(["BUTTON"]);
+    fire();
+    await flush();
+    const island = document.querySelector("neutron-island") as HTMLElement & { __neutronHydrated?: boolean };
+    expect(island.__neutronHydrated).toBe(true);
+    island.querySelector("button")!.click();
+    await flush();
+    expect(island.querySelector("button")!.textContent).toBe("count:1");
+    vi.unstubAllGlobals();
+  });
+
+  it("observes the marker itself when it has a box, and the nearest boxed ancestor for text-only content", () => {
+    document.body.innerHTML =
+      '<neutron-island style="display: block" data-component="Counter" data-client="visible" data-props="{}"><button>count:0</button></neutron-island>' +
+      '<section><neutron-island style="display: contents" data-component="Counter" data-client="visible" data-props="{}">text</neutron-island></section>';
+    initIslands();
+    expect(observed.map((target) => target.tagName)).toEqual(["NEUTRON-ISLAND", "SECTION"]);
+    vi.unstubAllGlobals();
+  });
+});

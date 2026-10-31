@@ -139,18 +139,44 @@ function normalizeExportName(name: string): string {
   return name.toLowerCase().replace(/[-_\s]/g, "");
 }
 
+/**
+ * Elements whose visibility stands for the island's. The marker itself is a
+ * layout-transparent `display: contents` element by default (seo.ts), which
+ * generates no box, and IntersectionObserver never reports an element without
+ * one. Its content does: the first descendants that generate a box, looking
+ * through any further `display: contents` wrappers. A marker that is given a
+ * box of its own is observed directly; a box-less marker with no element
+ * content (text only) stands in with its nearest ancestor that has a box.
+ */
+function visibilityTargets(island: IslandElement): Element[] {
+  const hasBox = (element: Element) => getComputedStyle(element).display !== "contents";
+  if (hasBox(island)) return [island];
+  const targets: Element[] = [];
+  const collect = (parent: Element) => {
+    for (const child of Array.from(parent.children)) {
+      if (hasBox(child)) targets.push(child);
+      else collect(child);
+    }
+  };
+  collect(island);
+  if (targets.length > 0) return targets;
+  let ancestor = island.parentElement;
+  while (ancestor && !hasBox(ancestor)) ancestor = ancestor.parentElement;
+  return [ancestor ?? document.documentElement];
+}
+
 function observeVisible(island: IslandElement) {
   const observer = new IntersectionObserver(
-    ([entry]) => {
-      if (entry.isIntersecting) {
-        hydrateIsland(island);
+    (entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
         observer.disconnect();
+        hydrateIsland(island);
       }
     },
     { threshold: 0.1 }
   );
 
-  observer.observe(island);
+  for (const target of visibilityTargets(island)) observer.observe(target);
 }
 
 function onIdle(callback: () => void) {

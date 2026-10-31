@@ -319,14 +319,17 @@ export function renderDocumentHead(
     '<style>html{background:var(--neutron-bg,#0A0A0A);color-scheme:var(--neutron-color-scheme,dark)}</style>';
 
   // <neutron-island> (the hydration wrapper <Island> renders) is a custom
-  // element with no built-in styling, so browsers treat it as inline. Inside
-  // a flex container with non-stretch alignment (e.g. `align-items: center`),
-  // an inline/auto-sized flex item sizes via shrink-to-fit rather than a
-  // definite width, which breaks percentage widths on its children (they have
-  // no definite containing block to resolve against). Force a real, definite
-  // block box so island content sizes predictably in every layout context.
+  // element with no built-in styling, so browsers treat it as inline: inside
+  // a flex container with non-stretch alignment an inline/auto-sized item
+  // shrinks to fit, which breaks percentage widths on its children. Any box
+  // of its own changes layout somewhere — a full-width block breaks flex rows,
+  // grids and inline text. `display: contents` gives it none: the island's
+  // content lays out exactly as it would without the marker, as a direct
+  // child of the island's parent. The runtime observes that content for
+  // `client="visible"` (island-runtime.ts). Author CSS that follows can still
+  // give the marker a box.
   const islandBaseStyle =
-    '<style>neutron-island{display:block;width:100%}</style>';
+    '<style>neutron-island{display:contents}</style>';
 
   return [
     '<meta charset="UTF-8">',

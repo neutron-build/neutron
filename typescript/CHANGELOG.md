@@ -120,6 +120,24 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **`<neutron-island>` is `display: contents` by default, and
+  `client="visible"` works without a marker box.** The document head styled
+  the marker `display: block; width: 100%`, a box of its own that changed
+  layout wherever an island sat: a flex row item stretched to full width, a
+  grid item's sizing went to the wrapper, inline text broke around it. Apps
+  that set `neutron-island { display: contents }` to avoid that (the Fylun
+  port) lost `client="visible"`, because IntersectionObserver never reports
+  an element without a box and the runtime observed the marker. The default
+  is now `display: contents` — the island's content lays out exactly as it
+  would without the marker, which is what the old rule was trying to achieve
+  for percentage widths inside flex containers — and `client="visible"`
+  observes the content's first boxed descendants (looking through nested
+  `display: contents` elements); a marker that has a box is observed itself,
+  and a box-less marker with only text inside is represented by its nearest
+  ancestor with a box. **Migration:** CSS that styled the marker as a box
+  (`neutron-island { margin: … }`) needs an explicit `display` again, e.g.
+  `neutron-island { display: block }`; author stylesheets come after the
+  framework's rule and win.
 - **Static-tier pages are no longer in the app's client bundle.** The client
   route table had an `import()` for every non-resource route, so a `mode:
   "static"` page's module — stripped only of loader/action/getStaticPaths/

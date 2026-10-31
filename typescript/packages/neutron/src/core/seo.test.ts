@@ -150,3 +150,13 @@ describe("seo utilities", () => {
     expect(html).toContain('rel="icon"');
   });
 });
+
+describe("island marker base style", () => {
+  // The marker is a hydration boundary, not a layout box: display: contents
+  // keeps flex/grid/inline layout as if it were absent.
+  it("makes <neutron-island> layout-transparent", () => {
+    const head = renderDocumentHead("/", null);
+    expect(head).toContain("<style>neutron-island{display:contents}</style>");
+    expect(head).not.toContain("width:100%");
+  });
+});
