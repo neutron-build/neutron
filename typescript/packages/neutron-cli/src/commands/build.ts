@@ -62,6 +62,7 @@ import {
   SERVER_BUNDLE_MANIFEST,
   SERVER_BUNDLE_FORMAT,
   findGlobalMiddlewareFile,
+  findServerEntryFile,
   generateServerBundleEntry,
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
@@ -1665,9 +1666,13 @@ async function buildStartServerBundle(
   fs.rmSync(manifestPath, { force: true });
 
   const globalMiddlewareFile = findGlobalMiddlewareFile(options.cwd);
+  // src/server.entry.ts is compiled into the same bundle, so its mounts and
+  // the routes share one instance of every module they both import.
+  const serverEntryFile = findServerEntryFile(options.cwd);
   const pages = options.routes.filter((route) => !route.file.includes("_layout"));
   const needsRuntime =
     globalMiddlewareFile !== null ||
+    serverEntryFile !== null ||
     pages.some((route) => route.config.mode === "app" || isResourceRoute(route));
   if (!needsRuntime) {
     return;
@@ -1679,6 +1684,7 @@ async function buildStartServerBundle(
   const files = [
     ...options.routes.map((route) => route.file),
     ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
+    ...(serverEntryFile ? [serverEntryFile] : []),
   ];
   fs.writeFileSync(
     entryPath,

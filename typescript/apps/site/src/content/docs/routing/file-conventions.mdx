@@ -21,6 +21,8 @@ Neutron uses a file-system based router. The files you create in `src/routes` di
 -   **`_error.tsx`**: An error boundary component that catches errors from child routes.
 -   **`_*.tsx`** (any other file starting with `_`): Private files. These are ignored by the router. Use them for co-located components, utilities, or styles.
 
+Outside `src/routes/`, two app-level files are picked up by convention: `src/middleware.ts` (global middleware) and `src/server.entry.ts` (mounted sub-apps, the WebSocket handler and other long-lived server objects; see [Server entry](/docs/configuration/neutron-config#server-entry)).
+
 ## Dynamic Routes
 
 You can create dynamic route segments by wrapping the filename in brackets `[]`.

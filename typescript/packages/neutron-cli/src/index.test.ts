@@ -1987,6 +1987,83 @@ export function GET() { return Response.json({ parsed: z.object({ a: z.string() 
     }
   });
 
+  // F-P4-1: mounts and the WebSocket handler declared in src/server.entry.ts
+  // are compiled into the start bundle, so a module they import and a route
+  // imports is one instance (a host-built mount loaded a second copy).
+  it("start: src/server.entry.ts mounts, routes and websocket share one module instance from the bundle", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "server-entry-fixture", type: "module" }),
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/lib/counter.ts": "let n = 0;\nexport const next = () => ++n;\n",
+      "src/server.entry.ts": `
+import { Hono } from "hono";
+import { defineServerEntry } from "@neutron-build/core";
+import { next } from "./lib/counter";
+const api = new Hono();
+api.get("/count", (c) => c.json({ n: next() }));
+export default defineServerEntry({
+  mount: { "/api": api },
+  websocket: { path: "/ws", attach(wss) { wss.on("connection", (socket) => socket.send(String(next()))); } },
+});
+`,
+      "src/routes/page.tsx": `
+import { h } from "preact";
+import { next } from "../lib/counter";
+export const config = { mode: "app" };
+export async function loader() { return { n: next() }; }
+export default function Page({ data }) { return h("p", null, "n=" + data.n); }
+`,
+    });
+    // The app's own hono (core's copy, linked in like every other package here).
+    fs.symlinkSync(
+      fs.realpathSync(path.join(CLI_PACKAGE_DIR, "node_modules", "@neutron-build", "core", "node_modules", "hono")),
+      path.join(dir, "node_modules", "hono"),
+      "dir"
+    );
+    try {
+      const output = await runBuild(dir);
+      assert.doesNotMatch(output, /Server bundle failed to build/, output);
+      const port = await freePort();
+      const proc = runCli("start", dir, { NEUTRON_HOST: "127.0.0.1", NEUTRON_PORT: String(port) });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+        assert.match(proc.output(), /Modules: prebuilt server bundle/, proc.output());
+        const base = `http://127.0.0.1:${port}`;
+        const first = await (await fetch(`${base}/api/count`)).json();
+        const page = await (await fetch(`${base}/page`, { headers: { accept: "text/html" } })).text();
+        const second = await (await fetch(`${base}/api/count`)).json();
+        // Two copies of the counter would count 1, 1, 2.
+        assert.deepEqual(first, { n: 1 }, proc.output());
+        assert.ok(page.includes("n=2"), page);
+        assert.deepEqual(second, { n: 3 });
+        const message = await new Promise<string>((resolve, reject) => {
+          const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+          const timer = setTimeout(() => reject(new Error("no websocket message")), 10_000);
+          socket.onmessage = (event) => {
+            clearTimeout(timer);
+            socket.close();
+            resolve(String(event.data));
+          };
+          socket.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error("websocket failed"));
+          };
+        });
+        assert.equal(message, "4");
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // The docker image context is dist/ alone (no node_modules beside it).
   // With pnpm-linked core + preserveSymlinks the docker runtime bundle failed
   // to build (gray-matter's section-matter is invisible from core's linked

@@ -96,6 +96,12 @@ export {
 } from "./server/index.js";
 export type { NeutronOpenApiOptions } from "./server/index.js";
 export {
+  defineServerEntry,
+  type NeutronServerEntry,
+  type NeutronServerEntryExport,
+  type NeutronServerEntryWebSocket,
+} from "./core/server-entry.js";
+export {
   defineConfig,
   resolveRuntime,
   resolveRuntimeAliases,

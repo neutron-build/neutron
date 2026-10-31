@@ -48,6 +48,29 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **`src/server.entry.ts`: mounts and WebSocket handlers in the routes'
+  module graph.** A custom server had to build its tRPC/REST mounts and its
+  WebSocket handler before `createServer`, outside the graph the routes run
+  in. Under `neutron-ts start` the routes come from the prebuilt server
+  bundle, so every module a mount and a route both imported was loaded twice:
+  two Prisma clients, two auth instances, split singletons. The Fylun port
+  worked around it with `globalThis` bridges. An app now declares them in
+  `src/server.entry.ts` (`export default defineServerEntry({ mount,
+  websocket: { path, authorize, attach }, close })`, or a function returning
+  that, async allowed). Neutron loads the file wherever it loads routes. It
+  is compiled into the `start` server bundle (`neutron-ts build` includes it
+  and `createServer` requires it there), loaded through the Vite runtime when
+  there is no bundle, and loaded through Vite in `neutron-ts dev`, which now
+  serves the entry's mounts (global middleware first, unmatched paths falling
+  through, as in production) and its WebSocket upgrades, and reloads the
+  entry on edit. Entry mounts merge with `createServer({ mount })` (a prefix
+  declared in both is a startup error). `websocket` enables the transport and
+  `attach` receives the `WebSocketServer`, and `close` runs on shutdown after
+  the drain. A present file that fails to load or exports nothing usable is a
+  startup error, like `src/middleware.ts`. The name is not `src/server.ts`:
+  that is where apps keep a custom server that calls `createServer`, which
+  must not import itself. `createServer({ mount })` is unchanged. The
+  vercel/netlify/cloudflare/docker handlers do not serve mounts, as before.
 - **Security headers can be scoped per route.** `securityHeaders` was one
   site-wide set, so an app that needs cross-origin isolation on one section
   (Fylun: COOP/COEP on `/builder/**` for WebContainer, and no COEP anywhere

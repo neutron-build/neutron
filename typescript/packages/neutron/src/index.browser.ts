@@ -156,6 +156,7 @@ export const setActiveMarkdownConfig = serverOnly("setActiveMarkdownConfig");
 export const getActiveMarkdownConfig = serverOnly("getActiveMarkdownConfig");
 export const createServer = serverOnly("createServer");
 export const startServer = serverOnly("startServer");
+export const defineServerEntry = serverOnly("defineServerEntry");
 export const resolvePreactSsr = serverOnly("resolvePreactSsr");
 export const vitePreactAliases = serverOnly("vitePreactAliases");
 export const mergePreactAliases = serverOnly("mergePreactAliases");

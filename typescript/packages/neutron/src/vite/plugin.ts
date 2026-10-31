@@ -16,6 +16,13 @@ import { resolveClientTier } from "../core/render-app-route.js";
 import { transformSsrCommonJs } from "./ssr-cjs.js";
 import { toDataRedirectResponse } from "../core/data-redirect.js";
 import { applySecurityHeaders, resolveSecurityHeadersConfig } from "../server/http-headers.js";
+import { Hono } from "hono";
+import type { WebSocketServer } from "ws";
+import {
+  findServerEntryFile,
+  resolveServerEntryModule,
+  type NeutronServerEntry,
+} from "../core/server-entry.js";
 import {
   applyRouteRuleHeaders,
   compileRouteRules,
@@ -370,9 +377,27 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
         }
       });
 
+      const loadDevGlobalMiddleware = async (): Promise<MiddlewareFn[]> => {
+        const globalMiddlewareFile = findGlobalMiddlewareFile(rootDir);
+        return globalMiddlewareFile
+          ? await loadGlobalMiddleware((id) => server.ssrLoadModule(id), globalMiddlewareFile)
+          : [];
+      };
+      const serverEntryState = createDevServerEntryState(rootDir, (id) => server.ssrLoadModule(id));
+      server.httpServer?.on("upgrade", (req, socket, head) => {
+        serverEntryState.upgrade(req, socket as import("node:net").Socket, head);
+      });
+      server.httpServer?.on("close", () => {
+        void serverEntryState.close();
+      });
+
       server.middlewares.use(async (req, res, next) => {
         const requestStartMs = performance.now();
         let matchedRouteId: string | undefined;
+        // A request a mount let fall through: its body was read once, and the
+        // global middleware already ran ahead of the mount.
+        let mountRequest: Request | undefined;
+        let globalChainRan = false;
         try {
           const url = new URL(req.url || "/", `http://${sanitizeHost(req.headers.host)}`);
           const originalPathname = url.pathname;
@@ -420,6 +445,36 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
               sendBuiltIn(req, res, "application/json", JSON.stringify(spec));
             }
             return;
+          }
+
+          // src/server.entry.ts mounts (core/server-entry.ts), loaded through
+          // this server's SSR graph like the routes, so they share module
+          // instances. Production registers mounts after /health & co. and
+          // before route rules and the routes, runs the global middleware
+          // ahead of them, and lets a path the sub-app does not match fall
+          // through to the routes with the chain already run.
+          const devMount = await serverEntryState.match(normalizePathname(originalPathname));
+          if (devMount) {
+            mountRequest = await createRequest(req, url);
+            const chain = devMount.globalMiddleware
+              ? await loadDevGlobalMiddleware()
+              : [];
+            let answer: Response;
+            try {
+              answer = await runMiddlewareChain(chain, mountRequest, {}, () =>
+                Promise.resolve(devMount.dispatcher.fetch(mountRequest!))
+              );
+            } catch (error) {
+              if (!isResponse(error)) throw error;
+              answer = error;
+            }
+            if (answer.headers.get(DEV_PASS_THROUGH_HEADER) !== devPassThroughToken) {
+              const sent = withMutableHeaders(toDataRedirectResponse(mountRequest, answer));
+              applyResponseHeaders(sent, originalPathname);
+              await sendWebResponse(req, res, sent);
+              return;
+            }
+            globalChainRan = chain.length > 0;
           }
 
           if (originalPathname === "/_neutron/image") {
@@ -507,10 +562,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           // ssrLoadModule, so adding, editing or deleting the file takes effect
           // on the next request. A present file that fails to load surfaces as
           // an error rather than silently serving without its gate.
-          const globalMiddlewareFile = findGlobalMiddlewareFile(rootDir);
-          const globalMiddleware = globalMiddlewareFile
-            ? await loadGlobalMiddleware((id) => server.ssrLoadModule(id), globalMiddlewareFile)
-            : [];
+          const globalMiddleware = globalChainRan ? [] : await loadDevGlobalMiddleware();
 
           const match = state.router.match(pathname);
           if (!match) {
@@ -566,7 +618,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           const layoutChain = getLayoutChain(route, state.routes);
           const allRoutes = [...layoutChain, route];
 
-          const request = await createRequest(req, url);
+          const request = mountRequest ?? (await createRequest(req, url));
           const context: AppContext = {};
 
           // Dev timing context
@@ -1359,6 +1411,173 @@ function renderDefaultError(error: Error): string {
   </div>
 </body>
 </html>`;
+}
+
+interface DevMount {
+  globalMiddleware: boolean;
+  /** The sub-app under its prefix; a path it does not match answers the pass-through marker. */
+  dispatcher: Hono;
+}
+
+/**
+ * The dev server's view of src/server.entry.ts. The module is loaded through
+ * Vite on every request (cheap: cached until an edit invalidates it), and the
+ * entry is rebuilt only when Vite hands back a new module, closing the old
+ * entry and its WebSocket clients first.
+ */
+function createDevServerEntryState(
+  rootDir: string,
+  loadModule: (id: string) => Promise<unknown>
+) {
+  interface EntryState {
+    mod: unknown;
+    entry: NeutronServerEntry;
+    mounts: Array<{ prefix: string; mount: DevMount }>;
+    wss?: Promise<WebSocketServer>;
+  }
+  let current: EntryState | null = null;
+  let loading: Promise<EntryState | null> | null = null;
+
+  const retire = async (previous: EntryState | null): Promise<void> => {
+    if (!previous) return;
+    if (previous.wss) {
+      const wss = await previous.wss;
+      for (const client of wss.clients) client.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+    await previous.entry.close?.();
+  };
+
+  const load = async (): Promise<EntryState | null> => {
+    const file = findServerEntryFile(rootDir);
+    if (!file) {
+      const previous = current;
+      current = null;
+      await retire(previous);
+      return null;
+    }
+    const mod = await loadModule(file);
+    if (current && current.mod === mod) return current;
+    const entry = await resolveServerEntryModule(mod, file);
+    const mounts = Object.entries(entry.mount ?? {}).map(([prefix, value]) => {
+      const { app, globalMiddleware = true } =
+        typeof (value as { fetch?: unknown }).fetch === "function"
+          ? { app: value as Hono, globalMiddleware: true }
+          : (value as { app: Hono; globalMiddleware?: boolean });
+      const dispatcher = new Hono();
+      dispatcher.route(prefix, app);
+      dispatcher.notFound(
+        () => new Response(null, { status: 404, headers: { [DEV_PASS_THROUGH_HEADER]: devPassThroughToken } })
+      );
+      return { prefix: prefix.replace(/\/+$/, "") || "/", mount: { globalMiddleware, dispatcher } };
+    });
+    const previous = current;
+    current = { mod, entry, mounts };
+    await retire(previous);
+    return current;
+  };
+
+  const resolve = async (): Promise<EntryState | null> => {
+    // One load at a time: concurrent first requests share it.
+    loading ??= load().finally(() => {
+      loading = null;
+    });
+    return loading;
+  };
+
+  return {
+    async match(pathname: string): Promise<DevMount | null> {
+      const state = await resolve();
+      if (!state) return null;
+      for (const { prefix, mount } of state.mounts) {
+        if (pathname === prefix || pathname.startsWith(prefix === "/" ? "/" : prefix + "/")) {
+          return mount;
+        }
+      }
+      return null;
+    },
+
+    /** Upgrades for the entry's `websocket`; Vite's own HMR socket is left to Vite. */
+    upgrade(req: import("node:http").IncomingMessage, socket: import("node:net").Socket, head: Buffer): void {
+      const protocol = req.headers["sec-websocket-protocol"];
+      if (protocol === "vite-hmr" || protocol === "vite-ping") return;
+      void (async () => {
+        let state: EntryState | null;
+        try {
+          state = await resolve();
+        } catch {
+          socket.destroy();
+          return;
+        }
+        const options = state?.entry.websocket;
+        if (!state || !options) return;
+        if (options.path) {
+          let pathname: string;
+          try {
+            pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+          } catch {
+            return;
+          }
+          if (pathname !== options.path) return;
+        }
+        if (options.authorize) {
+          // Fail closed with a deadline, as in production (TS-28).
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const allowed = await Promise.race([
+            Promise.resolve()
+              .then(() => options.authorize!(req))
+              .catch(() => false),
+            new Promise<false>((done) => {
+              timer = setTimeout(() => done(false), 5_000);
+            }),
+          ]);
+          clearTimeout(timer);
+          if (allowed !== true || socket.destroyed) {
+            socket.destroy();
+            return;
+          }
+        }
+        state.wss ??= (async () => {
+          const { WebSocketServer: WSServer } = await import("ws");
+          const wss = new WSServer({ noServer: true });
+          await options.attach(wss);
+          return wss;
+        })();
+        const wss = await state.wss;
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          wss.emit("connection", ws, req);
+        });
+      })();
+    },
+
+    async close(): Promise<void> {
+      const previous = current;
+      current = null;
+      await retire(previous);
+    },
+  };
+}
+
+async function sendWebResponse(
+  req: import("http").IncomingMessage,
+  res: import("http").ServerResponse,
+  response: Response
+): Promise<void> {
+  res.statusCode = response.status;
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase() !== "set-cookie") res.setHeader(key, value);
+  });
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length > 0) res.setHeader("set-cookie", cookies);
+  if (response.body && req.method !== "HEAD") {
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+  }
+  res.end();
 }
 
 async function createRequest(req: import("http").IncomingMessage, url: URL): Promise<Request> {

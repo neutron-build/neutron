@@ -19,6 +19,7 @@ import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
+import { findServerEntryFile, loadServerEntry } from "../core/server-entry.js";
 import { isResponse, notFound, acceptsHtml, withMutableHeaders } from "../core/response.js";
 import { createRouter } from "../core/router.js";
 import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
@@ -119,6 +120,13 @@ export type {
 } from "./cache-store.js";
 export { csrfMiddleware } from "./csrf.js";
 export { findGlobalMiddlewareFile } from "../core/global-middleware.js";
+export {
+  defineServerEntry,
+  findServerEntryFile,
+  type NeutronServerEntry,
+  type NeutronServerEntryExport,
+  type NeutronServerEntryWebSocket,
+} from "../core/server-entry.js";
 export {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
@@ -286,6 +294,12 @@ export interface NeutronServerOptions {
    * answers instead of the sub-app. A sub-app that gates itself and must not
    * see the global chain opts out per mount:
    * `mount: { "/api/trpc": { app: trpcApp, globalMiddleware: false } }`.
+   *
+   * Mounts whose sub-apps import modules the routes also import (a DB
+   * client, an auth instance) belong in `src/server.entry.ts`
+   * (`defineServerEntry`), which is loaded in the routes' module graph; a
+   * sub-app built by the caller is a separate copy of those modules. Both
+   * sources are merged, and a prefix may be declared in only one.
    */
   mount?: Record<string, NeutronMountApp | NeutronMount>;
   /**
@@ -553,8 +567,12 @@ export async function createServer(
   // The file is found with a plain fs check, which needs no runtime, so its
   // presence can be part of the decision to start one.
   const globalMiddlewareFile = isSsr ? findGlobalMiddlewareFile(resolvedRootDir) : null;
+  // src/server.entry.ts (core/server-entry.ts): mounts, the WebSocket handler
+  // and other long-lived server objects, loaded through the same runtime as
+  // the routes so both share one instance of every module (F-P4-1).
+  const serverEntryFile = isSsr ? findServerEntryFile(resolvedRootDir) : null;
   const needsSsrRuntime =
-    hasAppRoutes || hasResourceRoutes || globalMiddlewareFile !== null;
+    hasAppRoutes || hasResourceRoutes || globalMiddlewareFile !== null || serverEntryFile !== null;
   // Fail closed (TS-01): when the SSR runtime is required — app routes exist
   // or a global middleware file was found — a Vite initialization failure
   // must reject createServer, not silently downgrade the app to a static
@@ -573,6 +591,7 @@ export async function createServer(
         requiredFiles: [
           ...routes.map((route) => route.file),
           ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
+          ...(serverEntryFile ? [serverEntryFile] : []),
         ],
       })
     : null;
@@ -601,6 +620,32 @@ export async function createServer(
         "or remove the middleware file; serving requests without it would bypass its gate."
     );
   }
+  // A present entry that fails to load or exports nothing usable is a startup
+  // error, like the global middleware (TS-01).
+  const serverEntry =
+    serverEntryFile && ssrServer ? await loadServerEntry(ssrServer.ssrLoadModule, serverEntryFile) : null;
+  if (serverEntry?.mount && mount) {
+    for (const prefix of Object.keys(serverEntry.mount)) {
+      if (Object.prototype.hasOwnProperty.call(mount, prefix)) {
+        throw new Error(
+          `Mount prefix "${prefix}" is declared both in createServer({ mount }) and in ` +
+            `${path.relative(resolvedRootDir, serverEntryFile!)}; declare it once.`
+        );
+      }
+    }
+  }
+  const mounts =
+    serverEntry?.mount || mount ? { ...(serverEntry?.mount ?? {}), ...(mount ?? {}) } : undefined;
+  // The entry's websocket enables the transport if the options did not, and
+  // fills the path/authorizer the options leave unset.
+  const websocketOptions: boolean | NeutronWebSocketOptions | undefined = serverEntry?.websocket
+    ? {
+        ...(typeof websocket === "object" ? websocket : {}),
+        path: (typeof websocket === "object" ? websocket.path : undefined) ?? serverEntry.websocket.path,
+        authorize:
+          (typeof websocket === "object" ? websocket.authorize : undefined) ?? serverEntry.websocket.authorize,
+      }
+    : websocket;
   const routeModuleCache = new Map<string, Promise<RouteModule>>();
   const appResponseCacheStore =
     cache?.app || createMemoryAppCacheStore();
@@ -821,9 +866,9 @@ export async function createServer(
   // under a prefix the sub-app does not match falls through to the catch-all,
   // which must not run the chain a second time.
   const globallyGatedRequests = new WeakSet<Request>();
-  if (mount) {
-    validateMountConfig(mount, isSsr);
-    for (const [prefix, entry] of Object.entries(mount)) {
+  if (mounts) {
+    validateMountConfig(mounts, isSsr);
+    for (const [prefix, entry] of Object.entries(mounts)) {
       const { app: subApp, globalMiddleware: runGlobal = true } = normalizeMountEntry(entry);
       if (runGlobal && appGlobalMiddleware.length > 0) {
         app.use("*", async (c, next) => {
@@ -1442,9 +1487,9 @@ export async function createServer(
   // rendering mode. Raw `ws` in noServer mode so the framework owns the upgrade handshake
   // and the caller just attaches `wss.on("connection", ...)`.
   let wss: WebSocketServer | undefined;
-  if (websocket) {
+  if (websocketOptions) {
     const { WebSocketServer: WSServer } = await import("ws");
-    const wsOptions = websocket === true ? {} : websocket;
+    const wsOptions = websocketOptions === true ? {} : websocketOptions;
     wss = new WSServer({ noServer: true });
     const httpServer = server as unknown as import("node:http").Server;
     httpServer.on("upgrade", (req, socket, head) => {
@@ -1492,6 +1537,16 @@ export async function createServer(
     });
   }
 
+  if (wss && serverEntry?.websocket) {
+    try {
+      await serverEntry.websocket.attach(wss);
+    } catch (error) {
+      wss.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw error;
+    }
+  }
+
   // One shutdown per server (TS-29): repeated close() calls join the same
   // teardown instead of racing a second one through still-draining stages.
   let closingPromise: Promise<void> | undefined;
@@ -1533,6 +1588,9 @@ export async function createServer(
               server.close((err) => (err ? reject(err) : resolve()));
               (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
             }),
+          // The server entry's own resources (clients, pools): no request
+          // can reach its mounts any more.
+          () => Promise.resolve(serverEntry?.close?.()),
           // Last: the SSR runtime. Nothing still rendering depends on it now.
           () => ssrServer?.close() ?? Promise.resolve(),
         ];

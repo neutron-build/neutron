@@ -91,6 +91,35 @@ mount: {
 
 When your API is a handful of per-file endpoints rather than a sub-app, prefer [resource routes](/docs/routing/file-conventions#resource-routes) — route modules exporting `GET`/`POST`/… handlers, served through the same middleware chain as pages.
 
+### Server entry
+
+`server.mount` in `neutron.config.ts` needs a live Hono instance, and so does a custom server that builds its mounts before calling `createServer`. Either way the mounts are created outside the module graph the routes run in. Under `neutron-ts start` the routes come from the prebuilt server bundle, so a module imported by both a mount and a route (a database client, an auth instance, a rate limiter, a WebSocket hub) is loaded twice and splits into two instances.
+
+Declare them in `src/server.entry.ts` instead. Neutron loads that file in the same module graph as the routes: it is compiled into the server bundle for `start`, loaded through the Vite runtime when there is no bundle, and loaded through Vite by `neutron-ts dev`. Every module it shares with the routes is one instance.
+
+```ts
+// src/server.entry.ts
+import { defineServerEntry } from "@neutron-build/core";
+import { trpcApp } from "./server/trpc";
+import { hub } from "./server/hub";
+import { db } from "./lib/db"; // the same instance your loaders import
+
+export default defineServerEntry(async () => ({
+  mount: {
+    "/api/trpc": trpcApp, // or { app, globalMiddleware: false }
+  },
+  websocket: {
+    path: "/ws",
+    authorize: (request) => hub.authorize(request), // fail-closed, before the handshake
+    attach: (wss) => hub.attach(wss), // called once with the server's WebSocketServer
+  },
+  close: () => db.$disconnect(), // after in-flight requests drain
+}));
+```
+
+The default export is the entry object or a function returning it (async is fine, for setup that must finish before the server serves). `mount` follows the rules of `server.mount`: global middleware runs first, prefixes are validated, and paths the sub-app does not match fall through to the routes. It is merged with `createServer({ mount })`, and a prefix may only be declared in one of them. `websocket` turns the WebSocket server on (`createServer({ websocket })` options, if given, win for `path` and `authorize`). The dev server serves the entry's mounts and WebSocket too, and reloads the entry when it changes, calling the old one's `close` first. A file that exists but fails to load, or exports nothing usable, stops the server from starting. The entry runs in `ssr` mode only. The vercel, netlify, cloudflare and docker runtime handlers do not serve mounts. `createServer({ mount })` keeps working as before.
+
+
 ## Security headers
 
 `server.securityHeaders` is on by default. Every response gets these unless it already set the header itself:
