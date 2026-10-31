@@ -3087,10 +3087,17 @@ export default function Item({ data }) { return h("p", null, "item " + data.id);
         const base = `http://127.0.0.1:${port}`;
         await waitForHealth(`${base}/health`, start);
         assert.match(start.output(), /Modules: prebuilt server bundle/, start.output());
-        assertNotFoundPage(await get(base, "/models/unknown"), "start: ungenerated param");
-        assertNotFoundPage(await get(base, "/models/retired"), "start: prerender 404");
-        assertNotFoundPage(await get(base, "/items/missing"), "start: loader notFound()");
-        assertNotFoundPage(await get(base, "/no/such/page"), "start: unmatched");
+        // The server bundle's document names the not-found route on the
+        // client entry, so the router hydrates it, not the page (F-P6-5).
+        const assertMarked = (page: { status: number; body: string }, label: string) => {
+          assertNotFoundPage(page, label);
+          assert.match(page.body, /<script type="module"[^>]* data-neutron-not-found="route:not-found\.tsx"/, `${label}: ${page.body}`);
+        };
+        assertMarked(await get(base, "/models/unknown"), "start: ungenerated param");
+        assertMarked(await get(base, "/models/retired"), "start: prerender 404");
+        assertMarked(await get(base, "/items/missing"), "start: loader notFound()");
+        assertMarked(await get(base, "/no/such/page"), "start: unmatched");
+        assert.ok(!(await get(base, "/items/present")).body.includes("data-neutron-not-found"));
         assert.equal((await get(base, "/404")).status, 404, "404.html is not a page at /404");
         assert.equal((await get(base, "/models/known")).status, 200);
       } finally {

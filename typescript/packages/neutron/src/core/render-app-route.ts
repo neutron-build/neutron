@@ -639,7 +639,8 @@ function buildHtmlSuffix(
   includeClientRuntime: boolean = true,
   nonce?: string,
   clientTier: "none" | "static" | "full" = "full",
-  lazyStylesheetHrefs: string[] = []
+  lazyStylesheetHrefs: string[] = [],
+  notFoundRouteId?: string
 ): string {
   if (!includeClientRuntime) {
     return `</div>
@@ -665,8 +666,15 @@ function buildHtmlSuffix(
   const lazyCss = lazyStylesheetHrefs.length > 0
     ? ` data-neutron-css-lazy="${escapeHtml(lazyStylesheetHrefs.join(" "))}"`
     : "";
+  // A not-found page answering a URL that matches a page (a loader's
+  // notFound(), a static route's ungenerated param) names itself, so the
+  // client router hydrates it instead of the page (hydrate.ts
+  // renderedNotFoundRoute).
+  const notFoundAttr = notFoundRouteId
+    ? ` data-neutron-not-found="${escapeHtml(notFoundRouteId)}"`
+    : "";
   const clientScript = clientEntryScriptSrc
-    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"${lazyCss}></script>`
+    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"${lazyCss}${notFoundAttr}></script>`
     : "";
 
   // A static-tier document ships no router, so nothing intercepts its links.
@@ -705,7 +713,8 @@ function wrapHtml(
   seo: SeoMetaInput | null = null,
   stylesheetHrefs: string[] = [],
   clientTier: "none" | "static" | "full" = "full",
-  lazyStylesheetHrefs: string[] = []
+  lazyStylesheetHrefs: string[] = [],
+  notFoundRouteId?: string
 ): string {
   return `${buildHtmlPrefix(pathname, headHtml, seo, stylesheetHrefs)}${content}${buildHtmlSuffix(
     loaderData,
@@ -714,7 +723,8 @@ function wrapHtml(
     includeClientRuntime,
     nonce,
     clientTier,
-    lazyStylesheetHrefs
+    lazyStylesheetHrefs,
+    notFoundRouteId
   )}`;
 }
 
@@ -816,6 +826,8 @@ interface RenderAppRouteHtmlResponseArgs {
   sourceFile?: string;
   /** Host-resolved renderer pair matching the route modules' graph. */
   renderer?: RouteRenderer;
+  /** Set when the rendered route is a not-found page (buildHtmlSuffix). */
+  notFoundRouteId?: string;
 }
 
 async function renderAppRouteHtmlResponse(
@@ -844,7 +856,8 @@ async function renderAppRouteHtmlResponse(
       args.seo ?? null,
       args.stylesheetHrefs,
       args.clientTier ?? "full",
-      args.lazyStylesheetHrefs
+      args.lazyStylesheetHrefs,
+      args.notFoundRouteId
     );
   };
 
@@ -866,7 +879,8 @@ async function renderAppRouteHtmlResponse(
     args.includeClientRuntime,
     args.nonce,
     args.clientTier ?? "full",
-    args.lazyStylesheetHrefs
+    args.lazyStylesheetHrefs,
+    args.notFoundRouteId
   );
 
   let reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -1435,6 +1449,7 @@ export async function renderAppRoute(
             ? ((context as { cspNonce?: unknown }).cspNonce as string)
             : undefined,
         renderer,
+        notFoundRouteId: match.route.isNotFound ? match.route.id : undefined,
       });
     } catch (error) {
       emitHook(hooks?.onError, {

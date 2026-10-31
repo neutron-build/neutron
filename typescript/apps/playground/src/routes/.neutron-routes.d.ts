@@ -18,7 +18,9 @@ declare module "@neutron-build/core" {
     | "/error-demo"
     | "/islands"
     | "/login"
+    | `/notes/${string}`
     | "/protected"
+    | `/shelves/${string}`
     | "/todos"
     | "/users"
     | `/users/${string}`
