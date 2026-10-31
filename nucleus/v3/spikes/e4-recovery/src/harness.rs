@@ -835,8 +835,6 @@ fn run_task(
             for op in task.ops.iter() {
                 yld!();
                 if let Err(e) = script_op(&cx, op) {
-                    // TEMP-PROBE (reverted): the failing op, in full.
-                    eprintln!("SCRIPT-OP FAIL {op:?}: {e:?}");
                     // A failed script op is a round failure, recorded
                     // and reported — never a silent early exit (the
                     // service tasks would spin on a workload that can

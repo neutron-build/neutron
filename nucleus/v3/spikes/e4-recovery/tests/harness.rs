@@ -612,3 +612,24 @@ fn park_loops_exit_loudly_on_a_failed_round() {
         "P1: the forced-checkpoint wait must unwind loudly (got {ck:?})"
     );
 }
+
+/// X5-R13 (a): campaign stderr carries only the progress lines, real
+/// errors and the watchdog's abort line — the `TEMP-PROBE (reverted)`
+/// `eprintln!("SCRIPT-OP FAIL …")` (P's ruling: about 0.8 MB per seed,
+/// about 8 GB per 10k pass, all of it from that one line) is gone. The
+/// pin reads the harness source and fails if the probe (or any
+/// SCRIPT-OP stderr print) comes back: the flood was stderr-side, so
+/// the source is the deterministic observable.
+#[test]
+fn r13a_no_script_op_probe_on_stderr() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness.rs"))
+        .expect("read src/harness.rs");
+    assert!(
+        !src.contains("SCRIPT-OP FAIL"),
+        "X5-R13 (a): the TEMP-PROBE stderr line is back in src/harness.rs"
+    );
+    assert!(
+        !src.contains("TEMP-PROBE"),
+        "X5-R13 (a): a TEMP-PROBE marker is back in src/harness.rs"
+    );
+}

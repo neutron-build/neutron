@@ -18,12 +18,12 @@
 //!   --check results/mutants.json` re-runs, stopping at each mutant's
 //!   recorded first catch, and checks it matches.
 //!
-//! **Stage status (see the crate README):** X5-R6 — P's pre-data ruling
-//! on O-1 when recovery returns `Ok` alongside an XX001 — has not been
-//! delivered, and the card's amendment stops the worker before the first
-//! campaign `run` whose output anyone reads. The subcommands are fully
-//! implemented; a missing results file exits non-zero with a clear
-//! message, which is what the Acceptance runs of this stage record.
+//! **Stage status (see the crate README):** the rulings X5-R6–R12 are
+//! delivered and recorded verbatim in the crate README (before the first
+//! campaign `run`, per X5-R8); X5-R13's memory and liveness
+//! instrumentation — the liveness budget, the memory watchdog and the
+//! half-open seed range — guards every campaign-class command from this
+//! stage on.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -229,10 +229,8 @@ fn cmd_verify(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!(
                 "e4-campaign verify: cannot read {path}: {e}\n\
-                 \x20(no campaign results exist in this stage: the Work-2 X5-R6 ruling —\n\
-                 \x20 P's pre-data O-1 ruling for recovered-Ok-with-detected-loss — has not\n\
-                 \x20 been delivered, and the card stops the worker before the first\n\
-                 \x20 campaign run whose output anyone reads; see the crate README)"
+                 \x20(no campaign results there yet: run `run --seeds 0..10000 --threads N\n\
+                 \x20 --out <path>` first; see the crate README)"
             );
             return 2;
         }

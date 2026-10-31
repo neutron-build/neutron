@@ -3,10 +3,12 @@
 Status: **stage X-5c — X5-R10 and X5-R11 (a)-(f) landed with their pins,
 the 16-seed smoke shows all 16 seeds passing; the rulings X5-R6-R12 are
 recorded verbatim below (committed before the first campaign run, per
-X5-R8); the 10k campaign, `verify` and the mutant sweep follow in this
-attempt.** The stages before it (X-5a, X-5b) are complete and merged.
-Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
-fix).
+X5-R8); X5-R13 (a) landed (the TEMP-PROBE stderr line is gone, and the
+ruling is recorded verbatim below in the same commit, before the next
+`run`); (b)-(d), the 10k campaign, `verify` and the mutant sweep follow
+in this attempt.** The stages before it (X-5a, X-5b) are complete and
+merged. Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and
+X5-R9's sim fix).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -223,6 +225,79 @@ fixes each, pinned).**
   classes with deterministic repros in the README, and ESCALATE. Do
   not spend the remaining attempts. P triages from the committed,
   digest-reproducible file.
+
+## P's ruling on the OOM kills, verbatim (X-5c-esc-2, 2026-10-31; binding)
+
+Copied verbatim from the card. It replaces steps 2–3 of X5-R12's order;
+the worker landed (a) with this copy in the same commit, before the next
+`run`, as the ruling requires.
+
+**P ruling on the OOM kills of runs 2 and 3 (nv3-X-5c-esc-2, 2026-10-31): binding. It replaces steps 2–3 of X5-R12's order.** The full record is `nucleus/v3/verdicts/X-5c-esc-2.md` in the main checkout. Everything binding is below. Runs 2 and 3 were OOM-killed, not stopped by the provider: the systemd journal shows the runner's scope killed by the OOM killer, with a 32.5 GiB memory peak and a 60.7 GiB swap peak in run 3 (04:05:48). The kill took the agent session with it.
+
+**X5-R13 (memory and liveness: the campaign must terminate and stay bounded).**
+- **Measured by P at 5d99c141** (release build, `--threads 1`, each seed in its own process, under a memory cap):
+  - Seeds 0–49 except 36: max RSS 80–271 MiB (mean 76 MiB), 0.25–1.6 s each.
+  - **No accumulation across seeds.** One process over seeds 0–35 peaks at 291 MiB, against a single-seed max of 265 MiB in that range. A record is about 690 B, so 10k records are about 7 MB.
+  - **Threads.** At `--threads 16`, seeds 37–147 peak at 2.4 GiB RSS and 9.8 GiB VmPeak, at about 7.6 seeds/s. At 8 and 16 threads, seeds 0–35 give `campaign.json` byte-identical to `--threads 1`.
+  - **Seed 36 does not terminate.** RSS grows linearly at about 94 MiB/s, and the seed was OOM-killed at the 14 GiB cap after 117 s wall (2 min 31 s CPU).
+  - **Seeds 0–199** (20 s and 2 GiB per seed): 198 seeds finish, and every scheduler world in them uses fewer than 25,000 yields. Seeds **36 and 148** run forever: 2.94 M and 9.96 M yields at 20 s.
+  - **stderr** is about 0.8 MB per seed, so about 8 GB per 10k pass. All of it comes from the `TEMP-PROBE (reverted)` `eprintln!("SCRIPT-OP FAIL …")` at `src/harness.rs:839`, which was never reverted.
+- **The cause is neither the per-worker footprint nor accumulation.** 16 × 271 MiB ≈ 4.3 GiB. The cause is **livelocked seeds** (about 1 in 100). In them, some task keeps yielding and never parks, so "all tasks blocked" never holds and the DEADLOCK detector never fires.
+  - **Seed 36.** `tree::gc_step` hands back its own cursor (`next == resume`; tree 2, root lpid 3, `w = 30`), so `harness::gc_sweep` loops at `h:gcyield` forever. The checkpointer spins at `h:ckpt` meanwhile.
+  - **Seed 148.** The checkpointer spins at `h:ckpt` (`checkpointer_body`) waiting for `workload_done`. Its RSS stays flat: a pure spin, which costs a worker but no memory.
+  - **Why it kills.** Each such seed holds a worker forever and grows without bound. At about 1 per 100 seeds, all 16 workers are captured within the first few thousand seeds. That is run 2's exit at about 3,000/10,000 after 577 s, and run 3's 32.5 GiB + 60.7 GiB.
+  - **These are failing seeds under X5-R3, not sizing.** X5-R12's "577-s exit" item is answered by this ruling: P has root-caused the exit.
+- **The ruling.** Each item is an instrumentation fix (X5-R11 (g)'s class), in its own pinned commit, before any further campaign `run`:
+  1. **(a) stderr.** Delete the TEMP-PROBE `eprintln!`. Campaign stderr carries only:
+     - the progress lines;
+     - real errors;
+     - (d)'s abort line.
+  2. **(b) A liveness budget (a tightening: a hang becomes a recorded failure, never a pass).**
+     - **The budget.** `Sched` gets a fixed per-world yield budget, `YIELD_BUDGET = 1_000_000`: 40× the largest world measured.
+     - **On a trip.** When a world's `yields` exceeds the budget, the scheduler fails the world exactly as the deadlock path does (crashed, waiters cleared, all notified) and returns a new `SimFail::Livelock`.
+     - **The record.** The harness records it on the round, as `livelock: true` plus the site of the yield that tripped it. The round and seed `deadlock` flags fold it in, so it counts in `DEADLOCK=` and in RESULT item 7's n. `livelock` goes into `campaign.json` and the digest.
+     - **Determinism.** Yields are counted in sim order, so the S-DET/W-DET thread-count pin must still pass.
+     - **Changing the budget.** The constant is fixed now and goes in the README. It may change only as the fix for a seed whose root cause is a legitimately long world (an instrumentation defect), followed by a whole-campaign re-run.
+     - **Pins.**
+       - A directed test with a literal config: a task that only yields and never parks. Its round must record `livelock` and `deadlock`, and the test must fail with the budget check removed.
+       - `run --seeds 36..37` must finish, with seed 36 recorded as DEADLOCK/livelock.
+  3. **(c) A memory self-check (process-level; never a record, a digest or a sim input).**
+     - **The watchdog.** `run`, `verify` and `mutants` start a watchdog thread. It reads `VmRSS` from `/proc/self/status` (std only) once per second.
+     - **On a trip.** Above `E4_MEM_LIMIT_MIB` (default 20480), it stops dispatch, then:
+       - writes the completed records, sorted by seed, to `<out>.partial` (for `mutants`: the completed mutant records);
+       - prints `E4 ABORT rss=<MiB> limit=<MiB> done=<k>/<n> inflight=<seeds>` to stderr;
+       - exits 3, without writing `<out>` and without a final `E4` line.
+     - **Partial files.** A `.partial` file is diagnostic only. It is never `verify`'s input and never a RESULT count.
+     - **Progress lines.** Every progress line also prints `rss=<MiB>`.
+     - **Pin.** The check is a function of `(rss, limit)`, unit-tested on both sides of the limit.
+     - **Why it is allowed.** The watchdog's 1-s sleep is wall-clock, but it decides only whether the process lives. It never feeds a sim-visible decision, so the "Do not" ban on wall-clock time does not apply to it, and only to it.
+  4. **(d) The seed range is half-open.** `--seeds A..B` means A ≤ seed < B, as in Rust and in this card: `0..10000` is 10,000 seeds and `0..500` is 500.
+     - **The defect.** At 5d99c141, `parse_seeds` reads the range inclusive. `run --seeds 0..10000` would write 10,001 records, and `verify` would reject them ("not exactly 0..9999").
+     - **Pins.** `0..10000` gives 10,000 seeds; `5..5` is empty, which is an error.
+- **Bounds, derived from the measurements.**
+  - **Threads.** `--threads 16` stays. Steady state is at most 16 × 271 MiB ≈ 4.3 GiB.
+  - **The worst case.** A world that hits the budget is small, measured by P with the budget's yield count:
+    - seed 36 is at 509 MiB RSS when it reaches 1 M yields (after 5.5 s);
+    - seed 148 stays flat at 133 MiB (it reaches 1 M yields after 2.2 s).
+
+    Even with 16 livelocked seeds in flight at once, the total stays at about 8 GiB, well under the **24 GiB budget**.
+  - **Lowering threads.** If any later measurement shows a single-seed peak above 1.5 GiB, the worker sets `threads := floor(24 GiB / peak)`. Digests do not depend on the thread count, so this changes no result.
+  - **Not required.** Chunking, per-chunk commits and streamed records. The records are about 7 MB, and the run is about 20–25 min wall at 16 threads. X5-R12's "do not split" stands.
+- **The backstop and the logs.** The worker runs every campaign-class command (`run`, `verify`, `mutants`, `mutants --check`) like this:
+  - inside `( ulimit -v 25165824; … )`, a 24 GiB address-space cap. The measured VmPeak is 9.8 GiB at 16 threads. A runaway then fails an allocation inside the campaign process only, never in the agent's session;
+  - with stdout and stderr redirected to files **outside the worktree**. Read them with `tail` or `grep`; never stream them into the tool output.
+  - Capturing stderr whole (X5-R12) means that file.
+  - `systemd-run` is not used (an owner rule).
+- **Order inside the card** (replaces X5-R12's steps 2–3; step 1 is done):
+  1. (a)–(d), each pinned in its own commit;
+  2. `cargo test` green, and the 16-seed smoke passing;
+  3. `run`, then the X5-R12 sequence. Seeds 36 and 148 are failing seeds under X5-R3: root-cause each one (prototype deviation → fix, pin with a literal config, whole re-run; spec → ESCALATE), and X5-R12's budget valve applies unchanged.
+  4. **An `E4 ABORT` line or exit 3 is a harness defect.** Root-cause it before anything else, and if that is not possible inside the attempt, ESCALATE with the `.partial` file and the abort line.
+- **RESULT.**
+  - Item 1: `YIELD_BUDGET`, the threads, and the peak RSS.
+  - Item 2: the livelock count inside `DEADLOCK`.
+  - Item 5: every (a)–(d) item (instrumentation), and seeds 36 and 148 with their root causes.
+- **Nothing else moves.** The oracle, the model, the classes, the quotas and X5-R1–R12 are unchanged. Recording a livelock as DEADLOCK tightens the rule (before, it was a hang); it loosens nothing. The README gets X5-R13 verbatim in the same commit as (a), before the next `run`.
 
 ## This stage's delivery of the rulings (the worker's half)
 
