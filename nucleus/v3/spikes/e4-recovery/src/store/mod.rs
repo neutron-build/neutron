@@ -546,13 +546,15 @@ impl<'a, H: StoreHost> Cx<'a, H> {
 
     /// Run one atomic step under the world lock (no yields inside; rule 1).
     /// The acquisition is a `try_lock` that reports [`SimFail::Baton`]
-    /// naming `site` on a violation (rule 4).
+    /// naming `site` on a violation (rule 4) and carries the caller's
+    /// task id into X5-R14's S-DET gate (only the baton holder — or, in
+    /// a failed world, the unwind turn — may take a host step).
     pub fn with<R>(
         &self,
         site: &'static str,
         f: impl FnOnce(&mut H) -> Result<R, Fail>,
     ) -> Result<R, Fail> {
-        let mut g = self.w.acquire(site).map_err(Fail::Sim)?;
+        let mut g = self.w.acquire(self.t, site).map_err(Fail::Sim)?;
         f(&mut g)
     }
 

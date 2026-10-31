@@ -110,6 +110,15 @@ where
             let saw_baton = Arc::clone(&saw_baton);
             let saw_deadlock = Arc::clone(&saw_deadlock);
             handles.push(scope.spawn(move || {
+                // X5-R14: the task's first scheduler contact is a park
+                // (the same entry barrier the harness's `run_task`
+                // imposes): a body may not take host steps before the
+                // baton is handed to it. `Sched::acquire`'s S-DET gate
+                // enforces it; this barrier keeps every test body on
+                // the legal side of the gate.
+                if let Err(SimFail::Baton(s)) = sched.yield_baton(t) {
+                    panic!("entry barrier refused: Baton at {s}");
+                }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&sched, t)));
                 match r {
                     Err(_) => panicked.store(true, Ordering::SeqCst),

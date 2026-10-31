@@ -829,6 +829,20 @@ fn run_task(
     checkpointer_every: Option<u64>,
     crash: &Option<CrashSpec>,
 ) -> Result<(), SimFail> {
+    // X5-R14 (the thread-start window): a **service** task's first
+    // scheduler contact is a park — it must not act (its loop-entry
+    // `Cx::with` reads, which reach `wal_writer:take` and
+    // `evict:pick`'s clock-hand mutation) before the baton is ever
+    // handed to it; OS thread-start order otherwise leaks into the
+    // schedule and the digests stop being a function of `(seed,
+    // mutant)`. Script tasks already park first: their `yld!` macro
+    // yields before every op. The gate in `Sched::acquire` makes any
+    // remaining pre-baton step a loud `SimFail::Baton`; this barrier is
+    // what keeps the service bodies on the legal side of it.
+    if t > nscript {
+        let cx0 = Cx { w: sched, t };
+        cx0.yield_now("h:entry").map_err(fail_of)?;
+    }
     let cx = Cx { w: sched, t };
     // The task's script-level yield counter (crash arming).
     let mut yields = 0u64;
