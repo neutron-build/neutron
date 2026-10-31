@@ -265,6 +265,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`createServer` resolves once the server is listening.** It resolved as
+  soon as `serve()` returned, before the socket was bound, so an immediate
+  `close()` threw `ERR_SERVER_NOT_RUNNING`, `url` named the requested port
+  rather than the bound one (wrong for `port: 0`), and a bind failure
+  (`EADDRINUSE`) surfaced as an unhandled `'error'` event. It now waits for
+  `'listening'`, and rejects with the bind error.
 - **CommonJS dependencies run in the SSR module runner.** Vite's runner
   evaluates ESM only, so a CommonJS module it inlined — every dependency
   under react-compat's blanket `ssr.noExternal` — failed on its first

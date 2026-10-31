@@ -1393,6 +1393,23 @@ export async function createServer(
     // anyway.
     overrideGlobalObjects: false,
   });
+  // `serve()` returns before the socket is bound. Resolve once it is, so the
+  // caller can close() at once (instead of ERR_SERVER_NOT_RUNNING), `url`
+  // names the bound port (also for port 0), and a bind failure (EADDRINUSE)
+  // rejects here rather than surfacing as an unhandled 'error' event.
+  await new Promise<void>((resolve, reject) => {
+    if ((server as { listening?: boolean }).listening) return resolve();
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+  });
 
   // Transport axis: attach a WebSocket server to the live HTTP server, independent of
   // rendering mode. Raw `ws` in noServer mode so the framework owns the upgrade handshake
