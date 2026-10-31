@@ -1,12 +1,12 @@
-import { type ComponentType } from 'react'
+import { useState, type ComponentType } from 'react'
 import { View, Text, Pressable } from 'react-native'
-import { useSignal, useComputed } from '../signals/hooks.js'
-import { routerState, navigate } from '../router/navigator.js'
-import type { NavigatorProps, ScreenConfig, ScreenOptions } from './types.js'
+import { declaredScreens, useNavigator, NavigationDepth } from './scoped.js'
+
+import type { NavigatorProps, ScreenOptions } from './types.js'
 
 // ─── Screen registry ─────────────────────────────────────────────────────────
 
-const _drawerScreens: ScreenConfig[] = []
+
 
 // ─── Drawer.Screen ────────────────────────────────────────────────────────────
 
@@ -17,9 +17,7 @@ interface DrawerScreenProps {
 }
 
 function DrawerScreen({ name, component, options }: DrawerScreenProps) {
-  if (!_drawerScreens.find(s => s.name === name)) {
-    _drawerScreens.push({ name, component, options })
-  }
+  void { name, component, options }
   return null
 }
 
@@ -41,15 +39,15 @@ interface DrawerProps extends NavigatorProps {
  * </Drawer>
  */
 export function Drawer({
-  children: _children,
+  children,
   initialRouteName,
   drawerStyle,
   screenOptions,
 }: DrawerProps) {
-  const isOpen = useSignal(false)
-  const activeTab = useComputed(() => routerState.value.segments[0] ?? initialRouteName ?? _drawerScreens[0]?.name ?? '')
-
-  const activeScreen = _drawerScreens.find(s => s.name === activeTab.value)
+  const [isOpen, setOpen] = useState(false)
+  const _drawerScreens = declaredScreens(children, DrawerScreen)
+  const nav = useNavigator(_drawerScreens, initialRouteName)
+  const activeScreen = nav.active
   const ActiveComponent = activeScreen?.component
   const activeOptions = { ...screenOptions, ...activeScreen?.options }
 
@@ -68,7 +66,7 @@ export function Drawer({
           ...activeOptions.headerStyle,
         }}>
           <Pressable
-            onPress={() => { isOpen.value = !isOpen.value }}
+            onPress={() => { setOpen(!isOpen) }}
             style={{ padding: 8, marginRight: 8 }}
             accessible
             accessibilityRole="button"
@@ -90,15 +88,15 @@ export function Drawer({
 
       {/* Content area */}
       <View style={{ flex: 1 }}>
-        {ActiveComponent ? <ActiveComponent /> : null}
+        {ActiveComponent ? <NavigationDepth.Provider value={nav.depth + 1}><ActiveComponent /></NavigationDepth.Provider> : null}
       </View>
 
       {/* Overlay + Drawer panel */}
-      {isOpen.value && (
+      {isOpen && (
         <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}>
           {/* Tap-to-close backdrop */}
           <Pressable
-            onPress={() => { isOpen.value = false }}
+            onPress={() => { setOpen(false) }}
             style={{
               position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
               backgroundColor: 'rgba(0,0,0,0.4)',
@@ -118,7 +116,7 @@ export function Drawer({
           }}>
             {_drawerScreens.map(screen => {
               const opts = screen.options as DrawerScreenProps['options']
-              const isFocused = screen.name === activeTab.value
+              const isFocused = screen.name === activeScreen?.name
               const label = opts?.drawerLabel ?? screen.name
               const Icon = opts?.drawerIcon
 
@@ -126,8 +124,8 @@ export function Drawer({
                 <Pressable
                   key={screen.name}
                   onPress={() => {
-                    navigate(`/${screen.name}`)
-                    isOpen.value = false
+                    nav.select(screen.name)
+                    setOpen(false)
                   }}
                   accessible
                   accessibilityRole="menuitem"

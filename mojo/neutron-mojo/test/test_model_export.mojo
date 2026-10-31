@@ -27,7 +27,7 @@ def approx_eq(a: Float32, b: Float32, tol: Float32 = 1e-4) -> Bool:
 def test_nmf_magic() raises:
     """NMF magic and version constants."""
     assert_true(NMF_MAGIC() == 0x00464D4E, "Magic should be NMF\\0")
-    assert_true(NMF_VERSION() == 1, "Version should be 1")
+    assert_true(NMF_VERSION() == 2, "Version should be 2")
     print("  nmf_magic: PASS")
 
 
@@ -84,7 +84,13 @@ def test_serialize_params() raises:
 def test_deserialize_params() raises:
     """Deserialize ModelParams from text."""
     var text = "num_layers=3\nvocab_size=100\nhidden_dim=16\nnum_q_heads=4\nnum_kv_heads=2\nhead_dim=4\nffn_dim=32\nmax_seq_len=64\narch=Llama\n"
-    var p = deserialize_params(text)
+    var refused = False
+    try:
+        var strict = deserialize_params(text)
+    except:
+        refused = True
+    assert_true(refused, "Legacy incomplete parameters require explicit opt-in")
+    var p = deserialize_params(text, legacy_defaults=True)
     assert_true(p.num_layers == 3, "num_layers")
     assert_true(p.vocab_size == 100, "vocab_size")
     assert_true(p.hidden_dim == 16, "hidden_dim")

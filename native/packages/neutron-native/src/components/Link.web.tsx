@@ -20,7 +20,12 @@ export function Link({
   accessibilityLabel,
 }: LinkProps) {
   function handleClick(e: MouseEvent) {
-    if (disabled) return
+    if (disabled) {
+      // Block the browser's own navigation too — returning without
+      // preventDefault still follows the href (NF-NR-14).
+      e.preventDefault()
+      return
+    }
     if (external) return  // let browser handle it naturally
 
     // Don't intercept modifier-key clicks (open in new tab, etc.)
@@ -30,8 +35,6 @@ export function Link({
     navigate(href, { replace: shouldReplace, params })
   }
 
-  const resolvedStyle = style
-
   return (
     <a
       href={href}
@@ -40,12 +43,15 @@ export function Link({
       data-testid={testID}
       aria-label={accessibilityLabel}
       aria-disabled={disabled}
+      role="link"
       onClick={handleClick}
       style={{
         textDecoration: 'none',
         color: 'inherit',
         display: 'contents',
-        ...styleToCSS(Array.isArray(resolvedStyle) ? resolvedStyle[0] : resolvedStyle),
+        // Whole style arrays convert through the bridge with RN's
+        // later-wins flattening — not just the first entry (NF-NR-14).
+        ...styleToCSS(style),
       } as preact.JSX.CSSProperties}
     >
       {children}

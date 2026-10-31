@@ -4,6 +4,26 @@ All notable changes to the Neutron ecosystem will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2026-10-30]
+
+### Fixed
+
+- TypeScript core 0.4.1: island layout, nested-island and island import
+  resolution fixes.
+
+See [TypeScript release notes](typescript/CHANGELOG.md).
+
+## [2026-10-26]
+
+### Changed
+
+- TypeScript core and CLI 0.4.0 move to zod 4 (GHSA-mrhx-c7xc-m3w5) and make
+  shared caching opt-in per middleware. `@neutron-build/create` 0.1.10 generates
+  projects pinned to this pair. sql 0.2.0, nucleus 0.3.0 and data 0.3.0 carry the
+  data-layer audit fixes; ai, security, ops and otel get patch releases.
+
+See [TypeScript release notes](typescript/CHANGELOG.md).
+
 ## [2026-09-30]
 
 ### Changed

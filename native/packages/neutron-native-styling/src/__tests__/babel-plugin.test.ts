@@ -30,7 +30,9 @@ function transform(code: string, platform: string = 'all'): string | null | unde
   if (!transformSync) return code
   const result = transformSync(code, {
     plugins: [
-      ['@babel/plugin-syntax-jsx', {}],
+      // Pass VALUES: pnpm's isolated layout keeps string plugin names
+      // unresolvable from @babel/core's own module path.
+      [require('@babel/plugin-syntax-jsx'), {}],
       // Pass the plugin VALUE, not a path. `require.resolve` handed Babel a
       // `.ts` file to load itself, and Babel only transpiles `.cts` configs
       // and plugins -- so on CI this failed with "You are using a .ts config

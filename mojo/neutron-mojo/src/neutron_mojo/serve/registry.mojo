@@ -39,40 +39,18 @@ from neutron_mojo.tensor.shape import Shape
 
 def _copy_tensor(src: Tensor[DType.float32]) -> Tensor[DType.float32]:
     """Deep-copy a tensor by creating a new one and copying all elements."""
-    var dst = Tensor[DType.float32](src.shape)
-    for i in range(src.numel()):
-        dst.set(i, src.get(i))
-    return dst^
+    return src.clone()
+
 
 
 def _copy_model(src: Model) -> Model:
     """Deep-copy a Model by copying all tensor data."""
-    var m = Model(src.params.copy())
-    for i in range(src.embed.numel()):
-        m.embed.set(i, src.embed.get(i))
-    for i in range(src.final_norm.numel()):
-        m.final_norm.set(i, src.final_norm.get(i))
-    for i in range(src.lm_head.numel()):
-        m.lm_head.set(i, src.lm_head.get(i))
-    for i in range(src.layer_weights.numel()):
-        m.layer_weights.set(i, src.layer_weights.get(i))
-    return m^
+    return Model(copy_data=src)
 
 
 def _copy_q_model(src: QuantizedModel) -> QuantizedModel:
     """Deep-copy a QuantizedModel by copying all tensor data."""
-    var m = QuantizedModel(src.params.copy(), src.block_size)
-    for i in range(src.embed.numel()):
-        m.embed.set(i, src.embed.get(i))
-    for i in range(src.final_norm.numel()):
-        m.final_norm.set(i, src.final_norm.get(i))
-    for i in range(src.lm_head.numel()):
-        m.lm_head.set(i, src.lm_head.get(i))
-    for i in range(src.layer_weights.numel()):
-        m.layer_weights.set(i, src.layer_weights.get(i))
-    for i in range(src.layer_scales.numel()):
-        m.layer_scales.set(i, src.layer_scales.get(i))
-    return m^
+    return QuantizedModel(copy_data=src)
 
 
 def _copy_tokenizer(src: BPETokenizer) -> BPETokenizer:
@@ -87,6 +65,7 @@ def _copy_tokenizer(src: BPETokenizer) -> BPETokenizer:
     tok.eos_id = src.eos_id
     tok.unk_id = src.unk_id
     tok.pad_id = src.pad_id
+    tok.byte_encoding = src.byte_encoding
     return tok^
 
 
@@ -110,7 +89,7 @@ struct ModelEntry(Copyable, Movable, ImplicitlyCopyable):
     var total_requests: Int
     var total_tokens_generated: Int
 
-    def __init__(out self, name: String, var model: Model, var tokenizer: BPETokenizer):
+    def __init__(out self, name: String, var model: Model, var tokenizer: BPETokenizer) raises:
         """Create an FP32 model entry."""
         self.name = name
         self.is_quantized = False
@@ -132,7 +111,7 @@ struct ModelEntry(Copyable, Movable, ImplicitlyCopyable):
         self.total_tokens_generated = 0
 
     def __init__(out self, name: String, var q_model: QuantizedModel,
-                var tokenizer: BPETokenizer, params: ModelParams):
+                var tokenizer: BPETokenizer, params: ModelParams) raises:
         """Create a Q8 model entry."""
         self.name = name
         self.is_quantized = True
@@ -240,7 +219,7 @@ struct ModelRegistry(Movable):
         self.default_model = move.default_model^
 
     def register_fp32(mut self, name: String, var model: Model,
-                     var tokenizer: BPETokenizer):
+                     var tokenizer: BPETokenizer) raises:
         """Register an FP32 model.
 
         Args:
@@ -256,7 +235,7 @@ struct ModelRegistry(Movable):
             self.default_model = name
 
     def register_q8(mut self, name: String, var q_model: QuantizedModel,
-                   var tokenizer: BPETokenizer, params: ModelParams):
+                   var tokenizer: BPETokenizer, params: ModelParams) raises:
         """Register a Q8 quantized model.
 
         Args:

@@ -1,3 +1,4 @@
+import { mutableResponse } from "../core/response.js";
 /**
  * Rate Limiting Middleware
  *
@@ -249,7 +250,7 @@ export function rateLimitMiddleware(
       });
       // Emit limit headers on first requests too — a client's very first
       // request should see its budget like every subsequent one does.
-      const response = await next();
+      const response = mutableResponse(await next());
       response.headers.set("X-RateLimit-Limit", String(maxRequests));
       response.headers.set("X-RateLimit-Remaining", String(Math.max(0, maxRequests - 1)));
       response.headers.set("X-RateLimit-Reset", String(Math.ceil((now + windowMs) / 1000)));
@@ -278,7 +279,7 @@ export function rateLimitMiddleware(
     // Increment count and proceed
     record.count++;
 
-    const response = await next();
+    const response = mutableResponse(await next());
 
     // Add rate limit headers to response
     const remaining = maxRequests - record.count;

@@ -3,7 +3,7 @@ name = "neutron-desktop-updater"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Neutron Desktop auto-update with signature verification and rollback"
+description = "Neutron Desktop signed auto-update via the Tauri installer"
 
 [dependencies]
 tauri = { workspace = true }
@@ -16,3 +16,10 @@ tracing = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha2 = "0.10"
 dirs = { workspace = true }
+base64 = "0.22"
+minisign-verify = "0.2"
+semver = "1"
+url = { workspace = true }
+tauri-plugin-updater = "2.13"
+
+uuid = { version = "1", features = ["v4"] }

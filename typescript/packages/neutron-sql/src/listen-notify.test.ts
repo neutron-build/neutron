@@ -189,3 +189,61 @@ test("listen-notify: postgres.js listener maps channels to native handles and ne
   assert.deepEqual(unlistens, ["a", "b"]);
   assert.equal("end" in jsClient, false, "the borrowed handle is never ended");
 });
+
+test("TSD-11: pg close drains an in-flight LISTEN before borrowed teardown", async () => {
+  const client = fakePgClient();
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>((r) => { entered = r; });
+  const original = client.query.bind(client);
+  client.query = async (sql: string) => {
+    if (sql.startsWith("LISTEN ")) {
+      entered();
+      await new Promise<void>((r) => { release = r; });
+    }
+    return original(sql);
+  };
+  const listener = await pgListener({ client });
+  let callbacks = 0;
+  const pending = listener.listen("events", () => { callbacks++; });
+  await started;
+  const closing = listener.close();
+  client.emit({ channel: "events", payload: "late", processId: 1 });
+  release();
+  await Promise.all([pending, closing, listener.close()]);
+  assert.deepEqual(client.sent, ['LISTEN "events"', 'UNLISTEN "events"']);
+  assert.deepEqual(listener.channels, []);
+  assert.equal(callbacks, 0);
+});
+
+test("TSD-11: postgres.js close drains late native handle, suppresses callbacks and parallel duplicates", async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>((r) => { entered = r; });
+  let callback!: (payload: string) => void;
+  let acquisitions = 0;
+  let disposals = 0;
+  const listener = await postgresJsListener({ client: {
+    unsafe: async () => [],
+    listen: async (_channel, handler) => {
+      acquisitions++;
+      callback = handler;
+      entered();
+      await new Promise<void>((r) => { release = r; });
+      return { unlisten: async () => { disposals++; } };
+    },
+  } });
+  let callbacks = 0;
+  const pending = listener.listen("events", () => { callbacks++; });
+  await started;
+  const duplicate = listener.listen("events", () => { callbacks++; });
+  const duplicateRejected = assert.rejects(duplicate, /closed/);
+  const closing = listener.close();
+  callback("late");
+  release();
+  await Promise.all([pending, duplicateRejected, closing, listener.close()]);
+  assert.equal(acquisitions, 1);
+  assert.equal(disposals, 1);
+  assert.equal(callbacks, 0);
+  assert.deepEqual(listener.channels, []);
+});

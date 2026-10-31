@@ -80,7 +80,18 @@ pub const MAGIC_BYTES: &[u8; 8] = b"NUCLEUS\0";
 ///   than trusted (T0.3). v1 directories are read without the epoch field
 ///   (defaulting to 0) and transparently upgraded to v2 on the next directory
 ///   save. A stored version newer than this constant is refused on open.
-pub const DB_FORMAT_VERSION: u32 = 2;
+/// - v3: relocates the table-directory OVERFLOW payload past the common page
+///   header (NE-31). The v2 layout started the payload at byte 4, overlapping
+///   the flush-stamped checksum (bytes 4..8) and LSN (8..16), so every WAL
+///   log/flush of an overflow page silently corrupted the first 12 payload
+///   bytes and reopen misread or lost directory entries. v3 overflow pages
+///   keep the next-chain pointer at bytes 0..4 (never stamped) and place the
+///   payload at `COMMON_HEADER_SIZE` (16). A pre-v3 database WITH an overflow
+///   chain is refused on open rather than trusted: its overflow payload may
+///   already be corrupt, and "migrating" would launder damaged bytes into
+///   live state. A pre-v3 database whose directory fits in the meta page is
+///   unaffected and upgrades transparently on the next directory save.
+pub const DB_FORMAT_VERSION: u32 = 3;
 
 // ============================================================================
 // Overflow page layout

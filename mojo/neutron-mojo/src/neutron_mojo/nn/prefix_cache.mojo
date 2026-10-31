@@ -90,7 +90,7 @@ struct PrefixCacheEntry(Copyable, Movable, ImplicitlyCopyable):
     var hit_count: Int               # Number of times this entry was used
     var max_seq_len: Int             # Max sequence length of the cache
 
-    def __init__(out self):
+    def __init__(out self) raises:
         self.prefix_tokens = List[Int]()
         self.prefix_hash = 0
         self.prefix_len = 0
@@ -113,36 +113,12 @@ struct PrefixCacheEntry(Copyable, Movable, ImplicitlyCopyable):
         self.head_dim = copy.head_dim
         self.hit_count = copy.hit_count
         self.max_seq_len = copy.max_seq_len
-        var total = copy.num_layers * copy.max_seq_len * copy.num_kv_heads * copy.head_dim
-        if total <= 0:
-            total = 1
-        self.key_data = Tensor[DType.float32](Shape(total))
-        self.value_data = Tensor[DType.float32](Shape(total))
-        for i in range(total):
-            self.key_data.set(i, copy.key_data.get(i))
-            self.value_data.set(i, copy.value_data.get(i))
+        self.key_data = copy.key_data.clone()
+        self.value_data = copy.value_data.clone()
 
     def copy(self) -> PrefixCacheEntry:
-        """Return a copy of this entry."""
-        var e = PrefixCacheEntry()
-        for i in range(len(self.prefix_tokens)):
-            e.prefix_tokens.append(self.prefix_tokens[i])
-        e.prefix_hash = self.prefix_hash
-        e.prefix_len = self.prefix_len
-        e.num_layers = self.num_layers
-        e.num_kv_heads = self.num_kv_heads
-        e.head_dim = self.head_dim
-        e.hit_count = self.hit_count
-        e.max_seq_len = self.max_seq_len
-        var total = self.num_layers * self.max_seq_len * self.num_kv_heads * self.head_dim
-        if total <= 0:
-            total = 1
-        e.key_data = Tensor[DType.float32](Shape(total))
-        e.value_data = Tensor[DType.float32](Shape(total))
-        for i in range(total):
-            e.key_data.set(i, self.key_data.get(i))
-            e.value_data.set(i, self.value_data.get(i))
-        return e^
+        """Copy the admitted tensor allocations and matching metadata."""
+        return PrefixCacheEntry(copy=self)
 
     def __init__(out self, *, deinit move: Self):
         self.prefix_tokens = move.prefix_tokens^
@@ -165,22 +141,27 @@ struct PrefixMatch(Copyable, Movable, ImplicitlyCopyable):
     """Result of a prefix cache lookup."""
     var entry_idx: Int        # Index into cache entries (-1 if no match)
     var matched_len: Int      # Number of prefix tokens matched
+    var generation: Int       # Invalidated by every cache mutation
 
     def __init__(out self):
         self.entry_idx = -1
         self.matched_len = 0
+        self.generation = -1
 
-    def __init__(out self, entry_idx: Int, matched_len: Int):
+    def __init__(out self, entry_idx: Int, matched_len: Int, generation: Int = -1):
         self.entry_idx = entry_idx
         self.matched_len = matched_len
+        self.generation = generation
 
     def __init__(out self, *, copy: Self):
         self.entry_idx = copy.entry_idx
         self.matched_len = copy.matched_len
+        self.generation = copy.generation
 
     def __init__(out self, *, deinit move: Self):
         self.entry_idx = move.entry_idx^
         self.matched_len = move.matched_len^
+        self.generation = move.generation^
 
     def is_hit(self) -> Bool:
         """Whether a prefix match was found."""
@@ -205,9 +186,10 @@ struct PrefixCache(Movable):
     var max_seq_len: Int
     var total_hits: Int
     var total_misses: Int
+    var generation: Int
 
     def __init__(out self, max_entries: Int, num_layers: Int,
-                num_kv_heads: Int, head_dim: Int, max_seq_len: Int):
+                num_kv_heads: Int, head_dim: Int, max_seq_len: Int) raises:
         """Create a prefix cache.
 
         Args:
@@ -217,6 +199,9 @@ struct PrefixCache(Movable):
             head_dim: Head dimension.
             max_seq_len: Maximum sequence length.
         """
+        if max_entries <= 0 or num_layers <= 0 or num_kv_heads <= 0 or head_dim <= 0 or max_seq_len <= 0:
+            raise Error("Prefix cache dimensions must be positive")
+        var admitted = Shape(num_layers, max_seq_len, num_kv_heads, head_dim, 4)
         self.entries = List[PrefixCacheEntry]()
         self.max_entries = max_entries
         self.num_layers = num_layers
@@ -225,6 +210,7 @@ struct PrefixCache(Movable):
         self.max_seq_len = max_seq_len
         self.total_hits = 0
         self.total_misses = 0
+        self.generation = 0
 
     def __init__(out self, *, deinit move: Self):
         self.entries = move.entries^
@@ -235,6 +221,7 @@ struct PrefixCache(Movable):
         self.max_seq_len = move.max_seq_len^
         self.total_hits = move.total_hits^
         self.total_misses = move.total_misses^
+        self.generation = move.generation^
 
     def find_prefix(mut self, input_ids: List[Int]) -> PrefixMatch:
         """Find the longest matching prefix in the cache.
@@ -271,10 +258,10 @@ struct PrefixCache(Movable):
         else:
             self.total_misses += 1
 
-        return PrefixMatch(best_idx, best_len)
+        return PrefixMatch(best_idx, best_len, self.generation)
 
     def store(mut self, input_ids: List[Int], prefix_len: Int,
-             cache: MultiLayerKVCache):
+             cache: MultiLayerKVCache) raises:
         """Store a KV cache snapshot for a token prefix.
 
         If the cache is full, evicts the least-used entry.
@@ -284,10 +271,24 @@ struct PrefixCache(Movable):
             prefix_len: Number of prefix tokens to store.
             cache: KV cache to snapshot.
         """
+        if self.max_entries <= 0 or self.num_layers <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0:
+            raise Error("Invalid prefix cache dimensions")
+        if cache.num_layers != self.num_layers or cache.num_kv_heads != self.num_kv_heads or cache.head_dim != self.head_dim:
+            raise Error("Prefix cache source layout mismatch")
+        if prefix_len <= 0 or prefix_len > len(input_ids) or prefix_len > self.max_seq_len or prefix_len > cache.max_seq_len:
+            raise Error("Prefix exceeds source or snapshot capacity")
+        if len(cache.lengths) != self.num_layers or self.generation == 0x7FFFFFFFFFFFFFFF:
+            raise Error("Invalid prefix cache lengths or exhausted generation")
+        var source_total = Shape(self.num_layers, cache.max_seq_len, self.num_kv_heads, self.head_dim).numel()
+        if cache.key_data.numel() != source_total or cache.value_data.numel() != source_total:
+            raise Error("Prefix cache source buffer span mismatch")
+        for layer in range(self.num_layers):
+            if cache.lengths[layer] < prefix_len or cache.lengths[layer] > cache.max_seq_len:
+                raise Error("Source prefix is not filled in every layer")
         # Calculate storage size
-        var stride = self.num_kv_heads * self.head_dim
-        var data_per_layer = self.max_seq_len * stride
-        var total = self.num_layers * data_per_layer
+        var stride = Shape(self.num_kv_heads, self.head_dim).numel()
+        var data_per_layer = Shape(self.max_seq_len, stride).numel()
+        var total = Shape(self.num_layers, data_per_layer).numel()
 
         # Create entry
         var entry = PrefixCacheEntry()
@@ -308,45 +309,59 @@ struct PrefixCache(Movable):
         entry.key_data = Tensor[DType.float32](Shape(total))
         entry.value_data = Tensor[DType.float32](Shape(total))
 
+        var source_per_layer = Shape(cache.max_seq_len, stride).numel()
         for layer in range(self.num_layers):
             var layer_base = layer * data_per_layer
+            var source_base = layer * source_per_layer
             var filled = prefix_len * stride
             for i in range(filled):
-                entry.key_data.set(layer_base + i,
-                    cache.key_data.get(layer_base + i))
-                entry.value_data.set(layer_base + i,
-                    cache.value_data.get(layer_base + i))
+                entry.key_data.set(layer_base + i, cache.key_data.get(source_base + i))
+                entry.value_data.set(layer_base + i, cache.value_data.get(source_base + i))
 
         # Evict if needed
         if len(self.entries) >= self.max_entries:
             self._evict_least_used()
 
+        self.generation += 1
         self.entries.append(entry^)
 
     def restore_to_cache(self, prefix_match: PrefixMatch,
-                        mut cache: MultiLayerKVCache):
+                        mut cache: MultiLayerKVCache) raises:
         """Restore cached KV data into a live KV cache.
 
         Args:
             match: The prefix match result.
             cache: KV cache to populate (modified in-place).
         """
-        if not prefix_match.is_hit() or prefix_match.entry_idx >= len(self.entries):
+        if not prefix_match.is_hit():
             return
+        if prefix_match.generation != self.generation or prefix_match.entry_idx >= len(self.entries):
+            raise Error("Stale prefix match")
+        if cache.num_layers != self.num_layers or cache.num_kv_heads != self.num_kv_heads or cache.head_dim != self.head_dim:
+            raise Error("Prefix cache destination layout mismatch")
+        if prefix_match.matched_len > cache.max_seq_len or prefix_match.matched_len > self.max_seq_len or prefix_match.matched_len > len(self.entries[prefix_match.entry_idx].prefix_tokens) or prefix_match.matched_len != self.entries[prefix_match.entry_idx].prefix_len:
+            raise Error("Prefix exceeds destination capacity or entry length")
+
+        if self.entries[prefix_match.entry_idx].num_layers != self.num_layers or self.entries[prefix_match.entry_idx].num_kv_heads != self.num_kv_heads or self.entries[prefix_match.entry_idx].head_dim != self.head_dim or self.entries[prefix_match.entry_idx].max_seq_len != self.max_seq_len:
+            raise Error("Stored prefix layout mismatch")
+        var snapshot_total = Shape(self.num_layers, self.max_seq_len, self.num_kv_heads, self.head_dim).numel()
+        var destination_total = Shape(self.num_layers, cache.max_seq_len, self.num_kv_heads, self.head_dim).numel()
+        if len(cache.lengths) != self.num_layers or cache.key_data.numel() != destination_total or cache.value_data.numel() != destination_total or self.entries[prefix_match.entry_idx].key_data.numel() != snapshot_total or self.entries[prefix_match.entry_idx].value_data.numel() != snapshot_total:
+            raise Error("Prefix cache snapshot or destination buffer span mismatch")
 
         var entry_idx = prefix_match.entry_idx
         var prefix_len = prefix_match.matched_len
-        var stride = self.num_kv_heads * self.head_dim
-        var data_per_layer = self.max_seq_len * stride
+        var stride = Shape(self.num_kv_heads, self.head_dim).numel()
+        var data_per_layer = Shape(self.max_seq_len, stride).numel()
 
+        var destination_per_layer = Shape(cache.max_seq_len, stride).numel()
         for layer in range(self.num_layers):
             var layer_base = layer * data_per_layer
+            var destination_base = layer * destination_per_layer
             var filled = prefix_len * stride
             for i in range(filled):
-                cache.key_data.set(layer_base + i,
-                    self.entries[entry_idx].key_data.get(layer_base + i))
-                cache.value_data.set(layer_base + i,
-                    self.entries[entry_idx].value_data.get(layer_base + i))
+                cache.key_data.set(destination_base + i, self.entries[entry_idx].key_data.get(layer_base + i))
+                cache.value_data.set(destination_base + i, self.entries[entry_idx].value_data.get(layer_base + i))
             cache.lengths[layer] = prefix_len
 
     def _evict_least_used(mut self):
@@ -379,8 +394,11 @@ struct PrefixCache(Movable):
             return 0.0
         return Float64(self.total_hits) / Float64(total)
 
-    def clear(mut self):
+    def clear(mut self) raises:
         """Clear all cached entries."""
+        if self.generation == 0x7FFFFFFFFFFFFFFF:
+            raise Error("Prefix cache generation exhausted")
         self.entries = List[PrefixCacheEntry]()
+        self.generation += 1
         self.total_hits = 0
         self.total_misses = 0

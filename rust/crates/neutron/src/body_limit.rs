@@ -163,4 +163,24 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await, "len=1000");
     }
+
+    /// Regression (RS-05): a strict limit downstream of an earlier BROAD
+    /// buffering must still reject — the buffered bytes are re-checked
+    /// against each requested ceiling instead of passing through.
+    #[tokio::test]
+    async fn strict_limit_after_broad_buffering_rejects() {
+        let client = TestClient::new(
+            Router::new()
+                .middleware(BodyLimit::new(1024))
+                .middleware(BodyLimit::new(4))
+                .post("/data", |body: String| async move {
+                    format!("len={}", body.len())
+                }),
+        );
+
+        // 9 bytes: passes the broad limit (registered first, buffers the
+        // body), then the strict limit must still 413.
+        let resp = client.post("/data").body("123456789").send().await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

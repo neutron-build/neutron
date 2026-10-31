@@ -1,304 +1,48 @@
-/**
- * Tests for OTA update client.
- */
-
-import { OTAClient } from '../client'
-import type { NativeOTAConfig, UpdateManifest } from '../types'
-
-const makeConfig = (overrides: Partial<NativeOTAConfig> = {}): NativeOTAConfig => ({
-  endpoint: 'https://ota.example.com',
-  channel: 'production',
-  checkInterval: 0, // disable periodic checks for tests
-  updateStrategy: 'next-launch',
-  ...overrides,
-})
-
-const makeManifest = (overrides: Partial<UpdateManifest> = {}): UpdateManifest => ({
-  id: 'update-123',
-  version: '1.1.0',
-  buildNumber: 1,
-  runtimeVersion: '0.76.0',
-  channel: 'production',
-  bundleHash: 'abc123',
-  downloadSize: 1000,
-  chunks: [],
-  createdAt: '2026-01-01T00:00:00Z',
-  ...overrides,
-})
-
+/** The production adapter contract is required in every success case. */
+import { OTAClient, canonicalManifest } from '../client'
+import type { NativeOTAConfig, NativeOTAAdapter, OTABootState, UpdateManifest } from '../types'
+const hash = 'a'.repeat(64)
+const config = (overrides: Partial<NativeOTAConfig> = {}): NativeOTAConfig => ({ endpoint: 'https://ota.example.com', publicKey: 'trusted', channel: 'production', checkInterval: 0, updateStrategy: 'next-launch', ...overrides })
+const manifest = (overrides: Partial<UpdateManifest> = {}): UpdateManifest => ({ id: 'update-123', version: '1.1.0', buildNumber: 1, runtimeVersion: '0.76.0', channel: 'production', bundleHash: hash, signature: 'signed', downloadSize: 0, chunks: [], createdAt: '2026-01-01T00:00:00Z', ...overrides })
+// Minimal bounded streaming transport, independent of Response availability in Jest.
+const response = (value: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status,
+  body: { getReader: () => { let done = false; return { read: async () => done ? { done: true } : (done = true, { done: false, value: value instanceof Uint8Array ? value : new TextEncoder().encode(JSON.stringify(value)) }), cancel: async () => {}, releaseLock: () => {} } } },
+}) as unknown as Response
+function fixture() {
+  let boot: OTABootState = { currentUpdateId: null, lastGoodUpdateId: null, pendingUpdateId: null, buildNumber: 0, consecutiveCrashes: 0, launchPending: false }
+  const adapter: NativeOTAAdapter = { runtimeVersion: '0.76.0', appVersion: '1.0.0', nativeBootTracking: true,
+    readBootState: jest.fn(async () => ({ ...boot })), verifyManifest: jest.fn(async () => true), sha256: jest.fn(async () => hash),
+    beginStage: jest.fn(async () => {}), stageChunk: jest.fn(async () => {}), deleteStagedPath: jest.fn(async () => {}),
+    stagedBundleHash: jest.fn(async () => hash), discardStage: jest.fn(async () => {}), reload: jest.fn(async () => {}),
+    publishPending: jest.fn(async m => (boot = { ...boot, pendingUpdateId: m.id, buildNumber: m.buildNumber })),
+    recordCrash: jest.fn(async () => (boot = { ...boot, consecutiveCrashes: boot.consecutiveCrashes + 1 })),
+    rollback: jest.fn(async () => (boot = { ...boot, currentUpdateId: boot.lastGoodUpdateId, pendingUpdateId: null, consecutiveCrashes: 0, launchPending: false })),
+    markHealthy: jest.fn(async () => (boot = { ...boot, consecutiveCrashes: 0, launchPending: false })),
+  }
+  return { adapter, client: new OTAClient(config(), adapter) }
+}
 describe('OTAClient', () => {
-  let originalFetch: typeof global.fetch
-
-  beforeEach(() => {
-    originalFetch = global.fetch
-    jest.useFakeTimers()
-  })
-
-  afterEach(() => {
-    global.fetch = originalFetch
-    jest.useRealTimers()
-    const g = globalThis as any
-    delete g.__neutronOTA
-  })
-
-  it('starts in up-to-date state', () => {
-    const client = new OTAClient(makeConfig())
-    const state = client.getState()
-    expect(state.status).toBe('up-to-date')
-    expect(state.currentUpdateId).toBeNull()
-    expect(state.availableUpdate).toBeNull()
-    expect(state.downloadProgress).toBe(0)
-    expect(state.error).toBeNull()
-    expect(state.consecutiveCrashes).toBe(0)
-  })
-
-  it('checkForUpdate fetches from endpoint and returns manifest', async () => {
-    const manifest = makeManifest()
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve(manifest),
-    })
-
-    const client = new OTAClient(makeConfig())
-    const result = await client.checkForUpdate()
-    expect(result).toEqual(manifest)
-    expect(client.getState().status).toBe('available')
-    expect(client.getState().availableUpdate).toEqual(manifest)
-  })
-
-  it('checkForUpdate returns null on 304 (not modified)', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: false,
-      status: 304,
-    })
-
-    const client = new OTAClient(makeConfig())
-    const result = await client.checkForUpdate()
-    expect(result).toBeNull()
-    expect(client.getState().status).toBe('up-to-date')
-  })
-
-  it('checkForUpdate handles fetch errors gracefully', async () => {
-    global.fetch = jest.fn().mockRejectedValue(new Error('Network error'))
-
-    const client = new OTAClient(makeConfig())
-    const result = await client.checkForUpdate()
-    expect(result).toBeNull()
-    expect(client.getState().status).toBe('error')
-    expect(client.getState().error).toBe('Network error')
-  })
-
-  it('checkForUpdate handles HTTP errors', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-    })
-
-    const client = new OTAClient(makeConfig())
-    const result = await client.checkForUpdate()
-    expect(result).toBeNull()
-    expect(client.getState().status).toBe('error')
-    expect(client.getState().error).toContain('500')
-  })
-
-  it('checkForUpdate respects minAppVersion', async () => {
-    const g = globalThis as any
-    g.__neutronOTA = { appVersion: '1.0.0' }
-
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve(makeManifest({ minAppVersion: '2.0.0' })),
-    })
-
-    const client = new OTAClient(makeConfig())
-    const result = await client.checkForUpdate()
-    expect(result).toBeNull()
-    expect(client.getState().status).toBe('up-to-date')
-  })
-
-  it('downloadAndApply returns false when no update available', async () => {
-    const client = new OTAClient(makeConfig())
-    const result = await client.downloadAndApply()
-    expect(result).toBe(false)
-  })
-
-  it('downloadAndApply downloads chunks and verifies hashes', async () => {
-    const chunkData = new ArrayBuffer(100)
-    const manifest = makeManifest({
-      downloadSize: 100,
-      chunks: [
-        { path: 'bundle.js', url: 'https://cdn.example.com/chunk1', size: 100, hash: 'fakehash', operation: 'add' as any },
-      ],
-    })
-
-    const g = globalThis as any
-    g.__neutronOTA = {
-      sha256: jest.fn().mockResolvedValue('fakehash'),
-      storeChunk: jest.fn().mockResolvedValue(undefined),
-      markPending: jest.fn(),
-    }
-
-    global.fetch = jest.fn()
-      .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve(manifest) })
-      .mockResolvedValueOnce({ ok: true, arrayBuffer: () => Promise.resolve(chunkData) })
-
-    const client = new OTAClient(makeConfig())
-    await client.checkForUpdate()
-    const result = await client.downloadAndApply()
-    expect(result).toBe(true)
-    expect(client.getState().downloadProgress).toBe(1)
-    expect(g.__neutronOTA.storeChunk).toHaveBeenCalledWith('bundle.js', chunkData)
-  })
-
-  it('downloadAndApply fails on hash mismatch', async () => {
-    const manifest = makeManifest({
-      downloadSize: 100,
-      chunks: [
-        { path: 'bad.js', url: 'https://cdn.example.com/bad', size: 100, hash: 'expected', operation: 'add' as any },
-      ],
-    })
-
-    const g = globalThis as any
-    g.__neutronOTA = {
-      sha256: jest.fn().mockResolvedValue('different-hash'),
-      storeChunk: jest.fn(),
-    }
-
-    global.fetch = jest.fn()
-      .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve(manifest) })
-      .mockResolvedValueOnce({ ok: true, arrayBuffer: () => Promise.resolve(new ArrayBuffer(100)) })
-
-    const client = new OTAClient(makeConfig())
-    await client.checkForUpdate()
-    const result = await client.downloadAndApply()
-    expect(result).toBe(false)
-    expect(client.getState().status).toBe('error')
-    expect(client.getState().error).toContain('hash mismatch')
-  })
-
-  it('downloadAndApply skips delete-operation chunks', async () => {
-    const manifest = makeManifest({
-      downloadSize: 0,
-      chunks: [
-        { path: 'old.js', url: '', size: 0, hash: '', operation: 'delete' as any },
-      ],
-    })
-
-    const g = globalThis as any
-    g.__neutronOTA = { markPending: jest.fn() }
-
-    global.fetch = jest.fn()
-      .mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.resolve(manifest) })
-
-    const client = new OTAClient(makeConfig())
-    await client.checkForUpdate()
-    const result = await client.downloadAndApply()
-    expect(result).toBe(true)
-  })
-
-  it('recordCrash increments crash counter', async () => {
-    const client = new OTAClient(makeConfig())
-    const rolled = await client.recordCrash()
-    expect(rolled).toBe(false)
-    expect(client.getState().consecutiveCrashes).toBe(1)
-  })
-
-  it('recordCrash triggers rollback after 3 crashes', async () => {
-    const g = globalThis as any
-    g.__neutronOTA = { rollback: jest.fn() }
-
-    const client = new OTAClient(makeConfig())
-    // Simulate having a current update
-    ;(client as any).state.currentUpdateId = 'update-1'
-
-    await client.recordCrash() // 1
-    await client.recordCrash() // 2
-    const rolled = await client.recordCrash() // 3 — triggers rollback
-    expect(rolled).toBe(true)
-    expect(client.getState().status).toBe('rolled-back')
-    expect(client.getState().currentUpdateId).toBeNull()
-    expect(client.getState().consecutiveCrashes).toBe(0)
-  })
-
-  it('rollback calls native rollback and resets state', async () => {
-    const g = globalThis as any
-    g.__neutronOTA = { rollback: jest.fn() }
-
-    const client = new OTAClient(makeConfig())
-    await client.rollback()
-    expect(g.__neutronOTA.rollback).toHaveBeenCalled()
-    expect(client.getState().status).toBe('rolled-back')
-  })
-
-  it('markSuccessfulLaunch resets crash counter', () => {
-    const client = new OTAClient(makeConfig())
-    ;(client as any).state.consecutiveCrashes = 2
-    ;(client as any).state.isFirstLaunchAfterUpdate = true
-    client.markSuccessfulLaunch()
-    expect(client.getState().consecutiveCrashes).toBe(0)
-    expect(client.getState().isFirstLaunchAfterUpdate).toBe(false)
-  })
-
-  it('subscribe notifies on state changes', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve(makeManifest()),
-    })
-
-    const client = new OTAClient(makeConfig())
-    const states: string[] = []
-    const unsub = client.subscribe((state) => states.push(state.status))
-    await client.checkForUpdate()
-    unsub()
-    expect(states).toContain('checking')
-    expect(states).toContain('available')
-  })
-
-  it('start() calls checkForUpdate immediately', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: false,
-      status: 304,
-    })
-
-    const client = new OTAClient(makeConfig())
-    client.start()
-    // fetch should have been called
-    expect(global.fetch).toHaveBeenCalled()
-    client.stop()
-  })
-
-  it('start() sets up periodic checks when interval > 0', () => {
-    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 304 })
-    const client = new OTAClient(makeConfig({ checkInterval: 60 }))
-    client.start()
-    expect(global.fetch).toHaveBeenCalledTimes(1)
-    jest.advanceTimersByTime(60000)
-    expect(global.fetch).toHaveBeenCalledTimes(2)
-    client.stop()
-  })
-
-  it('stop() clears the periodic timer', () => {
-    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 304 })
-    const client = new OTAClient(makeConfig({ checkInterval: 10 }))
-    client.start()
-    client.stop()
-    jest.advanceTimersByTime(20000)
-    // Only the initial call should count
-    expect(global.fetch).toHaveBeenCalledTimes(1)
-  })
-
-  it('meetsMinVersion works correctly', () => {
-    const g = globalThis as any
-    g.__neutronOTA = { appVersion: '2.1.0' }
-
-    const client = new OTAClient(makeConfig())
-    // Access private method via bracket notation
-    expect((client as any).meetsMinVersion('1.0.0')).toBe(true)
-    expect((client as any).meetsMinVersion('2.1.0')).toBe(true)
-    expect((client as any).meetsMinVersion('2.1.1')).toBe(false)
-    expect((client as any).meetsMinVersion('3.0.0')).toBe(false)
-  })
+  let originalFetch: typeof fetch
+  beforeEach(() => { originalFetch = global.fetch; jest.useFakeTimers() })
+  afterEach(() => { global.fetch = originalFetch; jest.useRealTimers(); delete (globalThis as any).__neutronOTA })
+  it('starts in up-to-date state', () => { expect(new OTAClient(config()).getState()).toMatchObject({ status: 'up-to-date', currentUpdateId: null, availableUpdate: null, downloadProgress: 0, error: null, consecutiveCrashes: 0 }) })
+  it('requires native capabilities and trust before fetch', async () => { global.fetch = jest.fn(); await expect(new OTAClient(config()).checkForUpdate()).rejects.toThrow(/unsupported/); const { adapter } = fixture(); await expect(new OTAClient(config({ publicKey: undefined }), adapter).checkForUpdate()).rejects.toThrow(/trusted public key/); expect(global.fetch).not.toHaveBeenCalled() })
+  it('fetches the endpoint and authenticates the canonical manifest', async () => { const { client, adapter } = fixture(), m = manifest(); global.fetch = jest.fn(async () => response(m)); expect(await client.checkForUpdate()).toEqual(m); expect(client.getState().status).toBe('available'); expect(adapter.verifyManifest).toHaveBeenCalledWith(canonicalManifest(m), 'signed', 'trusted'); expect(global.fetch).toHaveBeenCalledWith('https://ota.example.com/check', expect.objectContaining({ method: 'POST', redirect: 'error' })) })
+  it('returns null on 304', async () => { const { client } = fixture(); global.fetch = jest.fn(async () => response(null, 304)); expect(await client.checkForUpdate()).toBeNull(); expect(client.getState().status).toBe('up-to-date') })
+  it('rejects network errors while publishing error state', async () => { const { client } = fixture(); global.fetch = jest.fn().mockRejectedValue(new Error('Network error')); await expect(client.checkForUpdate()).rejects.toThrow('Network error'); expect(client.getState().error).toBe('Network error') })
+  it('rejects HTTP errors', async () => { const { client } = fixture(); global.fetch = jest.fn(async () => response(null, 500)); await expect(client.checkForUpdate()).rejects.toThrow('500'); expect(client.getState().status).toBe('error') })
+  it.each(['signature', 'runtime', 'channel', 'build'])('rejects incompatible or unsigned %s', async defect => { const { client } = fixture(), m = manifest(); if (defect === 'signature') m.signature = undefined; if (defect === 'runtime') m.runtimeVersion = 'other'; if (defect === 'channel') m.channel = 'other'; if (defect === 'build') m.buildNumber = 0; global.fetch = jest.fn(async () => response(m)); await expect(client.checkForUpdate()).rejects.toThrow(); expect(client.getState().availableUpdate).toBeNull() })
+  it.each([['1.0.0', true], ['1.0.1', false], ['2.0.0', false]])('enforces minimum native version %s', async (minimum, accepted) => { const { client } = fixture(); global.fetch = jest.fn(async () => response(manifest({ minAppVersion: minimum as string }))); if (accepted) expect(await client.checkForUpdate()).not.toBeNull(); else await expect(client.checkForUpdate()).rejects.toThrow(/newer app version/) })
+  it('returns false without an available update', async () => { expect(await fixture().client.downloadAndApply()).toBe(false) })
+  it('downloads chunks, verifies hashes, and stages actual bytes', async () => { const { client, adapter } = fixture(), bytes = new Uint8Array(100), m = manifest({ downloadSize: 100, chunks: [{ path: 'bundle.js', url: 'https://cdn.example.com/chunk', size: 100, hash, operation: 'add' }] }); global.fetch = jest.fn().mockResolvedValueOnce(response(m)).mockResolvedValueOnce(response(bytes)); await client.checkForUpdate(); expect(await client.downloadAndApply()).toBe(true); expect(adapter.stageChunk).toHaveBeenCalledWith(m.id, 'bundle.js', bytes.buffer); expect(client.getState().downloadProgress).toBe(1); expect(adapter.publishPending).toHaveBeenCalledWith(m) })
+  it('rejects chunk hash mismatch and discards staging', async () => { const { client, adapter } = fixture(), m = manifest({ downloadSize: 1, chunks: [{ path: 'bad.js', url: 'https://cdn.example.com/bad', size: 1, hash, operation: 'add' }] }); adapter.sha256 = jest.fn(async () => 'b'.repeat(64)); global.fetch = jest.fn().mockResolvedValueOnce(response(m)).mockResolvedValueOnce(response(new Uint8Array(1))); await client.checkForUpdate(); await expect(client.downloadAndApply()).rejects.toThrow(/hash mismatch/); expect(adapter.stageChunk).not.toHaveBeenCalled(); expect(adapter.discardStage).toHaveBeenCalledWith(m.id); expect(client.getState().status).toBe('error') })
+  it('applies deletes and verifies the fully assembled bundle', async () => { const { client, adapter } = fixture(); global.fetch = jest.fn(async () => response(manifest({ chunks: [{ path: 'old.js', url: '', size: 0, hash: '', operation: 'delete' }] }))); await client.checkForUpdate(); expect(await client.downloadAndApply()).toBe(true); expect(adapter.deleteStagedPath).toHaveBeenCalledWith('update-123', 'old.js'); expect(adapter.stagedBundleHash).toHaveBeenCalledWith('update-123'); expect(global.fetch).toHaveBeenCalledTimes(1) })
+  it('increments durable crash state across clients', async () => { const { client, adapter } = fixture(); expect(await client.recordCrash()).toBe(false); expect(client.getState().consecutiveCrashes).toBe(1); await new OTAClient(config(), adapter).recordCrash(); expect(await new OTAClient(config(), adapter).recordCrash()).toBe(true); expect(adapter.rollback).toHaveBeenCalled() })
+  it('rollback requires native confirmation and resets projected state', async () => { const { client, adapter } = fixture(); await client.rollback(); expect(client.getState()).toMatchObject({ status: 'rolled-back', currentUpdateId: null, consecutiveCrashes: 0 }); adapter.rollback = jest.fn(async () => ({ ...await adapter.readBootState(), pendingUpdateId: 'unconfirmed' })); await expect(client.rollback()).rejects.toThrow(/not confirmed/) })
+  it('healthy confirmation clears crash and launch markers', async () => { const { client, adapter } = fixture(); await client.recordCrash(); await client.markSuccessfulLaunch(); expect(adapter.markHealthy).toHaveBeenCalled(); expect(client.getState()).toMatchObject({ consecutiveCrashes: 0, isFirstLaunchAfterUpdate: false }) })
+  it('subscription reports state and unsubscribe stops delivery', async () => { const { client } = fixture(); global.fetch = jest.fn(async () => response(manifest())); const states: string[] = []; const unsubscribe = client.subscribe(s => states.push(s.status)); await client.checkForUpdate(); expect(states).toEqual(['checking', 'checking', 'available']); unsubscribe(); await client.checkForUpdate(); expect(states).toHaveLength(3) })
+  it('startup checks immediately and repeated start owns one polling timer', async () => { const { adapter } = fixture(); global.fetch = jest.fn(async () => response(null, 304)); const client = new OTAClient(config({ checkInterval: 60 }), adapter); await client.start(); await client.start(); expect(global.fetch).toHaveBeenCalledTimes(1); expect(jest.getTimerCount()).toBe(1); await jest.advanceTimersByTimeAsync(60000); expect(global.fetch).toHaveBeenCalledTimes(2); client.stop(); expect(jest.getTimerCount()).toBe(0) })
+  it('stop clears the periodic timer', async () => { const { adapter } = fixture(); global.fetch = jest.fn(async () => response(null, 304)); const client = new OTAClient(config({ checkInterval: 10 }), adapter); await client.start(); client.stop(); await jest.advanceTimersByTimeAsync(20000); expect(global.fetch).toHaveBeenCalledTimes(1) })
+  it('stale startup rejection cannot stop a newer session or leak its timer', async () => { const { adapter } = fixture(); const read = adapter.readBootState; let rejectOld!: (error: Error) => void; adapter.readBootState = jest.fn().mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject })).mockImplementation(read); global.fetch = jest.fn(async () => response(null, 304)); const client = new OTAClient(config({ checkInterval: 60 }), adapter); const old = client.start(); client.stop(); await client.start(); rejectOld(new Error('stale')); await old; await client.start(); expect(client.getState().status).toBe('up-to-date'); expect(jest.getTimerCount()).toBe(1); client.stop(); expect(jest.getTimerCount()).toBe(0) })
+  it('stopped in-flight checks never publish into a replacement session', async () => { const { client } = fixture(); let resolve!: (response: Response) => void; global.fetch = jest.fn(() => new Promise(r => { resolve = r })); const old = client.checkForUpdate(); await Promise.resolve(); client.stop(); resolve(response(manifest())); await expect(old).rejects.toThrow(/superseded/); expect(client.getState().availableUpdate).toBeNull() })
 })

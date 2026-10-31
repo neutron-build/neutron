@@ -1,3 +1,4 @@
+import { counterTTL, incrementCounterScript } from "./counter.js";
 import type { CacheClient } from "./index.js";
 import { lazyImport } from "../internal/lazy-import.js";
 
@@ -13,10 +14,12 @@ interface RedisLikeClient {
   del(key: string): Promise<unknown>;
   incr(key: string): Promise<number>;
   expire(key: string, ttlSec: number): Promise<unknown>;
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
   quit(): Promise<unknown>;
 }
 
 export class RedisCacheClient implements CacheClient {
+  readonly counterCapabilities = Object.freeze({ plain: "checked", atomicTTL: true } as const);
   constructor(
     private readonly client: RedisLikeClient,
     private readonly keyPrefix: string
@@ -40,12 +43,8 @@ export class RedisCacheClient implements CacheClient {
   }
 
   async incr(key: string, ttlSec?: number): Promise<number> {
-    const fullKey = this.key(key);
-    const value = await this.client.incr(fullKey);
-    if (typeof ttlSec === "number" && ttlSec > 0 && value === 1) {
-      await this.client.expire(fullKey, ttlSec);
-    }
-    return value;
+    const ttl = counterTTL(ttlSec);
+    return Number(await this.client.eval(incrementCounterScript, 1, this.key(key), ttl ?? ""));
   }
 
   async close(): Promise<void> {

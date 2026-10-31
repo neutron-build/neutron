@@ -10,7 +10,7 @@ Uses the "online softmax" trick (Milakov & Gimelshein, 2018):
 Keep running max and sum of exponentials, correct at the end.
 """
 
-from std.math import exp
+from std.math import exp, sqrt
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.kv_cache import KVCache
@@ -27,7 +27,7 @@ def fused_attention_head(
     kv_head: Int,
     head_dim: Int,
     current_pos: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Fused single-head attention with online softmax.
 
     Computes attention output in a single pass over the KV cache,
@@ -59,14 +59,8 @@ def fused_attention_head(
     if attend_len > seq_len:
         attend_len = seq_len
 
-    # Scale factor: 1/sqrt(head_dim) via Newton's method
-    var inv_sqrt_d: Float32 = 1.0
-    if head_dim > 1:
-        var df = Float32(head_dim)
-        var x: Float32 = 0.5
-        for _ in range(10):
-            x = x * (1.5 - 0.5 * df * x * x)
-        inv_sqrt_d = x
+    # Scale with the standard library; a fixed Newton seed diverges at large dimensions.
+    var inv_sqrt_d = Float32(1.0) / sqrt(Float32(head_dim))
 
     # Online softmax pass
     var running_max: Float32 = -1e30
@@ -109,7 +103,7 @@ def fused_gqa_attention(
     num_kv_heads: Int,
     head_dim: Int,
     current_pos: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Fused GQA attention for all heads.
 
     Args:
@@ -152,7 +146,7 @@ def fused_q8_attention_head(
     kv_head: Int,
     head_dim: Int,
     current_pos: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Fused attention with online softmax using quantized KV cache.
 
     Same algorithm as fused_attention_head but dequantizes K/V on-the-fly.
@@ -179,13 +173,7 @@ def fused_q8_attention_head(
     if attend_len > seq_len:
         attend_len = seq_len
 
-    var inv_sqrt_d: Float32 = 1.0
-    if head_dim > 1:
-        var df = Float32(head_dim)
-        var x: Float32 = 0.5
-        for _ in range(10):
-            x = x * (1.5 - 0.5 * df * x * x)
-        inv_sqrt_d = x
+    var inv_sqrt_d = Float32(1.0) / sqrt(Float32(head_dim))
 
     var running_max: Float32 = -1e30
     var running_sum: Float32 = 0.0
@@ -233,7 +221,7 @@ def fused_q8_gqa_attention(
     num_kv_heads: Int,
     head_dim: Int,
     current_pos: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Fused GQA attention with quantized KV cache.
 
     Args:

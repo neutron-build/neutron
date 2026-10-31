@@ -56,6 +56,32 @@ describe("resolvePreactSsr", () => {
     );
   });
 
+  // Vite string aliases match `find` or `find/…`, first match wins. Every
+  // react-compat import must land on its own target, not on a bare-package
+  // alias with the subpath glued to a file (`compat.mjs/jsx-runtime`).
+  it("react-compat runtime imports each resolve through their own alias", () => {
+    const root = makeApp();
+    const preact = resolvePreactSsr(root);
+    const runtime = resolveRuntimeAliases("react-compat")!;
+    const aliases = vitePreactAliases(preact, runtime);
+    // A RegExp find (the exact bare-`react` entry) matches by test, as Vite's does.
+    const viteResolve = (id: string) => {
+      for (const a of aliases) {
+        if (typeof a.find !== "string") {
+          if (a.find.test(id)) return a.replacement;
+          continue;
+        }
+        if (id === a.find) return a.replacement;
+        if (id.startsWith(a.find + "/")) return a.replacement + id.slice(a.find.length);
+      }
+      return id;
+    };
+    for (const id of Object.keys(runtime)) {
+      const own = aliases.find((a) => (typeof a.find === "string" ? a.find === id : a.find.test(id)))!;
+      expect(viteResolve(id), id).toBe(own.replacement);
+    }
+  });
+
   it("vitePreactAliases lists subpaths before bare preact (prefix-match safety)", () => {
     const root = makeApp();
     const preact = resolvePreactSsr(root);

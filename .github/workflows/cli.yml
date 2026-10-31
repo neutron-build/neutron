@@ -67,6 +67,7 @@ jobs:
     name: Test
     needs: studio
     runs-on: ubuntu-latest
+
     # Required-live Postgres for the E2E legs (migration-safety in ./cmd,
     # studio row-safety in ./internal/studio). They read NEUTRON_E2E_DATABASE_URL
     # and skip with a reason locally; NEUTRON_LIVE_REQUIRED=1 flips a missing
@@ -115,9 +116,39 @@ jobs:
         run: go build -v .
         working-directory: cli
 
+      # The recovery legs run pg_dump/pg_restore against the PostgreSQL 17
+      # service. The runner's own client is older, and pg_dump refuses a newer
+      # server, so install the matching client (bounded retries as in
+      # pgregress.yml: a stalled apt mirror is not a CLI failure).
+      - name: Install PostgreSQL 17 client
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          retry() {
+            local what="$1"; shift
+            local limit="$1"; shift
+            for attempt in 1 2 3; do
+              if sudo timeout "$limit" "$@"; then
+                return 0
+              fi
+              echo "$what failed or stalled (attempt $attempt of 3), retrying"
+              sleep 5
+            done
+            echo "::error::$what did not succeed in 3 bounded attempts -- apt mirror stall, not a CLI failure"
+            return 1
+          }
+          retry "apt-get update" 120 apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30
+          retry "install postgresql-common" 180 apt-get install -y postgresql-common
+          retry "pgdg repository setup" 180 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          retry "install postgresql-client-17" 180 apt-get install -y postgresql-client-17
+          echo "NEUTRON_PG_DUMP_BINARY=/usr/lib/postgresql/17/bin/pg_dump" >> "$GITHUB_ENV"
+          echo "NEUTRON_PG_RESTORE_BINARY=/usr/lib/postgresql/17/bin/pg_restore" >> "$GITHUB_ENV"
+
       - name: Test
         run: go test -race -timeout 30m ./...
         working-directory: cli
+        env:
+          NEUTRON_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
 
       - name: Vet
         run: go vet ./...

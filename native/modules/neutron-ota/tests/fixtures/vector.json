@@ -1,0 +1,34 @@
+{
+  "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+  "publicKeyPEM": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n",
+  "canonical": "{\"id\":\"signed-fixture-1\",\"version\":\"1.0.1\",\"buildNumber\":1,\"runtimeVersion\":\"0.76.0\",\"channel\":\"test\",\"bundleHash\":\"a79b4ed295e0c1c186ab2d33aada2f09704d41ed08eabb424f842599faf949d8\",\"downloadSize\":31,\"createdAt\":\"2026-10-07T00:00:00Z\",\"minAppVersion\":null,\"chunks\":[{\"path\":\"index.jsbundle\",\"hash\":\"276ba2866de7f1bc7073d09891a19cfd1251a823afb3581966865d697a7b20e7\",\"size\":31,\"url\":\"https://fixture.invalid/index.jsbundle\",\"operation\":\"modify\"},{\"path\":\"obsolete.txt\",\"hash\":\"\",\"size\":0,\"url\":\"\",\"operation\":\"delete\"}]}",
+  "manifest": {
+    "id": "signed-fixture-1",
+    "version": "1.0.1",
+    "buildNumber": 1,
+    "runtimeVersion": "0.76.0",
+    "channel": "test",
+    "bundleHash": "a79b4ed295e0c1c186ab2d33aada2f09704d41ed08eabb424f842599faf949d8",
+    "downloadSize": 31,
+    "createdAt": "2026-10-07T00:00:00Z",
+    "minAppVersion": null,
+    "chunks": [
+      {
+        "path": "index.jsbundle",
+        "hash": "276ba2866de7f1bc7073d09891a19cfd1251a823afb3581966865d697a7b20e7",
+        "size": 31,
+        "url": "https://fixture.invalid/index.jsbundle",
+        "operation": "modify"
+      },
+      {
+        "path": "obsolete.txt",
+        "hash": "",
+        "size": 0,
+        "url": "",
+        "operation": "delete"
+      }
+    ],
+    "signature": "Z/rNsond90bKoyP9x0d4gh5X3H/PcjEnuCTWwNoDAGHHP49M9F7rqoQazBtKC/SjX4BOpz04oI+YxuSZPwrTDQ=="
+  },
+  "chunkBase64": "Z2xvYmFsLl9fTkVVVFJPTl9PVEFfVEVTVF9fPTE7Cg=="
+}

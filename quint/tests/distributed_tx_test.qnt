@@ -1,10 +1,10 @@
 // Distributed transaction invariant tests.
 module distributed_tx_test {
-    import distributed_tx.*
+    import distributed_tx.* from "../specs/nucleus/distributed_tx"
 
     // Test: initial state satisfies all invariants
     run init_safe_test = {
-        init.then(all { commit_validity, atomicity, no_committed_abort })
+        init.expect(all { commit_validity, atomicity, no_committed_abort })
     }
 
     // Test: prepare and commit flow
@@ -15,7 +15,7 @@ module distributed_tx_test {
             .then(vote_prepare(1, 2))
             .then(vote_prepare(1, 3))
             .then(commit_tx(1))
-            .then(all { commit_validity, atomicity, no_committed_abort })
+            .expect(all { commit_validity, atomicity, no_committed_abort })
     }
 
     // Test: abort if any participant aborts
@@ -25,7 +25,7 @@ module distributed_tx_test {
             .then(vote_prepare(1, 1))
             .then(vote_abort(1, 2))
             .then(abort_tx(1))
-            .then(all { commit_validity, atomicity, no_committed_abort })
+            .expect(all { commit_validity, atomicity, no_committed_abort })
     }
 
     // Test: multiple transactions — one committed, one aborted
@@ -40,7 +40,7 @@ module distributed_tx_test {
             .then(vote_prepare(2, 1))
             .then(vote_abort(2, 2))
             .then(abort_tx(2))
-            .then(all { commit_validity, atomicity, no_committed_abort })
+            .expect(all { commit_validity, atomicity, no_committed_abort })
     }
 
     // Test: multiple sequential commits
@@ -56,7 +56,7 @@ module distributed_tx_test {
             .then(vote_prepare(2, 2))
             .then(vote_prepare(2, 3))
             .then(commit_tx(2))
-            .then(all { commit_validity, atomicity, no_committed_abort })
+            .expect(all { commit_validity, atomicity, no_committed_abort })
     }
 
     // Test: partial prepare then abort preserves invariants
@@ -66,6 +66,6 @@ module distributed_tx_test {
             .then(vote_prepare(1, 1))
             .then(vote_abort(1, 3))
             .then(abort_tx(1))
-            .then(all { commit_validity, atomicity, no_committed_abort })
+            .expect(all { commit_validity, atomicity, no_committed_abort })
     }
 }

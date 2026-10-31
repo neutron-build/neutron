@@ -31,6 +31,18 @@ export interface QualifiedNode {
   readonly parts: readonly string[];
 }
 
+/** A reference to the row proposed for insertion, `excluded."col"`, built by
+ *  the `excluded()` constructor. A DISTINCT node rather than a qualified
+ *  `["excluded", col]` (NA-12): name-based detection could not tell the
+ *  pseudo-relation from an ordinary table, alias, or schema actually named
+ *  `excluded` — PostgreSQL permits all of those — so ordinary references were
+ *  rejected and the distinction was lost before validation ever ran. Only
+ *  this node is the pseudo-relation; ordinary qualified nodes stay ordinary. */
+export interface ExcludedReferenceNode {
+  readonly kind: "excluded-ref";
+  readonly column: string;
+}
+
 /** A bound value. Renders as the next $n placeholder, never as SQL text.
  *  `cast` (set via paramCast) renders the placeholder as `$n::text::<cast>`
  *  so the parameter stays a text value on both drivers — codecs use it for
@@ -330,6 +342,7 @@ export type AnyStatementNode = StatementNode | InsertStatementNode | UpdateState
 export type ValueNode =
   | IdentifierNode
   | QualifiedNode
+  | ExcludedReferenceNode
   | ParamNode
   | TrustedNode
   | FragmentNode
@@ -532,12 +545,14 @@ export function assertCteRefsResolve(stmt: AnyStatementNode, outer: readonly Cte
 // database, consistent with the fragment-text posture).
 // ---------------------------------------------------------------------------
 
-/** Collect `excluded."col"` references from expression positions (expr args,
- *  aggregate args, structural fragment parts). */
-export function collectExcludedRefs(node: ValueNode, out: QualifiedNode[]): void {
+/** Collect semantic `excluded-ref` nodes from expression positions (expr
+ *  args, aggregate args, structural fragment parts). Ordinary qualified
+ *  references named `excluded` are NOT collected — they are ordinary
+ *  identifiers as far as this AST is concerned (NA-12). */
+export function collectExcludedRefs(node: ValueNode, out: ExcludedReferenceNode[]): void {
   switch (node.kind) {
-    case "qualified":
-      if (node.parts.length > 0 && node.parts[0] === "excluded") out.push(node);
+    case "excluded-ref":
+      out.push(node);
       return;
     case "expr":
       for (const a of node.args) collectExcludedRefs(a, out);
@@ -555,7 +570,7 @@ export function collectExcludedRefs(node: ValueNode, out: QualifiedNode[]): void
 
 /** Reject excluded() references in one expression position. */
 export function assertNoExcludedRefs(node: ValueNode, who: string): void {
-  const refs: QualifiedNode[] = [];
+  const refs: ExcludedReferenceNode[] = [];
   collectExcludedRefs(node, refs);
   if (refs.length > 0) {
     throw new Error(`${who}: excluded() references the row proposed for insertion and is only valid in on-conflict clauses`);
@@ -568,29 +583,30 @@ function excludedScopeError(who: string): Error {
   );
 }
 
-/** "reject": no excluded reference anywhere. "set-scope": direct references
- *  allowed (the DO UPDATE SET / WHERE surfaces); subqueries inside still
- *  reject — a subquery can never see excluded, even in a legal clause. */
-type ExcludedPolicy = "reject" | "set-scope";
-
-function visitForExcluded(node: ValueNode, policy: ExcludedPolicy, who: string): void {
+/** A scalar subquery inside DO UPDATE SET/WHERE is correlated to the insert:
+ *  it sees `excluded` in its own expression positions AND in its nested
+ *  CTE/FROM-subquery bodies — live-verified on PostgreSQL 17 (NA-12's
+ *  fixture `SET body = (SELECT excluded.body || '-seen')` returns
+ *  'after-seen', and both a nested FROM subquery and a CTE body resolve
+ *  excluded the same way). So visibility is carried INTO nested statements
+ *  rather than reset; a statement that was never inside a conflict-update
+ *  expression tree starts with it off. */
+function visitForExcluded(node: ValueNode, excludedVisible: boolean, who: string): void {
   switch (node.kind) {
-    case "qualified":
-      if (policy === "reject" && node.parts.length > 0 && node.parts[0] === "excluded") {
-        throw excludedScopeError(who);
-      }
+    case "excluded-ref":
+      if (!excludedVisible) throw excludedScopeError(who);
       return;
     case "expr":
-      for (const a of node.args) visitForExcluded(a, policy, who);
+      for (const a of node.args) visitForExcluded(a, excludedVisible, who);
       return;
     case "aggregate":
-      for (const a of node.args) visitForExcluded(a, policy, who);
+      for (const a of node.args) visitForExcluded(a, excludedVisible, who);
       return;
     case "fragment":
-      for (const p of node.parts) if (typeof p !== "string") visitForExcluded(p, policy, who);
+      for (const p of node.parts) if (typeof p !== "string") visitForExcluded(p, excludedVisible, who);
       return;
     case "subquery":
-      assertStatementNoExcluded(node.select, `${who} (subquery)`);
+      assertStatementNoExcluded(node.select, `${who} (subquery)`, excludedVisible);
       return;
     default:
       return;
@@ -602,7 +618,7 @@ function visitForExcluded(node: ValueNode, policy: ExcludedPolicy, who: string):
  *  compileStatementNode: a structurally forged statement (missing Q02 fields)
  *  reaches the compiler's own field validations with their pinned messages
  *  instead of crashing here. */
-function assertStatementNoExcluded(stmt: StatementNode, who: string): void {
+function assertStatementNoExcluded(stmt: StatementNode, who: string, excludedVisible = false): void {
   const groupBy = stmt.groupBy ?? [];
   const having = stmt.having ?? [];
   const setOps = stmt.setOps ?? [];
@@ -611,18 +627,21 @@ function assertStatementNoExcluded(stmt: StatementNode, who: string): void {
   const joins = stmt.joins ?? [];
   const where = stmt.where ?? [];
   const ctes = stmt.ctes ?? [];
-  for (const c of ctes) assertStatementNoExcluded(c.select, `cte "${c.name}" in ${who}`);
-  if (stmt.from?.kind === "subquery") assertStatementNoExcluded(stmt.from.select, `from in ${who}`);
-  for (const p of projections) visitForExcluded(p.expr, "reject", `projection in ${who}`);
+  // Nested statements inherit the outer visibility (see visitForExcluded):
+  // a CTE or FROM subquery inside a conflict-update scalar subquery is
+  // correlated to the insert just like its parent.
+  for (const c of ctes) assertStatementNoExcluded(c.select, `cte "${c.name}" in ${who}`, excludedVisible);
+  if (stmt.from?.kind === "subquery") assertStatementNoExcluded(stmt.from.select, `from in ${who}`, excludedVisible);
+  for (const p of projections) visitForExcluded(p.expr, excludedVisible, `projection in ${who}`);
   for (const j of joins) {
-    if (j.target.kind === "subquery") assertStatementNoExcluded(j.target.select, `join target in ${who}`);
-    if (j.on !== undefined) visitForExcluded(j.on, "reject", `join on in ${who}`);
+    if (j.target.kind === "subquery") assertStatementNoExcluded(j.target.select, `join target in ${who}`, excludedVisible);
+    if (j.on !== undefined) visitForExcluded(j.on, excludedVisible, `join on in ${who}`);
   }
-  for (const w of where) visitForExcluded(w, "reject", `where in ${who}`);
-  for (const g of groupBy) visitForExcluded(g, "reject", `group by in ${who}`);
-  for (const h of having) visitForExcluded(h, "reject", `having in ${who}`);
-  for (const o of orderBy) visitForExcluded(o.expr, "reject", `order by in ${who}`);
-  for (const b of setOps) assertStatementNoExcluded(b.select, `set-operation branch in ${who}`);
+  for (const w of where) visitForExcluded(w, excludedVisible, `where in ${who}`);
+  for (const g of groupBy) visitForExcluded(g, excludedVisible, `group by in ${who}`);
+  for (const h of having) visitForExcluded(h, excludedVisible, `having in ${who}`);
+  for (const o of orderBy) visitForExcluded(o.expr, excludedVisible, `order by in ${who}`);
+  for (const b of setOps) assertStatementNoExcluded(b.select, `set-operation branch in ${who}`, excludedVisible);
 }
 
 /** Compile choke point: excluded() may appear ONLY directly inside an
@@ -637,26 +656,28 @@ export function assertExcludedScope(stmt: AnyStatementNode): void {
       assertStatementNoExcluded(stmt, "select statement");
       return;
     case "update":
-      for (const s of stmt.sets ?? []) visitForExcluded(s.value, "reject", "update set");
-      for (const w of stmt.where ?? []) visitForExcluded(w, "reject", "update where");
-      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, "reject", "update returning");
+      for (const s of stmt.sets ?? []) visitForExcluded(s.value, false, "update set");
+      for (const w of stmt.where ?? []) visitForExcluded(w, false, "update where");
+      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, false, "update returning");
       return;
     case "delete":
-      for (const w of stmt.where ?? []) visitForExcluded(w, "reject", "delete where");
-      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, "reject", "delete returning");
+      for (const w of stmt.where ?? []) visitForExcluded(w, false, "delete where");
+      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, false, "delete returning");
       return;
     case "insert": {
       const oc = stmt.onConflict;
       // The conflict TARGET's index predicate cannot see excluded (PG:
       // "invalid reference to FROM-clause entry for table excluded").
       if (oc?.target?.kind === "columns" && oc.target.where !== undefined) {
-        for (const w of oc.target.where) visitForExcluded(w, "reject", "on conflict target where");
+        for (const w of oc.target.where) visitForExcluded(w, false, "on conflict target where");
       }
       // DO UPDATE SET expressions and the DO UPDATE WHERE predicate are the
-      // two legal surfaces — direct refs allowed, subqueries still reject.
-      if (oc?.sets !== undefined) for (const s of oc.sets) visitForExcluded(s.value, "set-scope", "on conflict do update set");
-      if (oc?.where !== undefined) for (const w of oc.where) visitForExcluded(w, "set-scope", "on conflict do update where");
-      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, "reject", "insert returning");
+      // two legal surfaces. Visibility carries into their scalar subqueries
+      // (correlated to the insert — live-verified on PG 17, NA-12); every
+      // other statement position starts with it off.
+      if (oc?.sets !== undefined) for (const s of oc.sets) visitForExcluded(s.value, true, "on conflict do update set");
+      if (oc?.where !== undefined) for (const w of oc.where) visitForExcluded(w, true, "on conflict do update where");
+      if (stmt.returning !== undefined) for (const p of stmt.returning) visitForExcluded(p.expr, false, "insert returning");
       return;
     }
   }
@@ -733,7 +754,7 @@ export function forgedTextKind(v: object): TextBearingKind | null {
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-function validIdent(name: string, what: string): string {
+export function validIdent(name: string, what: string): string {
   if (typeof name !== "string" || name.length === 0) throw new Error(`${what}: must be a non-empty string`);
   if (name.includes("\0")) throw new Error(`${what}: NUL bytes are not allowed`);
   return name;
@@ -793,7 +814,7 @@ function deepFreeze(x: unknown): void {
   }
 }
 
-function frozen<N>(node: N): N {
+export function frozen<N>(node: N): N {
   deepFreeze(node);
   return node;
 }
@@ -1314,7 +1335,7 @@ export function deleteStatement(input: DeleteStatementInput): DeleteStatementNod
 // Kind guards
 // ---------------------------------------------------------------------------
 
-const VALUE_KINDS = new Set(["identifier", "qualified", "param", "trusted", "fragment", "expr", "aggregate", "subquery"]);
+const VALUE_KINDS = new Set(["identifier", "qualified", "excluded-ref", "param", "trusted", "fragment", "expr", "aggregate", "subquery"]);
 
 function hasKind(v: object): v is { kind: string } {
   return typeof (v as { kind?: unknown }).kind === "string";

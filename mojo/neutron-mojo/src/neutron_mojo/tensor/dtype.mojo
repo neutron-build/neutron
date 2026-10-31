@@ -111,6 +111,8 @@ def can_cast(source: DType, target: DType) -> Bool:
     - Widening (e.g. float16 -> float32, int8 -> int32)
     - int -> float of sufficient width
     """
+    if bitwidth_of(source) == 0 or bitwidth_of(target) == 0:
+        return False
     if source == target:
         return True
 
@@ -119,7 +121,10 @@ def can_cast(source: DType, target: DType) -> Bool:
 
     # Float -> wider float
     if source.is_floating_point() and target.is_floating_point():
-        return tgt_bw >= src_bw
+        # Half precision and bfloat16 have incomparable precision/range.
+        if source == DType.float16 or source == DType.bfloat16:
+            return target == DType.float32 or target == DType.float64
+        return (source == DType.float32 and target == DType.float64)
 
     # Int -> wider int (same signedness)
     if source.is_integral() and target.is_integral():

@@ -130,11 +130,28 @@ The result grids virtualize: only the rows in the scroll viewport plus a
 fixed overscan exist in the DOM, whatever the result size, with spacer
 rows keeping the scroll height exact. Bounded reads are the contract, not
 a courtesy: one table page is at most 1,000 rows (larger limits are
-refused with 400, never silently clamped — page with offset or export
+refused with 400, never silently clamped — continue paging or export
 instead), and the SQL editor retains at most 10,000 rows of a result,
 marking it `truncated` with the limit named in the grid. Offset paging is
 deterministic: the primary key is the unique tail of every table read, so
 unchanged-data pages neither repeat nor skip rows.
+
+For direct PostgreSQL, the table browser first attempts live keyset paging
+when an ordinary permanent, non-inherited table has one native bigint
+primary key and only supported builtin scalar columns. Next follows an
+opaque server cursor; Previous retains up to 64 page starts, and Refresh
+restarts at the first page. Filters, custom sorts, reference matches,
+Nucleus and unsupported table/type profiles use offset paging with a visible
+reason. Authentication, expired or stale cursors, resource limits and backend
+errors require refresh rather than silently switching paging modes.
+
+Each keyset page uses its own read-only repeatable-read snapshot. The whole
+browsing session has no shared snapshot: inserts behind the cursor and
+changes to primary keys can be missed. Cursor history resets after a
+successful refresh, page-size or query change, or committed-edit reload.
+Failed reads retain the previous rows and staged drafts, but disable new
+edits until a fresh read succeeds. Staged drafts keep their exact table,
+connection, key and version identity when navigating.
 
 The grid is a WAI-ARIA `grid` usable without a mouse: one roving tab stop
 moves with the active cell, arrows/PageUp/PageDown/Home/End navigate,
@@ -409,8 +426,10 @@ published CLI targets) and onboarding on Linux.
   (`orm-matrix.yml` run 36614418202 on main 071759ea). PostgreSQL 14 is not supported. Pull requests also run the
   real-browser journey on 17 (see the support matrix in
   `typescript/packages/neutron-sql/README.md`). Nucleus connections open the
-  model modules, measured against Nucleus 1.0.2 and not advertised for
-  release; the limits registry above states what each model does. Row
+  model modules, with historical evidence in the named
+  [2026-09-30 ORM recording](../conformance/live/orm/ORM_CONFORMANCE.md),
+  whose binary/source identity is not current-checkout certification and whose
+  Nucleus profile remains unsupported; the limits registry above states what each model does. Row
   editing on Nucleus is read-only: the catalog query that identifies keys
   and row versions does not run there.
 - **Platforms.** The CLI that embeds Studio is released for Linux and macOS
@@ -442,8 +461,10 @@ published CLI targets) and onboarding on Linux.
 
 ## Status
 
-Implemented and under active development — private workspace software in this
-monorepo, not a published product.
+Implemented and under active development in this monorepo. Studio is distributed
+as the embedded browser UI in CLI archives, rather than as a standalone package.
+The embed gate checks bundled asset identity; this statement does not certify a
+particular downloaded release artifact.
 
 ---
 
@@ -453,3 +474,17 @@ Grid, D3-force, Cytoscape.js, and a Rust backend, described a file layout that
 does not match the tree, and ended with "Status: Planned — not yet
 implemented" — while `studio/src/modules/` already ships a browser for each of
 the 14 models and the Go backend runs in CI. Found by the S97 claims audit.*
+
+### Codegen read profiles
+
+The schema designer's **Codegen read profile** selector defaults to **Legacy**.
+Select **Lossless read v1** explicitly for PostgreSQL scalar TS/Python/Go read
+models. CLI and Studio use the same generator. Legacy numeric mappings can
+lose precision; selecting the new profile does not change migration ownership
+or generate insert/update contracts. Unsupported types/languages are refused
+with table/column/type context displayed in the code panel.
+
+See [the generated read contract](../contracts/data/GENERATED.md) for admitted
+catalog identities, native transports and language-specific null/presence
+limits. The new profile does not provide six-language lossless equivalence or
+support temporal/array/JSON/domain/enum/composite fields.

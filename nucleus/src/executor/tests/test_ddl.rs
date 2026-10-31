@@ -720,6 +720,115 @@ async fn test_create_schema() {
 
 // ======================================================================
 
+// DROP SCHEMA
+// ======================================================================
+
+#[tokio::test]
+async fn test_drop_schema_empty() {
+    let ex = test_executor();
+    exec(&ex, "CREATE SCHEMA ds_empty").await;
+    let results = exec(&ex, "DROP SCHEMA ds_empty").await;
+    match &results[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "DROP SCHEMA"),
+        _ => panic!("expected Command result"),
+    }
+    assert!(!ex.schemas.read().await.contains("ds_empty"));
+}
+
+#[tokio::test]
+async fn test_drop_schema_nonempty_refuses_and_names_object() {
+    let ex = test_executor();
+    exec(&ex, "CREATE SCHEMA ds_full").await;
+    exec(&ex, "CREATE TABLE ds_full.t (id INT)").await;
+    let err = ex.execute("DROP SCHEMA ds_full").await.unwrap_err();
+    assert!(
+        err.to_string().contains("ds_full.t"),
+        "refusal must name the contained object, got: {err}"
+    );
+    // Fail-closed: neither the schema nor its table went anywhere.
+    assert!(ex.schemas.read().await.contains("ds_full"));
+    assert!(ex.catalog.get_table("ds_full.t").await.is_some());
+    // Dropping the contained table unblocks the schema drop.
+    exec(&ex, "DROP TABLE ds_full.t").await;
+    exec(&ex, "DROP SCHEMA ds_full").await;
+    assert!(!ex.schemas.read().await.contains("ds_full"));
+}
+
+#[tokio::test]
+async fn test_drop_schema_nonempty_refuses_naming_view() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ds_v_base (id INT)").await;
+    exec(&ex, "CREATE SCHEMA ds_v").await;
+    exec(&ex, "CREATE VIEW ds_v.v AS SELECT id FROM ds_v_base").await;
+    let err = ex.execute("DROP SCHEMA ds_v").await.unwrap_err();
+    assert!(
+        err.to_string().contains("ds_v.v"),
+        "refusal must name the contained view, got: {err}"
+    );
+    assert!(ex.schemas.read().await.contains("ds_v"));
+}
+
+#[tokio::test]
+async fn test_drop_schema_if_exists() {
+    let ex = test_executor();
+    // Missing without IF EXISTS is an error, mirroring DROP TABLE.
+    let err = ex.execute("DROP SCHEMA ds_missing").await.unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "got: {err}");
+    // Missing with IF EXISTS succeeds.
+    let results = exec(&ex, "DROP SCHEMA IF EXISTS ds_missing").await;
+    match &results[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "DROP SCHEMA"),
+        _ => panic!("expected Command result"),
+    }
+    // Present with IF EXISTS drops it.
+    exec(&ex, "CREATE SCHEMA ds_ie").await;
+    exec(&ex, "DROP SCHEMA IF EXISTS ds_ie").await;
+    assert!(!ex.schemas.read().await.contains("ds_ie"));
+}
+
+#[tokio::test]
+async fn test_drop_schema_cascade_refused() {
+    let ex = test_executor();
+    exec(&ex, "CREATE SCHEMA ds_casc").await;
+    let err = ex.execute("DROP SCHEMA ds_casc CASCADE").await.unwrap_err();
+    assert!(
+        err.to_string().contains("CASCADE"),
+        "CASCADE must be refused as unimplemented, got: {err}"
+    );
+    // Refused means the schema is still there.
+    assert!(ex.schemas.read().await.contains("ds_casc"));
+}
+
+#[tokio::test]
+async fn test_drop_schema_then_recreate_and_use() {
+    let ex = test_executor();
+    exec(&ex, "CREATE SCHEMA ds_re").await;
+    exec(&ex, "CREATE TABLE ds_re.t (id INT)").await;
+    exec(&ex, "DROP TABLE ds_re.t").await;
+    exec(&ex, "DROP SCHEMA ds_re").await;
+    // No schema-prefixed keys remain in the catalog.
+    assert!(ex.catalog.get_table("ds_re.t").await.is_none());
+    assert!(
+        !ex.catalog
+            .table_names()
+            .await
+            .iter()
+            .any(|t| t.starts_with("ds_re."))
+    );
+    // The name is immediately reusable.
+    let results = exec(&ex, "CREATE SCHEMA ds_re").await;
+    match &results[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "CREATE SCHEMA"),
+        _ => panic!("expected Command result"),
+    }
+    exec(&ex, "CREATE TABLE ds_re.t2 (id INT)").await;
+    exec(&ex, "INSERT INTO ds_re.t2 VALUES (7)").await;
+    let results = exec(&ex, "SELECT id FROM ds_re.t2").await;
+    assert_eq!(rows(&results[0]).len(), 1);
+}
+
+// ======================================================================
+
 // IF NOT EXISTS / OR REPLACE tests
 // ======================================================================
 

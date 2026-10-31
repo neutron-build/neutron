@@ -145,12 +145,12 @@ def _build_tiny_gguf_with_data() raises -> List[UInt8]:
     _write_u32_le(buf, 4)
     _write_u32_le(buf, 8)
 
-    # --- Tensor info ---
-    # embed: [8, 4] F32 = 32 floats = 128 bytes
+    # --- Tensor info --- (GGUF dims are fastest-varying-first)
+    # embed: row-major [8, 4] F32 = 32 floats = 128 bytes
     _write_string_gguf(buf, "model.embed_tokens.weight")
     _write_u32_le(buf, 2)   # n_dims
+    _write_u64_le(buf, 4)   # hidden_dim (fastest)
     _write_u64_le(buf, 8)   # vocab_size
-    _write_u64_le(buf, 4)   # hidden_dim
     _write_u32_le(buf, 0)   # F32
     _write_u64_le(buf, 0)   # offset
 
@@ -161,13 +161,13 @@ def _build_tiny_gguf_with_data() raises -> List[UInt8]:
     _write_u32_le(buf, 0)   # F32
     _write_u64_le(buf, 128) # offset after embed
 
-    # lm_head: [8, 4] F32 = 32 floats = 128 bytes
+    # lm_head: row-major [8, 4] F32 = 32 floats = 128 bytes (aligned up from 144)
     _write_string_gguf(buf, "lm_head.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
     _write_u64_le(buf, 4)
+    _write_u64_le(buf, 8)
     _write_u32_le(buf, 0)   # F32
-    _write_u64_le(buf, 144) # offset after norm
+    _write_u64_le(buf, 160) # offset after norm + alignment padding
 
     # --- Align to 32 bytes ---
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
@@ -182,6 +182,10 @@ def _build_tiny_gguf_with_data() raises -> List[UInt8]:
     # final_norm: 4 floats, all 1.0
     for _ in range(4):
         _write_f32_le(buf, Float32(1.0))
+
+    # alignment padding (16 bytes) so lm_head sits at aligned offset 160
+    for _ in range(16):
+        buf.append(0)
 
     # lm_head: 32 floats
     for i in range(32):

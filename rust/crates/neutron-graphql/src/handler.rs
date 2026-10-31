@@ -27,6 +27,7 @@ use crate::schema::ExecutableSchema;
 pub fn graphql_handler<S: ExecutableSchema>(
     schema: S,
 ) -> impl Fn(GraphQlRequest) -> Pin<Box<dyn Future<Output = GraphQlResponse> + Send + 'static>>
+       + Clone
        + Send
        + Sync
        + 'static {

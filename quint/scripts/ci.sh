@@ -7,6 +7,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CONFORMANCE_DIR="$ROOT_DIR/conformance"
 
 echo "=== Step 1: Quint Type Checking ==="
+python3 "$SCRIPT_DIR/test_manifest.py"
 bash "$SCRIPT_DIR/check.sh"
 
 echo ""
@@ -15,7 +16,7 @@ bash "$SCRIPT_DIR/simulate.sh"
 
 echo ""
 echo "=== Step 3: Quint Conformance Tests ==="
-quint test --match '.*_test' "$CONFORMANCE_DIR/conformance_test.qnt"
+python3 "$SCRIPT_DIR/manifest.py" test
 
 echo ""
 echo "=== Step 4: Rust Conformance Tests ==="

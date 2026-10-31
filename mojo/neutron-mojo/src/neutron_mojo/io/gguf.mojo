@@ -20,6 +20,7 @@ from std.collections import Dict
 from neutron_mojo.io.binary_reader import BinaryReader
 from neutron_mojo.model.config import ModelConfig, RoPEConfig, ACT_SILU
 from neutron_mojo.model.architecture import ArchitectureConfig, detect_architecture
+from neutron_mojo.tensor.shape import Shape
 
 
 # ===----------------------------------------------------------------------=== #
@@ -112,7 +113,7 @@ struct GGUFTensorInfo(Copyable, ImplicitlyCopyable):
     """Metadata for a single tensor in GGUF file."""
     var name: String
     var n_dims: Int
-    var shape: List[Int]  # Dimensions (reversed from file format)
+    var shape: List[Int]  # GGUF file order (fastest axis first)
     var tensor_type: GGUFTensorType
     var offset: Int  # Offset in data section
 
@@ -130,12 +131,9 @@ struct GGUFTensorInfo(Copyable, ImplicitlyCopyable):
         self.tensor_type = copy.tensor_type.copy()
         self.offset = copy.offset
 
-    def numel(self) -> Int:
+    def numel(self) raises -> Int:
         """Calculate total number of elements."""
-        var total = 1
-        for i in range(len(self.shape)):
-            total *= self.shape[i]
-        return total
+        return Shape(self.shape.copy()).numel()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -210,7 +208,7 @@ struct GGUFFile(Movable):
         shape: List[Int],
         tensor_type: GGUFTensorType,
         offset: Int,
-    ):
+    ) raises:
         """Manually register a tensor (for testing without file parsing).
 
         Args:
@@ -219,6 +217,9 @@ struct GGUFFile(Movable):
             tensor_type: GGUF tensor type.
             offset: Offset in data section.
         """
+        if self.alignment <= 0 or offset < 0 or offset % self.alignment != 0:
+            raise Error("Unaligned GGUF tensor offset")
+        var admitted_shape = Shape(shape.copy())
         var info = GGUFTensorInfo()
         info.name = name
         info.n_dims = len(shape)
@@ -338,7 +339,7 @@ def dtype_to_gguf_type(dtype: DType) -> GGUFTensorType:
         return GGUFTensorType(0)  # Default to F32
 
 
-def calculate_tensor_size(shape: List[Int], tensor_type: GGUFTensorType) -> Int:
+def calculate_tensor_size(shape: List[Int], tensor_type: GGUFTensorType) raises -> Int:
     """Calculate tensor size in bytes based on shape and type.
 
     Args:
@@ -348,32 +349,30 @@ def calculate_tensor_size(shape: List[Int], tensor_type: GGUFTensorType) -> Int:
     Returns:
         Size in bytes.
     """
-    var numel = 1
-    for i in range(len(shape)):
-        numel *= shape[i]
-
-    # Bytes per element for different types
-    if tensor_type._value == 0:  # F32
-        return numel * 4
-    elif tensor_type._value == 1:  # F16
-        return numel * 2
-    elif tensor_type._value == 2:  # Q4_0
-        # Q4_0: 4 bits per element, 32 element blocks
-        var num_blocks = (numel + 31) // 32
-        return num_blocks * 18  # 2 bytes scale + 16 bytes data
-    elif tensor_type._value == 8:  # Q8_0
-        # Q8_0: 8 bits per element, 32 element blocks
-        var num_blocks = (numel + 31) // 32
-        return num_blocks * 34  # 2 bytes scale + 32 bytes data
+    var numel = Shape(shape.copy()).numel()
+    var width = 0
+    var units = numel
+    if tensor_type._value == 0:
+        width = 4
+    elif tensor_type._value == 1:
+        width = 2
+    elif tensor_type._value == 2 or tensor_type._value == 8:
+        if len(shape) == 0 or shape[0] % 32 != 0:
+            raise Error("GGUF quantized rows must contain complete 32-element blocks")
+        units = numel // 32
+        width = 18 if tensor_type._value == 2 else 34
     else:
-        return numel  # Default to 1 byte per element
+        raise Error("Unsupported GGUF tensor storage codec")
+    if units > 0x7FFFFFFFFFFFFFFF // width:
+        raise Error("GGUF tensor byte size overflow")
+    return units * width
 
 
 # ===----------------------------------------------------------------------=== #
 # Alignment
 # ===----------------------------------------------------------------------=== #
 
-def _align_offset(offset: Int, alignment: Int) -> Int:
+def _align_offset(offset: Int, alignment: Int) raises -> Int:
     """Round offset up to the next alignment boundary.
 
     Args:
@@ -383,6 +382,8 @@ def _align_offset(offset: Int, alignment: Int) -> Int:
     Returns:
         Aligned offset.
     """
+    if offset < 0 or alignment <= 0 or offset > 0x7FFFFFFFFFFFFFFF - (alignment - 1):
+        raise Error("Invalid or overflowing alignment")
     var remainder = offset % alignment
     if remainder == 0:
         return offset
@@ -393,13 +394,15 @@ def _align_offset(offset: Int, alignment: Int) -> Int:
 # GGUF Binary Parser
 # ===----------------------------------------------------------------------=== #
 
-def _skip_gguf_value(mut reader: BinaryReader, value_type: Int) raises:
+def _skip_gguf_value(mut reader: BinaryReader, value_type: Int, depth: Int = 0) raises:
     """Skip a metadata value based on its type.
 
     Args:
         reader: BinaryReader positioned at the value.
         value_type: GGUF value type ID.
     """
+    if depth < 0 or depth > 128:
+        raise Error("GGUF metadata nesting exceeds supported depth")
     if value_type == GGUF_TYPE_UINT8 or value_type == GGUF_TYPE_INT8 or value_type == GGUF_TYPE_BOOL:
         reader.skip(1)
     elif value_type == GGUF_TYPE_UINT16 or value_type == GGUF_TYPE_INT16:
@@ -415,7 +418,7 @@ def _skip_gguf_value(mut reader: BinaryReader, value_type: Int) raises:
         var elem_type = reader.read_u32_le()
         var count = reader.read_u64_le()
         for _ in range(count):
-            _skip_gguf_value(reader, elem_type)
+            _skip_gguf_value(reader, elem_type, depth + 1)
     else:
         raise Error("Unknown GGUF value type: " + String(value_type))
 
@@ -480,6 +483,10 @@ def _parse_gguf_from_reader(mut reader: BinaryReader) raises -> GGUFFile:
     for _ in range(gguf.metadata_count):
         var key = reader.read_string_gguf()
         var vtype = reader.read_u32_le()
+        if key == "general.alignment" and vtype != GGUF_TYPE_UINT32:
+            raise Error("GGUF general.alignment must be UInt32")
+        if key in gguf.metadata_int or key in gguf.metadata_float or key in gguf.metadata_str or key + ".count" in gguf.metadata_int:
+            raise Error("Duplicate GGUF metadata key")
 
         if vtype == GGUF_TYPE_UINT32:
             var val = reader.read_u32_le()
@@ -551,17 +558,33 @@ def _parse_gguf_from_reader(mut reader: BinaryReader) raises -> GGUFFile:
         else:
             _skip_gguf_value(reader, vtype)
 
+    # GGUF alignment is metadata, and applies to both the data base and
+    # tensor offsets. Admit supported power-of-two UInt32 alignments only.
+    if "general.alignment" in gguf.metadata_int:
+        gguf.alignment = gguf.metadata_int["general.alignment"]
+    elif "general.alignment" in gguf.metadata_float or "general.alignment" in gguf.metadata_str:
+        raise Error("GGUF alignment must be an integer")
+    if gguf.alignment <= 0 or gguf.alignment > 0xFFFFFFFF or (gguf.alignment & (gguf.alignment - 1)) != 0:
+        raise Error("Invalid GGUF alignment")
+
     # 5. Read tensor info entries
     for _ in range(gguf.tensor_count):
         var name = reader.read_string_gguf()
+        if name in gguf.tensors:
+            raise Error("Duplicate GGUF tensor name")
         var n_dims = reader.read_u32_le()
+        if n_dims <= 0 or n_dims > reader.remaining() // 8:
+            raise Error("Invalid GGUF tensor rank")
         var shape = List[Int]()
         for _ in range(n_dims):
             var dim = reader.read_u64_le()
             shape.append(dim)
+        var admitted_shape = Shape(shape.copy())
         var ttype = reader.read_u32_le()
         var offset = reader.read_u64_le()
 
+        if offset % gguf.alignment != 0:
+            raise Error("Unaligned GGUF tensor offset")
         var info = GGUFTensorInfo()
         info.name = name
         info.n_dims = n_dims
@@ -571,7 +594,11 @@ def _parse_gguf_from_reader(mut reader: BinaryReader) raises -> GGUFFile:
         gguf.tensors[name] = info^
 
     # 6. Compute data offset (align current position)
+    if reader.tell() > 0x7FFFFFFFFFFFFFFF - (gguf.alignment - 1):
+        raise Error("GGUF alignment overflow")
     gguf.data_offset = _align_offset(reader.tell(), gguf.alignment)
+    if gguf.data_offset > reader.size:
+        raise Error("Truncated GGUF alignment padding")
 
     return gguf^
 
@@ -630,7 +657,7 @@ def gguf_to_model_config(gguf: GGUFFile) -> ModelConfig:
     return cfg^
 
 
-def detect_arch_from_gguf(gguf: GGUFFile) -> ArchitectureConfig:
+def detect_arch_from_gguf(gguf: GGUFFile) raises -> ArchitectureConfig:
     """Auto-detect architecture from GGUF metadata.
 
     Reads general.architecture and architecture-specific metadata keys
@@ -681,7 +708,7 @@ def _write_string_gguf(mut buf: List[UInt8], s: String):
         buf.append(bytes[i])
 
 
-def _write_f32_le(mut buf: List[UInt8], val: Float32):
+def _write_f32_le(mut buf: List[UInt8], val: Float32) raises:
     """Write a float32 as little-endian bytes."""
     from std.memory import alloc
     var p = alloc[Float32](1)
@@ -723,6 +750,24 @@ def build_test_gguf(
     Returns:
         Complete GGUF binary as bytes.
     """
+    if len(str_keys) != len(str_vals) or len(int_keys) != len(int_vals) or len(float_keys) != len(float_vals) or len(tensor_names) != len(tensor_shapes) or len(tensor_names) != len(tensor_types) or len(tensor_names) != len(tensor_data_sizes):
+        raise Error("Mismatched GGUF fixture lists")
+    var alignment = GGUF_DEFAULT_ALIGNMENT
+    for i in range(len(int_keys)):
+        if int_keys[i] == "general.alignment":
+            alignment = int_vals[i]
+    if alignment <= 0 or alignment > 0xFFFFFFFF or (alignment & (alignment - 1)) != 0:
+        raise Error("Invalid GGUF fixture alignment")
+    var offsets = List[Int]()
+    var span = 0
+    for i in range(len(tensor_names)):
+        if tensor_data_sizes[i] < 0:
+            raise Error("Negative GGUF fixture tensor bytes")
+        span = _align_offset(span, alignment)
+        offsets.append(span)
+        if tensor_data_sizes[i] > 0x7FFFFFFFFFFFFFFF - span:
+            raise Error("Overflowing GGUF fixture bytes")
+        span += tensor_data_sizes[i]
     var buf = List[UInt8]()
 
     # Magic
@@ -754,7 +799,6 @@ def build_test_gguf(
         _write_f32_le(buf, Float32(float_vals[i]))
 
     # Write tensor info
-    var running_offset = 0
     for i in range(len(tensor_names)):
         _write_string_gguf(buf, tensor_names[i])
         var ndims = len(tensor_shapes[i])
@@ -762,16 +806,18 @@ def build_test_gguf(
         for d in range(ndims):
             _write_u64_le(buf, tensor_shapes[i][d])
         _write_u32_le(buf, tensor_types[i])
-        _write_u64_le(buf, running_offset)
-        running_offset += tensor_data_sizes[i]
+        _write_u64_le(buf, offsets[i])
 
     # Pad to alignment
-    var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
+    var aligned = _align_offset(len(buf), alignment)
     while len(buf) < aligned:
         buf.append(0)
 
     # Write dummy tensor data
+    var data_base = len(buf)
     for i in range(len(tensor_data_sizes)):
+        while len(buf) - data_base < offsets[i]:
+            buf.append(0)
         for _ in range(tensor_data_sizes[i]):
             buf.append(0)
 

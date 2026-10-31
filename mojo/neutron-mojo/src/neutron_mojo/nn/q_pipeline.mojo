@@ -97,11 +97,14 @@ def q_pipeline_generate(
     var input_ids = tokenizer.encode_with_special(formatted, add_bos=config.add_bos)
 
     # 3. Create infrastructure
-    var total_len = len(input_ids) + config.max_new_tokens
+    var total_len = config.validate_request(input_ids, p, p.max_seq_len)
+    if config.max_new_tokens == 0:
+        return String("")
     var rope = RoPETable(
         head_dim=p.head_dim,
         max_seq_len=total_len,
         theta=p.rope_theta,
+        rotary_dim=p.rotary_dim(),
     )
     var sampler = Sampler(config.sampler_config)
 

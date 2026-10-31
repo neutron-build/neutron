@@ -204,6 +204,34 @@ func TestPayloadHasAttachmentWalksTheTree(t *testing.T) {
 	}
 }
 
+// GMAIL-03: envelope fetches use format=metadata, which omits the part
+// tree. Even a payload that looks walkable must report Unknown — the old
+// code walked the metadata payload, found nothing, and recorded an
+// absence no metadata fetch could prove.
+func TestMetadataEnvelopeAttachmentIsUnknown(t *testing.T) {
+	env := toEnvelope(&gmail.Message{
+		Id: "a",
+		Payload: &gmail.MessagePart{Headers: []*gmail.MessagePartHeader{
+			{Name: "Subject", Value: "no parts here"},
+		}},
+	})
+	if env.Attachment != mail.AttachmentUnknown {
+		t.Errorf("metadata envelope Attachment = %d, want Unknown", env.Attachment)
+	}
+
+	// A payload that even carries a named part stays Unknown: envelopes
+	// never come from a full-format fetch, so the walk is not evidence.
+	fullish := toEnvelope(&gmail.Message{
+		Id: "b",
+		Payload: &gmail.MessagePart{Parts: []*gmail.MessagePart{
+			{MimeType: "application/pdf", Filename: "invoice.pdf"},
+		}},
+	})
+	if fullish.Attachment != mail.AttachmentUnknown {
+		t.Errorf("envelope Attachment = %d, want Unknown even with a visible part tree", fullish.Attachment)
+	}
+}
+
 func TestNativeIDStripsThePrefix(t *testing.T) {
 	id := mail.NativeMessageID(mail.ProviderGmail, "18c9f0a")
 	if got := nativeID(id); got != "18c9f0a" {

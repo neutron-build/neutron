@@ -36,6 +36,7 @@ export {
   type PgTable,
   type PgTableCore,
   type PgSchemaBuilder,
+  type SchemaTable,
   type TableMetadata,
   type ViewDefinition,
   type ViewOptions,
@@ -56,6 +57,7 @@ export {
   type ColumnBuilder,
   type AnyColumnBuilder,
   type ColumnDataType,
+  type NumericColumnOptions,
   type JsTypeOf,
   type JsWriteTypeOf,
   type WriteTypeOf,
@@ -106,6 +108,7 @@ export {
 // nodes/fragments/TrustedSql structurally — legacy {sql, params} fragments
 // are rejected (their $n text can never be renumbered here).
 export { sqlAst, sqlAst as sql } from "./ast.js";
+export { PgArray, MAX_PG_ARRAY_ELEMENTS, type PgArrayDimension } from "./pg-array-value.js";
 
 export {
   raw,
@@ -482,6 +485,20 @@ export {
   type CapabilityGate,
 } from "./engine.js";
 
+// NP01: explicit, uncertified execution profiles. Omitting `profile` leaves
+// createDatabase unchanged; see profile.ts for the finite Nucleus contract.
+export {
+  POSTGRES_DIRECT_PROFILE,
+  NUCLEUS_CANDIDATE_PROFILE,
+  NUCLEUS_CANDIDATE_VERSION,
+  NUCLEUS_CAPABILITIES,
+  ProfileRefusedError,
+  admitEndpoint,
+  validateExecutionProfile,
+  type EndpointIdentity,
+  type ExecutionProfile,
+} from "./profile.js";
+
 export {
   resolveLogger,
   paramsLoggingEnabled,
@@ -516,3 +533,5 @@ export {
   type V2Index,
   type V2Table,
 } from "./export.js";
+export { createQueryTelemetry, type QueryMetrics, type SqlTelemetrySpan } from "./telemetry.js";
+export { SqlRequestLifecycle, RequestShutdownTimeoutError } from "./request-lifecycle.js";

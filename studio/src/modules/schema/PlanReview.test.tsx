@@ -80,3 +80,11 @@ describe('PlanReview (S05)', () => {
     expect(text).toContain('-- alter table "t" drop column if exists "x";')
   })
 })
+
+it('download comments every line of notes, warnings and reproduction commands', () => {
+  const plan = makePlan({ designerNotes: ['note\nDROP TABLE private;'], warnings: ['warning\rDELETE FROM private;'], cliEquivalent: 'neutron migrate\r\nUPDATE private SET x=1;', up: ['SELECT 1'], down: ['SELECT 0'] })
+  const text = planSqlText(plan)
+  for (const payload of ['DROP TABLE private;', 'DELETE FROM private;', 'UPDATE private SET x=1;']) {
+    expect(text.split('\n').find(line => line.includes(payload))?.startsWith('-- ')).toBe(true)
+  }
+})

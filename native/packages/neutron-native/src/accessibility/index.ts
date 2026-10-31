@@ -635,6 +635,11 @@ interface FocusTrapProps {
   style?: StyleProp<ViewStyle>
   /** Children to trap focus within */
   children?: ReactNode
+  /** Android only: refs to the app's background root views. While active,
+   * the trap hides these with importantForAccessibility="no-hide-descendants"
+   * and restores their prior values on release (NF-NR-17). Without them the
+   * Android trap is a modal-content hint only — it does not confine. */
+  backgroundRoots?: Array<RefObject<any>>
 }
 
 /**
@@ -652,7 +657,22 @@ interface FocusTrapProps {
  *   </Dialog>
  * </FocusTrap>
  */
-export function FocusTrap({ active = true, style, children }: FocusTrapProps) {
+/**
+ * FocusTrap constrains screen-reader focus within its children.
+ *
+ * HONEST CONTRACT (NF-NR-17): on iOS, `accessibilityViewIsModal` confines
+ * VoiceOver natively. On Android there is NO automatic confinement from the
+ * modal-content side alone: TalkBack keeps reaching background content
+ * unless the background roots are explicitly hidden. Pass `backgroundRoots`
+ * (refs to the app's background root views) and this trap hides them with
+ * `importantForAccessibility="no-hide-descendants"` while active, restoring
+ * each root's prior value on release. Nested traps compose: an inner trap
+ * only unhides what it itself hid.
+ *
+ * Without `backgroundRoots` on Android this component is ONLY a modal-
+ * content hint — it does not claim confinement.
+ */
+export function FocusTrap({ active = true, style, children, backgroundRoots }: FocusTrapProps) {
   const props: Record<string, unknown> = {
     style,
     accessible: false, // Container itself should not be focusable
@@ -662,11 +682,24 @@ export function FocusTrap({ active = true, style, children }: FocusTrapProps) {
     if (Platform.OS === 'ios') {
       props.accessibilityViewIsModal = true
     }
-    // On Android, the modal content should have importantForAccessibility="yes"
-    // and siblings should have "no-hide-descendants". This component handles
-    // the modal content side; the overlay/backdrop should handle hiding siblings.
     props.importantForAccessibility = 'yes'
   }
+
+  useEffect(() => {
+    if (!active || Platform.OS === 'ios' || !backgroundRoots?.length) return
+    const originals = new Map<unknown, unknown>()
+    for (const ref of backgroundRoots) {
+      const node = ref?.current
+      if (!node) continue
+      originals.set(node, (node as { importantForAccessibility?: unknown }).importantForAccessibility)
+      ;(node as { importantForAccessibility?: unknown }).importantForAccessibility = 'no-hide-descendants'
+    }
+    return () => {
+      for (const [node, value] of originals) {
+        ;(node as { importantForAccessibility?: unknown }).importantForAccessibility = value as string | undefined
+      }
+    }
+  }, [active, backgroundRoots])
 
   return React.createElement(View, props, children)
 }

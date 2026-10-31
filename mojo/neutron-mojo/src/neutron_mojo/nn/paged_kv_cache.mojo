@@ -50,7 +50,7 @@ struct PageAllocator(Copyable, Movable, ImplicitlyCopyable):
         max_pages: Int,
         page_size: Int,
         kv_dim: Int,
-    ):
+    ) raises:
         """Create a page allocator.
 
         Args:
@@ -58,6 +58,9 @@ struct PageAllocator(Copyable, Movable, ImplicitlyCopyable):
             page_size: Number of token positions per page.
             kv_dim: Elements per position (num_kv_heads * head_dim).
         """
+        if max_pages <= 0 or page_size <= 0 or kv_dim <= 0:
+            raise Error("Paged allocator dimensions must be positive")
+        var admitted_pool = Shape(max_pages, page_size, kv_dim, 4)
         self.max_pages = max_pages
         self.page_size = page_size
         self.kv_dim = kv_dim
@@ -79,12 +82,8 @@ struct PageAllocator(Copyable, Movable, ImplicitlyCopyable):
         self.kv_dim = copy.kv_dim
         self.num_allocated = copy.num_allocated
 
-        var total = copy.key_pool.numel()
-        self.key_pool = Tensor[DType.float32](Shape(total))
-        self.value_pool = Tensor[DType.float32](Shape(total))
-        for i in range(total):
-            self.key_pool.set(i, copy.key_pool.get(i))
-            self.value_pool.set(i, copy.value_pool.get(i))
+        self.key_pool = copy.key_pool.clone()
+        self.value_pool = copy.value_pool.clone()
 
         self.free_list = List[Int]()
         for i in range(len(copy.free_list)):
@@ -193,7 +192,9 @@ struct PageTable(Copyable, Movable, ImplicitlyCopyable):
     var num_tokens: Int      # Total tokens stored
     var page_size: Int       # Tokens per page
 
-    def __init__(out self, page_size: Int):
+    def __init__(out self, page_size: Int) raises:
+        if page_size <= 0:
+            raise Error("Page size must be positive")
         self.pages = List[Int]()
         self.num_tokens = 0
         self.page_size = page_size
@@ -278,7 +279,7 @@ struct PagedKVCache(Copyable, Movable, ImplicitlyCopyable):
         num_layers: Int,
         num_kv_heads: Int,
         head_dim: Int,
-    ):
+    ) raises:
         """Create a paged KV cache.
 
         Args:
@@ -288,7 +289,9 @@ struct PagedKVCache(Copyable, Movable, ImplicitlyCopyable):
             num_kv_heads: Number of KV heads.
             head_dim: Per-head dimension.
         """
-        var kv_dim = num_kv_heads * head_dim
+        if num_layers <= 0 or num_kv_heads <= 0 or head_dim <= 0:
+            raise Error("Paged cache model dimensions must be positive")
+        var kv_dim = Shape(num_kv_heads, head_dim).numel()
         self.allocator = PageAllocator(max_pages, page_size, kv_dim)
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -319,6 +322,58 @@ struct PagedKVCache(Copyable, Movable, ImplicitlyCopyable):
         """Current sequence length for a layer."""
         return self.page_tables[layer].num_tokens
 
+    def validate_request(self, num_layers: Int, num_kv_heads: Int, head_dim: Int,
+                         pos: Int, count: Int, layer: Int = -1) raises:
+        """Validate every page owner and reserve capacity for the complete call."""
+        if self.num_layers != num_layers or self.num_kv_heads != num_kv_heads or self.head_dim != head_dim or num_layers <= 0 or num_kv_heads <= 0 or head_dim <= 0 or self.page_size <= 0 or len(self.page_tables) != num_layers:
+            raise Error("Paged cache/model layout mismatch")
+        if pos < 0 or count < 0 or count > 0x7FFFFFFFFFFFFFFF - pos or layer < -1 or layer >= num_layers:
+            raise Error("Invalid paged cache append span")
+        var kv_dim = Shape(num_kv_heads, head_dim).numel()
+        if self.allocator.max_pages <= 0 or self.allocator.page_size != self.page_size or self.allocator.kv_dim != kv_dim or self.allocator.num_allocated < 0 or self.allocator.num_allocated > self.allocator.max_pages or len(self.allocator.free_list) != self.allocator.max_pages - self.allocator.num_allocated:
+            raise Error("Invalid paged allocator metadata")
+        var total = Shape(self.allocator.max_pages, self.page_size, kv_dim).numel()
+        if self.allocator.key_pool.numel() != total or self.allocator.value_pool.numel() != total:
+            raise Error("Paged cache pool span mismatch")
+        var seen = List[Bool]()
+        for _ in range(self.allocator.max_pages):
+            seen.append(False)
+        var needed = 0
+        var owned = 0
+        for i in range(num_layers):
+            var filled = self.page_tables[i].num_tokens
+            if filled < 0 or self.page_tables[i].page_size != self.page_size:
+                raise Error("Invalid page table metadata")
+            var pages = filled // self.page_size + Int(filled % self.page_size != 0)
+            if len(self.page_tables[i].pages) != pages:
+                raise Error("Page table extent mismatch")
+            for j in range(pages):
+                var id = self.page_tables[i].pages[j]
+                if id < 0 or id >= self.allocator.max_pages:
+                    raise Error("Page table index outside pool")
+                if seen[id]:
+                    raise Error("Duplicate physical page ownership")
+                seen[id] = True
+                owned += 1
+            if layer == -1 or layer == i:
+                if filled != pos:
+                    raise Error("Paged cache append position does not match filled length")
+                var final = pos + count
+                var new_pages = final // self.page_size + Int(final % self.page_size != 0) - pages
+                if new_pages > len(self.allocator.free_list) - needed:
+                    raise Error("Paged cache lacks capacity for complete forward call")
+                needed += new_pages
+        if owned != self.allocator.num_allocated:
+            raise Error("Paged allocator/table ownership mismatch")
+        for i in range(len(self.allocator.free_list)):
+            var id = self.allocator.free_list[i]
+            if id < 0 or id >= self.allocator.max_pages:
+                raise Error("Free page index outside pool")
+            if seen[id]:
+                raise Error("Free page ownership is duplicated")
+            seen[id] = True
+
+
     def append_kv(
         mut self,
         layer: Int,
@@ -334,7 +389,13 @@ struct PagedKVCache(Copyable, Movable, ImplicitlyCopyable):
             value: New values, same shape.
             num_new_tokens: Number of new positions.
         """
-        var kv_dim = self.num_kv_heads * self.head_dim
+        if layer < 0 or layer >= self.num_layers or len(self.page_tables) != self.num_layers:
+            raise Error("Paged cache layer index out of range")
+        self.validate_request(self.num_layers, self.num_kv_heads, self.head_dim, self.page_tables[layer].num_tokens, num_new_tokens, layer)
+        var kv_dim = Shape(self.num_kv_heads, self.head_dim).numel()
+        var input_count = Shape(num_new_tokens, kv_dim).numel()
+        if key.numel() != input_count or value.numel() != input_count:
+            raise Error("Paged cache append input span mismatch")
 
         for t in range(num_new_tokens):
             # Check if we need a new page

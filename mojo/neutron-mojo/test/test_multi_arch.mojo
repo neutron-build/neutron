@@ -68,43 +68,55 @@ def test_llama_generates_tokens() raises:
 # ===----------------------------------------------------------------------=== #
 
 def test_phi_forward() raises:
-    """Phi forward pass with GeLU activation."""
+    """Phi forward is refused (pre-norm bias unimplemented on this path)."""
     var model = make_tiny_model(phi_arch(0.5))
     var p = model.params.copy()
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
-    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    var logits = model.forward(0, cache, rope, 0)
-    assert_true(logits.numel() == p.vocab_size, "Phi logits size correct")
-    print("  phi_forward: PASS")
+    # Aligned rope so the intended norm-bias refusal fires, not a RoPE mismatch
+    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta, p.rotary_dim())
+    var refused = False
+    try:
+        _ = model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "Phi norm-bias forward must be refused")
+    print("  phi_forward: PASS (refused as documented)")
 
 
 def test_phi_partial_rotary() raises:
-    """Phi partial rotary config is set correctly and forward pass works at multiple positions."""
+    """Phi partial rotary config is set correctly; forward is refused (norm bias)."""
     var p = tiny_test_params()
     p.arch = phi_arch(0.5)
     assert_true(p.arch.partial_rotary_factor == 0.5, "Partial rotary factor")
-    var rotary_dim = Int(Float32(p.head_dim) * p.arch.partial_rotary_factor)
-    assert_true(rotary_dim == 1, "Rotary dim should be half of head_dim=2")
+    # Rotary dim rounds down to an even number of pair slots: Int(2*0.5)=1 -> 0
+    assert_true(p.rotary_dim() == 0, "Rotary dim rounds half of head_dim=2 down to 0")
 
     var model = Model(p)
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
-    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    # Run forward at multiple positions to exercise the partial rotary code
-    for pos in range(3):
-        var logits = model.forward(0, cache, rope, pos)
-        assert_true(logits.numel() == p.vocab_size, "Logits size at pos " + String(pos))
-    print("  phi_partial_rotary: PASS")
+    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta, p.rotary_dim())
+    var refused = False
+    try:
+        _ = model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "Phi partial-rotary forward must be refused")
+    print("  phi_partial_rotary: PASS (refused as documented)")
 
 
 def test_phi_generates_tokens() raises:
-    """Phi generates multiple tokens without error."""
+    """Phi decode positions are refused (pre-norm bias unimplemented)."""
     var model = make_tiny_model(phi_arch(0.5))
     var p = model.params.copy()
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
-    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    for pos in range(5):
-        _ = model.forward(0, cache, rope, pos)
-    print("  phi_generates_tokens: PASS")
+    var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta, p.rotary_dim())
+    var refused = False
+    try:
+        for pos in range(5):
+            _ = model.forward(0, cache, rope, pos)
+    except:
+        refused = True
+    assert_true(refused, "Phi generation must be refused")
+    print("  phi_generates_tokens: PASS (refused as documented)")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -112,14 +124,18 @@ def test_phi_generates_tokens() raises:
 # ===----------------------------------------------------------------------=== #
 
 def test_gemma_forward() raises:
-    """Gemma forward pass."""
+    """Gemma forward is refused (needs an embedding/norm adapter not implemented)."""
     var model = make_tiny_model(gemma_arch())
     var p = model.params.copy()
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
     var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    var logits = model.forward(0, cache, rope, 0)
-    assert_true(logits.numel() == p.vocab_size, "Gemma logits size correct")
-    print("  gemma_forward: PASS")
+    var refused = False
+    try:
+        _ = model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "Gemma forward must be refused on this path")
+    print("  gemma_forward: PASS (refused as documented)")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -137,14 +153,18 @@ def test_mistral_config() raises:
 
 
 def test_mistral_forward() raises:
-    """Mistral forward pass (uses standard attention path for tiny model)."""
+    """Mistral forward is refused (sliding window not implemented on this path)."""
     var model = make_tiny_model(mistral_arch(4096))
     var p = model.params.copy()
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
     var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    var logits = model.forward(0, cache, rope, 0)
-    assert_true(logits.numel() == p.vocab_size, "Mistral logits size correct")
-    print("  mistral_forward: PASS")
+    var refused = False
+    try:
+        _ = model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "Mistral sliding-window forward must be refused")
+    print("  mistral_forward: PASS (refused as documented)")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -152,29 +172,37 @@ def test_mistral_forward() raises:
 # ===----------------------------------------------------------------------=== #
 
 def test_q8_phi_forward() raises:
-    """Q8 model with Phi architecture."""
+    """Q8 Phi forward is refused (specialized path requires full rotary)."""
     var p = tiny_test_params()
     p.arch = phi_arch(0.5)
     var fp32_model = Model(p)
     var q8_model = quantize_from_model(fp32_model)
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
     var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    var logits = q8_model.forward(0, cache, rope, 0)
-    assert_true(logits.numel() == p.vocab_size, "Q8 Phi logits size correct")
-    print("  q8_phi_forward: PASS")
+    var refused = False
+    try:
+        _ = q8_model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "Q8 partial-rotary forward must be refused")
+    print("  q8_phi_forward: PASS (refused as documented)")
 
 
 def test_q8_gemma_forward() raises:
-    """Q8 model with Gemma architecture."""
+    """Q8 Gemma forward is refused (embedding/norm adapter not implemented)."""
     var p = tiny_test_params()
     p.arch = gemma_arch()
     var fp32_model = Model(p)
     var q8_model = quantize_from_model(fp32_model)
     var cache = MultiLayerKVCache(p.num_layers, p.max_seq_len, p.num_kv_heads, p.head_dim)
     var rope = RoPETable(p.head_dim, p.max_seq_len, p.rope_theta)
-    var logits = q8_model.forward(0, cache, rope, 0)
-    assert_true(logits.numel() == p.vocab_size, "Q8 Gemma logits size correct")
-    print("  q8_gemma_forward: PASS")
+    var refused = False
+    try:
+        _ = q8_model.forward(0, cache, rope, 0)
+    except:
+        refused = True
+    assert_true(refused, "Q8 Gemma forward must be refused")
+    print("  q8_gemma_forward: PASS (refused as documented)")
 
 
 def test_arch_name_roundtrip() raises:

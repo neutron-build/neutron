@@ -62,27 +62,61 @@ const allItems = computed<PaletteItem[]>(() => {
   return items
 })
 
-const filtered = computed(() => {
+const MAX_VISIBLE_MATCHES = 20
+const matching = computed(() => {
   const q = paletteQuery.value.toLowerCase().trim()
-  if (!q) return allItems.value.slice(0, 20)
-  return allItems.value
-    .filter(i => i.label.toLowerCase().includes(q) || i.sub.toLowerCase().includes(q))
-    .slice(0, 20)
+  const items: PaletteItem[] = []
+  let total = 0
+  for (const item of allItems.value) {
+    if (q && !item.label.toLowerCase().includes(q) && !item.sub.toLowerCase().includes(q)) continue
+    total++
+    if (items.length < MAX_VISIBLE_MATCHES) items.push(item)
+  }
+  return { items, total }
 })
 
 export function CommandPalette() {
-  if (!paletteOpen.value) return null
-
+  const isOpen = paletteOpen.value
+  const panelRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
+  // Hooks remain active while the overlay is closed. The App keeps this
+  // component mounted; a mount-only effect would not focus it on reopening
+  // or clean up the previous keyboard listener when the overlay disappears.
   useEffect(() => {
+    if (!isOpen) return
+    const opener = document.activeElement as HTMLElement | null
     inputRef.current?.focus()
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') closePalette()
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closePalette()
+      } else if (e.key === 'Tab') {
+        const controls = Array.from(panelRef.current?.querySelectorAll<HTMLElement>('input:not(:disabled), button:not(:disabled)') ?? [])
+        const first = controls[0], last = controls[controls.length - 1]
+        if (!first || !last) return
+        const active = document.activeElement
+        if (!panelRef.current?.contains(active)) {
+          e.preventDefault()
+          ;(e.shiftKey ? last : first).focus()
+        } else if (e.shiftKey && active === first) {
+          e.preventDefault()
+          last.focus()
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault()
+          first.focus()
+        }
+      }
     }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [])
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      if (opener?.isConnected) opener.focus()
+    }
+  }, [isOpen])
+
+  if (!isOpen) return null
+  const matches = matching.value
 
   function select(item: PaletteItem) {
     openTab(item.tab)
@@ -91,12 +125,13 @@ export function CommandPalette() {
 
   return (
     <div class={s.overlay} onClick={closePalette}>
-      <div class={s.panel} onClick={(e) => e.stopPropagation()}>
+      <div ref={panelRef} class={s.panel} role="dialog" aria-modal="true" aria-label="Find database objects and commands" onClick={(e) => e.stopPropagation()}>
         <div class={s.inputWrap}>
-          <span class={s.searchIcon}>⌕</span>
+          <span class={s.searchIcon} aria-hidden="true">⌕</span>
           <input
             ref={inputRef}
             class={s.input}
+            aria-label="Search database objects and commands"
             placeholder="Go to table, collection, query..."
             value={paletteQuery.value}
             onInput={(e) => { paletteQuery.value = (e.target as HTMLInputElement).value }}
@@ -104,12 +139,14 @@ export function CommandPalette() {
           <kbd class={s.esc}>Esc</kbd>
         </div>
         <div class={s.list}>
-          {filtered.value.length === 0 && (
-            <div class={s.empty}>No results</div>
-          )}
-          {filtered.value.map((item) => (
+          <div class={s.empty} role="status" aria-live="polite">
+            {matches.total === 0 ? 'No results' : matches.total > MAX_VISIBLE_MATCHES
+              ? `Showing first ${MAX_VISIBLE_MATCHES} of ${matches.total} matches. Narrow your search to see more.`
+              : `${matches.total} match${matches.total === 1 ? '' : 'es'}`}
+          </div>
+          {matches.items.map((item) => (
             <button key={item.id} class={s.item} onClick={() => select(item)}>
-              <span class={s.itemIcon}>{item.icon}</span>
+              <span class={s.itemIcon} aria-hidden="true">{item.icon}</span>
               <span class={s.itemLabel}>{item.label}</span>
               <span class={s.itemSub}>{item.sub}</span>
             </button>

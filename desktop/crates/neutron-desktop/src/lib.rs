@@ -1,21 +1,23 @@
 mod bridge;
 mod dev_server;
 mod ipc;
+mod migration;
+pub use migration::migrate_legacy_storage;
 mod nucleus_state;
 mod window;
 
-pub use bridge::{create_protocol_handler, Request, Response};
+pub use bridge::{Request, Response, create_protocol_handler};
 pub use dev_server::{dev_port, is_dev_mode};
 // Re-exported so callers of the `ipc_handler!` macro can name `IpcCommand`,
 // and so the TypeScript codegen helpers are reachable from outside the crate.
-pub use ipc::{collect_bindings, IpcCommand, TypeScriptBinding};
-pub use nucleus_state::{platform_data_dir, NucleusError, NucleusState};
+pub use ipc::{IpcCommand, TypeScriptBinding, collect_bindings};
 #[cfg(feature = "nucleus-embedded")]
 pub use nucleus_state::NucleusQueryResult;
+pub use nucleus_state::{NucleusError, NucleusState, platform_data_dir};
 pub use window::WindowConfig;
 
-use tauri::Manager;
 use std::sync::Arc;
+use tauri::Manager;
 
 /// A deferred `tauri::Builder` transformation used to register a plugin.
 type PluginRegistration = Box<dyn FnOnce(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry>>;
@@ -23,11 +25,10 @@ type PluginRegistration = Box<dyn FnOnce(tauri::Builder<tauri::Wry>) -> tauri::B
 /// Builder for configuring and launching a Neutron Desktop application.
 ///
 /// Routes frontend `fetch()` calls through the `neutron://` protocol to the
-/// Rust middleware pipeline — no open TCP port, no network attack surface.
+/// explicit synchronous handlers. Applications own authorization/middleware.
+/// Debug TCP dispatch is separately opt-in and capability authenticated.
 pub struct NeutronDesktopBuilder {
-    title: String,
-    width: f64,
-    height: f64,
+    window_config: WindowConfig,
     nucleus_enabled: bool,
     nucleus_data_dir: Option<std::path::PathBuf>,
     routes: Vec<Route>,
@@ -43,9 +44,7 @@ struct Route {
 impl NeutronDesktopBuilder {
     pub fn new() -> Self {
         Self {
-            title: "Neutron App".to_string(),
-            width: 1200.0,
-            height: 800.0,
+            window_config: WindowConfig::default(),
             nucleus_enabled: false,
             nucleus_data_dir: None,
             routes: Vec::new(),
@@ -67,21 +66,7 @@ impl NeutronDesktopBuilder {
 
     /// Configure the main window.
     pub fn window(mut self, f: impl FnOnce(&mut WindowConfig)) -> Self {
-        let mut config = WindowConfig {
-            title: self.title.clone(),
-            width: self.width,
-            height: self.height,
-            resizable: true,
-            decorations: true,
-            transparent: false,
-            fullscreen: false,
-            min_width: None,
-            min_height: None,
-        };
-        f(&mut config);
-        self.title = config.title;
-        self.width = config.width;
-        self.height = config.height;
+        f(&mut self.window_config);
         self
     }
 
@@ -143,9 +128,8 @@ impl NeutronDesktopBuilder {
 
     /// Add a Tauri plugin.
     pub fn plugin<P: tauri::plugin::Plugin<tauri::Wry> + 'static>(mut self, plugin: P) -> Self {
-        self.plugins.push(Box::new(move |builder| {
-            builder.plugin(plugin)
-        }));
+        self.plugins
+            .push(Box::new(move |builder| builder.plugin(plugin)));
         self
     }
 
@@ -154,6 +138,7 @@ impl NeutronDesktopBuilder {
     /// The caller must provide a `tauri::Context` (typically via `tauri::generate_context!()`
     /// in the binary crate that has a `tauri.conf.json`).
     pub fn run(mut self, context: tauri::Context) -> Result<(), Box<dyn std::error::Error>> {
+        self.window_config.validate()?;
         // When Nucleus is enabled, register built-in API routes
         #[cfg(feature = "nucleus-embedded")]
         if self.nucleus_enabled {
@@ -167,24 +152,32 @@ impl NeutronDesktopBuilder {
         let dev_mode = dev_server::is_dev_mode();
         let dev_port_val = dev_server::dev_port();
 
-        if dev_mode {
-            dev_server::spawn_dev_server(Arc::clone(&router), dev_port_val);
+        let dev_access = if dev_mode {
+            Some(dev_server::DevAccess::new(dev_port_val)?)
         } else {
-            println!("Desktop running in PRODUCTION MODE \u{2014} neutron:// protocol active, no TCP port");
+            None
+        };
+        if let Some(access) = &dev_access {
+            dev_server::spawn_dev_server(Arc::clone(&router), dev_port_val, access.clone())?;
+        } else {
+            println!(
+                "Desktop running in PRODUCTION MODE \u{2014} neutron:// protocol active, no TCP port"
+            );
         }
 
-        let title = self.title.clone();
-        let width = self.width;
-        let height = self.height;
+        let window_config = self.window_config;
+
         let nucleus_enabled = self.nucleus_enabled;
         let data_dir = self.nucleus_data_dir.clone();
 
         let protocol_router = Arc::clone(&router);
-        let mut builder = tauri::Builder::default()
-            .register_asynchronous_uri_scheme_protocol("neutron", move |_ctx, request, responder| {
+        let mut builder = tauri::Builder::default().register_asynchronous_uri_scheme_protocol(
+            "neutron",
+            move |_ctx, request, responder| {
                 let response = protocol_router.handle(request);
                 responder.respond(response);
-            });
+            },
+        );
 
         // Apply registered plugins
         for apply_plugin in self.plugins {
@@ -194,10 +187,10 @@ impl NeutronDesktopBuilder {
         builder.setup(move |app| {
                 // Initialize Nucleus if enabled
                 if nucleus_enabled {
-                    let dir = data_dir.unwrap_or_else(|| {
-                        let base = dirs::data_dir().expect("no data directory available");
-                        base.join("com.neutron.app").join("nucleus")
-                    });
+                    let dir = match data_dir {
+                        Some(dir) => dir,
+                        None => app.path().app_data_dir()?.join("nucleus"),
+                    };
                     let state = NucleusState::new(dir);
                     state.initialize().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
                     let state = Arc::new(state);
@@ -213,22 +206,23 @@ impl NeutronDesktopBuilder {
                     "main",
                     tauri::WebviewUrl::App("index.html".into()),
                 )
-                .title(&title)
-                .inner_size(width, height)
-                .build()?;
-
-                // In dev mode, inject the dev-mode flag into the WebView so the
-                // TypeScript bridge routes through the TCP server instead of
-                // the neutron:// protocol.
-                if dev_mode {
+                .title(&window_config.title)
+                .inner_size(window_config.width, window_config.height)
+                .resizable(window_config.resizable)
+                .decorations(window_config.decorations)
+                .transparent(window_config.transparent)
+                .fullscreen(window_config.fullscreen);
+                let window = if let Some(access) = &dev_access {
                     let js = format!(
-                        "window.__NEUTRON_DEV_MODE__ = true; window.__NEUTRON_DEV_PORT__ = {};",
-                        dev_port_val,
+                        "window.__NEUTRON_DEV_MODE__ = true; window.__NEUTRON_DEV_PORT__ = {}; window.__NEUTRON_DEV_TOKEN__ = {};",
+                        dev_port_val, serde_json::to_string(&access.token)?,
                     );
-                    window.eval(&js).unwrap_or_else(|e| {
-                        tracing::warn!("Failed to inject dev-mode flag: {e}");
-                    });
-                }
+                    window.initialization_script(&js)
+                } else { window };
+                let _window = match (window_config.min_width, window_config.min_height) {
+                    (Some(w), Some(h)) => window.min_inner_size(w, h),
+                    _ => window,
+                }.build()?;
 
                 tracing::info!(
                     mode = if dev_mode { "dev" } else { "production" },
@@ -244,46 +238,42 @@ impl NeutronDesktopBuilder {
     /// Register built-in Nucleus API routes for the protocol bridge.
     #[cfg(feature = "nucleus-embedded")]
     fn register_nucleus_routes(self) -> Self {
-        self
-            .get("/api/nucleus/health", |_req| {
-                Response::json(&serde_json::json!({
-                    "status": "ok",
-                    "nucleus": true,
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "engine": "embedded",
-                }))
-            })
-            .post("/api/nucleus/query", |req| {
-                // Parse SQL from request body
-                #[derive(serde::Deserialize)]
-                struct QueryRequest {
-                    sql: String,
+        self.get("/api/nucleus/health", |_req| {
+            Response::json(&serde_json::json!({
+                "status": "ok",
+                "nucleus": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "engine": "embedded",
+            }))
+        })
+        .post("/api/nucleus/query", |req| {
+            // Parse SQL from request body
+            #[derive(serde::Deserialize)]
+            struct QueryRequest {
+                sql: String,
+            }
+
+            let body: QueryRequest = match req.json() {
+                Ok(b) => b,
+                Err(e) => {
+                    return Response::error(400, "Bad Request", &format!("Invalid JSON: {e}"));
                 }
+            };
 
-                let body: QueryRequest = match req.json() {
-                    Ok(b) => b,
-                    Err(e) => return Response::error(400, "Bad Request", &format!("Invalid JSON: {e}")),
-                };
+            // Execute synchronously using a runtime handle
+            // (protocol handlers run in a sync context)
+            let rt = tauri::async_runtime::handle();
 
-                // Execute synchronously using a runtime handle
-                // (protocol handlers run in a sync context)
-                let rt = match tokio::runtime::Handle::try_current() {
-                    Ok(h) => h,
-                    Err(_) => return Response::error(500, "Internal Error", "No Tokio runtime"),
-                };
-
-                // We need access to the NucleusState, which is managed by Tauri.
-                // Since protocol handlers don't have app state, we use a global.
-                match NUCLEUS_DB.get() {
-                    Some(state) => {
-                        match rt.block_on(state.query(&body.sql)) {
-                            Ok(result) => Response::json(&result),
-                            Err(e) => Response::error(400, "Query Error", &e.to_string()),
-                        }
-                    }
-                    None => Response::error(503, "Not Ready", "Database not initialized"),
-                }
-            })
+            // We need access to the NucleusState, which is managed by Tauri.
+            // Since protocol handlers don't have app state, we use a global.
+            match NUCLEUS_DB.get() {
+                Some(state) => match rt.block_on(state.query(&body.sql)) {
+                    Ok(result) => Response::json(&result),
+                    Err(e) => Response::error(400, "Query Error", &e.to_string()),
+                },
+                None => Response::error(503, "Not Ready", "Database not initialized"),
+            }
+        })
     }
 }
 

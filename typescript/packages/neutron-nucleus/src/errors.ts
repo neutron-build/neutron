@@ -87,3 +87,12 @@ export class NucleusAuthError extends NucleusError {
     this.name = 'NucleusAuthError';
   }
 }
+
+/** A dispatched operation may have committed, but its response was lost.
+ * Reconcile server state before attempting it again. */
+export class NucleusUnknownOutcomeError extends NucleusError {
+  constructor(message: string, options?: NucleusErrorOptions) {
+    super('UNKNOWN_OUTCOME', message, options);
+    this.name = 'NucleusUnknownOutcomeError';
+  }
+}

@@ -17,14 +17,139 @@ PostgreSQL. Companion documents:
 
 `NUMERIC`/`DECIMAL` uses checked exact decimal arithmetic for casts,
 comparisons, arithmetic, and plain/grouped/window aggregates, across every
-table engine and across a durable restart.
+table engine and across a durable restart. A declared `NUMERIC(p, s)` is
+enforced on every write and on an explicit cast.
 
 - Supported range: a **96-bit coefficient with at most 28 fractional digits**.
-- Larger values fail with `numeric value out of range` rather than rounding
-  through floating point. Failing is deliberate: silently degrading to `f64` is
-  how exactness bugs get shipped.
-- Declared precision and scale modifiers such as `NUMERIC(10,2)` are **parsed
-  but not enforced as column typemods**.
+- Larger values fail rather than rounding through floating point. Failing is
+  deliberate: silently degrading to `f64` is how exactness bugs get shipped.
+
+Input is exact-or-refused, with PostgreSQL's SQLSTATE for each refusal:
+
+| Input | Result |
+|---|---|
+| Valid number that does not fit (more than 28 fractional digits, magnitude of 2^96 or more, exponent past 1000) | `numeric value '...' exceeds NUMERIC precision ceiling` (22003) |
+| Text that is not a number: empty, underscores (`1_000`), hex, non-ASCII digits, two points, a bare sign or exponent | `invalid input syntax for type numeric` (22P02) |
+| `NaN`, `Infinity`, `-Infinity` (valid in PostgreSQL) | `numeric NaN and Infinity are not supported` (0A000) |
+| Leading and trailing ASCII whitespace, a leading `+`, `.5`, `5.`, leading zeros | accepted |
+| `-0`, `-0.000` | stored as `0`, `0.000` (PostgreSQL has no negative zero) |
+
+The accepted grammar is PostgreSQL's `numeric_in`. Scientific notation is
+expanded as text (`1.50e1` is `15.0`, `2.5E-3` is `0.0025`) and then parsed
+exactly; it is never computed, so no digit can round. An earlier version used
+`Decimal::from_scientific`, which parsed the mantissa with the rounding parser
+and silently dropped digits past the 28th. The written scale is kept through a
+cast (`1.500` stays `1.500`) and equal values hash alike. A written trailing
+zero past the 28th fractional digit is refused, because the scale cannot be
+kept. Binary parameters follow the same rule: NaN, the infinities, a digit word
+of 10000 or more, an unknown sign, a mismatched length, or nonzero digits past
+`dscale` are refused instead of decoded. The NaN and Infinity refusal (0A000)
+holds on every route into NUMERIC — a text cast with or without a type
+modifier, a float8 cast, and an INSERT into a constrained or unconstrained
+column — before any comparison, hash or arithmetic could see one, so a
+refused statement writes nothing.
+
+Arithmetic (`+`, `-`, `*`, `%`, `SUM`, window `SUM`/`AVG`) returns the exact
+result or fails with `numeric value out of range` (22003). The underlying
+`Decimal` operations round instead: `MAX + 0.4` came back as a different
+number and `1e-28 * 0.5` as `1e-28`. A product whose unreduced coefficient
+exceeds `i128`, or a sum whose aligned coefficients do, is refused even when the
+reduced result would fit (a conservative refusal, not a rounding).
+
+Scalar functions on NUMERIC operate on digits and never produce a negative
+zero: `TRUNC` accepts a negative scale (`1234.5678` at `-2` is `1200`) and
+truncates `-0.5` to `0`, `CEIL(-0.5)` is `0` where `FLOOR(-0.5)` is `-1`,
+`ROUND(-0.4)` is `0`, and `ABS` keeps the written scale (`-1.50` is `1.50`);
+unary minus keeps the written scale too and never negates zero (`0.00`
+negates to `0.00`). A `ROUND` whose result cannot be held is refused with
+22003 (`5e28` at scale `-29` would be `1e29`; `4e28` rounds to `0`), and so
+is a scale argument beyond i32, an error rather than a wrap to scale 0.
+Mixed NUMERIC and integer input to `SUM`/`AVG` aggregates exactly (`1.5`,
+`2` and `0.25` sum to `3.75` and average `1.25`); a float8 beside a NUMERIC
+in the same aggregate is an error, not a dropped operand.
+
+**Type modifiers.** `NUMERIC(p, s)` and `DECIMAL(p, s)` are enforced on every
+write — INSERT, UPDATE, `ON CONFLICT DO UPDATE` assignments, expression
+results, a DEFAULT backfill, and each element of an array column — and on an
+explicit cast. The value is rounded half away from zero to the scale and
+padded to it: `1.005` becomes `1.01`, `2.5` becomes `2.50`, `-0.001` becomes
+`0.00` (no negative zero). A value that needs more than `p - s` integer
+digits after rounding is `numeric field overflow` (22003); a refused
+statement writes nothing and a failed UPDATE keeps the row's old value. When
+`p = s` there is no integer digit (`0.995` into `NUMERIC(2,2)` rounds to
+`1.00` and is refused), and scale 0 rounds to an integer. The declaration
+never extends the range: the 96-bit coefficient still bounds the padded
+value, so the largest 29-digit value fits `NUMERIC(29)` and is refused for
+`NUMERIC(28)`, or padded to scale 2 for `NUMERIC(40,2)`; `1.5` fits
+`NUMERIC(30,28)` as 29 digits where `12.5` needs 30 and is refused.
+
+Declarations are validated wherever one can appear — `CREATE TABLE`,
+`ALTER TABLE ... ADD COLUMN`, `ALTER COLUMN TYPE`, and a cast — and a
+refused CREATE leaves no table behind:
+
+| Declaration | Result |
+|---|---|
+| `p` 1–1000, `s` 0–28, `s <= p` (`NUMERIC(1000,28)` is the widest) | enforced |
+| One PostgreSQL itself rejects: `p = 0`, `p > 1000`, `s > 1000` | 22023 |
+| A declaration the exact decimal cannot hold: `s < 0`, `s > p`, `s > 28` | 0A000 |
+| No modifier (`NUMERIC`) | unconstrained; nothing is rounded or padded |
+
+`ALTER COLUMN TYPE numeric(p, s)` rewrites the stored values to the new
+declaration; when a stored value no longer fits, the ALTER is refused (22003)
+and leaves every value and the old declaration untouched. Changing to
+unconstrained `numeric` stops the rounding. `ADD COLUMN ... DEFAULT` pads
+both the backfilled rows and later defaulted writes to the scale. A logical
+dump keeps the declaration and the written scale, so a restored column still
+rounds, pads and refuses. The catalog reports the enforced declaration:
+`format_type` returns `numeric(10,2)` and `information_schema.columns`
+returns `numeric_precision` and `numeric_scale`. The modifier's encoding is
+PostgreSQL's `atttypmod`, `((p << 16) | s) + 4` (`655366` for
+`NUMERIC(10,2)`); `-1` — anything below 4 — is unconstrained. It persists in
+`catalog.json` (`numeric_typmod`) and a restarted executor still rounds and
+refuses; a catalog written before modifiers existed loads as unconstrained
+and is saved back without the key, so old files stay compatible in both
+directions.
+
+**Literals.** A decimal literal keeps every digit where NUMERIC can hold it
+instead of passing through `f64`: written into a NUMERIC column,
+`0.1234567890123456789012345678`, `1.10`, `-0.50`, `1.5e1` (= `15`) and
+`12345678901234567890.123` arrive exactly, on INSERT and on UPDATE. A
+literal the exact decimal cannot hold — a 29th fractional digit, `1e29`,
+`1e400` — is refused with 22003 rather than rounded through a float. Beside
+a NUMERIC or integer operand a decimal literal is NUMERIC, so `3 * 0.1` is
+`0.3` and `CAST('1' AS NUMERIC) - 0.1234567890123456789` is
+`0.8765432109876543211`; beside a float8 operand it stays float8, and
+NUMERIC combined with float8 is float8 arithmetic. An integer literal beyond
+bigint is NUMERIC (`9223372036854775808` is exact), and past the 96-bit
+coefficient it is refused with 22003. Comparing a NUMERIC column with a
+decimal literal compares digits, so values that differ past the 17th
+significant digit are not collapsed into one double.
+
+**float8 to NUMERIC** uses fifteen significant digits with no invented digits
+beyond them: `0.30000000000000004::float8::numeric` is `0.3` and
+`123456789.123456789::float8::numeric` is `123456789.123457`. A magnitude
+outside the exact range is refused (22003): `1e300` overflows the
+coefficient and `1e-30` needs 30 fractional digits. A type modifier applies
+after the conversion (`CAST(CAST(2.675 AS DOUBLE PRECISION) AS NUMERIC(5,2))`
+is `2.68`).
+
+Known deviations that are documented, not refused:
+
+- **Arithmetic results drop trailing zeros** (`1.10 + 1.10` is `2.2`, where
+  PostgreSQL shows `2.20`). The value is exact; only the display scale differs.
+  A cast keeps the written scale, and a type modifier re-pads the value on
+  write.
+- **Division and `AVG` round** to what fits the 96-bit coefficient and 28
+  fractional digits, as any finite decimal division must. PostgreSQL rounds at
+  a different scale, so the last digits can differ.
+
+## NULL casts
+
+A NULL operand stays NULL through a cast to text on every path: over NULL
+JSONB, TEXT and INT columns, `j::text`, `t::text`, `n::text` and
+`CAST(j AS VARCHAR)` all return SQL NULL (`j IS NULL` is true), never the
+string `NULL`. A cast of a present value still renders it (`n::text` of INT
+`5` is `'5'`).
 
 ## Date, time, and time zones
 
@@ -148,8 +273,7 @@ argument is NULL.
 
 These fixes do not establish full PostgreSQL scalar parity. Date infinity,
 enum declaration-order sorting and arbitrary numeric precision/scale remain
-limits. Large bare numeric literals may pass through floating-point parsing;
-use an exact text-to-NUMERIC cast within the engine's supported decimal range.
+limits.
 
 ### Deferred foreign keys and generated writes
 
@@ -201,6 +325,143 @@ or NULL. Cast COLUMNAR_INSERT inputs explicitly; COLUMNAR_COUNT still reports
 the stored row count. COLUMNAR_INSERT is refused inside a SQL transaction
 because the store has no rollback mechanism.
 
+### Cursors (DECLARE / FETCH / CLOSE)
+
+A cursor is one of two things, and `DECLARE` decides which from the query.
+
+**Lazy** (one shape). A select over a single `generate_series(a, b [, step])`
+call with constant integer arguments is produced lazily:
+
+```sql
+SELECT <select list> FROM generate_series(a, b [, step]) [[AS] t[(c)]]
+  [WHERE <predicate>] [LIMIT n] [OFFSET m]
+```
+
+The select list and predicate may use arithmetic, comparison, `AND`/`OR`,
+`CASE`, casts and literals over the series column. A function call, subquery,
+bind parameter, `ORDER BY`, `DISTINCT`, `GROUP BY`, `HAVING`, aggregate, window
+function, join, CTE, set operation, `FOR UPDATE` clause or `SELECT ... INTO`
+takes the query out of this shape, and so does an explicit `SCROLL`. For a lazy
+cursor `DECLARE` executes nothing (it evaluates the select list once on the
+first series value, only to type the columns) and stores a few integers plus
+the parsed select list; each `FETCH` produces exactly the rows it returns, so a
+cursor over `generate_series(1, 1000000000000)` costs the same as one over five
+rows. Because the source reads no table there is no snapshot to pin: the
+cursor is insensitive by construction, and `WITH HOLD` is safe because nothing
+in the producer belongs to the transaction. Rows are evaluated at `FETCH`
+time, so an expression that errors on a late row (`100 / (50 - g)`) fails the
+`FETCH` that reaches it, not the `DECLARE`.
+
+A lazy cursor is forward only: it keeps no rows, so `PRIOR`, `FIRST`, `LAST`,
+`BACKWARD`, a negative count, and `ABSOLUTE`/`RELATIVE` to a row at or behind
+the current position are refused with 55000 and leave the cursor where it was.
+Declare it `SCROLL` to get a materialized cursor that can move both ways.
+
+What bounds a lazy cursor, independent of the series length:
+
+- **Memory held**: one row (the current row, for `FETCH 0`) plus the state, at
+  any time. Nothing grows with `FETCH`.
+- **Rows and bytes per FETCH** (`limits.max_cursor_rows`,
+  `limits.max_cursor_bytes`): rows are produced and projected 256 at a time and
+  the result is checked against both budgets after each chunk, so a `FETCH`
+  that would return more (including `FETCH ALL` of a long series) is refused
+  with 54000 (`too_many_cursor_rows` / `too_many_cursor_bytes`) before it is
+  built. A refused `FETCH` consumes nothing: the cursor stays where it was.
+- **Cursors per session** (`limits.max_cursors_per_session`), refused with
+  54000 before any planning.
+- **Cancellation.** The cancel flag is read when a `FETCH` starts and every
+  1024 series values examined (so a selective `WHERE` over a long range is
+  still cancellable). A cancel, or any evaluation error, fails the `FETCH` with
+  its own SQLSTATE (57014 for a cancel) and closes the cursor, releasing its
+  state; like any statement error it also aborts the enclosing transaction. A
+  skipping `FETCH` (`ABSOLUTE`, `RELATIVE`) does work proportional to the rows
+  it skips, in constant memory.
+
+**Materialized** (everything else). `DECLARE` runs the query to completion and
+holds every row in the session until the cursor closes; nothing is read from
+storage at `FETCH` time. This is the design limit for any query that needs its
+whole input before it can emit a row (a sort, an aggregate, a join build) or
+that reads a table, because the executor's operators return whole row vectors
+and there is no snapshot that can be pinned across statements. It is bounded,
+not removed:
+
+- **Rows per cursor** (`limits.max_cursor_rows`, default 1,000,000). The cap is
+  added to the query as `LIMIT max_rows + 1` (a smaller user `LIMIT` is kept),
+  so a plain scan stops one row past the budget. A result over the budget is
+  refused with SQLSTATE 54000 (`too_many_cursor_rows`) and nothing is stored.
+  Queries with a non-literal `LIMIT`, `LIMIT ... BY`, `FETCH FIRST` or row locks
+  are not capped in flight; their result is still checked before it is stored.
+  A query that must read all its input first (sort, aggregate, join build) still
+  does so under the executor's own query-memory budget.
+- **Bytes per cursor** (`limits.max_cursor_bytes`, default 64 MiB), estimated
+  with `Value::approx_heap_size` and checked on the finished result before it
+  is stored (54000, `too_many_cursor_bytes`). The executor returns a whole
+  `Vec<Row>`, so bytes cannot be enforced mid-flight: the transient peak is at
+  most `max_cursor_rows + 1` rows.
+- **A `generate_series` in the top-level FROM** of a materialized cursor whose
+  length already exceeds `max_cursor_rows` is refused with 54000 before it is
+  built, because the executor builds a table function whole before any `LIMIT`
+  applies. A series nested in a subquery is not inspected; it is bounded only
+  by the query-memory budget like any other query.
+- **Cursors per session** (`limits.max_cursors_per_session`, default 1024),
+  refused with 54000 (`too_many_cursors`) before the query runs. The worst case
+  for one session is therefore `max_cursors_per_session * max_cursor_bytes`;
+  lower the byte budget where that product is too large. There is no separate
+  per-session byte total.
+
+Snapshot and visibility, for the materialized kind: the rows are the
+`DECLARE`-time result, so a cursor never sees later changes, whether made by
+the same transaction or another one (this is PostgreSQL's `INSENSITIVE`
+behaviour, which is also what an unspecified cursor gives there; `INSENSITIVE`
+and `ASENSITIVE` are accepted and treated the same). For a holdable cursor
+PostgreSQL materializes at `COMMIT`; Nucleus materializes at `DECLARE`, so rows
+committed or changed between `DECLARE` and `COMMIT` are not seen.
+
+Lifetime follows PostgreSQL, for both kinds:
+
+- `DECLARE` outside a transaction block is refused (25P01, `DECLARE CURSOR can
+  only be used in transaction blocks`) unless the cursor is `WITH HOLD`.
+- `COMMIT` and `ROLLBACK` close every non-holdable cursor, including a `COMMIT`
+  of an aborted transaction (which is a rollback). A `WITH HOLD` cursor survives
+  `COMMIT`; `ROLLBACK` drops a held cursor that was declared in the rolled-back
+  transaction. A multi-statement simple-query message is one implicit
+  transaction, so its cursors die when the message ends.
+- `ROLLBACK TO SAVEPOINT` closes every cursor declared after that savepoint,
+  held or not, including ones declared in a nested savepoint. A cursor declared
+  before the savepoint stays open and keeps the position its `FETCH`es left it
+  at (cursor motion is not undone, as in PostgreSQL). The savepoint remains
+  usable, so a second rollback to it closes the cursors declared since.
+  `RELEASE SAVEPOINT` keeps the cursors; they belong to the enclosing savepoint.
+- `DISCARD ALL`, session reset and disconnect close everything. `CLOSE name` of
+  an unknown cursor is an error (34000).
+
+`FETCH` keeps PostgreSQL's position model (before-first, on a row, after-last):
+`NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `n`, `ALL`,
+`FORWARD [n | ALL]`, `BACKWARD [n | ALL]`, with a zero count re-fetching the
+current row. A count that is not a 64-bit integer is refused (22023); a
+direction the engine does not recognize is refused (0A000) rather than treated
+as one row. A materialized cursor with no scroll mode allows backward movement,
+because the rows are in memory; `NO SCROLL` refuses any fetch that does not
+move strictly forward with 55000, which is stricter than PostgreSQL in one edge:
+`FETCH FIRST` or `ABSOLUTE k` to a row at or behind the current position is
+refused rather than rewinding.
+
+Not implemented, so the cursor is not a faithful PostgreSQL cursor:
+
+- **Lazy cursors over tables.** A table scan is not lazy: the storage engines
+  read live pages per request and the executor has no statement-spanning
+  snapshot, so a lazily advanced scan would see concurrent changes and the
+  transaction's own later writes, which an insensitive cursor must not. Until
+  an engine offers a pinned scan, a table cursor is materialized under the
+  budgets above.
+- **Cancellation of a materialized `DECLARE`** acts on the query as an ordinary
+  statement; the later `FETCH`es read memory and are not long-running.
+- `DECLARE BINARY` is refused (0A000) because rows are always returned in the
+  connection's normal result format. Redeclaring an existing name replaces it
+  instead of failing with 42P03; if the replacement is declared inside a
+  savepoint, rolling back to that savepoint closes it, and the original is not
+  restored.
+
 ### Catalog metadata
 
 Scalar `DataType::Text` currently emits PostgreSQL VARCHAR OID 1043, including
@@ -231,3 +492,13 @@ scale separately. Scientific JSONB numbers expand without rounding when the
 result fits 16,384 bytes; larger expansions retain exact scientific notation.
 Internal ordering is consistent with these equality classes; full PostgreSQL
 JSONB ordering across unequal values is not established.
+
+## Parameter types for schema-qualified tables
+
+Describe reports the column types. Parameter type inference resolves
+schema-qualified table names, so an INSERT against `"s1"."docs"` (BIGINT,
+BOOLEAN, TEXT, JSONB, INTEGER columns) describes its `$1..$5` as INT8, BOOL,
+TEXT, JSONB, INT4, and `UPDATE "s1"."docs" SET data = $1 WHERE id = $2`
+describes `$1` as JSONB and `$2` as INT8. Types the client declared are
+reported as declared, and a parameter with neither a declared nor an
+inferred type is described as TEXT.

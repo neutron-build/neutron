@@ -1,0 +1,14 @@
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'com.facebook.react'
+android {
+  namespace 'org.neutron.ota'
+  compileSdk rootProject.ext.has('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
+  defaultConfig { minSdk 24; targetSdk 35 }
+  sourceSets { main.java.srcDirs += 'src/main/java' }
+}
+react { jsRootDir = file('../src'); libraryName = 'NeutronOTASpec'; codegenJavaPackageName = 'org.neutron.ota' }
+dependencies {
+  implementation 'com.facebook.react:react-android'
+  implementation 'com.google.crypto.tink:tink-android:1.13.0'
+}

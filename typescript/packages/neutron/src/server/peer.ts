@@ -16,7 +16,10 @@ export interface TransportPeer {
   readonly remoteAddress: string;
 }
 
-const peerByRequest = new WeakMap<Request, TransportPeer>();
+// Vite SSR and native imports must consult the same socket identity registry.
+const peerRegistryKey = Symbol.for("@neutron-build/core/transport-peer");
+const registry = globalThis as unknown as Record<symbol, WeakMap<Request, TransportPeer> | undefined>;
+const peerByRequest = registry[peerRegistryKey] ??= new WeakMap<Request, TransportPeer>();
 
 /**
  * Install immutable peer metadata for a request. Call from the transport

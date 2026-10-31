@@ -173,7 +173,7 @@ def _copy_tape_to_layer(
         lw.set(offset + i, tape.get_data(tape_idx, i))
 
 
-def tape_to_model(tape: Tape, trainable: TrainableLM, params: ModelParams) -> Model:
+def tape_to_model(tape: Tape, trainable: TrainableLM, params: ModelParams) raises -> Model:
     """Copy trained weights from tape back into a new Model for inference.
 
     Creates a fresh Model and populates it from the tape variables

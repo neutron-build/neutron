@@ -15,11 +15,11 @@ export const RLS_EXPLANATION =
   'This store is unavailable because row-level security (RLS) is active for your session. ' +
   "Nucleus's specialty stores have no policy-aware access path, so they fail closed " +
   'while any RLS policy is enabled. No CREATE POLICY can open them — policies only cover ' +
-  'SQL tables. The missing grant is the superuser role (RLS never engages for superuser ' +
-  'sessions). A security admin can also disable RLS on the protected table ' +
-  '(ALTER TABLE <table> DISABLE ROW LEVEL SECURITY) or remove the policy outright ' +
-  '(DROP POLICY <name> ON <table>). Run SELECT * FROM pg_policies to find the table and ' +
-  'policy names — the view is populated from the live RLS engine.'
+  'SQL tables. Ask a security administrator to inspect the active policies and choose an authorized ' +
+  'access path or a dedicated administrative session. Disabling RLS or dropping a policy removes ' +
+  'row protections for affected users; it is a security change, not a routine access fix. ' +
+  'Use SELECT * FROM pg_policies to inspect policies before considering any change.'
+
 
 // The exact statements that restore specialty-store access, as rendered in
 // the RlsNotice panel. Real engine DDL: ALTER TABLE ... DISABLE ROW LEVEL
@@ -28,8 +28,6 @@ export const RLS_EXPLANATION =
 // from the live RLS engine, so it names every active policy and its table.
 export const RLS_FIX_SQL = [
   'SELECT * FROM pg_policies;',
-  'ALTER TABLE <table> DISABLE ROW LEVEL SECURITY;',
-  'DROP POLICY <name> ON <table>;',
 ]
 
 /** Map an engine error to a friendlier message when it is the known RLS denial. */

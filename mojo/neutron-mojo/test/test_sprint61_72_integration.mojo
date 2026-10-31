@@ -25,9 +25,21 @@ from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
 
-def _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32], requires_grad: Bool = True) raises -> Int:
     var dims = List[Int]()
     dims.append(len(vals))
+    var idx = tape.add_variable(dims^, requires_grad=requires_grad)
+    for i in range(len(vals)):
+        tape.set_data(idx, i, vals[i])
+    return idx
+
+
+def _make_var2d(mut tape: Tape, vals: List[Float32], rows: Int, cols: Int,
+                requires_grad: Bool = True) raises -> Int:
+    """2-D variable; strict tracked_matmul requires matrix-shaped operands."""
+    var dims = List[Int]()
+    dims.append(rows)
+    dims.append(cols)
     var idx = tape.add_variable(dims^, requires_grad=requires_grad)
     for i in range(len(vals)):
         tape.set_data(idx, i, vals[i])
@@ -69,19 +81,19 @@ def test_2_lora_concept() raises:
     w_vals.append(0.0)
     w_vals.append(0.0)
     w_vals.append(1.0)
-    var w = _make_var(tape, w_vals, requires_grad=False)
+    var w = _make_var2d(tape, w_vals, 2, 2, requires_grad=False)
 
     # LoRA A (trainable), small init
     var a_vals = List[Float32]()
     a_vals.append(0.01)
     a_vals.append(0.01)
-    var a = _make_var(tape, a_vals, requires_grad=True)
+    var a = _make_var2d(tape, a_vals, 1, 2, requires_grad=True)
 
     # x @ W + x @ A gives modified output
     var x_vals = List[Float32]()
     x_vals.append(1.0)
     x_vals.append(2.0)
-    var x = _make_var(tape, x_vals)
+    var x = _make_var2d(tape, x_vals, 1, 2)
 
     var base_out = tracked_matmul(tape, x, w, 1, 2, 2)
     var lora_out = tracked_mul(tape, x, a)
@@ -363,14 +375,14 @@ def test_12_matmul_backward() raises:
     a_vals.append(4.0)
     a_vals.append(5.0)
     a_vals.append(6.0)
-    var a = _make_var(tape, a_vals)
+    var a = _make_var2d(tape, a_vals, 3, 2)
 
     var b_vals = List[Float32]()
     b_vals.append(0.1)
     b_vals.append(0.2)
     b_vals.append(0.3)
     b_vals.append(0.4)
-    var b = _make_var(tape, b_vals)
+    var b = _make_var2d(tape, b_vals, 2, 2)
 
     var c = tracked_matmul(tape, a, b, 3, 2, 2)
     var loss = tracked_sum(tape, c)

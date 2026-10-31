@@ -60,4 +60,21 @@ describe('ContentArea limits wiring (X06)', () => {
     await waitFor(() => expect(screen.getByText('journey module')).toBeTruthy())
     expect(container.querySelector('[role="note"]')).toBeNull()
   })
+  it('puts routine PostgreSQL status below the workspace while partial engines stay above it', async () => {
+    limitsReport.value = limitsFixture.postgres as LimitsReport
+    show({ id: 't5', kind: 'sql-editor', label: 'SQL' })
+    const first = render(<ContentArea />)
+    await waitFor(() => expect(screen.getByText('sql editor')).toBeTruthy())
+    const editor = screen.getByText('sql editor')
+    const status = screen.getByLabelText('SQL limits')
+    expect(editor.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    first.unmount()
+    limitsReport.value = limitsFixture.nucleus as LimitsReport
+    render(<ContentArea />)
+    await waitFor(() => expect(screen.getByText('sql editor')).toBeTruthy())
+    const warning = screen.getByLabelText('SQL limits')
+    expect(warning.compareDocumentPosition(screen.getByText('sql editor')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(warning.textContent).toContain('DDL is NOT transactional')
+  })
+
 })

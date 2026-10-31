@@ -1,9 +1,10 @@
 //! [`PersistentJobQueue`] — wraps the in-memory [`JobQueue`] with a
 //! [`JobStore`] backend for durability.
 //!
-//! On construction it recovers any stale running jobs from the store,
-//! then loads all pending jobs into the in-memory queue so the existing
-//! `JobWorker` can process them without modification.
+//! Construction recovers stale claims. The store-backed worker continuously
+//! claims due jobs only when handler capacity is available. Delivery is at least
+//! once: handlers must make external side effects idempotent. Set the stale
+//! timeout above the maximum handler duration to avoid premature redelivery.
 //!
 //! # Usage
 //!
@@ -19,8 +20,8 @@
 //!     .with_store(pq.store())
 //!     .job("noop", || async { JobResult::Ok });
 //!
-//! // pq.enqueue() persists AND schedules in-memory
-//! pq.enqueue("noop", serde_json::to_vec(&payload)?)?;
+//! // pq.enqueue() persists and wakes the worker
+//! pq.enqueue("noop", serde_json::to_vec(&payload)?).await?;
 //!
 //! tokio::spawn(worker.run());
 //! ```
@@ -37,9 +38,8 @@ use crate::store::{now_ms, JobStore, StoreError, StoredJob};
 
 /// A [`JobQueue`] wrapper that persists jobs to a [`JobStore`].
 ///
-/// - `enqueue` / `enqueue_delayed` / `enqueue_with_retries` persist to the
-///   store first, then add to the in-memory queue.
-/// - On startup, pending + recovered stale jobs are loaded automatically.
+/// Enqueues persist and notify a worker configured with `with_store`. The worker
+/// claims due jobs continuously; this wrapper never bypasses claim ownership.
 pub struct PersistentJobQueue {
     inner: Arc<JobQueue>,
     store: Arc<dyn JobStore>,
@@ -60,16 +60,13 @@ impl PersistentJobQueue {
         stale_secs: u64,
     ) -> Result<Self, StoreError> {
         let inner = Arc::new(JobQueue::new());
+        inner
+            .stale_secs
+            .store(stale_secs, std::sync::atomic::Ordering::Relaxed);
 
         // Recover stale running jobs → they'll be re-added to pending by the store.
         let stale = store.recover_stale(stale_secs).await?;
         tracing::info!(count = stale.len(), "recovered stale jobs from store");
-
-        // Seed the in-memory queue with all due pending jobs.
-        let pending = store.claim_due("default", 10_000).await?;
-        for job in pending {
-            inner.enqueue_stored(job);
-        }
 
         Ok(Self { inner, store })
     }
@@ -82,6 +79,16 @@ impl PersistentJobQueue {
     /// The store — pass this to [`JobWorker::with_store`].
     pub fn store(&self) -> Arc<dyn JobStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Configure queues to poll, including queues containing jobs before startup.
+    pub fn with_queues(self, queues: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.inner
+            .persistent_queues
+            .lock()
+            .unwrap()
+            .extend(queues.into_iter().map(Into::into));
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -133,17 +140,14 @@ impl PersistentJobQueue {
     }
 
     async fn enqueue_job(&self, job: StoredJob) -> Result<u64, StoreError> {
-        let run_at_ms = job.run_at_ms;
-        let id = self.store.push(job.clone()).await?;
-
-        // Only add to the in-memory queue if it's due now (or past due).
-        if run_at_ms <= now_ms() {
-            let mut stamped = job;
-            stamped.id = id;
-            self.inner.enqueue_stored(stamped);
-        }
-        // Future-dated jobs will be picked up by a periodic poll (if configured)
-        // or when the server restarts and reloads pending jobs from the store.
+        self.inner
+            .persistent_queues
+            .lock()
+            .unwrap()
+            .insert(job.queue.clone());
+        let id = self.store.push(job).await?;
+        // Admission belongs to the worker and happens only after an atomic claim.
+        self.inner.wake();
 
         Ok(id)
     }
@@ -166,6 +170,7 @@ impl JobQueue {
 
         self.push_raw(crate::queue::QueuedJob {
             id: job.id,
+            claim_token: job.claim_token,
             job_type: job.job_type,
             payload: job.payload,
             queue: job.queue,
@@ -195,11 +200,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_adds_to_memory_queue() {
+    async fn enqueue_waits_for_worker_claim() {
         let store = Arc::new(MemoryJobStore::new());
         let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
         pq.enqueue("email", vec![]).await.unwrap();
-        assert_eq!(pq.queue().len(), 1);
+        assert_eq!(pq.queue().len(), 0);
     }
 
     #[tokio::test]
@@ -208,13 +213,8 @@ mod tests {
         let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
         pq.enqueue("email", b"body".to_vec()).await.unwrap();
 
-        // The store should have 1 running job (claimed by enqueue internally)
-        // Actually no — enqueue calls store.push (pending), then adds to in-memory.
-        // claim_due is only called on startup. So store has 1 pending job.
+        // Persisting alone leaves the job pending until a worker has capacity.
         let jobs = store.claim_due("default", 10).await.unwrap();
-        // Already claimed once by PersistentJobQueue::enqueue_job's in-memory path;
-        // the store still tracks it as pending until mark_completed is called.
-        // On enqueue, we call store.push → pending; do NOT call claim_due again.
         assert_eq!(jobs.len(), 1);
     }
 
@@ -236,12 +236,12 @@ mod tests {
         pq.enqueue_with_retries("critical", b"data".to_vec(), 10)
             .await
             .unwrap();
-        let job = pq.queue().try_dequeue().unwrap();
+        let job = store.claim_due("default", 1).await.unwrap().pop().unwrap();
         assert_eq!(job.max_attempts, 10);
     }
 
     #[tokio::test]
-    async fn new_loads_pending_from_store() {
+    async fn new_leaves_pending_until_worker_has_capacity() {
         let store = Arc::new(MemoryJobStore::new());
 
         // Push a job directly into the store
@@ -250,8 +250,8 @@ mod tests {
 
         // New PersistentJobQueue should pick it up via claim_due
         let pq = PersistentJobQueue::new(Arc::clone(&store)).await.unwrap();
-        assert_eq!(pq.queue().len(), 1);
-        let job = pq.queue().try_dequeue().unwrap();
+        assert_eq!(pq.queue().len(), 0);
+        let job = store.claim_due("default", 1).await.unwrap().pop().unwrap();
         assert_eq!(job.job_type, "preloaded");
     }
 }

@@ -5,6 +5,73 @@ Notable changes to the Nucleus engine. Format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-10-04
+
+### Fixed
+
+- **CREATE UNIQUE INDEX was still not enforced for wire-level autocommit
+  statements.** 1.2.1's enforcement (see its entry below) covered the parsed
+  INSERT/UPDATE path — but simple-protocol autocommit statements take the SQL
+  OLTP fast path, which writes straight to storage and only declined tables
+  with table-level constraints, so a table whose uniqueness came from a
+  `CREATE UNIQUE INDEX` accepted duplicate keys over the wire on every engine
+  (found from a live consumer, neutron#69). The fast path now declines any
+  table with a unique index for INSERT, and UPDATE declines when an assigned
+  column participates in one — both fall back to the enforcing parsed path and
+  both fail closed when the catalog cannot be read. Indexed keys also take
+  `UniqueGate` slots so two concurrent sessions cannot race check-then-write
+  on the same key, and index-sourced violations now report PostgreSQL's shape,
+  `duplicate key value violates unique constraint "<index>"` (SQLSTATE 23505),
+  instead of listing raw columns. ORM conformance verdicts are unchanged (the
+  extended protocol was already enforced).
+
+### Changed
+
+- **The statement dispatcher's debug stack cost is 27% smaller.** Every
+  heavyweight arm of `execute_statement_inner` now awaits a boxed sub-future,
+  so their state machines live on the heap instead of the enclosing poll
+  frame: the deepest executor test's stack requirement drops from ~1.94 MiB
+  to ~1.41 MiB (neutron#70). No behavior change. The remaining cost is the
+  view-expansion recursion tower (~540 KiB per view level, re-entering
+  top-level `execute()` once per level), mapped in PR #73 for any future
+  deeper fix; CI keeps its 8 MiB test-thread headroom.
+
+## [1.2.1] - 2026-10-04
+
+### Fixed
+
+- **ALTER TABLE ADD/DROP COLUMN and ALTER COLUMN TYPE could corrupt populated
+  tables on the disk stack.** Two or more ALTERs (or any read after the first)
+  inside one transaction left every tuple unreadable
+  (`corrupt tuple … does not decode against the column types`): the catalog and
+  the engine's cached column layout took effect immediately while the row
+  rewrite was buffered until COMMIT, so after the first ALTER the engine
+  believed the table was wider than every tuple on disk. The rewrite is now one
+  all-or-nothing step (new `StorageEngine::rewrite_table`): the engine adopts
+  the new layout, rewrites every row, rebuilds the table's indexes, and then
+  proves every live tuple decodes; on any failure the engine restores the
+  pre-change directory and free list and the executor restores the catalog, so
+  a half-done ALTER is never recorded as applied (a retried
+  `ADD COLUMN IF NOT EXISTS` used to skip over the damage and report the
+  migration as done). One behavioural change: ALTERing the columns of a table
+  the same transaction has already written to now fails with
+  `cannot change the columns of '<t>' while this transaction has uncommitted
+  changes to it` instead of silently widening buffered rows — order the ALTER
+  before the DML, or split the migration.
+- **CREATE UNIQUE INDEX did not enforce uniqueness on tables that already had
+  rows.** It now counts as a unique constraint on insert, update and the
+  concurrent-insert gate, and creating it fails when existing rows already hold
+  duplicates.
+
+## [1.2.0] - 2026-09-30
+
+Audited persistence and index-coherence repairs: durable-engine opens and
+native FTS recovery refuse incomplete or unreadable state instead of silently
+selecting volatile or partial storage; WAL/columnar failures propagate and
+uncertain outcomes fence subsequent operations; detached derived images use
+writer generations with conservative transaction fallbacks; retired insecure
+encrypted-index modes fail closed while legacy base rows stay readable.
+
 ### Added
 
 - **Per-session resource limits — the memory-bounding pass.** An audit of

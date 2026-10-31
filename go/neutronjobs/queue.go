@@ -59,7 +59,7 @@ const (
 // instant removes the whole class rather than escaping one instance of it.
 const claimJobSQL = `UPDATE _neutron_jobs
 			SET status = 'running', attempts = attempts + 1, updated_at = NOW(),
-			    lease_expires_at = $2, worker_id = $3
+			    lease_expires_at = $2, worker_id = $3, claim_token = $4
 			WHERE id = (
 				SELECT id FROM _neutron_jobs
 				WHERE job_type = $1 AND status = 'pending' AND run_at <= NOW()
@@ -69,6 +69,69 @@ const claimJobSQL = `UPDATE _neutron_jobs
 			)
 			AND status = 'pending'
 			RETURNING id, payload, attempts, max_retry, backoff_ms`
+
+// Terminal and renewal writes are fenced by the claim token: every one must
+// match `status = 'running' AND claim_token = $n`, and every caller must
+// check rows affected. An UPDATE that matches zero rows means this attempt no
+// longer owns the job — the reaper requeued it and another worker claimed it —
+// so the write is dropped, never retried with a weaker predicate (NA-01).
+//
+// `worker_id` deliberately does not appear in these predicates. It identifies
+// a process, not a claim: the same process can lose a lease, have the job
+// requeued, and claim it again, at which point its old attempt would satisfy a
+// worker_id check while belonging to a different attempt than the row now
+// records. The token is fresh per acquisition, so only the current attempt can
+// match. The token predicate also implies ownership changed only when the
+// reaper actually moved the row (it clears the token in the same UPDATE), not
+// merely when a lease lapsed: a handler that finished just before a delayed
+// terminal write can still record its completion, which avoids pointless
+// redelivery without ever letting a stale attempt speak for a newer one.
+const (
+	completeJobSQL = `UPDATE _neutron_jobs
+		SET status = 'completed', updated_at = NOW(),
+		    lease_expires_at = NULL, worker_id = NULL, claim_token = NULL
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`
+
+	retryJobSQL = `UPDATE _neutron_jobs
+		SET status = 'pending', run_at = $3, error = $4, updated_at = NOW(),
+		    lease_expires_at = NULL, worker_id = NULL, claim_token = NULL
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`
+
+	failJobSQL = `UPDATE _neutron_jobs
+		SET status = 'failed', error = $3, updated_at = NOW(),
+		    lease_expires_at = NULL, worker_id = NULL, claim_token = NULL
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`
+
+	// Shutdown release. Attempts are handed back rather than counted: the
+	// handler never ran to a verdict, so a deploy must not burn retry budget.
+	// Like every other terminal write it is token-fenced, so an old attempt
+	// cannot decrement a newer claim's counter.
+	releaseJobSQL = `UPDATE _neutron_jobs
+		SET status = 'pending', attempts = attempts - 1, run_at = NOW(),
+		    updated_at = NOW(), lease_expires_at = NULL,
+		    worker_id = NULL, claim_token = NULL
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`
+
+	// Renewal is additionally bounded by the stored expiry: a previous holder
+	// whose lease has already elapsed must not silently resurrect it — the
+	// reaper is entitled to that row once the lease (plus its grace) is past.
+	renewLeaseSQL = `UPDATE _neutron_jobs
+		SET lease_expires_at = $1, updated_at = NOW()
+		WHERE id = $2 AND status = 'running' AND claim_token = $3
+		  AND lease_expires_at > NOW()`
+)
+
+// claimed is one acquired job plus everything its attempt needs to fence its
+// own writes: the token minted at acquisition and the lease boundary the claim
+// wrote, which is where the renewal watchdog starts.
+type claimed struct {
+	id                 string
+	payload            []byte
+	attempts, maxRetry int
+	backoffMs          int64
+	token              string
+	leaseExpiresAt     time.Time
+}
 
 // Queue provides a persistent job queue backed by Nucleus/PostgreSQL.
 type Queue struct {
@@ -216,12 +279,38 @@ func (q *Queue) EnsureSchema(ctx context.Context) error {
 	for _, alter := range []string{
 		`ALTER TABLE _neutron_jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ`,
 		`ALTER TABLE _neutron_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT`,
+		`ALTER TABLE _neutron_jobs ADD COLUMN IF NOT EXISTS claim_token TEXT`,
 	} {
 		if _, err := q.client.SQL().Exec(ctx, alter); err != nil {
 			return fmt.Errorf("neutronjobs: migrate schema: %w", err)
 		}
 	}
 	return nil
+}
+
+// RecoverLegacyRunning makes 'running' rows from a pre-lease deployment
+// recoverable: the reaper requires a non-NULL lease_expires_at, so a row that
+// predates the lease columns (or was stranded by a worker that never wrote
+// one) can wait forever, however long its worker has been gone (NA-03).
+//
+// This is an explicit cutover step, not something to run on every boot: run it
+// once, while old workers are stopped, when upgrading a fleet that predates
+// leases. Giving the rows an already-expired lease hands them to the normal
+// reaper, which then applies the ordinary retry/dead-letter policy. Attempts
+// are deliberately unchanged — the migration cannot prove whether the lost
+// worker performed the work, so it must neither reward nor punish the job.
+//
+// Returns the number of rows marked recoverable.
+func (q *Queue) RecoverLegacyRunning(ctx context.Context) (int64, error) {
+	n, err := q.client.SQL().Exec(ctx, `
+		UPDATE _neutron_jobs
+		SET lease_expires_at = $1, updated_at = NOW()
+		WHERE status = 'running' AND lease_expires_at IS NULL`,
+		time.Unix(0, 0).UTC())
+	if err != nil {
+		return 0, fmt.Errorf("neutronjobs: recover legacy running jobs: %w", err)
+	}
+	return n, nil
 }
 
 // Enqueue adds a job to the queue.
@@ -266,6 +355,15 @@ func Enqueue[T any](ctx context.Context, q *Queue, jobType string, payload T, op
 // the moment the context is cancelled abandons that write, leaves the row
 // 'running', and the reaper then hands the same job to another worker. The
 // effect is that every deploy silently re-runs whatever was in flight.
+//
+// Capacity is acquired before the claim, not after (NA-02): exactly
+// `concurrency` worker loops each claim at most one row at a time, and only
+// when they are ready to execute it immediately. Claiming first and then
+// waiting for a slot used to lease rows that had no heartbeat — with
+// concurrency 1 the second queued job sat 'running' until another worker's
+// reaper reclaimed it and ran it, while this process still held its payload
+// and would execute it too once the slot freed. A claim may only be taken by
+// a worker that can start it now.
 func (q *Queue) Process(ctx context.Context, jobType string, handler func(ctx context.Context, payload []byte) error, concurrency int) error {
 	if concurrency < 1 {
 		concurrency = 1
@@ -280,97 +378,95 @@ func (q *Queue) Process(ctx context.Context, jobType string, handler func(ctx co
 		defer func() { <-reaperDone }()
 	}
 
-	sem := make(chan struct{}, concurrency)
-	var inflight sync.WaitGroup
-	defer inflight.Wait()
+	var workers sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for ctx.Err() == nil {
+				c, err := q.claimOne(ctx, jobType)
+				if err != nil {
+					// Log it. Swallowed, a schema that was never migrated or
+					// a permissions problem stops the worker processing
+					// anything at all while emitting nothing — the queue
+					// looks idle rather than broken, which is the hardest
+					// failure to notice.
+					//
+					// Cancellation is the ordinary way to stop a worker,
+					// though, and logging that at error level fires on every
+					// clean shutdown. An error that appears in normal
+					// operation is one people learn to scroll past, which
+					// costs more than it reports.
+					if ctx.Err() == nil {
+						q.logger.Error("job claim query failed", "job_type", jobType, "err", err)
+					}
+				}
+				if c != nil && err == nil {
+					// A claim taken is a claim owed an attempt: run it to its
+					// terminal write even if the context was cancelled in
+					// between — executeJob's shutdown path releases it back
+					// with the token fence. The next claim cannot happen
+					// until this attempt is finished, which is exactly the
+					// capacity-before-claim invariant.
+					q.executeClaim(ctx, *c, handler)
+					continue
+				}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		rows, err := q.client.Pool().Query(ctx, claimJobSQL, jobType, time.Now().Add(q.lease), q.workerID)
-		if err != nil {
-			// Log it. Swallowed, a schema that was never migrated or a
-			// permissions problem stops the worker processing anything at all
-			// while emitting nothing — the queue looks idle rather than broken,
-			// which is the hardest failure to notice.
-			//
-			// Cancellation is the ordinary way to stop a worker, though, and
-			// logging that at error level fires on every clean shutdown. An
-			// error that appears in normal operation is one people learn to
-			// scroll past, which costs more than it reports.
-			if ctx.Err() == nil {
-				q.logger.Error("job claim query failed", "job_type", jobType, "err", err)
+				// Nothing claimed (or the claim lost a race) — poll interval.
+				// This also covers a claim error, which keeps an unreachable
+				// database from spinning the loop at full speed.
+				timer := time.NewTimer(time.Second)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
 			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Second):
-			}
-			continue
-		}
-
-		// Drain the claim into memory before doing anything that can block.
-		// Acquiring the concurrency semaphore inside the row loop holds an open
-		// result set — and so a pooled connection — for as long as every worker
-		// slot is busy, which starves the pool the queue itself needs to make
-		// progress.
-		type claimed struct {
-			id                 string
-			payload            []byte
-			attempts, maxRetry int
-			backoffMs          int64
-		}
-		var batch []claimed
-		for rows.Next() {
-			var c claimed
-			if err := rows.Scan(&c.id, &c.payload, &c.attempts, &c.maxRetry, &c.backoffMs); err != nil {
-				q.logger.Error("scan job", "error", err)
-				continue
-			}
-			batch = append(batch, c)
-		}
-		rowsErr := rows.Err()
-		rows.Close()
-		if rowsErr != nil && ctx.Err() == nil {
-			q.logger.Error("job claim read failed", "job_type", jobType, "err", rowsErr)
-		}
-
-		for _, c := range batch {
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				// The claim already happened, so the lease is what recovers
-				// this one: leave it running and let the reaper requeue it.
-				inflight.Wait()
-				return ctx.Err()
-			}
-			inflight.Add(1)
-			go func(c claimed) {
-				defer inflight.Done()
-				defer func() { <-sem }()
-				q.executeJob(ctx, c.id, c.payload, c.attempts, c.maxRetry, c.backoffMs, handler)
-			}(c)
-		}
-
-		if len(batch) == 0 {
-			// Nothing claimed — poll interval. This also covers a row that
-			// failed to scan, which keeps an unreadable row from spinning the
-			// loop at full speed.
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Second):
-			}
-		}
+		}()
 	}
+	workers.Wait()
+	return ctx.Err()
 }
 
-// executeJob runs one claimed job, holding its lease for the duration.
-func (q *Queue) executeJob(ctx context.Context, id string, payload []byte, attempts, maxRetry int, backoffMs int64, handler func(context.Context, []byte) error) {
+// claimOne claims a single pending job and returns it with its fencing token,
+// or nil when no eligible job is waiting. The result set is drained into
+// memory before anything else touches it, so no pooled connection is held.
+func (q *Queue) claimOne(ctx context.Context, jobType string) (*claimed, error) {
+	token := generateJobID()
+	lease := time.Now().Add(q.lease)
+
+	rows, err := q.client.Pool().Query(ctx, claimJobSQL, jobType, lease, q.workerID, token)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var c claimed
+	if rows.Next() {
+		if err := rows.Scan(&c.id, &c.payload, &c.attempts, &c.maxRetry, &c.backoffMs); err != nil {
+			return nil, fmt.Errorf("neutronjobs: scan claim: %w", err)
+		}
+		c.token = token
+		c.leaseExpiresAt = lease
+		return &c, nil
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// executeClaim runs one claimed job, holding its lease for the duration.
+//
+// Every terminal write is fenced by the claim's token (NA-01): if this
+// attempt lost the job — lease expired, reaper requeued it, another worker
+// claimed it — the fenced UPDATE matches zero rows and is dropped. The old
+// attempt's outcome is discarded rather than written over the newer attempt's
+// row.
+func (q *Queue) executeClaim(ctx context.Context, c claimed, handler func(context.Context, []byte) error) {
 	// The job's own context. It is cancelled when the parent is cancelled, and
 	// also the moment this worker loses the lease — at that point another
 	// worker is entitled to the job, and continuing would run it twice.
@@ -380,10 +476,10 @@ func (q *Queue) executeJob(ctx context.Context, id string, payload []byte, attem
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		q.heartbeat(jobCtx, id, cancelJob)
+		q.heartbeat(jobCtx, c, cancelJob)
 	}()
 
-	err := q.runHandler(jobCtx, payload, handler)
+	err := q.runHandler(jobCtx, c.payload, handler)
 
 	cancelJob()
 	<-heartbeatDone
@@ -396,14 +492,8 @@ func (q *Queue) executeJob(ctx context.Context, id string, payload []byte, attem
 	defer cancelWrite()
 
 	if err == nil {
-		if _, uerr := q.client.SQL().Exec(writeCtx,
-			"UPDATE _neutron_jobs SET status = 'completed', updated_at = NOW(), lease_expires_at = NULL, worker_id = NULL WHERE id = $1", id); uerr != nil {
-			// The job did its work and we could not record it. The reaper will
-			// requeue it once the lease lapses, so this is an at-least-once
-			// delivery event and worth shouting about.
-			q.logger.Error("job completed but status write failed; job may run again",
-				"id", id, "error", uerr)
-		}
+		q.fencedExec(writeCtx, completeJobSQL, "completion", c,
+			"id", c.id, "token", c.token)
 		return
 	}
 
@@ -411,36 +501,51 @@ func (q *Queue) executeJob(ctx context.Context, id string, payload []byte, attem
 	// failed. Counting it as a failure burns a retry and can dead-letter a
 	// perfectly good job across a few deploys, so hand it straight back.
 	if ctx.Err() != nil {
-		if _, uerr := q.client.SQL().Exec(writeCtx,
-			`UPDATE _neutron_jobs SET status = 'pending', attempts = attempts - 1, run_at = NOW(),
-			 updated_at = NOW(), lease_expires_at = NULL, worker_id = NULL WHERE id = $1`, id); uerr != nil {
-			q.logger.Error("job interrupted and release failed; lease will recover it",
-				"id", id, "error", uerr)
-		} else {
-			q.logger.Info("job interrupted by shutdown, returned to queue", "id", id)
+		if q.fencedExec(writeCtx, releaseJobSQL, "shutdown release", c,
+			"id", c.id, "token", c.token) {
+			q.logger.Info("job interrupted by shutdown, returned to queue", "id", c.id)
 		}
 		return
 	}
 
-	q.logger.Error("job failed", "id", id, "attempt", attempts, "error", err)
+	q.logger.Error("job failed", "id", c.id, "attempt", c.attempts, "error", err)
 
-	if attempts < maxRetry {
-		retryAt := time.Now().Add(time.Duration(backoffMs*int64(attempts)) * time.Millisecond)
-		if _, uerr := q.client.SQL().Exec(writeCtx,
-			`UPDATE _neutron_jobs SET status = 'pending', run_at = $1, error = $2, updated_at = NOW(),
-			 lease_expires_at = NULL, worker_id = NULL WHERE id = $3`,
-			retryAt, err.Error(), id); uerr != nil {
-			q.logger.Error("job status update failed", "id", id, "target", "retry", "error", uerr)
-		}
+	if c.attempts < c.maxRetry {
+		retryAt := time.Now().Add(time.Duration(c.backoffMs*int64(c.attempts)) * time.Millisecond)
+		q.fencedExec(writeCtx, retryJobSQL, "retry", c,
+			"id", c.id, "token", c.token, "retry_at", retryAt, "error", err.Error())
 		return
 	}
 
-	if _, uerr := q.client.SQL().Exec(writeCtx,
-		`UPDATE _neutron_jobs SET status = 'failed', error = $1, updated_at = NOW(),
-		 lease_expires_at = NULL, worker_id = NULL WHERE id = $2`,
-		err.Error(), id); uerr != nil {
-		q.logger.Error("job status update failed", "id", id, "target", "failed", "error", uerr)
+	q.fencedExec(writeCtx, failJobSQL, "failure", c,
+		"id", c.id, "token", c.token, "error", err.Error())
+}
+
+// fencedExec runs one token-fenced terminal write and interprets its result.
+// A database error is logged by the caller's usual paths; zero rows affected
+// means the attempt no longer owns the job, which is an ownership change to
+// report, never a transition to force through with a weaker predicate.
+//
+// args are alternating log-key/SQL-value pairs; SQL values are taken from the
+// odd positions in order.
+func (q *Queue) fencedExec(ctx context.Context, sql string, what string, c claimed, kv ...any) bool {
+	values := make([]any, 0, len(kv)/2)
+	logAttrs := make([]any, 0, len(kv))
+	for i := 0; i < len(kv); i += 2 {
+		values = append(values, kv[i+1])
+		logAttrs = append(logAttrs, kv[i], kv[i+1])
 	}
+	n, err := q.client.SQL().Exec(ctx, sql, values...)
+	if err != nil {
+		q.logger.Error("job status update failed", "id", c.id, "target", what, "error", err)
+		return false
+	}
+	if n == 0 {
+		q.logger.Warn("job terminal write skipped: claim no longer owned; another attempt owns the job",
+			append([]any{"id", c.id, "target", what}, logAttrs...)...)
+		return false
+	}
+	return true
 }
 
 // runHandler invokes the handler and converts a panic into an ordinary error.
@@ -466,39 +571,79 @@ func (q *Queue) runHandler(ctx context.Context, payload []byte, handler func(con
 // dead worker quickly, but longer than the slowest job or a healthy worker gets
 // its job stolen mid-flight. Renewing removes the second half of that — the
 // lease only has to outlive a renewal interval, not the job.
-func (q *Queue) heartbeat(ctx context.Context, id string, cancelJob context.CancelFunc) {
+//
+// The handler's lifetime is bounded by the last *confirmed* lease boundary
+// (NA-01). `confirmedThrough` starts at the boundary the claim wrote and moves
+// only when a renewal is acknowledged by the database. A renewal that errors —
+// a partition, a hung query — never extends it: the watchdog timer fires at
+// that boundary and cancels the handler, because past it this worker's
+// ownership is indeterminate and another worker may legitimately have been
+// handed the job. Before that fix a partitioned worker warned and kept
+// executing forever, long after the reaper had requeued the job elsewhere.
+//
+// The renewal query itself is bounded by the same boundary, so a hanging query
+// cannot outlive the lease it is trying to renew. The watchdog and the renewal
+// ticker are owned by this one goroutine, which is what keeps the timer resets
+// race-free.
+func (q *Queue) heartbeat(ctx context.Context, c claimed, cancelJob context.CancelFunc) {
 	interval := max(q.lease/3, time.Second)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	confirmedThrough := c.leaseExpiresAt
+	watchdog := time.NewTimer(time.Until(confirmedThrough))
+	defer watchdog.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-		}
-
-		// Renew only while we still own it. `worker_id` in the predicate is the
-		// whole point: if the reaper decided we were dead and requeued the job,
-		// this matches zero rows and we must stop working on it.
-		n, err := q.client.SQL().Exec(ctx,
-			`UPDATE _neutron_jobs SET lease_expires_at = $1, updated_at = NOW()
-			 WHERE id = $2 AND worker_id = $3 AND status = 'running'`,
-			time.Now().Add(q.lease), id, q.workerID)
-		if err != nil {
-			// A failed renewal is not proof the lease was lost, so keep working
-			// and try again; the lease itself is the backstop.
-			if ctx.Err() == nil {
-				q.logger.Warn("lease renewal failed", "id", id, "error", err)
-			}
-			continue
-		}
-		if n == 0 {
-			q.logger.Warn("lease lost, abandoning job to avoid running it twice",
-				"id", id, "worker_id", q.workerID)
+		case <-watchdog.C:
+			q.logger.Warn("lease boundary reached without a confirmed renewal; abandoning job",
+				"id", c.id, "worker_id", q.workerID)
 			cancelJob()
 			return
+		case <-ticker.C:
+			// Bound the renewal by the confirmed boundary: a query that hangs
+			// cannot strand the watchdog past the lease it is renewing.
+			bound := time.Until(confirmedThrough)
+			if bound <= 0 {
+				continue // watchdog fires (or has fired); nothing to renew with
+			}
+			renewCtx, cancelRenew := context.WithTimeout(ctx, bound)
+			n, err := q.client.SQL().Exec(renewCtx, renewLeaseSQL,
+				time.Now().Add(q.lease), c.id, c.token)
+			cancelRenew()
+			if err != nil {
+				// A failed renewal is not proof the lease was lost — but it is
+				// also not permission to keep working past the last boundary
+				// the database confirmed. Try again; the watchdog holds the
+				// line at confirmedThrough.
+				if ctx.Err() == nil {
+					q.logger.Warn("lease renewal failed; handler stops at the last confirmed boundary",
+						"id", c.id, "error", err)
+				}
+				continue
+			}
+			if n == 0 {
+				// Renew only while we still own it: the token predicate means
+				// zero rows is the reaper (or a claim race) having moved the
+				// row on; the expiry predicate means the lease already elapsed
+				// and must not be resurrected. Either way, stop working on it.
+				q.logger.Warn("lease lost, abandoning job to avoid running it twice",
+					"id", c.id, "worker_id", q.workerID)
+				cancelJob()
+				return
+			}
+			// Renewal acknowledged: extend the boundary and the watchdog with
+			// it. Stop+drain then Reset is safe here because this goroutine is
+			// the only reader of watchdog.C.
+			if !watchdog.Stop() {
+				<-watchdog.C
+			}
+			confirmedThrough = time.Now().Add(q.lease)
+			watchdog.Reset(time.Until(confirmedThrough))
 		}
 	}
 }
@@ -538,11 +683,13 @@ func (q *Queue) Reap(ctx context.Context, jobType string) (requeued, deadLettere
 	cutoff := time.Now().Add(-q.reapGrace)
 
 	// Exhausted first. Doing it the other way round would requeue a job and
-	// then immediately dead-letter it in the same sweep.
+	// then immediately dead-letter it in the same sweep. Both updates clear
+	// the claim token in the same statement that moves the row: that is what
+	// fences the old attempt's terminal writes out (NA-01).
 	deadLettered, err = q.client.SQL().Exec(ctx,
 		`UPDATE _neutron_jobs
 		 SET status = 'dead_letter', updated_at = NOW(), lease_expires_at = NULL, worker_id = NULL,
-		     error = 'lease expired without completion; attempts exhausted'
+		     claim_token = NULL, error = 'lease expired without completion; attempts exhausted'
 		 WHERE job_type = $1 AND status = 'running'
 		   AND lease_expires_at IS NOT NULL AND lease_expires_at < $2
 		   AND attempts >= max_retry`,
@@ -554,7 +701,7 @@ func (q *Queue) Reap(ctx context.Context, jobType string) (requeued, deadLettere
 	requeued, err = q.client.SQL().Exec(ctx,
 		`UPDATE _neutron_jobs
 		 SET status = 'pending', run_at = NOW(), updated_at = NOW(),
-		     lease_expires_at = NULL, worker_id = NULL,
+		     lease_expires_at = NULL, worker_id = NULL, claim_token = NULL,
 		     error = 'lease expired without completion; requeued'
 		 WHERE job_type = $1 AND status = 'running'
 		   AND lease_expires_at IS NOT NULL AND lease_expires_at < $2

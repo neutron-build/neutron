@@ -46,6 +46,11 @@ function assertPlainTable(table: AnyPgTable, who: string): void {
     if (col.arrayDimensions !== undefined) throw new Error(`${at} is an array column — the v1 export shape cannot represent arrays; use exportSchemaV2 (Q07)`);
     if (col.identityKind !== undefined) throw new Error(`${at} is an identity column — the v1 export shape cannot represent identity defaults; use exportSchemaV2 (Q07)`);
     if (col.generatedExpr !== undefined) throw new Error(`${at} is a generated column — the v1 export shape cannot represent generated columns; use exportSchemaV2 (Q07)`);
+    if (col.numericPrecision !== undefined) {
+      throw new Error(
+        `${at} declares a constrained numeric type (numeric(${col.numericPrecision},${col.numericScale})) — the v1 export shape cannot represent numeric precision/scale; use exportSchemaV2`,
+      );
+    }
     if (col.foreignKey?.onUpdate !== undefined) throw new Error(`${at} declares a foreign key with ON UPDATE — the v1 export shape drops it; use exportSchemaV2 (Q07)`);
   }
 }
@@ -376,6 +381,7 @@ function v2DefaultFor(tableId: V2Identity, column: AnyColumnBuilder): V2Default 
 
 function v2TypeFor(tableId: V2Identity, column: AnyColumnBuilder): V2TypeRef {
   const at = `tables[${tableId.schema}.${tableId.name}].columns[${column.columnName}].type`;
+  if (column.arrayValueMode === "dimensions") throw exportError("unknown-type", at, "nativeArray dimensions and lower bounds require an explicit native schema; exportSchemaV2 supports one-dimensional default-bound arrays");
   const typeName = column.dataType === "enum" ? "enum" : V2_TYPE_NAMES[column.dataType];
   if (typeName === undefined) {
     throw exportError("unknown-type", at, `unknown column type ${JSON.stringify(column.dataType)}`);
@@ -397,6 +403,14 @@ function v2TypeFor(tableId: V2Identity, column: AnyColumnBuilder): V2TypeRef {
     ref.params = { dimensions: column.vectorDimensions };
   } else if (column.dataType === "varchar" && column.varcharLength) {
     ref.params = { length: column.varcharLength };
+  } else if (column.dataType === "numeric" && column.numericPrecision !== undefined) {
+    // The factory pairs precision with a normalized scale (precision-only =>
+    // 0) and validates the shared contract subset (1..1000 / 0..precision);
+    // half-present metadata is a defect, not something to coerce or drop.
+    if (column.numericScale === undefined) {
+      throw exportError("invalid-type-params", at, "numeric precision is set without scale — inconsistent column metadata (the factory normalizes precision-only to scale 0)");
+    }
+    ref.params = { precision: column.numericPrecision, scale: column.numericScale };
   }
   if (column.dataType === "enum") {
     if (column.enumDef === undefined) {

@@ -1,13 +1,23 @@
 /**
- * Animated component wrappers — apply animated styles via JSI worklets.
+ * Animated component wrappers.
+ *
+ * HOSTS AND HOOKS STAY ON THE SAME PROVIDER (NF-NR-04): when
+ * react-native-reanimated is installed, `Animated.View` & co. are the
+ * Reanimated hosts — the only hosts that understand the styles produced by
+ * `useAnimatedStyle`. Without the peer, the exported components are React
+ * Native's own JS-driven `Animated` hosts (they accept `Animated.Value`
+ * styles from the fallback hook layer) — NOT plain views pretending.
+ *
+ * `entering` / `exiting` / `layout` are Reanimated-only layout transitions;
+ * using them without the peer throws instead of silently no-oping.
  *
  * Usage:
  *   import { Animated } from '@neutron-build/native/animated'
  *   <Animated.View style={animatedStyle}>...</Animated.View>
  */
 
-import React, { type ReactNode } from 'react'
-import { View, Text, Image, ScrollView } from 'react-native'
+import React, { forwardRef, type ReactNode } from 'react'
+import { Animated as RNAnimated } from 'react-native'
 import type { NativeStyleProp } from '../types.js'
 
 interface AnimatedViewProps {
@@ -45,47 +55,92 @@ interface AnimatedScrollViewProps {
   children?: ReactNode
 }
 
+let _reanimatedHosts: Record<string, unknown> | null | undefined
+
+/** Resolve the Reanimated host components, or null when the peer is absent. */
+function getReanimatedHosts(): Record<string, unknown> | null {
+  if (_reanimatedHosts === undefined) {
+    _reanimatedHosts = null
+    try {
+      // Lazy peer resolution — never at module load.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mod: any = require('react-native-reanimated')
+      const animated = mod?.default?.Animated ?? mod?.Animated
+      if (animated && typeof animated.View === 'function') _reanimatedHosts = animated
+    } catch {
+      _reanimatedHosts = null
+    }
+  }
+  return _reanimatedHosts ?? null
+}
+
+/** True when the exported hosts are Reanimated's (worklet-compatible). */
+export function usingReanimatedHosts(): boolean {
+  return getReanimatedHosts() !== null
+}
+
+function assertNoLayoutTransitions(props: { entering?: unknown; exiting?: unknown; layout?: unknown }): void {
+  const used = (['entering', 'exiting', 'layout'] as const).filter(key => props[key] !== undefined)
+  if (used.length > 0) {
+    throw new Error(
+      `Animated <View> received ${used.join(', ')} — layout transitions require react-native-reanimated, ` +
+      'which is not installed. The no-peer components support Animated.Value styles only.',
+    )
+  }
+}
+
 /**
- * Animated.View — View with animated style support.
- * The style prop can include values driven by shared values and worklets.
+ * Animated.View — View whose host matches the animation provider:
+ * Reanimated's View when installed, RN's Animated.View otherwise.
  */
-function AnimatedView({ children, style, testID, ...rest }: AnimatedViewProps) {
-  // In production: register a NativeAnimatedModule observer that
-  // updates this view's props on each animation frame via JSI,
-  // bypassing the JS bridge entirely.
-  return React.createElement(View, { style: style as any, testID, ...rest }, children)
-}
+const AnimatedView = forwardRef<unknown, AnimatedViewProps>(function AnimatedView(props, ref) {
+  const hosts = getReanimatedHosts()
+  if (hosts) {
+    return React.createElement((hosts as any).View, { ...props, ref })
+  }
+  assertNoLayoutTransitions(props)
+  const { children, style, testID, ...rest } = props
+  return React.createElement(RNAnimated.View, { style: style as any, testID, ...(rest as any), ref })
+})
 
-/** Animated.Text — Text with animated style support. */
-function AnimatedText({ children, style, testID, ...rest }: AnimatedTextProps) {
-  return React.createElement(Text, { style: style as any, testID, ...rest }, children)
-}
+/** Animated.Text — Text on the active animation provider's host. */
+const AnimatedText = forwardRef<unknown, AnimatedTextProps>(function AnimatedText(props, ref) {
+  const hosts = getReanimatedHosts()
+  if (hosts) {
+    return React.createElement((hosts as any).Text, { ...props, ref })
+  }
+  const { children, style, testID, ...rest } = props
+  return React.createElement(RNAnimated.Text, { style: style as any, testID, ...(rest as any), ref })
+})
 
-/** Animated.Image — Image with animated style support. */
-function AnimatedImage({ style, source, testID, ...rest }: AnimatedImageProps) {
-  const src = typeof source === 'string' ? { uri: source } : source
-  return React.createElement(Image, { style: style as any, source: src as any, testID, ...rest })
-}
+/** Animated.Image — Image on the active animation provider's host. */
+const AnimatedImage = forwardRef<unknown, AnimatedImageProps>(function AnimatedImage(props, ref) {
+  const hosts = getReanimatedHosts()
+  if (hosts) {
+    return React.createElement((hosts as any).Image, { ...props, source: normalizeSource(props.source), ref })
+  }
+  const { style, source, testID, ...rest } = props
+  return React.createElement(RNAnimated.Image, { style: style as any, source: normalizeSource(source) as any, testID, ...(rest as any), ref })
+})
 
-/** Animated.ScrollView — ScrollView with animated scroll events. */
-function AnimatedScrollView({ children, style, testID, ...rest }: AnimatedScrollViewProps) {
-  return React.createElement(ScrollView, { style: style as any, testID, ...rest }, children)
+/** Animated.ScrollView — ScrollView on the active animation provider's host. */
+const AnimatedScrollView = forwardRef<unknown, AnimatedScrollViewProps>(function AnimatedScrollView(props, ref) {
+  const hosts = getReanimatedHosts()
+  if (hosts) {
+    return React.createElement((hosts as any).ScrollView, { ...props, ref })
+  }
+  const { children, style, testID, ...rest } = props
+  return React.createElement(RNAnimated.ScrollView, { style: style as any, testID, ...(rest as any), ref })
+})
+
+function normalizeSource(source: string | number | { uri: string }): string | number | { uri: string } {
+  return typeof source === 'string' ? { uri: source } : source
 }
 
 /**
- * Animated namespace — mirrors react-native-reanimated API.
- *
- * @example
- * import { Animated } from '@neutron-build/native/animated'
- *
- * function FadeIn({ children }) {
- *   const opacity = useSharedValue(0)
- *   const style = useAnimatedStyle(() => ({ opacity: opacity.value }))
- *
- *   useEffect(() => { opacity.value = withTiming(1) }, [])
- *
- *   return <Animated.View style={style}>{children}</Animated.View>
- * }
+ * Animated namespace. The hosts and the hooks (useAnimatedStyle etc.) are
+ * resolved from the SAME provider, so a style produced by the hook layer is
+ * always understood by the host that receives it.
  */
 export const Animated = {
   View: AnimatedView,

@@ -171,22 +171,23 @@ for (const driverKind of ["postgres", "pg"] as const) {
     });
   });
 
-  test(`live (${driverKind}): logger observes executed SQL`, async () => {
+  test(`live (${driverKind}): logger observes statement identity without SQL text`, async () => {
     await withSuite(driverKind, async () => {
       const url = new URL(TEST_URL);
       url.pathname = `/${DB_NAME}`;
-      const events: Array<{ sql: string }> = [];
+      const events: Array<{ sql: string | undefined; statementId: string }> = [];
       const db = await createDatabase({
         url: url.toString(),
         driverOptions: { driver: driverKind },
         tables: { users, posts },
         relations: { users: usersRelations, posts: postsRelations },
-        logger: (e) => events.push({ sql: e.sql ?? "" }),
+        logger: (e) => events.push({ sql: e.sql, statementId: e.statementId }),
       });
       try {
         await db.select().from(users);
         assert.ok(events.length >= 1);
-        assert.ok(events[0].sql.startsWith("select"));
+        assert.equal(events[0].sql, undefined);
+        assert.match(events[0].statementId, /^[0-9a-f]{16}$/);
       } finally {
         await db.close();
       }

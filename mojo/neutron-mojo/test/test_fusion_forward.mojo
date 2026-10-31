@@ -44,7 +44,7 @@ def assert_true(cond: Bool, msg: String) raises:
         raise Error("Assertion failed: " + msg)
 
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny model with small random-ish weights for testing."""
     var p = tiny_test_params()
     var model = Model(p)
@@ -240,9 +240,8 @@ def test_rmsnorm_matmul_fusion_pattern() raises:
     var norm_node = CanonicalNode(OpKind.RMSNorm, x, gamma)
     var norm_result = eg.add(norm_node^)
 
-    var w = eg.add(CanonicalNode(OpKind(50)))  # Another Const (hash-conses with gamma)
-    # Use a different op to get a distinct weight node
-    var w2 = eg.add(CanonicalNode(OpKind.Reshape))  # Distinct from gamma
+    # Distinct weight node (opaque leaves auto-assign distinct symbols)
+    var w2 = eg.add(CanonicalNode(OpKind.Const))
 
     var matmul_node = CanonicalNode(OpKind.Matmul, w2, norm_result)
     var result = eg.add(matmul_node^)
@@ -310,8 +309,8 @@ def test_swiglu_fusion_pattern() raises:
 
 
 def test_default_ruleset_has_fusion_rules() raises:
-    """Default ruleset should include 3 fusion rules + 8 algebraic rules."""
-    var ruleset = create_default_ruleset()
+    """Full fast-math ruleset should include 3 fusion rules + 8 algebraic rules."""
+    var ruleset = create_default_ruleset(fast_math=True)
 
     assert_true(ruleset.num_rules() == 11, "Should have 11 rules total")
 

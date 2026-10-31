@@ -3,6 +3,8 @@ import * as path from "node:path";
 import type { Route, RouteConfig } from "./types.js";
 import { RESOURCE_ROUTE_METHODS } from "./resource-routes.js";
 import type { ResourceRouteMethod } from "./resource-routes.js";
+export { findNotFoundMatch, findNotFoundRoute, type NotFoundMatch } from "./route-path.js";
+import { parse as babelParse } from "@babel/parser";
 
 export interface DiscoverOptions {
   routesDir: string;
@@ -274,29 +276,6 @@ function createRoute(
 }
 
 /**
- * The not-found page covering `urlPath`: the deepest one whose directory is a
- * prefix of the request.
- *
- * Deepest wins so a section can present its own 404 — a miss under `/admin`
- * should look like the admin app, not like the marketing site — while the root
- * page still catches everything else.
- */
-export function findNotFoundRoute(routes: Route[], urlPath: string): Route | undefined {
-  let best: Route | undefined;
-  for (const route of routes) {
-    if (!route.isNotFound) continue;
-    const base = route.path === "/" ? "/" : route.path + "/";
-    const candidate = urlPath.endsWith("/") ? urlPath : urlPath + "/";
-    if (base === "/" || candidate.startsWith(base)) {
-      if (!best || route.path.length > best.path.length) {
-        best = route;
-      }
-    }
-  }
-  return best;
-}
-
-/**
  * Facts about a route derived from its source, as opposed to declared in its
  * `config`. The client needs these to decide how much runtime a page requires,
  * and it cannot ask the module: `stripServerOnlyRouteModule` removes `loader`,
@@ -340,50 +319,160 @@ export interface RouteFacts {
 }
 
 /**
- * Detects `loader`/`middleware`/`action` exports and HTTP method handlers by
- * source shape, matching how the server-only stripper identifies the same
- * exports.
+ * Minimal structural AST types for the export scan — the same approach
+ * vite/server-only.ts takes: parse with @babel/parser, walk with structural
+ * interfaces, and never execute the module.
+ */
+interface BindingNode {
+  type: string;
+  name?: string;
+  argument?: BindingNode | null;
+  left?: BindingNode | null;
+  elements?: Array<BindingNode | null> | null;
+  properties?: Array<BindingNode | null> | null;
+  value?: BindingNode | null;
+}
+
+interface ExportSpecifierNode {
+  type: string;
+  exported?: { type?: string; name?: string; value?: string } | null;
+  exportKind?: string | null;
+}
+
+interface ExportStatementNode {
+  type: string;
+  exportKind?: string | null;
+  declaration?:
+    | {
+        type: string;
+        id?: { type?: string; name?: string } | null;
+        declarations?: Array<{ id?: BindingNode | null }> | null;
+      }
+    | null;
+  specifiers?: ExportSpecifierNode[] | null;
+}
+
+/** Collect every binding name a declaration's pattern introduces, including
+ * destructured, rest, and defaulted bindings. An unsupported binding form
+ * throws rather than silently becoming "no names" — an unrecognised pattern
+ * must not turn into a false absence fact. */
+function bindingNames(node: BindingNode): string[] {
+  switch (node.type) {
+    case "Identifier":
+      return node.name ? [node.name] : [];
+    case "RestElement":
+      return node.argument ? bindingNames(node.argument) : [];
+    case "AssignmentPattern":
+      return node.left ? bindingNames(node.left) : [];
+    case "ArrayPattern":
+      return (node.elements || []).flatMap((e) => (e ? bindingNames(e) : []));
+    case "ObjectPattern":
+      return (node.properties || []).flatMap((p) => {
+        if (!p) return [];
+        if (p.type === "RestElement") return p.argument ? bindingNames(p.argument) : [];
+        return p.value ? bindingNames(p.value) : [];
+      });
+    default:
+      throw new Error(`Unsupported exported binding pattern: ${node.type}`);
+  }
+}
+
+/** The runtime names a module exports, parsed rather than pattern-matched. An
+ * unresolved runtime `export *` sets `unresolvedStar`, which every fact reads
+ * as "potentially present": conservatively true beats an absent gate. */
+function collectExportedNames(
+  statements: ExportStatementNode[]
+): { names: Set<string>; unresolvedStar: boolean } {
+  const names = new Set<string>();
+  let unresolvedStar = false;
+  for (const statement of statements) {
+    if (statement.type === "ExportAllDeclaration") {
+      if (statement.exportKind !== "type") unresolvedStar = true;
+      continue;
+    }
+    if (statement.type !== "ExportNamedDeclaration") continue;
+    if (statement.exportKind === "type") continue; // type-only: no runtime export
+    const declaration = statement.declaration;
+    if (declaration) {
+      if (declaration.type === "VariableDeclaration" && declaration.declarations) {
+        for (const declarator of declaration.declarations) {
+          if (declarator.id) for (const name of bindingNames(declarator.id)) names.add(name);
+        }
+      } else if (declaration.id && declaration.id.type === "Identifier") {
+        names.add(declaration.id.name!);
+      }
+    }
+    for (const specifier of statement.specifiers || []) {
+      if (specifier.exportKind === "type") continue;
+      const exported = specifier.exported;
+      if (exported) {
+        names.add(exported.type === "StringLiteral" ? exported.value! : exported.name!);
+      }
+    }
+  }
+  return { names, unresolvedStar };
+}
+
+/**
+ * Facts about a route module's exports, by parsing it — not by regex.
  *
- * Deliberately conservative: anything ambiguous counts as HAVING a loader, so a
- * missed detection costs a network request that was already being made rather
- * than a page rendered without its data.
+ * The regex version recognized one narrow spelling per export and reported
+ * everything else as absent: `export const marker = 1, middleware = [...]`
+ * (middleware not the first declarator), alias and string-literal export
+ * lists, and `export * from "./guard"` all produced `hasMiddleware: false`.
+ * The static-serving fast path then skipped a route whose gate existed
+ * (NA-04). The parse is deliberately conservative in the other direction:
+ * anything unresolved — a star re-export, an unparseable file — counts as
+ * present, so a missed detection costs a fast path rather than an access
+ * control.
  */
 export function parseRouteFacts(fileContent: string): RouteFacts {
-  const declared =
-    /export\s+(?:async\s+)?(?:function|const|let|var)\s+loader\b/.test(fileContent);
-  // `export { loader }` and `export { x as loader }`, including re-exports.
-  const named = /export\s*\{[^}]*\bloader\b[^}]*\}/.test(fileContent);
-  // Same two shapes for `middleware`. Conservative in the same direction and
-  // for a stronger reason: a false positive costs a static route its prebuilt
-  // fast path, a false negative serves a gated page to anyone.
-  const middlewareDeclared =
-    /export\s+(?:async\s+)?(?:function|const|let|var)\s+middleware\b/.test(fileContent);
-  const middlewareNamed = /export\s*\{[^}]*\bmiddleware\b[^}]*\}/.test(fileContent);
-  // `action` powers the OpenAPI POST operation, same detection family.
-  const actionDeclared =
-    /export\s+(?:async\s+)?(?:function|const|let|var)\s+action\b/.test(fileContent);
-  const actionNamed = /export\s*\{[^}]*\baction\b[^}]*\}/.test(fileContent);
-  // HTTP method handlers (resource routes). The word boundary after the name
-  // keeps GETX/GET_DATA from matching; `export { GET }` covers re-exports.
-  // Collect WHICH methods matched, not just that one did: the route table is
-  // the only place the fact can live (OpenAPI runs from the table, the client
-  // build strips the exports), and a method not listed would be undocumented.
-  const resourceMethods = RESOURCE_ROUTE_METHODS.filter((method) =>
-    new RegExp(`export\\s+(?:async\\s+)?(?:function|const|let|var)\\s+${method}\\b`).test(
-      fileContent
-    ) ||
-      new RegExp(`export\\s*\\{[^}]*\\b${method}\\b[^}]*\\}`).test(fileContent)
-  );
-  // Any default-export form: `export default function/class/expr`.
-  const hasDefault = /(^|\n)\s*export\s+default\b/.test(fileContent);
-  return {
-    hasLoader: declared || named,
-    hasMiddleware: middlewareDeclared || middlewareNamed,
-    hasAction: actionDeclared || actionNamed,
-    hasMethodHandlers: resourceMethods.length > 0,
-    resourceMethods,
-    hasDefaultExport: hasDefault,
-  };
+  try {
+    const ast = babelParse(fileContent, {
+      sourceType: "module",
+      plugins: ["typescript", "jsx"],
+    });
+    const statements = ast.program.body as unknown as ExportStatementNode[];
+    const { names, unresolvedStar } = collectExportedNames(statements);
+    // HTTP method handlers (resource routes). Collect WHICH methods are
+    // exported, not just that one is: the route table is the only place the
+    // fact can live (OpenAPI runs from the table, the client build strips the
+    // exports). Only names the parse resolved count — an unresolved
+    // `export *` is not read as handlers, since a page that also has a
+    // default export would then be a discovery error, and a method listed
+    // without a handler would be documented falsely.
+    const resourceMethods = RESOURCE_ROUTE_METHODS.filter((method) => names.has(method));
+    // `export default …` or `export { X as default }`; `export *` never
+    // re-exports a default.
+    const hasDefaultExport =
+      names.has("default") || statements.some((statement) => statement.type === "ExportDefaultDeclaration");
+    return {
+      hasLoader: unresolvedStar || names.has("loader"),
+      hasMiddleware: unresolvedStar || names.has("middleware"),
+      hasAction: unresolvedStar || names.has("action"),
+      hasMethodHandlers: resourceMethods.length > 0,
+      resourceMethods,
+      hasDefaultExport,
+    };
+  } catch {
+    // Unparseable source: assume the heavier path and assume gated — never
+    // convert uncertainty into an absence fact. Method handlers and the
+    // default export fall back to source shape, which is what classified
+    // resource routes before the parse existed.
+    const resourceMethods = RESOURCE_ROUTE_METHODS.filter(
+      (method) =>
+        new RegExp(`export\\s+(?:async\\s+)?(?:function|const|let|var)\\s+${method}\\b`).test(fileContent) ||
+        new RegExp(`export\\s*\\{[^}]*\\b${method}\\b[^}]*\\}`).test(fileContent)
+    );
+    return {
+      hasLoader: true,
+      hasMiddleware: true,
+      hasAction: true,
+      hasMethodHandlers: resourceMethods.length > 0,
+      resourceMethods,
+      hasDefaultExport: /(^|\n)\s*export\s+default\b/.test(fileContent),
+    };
+  }
 }
 
 function readRouteFacts(filePath: string): RouteFacts {

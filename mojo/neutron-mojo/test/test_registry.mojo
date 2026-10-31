@@ -51,7 +51,7 @@ def assert_eq(a: Int, b: Int, msg: String) raises:
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)

@@ -22,6 +22,7 @@ from neutron_mojo.io.gguf import (
     calculate_tensor_size,
 )
 from neutron_mojo.model.config import ModelConfig
+from neutron_mojo.tensor.shape import Shape
 
 
 # ===----------------------------------------------------------------------=== #
@@ -108,12 +109,9 @@ struct WeightDescriptor(Copyable, ImplicitlyCopyable):
         self.is_quantized = copy.is_quantized
         self.quant_type = copy.quant_type
 
-    def numel(self) -> Int:
-        """Total number of elements."""
-        var total = 1
-        for i in range(len(self.shape)):
-            total *= self.shape[i]
-        return total
+    def numel(self) raises -> Int:
+        """Checked element count, including row-major stride products."""
+        return Shape(self.shape.copy()).numel()
 
     def ndim(self) -> Int:
         """Number of dimensions."""
@@ -149,12 +147,15 @@ struct WeightIndex(Movable):
         self.weight_names = move.weight_names^
         self.total_size_bytes = move.total_size_bytes^
 
-    def add_weight(mut self, desc: WeightDescriptor):
+    def add_weight(mut self, desc: WeightDescriptor) raises:
         """Add a weight descriptor to the index.
 
         Args:
             desc: Weight descriptor.
         """
+        _ = desc.numel()
+        if desc.name in self.weights or desc.size_bytes < 0 or desc.file_offset < 0 or self.total_size_bytes < 0 or desc.size_bytes > 0x7FFFFFFFFFFFFFFF - self.total_size_bytes or desc.size_bytes > 0x7FFFFFFFFFFFFFFF - desc.file_offset:
+            raise Error("Invalid, duplicate or overflowing weight descriptor")
         self.weight_names.append(desc.name)
         self.total_size_bytes += desc.size_bytes
         self.weights[desc.name] = desc.copy()
@@ -219,7 +220,7 @@ def register_safetensors_weight(
     name: String,
     info: TensorInfo,
     data_offset: Int,
-):
+) raises:
     """Register a SafeTensors tensor as a weight in the index.
 
     Args:
@@ -233,6 +234,8 @@ def register_safetensors_weight(
     desc.dtype = parse_dtype_string(info.dtype)
     desc.shape = info.shape.copy()
     desc.size_bytes = info.size_bytes()
+    if data_offset < 0 or info.data_offset_start < 0 or info.data_offset_end < info.data_offset_start or info.data_offset_start > 0x7FFFFFFFFFFFFFFF - data_offset:
+        raise Error("Invalid SafeTensors index offset")
     desc.file_offset = data_offset + info.data_offset_start
     desc.is_quantized = False
     desc.quant_type = String("none")
@@ -248,7 +251,7 @@ def register_gguf_weight(
     name: String,
     info: GGUFTensorInfo,
     data_offset: Int,
-):
+) raises:
     """Register a GGUF tensor as a weight in the index.
 
     Args:
@@ -262,6 +265,8 @@ def register_gguf_weight(
     desc.dtype = gguf_type_to_dtype(info.tensor_type)
     desc.shape = info.shape.copy()
     desc.size_bytes = calculate_tensor_size(info.shape, info.tensor_type)
+    if data_offset < 0 or info.offset < 0 or info.offset > 0x7FFFFFFFFFFFFFFF - data_offset:
+        raise Error("Invalid GGUF index offset")
     desc.file_offset = data_offset + info.offset
 
     # Detect quantization

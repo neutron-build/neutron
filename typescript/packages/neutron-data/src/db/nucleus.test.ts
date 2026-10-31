@@ -167,26 +167,26 @@ test("NucleusCacheClient.del delegates to kv.delete", async () => {
   assert.equal(calls[0], "cache:expired");
 });
 
-test("NucleusCacheClient.incr delegates to kv.incr and sets expire on the creating increment", async () => {
+test("NucleusCacheClient.incr delegates TTL increments to one atomic primitive", async () => {
   const calls: Array<{ method: string; args: unknown[] }> = [];
   const mockKV = {
     get: async () => null,
     set: async () => { /* noop */ },
     delete: async () => true,
     incr: async (key: string) => { calls.push({ method: "incr", args: [key] }); return 1; },
-    expire: async (key: string, seconds: number) => {
-      calls.push({ method: "expire", args: [key, seconds] });
-      return true;
+    expire: async () => { throw new Error("split expire forbidden"); },
+    incrWithExpiry: async (key: string, seconds: number) => {
+      calls.push({ method: "incrWithExpiry", args: [key, seconds] });
+      return 1;
     },
   };
 
   const cache = new NucleusCacheClient({ kv: mockKV });
   const val = await cache.incr("counter", 60);
   assert.equal(val, 1);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].method, "incr");
-  assert.equal(calls[1].method, "expire");
-  assert.equal(calls[1].args[1], 60);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "incrWithExpiry");
+  assert.equal(calls[0].args[1], 60);
 });
 
 // =========================================================================

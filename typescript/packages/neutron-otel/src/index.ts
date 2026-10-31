@@ -97,6 +97,11 @@ export async function createOpenTelemetryHooks(
       requestSpans.set(event.requestId, span);
     },
     onRequestEnd(event) {
+      for (const spans of [loaderSpans, actionSpans]) {
+        for (const [key, child] of spans) {
+          if (key.startsWith(`${event.requestId.length}:${event.requestId}:`)) { child.end(event.endedAt); spans.delete(key); }
+        }
+      }
       const span = requestSpans.get(event.requestId);
       if (!span) {
         return;
@@ -214,13 +219,13 @@ export async function createOpenTelemetryHooks(
 function loaderSpanKey(
   event: NeutronLoaderStartEvent | NeutronLoaderEndEvent
 ): string {
-  return `${event.requestId}:${event.routeId}`;
+  return `${event.requestId.length}:${event.requestId}:${event.routeId}`;
 }
 
 function actionSpanKey(
   event: NeutronActionStartEvent | NeutronActionEndEvent
 ): string {
-  return `${event.requestId}:${event.routeId}`;
+  return `${event.requestId.length}:${event.requestId}:${event.routeId}`;
 }
 
 function setCommonHttpResultAttributes(

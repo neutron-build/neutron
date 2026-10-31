@@ -222,23 +222,57 @@ export async function getUrl(): Promise<string | null> {
  * // later: sub.remove()
  * ```
  */
+/**
+ * Whether clipboard change monitoring is available at all (an installed
+ * provider that actually emits change events). A no-op subscription is
+ * still returned by addListener when this is false — check this instead of
+ * assuming a live subscription (NF-NR-12).
+ */
+export function isClipboardMonitoringAvailable(): boolean {
+  const expo = getExpoClipboard()
+  if (typeof expo?.addClipboardListener === 'function') return true
+  const community = getCommunityClipboard()
+  if (typeof community?.addListener === 'function') return true
+  return false
+}
+
 export function addListener(
   callback: (content: string) => void,
 ): { remove(): void } {
   const expo = getExpoClipboard()
-  if (expo?.addClipboardListener) {
-    const sub = expo.addClipboardListener(
-      (event: any) => callback(event?.content ?? ''), // eslint-disable-line @typescript-eslint/no-explicit-any
-    )
-    return { remove: () => expo.removeClipboardListener(sub) }
+  if (typeof expo?.addClipboardListener === 'function') {
+    // Expo's clipboard event carries contentTypes, NOT the text itself:
+    // reading `event.content` always produced the empty string (NF-NR-12).
+    // The public API is a string, so a relevant event fetches the text —
+    // fenced by the subscription's generation so a remove()d listener
+    // never delivers a late read.
+    let generation = 0
+    const sub = expo.addClipboardListener((event: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+      const atDispatch = generation
+      const relevant = Array.isArray(event?.contentTypes)
+        ? event.contentTypes.length > 0
+        : true
+      if (!relevant) return
+      void expo.getStringAsync().then((text: string) => {
+        if (generation === atDispatch) callback(text ?? '')
+      }).catch(() => { /* unreadable clipboard: skip this event */ })
+    })
+    return {
+      remove() {
+        generation++
+        try { expo.removeClipboardListener(sub) } catch { /* already gone */ }
+      },
+    }
   }
 
   const community = getCommunityClipboard()
-  if (community?.addListener) {
+  if (typeof community?.addListener === 'function') {
     const sub = community.addListener(callback)
     return { remove: () => sub?.remove?.() }
   }
 
-  // No listener support — return a no-op subscription
+  // Monitoring genuinely unavailable — a no-op handle; callers can detect
+  // this via isClipboardMonitoringAvailable() instead of mistaking it for
+  // a live subscription (NF-NR-12).
   return { remove() {} }
 }

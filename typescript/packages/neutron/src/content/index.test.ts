@@ -105,6 +105,65 @@ describe("content collections", () => {
     expect(types).toContain('"summary"?: string;');
   });
 
+  it("declares a type for every schema construct it understands", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "neutron-content-types-"));
+    tempRoots.push(root);
+    await fs.mkdir(path.join(root, "src", "content", "things"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "src", "content", "config.js"),
+      `
+import { z } from "zod";
+
+export const collections = {
+  things: {
+    type: "data",
+    schema: z.object({
+      name: z.string(),
+      count: z.number(),
+      live: z.boolean().default(true),
+      at: z.date(),
+      tags: z.array(z.string()),
+      note: z.string().nullable(),
+      kind: z.enum(["a", "b"]),
+      exact: z.literal("x"),
+      either: z.union([z.string(), z.number()]),
+      slug: z.string().transform((v) => v.toLowerCase()),
+      parsed: z.preprocess((v) => Number(v), z.number()),
+      checked: z.string().refine((v) => v.length > 0),
+      nested: z.object({ deep: z.string().optional() }),
+      extra: z.any(),
+    }),
+  },
+};
+`,
+      "utf-8"
+    );
+    await prepareContentCollections({ rootDir: root });
+
+    const types = await fs.readFile(
+      path.join(root, "src", "content", ".neutron-content.d.ts"),
+      "utf-8"
+    );
+    for (const field of [
+      '"name": string;',
+      '"count": number;',
+      '"live": boolean;',
+      '"at": Date;',
+      '"tags": string[];',
+      '"note": string | null;',
+      '"kind": "a" | "b";',
+      '"exact": "x";',
+      '"either": string | number;',
+      '"slug": string;',
+      '"parsed": number;',
+      '"checked": string;',
+      '"nested": { "deep"?: string; };',
+      '"extra": unknown;',
+    ]) {
+      expect(types).toContain(field);
+    }
+  });
+
   it("surfaces contextual MDX compile errors on render", async () => {
     const root = await makeBrokenMdxFixtureProject();
     process.chdir(root);
@@ -569,3 +628,74 @@ title: Typed Config
 
   return root;
 }
+
+it('TS-F19 validates live contracts', async () => {
+  const { defineCollection, z } = await import('./index.js');
+  const schema = z.object({ id: z.string() });
+  expect(() => defineCollection({ schema, live: true })).toThrow('type:data');
+  expect(() => defineCollection({ schema, loader: async () => [] })).toThrow('live:true');
+  expect(() => defineCollection({ schema, type: 'data', live: true, loader: async () => [], cacheTtl: Infinity })).toThrow('cacheTtl');
+  expect(() => defineCollection({ schema, type: 'data', live: true, loader: async () => [], cacheTtl: 2_147_483_648 })).toThrow('cacheTtl');
+});
+
+it('TS-F19 loads real live rows, expires TTL, invalidates and requires explicit build snapshots', async () => {
+  const { invalidateContentCollections } = await import('./index.js');
+  const root = await makeFixtureProject();
+  const key = 'finalCLive' + root;
+  const state = { calls: 0, valid: true };
+  (globalThis as any)[key] = state;
+  await fs.writeFile(path.join(root, 'src/content/config.js'), `import { z } from 'zod';
+    export const collections = { remote: { type: 'data', live: true, cacheTtl: 60000,
+      schema: z.object({ id: z.string(), value: z.number() }),
+      loader: async () => { const s = globalThis[${JSON.stringify(key)}]; s.calls++; return [{id:'one', value:s.valid ? s.calls : 'invalid'}]; } } };`);
+  process.chdir(root);
+  try {
+    expect((await getEntry('remote', 'one'))?.data).toEqual({ id: 'one', value: 1 });
+    expect((await getCollection('remote'))[0].data).toEqual({ id: 'one', value: 1 });
+    invalidateContentCollections();
+    expect((await getEntry('remote', 'one'))?.data).toEqual({ id: 'one', value: 2 });
+    const originalNow = Date.now;
+    Date.now = () => originalNow() + 60001;
+    try { expect((await getCollection('remote'))[0].data).toEqual({ id: 'one', value: 3 }); }
+    finally { Date.now = originalNow; }
+    await expect(prepareContentCollections({ rootDir: root, writeManifest: false, writeTypes: false })).rejects.toThrow('snapshotLive:true');
+    await prepareContentCollections({ rootDir: root, snapshotLive: true, writeTypes: false });
+    expect(JSON.parse(await fs.readFile(path.join(root, 'dist/.neutron-content.json'), 'utf8')).collections.remote[0].data.value).toBe(4);
+    state.valid = false; invalidateContentCollections();
+    await expect(getCollection('remote')).rejects.toThrow();
+  } finally { delete (globalThis as any)[key]; }
+});
+
+it('TS-F20 rejects untrusted MDX before evaluating authored JavaScript', async () => {
+  const root = await makeFixtureProject();
+  const config = path.join(root, 'src/content/config.js');
+  const source = await fs.readFile(config, 'utf8');
+  await fs.writeFile(config, source.replace('blog: {', 'blog: { sanitize: true,'));
+  await expect(prepareContentCollections({ rootDir: root, writeManifest: false, writeTypes: false })).rejects.toThrow('Untrusted MDX is not supported');
+});
+
+it.each(['invalidate', 'out-of-order'])('O4 fences %s live refresh publication', async scenario => {
+  const { invalidateContentCollections } = await import('./index.js');
+  const root = await makeFixtureProject();
+  const key = 'finalCRace' + root;
+  let release!: () => void, entered!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  const began = new Promise<void>(resolve => { entered = resolve; });
+  const state = { calls: 0, value: 0, barrier, entered };
+  (globalThis as any)[key] = state;
+  await fs.writeFile(path.join(root, 'src/content/config.js'), `import { z } from 'zod';
+    export const collections = { remote: { type:'data', live:true, cacheTtl:60000,
+      schema:z.object({id:z.string(),value:z.number()}), loader:async()=>{
+        const s=globalThis[${JSON.stringify(key)}]; const call=++s.calls, value=s.value;
+        if(call===1){s.entered();await s.barrier;}return [{id:'one',value}];
+      } } };`);
+  process.chdir(root);
+  try {
+    const old = getCollection('remote'); await began; state.value = 1;
+    if (scenario === 'invalidate') invalidateContentCollections(root);
+    else expect((await getCollection('remote'))[0].data).toMatchObject({ value: 1 });
+    release(); expect((await old)[0].data).toMatchObject({ value: 0 });
+    expect((await getCollection('remote'))[0].data).toMatchObject({ value: 1 });
+    expect(state.calls).toBe(2);
+  } finally { release(); delete (globalThis as any)[key]; }
+});

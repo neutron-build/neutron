@@ -29,11 +29,15 @@ module csrf_lifecycle {
 
     // === ACTIONS ===
 
+    var use_count: TokenId -> int
+    var original_session: TokenId -> SessionId
     action init = all {
         token_state' = TOKEN_IDS.mapBy(t => "invalid"),
         token_session' = TOKEN_IDS.mapBy(t => 0),
         token_ttl' = TOKEN_IDS.mapBy(t => 0),
         cookie_token' = SESSIONS.mapBy(s => -1),
+        use_count' = TOKEN_IDS.mapBy(t => 0),
+        original_session' = TOKEN_IDS.mapBy(t => 0),
         next_token' = 1,
     }
 
@@ -47,6 +51,8 @@ module csrf_lifecycle {
             token_session' = token_session.set(tid, session),
             token_ttl' = token_ttl.set(tid, TOKEN_TTL),
             cookie_token' = cookie_token.set(session, tid),
+            use_count' = use_count,
+            original_session' = original_session.set(tid, session),
             next_token' = next_token + 1,
         }
     }
@@ -67,6 +73,8 @@ module csrf_lifecycle {
         token_session' = token_session,
         token_ttl' = token_ttl,
         cookie_token' = cookie_token,
+        use_count' = use_count.set(form_token, use_count.get(form_token) + 1),
+        original_session' = original_session,
         next_token' = next_token,
     }
 
@@ -84,6 +92,8 @@ module csrf_lifecycle {
         token_session' = token_session,
         token_ttl' = token_ttl,
         cookie_token' = cookie_token,
+        use_count' = use_count,
+        original_session' = original_session,
         next_token' = next_token,
     }
 
@@ -101,6 +111,8 @@ module csrf_lifecycle {
             else token_ttl.get(t)),
         token_session' = token_session,
         cookie_token' = cookie_token,
+        use_count' = use_count,
+        original_session' = original_session,
         next_token' = next_token,
     }
 
@@ -131,12 +143,13 @@ module csrf_lifecycle {
     // Used tokens cannot be reused (no replay attacks)
     val no_replay: bool =
         TOKEN_IDS.forall(t =>
-            token_state.get(t) == "used" implies token_state.get(t) != "active"
+            use_count.get(t) <= 1 and (use_count.get(t) > 0 implies token_state.get(t) == "used")
         )
 
     // Cross-session isolation: a token for session A cannot validate for session B.
     // An active token owned by s1 is never the cookie token of a different session s2.
     val session_isolation: bool =
+        TOKEN_IDS.forall(t => token_session.get(t) == original_session.get(t)) and
         SESSIONS.forall(s1 => SESSIONS.forall(s2 =>
             s1 != s2 implies
             TOKEN_IDS.forall(t =>

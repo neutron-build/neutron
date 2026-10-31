@@ -22,7 +22,7 @@
  * </GestureDetector>
  */
 
-import React, { type ReactNode, useMemo } from 'react'
+import React, { type ReactNode, useEffect, useMemo } from 'react'
 import { View, PanResponder, type GestureResponderEvent, type PanResponderGestureState } from 'react-native'
 import type {
   GestureConfig, GestureEvent, PanGestureEvent, PinchGestureEvent,
@@ -79,19 +79,23 @@ function isComposed(g: GestureConfig | ComposedGesture): g is ComposedGesture {
  * Build a PanResponder that dispatches to the appropriate gesture callbacks.
  * This is used when react-native-gesture-handler is not installed.
  *
- * Limitations of the fallback:
- * - Only one gesture can be active at a time (no true simultaneous recognition)
- * - Pinch and rotation require two touches and are approximated
- * - No native-thread worklet execution
- * - Tap detection uses timing heuristics
+ * DELIBERATELY LIMITED ADAPTER (NF-NR-06) — no native/worklet parity:
+ * - One continuous gesture owns a touch sequence (first-activation-wins
+ *   arbitration); `simultaneous` compositions that overlap two CONTINUOUS
+ *   gestures throw instead of silently dropping one.
+ * - Pinch re-baselines at pointer-count transitions and ACCUMULATES scale
+ *   across finger lifts/replacements; end events RETAIN the last values.
+ * - Pan activation honors minDistance/activeOffsetX/Y and fails on
+ *   failOffsetX/Y before activation; fling honors its configured direction.
+ * - A detector whose every gesture is disabled never claims a touch.
+ * - Long-press timers are cleared on termination; `cleanup()` must be called
+ *   from the owning component's effect teardown (GestureDetector does).
  */
 function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
-  // Flatten composed gestures — in fallback mode, we process sequentially
   const gestures: AnyGestureConfig[] = isComposed(config)
     ? config.gestures
     : [config]
 
-  // Find the primary gesture for each type
   const panGesture = gestures.find((g) => g.type === 'pan') as PanGesture | undefined
   const tapGesture = gestures.find((g) => g.type === 'tap') as TapGesture | undefined
   const longPressGesture = gestures.find((g) => g.type === 'longPress') as LongPressGesture | undefined
@@ -99,17 +103,37 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
   const pinchGesture = gestures.find((g) => g.type === 'pinch') as PinchGesture | undefined
   const rotationGesture = gestures.find((g) => g.type === 'rotation') as RotationGesture | undefined
 
-  // State tracking
+  // Explicit unsupported case: simultaneous recognition of two continuous
+  // gestures is not implementable on this adapter — refuse loudly.
+  if (isComposed(config) && config.type === 'simultaneous') {
+    const continuous = gestures.filter(g => g.type === 'pan' || g.type === 'pinch' || g.type === 'rotation')
+    if (continuous.length >= 2) {
+      throw new Error(
+        'Gesture.Simultaneous over two continuous gestures (pan/pinch/rotation) requires react-native-gesture-handler; ' +
+        'the PanResponder fallback arbitrates exactly one continuous gesture per touch sequence.',
+      )
+    }
+  }
+
+  const enabledGestures = gestures.filter(g => g.enabled !== false)
+  const anyEnabled = () => enabledGestures.length > 0
+
+  // ── per-touch-sequence state ──
   let touchStartTime = 0
-  // touchStartX/Y tracked via PanResponder's gestureState (gs.x0, gs.y0)
   let activatedGestureType: string | null = null
   let longPressTimer: ReturnType<typeof setTimeout> | null = null
   let tapCount = 0
   let lastTapTime = 0
 
-  // Multi-touch tracking for pinch/rotation
-  let initialPinchDistance = 0
-  let initialRotationAngle = 0
+  // Pinch/rotation: baseline re-captured at every pointer-count transition;
+  // accumulated values survive finger lifts and are RETAINED on end.
+  let baselinePinchDistance = 0
+  let baselineRotationAngle = 0
+  let lastPointerCount = 0
+  let accumulatedScale = 1
+  let accumulatedRotation = 0
+  let pinchStarted = false
+  let rotationStarted = false
 
   function makeBaseEvent(evt: GestureResponderEvent, gs: PanResponderGestureState): GestureEvent {
     return {
@@ -154,10 +178,71 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
     }
   }
 
-  return PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
+  /** Re-baseline pinch/rotation when the pointer count changes: a finger
+   * arriving AFTER grant must not report a jump — the new pair becomes the
+   * baseline and accumulation continues from the retained values. */
+  function trackPointers(evt: GestureResponderEvent, gs: PanResponderGestureState): void {
+    const touches = (evt.nativeEvent as any).touches
+    const count = Math.min(gs.numberActiveTouches, touches?.length ?? gs.numberActiveTouches)
+    if (count !== lastPointerCount) {
+      lastPointerCount = count
+      if (touches && touches.length >= 2) {
+        baselinePinchDistance = getDistance(touches)
+        baselineRotationAngle = getAngle(touches)
+      }
+    }
+  }
+
+  function panActivationEvent(_evt: GestureResponderEvent, gs: PanResponderGestureState): boolean {
+    // Pan activation thresholds (NF-NR-06): minDistance OR an activeOffset
+    // axis bound; failOffset bounds refuse activation outright. Offsets may
+    // be a signed pair — a negative bound measures the negative direction.
+    const bound = (value: number | [number, number] | undefined, delta: number): boolean => {
+      if (value == null) return false
+      if (typeof value === 'number') return Math.abs(delta) >= Math.abs(value)
+      return value.some(b => b > 0 ? delta >= b : delta <= b)
+    }
+    const failed = (value: number | [number, number] | undefined, delta: number): boolean => {
+      if (value == null) return false
+      if (typeof value === 'number') return Math.abs(delta) > Math.abs(value)
+      return value.some(b => b > 0 ? delta > b : delta < b)
+    }
+    if (failed(panGesture!.failOffsetX, gs.dx)) return false
+    if (failed(panGesture!.failOffsetY, gs.dy)) return false
+    const minDist = panGesture!.minDistance ?? 10
+    const dist = Math.sqrt(gs.dx * gs.dx + gs.dy * gs.dy)
+    if (dist >= minDist) return true
+    if (bound(panGesture!.activeOffsetX, gs.dx)) return true
+    if (bound(panGesture!.activeOffsetY, gs.dy)) return true
+    return false
+  }
+
+  function flingDirectionMatches(gesture: FlingGesture, gs: PanResponderGestureState): boolean {
+    const dir = gesture.direction
+    if (!dir) return true
+    switch (dir) {
+      case 'right': return gs.vx > 0
+      case 'left': return gs.vx < 0
+      case 'up': return gs.vy < 0
+      case 'down': return gs.vy > 0
+      default: return true
+    }
+  }
+
+  function resetSequence(): void {
+    activatedGestureType = null
+    pinchStarted = false
+    rotationStarted = false
+    lastPointerCount = 0
+    // accumulatedScale/accumulatedRotation are RETAINED across sequences by
+    // design: they represent the gesture's last known values (NF-NR-06).
+  }
+
+  const responder = PanResponder.create({
+    // A detector whose every gesture is disabled must not claim any touch.
+    onStartShouldSetPanResponder: () => anyEnabled(),
     onMoveShouldSetPanResponder: (_evt, gs) => {
-      // Only claim movement if we have a pan/pinch/rotation gesture configured
+      if (!anyEnabled()) return false
       if (panGesture || pinchGesture || rotationGesture) {
         const minDist = panGesture?.minDistance ?? 10
         return Math.abs(gs.dx) > minDist || Math.abs(gs.dy) > minDist || gs.numberActiveTouches >= 2
@@ -166,17 +251,12 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
     },
     onPanResponderGrant: (evt, gs) => {
       touchStartTime = Date.now()
-      // Touch start coords available via gs.x0, gs.y0
       activatedGestureType = null
+      pinchStarted = false
+      rotationStarted = false
+      lastPointerCount = 0
+      trackPointers(evt, gs)
 
-      // Multi-touch init
-      const touches = (evt.nativeEvent as any).touches
-      if (touches && touches.length >= 2) {
-        initialPinchDistance = getDistance(touches)
-        initialRotationAngle = getAngle(touches)
-      }
-
-      // Set up long press timer
       if (longPressGesture && longPressGesture.enabled !== false) {
         const minDuration = longPressGesture.minDuration ?? 500
         longPressTimer = setTimeout(() => {
@@ -188,74 +268,81 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
         }, minDuration)
       }
 
-      // Fire onBegin for all configured gestures
       const base = makeBaseEvent(evt, gs)
       base.state = 'began'
-      for (const g of gestures) {
-        if (g.enabled !== false) g.onBegin?.(base as any)
+      for (const g of enabledGestures) {
+        g.onBegin?.(base as any)
       }
     },
     onPanResponderMove: (evt, gs) => {
-      clearLongPress()
+      // Movement cancels a pending (not yet fired) long press.
+      if (activatedGestureType !== 'longPress') clearLongPress()
 
+      trackPointers(evt, gs)
       const touches = (evt.nativeEvent as any).touches
       const numTouches = gs.numberActiveTouches
 
-      // Handle pinch (2+ fingers)
+      // Pinch — baselines re-captured at pointer transitions, values accumulate.
       if (numTouches >= 2 && pinchGesture && pinchGesture.enabled !== false && touches?.length >= 2) {
         if (activatedGestureType === null || activatedGestureType === 'pinch') {
           activatedGestureType = 'pinch'
           const currentDist = getDistance(touches)
-          const scale = initialPinchDistance > 0 ? currentDist / initialPinchDistance : 1
+          if (baselinePinchDistance > 0) {
+            accumulatedScale *= currentDist / baselinePinchDistance
+          }
+          baselinePinchDistance = currentDist
 
           const pinchEvt: PinchGestureEvent = {
             ...makeBaseEvent(evt, gs),
-            scale,
-            velocity: 0, // Would need frame delta tracking for velocity
+            scale: accumulatedScale,
+            velocity: 0,
             focalX: (touches[0].pageX + touches[1].pageX) / 2,
             focalY: (touches[0].pageY + touches[1].pageY) / 2,
           }
-
-          if (pinchGesture.onStart) {
-            pinchGesture.onStart(pinchEvt)
+          if (!pinchStarted) {
+            pinchStarted = true  // exactly one start per sequence
+            pinchGesture.onStart?.(pinchEvt)
           }
           pinchGesture.onUpdate?.(pinchEvt)
           return
         }
       }
 
-      // Handle rotation (2+ fingers)
+      // Rotation — same transition/accumulation rules as pinch.
       if (numTouches >= 2 && rotationGesture && rotationGesture.enabled !== false && touches?.length >= 2) {
         if (activatedGestureType === null || activatedGestureType === 'rotation') {
           activatedGestureType = 'rotation'
           const currentAngle = getAngle(touches)
-          const rotation = currentAngle - initialRotationAngle
+          accumulatedRotation += currentAngle - baselineRotationAngle
+          baselineRotationAngle = currentAngle
 
           const rotEvt: RotationGestureEvent = {
             ...makeBaseEvent(evt, gs),
-            rotation,
+            rotation: accumulatedRotation,
             velocity: 0,
             anchorX: (touches[0].pageX + touches[1].pageX) / 2,
             anchorY: (touches[0].pageY + touches[1].pageY) / 2,
           }
-
+          if (!rotationStarted) {
+            rotationStarted = true
+            rotationGesture.onStart?.(rotEvt)
+          }
           rotationGesture.onUpdate?.(rotEvt)
           return
         }
       }
 
-      // Handle pan (single or multi-finger drag)
-      if (panGesture && panGesture.enabled !== false) {
-        const minDist = panGesture.minDistance ?? 10
-        const dist = Math.sqrt(gs.dx * gs.dx + gs.dy * gs.dy)
-
-        if (dist >= minDist) {
-          if (activatedGestureType === null) {
-            activatedGestureType = 'pan'
-            const startEvt = makePanEvent(evt, gs)
-            startEvt.state = 'active'
-            panGesture.onStart?.(startEvt)
-          }
+      // Pan — config-enforced activation, started exactly once.
+      if (panGesture && panGesture.enabled !== false && (panGesture.maxPointers == null || numTouches <= panGesture.maxPointers)) {
+        if (activatedGestureType === null && panActivationEvent(evt, gs)) {
+          activatedGestureType = 'pan'
+          const startEvt = makePanEvent(evt, gs)
+          startEvt.state = 'active'
+          panGesture.onStart?.(startEvt)
+          panGesture.onUpdate?.(makePanEvent(evt, gs))
+          return
+        }
+        if (activatedGestureType === 'pan') {
           panGesture.onUpdate?.(makePanEvent(evt, gs))
         }
       }
@@ -267,19 +354,20 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
       const base = makeBaseEvent(evt, gs)
       base.state = 'end'
 
-      // Check for fling
+      // Fling — velocity threshold AND the configured direction.
       if (flingGesture && flingGesture.enabled !== false && activatedGestureType === null) {
         const speed = Math.sqrt(gs.vx * gs.vx + gs.vy * gs.vy)
-        if (speed > 0.5 && dist > 50) {
+        if (speed > 0.5 && dist > 50 && flingDirectionMatches(flingGesture, gs)) {
           activatedGestureType = 'fling'
           flingGesture.onStart?.(base)
           flingGesture.onEnd?.(base)
           flingGesture.onFinalize?.(base)
+          resetSequence()
           return
         }
       }
 
-      // Check for tap
+      // Tap
       if (tapGesture && tapGesture.enabled !== false && activatedGestureType === null) {
         const maxDuration = tapGesture.maxDuration ?? 300
         const maxDist = tapGesture.maxDistance ?? 10
@@ -301,73 +389,80 @@ function buildPanResponderFromConfig(config: GestureConfig | ComposedGesture) {
             tapGesture.onStart?.(base)
             tapGesture.onEnd?.(base)
             tapGesture.onFinalize?.(base)
+            resetSequence()
             return
           }
         }
       }
 
-      // Handle long press end
+      // Terminal states dispatch ONLY to the owning gesture, and pinch/
+      // rotation end events RETAIN the accumulated values.
       if (activatedGestureType === 'longPress' && longPressGesture) {
         longPressGesture.onEnd?.(base)
         longPressGesture.onFinalize?.(base)
+        resetSequence()
         return
       }
 
-      // Handle pinch end
       if (activatedGestureType === 'pinch' && pinchGesture) {
-        const touches = (evt.nativeEvent as any).touches ?? []
         const pinchEnd: PinchGestureEvent = {
           ...base,
-          scale: touches.length >= 2
-            ? getDistance(touches) / (initialPinchDistance || 1)
-            : 1,
+          scale: accumulatedScale,
           velocity: 0,
           focalX: base.absoluteX,
           focalY: base.absoluteY,
         }
         pinchGesture.onEnd?.(pinchEnd)
         pinchGesture.onFinalize?.(pinchEnd)
+        resetSequence()
         return
       }
 
-      // Handle rotation end
       if (activatedGestureType === 'rotation' && rotationGesture) {
         const rotEnd: RotationGestureEvent = {
           ...base,
-          rotation: 0,
+          rotation: accumulatedRotation,
           velocity: 0,
           anchorX: base.absoluteX,
           anchorY: base.absoluteY,
         }
         rotationGesture.onEnd?.(rotEnd)
         rotationGesture.onFinalize?.(rotEnd)
+        resetSequence()
         return
       }
 
-      // Handle pan end
       if (activatedGestureType === 'pan' && panGesture) {
         const panEnd = makePanEvent(evt, gs)
         panEnd.state = 'end'
         panGesture.onEnd?.(panEnd)
         panGesture.onFinalize?.(panEnd)
+        resetSequence()
         return
       }
 
-      // Finalize all gestures
-      for (const g of gestures) {
-        if (g.enabled !== false) g.onFinalize?.(base as any)
+      for (const g of enabledGestures) {
+        g.onFinalize?.(base as any)
       }
+      resetSequence()
     },
     onPanResponderTerminate: (evt, gs) => {
       clearLongPress()
       const base = makeBaseEvent(evt, gs)
       base.state = 'cancelled'
-      for (const g of gestures) {
-        if (g.enabled !== false) g.onFinalize?.(base as any)
+      for (const g of enabledGestures) {
+        g.onFinalize?.(base as any)
       }
-      activatedGestureType = null
+      resetSequence()
     },
   })
+
+  return {
+    panHandlers: responder.panHandlers,
+    /** Lifecycle cleanup for the owning component (NF-NR-06): clears any
+     * pending long-press timer when the detector unmounts or is replaced. */
+    cleanup: clearLongPress,
+  }
 }
 
 // ─── RNGH Native Gesture Builder ─────────────────────────────────────────────
@@ -431,23 +526,100 @@ function buildRNGHGesture(config: AnyGestureConfig): any {
       const lpCfg = config as LongPressGesture
       gesture = RNGesture.LongPress()
       if (lpCfg.minDuration != null) gesture = gesture.minDuration(lpCfg.minDuration)
-      if (lpCfg.maxDistance != null) gesture = gesture.maxDist(lpCfg.maxDistance)
+      // RNGH 2's builder method is `maxDistance` — `maxDist` does not exist
+      // and calling it throws at build time (NF-NR-05).
+      if (lpCfg.maxDistance != null) gesture = gesture.maxDistance(lpCfg.maxDistance)
       break
     }
     default:
       return null
   }
 
-  // Attach common callbacks
+  // Interaction relations (NF-NR-05): stored by the builders, and now
+  // actually forwarded through the provider's own composition graph.
+  // Entries may arrive as builders or raw configs — resolve both.
+  const resolveEntry = (entry: unknown): AnyGestureConfig | null => {
+    const resolved = entry && typeof entry === 'object' && 'build' in entry && typeof (entry as { build?: unknown }).build === 'function'
+      ? (entry as { build(): AnyGestureConfig }).build()
+      : entry as AnyGestureConfig
+    return resolved ?? null
+  }
+  if (config.simultaneousWith && config.simultaneousWith.length > 0) {
+    const others = config.simultaneousWith
+      .map(resolveEntry)
+      .filter((entry): entry is AnyGestureConfig => entry !== null)
+      .map(buildRNGHGesture)
+      .filter(Boolean)
+    if (others.length > 0) gesture = RNGesture.Simultaneous(gesture, ...others)
+  }
+  if (config.requireExternalFailure && config.requireExternalFailure.length > 0) {
+    for (const external of config.requireExternalFailure) {
+      const resolved = resolveEntry(external)
+      if (!resolved) continue
+      const required = buildRNGHGesture(resolved)
+      if (required) gesture = gesture.requireToFail(required)
+    }
+  }
+
+  // Attach common callbacks. Neutron's public contract is STRING gesture
+  // states; RNGH events carry numeric State constants — normalize on the
+  // boundary so the event shape is provider-independent (NF-NR-05).
   if (config.enabled === false) gesture = gesture.enabled(false)
-  if (config.onBegin) gesture = gesture.onBegin(config.onBegin)
-  if (config.onStart) gesture = gesture.onStart(config.onStart)
-  if (config.onUpdate) gesture = gesture.onUpdate(config.onUpdate)
-  if (config.onEnd) gesture = gesture.onEnd(config.onEnd)
-  if (config.onFinalize) gesture = gesture.onFinalize(config.onFinalize)
+  if (config.onBegin) gesture = gesture.onBegin((event: unknown) => config.onBegin!(normalizeRNGHEvent(event, rngh, 'began')))
+  if (config.onStart) gesture = gesture.onStart((event: unknown) => config.onStart!(normalizeRNGHEvent(event, rngh, 'active')))
+  if (config.onUpdate) gesture = gesture.onUpdate((event: unknown) => config.onUpdate!(normalizeRNGHEvent(event, rngh, 'active')))
+  if (config.onEnd) gesture = gesture.onEnd((event: unknown, success: boolean) => config.onEnd!(normalizeRNGHEvent(event, rngh, success ? 'end' : 'cancelled')))
+  if (config.onFinalize) gesture = gesture.onFinalize((event: unknown, success: boolean) => config.onFinalize!(normalizeRNGHEvent(event, rngh, success ? 'end' : 'cancelled')))
   if (config.hitSlop != null) gesture = gesture.hitSlop(config.hitSlop)
 
   return gesture
+}
+
+/**
+ * Map an RNGH numeric State constant onto Neutron's string GestureState.
+ * The mapping table covers the whole RNGH State enum; unknown values fall
+ * back to the lifecycle phase implied by the callback that received them.
+ */
+const RNGH_STATE_TO_STRING: Record<number, GestureState> = {}
+function normalizeRNGHEvent(event: any, rngh: any, phaseFallback: GestureState): any {
+  const State = rngh?.State
+  if (RNGH_STATE_TO_STRING[0] === undefined && State) {
+    RNGH_STATE_TO_STRING[State.UNDETERMINED] = 'undetermined'
+    RNGH_STATE_TO_STRING[State.BEGAN] = 'began'
+    RNGH_STATE_TO_STRING[State.ACTIVE] = 'active'
+    RNGH_STATE_TO_STRING[State.END] = 'end'
+    RNGH_STATE_TO_STRING[State.CANCELLED] = 'cancelled'
+    RNGH_STATE_TO_STRING[State.FAILED] = 'failed'
+  }
+  const native = event?.nativeEvent ?? event ?? {}
+  const state: GestureState = RNGH_STATE_TO_STRING[native.state] ?? phaseFallback
+  const normalized: GestureEvent = {
+    state,
+    absoluteX: native.absoluteX ?? 0,
+    absoluteY: native.absoluteY ?? 0,
+    x: native.x ?? 0,
+    y: native.y ?? 0,
+    numberOfPointers: native.numberOfPointers ?? 1,
+  }
+  // Enrich with pan/pinch/rotation fields when the provider supplied them.
+  if (native.translationX != null || native.translationY != null) {
+    return {
+      ...normalized,
+      translationX: native.translationX ?? 0,
+      translationY: native.translationY ?? 0,
+      velocityX: native.velocityX ?? 0,
+      velocityY: native.velocityY ?? 0,
+    } as PanGestureEvent
+  }
+  if (native.scale != null || native.rotation != null) {
+    return {
+      ...normalized,
+      scale: native.scale ?? 1,
+      rotation: native.rotation ?? 0,
+      velocity: native.velocity ?? 0,
+    } as unknown as GestureEvent
+  }
+  return normalized
 }
 
 /**
@@ -458,7 +630,10 @@ function buildRNGHComposed(composed: ComposedGesture): any {
   if (!rngh) return null
 
   const RNGesture = rngh.Gesture
-  const builtGestures = composed.gestures.map(buildRNGHGesture).filter(Boolean)
+  const builtGestures = composed.gestures
+    .filter((g): g is AnyGestureConfig => g !== null && g !== undefined)
+    .map(buildRNGHGesture)
+    .filter(Boolean)
   if (builtGestures.length === 0) return null
 
   switch (composed.type) {
@@ -531,6 +706,12 @@ export function GestureDetector({ gesture, children }: GestureDetectorProps) {
     () => buildPanResponderFromConfig(resolved),
     [resolved],
   )
+
+  // Long-press timers are tied to React lifecycle (NF-NR-06): unmount or
+  // gesture replacement clears any pending timer.
+  useEffect(() => {
+    return () => { panResponder.cleanup() }
+  }, [panResponder])
 
   return React.createElement(
     View,

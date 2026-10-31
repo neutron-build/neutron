@@ -1,3 +1,4 @@
+import { bindPathParams, parseUrlPath, comparePathSpecificity } from "../core/route-path.js";
 import { hydrate, render, h, ComponentType } from "preact";
 import {
   LoaderContext,
@@ -10,6 +11,8 @@ import {
 import {
   getCurrentPath,
   getCurrentSearch,
+  getNavigationGeneration,
+  subscribeNavigationStart,
   subscribe,
   navigate,
   dataRedirectTarget,
@@ -229,8 +232,13 @@ export async function init(): Promise<"static" | void> {
     void handleIncomingDataUpdate(data);
   });
   
+  subscribeNavigationStart(() => {
+    activeNavigationController?.abort();
+    activeNavigationController = null;
+    latestNavigationRequestId++;
+  });
   subscribe((event) => {
-    return handleNavigation(event.forceRevalidate === true);
+    return handleNavigation(event.forceRevalidate === true, event.generation);
   });
 
   // Warm navigations before the click lands. This is what makes a same-origin
@@ -283,19 +291,19 @@ export async function init(): Promise<"static" | void> {
 }
 
 async function handleIncomingDataUpdate(data: LoaderData): Promise<void> {
-  const pathname = getCurrentPath();
-  const route = findRoute(pathname);
-  if (route) {
-    currentRoute = route;
-    layouts = getLayoutChain(route);
-    await ensureRouteChainModules([...layouts, route]);
-  }
-
+  const nextUrl = getCurrentPath() + getCurrentSearch();
+  const identity = getNavigationGeneration();
+  const requestId = latestNavigationRequestId;
+  // Submit/revalidate data belongs to the committed document. A pending
+  // destination may need a different layout chain and complete loader diff.
+  if (nextUrl !== currentUrl || !currentRoute) return;
+  await ensureRouteChainModules([...layouts, currentRoute]);
+  if (identity !== getNavigationGeneration() || requestId !== latestNavigationRequestId || nextUrl !== currentUrl) return;
   applyData(data);
 }
 
 function findRoute(pathname: string): RouteInfo | null {
-  for (const route of routes) {
+  for (const route of [...routes].sort((a, b) => comparePathSpecificity(a.path, b.path))) {
     if (route.isLayout || route.isNotFound) continue;
     if (matchPath(route.path, pathname)) {
       return route;
@@ -346,20 +354,7 @@ function markStaticLinks(): void {
 }
 
 function matchPath(pattern: string, pathname: string): boolean {
-  if (pattern === pathname) return true;
-  
-  const patternParts = pattern.split("/").filter(Boolean);
-  const pathParts = pathname.split("/").filter(Boolean);
-  
-  if (patternParts.length !== pathParts.length) return false;
-  
-  for (let i = 0; i < patternParts.length; i++) {
-    const p = patternParts[i];
-    if (p.startsWith(":") || p === "*") continue;
-    if (p !== pathParts[i]) return false;
-  }
-  
-  return true;
+  try { return bindPathParams(pattern, parseUrlPath(decodeURIComponent(pathname))) !== null; } catch { return false; }
 }
 
 function getLayoutChain(route: RouteInfo): RouteInfo[] {
@@ -606,23 +601,7 @@ function safeDecodeSegment(segment: string | undefined): string {
 }
 
 function extractParams(pattern: string, pathname: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  const patternParts = pattern.split("/").filter(Boolean);
-  const pathParts = pathname.split("/").filter(Boolean);
-
-  for (let i = 0; i < patternParts.length; i++) {
-    const p = patternParts[i];
-    if (p.startsWith(":")) {
-      // Match the server, which decodes the request path before routing —
-      // otherwise useParams differs pre/post hydration for encoded segments.
-      params[p.slice(1)] = safeDecodeSegment(pathParts[i]);
-    } else if (p === "*") {
-      params["*"] = pathParts.slice(i).map(safeDecodeSegment).join("/");
-      break;
-    }
-  }
-
-  return params;
+  try { return bindPathParams(pattern, parseUrlPath(decodeURIComponent(pathname))) ?? {}; } catch { return {}; }
 }
 
 // Redirects followed in a row by the client router; reset by any navigation
@@ -630,7 +609,7 @@ function extractParams(pattern: string, pathname: string): Record<string, string
 const MAX_DATA_REDIRECTS = 20;
 let consecutiveDataRedirects = 0;
 
-async function handleNavigation(forceRevalidate: boolean = false) {
+async function handleNavigation(forceRevalidate: boolean = false, navigationIdentity = getNavigationGeneration()) {
   const pathname = getCurrentPath();
   const search = getCurrentSearch();
   const nextUrl = pathname + search;
@@ -638,6 +617,12 @@ async function handleNavigation(forceRevalidate: boolean = false) {
   if (!forceRevalidate && nextUrl === currentUrl) {
     return;
   }
+
+  activeNavigationController?.abort();
+  const controller = new AbortController();
+  activeNavigationController = controller;
+  const requestId = ++latestNavigationRequestId;
+  const isCurrent = () => !controller.signal.aborted && requestId === latestNavigationRequestId && navigationIdentity === getNavigationGeneration() && window.location.pathname + window.location.search === nextUrl;
 
   const previousUrl = currentUrl;
   const previousPathname = toPathname(previousUrl) || pathname;
@@ -672,11 +657,18 @@ async function handleNavigation(forceRevalidate: boolean = false) {
     ? nextSnapshots.map((snapshot) => snapshot.id)
     : diffRequestedRouteIds(previousSnapshots, nextSnapshots);
 
-  currentRoute = route;
-  layouts = nextLayouts;
-  currentUrl = nextUrl;
+  // currentRoute/layouts/currentUrl describe the data that actually committed,
+  // never a destination whose chunks or loader response are still pending.
+  const commit = (data: LoaderData) => {
+    if (!isCurrent()) return;
+    currentRoute = route;
+    layouts = nextLayouts;
+    currentUrl = nextUrl;
+    applyData(data);
+  };
   try {
     await ensureRouteChainModules([...nextLayouts, route]);
+    if (!isCurrent()) return;
   } catch (error) {
     // A deploy replaces every hashed chunk and the old ones stop existing, so a
     // tab open across a release asks for a file that is gone and the import
@@ -690,23 +682,12 @@ async function handleNavigation(forceRevalidate: boolean = false) {
     if (typeof console !== "undefined") {
       console.warn("neutron: route chunk failed to load, falling back to a full navigation", error);
     }
-    window.location.assign(nextUrl);
+    if (isCurrent()) window.location.assign(nextUrl);
     return;
   }
 
   const prefetched = forceRevalidate ? null : takePrefetch(nextUrl);
   if (prefetched) {
-    // Claim this navigation before doing anything async. An in-flight fetch
-    // from a previous click is still holding the old request id, and it only
-    // discards its result when a NEWER id exists. Without these two lines it
-    // would land after this render and overwrite the page the user is now on
-    // with the data for the page they left.
-    if (activeNavigationController) {
-      activeNavigationController.abort();
-      activeNavigationController = null;
-    }
-    const requestId = ++latestNavigationRequestId;
-
     // CSS should already be loaded from the prefetch, but a route whose
     // stylesheet was evicted or never fetched still must not paint unstyled.
     const prefetchCss = (prefetched as Record<string, unknown>).__css__;
@@ -715,19 +696,21 @@ async function handleNavigation(forceRevalidate: boolean = false) {
         await loadMissingStylesheets(prefetchCss as string[]);
       } catch {
         // CSS timeout — fall back to full page load (guaranteed no FOUC)
-        window.location.href = nextUrl;
+        if (isCurrent()) window.location.href = nextUrl;
         return;
       }
       delete (prefetched as Record<string, unknown>).__css__;
-      if (requestId !== latestNavigationRequestId) {
+      if (!isCurrent()) {
         return;
       }
     }
     const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, prefetched);
-    applyData(merged);
+    commit(merged);
     if (Array.isArray(prefetchCss)) {
       unloadUnusedStylesheets(prefetchCss as string[], requestId);
     }
+    setNavigationState({ state: "idle" });
+    if (activeNavigationController === controller) activeNavigationController = null;
     // Same contract as the fetched path: a new page starts at the top. Leaving
     // this out made a warmed navigation land mid-page, so whether scrolling
     // worked depended on whether the link happened to be prefetched.
@@ -736,14 +719,6 @@ async function handleNavigation(forceRevalidate: boolean = false) {
     }
     return;
   }
-
-  if (activeNavigationController) {
-    activeNavigationController.abort();
-  }
-
-  const controller = new AbortController();
-  activeNavigationController = controller;
-  const requestId = ++latestNavigationRequestId;
 
   setNavigationState({
     state: "loading",
@@ -764,21 +739,18 @@ async function handleNavigation(forceRevalidate: boolean = false) {
       signal: controller.signal,
     });
 
-    if (controller.signal.aborted || requestId !== latestNavigationRequestId) {
+    if (!isCurrent()) {
       return;
     }
 
     // The URL redirected (loader, middleware or a config rule). Its data is
     // not this URL's, and the redirect target may lose the address bar's
     // query if rendered in place, so navigate to the target instead,
-    // replacing the entry that redirected. The route state goes back to the
-    // page actually on screen first: the target's layout diff must be taken
-    // against what was rendered, not against the chain that never loaded.
+    // replacing the entry that redirected. The route state still describes
+    // the page on screen (it changes only at commit), so the target's layout
+    // diff is taken against what was rendered.
     const redirectTo = dataRedirectTarget(response);
     if (redirectTo !== null) {
-      currentRoute = previousRoute;
-      layouts = previousLayouts;
-      currentUrl = previousUrl;
       if (++consecutiveDataRedirects > MAX_DATA_REDIRECTS) {
         // A loop: hand it to the browser, which reports it.
         consecutiveDataRedirects = 0;
@@ -792,6 +764,7 @@ async function handleNavigation(forceRevalidate: boolean = false) {
 
     if (response.ok) {
       const payload = await response.json();
+      if (!isCurrent()) return;
       const data = decodeLoaderDataPayload(payload);
 
       // Load CSS for the new route before DOM swap
@@ -801,19 +774,19 @@ async function handleNavigation(forceRevalidate: boolean = false) {
           await loadMissingStylesheets(cssUrls as string[]);
         } catch {
           // CSS timeout — fall back to full page load (guaranteed no FOUC)
-          window.location.href = nextUrl;
+          if (isCurrent()) window.location.href = nextUrl;
           return;
         }
         delete (data as Record<string, unknown>).__css__;
 
         // Re-check: another navigation may have started while CSS was loading
-        if (requestId !== latestNavigationRequestId) {
+        if (!isCurrent()) {
           return;
         }
       }
 
       const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, data);
-      applyData(merged);
+      commit(merged);
       if (Array.isArray(cssUrls)) {
         unloadUnusedStylesheets(cssUrls as string[], requestId);
       }
@@ -824,12 +797,12 @@ async function handleNavigation(forceRevalidate: boolean = false) {
       window.location.reload();
     }
   } catch (error) {
-    if (controller.signal.aborted || requestId !== latestNavigationRequestId) {
+    if (!isCurrent()) {
       return;
     }
     window.location.reload();
   } finally {
-    if (requestId === latestNavigationRequestId) {
+    if (isCurrent()) {
       setNavigationState({ state: "idle" });
       if (activeNavigationController === controller) {
         activeNavigationController = null;
@@ -847,10 +820,10 @@ function buildRouteSnapshots(
   chain: RouteInfo[],
   pathname: string
 ): RouteSnapshot[] {
-  return chain.map((route) => ({
-    id: route.id,
-    params: extractParams(route.path, pathname),
-  }));
+  // Server layout loaders receive the full matched leaf params. Comparing
+  // layout patterns exactly to a longer URL silently produces empty params.
+  const params = chain.length ? extractParams(chain[chain.length - 1].path, pathname) : {};
+  return chain.map(route => ({ id: route.id, params: { ...params } }));
 }
 
 function diffRequestedRouteIds(

@@ -223,11 +223,14 @@ impl MetricsStore {
             for (label, hist) in entries {
                 let m = &label.method;
                 let p = &label.path;
-                let mut cumulative = 0u64;
+                // `observe` already increments every bucket whose bound
+                // contains the value (cumulative storage), so each bucket
+                // counter is rendered directly. Re-cumulating here used to
+                // double-count: finite buckets could exceed +Inf/count.
                 for (bound, counter) in &hist.buckets {
-                    cumulative += counter.load(Ordering::Relaxed);
                     out.push_str(&format!(
-                        "http_request_duration_seconds_bucket{{method=\"{m}\",path=\"{p}\",le=\"{bound}\"}} {cumulative}\n"
+                        "http_request_duration_seconds_bucket{{method=\"{m}\",path=\"{p}\",le=\"{bound}\"}} {}\n",
+                        counter.load(Ordering::Relaxed)
                     ));
                 }
                 let total = hist.count.load(Ordering::Relaxed);
@@ -254,11 +257,12 @@ impl MetricsStore {
             for (label, hist) in entries {
                 let m = &label.method;
                 let p = &label.path;
-                let mut cumulative = 0u64;
+                // Same cumulative-storage contract as the duration
+                // histogram above: render bucket counters directly.
                 for (bound, counter) in &hist.buckets {
-                    cumulative += counter.load(Ordering::Relaxed);
                     out.push_str(&format!(
-                        "http_response_size_bytes_bucket{{method=\"{m}\",path=\"{p}\",le=\"{bound}\"}} {cumulative}\n"
+                        "http_response_size_bytes_bucket{{method=\"{m}\",path=\"{p}\",le=\"{bound}\"}} {}\n",
+                        counter.load(Ordering::Relaxed)
                     ));
                 }
                 let total = hist.count.load(Ordering::Relaxed);
@@ -331,6 +335,11 @@ impl Metrics {
     /// Render current metrics as Prometheus text format.
     pub fn render(&self) -> String {
         self.store.render()
+    }
+
+    /// Record an observation into the duration histogram (test/advanced use).
+    pub fn observe_duration_for_test(&self, method: &str, path: &str, seconds: f64) {
+        self.store.observe_duration(method, path, seconds);
     }
 }
 
@@ -511,6 +520,43 @@ mod tests {
         assert!(output.contains(
             r#"http_request_duration_seconds_bucket{method="GET",path="/",le="+Inf"} 1"#
         ));
+    }
+
+    /// Regression (RS-21): buckets are stored cumulatively (one observation
+    /// increments every containing bucket) but render re-cumulated them,
+    /// double-counting: a single sub-bound observation rendered as 1, 2, 4,
+    /// 8… across nested bounds and could exceed +Inf/count. Each bucket must
+    /// render its own counter, monotonically non-decreasing in `le`, and the
+    /// widest finite bucket must not exceed +Inf.
+    #[tokio::test]
+    async fn histogram_buckets_render_without_double_counting() {
+        let metrics = Metrics::new();
+        metrics.observe_duration_for_test("GET", "/", 0.000_001); // below every bound
+        metrics.observe_duration_for_test("GET", "/", 0.000_001);
+        let output = metrics.render();
+
+        let mut prev = 0u64;
+        let mut widest = 0u64;
+        for line in output.lines() {
+            if let Some(rest) = line
+                .strip_prefix("http_request_duration_seconds_bucket{method=\"GET\",path=\"/\",le=")
+            {
+                let (le, value) = rest.rsplit_once("} ").expect("label then value");
+                let value: u64 = value.parse().expect("numeric");
+                if le.trim_matches('"') == "+Inf" {
+                    assert_eq!(value, 2, "+Inf must equal the observation count");
+                } else {
+                    assert!(value >= prev, "buckets must be monotonic: {line}");
+                    prev = value;
+                    widest = widest.max(value);
+                }
+            }
+        }
+        assert_eq!(
+            prev, 2,
+            "a below-every-bound value increments every bucket exactly once"
+        );
+        assert!(widest <= 2, "finite buckets must never exceed +Inf/count");
     }
 
     #[tokio::test]

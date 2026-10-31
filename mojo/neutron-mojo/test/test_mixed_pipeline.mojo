@@ -27,9 +27,14 @@ from neutron_mojo.nn.sampler import SamplerConfig, greedy_config
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny FP32 model with deterministic weights."""
     var p = tiny_test_params()
+    # Tests use generation budgets up to 100 tokens; align context capacity.
+    p.max_seq_len = 256
+    # build_test_tokenizer() has 27 ids (0..26); strict admission rejects
+    # prompt tokens >= vocab_size, so the model vocab must cover them.
+    p.vocab_size = 32
     var model = Model(p)
     var total = p.num_layers * p.layer_weight_count()
     for i in range(total):
@@ -46,7 +51,7 @@ def _build_tokenizer() raises -> BPETokenizer:
     return build_test_tokenizer()
 
 
-def _build_mixed_all_q8() -> MixedQuantModel:
+def _build_mixed_all_q8() raises -> MixedQuantModel:
     """Build a tiny mixed model with all layers Q8."""
     var model = _build_tiny_model()
     var modes = List[Int]()

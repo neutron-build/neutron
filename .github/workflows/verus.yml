@@ -1,0 +1,42 @@
+name: Verus executable model obligations
+on:
+  push:
+    branches: [main]
+    paths: ["verus/**", "nucleus/src/transport/mod.rs", ".github/workflows/verus.yml", ".github/scripts/test_formal_gates.py"]
+  pull_request:
+    paths: ["verus/**", "nucleus/src/transport/mod.rs", ".github/workflows/verus.yml", ".github/scripts/test_formal_gates.py"]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      VERUS_VERSION: 0.2026.10.04.426d8b0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the exact official tool release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/verus-tool"
+          gh release download "release/$VERUS_VERSION" --repo verus-lang/verus --pattern '*-x86-linux.zip' --dir "$RUNNER_TEMP/verus-tool"
+          python3 - "$RUNNER_TEMP/verus-tool" <<'PY'
+          from pathlib import Path
+          import sys, zipfile
+          root=Path(sys.argv[1]); archives=list(root.glob('*.zip'))
+          if len(archives)!=1: raise RuntimeError('Expected exactly one official pinned archive')
+          with zipfile.ZipFile(archives[0]) as archive:
+              for name in archive.namelist():
+                  if Path(name).is_absolute() or '..' in Path(name).parts: raise RuntimeError('Unsafe archive path')
+              archive.extractall(root)
+          binaries=list(root.rglob('verus'))
+          if len(binaries)!=1: raise RuntimeError('Pinned tool executable absent or ambiguous')
+          for name in ('verus','rust_verify','z3'):
+              for path in root.rglob(name): path.chmod(path.stat().st_mode | 0o111)
+          with open(__import__('os').environ['GITHUB_PATH'],'a') as f: f.write(str(binaries[0].parent)+'\n')
+          PY
+      - name: Check models and reject real semantic mutations
+        run: python3 verus/scripts/canary.py
+      - name: Test runner failure transports
+        run: python3 .github/scripts/test_formal_gates.py

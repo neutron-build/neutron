@@ -1,208 +1,58 @@
-/**
- * Tests for native components — View, Text, Image, Pressable, TextInput, Link,
- * ScrollView, FlatList, Modal, StatusBar, SafeAreaView, ActivityIndicator,
- * Switch, Slider, KeyboardAvoidingView, RefreshControl.
- */
+import { listenerTarget } from '../../turbomodule/__tests__/fixtures/listener-target.js'
+jest.unmock('react-native')
+jest.unmock('react')
+jest.unmock('react/jsx-runtime')
+import React from 'react'
+import { act, create } from 'react-test-renderer'
+import { Pressable } from '../Pressable.native.js'
+import { Image } from '../Image.native.js'
+import { View } from '../View.native.js'
+;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
-import { createElement } from 'react'
-
-describe('View.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with style prop, stripping className', () => {
-    const { default: View } = require('../View.native')
-    const el = createElement(View, { className: 'flex-1', style: { padding: 10 }, testID: 'v' } as any)
-    expect(el).toBeDefined()
-  })
-
-  it('passes children through', () => {
-    const { default: View } = require('../View.native')
-    const child = createElement('span', null, 'hi')
-    const el = createElement(View, null, child) as any
-    expect(el.props?.children).toBeDefined()
-  })
+it.each(['View', 'Text', 'Image', 'Pressable', 'TextInput', 'Link', 'ScrollView', 'FlatList', 'Modal', 'StatusBar', 'SafeAreaView', 'ActivityIndicator', 'Switch', 'KeyboardAvoidingView', 'RefreshControl'])('renders actual named %s export with real React', async name => {
+  const Component = require('../' + name + '.native')[name]
+  expect(typeof Component).toBe('function')
+  let renderer: any
+  await act(async () => { renderer = create(React.createElement(Component, { testID: 'actual', href: '/page', source: 'https://example.test/a.png', data: [] })) })
+  expect(renderer.toJSON()).not.toBeNull()
+  await act(async () => renderer.unmount())
 })
-
-describe('Text.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with text-specific props', () => {
-    const { default: Text } = require('../Text.native')
-    const el = createElement(Text, {
-      numberOfLines: 2,
-      ellipsizeMode: 'tail',
-      selectable: true,
-    } as any, 'Hello')
-    expect(el).toBeDefined()
-  })
+it('normalizes actual Image string source and strips View className', async () => {
+  let renderer: any
+  await act(async () => { renderer = create(<View className="ignored" testID="view"><Image source="https://example.test/a.png" /></View>) })
+  expect(renderer.root.findByType('View').props.className).toBeUndefined()
+  expect(renderer.root.findByType('Image').props.source).toEqual({ uri: 'https://example.test/a.png' })
+  await act(async () => renderer.unmount())
 })
-
-describe('Image.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('converts string source to uri object', () => {
-    const { default: Image } = require('../Image.native')
-    const el = createElement(Image, { source: 'https://example.com/img.png' } as any)
-    expect(el).toBeDefined()
-  })
-
-  it('passes object source through', () => {
-    const { default: Image } = require('../Image.native')
-    const source = { uri: 'https://example.com/img.png' }
-    const el = createElement(Image, { source } as any)
-    expect(el).toBeDefined()
-  })
+it('actual Pressable state rerenders and disabled handlers stay inert', async () => {
+  const press = jest.fn(); let renderer: any
+  await act(async () => { renderer = create(<Pressable onPress={press} style={({ pressed }) => ({ opacity: pressed ? 0.5 : 1 })}>{({ pressed }) => pressed ? 'down' : 'up'}</Pressable>) })
+  expect(renderer.root.findByType('Pressable').props.style.opacity).toBe(1)
+  await act(async () => renderer.root.findByType('Pressable').props.onPressIn({}))
+  expect(renderer.root.findByType('Pressable').props.style.opacity).toBe(0.5)
+  expect(renderer.toJSON().children).toEqual(['down'])
+  await act(async () => renderer.update(<Pressable disabled onPress={press}>disabled</Pressable>))
+  await act(async () => renderer.root.findByType('Pressable').props.onPress({}))
+  expect(press).not.toHaveBeenCalled()
+  await act(async () => renderer.unmount())
 })
-
-describe('Pressable.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders without crashing', () => {
-    const { default: Pressable } = require('../Pressable.native')
-    const el = createElement(Pressable, { onPress: jest.fn() } as any, 'Press me')
-    expect(el).toBeDefined()
-  })
-
-  it('accepts disabled prop', () => {
-    const { default: Pressable } = require('../Pressable.native')
-    const el = createElement(Pressable, { disabled: true } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('TextInput.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with placeholder and value', () => {
-    const { default: TextInput } = require('../TextInput.native')
-    const el = createElement(TextInput, {
-      placeholder: 'Enter text...',
-      value: 'hello',
-      onChangeText: jest.fn(),
-    } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('Link.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with href prop', () => {
-    const { default: Link } = require('../Link.native')
-    const el = createElement(Link, { href: '/about' } as any, 'About')
-    expect(el).toBeDefined()
-  })
-})
-
-describe('ScrollView.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders as a wrapper around RN ScrollView', () => {
-    const { default: ScrollView } = require('../ScrollView.native')
-    const el = createElement(ScrollView, { horizontal: true } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('FlatList.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with data and renderItem', () => {
-    const { default: FlatList } = require('../FlatList.native')
-    const el = createElement(FlatList, {
-      data: [1, 2, 3],
-      renderItem: ({ item }: { item: number }) => createElement('span', null, item),
-    } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('Modal.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with visible prop', () => {
-    const { default: Modal } = require('../Modal.native')
-    const el = createElement(Modal, { visible: true } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('StatusBar.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with barStyle prop', () => {
-    const { default: StatusBar } = require('../StatusBar.native')
-    const el = createElement(StatusBar, { barStyle: 'light-content' } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('SafeAreaView.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders as a wrapper', () => {
-    const { default: SafeAreaView } = require('../SafeAreaView.native')
-    const el = createElement(SafeAreaView, { style: { flex: 1 } } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('ActivityIndicator.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with size and color', () => {
-    const { default: ActivityIndicator } = require('../ActivityIndicator.native')
-    const el = createElement(ActivityIndicator, { size: 'large', color: '#000' } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('Switch.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with value and onValueChange', () => {
-    const { default: Switch } = require('../Switch.native')
-    const el = createElement(Switch, {
-      value: true,
-      onValueChange: jest.fn(),
-    } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('Slider.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders a placeholder View', () => {
-    const { default: Slider } = require('../Slider.native')
-    const el = createElement(Slider, {
-      value: 0.5,
-      minimumValue: 0,
-      maximumValue: 1,
-    } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('KeyboardAvoidingView.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with platform-aware behavior', () => {
-    const { default: KAV } = require('../KeyboardAvoidingView.native')
-    const el = createElement(KAV, { behavior: 'padding' } as any)
-    expect(el).toBeDefined()
-  })
-})
-
-describe('RefreshControl.native', () => {
-  beforeEach(() => jest.resetModules())
-
-  it('renders with refreshing and onRefresh', () => {
-    const { default: RefreshControl } = require('../RefreshControl.native')
-    const el = createElement(RefreshControl, {
-      refreshing: false,
-      onRefresh: jest.fn(),
-    } as any)
-    expect(el).toBeDefined()
-  })
+it('unmount releases a shipped browser subscription through real React effects', async () => {
+  const browser = listenerTarget(), connection = listenerTarget(), delivery = jest.fn()
+  ;(globalThis as any).window = browser
+  ;(globalThis as any).document = {}
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: true, connection } })
+  const { getModule, clearCache } = require('../../turbomodule/registry')
+  require('../../turbomodule/modules/net-info.web')
+  clearCache(); const net = getModule('NeutronNetInfo')
+  function Consumer() { React.useEffect(() => { const subscription = net.addEventListener(delivery); return () => subscription.remove() }, []); return <View /> }
+  let renderer: any
+  await act(async () => { renderer = create(<Consumer />) })
+  await act(async () => { browser.dispatch('online'); browser.dispatch('offline'); connection.dispatch('change') })
+  expect(delivery).toHaveBeenCalledTimes(3)
+  await act(async () => renderer.unmount())
+  for (const event of ['online', 'offline']) expect(browser.removeEventListener).toHaveBeenCalledWith(event, browser.registered(event))
+  expect(connection.removeEventListener).toHaveBeenCalledWith('change', connection.registered('change'))
+  expect(browser.count()).toBe(0); expect(connection.count()).toBe(0)
+  await act(async () => { browser.dispatch('online'); browser.dispatch('offline'); connection.dispatch('change') })
+  expect(delivery).toHaveBeenCalledTimes(3)
 })

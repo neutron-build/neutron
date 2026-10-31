@@ -2,6 +2,7 @@
 // Hydrates islands based on client directive
 
 import { h, hydrate, render, type ComponentType } from "preact";
+import { InsideIsland } from "./island-context.js";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -53,7 +54,9 @@ async function hydrateIsland(island: IslandElement) {
   }
 
   try {
-    const element = h(Component, props);
+    // Inside the provider <Island> renders on the server, so a nested <Island>
+    // renders inline here too instead of emitting a marker SSR never did.
+    const element = h(InsideIsland.Provider, { value: true }, h(Component, props));
     // Preact's hydrate() walks the existing DOM and attaches event handlers
     // in place — it crashes with "Cannot read properties of null (reading
     // 'length')" if you call it against an empty container, because its diff
@@ -213,9 +216,9 @@ export function initIslands(manifest?: IslandManifest) {
 
   islands.forEach((island) => {
     if (island.__neutronHydrated) return;
-    // An island rendered inside another island is part of the outer one's
-    // component tree: hydrating the outer mounts it. Hydrating it as well
-    // would put a second Preact root over the same DOM.
+    // An island nested in another island belongs to the outer island's
+    // client render; hydrating it again would mount a second Preact root
+    // over DOM the outer root already owns (content renders twice).
     if (island.parentElement?.closest("neutron-island")) return;
 
     const client = island.getAttribute("data-client") as ClientDirective | null;

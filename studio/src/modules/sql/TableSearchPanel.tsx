@@ -1,3 +1,5 @@
+import { useEffect } from 'preact/hooks'
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useSignal, useComputed } from '@preact/signals'
 import type { TableMeta, TableMetaColumn } from '../../lib/types'
 import { api } from '../../lib/api'
@@ -52,13 +54,19 @@ export function TableSearchPanel({ schema, table, meta }: TableSearchPanelProps)
     return `to_tsvector(...) @@ websearch_to_tsquery(...) with ts_rank(...) DESC ordering — core PostgreSQL full-text search.`
   })
 
+  const owner = useRequestOwner(JSON.stringify([activeConnection.value?.id, schema, table, meta.binding, kind.value, column.value, operator.value, query.value, limit.value]))
+  useEffect(() => { result.value = null; running.value = false }, [activeConnection.value?.id, schema, table, meta.binding])
+  function inputChanged() { owner.invalidate(); result.value = null; running.value = false }
+
   async function run() {
+    if (running.value) return
+    const owns = owner.begin()
     const conn = activeConnection.value
-    if (!conn || query.value.trim() === '' || column.value === '') return
+    if (!conn || !owns() || query.value.trim() === '' || column.value === '') return
     running.value = true
     result.value = null
     try {
-      result.value = await api.tableSearch({
+      const response = await api.tableSearch({
         connectionId: conn.id,
         schema,
         table,
@@ -68,13 +76,15 @@ export function TableSearchPanel({ schema, table, meta }: TableSearchPanelProps)
         ...(kind.value === 'vector' ? { operator: operator.value } : {}),
         limit: limit.value,
       })
+      if (owns()) result.value = response
     } catch (err: unknown) {
+      if (!owns()) return
       result.value = {
         columns: [], rows: [], rowCount: 0, duration: 0,
         error: err instanceof Error ? err.message : String(err),
       }
     } finally {
-      running.value = false
+      if (owns()) running.value = false
     }
   }
 
@@ -86,7 +96,7 @@ export function TableSearchPanel({ schema, table, meta }: TableSearchPanelProps)
         <select
           class={s.select}
           value={kind.value}
-          onChange={e => {
+          onChange={e => { inputChanged();
             const next = (e.currentTarget as HTMLSelectElement).value as SearchKind
             kind.value = next
             const cols = next === 'vector' ? vecCols : ftsCols
@@ -101,7 +111,7 @@ export function TableSearchPanel({ schema, table, meta }: TableSearchPanelProps)
         <select
           class={s.select}
           value={column.value}
-          onChange={e => { column.value = (e.currentTarget as HTMLSelectElement).value }}
+          onChange={e => { inputChanged(); column.value = (e.currentTarget as HTMLSelectElement).value }}
         >
           {columnsForKind.value.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
         </select>
@@ -109,7 +119,7 @@ export function TableSearchPanel({ schema, table, meta }: TableSearchPanelProps)
           <select
             class={s.select}
             value={operator.value}
-            onChange={e => { operator.value = (e.currentTarget as HTMLSelectElement).value as typeof operator.value }}
+            onChange={e => { inputChanged(); operator.value = (e.currentTarget as HTMLSelectElement).value as typeof operator.value }}
             title="pgvector distance operator (also selects the index opclass that accelerates it)"
           >
             <option value="cosine">&lt;=&gt; cosine</option>
@@ -123,13 +133,13 @@ export function TableSearchPanel({ schema, table, meta }: TableSearchPanelProps)
           type="text"
           placeholder={kind.value === 'vector' ? 'query vector, e.g. [0.1, 0.2, 0.3]' : 'search terms, e.g. "exact phrase" OR vector'}
           value={query.value}
-          onInput={e => { query.value = (e.currentTarget as HTMLInputElement).value }}
+          onInput={e => { inputChanged(); query.value = (e.currentTarget as HTMLInputElement).value }}
           onKeyDown={e => { if (e.key === 'Enter') void run() }}
         />
         <select
           class={s.select}
           value={String(limit.value)}
-          onChange={e => { limit.value = Number((e.currentTarget as HTMLSelectElement).value) }}
+          onChange={e => { inputChanged(); limit.value = Number((e.currentTarget as HTMLSelectElement).value) }}
         >
           {[10, 20, 50, 100].map(n => <option key={n} value={n}>{n}</option>)}
         </select>

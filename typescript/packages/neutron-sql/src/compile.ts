@@ -75,6 +75,11 @@ export function compile(node: SqlNode, state: CompileState): void {
     case "qualified":
       state.parts.push(node.parts.map(quoteIdent).join("."));
       return;
+    case "excluded-ref":
+      // The conflict pseudo-relation's column, emitted as ordinary quoted
+      // identifier text (NA-12) — identical output to the old qualified form.
+      state.parts.push(quoteIdent("excluded") + "." + quoteIdent(node.column));
+      return;
     case "param": {
       state.params.push(node.value);
       const n = state.params.length;

@@ -57,7 +57,7 @@ struct CausalLMWeights(Movable):
         num_kv_heads: Int,
         head_dim: Int,
         ffn_dim: Int,
-    ):
+    ) raises:
         """Create model weights (initialized to zeros/ones).
 
         Args:
@@ -112,7 +112,7 @@ def embed_token(
     embed_table: Tensor[DType.float32],
     token_id: Int,
     hidden_dim: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Look up a token's embedding vector.
 
     Args:
@@ -138,7 +138,7 @@ def compute_logits(
     lm_head: Tensor[DType.float32],
     vocab_size: Int,
     hidden_dim: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Compute logits from hidden state.
 
     Args:
@@ -197,7 +197,7 @@ def apply_temperature(
 
 def top_k_filter(
     mut logits: Tensor[DType.float32], size: Int, k: Int
-):
+) raises:
     """Zero out all logits outside the top-k.
 
     Args:

@@ -15,6 +15,9 @@ Reference: https://github.com/huggingface/safetensors
 from std.collections import Dict
 from std.collections import Set
 from std.pathlib import Path
+from neutron_mojo.tensor.shape import Shape
+from neutron_mojo.io.binary_reader import BinaryReader
+from neutron_mojo.io.json import parse_safetensors_header
 
 
 # ===----------------------------------------------------------------------=== #
@@ -46,16 +49,15 @@ struct TensorInfo(Copyable, Movable, ImplicitlyCopyable):
         self.data_offset_start = move.data_offset_start^
         self.data_offset_end = move.data_offset_end^
 
-    def size_bytes(self) -> Int:
+    def size_bytes(self) raises -> Int:
         """Calculate tensor size in bytes."""
+        if self.data_offset_start < 0 or self.data_offset_end < self.data_offset_start:
+            raise Error("Invalid SafeTensors byte interval")
         return self.data_offset_end - self.data_offset_start
 
-    def numel(self) -> Int:
+    def numel(self) raises -> Int:
         """Calculate total number of elements."""
-        var total = 1
-        for i in range(len(self.shape)):
-            total *= self.shape[i]
-        return total
+        return Shape(self.shape.copy()).numel()
 
 
 # ===----------------------------------------------------------------------=== #
@@ -96,7 +98,6 @@ struct SafeTensorsFile(Movable):
         Args:
             file_path: Path to the .safetensors file.
         """
-        from neutron_mojo.io.binary_reader import BinaryReader
 
         var reader = BinaryReader(file_path)
         self.file_size = reader.size
@@ -112,9 +113,7 @@ struct SafeTensorsFile(Movable):
 
         # Read JSON header as string
         var json_bytes = reader.read_bytes(self.header_size)
-        var json_str = String("")
-        for i in range(len(json_bytes)):
-            json_str += chr(Int(json_bytes[i]))
+        var json_str = String(from_utf8=json_bytes)
 
         self.metadata_json = json_str
 
@@ -126,7 +125,6 @@ struct SafeTensorsFile(Movable):
 
     def _parse_metadata(mut self) raises:
         """Parse JSON metadata to extract tensor information."""
-        from neutron_mojo.io.json import parse_safetensors_header
 
         if len(self.metadata_json) < 2:
             return
@@ -136,6 +134,32 @@ struct SafeTensorsFile(Movable):
         # Since we can't iterate dicts, we rely on the parser
         # having populated the dict correctly
         self.tensors = parsed^
+        self.validate_metadata()
+
+    def validate_metadata(self) raises:
+        """Check every source shape/range before any model weight is populated."""
+        if self.data_offset < 0 or self.data_offset > self.file_size:
+            raise Error("Invalid SafeTensors data base")
+        var available = self.file_size - self.data_offset
+        var starts = List[Int]()
+        var ends = List[Int]()
+        for key in self.tensors.keys():
+            var info = self.tensors[key].copy()
+            var width = dtype_element_size(info.dtype)
+            if info.dtype != "F32" and info.dtype != "F16" and info.dtype != "BF16" and info.dtype != "I32" and info.dtype != "I64" and info.dtype != "U8" and info.dtype != "I8":
+                raise Error("Unsupported SafeTensors metadata dtype")
+            var count = info.numel()
+            if count > 0x7FFFFFFFFFFFFFFF // width:
+                raise Error("SafeTensors byte count overflow")
+            var start = info.data_offset_start
+            var end = info.data_offset_end
+            if start < 0 or end < start or end > available or end - start != count * width:
+                raise Error("SafeTensors shape/data range mismatch")
+            for i in range(len(starts)):
+                if start < ends[i] and starts[i] < end:
+                    raise Error("Overlapping SafeTensors data ranges")
+            starts.append(start)
+            ends.append(end)
 
     def register_tensor(
         mut self,
@@ -285,7 +309,10 @@ struct SafeTensorsIndex(Movable):
         """
         if tensor_name not in self.weight_map:
             raise Error("Tensor not found in index: " + tensor_name)
-        return self.weight_map[tensor_name]
+        var shard = self.weight_map[tensor_name]
+        if shard.byte_length() == 0:
+            raise Error("Empty shard filename")
+        return shard
 
     def get_shard_path(self, tensor_name: String) raises -> String:
         """Get the full path to the shard file for a tensor.
@@ -307,7 +334,7 @@ struct SafeTensorsIndex(Movable):
 
     def num_tensors(self) -> Int:
         """Get total number of tensors."""
-        return len(self.shard_files)  # approximation — real count from weight_map
+        return len(self.weight_map)
 
 
 def load_safetensors_index(index_path: String) raises -> SafeTensorsIndex:

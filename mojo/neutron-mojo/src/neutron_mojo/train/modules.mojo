@@ -8,12 +8,12 @@ All modules are Copyable (store tape indices as Int, not Tensors).
 This enables List[TrainableTransformerBlock] pattern.
 """
 
-from std.math import sqrt
+from std.math import sqrt, isfinite
 from std.random import random_float64
 
-from neutron_mojo.autograd.tape import Tape, TapeEntry, OP_EMBEDDING
+from neutron_mojo.autograd.tape import Tape, TapeEntry, OP_EMBEDDING, OP_RMSNORM, OP_LAYERNORM
 from neutron_mojo.autograd.ops import (
-    tracked_add, tracked_matmul, tracked_relu, tracked_sigmoid,
+    tracked_add, tracked_matmul_right_transpose, tracked_bias_add, tracked_mul, tracked_relu, tracked_sigmoid,
     tracked_scalar_mul,
 )
 
@@ -55,7 +55,7 @@ struct Linear(ImplicitlyCopyable, Copyable, Movable):
         self.has_bias = move.has_bias^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register parameters on the tape with Xavier init."""
         var w_dims = List[Int]()
         w_dims.append(self.out_features)
@@ -77,33 +77,37 @@ struct Linear(ImplicitlyCopyable, Copyable, Movable):
 
         self.registered = True
 
-    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """Forward pass: y = x @ W^T (+ b).
 
         x_idx points to a variable of shape (in_features,) or (batch, in_features).
         W is (out_features, in_features).
         """
+        tape.validate_variable(x_idx)
+        if not self.registered or self.in_features <= 0 or self.out_features <= 0:
+            raise Error("Linear must have registered positive dimensions")
         var x_numel = tape.var_numel(x_idx)
         var x_shape = tape.var_shapes[x_idx].copy()
 
+        if len(x_shape) < 1 or len(x_shape) > 2 or x_shape[len(x_shape)-1] != self.in_features:
+            raise Error("Linear input shape mismatch")
         if len(x_shape) == 1:
             # Single vector: x (in,) @ W^T (in, out) -> (out,)
             # Treat as matmul: (1, in) @ (in, out) -> (1, out)
-            var y_idx = tracked_matmul(tape, x_idx, self.weight_idx,
+            var y_idx = tracked_matmul_right_transpose(tape, x_idx, self.weight_idx,
                 1, self.in_features, self.out_features)
             # Note: matmul stores (1, out_features) but we want to use it as-is
             if self.has_bias and self.bias_idx >= 0:
-                y_idx = tracked_add(tape, y_idx, self.bias_idx)
+                y_idx = tracked_bias_add(tape, y_idx, self.bias_idx)
             return y_idx
         else:
             # Batch: (batch, in) @ (in, out) -> (batch, out)
             var batch = x_shape[0]
-            var y_idx = tracked_matmul(tape, x_idx, self.weight_idx,
+            var y_idx = tracked_matmul_right_transpose(tape, x_idx, self.weight_idx,
                 batch, self.in_features, self.out_features)
             if self.has_bias and self.bias_idx >= 0:
-                # Broadcasting add: need to add bias to each row
-                # For now, add element-wise (bias is broadcast)
-                y_idx = tracked_add(tape, y_idx, self.bias_idx)
+                # Bias addition records reverse row reduction.
+                y_idx = tracked_bias_add(tape, y_idx, self.bias_idx)
             return y_idx
 
     def param_indices(self) -> List[Int]:
@@ -141,7 +145,7 @@ struct Embedding(ImplicitlyCopyable, Copyable, Movable):
         self.embedding_dim = move.embedding_dim^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register the embedding table."""
         var dims = List[Int]()
         dims.append(self.num_embeddings)
@@ -155,8 +159,13 @@ struct Embedding(ImplicitlyCopyable, Copyable, Movable):
             tape.set_data(self.embed_idx, i, Float32((random_float64() * 2.0 - 1.0) * scale))
         self.registered = True
 
-    def forward(self, mut tape: Tape, token_id: Int) -> Int:
+    def forward(self, mut tape: Tape, token_id: Int) raises -> Int:
         """Look up embedding for a single token."""
+        if not self.registered or token_id < 0 or token_id >= self.num_embeddings or self.embedding_dim <= 0:
+            raise Error("Embedding token or registration is invalid")
+        tape.validate_variable(self.embed_idx)
+        if len(tape.var_shapes[self.embed_idx]) != 2 or tape.var_shapes[self.embed_idx][0] != self.num_embeddings or tape.var_shapes[self.embed_idx][1] != self.embedding_dim:
+            raise Error("Embedding table shape mismatch")
         var dims = List[Int]()
         dims.append(self.embedding_dim)
         var y_idx = tape.add_variable(dims^, requires_grad=True)
@@ -201,7 +210,7 @@ struct RMSNormModule(ImplicitlyCopyable, Copyable, Movable):
         self.eps = move.eps^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register gamma parameter (initialized to ones)."""
         var dims = List[Int]()
         dims.append(self.dim)
@@ -210,8 +219,14 @@ struct RMSNormModule(ImplicitlyCopyable, Copyable, Movable):
             tape.set_data(self.gamma_idx, i, Float32(1.0))
         self.registered = True
 
-    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """RMSNorm forward."""
+        tape.validate_variable(x_idx)
+        if not self.registered or self.dim <= 0 or not isfinite(self.eps) or self.eps <= 0:
+            raise Error("Invalid normalization module configuration")
+        tape.validate_same_shape(x_idx, self.gamma_idx)
+        if len(tape.var_shapes[x_idx]) != 1 or tape.var_numel(x_idx) != self.dim:
+            raise Error("Normalization module requires its registered vector width")
         var n = tape.var_numel(x_idx)
         var dims = List[Int]()
         dims.append(n)
@@ -229,7 +244,6 @@ struct RMSNormModule(ImplicitlyCopyable, Copyable, Movable):
             var g_val = Float64(tape.get_data(self.gamma_idx, i))
             tape.set_data(y_idx, i, Float32((x_val / rms) * g_val))
 
-        from neutron_mojo.autograd.tape import OP_RMSNORM
         tape.record(TapeEntry(OP_RMSNORM(), x_idx, self.gamma_idx, y_idx,
             cached_scalar=self.eps, cached_int=n))
         return y_idx
@@ -270,7 +284,7 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
         self.eps = move.eps^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register gamma (ones) and beta (zeros) parameters."""
         var dims = List[Int]()
         dims.append(self.dim)
@@ -281,8 +295,15 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
         # beta already zeros
         self.registered = True
 
-    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """LayerNorm forward."""
+        tape.validate_variable(x_idx)
+        if not self.registered or self.dim <= 0 or not isfinite(self.eps) or self.eps <= 0:
+            raise Error("Invalid normalization module configuration")
+        tape.validate_same_shape(x_idx, self.gamma_idx)
+        if len(tape.var_shapes[x_idx]) != 1 or tape.var_numel(x_idx) != self.dim:
+            raise Error("Normalization module requires its registered vector width")
+        tape.validate_same_shape(x_idx, self.beta_idx)
         var n = tape.var_numel(x_idx)
         var dims = List[Int]()
         dims.append(n)
@@ -305,7 +326,6 @@ struct LayerNormModule(ImplicitlyCopyable, Copyable, Movable):
             var scaled = normed * Float64(tape.get_data(self.gamma_idx, i)) + Float64(tape.get_data(self.beta_idx, i))
             tape.set_data(y_idx, i, Float32(scaled))
 
-        from neutron_mojo.autograd.tape import OP_LAYERNORM
         tape.record(TapeEntry(OP_LAYERNORM(), x_idx, self.gamma_idx, y_idx,
             cached_scalar=self.eps, cached_int=n, cached_int3=self.beta_idx))
         return y_idx
@@ -336,29 +356,24 @@ struct Dropout(Copyable, Movable, ImplicitlyCopyable):
         self.p = move.p^
         self.training = move.training^
 
-    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
-        """Apply dropout: randomly zero elements with probability p."""
+    def forward(self, mut tape: Tape, x_idx: Int) raises -> Int:
+        """Save the sampled scaled mask, including kept zero-valued inputs."""
+        if not isfinite(self.p) or self.p < 0.0 or self.p > 1.0:
+            raise Error("Dropout probability must be in [0,1]")
+        tape.validate_variable(x_idx)
         if not self.training or self.p == 0.0:
             return x_idx
-
-        var n = tape.var_numel(x_idx)
-        var dims = List[Int]()
-        var shape = tape.var_shapes[x_idx].copy()
-        for i in range(len(shape)):
-            dims.append(shape[i])
-        var y_idx = tape.add_variable(dims^, requires_grad=True)
-
-        var scale = Float32(1.0 / (1.0 - self.p))
-        for i in range(n):
-            if random_float64() < self.p:
-                tape.set_data(y_idx, i, Float32(0.0))
-            else:
-                tape.set_data(y_idx, i, tape.get_data(x_idx, i) * scale)
-
-        # Record as scalar_mul for simplified backward
-        from neutron_mojo.autograd.tape import OP_SCALAR_MUL
-        tape.record(TapeEntry(OP_SCALAR_MUL(), x_idx, -1, y_idx, cached_scalar=1.0 / (1.0 - self.p)))
-        return y_idx
+        var dims = tape.var_shapes[x_idx].copy()
+        var mask_idx = tape.add_variable(dims^, requires_grad=False)
+        var scale = Float32(0.0)
+        if self.p < 1.0:
+            scale = Float32(1.0 / (1.0 - self.p))
+        for i in range(tape.var_numel(x_idx)):
+            var value = Float32(0.0)
+            if self.p < 1.0 and random_float64() >= self.p:
+                value = scale
+            tape.set_data(mask_idx, i, value)
+        return tracked_mul(tape, x_idx, mask_idx)
 
     def eval_mode(mut self):
         self.training = False

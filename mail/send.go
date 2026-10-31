@@ -305,6 +305,19 @@ func (msg *Outgoing) RenderWithBcc() ([]byte, error) {
 
 // render builds the RFC 5322 message.
 func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
+	raw, err := msg.renderUnchecked(messageID, includeBcc)
+	if err != nil {
+		return nil, err
+	}
+	// Text is transfer encoded, so this also checks generated MIME part headers.
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if len(line) > 998 {
+			return nil, errors.New("mail: rendered MIME line exceeds 998 bytes")
+		}
+	}
+	return raw, nil
+}
+func (msg *Outgoing) renderUnchecked(messageID string, includeBcc bool) ([]byte, error) {
 	for _, group := range [][]Address{msg.To, msg.Cc, msg.Bcc} {
 		for _, a := range group {
 			if err := validateAddress(a); err != nil {
@@ -318,23 +331,38 @@ func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
 
 	var b strings.Builder
 
-	b.WriteString("From: " + formatAddress(msg.From) + "\r\n")
-	if len(msg.To) > 0 {
-		b.WriteString("To: " + formatAddressList(msg.To) + "\r\n")
+	if err := writeFoldedHeader(&b, "From", formatAddress(msg.From)); err != nil {
+		return nil, err
 	}
-	if len(msg.Cc) > 0 {
-		b.WriteString("Cc: " + formatAddressList(msg.Cc) + "\r\n")
+	for _, field := range []struct {
+		name  string
+		addrs []Address
+	}{
+		{"To", msg.To}, {"Cc", msg.Cc}, {"Bcc", msg.Bcc},
+	} {
+		if field.name == "Bcc" && !includeBcc {
+			continue
+		}
+		if len(field.addrs) > 0 {
+			if err := writeFoldedHeader(&b, field.name, formatAddressList(field.addrs)); err != nil {
+				return nil, err
+			}
+		}
 	}
-	if includeBcc && len(msg.Bcc) > 0 {
-		b.WriteString("Bcc: " + formatAddressList(msg.Bcc) + "\r\n")
+	if strings.ContainsAny(msg.Subject, "\r\n\x00") {
+		return nil, errors.New("mail: subject contains control characters")
 	}
-	b.WriteString("Subject: " + encodeHeader(msg.Subject) + "\r\n")
+	if err := writeFoldedHeader(&b, "Subject", encodeHeader(msg.Subject)); err != nil {
+		return nil, err
+	}
 	b.WriteString("Date: " + time.Now().Format(time.RFC1123Z) + "\r\n")
 	b.WriteString("Message-ID: " + messageID + "\r\n")
 	b.WriteString("MIME-Version: 1.0\r\n")
 
 	if msg.InReplyTo != "" {
-		b.WriteString("In-Reply-To: <" + msg.InReplyTo + ">\r\n")
+		if err := writeFoldedHeader(&b, "In-Reply-To", "<"+msg.InReplyTo+">"); err != nil {
+			return nil, err
+		}
 	}
 	if len(msg.References) > 0 {
 		var refs []string
@@ -344,7 +372,9 @@ func (msg *Outgoing) render(messageID string, includeBcc bool) ([]byte, error) {
 			}
 		}
 		if len(refs) > 0 {
-			b.WriteString("References: " + strings.Join(refs, " ") + "\r\n")
+			if err := writeFoldedHeader(&b, "References", strings.Join(refs, " ")); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -572,4 +602,62 @@ func formatAddressList(addrs []Address) string {
 // encodeHeader applies RFC 2047 encoding when a header value is not ASCII.
 func encodeHeader(s string) string {
 	return mime.QEncoding.Encode("utf-8", s)
+}
+
+// Fold only at existing whitespace outside quoted strings/escaped characters.
+// Encoded words and addr-specs stay intact; a token over the hard limit refuses.
+// Unfolding restores the original whitespace exactly (no subject normalization).
+func writeFoldedHeader(b *strings.Builder, name, value string) error {
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return fmt.Errorf("mail: %s contains control characters", name)
+	}
+	prefix := name + ": "
+	for {
+		if len(prefix)+len(value) <= 78 {
+			b.WriteString(prefix + value + "\r\n")
+			return nil
+		}
+		quoted, escaped := false, false
+		cut, first := -1, -1
+		for i, c := range []byte(value) {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' && quoted {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				quoted = !quoted
+				continue
+			}
+			if !quoted && (c == ' ' || c == '\t') && i > 0 {
+				if first < 0 {
+					first = i
+				}
+				if len(prefix)+i <= 78 {
+					cut = i
+				} else {
+					break
+				}
+			}
+		}
+		if cut < 0 {
+			cut = first
+		}
+		if cut < 0 {
+			if len(prefix)+len(value) > 998 {
+				return fmt.Errorf("mail: %s contains an unsplittable oversized token", name)
+			}
+			b.WriteString(prefix + value + "\r\n")
+			return nil
+		}
+		if len(prefix)+cut > 998 {
+			return fmt.Errorf("mail: %s contains an unsplittable oversized token", name)
+		}
+		b.WriteString(prefix + value[:cut] + "\r\n")
+		prefix = value[cut : cut+1] // existing whitespace is the continuation prefix
+		value = value[cut+1:]
+	}
 }

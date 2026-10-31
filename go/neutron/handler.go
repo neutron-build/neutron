@@ -30,10 +30,8 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 		o(&options)
 	}
 
-	var in In
-	var out Out
-	inType := reflect.TypeOf(in)
-	outType := reflect.TypeOf(out)
+	inType := reflect.TypeFor[In]()
+	outType := reflect.TypeFor[Out]()
 
 	// Unwrap pointer types for reflection
 	if inType != nil && inType.Kind() == reflect.Ptr {
@@ -45,6 +43,13 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 	emptyType := reflect.TypeOf(Empty{})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// File headers are valid for the handler's lifetime. Clean up on every
+		// exit, including refusal of a form already parsed by middleware.
+		defer func() {
+			if req.MultipartForm != nil {
+				_ = req.MultipartForm.RemoveAll()
+			}
+		}()
 		var input In
 
 		// Bind through the actual generic input variable (GO-01): the old
@@ -63,13 +68,27 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 		// Decode input unless it's Empty
 		if inType != nil && inType != emptyType {
 			if hasBody(method) && req.Body != nil && req.ContentLength != 0 {
+				limit := options.BodyLimit
+				if limit <= 0 {
+					limit = DefaultBodyLimit
+				}
+				if req.ContentLength > limit {
+					WriteError(w, req, bodyDecodeError("Request body", &http.MaxBytesError{Limit: limit}))
+					return
+				}
+				// Bound every typed decoder, including unknown-length requests.
+				req.Body = http.MaxBytesReader(w, req.Body, limit)
 				ct := req.Header.Get("Content-Type")
 				mediaType, _, _ := mime.ParseMediaType(ct)
 
 				switch mediaType {
 				case "multipart/form-data":
-					if err := req.ParseMultipartForm(32 << 20); err != nil {
-						WriteError(w, req, ErrBadRequest("Invalid multipart form: "+err.Error()))
+					if !acceptsForm(inType) {
+						WriteError(w, req, newAppError(http.StatusUnsupportedMediaType, "unsupported-media-type", "Unsupported Media Type", "Handler does not accept multipart form data"))
+						return
+					}
+					if err := req.ParseMultipartForm(limit); err != nil {
+						WriteError(w, req, bodyDecodeError("Invalid multipart form", err))
 						return
 					}
 					if err := populateFromForm(rv, req.MultipartForm); err != nil {
@@ -77,7 +96,7 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 						return
 					}
 				case "application/x-www-form-urlencoded":
-					if err := decodeURLEncodedBody(w, req, maxFormBodyBytes); err != nil {
+					if err := decodeURLEncodedBody(w, req, limit); err != nil {
 						WriteError(w, req, formDecodeError(w, req, err))
 						return
 					}
@@ -90,7 +109,7 @@ func Register[In, Out any](r *Router, method, pattern string, h HandlerFunc[In, 
 					// and *T work (GO-01). Exactly one JSON value; trailing
 					// garbage or a second document is a 400 (GO-03).
 					if err := decodeOneJSON(req.Body, &input); err != nil {
-						WriteError(w, req, ErrBadRequest("Invalid JSON: "+err.Error()))
+						WriteError(w, req, bodyDecodeError("Invalid JSON", err))
 						return
 					}
 					// Re-derive after the decode (it may have replaced a
@@ -199,7 +218,7 @@ func decodeOneJSON(r io.Reader, dst any) error {
 		if err == nil {
 			return errors.New("request body must contain a single JSON value")
 		}
-		return errors.New("trailing data after JSON value")
+		return fmt.Errorf("trailing data after JSON value: %w", err)
 	}
 	return nil
 }
@@ -483,4 +502,27 @@ func typeNameForSchema(t reflect.Type) string {
 		return fmt.Sprintf("ArrayOf%s", elem.Name())
 	}
 	return t.Name()
+}
+
+// A form tag is an explicit multipart binding contract. JSON-only inputs
+// must not parse and spool irrelevant file uploads before their handler runs.
+func acceptsForm(t reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.IsExported() && f.Tag.Get("form") != "" && f.Tag.Get("form") != "-" {
+			return true
+		}
+	}
+	return false
+}
+
+func bodyDecodeError(detail string, err error) *AppError {
+	var limit *http.MaxBytesError
+	if errors.As(err, &limit) {
+		return newAppError(http.StatusRequestEntityTooLarge, "payload-too-large", "Payload Too Large", "Request body exceeds the size limit")
+	}
+	return ErrBadRequest(detail + ": " + err.Error())
 }

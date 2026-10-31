@@ -46,6 +46,17 @@ For a media-controlled island:
 />
 ```
 
+## Layout and nesting
+
+The `<neutron-island>` wrapper is `display: contents`: it generates no box, so
+an island's content lays out exactly as it would without the wrapper (as a flex
+or grid item, for example).
+
+An `<Island>` rendered inside another island's component is rendered inline as
+part of the outer island; the outer island hydrates the whole subtree, and the
+inner island's `client` directive does not apply. Put islands that need their
+own hydration timing side by side in route markup instead.
+
 ## Prerendered markup is not reconciled
 
 Hydration attaches listeners to the markup the build produced; it does not

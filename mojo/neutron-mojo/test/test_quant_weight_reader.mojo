@@ -186,12 +186,12 @@ def test_read_q4_0_multi_block() raises:
 
     assert_eq(t.numel(), 64, "numel=64")
 
-    # Block 1: byte 0 -> [0]=(0-8)*0.5=-4.0, [1]=(15-8)*0.5=3.5
+    # GGML splits nibbles into two halves: byte 0 -> indices 0 and 16.
     assert_near(t.get(0), -4.0, 0.001, "blk1[0]")
-    assert_near(t.get(1), 3.5, 0.001, "blk1[1]")
-    # Block 1: byte 1 -> [2]=0.0, [3]=0.0
-    assert_near(t.get(2), 0.0, 0.001, "blk1[2]")
-    assert_near(t.get(3), 0.0, 0.001, "blk1[3]")
+    assert_near(t.get(16), 3.5, 0.001, "blk1[16]")
+    # Block 1: byte 1 -> [1]=0.0, [17]=0.0
+    assert_near(t.get(1), 0.0, 0.001, "blk1[1]")
+    assert_near(t.get(17), 0.0, 0.001, "blk1[17]")
 
     # Block 2: all zeros
     assert_near(t.get(32), 0.0, 0.001, "blk2[0]")
@@ -224,7 +224,7 @@ def _build_gguf_with_q8_tensor() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "llama.embedding_length")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 4)
+    _write_u32_le(buf, 32)
 
     _write_string_gguf(buf, "llama.attention.head_count")
     _write_u32_le(buf, 4)
@@ -236,52 +236,54 @@ def _build_gguf_with_q8_tensor() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "llama.feed_forward_length")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 8)
+    _write_u32_le(buf, 32)
 
     _write_string_gguf(buf, "llama.vocab_size")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 8)
+    _write_u32_le(buf, 32)
 
-    # Tensor info: embed [8,4] Q8_0 = 32 elements = 1 block = 34 bytes
+    # Tensor info: embed [32,32] Q8_0 = 1024 elements = 32 blocks = 1088 bytes
+    # (whole 32-element blocks with 32-aligned offsets, per strict admission)
     _write_string_gguf(buf, "model.embed_tokens.weight")
     _write_u32_le(buf, 2)   # n_dims
-    _write_u64_le(buf, 8)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 8)   # Q8_0
     _write_u64_le(buf, 0)   # offset
 
-    # norm [4] F32 = 16 bytes
+    # norm [32] F32 = 128 bytes
     _write_string_gguf(buf, "model.norm.weight")
     _write_u32_le(buf, 1)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 0)   # F32
-    _write_u64_le(buf, 34)  # after Q8_0 block
+    _write_u64_le(buf, 1088)  # after Q8_0 blocks
 
-    # lm_head [8,4] F32 = 128 bytes
+    # lm_head [32,32] F32 = 4096 bytes
     _write_string_gguf(buf, "lm_head.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 0)   # F32
-    _write_u64_le(buf, 50)  # 34 + 16
+    _write_u64_le(buf, 1216)  # 1088 + 128
 
     # Align
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
     while len(buf) < aligned:
         buf.append(0)
 
-    # Data: Q8_0 embed block (34 bytes) - scale=0.5, values 0..31
-    _write_fp16_le(buf, 0x3800)  # scale=0.5
-    for i in range(32):
-        buf.append(UInt8(i))
+    # Data: Q8_0 embed blocks (32 blocks) - scale=0.5, values 0..31 per block
+    for _ in range(32):
+        _write_fp16_le(buf, 0x3800)  # scale=0.5
+        for i in range(32):
+            buf.append(UInt8(i))
 
-    # F32 norm (16 bytes) - all 1.0
-    for _ in range(4):
+    # F32 norm (128 bytes) - all 1.0
+    for _ in range(32):
         _write_f32_le(buf, Float32(1.0))
 
-    # F32 lm_head (128 bytes)
-    for i in range(32):
-        _write_f32_le(buf, Float32(i) * 0.01)
+    # F32 lm_head (4096 bytes)
+    for i in range(1024):
+        _write_f32_le(buf, Float32(i % 32) * 0.01)
 
     return buf^
 
@@ -325,7 +327,7 @@ def _build_gguf_with_q4_tensor() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "llama.embedding_length")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 4)
+    _write_u32_le(buf, 32)
 
     _write_string_gguf(buf, "llama.attention.head_count")
     _write_u32_le(buf, 4)
@@ -337,52 +339,53 @@ def _build_gguf_with_q4_tensor() raises -> List[UInt8]:
 
     _write_string_gguf(buf, "llama.feed_forward_length")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 8)
+    _write_u32_le(buf, 32)
 
     _write_string_gguf(buf, "llama.vocab_size")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 8)
+    _write_u32_le(buf, 32)
 
-    # Tensor info: embed [8,4] Q4_0 = 32 elements = 1 block = 18 bytes
+    # Tensor info: embed [32,32] Q4_0 = 1024 elements = 32 blocks = 576 bytes
     _write_string_gguf(buf, "model.embed_tokens.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 2)   # Q4_0
     _write_u64_le(buf, 0)
 
-    # norm [4] F32 = 16 bytes
+    # norm [32] F32 = 128 bytes
     _write_string_gguf(buf, "model.norm.weight")
     _write_u32_le(buf, 1)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 0)   # F32
-    _write_u64_le(buf, 18)  # after Q4_0 block
+    _write_u64_le(buf, 576)  # after Q4_0 blocks
 
-    # lm_head [8,4] F32 = 128 bytes
+    # lm_head [32,32] F32 = 4096 bytes
     _write_string_gguf(buf, "lm_head.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 0)   # F32
-    _write_u64_le(buf, 34)  # 18 + 16
+    _write_u64_le(buf, 704)  # 576 + 128
 
     # Align
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
     while len(buf) < aligned:
         buf.append(0)
 
-    # Data: Q4_0 embed block (18 bytes) - scale=1.0, all nibbles=8 (value=0)
-    _write_fp16_le(buf, 0x3C00)  # scale=1.0
-    for _ in range(16):
-        buf.append(UInt8(0x88))  # lo=8, hi=8 -> (8-8)*1.0 = 0.0
+    # Data: Q4_0 embed blocks (32 blocks) - scale=1.0, all nibbles=8 (value=0)
+    for _ in range(32):
+        _write_fp16_le(buf, 0x3C00)  # scale=1.0
+        for _ in range(16):
+            buf.append(UInt8(0x88))  # lo=8, hi=8 -> (8-8)*1.0 = 0.0
 
     # F32 norm
-    for _ in range(4):
+    for _ in range(32):
         _write_f32_le(buf, Float32(1.0))
 
     # F32 lm_head
-    for i in range(32):
-        _write_f32_le(buf, Float32(i) * 0.01)
+    for i in range(1024):
+        _write_f32_le(buf, Float32(i % 32) * 0.01)
 
     return buf^
 
@@ -425,7 +428,7 @@ def test_mixed_tensor_types() raises:
 
     _write_string_gguf(buf, "llama.embedding_length")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 4)
+    _write_u32_le(buf, 32)
 
     _write_string_gguf(buf, "llama.attention.head_count")
     _write_u32_le(buf, 4)
@@ -437,53 +440,54 @@ def test_mixed_tensor_types() raises:
 
     _write_string_gguf(buf, "llama.feed_forward_length")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 8)
+    _write_u32_le(buf, 32)
 
     _write_string_gguf(buf, "llama.vocab_size")
     _write_u32_le(buf, 4)
-    _write_u32_le(buf, 8)
+    _write_u32_le(buf, 32)
 
     # Tensor info:
-    # embed [8,4] F32 = 128 bytes at offset 0
+    # embed [32,32] F32 = 4096 bytes at offset 0
     _write_string_gguf(buf, "model.embed_tokens.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 0)   # F32
     _write_u64_le(buf, 0)
 
-    # norm [4] F32 = 16 bytes at offset 128
+    # norm [32] F32 = 128 bytes at offset 4096
     _write_string_gguf(buf, "model.norm.weight")
     _write_u32_le(buf, 1)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 0)   # F32
-    _write_u64_le(buf, 128)
+    _write_u64_le(buf, 4096)
 
-    # lm_head [8,4] Q8_0 = 32 elements = 1 block = 34 bytes at offset 144
+    # lm_head [32,32] Q8_0 = 1024 elements = 32 blocks = 1088 bytes at offset 4224
     _write_string_gguf(buf, "lm_head.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
-    _write_u64_le(buf, 4)
+    _write_u64_le(buf, 32)
+    _write_u64_le(buf, 32)
     _write_u32_le(buf, 8)   # Q8_0
-    _write_u64_le(buf, 144)
+    _write_u64_le(buf, 4224)
 
     # Align
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
     while len(buf) < aligned:
         buf.append(0)
 
-    # Data: F32 embed (128 bytes)
-    for i in range(32):
-        _write_f32_le(buf, Float32(i) * 0.1)
+    # Data: F32 embed (4096 bytes)
+    for i in range(1024):
+        _write_f32_le(buf, Float32(i % 32) * 0.1)
 
-    # F32 norm (16 bytes)
-    for _ in range(4):
+    # F32 norm (128 bytes)
+    for _ in range(32):
         _write_f32_le(buf, Float32(1.0))
 
-    # Q8_0 lm_head (34 bytes) - scale=0.5, values 0..31
-    _write_fp16_le(buf, 0x3800)  # scale=0.5
-    for i in range(32):
-        buf.append(UInt8(i))
+    # Q8_0 lm_head (32 blocks) - scale=0.5, values 0..31 per block
+    for _ in range(32):
+        _write_fp16_le(buf, 0x3800)  # scale=0.5
+        for i in range(32):
+            buf.append(UInt8(i))
 
     var model = load_gguf_model_from_buffer(buf^)
 

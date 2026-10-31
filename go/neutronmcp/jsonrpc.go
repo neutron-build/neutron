@@ -116,7 +116,14 @@ func TextContent(text string) []Content { return []Content{{Type: "text", Text: 
 // checks the JSON-RPC error field reads a failed action as a success, which for
 // something like a rollback is the worst possible misreading. Client.CallTool
 // checks both, and there is a test for exactly that.
-type toolResult struct {
+type toolResult = ToolResult
+
+// ToolResult is the exported shape of one tools/call outcome: the tool's
+// content blocks, plus isError for an in-band failure. Exported (NA-11) so an
+// application calling the server in process — Server.CallTool — gets the same
+// result type the HTTP transport returns, instead of re-implementing dispatch
+// or fabricating a request to reach it.
+type ToolResult struct {
 	Content []Content `json:"content"`
 	IsError bool      `json:"isError,omitempty"`
 }

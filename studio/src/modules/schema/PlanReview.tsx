@@ -5,19 +5,20 @@ import s from './ObjectInspector.module.css'
 /** Text of the reviewable SQL download: the plan's up statements in one
  * transaction, with its identity, notes and down statements as comments. */
 export function planSqlText(plan: SchemaPlanResponse): string {
+  const comment = (text: string) => text.split(/\r\n|\r|\n/).map(line => `-- ${line}`).join('\n')
   const lines = [
-    `-- Neutron Studio migration plan ${plan.planId.slice(0, 12)}`,
-    `-- Planned by the CLI planner from schema document ${plan.baseSha256.slice(0, 12)} to ${plan.targetSha256.slice(0, 12)}.`,
-    `-- Reproduce: ${plan.cliEquivalent}`,
-    ...plan.designerNotes.map(n => `-- NOTE: ${n}`),
-    ...plan.warnings.map(w => `-- WARNING: ${w}`),
+    comment(`Neutron Studio migration plan ${plan.planId.slice(0, 12)}`),
+    comment(`Planned by the CLI planner from schema document ${plan.baseSha256.slice(0, 12)} to ${plan.targetSha256.slice(0, 12)}.`),
+    comment(`Reproduce: ${plan.cliEquivalent}`),
+    ...plan.designerNotes.map(n => comment(`NOTE: ${n}`)),
+    ...plan.warnings.map(w => comment(`WARNING: ${w}`)),
     '',
     'BEGIN;',
     ...plan.up.map(stmt => `${stmt};`),
     'COMMIT;',
     '',
     '-- Down statements (structure only; down SQL never restores data):',
-    ...plan.down.map(stmt => stmt.split('\n').map(l => `-- ${l}`).join('\n') + ';'),
+    ...plan.down.map(stmt => comment(stmt) + ';'),
     '',
   ]
   return lines.join('\n')

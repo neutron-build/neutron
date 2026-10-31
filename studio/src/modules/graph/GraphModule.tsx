@@ -1,3 +1,4 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useSignal, useComputed } from '@preact/signals'
 import { useEffect, useMemo } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
@@ -228,15 +229,20 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
   const rlsDenied = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
+  const owner = useRequestOwner(JSON.stringify([conn.id, name]))
 
   useEffect(() => {
+    result.value = null; statsResult.value = null; running.value = false; rlsDenied.value = null
     async function loadStats() {
+      const owns = owner.begin('stats')
+      if (!owns()) return
       try {
         // Single global graph — counts are scalar functions, no graph name.
         const r = await api.query(
           `SELECT GRAPH_NODE_COUNT(), GRAPH_EDGE_COUNT()`,
           conn.id
         )
+        if (!owns()) return
         if (r.error) {
           if (isRlsDenied(r.error)) rlsDenied.value = r.error
           return
@@ -247,9 +253,14 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
       } catch { /* non-critical */ }
     }
     loadStats()
-  }, [name])
+  }, [name, conn.id])
 
   async function runQuery() {
+    if (running.value) return
+    const current = owner.begin('query')
+    const submitted = cypher.value
+    const owns = () => current() && submitted === cypher.value
+    if (!owns()) return
     const q = cypher.value.trim()
     if (!q) return
     running.value = true
@@ -258,7 +269,8 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
       // GRAPH_QUERY is a scalar returning JSON {columns, rows}; parse it into a
       // QueryResult shape for the grid and the graph visualization.
       const r = await api.query(`SELECT GRAPH_QUERY(${sqlStr(q)})`, conn.id)
-      if (r.error) throw new Error(r.error)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Query canceled')
       const cell = r.rows[0]?.[0]
       const parsed = (cell == null || cell === '')
         ? { columns: [], rows: [] }
@@ -270,9 +282,10 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
         duration: r.duration,
       }
     } catch (err: unknown) {
+      if (!owns()) return
       toast('error', friendlyError(err instanceof Error ? err.message : String(err)))
     } finally {
-      running.value = false
+      if (current()) running.value = false
     }
   }
 
@@ -286,7 +299,7 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
   // Run force layout when graph data changes
   const layoutData = useMemo(() => {
     const data = graphData.value
-    if (!data) return null
+    if (viewMode.value !== 'graph' || !data || data.nodes.length > 200 || data.edges.length > 1000) return null
 
     const WIDTH = 800
     const HEIGHT = 600
@@ -295,12 +308,13 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
     const edges = [...data.edges]
     forceLayout(nodes, edges, WIDTH, HEIGHT)
     return { nodes, edges, width: WIDTH, height: HEIGHT }
-  }, [graphData.value])
+  }, [graphData.value, viewMode.value])
 
-  const hasGraphView = graphData.value !== null && graphData.value.nodes.length > 0
+  const hasGraphView = graphData.value !== null && graphData.value.nodes.length > 0 && graphData.value.nodes.length <= 200 && graphData.value.edges.length <= 1000
 
   return (
     <div class={s.layout}>
+      {graphData.value && !hasGraphView && graphData.value.nodes.length > 0 && <div role="status">Graph layout is limited to 200 nodes and 1000 edges; use the table for larger results.</div>}
       {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
       <div class={s.header}>
         <span class={s.graphName}>{name}</span>
@@ -326,7 +340,7 @@ export function GraphModule({ name, initialCypher }: GraphModuleProps) {
         <textarea
           class={s.cypherInput}
           value={cypher.value}
-          onInput={e => { cypher.value = (e.target as HTMLTextAreaElement).value }}
+          onInput={e => { owner.invalidate('query'); running.value = false; result.value = null; cypher.value = (e.target as HTMLTextAreaElement).value }}
           rows={4}
           spellcheck={false}
           onKeyDown={e => {

@@ -272,3 +272,52 @@ test("a failed subscribe does not drop subscribers registered while it was in fl
   assert.ok(received.includes("B"), `B must receive messages, got: ${received.join(",")}`);
   assert.ok(received.includes("C"), `C must receive messages, got: ${received.join(",")}`);
 });
+
+test("awaitable Redis readiness drains late acquisition on close without post-close delivery", async () => {
+  let entered!: () => void; const subscribing = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  let unsubscriptions = 0; let nativeQuits = 0; let publisherQuits = 0; let deliveries = 0;
+  let callback: ((...args: unknown[]) => void) | undefined;
+  const native = { subscribe: async () => { entered(); await gate; }, unsubscribe: async () => { unsubscriptions++; },
+    on: (_event: string, fn: (...args: unknown[]) => void) => { callback = fn; return native; },
+    removeAllListeners: () => native, quit: async () => { nativeQuits++; }, status: "ready" };
+  const publisher = { duplicate: () => native, publish: async () => 0, quit: async () => { publisherQuits++; }, status: "ready" };
+  const bus = new RedisRealtimeBus(publisher, "", "borrowed");
+  const pending = bus.subscribeAsync("channel", () => { deliveries++; });
+  const rejected = assert.rejects(() => pending, /closed during acquisition/);
+  await subscribing;
+  const closing = bus.close();
+  callback?.("channel", '{}');
+  assert.equal(deliveries, 0);
+  release();
+  await rejected; await closing; await bus.close();
+  assert.equal(unsubscriptions, 1); assert.equal(nativeQuits, 1); assert.equal(publisherQuits, 0);
+});
+
+test("awaitable Redis registration reports failure and subsequent registration retries", async () => {
+  const publisher = new MockPublisher();
+  const native = publisher.duplicate();
+  publisher.duplicate = () => native;
+  let attempts = 0;
+  native.subscribe = async () => { attempts++; if (attempts === 1) throw new Error("subscription rejected"); };
+  const bus = new RedisRealtimeBus(publisher);
+  await assert.rejects(() => bus.subscribeAsync("channel", () => {}), /subscription rejected/);
+  const unsubscribe = await bus.subscribeAsync("channel", () => {});
+  assert.equal(attempts, 2);
+  unsubscribe(); await bus.close();
+});
+
+test("Redis close drains every owned connection when both close methods reject", async () => {
+  const publisher = new MockPublisher();
+  const native = publisher.duplicate();
+  publisher.duplicate = () => native;
+  const nativeError = new Error("native quit"); const publisherError = new Error("publisher quit");
+  let nativeQuits = 0; let publisherQuits = 0;
+  native.quit = async () => { nativeQuits++; throw nativeError; };
+  publisher.quit = async () => { publisherQuits++; throw publisherError; };
+  const bus = new RedisRealtimeBus(publisher);
+  await bus.subscribeAsync("channel", () => {});
+  await assert.rejects(() => bus.close(), (error: any) => { assert.deepEqual(error.errors, [nativeError, publisherError]); return true; });
+  await assert.rejects(() => bus.close());
+  assert.equal(nativeQuits, 1); assert.equal(publisherQuits, 1);
+});

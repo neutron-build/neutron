@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/ai",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "AI SDK for Neutron. Model calls, streaming, structured output, and tool-calling over pluggable provider adapters.",
   "author": "Tyler",
   "license": "MIT",
@@ -67,7 +67,7 @@
     "@types/node": "^22.10.7",
     "preact": "^10.25.4",
     "typescript": "^5.7.2",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "publishConfig": {
     "access": "public"

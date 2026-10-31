@@ -1,0 +1,18 @@
+{
+  "format": "neutron-value-cases",
+  "version": 1,
+  "status": "normative-proposed-runtime-compliance-unverified",
+  "cases": [
+    {
+      "id": "domain-identity",
+      "ddl": "CREATE DOMAIN amount AS numeric CHECK (VALUE >= 0)",
+      "assert": "qualified domain identity/base/check survive or explicit refusal; negative write native SQLSTATE preserved"
+    },
+    {
+      "id": "array-lower-bound",
+      "sql_type": "pg_catalog.int4[]",
+      "native_literal": "[0:2]={1,NULL,3}",
+      "assert": "array_lower=0; NULL member index1; shape preserved or explicit unsupported before writing"
+    }
+  ]
+}

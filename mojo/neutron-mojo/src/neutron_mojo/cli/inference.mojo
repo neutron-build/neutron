@@ -586,7 +586,7 @@ def _load_tokenizer(model_path: String) raises -> BPETokenizer:
 
     var tok = load_gguf_tokenizer(
         gguf.token_vocab, scores, gguf.token_merges,
-        bos_id=bos, eos_id=eos,
+        bos_id=bos, eos_id=eos, model_type=gguf.get_str("tokenizer.ggml.model", ""),
     )
     tok.unk_id = 0
     return tok^

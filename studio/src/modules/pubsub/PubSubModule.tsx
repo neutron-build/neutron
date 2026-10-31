@@ -1,7 +1,8 @@
 import { useSignal } from '@preact/signals'
 import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
-import { api } from '../../lib/api'
+import { useRequestOwner } from '../../lib/requestOwner'
+import { api, queryMutationOrThrow as runMutation } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
 import { isRlsDenied } from '../../lib/rls'
 import { RlsNotice } from '../../components/RlsNotice'
@@ -44,34 +45,65 @@ export function PubSubModule({ name }: PubSubModuleProps) {
   const rlsDenied = useSignal<string | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
-  const conn = activeConnection.value!
-
-  async function refreshInfo() {
-    const channel = channelName.value.trim()
-    try {
-      if (channel) {
-        const subRes = await api.query(
-          `SELECT PUBSUB_SUBSCRIBERS('${channel.replace(/'/g, "''")}')`,
-          conn.id
-        )
-        if (subRes.error) {
-          if (isRlsDenied(subRes.error)) rlsDenied.value = subRes.error
-        } else if (subRes.rows.length > 0) {
-          subscriberCount.value = Number(subRes.rows[0][0])
-        }
-      }
-      const chanRes = await api.query(`SELECT PUBSUB_CHANNELS()`, conn.id)
-      if (chanRes.error) {
-        if (isRlsDenied(chanRes.error)) rlsDenied.value = chanRes.error
-        return
-      }
-      if (chanRes.rows.length > 0) channels.value = parseChannels(chanRes.rows[0][0])
-    } catch { /* non-critical */ }
+  const priorName = useRef(name)
+  if (priorName.current !== name) { priorName.current = name; channelName.value = name }
+  const conn = activeConnection.value
+  const infoGeneration = useRef(0)
+  const publishVersion = useRef(0)
+  const logVersion = useRef(0)
+  const requests = useRequestOwner(JSON.stringify([conn?.id, name, channelName.value]))
+  const unavailable = useSignal<string | null>(null)
+  const owner = useRef({ epoch: 0, alive: true, connection: conn?.id, name: name })
+  function invalidate() {
+    requests.invalidate()
+    owner.current.epoch++
+    unavailable.value = null; rlsDenied.value = null
+    infoGeneration.current++; publishVersion.current++; logVersion.current++; subscriberCount.value = null; channels.value = []; messages.value = []; publishing.value = false;
   }
-
+  if (owner.current.connection !== conn?.id || owner.current.name !== name) {
+    invalidate(); owner.current.connection = conn?.id; owner.current.name = name
+  }
+  function capture(channel: string) {
+    const ticket = requests.begin(channel)
+    const epoch = owner.current.epoch
+    const connectionId = conn?.id
+    const target = channelName.value
+    return { connectionId, owns: () => ticket() && owner.current.alive && epoch === owner.current.epoch && connectionId === activeConnection.value?.id && target === channelName.value }
+  }
+  function fail(err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    unavailable.value = msg; rlsDenied.value = isRlsDenied(msg) ? msg : null
+  }
   useEffect(() => {
-    refreshInfo()
+    owner.current.alive = true
+    let current = activeConnection.value
+    const stop = activeConnection.subscribe(next => { if (next !== current) { current = next; invalidate() } })
+    return () => { owner.current.alive = false; invalidate(); stop() }
   }, [])
+  async function refreshInfo() {
+    const binding = capture('info')
+    if (!binding.connectionId || !binding.owns()) return
+    const channel = channelName.value.trim()
+    const generation = ++infoGeneration.current
+    const owns = () => binding.owns() && generation === infoGeneration.current
+    subscriberCount.value = null; channels.value = []; unavailable.value = null
+    try {
+      let count: number | null = null
+      if (channel) {
+        const r = await api.query(`SELECT PUBSUB_SUBSCRIBERS('${channel.replace(/'/g, "''")}')`, binding.connectionId)
+        if (!owns()) return
+        if (r.error || r.canceled) throw new Error(r.error || 'Subscriber read canceled')
+        if (r.rows[0]?.[0] == null || !Number.isFinite(Number(r.rows[0][0]))) throw new Error('Subscriber count unavailable')
+        count = Number(r.rows[0][0])
+      }
+      const r = await api.query(`SELECT PUBSUB_CHANNELS()`, binding.connectionId)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Channels read canceled')
+      if (!r.rows.length) throw new Error('Channels unavailable')
+      subscriberCount.value = count; channels.value = parseChannels(r.rows[0]?.[0])
+    } catch (err) { if (owns()) fail(err) }
+  }
+  useEffect(() => { void refreshInfo() }, [conn?.id, name])
 
   // Auto-scroll when pinned and new messages arrive
   useEffect(() => {
@@ -81,30 +113,37 @@ export function PubSubModule({ name }: PubSubModuleProps) {
   }, [messages.value.length, pinToBottom.value])
 
   async function publish() {
+    if (publishing.value) return
+    const binding = capture('publish')
+    if (!binding.connectionId || !binding.owns()) return
+    const version = publishVersion.current
+    const log = logVersion.current
+    const infoRevision = infoGeneration.current
     const channel = channelName.value.trim()
-    const msg = payload.value.trim()
+    const msg = payload.value
     if (!channel) return
-    if (!msg) return
+    if (!msg.trim()) return
     publishing.value = true
     try {
-      const r = await api.query(
+      const r = await queryMutationOrThrow(
         `SELECT PUBSUB_PUBLISH('${channel.replace(/'/g, "''")}', '${msg.replace(/'/g, "''")}')`,
-        conn.id
+        binding.connectionId
       )
-      if (r.error) throw new Error(r.error)
-      const reached = r.rows.length > 0 ? Number(r.rows[0][0]) : 0
+      if (!binding.owns()) return
+      if (r.rows[0]?.[0] == null || !Number.isSafeInteger(Number(r.rows[0][0])) || Number(r.rows[0][0]) < 0) throw new Error('Publish outcome unavailable; verify before retrying')
+      const reached = Number(r.rows[0][0])
       // Record locally so the user can see what they sent
-      messages.value = [
+      if (log === logVersion.current) messages.value = [
         ...messages.value,
         { id: crypto.randomUUID(), payload: msg, receivedAt: new Date().toISOString() },
       ]
-      payload.value = ''
+      if (version === publishVersion.current) payload.value = ''
       toast('success', `Published to ${channel} (${reached} subscriber${reached !== 1 ? 's' : ''})`)
-      refreshInfo()
+      if (infoRevision === infoGeneration.current) void refreshInfo()
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      if (binding.owns()) { fail(err); toast('error', err instanceof Error ? err.message : String(err)) }
     } finally {
-      publishing.value = false
+      if (binding.owns()) publishing.value = false
     }
   }
 
@@ -116,6 +155,7 @@ export function PubSubModule({ name }: PubSubModuleProps) {
   }
 
   function clearLog() {
+    logVersion.current++
     messages.value = []
   }
 
@@ -140,7 +180,7 @@ export function PubSubModule({ name }: PubSubModuleProps) {
           value={channelName.value}
           placeholder="channel name"
           title="Channel to publish to"
-          onInput={e => { channelName.value = (e.target as HTMLInputElement).value }}
+          onInput={e => { invalidate(); channelName.value = (e.target as HTMLInputElement).value }}
           onKeyDown={e => { if (e.key === 'Enter') refreshInfo() }}
           onBlur={refreshInfo}
         />
@@ -153,6 +193,7 @@ export function PubSubModule({ name }: PubSubModuleProps) {
       </div>
 
       {rlsDenied.value && <RlsNotice detail={rlsDenied.value} />}
+      {unavailable.value && <div role="alert">PubSub data unavailable: {unavailable.value}</div>}
 
       {/* Toolbar: refresh, pin, export, clear */}
       <div class={s.toolbar}>
@@ -203,7 +244,7 @@ export function PubSubModule({ name }: PubSubModuleProps) {
           class={s.payloadInput}
           placeholder="Message payload..."
           value={payload.value}
-          onInput={e => { payload.value = (e.target as HTMLTextAreaElement).value }}
+          onInput={e => { publishVersion.current++; payload.value = (e.target as HTMLTextAreaElement).value }}
           onKeyDown={handleKey}
           rows={3}
         />
@@ -216,3 +257,5 @@ export function PubSubModule({ name }: PubSubModuleProps) {
     </div>
   )
 }
+
+const queryMutationOrThrow = (sql: string, connectionId: string, params?: unknown[]) => runMutation(sql, connectionId, params, api.query)

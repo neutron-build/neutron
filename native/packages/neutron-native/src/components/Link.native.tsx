@@ -1,4 +1,4 @@
-import { Text, Pressable } from 'react-native'
+import { Text, Pressable, Linking } from 'react-native'
 import { navigate } from '../router/navigator.js'
 import type { ReactNode } from 'react'
 import type { NativeStyleProp, NativeTextStyleProp } from '../types.js'
@@ -10,7 +10,8 @@ export interface LinkProps {
   pressableStyle?: NativeStyleProp
   replace?: boolean
   params?: Record<string, string>
-  /** Web only: render a plain anchor and let the browser handle the navigation. */
+  /** Render a plain anchor (web) / open through Linking (native) and let
+   * the system handle the navigation — for absolute external URLs. */
   external?: boolean
   disabled?: boolean
   accessibilityLabel?: string
@@ -24,6 +25,7 @@ export function Link({
   pressableStyle,
   replace,
   params,
+  external,
   disabled,
   accessibilityLabel,
   testID,
@@ -31,9 +33,18 @@ export function Link({
   return (
     <Pressable
       style={pressableStyle}
-      onPress={() => navigate(href, { replace, params })}
+      // External native links go through Linking.openURL (NF-NR-14):
+      // the signal router only understands in-app routes.
+      onPress={() => {
+        if (external) {
+          void Linking.openURL(href)
+          return
+        }
+        navigate(href, { replace, params })
+      }}
       disabled={disabled}
       accessibilityLabel={accessibilityLabel}
+      accessibilityRole="link"
       testID={testID}
     >
       <Text style={style}>{children}</Text>

@@ -1,0 +1,4 @@
+import type { ComponentChildren } from "preact";
+export default function Layout({ children }: {
+    children?: ComponentChildren;
+}) { return <><style>{`body{font:16px system-ui;margin:0;background:#f6f7f8;color:#17232c}main{max-width:980px;margin:2rem auto;padding:1rem}section,article{background:white;padding:1rem;margin:1rem 0;border:1px solid #ccd4da;border-radius:6px}label{display:block;margin:.7rem 0}input,textarea,select{display:block;box-sizing:border-box;width:100%;padding:.45rem;font:inherit}button{padding:.6rem;font:inherit}code,pre,dd{overflow-wrap:anywhere;white-space:pre-wrap}.values{display:grid;grid-template-columns:12rem 1fr;gap:.4rem}dd{margin:0}.muted{color:#526471}.conflict,.unknown,.error{border:2px solid #a34413;padding:.8rem}.success{border:2px solid #24713f;padding:.8rem}`}</style>{children}</>; }

@@ -1,3 +1,4 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useEffect } from 'preact/hooks'
 import { useSignal } from '@preact/signals'
 import { activeConnection, openTab, toast } from '../../lib/store'
@@ -15,19 +16,22 @@ export function ObjectInspector({ schema, table }: { schema: string; table: stri
   const error = useSignal<string | null>(null)
   const loading = useSignal(false)
 
+  const owner = useRequestOwner(JSON.stringify([conn?.id, schema, table]))
   useEffect(() => {
-    if (!conn) return
+    const owns = owner.begin()
+    if (!conn || !owns()) return
     loading.value = true
     error.value = null
     detail.value = null
     api.schemaObject(conn.id, schema, table)
-      .then(d => { detail.value = d })
+      .then(d => { if (owns()) detail.value = d })
       .catch(e => {
+        if (!owns()) return
         error.value = e instanceof ApiError && e.status === 404
           ? `${schema}.${table} is gone from the live catalog (dropped, renamed, or not visible to this role). Refresh the schema tree.`
           : e instanceof Error ? e.message : String(e)
       })
-      .finally(() => { loading.value = false })
+      .finally(() => { if (owns()) loading.value = false })
   }, [conn?.id, schema, table])
 
   if (!conn) return <div class={s.hint}>Connect to a database first</div>

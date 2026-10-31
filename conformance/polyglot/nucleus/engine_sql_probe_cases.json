@@ -1,0 +1,120 @@
+[
+  {
+    "id": "create_schema",
+    "sql": "CREATE SCHEMA np_probe",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "create_table",
+    "sql": "CREATE TABLE np_probe.items (id bigint PRIMARY KEY, n integer NOT NULL, active boolean NOT NULL, title text NOT NULL, data jsonb, stamp timestamptz NOT NULL)",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "insert_text_params",
+    "sql": "INSERT INTO np_probe.items (id, n, active, title, data, stamp) VALUES (%s, %s, %s, %s, %s, %s)",
+    "params": [1, 41, false, "probe-row-text", null, "2026-01-02T03:04:05.123456+00:00"],
+    "format": "text"
+  },
+  {
+    "id": "insert_binary_params",
+    "sql": "INSERT INTO np_probe.items (id, n, active, title, data, stamp) VALUES (%s, %s, %s, %s, %s, %s)",
+    "params": [2, 42, true, "probe-row-binary", null, "2026-01-02T03:04:05.654321+00:00"],
+    "format": "binary"
+  },
+  {
+    "id": "update_text_params",
+    "sql": "UPDATE np_probe.items SET title = %s, n = %s WHERE id = %s",
+    "params": ["probe-updated-text", 43, 1],
+    "format": "text"
+  },
+  {
+    "id": "update_binary_params",
+    "sql": "UPDATE np_probe.items SET title = %s, n = %s WHERE id = %s",
+    "params": ["probe-updated-binary", 44, 2],
+    "format": "binary"
+  },
+  {
+    "id": "select_null_jsonb_cast_text",
+    "sql": "SELECT id, data::text FROM np_probe.items WHERE id = %s",
+    "params": [1],
+    "format": "text"
+  },
+  {
+    "id": "select_null_jsonb_cast_binary_param",
+    "sql": "SELECT id, data::text FROM np_probe.items WHERE id = %s",
+    "params": [2],
+    "format": "binary"
+  },
+  {
+    "id": "select_table_rows",
+    "sql": "SELECT id, n, active, title, data, stamp FROM np_probe.items ORDER BY id",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "drop_schema",
+    "sql": "DROP SCHEMA np_probe CASCADE",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "drop_table",
+    "sql": "DROP TABLE np_probe.items",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "begin_read_committed",
+    "sql": "BEGIN ISOLATION LEVEL READ COMMITTED",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "savepoint_create",
+    "sql": "SAVEPOINT probe_sp",
+    "params": [],
+    "format": "text",
+    "setup": ["BEGIN ISOLATION LEVEL READ COMMITTED"]
+  },
+  {
+    "id": "savepoint_rollback",
+    "sql": "ROLLBACK TO SAVEPOINT probe_sp",
+    "params": [],
+    "format": "text",
+    "setup": ["BEGIN ISOLATION LEVEL READ COMMITTED", "SAVEPOINT probe_sp"]
+  },
+  {
+    "id": "savepoint_release",
+    "sql": "RELEASE SAVEPOINT probe_sp",
+    "params": [],
+    "format": "text",
+    "setup": ["BEGIN ISOLATION LEVEL READ COMMITTED", "SAVEPOINT probe_sp"]
+  },
+  {
+    "id": "create_role_plain",
+    "sql": "CREATE ROLE probe_login LOGIN PASSWORD 'PROBE_ROLE_PASSWORD'",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "role_login_plain",
+    "sql": "SELECT current_user",
+    "params": [],
+    "format": "text",
+    "connect_as": "probe_login"
+  },
+  {
+    "id": "create_role_quoted",
+    "sql": "CREATE ROLE \"probe_quoted\" LOGIN",
+    "params": [],
+    "format": "text"
+  },
+  {
+    "id": "quoted_role_name_storage",
+    "sql": "SELECT rolname FROM pg_roles WHERE rolname IN ('probe_quoted', '\"probe_quoted\"') ORDER BY rolname",
+    "params": [],
+    "format": "text"
+  }
+]

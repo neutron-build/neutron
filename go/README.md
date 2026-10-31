@@ -48,6 +48,33 @@ err = client.WithTx(ctx, nil, func(tx *nucleus.Tx) error {
 (`FRAMEWORK_CONTRACT.md` §3.14); its test asserts a `55P03` is attempted
 exactly once.
 
+## Migration metadata namespace
+
+The SDK migration APIs infer one persistent metadata schema from `current_schema()`
+at the start of each invocation and qualify all history and claim operations,
+including transaction writes, adoption, diagnostics and force-unlock. Configure
+the connection search path so that its first existing schema is the intended
+migration schema. Temporary shadows, a history or claim found in a later search
+path schema, and metadata views or unlogged tables are refused before metadata mutation; remove the
+shadow or configure the intended schema first. Quoted schema identifiers are
+supported. Existing history version columns must have actual builtin
+`pg_catalog.int2`, `int4` or `int8` identity; domains and custom types are refused
+before claim metadata is created. Canonical CLI text-ID histories still require
+`neutron migrate`.
+
+This freezes metadata resolution across pooled connections and migration SQL
+using `SET LOCAL search_path`. Supplied up/down SQL retains its own name-resolution
+semantics. Connections must target the same database and authorization principal;
+this does not pin a session or protect metadata from privileged concurrent DDL.
+The row claim, explicit recovery, checksums and adoption rules are unchanged.
+
+Actual persistent catalog identity is required. Published Nucleus 1.2.0 lacks the
+required `pg_catalog.to_regclass` capability, so these migration, status,
+lock-info and force-unlock APIs refuse that experimental provider path with an
+unsupported namespace profile before mutation. PostgreSQL wire compatibility
+alone does not admit a migration provider. Other client SQL/model APIs are not
+certified or refused by this migration-specific check.
+
 ## HTTP framework
 
 Generic typed handlers — input and output types flow into OpenAPI generation

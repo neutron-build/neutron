@@ -27,6 +27,10 @@ export interface AdapterBuildContext {
   outDir: string;
   routes: AdapterRoutesSummary;
   log: (message: string) => void;
+  /** Producer-issued public artifact paths relative to outDir. Only browser
+   * bundle output, explicitly public source assets and rendered static routes
+   * belong here. Arbitrary output-directory metadata is NOT public. */
+  publicArtifacts?: readonly string[];
   clientEntryScriptSrc?: string | null;
   /** Server actions the build registered (`"use server"` exports client code reaches). */
   serverActions?: number;

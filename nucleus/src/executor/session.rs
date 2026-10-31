@@ -6,7 +6,7 @@ use crate::security::SecurityManager;
 use crate::types::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 /// Wall-clock milliseconds since the Unix epoch (for idle tracking).
@@ -320,6 +320,12 @@ pub struct Session {
     pub(super) cross_model: parking_lot::Mutex<Option<super::cross_model::CrossModelTxn>>,
     pub(super) prepared_stmts: RwLock<HashMap<String, Arc<PreparedStmt>>>,
     pub(super) cursors: RwLock<HashMap<String, CursorDef>>,
+    /// Next cursor declaration number (`CursorDef::seq`).
+    pub(super) cursor_seq: AtomicU64,
+    /// For each open savepoint, the value `cursor_seq` had when it was taken.
+    /// ROLLBACK TO SAVEPOINT closes every cursor declared since. Synchronous
+    /// like `deferred_fk_savepoints`: never held across an await.
+    pub(super) cursor_savepoints: parking_lot::Mutex<Vec<(String, u64)>>,
     pub(super) settings: parking_lot::RwLock<HashMap<String, String>>,
     /// Principal proven by the connection authentication handshake.
     pub(super) authenticated_user: parking_lot::RwLock<Option<String>>,
@@ -352,6 +358,11 @@ pub struct Session {
     /// executor's long loops check it cooperatively and abort with SQLSTATE
     /// 57014. Cleared at each statement start.
     pub(super) cancel_requested: AtomicBool,
+    /// Wire identity is immutable while registered; zero means no live backend.
+    pub(super) backend_pid: AtomicI32,
+    /// SQL and wire cancellation share the same wakeup and command boundary.
+    pub(super) cancel_notify: Arc<tokio::sync::Notify>,
+    pub(super) cancel_boundary: parking_lot::Mutex<()>,
     /// Nesting depth of `execute_statement` on this session. Statements run
     /// re-entrantly (stored procedures, triggers, function bodies execute
     /// statements inside statements); row locks taken by an autocommit
@@ -408,6 +419,8 @@ impl Session {
             cross_model: parking_lot::Mutex::new(None),
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
+            cursor_seq: AtomicU64::new(0),
+            cursor_savepoints: parking_lot::Mutex::new(Vec::new()),
             settings: parking_lot::RwLock::new(default_settings),
             authenticated_user: parking_lot::RwLock::new(Some("nucleus".to_string())),
             current_role: parking_lot::RwLock::new(None),
@@ -433,6 +446,9 @@ impl Session {
             executing: AtomicBool::new(false),
             stream_capable_consumer: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
+            backend_pid: AtomicI32::new(0),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            cancel_boundary: parking_lot::Mutex::new(()),
             statement_depth: AtomicU64::new(0),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
             deferred_fks: parking_lot::Mutex::new(Default::default()),
@@ -628,6 +644,60 @@ impl Session {
         self.executing.store(false, Ordering::Relaxed);
     }
 
+    /// Close the cursors a finished transaction owned. PostgreSQL drops every
+    /// non-holdable cursor at COMMIT or ROLLBACK. A WITH HOLD cursor survives
+    /// COMMIT (and stops counting as transaction-scoped) but a ROLLBACK drops
+    /// the ones declared in the rolled-back transaction.
+    ///
+    /// Called after the transaction state lock is released, so this lock is
+    /// never taken while that one is held.
+    pub(super) async fn close_cursors_at_txn_end(&self, committed: bool) {
+        self.cursor_savepoints.lock().clear();
+        let mut cursors = self.cursors.write().await;
+        if committed {
+            cursors.retain(|_, c| c.hold);
+            for cursor in cursors.values_mut() {
+                cursor.opened_in_txn = false;
+            }
+        } else {
+            cursors.retain(|_, c| c.hold && !c.opened_in_txn);
+        }
+    }
+
+    /// SAVEPOINT: remember how many cursors the session had declared, so a
+    /// later ROLLBACK TO can close exactly the ones declared after it.
+    pub(super) fn savepoint_cursors(&self, name: &str) {
+        let mark = self.cursor_seq.load(Ordering::SeqCst);
+        self.cursor_savepoints.lock().push((name.to_string(), mark));
+    }
+
+    /// RELEASE SAVEPOINT: forget the savepoint and every later one. Cursors
+    /// are kept; they now belong to the enclosing savepoint.
+    pub(super) fn release_cursors_savepoint(&self, name: &str) {
+        let mut marks = self.cursor_savepoints.lock();
+        if let Some(pos) = marks.iter().rposition(|(n, _)| n == name) {
+            marks.truncate(pos);
+        }
+    }
+
+    /// ROLLBACK TO SAVEPOINT: the savepoint stays (as in PostgreSQL), later
+    /// ones go. Returns the cursor mark to close back to, `None` for a name
+    /// this session never recorded.
+    pub(super) fn rollback_cursors_savepoint(&self, name: &str) -> Option<u64> {
+        let mut marks = self.cursor_savepoints.lock();
+        let pos = marks.iter().rposition(|(n, _)| n == name)?;
+        let mark = marks[pos].1;
+        marks.truncate(pos + 1);
+        Some(mark)
+    }
+
+    /// Close every cursor declared at or after `mark`, held or not: a cursor
+    /// created inside a rolled-back savepoint does not outlive it. Cursors
+    /// declared earlier keep the position their FETCHes left them at.
+    pub(super) async fn close_cursors_since(&self, mark: u64) {
+        self.cursors.write().await.retain(|_, c| c.seq < mark);
+    }
+
     /// Reset session state for connection reuse.
     ///
     /// Clears prepared statements, cursors, CTEs, and resets settings to
@@ -654,6 +724,7 @@ impl Session {
         self.prepared_stmts.write().await.clear();
         // Clear cursors
         self.cursors.write().await.clear();
+        self.cursor_savepoints.lock().clear();
         // Clear CTEs
         self.active_ctes.write().clear();
         // Reset settings to defaults

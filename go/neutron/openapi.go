@@ -354,6 +354,14 @@ func generateOpenAPI(routes []routeRecord, info OpenAPIInfo) *OpenAPISpec {
 			op.Responses["204"] = OpenAPIResponse{Description: "No content"}
 		}
 
+		// Dynamic interface results can also be nil at runtime.
+		if route.OutType != nil && route.OutType.Kind() == reflect.Interface {
+			op.Responses["204"] = OpenAPIResponse{Description: "No content (nil result)"}
+		}
+		if hasRequestBody(route) {
+			op.Responses["413"] = problem("Payload Too Large")
+		}
+
 		// Error responses. 422 is only reachable when the input carries
 		// validate rules; the handler validates every non-Empty input.
 		op.Responses["400"] = problem("Bad Request")

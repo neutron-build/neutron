@@ -1,53 +1,15 @@
-import { describe, it, expect, beforeEach } from '@jest/globals'
-
-describe('Location web implementation', () => {
-  beforeEach(() => {
-    Object.defineProperty(navigator, 'geolocation', {
-      value: {
-        getCurrentPosition: jest.fn(),
-        watchPosition: jest.fn(),
-      },
-      configurable: true,
-    })
-  })
-
-  it('should get current position', async () => {
-    const geo = navigator.geolocation as any
-    const callback = jest.fn()
-    geo.getCurrentPosition(callback)
-    expect(geo.getCurrentPosition).toHaveBeenCalled()
-  })
-
-  it('should return position on success', () => {
-    const success = jest.fn()
-    const position = { coords: { latitude: 40.7128, longitude: -74.0060 } }
-    success(position)
-    expect(success).toHaveBeenCalledWith(position)
-  })
-
-  it('should handle permission denied', () => {
-    const error = jest.fn()
-    const err = { code: 1, message: 'Permission denied' }
-    error(err)
-    expect(error).toHaveBeenCalledWith(err)
-  })
-
-  it('should handle position unavailable', () => {
-    const error = jest.fn()
-    const err = { code: 2, message: 'Position unavailable' }
-    error(err)
-    expect(error).toHaveBeenCalledWith(err)
-  })
-
-  it('should watch position', () => {
-    const geo = navigator.geolocation as any
-    const callback = jest.fn()
-    geo.watchPosition(callback)
-    expect(geo.watchPosition).toHaveBeenCalledWith(callback)
-  })
-
-  it('should return watch ID', () => {
-    const watch = { id: 123 }
-    expect(watch.id).toBe(123)
-  })
+import { getModule, clearCache } from '../../registry.js'
+import '../../modules/location.web.js'
+let mod: any
+beforeEach(() => {
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {} })
+  ;(globalThis as any).window = { addEventListener: jest.fn(), removeEventListener: jest.fn(), location: { hostname: 'example.test' } }
+  ;(globalThis as any).document = {}
+  clearCache()
+  mod = getModule('NeutronLocation')
+  expect(mod).not.toBeNull()
 })
+afterEach(() => { jest.useRealTimers() })
+it('actual provider coordinates are normalized', async () => { (navigator as any).geolocation = { getCurrentPosition: jest.fn((cb: Function) => cb({ coords: { latitude: 1, longitude: 2, accuracy: 3 }, timestamp: 4 })) }; expect(await mod.getCurrentPosition()).toMatchObject({ ok: true, value: { latitude: 1, longitude: 2, timestamp: 4 } }) })
+it('permission denial maps to failure', async () => { (navigator as any).geolocation = { getCurrentPosition: (_s: Function, fail: Function) => fail({ code: 1, message: 'denied' }) }; expect(await mod.getCurrentPosition()).toMatchObject({ ok: false, error: { code: 'PERMISSION_DENIED' } }) })
+it('watch removal calls the actual provider id', () => { (navigator as any).geolocation = { watchPosition: jest.fn(() => 42), clearWatch: jest.fn() }; const subscription = mod.watchPosition(jest.fn()); subscription.remove(); expect(navigator.geolocation.clearWatch).toHaveBeenCalledWith(42) })

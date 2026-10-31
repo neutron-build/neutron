@@ -37,6 +37,7 @@ fn open(dir: &std::path::Path) -> (Executor, Arc<MvccStorageAdapter>) {
                 analyzer: None,
                 generation: None,
                 max_len: None,
+                numeric_typmod: None,
             })
             .collect();
         let _ = catalog.create_table_sync(TableDef {

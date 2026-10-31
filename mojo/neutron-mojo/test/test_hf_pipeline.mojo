@@ -100,8 +100,8 @@ def test_dlpack_device_cpu() raises:
     t.set(1, 2.0)
     t.set(2, 3.0)
     var managed = tensor_to_dlpack(t)
-    assert_true(managed.dl_tensor.device.device_type == kDLCPU, "device == CPU")
-    assert_true(Int(managed.dl_tensor.device.device_id) == 0, "device_id == 0")
+    assert_true(managed.borrow().dl_tensor.device.device_type == kDLCPU, "device == CPU")
+    assert_true(Int(managed.borrow().dl_tensor.device.device_id) == 0, "device_id == 0")
     dlpack_free(managed)
     print("PASS: test_dlpack_device_cpu")
 

@@ -1217,8 +1217,13 @@ impl DiskEngine {
         // Meta page directory area: from META_TABLE_DIR_START to end of page.
         // Reserve last 4 bytes for overflow page pointer.
         let meta_dir_capacity = PAGE_SIZE - META_TABLE_DIR_START - 4;
-        // Overflow pages: use first 4 bytes for next-overflow pointer, rest for data.
-        let overflow_capacity = PAGE_SIZE - 4;
+        // Overflow pages (v3 layout, NE-31): bytes 0..4 hold the next-chain
+        // pointer (never stamped by the flusher); the payload starts at
+        // COMMON_HEADER_SIZE — past the flush-stamped checksum (4..8) and
+        // LSN (8..16). The v2 layout started the payload at byte 4, so every
+        // WAL log/flush stamped the header OVER the first 12 payload bytes
+        // and reopen misread the directory.
+        let overflow_capacity = PAGE_SIZE - page::COMMON_HEADER_SIZE;
 
         // Collect existing overflow page IDs so we can reuse them
         let mut existing_overflow_pages: Vec<u32> = Vec::new();
@@ -1273,7 +1278,8 @@ impl DiskEngine {
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             cur_pg.fill(0);
             page::write_u32(&mut cur_pg, 0, next);
-            cur_pg[4..4 + chunk.len()].copy_from_slice(chunk);
+            cur_pg[page::COMMON_HEADER_SIZE..page::COMMON_HEADER_SIZE + chunk.len()]
+                .copy_from_slice(chunk);
             cur_pg.set_dirty();
         }
 
@@ -1316,7 +1322,8 @@ impl DiskEngine {
         let has_epoch = format_version >= 2;
         // Read the meta page and collect directory bytes, following overflow pages.
         let meta_dir_capacity = PAGE_SIZE - META_TABLE_DIR_START - 4;
-        let overflow_capacity = PAGE_SIZE - 4;
+        // v3 overflow layout (NE-31): payload past the flush-stamped header.
+        let overflow_capacity = PAGE_SIZE - page::COMMON_HEADER_SIZE;
 
         // Collect all directory bytes from meta page and overflow pages
         let mut dir_data = Vec::new();
@@ -1334,7 +1341,22 @@ impl DiskEngine {
             dir_data.extend_from_slice(&dir_area[..first_chunk_len]);
 
             // Read overflow page pointer (last 4 bytes of meta page)
-            page::read_u32(&pg, PAGE_SIZE - 4)
+            let ov = page::read_u32(&pg, PAGE_SIZE - 4);
+            // NE-31: a pre-v3 database with an overflow chain used the
+            // header-overlapping payload layout — its overflow bytes may
+            // already be corrupted by the flusher's checksum/LSN stamping.
+            // Refuse rather than trust (or "migrate") potentially damaged
+            // bytes into live state; a database this large should be
+            // restored from a snapshot or have its directory rebuilt.
+            if ov != INVALID_PAGE_ID && ov != 0 && format_version < 3 {
+                return Err(StorageError::Io(format!(
+                    "table-directory overflow pages in format v{format_version} predate the \
+                     v3 overflow layout (payload overlapped the page checksum/LSN header, so \
+                     flushes could corrupt it). Refusing to trust the stored directory; \
+                     restore from a snapshot or recreate the database"
+                )));
+            }
+            ov
         };
 
         // Follow overflow page chain. Cycle-guarded: a corrupted overflow
@@ -1351,8 +1373,10 @@ impl DiskEngine {
                 .read_guard(overflow_page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let next_overflow = page::read_u32(&opg, 0);
-            let chunk_len = overflow_capacity.min(opg.len() - 4);
-            dir_data.extend_from_slice(&opg[4..4 + chunk_len]);
+            let chunk_len = overflow_capacity.min(opg.len() - page::COMMON_HEADER_SIZE);
+            dir_data.extend_from_slice(
+                &opg[page::COMMON_HEADER_SIZE..page::COMMON_HEADER_SIZE + chunk_len],
+            );
             overflow_page_id = next_overflow;
         }
 
@@ -2735,18 +2759,7 @@ impl StorageEngine for DiskEngine {
         // first: `parking_lot`'s RwLock is not reentrant and read-then-write on
         // one thread deadlocks.
         drop(tables_guard);
-        let page_id = self.alloc_data_page(table)?;
-        let slot_idx = {
-            let mut pg = self
-                .pool
-                .write_guard(page_id)
-                .map_err(|e| StorageError::Io(e.to_string()))?;
-            let slot = page::insert_tuple(&mut pg, &data)
-                .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
-            pg.set_dirty();
-            slot
-        };
-        self.record_dirty_page(page_id);
+        let (page_id, slot_idx) = self.place_in_new_page(table, &data)?;
         // `alloc_data_page` already published `last_page = page_id` in the same
         // `tables` write section that linked the page into the chain. Setting
         // it again here was a lost update: two sessions that both found the old
@@ -4153,20 +4166,30 @@ impl DiskEngine {
             return Ok((page_id, slot_idx));
         }
 
-        // Allocate new page
-        let page_id = self.alloc_data_page(table)?;
-        let slot_idx = {
+        self.place_in_new_page(table, data)
+    }
+
+    /// Allocate a page for `table` and place `data` in it. `alloc_data_page`
+    /// publishes the page as the table's last page before this thread takes its
+    /// write latch, so a concurrent insert can fill it first; that is retried
+    /// with another page. A tuple that does not fit an empty page is an error.
+    fn place_in_new_page(&self, table: &str, data: &[u8]) -> Result<(u32, u16), StorageError> {
+        loop {
+            let page_id = self.alloc_data_page(table)?;
             let mut pg = self
                 .pool
                 .write_guard(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
-            let slot = page::insert_tuple(&mut pg, data)
-                .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
-            pg.set_dirty();
-            slot
-        };
-        self.record_dirty_page(page_id);
-        Ok((page_id, slot_idx))
+            if let Some(slot) = page::insert_tuple(&mut pg, data) {
+                pg.set_dirty();
+                drop(pg);
+                self.record_dirty_page(page_id);
+                return Ok((page_id, slot));
+            }
+            if page::slot_count(&pg) == 0 {
+                return Err(StorageError::Io("failed to insert into fresh page".into()));
+            }
+        }
     }
 }
 
@@ -4269,6 +4292,133 @@ mod tests {
     use crate::catalog::{Catalog, ColumnDef, TableDef};
     use crate::types::{DataType, Value};
 
+    /// NE-31: the table-directory overflow payload used to start at byte 4,
+    /// overlapping the flush-stamped checksum (4..8) and LSN (8..16) — every
+    /// WAL log/flush of an overflow page corrupted the first 12 payload
+    /// bytes, and a database with enough tables misread or lost directory
+    /// entries on reopen. The v3 layout places the payload past the header,
+    /// so the FULL flush path (which stamps LSN + checksum into every dirty
+    /// page, overflow pages included) must leave the directory intact across
+    /// two reopens.
+    #[tokio::test]
+    async fn table_directory_overflow_survives_flush_stamp_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("overflow.db");
+
+        // Enough tables (long names) to force MULTIPLE overflow pages.
+        let names: Vec<String> = (0..800)
+            .map(|i| format!("directory_overflow_table_{i:03}_with_a_deliberately_long_name"))
+            .collect();
+        let mut expected: Vec<(String, u32)> = Vec::new();
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
+            for (i, name) in names.iter().enumerate() {
+                register_simple_table(&catalog, name).await;
+                engine.create_table(name).await.unwrap();
+                engine
+                    .insert(name, simple_row(i as i32, &format!("v{i}")))
+                    .await
+                    .unwrap();
+            }
+            // Capture the directory as saved: names + first pages.
+            {
+                let tables = engine.tables.read();
+                for name in &names {
+                    let meta = tables.get(name).expect("table in directory");
+                    expected.push((name.clone(), meta.first_page));
+                }
+            }
+            assert!(
+                expected.len() > 200,
+                "fixture must be large enough to overflow the meta page"
+            );
+            // The full durability path: WAL log + checksum/LSN stamping.
+            engine.flush().unwrap();
+            engine.checkpoint().unwrap();
+        }
+
+        // Reopen twice: the directory must be byte-identical every time. On
+        // the pre-v3 layout the first flush already stamped the header over
+        // the payload and this failed on reopen #1.
+        for pass in 1..=2 {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog).unwrap();
+            let tables = engine.tables.read();
+            for (name, first_page) in &expected {
+                match tables.get(name) {
+                    Some(meta) => assert_eq!(
+                        meta.first_page, *first_page,
+                        "reopen {pass}: first page moved for {name}"
+                    ),
+                    None => panic!("reopen {pass}: table {name} lost from the directory"),
+                }
+            }
+            assert_eq!(
+                tables.len(),
+                expected.len(),
+                "reopen {pass}: directory entry count changed"
+            );
+        }
+    }
+
+    /// NE-31: a pre-v3 database WITH an overflow chain is refused rather
+    /// than trusted — its overflow payload may already be corrupted by the
+    /// old header-overlapping layout, and "migrating" it would launder
+    /// damaged bytes into live state.
+    #[tokio::test]
+    async fn pre_v3_overflow_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+
+        // Build a v3 database with overflow pages.
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
+            for i in 0..800 {
+                let name = format!("legacy_overflow_table_{i:03}_with_a_long_name_padding");
+                register_simple_table(&catalog, &name).await;
+                engine.create_table(&name).await.unwrap();
+            }
+            engine.flush().unwrap();
+            engine.checkpoint().unwrap();
+        }
+
+        // Read page 0, then close the engine (its drop may flush).
+        let mut page = {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open(&db_path, catalog).unwrap();
+            let pg = engine.pool.read_guard(0).unwrap();
+            *pg
+        };
+        // Downgrade the stamped format version to v2 and re-checksum page 0,
+        // producing a well-formed "legacy database with overflow" fixture.
+        page::write_u32(&mut page, page::META_DB_VERSION, 2);
+        page::write_checksum(&mut page);
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            f.write_all(&page).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Remove the WAL so recovery cannot replay the v3 page-0 image over
+        // the downgraded fixture (the fixture models a quiescent legacy
+        // database, not one mid-WAL).
+        let wal_dir = db_path.with_extension("wal.d");
+        let _ = std::fs::remove_dir_all(&wal_dir);
+        let _ = std::fs::remove_file(db_path.with_extension("wal"));
+
+        let catalog = Arc::new(Catalog::new());
+        let err = DiskEngine::open(&db_path, catalog).err().expect("must refuse");
+        assert!(
+            err.to_string().contains("predate the v3 overflow layout"),
+            "refusal must name the legacy overflow defect: {err}"
+        );
+    }
+
     /// Create a DiskEngine backed by a temp directory with an empty catalog.
     async fn setup_engine(dir: &std::path::Path) -> (DiskEngine, Arc<Catalog>) {
         let catalog = Arc::new(Catalog::new());
@@ -4335,6 +4485,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "name".into(),
@@ -4345,6 +4496,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -5019,6 +5171,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "label".into(),
@@ -5029,6 +5182,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "score".into(),
@@ -5039,6 +5193,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -5049,6 +5204,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -5681,6 +5837,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "b".into(),
@@ -5691,6 +5848,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "c".into(),
@@ -5701,6 +5859,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "d".into(),
@@ -5711,6 +5870,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "e".into(),
@@ -5721,6 +5881,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
             ],
             constraints: vec![],
@@ -8835,6 +8996,7 @@ mod tests {
             analyzer: None,
             generation: None,
             max_len: None,
+            numeric_typmod: None,
         })
         .collect();
         rt.block_on(catalog.create_table(TableDef {

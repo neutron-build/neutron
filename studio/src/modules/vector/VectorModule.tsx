@@ -1,5 +1,5 @@
 import { useSignal, useComputed } from '@preact/signals'
-import { useEffect } from 'preact/hooks'
+import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
@@ -138,7 +138,9 @@ function parseVectors(result: QueryResult): { ids: string[]; vectors: number[][]
       }
     }
 
-    if (vec && vec.length > 0) {
+    if (Array.isArray(vec) && vec.length > 0 && vec.length <= 4096 &&
+        vec.every(v => typeof v === 'number' && Number.isFinite(v)) &&
+        (vectors.length === 0 || vec.length === vectors[0].length)) {
       ids.push(id)
       vectors.push(vec)
       scores.push(scoreIdx >= 0 ? Number(r[scoreIdx]) : NaN)
@@ -329,6 +331,18 @@ function qIdent(ident: string): string {
   return `"${ident.replace(/"/g, '""')}"`
 }
 
+// UI cap bounds parsing/allocation; the database validates the column's exact dimension.
+export const MAX_VECTOR_DIMENSIONS = 4096
+export function validatedVector(text: string): string {
+  if (text.length > 256 * 1024) throw new Error('Vector input exceeds 256 KiB')
+  const value: unknown = JSON.parse(text)
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_VECTOR_DIMENSIONS ||
+      !value.every(n => typeof n === 'number' && Number.isFinite(n))) {
+    throw new Error(`Vector must contain 1–${MAX_VECTOR_DIMENSIONS} finite numbers`)
+  }
+  return JSON.stringify(value)
+}
+
 export function VectorModule({ name }: VectorModuleProps) {
   // Nucleus has no named/global vector store — nearest-neighbor search runs
   // against a user SQL table that has a VECTOR column. The user supplies the
@@ -347,43 +361,73 @@ export function VectorModule({ name }: VectorModuleProps) {
 
   const conn = activeConnection.value!
 
-  // Load a sample of stored vectors on mount — a plain table scan aliasing the
-  // vector column to `embedding` so the PCA plot can pick it up.
-  useEffect(() => {
-    async function loadSample() {
-      const table = tableName.value.trim()
-      const col = vecColumn.value.trim()
-      if (!table || !col) return
-      sampleLoading.value = true
-      try {
-        const r = await api.query(
-          `SELECT id, ${qIdent(col)} AS embedding FROM ${qIdent(table)} LIMIT 20`,
-          conn.id
-        )
-        sampleResult.value = r
-      } catch {
-        // not critical
-      } finally {
-        sampleLoading.value = false
+  const sampleGeneration = useRef(0)
+  const searchGeneration = useRef(0)
+  const searchRequest = useRef<{ connectionId: string; requestId: string } | null>(null)
+  const cancelRequested = useSignal(false)
+  const viewIdentity = () => JSON.stringify([activeConnection.value?.id, name, tableName.value.trim(), vecColumn.value.trim()])
+
+  function cancelSearch() {
+    const request = searchRequest.current
+    if (!request || cancelRequested.value) return
+    cancelRequested.value = true
+    void api.cancelQuery(request.connectionId, request.requestId).catch(err => {
+      if (searchRequest.current === request) {
+        cancelRequested.value = false
+        toast('error', `Cancel failed: ${err instanceof Error ? err.message : String(err)}`)
       }
-    }
-    loadSample()
-  }, [name])
+    })
+  }
+
+  function invalidateSearch() {
+    cancelSearch()
+    searchGeneration.current++
+    searchRequest.current = null
+    cancelRequested.value = false
+    running.value = false
+    result.value = null
+    selectedPointId.value = null
+    viewMode.value = 'grid'
+  }
+
+  useEffect(() => {
+    const generation = ++sampleGeneration.current
+    const identity = viewIdentity()
+    const owns = () => generation === sampleGeneration.current && identity === viewIdentity()
+    const table = tableName.value.trim()
+    const col = vecColumn.value.trim()
+    sampleResult.value = null
+    invalidateSearch()
+    if (!table || !col) { sampleLoading.value = false; return }
+    sampleLoading.value = true
+    api.query(`SELECT id, ${qIdent(col)} AS embedding FROM ${qIdent(table)} LIMIT 20`, conn.id)
+      .then(r => { if (owns()) sampleResult.value = r.canceled ? { ...r, error: r.error || 'Sample canceled' } : r })
+      .catch(err => { if (owns()) sampleResult.value = { columns: [], rows: [], rowCount: 0, duration: 0, error: String(err) } })
+      .finally(() => { if (owns()) sampleLoading.value = false })
+    return () => { sampleGeneration.current++; invalidateSearch() }
+  }, [name, conn.id, tableName.value, vecColumn.value])
 
   async function runSearch() {
+    if (running.value) return
     const vec = queryVec.value.trim()
     if (!vec) { toast('error', 'Enter a query vector'); return }
 
-    // Validate it looks like [n,n,n]
-    if (!vec.startsWith('[') || !vec.endsWith(']')) {
-      toast('error', 'Vector must be in [1.0, 0.5, ...] format')
-      return
-    }
+    let canonical: string
+    try { canonical = validatedVector(vec) } catch (err) { toast('error', String(err instanceof Error ? err.message : err)); return }
+    const distance = metric.value
+    if (!['l2', 'cosine', 'inner'].includes(distance)) { toast('error', 'Unsupported distance metric'); return }
+    const count = Number.isFinite(k.value) ? Math.max(1, Math.min(1000, Math.floor(k.value))) : 10
 
     const table = tableName.value.trim()
     const col = vecColumn.value.trim()
     if (!table || !col) { toast('error', 'Set a table and vector column'); return }
 
+    const generation = ++searchGeneration.current
+    const identity = viewIdentity()
+    const request = { connectionId: conn.id, requestId: crypto.randomUUID() }
+    searchRequest.current = request
+    cancelRequested.value = false
+    const owns = () => generation === searchGeneration.current && identity === viewIdentity()
     running.value = true
     result.value = null
     try {
@@ -391,26 +435,37 @@ export function VectorModule({ name }: VectorModuleProps) {
       // ORDER BY that distance. No vector_search()/vector_scan() — those do
       // not exist in the engine.
       const r = await api.query(
-        `SELECT id, ${qIdent(col)} AS embedding, VECTOR_DISTANCE(${qIdent(col)}, VECTOR('${vec}'), '${metric.value}') AS distance
+        `SELECT id, ${qIdent(col)} AS embedding, VECTOR_DISTANCE(${qIdent(col)}, VECTOR($1), '${distance}') AS distance
          FROM ${qIdent(table)}
          ORDER BY distance ASC
-         LIMIT ${k.value}`,
-        conn.id
+         LIMIT ${count}`,
+        request.connectionId, [canonical], request.requestId
       )
-      result.value = r
+      if (!owns()) return
+      result.value = r.canceled ? { ...r, error: r.error || 'Search canceled' } : r
     } catch (err: unknown) {
-      toast('error', err instanceof Error ? err.message : String(err))
+      if (!owns()) return
+      const message = err instanceof Error ? err.message : String(err)
+      result.value = { columns: [], rows: [], rowCount: 0, duration: 0, error: message }
+      toast('error', message)
     } finally {
-      running.value = false
+      if (owns()) { running.value = false; searchRequest.current = null; cancelRequested.value = false }
     }
   }
 
-  // Compute PCA projection from whichever result set is active
+  // Bound the optional plot independently of query dimensions. Grid never runs PCA.
+  const plotVectors = useComputed(() => {
+    const r = result.value ?? sampleResult.value
+    return r && !r.error ? parseVectors(r) : { ids: [], vectors: [], scores: [] }
+  })
+  const plotAllowed = useComputed(() => {
+    const { vectors } = plotVectors.value
+    return vectors.length >= 2 && vectors.length <= 200 && vectors.length * vectors[0].length <= 16384
+  })
+  // Compute PCA projection only when the bounded scatter view is visible
   const scatterData = useComputed<{ points: Point2D[]; hasScores: boolean }>(() => {
-    const activeResult = result.value ?? sampleResult.value
-    if (!activeResult || activeResult.error) return { points: [], hasScores: false }
-
-    const { ids, vectors, scores } = parseVectors(activeResult)
+    if (viewMode.value !== 'scatter' || !plotAllowed.value) return { points: [], hasScores: false }
+    const { ids, vectors, scores } = plotVectors.value
     if (vectors.length < 2) return { points: [], hasScores: false }
 
     const hasScores = scores.some(s => !isNaN(s))
@@ -418,9 +473,9 @@ export function VectorModule({ name }: VectorModuleProps) {
     return { points: projected, hasScores }
   })
 
-  const hasResults = result.value && !result.value.error
+  const hasResults = result.value
   const hasSample = sampleResult.value && !sampleResult.value.error
-  const canPlot = scatterData.value.points.length >= 2
+  const canPlot = plotAllowed.value
 
   return (
     <div class={s.layout}>
@@ -432,13 +487,13 @@ export function VectorModule({ name }: VectorModuleProps) {
           <input
             class={s.kInput}
             value={tableName.value}
-            onInput={e => { tableName.value = (e.target as HTMLInputElement).value }}
+            onInput={e => { invalidateSearch(); tableName.value = (e.target as HTMLInputElement).value }}
           />
           <label class={s.controlLabel}>Vector column</label>
           <input
             class={s.kInput}
             value={vecColumn.value}
-            onInput={e => { vecColumn.value = (e.target as HTMLInputElement).value }}
+            onInput={e => { invalidateSearch(); vecColumn.value = (e.target as HTMLInputElement).value }}
           />
         </div>
       </div>
@@ -450,7 +505,7 @@ export function VectorModule({ name }: VectorModuleProps) {
           class={s.vecInput}
           placeholder={`[0.1, 0.2, 0.3, ...]`}
           value={queryVec.value}
-          onInput={e => { queryVec.value = (e.target as HTMLTextAreaElement).value }}
+          onInput={e => { invalidateSearch(); queryVec.value = (e.target as HTMLTextAreaElement).value }}
           rows={3}
         />
         <div class={s.searchControls}>
@@ -462,7 +517,7 @@ export function VectorModule({ name }: VectorModuleProps) {
               min={1}
               max={1000}
               value={k.value}
-              onInput={e => { k.value = parseInt((e.target as HTMLInputElement).value) || 10 }}
+              onInput={e => { invalidateSearch(); k.value = parseInt((e.target as HTMLInputElement).value) || 10 }}
             />
           </div>
           <div class={s.controlGroup}>
@@ -470,7 +525,7 @@ export function VectorModule({ name }: VectorModuleProps) {
             <select
               class={s.metricSelect}
               value={metric.value}
-              onChange={e => { metric.value = (e.target as HTMLSelectElement).value as any }}
+              onChange={e => { invalidateSearch(); metric.value = (e.target as HTMLSelectElement).value as any }}
             >
               <option value="cosine">Cosine</option>
               <option value="l2">L2</option>
@@ -480,6 +535,9 @@ export function VectorModule({ name }: VectorModuleProps) {
           <button class={s.searchBtn} onClick={runSearch} disabled={running.value}>
             {running.value ? 'Searching...' : 'Search'}
           </button>
+          {running.value && <button class={s.searchBtn} onClick={cancelSearch} disabled={cancelRequested.value}>
+            {cancelRequested.value ? 'Cancellation requested...' : 'Cancel search'}
+          </button>}
         </div>
       </div>
 
@@ -549,6 +607,7 @@ export function VectorModule({ name }: VectorModuleProps) {
                 </div>
               )}
             </div>
+            {sampleResult.value?.error && <div class={s.error}>{sampleResult.value.error}</div>}
             {sampleLoading.value && <div class={s.msg}>Loading sample...</div>}
             {hasSample && viewMode.value === 'grid' && (
               <div class={s.grid}>

@@ -8,8 +8,10 @@
 //
 // The parser is incremental: push() takes arbitrary chunks (a record, a
 // quoted field or a CRLF may straddle chunk boundaries) and returns the
-// records completed so far; end() flushes the last record. Memory is bounded
-// by the largest single record (maxRecordChars), never by the file.
+// records completed so far; end() flushes the last record. Retained record
+// state is bounded by maxRecordChars and maxFields. push() also returns an
+// array of records completed in that caller chunk; streaming consumers must
+// bound their chunk size and release completed records.
 //
 // Rules:
 //   - fields are separated by the delimiter (default ","); records end at
@@ -51,6 +53,8 @@ export interface CsvParserOptions {
   delimiter?: string
   /** Largest accepted record in characters (default 1 MiB). */
   maxRecordChars?: number
+  /** Largest accepted field count, including empty fields (default 4096). */
+  maxFields?: number
 }
 
 const QUOTE = 0x22
@@ -64,10 +68,12 @@ const QUOTE_IN_QUOTED = 3
 const AFTER_CR = 4
 
 export const DEFAULT_MAX_RECORD_CHARS = 1 << 20
+export const DEFAULT_MAX_CSV_FIELDS = 4096
 
 export class CsvParser {
   private readonly delim: number
   private readonly maxChars: number
+  private readonly maxFields: number
   private state = FIELD_START
   private buf = ''
   private quoted = false
@@ -87,6 +93,9 @@ export class CsvParser {
     }
     this.delim = d.charCodeAt(0)
     this.maxChars = options.maxRecordChars ?? DEFAULT_MAX_RECORD_CHARS
+    if (!Number.isSafeInteger(this.maxChars) || this.maxChars < 1) throw new Error('CSV record limit must be a positive safe integer')
+    this.maxFields = options.maxFields ?? DEFAULT_MAX_CSV_FIELDS
+    if (!Number.isSafeInteger(this.maxFields) || this.maxFields < 1) throw new Error('CSV field limit must be a positive safe integer')
   }
 
   private beginRecord() {
@@ -108,6 +117,8 @@ export class CsvParser {
   }
 
   private pushField() {
+    // Empty fields consume objects even though their text has zero length.
+    if (this.fields.length >= this.maxFields) throw new CsvParseError(`record exceeds ${this.maxFields} fields; remove unused source columns before importing`, this.recordLine)
     this.fields.push({ text: this.buf, quoted: this.quoted })
     this.buf = ''
     this.quoted = false

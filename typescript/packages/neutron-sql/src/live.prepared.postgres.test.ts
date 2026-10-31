@@ -346,28 +346,22 @@ test(`live prepared: statements survive transaction rollback and abort on PG 17 
   });
 });
 
-test(`live prepared: tx-scoped prepare after the transaction ends follows the plain tx.query posture (documented lease)`, async (t) => {
-  // Review-1 MINOR-3: the tx-scoped prepare closes over the pooled client,
-  // which begin() releases in its finally — the pin OUTLIVES the transaction.
-  // That is the same posture plain tx.query already has (I01): use after the
-  // transaction ends still executes, on the released pooled client, and is
-  // UNSUPPORTED. Pinned so the documented behavior cannot drift silently.
-  await t.test("pg: escaped statement and tx both execute after end (unsupported lease)", async () => {
-    await withSuite("pg", async ({ db }) => {
-      let escaped: PreparedStatement | undefined;
-      let escapedTx: Driver | undefined;
-      await db.driver.begin(async (tx) => {
-        escaped = tx.prepare!("select 13::int as v");
-        escapedTx = tx;
-        assert.equal((await escaped.query<{ v: number }>())[0].v, 13, "in-tx execution on the pinned connection");
+test(`live prepared: transaction-scoped statements and queries refuse use after settlement`, async (t) => {
+  for (const driver of ["pg", "postgres"] as const) {
+    await t.test(`${driver}: escaped statement and transaction refuse a released lease`, async () => {
+      await withSuite(driver, async ({ db }) => {
+        let escaped!: PreparedStatement;
+        let escapedTx!: Driver;
+        await db.driver.begin(async tx => {
+          escaped = tx.prepare!("select 13::int as v"); escapedTx = tx;
+          assert.equal((await escaped.query<{v:number}>())[0].v,13);
+        });
+        await assert.rejects(escaped.query(), /scope is settled/);
+        await assert.rejects(escapedTx.query("select 1 as v"), /scope is settled/);
+        assert.equal((await db.driver.query<{v:number}>("select 17::int as v"))[0].v,17);
       });
-      assert.ok(escaped && escapedTx);
-      const rows = await escaped!.query<{ v: number }>();
-      assert.equal(rows[0].v, 13, "use-after-end still executes on the released pooled client (documented, unsupported)");
-      const plain = await escapedTx!.query<{ v: number }>("select 1 as v");
-      assert.equal(plain[0].v, 1, "plain tx.query after end behaves identically — the I01 posture");
     });
-  });
+  }
 });
 
 test(`live prepared: adapters without prepare fail closed through the helper`, async () => {

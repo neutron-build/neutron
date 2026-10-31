@@ -11,7 +11,7 @@ Reference: "RoFormer: Enhanced Transformer with Rotary Position Embedding"
            (Su et al., 2021)
 """
 
-from std.math import sin, cos
+from std.math import sin, cos, isfinite
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 
@@ -26,13 +26,14 @@ struct RoPETable(Movable):
     Stores cos(m*theta_i) and sin(m*theta_i) for all positions m
     and frequency indices i, where theta_i = 1 / (base^(2i/dim)).
     """
-    var cos_table: Tensor[DType.float32]  # [max_seq_len, head_dim/2]
-    var sin_table: Tensor[DType.float32]  # [max_seq_len, head_dim/2]
+    var cos_table: Tensor[DType.float32]  # [max_seq_len * rotary_dim/2]
+    var sin_table: Tensor[DType.float32]  # [max_seq_len * rotary_dim/2]
     var head_dim: Int
+    var rotary_dim: Int
     var max_seq_len: Int
     var theta_base: Float64
 
-    def __init__(out self, head_dim: Int, max_seq_len: Int, theta: Float64 = 10000.0):
+    def __init__(out self, head_dim: Int, max_seq_len: Int, theta: Float64 = 10000.0, rotary_dim: Int = -1) raises:
         """Precompute RoPE cos/sin tables.
 
         Args:
@@ -40,28 +41,42 @@ struct RoPETable(Movable):
             max_seq_len: Maximum sequence length to precompute.
             theta: Base frequency (10000 for original, 500000 for Llama-3).
         """
+        var selected = head_dim if rotary_dim == -1 else rotary_dim
+        if head_dim <= 0 or head_dim % 2 != 0 or selected < 0 or selected > head_dim or selected % 2 != 0 or max_seq_len < 0 or not isfinite(theta) or theta <= 0:
+            raise Error("Invalid RoPE descriptor")
+        _ = Shape(max_seq_len, selected // 2).numel()
+        self.rotary_dim = selected
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.theta_base = theta
 
-        var half_dim = head_dim // 2
+        var half_dim = selected // 2
         self.cos_table = Tensor[DType.float32](Shape(max_seq_len * half_dim))
         self.sin_table = Tensor[DType.float32](Shape(max_seq_len * half_dim))
 
         # Precompute frequencies: theta_i = 1 / (base^(2i/dim))
         for pos in range(max_seq_len):
             for i in range(half_dim):
-                var freq_exp = Float64(2 * i) / Float64(head_dim)
+                var freq_exp = Float64(2 * i) / Float64(selected)
                 var freq = 1.0 / (theta ** freq_exp)
                 var angle = Float64(pos) * freq
 
                 self.cos_table.set(pos * half_dim + i, Float32(cos(angle)))
                 self.sin_table.set(pos * half_dim + i, Float32(sin(angle)))
 
+    def validate(self) raises:
+        """Check public descriptor fields against actual table storage."""
+        if self.head_dim <= 0 or self.head_dim % 2 != 0 or self.rotary_dim < 0 or self.rotary_dim > self.head_dim or self.rotary_dim % 2 != 0 or self.max_seq_len < 0 or not isfinite(self.theta_base) or self.theta_base <= 0:
+            raise Error("Invalid RoPE descriptor")
+        var count = Shape(self.max_seq_len, self.rotary_dim // 2).numel()
+        if self.cos_table.numel() != count or self.sin_table.numel() != count:
+            raise Error("RoPE table storage does not match descriptor")
+
     def __init__(out self, *, deinit move: Self):
         self.cos_table = move.cos_table^
         self.sin_table = move.sin_table^
         self.head_dim = move.head_dim^
+        self.rotary_dim = move.rotary_dim^
         self.max_seq_len = move.max_seq_len^
         self.theta_base = move.theta_base^
 
@@ -92,8 +107,13 @@ def apply_rope(
         seq_len: Number of positions to process.
         num_heads: Number of attention heads.
     """
+    table.validate()
+    if start_pos < 0 or seq_len < 0 or start_pos > table.max_seq_len or seq_len > table.max_seq_len - start_pos or num_heads <= 0:
+        raise Error("Invalid RoPE position/span")
+    if x.numel() != Shape(seq_len,num_heads,table.head_dim).numel():
+        raise Error("RoPE input span mismatch")
     var head_dim = table.head_dim
-    var half_dim = head_dim // 2
+    var half_dim = table.rotary_dim // 2
 
     for s in range(seq_len):
         var pos = start_pos + s
@@ -127,7 +147,12 @@ def apply_rope_single_head(
         table: Precomputed RoPE cos/sin table.
         pos: Position index.
     """
-    var half_dim = table.head_dim // 2
+    table.validate()
+    if pos < 0 or pos >= table.max_seq_len:
+        raise Error("RoPE position outside table")
+    if x.ndim() != 1 or (x.numel() != table.head_dim and x.numel() != table.rotary_dim) or x.numel() % 2 != 0:
+        raise Error("RoPE vector has invalid rotary width")
+    var half_dim = table.rotary_dim // 2
     var table_offset = pos * half_dim
 
     for i in range(half_dim):
@@ -150,7 +175,7 @@ def apply_rope_batch(
     num_q_heads: Int,
     num_kv_heads: Int,
     head_dim: Int,
-):
+) raises:
     """Apply RoPE to batched Q and K tensors in-place.
 
     Processes all tokens at once instead of per-token extraction loops.
@@ -165,7 +190,12 @@ def apply_rope_batch(
         num_kv_heads: Number of KV heads.
         head_dim: Per-head dimension.
     """
-    var half_dim = head_dim // 2
+    table.validate()
+    if head_dim != table.head_dim or num_q_heads <= 0 or num_kv_heads <= 0 or num_tokens < 0 or start_pos < 0 or start_pos > table.max_seq_len or num_tokens > table.max_seq_len - start_pos:
+        raise Error("Invalid batched RoPE descriptor/span")
+    if q_batch.numel() != Shape(num_tokens,num_q_heads,head_dim).numel() or k_batch.numel() != Shape(num_tokens,num_kv_heads,head_dim).numel():
+        raise Error("Batched RoPE input size mismatch")
+    var half_dim = table.rotary_dim // 2
     var q_dim = num_q_heads * head_dim
     var kv_dim = num_kv_heads * head_dim
 

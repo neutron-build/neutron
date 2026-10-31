@@ -10,7 +10,7 @@ in a flat indexed structure.
 """
 
 from neutron_mojo.tensor.tensor import Tensor
-from std.math import exp, tanh, sqrt
+from std.math import exp, tanh, sqrt, isfinite
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.tensor.ops import rmsnorm
 from neutron_mojo.tensor.simd_math import (
@@ -122,6 +122,75 @@ struct ModelParams(Copyable, ImplicitlyCopyable):
         self.rope_theta = copy.rope_theta
         self.arch = copy.arch.copy()
 
+    def validate(self) raises:
+        """Validate model allocation arithmetic before computing any offsets."""
+        if self.num_layers <= 0 or self.vocab_size <= 0 or self.hidden_dim <= 0 or self.num_q_heads <= 0 or self.num_kv_heads <= 0 or self.head_dim <= 0 or self.ffn_dim <= 0 or self.max_seq_len <= 0:
+            raise Error("Model dimensions must be positive")
+        if self.head_dim % 2 != 0 or not isfinite(self.rope_theta) or self.rope_theta <= 0 or not isfinite(self.arch.norm_eps) or self.arch.norm_eps <= 0:
+            raise Error("Invalid model rotary width/theta or normalization epsilon")
+        if self.arch.kind._value < 0 or self.arch.kind._value > 4 or not isfinite(self.arch.partial_rotary_factor) or self.arch.partial_rotary_factor < 0 or self.arch.partial_rotary_factor > 1 or not isfinite(self.arch.rope_scaling) or self.arch.rope_scaling <= 0 or self.arch.window_size < 0 or (self.arch.use_sliding_window and self.arch.window_size == 0):
+            raise Error("Invalid model architecture configuration")
+        if self.num_q_heads % self.num_kv_heads != 0:
+            raise Error("Query heads must be divisible by KV heads")
+        var q = Shape(self.num_q_heads, self.head_dim).numel()
+        var kv = Shape(self.num_kv_heads, self.head_dim).numel()
+        var h = self.hidden_dim
+        _ = Shape(self.vocab_size, h, 4).numel()
+        var counts: List[Int] = [
+            h,
+            Shape(q, h).numel(),
+            Shape(kv, h).numel(),
+            Shape(kv, h).numel(),
+            Shape(h, q).numel(),
+            h,
+            Shape(self.ffn_dim, h).numel(),
+            Shape(self.ffn_dim, h).numel(),
+            Shape(h, self.ffn_dim).numel(),
+        ]
+        var total = 0
+        for i in range(len(counts)):
+            if counts[i] > 0x7FFFFFFFFFFFFFFF - total:
+                raise Error("Model layer size overflow")
+            total += counts[i]
+        _ = Shape(self.num_layers, total, 4).numel()
+
+    def validate_generation(self, prompt_tokens: List[Int], budget: Int, capacity: Int) raises -> Int:
+        """Shared prompt/budget admission, including the legal empty zero-work case."""
+        self.validate()
+        if budget < 0 or capacity <= 0 or (budget > 0 and len(prompt_tokens) == 0):
+            raise Error("Invalid generation prompt or budget")
+        var limit = min(capacity, self.max_seq_len)
+        if len(prompt_tokens) > limit or budget > limit - len(prompt_tokens):
+            raise Error("Prompt plus generation exceeds context capacity")
+        for token in prompt_tokens:
+            if token < 0 or token >= self.vocab_size:
+                raise Error("Prompt token outside vocabulary")
+        var total = len(prompt_tokens) + budget
+        var span = Shape(self.num_layers, total, self.num_kv_heads, self.head_dim, 4)
+        return total
+
+    def rotary_dim(self) raises -> Int:
+        var factor = self.arch.partial_rotary_factor
+        if not isfinite(factor) or factor < 0 or factor > 1:
+            raise Error("Invalid partial rotary factor")
+        var dim = Int(Float64(self.head_dim) * Float64(factor))
+        return dim - dim % 2
+
+    def validate_execution(self, rope: RoPETable, pos: Int, count: Int = 1,
+                           specialized: Bool = False) raises:
+        self.validate()
+        rope.validate()
+        if pos < 0 or count < 0 or pos > self.max_seq_len or count > self.max_seq_len - pos or pos > rope.max_seq_len or count > rope.max_seq_len - pos:
+            raise Error("Model execution exceeds context/RoPE capacity")
+        if rope.head_dim != self.head_dim or rope.rotary_dim != self.rotary_dim() or rope.theta_base != self.rope_theta:
+            raise Error("Model RoPE descriptor mismatch")
+        if self.arch.kind._value == 3:
+            raise Error("Gemma execution requires an embedding/norm adapter not implemented by this path")
+        if self.arch.use_sliding_window or self.arch.use_pre_norm_bias or self.arch.rope_scaling != 1:
+            raise Error("This execution path does not implement sliding window, norm bias or RoPE scaling")
+        if specialized and (self.arch.use_gelu or self.arch.partial_rotary_factor != 1 or self.arch.norm_eps != Float32(1e-6)):
+            raise Error("Specialized execution requires full rotary SwiGLU and default RMSNorm epsilon")
+
     def q_dim(self) -> Int:
         return self.num_q_heads * self.head_dim
 
@@ -180,7 +249,8 @@ struct Model(Movable):
     var layer_weights: Tensor[DType.float32]
     var layer_size: Int  # elements per layer
 
-    def __init__(out self, params: ModelParams):
+    def __init__(out self, params: ModelParams) raises:
+        params.validate()
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
 
@@ -203,6 +273,15 @@ struct Model(Movable):
             for i in range(params.hidden_dim):
                 self.layer_weights.set(offsets.ffn_norm + i, 1.0)
 
+    def __init__(out self, *, copy_data: Self):
+        """Copy admitted allocations without accepting new allocation sizes."""
+        self.params = copy_data.params.copy()
+        self.embed = copy_data.embed.clone()
+        self.final_norm = copy_data.final_norm.clone()
+        self.lm_head = copy_data.lm_head.clone()
+        self.layer_weights = copy_data.layer_weights.clone()
+        self.layer_size = copy_data.layer_size
+
     def __init__(out self, *, deinit move: Self):
         self.params = move.params.copy()
         self.embed = move.embed^
@@ -210,6 +289,15 @@ struct Model(Movable):
         self.lm_head = move.lm_head^
         self.layer_weights = move.layer_weights^
         self.layer_size = move.layer_size^
+
+    def validate_storage(self) raises:
+        """Check model metadata against actual owned spans before forward access."""
+        self.params.validate()
+        var p = self.params.copy()
+        var matrix_count = Shape(p.vocab_size, p.hidden_dim).numel()
+        var layer_count = p.layer_weight_count()
+        if self.layer_size != layer_count or self.embed.numel() != matrix_count or self.lm_head.numel() != matrix_count or self.final_norm.numel() != p.hidden_dim or self.layer_weights.numel() != Shape(p.num_layers, layer_count).numel():
+            raise Error("Model parameter storage does not match metadata")
 
     def _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
         """Compute element offsets for a layer's weights."""
@@ -241,7 +329,7 @@ struct Model(Movable):
         off.w_down = cursor
         return off^
 
-    def _get_norm(self, offset: Int, size: Int) -> Tensor[DType.float32]:
+    def _get_norm(self, offset: Int, size: Int) raises -> Tensor[DType.float32]:
         """Extract a norm vector from layer weights."""
         var result = Tensor[DType.float32](Shape(size))
         for i in range(size):
@@ -254,7 +342,7 @@ struct Model(Movable):
         weight_offset: Int,
         out_dim: Int,
         in_dim: Int,
-    ) -> Tensor[DType.float32]:
+    ) raises -> Tensor[DType.float32]:
         """Parallel SIMD matrix-vector multiply using flat weight storage.
 
         Uses par_simd_matvec which auto-parallelizes for large matrices
@@ -284,13 +372,20 @@ struct Model(Movable):
         Returns:
             Output [hidden_dim].
         """
+        self.params.validate_execution(rope, pos, specialized=False)
+        self.validate_storage()
+        if x.numel() != self.params.hidden_dim:
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1, layer)
+        if layer < 0 or layer >= self.params.num_layers:
+            raise Error("Model layer index out of range")
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = self._layer_offsets(layer)
 
         # === Attention sublayer ===
         var normed = Tensor[DType.float32](Shape(hd))
-        simd_rmsnorm(normed, 0, x, 0, self.layer_weights, off.attn_norm, hd)
+        simd_rmsnorm(normed, 0, x, 0, self.layer_weights, off.attn_norm, hd, eps=p.arch.norm_eps)
 
         # Q/K/V projections
         var q = self._linear_from_flat(normed, off.wq, p.q_dim(), hd)
@@ -298,12 +393,7 @@ struct Model(Movable):
         var v = self._linear_from_flat(normed, off.wv, p.kv_dim(), hd)
 
         # Apply RoPE (with partial rotary support for Phi)
-        var rotary_dim = p.head_dim
-        if p.arch.partial_rotary_factor < 1.0:
-            rotary_dim = Int(Float32(p.head_dim) * p.arch.partial_rotary_factor)
-            # Ensure even
-            if rotary_dim % 2 != 0:
-                rotary_dim -= 1
+        var rotary_dim = p.rotary_dim()
 
         for h in range(p.num_q_heads):
             var q_head = Tensor[DType.float32](Shape(rotary_dim))
@@ -339,7 +429,7 @@ struct Model(Movable):
 
         # === FFN sublayer ===
         var ffn_normed = Tensor[DType.float32](Shape(hd))
-        simd_rmsnorm(ffn_normed, 0, residual1, 0, self.layer_weights, off.ffn_norm, hd)
+        simd_rmsnorm(ffn_normed, 0, residual1, 0, self.layer_weights, off.ffn_norm, hd, eps=p.arch.norm_eps)
 
         var gate = self._linear_from_flat(ffn_normed, off.w_gate, p.ffn_dim, hd)
         var up = self._linear_from_flat(ffn_normed, off.w_up, p.ffn_dim, hd)
@@ -384,13 +474,18 @@ struct Model(Movable):
         Returns:
             Logits [vocab_size].
         """
+        self.params.validate_execution(rope, pos, specialized=False)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1)
+        if token_id < 0 or token_id >= self.params.vocab_size:
+            raise Error("Token outside vocabulary")
         var hidden = embed_token(self.embed, token_id, self.params.hidden_dim)
 
         for layer in range(self.params.num_layers):
             hidden = self.forward_layer(hidden, layer, cache, rope, pos)
 
         var normed = Tensor[DType.float32](Shape(self.params.hidden_dim))
-        simd_rmsnorm(normed, 0, hidden, 0, self.final_norm, 0, self.params.hidden_dim)
+        simd_rmsnorm(normed, 0, hidden, 0, self.final_norm, 0, self.params.hidden_dim, eps=self.params.arch.norm_eps)
         # LM head is the largest matvec (vocab_size rows) — use parallel version
         var logits = Tensor[DType.float32](Shape(self.params.vocab_size))
         par_simd_matvec(logits, 0, self.lm_head, 0, normed, 0, self.params.vocab_size, self.params.hidden_dim)
@@ -408,12 +503,19 @@ struct Model(Movable):
 
         Same as forward_layer but stores K/V quantized and uses Q8 attention.
         """
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        if x.numel() != self.params.hidden_dim:
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1, layer)
+        if layer < 0 or layer >= self.params.num_layers:
+            raise Error("Model layer index out of range")
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = self._layer_offsets(layer)
 
         var normed = Tensor[DType.float32](Shape(hd))
-        simd_rmsnorm(normed, 0, x, 0, self.layer_weights, off.attn_norm, hd)
+        simd_rmsnorm(normed, 0, x, 0, self.layer_weights, off.attn_norm, hd, eps=p.arch.norm_eps)
 
         var q = self._linear_from_flat(normed, off.wq, p.q_dim(), hd)
         var k = self._linear_from_flat(normed, off.wk, p.kv_dim(), hd)
@@ -453,7 +555,7 @@ struct Model(Movable):
             residual1.set(i, x.get(i) + attn_proj.get(i))
 
         var ffn_normed = Tensor[DType.float32](Shape(hd))
-        simd_rmsnorm(ffn_normed, 0, residual1, 0, self.layer_weights, off.ffn_norm, hd)
+        simd_rmsnorm(ffn_normed, 0, residual1, 0, self.layer_weights, off.ffn_norm, hd, eps=p.arch.norm_eps)
 
         var gate = self._linear_from_flat(ffn_normed, off.w_gate, p.ffn_dim, hd)
         var up = self._linear_from_flat(ffn_normed, off.w_up, p.ffn_dim, hd)
@@ -477,13 +579,18 @@ struct Model(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Full forward pass with Q8 KV cache: embed → N layers → norm → logits."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1)
+        if token_id < 0 or token_id >= self.params.vocab_size:
+            raise Error("Token outside vocabulary")
         var hidden = embed_token(self.embed, token_id, self.params.hidden_dim)
 
         for layer in range(self.params.num_layers):
             hidden = self.forward_layer_q8cache(hidden, layer, cache, rope, pos)
 
         var normed = Tensor[DType.float32](Shape(self.params.hidden_dim))
-        simd_rmsnorm(normed, 0, hidden, 0, self.final_norm, 0, self.params.hidden_dim)
+        simd_rmsnorm(normed, 0, hidden, 0, self.final_norm, 0, self.params.hidden_dim, eps=self.params.arch.norm_eps)
         var logits = Tensor[DType.float32](Shape(self.params.vocab_size))
         par_simd_matvec(logits, 0, self.lm_head, 0, normed, 0, self.params.vocab_size, self.params.hidden_dim)
         return logits^
@@ -514,6 +621,13 @@ struct Model(Movable):
         Returns:
             Output [hidden_dim].
         """
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        if x.numel() != self.params.hidden_dim:
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1, layer)
+        if layer < 0 or layer >= self.params.num_layers:
+            raise Error("Model layer index out of range")
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = self._layer_offsets(layer)
@@ -628,13 +742,18 @@ struct Model(Movable):
         Returns:
             Logits [vocab_size].
         """
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1)
+        if token_id < 0 or token_id >= self.params.vocab_size:
+            raise Error("Token outside vocabulary")
         var hidden = embed_token(self.embed, token_id, self.params.hidden_dim)
 
         for layer in range(self.params.num_layers):
             hidden = self.forward_layer_fused(hidden, layer, cache, rope, pos)
 
         var normed = Tensor[DType.float32](Shape(self.params.hidden_dim))
-        simd_rmsnorm(normed, 0, hidden, 0, self.final_norm, 0, self.params.hidden_dim)
+        simd_rmsnorm(normed, 0, hidden, 0, self.final_norm, 0, self.params.hidden_dim, eps=self.params.arch.norm_eps)
         var logits = Tensor[DType.float32](Shape(self.params.vocab_size))
         par_simd_matvec(logits, 0, self.lm_head, 0, normed, 0, self.params.vocab_size, self.params.hidden_dim)
         return logits^
@@ -649,7 +768,7 @@ struct Model(Movable):
         weight_offset: Int,
         out_dim: Int,
         in_dim: Int,
-    ) -> Tensor[DType.float32]:
+    ) raises -> Tensor[DType.float32]:
         """Batch SIMD-vectorized matrix-vector multiply using flat weight storage.
 
         Processes num_tokens vectors at once with shared weight matrix.
@@ -686,6 +805,13 @@ struct Model(Movable):
         Returns:
             Output [num_tokens * hidden_dim] flattened.
         """
+        self.params.validate_execution(rope, start_pos, num_tokens, specialized=True)
+        self.validate_storage()
+        if x_batch.numel() != Shape(num_tokens, self.params.hidden_dim).numel():
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, start_pos, num_tokens, layer)
+        if layer < 0 or layer >= self.params.num_layers:
+            raise Error("Model layer index out of range")
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = self._layer_offsets(layer)
@@ -774,7 +900,15 @@ struct Model(Movable):
         Returns:
             Logits [vocab_size] for the last token.
         """
+        self.params.validate_execution(rope, start_pos, len(token_ids), specialized=True)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, start_pos, len(token_ids))
+        for token in token_ids:
+            if token < 0 or token >= self.params.vocab_size:
+                raise Error("Token outside vocabulary")
         var N = len(token_ids)
+        if N == 0:
+            raise Error("prefill requires at least one token")
         var hd = self.params.hidden_dim
 
         # Embed all tokens into a batch tensor [N * hidden_dim]
@@ -825,7 +959,11 @@ def generate(
         Generated token IDs (not including prompt).
     """
     var p = model.params.copy()
-    var total_len = len(prompt_tokens) + max_new_tokens
+    var total_len = p.validate_generation(prompt_tokens, max_new_tokens, p.max_seq_len)
+    if not isfinite(temperature) or temperature < 0:
+        raise Error("Invalid generation temperature")
+    if max_new_tokens == 0:
+        return List[Int]()
 
     var cache = MultiLayerKVCache(
         num_layers=p.num_layers,
@@ -837,6 +975,7 @@ def generate(
         head_dim=p.head_dim,
         max_seq_len=total_len,
         theta=p.rope_theta,
+        rotary_dim=p.rotary_dim(),
     )
 
     var generated = List[Int]()

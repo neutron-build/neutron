@@ -124,7 +124,7 @@ struct AttentionScoreTracker(Movable):
     var max_positions: Int
     var active_count: Int               # Number of positions with scores
 
-    def __init__(out self, max_positions: Int):
+    def __init__(out self, max_positions: Int) raises:
         self.max_positions = max_positions
         self.active_count = 0
         self.scores = Tensor[DType.float32](Shape(max_positions))

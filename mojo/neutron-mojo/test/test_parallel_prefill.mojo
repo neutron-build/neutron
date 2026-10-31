@@ -32,7 +32,7 @@ def assert_near(a: Float32, b: Float32, tol: Float32, msg: String) raises:
         )
 
 
-def _build_model() -> Model:
+def _build_model() raises -> Model:
     """Build a tiny model with non-trivial weights."""
     var p = tiny_test_params()
     var model = Model(p)

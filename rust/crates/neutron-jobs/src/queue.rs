@@ -16,6 +16,7 @@ use tokio::sync::Notify;
 #[derive(Debug)]
 pub struct QueuedJob {
     pub id: u64,
+    pub claim_token: u64,
     pub job_type: String,
     pub payload: Vec<u8>,
     pub queue: String,
@@ -57,6 +58,8 @@ pub struct JobQueue {
     heap: Mutex<BinaryHeap<MinByRunAt>>,
     notify: Notify,
     next_id: AtomicU64,
+    pub(crate) stale_secs: AtomicU64,
+    pub(crate) persistent_queues: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl JobQueue {
@@ -65,6 +68,8 @@ impl JobQueue {
             heap: Mutex::new(BinaryHeap::new()),
             notify: Notify::new(),
             next_id: AtomicU64::new(1),
+            stale_secs: AtomicU64::new(300),
+            persistent_queues: Mutex::new(["default".to_string()].into()),
         }
     }
 
@@ -103,6 +108,7 @@ impl JobQueue {
         let id = self.next_id.fetch_add(1, AtomicOrdering::Relaxed);
         let job = QueuedJob {
             id,
+            claim_token: 0,
             job_type: job_type.into(),
             payload,
             queue: "default".to_string(),
@@ -139,6 +145,10 @@ impl JobQueue {
         } else {
             None
         }
+    }
+
+    pub(crate) fn wake(&self) {
+        self.notify.notify_one();
     }
 
     /// Wait until at least one job is enqueued (woken by `notify_one`).

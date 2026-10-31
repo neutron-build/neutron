@@ -1,20 +1,22 @@
 .tabBar {
   display: flex;
   align-items: center;
-  height: 36px;
+  height: 40px;
   border-bottom: 1px solid var(--border);
-  background: var(--bg-panel);
+  background: var(--bg-app);
   overflow: hidden;
   flex-shrink: 0;
+  padding: 0 8px;
 }
 
 .tabs {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   height: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
+  gap: 4px;
 }
 
 .tabs::-webkit-scrollbar {
@@ -24,16 +26,18 @@
 .tab {
   display: flex;
   align-items: center;
-  gap: var(--space-1);
-  height: 100%;
-  padding: 0 var(--space-2) 0 var(--space-3);
+  gap: 4px;
+  height: 34px;
+  padding: 0 6px 0 0;
   font-size: var(--text-xs);
   color: var(--text-secondary);
   border-right: 1px solid var(--border);
   white-space: nowrap;
   transition: background var(--transition), color var(--transition);
-  max-width: 180px;
+  max-width: 220px;
   position: relative;
+  border: 1px solid transparent;
+  border-radius: 7px;
 }
 
 .tab:hover {
@@ -42,9 +46,11 @@
 }
 
 .tab.active {
-  background: var(--bg-active);
+  background: var(--bg-panel);
   color: var(--text-primary);
   border-bottom: 2px solid var(--accent);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
 }
 
 .tabDot {
@@ -54,20 +60,61 @@
   flex-shrink: 0;
 }
 
-.tabDot[data-kind="sql"]      { background: var(--model-sql); }
-.tabDot[data-kind="kv"]       { background: var(--model-kv); }
-.tabDot[data-kind="vector"]   { background: var(--model-vector); }
-.tabDot[data-kind="ts"]       { background: var(--model-ts); }
-.tabDot[data-kind="doc"]      { background: var(--model-doc); }
-.tabDot[data-kind="graph"]    { background: var(--model-graph); }
-.tabDot[data-kind="fts"]      { background: var(--model-fts); }
-.tabDot[data-kind="geo"]      { background: var(--model-geo); }
-.tabDot[data-kind="blob"]     { background: var(--model-blob); }
-.tabDot[data-kind="pubsub"]   { background: var(--model-pubsub); }
-.tabDot[data-kind="streams"]  { background: var(--model-streams); }
-.tabDot[data-kind="columnar"] { background: var(--model-columnar); }
-.tabDot[data-kind="datalog"]  { background: var(--model-datalog); }
-.tabDot[data-kind="cdc"]      { background: var(--model-cdc); }
+.tabDot[data-kind="sql"] {
+  background: var(--model-sql);
+}
+
+.tabDot[data-kind="kv"] {
+  background: var(--model-kv);
+}
+
+.tabDot[data-kind="vector"] {
+  background: var(--model-vector);
+}
+
+.tabDot[data-kind="ts"] {
+  background: var(--model-ts);
+}
+
+.tabDot[data-kind="doc"] {
+  background: var(--model-doc);
+}
+
+.tabDot[data-kind="graph"] {
+  background: var(--model-graph);
+}
+
+.tabDot[data-kind="fts"] {
+  background: var(--model-fts);
+}
+
+.tabDot[data-kind="geo"] {
+  background: var(--model-geo);
+}
+
+.tabDot[data-kind="blob"] {
+  background: var(--model-blob);
+}
+
+.tabDot[data-kind="pubsub"] {
+  background: var(--model-pubsub);
+}
+
+.tabDot[data-kind="streams"] {
+  background: var(--model-streams);
+}
+
+.tabDot[data-kind="columnar"] {
+  background: var(--model-columnar);
+}
+
+.tabDot[data-kind="datalog"] {
+  background: var(--model-datalog);
+}
+
+.tabDot[data-kind="cdc"] {
+  background: var(--model-cdc);
+}
 
 .tabLabel {
   flex: 1;
@@ -75,16 +122,20 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .tabClose {
-  font-size: var(--text-md);
+  font-size: 18px;
   line-height: 1;
   color: var(--text-tertiary);
-  width: 16px;
+  width: 24px;
   text-align: center;
   border-radius: var(--radius-sm);
   flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  height: 24px;
 }
 
 .tabClose:hover {
@@ -96,5 +147,14 @@
   font-size: var(--text-xs);
   color: var(--text-tertiary);
   padding: 0 var(--space-3);
-  font-style: italic;
+  font-style: normal;
+}
+
+.tabSelect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 6px 8px 10px;
+  min-width: 0;
+  height: 100%;
 }

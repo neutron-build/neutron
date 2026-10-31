@@ -57,8 +57,9 @@ def test_add_identity_via_engine() raises:
     """Add identity rule fires via engine: (add ?x 0) -> ?x."""
     var eg = EGraph()
 
-    # ClassId(0) = zero constant (must be first to match rule's Pattern.constant(ClassId(0)))
-    var zero = eg.add(CanonicalNode(OpKind.Const))
+    # Scalar zero must be created via the scalar-const API so the strict
+    # payload check (has_constant + exact bits) recognizes it.
+    var zero = eg.add_scalar_f32(0.0)
     var x = eg.add(CanonicalNode(OpKind.Input))
 
     var add_node = CanonicalNode(OpKind.Add, x, zero)
@@ -69,7 +70,7 @@ def test_add_identity_via_engine() raises:
     # Use only add_identity rule
     var rs = RuleSet()
     rs.add_rule(rule_add_identity()^)
-    var engine = RewriteEngine(max_iterations=3)
+    var engine = RewriteEngine(max_iterations=3, fast_math=True)
     var stats = engine.run_phase1(eg, rs)
 
     assert_true(eg.find(x) == eg.find(add_class), "merged after add_identity")
@@ -82,8 +83,8 @@ def test_mul_zero_via_engine() raises:
     """Mul zero rule fires via engine: (mul ?x 0) -> 0 (Const RHS)."""
     var eg = EGraph()
 
-    # ClassId(0) = zero
-    var zero = eg.add(CanonicalNode(OpKind.Const))
+    # zero (scalar payload, per strict scalar matching)
+    var zero = eg.add_scalar_f32(0.0)
     var x = eg.add(CanonicalNode(OpKind.Input))
 
     var mul_node = CanonicalNode(OpKind.Mul, x, zero)
@@ -93,7 +94,7 @@ def test_mul_zero_via_engine() raises:
 
     var rs = RuleSet()
     rs.add_rule(rule_mul_zero()^)
-    var engine = RewriteEngine(max_iterations=3)
+    var engine = RewriteEngine(max_iterations=3, fast_math=True)
     _ = engine.run_phase1(eg, rs)
 
     assert_true(eg.find(mul_class) == eg.find(zero), "mul_zero merged")
@@ -154,10 +155,8 @@ def test_rmsnorm_matmul_fusion_fires() raises:
 
     var x = eg.add(CanonicalNode(OpKind.Input))
     var gamma = eg.add(CanonicalNode(OpKind.Const))
-    # Distinct weight node
-    var w_node = CanonicalNode(OpKind.Input)
-    w_node.inputs.append(ClassId(999))
-    var w = eg.add(w_node^)
+    # Distinct weight node (opaque leaves auto-assign distinct symbols)
+    var w = eg.add(CanonicalNode(OpKind.Input))
 
     var rmsnorm_node = CanonicalNode(OpKind.RMSNorm, x, gamma)
     var rmsnorm_class = eg.add(rmsnorm_node^)
@@ -192,9 +191,7 @@ def test_linear_residual_add_fusion_fires() raises:
 
     var residual = eg.add(CanonicalNode(OpKind.Input))
     var w = eg.add(CanonicalNode(OpKind.Const))
-    var x_node = CanonicalNode(OpKind.Input)
-    x_node.inputs.append(ClassId(888))
-    var x = eg.add(x_node^)
+    var x = eg.add(CanonicalNode(OpKind.Input))
 
     var matmul_node = CanonicalNode(OpKind.Matmul, w, x)
     var matmul_class = eg.add(matmul_node^)
@@ -237,7 +234,7 @@ def test_add_commutativity_op_rhs() raises:
 
     var rs = RuleSet()
     rs.add_rule(rule_add_commutativity()^)
-    var engine = RewriteEngine(max_iterations=2)
+    var engine = RewriteEngine(max_iterations=2, fast_math=True)
     _ = engine.run_phase2(eg, rs)
 
     # (add y x) should now be in the same class
@@ -265,7 +262,7 @@ def test_mul_commutativity_op_rhs() raises:
 
     var rs = RuleSet()
     rs.add_rule(rule_mul_commutativity()^)
-    var engine = RewriteEngine(max_iterations=2)
+    var engine = RewriteEngine(max_iterations=2, fast_math=True)
     _ = engine.run_phase2(eg, rs)
 
     var mul_yx = CanonicalNode(OpKind.Mul, y, x)
@@ -348,16 +345,10 @@ def test_multiple_fusions_one_pass() raises:
     var mul_node = CanonicalNode(OpKind.Mul, silu_class, up)
     _ = eg.add(mul_node^)
 
-    # RMSNorm+Matmul pattern (distinct nodes)
-    var x_node = CanonicalNode(OpKind.Input)
-    x_node.inputs.append(ClassId(777))
-    var x = eg.add(x_node^)
-    var gamma_node = CanonicalNode(OpKind.Const)
-    gamma_node.inputs.append(ClassId(666))
-    var gamma = eg.add(gamma_node^)
-    var w_node = CanonicalNode(OpKind.Const)
-    w_node.inputs.append(ClassId(555))
-    var w = eg.add(w_node^)
+    # RMSNorm+Matmul pattern (distinct nodes via auto-assigned leaf symbols)
+    var x = eg.add(CanonicalNode(OpKind.Input))
+    var gamma = eg.add(CanonicalNode(OpKind.Const))
+    var w = eg.add(CanonicalNode(OpKind.Const))
 
     var rmsnorm_node = CanonicalNode(OpKind.RMSNorm, x, gamma)
     var rmsnorm_class = eg.add(rmsnorm_node^)
@@ -390,31 +381,25 @@ def test_fusion_and_identity_coexist() raises:
     """Fusion rules and identity rules work together in full default ruleset."""
     var eg = EGraph()
 
-    # ClassId(0) = zero, ClassId(1) = one
-    var zero = eg.add(CanonicalNode(OpKind.Const))
-    var one_node = CanonicalNode(OpKind.Const)
-    one_node.inputs.append(ClassId(100))
-    _ = eg.add(one_node^)
+    # Scalar zero via the scalar-const API; one is a distinct structural const
+    var zero = eg.add_scalar_f32(0.0)
+    _ = eg.add(CanonicalNode(OpKind.Const))
 
     # (add x 0) should simplify to x via add_identity
     var x = eg.add(CanonicalNode(OpKind.Input))
     var add_x_0 = CanonicalNode(OpKind.Add, x, zero)
     var add_class = eg.add(add_x_0^)
 
-    # SwiGLU pattern — gate and up must not be ClassId(0) or ClassId(1)
-    var gate_node = CanonicalNode(OpKind.Input)
-    gate_node.inputs.append(ClassId(222))
-    var gate = eg.add(gate_node^)
-    var up_node = CanonicalNode(OpKind.Input)
-    up_node.inputs.append(ClassId(333))
-    var up = eg.add(up_node^)
+    # SwiGLU pattern — gate and up are distinct by leaf symbol
+    var gate = eg.add(CanonicalNode(OpKind.Input))
+    var up = eg.add(CanonicalNode(OpKind.Input))
     var silu_node = CanonicalNode(OpKind.SiLU, gate)
     var silu_class = eg.add(silu_node^)
     var mul_node = CanonicalNode(OpKind.Mul, silu_class, up)
     var mul_class = eg.add(mul_node^)
 
-    var ruleset = create_default_ruleset()
-    var engine = RewriteEngine(max_iterations=5)
+    var ruleset = create_default_ruleset(fast_math=True)
+    var engine = RewriteEngine(max_iterations=5, fast_math=True)
     _ = engine.run_phase1(eg, ruleset)
 
     # Both should have fired
@@ -439,9 +424,7 @@ def test_associativity_nested_op() raises:
 
     var x = eg.add(CanonicalNode(OpKind.Input))
     var y = eg.add(CanonicalNode(OpKind.Const))
-    var z_node = CanonicalNode(OpKind.Input)
-    z_node.inputs.append(ClassId(444))
-    var z = eg.add(z_node^)
+    var z = eg.add(CanonicalNode(OpKind.Input))
 
     # Build (add (add x y) z)
     var inner = CanonicalNode(OpKind.Add, x, y)
@@ -451,7 +434,7 @@ def test_associativity_nested_op() raises:
 
     var rs = RuleSet()
     rs.add_rule(rule_add_associativity()^)
-    var engine = RewriteEngine(max_iterations=3)
+    var engine = RewriteEngine(max_iterations=3, fast_math=True)
     _ = engine.run_phase2(eg, rs)
 
     # The re-associated form (add x (add y z)) should exist and be in same class

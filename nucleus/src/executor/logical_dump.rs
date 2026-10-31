@@ -186,9 +186,17 @@ pub(super) fn render_create_table(def: &TableDef) -> String {
         .columns
         .iter()
         .map(|c| {
-            let mut s = match c.max_len {
-                Some(n) => format!("{} VARCHAR({n})", c.name),
-                None => format!("{} {}", c.name, c.data_type),
+            let mut s = match (c.max_len, c.numeric_typmod, &c.data_type) {
+                (Some(n), _, _) => format!("{} VARCHAR({n})", c.name),
+                // The declared precision and scale must survive a restore, or
+                // the restored column stops rounding and refusing.
+                (None, Some(t), DataType::Numeric) => {
+                    format!("{} NUMERIC({},{})", c.name, t.precision, t.scale)
+                }
+                (None, Some(t), DataType::Array(inner)) if **inner == DataType::Numeric => {
+                    format!("{} NUMERIC({},{})[]", c.name, t.precision, t.scale)
+                }
+                _ => format!("{} {}", c.name, c.data_type),
             };
             if !c.nullable {
                 s.push_str(" NOT NULL");
@@ -463,6 +471,9 @@ fn render_rls_predicate(p: &RlsPredicate) -> String {
         RlsPredicate::Not(inner) => format!("NOT ({})", render_rls_predicate(inner)),
         RlsPredicate::AlwaysTrue => "true".to_string(),
         RlsPredicate::AlwaysFalse => "false".to_string(),
+        // NE-06: the literal NULL predicate renders as NULL, which
+        // recompiles to AlwaysUnknown — the same three-valued semantics.
+        RlsPredicate::AlwaysUnknown => "NULL".to_string(),
     }
 }
 

@@ -21,6 +21,38 @@ struct SpanStorage {
     attributes: Vec<(String, AttributeValue)>,
 }
 
+struct AttributeVisitor<'a>(&'a mut Vec<(String, AttributeValue)>);
+impl tracing::field::Visit for AttributeVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push((
+            field.name().to_string(),
+            AttributeValue::String(value.to_string()),
+        ));
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0
+            .push((field.name().to_string(), AttributeValue::Int(value)));
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0
+            .push((field.name().to_string(), AttributeValue::Int(value as i64)));
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0
+            .push((field.name().to_string(), AttributeValue::Bool(value)));
+    }
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.0
+            .push((field.name().to_string(), AttributeValue::Float(value)));
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push((
+            field.name().to_string(),
+            AttributeValue::String(format!("{value:?}")),
+        ));
+    }
+}
+
 fn unix_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -35,6 +67,10 @@ pub struct OtelLayer {
 }
 
 impl OtelLayer {
+    pub fn exporter(&self) -> OtlpExporter {
+        (*self.exporter).clone()
+    }
+
     pub fn new(exporter: OtlpExporter) -> Self {
         OtelLayer {
             exporter: Arc::new(exporter),
@@ -57,7 +93,7 @@ where
             .and_then(|p| p.extensions().get::<SpanStorage>().map(|s| s.trace_id))
             .unwrap_or_else(random_trace_id);
 
-        let storage = SpanStorage {
+        let mut storage = SpanStorage {
             trace_id,
             span_id: random_span_id(),
             parent_span_id,
@@ -66,49 +102,14 @@ where
             attributes: vec![],
         };
 
+        attrs.record(&mut AttributeVisitor(&mut storage.attributes));
         span.extensions_mut().insert(storage);
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
             if let Some(storage) = span.extensions_mut().get_mut::<SpanStorage>() {
-                // Visit the recorded fields and store string representations
-                struct Visitor<'a>(&'a mut Vec<(String, AttributeValue)>);
-                impl tracing::field::Visit for Visitor<'_> {
-                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                        self.0.push((
-                            field.name().to_string(),
-                            AttributeValue::String(value.to_string()),
-                        ));
-                    }
-                    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-                        self.0
-                            .push((field.name().to_string(), AttributeValue::Int(value)));
-                    }
-                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-                        self.0
-                            .push((field.name().to_string(), AttributeValue::Int(value as i64)));
-                    }
-                    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                        self.0
-                            .push((field.name().to_string(), AttributeValue::Bool(value)));
-                    }
-                    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-                        self.0
-                            .push((field.name().to_string(), AttributeValue::Float(value)));
-                    }
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        self.0.push((
-                            field.name().to_string(),
-                            AttributeValue::String(format!("{value:?}")),
-                        ));
-                    }
-                }
-                values.record(&mut Visitor(&mut storage.attributes));
+                values.record(&mut AttributeVisitor(&mut storage.attributes));
             }
         }
     }
@@ -127,10 +128,9 @@ where
                     status: SpanStatus::Unset,
                     attributes: storage.attributes,
                 };
-                let exporter = Arc::clone(&self.exporter);
-                tokio::spawn(async move {
-                    let _ = exporter.push(span_data).await;
-                });
+                // Bounded synchronous admission before leaving on_close.
+                // Overflow/closed admission is counted by the exporter.
+                let _ = self.exporter.try_push(span_data);
             }
         }
     }
@@ -157,5 +157,29 @@ mod tests {
     fn otel_layer_constructs() {
         let exp = OtlpExporter::new(OtelConfig::new("svc")).unwrap();
         let _layer = OtelLayer::new(exp);
+    }
+    #[tokio::test]
+    async fn initial_span_attributes_are_exportable() {
+        use tracing_subscriber::prelude::*;
+        let exporter = OtlpExporter::new(OtelConfig::new("test")).unwrap();
+        let subscriber = tracing_subscriber::registry().with(OtelLayer::new(exporter.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request", user = "alice", attempts = 2i64);
+            drop(span);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while exporter.buffered_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let spans = exporter.buffered_spans();
+        assert!(spans[0].attributes.iter().any(|(key, value)| key == "user"
+            && matches!(value, AttributeValue::String(value) if value == "alice")));
+        assert!(spans[0]
+            .attributes
+            .iter()
+            .any(|(key, value)| key == "attempts" && matches!(value, AttributeValue::Int(2))));
     }
 }

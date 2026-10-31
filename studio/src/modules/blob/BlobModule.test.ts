@@ -40,8 +40,8 @@ describe('BlobModule — formatBytes', () => {
 })
 
 describe('BlobModule — parseKeys', () => {
-  it('should return empty for null', () => {
-    expect(parseKeys(null)).toEqual([])
+  it('should throw for null (a failed/unavailable list is never an empty success)', () => {
+    expect(() => parseKeys(null)).toThrow('Blob list unavailable')
   })
 
   it('should parse a JSON string array of keys', () => {
@@ -52,8 +52,8 @@ describe('BlobModule — parseKeys', () => {
     expect(parseKeys(['x', 'y'])).toEqual(['x', 'y'])
   })
 
-  it('should return empty for invalid JSON', () => {
-    expect(parseKeys('not json')).toEqual([])
+  it('should throw for invalid JSON', () => {
+    expect(() => parseKeys('not json')).toThrow('Invalid blob list')
   })
 })
 

@@ -536,13 +536,354 @@ async fn head_request_returns_headers_no_body() {
     shutdown.send(()).ok();
 }
 
-// A.7: HTTP/3 streaming upload parity. Requires a QUIC client harness, so this
-// is marked #[ignore] to keep default `cargo test` hermetic. The h3 dispatch
-// path itself is exercised by the unit build under --features http3.
+// ---------------------------------------------------------------------------
+// RS-05 regressions: configured body ceilings survive streaming/chunked
+// transports.
+// ---------------------------------------------------------------------------
+
+/// A chunked body (no Content-Length) larger than a lowered max_body_size
+/// must be rejected 413 — the old code only checked the Content-Length
+/// header, so chunked uploads bypassed the configured ceiling entirely.
+#[tokio::test]
+async fn chunked_body_over_configured_limit_is_413() {
+    use http_body_util::StreamBody;
+
+    let router = Router::new().post("/upload", |body: String| async move {
+        format!("got {} bytes", body.len())
+    });
+    let (addr, shutdown) = start_server_with_body_limit(router, 8).await;
+
+    let io = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // 16 bytes in 4-byte frames, no total length known up front → hyper
+    // sends Transfer-Encoding: chunked.
+    let stream = async_stream::stream! {
+        for chunk in b"1234567890abcdef".chunks(4) {
+            yield Ok::<_, std::convert::Infallible>(http_body::Frame::data(Bytes::copy_from_slice(chunk)));
+        }
+    };
+    let req = hyper::Request::builder()
+        .method("POST")
+        .uri("/upload")
+        .body(StreamBody::new(stream))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 413, "chunked body over the limit must 413");
+
+    shutdown.send(()).ok();
+}
+
+/// A chunked body WITHIN the configured limit passes through and is readable
+/// by extractors (no over-eager truncation).
+#[tokio::test]
+async fn chunked_body_within_limit_passes() {
+    use http_body_util::StreamBody;
+
+    let router = Router::new().post("/upload", |body: String| async move {
+        format!("len={}", body.len())
+    });
+    let (addr, shutdown) = start_server_with_body_limit(router, 64).await;
+
+    let io = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let stream = async_stream::stream! {
+        for chunk in b"1234567890abcdef".chunks(4) {
+            yield Ok::<_, std::convert::Infallible>(http_body::Frame::data(Bytes::copy_from_slice(chunk)));
+        }
+    };
+    let req = hyper::Request::builder()
+        .method("POST")
+        .uri("/upload")
+        .body(StreamBody::new(stream))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"len=16");
+
+    shutdown.send(()).ok();
+}
+
+// RS-06/07: run on a current-thread runtime, including the macOS shared-listener path.
+#[tokio::test]
+async fn listener_modes_drain_before_reverse_shutdown_hooks() {
+    for workers in [0, 2] {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let entered_handler = entered.clone();
+        let release_handler = release.clone();
+        let router = Router::new().get("/held", move || {
+            let entered = entered_handler.clone();
+            let release = release_handler.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                "finished"
+            }
+        });
+        let (stop, stopped) = oneshot::channel();
+        let first = order.clone();
+        let second = order.clone();
+        let server = tokio::spawn(async move {
+            Neutron::new()
+                .router(router)
+                .workers(workers)
+                .shutdown_timeout(Duration::from_secs(2))
+                .shutdown_signal(async move {
+                    let _ = stopped.await;
+                })
+                .on_shutdown(move || {
+                    let order = first.clone();
+                    async move {
+                        order.lock().unwrap().push(1);
+                    }
+                })
+                .on_shutdown(move || {
+                    let order = second.clone();
+                    async move {
+                        order.lock().unwrap().push(2);
+                    }
+                })
+                .listen(addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let request = tokio::spawn(http_get(addr, "/held"));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "hooks closed dependencies before drain, workers={workers}"
+        );
+        release.notify_one();
+        let response = request.await.unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "finished"
+        );
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![2, 1]);
+        assert!(TcpStream::connect(addr).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn drain_deadline_aborts_and_joins_owned_handlers() {
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    for workers in [0, 2] {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_handler = entered.clone();
+        let dropped_handler = dropped.clone();
+        let router = Router::new().get("/held", move || {
+            let dropped = Dropped(dropped_handler.clone());
+            let entered = entered_handler.clone();
+            async move {
+                let _guard = dropped;
+                entered.notify_one();
+                std::future::pending::<()>().await;
+                "unreachable"
+            }
+        });
+        let (stop, stopped) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Neutron::new()
+                .router(router)
+                .workers(workers)
+                .shutdown_timeout(Duration::from_millis(50))
+                .shutdown_signal(async move {
+                    let _ = stopped.await;
+                })
+                .listen(addr)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let request = tokio::spawn(http_get(addr, "/held"));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "handler outlived serve, workers={workers}"
+        );
+        request.abort();
+    }
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn stalled_tls_handshake_does_not_outlive_shutdown() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let tls = neutron::tls::TlsConfig::from_pem_bytes(
+        cert.cert.pem().as_bytes(),
+        cert.key_pair.serialize_pem().as_bytes(),
+    )
+    .unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = reservation.local_addr().unwrap();
+    drop(reservation);
+    let (stop, stopped) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        Neutron::new()
+            .shutdown_timeout(Duration::from_millis(50))
+            .shutdown_signal(async move {
+                let _ = stopped.await;
+            })
+            .listen_tls(addr, tls)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _stalled = TcpStream::connect(addr).await.unwrap();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[cfg(feature = "http3")]
 #[tokio::test]
-#[ignore = "needs a QUIC client harness"]
-async fn h3_streaming_upload() {
-    // Placeholder: wire a quinn/h3 client, POST a body, assert it round-trips
-    // through the streaming dispatch path. Tracked with P1.9.
+async fn h3_honors_shutdown_signal_and_hooks() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let tls = neutron::tls::TlsConfig::from_pem_bytes(
+        cert.cert.pem().as_bytes(),
+        cert.key_pair.serialize_pem().as_bytes(),
+    )
+    .unwrap();
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = reservation.local_addr().unwrap();
+    drop(reservation);
+    let (stop, stopped) = oneshot::channel();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first = order.clone();
+    let second = order.clone();
+    let server = tokio::spawn(async move {
+        Neutron::new()
+            .shutdown_timeout(Duration::from_millis(50))
+            .on_shutdown(move || {
+                let order = first.clone();
+                async move {
+                    order.lock().unwrap().push(1);
+                }
+            })
+            .on_shutdown(move || {
+                let order = second.clone();
+                async move {
+                    order.lock().unwrap().push(2);
+                }
+            })
+            .shutdown_signal(async move {
+                let _ = stopped.await;
+            })
+            .listen_h3(addr, tls)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*order.lock().unwrap(), vec![2, 1]);
+}
+
+#[cfg(feature = "ws")]
+#[tokio::test]
+async fn websocket_split_preserves_partial_frames_during_outbound_writes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let send_now = Arc::new(tokio::sync::Notify::new());
+    let received = Arc::new(tokio::sync::Notify::new());
+    let outbound = send_now.clone();
+    let inbound = received.clone();
+    let router = Router::new().get("/ws", move |upgrade: neutron::ws::WebSocketUpgrade| {
+        let outbound = outbound.clone();
+        let inbound = inbound.clone();
+        async move {
+            upgrade.on_upgrade(move |socket| async move {
+                let (sender, mut receiver) = socket.split();
+                let writer = tokio::spawn(async move {
+                    outbound.notified().await;
+                    sender
+                        .send(neutron::ws::Message::Text("outbound".into()))
+                        .await
+                        .unwrap();
+                    sender
+                });
+                let message = receiver.recv().await.unwrap();
+                assert_eq!(message.as_text().unwrap(), "hello");
+                inbound.notify_one();
+                let sender = writer.await.unwrap();
+                sender
+                    .send(neutron::ws::Message::Close(None))
+                    .await
+                    .unwrap();
+            })
+        }
+    });
+    let (addr, stop) = start_server(router).await;
+    let mut peer = TcpStream::connect(addr).await.unwrap();
+    peer.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(peer.read_u8().await.unwrap());
+    }
+    // Send only frame header: the reader must retain it while the server writes.
+    peer.write_all(&[0x81, 0x85]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    send_now.notify_one();
+    let mut header = [0; 2];
+    peer.read_exact(&mut header).await.unwrap();
+    assert_eq!(header, [0x81, 8]);
+    let mut bytes = [0; 8];
+    peer.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"outbound");
+    let mut tail = vec![1, 2, 3, 4];
+    tail.extend(
+        b"hello"
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ [1, 2, 3, 4][i % 4]),
+    );
+    peer.write_all(&tail).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), received.notified())
+        .await
+        .unwrap();
+    peer.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0] & 15, 8);
+    stop.send(()).unwrap();
 }

@@ -40,6 +40,27 @@ export function getBaseUrl(): string {
 }
 
 /**
+ * Re-issue a Request under a different URL WITHOUT losing its method, body,
+ * headers or abort signal (NF-DESK-04). `new Request(url, existingRequest)`
+ * treats the Request object as a RequestInit dictionary — every field it
+ * doesn't know is silently ignored, flattening the request to a bodyless GET.
+ * When the URL is unchanged the original Request is forwarded untouched
+ * (its body stream can only be handed off once).
+ */
+function rebuildRequest(url: string, request: Request): Request {
+  if (url === request.url) return request;
+  const hasBody = request.body != null && request.method !== 'GET' && request.method !== 'HEAD';
+  const init: RequestInit & { duplex?: 'half' } = {
+    method: request.method,
+    headers: new Headers(request.headers),
+    body: hasBody ? request.body : undefined,
+    signal: request.signal,
+    ...(hasBody ? { duplex: 'half' } : {}),
+  };
+  return new Request(url, init);
+}
+
+/**
  * Fetch wrapper that automatically routes through `neutron://` on desktop,
  * or through the dev TCP server when dev mode is active.
  * Identical API to standard `fetch()`.
@@ -64,7 +85,15 @@ export async function neutronFetch(
     url = input.url;
   }
 
-  return fetch(url, init);
+  const requestInput = input instanceof Request ? rebuildRequest(url, input) : url;
+  if (isDevMode() && url.startsWith(`${base}/`)) {
+    const request = new Request(requestInput, init);
+    const token = (window as any).__NEUTRON_DEV_TOKEN__;
+    if (typeof token !== 'string' || !token) throw new Error('Desktop dev capability unavailable');
+    request.headers.set('X-Neutron-Dev-Token', token);
+    return fetch(request);
+  }
+  return fetch(requestInput, init);
 }
 
 /**
@@ -79,6 +108,13 @@ export function installFetchInterceptor(): void {
   window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     if (typeof input === 'string' && input.startsWith('/')) {
       const base = getBaseUrl();
+      if (isDevMode()) {
+        const request = new Request(`${base}${input}`, init);
+        const token = (window as any).__NEUTRON_DEV_TOKEN__;
+        if (typeof token !== 'string' || !token) return Promise.reject(new Error('Desktop dev capability unavailable'));
+        request.headers.set('X-Neutron-Dev-Token', token);
+        return originalFetch(request);
+      }
       return originalFetch(`${base}${input}`, init);
     }
     return originalFetch(input, init);

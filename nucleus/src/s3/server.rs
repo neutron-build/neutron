@@ -89,11 +89,15 @@ pub async fn serve(
             continue;
         }
         connections.fetch_add(1, Ordering::Relaxed);
-        let connections = Arc::clone(&connections);
+        // RAII slot lease (NE-15): a panic anywhere in the connection task
+        // (e.g. the pre-fix x-amz-date slice) used to skip the manual
+        // decrement and permanently consume one of the gateway slots.
+        let slot = ConnectionSlotGuard(Arc::clone(&connections));
         let handler = Arc::clone(&handler);
         let idle = std::time::Duration::from_secs(server_config.idle_timeout_secs);
 
         tokio::spawn(async move {
+            let _slot = slot;
             let _ = stream.set_nodelay(true);
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
@@ -143,8 +147,16 @@ pub async fn serve(
                     break;
                 }
             }
-            connections.fetch_sub(1, Ordering::Relaxed);
             tracing::debug!("S3 connection from {peer} closed");
         });
+    }
+}
+
+/// RAII connection-slot lease — see the spawn site (NE-15).
+struct ConnectionSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }

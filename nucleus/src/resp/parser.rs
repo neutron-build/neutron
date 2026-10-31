@@ -82,7 +82,18 @@ async fn read_value_inner<R: AsyncBufRead + Unpin>(
         ));
     }
 
+    // Validate the type prefix BEFORE slicing. `&line[1..]` panics when byte
+    // 0 is the lead byte of a multibyte UTF-8 sequence (index 1 is then not a
+    // char boundary), so a pre-auth `é\r\n` used to abort the connection task
+    // by panic rather than answer with a protocol error.
     let prefix = line.as_bytes()[0];
+    if !matches!(prefix, b'+' | b'-' | b':' | b'$' | b'*') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown RESP type byte: {}", prefix as char),
+        ));
+    }
+    // The prefix was proved ASCII, so index 1 is a valid char boundary.
     let payload = &line[1..];
 
     match prefix {
@@ -110,9 +121,17 @@ async fn read_value_inner<R: AsyncBufRead + Unpin>(
             }
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).await?;
-            // Read trailing \r\n
+            // The payload must be terminated by CRLF. The bytes were read and
+            // discarded before; verifying them rejects desynchronized framing
+            // instead of silently resynchronizing mid-stream.
             let mut crlf = [0u8; 2];
             reader.read_exact(&mut crlf).await?;
+            if &crlf != b"\r\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bulk string not terminated by CRLF",
+                ));
+            }
             Ok(RespValue::BulkString(Some(buf)))
         }
         b'*' => {
@@ -300,6 +319,45 @@ mod tests {
             RespValue::SimpleString(s) => assert_eq!(s.len(), 60 * 1024),
             other => panic!("expected SimpleString, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unicode_type_byte_is_an_error_not_a_panic() {
+        // NE-08: a two-byte non-ASCII prefix followed by CRLF used to panic
+        // the connection task inside `&line[1..]` (byte 1 of `é` is not a
+        // char boundary) before any protocol answer — pre-auth. The parser
+        // must answer InvalidData instead.
+        let data = "é\r\n".as_bytes().to_vec();
+        let mut reader = BufReader::new(Cursor::new(data));
+        let err = read_value(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn multibyte_type_byte_variants_error_without_panic() {
+        // Sweep multibyte lead bytes and continuation-only input; none may
+        // panic, all must be protocol errors.
+        for probe in ["é\r\n", "ä", "😀\r\n", "«\r\n"] {
+            let mut reader = BufReader::new(Cursor::new(probe.as_bytes().to_vec()));
+            let err = read_value(&mut reader)
+                .await
+                .expect_err("multibyte prefix must not parse");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "probe {probe:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_string_requires_crlf_terminator() {
+        // The trailing CRLF was read and discarded; a desynchronizing peer
+        // sending other bytes there must now be rejected (NE-08 hardening).
+        let data = b"$5\r\nhelloXX";
+        let mut reader = BufReader::new(Cursor::new(data.to_vec()));
+        let err = read_value(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("CRLF"),
+            "expected CRLF error, got: {err}"
+        );
     }
 
     #[tokio::test]

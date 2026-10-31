@@ -189,6 +189,35 @@ impl S3Handler {
             return Err(deny(403, "InvalidAccessKeyId", "unknown access key"));
         }
 
+        // NE-13: operation-selecting headers must be inside the signed set.
+        // A presigned PUT grants upload-to-this-key only; an unsigned
+        // `x-amz-copy-source` used to flip that grant into an arbitrary
+        // CopyObject — reading any object the credential can reach and
+        // replacing the destination with it. The signature over the signed
+        // subset stays valid because unsigned headers never enter the
+        // canonical request, so signature verification alone cannot catch
+        // this.
+        let signed: std::collections::HashSet<String> = auth
+            .signed_headers
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        for header_name in [
+            "x-amz-copy-source",
+            "x-amz-copy-source-if-match",
+            "x-amz-copy-source-if-none-match",
+            "x-amz-copy-source-if-modified-since",
+            "x-amz-copy-source-if-unmodified-since",
+        ] {
+            if req.header(header_name).is_some() && !signed.contains(header_name) {
+                return Err(deny(
+                    403,
+                    "SignatureDoesNotMatch",
+                    &format!("{header_name} must be covered by SignedHeaders"),
+                ));
+            }
+        }
+
         // Payload hash handling.
         let payload_hash: String = if presigned {
             UNSIGNED_PAYLOAD.to_string()
@@ -279,18 +308,19 @@ impl S3Handler {
     }
 
     fn create_bucket(&self, bucket: &str) -> Response {
-        let mut store = self.executor.blob_store().write();
-        let marker = bucket_marker(bucket);
-        if store.metadata(&marker).is_some() {
-            return error_xml(
-                409,
-                "BucketAlreadyOwnedByYou",
-                "bucket already exists",
-                bucket,
-            );
-        }
-        store.put(&marker, b"", None);
-        Response::new(200).header("Location", format!("/{bucket}"))
+        self.blob_mutation(|store| {
+            let marker = bucket_marker(bucket);
+            if store.metadata(&marker).is_some() {
+                return error_xml(
+                    409,
+                    "BucketAlreadyOwnedByYou",
+                    "bucket already exists",
+                    bucket,
+                );
+            }
+            store.put(&marker, b"", None);
+            Response::new(200).header("Location", format!("/{bucket}"))
+        })
     }
 
     fn delete_bucket(&self, bucket: &str) -> Response {
@@ -343,6 +373,42 @@ impl S3Handler {
 
     // ── Listing ──────────────────────────────────────────────────────────────
 
+    /// NE-14: every S3 mutator runs through this gate.
+    ///
+    /// Admission first — a degraded/read-only server (disk watermark,
+    /// operator hold) must refuse BEFORE any blob state changes, exactly as
+    /// SQL DML is refused, while GET/HEAD keep working. Then the ordered
+    /// durability barrier — payload segment fsync BEFORE manifest WAL
+    /// group-sync — with failures surfaced as errors instead of a 200: an
+    /// acknowledged object put used to be returnable without any of its
+    /// bytes being durable.
+    fn blob_mutation<F>(&self, f: F) -> Response
+    where
+        F: FnOnce(&mut crate::blob::BlobStore) -> Response,
+    {
+        if self.executor.blob_write_refused() {
+            return error_xml(
+                503,
+                "ServiceUnavailable",
+                "server is read-only (degraded); S3 mutations are refused",
+                "",
+            );
+        }
+        let mut store = self.executor.blob_store().write();
+        let resp = f(&mut store);
+        drop(store);
+        if let Err(e) = self.executor.blob_durability_barrier() {
+            tracing::error!("S3 mutation durability barrier failed: {e}");
+            return error_xml(
+                503,
+                "InternalError",
+                "write durability could not be established; the outcome is indeterminate",
+                "",
+            );
+        }
+        resp
+    }
+
     fn list_objects(&self, bucket: &str, req: &Request) -> Response {
         let v2 = req.query_param("list-type") == Some("2");
         let prefix = req.query_param("prefix").unwrap_or("").to_string();
@@ -365,11 +431,19 @@ impl S3Handler {
 
         let store = self.executor.blob_store().read();
         let ns = obj_key(bucket, "");
+        // NE-16: when the resume point is a CommonPrefix label (it ends with
+        // the delimiter — bare object keys never do, they would have been
+        // grouped), the keys INSIDE that emitted group must be skipped, not
+        // merely those greater than the label: `a/1 > a/` is true, so the
+        // old `> after` filter alone re-listed the same group forever and a
+        // delimited listing with a small max-keys never advanced past it.
+        let skip_group_keys =
+            !delimiter.is_empty() && after.ends_with(&delimiter) && after.len() >= prefix.len();
         let mut keys: Vec<String> = store
             .list_prefix(&format!("{ns}{prefix}"))
             .into_iter()
             .map(|k| k[ns.len()..].to_string())
-            .filter(|k| *k > after)
+            .filter(|k| *k > after && !(skip_group_keys && k.starts_with(&after)))
             .collect();
         keys.sort();
 
@@ -414,6 +488,14 @@ impl S3Handler {
             ));
             count += 1;
             last_key = key.clone();
+        }
+
+        // max-keys=0 is a probe, not a page (NE-16): report NOT truncated —
+        // AWS semantics — so paginating clients terminate instead of looping
+        // on an empty token that never advances past the first key.
+        if max_keys == 0 {
+            truncated = false;
+            last_key.clear();
         }
 
         let mut common_xml = String::new();
@@ -501,10 +583,11 @@ impl S3Handler {
         let etag = blake3::hash(&req.body).to_hex().to_string();
         let blob_key = obj_key(bucket, key);
         let content_type = req.header("content-type");
-        let mut store = self.executor.blob_store().write();
-        store.put(&blob_key, &req.body, content_type);
-        store.set_tag(&blob_key, "etag", &etag);
-        Response::new(200).header("ETag", format!("\"{etag}\""))
+        self.blob_mutation(|store| {
+            store.put(&blob_key, &req.body, content_type);
+            store.set_tag(&blob_key, "etag", &etag);
+            Response::new(200).header("ETag", format!("\"{etag}\""))
+        })
     }
 
     fn copy_object(&self, bucket: &str, key: &str, req: &Request) -> Response {
@@ -523,24 +606,25 @@ impl S3Handler {
         };
         let src_blob = obj_key(src_bucket, src_key);
         let dst_blob = obj_key(bucket, key);
-        let mut store = self.executor.blob_store().write();
-        let (src_ct, src_etag) = match store.metadata(&src_blob) {
-            Some(m) => (m.content_type.clone(), blob_etag(&store, &src_blob)),
-            None => return error_xml(404, "NoSuchKey", "copy source does not exist", source),
-        };
-        // Zero-copy: the destination manifest references the source's chunks.
-        if !store.compose(&dst_blob, &[&src_blob], src_ct.as_deref()) {
-            return error_xml(404, "NoSuchKey", "copy source does not exist", source);
-        }
-        let etag = src_etag.unwrap_or_default();
-        store.set_tag(&dst_blob, "etag", &etag);
-        let modified = iso8601(now_unix());
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult>\
-             <LastModified>{modified}</LastModified><ETag>&quot;{etag}&quot;</ETag>\
-             </CopyObjectResult>"
-        );
-        Response::with_body(200, XML_CT, body.into_bytes())
+        self.blob_mutation(|store| {
+            let (src_ct, src_etag) = match store.metadata(&src_blob) {
+                Some(m) => (m.content_type.clone(), blob_etag(store, &src_blob)),
+                None => return error_xml(404, "NoSuchKey", "copy source does not exist", source),
+            };
+            // Zero-copy: the destination manifest references the source's chunks.
+            if !store.compose(&dst_blob, &[&src_blob], src_ct.as_deref()) {
+                return error_xml(404, "NoSuchKey", "copy source does not exist", source);
+            }
+            let etag = src_etag.unwrap_or_default();
+            store.set_tag(&dst_blob, "etag", &etag);
+            let modified = iso8601(now_unix());
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult>\
+                 <LastModified>{modified}</LastModified><ETag>&quot;{etag}&quot;</ETag>\
+                 </CopyObjectResult>"
+            );
+            Response::with_body(200, XML_CT, body.into_bytes())
+        })
     }
 
     /// Shared GET/HEAD logic. For HEAD the body is never materialized.
@@ -615,28 +699,30 @@ impl S3Handler {
     }
 
     fn delete_object(&self, bucket: &str, key: &str) -> Response {
-        let mut store = self.executor.blob_store().write();
-        store.delete(&obj_key(bucket, key));
-        // S3 returns 204 whether or not the key existed.
-        Response::new(204)
+        self.blob_mutation(|store| {
+            store.delete(&obj_key(bucket, key));
+            // S3 returns 204 whether or not the key existed.
+            Response::new(204)
+        })
     }
 
     fn delete_objects(&self, bucket: &str, req: &Request) -> Response {
         let body = String::from_utf8_lossy(&req.body);
         let keys = xml_extract_all(&body, "Key");
-        let mut store = self.executor.blob_store().write();
-        let mut deleted_xml = String::new();
-        for key in &keys {
-            store.delete(&obj_key(bucket, key));
-            deleted_xml.push_str(&format!(
-                "<Deleted><Key>{}</Key></Deleted>",
-                xml_escape(key)
-            ));
-        }
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult>{deleted_xml}</DeleteResult>"
-        );
-        Response::with_body(200, XML_CT, body.into_bytes())
+        self.blob_mutation(|store| {
+            let mut deleted_xml = String::new();
+            for key in &keys {
+                store.delete(&obj_key(bucket, key));
+                deleted_xml.push_str(&format!(
+                    "<Deleted><Key>{}</Key></Deleted>",
+                    xml_escape(key)
+                ));
+            }
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult>{deleted_xml}</DeleteResult>"
+            );
+            Response::with_body(200, XML_CT, body.into_bytes())
+        })
     }
 
     // ── Multipart upload ─────────────────────────────────────────────────────
@@ -652,20 +738,21 @@ impl S3Handler {
                 .map(|_| format!("{:x}", rng.gen_range(0..16)))
                 .collect()
         };
-        let mut store = self.executor.blob_store().write();
-        store.put(
-            &mpu_meta_key(bucket, &upload_id),
-            key.as_bytes(),
-            req.header("content-type"),
-        );
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult>\
-             <Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload_id}</UploadId>\
-             </InitiateMultipartUploadResult>",
-            xml_escape(bucket),
-            xml_escape(key)
-        );
-        Response::with_body(200, XML_CT, body.into_bytes())
+        self.blob_mutation(|store| {
+            store.put(
+                &mpu_meta_key(bucket, &upload_id),
+                key.as_bytes(),
+                req.header("content-type"),
+            );
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult>\
+                 <Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload_id}</UploadId>\
+                 </InitiateMultipartUploadResult>",
+                xml_escape(bucket),
+                xml_escape(key)
+            );
+            Response::with_body(200, XML_CT, body.into_bytes())
+        })
     }
 
     fn upload_part(&self, bucket: &str, key: &str, req: &Request) -> Response {
@@ -677,15 +764,18 @@ impl S3Handler {
         if req.body.len() > self.config.max_object_bytes {
             return error_xml(413, "EntityTooLarge", "part exceeds size limit", key);
         }
-        let mut store = self.executor.blob_store().write();
+        let store = self.executor.blob_store().write();
         if store.metadata(&mpu_meta_key(bucket, upload_id)).is_none() {
             return error_xml(404, "NoSuchUpload", "upload does not exist", upload_id);
         }
+        drop(store);
         let etag = blake3::hash(&req.body).to_hex().to_string();
         let part_key = mpu_part_key(bucket, upload_id, part);
-        store.put(&part_key, &req.body, None);
-        store.set_tag(&part_key, "etag", &etag);
-        Response::new(200).header("ETag", format!("\"{etag}\""))
+        self.blob_mutation(|store| {
+            store.put(&part_key, &req.body, None);
+            store.set_tag(&part_key, "etag", &etag);
+            Response::new(200).header("ETag", format!("\"{etag}\""))
+        })
     }
 
     fn complete_multipart(&self, bucket: &str, key: &str, req: &Request) -> Response {
@@ -710,76 +800,89 @@ impl S3Handler {
             );
         }
 
-        let mut store = self.executor.blob_store().write();
-        let meta_key = mpu_meta_key(bucket, &upload_id);
-        let Some(mpu_meta) = store.metadata(&meta_key) else {
-            return error_xml(404, "NoSuchUpload", "upload does not exist", &upload_id);
-        };
-        let content_type = mpu_meta.content_type.clone();
+        self.blob_mutation(|store| {
+            let meta_key = mpu_meta_key(bucket, &upload_id);
+            let Some(mpu_meta) = store.metadata(&meta_key) else {
+                return error_xml(404, "NoSuchUpload", "upload does not exist", &upload_id);
+            };
+            let content_type = mpu_meta.content_type.clone();
 
-        let part_keys: Vec<String> = part_numbers
-            .iter()
-            .map(|n| mpu_part_key(bucket, &upload_id, *n))
-            .collect();
-        let mut etag_concat = Vec::new();
-        for (n, pk) in part_numbers.iter().zip(&part_keys) {
-            match blob_etag(&store, pk) {
-                Some(etag) => etag_concat.extend_from_slice(etag.as_bytes()),
-                None => {
-                    return error_xml(400, "InvalidPart", &format!("part {n} not uploaded"), key);
+            let part_keys: Vec<String> = part_numbers
+                .iter()
+                .map(|n| mpu_part_key(bucket, &upload_id, *n))
+                .collect();
+            let mut etag_concat = Vec::new();
+            for (n, pk) in part_numbers.iter().zip(&part_keys) {
+                match blob_etag(store, pk) {
+                    Some(etag) => etag_concat.extend_from_slice(etag.as_bytes()),
+                    None => {
+                        return error_xml(
+                            400,
+                            "InvalidPart",
+                            &format!("part {n} not uploaded"),
+                            key,
+                        );
+                    }
                 }
             }
-        }
 
-        // Zero-copy assembly: the object manifest references the parts'
-        // chunks; no data moves.
-        let blob_key = obj_key(bucket, key);
-        let sources: Vec<&str> = part_keys.iter().map(|s| s.as_str()).collect();
-        if !store.compose(&blob_key, &sources, content_type.as_deref()) {
-            return error_xml(400, "InvalidPart", "a part disappeared", key);
-        }
-        let etag = format!(
-            "{}-{}",
-            blake3::hash(&etag_concat).to_hex(),
-            part_numbers.len()
-        );
-        store.set_tag(&blob_key, "etag", &etag);
+            // Zero-copy assembly: the object manifest references the parts'
+            // chunks; no data moves. Atomicity (NE-14), stated explicitly:
+            // publication is ONE manifest swap — the object either points at
+            // its complete assembled chunk list or keeps its previous state.
+            // Part deletion runs only after that swap, and is safe to
+            // replay or lose: the new object manifest holds the chunk
+            // references, so deleting the part MANIFESTS can never remove
+            // live data.
+            let blob_key = obj_key(bucket, key);
+            let sources: Vec<&str> = part_keys.iter().map(|s| s.as_str()).collect();
+            if !store.compose(&blob_key, &sources, content_type.as_deref()) {
+                return error_xml(400, "InvalidPart", "a part disappeared", key);
+            }
+            let etag = format!(
+                "{}-{}",
+                blake3::hash(&etag_concat).to_hex(),
+                part_numbers.len()
+            );
+            store.set_tag(&blob_key, "etag", &etag);
 
-        // Chunks stay alive through the object's references.
-        for pk in &part_keys {
-            store.delete(pk);
-        }
-        store.delete(&meta_key);
+            // Chunks stay alive through the object's references.
+            for pk in &part_keys {
+                store.delete(pk);
+            }
+            store.delete(&meta_key);
 
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult>\
-             <Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key>\
-             <ETag>&quot;{etag}&quot;</ETag></CompleteMultipartUploadResult>",
-            xml_escape(bucket),
-            xml_escape(key),
-            xml_escape(bucket),
-            xml_escape(key)
-        );
-        Response::with_body(200, XML_CT, body.into_bytes())
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult>\
+                 <Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key>\
+                 <ETag>&quot;{etag}&quot;</ETag></CompleteMultipartUploadResult>",
+                xml_escape(bucket),
+                xml_escape(key),
+                xml_escape(bucket),
+                xml_escape(key)
+            );
+            Response::with_body(200, XML_CT, body.into_bytes())
+        })
     }
 
     fn abort_multipart(&self, bucket: &str, key: &str, req: &Request) -> Response {
         let _ = key;
         let upload_id = req.query_param("uploadId").unwrap_or("");
-        let mut store = self.executor.blob_store().write();
-        let prefix = format!("s3mpu/{bucket}/{upload_id}/");
-        let keys: Vec<String> = store
-            .list_prefix(&prefix)
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        if keys.is_empty() {
-            return error_xml(404, "NoSuchUpload", "upload does not exist", upload_id);
-        }
-        for k in keys {
-            store.delete(&k);
-        }
-        Response::new(204)
+        self.blob_mutation(|store| {
+            let prefix = format!("s3mpu/{bucket}/{upload_id}/");
+            let keys: Vec<String> = store
+                .list_prefix(&prefix)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            if keys.is_empty() {
+                return error_xml(404, "NoSuchUpload", "upload does not exist", upload_id);
+            }
+            for k in keys {
+                store.delete(&k);
+            }
+            Response::new(204)
+        })
     }
 }
 

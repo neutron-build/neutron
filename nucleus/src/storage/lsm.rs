@@ -35,9 +35,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// One fully-materialized entry set: key plus value (`None` = tombstone).
+type SstEntries = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 /// v1 SSTable magic (`LSMS`): no per-entry checksums. Still loaded; never
 /// written.
@@ -321,6 +325,68 @@ impl SSTable {
             .map(move |(k, loc)| (k.clone(), self.read_value(k, loc)))
     }
 
+    /// [`Self::entries`] but FAIL-CLOSED: a value that cannot be read back
+    /// from the backing file (I/O error, gone file, checksum mismatch) is an
+    /// `Err`, not a tombstone. Compaction must use this — merging through
+    /// [`Self::entries`] converted an unreadable value into a real tombstone,
+    /// wrote it durably into the replacement run, and then deleted the input
+    /// files: a transient read error became permanent data loss (NE-20).
+    /// Point lookups keep the lenient floor deliberately; compaction is the
+    /// one place the loss would be DURABLE.
+    pub(crate) fn entries_checked(
+        &self,
+    ) -> io::Result<SstEntries> {
+        let mut out = Vec::with_capacity(self.index.len());
+        for (k, loc) in &self.index {
+            let value = match loc {
+                ValueLoc::Tombstone => None,
+                ValueLoc::Mem(bytes) => Some(bytes.clone()),
+                ValueLoc::Disk { offset, len } => {
+                    let path = self.path.as_ref().ok_or_else(|| {
+                        io::Error::other(format!(
+                            "SSTable L{}/seq{} entry has a disk location but no backing file",
+                            self.level, self.seq
+                        ))
+                    })?;
+                    let mut file = File::open(path).map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!(
+                                "SSTable {} cannot be reopened for compaction: {e}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                    file.seek(SeekFrom::Start(*offset))?;
+                    let mut buf = vec![0u8; *len as usize];
+                    file.read_exact(&mut buf)?;
+                    if self.checksummed {
+                        let mut trailer = [0u8; 4];
+                        file.read_exact(&mut trailer)?;
+                        let mut crc = crc32c::crc32c(&(k.len() as u32).to_le_bytes());
+                        crc = crc32c::crc32c_append(crc, k);
+                        crc = crc32c::crc32c_append(crc, &[1u8]); // kind
+                        crc = crc32c::crc32c_append(crc, &len.to_le_bytes());
+                        crc = crc32c::crc32c_append(crc, &buf);
+                        if u32::from_le_bytes(trailer) != crc {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "SSTable value checksum mismatch at {} offset {offset} — \
+                                     refusing to compact a corrupt input (NE-20)",
+                                    path.display()
+                                ),
+                            ));
+                        }
+                    }
+                    Some(buf)
+                }
+            };
+            out.push((k.clone(), value));
+        }
+        Ok(out)
+    }
+
     /// Keys in sorted order, without touching the backing file.
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
         self.index.iter().map(|(k, _)| k.as_slice())
@@ -400,9 +466,24 @@ impl LsmTree {
             .map(|d| d.join(Self::sst_filename(level, seq)))
     }
 
-    fn delete_sst_from_disk(&self, level: usize, seq: u64) {
+    fn delete_sst_from_disk(&self, level: usize, seq: u64) -> io::Result<()> {
         if let Some(path) = self.sst_path(level, seq) {
-            let _ = std::fs::remove_file(&path);
+            // NE-21: a failed input retirement must be VISIBLE. The old
+            // `let _ =` made the compaction report success while a superseded
+            // input file survived — and a surviving final-level input can
+            // resurrect data its dropped tombstone had deleted.
+            std::fs::remove_file(&path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "LSM: failed to retire superseded SSTable {}: {e} — the compaction is \
+                         incomplete; the file must be removed before it is trusted as history",
+                        path.display()
+                    ),
+                )
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -517,8 +598,10 @@ impl LsmTree {
         {
             // The partial file must not outlive the attempt: on restart it
             // would parse as a shorter table with this seq and shadow the
-            // intact lower-seq tables holding the same keys.
-            self.delete_sst_from_disk(sst.level, sst.seq);
+            // intact lower-seq tables holding the same keys. Best-effort
+            // cleanup: the original error must not be masked by a cleanup
+            // failure.
+            let _ = self.delete_sst_from_disk(sst.level, sst.seq);
             tracing::error!(
                 "LSM: failed to write SSTable L{}/seq{} to disk: {e}",
                 sst.level,
@@ -598,10 +681,25 @@ impl LsmTree {
         }
         all_tables.sort_by_key(|t| t.seq);
 
-        for table in &all_tables {
-            for (k, v) in table.entries() {
-                merged.insert(k.clone(), v.clone());
+        // NE-20: merge through the CHECKED reader. The lenient `entries()`
+        // turned an unreadable value into a tombstone; writing that tombstone
+        // durably into the merged run and then deleting the inputs converted
+        // a transient read error into permanent data loss. A failed input
+        // read aborts the compaction with the tree state and every input
+        // file untouched.
+        let merged_inputs = (|| -> io::Result<()> {
+            for table in &all_tables {
+                for (k, v) in table.entries_checked()? {
+                    merged.insert(k, v);
+                }
             }
+            Ok(())
+        })();
+        if let Err(e) = merged_inputs {
+            // Put the consumed levels back exactly as they were.
+            self.levels[level] = tables_to_merge;
+            self.levels[level + 1] = next_tables;
+            return Err(e);
         }
 
         // Remove tombstones at the last level.
@@ -622,7 +720,9 @@ impl LsmTree {
         if let Some(ref dir) = self.disk_dir
             && let Err(e) = write_sst_to_disk(dir, &mut sst)
         {
-            self.delete_sst_from_disk(sst.level, sst.seq);
+            // Best-effort cleanup of the partial output (the error path is
+            // already returning; the remove failure must not mask `e`).
+            let _ = self.delete_sst_from_disk(sst.level, sst.seq);
             tracing::error!(
                 "LSM: failed to write compacted SSTable L{}/seq{} to disk: {e}",
                 sst.level,
@@ -635,8 +735,13 @@ impl LsmTree {
         self.compaction_count += 1;
 
         // Remove input SSTable files (they are now superseded by the merged one).
+        // NE-21: a retirement failure propagates — the merged table is live
+        // and wins by sequence number for every key it holds, but a surviving
+        // input is unretired history the operator must know about (and on the
+        // final level, where tombstones are dropped, it can resurrect deleted
+        // data after a reopen).
         for (lvl, s) in inputs_to_delete {
-            self.delete_sst_from_disk(lvl, s);
+            self.delete_sst_from_disk(lvl, s)?;
         }
 
         // Recurse: the next level might now need compaction too.
@@ -1020,13 +1125,97 @@ mod tests {
         }
     }
 
+    /// NE-20: a corrupt or unreadable input value must ABORT compaction with
+    /// an error — never be merged as a tombstone, written durably into the
+    /// replacement run, and followed by deletion of the original files. The
+    /// lenient read floor (None = missing) stays for point lookups; this is
+    /// the one path where the loss would be permanent.
+    #[test]
+    fn corrupt_input_aborts_compaction_instead_of_deleting_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            memtable_flush_threshold: 4,
+            // High enough that seeding never auto-compacts: each flush leaves
+            // one L0 file, so the manual compact(0) below is the FIRST
+            // compaction and consumes them all as inputs.
+            level_max_sstables: 100,
+            max_levels: 3,
+            bloom_bits_per_key: 10,
+        };
+        // Enough distinct keys across enough flushes to build real runs.
+        let mut tree = LsmTree::open(cfg.clone(), dir.path()).unwrap();
+        for round in 0..6u32 {
+            for k in 0..4u32 {
+                tree.put(
+                    format!("key{k:02}").into_bytes(),
+                    format!("value-{round}-{k}").into_bytes(),
+                );
+            }
+            tree.force_flush().unwrap();
+        }
+        drop(tree);
+
+        // Reopen (values now cold on disk), then corrupt one value byte in
+        // the FIRST input file compaction would consume.
+        let mut tree = LsmTree::open(cfg, dir.path()).unwrap();
+        let sst_files: Vec<std::path::PathBuf> = {
+            let mut v: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sst"))
+                .collect();
+            v.sort();
+            v
+        };
+        assert!(sst_files.len() >= 2, "fixture needs multiple runs");
+        let victim = &sst_files[0];
+        // Snapshot every input file for the byte-identity check.
+        let before: Vec<Vec<u8>> = sst_files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let mut corrupt = before[0].clone();
+        // Flip a byte well inside the payload area (past the header).
+        corrupt[64] ^= 0xFF;
+        std::fs::write(victim, &corrupt).unwrap();
+
+        // Compaction must fail — the checksum mismatch is an error, not a
+        // tombstone — and must not delete or rewrite any input file.
+        let r = tree.compact(0);
+        assert!(r.is_err(), "compaction over a corrupt input must fail");
+        let err = r.unwrap_err().to_string();
+        assert!(
+            err.contains("checksum mismatch") || err.contains("cannot be reopened"),
+            "error must name the corrupt input: {err}"
+        );
+        let after: Vec<std::path::PathBuf> = {
+            let mut v: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sst"))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(after, sst_files, "no input file was deleted or created");
+        for (i, p) in after.iter().enumerate() {
+            let now = std::fs::read(p).unwrap();
+            let expected = if p == victim { &corrupt } else { &before[i] };
+            assert_eq!(&now, expected, "input file {p:?} was rewritten");
+        }
+
+        // Healing the corruption restores full compaction + reads.
+        std::fs::write(victim, &before[0]).unwrap();
+        tree.compact(0).unwrap();
+        let got = tree.range(b"key", b"kez");
+        assert!(!got.is_empty(), "post-heal compaction kept the data");
+    }
+
     #[test]
     // The property the cold tier exists for: after loading from disk, values are
     // NOT resident. Previously `SSTable` held every value in a Vec, so evicting
     // to "cold" moved bytes from one in-RAM structure to another and a fully
     // evicted 4.8 GB dataset stayed 4.8 GB resident.
-    fn loaded_sstable_holds_offsets_not_values() {
-        let dir = tempfile::tempdir().unwrap();
+    fn loaded_sstable_holds_offsets_not_values() {        let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(LsmConfig::default(), dir.path()).unwrap();
         let big = vec![b'x'; 256 * 1024];
         for i in 0..8 {

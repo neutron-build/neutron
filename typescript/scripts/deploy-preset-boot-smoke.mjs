@@ -32,6 +32,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
+import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -65,17 +66,17 @@ async function verifyVercel() {
   const call = async (url) => {
     const chunks = [];
     const headers = {};
-    const res = {
-      statusCode: 200,
-      setHeader: (key, value) => {
-        headers[key.toLowerCase()] = value;
-      },
-      write: (chunk) => {
+    // A real Writable: the generated handler streams the body with
+    // stream.pipeline, exactly as it does into Vercel's ServerResponse.
+    const res = new Writable({
+      write(chunk, _encoding, callback) {
         chunks.push(Buffer.from(chunk));
+        callback();
       },
-      end: (chunk) => {
-        if (chunk) chunks.push(Buffer.from(chunk));
-      },
+    });
+    res.statusCode = 200;
+    res.setHeader = (key, value) => {
+      headers[key.toLowerCase()] = value;
     };
     await handler({ method: "GET", url, headers: { host: "localhost" } }, res);
     return { status: res.statusCode, body: Buffer.concat(chunks).toString(), headers };

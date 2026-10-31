@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/data",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Data layer for Neutron. Database (Drizzle), cache, sessions, queues, storage, and rate limiting.",
   "author": "Tyler",
   "license": "MIT",
@@ -83,5 +83,8 @@
   "engines": {
     "node": ">=22"
   },
-  "sideEffects": false
+  "sideEffects": false,
+  "dependencies": {
+    "@neutron-build/sql": "workspace:^"
+  }
 }

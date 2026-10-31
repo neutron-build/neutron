@@ -1,12 +1,12 @@
 import { type ComponentType } from 'react'
 import { View, Text, Pressable } from 'react-native'
-import { useSignal, useComputed } from '../signals/hooks.js'
-import { routerState, navigate, goBack } from '../router/navigator.js'
-import type { NavigatorProps, ScreenConfig, ScreenOptions } from './types.js'
+import { declaredScreens, useNavigator, NavigationDepth } from './scoped.js'
+import { navigate, goBack } from '../router/navigator.js'
+import type { NavigatorProps, ScreenOptions } from './types.js'
 
 // ─── Screen registry ─────────────────────────────────────────────────────────
 
-const _screens = new Map<string, ScreenConfig>()
+
 
 // ─── Stack.Screen ─────────────────────────────────────────────────────────────
 
@@ -17,15 +17,15 @@ interface StackScreenProps {
 }
 
 function StackScreen({ name, component, options }: StackScreenProps) {
-  _screens.set(name, { name, component, options })
+  void { name, component, options }
   return null
 }
 
 // ─── Stack Navigator ──────────────────────────────────────────────────────────
 
 /**
- * Stack — push/pop navigation with native slide animation.
- * Wraps React Navigation's NativeStackNavigator under the hood.
+ * Stack — scoped declarative screens backed by synchronous router history.
+ * Native transitions and gestures require a React Navigation adapter.
  *
  * @example
  * <Stack initialRouteName="home">
@@ -34,26 +34,13 @@ function StackScreen({ name, component, options }: StackScreenProps) {
  * </Stack>
  */
 export function Stack({ children, initialRouteName, screenOptions }: NavigatorProps) {
-  // Render children first to populate _screens registry
-  void children  // traverse children to register screens
-
-  const currentSegment = useComputed(() => routerState.value.segments[0] ?? initialRouteName ?? '')
-
-  const _historyStack = useSignal<string[]>([currentSegment.value])
-
-  // Keep history stack in sync with router
-  const activeScreen = _screens.get(currentSegment.value)
+  const screens = declaredScreens(children, StackScreen)
+  const nav = useNavigator(screens, initialRouteName)
+  const activeScreen = nav.active
   const ActiveComponent = activeScreen?.component
   const activeOptions = { ...screenOptions, ...activeScreen?.options }
-
-  const canGoBackVal = _historyStack.value.length > 1
-
-  function handleBack() {
-    if (canGoBackVal) {
-      _historyStack.value = _historyStack.value.slice(0, -1)
-      goBack()
-    }
-  }
+  const canGoBackVal = nav.canGoBack
+  const handleBack = nav.back
 
   return (
     <View style={{ flex: 1 }}>
@@ -92,7 +79,7 @@ export function Stack({ children, initialRouteName, screenOptions }: NavigatorPr
         </View>
       )}
       {ActiveComponent
-        ? <ActiveComponent />
+        ? <NavigationDepth.Provider value={nav.depth + 1}><ActiveComponent /></NavigationDepth.Provider>
         : <View style={{ flex: 1 }} />
       }
     </View>
@@ -101,6 +88,6 @@ export function Stack({ children, initialRouteName, screenOptions }: NavigatorPr
 
 Stack.Screen = StackScreen
 
-// Allow imperative push from anywhere
+// Compatibility actions target the root. In nested screens use useStackActions().
 Stack.push = (name: string, params?: Record<string, string>) => navigate(`/${name}`, { params })
 Stack.pop = () => goBack()

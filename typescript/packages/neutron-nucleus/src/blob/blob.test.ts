@@ -269,8 +269,8 @@ describe("blob streaming", () => {
   });
 });
 
-describe("blob put cancellation cleanup (no partial blob)", () => {
-  it("abort during the tag loop deletes the stored blob and rethrows", async () => {
+describe("blob put cancellation preserves stored data", () => {
+  it("abort during the tag loop retains the stored blob and rethrows", async () => {
     const t = new BlobProtocolTransport();
     const blob = makeBlob(t);
     t.abortTagAfter(1);
@@ -282,9 +282,9 @@ describe("blob put cancellation cleanup (no partial blob)", () => {
       }),
       /aborted/,
     );
-    assert.equal(t.store.size, 0, "canceled put must leave no blob");
+    assert.equal(t.store.size, 1, "canceled tag operation must not delete data");
     const del = t.calls.filter((c) => c.sql.startsWith("SELECT BLOB_DELETE"));
-    assert.equal(del.length, 1);
+    assert.equal(del.length, 0);
   });
 
   it("a completed put with metadata stores blob + tags", async () => {
@@ -316,5 +316,39 @@ describe("blob identity-bound buckets", () => {
     assert.throws(() => blob.bucket("a/b"), /ambiguous/);
     assert.throws(() => blob.bucket("a:b"), /ambiguous/);
     assert.throws(() => blob.bucket("ok", { schema: "x y", table: "t" }), /Invalid bucket schema/);
+  });
+});
+
+describe('blob compensation ownership (TSD-09)', () => {
+  it('preserves a successful concurrent overwrite when the earlier tag operation aborts', async () => {
+    let tagEntered!: () => void;
+    let rejectTag!: (reason: unknown) => void;
+    const entered = new Promise<void>((resolve) => { tagEntered = resolve; });
+    class Interleaved extends BlobProtocolTransport {
+      override async execute(sql: string, params: unknown[] = [], opts?: { signal?: AbortSignal }): Promise<number> {
+        if (sql.includes('BLOB_TAG')) {
+          tagEntered();
+          return new Promise<number>((_resolve, reject) => { rejectTag = reject; });
+        }
+        return super.execute(sql, params, opts);
+      }
+    }
+    const t = new Interleaved();
+    const blob = makeBlob(t);
+    const earlier = blob.put('b', 'same', new Uint8Array([0xaa]), { metadata: { tag: 'A' } });
+    const rejected = assert.rejects(earlier, { name: 'AbortError' });
+    await entered;
+    await blob.put('b', 'same', new Uint8Array([0xbb]));
+    rejectTag(new DOMException('aborted', 'AbortError'));
+    await rejected;
+    assert.equal(t.store.get('b/same')?.hex, 'bb');
+    assert.equal(t.calls.filter((c) => c.sql.includes('BLOB_DELETE')).length, 0);
+  });
+  it('retains a canceled overwrite and does not claim to restore its previous value', async () => {
+    const t = new BlobProtocolTransport(); const blob = makeBlob(t);
+    await blob.put('b', 'same', new Uint8Array([0xaa]));
+    t.abortTagAfter(1);
+    await assert.rejects(blob.put('b', 'same', new Uint8Array([0xbb]), { metadata: { tag: 'B' } }), { name: 'AbortError' });
+    assert.equal(t.store.get('b/same')?.hex, 'bb');
   });
 });

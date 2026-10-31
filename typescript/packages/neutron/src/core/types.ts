@@ -3,7 +3,12 @@ import type { SeoMetaInput } from "./seo.js";
 import type { ResourceRouteMethod } from "./resource-routes.js";
 
 export interface RouteCacheConfig {
+  /** Explicit shared-public response opt-in, in seconds. */
   maxAge?: number;
+  /** Explicit shared-public loader opt-in, in seconds. Loader data may vary
+   * only by URL/params, origin, Accept, Accept-Language and Neutron data/route
+   * headers. Private/custom-header data must bypass sharing. Middleware and
+   * headers callbacks additionally require their sharedCacheSafe contract. */
   loaderMaxAge?: number;
 }
 
@@ -133,11 +138,16 @@ export interface AppContext {
   [key: string]: unknown;
 }
 
-export type MiddlewareFn = (
+export type MiddlewareFn = ((
   request: Request,
   context: AppContext,
   next: () => Promise<Response>
-) => Promise<Response>;
+) => Promise<Response>) & {
+  /** Explicit promise: no request-specific data and only cache-keyed representation
+   * dimensions, including post-next work. Authorization still runs before reads.
+   * Absent/false bypasses shared response and loader caches. */
+  sharedCacheSafe?: true;
+};
 
 export interface ErrorBoundaryProps {
   error: Error;
@@ -195,10 +205,10 @@ export interface RouteModule {
   HEAD?: ResourceRouteHandler;
   clientLoader?: (args: ClientLoaderArgs) => Promise<unknown>;
   clientAction?: (args: ClientActionArgs) => Promise<unknown>;
-  headers?:
-    | ((
-        args: HeadersArgs
-      ) => Headers | Record<string, string> | Promise<Headers | Record<string, string>>);
+  headers?: ((args: HeadersArgs) => Headers | Record<string, string> | Promise<Headers | Record<string, string>>) & {
+    /** Same public/keyed contract as MiddlewareFn.sharedCacheSafe. */
+    sharedCacheSafe?: true;
+  };
   head?: (
     args: HeadArgs
   ) =>

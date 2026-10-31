@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "server")]
+use futures::FutureExt;
 
 // GRANT / REVOKE tests
 // ======================================================================
@@ -41,6 +43,8 @@ async fn test_declare_fetch_close_cursor() {
     exec(&ex, "INSERT INTO cur_t VALUES (1, 'alice')").await;
     exec(&ex, "INSERT INTO cur_t VALUES (2, 'bob')").await;
     exec(&ex, "INSERT INTO cur_t VALUES (3, 'charlie')").await;
+    // A non-holdable cursor only exists inside a transaction block.
+    exec(&ex, "BEGIN").await;
     exec(&ex, "DECLARE my_cursor CURSOR FOR SELECT * FROM cur_t").await;
 
     // Fetch 2 rows
@@ -59,6 +63,7 @@ async fn test_declare_fetch_close_cursor() {
         ExecResult::Command { tag, .. } => assert_eq!(tag, "CLOSE"),
         _ => panic!("expected command"),
     }
+    exec(&ex, "COMMIT").await;
 }
 
 // ======================================================================
@@ -1309,4 +1314,190 @@ async fn create_model_path_containment_holds_even_for_superuser() {
         ),
         Ok(_) => panic!("/etc/passwd must never be registrable as a model path"),
     }
+}
+
+// NP02: actual SQL functions, live registry, authority, and shared wakeups.
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn backend_cancel_identity_authority_and_disconnect() {
+    let ex = test_executor();
+    for sql in [
+        "CREATE ROLE cancel_owner LOGIN",
+        "CREATE ROLE cancel_other LOGIN BYPASSRLS",
+        "CREATE ROLE cancel_admin LOGIN SUPERUSER",
+    ] {
+        exec(&ex, sql).await;
+    }
+    let owner = ex.create_unauthenticated_session();
+    let peer = ex.create_unauthenticated_session();
+    let other = ex.create_unauthenticated_session();
+    let admin = ex.create_unauthenticated_session();
+    for (id, role) in [
+        (owner, "cancel_owner"),
+        (peer, "cancel_owner"),
+        (other, "cancel_other"),
+        (admin, "cancel_admin"),
+    ] {
+        ex.bind_authenticated_session(id, role).await.unwrap();
+    }
+    let (pid, wakeup) = ex.register_session_backend(owner).unwrap();
+    let (peer_pid, _) = ex.register_session_backend(peer).unwrap();
+    ex.register_session_backend(other).unwrap();
+    let (admin_pid, _) = ex.register_session_backend(admin).unwrap();
+    assert_ne!(pid, peer_pid);
+    assert_ne!(pid, admin_pid);
+    let (again, same_wakeup) = ex.register_session_backend(owner).unwrap();
+    assert_eq!(pid, again);
+    assert!(Arc::ptr_eq(&wakeup, &same_wakeup));
+    let result = ex
+        .execute_with_session(owner, "SELECT pg_backend_pid()")
+        .await
+        .unwrap();
+    assert_eq!(scalar(&result[0]), &Value::Int32(pid));
+    let result = ex
+        .execute_with_session(peer, "SELECT pg_backend_pid()")
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&result[0]),
+        &Value::Int32(peer_pid),
+        "same-role peers must not replay another backend's cached PID"
+    );
+    let cancel = format!("SELECT pg_cancel_backend({pid})");
+    assert!(matches!(
+        ex.execute_with_session(other, &cancel).await,
+        Err(ExecError::PermissionDenied(_))
+    ));
+    assert!(!ex.session_cancel_pending(owner));
+    assert!(wakeup.notified().now_or_never().is_none());
+    let result = ex.execute_with_session(peer, &cancel).await.unwrap();
+    assert_eq!(scalar(&result[0]), &Value::Bool(true));
+    assert!(ex.session_cancel_pending(owner));
+    assert!(
+        wakeup.notified().now_or_never().is_some(),
+        "SQL cancellation must wake wire waits"
+    );
+    ex.clear_session_cancel(owner);
+    let cancel_super = format!("SELECT pg_cancel_backend({admin_pid})");
+    assert!(matches!(
+        ex.execute_with_session(peer, &cancel_super).await,
+        Err(ExecError::PermissionDenied(_))
+    ));
+    let result = ex.execute_with_session(admin, &cancel).await.unwrap();
+    assert_eq!(scalar(&result[0]), &Value::Bool(true));
+    ex.clear_session_cancel(owner);
+    // SQL self-cancellation also signals its own session, not the process.
+    let result = ex.execute_with_session(owner, &cancel).await.unwrap();
+    assert_eq!(scalar(&result[0]), &Value::Bool(true));
+    assert!(ex.session_cancel_pending(owner));
+    ex.clear_session_cancel(owner);
+    ex.drop_session(owner);
+    let result = ex.execute_with_session(peer, &cancel).await.unwrap();
+    assert_eq!(scalar(&result[0]), &Value::Bool(false));
+    assert!(ex.register_session_backend(owner).is_err());
+    ex.request_session_cancel(owner);
+    assert!(!ex.session_cancel_pending(owner));
+    let fresh = ex.create_session();
+    assert!(ex.register_session_backend(fresh).unwrap().0 > admin_pid);
+}
+
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn backend_cancel_unauthenticated_and_unregistered_are_not_targets() {
+    let ex = test_executor();
+    let caller = ex.create_unauthenticated_session();
+    ex.register_session_backend(caller).unwrap();
+    let target = ex.create_unauthenticated_session();
+    let (pid, wakeup) = ex.register_session_backend(target).unwrap();
+    let sql = format!("SELECT pg_cancel_backend({pid})");
+    assert!(
+        matches!(ex.execute(&sql).await, Err(ExecError::PermissionDenied(_))),
+        "embedded or unknown-session fallback must not supply cancellation authority"
+    );
+    assert!(matches!(
+        ex.execute_with_session(caller, &sql).await,
+        Err(ExecError::PermissionDenied(_))
+    ));
+    ex.bind_authenticated_session(caller, "nucleus")
+        .await
+        .unwrap();
+    ex.register_session_backend(caller).unwrap();
+    let result = ex.execute_with_session(caller, &sql).await.unwrap();
+    assert_eq!(scalar(&result[0]), &Value::Bool(false));
+    assert!(wakeup.notified().now_or_never().is_none());
+    for pid in [0, -1, i32::MAX] {
+        let result = ex
+            .execute_with_session(caller, &format!("SELECT pg_cancel_backend({pid})"))
+            .await
+            .unwrap();
+        assert_eq!(scalar(&result[0]), &Value::Bool(false));
+    }
+}
+
+#[cfg(feature = "server")]
+#[test]
+fn backend_cancel_boundary_keeps_flag_and_permit_consistent_under_race() {
+    let ex = test_executor();
+    let id = ex.create_session();
+    let (_, wakeup) = ex.register_session_backend(id).unwrap();
+    for _ in 0..128 {
+        ex.clear_session_cancel(id);
+        std::thread::scope(|scope| {
+            scope.spawn(|| ex.request_session_cancel(id));
+            scope.spawn(|| ex.clear_session_cancel(id));
+        });
+        // Both orders are permitted: old cancel cleared, or new cancel pending.
+        // Flag and wakeup must never disagree once both boundary operations end.
+        assert_eq!(
+            ex.session_cancel_pending(id),
+            wakeup.notified().now_or_never().is_some()
+        );
+    }
+    ex.request_session_cancel(id);
+    ex.clear_session_cancel(id);
+    assert!(!ex.session_cancel_pending(id));
+    assert!(wakeup.notified().now_or_never().is_none());
+}
+
+#[cfg(feature = "server")]
+#[test]
+fn backend_cancel_pid_exhaustion_refuses_wraparound() {
+    let ex = test_executor();
+    ex.next_backend_pid.store(i32::MAX - 1, Ordering::Relaxed);
+    assert_eq!(ex.allocate_backend_pid().unwrap(), i32::MAX - 1);
+    assert!(ex.allocate_backend_pid().is_err());
+    assert_eq!(ex.next_backend_pid.load(Ordering::Relaxed), i32::MAX);
+}
+
+#[tokio::test]
+async fn quoted_role_names_stored_without_delimiter_quotes() {
+    // Postgres identifier semantics: quotes delimit, they are not part of
+    // the name. sqlparser's Ident Display renders them back; storing that
+    // rendering left roles callable only as '"name"' (sql-probe-03 finding).
+    let ex = test_executor();
+    let id = ex.create_session();
+    CURRENT_SESSION
+        .scope(ex.get_session(id), async {
+            let session = ex.current_session();
+            session.session_context.write().user = "root".to_string();
+            ex.execute("CREATE ROLE root SUPERUSER LOGIN")
+                .await
+                .unwrap();
+            ex.execute(r#"CREATE ROLE "probe_quoted" LOGIN"#)
+                .await
+                .unwrap();
+            let role = ex
+                .roles
+                .read()
+                .await
+                .get("probe_quoted")
+                .cloned()
+                .expect("role must be stored under its identifier value");
+            assert!(role.can_login);
+            assert!(
+                !ex.roles.read().await.contains_key("\"probe_quoted\""),
+                "the quoted rendering must not be a separate stored name"
+            );
+        })
+        .await;
 }

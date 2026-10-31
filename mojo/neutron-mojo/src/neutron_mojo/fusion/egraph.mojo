@@ -16,6 +16,7 @@ This is the core data structure for the rewrite engine.
 from std.collections import List, Dict, Optional
 from .graph import OpKind, ValueId, ENode
 from .eclass import ClassId, UnionFind, EClass
+from std.memory import alloc
 
 # ===----------------------------------------------------------------------=== #
 # CanonicalNode — Canonicalized e-node with ClassId inputs
@@ -30,30 +31,60 @@ struct CanonicalNode(Writable, Copyable, Movable, ImplicitlyCopyable):
     canonical form.
     """
     var op: OpKind
+    var symbol: Int
+    var has_constant: Bool
+    var constant_bits: Int
+    var constant_dtype: Int
+    var constant_shape: List[Int]
     var inputs: List[ClassId]
 
     def __init__(out self, op: OpKind):
+        self.symbol = -1
+        self.has_constant = False
+        self.constant_bits = 0
+        self.constant_dtype = 32  # scalar F32
+        self.constant_shape = [1]
         self.op = op
         self.inputs = List[ClassId]()
 
     def __init__(out self, op: OpKind, input0: ClassId):
+        self.symbol = -1
+        self.has_constant = False
+        self.constant_bits = 0
+        self.constant_dtype = 32  # scalar F32
+        self.constant_shape = [1]
         self.op = op
         self.inputs = List[ClassId]()
         self.inputs.append(input0)
 
     def __init__(out self, op: OpKind, input0: ClassId, input1: ClassId):
+        self.symbol = -1
+        self.has_constant = False
+        self.constant_bits = 0
+        self.constant_dtype = 32  # scalar F32
+        self.constant_shape = [1]
         self.op = op
         self.inputs = List[ClassId]()
         self.inputs.append(input0)
         self.inputs.append(input1)
 
     def __init__(out self, *, copy: Self):
+        self.symbol = copy.symbol
+        self.has_constant = copy.has_constant
+        self.constant_bits = copy.constant_bits
+        self.constant_dtype = copy.constant_dtype
+        self.constant_shape = copy.constant_shape.copy()
         self.op = copy.op
         self.inputs = copy.inputs.copy()
 
     def copy(self) -> CanonicalNode:
         """Return a deep copy of this canonical node."""
         var cn = CanonicalNode(self.op)
+        cn.symbol = self.symbol
+        cn.has_constant = self.has_constant
+        cn.constant_bits = self.constant_bits
+        cn.constant_dtype = self.constant_dtype
+        cn.constant_shape = self.constant_shape.copy()
         cn.inputs = self.inputs.copy()
         return cn^
 
@@ -62,13 +93,23 @@ struct CanonicalNode(Writable, Copyable, Movable, ImplicitlyCopyable):
 
         Simple hash combining op value and input class IDs.
         """
-        var h = self.op._value
+        var h = self.op._value * 31 + self.symbol
+        h = h * 31 + Int(self.has_constant)
+        if self.has_constant:
+            h = h * 31 + self.constant_bits
+            h = h * 31 + self.constant_dtype
+            for i in range(len(self.constant_shape)):
+                h = h * 31 + self.constant_shape[i]
         for i in range(len(self.inputs)):
             h = h * 31 + self.inputs[i].id()
         return h
 
     def __eq__(self, other: CanonicalNode) -> Bool:
         """Check structural equality for hash-consing."""
+        if self.symbol != other.symbol or self.has_constant != other.has_constant:
+            return False
+        if self.has_constant and (self.constant_bits != other.constant_bits or self.constant_dtype != other.constant_dtype or self.constant_shape != other.constant_shape):
+            return False
         if self.op != other.op:
             return False
         if len(self.inputs) != len(other.inputs):
@@ -131,6 +172,10 @@ struct EGraph:
         Returns:
             The ClassId of the e-class containing this node.
         """
+        # Opaque leaves are distinct symbols, never presumed numeric constants.
+        if (node.op == OpKind.Input or node.op == OpKind.Const) and node.symbol < 0 and not node.has_constant:
+            node.symbol = len(self.nodes)
+        node = self.canonicalize(node^)
         # O(1) amortized hash-consing via bucket lookup
         var h = node.hash()
         var bucket = (h & 0x7FFFFFFF) & (self._num_buckets - 1)
@@ -168,7 +213,9 @@ struct EGraph:
         Returns:
             The canonical ClassId of the merged class.
         """
-        return self.unionfind.merge(id1, id2)
+        var root = self.unionfind.merge(id1, id2)
+        self.rebuild()
+        return self.find(root)
 
     def find(mut self, id: ClassId) -> ClassId:
         """Find the canonical representative of an e-class.
@@ -193,7 +240,8 @@ struct EGraph:
         Returns:
             A new CanonicalNode with canonicalized inputs.
         """
-        var canonical = CanonicalNode(node.op)
+        var canonical = node.copy()
+        canonical.inputs = List[ClassId]()
         for i in range(len(node.inputs)):
             var canonical_input = self.find(node.inputs[i])
             canonical.inputs.append(canonical_input)
@@ -206,3 +254,49 @@ struct EGraph:
     def num_nodes(self) -> Int:
         """Return the total number of e-nodes in the graph."""
         return len(self.nodes)
+
+
+    def rebuild(mut self):
+        """Rehash canonical children and merge congruent parents to a fixed point.
+
+        Rebuilding buckets on each round is bounded by the existing node count;
+        node/class storage remains stable for clients holding old ClassIds.
+        """
+        var changed = True
+        while changed:
+            changed = False
+            self._hash_buckets = List[List[Int]]()
+            for _ in range(self._num_buckets):
+                self._hash_buckets.append(List[Int]())
+            for idx in range(len(self.nodes)):
+                var canonical = self.canonicalize(self.nodes[idx].copy())
+                self.nodes[idx] = canonical^
+                var bucket = (self.nodes[idx].hash() & 0x7FFFFFFF) & (self._num_buckets - 1)
+                for i in range(len(self._hash_buckets[bucket])):
+                    var other = self._hash_buckets[bucket][i]
+                    if self.nodes[idx] == self.nodes[other]:
+                        var a = self.find(self.classes[idx].id)
+                        var b = self.find(self.classes[other].id)
+                        if a != b:
+                            _ = self.unionfind.merge(a,b)
+                            changed = True
+                self._hash_buckets[bucket].append(idx)
+
+    def add_scalar_f32(mut self, value: Float32) raises -> ClassId:
+        var ptr = alloc[Float32](1)
+        ptr.unsafe_store(value)
+        var bits = Int(ptr.unsafe_bitcast[UInt32]().unsafe_load())
+        ptr.free()
+        var node = CanonicalNode(OpKind.Const)
+        node.has_constant = True
+        node.constant_bits = bits
+        return self.add(node^)
+
+    def is_scalar_f32(mut self, cid: ClassId, bits: Int) -> Bool:
+        var root = self.find(cid)
+        for i in range(len(self.nodes)):
+            if self.find(self.classes[i].id) == root:
+                var node = self.nodes[i].copy()
+                if node.op == OpKind.Const and node.has_constant and node.constant_dtype == 32 and node.constant_shape == [1] and node.constant_bits == bits:
+                    return True
+        return False

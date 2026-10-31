@@ -28,6 +28,11 @@ pub struct RespHandler {
     kv: Arc<KvStore>,
     password: Option<String>,
     authenticated: bool,
+    /// Failed AUTH attempts on this connection (NE-10): bounded
+    /// independently of pgwire's login limiter. After the cap the connection
+    /// can never authenticate without reconnecting, so a brute-force attempt
+    /// costs one connection slot for a bounded number of guesses.
+    auth_failures: u32,
     /// When Some, we are in a MULTI transaction — commands are queued.
     transaction_queue: Option<Vec<Vec<Vec<u8>>>>,
     /// WATCH'd keys and their version at WATCH time.
@@ -39,6 +44,9 @@ pub struct RespHandler {
     /// Subscription receiver (allocated lazily).
     pubsub_sub: Option<Subscription>,
 }
+
+/// Per-connection AUTH failure cap (NE-10).
+const MAX_AUTH_FAILURES: u32 = 5;
 
 impl RespHandler {
     /// Create a new handler.
@@ -52,6 +60,7 @@ impl RespHandler {
             kv,
             password,
             authenticated,
+            auth_failures: 0,
             transaction_queue: None,
             watched_keys: Vec::new(),
             pubsub,
@@ -463,13 +472,31 @@ impl RespHandler {
                         "ERR wrong number of arguments for 'auth' command",
                     );
                 }
+                // NE-10: bounded authentication attempts, independent of
+                // pgwire's login limiter.
+                if self.auth_failures >= MAX_AUTH_FAILURES {
+                    return encoder::encode_error(
+                        "ERR too many authentication attempts; reconnect to retry",
+                    );
+                }
                 let provided = String::from_utf8_lossy(&args[1]).to_string();
                 match &self.password {
                     Some(pw) if constant_time_eq(pw.as_bytes(), provided.as_bytes()) => {
                         self.authenticated = true;
+                        self.auth_failures = 0;
                         encoder::encode_simple_string("OK")
                     }
-                    Some(_) => encoder::encode_error("ERR invalid password"),
+                    Some(_) => {
+                        self.auth_failures += 1;
+                        if self.auth_failures >= MAX_AUTH_FAILURES {
+                            encoder::encode_error(
+                                "ERR invalid password; too many authentication attempts, \
+                                 reconnect to retry",
+                            )
+                        } else {
+                            encoder::encode_error("ERR invalid password")
+                        }
+                    }
                     None => {
                         // No password set -- AUTH is a no-op (client compat).
                         encoder::encode_simple_string("OK")
@@ -2368,6 +2395,32 @@ mod tests {
         // Now GET works.
         let resp = h.handle_command(args(&["GET", "key"]));
         assert_eq!(decode_bulk(&resp), None); // key doesn't exist but no error
+    }
+
+    /// NE-10: authentication attempts are bounded per connection,
+    /// independently of pgwire's login limiter — a brute-force attempt costs
+    /// one connection slot for a bounded number of guesses.
+    #[test]
+    fn test_auth_attempts_are_bounded_per_connection() {
+        let mut h = new_handler_with_password("secret");
+        for _ in 0..5 {
+            let resp = h.handle_command(args(&["AUTH", "wrong"]));
+            assert!(is_error(&resp), "pre-cap failures must be ordinary errors");
+        }
+        // Cap reached: even the CORRECT password is refused on this
+        // connection — reconnecting is the only retry.
+        let resp = h.handle_command(args(&["AUTH", "secret"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.contains("too many authentication attempts"),
+            "expected the cap error, got: {s}"
+        );
+        assert!(!h.is_authenticated(), "the cap must not authenticate");
+
+        // A fresh connection gets a fresh (but equally bounded) budget.
+        let mut h2 = new_handler_with_password("secret");
+        let resp = h2.handle_command(args(&["AUTH", "secret"]));
+        assert_eq!(decode_simple(&resp), "OK");
     }
 
     #[test]

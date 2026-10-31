@@ -9,7 +9,7 @@ from std.math import sqrt
 from neutron_mojo.autograd.tape import Tape
 
 
-def clip_grad_norm(mut tape: Tape, param_indices: List[Int], max_norm: Float64) -> Float64:
+def clip_grad_norm(mut tape: Tape, param_indices: List[Int], max_norm: Float64) raises -> Float64:
     """Clip gradients by global norm.
 
     Scales all parameter gradients so that the global L2 norm

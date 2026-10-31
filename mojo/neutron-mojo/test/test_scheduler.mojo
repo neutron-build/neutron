@@ -32,9 +32,13 @@ def assert_true(cond: Bool, msg: String) raises:
 # Helper builders
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny model for testing (1 layer, vocab=32, dim=16)."""
     var params = tiny_test_params()
+    # Tokenizer has 32 ids (0..31); strict admission rejects out-of-vocab prompts
+    params.vocab_size = 32
+    # Scheduler runs with max_seq_len=64 budgets; align model context capacity
+    params.max_seq_len = 256
     var model = Model(params)
     var total = model.layer_weights.numel()
     for i in range(total):
@@ -219,6 +223,8 @@ def test_scheduler_enqueue() raises:
 def test_scheduler_admit() raises:
     """Test admitting requests from queue to active batch."""
     var params = tiny_test_params()
+    # Tokenizer ids go up to 31; strict admission rejects out-of-vocab prompts
+    params.vocab_size = 32
     var sched = BatchScheduler(params, max_batch_size=2, max_seq_len=64)
     var tok = _build_tiny_tokenizer()
 
@@ -238,7 +244,7 @@ def test_scheduler_single_request() raises:
     """Test processing a single request to completion."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim,
         max_seq_len=64,
@@ -262,7 +268,7 @@ def test_scheduler_multiple_requests() raises:
     """Test processing multiple requests."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim,
         max_seq_len=64,
@@ -289,7 +295,7 @@ def test_scheduler_batch_overflow() raises:
     """Test that requests beyond batch size wait in queue."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim,
         max_seq_len=64,
@@ -316,7 +322,7 @@ def test_scheduler_stats_tracking() raises:
     """Test that statistics are tracked correctly."""
     var model = _build_tiny_model()
     var tok = _build_tiny_tokenizer()
-    var params = tiny_test_params()
+    var params = model.params.copy()
     var rope = RoPETable(
         head_dim=params.head_dim,
         max_seq_len=64,
@@ -371,6 +377,8 @@ def test_scheduler_has_active() raises:
 def test_scheduler_peak_batch_tracking() raises:
     """Test peak batch size tracking."""
     var params = tiny_test_params()
+    # Tokenizer ids go up to 31; strict admission rejects out-of-vocab prompts
+    params.vocab_size = 32
     var tok = _build_tiny_tokenizer()
     var sched = BatchScheduler(params, max_batch_size=4, max_seq_len=64)
 

@@ -71,7 +71,7 @@ struct LayerScaleOffsets(Copyable, Movable, ImplicitlyCopyable):
 
 
 def _num_blocks(in_features: Int, block_size: Int) -> Int:
-    return (in_features + block_size - 1) // block_size
+    return in_features // block_size + Int(in_features % block_size != 0)
 
 
 def _scales_count(out_features: Int, in_features: Int, block_size: Int) -> Int:
@@ -98,7 +98,10 @@ struct QuantizedModel(Movable):
     var block_size: Int
     var scales_per_layer: Int
 
-    def __init__(out self, params: ModelParams, block_size: Int = 32):
+    def __init__(out self, params: ModelParams, block_size: Int = 32) raises:
+        params.validate()
+        if block_size <= 0:
+            raise Error("Quantization block size must be positive")
         self.params = params.copy()
         self.layer_size = params.layer_weight_count()
         self.block_size = block_size
@@ -136,6 +139,18 @@ struct QuantizedModel(Movable):
                 self.layer_weights.set(offsets.attn_norm + i, 1.0)
                 self.layer_weights.set(offsets.ffn_norm + i, 1.0)
 
+    def __init__(out self, *, copy_data: Self):
+        """Copy admitted allocations without accepting new allocation sizes."""
+        self.params = copy_data.params.copy()
+        self.embed = copy_data.embed.clone()
+        self.final_norm = copy_data.final_norm.clone()
+        self.lm_head = copy_data.lm_head.clone()
+        self.layer_weights = copy_data.layer_weights.clone()
+        self.layer_scales = copy_data.layer_scales.clone()
+        self.layer_size = copy_data.layer_size
+        self.block_size = copy_data.block_size
+        self.scales_per_layer = copy_data.scales_per_layer
+
     def __init__(out self, *, deinit move: Self):
         self.params = move.params.copy()
         self.embed = move.embed^
@@ -146,6 +161,20 @@ struct QuantizedModel(Movable):
         self.layer_size = move.layer_size^
         self.block_size = move.block_size^
         self.scales_per_layer = move.scales_per_layer^
+
+    def validate_storage(self) raises:
+        """Check model metadata against actual owned spans before forward access."""
+        self.params.validate()
+        var p = self.params.copy()
+        var matrix_count = Shape(p.vocab_size, p.hidden_dim).numel()
+        var layer_count = p.layer_weight_count()
+        if self.layer_size != layer_count or self.embed.numel() != matrix_count or self.lm_head.numel() != matrix_count or self.final_norm.numel() != p.hidden_dim or self.layer_weights.numel() != Shape(p.num_layers, layer_count).numel():
+            raise Error("Model parameter storage does not match metadata")
+        if self.block_size <= 0:
+            raise Error("Invalid model quantization block size")
+        var scales = _scales_count(p.q_dim(), p.hidden_dim, self.block_size) + _scales_count(p.kv_dim(), p.hidden_dim, self.block_size) * 2 + _scales_count(p.hidden_dim, p.q_dim(), self.block_size) + _scales_count(p.ffn_dim, p.hidden_dim, self.block_size) * 2 + _scales_count(p.hidden_dim, p.ffn_dim, self.block_size)
+        if self.scales_per_layer != scales or self.layer_scales.numel() != Shape(p.num_layers, scales).numel():
+            raise Error("Model scale storage does not match metadata")
 
     def _layer_offsets(self, layer: Int) -> LayerWeightOffsets:
         """Compute data offsets (same layout as Model)."""
@@ -211,7 +240,7 @@ struct QuantizedModel(Movable):
         scales_offset: Int,
         out_dim: Int,
         in_dim: Int,
-    ) -> Tensor[DType.float32]:
+    ) raises -> Tensor[DType.float32]:
         """Q8 dequant-on-the-fly matrix-vector multiply from flat storage."""
         var result = Tensor[DType.float32](Shape(out_dim))
         simd_q8_matvec(
@@ -230,6 +259,11 @@ struct QuantizedModel(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Forward pass through a single layer using Q8 weights."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        if x.numel() != self.params.hidden_dim:
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1, layer)
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = self._layer_offsets(layer)
@@ -330,6 +364,9 @@ struct QuantizedModel(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Full forward pass: embed → N Q8 layers → norm → logits."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1)
         var hidden = embed_token(self.embed, token_id, self.params.hidden_dim)
 
         for layer in range(self.params.num_layers):
@@ -356,6 +393,11 @@ struct QuantizedModel(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Forward pass through a single Q8 layer using Q8 KV cache."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        if x.numel() != self.params.hidden_dim:
+            raise Error("Model layer input span mismatch")
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1, layer)
         var p = self.params.copy()
         var hd = p.hidden_dim
         var off = self._layer_offsets(layer)
@@ -434,6 +476,9 @@ struct QuantizedModel(Movable):
         pos: Int,
     ) raises -> Tensor[DType.float32]:
         """Full forward pass with Q8 KV cache."""
+        self.params.validate_execution(rope, pos, specialized=True)
+        self.validate_storage()
+        cache.validate_request(self.params.num_layers, self.params.num_kv_heads, self.params.head_dim, pos, 1)
         var hidden = embed_token(self.embed, token_id, self.params.hidden_dim)
 
         for layer in range(self.params.num_layers):
@@ -506,7 +551,7 @@ def _quantize_projection(
                 dst.set(dst_offset + row * in_features + j, q)
 
 
-def quantize_from_model(model: Model, block_size: Int = 32) -> QuantizedModel:
+def quantize_from_model(model: Model, block_size: Int = 32) raises -> QuantizedModel:
     """Convert FP32 Model to Q8 QuantizedModel.
 
     Quantizes all 7 projection weight matrices per layer.
@@ -614,7 +659,12 @@ def q_generate(
         Generated token IDs (not including prompt).
     """
     var p = model.params.copy()
-    var total_len = len(prompt_tokens) + max_new_tokens
+    var total_len = p.validate_generation(prompt_tokens, max_new_tokens, p.max_seq_len)
+    from std.math import isfinite
+    if not isfinite(temperature) or temperature < 0:
+        raise Error("Invalid generation temperature")
+    if max_new_tokens == 0:
+        return List[Int]()
 
     var cache = MultiLayerKVCache(
         num_layers=p.num_layers,
@@ -626,6 +676,7 @@ def q_generate(
         head_dim=p.head_dim,
         max_seq_len=total_len,
         theta=p.rope_theta,
+        rotary_dim=p.rotary_dim(),
     )
 
     var generated = List[Int]()

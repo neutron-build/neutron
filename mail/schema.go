@@ -188,6 +188,26 @@ var ReferentialSchema = []string{
 	`ALTER TABLE mail_message_mailboxes VALIDATE CONSTRAINT mail_membership_message_fk`,
 }
 
+// AttachmentSchema replaces the has_attachment boolean with an honest
+// tri-state (GMAIL-03). Gmail envelope fetches use format=metadata,
+// which excludes the MIME part tree, so the old FALSE half of the column
+// was really "unknown" for Gmail rows: the adapter's part-tree walk over
+// a metadata payload always found nothing and recorded an absence that
+// was never provable. The backfill keeps present as present, recovers
+// Gmail's false to unknown, and leaves every other provider's false as
+// absent — IMAP BODYSTRUCTURE, Graph hasAttachments, and JMAP
+// hasAttachment are all definitive answers.
+var AttachmentSchema = []string{
+	`ALTER TABLE mail_messages ADD COLUMN attachment_state smallint NOT NULL DEFAULT 0`,
+	`UPDATE mail_messages SET attachment_state = CASE
+	   WHEN has_attachment THEN 2
+	   WHEN EXISTS (
+	     SELECT 1 FROM mail_accounts a
+	      WHERE a.id = mail_messages.account_id AND a.provider = 'gmail') THEN 0
+	   ELSE 1 END`,
+	`ALTER TABLE mail_messages DROP COLUMN has_attachment`,
+}
+
 // Account lock order (audit SYNC-04): every transaction that writes or
 // deletes mirror rows — PutEnvelopes, PutBody, DeleteMessages,
 // RemoveFromMailbox, PutMailboxes, scan staging and completion on the

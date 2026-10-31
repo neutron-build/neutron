@@ -2572,6 +2572,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 crate::catalog::ColumnDef {
                     name: "status".into(),
@@ -2582,6 +2583,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
             ],
             constraints: vec![],

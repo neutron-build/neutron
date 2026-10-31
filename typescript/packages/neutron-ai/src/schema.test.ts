@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { z as z3 } from "zod";
-import { z as z4 } from "zod/v4";
+import { z as z3 } from "zod/v3";
+import { z as z4 } from "zod";
 
 import { AIError } from "./errors.js";
 import { jsonSchema, resolveSchema } from "./schema.js";

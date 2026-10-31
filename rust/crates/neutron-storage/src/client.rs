@@ -25,9 +25,13 @@ fn tls_connector() -> Result<TlsConnector, StorageError> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("supported TLS versions")
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
 
     Ok(TlsConnector::from(Arc::new(config)))
 }

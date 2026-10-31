@@ -1,9 +1,19 @@
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tauri::plugin::TauriPlugin;
-use tauri::Wry;
+use tauri::{Manager, Wry};
+#[derive(Default, Clone)]
+struct Scheduled(Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>);
 
 pub fn init() -> TauriPlugin<Wry> {
     tauri::plugin::Builder::new("neutron-notifications")
+        .setup(|app, _| {
+            app.manage(Scheduled::default());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             send_notification,
             request_permission,
@@ -32,8 +42,10 @@ pub struct ScheduledNotification {
 
 #[tauri::command]
 async fn send_notification(notification: Notification) -> Result<(), String> {
-    tracing::info!(title = %notification.title, "Sending OS notification");
+    send(&notification)
+}
 
+fn send(notification: &Notification) -> Result<(), String> {
     let mut n = notify_rust::Notification::new();
     n.summary(&notification.title);
 
@@ -52,37 +64,53 @@ async fn send_notification(notification: Notification) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn schedule_notification(scheduled: ScheduledNotification) -> Result<(), String> {
-    let delay = scheduled.delay_ms;
-    let notification = scheduled.notification;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        let mut n = notify_rust::Notification::new();
-        n.summary(&notification.title);
-        if let Some(body) = &notification.body {
-            n.body(body);
+async fn schedule_notification(
+    scheduled: ScheduledNotification,
+    state: tauri::State<'_, Scheduled>,
+) -> Result<(), String> {
+    if scheduled.id.is_empty() {
+        return Err("Notification ID is required".into());
+    }
+    let state = state.inner().clone();
+    let mut pending = state.0.lock().map_err(|e| e.to_string())?;
+    if pending.contains_key(&scheduled.id) {
+        return Err("Notification ID is already scheduled".into());
+    }
+    let shared = state.clone();
+    let id = scheduled.id.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(scheduled.delay_ms)).await;
+        // Cancellation and dispatch are serialized. Cancellation winning this lock prevents send.
+        if let Ok(mut pending) = shared.0.lock()
+            && pending.remove(&id).is_some()
+            && let Err(error) = send(&scheduled.notification)
+        {
+            tracing::warn!(%error, "Scheduled notification failed");
         }
-        let _ = n.show();
     });
+    pending.insert(scheduled.id, task.abort_handle());
     Ok(())
 }
 
 #[tauri::command]
-async fn cancel_notification(_id: String) -> Result<(), String> {
-    // notify-rust doesn't support cancellation by ID on all platforms.
-    // On macOS, this would require UNUserNotificationCenter via objc.
-    tracing::debug!(id = %_id, "Cancel notification (platform-specific)");
+async fn cancel_notification(id: String, state: tauri::State<'_, Scheduled>) -> Result<(), String> {
+    let handle = state
+        .inner()
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove(&id)
+        .ok_or_else(|| "Notification is unknown or already dispatched".to_string())?;
+    handle.abort();
     Ok(())
 }
 
 #[tauri::command]
 async fn request_permission() -> Result<bool, String> {
-    // Desktop platforms generally don't require explicit permission.
-    // macOS 10.14+ does, but notify-rust handles it transparently.
-    Ok(true)
+    Err("This notification backend cannot request OS authorization; configure native notification permission integration".into())
 }
 
 #[tauri::command]
 async fn is_permission_granted() -> Result<bool, String> {
-    Ok(true)
+    Err("This notification backend cannot query OS authorization".into())
 }

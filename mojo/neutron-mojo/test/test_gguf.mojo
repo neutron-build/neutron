@@ -127,10 +127,11 @@ def test_gguf_tensor_offset() raises:
     var shape = List[Int]()
     shape.append(128)
 
-    gguf.register_tensor("bias", shape, GGUF_F32(), 2000)
+    # MJ-12: offsets must be aligned to the declared alignment (default 32).
+    gguf.register_tensor("bias", shape, GGUF_F32(), 2016)
 
     var abs_offset = gguf.get_tensor_offset("bias")
-    assert_true(abs_offset == 7000, "Absolute offset should be 5000 + 2000")
+    assert_true(abs_offset == 7016, "Absolute offset should be 5000 + 2016")
 
     print("  gguf_tensor_offset: PASS")
 

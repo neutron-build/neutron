@@ -24,5 +24,6 @@ tokio-stream     = { workspace = true }
 fastwebsockets   = { workspace = true }
 
 [dev-dependencies]
+neutron = { path = "../neutron", default-features = false, features = ["testing"] }
 tokio          = { workspace = true, features = ["rt", "macros"] }
 http-body-util = { workspace = true }

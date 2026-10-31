@@ -31,10 +31,64 @@ from neutron_mojo.io.gguf import (
     gguf_to_model_config,
     detect_arch_from_gguf,
 )
+from neutron_mojo.io.safetensors import SafeTensorsFile
 from neutron_mojo.model.config import ModelConfig
-from neutron_mojo.model.populate import model_from_config, load_named_weight, normalize_weight_name
+from neutron_mojo.model.populate import model_from_config, params_from_config, load_named_weight, normalize_weight_name, expected_weight_shape, is_supported_weight_name
 from neutron_mojo.nn.model import Model, ModelParams
 from neutron_mojo.nn.q_model import QuantizedModel, quantize_from_model, _num_blocks, _quantize_projection
+
+
+def _validate_gguf_weights(gguf: GGUFFile, reader: BinaryReader, params: ModelParams) raises:
+    params.validate()
+    if gguf.data_offset < 0 or gguf.data_offset > reader.size:
+        raise Error("Invalid GGUF data base")
+    var available = reader.size - gguf.data_offset
+    var starts = List[Int]()
+    var ends = List[Int]()
+    for key in gguf.tensors.keys():
+        var info = gguf.tensors[key].copy()
+        var count = info.numel()
+        var bytes = 0
+        if info.tensor_type == GGUF_F32():
+            bytes = Shape(count,4).numel()
+        elif info.tensor_type == GGUF_F16():
+            bytes = Shape(count,2).numel()
+        elif info.tensor_type == GGUF_Q8_0() or info.tensor_type == GGUF_Q4_0():
+            if len(info.shape) == 0 or info.shape[0] % 32 != 0 or count % 32 != 0:
+                raise Error("GGUF quantized rows must contain whole 32-element blocks")
+            bytes = Shape(count // 32, 34 if info.tensor_type == GGUF_Q8_0() else 18).numel()
+        else:
+            raise Error("Unsupported GGUF weight codec")
+        if info.offset < 0 or info.offset > available or bytes > available - info.offset:
+            raise Error("GGUF tensor exceeds file data")
+        var end = info.offset + bytes
+        for i in range(len(starts)):
+            if info.offset < ends[i] and starts[i] < end:
+                raise Error("Overlapping GGUF tensor ranges")
+        starts.append(info.offset)
+        ends.append(end)
+        var normalized = normalize_weight_name(key)
+        if not is_supported_weight_name(normalized):
+            continue
+        var expected = expected_weight_shape(params, normalized)
+        if len(expected) != len(info.shape):
+            raise Error("GGUF target rank mismatch")
+        for i in range(len(expected)):
+            if expected[i] != info.shape[len(expected)-1-i]:
+                raise Error("GGUF target shape mismatch")
+
+
+def _validate_st_weights(st: SafeTensorsFile, params: ModelParams) raises:
+    st.validate_metadata()
+    for key in st.tensors.keys():
+        var info = st.tensors[key].copy()
+        if not is_supported_weight_name(key):
+            continue
+        var expected = expected_weight_shape(params, key)
+        if info.shape != expected:
+            raise Error("SafeTensors target shape mismatch: " + key)
+        if info.dtype != "F32" and info.dtype != "F16" and info.dtype != "BF16":
+            raise Error("Model weight loader requires a supported floating dtype")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -99,9 +153,11 @@ def read_tensor_q8_0_as_f32(
         Tensor[float32] with dequantized values.
     """
     reader.seek(offset)
+    if numel < 0:
+        raise Error("Negative quantized tensor count")
+    var num_blocks = numel // 32 + Int(numel % 32 != 0)
+    reader._check_elements(num_blocks, 34)
     var result = Tensor[DType.float32](Shape(numel))
-
-    var num_blocks = (numel + 31) // 32
     var out_idx = 0
 
     for _ in range(num_blocks):
@@ -143,7 +199,7 @@ def read_tensor_q4_0_as_f32(
         - 2 bytes: FP16 scale
         - 16 bytes: packed nibbles (2 values per byte)
 
-    Low nibble = first value, high nibble = second value.
+    Low nibbles encode elements 0..15, high nibbles encode 16..31.
     Values are unsigned 0..15, centered: float_val = (nibble - 8) * scale
 
     Args:
@@ -155,9 +211,11 @@ def read_tensor_q4_0_as_f32(
         Tensor[float32] with dequantized values.
     """
     reader.seek(offset)
+    if numel < 0:
+        raise Error("Negative quantized tensor count")
+    var num_blocks = numel // 32 + Int(numel % 32 != 0)
+    reader._check_elements(num_blocks, 18)
     var result = Tensor[DType.float32](Shape(numel))
-
-    var num_blocks = (numel + 31) // 32
     var out_idx = 0
 
     for _ in range(num_blocks):
@@ -177,8 +235,8 @@ def read_tensor_q4_0_as_f32(
             var lo = byte_val & 0x0F
             var hi = (byte_val >> 4) & 0x0F
 
-            var idx_lo = i * 2
-            var idx_hi = i * 2 + 1
+            var idx_lo = i
+            var idx_hi = i + 16
 
             if idx_lo < elems_in_block:
                 result.set(out_idx + idx_lo, Float32(lo - 8) * scale)
@@ -216,13 +274,11 @@ def load_gguf_model(path: String) raises -> Model:
     var config = gguf_to_model_config(gguf)
     var arch = detect_arch_from_gguf(gguf)
 
-    # 3. Create model (model_from_config also sets arch from model_type)
-    var model = model_from_config(config)
-    # Override with GGUF-detected arch (may have sliding window from metadata)
-    model.params.arch = arch.copy()
-
-    # 4. Read and load each tensor
+    var params = params_from_config(config)
+    params.arch = arch.copy()
     var reader = BinaryReader(path)
+    _validate_gguf_weights(gguf, reader, params)
+    var model = Model(params)
 
     # Load weights by known name conventions
     _load_known_weights(model, gguf, reader)
@@ -242,6 +298,7 @@ def _load_known_weights(
         gguf: Parsed GGUF with tensor info.
         reader: BinaryReader for reading data.
     """
+    _validate_gguf_weights(gguf, reader, model.params)
     var p = model.params.copy()
 
     # Embedding
@@ -329,10 +386,11 @@ def load_gguf_model_from_buffer(var buf: List[UInt8]) raises -> Model:
     var gguf = parse_gguf_from_buffer(buf^)
     var config = gguf_to_model_config(gguf)
     var arch = detect_arch_from_gguf(gguf)
-    var model = model_from_config(config)
-    model.params.arch = arch.copy()
-
+    var params = params_from_config(config)
+    params.arch = arch.copy()
     var reader = BinaryReader(buf_copy^)
+    _validate_gguf_weights(gguf, reader, params)
+    var model = Model(params)
     _load_known_weights(model, gguf, reader)
 
     return model^
@@ -397,8 +455,10 @@ def read_tensor_q8_0_as_quantized(
         QuantizedTensorData with data (INT8 as Float32) and scales (FP16->F32).
     """
     reader.seek(offset)
-
-    var num_blocks = (numel + 31) // 32
+    if numel < 0 or block_size != 32:
+        raise Error("Q8_0 reader requires nonnegative count and 32-element blocks")
+    var num_blocks = numel // 32 + Int(numel % 32 != 0)
+    reader._check_elements(num_blocks, 34)
     var q_data = Tensor[DType.float32](Shape(numel))
     var q_scales = Tensor[DType.float32](Shape(num_blocks))
     var out_idx = 0
@@ -464,6 +524,14 @@ def _load_q8_projection(
         in_features: Input dimension (cols).
         block_size: Quantization block size.
     """
+    if out_features <= 0 or in_features <= 0 or block_size != 32 or in_features % 32 != 0:
+        raise Error("Direct Q8 loading requires positive dimensions and complete 32-element rows")
+    var expected = Shape(out_features, in_features).numel()
+    if numel != expected or weight_offset < 0 or weight_offset > model.layer_weights.numel() or numel > model.layer_weights.numel() - weight_offset:
+        raise Error("Direct Q8 projection data span mismatch")
+    var total_blocks = Shape(out_features, in_features // 32).numel()
+    if scale_offset < 0 or scale_offset > model.layer_scales.numel() or total_blocks > model.layer_scales.numel() - scale_offset:
+        raise Error("Direct Q8 projection scale span mismatch")
     var qtd = read_tensor_q8_0_as_quantized(reader, abs_offset, numel, block_size)
 
     # Copy INT8 values into layer_weights
@@ -472,7 +540,6 @@ def _load_q8_projection(
 
     # Copy scales: need to map from flat block index to row-major block layout
     var num_blocks_per_row = _num_blocks(in_features, block_size)
-    var total_blocks = out_features * num_blocks_per_row
     for i in range(total_blocks):
         model.layer_scales.set(scale_offset + i, qtd.scales.get(i))
 
@@ -490,6 +557,7 @@ def _load_q8_known_weights(
         gguf: Parsed GGUF with tensor info.
         reader: BinaryReader for reading data.
     """
+    _validate_gguf_weights(gguf, reader, model.params)
     var p = model.params.copy()
 
     # Embedding (always F32/F16 — non-projection)
@@ -549,10 +617,28 @@ def _try_load_q8_tensor_f32(
     else:
         return
 
+    model.validate_storage()
     var info = gguf.get_tensor_info(found_name)
+    var expected = expected_weight_shape(model.params, hf_name)
+    if len(expected) != len(info.shape):
+        raise Error("Quantized loader target rank mismatch")
+    for i in range(len(expected)):
+        if expected[i] != info.shape[len(expected) - 1 - i]:
+            raise Error("Quantized loader target shape mismatch")
     var numel = info.numel()
     var abs_offset = gguf.data_offset + info.offset
 
+    var target_count = 0
+    if target == "embed":
+        target_count = model.embed.numel()
+    elif target == "final_norm":
+        target_count = model.final_norm.numel()
+    elif target == "lm_head":
+        target_count = model.lm_head.numel()
+    else:
+        raise Error("Unknown quantized F32 target")
+    if numel != target_count:
+        raise Error("Quantized loader target span mismatch")
     var data: Tensor[DType.float32]
     if info.tensor_type == GGUF_F32():
         data = read_tensor_f32(reader, abs_offset, numel)
@@ -602,17 +688,32 @@ def _try_load_q8_tensor_norm(
     else:
         return
 
+    model.validate_storage()
     var info = gguf.get_tensor_info(found_name)
+    var expected = expected_weight_shape(model.params, hf_name)
+    if len(expected) != len(info.shape):
+        raise Error("Quantized loader target rank mismatch")
+    for i in range(len(expected)):
+        if expected[i] != info.shape[len(expected) - 1 - i]:
+            raise Error("Quantized loader target shape mismatch")
     var numel = info.numel()
     var abs_offset = gguf.data_offset + info.offset
 
+    if weight_offset < 0 or weight_offset > model.layer_weights.numel() or numel > model.layer_weights.numel() - weight_offset:
+        raise Error("Quantized loader norm span mismatch")
     var data: Tensor[DType.float32]
     if info.tensor_type == GGUF_F32():
         data = read_tensor_f32(reader, abs_offset, numel)
     elif info.tensor_type == GGUF_F16():
         data = read_tensor_f16_as_f32(reader, abs_offset, numel)
-    else:
+    elif info.tensor_type == GGUF_F32():
         data = read_tensor_f32(reader, abs_offset, numel)
+    elif info.tensor_type == GGUF_Q8_0():
+        data = read_tensor_q8_0_as_f32(reader, abs_offset, numel)
+    elif info.tensor_type == GGUF_Q4_0():
+        data = read_tensor_q4_0_as_f32(reader, abs_offset, numel)
+    else:
+        raise Error("Unsupported quantized norm codec")
 
     for i in range(numel):
         model.layer_weights.set(weight_offset + i, data.get(i))
@@ -653,7 +754,14 @@ def _try_load_q8_projection(
     else:
         return
 
+    model.validate_storage()
     var info = gguf.get_tensor_info(found_name)
+    var expected = expected_weight_shape(model.params, hf_name)
+    if len(expected) != len(info.shape):
+        raise Error("Quantized loader target rank mismatch")
+    for i in range(len(expected)):
+        if expected[i] != info.shape[len(expected) - 1 - i]:
+            raise Error("Quantized loader target shape mismatch")
     var numel = info.numel()
     var abs_offset = gguf.data_offset + info.offset
 
@@ -701,20 +809,11 @@ def load_gguf_quantized_direct(path: String, block_size: Int = 32) raises -> Qua
     var gguf = parse_gguf_file(path)
     var config = gguf_to_model_config(gguf)
 
-    var p = ModelParams()
-    p.num_layers = config.num_hidden_layers
-    p.vocab_size = config.vocab_size
-    p.hidden_dim = config.hidden_size
-    p.num_q_heads = config.num_attention_heads
-    p.num_kv_heads = config.num_key_value_heads
-    p.head_dim = config.head_dim
-    p.ffn_dim = config.intermediate_size
-    p.max_seq_len = config.max_position_embeddings
-    p.rope_theta = config.rope.theta
-
-    var model = QuantizedModel(p, block_size)
-
+    var p = params_from_config(config)
+    p.arch = detect_arch_from_gguf(gguf)
     var reader = BinaryReader(path)
+    _validate_gguf_weights(gguf, reader, p)
+    var model = QuantizedModel(p, block_size)
     _load_q8_known_weights(model, gguf, reader)
 
     return model^
@@ -737,20 +836,11 @@ def load_gguf_quantized_direct_from_buffer(var buf: List[UInt8], block_size: Int
     var gguf = parse_gguf_from_buffer(buf^)
     var config = gguf_to_model_config(gguf)
 
-    var p = ModelParams()
-    p.num_layers = config.num_hidden_layers
-    p.vocab_size = config.vocab_size
-    p.hidden_dim = config.hidden_size
-    p.num_q_heads = config.num_attention_heads
-    p.num_kv_heads = config.num_key_value_heads
-    p.head_dim = config.head_dim
-    p.ffn_dim = config.intermediate_size
-    p.max_seq_len = config.max_position_embeddings
-    p.rope_theta = config.rope.theta
-
-    var model = QuantizedModel(p, block_size)
-
+    var p = params_from_config(config)
+    p.arch = detect_arch_from_gguf(gguf)
     var reader = BinaryReader(buf_copy^)
+    _validate_gguf_weights(gguf, reader, p)
+    var model = QuantizedModel(p, block_size)
     _load_q8_known_weights(model, gguf, reader)
 
     return model^
@@ -781,8 +871,13 @@ def _read_safetensors_tensor(
     Returns:
         Tensor[float32] with the loaded values.
     """
+    if data_base_offset < 0 or data_base_offset > reader.size or info_start < 0 or info_end < info_start or info_end > reader.size - data_base_offset:
+        raise Error("Invalid SafeTensors tensor span")
     var abs_offset = data_base_offset + info_start
     var size_bytes = info_end - info_start
+    var width = 4 if dtype == "F32" else 2
+    if size_bytes % width != 0:
+        raise Error("Partial SafeTensors element")
 
     if dtype == "F32":
         var numel = size_bytes // 4
@@ -825,9 +920,10 @@ def load_safetensors_model(
     var st = SafeTensorsFile()
     st.load(path)
 
-    var model = model_from_config(config)
+    var params = params_from_config(config)
+    _validate_st_weights(st, params)
     var reader = BinaryReader(path)
-
+    var model = Model(params)
     _load_safetensors_weights(model, st, reader)
 
     return model^
@@ -849,6 +945,7 @@ def _load_safetensors_weights(
     """
     from neutron_mojo.io.safetensors import SafeTensorsFile
 
+    _validate_st_weights(st, model.params)
     var p = model.params.copy()
 
     # Global tensors
@@ -915,9 +1012,7 @@ def load_safetensors_sharded(
     from neutron_mojo.io.safetensors import load_safetensors_index, SafeTensorsFile
 
     var index = load_safetensors_index(index_path)
-    var model = model_from_config(config)
-
-    var p = model.params.copy()
+    var p = params_from_config(config)
 
     # Build list of all weight names we want to load
     var names = List[String]()
@@ -936,6 +1031,24 @@ def load_safetensors_sharded(
         names.append(lp + "mlp.up_proj.weight")
         names.append(lp + "mlp.down_proj.weight")
 
+    # Validate every index mapping and shard before model allocation/population.
+    var checked_shards = List[String]()
+    for tensor_name in index.weight_map.keys():
+        var path = index.get_shard_path(tensor_name)
+        var already = False
+        for j in range(len(checked_shards)):
+            if checked_shards[j] == path:
+                already = True
+        if not already:
+            var metadata = SafeTensorsFile()
+            metadata.load(path)
+            _validate_st_weights(metadata, p)
+            for mapped_name in index.weight_map.keys():
+                if index.get_shard_path(mapped_name) == path and not metadata.has_tensor(mapped_name):
+                    raise Error("Index tensor absent from its declared shard: " + mapped_name)
+            checked_shards.append(path)
+
+    var model = Model(p)
     # Load each tensor from its shard
     # Cache: track last opened shard to avoid re-parsing
     var last_shard_name = String("")
@@ -984,17 +1097,22 @@ def load_safetensors_from_buffer(
     var header_size = reader.read_u64_le()
 
     # Read JSON header as string
-    var json_str = String("")
-    for _ in range(header_size):
-        json_str += chr(Int(reader.read_u8()))
+    var json_bytes = reader.read_bytes(header_size)
+    var json_str = String(from_utf8=json_bytes)
 
     var data_offset = 8 + header_size
 
     # Parse tensor metadata
     var tensors = parse_safetensors_header(json_str)
 
-    # Create model and load weights
-    var model = model_from_config(config)
+    # Validate complete source metadata before population.
+    var params = params_from_config(config)
+    var st = SafeTensorsFile()
+    st.tensors = tensors^
+    st.file_size = reader.size
+    st.data_offset = data_offset
+    _validate_st_weights(st, params)
+    var model = Model(params)
     var data_reader = BinaryReader(buf_copy^)
 
     # Load each tensor by trying known weight names
@@ -1017,9 +1135,9 @@ def load_safetensors_from_buffer(
 
     for i in range(len(all_names)):
         var name = all_names[i]
-        if name not in tensors:
+        if not st.has_tensor(name):
             continue
-        var info = tensors[name].copy()
+        var info = st.get_tensor_info(name)
         var data = _read_safetensors_tensor(
             data_reader, data_offset, info.data_offset_start, info.data_offset_end, info.dtype
         )
@@ -1053,9 +1171,10 @@ def load_gguf_model_mmap(path: String) raises -> Model:
     # Create model from config with auto-detected architecture
     var config = gguf_to_model_config(gguf)
     var arch = detect_arch_from_gguf(gguf)
-    var model = model_from_config(config)
-    model.params.arch = arch.copy()
-
+    var params = params_from_config(config)
+    params.arch = arch.copy()
+    _validate_gguf_weights(gguf, header_reader, params)
+    var model = Model(params)
     # Read tensor data via mmap
     var data_reader = mmap_reader(path)
     _load_known_weights(model, gguf, data_reader)
@@ -1096,20 +1215,11 @@ def load_gguf_quantized_direct_mmap(path: String, block_size: Int = 32) raises -
 
     var config = gguf_to_model_config(gguf)
 
-    var p = ModelParams()
-    p.num_layers = config.num_hidden_layers
-    p.vocab_size = config.vocab_size
-    p.hidden_dim = config.hidden_size
-    p.num_q_heads = config.num_attention_heads
-    p.num_kv_heads = config.num_key_value_heads
-    p.head_dim = config.head_dim
-    p.ffn_dim = config.intermediate_size
-    p.max_seq_len = config.max_position_embeddings
-    p.rope_theta = config.rope.theta
-
-    var model = QuantizedModel(p, block_size)
-
+    var p = params_from_config(config)
+    p.arch = detect_arch_from_gguf(gguf)
     var data_reader = mmap_reader(path)
+    _validate_gguf_weights(gguf, data_reader, p)
+    var model = QuantizedModel(p, block_size)
     _load_q8_known_weights(model, gguf, data_reader)
 
     return model^

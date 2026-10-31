@@ -8,9 +8,10 @@ Supports greedy, top-k, top-p (nucleus), and temperature-scaled sampling.
 Uses a simple LCG PRNG for reproducible random sampling.
 """
 
-from std.math import exp
+from std.math import exp, isfinite
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
+from neutron_mojo.io.binary_reader import _u32_to_f32
 
 
 # ===----------------------------------------------------------------------=== #
@@ -25,7 +26,7 @@ struct LCG(Copyable, Movable, ImplicitlyCopyable):
     var state: Int
 
     def __init__(out self, seed: Int = 42):
-        self.state = seed
+        self.state = seed & 0x7FFFFFFF
 
     def __init__(out self, *, copy: Self):
         self.state = copy.state
@@ -37,12 +38,12 @@ struct LCG(Copyable, Movable, ImplicitlyCopyable):
         """Generate next pseudo-random integer."""
         # LCG: state = (a * state + c) mod m
         # Using Numerical Recipes constants
-        self.state = (1664525 * self.state + 1013904223) & 0x7FFFFFFF
+        self.state = (1664525 * (self.state & 0x7FFFFFFF) + 1013904223) & 0x7FFFFFFF
         return self.state
 
     def next_float(mut self) -> Float32:
         """Generate next uniform random float in [0, 1)."""
-        return Float32(self.next_int()) / Float32(0x7FFFFFFF)
+        return Float32(self.next_int() >> 7) / Float32(16777216)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -74,6 +75,10 @@ struct SamplerConfig(Copyable, Movable, ImplicitlyCopyable):
         self.top_k = move.top_k^
         self.top_p = move.top_p^
         self.seed = move.seed^
+    def validate(self, vocab_size: Int) raises:
+        if vocab_size <= 0 or not isfinite(self.temperature) or self.temperature < 0 or self.top_k < 0 or not isfinite(self.top_p) or self.top_p <= 0 or self.top_p > 1:
+            raise Error("Invalid sampling configuration")
+
 
 
 def greedy_config() -> SamplerConfig:
@@ -127,19 +132,30 @@ struct Sampler(Movable):
         Returns:
             Sampled token ID.
         """
+        self.config.validate(vocab_size)
+        if logits.numel() != vocab_size:
+            raise Error("Sampler logits size mismatch")
+        var has_finite = False
+        var maximum = Float32(0)
+        for i in range(vocab_size):
+            var value = logits.data_ptr()[i]
+            if isfinite(value):
+                if not has_finite or value > maximum:
+                    maximum = value
+                has_finite = True
+            elif not (value < 0):
+                raise Error("Sampler refuses NaN or positive-infinite logits")
+        if not has_finite:
+            raise Error("Sampler has no selectable logit")
         # Greedy: just argmax
         if self.config.temperature <= 0.0:
             return self._argmax(logits, vocab_size)
 
-        # Make a working copy of logits
+        # Subtract in Float64 before scaling, so extreme finite logits or
+        # a small temperature cannot create positive infinity / inf-inf.
         var scores = Tensor[DType.float32](Shape(vocab_size))
         for i in range(vocab_size):
-            scores.set(i, logits.get(i))
-
-        # Temperature scaling
-        if self.config.temperature != 1.0:
-            for i in range(vocab_size):
-                scores.set(i, scores.get(i) / self.config.temperature)
+            scores.set(i, Float32((Float64(logits.data_ptr()[i]) - Float64(maximum)) / Float64(self.config.temperature)))
 
         # Top-k filtering
         if self.config.top_k > 0 and self.config.top_k < vocab_size:
@@ -184,10 +200,10 @@ struct Sampler(Movable):
             for i in range(size):
                 scores.set(i, scores.get(i) / sum_exp)
 
-    def _top_k_filter(self, mut scores: Tensor[DType.float32], size: Int):
+    def _top_k_filter(self, mut scores: Tensor[DType.float32], size: Int) raises:
         """Zero out all but top-k logits."""
         var k = self.config.top_k
-        var neg_inf: Float32 = -1e30
+        var neg_inf = _u32_to_f32(0xFF800000)
 
         # Find k-th largest value using k passes
         var used = Tensor[DType.float32](Shape(size))
@@ -196,7 +212,7 @@ struct Sampler(Movable):
 
         for _ in range(k):
             var best_idx = -1
-            var best_val: Float32 = -1e30
+            var best_val = neg_inf
             for j in range(size):
                 if used.get(j) == 0.0 and scores.get(j) > best_val:
                     best_val = scores.get(j)
@@ -208,14 +224,16 @@ struct Sampler(Movable):
             if used.get(j) == 0.0:
                 scores.set(j, neg_inf)
 
-    def _top_p_filter(self, mut probs: Tensor[DType.float32], size: Int):
+    def _top_p_filter(self, mut probs: Tensor[DType.float32], size: Int) raises:
         """Apply nucleus (top-p) filtering on probability distribution.
 
         Zeroes out tokens whose cumulative probability exceeds top_p.
         """
         # Build sorted indices by probability (descending)
         # Simple O(n^2) sort is fine for small vocabs
-        var indices = Tensor[DType.float32](Shape(size))
+        var indices = List[Int]()
+        for _ in range(size):
+            indices.append(-1)
         var sorted_probs = Tensor[DType.float32](Shape(size))
         var used = Tensor[DType.float32](Shape(size))
         for i in range(size):
@@ -229,7 +247,7 @@ struct Sampler(Movable):
                     best_val = probs.get(j)
                     best_idx = j
             if best_idx >= 0:
-                indices.set(rank, Float32(best_idx))
+                indices[rank] = best_idx
                 sorted_probs.set(rank, best_val)
                 used.set(best_idx, 1.0)
 
@@ -247,7 +265,7 @@ struct Sampler(Movable):
         for i in range(size):
             keep.set(i, 0.0)
         for rank in range(cutoff_rank):
-            var idx = Int(indices.get(rank))
+            var idx = indices[rank]
             keep.set(idx, 1.0)
 
         # Renormalize
@@ -264,10 +282,17 @@ struct Sampler(Movable):
 
     def _categorical_sample(mut self, probs: Tensor[DType.float32], size: Int) -> Int:
         """Sample from a categorical distribution."""
-        var u = self.rng.next_float()
-        var cumsum: Float32 = 0.0
+        var total = Float64(0)
+        var last_positive = 0
         for i in range(size):
-            cumsum += probs.get(i)
-            if u < cumsum:
+            var probability = Float64(probs.data_ptr()[i])
+            total += probability
+            if probability > 0:
+                last_positive = i
+        var threshold = Float64(self.rng.next_float()) * total
+        var cumsum = Float64(0)
+        for i in range(size):
+            cumsum += Float64(probs.data_ptr()[i])
+            if threshold < cumsum:
                 return i
-        return size - 1  # fallback to last token
+        return last_positive

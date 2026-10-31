@@ -27,8 +27,9 @@ struct TrainingConfig(Copyable, Movable, ImplicitlyCopyable):
         self.lr = 1e-3
         self.grad_accumulation_steps = 1
         self.log_interval = 10
-        self.eval_interval = 100
-        self.save_interval = 500
+        # Evaluation/checkpoint callbacks are not supplied by train_tiny_lm.
+        self.eval_interval = 0
+        self.save_interval = 0
         self.max_grad_norm = 1.0
         self.use_adam = True
         self.warmup_steps = 100

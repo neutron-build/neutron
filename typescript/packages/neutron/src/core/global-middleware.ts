@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MiddlewareFn } from "./types.js";
+import { normalizeMiddlewareExport } from "./middleware.js";
 
 // The app's optional global middleware: <rootDir>/src/middleware.{ts,tsx,js,mjs}.
 // Shared by the production server and the dev server so both find the same
@@ -50,20 +51,12 @@ export async function loadGlobalMiddleware(
   // accept a single function (default or named) for ergonomics. An export
   // that exists but is not usable is likewise a startup error.
   const exported = mod.middleware ?? mod.default;
-  const list = normalizeMiddlewareExport(exported);
-  if (list.length === 0 || (Array.isArray(exported) && exported.length !== list.length)) {
+  try {
+    return normalizeMiddlewareExport(exported);
+  } catch {
     throw new TypeError(
-      `Global middleware ${path.basename(absolutePath)}: expected \`middleware\` or default ` +
-        `export of a function or an array of functions (got ${typeof exported}).`
+      `Invalid global middleware ${path.basename(absolutePath)}: expected \`middleware\` or default ` +
+        `export of a function or a nonempty array of functions (got ${typeof exported}).`
     );
   }
-  return list;
-}
-
-function normalizeMiddlewareExport(exported: unknown): MiddlewareFn[] {
-  if (typeof exported === "function") return [exported as MiddlewareFn];
-  if (Array.isArray(exported)) {
-    return exported.filter((f): f is MiddlewareFn => typeof f === "function");
-  }
-  return [];
 }

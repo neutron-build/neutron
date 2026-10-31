@@ -68,7 +68,7 @@ struct IntArrayParseResult(Movable):
 # JSON Primitives
 # ===----------------------------------------------------------------------=== #
 
-def json_skip_whitespace(s: String, pos: Int) -> Int:
+def json_skip_whitespace(s: String, pos: Int) raises -> Int:
     """Skip whitespace characters (space, tab, newline, CR).
 
     Args:
@@ -78,6 +78,8 @@ def json_skip_whitespace(s: String, pos: Int) -> Int:
     Returns:
         Position after whitespace.
     """
+    if pos < 0 or pos > s.byte_length():
+        raise Error("JSON cursor outside byte span")
     var p = pos
     var n = s.byte_length()
     while p < n:
@@ -89,50 +91,77 @@ def json_skip_whitespace(s: String, pos: Int) -> Int:
     return p
 
 
+def _json_hex4(s: String, pos: Int) raises -> Int:
+    if pos < 0 or pos > s.byte_length() or 4 > s.byte_length() - pos:
+        raise Error("Truncated JSON unicode escape")
+    var value = 0
+    for i in range(4):
+        var c = ord(s[byte=pos+i])
+        var digit = -1
+        if c >= 48 and c <= 57:
+            digit = c - 48
+        elif c >= 65 and c <= 70:
+            digit = c - 55
+        elif c >= 97 and c <= 102:
+            digit = c - 87
+        if digit < 0:
+            raise Error("Invalid JSON unicode escape")
+        value = value * 16 + digit
+    return value
+
+
 def json_parse_string(s: String, pos: Int) raises -> StringParseResult:
-    """Parse a JSON string starting at pos (must be at opening quote).
-
-    Handles basic escapes: \\", \\\\, \\n, \\t
-
-    Args:
-        s: JSON string.
-        pos: Position of opening quote.
-
-    Returns:
-        StringParseResult with value and position after closing quote.
-    """
-    if pos >= s.byte_length() or ord(s[byte=pos]) != 34:  # '"'
-        raise Error("Expected '\"' at position " + String(pos))
-
+    """Decode complete UTF-8 and JSON escapes, including surrogate pairs."""
+    if pos < 0 or pos >= s.byte_length() or ord(s[byte=pos]) != 34:
+        raise Error("Expected JSON string")
+    var bytes = List[UInt8]()
     var p = pos + 1
-    var result = String("")
     var n = s.byte_length()
-
     while p < n:
         var c = ord(s[byte=p])
-        if c == 34:  # closing quote
-            return StringParseResult(result^, p + 1)
-        elif c == 92:  # backslash
-            p += 1
-            if p >= n:
-                raise Error("Unexpected end after backslash")
-            var ec = ord(s[byte=p])
-            if ec == 34:
-                result += chr(34)
-            elif ec == 92:
-                result += chr(92)
-            elif ec == 110:  # 'n'
-                result += chr(10)
-            elif ec == 116:  # 't'
-                result += chr(9)
-            else:
-                result += chr(ec)
-            p += 1
+        p += 1
+        if c == 34:
+            return StringParseResult(String(from_utf8=bytes), p)
+        if c < 32:
+            raise Error("Raw control in JSON string")
+        if c != 92:
+            bytes.append(UInt8(c))
+            continue
+        if p >= n:
+            raise Error("Truncated JSON escape")
+        var e = ord(s[byte=p])
+        p += 1
+        if e == 34 or e == 92 or e == 47:
+            bytes.append(UInt8(e))
+        elif e == 98:
+            bytes.append(8)
+        elif e == 102:
+            bytes.append(12)
+        elif e == 110:
+            bytes.append(10)
+        elif e == 114:
+            bytes.append(13)
+        elif e == 116:
+            bytes.append(9)
+        elif e == 117:
+            var cp = _json_hex4(s,p)
+            p += 4
+            if cp >= 0xD800 and cp <= 0xDBFF:
+                if p + 2 > n or ord(s[byte=p]) != 92 or ord(s[byte=p+1]) != 117:
+                    raise Error("Unpaired JSON high surrogate")
+                var low = _json_hex4(s,p+2)
+                if low < 0xDC00 or low > 0xDFFF:
+                    raise Error("Invalid JSON low surrogate")
+                p += 6
+                cp = 0x10000 + (cp-0xD800)*1024 + low-0xDC00
+            elif cp >= 0xDC00 and cp <= 0xDFFF:
+                raise Error("Unpaired JSON low surrogate")
+            var encoded = chr(cp).as_bytes()
+            for i in range(len(encoded)):
+                bytes.append(encoded[i])
         else:
-            result += chr(c)
-            p += 1
-
-    raise Error("Unterminated string")
+            raise Error("Unsupported JSON escape")
+    raise Error("Unterminated JSON string")
 
 
 def json_parse_int(s: String, pos: Int) raises -> IntParseResult:
@@ -145,6 +174,8 @@ def json_parse_int(s: String, pos: Int) raises -> IntParseResult:
     Returns:
         IntParseResult with value and position after the number.
     """
+    if pos < 0 or pos >= s.byte_length():
+        raise Error("JSON integer cursor outside byte span")
     var p = pos
     var negative = False
     var n = s.byte_length()
@@ -156,16 +187,21 @@ def json_parse_int(s: String, pos: Int) raises -> IntParseResult:
     if p >= n or ord(s[byte=p]) < 48 or ord(s[byte=p]) > 57:
         raise Error("Expected digit at position " + String(p))
 
+    if ord(s[byte=p]) == 48 and p + 1 < n and ord(s[byte=p+1]) >= 48 and ord(s[byte=p+1]) <= 57:
+        raise Error("Leading zero in JSON integer")
     var value = 0
     while p < n:
         var c = ord(s[byte=p])
         if c >= 48 and c <= 57:
-            value = value * 10 + (c - 48)
+            var digit = c - 48
+            if value < -922337203685477580 or (value == -922337203685477580 and digit > (8 if negative else 7)):
+                raise Error("JSON integer overflow")
+            value = value * 10 - digit
             p += 1
         else:
             break
 
-    if negative:
+    if not negative:
         value = -value
 
     return IntParseResult(value, p)
@@ -181,7 +217,7 @@ def json_parse_int_array(s: String, pos: Int) raises -> IntArrayParseResult:
     Returns:
         IntArrayParseResult with values and position after closing bracket.
     """
-    if pos >= s.byte_length() or ord(s[byte=pos]) != 91:  # '['
+    if pos < 0 or pos >= s.byte_length() or ord(s[byte=pos]) != 91:  # '['
         raise Error("Expected '[' at position " + String(pos))
 
     var p = pos + 1
@@ -216,7 +252,7 @@ def json_parse_int_array(s: String, pos: Int) raises -> IntArrayParseResult:
 # SafeTensors Header Parser
 # ===----------------------------------------------------------------------=== #
 
-def _skip_json_value(s: String, pos: Int) raises -> Int:
+def _skip_json_value(s: String, pos: Int, depth: Int = 0) raises -> Int:
     """Skip a JSON value (string, number, object, array, bool, null).
 
     Args:
@@ -226,6 +262,8 @@ def _skip_json_value(s: String, pos: Int) raises -> Int:
     Returns:
         Position after the value.
     """
+    if depth < 0 or depth >= 128:
+        raise Error("JSON nesting exceeds supported depth")
     var p = json_skip_whitespace(s, pos)
     if p >= s.byte_length():
         raise Error("Unexpected end of JSON")
@@ -236,23 +274,30 @@ def _skip_json_value(s: String, pos: Int) raises -> Int:
         var r = json_parse_string(s, p)
         return r.pos
     elif c == 123:  # '{'
-        return _skip_json_object(s, p)
+        return _skip_json_object(s, p, depth + 1)
     elif c == 91:  # '['
-        return _skip_json_array(s, p)
+        return _skip_json_array(s, p, depth + 1)
     elif c == 116 or c == 102:  # 'true' or 'false'
-        if c == 116:
+        if c == 116 and p + 4 <= s.byte_length() and s[byte=p:p+4] == "true":
             return p + 4
-        return p + 5
+        if c == 102 and p + 5 <= s.byte_length() and s[byte=p:p+5] == "false":
+            return p + 5
+        raise Error("Invalid JSON boolean")
     elif c == 110:  # 'null'
-        return p + 4
+        if p + 4 <= s.byte_length() and s[byte=p:p+4] == "null":
+            return p + 4
+        raise Error("Invalid JSON null")
     elif c == 45 or (c >= 48 and c <= 57):  # number
         return _skip_json_number(s, p)
     else:
         raise Error("Unexpected character in JSON at " + String(p))
 
 
-def _skip_json_object(s: String, pos: Int) raises -> Int:
+def _skip_json_object(s: String, pos: Int, depth: Int = 0) raises -> Int:
     """Skip a JSON object {...}."""
+    if pos < 0 or pos >= s.byte_length() or ord(s[byte=pos]) != 123 or depth < 0 or depth > 128:
+        raise Error("Invalid JSON object cursor/depth")
+    var seen = Dict[String,Bool]()
     var p = pos + 1
     var n = s.byte_length()
     p = json_skip_whitespace(s, p)
@@ -261,11 +306,15 @@ def _skip_json_object(s: String, pos: Int) raises -> Int:
     while p < n:
         p = json_skip_whitespace(s, p)
         var kr = json_parse_string(s, p)
+        if kr.value in seen:
+            raise Error("Duplicate JSON object key")
+        seen[kr.value] = True
         p = kr.pos
         p = json_skip_whitespace(s, p)
-        if p < n and ord(s[byte=p]) == 58:  # ':'
-            p += 1
-        p = _skip_json_value(s, p)
+        if p >= n or ord(s[byte=p]) != 58:
+            raise Error("Expected JSON colon")
+        p += 1
+        p = _skip_json_value(s, p, depth)
         p = json_skip_whitespace(s, p)
         if p < n and ord(s[byte=p]) == 44:
             p += 1
@@ -276,15 +325,17 @@ def _skip_json_object(s: String, pos: Int) raises -> Int:
     raise Error("Unterminated object")
 
 
-def _skip_json_array(s: String, pos: Int) raises -> Int:
+def _skip_json_array(s: String, pos: Int, depth: Int = 0) raises -> Int:
     """Skip a JSON array [...]."""
+    if pos < 0 or pos >= s.byte_length() or ord(s[byte=pos]) != 91 or depth < 0 or depth > 128:
+        raise Error("Invalid JSON array cursor/depth")
     var p = pos + 1
     var n = s.byte_length()
     p = json_skip_whitespace(s, p)
     if p < n and ord(s[byte=p]) == 93:  # ']'
         return p + 1
     while p < n:
-        p = _skip_json_value(s, p)
+        p = _skip_json_value(s, p, depth)
         p = json_skip_whitespace(s, p)
         if p < n and ord(s[byte=p]) == 44:
             p += 1
@@ -295,18 +346,41 @@ def _skip_json_array(s: String, pos: Int) raises -> Int:
     raise Error("Unterminated array")
 
 
-def _skip_json_number(s: String, pos: Int) -> Int:
-    """Skip a JSON number (int or float)."""
+def _skip_json_number(s: String, pos: Int) raises -> Int:
+    """Lex one complete strict JSON number, including fraction/exponent."""
+    if pos < 0 or pos >= s.byte_length():
+        raise Error("JSON number cursor outside byte span")
     var p = pos
     var n = s.byte_length()
     if p < n and ord(s[byte=p]) == 45:
         p += 1
-    while p < n:
-        var c = ord(s[byte=p])
-        if (c >= 48 and c <= 57) or c == 46 or c == 101 or c == 69 or c == 43 or c == 45:
+    if p >= n or ord(s[byte=p]) < 48 or ord(s[byte=p]) > 57:
+        raise Error("Expected JSON number digit")
+    if ord(s[byte=p]) == 48:
+        p += 1
+    else:
+        while p < n and ord(s[byte=p]) >= 48 and ord(s[byte=p]) <= 57:
             p += 1
-        else:
-            break
+    if p < n and ord(s[byte=p]) == 46:
+        p += 1
+        var start = p
+        while p < n and ord(s[byte=p]) >= 48 and ord(s[byte=p]) <= 57:
+            p += 1
+        if p == start:
+            raise Error("Missing JSON fraction digits")
+    if p < n and (ord(s[byte=p]) == 101 or ord(s[byte=p]) == 69):
+        p += 1
+        if p < n and (ord(s[byte=p]) == 43 or ord(s[byte=p]) == 45):
+            p += 1
+        var start = p
+        while p < n and ord(s[byte=p]) >= 48 and ord(s[byte=p]) <= 57:
+            p += 1
+        if p == start:
+            raise Error("Missing JSON exponent digits")
+    if p < n:
+        var c = ord(s[byte=p])
+        if c != 32 and c != 9 and c != 10 and c != 13 and c != 44 and c != 93 and c != 125:
+            raise Error("Invalid JSON number suffix")
     return p
 
 
@@ -330,6 +404,10 @@ def parse_safetensors_header(json: String) raises -> Dict[String, TensorInfo]:
     Returns:
         Dict mapping tensor names to TensorInfo.
     """
+    var document_end = _skip_json_value(json, 0)
+    if json_skip_whitespace(json, document_end) != json.byte_length():
+        raise Error("Trailing JSON document bytes")
+
     var result = Dict[String, TensorInfo]()
     var p = json_skip_whitespace(json, 0)
     var n = json.byte_length()
@@ -391,6 +469,9 @@ def _parse_tensor_info_object(
     json: String, pos: Int
 ) raises -> _TensorInfoParseResult:
     """Parse a tensor info JSON object: {"dtype":"F32","shape":[...],"data_offsets":[...]}"""
+    var has_dtype = False
+    var has_shape = False
+    var has_offsets = False
     var info = TensorInfo()
     var p = pos
 
@@ -415,18 +496,22 @@ def _parse_tensor_info_object(
         p = json_skip_whitespace(json, p)
 
         if field == "dtype":
+            has_dtype = True
             var vr = json_parse_string(json, p)
             info.dtype = vr.value
             p = vr.pos
         elif field == "shape":
+            has_shape = True
             var ar = json_parse_int_array(json, p)
             info.shape = ar.values.copy()
             p = ar.pos
         elif field == "data_offsets":
+            has_offsets = True
             var ar = json_parse_int_array(json, p)
-            if len(ar.values) >= 2:
-                info.data_offset_start = ar.values[0]
-                info.data_offset_end = ar.values[1]
+            if len(ar.values) != 2:
+                raise Error("SafeTensors requires exactly two data offsets")
+            info.data_offset_start = ar.values[0]
+            info.data_offset_end = ar.values[1]
             p = ar.pos
         else:
             p = _skip_json_value(json, p)
@@ -435,6 +520,8 @@ def _parse_tensor_info_object(
         if p < n and ord(json[byte=p]) == 44:
             p += 1
 
+    if not has_dtype or not has_shape or not has_offsets:
+        raise Error("Missing required SafeTensors metadata field")
     return _TensorInfoParseResult(info^, p)
 
 
@@ -463,7 +550,14 @@ def parse_weight_map(json: String) raises -> Dict[String, String]:
     Returns:
         Dict mapping tensor names to shard filenames.
     """
+    var document_end = _skip_json_value(json, 0)
+    if json_skip_whitespace(json, document_end) != json.byte_length():
+        raise Error("Trailing JSON document bytes")
+
     var result = Dict[String, String]()
+    var bare = Dict[String, String]()
+    var wrapped = False
+    var bare_only = True
     var p = json_skip_whitespace(json, 0)
     var n = json.byte_length()
 
@@ -488,20 +582,30 @@ def parse_weight_map(json: String) raises -> Dict[String, String]:
         p = json_skip_whitespace(json, p)
 
         if key == "weight_map":
+            wrapped = True
             # Parse the inner string->string dict
             result = _parse_string_dict(json, p)
             # Skip past the object to continue
             p = _skip_json_object(json, p)
         else:
-            # Skip other values (metadata, etc.)
-            p = _skip_json_value(json, p)
+            if p < n and ord(json[byte=p]) == 34:
+                var value = json_parse_string(json, p)
+                bare[key] = value.value
+                p = value.pos
+            else:
+                bare_only = False
+                p = _skip_json_value(json, p)
 
         # Skip comma
         p = json_skip_whitespace(json, p)
         if p < n and ord(json[byte=p]) == 44:
             p += 1
 
-    return result^
+    if wrapped:
+        return result^
+    if not bare_only:
+        raise Error("Index lacks a weight_map string dictionary")
+    return bare^
 
 
 def _parse_string_dict(json: String, pos: Int) raises -> Dict[String, String]:
@@ -552,50 +656,49 @@ def _parse_string_dict(json: String, pos: Int) raises -> Dict[String, String]:
 
 
 def parse_config_json(json: String) raises -> Dict[String, Int]:
-    """Parse a minimal HuggingFace config.json into string->int dict.
+    """Read integer configuration fields; validate and skip other JSON values."""
+    var document_end = _skip_json_value(json, 0)
+    if json_skip_whitespace(json, document_end) != json.byte_length():
+        raise Error("Trailing JSON document bytes")
 
-    Extracts only integer-valued fields (sufficient for model dimensions).
-    Ignores string, float, array, and nested object fields.
-
-    Args:
-        json: JSON string of config.json.
-
-    Returns:
-        Dict of field name to integer value.
-    """
     var result = Dict[String, Int]()
     var p = json_skip_whitespace(json, 0)
     var n = json.byte_length()
-
     if p >= n or ord(json[byte=p]) != 123:
-        raise Error("Expected '{' at start of config JSON")
-    p += 1
-
+        raise Error("Expected config object")
+    p = json_skip_whitespace(json, p + 1)
+    if p < n and ord(json[byte=p]) == 125:
+        if json_skip_whitespace(json, p + 1) != n:
+            raise Error("Trailing config JSON")
+        return result^
     while p < n:
-        p = json_skip_whitespace(json, p)
-        if p >= n or ord(json[byte=p]) == 125:
-            break
-
         var kr = json_parse_string(json, p)
-        p = kr.pos
-
-        p = json_skip_whitespace(json, p)
-        if p < n and ord(json[byte=p]) == 58:
-            p += 1
-        p = json_skip_whitespace(json, p)
-
-        # Try to parse as int; skip if not a number
-        if p < n:
-            var c = ord(json[byte=p])
-            if c == 45 or (c >= 48 and c <= 57):  # number
+        p = json_skip_whitespace(json, kr.pos)
+        if p >= n or ord(json[byte=p]) != 58:
+            raise Error("Expected config colon")
+        p = json_skip_whitespace(json, p + 1)
+        if p >= n:
+            raise Error("Missing config value")
+        var c = ord(json[byte=p])
+        if c == 45 or (c >= 48 and c <= 57):
+            var end = _skip_json_number(json, p)
+            var integer = True
+            for i in range(p, end):
+                var digit = ord(json[byte=i])
+                if digit == 46 or digit == 101 or digit == 69:
+                    integer = False
+            if integer:
                 var ir = json_parse_int(json, p)
                 result[kr.value] = ir.value
-                p = ir.pos
-            else:
-                p = _skip_json_value(json, p)
-
+            p = end
+        else:
+            p = _skip_json_value(json, p)
         p = json_skip_whitespace(json, p)
-        if p < n and ord(json[byte=p]) == 44:
-            p += 1
-
-    return result^
+        if p < n and ord(json[byte=p]) == 125:
+            if json_skip_whitespace(json, p + 1) != n:
+                raise Error("Trailing config JSON")
+            return result^
+        if p >= n or ord(json[byte=p]) != 44:
+            raise Error("Expected config comma or closing brace")
+        p = json_skip_whitespace(json, p + 1)
+    raise Error("Unterminated config JSON")

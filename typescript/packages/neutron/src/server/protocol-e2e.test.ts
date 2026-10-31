@@ -49,6 +49,9 @@ export function headers() {
     Vary: "Accept",
   };
 }
+// This route opts into shared caching: its headers() emits only the keyed
+// representation dimensions above (no per-request tokens/nonces).
+headers.sharedCacheSafe = true;
 
 export async function loader({ params }) {
   return {
@@ -238,6 +241,9 @@ describe("protocol e2e", () => {
       headers: {
         Accept: "application/json",
         "If-None-Match": appHitEtag!,
+        // Avoid Node fetch implicitly adding no-cache: this case tests a
+        // permitted cache read; explicit no-cache bypass has separate coverage.
+        "Cache-Control": "max-age=0",
       },
     });
     expect(app304.status).toBe(304);

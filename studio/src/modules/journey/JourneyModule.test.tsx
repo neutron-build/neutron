@@ -125,3 +125,16 @@ describe('JourneyModule (X06)', () => {
     expect(planTop(null)).toBeNull()
   })
 })
+
+it('old connection journey cannot replace shared current limits', async () => {
+  let finish!: (j: JourneyResponse) => void
+  journeyMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    .mockResolvedValueOnce({ ...nucleusJourney(), limits: limitsFixture.postgres as LimitsReport, stages: [] })
+  render(<JourneyModule schema="public" table="orders" />)
+  await waitFor(() => expect(finish).toBeTypeOf('function'))
+  activeConnection.value = { id: 'c2', name: 'two', url: 'pg://two', isNucleus: false }
+  await waitFor(() => expect(limitsReport.value?.engine.product).toBe('postgres'))
+  finish(nucleusJourney())
+  await new Promise(resolve => setTimeout(resolve, 0))
+  expect(limitsReport.value?.engine.product).toBe('postgres')
+})

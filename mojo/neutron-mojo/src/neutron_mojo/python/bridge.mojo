@@ -24,10 +24,12 @@ def to_python_list(tensor: Tensor[DType.float32], size: Int) raises -> PythonObj
     Returns:
         Python list of floats.
     """
+    if size < 0 or size > tensor.numel():
+        raise Error("Python export size exceeds tensor storage")
     var builtins = Python.import_module("builtins")
     var py_list = builtins.list()
     for i in range(size):
-        py_list.append(Float64(tensor.get(i)))
+        py_list.append(Float64(tensor.data_ptr().unsafe_load(i)))
     return py_list
 
 

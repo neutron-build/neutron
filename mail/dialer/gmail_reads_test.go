@@ -14,11 +14,17 @@ import (
 
 func refreshFixture(t *testing.T, method, url string, refreshErr error) (*http.Response, error, int, int) {
 	t.Helper()
+	tr := &refreshTransport{acct: "synthetic", cred: mail.Credential{Provider: mail.ProviderGmail, AccessToken: "old"},
+		provider: mail.ProviderGmail, host: gmailAPIHost, gate: make(chan struct{}, 1), limiter: gmail.NewReadLimiter()}
+	return runRefreshFixture(t, tr, mail.ProviderGmail, method, url, refreshErr)
+}
+
+func runRefreshFixture(t *testing.T, tr *refreshTransport, refreshed mail.Provider, method, url string, refreshErr error) (*http.Response, error, int, int) {
+	t.Helper()
 	calls, refreshes := 0, 0
-	tr := &gmailRefreshTransport{acct: "synthetic", cred: mail.Credential{Provider: mail.ProviderGmail, AccessToken: "old"}, gate: make(chan struct{}, 1), limiter: gmail.NewReadLimiter()}
 	tr.base = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		calls++
-		allowed := r.URL.Scheme == "https" && r.URL.Hostname() == gmailAPIHost
+		allowed := r.URL.Scheme == "https" && r.URL.Hostname() == tr.host
 		if allowed && r.Header.Get("Authorization") == "" || !allowed && r.Header.Get("Authorization") != "" {
 			t.Fatalf("bearer-origin restriction violated at %s", r.URL)
 		}
@@ -26,7 +32,7 @@ func refreshFixture(t *testing.T, method, url string, refreshErr error) (*http.R
 	})
 	tr.refresh = func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error) {
 		refreshes++
-		return mail.Credential{Provider: mail.ProviderGmail, AccessToken: "fresh"}, refreshErr
+		return mail.Credential{Provider: refreshed, AccessToken: "fresh"}, refreshErr
 	}
 	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
@@ -75,5 +81,76 @@ func TestGmailReadLimiterSharedAndBounded(t *testing.T) {
 	}
 	if len(unique) > 256 {
 		t.Fatalf("unbounded account limiter retention: %d", len(unique))
+	}
+}
+
+func graphRefreshFixture(t *testing.T, method, url string, refreshed mail.Provider) (*http.Response, error, int, int) {
+	t.Helper()
+	tr := &refreshTransport{acct: "synthetic", cred: mail.Credential{Provider: mail.ProviderGraph, AccessToken: "old"},
+		provider: mail.ProviderGraph, host: graphAPIHost, gate: make(chan struct{}, 1)}
+	return runRefreshFixture(t, tr, refreshed, method, url, nil)
+}
+
+// A Graph access token lasts about an hour; an import that runs longer must
+// refresh and continue rather than end as ErrReauthRequired.
+func TestGraphRefreshRetriesGetExactlyOnce(t *testing.T) {
+	response, err, calls, refreshes := graphRefreshFixture(t, http.MethodGet, "https://graph.microsoft.com/v1.0/me/messages", mail.ProviderGraph)
+	if err != nil || response.StatusCode != 401 || calls != 2 || refreshes != 1 {
+		t.Fatalf("status=%v err=%v calls=%d refreshes=%d", response, err, calls, refreshes)
+	}
+	response.Body.Close()
+}
+
+func TestGraphRefreshNeverReplaysMutationsOrForeignOrigin(t *testing.T) {
+	for _, tc := range []struct{ method, url string }{{http.MethodPost, "https://graph.microsoft.com/v1.0/me/sendMail"}, {http.MethodPatch, "https://graph.microsoft.com/v1.0/me/messages/1"}, {http.MethodGet, gmailAPIEndpoint + "gmail/v1/users/me/labels"}, {http.MethodGet, "http://graph.microsoft.com/v1.0/me/messages"}} {
+		t.Run(tc.method+tc.url, func(t *testing.T) {
+			response, err, calls, refreshes := graphRefreshFixture(t, tc.method, tc.url, mail.ProviderGraph)
+			if err != nil || response.StatusCode != 401 || calls != 1 || refreshes != 0 {
+				t.Fatalf("err=%v calls=%d refreshes=%d", err, calls, refreshes)
+			}
+			response.Body.Close()
+		})
+	}
+}
+
+func TestGraphRefreshRefusesAnotherProvidersCredential(t *testing.T) {
+	response, err, calls, refreshes := graphRefreshFixture(t, http.MethodGet, "https://graph.microsoft.com/v1.0/me/messages", mail.ProviderGmail)
+	if response != nil || err == nil || calls != 1 || refreshes != 1 {
+		t.Fatalf("response=%v err=%v calls=%d refreshes=%d", response, err, calls, refreshes)
+	}
+}
+
+// The resolver installs the refresh only when the policy supplies one.
+func TestResolverRefreshesGraphReadsOnlyWithPolicy(t *testing.T) {
+	saved := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = saved })
+	var rejected int
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") != "Bearer fresh" {
+			rejected++
+			return &http.Response{StatusCode: 401, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("expired"))}, nil
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"value":[]}`))}, nil
+	})
+	cred := mail.Credential{Provider: mail.ProviderGraph, Email: "a@example.test", AccessToken: "old"}
+	refresh := func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error) {
+		return mail.Credential{Provider: mail.ProviderGraph, Email: "a@example.test", AccessToken: "fresh"}, nil
+	}
+	for _, tc := range []struct {
+		policy Policy
+		ok     bool
+	}{{Policy{}, false}, {Policy{GraphRefresh: refresh}, true}} {
+		ad, release, err := NewWithPolicy(nil, tc.policy)(context.Background(), "acct", cred)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = ad.Mailboxes(context.Background())
+		release()
+		if tc.ok && err != nil || !tc.ok && !errors.Is(err, mail.ErrReauthRequired) {
+			t.Fatalf("refresh installed=%v: err=%v", tc.ok, err)
+		}
+	}
+	if rejected == 0 {
+		t.Fatal("the expired token was never presented")
 	}
 }

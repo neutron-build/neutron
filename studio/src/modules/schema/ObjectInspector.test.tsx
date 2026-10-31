@@ -112,3 +112,17 @@ describe('ObjectInspector (S05)', () => {
     expect(alert.textContent).toContain('Refresh the schema tree')
   })
 })
+
+it('an old relation response cannot replace the latest inspected target', async () => {
+  let finish!: (d: SchemaObjectDetail) => void
+  detailMock.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    .mockResolvedValueOnce({ ...tableDetail, name: 'current', table: { ...tableDetail.table!, columns: [{ name: 'current-only', type: 'text', notNull: false, isPrimaryKey: false }] } })
+  const view = render(<ObjectInspector schema="public" table="orders" />)
+  await waitFor(() => expect(finish).toBeTypeOf('function'))
+  view.rerender(<ObjectInspector schema="public" table="current" />)
+  await screen.findByText('current-only')
+  finish(tableDetail)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  expect(screen.getByText('current-only')).toBeTruthy()
+  expect(screen.queryByText('total')).toBeNull()
+})

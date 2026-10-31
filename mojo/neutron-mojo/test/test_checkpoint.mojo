@@ -42,7 +42,7 @@ def assert_true(val: Bool, msg: String = "Expected true") raises:
 # Helper: build a tape with chain a*b+c -> relu -> sum
 # ===----------------------------------------------------------------------=== #
 
-def _build_chain_tape() -> Tape:
+def _build_chain_tape() raises -> Tape:
     """Build a tape with: loss = sum(relu(a*b + c))."""
     var tape = Tape(4096)
     var d = List[Int]()
@@ -71,7 +71,7 @@ def _build_chain_tape() -> Tape:
     return tape^
 
 
-def _build_chain_tape_copy() -> Tape:
+def _build_chain_tape_copy() raises -> Tape:
     """Build an identical tape for comparison."""
     return _build_chain_tape()
 

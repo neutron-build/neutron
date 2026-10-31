@@ -42,7 +42,13 @@ interface TurboModuleRegistry {
 function getNativeRegistry(): TurboModuleRegistry | null {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const g = globalThis as any
-  return g.__turboModuleProxy ?? g.TurboModuleRegistry ?? null
+  const proxy = g.__turboModuleProxy ?? g.TurboModuleRegistry
+  if (typeof proxy === 'function') return { get: proxy, getEnforcing: (name: string) => {
+    const module = proxy(name)
+    if (!module) throw new Error(`TurboModule ${name} unavailable`)
+    return module
+  } }
+  return proxy && typeof proxy.get === 'function' ? proxy : null
 }
 
 // ─── Module cache ────────────────────────────────────────────────────────────
@@ -142,14 +148,7 @@ export function requireModule<T extends TurboModule>(name: string): T {
  * Check if a TurboModule is available (native, web, or JS stub).
  */
 export function hasModule(name: string): boolean {
-  if (_cache.has(name)) return true
-
-  const registry = getNativeRegistry()
-  if (registry?.get(name)) return true
-
-  if (isWeb() && _webImplementations.has(name)) return true
-
-  return _factories.has(name)
+  return getModule(name) !== null
 }
 
 /**

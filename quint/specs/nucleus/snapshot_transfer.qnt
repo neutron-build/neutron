@@ -10,8 +10,10 @@ module snapshot_transfer {
     var snapshot_target: NodeId
     var transferred_keys: Set[Key]
 
+    var original_source_data: Set[Key]
     action init = all {
         node_data' = NODES.mapBy(n => if (n == 1) 1.to(100) else Set()),
+        original_source_data' = Set(),
         snapshot_in_progress' = false,
         snapshot_source' = 0,
         snapshot_target' = 0,
@@ -24,6 +26,7 @@ module snapshot_transfer {
         target.in(NODES),
         source != target,
         node_data.get(source).size() > 0,
+        original_source_data' = node_data.get(source),
         snapshot_in_progress' = true,
         snapshot_source' = source,
         snapshot_target' = target,
@@ -38,6 +41,7 @@ module snapshot_transfer {
         transferred_keys' = transferred_keys.union(Set(k)),
         node_data' = node_data.set(snapshot_target,
             node_data.get(snapshot_target).union(Set(k))),
+        original_source_data' = original_source_data,
         snapshot_in_progress' = snapshot_in_progress,
         snapshot_source' = snapshot_source,
         snapshot_target' = snapshot_target,
@@ -46,6 +50,7 @@ module snapshot_transfer {
     action complete_transfer: bool = all {
         snapshot_in_progress,
         transferred_keys == node_data.get(snapshot_source),
+        original_source_data' = original_source_data,
         snapshot_in_progress' = false,
         snapshot_source' = 0,
         snapshot_target' = 0,
@@ -65,5 +70,5 @@ module snapshot_transfer {
     // Source data is never modified during transfer
     val source_unchanged: bool =
         not(snapshot_in_progress) or
-        node_data.get(snapshot_source).size() >= transferred_keys.size()
+        node_data.get(snapshot_source) == original_source_data
 }

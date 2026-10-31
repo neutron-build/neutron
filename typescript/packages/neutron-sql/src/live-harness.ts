@@ -19,7 +19,7 @@ export const TEST_URL = process.env.NEUTRON_TEST_DATABASE_URL || process.env.NEU
 let liveRuns = 0;
 process.on("exit", () => {
   if (LIVE_REQUIRED && liveRuns === 0) {
-    const where = TEST_URL ? ` against ${TEST_URL}` : " (NEUTRON_TEST_DATABASE_URL is not set)";
+    const where = TEST_URL ? " (NEUTRON_TEST_DATABASE_URL is configured)" : " (NEUTRON_TEST_DATABASE_URL is not set)";
     console.error(`live harness: NEUTRON_LIVE_REQUIRED=1 but zero live cases executed${where}`);
     process.exitCode = 1;
   }
@@ -60,7 +60,7 @@ export async function liveGate(): Promise<LiveGate> {
     return { ok: false, reason: "NEUTRON_TEST_DATABASE_URL is not set (live suites are opt-in locally; see README)" };
   }
   if (!(await reachable())) {
-    return { ok: false, reason: `Postgres not reachable at ${TEST_URL}` };
+    return { ok: false, reason: "Postgres is not reachable using the configured test database URL" };
   }
   return { ok: true, reason: "" };
 }

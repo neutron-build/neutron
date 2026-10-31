@@ -12,7 +12,7 @@ Mistral 7B uses window_size=4096, meaning each token attends to at most
 the 4096 most recent positions.
 """
 
-from std.math import exp
+from std.math import exp, sqrt
 from neutron_mojo.tensor.tensor import Tensor
 from neutron_mojo.tensor.shape import Shape
 from neutron_mojo.nn.kv_cache import KVCache
@@ -36,7 +36,7 @@ struct SlidingWindowKVCache(Movable):
     var total_length: Int  # Total tokens seen (may exceed window_size)
     var write_pos: Int     # Current write position in ring buffer
 
-    def __init__(out self, window_size: Int, num_kv_heads: Int, head_dim: Int):
+    def __init__(out self, window_size: Int, num_kv_heads: Int, head_dim: Int) raises:
         self.window_size = window_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -127,7 +127,7 @@ def sliding_window_attention_head(
     cache: SlidingWindowKVCache,
     kv_head: Int,
     head_dim: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Fused attention with sliding window constraint.
 
     Attends only to positions within the window. Uses online softmax.
@@ -150,13 +150,7 @@ def sliding_window_attention_head(
         return output^
 
     # Scale: 1/sqrt(head_dim)
-    var inv_sqrt_d: Float32 = 1.0
-    if head_dim > 1:
-        var df = Float32(head_dim)
-        var x: Float32 = 0.5
-        for _ in range(10):
-            x = x * (1.5 - 0.5 * df * x * x)
-        inv_sqrt_d = x
+    var inv_sqrt_d = Float32(1.0) / sqrt(Float32(head_dim))
 
     # Online softmax over all active positions
     var running_max: Float32 = -1e30
@@ -194,7 +188,7 @@ def sliding_window_gqa_attention(
     num_q_heads: Int,
     num_kv_heads: Int,
     head_dim: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """GQA attention with sliding window.
 
     Args:
@@ -236,7 +230,7 @@ def windowed_fused_attention_head(
     head_dim: Int,
     current_pos: Int,
     window_size: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Fused attention with window constraint on a standard KV cache.
 
     Like fused_attention_head but limits attention range to
@@ -273,13 +267,7 @@ def windowed_fused_attention_head(
     if attend_start >= attend_end:
         return output^
 
-    var inv_sqrt_d: Float32 = 1.0
-    if head_dim > 1:
-        var df = Float32(head_dim)
-        var x: Float32 = 0.5
-        for _ in range(10):
-            x = x * (1.5 - 0.5 * df * x * x)
-        inv_sqrt_d = x
+    var inv_sqrt_d = Float32(1.0) / sqrt(Float32(head_dim))
 
     var running_max: Float32 = -1e30
     var running_sum: Float32 = 0.0

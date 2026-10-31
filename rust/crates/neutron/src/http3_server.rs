@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use h3::server::RequestStream;
 use h3_quinn::quinn;
 use http::StatusCode;
@@ -88,6 +89,29 @@ pub async fn serve_h3(
     tls_config: TlsConfig,
     config: Http3Config,
 ) -> Result<(), std::io::Error> {
+    serve_h3_with_shutdown(
+        addr,
+        dispatch,
+        state_map,
+        tls_config,
+        config,
+        Box::pin(std::future::pending()),
+        std::time::Duration::from_secs(30),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn serve_h3_with_shutdown(
+    addr: SocketAddr,
+    dispatch: DispatchChain,
+    state_map: Arc<StateMap>,
+    tls_config: TlsConfig,
+    config: Http3Config,
+    mut shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    deadline: std::time::Duration,
+    max_connections: Option<usize>,
+) -> Result<(), std::io::Error> {
     // Clone the rustls ServerConfig and replace ALPN protocols with "h3".
     let mut rustls_cfg = (*tls_config.server_config).clone();
     rustls_cfg.alpn_protocols = vec![b"h3".to_vec()];
@@ -104,12 +128,38 @@ pub async fn serve_h3(
 
     tracing::info!("HTTP/3 (QUIC) listening on {addr}");
 
-    while let Some(incoming) = endpoint.accept().await {
-        let dispatch = Arc::clone(&dispatch);
-        let state_map = Arc::clone(&state_map);
-        let cfg = config.clone();
-        tokio::spawn(handle_connection(incoming, dispatch, state_map, cfg));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut tasks = tokio::task::JoinSet::new();
+    let semaphore = max_connections.map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break; };
+                let permit = if let Some(ref semaphore) = semaphore {
+                    match semaphore.clone().try_acquire_owned() { Ok(permit) => Some(permit), Err(_) => { incoming.refuse(); continue; } }
+                } else { None };
+                let dispatch = dispatch.clone();
+                let state_map = state_map.clone();
+                let config = config.clone();
+                let stop = stop_rx.clone();
+                tasks.spawn(async move { let _permit = permit; handle_connection(incoming, dispatch, state_map, config, stop).await; });
+            }
+        }
     }
+    let end = tokio::time::Instant::now() + deadline;
+    let _ = stop_tx.send(true);
+    if tokio::time::timeout_at(end, async { while tasks.join_next().await.is_some() {} })
+        .await
+        .is_err()
+    {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    endpoint.close(0u32.into(), b"server shutdown");
+    let _ = tokio::time::timeout_at(end, endpoint.wait_idle()).await;
 
     Ok(())
 }
@@ -123,8 +173,9 @@ async fn handle_connection(
     dispatch: DispatchChain,
     state_map: Arc<StateMap>,
     config: Http3Config,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    let conn = match incoming.await {
+    let conn = match tokio::select! { _ = stop.changed() => return, result = incoming => result } {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("QUIC connection failed: {e}");
@@ -145,13 +196,22 @@ async fn handle_connection(
         }
     };
 
+    let mut requests = futures_util::stream::FuturesUnordered::<
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    >::new();
     loop {
-        match h3.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            _ = stop.changed() => { let _ = h3.shutdown(0).await; break; }
+            _ = requests.next(), if !requests.is_empty() => continue,
+            result = h3.accept() => result,
+        };
+        match accepted {
             Ok(Some(resolver)) => {
                 let dispatch = Arc::clone(&dispatch);
                 let state_map = Arc::clone(&state_map);
                 let cfg = config.clone();
-                tokio::spawn(async move {
+                requests.push(Box::pin(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
                             handle_request(req, stream, dispatch, state_map, cfg, remote).await;
@@ -160,7 +220,7 @@ async fn handle_connection(
                             tracing::debug!(%remote, "HTTP/3 resolve_request error: {e}");
                         }
                     }
-                });
+                }));
             }
             Ok(None) => break, // Connection closed cleanly.
             Err(e) => {
@@ -169,6 +229,7 @@ async fn handle_connection(
             }
         }
     }
+    while requests.next().await.is_some() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -191,14 +252,13 @@ async fn handle_request(
                 while data.has_remaining() {
                     let chunk = data.chunk().to_vec();
                     let len = chunk.len();
-                    body_bytes.extend_from_slice(&chunk);
-                    data.advance(len);
-
-                    if body_bytes.len() > config.max_body_size {
+                    if len > config.max_body_size.saturating_sub(body_bytes.len()) {
                         tracing::warn!(%remote, "HTTP/3 request body exceeds limit");
                         let _ = send_error(&mut stream, StatusCode::PAYLOAD_TOO_LARGE).await;
                         return;
                     }
+                    body_bytes.extend_from_slice(&chunk);
+                    data.advance(len);
                 }
             }
             Ok(None) => break, // End of body.
@@ -231,25 +291,24 @@ async fn handle_request(
     // Dispatch through the middleware + router chain.
     let response = dispatch(neutron_req).await;
 
-    // Collect the response body.
-    let (resp_parts, resp_body) = response.into_parts();
-    let body = resp_body
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .unwrap_or_default();
-
-    // Send the response.
+    // Send frames incrementally: an SSE/stream response must not be collected
+    // before headers or retained in an unbounded whole-response buffer.
+    let (resp_parts, mut resp_body) = response.into_parts();
     let h3_resp = http::Response::from_parts(resp_parts, ());
     if let Err(e) = stream.send_response(h3_resp).await {
         tracing::debug!(%remote, "HTTP/3 send_response error: {e}");
         return;
     }
-
-    if !body.is_empty() {
-        if let Err(e) = stream.send_data(body).await {
-            tracing::debug!(%remote, "HTTP/3 send_data error: {e}");
-            return;
+    while let Some(frame) = resp_body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(never) => match never {},
+        };
+        if let Ok(data) = frame.into_data() {
+            if let Err(e) = stream.send_data(data).await {
+                tracing::debug!(%remote, "HTTP/3 send_data error: {e}");
+                return;
+            }
         }
     }
 

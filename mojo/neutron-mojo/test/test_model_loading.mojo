@@ -303,7 +303,7 @@ def test_gguf_metadata_to_weight_index() raises:
     wq_shape.append(4)
     wq_shape.append(4)
     gguf.register_tensor(
-        "model.layers.0.self_attn.q_proj.weight", wq_shape, GGUF_Q8_0(), 144
+        "model.layers.0.self_attn.q_proj.weight", wq_shape, GGUF_Q8_0(), 160
     )
 
     # Verify GGUF metadata

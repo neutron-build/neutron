@@ -488,7 +488,16 @@ test("conflict: excluded() in the on-conflict target index predicate fails befor
 });
 
 test("conflict: the compile choke point rejects excluded() in every non-conflict position", () => {
-  const bad = qual("excluded", "hits");
+  // The SEMANTIC node: only excluded() builds it, and only it is scoped.
+  const bad = excluded(members.hits);
+  // NA-12 part A: an ordinary qualified reference named "excluded" is just an
+  // identifier (PostgreSQL allows a table/schema with that name) and must
+  // compile like any other column reference instead of tripping name-based
+  // pseudo-relation detection.
+  const ordinary = compileStatement(
+    selectStatement({ from: qual("excluded", "events"), where: [qual("excluded", "hits")] }),
+  );
+  assert.match(ordinary.sql, /"excluded"\."events"/);
   // select order by
   assert.throws(
     () => compileStatement(selectStatement({ from: ident("members"), orderBy: [{ expr: bad, direction: "asc" }] })),
@@ -499,20 +508,28 @@ test("conflict: the compile choke point rejects excluded() in every non-conflict
     () => compileStatement(selectStatement({ from: ident("members"), having: [bad] })),
     /only valid directly inside on-conflict/,
   );
-  // a subquery inside a LEGAL DO UPDATE SET still rejects (subqueries never see excluded)
+  // A scalar subquery inside a LEGAL DO UPDATE SET inherits the excluded
+  // binding: it is correlated to the insert, and PostgreSQL resolves
+  // `excluded` through it (live-verified on PG 17; NA-12 corrected the old
+  // blanket rejection, which refused statements the database accepts).
+  // It still compiles; the same subquery in a plain SELECT below still throws.
+  const correlated = compileStatement(
+    insertStatement({
+      table: ident("members"),
+      columns: ["email"],
+      rows: [[param("a@x")]],
+      onConflict: onConflictClause({
+        action: "update",
+        targetColumns: ["email"],
+        sets: [{ column: "hits", value: fragment("(select ", subquery(selectStatement({ from: ident("members"), where: [bad] })), ")") }],
+      }),
+    }),
+  );
+  assert.match(correlated.sql, /\(select/);
   assert.throws(
     () =>
       compileStatement(
-        insertStatement({
-          table: ident("members"),
-          columns: ["email"],
-          rows: [[param("a@x")]],
-          onConflict: onConflictClause({
-            action: "update",
-            targetColumns: ["email"],
-            sets: [{ column: "hits", value: fragment("(select ", subquery(selectStatement({ from: ident("members"), where: [bad] })), ")") }],
-          }),
-        }),
+        selectStatement({ from: ident("members"), where: [subquery(selectStatement({ from: ident("members"), where: [bad] }))] }),
       ),
     /only valid directly inside on-conflict/,
   );

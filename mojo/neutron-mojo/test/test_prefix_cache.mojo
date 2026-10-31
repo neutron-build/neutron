@@ -47,7 +47,7 @@ def _make_tokens(values: List[Int]) -> List[Int]:
     return result^
 
 
-def _make_cache(num_layers: Int, max_seq: Int, heads: Int, dim: Int) -> MultiLayerKVCache:
+def _make_cache(num_layers: Int, max_seq: Int, heads: Int, dim: Int) raises -> MultiLayerKVCache:
     """Create a KV cache with known values."""
     var cache = MultiLayerKVCache(
         num_layers=num_layers, max_seq_len=max_seq,

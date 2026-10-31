@@ -32,7 +32,7 @@ run_cmd do
       -- `sha256` is `opaque`, so its output length is a property of the real
       -- function rather than of this model — assumed, not provable here.
       `Nucleus.Crypto.sha256_output_len,
-      -- Hardness assumptions. Not theorems anyone can prove.
+      -- Strong global injectivity assumptions, not bounded cryptographic security.
       `Nucleus.Crypto.Spec.sha256_collision_resistant,
       `Nucleus.Crypto.Proofs.hmac_prf_security ]
   let env ← getEnv
@@ -43,6 +43,7 @@ run_cmd do
     if n.isInternal then continue
     unless (match ci with | .thmInfo _ => true | _ => false) do continue
     checked := checked + 1
+    logInfo m!"AXIOM THEOREM: {n}"
     for a in ← Lean.collectAxioms n do
       unless allowed.contains a do bad := bad.push (n, a)
   for (n, a) in bad do

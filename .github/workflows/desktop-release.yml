@@ -351,6 +351,6 @@ jobs:
 
             ### Code signing
 
-            - **macOS**: Signed with Developer ID and notarized by Apple
-            - **Windows**: Signed with EV code signing certificate
+            - **macOS**: Signing and notarization depend on configured credentials; verify the downloaded artifact before relying on either.
+            - **Windows**: Signing depends on the configured certificate; verify the downloaded artifact. No EV certificate claim is made here.
             - **Linux**: Unsigned (verify via checksum)

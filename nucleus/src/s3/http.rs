@@ -12,6 +12,46 @@ use super::sigv4::percent_decode;
 /// Hard cap on the header block (request line + headers).
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
+/// Hard cap on the number of header lines in one request head. Legitimate
+/// S3 clients send a couple of dozen at most; a count cap stops a peer from
+/// burning the byte budget on thousands of 1-byte headers.
+const MAX_HEADER_LINES: usize = 256;
+
+/// One bounded, `\n`-terminated line read under the remaining head budget.
+enum BoundedLine {
+    Line(String),
+    /// Clean EOF before the first byte.
+    Eof,
+    /// Over the remaining budget, or EOF mid-line (unterminated input).
+    /// Either way the head must be rejected before any more allocation.
+    Over,
+}
+
+/// Read one line of at most `remaining` bytes (NE-12).
+///
+/// The line is read through `take(remaining + 1)`, so a peer streaming a
+/// request line or a single header without ever sending LF cannot grow the
+/// buffer past the cap — the previous `read_line` allocated unboundedly and
+/// only checked the length afterwards.
+async fn read_line_bounded<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    remaining: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut line = String::new();
+    let n = reader
+        .take(remaining as u64 + 1)
+        .read_line(&mut line)
+        .await?;
+    if n == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+    if n > remaining || !line.ends_with('\n') {
+        return Ok(BoundedLine::Over);
+    }
+    Ok(BoundedLine::Line(line))
+}
+
+
 #[derive(Debug)]
 pub struct Request {
     pub method: String,
@@ -47,6 +87,7 @@ impl Request {
 
 /// A parsed request head — body not yet read (so the server can emit
 /// `100 Continue` before the client streams the payload).
+#[derive(Debug)]
 pub struct RequestHead {
     pub method: String,
     pub raw_path: String,
@@ -58,6 +99,7 @@ pub struct RequestHead {
 }
 
 /// Outcome of reading one request head off the wire.
+#[derive(Debug)]
 pub enum ReadOutcome {
     Head(Box<RequestHead>),
     /// Connection closed cleanly between requests.
@@ -71,12 +113,18 @@ pub async fn read_request_head<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     max_body: usize,
 ) -> std::io::Result<ReadOutcome> {
+    // One aggregate budget covers the request line and every header line
+    // (NE-12): bytes are bounded as they arrive, not checked after the
+    // allocation has already grown.
+    let mut head_budget = MAX_HEADER_BYTES;
+
     // Request line
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        return Ok(ReadOutcome::Closed);
-    }
+    let line = match read_line_bounded(reader, head_budget).await? {
+        BoundedLine::Line(line) => line,
+        BoundedLine::Eof => return Ok(ReadOutcome::Closed),
+        BoundedLine::Over => return Ok(ReadOutcome::Bad("request line too large")),
+    };
+    head_budget -= line.len();
     let line = line.trim_end();
     let mut parts = line.split(' ');
     let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
@@ -95,17 +143,16 @@ pub async fn read_request_head<R: tokio::io::AsyncRead + Unpin>(
 
     // Headers
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut header_bytes = 0usize;
     loop {
-        let mut hline = String::new();
-        let n = reader.read_line(&mut hline).await?;
-        if n == 0 {
-            return Ok(ReadOutcome::Bad("connection closed mid-headers"));
+        if headers.len() >= MAX_HEADER_LINES {
+            return Ok(ReadOutcome::Bad("too many header lines"));
         }
-        header_bytes += n;
-        if header_bytes > MAX_HEADER_BYTES {
-            return Ok(ReadOutcome::Bad("header block too large"));
-        }
+        let hline = match read_line_bounded(reader, head_budget).await? {
+            BoundedLine::Line(hline) => hline,
+            BoundedLine::Eof => return Ok(ReadOutcome::Bad("connection closed mid-headers")),
+            BoundedLine::Over => return Ok(ReadOutcome::Bad("header block too large")),
+        };
+        head_budget -= hline.len();
         let hline = hline.trim_end();
         if hline.is_empty() {
             break;
@@ -136,10 +183,23 @@ pub async fn read_request_head<R: tokio::io::AsyncRead + Unpin>(
     if te.as_deref().is_some_and(|v| v.contains("chunked")) {
         return Ok(ReadOutcome::Bad("Transfer-Encoding: chunked not supported"));
     }
-    let content_length = headers
+    // Framing ambiguity (NE-12): duplicate Content-Length values that
+    // disagree, or Content-Length combined with any Transfer-Encoding, must
+    // be refused rather than guessed.
+    let cl_values: Vec<&str> = headers
         .iter()
-        .find(|(k, _)| k == "content-length")
-        .map(|(_, v)| v.parse::<usize>())
+        .filter(|(k, _)| k == "content-length")
+        .map(|(_, v)| v.trim())
+        .collect();
+    if cl_values.len() > 1 && cl_values.windows(2).any(|w| w[0] != w[1]) {
+        return Ok(ReadOutcome::Bad("conflicting content-length headers"));
+    }
+    if te.is_some() && !cl_values.is_empty() {
+        return Ok(ReadOutcome::Bad("ambiguous content-length and transfer-encoding"));
+    }
+    let content_length = cl_values
+        .first()
+        .map(|v| v.parse::<usize>())
         .transpose()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad content-length"))?
         .unwrap_or(0);
@@ -403,5 +463,103 @@ mod tests {
         let body = "<Delete><Object><Key>a&amp;b</Key></Object>\
                     <Object><Key>c</Key></Object></Delete>";
         assert_eq!(xml_extract_all(body, "Key"), vec!["a&b", "c"]);
+    }
+
+    /// Drive `read_request_head` against in-memory bytes.
+    async fn head_of(bytes: &[u8]) -> ReadOutcome {
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        use tokio::io::AsyncWriteExt;
+        client.write_all(bytes).await.unwrap();
+        drop(client); // half-close: EOF after the supplied bytes
+        let mut reader = BufReader::new(server);
+        read_request_head(&mut reader, 1024 * 1024).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn overlong_request_line_without_newline_is_rejected() {
+        // NE-12: streaming a request line with no LF used to allocate the
+        // whole stream before any length check; the head must now be
+        // rejected at the cap without a newline ever arriving.
+        let mut req = vec![b'G'; 70 * 1024];
+        req.extend_from_slice(b"\r\n\r\n");
+        match head_of(&req).await {
+            ReadOutcome::Bad(msg) => assert_eq!(msg, "request line too large"),
+            other => panic!("expected Bad, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn overlong_single_header_is_rejected() {
+        // A single unterminated header past the head budget.
+        let mut req = b"GET / HTTP/1.1\r\nx-big: ".to_vec();
+        req.extend(std::iter::repeat_n(b'h', 70 * 1024));
+        match head_of(&req).await {
+            ReadOutcome::Bad(msg) => {
+                assert!(msg.contains("header block too large"), "got {msg}")
+            }
+            other => panic!("expected Bad, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn many_short_headers_are_rejected() {
+        let mut req = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..300 {
+            req.extend_from_slice(format!("x-n{i}: v\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        match head_of(&req).await {
+            ReadOutcome::Bad(msg) => assert!(msg.contains("too many"), "got {msg}"),
+            other => panic!("expected Bad, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_content_length_is_rejected() {
+        let req = b"PUT /k HTTP/1.1\r\ncontent-length: 5\r\ncontent-length: 6\r\n\r\n";
+        match head_of(req).await {
+            ReadOutcome::Bad(msg) => assert!(msg.contains("conflicting"), "got {msg}"),
+            other => panic!("expected Bad, got {other:?}"),
+        }
+        // Content-Length alongside any Transfer-Encoding is ambiguous.
+        let req = b"PUT /k HTTP/1.1\r\ncontent-length: 5\r\ntransfer-encoding: gzip\r\n\r\n";
+        match head_of(req).await {
+            ReadOutcome::Bad(msg) => assert!(msg.contains("ambiguous"), "got {msg}"),
+            other => panic!("expected Bad, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unterminated_header_at_eof_is_rejected() {
+        // EOF in the middle of a header line must not parse as a head.
+        let req = b"GET / HTTP/1.1\r\nx-trunc: aa";
+        match head_of(req).await {
+            ReadOutcome::Bad(msg) => {
+                assert!(msg.contains("mid-headers") || msg.contains("too large"), "got {msg}")
+            }
+            other => panic!("expected Bad, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_head_still_parses() {
+        // Control: a normal request head inside the budget.
+        let req = b"GET /bucket/key?list-type=2 HTTP/1.1\r\nhost: h\r\n\
+                    x-amz-content-sha256: UNSIGNED-PAYLOAD\r\n\r\n";
+        match head_of(req).await {
+            ReadOutcome::Head(head) => {
+                assert_eq!(head.method, "GET");
+                assert_eq!(head.raw_path, "/bucket/key");
+                assert_eq!(
+                    head.headers
+                        .iter()
+                        .find(|(k, _)| k == "host")
+                        .map(|(_, v)| v.as_str()),
+                    Some("h")
+                );
+                assert!(head.keep_alive);
+            }
+            other => panic!("expected Head, got {other:?}"),
+        }
     }
 }

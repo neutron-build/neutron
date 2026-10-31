@@ -31,12 +31,18 @@ module session_lifecycle {
 
     // === ACTIONS ===
 
+    var terminal_sessions: Set[SessionId]
+    var revoked_sessions: Set[SessionId]
+    var original_owner: SessionId -> UserId
     action init = all {
         phase' = SESSION_IDS.mapBy(s => "none"),
         owner' = SESSION_IDS.mapBy(s => 0),
         abs_ttl' = SESSION_IDS.mapBy(s => 0),
         idle_ticks' = SESSION_IDS.mapBy(s => 0),
         renewals' = SESSION_IDS.mapBy(s => 0),
+        terminal_sessions' = Set(),
+        revoked_sessions' = Set(),
+        original_owner' = SESSION_IDS.mapBy(s => 0),
         next_sid' = 1,
     }
 
@@ -50,6 +56,9 @@ module session_lifecycle {
             abs_ttl' = abs_ttl.set(sid, SESSION_TTL),
             idle_ticks' = idle_ticks.set(sid, 0),
             renewals' = renewals.set(sid, 0),
+            terminal_sessions' = terminal_sessions,
+            revoked_sessions' = revoked_sessions,
+            original_owner' = original_owner.set(sid, user),
             next_sid' = next_sid + 1,
         }
     }
@@ -65,6 +74,9 @@ module session_lifecycle {
         owner' = owner,
         abs_ttl' = abs_ttl,
         renewals' = renewals,
+        terminal_sessions' = terminal_sessions,
+        revoked_sessions' = revoked_sessions,
+        original_owner' = original_owner,
         next_sid' = next_sid,
     }
 
@@ -79,6 +91,9 @@ module session_lifecycle {
         idle_ticks' = idle_ticks.set(sid, 0),
         phase' = phase,
         owner' = owner,
+        terminal_sessions' = terminal_sessions,
+        revoked_sessions' = revoked_sessions,
+        original_owner' = original_owner,
         next_sid' = next_sid,
     }
 
@@ -92,6 +107,9 @@ module session_lifecycle {
         abs_ttl' = abs_ttl,
         idle_ticks' = idle_ticks,
         renewals' = renewals,
+        terminal_sessions' = terminal_sessions.union(Set(sid)),
+        revoked_sessions' = revoked_sessions.union(Set(sid)),
+        original_owner' = original_owner,
         next_sid' = next_sid,
     }
 
@@ -122,6 +140,9 @@ module session_lifecycle {
             else idle_ticks.get(sid)),
         owner' = owner,
         renewals' = renewals,
+        terminal_sessions' = terminal_sessions.union(SESSION_IDS.filter(s => s < next_sid and (phase.get(s) == "active" or phase.get(s) == "idle") and (abs_ttl.get(s) <= 1 or (phase.get(s) == "idle" and idle_ticks.get(s) + 1 >= IDLE_TIMEOUT)))),
+        revoked_sessions' = revoked_sessions,
+        original_owner' = original_owner,
         next_sid' = next_sid,
     }
 
@@ -153,7 +174,7 @@ module session_lifecycle {
     // Terminal states are permanent: expired/revoked sessions never become active
     val terminal_permanent: bool =
         SESSION_IDS.forall(s =>
-            phase.get(s) == "expired" implies phase.get(s) != "active"
+            s.in(terminal_sessions) implies (phase.get(s) == "expired" or phase.get(s) == "revoked")
         )
 
     // Renewal limit is respected
@@ -178,13 +199,13 @@ module session_lifecycle {
     // Session-user binding is immutable: owner never changes after creation
     val owner_immutable: bool =
         SESSION_IDS.forall(s =>
-            s < next_sid implies owner.get(s) > 0
+            s < next_sid implies owner.get(s) == original_owner.get(s)
         )
 
     // Revoked sessions cannot be renewed or touched
     // (enforced by action guards, but stated as invariant)
     val revoked_is_final: bool =
         SESSION_IDS.forall(s =>
-            phase.get(s) == "revoked" implies phase.get(s) != "active"
+            s.in(revoked_sessions) implies phase.get(s) == "revoked"
         )
 }

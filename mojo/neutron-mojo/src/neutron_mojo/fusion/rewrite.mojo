@@ -20,6 +20,7 @@ from .eclass import ClassId
 from .rules import RewriteRule, RuleSet
 from .pattern import Pattern, PatternKind, Bindings, match_pattern, match_pattern_egraph
 from .graph import OpKind
+from neutron_mojo.io.binary_reader import _u32_to_f32
 
 
 # ===----------------------------------------------------------------------=== #
@@ -88,10 +89,12 @@ struct RewriteEngine:
     """
     var max_iterations: Int
     var max_nodes: Int  # Stop if e-graph grows too large
+    var fast_math: Bool
 
-    def __init__(out self, max_iterations: Int = 10, max_nodes: Int = 10000):
+    def __init__(out self, max_iterations: Int = 10, max_nodes: Int = 10000, fast_math: Bool = False):
         self.max_iterations = max_iterations
         self.max_nodes = max_nodes
+        self.fast_math = fast_math
 
     def run_phase1(self, mut egraph: EGraph, ruleset: RuleSet) raises -> RewriteStats:
         """Run Phase 1: directed simplifications.
@@ -106,6 +109,7 @@ struct RewriteEngine:
         Returns:
             Statistics from the rewrite process.
         """
+        var initial_nodes = egraph.num_nodes()
         var stats = RewriteStats()
         var phase1_rules = ruleset.get_phase1_rules()
 
@@ -119,10 +123,10 @@ struct RewriteEngine:
             stats.rules_applied += applied
             stats.iterations += 1
 
-            if egraph.num_nodes() > self.max_nodes:
+            if applied == 0 or egraph.num_nodes() >= self.max_nodes:
                 break  # E-graph too large, stop
 
-        stats.nodes_added = egraph.num_nodes()
+        stats.nodes_added = egraph.num_nodes() - initial_nodes
         return stats^
 
     def run_phase2(self, mut egraph: EGraph, ruleset: RuleSet) raises -> RewriteStats:
@@ -139,6 +143,7 @@ struct RewriteEngine:
         Returns:
             Statistics from the rewrite process.
         """
+        var initial_nodes = egraph.num_nodes()
         var stats = RewriteStats()
         var phase2_rules = ruleset.get_phase2_rules()
 
@@ -152,10 +157,10 @@ struct RewriteEngine:
             stats.rules_applied += applied
             stats.iterations += 1
 
-            if egraph.num_nodes() > self.max_nodes:
+            if applied == 0 or egraph.num_nodes() >= self.max_nodes:
                 break  # E-graph too large, stop
 
-        stats.nodes_added = egraph.num_nodes()
+        stats.nodes_added = egraph.num_nodes() - initial_nodes
         return stats^
 
     def _find_matches(self, mut egraph: EGraph, rules: List[RewriteRule]) raises -> List[Match]:
@@ -175,6 +180,8 @@ struct RewriteEngine:
 
         for rule_idx in range(len(rules)):
             var rule = rules[rule_idx].copy()
+            if rule.requires_fast_math and not self.fast_math:
+                continue
 
             # Count max variable IDs in pattern for bindings allocation
             var num_vars = _count_vars(rule.lhs)
@@ -209,11 +216,17 @@ struct RewriteEngine:
         var applied = 0
 
         for i in range(len(matches)):
+            if egraph.num_nodes() >= self.max_nodes:
+                break
             var m = matches[i].copy()
-            var rhs_class = _instantiate_pattern(m.rhs, m.bindings, egraph)
+            var before_nodes = egraph.num_nodes()
+            var rhs_class = _instantiate_pattern(m.rhs, m.bindings, egraph, self.max_nodes)
             if rhs_class.id() >= 0:
-                _ = egraph.merge(m.matched_class, rhs_class)
-                applied += 1
+                var different = egraph.find(m.matched_class) != egraph.find(rhs_class)
+                if different:
+                    _ = egraph.merge(m.matched_class, rhs_class)
+                if different or egraph.num_nodes() != before_nodes:
+                    applied += 1
 
         return applied
 
@@ -248,7 +261,7 @@ def count_rewrites_applied(
     mut egraph: EGraph,
     ruleset: RuleSet,
     max_iterations: Int = 5
-) -> Int:
+) raises -> Int:
     """Count how many rewrites would be applied.
 
     Args:
@@ -274,13 +287,13 @@ def _count_vars(pattern: Pattern) -> Int:
         if pattern.var_id > max_var:
             max_var = pattern.var_id
     for i in range(len(pattern.children)):
-        var child_max = _count_vars(pattern.children[i])
+        var child_max = _count_vars(pattern.children[i]) - 1
         if child_max > max_var:
             max_var = child_max
     return max_var + 1
 
 
-def _instantiate_pattern(pattern: Pattern, bindings: Bindings, mut egraph: EGraph) raises -> ClassId:
+def _instantiate_pattern(pattern: Pattern, bindings: Bindings, mut egraph: EGraph, max_nodes: Int = 10000) raises -> ClassId:
     """Instantiate a pattern RHS using bindings.
 
     Recursively creates e-graph nodes for the RHS pattern:
@@ -300,18 +313,26 @@ def _instantiate_pattern(pattern: Pattern, bindings: Bindings, mut egraph: EGrap
     if pattern.kind == PatternKind.Var:
         return bindings.get(pattern.var_id)
 
+    elif pattern.kind == PatternKind.ScalarF32:
+        if egraph.num_nodes() >= max_nodes:
+            return ClassId(-1)
+        return egraph.add_scalar_f32(_u32_to_f32(UInt32(pattern.class_id)))
     elif pattern.kind == PatternKind.Const:
-        return ClassId(pattern.class_id)
+        return egraph.find(ClassId(pattern.class_id))
 
     elif pattern.kind == PatternKind.Op:
         # Recursively instantiate children
         var node = CanonicalNode(pattern.op)
         for i in range(len(pattern.children)):
             var child_class = _instantiate_pattern(
-                pattern.children[i], bindings, egraph
+                pattern.children[i], bindings, egraph, max_nodes
             )
+            if child_class.id() < 0:
+                return ClassId(-1)
             node.inputs.append(child_class)
         # Add to e-graph (hash-consing handles dedup)
+        if egraph.num_nodes() >= max_nodes:
+            return ClassId(-1)
         return egraph.add(node^)
 
     return ClassId(-1)

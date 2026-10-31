@@ -30,6 +30,7 @@ struct PatternKind(Writable, TrivialRegisterPassable):
 
     # Operation pattern: matches an operation with sub-patterns as inputs
     comptime Op = PatternKind(2)
+    comptime ScalarF32 = PatternKind(3)
 
     @implicit
     def __init__(out self, value: Int):
@@ -115,6 +116,12 @@ struct Pattern(Copyable, Movable, ImplicitlyCopyable):
         """Create a constant pattern matching a specific e-class."""
         var p = Pattern(PatternKind.Const)
         p.class_id = class_id.id()
+        return p^
+
+    @staticmethod
+    def scalar_f32(bits: Int) -> Pattern:
+        var p = Pattern(PatternKind.ScalarF32)
+        p.class_id = bits
         return p^
 
     @staticmethod
@@ -209,6 +216,8 @@ def match_pattern(
         Error if binding conflicts occur.
     """
     if pattern.kind == PatternKind.Var:
+        if bindings.is_bound(pattern.var_id):
+            return bindings.get(pattern.var_id) == class_id
         bindings.bind(pattern.var_id, class_id)
         return True
 
@@ -242,11 +251,16 @@ def match_pattern_egraph(
         True if pattern matches, False otherwise.
     """
     if pattern.kind == PatternKind.Var:
-        bindings.bind(pattern.var_id, class_id)
+        var canonical = egraph.find(class_id)
+        if bindings.is_bound(pattern.var_id):
+            return egraph.find(bindings.get(pattern.var_id)) == canonical
+        bindings.bind(pattern.var_id, canonical)
         return True
 
+    elif pattern.kind == PatternKind.ScalarF32:
+        return egraph.is_scalar_f32(class_id, pattern.class_id)
     elif pattern.kind == PatternKind.Const:
-        return class_id.id() == pattern.class_id
+        return egraph.find(class_id) == egraph.find(ClassId(pattern.class_id))
 
     elif pattern.kind == PatternKind.Op:
         # Find canonical class

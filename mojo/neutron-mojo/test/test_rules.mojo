@@ -40,7 +40,7 @@ def test_add_identity_rule() raises:
     assert_true(rule.lhs.op == OpKind.Add, "LHS op should be Add")
     assert_true(len(rule.lhs.children) == 2, "Add should have 2 children")
     assert_true(rule.lhs.children[0].kind == PatternKind.Var, "First child should be Var")
-    assert_true(rule.lhs.children[1].kind == PatternKind.Const, "Second child should be Const")
+    assert_true(rule.lhs.children[1].kind == PatternKind.ScalarF32, "Second child should be a scalar F32 constant")
 
     # RHS should be ?x
     assert_true(rule.rhs.kind == PatternKind.Var, "RHS should be Var")
@@ -65,7 +65,7 @@ def test_mul_zero_rule() raises:
 
     assert_true(rule.name == "mul_zero", "Rule name should be mul_zero")
     assert_true(rule.lhs.op == OpKind.Mul, "LHS op should be Mul")
-    assert_true(rule.rhs.kind == PatternKind.Const, "RHS should be Const (0)")
+    assert_true(rule.rhs.kind == PatternKind.ScalarF32, "RHS should be a scalar F32 zero")
 
     print("  mul_zero_rule: PASS")
 
@@ -191,16 +191,25 @@ def test_ruleset_phase_filtering() raises:
 
 
 def test_default_ruleset() raises:
-    """Test default ruleset creation."""
+    """Test default ruleset creation.
+
+    MJ-K15: numerically unsafe simplifications (identity/collapse/
+    commutativity/associativity) require explicit fast-math opt-in; the
+    default ruleset keeps only the value-safe cancellation and fusion rules.
+    """
     var rs = create_default_ruleset()
 
-    assert_true(rs.num_rules() == 11, "Default ruleset should have 11 rules")
+    assert_true(rs.num_rules() == 4, "Default ruleset should have 4 safe rules")
 
     var phase1 = rs.get_phase1_rules()
     var phase2 = rs.get_phase2_rules()
 
-    assert_true(len(phase1) == 7, "Should have 7 phase 1 rules")
-    assert_true(len(phase2) == 4, "Should have 4 phase 2 rules")
+    assert_true(len(phase1) == 4, "Should have 4 phase 1 rules")
+    assert_true(len(phase2) == 0, "Should have 0 phase 2 rules without fast-math")
+
+    var unsafe_rs = create_default_ruleset(fast_math=True)
+    assert_true(unsafe_rs.num_rules() == 11, "Fast-math ruleset should have 11 rules")
+    assert_true(len(unsafe_rs.get_phase2_rules()) == 4, "Fast-math phase 2 should have 4 rules")
 
     print("  default_ruleset: PASS")
 

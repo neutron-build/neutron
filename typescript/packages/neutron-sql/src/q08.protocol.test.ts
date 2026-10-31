@@ -230,8 +230,9 @@ test("stream protocol: inside db.transaction the stream never issues BEGIN/COMMI
   assert.equal(pins.length, 1, "the stream rides the transaction's pin");
   const log = pins[0].log.map((s) => s.replace(/"neutron_cursor_\d+"/, "C"));
   assert.equal(log[0], "begin");
-  assert.match(log[1], /^declare C no scroll cursor for select /);
-  assert.deepEqual(log.slice(2), ["fetch forward 4 from C", "close C", "commit"]);
+  assert.equal(log[1], "select version() as version", "cold capabilities resolve on the transaction pin");
+  assert.match(log[2], /^declare C no scroll cursor for select /);
+  assert.deepEqual(log.slice(3), ["fetch forward 4 from C", "close C", "commit"]);
 });
 
 test("stream protocol: a stream kept past its transaction runs nothing afterwards", async () => {
@@ -294,4 +295,41 @@ test("batch protocol: inside db.transaction the batch joins the scope (no BEGIN 
     pins[0].log.map((s) => (s.startsWith("select") ? "select" : s)),
     ["begin", "select", "select", "commit"],
   );
+});
+
+test('parent streams and batches refuse suspended access without losing buffered rows', async () => {
+  const { driver, pins } = fakeDriver(5);
+  const database = await createDatabase({ driver, tables: { items } });
+  await database.transaction(async tx => {
+    const stream = tx.select().from(items).stream({ batchSize: 3 });
+    const batch = tx.batch([tx.select().from(items)]);
+    assert.equal((await stream.next()).value.id, 1);
+    await tx.transaction(async () => {
+      const before = [...pins[0]!.log];
+      await assert.rejects(stream.next(), /suspended/);
+      await assert.rejects(stream.return(), /suspended/);
+      await assert.rejects(batch.execute(), /suspended/);
+      assert.deepEqual(pins[0]!.log, before);
+    });
+    assert.equal((await stream.next()).value.id, 2);
+    assert.equal((await stream.next()).value.id, 3);
+    await stream.return();
+    assert.equal((await batch.execute())[0].length, 5);
+  });
+  assert.equal(pins[0]!.released, 1);
+  await database.close();
+});
+
+test("TSD-01: full-batch decoder rejection rolls back and releases exactly once", async () => {
+  const { driver, pins } = fakeDriver(3);
+  const broken = pgTable("items", {
+    label: text("label").codec({ encode: (value: string) => value, decode: () => { throw new Error("codec rejected"); } }),
+  });
+  const db = await createDatabase({ driver });
+  const stream = db.select().from(broken).stream({ batchSize: 1 });
+  await assert.rejects(() => stream.next(), /codec rejected/);
+  assert.equal(pins[0].log.at(-1), "rollback");
+  assert.equal(pins[0].released, 1);
+  await stream.return();
+  assert.equal(pins[0].released, 1);
 });

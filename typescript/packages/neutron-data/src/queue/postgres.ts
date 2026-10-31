@@ -1,3 +1,4 @@
+import { cleanupAfterFailure } from "../internal/resources.js";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import type { Job, JobHandler, QueueDriver, ScheduleOptions } from "./index.js";
@@ -40,7 +41,7 @@ export interface PostgresQueueDriverOptions {
   workerId?: string;
   /** Delay between poll ticks. Default 2000ms. */
   pollIntervalMs?: number;
-  /** Jobs claimed per tick. Default 10. */
+  /** Maximum sequential jobs per tick; only the running slot is leased. Default 10. */
   batchSize?: number;
   /** Lease length: an active job whose locked_at is older is reaped back to pending. Default 60s. */
   leaseMs?: number;
@@ -54,6 +55,8 @@ export interface PostgresQueueDriverOptions {
   retentionMs?: number;
   /** How often the retention sweep runs. Default 60s. */
   retentionSweepIntervalMs?: number;
+  /** Reports uncertain/lost ownership. Handlers also receive an aborted signal. */
+  onLeaseLost?: (jobId: string, error: unknown) => void;
 }
 
 const DEFAULT_URL_FALLBACK = "postgres://127.0.0.1:5432/postgres";
@@ -103,6 +106,7 @@ function errorMessage(error: unknown): string {
 }
 
 export class PostgresQueueDriver implements QueueDriver {
+  readonly capabilities = Object.freeze({ durability: "backend", unknownHandlers: "filter-before-claim", claimFencing: "attempt", handlerSignal: true, close: "drain-sql-worker", acknowledgement: "fenced-uncertain-stop", errorObservation: "workerError-and-close", registration: "process-starts-worker", retry: "persisted-budget", scheduling: "persisted-cron", routing: "registered-names", postClose: "all-refusal" } as const);
   private readonly handlers = new Map<string, JobHandler<unknown>>();
   private readonly scheduleQueues = new Map<string, string>();
   private readonly workerId: string;
@@ -116,6 +120,10 @@ export class PostgresQueueDriver implements QueueDriver {
   private readonly retentionMs: number;
   private readonly retentionSweepIntervalMs: number;
   private readonly heartbeatMs: number;
+  private readonly onLeaseLost: PostgresQueueDriverOptions["onLeaseLost"];
+  /** Last poll failure, retained even when the background loop has observed it. */
+  workerError: unknown;
+  private acknowledgementUnknown = false;
   private ready: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
@@ -127,6 +135,7 @@ export class PostgresQueueDriver implements QueueDriver {
     private readonly sql: PostgresQueueSql,
     options: Omit<PostgresQueueDriverOptions, "url" | "sql"> = {}
   ) {
+    this.onLeaseLost = options.onLeaseLost;
     this.queueName = options.queueName ?? "neutron";
     this.workerId =
       options.workerId ?? `${this.queueName}:${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
@@ -146,12 +155,14 @@ export class PostgresQueueDriver implements QueueDriver {
   }
 
   async add<TPayload = unknown>(name: string, payload: TPayload): Promise<Job<TPayload>> {
+    this.assertOpen();
     await this.ensureSchema();
+    this.assertOpen();
     const id = randomUUID();
     const createdAt = new Date();
     await this.sql.unsafe(
       `INSERT INTO neutron_jobs (id, queue, name, payload, max_attempts, created_at)
-       VALUES ($1::uuid, $2, $3, $4::jsonb, $5, $6::timestamptz)`,
+       VALUES ($1::uuid, $2, $3, COALESCE($4::text::jsonb, 'null'::jsonb), $5, $6::timestamptz)`,
       [id, this.queueName, name, JSON.stringify(payload ?? null), this.maxAttempts, createdAt]
     );
     return { id, name, payload, createdAt: createdAt.getTime() };
@@ -161,8 +172,10 @@ export class PostgresQueueDriver implements QueueDriver {
     name: string,
     handler: JobHandler<TPayload>
   ): Promise<void> {
+    this.assertOpen();
     this.handlers.set(name, handler as JobHandler<unknown>);
     await this.ensureSchema();
+    this.assertOpen();
     this.startLoop();
   }
 
@@ -172,12 +185,14 @@ export class PostgresQueueDriver implements QueueDriver {
     payload: unknown,
     opts?: ScheduleOptions
   ): Promise<void> {
+    this.assertOpen();
     await this.ensureSchema();
+    this.assertOpen();
     const next = nextCronDate(pattern, new Date());
     const queue = opts?.queue ?? this.queueName;
     await this.sql.unsafe(
       `INSERT INTO neutron_schedules (id, queue, name, cron, payload, next_run_at)
-       VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6::timestamptz)
+       VALUES ($1::uuid, $2, $3, $4, COALESCE($5::text::jsonb, 'null'::jsonb), $6::timestamptz)
        ON CONFLICT (queue, name) DO UPDATE SET
          cron = EXCLUDED.cron,
          payload = EXCLUDED.payload,
@@ -188,7 +203,9 @@ export class PostgresQueueDriver implements QueueDriver {
   }
 
   async unschedule(id: string): Promise<void> {
+    this.assertOpen();
     await this.ensureSchema();
+    this.assertOpen();
     const queue = this.scheduleQueues.get(id) ?? this.queueName;
     await this.sql.unsafe(
       `DELETE FROM neutron_schedules WHERE queue = $1 AND name = $2`,
@@ -196,6 +213,8 @@ export class PostgresQueueDriver implements QueueDriver {
     );
     this.scheduleQueues.delete(id);
   }
+
+  private assertOpen(): void { if (this.stopped) throw new Error("PostgresQueueDriver is stopped; reconcile workerError before replacement"); }
 
   async close(): Promise<void> {
     if (this.closePromise) {
@@ -206,7 +225,14 @@ export class PostgresQueueDriver implements QueueDriver {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    this.closePromise = this.inFlight.then(() => this.sql.end());
+    this.closePromise = this.inFlight.then(async () => {
+      try { await this.sql.end(); }
+      catch (cleanupError) {
+        if (this.acknowledgementUnknown) throw new AggregateError([this.workerError, cleanupError], "Queue acknowledgement and cleanup failed", { cause: this.workerError });
+        throw cleanupError;
+      }
+      if (this.acknowledgementUnknown) throw this.workerError;
+    });
     return this.closePromise;
   }
 
@@ -240,7 +266,13 @@ export class PostgresQueueDriver implements QueueDriver {
       this.timer = null;
       this.inFlight = this.tick().then(
         () => this.queueTick(this.pollIntervalMs),
-        () => this.queueTick(this.pollIntervalMs)
+        (error: unknown) => {
+          this.workerError = error;
+          // An acknowledgement may already have committed. Stop this worker;
+          // reconciliation belongs to its owner, never replay the UPDATE.
+          if (this.acknowledgementUnknown) this.stopped = true;
+          else this.queueTick(this.pollIntervalMs);
+        }
       );
     }, delayMs);
   }
@@ -290,7 +322,7 @@ export class PostgresQueueDriver implements QueueDriver {
         const next = nextCronDate(row.cron, new Date());
         await tx.unsafe(
           `INSERT INTO neutron_jobs (id, queue, name, payload)
-           VALUES ($1::uuid, $2, $3, $4::jsonb)`,
+           VALUES ($1::uuid, $2, $3, COALESCE($4::text::jsonb, 'null'::jsonb))`,
           [randomUUID(), this.queueName, row.name, JSON.stringify(row.payload ?? null)]
         );
         await tx.unsafe(
@@ -307,25 +339,25 @@ export class PostgresQueueDriver implements QueueDriver {
       return;
     }
     const names = [...this.handlers.keys()];
-    // batchSize is constructor-validated (integer 1..1000) and inlined as a
-    // literal: parameterized LIMIT is not resolved by every wire-compatible
-    // server (Nucleus today), and the value is never user input.
-    const claimed = await this.sql.unsafe<ClaimedJobRow>(
-      `UPDATE neutron_jobs SET status = 'active', locked_at = now(), locked_by = $1,
-         attempts = attempts + 1
-       WHERE id IN (
-         SELECT id FROM neutron_jobs
-         WHERE queue = $2 AND status = 'pending' AND run_at <= now()
-           AND name = ANY($3::text[])
-         ORDER BY priority, run_at
-         LIMIT ${this.batchSize}
-         FOR UPDATE SKIP LOCKED
-       )
-       RETURNING id, name, payload, attempts, max_attempts, created_at`,
-      [this.workerId, this.queueName, names]
-    );
-    for (const row of claimed) {
-      await this.runClaimed(row);
+    // Acquire only the execution slot we can run now. Waiting jobs stay
+    // pending and available to other workers, rather than aging unheartbeated.
+    for (let slot = 0; slot < this.batchSize && !this.stopped; slot += 1) {
+      const claimed = await this.sql.unsafe<ClaimedJobRow>(
+        `UPDATE neutron_jobs SET status = 'active', locked_at = now(), locked_by = $1,
+           attempts = attempts + 1
+         WHERE id IN (
+           SELECT id FROM neutron_jobs
+           WHERE queue = $2 AND status = 'pending' AND run_at <= now()
+             AND name = ANY($3::text[])
+           ORDER BY priority, run_at
+           LIMIT 1
+           FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id, name, payload, attempts, max_attempts, created_at`,
+        [this.workerId, this.queueName, names]
+      );
+      if (claimed.length === 0) break;
+      await this.runClaimed(claimed[0]!);
     }
   }
 
@@ -334,47 +366,72 @@ export class PostgresQueueDriver implements QueueDriver {
     if (!handler) {
       return;
     }
-    const job: Job<unknown> = {
-      id: row.id,
-      name: row.name,
-      payload: row.payload,
-      createdAt: new Date(row.created_at).getTime(),
+    const controller = new AbortController();
+    let lost = false;
+    const lose = (error: unknown): void => {
+      if (lost) return;
+      lost = true;
+      controller.abort(error);
+      try { this.onLeaseLost?.(row.id, error); } catch { /* observer cannot restore ownership */ }
     };
+    const job: Job<unknown> = {
+      id: row.id, name: row.name, payload: row.payload,
+      createdAt: new Date(row.created_at).getTime(), signal: controller.signal,
+    };
+    // attempts increases on every acquisition, including reuse of workerId.
+    // It is the claim generation, not merely a retry counter.
+    let heartbeatWork = Promise.resolve();
     const heartbeat = setInterval(() => {
-      void this.sql
-        .unsafe(
-          `UPDATE neutron_jobs SET locked_at = now()
-           WHERE id = $1::uuid AND locked_by = $2 AND status = 'active'`,
-          [row.id, this.workerId]
-        )
-        .catch(() => {});
+      heartbeatWork = heartbeatWork.then(async () => {
+        if (lost) return;
+        try {
+          const rows = await this.sql.unsafe(
+            `UPDATE neutron_jobs SET locked_at = now()
+             WHERE id = $1::uuid AND locked_by = $2 AND attempts = $3 AND status = 'active'
+             RETURNING id`,
+            [row.id, this.workerId, row.attempts],
+          );
+          if (rows.length !== 1) lose(new Error("queue lease lost"));
+        } catch (error) { lose(error); }
+      });
     }, this.heartbeatMs);
+    let failed = false;
+    let failure: unknown;
+    try { await handler(job); } catch (error) { failed = true; failure = error; }
+    clearInterval(heartbeat);
+    await heartbeatWork;
+    if (lost) return;
+    const fence = "AND locked_by = $4 AND attempts = $5 AND status = 'active' RETURNING id";
     try {
-      await handler(job);
-      await this.sql.unsafe(
-        `UPDATE neutron_jobs SET status = 'done', done_at = now(), locked_at = NULL, locked_by = NULL
-         WHERE id = $1::uuid`,
-        [row.id]
-      );
-    } catch (error) {
-      const message = errorMessage(error);
-      if (row.attempts >= row.max_attempts) {
-        await this.sql.unsafe(
+      let updated: Record<string, unknown>[];
+      if (!failed) {
+        updated = await this.sql.unsafe(
+          `UPDATE neutron_jobs SET status = 'done', done_at = now(), locked_at = NULL, locked_by = NULL
+           WHERE id = $1::uuid AND locked_by = $2 AND attempts = $3 AND status = 'active' RETURNING id`,
+          [row.id, this.workerId, row.attempts],
+        );
+      } else if (row.attempts >= row.max_attempts) {
+        updated = await this.sql.unsafe(
           `UPDATE neutron_jobs SET status = 'dead', done_at = now(), locked_at = NULL,
              locked_by = NULL, last_error = $2
-           WHERE id = $1::uuid`,
-          [row.id, message]
+           WHERE id = $1::uuid AND locked_by = $3 AND attempts = $4 AND status = 'active' RETURNING id`,
+          [row.id, errorMessage(failure), this.workerId, row.attempts],
         );
       } else {
-        await this.sql.unsafe(
+        updated = await this.sql.unsafe(
           `UPDATE neutron_jobs SET status = 'pending', locked_at = NULL, locked_by = NULL,
              last_error = $2, run_at = $3::timestamptz
-           WHERE id = $1::uuid`,
-          [row.id, message, new Date(Date.now() + this.backoffMs(row.attempts))]
+           WHERE id = $1::uuid ${fence}`,
+          [row.id, errorMessage(failure), new Date(Date.now() + this.backoffMs(row.attempts)), this.workerId, row.attempts],
         );
       }
-    } finally {
-      clearInterval(heartbeat);
+      if (updated.length !== 1) lose(new Error("queue lease lost before acknowledgement"));
+    } catch (error) {
+      this.acknowledgementUnknown = true;
+      this.workerError = error;
+      this.stopped = true;
+      lose(error);
+      throw error;
     }
   }
 
@@ -407,5 +464,6 @@ export async function createPostgresQueueDriver(
     idle_timeout: 20,
     connect_timeout: 10,
   }) as unknown as PostgresQueueSql;
-  return new PostgresQueueDriver(sql, options);
+  try { return new PostgresQueueDriver(sql, options); }
+  catch (error) { return cleanupAfterFailure(error, [() => sql.end({ timeout: 5 })]); }
 }

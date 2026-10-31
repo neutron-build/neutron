@@ -1,0 +1,250 @@
+{
+  "id": "PY-APP",
+  "repo": "fastapi/full-stack-fastapi-template",
+  "commit": "cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7",
+  "license": "MIT",
+  "files": [
+    {
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/LICENSE",
+      "sha256": "0bd4e76cdd06ab24cce2de5e74f490920897f90a22ad35e8403ed006d4560f48",
+      "bytes": 1076
+    },
+    {
+      "path": "backend/pyproject.toml",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/pyproject.toml",
+      "sha256": "a2c49d0900e917115a65bd838c20e193940846e231d3fc44dc9670b6e2c1ee1e",
+      "bytes": 1892
+    },
+    {
+      "path": "backend/alembic.ini",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/alembic.ini",
+      "sha256": "a3fe6c2cd06b6c5b66e13901c0e25c018372d75009359e56692d24a1b7c554a2",
+      "bytes": 1596
+    },
+    {
+      "path": "backend/app/models.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/models.py",
+      "sha256": "1b7384d0dc779cca9ebc9d2b05ccd1864988c2043a3692384ff7a731819050f0",
+      "bytes": 3653
+    },
+    {
+      "path": "backend/app/crud.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/crud.py",
+      "sha256": "f69d79e858ee22cee7792494b0df0370afaed20439ed16bbf6f70767926254d1",
+      "bytes": 2463
+    },
+    {
+      "path": "backend/app/initial_data.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/initial_data.py",
+      "sha256": "29b51ebdd3c8cb9fde80a426f9c10af08c606ad0ffcec39a23fddc6587ab812c",
+      "bytes": 402
+    },
+    {
+      "path": "backend/app/main.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/main.py",
+      "sha256": "e8b28b639d86c76dcf60348185c91125a789951ff085a5289d9f5add0854dfda",
+      "bytes": 958
+    },
+    {
+      "path": "backend/app/utils.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/utils.py",
+      "sha256": "61fbc8476b1c1247b80e2220d28f89e33370434e2eb172f325ed0a6643e433b3",
+      "bytes": 3934
+    },
+    {
+      "path": "backend/app/api/main.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/main.py",
+      "sha256": "9e9d533bea7c8616a1d9dd3d7e7cdfefa36726fb221bb289fd102654b7e93b3f",
+      "bytes": 407
+    },
+    {
+      "path": "backend/app/api/deps.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/deps.py",
+      "sha256": "84c30966b3b862c643009c14146d1924dec50be5b0efb9f56798e2fda5189daa",
+      "bytes": 1711
+    },
+    {
+      "path": "backend/app/api/routes/items.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/routes/items.py",
+      "sha256": "7f0fa55d1f7b02188c4abd4f88aa6db92fe03de38258b765ed050ec72032b410",
+      "bytes": 3446
+    },
+    {
+      "path": "backend/app/api/routes/login.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/routes/login.py",
+      "sha256": "3c7f7c395b74cea54e505a16052679614b4fd92325d88b761385df8d952af642",
+      "bytes": 4088
+    },
+    {
+      "path": "backend/app/api/routes/private.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/routes/private.py",
+      "sha256": "f5df74cc276f0d8d83337922fb8e05e69ecbc885d466d90d2e3de54ba5e4c8f4",
+      "bytes": 777
+    },
+    {
+      "path": "backend/app/api/routes/users.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/routes/users.py",
+      "sha256": "566f253330d75bdbf04f2fd59b380dd2c51041d931bd7af6b2064ee66ea96e6d",
+      "bytes": 6918
+    },
+    {
+      "path": "backend/app/api/routes/utils.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/api/routes/utils.py",
+      "sha256": "5e77b59fab0bfcb1cef581938dcc8a47afb7518664a497763d4c50711898e925",
+      "bytes": 783
+    },
+    {
+      "path": "backend/app/core/config.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/core/config.py",
+      "sha256": "ef306f8b68c64f1864269891d353c23807d5685d62e514066598b33ee099ca08",
+      "bytes": 2935
+    },
+    {
+      "path": "backend/app/core/db.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/core/db.py",
+      "sha256": "22b8642606ae619a1ea07b5e3c3bee49c2fc0ded5d0e583e810fba6e7ffadfc9",
+      "bytes": 1190
+    },
+    {
+      "path": "backend/app/core/security.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/core/security.py",
+      "sha256": "adb90882929ab33c238e2e9fa81b03fa0364c1a8cce0e9e70b98c68c321f468f",
+      "bytes": 907
+    },
+    {
+      "path": "backend/app/alembic/env.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/alembic/env.py",
+      "sha256": "5e65dea30d8b09742383af77fe10abe22dab87d92d36a8e46781fde08d64a265",
+      "bytes": 2311
+    },
+    {
+      "path": "backend/app/alembic/versions/e2412789c190_initialize_models.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/alembic/versions/e2412789c190_initialize_models.py",
+      "sha256": "a73fcd9ff8a143b0a75228b63b6589e0ecbfa14c27286d33d4adeffe99c40075",
+      "bytes": 1728
+    },
+    {
+      "path": "backend/app/alembic/versions/9c0a54914c78_add_max_length_for_string_varchar_.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/alembic/versions/9c0a54914c78_add_max_length_for_string_varchar_.py",
+      "sha256": "d9919ae828a0d1aa0fa68fd75bc75a90994a256b66a3a153918149d9578c0c1b",
+      "bytes": 2249
+    },
+    {
+      "path": "backend/app/alembic/versions/d98dd8ec85a3_edit_replace_id_integers_in_all_models_.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/alembic/versions/d98dd8ec85a3_edit_replace_id_integers_in_all_models_.py",
+      "sha256": "d5c549df50ddda6c9877e637e146cd757095460ee6285a7db06bb66724f32730",
+      "bytes": 3754
+    },
+    {
+      "path": "backend/app/alembic/versions/1a31ce608336_add_cascade_delete_relationships.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/alembic/versions/1a31ce608336_add_cascade_delete_relationships.py",
+      "sha256": "56d9a949c1455e59dc9a4b09c469a4d35cd6063230ab1ac1059ba4b58f6804c1",
+      "bytes": 1126
+    },
+    {
+      "path": "backend/app/alembic/versions/fe56fa70289e_add_created_at_to_user_and_item.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/app/alembic/versions/fe56fa70289e_add_created_at_to_user_and_item.py",
+      "sha256": "68dc46eb06c7a6fe9059930eadbdeb349f5b13c789bb1a11846b05eccea0c304",
+      "bytes": 852
+    },
+    {
+      "path": "backend/scripts/prestart.sh",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/scripts/prestart.sh",
+      "sha256": "0f5800314811d06f5ffd6902c946cd0720541604f9666b3f4b29f66d253179ea",
+      "bytes": 131
+    },
+    {
+      "path": "backend/scripts/test.sh",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/scripts/test.sh",
+      "sha256": "fec2f31afa79d7a32fbde58d0f2c565fe5d24521e976f76ffda4bf2009753bc3",
+      "bytes": 144
+    },
+    {
+      "path": "backend/scripts/tests-start.sh",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/scripts/tests-start.sh",
+      "sha256": "a89e6b4383e2cc67df0aa4407261c7405de78e9c2eb71e018a5fcd96f199b50c",
+      "bytes": 62
+    },
+    {
+      "path": "backend/tests/conftest.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/conftest.py",
+      "sha256": "ccccd7fa1092256e889fcf88c5fbc3415a52e2964fd66cb775722dbe7a6dd763",
+      "bytes": 1209
+    },
+    {
+      "path": "backend/tests/utils/item.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/utils/item.py",
+      "sha256": "b06bc74e8df901f56c07e7c82bfc67cc9cb4bea2a0b69b51306a4da5402f5577",
+      "bytes": 538
+    },
+    {
+      "path": "backend/tests/utils/user.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/utils/user.py",
+      "sha256": "00fb245dc85bdcfda38f0d790597ec56581d1782fdc23fc72646237e6680cb27",
+      "bytes": 1664
+    },
+    {
+      "path": "backend/tests/utils/utils.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/utils/utils.py",
+      "sha256": "ec4de331ed328dda26e329024c1f598996845fb5d9f662413a99a5b39a7e7f70",
+      "bytes": 717
+    },
+    {
+      "path": "backend/tests/crud/test_user.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/crud/test_user.py",
+      "sha256": "e0c648b540d19f28e9f6a94fc025357698866361bdd29aa849e20d72e1f9e3bc",
+      "bytes": 4765
+    },
+    {
+      "path": "backend/tests/api/routes/test_items.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/api/routes/test_items.py",
+      "sha256": "be711def80eb52caeb1f2b0d9a933e294ea4f2f798ae2dc8924fb41fdda5528a",
+      "bytes": 5165
+    },
+    {
+      "path": "backend/tests/api/routes/test_login.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/api/routes/test_login.py",
+      "sha256": "8f34b92a572406ce10a8cf8595736ee8aea5c84268be123a4a84498074228b8c",
+      "bytes": 6140
+    },
+    {
+      "path": "backend/tests/api/routes/test_private.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/api/routes/test_private.py",
+      "sha256": "50b1d6d285a86c878b2501f8af68ce862dfb16dfccb7a4ab25b6c04143e40aa9",
+      "bytes": 659
+    },
+    {
+      "path": "backend/tests/api/routes/test_users.py",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/backend/tests/api/routes/test_users.py",
+      "sha256": "20676b10b47c74505cca440ec00fd21d5d4b376f46190de2ec7c8194f579f1e8",
+      "bytes": 16867
+    }
+  ],
+  "hash_only_files": [
+    {
+      "path": ".env",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/.env",
+      "sha256": "4d23d87d64b8b2537539b374a1b88db3fc494da4c22bac793e991277f8f2d982",
+      "bytes": 443
+    },
+    {
+      "path": ".python-version",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/.python-version",
+      "sha256": "a876e0b10411037a012498b9fe18d9bc1df32ed8b722a13564dc944ddcfd9135",
+      "bytes": 5
+    },
+    {
+      "path": "pyproject.toml",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/pyproject.toml",
+      "sha256": "3380781f555000449b89eb82b477cd86d91027d6f20ee2a4e2cc42af843160d2",
+      "bytes": 656
+    },
+    {
+      "path": "uv.lock",
+      "url": "https://raw.githubusercontent.com/fastapi/full-stack-fastapi-template/cb740b656d7a0a6c5e12c7bf8e50343ec94ee9c7/uv.lock",
+      "sha256": "0b70f5b6fcbc69ddaace35bd66078bd92c4a381a6cded72c01ad65938c54ef50",
+      "bytes": 255646
+    }
+  ]
+}

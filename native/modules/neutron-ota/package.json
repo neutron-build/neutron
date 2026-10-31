@@ -1,0 +1,6 @@
+{
+  "name": "@neutron-build/native-ota", "version": "0.1.0", "main": "src/NativeNeutronOTA.ts",
+  "react-native": "src/NativeNeutronOTA.ts", "license": "MIT",
+  "peerDependencies": { "react-native": "^0.76.0" },
+  "codegenConfig": { "name": "NeutronOTASpec", "type": "modules", "jsSrcsDir": "src", "android": { "javaPackageName": "org.neutron.ota" } }
+}

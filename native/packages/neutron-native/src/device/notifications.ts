@@ -383,6 +383,13 @@ export async function scheduleLocal(
   if (notifee) {
     const ntf = notifee.default ?? notifee
 
+    // Notifee's typed enum values, not magic numbers (NF-NR-11):
+    // TIMESTAMP triggers carry an explicit repeat-frequency mapping.
+    const TIMESTAMP = ntf.TriggerType?.TIMESTAMP ?? 1
+    const repeatFrequency = trigger.repeats
+      ? (ntf.RepeatFrequency?.DAILY ?? -1)  // -1 = EACH_DAY in notifee's enum
+      : undefined
+
     // Ensure default channel on Android
     const channelId = trigger.channelId ?? 'default'
     await ntf.createChannel?.({ id: channelId, name: 'Default' })
@@ -390,16 +397,16 @@ export async function scheduleLocal(
     let ntfTrigger: any = undefined // eslint-disable-line @typescript-eslint/no-explicit-any
     if (trigger.seconds) {
       ntfTrigger = {
-        type: 1, // TriggerType.TIMESTAMP
+        type: TIMESTAMP,
         timestamp: Date.now() + trigger.seconds * 1000,
-        repeatFrequency: trigger.repeats ? -1 : undefined,
+        repeatFrequency,
       }
     } else if (trigger.date) {
       const ts = trigger.date instanceof Date ? trigger.date.getTime() : new Date(trigger.date).getTime()
       ntfTrigger = {
-        type: 1,
+        type: TIMESTAMP,
         timestamp: ts,
-        repeatFrequency: trigger.repeats ? -1 : undefined,
+        repeatFrequency,
       }
     }
 

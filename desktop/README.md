@@ -12,7 +12,7 @@ Light core, modular OS integrations. The core shell is Tauri 2.0 (window managem
 |-------|-----------|
 | Frontend | Preact + @preact/signals + Neutron Router |
 | Builder | Tauri 2.0 (wry → system WebView) |
-| Backend | Neutron Rust (full middleware pipeline) |
+| Backend | Synchronous typed desktop bridge handlers |
 | Database | Nucleus (embedded, in-process) |
 | Bundler | Vite |
 
@@ -32,17 +32,17 @@ Electron's figures are its commonly cited ballpark.
 
 ## How the Backend Works
 
-The frontend makes standard `fetch()` calls — identical to Neutron TS web apps. A `neutron://` custom protocol intercepts them and routes through the full Neutron Rust middleware pipeline (auth, logging, rate limiting, etc.). No open TCP port. No attack surface. Zero frontend code changes when moving a route between web and desktop.
+The frontend makes standard `fetch()` calls — identical to Neutron TS web apps. A `neutron://` custom protocol dispatches typed desktop bridge handlers. Applications supply authorization and middleware in those handlers. Production uses no development TCP listener; WebView content and IPC permissions still require an application security policy.
 
 ```
 fetch("neutron://localhost/api/users")
     → Tauri custom protocol handler
-    → Neutron Rust Router (full middleware pipeline)
+    → Desktop bridge router
     → Handler → Nucleus query
     → Response
 ```
 
-Direct `invoke()` calls are reserved only for native OS operations (window management, file dialogs, tray) where typed bindings are auto-generated at build time.
+Direct `invoke()` calls are reserved only for native OS operations (window management, file dialogs, tray) through the hand-written TypeScript adapters in this package.
 
 ## Component Sharing with Neutron TS
 
@@ -77,21 +77,16 @@ SQL migrations are embedded at compile time and run at startup.
 ```rust
 // src-tauri/src/lib.rs
 use neutron_desktop::NeutronDesktopBuilder;
-use neutron::Router;
+use neutron_desktop::Response;
 
 pub fn run() {
-    let router = Router::new()
-        .get("/api/users", handlers::list_users)
-        .post("/api/users", handlers::create_user);
-
     NeutronDesktopBuilder::new()
-        .router(router)
+        .get("/api/users", |_request| Response::json(&vec!["example"]))
         .nucleus_embedded()
         .plugin(neutron_desktop_fs::init())
         .plugin(neutron_desktop_tray::init())
-        .plugin(neutron_desktop_updater::init("https://releases.example.com/latest.json"))
         .window(|w| w.title("My App").size(1200, 800))
-        .run()
+        .run(tauri::generate_context!())
         .expect("failed to run");
 }
 ```
@@ -113,11 +108,11 @@ Core is minimal. OS integrations are opt-in (12 plugin crates; one shared TypeSc
 | `neutron-desktop-autostart` | Launch at OS startup |
 | `neutron-desktop-window-state` | Persist window size/position |
 | `neutron-desktop-deeplink` | Custom URI scheme deep links |
-| `neutron-desktop-biometrics` | TouchID / Windows Hello |
+| `neutron-desktop-biometrics` | macOS Touch ID; other platforms unsupported |
 
 ## Auto-Update
 
-Built-in signature verification (cannot be disabled — correct default). Non-blocking UI by default. Rollback if app crashes on first launch after update.
+Initialize with `init_secure(endpoint, trusted_minisign_key, channel)` in Rust. Metadata and payload signatures are mandatory. Verified stages and signed metadata persist across restart. An interrupted installer is not automatically retried: the next process must reauthenticate the selection and explicitly retry through Tauri. Desktop automatic crash rollback is not implemented.
 
 ## Distribution
 
@@ -157,9 +152,9 @@ desktop/
 - **`neutron://` protocol, not `localhost`** — no open TCP port, no firewall alerts, no port conflicts
 - **Nucleus in-process** — zero IPC overhead, `Arc<Mutex<Client>>` handles concurrent access
 - **Signals over `useState`** — desktop apps run for hours; signals don't leak across navigations
-- **File-based routes identical to Neutron TS** — move route files between web and desktop with zero changes
-- **No CSP relaxation** — strict by default; `neutron://` and `tauri://` explicitly allowed
-- **Auto-generated native bindings** — no magic strings in `invoke()` calls
+- **Explicit desktop handlers** — register typed bridge routes in the Rust builder
+- **Application CSP ownership** — the starter currently has `csp: null`; provision and verify a policy for the shipped WebView content
+- **Explicit native adapters** — TypeScript wrappers call the Tauri plugin commands
 
 ## Status
 
@@ -167,3 +162,31 @@ Implemented and tested in-tree: `desktop.yml` runs `cargo test --workspace`
 (including an embedded-Nucleus lifecycle test) and the TypeScript package's
 tests; `desktop-release.yml` owns the signed release path. Platform surface
 still evolving — see the note on size targets above.
+
+Desktop storage defaults come from Tauri's configured application identifier.
+Legacy shared directories are not adopted automatically. Stop the legacy app
+and explicitly call `migrate_legacy_storage(source, destination)` to copy a
+selected store to an unused destination; it preserves the source and a backup,
+refuses links and conflicts, and requires the caller to keep both stores offline
+throughout migration. This helper can migrate either the old Nucleus directory
+or the old window-state directory.
+
+The updater requires a Rust-provisioned trusted key and HTTPS endpoint through
+`init_secure`. Its dynamic response must include signed `channel`, `size`,
+`sha256` and `metadataSignature` fields. The metadata signature authenticates
+fixed-order JSON fields `version`, `channel`, `download_url`, `signature`,
+`sha256`, `size`; payload signatures use Tauri's Minisign encoding. Downloads
+are bounded, verified and staged in app-local storage; installation delegates
+to Tauri's supported installer. Legacy `init` and IPC trust mutation fail closed.
+Private stage files and signed selection records survive restart. Call
+`recover_update` to reacquire the same release through Tauri and reverify its
+stage; offline recovery cannot reconstruct a Tauri installer handle and rejects.
+An `installing` record never auto-retries: only a new explicit install request
+can do so after recovery. Automatic desktop crash rollback is not implemented.
+Owner-only durable staging currently supports Unix; other storage backends
+reject until their ACL and directory-sync implementation is provided.
+
+File selection delegates to Tauri's native dialog plugin. Notification delivery
+uses the OS backend; scheduling has cancellable IDs, while permission queries
+return an explicit unsupported error because this backend has no permission API.
+Animated native platform behavior and signed installer execution need OS tests.

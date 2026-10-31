@@ -27,6 +27,7 @@ function jobClaimResult(row: Partial<Record<string, unknown>>): ResultFn {
         },
       ];
     }
+    if (query.startsWith("UPDATE neutron_jobs") && query.includes("RETURNING id") && !query.includes("FOR UPDATE SKIP LOCKED")) return [{ id: row.id }];
     return [];
   };
 }
@@ -154,7 +155,7 @@ test("a failed attempt within budget returns the job to pending with a future ru
   await new Promise((resolve) => setTimeout(resolve, 30));
   await driver.close();
 
-  const retry = sql.matching("SET status = 'pending', locked_at = NULL, locked_by = NULL,\n             last_error");
+  const retry = sql.matching("last_error = $2, run_at = $3");
   assert.equal(retry.length, 1);
   assert.equal(retry[0].params?.[1], "transient");
   const runAt = retry[0].params?.[2] as Date;
@@ -313,3 +314,67 @@ test("schedule honors the opts.queue override and unschedule targets the same qu
   assert.deepEqual(del[0].params, ["other-queue", "elsewhere"]);
   await driver.close();
 });
+
+test("TSD-03: heartbeat transport uncertainty aborts handler and prevents acknowledgement", { timeout: 2000 }, async () => {
+  const sql = new MockSql();
+  const losses: unknown[] = [];
+  sql.results = ({ query }) => {
+    if (query.includes("SET locked_at = now()")) throw new Error("partition");
+    return [];
+  };
+  const driver = makeDriver(sql, { leaseMs: 150, onLeaseLost: (_id: string, error: unknown) => losses.push(error) });
+  let signal: AbortSignal | undefined;
+  (driver as any).handlers.set("task", async (job: { signal: AbortSignal }) => {
+    signal = job.signal;
+    await new Promise<void>((resolve) => job.signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  await (driver as any).runClaimed({ id: "11111111-1111-1111-1111-111111111111", name: "task", attempts: 7, max_attempts: 8, created_at: new Date() });
+  assert.equal(signal?.aborted, true);
+  assert.equal(losses.length, 1);
+  assert.equal(sql.matching("SET status = 'done'").length, 0);
+  assert.equal(sql.matching("last_error").length, 0);
+  const heartbeat = sql.matching("SET locked_at = now()")[0];
+  assert.match(heartbeat.query, /attempts = \$3.*status = 'active'/);
+  assert.equal(heartbeat.params?.[2], 7);
+  await driver.close();
+});
+
+for (const disposition of ["done", "retry", "dead"] as const) {
+  for (const timing of ["before", "after", "newer"] as const) {
+    test(`TSD-03: ${disposition} acknowledgement ${timing} uncertainty aborts once without replay`, async () => {
+      const sql = new MockSql();
+      const failure = new Error("acknowledgement response lost");
+      const losses: unknown[] = [];
+      let state = timing === "newer" ? "active:newer" : "active:7";
+      let sends = 0;
+      sql.results = ({ query, params }) => {
+        sends++;
+        assert.match(query, /status = 'active' RETURNING id/);
+        assert.match(query, /locked_by = \$[234]/);
+        assert.match(query, /attempts = \$[345]/);
+        assert.equal(params?.at(-1), 7);
+        if (timing === "after") state = disposition === "retry" ? "pending" : disposition;
+        throw failure;
+      };
+      const driver = makeDriver(sql, { onLeaseLost: (_id: string, error: unknown) => losses.push(error) });
+      let signal: AbortSignal | undefined;
+      (driver as any).handlers.set("task", (job: { signal: AbortSignal }) => {
+        signal = job.signal;
+        if (disposition !== "done") throw new Error("handler failed");
+      });
+      await assert.rejects(() => (driver as any).runClaimed({ id: "11111111-1111-1111-1111-111111111111", name: "task", attempts: 7,
+        max_attempts: disposition === "dead" ? 7 : 8, created_at: new Date() }), error => error === failure);
+      assert.equal(signal?.aborted, true);
+      assert.equal(signal?.reason, failure);
+      assert.deepEqual(losses, [failure]);
+      assert.equal(driver.workerError, failure);
+      assert.equal(sends, 1);
+      assert.equal(state, timing === "after" ? (disposition === "retry" ? "pending" : disposition) : (timing === "newer" ? "active:newer" : "active:7"));
+      let ends = 0;
+      sql.end = async () => { ends++; };
+      await assert.rejects(() => driver.close(), error => error === failure);
+      assert.equal(ends, 1);
+      assert.equal(sends, 1);
+    });
+  }
+}

@@ -38,7 +38,7 @@ test("I02: default logger prints one JSON line per event, without params", () =>
   const end = JSON.parse(lines[1].slice("[neutron-sql] ".length)) as Record<string, unknown>;
   assert.equal(end.kind, "query-end");
   assert.equal(typeof end.durationMs, "number");
-  assert.equal(end.sql, "select $1");
+  assert.equal(end.sql, undefined);
 });
 
 test("I02: params appear only under the explicit NEUTRON_SQL_LOG_PARAMS opt-in", () => {
@@ -67,11 +67,11 @@ test("I02: params appear only under the explicit NEUTRON_SQL_LOG_PARAMS opt-in",
   }
 });
 
-test("I02: false/undefined loggers resolve to null; custom functions pass through", () => {
+test("I02: false/undefined loggers resolve to null; custom sinks receive redacted events", () => {
   assert.equal(resolveLogger(undefined), null);
   assert.equal(resolveLogger(false), null);
   const custom = (event: SqlEvent): void => void event;
-  assert.equal(resolveLogger(custom), custom);
+  assert.equal(typeof resolveLogger(custom), "function");
 });
 
 test("I02: statementIdOf is deterministic, 16 hex chars, distinct per SQL", () => {
@@ -81,15 +81,46 @@ test("I02: statementIdOf is deterministic, 16 hex chars, distinct per SQL", () =
   assert.notEqual(a, statementIdOf("select 2"));
 });
 
-test("I02: errorSummary carries name/message/sqlstate without the Error object", () => {
+test("I02: errorSummary carries classification and SQLSTATE without native values", () => {
   const err = new Error("boom") as Error & { code: string };
   err.code = "23505";
   const summary = errorSummary(err);
-  assert.deepEqual(summary, { name: "Error", message: "boom", sqlstate: "23505" });
+  assert.deepEqual(summary, { name: "Error", message: "SQL request failed (23505)", sqlstate: "23505" });
   const plain = errorSummary(new Error("no code"));
   assert.equal(plain.sqlstate, undefined);
   assert.equal(plain.name, "Error");
   const notError = errorSummary("string failure");
   assert.equal(notError.name, "string");
-  assert.equal(notError.message, "string failure");
+  assert.equal(notError.message, "SQL request failed");
+});
+
+
+test("redacted sinks omit literal secrets and native duplicate-key values", () => {
+  const previous = process.env.NEUTRON_SQL_LOG_PARAMS;
+  delete process.env.NEUTRON_SQL_LOG_PARAMS;
+  try {
+    const events: SqlEvent[] = [];
+    const sink = resolveLogger(event => events.push(event))!;
+    const secret = "postgresql://private-user:private-password@private-host/db";
+    const error = new Error(`duplicate key: ${secret}`) as Error & { code: string };
+    error.code = "23505";
+    sink({ kind: "query-error", statementId: "fixed", sql: `select '${secret}'`, params: [secret], error: errorSummary(error) });
+    assert.equal(JSON.stringify(events).includes(secret), false);
+    assert.equal(events[0].error?.sqlstate, "23505");
+    assert.doesNotThrow(() => resolveLogger(() => { throw new Error(secret); })!(events[0]));
+  } finally {
+    if (previous === undefined) delete process.env.NEUTRON_SQL_LOG_PARAMS;
+    else process.env.NEUTRON_SQL_LOG_PARAMS = previous;
+  }
+});
+
+test("async observer rejection is drained without process failure", async () => {
+  resolveLogger(async () => { throw new Error("async observer unavailable"); })!({ kind: "query-end", statementId: "fixed" });
+  await new Promise<void>(resolve => setImmediate(resolve));
+});
+
+test("opaque application error accessors cannot change observation outcome", () => {
+  const error = new Error("private native detail");
+  for (const key of ["sqlstate", "code", "constructor"]) Object.defineProperty(error, key, { get() { throw new Error("private accessor detail"); } });
+  assert.deepEqual(errorSummary(error), { name: "Error", message: "SQL request failed", sqlstate: undefined });
 });

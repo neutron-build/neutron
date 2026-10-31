@@ -1,3 +1,9 @@
+import { cacheOperation, publishCacheEntry, supportsBoundedPublication, CACHE_MAX_OPERATIONS } from "./cache-publication.js";
+import { sharedResponseMaxAge } from "../core/shared-cache-policy.js";
+import { normalizePathname } from "../core/route-path.js";
+export { normalizePathname } from "../core/route-path.js";
+import { beginCacheMutation, encodeCacheInvalidationPath } from "./cache-mutation.js";
+import { captureCacheBody } from "./cache-capture.js";
 import * as fs from "node:fs";
 import { runWithRequestCache } from "./request-cache.js";
 import {
@@ -13,14 +19,14 @@ import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import type { WebSocketServer } from "ws";
 import { compress } from "hono/compress";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
 import { findServerEntryFile, loadServerEntry } from "../core/server-entry.js";
-import { isResponse, notFound, acceptsHtml, withMutableHeaders } from "../core/response.js";
+import { isResponse, notFound, acceptsHtml, mutableResponse } from "../core/response.js";
 import { createRouter } from "../core/router.js";
 import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
 import { installTransportPeer } from "./peer.js";
@@ -769,6 +775,7 @@ export async function createServer(
       requestIdHeader && requestIdHeader.length > 0 ? requestIdHeader : createRequestId();
     c.set("requestId", requestId);
     await next();
+    setMutableResponse(c);
     c.res.headers.set("x-request-id", requestId);
   });
 
@@ -818,6 +825,7 @@ export async function createServer(
       }
 
       await next();
+      setMutableResponse(c);
 
       if (corsOptions) {
         applyCorsHeaders(c.req.raw, c.res, corsOptions);
@@ -847,6 +855,7 @@ export async function createServer(
     // stored the uncompressed representation needs it just as much.
     app.use("*", async (c, next) => {
       await next();
+      setMutableResponse(c);
       const existing = c.res.headers.get("Vary");
       if (!existing) {
         c.res.headers.set("Vary", "Accept-Encoding");
@@ -865,10 +874,7 @@ export async function createServer(
   // a bare 500.
   app.use("*", async (c, next) => {
     await next();
-    const mutable = withMutableHeaders(c.res);
-    if (mutable !== c.res) {
-      c.res = mutable;
-    }
+    setMutableResponse(c);
   });
 
   // GET /health — contract shape { status, nucleus, version }. Registered before
@@ -1021,6 +1027,7 @@ export async function createServer(
   );
   app.use("/assets/*", async (c, next) => {
     await next();
+    setMutableResponse(c);
     if (
       c.res.status >= 200 &&
       c.res.status < 300 &&
@@ -1122,7 +1129,7 @@ export async function createServer(
     ): Response => {
       // Middleware, loaders, actions and resource routes may hand back an
       // immutable-header Response; route-rule headers are set right below.
-      response = withMutableHeaders(response);
+      response = mutableResponse(response);
       const normalizedRequestPath = normalizePathname(requestTrace.pathname) || "/";
       applyRouteRuleHeaders(
         response,
@@ -1395,8 +1402,9 @@ export async function createServer(
         // Advance the invalidation epoch BEFORE deleting (TS-07): an
         // in-flight cacheable GET that started before this mutation must not
         // publish its (now stale) fill afterwards.
-        await invalidateMutatedPath(effectivePathname);
+        appCacheEpoch++;
       }
+      const finishMutation = await beginCacheMutation(isMutationMethod(method), effectivePathname, [appResponseCacheStore, loaderDataCacheStore]);
 
       const appCacheMaxAge = match.route.config.cache?.maxAge ?? 0;
       // SECURITY: the app-response cache is keyed on the full representation
@@ -1410,11 +1418,12 @@ export async function createServer(
         appCacheMaxAge > 0 && !requestCarriesCredentials(c.req.raw)
           ? buildAppCacheKey(c.req.raw, effectivePathname)
           : null;
+      const requestDirectives = cacheControlDirectives(c.req.raw.headers.get("cache-control"));
       const cacheReadsPermitted =
-        appCacheKey !== null && (method === "GET" || method === "HEAD");
+        supportsBoundedPublication(appResponseCacheStore) && appCacheKey !== null && !requestDirectives.has("no-cache") && !requestDirectives.has("no-store") && (method === "GET" || method === "HEAD");
       const requestEpoch = appCacheEpoch;
-      const appGeneration = await appResponseCacheStore.getGeneration!();
-      const loaderGeneration = await loaderDataCacheStore.getGeneration!();
+      const appGeneration = cacheReadsPermitted ? await cacheOperation<string | undefined>(() => appResponseCacheStore.getGeneration!(), undefined, appResponseCacheStore) : undefined;
+      const loaderGeneration = supportsBoundedPublication(loaderDataCacheStore) ? await cacheOperation<string | undefined>(() => loaderDataCacheStore.getGeneration!(), undefined, loaderDataCacheStore) : undefined;
 
       // The shared-cache boundary is applied INSIDE the route middleware
       // chain (see renderAppRoute): a cache hit still executes every request
@@ -1422,13 +1431,14 @@ export async function createServer(
       // deliberately NO response-level single-flight sharing anymore (TS-03):
       // joining a pending Response shared its Set-Cookie headers across
       // concurrent cookieless requests, minting duplicate session cookies.
-      const responseCacheBoundary = cacheReadsPermitted
+      const responseCacheBoundary = cacheReadsPermitted && appGeneration !== undefined
         ? {
             enabled: true,
             read: async (): Promise<Response | null> => {
               const pendingStore = appPendingStores.get(appCacheKey!);
               if (pendingStore) {
-                await pendingStore;
+                await cacheOperation(() => pendingStore, undefined);
+                if (!supportsBoundedPublication(appResponseCacheStore)) return null;
               }
               const hit = await readCachedAppResponse(
                 appResponseCacheStore,
@@ -1439,7 +1449,7 @@ export async function createServer(
               return hit;
             },
             store: (response: Response) => {
-              if (method !== "GET" || !appCacheKey) {
+              if (method !== "GET" || !appCacheKey || appPendingStores.has(appCacheKey) || appPendingStores.size >= CACHE_MAX_OPERATIONS) {
                 return;
               }
               // maybeStoreAppResponse applies eligibility (status, cookies,
@@ -1452,7 +1462,7 @@ export async function createServer(
                 appCacheMaxAge,
                 c.req.raw.headers.get("cache-control"),
                 () => appCacheEpoch === requestEpoch,
-                appGeneration
+                appGeneration!
               ).catch(() => {});
               appPendingStores.set(appCacheKey, store);
               void store.then(() => {
@@ -1464,35 +1474,49 @@ export async function createServer(
           }
         : undefined;
 
-      const response = await handleAppRouteRequest(
-        c.req.raw,
-        match,
-        ssrServer,
-        clientEntryScriptSrc,
-        stylesheetsFor(match.route.id),
-        routeModuleCache,
-        loaderDataCacheStore,
-        requestTrace,
-        hooks,
-        globalMiddleware,
-        responseCacheBoundary,
-        // Loader fills share the app-cache generation fence (TS-07): the
-        // epoch is captured per request and re-checked immediately before a
-        // loader result is committed, so a GET that began before a mutation
-        // completed cannot republish the pre-mutation loader data.
-        { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration }
-      );
+      let response: Response;
+      let renderFailed = false;
+      try {
+        response = await handleAppRouteRequest(
+          c.req.raw,
+          match,
+          ssrServer,
+          clientEntryScriptSrc,
+          stylesheetsFor(match.route.id),
+          routeModuleCache,
+          loaderDataCacheStore,
+          requestTrace,
+          hooks,
+          globalMiddleware,
+          responseCacheBoundary,
+          // Loader fills share the app-cache generation fence (TS-07): the
+          // epoch is captured per request and re-checked immediately before a
+          // loader result is committed, so a GET that began before a mutation
+          // completed cannot republish the pre-mutation loader data.
+          { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration }
+        );
+      } catch (error) {
+        renderFailed = true;
+        throw error;
+      } finally {
+        if (isMutationMethod(method)) {
+          appCacheEpoch++;
+          try { await finishMutation(); } catch (error) { if (!renderFailed) throw error; }
+        }
+      }
 
       if (isMutationMethod(method)) {
-        // Advance the epoch AGAIN before completion invalidation (TS-07
-        // round 2): a GET that STARTED during the mutation captured the
-        // post-pre-invalidation epoch, and its fill must not publish after
-        // this final delete. The pre-mutation bump alone fenced only GETs
-        // that began before the mutation.
-        // GETs may have published old data after the start invalidation while
-        // the action was running. Evict those entries and fence remote fills
-        // at completion even when the action emits no invalidation header.
-        await invalidateMutatedPath(effectivePathname, response);
+        // Completion invalidation already ran in finally, including failure paths.
+        await applyMutationInvalidationFromResponse(
+          appResponseCacheStore,
+          effectivePathname,
+          response
+        );
+        await applyMutationInvalidationToLoaderDataCache(
+          loaderDataCacheStore,
+          effectivePathname,
+          response
+        );
       }
 
       return finalize(response, {
@@ -1541,10 +1565,10 @@ export async function createServer(
   // the app — the middleware cannot substitute the body, but the adapter
   // can. Content-Length stays as the early check (both in the middleware
   // and here, so the cap holds even for requests that never see it).
-  let fetchFn: (request: Request) => Response | Promise<Response> = app.fetch;
+  let fetchFn: typeof app.fetch = app.fetch;
   if (options.maxRequestBodyBytes !== undefined && options.maxRequestBodyBytes > 0) {
     const cap = options.maxRequestBodyBytes;
-    fetchFn = (request: Request): Response | Promise<Response> => {
+    fetchFn = (request, env, executionCtx) => {
       const declared = request.headers.get("content-length");
       if (declared !== null && Number(declared) > cap) {
         return new Response("Request body too large", {
@@ -1552,7 +1576,7 @@ export async function createServer(
           headers: { "Content-Type": "text/plain" },
         });
       }
-      return app.fetch(capRequestBody(request, cap));
+      return app.fetch(capRequestBody(request, cap), env, executionCtx);
     };
   }
 
@@ -1869,26 +1893,6 @@ function loadRouteModule(
 }
 
 /** Normalize a request pathname for matching/caching. Exported for tests. */
-export function normalizePathname(pathname: string): string | null {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(pathname || "/");
-  } catch {
-    return null;
-  }
-
-  // Traversal is a whole segment equal to "..", not a substring: `/a..b`
-  // and `/v1.2..3` are legal paths, `/a/../b` is not.
-  if (!decoded.startsWith("/") || decoded.split("/").includes("..")) {
-    return null;
-  }
-
-  if (decoded.length > 1 && decoded.endsWith("/")) {
-    return decoded.slice(0, -1);
-  }
-
-  return decoded;
-}
 
 // Framework paths a mount prefix must never take over. Batteries registered
 // before the mounts would keep answering anyway (Hono resolves in registration
@@ -2153,7 +2157,36 @@ function buildAppCacheKey(request: Request, pathname: string): string {
     acceptLanguage,
     dataHeader,
     routesHeader,
+    request.headers.get("accept") ?? "",
   ].join("\n");
+}
+
+/**
+ * The Vary fields that mirror the app-cache key dimensions — the same set
+ * maybeStoreAppResponse admits (keyableVary). A stored entry advertises shared
+ * freshness (the synthesized `Cache-Control: public, max-age=N`), so it must
+ * also declare every dimension the entry is keyed on, or a shared cache that
+ * trusts the advertisement can reuse one variant's body for another's
+ * request. Entries whose producer did not go through the render layer's
+ * declaration (e.g. resource-route Responses) rely on this.
+ */
+const KEYABLE_VARY_FIELDS = ["Accept", "Accept-Language", "X-Neutron-Data", "X-Neutron-Routes"];
+
+function appendKeyableVaryFields(headers: Headers): void {
+  const tokens = (headers.get("Vary") ?? "")
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const present = new Set(tokens.map((token) => token.toLowerCase()));
+  if (present.has("*")) {
+    return;
+  }
+  for (const field of KEYABLE_VARY_FIELDS) {
+    if (!present.has(field.toLowerCase())) {
+      tokens.push(field);
+    }
+  }
+  headers.set("Vary", tokens.join(", "));
 }
 
 /**
@@ -2165,18 +2198,6 @@ function requestCarriesCredentials(request: Request): boolean {
   return request.headers.has("Authorization") || request.headers.has("Cookie");
 }
 
-
-
-
-
-
-/** Stores accept URL-encoded paths and decode exactly once. The router and
- * explicit invalidation parsing already produced decoded canonical paths;
- * re-encode their segments to preserve literal percent and reserved characters.
- */
-function encodeCacheInvalidationPath(pathname: string): string {
-  return pathname.split('/').map(segment => encodeURIComponent(segment)).join('/');
-}
 
 async function applyMutationInvalidationFromResponse(
   cache: NeutronAppCacheStore,
@@ -2258,7 +2279,7 @@ async function readCachedAppResponse(
   request: Request,
   method: string
 ): Promise<Response | null> {
-  const entry = await cache.get(key);
+  const entry = await cacheOperation(() => cache.get(key), null, cache);
   if (!entry) {
     return null;
   }
@@ -2307,13 +2328,15 @@ function cacheControlDirectives(value: string | null): Map<string, string> {
       .filter(Boolean)
       .map((part) => {
         const [name, ...rest] = part.split("=");
-        return [name.toLowerCase(), rest.join("=").replace(/^"|"$/g, "")];
+        return [name.trim().toLowerCase(), rest.join("=").replace(/^"|"$/g, "")];
       })
   );
 }
 
 /** Per-entry byte budget for a cached response body (TS-06). */
 const APP_CACHE_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const APP_CACHE_MAX_CAPTURES = 8;
+let activeCacheCaptures = 0;
 
 async function maybeStoreAppResponse(
   cache: NeutronAppCacheStore,
@@ -2324,66 +2347,9 @@ async function maybeStoreAppResponse(
   stillValid: () => boolean,
   generation: string
 ): Promise<void> {
-  if (maxAgeSec <= 0 || response.status !== 200) {
-    return;
-  }
-
-  if (response.headers.has("Set-Cookie")) {
-    return;
-  }
-
-  // Full Cache-Control policy, parsed case-insensitively (TS-05): the old
-  // substring test missed `NO-STORE`, `no-cache`, and request-side
-  // directives entirely.
-  const requestDirectives = cacheControlDirectives(requestCacheControl);
-  const responseDirectives = cacheControlDirectives(
-    response.headers.get("Cache-Control")
-  );
-  if (
-    requestDirectives.has("no-store") ||
-    requestDirectives.has("no-cache") ||
-    responseDirectives.has("private") ||
-    responseDirectives.has("no-store") ||
-    responseDirectives.has("no-cache")
-  ) {
-    return;
-  }
-
-  // A response that reflects a per-request Origin (CORS) must not be shared —
-  // storing it would replay one origin's Access-Control-Allow-Origin to
-  // another. (The Accept-based JSON/HTML split is already part of the cache
-  // key, and Cookie/Authorization requests are excluded before we get here.)
-  if (response.headers.has("Access-Control-Allow-Origin")) {
-    return;
-  }
-
-  // Vary: the stored entry is keyed on a fixed representation set (variant +
-  // origin + accept-language + neutron data headers). Any other Vary field —
-  // or `Vary: *` — means this response cannot be safely reused for that key.
-  const varyFields = (response.headers.get("Vary") ?? "")
-    .split(",")
-    .map((field) => field.trim().toLowerCase())
-    .filter(Boolean);
-  const keyableVary = new Set(["accept", "accept-language", "x-neutron-data", "x-neutron-routes"]);
-  if (varyFields.some((field) => field === "*" || !keyableVary.has(field))) {
-    return;
-  }
-
-  // Cap the stored freshness by the response's own explicit lifetime, when
-  // it declares one (TS-05).
-  let effectiveMaxAge = maxAgeSec;
-  const declared =
-    responseDirectives.get("s-maxage") ?? responseDirectives.get("max-age");
-  if (declared !== undefined) {
-    if (!/^\d+$/.test(declared)) {
-      return;
-    }
-    const declaredSec = Number(declared);
-    if (!Number.isSafeInteger(declaredSec) || declaredSec <= 0) {
-      return;
-    }
-    effectiveMaxAge = Math.min(effectiveMaxAge, declaredSec);
-  }
+  if (!supportsBoundedPublication(cache)) return;
+  const effectiveMaxAge = sharedResponseMaxAge(requestCacheControl, response, maxAgeSec);
+  if (effectiveMaxAge === null) return;
 
   // Byte-exact body capture (TS-06): arrayBuffer() copies the response's
   // octets verbatim — no text transcoding — and the byte budget bounds a
@@ -2393,10 +2359,12 @@ async function maybeStoreAppResponse(
   if (Number.isFinite(declaredLength) && declaredLength > APP_CACHE_MAX_BODY_BYTES) {
     return;
   }
-  const body = new Uint8Array(await response.clone().arrayBuffer());
-  if (body.byteLength > APP_CACHE_MAX_BODY_BYTES) {
-    return;
-  }
+  if (activeCacheCaptures >= APP_CACHE_MAX_CAPTURES) return;
+  activeCacheCaptures++;
+  let body: Uint8Array | null;
+  try { body = await captureCacheBody(response, APP_CACHE_MAX_BODY_BYTES, 2000); }
+  finally { activeCacheCaptures--; }
+  if (!body) return;
 
   // Generation fence (TS-07): checked immediately before the (synchronous
   // for the memory store) insertion. A mutation that invalidated this path
@@ -2409,6 +2377,11 @@ async function maybeStoreAppResponse(
   if (!headers.has("Cache-Control")) {
     headers.set("Cache-Control", `public, max-age=${effectiveMaxAge}`);
   }
+  // The stored entry advertises shared freshness; it must also declare the
+  // dimensions the entry is keyed on, or a shared cache can reuse one
+  // variant's body for another's request (reload painting the raw JSON
+  // payload). No-op for responses that already declared the full set.
+  appendKeyableVaryFields(headers);
   if (!headers.has("ETag")) {
     headers.set("ETag", createEntityTag(body));
   }
@@ -2419,7 +2392,7 @@ async function maybeStoreAppResponse(
     headerPairs.push([name, value]);
   });
 
-  await cache.setIfGeneration!(key, {
+  await publishCacheEntry(cache, key, {
     status: response.status,
     statusText: response.statusText,
     headers: headerPairs,
@@ -2466,21 +2439,14 @@ function createRootPublicAssetFilter(distDir: string): (pathname: string) => boo
 const PUBLIC_FILES_METADATA = ".neutron-public-files.json";
 
 function tryReadStaticHtml(distDir: string, pathname: string): string | null {
-  if (pathname === "/") {
-    const rootHtml = path.join(distDir, "index.html");
-    if (fs.existsSync(rootHtml)) {
-      return fs.readFileSync(rootHtml, "utf-8");
-    }
-    return null;
-  }
-
-  const relativePath = pathname.startsWith("/") ? pathname.slice(1) : pathname;
-  const indexHtml = path.join(distDir, relativePath, "index.html");
-  if (fs.existsSync(indexHtml)) {
-    return fs.readFileSync(indexHtml, "utf-8");
-  }
-
-  return null;
+  if (!normalizePathname(pathname)) return null;
+  const candidate = path.join(distDir, pathname.slice(1), "index.html");
+  try {
+    const root = fs.realpathSync(distDir);
+    const resolved = fs.realpathSync(candidate);
+    if (!resolved.startsWith(root + path.sep) || !fs.statSync(resolved).isFile()) return null;
+    return fs.readFileSync(resolved, "utf-8");
+  } catch { return null; }
 }
 
 /**
@@ -2850,4 +2816,11 @@ export async function startServer(
   // Return the handle so realtime callers can attach `wss.on("connection", ...)` while
   // still getting startServer's signal-driven graceful shutdown.
   return running;
+}
+
+// Hono's `res` setter copies the response and every header, so reassign only
+// when mutableResponse() actually had to replace an immutable response.
+function setMutableResponse(c: Context): void {
+  const response = mutableResponse(c.res);
+  if (response !== c.res) c.res = response;
 }

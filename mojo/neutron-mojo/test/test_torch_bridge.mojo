@@ -13,7 +13,7 @@ from neutron_mojo.autograd.ops import tracked_add, tracked_sum
 from neutron_mojo.python.bridge import torch_available, numpy_available
 
 
-def _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
+def _make_var(mut tape: Tape, vals: List[Float32]) raises -> Int:
     var dims = List[Int]()
     dims.append(len(vals))
     var idx = tape.add_variable(dims^, requires_grad=True)
@@ -22,7 +22,7 @@ def _make_var(mut tape: Tape, vals: List[Float32]) -> Int:
     return idx
 
 
-def _make_2d_var(mut tape: Tape, rows: Int, cols: Int, vals: List[Float32]) -> Int:
+def _make_2d_var(mut tape: Tape, rows: Int, cols: Int, vals: List[Float32]) raises -> Int:
     var dims = List[Int]()
     dims.append(rows)
     dims.append(cols)

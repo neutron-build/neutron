@@ -297,3 +297,46 @@ test("BullMqQueueDriver.schedule twice replaces the remembered pattern", async (
     key: "ticker",
   });
 });
+
+test("TSD-04: unknown job is delayed without successful acknowledgement, then handled after registration", async () => {
+  class DelayedError extends Error {}
+  const driver = new BullMqQueueDriver(new MockBullMqQueue(), MockBullMqWorker as any, {}, "mixed", new MockRedisConnection(), DelayedError);
+  await driver.process("email", () => {});
+  let delayed = 0;
+  const unknown = {
+    name: "video", data: { id: 1 },
+    moveToDelayed: async (when: number) => { assert.ok(when > Date.now()); delayed++; },
+  };
+  await assert.rejects(() => capturedProcessor!(unknown), DelayedError);
+  assert.equal(delayed, 1);
+  let handled = false;
+  await driver.process("video", () => { handled = true; });
+  await capturedProcessor!(unknown);
+  assert.equal(handled, true);
+  await driver.close();
+});
+
+test("TSD-04: custom worker without native delay fails observably for unknown names", async () => {
+  const driver = new BullMqQueueDriver(new MockBullMqQueue(), MockBullMqWorker as any, {}, "mixed", new MockRedisConnection());
+  await driver.process("email", () => {});
+  await assert.rejects(() => capturedProcessor!({ name: "video", data: null }), /no handler registered/);
+  await driver.close();
+});
+
+test("BullMQ close preserves worker-before-connection order and drains every failed owner", async () => {
+  const calls: string[] = [];
+  const errors = [new Error("worker close"), new Error("queue close"), new Error("connection quit")];
+  class Worker extends MockBullMqWorker {
+    async close(): Promise<void> { calls.push("worker"); throw errors[0]; }
+  }
+  const queue = new MockBullMqQueue();
+  queue.close = async () => { calls.push("queue"); throw errors[1]; };
+  const connection = new MockRedisConnection();
+  connection.quit = async () => { calls.push("connection"); throw errors[2]; };
+  const driver = new BullMqQueueDriver(queue, Worker, {}, "test", connection);
+  await driver.process("task", () => {});
+  await assert.rejects(() => driver.close(), (error: any) => { assert.deepEqual(error.errors, errors); return true; });
+  await assert.rejects(() => driver.close());
+  assert.deepEqual(calls, ["worker", "queue", "connection"]);
+  await assert.rejects(() => driver.process("task", () => {}), /closed/);
+});

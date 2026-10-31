@@ -1,0 +1,265 @@
+// Shared by the unchanged-original and the converted native harnesses. It uses
+// only the standard library, so both sides execute one scenario definition and
+// write transcripts in one format. It contains no application behavior.
+package __PACKAGE__
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+const (
+	corpusScenarioFile  = "neutron_corpus_scenario.json"
+	corpusTranscriptEnv = "NEUTRON_GO_APP_TRANSCRIPT_DIR"
+
+	corpusMessageNotVisible   = "查看对象不存在或无权查看"
+	corpusMessageRemoveDenied = "无权删除该数据"
+	corpusMessageDuplicate    = "用户名已存在！"
+	corpusMessageUpdateFailed = "update userinfo error"
+)
+
+type corpusSeedTable struct {
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+	Rows    [][]any  `json:"rows"`
+}
+
+type corpusPermission struct {
+	Scope  string `json:"scope"`
+	UserID int    `json:"userId"`
+	DeptID int    `json:"deptId"`
+	RoleID int    `json:"roleId"`
+}
+
+type corpusSearch struct {
+	UserID         int    `json:"userId"`
+	Username       string `json:"username"`
+	NickName       string `json:"nickName"`
+	Phone          string `json:"phone"`
+	RoleID         string `json:"roleId"`
+	Sex            string `json:"sex"`
+	Email          string `json:"email"`
+	PostID         string `json:"postId"`
+	Status         string `json:"status"`
+	DeptID         string `json:"deptId"`
+	UserIDOrder    string `json:"userIdOrder"`
+	UsernameOrder  string `json:"usernameOrder"`
+	StatusOrder    string `json:"statusOrder"`
+	CreatedAtOrder string `json:"createdAtOrder"`
+	PageIndex      int    `json:"pageIndex"`
+	PageSize       int    `json:"pageSize"`
+}
+
+type corpusQuery struct {
+	Name                 string           `json:"name"`
+	EnableDataPermission bool             `json:"enableDataPermission"`
+	Permission           corpusPermission `json:"permission"`
+	Search               corpusSearch     `json:"search"`
+}
+
+type corpusUserRequest struct {
+	UserID   int    `json:"userId"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	NickName string `json:"nickName"`
+	Phone    string `json:"phone"`
+	RoleID   int    `json:"roleId"`
+	Avatar   string `json:"avatar"`
+	Sex      string `json:"sex"`
+	Email    string `json:"email"`
+	DeptID   int    `json:"deptId"`
+	PostID   int    `json:"postId"`
+	Remark   string `json:"remark"`
+	Status   string `json:"status"`
+	CreateBy int    `json:"createBy"`
+}
+
+type corpusOperation struct {
+	Name       string            `json:"name"`
+	Kind       string            `json:"kind"`
+	Permission corpusPermission  `json:"permission"`
+	UserID     int               `json:"userId"`
+	CallerID   int               `json:"callerId"`
+	Request    corpusUserRequest `json:"request"`
+	SQL        string            `json:"sql"`
+}
+
+type corpusScenario struct {
+	Version    int               `json:"version"`
+	AfterSeed  []string          `json:"afterSeed"`
+	Seed       []corpusSeedTable `json:"seed"`
+	Queries    []corpusQuery     `json:"queries"`
+	Operations []corpusOperation `json:"operations"`
+}
+
+type corpusObservation struct {
+	Name    string `json:"name"`
+	Count   int64  `json:"count"`
+	IDs     []int  `json:"ids"`
+	DeptIDs []int  `json:"deptIds"`
+}
+
+type corpusOperationResult struct {
+	Name     string         `json:"name"`
+	Error    string         `json:"error"`
+	UserID   int            `json:"userId"`
+	Snapshot map[string]any `json:"snapshot"`
+	Extra    map[string]any `json:"extra"`
+}
+
+type corpusStatement struct {
+	SQL  string
+	Args []any
+}
+
+var corpusIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+func loadCorpusScenario(t *testing.T) corpusScenario {
+	t.Helper()
+	raw, err := os.ReadFile(corpusScenarioFile)
+	if err != nil {
+		t.Fatal("shared corpus scenario is missing from the test directory")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	decoder.DisallowUnknownFields()
+	var scenario corpusScenario
+	if err := decoder.Decode(&scenario); err != nil {
+		t.Fatalf("shared corpus scenario is invalid: %v", err)
+	}
+	if scenario.Version != 1 {
+		t.Fatal("unsupported shared corpus scenario version")
+	}
+	return scenario
+}
+
+// corpusSeedStatements returns identical INSERT statements for both harnesses.
+// Identifiers are validated, values are always bound parameters.
+func corpusSeedStatements(t *testing.T, scenario corpusScenario) []corpusStatement {
+	t.Helper()
+	var statements []corpusStatement
+	for _, block := range scenario.Seed {
+		if !corpusIdentifier.MatchString(block.Table) {
+			t.Fatal("invalid seed table identifier")
+		}
+		quoted := make([]string, len(block.Columns))
+		for i, column := range block.Columns {
+			if !corpusIdentifier.MatchString(column) {
+				t.Fatal("invalid seed column identifier")
+			}
+			quoted[i] = `"` + column + `"`
+		}
+		for _, row := range block.Rows {
+			if len(row) != len(block.Columns) {
+				t.Fatalf("seed row width mismatch in %s", block.Table)
+			}
+			args := make([]any, len(row))
+			marks := make([]string, len(row))
+			for i, value := range row {
+				marks[i] = fmt.Sprintf("$%d", i+1)
+				switch typed := value.(type) {
+				case nil:
+					args[i] = nil
+				case string:
+					args[i] = typed
+				case json.Number:
+					number, err := typed.Int64()
+					if err != nil {
+						t.Fatalf("seed value is not an integer in %s", block.Table)
+					}
+					args[i] = number
+				default:
+					t.Fatalf("unsupported seed value type in %s", block.Table)
+				}
+			}
+			statements = append(statements, corpusStatement{
+				SQL:  `INSERT INTO "` + block.Table + `" (` + strings.Join(quoted, ", ") + `) VALUES (` + strings.Join(marks, ", ") + `)`,
+				Args: args,
+			})
+		}
+	}
+	for _, statement := range scenario.AfterSeed {
+		statements = append(statements, corpusStatement{SQL: statement})
+	}
+	return statements
+}
+
+const corpusUserSnapshotSQL = `SELECT user_id::text, username, nick_name, phone, email, role_id::text, dept_id::text, post_id::text, remark, status, avatar, sex, create_by::text, update_by::text, (deleted_at > 0)::text FROM sys_user WHERE user_id = $1`
+
+var corpusUserSnapshotColumns = []string{"user_id", "username", "nick_name", "phone", "email", "role_id", "dept_id", "post_id", "remark", "status", "avatar", "sex", "create_by", "update_by", "deleted"}
+
+// corpusSnapshotRecord keeps SQL NULL (nil) distinct from the empty string.
+func corpusSnapshotRecord(values []*string) map[string]any {
+	record := map[string]any{}
+	for i, name := range corpusUserSnapshotColumns {
+		if values[i] == nil {
+			record[name] = nil
+		} else {
+			record[name] = *values[i]
+		}
+	}
+	return record
+}
+
+// corpusErrorClass reduces an error to a stable class without server text.
+func corpusErrorClass(err error, isNotFound func(error) bool) string {
+	if err == nil {
+		return ""
+	}
+	switch err.Error() {
+	case corpusMessageNotVisible:
+		return "not_visible"
+	case corpusMessageRemoveDenied:
+		return "remove_denied"
+	case corpusMessageDuplicate:
+		return "duplicate_username"
+	case corpusMessageUpdateFailed:
+		return "update_failed"
+	}
+	if isNotFound(err) {
+		return "record_not_found"
+	}
+	return "error"
+}
+
+type corpusTranscript struct {
+	name    string
+	entries map[string]any
+}
+
+func newCorpusTranscript(name string) *corpusTranscript {
+	return &corpusTranscript{name: name, entries: map[string]any{}}
+}
+
+func (c *corpusTranscript) record(key string, value any) {
+	if _, exists := c.entries[key]; exists {
+		panic("duplicate transcript key " + key)
+	}
+	c.entries[key] = value
+}
+
+// write stores the transcript only when the coordinator names a directory. The
+// transcript holds scenario observations only; it never holds connection data.
+func (c *corpusTranscript) write(t *testing.T) {
+	t.Helper()
+	dir := os.Getenv(corpusTranscriptEnv)
+	if dir == "" {
+		return
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", " ")
+	if err := encoder.Encode(c.entries); err != nil {
+		t.Fatal("transcript encoding failed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, c.name+".json"), buffer.Bytes(), 0o600); err != nil {
+		t.Fatal("transcript write failed")
+	}
+}

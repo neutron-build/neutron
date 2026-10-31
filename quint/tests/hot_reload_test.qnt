@@ -1,10 +1,10 @@
 // Hot reload protocol invariant tests.
 module hot_reload_test {
-    import hot_reload.*
+    import hot_reload.* from "../specs/realtime/hot_reload"
 
     // Test: initial state is valid
     run init_valid_test = {
-        init.then(all {
+        init.expect(all {
             version_monotonic, server_monotonic,
             valid_client_states, disconnected_no_pending,
         })
@@ -17,7 +17,7 @@ module hot_reload_test {
             .then(sync_full(1))
             .then(file_change)
             .then(apply_delta(1))
-            .then(all { version_monotonic, delta_ordering })
+            .expect(all { version_monotonic, delta_ordering })
     }
 
     // Test: reconnection triggers sync
@@ -31,7 +31,7 @@ module hot_reload_test {
             .then(connect(1))
             // Client is behind — should be syncing
             .then(sync_full(1))
-            .then(all { version_monotonic, valid_client_states })
+            .expect(all { version_monotonic, valid_client_states })
     }
 
     // Test: delta ordering is maintained
@@ -44,7 +44,7 @@ module hot_reload_test {
             .then(file_change)
             .then(apply_delta(1))
             .then(apply_delta(1))
-            .then(all { delta_ordering, no_version_gaps })
+            .expect(all { delta_ordering, no_version_gaps })
     }
 
     // Test: disconnected clients have no pending deltas
@@ -54,7 +54,7 @@ module hot_reload_test {
             .then(sync_full(1))
             .then(file_change)
             .then(disconnect(1))
-            .then(disconnected_no_pending)
+            .expect(disconnected_no_pending)
     }
 
     // Test: multiple clients independent
@@ -67,6 +67,6 @@ module hot_reload_test {
             .then(file_change)
             .then(apply_delta(1))
             // Client 2 still has pending delta
-            .then(all { version_monotonic, delta_ordering })
+            .expect(all { version_monotonic, delta_ordering })
     }
 }

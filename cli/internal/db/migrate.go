@@ -63,7 +63,7 @@ type ExtensionStatus struct {
 	Version   string // installed version when Installed
 	// Available reports pg_available_extensions: the server carries the
 	// extension package and "create extension" would work.
-	Available bool
+	Available      bool
 	DefaultVersion string
 }
 
@@ -100,19 +100,20 @@ func (c *Client) Extension(ctx context.Context, name string) (*ExtensionStatus, 
 }
 
 func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
-	var exists bool
-	err := c.pool.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM information_schema.tables
-		WHERE table_schema = current_schema() AND table_name = '_neutron_migrations'
-	)`).Scan(&exists)
+	conn, err := c.pool.Acquire(ctx)
 	if err != nil {
 		return false, err
 	}
-	if !exists {
+	defer conn.Release()
+	n, err := captureMigrationNamespace(ctx, conn)
+	if err != nil {
+		return false, err
+	}
+	if n.historyOID == 0 {
 		return false, nil
 	}
 	var count int
-	if err := c.pool.QueryRow(ctx, `SELECT count(*) FROM _neutron_migrations`).Scan(&count); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT pg_catalog.count(*) FROM "+n.table()).Scan(&count); err != nil {
 		return false, err
 	}
 	return count > 0, nil
@@ -123,7 +124,16 @@ func (c *Client) HasMigrationHistory(ctx context.Context) (bool, error) {
 // yields no records and creates nothing — the history table is born only
 // under a locked run (MigrationSession.EnsureMigrationTableV2) or adoption.
 func (c *Client) AppliedMigrations(ctx context.Context) ([]MigrationRecord, error) {
-	shape, err := c.InspectMigrationHistory(ctx)
+	conn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+	n, err := captureMigrationNamespace(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	shape, err := inspectMigrationShape(ctx, conn, n)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +142,7 @@ func (c *Client) AppliedMigrations(ctx context.Context) ([]MigrationRecord, erro
 	}
 	if shape == HistoryLegacyText || shape == HistoryLegacyInteger || shape == HistoryIncompatible {
 		// Read what is there without the v2 columns.
-		rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at FROM _neutron_migrations ORDER BY version")
+		rows, err := conn.Query(ctx, "SELECT version, name, applied_at FROM "+n.table()+" ORDER BY version")
 		if err != nil {
 			return nil, err
 		}
@@ -148,7 +158,7 @@ func (c *Client) AppliedMigrations(ctx context.Context) ([]MigrationRecord, erro
 		return records, rows.Err()
 	}
 
-	rows, err := c.pool.Query(ctx, "SELECT version, name, applied_at, checksum, owner, format FROM _neutron_migrations ORDER BY version")
+	rows, err := conn.Query(ctx, "SELECT version, name, applied_at, checksum, owner, format FROM "+n.table()+" ORDER BY version")
 	if err != nil {
 		return nil, err
 	}

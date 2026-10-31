@@ -68,6 +68,15 @@ impl Body {
         Body::Stream(Box::pin(body))
     }
 
+    /// Exact buffered length, or None for a stream. Allows admission without
+    /// polling or collecting a potentially unbounded body.
+    pub fn buffered_len(&self) -> Option<usize> {
+        match self {
+            Self::Full(body) => body.size_hint().exact().map(|n| n as usize),
+            Self::Stream(_) => None,
+        }
+    }
+
     /// Returns `true` if this is a streaming body.
     pub fn is_streaming(&self) -> bool {
         matches!(self, Body::Stream(_))
@@ -145,6 +154,70 @@ pub type Response = http::Response<Body>;
 pub type ReqBody =
     Pin<Box<dyn HttpBody<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>> + Send>>;
 
+/// Marker error raised by [`limit_body_stream`] when a transport body
+/// crosses its configured ceiling. Consumers (like `collect_limited`)
+/// classify it as 413 rather than a generic 400.
+#[derive(Debug)]
+pub(crate) struct BodyLimitExceeded;
+
+impl std::fmt::Display for BodyLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request body exceeds the configured size limit")
+    }
+}
+
+impl std::error::Error for BodyLimitExceeded {}
+
+/// Wrap a transport body in a byte-counting ceiling (RS-05). The server's
+/// configured `max_body_size` used to be enforced only against the
+/// Content-Length header, so a chunked (or length-less) body bypassed the
+/// global cap entirely — extractors with their own fixed ceiling enforced a
+/// DIFFERENT number, and streaming consumers had no cap at all. Every
+/// transport constructs the request body through this wrapper; a breach
+/// surfaces as a `BodyLimitExceeded` body error, which the standard
+/// extractors map to 413.
+pub(crate) fn limit_body_stream(body: ReqBody, cap: usize) -> ReqBody {
+    Box::pin(LimitedBody {
+        inner: body,
+        remaining: cap,
+    })
+}
+
+/// Byte-counting wrapper enforcing a transport-level ceiling while
+/// preserving frame/trailer pass-through.
+struct LimitedBody {
+    inner: ReqBody,
+    remaining: usize,
+}
+
+impl http_body::Body for LimitedBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if data.len() > this.remaining {
+                        let e: Box<dyn std::error::Error + Send + Sync> =
+                            Box::new(BodyLimitExceeded);
+                        return std::task::Poll::Ready(Some(Err(e)));
+                    }
+                    this.remaining -= data.len();
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// Collect a streaming request body with a hard byte ceiling enforced
 /// **during** streaming — the limit is checked per-frame as bytes arrive, so a
 /// body exceeding `limit` is rejected after `limit + 1` bytes, never buffered
@@ -153,8 +226,15 @@ async fn collect_limited(mut body: ReqBody, limit: usize) -> Result<Bytes, Respo
     use http_body_util::BodyExt;
     let mut acc = BytesMut::new();
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| {
-            AppError::bad_request("The request body could not be read.").into_response()
+        let frame = frame.map_err(|e| {
+            // A transport-level ceiling breach is a 413, not a generic 400
+            // (RS-05: preserve streaming error classification).
+            if e.is::<BodyLimitExceeded>() {
+                AppError::payload_too_large("The request body exceeds the configured limit.")
+                    .into_response()
+            } else {
+                AppError::bad_request("The request body could not be read.").into_response()
+            }
         })?;
         if let Ok(data) = frame.into_data() {
             if acc.len() + data.len() > limit {
@@ -288,6 +368,39 @@ impl Request {
         }
     }
 
+    // Preserve all owned framework context while Tower changes HTTP parts.
+    #[cfg(feature = "tower-compat")]
+    pub(crate) fn replace_http_parts(
+        &mut self,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) {
+        self.method = method;
+        self.uri = uri;
+        self.headers = headers;
+        self.buffered = body.clone();
+        *self.body_stream.get_mut().unwrap() = Some(full_frame(body));
+    }
+
+    /// An empty placeholder request. Used by the [`FromRequest for Request`]
+    /// identity extractor to swap out the live request after taking it.
+    pub(crate) fn shell() -> Self {
+        Self {
+            method: Method::GET,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            body_stream: std::sync::Mutex::new(None),
+            buffered: Bytes::new(),
+            params: SmallVec::new(),
+            state: Arc::new(HashMap::new()),
+            on_upgrade: std::sync::Mutex::new(None),
+            extensions: SmallVec::new(),
+            remote_addr: None,
+        }
+    }
+
     /// Create a request with a **streaming** body (the production dispatch path).
     /// The body is consumed lazily — nothing is buffered until an extractor calls
     /// [`collect_body`](Self::collect_body) or [`take_body`](Self::take_body).
@@ -319,7 +432,18 @@ impl Request {
         let taken = self.body_stream.get_mut().unwrap().take();
         match taken {
             Some(stream) => collect_limited(stream, limit).await,
-            None => Ok(self.buffered.clone()),
+            None => {
+                // The body was already buffered (e.g. by earlier middleware
+                // with a BROADER ceiling) — re-check against THIS limit so a
+                // stricter downstream consumer still gets its 413 (RS-05).
+                if self.buffered.len() > limit {
+                    return Err(AppError::payload_too_large(
+                        "The request body exceeds the configured limit.",
+                    )
+                    .into_response());
+                }
+                Ok(self.buffered.clone())
+            }
         }
     }
 
@@ -339,6 +463,13 @@ impl Request {
         let taken = self.body_stream.get_mut().unwrap().take();
         if let Some(stream) = taken {
             self.buffered = collect_limited(stream, limit).await?;
+        } else if self.buffered.len() > limit {
+            // RS-05: re-check materialized bytes against the stricter
+            // downstream ceiling (broad-then-strict buffering sequence).
+            return Err(AppError::payload_too_large(
+                "The request body exceeds the configured limit.",
+            )
+            .into_response());
         }
         Ok(&self.buffered)
     }

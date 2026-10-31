@@ -9,21 +9,32 @@
   "exports": {
     ".": {
       "import": "./dist/index.js",
+      "require": "./dist/cjs/index.js",
       "types": "./dist/index.d.ts"
     },
     "./babel": {
       "import": "./dist/babel-plugin.js",
-      "require": "./dist/babel-plugin.cjs",
+      "require": "./dist/cjs/babel-plugin.js",
       "types": "./dist/babel-plugin.d.ts"
     },
     "./rspack": {
       "import": "./dist/rspack-loader.js",
-      "require": "./dist/rspack-loader.cjs",
+      "require": "./dist/cjs/rspack-loader.js",
       "types": "./dist/rspack-loader.d.ts"
+    },
+    "./runtime": {
+      "import": "./dist/runtime.js",
+      "require": "./dist/cjs/runtime.js",
+      "types": "./dist/runtime.d.ts"
     }
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "build": "tsc --project tsconfig.json",
+    "build": "tsc --project tsconfig.json && tsc --project tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({type: 'commonjs'}) + '\\n')\"",
+    "verify:exports": "node scripts/verify-exports.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -31,6 +42,8 @@
   },
   "devDependencies": {
     "@babel/core": "^7.29.7",
+    "@babel/plugin-syntax-jsx": "^7.29.7",
+    "@babel/plugin-syntax-typescript": "^7.29.7",
     "@babel/types": "^7.29.8",
     "@types/babel__core": "^7.20.5",
     "@types/jest": "^29.5.14",

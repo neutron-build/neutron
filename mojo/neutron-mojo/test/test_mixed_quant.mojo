@@ -25,7 +25,7 @@ from neutron_mojo.nn.mixed_quant import (
 # Test Helpers
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny model with non-trivial weights for testing."""
     var p = tiny_test_params()
     var model = Model(p)

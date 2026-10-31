@@ -93,6 +93,15 @@ class _TransactionSQL:
             raise not_found("Record not found")
         return model.model_validate(dict(row))
 
+    async def query_one_or_none(
+        self, model: type[Any], sql: str, *args: object
+    ) -> Any | None:
+        """Query one optional row on this transaction's existing connection."""
+        row = await self._conn.fetchrow(sql, *args)
+        if row is None:
+            return None
+        return model.model_validate(dict(row))
+
     async def execute(self, sql: str, *args: object) -> int:
         result: str = await self._conn.execute(sql, *args)
         parts = result.split()

@@ -1,0 +1,70 @@
+{
+  "id": "GO-APP",
+  "repo": "go-admin-team/go-admin",
+  "commit": "386ddeae8207684d0df572a49ef180b700ddda74",
+  "license": "MIT",
+  "files": [
+    {
+      "path": "LICENSE.md",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/LICENSE.md",
+      "sha256": "e1bd2eb01e4ddae9a0634b9d529f3a572e4772c40eeac2d37e7f9b8b19e77572",
+      "bytes": 1070
+    },
+    {
+      "path": "go.mod",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/go.mod",
+      "sha256": "d99b83f8a052988eeeb2ad202d27dacaed96c896dc0c8259a719a7cfad52108e",
+      "bytes": 7113
+    },
+    {
+      "path": "go.sum",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/go.sum",
+      "sha256": "50c3881d5441694b6ef5cce8eb37d1f1d6aec90e3ac9fa4f5cd931e8d9323fee",
+      "bytes": 83164
+    },
+    {
+      "path": "app/admin/models/sys_user.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_user.go",
+      "sha256": "0ec2bd81d54d52f5f27b6dc3b8c14774fe30b3ee3c4834031d1699c9b9a25f78",
+      "bytes": 3000
+    },
+    {
+      "path": "app/admin/models/sys_user_password_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/models/sys_user_password_test.go",
+      "sha256": "750d1f292e355e2447b0cf796da47e3659cbf405825ddddd112eea536c8ca2dd",
+      "bytes": 3368
+    },
+    {
+      "path": "app/admin/service/sys_user.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/service/sys_user.go",
+      "sha256": "574d0d6029d77466825b73c82e369a33e0767e91e4ad8653a9e676b22739390b",
+      "bytes": 8373
+    },
+    {
+      "path": "app/admin/apis/sys_user.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/apis/sys_user.go",
+      "sha256": "40e0e9a8bd6d32e80fe3065495e3dd201638e4dde035fd31861175f427085263",
+      "bytes": 12409
+    },
+    {
+      "path": "app/admin/apis/sys_user_privesc_test.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/apis/sys_user_privesc_test.go",
+      "sha256": "595f13354c96c427296fbbcc7e4ebebf7baf1ee9130e3b54725a420110334570",
+      "bytes": 6557
+    },
+    {
+      "path": "app/admin/service/dto/sys_user.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/app/admin/service/dto/sys_user.go",
+      "sha256": "2c12e19a74d08d3cab35493c5260d5a24aed88be1cdc866ca68029f7205cceab",
+      "bytes": 6065
+    },
+    {
+      "path": "common/actions/permission.go",
+      "url": "https://raw.githubusercontent.com/go-admin-team/go-admin/386ddeae8207684d0df572a49ef180b700ddda74/common/actions/permission.go",
+      "sha256": "ce8da0195ba73be083e94565128feb02a03d257751a0b5d7601b1f5cfe2f8632",
+      "bytes": 1859
+    }
+  ],
+  "source_tree_sha256": "ec2d1f42de2aecdff3f9d76b27acfa1f1fecae722aa845cf8f44c4ca64c6a05e",
+  "status": "frozen-source-only; unchanged reconstruction and conversion acceptance pending"
+}

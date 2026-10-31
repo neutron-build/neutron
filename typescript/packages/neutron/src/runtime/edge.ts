@@ -1,5 +1,5 @@
 export { createRouter } from "../core/router.js";
-export { runMiddlewareChain } from "../core/middleware.js";
+export { runMiddlewareChain, normalizeMiddlewareExport } from "../core/middleware.js";
 export { renderToString } from "preact-render-to-string";
 export {
   encodeSerializedPayloadAsJson,
@@ -30,4 +30,7 @@ export { SERVER_ACTION_PATH } from "../core/server-action-protocol.js";
 export { compileMounts, dispatchMounts } from "../core/mount-dispatch.js";
 export { applySecurityHeaders, resolveSecurityHeadersConfig } from "../server/http-headers.js";
 export { applyRouteRuleHeaders } from "../core/route-rules.js";
-export { withMutableHeaders } from "../core/response.js";
+export { mutableResponse } from "../core/response.js";
+export { beginCacheMutation, encodeCacheInvalidationPath } from "../server/cache-mutation.js";
+export { installTransportPeer } from "../server/peer.js";
+export { normalizePathname } from "../core/route-path.js";

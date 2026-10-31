@@ -1,10 +1,11 @@
 /**
- * Animation worklets — Reanimated-compatible animation system with fallback.
+ * Animation helpers with optional Reanimated delegation.
  *
  * When react-native-reanimated is installed, all APIs delegate to it for
  * true worklet-based UI-thread animations. When it is not available, a
- * fallback implementation uses React Native's built-in `Animated` API with
- * `useNativeDriver: true` to still achieve hardware-accelerated animations.
+ * limited helpers use React Native's built-in `Animated` API. Animated styles
+ * require Reanimated and throw when it is absent; the helpers do not provide
+ * a complete style subscription or UI-thread worklet implementation.
  *
  * @example
  * import { useSharedValue, withTiming, useAnimatedStyle } from '@neutron-build/native/animated'
@@ -17,7 +18,7 @@
  * }
  */
 
-import { useRef, useEffect, useMemo, useState, type RefObject } from 'react'
+import { useRef, useEffect, useMemo, type RefObject } from 'react'
 import { Animated as RNAnimated } from 'react-native'
 import type {
   SharedValue, TimingConfig, SpringConfig, DecayConfig,
@@ -260,15 +261,7 @@ export function useAnimatedStyle(
     return rnr.useAnimatedStyle(worklet, deps) as NativeStyleProp
   }
 
-  // Fallback: evaluate the worklet and track changes via re-renders
-  const [style, setStyle] = useState<NativeStyleProp>(() => worklet())
-
-  // Re-evaluate when deps change
-  useEffect(() => {
-    setStyle(worklet())
-  }, deps ?? [])
-
-  return style
+  throw new Error('[neutron-native] useAnimatedStyle requires react-native-reanimated; use RN Animated.Value bindings for fallback animations')
 }
 
 // ─── withTiming ──────────────────────────────────────────────────────────────

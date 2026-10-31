@@ -177,6 +177,16 @@
             },
             "description": "Not Found"
           },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
           "422": {
             "content": {
               "application/problem+json": {

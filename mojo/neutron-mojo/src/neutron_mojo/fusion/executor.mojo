@@ -50,11 +50,7 @@ struct TensorValue(Copyable, Movable, ImplicitlyCopyable):
         self.cols = n
 
     def __init__(out self, *, copy: Self):
-        var n = copy.data.numel()
-        var t = Tensor[DType.float32](copy.data.shape())
-        for i in range(n):
-            t.set(i, copy.data.get(i))
-        self.data = t^
+        self.data = copy.data.clone()
         self.rows = copy.rows
         self.cols = copy.cols
 
@@ -68,11 +64,7 @@ struct TensorValue(Copyable, Movable, ImplicitlyCopyable):
 
     def copy(self) -> TensorValue:
         """Return a deep copy."""
-        var t = Tensor[DType.float32](self.data.shape())
-        var n = self.data.numel()
-        for i in range(n):
-            t.set(i, self.data.get(i))
-        return TensorValue(t^, self.rows, self.cols)
+        return TensorValue(self.data.clone(), self.rows, self.cols)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -83,10 +75,10 @@ def _elementwise_add(
     a: Tensor[DType.float32],
     b: Tensor[DType.float32],
     n: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     var out = Tensor[DType.float32](Shape(n))
     for i in range(n):
-        out.set(i, a.get(i) + b.get(i))
+        out.set(i, a.data_ptr()[i] + b.data_ptr()[i])
     return out^
 
 
@@ -94,10 +86,10 @@ def _elementwise_mul(
     a: Tensor[DType.float32],
     b: Tensor[DType.float32],
     n: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     var out = Tensor[DType.float32](Shape(n))
     for i in range(n):
-        out.set(i, a.get(i) * b.get(i))
+        out.set(i, a.data_ptr()[i] * b.data_ptr()[i])
     return out^
 
 
@@ -243,6 +235,8 @@ def optimize_and_execute(
     for node_idx in range(len(graph.nodes)):
         var node = graph.nodes[node_idx].copy()
         var cn = CanonicalNode(node.op)
+        if node.op == OpKind.Input or node.op == OpKind.Const:
+            cn.symbol = node_idx
         for i in range(len(node.inputs)):
             cn.inputs.append(class_ids[node.inputs[i].id()])
         var cid = egraph.add(cn^)

@@ -186,7 +186,7 @@ enum Commands {
         host: String,
     },
 
-    /// Interactive SQL shell (psql-like REPL).
+    /// SQL shell: interactive REPL or one-shot command execution.
     Shell {
         /// Host to connect to.
         #[arg(short = 'H', long, default_value = "127.0.0.1")]
@@ -202,7 +202,12 @@ enum Commands {
         #[arg(short = 'c', long)]
         command: Option<String>,
 
-        /// With -c: print SELECT results as a JSON array of objects
+        /// Read one SQL command from stdin through EOF and exit.
+        /// Requires valid UTF-8; preserves SQL bytes without adding a newline.
+        #[arg(long, conflicts_with = "command")]
+        command_stdin: bool,
+
+        /// With -c or --command-stdin: print SELECT results as a JSON array of objects
         /// (machine-readable) instead of an ASCII table.
         #[arg(long)]
         json: bool,
@@ -514,10 +519,21 @@ async fn main() {
             host,
             port,
             command,
+            command_stdin,
             json,
         }) => {
-            if let Some(sql) = command {
-                cmd_shell_exec(&host, port, &sql, json).await;
+            if command_stdin {
+                let sql = match read_shell_command(std::io::stdin().lock()) {
+                    Ok(sql) => sql,
+                    Err(message) => {
+                        eprintln!("{message}");
+                        std::process::exit(1);
+                    }
+                };
+                cmd_shell_exec(&host, port, &sql, json, true).await;
+            } else if let Some(sql) = command {
+                let sql = sql.trim().trim_end_matches(';');
+                cmd_shell_exec(&host, port, sql, json, false).await;
             } else {
                 cmd_shell(&host, port).await;
             }
@@ -1469,6 +1485,10 @@ async fn cmd_start(cfg: StartConfig) {
         config.limits.max_prepared_statements_per_session,
         config.limits.max_cursors_per_session,
     );
+    executor.set_cursor_budgets(
+        config.limits.max_cursor_rows,
+        config.limits.max_cursor_bytes,
+    );
     let wire_limits = nucleus::wire::WireLimits {
         max_prepared_statements_per_session: config.limits.max_prepared_statements_per_session,
         max_portals_per_session: config.limits.max_portals_per_session,
@@ -2365,19 +2385,57 @@ async fn cmd_start(cfg: StartConfig) {
 
     // Spawn RESP2 (Redis protocol) server
     if resp_port > 0 {
-        let resp_addr = format!("{host}:{resp_port}");
-        let kv = std::sync::Arc::clone(executor.kv_store());
-        let resp_pw = resolved_password_for_resp.clone();
-        let resp_shutdown = shutdown_notify.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                nucleus::resp::server::start_resp_server(resp_addr, kv, resp_pw, resp_shutdown)
-                    .await
-            {
-                tracing::error!("RESP server error: {e}");
+        // NE-10: this listener used to ALWAYS start — plaintext, on a
+        // well-known port, sharing the SQL bootstrap password. Deploying SQL
+        // with TLS + SCRAM therefore still exposed that credential to anyone
+        // on the network who issued AUTH. Policy now:
+        //  - whenever SQL TLS is on, RESP gets the same TLS acceptor (the
+        //    configured certificate), so AUTH rides TLS;
+        //  - on a NON-loopback bind, RESP must be both TLS-protected and
+        //    password-gated to start — mirroring the rule SQL already
+        //    enforces for itself. Otherwise it is refused, with an explicit
+        //    NUCLEUS_RESP_INSECURE_AUTH=1 development override;
+        //  - loopback keeps the historical dev default (plaintext allowed).
+        let resp_loopback = is_loopback_host(&host);
+        let resp_tls_ok = tls_acceptor.is_some();
+        let resp_insecure_ok = env_var_truthy("NUCLEUS_RESP_INSECURE_AUTH");
+        let resp_allowed = resp_loopback || (resp_tls_ok && auth_enabled) || resp_insecure_ok;
+        if !resp_allowed {
+            tracing::error!(
+                "RESP server NOT started: a non-loopback plaintext (or unauthenticated) RESP \
+                 listener would expose the SQL bootstrap password or an open keyspace on the \
+                 network. Start RESP with TLS plus a password (--password and TLS on), or set \
+                 NUCLEUS_RESP_INSECURE_AUTH=1 to accept the exposure for development."
+            );
+        } else {
+            let resp_addr = format!("{host}:{resp_port}");
+            let kv = std::sync::Arc::clone(executor.kv_store());
+            let resp_pw = resolved_password_for_resp.clone();
+            let resp_shutdown = shutdown_notify.clone();
+            let resp_tls_config = tls_acceptor.clone();
+            let resp_config = nucleus::resp::server::RespServerConfig {
+                tls_config: resp_tls_config,
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                if let Err(e) = nucleus::resp::server::start_resp_server_with_config(
+                    resp_addr,
+                    kv,
+                    resp_pw,
+                    resp_shutdown,
+                    resp_config,
+                )
+                .await
+                {
+                    tracing::error!("RESP server error: {e}");
+                }
+            });
+            if resp_tls_ok {
+                tracing::info!("RESP server on port {resp_port} (TLS enabled)");
+            } else {
+                tracing::info!("RESP server on port {resp_port} (redis-cli compatible)");
             }
-        });
-        tracing::info!("RESP server on port {resp_port} (redis-cli compatible)");
+        }
     }
 
     // Spawn S3-compatible gateway
@@ -2537,6 +2595,22 @@ async fn cmd_start(cfg: StartConfig) {
                         continue;
                     }
                 }
+            }
+            // Reap finished connection tasks continuously (NE-19): JoinSet
+            // retains every completed entry until joined or dropped, so a
+            // churning server accumulated them for its whole lifetime and a
+            // panicked handler's result was never observed. The `if` guard
+            // keeps this branch disabled while the set is empty (an empty
+            // JoinSet is permanently ready and would starve accept()).
+            joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Err(e) = joined.unwrap_or(Ok(())) {
+                    if e.is_panic() {
+                        tracing::error!("Connection task panicked: {e}");
+                    } else {
+                        tracing::error!("Connection task failed: {e}");
+                    }
+                }
+                continue;
             }
             _ = shutdown_notify.notified() => {
                 tracing::info!("Accept loop exiting due to shutdown");
@@ -3507,21 +3581,39 @@ async fn cmd_status(host: &str) {
     }
 }
 
-/// One-shot shell: execute a single SQL statement and exit (`shell -c`).
+/// Read private SQL without lossy UTF-8 conversion or byte normalization.
+/// Validate before connecting: NUL cannot be represented in pgwire's C string.
+/// Diagnostics deliberately exclude input and reader-provided error messages.
+fn read_shell_command(mut reader: impl std::io::Read) -> Result<String, &'static str> {
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Failed to read SQL command from stdin")?;
+    let sql = String::from_utf8(bytes).map_err(|_| "SQL command stdin must be valid UTF-8")?;
+    if sql.contains('\0') {
+        return Err("SQL command stdin must not contain NUL bytes");
+    }
+    Ok(sql)
+}
+
+/// One-shot shell: execute SQL and exit (`shell -c` or `shell --command-stdin`).
 /// Prints SELECT results as a table (or JSON with --json), command tags as-is.
 /// Exits 1 on connection failure or statement error so scripts can gate on it.
-async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool) {
+async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool, private: bool) {
     use nucleus::cli::{PgClient, QueryResult, TableDisplay};
 
     let mut client = match PgClient::connect(host, port).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to connect: {e}");
+            if private {
+                eprintln!("Failed to connect to Nucleus for stdin command");
+            } else {
+                eprintln!("Failed to connect: {e}");
+            }
             std::process::exit(1);
         }
     };
 
-    let sql = sql.trim().trim_end_matches(';');
     let mut failed = false;
     match client.simple_query(sql).await {
         Ok(QueryResult::Select { columns, rows }) => {
@@ -3561,17 +3653,29 @@ async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool) {
             }
         }
         Ok(QueryResult::Error { message }) => {
-            eprintln!("ERROR: {message}");
+            if private {
+                eprintln!("SQL command failed");
+            } else {
+                eprintln!("ERROR: {message}");
+            }
             failed = true;
         }
         Err(e) => {
-            eprintln!("Error: {e}");
+            if private {
+                eprintln!("SQL command transport failed");
+            } else {
+                eprintln!("Error: {e}");
+            }
             failed = true;
         }
     }
 
     if let Err(e) = client.close().await {
-        eprintln!("Warning: disconnect error: {e}");
+        if private {
+            eprintln!("Warning: stdin command disconnect failed");
+        } else {
+            eprintln!("Warning: disconnect error: {e}");
+        }
     }
     if failed {
         std::process::exit(1);
@@ -3753,6 +3857,79 @@ async fn shell_execute_and_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_command_stdin_parser_and_conflict() {
+        let cli = Cli::try_parse_from(["nucleus", "shell", "--command-stdin", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Shell {
+                command: None,
+                command_stdin: true,
+                json: true,
+                ..
+            })
+        ));
+        for option in ["-c", "--command"] {
+            let error =
+                Cli::try_parse_from(["nucleus", "shell", "--command-stdin", option, "SELECT 1"])
+                    .err()
+                    .unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        let cli = Cli::try_parse_from(["nucleus", "shell", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Shell {
+                command: None,
+                command_stdin: false,
+                json: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn shell_command_stdin_exact_utf8_bytes() {
+        for sql in [
+            "",
+            " \tSELECT '雪 ; \n';;\r\n ",
+            "SELECT 1",
+            "SELECT 1; -- no newline",
+        ] {
+            assert_eq!(
+                read_shell_command(sql.as_bytes()).unwrap().as_bytes(),
+                sql.as_bytes()
+            );
+        }
+        assert_eq!(
+            read_shell_command(&b"SELECT '\xff'"[..]),
+            Err("SQL command stdin must be valid UTF-8")
+        );
+        assert_eq!(
+            read_shell_command(&b"SELECT 1\0SELECT 2"[..]),
+            Err("SQL command stdin must not contain NUL bytes")
+        );
+    }
+
+    #[test]
+    fn shell_command_stdin_partial_read_failure_is_closed() {
+        struct BrokenReader(bool);
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("reader error must not be disclosed"));
+                }
+                self.0 = true;
+                buf[0] = b'Q';
+                Ok(1)
+            }
+        }
+        assert_eq!(
+            read_shell_command(BrokenReader(false)),
+            Err("Failed to read SQL command from stdin")
+        );
+    }
 
     #[test]
     fn parse_auth_method_env_scram_variants() {

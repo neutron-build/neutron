@@ -77,7 +77,7 @@ import { compileStatement } from "./compile.js";
 import { NeutronSqlError } from "./errors.js";
 import type { IsolationLevel } from "./logger.js";
 import type { QueryExecutionOptions } from "./transactions.js";
-import { getTableColumns, getTableIndexes, getTableName, tableRefParts } from "./schema.js";
+import { getTableColumns, getTableIndexes, getTableName, getTableRelationKey, rejectViewHandle, rejectAliasHandle, tableRefParts } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne } from "./schema.js";
 
 // ---------------------------------------------------------------------------
@@ -317,6 +317,8 @@ function newDraft(
     seq?: number;
   },
 ): Draft {
+  rejectAliasHandle(init.table, init.path);
+  if (init.action !== "select") rejectViewHandle(init.table, init.path);
   const draft: Draft = {
     seq: init.seq ?? pc.nextSeq++,
     path: init.path,
@@ -350,17 +352,15 @@ function columnsOf(table: AnyPgTable): Record<string, AnyColumnBuilder> {
 }
 
 function tableId(table: AnyPgTable): string {
-  return tableRefParts(table).join(".");
+  return getTableRelationKey(table);
 }
 
-/** Property key of a column object on `table` (identity first, then the
- *  physical name — relation configs hold the table's own column objects). */
+/** Property key of a declared column object. Physical names alone cannot
+ *  prove ownership when same-named tables exist in different schemas. */
 function propertyKeyOf(table: AnyPgTable, column: AnyColumnBuilder, path: string): string {
   const entries = Object.entries(columnsOf(table));
   const byIdentity = entries.find(([, c]) => c === column);
   if (byIdentity) return byIdentity[0];
-  const byName = entries.filter(([, c]) => c.columnName === column.columnName);
-  if (byName.length === 1) return byName[0][0];
   throw planError(path, `relation column "${column.columnName}" is not a column of ${getTableName(table)}`);
 }
 
@@ -559,7 +559,7 @@ function splitData(pc: PlanCtx, table: AnyPgTable, data: unknown, mode: Mode, pa
     throw planError(path, `data must be an object of column values and relation operations for ${tableName}`);
   }
   const cols = columnsOf(table);
-  const entries = pc.relationsByTable.get(tableName) ?? {};
+  const entries = pc.relationsByTable.get(getTableRelationKey(table)) ?? {};
   const input = data as Record<string, unknown>;
   for (const key of Object.keys(input)) {
     const isColumn = Object.hasOwn(cols, key);
@@ -1163,7 +1163,7 @@ function planDependentLevel(
   const { pc, root } = dctx;
   const levelName = getTableName(levelTable);
   checkDepth(depth, `${levelName}.cascade`);
-  const entries = pc.relationsByTable.get(levelName) ?? {};
+  const entries = pc.relationsByTable.get(getTableRelationKey(levelTable)) ?? {};
   for (const [key, rel] of Object.entries(entries)) {
     if (rel.kind !== "many") continue;
     const source = rel.source;
@@ -1580,6 +1580,8 @@ export function compileNestedCreate(
   args: NestedCreateInput,
   relationsByTable: Map<string, Record<string, Relation>>,
 ): CompiledNestedWrite {
+  rejectAliasHandle(table, "nested create");
+  rejectViewHandle(table, "nested create");
   const tableName = getTableName(table);
   if (typeof args !== "object" || args === null || !("data" in args)) {
     throw new NeutronSqlError(`create on ${tableName}: expected { data }`);
@@ -1598,6 +1600,8 @@ export function compileNestedUpdate(
   args: NestedUpdateInput,
   relationsByTable: Map<string, Record<string, Relation>>,
 ): CompiledNestedWrite {
+  rejectAliasHandle(table, "nested update");
+  rejectViewHandle(table, "nested update");
   const tableName = getTableName(table);
   if (typeof args !== "object" || args === null || !("where" in args) || !("data" in args)) {
     throw new NeutronSqlError(`update on ${tableName}: expected { where, data } — where names one unique key`);
@@ -1619,6 +1623,8 @@ export function compileNestedDelete(
   args: NestedDeleteInput,
   relationsByTable: Map<string, Record<string, Relation>>,
 ): CompiledNestedWrite {
+  rejectAliasHandle(table, "nested delete");
+  rejectViewHandle(table, "nested delete");
   const tableName = getTableName(table);
   if (typeof args !== "object" || args === null || !("where" in args)) {
     throw new NeutronSqlError(`delete on ${tableName}: expected { where, cascade? } — where names one unique key`);
@@ -1634,7 +1640,7 @@ export function compileNestedDelete(
   if (cascade !== undefined && (typeof cascade !== "object" || cascade === null || Array.isArray(cascade))) {
     throw new NeutronSqlError(`delete on ${tableName}: cascade must be an object keyed by relation names`);
   }
-  const entries = relationsByTable.get(tableName) ?? {};
+  const entries = relationsByTable.get(getTableRelationKey(table)) ?? {};
   if (cascade !== undefined) {
     for (const key of Object.keys(cascade).filter((k) => (cascade as Record<string, unknown>)[k] !== undefined)) {
       const rel = entries[key];

@@ -944,9 +944,58 @@ impl<S> Router<S> {
                     }));
             }
 
-            // Merge sub fallback
-            if self.fallback.is_none() {
-                self.fallback = sub.fallback;
+            // Merge sub fallback — SCOPED to the nest prefix (RS-02).
+            //
+            // Previously the raw fallback was hoisted to the parent, so an
+            // unmatched path ANYWHERE on the parent invoked the child
+            // fallback without the child's middleware (an auth-protected
+            // fallback under /private answered /unrelated anonymously), and
+            // a missing route inside the prefix also bypassed the child
+            // chain. Instead, compile a prefix-scoped catch-all whose
+            // handler is the child fallback wrapped with the child
+            // middleware chain. Requests outside the prefix keep hitting
+            // the parent fallback (or the default 404).
+            if let Some(sub_fallback) = sub.fallback.take() {
+                let wrapped = if sub_middlewares.is_empty() {
+                    sub_fallback
+                } else {
+                    wrap_handler_with_chain(sub_fallback, &sub_middlewares)
+                };
+                let shared: Arc<BoxedHandler> = Arc::new(wrapped);
+                let catch_all = format!("{prefix_str}/{{*__neutron_nest_fallback}}");
+                let bare = if prefix_str.is_empty() {
+                    "/".to_string()
+                } else {
+                    prefix_str.to_string()
+                };
+                for path in [catch_all.clone(), bare.clone()] {
+                    // The bare prefix only registers when nothing else
+                    // already claims it (a real route there wins for that
+                    // exact path anyway; registering both would overwrite
+                    // it in the method map).
+                    if path == bare
+                        && (self.pending.contains_key(&bare)
+                            || (bare != "/" && self.pending.contains_key("/")))
+                    {
+                        continue;
+                    }
+                    let entry = self.pending.entry(path).or_default();
+                    // First registered nest fallback wins for this path,
+                    // matching the previous "first sub-fallback" behavior.
+                    if entry.iter().any(|r| r.from_nest) {
+                        continue;
+                    }
+                    for kind in MethodKind::ALL {
+                        let forwarding: BoxedHandler = Box::new(ForwardingHandler {
+                            inner: Arc::clone(&shared),
+                        });
+                        entry.push(PendingRoute {
+                            method: kind,
+                            handler: forwarding,
+                            from_nest: true,
+                        });
+                    }
+                }
             }
         }
     }
@@ -2769,5 +2818,80 @@ mod tests {
     fn fallback_not_set_by_default() {
         let r = Router::<()>::new().get("/", || async { "root" });
         assert!(r.fallback.is_none());
+    }
+
+    /// Regression (RS-02): a nested router's fallback must stay scoped to
+    /// its prefix and wrapped with the child middleware. Previously the raw
+    /// fallback was hoisted to the parent, so (a) unmatched paths anywhere
+    /// invoked it without the child's auth middleware, and (b) missing
+    /// routes inside the prefix bypassed the child chain.
+    #[tokio::test]
+    async fn nested_fallback_is_scoped_and_authenticated() {
+        use crate::middleware::Next;
+        use crate::testing::TestClient;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct RequireAuth;
+        impl crate::middleware::MiddlewareTrait for RequireAuth {
+            fn call(
+                &self,
+                req: crate::handler::Request,
+                next: Next,
+            ) -> Pin<Box<dyn Future<Output = crate::handler::Response> + Send>> {
+                let ok = req
+                    .headers()
+                    .get("authorization")
+                    .map(|v| v == "Bearer secret".parse::<http::HeaderValue>().unwrap())
+                    .unwrap_or(false);
+                Box::pin(async move {
+                    if ok {
+                        next.run(req).await
+                    } else {
+                        use crate::handler::IntoResponse;
+                        (http::StatusCode::UNAUTHORIZED, "missing credentials").into_response()
+                    }
+                })
+            }
+        }
+
+        let child = Router::new()
+            .middleware(RequireAuth)
+            .get("/data", || async { "private data" })
+            .fallback(|| async { (http::StatusCode::NOT_FOUND, "private 404") });
+
+        let parent = Router::new().nest("/private", child);
+
+        let client = TestClient::new(parent);
+
+        // (a) Unmatched path OUTSIDE the prefix: parent 404, NOT the child
+        // fallback (which the old hoist answered without auth).
+        let resp = client.get("/unrelated").send().await;
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+        assert_ne!(resp.text().await, "private 404");
+
+        // (b) Missing route INSIDE the prefix: child middleware runs —
+        // without credentials it is 401, never the raw fallback body.
+        let resp = client.get("/private/missing").send().await;
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+
+        // With valid credentials the fallback is reachable through the
+        // chain.
+        let resp = client
+            .get("/private/missing")
+            .header("authorization", "Bearer secret")
+            .send()
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(resp.text().await, "private 404");
+
+        // Real routes still work with credentials.
+        let resp = client
+            .get("/private/data")
+            .header("authorization", "Bearer secret")
+            .send()
+            .await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(resp.text().await, "private data");
     }
 }

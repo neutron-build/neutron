@@ -245,7 +245,7 @@ try {
     await page.getByRole("button", { name: "Test Connection" }).click();
     const tested = await page.getByText(/^Connected — PostgreSQL/).waitFor({ timeout: 15000 }).then(() => true, () => false);
     await page.getByRole("button", { name: "Save" }).click();
-    await page.getByRole("button", { name: "Connect" }).click();
+    await page.getByRole("button", { name: "Connect" }).first().click();
     await page.getByTitle("Browse users", { exact: true }).click();
     await page.waitForFunction(() => document.querySelectorAll('table[role="grid"] tbody tr[data-row-index]').length === 1, null, { timeout: 30000 });
     const emailCell = await page.evaluateHandle(() => {

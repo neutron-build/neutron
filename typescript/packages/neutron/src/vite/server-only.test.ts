@@ -130,3 +130,70 @@ describe("server-only module handling", () => {
     expect(transformed.includes("path-browserify")).toBe(true);
   });
 });
+
+// NA-08: a mixed re-export list used to be rebuilt as `export { kept };`,
+// dropping the `from "./shared"` clause — so the surviving export named
+// something that was not a local binding and the client module stopped
+// parsing. The transform must preserve the original statement's prefix and
+// suffix verbatim.
+describe("server-only re-export stripping", () => {
+  const parse = (code: string) =>
+    // Parse as a module; a transform result that no longer parses is the bug.
+    import("@babel/parser").then((m) =>
+      m.parse(code, { sourceType: "module", plugins: ["typescript", "jsx"] })
+    );
+
+  it("preserves the from-clause of a mixed re-export", async () => {
+    const code = `export { loader, Card } from "./shared";\n`;
+    const transformed = stripServerOnlyRouteModule(code);
+    await expect(parse(transformed)).resolves.toBeTruthy();
+    expect(transformed).toContain(`from "./shared"`);
+    expect(transformed).toContain("Card");
+    expect(transformed).not.toMatch(/\bloader\b/);
+  });
+
+  it("preserves aliases, trailing commas, and comments in a mixed re-export", async () => {
+    const code = `export {\n  loader as dataLoader, // the loader\n  Card as UI, // kept\n} from "./shared";\n`;
+    const transformed = stripServerOnlyRouteModule(code);
+    await expect(parse(transformed)).resolves.toBeTruthy();
+    expect(transformed).toContain(`from "./shared"`);
+    expect(transformed).toContain("UI");
+    expect(transformed).not.toContain("dataLoader");
+  });
+
+  it("removes an all-server re-export entirely", async () => {
+    const code = `import x from "./x";\nexport { loader, action } from "./shared";\nconsole.log(x);\n`;
+    const transformed = stripServerOnlyRouteModule(code);
+    await expect(parse(transformed)).resolves.toBeTruthy();
+    expect(transformed).not.toContain("shared");
+    expect(transformed).toContain("console.log(x)");
+  });
+
+  it("keeps an all-client re-export untouched", () => {
+    const code = `export { Card, Badge } from "./shared";\n`;
+    expect(stripServerOnlyRouteModule(code)).toBe(code);
+  });
+
+  it("handles a string-literal export name", async () => {
+    const code = `export { run as "loader", Card } from "./shared";\n`;
+    const transformed = stripServerOnlyRouteModule(code);
+    await expect(parse(transformed)).resolves.toBeTruthy();
+    expect(transformed).toContain(`from "./shared"`);
+    expect(transformed).not.toContain(`"loader"`);
+  });
+
+  it("mixed local exports alongside a re-export both survive", async () => {
+    const code = [
+      `export const config = { mode: "app" };`,
+      `export { loader, Card } from "./shared";`,
+      `export default function Page() {}`,
+      ``,
+    ].join("\n");
+    const transformed = stripServerOnlyRouteModule(code);
+    await expect(parse(transformed)).resolves.toBeTruthy();
+    expect(transformed).toContain("export const config");
+    expect(transformed).toContain(`from "./shared"`);
+    expect(transformed).toContain("Card");
+    expect(transformed).toContain("export default function Page");
+  });
+});

@@ -5128,10 +5128,8 @@ impl Executor {
                 ast::Value::Number(n, _) => {
                     if let Ok(i) = n.parse::<i64>() {
                         Ok(Value::Int64(i))
-                    } else if let Ok(f) = n.parse::<f64>() {
-                        Ok(Value::Float64(f))
                     } else {
-                        Ok(Value::Text(n.clone()))
+                        wide_number_literal(n)
                     }
                 }
                 ast::Value::SingleQuotedString(s) | ast::Value::EscapedStringLiteral(s) => {
@@ -5162,8 +5160,9 @@ impl Executor {
                 self.eval_expr_plan(time_zone, row, meta)?,
             ),
             Expr::BinaryOp { left, op, right } => {
-                let lv = self.eval_expr_plan(left, row, meta)?;
-                let rv = self.eval_expr_plan(right, row, meta)?;
+                let mut lv = self.eval_expr_plan(left, row, meta)?;
+                let mut rv = self.eval_expr_plan(right, row, meta)?;
+                adopt_decimal_literals(left, right, &mut lv, &mut rv)?;
                 // SQL 3-valued logic: comparisons with NULL yield NULL
                 if matches!(lv, Value::Null) || matches!(rv, Value::Null) {
                     match op {
@@ -5392,6 +5391,11 @@ impl Executor {
                     Value::Int32(n) => Ok(Value::Int64(-(n as i64))),
                     Value::Int64(n) => Ok(Value::Int64(-n)),
                     Value::Float64(n) => Ok(Value::Float64(-n)),
+                    // It used to fall through to NULL: `-numeric_col` silently
+                    // evaluated to NULL on this path.
+                    Value::Numeric(raw) => crate::types::numeric_negate_keep_scale(&raw)
+                        .map(Value::Numeric)
+                        .map_err(ExecError::Runtime),
                     _ => Ok(Value::Null),
                 }
             }
@@ -5448,6 +5452,21 @@ impl Executor {
             Expr::Cast {
                 expr, data_type, ..
             } => {
+                // A cast to NUMERIC / NUMERIC(p, s) is the AST evaluator's, so
+                // the digits of a literal, the rounding to the scale and the
+                // 22003 overflow refusal are the same on both paths;
+                // `plan_cast_value` returns a value unchanged for a type it
+                // does not list, which skipped all three.
+                if matches!(
+                    data_type,
+                    ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_)
+                ) {
+                    let v = match super::expr::numeric_literal_text(expr, data_type) {
+                        Some(text) => Value::Text(text),
+                        None => self.eval_expr_plan(expr, row, meta)?,
+                    };
+                    return self.eval_cast(v, data_type);
+                }
                 let v = self.eval_expr_plan(expr, row, meta)?;
                 Ok(self.plan_cast_value(v, data_type))
             }
@@ -5668,6 +5687,8 @@ impl Executor {
                     us,
                     super::timestamptz::ambient_time_zone(),
                 )),
+                // NULL stays NULL; `to_string` would render it as the text 'NULL'.
+                Value::Null => Value::Null,
                 other => Value::Text(other.to_string()),
             },
             ast::DataType::Boolean => match &v {

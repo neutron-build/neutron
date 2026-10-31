@@ -54,9 +54,20 @@ function pack(which){
  if(keep){mkdirSync(keep,{recursive:true});cpSync(tgz,path.join(keep,path.basename(tgz)));}
  tarballs[which]={file:tgz,record};return record;
 }
+// The packed nucleus depends on @neutron-build/sql at the same release; until
+// that version is published npm cannot resolve it, so it is packed from this
+// source and overridden in every consumer.
+function packSql(){
+ const pkg=path.join(REPO,'typescript/packages/neutron-sql');
+ run('pnpm',['run','build'],pkg);
+ const meta=JSON.parse(readFileSync(path.join(pkg,'package.json'),'utf8'));
+ run('pnpm',['pack','--pack-destination',work],pkg);
+ tarballs.sql={file:path.join(work,'neutron-build-sql-'+meta.version+'.tgz')};
+}
 function consumer(label,deps){
  const dir=path.join(work,label);mkdirSync(dir);
- writeFileSync(path.join(dir,'package.json'),JSON.stringify({name:'installed-'+label,private:true,type:'module',dependencies:deps},null,2));
+ const overrides=tarballs.sql?{'@neutron-build/sql':'file:'+tarballs.sql.file}:undefined;
+ writeFileSync(path.join(dir,'package.json'),JSON.stringify({name:'installed-'+label,private:true,type:'module',dependencies:deps,overrides},null,2));
  run('npm',['install','--engine-strict','--omit=optional','--no-audit','--no-fund'],dir,300000);
  return dir;
 }
@@ -95,6 +106,7 @@ function types(dir,file,{skipLibCheck=false,unsupported=false}={}){
 }
 let fatal;
 try{
+ check('pack sql',()=>packSql());
  check('pack nucleus',()=>pack('nucleus'));
  if(kind==='data')check('pack data',()=>pack('data'));
  if(kind==='nucleus'){

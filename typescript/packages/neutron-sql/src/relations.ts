@@ -37,10 +37,10 @@
 
 import { type Condition, type OrderExpression } from "./expr.js";
 import { collectRequirements } from "./ast.js";
-import { getTableColumns, getTableName } from "./schema.js";
+import { getTableColumns, getTableConstraints, getTableName, getTableRelationKey, tableRefParts } from "./schema.js";
 import type { AnyColumnBuilder, AnyPgTable, Relation, RelationOne, TableRelations } from "./schema.js";
 import type { ExecContext } from "./builder.js";
-import { run, whereItems } from "./builder.js";
+import { run, whereItems, tableTargetNode } from "./builder.js";
 import type { QueryExecutionOptions } from "./transactions.js";
 import {
   applyProjectionDecoders,
@@ -105,13 +105,28 @@ export interface ResolvedRelations {
 export function resolveRelations(all: TableRelations[]): ResolvedRelations {
   const byTable = new Map<string, TableRelations>();
   for (const r of all) {
-    const existing = byTable.get(getTableName(r.table));
+    const existing = byTable.get(getTableRelationKey(r.table));
     if (existing) {
       throw new Error(
         `relations for table ${getTableName(r.table)} are declared more than once (duplicate declarations cannot be merged)`,
       );
     }
-    byTable.set(getTableName(r.table), r);
+    byTable.set(getTableRelationKey(r.table), r);
+  }
+
+  // Relation columns must belong to their declared owner and target. Name
+  // matching alone would accept a same-named column from another schema.
+  for (const set of all) {
+    for (const [key, relation] of Object.entries(set.entries)) {
+      if (relation.kind !== "one") continue;
+      const fields = Object.values(getTableColumns(set.table));
+      const references = Object.values(getTableColumns(relation.targetTable));
+      if (relation.fields.length === 0 || relation.fields.length !== relation.references.length ||
+          relation.fields.some((column) => !fields.includes(column)) ||
+          relation.references.some((column) => !references.includes(column))) {
+        throw new Error(`relation "${key}" on ${getTableName(set.table)}: fields/references must be equally sized nonempty arrays of the declaring and target tables' own columns`);
+      }
+    }
   }
 
   // relationName pairing keys must be unambiguous per table per KIND: two
@@ -138,12 +153,12 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
     for (const [key, rel] of Object.entries(r.entries)) {
       if (rel.kind !== "many") continue;
       const target = rel.targetTable;
-      if ((Object.values(getTableColumns(target)) as AnyColumnBuilder[]).every((c) => !c.isPrimaryKey)) {
-        throw new Error(
-          `relation "${key}" on ${getTableName(r.table)}: target table ${getTableName(target)} has no primary key; relation ordering undefined`,
-        );
+      try {
+        pkColumnsOf(target);
+      } catch (error) {
+        throw new Error(`relation "${key}" on ${getTableName(r.table)}: ${(error as Error).message}`);
       }
-      const targetSet = byTable.get(getTableName(target));
+      const targetSet = byTable.get(getTableRelationKey(target));
       if (!targetSet) {
         throw new Error(
           `relation "${key}" on ${getTableName(r.table)} targets ${getTableName(target)} but that table declares no relations`,
@@ -151,7 +166,7 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
       }
       const candidates: Array<[string, RelationOne]> = [];
       for (const [k, candidate] of Object.entries(targetSet.entries)) {
-        if (candidate.kind === "one" && getTableName(candidate.targetTable) === getTableName(r.table)) {
+        if (candidate.kind === "one" && getTableRelationKey(candidate.targetTable) === getTableRelationKey(r.table)) {
           candidates.push([k, candidate]);
         }
       }
@@ -181,16 +196,43 @@ export function resolveRelations(all: TableRelations[]): ResolvedRelations {
   }
 
   const byTableEntries = new Map<string, Record<string, Relation>>();
-  for (const r of all) byTableEntries.set(getTableName(r.table), r.entries);
+  for (const r of all) byTableEntries.set(getTableRelationKey(r.table), r.entries);
   return { byTable: byTableEntries };
 }
 
+// Table constraints retain ordered physical names, while column declarations
+// retain flags. Resolve either representation without mutating schema metadata.
 function pkColumnsOf(table: AnyPgTable): AnyColumnBuilder[] {
-  const pks = (Object.values(getTableColumns(table)) as AnyColumnBuilder[]).filter((c) => c.isPrimaryKey);
-  if (pks.length === 0) {
-    throw new Error(`target table ${getTableName(table)} has no primary key; relation ordering undefined`);
+  const columns = Object.values(getTableColumns(table)) as AnyColumnBuilder[];
+  const columnPks = columns.filter((c) => c.isPrimaryKey);
+  const tablePks = getTableConstraints(table).filter((c) => c.kind === "primary-key");
+  const invalid = (reason: string): never => {
+    throw new Error(`target table ${getTableName(table)} has invalid primary-key metadata: ${reason}`);
+  };
+  if (tablePks.length > 1 || (tablePks.length > 0 && columnPks.length > 0)) {
+    return invalid("multiple or conflicting primary key declarations");
   }
-  return pks;
+  if (tablePks.length === 0) {
+    if (columnPks.length === 0) {
+      throw new Error(`target table ${getTableName(table)} has no primary key; relation ordering undefined`);
+    }
+    if (columnPks.some((c) => typeof c.columnName !== "string" || c.columnName.length === 0 || columns.filter((other) => other.columnName === c.columnName).length !== 1)) {
+      return invalid("empty or ambiguous physical primary key columns");
+    }
+    return columnPks;
+  }
+  const names = tablePks[0].columns;
+  if (names.length === 0) return invalid("empty primary key");
+  const seen = new Set<string>();
+  return names.map((name) => {
+    if (typeof name !== "string" || name.length === 0 || seen.has(name)) {
+      return invalid("empty or duplicate primary key column name");
+    }
+    seen.add(name);
+    const matches = columns.filter((c) => c.columnName === name);
+    if (matches.length !== 1) return invalid(`unknown or ambiguous primary key column ${JSON.stringify(name)}`);
+    return matches[0];
+  });
 }
 
 /** Nested JSON objects are labeled with declared property keys; values come
@@ -359,7 +401,7 @@ function validateRQBArgs(
       );
     }
     const targetName = getTableName(rel.targetTable);
-    const targetEntries = relationsByTable.get(targetName);
+    const targetEntries = relationsByTable.get(getTableRelationKey(rel.targetTable));
     if (!targetEntries) {
       throw new Error(
         `relation "${key}" on ${tableName} targets ${targetName} but that table declares no relations (nested with needs the target's relation set)`,
@@ -391,13 +433,13 @@ function remapError(label: string, reason: string): Error {
   return new Error(`${label}: ${reason}`);
 }
 
-function remapChildRefs(node: ValueNode, childTable: string, alias: string, label: string): ValueNode {
+function remapChildRefs(node: ValueNode, childTable: readonly string[], alias: string, label: string): ValueNode {
   switch (node.kind) {
     case "qualified": {
-      if (node.parts.length === 2 && node.parts[0] === childTable) return qual(alias, node.parts[1]);
+      if (node.parts.length === childTable.length + 1 && childTable.every((part, index) => node.parts[index] === part)) return qual(alias, node.parts[node.parts.length - 1]);
       throw remapError(
         label,
-        `where/orderBy may reference only the relation's own table "${childTable}" — found ${node.parts.map(quoteIdent).join(".")} ` +
+        `where/orderBy may reference only the relation's own table "${childTable.join(".")}" — found ${node.parts.map(quoteIdent).join(".")} ` +
           `(filter the parent instead, or filter on the relation's own columns)`,
       );
     }
@@ -429,7 +471,7 @@ function remapChildRefs(node: ValueNode, childTable: string, alias: string, labe
   }
 }
 
-function remapOrderSpec(o: OrderExpression, childTable: string, alias: string, label: string): OrderSpec {
+function remapOrderSpec(o: OrderExpression, childTable: readonly string[], alias: string, label: string): OrderSpec {
   if (typeof (o as OrderSpec).direction === "string") {
     const spec = o as OrderSpec;
     return Object.freeze({ expr: remapChildRefs(spec.expr, childTable, alias, label), direction: spec.direction, nulls: spec.nulls });
@@ -529,10 +571,10 @@ function buildEdge(
   const alias = edgeAlias(ctx.aliasCtx, path);
   const label = pathLabel(getTableName(outerTable), path);
   const selected = requestedEntries(target, args);
-  const targetEntries = ctx.relationsByTable.get(targetName) ?? {};
+  const targetEntries = ctx.relationsByTable.get(getTableRelationKey(target)) ?? {};
 
-  const userWhere = args.where === undefined ? [] : whereItems([remapChildRefs(args.where, targetName, alias, label)]);
-  const userOrder = (args.orderBy ?? []).map((o) => remapOrderSpec(o, targetName, alias, label));
+  const userWhere = args.where === undefined ? [] : whereItems([remapChildRefs(args.where, tableRefParts(target), alias, label)]);
+  const userOrder = (args.orderBy ?? []).map((o) => remapOrderSpec(o, tableRefParts(target), alias, label));
 
   const nestedPlans: RelationEdgePlan[] = [];
 
@@ -566,7 +608,7 @@ function buildEdge(
       const derivedColumns = Object.values(getTableColumns(target)) as AnyColumnBuilder[];
       const derived = selectStatement({
         projections: derivedColumns.map((column) => projectionNode(qual(alias, column.columnName))),
-        from: ident(targetName),
+        from: tableTargetNode(target),
         fromAlias: alias,
         where: [correlation, ...userWhere],
         orderBy: effectiveOrder,
@@ -581,7 +623,7 @@ function buildEdge(
       const nestedPairs = buildNestedPairs(ctx, target, sourceAlias, targetEntries, args, path, nestedPlans);
       const obj = jsonObjectForEntries(selected, sourceAlias, nestedPairs);
       const orderOnSource: OrderSpec[] = [
-        ...(args.orderBy ?? []).map((o) => remapOrderSpec(o, targetName, sourceAlias, label)),
+        ...(args.orderBy ?? []).map((o) => remapOrderSpec(o, tableRefParts(target), sourceAlias, label)),
         ...pkColumnsOf(target).map((c) => ({ expr: qual(sourceAlias, c.columnName) as ValueNode, direction: "asc" as const })),
       ];
       const agg = aggWithOrder(obj, orderOnSource);
@@ -612,7 +654,7 @@ function buildEdge(
     const agg = aggWithOrder(obj, effectiveOrder);
     const inner = selectStatement({
       projections: [projectionNode(agg)],
-      from: ident(targetName),
+      from: tableTargetNode(target),
       fromAlias: alias,
       where: [correlation, ...userWhere],
     });
@@ -639,7 +681,7 @@ function buildEdge(
   const obj = jsonObjectForEntries(selected, alias, nestedPairs);
   const inner = selectStatement({
     projections: [projectionNode(obj)],
-    from: ident(targetName),
+    from: tableTargetNode(target),
     fromAlias: alias,
     where: [correlation, ...userWhere],
     orderBy: userOrder,
@@ -700,7 +742,7 @@ export function buildRelationalPlan(
   args: RQBArgs,
   relationsByTable?: Map<string, Record<string, Relation>>,
 ): RelationalExplainPlan {
-  const byTable = relationsByTable ?? new Map<string, Record<string, Relation>>([[getTableName(table), relations]]);
+  const byTable = relationsByTable ?? new Map<string, Record<string, Relation>>([[getTableRelationKey(table), relations]]);
   validateRQBArgs(table, relations, byTable, args, 0, [], getTableName(table));
   if (args.where !== undefined && isLegacySqlFragment(args.where)) throw legacyFragmentError("where");
   for (const o of args.orderBy ?? []) {
@@ -750,7 +792,7 @@ export function buildRelationalPlan(
 
   const stmt = selectStatement({
     projections,
-    from: ident(tableName),
+    from: tableTargetNode(table),
     where: args.where ? whereItems([args.where]) : [],
     orderBy: (args.orderBy ?? []).map((o) =>
       typeof (o as OrderSpec).direction === "string" ? (o as OrderSpec) : { expr: o as ValueNode, direction: "asc" as const },
@@ -840,7 +882,7 @@ function decodeChildRow(
     child[propertyKey] = decodeJsonLeaf(column, { propertyKey, columnName: column.columnName, tableName: targetName }, raw);
   }
   if (childArgs === true) return;
-  const entries = relationsByTable.get(targetName) ?? {};
+  const entries = relationsByTable.get(getTableRelationKey(target)) ?? {};
   for (const [key, value] of Object.entries(childArgs.with ?? {})) {
     if (value === undefined) continue;
     const rel = entries[key];
@@ -902,7 +944,7 @@ export async function findMany(
   relationsByTable?: Map<string, Record<string, Relation>>,
   options?: QueryExecutionOptions,
 ): Promise<Array<Record<string, unknown>>> {
-  const byTable = relationsByTable ?? new Map<string, Record<string, Relation>>([[getTableName(table), relations]]);
+  const byTable = relationsByTable ?? new Map<string, Record<string, Relation>>([[getTableRelationKey(table), relations]]);
   const built = buildRelationalSQL(table, relations, args, byTable);
   const rows = (await run(ctx, built.sql, built.params, "query", built.capabilities, options)) as Array<Record<string, unknown>>;
   // Parent columns decode through the compiled statement's decode plan,

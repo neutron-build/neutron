@@ -232,7 +232,7 @@ jobs:
         working-directory: typescript
 
       - name: Build @neutron-build/nucleus
-        run: pnpm --filter @neutron-build/nucleus build
+        run: pnpm --filter "@neutron-build/nucleus..." build
         working-directory: typescript
 
       - name: Run the X02 leg

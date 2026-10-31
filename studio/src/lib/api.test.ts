@@ -500,3 +500,90 @@ describe('api', () => {
     })
   })
 })
+
+describe('codegen selected read profile', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('passes the explicit profile and preserves contextual server errors', async () => {
+    const fetch = vi.fn().mockResolvedValue({ok:false,status:400,text:async () => JSON.stringify({error:'python samples column stamp type pg_catalog.timestamp: unsupported identity'})})
+    vi.stubGlobal('fetch', fetch)
+    await expect(api.codegen('c1', 'public', 'samples', 'python', 'lossless-read-v1')).rejects.toThrow('column stamp')
+    expect(fetch.mock.calls[0][0]).toContain('profile=lossless-read-v1')
+  })
+  it('defaults to the legacy profile', async () => {
+    const fetch=vi.fn().mockResolvedValue({ok:true,json:async()=>({code:'legacy'})})
+    vi.stubGlobal('fetch',fetch)
+    await api.codegen('c1','public','samples','ts')
+    expect(fetch.mock.calls[0][0]).toContain('profile=legacy')
+  })
+})
+
+
+describe('PostgreSQL keyset page API', () => {
+  const fetchMock = vi.fn()
+  const nativePage = () => ({
+    columns: ['id', 'body'], rows: [[{ t: 'int8', v: '9007199254740993' }, 'exact']],
+    rowCount: 1, versions: ['123'], keyColumns: ['id'], binding: 'e1:12345', versioned: true,
+    readOnly: false, hasNext: false, nextCursor: '', consistency: 'live-keyset/request-repeatable-read',
+  })
+  beforeEach(() => { vi.stubGlobal('fetch', fetchMock); fetchMock.mockReset(); _setSessionTokenForTests('keyset-session') })
+  afterEach(() => { vi.unstubAllGlobals(); _setSessionTokenForTests(null) })
+
+  it('POSTs a cursor only in the authenticated JSON body and preserves an exact bigint', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => nativePage() })
+    const page = await api.tablePage('c1', 'Odd Schema', 'Odd Table', 100, 'opaque-secret-cursor')
+    expect(page.rows[0][0]).toBe(9007199254740993n)
+    expect(fetchMock).toHaveBeenCalledWith('/api/table/v2/page', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Studio-Session': 'keyset-session' },
+      body: JSON.stringify({ connectionId: 'c1', schema: 'Odd Schema', table: 'Odd Table', profile: 'postgres-direct', limit: 100, cursor: 'opaque-secret-cursor' }),
+    })
+  })
+
+  it('rejects malformed shape, unsafe numeric keys, cursor inconsistencies and unsupported JSON cells', async () => {
+    const malformed = [
+      { ...nativePage(), versions: [] }, { ...nativePage(), rows: [[9007199254740992, 'rounded']] },
+      { ...nativePage(), rows: [[{ t: 'int8', v: '9223372036854775808' }, 'overflow']] },
+      { ...nativePage(), rows: [[{ t: 'int8', v: '1' }, { json: true }]] },
+      { ...nativePage(), hasNext: true, nextCursor: '' }, { ...nativePage(), hasNext: false, nextCursor: 'unexpected' },
+      { ...nativePage(), nextCursor: 'x'.repeat(8193) }, { ...nativePage(), consistency: 'snapshot' },
+      { ...nativePage(), keyColumns: ['id', 'body'] },
+    ]
+    for (const response of malformed) {
+      fetchMock.mockResolvedValueOnce({ ok: true, json: async () => response })
+      await expect(api.tablePage('c1', 'public', 't', 100)).rejects.toBeInstanceOf(ApiError)
+    }
+    const calls = fetchMock.mock.calls.length
+    await expect(api.tablePage('c1', 'public', 't', 1001)).rejects.toMatchObject({ status: 400 })
+    await expect(api.tablePage('c1', 'public', 't', 100, 'x'.repeat(8193))).rejects.toMatchObject({ status: 400 })
+    expect(fetchMock.mock.calls).toHaveLength(calls)
+  })
+
+  it('preserves explicit profile refusal and never retries it as a legacy read', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 400, text: async () => JSON.stringify({ error: 'JSON is not supported', state: 'unsupported-profile' }) })
+    await expect(api.tablePage('c1', 'public', 't', 100)).rejects.toMatchObject({ status: 400, state: 'unsupported-profile' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+// Parseable JSON must cross the real mutation transport validator.
+describe('commit transport receipt validation', () => {
+  beforeEach(() => { vi.stubGlobal('fetch', vi.fn()); _setSessionTokenForTests('token') })
+  afterEach(() => { vi.unstubAllGlobals(); _setSessionTokenForTests(null) })
+  function mockOk(body: unknown) { vi.mocked(fetch).mockResolvedValueOnce({ok:true, json:async()=>body} as Response) }
+  it.each([{}, null, { operationId: 'other', rowsAffected: 0, operations: [], reversible: false }])('rejects a malformed direct receipt %j', async body => {
+    _setSessionTokenForTests('token')
+    mockOk(body)
+    await expect(api.commitOperations({ connectionId: 'c', operationId: 'requested', operations: [] })).rejects.toThrow('receipt')
+  })
+  it.each([{ operationId: 'other', state: 'unknown' }, { operationId: 'requested', state: 'committed', response: {} }, { operationId: 'requested', state: 'failed', status: 409, response: { operationId: 'other', error: 'no' } }])('rejects malformed outcome %j', async body => {
+    _setSessionTokenForTests('token')
+    mockOk(body)
+    await expect(api.operationOutcome('c', 'requested')).rejects.toThrow('receipt')
+  })
+})
+
+it('direct failed commit response with mismatched identity stays ambiguous', async () => {
+  _setSessionTokenForTests('token')
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 409, text: async () => JSON.stringify({ operationId: 'other', state: 'conflict', error: 'refused' }) }))
+  try { await expect(api.commitOperations({ connectionId: 'c', operationId: 'requested', operations: [] })).rejects.toThrow('receipt') }
+  finally { vi.unstubAllGlobals(); _setSessionTokenForTests(null) }
+})

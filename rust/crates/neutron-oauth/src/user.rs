@@ -19,6 +19,8 @@ use crate::token::TokenResponse;
 pub struct OAuthUser {
     /// Provider-assigned user ID (as a string for cross-provider compatibility).
     pub id: String,
+    /// Stable configured issuer/provider namespace. Link accounts by (provider, id).
+    pub provider: String,
     /// Primary email address, if available.
     pub email: Option<String>,
     /// Display name or username.
@@ -32,12 +34,12 @@ pub struct OAuthUser {
 impl OAuthUser {
     /// Extract an `OAuthUser` from raw JSON (provider-agnostic field mapping).
     pub fn from_json(raw: Value) -> Option<Self> {
-        // Try common field names across providers
-        let id = raw.get("id").or_else(|| raw.get("sub")).map(|v| match v {
-            Value::Number(n) => n.to_string(),
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })?;
+        let value = raw.get("sub").or_else(|| raw.get("id"))?;
+        let id = match value {
+            Value::String(s) if !s.trim().is_empty() => s.clone(),
+            Value::Number(n) if n.as_u64().is_some_and(|n| n > 0) => n.to_string(),
+            _ => return None,
+        };
 
         let email = raw.get("email").and_then(Value::as_str).map(str::to_string);
 
@@ -55,12 +57,43 @@ impl OAuthUser {
             .map(str::to_string);
 
         Some(Self {
+            provider: String::new(),
             id,
             email,
             name,
             avatar_url,
             raw,
         })
+    }
+    /// Parse only the configured subject field/type; no cross-provider fallback.
+    pub fn from_provider_json(config: &OAuthConfig, raw: Value) -> Option<Self> {
+        if config.provider.trim().is_empty() || raw.get("error").is_some() {
+            return None;
+        }
+        let value = raw.get(&config.subject_field)?;
+        let id = match value {
+            Value::String(s) if !s.trim().is_empty() => s.clone(),
+            Value::Number(n) if config.numeric_subject && n.as_u64().is_some_and(|n| n > 0) => {
+                n.to_string()
+            }
+            _ => return None,
+        };
+        let mut user = Self::from_json(serde_json::json!({"sub": id}))?;
+        user.email = raw.get("email").and_then(Value::as_str).map(str::to_owned);
+        user.name = raw
+            .get("name")
+            .or_else(|| raw.get("login"))
+            .or_else(|| raw.get("username"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        user.avatar_url = raw
+            .get("avatar_url")
+            .or_else(|| raw.get("picture"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        user.provider = config.provider.clone();
+        user.raw = raw;
+        Some(user)
     }
 }
 
@@ -81,17 +114,21 @@ pub async fn fetch_userinfo(
         let body = https_get(url, &tokens.access_token).await?;
         let raw: Value = serde_json::from_str(&body)
             .map_err(|e| OAuthError::UserInfo(format!("JSON parse: {e}")))?;
-        OAuthUser::from_json(raw)
+        OAuthUser::from_provider_json(config, raw)
             .ok_or_else(|| OAuthError::UserInfo("missing 'id' field in userinfo response".into()))
     } else {
-        // No userinfo endpoint — return a minimal user from the token alone
-        Ok(OAuthUser {
-            id: tokens.access_token.chars().take(16).collect(),
-            email: None,
-            name: None,
-            avatar_url: None,
-            raw: Value::Null,
-        })
+        // No userinfo endpoint and no decoded, verified OIDC id_token subject:
+        // refuse rather than invent an identity. The previous fallback used
+        // the first 16 characters of the opaque access token as `id` — for
+        // JWT-shaped tokens that prefix is the (shared) header, so distinct
+        // users received exactly the same id and account linkage conflated
+        // them. Configure `userinfo_url` (the built-in presets all do) or
+        // verify the `id_token` claim yourself before linking accounts.
+        Err(OAuthError::UserInfo(
+            "provider has no userinfo_url; refusing to derive user identity from an opaque \
+             access token — configure userinfo_url or verify the OIDC id_token"
+                .to_string(),
+        ))
     }
 }
 
@@ -103,6 +140,25 @@ pub async fn fetch_userinfo(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Regression (RS-15): with no userinfo endpoint the old fallback
+    /// returned a user whose `id` was the first 16 chars of the access
+    /// token — for JWT-shaped tokens that is the shared header, so distinct
+    /// users were conflated onto one identity. The fallback must fail closed.
+    #[tokio::test]
+    async fn missing_userinfo_url_fails_closed() {
+        let config = OAuthConfig::new("https://example.com/authorize", "https://example.com/token");
+        let tokens = crate::token::TokenResponse {
+            access_token: "eyJhbGciOiJIUzI1NiJ9.SUBJECT_A.SIGNATURE".to_string(),
+            refresh_token: None,
+            expires_in: Some(3600),
+            token_type: "bearer".to_string(),
+            id_token: None,
+            scope: None,
+        };
+        let err = fetch_userinfo(&config, &tokens).await.unwrap_err();
+        assert!(matches!(err, crate::error::OAuthError::UserInfo(_)));
+    }
 
     #[test]
     fn from_json_github_style() {
@@ -166,5 +222,29 @@ mod tests {
         let raw = json!({ "id": "x", "custom_field": "custom_value" });
         let user = OAuthUser::from_json(raw).unwrap();
         assert_eq!(user.raw["custom_field"], "custom_value");
+    }
+
+    #[test]
+    fn configured_subject_rejects_malformed_values_and_namespaces_equal_ids() {
+        let github = crate::config::OAuthProvider::github();
+        let google = crate::config::OAuthProvider::google();
+        for bad in [
+            json!(null),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(""),
+            json!("   "),
+            json!(1.5),
+        ] {
+            assert!(OAuthUser::from_provider_json(&github, json!({"id":bad})).is_none());
+        }
+        assert!(
+            OAuthUser::from_provider_json(&github, json!({"id": 1, "error":"denied"})).is_none()
+        );
+        let a = OAuthUser::from_provider_json(&github, json!({"id": 1, "sub":"wrong"})).unwrap();
+        let b = OAuthUser::from_provider_json(&google, json!({"sub":"1", "id":false})).unwrap();
+        assert_eq!(a.id, b.id);
+        assert_ne!(a.provider, b.provider);
     }
 }

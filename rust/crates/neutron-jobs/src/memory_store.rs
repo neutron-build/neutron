@@ -1,7 +1,7 @@
 //! In-memory [`JobStore`] implementation — no durability, useful for testing
 //! and development.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -44,6 +44,7 @@ struct Record {
 pub struct MemoryJobStore {
     records: Mutex<HashMap<u64, Record>>,
     next_id: AtomicU64,
+    pending: Mutex<HashMap<String, BTreeSet<(u64, u64)>>>,
 }
 
 impl MemoryJobStore {
@@ -51,6 +52,7 @@ impl MemoryJobStore {
         Self {
             records: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -66,11 +68,21 @@ impl JobStore for MemoryJobStore {
         Box::pin(async move {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             job.id = id;
+            job.claim_token = 0;
+            let queue = job.queue.clone();
+            let run_at_ms = job.run_at_ms;
             let record = Record {
                 job,
                 status: JobStatus::Pending,
             };
-            self.records.lock().unwrap().insert(id, record);
+            let mut records = self.records.lock().unwrap();
+            records.insert(id, record);
+            self.pending
+                .lock()
+                .unwrap()
+                .entry(queue)
+                .or_default()
+                .insert((run_at_ms, id));
             Ok(id)
         })
     }
@@ -86,14 +98,20 @@ impl JobStore for MemoryJobStore {
             let mut records = self.records.lock().unwrap();
             let mut claimed = Vec::new();
 
-            for record in records.values_mut() {
-                if claimed.len() >= limit {
-                    break;
-                }
-                if record.job.queue == queue
-                    && record.status == JobStatus::Pending
-                    && record.job.run_at_ms <= now
-                {
+            let mut pending = self.pending.lock().unwrap();
+            if let Some(index) = pending.get_mut(&queue) {
+                let due: Vec<_> = index
+                    .iter()
+                    .take_while(|(run_at, _)| *run_at <= now)
+                    .take(limit)
+                    .copied()
+                    .collect();
+                for entry in due {
+                    index.remove(&entry);
+                    let record = records
+                        .get_mut(&entry.1)
+                        .expect("pending index references record");
+                    record.job.claim_token += 1;
                     record.status = JobStatus::Running { started_at_ms: now };
                     claimed.push(record.job.clone());
                 }
@@ -103,10 +121,16 @@ impl JobStore for MemoryJobStore {
         })
     }
 
-    fn mark_completed(&self, id: u64) -> BoxFuture<'_, Result<(), StoreError>> {
+    fn mark_completed(&self, id: u64, claim_token: u64) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             let mut records = self.records.lock().unwrap();
             match records.get_mut(&id) {
+                Some(r)
+                    if r.job.claim_token != claim_token
+                        || !matches!(r.status, JobStatus::Running { .. }) =>
+                {
+                    Err(StoreError::StaleClaim(id))
+                }
                 Some(r) => {
                     r.status = JobStatus::Completed;
                     Ok(())
@@ -119,11 +143,18 @@ impl JobStore for MemoryJobStore {
     fn mark_failed<'a>(
         &'a self,
         id: u64,
+        claim_token: u64,
         _reason: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             let mut records = self.records.lock().unwrap();
             match records.get_mut(&id) {
+                Some(r)
+                    if r.job.claim_token != claim_token
+                        || !matches!(r.status, JobStatus::Running { .. }) =>
+                {
+                    Err(StoreError::StaleClaim(id))
+                }
                 Some(r) => {
                     r.status = JobStatus::Failed;
                     Ok(())
@@ -136,16 +167,29 @@ impl JobStore for MemoryJobStore {
     fn schedule_retry(
         &self,
         id: u64,
+        claim_token: u64,
         attempt: u32,
         run_at_ms: u64,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             let mut records = self.records.lock().unwrap();
             match records.get_mut(&id) {
+                Some(r)
+                    if r.job.claim_token != claim_token
+                        || !matches!(r.status, JobStatus::Running { .. }) =>
+                {
+                    Err(StoreError::StaleClaim(id))
+                }
                 Some(r) => {
                     r.job.attempt = attempt;
                     r.job.run_at_ms = run_at_ms;
                     r.status = JobStatus::Pending;
+                    self.pending
+                        .lock()
+                        .unwrap()
+                        .entry(r.job.queue.clone())
+                        .or_default()
+                        .insert((run_at_ms, id));
                     Ok(())
                 }
                 None => Err(StoreError::NotFound(id)),
@@ -155,15 +199,28 @@ impl JobStore for MemoryJobStore {
 
     fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
         Box::pin(async move {
-            let threshold = now_ms().saturating_sub(stale_secs * 1_000);
+            let threshold = now_ms().saturating_sub(stale_secs.saturating_mul(1_000));
             let mut records = self.records.lock().unwrap();
             let mut recovered = Vec::new();
 
             for record in records.values_mut() {
                 if let JobStatus::Running { started_at_ms } = record.status {
                     if started_at_ms < threshold {
-                        record.job.attempt += 1;
-                        record.status = JobStatus::Pending;
+                        let exhausted = record.job.attempt >= record.job.max_attempts;
+                        record.job.attempt = record.job.attempt.saturating_add(1);
+                        record.status = if exhausted {
+                            JobStatus::Failed
+                        } else {
+                            JobStatus::Pending
+                        };
+                        if record.status == JobStatus::Pending {
+                            self.pending
+                                .lock()
+                                .unwrap()
+                                .entry(record.job.queue.clone())
+                                .or_default()
+                                .insert((record.job.run_at_ms, record.job.id));
+                        }
                         recovered.push(record.job.clone());
                     }
                 }
@@ -249,7 +306,7 @@ mod tests {
         let s = MemoryJobStore::new();
         let id = s.push(make_job("default")).await.unwrap();
         s.claim_due("default", 1).await.unwrap();
-        s.mark_completed(id).await.unwrap();
+        s.mark_completed(id, 1).await.unwrap();
 
         // Job should no longer be claimable
         let again = s.claim_due("default", 1).await.unwrap();
@@ -261,7 +318,7 @@ mod tests {
         let s = MemoryJobStore::new();
         let id = s.push(make_job("default")).await.unwrap();
         s.claim_due("default", 1).await.unwrap();
-        s.mark_failed(id, "bad thing").await.unwrap();
+        s.mark_failed(id, 1, "bad thing").await.unwrap();
 
         let again = s.claim_due("default", 1).await.unwrap();
         assert!(again.is_empty());
@@ -271,7 +328,7 @@ mod tests {
     async fn mark_completed_not_found() {
         let s = MemoryJobStore::new();
         assert!(matches!(
-            s.mark_completed(999).await,
+            s.mark_completed(999, 1).await,
             Err(StoreError::NotFound(999))
         ));
     }
@@ -283,7 +340,7 @@ mod tests {
         s.claim_due("default", 1).await.unwrap();
 
         // Reschedule with run_at = now (immediately runnable)
-        s.schedule_retry(id, 2, now_ms()).await.unwrap();
+        s.schedule_retry(id, 1, 2, now_ms()).await.unwrap();
 
         let jobs = s.claim_due("default", 1).await.unwrap();
         assert_eq!(jobs.len(), 1);
@@ -297,7 +354,7 @@ mod tests {
         s.claim_due("default", 1).await.unwrap();
 
         // Schedule far in the future
-        s.schedule_retry(id, 2, now_ms() + 60_000).await.unwrap();
+        s.schedule_retry(id, 1, 2, now_ms() + 60_000).await.unwrap();
 
         let jobs = s.claim_due("default", 1).await.unwrap();
         assert!(jobs.is_empty());

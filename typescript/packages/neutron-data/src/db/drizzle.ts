@@ -1,8 +1,10 @@
 import type { DataConfigInput, DatabaseProvider } from "../config.js";
 import { resolveDatabaseProfile, type DatabaseProfile } from "./index.js";
 import type { DrizzleDatabase, DrizzleDatabaseOptions } from "./types.js";
-export type { DrizzleDatabase, DrizzleDatabaseOptions } from "./types.js";
+export type { DrizzleDatabase, DrizzleDatabaseOptions, NucleusCompanion } from "./types.js";
 import { lazyImport } from "../internal/lazy-import.js";
+import { cleanupAfterFailure, ownedClose } from "../internal/resources.js";
+import { admitConnection, resourceLifecycle } from "@neutron-build/sql/lifecycle";
 import { assertNodeRuntime } from "../internal/node-runtime.js";
 
 // Typed Drizzle interop (I03): this module returns REAL drizzle-orm objects —
@@ -44,15 +46,24 @@ export interface TypedDrizzleOptions<
  *  `drizzle-orm/postgres-js`'s `drizzle()` actually returns — a genuine
  *  `PostgresJsDatabase` carrying the caller's schema (relational
  *  `db.query.<table>` typing included) plus drizzle's `$client` handle. */
+const drizzleCapabilities = Object.freeze({ cancellation: 'unsupported', mutationOutcome: 'driver-error', automaticMutationReplay: false } as const);
+
+function withOwnership<T extends object>(value: T, resources: (() => unknown | Promise<unknown>)[]) {
+  const lifecycle = resourceLifecycle('owned', ownedClose(resources));
+  return { ...value, capabilities: drizzleCapabilities, lifecycle, close: () => lifecycle.terminate() };
+}
+
 export interface PostgresDrizzleDatabase<
   TSchema extends Record<string, unknown> = Record<string, never>,
 > {
+  readonly capabilities: DrizzleDatabase["capabilities"];
+  readonly lifecycle: DrizzleDatabase["lifecycle"];
   profile: ProfileOf<"postgres" | "nucleus">;
   /** The postgres.js `Sql` client driving Drizzle. */
   client: Sql;
   db: PostgresJsDatabase<TSchema> & { $client: Sql };
-  /** `@neutron-build/nucleus` client after `.connect()` when the provider is
-   *  `nucleus` and the package is installed; `null` otherwise. */
+  /** Configured companion or legacy plugin-free client; null when opted out
+   * or when the optional peer is absent. Plugins are caller-owned configuration. */
   nucleus: unknown | null;
   close: () => Promise<void>;
 }
@@ -63,6 +74,8 @@ export interface PostgresDrizzleDatabase<
 export interface SqliteDrizzleDatabase<
   TSchema extends Record<string, unknown> = Record<string, never>,
 > {
+  readonly capabilities: DrizzleDatabase["capabilities"];
+  readonly lifecycle: DrizzleDatabase["lifecycle"];
   profile: ProfileOf<"sqlite">;
   /** The `@libsql/client` `Client` driving Drizzle. */
   client: LibSqlClient;
@@ -92,10 +105,17 @@ export async function createDrizzleDatabase<
 >(options: DrizzleDatabaseOptions<TSchema> = {}): Promise<DrizzleDatabase> {
   assertNodeRuntime("createDrizzleDatabase");
 
+  admitConnection({ capabilities: drizzleCapabilities }, options.requiredCapabilities ?? {});
   const profile = options.profile || resolveDatabaseProfile(options.config);
+  if (options.nucleusCompanion !== undefined && options.nucleusCompanion !== null) {
+    if (profile.provider !== "nucleus") throw new Error("nucleusCompanion requires a Nucleus profile");
+    if (!["borrowed", "owned"].includes(options.nucleusCompanion.ownership) || typeof options.nucleusCompanion.client?.close !== "function") {
+      throw new Error("nucleusCompanion requires a closeable client and explicit borrowed/owned ownership");
+    }
+  }
 
   if (profile.provider === "nucleus") {
-    return await createNucleusDrizzle(profile, options.schema);
+    return await createNucleusDrizzle(profile, options.schema, options.nucleusCompanion);
   }
 
   if (profile.provider === "postgres") {
@@ -110,71 +130,41 @@ export async function createDrizzleDatabase<
  *
  * Since Nucleus speaks the PostgreSQL wire protocol, we reuse the same
  * `postgres` driver for Drizzle ORM. In addition, we create a Nucleus
- * client to provide access to non-relational data models.
+ * plugin-free companion for legacy callers. Inject a configured companion for model access.
  */
 async function createNucleusDrizzle(
   profile: DatabaseProfile,
-  schema?: Record<string, unknown>
+  schema?: Record<string, unknown>,
+  companion?: DrizzleDatabaseOptions["nucleusCompanion"],
 ): Promise<DrizzleDatabase> {
-  // Use the same postgres driver — Nucleus speaks pgwire
-  const postgresModule = await lazyImport<{ default: typeof import("postgres") }>(
-    "postgres",
-    "Install with `pnpm add postgres drizzle-orm` (or npm/yarn equivalent)"
-  );
-  const drizzleModule = await lazyImport<typeof import("drizzle-orm/postgres-js")>(
-    "drizzle-orm/postgres-js",
-    "Install with `pnpm add drizzle-orm` (or npm/yarn equivalent)"
-  );
-
-  const sqlClient: Sql = postgresModule.default(profile.connectionString, {
-    max: 10,
-    idle_timeout: 20,
-    connect_timeout: 10,
-  });
-
-  const db = schema
-    ? drizzleModule.drizzle(sqlClient, { schema })
-    : drizzleModule.drizzle(sqlClient);
-
-  // Optionally create the Nucleus multi-model client.
-  // This uses `@neutron-build/nucleus` which may not be installed in every project.
-  let nucleus: unknown | null = null;
-  type NucleusFactory = (config: { url: string }) => {
-    use: (plugin: unknown) => unknown;
-    connect: () => Promise<unknown>;
-  };
-  let createNucleusClient: NucleusFactory | undefined;
+  const resources: (() => unknown | Promise<unknown>)[] = [];
+  // Ownership transfers at factory entry, before any later startup await.
+  if (companion?.ownership === "owned") resources.push(() => companion.client.close());
   try {
-    const nucleusModule = await lazyImport<{ createClient?: NucleusFactory }>(
-      "@neutron-build/nucleus",
-      "@neutron-build/nucleus is optional for multi-model features"
-    );
-    createNucleusClient = nucleusModule.createClient;
-  } catch {
-    // Only the import belongs in the try: a missing module legitimately means
-    // Drizzle-only mode. A failed connect() (server down, auth rejected) must
-    // surface — swallowing it here silently degraded Nucleus profiles to
-    // `nucleus: null` with no error and no log.
-    nucleus = null;
-  }
-  if (createNucleusClient) {
-    nucleus = await createNucleusClient({
-      url: profile.connectionString,
-    }).connect();
-  }
-
-  return {
-    profile,
-    client: sqlClient,
-    db,
-    nucleus,
-    close: async () => {
-      if (nucleus && typeof (nucleus as { close?: () => Promise<void> }).close === "function") {
-        await (nucleus as { close: () => Promise<void> }).close();
+    const postgresModule = await lazyImport<{ default: typeof import("postgres") }>("postgres", "Install postgres drizzle-orm");
+    const drizzleModule = await lazyImport<typeof import("drizzle-orm/postgres-js")>("drizzle-orm/postgres-js", "Install drizzle-orm");
+    const sqlClient: Sql = postgresModule.default(profile.connectionString, { max: 10, idle_timeout: 20, connect_timeout: 10 });
+    resources.push(() => sqlClient.end());
+    const db = schema ? drizzleModule.drizzle(sqlClient, { schema }) : drizzleModule.drizzle(sqlClient);
+    let nucleus: unknown | null = companion?.client ?? null;
+    if (companion === undefined) {
+      type Connected = { close: () => Promise<void> };
+      let factory: ((config: { url: string }) => { connect: () => Promise<Connected> }) | undefined;
+      try {
+        const module = await lazyImport<{ createClient?: typeof factory }>("@neutron-build/nucleus", "Optional Nucleus companion");
+        factory = module.createClient;
+      } catch { /* Optional peer absent: Drizzle-only mode. */ }
+      if (factory) {
+        // The builder owns failed connection startup; once connected we own close.
+        const connected = await factory({ url: profile.connectionString }).connect();
+        resources.push(() => connected.close());
+        nucleus = connected;
       }
-      await sqlClient.end();
-    },
-  };
+    }
+    return withOwnership({ profile, client: sqlClient, db, nucleus }, resources);
+  } catch (error) {
+    return cleanupAfterFailure(error, resources);
+  }
 }
 
 async function createPostgresDrizzle(
@@ -196,19 +186,11 @@ async function createPostgresDrizzle(
     connect_timeout: 10,
   });
 
-  const db = schema
-    ? drizzleModule.drizzle(sqlClient, { schema })
-    : drizzleModule.drizzle(sqlClient);
-
-  return {
-    profile,
-    client: sqlClient,
-    db,
-    nucleus: null,
-    close: async () => {
-      await sqlClient.end();
-    },
-  };
+  const resources = [() => sqlClient.end()];
+  try {
+    const db = schema ? drizzleModule.drizzle(sqlClient, { schema }) : drizzleModule.drizzle(sqlClient);
+    return withOwnership({ profile, client: sqlClient, db, nucleus: null }, resources);
+  } catch (error) { return cleanupAfterFailure(error, resources); }
 }
 
 async function createSqliteDrizzle(
@@ -231,17 +213,11 @@ async function createSqliteDrizzle(
   const pathModule = await import("node:path");
   const url = normalizeSqliteConnection(profile.connectionString, pathModule.resolve);
   const client: LibSqlClient = libsqlModule.createClient({ url });
-  const db = schema ? drizzleModule.drizzle(client, { schema }) : drizzleModule.drizzle(client);
-
-  return {
-    profile,
-    client,
-    db,
-    nucleus: null,
-    close: async () => {
-      await client.close();
-    },
-  };
+  const resources = [() => client.close()];
+  try {
+    const db = schema ? drizzleModule.drizzle(client, { schema }) : drizzleModule.drizzle(client);
+    return withOwnership({ profile, client, db, nucleus: null }, resources);
+  } catch (error) { return cleanupAfterFailure(error, resources); }
 }
 
 function normalizeSqliteConnection(connectionString: string, resolve: (p: string) => string): string {

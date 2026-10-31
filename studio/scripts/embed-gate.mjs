@@ -78,7 +78,7 @@ try {
   let rendered = false;
   try {
     await page.getByRole("heading", { name: "Neutron Studio" }).waitFor({ timeout: 30000 });
-    await page.getByText("No saved connections. Add one above.").waitFor({ timeout: 30000 });
+    await page.getByText("A workspace starts with a connection").waitFor({ timeout: 30000 });
     rendered = true;
   } catch {}
   verdict("V17.ui: the served Studio renders its connection screen in Chrome", rendered, `${await page.title()} ${page.url()}`);

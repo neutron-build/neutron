@@ -376,6 +376,9 @@ func (o *outcomeStore) reserve(key, connID, hash string) reservation {
 	defer o.mu.Unlock()
 	now := time.Now()
 	if rec, ok := o.records[key]; ok {
+		if !recordOwnsOutcomeKey(rec, key) {
+			return reservation{kind: "unknown"}
+		}
 		if rec.State != outcomeInProgress && o.ttl > 0 && now.Sub(rec.CreatedAt) > o.ttl {
 			delete(o.records, key)
 			o.tombstone(key)
@@ -417,12 +420,19 @@ func (o *outcomeStore) finish(key string, mutate func(*outcomeRecord)) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	rec, ok := o.records[key]
-	if !ok {
+	if !ok || !recordOwnsOutcomeKey(rec, key) {
 		return
 	}
 	if mutate != nil {
 		mutate(rec)
 	}
+	// Bind the recorded and direct response to the admitted reservation,
+	// never to an identity supplied by a loose response body. All terminal
+	// writers share this boundary, including import and ambiguous outcomes.
+	if rec.Response == nil {
+		rec.Response = map[string]any{}
+	}
+	rec.Response["operationId"] = rec.OperationID
 	rec.CreatedAt = time.Now()
 }
 
@@ -438,12 +448,22 @@ func (o *outcomeStore) lookup(key string) (*outcomeRecord, string) {
 		}
 		return nil, "absent"
 	}
+	if !recordOwnsOutcomeKey(rec, key) {
+		return nil, outcomeUnknown
+	}
 	if rec.State != outcomeInProgress && o.ttl > 0 && time.Since(rec.CreatedAt) > o.ttl {
 		delete(o.records, key)
 		o.tombstone(key)
 		return nil, outcomeUnknown
 	}
 	return rec, rec.State
+}
+
+// recordOwnsOutcomeKey verifies both parts of the admitted identity before a
+// record can be used as evidence for a request or supply a response identity.
+func recordOwnsOutcomeKey(rec *outcomeRecord, key string) bool {
+	return rec != nil && rec.OperationID == splitOutcomeKey(key) &&
+		outcomeKey(rec.ConnectionID, rec.OperationID) == key
 }
 
 func splitOutcomeKey(key string) string {
@@ -1199,8 +1219,8 @@ func (s *Server) handleTableCommitV2(w http.ResponseWriter, r *http.Request) {
 	// is a failed (rolled-back, never-applied) outcome for this ID.
 	prepared, err := s.prepareCommitOps(r.Context(), body.ConnectionID, body.Operations)
 	if err != nil {
-		finishFailed(store, key, err, "commit prepare")
-		writeMutationOutcome(w, err, "commit prepare")
+		status, out := finishFailed(store, key, err, "commit prepare")
+		writeJSON(w, status, out)
 		return
 	}
 
@@ -1258,14 +1278,18 @@ func (s *Server) handleTableCommitV2(w http.ResponseWriter, r *http.Request) {
 }
 
 // finishFailed records a preparation-stage failure (nothing executed).
-func finishFailed(store *outcomeStore, key string, err error, verb string) {
+func finishFailed(store *outcomeStore, key string, err error, verb string) (int, map[string]any) {
 	status, out := classifyMutationOutcome(err, verb)
 	if out == nil {
 		out = map[string]any{}
 	}
+	if status >= 500 {
+		log.Printf("studio: %s error: %v", verb, err)
+	}
 	store.finish(key, func(rec *outcomeRecord) {
 		rec.State, rec.Status, rec.Response = outcomeFailed, status, out
 	})
+	return status, out
 }
 
 func commitResponseBody(operationID string, execs []opExecution, reversible bool, refusal string) map[string]any {
@@ -1292,6 +1316,9 @@ func copyResponseBody(rec *outcomeRecord) map[string]any {
 	for k, v := range rec.Response {
 		out[k] = v
 	}
+	// The caller has established record ownership through reserve/lookup.
+	// Also bind legacy bodies that were recorded without an operation ID.
+	out["operationId"] = rec.OperationID
 	return out
 }
 
@@ -1480,13 +1507,12 @@ func (s *Server) handleTableRevertV2(w http.ResponseWriter, r *http.Request) {
 	store := s.outcomeRecords()
 	prepared, err := s.prepareCommitOps(r.Context(), body.ConnectionID, rec.Inverse)
 	if err != nil {
-		finishFailed(store, revertKey, err, "revert prepare")
 		if se, ok := err.(rowStateError); ok && se.state == "binding" {
 			se.msg = "the recorded inverse no longer matches the live relation (reconnected or table replaced); reload and repair manually: " + se.msg
-			writeMutationOutcome(w, se, "revert prepare")
-			return
+			err = se
 		}
-		writeMutationOutcome(w, err, "revert prepare")
+		status, out := finishFailed(store, revertKey, err, "revert prepare")
+		writeJSON(w, status, out)
 		return
 	}
 	client, _ := s.clientFor(body.ConnectionID)

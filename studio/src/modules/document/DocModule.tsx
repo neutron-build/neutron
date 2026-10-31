@@ -1,19 +1,27 @@
 import { useSignal } from '@preact/signals'
 import { useEffect, useRef, useCallback } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
-import { api } from '../../lib/api'
-import { exportCSV, exportJSON } from '../../lib/export'
+import { queryMutationOrThrow as runMutation, api } from '../../lib/api'
+import { parseDocument, serializeDocument, replaceDocument, JsonNumber, type DocumentValue, type DocumentPath } from '../../lib/documentJson'
+import { exportCSV, exportDocumentJSON } from '../../lib/export'
 import { isRlsDenied } from '../../lib/rls'
 import { RlsNotice } from '../../components/RlsNotice'
 import s from './DocModule.module.css'
 
 interface DocEntry {
   id: string
-  data: unknown
+  data: DocumentValue
+  raw: string
+  connectionId: string
+  collection: string
 }
 
 interface DocModuleProps {
   name: string
+}
+
+function docIdentity(d: DocEntry): string {
+  return JSON.stringify([d.connectionId, d.collection, d.id])
 }
 
 // Editable JSON tree renderer with inline edit on click
@@ -23,46 +31,71 @@ function JsonNode({
   path,
   onEdit,
 }: {
-  value: unknown
+  value: DocumentValue
   depth?: number
-  path: string
-  onEdit: (path: string, newValue: unknown) => void
+  path: DocumentPath
+  onEdit: (path: DocumentPath, newValue: DocumentValue) => void
 }) {
   const collapsed = useSignal(depth > 2)
   const editing = useSignal(false)
   const editText = useSignal('')
+  const editError = useSignal<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const leafRef = useRef<HTMLSpanElement>(null)
+  const wasEditing = useRef(false)
+  useEffect(() => {
+    if (editing.value) inputRef.current?.focus()
+    else if (wasEditing.current) leafRef.current?.focus()
+    wasEditing.current = editing.value
+  }, [editing.value])
 
   function startEdit(ev: Event) {
     ev.stopPropagation()
     editing.value = true
-    editText.value = typeof value === 'string' ? value : JSON.stringify(value)
+    editText.value = serializeDocument(value)
+    editError.value = null
   }
 
   function cancelEdit() {
     editing.value = false
     editText.value = ''
+    editError.value = null
+    leafRef.current?.focus()
   }
 
   function commitEdit() {
     const raw = editText.value
-    let parsed: unknown
-    // Try parsing as JSON first (for numbers, booleans, null, objects, arrays)
+    let parsed: DocumentValue
     try {
-      parsed = JSON.parse(raw)
-    } catch {
-      // If it fails, treat as string
-      parsed = raw
+      parsed = parseDocument(raw)
+    } catch (err) {
+      editError.value = `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`
+      inputRef.current?.focus()
+      return
     }
     onEdit(path, parsed)
     editing.value = false
+    editError.value = null
+    leafRef.current?.focus()
+  }
+
+  const leafControls = {
+    role: 'button' as const, tabIndex: 0, ref: leafRef,
+    'aria-label': `Edit JSON value at ${JSON.stringify(path)}`,
+    onKeyDown: (ev: KeyboardEvent) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); startEdit(ev) }
+    },
   }
 
   // Leaf nodes (null, boolean, number, string) are directly editable
-  if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+  if (value === null || typeof value === 'boolean' || value instanceof JsonNumber || typeof value === 'string') {
     if (editing.value) {
       return (
         <span class={s.inlineEditWrap} onClick={(ev) => ev.stopPropagation()}>
           <input
+            ref={inputRef}
+            aria-label={`JSON value at ${JSON.stringify(path)}`}
+            aria-invalid={!!editError.value}
             class={s.inlineEditInput}
             value={editText.value}
             onInput={ev => { editText.value = (ev.target as HTMLInputElement).value }}
@@ -71,23 +104,24 @@ function JsonNode({
               if (ev.key === 'Escape') cancelEdit()
             }}
           />
-          <button class={s.inlineEditSave} onClick={commitEdit}>&#10003;</button>
-          <button class={s.inlineEditCancel} onClick={cancelEdit}>&#10005;</button>
+          <button aria-label="Save JSON value" class={s.inlineEditSave} onClick={commitEdit}>&#10003;</button>
+          <button aria-label="Cancel JSON edit" class={s.inlineEditCancel} onClick={cancelEdit}>&#10005;</button>
+          {editError.value && <span role="alert">{editError.value}</span>}
         </span>
       )
     }
 
-    if (value === null) return <span class={`${s.jNull} ${s.jEditable}`} onClick={startEdit}>null</span>
-    if (typeof value === 'boolean') return <span class={`${s.jBool} ${s.jEditable}`} onClick={startEdit}>{String(value)}</span>
-    if (typeof value === 'number') return <span class={`${s.jNum} ${s.jEditable}`} onClick={startEdit}>{value}</span>
-    return <span class={`${s.jStr} ${s.jEditable}`} onClick={startEdit}>"{value}"</span>
+    if (value === null) return <span class={`${s.jNull} ${s.jEditable}`} onClick={startEdit} {...leafControls}>null</span>
+    if (typeof value === 'boolean') return <span class={`${s.jBool} ${s.jEditable}`} onClick={startEdit} {...leafControls}>{String(value)}</span>
+    if (value instanceof JsonNumber) return <span class={`${s.jNum} ${s.jEditable}`} onClick={startEdit} {...leafControls}>{(value as JsonNumber).raw}</span>
+    return <span class={`${s.jStr} ${s.jEditable}`} onClick={startEdit} {...leafControls}>"{value}"</span>
   }
 
   if (Array.isArray(value)) {
     if (value.length === 0) return <span class={s.jBracket}>[]</span>
     return (
       <span>
-        <button class={s.collapseBtn} onClick={() => { collapsed.value = !collapsed.value }}>
+        <button aria-label={`Toggle JSON children at ${JSON.stringify(path)}`} aria-expanded={!collapsed.value} class={s.collapseBtn} onClick={() => { collapsed.value = !collapsed.value }}>
           {collapsed.value ? '\u25b6' : '\u25bc'}
         </button>
         <span class={s.jBracket}>[</span>
@@ -100,7 +134,7 @@ function JsonNode({
             {value.map((v, i) => (
               <div key={i} class={s.jLine}>
                 <span class={s.jIndex}>{i}</span>
-                <JsonNode value={v} depth={depth + 1} path={`${path}[${i}]`} onEdit={onEdit} />
+                <JsonNode value={v} depth={depth + 1} path={[...path, i]} onEdit={onEdit} />
                 {i < value.length - 1 && <span class={s.jComma}>,</span>}
               </div>
             ))}
@@ -116,7 +150,7 @@ function JsonNode({
     if (keys.length === 0) return <span class={s.jBracket}>{'{}'}</span>
     return (
       <span>
-        <button class={s.collapseBtn} onClick={() => { collapsed.value = !collapsed.value }}>
+        <button aria-label={`Toggle JSON children at ${JSON.stringify(path)}`} aria-expanded={!collapsed.value} class={s.collapseBtn} onClick={() => { collapsed.value = !collapsed.value }}>
           {collapsed.value ? '\u25b6' : '\u25bc'}
         </button>
         <span class={s.jBracket}>{'{'}</span>
@@ -130,7 +164,7 @@ function JsonNode({
               <div key={k} class={s.jLine}>
                 <span class={s.jKey}>"{k}"</span>
                 <span class={s.jColon}>: </span>
-                <JsonNode value={(value as Record<string, unknown>)[k]} depth={depth + 1} path={`${path}.${k}`} onEdit={onEdit} />
+                <JsonNode value={(value as { [key: string]: DocumentValue })[k]} depth={depth + 1} path={[...path, k]} onEdit={onEdit} />
                 {i < keys.length - 1 && <span class={s.jComma}>,</span>}
               </div>
             ))}
@@ -148,6 +182,7 @@ export function DocModule({ name }: DocModuleProps) {
   const docs = useSignal<DocEntry[]>([])
   const loading = useSignal(false)
   const selected = useSignal<DocEntry | null>(null)
+  const selectionGeneration = useRef(0)
   const editRaw = useSignal('')
   const editMode = useSignal(false) // false = tree view, true = raw JSON editor
   const saving = useSignal(false)
@@ -158,15 +193,14 @@ export function DocModule({ name }: DocModuleProps) {
   // X02: collection scoping. The engine scopes every DOC_* statement to one
   // collection (a document in another collection reads as absent); an empty
   // value is the default collection. Collections are namespaces, not
-  // permissions: any session may name any collection. The /api/query endpoint does not bind
-  // parameters yet, so the UI constrains the name to characters that
-  // cannot break out of a single-quoted literal.
+  // permissions: any session may name any collection. Names are constrained
+  // to this namespace vocabulary; every loaded entry retains its origin.
   const collection = useSignal('')
   const COLLECTION_RE = /^[a-zA-Z0-9_-]{0,64}$/
 
   // Track if the document has been modified (for tree-view inline edits)
   const treeModified = useSignal(false)
-  const treeData = useSignal<unknown>(null)
+  const treeData = useSignal<DocumentValue>(null)
 
   // New document form
   const showNewDoc = useSignal(false)
@@ -185,16 +219,24 @@ export function DocModule({ name }: DocModuleProps) {
   const conn = activeConnection.value!
 
   /** Scoped-collection SQL helpers (empty = the default collection). */
-  function collLit(): string {
-    return collection.value === '' ? '' : `'${collection.value}', `
+  function collLit(coll = collection.value): string {
+    return coll === '' ? '' : `'${coll}', `
   }
+  const loadGeneration = useRef(0)
+  const currentLoad = (generation: number, coll: string, connectionId: string) => generation === loadGeneration.current && coll === collection.value && connectionId === activeConnection.value?.id
 
   async function load() {
+    const generation = ++loadGeneration.current
+    const coll = collection.value
+    const connectionId = conn.id
+    const lit = collLit(coll)
+    const owns = () => currentLoad(generation, coll, connectionId)
     loading.value = true
     try {
       // DOC_QUERY with an empty filter returns a comma-separated list of all
       // matching ids, scoped to the selected collection.
-      const idRes = await api.query(`SELECT DOC_QUERY(${collLit()}'{}')`, conn.id)
+      const idRes = await api.query(`SELECT DOC_QUERY(${lit}'{}')`, connectionId)
+      if (!owns()) return
       if (idRes.error) throw new Error(idRes.error)
       const cell = idRes.rows[0]?.[0]
       // Ids come from the engine; only plain digit tokens are kept, so
@@ -211,73 +253,86 @@ export function DocModule({ name }: DocModuleProps) {
         return
       }
       // Fetch each document body with DOC_GET(id) in one multi-column select.
-      const cols = pageIds.map(id => `DOC_GET(${collLit()}${id})`).join(', ')
-      const dataRes = await api.query(`SELECT ${cols}`, conn.id)
+      const cols = pageIds.map(id => `DOC_GET(${lit}${id})`).join(', ')
+      const dataRes = await api.query(`SELECT ${cols}`, connectionId)
+      if (!owns()) return
       if (dataRes.error) throw new Error(dataRes.error)
       const row = (dataRes.rows[0] ?? []) as unknown[]
-      docs.value = pageIds.map((id, i) => ({
-        id,
-        data: row[i] != null ? (typeof row[i] === 'string' ? JSON.parse(row[i] as string) : row[i]) : null,
-      }))
+      docs.value = pageIds.map((id, i) => {
+        const raw = typeof row[i] === 'string' ? row[i] as string : JSON.stringify(row[i] ?? null)
+        return { id, raw, data: parseDocument(raw), connectionId, collection: coll }
+      })
     } catch (err: unknown) {
+      if (!owns()) return
       const msg = err instanceof Error ? err.message : String(err)
       rlsDenied.value = isRlsDenied(msg) ? msg : null
       toast('error', msg)
     } finally {
-      loading.value = false
+      if (owns()) loading.value = false
     }
   }
 
-  useEffect(() => { load() }, [name, page.value, collection.value])
+  useEffect(() => { load() }, [name, page.value, collection.value, conn.id])
+
+  useEffect(() => {
+    confirmDeleteId.value = null
+    if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
+    confirmTimerRef.current = null
+  }, [name, collection.value, conn.id])
 
   // Clean up confirm timer on unmount
   useEffect(() => {
     return () => {
+      selectionGeneration.current++
+      loadGeneration.current++
       if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
     }
   }, [])
 
   function selectDoc(d: DocEntry) {
-    selected.value = d
-    const raw = JSON.stringify(d.data, null, 2)
+    selectionGeneration.current++
+    selected.value = { ...d }
+    const raw = d.raw
     editRaw.value = raw
     rawOriginal.value = raw
     editMode.value = false
-    treeData.value = structuredClone(d.data)
+    treeData.value = parseDocument(d.raw)
     treeModified.value = false
   }
 
   // Handle inline edits in tree view
-  function handleTreeEdit(path: string, newValue: unknown) {
-    if (!treeData.value || typeof treeData.value !== 'object') return
-    const cloned = structuredClone(treeData.value) as Record<string, unknown>
-    setNestedValue(cloned, path, newValue)
-    treeData.value = cloned
-    treeModified.value = true
-    // Sync with raw editor
-    editRaw.value = JSON.stringify(cloned, null, 2)
+  function handleTreeEdit(path: DocumentPath, newValue: DocumentValue) {
+    try {
+      treeData.value = replaceDocument(treeData.value, path, newValue)
+      treeModified.value = true
+      editRaw.value = serializeDocument(treeData.value)
+    } catch (err) { toast('error', err instanceof Error ? err.message : String(err)) }
   }
 
   async function saveDoc() {
+    if (saving.value) return
     const d = selected.value
     if (!d) return
-    let parsed: unknown
     try {
-      parsed = JSON.parse(editRaw.value)
+      parseDocument(editRaw.value)
     } catch {
       toast('error', 'Invalid JSON')
       return
     }
+    const submitted = editRaw.value
     saving.value = true
     try {
-      const jsonStr = JSON.stringify(parsed).replace(/'/g, "''")
-      await api.query(
-        `SELECT DOC_UPDATE(${collLit()}${d.id}, '${jsonStr}')`,
-        conn.id
+      const jsonStr = submitted.replace(/'/g, "''")
+      await queryMutationOrThrow(
+        `SELECT DOC_UPDATE(${collLit(d.collection)}${d.id}, '${jsonStr}')`,
+        d.connectionId
       )
       toast('success', `Document ${d.id} saved`)
-      treeModified.value = false
-      rawOriginal.value = editRaw.value
+      if (selected.value === d) {
+        selected.value = { ...d, raw: submitted, data: parseDocument(submitted) }
+        rawOriginal.value = submitted
+        if (editRaw.value === submitted) treeModified.value = false
+      }
       await load()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -287,17 +342,23 @@ export function DocModule({ name }: DocModuleProps) {
   }
 
   async function saveTreeDoc() {
+    if (saving.value) return
     const d = selected.value
-    if (!d || !treeData.value) return
+    if (!d) return
+    const submitted = serializeDocument(treeData.value)
     saving.value = true
     try {
-      const jsonStr = JSON.stringify(treeData.value).replace(/'/g, "''")
-      await api.query(
-        `SELECT DOC_UPDATE(${collLit()}${d.id}, '${jsonStr}')`,
-        conn.id
+      const jsonStr = submitted.replace(/'/g, "''")
+      await queryMutationOrThrow(
+        `SELECT DOC_UPDATE(${collLit(d.collection)}${d.id}, '${jsonStr}')`,
+        d.connectionId
       )
       toast('success', `Document ${d.id} saved`)
-      treeModified.value = false
+      if (selected.value === d) {
+        selected.value = { ...d, raw: submitted, data: parseDocument(submitted) }
+        rawOriginal.value = submitted
+        if (editRaw.value === submitted) treeModified.value = false
+      }
       await load()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -308,22 +369,25 @@ export function DocModule({ name }: DocModuleProps) {
 
   // New document
   async function insertDoc() {
-    let parsed: unknown
+    if (saving.value) return
     try {
-      parsed = JSON.parse(newDocRaw.value)
+      parseDocument(newDocRaw.value)
     } catch {
       toast('error', 'Invalid JSON')
       return
     }
+    const submitted = newDocRaw.value
     saving.value = true
     try {
-      const jsonStr = JSON.stringify(parsed).replace(/'/g, "''")
-      await api.query(
+      const jsonStr = submitted.replace(/'/g, "''")
+      await queryMutationOrThrow(
         `SELECT DOC_INSERT(${collLit()}'${jsonStr}')`,
         conn.id
       )
-      showNewDoc.value = false
-      newDocRaw.value = '{\n  \n}'
+      if (newDocRaw.value === submitted) {
+        showNewDoc.value = false
+        newDocRaw.value = '{\n  \n}'
+      }
       toast('success', 'Document created')
       await load()
     } catch (err: unknown) {
@@ -334,12 +398,13 @@ export function DocModule({ name }: DocModuleProps) {
   }
 
   // Delete with confirmation
-  const requestDelete = useCallback((id: string, ev: Event) => {
+  const requestDelete = useCallback((d: DocEntry, ev: Event) => {
+    const id = docIdentity(d)
     ev.stopPropagation()
     if (confirmDeleteId.value === id) {
       if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
       confirmDeleteId.value = null
-      doDelete(id)
+      doDelete(d)
     } else {
       confirmDeleteId.value = id
       if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current)
@@ -347,12 +412,16 @@ export function DocModule({ name }: DocModuleProps) {
         confirmDeleteId.value = null
       }, 3000)
     }
-  }, [])
+  }, [conn.id])
 
-  async function doDelete(id: string) {
+  async function doDelete(d: DocEntry) {
+    const id = d.id
+    const selection = selected.value
+    const generation = selectionGeneration.current
     try {
-      await api.query(`SELECT DOC_DELETE(${collLit()}${id})`, conn.id)
-      if (selected.value?.id === id) selected.value = null
+      await queryMutationOrThrow(`SELECT DOC_DELETE(${collLit(d.collection)}${id})`, d.connectionId)
+      if (selectionGeneration.current === generation && selected.value === selection &&
+          selection && docIdentity(selection) === docIdentity(d)) selected.value = null
       toast('info', `Document ${id} deleted`)
       await load()
     } catch (err: unknown) {
@@ -377,7 +446,10 @@ export function DocModule({ name }: DocModuleProps) {
             title="Document collection (empty = default). Statements are scoped to it: a document in another collection reads as absent here."
             onInput={e => {
               const el = e.target as HTMLInputElement
-              if (COLLECTION_RE.test(el.value)) collection.value = el.value
+              if (COLLECTION_RE.test(el.value)) {
+                if (collection.value !== el.value) { confirmDeleteId.value = null; if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current); confirmTimerRef.current = null; loadGeneration.current++; docs.value = []; total.value = 0; loading.value = false }
+                collection.value = el.value
+              }
               else el.value = collection.value // rejected characters never stick
             }}
             onKeyDown={e => { if (e.key === 'Enter') { page.value = 0; load() } }}
@@ -389,7 +461,7 @@ export function DocModule({ name }: DocModuleProps) {
           <button
             class={s.exportBtn}
             onClick={() => {
-              const data = docs.value.map(d => ({ id: d.id, data: JSON.stringify(d.data) }))
+              const data = docs.value.map(d => ({ id: d.id, data: d.raw }))
               exportCSV(data, `docs-${name}.csv`)
             }}
             disabled={docs.value.length === 0}
@@ -397,7 +469,7 @@ export function DocModule({ name }: DocModuleProps) {
           >CSV</button>
           <button
             class={s.exportBtn}
-            onClick={() => exportJSON(docs.value, `docs-${name}.json`)}
+            onClick={() => exportDocumentJSON(docs.value, `docs-${name}.json`)}
             disabled={docs.value.length === 0}
             title="Export JSON"
           >JSON</button>
@@ -429,18 +501,20 @@ export function DocModule({ name }: DocModuleProps) {
             <div class={s.msg}>No documents</div>
           )}
           {docs.value.map(d => {
-            const isConfirming = confirmDeleteId.value === d.id
+            const isConfirming = confirmDeleteId.value === docIdentity(d)
             return (
               <div
-                key={d.id}
-                class={`${s.docRow} ${selected.value?.id === d.id ? s.docRowActive : ''}`}
+                key={docIdentity(d)}
+                role="button" tabIndex={0} aria-label={`Open document ${d.id} in ${d.collection || "default"} on ${d.connectionId}`}
+                onKeyDown={ev => { if (ev.target === ev.currentTarget && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); selectDoc(d) } }}
+                class={`${s.docRow} ${selected.value && docIdentity(selected.value) === docIdentity(d) ? s.docRowActive : ''}`}
                 onClick={() => selectDoc(d)}
               >
                 <span class={s.docId}>{d.id}</span>
                 <span class={s.docPreview}>{previewDoc(d.data)}</span>
                 <button
                   class={`${s.deleteBtn} ${isConfirming ? s.deleteBtnConfirm : ''}`}
-                  onClick={ev => requestDelete(d.id, ev)}
+                  onClick={ev => requestDelete(d, ev)}
                   title={isConfirming ? 'Click again to confirm' : 'Delete'}
                 >{isConfirming ? 'Confirm?' : '\u00d7'}</button>
               </div>
@@ -462,19 +536,19 @@ export function DocModule({ name }: DocModuleProps) {
         ) : (
           <>
             <div class={s.docHeader}>
-              <span class={s.docHeaderId}>{selected.value.id}</span>
+              <span class={s.docHeaderId}>{selected.value.id} · {selected.value.collection || '(default)'} @{selected.value.connectionId}</span>
               <div class={s.viewToggle}>
                 <button
                   class={`${s.toggleBtn} ${!editMode.value ? s.toggleActive : ''}`}
                   onClick={() => {
-                    editMode.value = false
                     // Sync tree data from raw if raw was edited
                     if (rawDirty) {
                       try {
-                        treeData.value = JSON.parse(editRaw.value)
+                        treeData.value = parseDocument(editRaw.value)
                         treeModified.value = true
-                      } catch { /* ignore parse errors when switching */ }
+                      } catch { toast('error', 'Invalid JSON'); return }
                     }
+                    editMode.value = false
                   }}
                 >Tree</button>
                 <button
@@ -483,7 +557,7 @@ export function DocModule({ name }: DocModuleProps) {
                     editMode.value = true
                     // Sync raw from tree data if tree was modified
                     if (treeModified.value && treeData.value) {
-                      editRaw.value = JSON.stringify(treeData.value, null, 2)
+                      editRaw.value = serializeDocument(treeData.value)
                     }
                   }}
                 >Raw</button>
@@ -493,16 +567,16 @@ export function DocModule({ name }: DocModuleProps) {
             {!editMode.value ? (
               <>
                 <div class={s.treeView}>
-                  <JsonNode value={treeData.value} depth={0} path="$" onEdit={handleTreeEdit} />
+                  <JsonNode key={`${docIdentity(selected.value)}:${selectionGeneration.current}`} value={treeData.value} depth={0} path={[]} onEdit={handleTreeEdit} />
                 </div>
                 {treeModified.value && (
                   <div class={s.editFooter}>
                     <span class={s.modifiedBadge}>Modified</span>
                     <button class={s.discardBtn} onClick={() => {
                       if (selected.value) {
-                        treeData.value = structuredClone(selected.value.data)
+                        treeData.value = parseDocument(selected.value.raw)
                         treeModified.value = false
-                        editRaw.value = JSON.stringify(selected.value.data, null, 2)
+                        editRaw.value = selected.value.raw
                       }
                     }}>Discard</button>
                     <button class={s.saveBtn} onClick={saveTreeDoc} disabled={saving.value}>
@@ -524,7 +598,7 @@ export function DocModule({ name }: DocModuleProps) {
                   {rawDirty && (
                     <button class={s.discardBtn} onClick={() => {
                       if (selected.value) {
-                        editRaw.value = JSON.stringify(selected.value.data, null, 2)
+                        editRaw.value = selected.value.raw
                         rawOriginal.value = editRaw.value
                       }
                     }}>Discard</button>
@@ -543,50 +617,11 @@ export function DocModule({ name }: DocModuleProps) {
 }
 
 function previewDoc(data: unknown): string {
+  if (data instanceof JsonNumber) return data.raw
   if (!data || typeof data !== 'object') return String(data)
   const keys = Object.keys(data as object)
   return keys.slice(0, 3).join(', ') + (keys.length > 3 ? '...' : '')
 }
 
-/** Set a value at a JSON path like "$.foo.bar[2].baz" */
-function setNestedValue(obj: unknown, path: string, value: unknown): void {
-  // Parse path: "$" is root, then ".key" or "[index]"
-  const parts = parsePath(path)
-  if (parts.length === 0) return
 
-  let current: unknown = obj
-  for (let i = 0; i < parts.length - 1; i++) {
-    const part = parts[i]
-    if (typeof part === 'number' && Array.isArray(current)) {
-      current = current[part]
-    } else if (typeof part === 'string' && current && typeof current === 'object') {
-      current = (current as Record<string, unknown>)[part]
-    } else {
-      return
-    }
-  }
-
-  const last = parts[parts.length - 1]
-  if (typeof last === 'number' && Array.isArray(current)) {
-    current[last] = value
-  } else if (typeof last === 'string' && current && typeof current === 'object') {
-    (current as Record<string, unknown>)[last] = value
-  }
-}
-
-function parsePath(path: string): (string | number)[] {
-  const parts: (string | number)[] = []
-  // Remove leading "$"
-  let p = path.startsWith('$') ? path.slice(1) : path
-  // Match .key or [index]
-  const regex = /\.([^.[]+)|\[(\d+)\]/g
-  let match: RegExpExecArray | null
-  while ((match = regex.exec(p)) !== null) {
-    if (match[1] !== undefined) {
-      parts.push(match[1])
-    } else if (match[2] !== undefined) {
-      parts.push(parseInt(match[2], 10))
-    }
-  }
-  return parts
-}
+const queryMutationOrThrow = (sql: string, connectionId: string, params?: unknown[]) => runMutation(sql, connectionId, params, api.query)

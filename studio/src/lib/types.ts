@@ -174,6 +174,13 @@ export interface QueryResult {
   rowLimit?: number
 }
 
+/** Bounded PostgreSQL-direct live keyset page; no cross-page snapshot/count. */
+export interface TablePageResult extends QueryResult {
+  hasNext: boolean
+  nextCursor: string
+  consistency: 'live-keyset/request-repeatable-read'
+}
+
 /** One component of a full-tuple equality filter; value is a wire cell. */
 export interface MatchCell {
   column: string

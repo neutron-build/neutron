@@ -25,6 +25,11 @@ class AnimatedValue {
   stopAnimation(cb?: (v: number) => void) { cb?.(this._value) }
 }
 
+// Host components for RN's JS-driven Animated (used by neutron-native's
+// no-Reanimated Animated hosts).
+function AnimatedHost(host: string) {
+  return ({ children, ...props }: { children?: unknown } & Record<string, unknown>) => ({ type: host, props: { ...props, children } })
+}
 const Animated = {
   Value: AnimatedValue,
   timing: (_av: AnimatedValue, _config: Record<string, unknown>) => ({
@@ -52,10 +57,10 @@ const Animated = {
     },
     stop: () => {},
   }),
-  View: 'Animated.View',
-  Text: 'Animated.Text',
-  Image: 'Animated.Image',
-  ScrollView: 'Animated.ScrollView',
+  View: AnimatedHost('AnimatedView'),
+  Text: AnimatedHost('AnimatedText'),
+  Image: AnimatedHost('AnimatedImage'),
+  ScrollView: AnimatedHost('AnimatedScrollView'),
   createAnimatedComponent: (comp: unknown) => comp,
 }
 
@@ -125,17 +130,12 @@ const Vibration = {
 }
 
 // --- PanResponder ---
+// panHandlers exposes the CONFIG callbacks so tests can drive a real
+// fallback sequence (grant/move/release) through them.
 const PanResponder = {
-  create: jest.fn().mockReturnValue({
-    panHandlers: {
-      onStartShouldSetResponder: jest.fn(),
-      onMoveShouldSetResponder: jest.fn(),
-      onResponderGrant: jest.fn(),
-      onResponderMove: jest.fn(),
-      onResponderRelease: jest.fn(),
-      onResponderTerminate: jest.fn(),
-    },
-  }),
+  create: jest.fn((config: Record<string, (e: unknown, gs: unknown) => unknown>) => ({
+    panHandlers: { ...config },
+  })),
 }
 
 // --- PixelRatio ---

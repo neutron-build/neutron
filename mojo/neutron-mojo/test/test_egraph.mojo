@@ -35,9 +35,13 @@ def test_hash_consing_same_op() raises:
     """Hash-consing: duplicate nodes should return same e-class."""
     var eg = EGraph()
 
-    # Add two identical Const nodes
+    # Add two explicit scalar F32 constants with identical payloads
     var const1 = CanonicalNode(OpKind.Const)
     var const2 = CanonicalNode(OpKind.Const)
+    const1.has_constant = True
+    const2.has_constant = True
+    const1.constant_bits = 0x3F800000
+    const2.constant_bits = 0x3F800000
 
     var c0 = eg.add(const1^)
     var c1 = eg.add(const2^)
@@ -71,7 +75,7 @@ def test_add_binary_op() raises:
     var eg = EGraph()
 
     # Create leaf nodes with different ops (Input and Const)
-    # Note: Two Input nodes would hash-cons to the same class
+    # Opaque Input nodes remain distinct symbols.
     var input_node = CanonicalNode(OpKind.Input)
     var const_node = CanonicalNode(OpKind.Const)
 

@@ -28,13 +28,33 @@ import (
 // credential that permitted it.
 func New() mail.Resolver { return NewWithGmailRefresh(nil) }
 
-// GmailRefresh renews a rejected access token using the application-owned
+// Refresh renews a rejected access token using the application-owned
 // credential store. It must honor ctx and must not create new grants.
-type GmailRefresh func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error)
+type Refresh func(context.Context, mail.AccountID, mail.Credential) (mail.Credential, error)
+
+// GmailRefresh is the Refresh used for Gmail reads.
+type GmailRefresh = Refresh
 
 // NewWithGmailRefresh permits one refresh/retry of a rejected Gmail GET.
 // Mutations never use this recovery path.
-func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver {
+func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver { return NewWithPolicy(refresh, Policy{}) }
+
+// Policy comes from product account configuration, never request headers.
+type Policy struct {
+	// JMAPAllowedOrigins names credential destinations beyond the JMAP
+	// discovery origin (a provider's separate download host, for one).
+	// Session metadata cannot authorize an origin by itself.
+	JMAPAllowedOrigins func(context.Context, mail.AccountID, mail.Credential) ([]string, error)
+
+	// GraphRefresh permits one refresh/retry of a rejected Graph GET, as the
+	// GmailRefresh argument does for Gmail. Without it an access token that
+	// expires during a long import fails the run as ErrReauthRequired.
+	// Mutations never use this recovery path.
+	GraphRefresh Refresh
+}
+
+// NewWithPolicy is NewWithGmailRefresh plus product-owned dial policy.
+func NewWithPolicy(refresh GmailRefresh, policy Policy) mail.Resolver {
 	return func(ctx context.Context, acct mail.AccountID, cred mail.Credential) (mail.Adapter, func(), error) {
 		if cred.Zero() {
 			return nil, nil, fmt.Errorf("mail: no credential supplied for account %s", acct)
@@ -47,11 +67,18 @@ func NewWithGmailRefresh(refresh GmailRefresh) mail.Resolver {
 		case mail.ProviderIMAP:
 			return dialIMAP(ctx, cred)
 		case mail.ProviderJMAP:
-			return dialJMAP(ctx, cred)
+			var origins []string
+			if policy.JMAPAllowedOrigins != nil {
+				var err error
+				if origins, err = policy.JMAPAllowedOrigins(ctx, acct, cred); err != nil {
+					return nil, nil, err
+				}
+			}
+			return dialJMAP(ctx, cred, origins)
 		case mail.ProviderGmail:
 			return dialGmailAccount(ctx, acct, cred, refresh)
 		case mail.ProviderGraph:
-			return dialGraph(cred)
+			return dialGraphAccount(acct, cred, policy.GraphRefresh)
 		default:
 			return nil, nil, fmt.Errorf("mail: unsupported provider %q", cred.Provider)
 		}
@@ -74,15 +101,16 @@ func dialIMAP(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), 
 	return ad, func() { _ = ad.Close() }, nil
 }
 
-func dialJMAP(ctx context.Context, cred mail.Credential) (mail.Adapter, func(), error) {
+func dialJMAP(ctx context.Context, cred mail.Credential, origins []string) (mail.Adapter, func(), error) {
 	sessionURL := fmt.Sprintf("https://%s/.well-known/jmap", cred.Host)
 	if cred.Port != 0 {
 		sessionURL = fmt.Sprintf("https://%s:%d/.well-known/jmap", cred.Host, cred.Port)
 	}
 
 	ad, err := jmap.Dial(ctx, jmap.Config{
-		SessionURL: sessionURL,
-		Token:      cred.AccessToken,
+		SessionURL:     sessionURL,
+		Token:          cred.AccessToken,
+		AllowedOrigins: origins,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -109,7 +137,8 @@ func dialGmailAccount(ctx context.Context, acct mail.AccountID, cred mail.Creden
 	limiter := gmailLimiterFor(acct)
 	client := bearerClient(cred.AccessToken, gmailAPIHost)
 	if refresh != nil {
-		client.Transport = &gmailRefreshTransport{acct: acct, cred: cred, refresh: refresh,
+		client.Transport = &refreshTransport{acct: acct, cred: cred, refresh: refresh,
+			provider: mail.ProviderGmail, host: gmailAPIHost,
 			base: http.DefaultTransport, limiter: limiter, gate: make(chan struct{}, 1)}
 	}
 	ad, err := gmail.NewWithReadLimiter(ctx, limiter,
@@ -120,8 +149,16 @@ func dialGmailAccount(ctx context.Context, acct mail.AccountID, cred mail.Creden
 	return ad, func() { _ = ad.Close() }, nil
 }
 
-func dialGraph(cred mail.Credential) (mail.Adapter, func(), error) {
-	ad := graph.New(bearerClient(cred.AccessToken, "graph.microsoft.com"))
+const graphAPIHost = "graph.microsoft.com"
+
+func dialGraphAccount(acct mail.AccountID, cred mail.Credential, refresh Refresh) (mail.Adapter, func(), error) {
+	client := bearerClient(cred.AccessToken, graphAPIHost)
+	if refresh != nil {
+		client.Transport = &refreshTransport{acct: acct, cred: cred, refresh: refresh,
+			provider: mail.ProviderGraph, host: graphAPIHost,
+			base: http.DefaultTransport, gate: make(chan struct{}, 1)}
+	}
+	ad := graph.New(client)
 	return ad, func() { _ = ad.Close() }, nil
 }
 

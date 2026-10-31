@@ -1,10 +1,10 @@
 // WebSocket hub invariant tests.
 module websocket_hub_test {
-    import websocket_hub.*
+    import websocket_hub.* from "../specs/realtime/websocket_hub"
 
     // Test: initial state is valid
     run init_valid_test = {
-        init.then(all { members_connected, empty_rooms_clean })
+        init.expect(all { members_connected, empty_rooms_clean })
     }
 
     // Test: connect, join, broadcast, deliver
@@ -16,7 +16,7 @@ module websocket_hub_test {
             .then(join_room(2, 1))
             .then(broadcast(1, 1))
             .then(deliver(2, 1))
-            .then(all {
+            .expect(all {
                 members_connected,
                 no_self_delivery,
                 no_duplicate_delivery,
@@ -31,7 +31,7 @@ module websocket_hub_test {
             .then(join_room(1, 1))
             .then(join_room(2, 1))
             .then(broadcast(1, 1))
-            .then(no_self_delivery)
+            .expect(no_self_delivery)
     }
 
     // Test: disconnect removes from rooms
@@ -40,7 +40,7 @@ module websocket_hub_test {
             .then(connect(1))
             .then(join_room(1, 1))
             .then(disconnect(1))
-            .then(all { members_connected, empty_rooms_clean })
+            .expect(all { members_connected, empty_rooms_clean })
     }
 
     // Test: leave room mid-broadcast
@@ -55,7 +55,7 @@ module websocket_hub_test {
             .then(broadcast(1, 1))
             .then(leave_room(2, 1))
             // Message still pending for conn 2 even after leaving
-            .then(all { members_connected, broadcast_scoped })
+            .expect(all { members_connected, broadcast_scoped })
     }
 
     // Test: multiple rooms are independent
@@ -69,6 +69,6 @@ module websocket_hub_test {
             .then(join_room(3, 2))
             // Broadcast to room 1 — conn 3 should not receive
             .then(broadcast(1, 1))
-            .then(all { no_self_delivery, broadcast_scoped })
+            .expect(all { no_self_delivery, broadcast_scoped })
     }
 }

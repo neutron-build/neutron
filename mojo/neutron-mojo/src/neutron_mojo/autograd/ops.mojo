@@ -31,8 +31,9 @@ from .tape import (
 comptime AUTOGRAD_SIMD_WIDTH = 4
 
 
-def tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) raises -> Int:
     """Tracked elementwise addition: c = a + b. SIMD-accelerated."""
+    tape.validate_same_shape(a_idx, b_idx)
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[a_idx].copy()
@@ -68,8 +69,9 @@ def tracked_add(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     return c_idx
 
 
-def tracked_sub(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_sub(mut tape: Tape, a_idx: Int, b_idx: Int) raises -> Int:
     """Tracked elementwise subtraction: c = a - b."""
+    tape.validate_same_shape(a_idx, b_idx)
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[a_idx].copy()
@@ -85,8 +87,9 @@ def tracked_sub(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     return c_idx
 
 
-def tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) raises -> Int:
     """Tracked elementwise multiplication: c = a * b. SIMD-accelerated."""
+    tape.validate_same_shape(a_idx, b_idx)
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[a_idx].copy()
@@ -122,11 +125,26 @@ def tracked_mul(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
     return c_idx
 
 
-def tracked_matmul(mut tape: Tape, a_idx: Int, b_idx: Int, M: Int, K: Int, N: Int) -> Int:
+def tracked_matmul(mut tape: Tape, a_idx: Int, b_idx: Int, M: Int, K: Int, N: Int) raises -> Int:
     """Tracked matrix multiplication: C = A @ B.
 
     A is (M, K), B is (K, N), C is (M, N).
     """
+    tape.validate_variable(a_idx)
+    tape.validate_variable(b_idx)
+    if M <= 0 or K <= 0 or N <= 0:
+        raise Error("Tracked matmul dimensions must be positive")
+    var a_shape = Shape(M, K)
+    var b_shape = Shape(K, N)
+    var output_shape = Shape(M, N)
+    if tape.var_numel(a_idx) != a_shape.numel() or tape.var_numel(b_idx) != b_shape.numel():
+        raise Error("Tracked matmul input spans do not match dimensions")
+    var ash = tape.var_shapes[a_idx].copy()
+    var bsh = tape.var_shapes[b_idx].copy()
+    if not ((len(ash) == 2 and ash[0] == M and ash[1] == K) or (len(ash) == 1 and M == 1 and ash[0] == K)):
+        raise Error("Tracked matmul left shape mismatch")
+    if len(bsh) != 2 or bsh[0] != K or bsh[1] != N:
+        raise Error("Tracked matmul right shape mismatch")
     var dims = List[Int]()
     dims.append(M)
     dims.append(N)
@@ -143,8 +161,9 @@ def tracked_matmul(mut tape: Tape, a_idx: Int, b_idx: Int, M: Int, K: Int, N: In
     return c_idx
 
 
-def tracked_relu(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_relu(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked ReLU: y = max(0, x). SIMD-accelerated with compare+select."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -180,8 +199,9 @@ def tracked_relu(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_sigmoid(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_sigmoid(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked sigmoid: y = 1/(1+exp(-x))."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -198,8 +218,9 @@ def tracked_sigmoid(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_tanh(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_tanh(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked tanh: y = tanh(x)."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -214,8 +235,9 @@ def tracked_tanh(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_exp(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_exp(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked exp: y = exp(x)."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -230,8 +252,9 @@ def tracked_exp(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_log(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_log(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked log: y = log(x)."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -246,8 +269,9 @@ def tracked_log(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_neg(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_neg(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked negation: y = -x."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -262,8 +286,9 @@ def tracked_neg(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
+def tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) raises -> Int:
     """Tracked scalar multiplication: y = x * scalar. SIMD-accelerated."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -294,8 +319,9 @@ def tracked_scalar_mul(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     return y_idx
 
 
-def tracked_scalar_add(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
+def tracked_scalar_add(mut tape: Tape, x_idx: Int, scalar: Float64) raises -> Int:
     """Tracked scalar addition: y = x + scalar."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
@@ -311,9 +337,12 @@ def tracked_scalar_add(mut tape: Tape, x_idx: Int, scalar: Float64) -> Int:
     return y_idx
 
 
-def tracked_softmax(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_softmax(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked softmax (1D)."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
+    if n <= 0:
+        raise Error("tracked_softmax requires a nonempty variable")
     var dims = List[Int]()
     var shape = tape.var_shapes[x_idx].copy()
     for i in range(len(shape)):
@@ -343,8 +372,9 @@ def tracked_softmax(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_sum(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_sum(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked sum reduction to scalar (stored as 1-element variable)."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
     var dims = List[Int]()
     dims.append(1)
@@ -359,9 +389,12 @@ def tracked_sum(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_mean(mut tape: Tape, x_idx: Int) -> Int:
+def tracked_mean(mut tape: Tape, x_idx: Int) raises -> Int:
     """Tracked mean reduction to scalar."""
+    tape.validate_variable(x_idx)
     var n = tape.var_numel(x_idx)
+    if n <= 0:
+        raise Error("tracked_mean requires a nonempty variable")
     var dims = List[Int]()
     dims.append(1)
     var y_idx = tape.add_variable(dims^, requires_grad=True)
@@ -375,8 +408,9 @@ def tracked_mean(mut tape: Tape, x_idx: Int) -> Int:
     return y_idx
 
 
-def tracked_div(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
+def tracked_div(mut tape: Tape, a_idx: Int, b_idx: Int) raises -> Int:
     """Tracked elementwise division: c = a / b."""
+    tape.validate_same_shape(a_idx, b_idx)
     var n = tape.var_numel(a_idx)
     var dims = List[Int]()
     var shape = tape.var_shapes[a_idx].copy()
@@ -394,3 +428,107 @@ def tracked_div(mut tape: Tape, a_idx: Int, b_idx: Int) -> Int:
 
     tape.record(TapeEntry(OP_DIV(), a_idx, b_idx, c_idx))
     return c_idx
+
+
+def tracked_matmul_right_transpose(mut tape: Tape, a_idx: Int, w_idx: Int,
+                                   M: Int, K: Int, N: Int) raises -> Int:
+    """C[M,N] = A[M,K] @ W[N,K]^T, preserving row-major weights."""
+    from .tape import OP_MATMUL_RIGHT_TRANSPOSE
+    tape.validate_variable(a_idx)
+    tape.validate_variable(w_idx)
+    if M <= 0 or K <= 0 or N <= 0:
+        raise Error("Matmul dimensions must be positive")
+    if M > 0x7FFFFFFFFFFFFFFF // K or N > 0x7FFFFFFFFFFFFFFF // K or M > 0x7FFFFFFFFFFFFFFF // N:
+        raise Error("Matmul shape overflow")
+    if tape.var_numel(a_idx) != M * K or tape.var_numel(w_idx) != N * K:
+        raise Error("Transposed-right matmul operand size mismatch")
+    var ws = tape.var_shapes[w_idx].copy()
+    if len(ws) != 2 or ws[0] != N or ws[1] != K:
+        raise Error("Transposed-right weight must have shape [N,K]")
+    var dims = List[Int]()
+    if len(tape.var_shapes[a_idx]) != 1:
+        dims.append(M)
+    dims.append(N)
+    var out_idx = tape.add_variable(dims^, requires_grad=True)
+    for m in range(M):
+        for n in range(N):
+            var value = Float32(0)
+            for k in range(K):
+                value += tape.get_data(a_idx, m * K + k) * tape.get_data(w_idx, n * K + k)
+            tape.set_data(out_idx, m * N + n, value)
+    tape.record(TapeEntry(OP_MATMUL_RIGHT_TRANSPOSE(), a_idx, w_idx, out_idx,
+                         cached_int=M, cached_int2=K, cached_int3=N))
+    return out_idx
+
+
+def tracked_bias_add(mut tape: Tape, x_idx: Int, bias_idx: Int) raises -> Int:
+    """Add a final-axis bias to each row; backward sums rows into the bias."""
+    tape.validate_variable(x_idx)
+    from .tape import OP_BIAS_ADD
+    tape.validate_variable(x_idx)
+    tape.validate_variable(bias_idx)
+    var shape = tape.var_shapes[x_idx].copy()
+    var bias_shape = tape.var_shapes[bias_idx].copy()
+    if len(shape) == 0 or len(bias_shape) != 1:
+        raise Error("Bias addition needs a vector bias and ranked input")
+    var width = shape[len(shape) - 1]
+    if width <= 0 or bias_shape[0] != width:
+        raise Error("Bias width mismatch")
+    var n = tape.var_numel(x_idx)
+    var out_idx = tape.add_variable(shape^, requires_grad=True)
+    for i in range(n):
+        tape.set_data(out_idx, i, tape.get_data(x_idx, i) + tape.get_data(bias_idx, i % width))
+    tape.record(TapeEntry(OP_BIAS_ADD(), x_idx, bias_idx, out_idx, cached_int=width))
+    return out_idx
+
+
+def tracked_slice(mut tape: Tape, x_idx: Int, start: Int, length: Int) raises -> Int:
+    """Tracked flat slice with reverse scatter into its source."""
+    tape.validate_variable(x_idx)
+    from .tape import OP_SPLIT
+    tape.validate_variable(x_idx)
+    var n = tape.var_numel(x_idx)
+    if start < 0 or start > n or length < 0 or length > n - start:
+        raise Error("Invalid tracked slice")
+    var dims = List[Int]()
+    dims.append(length)
+    var out = tape.add_variable(dims^, requires_grad=True)
+    for i in range(length):
+        tape.set_data(out, i, tape.get_data(x_idx, start + i))
+    tape.record(TapeEntry(OP_SPLIT(), x_idx, -1, out, cached_int=start))
+    return out
+
+
+def tracked_concat_flat(mut tape: Tape, a: Int, b: Int) raises -> Int:
+    """Tracked flat concatenation, retaining both graph edges."""
+    from .tape import OP_CONCAT
+    tape.validate_variable(a)
+    tape.validate_variable(b)
+    var na = tape.var_numel(a)
+    var nb = tape.var_numel(b)
+    if nb > 0x7FFFFFFFFFFFFFFF - na:
+        raise Error("Tracked concatenation overflow")
+    var dims = List[Int]()
+    dims.append(na + nb)
+    var out = tape.add_variable(dims^, requires_grad=True)
+    for i in range(na):
+        tape.set_data(out, i, tape.get_data(a, i))
+    for i in range(nb):
+        tape.set_data(out, na + i, tape.get_data(b, i))
+    tape.record(TapeEntry(OP_CONCAT(), a, b, out, cached_int=na))
+    return out
+
+
+def tracked_vector_scale(mut tape: Tape, x: Int, scalar: Int) raises -> Int:
+    """Multiply a vector by a tracked scalar (gradient reaches both operands)."""
+    from .tape import OP_VECTOR_SCALE
+    tape.validate_variable(x)
+    tape.validate_variable(scalar)
+    if tape.var_numel(scalar) != 1:
+        raise Error("Vector scale requires a scalar")
+    var dims = tape.var_shapes[x].copy()
+    var out = tape.add_variable(dims^, requires_grad=True)
+    for i in range(tape.var_numel(x)):
+        tape.set_data(out, i, tape.get_data(x, i) * tape.get_data(scalar, 0))
+    tape.record(TapeEntry(OP_VECTOR_SCALE(), x, scalar, out))
+    return out

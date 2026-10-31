@@ -61,6 +61,14 @@ struct GrammarState(Copyable, Movable, ImplicitlyCopyable):
     comptime IN_KEY = 14         # Inside key string
     comptime IN_KEY_ESCAPE = 15  # After \ in key string
     comptime DONE = 16           # Complete valid JSON
+    comptime NUMBER_SIGN = 18
+    comptime NUMBER_ZERO = 19
+    comptime FRAC_START = 20
+    comptime EXP_START = 21
+    comptime EXP_SIGN = 22
+    comptime STRING_UNICODE = 23
+    comptime KEY_UNICODE = 24
+    comptime OBJECT_KEY = 25
     comptime ERROR = 17          # Invalid state
 
     @implicit
@@ -97,6 +105,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
     var state: GrammarState
     var depth: Int                # Current nesting depth
     var max_depth: Int            # Maximum allowed depth
+    var unicode_remaining: Int
     var literal_pos: Int          # Position within literal (true/false/null)
     var num_stack: List[Int]      # Stack of container types (0=object, 1=array)
     var after_stack: List[Int]    # Stack of states to return to after value
@@ -105,6 +114,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         self.state = GrammarState(GrammarState.START)
         self.depth = 0
         self.max_depth = max_depth
+        self.unicode_remaining = 0
         self.literal_pos = 0
         self.num_stack = List[Int]()
         self.after_stack = List[Int]()
@@ -113,6 +123,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         self.state = GrammarState(copy.state.value())
         self.depth = copy.depth
         self.max_depth = copy.max_depth
+        self.unicode_remaining = copy.unicode_remaining
         self.literal_pos = copy.literal_pos
         self.num_stack = List[Int]()
         for i in range(len(copy.num_stack)):
@@ -125,6 +136,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         self.state = GrammarState(move.state.value())
         self.depth = move.depth^
         self.max_depth = move.max_depth^
+        self.unicode_remaining = move.unicode_remaining^
         self.literal_pos = move.literal_pos^
         self.num_stack = move.num_stack^
         self.after_stack = move.after_stack^
@@ -134,6 +146,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         var fsm = JsonFSM(self.max_depth)
         fsm.state = GrammarState(self.state.value())
         fsm.depth = self.depth
+        fsm.unicode_remaining = self.unicode_remaining
         fsm.literal_pos = self.literal_pos
         for i in range(len(self.num_stack)):
             fsm.num_stack.append(self.num_stack[i])
@@ -151,7 +164,8 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
 
     def can_end(self) -> Bool:
         """Check if current state allows generation to end (valid JSON so far)."""
-        return self.state == GrammarState(GrammarState.DONE) or self.state == GrammarState(GrammarState.AFTER_VALUE)
+        var state = self.state.value()
+        return self.depth == 0 and (state == GrammarState.DONE or state == GrammarState.IN_NUMBER or state == GrammarState.NUMBER_ZERO or state == GrammarState.IN_NUMBER_FRAC or state == GrammarState.IN_NUMBER_EXP)
 
     def _push_container(mut self, container_type: Int):
         """Push a container (0=object, 1=array) onto the stack."""
@@ -194,8 +208,11 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
 
         if s == GrammarState.START or s == GrammarState.AFTER_COLON:
             self._feed_value_start(c)
-        elif s == GrammarState.IN_OBJECT:
-            self._feed_in_object(c)
+        elif s == GrammarState.IN_OBJECT or s == GrammarState.OBJECT_KEY:
+            if s == GrammarState.OBJECT_KEY and c == 125:
+                self.state = GrammarState(GrammarState.ERROR)
+            else:
+                self._feed_in_object(c)
         elif s == GrammarState.IN_ARRAY:
             self._feed_in_array(c)
         elif s == GrammarState.IN_STRING:
@@ -206,6 +223,35 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
             self._feed_in_key(c)
         elif s == GrammarState.IN_KEY_ESCAPE:
             self._feed_key_escape(c)
+        elif s == GrammarState.NUMBER_SIGN:
+            if not is_digit(c):
+                self.state = GrammarState(GrammarState.ERROR)
+            else:
+                self.state = GrammarState(GrammarState.NUMBER_ZERO if c == 48 else GrammarState.IN_NUMBER)
+        elif s == GrammarState.NUMBER_ZERO:
+            if is_digit(c):
+                self.state = GrammarState(GrammarState.ERROR)
+            else:
+                self._feed_in_number(c)
+        elif s == GrammarState.FRAC_START or s == GrammarState.EXP_SIGN:
+            if not is_digit(c):
+                self.state = GrammarState(GrammarState.ERROR)
+            else:
+                self.state = GrammarState(GrammarState.IN_NUMBER_FRAC if s == GrammarState.FRAC_START else GrammarState.IN_NUMBER_EXP)
+        elif s == GrammarState.EXP_START:
+            if c == 43 or c == 45:
+                self.state = GrammarState(GrammarState.EXP_SIGN)
+            elif is_digit(c):
+                self.state = GrammarState(GrammarState.IN_NUMBER_EXP)
+            else:
+                self.state = GrammarState(GrammarState.ERROR)
+        elif s == GrammarState.STRING_UNICODE or s == GrammarState.KEY_UNICODE:
+            if not is_hex(c):
+                self.state = GrammarState(GrammarState.ERROR)
+            else:
+                self.unicode_remaining -= 1
+                if self.unicode_remaining == 0:
+                    self.state = GrammarState(GrammarState.IN_STRING if s == GrammarState.STRING_UNICODE else GrammarState.IN_KEY)
         elif s == GrammarState.IN_NUMBER:
             self._feed_in_number(c)
         elif s == GrammarState.IN_NUMBER_FRAC:
@@ -244,7 +290,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         elif c == 34:  # '"'
             self.state = GrammarState(GrammarState.IN_STRING)
         elif c == 45 or is_digit(c):  # '-' or digit
-            self.state = GrammarState(GrammarState.IN_NUMBER)
+            self.state = GrammarState(GrammarState.NUMBER_SIGN if c == 45 else (GrammarState.NUMBER_ZERO if c == 48 else GrammarState.IN_NUMBER))
         elif c == 116:  # 't'
             self.literal_pos = 1
             self.state = GrammarState(GrammarState.IN_TRUE)
@@ -282,7 +328,9 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
 
     def _feed_in_string(mut self, c: Int):
         """Handle character inside string value."""
-        if c == 92:  # '\\' — escape
+        if c < 32:
+            self.state = GrammarState(GrammarState.ERROR)
+        elif c == 92:  # '\\' — escape
             self.state = GrammarState(GrammarState.IN_STRING_ESCAPE)
         elif c == 34:  # '"' — end of string
             self._finish_value()
@@ -291,14 +339,19 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
     def _feed_string_escape(mut self, c: Int):
         """Handle character after backslash in string."""
         # Valid escapes: " \ / b f n r t u
-        if c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116 or c == 117:
+        if c == 117:
+            self.unicode_remaining = 4
+            self.state = GrammarState(GrammarState.STRING_UNICODE)
+        elif c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116:
             self.state = GrammarState(GrammarState.IN_STRING)
         else:
             self.state = GrammarState(GrammarState.ERROR)
 
     def _feed_in_key(mut self, c: Int):
         """Handle character inside key string."""
-        if c == 92:  # '\\' — escape
+        if c < 32:
+            self.state = GrammarState(GrammarState.ERROR)
+        elif c == 92:  # '\\' — escape
             self.state = GrammarState(GrammarState.IN_KEY_ESCAPE)
         elif c == 34:  # '"' — end of key
             self.state = GrammarState(GrammarState.AFTER_KEY)
@@ -306,7 +359,10 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
 
     def _feed_key_escape(mut self, c: Int):
         """Handle character after backslash in key."""
-        if c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116 or c == 117:
+        if c == 117:
+            self.unicode_remaining = 4
+            self.state = GrammarState(GrammarState.KEY_UNICODE)
+        elif c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116:
             self.state = GrammarState(GrammarState.IN_KEY)
         else:
             self.state = GrammarState(GrammarState.ERROR)
@@ -325,37 +381,37 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         if is_digit(c):
             return  # continue reading digits
         elif c == 46:  # '.'
-            self.state = GrammarState(GrammarState.IN_NUMBER_FRAC)
+            self.state = GrammarState(GrammarState.FRAC_START)
         elif c == 101 or c == 69:  # 'e' or 'E'
-            self.state = GrammarState(GrammarState.IN_NUMBER_EXP)
+            self.state = GrammarState(GrammarState.EXP_START)
         else:
             # Number ended — process this character as after-value
             self._finish_value()
-            self._feed_after_value(c)
+            self.feed_char(c)
 
     def _feed_in_number_frac(mut self, c: Int):
         """Handle character after decimal point."""
         if is_digit(c):
             return
         elif c == 101 or c == 69:  # 'e' or 'E'
-            self.state = GrammarState(GrammarState.IN_NUMBER_EXP)
+            self.state = GrammarState(GrammarState.EXP_START)
         else:
             self._finish_value()
-            self._feed_after_value(c)
+            self.feed_char(c)
 
     def _feed_in_number_exp(mut self, c: Int):
         """Handle character in exponent."""
-        if is_digit(c) or c == 43 or c == 45:  # digit, +, -
+        if is_digit(c):
             return
         else:
             self._finish_value()
-            self._feed_after_value(c)
+            self.feed_char(c)
 
     def _feed_literal(mut self, c: Int, expected: String):
         """Handle character in literal (true/false/null)."""
         if self.literal_pos >= expected.byte_length():
             self._finish_value()
-            self._feed_after_value(c)
+            self.feed_char(c)
             return
 
         var expected_byte = ord(expected[byte=self.literal_pos])
@@ -373,7 +429,7 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
         var ct = self._current_container()
         if ct == 0:  # in object
             if c == 44:  # ',' — next key-value pair
-                self.state = GrammarState(GrammarState.IN_OBJECT)
+                self.state = GrammarState(GrammarState.OBJECT_KEY)
             elif c == 125:  # '}' — close object
                 _ = self._pop_container()
                 self._finish_value()
@@ -401,131 +457,13 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
             self.state = GrammarState(GrammarState.AFTER_VALUE)
 
     def get_valid_chars(self) -> List[Int]:
-        """Get list of valid next character byte values.
-
-        Returns:
-            List of ASCII byte values that are valid next characters.
-        """
+        """First-byte prefilter derived from the same transition contract."""
         var valid = List[Int]()
-        var s = self.state.value()
-
-        if s == GrammarState.ERROR:
-            return valid^  # nothing valid
-
-        if s == GrammarState.DONE:
-            # Only EOS / whitespace
-            valid.append(32)   # space
-            valid.append(10)   # newline
-            return valid^
-
-        if s == GrammarState.START or s == GrammarState.AFTER_COLON:
-            # Value start: { [ " - 0-9 t f n whitespace
-            valid.append(123)  # {
-            valid.append(91)   # [
-            valid.append(34)   # "
-            valid.append(45)   # -
-            for d in range(10):
-                valid.append(48 + d)  # 0-9
-            valid.append(116)  # t
-            valid.append(102)  # f
-            valid.append(110)  # n
-            valid.append(32)   # space
-            valid.append(10)   # newline
-            valid.append(9)    # tab
-            valid.append(13)   # CR
-
-        elif s == GrammarState.IN_OBJECT:
-            valid.append(34)   # " (key start)
-            valid.append(125)  # }
-            valid.append(32)
-            valid.append(10)
-            valid.append(9)
-            valid.append(13)
-
-        elif s == GrammarState.IN_ARRAY:
-            # Value start + ]
-            valid.append(93)   # ]
-            valid.append(123)  # {
-            valid.append(91)   # [
-            valid.append(34)   # "
-            valid.append(45)   # -
-            for d in range(10):
-                valid.append(48 + d)
-            valid.append(116)  # t
-            valid.append(102)  # f
-            valid.append(110)  # n
-            valid.append(32)
-            valid.append(10)
-            valid.append(9)
-            valid.append(13)
-
-        elif s == GrammarState.IN_STRING or s == GrammarState.IN_KEY:
-            # Any printable ASCII except unescaped control chars
-            valid.append(92)   # \ (escape start)
-            valid.append(34)   # " (end string)
-            for c in range(32, 127):
-                if c != 34 and c != 92:
-                    valid.append(c)
-
-        elif s == GrammarState.IN_STRING_ESCAPE or s == GrammarState.IN_KEY_ESCAPE:
-            valid.append(34)   # "
-            valid.append(92)   # backslash
-            valid.append(47)   # /
-            valid.append(98)   # b
-            valid.append(102)  # f
-            valid.append(110)  # n
-            valid.append(114)  # r
-            valid.append(116)  # t
-            valid.append(117)  # u
-
-        elif s == GrammarState.AFTER_KEY:
-            valid.append(58)   # :
-            valid.append(32)
-            valid.append(10)
-            valid.append(9)
-            valid.append(13)
-
-        elif s == GrammarState.IN_NUMBER:
-            for d in range(10):
-                valid.append(48 + d)
-            valid.append(46)   # .
-            valid.append(101)  # e
-            valid.append(69)   # E
-            # Number can end -> add after-value chars
-            self._add_after_value_chars(valid)
-
-        elif s == GrammarState.IN_NUMBER_FRAC:
-            for d in range(10):
-                valid.append(48 + d)
-            valid.append(101)  # e
-            valid.append(69)   # E
-            self._add_after_value_chars(valid)
-
-        elif s == GrammarState.IN_NUMBER_EXP:
-            for d in range(10):
-                valid.append(48 + d)
-            valid.append(43)   # +
-            valid.append(45)   # -
-            self._add_after_value_chars(valid)
-
-        elif s == GrammarState.IN_TRUE:
-            var expected = "true"
-            if self.literal_pos < expected.byte_length():
-                valid.append(ord(expected[byte=self.literal_pos]))
-
-        elif s == GrammarState.IN_FALSE:
-            var expected = "false"
-            if self.literal_pos < expected.byte_length():
-                valid.append(ord(expected[byte=self.literal_pos]))
-
-        elif s == GrammarState.IN_NULL:
-            var expected = "null"
-            if self.literal_pos < expected.byte_length():
-                valid.append(ord(expected[byte=self.literal_pos]))
-
-        elif s == GrammarState.AFTER_VALUE:
-            self._add_after_value_chars(valid)
-
+        for c in range(256):
+            var candidate = self.copy()
+            candidate.feed_char(c)
+            if not candidate.is_error():
+                valid.append(c)
         return valid^
 
     def _add_after_value_chars(self, mut valid: List[Int]):
@@ -548,102 +486,42 @@ struct JsonFSM(Copyable, Movable, ImplicitlyCopyable):
 # Grammar Mask Application
 # ===----------------------------------------------------------------------=== #
 
-def apply_grammar_mask(
-    mut logits: Tensor[DType.float32],
-    vocab_size: Int,
-    fsm: JsonFSM,
-    tokenizer_vocab: List[String],
-    eos_id: Int,
-):
-    """Mask logits to only allow tokens producing valid JSON characters.
-
-    For each token in the vocabulary, checks if its first character is valid
-    according to the current FSM state. Tokens whose first character is
-    invalid get their logit set to -infinity.
-
-    Args:
-        logits: Raw logits [vocab_size], modified in-place.
-        vocab_size: Vocabulary size.
-        fsm: Current JSON FSM state.
-        tokenizer_vocab: List mapping token ID -> token string.
-        eos_id: EOS token ID (allowed when FSM can end).
-    """
-    var valid_chars = fsm.get_valid_chars()
-
-    for tok_id in range(vocab_size):
-        if tok_id == eos_id:
-            # Allow EOS only when JSON is complete
-            if not fsm.can_end():
-                logits.set(tok_id, Float32(-1e30))
-            continue
-
-        if tok_id >= len(tokenizer_vocab):
-            logits.set(tok_id, Float32(-1e30))
-            continue
-
-        var token_str = tokenizer_vocab[tok_id]
-        if token_str.byte_length() == 0:
-            logits.set(tok_id, Float32(-1e30))
-            continue
-
-        # Check if first byte of this token is valid
-        var first_byte = ord(token_str[byte=0])
-        var is_valid = False
-        for i in range(len(valid_chars)):
-            if valid_chars[i] == first_byte:
-                is_valid = True
-                break
-
-        if not is_valid:
-            logits.set(tok_id, Float32(-1e30))
+def apply_grammar_mask(mut logits: Tensor[DType.float32], vocab_size: Int,
+                       fsm: JsonFSM, tokenizer_vocab: List[String], eos_id: Int) raises:
+    """Enforce the complete token grammar; first-byte filtering is insufficient."""
+    apply_grammar_mask_full(logits, vocab_size, fsm, tokenizer_vocab, eos_id)
 
 
-def apply_grammar_mask_full(
-    mut logits: Tensor[DType.float32],
-    vocab_size: Int,
-    fsm: JsonFSM,
-    tokenizer_vocab: List[String],
-    eos_id: Int,
-):
-    """Stricter grammar mask: validates ALL bytes of each token.
-
-    Simulates feeding every byte of each token through the FSM.
-    If any byte causes an error, the token is masked out.
-    More accurate than first-byte-only but slower.
-
-    Args:
-        logits: Raw logits [vocab_size], modified in-place.
-        vocab_size: Vocabulary size.
-        fsm: Current JSON FSM state.
-        tokenizer_vocab: List mapping token ID -> token string.
-        eos_id: EOS token ID.
-    """
-    for tok_id in range(vocab_size):
-        if tok_id == eos_id:
-            if not fsm.can_end():
-                logits.set(tok_id, Float32(-1e30))
-            continue
-
-        if tok_id >= len(tokenizer_vocab):
-            logits.set(tok_id, Float32(-1e30))
-            continue
-
-        var token_str = tokenizer_vocab[tok_id]
-        if token_str.byte_length() == 0:
-            logits.set(tok_id, Float32(-1e30))
-            continue
-
-        # Simulate feeding all bytes through a copy of the FSM
-        var test_fsm = fsm.copy()
-        var valid = True
-        for i in range(token_str.byte_length()):
-            test_fsm.feed_char(ord(token_str[byte=i]))
-            if test_fsm.is_error():
-                valid = False
-                break
-
-        if not valid:
-            logits.set(tok_id, Float32(-1e30))
+def apply_grammar_mask_full(mut logits: Tensor[DType.float32], vocab_size: Int,
+                            fsm: JsonFSM, tokenizer_vocab: List[String], eos_id: Int) raises:
+    """Full-token JSON admission with a true forbidden mask and dead-end refusal."""
+    from neutron_mojo.io.binary_reader import _u32_to_f32
+    from std.math import isfinite
+    if vocab_size <= 0 or logits.numel() != vocab_size or fsm.is_error():
+        raise Error("Invalid JSON grammar sampling input")
+    var allowed = List[Bool]()
+    var any_allowed = False
+    for id in range(vocab_size):
+        var valid = False
+        if id == eos_id:
+            valid = fsm.can_end()
+        elif id < len(tokenizer_vocab) and tokenizer_vocab[id].byte_length() > 0:
+            var candidate = fsm.copy()
+            var token = tokenizer_vocab[id]
+            for i in range(token.byte_length()):
+                candidate.feed_char(ord(token[byte=i]))
+                if candidate.is_error():
+                    break
+            valid = not candidate.is_error()
+        allowed.append(valid)
+        if valid and isfinite(logits.data_ptr()[id]):
+            any_allowed = True
+    if not any_allowed:
+        raise Error("JSON grammar has no selectable token")
+    var forbidden = _u32_to_f32(0xFF800000)
+    for id in range(vocab_size):
+        if not allowed[id]:
+            logits.set(id, forbidden)
 
 
 def advance_fsm(mut fsm: JsonFSM, token_str: String):

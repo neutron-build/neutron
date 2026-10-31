@@ -52,13 +52,15 @@ struct RewriteRule(Copyable, Movable, ImplicitlyCopyable):
     var priority: RulePriority
     var lhs: Pattern  # Left-hand side pattern to match
     var rhs: Pattern  # Right-hand side pattern (replacement)
+    var requires_fast_math: Bool
 
-    def __init__(out self, name: String, phase: Int, priority: RulePriority, var lhs: Pattern, var rhs: Pattern):
+    def __init__(out self, name: String, phase: Int, priority: RulePriority, var lhs: Pattern, var rhs: Pattern, requires_fast_math: Bool = False):
         self.name = name
         self.phase = phase
         self.priority = priority
         self.lhs = lhs^
         self.rhs = rhs^
+        self.requires_fast_math = requires_fast_math
 
     def __init__(out self, *, copy: Self):
         self.name = copy.name
@@ -66,10 +68,11 @@ struct RewriteRule(Copyable, Movable, ImplicitlyCopyable):
         self.priority = copy.priority
         self.lhs = copy.lhs.copy()
         self.rhs = copy.rhs.copy()
+        self.requires_fast_math = copy.requires_fast_math
 
     def copy(self) -> RewriteRule:
         """Return a deep copy of this rewrite rule."""
-        return RewriteRule(self.name, self.phase, self.priority, self.lhs.copy(), self.rhs.copy())
+        return RewriteRule(self.name, self.phase, self.priority, self.lhs.copy(), self.rhs.copy(), self.requires_fast_math)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -86,12 +89,12 @@ def rule_add_identity() -> RewriteRule:
     # Pattern: (add ?x 0)
     var lhs = Pattern.operation(OpKind.Add)
     lhs.add_child(Pattern.variable(0)^)  # ?x
-    lhs.add_child(Pattern.constant(ClassId(0))^)  # Assume 0 is ClassId(0)
+    lhs.add_child(Pattern.scalar_f32(0)^)  # F32 zero payload
 
     # Replacement: ?x
     var rhs = Pattern.variable(0)
 
-    return RewriteRule("add_identity", 1, RulePriority.High, lhs^, rhs^)
+    return RewriteRule("add_identity", 1, RulePriority.High, lhs^, rhs^, requires_fast_math=True)
 
 
 def rule_mul_identity() -> RewriteRule:
@@ -103,11 +106,11 @@ def rule_mul_identity() -> RewriteRule:
     """
     var lhs = Pattern.operation(OpKind.Mul)
     lhs.add_child(Pattern.variable(0)^)  # ?x
-    lhs.add_child(Pattern.constant(ClassId(1))^)  # Assume 1 is ClassId(1)
+    lhs.add_child(Pattern.scalar_f32(0x3F800000)^)  # F32 one payload
 
     var rhs = Pattern.variable(0)
 
-    return RewriteRule("mul_identity", 1, RulePriority.High, lhs^, rhs^)
+    return RewriteRule("mul_identity", 1, RulePriority.High, lhs^, rhs^, requires_fast_math=True)
 
 
 def rule_mul_zero() -> RewriteRule:
@@ -120,11 +123,11 @@ def rule_mul_zero() -> RewriteRule:
     """
     var lhs = Pattern.operation(OpKind.Mul)
     lhs.add_child(Pattern.variable(0)^)  # ?x
-    lhs.add_child(Pattern.constant(ClassId(0))^)  # 0
+    lhs.add_child(Pattern.scalar_f32(0)^)  # 0
 
-    var rhs = Pattern.constant(ClassId(0))  # 0
+    var rhs = Pattern.scalar_f32(0)  # 0
 
-    return RewriteRule("mul_zero", 1, RulePriority.High, lhs^, rhs^)
+    return RewriteRule("mul_zero", 1, RulePriority.High, lhs^, rhs^, requires_fast_math=True)
 
 
 def rule_transpose_involution() -> RewriteRule:
@@ -164,7 +167,7 @@ def rule_add_commutativity() -> RewriteRule:
     rhs.add_child(Pattern.variable(1)^)  # ?y
     rhs.add_child(Pattern.variable(0)^)  # ?x
 
-    return RewriteRule("add_commutativity", 2, RulePriority.High, lhs^, rhs^)
+    return RewriteRule("add_commutativity", 2, RulePriority.High, lhs^, rhs^, requires_fast_math=True)
 
 
 def rule_mul_commutativity() -> RewriteRule:
@@ -182,7 +185,7 @@ def rule_mul_commutativity() -> RewriteRule:
     rhs.add_child(Pattern.variable(1)^)  # ?y
     rhs.add_child(Pattern.variable(0)^)  # ?x
 
-    return RewriteRule("mul_commutativity", 2, RulePriority.High, lhs^, rhs^)
+    return RewriteRule("mul_commutativity", 2, RulePriority.High, lhs^, rhs^, requires_fast_math=True)
 
 
 def rule_add_associativity() -> RewriteRule:
@@ -211,7 +214,7 @@ def rule_add_associativity() -> RewriteRule:
     rhs.add_child(Pattern.variable(0)^)  # ?x
     rhs.add_child(inner_add2^)
 
-    return RewriteRule("add_associativity", 2, RulePriority.Medium, lhs^, rhs^)
+    return RewriteRule("add_associativity", 2, RulePriority.Medium, lhs^, rhs^, requires_fast_math=True)
 
 
 def rule_mul_associativity() -> RewriteRule:
@@ -239,7 +242,7 @@ def rule_mul_associativity() -> RewriteRule:
     rhs.add_child(Pattern.variable(0)^)  # ?x
     rhs.add_child(inner_mul2^)
 
-    return RewriteRule("mul_associativity", 2, RulePriority.Medium, lhs^, rhs^)
+    return RewriteRule("mul_associativity", 2, RulePriority.Medium, lhs^, rhs^, requires_fast_math=True)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -357,7 +360,7 @@ struct RuleSet(Movable):
         return phase2^
 
 
-def create_default_ruleset() -> RuleSet:
+def create_default_ruleset(fast_math: Bool = False) -> RuleSet:
     """Create the default rule set with high-priority algebraic rules.
 
     Implements the highest-priority rules from egraph_rules.md:
@@ -370,9 +373,10 @@ def create_default_ruleset() -> RuleSet:
     var rs = RuleSet()
 
     # Phase 1: Simplification rules
-    rs.add_rule(rule_add_identity()^)
-    rs.add_rule(rule_mul_identity()^)
-    rs.add_rule(rule_mul_zero()^)
+    if fast_math:
+        rs.add_rule(rule_add_identity()^)
+        rs.add_rule(rule_mul_identity()^)
+        rs.add_rule(rule_mul_zero()^)
     rs.add_rule(rule_transpose_involution()^)
 
     # Phase 1: Fusion rules
@@ -381,9 +385,10 @@ def create_default_ruleset() -> RuleSet:
     rs.add_rule(rule_swiglu_fusion()^)
 
     # Phase 2: Equality saturation rules
-    rs.add_rule(rule_add_commutativity()^)
-    rs.add_rule(rule_mul_commutativity()^)
-    rs.add_rule(rule_add_associativity()^)
-    rs.add_rule(rule_mul_associativity()^)
+    if fast_math:
+        rs.add_rule(rule_add_commutativity()^)
+        rs.add_rule(rule_mul_commutativity()^)
+        rs.add_rule(rule_add_associativity()^)
+        rs.add_rule(rule_mul_associativity()^)
 
     return rs^

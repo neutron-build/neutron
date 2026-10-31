@@ -169,6 +169,15 @@ pub fn load_internal_tls_config(
 /// Generate a self-signed certificate and return a TLS acceptor.
 /// Uses rcgen to create an ECDSA P-256 certificate valid for localhost.
 pub fn generate_self_signed_tls() -> Result<TlsAcceptor, TlsError> {
+    generate_self_signed_tls_with_client_ca(None)
+}
+
+/// Generate a self-signed certificate, optionally requiring client
+/// certificates signed by `client_ca_path` (NE-11: a requested mTLS policy
+/// must not silently produce an acceptor that verifies nothing).
+pub fn generate_self_signed_tls_with_client_ca(
+    client_ca_path: Option<&Path>,
+) -> Result<TlsAcceptor, TlsError> {
     let key_pair = rcgen::KeyPair::generate().map_err(|e| TlsError::Generate(e.to_string()))?;
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
         .map_err(|e| TlsError::Generate(e.to_string()))?;
@@ -190,7 +199,7 @@ pub fn generate_self_signed_tls() -> Result<TlsAcceptor, TlsError> {
 
     let key = rustls::pki_types::PrivateKeyDer::from(keys.remove(0));
 
-    build_tls_acceptor(certs, key, None)
+    build_tls_acceptor(certs, key, client_ca_path)
 }
 
 /// Create a TLS acceptor from configuration.
@@ -201,11 +210,25 @@ pub fn setup_tls() -> Result<Option<TlsAcceptor>, TlsError> {
 }
 
 /// Create a TLS acceptor from configuration with optional client-CA mTLS.
+///
+/// Fail-closed on inconsistent mTLS configuration (NE-11): a requested
+/// client CA is a policy ("clients must present a certificate signed by this
+/// CA"), not a hint. Previously a CA without cert/key only logged a warning
+/// and produced an acceptor with NO client verification, a half-set
+/// cert/key silently fell back to a self-signed acceptor, and `NUCLEUS_TLS=off`
+/// ignored the CA entirely — every path silently downgraded mTLS.
 pub fn setup_tls_with_client_ca(
     client_ca_path: Option<&Path>,
 ) -> Result<Option<TlsAcceptor>, TlsError> {
     // Check for explicit disable
     if std::env::var("NUCLEUS_TLS").unwrap_or_default() == "off" {
+        if client_ca_path.is_some() {
+            return Err(TlsError::ClientAuthConfig(
+                "a client CA is configured (mTLS requested) but NUCLEUS_TLS=off; \
+                 refusing to start without certificate verification"
+                    .into(),
+            ));
+        }
         tracing::warn!("TLS disabled — connections will be unencrypted");
         return Ok(None);
     }
@@ -213,24 +236,35 @@ pub fn setup_tls_with_client_ca(
     // Check for user-provided certs
     let cert_path = std::env::var("NUCLEUS_TLS_CERT").ok();
     let key_path = std::env::var("NUCLEUS_TLS_KEY").ok();
-
-    if let (Some(cert), Some(key)) = (cert_path, key_path) {
-        tracing::info!("Loading TLS certificate from {cert}");
-        let acceptor =
-            load_tls_config_with_client_ca(Path::new(&cert), Path::new(&key), client_ca_path)?;
-        return Ok(Some(acceptor));
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            tracing::info!("Loading TLS certificate from {cert}");
+            let acceptor =
+                load_tls_config_with_client_ca(Path::new(&cert), Path::new(&key), client_ca_path)?;
+            Ok(Some(acceptor))
+        }
+        (None, None) => {
+            // Auto-generate self-signed — with the client-CA verifier when
+            // mTLS was requested, so the generated server certificate still
+            // demands client certificates.
+            tracing::info!("Generating self-signed TLS certificate for localhost");
+            if client_ca_path.is_some() {
+                tracing::info!(
+                    "Client CA configured: generated certificate requires client certificates"
+                );
+            }
+            let acceptor = generate_self_signed_tls_with_client_ca(client_ca_path)?;
+            Ok(Some(acceptor))
+        }
+        (Some(cert), None) => Err(TlsError::Config(format!(
+            "NUCLEUS_TLS_CERT is set ({cert}) but NUCLEUS_TLS_KEY is missing; \
+             refusing to silently fall back to a certificate that was not configured"
+        ))),
+        (None, Some(key)) => Err(TlsError::Config(format!(
+            "NUCLEUS_TLS_KEY is set ({key}) but NUCLEUS_TLS_CERT is missing; \
+             refusing to silently fall back to a certificate that was not configured"
+        ))),
     }
-
-    // Auto-generate self-signed
-    tracing::info!("Generating self-signed TLS certificate for localhost");
-    if client_ca_path.is_some() {
-        tracing::warn!(
-            "Client CA was configured but no TLS cert/key was provided; \
-             auto-generated certificates do not enable mTLS client verification"
-        );
-    }
-    let acceptor = generate_self_signed_tls()?;
-    Ok(Some(acceptor))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -275,6 +309,234 @@ mod tests {
             result.is_ok(),
             "self-signed TLS generation failed: {:?}",
             result.err()
+        );
+    }
+
+    /// Serializes the env-var-dependent tests (process-global environment).
+    static TLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// NE-11: mTLS configuration must fail closed. Every inconsistent form
+    /// used to silently produce an acceptor with NO client verification.
+    #[test]
+    fn client_ca_configuration_fails_closed() {
+        let _guard = TLS_ENV_LOCK.lock().unwrap();
+        let (cert_pem, key_pem) = generate_pem_pair();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = write_temp_file(&dir, "cert.pem", &cert_pem);
+        let key_path = write_temp_file(&dir, "key.pem", &key_pem);
+        let ca_path = write_temp_file(&dir, "ca.pem", &cert_pem);
+
+        // SAFETY: test-only env mutation, serialized by TLS_ENV_LOCK and
+        // restored before return (edition-2024 marks it unsafe).
+        unsafe {
+            // CA configured but TLS explicitly off → refuse (was: Ok(None)).
+            std::env::set_var("NUCLEUS_TLS", "off");
+            let r = setup_tls_with_client_ca(Some(&ca_path));
+            std::env::remove_var("NUCLEUS_TLS");
+            assert!(
+                matches!(r, Err(TlsError::ClientAuthConfig(_))),
+                "CA + NUCLEUS_TLS=off must refuse, got {:?}",
+                r.err().map(|e| e.to_string())
+            );
+
+            // CA + cert without key → refuse (was: silent self-signed).
+            std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
+            let r = setup_tls_with_client_ca(Some(&ca_path));
+            std::env::remove_var("NUCLEUS_TLS_CERT");
+            assert!(
+                matches!(r, Err(TlsError::Config(_))),
+                "CA + cert-without-key must refuse, got {:?}",
+                r.err().map(|e| e.to_string())
+            );
+
+            // CA + key without cert → refuse.
+            std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
+            let r = setup_tls_with_client_ca(Some(&ca_path));
+            std::env::remove_var("NUCLEUS_TLS_KEY");
+            assert!(
+                matches!(r, Err(TlsError::Config(_))),
+                "CA + key-without-cert must refuse, got {:?}",
+                r.err().map(|e| e.to_string())
+            );
+
+            // CA + complete cert/key → acceptor that verifies client
+            // certificates (real-handshake proof in the test below).
+            std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
+            std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
+            let acceptor = setup_tls_with_client_ca(Some(&ca_path)).unwrap().unwrap();
+            drop(acceptor);
+
+            // CA only, no user cert/key → generated certificate must still
+            // carry the client-CA verifier (was: warn + no verification).
+            std::env::remove_var("NUCLEUS_TLS_CERT");
+            std::env::remove_var("NUCLEUS_TLS_KEY");
+            let acceptor = setup_tls_with_client_ca(Some(&ca_path)).unwrap().unwrap();
+            drop(acceptor);
+
+            // No CA anywhere → plain self-signed still works.
+            std::env::remove_var("NUCLEUS_TLS");
+            std::env::remove_var("NUCLEUS_TLS_CERT");
+            std::env::remove_var("NUCLEUS_TLS_KEY");
+            assert!(setup_tls_with_client_ca(None).unwrap().is_some());
+            // TLS off without a CA remains a supported explicit choice.
+            std::env::set_var("NUCLEUS_TLS", "off");
+            assert!(setup_tls_with_client_ca(None).unwrap().is_none());
+            std::env::remove_var("NUCLEUS_TLS");
+        }
+    }
+
+    /// Drive one TLS handshake over an in-memory duplex stream; returns
+    /// (server_result, client_ok) where server_result is Ok(()) on success
+    /// or the handshake error text. The client parks on read after
+    /// connecting so the server can always finish its final flight (alert
+    /// or session tickets) instead of hitting a closed pipe.
+    async fn handshake_pair(
+        acceptor: &TlsAcceptor,
+        client: TlsConnector,
+    ) -> (Result<(), String>, bool) {
+        use tokio::io::AsyncReadExt;
+        let (a, b) = tokio::io::duplex(4096);
+        let acceptor = pgwire::tokio::tokio_rustls::TlsAcceptor::from(acceptor.clone());
+        let server = tokio::spawn(async move {
+            acceptor
+                .accept(a)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+            .expect("valid server name");
+        let client_task = tokio::spawn(async move {
+            let connected = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.connect(name, b),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+            let Some(mut stream) = connected else {
+                return false;
+            };
+            // Hold the connection open until the server side finishes and
+            // drops its end (EOF) or errors.
+            let mut buf = [0u8; 64];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read(&mut buf),
+            )
+            .await;
+            true
+        });
+        let server_result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server handshake task finishes")
+            .unwrap_or_else(|_| Ok(()));
+        let client_ok = tokio::time::timeout(std::time::Duration::from_secs(5), client_task)
+            .await
+            .map(|r| r.unwrap_or(false))
+            .unwrap_or(false);
+        (server_result, client_ok)
+    }
+
+    fn client_connector(
+        ca_pem: &str,
+        client_cert_pem: Option<(&str, &str)>,
+    ) -> TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let ca = rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for c in ca {
+            roots.add(c).unwrap();
+        }
+        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        let config = match client_cert_pem {
+            None => builder.with_no_client_auth(),
+            Some((cert_pem, key_pem)) => {
+                let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let mut keys =
+                    rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_pem.as_bytes()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                builder
+                    .with_client_auth_cert(
+                        certs,
+                        rustls::pki_types::PrivateKeyDer::Pkcs8(keys.remove(0)),
+                    )
+                    .unwrap()
+            }
+        };
+        TlsConnector::from(Arc::new(config))
+    }
+
+    /// NE-11, handshake level: an acceptor built with a client CA must
+    /// refuse a certificate-less client, and admit one whose certificate the
+    /// CA signed. Before the fix, a CA-only configuration produced an
+    /// acceptor that accepted the certless client.
+    #[tokio::test]
+    async fn mtls_acceptor_rejects_certless_handshake() {
+        // Build a real CA and have it sign both the server and a client cert.
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_params = rcgen::CertificateParams::new(vec!["client".to_string()]).unwrap();
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = write_temp_file(&dir, "ca.pem", &ca_cert.pem());
+        let cert_path = write_temp_file(&dir, "server.pem", &server_cert.pem());
+        let key_path = write_temp_file(&dir, "server.key", &server_key.serialize_pem());
+
+        let _guard = TLS_ENV_LOCK.lock().unwrap();
+        // SAFETY: test-only env mutation, serialized by TLS_ENV_LOCK and
+        // restored before return.
+        unsafe {
+            std::env::set_var("NUCLEUS_TLS_CERT", cert_path.to_str().unwrap());
+            std::env::set_var("NUCLEUS_TLS_KEY", key_path.to_str().unwrap());
+        }
+        let acceptor = setup_tls_with_client_ca(Some(&ca_path))
+            .expect("valid mTLS configuration")
+            .expect("acceptor");
+        unsafe {
+            std::env::remove_var("NUCLEUS_TLS_CERT");
+            std::env::remove_var("NUCLEUS_TLS_KEY");
+        }
+
+        // Client trusts the CA but presents NO certificate. The server MUST
+        // abort the handshake. (The client may locally complete its TLS 1.3
+        // flight before the server's alert arrives, so only the server side
+        // is authoritative here.)
+        let certless = client_connector(&ca_cert.pem(), None);
+        let (server_result, _client_ok) = handshake_pair(&acceptor, certless).await;
+        assert!(
+            server_result.is_err(),
+            "certless client must not complete an mTLS handshake (server accepted)"
+        );
+
+        // Client presents a CA-signed certificate: handshake completes.
+        let certed = client_connector(
+            &ca_cert.pem(),
+            Some((&client_cert.pem(), &client_key.serialize_pem())),
+        );
+        let (server_result, client_ok) = handshake_pair(&acceptor, certed).await;
+        assert!(
+            server_result.is_ok() && client_ok,
+            "CA-signed client must complete the handshake (server={server_result:?}, client={client_ok})"
         );
     }
 

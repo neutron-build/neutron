@@ -26,11 +26,13 @@ module hot_reload {
 
     // === ACTIONS ===
 
+    var previous_server_version: int
     action init = all {
         server_version' = 1,
         client_version' = CLIENTS.mapBy(c => 0),
         client_state' = CLIENTS.mapBy(c => "disconnected"),
         pending_deltas' = CLIENTS.mapBy(c => List()),
+        previous_server_version' = 1,
         total_updates' = 0,
     }
 
@@ -53,6 +55,7 @@ module hot_reload {
             },
         server_version' = server_version,
         client_version' = client_version,
+        previous_server_version' = server_version,
         total_updates' = total_updates,
     }
 
@@ -65,6 +68,7 @@ module hot_reload {
         client_state' = client_state.set(client, "connected"),
         pending_deltas' = pending_deltas.set(client, List()),
         server_version' = server_version,
+        previous_server_version' = server_version,
         total_updates' = total_updates + 1,
     }
 
@@ -77,6 +81,7 @@ module hot_reload {
         pending_deltas' = pending_deltas.set(client, List()),
         server_version' = server_version,
         client_version' = client_version,
+        previous_server_version' = server_version,
         total_updates' = total_updates,
     }
 
@@ -93,6 +98,7 @@ module hot_reload {
                 else pending_deltas.get(c)),
             client_state' = client_state,
             client_version' = client_version,
+            previous_server_version' = server_version,
             total_updates' = total_updates,
         }
     }
@@ -111,6 +117,7 @@ module hot_reload {
                 pending_deltas.get(client).slice(1, pending_deltas.get(client).length())),
             client_state' = client_state,
             server_version' = server_version,
+            previous_server_version' = server_version,
             total_updates' = total_updates + 1,
         }
     }
@@ -159,8 +166,8 @@ module hot_reload {
             deltas[0] == client_version.get(c) + 1
         )
 
-    // Syncing clients eventually reach server version (via sync_full)
-    val sync_reaches_server: bool =
+    // Safety bound only; eventual sync requires a fair delivery schedule.
+    val sync_client_not_ahead: bool =
         CLIENTS.forall(c =>
             client_state.get(c) == "syncing" implies
             client_version.get(c) <= server_version
@@ -168,7 +175,7 @@ module hot_reload {
 
     // Server version only increases
     val server_monotonic: bool =
-        server_version >= 1
+        server_version >= previous_server_version
 
     // Disconnected clients have no pending deltas
     val disconnected_no_pending: bool =

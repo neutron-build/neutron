@@ -28,7 +28,7 @@ def assert_true(cond: Bool, msg: String) raises:
 # Helpers
 # ===----------------------------------------------------------------------=== #
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     var params = tiny_test_params()
     var model = Model(params)
     var total = model.layer_weights.numel()

@@ -1,0 +1,1 @@
+module.exports = { dependency: { platforms: { ios: { podspecPath: 'NeutronOTA.podspec' }, android: { sourceDir: 'android', packageImportPath: 'import org.neutron.ota.NeutronOTAPackage;', packageInstance: 'new NeutronOTAPackage()' } } } }

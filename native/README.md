@@ -42,3 +42,31 @@ of which match the shipped code, which uses RN 0.76's own renderer with a web
 preact/compat alias, in-package device modules, and a four-command CLI. It
 ended with "Status: Planned — not yet implemented". Found by the S97 claims
 audit.*
+
+OTA requires a complete `NativeOTAAdapter` with native boot tracking and a
+trusted public key. Without that adapter the client reports an unsupported
+error before fetching or staging. The adapter owns atomic durable staging,
+signature/hash verification, pending update publication, native early-boot
+crash counting, healthy launch confirmation and rollback to the last good
+bundle. JavaScript cannot count crashes that occur before it starts. The core package supplies orchestration and a typed public RN adapter.
+`modules/neutron-ota` supplies Swift/CryptoKit and Kotlin/Android storage,
+cryptography and pre-JS boot selection source. Hosts must autolink/codegen it,
+provision trust and use its native selected loader before JS. These modules
+remain subject to compilation and installed-app/device acceptance; see
+`modules/neutron-ota/README.md`. Startup publishes failures to its error state. Update methods are async and
+can reject; callers must handle rejection and observe the error state.
+
+File-route components may be passed directly, or explicitly as
+`{kind: 'component', component: Screen}`. Lazy routes use
+`{kind: 'lazy', load: () => import('./Screen'), loading, errorFallback}`. Discovery
+never invokes a function to determine its shape. Lazy loading occurs during
+React rendering within Suspense and an error boundary.
+
+`useAnimatedStyle` requires `react-native-reanimated`. If unavailable, it throws
+an explicit unsupported error; the limited Animated helpers do not supply a
+shared-value style subscription. `ReactNavigationRoot` and `NativeStack` delegate native UI to React Navigation 7;
+`useStackActions()` targets the current screen's scoped siblings. The public
+container ref projects native back/gesture state into router subscriptions,
+and replace/forward update the same native root. Installed RN gesture/transition
+acceptance remains required. The smaller `Stack`/`Tabs`/`Drawer` implementations
+retain synchronous scoped JS rendering without claiming native transitions.

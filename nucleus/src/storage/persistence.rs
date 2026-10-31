@@ -77,6 +77,11 @@ struct ColumnDefSer {
     /// Declared `varchar(n)` / `char(n)` length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_len: Option<u32>,
+    /// Declared `numeric(p, s)` as PostgreSQL's `atttypmod`
+    /// (`((p << 16) | s) + 4`). Absent in snapshots written before numeric
+    /// typmods were enforced, which then load as unconstrained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    numeric_typmod: Option<i32>,
 }
 
 fn generation_to_ser(g: &Option<ColumnGeneration>) -> (Option<String>, Option<String>) {
@@ -417,6 +422,7 @@ impl CatalogPersistence {
                             generated: generation_to_ser(&c.generation).0,
                             identity: generation_to_ser(&c.generation).1,
                             max_len: c.max_len,
+                            numeric_typmod: c.numeric_typmod.map(|typmod| typmod.atttypmod()),
                         })
                         .collect(),
                     constraints: t.constraints.iter().map(constraint_to_ser).collect(),
@@ -509,6 +515,9 @@ impl CatalogPersistence {
                         analyzer: None,
                         generation: generation_from_ser(c),
                         max_len: c.max_len,
+                        numeric_typmod: c
+                            .numeric_typmod
+                            .and_then(crate::types::NumericTypmod::from_atttypmod),
                     })
                 })
                 .collect();
@@ -606,6 +615,9 @@ impl CatalogPersistence {
                         analyzer: None,
                         generation: generation_from_ser(c),
                         max_len: c.max_len,
+                        numeric_typmod: c
+                            .numeric_typmod
+                            .and_then(crate::types::NumericTypmod::from_atttypmod),
                     })
                 })
                 .collect();
@@ -1109,6 +1121,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "email".into(),
@@ -1119,6 +1132,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "active".into(),
@@ -1129,6 +1143,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![TableConstraint::PrimaryKey {
@@ -1154,6 +1169,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "amount".into(),
@@ -1164,6 +1180,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                     ColumnDef {
                         name: "tags".into(),
@@ -1174,6 +1191,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     },
                 ],
                 constraints: vec![],
@@ -1646,6 +1664,7 @@ mod tests {
                         analyzer: None,
                         generation: None,
                         max_len: None,
+                        numeric_typmod: None,
                     }],
                     constraints: vec![],
                     append_only: false,

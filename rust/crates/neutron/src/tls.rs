@@ -62,10 +62,14 @@ impl TlsConfig {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self, TlsError> {
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| TlsError::Config(e.to_string()))?;
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("supported TLS versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| TlsError::Config(e.to_string()))?;
 
         // Enable ALPN for HTTP/2 and HTTP/1.1
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

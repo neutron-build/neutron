@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { h } from "preact";
 import { useState } from "preact/hooks";
 import { initIslands, resolveIslandExport } from "./island-runtime.js";
@@ -174,7 +174,7 @@ describe("nested islands", () => {
   });
 
   // <Island component={Outer}/> where Outer renders <Island component={Inner}/>:
-  // hydrating Outer mounts Inner as part of its tree. A second root for the
+  // hydrating Outer mounts Inner as part of its tree. A second root for an
   // inner marker would mount Inner twice over the same DOM.
   it("hydrates the outer island only; the inner marker belongs to it", async () => {
     const { Island } = await import("./island.js");
@@ -197,13 +197,34 @@ describe("nested islands", () => {
     await flush();
     await flush();
 
-    const [outer, inner] = Array.from(document.querySelectorAll("neutron-island")) as Array<
+    // The nested <Island> renders inline (island.tsx): one marker, one root.
+    const markers = Array.from(document.querySelectorAll("neutron-island")) as Array<
       HTMLElement & { __neutronHydrated?: boolean }
     >;
-    expect(outer.__neutronHydrated).toBe(true);
-    expect(inner.__neutronHydrated).toBeUndefined();
+    expect(markers.length).toBe(1);
+    expect(markers[0].__neutronHydrated).toBe(true);
     expect(innerMounts).toBe(1);
     expect(document.querySelectorAll("span").length).toBe(1);
+  });
+
+  // Regression: an island inside another island is part of the outer island's
+  // client render. Hydrating it as well mounted a second Preact root over DOM
+  // the outer root owns, so its content rendered twice.
+  it("leaves a nested marker to the outer island", async () => {
+    const Inner = () => h("span", { class: "inner" }, "inner");
+    const Outer = () => h("div", null, h("neutron-island", { "data-client": "load" }, h(Inner, null)));
+    document.body.innerHTML =
+      '<neutron-island data-component="Outer" data-client="load" data-props="{}" data-src="/o.tsx">' +
+      '<div><neutron-island data-component="Inner" data-client="load" data-props="{}" data-src="/i.tsx">' +
+      '<span class="inner">inner</span></neutron-island></div></neutron-island>';
+
+    const inner = vi.fn(async () => ({ default: Inner }));
+    initIslands({ "/o.tsx": async () => ({ default: Outer }), "/i.tsx": inner });
+    await flush();
+    await flush();
+
+    expect(inner).not.toHaveBeenCalled();
+    expect(document.querySelectorAll("span.inner").length).toBe(1);
   });
 });
 
@@ -260,5 +281,45 @@ describe('client="visible"', () => {
     initIslands();
     expect(observed.map((target) => target.tagName)).toEqual(["NEUTRON-ISLAND", "SECTION"]);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("client=visible", () => {
+  let observed: Element[];
+  let trigger: (entries: Partial<IntersectionObserverEntry>[]) => void;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    delete (window as any).__ISLAND_COMPONENTS__;
+    observed = [];
+    (globalThis as any).IntersectionObserver = class {
+      constructor(cb: (entries: Partial<IntersectionObserverEntry>[]) => void) {
+        trigger = cb;
+      }
+      observe(el: Element) {
+        observed.push(el);
+      }
+      disconnect() {}
+    };
+  });
+  afterEach(() => {
+    delete (globalThis as any).IntersectionObserver;
+  });
+
+  // The marker is display:contents and has no box, so the observer must watch
+  // its rendered children rather than the marker itself.
+  it("observes the island's children and hydrates when one intersects", async () => {
+    document.body.innerHTML =
+      '<neutron-island style="display: contents" data-component="Counter" data-client="visible" ' +
+      'data-props="{}" data-src="/c.tsx"><button>count:0</button></neutron-island>';
+    const importer = vi.fn(async () => ({ default: Counter }));
+    initIslands({ "/c.tsx": importer });
+
+    expect(observed.map((el) => el.tagName)).toEqual(["BUTTON"]);
+    expect(importer).not.toHaveBeenCalled();
+
+    trigger([{ isIntersecting: true }]);
+    await flush();
+    expect(importer).toHaveBeenCalledTimes(1);
   });
 });

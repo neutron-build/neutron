@@ -171,7 +171,39 @@ impl ColumnarWal {
         let path = dir.join("columnar.wal");
         let state = if path.exists() {
             let data = std::fs::read(&path)?;
-            replay(&data, committed)
+            let (state, valid_len) = replay_with_len(&data, committed);
+            if valid_len < data.len() {
+                // NE-22: the log ends in a torn or corrupt tail. Appending
+                // behind the invalid bytes "succeeds" while the next recovery
+                // stops at the tear and omits every later acknowledged entry.
+                // Repair before the append handle exists; a repair that
+                // cannot complete fails the open.
+                let repair = OpenOptions::new().write(true).open(&path).and_then(|f| {
+                    f.set_len(valid_len as u64)?;
+                    f.sync_all()
+                });
+                if let Err(e) = repair {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "columnar WAL at {} has a torn tail ({} valid of {} bytes) and \
+                             the repair truncate failed: {e} — refusing to open a log whose \
+                             appends could not be recovered",
+                            path.display(),
+                            valid_len,
+                            data.len()
+                        ),
+                    ));
+                }
+                tracing::warn!(
+                    "columnar WAL at {} recovered a valid prefix of {} of {} bytes; \
+                     truncated the torn tail before appending (NE-22)",
+                    path.display(),
+                    valid_len,
+                    data.len()
+                );
+            }
+            state
         } else {
             WalState {
                 tables: Vec::new(),
@@ -630,7 +662,10 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
 /// committed, and is discarded — its body is still parsed past, and ids feed
 /// `max_xact_id` whether kept or discarded, so the caller can seed the XactId
 /// high-water mark.
-fn replay(data: &[u8], committed: &HashSet<u64>) -> WalState {
+/// [`replay_with_len`] — the state plus the number of leading bytes that
+/// parsed as complete entries; anything after that is a torn or corrupt tail
+/// the caller must repair (truncate) before appending (NE-22).
+fn replay_with_len(data: &[u8], committed: &HashSet<u64>) -> (WalState, usize) {
     let mut tables: std::collections::HashMap<String, Vec<Row>> = std::collections::HashMap::new();
     let mut columns: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -638,9 +673,20 @@ fn replay(data: &[u8], committed: &HashSet<u64>) -> WalState {
     let mut max_xact_id: u64 = 0;
 
     while pos < data.len() {
+        // NE-22: every break must leave `pos` at this record's START so the
+        // returned valid-prefix length is a record boundary — a torn record's
+        // successfully-parsed framing would otherwise count as valid bytes
+        // and appends would land behind the tear anyway.
+        let start = pos;
+        macro_rules! bail {
+            () => {{
+                pos = start;
+                break;
+            }};
+        }
         // entry_type
         let Some(&entry_type) = data.get(pos) else {
-            break;
+            bail!();
         };
         pos += 1;
 
@@ -655,7 +701,7 @@ fn replay(data: &[u8], committed: &HashSet<u64>) -> WalState {
             ENTRY_CREATE_TABLE_XACT | ENTRY_DROP_TABLE_XACT | ENTRY_INSERT_ROWS_NAMED_XACT
         ) {
             let Some(xact) = read_u64(data, &mut pos) else {
-                break;
+                bail!();
             };
             max_xact_id = max_xact_id.max(xact);
             keep_tagged = xact == XACT_AUTOCOMMIT || committed.contains(&xact);
@@ -663,25 +709,25 @@ fn replay(data: &[u8], committed: &HashSet<u64>) -> WalState {
 
         // name
         let Some(name_len) = read_u32(data, &mut pos) else {
-            break;
+            bail!();
         };
         let name_len = name_len as usize;
         if pos + name_len > data.len() {
-            break;
+            bail!();
         }
         let name = match std::str::from_utf8(&data[pos..pos + name_len]) {
             Ok(s) => s.to_string(),
-            Err(_) => break,
+            Err(_) => bail!(),
         };
         pos += name_len;
 
         // payload
         let Some(payload_len) = read_u32(data, &mut pos) else {
-            break;
+            bail!();
         };
         let payload_len = payload_len as usize;
         if pos + payload_len > data.len() {
-            break;
+            bail!();
         }
         let payload = &data[pos..pos + payload_len];
         pos += payload_len;
@@ -726,11 +772,14 @@ fn replay(data: &[u8], committed: &HashSet<u64>) -> WalState {
         }
     }
 
-    WalState {
-        tables: tables.into_iter().collect(),
-        columns: columns.into_iter().collect(),
-        max_xact_id,
-    }
+    (
+        WalState {
+            tables: tables.into_iter().collect(),
+            columns: columns.into_iter().collect(),
+            max_xact_id,
+        },
+        pos,
+    )
 }
 
 fn decode_rows(data: &[u8]) -> Vec<Row> {
@@ -1069,6 +1118,61 @@ mod tests {
         let t = state2.tables.iter().find(|(n, _)| n == "t").unwrap();
         assert_eq!(t.1.len(), 2);
         assert_eq!(t.1[0][0], Value::Int64(1));
+    }
+
+    /// NE-22: reopening a torn-tail log used to append BEHIND the invalid
+    /// bytes; the append acknowledged, yet the next recovery stopped at the
+    /// tear and omitted it. Open must repair (truncate to the valid prefix)
+    /// before the append handle exists.
+    #[test]
+    fn torn_tail_is_repaired_so_post_recovery_appends_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("columnar.wal");
+
+        let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
+        wal.log_create_table(None, "t").unwrap();
+        wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
+        let after_first = std::fs::metadata(&path).unwrap().len() as usize;
+        wal.log_insert_rows("t", &[int_row(2, 2.0)]).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let full = std::fs::metadata(&path).unwrap().len() as usize;
+
+        for cut in after_first..full {
+            std::fs::write(&path, &std::fs::read(&path).unwrap()[..cut]).unwrap();
+
+            // Reopen over the torn tail, append a sentinel, make it durable.
+            let (wal, state) = ColumnarWal::open(dir.path()).unwrap();
+            let rows = state
+                .tables
+                .iter()
+                .find(|(n, _)| n == "t")
+                .map(|(_, r)| r.len())
+                .unwrap_or(0);
+            assert_eq!(rows, 1, "cut {cut}: prefix rows must recover");
+            wal.log_insert_rows("t", &[int_row(9, 9.0)]).unwrap();
+            wal.sync().unwrap();
+            drop(wal);
+
+            // Second reopen: the sentinel row must be there. Before the
+            // repair it was silently omitted (replay stopped at the tear).
+            let (_, state2) = ColumnarWal::open(dir.path()).unwrap();
+            let rows: Vec<_> = state2
+                .tables
+                .iter()
+                .find(|(n, _)| n == "t")
+                .map(|(_, r)| r.clone())
+                .unwrap_or_default();
+            assert!(
+                rows.iter().any(|r| r[0] == Value::Int64(9)),
+                "cut {cut}: the acknowledged post-recovery row was omitted by the \
+                 second recovery (NE-22)"
+            );
+            assert!(
+                rows.iter().any(|r| r[0] == Value::Int64(1)),
+                "cut {cut}: prefix row lost"
+            );
+        }
     }
 
     #[test]

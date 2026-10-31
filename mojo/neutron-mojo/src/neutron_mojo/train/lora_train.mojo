@@ -16,7 +16,7 @@ from std.math import sqrt
 from std.random import random_float64
 
 from neutron_mojo.autograd.tape import Tape, TapeEntry
-from neutron_mojo.autograd.ops import tracked_add, tracked_matmul
+from neutron_mojo.autograd.ops import tracked_add, tracked_matmul_right_transpose
 from neutron_mojo.train.trainable import TrainableLM, TrainableTransformerBlock
 from neutron_mojo.train.modules import Linear
 
@@ -59,7 +59,7 @@ struct TrainableLoRA(ImplicitlyCopyable, Copyable, Movable):
         self.rank = move.rank^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register A (random init) and B (zero init) on tape."""
         # A: (rank, in_features)
         var a_dims = List[Int]()
@@ -83,17 +83,22 @@ struct TrainableLoRA(ImplicitlyCopyable, Copyable, Movable):
 
         self.registered = True
 
-    def forward(self, mut tape: Tape, x_idx: Int) -> Int:
+    def forward(self, mut tape: Tape, x_idx: Int) raises -> Int:
         """LoRA forward: x @ A^T @ B^T (additive delta).
 
         x: (in_features,) -> intermediate: (rank,) -> delta: (out_features,).
         Uses tracked_matmul for gradient tracking.
         """
+        tape.validate_variable(x_idx)
+        if not self.registered or self.in_features <= 0 or self.out_features <= 0 or self.rank <= 0:
+            raise Error("LoRA must be registered with positive dimensions")
+        if len(tape.var_shapes[x_idx]) != 1 or tape.var_shapes[x_idx][0] != self.in_features:
+            raise Error("LoRA forward requires a single input vector")
         # x @ A^T: (1, in) @ (in, rank) -> (1, rank)
-        var mid_idx = tracked_matmul(tape, x_idx, self.a_idx,
+        var mid_idx = tracked_matmul_right_transpose(tape, x_idx, self.a_idx,
             1, self.in_features, self.rank)
         # mid @ B^T: (1, rank) @ (rank, out) -> (1, out)
-        var delta_idx = tracked_matmul(tape, mid_idx, self.b_idx,
+        var delta_idx = tracked_matmul_right_transpose(tape, mid_idx, self.b_idx,
             1, self.rank, self.out_features)
         return delta_idx
 
@@ -138,7 +143,7 @@ struct LoRATrainableLM(Movable):
         self.rank = move.rank^
         self.registered = move.registered^
 
-    def register(mut self, mut tape: Tape):
+    def register(mut self, mut tape: Tape) raises:
         """Register base model and LoRA adapters."""
         self.base.register(tape)
         for i in range(len(self.lora_q)):
@@ -152,7 +157,7 @@ struct LoRATrainableLM(Movable):
         for i in range(len(base_params)):
             tape.var_requires_grad[base_params[i]] = False
 
-    def forward(self, mut tape: Tape, token_id: Int) -> Int:
+    def forward(self, mut tape: Tape, token_id: Int) raises -> Int:
         """Forward with LoRA: base forward + LoRA deltas on Q/V."""
         var x_idx = self.base.embedding.forward(tape, token_id)
 
@@ -163,7 +168,7 @@ struct LoRATrainableLM(Movable):
         var logits = self.base.lm_head.forward(tape, normed)
         return logits
 
-    def _forward_block_lora(self, mut tape: Tape, layer: Int, x_idx: Int) -> Int:
+    def _forward_block_lora(self, mut tape: Tape, layer: Int, x_idx: Int) raises -> Int:
         """Forward one block with LoRA on Q and V projections."""
         var block = self.base.blocks[layer]
         var normed = block.attn_norm.forward(tape, x_idx)

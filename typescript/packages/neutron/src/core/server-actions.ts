@@ -24,7 +24,7 @@
  */
 import { parse, stringify } from "devalue";
 import { runMiddlewareChain } from "./middleware.js";
-import { isResponse, withMutableHeaders } from "./response.js";
+import { isResponse, mutableResponse } from "./response.js";
 import { ProblemError, badRequest, forbidden, internalError, isProblemError, notFoundError } from "./problem.js";
 import { toDataRedirectResponse } from "./data-redirect.js";
 import { runInServerActionContext } from "./action-context.js";
@@ -151,7 +151,7 @@ async function decodeArguments(request: Request): Promise<unknown[]> {
 }
 
 function withHeaders(response: Response, extra: Headers): Response {
-  const mutable = withMutableHeaders(response);
+  const mutable = mutableResponse(response);
   extra.forEach((value, name) => {
     if (name.toLowerCase() === "set-cookie") return;
     mutable.headers.set(name, value);

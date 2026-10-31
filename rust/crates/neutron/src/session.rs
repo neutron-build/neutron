@@ -47,16 +47,32 @@ use crate::middleware::{MiddlewareTrait, Next};
 ///
 /// Implement this trait to store sessions in Redis, a database, or any
 /// other backend. The default [`MemoryStore`] keeps sessions in-process.
+pub type SessionData = HashMap<String, serde_json::Value>;
+pub type SessionFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, SessionStoreError>> + Send + 'a>>;
+
+/// Version 2 storage failures distinguish lost ownership from unavailable or
+/// corrupt storage. A timed-out dispatched commit/revoke has an unknown outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionStoreError {
+    Conflict,
+    Capacity,
+    Unavailable(String),
+    Corrupt(String),
+}
+
+/// Async, fallible, revision-owned contract. No legacy synchronous adapter is
+/// accepted by SessionLayer. Implementations must yield, not block a worker.
 pub trait SessionStore: Send + Sync + 'static {
-    /// Load session data by ID. Returns `None` if the session doesn't exist
-    /// or has expired.
-    fn load(&self, id: &str) -> Option<HashMap<String, serde_json::Value>>;
-
-    /// Save session data with a time-to-live.
-    fn save(&self, id: &str, data: HashMap<String, serde_json::Value>, ttl: Duration);
-
-    /// Delete a session by ID.
-    fn destroy(&self, id: &str);
+    fn load_versioned<'a>(&'a self, id: &'a str) -> SessionFuture<'a, Option<(SessionData, u64)>>;
+    fn commit<'a>(
+        &'a self,
+        id: &'a str,
+        data: SessionData,
+        ttl: Duration,
+        expected: u64,
+    ) -> SessionFuture<'a, ()>;
+    fn revoke<'a>(&'a self, id: &'a str, expected: u64) -> SessionFuture<'a, ()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +82,7 @@ pub trait SessionStore: Send + Sync + 'static {
 struct StoredSession {
     data: HashMap<String, serde_json::Value>,
     expires_at: Instant,
+    revision: u64,
 }
 
 /// In-memory session store.
@@ -83,6 +100,12 @@ pub struct MemoryStore {
     sessions: Mutex<HashMap<String, StoredSession>>,
     last_cleanup: Mutex<Instant>,
     max_sessions: usize,
+    /// Destroyed session IDs. A stale request that loaded a session before
+    /// another request destroyed it must not be able to save it back into
+    /// existence under the same signed ID (RS-03).
+    tombs: Mutex<HashMap<String, ()>>,
+    /// Monotonic revision source for save/destroy fencing.
+    next_revision: std::sync::atomic::AtomicU64,
 }
 
 impl MemoryStore {
@@ -92,6 +115,8 @@ impl MemoryStore {
             sessions: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(Instant::now()),
             max_sessions: DEFAULT_MAX_SESSIONS,
+            tombs: Mutex::new(HashMap::new()),
+            next_revision: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -101,6 +126,8 @@ impl MemoryStore {
             sessions: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(Instant::now()),
             max_sessions,
+            tombs: Mutex::new(HashMap::new()),
+            next_revision: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
@@ -111,17 +138,49 @@ impl Default for MemoryStore {
     }
 }
 
-impl SessionStore for MemoryStore {
-    fn load(&self, id: &str) -> Option<HashMap<String, serde_json::Value>> {
+impl MemoryStore {
+    pub fn load(&self, id: &str) -> Option<HashMap<String, serde_json::Value>> {
+        self.load_with_revision(id).map(|(data, _)| data)
+    }
+
+    pub fn load_with_revision(
+        &self,
+        id: &str,
+    ) -> Option<(HashMap<String, serde_json::Value>, u64)> {
         let sessions = self.sessions.lock().unwrap();
         let stored = sessions.get(id)?;
         if Instant::now() >= stored.expires_at {
             return None;
         }
-        Some(stored.data.clone())
+        Some((stored.data.clone(), stored.revision))
     }
 
-    fn save(&self, id: &str, data: HashMap<String, serde_json::Value>, ttl: Duration) {
+    pub fn revision(&self, id: &str) -> Option<u64> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(id).map(|s| s.revision)
+    }
+
+    pub fn save(&self, id: &str, data: HashMap<String, serde_json::Value>, ttl: Duration) {
+        let _ = self.save_if_current(id, data, ttl, self.revision(id).unwrap_or(0));
+    }
+
+    pub fn save_if_current(
+        &self,
+        id: &str,
+        data: HashMap<String, serde_json::Value>,
+        ttl: Duration,
+        loaded_revision: u64,
+    ) -> bool {
+        self.commit_sync(id, data, ttl, loaded_revision).is_ok()
+    }
+
+    fn commit_sync(
+        &self,
+        id: &str,
+        data: SessionData,
+        ttl: Duration,
+        loaded_revision: u64,
+    ) -> Result<(), SessionStoreError> {
         let mut sessions = self.sessions.lock().unwrap();
         let now = Instant::now();
 
@@ -132,27 +191,107 @@ impl SessionStore for MemoryStore {
             *last_cleanup = now;
         }
 
-        // Reject new sessions if at capacity (existing sessions can still be updated)
-        if !sessions.contains_key(id) && sessions.len() >= self.max_sessions {
+        // A destroyed session stays destroyed: saving under a tombstoned ID
+        // would resurrect destroyed authentication data under the same
+        // signed cookie (RS-03). New sessions always get fresh random IDs,
+        // so a tombstone hit can only be a stale writer.
+        if self.tombs.lock().unwrap().contains_key(id) {
+            tracing::warn!(
+                session_id = id,
+                "refusing to save a session destroyed by a concurrent request"
+            );
+            return Err(SessionStoreError::Conflict);
+        }
+
+        sessions.retain(|_, s| now < s.expires_at);
+        if let Some(stored) = sessions.get(id) {
+            // Concurrent writer fencing: only the writer that saw the
+            // current revision may land (last-writer-wins otherwise loses
+            // the other request's updates silently).
+            if stored.revision != loaded_revision {
+                tracing::warn!(
+                    session_id = id,
+                    "session was modified by a concurrent request; save refused"
+                );
+                return Err(SessionStoreError::Conflict);
+            }
+        } else if loaded_revision != 0 {
+            // Expiry/cleanup must not turn a stale writer into a fresh insertion.
+            return Err(SessionStoreError::Conflict);
+        } else if sessions.len() >= self.max_sessions {
+            // New session at capacity: the save did NOT land — report it so
+            // the layer can refuse to claim success with an unsaved cookie
+            // (RS-04).
             tracing::warn!(
                 max_sessions = self.max_sessions,
                 current = sessions.len(),
                 "session store at capacity, rejecting new session"
             );
-            return;
+            return Err(SessionStoreError::Capacity);
         }
 
+        let revision = self
+            .next_revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         sessions.insert(
             id.to_string(),
             StoredSession {
                 data,
                 expires_at: now + ttl,
+                revision,
             },
         );
+        Ok(())
     }
 
-    fn destroy(&self, id: &str) {
-        self.sessions.lock().unwrap().remove(id);
+    pub fn destroy(&self, id: &str) {
+        let _ = self.destroy_checked(id);
+    }
+
+    pub fn destroy_checked(&self, id: &str) -> bool {
+        let removed = self.sessions.lock().unwrap().remove(id).is_some();
+        let mut tombs = self.tombs.lock().unwrap();
+        // Bound the tombstone set (same order as the session cap).
+        if tombs.len() >= DEFAULT_MAX_SESSIONS {
+            tombs.clear();
+        }
+        tombs.insert(id.to_string(), ());
+        let _ = removed; // a session that was already absent is still destroyed
+        true
+    }
+}
+
+impl SessionStore for MemoryStore {
+    fn load_versioned<'a>(&'a self, id: &'a str) -> SessionFuture<'a, Option<(SessionData, u64)>> {
+        Box::pin(async move { Ok(self.load_with_revision(id)) })
+    }
+    fn commit<'a>(
+        &'a self,
+        id: &'a str,
+        data: SessionData,
+        ttl: Duration,
+        expected: u64,
+    ) -> SessionFuture<'a, ()> {
+        Box::pin(async move { self.commit_sync(id, data, ttl, expected) })
+    }
+    fn revoke<'a>(&'a self, id: &'a str, expected: u64) -> SessionFuture<'a, ()> {
+        Box::pin(async move {
+            let mut sessions = self.sessions.lock().unwrap();
+            let current = sessions
+                .get(id)
+                .filter(|s| Instant::now() < s.expires_at)
+                .map(|s| s.revision);
+            if current != Some(expected) && !(current.is_none() && expected == 0) {
+                return Err(SessionStoreError::Conflict);
+            }
+            sessions.remove(id);
+            let mut tombs = self.tombs.lock().unwrap();
+            if tombs.len() >= self.max_sessions {
+                tombs.clear();
+            }
+            tombs.insert(id.to_owned(), ());
+            Ok(())
+        })
     }
 }
 
@@ -312,6 +451,7 @@ pub struct SessionLayer {
     cookie_http_only: bool,
     cookie_secure: bool,
     cookie_same_site: Option<SameSite>,
+    operation_timeout: Duration,
 }
 
 impl SessionLayer {
@@ -326,7 +466,15 @@ impl SessionLayer {
             cookie_http_only: true,
             cookie_secure: true,
             cookie_same_site: Some(SameSite::Lax),
+            operation_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Deadline for each yielding storage operation. Deadline failures return
+    /// 503 without confirming cookie changes; reconcile unknown writes.
+    pub fn operation_timeout(mut self, timeout: Duration) -> Self {
+        self.operation_timeout = timeout;
+        self
     }
 
     /// Set the session cookie name (default: `"neutron.sid"`).
@@ -399,18 +547,37 @@ impl MiddlewareTrait for SessionLayer {
         let cookie_http_only = self.cookie_http_only;
         let cookie_secure = self.cookie_secure;
         let cookie_same_site = self.cookie_same_site;
+        let operation_timeout = self.operation_timeout;
 
         Box::pin(async move {
             let mut req = req;
 
-            // 1. Try to load existing session from signed cookie
-            let (session, existing_id) =
+            // 1. Try to load existing session from signed cookie. The
+            //    revision travels with the data so the post-handler save can
+            //    be refused if the session was destroyed or rewritten by a
+            //    concurrent request in the meantime (RS-03).
+            let (session, existing) =
                 if let Some(cookie_value) = parse_session_cookie(req.headers(), &cookie_name) {
                     if let Some(session_id) = key.verify(&cookie_value) {
-                        if let Some(data) = store.load(&session_id) {
+                        let loaded = match tokio::time::timeout(
+                            operation_timeout,
+                            store.load_versioned(&session_id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(data)) => data,
+                            _ => {
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "session storage load failed",
+                                )
+                                    .into_response()
+                            }
+                        };
+                        if let Some((data, revision)) = loaded {
                             (
                                 Session::new(session_id.clone(), data, false),
-                                Some(session_id),
+                                Some((session_id, revision)),
                             )
                         } else {
                             // Session expired or not found — create new
@@ -438,14 +605,34 @@ impl MiddlewareTrait for SessionLayer {
             let mut resp = next.run(req).await;
 
             // 5. Post-handler: save or destroy session
-            let inner = session_ref.inner.lock().unwrap();
+            let (id, data, destroyed_flag, modified, is_new) = {
+                let inner = session_ref.inner.lock().unwrap();
+                (
+                    inner.id.clone(),
+                    inner.data.clone(),
+                    inner.destroyed,
+                    inner.modified,
+                    inner.is_new,
+                )
+            };
 
-            if inner.destroyed {
-                // Destroy: remove from store, clear cookie
-                if let Some(ref old_id) = existing_id {
-                    store.destroy(old_id);
+            if destroyed_flag {
+                // Destroy: remove from store, clear cookie — but only claim
+                // success when the store confirms the revocation. A failed
+                // destroy that still cleared the cookie would tell the user
+                // they are logged out while the authenticated record stays
+                // usable (RS-04).
+                let expected = existing.as_ref().map(|(_, rev)| *rev).unwrap_or(0);
+                if !matches!(
+                    tokio::time::timeout(operation_timeout, store.revoke(&id, expected)).await,
+                    Ok(Ok(()))
+                ) {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session revocation failed; outcome may be unknown",
+                    )
+                        .into_response();
                 }
-                store.destroy(&inner.id);
 
                 let mut cookie_parts = vec![
                     format!("{}=", cookie_name),
@@ -460,14 +647,36 @@ impl MiddlewareTrait for SessionLayer {
                 }
                 resp.headers_mut()
                     .append("set-cookie", cookie_parts.join("; ").parse().unwrap());
-            } else if inner.modified || inner.is_new {
-                // Save session data
-                store.save(&inner.id, inner.data.clone(), max_age);
+            } else if modified || is_new {
+                // Save session data conditionally on the loaded revision.
+                // Failure means: tombstoned (destroyed concurrently),
+                // rewritten by a concurrent writer, or the store could not
+                // persist (capacity/backend). In every case the response
+                // must not claim success with an unsaved session cookie
+                // (RS-03/RS-04).
+                let loaded_revision = existing.as_ref().map(|(_, rev)| *rev).unwrap_or(0);
+                let saved = matches!(
+                    tokio::time::timeout(
+                        operation_timeout,
+                        store.commit(&id, data, max_age, loaded_revision)
+                    )
+                    .await,
+                    Ok(Ok(()))
+                );
+
+                if !saved {
+                    tracing::error!("session save failed; refusing to confirm login");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session could not be persisted (store failure or concurrent change); retry",
+                    )
+                        .into_response();
+                }
 
                 // Set signed session cookie
-                let signed_id = key.sign(&inner.id);
+                let signed_id = key.sign(&id);
                 let mut cookie_parts = vec![
-                    format!("{cookie_name}={signed_id}"),
+                    format!("{}={signed_id}", cookie_name),
                     format!("Path={cookie_path}"),
                     format!("Max-Age={}", max_age.as_secs()),
                 ];
@@ -544,6 +753,7 @@ mod tests {
                     cookie_http_only: true,
                     cookie_secure: false,
                     cookie_same_site: Some(SameSite::Lax),
+                    operation_timeout: Duration::from_secs(5),
                 })
                 .get("/set", |session: Session| async move {
                     session.insert("count", 42u64);
@@ -618,6 +828,7 @@ mod tests {
                     cookie_http_only: true,
                     cookie_secure: false,
                     cookie_same_site: Some(SameSite::Lax),
+                    operation_timeout: Duration::from_secs(5),
                 })
                 .get("/set", |session: Session| async move {
                     session.insert("a", 1u32);
@@ -670,6 +881,7 @@ mod tests {
                     cookie_http_only: true,
                     cookie_secure: false,
                     cookie_same_site: Some(SameSite::Lax),
+                    operation_timeout: Duration::from_secs(5),
                 })
                 .get("/set", |session: Session| async move {
                     session.insert("data", "important");
@@ -848,6 +1060,7 @@ mod tests {
                     cookie_http_only: true,
                     cookie_secure: false,
                     cookie_same_site: Some(SameSite::Lax),
+                    operation_timeout: Duration::from_secs(5),
                 })
                 .get("/set", |session: Session| async move {
                     session.insert("data", "value");
@@ -910,5 +1123,321 @@ mod tests {
 
         // Should be expired
         assert!(store.load("sess1").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // RS-03 / RS-04 regressions
+    // ------------------------------------------------------------------
+
+    fn layer_with_store(store: MemoryStore) -> SessionLayer {
+        SessionLayer::new(store, Key::generate())
+    }
+
+    /// RS-03: request A loads a session, request B destroys it, then A
+    /// finishes and modifies — A's save must be refused rather than
+    /// resurrect the destroyed session under the same signed ID.
+    #[tokio::test]
+    async fn stale_request_cannot_resurrect_destroyed_session() {
+        let key = Key::generate();
+        let store = Arc::new(MemoryStore::new());
+        let client = TestClient::new(
+            Router::new()
+                .middleware(SessionLayer {
+                    store: Arc::clone(&store) as Arc<dyn SessionStore>,
+                    key: key.clone(),
+                    cookie_name: "sid".to_string(),
+                    max_age: Duration::from_secs(3600),
+                    cookie_path: "/".to_string(),
+                    cookie_http_only: true,
+                    cookie_secure: false,
+                    cookie_same_site: Some(SameSite::Lax),
+                    operation_timeout: Duration::from_secs(5),
+                })
+                .get("/login", |session: Session| async move {
+                    session.insert("user", "alice");
+                    "logged in"
+                })
+                .get("/touch", |session: Session| async move {
+                    session.insert("stale-write", true);
+                    "touched"
+                }),
+        );
+
+        // Create the session.
+        let resp = client.get("/login").send().await;
+        let cookie = resp
+            .header("set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+        let sid = key.verify(cookie.strip_prefix("sid=").unwrap()).unwrap();
+
+        // Request A loads the session (revision observed)…
+        let _rev = store.revision(&sid).expect("session exists");
+
+        // Through the LAYER with genuinely concurrent requests: request A
+        // loads the session and pauses in its handler; request B destroys
+        // the session; A resumes and modifies — A's save must be refused
+        // (503), and the session must not reappear.
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        fn slow_router(
+            store: &Arc<MemoryStore>,
+            key: &Key,
+            entered: &Arc<std::sync::atomic::AtomicBool>,
+            release: &Arc<tokio::sync::Notify>,
+        ) -> Router {
+            let entered = Arc::clone(entered);
+            let release = Arc::clone(release);
+            Router::new()
+                .middleware(SessionLayer {
+                    store: Arc::clone(store) as Arc<dyn SessionStore>,
+                    key: key.clone(),
+                    cookie_name: "sid".to_string(),
+                    max_age: Duration::from_secs(3600),
+                    cookie_path: "/".to_string(),
+                    cookie_http_only: true,
+                    cookie_secure: false,
+                    cookie_same_site: Some(SameSite::Lax),
+                    operation_timeout: Duration::from_secs(5),
+                })
+                .get("/slow-touch", move |session: Session| {
+                    let e = Arc::clone(&entered);
+                    let r = Arc::clone(&release);
+                    async move {
+                        e.store(true, std::sync::atomic::Ordering::SeqCst);
+                        r.notified().await;
+                        session.insert("stale-write", true);
+                        "touched"
+                    }
+                })
+                .get("/logout", |session: Session| async move {
+                    session.destroy();
+                    "logged out"
+                })
+        }
+
+        // Request A: loads the session, pauses inside the handler. (Its own
+        // client instance — both instances share the store and key.)
+        let a_client = TestClient::new(slow_router(&store, &key, &entered, &release));
+        let a_cookie = cookie.clone();
+        let a = tokio::spawn(async move {
+            a_client
+                .get("/slow-touch")
+                .header("cookie", &a_cookie)
+                .send()
+                .await
+        });
+        for _ in 0..200 {
+            if entered.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Request B: logs out through the layer (destroy path).
+        let b_client = TestClient::new(slow_router(&store, &key, &entered, &release));
+        let resp = b_client
+            .get("/logout")
+            .header("cookie", &cookie)
+            .send()
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(store.load(&sid).is_none(), "destroyed");
+
+        // A resumes: its stale save must be refused…
+        release.notify_waiters();
+        let resp = a.await.expect("request A panicked");
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the stale request must not save over the destroyed session"
+        );
+        // …and the destroyed session stays destroyed.
+        assert!(store.load(&sid).is_none());
+
+        // Store-level probe (same fencing, direct): after destroy, a save at
+        // the pre-destroy revision is refused and the session stays gone.
+        let mut probe = HashMap::new();
+        probe.insert("user".to_string(), serde_json::json!("alice"));
+        assert!(
+            !store.save_if_current(&sid, probe, Duration::from_secs(60), _rev),
+            "stale writer must not resurrect the destroyed session"
+        );
+        assert!(store.load(&sid).is_none(), "session stays destroyed");
+    }
+
+    /// RS-04: a MemoryStore at capacity refuses new sessions, and the layer
+    /// reports failure instead of returning success with an unsaved cookie.
+    #[tokio::test]
+    async fn capacity_exhaustion_reports_failure_not_success() {
+        let store = MemoryStore::with_max_sessions(1);
+        // Occupy the single slot.
+        let mut first = HashMap::new();
+        first.insert("user".to_string(), serde_json::json!("first"));
+        assert!(store.save_if_current("occupied-1", first, Duration::from_secs(60), 0));
+
+        let client = TestClient::new(Router::new().middleware(layer_with_store(store)).get(
+            "/login",
+            |session: Session| async move {
+                session.insert("user", "second");
+                "logged in"
+            },
+        ));
+
+        let resp = client.get("/login").send().await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "login must not claim success with an unsaved session"
+        );
+        assert!(
+            resp.header("set-cookie").is_none(),
+            "no session cookie for a session that was not persisted"
+        );
+    }
+
+    /// RS-04 (store level): failed capacity saves are observable.
+    #[test]
+    fn memory_store_save_reports_capacity_failure() {
+        let store = MemoryStore::with_max_sessions(1);
+        let mut a = HashMap::new();
+        a.insert("k".to_string(), serde_json::json!(1));
+        assert!(store.save_if_current("a", a.clone(), Duration::from_secs(60), 0));
+        assert!(
+            !store.save_if_current("b", a, Duration::from_secs(60), 0),
+            "at capacity"
+        );
+    }
+
+    /// RS-03 (concurrent writers): the second writer at a stale revision is
+    /// refused instead of silently discarding the first writer's update.
+    #[test]
+    fn memory_store_fences_concurrent_writers() {
+        let store = MemoryStore::new();
+        let mut v1 = HashMap::new();
+        v1.insert("n".to_string(), serde_json::json!(1));
+        assert!(store.save_if_current("s", v1.clone(), Duration::from_secs(60), 0));
+        let rev1 = store.revision("s").unwrap();
+
+        // Writer 2 loaded at revision 0 (stale): refused.
+        assert!(!store.save_if_current("s", v1.clone(), Duration::from_secs(60), 0));
+        // Writer 3 loaded at the current revision: lands.
+        assert!(store.save_if_current("s", v1, Duration::from_secs(60), rev1));
+    }
+    #[test]
+    fn expired_record_cannot_be_reinserted_by_a_stale_writer() {
+        let store = MemoryStore::new();
+        assert!(store.save_if_current("expired", HashMap::new(), Duration::ZERO, 0));
+        let revision = store.revision("expired").unwrap();
+        // Force the periodic cleanup branch to remove the expired row.
+        *store.last_cleanup.lock().unwrap() = Instant::now() - Duration::from_secs(61);
+        assert!(!store.save_if_current(
+            "expired",
+            HashMap::new(),
+            Duration::from_secs(60),
+            revision
+        ));
+        assert!(store.load("expired").is_none());
+    }
+
+    struct FailingAsyncStore {
+        pending: bool,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct StorageDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StorageDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl SessionStore for FailingAsyncStore {
+        fn load_versioned<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> SessionFuture<'a, Option<(SessionData, u64)>> {
+            Box::pin(async move {
+                let _guard = StorageDrop(self.dropped.clone());
+                if self.pending {
+                    std::future::pending::<()>().await;
+                }
+                Err(SessionStoreError::Unavailable("injected".into()))
+            })
+        }
+        fn commit<'a>(
+            &'a self,
+            _: &'a str,
+            _: SessionData,
+            _: Duration,
+            _: u64,
+        ) -> SessionFuture<'a, ()> {
+            Box::pin(async { Err(SessionStoreError::Unavailable("injected".into())) })
+        }
+        fn revoke<'a>(&'a self, _: &'a str, _: u64) -> SessionFuture<'a, ()> {
+            Box::pin(async { Err(SessionStoreError::Unavailable("injected".into())) })
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_error_and_deadline_stop_dispatch_and_drop_storage_work() {
+        for pending in [false, true] {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls2 = calls.clone();
+            let key = Key::generate();
+            let cookie = format!("neutron.sid={}", key.sign("existing"));
+            let client = TestClient::new(
+                Router::new()
+                    .middleware(
+                        SessionLayer::new(
+                            FailingAsyncStore {
+                                pending,
+                                dropped: dropped.clone(),
+                            },
+                            key,
+                        )
+                        .operation_timeout(Duration::from_millis(20)),
+                    )
+                    .get("/me", move || {
+                        let calls = calls2.clone();
+                        async move {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            "unsafe"
+                        }
+                    }),
+            );
+            let resp = client.get("/me").header("cookie", &cookie).send().await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(resp.header("set-cookie").is_none());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_revision_contract_distinguishes_conflict_capacity_and_revoke_owner() {
+        let store = MemoryStore::with_max_sessions(1);
+        store
+            .commit("a", HashMap::new(), Duration::from_secs(60), 0)
+            .await
+            .unwrap();
+        let (_, revision) = store.load_versioned("a").await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .commit("b", HashMap::new(), Duration::from_secs(60), 0)
+                .await,
+            Err(SessionStoreError::Capacity)
+        );
+        assert_eq!(store.revoke("a", 0).await, Err(SessionStoreError::Conflict));
+        store.revoke("a", revision).await.unwrap();
+        assert_eq!(
+            store
+                .commit("a", HashMap::new(), Duration::from_secs(60), revision)
+                .await,
+            Err(SessionStoreError::Conflict)
+        );
     }
 }

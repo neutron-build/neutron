@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { generateRoutesModule, neutronPlugin } from "./plugin.js";
+import { findImportSpecifier, generateRoutesModule, neutronPlugin } from "./plugin.js";
 import type { Route } from "../core/types.js";
 
 describe("content module client stub", () => {
@@ -185,5 +185,33 @@ describe("dep optimizer virtual-namespace externals", () => {
     const { optimizeDeps } = config.call(undefined);
     expect(optimizeDeps.rolldownOptions).toBeUndefined();
     expect(optimizeDeps.esbuildOptions!.plugins).toHaveLength(1);
+  });
+});
+
+describe("findImportSpecifier (Island __src resolution)", () => {
+  it.each([
+    ['import Counter from "./c.js";', "Counter", "./c.js"],
+    ['import { Counter } from "./c.js";', "Counter", "./c.js"],
+    ['import { Other as Counter } from "./c.js";', "Counter", "./c.js"],
+    ['import Counter, { type Props } from "./c.js";', "Counter", "./c.js"],
+    ['import Def, { Counter } from "./c.js";', "Counter", "./c.js"],
+    ['import Counter, * as ns from "./c.js";', "Counter", "./c.js"],
+    ['import * as Counter from "./c.js";', "Counter", "./c.js"],
+    ['import {\n  A,\n  Counter,\n} from "./c.js";', "Counter", "./c.js"],
+    ["import Counter from '../c';", "Counter", "../c"],
+  ])("%s", (code, name, expected) => {
+    expect(findImportSpecifier(code, name)).toBe(expected);
+  });
+
+  it("skips type-only bindings and look-alike names", () => {
+    expect(findImportSpecifier('import type Counter from "./c.js";', "Counter")).toBeNull();
+    expect(findImportSpecifier('import { type Counter } from "./c.js";', "Counter")).toBeNull();
+    expect(findImportSpecifier('import { Counter as X } from "./c.js";', "Counter")).toBeNull();
+    expect(findImportSpecifier('import CounterBox from "./c.js";', "Counter")).toBeNull();
+  });
+
+  it("picks the import that binds the name, not the first one", () => {
+    const code = 'import A from "./a.js";\nimport B, { type T } from "./b.js";';
+    expect(findImportSpecifier(code, "B")).toBe("./b.js");
   });
 });

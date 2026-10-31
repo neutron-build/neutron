@@ -42,9 +42,11 @@ def _build_tiny_tokenizer() -> BPETokenizer:
     return tok^
 
 
-def _build_tiny_model() -> Model:
+def _build_tiny_model() raises -> Model:
     """Build a tiny FP32 model with non-trivial weights."""
     var p = tiny_test_params()
+    # Chat-template prompts encode to ~45 tokens; align context capacity.
+    p.max_seq_len = 256
     var model = Model(p)
 
     for v in range(p.vocab_size):
@@ -64,7 +66,7 @@ def _build_tiny_model() -> Model:
     return model^
 
 
-def _build_tiny_q_model() -> QuantizedModel:
+def _build_tiny_q_model() raises -> QuantizedModel:
     """Build a tiny QuantizedModel from FP32 model."""
     var model = _build_tiny_model()
     return quantize_from_model(model, block_size=2)

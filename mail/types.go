@@ -103,6 +103,28 @@ type Keywords struct {
 	Custom   []string `json:"custom,omitempty"`
 }
 
+// AttachmentState is the honest claim an envelope can make about
+// attachments. Unknown means the fetch that produced the envelope could
+// not see the part tree (Gmail format=metadata); it is never a claim of
+// absence.
+type AttachmentState int8
+
+const (
+	AttachmentUnknown AttachmentState = iota
+	AttachmentAbsent
+	AttachmentPresent
+)
+
+// AttachmentFromBool maps a provider's definitive yes/no answer onto the
+// tri-state. Only adapters whose fetch always sees the part tree — IMAP
+// with BODYSTRUCTURE, Graph and JMAP with their API flags — may call it.
+func AttachmentFromBool(present bool) AttachmentState {
+	if present {
+		return AttachmentPresent
+	}
+	return AttachmentAbsent
+}
+
 // Envelope is everything about a message except its body.
 //
 // Envelopes sync eagerly and bodies do not: envelope-only for a 100k-message
@@ -128,10 +150,10 @@ type Envelope struct {
 	SentAt     time.Time
 	ReceivedAt time.Time
 
-	Keywords      Keywords
-	HasAttachment bool
-	Size          int64
-	Preview       string
+	Keywords   Keywords
+	Attachment AttachmentState
+	Size       int64
+	Preview    string
 
 	// RFC 5322 threading headers, retained because they are the identity
 	// fallback for providers that expose no stable ID, and the only way to

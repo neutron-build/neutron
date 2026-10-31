@@ -1,0 +1,32 @@
+{
+  "profile": "nucleus-relational-rc-v1-candidate",
+  "status": "source-assessment-only",
+  "package_enabled": false,
+  "assessed_nucleus_tree": "315b1720f6e2292e7c85e8fec4805886340e0ff8",
+  "engine": {"product": "nucleus", "storage": "buffered-disk", "transport": "pgwire", "isolation": ["read committed"], "schema_authority": "externally provisioned, autocommit DDL only"},
+  "clients": ["typescript-pg", "typescript-postgres", "python-sync", "python-async", "go-pgx"],
+  "candidate_values": ["int4", "int8", "boolean", "text", "jsonb", "timestamptz-UTC-microseconds", "SQL-NULL-distinct-from-JSON-null"],
+  "candidate_shapes": ["qualified-bound-point-select", "qualified-bound-insert-returning", "qualified-bound-update-explicit-zero-false-empty", "qualified-bound-delete", "read-committed-data-transaction", "read-only-refusal", "savepoint-rollback-error-recovery", "SET-LOCAL-rollback-reset"],
+  "excluded_from_initial_candidate": ["numeric", "arrays", "custom-OID", "enum-ordering", "row-comparison", "catalog-codegen", "transactional-DDL-migrations", "advisory-locks", "prepared-cache-pooler", "repeatable-read", "serializable", "deadline-SQL-side-channel", "bounded-server-cursor-memory", "RLS-parity", "specialty-model-atomicity", "universal-query-algebra"],
+  "mandatory_program_requirements_retained": true,
+  "selected_blockers": [
+    {"id": "NP01", "title": "Explicit SDK named-profile admission", "kind": "client-contract", "required": true, "source": ["python/neutron/orm/endpoint.py", "typescript/packages/neutron-sql/src/engine.ts", "go/orm/metadata.go"], "acceptance": "All five fresh clients bind exact Nucleus identity/profile and refuse unapproved types/features before partial writes; postgres-direct Python admission still rejects Nucleus."},
+    {"id": "NP02", "title": "Session PID and SQL cancellation target bridge", "kind": "selected-engine-blocker", "required": true, "source": ["nucleus/src/executor/scalar_fns.rs", "nucleus/src/wire/mod.rs"], "acceptance": "pg_backend_pid matches this session's BackendKeyData target; authorized pg_cancel_backend cancels only its owned target with 57014; wrong/stale identity cannot cancel another borrower; native CancelRequest independently tested without relying on absent pg_sleep."},
+    {"id": "NP03", "title": "Exact numeric range and written scale", "kind": "engine-format-contract", "required": true, "source": ["nucleus/src/types/mod.rs", "nucleus/src/wire/mod.rs"], "acceptance": "Full scalar cross-writer matrix preserves 1.50, values outside rust_decimal's coefficient/scale ceiling, and native text/binary fidelity; typemod range/scale must be enforced or explicitly refused, never ignored."},
+    {"id": "NP04", "title": "Transactional catalog and migration authority", "kind": "engine-catalog-contract", "required": true, "source": ["nucleus/src/executor/ddl.rs", "nucleus/src/executor/pg_catalog.rs", "nucleus/src/executor/txn.rs"], "acceptance": "DDL visibility/rollback/history is atomic, full canonical introspection retains objects and native result types, migration lock and concurrent-index semantics are proven on exact binary."},
+    {"id": "NP05", "title": "Server cursor memory and cancellation granularity", "kind": "engine-query-contract", "required": true, "source": ["nucleus/src/executor/admin.rs", "nucleus/src/wire/mod.rs"], "acceptance": "Named DECLARE/FETCH does not eagerly materialize the entire accepted stream and cancellation bounds are observed; stream path reports actual served rows and rejects unsupported shapes instead of unreported materialization fallback."},
+    {"id": "NP06", "title": "Exact current native and recovery gates", "kind": "qualification", "required": true, "source": ["nucleus/docs/PROBES.md", "nucleus/scripts/probe.sh", "conformance/live/orm/capabilities.nucleus.json"], "acceptance": "Current source/config/binary/dependency hashes, PostgreSQL controls, all five installed consumers, adversarial faults and independent review; expired catalog holdout must be resolved or explicitly rejected as a remaining release blocker, not silently extended."}
+  ],
+  "source_evidence": [
+    "AUDIT_OPEN.md", "nucleus/CLAUDE.md", "nucleus/docs/PROBES.md", "nucleus/scripts/probe.sh",
+    "nucleus/src/types/mod.rs", "nucleus/src/wire/mod.rs", "nucleus/src/wire/tests_row_description.rs",
+    "nucleus/src/executor/txn.rs", "nucleus/src/executor/txn_modes.rs", "nucleus/src/executor/scalar_fns.rs",
+    "nucleus/src/executor/admin.rs", "nucleus/src/executor/ddl.rs", "nucleus/src/executor/pg_catalog.rs",
+    "conformance/live/orm/capabilities.nucleus.json", "conformance/live/orm/probes.mjs",
+    "conformance/live/orm/ORM_CONFORMANCE.md", "conformance/live/scripts/start-engine.sh",
+    "python/neutron/orm/endpoint.py", "python/neutron/orm/core.py", "python/neutron/orm/client.py", "python/neutron/orm/streaming.py",
+    "typescript/packages/neutron-sql/src/engine.ts", "typescript/packages/neutron-sql/src/drivers.ts", "typescript/packages/neutron-sql/src/transactions.ts",
+    "go/orm/metadata.go", "go/orm/query.go", "go/orm/write.go", "go/orm/transaction.go"
+  ],
+  "claims": "An unenabled finite candidate and source assessment. Historical TS recordings are scoped to their recorded engine tree and binary; no current polyglot certification or PostgreSQL parity."
+}

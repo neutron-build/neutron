@@ -157,12 +157,12 @@ def _build_gguf_with_gguf_names() raises -> List[UInt8]:
     _write_u32_le(buf, 4)
     _write_u32_le(buf, 8)
 
-    # Tensor info — using GGUF names!
-    # token_embd [8,4] F32 = 128 bytes
+    # Tensor info — using GGUF names (dims fastest-varying first: [hidden, vocab])
+    # token_embd [4,8] F32 = 128 bytes
     _write_string_gguf(buf, "token_embd.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
     _write_u64_le(buf, 4)
+    _write_u64_le(buf, 8)
     _write_u32_le(buf, 0)   # F32
     _write_u64_le(buf, 0)
 
@@ -173,13 +173,13 @@ def _build_gguf_with_gguf_names() raises -> List[UInt8]:
     _write_u32_le(buf, 0)
     _write_u64_le(buf, 128)
 
-    # output [8,4] F32 = 128 bytes
+    # output [4,8] F32 = 128 bytes (aligned up from 144)
     _write_string_gguf(buf, "output.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
     _write_u64_le(buf, 4)
+    _write_u64_le(buf, 8)
     _write_u32_le(buf, 0)
-    _write_u64_le(buf, 144)
+    _write_u64_le(buf, 160)
 
     # Align
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
@@ -193,6 +193,10 @@ def _build_gguf_with_gguf_names() raises -> List[UInt8]:
     # norm (16 bytes)
     for _ in range(4):
         _write_f32_le(buf, Float32(1.0))
+
+    # alignment padding (16 bytes) so output sits at aligned offset 160
+    for _ in range(16):
+        buf.append(0)
 
     # lm_head (128 bytes)
     for i in range(32):
@@ -267,12 +271,12 @@ def test_mixed_naming() raises:
     _write_u32_le(buf, 4)
     _write_u32_le(buf, 8)
 
-    # Tensors: mix of GGUF and HF names
+    # Tensors: mix of GGUF and HF names (dims fastest-varying first)
     # GGUF name: token_embd.weight
     _write_string_gguf(buf, "token_embd.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
     _write_u64_le(buf, 4)
+    _write_u64_le(buf, 8)
     _write_u32_le(buf, 0)
     _write_u64_le(buf, 0)
 
@@ -283,13 +287,13 @@ def test_mixed_naming() raises:
     _write_u32_le(buf, 0)
     _write_u64_le(buf, 128)
 
-    # GGUF name: output.weight
+    # GGUF name: output.weight (dims fastest-varying first; aligned up from 144)
     _write_string_gguf(buf, "output.weight")
     _write_u32_le(buf, 2)
-    _write_u64_le(buf, 8)
     _write_u64_le(buf, 4)
+    _write_u64_le(buf, 8)
     _write_u32_le(buf, 0)
-    _write_u64_le(buf, 144)
+    _write_u64_le(buf, 160)
 
     # Align
     var aligned = _align_offset(len(buf), GGUF_DEFAULT_ALIGNMENT)
@@ -301,6 +305,9 @@ def test_mixed_naming() raises:
         _write_f32_le(buf, Float32(i) * 0.1)
     for _ in range(4):
         _write_f32_le(buf, Float32(1.0))
+    # alignment padding (16 bytes) so output sits at aligned offset 160
+    for _ in range(16):
+        buf.append(0)
     for i in range(32):
         _write_f32_le(buf, Float32(i) * 0.05)
 

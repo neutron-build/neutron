@@ -167,6 +167,133 @@ fn compare_cells(left: &str, right: &str) -> std::cmp::Ordering {
     left.cmp(right)
 }
 
+/// How a policy comparison interprets the values it compares (NE-05).
+///
+/// The RLS row map is stringly-typed, and the old comparison guessed numeric
+/// semantics whenever both rendered values happened to parse as numbers —
+/// which changed policy meaning: on a TEXT column `code > '2'` admitted '10'
+/// (both parse as integers), and on exact numerics an f64 boundary rounded so
+/// 9007199254740993 <= 9007199254740992.0 could hold. The domain is bound
+/// once, at CREATE POLICY time, from the catalog column type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ColumnDomain {
+    /// Numeric when both sides parse, else lexical — the behavior policies
+    /// persisted before domains existed were written under. Kept as the
+    /// serde default so reloaded policies keep their recorded semantics;
+    /// recreating a policy rebinds its domain.
+    #[default]
+    Heuristic,
+    /// Lexical comparison — TEXT-family columns (`code > '9'` must NOT admit
+    /// '10').
+    Text,
+    /// Exact decimal comparison — integer/NUMERIC columns compared digit-wise
+    /// with no f64 rounding, so boundaries beyond 2^53 stay exact.
+    Numeric,
+}
+
+/// Compare two rendered values under a bound column domain (NE-05).
+///
+/// `Text` is strictly lexical — no numeric guessing for numeric-looking text.
+/// `Numeric` compares decimal digit strings EXACTLY (sign, integer width,
+/// digit-wise, fraction padded), so a boundary like `id > 9007199254740992`
+/// cannot round through an f64 mantissa; exponent forms fall back to f64.
+/// `Heuristic` keeps the legacy `compare_cells`.
+fn compare_cells_domain(left: &str, right: &str, domain: ColumnDomain) -> std::cmp::Ordering {
+    match domain {
+        ColumnDomain::Text => left.trim().cmp(right.trim()),
+        ColumnDomain::Numeric => compare_exact_decimal(left.trim(), right.trim()),
+        ColumnDomain::Heuristic => compare_cells(left, right),
+    }
+}
+
+/// Equality of two rendered values under a bound column domain (NE-05):
+/// numeric columns compare values ('100' == '100.0'), text compares text.
+fn cells_equal_domain(left: &str, right: &str, domain: ColumnDomain) -> bool {
+    match domain {
+        ColumnDomain::Numeric => {
+            compare_exact_decimal(left.trim(), right.trim()) == std::cmp::Ordering::Equal
+        }
+        ColumnDomain::Text | ColumnDomain::Heuristic => left == right,
+    }
+}
+
+/// Exact decimal comparison of two rendered numeric strings.
+///
+/// Handles optional sign and integer/fraction digit strings of arbitrary
+/// length without any floating-point conversion. Exponent notation (or
+/// anything unparsable as a decimal) falls back to f64 and finally lexical.
+fn compare_exact_decimal(left: &str, right: &str) -> std::cmp::Ordering {
+    if let Some(ordering) = cmp_decimal_exact(left, right) {
+        return ordering;
+    }
+    if let (Ok(l), Ok(r)) = (left.parse::<f64>(), right.parse::<f64>())
+        && let Some(ordering) = l.partial_cmp(&r)
+    {
+        return ordering;
+    }
+    left.cmp(right)
+}
+
+/// Sign/magnitude split: `(is_negative, magnitude)`.
+fn split_sign_decimal(s: &str) -> (bool, &str) {
+    match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    }
+}
+
+/// Exact digit-wise decimal comparison; `None` when either side is not a
+/// plain (optionally signed) integer/fraction decimal.
+fn cmp_decimal_exact(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let is_plain_decimal = |s: &str| {
+        !s.is_empty()
+            && !s.contains(['e', 'E'])
+            && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            && s.matches('.').count() <= 1
+            && s.bytes().any(|b| b.is_ascii_digit())
+    };
+    let (lneg, lmag) = split_sign_decimal(left);
+    let (rneg, rmag) = split_sign_decimal(right);
+    if !is_plain_decimal(lmag) || !is_plain_decimal(rmag) {
+        return None;
+    }
+    // -0 and 0 are equal: normalize an all-zero magnitude to non-negative.
+    let l_zero = !lmag.bytes().any(|b| b != b'.' && b != b'0');
+    let r_zero = !rmag.bytes().any(|b| b != b'.' && b != b'0');
+    let lneg = lneg && !l_zero;
+    let rneg = rneg && !r_zero;
+    match (lneg, rneg) {
+        (true, false) => return Some(std::cmp::Ordering::Less),
+        (false, true) => return Some(std::cmp::Ordering::Greater),
+        _ => {}
+    }
+    let magnitude = cmp_decimal_magnitude(lmag, rmag);
+    Some(if lneg == rneg {
+        magnitude
+    } else {
+        magnitude.reverse()
+    })
+}
+
+/// Compare non-negative decimal magnitudes ("3", "3.5", "03.50").
+fn cmp_decimal_magnitude(l: &str, r: &str) -> std::cmp::Ordering {
+    let (li, lf) = l.split_once('.').unwrap_or((l, ""));
+    let (ri, rf) = r.split_once('.').unwrap_or((r, ""));
+    let li = li.trim_start_matches('0');
+    let ri = ri.trim_start_matches('0');
+    if li.len() != ri.len() {
+        return li.len().cmp(&ri.len());
+    }
+    if li != ri {
+        return li.cmp(ri);
+    }
+    let width = lf.len().max(rf.len());
+    let lf_padded: String = lf.chars().chain(std::iter::repeat('0')).take(width).collect();
+    let rf_padded: String = rf.chars().chain(std::iter::repeat('0')).take(width).collect();
+    lf_padded.cmp(&rf_padded)
+}
+
 /// SQL three-valued logic for predicate evaluation.
 ///
 /// A NULL column is ABSENT from the row map, so a comparison against it is
@@ -197,6 +324,8 @@ pub enum RlsPredicate {
         value: String,
         #[serde(default)]
         column_id: u32,
+        #[serde(default)]
+        domain: ColumnDomain,
     },
     /// Column must equal the session's tenant_id.
     ColumnEqTenant {
@@ -217,6 +346,8 @@ pub enum RlsPredicate {
         value: String,
         #[serde(default)]
         column_id: u32,
+        #[serde(default)]
+        domain: ColumnDomain,
     },
     /// Column must be one of a constant list (`IN`).
     ColumnInList {
@@ -224,6 +355,8 @@ pub enum RlsPredicate {
         values: Vec<String>,
         #[serde(default)]
         column_id: u32,
+        #[serde(default)]
+        domain: ColumnDomain,
     },
     /// Column `IS NULL`, or `IS NOT NULL` when `negated`.
     ColumnIsNull {
@@ -244,6 +377,11 @@ pub enum RlsPredicate {
     AlwaysTrue,
     /// Always false (restrictive default).
     AlwaysFalse,
+    /// The literal NULL constant (NE-06): SQL evaluates every comparison
+    /// against NULL to UNKNOWN, and so must a policy. Binding it to
+    /// AlwaysFalse made `NOT NULL` — as a predicate — evaluate to TRUE and
+    /// grant every row.
+    AlwaysUnknown,
 }
 
 impl RlsPredicate {
@@ -305,9 +443,10 @@ impl RlsPredicate {
                 left || right
             }
             RlsPredicate::Not(inner) => inner.rename_column(column_id, new_name),
-            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
-                false
-            }
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse
+            | RlsPredicate::AlwaysUnknown => false,
         }
     }
 
@@ -357,8 +496,34 @@ impl RlsPredicate {
                 b.bind_column_ids(resolve);
             }
             RlsPredicate::Not(inner) => inner.bind_column_ids(resolve),
-            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse
+            | RlsPredicate::AlwaysUnknown => {}
+        }
+    }
+
+    /// Bind each comparison leaf's value domain from the catalog column type
+    /// (NE-05), so evaluation compares values with the semantics the column
+    /// actually has instead of guessing from the rendered strings.
+    ///
+    /// `resolve` returning `None` (unknown column) keeps the legacy
+    /// heuristic for that leaf.
+    pub fn bind_column_domains(&mut self, resolve: &dyn Fn(&str) -> Option<ColumnDomain>) {
+        match self {
+            RlsPredicate::ColumnEqStr { column, domain, .. }
+            | RlsPredicate::ColumnCmp { column, domain, .. }
+            | RlsPredicate::ColumnInList { column, domain, .. } => {
+                if let Some(resolved) = resolve(column) {
+                    *domain = resolved;
+                }
             }
+            RlsPredicate::And(a, b) | RlsPredicate::Or(a, b) => {
+                a.bind_column_domains(resolve);
+                b.bind_column_domains(resolve);
+            }
+            RlsPredicate::Not(inner) => inner.bind_column_domains(resolve),
+            _ => {}
         }
     }
 
@@ -382,8 +547,10 @@ impl RlsPredicate {
                 b.referenced_column_ids(out);
             }
             RlsPredicate::Not(inner) => inner.referenced_column_ids(out),
-            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
-            }
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse
+            | RlsPredicate::AlwaysUnknown => {}
         }
     }
 
@@ -402,8 +569,10 @@ impl RlsPredicate {
                 b.referenced_column_names(out);
             }
             RlsPredicate::Not(inner) => inner.referenced_column_names(out),
-            RlsPredicate::HasRole { .. } | RlsPredicate::AlwaysTrue | RlsPredicate::AlwaysFalse => {
-            }
+            RlsPredicate::HasRole { .. }
+            | RlsPredicate::AlwaysTrue
+            | RlsPredicate::AlwaysFalse
+            | RlsPredicate::AlwaysUnknown => {}
         }
     }
 
@@ -423,8 +592,13 @@ impl RlsPredicate {
         // NULL is unknown, and unknown never grants — so a row whose guarded
         // column is NULL is withheld rather than leaked, including under NOT.
         match self {
-            RlsPredicate::ColumnEqStr { column, value, .. } => match row.get(column) {
-                Some(cell) => (cell == value).into(),
+            RlsPredicate::ColumnEqStr {
+                column,
+                value,
+                domain,
+                ..
+            } => match row.get(column) {
+                Some(cell) => cells_equal_domain(cell, value, *domain).into(),
                 None => TriState::Unknown,
             },
             RlsPredicate::ColumnEqTenant { column, .. } => match &ctx.tenant_id {
@@ -441,13 +615,25 @@ impl RlsPredicate {
                 None => TriState::Unknown,
             },
             RlsPredicate::ColumnCmp {
-                column, op, value, ..
+                column,
+                op,
+                value,
+                domain,
+                ..
             } => match row.get(column) {
-                Some(cell) => op.admits(compare_cells(cell, value)).into(),
+                Some(cell) => op.admits(compare_cells_domain(cell, value, *domain)).into(),
                 None => TriState::Unknown,
             },
-            RlsPredicate::ColumnInList { column, values, .. } => match row.get(column) {
-                Some(cell) => values.iter().any(|candidate| candidate == cell).into(),
+            RlsPredicate::ColumnInList {
+                column,
+                values,
+                domain,
+                ..
+            } => match row.get(column) {
+                Some(cell) => values
+                    .iter()
+                    .any(|candidate| cells_equal_domain(cell, candidate, *domain))
+                    .into(),
                 None => TriState::Unknown,
             },
             // IS NULL / IS NOT NULL are definite: NULL never makes them unknown.
@@ -475,6 +661,9 @@ impl RlsPredicate {
             },
             RlsPredicate::AlwaysTrue => TriState::True,
             RlsPredicate::AlwaysFalse => TriState::False,
+            // The literal NULL predicate is UNKNOWN under SQL three-valued
+            // logic — including under NOT — so it never grants (NE-06).
+            RlsPredicate::AlwaysUnknown => TriState::Unknown,
         }
     }
 }
@@ -862,15 +1051,22 @@ impl MaskingRule {
                 if let Some(at_pos) = value.find('@') {
                     let local = &value[..at_pos];
                     let domain = &value[at_pos..];
-                    if local.len() <= 1 {
+                    // Operate on characters, not bytes: `&local[..1]` panicked
+                    // when the local part started with a multibyte character
+                    // (internationalized addresses), and byte-count stars
+                    // misrepresented the mask width for non-ASCII local parts.
+                    // A one-character local part stays fully masked.
+                    let char_count = local.chars().count();
+                    if char_count <= 1 {
                         format!("*{domain}")
                     } else {
-                        let first = &local[..1];
-                        let stars = "*".repeat(local.len() - 1);
+                        let mut chars = local.chars();
+                        let first = chars.next().expect("char_count > 1");
+                        let stars = "*".repeat(char_count - 1);
                         format!("{first}{stars}{domain}")
                     }
                 } else {
-                    "*".repeat(value.len())
+                    "*".repeat(value.chars().count())
                 }
             }
             MaskingRule::Partial {
@@ -1676,6 +1872,7 @@ mod tests {
                 column: "owner".into(),
                 value: value.into(),
                 column_id: 0,
+                domain: ColumnDomain::Heuristic,
             },
             check_predicate: None,
             permissive: true,
@@ -1782,6 +1979,7 @@ mod tests {
             op: CmpOp::Gt,
             value: "100".into(),
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
         let ctx = SessionContext::new("u");
         assert!(predicate.evaluate(&make_row(&[("amount", "200")]), &ctx));
@@ -1809,6 +2007,7 @@ mod tests {
             op: CmpOp::Gt,
             value: "9007199254740992".into(),
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
         let ctx = SessionContext::new("u");
         assert!(predicate.evaluate(&make_row(&[("id", "9007199254740993")]), &ctx));
@@ -1842,6 +2041,7 @@ mod tests {
                 op,
                 value: "100".into(),
                 column_id: 0,
+                domain: ColumnDomain::Heuristic,
             };
             assert!(
                 !predicate.evaluate(&null_row, &ctx),
@@ -1853,6 +2053,7 @@ mod tests {
             column: "amount".into(),
             values: vec!["1".into(), "2".into()],
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
         assert!(!in_list.evaluate(&null_row, &ctx));
     }
@@ -1887,6 +2088,7 @@ mod tests {
             column: "region".into(),
             values: vec!["eu".into(), "us".into()],
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
         assert!(in_list.evaluate(&make_row(&[("region", "eu")]), &ctx));
         assert!(!in_list.evaluate(&make_row(&[("region", "apac")]), &ctx));
@@ -1897,6 +2099,7 @@ mod tests {
             op: CmpOp::Lt,
             value: "m".into(),
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
         assert!(text_cmp.evaluate(&make_row(&[("region", "eu")]), &ctx));
         assert!(!text_cmp.evaluate(&make_row(&[("region", "us")]), &ctx));
@@ -1914,6 +2117,7 @@ mod tests {
             column: "region".into(),
             value: "eu".into(),
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         }));
         assert!(
             !not_eq.evaluate(&null_row, &ctx),
@@ -1929,6 +2133,7 @@ mod tests {
                 op,
                 value: "100".into(),
                 column_id: 0,
+                domain: ColumnDomain::Heuristic,
             }));
             assert!(
                 !not_cmp.evaluate(&null_row, &ctx),
@@ -1940,6 +2145,7 @@ mod tests {
             column: "amount".into(),
             values: vec!["1".into(), "2".into()],
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         }));
         assert!(
             !not_in_list.evaluate(&null_row, &ctx),
@@ -1981,12 +2187,14 @@ mod tests {
             column: "owner".into(),
             value: "alice".into(),
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
         let amount_over = RlsPredicate::ColumnCmp {
             column: "amount".into(),
             op: CmpOp::Gt,
             value: "100".into(),
             column_id: 0,
+            domain: ColumnDomain::Heuristic,
         };
 
         // owner = 'alice' AND amount > 100, amount NULL → Unknown → deny.
@@ -2078,6 +2286,7 @@ mod tests {
                 column: "status".into(),
                 value: "published".into(),
                 column_id: 0,
+                domain: ColumnDomain::Heuristic,
             },
             check_predicate: None,
             permissive: false,
@@ -2132,6 +2341,27 @@ mod tests {
         let rule = MaskingRule::EmailMask;
         assert_eq!(rule.apply("tyler@example.com"), "t****@example.com");
         assert_eq!(rule.apply("ab@test.io"), "a*@test.io");
+    }
+
+    #[test]
+    fn masking_email_multibyte_local_parts_do_not_panic() {
+        // NE-09: `&local[..1]` panicked when the local part began with a
+        // multibyte character (an internationalized email), aborting the
+        // masking query. Char-based masking must handle these.
+        let rule = MaskingRule::EmailMask;
+        // é is one char, two bytes: first char kept, one star per remaining CHAR.
+        assert_eq!(rule.apply("éa@example.com"), "é*@example.com");
+        assert_eq!(rule.apply("é@é.com"), "*@é.com");
+        assert_eq!(rule.apply("日本語@example.com"), "日**@example.com");
+        // No local part at all.
+        assert_eq!(rule.apply("@example.com"), "*@example.com");
+    }
+
+    #[test]
+    fn masking_email_no_at_masks_by_characters() {
+        let rule = MaskingRule::EmailMask;
+        // The no-@ arm also masked by byte length before; chars now.
+        assert_eq!(rule.apply("ééé"), "***");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::catalog::{ColumnDef, ColumnGeneration, Deferrable, FkAction};
-use crate::types::DataType;
+use crate::types::{DataType, NumericTypmod, NumericTypmodError};
 
 /// Convert a sqlparser `ReferentialAction` to our internal `FkAction`.
 ///
@@ -740,6 +740,10 @@ pub fn extract_columns(columns: &[ast::ColumnDef]) -> Result<Vec<ColumnDef>, Par
                 analyzer: None,
                 generation,
                 max_len: declared_max_len(&col.data_type),
+                // The executor validates every declaration before it gets here
+                // (`column_writes::declared_numeric_typmod`), so an invalid
+                // one never reaches this lenient read.
+                numeric_typmod: declared_numeric_typmod(&col.data_type).ok().flatten(),
             })
         })
         .collect()
@@ -758,6 +762,33 @@ pub fn declared_max_len(dt: &ast::DataType) -> Option<u32> {
     match size {
         ast::CharacterLength::IntegerLength { length, .. } => u32::try_from(*length).ok(),
         ast::CharacterLength::Max => None,
+    }
+}
+
+/// The `numeric(p, s)` / `decimal(p, s)` a declared SQL type carries (the
+/// element's, for an array), validated. `Ok(None)` for an unconstrained
+/// `numeric` and for every other type.
+pub fn declared_numeric_typmod(
+    dt: &ast::DataType,
+) -> Result<Option<NumericTypmod>, NumericTypmodError> {
+    match dt {
+        ast::DataType::Numeric(info) | ast::DataType::Decimal(info) | ast::DataType::Dec(info) => {
+            match info {
+                ast::ExactNumberInfo::None => Ok(None),
+                ast::ExactNumberInfo::Precision(precision) => {
+                    NumericTypmod::new(*precision, 0).map(Some)
+                }
+                ast::ExactNumberInfo::PrecisionAndScale(precision, scale) => {
+                    NumericTypmod::new(*precision, *scale).map(Some)
+                }
+            }
+        }
+        ast::DataType::Array(
+            ast::ArrayElemTypeDef::AngleBracket(inner)
+            | ast::ArrayElemTypeDef::SquareBracket(inner, _)
+            | ast::ArrayElemTypeDef::Parenthesis(inner),
+        ) => declared_numeric_typmod(inner),
+        _ => Ok(None),
     }
 }
 

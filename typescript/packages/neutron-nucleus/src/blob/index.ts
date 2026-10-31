@@ -25,9 +25,9 @@ export interface BlobPutOptions {
    *  stores tags but no SQL read function exists for them. */
   metadata?: Record<string, string>;
   /** Abort the operation. Aborting between the store and the tag loop (or
-   *  mid-loop) triggers best-effort cleanup: the stored blob is deleted so
-   *  a canceled put leaves no partial blob. Store + tags are separate engine
-   *  statements and are NOT atomic. */
+   *  mid-loop) can leave the stored blob with partial metadata. No destructive
+   *  cleanup is attempted: another writer may own the key. Store + tags
+   *  are separate engine statements and are NOT atomic. */
   signal?: AbortSignal;
 }
 
@@ -212,10 +212,6 @@ function parseBlobMeta(key: string, raw: RawBlobMeta): BlobMeta {
   };
 }
 
-function isAbortError(err: unknown): boolean {
-  return err instanceof Error && err.name === 'AbortError';
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -269,23 +265,12 @@ class BlobModelImpl implements BlobModel {
     });
 
     if (opts.metadata) {
-      try {
-        for (const [k, v] of Object.entries(opts.metadata)) {
-          if (opts.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError');
-          await this.transport.execute('SELECT BLOB_TAG($1, $2, $3)', [fullKey, k, v], {
-            signal: opts.signal,
-          });
-        }
-      } catch (err) {
-        if (isAbortError(err) || opts.signal?.aborted) {
-          // Cancellation between store and tags leaves a blob without its
-          // metadata — a partial put. Clean up so a canceled put leaves
-          // nothing, then surface the abort. (Store + tags are separate
-          // engine statements; this cleanup is best-effort.)
-          await this.transport.execute('SELECT BLOB_DELETE($1)', [fullKey]).catch(() => {});
-          throw err;
-        }
-        throw err;
+      // Store and tags are independent writes. There is no ownership/version
+      // token for a conditional delete, so destructive compensation could
+      // delete a concurrent writer's object or lose an overwritten value.
+      for (const [k, v] of Object.entries(opts.metadata)) {
+        if (opts.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError');
+        await this.transport.execute('SELECT BLOB_TAG($1, $2, $3)', [fullKey, k, v], { signal: opts.signal });
       }
     }
   }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Audit what the Lean proofs actually rest on.
 #
-# `lake build` proves the proofs elaborate; it does not prove they prove
+# `python3 "$ROOT/../.github/scripts/run_with_timeout.py" lake build` proves the proofs elaborate; it does not prove they prove
 # anything. A `theorem` whose body is an `axiom` builds green, and on
 # 2026-08-17 two headline results were exactly that — with three of the
 # underlying axioms false, which made `False` derivable and every theorem in
@@ -68,7 +68,7 @@ fi
 # tree and reports it clean. Found by negative-testing this very script: an
 # axiom added on purpose passed, because the module had not been rebuilt.
 echo "=== Lean 4: building before audit (an audit of a stale build is not an audit) ==="
-lake build
+python3 "$ROOT/../.github/scripts/run_with_timeout.py" lake build
 
 echo "=== Lean 4: axiom audit (${#MODULES[@]} modules) ==="
 
@@ -80,13 +80,10 @@ total=0
 for m in "${MODULES[@]}"; do
     f="$TMP/audit.lean"
     { echo "import $m"; sed '1,/^-- AUDIT BODY$/d' "$SCRIPT_DIR/AxiomAudit.lean"; } > "$f"
-    if out=$(lake env lean "$f" 2>&1); then
-        n=$(echo "$out" | grep -oE 'AXIOM AUDIT OK: [0-9]+' | grep -oE '[0-9]+' || echo 0)
-        total=$((total + n))
-        printf '  ok  %-40s %s theorem(s)\n' "$m" "$n"
+    if python3 "$ROOT/../.github/scripts/run_with_timeout.py" lake env lean "$f" > "$TMP/$m.log" 2>&1; then
+        printf '  evaluated %s\n' "$m"
     else
-        echo "  FAIL $m"
-        echo "$out" | sed 's/^/       /'
+        cat "$TMP/$m.log"
         fail=1
     fi
 done
@@ -98,4 +95,6 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "=== Axiom audit passed: $total theorem(s), none on an unlisted axiom ==="
+# Validate every invocation, then deduplicate names across imported environments.
+python3 "$SCRIPT_DIR/audit_output.py" "$TMP"
+echo '=== Axiom audit passed: nonempty deduplicated inventory, module counts above ==='

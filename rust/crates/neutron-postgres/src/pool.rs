@@ -110,9 +110,25 @@ impl PgConfig {
         }
         format!(
             "host={} port={} dbname={} user={} password={}",
-            self.host, self.port, self.dbname, self.user, self.password,
+            connection_value(&self.host),
+            self.port,
+            connection_value(&self.dbname),
+            connection_value(&self.user),
+            connection_value(&self.password),
         )
     }
+}
+
+// Quote libpq values that would otherwise terminate or escape a field.
+fn connection_value(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|c| c.is_whitespace() || c == '\\' || c == '\'')
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +196,7 @@ impl PgPool {
             client: Some(client),
             pool: Arc::clone(&self.0),
             permit: Some(permit),
+            reusable: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -206,22 +223,38 @@ impl PgPool {
 
 /// A `tokio-postgres` client checked out from a [`PgPool`].
 ///
-/// Automatically returned to the pool (and semaphore slot released) on drop.
+/// Untouched leases return to idle. Raw client access permanently disables reuse.
+/// The semaphore slot is released on drop in both cases.
 pub struct PooledConn {
     pub(crate) client: Option<Client>,
     pool: Arc<PoolInner>,
     permit: Option<OwnedSemaphorePermit>,
+    reusable: std::sync::atomic::AtomicBool,
 }
 
 impl PooledConn {
+    /// Compatibility alias for raw_client_nonreusable. ANY raw SQL can mutate
+    /// session state; this lease is discarded on drop, including cancellation.
     pub fn client(&self) -> &Client {
+        self.raw_client_nonreusable()
+    }
+
+    /// Trusted raw SQL escape hatch. Never returned to idle after access.
+    /// Disposal does not establish immediate rollback or a known commit outcome.
+    pub fn raw_client_nonreusable(&self) -> &Client {
+        self.reusable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.client.as_ref().unwrap()
     }
 }
 
 impl Drop for PooledConn {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
+        if let Some(client) = self
+            .client
+            .take()
+            .filter(|_| self.reusable.load(std::sync::atomic::Ordering::SeqCst))
+        {
             // Return to idle before releasing the semaphore so that a woken
             // waiter finds the connection immediately.
             if let Ok(mut idle) = self.pool.idle.lock() {
@@ -240,6 +273,20 @@ impl Drop for PooledConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_fields_round_trip_empty_and_escaped_values() {
+        let default: tokio_postgres::Config = PgConfig::default().connect_string().parse().unwrap();
+        assert_eq!(default.get_password(), Some(&b""[..]));
+        let cfg = PgConfig::default()
+            .user("a b\\c'")
+            .dbname("d e")
+            .password("p\\ q' sslmode=require");
+        let parsed: tokio_postgres::Config = cfg.connect_string().parse().unwrap();
+        assert_eq!(parsed.get_user(), Some("a b\\c'"));
+        assert_eq!(parsed.get_dbname(), Some("d e"));
+        assert_eq!(parsed.get_password(), Some(&b"p\\ q' sslmode=require"[..]));
+    }
 
     #[test]
     fn config_connect_string_fields() {

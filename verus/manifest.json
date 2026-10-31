@@ -1,0 +1,44 @@
+{
+  "release": "0.2026.10.04.426d8b0",
+  "targets": [
+    {
+      "path": "checked/model_obligations.rs",
+      "minimumVerified": 6,
+      "state": "active-unchecked-executable-model",
+      "properties": [
+        {
+          "function": "pinned_survives",
+          "property": "pinned ID remains present after eviction"
+        },
+        {
+          "function": "commit_pair",
+          "property": "conflicting pair cannot both commit; disjoint pair commits"
+        },
+        {
+          "function": "xor_or_zero",
+          "property": "byte accumulator lemma"
+        },
+        {
+          "function": "compare_bytes",
+          "property": "byte equality and executed iteration count"
+        },
+        {
+          "function": "conditional_collision_bound",
+          "property": "conditional finite event-count collision bound"
+        },
+        {
+          "function": "constant_distribution_not_uniform",
+          "property": "constant joint distribution violates uniform independence for domain > 1"
+        }
+      ]
+    }
+  ],
+  "productionMapping": {
+    "function": "nucleus/src/transport/mod.rs::constant_time_eq_token",
+    "source": "nucleus/src/transport/mod.rs",
+    "sha256": "9327ea97cdeaeab47eab09c5a380b72c6c7bf8b6a26d6d18f71557c9a850d302",
+    "base": "fa9cc9bb56df51f34e255c63f94d3ce5b681cddd",
+    "relation": "manual equal-length algorithm transcription; no refinement proof",
+    "state": "unchecked"
+  }
+}

@@ -71,7 +71,7 @@ def _build_tiny_gguf_file(path: String) raises:
     f.write_bytes(bytes_span)
 
 
-def _build_tiny_gguf_buffer() -> List[UInt8]:
+def _build_tiny_gguf_buffer() raises -> List[UInt8]:
     """Build a tiny GGUF buffer with known structure."""
     var buf = List[UInt8]()
     # Magic
@@ -80,8 +80,8 @@ def _build_tiny_gguf_buffer() -> List[UInt8]:
     _write_u32_le(buf, 3)
     # Tensor count: 1 (embed only)
     _write_u64_le(buf, 1)
-    # Metadata count: 6
-    _write_u64_le(buf, 6)
+    # Metadata count: 7
+    _write_u64_le(buf, 7)
 
     # Metadata: architecture
     _write_string_gguf(buf, "general.architecture")
@@ -110,6 +110,11 @@ def _build_tiny_gguf_buffer() -> List[UInt8]:
 
     # Metadata: ffn_dim
     _write_string_gguf(buf, "llama.feed_forward_length")
+    _write_u32_le(buf, 4)
+    _write_u32_le(buf, 8)
+
+    # Metadata: vocab_size (must match tensor data; strict admission checks it)
+    _write_string_gguf(buf, "llama.vocab_size")
     _write_u32_le(buf, 4)
     _write_u32_le(buf, 8)
 

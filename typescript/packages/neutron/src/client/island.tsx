@@ -1,5 +1,7 @@
 import { h } from "preact";
+import { useContext } from "preact/hooks";
 import type { AnyJsxElement } from "./jsx-agnostic.js";
+import { InsideIsland } from "./island-context.js";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -24,25 +26,20 @@ let islandCounter = 0;
 const componentIdMap = new WeakMap<preact.FunctionComponent<any>, string>();
 const componentNameCounts = new Map<string, number>();
 
-/**
- * Island component for progressive hydration
- *
- * Usage:
- * ```tsx
- * import Counter from "./Counter.js";
- * <Island component={Counter} client="load" count={0} />
- * ```
- *
- * Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX.
- */
-export function Island({
+function IslandComponent({
   component: Component,
   client,
   id,
   media,
   __src,
   ...props
-}: IslandProps): AnyJsxElement | null {
+}: IslandProps) {
+  // Nested island: render the component inline as part of the outer island.
+  // Emitting another marker would let the runtime hydrate it a second time.
+  if (useContext(InsideIsland)) {
+    return h(Component, props);
+  }
+
   const islandId = `island-${islandCounter++}`;
   const componentId = resolveComponentId(Component, id);
   
@@ -69,7 +66,7 @@ export function Island({
       ...(media ? { "data-media": media } : {}),
       ...(__src ? { "data-src": __src } : {}),
     },
-    h(Component, props)
+    h(InsideIsland.Provider, { value: true }, h(Component, props))
   );
 }
 
@@ -101,6 +98,23 @@ function safeSerializeProps(props: Record<string, unknown>): string {
     return "{}";
   }
 }
+
+/**
+ * Island component for progressive hydration
+ *
+ * Usage:
+ * ```tsx
+ * import Counter from "./Counter.js";
+ * <Island component={Counter} client="load" count={0} />
+ * ```
+ *
+ * Typed for both JSX runtimes the framework supports, `preact` and
+ * `react-compat`: the element an island renders is runtime-specific (a Preact
+ * VNode is not a React ReactNode, so React's JSX types rejected `<Island>`),
+ * the props are not. Returns {@link AnyJsxElement}, which both runtimes'
+ * JSX element checks accept; the props stay strict.
+ */
+export const Island = IslandComponent as unknown as (props: IslandProps) => AnyJsxElement | null;
 
 export type { ClientDirective };
 export type { IslandProps };

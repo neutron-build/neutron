@@ -4,7 +4,7 @@ import {
   importTargets, isRequired, encodeRecord, encodeSourceValue, newImportJournal,
   runImport, resolvePending, retryPending, skipPending, skipFailedRow,
   markPendingCommitted, batchOperationId, journalKey, loadJournal, sameFile,
-  describeJournal, MAX_BATCH_ROWS, MAX_BATCH_BYTES,
+  describeJournal, MAX_BATCH_ROWS, MAX_BATCH_BYTES, MAX_SOURCE_FIELDS,
   type ColumnMapping, type ImportFormat, type ImportJournal, type ImportDeps,
   type CsvSourceOptions, type SourceField, type TableMetaCol,
 } from './importer'
@@ -541,5 +541,17 @@ describe('journal persistence helpers', () => {
     retryPending(j)
     expect(j.pending!.operationId).toBe(batchOperationId('z', 2, 2))
     expect(j.pending!.attempt).toBe(2)
+  })
+})
+
+
+describe('whole-file source field inventory resource admission', () => {
+  it('bounds unique fields while allowing rediscovery of existing names', () => {
+    const registry = new FieldRegistry()
+    for (let index = 0; index < MAX_SOURCE_FIELDS; index++) registry.add({ id: `j:${index}`, label: `field ${index}` })
+    registry.add({ id: 'j:0', label: 'same field in a later row' })
+    expect(registry.fields).toHaveLength(MAX_SOURCE_FIELDS)
+    expect(() => registry.add({ id: 'j:extra', label: 'new key from a later row' })).toThrow(/distinct fields/)
+    expect(registry.fields).toHaveLength(MAX_SOURCE_FIELDS)
   })
 })

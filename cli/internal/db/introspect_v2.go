@@ -13,7 +13,7 @@ package db
 //
 // Expression-bearing fields (defaults, check expressions, index predicates
 // and key expressions, view definitions) are emitted in the catalog's
-// deparsed spelling (pg_get_expr / pg_get_viewdef / pg_get_indexdef) with
+// deparsed spelling (pg_catalog.pg_get_expr / pg_catalog.pg_get_viewdef / pg_catalog.pg_get_indexdef) with
 // type-name casts compacted to the contract vocabulary ("character varying"
 // -> "varchar"). The diff compares desired text against these spellings
 // through the twin normalizer, never by trimming guesses.
@@ -39,7 +39,7 @@ type pgQueryer interface {
 
 const introspectV2SchemasSQL = `
 SELECT nspname
-FROM pg_namespace
+FROM pg_catalog.pg_namespace
 WHERE nspname <> 'information_schema' AND nspname !~ '^pg_'
 ORDER BY nspname
 `
@@ -51,19 +51,19 @@ const introspectV2EnumsSQL = `
 SELECT n.nspname,
        t.typname,
        EXISTS (
-         SELECT 1 FROM pg_depend d
-         WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e'
+         SELECT 1 FROM pg_catalog.pg_depend d
+         WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass AND d.objid = t.oid AND d.deptype = 'e'
        ) AS extension_owned,
        COALESCE((
-         SELECT x.extname FROM pg_depend d
-         JOIN pg_extension x ON x.oid = d.refobjid
-         WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e'
+         SELECT x.extname FROM pg_catalog.pg_depend d
+         JOIN pg_catalog.pg_extension x ON x.oid = d.refobjid
+         WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass AND d.objid = t.oid AND d.deptype = 'e'
          LIMIT 1
        ), '') AS extension_owner,
        e.enumlabel
-FROM pg_type t
-JOIN pg_namespace n ON n.oid = t.typnamespace
-LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+FROM pg_catalog.pg_type t
+JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+LEFT JOIN pg_catalog.pg_enum e ON e.enumtypid = t.oid
 WHERE t.typtype = 'e' AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
 ORDER BY n.nspname, t.typname, e.enumsortorder
 `
@@ -78,33 +78,33 @@ const introspectV2RelationsSQL = `
 SELECT c.oid,
        n.nspname,
        c.relname,
-       c.relkind::text,
-       c.relpersistence::text,
+       c.relkind::pg_catalog.text,
+       c.relpersistence::pg_catalog.text,
        c.relrowsecurity,
        c.relforcerowsecurity,
        c.relispartition,
-       COALESCE(c.reloptions, '{}'::name[])::text[],
+       COALESCE(c.reloptions, '{}'::pg_catalog.name[])::pg_catalog.text[],
        EXISTS (
-         SELECT 1 FROM pg_depend d
-         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+         SELECT 1 FROM pg_catalog.pg_depend d
+         WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid AND d.deptype = 'e'
        ) AS extension_owned,
        COALESCE((
-         SELECT x.extname FROM pg_depend d
-         JOIN pg_extension x ON x.oid = d.refobjid
-         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+         SELECT x.extname FROM pg_catalog.pg_depend d
+         JOIN pg_catalog.pg_extension x ON x.oid = d.refobjid
+         WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid AND d.deptype = 'e'
          LIMIT 1
        ), '') AS extension_owner,
-       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS npolicies,
-       (SELECT count(*) FROM pg_trigger g WHERE g.tgrelid = c.oid AND NOT g.tgisinternal) AS ntriggers,
-       (SELECT count(*) FROM pg_inherits i WHERE i.inhrelid = c.oid) AS nparents,
-       (SELECT count(*) FROM pg_inherits i2 WHERE i2.inhparent = c.oid) AS nchildren,
+       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid) AS npolicies,
+       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger g WHERE g.tgrelid = c.oid AND NOT g.tgisinternal) AS ntriggers,
+       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid) AS nparents,
+       (SELECT pg_catalog.count(*) FROM pg_catalog.pg_inherits i2 WHERE i2.inhparent = c.oid) AS nchildren,
        EXISTS (
-         SELECT 1 FROM pg_depend d
-         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
-           AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')
+         SELECT 1 FROM pg_catalog.pg_depend d
+         WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid
+           AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.deptype IN ('a', 'i')
        ) AS sequence_attached
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
   AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
 ORDER BY n.nspname, c.relname
@@ -114,45 +114,49 @@ const introspectV2ColumnsSQL = `
 SELECT a.attnum,
        a.attname,
        tn.nspname AS type_schema,
-       t.typname, t.typtype::text AS typtype, t.typcategory::text AS typcategory,
-       et.typname AS elem_name, et.typtype::text AS elem_typtype, et.typcategory::text AS elem_category,
+       t.typname, t.typtype::pg_catalog.text AS typtype, t.typcategory::pg_catalog.text AS typcategory,
+       et.typname AS elem_name, et.typtype::pg_catalog.text AS elem_typtype, et.typcategory::pg_catalog.text AS elem_category,
        ens.nspname AS elem_schema,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_depend vd JOIN pg_catalog.pg_extension vx ON vx.oid=vd.refobjid
+         WHERE vd.classid='pg_catalog.pg_type'::pg_catalog.regclass AND vd.objid=t.oid AND vd.deptype='e' AND vx.extname='vector') AS vector_type,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_depend vd JOIN pg_catalog.pg_extension vx ON vx.oid=vd.refobjid
+         WHERE vd.classid='pg_catalog.pg_type'::pg_catalog.regclass AND vd.objid=et.oid AND vd.deptype='e' AND vx.extname='vector') AS vector_element,
        a.atttypmod,
        a.attnotnull,
-       a.attidentity::text,
-       a.attgenerated::text,
+       a.attidentity::pg_catalog.text,
+       a.attgenerated::pg_catalog.text,
        a.attcollation <> t.typcollation AS nondefault_collation,
-       a.attcollation::oid,
-       pg_get_expr(ad.adbin, a.attrelid) AS default_expr
-FROM pg_attribute a
-JOIN pg_type t ON t.oid = a.atttypid
-JOIN pg_namespace tn ON tn.oid = t.typnamespace
-LEFT JOIN pg_type et ON et.oid = t.typelem
-LEFT JOIN pg_namespace ens ON ens.oid = et.typnamespace
-LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+       a.attcollation::pg_catalog.oid,
+       pg_catalog.pg_get_expr(ad.adbin, a.attrelid) AS default_expr
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace
+LEFT JOIN pg_catalog.pg_type et ON et.oid = t.typelem
+LEFT JOIN pg_catalog.pg_namespace ens ON ens.oid = et.typnamespace
+LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
 WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum
 `
 
 const introspectV2ConstraintsSQL = `
 SELECT rc.conname,
-       rc.contype::text,
-       rc.conkey::int2[],
+       rc.contype::pg_catalog.text,
+       rc.conkey::pg_catalog.int2[],
        rn.nspname AS ref_schema,
        rt.relname AS ref_table,
-       (SELECT array_agg(ta.attname ORDER BY k.ord)
-          FROM unnest(rc.confkey) WITH ORDINALITY AS k(attnum, ord)
-          JOIN pg_attribute ta ON ta.attrelid = rc.confrelid AND ta.attnum = k.attnum) AS ref_cols,
-       rc.confdeltype::text,
-       rc.confupdtype::text,
-       rc.confmatchtype::text,
+       (SELECT pg_catalog.array_agg(ta.attname ORDER BY k.ord)
+          FROM pg_catalog.unnest(rc.confkey) WITH ORDINALITY AS k(attnum, ord)
+          JOIN pg_catalog.pg_attribute ta ON ta.attrelid = rc.confrelid AND ta.attnum = k.attnum) AS ref_cols,
+       rc.confdeltype::pg_catalog.text,
+       rc.confupdtype::pg_catalog.text,
+       rc.confmatchtype::pg_catalog.text,
        rc.condeferrable,
        rc.condeferred,
-       pg_get_constraintdef(rc.oid) AS condef,
-       pg_get_expr(rc.conbin, rc.conrelid) AS check_expr
-FROM pg_constraint rc
-LEFT JOIN pg_class rt ON rt.oid = rc.confrelid
-LEFT JOIN pg_namespace rn ON rn.oid = rt.relnamespace
+       pg_catalog.pg_get_constraintdef(rc.oid) AS condef,
+       pg_catalog.pg_get_expr(rc.conbin, rc.conrelid) AS check_expr
+FROM pg_catalog.pg_constraint rc
+LEFT JOIN pg_catalog.pg_class rt ON rt.oid = rc.confrelid
+LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rt.relnamespace
 WHERE rc.conrelid = $1 AND rc.contype IN ('p', 'u', 'c', 'f', 'x')
 ORDER BY rc.conname
 `
@@ -164,32 +168,32 @@ SELECT ic.oid,
        am.amname,
        i.indnkeyatts,
        i.indnatts,
-       i.indkey::int2[],
-       i.indoption::int2[],
-       i.indcollation::oid[],
-       pg_get_indexdef(i.indexrelid) AS indexdef,
-       pg_get_expr(i.indpred, i.indrelid) AS predicate,
+       i.indkey::pg_catalog.int2[],
+       i.indoption::pg_catalog.int2[],
+       i.indcollation::pg_catalog.oid[],
+       pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef,
+       pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS predicate,
        EXISTS (
-         SELECT 1 FROM pg_depend d
-         WHERE d.classid = 'pg_class'::regclass AND d.objid = ic.oid AND d.deptype = 'e'
+         SELECT 1 FROM pg_catalog.pg_depend d
+         WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = ic.oid AND d.deptype = 'e'
        ) AS extension_owned,
        (
-         SELECT array_agg(oc.opcdefault ORDER BY k.ord)
-           FROM unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
-           JOIN pg_opclass oc ON oc.oid = k.opclass
+         SELECT pg_catalog.array_agg(oc.opcdefault ORDER BY k.ord)
+           FROM pg_catalog.unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
+           JOIN pg_catalog.pg_opclass oc ON oc.oid = k.opclass
        ) AS opclass_defaults,
        (
-         SELECT array_agg(oc.opcname::text ORDER BY k.ord)
-           FROM unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
-           JOIN pg_opclass oc ON oc.oid = k.opclass
+         SELECT pg_catalog.array_agg(oc.opcname::pg_catalog.text ORDER BY k.ord)
+           FROM pg_catalog.unnest(i.indclass) WITH ORDINALITY AS k(opclass, ord)
+           JOIN pg_catalog.pg_opclass oc ON oc.oid = k.opclass
        ) AS opclass_names,
-       COALESCE(ic.reloptions, '{}'::name[])::text[] AS index_reloptions
-FROM pg_index i
-JOIN pg_class ic ON ic.oid = i.indexrelid
-JOIN pg_am am ON am.oid = ic.relam
+       COALESCE(ic.reloptions, '{}'::pg_catalog.name[])::pg_catalog.text[] AS index_reloptions
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_catalog.pg_am am ON am.oid = ic.relam
 WHERE i.indrelid = $1
   AND i.indisvalid AND i.indisready
-  AND NOT EXISTS (SELECT 1 FROM pg_constraint pc WHERE pc.conindid = i.indexrelid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint pc WHERE pc.conindid = i.indexrelid)
 ORDER BY ic.relname
 `
 
@@ -199,13 +203,13 @@ ORDER BY ic.relname
 // dropping them implicitly would destroy state, so they make the table
 // unrepresentable.
 const introspectV2InvalidIndexSQL = `
-SELECT ic.relname FROM pg_index i
-JOIN pg_class ic ON ic.oid = i.indexrelid
-JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+SELECT ic.relname FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
 WHERE i.indrelid = $1 AND (NOT i.indisvalid OR NOT i.indisready)
 `
 
-// introspectBaseTypes maps pg_type.typname onto the contract type vocabulary.
+// introspectBaseTypes maps pg_catalog.pg_type.typname onto the contract type vocabulary.
 // Types absent from this map are unrepresentable.
 var introspectBaseTypes = map[string]bool{
 	"int2": true, "int4": true, "int8": true,
@@ -283,7 +287,7 @@ func parseQualifiedRelName(ref string) (schema, name string, ok bool) {
 
 func strPtrV2(s string) *string { return &s }
 
-// referentialActionFromPG maps pg_constraint confdeltype/confupdtype codes
+// referentialActionFromPG maps pg_catalog.pg_constraint confdeltype/confupdtype codes
 // onto contract actions. "no action" (code a) is the catalog default for an
 // omitted clause and is emitted as absent: the catalog cannot distinguish an
 // explicit NO ACTION from omission, so the canonical minimal spelling is the
@@ -330,7 +334,15 @@ type v2RelationInfo struct {
 
 // IntrospectV2 reads the connected database into a validated schema
 // document v2.
+// v2CatalogReader allows v3 to reuse the immutable relational-v2 reader on
+// one pinned read-only transaction. The public v2 reader retains its pool path.
+type v2CatalogReader struct{ pool pgQueryer }
+
 func (c *Client) IntrospectV2(ctx context.Context) (*V2Document, error) {
+	return (&v2CatalogReader{pool: c.pool}).introspect(ctx)
+}
+
+func (c *v2CatalogReader) introspect(ctx context.Context) (*V2Document, error) {
 	schemaNames, err := c.introspectV2Schemas(ctx)
 	if err != nil {
 		return nil, err
@@ -596,7 +608,7 @@ func sortV2Model(m *V2DocumentModel) {
 	sort.Strings(m.Capabilities)
 }
 
-func (c *Client) introspectV2Schemas(ctx context.Context) ([]string, error) {
+func (c *v2CatalogReader) introspectV2Schemas(ctx context.Context) ([]string, error) {
 	rows, err := c.pool.Query(ctx, introspectV2SchemasSQL)
 	if err != nil {
 		return nil, fmt.Errorf("introspect v2 schemas: %w", err)
@@ -613,7 +625,7 @@ func (c *Client) introspectV2Schemas(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-func (c *Client) introspectV2Enums(ctx context.Context) (enums []V2EnumDecl, opaque []V2Opaque, err error) {
+func (c *v2CatalogReader) introspectV2Enums(ctx context.Context) (enums []V2EnumDecl, opaque []V2Opaque, err error) {
 	rows, err := c.pool.Query(ctx, introspectV2EnumsSQL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("introspect v2 enums: %w", err)
@@ -675,7 +687,7 @@ func (c *Client) introspectV2Enums(ctx context.Context) (enums []V2EnumDecl, opa
 	return enums, opaque, nil
 }
 
-func (c *Client) introspectV2Relations(ctx context.Context) ([]v2RelationInfo, error) {
+func (c *v2CatalogReader) introspectV2Relations(ctx context.Context) ([]v2RelationInfo, error) {
 	rows, err := c.pool.Query(ctx, introspectV2RelationsSQL)
 	if err != nil {
 		return nil, fmt.Errorf("introspect v2 relations: %w", err)
@@ -702,7 +714,7 @@ func (c *Client) introspectV2Relations(ctx context.Context) ([]v2RelationInfo, e
 // view with check_option/security_invoker only, so user triggers (INSTEAD
 // OF or statement-level), security barriers and any other unmodeled
 // reloption must never be flattened into the plain shape.
-func (c *Client) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2View, []string, error) {
+func (c *v2CatalogReader) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2View, []string, error) {
 	view := V2View{
 		Identity: V2Identity{Schema: rel.schema, Name: rel.name},
 		Managed:  true,
@@ -737,7 +749,7 @@ func (c *Client) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2Vi
 	}
 	var def string
 	err := c.pool.QueryRow(ctx,
-		`SELECT pg_get_viewdef(c.oid) FROM pg_class c WHERE c.oid = $1`, rel.oid).Scan(&def)
+		`SELECT pg_catalog.pg_get_viewdef(c.oid) FROM pg_catalog.pg_class c WHERE c.oid = $1`, rel.oid).Scan(&def)
 	if err != nil {
 		return view, nil, fmt.Errorf("introspect view definition %s: %w", view.Identity, err)
 	}
@@ -748,7 +760,7 @@ func (c *Client) introspectV2View(ctx context.Context, rel v2RelationInfo) (V2Vi
 // introspectV2Table reads one candidate table. Returned reasons make the
 // table unrepresentable (opaque inventory); fkRefs are the qualified FK
 // target identities for the cascade pass.
-func (c *Client) introspectV2Table(ctx context.Context, rel v2RelationInfo, hasVector *bool) (V2Table, []string, []V2Identity, error) {
+func (c *v2CatalogReader) introspectV2Table(ctx context.Context, rel v2RelationInfo, hasVector *bool) (V2Table, []string, []V2Identity, error) {
 	return introspectV2TableOn(ctx, c.pool, rel, hasVector)
 }
 
@@ -798,6 +810,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			typcategory                        string
 			elemName, elemSchema               *string
 			elemTypetype, elemCategory         *string
+			vectorType, vectorElement          bool
 			typmod                             int
 			notNull                            bool
 			identity, generated                string
@@ -808,7 +821,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 		if err := colRows.Scan(
 			&attnum, &name, &typeSchema, &typname, &typtype, &typcategory,
 			&elemName, &elemTypetype, &elemCategory, &elemSchema,
-			&typmod, &notNull, &identity, &generated, &nonDefaultCollation, &collation, &defaultExpr,
+			&vectorType, &vectorElement, &typmod, &notNull, &identity, &generated, &nonDefaultCollation, &collation, &defaultExpr,
 		); err != nil {
 			return table, nil, nil, err
 		}
@@ -829,7 +842,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 		}
 
 		colType, typeReason := introspectV2ColumnType(name, typeSchema, typname, typtype, typcategory,
-			elemName, elemTypetype, elemCategory, elemSchema, typmod)
+			elemName, elemTypetype, elemCategory, elemSchema, typmod, vectorType, vectorElement)
 		if typeReason != "" {
 			reasons = append(reasons, typeReason)
 			continue
@@ -840,7 +853,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 
 		col := V2Column{Name: name, Type: colType, NotNull: notNull}
 		if generated == "s" {
-			// Stored generated column: the pg_attrdef row carries the
+			// Stored generated column: the pg_catalog.pg_attrdef row carries the
 			// generation expression, which is NOT a default.
 			if defaultExpr == nil {
 				reasons = append(reasons, fmt.Sprintf("generated column %q has no stored expression in the catalog", name))
@@ -900,7 +913,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 		}
 		constraintNames[name] = true
 		// NULLS NOT DISTINCT is detected from the constraint definition:
-		// the pg_constraint.connullsnotdistinct catalog column is a
+		// the pg_catalog.pg_constraint.connullsnotdistinct catalog column is a
 		// PostgreSQL 15+ addition that wire-compatible engines may not
 		// carry, while the deparse spelling is authoritative wherever the
 		// syntax exists at all.
@@ -982,7 +995,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 
 	// Indexes (non-constraint-backed): method, ordered key parts (column or
 	// expression), predicate and INCLUDE columns. Rows are drained before
-	// the per-part pg_get_indexdef queries so a single pinned connection
+	// the per-part pg_catalog.pg_get_indexdef queries so a single pinned connection
 	// (the twin normalizer) never interleaves an open iterator with a new
 	// query.
 	type rawIndex struct {
@@ -1026,7 +1039,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 			continue
 		}
 		// NULLS NOT DISTINCT unique indexes: detected from the index
-		// definition (pg_index.indnullsnotdistinct is a PostgreSQL 15+
+		// definition (pg_catalog.pg_index.indnullsnotdistinct is a PostgreSQL 15+
 		// catalog column wire-compatible engines may not carry; the deparse
 		// spelling is authoritative wherever the syntax exists).
 		if r.unique && strings.Contains(r.indexdef, "NULLS NOT DISTINCT") {
@@ -1097,7 +1110,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 				}
 			}
 			// A non-default operator class is REPRESENTABLE since X01: the
-			// key part carries the catalog's opcname verbatim. pg_get_indexdef
+			// key part carries the catalog's opcname verbatim. pg_catalog.pg_get_indexdef
 			// omits opclass/collation for default classes only, so the name is
 			// read from the catalog, never guessed from the deparse.
 			var opclass *string
@@ -1147,7 +1160,7 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 				bad = true
 				break
 			}
-			// pg_get_indexdef(idx, part, false) returns the bare column
+			// pg_catalog.pg_get_indexdef(idx, part, false) returns the bare column
 			// name (default operator class) or `col opclass` when the class
 			// is explicit; anything else is a non-default decoration the
 			// catalog checks above did not classify.
@@ -1197,13 +1210,13 @@ func introspectV2TableOn(ctx context.Context, q pgQueryer, rel v2RelationInfo, h
 	return table, reasons, fkRefs, nil
 }
 
-func (c *Client) indexPartExpression(ctx context.Context, indexOID uint32, part int) (string, error) {
+func (c *v2CatalogReader) indexPartExpression(ctx context.Context, indexOID uint32, part int) (string, error) {
 	return indexPartExpressionOn(ctx, c.pool, indexOID, part)
 }
 
 func indexPartExpressionOn(ctx context.Context, q pgQueryer, indexOID uint32, part int) (string, error) {
 	var def string
-	if err := q.QueryRow(ctx, `SELECT pg_get_indexdef($1, $2, false)`, indexOID, part).Scan(&def); err != nil {
+	if err := q.QueryRow(ctx, `SELECT pg_catalog.pg_get_indexdef($1, $2, false)`, indexOID, part).Scan(&def); err != nil {
 		return "", fmt.Errorf("read index key part %d of index %d: %w", part, indexOID, err)
 	}
 	return def, nil
@@ -1212,7 +1225,7 @@ func indexPartExpressionOn(ctx context.Context, q pgQueryer, indexOID uint32, pa
 // introspectV2ColumnType maps catalog type information onto the contract
 // type shape. A non-empty return reason makes the table unrepresentable.
 func introspectV2ColumnType(colName, typeSchema, typname, typtype, typcategory string,
-	elemName, elemTypetype, elemCategory, elemSchema *string, typmod int) (V2ColumnType, string) {
+	elemName, elemTypetype, elemCategory, elemSchema *string, typmod int, vectorType, vectorElement bool) (V2ColumnType, string) {
 
 	build := func(name string, params map[string]int64, enum *V2Identity, array bool) V2ColumnType {
 		codec := v2TypeCodecs[name]
@@ -1222,25 +1235,31 @@ func introspectV2ColumnType(colName, typeSchema, typname, typtype, typcategory s
 		return V2ColumnType{Name: name, Params: params, Array: array, Codec: codec, Enum: enum}
 	}
 
-	var base func(typeSchema, typname, typtype, typcategory string, elemName, elemTypetype, elemCategory, elemSchema *string) (V2ColumnType, string)
-	base = func(typeSchema, typname, typtype, typcategory string, elemName, elemTypetype, elemCategory, elemSchema *string) (V2ColumnType, string) {
+	var base func(typeSchema, typname, typtype, typcategory string, elemName, elemTypetype, elemCategory, elemSchema *string, vectorOK bool) (V2ColumnType, string)
+	base = func(typeSchema, typname, typtype, typcategory string, elemName, elemTypetype, elemCategory, elemSchema *string, vectorOK bool) (V2ColumnType, string) {
 		if typtype == "e" {
 			// Enum types are resolved by identity; the enum itself is
 			// declared (or inventoried) by the enums pass.
 			id := V2Identity{Schema: typeSchema, Name: typname}
 			return build("enum", nil, &id, false), ""
 		}
+		if typtype != "b" {
+			return V2ColumnType{}, fmt.Sprintf("column %q has unsupported type identity %q.%q (kind %s)", colName, typeSchema, typname, typtype)
+		}
 		if typcategory == "A" {
-			if elemName == nil || elemTypetype == nil || elemCategory == nil {
+			if elemName == nil || elemTypetype == nil || elemCategory == nil || elemSchema == nil {
 				return V2ColumnType{}, fmt.Sprintf("column %q is an array with an unreadable element type", colName)
 			}
-			elem, reason := base(*elemSchema, *elemName, *elemTypetype, *elemCategory, nil, nil, nil, nil)
+			elem, reason := base(*elemSchema, *elemName, *elemTypetype, *elemCategory, nil, nil, nil, nil, vectorElement)
 			if reason != "" {
 				return V2ColumnType{}, reason
 			}
 			elem.Array = true
 			elem.Codec = "array"
 			return elem, ""
+		}
+		if typeSchema != "pg_catalog" && !(typname == "vector" && vectorOK) {
+			return V2ColumnType{}, fmt.Sprintf("column %q has non-builtin type identity %q.%q", colName, typeSchema, typname)
 		}
 		if !introspectBaseTypes[typname] {
 			return V2ColumnType{}, fmt.Sprintf("column %q has type %q, which is outside the contract type vocabulary", colName, typname)
@@ -1268,7 +1287,7 @@ func introspectV2ColumnType(colName, typeSchema, typname, typtype, typcategory s
 		return build(typname, params, nil, false), ""
 	}
 
-	return base(typeSchema, typname, typtype, typcategory, elemName, elemTypetype, elemCategory, elemSchema)
+	return base(typeSchema, typname, typtype, typcategory, elemName, elemTypetype, elemCategory, elemSchema, vectorType)
 }
 
 // introspectV2Default classifies a deparsed column default into the tagged

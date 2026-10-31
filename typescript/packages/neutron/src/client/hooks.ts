@@ -1,3 +1,4 @@
+import { getNavigationGeneration } from "./navigate.js";
 import { useContext, useCallback, useMemo, useState, useEffect, useRef } from "preact/hooks";
 import {
   LoaderContext,
@@ -128,6 +129,9 @@ export function useRevalidator() {
   
   const revalidate = useCallback(async () => {
     const requestId = ++requestIdRef.current;
+    const originUrl = window.location.href;
+    const generation = getNavigationGeneration();
+    const isCurrent = () => originUrl === window.location.href && generation === getNavigationGeneration();
     setState("loading");
     setNavigationState({
       state: "loading",
@@ -154,15 +158,15 @@ export function useRevalidator() {
       if (response.ok) {
         const payload = await response.json();
         const data = decodeLoaderDataPayload(payload);
-        if (data && requestId === requestIdRef.current) {
+        if (data && requestId === requestIdRef.current && isCurrent()) {
           window.__NEUTRON_DATA__ = data;
           window.dispatchEvent(new CustomEvent("neutron:data-updated", { detail: data }));
         }
       }
     } finally {
-      if (requestId === requestIdRef.current) {
+      if (requestId === requestIdRef.current && isCurrent()) {
         setState("idle");
-        setNavigationState({ state: "idle" });
+        if (isCurrent()) setNavigationState({ state: "idle" });
       }
     }
   }, []);
@@ -203,6 +207,9 @@ export function useSubmit(): {
       form: HTMLFormElement | FormData,
       options: { action?: string; method?: string } = {}
     ) => {
+      const originUrl = window.location.href;
+      const generation = getNavigationGeneration();
+      const isCurrent = () => originUrl === window.location.href && generation === getNavigationGeneration();
       const formData = form instanceof FormData ? form : new FormData(form);
       const action = options.action || window.location.pathname;
       const method = (options.method || "post").toUpperCase();
@@ -240,6 +247,7 @@ export function useSubmit(): {
           redirect: "follow",
         });
 
+        if (!isCurrent()) return;
         const redirectTo = dataRedirectTarget(response);
         if (redirectTo !== null) {
           const localUrl = toLocalUrl(redirectTo);
@@ -264,6 +272,7 @@ export function useSubmit(): {
         const contentType = response.headers.get("content-type");
         if (contentType?.includes("application/json")) {
           const payload = await response.json();
+          if (!isCurrent()) return;
           const data = decodeLoaderDataPayload(payload);
           if (isRedirectResult(data)) {
             const localUrl = toLocalUrl(data.redirect);
@@ -295,13 +304,14 @@ export function useSubmit(): {
       } catch (error) {
         // Network-level failure (no response): record it as status 0 and
         // keep rethrowing — callers awaiting the submit keep their contract.
+        if (!isCurrent()) return;
         setError({
           status: 0,
           message: error instanceof Error ? error.message : String(error),
         });
         throw error;
       } finally {
-        setNavigationState({ state: "idle" });
+        if (isCurrent()) setNavigationState({ state: "idle" });
       }
     },
     []

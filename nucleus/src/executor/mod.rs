@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
+use futures::FutureExt;
 
 use sqlparser::ast::{self, Expr, Statement};
 #[cfg(feature = "server")]
@@ -559,10 +560,23 @@ const SKIP_WARN_EVERY: u64 = 10;
 /// `limits.max_prepared_statements_per_session`.
 pub(crate) const DEFAULT_MAX_PREPARED_STMTS: usize = 1024;
 
-/// Default per-session cap on open cursors. Each cursor materializes its full
-/// row set, so this bounds both map growth and per-cursor memory pressure.
-/// Overridable via `limits.max_cursors_per_session`.
+/// Default per-session cap on open cursors. A materialized cursor holds its
+/// full row set (a lazy one holds a few integers), so this bounds both map
+/// growth and per-cursor memory pressure. Overridable via
+/// `limits.max_cursors_per_session`.
 pub(crate) const DEFAULT_MAX_CURSORS: usize = 1024;
+
+/// Default per-cursor cap on rows. A materialized cursor runs its query to
+/// completion at DECLARE, so the cap is applied as a row limit on the query
+/// itself and re-checked on the result; a lazy cursor holds no rows, so the
+/// same cap bounds the rows one FETCH may return. Overridable via
+/// `limits.max_cursor_rows`.
+pub(crate) const DEFAULT_MAX_CURSOR_ROWS: usize = 1_000_000;
+
+/// Default per-cursor cap on estimated bytes (64 MiB). Checked on a
+/// materialized result before it is stored, and on the rows one FETCH of a lazy
+/// cursor returns. Overridable via `limits.max_cursor_bytes`.
+pub(crate) const DEFAULT_MAX_CURSOR_BYTES: usize = 64 * 1024 * 1024;
 
 /// The executor holds shared catalog/storage state and per-session state.
 ///
@@ -730,6 +744,8 @@ pub struct Executor {
     snapshot_leases: snapshot_lease::SnapshotLeaseRegistry,
     /// Counter for generating unique session IDs.
     next_session_id: AtomicU64,
+    #[cfg(feature = "server")]
+    next_backend_pid: std::sync::atomic::AtomicI32,
     /// Coordinator transaction-id counter (S63): minted at BEGIN, never
     /// derived from the SQL engine's own `next_txn_id` (minted at COMMIT, and
     /// reusable across restarts after segment pruning). Seeded at open above
@@ -773,6 +789,12 @@ pub struct Executor {
     /// materializes its whole row set. Configurable via
     /// `limits.max_cursors_per_session`.
     max_cursors_per_session: AtomicUsize,
+    /// Per-cursor cap on rows (`limits.max_cursor_rows`): materialized at
+    /// DECLARE, or returned by one FETCH of a lazy cursor.
+    max_cursor_rows: AtomicUsize,
+    /// Per-cursor cap on estimated bytes (`limits.max_cursor_bytes`), applied
+    /// the same two ways.
+    max_cursor_bytes: AtomicUsize,
     /// Default session for backward-compatible `execute()` (embedded mode).
     default_session: Arc<Session>,
     /// In-memory key-value store for KV SQL functions (kv_get, kv_set, kv_del, etc.).
@@ -1197,6 +1219,8 @@ impl Executor {
             #[cfg(feature = "server")]
             snapshot_leases: snapshot_lease::SnapshotLeaseRegistry::new(),
             next_session_id: AtomicU64::new(1),
+            #[cfg(feature = "server")]
+            next_backend_pid: std::sync::atomic::AtomicI32::new(1),
             next_xact_id: AtomicU64::new(1),
             specialty_horizon: AtomicU64::new(1),
             specialty_checkpoint_skips: AtomicU64::new(0),
@@ -1205,6 +1229,8 @@ impl Executor {
             default_slow_query_ms: AtomicU64::new(0),
             max_prepared_stmts_per_session: AtomicUsize::new(DEFAULT_MAX_PREPARED_STMTS),
             max_cursors_per_session: AtomicUsize::new(DEFAULT_MAX_CURSORS),
+            max_cursor_rows: AtomicUsize::new(DEFAULT_MAX_CURSOR_ROWS),
+            max_cursor_bytes: AtomicUsize::new(DEFAULT_MAX_CURSOR_BYTES),
             default_session: Arc::new(Session::new()),
             kv_store: Arc::new(crate::kv::KvStore::new()),
             columnar_store: parking_lot::RwLock::new(crate::columnar::ColumnarStore::new()),
@@ -2716,6 +2742,15 @@ impl Executor {
             .store(cursors, Ordering::Release);
     }
 
+    /// Set the per-cursor budgets after construction. A DECLARE whose
+    /// materialized result exceeds either is REFUSED (54000) and stores nothing;
+    /// a FETCH on a lazy cursor that would return more is REFUSED (54000) and
+    /// does not move the cursor.
+    pub fn set_cursor_budgets(&self, max_rows: usize, max_bytes: usize) {
+        self.max_cursor_rows.store(max_rows, Ordering::Release);
+        self.max_cursor_bytes.store(max_bytes, Ordering::Release);
+    }
+
     /// Record a weak self-reference so `&self` methods can recover an owned
     /// `Arc<Executor>` (see [`Executor::arc_self`]). Call this once, right after the
     /// executor is wrapped in an `Arc` at a server/embedded entry point. Idempotent;
@@ -3261,6 +3296,42 @@ impl Executor {
         id
     }
 
+    /// Trusted wire boundary: register a unique, never-reused backend identity.
+    /// Unauthenticated sessions have no SQL cancellation authority. Rebinding
+    /// the same live session returns its original identity and shared wakeup.
+    #[cfg(feature = "server")]
+    pub fn register_session_backend(
+        &self,
+        id: u64,
+    ) -> Result<(i32, Arc<tokio::sync::Notify>), ExecError> {
+        // Hold the map guard through registration so disconnect cannot remove
+        // the session and then have a stale caller register it afterward.
+        let sessions = self.sessions.read();
+        let session = sessions.get(&id).ok_or_else(|| {
+            ExecError::PermissionDenied("cannot register an unknown backend session".into())
+        })?;
+        let _boundary = session.cancel_boundary.lock();
+        let old = session.backend_pid.load(Ordering::Acquire);
+        let pid = if old > 0 {
+            old
+        } else {
+            let pid = self.allocate_backend_pid()?;
+            session.backend_pid.store(pid, Ordering::Release);
+            pid
+        };
+        Ok((pid, session.cancel_notify.clone()))
+    }
+
+    /// Refuse exhaustion rather than wrapping a stale PID onto a new borrower.
+    #[cfg(feature = "server")]
+    pub(crate) fn allocate_backend_pid(&self) -> Result<i32, ExecError> {
+        self.next_backend_pid
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pid| {
+                pid.checked_add(1)
+            })
+            .map_err(|_| ExecError::Unsupported("backend identity space exhausted".into()))
+    }
+
     /// Install/rotate the bootstrap role's SCRAM verifier. Used by the server
     /// startup flag before accepting connections.
     #[cfg(feature = "server")]
@@ -3404,6 +3475,7 @@ impl Executor {
     pub fn drop_session(&self, id: u64) {
         let session = self.sessions.write().remove(&id);
         if let Some(session) = session {
+            session.backend_pid.store(0, Ordering::Release);
             if session.txn_active.load(Ordering::SeqCst) {
                 #[cfg(feature = "server")]
                 {
@@ -3809,9 +3881,88 @@ impl Executor {
     /// cancellation (wire CancelRequest). Long compute loops observe the flag
     /// and abort with SQLSTATE 57014; the flag clears at the next statement.
     pub fn request_session_cancel(&self, session_id: u64) {
-        self.get_session(session_id)
-            .cancel_requested
-            .store(true, Ordering::Relaxed);
+        if let Some(session) = self.sessions.read().get(&session_id) {
+            Self::signal_session_cancel(session);
+        }
+    }
+
+    fn signal_session_cancel(session: &Session) {
+        let _boundary = session.cancel_boundary.lock();
+        session.cancel_requested.store(true, Ordering::Relaxed);
+        session.cancel_notify.notify_one();
+    }
+
+    /// Wire completion fence for a cancellation signaled during a single
+    /// non-yielding executor poll. Unknown/disconnected sessions never fall back.
+    #[cfg(feature = "server")]
+    pub(crate) fn session_cancel_pending(&self, session_id: u64) -> bool {
+        self.sessions
+            .read()
+            .get(&session_id)
+            .is_some_and(|session| session.cancel_requested.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn current_backend_pid(&self) -> i32 {
+        let pid = self.current_session().backend_pid.load(Ordering::Acquire);
+        if pid > 0 {
+            pid
+        } else {
+            std::process::id() as i32
+        }
+    }
+
+    /// Finite authorization: same effective role as the authenticated target
+    /// owner, or an effective superuser. pg_signal_backend/membership authority
+    /// is not advertised here; BYPASSRLS never confers cancellation authority.
+    pub(super) fn cancel_backend(&self, pid: i32) -> Result<bool, ExecError> {
+        if pid <= 0 {
+            return Ok(false);
+        }
+        let caller = self.current_session();
+        if caller.backend_pid.load(Ordering::Acquire) <= 0
+            || caller.authenticated_user.read().is_none()
+        {
+            return Err(ExecError::PermissionDenied(
+                "unregistered or unauthenticated cancellation refused".into(),
+            ));
+        }
+        let caller_context = caller.session_context.read().clone();
+        let sessions = self.sessions.read();
+        let Some(target) = sessions
+            .values()
+            .find(|session| session.backend_pid.load(Ordering::Acquire) == pid)
+        else {
+            return Ok(false);
+        };
+        let owner = target.authenticated_user.read().clone();
+        if owner.is_none() {
+            return Ok(false);
+        }
+        // The protected target is the authenticated login role, not whichever
+        // effective role it later assumes. Consult committed attributes; if
+        // the catalog is busy or the login disappeared, fail closed.
+        let target_is_superuser = self
+            .roles
+            .try_read()
+            .map_err(|_| {
+                ExecError::PermissionDenied(
+                    "backend role catalog is busy; retry cancellation".into(),
+                )
+            })?
+            .get(owner.as_deref().expect("authenticated owner checked above"))
+            .map(|role| role.is_superuser)
+            .unwrap_or(true);
+        if !caller_context.is_superuser
+            && (target_is_superuser || owner.as_deref() != Some(caller_context.user.as_str()))
+        {
+            return Err(ExecError::PermissionDenied(
+                "permission to cancel target backend denied".into(),
+            ));
+        }
+        // Keep the map read lock until signaling: removal cannot recycle or
+        // detach the target between identity/authorization checks and wakeup.
+        Self::signal_session_cancel(target);
+        Ok(true)
     }
 
     /// Drop any pending cancel on the session. The wire layer calls this at
@@ -3820,9 +3971,11 @@ impl Executor {
     /// several internal statements (e.g. the Describe probe) and a cancel
     /// arriving during any of them targets the same client command.
     pub fn clear_session_cancel(&self, session_id: u64) {
-        self.get_session(session_id)
-            .cancel_requested
-            .store(false, Ordering::Relaxed);
+        if let Some(session) = self.sessions.read().get(&session_id) {
+            let _boundary = session.cancel_boundary.lock();
+            session.cancel_requested.store(false, Ordering::Relaxed);
+            while session.cancel_notify.notified().now_or_never().is_some() {}
+        }
     }
 
     /// Error out if the current session's statement has been cancelled.
@@ -3868,6 +4021,14 @@ impl Executor {
         self.policy_gen.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Read the current policy generation (NE-04). Every live policy
+    /// publication bumps the counter, so a value newer than one previously
+    /// observed proves another publication intervened — used to scope
+    /// failure compensation so it can never revert a concurrent commit.
+    pub(super) fn policy_generation(&self) -> u64 {
+        self.policy_gen.load(Ordering::Relaxed)
+    }
+
     /// Read the security catalog visible to this SQL transaction. Policy DDL
     /// is staged per session, so other connections continue to see the
     /// committed catalog until COMMIT.
@@ -3897,7 +4058,18 @@ impl Executor {
         })?;
         if txn.active {
             if txn.security_pending.is_none() {
-                txn.security_pending = Some(self.security.read().clone_policy_state());
+                // NE-03: the baseline (`security_snapshot`) used to remain the
+                // BEGIN-era clone while `security_pending` was cloned from the
+                // live catalog NOW. A peer policy change landing between those
+                // two moments was already inside the staged copy but absent
+                // from the baseline, so COMMIT's three-way merge classified
+                // the peer's entry as this transaction's delta and could
+                // reinstall an outdated version of it over the peer's later
+                // tightening. Baseline and staged copy must be captured from
+                // the SAME moment: clone once under one read lock and split it.
+                let live = self.security.read().clone_policy_state();
+                txn.security_snapshot = Some(live.clone_policy_state());
+                txn.security_pending = Some(live);
             }
             return Ok(f(txn.security_pending.as_mut().expect("initialized above")));
         }
@@ -5004,6 +5176,24 @@ impl Executor {
         &self.blob_store
     }
 
+    /// NE-14: S3/blob write admission — the same degraded/read-only gate SQL
+    /// DML already passes through. A server refusing writes under disk
+    /// pressure (or an operator hold) must refuse blob mutations too, BEFORE
+    /// any state changes; reads keep working.
+    pub fn blob_write_refused(&self) -> bool {
+        self.service.is_read_only()
+    }
+
+    /// NE-14: ordered durability barrier for blob mutations — payload
+    /// segments fsync BEFORE the manifest WAL group-syncs, so a recovered
+    /// manifest never references unwritten payload bytes and an acknowledged
+    /// mutation never loses its payload. No-op for in-memory stores.
+    pub fn blob_durability_barrier(&self) -> std::io::Result<()> {
+        let store = self.blob_store.read();
+        store.sync_segments()?;
+        store.wal_group_sync()
+    }
+
     /// Convenience: put data into the blob store.
     pub fn blob_store_put(&self, key: &str, data: &[u8], content_type: Option<&str>) {
         let mut store = self.blob_store.write();
@@ -5716,8 +5906,8 @@ impl Executor {
             let event = ChangeEvent {
                 table: table.to_string(),
                 change_type: change_type.clone(),
-                new_row: new_rows.first().map(&to_map),
-                old_row: old_rows.first().map(&to_map),
+                new_row: new_rows.first().map(to_map),
+                old_row: old_rows.first().map(to_map),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -6179,23 +6369,42 @@ impl Executor {
                 // NOT NULL / CHECK / FOREIGN KEY) for any table that has them, so a
                 // wire-level autocommit INSERT can never silently bypass a
                 // constraint. The fast path stays only for constraint-free tables.
-                let has_enforceable_constraints = !table_def.constraints.is_empty()
+                // UNIQUE indexes count: `check_unique_constraints` enforces
+                // `CREATE UNIQUE INDEX` exactly like a UNIQUE constraint, but only
+                // on the parsed path this gate falls back to (#69).
+                let has_unique_index = self
+                    .catalog
+                    .get_indexes_cached(table)
+                    .is_none_or(|idxs| idxs.iter().any(|idx| idx.unique));
+                let has_enforceable_constraints = has_unique_index
+                    || !table_def.constraints.is_empty()
                     || table_def.columns.iter().any(|col| !col.nullable);
                 if has_enforceable_constraints {
                     return None;
                 }
-                // Generated columns, identity columns and declared lengths are
-                // enforced by the full INSERT path only.
-                if table_def
-                    .columns
-                    .iter()
-                    .any(|c| c.generation.is_some() || c.max_len.is_some())
-                {
+                // Generated columns, identity columns, declared lengths and declared
+                // numeric precisions are enforced by the full INSERT path only.
+                if table_def.columns.iter().any(|c| {
+                    c.generation.is_some() || c.max_len.is_some() || c.numeric_typmod.is_some()
+                }) {
                     return None;
                 }
                 // Column count must match exactly for a simple VALUES insert.
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.
+                }
+                // The fast-path parser reads a decimal literal as an f64. A
+                // NUMERIC column must get its digits and written scale, which
+                // only the full INSERT path keeps.
+                if values
+                    .iter()
+                    .zip(table_def.columns.iter())
+                    .any(|(lit, col)| {
+                        matches!(lit, crate::wire::kv_fast_path::SqlLiteral::Float(_))
+                            && matches!(col.data_type, DataType::Numeric)
+                    })
+                {
+                    return None;
                 }
                 // Coerce each literal to its target column's declared type
                 // so pgx SimpleProtocol text-literal inserts land in the
@@ -6264,11 +6473,12 @@ impl Executor {
                 }
                 let table_def = self.catalog.get_table_cached(table)?;
                 // These columns require the full UPDATE path's casts,
-                // generated expressions and declared-length checks.
+                // generated expressions and declared-length / numeric-precision checks.
                 if table_def.columns.iter().any(|col| {
                     matches!(col.data_type, DataType::Array(_) | DataType::TimestampTz)
                         || col.generation.is_some()
                         || col.max_len.is_some()
+                        || col.numeric_typmod.is_some()
                 }) {
                     return None;
                 }
@@ -6278,17 +6488,34 @@ impl Executor {
                 // PRIMARY KEY / UNIQUE / FOREIGN KEY, or the table has any CHECK
                 // constraint — otherwise UPDATE silently bypassed CHECK and PK
                 // uniqueness (a duplicate PK could be produced by UPDATE).
+                // A unique INDEX's columns participate the same way: writing a
+                // key column through this path could produce a duplicate the
+                // full path's `check_unique_constraints` would have rejected
+                // (#69). `get_indexes_cached` returning None means the catalog
+                // could not be read — treat that as participation so the
+                // fallback is to the enforcing path, not around it.
                 {
                     let assigned: std::collections::HashSet<&str> =
                         assignments.iter().map(|(c, _)| c.as_str()).collect();
-                    let touches_keyed = table_def.constraints.iter().any(|c| match c {
-                        crate::catalog::TableConstraint::Check { .. } => true,
-                        crate::catalog::TableConstraint::PrimaryKey { columns, .. }
-                        | crate::catalog::TableConstraint::Unique { columns, .. }
-                        | crate::catalog::TableConstraint::ForeignKey { columns, .. } => {
-                            columns.iter().any(|col| assigned.contains(col.as_str()))
-                        }
-                    });
+                    let touches_unique_index =
+                        self.catalog.get_indexes_cached(table).is_none_or(|idxs| {
+                            idxs.iter().any(|idx| {
+                                idx.unique
+                                    && idx
+                                        .columns
+                                        .iter()
+                                        .any(|col| assigned.contains(col.as_str()))
+                            })
+                        });
+                    let touches_keyed = touches_unique_index
+                        || table_def.constraints.iter().any(|c| match c {
+                            crate::catalog::TableConstraint::Check { .. } => true,
+                            crate::catalog::TableConstraint::PrimaryKey { columns, .. }
+                            | crate::catalog::TableConstraint::Unique { columns, .. }
+                            | crate::catalog::TableConstraint::ForeignKey { columns, .. } => {
+                                columns.iter().any(|col| assigned.contains(col.as_str()))
+                            }
+                        });
                     if touches_keyed {
                         return None;
                     }
@@ -6302,6 +6529,12 @@ impl Executor {
                 let mut col_updates: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
                 for (col_name, lit) in assignments {
                     let idx = table_def.column_index(col_name)?;
+                    // A decimal literal was read as f64; see SimpleInsert.
+                    if matches!(lit, crate::wire::kv_fast_path::SqlLiteral::Float(_))
+                        && matches!(table_def.columns[idx].data_type, DataType::Numeric)
+                    {
+                        return None;
+                    }
                     let v = lit
                         .to_value()
                         .cast(&table_def.columns[idx].data_type)
@@ -7037,7 +7270,7 @@ impl Executor {
                 let _ = block.close(false).await;
                 return Err(e);
             }
-            let r = match self.execute_statement(stmt).await {
+            let r = match Box::pin(self.execute_statement(stmt)).await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = block.close(false).await;
@@ -7181,11 +7414,9 @@ impl Executor {
         let execution = derived_coherence::READ_GENERATION
             .scope(read_generation, self.execute_statement_inner(stmt));
         let result = if let Some(ref writer) = writer {
-            derived_coherence::WRITER_GENERATION
-                .scope(writer.generation, execution)
-                .await
+            Box::pin(derived_coherence::WRITER_GENERATION.scope(writer.generation, execution)).await
         } else {
-            execution.await
+            Box::pin(execution).await
         };
 
         if result.is_ok()
@@ -7377,7 +7608,9 @@ impl Executor {
                 // streamed query bypasses the materialized cache. Non-wire
                 // consumers collapse it at the materialization boundary.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_scan(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_scan(&query)).await?
+                {
                     return Ok(stream);
                 }
 
@@ -7387,7 +7620,8 @@ impl Executor {
                 // would return MemoryExceeded. Falls through (None) for every
                 // shape it does not handle, and never engages without a limit.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_aggregate(&query).await?
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_aggregate(&query)).await?
                 {
                     return Ok(stream);
                 }
@@ -7397,7 +7631,9 @@ impl Executor {
                 // so a large SELECT DISTINCT completes under a budget. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_distinct(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_distinct(&query)).await?
+                {
                     return Ok(stream);
                 }
 
@@ -7407,7 +7643,9 @@ impl Executor {
                 // materialized hash-join build would return MemoryExceeded. Falls
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
-                if !has_row_locks && let Some(stream) = self.try_streaming_join(&query).await? {
+                if !has_row_locks
+                    && let Some(stream) = Box::pin(self.try_streaming_join(&query)).await?
+                {
                     return Ok(stream);
                 }
 
@@ -7417,7 +7655,14 @@ impl Executor {
                 // cacheable: a replay serves rows without taking the locks the
                 // clause promises, from a snapshot the claim already consumed.
                 let sql_text = query.to_string();
+                // Backend identity is session-local; cancellation must execute
+                // on every call. Never replay either from a shared result cache.
+                let backend_control = {
+                    let upper = sql_text.to_ascii_uppercase();
+                    upper.contains("PG_BACKEND_PID") || upper.contains("PG_CANCEL_BACKEND")
+                };
                 let cacheable = !has_row_locks
+                    && !backend_control
                     && !in_txn
                     && !Self::query_cache_disabled()
                     && !self.any_table_secured()
@@ -7453,55 +7698,65 @@ impl Executor {
                 }
                 result
             }
-            Statement::CreateTable(create) => self.execute_create_table(create).await,
-            Statement::Insert(insert) => self.execute_insert(insert).await,
-            Statement::Update(update) => self.execute_update(update).await,
-            Statement::Delete(delete) => self.execute_delete(delete).await,
+            Statement::CreateTable(create) => Box::pin(self.execute_create_table(create)).await,
+            Statement::Insert(insert) => Box::pin(self.execute_insert(insert)).await,
+            Statement::Update(update) => Box::pin(self.execute_update(update)).await,
+            Statement::Delete(delete) => Box::pin(self.execute_delete(delete)).await,
             Statement::Explain {
                 statement, analyze, ..
-            } => self.execute_explain(*statement, analyze).await,
+            } => Box::pin(self.execute_explain(*statement, analyze)).await,
             Statement::Drop {
                 object_type,
                 names,
                 if_exists,
+                cascade,
                 ..
-            } => self.execute_drop(object_type, names, if_exists).await,
-            Statement::CreateIndex(create_index) => self.execute_create_index(create_index).await,
+            } => {
+                if object_type == ast::ObjectType::Schema {
+                    Box::pin(self.execute_drop_schema(names, if_exists, cascade)).await
+                } else {
+                    Box::pin(self.execute_drop(object_type, names, if_exists)).await
+                }
+            }
+            Statement::CreateIndex(create_index) => {
+                Box::pin(self.execute_create_index(create_index)).await
+            }
             Statement::StartTransaction { ref modes, .. } => {
                 // ISOLATION LEVEL and READ ONLY are applied to the transaction
                 // (`begin_transaction_with`); a level the engine cannot provide
                 // is refused there rather than run weaker than reported.
-                self.begin_transaction_with(txn_modes::TxnModes::from_ast(modes))
-                    .await
+                Box::pin(self.begin_transaction_with(txn_modes::TxnModes::from_ast(modes))).await
             }
-            Statement::Commit { .. } => self.commit_transaction().await,
+            Statement::Commit { .. } => Box::pin(self.commit_transaction()).await,
             Statement::Rollback {
                 savepoint: Some(ref sp),
                 ..
-            } => self.execute_rollback_to_savepoint(&sp.value).await,
-            Statement::Rollback { .. } => self.rollback_transaction().await,
-            Statement::Savepoint { name } => self.execute_savepoint(&name.value).await,
+            } => Box::pin(self.execute_rollback_to_savepoint(&sp.value)).await,
+            Statement::Rollback { .. } => Box::pin(self.rollback_transaction()).await,
+            Statement::Savepoint { name } => Box::pin(self.execute_savepoint(&name.value)).await,
             Statement::ReleaseSavepoint { name } => {
-                self.execute_release_savepoint(&name.value).await
+                Box::pin(self.execute_release_savepoint(&name.value)).await
             }
             Statement::Set(ast::Set::SetTransaction {
                 ref modes, session, ..
-            }) => self.execute_set_transaction(modes, session).await,
+            }) => Box::pin(self.execute_set_transaction(modes, session)).await,
             Statement::Set(set) => match crate::sql::set_constraints_spec(&set) {
-                Some(spec) => self.execute_set_constraints(&spec).await,
+                Some(spec) => Box::pin(self.execute_set_constraints(&spec)).await,
                 None => self.execute_set(set),
             },
-            Statement::ShowVariable { variable } => self.execute_show(variable).await,
-            Statement::ShowTables { .. } => self.execute_show_tables().await,
-            Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
-            Statement::AlterTable(alter_table) => self.execute_alter_table(alter_table).await,
+            Statement::ShowVariable { variable } => Box::pin(self.execute_show(variable)).await,
+            Statement::ShowTables { .. } => Box::pin(self.execute_show_tables()).await,
+            Statement::Truncate(truncate) => Box::pin(self.execute_truncate(truncate)).await,
+            Statement::AlterTable(alter_table) => {
+                Box::pin(self.execute_alter_table(alter_table)).await
+            }
             Statement::CreateView(create_view) if create_view.materialized => {
                 self.require_security_admin("create materialized views")?;
                 let view_name = create_view.name.to_string();
                 let sql = create_view.query.to_string();
                 // Extract source table references for write-time MV refresh.
                 let source_tables = Self::extract_table_refs(&create_view.query);
-                let query_result = self.execute_query(*create_view.query).await?;
+                let query_result = Box::pin(self.execute_query(*create_view.query)).await?;
                 if let ExecResult::Select { columns, rows } = query_result {
                     let mv = MaterializedViewDef {
                         name: view_name.clone(),
@@ -7544,8 +7799,12 @@ impl Executor {
                         dep_names.remove(&view_name);
                     }
                 }
-                self.execute_create_view(view_name, *create_view.query, create_view.columns)
-                    .await
+                Box::pin(self.execute_create_view(
+                    view_name,
+                    *create_view.query,
+                    create_view.columns,
+                ))
+                .await
             }
             Statement::CreateSequence {
                 name,
@@ -7553,23 +7812,28 @@ impl Executor {
                 if_not_exists,
                 ..
             } => {
-                self.execute_create_sequence(&name.to_string(), &sequence_options, if_not_exists)
-                    .await
+                Box::pin(self.execute_create_sequence(
+                    &name.to_string(),
+                    &sequence_options,
+                    if_not_exists,
+                ))
+                .await
             }
             Statement::Grant(grant) => {
-                self.execute_grant(grant.privileges, grant.objects, grant.grantees)
-                    .await
+                Box::pin(self.execute_grant(grant.privileges, grant.objects, grant.grantees)).await
             }
             Statement::Revoke(revoke) => {
-                self.execute_revoke(revoke.privileges, revoke.objects, revoke.grantees)
+                Box::pin(self.execute_revoke(revoke.privileges, revoke.objects, revoke.grantees))
                     .await
             }
-            Statement::CreateRole(create_role) => self.execute_create_role(create_role).await,
+            Statement::CreateRole(create_role) => {
+                Box::pin(self.execute_create_role(create_role)).await
+            }
             Statement::CreatePolicy(policy) => self.execute_create_policy(policy),
             Statement::DropPolicy(policy) => self.execute_drop_policy(policy),
             Statement::AlterPolicy(alter) => self.execute_alter_policy(alter),
             Statement::AlterRole { name, operation } => {
-                self.execute_alter_role(&name.to_string(), operation).await
+                Box::pin(self.execute_alter_role(&name.to_string(), operation)).await
             }
             Statement::Copy {
                 source,
@@ -7578,38 +7842,40 @@ impl Executor {
                 options,
                 values,
                 ..
-            } => self.execute_copy(source, to, target, options, values).await,
+            } => Box::pin(self.execute_copy(source, to, target, options, values)).await,
             Statement::NOTIFY { channel, payload } => {
-                self.execute_notify(&channel.value, payload.as_deref())
-                    .await
+                Box::pin(self.execute_notify(&channel.value, payload.as_deref())).await
             }
-            Statement::LISTEN { channel } => self.execute_listen(&channel.value).await,
-            Statement::UNLISTEN { channel } => self.execute_unlisten(&channel.value).await,
+            Statement::LISTEN { channel } => Box::pin(self.execute_listen(&channel.value)).await,
+            Statement::UNLISTEN { channel } => {
+                Box::pin(self.execute_unlisten(&channel.value)).await
+            }
             Statement::Declare { stmts } => {
                 if let Some(stmt) = stmts.first() {
-                    self.execute_declare_cursor(stmt).await
+                    Box::pin(self.execute_declare_cursor(stmt)).await
                 } else {
                     Err(ExecError::Unsupported("empty DECLARE".into()))
                 }
             }
             Statement::Fetch {
                 name, direction, ..
-            } => self.execute_fetch_cursor(&name.value, &direction).await,
-            Statement::Close { cursor } => self.execute_close_cursor(cursor).await,
-            Statement::CreateFunction(create_fn) => self.execute_create_function(create_fn).await,
-            Statement::Analyze(analyze) => self.execute_analyze(&analyze).await,
+            } => Box::pin(self.execute_fetch_cursor(&name.value, &direction)).await,
+            Statement::Close { cursor } => Box::pin(self.execute_close_cursor(cursor)).await,
+            Statement::CreateFunction(create_fn) => {
+                Box::pin(self.execute_create_function(create_fn)).await
+            }
+            Statement::Analyze(analyze) => Box::pin(self.execute_analyze(&analyze)).await,
             Statement::DropFunction(drop_fn) => {
-                self.execute_drop_function(&drop_fn.func_desc, drop_fn.if_exists)
-                    .await
+                Box::pin(self.execute_drop_function(&drop_fn.func_desc, drop_fn.if_exists)).await
             }
             Statement::Prepare {
                 name, statement, ..
-            } => self.execute_prepare(&name.value, *statement).await,
+            } => Box::pin(self.execute_prepare(&name.value, *statement)).await,
             Statement::Execute {
                 name, parameters, ..
             } => {
                 let exec_name = name.map(|n| n.to_string()).unwrap_or_default();
-                self.execute_execute(&exec_name, &parameters).await
+                Box::pin(self.execute_execute(&exec_name, &parameters)).await
             }
             Statement::Deallocate { name, .. } => {
                 let sess = self.current_session();
@@ -7629,14 +7895,14 @@ impl Executor {
             }
             Statement::CreateExtension(ext) => self.execute_create_extension(&ext),
             Statement::DropExtension(ext) => self.execute_drop_extension(&ext),
-            Statement::Call(func) => self.execute_call(func).await,
-            Statement::Vacuum(ref vacuum_stmt) => self.execute_vacuum(vacuum_stmt).await,
-            Statement::Discard { object_type } => self.execute_discard(object_type).await,
-            Statement::Reset(reset_stmt) => self.execute_reset(reset_stmt).await,
+            Statement::Call(func) => Box::pin(self.execute_call(func)).await,
+            Statement::Vacuum(ref vacuum_stmt) => Box::pin(self.execute_vacuum(vacuum_stmt)).await,
+            Statement::Discard { object_type } => Box::pin(self.execute_discard(object_type)).await,
+            Statement::Reset(reset_stmt) => Box::pin(self.execute_reset(reset_stmt)).await,
             Statement::CreateType {
                 name,
                 representation,
-            } => self.execute_create_type(name, representation).await,
+            } => Box::pin(self.execute_create_type(name, representation)).await,
             Statement::CreateTrigger(ct) => {
                 let timing = match ct.period {
                     Some(ast::TriggerPeriod::Before) => TriggerTiming::Before,
@@ -7666,14 +7932,14 @@ impl Executor {
                 } else {
                     String::new()
                 };
-                self.execute_create_trigger(
+                Box::pin(self.execute_create_trigger(
                     &crate::sql::object_name_key(&ct.name),
                     &crate::sql::object_name_key(&ct.table_name),
                     timing,
                     events,
                     for_each_row,
                     body,
-                )
+                ))
                 .await
             }
             Statement::DropTrigger(dt) => {
@@ -7801,9 +8067,7 @@ impl Executor {
                 // "storage ahead of catalog" — a reclaimable orphan, not silent
                 // corruption. Unconditional (not synchronous_commit-gated),
                 // matching persist_catalog, so DDL is durable on both sides.
-                if let Err(e) = self
-                    .storage
-                    .flush_schema()
+                if let Err(e) = Box::pin(self.storage.flush_schema())
                     .await
                     .map_err(ExecError::Storage)
                 {
@@ -7813,7 +8077,7 @@ impl Executor {
                     }
                     return Err(e);
                 }
-                if let Err(e) = self.persist_catalog().await {
+                if let Err(e) = Box::pin(self.persist_catalog()).await {
                     if let Some(previous) = security_before.take() {
                         *self.security.write() = previous;
                         self.bump_policy_gen();
@@ -7872,7 +8136,7 @@ impl Executor {
         {
             // The write already applied in memory; if the WAL can't be made
             // durable the client must NOT get a success ack.
-            self.force_wal_durability().await?;
+            Box::pin(self.force_wal_durability()).await?;
         }
 
         result
@@ -9415,6 +9679,104 @@ impl Executor {
         }
         Ok(ExecResult::Command {
             tag: "DROP EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    // ========================================================================
+    // Schemas (DROP SCHEMA)
+    // ========================================================================
+
+    /// `DROP SCHEMA [IF EXISTS] name [, ...]` — RESTRICT only.
+    ///
+    /// A schema is a name in the `schemas` registry; its objects are entries
+    /// keyed `schema.object` across the engine's flat-keyed stores: catalog
+    /// tables, indexes and enum types, views, materialized views, sequences
+    /// and functions. RESTRICT — the default, and the only mode implemented —
+    /// refuses while any such entry remains, naming the objects, so a drop can
+    /// never orphan keys under a schema that no longer exists. `IF EXISTS`
+    /// turns a missing schema into a no-op success, mirroring how
+    /// `DROP TABLE IF EXISTS` behaves. CASCADE is refused outright rather
+    /// than silently degraded to RESTRICT. `public` and the session's current
+    /// schema get no special case: unqualified DDL stores bare names, so an
+    /// empty `public` is droppable exactly like any other schema.
+    async fn execute_drop_schema(
+        &self,
+        names: Vec<ast::ObjectName>,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<ExecResult, ExecError> {
+        if cascade {
+            return Err(ExecError::Unsupported(
+                "DROP SCHEMA CASCADE is not implemented; drop the schema's objects first".into(),
+            ));
+        }
+        // Same authority gate as every other DROP (see execute_drop).
+        self.require_security_admin("drop an object")?;
+        for name in &names {
+            let schema_name = admin::object_name_value(name);
+            // Held across the member scan so two concurrent DROP SCHEMA calls
+            // cannot both pass the emptiness check for the same name. No
+            // other DDL path takes this lock, so no lock-order cycle is
+            // possible.
+            let mut schemas = self.schemas.write().await;
+            if !schemas.contains(&schema_name) {
+                if if_exists {
+                    continue;
+                }
+                return Err(ExecError::Unsupported(format!(
+                    "schema '{schema_name}' does not exist"
+                )));
+            }
+            let prefix = format!("{schema_name}.");
+            let mut members: Vec<String> = Vec::new();
+            for table in self.catalog.list_tables().await {
+                if table.name.starts_with(&prefix) {
+                    members.push(table.name.clone());
+                }
+            }
+            for index in self.catalog.get_all_indexes().await {
+                if index.name.starts_with(&prefix) {
+                    members.push(index.name.clone());
+                }
+            }
+            for type_name in self.catalog.list_enum_types().await {
+                if type_name.starts_with(&prefix) {
+                    members.push(type_name);
+                }
+            }
+            for view in self.views.read().await.keys() {
+                if view.starts_with(&prefix) {
+                    members.push(view.clone());
+                }
+            }
+            for mat_view in self.materialized_views.read().await.keys() {
+                if mat_view.starts_with(&prefix) {
+                    members.push(mat_view.clone());
+                }
+            }
+            for sequence in self.sequences.read().keys() {
+                if sequence.starts_with(&prefix) {
+                    members.push(sequence.clone());
+                }
+            }
+            for function in self.functions.read().keys() {
+                if function.starts_with(&prefix) {
+                    members.push(function.clone());
+                }
+            }
+            if !members.is_empty() {
+                members.sort();
+                return Err(ExecError::Unsupported(format!(
+                    "cannot drop schema \"{schema_name}\" because it contains {}; \
+                     drop those objects first",
+                    members.join(", ")
+                )));
+            }
+            schemas.remove(&schema_name);
+        }
+        Ok(ExecResult::Command {
+            tag: "DROP SCHEMA".into(),
             rows_affected: 0,
         })
     }

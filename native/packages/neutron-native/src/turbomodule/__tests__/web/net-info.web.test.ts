@@ -1,75 +1,33 @@
-import { describe, it, expect, beforeEach } from '@jest/globals'
-
-describe('NetInfo web implementation', () => {
-  let listeners: Record<string, Function[]>
-
-  beforeEach(() => {
-    jest.clearAllMocks()
-    listeners = {}
-    // Mock window with real event listener behavior
-    ;(global as any).window = {
-      addEventListener: jest.fn((event: string, callback: Function) => {
-        if (!listeners[event]) listeners[event] = []
-        listeners[event].push(callback)
-      }),
-      removeEventListener: jest.fn((event: string, callback: Function) => {
-        if (listeners[event]) {
-          listeners[event] = listeners[event].filter(cb => cb !== callback)
-        }
-      }),
-      dispatchEvent: jest.fn((event: Event) => {
-        if (listeners[event.type]) {
-          listeners[event.type].forEach(cb => cb(event))
-        }
-      }),
-    }
-  })
-
-  it('should return isConnected true', () => {
-    Object.defineProperty(navigator, 'onLine', { value: true, writable: true, configurable: true })
-    expect(navigator.onLine).toBe(true)
-  })
-
-  it('should return isConnected false', () => {
-    Object.defineProperty(navigator, 'onLine', { value: false, writable: true, configurable: true })
-    expect(navigator.onLine).toBe(false)
-  })
-
-  it('should detect connection type', () => {
-    const connection = { type: 'wifi' }
-    expect(connection.type).toBe('wifi')
-  })
-
-  it('should fire online event on connect', () => {
-    const listener = jest.fn()
-    window.addEventListener('online', listener)
-    window.dispatchEvent(new Event('online'))
-    expect(listener).toHaveBeenCalled()
-    window.removeEventListener('online', listener)
-  })
-
-  it('should fire offline event on disconnect', () => {
-    const listener = jest.fn()
-    window.addEventListener('offline', listener)
-    window.dispatchEvent(new Event('offline'))
-    expect(listener).toHaveBeenCalled()
-    window.removeEventListener('offline', listener)
-  })
-
-  it('should handle subscription', () => {
-    let isConnected = true
-    const listener = (connected: boolean) => {
-      isConnected = connected
-    }
-    window.addEventListener('online', () => listener(true))
-    window.addEventListener('offline', () => listener(false))
-    window.dispatchEvent(new Event('offline'))
-    expect(isConnected).toBe(false)
-  })
-
-  it('should detect network type from connection API', () => {
-    const connection = { type: 'cellular', effectiveType: '4g' }
-    expect(connection.type).toBe('cellular')
-    expect(connection.effectiveType).toBe('4g')
-  })
+import { listenerTarget } from '../fixtures/listener-target.js'
+import { getModule, clearCache } from '../../registry.js'
+import '../../modules/net-info.web.js'
+let mod: any
+let browser: ReturnType<typeof listenerTarget>
+let connection: ReturnType<typeof listenerTarget>
+beforeEach(() => {
+  browser = listenerTarget(); connection = listenerTarget()
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { connection } })
+  ;(globalThis as any).window = { ...browser, location: { hostname: 'example.test' } }
+  ;(globalThis as any).document = {}
+  clearCache()
+  mod = getModule('NeutronNetInfo')
+  expect(mod).not.toBeNull()
+})
+afterEach(() => { jest.useRealTimers() })
+it('uses actual online state', async () => { (navigator as any).onLine = false; expect(await mod.fetch()).toMatchObject({ isConnected: false, type: 'none' }); (navigator as any).onLine = true; expect(await mod.isConnected()).toBe(true) })
+it('subscription cleanup removes the exact callbacks and stops browser/connection delivery', () => {
+  const cb = jest.fn()
+  const subscription = mod.addEventListener(cb)
+  for (const event of ['online', 'offline']) browser.dispatch(event)
+  connection.dispatch('change')
+  expect(cb).toHaveBeenCalledTimes(3)
+  subscription.remove()
+  for (const event of ['online', 'offline']) {
+    expect(browser.removeEventListener).toHaveBeenCalledWith(event, browser.registered(event))
+    browser.dispatch(event)
+  }
+  expect(connection.removeEventListener).toHaveBeenCalledWith('change', connection.registered('change'))
+  connection.dispatch('change')
+  expect(browser.count()).toBe(0); expect(connection.count()).toBe(0)
+  expect(cb).toHaveBeenCalledTimes(3)
 })

@@ -116,7 +116,7 @@ impl PostgresJobStore {
     pub async fn new(url: &str, max_conns: usize) -> Result<Self, StoreError> {
         let pool = Arc::new(PoolInner {
             url: url.to_string(),
-            sem: Arc::new(Semaphore::new(max_conns)),
+            sem: Arc::new(Semaphore::new(max_conns.max(1))),
             idle: Mutex::new(VecDeque::new()),
         });
 
@@ -136,6 +136,7 @@ impl PostgresJobStore {
                      started_at_ms  BIGINT,
                      error          TEXT
                  );
+                 ALTER TABLE __neutron_jobs ADD COLUMN IF NOT EXISTS claim_token BIGINT NOT NULL DEFAULT 0;
                  CREATE INDEX IF NOT EXISTS __neutron_jobs_pending_idx
                      ON __neutron_jobs (queue, run_at_ms)
                      WHERE status = 'pending';",
@@ -150,6 +151,7 @@ impl PostgresJobStore {
 fn row_to_job(row: &Row) -> StoredJob {
     StoredJob {
         id: row.get::<_, i64>("id") as u64,
+        claim_token: row.get::<_, i64>("claim_token") as u64,
         job_type: row.get("job_type"),
         queue: row.get("queue"),
         payload: row.get("payload"),
@@ -204,7 +206,7 @@ impl JobStore for PostgresJobStore {
                 .client()
                 .query(
                     "UPDATE __neutron_jobs
-                     SET status = 'running', started_at_ms = $1
+                     SET status = 'running', started_at_ms = $1, claim_token = claim_token + 1
                      WHERE id IN (
                          SELECT id FROM __neutron_jobs
                          WHERE queue = $2
@@ -224,16 +226,19 @@ impl JobStore for PostgresJobStore {
         })
     }
 
-    fn mark_completed(&self, id: u64) -> BoxFuture<'_, Result<(), StoreError>> {
+    fn mark_completed(&self, id: u64, claim_token: u64) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             let conn = pool_get(&self.pool).await?;
-            conn.client()
+            let changed = conn.client()
                 .execute(
-                    "UPDATE __neutron_jobs SET status = 'completed' WHERE id = $1",
-                    &[&(id as i64)],
+                    "UPDATE __neutron_jobs SET status = 'completed' WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+                    &[&(id as i64), &(claim_token as i64)],
                 )
                 .await
                 .map_err(|e| StoreError::Backend(Box::new(e)))?;
+            if changed == 0 {
+                return Err(StoreError::StaleClaim(id));
+            }
             Ok(())
         })
     }
@@ -241,18 +246,22 @@ impl JobStore for PostgresJobStore {
     fn mark_failed<'a>(
         &'a self,
         id: u64,
+        claim_token: u64,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let reason = reason.to_string();
         Box::pin(async move {
             let conn = pool_get(&self.pool).await?;
-            conn.client()
+            let changed = conn.client()
                 .execute(
-                    "UPDATE __neutron_jobs SET status = 'failed', error = $2 WHERE id = $1",
-                    &[&(id as i64), &reason],
+                    "UPDATE __neutron_jobs SET status = 'failed', error = $2 WHERE id = $1 AND claim_token = $3 AND status = 'running'",
+                    &[&(id as i64), &reason, &(claim_token as i64)],
                 )
                 .await
                 .map_err(|e| StoreError::Backend(Box::new(e)))?;
+            if changed == 0 {
+                return Err(StoreError::StaleClaim(id));
+            }
             Ok(())
         })
     }
@@ -260,21 +269,31 @@ impl JobStore for PostgresJobStore {
     fn schedule_retry(
         &self,
         id: u64,
+        claim_token: u64,
         attempt: u32,
         run_at_ms: u64,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             let conn = pool_get(&self.pool).await?;
-            conn.client()
+            let changed = conn
+                .client()
                 .execute(
                     "UPDATE __neutron_jobs
                      SET status = 'pending', attempt = $2, run_at_ms = $3,
                          started_at_ms = NULL
-                     WHERE id = $1",
-                    &[&(id as i64), &(attempt as i32), &(run_at_ms as i64)],
+                     WHERE id = $1 AND claim_token = $4 AND status = 'running'",
+                    &[
+                        &(id as i64),
+                        &(attempt as i32),
+                        &(run_at_ms as i64),
+                        &(claim_token as i64),
+                    ],
                 )
                 .await
                 .map_err(|e| StoreError::Backend(Box::new(e)))?;
+            if changed == 0 {
+                return Err(StoreError::StaleClaim(id));
+            }
             Ok(())
         })
     }
@@ -282,15 +301,15 @@ impl JobStore for PostgresJobStore {
     fn recover_stale(&self, stale_secs: u64) -> BoxFuture<'_, Result<Vec<StoredJob>, StoreError>> {
         Box::pin(async move {
             let conn = pool_get(&self.pool).await?;
-            let threshold = now_ms().saturating_sub(stale_secs * 1_000) as i64;
+            let threshold = now_ms().saturating_sub(stale_secs.saturating_mul(1_000)) as i64;
             let now_ms_i = now_ms() as i64;
 
             let rows = conn
                 .client()
                 .query(
                     "UPDATE __neutron_jobs
-                     SET status = 'pending',
-                         attempt = attempt + 1,
+                     SET status = CASE WHEN attempt >= max_attempts THEN 'failed' ELSE 'pending' END,
+                         attempt = CASE WHEN attempt >= max_attempts THEN attempt ELSE attempt + 1 END,
                          run_at_ms = $1,
                          started_at_ms = NULL
                      WHERE status = 'running'

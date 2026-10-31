@@ -1,0 +1,48 @@
+{
+  "format": "neutron-value-cases",
+  "version": 1,
+  "status": "normative-proposed-runtime-compliance-unverified",
+  "cases": [
+    {
+      "id": "int8-max",
+      "sql_type": "pg_catalog.int8",
+      "input": {
+        "kind": "integer",
+        "decimal": "9223372036854775807"
+      },
+      "expected_native_text": "9223372036854775807"
+    },
+    {
+      "id": "decimal-extreme",
+      "sql_type": "pg_catalog.numeric",
+      "input": {
+        "kind": "decimal",
+        "text": "12345678901234567890.123456789"
+      },
+      "expected_native_text": "12345678901234567890.123456789"
+    },
+    {
+      "id": "instant-microseconds",
+      "sql_type": "pg_catalog.timestamptz",
+      "input": {
+        "kind": "instant",
+        "text": "2024-01-02T03:04:05.123456Z"
+      },
+      "expected_utc_native_text": "2024-01-02 03:04:05.123456+00"
+    },
+    {
+      "id": "null-vs-json-null",
+      "sql_type": "pg_catalog.jsonb",
+      "inputs": [
+        {
+          "kind": "sql-null"
+        },
+        {
+          "kind": "json",
+          "value": null
+        }
+      ],
+      "assert": "sql IS NULL true only first; jsonb_typeof second equals null"
+    }
+  ]
+}

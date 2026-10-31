@@ -70,7 +70,7 @@ def draft_greedy(logits: Tensor[DType.float32], vocab_size: Int) -> Int:
 def compute_probs(
     logits: Tensor[DType.float32],
     vocab_size: Int,
-) -> Tensor[DType.float32]:
+) raises -> Tensor[DType.float32]:
     """Convert logits to probabilities via softmax.
 
     Args:
@@ -132,7 +132,7 @@ def verify_tokens(
     k: Int,
     vocab_size: Int,
     mut rng: LCG,
-) -> SpeculativeResult:
+) raises -> SpeculativeResult:
     """Verify draft tokens against target model probabilities.
 
     For each draft token x_i:
@@ -229,7 +229,7 @@ def sample_residual_flat(
     step: Int,
     vocab_size: Int,
     mut rng: LCG,
-) -> Int:
+) raises -> Int:
     """Sample from residual distribution at a given step.
 
     residual(x) = max(0, p_target(x) - p_draft(x)) / Z

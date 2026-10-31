@@ -57,6 +57,24 @@ truth, and dropping the local copy must cost nothing but a resync. That is a
 testable claim, unlike "stateless", and
 `TestIntegrationRebuildFromZero` tests it.
 
+## Attachments, JMAP origins and header folding
+
+`Envelope.Attachment` is `AttachmentUnknown`, `AttachmentAbsent` or
+`AttachmentPresent`. Gmail metadata sync cannot see the part tree, so it
+reports Unknown, and the store never lets Unknown overwrite a known state.
+A fetched body resolves it: attachments found mean Present, none found turns
+Unknown into Absent but never overrules a provider's own definitive flag.
+Consumers must show Unknown honestly.
+
+JMAP credentials go only to the discovery origin plus origins the product
+names through `jmap.Config.AllowedOrigins` (or `dialer.Policy.JMAPAllowedOrigins`
+for the resolver). Session metadata cannot authorize an origin. Discovery,
+API calls, downloads, redirects and custom HTTP clients are all checked before
+dispatch; a redirect never grants a new plaintext origin.
+
+The MIME renderer folds headers at existing whitespace and refuses
+unsplittable lines over 998 bytes, including generated part headers.
+
 ## Running
 
 ```bash

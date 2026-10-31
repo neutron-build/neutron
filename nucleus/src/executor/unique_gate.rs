@@ -332,6 +332,38 @@ impl super::Executor {
                 slots.push(slot);
             }
         }
+
+        // CREATE UNIQUE INDEX enforces on the same write path, so its keys
+        // need the same serialization: without a slot, two sessions can race
+        // check-then-write on an indexed key exactly as they once did on a
+        // PRIMARY KEY (#69). Slot ids continue past the constraint ids so an
+        // index can never alias a constraint. `get_indexes_cached` is the sync
+        // mirror of the async enumeration `check_unique_constraints` does; on
+        // lock contention (None) no slot is taken — enforcement itself is the
+        // full path's call and still runs.
+        if let Some(indexes) = self.catalog.get_indexes_cached(table_name) {
+            for (pos, index) in indexes.iter().enumerate() {
+                if !index.unique {
+                    continue;
+                }
+                let indices: Vec<usize> = index
+                    .columns
+                    .iter()
+                    .filter_map(|c| table_def.column_index(c))
+                    .collect();
+                if indices.len() != index.columns.len() {
+                    continue;
+                }
+                let key: Vec<Value> = indices
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                let cid = table_def.constraints.len() + pos;
+                if let Some(slot) = UniqueGate::slot(table_name, cid, &key) {
+                    slots.push(slot);
+                }
+            }
+        }
         slots
     }
 

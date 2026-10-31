@@ -294,16 +294,18 @@ export function isResponse(value: unknown): value is Response {
   );
 }
 
+
 /**
- * Return `response` itself when its headers can be written, otherwise a copy
- * with a mutable header list (same body stream, status, statusText). Native
- * `Response.redirect()`, `Response.error()` and fetched responses carry an
- * immutable header guard, and every header write on them throws.
+ * Return a response with writable headers, retaining the original body stream.
+ * A response whose headers are already writable is returned as is: copying it
+ * on every middleware layer cost a third of the request path's throughput.
+ * `Headers.delete` throws on an immutable guard even for an absent name, so
+ * the probe never changes a writable response. Native `Response.redirect()`,
+ * `Response.error()` and fetched responses carry an immutable guard.
  */
-export function withMutableHeaders(response: Response): Response {
+export function mutableResponse(response: Response): Response {
   try {
-    response.headers.set(MUTABLE_HEADERS_PROBE, "1");
-    response.headers.delete(MUTABLE_HEADERS_PROBE);
+    response.headers.delete("x-neutron-mutability-probe");
     return response;
   } catch {
     // The Response constructor only accepts 200-599; Response.error()
@@ -311,12 +313,6 @@ export function withMutableHeaders(response: Response): Response {
     if (response.status < 200 || response.status > 599) {
       return response;
     }
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: new Headers(response.headers),
-    });
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) });
   }
 }
-
-const MUTABLE_HEADERS_PROBE = "x-neutron-mutable-probe";

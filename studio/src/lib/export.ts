@@ -34,6 +34,14 @@ export function exportJSON(data: unknown, filename: string): void {
   download(JSON.stringify(data, null, 2), filename, 'application/json')
 }
 
+/** Document JSON source is validated, then embedded verbatim so numeric
+ * lexemes remain numbers. Keep the established {id,data} download shape. */
+export function exportDocumentJSON(documents: Array<{ id: string; raw: string }>, filename: string): void {
+  for (const doc of documents) JSON.parse(doc.raw)
+  const rows = documents.map(doc => `{"id":${JSON.stringify(doc.id)},"data":${doc.raw}}`)
+  download(`[\n${rows.join(',\n')}\n]`, filename, 'application/json')
+}
+
 // --- Query-result export (S06) ---
 //
 // Exports the rows a grid already holds (the SQL editor's bounded result).

@@ -23,6 +23,11 @@ pub enum WebAuthnError {
     UnsupportedCredentialType,
     /// The algorithm is unsupported (must be ES256 / COSE -7).
     UnsupportedAlgorithm,
+    /// The attestation format is not supported. This crate verifies only the
+    /// `none` attestation statement format; a response using any other format
+    /// (`packed`, `tpm`, `android-key`, …) is rejected instead of silently
+    /// being treated as verified.
+    UnsupportedAttestationFormat(String),
 }
 
 impl fmt::Display for WebAuthnError {
@@ -42,6 +47,10 @@ impl fmt::Display for WebAuthnError {
                 write!(f, "webauthn: credential type must be public-key")
             }
             WebAuthnError::UnsupportedAlgorithm => write!(f, "webauthn: algorithm must be ES256"),
+            WebAuthnError::UnsupportedAttestationFormat(fmt) => write!(
+                f,
+                "webauthn: attestation format {fmt:?} is not supported (only \"none\")"
+            ),
         }
     }
 }

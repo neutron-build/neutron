@@ -32,4 +32,5 @@ tracing         = { workspace = true }
 serde_urlencoded = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+neutron = { path = "../neutron", default-features = false, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt"] }

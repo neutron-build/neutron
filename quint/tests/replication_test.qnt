@@ -1,17 +1,17 @@
 // Replication protocol invariant tests.
 module replication_test {
-    import replication.*
+    import replication.* from "../specs/nucleus/replication"
 
     // Test: initial state satisfies all invariants
     run init_valid_test = {
-        init.then(all { replicas_behind, sync_durability })
+        init.expect(all { replicas_behind, sync_durability })
     }
 
     // Test: primary write maintains replica ordering
     run primary_write_test = {
         init
             .then(primary_write)
-            .then(all { replicas_behind, sync_durability })
+            .expect(all { replicas_behind, sync_durability })
     }
 
     // Test: replica catches up to primary
@@ -19,7 +19,7 @@ module replication_test {
         init
             .then(primary_write)
             .then(replica_apply(2))
-            .then(all { replicas_behind, sync_durability })
+            .expect(all { replicas_behind, sync_durability })
     }
 
     // Test: multiple writes then replica catch-up
@@ -31,7 +31,7 @@ module replication_test {
             .then(replica_apply(2))
             .then(replica_apply(2))
             .then(replica_apply(2))
-            .then(all { replicas_behind, sync_durability })
+            .expect(all { replicas_behind, sync_durability })
     }
 
     // Test: both replicas catching up independently
@@ -41,7 +41,7 @@ module replication_test {
             .then(primary_write)
             .then(replica_apply(2))
             .then(replica_apply(3))
-            .then(all { replicas_behind, sync_durability })
+            .expect(all { replicas_behind, sync_durability })
     }
 
     // Test: sync durability — after replica catches up to primary_lsn,
@@ -51,7 +51,7 @@ module replication_test {
             .then(primary_write)
             .then(replica_apply(2))
             // In synchronous mode, acked_lsn should now equal primary_lsn
-            .then(all { replicas_behind, sync_durability })
+            .expect(all { replicas_behind, sync_durability })
     }
 
     // Test: staggered writes and applies maintain ordering
@@ -64,6 +64,6 @@ module replication_test {
             .then(primary_write)
             .then(replica_apply(2))
             .then(replica_apply(2))
-            .then(all { replicas_behind, sync_durability })
+            .expect(all { replicas_behind, sync_durability })
     }
 }

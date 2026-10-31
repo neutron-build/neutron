@@ -1,0 +1,9 @@
+{
+  "name": "neutron-orm-project-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check run.mjs && node --check main.mjs && node --check providers.mjs",
+    "check:live": "node run.mjs"
+  }
+}

@@ -260,12 +260,6 @@ All notable changes to this project are documented in this file.
   scaffolded sources under BOTH runtimes, so a scaffolded app typechecks
   out of the box — the criterion that previously kept the scaffold on
   `preact` (settings.tsx uses `<Form>`).
-- **`<Island>` is usable from React-typed JSX.** The element `Island` returns
-  is now deliberately JSX-agnostic (like `Image`/`Picture`): under
-  `runtime: "react-compat"` an app that typechecks against `@types/react`
-  (`jsxImportSource: "react"`) can use `<Island …>` with children directly —
-  previously TS2786 rejected the preact `VNode` return against React's
-  `ReactNode`, forcing a hand-rolled facade per app. Props stay fully typed.
 - `docs/react-compat.md` documents the types setup for react-compat apps:
   `react` ships no bundled types, so apps need `@types/react` (the bundler
   never needs the real `react` package — the runtime aliases cover it), and
@@ -292,24 +286,14 @@ All notable changes to this project are documented in this file.
   "Security headers" section of the `neutron.config.ts` docs records both
   decisions.
 
-- **`<neutron-island>` is `display: contents` by default, and
-  `client="visible"` works without a marker box.** The document head styled
-  the marker `display: block; width: 100%`, a box of its own that changed
-  layout wherever an island sat: a flex row item stretched to full width, a
-  grid item's sizing went to the wrapper, inline text broke around it. Apps
-  that set `neutron-island { display: contents }` to avoid that (the Fylun
-  port) lost `client="visible"`, because IntersectionObserver never reports
-  an element without a box and the runtime observed the marker. The default
-  is now `display: contents` — the island's content lays out exactly as it
-  would without the marker, which is what the old rule was trying to achieve
-  for percentage widths inside flex containers — and `client="visible"`
-  observes the content's first boxed descendants (looking through nested
-  `display: contents` elements); a marker that has a box is observed itself,
-  and a box-less marker with only text inside is represented by its nearest
-  ancestor with a box. **Migration:** CSS that styled the marker as a box
-  (`neutron-island { margin: … }`) needs an explicit `display` again, e.g.
-  `neutron-island { display: block }`; author stylesheets come after the
-  framework's rule and win.
+- **`client="visible"` finds the island's boxed content.** core 0.4.1 made
+  the `<neutron-island>` marker `display: contents` and observed the marker's
+  child elements, hydrating at once when it had none. The runtime now
+  observes the content's first boxed descendants, looking through nested
+  `display: contents` elements; a marker given a box of its own
+  (`neutron-island { display: block }`) is observed itself, and a box-less
+  marker with only text inside is represented by its nearest ancestor with a
+  box instead of hydrating immediately.
 - **Static-tier pages are no longer in the app's client bundle.** The client
   route table had an `import()` for every non-resource route, so a `mode:
   "static"` page's module — stripped only of loader/action/getStaticPaths/
@@ -539,13 +523,6 @@ All notable changes to this project are documented in this file.
   keys are named exports. Builds (the `start` server bundle, the client)
   were already fine — Rolldown bundles CommonJS itself — and are unchanged.
   Per-app `ssr.external` lists for CommonJS packages are no longer needed.
-- **Nested islands hydrate once.** `initIslands` hydrated every
-  `<neutron-island>` in the document, including a marker inside another
-  island's subtree (`<Island component={Outer}/>` where Outer renders
-  `<Island component={Inner}/>`), so Inner got a second Preact root over the
-  DOM the outer root already owned — mounted twice, dynamic nodes inserted
-  twice. A marker nested in another island is now skipped: hydrating the
-  outer island mounts it, whatever either's `client` directive says.
 - **The server bundle builds when core is linked or pnpm-installed under
   `resolve.preserveSymlinks`, and no longer inlines core's dependencies.**
   Under react-compat (`ssr.noExternal: true`) the `start` bundle inlined
@@ -696,7 +673,9 @@ All notable changes to this project are documented in this file.
   every response on the way out (`x-request-id`, security headers, CORS,
   `Vary`, route-rule headers), so the first write threw `TypeError`. The
   server now copies such a response into one with mutable headers before
-  touching it, keeping body, status and headers. `neutron-ts dev` did not
+  touching it, keeping body, status and headers (through core 0.4.0's
+  `mutableResponse()`, which now returns `Response.error()`, status 0, as
+  is instead of throwing a `RangeError` copying it). `neutron-ts dev` did not
   500 but silently dropped route-rule headers on these responses; it now
   applies them like `start`. `new Response(null, { status: 307, headers: {
   Location } })` and `redirect()` were never affected.
@@ -709,6 +688,135 @@ All notable changes to this project are documented in this file.
   space. The default 404, and the 404 for a static route missing from dist,
   now answer through global middleware like the static fast path already
   did; a response it returns (401, redirect) wins.
+
+## [core 0.4.2] - 2026-10-30
+
+### Fixed
+
+- `<Island>` type-checks under the `react-compat` runtime. It returned a
+  Preact VNode, which React's JSX types reject (TS2786 on every island). The
+  props stay strictly typed; the element type is left to the JSX runtime.
+  `apps/playground-react-compat` now runs `tsc` over an island route in CI.
+- react-compat builds: `react/jsx-runtime` (and `react-dom/client`,
+  `react-dom/server`) resolved through the bare `react`/`react-dom` alias
+  into `…/compat.mjs/jsx-runtime`, so the first client-bundled island with
+  React-typed JSX failed with "Not a directory" unless the app happened to
+  add `@preact/preset-vite`. Runtime aliases are now ordered most specific
+  first.
+
+## [core 0.4.1] - 2026-10-30
+
+### Fixed
+
+- Islands: the `<neutron-island>` marker is `display: contents` instead of
+  `display: block; width: 100%`. As a flex item the old rule took the whole
+  row and collapsed `flex-1` siblings to 0px. `client="visible"` now observes
+  the marker's children.
+- Islands: an `<Island>` inside another island's component renders inline as
+  part of the outer island. It used to emit its own marker, which the
+  standalone runtime hydrated a second time (content rendered twice).
+- Islands: `<Island component={X}>` resolves `X` from every value-import shape,
+  including `import X, { type T } from` and `import X, * as ns from`. Those
+  shapes left the marker without `data-src`, so the island never hydrated on
+  static pages. The Vite plugin now warns when a local island component cannot
+  be resolved.
+
+## [core 0.4.0, cli 0.4.0, create 0.1.10, sql 0.2.0, nucleus 0.3.0, data 0.3.0, ai 0.1.2, security 0.1.5, ops 0.1.4, otel 0.1.4] - 2026-10-26
+
+### Breaking
+
+- **zod 4.** `@neutron-build/core` and `@neutron-build/ai` move to zod 4
+  (closes GHSA-mrhx-c7xc-m3w5, which has no zod 3 fix). Content collection
+  schemas must be zod 4 schemas: import `z` from `"zod"` and use the zod 4 API
+  (`z.email()`, `z.url()`). `@neutron-build/ai` still converts zod 3 schemas
+  passed through `zod/v3`.
+- **Shared caching is opt-in per middleware.** Middleware and `headers()`
+  callbacks must declare `sharedCacheSafe: true` before a response passing
+  through them is stored in a shared cache; without it the response bypasses
+  shared caching (TS-F04/06/07/08).
+- Raw and mobile SELECT caching in the data layer defaults off and requires an
+  explicit pure-read assertion (TSD-05). Dispatched mutations and `BEGIN` are no
+  longer replayed automatically; ambiguous responses surface as `UnknownOutcome`
+  (TSD-06).
+
+### Fixed
+
+- Runtime (TS-F01..21): global middleware is gated in static and production
+  builds; the Docker adapter serves only declared public artifacts; cache
+  capture runs after the full middleware chain with byte-budgeted body capture;
+  `mutableResponse()` lets middleware set headers on immutable responses;
+  stream writers honor backpressure and abort; backslash path escapes are
+  blocked; body caps propagate cancellation; client data is fenced across async
+  boundaries and the client matcher implements server catch-all semantics;
+  returned loader Responses close their spans; MDX `sanitize: true` refuses a
+  custom render factory; ServerIsland props are JSON-escaped.
+- `mutableResponse()` copies only responses whose headers are immutable, and
+  the server reassigns Hono's response only when a copy was made. Copying on
+  every middleware layer had cut static and login throughput by about 40%.
+- The runtime router no longer imports the build-time route manifest, which
+  pulled `@babel/parser` and `node:fs` into every server bundle, edge presets
+  included (about 17 KB gzipped).
+- Security: rate-limit buckets survive quota reset, CSRF origin comparison is
+  scheme-aware, trusted-proxy mode ignores unverifiable vendor identity headers.
+- Data layer (TSD-01..14): cursor decode failures release their connection;
+  pinned-session capability probes no longer deadlock the pool; Postgres queue
+  claims are lease- and worker-fenced; unknown BullMQ jobs are deferred instead
+  of completed; cancellation drains on every outcome; HTTP deadlines cover body
+  parsing (30 s default); blob compensation no longer deletes a newer writer;
+  rollback preflights the whole frontier before DDL; listener close during
+  subscribe releases late subscriptions; Redis increment with expiry is atomic;
+  cron coalesces missed work after clock changes; legacy DDL defers cyclic
+  foreign keys.
+- `@neutron-build/ops` request-context middleware sets its header through
+  `mutableResponse()` and requires core 0.4.0. `@neutron-build/otel` ends
+  loader and action spans left open when their request ends.
+
+## [core 0.3.2, cli 0.3.2, create-neutron 0.1.9] - 2026-10-07
+
+### Fixed
+
+- **Both data-protocol representations now declare
+  `Vary: Accept, Accept-Language, X-Neutron-Data, X-Neutron-Routes`** (TS-33),
+  and cache-stored app responses synthesize the same set before publishing
+  `Cache-Control`. Without it a shared cache (browser HTTP cache, CDN) could
+  store the JSON payload under a page's bare URL and answer a document reload
+  with it — the raw `__neutron_serialized__` envelope painted as page content
+  (observed on a deployed app 2026-10-06). The server-side cache key was
+  already variant-split; the defect was wire-level. Route-declared `Vary` is
+  merged, never replaced; `Vary: *` is untouched.
+- **Jobs** (framework audit NA-01..NA-03): claim-token fencing on every
+  terminal write so an old attempt can never overwrite a newer one; renewal
+  is expiry-bounded and a confirmed-through watchdog bounds handler lifetime;
+  jobs are claimed only when a concurrency slot is ready; upgraded running
+  rows with NULL leases get an explicit recovery cutover. **Operators must
+  stop old workers before deploying this version** — mixed fleets keep the
+  old claim semantics against the same queue.
+- **Static builds** (NA-04): middleware route facts are parsed conservatively
+  (all declarator shapes, star exports, unparseable treated as present) and
+  the production build gates on them before any write, closing a path where
+  a protected static page skipped its route middleware.
+- OpenAPI generation is atomic and generation-keyed; group registration and
+  post-build registration no longer leave stale documents (NA-05).
+- Shared dynamic route branches bind the winning route's parameter names
+  (NA-06); dynamic-directory not-found pages receive scoped parameters with
+  a deterministic specificity order (NA-07).
+- Client export stripping preserves a surviving re-export's source clause
+  (NA-08). Generated route declarations are valid string literals (NA-13).
+- Code generation: output destinations decided by table count (a single
+  `--out` file no longer becomes a directory, NA-09); `json.RawMessage`
+  gains its import via a real `go/types` harness (NA-10); legacy table
+  enumeration fails closed on scan errors and stages whole batches before
+  publishing (NA-14).
+- `@neutron-build/mcp` exports a permission-aware in-process
+  `Server.CallTool` dispatcher; the HTTP route becomes a shim over it with
+  parity tests (NA-11).
+- ORM `excluded` validation is scope-aware (scalar subqueries inherit it;
+  ordinary identifiers are no longer rejected), verified against live
+  PostgreSQL (NA-12).
+
+### Changed
+
+- `create-neutron` 0.1.9 scaffolds pin `@neutron-build/core`/`cli` `^0.3.2`.
 
 ## [core 0.3.1, cli 0.3.1, create-neutron 0.1.8] - 2026-10-03
 

@@ -300,6 +300,8 @@ export class CapabilityRequirementError extends Error {
 }
 
 export interface CapabilityGate {
+  /** Independent session-local probes, never through the parent pool. */
+  scoped?(driver: Driver, probe?: (sql: string) => Promise<void>): CapabilityGate;
   /** Engine identity, resolved once per gate (memoized `SELECT VERSION()`). */
   engine(): Promise<EngineIdentity>;
   /** Status of one capability (memoized per capability). */
@@ -309,7 +311,7 @@ export interface CapabilityGate {
   assert(required: readonly StatementCapability[]): Promise<void>;
 }
 
-export function capabilityGate(driver: Driver): CapabilityGate {
+export function capabilityGate(driver: Driver, probe?: (sql: string) => Promise<void>): CapabilityGate {
   let enginePromise: Promise<EngineIdentity> | null = null;
   const statusPromises = new Map<string, Promise<CapabilityEvidence>>();
 
@@ -335,7 +337,7 @@ export function capabilityGate(driver: Driver): CapabilityGate {
     if (!p) {
       p = engine().then((identity) =>
         resolveCapabilityStatus(identity, capability, async (sql) => {
-          await driver.query(sql);
+          if (probe) await probe(sql); else await driver.query(sql);
         }),
       );
       statusPromises.set(capability, p);
@@ -346,11 +348,13 @@ export function capabilityGate(driver: Driver): CapabilityGate {
   };
 
   return {
+    scoped: (local, runProbe) => capabilityGate(local, runProbe),
     engine,
     status,
     assert: async (required: readonly StatementCapability[]): Promise<void> => {
       if (required.length === 0) return;
-      const settled = await Promise.all(required.map((cap) => status(cap)));
+      const settled: CapabilityEvidence[] = [];
+      for (const cap of required) settled.push(await status(cap));
       const failing = settled.filter((r) => r.status !== "supported");
       if (failing.length > 0) {
         const lines = failing.map((r) => `  - "${r.capability}": ${r.status} (${r.evidence})`);

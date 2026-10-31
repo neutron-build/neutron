@@ -13,6 +13,7 @@ export {
 // renderStatic is a minimal standalone SSG (for tests); the production build is
 // neutron-cli/src/commands/build.ts. See the doc comment in render-static.ts.
 export { renderStatic, renderToString } from "./core/render-static.js";
+export { assertStaticRoutesUngated, type StaticGateOptions } from "./core/render-static.js";
 export { assertRenderedFragment } from "./core/fragment-guard.js";
 export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse } from "./core/response.js";
 export {
@@ -340,3 +341,5 @@ export {
   type ResolvedLocalePath,
 } from "./core/i18n.js";
 export { buildRssFeed, type RssItem, type RssOptions } from "./core/rss.js";
+
+export { mutableResponse } from "./core/response.js";

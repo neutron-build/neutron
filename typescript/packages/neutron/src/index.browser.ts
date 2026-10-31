@@ -29,7 +29,7 @@ export {
 } from "./core/resource-routes.js";
 export { renderSpeculationRules, renderStaticLinkSpeculationRules } from "./core/speculation-rules.js";
 export { assertRenderedFragment } from "./core/fragment-guard.js";
-export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse } from "./core/response.js";
+export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse, mutableResponse } from "./core/response.js";
 export {
   ProblemError,
   isProblemError,
@@ -145,6 +145,7 @@ export const createRouter = serverOnly("createRouter");
 export const discoverRoutes = serverOnly("discoverRoutes");
 export const parseRouteConfig = serverOnly("parseRouteConfig");
 export const renderStatic = serverOnly("renderStatic");
+export const assertStaticRoutesUngated = serverOnly("assertStaticRoutesUngated");
 export const renderToString = serverOnly("renderToString");
 export const prepareRouteTypes = serverOnly("prepareRouteTypes");
 export const generateRouteTypesDeclaration = serverOnly("generateRouteTypesDeclaration");

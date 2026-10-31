@@ -1,3 +1,4 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useEffect } from 'preact/hooks'
 import { useSignal } from '@preact/signals'
 import { activeConnection, openTab, limitsReport } from '../../lib/store'
@@ -31,20 +32,25 @@ export function JourneyModule({ schema, table }: { schema: string; table: string
   const error = useSignal<string | null>(null)
   const loading = useSignal(false)
 
+  const owner = useRequestOwner(JSON.stringify([conn?.id, schema, table]))
   async function load() {
-    if (!conn) return
+    const owns = owner.begin()
+    if (!conn || !owns()) return
+    journey.value = null
     loading.value = true
     error.value = null
     try {
       const j = await api.journey(conn.id, schema, table)
+      if (!owns()) return
       journey.value = j
       // The journey carries the limits it was built with; keep the shared
       // report current for every other surface.
       limitsReport.value = j.limits
     } catch (e) {
+      if (!owns()) return
       error.value = e instanceof Error ? e.message : String(e)
     } finally {
-      loading.value = false
+      if (owns()) loading.value = false
     }
   }
 

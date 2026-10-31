@@ -1,6 +1,6 @@
 /-
-  B-Tree — Aeneas-translated model of Nucleus's B-tree implementation.
-  Models the core types and operations from `nucleus/src/storage/btree.rs`.
+  Unordered first-child map abstraction, hand-written (not an Aeneas translation).
+  Motivated by types from `nucleus/src/storage/btree.rs`.
 -/
 
 namespace Nucleus.Aeneas

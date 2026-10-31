@@ -15,6 +15,7 @@ gradients to regular backward. The actual memory savings require a proper
 memory allocator (future work).
 """
 
+from std.math import isfinite
 from .tape import Tape, TapeEntry
 from .backward import run_backward, _dispatch_backward
 
@@ -157,46 +158,22 @@ def _list_contains(lst: List[Int], val: Int) -> Bool:
 # ===----------------------------------------------------------------------=== #
 
 
-def run_backward_checkpointed(
-    mut tape: Tape,
-    loss_idx: Int,
-    segments: List[CheckpointSegment],
-):
-    """Run backward with gradient checkpointing.
+def run_backward_checkpointed(mut tape: Tape, loss_idx: Int,
+                             segments: List[CheckpointSegment]) raises:
+    """Validate full segment coverage and use the same reachable reverse walk.
 
-    For each segment in reverse:
-    1. Save input variable data
-    2. Run backward through the segment entries
-    3. Continue to next segment
-
-    NOTE: This is a simplified version -- intermediates are NOT actually
-    freed from the flat tensor (that would require a memory allocator).
-    Instead, we verify that checkpointed backward produces the same
-    gradients as regular backward, proving the mechanism is correct
-    for when a proper allocator is added.
-
-    The key correctness property: run_backward_checkpointed produces
-    identical gradients to run_backward.
-
-    Args:
-        tape: The autograd tape with recorded operations.
-        loss_idx: The variable index of the scalar loss.
-        segments: List of CheckpointSegments covering the tape.
+    The current checkpoint API keeps all intermediates, so it provides
+    equivalent gradients and segment admission without claiming memory savings.
     """
-    # Seed loss gradient
-    tape.set_grad(loss_idx, 0, Float32(1.0))
-
-    if len(segments) == 0:
-        # Fall back to regular backward
-        _backward_all_entries(tape)
-        return
-
-    # Process segments in reverse order
-    var seg_idx = len(segments) - 1
-    while seg_idx >= 0:
-        var seg = segments[seg_idx].copy()
-        _backward_segment(tape, seg)
-        seg_idx -= 1
+    if len(segments) > 0:
+        var next_entry = 0
+        for i in range(len(segments)):
+            if segments[i].start_entry != next_entry or segments[i].end_entry < next_entry or segments[i].end_entry > tape.num_entries():
+                raise Error("Checkpoint segments must cover the tape in order")
+            next_entry = segments[i].end_entry
+        if next_entry != tape.num_entries():
+            raise Error("Checkpoint segments do not cover the whole tape")
+    run_backward(tape, loss_idx)
 
 
 def _backward_segment(mut tape: Tape, seg: CheckpointSegment):
@@ -245,10 +222,18 @@ def gradients_match(
     Returns:
         True if all gradient elements match within tolerance.
     """
+    if atol < 0 or not isfinite(atol):
+        return False
+    if var_idx < 0 or var_idx >= tape_a.num_variables() or var_idx >= tape_b.num_variables():
+        return False
+    if tape_a.var_shapes[var_idx] != tape_b.var_shapes[var_idx]:
+        return False
     var n = tape_a.var_numel(var_idx)
+    if n != tape_b.var_numel(var_idx):
+        return False
     for i in range(n):
         var ga = Float64(tape_a.get_grad(var_idx, i))
         var gb = Float64(tape_b.get_grad(var_idx, i))
-        if abs(ga - gb) > atol:
+        if not isfinite(ga) or not isfinite(gb) or abs(ga - gb) > atol:
             return False
     return True

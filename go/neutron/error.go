@@ -104,8 +104,21 @@ func (e *AppError) ToProblemDetail(instance string) ProblemDetail {
 	}
 	if errs, ok := e.Meta["errors"]; ok {
 		if ve, ok := errs.([]ValidationError); ok {
-			pd.Errors = ve
+			pd.Errors = append([]ValidationError(nil), ve...)
 		}
+	}
+	// Validation errors have their canonical top-level field; preserve
+	// all other extension keys without sharing the caller's map.
+	for key, value := range e.Meta {
+		if key == "errors" {
+			if _, ok := value.([]ValidationError); ok {
+				continue
+			}
+		}
+		if pd.Meta == nil {
+			pd.Meta = make(map[string]any)
+		}
+		pd.Meta[key] = value
 	}
 	return pd
 }

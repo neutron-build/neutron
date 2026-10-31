@@ -40,32 +40,11 @@ describe('friendlyError', () => {
   })
 })
 
-describe('RLS remediation', () => {
-  // The user hitting this denial has no path forward unless the notice shows
-  // the exact statements the engine accepts. Both are real Nucleus DDL:
-  // ALTER TABLE ... DISABLE ROW LEVEL SECURITY (executor/ddl.rs) and
-  // DROP POLICY (executor/policy.rs). No SHOW POLICIES surface exists, so the
-  // table/policy names are placeholders.
-  it('should show the exact SQL that restores specialty-store access', () => {
-    expect(RLS_FIX_SQL).toContain('ALTER TABLE <table> DISABLE ROW LEVEL SECURITY;')
-    expect(RLS_FIX_SQL).toContain('DROP POLICY <name> ON <table>;')
-  })
-
-  it('should tell the user how to find the names the other statements need', () => {
-    // The placeholders are useless without a way to resolve them. pg_policies
-    // is served from the live RLS engine (executor/mod.rs), so it lists every
-    // active policy and its table — the notice claimed no such surface existed.
-    expect(RLS_FIX_SQL).toContain('SELECT * FROM pg_policies;')
-    expect(RLS_EXPLANATION).toMatch(/pg_policies/)
-  })
-
-  it('should name the missing grant — superuser bypass, not a policy grant', () => {
-    expect(RLS_EXPLANATION).toMatch(/superuser/i)
+describe('RLS access guidance', () => {
+  it('offers policy inspection without presenting protection removal as an access fix', () => {
+    expect(RLS_FIX_SQL).toEqual(['SELECT * FROM pg_policies;'])
+    expect(RLS_EXPLANATION).toMatch(/security administrator/)
+    expect(RLS_EXPLANATION).toMatch(/removes row protections/)
     expect(RLS_EXPLANATION).toMatch(/no CREATE POLICY can open them/i)
-  })
-
-  it('should carry the fix SQL inside the toast-length explanation too', () => {
-    expect(RLS_EXPLANATION).toContain('ALTER TABLE <table> DISABLE ROW LEVEL SECURITY')
-    expect(RLS_EXPLANATION).toContain('DROP POLICY <name> ON <table>')
   })
 })

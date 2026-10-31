@@ -1,0 +1,20 @@
+{
+  "state": "source-prepared-unexecuted",
+  "package": "nucleusdb",
+  "version": "1.2.2",
+  "base": "fa9cc9bb56df51f34e255c63f94d3ce5b681cddd",
+  "criticalOperations": [
+    "Wal::open",
+    "Wal::log_page_write",
+    "Wal::log_commit",
+    "Wal::log_abort",
+    "Wal::sync",
+    "read_wal_records"
+  ],
+  "sources": {
+    "nucleus/Cargo.toml": "46bed5aa7f9351bc0e46038fbc08e713ea764bdef63ac46cdd9d16d78705e2bb",
+    "nucleus/src/storage/wal.rs": "e45e10d14eed61db2e1764fb85f4874679d6fc774a9c61956b25902de95b5f32",
+    "nucleus/src/storage/page.rs": "4aca792f854fd60df879a696b1ec62d3583490f3ff456f2ed8c8e151d1b10d9c",
+    "quint/conformance/src/production_wal_trace.rs": "feec21aee72235e5f3bbd80987842612d79ed9240797df0a1ae3e4c2e0a298dd"
+  }
+}

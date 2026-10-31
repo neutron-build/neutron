@@ -16,7 +16,7 @@ use crate::pool::{NucleusPool, PooledConn};
 /// Database handle extracted from handler parameters.
 ///
 /// Each call to `execute`, `query`, etc. acquires a connection from the pool,
-/// runs the statement, and returns the connection — no per-request connection
+/// runs arbitrary SQL, and discards the raw session lease — no per-request connection
 /// held open.  For multi-statement atomicity use [`Db::transaction`].
 ///
 /// **Registration** — add the pool to the router state once:
@@ -100,11 +100,21 @@ impl Db {
     /// returned [`NucleusTransaction`]; call `.commit()` or `.rollback()`.
     pub async fn transaction(&self) -> Result<NucleusTransaction, NucleusError> {
         let conn = self.pool.get().await?;
-        conn.client()
+        // Arm the transaction guard BEFORE sending BEGIN (RS-18): if the
+        // BEGIN await is cancelled (future dropped) or errors, `tx`'s Drop
+        // takes the client out of the pooled connection so it is discarded
+        // instead of recycled with an in-flight/open transaction. The old
+        // ordering constructed the guard only after BEGIN resolved, so a
+        // cancellation between the two recycled the connection through the
+        // ordinary `PooledConn::drop` and the next borrower unknowingly
+        // executed inside this transaction.
+        let tx = NucleusTransaction { conn, done: false };
+        tx.conn
+            .client()
             .execute("BEGIN", &[])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(NucleusTransaction { conn, done: false })
+        Ok(tx)
     }
 }
 
@@ -150,7 +160,7 @@ impl NucleusTransaction {
             .map_err(NucleusError::Query)
     }
 
-    /// Commit the transaction and return the connection to the pool.
+    /// Commit the transaction. The raw session lease is discarded on drop.
     pub async fn commit(mut self) -> Result<(), NucleusError> {
         self.conn
             .client()
@@ -161,7 +171,7 @@ impl NucleusTransaction {
         Ok(())
     }
 
-    /// Roll back the transaction and return the connection to the pool.
+    /// Roll back the transaction. The raw session lease is discarded on drop.
     pub async fn rollback(mut self) -> Result<(), NucleusError> {
         self.conn
             .client()
@@ -186,6 +196,130 @@ impl Drop for NucleusTransaction {
             );
             // Take the client out so pool::PooledConn::drop skips re-pooling.
             self.conn.client.take();
+        }
+    }
+}
+
+#[cfg(test)]
+mod begin_cancellation_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn startup(stream: &mut tokio::net::TcpStream) {
+        let mut len = stream.read_u32().await.unwrap() as usize;
+        if len == 8 {
+            let _ssl_request = stream.read_u32().await.unwrap();
+            stream.write_all(b"N").await.unwrap();
+            len = stream.read_u32().await.unwrap() as usize;
+        }
+        let mut bytes = vec![0; len - 4];
+        stream.read_exact(&mut bytes).await.unwrap();
+        // AuthenticationOk and ReadyForQuery (idle).
+        stream
+            .write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I")
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_in_flight_begin_discards_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen, began) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            startup(&mut first).await;
+            loop {
+                let tag = first.read_u8().await.unwrap();
+                let len = first.read_u32().await.unwrap() as usize;
+                let mut body = vec![0; len - 4];
+                first.read_exact(&mut body).await.unwrap();
+                if tag == b'P' && body.windows(5).any(|bytes| bytes == b"BEGIN") {
+                    break;
+                }
+            }
+            seen.send(()).unwrap();
+            // Leave BEGIN unresolved; a recycled first connection would avoid this accept.
+            let (mut second, _) = listener.accept().await.unwrap();
+            startup(&mut second).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let pool = NucleusPool::new(
+            crate::pool::NucleusConfig::new("127.0.0.1", port, "test")
+                .user("test")
+                .max_size(1)
+                .sslmode(crate::pool::SslMode::Disable),
+        );
+        let task_pool = pool.clone();
+        let transaction = tokio::spawn(async move { Db { pool: task_pool }.transaction().await });
+        tokio::time::timeout(Duration::from_secs(1), began)
+            .await
+            .unwrap()
+            .unwrap();
+        transaction.abort();
+        let _ = transaction.await;
+        let _connection = tokio::time::timeout(Duration::from_secs(1), pool.get())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_begin_and_set_success_and_cancellation_never_repool_session() {
+        for cancel in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (seen, received) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                startup(&mut first).await;
+                assert_eq!(first.read_u8().await.unwrap(), b'Q');
+                let len = first.read_u32().await.unwrap() as usize;
+                let mut sql = vec![0; len - 4];
+                first.read_exact(&mut sql).await.unwrap();
+                assert!(sql.windows(5).any(|w| w == b"BEGIN"));
+                assert!(sql.windows(3).any(|w| w == b"SET"));
+                seen.send(()).unwrap();
+                if !cancel {
+                    first
+                        .write_all(b"C\0\0\0\x0aBEGIN\0Z\0\0\0\x05T")
+                        .await
+                        .unwrap();
+                }
+                let (mut second, _) = listener.accept().await.unwrap();
+                startup(&mut second).await;
+            });
+            let pool = NucleusPool::new(
+                crate::pool::NucleusConfig::new("127.0.0.1", port, "test").max_size(1),
+            );
+            let pool2 = pool.clone();
+            let query = tokio::spawn(async move {
+                let conn = pool2.get().await.unwrap();
+                conn.raw_client_nonreusable()
+                    .batch_execute("BEGIN; SET application_name='raw-fixture'")
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), received)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                query.abort();
+                let _ = query.await;
+            } else {
+                query.await.unwrap().unwrap();
+            }
+            let _clean = tokio::time::timeout(Duration::from_secs(1), pool.get())
+                .await
+                .expect("raw session was reused")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 }

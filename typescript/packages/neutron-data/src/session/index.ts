@@ -8,6 +8,8 @@ export interface SessionRecord<T extends SessionData = SessionData> {
   data: T;
 }
 
+/** Unconditional application cache sessions, not the core revisioned SessionStore.
+ * No CAS/revocation protection; do not adapt by forwarding set/destroy. */
 export interface SessionStore {
   create<T extends SessionData = SessionData>(data?: T): Promise<SessionRecord<T>>;
   get<T extends SessionData = SessionData>(id: string): Promise<SessionRecord<T> | null>;

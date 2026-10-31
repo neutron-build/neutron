@@ -1,3 +1,4 @@
+import { useRequestOwner } from '../../lib/requestOwner'
 import { useSignal } from '@preact/signals'
 import { useEffect } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
@@ -30,11 +31,16 @@ export function FTSModule({ name }: FTSModuleProps) {
   const rlsDenied = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
+  const owner = useRequestOwner(JSON.stringify([conn.id, name]))
 
   useEffect(() => {
+    hits.value = []; totalDocs.value = null; rlsDenied.value = null; running.value = false
     async function loadCount() {
+      const owns = owner.begin('count')
+      if (!owns()) return
       try {
         const r = await api.query(`SELECT FTS_DOC_COUNT()`, conn.id)
+        if (!owns()) return
         if (r.error) {
           if (isRlsDenied(r.error)) rlsDenied.value = r.error
           return
@@ -43,9 +49,16 @@ export function FTSModule({ name }: FTSModuleProps) {
       } catch { /* non-critical */ }
     }
     loadCount()
-  }, [])
+  }, [conn.id, name])
+
+  function inputChanged() { owner.invalidate('query'); running.value = false; hits.value = [] }
 
   async function search() {
+    if (running.value) return
+    const current = owner.begin('query')
+    const setup = JSON.stringify([query.value, fuzzy.value, maxDistance.value, limit.value])
+    const owns = () => current() && setup === JSON.stringify([query.value, fuzzy.value, maxDistance.value, limit.value])
+    if (!owns()) return
     const q = query.value.trim()
     if (!q) return
     running.value = true
@@ -56,13 +69,15 @@ export function FTSModule({ name }: FTSModuleProps) {
         ? `SELECT FTS_FUZZY_SEARCH('${esc}', ${maxDistance.value}, ${limit.value})`
         : `SELECT FTS_SEARCH('${esc}', ${limit.value})`
       const r = await api.query(sql, conn.id)
-      if (r.error) throw new Error(r.error)
+      if (!owns()) return
+      if (r.error || r.canceled) throw new Error(r.error || 'Query canceled')
       const cell = r.rows.length > 0 ? r.rows[0][0] : null
       hits.value = parseHits(cell)
     } catch (err: unknown) {
+      if (!owns()) return
       toast('error', friendlyError(err instanceof Error ? err.message : String(err)))
     } finally {
-      running.value = false
+      if (current()) running.value = false
     }
   }
 
@@ -85,7 +100,7 @@ export function FTSModule({ name }: FTSModuleProps) {
           class={s.searchInput}
           placeholder="Search documents…"
           value={query.value}
-          onInput={e => { query.value = (e.target as HTMLInputElement).value }}
+          onInput={e => { inputChanged(); query.value = (e.target as HTMLInputElement).value }}
           onKeyDown={handleKey}
           autoFocus
         />
@@ -93,7 +108,7 @@ export function FTSModule({ name }: FTSModuleProps) {
           <input
             type="checkbox"
             checked={fuzzy.value}
-            onChange={() => { fuzzy.value = !fuzzy.value }}
+            onChange={() => { inputChanged(); fuzzy.value = !fuzzy.value }}
           />
           Fuzzy
         </label>
@@ -101,7 +116,7 @@ export function FTSModule({ name }: FTSModuleProps) {
           <select
             class={s.limitSelect}
             value={maxDistance.value}
-            onChange={e => { maxDistance.value = parseInt((e.target as HTMLSelectElement).value) }}
+            onChange={e => { inputChanged(); maxDistance.value = parseInt((e.target as HTMLSelectElement).value) }}
             title="Max edit distance"
           >
             <option value={1}>dist 1</option>
@@ -112,7 +127,7 @@ export function FTSModule({ name }: FTSModuleProps) {
         <select
           class={s.limitSelect}
           value={limit.value}
-          onChange={e => { limit.value = parseInt((e.target as HTMLSelectElement).value) }}
+          onChange={e => { inputChanged(); limit.value = parseInt((e.target as HTMLSelectElement).value) }}
         >
           <option value={10}>10</option>
           <option value={25}>25</option>

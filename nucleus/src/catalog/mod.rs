@@ -129,6 +129,13 @@ pub struct ColumnDef {
     /// data type stays `Text`; this is the typmod that a write is checked
     /// against (SQLSTATE 22001).
     pub max_len: Option<u32>,
+    /// Declared `numeric(p, s)` / `decimal(p, s)`. The column's data type stays
+    /// `Numeric`; this is the typmod every write and explicit cast is checked
+    /// against: rounded half away from zero to the scale, then refused with
+    /// SQLSTATE 22003 when the precision is exceeded. `None` for an
+    /// unconstrained `numeric`, and for every column recorded before typmods
+    /// existed.
+    pub numeric_typmod: Option<crate::types::NumericTypmod>,
 }
 
 /// How a column's value is produced by the engine instead of by the writer.
@@ -875,6 +882,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -885,6 +893,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
                 ColumnDef {
                     name: "active".into(),
@@ -895,6 +904,7 @@ mod tests {
                     analyzer: None,
                     generation: None,
                     max_len: None,
+                    numeric_typmod: None,
                 },
             ],
             constraints: vec![],
@@ -928,6 +938,7 @@ mod tests {
                 analyzer: None,
                 generation: None,
                 max_len: None,
+                numeric_typmod: None,
             }],
             constraints: vec![],
             append_only: false,
@@ -1053,6 +1064,7 @@ mod tests {
                 analyzer: None,
                 generation: None,
                 max_len: None,
+                numeric_typmod: None,
             }],
             constraints: vec![],
             append_only: false,
