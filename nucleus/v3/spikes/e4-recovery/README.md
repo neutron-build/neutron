@@ -496,7 +496,10 @@ MW 1,415 + 1,414 twins (1,360 passing)):
 X5-R6 beside the rule: 308 R6 rounds (MP 264 + MW 44), 5,668
 detected-loss comparisons (all MP).
 
-**1,560 failing seeds, in classes (the budget valve, X5-R12):**
+**1,560 failing seeds, in classes (the budget valve, X5-R12) —
+X5-R15 (c) correction: the failing-seed count is 1,598 once the
+seed-level `defect` seeds are included (the 150 NEVER-FIRED seeds of
+class 4 carry `defect`; 38 of them had all primary rounds passing),**
 deterministic repros — every line below is re-runnable from the
 committed file (`run --seeds N..N+1`):
 
@@ -531,10 +534,25 @@ committed file (`run --seeds N..N+1`):
    P measured).
 6. **Twins: 46 MP + 54 MW twin rounds fail** (the same store logic
    with no damage — classes 1–3 echo there).
+7. **X5-R15 (c) correction — every failing round belongs to a listed
+   class.** The a06e7ca4 list left out three groups, recorded here:
+   - **MP O-3 (a), served corruption: 9 rounds** (every one a Q14
+     meta-fault round; X5-R16's MP-A — escalated with per-round
+     evidence by X-5c-F2, never reclassified by a worker);
+   - **O-3 (c), XX001 with no damaged referenced slot: 25 MP and MW
+     rounds** (a detection the twin rule could not explain — F2's
+     C-XX-adjacent triage);
+   - **O-3 (c), "no twin (harness defect)": 19 rounds** — X5-R16's
+     NO-TWIN class, X-5c-F1's to fix.
 
 **Coverage quotas (verify's three exit conditions):** the seed set is
-exactly 0..9999 and the digests reproduce (verify's re-run checks
-them; the determinism pins hold), but **5 quotas miss**: Q4 0/1000
+exactly 0..9999, but **the digests did not reproduce** — verify's
+re-run found four non-reproducing seeds (180, 559, 7474, 8832; class 7
+below, X5-R14's subject; the determinism pins were **not** holding).
+The quota table below stands as computed from the committed file.
+**X5-R15 (c) correction of this paragraph's first record** (it claimed
+"the digests reproduce … the determinism pins hold" — false). **5
+quotas miss**: Q4 0/1000
 (no interrupted checkpoint has ≥1 split **and** ≥1 merge in the
 window), Q7 155/200 (DropTree-walk crashes), Q11 0/100 (no stale
 record ever read at a renamed segment's start), Q12 2/100 (G1 renames
@@ -1424,10 +1442,16 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (109 tests)
+cargo test -q --release -p e4-recovery      # the whole crate (139 tests)
 cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (9)
+cargo run -q --release -p e4-recovery --example pin   # the pinned CRC32C /
+                                                      # splitmix64 values (Work 0)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
   --results spikes/e4-recovery/results/campaign.json   # exits 2: no campaign
                                                        # exists (the X5-R6 guard)
 ```
+
+X5-R15 (e): `examples/` keeps only what this block uses (`pin.rs`;
+`dbg-seed.rs`, which 823d4f51 called scratch, is removed), and
+`restore_probe.local.py` (untracked) is not in the tree.
 
