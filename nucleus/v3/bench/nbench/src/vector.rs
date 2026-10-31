@@ -645,6 +645,14 @@ pub fn qdrant_index_tail(host: &str, port: u16, collection: &str) -> Result<()> 
             stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
         });
     }
+    // The response is evidence (a Qdrant "ok" acknowledgement carries
+    // result/status/time), so it lands in the run log, not just the
+    // exit code.
+    eprintln!(
+        "qdrant index tail (PATCH /collections/{collection}) -> {}: {}",
+        resp.status,
+        String::from_utf8_lossy(&resp.body)
+    );
     Ok(())
 }
 

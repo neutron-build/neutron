@@ -19,6 +19,11 @@ set -euo pipefail
 
 BIN=${NB_BIN:?NB_BIN not set}
 ROOT=${NB_HARNESS:?}
+# The release binary may live in a shared CARGO_TARGET_DIR outside the
+# harness tree, so the harness root must be explicit (the same export
+# remeasure.sh and reproduce.sh make).
+export NBENCH_ROOT="$ROOT"
+export PATH="${ROOT}/bin:$PATH"
 DATE=$(date -u +%F)
 WORK="$ROOT/work/$DATE/vector-sift1m-qdrant-smoke"
 RESULTS="$ROOT/results/smoke/$DATE/vector-sift1m-qdrant.smoke.json"
