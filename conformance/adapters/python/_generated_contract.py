@@ -16,6 +16,7 @@ STANDARD_ERRORS = [
     (401, "unauthorized", "Unauthorized", "/errors/unauthorized"),
     (403, "forbidden", "Forbidden", "/errors/forbidden"),
     (404, "not-found", "Not Found", "/errors/not-found"),
+    (405, "method-not-allowed", "Method Not Allowed", None),
     (409, "conflict", "Conflict", "/errors/conflict"),
     (422, "validation", "Validation Failed", None),
     (429, "rate-limited", "Rate Limited", "/errors/rate-limited"),
