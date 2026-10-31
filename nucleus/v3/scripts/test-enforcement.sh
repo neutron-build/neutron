@@ -961,6 +961,9 @@ expect_ok "runner refs: RF10 a failed snapshot raises and a failed check is a vi
 # RF11: R1 covers refs that existed before the run, not only new ones: an existing
 # card branch moved onto this run's commit (G-R1-CREATED-ONLY; RF4 only creates).
 expect_ok "runner refs: RF11 an existing card branch moved onto this run's commit is a violation" rf refs/heads/card/v3-ZZ 'git fetch -q . +card/v3-RF:card/v3-ZZ'
+# RF18: R1 is ancestry, not equality: a branch on a commit built on top of this
+# run's commit carries it too (G-R1-TIP-ONLY: every other R1 row sits on W itself).
+expect_ok "runner refs: RF18 a new branch on a descendant of this run's commit is a violation" rf refs/heads/card/v3-DESC 'git branch card/v3-DESC "$(git commit-tree "card/v3-RF^{tree}" -p card/v3-RF -m "nucleus v3: DESC on top")"'
 
 # --- runner end to end: main() against a fake opencode (X-6-F1-F1) ----------
 # The trust ledger (X-6-F1 F1), the gate's verdict between runs (F5) and killed-
