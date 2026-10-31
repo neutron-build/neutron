@@ -153,6 +153,73 @@ root=$(git -C "$r" rev-list --max-parents=0 nucleus/v3-scaffold)
 root_absent() { local o; o=$(git -C "$r" ls-tree --full-tree "$root" -- nucleus/v3/CORE_PATHS) && [ -z "$o" ]; }
 expect_ok "premise: ls-tree of the root commit lists no CORE_PATHS" root_absent
 expect_ok "check-core-paths: a base that predates CORE_PATHS uses the worktree's list" bash -c "cd '$v3' && bash scripts/check-core-paths.sh '$root' card/v3-B | grep -qxF 'CORE scripts/gate.sh (scripts/)'"
+# A base whose CORE_PATHS is not a regular file is refused (S-0-F2-F2-F1-F1-F1).
+# git stores a symlink as a blob holding the link text, so accepting any blob
+# would read "CORE_PATHS.real" as the CORE list and let an S verdict through on
+# scripts/. Built in copies of $r, like mb, so later scenarios see none of it.
+# cpcard DIR BASE ID GATEEXIT FILE...: in DIR, card/v3-ID off BASE with one
+# commit adding FILEs, then an otherwise valid S verdict with that Gate-exit.
+cpcard() {
+  local d=$1 b=$2 id=$3 ge=$4 f; shift 4
+  git -C "$d" checkout -q -b "card/v3-$id" "$b"
+  for f in "$@"; do mkdir -p "$(dirname "$d/$f")"; echo "$id" >"$d/$f"; done
+  git -C "$d" add -A && git -C "$d" commit -qm "nucleus v3: $id work"
+  printf 'Card: %s\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-10-31\nGate-exit: %s\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$id" "$ge" "$(git -C "$d" rev-parse --short HEAD)" >"$d/nucleus/v3/verdicts/$id.md"
+  git -C "$d" add -A && git -C "$d" commit -qm "nucleus v3: $id verdict MERGE"
+}
+# cpm DIR ID BASE HEAD: check_merge in the copy DIR, as cm_mb runs it.
+cpm() { (cd "$1/nucleus/v3" && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge "$2" "$3" "$4" audit); }
+# cpm_refused DIR ID BASE HEAD: check_merge fails and names the CORE_PATHS read.
+cpm_refused() { local o rc=0; o=$(cpm "$@" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "cannot read CORE_PATHS from $3" <<<"$o"; }
+# ccp_why DIR BASE HEAD WHY: ccp_refused, and the output also gives WHY.
+ccp_why() { local o rc=0; o=$(ccp_refused "$1" "$2" "$3") || rc=$?; echo "$o"; [ "$rc" -eq 0 ] && grep -qF -- "$4" <<<"$o"; }
+# cp_has WANT... -- CMD...: CMD exits non-zero and its output holds every WANT
+# (out_has, which is defined further down).
+cp_has() { local w=() o rc=0 x; while [ "$1" != -- ]; do w+=("$1"); shift; done; shift; o=$("$@" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] || return 1; for x in "${w[@]}"; do grep -qF -- "$x" <<<"$o" || { echo "missing: $x"; return 1; }; done; }
+# lstree_is DIR BASE PREFIX: BASE's CORE_PATHS entry starts with PREFIX.
+lstree_is() { local o; o=$(git -C "$1" ls-tree --full-tree "$2" -- nucleus/v3/CORE_PATHS) && [[ $o == "$3"* ]]; }
+# diff_lists DIR RANGE PATH...: git diff RANGE lists every PATH.
+diff_lists() { local o p; o=$(git -C "$1" diff --name-only "$2") || return 1; shift 2; for p in "$@"; do grep -qxF -- "$p" <<<"$o" || return 1; done; }
+
+sl=$t/sl
+cp -a "$r" "$sl"
+git -C "$sl" checkout -q -b sl-base nucleus/v3-scaffold
+git -C "$sl" mv nucleus/v3/CORE_PATHS nucleus/v3/CORE_PATHS.real
+ln -s CORE_PATHS.real "$sl/nucleus/v3/CORE_PATHS"
+git -C "$sl" add -A && git -C "$sl" commit -qm "nucleus v3: sl-base CORE_PATHS is a symlink"
+card SL S standard
+cpcard "$sl" sl-base SL "GATE EXIT=0" nucleus/v3/scripts/sl.sh
+# Off sl-base too: one more violation before the CORE read (Gate-exit) and one
+# after it (docs/), so a check_merge that stops at the failed read loses one.
+card SLX S standard
+cpcard "$sl" sl-base SLX "GATE EXIT=1" nucleus/v3/scripts/slx.sh nucleus/v3/docs/slx.md
+git -C "$sl" checkout -q nucleus/v3-scaffold
+expect_ok "premise: sl-base's CORE_PATHS is a symlink (ls-tree 120000 blob)" lstree_is "$sl" sl-base "120000 blob "
+expect_ok "premise: git diff sl-base...card/v3-SL lists scripts/sl.sh" diff_lists "$sl" sl-base...card/v3-SL nucleus/v3/scripts/sl.sh
+expect_ok "check-core-paths: a base whose CORE_PATHS is a symlink is refused" ccp_why "$sl/nucleus/v3" sl-base card/v3-SL "(mode 120000), not a regular file"
+expect_ok "check_merge: a base whose CORE_PATHS is a symlink is refused" cpm_refused "$sl" SL sl-base card/v3-SL
+
+# A directory at the path: the reason pin. Without the type check the tree id
+# still fails `cat-file blob`, so this row pins only the reason text.
+dr=$t/dr
+cp -a "$r" "$dr"
+git -C "$dr" checkout -q -b dr-base nucleus/v3-scaffold
+git -C "$dr" mv nucleus/v3/CORE_PATHS nucleus/v3/CORE_PATHS.list
+mkdir "$dr/nucleus/v3/CORE_PATHS"
+git -C "$dr" mv nucleus/v3/CORE_PATHS.list nucleus/v3/CORE_PATHS/list
+git -C "$dr" commit -qm "nucleus v3: dr-base CORE_PATHS is a directory"
+card DR S standard
+cpcard "$dr" dr-base DR "GATE EXIT=0" nucleus/v3/scripts/dr.sh
+git -C "$dr" checkout -q nucleus/v3-scaffold
+expect_ok "premise: dr-base's CORE_PATHS is a directory (ls-tree 040000 tree)" lstree_is "$dr" dr-base "040000 tree "
+expect_ok "check-core-paths: a base whose CORE_PATHS is a directory is refused as a tree" ccp_why "$dr/nucleus/v3" dr-base card/v3-DR "is a tree (mode 040000)"
+expect_ok "check_merge: a base whose CORE_PATHS is a directory is refused" cpm_refused "$dr" DR dr-base card/v3-DR
+
+# The failed read is one error among the others (S-0-F2-F2-F1-F1 Work 3).
+expect_ok "premise: git diff sl-base...card/v3-SLX lists scripts/slx.sh and docs/slx.md" diff_lists "$sl" sl-base...card/v3-SLX nucleus/v3/scripts/slx.sh nucleus/v3/docs/slx.md
+expect_ok "check_merge: a failed CORE_PATHS read still reports every other violation" cp_has \
+  "cannot read CORE_PATHS from sl-base" "Gate-exit is 'GATE EXIT=1', not 'GATE EXIT=0'" "nucleus/v3/docs/slx.md: docs/ changes need Class: spec and a P verdict" \
+  -- cpm "$sl" SLX sl-base card/v3-SLX
 
 card F S standard; branch F nucleus/v3/spikes/f.txt; verdict F S MERGE standard S "GATE EXIT=1"
 scratch; expect_no "Gate-exit GATE EXIT=1 is refused" mc F
