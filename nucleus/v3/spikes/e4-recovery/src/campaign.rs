@@ -69,10 +69,13 @@ fn usage() {
     );
 }
 
-/// Parse `--seeds A..B` (inclusive range).
-fn parse_seeds(args: &[String]) -> (u64, u64) {
+/// Parse `--seeds A..B` (X5-R13 (d): **half-open**, A ≤ seed < B, as in
+/// Rust and in the card — `0..10000` is 10,000 seeds, `0..500` is 500,
+/// `5..5` is empty). `default` is the exclusive upper bound when the
+/// flag is absent (the campaign's 10,000; the sweep's 500).
+fn parse_seeds(args: &[String], default: u64) -> (u64, u64) {
     let mut lo = 0u64;
-    let mut hi = CAMPAIGN_SEEDS - 1;
+    let mut hi = default;
     let mut i = 0usize;
     while i < args.len() {
         if args[i] == "--seeds"
@@ -85,6 +88,12 @@ fn parse_seeds(args: &[String]) -> (u64, u64) {
         i += 1;
     }
     (lo, hi)
+}
+
+/// The seed count of a half-open range `lo..hi` (X5-R13 (d)'s pin:
+/// `0..10000` is 10,000; `5..5` is 0, an error at the command level).
+pub fn seed_count(lo: u64, hi: u64) -> u64 {
+    hi.saturating_sub(lo)
 }
 
 fn parse_threads(args: &[String]) -> usize {
@@ -362,9 +371,10 @@ fn cmd_run(args: &[String]) -> i32 {
         eprintln!("e4-campaign run: --out is required");
         return 2;
     };
-    let (lo, hi) = parse_seeds(args);
+    let (lo, hi) = parse_seeds(args, CAMPAIGN_SEEDS);
     let threads = parse_threads(args);
-    if lo > hi {
+    // X5-R13 (d): the range is half-open; `5..5` is empty, an error.
+    if lo >= hi {
         eprintln!("e4-campaign run: empty seed range {lo}..{hi}");
         return 2;
     }
@@ -374,7 +384,7 @@ fn cmd_run(args: &[String]) -> i32 {
     // writes. `WatchRetire` retires it the moment the run completes
     // normally (a last-instant sample may not abort a finished run).
     let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
-    let dispatch = std::sync::Arc::new(Dispatch::new(hi - lo + 1));
+    let dispatch = std::sync::Arc::new(Dispatch::new(seed_count(lo, hi)));
     let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::new(PartialSink::Seeds {
@@ -409,8 +419,9 @@ impl Drop for WatchRetire {
     }
 }
 
-/// Run `lo..=hi` over `threads` workers. Each seed is independent
-/// (S-DET); the records come back sorted by seed.
+/// Run the half-open range `lo..hi` over `threads` workers (X5-R13
+/// (d)). Each seed is independent (S-DET); the records come back sorted
+/// by seed.
 pub fn run_range(lo: u64, hi: u64, mutant: Option<Mutant>, threads: usize) -> Vec<SeedRec> {
     let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -420,11 +431,12 @@ pub fn run_range(lo: u64, hi: u64, mutant: Option<Mutant>, threads: usize) -> Ve
     recs
 }
 
-/// The dispatch loop behind [`run_range`]: workers pull seeds from
-/// `lo..=hi`, push records into `shared`, and honor the watchdog's stop
-/// flag (X5-R13 (c): a tripped watchdog stops dispatch — no worker takes
-/// a new seed; the abort itself is the watchdog's). Progress lines print
-/// every 500 completions with the latest RSS sample, `rss=<MiB>`.
+/// The dispatch loop behind [`run_range`]: workers pull seeds from the
+/// half-open range `lo..hi` (X5-R13 (d)), push records into `shared`,
+/// and honor the watchdog's stop flag (X5-R13 (c): a tripped watchdog
+/// stops dispatch — no worker takes a new seed; the abort itself is the
+/// watchdog's). Progress lines print every 500 completions with the
+/// latest RSS sample, `rss=<MiB>`.
 pub fn run_range_into(
     shared: &std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>>,
     lo: u64,
@@ -435,7 +447,7 @@ pub fn run_range_into(
 ) {
     let next = AtomicU64::new(lo);
     let done = AtomicU64::new(0);
-    let total = hi - lo + 1;
+    let total = seed_count(lo, hi);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
@@ -450,7 +462,7 @@ pub fn run_range_into(
                         break;
                     }
                     let s = next.fetch_add(1, Ordering::SeqCst);
-                    if s > hi {
+                    if s >= hi {
                         break;
                     }
                     if let Some((_, d)) = watch {
@@ -588,7 +600,7 @@ fn cmd_verify(args: &[String]) -> i32 {
     run_range_into(
         &shared,
         0,
-        CAMPAIGN_SEEDS - 1,
+        CAMPAIGN_SEEDS,
         None,
         threads,
         Some((&watch, &dispatch)),
@@ -683,14 +695,20 @@ fn cmd_mutants(args: &[String]) -> i32 {
         eprintln!("e4-campaign mutants: --out is required");
         return 2;
     };
-    let (lo, hi) = parse_seeds(args);
+    let (lo, hi) = parse_seeds(args, MUTANT_SEEDS);
     let threads = parse_threads(args).max(4);
+    // X5-R13 (d): the range is half-open (`0..500` is 500 seeds, the
+    // card's sweep form); `5..5` is empty, an error.
+    if lo >= hi {
+        eprintln!("e4-campaign mutants: empty seed range {lo}..{hi}");
+        return 2;
+    }
     // X5-R13 (c): the watchdog rides with the whole sweep; its partial
     // sink holds the completed mutant records (each mutant's seed sweep
     // feeds the dispatch counters, so the abort line names the sweep in
     // flight when the trip came).
     let watch = std::sync::Arc::new(Watch::new(mem_limit_mib()));
-    let dispatch = std::sync::Arc::new(Dispatch::new(hi - lo + 1));
+    let dispatch = std::sync::Arc::new(Dispatch::new(seed_count(lo, hi)));
     let mut recs = Vec::new();
     let shared: std::sync::Arc<std::sync::Mutex<Vec<MutantRec>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1916,8 +1934,8 @@ mod tests {
         let dispatch = Dispatch::new(2);
         let shared: std::sync::Arc<std::sync::Mutex<Vec<SeedRec>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        run_range_into(&shared, 10, 11, None, 2, Some((&watch, &dispatch)));
-        let with_watch = run_range(10, 11, None, 2);
+        run_range_into(&shared, 10, 12, None, 2, Some((&watch, &dispatch)));
+        let with_watch = run_range(10, 12, None, 2);
         let mut got = shared.lock().map(|m| m.clone()).unwrap_or_default();
         got.sort_unstable_by_key(|r| r.seed);
         assert_eq!(got.len(), 2);
@@ -1950,5 +1968,40 @@ mod tests {
         for (a, b) in sorted_in.iter().zip(back.iter()) {
             assert_eq!(a.digest, b.digest, "seed {} digest", a.seed);
         }
+    }
+
+    /// X5-R13 (d)'s pins: `0..10000` is 10,000 seeds; `5..5` is empty,
+    /// which is an error at the command level; the sweep default is the
+    /// card's `0..500`; and the dispatch loop's bounds are half-open
+    /// (`run_range(0, 3)` runs exactly seeds 0, 1, 2).
+    #[test]
+    fn r13d_seed_range_is_half_open() {
+        let args: Vec<String> = ["--seeds", "0..10000"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (lo, hi) = parse_seeds(&args, CAMPAIGN_SEEDS);
+        assert_eq!((lo, hi), (0, CAMPAIGN_SEEDS));
+        assert_eq!(seed_count(lo, hi), 10_000, "0..10000 is 10,000 seeds");
+        let args: Vec<String> = ["--seeds", "5..5"].iter().map(|s| s.to_string()).collect();
+        let (lo, hi) = parse_seeds(&args, CAMPAIGN_SEEDS);
+        assert_eq!(seed_count(lo, hi), 0, "5..5 is empty");
+        // The command level rejects the empty range without running.
+        let run_args: Vec<String> = ["--seeds", "5..5", "--out", "/tmp/opencode/x5c-d-err.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(cmd_run(&run_args), 2, "the empty range is an error");
+        // The sweep's default is the card's 0..500.
+        let empty: Vec<String> = Vec::new();
+        let (lo, hi) = parse_seeds(&empty, MUTANT_SEEDS);
+        assert_eq!(seed_count(lo, hi), 500);
+        // The dispatch bounds are half-open end to end.
+        let recs = run_range(0, 3, None, 2);
+        assert_eq!(
+            recs.iter().map(|r| r.seed).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "run_range(0, 3) runs exactly three seeds"
+        );
     }
 }
