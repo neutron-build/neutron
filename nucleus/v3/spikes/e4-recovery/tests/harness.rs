@@ -633,3 +633,55 @@ fn r13a_no_script_op_probe_on_stderr() {
         "X5-R13 (a): a TEMP-PROBE marker is back in src/harness.rs"
     );
 }
+
+/// X5-R13 (b), the ruled directed pin — a literal config, not a seed
+/// number: a task that only yields and never parks (1,050,000 bounded
+/// `Yields`, comfortably past `YIELD_BUDGET` = 1,000,000 with no service
+/// tasks adding noise). The world crosses the budget mid-round; the
+/// scheduler fails it exactly as the deadlock path does, and the round
+/// records `livelock` (with the tripping site, the yielding task's own
+/// `h:yields`) and `deadlock`, never a pass. With the budget check
+/// removed (verified mutant-style, then reverted), the task completes
+/// all its yields, the round ends normally, `livelock` stays false and
+/// this test fails.
+#[test]
+fn r13b_livelock_budget_trips_and_folds_into_deadlock() {
+    let script = Script {
+        tasks: vec![ScriptTask {
+            ops: vec![ScriptOp::Yields(1_050_000)],
+        }],
+        writer: false,
+        evictor: false,
+        checkpointer_every: None,
+        crash: None,
+        nested: Vec::new(),
+    };
+    let (disk, st) = harness::create_store(cfg(None), 2099, 7).expect("create");
+    let out = harness::run_round(
+        2099,
+        0,
+        &script,
+        &round_faults(),
+        cfg(None),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        None,
+    );
+    assert!(out.livelock, "the round must record the livelock");
+    assert!(
+        out.deadlock,
+        "the livelock folds into the round's deadlock flag"
+    );
+    assert_eq!(
+        out.livelock_site, "h:yields",
+        "the tripping site is the yielding task's own yield point"
+    );
+    assert!(!out.pass, "a livelock is never a pass");
+    assert!(
+        out.sched_yields > e4_recovery::sim::YIELD_BUDGET,
+        "the trip happens past the budget (yields={})",
+        out.sched_yields
+    );
+}

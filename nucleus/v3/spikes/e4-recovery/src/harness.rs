@@ -214,6 +214,13 @@ pub struct HarnessState {
     pub force_ckpt: bool,
     /// A DEADLOCK was observed.
     pub deadlock: bool,
+    /// A livelock was observed (X5-R13 (b)): a world of this round
+    /// exceeded `YIELD_BUDGET`. Folded into `deadlock` — it counts in
+    /// `DEADLOCK=` and in the rule's n, and is recorded beside it with
+    /// its site.
+    pub livelock: bool,
+    /// The site of the yield that tripped the budget (X5-R13 (b)).
+    pub livelock_site: &'static str,
     /// A `SimFail::Baton` was observed.
     pub baton: bool,
     /// A task panicked.
@@ -788,6 +795,15 @@ pub fn run_script(sched: &Sched<RoundWorld>, script: &Script, seed: u64) {
     });
     let mut g = sched.lock();
     if deadlock {
+        g.h.deadlock = true;
+    }
+    // X5-R13 (b): a livelocked world (a task that kept yielding and never
+    // parked — the DEADLOCK detector's blind spot) is a recorded failure:
+    // the flag and its site land on the round, folded into `deadlock` so
+    // it counts in `DEADLOCK=` and in the rule's n, never as a pass.
+    if g.sched.livelock {
+        g.h.livelock = true;
+        g.h.livelock_site = g.sched.livelock_site;
         g.h.deadlock = true;
     }
     if panicked.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1393,6 +1409,11 @@ pub struct RoundOutcome {
     pub class: FaultClass,
     /// A DEADLOCK occurred.
     pub deadlock: bool,
+    /// A livelock occurred (X5-R13 (b)): some world of this round
+    /// exceeded `YIELD_BUDGET`; folded into `deadlock`.
+    pub livelock: bool,
+    /// The site of the yield that tripped the budget (X5-R13 (b)).
+    pub livelock_site: &'static str,
     /// A SimFail::Baton was observed (RoundOutcome).
     pub baton: bool,
     /// A task panicked.
@@ -1466,6 +1487,8 @@ impl Default for RoundOutcome {
             cut: 0,
             class: FaultClass::C,
             deadlock: false,
+            livelock: false,
+            livelock_site: "",
             baton: false,
             panicked: false,
             task_error: None,
@@ -1501,13 +1524,16 @@ impl RoundOutcome {
             self.pass
         ));
         s.push_str(&format!(
-            "|{:?}|{:?}|{}|{}|{}|{:?}",
+            "|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}",
             self.monitors,
             self.acked_lost,
             self.meta_rollback,
             self.deadlock,
+            self.livelock,
+            self.livelock_site,
+            self.task_error,
             self.baton,
-            self.task_error
+            self.panicked
         ));
         s.push_str(&format!(
             "|{:?}|{}|{:?}|{}|{:?}",
@@ -1746,6 +1772,8 @@ pub fn run_round(
                 g.h.baton,
                 g.h.panicked,
                 g.h.task_error.clone(),
+                g.h.livelock,
+                g.h.livelock_site,
             ),
             g.h.wal_commits.clone(),
             g.disk.events.clone(),
@@ -1758,6 +1786,11 @@ pub fn run_round(
         // defined; everything downstream of the crash is skipped.
         let mut outcome = RoundOutcome {
             class: faults.class,
+            deadlock: flags.0,
+            baton: flags.1,
+            panicked: flags.2,
+            livelock: flags.4,
+            livelock_site: flags.5,
             ..Default::default()
         };
         outcome.sched_yields = sched_yields_total;
@@ -1885,6 +1918,12 @@ pub fn run_round(
     };
     let mut nested_fired = 0u32;
     let mut recovery_disk = disk.clone();
+    // X5-R13 (b): recovery itself livelocked (its single-task world
+    // crossed `YIELD_BUDGET`) — recorded with the site, and the oracle is
+    // skipped for this round: recovery produced no opened image to
+    // compare, and an "XX001 at Open" would claim a detection that never
+    // happened. The round fails through the deadlock fold.
+    let mut recovery_livelock: Option<&'static str> = None;
     // Every exit of the loop below assigns this before it is read (the
     // Ok arm and the final Err arm both collect the attempt's reads);
     // the initializer only satisfies the borrow checker.
@@ -1957,6 +1996,15 @@ pub fn run_round(
                 nested_fired += 1;
                 let mut frng = Rng::new(derive(seed * 100 + 50 + nested_fired as u64, S_CRASH));
                 let mut g = world.lock();
+                if g.sched.livelock {
+                    // The "crash" was the livelock failing the world
+                    // (X5-R13 (b)); retrying would only re-livelock.
+                    // (The counter above is undone: no nested crash
+                    // fired.)
+                    nested_fired -= 1;
+                    recovery_livelock = Some(g.sched.livelock_site);
+                    break Err(Fail::Sim(SimFail::Livelock(g.sched.livelock_site)));
+                }
                 recovery_served.extend(g.disk.served.clone());
                 recovery_events = g.disk.events.clone();
                 let _ = g.disk.apply_crash(&mut frng, &faults.knobs);
@@ -1965,6 +2013,9 @@ pub fn run_round(
             }
             Err(e) => {
                 let g = world.lock();
+                if g.sched.livelock {
+                    recovery_livelock = Some(g.sched.livelock_site);
+                }
                 // The failed attempt's reads are the twin's too (the
                 // G7 clean shape: open **did** read both meta slots
                 // before failing — without this the twin under-reported
@@ -2017,10 +2068,40 @@ pub fn run_round(
         deadlock: flags.0,
         baton: flags.1,
         panicked: flags.2,
+        livelock: flags.4,
+        livelock_site: flags.5,
         task_error,
         ..Default::default()
     };
     match recovery {
+        Err(Fail::Sim(SimFail::Livelock(site))) if recovery_livelock.is_some() => {
+            // X5-R13 (b): recovery livelocked. There is no opened image
+            // to judge, so the oracle's checks are skipped wholesale
+            // (an "XX001 at Open" would claim a detection that never
+            // happened); the round fails through the deadlock fold, with
+            // the site recorded.
+            outcome.deadlock = true;
+            outcome.livelock = true;
+            outcome.livelock_site = site;
+            outcome.o1 = Err(format!("recovery livelock at {site}"));
+            outcome.pass = fold_pass(
+                false,
+                outcome.task_error.as_deref(),
+                true,
+                outcome.panicked,
+                outcome.baton,
+            );
+            outcome.lo = model.lower_bound(c_prev);
+            outcome.hi = model.upper_bound(outcome.lo);
+            outcome.cut = outcome.lo;
+            outcome.crashed_disk = disk.clone();
+            outcome.end_disk = disk.clone();
+            {
+                let mut m = clone_model(&model);
+                m.truncate(outcome.cut);
+                outcome.end_model = m;
+            }
+        }
         Ok((st, frontier, end_disk)) => {
             let (opened_meta, _opened_xx) = read_opened_meta(&end_disk);
             let opened_t = opened_meta.as_ref().map(|m| m.t).unwrap_or(0);

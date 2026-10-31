@@ -593,6 +593,12 @@ pub struct RoundRec {
     pub pass: bool,
     /// Per-seed failure flags.
     pub deadlock: bool,
+    /// A livelock occurred (X5-R13 (b)): some world of the round
+    /// exceeded `YIELD_BUDGET`. Folded into `deadlock` (it counts in
+    /// `DEADLOCK=` and the rule's n) and recorded beside it.
+    pub livelock: bool,
+    /// The site of the yield that tripped the budget (X5-R13 (b)).
+    pub livelock_site: String,
     /// A task panicked.
     pub panic: bool,
     /// An S-BATON violation was observed.
@@ -708,7 +714,7 @@ impl SeedRec {
         );
         for r in &self.rounds {
             s.push_str(&format!(
-                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.crash,
                 r.fired,
                 r.nested,
@@ -731,6 +737,8 @@ impl SeedRec {
                 r.client_xx001,
                 r.pass,
                 r.deadlock,
+                r.livelock,
+                r.livelock_site.as_str(),
                 r.task_error.is_some(),
                 (r.q4_split_merge as u8)
                     + 2 * (r.q5_open as u8)
@@ -1052,6 +1060,8 @@ fn round_rec(
     rr.r_len = out.rollback_slots.len();
     rr.pass = out.pass;
     rr.deadlock = out.deadlock;
+    rr.livelock = out.livelock;
+    rr.livelock_site = out.livelock_site.to_owned();
     rr.panic = out.panicked;
     rr.baton = out.baton;
     rr.task_error = out.task_error.clone();

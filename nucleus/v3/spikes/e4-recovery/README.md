@@ -1,14 +1,15 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c — X5-R10 and X5-R11 (a)-(f) landed with their pins,
-the 16-seed smoke shows all 16 seeds passing; the rulings X5-R6-R12 are
-recorded verbatim below (committed before the first campaign run, per
-X5-R8); X5-R13 (a) landed (the TEMP-PROBE stderr line is gone, and the
-ruling is recorded verbatim below in the same commit, before the next
-`run`); (b)-(d), the 10k campaign, `verify` and the mutant sweep follow
-in this attempt.** The stages before it (X-5a, X-5b) are complete and
-merged. Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and
-X5-R9's sim fix).
+Status: **stage X-5c — X5-R13 (a) and (b) landed (`YIELD_BUDGET` =
+1,000,000, the trip failing the world exactly as the deadlock path
+does, `SimFail::Livelock` naming the site, folded into the round and
+seed `deadlock` flags, in `campaign.json` and the digest; the directed
+pin `r13b_livelock_budget_trips_and_folds_into_deadlock`, verified
+mutant-style); X5-R13 is recorded verbatim below; (c) and (d), the
+10k campaign, `verify` and the mutant sweep follow in this attempt.**
+The stages before it (X-5a, X-5b) are complete and merged.
+Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
+fix).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 

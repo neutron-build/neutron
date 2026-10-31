@@ -17,6 +17,13 @@
 //!   receives [`SimFail::Crashed`] at its next yield and unwinds. `DEADLOCK`
 //!   (all tasks blocked) and `PANIC` (a task unwound by panic) are per-seed
 //!   failures, never passes (card 1.2).
+//! - S-LIVE (X5-R13 (b)): a world whose yield count exceeds
+//!   [`YIELD_BUDGET`] is livelocked — a task that keeps yielding and never
+//!   parks can never trip the deadlock detector. The scheduler fails the
+//!   world exactly as the deadlock path does and returns
+//!   [`SimFail::Livelock`] naming the tripping site; the harness records it
+//!   on the round, folded into the `deadlock` flags. A hang is never a
+//!   pass, and never a hang.
 //!
 //! The `nucleus-env` SimEnv (cards A-1a/A-1b) had not merged when this card
 //! launched, so per the card's "Substrate" clause this module is the
@@ -34,5 +41,6 @@ pub use disk::{
 };
 pub use env::{E4Env, EnvRef, FileId, HasDisk, PAGE_FILE, ROOT_DIR, WAL_DIR};
 pub use sched::{
-    HARNESS, Sched, SchedCore, SchedHost, SimFail, TaskId, WaitKey, WorldGuard, world_held_by_me,
+    HARNESS, Sched, SchedCore, SchedHost, SimFail, TaskId, WaitKey, WorldGuard, YIELD_BUDGET,
+    world_held_by_me,
 };

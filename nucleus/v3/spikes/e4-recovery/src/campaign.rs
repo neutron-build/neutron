@@ -175,6 +175,15 @@ pub fn run_range(lo: u64, hi: u64, mutant: Option<Mutant>, threads: usize) -> Ve
     recs
 }
 
+/// The livelock count inside `DEADLOCK` (X5-R13's RESULT item 2): seeds
+/// with at least one livelocked round (every one of them also carries
+/// the seed `deadlock` flag, so the counts nest by construction).
+pub fn livelock_seeds(recs: &[SeedRec]) -> u64 {
+    recs.iter()
+        .filter(|r| r.rounds.iter().any(|x| x.livelock))
+        .count() as u64
+}
+
 /// The final summary line (Work 7): counts over the 10,000 primary seeds.
 pub fn final_line(recs: &[SeedRec]) -> String {
     let mut o1 = 0u64;
@@ -872,7 +881,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -899,6 +908,8 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.client_xx001,
                 x.pass,
                 x.deadlock,
+                x.livelock,
+                esc(&x.livelock_site),
                 x.panic,
                 x.baton,
                 x.task_error.is_some(),
@@ -1315,6 +1326,8 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "cxx" => x.client_xx001 = j.int()? as u32,
             "pass" => x.pass = j.boolv()?,
             "dl" => x.deadlock = j.boolv()?,
+            "ll" => x.livelock = j.boolv()?,
+            "lls" => x.livelock_site = j.string()?,
             "pa" => x.panic = j.boolv()?,
             "bt" => x.baton = j.boolv()?,
             "terr" => {
