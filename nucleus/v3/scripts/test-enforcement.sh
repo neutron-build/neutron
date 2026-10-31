@@ -898,6 +898,51 @@ git -C "$r" config --unset core.fsmonitor; git -C "$r" checkout -q -- nucleus/v3
 expect_ok "git state: R6's hook is gone" no_state
 expect_ok "runner: control: a clean branch names no git state" gs nucleus/v3-scaffold - none
 
+# GIT_CONFIG_PARAMETERS (X-6-F1-F2-F2): a caller's -c, inherited by children,
+# applies after the GIT_CONFIG_COUNT entries on this git, so an inherited
+# -c core.fsmonitor=<hook> beats the environment's core.fsmonitor=false. The
+# refusal is its only layer, by decision: its read keeps the variable and names
+# the hook at command-line scope. $xcp is set for the one command under test,
+# never exported (XP below exports it around one run); $t/fsm is R6's hook.
+xcp="'core.fsmonitor'='$t/fsm'"
+cp_beats() { local v; v=$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false GIT_CONFIG_PARAMETERS=$xcp git -C "$r" config core.fsmonitor); echo "$v"; [ "$v" = "$t/fsm" ]; }
+expect_ok "premise: GIT_CONFIG_PARAMETERS beats GIT_CONFIG_COUNT on this git" cp_beats
+cp_refuse() { local o rc=0; o=$(cd "$v3" && GIT_CONFIG_PARAMETERS=$xcp bash -c '. scripts/git-env.sh; git_state_refuse' 2>&1) || rc=$?; echo "$o"; echo "exit $rc"; [ "$rc" -eq 1 ] && grep -qF -- "core.fsmonitor is '$t/fsm' (command line:" <<<"$o"; }
+expect_ok "git-env.sh: an inherited -c core.fsmonitor hook is refused, at command-line scope" cp_refuse
+cp_audit() { (cd "$v3" && GIT_CONFIG_PARAMETERS=$xcp bash scripts/audit-merges.sh nucleus/v3-scaffold); }
+expect_ok "audit: fails on an inherited -c core.fsmonitor hook" out_has "audit: core.fsmonitor is '$t/fsm'" -- cp_audit
+cp_py() { GIT_CONFIG_PARAMETERS=$xcp PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$t/fsm" <<'P'
+import importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+probs = rc.git_state_problems(pathlib.Path(sys.argv[2]))
+print(os.environ.get("GIT_CONFIG_PARAMETERS"), probs)
+sys.exit(0 if any(f"core.fsmonitor is '{sys.argv[3]}' (command line:" in p for p in probs) else 1)
+P
+}
+expect_ok "runner: an inherited -c core.fsmonitor hook is named, at command-line scope" cp_py
+
+# GIT_REPLACE_REF_BASE (X-6-F1-F2-F2): R1 with the replacement under another
+# base, refs/alt/, which the refusal (refs/replace/) does not list. The
+# environment is its only layer, by decision: GIT_NO_REPLACE_OBJECTS disables
+# replacement whatever the base, so the hidden file is still listed. The
+# variable is set per command; without it refs/alt/ does nothing.
+git -C "$r" checkout -q -B card/v3-GRB nucleus/v3-scaffold
+echo x >"$v3/tools/grb.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: GRB work"
+grbx=$(git -C "$r" rev-parse HEAD)
+git -C "$r" update-ref "refs/alt/$grbx" "$(git -C "$r" commit-tree "$grbx^^{tree}" -p "$grbx^" -m "nucleus v3: GRB work")"
+GIT_REPLACE_REF_BASE=refs/alt/ plain reset -q; rm -f "$v3/tools/grb.py"
+grb_hidden() { local d; d=$(GIT_REPLACE_REF_BASE=refs/alt/ plain diff --name-only nucleus/v3-scaffold...card/v3-GRB); echo "$d"; [ -z "$d" ]; }
+expect_ok "premise: GRB: plain diff under GIT_REPLACE_REF_BASE=refs/alt/ lists nothing" grb_hidden
+grb_inert() { local d; d=$(plain diff --name-only nucleus/v3-scaffold...card/v3-GRB); echo "$d"; [ "$d" = nucleus/v3/tools/grb.py ]; }
+expect_ok "premise: GRB: plain diff without the variable lists the file" grb_inert
+expect_ok "check-core-paths: under GIT_REPLACE_REF_BASE=refs/alt/ it still lists the hidden CORE file" bash -c "cd '$v3' && GIT_REPLACE_REF_BASE=refs/alt/ bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-GRB 2>/dev/null | grep -qxF 'CORE tools/grb.py (tools/)'"
+grb_gs() { GIT_REPLACE_REF_BASE=refs/alt/ gs nucleus/v3-scaffold nucleus/v3/tools/grb.py -; }
+expect_ok "runner: under GIT_REPLACE_REF_BASE=refs/alt/ the committed tools/ file is still protected" grb_gs
+git -C "$r" update-ref -d "refs/alt/$grbx"
+git -C "$r" checkout -q nucleus/v3-scaffold
+expect_ok "git state: GRB's refs/alt/ ref is gone" bash -c "[ -z \"\$(git -C '$r' for-each-ref refs/alt/)\" ]"
+expect_ok "git state: none after GRB" no_state
+
 # promote-pass reads its worktree: a skip-worktree-hidden dirty file stops the
 # push, after the gate, queue-check and the audit have run.
 git -C "$r" checkout -q -B scratch/pass5 nucleus/v3-scaffold
@@ -1304,6 +1349,15 @@ expect_ok "git state: XS's replace ref is gone" no_state
 e2e XV "gitenv work" --attempts 1
 expect_ok "runner e2e: V: opencode runs with replace refs, grafts and fsmonitor off" \
   res XV "open('$e/XV.n.env').read().split() == ['false', '1', '/dev/null'] and 'command\tcore.fsmonitor=false' in open('$e/XV.n.cfg').read().splitlines()"
+# P: an inherited -c core.fsmonitor hook (GIT_CONFIG_PARAMETERS, refuse-only;
+# X-6-F1-F2-F2) stops main() before attempt 1, naming it. Exported around this
+# one run, as K does E2E_SIGTERM_AFTER. (Not XCP: stray_commits matches card ids
+# by substring, and XC is a card here.)
+export GIT_CONFIG_PARAMETERS=$xcp
+e2e XP work --attempts 1
+unset GIT_CONFIG_PARAMETERS
+expect_ok "runner e2e: P: an inherited -c core.fsmonitor hook stops the run before attempt 1, naming it" \
+  res XP "rc == 1 and 'git state hides changes; not starting' in out and \"core.fsmonitor is '$t/fsm'\" in out and 'attempt 1:' not in out"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi

@@ -19,6 +19,23 @@
 # environment turns all three off (neutralise), and git_state_refuse names the
 # state (refuse): a branch carrying it is stopped and named, not just read
 # correctly. Nothing here clears the state; the operator decides.
+#
+# Two channels get one layer each, by decision (X-6-F1-F2-F2):
+# - GIT_CONFIG_PARAMETERS (a caller's `git -c`, inherited by children) applies
+#   after the GIT_CONFIG_COUNT entries on git 2.47.3, so an inherited
+#   -c core.fsmonitor=<hook> beats the core.fsmonitor=false below: refuse only.
+#   git_state_refuse's read keeps the variable and names the hook (origin
+#   "command line:"), and every entry point exits non-zero on it. It is not
+#   stripped: taking one key out of git's quoted format is a second parser, in
+#   bash and in Python, on the enforcement path, for a channel that already
+#   fails closed. It is not unset: that drops every caller -c silently and
+#   blinds the refusal, so a nested script could no longer name the hook. The
+#   index flags are refuse-only for the same kind of reason (verdict
+#   X-6-F1-F2, Ruling 2).
+# - GIT_REPLACE_REF_BASE puts replace refs outside refs/replace/, where the
+#   refusal does not look: neutralise only. GIT_NO_REPLACE_OBJECTS disables
+#   replacement whatever the base, and refs under another base do nothing for
+#   a git call without the variable, so the refusal is not extended to them.
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE=/dev/null
 
