@@ -440,7 +440,19 @@ pub fn commit_txn(
     let mode = if sync_on { Mode::SyncOn } else { Mode::SyncOff };
     cx.with("h:model", |c| {
         let h = c.h();
-        h.model.commit(ts, mode, ops.to_vec());
+        // X5-R10's harness guard: a commit ts the model already holds
+        // can only be a sequencer reissue (a recovery that restarted
+        // `next_ts` below its apply frontier). `Model::commit` would
+        // silently overwrite the held record and hide the collision —
+        // the seed-10 shape the ruling names; fail the round loudly
+        // instead (task_error fails the pass fold).
+        if h.model.commits.contains_key(&ts) {
+            if h.task_error.is_none() {
+                h.task_error = Some(format!("model commit at held ts {ts} (sequencer reissue)"));
+            }
+        } else {
+            h.model.commit(ts, mode, ops.to_vec());
+        }
         h.wal_commits.insert(ts, (sync_on, lsn, len));
         h.commits_done += 1;
         Ok(())

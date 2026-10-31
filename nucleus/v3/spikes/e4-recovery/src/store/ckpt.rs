@@ -1366,13 +1366,24 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
             _ => {}
         }
     }
-    // Advance visible_ts through contiguous applied commits.
+    // §14 (X5-R10): C-T0 restarts its sequencer from the **apply
+    // frontier** — "the largest replayed commit_ts … C-T0 v8 restarts
+    // its sequencer … from that value" — not from the contiguous
+    // visible_ts walk. A replay that applied a non-contiguous set (a
+    // bulk load's §10.1 S_L draw consumed a ts that carries no record;
+    // any WAL shape that replays around a hole) leaves the contiguous
+    // walk stranded below the frontier, and a next_ts below it reissues
+    // ts's the recovered store already holds (the seed-10 shape: T=3,
+    // replay {4,6,7}, next_ts 5 reused 5–7 while the model silently
+    // overwrote ts 6). Every replayed commit is durable in the
+    // recovered state, so visible_ts jumps to the frontier and the
+    // leftover applied set is cleared: post-recovery commits continue
+    // strictly above the frontier.
     cx.with("recover:visible", |c| {
         let st = c.store();
-        while st.seq.applied.remove(&(st.seq.visible_ts + 1)) {
-            st.seq.visible_ts += 1;
-        }
-        st.seq.next_ts = st.seq.visible_ts + 1;
+        st.seq.visible_ts = frontier;
+        st.seq.next_ts = frontier + 1;
+        st.seq.applied.clear();
         Ok(())
     })?;
     // G2: physical truncation before returning (and before any new

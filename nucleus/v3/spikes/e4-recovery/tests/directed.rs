@@ -1228,6 +1228,170 @@ fn d10b_rollback_exception() {
     );
 }
 
+/// X5-R10 (P ruling 2026-10-31, nv3-X-5c-esc-1): §14 — "the apply
+/// frontier is the largest replayed `commit_ts` … C-T0 v8 restarts its
+/// sequencer … from that value". The literal shape, a config not a seed
+/// number: the bulk load's §10.1 `S_L` draw consumes a commit ts that
+/// carries **no record** (ts 6 below), the publish commit (ts 7) is
+/// durable above the opened image's `T` (5 — the forced checkpoint's
+/// flip ran after the load's `CreateTree` at ts 5 was applied but
+/// before the publish), and recovery replays a non-contiguous set
+/// {7}. The draft advanced `visible_ts` only through contiguous
+/// replayed ts, stranding it at 5 with the frontier at 7: `next_ts`
+/// became 6, and the next round reissued ts's the recovered store
+/// already held (seed 10 round 1: the store held seven entries at ts 6,
+/// the model four — `Model::commit` had silently overwritten ts 6).
+///
+/// Pins: (1) the recovered store's sequencer restarts strictly above
+/// the frontier (`next_ts == frontier + 1`, `visible_ts == frontier`,
+/// no leftover `applied`); (2) the ruling's own form — a crash, then
+/// recovery, then a new commit whose ts must exceed the frontier (the
+/// round-1 chain makes three commits so a reissue at 6–7 also trips the
+/// harness guard); (3) the harness guard — a model commit at a ts the
+/// model already holds is a loud `task_error`, never a silent
+/// overwrite.
+#[test]
+fn r10_sequencer_restarts_at_the_frontier() {
+    let ops = vec![
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![
+                Op::CreateTree { tree: 2 },
+                Op::CreateTree { tree: CATALOG },
+                publish(2),
+            ],
+        },
+        // ts 2, 3, 4: three acked commits below the load.
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(1, 1)],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(2, 1)],
+        },
+        ScriptOp::Commit {
+            sync_on: true,
+            ops: vec![put(3, 1)],
+        },
+        // ts 5: the load's CreateTree; ts 6: the S_L draw — a ts with
+        // no commit record; ts 7: the publish commit. The forced
+        // checkpoint's flip takes T = visible_ts = 5 (the pre-marked
+        // S_L ts 6 lets the *live* contiguous walk pass through later,
+        // but recovery's replayed set is what rebuilds it).
+        ScriptOp::BulkLoad {
+            tree: 3,
+            entries: (0..20u64)
+                .map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 6]))
+                .collect(),
+        },
+        ScriptOp::Yields(3),
+    ];
+    let script = Script {
+        tasks: vec![ScriptTask { ops }],
+        writer: true,
+        evictor: false,
+        checkpointer_every: Some(1000),
+        crash: Some(CrashSpec::TaskYield(1, 6)),
+        nested: Vec::new(),
+    };
+    let base = run(2031, &script, &faults(FaultClass::C, knobs(0, 0)), None);
+    assert!(
+        base.pass && base.o1.is_ok(),
+        "R10 base: the round itself is sound (o1={:?}, o3={:?}, te={:?})",
+        base.o1,
+        base.o3_fail,
+        base.task_error
+    );
+    // The literal shape under test: T=5, the S_L hole at 6, the
+    // publish at 7 durable and replayed. (The opened meta is read from
+    // the crashed disk — the recovery input; `opened_t` on the outcome
+    // is the harness checkpoint's later meta.)
+    let (crashed_meta, _) = harness::read_opened_meta(&base.crashed_disk);
+    let crashed_t = crashed_meta.expect("R10: a valid meta at the crash").t;
+    assert_eq!(
+        crashed_t, 5,
+        "R10: the opened image's T must sit below the S_L draw (frontier={})",
+        base.frontier
+    );
+    assert_eq!(base.frontier, 7, "R10: the publish commit is the frontier");
+    let st = base
+        .end_store
+        .as_ref()
+        .expect("R10: recovery returned a store");
+    assert_eq!(
+        st.seq.next_ts,
+        base.frontier + 1,
+        "R10 pin 1: §14 — the sequencer restarts at the frontier + 1, never below it (visible={}, applied={:?})",
+        st.seq.visible_ts,
+        st.seq.applied
+    );
+    assert_eq!(
+        st.seq.visible_ts, base.frontier,
+        "R10 pin 1: visible_ts jumps to the apply frontier over the S_L hole"
+    );
+    assert!(
+        st.seq.applied.is_empty(),
+        "R10 pin 1: the leftover replayed set is cleared"
+    );
+    // The ruling's form: a crash (round 0 above), recovery, then a new
+    // commit whose ts must exceed the frontier. Three commits, so a
+    // reissue at 6–7 would also collide with a held model ts and trip
+    // the guard.
+    let r1 = {
+        let script2 = Script {
+            tasks: vec![ScriptTask {
+                ops: vec![
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![put(4, 9)],
+                    },
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![put(5, 9)],
+                    },
+                    ScriptOp::Commit {
+                        sync_on: true,
+                        ops: vec![put(6, 9)],
+                    },
+                    ScriptOp::Yields(1),
+                ],
+            }],
+            writer: true,
+            evictor: false,
+            checkpointer_every: Some(1000),
+            crash: Some(CrashSpec::TaskYield(1, 5)),
+            nested: Vec::new(),
+        };
+        harness::run_round(
+            2032,
+            1,
+            &script2,
+            &faults(FaultClass::C, knobs(0, 0)),
+            cfg(None),
+            base.end_disk.clone(),
+            base.end_store.clone().expect("R10 end store"),
+            &base.end_model,
+            base.cut,
+            None,
+        )
+    };
+    assert!(
+        r1.pass && r1.o1.is_ok() && r1.task_error.is_none(),
+        "R10 pin 2+3: the post-recovery commits continue above the frontier with no held-ts collision (o1={:?}, te={:?}, o3={:?})",
+        r1.o1,
+        r1.task_error,
+        r1.o3_fail
+    );
+    let new_ts = r1.end_model.commits.keys().copied().max();
+    assert_eq!(
+        new_ts,
+        Some(base.frontier + 3),
+        "R10 pin 2: the new commits' ts values must exceed the frontier ({}), never reissue below it",
+        base.frontier
+    );
+}
+
 /// D11 (publish): §12.8's ordering — the unlogged build, the forced
 /// checkpoint, then the publish commit; the crash lands right after the
 /// publish commit's ack. Clean: the loaded tree is whole at the cut
