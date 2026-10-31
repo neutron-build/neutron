@@ -540,6 +540,8 @@ bash_deny=(
   'git update-index --assume-unchanged x'
   'git config core.fsmonitor /tmp/x'
   'git branch -f card/v3-X HEAD~1'
+  # a flag before -f: only the " * " separator forms of the branch patterns deny it
+  'git branch -q -f card/v3-X HEAD~1'
   'git stash push'
   'git push origin HEAD'
   'rm -rf target'
@@ -570,9 +572,14 @@ bash_allow=(
   'git diff --stat HEAD~1'
   'git show HEAD --stat'
   'git commit -m "fix the tag parser"'
+  # the | is quoted, so this is one command; "|rm" is not "rm" after a space or "/"
+  'git commit -m "a|rm -rf b"'
 )
 for c in "${bash_deny[@]}"; do expect_ok "runner: bash deny $c" bp deny "$c"; done
 for c in "${bash_allow[@]}"; do expect_ok "runner: bash allow $c" bp allow "$c"; done
+# A bare rm is denied only because a trailing " *" is optional ("rm *"). It is
+# not in bash_deny, whose row name would be a prefix of the "rm -rf target" one.
+expect_ok "runner: bash deny a bare rm" bp deny rm
 git -C "$r" checkout -q -b card/v3-RS nucleus/v3-scaffold
 git -C "$r" mv nucleus/v3/docs/README.md nucleus/v3/spikes/moved.md && git -C "$r" commit -qm "nucleus v3: RS move"
 rs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
