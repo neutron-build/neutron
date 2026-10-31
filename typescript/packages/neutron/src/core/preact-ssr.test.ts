@@ -131,6 +131,10 @@ describe("resolvePreactSsr", () => {
     // prefix-join replacement), first entry wins.
     const matchAlias = (id: string): string | null => {
       for (const { find, replacement } of aliases) {
+        if (find instanceof RegExp) {
+          if (find.test(id)) return replacement;
+          continue;
+        }
         if (id === find || id.startsWith(find + "/")) {
           return replacement + id.slice(find.length);
         }
@@ -157,7 +161,9 @@ describe("resolvePreactSsr", () => {
     // unlisted react/* subpath joins a real directory instead of a
     // guaranteed ENOTDIR (`<compat.mjs>/<subpath>`).
     const compatRoot = preact.packageRoots["preact/compat"];
-    expect(matchAlias("react")).toBe(compatRoot);
+    // Bare `react` itself is Neutron's react-compat module: compat plus the
+    // React 19 APIs it lacks (`use`).
+    expect(matchAlias("react")).toMatch(/react-compat[\\/]index\.(ts|js)$/);
     expect(matchAlias("react-dom")).toBe(compatRoot);
     expect(fs.existsSync(path.join(compatRoot, "package.json"))).toBe(true);
     // The latent case the spike flagged: an unlisted react/* subpath.

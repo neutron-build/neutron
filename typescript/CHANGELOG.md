@@ -40,6 +40,21 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **React 19 `use()` under `runtime: "react-compat"`.** preact/compat
+  (10.29) has no `use`, so `import { use } from "react"` — how React 19 /
+  Next 15 pages read `params` and promises — failed with `use is not a
+  function`. Bare `react` now resolves to `@neutron-build/core/react-compat`:
+  preact/compat re-exported, plus `use` on the module and on the default
+  `React` object. A promise is tracked under React's thenable protocol
+  (`status`/`value`/`reason` on the promise): settled, it returns its value
+  or throws its reason; pending, it suspends to the nearest `<Suspense>`,
+  which re-renders when it settles — on the client and in streaming SSR,
+  where the resolved content streams into the document (non-streaming
+  `renderToString` cannot suspend). As in React, the promise must be the
+  same object across renders. A context is read with `useContext`, so —
+  unlike React — not conditionally. `react/*` subpaths and `react-dom` are
+  unchanged; `ViteAliasEntry.find` is now `string | RegExp` (the bare-`react`
+  entry is an exact match), and `mergePreactAliases`' flat map omits it.
 - **`<ServerIsland>` is usable from React-typed JSX — the component surface
   is fully JSX-agnostic.** The last residual named by the control-flow work:
   the server-side deferred-rendering island (exported from the package root,

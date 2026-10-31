@@ -1799,12 +1799,16 @@ export default function Layout({ children }) {
 }
 `,
       "src/routes/index.tsx": `
-import { useState, useMemo } from "react";
+import { useState, useMemo, use, createContext, Suspense } from "react";
 export const config = { mode: "app" };
 export async function loader() { return { n: 41 }; }
+const Tone = createContext("tone-default");
+const later = new Promise((resolve) => setTimeout(() => resolve("use-later"), 20));
+function Later() { return <i>{use(later)}</i>; }
+function ToneReader() { return <b>{use(Tone)}</b>; }
 export default function Home({ data }) {
   const [count] = useState(data.n + 1);
-  return <p>{useMemo(() => "hooks-count=" + count, [count])}</p>;
+  return <Tone.Provider value="use-context"><p>{useMemo(() => "hooks-count=" + count, [count])}</p><ToneReader /><Suspense fallback="wait"><Later /></Suspense></Tone.Provider>;
 }
 `,
       "src/routes/about.tsx": `
@@ -1877,6 +1881,10 @@ export async function resolve(specifier, context, next) {
       assert.equal(fs.readFileSync(probeLog, "utf-8"), "", "a Vite server was constructed");
       assert.equal(bundled.home.status, 200);
       assert.ok(bundled.home.body.includes("hooks-count=42"), bundled.home.body);
+      // React 19 use() from "react" (react-compat): a context, and a promise
+      // through Suspense in the streamed document.
+      assert.ok(bundled.home.body.includes("<b>use-context</b>"), bundled.home.body);
+      assert.ok(bundled.home.body.includes("<i>use-later</i>"), bundled.home.body);
       assert.ok(bundled.home.body.includes("layout-path=/<"), bundled.home.body);
       assert.equal(bundled.home.global, "ran");
       assert.equal(bundled.about.status, 200);

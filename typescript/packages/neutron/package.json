@@ -56,6 +56,10 @@
     "./runtime-edge": {
       "types": "./dist/runtime/edge.d.ts",
       "import": "./dist/runtime/edge.js"
+    },
+    "./react-compat": {
+      "types": "./dist/react-compat/index.d.ts",
+      "import": "./dist/react-compat/index.js"
     }
   },
   "files": [

@@ -161,6 +161,7 @@ Two coherent setups; mixing them per-file is fine (the pragma is per-module):
 | Tier | Status | Notes |
 | --- | --- | --- |
 | React component model (JSX, hooks, context, memo, refs) | Supported | Via `preact/compat` aliases. |
+| React 19 `use()` | Supported | `import { use } from "react"` resolves to Neutron's react-compat module (`@neutron-build/core/react-compat`): promises suspend to the nearest `<Suspense>` (client and streaming SSR), contexts read like `useContext` — so not conditionally. The promise must be the same object across renders. |
 | App routing/loaders/actions in Neutron | Supported | Same runtime APIs in both modes. |
 | Client navigation/forms/hydration | Supported | Covered by runtime-compat smoke lane. |
 | Common React libraries that depend on public React APIs | **Tested per package** | See the [compatibility matrix](./react-compat-matrix.md) — real packages, server-rendered, 28 of 29 currently render. |

@@ -322,11 +322,14 @@ describe("react-compat SSR through the Vite graph", () => {
       expect(jsxRuntime?.id).toBe(composed.preactSsr.paths["preact/jsx-runtime"]);
 
       const bareReact = await server.pluginContainer.resolveId("react");
-      // Bare react resolves INSIDE the preact/compat package (its entry via
-      // the compat package.json) — never to real react in node_modules.
-      const compatRoot = composed.preactSsr.packageRoots["preact/compat"];
-      expect(path.resolve(bareReact?.id ?? "")).toContain(path.resolve(compatRoot));
+      // Bare react resolves to Neutron's react-compat module (preact/compat
+      // plus `use`) — never to real react in node_modules.
+      expect(bareReact?.id ?? "").toMatch(/react-compat[\\/]index\.(ts|js)$/);
       expect(fs.existsSync(bareReact?.id ?? "")).toBe(true);
+      // react-dom still resolves INSIDE the preact/compat package.
+      const compatRoot = composed.preactSsr.packageRoots["preact/compat"];
+      const bareReactDom = await server.pluginContainer.resolveId("react-dom");
+      expect(path.resolve(bareReactDom?.id ?? "")).toContain(path.resolve(compatRoot));
     } finally {
       await server.close();
     }
@@ -638,6 +641,54 @@ describe("react-compat SSR through the Vite graph", () => {
       const html = await response.text();
       expect(html).toContain('data-hook="counter"');
       expect(html).toContain("count:7");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("start shape: React 19 use() reads contexts and suspends on promises in streaming SSR", async () => {
+    const root = makeHooksStartShapeApp();
+    fs.writeFileSync(
+      path.join(root, "src", "routes", "use.ts"),
+      [
+        'import { createElement, createContext, Suspense, use } from "react";',
+        "",
+        'export const config = { mode: "app" };',
+        "",
+        'const Theme = createContext("theme-default");',
+        "// Created once, as use() requires: the same promise across renders.",
+        'const later = new Promise((resolve) => setTimeout(() => resolve("resolved-later"), 30));',
+        'const settled = Object.assign(Promise.resolve("already"), { status: "fulfilled", value: "already" });',
+        "",
+        "function Later() {",
+        '  return createElement("span", { "data-use": "pending" }, "pending:" + use(later));',
+        "}",
+        "function Reader() {",
+        '  return createElement("span", { "data-use": "context" }, "context:" + use(Theme) + ";settled:" + use(settled));',
+        "}",
+        "export default function Page() {",
+        "  return createElement(Theme.Provider, { value: \"dark\" },",
+        "    createElement(Reader, null),",
+        '    createElement(Suspense, { fallback: createElement("i", null, "waiting") }, createElement(Later, null)));',
+        "}",
+        "",
+      ].join("\n")
+    );
+    const port = await getFreePort();
+    const server = await createNeutronServer({
+      mode: "ssr",
+      runtime: "react-compat",
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/use`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("context:dark;settled:already");
+      expect(html).toContain("pending:resolved-later");
     } finally {
       await server.close();
     }

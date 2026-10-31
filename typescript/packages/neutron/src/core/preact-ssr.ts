@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
  * Single physical Preact graph for Vite (client + SSR) and native SSG.
@@ -63,8 +63,20 @@ export interface PreactSsrResolution {
 }
 
 export interface ViteAliasEntry {
-  find: string;
+  find: string | RegExp;
   replacement: string;
+}
+
+/**
+ * Neutron's `react` for react-compat: preact/compat plus the React 19 APIs
+ * it lacks (`use`). Source layout under vitest, dist layout otherwise.
+ */
+function reactCompatModulePath(): string | null {
+  for (const candidate of ["../react-compat/index.js", "../react-compat/index.ts"]) {
+    const file = fileURLToPath(new URL(candidate, import.meta.url));
+    if (fs.existsSync(file)) return file;
+  }
+  return null;
 }
 
 const PREACT_IDS = [
@@ -236,9 +248,10 @@ export function vitePreactAliases(
   const entries: ViteAliasEntry[] = [];
   const used = new Set<string>();
 
-  const push = (find: string, replacement: string) => {
-    if (used.has(find)) return;
-    used.add(find);
+  const push = (find: string | RegExp, replacement: string) => {
+    const key = String(find);
+    if (used.has(key)) return;
+    used.add(key);
     entries.push({ find, replacement });
   };
 
@@ -255,6 +268,12 @@ export function vitePreactAliases(
   //    emits) is rewritten onto the bare entry's replacement and the client
   //    build fails with ENOTDIR for every react-compat app.
   if (runtimeAliases) {
+    // Exactly `react` (not `react/*`, which the prefix entries below map onto
+    // compat's own files) → Neutron's react-compat module, so React 19 APIs
+    // preact/compat lacks (`use`) import from "react". Its own
+    // `preact/compat` import is aliased like any other.
+    const reactCompat = runtimeAliases.react === "preact/compat" ? reactCompatModulePath() : null;
+    if (reactCompat) push(/^react$/, reactCompat);
     const runtimeEntries = Object.entries(runtimeAliases).sort(
       (a, b) => b[0].length - a[0].length
     );
@@ -311,7 +330,9 @@ export function mergePreactAliases(
   const ordered = vitePreactAliases(preact, runtimeAliases);
   const map: Record<string, string> = {};
   for (const { find, replacement } of ordered) {
-    map[find] = replacement;
+    // An exact-match (RegExp) entry has no flat-map form; the prefix entry
+    // for the same id still covers it.
+    if (typeof find === "string") map[find] = replacement;
   }
   return map;
 }

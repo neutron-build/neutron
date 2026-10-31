@@ -1301,7 +1301,7 @@ interface RuntimeBundleBuilderOptions {
   clientCssFiles: string[];
   routeCss: RouteCssManifest | null;
   userConfig: Record<string, any>;
-  runtimeAliases?: Array<{ find: string; replacement: string }> | Record<string, string>;
+  runtimeAliases?: Array<{ find: string | RegExp; replacement: string }> | Record<string, string>;
   /** `true` = process the whole dependency graph (react-compat). */
   runtimeNoExternal?: string[] | true;
 }
