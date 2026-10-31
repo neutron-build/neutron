@@ -344,6 +344,16 @@ All notable changes to this project are documented in this file.
   were sent by `start` and missing in dev. Dev now merges the route and layout
   `headers()` the way `start` does (Set-Cookie appended across the chain) onto
   both the HTML document and the data (JSON) response.
+- **`neutron-ts dev` attaches the server entry's WebSocket handler at
+  startup.** Dev created the `WebSocketServer` and called
+  `websocket.attach` only once an upgrade had passed `authorize`, while
+  `start` attaches at boot. An authorizer that depends on state `attach` sets
+  up refused every upgrade in dev (F-B6-1). Dev now loads
+  `src/server.entry.ts` and attaches its handler when the server starts
+  listening. After an edit to the entry or a module it imports, it closes the
+  old entry first (terminates its clients, closes its server, runs its
+  `close`) and then loads and attaches the new one, without waiting for a
+  request. A load failure is logged and surfaces again on the next request.
 
 - **`--preset docker` builds under pnpm and ships a self-contained context.**
   With pnpm-linked core and `resolve.preserveSymlinks`, the docker runtime

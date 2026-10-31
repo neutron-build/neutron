@@ -117,6 +117,17 @@ async function bootDev(root: string): Promise<string> {
   });
   await vite.listen();
   closers.push(() => vite.close());
+  // macOS FSEvents can report the fixture's own writes after the watcher
+  // starts; Vite then invalidates those modules (and dev reloads the entry),
+  // which would split the counter. Start once the watcher has been quiet.
+  let lastEvent = Date.now();
+  vite.watcher.on("all", () => {
+    lastEvent = Date.now();
+  });
+  const deadline = Date.now() + 5_000;
+  while (Date.now() - lastEvent < 500 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
   return `127.0.0.1:${port}`;
 }
 
@@ -159,5 +170,101 @@ describe("src/server.entry.ts shares the routes' module graph", () => {
 
   it("dev server: mount, route and websocket see one counter", { timeout: 30_000 }, async () => {
     await expectOneInstance(await bootDev(await writeFixture(".tmp-neutron-dev-server-entry-")));
+  });
+});
+
+/**
+ * F-B6-1: dev created the WebSocketServer and called `attach` only after the
+ * first upgrade had passed `authorize`, while createServer attaches at
+ * startup. An authorizer that depends on state `attach` sets up refused every
+ * upgrade in dev. Dev now attaches when the entry loads (at startup, and again
+ * after an edit, closing the previous entry first).
+ */
+const ATTACH_ENTRY = (key: string, greeting: string) => `
+const log = (globalThis[${JSON.stringify(key)}] ??= []);
+let ready = false;
+export default {
+  websocket: {
+    authorize: () => ready,
+    attach(wss) {
+      log.push("attach:${greeting}");
+      ready = true;
+      wss.on("connection", (ws) => ws.send("${greeting}"));
+    },
+  },
+  close() { log.push("close:${greeting}"); },
+};
+`;
+
+async function waitFor(check: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function writeAttachFixture(prefix: string, key: string): Promise<string> {
+  const root = await fs.mkdtemp(path.join(process.cwd(), prefix));
+  roots.push(root);
+  await fs.mkdir(path.join(root, "src", "routes"), { recursive: true });
+  await fs.writeFile(path.join(root, "src", "server.entry.ts"), ATTACH_ENTRY(key, "hi"), "utf-8");
+  return root;
+}
+
+async function wsOpen(host: string): Promise<{ socket: WebSocket; first: Promise<string>; closed: Promise<void> }> {
+  const socket = new WebSocket(`ws://${host}/x`);
+  const closed = new Promise<void>((resolve) => socket.addEventListener("close", () => resolve()));
+  const first = new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("no websocket message")), 10_000);
+    socket.onmessage = (event) => {
+      clearTimeout(timer);
+      resolve(String(event.data));
+    };
+    socket.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("websocket failed"));
+    };
+  });
+  return { socket, first, closed };
+}
+
+describe("src/server.entry.ts websocket: attach runs before authorize", () => {
+  it("createServer attaches at startup", { timeout: 30_000 }, async () => {
+    const key = "__neutronAttachStart";
+    const host = await bootViteFallback(await writeAttachFixture(".tmp-neutron-attach-start-", key));
+    const log = (globalThis as Record<string, unknown>)[key] as string[];
+    expect(log).toEqual(["attach:hi"]);
+    const { socket, first } = await wsOpen(host);
+    expect(await first).toBe("hi");
+    socket.close();
+  });
+
+  it("dev attaches at startup and re-attaches after an edit", { timeout: 60_000 }, async () => {
+    const key = "__neutronAttachDev";
+    const root = await writeAttachFixture(".tmp-neutron-attach-dev-", key);
+    const host = await bootDev(root);
+    const log = () => ((globalThis as Record<string, unknown>)[key] as string[] | undefined) ?? [];
+    // No request or upgrade yet: the server start alone attached the handler.
+    // (A late FSEvents report of the fixture's writes may reload it once
+    // more, which appends close:hi, attach:hi.)
+    await waitFor(() => log().length > 0, "attach at startup");
+    expect(log()[0]).toBe("attach:hi");
+    expect(log().at(-1)).toBe("attach:hi");
+
+    const first = await wsOpen(host);
+    expect(await first.first).toBe("hi");
+
+    // An edit replaces the entry without a request: the old one's clients and
+    // close() go first, then the new handler attaches.
+    const before = log().length;
+    await fs.writeFile(path.join(root, "src", "server.entry.ts"), ATTACH_ENTRY(key, "hi2"), "utf-8");
+    await waitFor(() => log().includes("attach:hi2"), "re-attach after edit");
+    expect(log().slice(before)).toEqual(["close:hi", "attach:hi2"]);
+    await first.closed;
+
+    const second = await wsOpen(host);
+    expect(await second.first).toBe("hi2");
+    second.socket.close();
   });
 });

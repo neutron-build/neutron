@@ -390,6 +390,22 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       server.httpServer?.on("close", () => {
         void serverEntryState.close();
       });
+      // src/server.entry.ts is loaded (and its WebSocket handler attached)
+      // when the server starts, as start does, and again after an edit,
+      // not on the first request that needs it.
+      const loadServerEntry = () => {
+        serverEntryState.load().catch((error) => {
+          console.error("[neutron] Failed to load src/server.entry.ts:", error);
+        });
+      };
+      server.httpServer?.once("listening", loadServerEntry);
+      let serverEntryReload: ReturnType<typeof setTimeout> | undefined;
+      server.watcher.on("all", (event) => {
+        if (event !== "change" && event !== "add" && event !== "unlink") return;
+        // After Vite has invalidated the module graph for this event.
+        clearTimeout(serverEntryReload);
+        serverEntryReload = setTimeout(loadServerEntry, 50);
+      });
 
       server.middlewares.use(async (req, res, next) => {
         const requestStartMs = performance.now();
@@ -1436,22 +1452,41 @@ function createDevServerEntryState(
     mod: unknown;
     entry: NeutronServerEntry;
     mounts: Array<{ prefix: string; mount: DevMount }>;
-    wss?: Promise<WebSocketServer>;
+    wss?: WebSocketServer;
   }
   let current: EntryState | null = null;
   let loading: Promise<EntryState | null> | null = null;
+  // Set on shutdown: a reload scheduled by the watcher must not rebuild it.
+  let closed = false;
 
   const retire = async (previous: EntryState | null): Promise<void> => {
     if (!previous) return;
     if (previous.wss) {
-      const wss = await previous.wss;
+      const wss = previous.wss;
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
     }
     await previous.entry.close?.();
   };
 
+  // As in production, `attach` runs when the entry is loaded, before any
+  // upgrade reaches `authorize`.
+  const attach = async (entry: NeutronServerEntry): Promise<WebSocketServer | undefined> => {
+    if (!entry.websocket) return undefined;
+    const { WebSocketServer: WSServer } = await import("ws");
+    const wss = new WSServer({ noServer: true });
+    try {
+      await entry.websocket.attach(wss);
+    } catch (error) {
+      wss.close();
+      await entry.close?.();
+      throw error;
+    }
+    return wss;
+  };
+
   const load = async (): Promise<EntryState | null> => {
+    if (closed) return null;
     const file = findServerEntryFile(rootDir);
     if (!file) {
       const previous = current;
@@ -1474,9 +1509,19 @@ function createDevServerEntryState(
       );
       return { prefix: prefix.replace(/\/+$/, "") || "/", mount: { globalMiddleware, dispatcher } };
     });
+    // The previous entry goes first (its clients, its server, its close()),
+    // so the two never hold resources at the same time.
     const previous = current;
-    current = { mod, entry, mounts };
+    current = null;
     await retire(previous);
+    const wss = await attach(entry);
+    current = { mod, entry, mounts, wss };
+    if (closed) {
+      const late = current;
+      current = null;
+      await retire(late);
+      return null;
+    }
     return current;
   };
 
@@ -1489,6 +1534,11 @@ function createDevServerEntryState(
   };
 
   return {
+    /** Load (or reload after an edit) the entry now; a no-op while it is unchanged. */
+    async load(): Promise<void> {
+      await resolve();
+    },
+
     async match(pathname: string): Promise<DevMount | null> {
       const state = await resolve();
       if (!state) return null;
@@ -1540,13 +1590,11 @@ function createDevServerEntryState(
             return;
           }
         }
-        state.wss ??= (async () => {
-          const { WebSocketServer: WSServer } = await import("ws");
-          const wss = new WSServer({ noServer: true });
-          await options.attach(wss);
-          return wss;
-        })();
-        const wss = await state.wss;
+        const wss = state.wss;
+        if (!wss || socket.destroyed) {
+          socket.destroy();
+          return;
+        }
         wss.handleUpgrade(req, socket, head, (ws) => {
           wss.emit("connection", ws, req);
         });
@@ -1554,6 +1602,9 @@ function createDevServerEntryState(
     },
 
     async close(): Promise<void> {
+      closed = true;
+      // An in-flight load finishes first (it retires what it built).
+      await loading?.catch(() => undefined);
       const previous = current;
       current = null;
       await retire(previous);
