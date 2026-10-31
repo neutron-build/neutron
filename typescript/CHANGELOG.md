@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [core 0.5.0, cli 0.5.0, create 0.1.11, auth 0.1.6, cache-redis 0.2.1, ops 0.1.5, otel 0.1.5, security 0.1.6] - 2026-10-31
+
+Upgrading from core/cli 0.4.x: read Breaking first; each entry has a
+**Migration:** note on what an app must change. Upgrade `core`, `cli` and
+the packages under Dependents in one step.
+
 ### Breaking
 
 - **`:name*` in `routes` rules matches zero or more segments**, as in Next.
@@ -45,6 +51,55 @@ All notable changes to this project are documented in this file.
   (`origin: "*"`, no credentials) if the old default is genuinely what you
   want. Security headers stay on by default (`securityHeaders: false` to opt
   out) and are unchanged by this flip.
+- **Default `Cross-Origin-Opener-Policy` is now `same-origin-allow-popups`**
+  (was `same-origin`). `same-origin` severs `window.opener` in popups a page
+  opens, which is the channel OAuth providers and payment sheets (Google/Apple
+  sign-in, PayPal, wallet popups) use to report back. Every app on the
+  defaults had those flows broken until it found and overrode the header.
+  `same-origin-allow-popups` keeps the protection COOP exists for: a
+  cross-origin page that opens yours gets no handle on it. What it gives up
+  is cross-origin isolation, which needs `Cross-Origin-Embedder-Policy` as
+  well and breaks third-party embeds, so it has to be configured where it is
+  needed anyway. **Migration:** an app that relied on cross-origin
+  isolation restores the old value with
+  `securityHeaders: { headers: { "Cross-Origin-Opener-Policy": "same-origin" } }`.
+  `X-Frame-Options: DENY` is unchanged: framing stays opt-in, and a CSP
+  `frame-ancestors` supersedes XFO in browsers that implement CSP 2. The new
+  "Security headers" section of the `neutron.config.ts` docs records both
+  decisions.
+- **Framework components return `AnyJsxElement | null` instead of `any`.**
+  `Form`, `Link`, `NavLink`, `ViewTransitions`, `ScrollReveal`, `Island`,
+  `Image`, `Picture`, `ServerIsland` and `Show`/`For`/`Switch`/`Match`/
+  `Index` declared `any` as their element return so React-typed JSX could
+  use them. The exported structural `AnyJsxElement` passes both runtimes'
+  JSX checks too (the `type-fixtures/react-*` compiles are unchanged and
+  still pass), so the declarations are typed again. Runtime output is
+  unchanged. **Migration:** code that assigned a component's return value to a
+  preact `VNode` needs a cast. `Await` stays `any`: it returns
+  `children(data)` as is, which can be a string or an array.
+- **The SSR server's default 404 is content-negotiated.** With no
+  application `not-found.tsx`, an unmatched path used to answer bare
+  `text/plain` "Not Found". HTML-preferring clients (`Accept: text/html`,
+  i.e. browsers) now get the same minimal HTML page `notFound()` serves;
+  every other client — `Accept: application/json`, `X-Neutron-Data`, no
+  preference, wildcard-only — gets the RFC 7807 `application/problem+json`
+  document in exactly the shape api mode serves (`No route matches <path>`).
+  An application `not-found.tsx` still answers for every client, and api
+  mode's JSON 404 is unchanged. FRAMEWORK_CONTRACT.md §2 states the
+  negotiation rule.
+  **Migration:** a client or test that matched the bare `Not Found` text
+  should check the status code, or the app should add a `not-found.tsx`.
+- **`PUBLIC_*` environment variables are inlined into client code.**
+  `PUBLIC_` was documented as the public prefix but nothing applied it; the
+  new `env.publicPrefixes` (default `["PUBLIC_"]`, see Added) does, so a
+  variable with that prefix now reaches browser bundles at build time.
+  **Migration:** rename any secret whose name starts with `PUBLIC_` before
+  building, or set `env.publicPrefixes` to the prefixes you mean.
+- **`ViteAliasEntry.find` is `string | RegExp`, and bare `react` resolves to
+  `@neutron-build/core/react-compat` under react-compat** (see the React 19
+  `use()` entry under Added). **Migration:** custom Vite setups that read
+  `find` as a string, or `mergePreactAliases`' flat map for a bare `react`
+  key, must handle the RegExp entry.
 
 ### Added
 
@@ -270,22 +325,6 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- **Default `Cross-Origin-Opener-Policy` is now `same-origin-allow-popups`**
-  (was `same-origin`). `same-origin` severs `window.opener` in popups a page
-  opens, which is the channel OAuth providers and payment sheets (Google/Apple
-  sign-in, PayPal, wallet popups) use to report back. Every app on the
-  defaults had those flows broken until it found and overrode the header.
-  `same-origin-allow-popups` keeps the protection COOP exists for: a
-  cross-origin page that opens yours gets no handle on it. What it gives up
-  is cross-origin isolation, which needs `Cross-Origin-Embedder-Policy` as
-  well and breaks third-party embeds, so it has to be configured where it is
-  needed anyway. Restore the old value with
-  `securityHeaders: { headers: { "Cross-Origin-Opener-Policy": "same-origin" } }`.
-  `X-Frame-Options: DENY` is unchanged: framing stays opt-in, and a CSP
-  `frame-ancestors` supersedes XFO in browsers that implement CSP 2. The new
-  "Security headers" section of the `neutron.config.ts` docs records both
-  decisions.
-
 - **`client="visible"` finds the island's boxed content.** core 0.4.1 made
   the `<neutron-island>` marker `display: contents` and observed the marker's
   child elements, hydrating at once when it had none. The runtime now
@@ -371,26 +410,6 @@ All notable changes to this project are documented in this file.
   kept as written (Next.js semantics); the query goes before any `#fragment`.
   Destinations without a query behave as before. Applies to `start`, `dev`,
   `preview` and the edge runtimes, which share the resolver.
-- **Framework components return `AnyJsxElement | null` instead of `any`.**
-  `Form`, `Link`, `NavLink`, `ViewTransitions`, `ScrollReveal`, `Island`,
-  `Image`, `Picture`, `ServerIsland` and `Show`/`For`/`Switch`/`Match`/
-  `Index` declared `any` as their element return so React-typed JSX could
-  use them. The exported structural `AnyJsxElement` passes both runtimes'
-  JSX checks too (the `type-fixtures/react-*` compiles are unchanged and
-  still pass), so the declarations are typed again. Runtime output is
-  unchanged. Code that assigned a component's return value to a preact
-  `VNode` needs a cast. `Await` stays `any`: it returns `children(data)` as
-  is, which can be a string or an array.
-- **The SSR server's default 404 is content-negotiated.** With no
-  application `not-found.tsx`, an unmatched path used to answer bare
-  `text/plain` "Not Found". HTML-preferring clients (`Accept: text/html`,
-  i.e. browsers) now get the same minimal HTML page `notFound()` serves;
-  every other client — `Accept: application/json`, `X-Neutron-Data`, no
-  preference, wildcard-only — gets the RFC 7807 `application/problem+json`
-  document in exactly the shape api mode serves (`No route matches <path>`).
-  An application `not-found.tsx` still answers for every client, and api
-  mode's JSON 404 is unchanged. FRAMEWORK_CONTRACT.md §2 states the
-  negotiation rule.
 
 ### Fixed
 
@@ -706,6 +725,16 @@ All notable changes to this project are documented in this file.
   space. The default 404, and the 404 for a static route missing from dist,
   now answer through global middleware like the static fast path already
   did; a response it returns (401, redirect) wins.
+
+### Dependents
+
+- `@neutron-build/auth` 0.1.6, `cache-redis` 0.2.1, `ops` 0.1.5, `otel` 0.1.5
+  and `security` 0.1.6 are republished unchanged except for their
+  `@neutron-build/core` dependency, now `^0.5.0`. Their previous versions
+  require `^0.3.0` / `^0.4.0`, which would install a second copy of core
+  next to 0.5.0. Upgrade them together with core.
+- `@neutron-build/create` 0.1.11 scaffolds external projects on
+  `@neutron-build/core` and `@neutron-build/cli` `^0.5.0`.
 
 ## [core 0.4.2] - 2026-10-30
 
