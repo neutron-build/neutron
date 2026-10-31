@@ -977,4 +977,287 @@ mod tests {
         assert_eq!(v.get("p50_ms").and_then(Value::as_f64), Some(480.0));
         assert_eq!(v.get("server_p50_ms").and_then(Value::as_f64), Some(470.0));
     }
+
+    // ---- card B-0-F7-F2: the search command's server-column glue ----
+    //
+    // Verdict B-0-F7 (39d72c2f) finding 4: three gate mutants inside
+    // `cmd_vec_qdrant_search` passed 113/113 — M1b-CMD-PUSH-ZERO (the
+    // command pushes 0 into the server column), O4-SERVER-P50-FROM-CLIENT
+    // (the server p50 is computed from the client column) and
+    // O7-SERVER-MS-UNIT (the server time is kept in seconds). The parse
+    // seam was tested (`vector::search_response_records_the_server_time_
+    // next_to_the_ids`), but the command glue between the parse and the
+    // metrics/CSV was not. These tests drive the REAL command against a
+    // scripted keep-alive HTTP server (the `keepalive_server` pattern
+    // from http.rs, private to that module's tests): the actual push
+    // site, the CSV write, the sorts and the percentiles are exercised.
+    // Test-only by design — no seam is extracted, no non-test code
+    // changes.
+
+    // `Write` for the socket comes from `use super::*` above; `Read`
+    // is not imported outside, so it is named here.
+    use std::io::Read as _;
+
+    /// A temp dir unique to one test (the `write_tmp` pattern from
+    /// vector.rs, which is private to that module): process id plus test
+    /// name, so the two command tests never share files.
+    fn cmd_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("nbench-tests").join(format!(
+            "{}-search-command-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        dir
+    }
+
+    /// fvecs bytes (dim:u32, then dim f32 per vector) — a copy of
+    /// vector.rs's private `fvec_bytes` test helper.
+    fn cmd_fvec_bytes(vectors: &[&[f32]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in vectors {
+            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for x in *v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    /// ivecs bytes (dim:u32, then dim i32 per row) — the ivecs twin of
+    /// [`cmd_fvec_bytes`].
+    fn cmd_ivec_bytes(rows: &[&[i32]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for r in rows {
+            b.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            for x in *r {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    /// Offset of the first `\r\n\r\n` (the end of an HTTP request head).
+    fn request_head_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+
+    /// The `Content-Length` of a request head (0 when the header is
+    /// absent, e.g. a bodyless GET).
+    fn request_content_length(head: &str) -> usize {
+        for line in head.split('\n') {
+            if let Some((k, v)) = line.trim_end().split_once(':')
+                && k.trim().eq_ignore_ascii_case("content-length")
+                && let Some(n) = v.trim().parse::<usize>().ok()
+            {
+                return n;
+            }
+        }
+        0
+    }
+
+    /// A scripted Qdrant search server for one command pass (card
+    /// B-0-F7-F2 Work 1): binds `127.0.0.1:0`, accepts exactly ONE
+    /// connection — the command's whole pass shares one socket, per the
+    /// keep-alive invariant `cmd_vec_qdrant_search` owns — and answers
+    /// `times_s.len()` Content-Length-framed responses on it. For each
+    /// entry it reads one full request (head, then `Content-Length`
+    /// bytes of body) and answers `200 OK` with the body
+    /// `{"result":[{"id":0,"score":0.0},… ids 0..=9 …],"status":"ok",
+    /// "time":<t>}` where `<t>` is the entry formatted with `{}`. The
+    /// times must be binary-exact (`0.0625`, `0.03125`, `0.125`), so
+    /// the seconds→ms conversion in the command is exact and the CSV
+    /// fields compare as strings.
+    ///
+    /// The join value is the number of requests served: a read error,
+    /// EOF or the 30 s read timeout returns the count so far, so a
+    /// failed pass fails the test instead of hanging it.
+    fn scripted_qdrant(times_s: Vec<f64>) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted server");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return 0;
+            };
+            conn.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("set read timeout");
+            let mut served = 0usize;
+            let mut pending: Vec<u8> = Vec::new();
+            for t in times_s {
+                // one full request: the head, then the body bytes
+                let (sep, body_len) = loop {
+                    if let Some(sep) = request_head_end(&pending) {
+                        let head = String::from_utf8_lossy(&pending[..sep]).to_string();
+                        let body_len = request_content_length(&head);
+                        if pending.len() >= sep + 4 + body_len {
+                            break (sep, body_len);
+                        }
+                    }
+                    let mut chunk = [0u8; 8192];
+                    match conn.read(&mut chunk) {
+                        Ok(0) | Err(_) => return served,
+                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                // consume this request; leftovers belong to the next one
+                pending.drain(..sep + 4 + body_len);
+                let hits = (0..10)
+                    .map(|id| format!("{{\"id\":{id},\"score\":0.0}}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let body = format!("{{\"result\":[{hits}],\"status\":\"ok\",\"time\":{t}}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                if conn.write_all(resp.as_bytes()).is_err() {
+                    return served;
+                }
+                served += 1;
+            }
+            served
+        });
+        (port, handle)
+    }
+
+    /// Run the real `cmd_vec_qdrant_search` against [`scripted_qdrant`]
+    /// with the card's inputs (card B-0-F7-F2 Work 2-3): 3 dim-2 query
+    /// vectors, truth rows of the ids 0..=9, `--limit 10`, and
+    /// `--pass-kind cold` — cold is exempt from the 10 ms p50 sanity
+    /// check, so a slow test host cannot flake the pass on the client
+    /// column. Returns (metrics path, latency CSV path, requests
+    /// served).
+    fn run_scripted_search_command(name: &str, times_s: Vec<f64>) -> (PathBuf, PathBuf, usize) {
+        let dir = cmd_test_dir(name);
+        let query = dir.join("query.fvecs");
+        let truth = dir.join("truth.ivecs");
+        let metrics = dir.join("metrics.json");
+        let latency = dir.join("latency.csv");
+        std::fs::write(
+            &query,
+            cmd_fvec_bytes(&[&[1.0, 2.0], &[3.0, 4.0], &[5.0, 6.0]]),
+        )
+        .expect("write query.fvecs");
+        let ids: Vec<i32> = (0..10).collect();
+        std::fs::write(&truth, cmd_ivec_bytes(&[&ids, &ids, &ids])).expect("write truth.ivecs");
+        let (port, server) = scripted_qdrant(times_s);
+        let up = |p: &std::path::Path| p.to_str().expect("temp paths are utf-8").to_string();
+        let args: Vec<String> = [
+            ("--query", up(&query)),
+            ("--truth", up(&truth)),
+            ("--host", "127.0.0.1".to_string()),
+            ("--port", port.to_string()),
+            ("--ef", "16".to_string()),
+            ("--limit", "10".to_string()),
+            ("--pass-kind", "cold".to_string()),
+            ("--metrics-out", up(&metrics)),
+            ("--latency-out", up(&latency)),
+        ]
+        .into_iter()
+        .flat_map(|(flag, value)| [flag.to_string(), value])
+        .collect();
+        cmd_vec_qdrant_search(&args)
+            .expect("the real search command succeeds against the scripted server");
+        let served = server.join().expect("scripted server thread finished");
+        (metrics, latency, served)
+    }
+
+    #[test]
+    fn search_command_records_server_ms_per_query_in_order() {
+        // Card B-0-F7-F2 Work 3 (verdict B-0-F7 finding 4): the server
+        // column of the latency CSV must carry the parsed server time
+        // converted to MILLISECONDS, one row per query, in query order.
+        // String-exact fields, because the scripted times are
+        // binary-exact: 0.0625 s → "62.500000". M1b-CMD-PUSH-ZERO
+        // prints "0.000000" everywhere; O7-SERVER-MS-UNIT prints
+        // "0.062500" (seconds, unconverted).
+        let (_metrics, latency, served) =
+            run_scripted_search_command("records-server-ms", vec![0.0625, 0.03125, 0.125]);
+        assert_eq!(
+            served, 3,
+            "one request per query on the pass's single connection"
+        );
+        let text = std::fs::read_to_string(&latency).expect("read latency csv");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "header + one row per query:\n{text}");
+        assert_eq!(lines[0], "client_ms,server_ms");
+        let server_fields: Vec<&str> = lines[1..]
+            .iter()
+            .map(|row| row.split(',').nth(1).expect("two csv fields"))
+            .collect();
+        assert_eq!(
+            server_fields,
+            vec!["62.500000", "31.250000", "125.000000"],
+            "server column in query order, in ms"
+        );
+        for (i, row) in lines[1..].iter().enumerate() {
+            let client: f64 = row
+                .split(',')
+                .next()
+                .expect("client field present")
+                .parse()
+                .expect("client field parses as a number");
+            assert!(
+                client.is_finite() && client >= 0.0,
+                "row {i} client field must be finite and >= 0: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_command_server_percentiles_come_from_the_server_column() {
+        // Card B-0-F7-F2 Work 4 (verdict B-0-F7 finding 4): the server
+        // percentiles in the metrics JSON must come from the SERVER
+        // column, not the client column. Sorted scripted server times:
+        // [31.25, 62.5, 125] ms → type-7 p50 = 62.5 and
+        // p99 = 62.5 + 0.98 × (125 − 62.5) = 123.75.
+        // O4-SERVER-P50-FROM-CLIENT (and its p99 twin O4b) would put
+        // the loopback client numbers there instead.
+        let (metrics, _latency, served) =
+            run_scripted_search_command("server-percentiles", vec![0.0625, 0.03125, 0.125]);
+        assert_eq!(
+            served, 3,
+            "one request per query on the pass's single connection"
+        );
+        let text = std::fs::read_to_string(&metrics).expect("read metrics json");
+        let v = json::parse(&text).expect("metrics json parses");
+        let server_p50 = v
+            .get("server_p50_ms")
+            .and_then(Value::as_f64)
+            .expect("server_p50_ms recorded");
+        assert!(
+            (server_p50 - 62.5).abs() < 1e-9,
+            "server p50 must be the scripted 62.5 ms, got {server_p50}"
+        );
+        let server_p99 = v
+            .get("server_p99_ms")
+            .and_then(Value::as_f64)
+            .expect("server_p99_ms recorded");
+        assert!(
+            (server_p99 - 123.75).abs() < 1e-9,
+            "server p99 must be the scripted 123.75 ms (type-7 at 0.99), got {server_p99}"
+        );
+        // the scripted hits are exactly the truth ids
+        assert_eq!(
+            v.get("recall_at_10").and_then(Value::as_f64),
+            Some(1.0),
+            "scripted ids 0..=9 against truth rows 0..=9"
+        );
+        // Column independence (this test's own guard): the client
+        // column is loopback transport time (microseconds), so its p50
+        // cannot coincide with the scripted server p50 — if it ever
+        // did, the assertions above could not tell the two columns
+        // apart. If a pathologically slow host makes this flaky, scale
+        // the scripted times by 16x (binary-exact again) rather than
+        // dropping the check (card B-0-F7-F2 Work 4).
+        let client_p50 = v
+            .get("p50_ms")
+            .and_then(Value::as_f64)
+            .expect("p50_ms recorded");
+        assert!(
+            (client_p50 - 62.5).abs() >= 1e-6,
+            "client p50 {client_p50} is suspiciously equal to the server p50; \
+             the two columns must be independent measurements"
+        );
+    }
 }
