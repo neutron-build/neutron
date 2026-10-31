@@ -1,19 +1,16 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c — X5-R13 (a)–(d) landed (each pinned in its own
-commit, before any campaign `run`); the gc_step livelock root-caused
-and fixed (pin `gc_sweep_crosses_subtree_boundaries`); seed 148's
-livelock pinned to its class (a hidden deadlock behind the service
-spins — budget-valve, repro `run --seeds 148..149`); `cargo test`
-green (130 tests), the 16-seed smoke passing. The 10k campaign **has
-not completed**: three runs died with runner 60-min kills (7500/10000
-pre-fix at ~3 seeds/s under co-tenant load; 3500/10000 post-fix at
-~2.4 seeds/s — the gc fix dropped peak RSS from ~14 GiB to ~4.7 GiB,
-and the projected full run is ~65–70 min on this host, over the
-60-min command budget). The next attempt runs it under `--keep` from
-here: `run` → `verify` → retune if a quota misses → the final `run` →
-`mutants` → the README numbers and the RESULT.** The stages before it
-(X-5a, X-5b) are complete and merged.
+Status: **stage X-5c — X5-R13 (a)–(d) landed (each pinned); the gc_step
+livelock fixed (pin `gc_sweep_crosses_subtree_boundaries`); the first
+complete 10k campaign committed (exit 0, ~13 min, RSS 5.1 GiB; see
+"The first complete 10k campaign" below): `E4 SEEDS=10000 O1_FAIL=2712
+O2_FAIL=98 O3_FAIL=1029 DEADLOCK=46 PANIC=0 O1F_FAIL=2722 MONITOR=0`,
+1,560 failing seeds in six recorded classes, five coverage quotas
+missed (Q4, Q7, Q11, Q12, SIZING) — **X5-R12's budget valve applied:
+the classes are recorded with deterministic repros, the file is
+committed, and the retune/final-run/mutant-sweep wait for P's
+triage.** `cargo test` green (139 tests); the gate green at this code
+state.** The stages before it (X-5a, X-5b) are complete and merged.
 Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
 fix).
 
@@ -306,7 +303,89 @@ the worker landed (a) with this copy in the same commit, before the next
   - Item 5: every (a)–(d) item (instrumentation), and seeds 36 and 148 with their root causes.
 - **Nothing else moves.** The oracle, the model, the classes, the quotas and X5-R1–R12 are unchanged. Recording a livelock as DEADLOCK tightens the rule (before, it was a hang); it loosens nothing. The README gets X5-R13 verbatim in the same commit as (a), before the next `run`.
 
-## This stage's delivery of the rulings (the worker's half)
+## The first complete 10k campaign (run 3 of the attempt, committed)
+
+`run --seeds 0..10000 --threads 16` after the gc fix and X5-R13
+(a)–(d): **exit 0, ~13 min wall on a quiet host (16 threads), peak
+RSS 5.1 GiB** (the gc fix took the pre-fix runs' ~14 GiB peak with
+it). `results/campaign.json` (7.8 MB, digest-reproducible) is
+committed at d2c8bba7. Final line, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=98 O3_FAIL=1029 DEADLOCK=46 PANIC=0 O1F_FAIL=2722 MONITOR=0
+```
+
+Per class (rounds: C 11,777 / MP 2,183 + 2,183 twins (2,137 passing) /
+MW 1,415 + 1,414 twins (1,360 passing)):
+
+| | O-1 | O-2 | O-3 | O-1f | DEADLOCK | livelock rounds | acked lost (SyncOff) |
+|---|---|---|---|---|---|---|---|
+| C | 474 | 98 | 133 | 474 | 0 | 0 | 140 (140) |
+| MP | 1784 | 0 | 436 | 1785 | 46 | 46 | 46 (46) |
+| MW | 454 | 0 | 460 | 463 | 0 | 0 | 1962 (618) |
+
+X5-R6 beside the rule: 308 R6 rounds (MP 264 + MW 44), 5,668
+detected-loss comparisons (all MP).
+
+**1,560 failing seeds, in classes (the budget valve, X5-R12):**
+deterministic repros — every line below is re-runnable from the
+committed file (`run --seeds N..N+1`):
+
+1. **Class C scan mismatches with no faults at all** (the gravest
+   class: O-1 (b)/(c)/(d) "scan mismatch" / "raw entry above the
+   cut" — e.g. seeds 21, 36, 46, 63, 93, 104, 112, 152, 186, 200).
+   Class C applies F-CRASH only; every one of these is a genuine
+   divergence between the recovered store and the model at every
+   candidate cut, or an oracle/model-semantics gap. Not root-caused
+   in this attempt.
+2. **MP O-1(a) "published {} != model {…}" with O-3 (e) exactness or
+   completeness failures** (1,784 O-1 records; the pass-failing arm is
+   O-3 (e): "amcheck reported slot … neither tainted nor in R" /
+   "tainted referenced slot … not reported" — e.g. seeds 37, 38, 47,
+   67, 118, 137, 157, 198, 228). The O-1(a) text is the frozen
+   oracle's recovery-`Err` branch (an empty default published set
+   compared against the model — recorded, not pass-failing by
+   itself); the O-3 (e) findings are the failures. The O-3 (e) /
+   X5-R5 interplay under page damage is not root-caused here.
+3. **MW O-1 (c) "raw entry above the cut" + O-3 (d) silent-Ok**
+   (e.g. seeds 39, 59, 69, 109, 149, 159, 199, 209, 239). No
+   candidate cut exists: the store holds a raw entry above every
+   legal cut. 1,962 acked commits lost (618 SyncOff) — X5-R1's known
+   cost is reported beside the rule, but these rounds fail O-1/O-3.
+4. **The Mid2 crash point never fires** (a harness defect class the
+   fired-guard catches: seeds 60, 62, 64, 262, 268… defect "the
+   crash spec never fired (Mid2@2)"). The targeted draw picks
+   checkpoint index 2 / hook Mid2, which the round's own checkpoints
+   never reach.
+5. **The 46 DEADLOCK seeds are all MP livelocks** (the seed-148
+   hidden-deadlock class, `ll=True`; 46/2000 MP seeds ≈ the ~1/100
+   P measured).
+6. **Twins: 46 MP + 54 MW twin rounds fail** (the same store logic
+   with no damage — classes 1–3 echo there).
+
+**Coverage quotas (verify's three exit conditions):** the seed set is
+exactly 0..9999 and the digests reproduce (verify's re-run checks
+them; the determinism pins hold), but **5 quotas miss**: Q4 0/1000
+(no interrupted checkpoint has ≥1 split **and** ≥1 merge in the
+window), Q7 155/200 (DropTree-walk crashes), Q11 0/100 (no stale
+record ever read at a renamed segment's start), Q12 2/100 (G1 renames
+dropped by F-CRASH), and **SIZING: 14,988 rounds miss Work 5.3's ≥ 4·F
+distinct dirtied LPIDs** — the workload never dirties 4× the pool in
+one interval (a harness defect per 5.3, i.e. a workload-sizing
+retune, which the card allows only before a final run). Q1 (all 10
+hooks), Q2, Q3, Q5a–c, Q6a/b, Q8, Q9, Q10, Q13a–c, Q14, Q15, Q16,
+Q17, Q18 are all met.
+
+**Where this leaves the stage (X5-R12's budget valve, applied
+verbatim):** the first full campaign shows failing seed classes this
+attempt cannot root-cause (classes 1–3 above; 1,560 seeds). The
+campaign file is committed; the classes are recorded here with
+deterministic repros; the attempt does not spend itself on a retune +
+final run + sweep whose outcomes P must triage first — the retune
+(SIZING/Q4/Q7/Q11/Q12) and the mutant sweep stay to run after that
+triage. The E4 rule's verdict for THIS run is in the stage RESULT.
+
+
 
 - **X5-R13 (a)–(d)** (commits e25073a2, 9f581381, 20781b78, ca77230e):
   each landed pinned in its own commit, before any campaign `run` (the
@@ -371,6 +450,9 @@ the worker landed (a) with this copy in the same commit, before the next
   4}") is the frozen oracle's Err-branch default (the pass fold
   ignores O-1 for a recovery `Err` in MP; the round fails through the
   deadlock fold).
+
+## This stage's delivery of the rulings (the worker's half)
+
 - **X5-R10** (commit 9488e1ed): `recover` restarts at the frontier
   (`visible_ts := frontier`, `next_ts := frontier + 1`, `applied`
   cleared); the model-commit guard makes a held-ts commit a loud
