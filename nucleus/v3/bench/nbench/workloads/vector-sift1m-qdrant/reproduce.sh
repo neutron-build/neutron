@@ -26,10 +26,15 @@
 # on VOID (a digest mismatch writes the JSON, then exits 1). Such a
 # run is final: its JSON moves into repro/ and it is never re-done,
 # so J6's voided->INVALID arm can actually fire. A FAILED run (no
-# results line) keeps its log, and its work-dir evidence — including
-# every settle transcript — is copied into repro/ before the script
-# exits non-zero, so run B on the same UTC date can never overwrite
-# the only copy.
+# results line) keeps its log, and its work-dir evidence — every
+# settle transcript and pass log — is copied into repro/ before the
+# script exits non-zero, so run B on the same UTC date can never
+# overwrite the only copy.
+#
+# Run B is executed even when run A FAILED or was VOID (gate round 2,
+# finding R2-1): B-0-F7-F1b Work 3 needs both runs as evidence for
+# the P escalation, and `verdict` derives INVALID from run A first,
+# so run B can never change the word — only complete the evidence.
 #
 # Usage: reproduce.sh a|b|verdict|check|selftest
 # Environment: NB_HARNESS (this harness root) and NB_BIN (a RELEASE
@@ -157,9 +162,12 @@ probe_build_profile() {
   esac
 }
 
-# Copy this run's index-state evidence (J4) into $REPRO/run-<x>/:
-# every settle state file, the init collection info, the init log and
-# every settle transcript. Called on EVERY outcome (gate round 1,
+# Copy this run's evidence (J4) into $REPRO/run-<x>/: every settle
+# state file, the init collection info, and every log the work dir
+# holds — init log, settle transcripts AND the per-pass logs, whose
+# tail is what the runner's FAILED line falls back to when driver
+# stderr is empty (gate round 2, finding R2-2) — plus the pass
+# metrics and latency CSVs. Called on EVERY outcome (gate round 1,
 # finding R3): on a failure this is the only chance — run B on the
 # same UTC date overwrites the work dir. Globs are guarded so a file
 # that a refusal-before-init never wrote is skipped, not an error.
@@ -167,9 +175,10 @@ copy_evidence() {
   local x=$1 work=$2 f
   mkdir -p "$REPRO/run-$x"
   for f in "$work"/index-state-*.json \
-           "$work/collection-info.json" \
-           "$work/init-0.log" \
-           "$work"/*.settle.log; do
+           "$work"/collection-info.json \
+           "$work"/*.log \
+           "$work"/*.metrics.json \
+           "$work"/*.latency.csv; do
     [ -f "$f" ] && cp "$f" "$REPRO/run-$x/"
   done
   return 0
@@ -211,7 +220,10 @@ run_one() {
 
   # Where this run's evidence lives. Run A opens today's repro dir; run
   # B must land in the SAME dir as run A (refuse if run A has not
-  # finished, or if more than one dir claims it). Note: a killed
+  # finished, or if more than one dir claims it). A FAILED or VOID run
+  # A does NOT refuse run B (gate round 2, finding R2-1): both runs
+  # are evidence for the P escalation (B-0-F7-F1b Work 3), and
+  # `verdict` derives INVALID from run A first. Note: a killed
   # attempt that began before a UTC midnight keeps its .killed.log in
   # the earlier date's repro dir; `check` will then (correctly) report
   # more than one repro dir — run the protocol inside one UTC day.
@@ -224,16 +236,6 @@ run_one() {
     count=$(printf '%s\n' "$dirs" | grep -c . || true)
     [ "$count" -eq 0 ] && refuse "run A has not finished (no repro dir holds run-a evidence)"
     [ "$count" -gt 1 ] && refuse "more than one repro dir holds run-a evidence: $dirs"
-    # Run A's outcome already decides INVALID under J6 (it FAILED, or
-    # it is digest.voided): no run B can change that verdict, and B
-    # would spend a quiet window as evidence the `verdict` step never
-    # reads. Point at `verdict` instead (gate round 1, findings R2/R3).
-    if [ ! -f "$dir/$ROW.run-a.json" ]; then
-      refuse "run A FAILED (see $dir/run-a.log); the verdict is already INVALID — run 'verdict'"
-    fi
-    if grep -q '"voided":true' "$dir/$ROW.run-a.json"; then
-      refuse "run A is VOID (digest mismatch, recorded in $dir/$ROW.run-a.json); the verdict is already INVALID — run 'verdict'"
-    fi
     REPRO=$dir
   fi
 
@@ -468,7 +470,7 @@ selftest() {
   local script lib t r rc fails=0
   script=$(readlink -f "$0")
   lib=$(dirname "$script")/../../lib/nb-lib.sh
-  t=$(mktemp -d "${TMPDIR:-/tmp/opencode}/nbench-repro-selftest.XXXXXXXX")
+  t=$(mktemp -d "${TMPDIR:-/tmp}/nbench-repro-selftest.XXXXXXXX")
   echo "selftest scratch: $t (left in place for inspection)"
 
   # The stub nbench. Its `run` reproduces the three outcomes of the
@@ -516,6 +518,9 @@ case "$1" in
         mkdir -p "$work"
         : > "$work/index-state-init.json"
         : > "$work/ef_search=16-cold-0.settle.log"
+        : > "$work/ef_search=16-cold-0.log"
+        : > "$work/ef_search=16-cold-0.metrics.json"
+        : > "$work/ef_search=16-cold-0.latency.csv"
         echo "row $row FAILED: command failed (driver [ef_search=16-cold-0], exit 1): index state differs: init {segments:8,points:1000000,indexed:1000000,threshold_kb:1} vs now {segments:92,points:1000000,indexed:3861632,threshold_kb:1}" >&2
         exit 1
         ;;
@@ -588,19 +593,22 @@ STUB
   st_rc "check consistent" 0 st_run "$r" success check
   st_ok "exactly one repro dir" test "$(find "$r" -name repro -type d | wc -l)" -eq 1
 
-  echo "S2: FAILED run A (R3: evidence survives; the FAILED line reaches the verdict)"
+  echo "S2: FAILED run A (R3: evidence survives; R2-1: run B still runs; the FAILED line reaches the verdict)"
   r=$t/s2; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
   st_rc "a fails loudly" 1 st_run "$r" failed a
   st_ok "no run-a.json (nothing was recorded)" test ! -f "$r/results/$D/repro/$ROW.run-a.json"
   st_ok "FAILED evidence copied (R3)" test -f "$r/results/$D/repro/run-a/ef_search=16-cold-0.settle.log"
+  st_ok "FAILED pass log copied (R2-2)" test -f "$r/results/$D/repro/run-a/ef_search=16-cold-0.log"
+  st_ok "FAILED pass metrics copied (R2-2)" test -f "$r/results/$D/repro/run-a/ef_search=16-cold-0.metrics.json"
   st_ok "FAILED log kept" grep -q FAILED "$r/results/$D/repro/run-a.log"
   st_rc "a again is refused (no re-runs)" 4 st_run "$r" failed a
-  st_rc "b refuses: A already decided INVALID" 4 st_run "$r" success b
+  st_rc "b runs after a FAILED A (R2-1: evidence, not a refusal)" 0 st_run "$r" success b
+  st_ok "run-b.json recorded in the same repro dir" test -f "$r/results/$D/repro/$ROW.run-b.json"
   st_rc "verdict records INVALID" 0 st_run "$r" failed verdict
-  st_ok "verdict quotes the FAILED line" grep -q "INVALID (run A refused: row $ROW FAILED" "$r/results/$D/repro/verdict.txt"
+  st_ok "verdict still names run A's FAILED line" grep -q "INVALID (run A refused: row $ROW FAILED" "$r/results/$D/repro/verdict.txt"
   st_rc "check consistent" 0 st_run "$r" failed check
 
-  echo "S3: VOID run A (R2: recorded and final; J6's voided arm fires)"
+  echo "S3: VOID run A (R2: recorded and final; R2-1: run B still runs; J6's voided arm fires)"
   r=$t/s3; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
   st_rc "a exits 1 (recorded but VOID)" 1 st_run "$r" voided a
   st_ok "voided JSON moved into repro (R2)" grep -q '"voided":true' "$r/results/$D/repro/$ROW.run-a.json"
@@ -608,9 +616,10 @@ STUB
   st_ok "voided run evidence copied" test -f "$r/results/$D/repro/run-a/index-state-init.json"
   st_rc "a again is refused (R2)" 4 st_run "$r" voided a
   st_ok "no killed-rename happened" test ! -f "$r/results/$D/repro/run-a.killed.log"
-  st_rc "b refuses: A is voided" 4 st_run "$r" success b
+  st_rc "b runs after a VOID A (R2-1: evidence, not a refusal)" 0 st_run "$r" success b
+  st_ok "run-b.json recorded in the same repro dir" test -f "$r/results/$D/repro/$ROW.run-b.json"
   st_rc "verdict records INVALID (voided)" 0 st_run "$r" voided verdict
-  st_ok "verdict names the VOID run" grep -q "INVALID (run A voided:" "$r/results/$D/repro/verdict.txt"
+  st_ok "verdict still names run A (the VOID run)" grep -q "INVALID (run A voided:" "$r/results/$D/repro/verdict.txt"
   st_rc "check consistent" 0 st_run "$r" voided check
 
   echo "S4: debug NB_BIN (R5: refused before anything starts)"

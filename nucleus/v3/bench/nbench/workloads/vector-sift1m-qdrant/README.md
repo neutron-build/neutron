@@ -141,15 +141,19 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   client is refused with nbench's own J5 message (exit 4). A run that
   printed a `results:` line was **recorded** — on success or on VOID
   (a digest mismatch writes the JSON and exits 1); its JSON,
-  `index-state-*.json`, `collection-info.json`, init log and every
-  settle transcript land in `results/<date>/repro/`, and it is never
-  re-run (exit 4 on retry). A FAILED run keeps its log and its
-  work-dir evidence is copied into `repro/run-<x>/` before the script
-  exits, so run B on the same UTC date cannot overwrite it. A killed
-  attempt is kept as `run-*.killed.log` (one retry). Run B goes into
-  the same `repro/` dir as run A, and refuses early if run A's
-  outcome (FAILED or VOID) already decides INVALID. Run A is the row;
-  run B is evidence only; there is no third run.
+  `index-state-*.json`, `collection-info.json`, every log (init,
+  settle transcripts and the per-pass logs) and the pass metrics land
+  in `results/<date>/repro/`, and it is never re-run (exit 4 on
+  retry). A FAILED run keeps its log and its work-dir evidence is
+  copied into `repro/run-<x>/` before the script exits, so run B on
+  the same UTC date cannot overwrite it. A killed attempt is kept as
+  `run-*.killed.log` (one retry). Run B goes into the same `repro/`
+  dir as run A, and is **executed even when run A FAILED or was
+  VOID** — both runs are evidence for the P escalation
+  (B-0-F7-F1b Work 3), and `verdict` derives INVALID from run A
+  first, so run B can never change the word; it refuses only if run
+  A has not finished or run B already exists. Run A is the row; run
+  B is evidence only; there is no third run.
 - `verdict` — writes `repro/verdict.txt`: `nbench qdrant-repro-verdict
   --a F --b F` when both JSONs exist, or `REPRO VERDICT=INVALID (run X
   refused/voided: …)` for a failed or voided run. On REPRODUCED only,
@@ -162,10 +166,17 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   is byte-identical to run-a.json, and exactly one `repro/` dir must
   exist.
 - `selftest` — the stub-driven protocol test (gate round 1 rework
-  acceptance): a fake `NB_BIN` replays `nbench run`'s success, VOID,
-  FAILED and debug-refusal outcomes against a throwaway root with the
-  quiet wait bypassed loudly; it needs no host, no podman and no
-  dataset, and passes when the protocol above behaves as written.
+  acceptance, extended in round 2): a fake `NB_BIN` replays `nbench
+  run`'s success, VOID, FAILED and debug-refusal outcomes against a
+  throwaway root with the quiet wait bypassed loudly — including run
+  B after a FAILED or VOID run A (round 2, R2-1) and the pass-log
+  evidence copy (R2-2). It needs no host, no podman and no dataset,
+  and passes when the protocol above behaves as written.
+  `NB_MODE=selftest bash driver.sh` is the matching driver-level test:
+  it pins the driver's stderr contract — a J4 settle mismatch's
+  both-states diff reaches driver stderr, and a successful settle
+  leaves it empty so a later search refusal stays reachable through
+  the pass-log fallback (round 2, R2-2).
 
 **J6, the reproducibility rule (pre-registered, applied verbatim by
 `nbench qdrant-repro-verdict`):** two fresh-build runs, A then B, on a
