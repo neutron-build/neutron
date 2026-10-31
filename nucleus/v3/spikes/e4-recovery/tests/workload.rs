@@ -725,6 +725,42 @@ fn r16_mpe_referenced_set_excludes_the_file_header() {
 /// X5-R16) now covers every tainted slot of the referenced set, armed
 /// for the MP amcheck (i) walk. On the reverted arm the "not
 /// reported" text reappears.
+/// **X5-R21 (c) pin (P ruling nv3-X-5c-F1-esc-1; literal config = the
+/// ruling's five seeds 2669/4049/4309/7469/9809 — all targeted MW
+/// seeds where the twin and real chains diverge and the real round
+/// re-derives its spec).** The draft's real-round retry re-derived
+/// the spec and re-ran alone, keeping the twin's supply and nested
+/// points from the twin's run at the OLD spec — a Work 2.5 pairing
+/// break (the twin is the same script, crash and F-CRASH
+/// resolutions). Now the twin re-runs at the re-derived spec, from
+/// its own start, before the real round uses its supply and nested
+/// points; the twin record, supply, nested points and chain
+/// continuation come from the re-run. Observable at seed 7469 (the
+/// re-derived round's twin outcome changed with it) and 9809 (its
+/// nested points); `twin_paired` (diagnostic only, never a digest
+/// input) asserts the pairing on every round. On the reverted
+/// pairing re-run the flag reads false on the re-derived round.
+#[test]
+fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
+    for seed in [2669u64, 4049, 4309, 7469, 9809] {
+        let rec = workload::run_seed(seed, None);
+        assert!(
+            rec.defect.is_none(),
+            "seed {seed}: the fired-guard defect is back: {:?}",
+            rec.defect
+        );
+        assert_eq!(
+            rec.twin_paired.len(),
+            rec.rounds.len(),
+            "seed {seed}: the pairing flag must cover every executed round"
+        );
+        assert!(
+            rec.twin_paired.iter().all(|p| *p),
+            "seed {seed}: a round ran with a twin at a different crash spec (Work 2.5 break)"
+        );
+    }
+}
+
 #[test]
 fn r20_mpe_damage_fallout_covers_every_referenced_slot() {
     for seed in [1787u64, 6157] {
