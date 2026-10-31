@@ -1722,13 +1722,18 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (139 tests)
-cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (9)
+cargo test -q --release -p e4-recovery      # the whole crate (137 tests)
+cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (14)
 cargo run -q --release -p e4-recovery --example pin   # the pinned CRC32C /
                                                       # splitmix64 values (Work 0)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
-  --results spikes/e4-recovery/results/campaign.json   # exits 2: no campaign
-                                                       # exists (the X5-R6 guard)
+  --results spikes/e4-recovery/results/campaign.json
+# verify re-runs all 10,000 seeds (~13 min at 16 threads). On this file it
+# exits 2 on the five missed quotas alone (Q4/Q7/Q11/Q12/SIZING — X5-R17's
+# retune is X-5c-F2's); the digests and the seed set reproduce. Its exit
+# is 2 for any failed check (seed set, digests, quotas), 0 otherwise.
+# `--no-quotas` (X5-R15 (b)) waives only the quota exit: X-5c-F1's
+# Acceptance form.
 ```
 
 X5-R15 (e): `examples/` keeps only what this block uses (`pin.rs`;
