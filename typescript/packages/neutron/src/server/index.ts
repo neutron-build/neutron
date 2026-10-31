@@ -80,6 +80,12 @@ import { handleImageRequest } from "./image-optimizer.js";
 import { capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 import { handleIslandRequest } from "./server-islands.js";
 import { loadServerBundle, serverBundleKey, type LoadedServerBundle } from "./server-bundle.js";
+import {
+  ROUTE_CSS_MANIFEST,
+  parseRouteCssManifest,
+  routeStylesheetHrefs,
+  type RouteCssManifest,
+} from "../core/route-css.js";
 import type {
   ActionArgs,
   AppContext,
@@ -111,6 +117,14 @@ export type {
 } from "./cache-store.js";
 export { csrfMiddleware } from "./csrf.js";
 export { findGlobalMiddlewareFile } from "../core/global-middleware.js";
+export {
+  ROUTE_CSS_MANIFEST,
+  ROUTE_CSS_MANIFEST_FORMAT,
+  collectChunkCss,
+  routeStylesheetHrefs,
+  type RouteCssManifest,
+  type ViteManifest,
+} from "../core/route-css.js";
 export {
   SERVER_BUNDLE_MANIFEST,
   SERVER_BUNDLE_FORMAT,
@@ -497,7 +511,10 @@ export async function createServer(
   const resolvedDistDir = path.resolve(resolvedRootDir, distDir);
   const resolvedRoutesDir = path.resolve(resolvedRootDir, routesDir);
   const clientEntryScriptSrc = getClientEntryScriptSrc(resolvedDistDir);
-  const stylesheetHrefs = getClientStylesheetHrefs(resolvedDistDir);
+  const allStylesheetHrefs = getClientStylesheetHrefs(resolvedDistDir);
+  const routeCss = loadRouteCssManifest(resolvedDistDir);
+  const stylesheetsFor = (routeId: string) =>
+    routeStylesheetHrefs(routeCss, routeId, allStylesheetHrefs);
   const staticRouteHeaders = loadStaticRouteHeaders(resolvedDistDir);
   const staticHtmlCache = buildStaticHtmlCache(resolvedDistDir);
   const corsOptions = resolveCorsOptions(cors);
@@ -1116,7 +1133,7 @@ export async function createServer(
               notFoundMatch,
               ssrServer!,
               clientEntryScriptSrc,
-              stylesheetHrefs,
+              stylesheetsFor(notFoundMatch.route.id),
               routeModuleCache,
               loaderDataCacheStore,
               requestTrace,
@@ -1276,7 +1293,7 @@ export async function createServer(
         match,
         ssrServer,
         clientEntryScriptSrc,
-        stylesheetHrefs,
+        stylesheetsFor(match.route.id),
         routeModuleCache,
         loaderDataCacheStore,
         requestTrace,
@@ -2546,6 +2563,14 @@ function getClientEntryScriptSrc(distDir: string): string | null {
   );
 
   return match?.[1] || null;
+}
+
+function loadRouteCssManifest(distDir: string): RouteCssManifest | null {
+  try {
+    return parseRouteCssManifest(fs.readFileSync(path.join(distDir, ROUTE_CSS_MANIFEST), "utf-8"));
+  } catch {
+    return null;
+  }
 }
 
 function getClientStylesheetHrefs(distDir: string): string[] {

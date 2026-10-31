@@ -120,6 +120,27 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Pages link only the stylesheets their route needs.** Every page —
+  prerendered static pages, SSR'd app pages, and the `__css__` list a client
+  navigation loads before it swaps the page — linked every `dist/assets/*.css`
+  file, so an app's CSS grew on every page with every section (29 sheets /
+  ~2.6 MB per page on the Fylun port), and two routes that style `:root`
+  differently fought, the later-sorted file winning on both. `neutron-ts
+  build` now writes `dist/.neutron-route-css.json`: per page route (and
+  not-found route), the client entry's CSS, then each layout's from the
+  outermost in, then the route's own, each being what that module's static
+  import graph reaches. CSS shared by several routes comes from the common
+  chunk Vite splits it into, so they share one file. `start` (Vite runtime
+  and server bundle), the node/docker and worker runtime bundles, and the
+  static prerender all link from it; `dev` already linked per route from the
+  module graph and is unchanged. A route the table does not know (a dist
+  from an older CLI, a route added since the build) still links every
+  stylesheet. Stylesheets are now ordered layout-first rather than
+  alphabetically, so a route's own rules follow its layouts'. On static-only
+  sites the CSS pass is code-split per route: `assets/style-<hash>.css` is
+  replaced by one file per route module and shared chunk, recorded in
+  `dist/.vite/neutron-css-manifest.json`. Stylesheets a previous page linked
+  stay in the document after a client navigation (as in Next's App Router).
 - **`neutron-ts start` serves from a prebuilt server bundle instead of
   transforming source through Vite.** `createServer` built a Vite SSR server
   at every boot and transformed each route module, layout, `not-found`,

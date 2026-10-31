@@ -937,6 +937,7 @@ import { extractClientEntryScriptSrc } from "./client-entry.js";
 
 import { findGatedStaticRoutes, gatedStaticRoutesError } from "./commands/gated-static.js";
 import type { Route } from "@neutron-build/core";
+import { decodeSerializedPayload } from "@neutron-build/core";
 
 /** Minimal Route factory — only the fields the gate reads. */
 function gateRoute(overrides: {
@@ -2111,6 +2112,117 @@ export default function Page() { return h("p", null, "fonts"); }
       assert.ok(
         fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8").includes('rel="stylesheet"')
       );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-route CSS (F-P3-1): a page links only what its route graph imports.
+// ---------------------------------------------------------------------------
+
+const ROUTE_CSS_FILES: Record<string, string> = {
+  "src/styles/root.css": "body { --from-root: 1; }\n",
+  "src/styles/shared.css": ".from-shared { color: green; }\n",
+  "src/styles/shop.css": ":root { --theme: shop; }\n",
+  "src/styles/docs.css": ":root { --theme: docs; }\n",
+  "src/Shared.tsx": `import { h } from "preact";
+import "./styles/shared.css";
+export function Shared() { return h("b", { class: "from-shared" }, "shared"); }
+`,
+  "src/routes/_layout.tsx": `import { h } from "preact";
+import "../styles/root.css";
+export default function Layout({ children }) { return h("main", null, children); }
+`,
+  "src/routes/about.tsx": `import { h } from "preact";
+export const config = { mode: "static" };
+export default function About() { return h("p", null, "about-page"); }
+`,
+};
+
+function sectionRoute(name: string, mode: "app" | "static"): string {
+  return `import { h } from "preact";
+import "../styles/${name}.css";
+import { Shared } from "../Shared";
+export const config = { mode: "${mode}" };
+export default function Page() { return h("p", null, "${name}-page", h(Shared, null)); }
+`;
+}
+
+function linkedCss(dir: string, hrefs: string[]): string {
+  return hrefs.map((href) => fs.readFileSync(path.join(dir, "dist", href), "utf-8")).join("\n");
+}
+
+function stylesheetLinks(html: string): string[] {
+  return [...html.matchAll(/<link rel="stylesheet" href="([^"]+)">/g)].map((match) => match[1]);
+}
+
+function assertSectionCss(css: string, section: "shop" | "docs" | null, where: string): void {
+  assert.ok(css.includes("--from-root"), `${where}: root layout CSS missing:\n${css}`);
+  for (const other of ["shop", "docs"]) {
+    assert.equal(new RegExp(`--theme:\\s*${other}`).test(css), other === section, `${where}: ${other} theme CSS:\n${css}`);
+  }
+  assert.equal(css.includes(".from-shared"), section !== null, `${where}: shared CSS:\n${css}`);
+}
+
+describe("neutron-ts build (process): per-route CSS", () => {
+  it("links each app and static page only to its own route graph's stylesheets", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      ...ROUTE_CSS_FILES,
+      "package.json": JSON.stringify({ name: "route-css-fixture", type: "module" }),
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/shop.tsx": sectionRoute("shop", "app"),
+      "src/routes/docs.tsx": sectionRoute("docs", "app"),
+    });
+    try {
+      await runBuild(dir);
+      const about = fs.readFileSync(path.join(dir, "dist", "about", "index.html"), "utf-8");
+      assertSectionCss(linkedCss(dir, stylesheetLinks(about)), null, "static /about");
+
+      const port = await freePort();
+      const proc = runCli("start", dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+        for (const section of ["shop", "docs"] as const) {
+          const html = await (
+            await fetch(`http://127.0.0.1:${port}/${section}`, { headers: { accept: "text/html" } })
+          ).text();
+          assert.ok(html.includes(`${section}-page`), html);
+          const hrefs = stylesheetLinks(html);
+          assertSectionCss(linkedCss(dir, hrefs), section, `SSR /${section}`);
+          // Client navigation loads the same list before it swaps the page.
+          const data = decodeSerializedPayload<{ __css__: string[] }>(
+            await (await fetch(`http://127.0.0.1:${port}/${section}`, { headers: { accept: "application/json" } })).json()
+          );
+          assert.deepEqual(data.__css__, hrefs);
+        }
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("splits a static-only site's CSS per page", { timeout: 180_000 }, async () => {
+    const dir = makeBuildFixture({
+      ...ROUTE_CSS_FILES,
+      "src/routes/shop.tsx": sectionRoute("shop", "static"),
+      "src/routes/docs.tsx": sectionRoute("docs", "static"),
+    });
+    try {
+      await runBuild(dir);
+      for (const [page, section] of [["about", null], ["shop", "shop"], ["docs", "docs"]] as const) {
+        const html = fs.readFileSync(path.join(dir, "dist", page, "index.html"), "utf-8");
+        assertSectionCss(linkedCss(dir, stylesheetLinks(html)), section, `static /${page}`);
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

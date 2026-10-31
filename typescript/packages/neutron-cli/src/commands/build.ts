@@ -57,6 +57,12 @@ import {
   SERVER_BUNDLE_FORMAT,
   findGlobalMiddlewareFile,
   generateServerBundleEntry,
+  ROUTE_CSS_MANIFEST,
+  ROUTE_CSS_MANIFEST_FORMAT,
+  collectChunkCss,
+  routeStylesheetHrefs,
+  type RouteCssManifest,
+  type ViteManifest,
 } from "@neutron-build/core/server";
 
 export async function build(): Promise<void> {
@@ -253,34 +259,21 @@ export async function build(): Promise<void> {
     );
   } else {
     console.log("Building CSS bundle (static site)...");
-    const cssEntryDir = path.join(cwd, ".neutron");
-    fs.mkdirSync(cssEntryDir, { recursive: true });
-    const cssEntryPath = path.join(cssEntryDir, "_css-entry.js");
-    // Import every route + layout MODULE through the client-route pipeline so Vite
-    // walks the real import graph and extracts ALL reachable CSS — side-effect
-    // imports, component-level CSS, AND CSS Modules — not just side-effect `*.css`
-    // imports textually present in the route file. The ?CLIENT_ROUTE_QUERY suffix
-    // makes neutronPlugin strip server-only code (loader/action) while keeping CSS
-    // imports in build mode, exactly as the client bundle does. Root-relative paths
-    // (`/src/...`) are used so Vite resolves them from the project root.
-    // Namespace-import + export each module so its component graph is NOT
-    // tree-shaken. Side-effect-only imports would keep `import "x.css"` lines but
-    // drop value-imported CSS Modules (`import s from "x.module.css"`) once the
-    // unused component that references them is shaken away.
-    // Resource routes are skipped: they render no page and carry no CSS, and
-    // their handlers are server code through and through.
-    const importLines: string[] = [];
-    const keepRefs: string[] = [];
+    // Every route + layout MODULE is an entry of its own, loaded through the
+    // client-route pipeline, so Vite walks the real import graph and extracts
+    // ALL reachable CSS — side-effect imports, component-level CSS, AND CSS
+    // Modules — not just side-effect `*.css` imports textually present in the
+    // route file. The ?CLIENT_ROUTE_QUERY suffix makes neutronPlugin strip
+    // server-only code (loader/action) while keeping CSS imports in build
+    // mode, exactly as the client bundle does. With CSS code-splitting each
+    // entry's own stylesheets (and those of the shared chunks it imports) are
+    // recorded in this pass's manifest, which is what the per-route CSS table
+    // is built from. Resource routes are skipped: they render no page and
+    // carry no CSS, and their handlers are server code through and through.
+    const cssPassInput: Record<string, string> = {};
     routes.filter((route) => !isResourceRoute(route)).forEach((route, i) => {
-      const abs = route.file.replace(/\\/g, "/");
-      const rel = abs.startsWith(cwdFwd + "/") ? abs.slice(cwdFwd.length) : "/@fs" + abs;
-      importLines.push(`import * as __r${i} from ${JSON.stringify(rel + "?" + CLIENT_ROUTE_QUERY)};`);
-      keepRefs.push(`__r${i}`);
+      cssPassInput[`neutron-css-${i}`] = route.file.replace(/\\/g, "/") + "?" + CLIENT_ROUTE_QUERY;
     });
-    fs.writeFileSync(
-      cssEntryPath,
-      importLines.join("\n") + `\nexport const __keep = [${keepRefs.join(", ")}];\n`
-    );
     await viteBuild(
       mergeConfig(userConfig, {
         oxc: oxcJsx,
@@ -343,7 +336,7 @@ export async function build(): Promise<void> {
           // route's exports, so CSS Modules referenced only by components are
           // not shaken away. JS lands at the top level for the cleanup below.
           rolldownOptions: {
-            input: { "neutron-css": cssEntryPath },
+            input: cssPassInput,
             preserveEntrySignatures: "strict" as const,
             output: {
               entryFileNames: "[name].js",
@@ -351,16 +344,13 @@ export async function build(): Promise<void> {
               assetFileNames: "assets/[name]-[hash][extname]",
             },
           },
-          cssCodeSplit: false,
-          // This build imports every route to walk their CSS, so it emits a
-          // route chunk per route — including `assets/index-<hash>.js`. Without
-          // the manifest naming them, the client-entry resolver can pick one up
-          // and inject a stray route stub into pages that need no JS at all.
-          manifest: true,
+          cssCodeSplit: true,
+          // Its own file: the per-route CSS table reads it, and it must never
+          // be mistaken for the client build's manifest.
+          manifest: CSS_PASS_MANIFEST,
         },
       })
     );
-    try { fs.unlinkSync(cssEntryPath); } catch {}
     // Remove the JS lib output from the CSS-extraction build — we only need
     // the extracted CSS. Preserve any JS files that were copied here from
     // publicDir (e.g. sw.js, service workers, third-party widgets) so user
@@ -436,8 +426,19 @@ export async function build(): Promise<void> {
   // Prerendered static pages with islands reference this instead of the SPA runtime.
   const islandsEntryScriptSrc = hasIslands ? extractIslandsEntryScriptSrc(outputDir) : null;
 
-  // Collect CSS files produced by the client build for injection into static HTML
+  // Every stylesheet the builds produced: what a route missing from the
+  // per-route table links (the pre-table behaviour).
   const clientCssFiles = extractClientCssFiles(outputDir);
+  // Per-route stylesheets: each page links what its own route graph needs.
+  // Static-only sites take every route's CSS from the CSS pass; otherwise the
+  // client build's manifest has them all.
+  const routeCss = writeRouteCssManifest(
+    cwd,
+    outputDir,
+    routes,
+    appRouteCount > 0 ? new Set() : new Set(routes.map((route) => route.id))
+  );
+  const stylesheetsFor = (route: Route) => routeStylesheetHrefs(routeCss, route.id, clientCssFiles);
 
   const ensureRuntimeBundle = createRuntimeBundleBuilder({
     cwd,
@@ -448,6 +449,7 @@ export async function build(): Promise<void> {
     pageRoutes,
     clientEntryScriptSrc,
     clientCssFiles,
+    routeCss,
     userConfig,
     runtimeAliases: preactAliases,
     // `true` for react-compat (blanket processing — see resolveRuntimeNoExternal).
@@ -857,7 +859,7 @@ export async function build(): Promise<void> {
             loaderData,
             clientEntryScriptSrc,
             headHtml,
-            clientCssFiles,
+            stylesheetsFor(route),
             islandsEntryScriptSrc,
             seo
           );
@@ -943,7 +945,7 @@ export async function build(): Promise<void> {
         loaderData,
         clientEntryScriptSrc,
         headHtml,
-        clientCssFiles,
+        stylesheetsFor(route),
         islandsEntryScriptSrc,
         seo
       );
@@ -1104,6 +1106,66 @@ function getResourceOutputPath(outputDir: string, routePath: string): string {
   return path.join(outputDir, routePath.replace(/^\//, ""));
 }
 
+// The CSS pass's own manifest, beside the client build's `.vite/manifest.json`.
+const CSS_PASS_MANIFEST = ".vite/neutron-css-manifest.json";
+
+function readViteManifest(file: string): ViteManifest | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf-8")) as ViteManifest;
+  } catch {
+    return null;
+  }
+}
+
+/** A route module's key in a Vite manifest: its root-relative id with the client-route query. */
+function clientRouteManifestKey(cwd: string, file: string): string {
+  return path.relative(cwd, file).split(path.sep).join("/") + "?" + CLIENT_ROUTE_QUERY;
+}
+
+/**
+ * Write `dist/.neutron-route-css.json`: for every page route (and not-found
+ * route), the client entry's CSS, then each layout's from the outermost in,
+ * then the route's own, deduplicated. Routes in `cssPassRouteIds` are read
+ * from the CSS pass's manifest, every other route from the client build's.
+ */
+function writeRouteCssManifest(
+  cwd: string,
+  outputDir: string,
+  routes: Route[],
+  cssPassRouteIds: Set<string>
+): RouteCssManifest | null {
+  const client = readViteManifest(path.join(outputDir, ".vite", "manifest.json"));
+  const cssPass = readViteManifest(path.join(outputDir, CSS_PASS_MANIFEST));
+  if (!client && !cssPass) return null;
+  const entryCss = client
+    ? Object.keys(client)
+        .filter((key) => client[key].isEntry)
+        .flatMap((key) => collectChunkCss(client, key))
+    : [];
+  const byId = new Map(routes.map((route) => [route.id, route]));
+  const table: Record<string, string[]> = {};
+  for (const route of routes) {
+    if (route.isLayout || route.file.includes("_layout") || isResourceRoute(route)) continue;
+    const manifest = cssPassRouteIds.has(route.id) ? cssPass : client;
+    if (!manifest) continue;
+    const chain: Route[] = [route];
+    for (let id = route.parentId; id; ) {
+      const parent = byId.get(id);
+      if (!parent) break;
+      chain.unshift(parent);
+      id = parent.parentId;
+    }
+    const hrefs = [...entryCss];
+    for (const member of chain) {
+      hrefs.push(...collectChunkCss(manifest, clientRouteManifestKey(cwd, member.file)));
+    }
+    table[route.id] = [...new Set(hrefs)];
+  }
+  const routeCss: RouteCssManifest = { format: ROUTE_CSS_MANIFEST_FORMAT, routes: table };
+  fs.writeFileSync(path.join(outputDir, ROUTE_CSS_MANIFEST), JSON.stringify(routeCss, null, 2));
+  return routeCss;
+}
+
 function extractClientCssFiles(outputDir: string): string[] {
   const assetsDir = path.join(outputDir, "assets");
   if (!fs.existsSync(assetsDir)) return [];
@@ -1190,6 +1252,7 @@ interface RuntimeBundleBuilderOptions {
   pageRoutes: Route[];
   clientEntryScriptSrc: string | null;
   clientCssFiles: string[];
+  routeCss: RouteCssManifest | null;
   userConfig: Record<string, any>;
   runtimeAliases?: Array<{ find: string; replacement: string }> | Record<string, string>;
   /** `true` = process the whole dependency graph (react-compat). */
@@ -1325,6 +1388,7 @@ async function buildRuntimeBundle(
       appRoutes,
       options.clientEntryScriptSrc,
       options.clientCssFiles,
+      options.routeCss,
       entryPath,
       options.routeRules,
       globalMiddlewarePath
@@ -1821,6 +1885,7 @@ function generateRuntimeEntrySource(
   appRoutes: Route[],
   clientEntryScriptSrc: string | null,
   clientCssFiles: string[],
+  routeCss: RouteCssManifest | null,
   entryPath: string,
   routeRules: NeutronConfig["routes"] | undefined,
   globalMiddlewarePath?: string
@@ -1860,11 +1925,12 @@ function generateRuntimeEntrySource(
   },`);
   });
 
-  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore } from "@neutron-build/core/runtime-edge";
+  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs } from "@neutron-build/core/runtime-edge";
 ${imports.join("\n")}
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
 const CLIENT_STYLESHEET_HREFS = ${JSON.stringify(clientCssFiles)};
+const ROUTE_CSS = ${JSON.stringify(routeCss)};
 const ROUTE_RULES = compileRouteRules(${routeRulesJson});
 
 const ROUTE_DEFS = [
@@ -1932,7 +1998,7 @@ async function handleNeutronRequestInner(request) {
     routeModules,
     {
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
-      stylesheetHrefs: CLIENT_STYLESHEET_HREFS,
+      stylesheetHrefs: routeStylesheetHrefs(ROUTE_CSS, match.route.id, CLIENT_STYLESHEET_HREFS),
       loaderDataCache: LOADER_DATA_CACHE,
       requestTrace: {
         requestId: String(++__requestSeq),

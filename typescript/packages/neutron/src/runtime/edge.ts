@@ -23,3 +23,4 @@ export {
   isJsonRequest,
 } from "../core/render-app-route.js";
 export { createMemoryLoaderCacheStore } from "../server/cache-store.js";
+export { routeStylesheetHrefs } from "../core/route-css.js";
