@@ -27,6 +27,11 @@
 //!   [`failure_message_tail`] — stderr when it has content, otherwise
 //!   the last ~4000 bytes of the run's `NB_LOG` (card B-0-F6,
 //!   escalation nv3-B-0-esc-2).
+//! - Every measured row runs one build profile of the client: a
+//!   **release** build, enforced by [`measured_build_allowed`] at the
+//!   top of `run` and recorded as `provenance.nbench_build.profile`
+//!   (card B-0-F7-F1 J5; verdict B-0-F7 finding 3: the debug client's
+//!   per-query JSON work is harness time inside the measured latency).
 
 use crate::digest;
 use crate::error::{Error, Result};
@@ -51,6 +56,29 @@ pub struct RunOutcome {
     pub report_path: PathBuf,
     /// True when a strict digest mismatch voided the run.
     pub voided: bool,
+}
+
+/// The build profile of the nbench binary, as a word for provenance
+/// (card B-0-F7-F1 J5). Pure over `cfg!(debug_assertions)` so the
+/// mapping itself is testable.
+pub fn build_profile(debug_assertions: bool) -> &'static str {
+    if debug_assertions { "debug" } else { "release" }
+}
+
+/// Whether a `nbench run` with this tag may measure with this build
+/// profile (card B-0-F7-F1 J5): every row except the smoke tag refuses
+/// a debug client. The refusal is a [`Error::Usage`] so it prints with
+/// the usage text and starts nothing.
+pub fn measured_build_allowed(tag: Option<&str>, profile: &str) -> Result<()> {
+    if tag == Some("smoke") || profile == "release" {
+        return Ok(());
+    }
+    Err(Error::Usage(
+        "nbench run of a measured row needs a release build \
+         (cargo build --release -p nbench); debug clients add harness time \
+         inside measured latencies — verdict B-0-F7 finding 3"
+            .into(),
+    ))
 }
 
 /// Convert days since the Unix epoch to a civil (y, m, d) date.
@@ -912,6 +940,16 @@ pub fn run_row(
                     ]),
                 ),
                 ("versions", Value::s(versions.trim())),
+                (
+                    // card B-0-F7-F1 J5: one build profile for all rows,
+                    // recorded so the rule is checkable from the results
+                    // file alone
+                    "nbench_build",
+                    Value::obj(vec![(
+                        "profile",
+                        Value::s(build_profile(cfg!(debug_assertions))),
+                    )]),
+                ),
             ]),
         ),
         ("digest", digest_obj),
@@ -1271,5 +1309,34 @@ mod tests {
         std::fs::write(&empty, "").expect("write empty log");
         let msg = failure_message_tail(b"", &empty);
         assert_eq!(msg, format!("no stderr; log {} is empty", empty.display()));
+    }
+
+    // ---- card B-0-F7-F1: one build profile for all rows (J5) ----
+
+    #[test]
+    fn measured_rows_refuse_a_debug_build() {
+        // Verdict B-0-F7 finding 3: the debug client's per-query JSON
+        // work (~0.3–0.4 ms) is harness time inside the measured
+        // latency — about 100% of a 0.34 ms p50 — and the pgvector arm
+        // times a release binary. Only the smoke tag is exempt.
+        // DEBUG-ALLOWED (always Ok) fails here.
+        let err = measured_build_allowed(None, "debug").expect_err("no tag + debug refuses");
+        let text = format!("{err}");
+        assert!(text.contains("release build"), "{text}");
+        assert!(
+            text.contains("B-0-F7"),
+            "the rule cites its verdict: {text}"
+        );
+        assert!(measured_build_allowed(Some("smoke"), "debug").is_ok());
+        assert!(measured_build_allowed(None, "release").is_ok());
+        assert!(measured_build_allowed(Some("x"), "debug").is_err());
+        // release is fine with any tag
+        assert!(measured_build_allowed(Some("x"), "release").is_ok());
+    }
+
+    #[test]
+    fn build_profile_names_both_profiles() {
+        assert_eq!(build_profile(true), "debug");
+        assert_eq!(build_profile(false), "release");
     }
 }

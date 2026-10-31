@@ -42,6 +42,11 @@ Overrides: `--set key=value` (repeatable) — e.g. `--set runs=5
 --set duration_s=60 --set scale=100 --set clients=1,16,64`. Defaults
 implement card B-0 Work item 3 exactly.
 
+Measured rows need a **release build** (`cargo build --release -p
+nbench`): `nbench run` refuses a debug client for any row without
+`--tag smoke` (card B-0-F7-F1 J5), and every results JSON records
+`provenance.nbench_build.profile`.
+
 ## How a row runs (§5.2 mapping)
 
 1. Pin: every system starts from a digest-pinned image (`systems/*/image.txt`).

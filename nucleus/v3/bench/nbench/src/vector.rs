@@ -7,12 +7,20 @@
 //!   spirit: wrong answers void the run).
 //! - recall@10 is computed against the dataset's own ground truth with
 //!   0-based ids, the same convention the groundtruth file uses.
-//! - Qdrant is driven over its REST API with `wait=true` writes and
-//!   collection status polled to `green` before any search is timed, so
-//!   the QPS numbers never include background indexing. Readiness is
-//!   [`collection_ready`] (green + all points; tail segments may stay
-//!   unindexed), a pure seam unit-tested against the alternative
-//!   predicate it replaced.
+//! - Qdrant is driven over its REST API with `wait=true` writes, and
+//!   readiness is a **settled index**, not a green poll (card
+//!   B-0-F7-F1 judgements J2/J3; verdict B-0-F7 finding 1: one green
+//!   poll raced the optimizer and let the same inputs land in three
+//!   different index states). After the upload the loader always
+//!   applies the tail rule — PATCH
+//!   `{"optimizers_config":{"indexing_threshold":1}}`
+//!   ([`QDRANT_TAIL_INDEXING_THRESHOLD_KB`]) — and then
+//!   [`qdrant_wait_settled`] requires green, optimizer ok, an empty
+//!   update queue, all points present, `indexed == points`, and
+//!   identical `(segments, indexed)` on every poll across a trailing
+//!   window of `max(30 s, 2 × flush_interval_sec)`
+//!   ([`settle_decision`], the pure seam). A collection whose state
+//!   drifts across restarts is refused by [`same_index_state`] (J4).
 //! - The timed search pass must measure Qdrant, not TCP mechanics:
 //!   [`qdrant_latency_sanity`] rejects a per-query p50 above
 //!   [`QDRANT_P50_SANITY_LIMIT_MS`] (gate verdict ddb00ba5 defect 1 — a
@@ -432,88 +440,450 @@ fn parse_search_hits(body: &[u8]) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
-/// Poll the collection until it is `green` with all points present.
+/// The tail rule of card B-0-F7-F1 judgement J3 (pre-registered): the
+/// value sent as `optimizers_config.indexing_threshold` (in KB — Qdrant
+/// docs: "Maximum size (in kilobytes) of vectors allowed for plain
+/// index, exceeding this threshold will enable vector indexing … To
+/// disable vector indexing, set to `0`") after every upload, before any
+/// readiness wait. 1 KB indexes every segment, including the tail a
+/// default threshold (10000 KB ≈ 19.5k 128-d vectors) leaves
+/// exact-scanned; that unindexed tail made the row's latency
+/// non-deterministic (9x apart at ef16 — verdict B-0-F7 finding 1).
+/// Unconditional, so every build follows one procedure, and the value
+/// is recorded in provenance (§5.2 rules 2 and 6). **0 must never be
+/// sent: it disables indexing entirely.**
+pub const QDRANT_TAIL_INDEXING_THRESHOLD_KB: usize = 1;
+
+/// The settle window of judgement J2: `max(30, 2 × flush_interval_sec)`
+/// seconds. The optimizer's flush interval bounds how long a state can
+/// hide from a status poll, so a window of twice it (never under 30 s)
+/// is the shortest trailing history that can trust "nothing is still
+/// moving".
+pub fn settle_window_s(flush_interval_sec: usize) -> f64 {
+    let twice_flush = 2.0 * flush_interval_sec as f64;
+    let floor = 30.0;
+    if twice_flush > floor {
+        twice_flush
+    } else {
+        floor
+    }
+}
+
+/// One status poll: the collection summary plus the wall-clock second
+/// (relative to the start of the wait) it was taken at. `at_s` is what
+/// gives the settle window its span.
+#[derive(Clone, Copy, Debug)]
+pub struct StatePoll {
+    /// Seconds since the wait began.
+    pub at_s: f64,
+    /// The summary read at that moment.
+    pub s: CollectionSummary,
+}
+
+/// The verdict of [`settle_decision`] (card B-0-F7-F1 J2/J3):
+/// `Settled` only when the whole trailing window says the index is
+/// done and stable; `Waiting(reason)` while it does not; `Refused`
+/// when the collection was not built by this procedure at all (the
+/// tail rule is absent, or there are more points than expected).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Settle {
+    /// Every J2 condition holds on every poll in the window.
+    Settled,
+    /// Not settled yet; the reason names the first failing condition
+    /// and its values.
+    Waiting(String),
+    /// The collection cannot settle under this procedure (J3 not
+    /// applied, or points above the expectation).
+    Refused(String),
+}
+
+/// Apply the settle predicate of card B-0-F7-F1 judgement J2 (pure, so
+/// the readiness rule is a unit-tested seam — the rule it replaces, a
+/// single green poll, passed 98.5%-indexed collections that then cost
+/// every query an exact scan).
 ///
-/// `indexed_vectors_count` equals `points_count` only when Qdrant's
-/// optimizer decides every segment warrants an HNSW graph; with the
-/// default optimizer settings small tail segments legitimately stay
-/// unindexed (exact-scanned) while the collection is green. Readiness is
-/// therefore green + all points; the indexed fraction is printed as
-/// provenance into the row's init log.
-pub fn qdrant_wait_green(
+/// - `Refused` when the **last** poll shows the tail rule was not
+///   applied (`indexing_threshold_kb != QDRANT_TAIL_INDEXING_THRESHOLD_KB`)
+///   or `points > expected_points` — waiting cannot fix either.
+/// - `window_s == 0.0` considers only the last poll (the cheap
+///   re-check warm passes make against an already-settled collection).
+/// - `window_s > 0` takes the **shortest suffix** of `polls` whose span
+///   (`last.at_s − first.at_s`) is ≥ `window_s`; if no suffix spans the
+///   window the answer is `Waiting("history shorter than the window")`.
+/// - `Settled` iff every poll in that suffix is green, optimizer-ok,
+///   has an empty update queue, exactly `expected_points` points,
+///   `indexed == points`, and all of them carry identical
+///   `(segments, indexed)`. Otherwise `Waiting(reason)` naming the
+///   first failing condition and its values.
+pub fn settle_decision(polls: &[StatePoll], expected_points: usize, window_s: f64) -> Settle {
+    let Some(last) = polls.last() else {
+        return Settle::Waiting("no polls yet".into());
+    };
+    if last.s.indexing_threshold_kb != QDRANT_TAIL_INDEXING_THRESHOLD_KB {
+        return Settle::Refused(format!(
+            "indexing_threshold {} KB is not the pre-registered tail rule {} KB (J3): \
+             this collection was not built by this procedure",
+            last.s.indexing_threshold_kb, QDRANT_TAIL_INDEXING_THRESHOLD_KB
+        ));
+    }
+    if last.s.points > expected_points {
+        return Settle::Refused(format!(
+            "points_count {} exceeds the expected {}",
+            last.s.points, expected_points
+        ));
+    }
+    // The suffix the J2 conditions must hold on. window_s <= 0 is the
+    // one-poll mode; otherwise walk backwards until a suffix spans the
+    // window (the first hit is the shortest). A 1e-9 slack keeps float
+    // elapsed times from deciding a whole-second boundary.
+    let suffix: &[StatePoll] = if window_s <= 0.0 {
+        &polls[polls.len() - 1..]
+    } else {
+        let n = polls.len();
+        let mut start = n; // exclusive end of the prefix to drop
+        for k in 1..=n {
+            let span = polls[n - 1].at_s - polls[n - k].at_s;
+            if span + 1e-9 >= window_s {
+                start = n - k;
+                break;
+            }
+        }
+        if start == n {
+            return Settle::Waiting("history shorter than the window".into());
+        }
+        &polls[start..]
+    };
+    // Stability anchors are the LAST poll's numbers: every poll in the
+    // window must agree with them on segments and indexed count (J2's
+    // last condition), and the per-poll conditions are checked in J2's
+    // order so the reason names the first failure.
+    let (want_segments, want_indexed) = (last.s.segments, last.s.indexed);
+    for p in suffix {
+        let s = &p.s;
+        if s.status != "green" {
+            return Settle::Waiting(format!(
+                "status {} at t={:.1}s (want green)",
+                s.status, p.at_s
+            ));
+        }
+        if !s.optimizer_ok {
+            return Settle::Waiting(format!(
+                "optimizer_status is not \"ok\" at t={:.1}s",
+                p.at_s
+            ));
+        }
+        if s.update_queue != 0 {
+            return Settle::Waiting(format!(
+                "update_queue {} at t={:.1}s (want 0)",
+                s.update_queue, p.at_s
+            ));
+        }
+        if s.points != expected_points {
+            return Settle::Waiting(format!(
+                "points {} != expected {} at t={:.1}s",
+                s.points, expected_points, p.at_s
+            ));
+        }
+        if s.indexed != s.points {
+            return Settle::Waiting(format!(
+                "indexed {} != points {} at t={:.1}s (the tail is not indexed)",
+                s.indexed, s.points, p.at_s
+            ));
+        }
+        if s.segments != want_segments {
+            return Settle::Waiting(format!(
+                "segments {} at t={:.1}s != {} on the other polls in the window",
+                s.segments, p.at_s, want_segments
+            ));
+        }
+        if s.indexed != want_indexed {
+            return Settle::Waiting(format!(
+                "indexed {} at t={:.1}s != {} on the other polls in the window",
+                s.indexed, p.at_s, want_indexed
+            ));
+        }
+    }
+    Settle::Settled
+}
+
+/// The exact PATCH body of the J3 tail rule (pure so the bytes are
+/// pinned by a test — a `0` here would silently disable indexing, and
+/// a differently-shaped body would touch settings J3 forbids).
+fn tail_indexing_body() -> String {
+    let v = Value::obj(vec![(
+        "optimizers_config",
+        Value::obj(vec![(
+            "indexing_threshold",
+            Value::n(QDRANT_TAIL_INDEXING_THRESHOLD_KB as f64),
+        )]),
+    )]);
+    // `json::to_string` only fails on non-finite numbers and the single
+    // number here is the constant 1, so this cannot fail; the fallback
+    // exists because panics are forbidden and would surface as the
+    // server rejecting an empty body.
+    json::to_string(&v).unwrap_or_default()
+}
+
+/// Apply the J3 tail rule: `PATCH /collections/{c}` with
+/// `{"optimizers_config":{"indexing_threshold":1}}`. Sent after every
+/// upload, before any readiness wait, unconditionally — one procedure
+/// for every build. The PATCH is idempotent, so it uses the load-path
+/// retry; a non-200 response is a loud error carrying the body.
+pub fn qdrant_index_tail(host: &str, port: u16, collection: &str) -> Result<()> {
+    let resp = request_with_retry(
+        host,
+        port,
+        "PATCH",
+        &format!("/collections/{collection}"),
+        tail_indexing_body().as_bytes(),
+        Duration::from_secs(60),
+    )?;
+    if resp.status != 200 {
+        return Err(Error::Command {
+            name: format!("qdrant index tail (HTTP {})", resp.status),
+            status: resp.status as i32,
+            stderr_tail: String::from_utf8_lossy(&resp.body).to_string(),
+        });
+    }
+    // The response is evidence (a Qdrant "ok" acknowledgement carries
+    // result/status/time), so it lands in the run log, not just the
+    // exit code.
+    eprintln!(
+        "qdrant index tail (PATCH /collections/{collection}) -> {}: {}",
+        resp.status,
+        String::from_utf8_lossy(&resp.body)
+    );
+    Ok(())
+}
+
+/// The settled index state of a collection, as a `qdrant_wait_settled`
+/// wait left it: the summary fields plus the wait's own facts (J4 —
+/// the state that every restart must reproduce, and that rides in the
+/// pass metrics as numbers).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexState {
+    /// Collection status at settle time (`green`, by construction of
+    /// the settle rule).
+    pub status: &'static str,
+    /// `points_count`.
+    pub points: usize,
+    /// `indexed_vectors_count` (== `points` when settled).
+    pub indexed: usize,
+    /// `segments_count`.
+    pub segments: usize,
+    /// `update_queue.length` (0 when settled).
+    pub update_queue: usize,
+    /// `optimizer_status == "ok"`.
+    pub optimizer_ok: bool,
+    /// `config.optimizer_config.indexing_threshold` in KB.
+    pub indexing_threshold_kb: usize,
+    /// `config.optimizer_config.flush_interval_sec`.
+    pub flush_interval_sec: usize,
+    /// The window the settle used, seconds.
+    pub window_s: f64,
+    /// How long the wait took, seconds.
+    pub waited_s: f64,
+    /// Polls the wait took.
+    pub polls: usize,
+}
+
+impl IndexState {
+    /// Capture the outcome of a settle wait: the last poll's summary
+    /// plus the wait's own facts.
+    pub fn from_summary(s: CollectionSummary, window_s: f64, waited_s: f64, polls: usize) -> Self {
+        IndexState {
+            status: s.status,
+            points: s.points,
+            indexed: s.indexed,
+            segments: s.segments,
+            update_queue: s.update_queue,
+            optimizer_ok: s.optimizer_ok,
+            indexing_threshold_kb: s.indexing_threshold_kb,
+            flush_interval_sec: s.flush_interval_sec,
+            window_s,
+            waited_s,
+            polls,
+        }
+    }
+
+    /// Serialize to the compact JSON written by `--state-out` (flat, so
+    /// shell checks can `grep -o` the numbers out of it).
+    pub fn to_value(&self) -> Value {
+        Value::obj(vec![
+            ("status", Value::s(self.status)),
+            ("points", Value::n(self.points as f64)),
+            ("indexed", Value::n(self.indexed as f64)),
+            ("segments", Value::n(self.segments as f64)),
+            ("update_queue", Value::n(self.update_queue as f64)),
+            ("optimizer_ok", Value::Bool(self.optimizer_ok)),
+            (
+                "indexing_threshold_kb",
+                Value::n(self.indexing_threshold_kb as f64),
+            ),
+            (
+                "flush_interval_sec",
+                Value::n(self.flush_interval_sec as f64),
+            ),
+            ("window_s", Value::n(self.window_s)),
+            ("waited_s", Value::n(self.waited_s)),
+            ("polls", Value::n(self.polls as f64)),
+        ])
+    }
+
+    /// Parse the JSON [`IndexState::to_value`] wrote. A missing field
+    /// is [`Error::Missing`], never a default — a state file that
+    /// cannot be read in full must not be compared as if it were.
+    pub fn from_value(v: &Value) -> Result<IndexState> {
+        let status = v
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Missing("index state status".into()))?;
+        let num = |k: &str| -> Result<usize> {
+            v.get(k)
+                .and_then(Value::as_f64)
+                .map(|n| n as usize)
+                .ok_or_else(|| Error::Missing(format!("index state {k}")))
+        };
+        let fnum = |k: &str| -> Result<f64> {
+            v.get(k)
+                .and_then(Value::as_f64)
+                .ok_or_else(|| Error::Missing(format!("index state {k}")))
+        };
+        let optimizer_ok = v
+            .get("optimizer_ok")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::Missing("index state optimizer_ok".into()))?;
+        Ok(IndexState {
+            status: static_status(status),
+            points: num("points")?,
+            indexed: num("indexed")?,
+            segments: num("segments")?,
+            update_queue: num("update_queue")?,
+            optimizer_ok,
+            indexing_threshold_kb: num("indexing_threshold_kb")?,
+            flush_interval_sec: num("flush_interval_sec")?,
+            window_s: fnum("window_s")?,
+            waited_s: fnum("waited_s")?,
+            polls: num("polls")?,
+        })
+    }
+
+    /// The one-line form every settle prints (`vec-qdrant-load`,
+    /// `vec-qdrant-settle`): the numbers of J2/J3/J4 at a glance.
+    pub fn line(&self) -> String {
+        format!(
+            "index state: settled status={} points={} indexed={} segments={} \
+             threshold_kb={} window_s={} waited_s={:.1}",
+            self.status,
+            self.points,
+            self.indexed,
+            self.segments,
+            self.indexing_threshold_kb,
+            self.window_s,
+            self.waited_s
+        )
+    }
+}
+
+/// Poll the collection every 2 s until [`settle_decision`] says
+/// `Settled` (card B-0-F7-F1 J2), and return the [`IndexState`] it
+/// settled in.
+///
+/// `window: None` derives the window from the polled
+/// `flush_interval_sec` ([`settle_window_s`], J2); `Some(0.0)` is the
+/// one-poll re-check; any other `Some(w)` pins it. A `Refused`
+/// collection fails at once (waiting cannot fix it); at `timeout` the
+/// wait fails with the last `Waiting` reason and the last summary, so
+/// the log shows exactly what the optimizer was still doing. Status
+/// polls are idempotent reads through the load-path retry, so a
+/// dropped poll response does not void a long wait.
+pub fn qdrant_wait_settled(
     host: &str,
     port: u16,
     collection: &str,
     expected_points: usize,
+    window: Option<f64>,
     timeout: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+) -> Result<IndexState> {
+    let start = Instant::now();
+    let mut history: Vec<StatePoll> = Vec::new();
     loop {
-        // Status polls are pure reads: retry transient transport errors
-        // so a long wait is not voided by one dropped poll response.
-        let resp = request_with_retry(
-            host,
-            port,
-            "GET",
-            &format!("/collections/{collection}"),
-            b"",
-            Duration::from_secs(30),
-        )?;
-        if resp.status == 200 {
-            let v = json::parse(&String::from_utf8_lossy(&resp.body))?;
-            let result = v.get("result").cloned().unwrap_or(Value::Null);
-            let status = result
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let points = result
-                .get("points_count")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as usize;
-            let indexed = result
-                .get("indexed_vectors_count")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as usize;
-            if collection_ready(&status, points, indexed, expected_points) {
-                eprintln!(
-                    "collection green: {points} points, {indexed} indexed vectors \
-                     ({:.1}% in HNSW segments; the remainder is exact-scanned, which \
-                     is Qdrant's default optimizer policy for small tail segments)",
-                    100.0 * indexed as f64 / points.max(1) as f64
-                );
-                return Ok(());
+        let info = qdrant_collection_info(host, port, collection)?;
+        let summary = collection_summary(&info)?;
+        let at_s = start.elapsed().as_secs_f64();
+        history.push(StatePoll { at_s, s: summary });
+        let window_s = window.unwrap_or_else(|| settle_window_s(summary.flush_interval_sec));
+        match settle_decision(&history, expected_points, window_s) {
+            Settle::Settled => {
+                let waited_s = start.elapsed().as_secs_f64();
+                let polls = history.len();
+                return Ok(IndexState::from_summary(summary, window_s, waited_s, polls));
             }
-        }
-        if Instant::now() > deadline {
-            return Err(Error::Command {
-                name: "qdrant wait green".into(),
-                status: 1,
-                stderr_tail: format!("collection not green after {timeout:?}"),
-            });
+            Settle::Refused(reason) => {
+                return Err(Error::Command {
+                    name: "qdrant settle".into(),
+                    status: 1,
+                    stderr_tail: reason,
+                });
+            }
+            // At the timeout the wait fails with this (the last)
+            // Waiting reason and the last summary, so the log shows
+            // exactly what the optimizer was still doing.
+            Settle::Waiting(reason) => {
+                if start.elapsed() > timeout {
+                    return Err(Error::Command {
+                        name: "qdrant wait settled".into(),
+                        status: 1,
+                        stderr_tail: format!(
+                            "not settled after {timeout:?}: {reason}; last poll: status={} \
+                             points={} indexed={} segments={} update_queue={} threshold_kb={}",
+                            summary.status,
+                            summary.points,
+                            summary.indexed,
+                            summary.segments,
+                            summary.update_queue,
+                            summary.indexing_threshold_kb
+                        ),
+                    });
+                }
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     }
 }
 
-/// Readiness of a Qdrant collection: `green` **and** all expected points
-/// present.
-///
-/// Kept pure so the predicate is a unit-tested seam (gate verdict
-/// ddb00ba5 left the round-2 mutant M-D — reverting this to the older
-/// `indexed_vectors_count == points_count` bar — uncaught; the first
-/// assertion below is exactly the tail-segment state that predicate
-/// rejects). `indexed` is accepted (and ignored) because it is part of
-/// the status document the caller already parsed; it is printed as
-/// provenance by [`qdrant_wait_green`], never gated on.
-pub fn collection_ready(
-    status: &str,
-    points: usize,
-    indexed: usize,
-    expected_points: usize,
-) -> bool {
-    let _ = indexed;
-    status == "green" && points == expected_points
+/// The J4 state-equality seam: two settles (typically init and a
+/// post-restart pass) describe the **same** index iff `points`,
+/// `indexed`, `segments` and `indexing_threshold_kb` all agree. Wait
+/// facts (`window_s`, `waited_s`, `polls`) are deliberately not
+/// compared — they describe the wait, not the index. On a difference
+/// the error names every differing field with both values, so the
+/// refusal is its own evidence.
+pub fn same_index_state(a: &IndexState, b: &IndexState) -> Result<()> {
+    let mut diffs: Vec<String> = Vec::new();
+    if a.points != b.points {
+        diffs.push(format!("points {} vs {}", a.points, b.points));
+    }
+    if a.indexed != b.indexed {
+        diffs.push(format!("indexed {} vs {}", a.indexed, b.indexed));
+    }
+    if a.segments != b.segments {
+        diffs.push(format!("segments {} vs {}", a.segments, b.segments));
+    }
+    if a.indexing_threshold_kb != b.indexing_threshold_kb {
+        diffs.push(format!(
+            "indexing_threshold_kb {} vs {}",
+            a.indexing_threshold_kb, b.indexing_threshold_kb
+        ));
+    }
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Command {
+        name: "index state changed".into(),
+        status: 1,
+        stderr_tail: diffs.join("; "),
+    })
 }
 
 /// Fetch a collection's info document (`GET /collections/{c}`) and
@@ -541,8 +911,11 @@ pub fn qdrant_collection_info(host: &str, port: u16, collection: &str) -> Result
         .ok_or_else(|| Error::Missing("collection info result".into()))
 }
 
-/// The index-state facts a card B-0-F7 diagnosis needs from a
-/// collection info `result` document (Work 2), as a pure seam.
+/// The index-state facts a settle or diagnosis needs from a collection
+/// info `result` document (card B-0-F7 Work 2; B-0-F7-F1 Work 1), as a
+/// pure seam. Every field is mandatory: a missing field is
+/// [`Error::Missing`], never a default — a status document that cannot
+/// be read in full must not settle or diagnose as if it were green.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CollectionSummary {
     /// Collection status as reported (`green`/`yellow`/`grey`/`red`).
@@ -558,6 +931,16 @@ pub struct CollectionSummary {
     pub segments: usize,
     /// `update_queue.length`.
     pub update_queue: usize,
+    /// `optimizer_status` is exactly the string `"ok"` (Qdrant reports
+    /// `"ok"` or an error object such as `{"error": …}`; anything but
+    /// the string is `false`, never an error, so a broken optimizer
+    /// reads as not-ok and keeps the settle waiting).
+    pub optimizer_ok: bool,
+    /// `config.optimizer_config.indexing_threshold`, KB (the J3 knob).
+    pub indexing_threshold_kb: usize,
+    /// `config.optimizer_config.flush_interval_sec` (the J2 window
+    /// derives from it).
+    pub flush_interval_sec: usize,
 }
 
 /// Classify a collection status string into the four values Qdrant
@@ -587,12 +970,20 @@ fn nested_num(v: &Value, path: &[&str]) -> Result<usize> {
 
 /// Extract the diagnosis summary from a collection info `result`
 /// document. Pure; unit-tested against the live shape the preserved
-/// chain10 collection returned (grey, 92 segments).
+/// chain10 collection returned (grey, 92 segments) and against an
+/// optimizer error object.
 pub fn collection_summary(result: &Value) -> Result<CollectionSummary> {
     let raw_status = result
         .get("status")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Missing("collection status".into()))?;
+    let optimizer_ok = match result.get("optimizer_status") {
+        // Qdrant reports "ok" or an error object; only the exact
+        // string is ok (card B-0-F7-F1 J2).
+        Some(Value::Str(s)) => s == "ok",
+        Some(_) => false,
+        None => return Err(Error::Missing("optimizer_status".into())),
+    };
     let num = |k: &str| -> Result<usize> {
         result
             .get(k)
@@ -606,6 +997,15 @@ pub fn collection_summary(result: &Value) -> Result<CollectionSummary> {
         indexed: num("indexed_vectors_count")?,
         segments: num("segments_count")?,
         update_queue: nested_num(result, &["update_queue", "length"])?,
+        optimizer_ok,
+        indexing_threshold_kb: nested_num(
+            result,
+            &["config", "optimizer_config", "indexing_threshold"],
+        )?,
+        flush_interval_sec: nested_num(
+            result,
+            &["config", "optimizer_config", "flush_interval_sec"],
+        )?,
     })
 }
 
@@ -1014,21 +1414,259 @@ mod tests {
         assert_eq!(load_retry_backoff(9), Duration::from_secs(8));
     }
 
+    // ---- card B-0-F7-F1: the settle predicate (J2/J3) ----
+    //
+    // These tests replace `readiness_is_green_plus_all_points_not_
+    // indexed_equality`, which pinned the "green + all points, ~98.5%
+    // indexed is ready" rule that verdict B-0-F7 finding 1 found
+    // non-deterministic (the gate's build settled 984,064 of 1,000,000
+    // indexed and paid an exact scan on every query). The replacement
+    // is stricter, never looser — that replacement is authorised by the
+    // P card itself.
+
+    /// A settled 1M-point collection under the J3 tail rule: green,
+    /// optimizer ok, queue empty, fully indexed, 8 segments, threshold
+    /// 1 KB, flush 5 s (the live shape the 2026-10-31 row recorded).
+    fn settled_summary() -> CollectionSummary {
+        CollectionSummary {
+            status: "green",
+            points: 1_000_000,
+            indexed: 1_000_000,
+            segments: 8,
+            update_queue: 0,
+            optimizer_ok: true,
+            indexing_threshold_kb: QDRANT_TAIL_INDEXING_THRESHOLD_KB,
+            flush_interval_sec: 5,
+        }
+    }
+
+    /// Polls every 2 s from `from_s` to `to_s` inclusive, all carrying
+    /// the settled summary.
+    fn polls_between(from_s: f64, to_s: f64) -> Vec<StatePoll> {
+        let mut out = Vec::new();
+        let mut t = from_s;
+        while t <= to_s + 1e-9 {
+            out.push(StatePoll {
+                at_s: t,
+                s: settled_summary(),
+            });
+            t += 2.0;
+        }
+        out
+    }
+
     #[test]
-    fn readiness_is_green_plus_all_points_not_indexed_equality() {
-        // The tail-segment state the old predicate (verdict round-2
-        // mutant M-D: `indexed_vectors_count == points_count`) rejected:
-        // green with all 1M points and ~98.5% indexed IS ready — Qdrant's
-        // default optimizer policy leaves small tail segments
-        // exact-scanned. This assertion is what makes that mutant catchable.
-        assert!(collection_ready("green", 1_000_000, 985_000, 1_000_000));
-        // fully indexed and green is of course ready too
-        assert!(collection_ready("green", 1_000_000, 1_000_000, 1_000_000));
-        // points still arriving: not ready even if what exists is indexed
-        assert!(!collection_ready("green", 999_999, 999_999, 1_000_000));
-        // optimizer still running (yellow/grey): not ready at full count
-        assert!(!collection_ready("yellow", 1_000_000, 1_000_000, 1_000_000));
-        assert!(!collection_ready("grey", 0, 0, 1_000_000));
+    fn settle_requires_the_whole_window() {
+        // J2: every condition must hold across a trailing window, so a
+        // perfect-but-short history is Waiting, not Settled. SETTLE-
+        // ONE-GREEN (the old single-poll rule) settles both and fails
+        // here.
+        let short = polls_between(0.0, 28.0);
+        assert_eq!(
+            settle_decision(&short, 1_000_000, 30.0),
+            Settle::Waiting("history shorter than the window".into())
+        );
+        let spans = polls_between(0.0, 30.0);
+        assert_eq!(settle_decision(&spans, 1_000_000, 30.0), Settle::Settled);
+        // a longer history than the window still settles (the suffix
+        // covers it)
+        let long = polls_between(0.0, 60.0);
+        assert_eq!(settle_decision(&long, 1_000_000, 30.0), Settle::Settled);
+        // no polls at all is Waiting, never a guess
+        assert_eq!(
+            settle_decision(&[], 1_000_000, 30.0),
+            Settle::Waiting("no polls yet".into())
+        );
+    }
+
+    #[test]
+    fn settle_requires_a_full_index() {
+        // Verdict B-0-F7 finding 1, the gate's build: green with all
+        // points but 984,064 of 1,000,000 indexed, held for 60 s —
+        // still Waiting. SETTLE-PARTIAL-INDEX (drop the
+        // indexed == points condition) settles these and fails here.
+        let mut polls = polls_between(0.0, 60.0);
+        for p in &mut polls {
+            p.s.indexed = 984_064;
+        }
+        assert!(matches!(
+            settle_decision(&polls, 1_000_000, 30.0),
+            Settle::Waiting(ref r) if r.contains("indexed") && r.contains("984064")
+        ));
+        // chain10's wedged state: indexed 3.86x points
+        let mut wedged = polls_between(0.0, 60.0);
+        for p in &mut wedged {
+            p.s.indexed = 3_861_632;
+        }
+        assert!(matches!(
+            settle_decision(&wedged, 1_000_000, 30.0),
+            Settle::Waiting(_)
+        ));
+    }
+
+    #[test]
+    fn settle_requires_stable_segments_and_counts() {
+        // One poll mid-window with 9 segments instead of 8: the window
+        // caught a merge in progress, so it is not settled. SETTLE-
+        // UNSTABLE-OK (drop the identical-(segments, indexed)
+        // condition) settles the first case and fails here.
+        let mut drift = polls_between(0.0, 30.0);
+        drift[7].s.segments = 9;
+        assert!(matches!(
+            settle_decision(&drift, 1_000_000, 30.0),
+            Settle::Waiting(ref r) if r.contains("segments")
+        ));
+        // likewise one poll with a different indexed count
+        let mut other = polls_between(0.0, 30.0);
+        other[7].s.indexed = 984_064;
+        assert!(matches!(
+            settle_decision(&other, 1_000_000, 30.0),
+            Settle::Waiting(ref r) if r.contains("indexed")
+        ));
+    }
+
+    #[test]
+    fn settle_requires_green_ok_and_an_empty_queue() {
+        // Each J2 condition fails its own poll mid-window; every one of
+        // them must keep the settle Waiting. SETTLE-OPTIMIZER-IGNORED
+        // (drop optimizer_ok) lets the third case settle and fails
+        // here.
+        type Case = (&'static str, fn(&mut CollectionSummary));
+        let cases: Vec<Case> = vec![
+            ("status", |s| s.status = "yellow"),
+            ("status", |s| s.status = "grey"),
+            ("optimizer", |s| s.optimizer_ok = false),
+            ("update_queue", |s| s.update_queue = 3),
+        ];
+        for (needle, mutate) in cases {
+            let mut polls = polls_between(0.0, 30.0);
+            mutate(&mut polls[7].s);
+            let verdict = settle_decision(&polls, 1_000_000, 30.0);
+            assert!(
+                matches!(&verdict, Settle::Waiting(r) if r.contains(needle)),
+                "case {needle:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_refuses_a_collection_without_the_tail_rule() {
+        // J3 was not applied (the default threshold 10000): waiting
+        // cannot fix it — Refused. TAIL-RULE-UNCHECKED (drop this arm)
+        // turns this into Waiting/Settled and fails here.
+        let mut untouched = polls_between(0.0, 30.0);
+        for p in &mut untouched {
+            p.s.indexing_threshold_kb = 10_000;
+        }
+        assert!(matches!(
+            settle_decision(&untouched, 1_000_000, 30.0),
+            Settle::Refused(_)
+        ));
+        // more points than expected is refused the same way
+        let mut extra = polls_between(0.0, 30.0);
+        for p in &mut extra {
+            p.s.points = 1_000_001;
+            p.s.indexed = 1_000_001;
+        }
+        assert!(matches!(
+            settle_decision(&extra, 1_000_000, 30.0),
+            Settle::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn settle_with_zero_window_checks_one_poll() {
+        // window 0 is the warm-pass re-check: one poll, the last one.
+        // A bad earlier poll is ignored; a bad last poll waits.
+        let mut history = polls_between(0.0, 4.0);
+        history[0].s.status = "yellow";
+        assert_eq!(
+            settle_decision(&history, 1_000_000, 0.0),
+            Settle::Settled,
+            "an earlier poll outside the one-poll window is ignored"
+        );
+        let mut bad_last = polls_between(0.0, 4.0);
+        let n = bad_last.len();
+        bad_last[n - 1].s.update_queue = 1;
+        assert!(matches!(
+            settle_decision(&bad_last, 1_000_000, 0.0),
+            Settle::Waiting(_)
+        ));
+    }
+
+    #[test]
+    fn settle_window_is_twice_flush_or_30s() {
+        // J2: max(30 s, 2 x flush_interval_sec)
+        assert_eq!(settle_window_s(5), 30.0);
+        assert_eq!(settle_window_s(20), 40.0);
+        assert_eq!(settle_window_s(0), 30.0);
+        assert_eq!(settle_window_s(15), 30.0);
+    }
+
+    #[test]
+    fn tail_body_is_the_preregistered_patch_exactly() {
+        // J3: the PATCH body must be exactly this document. TAIL-BODY-
+        // ZERO (send 0, which *disables* indexing) fails here.
+        assert_eq!(
+            tail_indexing_body(),
+            r#"{"optimizers_config":{"indexing_threshold":1}}"#
+        );
+    }
+
+    #[test]
+    fn index_state_roundtrips_through_json() {
+        // J4: --state-out files are the equality evidence across
+        // restarts, so to_value -> from_value must be lossless, and a
+        // missing field must be a loud error, never a default.
+        let st = IndexState::from_summary(settled_summary(), 30.0, 64.0, 33);
+        let back = IndexState::from_value(&st.to_value()).expect("round trip");
+        assert_eq!(back, st);
+        assert_eq!(back.status, "green");
+        assert_eq!(back.window_s, 30.0);
+        assert_eq!(back.waited_s, 64.0);
+        assert_eq!(back.polls, 33);
+        let partial = json::parse(r#"{"status":"green","points":1000000}"#).expect("partial");
+        assert!(IndexState::from_value(&partial).is_err());
+        assert!(IndexState::from_value(&Value::Null).is_err());
+        // the printed line carries the J2/J3 numbers
+        let line = st.line();
+        assert!(
+            line.starts_with("index state: settled status=green points=1000000"),
+            "{line}"
+        );
+        assert!(line.contains("segments=8 threshold_kb=1"), "{line}");
+    }
+
+    #[test]
+    fn same_index_state_names_every_difference() {
+        // J4: the equality seam compares points, indexed, segments and
+        // indexing_threshold_kb — and names every differing field with
+        // both values. STATE-EQ-NO-SEGMENTS (ignore segments) passes
+        // the first case and fails here.
+        let a = IndexState::from_summary(settled_summary(), 30.0, 64.0, 33);
+        let mut b = IndexState::from_summary(settled_summary(), 0.0, 2.0, 1);
+        b.segments = 9;
+        let err = same_index_state(&a, &b).expect_err("segments differ");
+        let text = format!("{err}");
+        assert!(text.contains("segments"), "{text}");
+        assert!(text.contains('8') && text.contains('9'), "{text}");
+        b.segments = a.segments;
+        b.indexed = 999_999;
+        let err2 = same_index_state(&a, &b).expect_err("indexed differs");
+        assert!(format!("{err2}").contains("indexed"), "{err2}");
+        // wait facts are not index facts: different window/waited/polls
+        // with the same index is Ok
+        b.indexed = a.indexed;
+        assert!(same_index_state(&a, &b).is_ok());
+        // every differing field is named at once, not just the first
+        let mut c = IndexState::from_summary(settled_summary(), 30.0, 64.0, 33);
+        c.segments = 12;
+        c.indexing_threshold_kb = 10_000;
+        let both = format!("{}", same_index_state(&a, &c).expect_err("two differences"));
+        assert!(
+            both.contains("segments") && both.contains("indexing_threshold_kb"),
+            "{both}"
+        );
     }
 
     #[test]
@@ -1264,7 +1902,11 @@ mod tests {
     /// The `result` document the preserved chain10 collection returned
     /// on 2026-10-31 (restart + idle): grey, 92 segments,
     /// indexed_vectors_count 3.86x points_count, update_queue empty.
-    /// This is the live index-state shape the diagnosis recorded.
+    /// This is the live index-state shape the diagnosis recorded. The
+    /// optimizer_config values (indexing_threshold 10000,
+    /// flush_interval_sec 5) are read from the committed
+    /// `results/2026-10-31/vector-sift1m-qdrant.diagnosis-collection-info-chain10-era.txt`,
+    /// not invented.
     const CHAIN10_ERA_COLLECTION_INFO: &str = r#"{
         "status":"grey","optimizer_status":"ok",
         "indexed_vectors_count":3861632,"points_count":1000000,
@@ -1272,7 +1914,8 @@ mod tests {
         "config":{"params":{"vectors":{"size":128,"distance":"Euclid"},
           "shard_number":1,"replication_factor":1},
           "hnsw_config":{"m":16,"ef_construct":200,"full_scan_threshold":10000},
-          "optimizer_config":{"indexing_threshold":10000,"default_segment_number":0}},
+          "optimizer_config":{"indexing_threshold":10000,
+            "default_segment_number":0,"flush_interval_sec":5}},
         "payload_schema":{},"update_queue":{"length":0}}"#;
 
     #[test]
@@ -1280,6 +1923,8 @@ mod tests {
         // Card B-0-F7 Work 2: the summary must read exactly what the
         // server said — the 92-segment, 3.86x-indexed, grey state that
         // answers the card's recall question is data, not narrative.
+        // Card B-0-F7-F1 Work 1: optimizer_status and the optimizer
+        // config are part of that data now (J2/J3 read them).
         let v = json::parse(CHAIN10_ERA_COLLECTION_INFO).expect("fixture json");
         let s = collection_summary(&v).expect("summary");
         assert_eq!(s.status, "grey");
@@ -1287,15 +1932,25 @@ mod tests {
         assert_eq!(s.indexed, 3_861_632);
         assert_eq!(s.segments, 92);
         assert_eq!(s.update_queue, 0);
+        assert!(
+            s.optimizer_ok,
+            "the chain10-era dump reported optimizer_status \"ok\""
+        );
+        assert_eq!(s.indexing_threshold_kb, 10_000);
+        assert_eq!(s.flush_interval_sec, 5);
         // a settled collection reads just as truthfully
         let settled = json::parse(
-            r#"{"status":"green","indexed_vectors_count":985000,"points_count":1000000,
-                "segments_count":2,"update_queue":{"length":0}}"#,
+            r#"{"status":"green","optimizer_status":"ok",
+                "indexed_vectors_count":985000,"points_count":1000000,
+                "segments_count":2,"update_queue":{"length":0},
+                "config":{"optimizer_config":{"indexing_threshold":10000,
+                  "flush_interval_sec":5}}}"#,
         )
         .expect("settled json");
         let s2 = collection_summary(&settled).expect("summary");
         assert_eq!(s2.status, "green");
         assert_eq!(s2.segments, 2);
+        assert!(s2.optimizer_ok);
         // missing fields are loud errors, never zero-filled guesses
         assert!(collection_summary(&json::parse("{}").expect("empty")).is_err());
         assert!(
@@ -1304,6 +1959,53 @@ mod tests {
             )
             .is_err()
         );
+        // a config without the new nested fields is a Missing error
+        // too (card B-0-F7-F1 Work 1: never a default)
+        let no_flush = json::parse(
+            r#"{"status":"green","optimizer_status":"ok","points_count":1,
+                "indexed_vectors_count":1,"segments_count":1,
+                "update_queue":{"length":0},
+                "config":{"optimizer_config":{"indexing_threshold":1}}}"#,
+        )
+        .expect("no flush_interval_sec");
+        let err = collection_summary(&no_flush).expect_err("flush_interval_sec is mandatory");
+        assert!(format!("{err}").contains("flush_interval_sec"), "{err}");
+    }
+
+    #[test]
+    fn collection_summary_reads_an_optimizer_error_as_not_ok() {
+        // Card B-0-F7-F1 Work 1: Qdrant reports optimizer_status as the
+        // string "ok" or an error object; only the exact string counts
+        // as ok, and the object is not a parse error — the settle keeps
+        // waiting on it instead of crashing.
+        let error_obj = json::parse(
+            r#"{"status":"green","optimizer_status":{"error":"optimization failed"},
+                "indexed_vectors_count":100,"points_count":100,
+                "segments_count":1,"update_queue":{"length":0},
+                "config":{"optimizer_config":{"indexing_threshold":1,
+                  "flush_interval_sec":5}}}"#,
+        )
+        .expect("optimizer error json");
+        let s = collection_summary(&error_obj).expect("summary");
+        assert!(!s.optimizer_ok, "an error object is not \"ok\"");
+        // a missing optimizer_status is a loud error, never a default
+        let missing = json::parse(
+            r#"{"status":"green","indexed_vectors_count":100,"points_count":100,
+                "segments_count":1,"update_queue":{"length":0},
+                "config":{"optimizer_config":{"indexing_threshold":1,
+                  "flush_interval_sec":5}}}"#,
+        )
+        .expect("missing optimizer_status");
+        assert!(collection_summary(&missing).is_err());
+        // and a settle over an error-object collection waits on it
+        let mut polls = polls_between(0.0, 30.0);
+        for p in &mut polls {
+            p.s.optimizer_ok = false;
+        }
+        assert!(matches!(
+            settle_decision(&polls, 1_000_000, 30.0),
+            Settle::Waiting(ref r) if r.contains("optimizer_status")
+        ));
     }
 
     #[test]
