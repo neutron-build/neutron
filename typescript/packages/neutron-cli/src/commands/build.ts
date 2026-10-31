@@ -53,6 +53,12 @@ import { loadNeutronConfig } from "../lib/config.js";
 import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
 import { writePublicFilesMetadata } from "./public-files.js";
 import {
+  bareSpecifierPackage,
+  resolvePackageDir,
+  shipDependencies,
+  type ShippedDependencyRoot,
+} from "./ship-dependencies.js";
+import {
   SERVER_BUNDLE_MANIFEST,
   SERVER_BUNDLE_FORMAT,
   findGlobalMiddlewareFile,
@@ -1389,17 +1395,19 @@ function resolveAdapterForBuild(
 
 function createRuntimeBundleBuilder(
   options: RuntimeBundleBuilderOptions
-): (target: RuntimeBundleArtifact["target"]) => Promise<RuntimeBundleArtifact> {
-  const pending = new Map<
-    RuntimeBundleArtifact["target"],
-    Promise<RuntimeBundleArtifact>
-  >();
+): (
+  target: RuntimeBundleArtifact["target"],
+  bundleOptions?: { selfContained?: boolean }
+) => Promise<RuntimeBundleArtifact> {
+  const pending = new Map<string, Promise<RuntimeBundleArtifact>>();
 
-  return async (target: RuntimeBundleArtifact["target"]): Promise<RuntimeBundleArtifact> => {
-    let bundle = pending.get(target);
+  return async (target, bundleOptions = {}): Promise<RuntimeBundleArtifact> => {
+    const selfContained = bundleOptions.selfContained === true;
+    const key = `${target}:${selfContained}`;
+    let bundle = pending.get(key);
     if (!bundle) {
-      bundle = buildRuntimeBundle(options, target);
-      pending.set(target, bundle);
+      bundle = buildRuntimeBundle(options, target, selfContained);
+      pending.set(key, bundle);
     }
     return bundle;
   };
@@ -1407,7 +1415,8 @@ function createRuntimeBundleBuilder(
 
 async function buildRuntimeBundle(
   options: RuntimeBundleBuilderOptions,
-  target: RuntimeBundleArtifact["target"]
+  target: RuntimeBundleArtifact["target"],
+  selfContained = false
 ): Promise<RuntimeBundleArtifact> {
   const appRoutes = options.pageRoutes.filter((route) => route.config.mode === "app");
   if (appRoutes.length === 0) {
@@ -1444,12 +1453,44 @@ async function buildRuntimeBundle(
   );
 
   const bundleOutDir = path.join(options.outputDir, "server", target);
+  // Self-contained (docker): core's own dependencies stay external exactly as
+  // in the start bundle (bundling them fails under pnpm + preserveSymlinks),
+  // and everything the bundle imports is shipped into the output.
+  const externals = selfContained
+    ? importerResolvedExternals(bundleOutDir, corePackageRoots(options.cwd))
+    : null;
+  const imported = new Set<string>();
   await bundleServerEntry(options, {
     entryPath,
     outDir: bundleOutDir,
     target: target === "worker" ? "webworker" : "node",
     chunkFileNames: "chunks/[name]-[hash].js",
+    ...(externals
+      ? { plugins: [externals.plugin, collectExternalImportsPlugin(imported)], external: ["vite"] }
+      : {}),
   });
+  if (externals) {
+    const roots: ShippedDependencyRoot[] = [];
+    const aliases = externals.aliases();
+    const seen = new Set<string>();
+    for (const specifier of imported) {
+      const name = bareSpecifierPackage(specifier);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      const aliasTarget = aliases.get(name);
+      if (aliasTarget) {
+        roots.push({ realDir: aliasTarget, dest: path.join(bundleOutDir, "node_modules", name) });
+        continue;
+      }
+      // Bare: resolved from the bundle's location, i.e. the app root.
+      const realDir = resolvePackageDir(bundleOutDir, name);
+      if (realDir) {
+        roots.push({ realDir, dest: path.join(options.outputDir, "node_modules", name) });
+      }
+    }
+    const count = shipDependencies(options.outputDir, roots);
+    console.log(`  ${count} runtime packages shipped → ${path.relative(options.cwd, path.join(options.outputDir, "node_modules"))}/`);
+  }
 
   const entryRelativePath = path.relative(options.outputDir, path.join(bundleOutDir, "entry.js"));
   return {
@@ -1850,6 +1891,10 @@ function importerResolvedExternals(outDir: string, nativeDepsOf: string[] = []) 
         return { id: alias + subpath, external: true };
       },
     },
+    /** Alias package name (`@neutron-external/<name>-<hash>`) → the real package root it stands for. */
+    aliases(): Map<string, string> {
+      return new Map(links);
+    },
     /** Create the alias symlinks (relative, so the dist moves with node_modules). */
     link(): void {
       for (const [alias, target] of links) {
@@ -1857,6 +1902,24 @@ function importerResolvedExternals(outDir: string, nativeDepsOf: string[] = []) 
         fs.mkdirSync(path.dirname(linkPath), { recursive: true });
         fs.rmSync(linkPath, { force: true, recursive: true });
         fs.symlinkSync(path.relative(path.dirname(linkPath), target), linkPath, "dir");
+      }
+    },
+  };
+}
+
+/** Records every external module id the emitted chunks import (static or dynamic). */
+function collectExternalImportsPlugin(into: Set<string>) {
+  return {
+    name: "neutron:collect-external-imports",
+    generateBundle(
+      _options: unknown,
+      bundle: Record<string, { type: string; imports?: string[]; dynamicImports?: string[] }>
+    ) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== "chunk") continue;
+        for (const id of [...(output.imports ?? []), ...(output.dynamicImports ?? [])]) {
+          if (!(id in bundle)) into.add(id);
+        }
       }
     },
   };

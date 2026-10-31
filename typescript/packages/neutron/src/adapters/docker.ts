@@ -20,7 +20,9 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
           throw new Error("Docker adapter requires runtime bundle support from neutron build.");
         }
 
-        const runtimeBundle = await context.ensureRuntimeBundle("node");
+        // The image context is dist/ alone: the bundle ships its runtime
+        // dependencies into dist/node_modules (real directories).
+        const runtimeBundle = await context.ensureRuntimeBundle("node", { selfContained: true });
         runtimeEntryImport = `./${runtimeBundle.entryRelativePath}`.replace(/\\/g, "/");
         context.log(`Docker runtime bundle: ${runtimeBundle.entryRelativePath}`);
       }
@@ -44,7 +46,8 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
       fs.writeFileSync(
         dockerIgnorePath,
         [
-          "node_modules",
+          // No node_modules here: dist/node_modules is the image's
+          // dependency set, shipped by the build.
           ".git",
           ".DS_Store",
           "npm-debug.log*",

@@ -306,6 +306,26 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`--preset docker` builds under pnpm and ships a self-contained context.**
+  With pnpm-linked core and `resolve.preserveSymlinks`, the docker runtime
+  bundle failed to build: it bundled core's own dependencies, and
+  gray-matter's `section-matter` is invisible from core's linked path. Keeping
+  them external, as the `start` bundle does, would not have been enough on its
+  own, because the image context is `dist/` alone and its `.dockerignore`
+  excluded `node_modules`, so the image had nothing to load them from. The
+  docker build now asks for a self-contained runtime bundle
+  (`ensureRuntimeBundle("node", { selfContained: true })`, new
+  `AdapterRuntimeBundleOptions`). Core's dependencies stay external, resolved
+  from core's real directory, and every external package the emitted chunks
+  import is copied, `pnpm deploy`-style, into the context as real directories
+  together with its production dependencies (resolved from each package's
+  real path, hoisted to `dist/node_modules` and nested only on a version
+  conflict). Core's aliased externals land under
+  `dist/server/node/node_modules/@neutron-external/` as copies instead of
+  symlinks into the build machine's store. `node_modules` is no longer in the
+  generated `.dockerignore`. The vercel/netlify runtime bundles are
+  unchanged.
+
 - **A redirected client navigation lands on the redirect target.** The router
   fetched loader data with fetch's default `redirect: "follow"` and never
   looked at the result: when the data request was redirected — a loader's

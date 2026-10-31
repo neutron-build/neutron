@@ -1987,6 +1987,102 @@ export function GET() { return Response.json({ parsed: z.object({ a: z.string() 
     }
   });
 
+  // The docker image context is dist/ alone (no node_modules beside it).
+  // With pnpm-linked core + preserveSymlinks the docker runtime bundle failed
+  // to build (gray-matter's section-matter is invisible from core's linked
+  // path), and a bundle that kept core's deps external would have had nothing
+  // to load them from in the image. The build now keeps them external, as
+  // start does, and ships them into dist/node_modules as real directories.
+  it("docker preset: builds with preserveSymlinks + pnpm-linked core and the context runs alone", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "docker-symlinks-fixture", type: "module" }),
+      "neutron.config.ts": `export default { runtime: "react-compat" };\n`,
+      "vite.config.ts": `export default { resolve: { preserveSymlinks: true } };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      // z is core's zod: resolvable only from core's real directory, so in
+      // the image it can only come from the shipped dependency set.
+      "src/routes/probe.tsx": `
+import { useState } from "react";
+import { useLocation, z } from "@neutron-build/core";
+export const config = { mode: "app" };
+export async function loader() { return { parsed: z.object({ a: z.string() }).parse({ a: "zod-ok" }).a }; }
+export default function Probe({ data }) {
+  const [n] = useState(7);
+  return <p>{"docker-" + n + "-" + useLocation().pathname + "-" + data.parsed}</p>;
+}
+`,
+    });
+    const context = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-docker-context-"));
+    try {
+      const build = runCli("build", dir, {}, ["--preset", "docker"]);
+      assert.equal(await build.exited, 0, build.output());
+      const dist = path.join(dir, "dist");
+
+      // The dependency set is in the context, as real directories.
+      assert.ok(fs.existsSync(path.join(dist, "node_modules", "section-matter", "package.json")), build.output());
+      const runtimeDir = path.join(dist, "server", "node");
+      const aliases = fs.readdirSync(path.join(runtimeDir, "node_modules", "@neutron-external"));
+      for (const alias of ["gray-matter", "zod"]) {
+        assert.ok(aliases.some((name) => name.startsWith(`${alias}-`)), aliases.join(", "));
+      }
+      const symlinks: string[] = [];
+      const walk = (current: string) => {
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+          const full = path.join(current, entry.name);
+          if (entry.isSymbolicLink()) symlinks.push(full);
+          else if (entry.isDirectory()) walk(full);
+        }
+      };
+      walk(path.join(dist, "node_modules"));
+      walk(runtimeDir);
+      assert.deepEqual(symlinks, []);
+      // And it is not excluded from the image.
+      const dockerignore = fs.readFileSync(path.join(dist, ".dockerignore"), "utf-8");
+      assert.ok(!dockerignore.split("\n").includes("node_modules"), dockerignore);
+
+      // The context alone, outside any tree with node_modules, serves the page.
+      fs.cpSync(dist, context, { recursive: true });
+      const port = await freePort();
+      const child = spawn(process.execPath, ["server.mjs"], {
+        cwd: context,
+        env: { ...process.env, PORT: String(port), NODE_PATH: "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout!.on("data", (chunk) => (output += chunk));
+      child.stderr!.on("data", (chunk) => (output += chunk));
+      const exited = new Promise((resolve) => child.on("exit", resolve));
+      try {
+        const deadline = Date.now() + 30_000;
+        let html = "";
+        while (Date.now() < deadline) {
+          assert.equal(child.exitCode, null, output);
+          try {
+            const res = await fetch(`http://127.0.0.1:${port}/probe`, { headers: { accept: "text/html" } });
+            html = await res.text();
+            assert.equal(res.status, 200, html + output);
+            break;
+          } catch (error) {
+            if (error instanceof assert.AssertionError) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 150));
+          }
+        }
+        assert.ok(html.includes("docker-7-/probe-zod-ok"), html + output);
+      } finally {
+        child.kill("SIGTERM");
+        await exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(context, { recursive: true, force: true });
+    }
+  });
+
   // Rolldown writes the chunks before it reports a resolve error; the dead
   // tree then sat under the app root, where the Vite runtime start falls
   // back to scans it (Tailwind source detection: +120 MB boot RSS on the

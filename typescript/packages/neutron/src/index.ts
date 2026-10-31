@@ -149,6 +149,7 @@ export type {
   AdapterBuildContext,
   AdapterRoutesSummary,
   AdapterRuntimeBundle,
+  AdapterRuntimeBundleOptions,
 } from "./adapters/adapter.js";
 export {
   parseCookieHeader,
