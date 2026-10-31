@@ -1171,7 +1171,8 @@ fn r14_unwind_host_steps_run_in_taskid_order() {
     let h = sched.lock();
     assert!(h.sched.crashed, "the crash was delivered");
     assert_eq!(
-        h.unwind_log, vec![1, 2],
+        h.unwind_log,
+        vec![1, 2],
         "post-crash host steps must run in TaskId order (the deterministic unwind), got {:?}",
         h.unwind_log
     );

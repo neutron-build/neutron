@@ -463,3 +463,120 @@ fn directed_arms_table_is_complete() {
     let d17 = campaign::directed_arms::run_arm(Mutant::CrcSkip);
     assert_eq!(d17, Some(true), "D17's arm must catch CRC-SKIP");
 }
+
+// ---- X5-R15 (P ruling nv3-X-5c-esc-3): the pass-fold line and verify's
+// always-report-all-three exit ----
+
+/// **X5-R15 (a) pin: the `E4 FOLD` line, from a literal 2-seed record
+/// set.** Seed A is fully passing but carries a round with O-1 text
+/// that **passes** the fold (the recovery-`Err` default O-1(a) text —
+/// the 1,315 d2c8bba7 MP rounds the Work 7 line's `O1_FAIL` wrongly
+/// counted as failures); it must contribute nothing. Seed B fails one
+/// round of the fold, one twin round, and carries a seed-level defect.
+/// The counts come from the pass fold and the seed-level
+/// `defect`/`deadlock`/`panic`/`baton` flags, never from O-1 text
+/// presence (validated against d2c8bba7: 1,598 failing seeds, 100
+/// failing twin rounds, 150 defect seeds). A fold that counts O-1 text
+/// presence (the reverted form) fails this test on seed A.
+#[test]
+fn r15a_fold_line_from_a_literal_2_seed_record_set() {
+    use e4_recovery::workload::{RoundRec, SeedRec, TwinRound};
+    let passing_round_with_o1_text = RoundRec {
+        // The shape of d2c8bba7's recovery-Err MP rounds: O-1 text
+        // present, round passing under the frozen fold.
+        o1_fail: Some("published {} != model {2, 3}".to_owned()),
+        pass: true,
+        ..RoundRec::default()
+    };
+    let a = SeedRec {
+        seed: 0,
+        class: "MP".to_owned(),
+        knobs: 1,
+        rounds: vec![
+            passing_round_with_o1_text,
+            RoundRec {
+                pass: true,
+                ..RoundRec::default()
+            },
+        ],
+        twin: vec![TwinRound {
+            pass: true,
+            o1_fail: None,
+        }],
+        ..SeedRec::default()
+    };
+    let b = SeedRec {
+        seed: 1,
+        class: "MP".to_owned(),
+        knobs: 2,
+        rounds: vec![
+            RoundRec {
+                pass: true,
+                ..RoundRec::default()
+            },
+            RoundRec {
+                pass: false,
+                ..RoundRec::default()
+            },
+        ],
+        twin: vec![TwinRound {
+            pass: false,
+            o1_fail: Some("scan mismatch".to_owned()),
+        }],
+        defect: Some("twin round 0: the crash spec never fired".to_owned()),
+        ..SeedRec::default()
+    };
+    assert_eq!(
+        campaign::fold_line(&[a.clone(), b.clone()]),
+        "E4 FOLD FAILING_SEEDS=1 FAILING_ROUNDS=1 TWIN_FAILING_ROUNDS=1 DEFECT_SEEDS=1",
+        "the fold counts pass-fold failures and seed-level flags, never O-1 text presence"
+    );
+    // And the Work 7 line keeps its own form (unchanged by X5-R15).
+    assert!(campaign::final_line(&[a.clone(), b.clone()]).starts_with("E4 SEEDS=2 "));
+}
+
+/// **X5-R15 (b) pin: `verify` reports all three checks before its exit,
+/// and `--no-quotas` does not fail on the quota table.** The exit code
+/// is decided once, at the end, from all three outcomes together
+/// ([`campaign::verify_exit_code`]): a seed-set failure or a
+/// non-reproducing digest always fails; a missed quota fails only
+/// without `--no-quotas` (the flag exists for X-5c-F1's Acceptance).
+#[test]
+fn r15b_verify_reports_all_three_checks_before_failing() {
+    // (a) everything clean: exit 0, plain and --no-quotas alike.
+    assert_eq!(campaign::verify_exit_code(true, 0, 0, false), 0);
+    assert_eq!(campaign::verify_exit_code(true, 0, 5, true), 0);
+    // (b) a missed quota: plain verify fails, --no-quotas does not (the
+    // table is still printed by the command).
+    assert_eq!(campaign::verify_exit_code(true, 0, 5, false), 2);
+    // (c) a non-reproducing digest fails both — --no-quotas waives the
+    // quota check only, never the digests or the seed set.
+    assert_eq!(campaign::verify_exit_code(true, 1, 0, true), 2);
+    assert_eq!(campaign::verify_exit_code(true, 1, 5, true), 2);
+    // (d) a seed-set failure fails both.
+    assert_eq!(campaign::verify_exit_code(false, 0, 0, true), 2);
+    // The seed-set predicate: exactly 0..CAMPAIGN_SEEDS-1 in order.
+    let good: Vec<e4_recovery::workload::SeedRec> = (0..campaign::CAMPAIGN_SEEDS)
+        .map(|s| e4_recovery::workload::SeedRec {
+            seed: s,
+            ..Default::default()
+        })
+        .collect();
+    assert!(campaign::verify_seed_set_ok(&good));
+    let mut hole = good.clone();
+    hole.truncate((campaign::CAMPAIGN_SEEDS - 1) as usize);
+    assert!(!campaign::verify_seed_set_ok(&hole));
+    // The digest report names the non-reproducing seeds.
+    let x = e4_recovery::workload::SeedRec {
+        seed: 7,
+        digest: 1,
+        ..Default::default()
+    };
+    let y = e4_recovery::workload::SeedRec {
+        seed: 7,
+        digest: 2,
+        ..Default::default()
+    };
+    let (n, list) = campaign::verify_digest_report(&[x], &[y]);
+    assert_eq!((n, list), (1, vec![7]));
+}

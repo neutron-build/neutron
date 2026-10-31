@@ -498,6 +498,43 @@ pub fn livelock_seeds(recs: &[SeedRec]) -> u64 {
         .count() as u64
 }
 
+/// **X5-R15 (a) (P ruling nv3-X-5c-esc-3): the pass-fold line.** Its
+/// counts come from the pass fold and the seed-level
+/// `defect`/`deadlock`/`panic`/`baton` flags — never from O-1/O-2/O-3
+/// text presence: the Work 7 line's `O1_FAIL` counts every record that
+/// carries an O-1 text, which in d2c8bba7 included 1,315 MP
+/// recovery-`Err` rounds that **pass** under the frozen fold (they
+/// carry the Err branch's default O-1(a) text). A seed fails the fold
+/// when any round fails it, any twin round fails it, or a seed-level
+/// flag (defect/deadlock/panic/baton) is set; RESULT item 7's n is
+/// `FAILING_SEEDS` (validated against d2c8bba7: 1,598 — the ruling's
+/// corrected count, not the 1,560 the README's first record carried).
+pub fn fold_line(recs: &[SeedRec]) -> String {
+    let mut failing_seeds = 0u64;
+    for r in recs {
+        let round_fail = r.rounds.iter().any(|x| !x.pass);
+        let twin_fail = r.twin.iter().any(|t| !t.pass);
+        if !r.passes() || twin_fail || round_fail {
+            failing_seeds += 1;
+        }
+    }
+    let failing_rounds = recs
+        .iter()
+        .flat_map(|r| r.rounds.iter())
+        .filter(|x| !x.pass)
+        .count() as u64;
+    let twin_failing_rounds = recs
+        .iter()
+        .flat_map(|r| r.twin.iter())
+        .filter(|t| !t.pass)
+        .count() as u64;
+    let defect_seeds = recs.iter().filter(|r| r.defect.is_some()).count() as u64;
+    format!(
+        "E4 FOLD FAILING_SEEDS={failing_seeds} FAILING_ROUNDS={failing_rounds} \
+         TWIN_FAILING_ROUNDS={twin_failing_rounds} DEFECT_SEEDS={defect_seeds}"
+    )
+}
+
 /// The final summary line (Work 7): counts over the 10,000 primary seeds.
 pub fn final_line(recs: &[SeedRec]) -> String {
     let mut o1 = 0u64;
@@ -538,11 +575,68 @@ pub fn final_line(recs: &[SeedRec]) -> String {
 
 fn print_final_line(recs: &[SeedRec]) {
     println!("{}", final_line(recs));
+    // X5-R15 (a): the pass-fold line after the Work 7 line, unchanged
+    // in form ("Keep the Work 7 line exactly as it is. After it, print
+    // one more line").
+    println!("{}", fold_line(recs));
 }
 
 // ---- verify ----
 
+/// X5-R15 (b): the seed-set check, pure — exactly `0..CAMPAIGN_SEEDS-1`
+/// in order, nothing missing, nothing extra.
+pub fn verify_seed_set_ok(recs: &[SeedRec]) -> bool {
+    recs.len() == CAMPAIGN_SEEDS as usize
+        && recs.first().map(|r| r.seed) == Some(0)
+        && recs.last().map(|r| r.seed) == Some(CAMPAIGN_SEEDS - 1)
+        && !recs.windows(2).any(|w| w[0].seed + 1 != w[1].seed)
+}
+
+/// X5-R15 (b): the digest comparison, pure — the count and the list of
+/// non-reproducing seeds (the report prints the list; the re-run itself
+/// is the command's job).
+pub fn verify_digest_report(recs: &[SeedRec], rerun: &[SeedRec]) -> (u64, Vec<u64>) {
+    let mut bad_list = Vec::new();
+    for (a, b) in recs.iter().zip(rerun.iter()) {
+        if a.seed != b.seed || a.digest != b.digest {
+            bad_list.push(a.seed);
+        }
+    }
+    (bad_list.len() as u64, bad_list)
+}
+
+/// X5-R15 (b): the exit decision, pure and **at the end** — every check
+/// has already been reported when this runs. Non-zero on a seed-set
+/// failure or a digest failure always; on a missed quota only without
+/// `--no-quotas` (the flag exists for X-5c-F1's Acceptance; X-5c's own
+/// keeps plain `verify`).
+pub fn verify_exit_code(
+    seed_set_ok: bool,
+    digest_bad: u64,
+    quota_missed: u64,
+    no_quotas: bool,
+) -> i32 {
+    if !seed_set_ok {
+        return 2;
+    }
+    if digest_bad > 0 {
+        return 2;
+    }
+    if quota_missed > 0 && !no_quotas {
+        return 2;
+    }
+    0
+}
+
 fn cmd_verify(args: &[String]) -> i32 {
+    // X5-R15 (b) (P ruling nv3-X-5c-esc-3): `verify` reports everything
+    // before it exits — the seed-set check, the digest check (with the
+    // list of non-reproducing seeds) and the full quota table all
+    // print, whatever failed, and the exit code is decided at the end.
+    // `--no-quotas` checks the seed set and the digests and prints the
+    // quota table without failing on it; it exists only for X-5c-F1's
+    // Acceptance (X-5c's own keeps plain `verify`).
+    let no_quotas = args.iter().any(|a| a == "--no-quotas");
     let Some(path) = parse_results(args) else {
         eprintln!("e4-campaign verify: --results is required");
         return 2;
@@ -565,20 +659,18 @@ fn cmd_verify(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // X5-R15 (b): the exit code is decided once, at the end, after all
+    // three checks have been reported.
+    let exit;
     // 1. The seed set is exactly the campaign's (0..9999).
     let n = recs.len();
-    let want = CAMPAIGN_SEEDS as usize;
-    if n != want
-        || recs.first().map(|r| r.seed) != Some(0)
-        || recs.last().map(|r| r.seed) != Some(CAMPAIGN_SEEDS - 1)
-        || recs.windows(2).any(|w| w[0].seed + 1 != w[1].seed)
-    {
+    let seed_set_ok = verify_seed_set_ok(&recs);
+    if !seed_set_ok {
         eprintln!(
             "e4-campaign verify: the seed set is not exactly 0..{} ({} records)",
             CAMPAIGN_SEEDS - 1,
             n
         );
-        return 2;
     }
     // 2. The digests reproduce. A re-run of every seed in the file.
     let threads = parse_threads(args).max(4);
@@ -608,24 +700,31 @@ fn cmd_verify(args: &[String]) -> i32 {
     let _retire = WatchRetire(std::sync::Arc::clone(&watch));
     let mut rerun = shared.lock().map(|m| m.clone()).unwrap_or_default();
     rerun.sort_unstable_by_key(|r| r.seed);
-    let mut bad = 0u64;
-    for (a, b) in recs.iter().zip(rerun.iter()) {
-        if a.seed != b.seed || a.digest != b.digest {
-            if bad < 10 {
+    let (bad, bad_list) = verify_digest_report(&recs, &rerun);
+    if bad > 0 {
+        for seed in bad_list.iter().take(10) {
+            let a = recs.iter().find(|r| r.seed == *seed);
+            let b = rerun.iter().find(|r| r.seed == *seed);
+            if let (Some(a), Some(b)) = (a, b) {
                 eprintln!(
                     "e4-campaign verify: seed {} did not reproduce ({} vs {})",
                     a.seed, a.digest, b.digest
                 );
             }
-            bad += 1;
         }
-    }
-    if bad > 0 {
-        eprintln!("e4-campaign verify: {bad} seeds did not reproduce");
-        return 2;
+        eprintln!(
+            "e4-campaign verify: {bad} seeds did not reproduce: {}",
+            if bad_list.len() <= 32 {
+                format!("{bad_list:?}")
+            } else {
+                format!("{}.. (first 32 shown)", bad_list.len())
+            }
+        );
     }
     // 3. Every 5.6 quota is met (and Work 5.3's sizing assertion holds:
-    // its row's achieved counts **misses**, which must be zero).
+    // its row's achieved counts **misses**, which must be zero). The
+    // table always prints; with `--no-quotas` a miss is reported but
+    // does not fail the exit.
     let rows = workload::quotas(&recs, CAMPAIGN_SEEDS);
     let mut missed = 0u64;
     for row in &rows {
@@ -646,12 +745,29 @@ fn cmd_verify(args: &[String]) -> i32 {
             missed += 1;
         }
     }
-    if missed > 0 {
+    if missed > 0 && !no_quotas {
         eprintln!("e4-campaign verify: {missed} quotas missed");
-        return 2;
     }
-    println!("VERIFY OK seeds={n} digests reproduce, every quota met");
-    0
+    if missed > 0 && no_quotas {
+        // X5-R15 (b): `--no-quotas` prints the table without failing
+        // on it (the digests and the seed set still do).
+        eprintln!("e4-campaign verify: {missed} quotas missed (--no-quotas: not failing the exit)");
+    }
+    // X5-R15 (b): every check has now been reported; the exit code is
+    // decided once, at the end, from all three outcomes together.
+    exit = verify_exit_code(seed_set_ok, bad, missed, no_quotas);
+    if exit == 0 {
+        if no_quotas {
+            println!(
+                "VERIFY OK (--no-quotas) seeds={n} digests reproduce; the quota table is printed above without judging it"
+            );
+        } else {
+            println!("VERIFY OK seeds={n} digests reproduce, every quota met");
+        }
+    } else {
+        println!("VERIFY FAILED seeds={n} (all three checks reported above; exit {exit})");
+    }
+    exit
 }
 
 // ---- mutants ----

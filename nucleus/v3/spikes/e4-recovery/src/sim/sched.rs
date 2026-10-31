@@ -307,7 +307,6 @@ impl<H: SchedHost> Sched<H> {
         }
     }
 
-
     /// Lock the world. Only meaningful for the baton holder; every caller
     /// runs between scheduler calls by construction.
     pub fn lock(&self) -> MutexGuard<'_, H> {
