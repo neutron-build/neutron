@@ -645,3 +645,33 @@ fn r16_no_twin_is_always_supplied() {
         );
     }
 }
+
+/// **X5-R16 MP-E pin — the completeness half (P ruling nv3-X-5c-esc-3;
+/// literal config = d2c8bba7's completeness seeds 47/118/198, round 0
+/// each).** All three carried "O-3(e): tainted referenced slot 0 not
+/// reported": slot 0 is the §2.1 **file header**, which §3.3's
+/// reference model has no reference for, so amcheck (i) can neither
+/// check nor report it — yet the harness's referenced set hardcoded
+/// it, making every media fault on its range an unreportable "tainted
+/// referenced slot". The referenced set is the image's own slots (the
+/// map's, the free set's, the metas'); the header stays covered by
+/// open's own read (a corrupt header fails open with XX001 at `Open`).
+/// On the reverted `used.insert(0)` the completeness text reappears.
+/// (The exactness half of MP-E is escalated with its evidence — see
+/// the README's stage record: seed 37's slot-11 finding is C-XX's
+/// mechanism inside a Q14 rollback, not an instrumentation defect.)
+#[test]
+fn r16_mpe_referenced_set_excludes_the_file_header() {
+    for seed in [47u64, 118, 198] {
+        let rec = workload::run_seed(seed, None);
+        let not_reported = rec
+            .rounds
+            .iter()
+            .filter_map(|r| r.o3_fail.as_ref())
+            .any(|t| t.contains("not reported"));
+        assert!(
+            !not_reported,
+            "seed {seed}: the header-slot completeness defect is back"
+        );
+    }
+}

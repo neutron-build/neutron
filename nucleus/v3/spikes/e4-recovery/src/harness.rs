@@ -2847,7 +2847,32 @@ pub fn durable_image(
             });
         }
     }
-    used.insert(0);
+    // **X5-R16 MP-E (completeness half, P ruling nv3-X-5c-esc-3): the
+    // referenced set is the image's own slots — not the file header.**
+    // Slot 0 is the §2.1 file header: §3.3's reference model has no
+    // reference for it (a page-map entry or a parent ref), so amcheck
+    // (i) can neither §3.3-check it nor report it, while the draft's
+    // `used.insert(0)` made every fault on its range a "tainted
+    // referenced slot not reported" (the 205 d2c8bba7 completeness
+    // rounds, all recovery-`Err`; the ruling's repro seeds 47/118/198
+    // each name slot 0). The header is still read by
+    // open (a corrupt header fails open with XX001, a detection the
+    // oracle sees at `Open`); it just leaves the amcheck-referenced
+    // set. The meta slots (1, 2) stay: they carry slotted findings of
+    // their own ("no valid meta", the rollback fallout).
+    // **X5-R16 MP-E (completeness half, P ruling nv3-X-5c-esc-3): the
+    // referenced set is the image's own slots — not the file header.**
+    // Slot 0 is the §2.1 file header: §3.3's reference model has no
+    // reference for it (a page-map entry or a parent ref), so amcheck
+    // (i) can neither §3.3-check it nor report it, while the draft's
+    // `used.insert(0)` made every fault on its range a "tainted
+    // referenced slot not reported" (the 205 d2c8bba7 completeness
+    // rounds, all recovery-`Err`; the ruling's repro seeds 47/118/198
+    // each name slot 0). The header is still read by open (a corrupt
+    // header fails open with XX001, a detection the oracle sees at
+    // `Open`); it just leaves the amcheck-referenced set. The meta
+    // slots (1, 2) stay: they carry slotted findings of their own
+    // ("no valid meta", the rollback fallout).
     used.insert(1);
     used.insert(2);
     // The meta bounds of card 3.8 (the harness walk reports them so
