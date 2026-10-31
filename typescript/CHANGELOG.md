@@ -394,6 +394,24 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **`neutron-ts build` prerenders static pages behind `src/middleware.ts`
+  for `neutron-ts start` again.** core/cli 0.4.0 refused any build with a
+  global middleware and a `mode: "static"` route, because prebuilt files
+  bypass request authorization. Under `start` they do not: its static fast
+  path runs global middleware before every prebuilt file it serves. The
+  refusal now applies only with an adapter other than `node` (`static`,
+  `docker`, `vercel`, `netlify`, `cloudflare`), where dist files are served
+  with no Neutron server in front. Resource routes, never prerendered, are
+  no longer loaded by that check either.
+- **`maxRequestBodyBytes` no longer turns every request into a 500.** The
+  0.4.0 body cap copied the incoming request with the native `Request`
+  constructor, which throws on `@hono/node-server`'s request object now that
+  `serve()` keeps the native globals. It rebuilds the request from its URL,
+  method, headers and signal.
+- **A nested `<Island>` renders inline after hydration too.** The islands
+  runtime hydrated each island outside the context that tells a nested
+  `<Island>` it is nested, so the client render emitted a marker the server
+  render did not.
 - **Dev no longer links a previous build's stylesheets.** With a `dist/`
   present, dev pages (and client navigations, whose stylesheet list comes
   from the same walk) could link `dist/assets/*.css` — minified CSS from an
