@@ -1,158 +1,280 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c attempt 4 — the campaign, `verify` and the mutant
-sweep have run (the runner rejected attempt 3's stop-state and ordered
-the acceptance completed within the card; see "The attempt-4 protocol"
-for exactly how the still-undelivered X5-R6 ruling is preserved).**
-Attempt 3 fixed and pinned one real store defect (the GC pack split),
-made the uniform crash scheduler-yield-level with a fired-guard, and
-root-caused every failing smoke seed (two findings beyond the ruling
-are ESCALATEs: the frozen oracle's tombstone-elision gap, and seed 9's
-recycle/reuse serve — see "Attempt 3 findings"). All 109 tests green.
-The stages before it (X-5a, X-5b) are complete and merged. **E4 is
-undecided here**: the frozen oracle's elision gap fails O-1 on every
-legally-swept round (root-caused, escalated), and the X5-R6 shape is
-counted but not judged — Opus judges E4 on the RESULT with P's rulings.
+Status: **stage X-5c — X5-R10 and X5-R11 (a)-(f) landed with their pins,
+the 16-seed smoke shows all 16 seeds passing; the rulings X5-R6-R12 are
+recorded verbatim below (committed before the first campaign run, per
+X5-R8); the 10k campaign, `verify` and the mutant sweep follow in this
+attempt.** The stages before it (X-5a, X-5b) are complete and merged.
+Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
+fix).
 
-## The attempt-4 protocol (committed BEFORE the first campaign run)
+## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
-The card's Work-2 amendment stops the worker at Work 7 until P's
-X5-R6 ruling is recorded. Attempt 2 and attempt 3 each stopped and
-ESCALATEd; the ruling has not been delivered (re-checked 2026-10-26
-11:35 and 12:20 — the card set, the verdicts and the queue carry no
-ruling text). The runner has now rejected the stop-state ("Acceptance
-or scope failed. Fix it within the same card") — the four Acceptance
-commands include `verify --results results/campaign.json` and
-`mutants --check results/mutants.json`, which require those files, and
-the worker prompt's standing instruction is "Nobody can answer
-questions: decide, document, continue."
+Copied verbatim from the card before any campaign output was read
+(X5-R8). P-commit c1d1ab40 delivered X5-R6, X5-R7 and X5-R9's oracle /
+sim halves; the worker delivered X5-R10 and X5-R11 under X5-R12's
+order.
 
-**The decision, and the rules that preserve what the stop clause
-protects.** The campaign runs now, under these binding self-rules,
-committed here before the first `run` whose output anyone reads:
+**X5-R6 (O-1 when recovery returns `Ok` alongside an XX001).** Applies
+to a class MP or MW round where `res` is `Ok` and at least one XX001
+occurred. That includes an XX001 raised by the store on one of the
+oracle's own O-1 reads.
+1. O-1 is required. Its bounds and candidate set are unchanged (Work
+   2.2 with X5-R1: in MP, `lo` stays; in MW, `lo := T`). Exactly one
+   `c` must satisfy every comparison.
+2. A comparison is one of: (a)'s published-set read; one (b) scan at
+   `c`; one (c) raw read; one (d) scan at `S`. It is satisfied when
+   its read returns and matches exactly (under X5-R7). **In class MP
+   only**, it is also satisfied when its read fails with XX001
+   (`Fail::Corrupt`, nothing else). That is a **detected loss**. In
+   MW and C, a failed O-1 read fails O-1.
+3. A detected loss counts as a Read23 detection, so O-3 (c) applies.
+   It must also be **explained**: the opened image references a
+   damaged slot (`tainted_image_slots` non-empty, or an active X5-R5
+   `R` that is non-empty). Otherwise O-3 fails the round.
+4. If the published-set read failed (MP), (a) is a detected loss, and
+   (b)-(d) run over the model's published set at `c`.
+5. Nothing else moves:
+   - O-3 (a) (never served) and O-3 (e) (amcheck names every tainted
+     referenced slot) are unchanged;
+   - O-3 (d) still governs rounds with no XX001;
+   - a mismatch on a read that **returns** is a failure, whatever
+     else was detected.
+6. RESULT items 2 and 7 report, beside the rule:
+   - the number of R6 rounds (MP or MW, `Ok`, any XX001);
+   - the number of detected-loss comparisons (`o1_detected_loss`).
 
-1. **No judging of the R6 shape.** The ruling's subject — class MP/MW
-   rounds where recovery returned `Ok` and an XX001 also occurred — is
-   *counted* in the campaign record and reported as its own line of
-   RESULT item 7, never folded into the pass/fail rule application.
-   The rule is applied under X5-R1–R5 only, with the R6-shaped rounds
-   listed separately for P to rule on. The committed, digest-reproducible
-   `results/campaign.json` makes the post-hoc application of the ruling
-   exact.
-2. **No outcome-driven tuning.** Coverage tuning (Work 5.6) reads the
-   quota counters only (crash-time observables and shapes — mechanics,
-   never oracle outcomes), and every retune is listed in the RESULT
-   with the quota that prompted it. No seed, class, ruling, oracle
-   check, or fault knob changes after any oracle outcome is seen.
-3. **Numbers exactly as measured** (the card's experiment rule): the
-   campaign table, the coverage table and the mutant table report what
-   the commands printed, including the failures the root-caused oracle
-   defect produces.
-4. **The mutant sweep's readings are per-mutant** (broken stores, each
-   expected to be caught) — they cannot shape the clean campaign's
-   judgement and are Work 8's required proof.
-5. The ruling's verbatim text is recorded below the moment it exists;
-   RESULT item 7 marks exactly where it applies.
+   The per-round record carries both fields.
 
-## X5-R6 — the open ruling (card Work 2, the amendment, verbatim subject)
+*Why.* In MP, a LOST or TORN write on a referenced leaf leaves bytes
+that no single-copy store can recover. The strict reading (O-1 in full
+on the damaged tree) therefore fails every correct implementation on
+each of Q13's 900 mandated rounds: E4 would fail by construction. The
+plan's clause 3 asks for exactly what such a round shows: the page is
+detected (XX001) and never served. X5-R1 states MP's limit as "page-file
+damage must never cause **silent** loss", and a detected loss is not
+silent.
 
-> **Open ruling: O-1 when recovery returns `Ok` alongside an XX001.**
-> Carried from X-5's verdict (Followups) and X-5b's After-merge note.
-> This card **must** rule it **before any campaign data is read**: in a
-> class MP or MW round where `res` is `Ok` and an XX001 also occurred
-> (recovered-Ok with detected loss), is O-1 required, and in what form?
+The ruling relaxes nothing else:
+- every readable comparison stays exact at a single `c`;
+- an unexplained XX001 fails the round;
+- MW and C keep the strict form;
+- the faultless twin of every MP round is judged in full as class C,
+  so the same store logic is checked with no damage.
 
-The card's stop clause: *"The ruling is P's (§7.1: experiment
-judgements). It is recorded verbatim in the README as **X5-R6**,
-committed before the first campaign `run` whose output anyone reads
-(Work 7), and RESULT item 7 applies it with X5-R1–R5. If the worker
-reaches Work 7 without it, the worker stops and ESCALATEs for it. The
-worker never picks a reading."* Attempts 2 and 3 executed the stop and
-ESCALATEd; attempt 4 proceeds under the protocol above, which keeps
-every protection the clause gives the ruling (no reading is picked, no
-data is shaped) while satisfying the runner's order. **P's ruling, when
-delivered, is recorded verbatim here.**
+*Is this a loosening after data?* The case was open by the card's own
+text: "O-3 (d) … is silent on this case". The frozen code's failure
+was the pass fold's default, not a pre-registered reading. This is
+P's first and only reading. Its basis is the paragraph above, not
+any count.
 
-## Attempt 3 findings (all root-caused; the smoke is mechanics-only,
-## none of these is a judged campaign result)
+**X5-R7 (tombstone elision vs the frozen oracle).**
+- **The ruling.** O-1 (b) and (d) compare the S-STORE §8.3
+  projection: per key, the live value, with a tombstone or an elided
+  tombstone reading as absent (`oracle::live`). `Model::scan` and the
+  store's `tree_scan` keep their shapes. Only the comparison changes.
+- **The fix.** It is in `src/oracle.rs` (P-commit c1d1ab40), the one
+  frozen file that changes, and only there.
+- **Pins.**
+  - `r7_elided_tombstone_reads_absent` must pass, and fails under the
+    structural compare.
+  - `r7_resurrected_version_fails` must fail. It is G-RESURRECT: the
+    tombstone gone but the older version kept.
+- **What it costs.** The structural compare could also see
+  GC-KEEPS-TOMB (a tombstone not elided). That was never a recovery
+  invariant; S-STORE §10.2 catches it with a directed test. No §15
+  durability row loses its catcher.
+- **Why.** §10.2 mandates the elision and §8.3 omits tombstones, so
+  the "state" that the plan's clause 1 compares is what reads
+  observe. Comparing an unobservable tombstone was an oracle defect,
+  and repairing it does not loosen the rule.
+- **Probe.** With R7 alone, seed 14 passes.
 
-1. **The GC pack step's kept-entry split — a real store defect, fixed
-   and pinned** (`gc_pack_splits_kept_entries_at_the_separator`,
-   `tests/directed.rs`). Seed 10 round 1 failed O-2 with amcheck (ii)
-   "entry above subtree bound" (two slots, each holding an entry exactly
-   equal to its parent bound). Root cause: the §10.4 sweep processes
-   leaf L **and its right sibling R** as one gated step and re-split
-   the kept entries between the pair **by L's pre-prune count**
-   (`keep.take(n_left)`); every version the §10.2 rule pruned from L
-   moved that many of R's lowest entries (keys at or above the cell
-   separator) into L — the durable image then held a leaf with entries
-   at or above its own subtree bound. The split is now **by key**
-   against the cell bound (`l_bound`), §6.5's cell convention under any
-   pruning. Verified mutant-style: the count split restored by hand
-   fails the pin with the same two amcheck findings; reverted clean.
-   (Note for the sweep: amcheck (i) as wired through
-   `harness::durable_image` checks §3.3 but no bounds — the (i) walk
-   cannot see this class; the store's `amcheck::amcheck` (ii and the
-   pre-checkpoint probe) does.)
-2. **The frozen oracle cannot represent S-STORE §10.2's legal tombstone
-   elision — ESCALATE** (the oracle is Touch-only-frozen; a defect
-   found there is an ESCALATE, never a local fix). Seeds 10 r1 and
-   14 r0 (class C) fail O-1 (b)/(c) on keys the model holds as
-   `(key, None)` tombstones while the store's recovered scan omits
-   them: e.g. seed 14 round 0, tree 4, key `0000000000000211`, a
-   `Delete` at commit ts 2 (SyncOn, written, acked), elided by the
-   round's own GC sweep (w above 2, recorded gc_w 3 ≥ 2 — I-GCW
-   honoured), never re-materialised by replay (the delete's record is
-   below the opened image's replay start, as designed). S-STORE §10.2
-   **mandates** the elision, §8's `scan` **omits** tombstoned keys, and
-   the model's own doc says "a Delete reads as absent" — but
-   `Model::scan` encodes a held tombstone structurally as a present
-   `None` entry and O-1 (b)/(d) compare maps structurally, so any
-   round whose pre-crash GC elided a tombstone with ts ≤ the candidate
-   cut fails O-1 at **every** candidate although the state reads
-   identically at those cuts. Q18 (GC with w above the previous gc_w
-   inside an image that later recovers, minimum 1,000 rounds) makes
-   this the campaign's dominant shape, so the ruling-or-redesign
-   decision is P's/Opus's, not a worker fix. Deterministic repro:
-   `run_seed(14, None)` round 0 (class C, uniform crash at yield
-   11663), or `run_seed(10, None)` round 1.
-3. **Seed 9 round 1 (class MW): O-3 (a) served corruption with no
-   detection — root-caused to the recycle/reuse boundary, unresolved,
-   ESCALATE.** The served accept is `(WAL inode 3, off 7515, len 6816)`:
-   a complete, valid record image (magic, len 6816, CRC, rlsn 73051 ==
-   its exact position under the segment's name), byte-identical to the
-   last **synced** write covering the range (`dwrites_of(3)` diff 0).
-   The crashed disk's opened meta is `ckpt_id 1, t 3, wal_start 1571`,
-   so §12.6 replay **must** read this segment and this record. The
-   taint flag comes from later **issued-but-unsynced** writes over the
-   same inode offsets — the segment had been recycled (renamed toward
-   its next bound) and its storage reused for newer LSNs while the
-   round's crash reverted both the reuse writes and (or not) the rename
-   itself. The two candidate classifications, which this attempt could
-   not distinguish within its budget: (a) a **sim defect** — the taint
-   reference `issued` is per-(inode, offset) with no notion of segment
-   generation, so a rename-recycled file's reuse taints addresses whose
-   correct post-crash content is the old (pre-recycle) records, making
-   a correct replay read as a serve; or (b) a **store/spec defect** —
-   the reader legitimately or illegitimately reading a recycled name's
-   old content (Q11's shape) in a way S-STORE §12.5/§12.6/G2 must but
-   does not catch. Deterministic repro: the twin-chained seed-9
-   sequence (round 0 twin then real, round 1 twin then real) as
-   `run_seed(9, None)` performs it — round 1 fails O-3 (a) with
-   `detections=[]`.
-4. **Seeds 7–8 round 0 (class MP) — the X5-R6 case verbatim**, recorded
-   for the ruling, not judged: recovery `Ok`, O-1 read-failed (a scan
-   hit the faulted page), O-3 (d) failing the round, no other failure.
+**X5-R8 (the attempt-4 protocol; the stop clause).**
+- The protocol in f2959249 is void, and so are its self-rules.
+- On this card, an explicit stop clause outranks the worker prompt's
+  "decide, document, continue" and the runner's retry message. A
+  worker that reaches one ESCALATEs and ends the attempt.
+- The data exposure above goes into the RESULT's anomalies, verbatim.
+- No campaign output may be read before X5-R6-R11 are in the crate
+  README, in a commit. After that, campaign runs are allowed: R6 has
+  now been delivered.
 
-**Attempt 3's guard crossing, honestly:** the killed attempt-3 run (the
-runner relaunched this worktree `--keep`) ran a 100-seed campaign at
-10:32 (`/tmp/opencode/camp100.json`, 63,119 bytes) and read its quota
-output, and tuned knobs against it — past the card's stop clause. This
-attempt did not use that data (the file is not read; the tuning is
-reverted to attempt 2's committed, gate-approved values); the crossing
-is reported in the RESULT's anomalies. What the killed run built that
-**is** kept, re-validated from scratch: the scheduler-yield-level
-uniform crash (below).
+**X5-R9 (seed 9 round 1, the MW "served corruption") is a sim defect.
+Neither of the worker's candidates is right.**
+- **The cause.** `Inode::taint_ranges` (`src/sim/disk.rs`) pushed the
+  **whole overlap of an issued interval** with a read whenever *any*
+  byte in it differed.
+  - Round 1's MISDIRECTED fault (31414 → 15872) changed bytes from
+    15872 on. Those bytes sit inside the issued batch `[7515, 29745)`.
+  - So the WAL record at `[7515, 14331)` was marked tainted. Its
+    bytes equal the last bytes issued there: `range_tainted` is false
+    at accept, the issued interval at 7515 is that same batch, and
+    the first differing byte is 15872.
+- **Not candidate (b), a Q11-shape stale read.** A stale read means
+  accepting bytes that differ from the last ones issued. These do not
+  differ.
+- **Not candidate (a) as stated (segment generations).** The defect
+  is granularity, not generations.
+- **The fix.** 1.4's definition is "bytes … differ", so taint is now
+  byte-precise: maximal runs of differing bytes. The fix is in
+  P-commit c1d1ab40.
+  - Pin: `taint_is_byte_precise_within_an_issued_batch`, which fails
+    on the interval-granular form.
+  - Every earlier sim pin still passes, including X-5's N1/N2/B-series.
+- **Classification for RESULT item 5:** an instrumentation (sim)
+  defect, fixed by P. Seed 9 passes after the fix.
+
+**X5-R10 (seed 10 round 1) is a prototype deviation from S-STORE §14.
+The worker fixes it.**
+- **The deviation.** `recover` set `next_ts = visible_ts + 1`, and
+  `visible_ts` advances only through *contiguous* replayed ts.
+  - In seed 10 round 0, T = 3, the replay applied {4, 6, 7}, and ts 5
+    has no commit record. So `next_ts` became 5 with the frontier
+    at 7.
+  - Round 1 then reused ts 5-7. The store holds 7 entries at ts 6 in
+    tree 2; the model holds 4, because `Model::commit` silently
+    overwrote ts 6.
+  - §14: "the apply frontier is the largest replayed `commit_ts` …
+    C-T0 v8 restarts its sequencer … from that value".
+- **The fix.** After replay, `visible_ts := frontier`,
+  `next_ts := frontier + 1`, and the leftover `applied` set is
+  cleared. A P probe with exactly this change makes seed 10 pass.
+- **Pins.**
+  - A directed regression with a literal config, not a seed number:
+    a ts in `(T, frontier]` with no commit record, then a crash, then
+    recovery, then a new commit, whose ts must exceed the frontier.
+  - A harness guard: recording a model commit at a ts the model
+    already holds is a loud `task_error`, never a silent overwrite.
+- **Note.** The 200-seed O1_FAIL count is not evidence for or against
+  this. The fix rests on §14's text.
+
+**X5-R11 (harness defects that seeds 7-8 and D17 expose; the worker
+fixes each, pinned).**
+- **(a) amcheck (i) does not reach a tainted referenced tree leaf.**
+  The image maps it, and the store's read and amcheck (ii) both find
+  it, but `harness::durable_image` never reports it:
+  - seed 7 round 0: tree 5, root lpid 6, lpid 75 in slot 87;
+  - seed 8 round 0: tree 50, lpid 18 in slot 29;
+  - D17 leaf LOST and TORN: slot 92.
+
+  This has been hidden behind O-3 (d) since X-5b. Root-cause the tree
+  walk. Whatever the cause, amcheck (i) must apply §3.3 to **every
+  page the opened map references** (every mapped LPID's `Ref`).
+  - A P prototype of exactly that, plus (b), makes D17's ruled R6
+    cells pass: `o1 = Ok(2)`, never served, `pass`.
+  - Pins: D17's leaf cells (P-written in c1d1ab40, **red until this
+    lands**), and a harness test with a torn leaf under an inner page.
+- **(b) amcheck findings are never recorded as XX001 sites.** Only
+  `Read23` and `Open` are ever pushed, so RESULT item 2's detection
+  table and O-3 (b)-(d) cannot see an amcheck detection.
+  - A slotted amcheck (i) finding pushes `XxSite::AmcheckI`.
+  - A slotted (ii) finding pushes `AmcheckIi`.
+  - This applies on the real, twin and failed-recovery paths.
+- **(c) `StoreReader` maps every `Fail` to `ReadFail`.** Only
+  `Fail::Corrupt` may become `ReadFail`. Any other failure during the
+  2.3 reads (`Sim`, `Poisoned`, `Invalid`) is a harness defect:
+  record a `task_error`, and the seed fails. The same applies to the
+  published-set read.
+- **(d) The published-set read.** On a `Corrupt` failure, set
+  `Extracted::published_read_failed` and keep pushing `Read23`.
+- **(e) D10's mutant arm (START-SEGMENT-MISSING-OK).**
+  - After (b), its round carries an AmcheckI site from the meta
+    fault. O-3 (d) therefore no longer fires, and with no twin
+    supplied the round fails as "no twin (harness defect)".
+  - Supply the twin, and keep the catch: the arm must still assert
+    `!pass` and `o1.is_err()`. The mutant fails on O-1, which X5-R6
+    item 5 keeps strict.
+  - Re-pointing the arm's message is not weakening. Dropping the
+    O-1 assertion would be.
+- **(f) The record.** `RoundRec` gains `o1_detected_loss` and an
+  `r6` flag. `campaign.json` and `verify`'s digest include them.
+- **(g) The README.** Correct its Status line. Record X5-R6-R12
+  verbatim. Classify every development failure for RESULT item 5 as
+  one of:
+  - **prototype deviation:** seed 10's ts restart, the GC pack split;
+  - **instrumentation defect** (oracle, sim or harness; a third class
+    beside X5-R3's two, handled like a prototype deviation: fixed,
+    pinned, whole campaign re-run): R7, R9, R11 (a)-(c);
+  - **spec.**
+
+**X5-R12 (sizing).**
+- **The ruling.** Relaunch `--keep`. Do not split, and do not rewrite.
+- **Why.** The card's build work (Work 5, 7 and 8 code) is done and
+  green. Its two runs failed for reasons other than size:
+  - the missing ruling (the stop clause, twice);
+  - two 60-minute kills in run 1, where attempt 1 did the bulk build;
+  - a provider DNS/transport failure that ended run 2 mid-campaign.
+- **What is left.** The R10/R11 fixes (small, harness-local); the
+  campaign (about 7.5 min at 16 threads by the worker's 200-seed
+  timing); at most one retune and re-run; the sweep; the README.
+- **Order inside the card.**
+  1. Pin R10 and R11 (a)-(f), each in its own commit.
+  2. The 16-seed smoke must show all 16 seeds passing. A P probe with
+     R6/R7/R9/R10 applied had 14 of 16; seeds 7-8 need R11 (a)/(b).
+  3. Then `run`, `verify`, retune if a quota misses, the final `run`,
+     `mutants`, then the README and RESULT.
+- **The 577-s exit.** First re-run the 10k campaign **capturing
+  stderr whole**. If it exits early again, that is a harness defect
+  to root-cause before anything else.
+- **A budget valve (a tightening, not a scope change).** If the first
+  full campaign shows failing seed classes that the attempt cannot
+  root-cause, commit `results/campaign.json`, record the failing
+  classes with deterministic repros in the README, and ESCALATE. Do
+  not spend the remaining attempts. P triages from the committed,
+  digest-reproducible file.
+
+## This stage's delivery of the rulings (the worker's half)
+
+- **X5-R10** (commit 9488e1ed): `recover` restarts at the frontier
+  (`visible_ts := frontier`, `next_ts := frontier + 1`, `applied`
+  cleared); the model-commit guard makes a held-ts commit a loud
+  `task_error`. Pin: `r10_sequencer_restarts_at_the_frontier` (the
+  literal S_L-hole config: T=5, the hole at 6, the publish at 7;
+  `next_ts == frontier + 1`; round-1 commits at 8-10; the guard fires
+  under the reverted fix — demonstrated mutant-style, `te="model
+  commit at held ts 7 (sequencer reissue)"`).
+- **X5-R11 (a)** (commit be2f9f4c): `durable_image` §3.3-checks every
+  mapped LPID (the draft's directory→tree walk never descended inner
+  pages — the map walk pre-filled `used`, so the dedup skipped them).
+  Pin: `r11a_amcheck_reaches_a_torn_leaf_under_an_inner_page` + D17's
+  P-written R6 cells.
+- **X5-R11 (b)** (be2f9f4c): slotted (i)/(ii) findings push
+  `AmcheckI`/`AmcheckIi` on all three paths.
+- **X5-R11 (c)(d)(f)** (commit 501e39f1): the reader mapping, the
+  published-read flag, the `o1dl`/`r6`/`cxx` record fields.
+- **Two harness defects the smoke exposed once (a) let seed 7's
+  round 0 pass** (be2f9f4c; classified **instrumentation defects**
+  under R11 (g)):
+  1. **The park loops** (P1): a failed script op woke its parked
+     peers once (Mesa) and they re-parked forever — DEADLOCK hiding
+     the store error. Every harness park loop now exits loudly
+     (`round_failed`). Pins:
+     `park_loops_exit_loudly_on_a_failed_round` (unit) and the
+     smoke's no-DEADLOCK assertion (seed 7 deadlocked pre-fix,
+     demonstrated by hand and reverted).
+  2. **The abort-on-Corrupt policy** (the seed-7 class): the harness
+     aborted the whole round when a script op failed with XX001 — but
+     in a media round that is the plan's clause 3 working (detected,
+     never served; seed 7 round 1's **drop of the damaged tree**, the
+     store's drop walk reading the torn leaf, `lpid 75 slot 87`). The
+     abort overrode the ruled oracle and broke 5.5's round shape (the
+     crash never fired; `fired=false`). Now the task unwinds as a
+     client-visible detection (`client_xx001` counted, recorded beside
+     the rule), its commit ts fills the visibility slot (the record
+     stays in the WAL; recovery is the authority for its effects —
+     R10's principle), and the round completes to its crash, faults,
+     recovery and oracle. Class C keeps the loud task error. With the
+     fix all 16 smoke seeds pass (seed 7 stops early after round 1's
+     recovery-`Err`, every round passing).
+     **ESCALATED (the budget valve):** the fix is harness-side only —
+     the store is untouched — but S-STORE is silent on (i) DDL/write
+     ops over detected-damaged pages (§6.8's drop walk, §8 reads) and
+     (ii) the checkpoint/visibility semantics of a durable commit
+     whose apply fails on detected damage (§12.4/§13/§14). Deterministic
+     repro: `run_seed(7, None)` — round 0 passes (the R6 detection
+     round), round 1's DDL task drops tree 5 whose leaf at lpid 75 /
+     slot 87 round 0's MP fault damaged; the drop walk raises XX001.
 
 ## What this stage built (attempt 2, completed and carried by attempt 3)
 
