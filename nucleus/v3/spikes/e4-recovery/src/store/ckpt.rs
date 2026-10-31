@@ -74,6 +74,20 @@ pub const CKPT_HOOKS: [CkptHook; 10] = [
     CkptHook::After6,
 ];
 
+/// The hook's position bit in [`CKPT_HOOKS`] (X5-R16 NEVER-FIRED's
+/// per-index hook mask: the harness records which hooks each completed
+/// checkpoint reached, and the driver's targeted draw picks an index
+/// whose mask carries the drawn hook). Every hook is in `CKPT_HOOKS`;
+/// a hook that is not (none today) returns 0 — a conservative bit no
+/// draw relies on.
+pub fn hook_bit(hook: CkptHook) -> u16 {
+    CKPT_HOOKS
+        .iter()
+        .position(|h| *h == hook)
+        .map(|i| 1u16 << i)
+        .unwrap_or(0)
+}
+
 /// A checkpoint hook callback: `Err` aborts the checkpoint (a harness
 /// crash arms the scheduler's crash flag and returns `Crashed`).
 pub type Hooks<'a> = dyn FnMut(CkptHook) -> Result<(), Fail> + 'a;

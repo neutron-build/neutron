@@ -580,3 +580,38 @@ fn r15b_verify_reports_all_three_checks_before_failing() {
     let (n, list) = campaign::verify_digest_report(&[x], &[y]);
     assert_eq!((n, list), (1, vec![7]));
 }
+
+/// **X5-R16 NEVER-FIRED pin (P ruling nv3-X-5c-esc-3; literal config =
+/// d2c8bba7's defect seeds).** Seeds 60 and 660 both carried "the crash
+/// spec never fired" in the committed campaign (60: the drawn
+/// `Mid2@2`'s checkpoint never reached Mid2; 660: round 0's checkpoints
+/// reached no Mid2 at all — the tiny pool's evictor wrote every dirty
+/// page, so step 2 wrote nothing, P's stated cause "its step 2 has too
+/// little to write"). The targeted draw's counting pass (the same probe
+/// pattern as the uniform draw's) now records which hooks each
+/// checkpoint index reaches (`WorkloadObs::ckpt_hooks_hit`) and the
+/// draw lands on a reached (index, hook); every round's crash fires and
+/// the seed carries no defect. On the reverted draw both assertions
+/// fail (the defect text reappears and `fired` is false).
+#[test]
+fn r16_never_fired_targeted_draws_reach_their_hook() {
+    for seed in [60u64, 660] {
+        let rec = workload::run_seed(seed, None);
+        assert!(
+            rec.defect.is_none(),
+            "seed {seed}: the fired-guard defect is back: {:?}",
+            rec.defect
+        );
+        assert!(
+            rec.rounds.iter().all(|r| r.fired),
+            "seed {seed}: a round's crash spec never fired: {:?}",
+            rec.rounds.iter().map(|r| (r.crash.clone(), r.fired)).collect::<Vec<_>>()
+        );
+        // The twin rounds fired too (35 of the 150 defects were twin
+        // rounds; the twin shares the real round's spec).
+        assert!(
+            !rec.rounds.iter().any(|r| r.crash.ends_with("never fired")),
+            "seed {seed}: a stale never-fired description"
+        );
+    }
+}

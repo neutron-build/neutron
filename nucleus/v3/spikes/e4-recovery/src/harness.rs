@@ -244,6 +244,10 @@ pub struct HarnessState {
     /// 7+ are later hooks). Maintained by the checkpointer's hook
     /// closure.
     pub ckpt_step: u8,
+    /// Per checkpoint completion index, the bitmask of the hooks it
+    /// reached (X5-R16 NEVER-FIRED; see [`WorkloadObs::ckpt_hooks_hit`]).
+    /// Grown by the checkpointer's hook closure as checkpoints run.
+    pub ckpt_hooks_hit: Vec<u16>,
 }
 
 /// The bulk-load phases of card Work 5.6's Q6 (crash between the load and
@@ -1273,6 +1277,7 @@ fn checkpointer_body(
                 Some(CrashSpec::Hook { ckpt_index, hook }) if *ckpt_index == idx => Some(*hook),
                 _ => None,
             };
+            let ck_idx = idx;
             let mut hooks = |hook: CkptHook| -> Result<(), Fail> {
                 // Q4's position code (card Work 5.6): record the hook's
                 // step before any crash arm, so the crash-time snapshot
@@ -1294,7 +1299,18 @@ fn checkpointer_body(
                     CkptHook::After6 => 0,
                 };
                 let _ = cx.with("h:ckstep", |c| {
-                    c.h().ckpt_step = step;
+                    let h = c.h();
+                    h.ckpt_step = step;
+                    // X5-R16 NEVER-FIRED: this checkpoint (completion
+                    // index `idx`) reached `hook` — the targeted draw's
+                    // counting pass reads this mask.
+                    let bit = ckpt::hook_bit(hook);
+                    if c.h().ckpt_hooks_hit.len() <= ck_idx as usize {
+                        c.h().ckpt_hooks_hit.resize(ck_idx as usize + 1, 0);
+                    }
+                    if let Some(slot) = c.h().ckpt_hooks_hit.get_mut(ck_idx as usize) {
+                        *slot |= bit;
+                    }
                     Ok(())
                 });
                 if Some(hook) == fire_at {
@@ -1691,6 +1707,15 @@ pub struct WorkloadObs {
     /// The last checkpoint hook passed, as a position code (1 = Before0 …
     /// 6 = After3 — Q4's window; 0 = none).
     pub ckpt_step: u8,
+    /// **X5-R16 NEVER-FIRED (P ruling nv3-X-5c-esc-3): per checkpoint
+    /// completion index, the bitmask of the hooks it reached** (bit
+    /// `i` = [`crate::store::ckpt::CKPT_HOOKS[i]`], set by the
+    /// checkpointer's hook closure). The driver's targeted draw reads
+    /// it from a counting pass and picks an index that actually
+    /// reaches the drawn hook — "make every targeted draw reach its
+    /// hook, deterministically from the seed. A deterministic counting
+    /// pass, like the uniform draw's, is allowed."
+    pub ckpt_hooks_hit: Vec<u16>,
 }
 
 /// Run one round: workload → crash → faults → recovery (nested crashes)
@@ -1781,6 +1806,7 @@ pub fn run_round(
             drop_walk: g.h.drop_walk,
             gc_adv_in_window: g.h.gc_adv_in_window,
             ckpt_step: g.h.ckpt_step,
+            ckpt_hooks_hit: g.h.ckpt_hooks_hit.clone(),
         };
         (
             g.disk.clone(),

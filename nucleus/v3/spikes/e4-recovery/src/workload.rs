@@ -44,6 +44,14 @@ const S_WORK: u64 = 2;
 const S_CRASHP: u64 = 8;
 const S_NESTED: u64 = 9;
 const S_GEN: u64 = 10;
+/// X5-R16 NEVER-FIRED: the targeted fallback draw's stream (a hook the
+/// round's checkpoints actually reach).
+const S_HOOK: u64 = 11;
+
+/// X5-R16 NEVER-FIRED: does the per-index hook mask carry `hook`?
+fn ckpt_hook_reached(hook: crate::store::ckpt::CkptHook, mask: u16) -> bool {
+    crate::store::ckpt::hook_bit(hook) & mask != 0
+}
 
 /// The per-seed knobs (card Work 5.1, sized against the ≤ 20 min
 /// campaign budget of 5.3 — per-seed work shrinks, never the seed count).
@@ -826,6 +834,17 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         // measures the total, then the real round — and its twin, which
         // must crash at the same point (Work 2.5) — arm `Yield(k)` at a
         // seeded point in `1..=count`.
+        //
+        // The targeted crash runs the same counting pass for its own
+        // address (X5-R16 NEVER-FIRED, P ruling nv3-X-5c-esc-3): the
+        // pass records, per checkpoint completion index, the hooks it
+        // reached (`WorkloadObs::ckpt_hooks_hit`), and the draw keeps
+        // the seed's hook but moves its index to one that reaches it
+        // (the drawn index if it does; else the smallest that does).
+        // Pre-fix, 150 seeds drew (index, Mid2) pairs whose checkpoint
+        // step 2 had too little to write, the hook never fired, and
+        // the fired-guard failed the seed ("the crash spec never
+        // fired") — a harness defect, never a pass.
         let uniform = (seed / 10) % 2 == 1;
         let (script_twin, script_real, crash_desc);
         if uniform {
@@ -865,12 +884,109 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             };
             crash_desc = format!("uniform@y:{k}");
         } else {
-            script_twin = Script {
+            let probe = Script {
+                crash: None,
                 nested: Vec::new(),
                 ..base.clone()
             };
-            script_real = base;
-            crash_desc = _crash_desc;
+            let out = harness::run_round(
+                seed,
+                round,
+                &probe,
+                &RoundFaults {
+                    class: FaultClass::C,
+                    knobs: knobs.fault,
+                    directed: Vec::new(),
+                    no_r_taint: false,
+                    media: MediaDraw::None,
+                    twin_supply: None,
+                    nested_draw: 0,
+                    probe_pass: true,
+                },
+                cfg.clone(),
+                ch.disk.clone(),
+                ch.st.clone(),
+                &ch.model,
+                ch.cut,
+                None,
+            );
+            let (hook, drawn_idx) = match base.crash.as_ref() {
+                Some(CrashSpec::Hook { ckpt_index, hook }) => (*hook, *ckpt_index),
+                _ => (crate::store::ckpt::CkptHook::Before0, 0),
+            };
+            let bit = crate::store::ckpt::hook_bit(hook);
+            let reached: Vec<u64> = out
+                .obs
+                .ckpt_hooks_hit
+                .iter()
+                .enumerate()
+                .filter(|(_, mask)| *mask & bit != 0)
+                .map(|(i, _)| i as u64)
+                .collect();
+            let (chosen, chosen_hook) = if let Some(first) = reached.first() {
+                // The drawn index if it reaches the drawn hook, else
+                // the smallest index that does.
+                let idx = if reached.contains(&drawn_idx) {
+                    drawn_idx
+                } else {
+                    *first
+                };
+                (idx, hook)
+            } else {
+                // **The drawn hook is unreachable in this round** (seed
+                // 660 round 0's shape: the tiny pool's evictor wrote
+                // every dirty page itself, so every checkpoint's step 2
+                // wrote nothing and `Mid2` never fired — "its step 2
+                // has too little to write"). The draw then falls to a
+                // hook the round's checkpoints DO reach, drawn
+                // deterministically from `(seed, round)` over the
+                // union mask — the same adaptation the uniform draw
+                // makes to the counted yield total. The workload
+                // itself is untouched (no retune: X5-R17 is X-5c-F2's).
+                let union: u16 = out.obs.ckpt_hooks_hit.iter().fold(0u16, |a, m| a | m);
+                let mut hrng = Rng::new(derive(seed * 13 + round as u64, S_HOOK));
+                let mut pick = hook;
+                let mut left = 1 + hrng.below(10);
+                while left > 0 {
+                    // Walk the reached hooks in `CKPT_HOOKS` order,
+                    // `left` steps: deterministic, and lands on a
+                    // reached hook (a completed checkpoint always
+                    // reaches `Before0`).
+                    for cand in crate::store::ckpt::CKPT_HOOKS {
+                        if ckpt_hook_reached(cand, union) {
+                            pick = cand;
+                            left -= 1;
+                            if left == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let idx = out
+                    .obs
+                    .ckpt_hooks_hit
+                    .iter()
+                    .position(|m| ckpt_hook_reached(pick, *m))
+                    .map(|i| i as u64)
+                    .unwrap_or(drawn_idx);
+                (idx, pick)
+            };
+            script_twin = Script {
+                crash: Some(CrashSpec::Hook {
+                    ckpt_index: chosen,
+                    hook: chosen_hook,
+                }),
+                nested: Vec::new(),
+                ..base.clone()
+            };
+            script_real = Script {
+                crash: Some(CrashSpec::Hook {
+                    ckpt_index: chosen,
+                    hook: chosen_hook,
+                }),
+                ..base
+            };
+            crash_desc = format!("{chosen_hook:?}@{chosen}");
         }
         let mut supply = None;
         let mut twin_points = Vec::new();
@@ -960,6 +1076,7 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             ch.cut,
             None,
         );
+
         if let Some(d) = crash_fired_defect(&out, &crash_desc)
             && rec.defect.is_none()
         {
