@@ -3054,13 +3054,11 @@ impl StoreReader<'_> {
             w: self.w,
             t: HARNESS,
         };
-        let root = cx
-            .with("r:cat", |c| Ok(tree::catalog_root(c.store())))
-            .map_err(Fail::from)?;
+        let root = cx.with("r:cat", |c| Ok(tree::catalog_root(c.store())))?;
         if root == 0 {
             return Ok(BTreeSet::new());
         }
-        let scan = tree::tree_scan(&cx, root, frontier).map_err(|e| e)?;
+        let scan = tree::tree_scan(&cx, root, frontier)?;
         let mut out = BTreeSet::new();
         for (k, v) in scan {
             if v.as_deref() == Some(PUBLIC) && k.len() == 8 {
