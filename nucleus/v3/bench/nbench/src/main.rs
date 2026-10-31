@@ -40,13 +40,16 @@ nbench — NBench harness (PLAN-v3 §5, card B-0)
 USAGE:
   nbench list
   nbench run <row|all> [--tag NAME] [--set key=value]...
+             (measured rows need a release build; --tag smoke is exempt — card B-0-F7-F1 J5)
   nbench report [--date YYYY-MM-DD] [--tag smoke] [--out FILE]
   nbench cleanup
   nbench host-info
-  nbench vec-qdrant-load   --base F --host H --port P [--collection C] [--m N] [--ef-construct N] [--batch N]
-  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run] [--latency-out F] [--ids-out F] [--exact] [--max-queries N]
+  nbench vec-qdrant-load   --base F --host H --port P [--collection C] [--m N] [--ef-construct N] [--batch N] [--state-out F]
+  nbench vec-qdrant-settle --host H --port P [--collection C] --expected-points N [--window-s W] [--timeout-s T] --state-out F [--expect-state F]
+  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run] [--latency-out F] [--ids-out F] [--exact] [--max-queries N] [--index-state F]
   nbench vec-qdrant-info   --host H --port P [--collection C]
   nbench qdrant-latency-verdict --client-p50-ms X --server-p50-ms Y
+  nbench qdrant-repro-verdict --a F --b F
   nbench vec-recall          --ids F --truth F [--k N]
   nbench vec-qdrant-digest --host H --port P [--collection C]
   nbench vec-qdrant-version --host H --port P
@@ -135,6 +138,9 @@ fn cmd_vec_qdrant_load(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| "1024".into())
         .parse()
         .map_err(|_| Error::Usage("bad batch".into()))?;
+    // Card B-0-F7-F1 J4: the settled state is written to a file so the
+    // post-restart settles can compare against it.
+    let state_out = arg_value(args, "state-out");
 
     let vectors = vector::read_fvecs(&PathBuf::from(&base))?;
     let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
@@ -151,34 +157,26 @@ fn cmd_vec_qdrant_load(args: &[String]) -> Result<()> {
         }
     }
     eprintln!(
-        "upload done in {:.1}s; waiting for green",
+        "upload done in {:.1}s; applying the tail indexing rule (J3) and \
+         waiting for the index to settle (J2)",
         start.elapsed().as_secs_f64()
     );
-    vector::qdrant_wait_green(
+    // Card B-0-F7-F1 J3: the tail rule is unconditional — one build
+    // procedure for every run — and J2 replaces the single green poll
+    // that let three different index states measure as "ready"
+    // (verdict B-0-F7 finding 1).
+    vector::qdrant_index_tail(&host, port, &collection)?;
+    let state = vector::qdrant_wait_settled(
         &host,
         port,
         &collection,
         vectors.len(),
+        None,
         Duration::from_secs(3600),
     )?;
-    eprintln!(
-        "collection green with {} points in {:.1}s total",
-        vectors.len(),
-        start.elapsed().as_secs_f64()
-    );
-    // Card B-0-F7 Work 2: the index state the passes will measure —
-    // segment count and the raw config — is part of every init log.
-    // `green` does not mean the optimizer finished (the preserved
-    // chain10 collection was grey with 92 segments and 3.86x indexed
-    // vectors), so the summary line is recorded, never assumed.
-    if let Ok(info) = vector::qdrant_collection_info(&host, port, &collection)
-        && let Ok(s) = vector::collection_summary(&info)
-    {
-        eprintln!(
-            "index state at init end: status={} points={} indexed={} segments={} \
-             update_queue={}",
-            s.status, s.points, s.indexed, s.segments, s.update_queue
-        );
+    eprintln!("{}", state.line());
+    if let Some(path) = state_out.as_deref() {
+        std::fs::write(path, json::to_string(&state.to_value())?).map_err(Error::Io)?;
     }
     Ok(())
 }
@@ -257,6 +255,34 @@ fn qdrant_pass_metrics(pass_kind: &str, n: &QdrantPassNumbers) -> Result<Value> 
     Ok(Value::obj(fields))
 }
 
+/// Append the index-state numbers to a pass's metrics (card B-0-F7-F1
+/// J4). Pure so the wiring — state rides in the metrics, and only when
+/// a state file was given — is a unit-tested seam: the numbers must
+/// survive into the results JSON (only numeric metrics make it through
+/// `parse_result`), and without `--index-state` the metrics must stay
+/// byte-identical to the pre-F1 shape.
+///
+/// STATE-NOT-IN-METRICS (returning the metrics unchanged) empties the
+/// row of its per-series index evidence and fails the test below.
+fn with_index_state(metrics: Value, st: &vector::IndexState) -> Value {
+    match metrics {
+        Value::Obj(mut pairs) => {
+            pairs.push(("index_points".into(), Value::n(st.points as f64)));
+            pairs.push(("index_indexed".into(), Value::n(st.indexed as f64)));
+            pairs.push(("index_segments".into(), Value::n(st.segments as f64)));
+            pairs.push((
+                "index_threshold_kb".into(),
+                Value::n(st.indexing_threshold_kb as f64),
+            ));
+            pairs.push(("index_waited_s".into(), Value::n(st.waited_s)));
+            Value::Obj(pairs)
+        }
+        // `qdrant_pass_metrics` always returns an object; anything else
+        // is passed through untouched rather than guessed into one.
+        other => other,
+    }
+}
+
 fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let query_path = required(args, "query")?;
     let truth_path = required(args, "truth")?;
@@ -297,6 +323,12 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
             .map_err(|_| Error::Usage("bad max-queries".into()))?,
         None => usize::MAX,
     };
+    // Card B-0-F7-F1 J4: the settled index state recorded before this
+    // pass rides in the metrics as numbers (the parser keeps numeric
+    // metrics only), so every pass's evidence carries the state it
+    // measured. Without the flag the metrics are byte-identical to
+    // before this card.
+    let index_state_path = arg_value(args, "index-state");
 
     let mut queries = vector::read_fvecs(&PathBuf::from(&query_path))?;
     let mut truth = vector::read_ivecs(&PathBuf::from(&truth_path))?;
@@ -368,12 +400,75 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
             exact,
         },
     )?;
+    // Card B-0-F7-F1 J4: after the metrics (and their sanity check)
+    // exist, append the index-state numbers from the settle that ran
+    // before this pass — outside the timed loop, which is untouched.
+    let v = match index_state_path.as_deref() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(Error::Io)?;
+            let st = vector::IndexState::from_value(&json::parse(&text)?)?;
+            with_index_state(v, &st)
+        }
+        None => v,
+    };
     write_metrics_json(metrics_out.as_deref(), &v)?;
     eprintln!(
         "ef={ef}: qps={qps:.1} recall@{limit}={recall:.4} p50={p50:.3}ms p99={:.3}ms \
          server_p50={server_p50:.3}ms",
         percentile_of(&lat_ms, 0.99)
     );
+    Ok(())
+}
+
+/// Card B-0-F7-F1 J4: wait for the collection to settle again (after a
+/// container restart or between passes), write the settled state, and
+/// — with `--expect-state` — refuse the row when the index is not the
+/// state the init settled in. `--window-s` absent means the full J2
+/// window (the post-restart case); `0` means the one-poll re-check the
+/// warm passes make.
+fn cmd_vec_qdrant_settle(args: &[String]) -> Result<()> {
+    let host = required(args, "host")?;
+    let port: u16 = required(args, "port")?
+        .parse()
+        .map_err(|_| Error::Usage("bad port".into()))?;
+    let collection = arg_value(args, "collection").unwrap_or_else(|| "nbench-sift".into());
+    let expected_points: usize = required(args, "expected-points")?
+        .parse()
+        .map_err(|_| Error::Usage("bad expected-points".into()))?;
+    let window: Option<f64> = match arg_value(args, "window-s") {
+        Some(s) => Some(s.parse().map_err(|_| Error::Usage("bad window-s".into()))?),
+        None => None,
+    };
+    let timeout_s: u64 = arg_value(args, "timeout-s")
+        .unwrap_or_else(|| "3600".into())
+        .parse()
+        .map_err(|_| Error::Usage("bad timeout-s".into()))?;
+    let state_out = required(args, "state-out")?;
+    let expect_state = arg_value(args, "expect-state");
+
+    let state = vector::qdrant_wait_settled(
+        &host,
+        port,
+        &collection,
+        expected_points,
+        window,
+        Duration::from_secs(timeout_s),
+    )?;
+    eprintln!("{}", state.line());
+    std::fs::write(&state_out, json::to_string(&state.to_value())?).map_err(Error::Io)?;
+
+    if let Some(expected_path) = expect_state.as_deref() {
+        let text = std::fs::read_to_string(expected_path).map_err(Error::Io)?;
+        let expected = vector::IndexState::from_value(&json::parse(&text)?)?;
+        if let Err(diff) = vector::same_index_state(&expected, &state) {
+            // Both states are printed in full: the refusal is its own
+            // evidence (J4 — "a row whose state changes is refused").
+            eprintln!("index state mismatch against {expected_path}: {diff}");
+            eprintln!("expected state: {}", json::to_string(&expected.to_value())?);
+            eprintln!("actual state:   {}", json::to_string(&state.to_value())?);
+            return Err(diff);
+        }
+    }
     Ok(())
 }
 
@@ -468,6 +563,251 @@ fn cmd_qdrant_latency_verdict(args: &[String]) -> Result<()> {
         vector::LatencyVerdict::WithinTolerances { .. } => "WITHIN-TOLERANCES",
     };
     println!("VERDICT {arm} c={c:.3}ms s={s:.3}ms c-s={d:.3}ms");
+    Ok(())
+}
+
+// ---- card B-0-F7-F1: the reproducibility rule (J6, pre-registered) ----
+
+/// J6: warm-median `qps` and `p50_ms` must agree within this fraction
+/// of the **smaller** value (|a − b| ≤ 0.15 × min(a, b); boundaries
+/// inclusive). REPRO-MAX-BASE (using max) is a mutant of exactly this
+/// constant's use.
+const REPRO_REL_BOUND: f64 = 0.15;
+
+/// J6: warm-median `recall_at_10` must agree within this absolute
+/// distance.
+const REPRO_RECALL_BOUND: f64 = 0.002;
+
+/// J6: boundaries are inclusive "with a 1e-9 tolerance so float
+/// rounding cannot decide a decimal boundary" (0.002 is exactly on the
+/// recall boundary in f64 only within this slack).
+const REPRO_TOL: f64 = 1e-9;
+
+/// The outcome of the J6 rule applied to two results documents.
+struct ReproVerdict {
+    /// `REPRODUCED`, `NOT-REPRODUCED` or `INVALID`.
+    word: &'static str,
+    /// One line per ef point and metric (both values, the spread and
+    /// pass/fail), plus the explanation when the word is not
+    /// REPRODUCED.
+    lines: Vec<String>,
+}
+
+/// The `ef_search` value of one series' `config` pairs, if the series
+/// has one. The pair is a `[key, value]` array of strings.
+fn series_ef(series: &Value) -> Option<u64> {
+    let config = series.get("config").and_then(Value::as_arr)?;
+    let mut found = None;
+    for pair in config {
+        let kv = pair.as_arr()?;
+        if kv.first().and_then(Value::as_str) == Some("ef_search")
+            && let Some(v) = kv.get(1).and_then(Value::as_str)
+            && let Some(n) = v.parse::<u64>().ok()
+        {
+            found = Some(n);
+            break;
+        }
+    }
+    found
+}
+
+/// Every series' ef point of a run, in series order.
+fn run_efs(run: &Value) -> Vec<Option<u64>> {
+    run.get("series")
+        .and_then(Value::as_arr)
+        .map(|series| series.iter().map(series_ef).collect())
+        .unwrap_or_default()
+}
+
+/// The warm-median of one metric at one ef point of a run.
+fn warm_median(run: &Value, ef: u64, metric: &str) -> Option<f64> {
+    for series in run.get("series").and_then(Value::as_arr)? {
+        if series_ef(series) == Some(ef) {
+            return series
+                .get("warm")?
+                .get("metrics")?
+                .get(metric)?
+                .get("median")
+                .and_then(Value::as_f64);
+        }
+    }
+    None
+}
+
+/// The J6 INVALID preconditions (checked first — a bounds failure must
+/// never mask them, and vice versa an INVALID never needs bounds):
+/// `digest.voided`, `provenance.nbench_build.profile != "release"`,
+/// and "any pass without the index-state metrics" — every series'
+/// `cold.metrics` must carry `index_indexed == index_points`, and
+/// every warm aggregate `index_segments`. One line per violation.
+fn repro_precondition_lines(a: &Value, b: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (name, run) in [("A", a), ("B", b)] {
+        if run
+            .get("digest")
+            .and_then(|d| d.get("voided"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            lines.push(format!("INVALID: run {name} is digest.voided"));
+        }
+        let profile = run
+            .get("provenance")
+            .and_then(|p| p.get("nbench_build"))
+            .and_then(|nb| nb.get("profile"))
+            .and_then(Value::as_str);
+        if profile != Some("release") {
+            lines.push(format!(
+                "INVALID: run {name} provenance.nbench_build.profile is {}, not \"release\"",
+                profile.unwrap_or("<missing>")
+            ));
+        }
+        for series in run.get("series").and_then(Value::as_arr).unwrap_or(&[]) {
+            let ef = series_ef(series)
+                .map(|e| e.to_string())
+                .unwrap_or("?".into());
+            let cold_metrics = series.get("cold").and_then(|c| c.get("metrics"));
+            let idx = cold_metrics
+                .and_then(|m| m.get("index_indexed"))
+                .and_then(Value::as_f64);
+            let pts = cold_metrics
+                .and_then(|m| m.get("index_points"))
+                .and_then(Value::as_f64);
+            match (idx, pts) {
+                (Some(i), Some(p)) if i == p => {}
+                (Some(i), Some(p)) => lines.push(format!(
+                    "INVALID: run {name} ef{ef}: cold metrics record index_indexed {i} != index_points {p}"
+                )),
+                _ => lines.push(format!(
+                    "INVALID: run {name} ef{ef}: cold metrics lack the index-state numbers"
+                )),
+            }
+            let warm_has_segments = series
+                .get("warm")
+                .and_then(|w| w.get("metrics"))
+                .and_then(|m| m.get("index_segments"))
+                .is_some();
+            if !warm_has_segments {
+                lines.push(format!(
+                    "INVALID: run {name} ef{ef}: warm aggregate lacks index_segments"
+                ));
+            }
+        }
+    }
+    lines
+}
+
+/// Apply the pre-registered J6 rule to two results documents (pure).
+///
+/// INVALID is decided first (see [`repro_precondition_lines`]); a run
+/// whose shape cannot be evaluated at all (a series without an
+/// `ef_search` pair, a missing warm median) is also INVALID — the rule
+/// cannot say "the runs disagree" about numbers it does not have.
+/// ef sets that differ (as sets) are NOT-REPRODUCED per the card.
+/// Otherwise one line per ef point and metric, and the verdict is
+/// REPRODUCED iff every bound holds at **every** ef point.
+fn repro_verdict(a: &Value, b: &Value) -> ReproVerdict {
+    let mut lines = repro_precondition_lines(a, b);
+    if !lines.is_empty() {
+        return ReproVerdict {
+            word: "INVALID",
+            lines,
+        };
+    }
+    let a_efs = run_efs(a);
+    let b_efs = run_efs(b);
+    let mut a_sorted: Vec<u64> = match a_efs.iter().copied().collect::<Option<Vec<_>>>() {
+        Some(v) => v,
+        None => {
+            return ReproVerdict {
+                word: "INVALID",
+                lines: vec!["INVALID: run A has a series without an ef_search config pair".into()],
+            };
+        }
+    };
+    let mut b_sorted: Vec<u64> = match b_efs.iter().copied().collect::<Option<Vec<_>>>() {
+        Some(v) => v,
+        None => {
+            return ReproVerdict {
+                word: "INVALID",
+                lines: vec!["INVALID: run B has a series without an ef_search config pair".into()],
+            };
+        }
+    };
+    a_sorted.sort_unstable();
+    b_sorted.sort_unstable();
+    if a_sorted != b_sorted {
+        return ReproVerdict {
+            word: "NOT-REPRODUCED",
+            lines: vec![format!(
+                "ef_search sets differ: run A {:?} vs run B {:?}",
+                a_sorted, b_sorted
+            )],
+        };
+    }
+    // One line per ef point and metric. The bounds use min(a, b) as
+    // the base (J6: |a − b| ≤ 0.15 × min), inclusive with the 1e-9
+    // tolerance; recall is absolute. A missing median is INVALID: the
+    // rule cannot compare numbers that do not exist.
+    let metrics: [(&str, bool); 3] = [("qps", true), ("p50_ms", true), ("recall_at_10", false)];
+    let mut all_pass = true;
+    for ef in &a_efs {
+        let ef = ef.unwrap_or(0);
+        for (metric, relative) in metrics {
+            let (av, bv) = match (warm_median(a, ef, metric), warm_median(b, ef, metric)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => {
+                    return ReproVerdict {
+                        word: "INVALID",
+                        lines: vec![format!(
+                            "INVALID: ef{ef}: a warm aggregate lacks {metric}'s median"
+                        )],
+                    };
+                }
+            };
+            let spread = (av - bv).abs();
+            let (bound, kind) = if relative {
+                (REPRO_REL_BOUND * av.min(bv), "15% of min")
+            } else {
+                (REPRO_RECALL_BOUND, "absolute")
+            };
+            let pass = spread <= bound + REPRO_TOL;
+            if !pass {
+                all_pass = false;
+            }
+            lines.push(format!(
+                "ef{ef} {metric}: a={av} b={bv} spread={spread} bound={} ({kind}) {}",
+                bound,
+                if pass { "PASS" } else { "FAIL" }
+            ));
+        }
+    }
+    ReproVerdict {
+        word: if all_pass {
+            "REPRODUCED"
+        } else {
+            "NOT-REPRODUCED"
+        },
+        lines,
+    }
+}
+
+/// Apply [`repro_verdict`] to two results files and print the table
+/// plus the final `REPRO VERDICT=<word>` line (card B-0-F7-F1 Work 6).
+/// Exits 0 whenever the rule could be evaluated — the word carries the
+/// outcome — and non-zero only for unreadable input.
+fn cmd_qdrant_repro_verdict(args: &[String]) -> Result<()> {
+    let a_path = required(args, "a")?;
+    let b_path = required(args, "b")?;
+    let a_text = std::fs::read_to_string(&a_path).map_err(Error::Io)?;
+    let b_text = std::fs::read_to_string(&b_path).map_err(Error::Io)?;
+    let a = json::parse(&a_text)?;
+    let b = json::parse(&b_text)?;
+    let verdict = repro_verdict(&a, &b);
+    for line in &verdict.lines {
+        println!("{line}");
+    }
+    println!("REPRO VERDICT={}", verdict.word);
     Ok(())
 }
 
@@ -691,6 +1031,15 @@ fn cmd_run(args: &[String]) -> Result<()> {
         .cloned()
         .ok_or_else(|| Error::Usage("run needs a row id (or all)".into()))?;
     let tag = arg_value(args, "tag");
+    // Card B-0-F7-F1 J5: FIRST, before Params, harness_root or anything
+    // that touches podman — a refused run starts nothing. A debug
+    // client's per-query JSON work (~0.3–0.4 ms measured) is harness
+    // time inside the competitor's latency, and the pgvector arm times
+    // a release binary; only `--tag smoke` is exempt.
+    runner::measured_build_allowed(
+        tag.as_deref(),
+        runner::build_profile(cfg!(debug_assertions)),
+    )?;
     let sets = collect_sets(args);
     let set_refs: Vec<(&str, &str)> = sets.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let params = Params::with_overrides(&set_refs)?;
@@ -795,11 +1144,13 @@ fn main() {
             })
         })),
         Some("vec-qdrant-load") => ok_or_print(cmd_vec_qdrant_load(&argv[1..])),
+        Some("vec-qdrant-settle") => ok_or_print(cmd_vec_qdrant_settle(&argv[1..])),
         Some("vec-qdrant-search") => ok_or_print(cmd_vec_qdrant_search(&argv[1..])),
         Some("vec-qdrant-digest") => ok_or_print(cmd_vec_qdrant_digest(&argv[1..])),
         Some("vec-qdrant-version") => ok_or_print(cmd_vec_qdrant_version(&argv[1..])),
         Some("vec-qdrant-info") => ok_or_print(cmd_vec_qdrant_info(&argv[1..])),
         Some("qdrant-latency-verdict") => ok_or_print(cmd_qdrant_latency_verdict(&argv[1..])),
+        Some("qdrant-repro-verdict") => ok_or_print(cmd_qdrant_repro_verdict(&argv[1..])),
         Some("vec-recall") => ok_or_print(cmd_vec_recall(&argv[1..])),
         Some("vec-pg-copy") => ok_or_print(cmd_vec_pg_copy(&argv[1..])),
         Some("vec-pg-search") => ok_or_print(cmd_vec_pg_search(&argv[1..])),
@@ -1259,5 +1610,428 @@ mod tests {
             "client p50 {client_p50} is suspiciously equal to the server p50; \
              the two columns must be independent measurements"
         );
+    }
+
+    // ---- card B-0-F7-F1: index state in the metrics (J4) ----
+
+    #[test]
+    fn index_state_rides_in_the_pass_metrics() {
+        // The settle's numbers must survive into the recorded metrics
+        // (only numeric metrics make it through the runner's parser, so
+        // the state travels as numbers). STATE-NOT-IN-METRICS (returning
+        // the metrics unchanged) fails here.
+        let metrics = qdrant_pass_metrics(
+            "cold",
+            &QdrantPassNumbers {
+                ef: 16,
+                limit: 10,
+                queries: 10_000,
+                qps: 65.0,
+                recall: 0.94,
+                p50_ms: 15.37,
+                p99_ms: 40.0,
+                server_p50_ms: Some(14.9),
+                server_p99_ms: Some(38.0),
+                exact: false,
+            },
+        )
+        .expect("cold pass records");
+        let st = vector::IndexState::from_summary(
+            vector::CollectionSummary {
+                status: "green",
+                points: 1_000_000,
+                indexed: 1_000_000,
+                segments: 8,
+                update_queue: 0,
+                optimizer_ok: true,
+                indexing_threshold_kb: 1,
+                flush_interval_sec: 5,
+            },
+            30.0,
+            64.0,
+            33,
+        );
+        let with = with_index_state(metrics, &st);
+        assert_eq!(
+            with.get("index_points").and_then(Value::as_f64),
+            Some(1_000_000.0)
+        );
+        assert_eq!(
+            with.get("index_indexed").and_then(Value::as_f64),
+            Some(1_000_000.0)
+        );
+        assert_eq!(
+            with.get("index_segments").and_then(Value::as_f64),
+            Some(8.0)
+        );
+        assert_eq!(
+            with.get("index_threshold_kb").and_then(Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            with.get("index_waited_s").and_then(Value::as_f64),
+            Some(64.0)
+        );
+        // the pass's own numbers are untouched
+        assert_eq!(with.get("qps").and_then(Value::as_f64), Some(65.0));
+        assert_eq!(with.get("pass_kind").and_then(Value::as_str), Some("cold"));
+    }
+
+    #[test]
+    fn metrics_without_index_state_are_unchanged() {
+        // Without --index-state the metrics must be byte-identical to
+        // the pre-F1 shape — pinned as an exact JSON string so any field
+        // or ordering drift is caught, not just the absence of the new
+        // keys.
+        let v = qdrant_pass_metrics(
+            "run",
+            &QdrantPassNumbers {
+                ef: 16,
+                limit: 10,
+                queries: 100,
+                qps: 500.0,
+                recall: 0.94,
+                p50_ms: 1.8,
+                p99_ms: 2.4,
+                server_p50_ms: Some(1.7),
+                server_p99_ms: Some(2.1),
+                exact: false,
+            },
+        )
+        .expect("healthy warm pass records");
+        let text = json::to_string(&v).expect("serialize");
+        assert_eq!(
+            text,
+            "{\"qps\":500,\"recall_at_10\":0.94,\"queries\":100,\"p50_ms\":1.8,\
+\"p99_ms\":2.4,\"ef_search\":16,\"timing_note\":\"one persistent connection \
+(HTTP keep-alive, TCP_NODELAY, single write per request) for the whole pass; \
+warm-pass p50 sanity-checked at 10 ms\",\"pass_kind\":\"run\",\
+\"limit\":10,\"server_p50_ms\":1.7,\"server_p99_ms\":2.1}"
+        );
+        // and with_index_state appends AFTER those fields, in order
+        let st = vector::IndexState::from_summary(
+            vector::CollectionSummary {
+                status: "green",
+                points: 100,
+                indexed: 100,
+                segments: 2,
+                update_queue: 0,
+                optimizer_ok: true,
+                indexing_threshold_kb: 1,
+                flush_interval_sec: 5,
+            },
+            0.0,
+            0.0,
+            1,
+        );
+        let with = json::to_string(&with_index_state(v, &st)).expect("serialize with state");
+        assert!(with.ends_with(
+            "\"server_p99_ms\":2.1,\"index_points\":100,\"index_indexed\":100,\
+             \"index_segments\":2,\"index_threshold_kb\":1,\"index_waited_s\":0}"
+        ));
+    }
+
+    // ---- card B-0-F7-F1: the reproducibility rule (J6) ----
+
+    /// One series of a results document at one ef point: a cold pass
+    /// whose metrics carry the index-state numbers (`cold_indexed`
+    /// overrides `index_indexed`; `None` means fully indexed), and a
+    /// warm aggregate with the three J6 medians plus `index_segments`.
+    fn repro_series(ef: u64, qps: f64, p50: f64, recall: f64, cold_indexed: Option<f64>) -> Value {
+        let points = 1_000_000.0;
+        let indexed = cold_indexed.unwrap_or(points);
+        let cold = Value::obj(vec![(
+            "metrics",
+            Value::obj(vec![
+                ("qps", Value::n(qps / 2.0)),
+                ("index_points", Value::n(points)),
+                ("index_indexed", Value::n(indexed)),
+                ("index_segments", Value::n(8.0)),
+            ]),
+        )]);
+        let med = |x: f64| {
+            Value::obj(vec![
+                ("samples", Value::Arr(vec![Value::n(x)])),
+                ("median", Value::n(x)),
+                ("ci95", Value::Arr(vec![Value::n(x), Value::n(x)])),
+            ])
+        };
+        let warm = Value::obj(vec![
+            ("runs", Value::n(1.0)),
+            (
+                "metrics",
+                Value::obj(vec![
+                    ("qps", med(qps)),
+                    ("p50_ms", med(p50)),
+                    ("recall_at_10", med(recall)),
+                    ("index_segments", med(8.0)),
+                ]),
+            ),
+        ]);
+        Value::obj(vec![
+            (
+                "config",
+                Value::Arr(vec![Value::Arr(vec![
+                    Value::s("ef_search"),
+                    Value::s(&ef.to_string()),
+                ])]),
+            ),
+            ("cold", cold),
+            ("warm", warm),
+        ])
+    }
+
+    /// A results document with the J6 provenance fields.
+    fn repro_run(profile: &str, voided: bool, series: Vec<Value>) -> Value {
+        Value::obj(vec![
+            ("row", Value::s("vector-sift1m-qdrant")),
+            (
+                "digest",
+                Value::obj(vec![
+                    ("init", Value::s("count=1000000 sample=128 fnv=x")),
+                    ("voided", Value::Bool(voided)),
+                ]),
+            ),
+            (
+                "provenance",
+                Value::obj(vec![
+                    ("versions", Value::s("qdrant 1.19.2")),
+                    (
+                        "nbench_build",
+                        Value::obj(vec![("profile", Value::s(profile))]),
+                    ),
+                ]),
+            ),
+            ("series", Value::Arr(series)),
+        ])
+    }
+
+    #[test]
+    fn repro_verdict_applies_the_preregistered_rule_verbatim() {
+        // Two ef points, base numbers from the committed 2026-10-31 row.
+        let base = || {
+            (
+                repro_run(
+                    "release",
+                    false,
+                    vec![
+                        repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                        repro_series(64, 664.0, 1.566, 0.9951, None),
+                    ],
+                ),
+                repro_run(
+                    "release",
+                    false,
+                    vec![
+                        repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                        repro_series(64, 664.0, 1.566, 0.9951, None),
+                    ],
+                ),
+            )
+        };
+
+        // identical runs → REPRODUCED, one table line per ef and metric
+        let (a, b) = base();
+        let v = repro_verdict(&a, &b);
+        assert_eq!(v.word, "REPRODUCED");
+        assert_eq!(
+            v.lines.len(),
+            6,
+            "two ef points x three metrics: {:?}",
+            v.lines
+        );
+        assert!(v.lines.iter().all(|l| l.contains("PASS")), "{:?}", v.lines);
+
+        // qps 115 vs 100 → REPRODUCED (exactly 15% of min)
+        let a = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 115.0, 0.34433, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 100.0, 0.34433, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        assert_eq!(repro_verdict(&a, &b).word, "REPRODUCED");
+
+        // 115.1 vs 100 → NOT-REPRODUCED (REPRO-MAX-BASE's mutant lets
+        // this through and fails here)
+        let a2 = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 115.1, 0.34433, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let v = repro_verdict(&a2, &b);
+        assert_eq!(v.word, "NOT-REPRODUCED");
+        assert!(
+            v.lines
+                .iter()
+                .any(|l| l.contains("ef16 qps") && l.contains("FAIL")),
+            "{:?}",
+            v.lines
+        );
+
+        // 100 vs 115 → same as 115 vs 100 (symmetry)
+        assert_eq!(repro_verdict(&b, &a).word, "REPRODUCED");
+        assert_eq!(repro_verdict(&b, &a2).word, "NOT-REPRODUCED");
+
+        // p50 alone out of bounds → NOT-REPRODUCED
+        let p50_a = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 1.0, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let p50_b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 1.5, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        assert_eq!(repro_verdict(&p50_a, &p50_b).word, "NOT-REPRODUCED");
+
+        // recall 0.9410 vs 0.9430 → REPRODUCED (exactly 0.002)
+        let rec_a = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let rec_b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9430, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        assert_eq!(repro_verdict(&rec_a, &rec_b).word, "REPRODUCED");
+
+        // recall 0.9410 vs 0.9431 → NOT-REPRODUCED (REPRO-RECALL-SKIPPED
+        // passes this and fails here)
+        let rec_c = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9431, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        assert_eq!(repro_verdict(&rec_a, &rec_c).word, "NOT-REPRODUCED");
+
+        // all bounds fine at ef16 but qps 2x off at the second ef →
+        // NOT-REPRODUCED (REPRO-EF16-ONLY passes this and fails here)
+        let ef64_b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                repro_series(64, 332.0, 1.566, 0.9951, None),
+            ],
+        );
+        let (a3, _) = base();
+        let v = repro_verdict(&a3, &ef64_b);
+        assert_eq!(v.word, "NOT-REPRODUCED");
+        assert!(
+            v.lines
+                .iter()
+                .any(|l| l.contains("ef64 qps") && l.contains("FAIL")),
+            "{:?}",
+            v.lines
+        );
+
+        // ef sets differ → NOT-REPRODUCED
+        let efs_b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                repro_series(128, 409.0, 2.450, 0.9989, None),
+            ],
+        );
+        assert_eq!(repro_verdict(&a3, &efs_b).word, "NOT-REPRODUCED");
+
+        // run B voided → INVALID
+        let voided_b = repro_run(
+            "release",
+            true,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let v = repro_verdict(&a3, &voided_b);
+        assert_eq!(v.word, "INVALID");
+        assert!(
+            v.lines.iter().any(|l| l.contains("voided")),
+            "{:?}",
+            v.lines
+        );
+
+        // run A profile debug → INVALID
+        let debug_a = repro_run(
+            "debug",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let (_, b4) = base();
+        let v = repro_verdict(&debug_a, &b4);
+        assert_eq!(v.word, "INVALID");
+        assert!(
+            v.lines.iter().any(|l| l.contains("profile")),
+            "{:?}",
+            v.lines
+        );
+
+        // a cold pass with index_indexed != index_points → INVALID
+        let tail_b = repro_run(
+            "release",
+            false,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, Some(984_064.0)),
+                repro_series(64, 664.0, 1.566, 0.9951, None),
+            ],
+        );
+        let v = repro_verdict(&a3, &tail_b);
+        assert_eq!(v.word, "INVALID");
+        assert!(
+            v.lines
+                .iter()
+                .any(|l| l.contains("index_indexed") && l.contains("ef16")),
+            "{:?}",
+            v.lines
+        );
+
+        // INVALID wins over a bounds failure (REPRO-INVALID-LAST checks
+        // bounds first, answers NOT-REPRODUCED here, and fails)
+        let bad_and_voided = repro_run(
+            "release",
+            true,
+            vec![
+                repro_series(16, 2404.4, 0.34433, 0.9410, None),
+                repro_series(64, 332.0, 1.566, 0.9951, None),
+            ],
+        );
+        let v = repro_verdict(&a3, &bad_and_voided);
+        assert_eq!(v.word, "INVALID");
     }
 }
