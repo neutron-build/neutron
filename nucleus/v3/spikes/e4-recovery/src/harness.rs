@@ -2205,6 +2205,7 @@ pub fn run_round(
                 &image_slots,
                 &tainted_slots,
                 &noinplace_hits,
+                &events,
             );
             (rb, r)
         }
@@ -3228,8 +3229,26 @@ pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
 /// X5-R5's set R: slots the opened image references that are not tainted,
 /// written after the first completed `sync_all` covering a meta newer
 /// than the opened one, **and never written with an M-NOINPLACE hit**
-/// (condition 3, the monitor's per-write verdicts). From the
-/// durable-write history.
+/// (condition 3, the monitor's per-write verdicts).
+///
+/// **X5-R20 shape B (P ruling nv3-X-5c-F1-esc-1): condition 3's write
+/// history is the *issued* record, not only the sync-covered one.**
+/// R5's text says "SimDisk records a page-file write to `s` **issued**
+/// after [the anchor]" — and its condition-3 guard (M-NOINPLACE) is
+/// itself computed over the issued-event stream. The draft consulted
+/// only `dwrites_of` (whose membership is writes a completed sync
+/// covered), so a slot reused after the newer graduation whose reuse
+/// writes were still unsynced at the crash — the crash keeps their
+/// bytes (F-CRASH's `p_keep_latest`), the bytes equal the last issued
+/// so 1.4 does not taint them, and the rolled-back image references
+/// the slot with its stale create-era reference CRC — was missing from
+/// R, and amcheck's correct detection failed the round as "amcheck
+/// reported slot … neither tainted nor in R" (the 39 bc4f3bba shape-B
+/// rounds; repro seed 38 round 0: slot 4, ten issued writes after the
+/// k=1 graduation's sync at ev[128], the crash kept ev[287]'s id-6
+/// epoch-2 page, `check2` fails against meta k=0's map-root ref). Both
+/// sources are consulted: the durable-write list (cross-life, as
+/// before) and this life's event stream (the unsynced reuses).
 pub fn exception_set_r(
     disk: &SimDisk,
     pf: usize,
@@ -3237,6 +3256,7 @@ pub fn exception_set_r(
     image_slots: &BTreeSet<u64>,
     tainted: &BTreeSet<u64>,
     noinplace_hits: &BTreeSet<u64>,
+    events: &[DiskEvent],
 ) -> BTreeSet<u64> {
     let mut newer_graduation: Option<usize> = None;
     let dw = disk.dwrites_of(pf);
@@ -3262,6 +3282,69 @@ pub fn exception_set_r(
         let slot = w.off / 4096;
         if r_slot_qualifies(slot, image_slots, tainted, noinplace_hits) {
             out.insert(slot);
+        }
+    }
+    // The issued-write half (X5-R20 shape B). The anchor in the event
+    // stream: the first completed `sync_all` after the first issued
+    // write of a meta newer than the opened one. When that first
+    // issued-and-covered newer meta (`dw[g]`) is **not** the in-stream
+    // one, a still earlier graduation happened in a prior life of the
+    // seed (chained round) and the whole stream is post-anchor. When
+    // no in-stream pair exists at all but `dw[g]` does, same: the
+    // graduation precedes this life. Writes before the anchor are not
+    // excused — the slot was the opened image's own content when they
+    // were issued.
+    let is_meta_issued = |e: &DiskEvent| -> bool {
+        match e {
+            DiskEvent::WriteIssued { inode, off, bytes }
+                if *inode == pf && (*off == 4096 || *off == 8192) =>
+            {
+                crate::store::page::parse_meta(bytes)
+                    .ok()
+                    .is_some_and(|m| m.ckpt_id > opened_k)
+            }
+            _ => false,
+        }
+    };
+    let in_stream = events.iter().position(is_meta_issued);
+    let anchor: usize = match in_stream {
+        Some(w) => {
+            let synced = events.iter().skip(w + 1).position(
+                |e| matches!(e, DiskEvent::SyncReturned { inode, all: true } if *inode == pf),
+            );
+            match synced {
+                // The in-stream pair exists: if that issued write is
+                // the same one `dw[g]` covered, this life holds the
+                // earliest graduation and the anchor is its sync;
+                // otherwise a prior-life graduation precedes the whole
+                // stream (the in-stream one never synced, or a still
+                // earlier covered meta exists).
+                Some(s) => {
+                    let same = match &events[w] {
+                        DiskEvent::WriteIssued { off, bytes, .. } => {
+                            dw[g].off == *off && dw[g].bytes == *bytes
+                        }
+                        _ => false,
+                    };
+                    if same { w + 1 + s } else { 0 }
+                }
+                None => 0,
+            }
+        }
+        None => 0,
+    };
+    for (i, e) in events.iter().enumerate() {
+        if i <= anchor {
+            continue;
+        }
+        if let DiskEvent::WriteIssued { inode, off, .. } = e {
+            if *inode != pf {
+                continue;
+            }
+            let slot = off / 4096;
+            if r_slot_qualifies(slot, image_slots, tainted, noinplace_hits) {
+                out.insert(slot);
+            }
         }
     }
     out

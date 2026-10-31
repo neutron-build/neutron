@@ -691,6 +691,56 @@ fn r16_mpe_referenced_set_excludes_the_file_header() {
 /// slot, like the `MisplacedNewer` arm), and the damage stays detected
 /// at `Open` (XX001, never served). On the reverted `slot: Some(1)`
 /// the exactness text reappears and the rounds fail.
+/// **X5-R20 shape B pin (P ruling nv3-X-5c-F1-esc-1; literal config =
+/// bc4f3bba's shape-B seeds 38/137, round 0 each).** Both carried
+/// "O-3(e): amcheck reported slot 4 that is neither tainted nor in R"
+/// with `mrb=true`, `rlen=0`: a Q14 fault tore/misdirected away the
+/// newest meta (k=1 at slot 2), open rolled back to the create's
+/// k=0 at slot 1, and the checkpoint after k=1's graduation had
+/// **reused** k=0's freed map-root slot 4 — ten issued writes after
+/// the graduation sync (seed 38: ev[132..287], epoch-2 map leaves),
+/// none sync-covered, the crash keeping the last (an id-6 epoch-2
+/// page). The bytes equal the last issued (untainted by 1.4), the
+/// rolled-back image references the slot with its stale create-era
+/// ref CRC (§3.3 check 2 fails) — X5-R5's rollback-reuse narrative
+/// word for word, and R5's condition-3 text excuses it ("SimDisk
+/// records a page-file write to `s` **issued** after the first
+/// completed `sync_all` that covered a meta newer than the opened
+/// one"). The draft's `exception_set_r` consulted only the
+/// sync-covered durable-write list and missed every unsynced reuse;
+/// it now also consults the issued-write event stream (the same
+/// record R5's M-NOINPLACE guard reads). On the reverted event source
+/// `rlen` is 0 again and the exactness text reappears.
+#[test]
+fn r20_mpe_r_reads_the_issued_write_history() {
+    for seed in [38u64, 137] {
+        let rec = workload::run_seed(seed, None);
+        let exactness = rec
+            .rounds
+            .iter()
+            .filter_map(|r| r.o3_fail.as_ref())
+            .any(|t| t.contains("neither tainted nor in R"));
+        assert!(
+            !exactness,
+            "seed {seed}: the unsynced-rollback-reuse slot left R again (condition 3 must read the issued-write events)"
+        );
+        // The rollback rounds now carry a non-empty R (|R| ≥ 1) —
+        // the reused slot itself — and no O-3 clause fails.
+        assert!(
+            rec.rounds.iter().any(|r| r.meta_rollback && r.r_len >= 1),
+            "seed {seed}: the shape-B rollback round lost its R set",
+        );
+        assert!(
+            rec.rounds.iter().all(|r| r.pass),
+            "seed {seed}: a round fails beyond the removed defect: {:?}",
+            rec.rounds
+                .iter()
+                .map(|r| (&r.crash, &r.o3_fail, r.pass))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {

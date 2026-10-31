@@ -242,13 +242,22 @@ fn exception_set_r_consults_its_noinplace_hits() {
     let image: BTreeSet<u64> = [7u64].into_iter().collect();
     let tainted: BTreeSet<u64> = BTreeSet::new();
     let hits: BTreeSet<u64> = [7u64].into_iter().collect();
-    let r = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &hits);
+    let r =
+        e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &hits, &disk.events);
     assert!(
         !r.contains(&7),
         "condition 3 at the call site: a slot with an M-NOINPLACE hit must not enter R (R={r:?})"
     );
     let no_hits: BTreeSet<u64> = BTreeSet::new();
-    let r2 = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &no_hits);
+    let r2 = e4_recovery::harness::exception_set_r(
+        &disk,
+        pf,
+        1,
+        &image,
+        &tainted,
+        &no_hits,
+        &disk.events,
+    );
     assert_eq!(
         r2,
         BTreeSet::from([7u64]),
