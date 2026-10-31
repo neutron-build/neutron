@@ -2774,15 +2774,15 @@ fn d17_integrity() {
                     },
                 };
                 match (target, kind) {
-                    // The two R6 cells (P's F4 ruling; X-5c's
-                    // pre-registered X5-R6): recovery returned `Ok`, the
-                    // extraction's scan hit the faulted page (an XX001
-                    // that surfaced through O-1's own reads — hence the
-                    // read-failed message), and the frozen oracle's
-                    // strict reading fails the round through O-3 (d).
-                    // Whether that reading is right is X-5c's to rule:
-                    // assert neither `pass` nor `!pass`, only the
-                    // reading-independent facts.
+                    // The two R6 cells, ruled (X5-R6, P ruling 2026-10-31,
+                    // nv3-X-5c-esc-1): recovery returned `Ok`, the leaf's
+                    // XX001 surfaces on O-1's own reads and is a detected
+                    // loss in class MP; every readable comparison is exact,
+                    // nothing is served, amcheck (i) names the tainted leaf
+                    // (O-3 (e)), and the round passes. P-written before the
+                    // harness fix it needs (amcheck (i) must reach every
+                    // referenced leaf, and amcheck findings must be recorded
+                    // as XX001 sites): red until that fix lands.
                     (Cell::Leaf, Kind::Lost) | (Cell::Leaf, Kind::Torn) => {
                         let r = run17(None, fault);
                         assert!(
@@ -2791,8 +2791,8 @@ fn d17_integrity() {
                             r.o1
                         );
                         assert!(
-                            is_read_failed(&r.o1),
-                            "D17 leaf {kind:?}: the o1 error must be a read-failed form — anything else is silent damage (o1={:?})",
+                            r.o1.is_ok(),
+                            "D17 leaf {kind:?}: X5-R6 — the unreadable leaf is a detected loss, the rest exact (o1={:?})",
                             r.o1
                         );
                         assert!(
@@ -2801,9 +2801,10 @@ fn d17_integrity() {
                             r.served,
                             r.task_error
                         );
-                        println!(
-                            "D17 [R6] leaf {kind:?}: o1={:?} o3={:?} pass={} (X-5c's X5-R6)",
-                            r.o1, r.o3_fail, r.pass
+                        assert!(
+                            r.pass,
+                            "D17 leaf {kind:?}: X5-R6 — a detected, explained loss passes (o3={:?})",
+                            r.o3_fail
                         );
                     }
                     // G7's catching test (the F3 ruling): clean — the

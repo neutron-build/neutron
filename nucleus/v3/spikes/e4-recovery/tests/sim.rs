@@ -1030,3 +1030,43 @@ fn baton_violation_cross_thread_holder_is_reported() {
         r.map(|_| ())
     );
 }
+
+/// X5-R9 (P ruling 2026-10-31, nv3-X-5c-esc-1): taint is byte-precise.
+/// One issued 8 KiB batch whose surviving bytes differ from the issued
+/// ones only in `[5000, 5100)`: the read's tainted ranges are exactly
+/// that run, an accept of `[0, 4096)` is clean, and an accept covering
+/// the run is served. The interval-granular form (the whole overlap
+/// pushed on any difference) fails the first two assertions; it is the
+/// seed-9 round-1 false serve.
+#[test]
+fn taint_is_byte_precise_within_an_issued_batch() {
+    let mut rng = Rng::new(29);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/f").unwrap();
+    disk.sync_dir(ROOT_DIR).unwrap();
+    disk.write_at(f, 0, &[1u8; 8192]).unwrap();
+    disk.sync_data(f).unwrap();
+    let mut next = vec![1u8; 8192];
+    for b in next.iter_mut().take(5100).skip(5000) {
+        *b = 2;
+    }
+    disk.write_at(f, 0, &next).unwrap(); // volatile, will drop
+    disk.apply_crash(&mut rng, &drop_all());
+    disk.new_round();
+    let _ = disk.read_at(f, 0, 8192).unwrap();
+    assert_eq!(
+        disk.reads.last().unwrap().tainted_ranges,
+        vec![(5000, 5100)]
+    );
+    disk.accepted(f, 0, 4096);
+    assert!(
+        disk.served.is_empty(),
+        "bytes equal to the issued ones are not served"
+    );
+    disk.accepted(f, 4096, 2000);
+    assert_eq!(
+        disk.served.len(),
+        1,
+        "an accept covering the differing run is served"
+    );
+}
