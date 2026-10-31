@@ -985,8 +985,12 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             });
         }
         // The targeted draw of a class C round retries on its own
-        // (no twin exists); keep the round's start for the re-run.
-        let mut ch_retry = (!uniform && class == FaultClass::C).then(|| Chain {
+        // (no twin exists); keep the round's start for the re-run. The
+        // MP/MW real round needs its own retry too (the twin and real
+        // chains can have diverged — the twin chain re-seeds after a
+        // failed twin recovery — so the twin's firing does not
+        // guarantee the real round's).
+        let mut ch_retry = (!uniform).then(|| Chain {
             disk: ch.disk.clone(),
             st: ch.st.clone(),
             model: harness::clone_model(&ch.model),
@@ -1032,7 +1036,14 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
             // fired re-derives the spec from its own complete masks and
             // re-runs; the failed attempt is discarded (its outcome
             // would trip the fired-guard for a crash point no checkpoint
-            // reaches — a harness defect, never a pass).
+            // reaches — a harness defect, never a pass). A **uniform**
+            // twin whose counted point overshot (the twin chain may have
+            // diverged from the real chain the count was taken on — the
+            // re-seed after a failed twin recovery) wraps `k` into the
+            // attempt's own measured total: an unfired crash means the
+            // attempt ran to completion, so its `sched_yields` **is**
+            // its total.
+            let uniform_wrap = uniform && !out.0.obs.crash_fired;
             if !uniform
                 && !out.0.obs.crash_fired
                 && let Some(CrashSpec::Hook { ckpt_index, hook }) = script_twin_run.crash
@@ -1073,6 +1084,38 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                     );
                     (o, reads)
                 };
+            } else if uniform_wrap {
+                let total = out.0.sched_yields.max(1);
+                let k2 = match script_twin_run.crash {
+                    Some(CrashSpec::Yield(k)) => 1 + (k - 1) % total,
+                    _ => 0,
+                };
+                if k2 > 0 {
+                    script_twin_run = Script {
+                        crash: Some(CrashSpec::Yield(k2)),
+                        ..script_twin_run
+                    };
+                    // `crash_desc` keeps describing the REAL round's
+                    // point (the twin's record carries no crash desc;
+                    // the real's k is counted on its own chain and
+                    // fires).
+                    let mut reads = Vec::new();
+                    out = {
+                        let o = harness::run_round(
+                            seed,
+                            round,
+                            &script_twin_run,
+                            &tf,
+                            cfg.clone(),
+                            tch_retry.disk,
+                            tch_retry.st,
+                            &tch_retry.model,
+                            tch_retry.cut,
+                            Some(&mut reads),
+                        );
+                        (o, reads)
+                    };
+                }
             } else if !uniform {
                 crash_desc = match script_twin_run.crash {
                     Some(CrashSpec::Hook { ckpt_index, hook }) => {

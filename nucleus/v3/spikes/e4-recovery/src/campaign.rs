@@ -673,7 +673,11 @@ fn cmd_verify(args: &[String]) -> i32 {
         );
     }
     // 2. The digests reproduce. A re-run of every seed in the file.
-    let threads = parse_threads(args).max(4);
+    // X5-R13 (b) bounds the workers at 16 and digests are independent
+    // of the thread count (pinned), so the re-run defaults to 16: at
+    // the card's 10,000 seeds a 4-thread re-run would not fit a
+    // 60-minute command budget.
+    let threads = parse_threads(args).max(16);
     let rss = rss_mib().unwrap_or(0);
     eprintln!("e4-campaign verify: re-running {n} seeds at {threads} threads rss={rss}");
     // X5-R13 (c): the watchdog rides with the re-run (no partial sink —
