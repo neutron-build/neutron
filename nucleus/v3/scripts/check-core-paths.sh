@@ -51,9 +51,13 @@ esac
 # then fails the nucleus/v3/ prefix strip and every CORE_PATHS match.
 # Through a file, not `< <(git diff ...)`: process substitution drops git's exit
 # status, so a failed diff (a bad BASE) would list nothing and exit 0.
+# --no-relative and --ignore-submodules=none beat diff.relative and submodule
+# ignore settings from any scope (enforce-lib.sh's changed() says why). Run
+# from nucleus/v3 under diff.relative this listing would still work, but only
+# by accident: every path is under nucleus/v3, and the prefix strip is a no-op.
 lst=$(mktemp)
 trap 'rm -f "$lst"' EXIT
-git diff -z --no-renames --name-only "$base...$head" -- ":/$v3" >"$lst" || { echo "check-core-paths: git diff $base...$head failed" >&2; exit 1; }
+git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$base...$head" -- ":/$v3" >"$lst" || { echo "check-core-paths: git diff $base...$head failed" >&2; exit 1; }
 while IFS= read -r -d '' f; do
   [ -n "$f" ] || continue
   rel=${f#"$v3"/}

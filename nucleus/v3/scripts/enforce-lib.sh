@@ -22,9 +22,19 @@ vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed '
 # control character ("nucleus/v3/docs/\303\251.md"), and a quoted path no
 # longer matches nucleus/v3/* -- docs/é.md would pass as an outside-v3 file.
 # core.quotePath=false is not enough: it still quotes `"`, `\` and controls.
+# --no-relative: diff.relative, from any config scope (`git -c` and
+# GIT_CONFIG_PARAMETERS included, which no GIT_ENV entry beats), makes a diff
+# run from a subdirectory print cwd-relative paths and drop everything outside
+# it. audit-merges.sh runs this from nucleus/v3, where a P merge's docs/ change
+# then read as an outside-v3 file and .forgejo/ vanished (X-6-F1-F2-F2-F1).
+# Only a flag beats every scope. diff-tree does not read the key.
+# --ignore-submodules=none: diff.ignoreSubmodules=all in any config scope, and
+# submodule.<name>.ignore=all in a worktree .gitmodules (tracked or untracked),
+# drop an added gitlink from the listing; the .gitmodules one shapes diff-tree
+# too, so the tip check below passes the same flag.
 # Callers must check its exit status: a failed listing (a bad BASE) prints
 # nothing, and `done < <(changed ...)` would read that as "nothing changed".
-changed() { local b=$1 h=$2; shift 2; git diff -z --no-renames --name-only "$b...$h" -- "$@"; }
+changed() { local b=$1 h=$2; shift 2; git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$b...$h" -- "$@"; }
 
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
@@ -62,7 +72,7 @@ check_merge() {
   # that a late commit ground to share the reviewed prefix would reuse the verdict.
   # Only commits count, as the ^{commit} peel ignored blobs and trees.
   local tipfiles=()
-  mapfile -d '' -t tipfiles < <(git diff-tree -z --no-commit-id --name-only -r "$head" -- ':/')
+  mapfile -d '' -t tipfiles < <(git diff-tree -z --ignore-submodules=none --no-commit-id --name-only -r "$head" -- ':/')
   { [ ${#tipfiles[@]} -eq 1 ] && [ "${tipfiles[0]}" = "$own" ]; } || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: ${tipfiles[*]}")
   if [[ $vcommit =~ ^[0123456789abcdef]{7,40}$ ]]; then
     local parent objs kinds ty name ncommit=0 mine=0 bad=0
