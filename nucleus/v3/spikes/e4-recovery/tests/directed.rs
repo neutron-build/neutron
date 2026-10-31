@@ -1010,8 +1010,17 @@ fn d10_lost_meta() {
         "D10 clean: never served (o3={:?})",
         clean.o3_fail
     );
-    let m = run(
+    // X5-R11 (e) (P ruling 2026-10-31): after (b), this round carries
+    // an AmcheckI site from the meta fault (the stale-durable-meta-slot
+    // finding), so O-3 (d) no longer fires; supply the twin (the clean
+    // arm's collector pattern) and keep the catch on O-1, which X5-R6
+    // item 5 keeps strict: a mismatch on a read that returns is a
+    // failure, whatever else was detected.
+    let (disk, st) = harness::create_store(cfg(None), 2009, 7).expect("create");
+    let mut twin = Vec::new();
+    let m = harness::run_round(
         2009,
+        0,
         &script,
         &RoundFaults {
             class: FaultClass::Mp,
@@ -1023,12 +1032,18 @@ fn d10_lost_meta() {
             nested_draw: 0,
             probe_pass: false,
         },
-        Some(Mutant::StartSegmentMissingOk),
+        cfg(Some(Mutant::StartSegmentMissingOk)),
+        disk,
+        st,
+        &Model::new(),
+        0,
+        Some(&mut twin),
     );
     assert!(
-        !m.pass && m.o1.is_err() && m.o3_fail.as_deref().unwrap_or("").contains("O-3(d)"),
-        "D10 mutant: the silent empty WAL must lose the acked commits (o1={:?}, o3={:?})",
+        !m.pass && m.o1.is_err(),
+        "D10 mutant: the silent empty WAL must lose the acked commits — O-1 fails on the returned read (o1={:?}, pass={}, o3={:?})",
         m.o1,
+        m.pass,
         m.o3_fail
     );
 }

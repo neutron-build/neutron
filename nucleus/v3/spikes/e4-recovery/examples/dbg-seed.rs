@@ -1,31 +1,29 @@
 //! Debug helper (not part of the suite): reproduce one workload seed and
-//! print the parked state when the round deadlocks.
+//! print the per-round state.
 fn main() {
-    let seed: u64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let rec = e4_recovery::workload::run_seed(seed, None);
-    println!(
-        "seed {seed}: rounds {} deadlock {} panic {} baton {}",
-        rec.rounds.len(),
-        rec.deadlock,
-        rec.panic,
-        rec.baton
-    );
-    for (i, r) in rec.rounds.iter().enumerate() {
+    let seeds: Vec<u64> = std::env::args()
+        .skip(1)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let list = if seeds.is_empty() {
+        (0..16).collect()
+    } else {
+        seeds
+    };
+    for seed in list {
+        let rec = e4_recovery::workload::run_seed(seed, None);
         println!(
-            "round {i}: crash {} fired {} pass {} dl {} te {:?} o1 {:?} o2 {:?} o3 {:?} monitors {:?}",
-            r.crash,
-            r.fired,
-            r.pass,
-            r.deadlock,
-            r.task_error,
-            r.o1_fail,
-            r.o2_fail,
-            r.o3_fail,
-            r.monitors
+            "seed {seed}: pass={} rounds={} deadlock={} panic={} baton={} stopped_early={} te={:?}",
+            rec.passes(),
+            rec.rounds.len(),
+            rec.deadlock,
+            rec.panic,
+            rec.baton,
+            rec.stopped_early,
+            rec.rounds
+                .iter()
+                .filter_map(|r| r.task_error.as_ref())
+                .next()
         );
     }
-    println!("twin: {:?}", rec.twin);
 }

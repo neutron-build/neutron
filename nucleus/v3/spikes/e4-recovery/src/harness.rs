@@ -177,6 +177,16 @@ impl Script {
 pub struct HarnessState {
     /// The reference model.
     pub model: Model,
+    /// X-5c (the seed-7 class): this workload pass runs the round's
+    /// media faults (class MP/MW) — a script op failing with XX001 is a
+    /// client-visible detection of already-recorded damage, and the
+    /// task unwinds without failing the round (the ruled oracle judges
+    /// the round; class C keeps the loud task error).
+    pub media_round: bool,
+    /// X-5c: script ops that unwound on a client-visible XX001
+    /// (counted for the record; the oracle's own detections live in
+    /// `RoundOutcome.detections`).
+    pub client_xx001: u32,
     /// Commit ts → `(sync_on, record lsn, record len)` — recorded at the
     /// enqueue, with the extent `wal_enqueue` returned (the Work 2.1
     /// derivation's F1 fix: the extent lets it fail loudly when a
@@ -327,6 +337,26 @@ pub fn create_store(cfg: StoreCfg, seed: u64, uuid: u128) -> Result<(SimDisk, St
 
 // ---- the commit path (Work 4.3) ----
 
+/// True when the workload pass has already failed (a task error, or
+/// `workload_done` set by a failed peer — a task that is still parked
+/// keeps `tasks_left` above zero, so this is exactly "some task failed
+/// loudly"). Every harness park loop treats this as a loud unwind,
+/// never an endless park: X-5b's N3 discipline (fail loudly rather than
+/// spin the service tasks into the deadlock detector) extended to the
+/// `Applied`/`MetaDurable` waits. The shape it closes: a script op that
+/// fails with a store error (an MP round's legitimately damaged page —
+/// XX001 on a bricked tree) records its task error and wakes the park
+/// keys **once** (Mesa), but the parked peers re-check their own
+/// condition, still false, and park again forever — the scheduler's
+/// DEADLOCK, with the round's true cause (the store error) hidden
+/// behind it (seed 7 round 1 after X5-R11 (a) let round 0 pass).
+fn round_failed(cx: &Cx<'_, RoundWorld>) -> Result<bool, Fail> {
+    cx.with("h:failed", |c| {
+        let h = c.h();
+        Ok(h.task_error.is_some() || h.workload_done)
+    })
+}
+
 /// The commit critical section (ts + enqueue, I-WAL-TS-ORDER), the
 /// group-commit ack (§12.4), apply entry by entry as gated inserts, and
 /// `mark_applied` (visible_ts advances in ts order). Chunked
@@ -383,6 +413,9 @@ pub fn commit_txn(
         if taken {
             break;
         }
+        if round_failed(cx)? {
+            return Err(Fail::Invalid("commit CS wait: the round failed".into()));
+        }
         cx.wait_for(WaitKey::Applied)?;
     }
     let ts = cx.with("h:ts", |c| {
@@ -412,6 +445,9 @@ pub fn commit_txn(
             })?;
             if taken {
                 break;
+            }
+            if round_failed(cx)? {
+                return Err(Fail::Invalid("commit CS wait: the round failed".into()));
             }
             cx.wait_for(WaitKey::Applied)?;
         }
@@ -557,7 +593,9 @@ pub fn commit_txn(
                 Ok(())
             })?;
         }
-        ckpt::apply_op(cx, &to_wop(op), ts, false)?;
+        if let Err(e) = ckpt::apply_op(cx, &to_wop(op), ts, false) {
+            client_xx001_unwind(cx, ts, e)?;
+        }
         if is_drop {
             cx.with("h:dropdone", |c| {
                 c.h().drop_walk = None;
@@ -590,6 +628,36 @@ pub fn commit_txn(
     Ok(ts)
 }
 
+/// X-5c (the seed-7 class, R11 (g) instrumentation defect): in a
+/// media round a script op's `Fail::Corrupt` is a client-visible
+/// detection of already-recorded damage (the plan's clause 3: detected,
+/// never served) — the harness's abort-on-error policy overrode the
+/// ruled oracle and broke the 5.5 round shape (the crash never fired;
+/// seed 7 round 1's drop of the damaged tree). The task unwinds; the
+/// commit's record stays in the WAL (recovery is the authority for its
+/// effects — §14/R10's principle), so its ts fills the visibility slot
+/// (`applied`, never walked here) or every later committer would park
+/// below it. The oracle then judges the round: O-1 at a cut below the
+/// failed commit, or a replay-XX001 `Err` recovery — both legal. In
+/// class C the error propagates unchanged (a loud task error: class C
+/// has no damage, so a Corrupt there is a defect).
+fn client_xx001_unwind(cx: &Cx<'_, RoundWorld>, ts: u64, e: Fail) -> Result<(), Fail> {
+    let media = cx.with("h:cxx", |c| {
+        Ok(c.h().media_round && matches!(e, Fail::Corrupt(_)))
+    })?;
+    if !media {
+        return Err(e);
+    }
+    cx.with("h:cxx2", |c| {
+        c.h().client_xx001 += 1;
+        // The visibility fill: the record exists in the WAL; later
+        // mark_applied walks pass through the ts.
+        c.store().seq.applied.insert(ts);
+        Ok(())
+    })?;
+    Err(e)
+}
+
 /// `mark_applied`: visible_ts advances in ts order; a committer waits
 /// for its turn to pass (§12.4's visibility rule).
 fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
@@ -613,6 +681,11 @@ fn mark_applied(cx: &Cx<'_, RoundWorld>, ts: u64) -> Result<(), Fail> {
         let vis = cx.with("h:vis2", |c| Ok(c.store().seq.visible_ts))?;
         if vis >= ts {
             return Ok(());
+        }
+        if round_failed(cx)? {
+            return Err(Fail::Invalid(format!(
+                "mark_applied(ts {ts}): the round failed below the frontier"
+            )));
         }
         cx.wait_for(WaitKey::Applied)?;
     }
@@ -762,6 +835,8 @@ fn run_task(
             for op in task.ops.iter() {
                 yld!();
                 if let Err(e) = script_op(&cx, op) {
+                    // TEMP-PROBE (reverted): the failing op, in full.
+                    eprintln!("SCRIPT-OP FAIL {op:?}: {e:?}");
                     // A failed script op is a round failure, recorded
                     // and reported — never a silent early exit (the
                     // service tasks would spin on a workload that can
@@ -779,7 +854,25 @@ fn run_task(
                     let world_crashed = cx
                         .with("h:taskerr", |c| Ok(c.sched_mut().crashed))
                         .unwrap_or(true);
-                    if !world_crashed {
+                    let client_xx = cx
+                        .with("h:taskcxx", |c| {
+                            Ok(c.h().media_round && matches!(e, Fail::Corrupt(_)))
+                        })
+                        .unwrap_or(false);
+                    if client_xx && !world_crashed {
+                        // X-5c: the detection is client-visible; the task
+                        // ends (its remaining ops do not run — like a
+                        // crash), the ROUND continues to its own crash,
+                        // faults, recovery and the ruled oracle.
+                        cx.with("h:taskcxx2", |c| {
+                            c.h().client_xx001 += 1;
+                            Ok(())
+                        })
+                        .ok();
+                        cx.w.wake(WaitKey::WalAcks);
+                        cx.w.wake(WaitKey::MetaDurable);
+                        cx.w.wake(WaitKey::Applied);
+                    } else if !world_crashed {
                         cx.with("h:taskerr2", |c| {
                             let h = c.h();
                             if h.task_error.is_none() {
@@ -841,7 +934,8 @@ fn run_task(
 /// Run one scripted op. Returns the store's `Fail` unchanged (every
 /// `Cx` call already yields `Fail`): the task runner records the
 /// original error, never a masked one (the gate's N3).
-fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
+/// Run one scripted op (pub for the harness tests' unit pins).
+pub fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
     match op {
         ScriptOp::Commit { sync_on, ops } => commit_txn(cx, ops, *sync_on, false).map(|_| ()),
         ScriptOp::Chunked { sync_on, ops } => commit_txn(cx, ops, *sync_on, true).map(|_| ()),
@@ -868,6 +962,11 @@ fn script_op(cx: &Cx<'_, RoundWorld>, op: &ScriptOp) -> Result<(), Fail> {
                 let vis = cx.with("h:waitv", |c| Ok(c.store().seq.visible_ts))?;
                 if vis >= *v {
                     break;
+                }
+                if round_failed(cx)? {
+                    return Err(Fail::Invalid(format!(
+                        "WaitVisible({v}): the round failed below the frontier"
+                    )));
                 }
                 cx.wait_for(WaitKey::Applied)?;
             }
@@ -1052,6 +1151,11 @@ fn wait_ckpt(cx: &Cx<'_, RoundWorld>) -> Result<(), Fail> {
         })?;
         if !pending && !open {
             return Ok(());
+        }
+        if round_failed(cx)? {
+            return Err(Fail::Invalid(
+                "forced-checkpoint wait: the round failed".into(),
+            ));
         }
         cx.wait_for(WaitKey::MetaDurable)?;
     }
@@ -1319,6 +1423,10 @@ pub struct RoundOutcome {
     /// prior rounds' media list; O-3 (c)'s targets and the quota flags
     /// read exactly this slice).
     pub media_faults: Vec<MediaFault>,
+    /// X-5c: script ops that unwound on a client-visible XX001 (a
+    /// media round's detected damage surfacing at the client; recorded
+    /// beside the rule, never inside it).
+    pub client_xx001: u32,
     /// Recycle renames the F-CRASH directory draw dropped (Q12): rename
     /// events whose from-name still resolves after the crash.
     pub renames_dropped: u64,
@@ -1363,6 +1471,7 @@ impl Default for RoundOutcome {
             nested_fired: 0,
             nested_points: Vec::new(),
             media_faults: Vec::new(),
+            client_xx001: 0,
             renames_dropped: 0,
             digest: 0,
         }
@@ -1558,6 +1667,7 @@ pub fn run_round(
             st: start_store.clone(),
             h: HarnessState {
                 model: clone_model(model),
+                media_round: faults.class != FaultClass::C,
                 ..HarnessState::default()
             },
         };
@@ -1645,6 +1755,10 @@ pub fn run_round(
             ..Default::default()
         };
         outcome.sched_yields = sched_yields_total;
+        outcome.client_xx001 = {
+            let g = sched.lock();
+            g.h.client_xx001
+        };
         outcome.obs = obs;
         return outcome;
     }
@@ -1929,6 +2043,13 @@ pub fn run_round(
                 Ok(p) => ex.published = p,
                 Err(_) => ex.xx001.push(XxSite::Read23),
             }
+            // X5-R11 (b): a slotted amcheck (i) finding is an XX001
+            // detection site — the detection table and O-3 (b)-(d) must
+            // see it (the draft pushed only `Read23` and `Open`, so an
+            // amcheck detection was invisible to the verdict).
+            if amcheck_i.iter().any(|f| f.slot.is_some()) && !ex.xx001.contains(&XxSite::AmcheckI) {
+                ex.xx001.push(XxSite::AmcheckI);
+            }
             // The served corruption check. Every life of this round
             // contributes: the workload pass (the sched disk), the
             // recovery pass(es) and this extraction's own accepts, plus
@@ -2021,6 +2142,12 @@ pub fn run_round(
             ex.amcheck_ii_ran = ck.is_ok();
             ex.image_slots_ii = image_slots_ii;
             ex.tainted_image_slots_ii = tainted_slots_ii;
+            // X5-R11 (b): the (ii) sites, same as the (i) push above.
+            if findings_ii.iter().any(|f| f.slot.is_some())
+                && !ex.xx001.contains(&XxSite::AmcheckIi)
+            {
+                ex.xx001.push(XxSite::AmcheckIi);
+            }
             // The final verdict: the same extraction plus the (ii)
             // fields, judged by the frozen oracle (a fresh sample rng,
             // seeded identically — determinism is per schedule, not per
@@ -2096,7 +2223,12 @@ pub fn run_round(
                 rollback_slots: rollback_slots.clone(),
                 ..Default::default()
             };
-            let _ = &mut ex;
+            // X5-R11 (b): the failed-recovery path records the (i) sites
+            // beside `Open` (the ruling names all three paths: real,
+            // twin — the same code — and failed-recovery).
+            if amcheck_i.iter().any(|f| f.slot.is_some()) && !ex.xx001.contains(&XxSite::AmcheckI) {
+                ex.xx001.push(XxSite::AmcheckI);
+            }
             let mut nop = NopReader;
             // The failed-recovery twin supply: the pre-supplied twin when
             // present (the G7 clean shape's reads come from the failed
@@ -2515,16 +2647,28 @@ pub fn durable_image(
             &mut out,
         );
     }
-    // The trees, from the directory entries.
-    if meta.dir_root != 0
-        && let Some(r) = flat.get(&meta.dir_root).copied()
-    {
-        let entries = dir_entries_disk(disk, pf, meta.dir_root, r, &flat, &mut out);
-        used.insert(r.slot);
-        for (_id, root) in entries {
-            if let Some(rr) = flat.get(&root).copied() {
-                walk_tree_disk(disk, pf, root, rr, &flat, &mut used, &mut out);
-            }
+    // The pages the opened map references (X5-R11 (a), P ruling
+    // 2026-10-31): amcheck (i) applies §3.3 to **every mapped LPID's
+    // `Ref`** — the directory and tree pages are LPIDs of the map, and
+    // the earlier directory→tree walk never reached a leaf under an
+    // inner page: `walk_map_disk` below pre-inserts every mapped slot
+    // into `used`, and the walk's `used`-dedup then `continue`d past
+    // the descent of inner pages on their first visit, so a tainted
+    // referenced leaf (D17's slot 92, seeds 7–8's map-referenced tree
+    // leaves) was never §3.3-checked and never named — hidden behind
+    // O-3 (d), which failed those rounds before the (e) completeness
+    // half could matter. The loop is also strictly more thorough than
+    // the walk: a mapped-but-dir-unreachable page (a dropping tree's
+    // pages, a directory inner's stray cell) is checked too, and the
+    // expected id of every mapped page is its LPID (check (3) is
+    // positional — the gate's R4).
+    for (lpid, r) in flat.iter() {
+        let b = disk.durable_read(pf, r.slot * 4096, 4096);
+        if crate::store::page::check(b.as_slice(), r, *lpid, None).is_err() {
+            out.push(Finding {
+                slot: Some(r.slot),
+                what: "§3.3 fail on mapped page".into(),
+            });
         }
     }
     used.insert(0);
@@ -2690,108 +2834,6 @@ fn walk_free_disk(
         }
     }
 }
-
-fn dir_entries_disk(
-    disk: &SimDisk,
-    pf: usize,
-    dir_root: u64,
-    root_ref: crate::store::page::Ref,
-    flat: &BTreeMap<u64, crate::store::page::Ref>,
-    out: &mut Vec<Finding>,
-) -> Vec<(u64, u64)> {
-    let mut out_entries = Vec::new();
-    // `(lpid, ref)` — the §3.3 id check is positional: the page's header
-    // id must equal its LPID (the draft passed a hardcoded 0, which
-    // failed every directory page and was silently swallowed).
-    let mut stack = vec![(dir_root, root_ref)];
-    while let Some((l, r)) = stack.pop() {
-        let b = disk.durable_read(pf, r.slot * 4096, 4096);
-        if crate::store::page::check(&b, &r, l, None).is_err() {
-            // Report it (the gate's N4): the draft `continue`d silently,
-            // so a fault on the directory page — a leaf — left the
-            // tainted referenced slot unnamed and O-3 (e)'s completeness
-            // half failed the round (D17's second half found it: the
-            // planted stale page was the directory's own).
-            out.push(Finding {
-                slot: Some(r.slot),
-                what: "§3.3 fail on directory page".into(),
-            });
-            continue;
-        }
-        let kind = crate::store::page::header_kind(&b);
-        if kind == crate::store::page::KIND_LEAF {
-            if let Ok(cells) = tree::leaf_cells(&b) {
-                for (k, v) in cells {
-                    if k.len() != 8 || v.len() != 9 {
-                        continue;
-                    }
-                    let mut rb = [0u8; 8];
-                    if let Some(s) = v.get(0..8) {
-                        rb.copy_from_slice(s);
-                    }
-                    if let Ok(id) = k.try_into() {
-                        out_entries.push((u64::from_be_bytes(id), u64::from_le_bytes(rb)));
-                    }
-                }
-            }
-        } else if let Ok((seps, right)) = tree::inner_seps(&b) {
-            for (c, _) in seps {
-                if let Some(cr) = flat.get(&c) {
-                    stack.push((c, *cr));
-                }
-            }
-            if let Some(rr) = flat.get(&right) {
-                stack.push((right, *rr));
-            }
-        }
-    }
-    out_entries
-}
-
-fn walk_tree_disk(
-    disk: &SimDisk,
-    pf: usize,
-    lpid: u64,
-    root_ref: crate::store::page::Ref,
-    flat: &BTreeMap<u64, crate::store::page::Ref>,
-    used: &mut BTreeSet<u64>,
-    out: &mut Vec<Finding>,
-) {
-    let mut stack = vec![(lpid, root_ref)];
-    while let Some((l, r)) = stack.pop() {
-        let b = disk.durable_read(pf, r.slot * 4096, 4096);
-        // §3.3 on a referenced tree page fails: report it (the gate's
-        // N4 — the draft `continue`d silently, and the map walk's
-        // slot-set collection pre-inserted every data slot into `used`,
-        // so the dedup below skipped the check entirely; O-3 (e)'s
-        // completeness half then failed rounds whose tainted tree slots
-        // the walk had walked past without naming). The check runs
-        // before the dedup for exactly that reason.
-        if crate::store::page::check(&b, &r, l, None).is_err() {
-            out.push(Finding {
-                slot: Some(r.slot),
-                what: "§3.3 fail on tree page".into(),
-            });
-            continue;
-        }
-        if !used.insert(r.slot) {
-            continue;
-        }
-        if crate::store::page::header_kind(&b) == crate::store::page::KIND_INNER
-            && let Ok((seps, right)) = tree::inner_seps(&b)
-        {
-            for (c, _) in seps {
-                if let Some(cr) = flat.get(&c).copied() {
-                    stack.push((c, cr));
-                }
-            }
-            if let Some(rr) = flat.get(&right).copied() {
-                stack.push((right, rr));
-            }
-        }
-    }
-}
-
 /// The opened meta of a disk (durable bytes).
 pub fn read_opened_meta(disk: &SimDisk) -> (Option<crate::store::page::Meta>, ()) {
     let pf = match disk.stat(crate::sim::PAGE_FILE) {
