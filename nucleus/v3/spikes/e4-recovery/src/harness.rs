@@ -1414,6 +1414,10 @@ pub struct RoundOutcome {
     pub livelock: bool,
     /// The site of the yield that tripped the budget (X5-R13 (b)).
     pub livelock_site: &'static str,
+    /// The park table at the trip (X5-R13 (b) diagnosis): `task:key`
+    /// per task (`run` = runnable — the spinner the deadlock detector
+    /// could never see). Diagnostic only; never a digest input.
+    pub livelock_parked: Vec<String>,
     /// A SimFail::Baton was observed (RoundOutcome).
     pub baton: bool,
     /// A task panicked.
@@ -1489,6 +1493,7 @@ impl Default for RoundOutcome {
             deadlock: false,
             livelock: false,
             livelock_site: "",
+            livelock_parked: Vec::new(),
             baton: false,
             panicked: false,
             task_error: None,
@@ -1774,6 +1779,18 @@ pub fn run_round(
                 g.h.task_error.clone(),
                 g.h.livelock,
                 g.h.livelock_site,
+                g.sched
+                    .livelock_parked
+                    .iter()
+                    .enumerate()
+                    .map(|(t, w)| {
+                        format!(
+                            "{t}:{}",
+                            w.map(|k| format!("{k:?}"))
+                                .unwrap_or_else(|| "run".to_owned())
+                        )
+                    })
+                    .collect::<Vec<_>>(),
             ),
             g.h.wal_commits.clone(),
             g.disk.events.clone(),
@@ -1791,6 +1808,7 @@ pub fn run_round(
             panicked: flags.2,
             livelock: flags.4,
             livelock_site: flags.5,
+            livelock_parked: flags.6,
             ..Default::default()
         };
         outcome.sched_yields = sched_yields_total;
@@ -2070,6 +2088,7 @@ pub fn run_round(
         panicked: flags.2,
         livelock: flags.4,
         livelock_site: flags.5,
+        livelock_parked: flags.6,
         task_error,
         ..Default::default()
     };

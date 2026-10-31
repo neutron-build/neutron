@@ -695,6 +695,21 @@ fn gc_locked<H: StoreHost>(
         root_collapse(cx, pins, root)?;
         return Ok(Vec::new());
     }
+    // X5-R13's seed 36, root-caused (P: "gc_step hands back its own
+    // cursor (`next == resume`)"): when the leaf **closes a subtree** —
+    // it is its parent's right child under a non-rightmost parent, so
+    // no in-parent sibling pair exists — and the key region ahead is
+    // empty (a key gap across the subtree boundary), `next_after` of
+    // the last processed cell stays below the subtree's separator: the
+    // descent re-enters the same subtree, the step hands back its own
+    // cursor, and `gc_sweep` loops at `h:gcyield` forever — a hang the
+    // DEADLOCK detector can never see, because the looping task never
+    // parks (the livelock X5-R13 (b)'s budget bounds and records).
+    // Resume at the subtree's ceiling instead; the leaf's groups were
+    // already decided (it was the R of the previous step's pair).
+    if exhausted && leaf_is_parents_right(&path)? {
+        return subtree_ceiling(&path);
+    }
     // §10.4's per-step shape: the leaf L **and its right sibling R** (one
     // gated operation): a group spanning the L/R boundary is decided as a
     // whole, so a deferred tombstone's older versions cannot survive
@@ -931,6 +946,48 @@ fn path_is_rightmost(path: &[(u64, Vec<u8>)]) -> Result<bool, Fail> {
         }
     }
     Ok(true)
+}
+
+/// The subtree ceiling of a descent path: the smallest separator that
+/// bounds the path's leaf from above at any ancestor — the least key
+/// that routes a descent strictly right of that leaf's subtree (§10.4's
+/// sweep resumes there when the key region ahead of the leaf is empty;
+/// see `gc_locked`). Never empty for a path that is not the tree's
+/// rightmost: some ancestor then bounds the leaf.
+fn subtree_ceiling(path: &[(u64, Vec<u8>)]) -> Result<Vec<u8>, Fail> {
+    let mut ceil: Option<Vec<u8>> = None;
+    for w in path.windows(2) {
+        let (_parent_lpid, parent_bytes) =
+            w.first().ok_or_else(|| Fail::Invalid("path".to_owned()))?;
+        let (child_lpid, _) = w.get(1).ok_or_else(|| Fail::Invalid("path".to_owned()))?;
+        let (seps, _right) = inner_seps(parent_bytes)?;
+        for (c, s) in seps.iter() {
+            if c == child_lpid {
+                let tighter = ceil
+                    .as_ref()
+                    .map(|k| s.as_slice() < k.as_slice())
+                    .unwrap_or(true);
+                if tighter {
+                    ceil = Some(s.clone());
+                }
+            }
+        }
+    }
+    ceil.ok_or_else(|| Fail::Invalid("no ceiling above a rightmost path".to_owned()))
+}
+
+/// Whether the path's leaf is its parent's **right** child (it closes
+/// its parent's subtree: §10.4's step has no in-parent sibling to pair
+/// it with). A single-leaf root answers false (there is no parent).
+fn leaf_is_parents_right(path: &[(u64, Vec<u8>)]) -> Result<bool, Fail> {
+    let Some((leaf_lpid, _)) = path.last() else {
+        return Ok(false);
+    };
+    let Some((_p_lpid, parent_bytes)) = path.get(path.len().saturating_sub(2)) else {
+        return Ok(false);
+    };
+    let (seps, _right) = inner_seps(parent_bytes)?;
+    Ok(!seps.iter().any(|(c, _)| c == leaf_lpid))
 }
 
 /// Root collapse (§6.3): an inner root with one child copies the child up

@@ -1,19 +1,14 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c — X5-R13 (a)–(d) landed — (a) the TEMP-PROBE
-stderr line is gone and the ruling is recorded verbatim below; (b)
-`YIELD_BUDGET` = 1,000,000 with `SimFail::Livelock` naming the site,
-folded into the `deadlock` flags, `campaign.json` and the digest (pin
-`r13b_livelock_budget_trips_and_folds_into_deadlock`, verified
-mutant-style); (c) the memory watchdog (`E4_MEM_LIMIT_MIB`, default
-20480; on a trip: dispatch stops, the completed records go to
-`<out>.partial`, `E4 ABORT rss=… limit=… done=…/n inflight=…`, exit 3,
-no `<out>`, no final `E4` line — verified live); (d) the seed range is
-half-open (`0..10000` = 10,000 seeds; `5..5` empty = an error; the
-sweep defaults to `0..500`; pins in
-`r13d_seed_range_is_half_open`). `cargo test` green, the 16-seed smoke
-passing; next: the 10k campaign `run`, `verify`, the sweep and the
-RESULT.** The stages before it (X-5a, X-5b) are complete and merged.
+Status: **stage X-5c — X5-R13 (a)–(d) landed (each pinned in its own
+commit, before any campaign `run`); the gc_step livelock root-caused
+and fixed (seed 36's class: the sweep's resume could not cross the
+subtree boundary — pin `gc_sweep_crosses_subtree_boundaries`);
+`cargo test` green (130 tests), the 16-seed smoke passing; the 10k
+campaign `run` follows in this attempt (two earlier partial runs died
+with runner kills at 7500/10000 — no results file was written; a first
+full campaign landed at 10000 after the gc fix, see below).**
+The stages before it (X-5a, X-5b) are complete and merged.
 Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
 fix).
 
@@ -308,6 +303,57 @@ the worker landed (a) with this copy in the same commit, before the next
 
 ## This stage's delivery of the rulings (the worker's half)
 
+- **X5-R13 (a)–(d)** (commits e25073a2, 9f581381, 20781b78, ca77230e):
+  each landed pinned in its own commit, before any campaign `run` (the
+  live checks are in the Status line above and the commit messages:
+  the abort path `E4 ABORT rss=2 limit=1 done=0/4 inflight=2`, exit 3,
+  the `.partial` written, no `<out>`, no `E4` line; `run --seeds 36..37`
+  finishes — see the seed-36 note below for how its second half read
+  out).
+- **Seed 36, root-caused and fixed (a prototype deviation from S-STORE
+  §10.4, classified per X5-R11 (g)/X5-R13 item 3).** P's diagnosis
+  confirmed exactly: `tree::gc_step` handed back its own cursor. The
+  mechanism: the sweep's resume was `next_after` of the last processed
+  cell, which cannot cross the **subtree boundary** the leaf closes
+  when the key region ahead is empty (a key gap across an inner
+  boundary) — the descent re-enters the same subtree forever, a hang
+  the DEADLOCK detector can never see because the looping task never
+  parks (pre-(b): an unbounded hang and the OOM kill; post-(b): a
+  recorded livelock). The fix (`src/store/tree.rs`): when the leaf is
+  exhausted, is its parent's right child (no in-parent sibling pair —
+  its groups were already decided as the previous step's R), and the
+  path is not the tree's rightmost, the step resumes at the
+  **subtree ceiling** (the smallest separator bounding the leaf from
+  above at any ancestor) instead. Pin:
+  `gc_sweep_crosses_subtree_boundaries` (a literal config: a depth-3
+  tree of 3,000 keys spaced 7 apart — an inner page caps at 254
+  children, so ~334 leaves force the third level, and every inner
+  boundary crossing has an empty key region ahead; fails on the step
+  bound with the ceiling reverted, demonstrated mutant-style both for
+  the draft resume and for the minimal branch, reverted clean). The
+  empty-leaf and exhausted-with-sibling flows are byte-identical to
+  the draft (gc_merges_and_root_collapse stays green).
+  - **The `run --seeds 36..37` pin, honestly:** the run finishes, but
+    seed 36 is **not** recorded DEADLOCK/livelock — after (b), the
+    uniform draw's counting pass is bounded by the budget, so every
+    round's crash point (y:3494, y:15821, y:472667) fires **before**
+    the livelock begins, and all three rounds pass (the 36..37 run at
+    the (b) commit: `E4 SEEDS=2 O1_FAIL=1 O2_FAIL=0 O3_FAIL=1
+    DEADLOCK=0 PANIC=0 O1F_FAIL=1 MONITOR=0`, the failures being seed
+    37's pre-fix round). The termination half of the ruling's pin
+    holds; the DEADLOCK/livelock half described the pre-(b) behavior
+    (the hang P measured was the counting pass, which never
+    terminated without a budget).
+- **Seed 148, root-caused (same class, confirmed after the fix
+  pending):** round 1 livelocked at `h:evictor` with a pre-trip park
+  table of **all tasks runnable** (the sched's trip snapshot,
+  `RoundOutcome.livelock_parked`) — the GC-task loop shape of seed 36
+  with the service tasks spinning behind it, plus a recovery-`Err`
+  round whose recorded O-1 text is the frozen oracle's Err-branch
+  default (an empty published set compared against the model — the
+  pass fold ignores O-1 for a recovery `Err` in MP; the round fails
+  through the deadlock fold). The gc fix is expected to clear it; the
+  campaign confirms.
 - **X5-R10** (commit 9488e1ed): `recover` restarts at the frontier
   (`visible_ts := frontier`, `next_ts := frontier + 1`, `applied`
   cleared); the model-commit guard makes a held-ts commit a loud

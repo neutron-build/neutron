@@ -124,6 +124,11 @@ pub struct SchedCore {
     pub livelock: bool,
     /// The call site of the yield that tripped [`YIELD_BUDGET`].
     pub livelock_site: &'static str,
+    /// The park table at the trip (X5-R13 (b) diagnosis): each task's
+    /// [`WaitKey`] just before the world was failed — the stuck pattern
+    /// that the DEADLOCK detector could not see because some task kept
+    /// yielding. Diagnostic only; never a record or a digest input.
+    pub livelock_parked: Vec<Option<WaitKey>>,
     /// Trace of `(yield_count, picked_task)` handoffs, for the determinism
     /// self-test and diagnosis; bounded so long rounds stay cheap.
     pub trace: Vec<(u64, TaskId)>,
@@ -150,6 +155,7 @@ impl SchedCore {
             deadlock: false,
             livelock: false,
             livelock_site: "",
+            livelock_parked: Vec::new(),
             trace: Vec::new(),
         }
     }
@@ -347,6 +353,10 @@ impl<H: SchedHost> Sched<H> {
             if core.yields > YIELD_BUDGET && !core.livelock {
                 core.livelock = true;
                 core.livelock_site = site;
+                // Snapshot the stuck pattern before the world-fail
+                // clears it (diagnosis; the deadlock detector never
+                // saw it because some task kept yielding).
+                core.livelock_parked = core.waiting.clone();
                 core.crashed = true;
                 core.running = None;
                 for w in core.waiting.iter_mut() {
