@@ -874,7 +874,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"pass\":{},\"dl\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -896,6 +896,9 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.acked_lost_syncoff,
                 x.meta_rollback,
                 x.r_len,
+                x.o1_detected_loss,
+                x.r6_round,
+                x.client_xx001,
                 x.pass,
                 x.deadlock,
                 x.panic,
@@ -1309,6 +1312,9 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "ackls" => x.acked_lost_syncoff = j.int()?,
             "mrb" => x.meta_rollback = j.boolv()?,
             "rlen" => x.r_len = j.int()? as usize,
+            "o1dl" => x.o1_detected_loss = j.int()? as u32,
+            "r6" => x.r6_round = j.boolv()?,
+            "cxx" => x.client_xx001 = j.int()? as u32,
             "pass" => x.pass = j.boolv()?,
             "dl" => x.deadlock = j.boolv()?,
             "pa" => x.panic = j.boolv()?,

@@ -576,6 +576,15 @@ pub struct RoundRec {
     pub acked_lost: u64,
     /// The SyncOff subset of the acked commits lost.
     pub acked_lost_syncoff: u64,
+    /// X5-R6: O-1 comparisons at the matched `c` satisfied by a
+    /// detected loss (class MP only; reported beside the rule, never
+    /// inside it).
+    pub o1_detected_loss: u32,
+    /// X5-R6: this round is an R6 round (class MP/MW, recovery `Ok`,
+    /// at least one XX001).
+    pub r6_round: bool,
+    /// X-5c: script ops that unwound on a client-visible XX001.
+    pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
     pub meta_rollback: bool,
     /// X5-R5: `|R|`.
@@ -699,7 +708,7 @@ impl SeedRec {
         );
         for r in &self.rounds {
             s.push_str(&format!(
-                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.crash,
                 r.fired,
                 r.nested,
@@ -717,6 +726,9 @@ impl SeedRec {
                 r.served,
                 r.meta_rollback,
                 r.r_len,
+                r.o1_detected_loss,
+                r.r6_round,
+                r.client_xx001,
                 r.pass,
                 r.deadlock,
                 r.task_error.is_some(),
@@ -1033,6 +1045,9 @@ fn round_rec(
     rr.detections = out.detections.clone();
     rr.acked_lost = out.acked_lost.len() as u64;
     rr.acked_lost_syncoff = out.acked_lost.iter().filter(|(_, so)| *so).count() as u64;
+    rr.o1_detected_loss = out.o1_detected_loss;
+    rr.r6_round = out.r6_round;
+    rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();
     rr.pass = out.pass;

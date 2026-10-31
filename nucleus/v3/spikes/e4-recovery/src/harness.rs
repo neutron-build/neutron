@@ -1427,6 +1427,12 @@ pub struct RoundOutcome {
     /// media round's detected damage surfacing at the client; recorded
     /// beside the rule, never inside it).
     pub client_xx001: u32,
+    /// X5-R6: O-1 comparisons at the matched `c` satisfied by a
+    /// detected loss (class MP only; reported beside the rule).
+    pub o1_detected_loss: u32,
+    /// X5-R6: this round is an R6 round (class MP/MW, recovery `Ok`,
+    /// at least one XX001).
+    pub r6_round: bool,
     /// Recycle renames the F-CRASH directory draw dropped (Q12): rename
     /// events whose from-name still resolves after the crash.
     pub renames_dropped: u64,
@@ -1472,6 +1478,8 @@ impl Default for RoundOutcome {
             nested_points: Vec::new(),
             media_faults: Vec::new(),
             client_xx001: 0,
+            o1_detected_loss: 0,
+            r6_round: false,
             renames_dropped: 0,
             digest: 0,
         }
@@ -2024,7 +2032,10 @@ pub fn run_round(
                 w: &world,
                 t: HARNESS,
             };
-            let mut reader = StoreReader { w: &world };
+            let mut reader = StoreReader {
+                w: &world,
+                defects: Vec::new(),
+            };
             let mut ex = Extracted {
                 ok: true,
                 frontier,
@@ -2039,9 +2050,21 @@ pub fn run_round(
                 ..Default::default()
             };
             // The published set (a catalog scan at the frontier, 2.3).
+            // X5-R11 (d): a `Corrupt` failure marks the published-set
+            // read failed (O-1 (a) is then a detected loss in MP) and
+            // still records the `Read23` site; any other failure is a
+            // harness defect the reader records (folded into task_error
+            // after the check).
             match reader.published(frontier) {
                 Ok(p) => ex.published = p,
-                Err(_) => ex.xx001.push(XxSite::Read23),
+                Err(Fail::Corrupt(_)) => {
+                    ex.published_read_failed = true;
+                    ex.xx001.push(XxSite::Read23);
+                }
+                Err(e) => {
+                    reader.map(e, "published");
+                    ex.xx001.push(XxSite::Read23);
+                }
             }
             // X5-R11 (b): a slotted amcheck (i) finding is an XX001
             // detection site — the detection table and O-3 (b)-(d) must
@@ -2164,8 +2187,23 @@ pub fn run_round(
                 &mut sample_rng2,
                 &OracleCfg::default(),
             );
+            // X5-R11 (c): the 2.3 reads' non-Corrupt failures are
+            // harness defects — a loud task error, and the seed fails.
+            if !reader.defects.is_empty() {
+                let d = reader.defects.join("; ");
+                cx.with("h:rdefect", |c| {
+                    let h = c.h();
+                    if h.task_error.is_none() {
+                        h.task_error = Some(format!("2.3 read defect: {d}"));
+                    }
+                    Ok(())
+                })
+                .ok();
+            }
             outcome.o1 = verdict.o1.clone();
             outcome.o1f_ok = verdict.o1f_ok;
+            outcome.o1_detected_loss = verdict.o1_detected_loss;
+            outcome.r6_round = faults.class != FaultClass::C && ex.ok && !ex.xx001.is_empty();
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
             outcome.served = ex.served;
@@ -2989,22 +3027,40 @@ pub fn r_taint_of(events: &[DiskEvent], pf: usize, r_slots: &BTreeSet<u64>) -> b
 pub struct StoreReader<'a> {
     /// The single-task world holding the recovered store.
     pub w: &'a Sched<RoundWorld>,
+    /// X5-R11 (c): non-Corrupt failures seen during the 2.3 reads —
+    /// each is a harness defect (the harness sets a task error from
+    /// them after the check; the seed fails). Only `Fail::Corrupt`
+    /// maps to `ReadFail`.
+    pub defects: Vec<String>,
 }
 
 impl StoreReader<'_> {
-    /// The published set at the frontier (a catalog scan, 2.3).
-    pub fn published(&mut self, frontier: u64) -> Result<BTreeSet<u64>, ReadFail> {
+    /// X5-R11 (c)'s mapping: `Fail::Corrupt` (XX001) is a read failure
+    /// the oracle understands; anything else (`Sim`, `Poisoned`,
+    /// `Invalid`) is a harness defect, recorded and never hidden.
+    fn map(&mut self, e: Fail, what: &str) -> ReadFail {
+        if !matches!(e, Fail::Corrupt(_)) {
+            self.defects.push(format!("{what}: {e:?}"));
+        }
+        ReadFail
+    }
+
+    /// The published set at the frontier (a catalog scan, 2.3). The
+    /// error is the store's own `Fail`: X5-R11 (d) — the caller marks
+    /// `published_read_failed` on `Corrupt` (and keeps the `Read23`
+    /// site); any other failure is a defect via [`Self::map`].
+    pub fn published(&mut self, frontier: u64) -> Result<BTreeSet<u64>, Fail> {
         let cx = Cx {
             w: self.w,
             t: HARNESS,
         };
         let root = cx
             .with("r:cat", |c| Ok(tree::catalog_root(c.store())))
-            .map_err(|_| ReadFail)?;
+            .map_err(Fail::from)?;
         if root == 0 {
             return Ok(BTreeSet::new());
         }
-        let scan = tree::tree_scan(&cx, root, frontier).map_err(|_| ReadFail)?;
+        let scan = tree::tree_scan(&cx, root, frontier).map_err(|e| e)?;
         let mut out = BTreeSet::new();
         for (k, v) in scan {
             if v.as_deref() == Some(PUBLIC) && k.len() == 8 {
@@ -3025,11 +3081,18 @@ impl StateReader for StoreReader<'_> {
             w: self.w,
             t: HARNESS,
         };
-        let root = cx
-            .with("r:root", |c| Ok(c.store().dir.get(&tree).map(|e| e.root)))
-            .map_err(|_| ReadFail)?
-            .ok_or(ReadFail)?;
-        tree::tree_scan(&cx, root, s).map_err(|_| ReadFail)
+        let root = match cx.with("r:root", |c| Ok(c.store().dir.get(&tree).map(|e| e.root))) {
+            Ok(r) => r.ok_or_else(|| {
+                self.defects
+                    .push(format!("scan({tree}): tree missing in directory"));
+                ReadFail
+            }),
+            Err(e) => Err(self.map(e, "scan")),
+        }?;
+        match tree::tree_scan(&cx, root, s) {
+            Ok(x) => Ok(x),
+            Err(e) => Err(self.map(e, "scan")),
+        }
     }
 
     fn raw(&mut self, tree: u64) -> Result<Vec<RawEntry>, ReadFail> {
@@ -3037,11 +3100,18 @@ impl StateReader for StoreReader<'_> {
             w: self.w,
             t: HARNESS,
         };
-        let root = cx
-            .with("r:root2", |c| Ok(c.store().dir.get(&tree).map(|e| e.root)))
-            .map_err(|_| ReadFail)?
-            .ok_or(ReadFail)?;
-        let raw = tree::tree_raw(&cx, root).map_err(|_| ReadFail)?;
+        let root = match cx.with("r:root2", |c| Ok(c.store().dir.get(&tree).map(|e| e.root))) {
+            Ok(r) => r.ok_or_else(|| {
+                self.defects
+                    .push(format!("raw({tree}): tree missing in directory"));
+                ReadFail
+            }),
+            Err(e) => Err(self.map(e, "raw")),
+        }?;
+        let raw = match tree::tree_raw(&cx, root) {
+            Ok(x) => x,
+            Err(e) => return Err(self.map(e, "raw")),
+        };
         Ok(raw
             .into_iter()
             .filter_map(|(k, tag, v)| {
