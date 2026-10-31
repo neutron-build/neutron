@@ -1,23 +1,32 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F1 (stacked on X-5c's branch; X5-R18's first
-card) — **DONE**: steps 0–5 complete. X5-R14 root-caused (the S-DET
+Status: **stage X-5c-F1, relaunched `--keep` under nv3-X-5c-F1-esc-1
+(P, 2026-10-31; run 2's steps 0–3 and NEVER-FIRED/NO-TWIN stand, except
+where X5-R21 (b)/(c) touches them). Resumed at **step 4 (MP-E), then
+step 5**: X5-R20 re-derives the MP-E repros from the committed triage
+file (bc4f3bba), examines shape A (177 of the 222 exactness rounds —
+the seed-37 escalation covered shape B only, and seed 37 now passes),
+and roots or escalates shapes B, C and the completeness residual with
+current-file evidence; X5-R21 (a)–(d) are the record corrections (the
+digest-stability list, the honest NEVER-FIRED record, the twin-pairing
+fix, the twins count); X5-R22 is the run hygiene. A code fix re-runs
+the 10k triage campaign (X5-R20's last bullet). The prior state stands:
+X5-R14 root-caused and pinned, X5-R15 landed with pins, the fresh 10k
+triage campaign committed (exit 0, ~12 min, peak RSS 5.6 GiB):
+`E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=850 DEADLOCK=41
+PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1296
+FAILING_ROUNDS=1247 TWIN_FAILING_ROUNDS=102 DEFECT_SEEDS=0`. Not this
+card (X-5c-F2's): C-XX, C-DIV, MP-LIVELOCK, MP-A, MW-ORPHAN, the
+twins, the retune (X5-R17), the sweep, the RESULT.** The stages before
+it (X-5a, X-5b) are complete and merged. Opus judges E4 on the RESULT
+with P's rulings X5-R1–R21. X5-R14 root-caused (the S-DET
 gate and the deterministic unwind in `Sched::acquire`; both windows
 pinned, stress evidence 4 seeds × 25 loaded runs one digest each),
-X5-R15 (a)–(c)+(e) landed with pins, the fresh 10k triage campaign
-committed (exit 0, ~12 min, peak RSS 5.6 GiB): `E4 SEEDS=10000
-O1_FAIL=2711 O2_FAIL=101 O3_FAIL=850 DEADLOCK=41 PANIC=0
-O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1296
-FAILING_ROUNDS=1247 TWIN_FAILING_ROUNDS=102 DEFECT_SEEDS=0`,
-`verify --no-quotas` green on the digests and the seed set. The
-instrumentation classes: NEVER-FIRED 150→0, NO-TWIN 19→0, MP-E
-completeness 205→6 (residual to F2), MP-E exactness 199→222
-**ESCALATED** (C-XX's mechanism in Q14 rollback rounds — R5 not
-reopened, R not widened; see the class record and the ESCALATE list).
-Not this card (X-5c-F2's): C-XX, C-DIV, MP-LIVELOCK, MP-A, MW-ORPHAN,
-the twins, the retune (X5-R17), the sweep, the RESULT.** The stages
-before it (X-5a, X-5b) are complete and merged. Opus judges E4 on the
-RESULT with P's rulings X5-R1–R19.
+X5-R15 (a)–(c)+(e) landed with pins, `verify --no-quotas` green on the
+run-2 file's digests and seed set. The instrumentation classes after
+run 2: NEVER-FIRED 150→0, NO-TWIN 19→0, MP-E completeness 205→6,
+MP-E exactness 199→222 ESCALATED on stale seed-37 evidence (X5-R20
+re-opens it: shapes A/B/C and the residual, below).
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
@@ -474,6 +483,72 @@ Copied verbatim from the card X-5c-F1 (its "Carried: X5-R14–R19" section, itse
 - **An escalation about one class does not end the attempt.** Record it in the README with its evidence, and continue with the next class.
 - **At the end of the attempt,** if any class is escalated, finish the attempt's remaining Work, then ESCALATE.
 - **Never** fix around an escalated class. Never exclude its seeds, retune to avoid it, or re-run only some seeds.
+
+## P ruling nv3-X-5c-F1-esc-1, verbatim (relaunch, 2026-10-31; binding)
+
+Copied verbatim from the card before any other change of this relaunch
+(step-0 discipline, as X5-R14–R19 before it). The full record is
+`nucleus/v3/verdicts/X-5c-F1-esc-1.md` in the main checkout.
+
+**RELAUNCH `--keep` under nv3-X-5c-F1-esc-1 (P, 2026-10-31): binding, read this first.** Run 2 committed steps 0–5 (tip c3f292cc), and P's rustfmt P-commit 6e689374 made the full gate green (`GATE EXIT=0`). But the Goal is **not** met, for two reasons:
+- **X5-R16 MP-E.** The exactness escalation rests on seed 37, which **passes** in the committed triage file bc4f3bba. Even where it held, that evidence covers only 39 of 222 rounds. The completeness residual (6 rounds) is neither root-caused nor escalated.
+- **RESULT item 1.** It lacks X5-R14 pin 3's seed list.
+
+**Resume at step 4 (MP-E), then step 5.** Set the README's Status line to name this relaunch. Steps 0–3 and NEVER-FIRED/NO-TWIN stand, except where X5-R21 (b)/(c) touches them. X5-R1–R19 bind unchanged. The full record is `verdicts/X-5c-F1-esc-1.md` in the main checkout; everything binding is carried below.
+
+P's reading of the committed file (bc4f3bba), carried for X5-R20:
+
+**The class in the committed file** has 222 rounds of "amcheck reported slot … neither tainted nor in R". All are MP. They split into three shapes:
+
+| Shape | d2c8bba7 | bc4f3bba | Examples (bc4f3bba) |
+|---|---|---|---|
+| **A** reported slot is a **meta slot (1 or 2)**, `mrb=false`, `rlen=0` | 156 | **177** | 67, 268, 328, 337, 377, 378 (round 0, slot 1) |
+| **B** a non-meta slot, `mrb=true`, `rlen=0` | 39 | 39 | 38, 137, 598, 738 (slot 4), 1038 (slot 60) |
+| **C** a non-meta slot, `mrb=false` | 4 | 6 | 688, 3718, 4858, 5238, 5638, 9717 |
+
+- **The evidence covers shape B only.** The worker's escalation rests on one seed, 37 round 0 (`mrb=true`, slot 11, "C-XX's mechanism inside a Q14 rollback round"). So at most 39 of 222 rounds are covered.
+- **That one seed no longer reproduces.** In the committed triage file, seed 37 round 0 **passes** (`mrb=false`, no O-3 text). The fixes moved it, and the README still lists it as "the deterministic repro: `run --seeds 37..38`". That breaks X5-R16's instruction: "confirm that its repro reproduces twice at the fixed code … If a fix moved a repro, re-derive it from the triage file".
+- **Shape A, 80% of the class, was never examined.** In it, amcheck reports a **meta** slot as a finding, there is no meta rollback, and recovery returns `Err` (216 of the 222 rounds carry the recovery-`Err` default O-1(a) text). P's ruling named seed 67, a shape-A seed, as a repro, and it still reproduces (its digest is unchanged).
+- **Shape A's lead** points back at this card's own MP-E completeness fix, 12b54965. That fix changed "the referenced set is now the image's own slots (map, free set, **metas**)". With the metas in the referenced set, the question is what amcheck (i) should say about the meta slot that open did **not** select, or that it rejected, in a Q14 round whose fault is on a meta slot. This is a harness/amcheck-input question. It is X5-R16's original lead ("the image that `harness::durable_image` and amcheck (i) analyse is not the image the store opened"), not C-XX.
+- **The completeness residual** is 6 rounds, all `mrb=true` and `rlen=0`: 1787, 5808, 6157, 8598, 9098, 9647. They are neither root-caused nor escalated with evidence.
+
+**X5-R20 (MP-E is not finished: re-derive, cover every shape, then fix or escalate).**
+- **Seeds.** Re-derive the repro seeds from bc4f3bba's triage file, and confirm each reproduces twice:
+  - shape A: 67 and 268;
+  - shape B: 38 and 137;
+  - shape C: 688 and 3718;
+  - completeness residual: 1787 and 6157.
+- **Shape A first.** For seed 67 round 0, record:
+  - which meta open selected, and why the other was rejected;
+  - which meta slot amcheck (i) reported, and what it read there;
+  - the fault list;
+  - whether that slot's bytes are the last bytes the store issued to it.
+
+  Then classify. If the cause is the harness feeding amcheck a slot outside the opened image (an instrumentation or harness defect), fix it with a literal-config pin that fails on revert, as X5-R16 requires.
+- **Shapes B and C, and the completeness residual.** Root-cause each, or escalate each with its **own** current-file evidence. Seed 37's stale evidence may be kept only as history.
+- **The limits are unchanged.** R5 is not reopened and R is not widened. A served corruption is never classified as a non-failure.
+- **If any MP-E fix changes code:** re-run the 10k triage campaign under X5-R13's backstop, commit it, `verify --no-quotas` it, and re-derive F2's hand-off seeds from it.
+
+**X5-R21 (record corrections: no code unless stated).**
+- **(a) Digest stability.** Commit a seed list under `spikes/e4-recovery/results/` (for example `digest-stability.tsv`: seed, old digest, new digest, cause). Each change is attributed to exactly one cause:
+  - NEVER-FIRED re-draw: the round's crash spec changed and the old round was unfired;
+  - the X5-R14 entry park: uniform `k` changed, or the schedule changed with the spec unchanged;
+  - NO-TWIN supply;
+  - MP-E referenced set.
+
+  To separate X5-R14's own shift, run a 10k `run` at **9b041a3d** (the X5-R14 fix alone) into a file **outside the worktree**, and diff it against d2c8bba7.
+  - Use a detached checkout outside the card worktree: `git worktree add --detach $HOME/.cache/nv3-review/x5cf1-r14only 9b041a3d`.
+  - Give it its own `CARGO_TARGET_DIR`, and run it under X5-R13's backstop, in the foreground.
+  - Remove the checkout afterwards with `git worktree remove`.
+  - Commit only the derived list, never that run's file. Then demonstrate the "stably wrong old order" reading on two changed seeds that d2c8bba7's `verify` did reproduce: show that the old code's `E4_SCHED_LOG` has the pre-baton `h:entry`-class step at the same position on every run.
+- **(b) The README's NEVER-FIRED record** must describe the code as it is (6cc53657 and 4fedc648), including the uniform twin wrap.
+- **(c) The real-round-only retry** (2b (i)) is a Work 2.5 pairing break. Fix it: when the real round re-derives a targeted spec, the twin re-runs at that same spec, from `tch_retry`, before the real round uses its supply and nested points. Pin it with one of 2669, 4049, 4309, 7469 or 9809, and show the pin failing on revert. This is a code change, so X5-R20's campaign re-run applies.
+- **(d) Fix the twins count** (102 rounds, 91 seeds, 44 MP + 58 MW). Answer 2e's re-seed question.
+
+**X5-R22 (run hygiene for this card).**
+- Run every Acceptance-class command (the full gate, `verify`, 10k runs) in the **foreground**, in one shell call that blocks until it exits. Never end a turn while a job you are waiting on is still running in the background: the runner kills it.
+- After any edit, including a lint fix, re-run `cargo fmt --all -- --check` and `cargo clippy -q --workspace --all-targets -- -D warnings` before committing.
+- Read gate failures with `grep 'STEP .* EXIT=[1-9]'` on the full log. The runner's retry message shows only the tail.
 
 ## Stage X-5c-F1's record (this card)
 
