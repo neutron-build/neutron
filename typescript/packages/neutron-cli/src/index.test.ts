@@ -1671,6 +1671,29 @@ function makeBuildFixture(files: Record<string, string | Buffer>): string {
   return dir;
 }
 
+/**
+ * The client build walks core's root entry (Link, hooks). It must not carry
+ * Vite, esbuild, shiki, … — not even as orphan dynamic-import chunks the
+ * browser never loads, which still ship in dist/assets.
+ */
+function assertNoServerCodeInClientBuild(dir: string): void {
+  const manifest = JSON.parse(fs.readFileSync(path.join(dir, "dist", ".vite", "manifest.json"), "utf-8")) as Record<
+    string,
+    unknown
+  >;
+  const serverModules = Object.keys(manifest).filter((key) =>
+    /node_modules\/(\.pnpm\/[^/]+\/node_modules\/)?(vite|esbuild|rolldown|postcss|jiti|tsx|lightningcss|shiki|@shikijs\/[^/]+|typescript|@mdx-js\/mdx|ws)\//.test(key)
+  );
+  assert.deepEqual(serverModules, [], "server-only modules in the client build");
+  const assetsDir = path.join(dir, "dist", "assets");
+  for (const file of fs.readdirSync(assetsDir).filter((name) => name.endsWith(".js"))) {
+    const code = fs.readFileSync(path.join(assetsDir, file), "utf-8");
+    for (const marker of ["createServerModuleRunner", "vite:build-import-analysis", "createHighlighterCore"]) {
+      assert.ok(!code.includes(marker), `${file} carries server code (${marker})`);
+    }
+  }
+}
+
 async function runBuild(dir: string): Promise<string> {
   const proc = runCli("build", dir, {});
   const code = await proc.exited;
@@ -1840,6 +1863,7 @@ export async function resolve(specifier, context, next) {
     };
     try {
       await runBuild(dir);
+      assertNoServerCodeInClientBuild(dir);
       const manifest = path.join(dir, "dist", ".neutron-server-bundle.json");
       assert.deepEqual(JSON.parse(fs.readFileSync(manifest, "utf-8")), {
         format: 1,

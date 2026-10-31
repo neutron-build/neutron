@@ -1380,6 +1380,33 @@ async function bundleServerEntry(
       ...(options.oxc ? { oxc: options.oxc } : {}),
       plugins: [
         ...(build.plugins ?? []),
+        // A webworker SSR target resolves with the client conditions, which
+        // select core's browser entry (server-only exports stubbed). A worker
+        // bundle is the server, so it takes the full root entry.
+        ...(build.target === "webworker"
+          ? [
+              {
+                name: "neutron:worker-core-entry",
+                enforce: "pre" as const,
+                async resolveId(
+                  this: {
+                    resolve: (
+                      id: string,
+                      importer?: string,
+                      options?: { skipSelf?: boolean }
+                    ) => Promise<{ id: string } | null>;
+                  },
+                  id: string,
+                  importer: string | undefined
+                ) {
+                  if (id !== "@neutron-build/core") return null;
+                  const resolved = await this.resolve(id, importer, { skipSelf: true });
+                  if (!resolved || !resolved.id.endsWith("index.browser.js")) return resolved;
+                  return { ...resolved, id: resolved.id.slice(0, -"index.browser.js".length) + "index.js" };
+                },
+              },
+            ]
+          : []),
         // Vite's SSR resolver does not honor the `exports` map for the
         // dynamic-import subpath `preact-render-to-string/stream` inside the
         // noExternal @neutron-build/core dep — it falls back to a raw

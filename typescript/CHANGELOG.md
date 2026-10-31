@@ -178,6 +178,21 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Client builds no longer contain Vite, esbuild, shiki or other server
+  code.** Route modules import `Link` and hooks from `@neutron-build/core`,
+  whose root entry also re-exports the server, the adapters, content
+  collections and the Vite plugins. Tree-shaking dropped their code, but
+  the bundler still had to resolve their imports (a `preserveSymlinks`
+  build failed on magic-string's dependencies) and kept their dynamic
+  imports (`vite`, `ws`, `shiki`, `typescript`) as orphan chunks in
+  `dist/assets/` — on a one-route app, under both runtimes, 18 files /
+  945 KB of client JS, nearly all of it Vite, esbuild, tsx, postcss, jiti and
+  lightningcss; now 5 files / 38 KB. The root entry now has a
+  `browser` export condition (`dist/index.browser.js`) with the same export
+  names: client modules are re-exported unchanged, node-only functions are
+  stubs that throw a "server-only" error if called, and `ServerIsland`
+  renders its children as it already did in the browser. Webworker server
+  bundles, whose resolver also selects `browser`, keep the full entry.
 - **`neutron-ts build` prerenders react-compat pages that import core.**
   Under `runtime: "react-compat"` the prerender's Vite SSR server processes
   every dependency, and it did not keep core's CommonJS-only dependencies
