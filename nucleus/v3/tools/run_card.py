@@ -7,9 +7,13 @@ Usage: nucleus/v3/tools/run_card.py nucleus/v3/cards/<id>.local.md [--base <bran
 Flow: worktree on branch card/v3-<id> from --base -> copy card + worker prompt in (they are local-only)
 -> opencode v2 `run --standalone`, cwd = worktree, stdin closed (denied: rm, sudo, curl, wget, brew, git push/reset/checkout/stash, git fetch/pull/tag/reflog/fast-import, history rewrites, git-state edits, git global options and their GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/GIT_CONFIG* environment forms) -> scope guard (only the
 card's "Touch only" globs) -> acceptance commands -> up to N attempts with failure output fed back ->
-RUNLOG row. Every attempt first checks free disk. Every git call runs with replace refs, grafts and
-fsmonitor off (GIT_ENV), and a repository carrying them, or index entries marked assume-unchanged or
-skip-worktree, is refused: before the first attempt, and by every scope check (git_state_problems).
+RUNLOG row. Every attempt first checks free disk. Every git call runs with replace refs, grafts,
+fsmonitor, the commit-graph and the untracked cache off (GIT_ENV), and a repository carrying them (a
+commit-graph that fails verification, a command-line -c turning a cache back on), a shallow one, one
+with alternates, or index entries marked assume-unchanged or skip-worktree, is refused: before the
+first attempt, and by every scope check (git_state_problems). Probed and inert (X-6-F1-F2-F3):
+alternates beyond their commit-graph (objects are addressed by hash), and core.ignoreStat (it acts
+only through the assume-unchanged bit, which is refused).
 Nothing is merged here: a gate writes verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3,
 §7.6).
 
@@ -75,14 +79,23 @@ GATE_CMD = "cd nucleus/v3 && bash scripts/gate.sh"
 # GIT_REPLACE_REF_BASE outside refs/replace/ is neutralise-only:
 # GIT_NO_REPLACE_OBJECTS disables replacement under any base, and the refusal
 # does not list other bases.
+# The commit-graph and the untracked cache are off too (X-6-F1-F2-F3): a
+# hand-written graph's parents and Bloom filters, or a stale untracked cache,
+# hide changes. A -c turning either back on beats this, so git_state_problems
+# names it, and also names a graph that fails `git commit-graph verify`, a
+# shallow repository and alternates (git-env.sh gives the reasons).
 GIT_ENV = {
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_GRAFT_FILE": "/dev/null",
-    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_COUNT": "4",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
     "GIT_CONFIG_KEY_1": "advice.graftFileDeprecated",
     "GIT_CONFIG_VALUE_1": "false",
+    "GIT_CONFIG_KEY_2": "core.commitGraph",
+    "GIT_CONFIG_VALUE_2": "false",
+    "GIT_CONFIG_KEY_3": "core.untrackedCache",
+    "GIT_CONFIG_VALUE_3": "false",
 }
 GATE_PASS = "GATE EXIT=0"
 OPENCODE_CONFIG = {
@@ -369,12 +382,18 @@ def gate_committed(wt, base, f, card_id, pre_head, ledger=None):
 def git_state_problems(wt, index=True):
     """One line per piece of git state in wt that hides changes, as
     git_state_refuse in scripts/git-env.sh reports them: replace refs, a graft
-    file (common dir or this worktree's git dir), a core.fsmonitor that is set
-    and not false at any scope (read without GIT_ENV's override, which would
-    make it always read false), and, with index, entries marked
+    file (common dir or this worktree's git dir), a shallow repository, an
+    alternates file or GIT_ALTERNATE_OBJECT_DIRECTORIES, a core.fsmonitor that
+    is set and not false at any scope (read without GIT_ENV's override, which
+    would make it always read false), a core.commitGraph or
+    core.untrackedCache that is not false under GIT_ENV (only a caller's
+    GIT_CONFIG_PARAMETERS can beat it), GIT_TEST_COMMIT_GRAPH (forces graph
+    reads), a commit-graph that `git commit-graph verify` (run without the
+    override) rejects, and, with index, entries marked
     assume-unchanged (lowercase ls-files -v tag) or skip-worktree (S), which
-    status and diff skip. GIT_ENV neutralises the first three; nothing
-    neutralises the index flags. Nor an fsmonitor hook from a caller's
+    status and diff skip. GIT_ENV neutralises replace refs, grafts, fsmonitor
+    and the two caches; nothing neutralises shallow entries, alternates or
+    the index flags. Nor an fsmonitor hook from a caller's
     GIT_CONFIG_PARAMETERS (`git -c`), which applies after GIT_ENV's
     GIT_CONFIG_COUNT entries: the override=False read keeps the variable and
     names the hook ("command line:"), so this refusal is its only layer.
@@ -394,11 +413,36 @@ def git_state_problems(wt, index=True):
         probs += [f"replace ref {ref}" for ref in git("for-each-ref", "--format=%(refname)", "refs/replace/").stdout.splitlines() if ref]
         dirs = dict.fromkeys(git("rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir").stdout.splitlines())
         probs += [f"graft file {d}/info/grafts" for d in dirs if d and os.path.lexists(f"{d}/info/grafts")]
+        cmd = ("rev-parse", "--path-format=absolute", "--is-shallow-repository", "--git-path", "shallow", "--git-path", "objects/info/alternates")
+        shallow, spath, apath = (git(*cmd).stdout.splitlines() + ["", "", ""])[:3]
+        if not apath:
+            raise subprocess.CalledProcessError(0, ["git", *cmd], "", "no alternates path in its output")
+        if shallow == "true":
+            probs.append(f"shallow repository ({os.environ.get('GIT_SHALLOW_FILE') or spath})")
+        if os.path.lexists(apath):
+            probs.append(f"alternates file {apath}")
+        if os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+            probs.append(f"GIT_ALTERNATE_OBJECT_DIRECTORIES is '{os.environ['GIT_ALTERNATE_OBJECT_DIRECTORIES']}' in the environment")
         p = git("config", "-z", "--show-origin", "--get-all", "core.fsmonitor", override=False, ok=(0, 1))
         rec = p.stdout.split("\0") if p.returncode == 0 else []
         for origin, val in zip(rec[0::2], rec[1::2]):
             if val.lower() not in ("false", "no", "off", "0"):
                 probs.append(f"core.fsmonitor is '{val}' ({origin})")
+        for key in ("core.commitGraph", "core.untrackedCache"):
+            p = git("config", "-z", "--show-origin", "--get", key, ok=(0, 1))
+            origin, val = (p.stdout.split("\0") + ["", ""])[:2]
+            if p.returncode == 1:
+                probs.append(f"{key} is not set under the environment (its false is missing)")
+            elif val.lower() not in ("false", "no", "off", "0"):
+                probs.append(f"{key} is '{val}' ({origin}), over the environment's false")
+        val = os.environ.get("GIT_TEST_COMMIT_GRAPH", "")
+        if val.lower() not in ("", "false", "no", "off", "0"):
+            probs.append(f"GIT_TEST_COMMIT_GRAPH is '{val}' in the environment (forces commit-graph reads)")
+        # Without the override (git-env.sh says why); -c keeps the grafts hint out.
+        p = git("-c", "advice.graftFileDeprecated=false", "commit-graph", "verify", override=False, ok=(0, 1))
+        if p.returncode == 1:
+            first = ((p.stdout + p.stderr).splitlines() or [""])[0]
+            probs.append(f"commit-graph fails verification ({first or 'no output'})")
         if index:
             for e in git("ls-files", "-v", "-z", "--full-name", "--", ":/").stdout.split("\0"):
                 tag, path = e[:1], e[2:]

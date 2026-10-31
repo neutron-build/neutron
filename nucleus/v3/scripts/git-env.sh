@@ -36,17 +36,52 @@
 #   refusal does not look: neutralise only. GIT_NO_REPLACE_OBJECTS disables
 #   replacement whatever the base, and refs under another base do nothing for
 #   a git call without the variable, so the refusal is not extended to them.
+#
+# Two caches hide changes too (X-6-F1-F2-F3, probed on git 2.47.3):
+# - a hand-written commit-graph: git trusts its parents, generation numbers and
+#   changed-path Bloom filters without reading the commit objects, so one
+#   interior base commit given the card's commit as parent moves base...card's
+#   merge-base and drops the card's tools/ file from the diff, and a zeroed
+#   Bloom filter drops a commit from a walk limited to a plain path (the
+#   runner's `log -- verdicts/<ID>.md`; `:/` pathspecs, as the audit's, make
+#   git skip the filters);
+# - an untracked cache (index extension UNTR) whose directory stat still
+#   matches lists no new file; with core.trustctime=false a restored directory
+#   mtime is enough, so no forgery of the index is needed.
+# Both get both layers. core.commitGraph=false and core.untrackedCache=false
+# below make git ignore the files (under the second, git drops the extension
+# at its next index write: a cache, rebuilt when the setting allows). Since a
+# GIT_CONFIG_PARAMETERS `-c core.commitGraph=true` beats them, as it beats
+# every entry here, the refusal reads both keys under the environment and
+# names a value that is not false (only a command-line entry can win), and
+# names GIT_TEST_COMMIT_GRAPH, git's test switch that forces graph reads over
+# the config. It also runs `git commit-graph verify`, which names a forged
+# parent or generation (not a Bloom filter) whatever the config says; a graph
+# that verifies, such as the ones gc writes, is not refused.
+# Two neighbours are refused outright, since nothing neutralises them and git
+# never makes them on its own:
+# - a shallow repository: shallow entries cut parents, so
+#   `merge-base --is-ancestor` says no for a ref that does carry a worker
+#   commit, and the runner's ref check (R1) passes it;
+# - alternates (objects/info/alternates or GIT_ALTERNATE_OBJECT_DIRECTORIES):
+#   git reads an alternate's commit-graph too, and verify checks only the
+#   repository's own.
+# Probed and inert, so nothing is added for them: what alternates add beyond
+# their commit-graph (objects are addressed by hash); core.ignoreStat (it hides
+# edits only through the assume-unchanged bit it sets on `git add`, which the
+# --index refusal names).
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE=/dev/null
 
-# core.fsmonitor=false and advice.graftFileDeprecated=false go in as
+# core.fsmonitor=false, advice.graftFileDeprecated=false, core.commitGraph=false
+# and core.untrackedCache=false go in as
 # GIT_CONFIG_* entries (command scope, which beats every config file), appended
 # after any the caller set so theirs still apply. A script run by a script finds
 # its own entries already last and does not add them twice. GIT_ENV_BASE_COUNT
-# is the count without them, for the one read that must see the configured
-# value. A count that is not a number is left alone: git then refuses every
+# is the count without them, for the reads that must see the configured
+# values (core.fsmonitor, commit-graph verify). A count that is not a number is left alone: git then refuses every
 # call, which fails closed.
-GIT_ENV_CONFIG=(core.fsmonitor false advice.graftFileDeprecated false)
+GIT_ENV_CONFIG=(core.fsmonitor false advice.graftFileDeprecated false core.commitGraph false core.untrackedCache false)
 _git_env_init() {
   local n=${GIT_CONFIG_COUNT:-0} k=$((${#GIT_ENV_CONFIG[@]} / 2)) i key val same=1
   case $n in *[!0123456789]*) GIT_ENV_BASE_COUNT=; return ;; esac
@@ -68,14 +103,17 @@ GIT_STATE_PROBLEMS=
 
 # git_state_refuse [--index]: prints one line per piece of git state that hides
 # changes, "<problem> (git state hides changes)", and returns 1 if there is
-# any; GIT_STATE_PROBLEMS holds the same lines. A git failure is a problem too,
-# never "nothing found". --index also refuses index entries marked
+# any; GIT_STATE_PROBLEMS holds the same lines: replace refs, a graft file, a
+# shallow repository, alternates, a core.fsmonitor hook, a core.commitGraph or
+# core.untrackedCache that is not false under this environment,
+# GIT_TEST_COMMIT_GRAPH, and a commit-graph that fails `git commit-graph
+# verify`. A git failure is a problem too, never "nothing found". --index also refuses index entries marked
 # assume-unchanged (lowercase `ls-files -v` tag) or skip-worktree (S): status
 # and diff skip them. Only a caller that judges its worktree needs it (the
 # others read committed trees). Callers print, still run their own checks
 # under the environment above, and then exit non-zero.
 git_state_refuse() {
-  local p=() out ref common gitdir tmp rc=0 origin val tag path
+  local p=() out ref common gitdir tmp rc=0 origin val tag path shallow spath apath key
   if out=$(git for-each-ref --format='%(refname)' refs/replace/); then
     while IFS= read -r ref; do [ -n "$ref" ] && p+=("replace ref $ref"); done <<<"$out"
   else
@@ -87,6 +125,16 @@ git_state_refuse() {
   else
     p+=("git rev-parse --git-common-dir --git-dir failed (cannot check for a graft file)")
   fi
+  # Neither has a neutraliser, and git makes neither on its own (clone makes
+  # them only when asked: --depth, --shared, --reference). --git-path follows
+  # the object directory wherever it is.
+  if { read -r shallow && read -r spath && read -r apath; } < <(git rev-parse --path-format=absolute --is-shallow-repository --git-path shallow --git-path objects/info/alternates) && [ -n "$apath" ]; then
+    [ "$shallow" != true ] || p+=("shallow repository (${GIT_SHALLOW_FILE:-$spath})")
+    [ ! -e "$apath" ] || p+=("alternates file $apath")
+  else
+    p+=("git rev-parse --is-shallow-repository failed (cannot check for a shallow repository or alternates)")
+  fi
+  [ -z "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ] || p+=("GIT_ALTERNATE_OBJECT_DIRECTORIES is '$GIT_ALTERNATE_OBJECT_DIRECTORIES' in the environment")
   # NUL-separated records go through a file: $(...) drops NULs.
   tmp=$(mktemp) || { echo "cannot create a temporary file to check git state (git state hides changes)"; GIT_STATE_PROBLEMS="cannot create a temporary file to check git state"; return 1; }
   # Read without the override, which would make this always read false.
@@ -97,6 +145,33 @@ git_state_refuse() {
        done <"$tmp" ;;
     1) ;; # unset
     *) p+=("git config --get-all core.fsmonitor failed (exit $rc; cannot check for an fsmonitor hook)") ;;
+  esac
+  # Read under the override, which only a command-line entry can beat: any
+  # value but false means git reads the cache, and so does no value at all
+  # (exit 1: the environment's entry is missing).
+  for key in core.commitGraph core.untrackedCache; do
+    rc=0
+    git config -z --show-origin --get "$key" >"$tmp" || rc=$?
+    case $rc in
+      0) { IFS= read -r -d '' origin && IFS= read -r -d '' val; } <"$tmp" || val=
+         case ${val,,} in false | no | off | 0) ;; *) p+=("$key is '$val' ($origin), over the environment's false") ;; esac ;;
+      1) p+=("$key is not set under the environment (its false is missing)") ;;
+      *) p+=("git config --get $key failed (exit $rc; cannot check that the environment's $key=false holds)") ;;
+    esac
+  done
+  val=${GIT_TEST_COMMIT_GRAPH:-}
+  case ${val,,} in '' | false | no | off | 0) ;; *) p+=("GIT_TEST_COMMIT_GRAPH is '$val' in the environment (forces commit-graph reads)") ;; esac
+  # Without the override, as the fsmonitor read: on git 2.47.3 verify checks the
+  # file whatever core.commitGraph says, and a git that skipped it under false
+  # would turn this check off without a word. The -c keeps the grafts hint,
+  # which the override also silences, out of the line. Exit 1 is a bad graph;
+  # no graph exits 0.
+  rc=0
+  out=$(GIT_CONFIG_COUNT=$GIT_ENV_BASE_COUNT git -c advice.graftFileDeprecated=false commit-graph verify 2>&1) || rc=$?
+  case $rc in
+    0) ;;
+    1) out=${out%%$'\n'*}; p+=("commit-graph fails verification (${out:-no output})") ;;
+    *) p+=("git commit-graph verify failed (exit $rc; cannot check the commit-graph)") ;;
   esac
   if [ "${1:-}" = --index ]; then
     # From the top, repository-relative: callers run from nucleus/v3, and a
