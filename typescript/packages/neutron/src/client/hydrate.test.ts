@@ -760,6 +760,134 @@ describe("hydrate — document click interceptor", () => {
   });
 });
 
+describe("hydrate — a redirected navigation lands on the redirect target (F-P4-2)", () => {
+  beforeEach(() => {
+    window.history.replaceState(null, "", "/");
+  });
+
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h, hooks } = deps;
+    return {
+      "route:/start": { path: "/start", mode: "app", default: () => h("p", { class: "title" }, "Start") },
+      "route:/open/:id": { path: "/open/:id", mode: "app", hasLoader: true, default: () => h("p", { class: "title" }, "never") },
+      "route:/workspace": {
+        path: "/workspace",
+        mode: "app",
+        hasLoader: true,
+        default: function Workspace() {
+          const data = hooks.useLoaderData<{ open: string }>();
+          return h("p", { class: "title" }, `workspace ${data?.open ?? "none"}`);
+        },
+      },
+    };
+  }
+
+  function redirectResponse(location: string): Response {
+    return {
+      ok: true,
+      status: 204,
+      redirected: false,
+      url: "",
+      headers: new Headers({ "X-Neutron-Redirect": location }),
+      json: async () => {
+        throw new SyntaxError("Unexpected end of JSON input");
+      },
+    } as unknown as Response;
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 6; i++) await flush();
+  }
+
+  it("follows a reported same-origin redirect on the client, replacing the entry, query kept", async () => {
+    const fetchMock = vi.fn(async (url: string) =>
+      url.startsWith("/open/")
+        ? redirectResponse("/workspace?open=note:x")
+        : jsonResponse({ "route:/workspace": { open: new URL(url, "http://x").searchParams.get("open") } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const booted = await bootRouter({
+      pathname: "/start",
+      routeId: "route:/start",
+      data: { "route:/start": {} },
+      routes,
+    });
+    const historyBefore = window.history.length;
+
+    const { navigate } = await import("./navigate.js");
+    navigate("/open/note-x");
+    await settle();
+
+    expect(window.location.pathname).toBe("/workspace");
+    expect(window.location.search).toBe("?open=note:x");
+    expect(booted.app.querySelector(".title")?.textContent).toBe("workspace note:x");
+    // One entry for the navigation: the URL that redirected was replaced.
+    expect(window.history.length).toBe(historyBefore + 1);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/open/note-x",
+      "/workspace?open=note:x",
+    ]);
+    const second = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    expect((second[1].headers as Record<string, string>)["X-Neutron-Routes"]).toBe("route:/workspace");
+  });
+
+  it("falls back to response.redirected when fetch followed a redirect anyway", async () => {
+    const fetchMock = vi.fn(async (url: string) =>
+      url.startsWith("/open/")
+        ? jsonResponse({ "route:/workspace": { open: null } }, {
+            redirected: true,
+            url: `${window.location.origin}/workspace?open=followed`,
+          } as Partial<Response>)
+        : jsonResponse({ "route:/workspace": { open: new URL(url, "http://x").searchParams.get("open") } })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const booted = await bootRouter({
+      pathname: "/start",
+      routeId: "route:/start",
+      data: { "route:/start": {} },
+      routes,
+    });
+
+    const { navigate } = await import("./navigate.js");
+    navigate("/open/note-x");
+    await settle();
+
+    expect(window.location.pathname + window.location.search).toBe("/workspace?open=followed");
+    expect(booted.app.querySelector(".title")?.textContent).toBe("workspace followed");
+  });
+
+  it("hands a cross-origin redirect to the browser as a replace", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => redirectResponse("https://auth.example/login")));
+    const booted = await bootRouter({
+      pathname: "/start",
+      routeId: "route:/start",
+      data: { "route:/start": {} },
+      routes,
+    });
+    const replace = vi.spyOn(window.location, "replace").mockImplementation(() => {});
+
+    const { navigate } = await import("./navigate.js");
+    navigate("/open/note-x");
+    await settle();
+
+    expect(replace).toHaveBeenCalledWith("https://auth.example/login");
+    expect(booted.app.querySelector(".title")?.textContent).toBe("Start");
+  });
+});
+
 describe("hydrate — a not-found route never shadows the page it covers", () => {
   // A `not-found.tsx` carries its DIRECTORY's path, so on the client it
   // collides by path with that directory's index route. Only the isNotFound

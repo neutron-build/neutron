@@ -25,6 +25,7 @@ import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } fr
 import { installTransportPeer } from "./peer.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./health.js";
 import { onShutdownSignal } from "./shutdown.js";
+import { toDataRedirectResponse } from "../core/data-redirect.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -683,6 +684,20 @@ export async function createServer(
     c.set("requestId", requestId);
     await next();
     c.res.headers.set("x-request-id", requestId);
+  });
+
+  // A 3xx answering a data request (X-Neutron-Data) is reported, not sent:
+  // fetch would follow it and the client router would render the target's
+  // data under the URL that redirected (core/data-redirect.ts). Outside every
+  // other layer, so config redirect rules, global middleware, loaders and
+  // mounts are all covered, and the headers they added travel with it.
+  app.use("*", async (c, next) => {
+    await next();
+    const reported = toDataRedirectResponse(c.req.raw, c.res);
+    if (reported !== c.res) {
+      c.res = undefined;
+      c.res = reported;
+    }
   });
 
   // Reject untrusted Host headers first, before any other processing, so a

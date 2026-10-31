@@ -7,7 +7,14 @@ import {
   LoaderData,
   setNavigationState,
 } from "./hooks.js";
-import { getCurrentPath, getCurrentSearch, subscribe, navigate } from "./navigate.js";
+import {
+  getCurrentPath,
+  getCurrentSearch,
+  subscribe,
+  navigate,
+  dataRedirectTarget,
+  followDataRedirect,
+} from "./navigate.js";
 import type { RouteHref } from "../core/typed-routes.js";
 import { initIslands } from "./island-runtime.js";
 import { decodeLoaderDataPayload, readInitialLoaderData } from "./serialization.js";
@@ -586,6 +593,11 @@ function extractParams(pattern: string, pathname: string): Record<string, string
   return params;
 }
 
+// Redirects followed in a row by the client router; reset by any navigation
+// that lands. Bounded like a browser's own redirect limit.
+const MAX_DATA_REDIRECTS = 20;
+let consecutiveDataRedirects = 0;
+
 async function handleNavigation(forceRevalidate: boolean = false) {
   const pathname = getCurrentPath();
   const search = getCurrentSearch();
@@ -720,6 +732,28 @@ async function handleNavigation(forceRevalidate: boolean = false) {
     if (controller.signal.aborted || requestId !== latestNavigationRequestId) {
       return;
     }
+
+    // The URL redirected (loader, middleware or a config rule). Its data is
+    // not this URL's, and the redirect target may lose the address bar's
+    // query if rendered in place, so navigate to the target instead,
+    // replacing the entry that redirected. The route state goes back to the
+    // page actually on screen first: the target's layout diff must be taken
+    // against what was rendered, not against the chain that never loaded.
+    const redirectTo = dataRedirectTarget(response);
+    if (redirectTo !== null) {
+      currentRoute = previousRoute;
+      layouts = previousLayouts;
+      currentUrl = previousUrl;
+      if (++consecutiveDataRedirects > MAX_DATA_REDIRECTS) {
+        // A loop: hand it to the browser, which reports it.
+        consecutiveDataRedirects = 0;
+        window.location.replace(redirectTo);
+        return;
+      }
+      followDataRedirect(redirectTo, { replace: true });
+      return;
+    }
+    consecutiveDataRedirects = 0;
 
     if (response.ok) {
       const payload = await response.json();

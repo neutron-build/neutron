@@ -8,7 +8,14 @@ import {
 } from "./contexts.js";
 import type { LoaderData, NavigationState, RouterState, UIMatch } from "./contexts.js";
 import { decodeLoaderDataPayload } from "./serialization.js";
-import { go, navigate, registerBlocker, unregisterBlocker } from "./navigate.js";
+import {
+  go,
+  navigate,
+  registerBlocker,
+  unregisterBlocker,
+  dataRedirectTarget,
+  followDataRedirect,
+} from "./navigate.js";
 import { storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
 import type { SerializeFrom } from "../core/types.js";
@@ -135,6 +142,15 @@ export function useRevalidator() {
           "X-Neutron-Routes": getActiveRouteIdsHeader(),
         },
       });
+      // Revalidating the page on screen redirected it (a session that ended,
+      // a record that moved): go there, in place of this entry.
+      const redirectTo = dataRedirectTarget(response);
+      if (redirectTo !== null) {
+        if (requestId === requestIdRef.current) {
+          followDataRedirect(redirectTo, { replace: true });
+        }
+        return;
+      }
       if (response.ok) {
         const payload = await response.json();
         const data = decodeLoaderDataPayload(payload);
@@ -224,12 +240,13 @@ export function useSubmit(): {
           redirect: "follow",
         });
 
-        if (response.redirected) {
-          const localUrl = toLocalUrl(response.url);
+        const redirectTo = dataRedirectTarget(response);
+        if (redirectTo !== null) {
+          const localUrl = toLocalUrl(redirectTo);
           if (localUrl) {
             navigate(localUrl);
           } else {
-            window.location.href = response.url;
+            window.location.href = redirectTo;
           }
           return;
         }

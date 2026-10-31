@@ -1,7 +1,7 @@
 import { h } from "preact";
 import { useState, useCallback, useRef, useEffect } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
-import { navigate } from "./navigate.js";
+import { navigate, dataRedirectTarget } from "./navigate.js";
 import { setNavigationState } from "./hooks.js";
 import type { SubmitError } from "./hooks.js";
 import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
@@ -67,6 +67,8 @@ export async function prefetch(to: string): Promise<void> {
   });
 
   if (!response.ok) return;
+  // A redirect: the data is not this URL's (see incrementalPrefetch).
+  if (response.redirected || dataRedirectTarget(response) !== null) return;
 
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("application/json")) return;
@@ -169,8 +171,9 @@ export function Form({
         redirect: "follow",
       });
 
-      if (response.redirected) {
-        const localUrl = toLocalUrl(response.url);
+      const redirectTo = dataRedirectTarget(response);
+      if (redirectTo !== null) {
+        const localUrl = toLocalUrl(redirectTo);
           if (localUrl) {
             if (replace) {
               window.history.replaceState(null, "", localUrl);
@@ -179,7 +182,7 @@ export function Form({
             }
             window.dispatchEvent(new PopStateEvent("popstate"));
         } else {
-          window.location.href = response.url;
+          window.location.href = redirectTo;
         }
       } else if (response.ok) {
         setNavigationState({

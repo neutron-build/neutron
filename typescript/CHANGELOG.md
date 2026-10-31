@@ -265,6 +265,31 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **A redirected client navigation lands on the redirect target.** The router
+  fetched loader data with fetch's default `redirect: "follow"` and never
+  looked at the result: when the data request was redirected — a loader's
+  `redirect()`, an auth gate in `src/middleware.ts`, a `routes.redirects`
+  rule — it rendered the TARGET's data while the address bar kept the URL
+  that redirected, and the target's query string was lost (`/open/note/x`
+  showed the workspace at `/open/note/x`, without `?open=`). Redirects are
+  now part of the data protocol: a 3xx answering an `X-Neutron-Data` request
+  is sent as `204` with the location in `X-Neutron-Redirect` (Set-Cookie and
+  the other headers kept; `Location` removed), by `createServer` outermost
+  (so mounts, middleware, loaders and config rules are all covered), by the
+  dev server and by the generated edge handler. Document requests still get
+  the plain 3xx. The router navigates to the target, replacing the history
+  entry that redirected (the semantics of Next and React Router): a
+  same-origin target is a client navigation that keeps its query and hash, a
+  cross-origin one is `location.replace`. `response.redirected` (a hop fetch
+  followed anyway, e.g. a proxy in front of the app) is honoured the same
+  way, and a redirect loop is handed to the browser after 20 hops. The other
+  data consumers read the same signal: `<Form>`, `useSubmit` and
+  `fetcher.submit` navigate to it as before; `useRevalidator` and fetcher
+  revalidation follow it in place; `fetcher.load` navigates; `prefetch()`
+  (which previously cached a redirected payload under the linked URL) and
+  link prefetching never warm a redirected URL. A client from before this
+  release that receives the 204 reloads the page, which follows the redirect.
+
 - **`createServer` resolves once the server is listening.** It resolved as
   soon as `serve()` returned, before the socket was bound, so an immediate
   `close()` threw `ERR_SERVER_NOT_RUNNING`, `url` named the requested port

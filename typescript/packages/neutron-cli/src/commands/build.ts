@@ -1972,7 +1972,7 @@ function generateRuntimeEntrySource(
   },`);
   });
 
-  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs } from "@neutron-build/core/runtime-edge";
+  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse } from "@neutron-build/core/runtime-edge";
 ${imports.join("\n")}
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
@@ -2166,7 +2166,8 @@ async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
 // Apply baseline security headers to every response from the production handler
 // (the dev server does this already; the generated handler must match).
 export async function handleNeutronRequest(request) {
-  const response = await handleNeutronRequestInner(request);
+  // A redirected data request is reported, not followed (core/data-redirect.ts).
+  const response = toDataRedirectResponse(request, await handleNeutronRequestInner(request));
   const defaults = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",

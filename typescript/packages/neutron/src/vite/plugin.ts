@@ -14,6 +14,7 @@ import { isResponse, withMutableHeaders } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
 import { resolveClientTier } from "../core/render-app-route.js";
 import { transformSsrCommonJs } from "./ssr-cjs.js";
+import { toDataRedirectResponse } from "../core/data-redirect.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -438,8 +439,16 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             url.search
           );
           if (redirect) {
-            res.statusCode = redirect.status;
-            res.setHeader("Location", redirect.location);
+            // A data request gets the redirect reported, as in production
+            // (core/data-redirect.ts).
+            const answer = toDataRedirectResponse(
+              new Request(url.toString(), { headers: req.headers as HeadersInit }),
+              new Response(null, { status: redirect.status, headers: { Location: redirect.location } })
+            );
+            res.statusCode = answer.status;
+            answer.headers.forEach((value, key) => {
+              res.setHeader(key, value);
+            });
             res.end();
             return;
           }
@@ -513,7 +522,12 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             ) {
               return next();
             }
-            const denied = withMutableHeaders(gateResponse);
+            const denied = withMutableHeaders(
+              toDataRedirectResponse(
+                new Request(url.toString(), { headers: req.headers as HeadersInit }),
+                gateResponse
+              )
+            );
             applyRouteRuleHeadersToResponse(
               denied,
               resolveRouteRuleHeaders(compiledRouteRules, normalizePathname(originalPathname))
@@ -557,11 +571,14 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           // Same as start: an immutable-header Response (Response.redirect())
           // still gets the route-rule headers below.
           const response = withMutableHeaders(
-            await runMiddlewareChain(
-              middlewares,
+            toDataRedirectResponse(
               request,
-              context,
-              () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming)
+              await runMiddlewareChain(
+                middlewares,
+                request,
+                context,
+                () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming)
+              )
             )
           );
           applyRouteRuleHeadersToResponse(

@@ -28,6 +28,7 @@
 
 import { decodeLoaderDataPayload } from "./serialization.js";
 import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
+import { dataRedirectTarget } from "./navigate.js";
 
 export { clearPrefetchCache, clearPrefetchCacheForUrl } from "./prefetch-cache.js";
 
@@ -123,7 +124,7 @@ export async function incrementalPrefetch(url: string): Promise<void> {
     // A redirect means the destination is not what was linked. Warming the
     // wrong URL would make the click render a page the server would not serve
     // for it — including, behind auth middleware, one it would have refused.
-    if (response.redirected) return;
+    if (response.redirected || dataRedirectTarget(response) !== null) return;
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("application/json")) return;
 

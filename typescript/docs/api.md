@@ -37,6 +37,7 @@ Loader cache policy notes:
 - Fresh loader results can be stored after mutations, then reused on next reads.
 - Requests with `Authorization`/`Cookie` or `Cache-Control: no-cache|no-store` bypass loader cache.
 - Client data requests can use `X-Neutron-Data: true`.
+- A redirect answering a data request (loader, middleware or `routes.redirects`) is sent as `204` with the target in `X-Neutron-Redirect` instead of a 3xx, so fetch does not follow it; the client router navigates to the target (replacing the entry that redirected). Document requests get the plain 3xx.
 - Optional `X-Neutron-Routes: route:id,...` can request partial loader execution for matched routes.
 
 Server cache store options (`createServer({ cache })`):

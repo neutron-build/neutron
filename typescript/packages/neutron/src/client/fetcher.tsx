@@ -1,7 +1,7 @@
 import { h, FunctionalComponent } from "preact";
 import { useState, useCallback, useMemo, useRef, useEffect } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
-import { navigate } from "./navigate.js";
+import { navigate, dataRedirectTarget, followDataRedirect } from "./navigate.js";
 
 export interface FetcherState<T = unknown> {
   state: "idle" | "loading" | "submitting";
@@ -70,6 +70,11 @@ function revalidateRouteData(locationHref: string): void {
     .then(async (response) => {
       // Guard: don't apply stale data if user has navigated away
       if (window.location.href !== locationHref) return;
+      const redirectTo = dataRedirectTarget(response);
+      if (redirectTo !== null) {
+        followDataRedirect(redirectTo, { replace: true });
+        return;
+      }
       if (!response.ok) return;
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) return;
@@ -181,6 +186,20 @@ export function useFetcher<T = unknown>(key?: string): Fetcher<T> {
           });
 
           if (controller.signal.aborted) return;
+          // A redirected load is a navigation, as in React Router: the data
+          // belongs to another URL, so the fetcher does not keep it.
+          const redirectTo = dataRedirectTarget(response);
+          if (redirectTo !== null) {
+            update({
+              state: "idle",
+              data: dataRef.current,
+              formData: undefined,
+              formAction: undefined,
+              formMethod: undefined,
+            });
+            followDataRedirect(redirectTo);
+            return;
+          }
 
           if (response.ok) {
             const contentType = response.headers.get("content-type") || "";
@@ -277,6 +296,20 @@ export function useFetcher<T = unknown>(key?: string): Fetcher<T> {
             });
 
             if (controller.signal.aborted) return;
+            // A redirected load is a navigation, as in React Router: the data
+            // belongs to another URL, so the fetcher does not keep it.
+            const redirectTo = dataRedirectTarget(response);
+            if (redirectTo !== null) {
+              update({
+                state: "idle",
+                data: dataRef.current,
+                formData: undefined,
+                formAction: undefined,
+                formMethod: undefined,
+              });
+              followDataRedirect(redirectTo);
+              return;
+            }
 
             if (response.ok) {
               const contentType = response.headers.get("content-type") || "";
@@ -344,12 +377,13 @@ export function useFetcher<T = unknown>(key?: string): Fetcher<T> {
 
           if (controller.signal.aborted) return;
 
-          if (response.redirected) {
-            const localUrl = toLocalUrl(response.url);
+          const redirectTo = dataRedirectTarget(response);
+          if (redirectTo !== null) {
+            const localUrl = toLocalUrl(redirectTo);
             if (localUrl) {
               navigate(localUrl);
             } else {
-              window.location.href = response.url;
+              window.location.href = redirectTo;
             }
             update({
               state: "idle",
