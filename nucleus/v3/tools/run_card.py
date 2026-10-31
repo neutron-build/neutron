@@ -536,10 +536,11 @@ def git_state_problems(wt, index=True):
             p = subprocess.run(cmd, cwd=top, env=git_env(), input=paths, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
             if p.returncode != 0:
                 raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+            # No value is skipped, the state words included: git runs
+            # filter.set.clean for `filter=set` (git-env.sh says why).
             rec, drivers = p.stdout.split("\0"), {}
             for path, val in zip(rec[0::3], rec[2::3]):
-                if val not in ("unspecified", "unset", "set"):
-                    drivers.setdefault(val, []).append(path)
+                drivers.setdefault(val, []).append(path)
             for d, used in drivers.items():
                 for kind in ("clean", "process"):
                     q = git("config", "-z", "--show-origin", "--get-all", f"filter.{d}.{kind}", override=False, ok=(0, 1))

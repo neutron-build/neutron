@@ -273,11 +273,16 @@ git_state_refuse() {
     # off, nothing names the drivers ahead of time, and hashing the worktree
     # without filters would list every eol=crlf file: refuse only. A driver
     # configured with no path using it (a global filter.lfs.*) is not named.
+    # No value is skipped: check-attr prints the same word for a state and
+    # for a driver of that name, and git runs filter.set.clean for
+    # `filter=set` (likewise unset, unspecified). Looking up filter.set.* for a
+    # bare `filter` attribute costs one config read, and no one configures a
+    # driver of those names in normal use. The count for such a word may
+    # include paths in that state.
     local top d n kind first drv=()
     declare -A dfirst=() dn=()
     if top=$(git rev-parse --show-toplevel) && git ls-files -z --full-name -- ':/' >"$tmp" && (cd "$top" && git check-attr -z --stdin filter <"$tmp") >"$tmp.attr"; then
       while IFS= read -r -d '' path && IFS= read -r -d '' _ && IFS= read -r -d '' val; do
-        case $val in unspecified | unset | set) continue ;; esac
         [ -n "${dfirst[$val]:-}" ] || { dfirst[$val]=$path; drv+=("$val"); }
         dn[$val]=$((${dn[$val]:-0} + 1))
       done <"$tmp.attr"

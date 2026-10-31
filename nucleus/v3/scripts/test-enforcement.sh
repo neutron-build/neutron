@@ -1317,6 +1317,32 @@ ex_a() { GIT_CONFIG_PARAMETERS=$xex "$@"; }
 expect_ok "premise: EX (a): a -c core.excludesFile hides it from plain status" ex_a ex_hidden
 expect_ok "runner: EX (a): under a -c core.excludesFile tools/ex.py is still protected" ex_a gs nucleus/v3-scaffold nucleus/v3/tools/ex.py -
 expect_ok "promote: EX (f): under a -c core.excludesFile the worktree is not clean" out_has "promote-pass: worktree is not clean" "!! nucleus/v3/tools/ex.py" -- ex_a promote7
+# EX rework (verdict R3): a check-ignore that fails, with an ignored path to
+# name, never reads as "nothing hidden by a tracked rule": the runner's
+# listing raises (the dirty check's and scope_violations' listing alike), and
+# promote-pass dies.
+wtc_raises() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+try:
+    print("listed:", rc.worktree_changes(pathlib.Path(sys.argv[2])))
+except subprocess.CalledProcessError as e:
+    print("raised:", e.cmd, e.returncode, e.stderr)
+    sys.exit(0 if "check-ignore" in e.cmd and e.returncode == 128 else 1)
+sys.exit(1)
+P
+}
+expect_ok "runner: EX: a failed check-ignore makes worktree_changes raise (the dirty check's listing)" ex_a gshim check-ignore wtc_raises
+ci_gs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), "nucleus/v3-scaffold", ["nucleus/v3/spikes/"])
+print("\n".join(bad) or "(no violations)")
+sys.exit(0 if any(b.startswith("git check-ignore ") and "gshim refused check-ignore" in b and b.endswith("(cannot list changed files)") for b in bad) else 1)
+P
+}
+expect_ok "runner: EX: scope_violations reports a failed check-ignore, not a listing" ex_a gshim check-ignore ci_gs
+expect_ok "promote: EX: a failed check-ignore dies, never reads as clean" out_has "promote-pass: cannot name the rules hiding ignored paths (git check-ignore exit 128)" -- ex_a gshim check-ignore promote7
 mkdir -p "$t/xdg/git"; printf '*.py\n' >"$t/xdg/git/ignore"
 ex_b() { XDG_CONFIG_HOME=$t/xdg "$@"; }
 expect_ok "premise: EX (b): the XDG default ignore file hides it from plain status" ex_b ex_hidden
@@ -1416,6 +1442,33 @@ expect_ok "SF: both refusals name a clean filter in the repository config" both 
 expect_ok "git-env.sh: SF: a failed check-attr is a problem" gsr check-attr "git check-attr filter failed (cannot check for clean filters)"
 expect_ok "runner: SF: a failed check-attr is a problem" gshim check-attr gsp
 expect_ok "git-env.sh: SF: a failed config --get-all filter.sf.clean is a problem" gsr filter.sf.clean "git config --get-all filter.sf.clean failed (exit 128; cannot check the clean filter)"
+# SF rework (verdict R1): a driver named like an attribute state. check-attr
+# prints `set` both for a bare `filter` and for `filter=set`, yet git runs
+# filter.set.clean for the second (likewise unset and unspecified), so no
+# value may be skipped. Premise: hash-object --path applies the attribute's
+# filter, so the edited file hashes to the committed blob under the driver.
+# For unspecified the count covers every unattributed path, so that row
+# matches from ", and" on.
+git -C "$r" config --unset filter.sf.clean
+st_blob=$(git -C "$r" rev-parse st-base:nucleus/v3/tools/st.py)
+for sd in set unset unspecified; do
+  echo "nucleus/v3/tools/st.py filter=$sd" >"$r/.git/info/attributes"
+  xsd="'filter.$sd.clean'='cat $t/st.orig'"
+  sd_hash() { (cd "$v3" && . scripts/git-env.sh && GIT_CONFIG_PARAMETERS=$xsd git -C "$r" hash-object --path=nucleus/v3/tools/st.py nucleus/v3/tools/st.py) | grep -qxF "$st_blob" && ! git -C "$r" hash-object --no-filters nucleus/v3/tools/st.py | grep -qxF "$st_blob"; }
+  expect_ok "premise: SF: git runs filter.$sd.clean for filter=$sd: the edit hashes to the committed blob" sd_hash
+  sd_line=", and filter.$sd.clean is 'cat $t/st.orig' (command line:)"
+  [ "$sd" = unspecified ] || sd_line="filter=$sd is on 1 tracked path(s) (first: nucleus/v3/tools/st.py)$sd_line"
+  sd_both() { GIT_CONFIG_PARAMETERS=$xsd both "$sd_line"; }
+  expect_ok "SF: both refusals name a -c clean filter for a driver named '$sd'" sd_both
+done
+# SF rework (verdict R2): a driver with only filter.<driver>.process set. The
+# refusal reads config only, so the command need not run.
+echo 'nucleus/v3/tools/st.py filter=sf' >"$r/.git/info/attributes"
+xsp="'filter.sf.process'='nv3-no-such-process'"
+expect_ok "premise: SF: under a -c filter.sf.process alone, filter.sf.clean is unset" bash -c "! GIT_CONFIG_PARAMETERS=\"\$1\" git -C '$r' config --get-all filter.sf.clean" _ "$xsp"
+sp_both() { GIT_CONFIG_PARAMETERS=$xsp both "filter=sf is on 1 tracked path(s) (first: nucleus/v3/tools/st.py), and filter.sf.process is 'nv3-no-such-process' (command line:)"; }
+expect_ok "SF: both refusals name a -c process filter with no clean command" sp_both
+git -C "$r" config filter.sf.clean "cat $t/st.orig"
 # Controls: a driver no path uses (a global filter.lfs.* in normal use) and a
 # filter attribute with no driver are not refused. The filtered status wrote
 # the edited file's stat into the index (see RESULT: a residual of this
