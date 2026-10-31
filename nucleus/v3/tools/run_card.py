@@ -68,6 +68,13 @@ GATE_CMD = "cd nucleus/v3 && bash scripts/gate.sh"
 # advice.graftFileDeprecated=false silences the hint GIT_GRAFT_FILE makes git
 # print on every call, which run() would fold into what it parses. Identical to
 # scripts/git-env.sh, which explains each one.
+# Two channels have one layer each (X-6-F1-F2-F2; git-env.sh gives the reasons):
+# a caller's GIT_CONFIG_PARAMETERS (`git -c`) applies after GIT_CONFIG_COUNT,
+# so an inherited -c core.fsmonitor=<hook> beats ours; it is refuse-only
+# (git_state_problems names it) and is neither stripped nor unset. A
+# GIT_REPLACE_REF_BASE outside refs/replace/ is neutralise-only:
+# GIT_NO_REPLACE_OBJECTS disables replacement under any base, and the refusal
+# does not list other bases.
 GIT_ENV = {
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_GRAFT_FILE": "/dev/null",
@@ -367,7 +374,13 @@ def git_state_problems(wt, index=True):
     make it always read false), and, with index, entries marked
     assume-unchanged (lowercase ls-files -v tag) or skip-worktree (S), which
     status and diff skip. GIT_ENV neutralises the first three; nothing
-    neutralises the index flags. A git failure is one line, never [].
+    neutralises the index flags. Nor an fsmonitor hook from a caller's
+    GIT_CONFIG_PARAMETERS (`git -c`), which applies after GIT_ENV's
+    GIT_CONFIG_COUNT entries: the override=False read keeps the variable and
+    names the hook ("command line:"), so this refusal is its only layer.
+    Replace refs under another GIT_REPLACE_REF_BASE are not listed:
+    GIT_NO_REPLACE_OBJECTS disables them whatever the base, so GIT_ENV is
+    their only layer. A git failure is one line, never [].
     Nothing is cleared: the operator decides."""
     def git(*args, override=True, ok=(0,)):
         cmd = ["git", *args]
