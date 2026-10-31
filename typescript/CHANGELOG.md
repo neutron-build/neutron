@@ -393,6 +393,24 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Docker preset: `/` reaches the app, the image context drops `start`'s
+  bundle, and files get `start`'s headers.** The image's `server.mjs`
+  served `dist/index.html` for `/` before the app handler, so an app route at
+  `/` was shadowed by the client build's shell; a prebuilt HTML file now
+  answers only where no app route (or redirect rule) claims the path, as in
+  `start`. The image context carried `dist/server/start` — `start`'s bundle,
+  unused by the image, whose `node_modules` links point into the build
+  machine's package store; `.dockerignore` now excludes it and its manifest.
+  Files the image serves get the `routes.headers` and security defaults the
+  app's responses get, and `/assets/*` the immutable cache header.
+- **No `Cannot find module '@jridgewell/sourcemap-codec'` during builds with
+  `resolve.preserveSymlinks` (react-compat, pnpm-linked core).** The
+  prerender's SSR runtime evaluated core's `magic-string` at core's linked
+  path, where its own dependency is invisible; loading core failed (logged)
+  and the prerender fell back to the CLI's copy of the router providers.
+  `magic-string` joins the deps the SSR runner keeps native
+  (`RUNTIME_RUNNER_CJS_EXTERNALS`).
+
 - **`neutron-ts dev` sends every `Set-Cookie` of a response.** Dev copied
   route responses onto the Node response one header entry at a time with
   `setHeader`, which replaces, so of several `Set-Cookie` headers only the

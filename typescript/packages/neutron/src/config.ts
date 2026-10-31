@@ -227,6 +227,17 @@ export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] | tr
  * - `yaml` — config/route-rules parsing
  * - `@babel/parser` — route type generation
  *
+ *
+ * And one ESM dependency for a different reason:
+ *
+ * - `magic-string` — the Vite plugin's source rewriting, reached through
+ *   core's root entry. Under `resolve.preserveSymlinks` with a pnpm-linked
+ *   core, the runner resolves it at core's LINKED path, where its own
+ *   dependency (`@jridgewell/sourcemap-codec`, a pnpm sibling) is invisible,
+ *   and evaluating core fails. The build's prerender then fell back to the
+ *   CLI's own router providers (a second instance). Native, Node resolves
+ *   it from the real path. It shares no module instance with app code.
+ *
  * Keeping exactly these native lets CORE itself run in the SSR graph
  * (dev and start compose this the same way), which is what unifies core's
  * hooks (useLocation, useLoaderData, …) with the app's react-compat hooks
@@ -239,6 +250,7 @@ export const RUNTIME_RUNNER_CJS_EXTERNALS = [
   "gray-matter",
   "yaml",
   "@babel/parser",
+  "magic-string",
 ] as const;
 
 /**

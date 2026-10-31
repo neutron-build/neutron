@@ -2093,12 +2093,23 @@ export default function Probe({ data }) {
   return <p>{"docker-" + n + "-" + useLocation().pathname + "-" + data.parsed}</p>;
 }
 `,
+      // An app route at "/": dist/index.html (the client build's shell)
+      // must not answer for it.
+      "src/routes/index.tsx": `
+export const config = { mode: "app" };
+export async function loader() { return { at: "home-loader" }; }
+export default function Home({ data }) { return <p>{"docker-home-" + data.at}</p>; }
+`,
     });
     const context = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-docker-context-"));
     try {
       const build = runCli("build", dir, {}, ["--preset", "docker"]);
       assert.equal(await build.exited, 0, build.output());
+      // The prerender's SSR runtime evaluated core from its linked path, where
+      // magic-string's own dependency is invisible (logged, then a fallback).
+      assert.doesNotMatch(build.output(), /Cannot find module|Error when evaluating SSR module/, build.output());
       const dist = path.join(dir, "dist");
+      assert.ok(fs.existsSync(path.join(dist, "index.html")), "fixture premise: the client shell is in dist");
 
       // The dependency set is in the context, as real directories.
       assert.ok(fs.existsSync(path.join(dist, "node_modules", "section-matter", "package.json")), build.output());
@@ -2118,12 +2129,27 @@ export default function Probe({ data }) {
       walk(path.join(dist, "node_modules"));
       walk(runtimeDir);
       assert.deepEqual(symlinks, []);
-      // And it is not excluded from the image.
-      const dockerignore = fs.readFileSync(path.join(dist, ".dockerignore"), "utf-8");
-      assert.ok(!dockerignore.split("\n").includes("node_modules"), dockerignore);
+      // And it is not excluded from the image; start's bundle (whose
+      // node_modules links point into this machine's store) is.
+      const dockerignore = fs.readFileSync(path.join(dist, ".dockerignore"), "utf-8").split("\n");
+      assert.ok(!dockerignore.includes("node_modules"), dockerignore.join("\n"));
+      assert.ok(dockerignore.includes("server/start") && dockerignore.includes(".neutron-server-bundle.json"));
+      assert.ok(fs.existsSync(path.join(dist, "server", "start")), "fixture premise: start's bundle is in dist");
 
-      // The context alone, outside any tree with node_modules, serves the page.
-      fs.cpSync(dist, context, { recursive: true });
+      // The context alone — what docker sends, .dockerignore applied —
+      // outside any tree with node_modules, serves the page and has no links.
+      const ignored = new Set(dockerignore.filter(Boolean).map((entry) => path.join(dist, entry)));
+      fs.cpSync(dist, context, { recursive: true, filter: (source) => !ignored.has(source) });
+      const contextLinks: string[] = [];
+      const walkContext = (current: string) => {
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+          const full = path.join(current, entry.name);
+          if (entry.isSymbolicLink()) contextLinks.push(full);
+          else if (entry.isDirectory()) walkContext(full);
+        }
+      };
+      walkContext(context);
+      assert.deepEqual(contextLinks, []);
       const port = await freePort();
       const child = spawn(process.execPath, ["server.mjs"], {
         cwd: context,
@@ -2150,6 +2176,20 @@ export default function Probe({ data }) {
           }
         }
         assert.ok(html.includes("docker-7-/probe-zod-ok"), html + output);
+
+        const home = await fetch(`http://127.0.0.1:${port}/`, { headers: { accept: "text/html" } });
+        const homeHtml = await home.text();
+        assert.equal(home.status, 200);
+        assert.ok(homeHtml.includes("docker-home-home-loader"), homeHtml + output);
+        assert.equal(home.headers.get("cross-origin-resource-policy"), "same-origin");
+
+        // Files get start's headers too.
+        const asset = fs.readdirSync(path.join(context, "assets")).find((name) => name.endsWith(".js"))!;
+        const assetResponse = await fetch(`http://127.0.0.1:${port}/assets/${asset}`);
+        await assetResponse.arrayBuffer();
+        assert.equal(assetResponse.status, 200);
+        assert.equal(assetResponse.headers.get("x-frame-options"), "DENY");
+        assert.equal(assetResponse.headers.get("cache-control"), "public, max-age=31536000, immutable");
       } finally {
         child.kill("SIGTERM");
         await exited;

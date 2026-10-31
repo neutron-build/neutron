@@ -2392,6 +2392,31 @@ async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
   }
 }
 
+// Whether the app answers \`pathname\` (a redirect rule, or an app route
+// after rewrites): a host serving dist files must not shadow it with one.
+export function handlesPath(pathname) {
+  const normalized = normalizePathname(pathname);
+  if (!normalized) return false;
+  if (resolveRouteRuleRedirect(ROUTE_RULES, normalized, "")) return true;
+  const effective = resolveRouteRuleRewrite(ROUTE_RULES, normalized)?.pathname || normalized;
+  const match = router.match(effective);
+  return Boolean(match && APP_ROUTE_IDS.has(match.route.id));
+}
+
+// The headers a file served for \`pathname\` gets: what handleNeutronRequest
+// adds to its own responses.
+export function staticHeaders(pathname) {
+  const response = new Response(null);
+  const rulePath = normalizePathname(pathname);
+  const suppressed = rulePath
+    ? applyRouteRuleHeaders(response, resolveRouteRuleHeaders(ROUTE_RULES, rulePath))
+    : new Set();
+  if (SECURITY_HEADERS) {
+    applySecurityHeaders(response, SECURITY_HEADERS, suppressed);
+  }
+  return Object.fromEntries(response.headers);
+}
+
 // Route-rule headers, then the security defaults they do not override or
 // null out, on every response — the order and set \`neutron-ts start\` applies.
 export async function handleNeutronRequest(request) {
