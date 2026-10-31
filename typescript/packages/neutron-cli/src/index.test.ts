@@ -2228,3 +2228,63 @@ void init();
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Static-tier routes stay out of the client build (F-P3-8).
+// ---------------------------------------------------------------------------
+
+describe("neutron-ts build (process): static-tier routes in an app", () => {
+  it("keeps static pages' modules out of the client bundle and still links their CSS", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "static-tier-fixture", type: "module" }),
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      // Bundleable for Node only: a browser build has to load the binary.
+      "node_modules/server-native/package.json": JSON.stringify({ name: "server-native", main: "index.js" }),
+      "node_modules/server-native/index.js": `exports.load = () => require("./out/addon");\n`,
+      "node_modules/server-native/out/addon.node": Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0xff, 0xfe, 0x00, 0x80]),
+      "src/marketing.ts": `export const MARKETING_COPY = "static-tier-marker-" + "x".repeat(64);\n`,
+      "src/routes/_layout.tsx": `import { h } from "preact";
+import "./layout.css";
+export default function Layout({ children }) { return h("main", null, children); }
+`,
+      "src/routes/layout.css": ".from-layout { color: red; }\n",
+      "src/routes/legal.tsx": `import { h } from "preact";
+import { load } from "server-native";
+import { MARKETING_COPY } from "../marketing";
+import "./legal.css";
+export const config = { mode: "static" };
+export default function Legal() { return h("p", null, "legal:" + typeof load + ":" + MARKETING_COPY.length); }
+`,
+      "src/routes/legal.css": ".from-legal { color: blue; }\n",
+      "src/routes/app.tsx": `import { h } from "preact";
+export const config = { mode: "app" };
+export default function App() { return h("p", null, "app-page"); }
+`,
+    });
+    try {
+      await runBuild(dir);
+      const manifest = JSON.parse(fs.readFileSync(path.join(dir, "dist", ".vite", "manifest.json"), "utf-8"));
+      assert.ok(manifest["src/routes/app.tsx?neutron-client-route"], Object.keys(manifest).join(", "));
+      assert.equal(manifest["src/routes/legal.tsx?neutron-client-route"], undefined, "static route in the client build");
+      const assets = path.join(dir, "dist", "assets");
+      for (const file of fs.readdirSync(assets).filter((name) => name.endsWith(".js"))) {
+        assert.ok(!fs.readFileSync(path.join(assets, file), "utf-8").includes("static-tier-marker"), file);
+      }
+      const html = fs.readFileSync(path.join(dir, "dist", "legal", "index.html"), "utf-8");
+      assert.ok(html.includes("legal:function:83"), html);
+      const css = linkedCss(dir, stylesheetLinks(html));
+      assert.ok(css.includes(".from-layout") && css.includes(".from-legal"), css);
+      // The layout's stylesheet is the same file for the static and the app page.
+      const routeCss = JSON.parse(fs.readFileSync(path.join(dir, "dist", ".neutron-route-css.json"), "utf-8"));
+      const layoutHref = (routeCss.routes["route:app.tsx"] as string[])[0];
+      assert.equal((routeCss.routes["route:legal.tsx"] as string[])[0], layoutHref);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -2,7 +2,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
-import { neutronPlugin, CLIENT_ROUTE_QUERY } from "@neutron-build/core/vite";
+import { neutronPlugin, CLIENT_ROUTE_QUERY, staticTierRouteIds } from "@neutron-build/core/vite";
 import { runtimeOxc, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
 import {
   discoverRoutes,
@@ -203,6 +203,14 @@ export async function build(): Promise<void> {
     },
   };
 
+  // Pages whose CSS the CSS pass collects, and the modules (each page with its
+  // layouts) it bundles to find it.
+  const staticTier = staticTierRouteIds(routes);
+  const cssPassPages = pageRoutes.filter(
+    (route) => !isResourceRoute(route) && (appRouteCount === 0 || staticTier.has(route.id))
+  );
+  const cssPassModules = [...new Set(cssPassPages.flatMap((route) => routeChain(route, routes)))];
+
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
   // requiring an index.html entry point. Static sites WITH islands take the
@@ -257,8 +265,12 @@ export async function build(): Promise<void> {
         },
       })
     );
-  } else {
-    console.log("Building CSS bundle (static site)...");
+  }
+  // Static-tier pages are not in the client build (staticTierRouteIds: no
+  // client module), so their stylesheets come from this pass — for every page
+  // of a static-only site, and for the static-tier pages of an app.
+  if (cssPassModules.length > 0) {
+    console.log(appRouteCount > 0 ? "Building CSS bundle (static-tier pages)..." : "Building CSS bundle (static site)...");
     // Every route + layout MODULE is an entry of its own, loaded through the
     // client-route pipeline, so Vite walks the real import graph and extracts
     // ALL reachable CSS — side-effect imports, component-level CSS, AND CSS
@@ -271,7 +283,7 @@ export async function build(): Promise<void> {
     // is built from. Resource routes are skipped: they render no page and
     // carry no CSS, and their handlers are server code through and through.
     const cssPassInput: Record<string, string> = {};
-    routes.filter((route) => !isResourceRoute(route)).forEach((route, i) => {
+    cssPassModules.forEach((route, i) => {
       cssPassInput[`neutron-css-${i}`] = route.file.replace(/\\/g, "/") + "?" + CLIENT_ROUTE_QUERY;
     });
     await viteBuild(
@@ -327,7 +339,7 @@ export async function build(): Promise<void> {
         },
         build: {
           outDir: outputDir,
-          emptyOutDir: true,
+          emptyOutDir: appRouteCount === 0,
           // Not a lib build: lib mode inlines every url() asset as a data: URI
           // regardless of assetsInlineLimit (F-P1-3: every font face base64'd
           // into the one stylesheet). As a plain build, fonts and images are
@@ -426,18 +438,18 @@ export async function build(): Promise<void> {
   // Prerendered static pages with islands reference this instead of the SPA runtime.
   const islandsEntryScriptSrc = hasIslands ? extractIslandsEntryScriptSrc(outputDir) : null;
 
-  // Every stylesheet the builds produced: what a route missing from the
-  // per-route table links (the pre-table behaviour).
-  const clientCssFiles = extractClientCssFiles(outputDir);
-  // Per-route stylesheets: each page links what its own route graph needs.
-  // Static-only sites take every route's CSS from the CSS pass; otherwise the
-  // client build's manifest has them all.
+  // Per-route stylesheets: each page links what its own route graph needs,
+  // from the CSS pass's manifest for the pages that pass collected, the
+  // client build's for the rest.
   const routeCss = writeRouteCssManifest(
     cwd,
     outputDir,
     routes,
-    appRouteCount > 0 ? new Set() : new Set(routes.map((route) => route.id))
+    new Set(cssPassPages.map((route) => route.id))
   );
+  // Every stylesheet the builds produced: what a route missing from the
+  // per-route table links (the pre-table behaviour).
+  const clientCssFiles = extractClientCssFiles(outputDir);
   const stylesheetsFor = (route: Route) => routeStylesheetHrefs(routeCss, route.id, clientCssFiles);
 
   const ensureRuntimeBundle = createRuntimeBundleBuilder({
@@ -1117,6 +1129,18 @@ function readViteManifest(file: string): ViteManifest | null {
   }
 }
 
+/** A route with its layouts, outermost first. */
+function routeChain(route: Route, routes: Route[]): Route[] {
+  const chain: Route[] = [route];
+  for (let id = route.parentId; id; ) {
+    const parent = routes.find((candidate) => candidate.id === id);
+    if (!parent) break;
+    chain.unshift(parent);
+    id = parent.parentId;
+  }
+  return chain;
+}
+
 /** A route module's key in a Vite manifest: its root-relative id with the client-route query. */
 function clientRouteManifestKey(cwd: string, file: string): string {
   return path.relative(cwd, file).split(path.sep).join("/") + "?" + CLIENT_ROUTE_QUERY;
@@ -1142,24 +1166,47 @@ function writeRouteCssManifest(
         .filter((key) => client[key].isEntry)
         .flatMap((key) => collectChunkCss(client, key))
     : [];
-  const byId = new Map(routes.map((route) => [route.id, route]));
+  // The CSS pass re-emits stylesheets the client build also has (a layout
+  // shared by static-tier and app pages) under another name. Link the client
+  // build's copy so both kinds of page share one cached file.
+  const alias = new Map<string, string>();
+  if (client && cssPass) {
+    const read = (href: string) => {
+      try {
+        return fs.readFileSync(path.join(outputDir, href), "utf-8");
+      } catch {
+        return null;
+      }
+    };
+    const byContent = new Map<string, string>();
+    for (const key of Object.keys(client)) {
+      for (const href of collectChunkCss(client, key)) {
+        const content = read(href);
+        if (content !== null && !byContent.has(content)) byContent.set(content, href);
+      }
+    }
+    for (const key of Object.keys(cssPass)) {
+      for (const href of collectChunkCss(cssPass, key)) {
+        const content = read(href);
+        const same = content === null ? undefined : byContent.get(content);
+        if (same && same !== href) alias.set(href, same);
+      }
+    }
+  }
   const table: Record<string, string[]> = {};
   for (const route of routes) {
     if (route.isLayout || route.file.includes("_layout") || isResourceRoute(route)) continue;
     const manifest = cssPassRouteIds.has(route.id) ? cssPass : client;
     if (!manifest) continue;
-    const chain: Route[] = [route];
-    for (let id = route.parentId; id; ) {
-      const parent = byId.get(id);
-      if (!parent) break;
-      chain.unshift(parent);
-      id = parent.parentId;
-    }
+    const chain = routeChain(route, routes);
     const hrefs = [...entryCss];
     for (const member of chain) {
       hrefs.push(...collectChunkCss(manifest, clientRouteManifestKey(cwd, member.file)));
     }
-    table[route.id] = [...new Set(hrefs)];
+    table[route.id] = [...new Set(hrefs.map((href) => alias.get(href) ?? href))];
+  }
+  for (const duplicate of alias.keys()) {
+    fs.rmSync(path.join(outputDir, duplicate), { force: true });
   }
   const routeCss: RouteCssManifest = { format: ROUTE_CSS_MANIFEST_FORMAT, routes: table };
   fs.writeFileSync(path.join(outputDir, ROUTE_CSS_MANIFEST), JSON.stringify(routeCss, null, 2));

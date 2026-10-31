@@ -789,3 +789,80 @@ describe("hydrate — a not-found route never shadows the page it covers", () =>
     expect(app.textContent).not.toContain("four oh four");
   });
 });
+
+describe("hydrate — static-tier page in an app (no client module)", () => {
+  beforeEach(() => {
+    // The suite above boots without cleanup: drop its click interceptor.
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    window.history.replaceState(null, "", "/");
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+  });
+
+  // The build leaves a static-tier route's module out of the client bundle
+  // (staticTierRouteIds). Its document boots like a static page: islands
+  // hydrate, the router does not start and never asks for the module.
+  it("does not start the router, and leaves links to the browser", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    let anchor: HTMLAnchorElement | null = null;
+    await bootRouter({
+      pathname: "/legal",
+      routeId: "route:/legal",
+      appHtml: "<p>legal prerendered</p>",
+      routes: ({ h }) =>
+        ({
+          "route:/app": { path: "/app", mode: "app", default: () => h("p", null, "app") },
+          "route:/legal": { path: "/legal", mode: "static", hasLoader: false, clientModule: false },
+        }) as unknown as Record<string, RouteReg>,
+      beforeInit: () => {
+        anchor = addAnchor("/app");
+      },
+    });
+    expect(window.__NEUTRON_ROUTER_ACTIVE__).toBeUndefined();
+    expect(document.getElementById("app")!.innerHTML).toBe("<p>legal prerendered</p>");
+    expect(clickAnchor(anchor!)).toBe(true);
+    await flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("navigates to a static-tier route with a document load, not the router", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    let anchor: HTMLAnchorElement | null = null;
+    await bootRouter({
+      pathname: "/app",
+      routeId: "route:/app",
+      routes: ({ h }) =>
+        ({
+          "route:/shell": { path: "/", isLayout: true, mode: "app", default: (p: { children?: ComponentChildren }) => h("div", null, p.children) },
+          "route:/app": { path: "/app", parentId: "route:/shell", mode: "app", default: () => h("p", null, "app") },
+          "route:/legal": { path: "/legal", parentId: "route:/shell", mode: "static", clientModule: false },
+        }) as unknown as Record<string, RouteReg>,
+      beforeInit: () => {
+        anchor = addAnchor("/legal");
+      },
+    });
+    expect(window.__NEUTRON_ROUTER_ACTIVE__).toBe(true);
+    // Under an app layout, but without a module: only a document load renders it.
+    expect(clickAnchor(anchor!)).toBe(true);
+    await flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

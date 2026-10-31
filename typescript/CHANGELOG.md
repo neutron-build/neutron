@@ -120,6 +120,27 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Static-tier pages are no longer in the app's client bundle.** The client
+  route table had an `import()` for every non-resource route, so a `mode:
+  "static"` page's module — stripped only of loader/action/getStaticPaths/
+  headers/middleware, not of `head` or its top-level imports — and its whole
+  import graph were bundled as browser code, although the router never
+  renders such a page: a static page that imported a server-only package
+  failed the client build, and everything it imported shipped as chunks. A
+  page whose whole chain renders at the static client tier
+  (`resolveClientTier` is not `"full"`: every route `mode: "static"` and no
+  `hydrate: true`), and any layout only such pages use, is now listed in the
+  route table with `clientModule: false` and no `import()`. Its document
+  boots like a static site's page — islands hydrate, the router does not
+  start — and the router reaches it by a document load, also under an app
+  layout. Its stylesheets come from the CSS pass, which now also runs in app
+  builds for these pages; a stylesheet both builds emit is linked from the
+  client build's copy, so static and app pages share the file. On a fixture
+  with two app routes and four static pages each importing ~60 KB of
+  content, the client build went from 10 JS files / 276 KB to 6 / 36 KB; an
+  app page's initial JS is unchanged (~35 KB — route chunks were already
+  loaded lazily). `staticTierRouteIds` is exported from
+  `@neutron-build/core/vite`.
 - **Pages link only the stylesheets their route needs.** Every page —
   prerendered static pages, SSR'd app pages, and the `__css__` list a client
   navigation loads before it swaps the page — linked every `dist/assets/*.css`

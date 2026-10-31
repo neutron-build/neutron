@@ -36,6 +36,8 @@ interface RouteRegistration {
   mode?: "static" | "app";
   hasLoader?: boolean;
   load?: () => Promise<unknown>;
+  /** `false` for a static-tier route: the build ships no client module for it. */
+  clientModule?: false;
   default?: ComponentType<{ data?: unknown; params?: Record<string, string>; actionData?: unknown }>;
   loader?: () => Promise<unknown>;
   ErrorBoundary?: ComponentType<{ error: Error; reset?: () => void }>;
@@ -68,6 +70,8 @@ interface RouteInfo {
    */
   mode?: "static" | "app";
   hasLoader?: boolean;
+  /** No client module: the route renders at the static tier (staticTierRouteIds). */
+  clientModule?: false;
 }
 
 let routes: RouteInfo[] = [];
@@ -136,12 +140,26 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
   ]);
 }
 
-export async function init() {
+/**
+ * Start the router. Resolves `"static"` without starting it when the current
+ * page is a static-tier route the build shipped no client module for.
+ */
+export async function init(): Promise<"static" | void> {
   if (initialized) return;
   initialized = true;
 
   if (import.meta.env.DEV) {
     await import("preact/debug");
+  }
+
+  // A static-tier page (its whole chain renders without the router) has no
+  // client module to hydrate it with: the router does not start, and the
+  // caller boots the document as a static page — islands only, as a
+  // prerendered page that never loads this module would be.
+  const initialRoute = findRoute(getCurrentPath());
+  if (initialRoute && [...getLayoutChain(initialRoute), initialRoute].some((r) => r.clientModule === false)) {
+    initialized = false;
+    return "static";
   }
 
   window.__NEUTRON_ROUTER_ACTIVE__ = true;
@@ -263,6 +281,9 @@ function findRoute(pathname: string): RouteInfo | null {
 function isBrowserNavigationTarget(pathname: string): boolean {
   const route = findRoute(pathname);
   if (!route) return false;
+  const chain = [...getLayoutChain(route), route];
+  // Built without a client module: only a document load can render it.
+  if (chain.some((entry) => entry.clientModule === false)) return true;
   if (route.mode !== "static") return false;
   return getLayoutChain(route).every((layout) => layout.mode === "static");
 }
@@ -824,18 +845,23 @@ export function registerRoutes(routeMap: Record<string, RouteRegistration | Rout
     path:
       registration.path || id.replace(/^route:/, "").replace(/\.(tsx|ts|jsx|js|mdx)$/, ""),
     module:
-      typeof registration.load === "function"
+      typeof registration.load === "function" || registration.clientModule === false
         ? null
         : normalizeRouteModule(registration),
     load:
-      typeof registration.load === "function"
-        ? async () => normalizeRouteModule(await registration.load!())
-        : async () => normalizeRouteModule(registration),
+      registration.clientModule === false
+        ? async () => {
+            throw new Error(`neutron: route ${id} renders at the static tier and has no client module`);
+          }
+        : typeof registration.load === "function"
+          ? async () => normalizeRouteModule(await registration.load!())
+          : async () => normalizeRouteModule(registration),
     parentId: registration.parentId ?? null,
     isLayout: registration.isLayout === true,
     isNotFound: registration.isNotFound === true,
     mode: registration.mode,
     hasLoader: registration.hasLoader,
+    clientModule: registration.clientModule,
   }));
 }
 

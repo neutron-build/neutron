@@ -12,6 +12,7 @@ import { runMiddlewareChain } from "../core/middleware.js";
 import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
 import { isResponse, withMutableHeaders } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
+import { resolveClientTier } from "../core/render-app-route.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -1415,6 +1416,46 @@ ${clientScript}
 </html>`;
 }
 
+/**
+ * Routes whose client module is never loaded: page routes whose whole chain
+ * renders at the static client tier (`resolveClientTier` is not `"full"`),
+ * plus layouts only such routes use. Their documents ship no router — a
+ * browser navigation reaches them, and the router never renders one in place —
+ * so the client route table carries their facts (path, mode) without an
+ * `import()`, and their modules, with everything they import, stay out of the
+ * client build. The build takes their CSS from its CSS pass instead.
+ */
+export function staticTierRouteIds(routes: Route[]): Set<string> {
+  const pages = routes.filter((route) => !isResourceRoute(route));
+  const byId = new Map(pages.map((route) => [route.id, route]));
+  const chainOf = (route: Route): Route[] => {
+    const chain: Route[] = [route];
+    for (let id = route.parentId; id; ) {
+      const parent = byId.get(id);
+      if (!parent) break;
+      chain.unshift(parent);
+      id = parent.parentId;
+    }
+    return chain;
+  };
+  const isLayout = (route: Route) => route.isLayout === true || route.file.includes("_layout");
+  const stubbed = new Set<string>();
+  const needed = new Set<string>();
+  for (const route of pages) {
+    if (isLayout(route)) continue;
+    const chain = chainOf(route);
+    if (!route.isNotFound && resolveClientTier(chain) !== "full") {
+      stubbed.add(route.id);
+    } else {
+      for (const member of chain) needed.add(member.id);
+    }
+  }
+  for (const route of pages) {
+    if (isLayout(route) && !needed.has(route.id)) stubbed.add(route.id);
+  }
+  return stubbed;
+}
+
 export function generateRoutesModule(routes: Route[]): string {
   const cwd = process.cwd().replace(/\\/g, "/");
   // Resource routes are endpoints, not pages: excluded from the client route
@@ -1423,6 +1464,7 @@ export function generateRoutesModule(routes: Route[]): string {
   // browser (stripServerOnlyRouteModule) — belt and braces, because handler
   // code must never ship to the client.
   const clientRoutes = routes.filter((route) => !isResourceRoute(route));
+  const staticTier = staticTierRouteIds(routes);
   const routeMap: string[] = clientRoutes.map((route) => {
     const absPath = route.file.replace(/\\/g, "/");
     // Make path relative to project root so Vite can resolve it.
@@ -1430,6 +1472,9 @@ export function generateRoutesModule(routes: Route[]): string {
     const relativePath = absPath.startsWith(cwd + "/")
       ? absPath.slice(cwd.length)
       : "/@fs" + absPath;
+    const moduleField = staticTier.has(route.id)
+      ? "clientModule: false"
+      : `load: () => import(${JSON.stringify(relativePath + "?" + CLIENT_ROUTE_QUERY)})`;
     return `  ${JSON.stringify(route.id)}: {
     id: ${JSON.stringify(route.id)},
     path: ${JSON.stringify(route.path)},
@@ -1438,7 +1483,7 @@ export function generateRoutesModule(routes: Route[]): string {
     isNotFound: ${!!route.isNotFound},
     mode: ${JSON.stringify(route.config.mode)},
     hasLoader: ${route.hasLoader !== false},
-    load: () => import(${JSON.stringify(relativePath + "?" + CLIENT_ROUTE_QUERY)})
+    ${moduleField}
   }`;
   });
 
