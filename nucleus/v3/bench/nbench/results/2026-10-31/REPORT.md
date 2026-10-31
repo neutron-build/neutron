@@ -10,12 +10,12 @@ kernel: 6.12.111+deb13-amd64
 cpu_model: 13th Gen Intel(R) Core(TM) i5-13500H
 cpus: 16
 mem_total: 38.8 GiB
-load1: 1.10
-load5: 1.65
-load15: 1.75
-nbench_units_live: nbench-qdrant.service
+load1: 0.19
+load5: 0.71
+load15: 2.52
+nbench_units_live: none
 root_fs: Size  Used Avail
- 1.8T  1.4T  302G
+ 1.8T  1.4T  291G
 podman: podman version 5.4.2
 container_runtime_note: rootless podman via systemd-run --user (PLAN-v3 §5.2 rule 1; card B-0 environment note)
 ```
@@ -29,24 +29,18 @@ ann-benchmarks SIFT1M (HNSW m=16, ef_construction=200), recall@10 vs QPS
 
 Status: ok
 
-Anomalies:
-
-- B-0-F7 re-measure (card Work 5): chain10's script with the row list cut to this row, run with the release-built client per Work 3
-- diagnosis artefacts beside this file
-- the preserved chain10 collection is replaced by the row's own init (fresh upload)
-
 | config | run | qps | recall_at_10 | p50_ms | p99_ms | Nucleus ratio | label |
 |---|---|---|---|---|---|---|---|
-| ef_search=16 | cold | 3104 | 0.941 | 0.262 | 0.880 | n/a | n/a |
-| ef_search=16 | warm (n=5) | 2404 [2077, 2467] | 0.941 [0.941, 0.941] | 0.344 [0.310, 0.457] | 1.004 [0.985, 1.052] | n/a | n/a |
-| ef_search=32 | cold | 2186 | 0.981 | 0.375 | 1.088 | n/a | n/a |
-| ef_search=32 | warm (n=5) | 2115 [2048, 2506] | 0.981 [0.981, 0.981] | 0.380 [0.356, 0.395] | 1.199 [1.028, 1.289] | n/a | n/a |
-| ef_search=64 | cold | 674.3 | 0.995 | 1.501 | 2.354 | n/a | n/a |
-| ef_search=64 | warm (n=5) | 663.8 [629.9, 729.2] | 0.995 [0.995, 0.995] | 1.566 [1.467, 1.618] | 2.399 [2.344, 2.494] | n/a | n/a |
-| ef_search=128 | cold | 417.3 | 0.999 | 2.425 | 3.638 | n/a | n/a |
-| ef_search=128 | warm (n=5) | 408.8 [401.8, 421.7] | 0.999 [0.999, 0.999] | 2.450 [2.389, 2.523] | 3.573 [3.526, 3.592] | n/a | n/a |
-| ef_search=256 | cold | 286.0 | 0.999 | 3.530 | 5.147 | n/a | n/a |
-| ef_search=256 | warm (n=5) | 277.9 [274.2, 291.5] | 0.999 [0.999, 0.999] | 3.666 [3.477, 3.731] | 5.319 [5.286, 5.336] | n/a | n/a |
+| ef_search=16 | cold | 2027 | 0.939 | 0.471 | 1.061 | n/a | n/a |
+| ef_search=16 | warm (n=5) | 2667 [1881, 2995] | 0.939 [0.939, 0.939] | 0.301 [0.271, 0.490] | 0.980 [0.924, 1.193] | n/a | n/a |
+| ef_search=32 | cold | 1384 | 0.980 | 0.709 | 1.455 | n/a | n/a |
+| ef_search=32 | warm (n=5) | 1518 [1069, 1844] | 0.980 [0.980, 0.980] | 0.574 [0.429, 0.950] | 1.467 [1.351, 1.647] | n/a | n/a |
+| ef_search=64 | cold | 680.9 | 0.995 | 1.494 | 2.299 | n/a | n/a |
+| ef_search=64 | warm (n=5) | 665.6 [650.8, 725.4] | 0.995 [0.995, 0.995] | 1.529 [1.449, 1.548] | 2.338 [2.291, 2.377] | n/a | n/a |
+| ef_search=128 | cold | 442.4 | 0.999 | 2.254 | 3.353 | n/a | n/a |
+| ef_search=128 | warm (n=5) | 431.6 [417.7, 438.4] | 0.999 [0.999, 0.999] | 2.324 [2.291, 2.404] | 3.403 [3.361, 3.464] | n/a | n/a |
+| ef_search=256 | cold | 284.2 | 0.999 | 3.551 | 5.094 | n/a | n/a |
+| ef_search=256 | warm (n=5) | 282.4 [279.5, 288.9] | 0.999 [0.999, 0.999] | 3.577 [3.504, 3.603] | 5.086 [5.034, 5.206] | n/a | n/a |
 
 ## Nucleus comparison
 
