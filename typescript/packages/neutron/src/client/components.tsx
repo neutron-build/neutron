@@ -258,8 +258,7 @@ export function Form({
   );
 }
 
-export interface LinkProps {
-  to: RouteHref;
+interface LinkBaseProps {
   replace?: boolean;
   prefetch?: "none" | "intent" | "render";
   children?: preact.ComponentChildren;
@@ -269,15 +268,24 @@ export interface LinkProps {
   target?: string;
 }
 
+/**
+ * The destination is `to`, or `href` — the Next.js `next/link` / plain-anchor
+ * name, accepted so ported code keeps working. Exactly one of the two.
+ */
+export type LinkProps = LinkBaseProps &
+  ({ to: RouteHref; href?: never } | { href: RouteHref; to?: never });
+
 /** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
 export function Link({ 
-  to, 
+  to: toProp,
+  href: hrefProp,
   replace, 
   prefetch = "none",
   target,
   children, 
   ...props 
 }: LinkProps): AnyJsxElement | null {
+  const to: string = toProp ?? hrefProp;
   const linkRef = useRef<HTMLAnchorElement>(null);
   const [prefetched, setPrefetched] = useState(false);
 
@@ -352,21 +360,23 @@ export function Link({
   );
 }
 
-export interface NavLinkProps extends LinkProps {
+export type NavLinkProps = LinkProps & {
   activeClass?: string;
   activeStyle?: Record<string, string>;
   end?: boolean;
-}
+};
 
 /** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
 export function NavLink({ 
-  to, 
+  to: toProp,
+  href: hrefProp,
   activeClass,
   activeStyle,
   end,
   children,
   ...props 
 }: NavLinkProps): AnyJsxElement | null {
+  const to: string = toProp ?? hrefProp;
   const [isActive, setIsActive] = useState(false);
 
   useEffect(() => {

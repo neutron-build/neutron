@@ -194,6 +194,14 @@ All notable changes to this project are documented in this file.
   preact-render-to-string and `@preact/signals-core` stay in the bundle's
   graph. On a one-route fixture the bundle's JS went from 8.3 MB (7.8 MB of
   it an inlined `typescript`) to 0.53 MB.
+- **`Link` and `NavLink` accept `href` as the destination.** The
+  destination prop is `to`; given `href` (the `next/link` and plain-anchor
+  name, common in ported code) `Link` spread it onto the `<a>` and then
+  overwrote it with the missing `to`, rendering a link with no `href`, and
+  `NavLink` was never active. `href` is now an alias for `to`. The props
+  type takes exactly one of the two: both, or neither, is a type error.
+  `LinkProps` and `NavLinkProps` are now type aliases (a union), not
+  interfaces, so code that `extends` them must use an intersection instead.
 - **A failed server bundle build no longer leaves its chunks in
   `dist/server/start/`.** Rolldown writes the output before it reports a
   resolve error, so a build that warned and fell back to the Vite runtime

@@ -246,6 +246,45 @@ describe("navigation/form components (preact JSX)", () => {
     return <Link to="/x" wrongProp={1}>broken</Link>;
   });
 
+  it("rejects a Link with both `to` and `href`, or neither", () => {
+    return [
+      // @ts-expect-error to and href are alternatives, not both
+      <Link to="/a" href="/b">both</Link>,
+      // @ts-expect-error a Link needs a destination
+      <Link>none</Link>,
+    ];
+  });
+
+  // Code ported from Next.js / plain anchors passes `href`; Link used to
+  // spread it and then overwrite it with the missing `to`, rendering an
+  // <a> with no href at all.
+  it("accepts `href` as the destination of Link and NavLink", async () => {
+    window.history.replaceState(null, "", "/docs/intro");
+    const pushState = vi.spyOn(window.history, "pushState");
+    try {
+      mount(
+        <div>
+          <Link href="/next-style" prefetch="none">Next style</Link>
+          <NavLink href="/docs" activeClass="is-active">Docs</NavLink>
+        </div>
+      );
+      // Passive effects (NavLink's active check) run on requestAnimationFrame.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await flush();
+
+      const [link, navLink] = Array.from(document.querySelectorAll("a")) as HTMLAnchorElement[];
+      expect(link.getAttribute("href")).toBe("/next-style");
+      expect(navLink.getAttribute("href")).toBe("/docs");
+      expect(navLink.classList.contains("is-active")).toBe(true);
+
+      link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+      expect(pushState).toHaveBeenCalled();
+      expect(String(pushState.mock.calls.at(-1)?.[2])).toContain("/next-style");
+    } finally {
+      pushState.mockRestore();
+    }
+  });
+
   it("renders Form, Link, NavLink, ViewTransitions and ScrollReveal through preact JSX", () => {
     window.history.replaceState(null, "", "/blog/post");
 

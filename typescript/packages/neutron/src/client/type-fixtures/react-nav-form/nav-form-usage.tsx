@@ -55,6 +55,13 @@ export function ReactShell() {
         <Link to="/users/42" prefetch="intent" target="_self">
           Users
         </Link>
+        {/* Next.js-style destination (ported next/link code). */}
+        <Link href="/settings" className="nav-item">
+          Settings
+        </Link>
+        <NavLink href="/billing" activeClass="active">
+          Billing
+        </NavLink>
       </nav>
 
       <Form
