@@ -741,7 +741,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
 
               // Collect CSS from Vite's module graph (populated by ssrLoadModule)
               // and inject <link> tags so CSS loads before content renders (prevents FOUC)
-              const cssUrls = collectCssFromModuleGraph(server, allRoutes.map(r => r.file));
+              const cssUrls = collectCssFromModuleGraph(server, allRoutes.map((r) => r.file));
               if (cssUrls.length > 0) {
                 // Deduplicate: keep only ?direct URLs (serve actual CSS, not JS modules)
                 const seen = new Set<string>();
@@ -1024,45 +1024,88 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
  * Collect CSS URLs by walking the SSR module graph from loaded route files.
  * After ssrLoadModule, CSS imports are tracked in the environment module graph.
  * We inject these as <link> tags so CSS loads before content renders (prevents FOUC).
+ *
+ * Only real imports count. A stylesheet's own `importedModules` also holds
+ * Vite's file-only entries (`type: "asset"`, no id): every file a CSS plugin
+ * registered with `addWatchFile`, so a change to it re-runs the transform.
+ * Tailwind v4 registers each source file it scans — and where `dist/` is not
+ * gitignored it scans the previous build's output, so `dist/assets/*.css`
+ * hung off the app's own stylesheet and dev linked it: minified, stale CSS
+ * from an old build on a dev page. Watch entries are skipped, and nothing
+ * under the build output directory is ever linked.
  */
 function collectCssFromModuleGraph(server: ViteDevServer, routeFiles: string[]): string[] {
   const cssUrls: string[] = [];
   const visited = new Set<string>();
+  const outDir = normalizePathForComparison(
+    path.resolve(server.config.root, server.config.build?.outDir ?? "dist")
+  );
+  const isBuildOutput = (file: string) => {
+    const normalized = normalizePathForComparison(file);
+    return normalized === outDir || normalized.startsWith(outDir + "/");
+  };
 
-  // Try the SSR environment module graph (Vite 6+)
-  const ssrEnv = (server as unknown as Record<string, unknown>).environments as
-    | Record<string, { moduleGraph?: { getModulesByFile?(f: string): Set<{ url: string; file: string | null; importedModules: Set<unknown> }> | undefined } }>
+  type GraphModule = {
+    url: string;
+    id?: string | null;
+    type?: string;
+    file: string | null;
+    importedModules: Set<unknown>;
+  };
+
+  // The environment module graphs (Vite 6+)
+  const environments = (server as unknown as Record<string, unknown>).environments as
+    | Record<string, { moduleGraph?: { getModulesByFile?(f: string): Set<GraphModule> | undefined } }>
     | undefined;
-  const ssrModuleGraph = ssrEnv?.ssr?.moduleGraph;
+  const ssrModuleGraph = environments?.ssr?.moduleGraph;
+  // The graph keys real paths; a route discovered under a symlinked path
+  // (macOS /tmp → /private/tmp) is looked up both ways.
+  const modulesByFile = (graph: typeof ssrModuleGraph, file: string): GraphModule[] => {
+    const found = [...(graph?.getModulesByFile?.(file) ?? [])];
+    try {
+      const real = fs.realpathSync(file);
+      if (real !== file) found.push(...(graph?.getModulesByFile?.(real) ?? []));
+    } catch {
+      // not on disk
+    }
+    return found;
+  };
 
-  function walkSsr(mod: { url: string; file: string | null; importedModules: Set<unknown> }) {
+  function walkSsr(mod: GraphModule) {
     const key = mod.url;
     if (visited.has(key)) return;
     visited.add(key);
+    // A watched file, not an import (see above).
+    if (mod.type === "asset" || !mod.id) return;
+    if (mod.file && isBuildOutput(mod.file)) return;
 
     if (mod.file && /\.css($|\?)/.test(mod.file)) {
       cssUrls.push(mod.url);
     }
 
     for (const dep of mod.importedModules) {
-      walkSsr(dep as typeof mod);
+      walkSsr(dep as GraphModule);
     }
   }
 
   if (ssrModuleGraph?.getModulesByFile) {
     for (const file of routeFiles) {
-      const mods = ssrModuleGraph.getModulesByFile(file);
-      if (mods) {
-        for (const mod of mods) walkSsr(mod);
-      }
+      for (const mod of modulesByFile(ssrModuleGraph, file)) walkSsr(mod);
     }
   }
 
-  // Fallback: scan the legacy module graph
+  // Fallback: every stylesheet the graphs hold (same filters).
   if (cssUrls.length === 0) {
     for (const mods of server.moduleGraph.fileToModulesMap.values()) {
       for (const mod of mods) {
-        if (mod.file && /\.css($|\?)/.test(mod.file) && !visited.has(mod.url)) {
+        if (
+          mod.file &&
+          mod.id &&
+          mod.type !== "asset" &&
+          /\.css($|\?)/.test(mod.file) &&
+          !isBuildOutput(mod.file) &&
+          !visited.has(mod.url)
+        ) {
           visited.add(mod.url);
           cssUrls.push(mod.url);
         }
@@ -1070,9 +1113,9 @@ function collectCssFromModuleGraph(server: ViteDevServer, routeFiles: string[]):
     }
   }
 
-  // Last resort: find CSS files in the project src/ directory
+  // Last resort: the app's top-level src/*.css (an entry stylesheet).
   if (cssUrls.length === 0) {
-    const srcDir = path.resolve("src");
+    const srcDir = path.resolve(server.config.root, "src");
     if (fs.existsSync(srcDir)) {
       for (const entry of fs.readdirSync(srcDir)) {
         if (entry.endsWith(".css")) {

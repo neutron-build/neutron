@@ -410,6 +410,22 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Dev no longer links a previous build's stylesheets.** With a `dist/`
+  present, dev pages (and client navigations, whose stylesheet list comes
+  from the same walk) could link `dist/assets/*.css` — minified CSS from an
+  old build, stale after any source edit (the Fylun port: `/pricing`,
+  `/studio`, a colour-format diff against a fresh load). Dev reads nothing
+  from `dist/`; the stylesheets came from the module graph. Tailwind v4
+  registers every source file it scans with `addWatchFile`, and where
+  `dist/` is not gitignored it scans the build output; Vite records each such
+  file as a file-only "asset" entry under the stylesheet that registered it,
+  and dev's CSS collection walked those entries as if they were imports.
+  It now follows only real imports, never links a file under the build
+  output directory, and looks route files up by their real path as well
+  (a symlinked path, macOS `/tmp`, no longer misses the route's graph and
+  falls back to every stylesheet). The fallbacks are filtered the same way,
+  and the last-resort `src/*.css` scan is rooted at the app, not the
+  process's working directory.
 - **Docker preset: `/` reaches the app, the image context drops `start`'s
   bundle, and files get `start`'s headers.** The image's `server.mjs`
   served `dist/index.html` for `/` before the app handler, so an app route at
