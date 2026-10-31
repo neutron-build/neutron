@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [core 0.5.1, cli 0.5.1] - 2026-10-31
+
+Patch release; no migration. `create` 0.1.11 and the dependent packages
+already admit core 0.5.1 (`^0.5.0`) and are not republished.
+
 ### Fixed
 
 - **A loader's `notFound()` page hydrates as the not-found page (F-P6-5).**
