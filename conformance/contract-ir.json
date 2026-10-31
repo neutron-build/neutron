@@ -35,12 +35,13 @@
       { "status": 401, "code": "unauthorized", "title": "Unauthorized", "probePath": "/errors/unauthorized" },
       { "status": 403, "code": "forbidden", "title": "Forbidden", "probePath": "/errors/forbidden" },
       { "status": 404, "code": "not-found", "title": "Not Found", "probePath": "/errors/not-found" },
+      { "status": 405, "code": "method-not-allowed", "title": "Method Not Allowed", "probePath": null },
       { "status": 409, "code": "conflict", "title": "Conflict", "probePath": "/errors/conflict" },
       { "status": 422, "code": "validation", "title": "Validation Failed", "probePath": null },
       { "status": 429, "code": "rate-limited", "title": "Rate Limited", "probePath": "/errors/rate-limited" },
       { "status": 500, "code": "internal", "title": "Internal Server Error", "probePath": "/errors/internal" }
     ],
-    "$probeNote": "`validation` has no forced-error probe path on purpose: it is produced by POSTing an invalid body to the validation endpoint, and is asserted by the `validation.format` dimension instead. Every other code gets a GET endpoint that forces it. The checker used to hardcode a 7-entry list that silently omitted 422; here the omission is explicit and the count is checked against the document's 8-row table."
+    "$probeNote": "`validation` and `method-not-allowed` have no forced-error probe path on purpose. `validation` is produced by POSTing an invalid body to the validation endpoint, and is asserted by the `validation.format` dimension instead. `method-not-allowed` is produced by sending a method an endpoint does not handle (a resource route without that method export), which is SDK-specific routing, so each SDK's own tests cover it. Every other code gets a GET endpoint that forces it. The checker used to hardcode a 7-entry list that silently omitted 422; here the omissions are explicit and the count is checked against the document's 9-row table."
   },
 
   "validation": {
