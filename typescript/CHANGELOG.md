@@ -48,6 +48,24 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **`env.publicPrefixes`: public environment variables for client code,
+  including Next's `process.env.NEXT_PUBLIC_*`.** Client builds turned
+  `process.env` into `{}` and exposed only Vite's `import.meta.env.VITE_*`,
+  so every `process.env.NEXT_PUBLIC_*` read in a Next app's browser code was
+  empty in a build and threw `process is not defined` in dev (the Fylun port
+  shimmed it). `neutron.config.ts` `env: { publicPrefixes: ["PUBLIC_",
+  "NEXT_PUBLIC_"] }` (default `["PUBLIC_"]`) makes those prefixes public: they
+  join Vite's `envPrefix` (`import.meta.env.<PREFIX>X`), and
+  `process.env.<PREFIX>X` is replaced with its build-time value from `.env`
+  files or the process environment in client and server code, in builds and
+  in dev. An unset one reads `undefined` in client code and stays a runtime
+  read on the server. Dev client code also gets the rest of a client build's
+  replacement (`process.env` is `{}`, `NODE_ENV` inlined), so it reads what
+  the build reads instead of throwing `process is not defined`. Variables
+  without a public prefix are never inlined, and an empty prefix is refused. `PUBLIC_` was already documented as public
+  but nothing set it, so `PUBLIC_*` variables now reach client code as the
+  docs said. `neutronPublicEnvPlugin` is exported from
+  `@neutron-build/core/vite` for custom Vite setups.
 - **`src/server.entry.ts`: mounts and WebSocket handlers in the routes'
   module graph.** A custom server had to build its tRPC/REST mounts and its
   WebSocket handler before `createServer`, outside the graph the routes run

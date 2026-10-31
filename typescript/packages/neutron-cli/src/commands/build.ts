@@ -2,7 +2,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
-import { neutronPlugin, CLIENT_ROUTE_QUERY, staticTierRouteIds } from "@neutron-build/core/vite";
+import { neutronPlugin, neutronPublicEnvPlugin, CLIENT_ROUTE_QUERY, staticTierRouteIds } from "@neutron-build/core/vite";
 import { runtimeOxc, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
 import {
   discoverRoutes,
@@ -255,6 +255,7 @@ export async function build(): Promise<void> {
             },
           },
           neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
         resolve: {
@@ -338,6 +339,7 @@ export async function build(): Promise<void> {
             },
           },
           neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
         resolve: {
@@ -418,7 +420,10 @@ export async function build(): Promise<void> {
         oxc: oxcJsx,
         configFile: false,
         root: cwd,
-        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        plugins: [
+          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPublicEnvPlugin(neutronConfig.env),
+        ],
         css: cssConfig,
         resolve: {
           alias: preactAliases,
@@ -464,6 +469,7 @@ export async function build(): Promise<void> {
     outputDir,
     routesDir,
     routeRules: neutronConfig.routes,
+    env: neutronConfig.env,
     routes,
     pageRoutes,
     clientEntryScriptSrc,
@@ -482,7 +488,10 @@ export async function build(): Promise<void> {
       oxc: oxcJsx,
       configFile: false,
       root: cwd,
-      plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+      plugins: [
+          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPublicEnvPlugin(neutronConfig.env),
+        ],
       css: cssConfig,
       resolve: {
         // Absolute aliases force one preact + RTS into the SSR graph even when
@@ -1006,6 +1015,7 @@ export async function build(): Promise<void> {
     outputDir,
     routesDir,
     routeRules: neutronConfig.routes,
+    env: neutronConfig.env,
     routes,
     userConfig,
     runtimeAliases: preactAliases,
@@ -1302,6 +1312,7 @@ interface RuntimeBundleBuilderOptions {
   outputDir: string;
   routesDir: string;
   routeRules?: NeutronConfig["routes"];
+  env?: NeutronConfig["env"];
   routes: Route[];
   pageRoutes: Route[];
   clientEntryScriptSrc: string | null;
@@ -1513,7 +1524,7 @@ async function buildRuntimeBundle(
 async function bundleServerEntry(
   options: Pick<
     RuntimeBundleBuilderOptions,
-    "cwd" | "routesDir" | "routeRules" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
+    "cwd" | "routesDir" | "routeRules" | "env" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
   > & { oxc?: unknown },
   build: {
     entryPath: string;
@@ -1598,6 +1609,7 @@ async function bundleServerEntry(
           rootDir: options.cwd,
           routeRules: options.routeRules,
         }),
+        neutronPublicEnvPlugin(options.env),
       ],
       resolve: {
         ...(options.runtimeAliases ? { alias: options.runtimeAliases } : {}),
@@ -1659,7 +1671,7 @@ async function bundleServerEntry(
 async function buildStartServerBundle(
   options: Pick<
     RuntimeBundleBuilderOptions,
-    "cwd" | "outputDir" | "routesDir" | "routeRules" | "routes" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
+    "cwd" | "outputDir" | "routesDir" | "routeRules" | "env" | "routes" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
   > & { runtime: string; oxc: unknown }
 ): Promise<void> {
   const manifestPath = path.join(options.outputDir, SERVER_BUNDLE_MANIFEST);

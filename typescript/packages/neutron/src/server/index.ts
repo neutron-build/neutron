@@ -62,6 +62,7 @@ import {
 import { assertRenderedFragment, decodeChunkStart } from "../core/fragment-guard.js";
 import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
 import { neutronPlugin } from "../vite/plugin.js";
+import { neutronPublicEnvPlugin } from "../vite/public-env.js";
 import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
@@ -2415,7 +2416,7 @@ async function createSsrServer(
         // an ancestor's node_modules/.vite directory. Different roots can
         // then clear one another's optimizer cache during concurrent startup.
         cacheDir: userConfig.cacheDir ?? path.join(rootDir, ".neutron", "vite-ssr"),
-        plugins: [neutronPlugin({ routesDir })],
+        plugins: [neutronPlugin({ routesDir }), neutronPublicEnvPlugin()],
         resolve: { alias: preactAliases },
         // react-compat: process the whole APP dependency graph (see
         // resolveRuntimeNoExternal) — externalized deps natively resolve

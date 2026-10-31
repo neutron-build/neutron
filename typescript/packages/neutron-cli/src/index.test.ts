@@ -2542,3 +2542,64 @@ void init();
     }
   });
 });
+
+// Next apps read public configuration as process.env.NEXT_PUBLIC_*. Client
+// builds turned process.env into {} and exposed only import.meta.env.VITE_*,
+// so every such read was empty. neutron.config env.publicPrefixes inlines
+// prefixed variables in the client and server bundles; nothing else ships.
+describe("neutron-ts build (process): env.publicPrefixes", () => {
+  it("inlines prefixed variables into client and server output, never a secret", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "public-env-fixture", type: "module" }),
+      "neutron.config.ts": `export default { env: { publicPrefixes: ["NEXT_PUBLIC_"] } };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+(globalThis as any).__publicEnv = [
+  process.env.NEXT_PUBLIC_APP_URL,
+  import.meta.env.NEXT_PUBLIC_APP_URL,
+  process.env.NEXT_PUBLIC_UNSET ?? "client-fallback",
+  typeof process === "undefined" ? "" : process.env.FYLUN_SECRET_KEY,
+];
+void init();
+`,
+      "src/routes/page.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export async function loader() { return { url: process.env.NEXT_PUBLIC_APP_URL, secret: typeof process.env.FYLUN_SECRET_KEY }; }
+export default function Page({ data }) { return h("p", null, "url=" + data.url); }
+`,
+    });
+    try {
+      const proc = runCli("build", dir, {
+        NEXT_PUBLIC_APP_URL: "https://public-env.example",
+        FYLUN_SECRET_KEY: "secret-value-must-not-ship",
+      });
+      assert.equal(await proc.exited, 0, proc.output());
+      const files = (root: string): string[] =>
+        fs.readdirSync(root, { recursive: true, withFileTypes: true })
+          .filter((entry) => entry.isFile() && /\.(m?js|html)$/.test(entry.name))
+          .map((entry) => path.join(entry.parentPath, entry.name));
+      const dist = path.join(dir, "dist");
+      const serverDir = path.join(dist, "server");
+      const all = files(dist);
+      const client = all.filter((file) => !file.startsWith(serverDir + path.sep));
+      const server = all.filter((file) => file.startsWith(serverDir + path.sep));
+      assert.ok(server.length > 0, "no server bundle");
+      const read = (list: string[]) => list.map((file) => fs.readFileSync(file, "utf-8")).join("\n");
+      const clientCode = read(client);
+      const serverCode = read(server);
+      // Inlined as a string literal (the minifier may pick any quote).
+      const inlined = /["'`]https:\/\/public-env\.example["'`]/;
+      assert.match(clientCode, inlined, "client output lacks the public value");
+      assert.ok(clientCode.includes("client-fallback"));
+      assert.doesNotMatch(clientCode, /process\.env\.NEXT_PUBLIC_APP_URL/);
+      assert.match(serverCode, inlined, "server bundle lacks the public value");
+      assert.ok(serverCode.includes("process.env.FYLUN_SECRET_KEY"), "the server's secret read must stay a runtime read");
+      assert.doesNotMatch(clientCode + serverCode, /secret-value-must-not-ship/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

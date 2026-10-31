@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { createServer, loadConfigFromFile, mergeConfig } from "vite";
 import {
   neutronPlugin,
+  neutronPublicEnvPlugin,
 } from "@neutron-build/core/vite";
 import { runtimeOxc, stripCliOwnedPlugins } from "../lib/vite-shared.js";
 import {
@@ -100,6 +101,7 @@ export async function dev(): Promise<void> {
           openapi: neutronConfig.server?.openapi,
           securityHeaders: neutronConfig.server?.securityHeaders,
         }),
+        neutronPublicEnvPlugin(neutronConfig.env),
       ],
       resolve: {
         // Absolute aliases so preact-render-to-string is resolvable even when

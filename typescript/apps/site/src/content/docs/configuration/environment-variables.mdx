@@ -25,9 +25,23 @@ PUBLIC_API_KEY="12345"
     }
     ```
 
--   **Client**: Only variables prefixed with `PUBLIC_` (or `VITE_`) are exposed to the client.
+-   **Client**: Only variables prefixed with `PUBLIC_` (or `VITE_`) are exposed to the client. Both `import.meta.env.PUBLIC_X` and `process.env.PUBLIC_X` work, and their values are inlined at build time (in dev, when the server starts).
     ```ts
     console.log(import.meta.env.PUBLIC_API_KEY);
+    console.log(process.env.PUBLIC_API_KEY);
     ```
+
+## Public prefixes
+
+`env.publicPrefixes` in `neutron.config.ts` sets which prefixes are public. An app moving from Next keeps its `NEXT_PUBLIC_*` reads as they are:
+
+```ts
+// neutron.config.ts
+export default defineConfig({
+  env: { publicPrefixes: ["PUBLIC_", "NEXT_PUBLIC_"] },
+});
+```
+
+Each prefixed variable (from `.env` files or the process environment) is replaced with its value wherever client or server code reads it as `process.env.NEXT_PUBLIC_X` or `import.meta.env.NEXT_PUBLIC_X`. A prefixed variable that is not set reads as `undefined` in client code; on the server it stays a runtime read. In client code every other `process.env` read is `undefined` too and `process.env.NODE_ENV` is inlined, in dev as in a build. A variable without a public prefix is never inlined, so a secret such as `DATABASE_URL` cannot reach the client bundle. Only direct reads are replaced: `const { NEXT_PUBLIC_X } = process.env` is not. Dependencies pre-bundled by Vite in dev are not rewritten (builds rewrite them).
 
 **Warning**: Never access private secrets (like DB passwords) in code that runs on the client (components), even if you think you are "hiding" it. Only access them in `loader` or `action` functions.

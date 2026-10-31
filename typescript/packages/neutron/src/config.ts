@@ -120,6 +120,20 @@ export interface NeutronMarkdownConfig {
   renderCacheSize?: number;
 }
 
+export interface NeutronEnvConfig {
+  /**
+   * Prefixes of environment variables that client code may read, as
+   * `import.meta.env.<PREFIX>X` or `process.env.<PREFIX>X` (the Next
+   * spelling). Their build-time values (`.env` files and the process
+   * environment) are inlined in client and server code. Variables without one
+   * of these prefixes are never exposed. Vite's own `VITE_` (or your
+   * `envPrefix`) keeps working for `import.meta.env`.
+   * @default ["PUBLIC_"]
+   * @example ["PUBLIC_", "NEXT_PUBLIC_"]
+   */
+  publicPrefixes?: string[];
+}
+
 export interface NeutronConfig {
   adapter?: NeutronAdapter;
   server?: Omit<NeutronServerOptions, "rootDir">;
@@ -134,6 +148,8 @@ export interface NeutronConfig {
    */
   inputLimits?: NeutronInputLimits;
   markdown?: NeutronMarkdownConfig;
+  /** Public environment variables for client code. */
+  env?: NeutronEnvConfig;
 }
 
 export function defineConfig(config: NeutronConfig): NeutronConfig {
