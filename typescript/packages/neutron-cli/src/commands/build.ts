@@ -1561,6 +1561,12 @@ async function buildStartServerBundle(
       ],
     });
   } catch (error) {
+    // Rolldown writes the chunks before it reports a resolve error. Left in
+    // place, that tree sits under the app root, where the Vite runtime start
+    // falls back to scans it (Tailwind's source detection read the Fylun
+    // port's 135 MB of dead chunks on every CSS compile: +120 MB boot RSS,
+    // +5 s CPU on first SSR).
+    fs.rmSync(outDir, { recursive: true, force: true });
     console.warn(
       `\n  [warn] Server bundle failed to build; \`neutron-ts start\` will transform route ` +
         `modules through Vite at boot instead.\n  ${String((error as Error)?.message ?? error)}\n`

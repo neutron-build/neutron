@@ -194,6 +194,14 @@ All notable changes to this project are documented in this file.
   preact-render-to-string and `@preact/signals-core` stay in the bundle's
   graph. On a one-route fixture the bundle's JS went from 8.3 MB (7.8 MB of
   it an inlined `typescript`) to 0.53 MB.
+- **A failed server bundle build no longer leaves its chunks in
+  `dist/server/start/`.** Rolldown writes the output before it reports a
+  resolve error, so a build that warned and fell back to the Vite runtime
+  still left a complete-looking bundle tree under the app root — 135 MB on
+  the Fylun port. The Vite runtime that `start` fell back to then scanned it:
+  Tailwind's source detection read it on every CSS compile, raising boot RSS
+  from ~590 MB to 710–745 MB and the first SSR of 39 app shells from ~10 s
+  to 15–17 s CPU. The directory is now removed when the bundle fails.
 - **Client builds no longer contain Vite, esbuild, shiki or other server
   code.** Route modules import `Link` and hooks from `@neutron-build/core`,
   whose root entry also re-exports the server, the adapters, content

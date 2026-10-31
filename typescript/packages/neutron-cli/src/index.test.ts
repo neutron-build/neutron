@@ -1977,6 +1977,53 @@ export function GET() { return Response.json({ parsed: z.object({ a: z.string() 
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // Rolldown writes the chunks before it reports a resolve error; the dead
+  // tree then sat under the app root, where the Vite runtime start falls
+  // back to scans it (Tailwind source detection: +120 MB boot RSS on the
+  // Fylun port).
+  it("leaves no partial dist/server/start behind when the bundle fails", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "server-bundle-failure-fixture", type: "module" }),
+      "neutron.config.ts": `export default { runtime: "react-compat" };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/index.tsx": `
+export const config = { mode: "app" };
+export default function Home() { return <p>fallback-home</p>; }
+`,
+      // Resource routes are in no client build or prerender: only the server
+      // bundle resolves this import.
+      "src/routes/api/broken.ts": `
+import missing from "neutron-missing-package-xyz";
+export function GET() { return Response.json({ v: String(missing) }); }
+`,
+    });
+    try {
+      const output = await runBuild(dir);
+      assert.match(output, /Server bundle failed to build/, output);
+      assert.ok(!fs.existsSync(path.join(dir, "dist", ".neutron-server-bundle.json")));
+      assert.ok(!fs.existsSync(path.join(dir, "dist", "server", "start")), "partial server bundle left in dist");
+
+      const port = await freePort();
+      const proc = runCli("start", dir, { NEUTRON_HOST: "127.0.0.1", NEUTRON_PORT: String(port) });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+        assert.match(proc.output(), /Modules: transformed through Vite/, proc.output());
+        const home = await fetch(`http://127.0.0.1:${port}/`, { headers: { accept: "text/html" } });
+        assert.ok((await home.text()).includes("fallback-home"));
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("neutron-ts build (process): static CSS pass", () => {
