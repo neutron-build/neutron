@@ -9,6 +9,7 @@ import { escapeJsonForInlineScript } from "../core/serialization.js";
 import crypto from "node:crypto";
 import { Fragment, h, type ComponentChildren } from "preact";
 import { renderToString } from "preact-render-to-string";
+import type { AnyJsxElement } from "../client/jsx-agnostic.js";
 
 export interface ServerIslandProps {
   children: ComponentChildren;
@@ -57,8 +58,10 @@ function isValidIslandToken(provided: string | undefined, expected: string): boo
  * Server Island Component
  * On server: Returns fallback + script to fetch real content
  * On client: Just renders children
+ *
+ * Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX.
  */
-export function ServerIsland({ children, fallback, id }: ServerIslandProps) {
+export function ServerIsland({ children, fallback, id }: ServerIslandProps): AnyJsxElement | null {
   // Client-side: just render children
   if (typeof window !== "undefined") {
     return <>{children}</>;

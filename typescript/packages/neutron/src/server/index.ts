@@ -2,7 +2,6 @@ import { cacheOperation, publishCacheEntry, supportsBoundedPublication, CACHE_MA
 import { sharedResponseMaxAge } from "../core/shared-cache-policy.js";
 import { normalizePathname } from "../core/route-path.js";
 export { normalizePathname } from "../core/route-path.js";
-import { normalizeMiddlewareExport } from "../core/middleware.js";
 import { beginCacheMutation, encodeCacheInvalidationPath } from "./cache-mutation.js";
 import { captureCacheBody } from "./cache-capture.js";
 import * as fs from "node:fs";
@@ -13,6 +12,7 @@ import {
   isJsonRequest,
   isMutationMethod,
   toError,
+  type RouteRenderer,
 } from "../core/render-app-route.js";
 import * as path from "node:path";
 import { serve, type ServerType } from "@hono/node-server";
@@ -24,12 +24,17 @@ import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
 import { discoverRoutes } from "../core/manifest.js";
 import { runMiddlewareChain } from "../core/middleware.js";
-import { mutableResponse, isResponse } from "../core/response.js";
+import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
+import { findServerEntryFile, loadServerEntry } from "../core/server-entry.js";
+import { isResponse, notFound, acceptsHtml, mutableResponse } from "../core/response.js";
 import { createRouter } from "../core/router.js";
+import { dispatchResourceHandler, isResourceRoute, type ResourceRouteMethod } from "../core/resource-routes.js";
 import { installTransportPeer } from "./peer.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./health.js";
 import { onShutdownSignal } from "./shutdown.js";
+import { toDataRedirectResponse } from "../core/data-redirect.js";
 import {
+  applyRouteRuleHeaders,
   compileRouteRules,
   resolveRouteRuleHeaders,
   resolveRouteRuleRedirect,
@@ -53,7 +58,7 @@ import {
 } from "./cache-store.js";
 import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
-import { isProblemError, notFoundError } from "../core/problem.js";
+import { internalError, isProblemError, notFoundError } from "../core/problem.js";
 import {
   appDefinesSpecRoute,
   serverOpenApiSpec,
@@ -61,10 +66,13 @@ import {
   type NeutronOpenApiOptions,
 } from "./openapi.js";
 import { assertRenderedFragment, decodeChunkStart } from "../core/fragment-guard.js";
+import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
 import { neutronPlugin } from "../vite/plugin.js";
+import { neutronPublicEnvPlugin } from "../vite/public-env.js";
 import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
   type NeutronImageConfig,
   type NeutronRoutesConfig,
   type NeutronRuntime,
@@ -81,6 +89,24 @@ import {
 import { handleImageRequest } from "./image-optimizer.js";
 import { capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 import { handleIslandRequest } from "./server-islands.js";
+import {
+  handleServerActionRequest,
+  serverActionReferrerPath,
+  type ServerActionsOptions,
+} from "../core/server-actions.js";
+import {
+  parseServerActionsManifest,
+  SERVER_ACTION_PATH,
+  SERVER_ACTIONS_MANIFEST,
+  type ServerActionsManifest,
+} from "../core/server-action-protocol.js";
+import { loadServerBundle, serverBundleKey, type LoadedServerBundle } from "./server-bundle.js";
+import {
+  ROUTE_CSS_MANIFEST,
+  parseRouteCssManifest,
+  routeStylesheetHrefs,
+  type RouteCssManifest,
+} from "../core/route-css.js";
 import type {
   ActionArgs,
   AppContext,
@@ -89,6 +115,7 @@ import type {
   HeadersArgs,
   LoaderArgs,
   MiddlewareFn,
+  ResourceRouteHandler,
   Route,
   RouteMatch,
   RouteModule,
@@ -110,6 +137,38 @@ export type {
   MemoryLoaderCacheStoreOptions,
 } from "./cache-store.js";
 export { csrfMiddleware } from "./csrf.js";
+export { getActionContext, type ServerActionContext } from "../core/action-context.js";
+export type { ServerActionsOptions } from "../core/server-actions.js";
+export { findGlobalMiddlewareFile } from "../core/global-middleware.js";
+export {
+  defineServerEntry,
+  findServerEntryFile,
+  serverEntryDeclaresWebSocket,
+  type NeutronServerEntry,
+  type NeutronServerEntryExport,
+  type NeutronServerEntryWebSocket,
+} from "../core/server-entry.js";
+export {
+  SERVER_ACTIONS_MANIFEST,
+  SERVER_ACTIONS_MANIFEST_FORMAT,
+  SERVER_ACTION_PATH,
+  parseServerActionsManifest,
+  type ServerActionsManifest,
+} from "../core/server-action-protocol.js";
+export {
+  ROUTE_CSS_MANIFEST,
+  ROUTE_CSS_MANIFEST_FORMAT,
+  collectChunkCss,
+  routeStylesheetHrefs,
+  type RouteCssManifest,
+  type ViteManifest,
+} from "../core/route-css.js";
+export {
+  SERVER_BUNDLE_MANIFEST,
+  SERVER_BUNDLE_FORMAT,
+  generateServerBundleEntry,
+  type ServerBundleManifest,
+} from "./server-bundle.js";
 export {
   onShutdownSignal,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -157,7 +216,26 @@ export interface NeutronServerOptions {
   runtime?: NeutronRuntime;
   /** Version reported by GET /health (FRAMEWORK_CONTRACT.md). Defaults to "0.1.0". */
   version?: string;
+  /**
+   * CORS — **opt-in** (default off). Absent or `false`: no `Access-Control-*`
+   * headers are sent and preflights are never short-circuited, in every
+   * {@link mode}. Provide a config object to enable CORS: `origin` is a single
+   * string or an allowlist of origins (use an explicit list, not `"*"`, for
+   * credentialed apps — `credentials: true` with `"*"` is refused at
+   * startup). Also `methods`, `allowedHeaders`, `exposedHeaders`,
+   * `credentials`, `maxAge` (default 600). Enabled responses echo the allowed
+   * origin exactly and carry `Vary: Origin`.
+   */
   cors?: false | CorsOptions;
+  /**
+   * Security headers — **on by default** (opt-out). Every response gets
+   * `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+   * `Referrer-Policy: strict-origin-when-cross-origin`,
+   * `Cross-Origin-Opener-Policy: same-origin-allow-popups` and
+   * `Cross-Origin-Resource-Policy: same-origin` unless the response already
+   * set them. Pass `{ headers }` to override/extend individual values, or
+   * `false` to disable entirely. Unchanged by the CORS default-off flip.
+   */
   securityHeaders?: false | { headers?: Record<string, string> };
   /**
    * Serve an OpenAPI 3.1 document (FRAMEWORK_CONTRACT.md §4) generated from
@@ -191,8 +269,9 @@ export interface NeutronServerOptions {
    * - `"ssr"` — full Neutron: route discovery, Vite SSR runtime, asset/image/island
    *   routes, and the HTML catch-all. The canonical, unchanged behavior.
    * - `"api"` — JSON backend. No route discovery, no SSR, no asset serving. Keeps the
-   *   shared batteries (request-id, /health, CORS/security, compression) and answers a
-   *   clean JSON 404 for unmatched paths. Mount your own routes on the returned `app`.
+   *   shared batteries (request-id, /health, default security headers, opt-in
+   *   CORS, compression) and answers a clean JSON 404 for unmatched paths.
+   *   Mount your own routes on the returned `app`.
    * - `"raw"` — bare Hono with only the shared batteries. No catch-all; unmatched paths
    *   get Hono's default 404. Full control.
    *
@@ -217,7 +296,77 @@ export interface NeutronServerOptions {
    * adapter cap; the input-limits middleware alone applies.
    */
   maxRequestBodyBytes?: number;
+  /**
+   * Mount Hono sub-apps at path prefixes, so an SSR (or api/raw) server can
+   * serve an in-process API alongside its pages — one server instead of two
+   * (tRPC's single mountable handler tree is the canonical shape:
+   * `mount: { "/api/trpc": trpcApp }`). Each sub-app is registered via
+   * `app.route(prefix, subApp)` AFTER the framework batteries (/health,
+   * /openapi.json, image/island/static routes) and BEFORE the HTML catch-all,
+   * so mounts can neither be shadowed by the catch-all nor shadow the
+   * batteries. Works in every {@link mode}; orthogonal to {@link websocket}.
+   *
+   * Prefixes are literal path prefixes (`/api`, `/api/trpc`) and are
+   * validated at startup: a prefix that duplicates/nests another mount's, or
+   * that covers a reserved framework path (/health, /openapi.json, /docs,
+   * /_neutron/image, /__neutron_island, and /assets//public in ssr mode),
+   * is a configuration error. A request under a prefix whose sub-app has no
+   * matching route falls through to the rest of the app (in ssr mode, the
+   * HTML catch-all) — mounting does not claim the prefix, it registers
+   * routes under it.
+   *
+   * In ssr mode the app's global middleware (`src/middleware.ts`) runs before
+   * every mounted sub-app, outermost, with the real request
+   * (FRAMEWORK_CONTRACT §5: authentication precedes the route handler, and a
+   * mount is a route handler). A response it returns without calling `next()`
+   * answers instead of the sub-app. A sub-app that gates itself and must not
+   * see the global chain opts out per mount:
+   * `mount: { "/api/trpc": { app: trpcApp, globalMiddleware: false } }`.
+   *
+   * Mounts whose sub-apps import modules the routes also import (a DB
+   * client, an auth instance) belong in `src/server.entry.ts`
+   * (`defineServerEntry`), which is loaded in the routes' module graph; a
+   * sub-app built by the caller is a separate copy of those modules. Both
+   * sources are merged, and a prefix may be declared in only one.
+   */
+  mount?: Record<string, NeutronMountApp | NeutronMount>;
+  /**
+   * Load route modules, layouts and global middleware from the prebuilt
+   * server bundle `neutron-ts build` writes to dist (default `true`, used
+   * when the dist carries a current one). `false` always transforms them
+   * from source through a Vite SSR runtime — for a development server built
+   * on `createServer`, where a bundle left in dist by an earlier build would
+   * otherwise serve that build's code.
+   */
+  serverBundle?: boolean;
+  /**
+   * Server Actions (`"use server"` modules client code imports): the body
+   * cap and extra allowed origins of `POST /_neutron/action`. The actions
+   * themselves are the ones `neutron-ts build` recorded in dist
+   * (`.neutron-server-actions.json`); without that file none are served.
+   */
+  serverActions?: ServerActionsOptions;
 }
+
+/** The object form of a {@link NeutronServerOptions.mount} entry. */
+export interface NeutronMount {
+  app: NeutronMountApp;
+  /**
+   * Run the app's global middleware (`src/middleware.ts`) before this
+   * sub-app. Default `true`. Set `false` only when the sub-app enforces its
+   * own authentication: the global chain (auth gates included) then does not
+   * see requests the sub-app answers.
+   */
+  globalMiddleware?: boolean;
+}
+
+/**
+ * A Hono sub-app accepted by {@link NeutronServerOptions.mount}. Any Hono
+ * instance works (`new Hono()` with whatever bindings/variables it needs) —
+ * `any` generics keep user sub-apps assignable regardless of their own types.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type NeutronMountApp = Hono<any, any, any>;
 
 /** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
 export type NeutronServerMode = "ssr" | "api" | "raw";
@@ -247,6 +396,13 @@ export interface NeutronServer {
   wss?: WebSocketServer;
   close: () => Promise<void>;
   url: string;
+  /**
+   * Where route modules, layouts and global middleware are loaded from:
+   * `"server-bundle"` (the dist's prebuilt bundle, no Vite at runtime),
+   * `"vite"` (transformed through a Vite SSR runtime — dev, or a dist without
+   * a current bundle), or `null` (nothing to load: static-only or api/raw).
+   */
+  moduleSource: "server-bundle" | "vite" | null;
 }
 
 export interface NeutronRequestStartEvent {
@@ -339,6 +495,21 @@ export interface NeutronServerHooks {
 
 interface SsrServer {
   ssrLoadModule: (id: string) => Promise<unknown>;
+  /**
+   * The renderer pair resolved through the SAME module graph as the route
+   * modules (see RouteRenderer in core/render-app-route.ts). Every render
+   * leg — streaming, buffered, error boundary, provider mounting — runs on
+   * this pair, so app hooks and the renderer always share one Preact
+   * `options` object.
+   */
+  renderer: RouteRenderer;
+  /**
+   * Server-island endpoint from the same graph as the routes: `<ServerIsland>`
+   * registers into its own module's registry and renders with its own Preact,
+   * so the endpoint must be that module's. Absent = core's own.
+   */
+  handleIslandRequest?: typeof handleIslandRequest;
+  source: "server-bundle" | "vite";
   close: () => Promise<void>;
 }
 
@@ -374,6 +545,7 @@ export async function createServer(
     runtime = "preact",
     mode = "ssr",
     websocket,
+    mount,
     cors,
     securityHeaders,
     openapi,
@@ -383,13 +555,18 @@ export async function createServer(
     routes: routeRules,
     hooks,
     version: serverVersion = DEFAULT_HEALTH_VERSION,
+    serverBundle: useServerBundle = true,
+    serverActions: serverActionsOptions,
   } = options;
 
   const resolvedRootDir = path.resolve(rootDir);
   const resolvedDistDir = path.resolve(resolvedRootDir, distDir);
   const resolvedRoutesDir = path.resolve(resolvedRootDir, routesDir);
   const clientEntryScriptSrc = getClientEntryScriptSrc(resolvedDistDir);
-  const stylesheetHrefs = getClientStylesheetHrefs(resolvedDistDir);
+  const allStylesheetHrefs = getClientStylesheetHrefs(resolvedDistDir);
+  const routeCss = loadRouteCssManifest(resolvedDistDir);
+  const stylesheetsFor = (routeId: string) =>
+    routeStylesheetHrefs(routeCss, routeId, allStylesheetHrefs);
   const staticRouteHeaders = loadStaticRouteHeaders(resolvedDistDir);
   const staticHtmlCache = buildStaticHtmlCache(resolvedDistDir);
   const corsOptions = resolveCorsOptions(cors);
@@ -404,6 +581,11 @@ export async function createServer(
   if (cache?.loader) assertAtomicCacheStore(cache.loader);
 
   const routes = isSsr ? discoverRoutes({ routesDir: resolvedRoutesDir }) : [];
+  // The "use server" exports the build registered (client code reached them).
+  const serverActions = isSsr ? loadServerActionsManifest(resolvedDistDir) : null;
+  const serverActionFiles = serverActions
+    ? [...new Set(Object.values(serverActions.actions).map((entry) => path.resolve(resolvedRootDir, entry.file)))]
+    : [];
   const router = createRouter();
   for (const route of routes) {
     router.insert(route);
@@ -411,6 +593,11 @@ export async function createServer(
 
   const hasAppRoutes = routes.some(
     (route) => !route.file.includes("_layout") && route.config.mode === "app"
+  );
+  // Resource routes load their handler modules through the SSR runtime like
+  // app routes do — an app whose routes are all endpoints still needs one.
+  const hasResourceRoutes = routes.some(
+    (route) => !route.file.includes("_layout") && isResourceRoute(route)
   );
   // Global middleware is loaded THROUGH the SSR runtime, so the runtime has to
   // exist for it to run at all. Deciding to start one on `hasAppRoutes` alone
@@ -421,24 +608,53 @@ export async function createServer(
   // The file is found with a plain fs check, which needs no runtime, so its
   // presence can be part of the decision to start one.
   const globalMiddlewareFile = isSsr ? findGlobalMiddlewareFile(resolvedRootDir) : null;
-  const needsSsrRuntime = hasAppRoutes || globalMiddlewareFile !== null;
+  // src/server.entry.ts (core/server-entry.ts): mounts, the WebSocket handler
+  // and other long-lived server objects, loaded through the same runtime as
+  // the routes so both share one instance of every module (F-P4-1).
+  const serverEntryFile = isSsr ? findServerEntryFile(resolvedRootDir) : null;
+  const needsSsrRuntime =
+    hasAppRoutes ||
+    hasResourceRoutes ||
+    globalMiddlewareFile !== null ||
+    serverEntryFile !== null ||
+    serverActionFiles.length > 0;
   // Fail closed (TS-01): when the SSR runtime is required — app routes exist
   // or a global middleware file was found — a Vite initialization failure
   // must reject createServer, not silently downgrade the app to a static
   // server whose auth/tenant/CSRF middleware never runs. Static-only
   // serving is an explicitly selected mode, not an error fallback.
-  const ssrServer = needsSsrRuntime
-    ? await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime)
+  //
+  // `neutron-ts build` compiles everything this runtime would load into a
+  // server bundle; a dist that carries a current one is served from it with
+  // no Vite server at all (F-P2-1: transforming the app graph at every boot
+  // cost real apps tens of seconds of CPU and gigabytes of RSS).
+  const serverBundle = needsSsrRuntime && useServerBundle
+    ? await loadServerBundle({
+        rootDir: resolvedRootDir,
+        distDir: resolvedDistDir,
+        runtime,
+        requiredFiles: [
+          ...routes.map((route) => route.file),
+          ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
+          ...(serverEntryFile ? [serverEntryFile] : []),
+          ...serverActionFiles,
+        ],
+      })
     : null;
+  const ssrServer = !needsSsrRuntime
+    ? null
+    : serverBundle
+      ? await createBundledSsrServer(resolvedRootDir, serverBundle)
+      : await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime);
   // An optional src/middleware.ts (default export = a MiddlewareFn) runs
   // OUTERMOST, before any per-route middleware. Loaded once at startup through
   // the same SSR runtime as routes so it shares the module graph (hooks,
   // aliases). Absent file = none. A PRESENT file that fails to import or
   // exports something invalid is a startup error (TS-01): losing the auth
   // gate to a typo must not look like a working server.
-  const globalMiddleware: MiddlewareFn[] =
+  const appGlobalMiddleware: MiddlewareFn[] =
     globalMiddlewareFile && ssrServer
-      ? await loadGlobalMiddleware(ssrServer, globalMiddlewareFile)
+      ? await loadGlobalMiddleware(ssrServer.ssrLoadModule, globalMiddlewareFile)
       : [];
 
   if (globalMiddlewareFile && !ssrServer) {
@@ -450,6 +666,32 @@ export async function createServer(
         "or remove the middleware file; serving requests without it would bypass its gate."
     );
   }
+  // A present entry that fails to load or exports nothing usable is a startup
+  // error, like the global middleware (TS-01).
+  const serverEntry =
+    serverEntryFile && ssrServer ? await loadServerEntry(ssrServer.ssrLoadModule, serverEntryFile) : null;
+  if (serverEntry?.mount && mount) {
+    for (const prefix of Object.keys(serverEntry.mount)) {
+      if (Object.prototype.hasOwnProperty.call(mount, prefix)) {
+        throw new Error(
+          `Mount prefix "${prefix}" is declared both in createServer({ mount }) and in ` +
+            `${path.relative(resolvedRootDir, serverEntryFile!)}; declare it once.`
+        );
+      }
+    }
+  }
+  const mounts =
+    serverEntry?.mount || mount ? { ...(serverEntry?.mount ?? {}), ...(mount ?? {}) } : undefined;
+  // The entry's websocket enables the transport if the options did not, and
+  // fills the path/authorizer the options leave unset.
+  const websocketOptions: boolean | NeutronWebSocketOptions | undefined = serverEntry?.websocket
+    ? {
+        ...(typeof websocket === "object" ? websocket : {}),
+        path: (typeof websocket === "object" ? websocket.path : undefined) ?? serverEntry.websocket.path,
+        authorize:
+          (typeof websocket === "object" ? websocket.authorize : undefined) ?? serverEntry.websocket.authorize,
+      }
+    : websocket;
   const routeModuleCache = new Map<string, Promise<RouteModule>>();
   const appResponseCacheStore =
     cache?.app || createMemoryAppCacheStore();
@@ -465,6 +707,19 @@ export async function createServer(
   // invalidated the path in between advances the epoch and the stale fill is
   // dropped instead of published after the invalidation.
   let appCacheEpoch = 0;
+  // Advance the epoch, then evict the path from both caches (the deletes also
+  // bump the stores' generations, fencing remote fills). Given the mutation's
+  // response, also evict what its `x-neutron-invalidate` header names — the
+  // same directive for page actions and resource-route handlers.
+  const invalidateMutatedPath = async (pathname: string, response?: Response): Promise<void> => {
+    appCacheEpoch++;
+    await appResponseCacheStore.deleteByPath(encodeCacheInvalidationPath(pathname));
+    await loaderDataCacheStore.deleteByPath(encodeCacheInvalidationPath(pathname));
+    if (response) {
+      await applyMutationInvalidationFromResponse(appResponseCacheStore, pathname, response);
+      await applyMutationInvalidationToLoaderDataCache(loaderDataCacheStore, pathname, response);
+    }
+  };
 
   if (hasAppRoutes && !ssrServer) {
     // Unreachable for isSsr apps (needsSsrRuntime throws first) — kept for
@@ -524,6 +779,20 @@ export async function createServer(
     c.res.headers.set("x-request-id", requestId);
   });
 
+  // A 3xx answering a data request (X-Neutron-Data) is reported, not sent:
+  // fetch would follow it and the client router would render the target's
+  // data under the URL that redirected (core/data-redirect.ts). Outside every
+  // other layer, so config redirect rules, global middleware, loaders and
+  // mounts are all covered, and the headers they added travel with it.
+  app.use("*", async (c, next) => {
+    await next();
+    const reported = toDataRedirectResponse(c.req.raw, c.res);
+    if (reported !== c.res) {
+      c.res = undefined;
+      c.res = reported;
+    }
+  });
+
   // Reject untrusted Host headers first, before any other processing, so a
   // spoofed Host can't reach URL/link construction or cache keying.
   if (trustedHosts && trustedHosts.length > 0) {
@@ -539,7 +808,14 @@ export async function createServer(
 
   // FRAMEWORK_CONTRACT.md middleware order: CORS precedes Compression. (CORS
   // preflight short-circuits before the body is ever compressed.)
-  if (corsOptions || securityHeadersConfig) {
+  //
+  // `routes.headers` rules are applied here too, so they reach every
+  // response the server sends — mounts, assets and the batteries as well as
+  // the catch-all — and they are the per-route override of the security
+  // defaults: a rule's value is set first (so the default no longer fills
+  // it), and a rule's `null` keeps the default off that path (F-P5-1).
+  const hasHeaderRules = compiledRouteRules.headers.length > 0;
+  if (corsOptions || securityHeadersConfig || hasHeaderRules) {
     app.use("*", async (c, next) => {
       if (corsOptions) {
         const preflightResponse = createCorsPreflightResponse(c.req.raw, corsOptions);
@@ -555,8 +831,12 @@ export async function createServer(
         applyCorsHeaders(c.req.raw, c.res, corsOptions);
       }
 
+      const rulePath = hasHeaderRules ? normalizePathname(c.req.path) : null;
+      const suppressed = rulePath
+        ? applyRouteRuleHeaders(c.res, resolveRouteRuleHeaders(compiledRouteRules, rulePath))
+        : undefined;
       if (securityHeadersConfig) {
-        applySecurityHeaders(c.res, securityHeadersConfig);
+        applySecurityHeaders(c.res, securityHeadersConfig, suppressed);
       }
     });
   }
@@ -586,6 +866,17 @@ export async function createServer(
     app.use("*", compress());
   }
 
+  // Innermost of the framework's response post-processors (request id,
+  // security headers, CORS, Vary, compression all set headers after next()).
+  // A handler or mounted sub-app may answer with an immutable-header Response
+  // — `Response.redirect()`, a fetched response — which Hono passes through
+  // as-is, so the first of those header writes threw and the response became
+  // a bare 500.
+  app.use("*", async (c, next) => {
+    await next();
+    setMutableResponse(c);
+  });
+
   // GET /health — contract shape { status, nucleus, version }. Registered before
   // the static/SSR routes so it always answers. The SSR server holds no Nucleus
   // pool (loaders connect per-request), so nucleus is "unconfigured" here.
@@ -604,6 +895,124 @@ export async function createServer(
     const spec = serverOpenApiSpec(routes, openapi, serverVersion);
     app.get("/openapi.json", (c) => c.json(spec));
     app.get("/docs", (c) => c.html(swaggerDocsHtml(openapi.title)));
+  }
+
+  // Caller-mounted sub-apps (in-process API routes: tRPC, REST, SSE). They are
+  // registered AFTER the framework batteries above and BEFORE the HTML
+  // catch-all below, so neither shadowing direction can happen:
+  //   - a mount cannot shadow /health & co. (registered earlier, and the
+  //     prefixes are validated to not cover reserved paths at all);
+  //   - the catch-all cannot shadow a mount (REALTIME_PLAN §5 records the
+  //     class: an "*" route swallows everything a later caller adds — the
+  //     mount is intentionally on the other side of it).
+  // A request under the prefix that the sub-app does not match falls through
+  // to whatever comes next (in ssr mode, the catch-all): mounting registers
+  // routes under a prefix, it does not claim the namespace.
+  // Requests whose global middleware already ran ahead of a mount. A request
+  // under a prefix the sub-app does not match falls through to the catch-all,
+  // which must not run the chain a second time.
+  const globallyGatedRequests = new WeakSet<Request>();
+
+  // Server Actions (core/server-actions.ts): one endpoint, ahead of the
+  // mounts (whose prefixes may not cover it) and the catch-all.
+  if (isSsr && serverActions && ssrServer) {
+    const registered = serverActions.actions;
+    app.all(SERVER_ACTION_PATH, async (c) => {
+      const requestId = c.get("requestId") ?? createRequestId();
+      const startedAt = Date.now();
+      const method = c.req.method.toUpperCase();
+      emitHook(hooks?.onRequestStart, {
+        requestId,
+        method,
+        url: c.req.raw.url,
+        pathname: SERVER_ACTION_PATH,
+        startedAt,
+      });
+      const response = await handleServerActionRequest(c.req.raw, {
+        ...serverActionsOptions,
+        globalMiddleware: appGlobalMiddleware,
+        resolve: async (id) => {
+          const entry = Object.prototype.hasOwnProperty.call(registered, id) ? registered[id] : undefined;
+          if (!entry) return null;
+          const mod = (await ssrServer.ssrLoadModule(path.resolve(resolvedRootDir, entry.file))) as Record<
+            string,
+            unknown
+          >;
+          const fn = mod[entry.export];
+          if (typeof fn !== "function") {
+            throw new Error(
+              `Server action ${entry.file}#${entry.export} is registered but the module does not export ` +
+                "that function; rebuild with `neutron-ts build`."
+            );
+          }
+          return { fn: fn as (...args: unknown[]) => unknown, name: entry.export };
+        },
+        onError: (error) =>
+          emitHook(hooks?.onError, {
+            requestId,
+            method,
+            pathname: SERVER_ACTION_PATH,
+            source: "action",
+            error,
+          }),
+      });
+      // An action is a mutation: evict what its x-neutron-invalidate names,
+      // `self` being the page that invoked it.
+      if (response.headers.has("x-neutron-invalidate")) {
+        await invalidateMutatedPath(serverActionReferrerPath(c.req.raw) ?? SERVER_ACTION_PATH, response);
+      }
+      const endedAt = Date.now();
+      emitHook(hooks?.onRequestEnd, {
+        requestId,
+        method,
+        url: c.req.raw.url,
+        pathname: SERVER_ACTION_PATH,
+        startedAt,
+        endedAt,
+        durationMs: endedAt - startedAt,
+        status: response.status,
+      });
+      return response;
+    });
+  }
+
+  if (mounts) {
+    validateMountConfig(mounts, isSsr);
+    for (const [prefix, entry] of Object.entries(mounts)) {
+      const { app: subApp, globalMiddleware: runGlobal = true } = normalizeMountEntry(entry);
+      if (runGlobal && appGlobalMiddleware.length > 0) {
+        app.use("*", async (c, next) => {
+          if (!mountPrefixCovers(prefix, c.req.path)) {
+            return next();
+          }
+          globallyGatedRequests.add(c.req.raw);
+          let result: Response;
+          try {
+            result = await runMiddlewareChain(appGlobalMiddleware, c.req.raw, {}, async () => {
+              await next();
+              return c.res;
+            });
+          } catch (error) {
+            // The catch-all's treatment of middleware throws: a thrown
+            // Response is a short-circuit, a ProblemError answers as 7807.
+            if (isResponse(error)) {
+              result = error;
+            } else if (isProblemError(error)) {
+              result = error.toResponse(c.req.path);
+            } else {
+              throw error;
+            }
+          }
+          if (result !== c.res) {
+            // Replace outright. Assigning over a finalized response would
+            // merge the sub-app's headers into the middleware's own answer.
+            c.res = undefined;
+            c.res = result;
+          }
+        });
+      }
+      app.route(prefix, subApp);
+    }
   }
 
   // SSR-only routes: static assets, image optimization, server islands, and the HTML
@@ -636,6 +1045,34 @@ export async function createServer(
     })
   );
 
+  // Root-URL public assets (dev/prod parity): Vite copies public/ into the
+  // dist ROOT (dist/favicon.svg), and `neutron-ts dev` serves those files at
+  // their root URLs — but production only served /assets/* and /public/*
+  // (which the build never writes), so an app's own /favicon.svg 404'd in
+  // production while working in dev. Only files that came from public/ are
+  // served: the dist root also holds the Vite manifest, build metadata and
+  // (node/docker presets) a server bundle under server/. Route rules still
+  // win, and anything else falls through to the route pipeline below, which
+  // owns loaders, route rules, gating and the app cache.
+  const rootAssetStatic = serveStatic({
+    root: resolvedDistDir,
+    rewriteRequestPath: (p) => p,
+  });
+  const isRootPublicAsset = createRootPublicAssetFilter(resolvedDistDir);
+  app.use("*", async (c, next) => {
+    const pathname = normalizePathname(c.req.path);
+    if (pathname === null || !isRootPublicAsset(pathname)) {
+      return next();
+    }
+    // Redirect rules own the URL space even over physical files.
+    if (
+      resolveRouteRuleRedirect(compiledRouteRules, pathname, new URL(c.req.url).search)
+    ) {
+      return next();
+    }
+    return rootAssetStatic(c, next);
+  });
+
   app.get("/_neutron/image", async (c) => {
     const response = await handleImageRequest(c.req.raw, {
       publicDirs: [
@@ -651,7 +1088,10 @@ export async function createServer(
 
   app.get("/__neutron_island/:id", async (c) => {
     const islandId = c.req.param("id");
-    const html = await handleIslandRequest(islandId, c.req.query("t"));
+    const html = await (ssrServer?.handleIslandRequest ?? handleIslandRequest)(
+      islandId,
+      c.req.query("t")
+    );
     if (html === null) {
       return c.text("Not Found", 404);
     }
@@ -666,6 +1106,7 @@ export async function createServer(
   });
 
   app.all("*", async (c) => {
+    const globalMiddleware = globallyGatedRequests.has(c.req.raw) ? [] : appGlobalMiddleware;
     const requestTrace: RequestTraceContext = {
       requestId: c.get("requestId") ?? createRequestId(),
       method: c.req.method.toUpperCase(),
@@ -686,9 +1127,11 @@ export async function createServer(
       response: Response,
       routeMeta?: { routeId?: string; routePath?: string; routeMode?: "static" | "app" }
     ): Response => {
+      // Middleware, loaders, actions and resource routes may hand back an
+      // immutable-header Response; route-rule headers are set right below.
       response = mutableResponse(response);
       const normalizedRequestPath = normalizePathname(requestTrace.pathname) || "/";
-      applyRouteRuleHeadersToResponse(
+      applyRouteRuleHeaders(
         response,
         resolveRouteRuleHeaders(compiledRouteRules, normalizedRequestPath)
       );
@@ -741,6 +1184,55 @@ export async function createServer(
 
       const match = router.match(effectivePathname);
 
+      // Resource route (method handlers, no component): an HTTP endpoint, not
+      // a page. Dispatched BEFORE the static fast path and the static-mode
+      // 404 — a prebuilt file at this path must never answer for an endpoint,
+      // and the resource route is the route table's authority for its path.
+      // Endpoints run per request, so their middleware (global + layout +
+      // route, FRAMEWORK_CONTRACT §5 order) runs every time: the A-020
+      // prerender/gate contradiction cannot arise because resource routes are
+      // never prerendered in the first place.
+      if (match && isResourceRoute(match.route)) {
+        if (!ssrServer) {
+          return finalize(
+            internalError("Resource route SSR runtime is unavailable").toResponse(
+              requestTrace.pathname
+            ),
+            { routeId: match.route.id, routePath: match.route.path }
+          );
+        }
+        const response = await handleResourceRouteRequest(
+          c.req.raw,
+          match,
+          ssrServer,
+          routeModuleCache,
+          globalMiddleware,
+          (error) =>
+            emitHook(hooks?.onError, {
+              requestId: requestTrace.requestId,
+              method: requestTrace.method,
+              pathname: requestTrace.pathname,
+              source: "request",
+              routeId: match.route.id,
+              routePath: match.route.path,
+              error: toError(error),
+            })
+        );
+        // A mutating endpoint can change what app pages show: fence fills
+        // that were in flight while it ran (TS-07 completion fence), and
+        // evict the pages its `x-neutron-invalidate` header names. No
+        // pre-handler call: a resource route's own path holds no cache
+        // entries, and this bump already fences GETs that began earlier.
+        if (isMutationMethod(requestTrace.method)) {
+          await invalidateMutatedPath(effectivePathname, response);
+        }
+        return finalize(response, {
+          routeId: match.route.id,
+          routePath: match.route.path,
+          routeMode: "app",
+        });
+      }
+
       // Static dist HTML may only answer when no non-static app route claims
       // the path. The pre-seeded cache (buildStaticHtmlCache walks dist/ at
       // boot, including index.html -> "/") used to short-circuit BEFORE the
@@ -757,7 +1249,8 @@ export async function createServer(
       // app-level middleware — it is only passed into renderAppRoute — so
       // before this it did not run for static hits at all. Now it runs, and a
       // response it returns (a redirect, a 403) wins over the prebuilt file.
-      const serveStatic = async (respond: () => Response): Promise<Response> => {
+      // The framework's own 404s below run through it the same way.
+      const withGlobalMiddleware = async (respond: () => Response): Promise<Response> => {
         if (globalMiddleware.length === 0) {
           return respond();
         }
@@ -775,7 +1268,7 @@ export async function createServer(
       ) {
         const cached = staticHtmlCache.get(effectivePathname);
         if (cached) {
-          const response = await serveStatic(() =>
+          const response = await withGlobalMiddleware(() =>
             createStaticHtmlResponse(
               cached,
               c.req.raw,
@@ -795,7 +1288,7 @@ export async function createServer(
         if (html !== null) {
           const entry = createStaticHtmlEntry(html);
           staticHtmlCache.set(effectivePathname, entry);
-          const response = await serveStatic(() =>
+          const response = await withGlobalMiddleware(() =>
             createStaticHtmlResponse(
               entry,
               c.req.raw,
@@ -823,7 +1316,7 @@ export async function createServer(
               notFoundMatch,
               ssrServer!,
               clientEntryScriptSrc,
-              stylesheetHrefs,
+              stylesheetsFor(notFoundMatch.route.id),
               routeModuleCache,
               loaderDataCacheStore,
               requestTrace,
@@ -859,8 +1352,15 @@ export async function createServer(
               error: toError(error),
             });
           }
+          // The not-found render already ran the global middleware chain.
+          return finalize(defaultNotFoundResponse(c.req.raw, originalPathname));
         }
-        return finalize(c.text("Not Found", 404));
+        // FRAMEWORK_CONTRACT §5: global middleware (auth gates) runs for every
+        // request, matched or not — it used to run here only when the app had
+        // a not-found.tsx to render.
+        return finalize(
+          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname))
+        );
       }
 
       // A non-app route that reached here was not answered from dist, and
@@ -868,18 +1368,26 @@ export async function createServer(
       // A GATED one is the exception: it got here precisely because it must not
       // be served from disk, and 404ing it would turn "this page is protected"
       // into "this page does not exist". Render it through the app path so its
-      // middleware actually runs and decides. `neutron build` refuses to
-      // produce this combination at all (render-static.ts), so in practice this
-      // is reached only with a dist built before the gate was added. A-020.
+      // middleware actually runs and decides. `neutron build`
+      // (neutron-cli/src/commands/build.ts) and core's renderStatic both
+      // refuse to prerender this combination, so in practice this is reached
+      // only with a dist built before the gate was added — or by files placed
+      // in dist by anything other than those two. A-020.
       if (
         match.route.file.includes("_layout") ||
         (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw) && !gated)
       ) {
-        return finalize(c.text("Not Found", 404), {
-          routeId: match.route.id,
-          routePath: match.route.path,
-          routeMode: match.route.config.mode,
-        });
+        // Same content-negotiated default as an unmatched path, behind the
+        // same global middleware: a static route whose file is missing from
+        // dist is still a 404 a human or a machine will read.
+        return finalize(
+          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname)),
+          {
+            routeId: match.route.id,
+            routePath: match.route.path,
+            routeMode: match.route.config.mode,
+          }
+        );
       }
 
       if (!ssrServer) {
@@ -974,7 +1482,7 @@ export async function createServer(
           match,
           ssrServer,
           clientEntryScriptSrc,
-          stylesheetHrefs,
+          stylesheetsFor(match.route.id),
           routeModuleCache,
           loaderDataCacheStore,
           requestTrace,
@@ -1076,15 +1584,40 @@ export async function createServer(
     fetch: fetchFn,
     port,
     hostname: host,
+    // Left on, @hono/node-server replaces globalThis.Response and Request with
+    // its own classes for the process lifetime. A Response subclass defined
+    // before this call (a Next-compat NextResponse evaluated at import), and
+    // every Response.json()/redirect() result, then fail `instanceof Response`
+    // in app code. The lightweight classes only save allocations on simple
+    // bodies, which Neutron's header-writing pipeline mostly materializes
+    // anyway.
+    overrideGlobalObjects: false,
+  });
+  // `serve()` returns before the socket is bound. Resolve once it is, so the
+  // caller can close() at once (instead of ERR_SERVER_NOT_RUNNING), `url`
+  // names the bound port (also for port 0), and a bind failure (EADDRINUSE)
+  // rejects here rather than surfacing as an unhandled 'error' event.
+  await new Promise<void>((resolve, reject) => {
+    if ((server as { listening?: boolean }).listening) return resolve();
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
   });
 
   // Transport axis: attach a WebSocket server to the live HTTP server, independent of
   // rendering mode. Raw `ws` in noServer mode so the framework owns the upgrade handshake
   // and the caller just attaches `wss.on("connection", ...)`.
   let wss: WebSocketServer | undefined;
-  if (websocket) {
+  if (websocketOptions) {
     const { WebSocketServer: WSServer } = await import("ws");
-    const wsOptions = websocket === true ? {} : websocket;
+    const wsOptions = websocketOptions === true ? {} : websocketOptions;
     wss = new WSServer({ noServer: true });
     const httpServer = server as unknown as import("node:http").Server;
     httpServer.on("upgrade", (req, socket, head) => {
@@ -1132,6 +1665,16 @@ export async function createServer(
     });
   }
 
+  if (wss && serverEntry?.websocket) {
+    try {
+      await serverEntry.websocket.attach(wss);
+    } catch (error) {
+      wss.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw error;
+    }
+  }
+
   // One shutdown per server (TS-29): repeated close() calls join the same
   // teardown instead of racing a second one through still-draining stages.
   let closingPromise: Promise<void> | undefined;
@@ -1173,6 +1716,9 @@ export async function createServer(
               server.close((err) => (err ? reject(err) : resolve()));
               (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
             }),
+          // The server entry's own resources (clients, pools): no request
+          // can reach its mounts any more.
+          () => Promise.resolve(serverEntry?.close?.()),
           // Last: the SSR runtime. Nothing still rendering depends on it now.
           () => ssrServer?.close() ?? Promise.resolve(),
         ];
@@ -1197,6 +1743,7 @@ export async function createServer(
       }
       return `http://${host}:${port}`;
     })(),
+    moduleSource: ssrServer?.source ?? null,
   };
 }
 
@@ -1222,7 +1769,9 @@ async function handleAppRouteRequest(
   }
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
-  // Vite SSR runtime, then hand the loaded map to the shared render core.
+  // Vite SSR runtime, then hand the loaded map to the shared render core —
+  // together with the runtime's renderer pair, resolved through the SAME
+  // graph so hooks and renderer share one Preact instance.
   const allRoutes = [...match.layouts, match.route];
   const routeModules = new Map<string, RouteModule>();
   await Promise.all(
@@ -1239,7 +1788,55 @@ async function handleAppRouteRequest(
     globalMiddleware,
     responseCache,
     loaderCacheFence,
+    renderer: ssrServer.renderer,
   });
+}
+
+/**
+ * Serve one resource-route request: load the module chain through the SSR
+ * runtime, run middleware (global outermost, then layouts, then the route —
+ * the exact chain renderAppRoute assembles, so a gate on a parent layout
+ * covers endpoints in its subtree like it covers pages), and dispatch the
+ * method handler. Loaders never run for resource routes.
+ */
+async function handleResourceRouteRequest(
+  request: Request,
+  match: RouteMatch,
+  ssrServer: SsrServer,
+  moduleCache: Map<string, Promise<RouteModule>>,
+  globalMiddleware: MiddlewareFn[] | undefined,
+  onError: (error: unknown) => void
+): Promise<Response> {
+  const allRoutes = [...match.layouts, match.route];
+  const routeModules = new Map<string, RouteModule>();
+  await Promise.all(
+    allRoutes.map(async (route) => {
+      routeModules.set(route.id, await loadRouteModule(ssrServer, route.file, moduleCache));
+    })
+  );
+
+  const middlewares: MiddlewareFn[] = [];
+  if (globalMiddleware && globalMiddleware.length > 0) {
+    middlewares.push(...globalMiddleware);
+  }
+  for (const route of allRoutes) {
+    const module = routeModules.get(route.id);
+    if (module?.middleware) {
+      middlewares.push(module.middleware);
+    }
+  }
+
+  const context: AppContext = {};
+  const module = routeModules.get(match.route.id);
+  return runMiddlewareChain(middlewares, request, context, async () =>
+    dispatchResourceHandler(
+      module as Partial<Record<ResourceRouteMethod, ResourceRouteHandler>>,
+      request,
+      match.params,
+      context,
+      { onError }
+    )
+  );
 }
 
 
@@ -1274,57 +1871,6 @@ function routeChainIsGated(match: RouteMatch): boolean {
   return [...match.layouts, match.route].some((route) => route.hasMiddleware !== false);
 }
 
-// Load an optional global middleware from <rootDir>/src/middleware.ts (or
-// .js/.tsx). Returns its default export if it is a function, else null. A
-// present-but-malformed file warns and is ignored rather than crashing boot.
-const GLOBAL_MIDDLEWARE_CANDIDATES = [
-  "src/middleware.ts",
-  "src/middleware.tsx",
-  "src/middleware.js",
-  "src/middleware.mjs",
-];
-
-/**
- * Absolute path of the app's global middleware file, or null.
- *
- * Split out from {@link loadGlobalMiddleware} because the answer is needed
- * BEFORE the SSR runtime is created — its presence is part of deciding whether
- * to create one at all. A plain fs check, so it costs nothing at boot. A-022.
- */
-function findGlobalMiddlewareFile(rootDir: string): string | null {
-  for (const rel of GLOBAL_MIDDLEWARE_CANDIDATES) {
-    const abs = path.join(rootDir, rel);
-    if (fs.existsSync(abs)) {
-      return abs;
-    }
-  }
-  return null;
-}
-
-async function loadGlobalMiddleware(
-  ssrServer: SsrServer,
-  absolutePath: string
-): Promise<MiddlewareFn[]> {
-  let mod: { default?: unknown; middleware?: unknown };
-  try {
-    mod = (await ssrServer.ssrLoadModule(absolutePath)) as {
-      default?: unknown;
-      middleware?: unknown;
-    };
-  } catch (error) {
-    // A file that exists but cannot be imported is a startup error (TS-01):
-    // continuing without it silently removes whatever gate it carried.
-    throw new Error(
-      `Failed to load global middleware ${path.basename(absolutePath)}: ${String(error)}`
-    );
-  }
-  // Documented form: `export const middleware: MiddlewareFn[]`. Also
-  // accept a single function (default or named) for ergonomics. An export
-  // that exists but is not usable is likewise a startup error.
-  const exported = mod.middleware ?? mod.default;
-  return normalizeMiddlewareExport(exported);
-}
-
 function loadRouteModule(
   ssrServer: SsrServer,
   routeFile: string,
@@ -1348,18 +1894,105 @@ function loadRouteModule(
 
 /** Normalize a request pathname for matching/caching. Exported for tests. */
 
-function applyRouteRuleHeadersToResponse(
-  response: Response,
-  ruleHeaders: Array<{ headers: Record<string, string> }>
+// Framework paths a mount prefix must never take over. Batteries registered
+// before the mounts would keep answering anyway (Hono resolves in registration
+// order), so a mount that covers one would silently never see those requests —
+// refuse it up front instead. /assets and /public are ssr-mode static trees.
+const RESERVED_MOUNT_PATHS: Array<{ path: string; ssrOnly: boolean; what: string }> = [
+  { path: "/health", ssrOnly: false, what: "GET /health (FRAMEWORK_CONTRACT.md §7)" },
+  { path: "/openapi.json", ssrOnly: false, what: "GET /openapi.json (FRAMEWORK_CONTRACT.md §4)" },
+  { path: "/docs", ssrOnly: false, what: "GET /docs (FRAMEWORK_CONTRACT.md §4)" },
+  { path: "/_neutron/image", ssrOnly: true, what: "the image optimizer route" },
+  { path: SERVER_ACTION_PATH, ssrOnly: true, what: "the server actions endpoint" },
+  { path: "/__neutron_island", ssrOnly: true, what: "the server-islands route" },
+  { path: "/assets", ssrOnly: true, what: "the built-assets static route" },
+  { path: "/public", ssrOnly: true, what: "the public-dir static route" },
+];
+
+/** `"/api"` covers `"/api/anything"` — segment-boundary prefix, not substring. */
+function mountPrefixCovers(prefix: string, path: string): boolean {
+  if (prefix === path) return true;
+  return path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+}
+
+/**
+ * Fail fast on mount configurations whose behavior would be surprising.
+ * Every rule here encodes a shadowing/conflict case that would otherwise be
+ * resolved silently by registration order or Hono fall-through.
+ */
+function isHonoApp(value: unknown): value is NeutronMountApp {
+  return (
+    !!value &&
+    typeof (value as { fetch?: unknown }).fetch === "function" &&
+    typeof (value as { route?: unknown }).route === "function"
+  );
+}
+
+function normalizeMountEntry(entry: NeutronMountApp | NeutronMount): NeutronMount {
+  return isHonoApp(entry) ? { app: entry } : entry;
+}
+
+function validateMountConfig(
+  mount: Record<string, NeutronMountApp | NeutronMount>,
+  isSsr: boolean
 ): void {
-  for (const rule of ruleHeaders) {
-    for (const [name, value] of Object.entries(rule.headers)) {
-      try {
-        if (!response.headers.has(name)) {
-          response.headers.set(name, value);
-        }
-      } catch {
-        // Some Response instances can expose immutable headers (e.g. redirects).
+  const prefixes = Object.keys(mount);
+
+  for (const prefix of prefixes) {
+    const entry = mount[prefix];
+    const subApp = isHonoApp(entry) ? entry : (entry as NeutronMount | undefined)?.app;
+    if (typeof prefix !== "string" || prefix.length === 0 || !prefix.startsWith("/")) {
+      throw new Error(
+        `Neutron: mount prefix ${JSON.stringify(prefix)} is invalid — prefixes are absolute ` +
+          `path prefixes like "/api". For the site root use mode: "raw".`
+      );
+    }
+    if (prefix !== "/" && prefix.endsWith("/")) {
+      throw new Error(
+        `Neutron: mount prefix "${prefix}" must not end with "/" — write "${prefix.slice(0, -1)}".`
+      );
+    }
+    if (prefix.split("/").some((segment) => segment.includes("*") || segment.includes(":"))) {
+      throw new Error(
+        `Neutron: mount prefix "${prefix}" must be literal — dynamic segments are not ` +
+          `supported in mount prefixes (match inside the sub-app instead).`
+      );
+    }
+    if (!isHonoApp(subApp)) {
+      throw new Error(
+        `Neutron: mount["${prefix}"] is not a Hono instance — pass the app itself ` +
+          `(e.g. new Hono()) or { app, globalMiddleware }, not a handler or a fetch function.`
+      );
+    }
+
+    for (const reserved of RESERVED_MOUNT_PATHS) {
+      if (reserved.ssrOnly && !isSsr) continue;
+      if (mountPrefixCovers(prefix, reserved.path)) {
+        const hint =
+          prefix === "/"
+            ? ' Mounting at "/" is not supported — for a fully caller-owned router use mode: "raw".'
+            : " Choose a different prefix.";
+        throw new Error(
+          `Neutron: mount prefix "${prefix}" would take over ${reserved.what} — ` +
+            `reserved framework paths cannot be mounted over.${hint}`
+        );
+      }
+    }
+  }
+
+  // Pairwise: exact duplicates and nested prefixes. A sub-app that answers a
+  // path the outer prefix also reaches makes the winner an accident of object
+  // key order; say it once at startup instead.
+  for (let i = 0; i < prefixes.length; i++) {
+    for (let j = i + 1; j < prefixes.length; j++) {
+      const a = prefixes[i];
+      const b = prefixes[j];
+      if (mountPrefixCovers(a, b) || mountPrefixCovers(b, a)) {
+        throw new Error(
+          `Neutron: mount prefixes "${a}" and "${b}" overlap — nested/duplicate mount ` +
+            `prefixes are not supported (registration order would silently decide ` +
+            `which sub-app answers). Mount one sub-app and route the sub-prefix inside it.`
+        );
       }
     }
   }
@@ -1768,6 +2401,43 @@ async function maybeStoreAppResponse(
   }, generation);
 }
 
+/**
+ * Decide which root URLs the SSR server may answer from the dist root. `neutron
+ * build` records the URL of every file it copied from public/ in
+ * `.neutron-public-files.json`; only those are public. A dist without that
+ * metadata (built before it existed, or by other tooling) falls back to: the
+ * last segment carries an extension, no segment starts with "." (the Vite
+ * manifest, build metadata) and the path is not under server/ (preset server
+ * bundles).
+ */
+function createRootPublicAssetFilter(distDir: string): (pathname: string) => boolean {
+  const metadataPath = path.join(distDir, PUBLIC_FILES_METADATA);
+  if (fs.existsSync(metadataPath)) {
+    let files: unknown = [];
+    try {
+      files = (JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as { files?: unknown }).files;
+    } catch {
+      // Malformed metadata serves nothing rather than everything.
+    }
+    const allowed = new Set(
+      Array.isArray(files) ? files.filter((f): f is string => typeof f === "string") : []
+    );
+    return (pathname) => allowed.has(pathname);
+  }
+  return (pathname) => {
+    const segments = pathname.split("/").filter(Boolean);
+    if (segments.length === 0 || segments[0] === "server") {
+      return false;
+    }
+    if (segments.some((segment) => segment.startsWith("."))) {
+      return false;
+    }
+    return segments[segments.length - 1].includes(".");
+  };
+}
+
+const PUBLIC_FILES_METADATA = ".neutron-public-files.json";
+
 function tryReadStaticHtml(distDir: string, pathname: string): string | null {
   if (!normalizePathname(pathname)) return null;
   const candidate = path.join(distDir, pathname.slice(1), "index.html");
@@ -1778,6 +2448,13 @@ function tryReadStaticHtml(distDir: string, pathname: string): string | null {
     return fs.readFileSync(resolved, "utf-8");
   } catch { return null; }
 }
+
+/**
+ * Deps that must stay EXTERNAL under the react-compat blanket
+ * `noExternal: true` — see {@link RUNTIME_RUNNER_CJS_EXTERNALS} in
+ * config.ts (single source; dev composes the same list).
+ */
+const RUNNER_CJS_EXTERNALS: readonly string[] = RUNTIME_RUNNER_CJS_EXTERNALS;
 
 async function createSsrServer(
   rootDir: string,
@@ -1795,6 +2472,13 @@ async function createSsrServer(
     const userConfig = loadedConfig?.config || {};
     const runtimeAliases = resolveRuntimeAliases(runtime);
     const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
+    // One physical Preact graph for the SSR runner, app copy first: the
+    // aliases make preact-render-to-string (and its /stream subpath — a bare
+    // root alias would prefix-match it onto a non-file) resolvable even when
+    // the app declares only `preact`, and pin react-family ids onto absolute
+    // preact/compat files for react-compat. Same composition dev/build use.
+    const preactSsr = resolvePreactSsr(rootDir);
+    const preactAliases = vitePreactAliases(preactSsr, runtimeAliases);
     const viteServer = await vite.createServer(
       vite.mergeConfig(userConfig, {
         root: rootDir,
@@ -1802,10 +2486,28 @@ async function createSsrServer(
         // an ancestor's node_modules/.vite directory. Different roots can
         // then clear one another's optimizer cache during concurrent startup.
         cacheDir: userConfig.cacheDir ?? path.join(rootDir, ".neutron", "vite-ssr"),
-        plugins: [neutronPlugin({ routesDir })],
-        ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
-        ...(runtimeNoExternal.length > 0
-          ? { ssr: { noExternal: runtimeNoExternal } }
+        plugins: [neutronPlugin({ routesDir }), neutronPublicEnvPlugin()],
+        resolve: { alias: preactAliases },
+        // react-compat: process the whole APP dependency graph (see
+        // resolveRuntimeNoExternal) — externalized deps natively resolve
+        // REAL React next to preact-render-to-string and crash at render.
+        // @neutron-build/core is no longer the exception it once was: core
+        // now runs IN the SSR graph with only its CJS-only deps (see
+        // RUNNER_CJS_EXTERNALS) kept native. Two reasons, same root cause —
+        // one Preact `options` object for the whole request render:
+        //   1. core's hooks (useLocation, useLoaderData, …) must come from
+        //      the app's graph, or they crash/see defaults under the
+        //      app-graph renderer (react hooks crash the other way around).
+        //   2. the renderer itself is loaded through the same graph below.
+        // `ssr.external` in vite.config.ts still opts individual deps back
+        // out (Vite checks external before noExternal).
+        ...(runtimeNoExternal === true
+          ? {
+              ssr: {
+                noExternal: true,
+                external: [...RUNNER_CJS_EXTERNALS],
+              },
+            }
           : {}),
         server: {
           middlewareMode: true,
@@ -1822,8 +2524,21 @@ async function createSsrServer(
       })
     );
 
+    const ssrLoadModule = (id: string) => viteServer.ssrLoadModule(id);
+    // Resolve the renderer THROUGH the runner, exactly the way route modules
+    // are loaded: same graph, same Preact instance. Under react-compat the
+    // preact family is runner-evaluated (blanket noExternal), so the renderer
+    // must be too; under preact the same legs return the externalized native
+    // modules the routes already share. A native fallback would bind a
+    // second options object and crash hooks with "reading '__H'" — the
+    // A-011 / Gap 5 split-graph bug class.
+    const renderer = await loadRunnerRenderer(ssrLoadModule);
+
     return {
-      ssrLoadModule: (id: string) => viteServer.ssrLoadModule(id),
+      ssrLoadModule,
+      renderer,
+      handleIslandRequest: await loadGraphIslandHandler(ssrLoadModule),
+      source: "vite",
       close: () => viteServer.close(),
     };
   } catch (error) {
@@ -1835,9 +2550,121 @@ async function createSsrServer(
   }
 }
 
+/**
+ * SSR runtime backed by the dist's prebuilt server bundle. Module ids are the
+ * ones the Vite runtime receives — absolute source paths for route modules
+ * and global middleware, bare ids for the renderer — so everything above it
+ * (loadRouteModule, loadGlobalMiddleware, loadRunnerRenderer) is shared.
+ */
+async function createBundledSsrServer(
+  rootDir: string,
+  bundle: LoadedServerBundle
+): Promise<SsrServer> {
+  const ssrLoadModule = async (id: string): Promise<unknown> => {
+    if (Object.prototype.hasOwnProperty.call(bundle.renderer, id)) {
+      return bundle.renderer[id];
+    }
+    const load = bundle.modules[serverBundleKey(rootDir, id)];
+    if (!load) {
+      throw new Error(
+        `${path.relative(rootDir, id) || id} is not in the server bundle ` +
+          `${path.relative(rootDir, bundle.entryPath)}; rebuild with \`neutron-ts build\`.`
+      );
+    }
+    return load();
+  };
+  return {
+    ssrLoadModule,
+    renderer: await loadRunnerRenderer(ssrLoadModule),
+    handleIslandRequest: await loadGraphIslandHandler(ssrLoadModule),
+    source: "server-bundle",
+    close: async () => {},
+  };
+}
 
+async function loadGraphIslandHandler(
+  ssrLoadModule: (id: string) => Promise<unknown>
+): Promise<typeof handleIslandRequest | undefined> {
+  try {
+    const core = (await ssrLoadModule("@neutron-build/core")) as {
+      handleIslandRequest?: typeof handleIslandRequest;
+    };
+    return typeof core.handleIslandRequest === "function" ? core.handleIslandRequest : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
+/**
+ * Renderer pair from the Vite SSR graph: the same modules route components
+ * import, evaluated by the same runner. Includes the router provider mount
+ * (`withRouterProviders`) so providers and their consumers are created from
+ * one module instance — a Provider/consumer pair from two instances silently
+ * returns the context DEFAULT (A-011's wrong-branch failure mode).
+ */
+async function loadRunnerRenderer(
+  ssrLoadModule: (id: string) => Promise<unknown>
+): Promise<RouteRenderer> {
+  const preact = (await ssrLoadModule("preact")) as {
+    h?: RouteRenderer["h"];
+  };
+  const rts = (await ssrLoadModule("preact-render-to-string")) as {
+    renderToString?: RouteRenderer["renderToString"];
+    default?: { renderToString?: RouteRenderer["renderToString"] };
+  };
+  const renderToString = rts.renderToString ?? rts.default?.renderToString;
+  if (!preact.h || !renderToString) {
+    throw new Error(
+      "[Neutron] preact / preact-render-to-string not resolvable through the SSR graph. " +
+        "Ensure the start server applies resolvePreactSsr aliases."
+    );
+  }
 
+  // Streaming renderer — optional: an older preact-render-to-string without
+  // the subpath falls back to buffered rendering.
+  let renderToReadableStream: RouteRenderer["renderToReadableStream"];
+  try {
+    const streamModule = (await ssrLoadModule("preact-render-to-string/stream")) as {
+      renderToReadableStream?: RouteRenderer["renderToReadableStream"];
+      default?: { renderToReadableStream?: RouteRenderer["renderToReadableStream"] };
+    };
+    renderToReadableStream =
+      streamModule.renderToReadableStream ??
+      streamModule.default?.renderToReadableStream;
+  } catch {
+    renderToReadableStream = undefined;
+  }
+
+  // Provider mount from the app's graph (contexts match consumers by module
+  // instance, not by shape). Loaded via the ROOT package id: import-only
+  // subpaths in package "exports" fail the runner's external resolution
+  // (require conditions), and the root id loads in every runtime shape —
+  // native/external under preact, in-graph under react-compat.
+  let providers: RouteRenderer["withRouterProviders"];
+  try {
+    const client = (await ssrLoadModule("@neutron-build/core")) as {
+      withRouterProviders?: RouteRenderer["withRouterProviders"];
+    };
+    providers = client.withRouterProviders;
+  } catch {
+    providers = undefined;
+  }
+  if (!providers) {
+    console.warn(
+      "[Neutron] withRouterProviders not resolvable through the SSR graph; " +
+        "falling back to core's own provider mount. Context hooks " +
+        "(useLocation, useLoaderData, …) may read default values when core " +
+        "and the app do not share one module graph."
+    );
+  }
+
+  return {
+    h: preact.h,
+    renderToString,
+    renderToReadableStream,
+    ...(providers ? { withRouterProviders: providers } : {}),
+  };
+}
 
 
 
@@ -1894,6 +2721,27 @@ function getClientEntryScriptSrc(distDir: string): string | null {
   return match?.[1] || null;
 }
 
+function loadServerActionsManifest(distDir: string): ServerActionsManifest | null {
+  const file = path.join(distDir, SERVER_ACTIONS_MANIFEST);
+  if (!fs.existsSync(file)) return null;
+  const manifest = parseServerActionsManifest(fs.readFileSync(file, "utf-8"));
+  if (!manifest) {
+    throw new Error(
+      `${SERVER_ACTIONS_MANIFEST} in ${distDir} is unreadable or from another Neutron version; ` +
+        "rebuild with `neutron-ts build`."
+    );
+  }
+  return Object.keys(manifest.actions).length > 0 ? manifest : null;
+}
+
+function loadRouteCssManifest(distDir: string): RouteCssManifest | null {
+  try {
+    return parseRouteCssManifest(fs.readFileSync(path.join(distDir, ROUTE_CSS_MANIFEST), "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
 function getClientStylesheetHrefs(distDir: string): string[] {
   const assetsDir = path.join(distDir, "assets");
   if (!fs.existsSync(assetsDir)) {
@@ -1918,6 +2766,29 @@ function createRequestId(): string {
   return `req-${Date.now()}-${requestCounter}`;
 }
 
+/**
+ * The SSR catch-all's default 404 — what an unmatched path gets when the app
+ * ships no `not-found.tsx` (or that page failed to render). Content-negotiated:
+ *
+ * - HTML-preferring clients (`Accept: text/html`, i.e. browsers) get the same
+ *   minimal HTML shell `notFound()` has always served — a human-facing SSR app
+ *   answering "Not Found" as bare text/plain is not a page.
+ * - Everything else — JSON clients (`X-Neutron-Data`, `Accept:
+ *   application/json`), no preference at all, a wildcard-only Accept — gets
+ *   the RFC 7807 problem document in the exact shape api mode serves, so
+ *   machines see the contract error and the client router never receives
+ *   HTML it must parse.
+ *
+ * A user `not-found.tsx` still wins for every client: this runs only when
+ * there is nothing of the app's to render. FRAMEWORK_CONTRACT.md §2.
+ */
+function defaultNotFoundResponse(request: Request, pathname: string): Response {
+  if (!isJsonRequest(request) && acceptsHtml(request)) {
+    return notFound();
+  }
+  return notFoundError(`No route matches ${pathname}`).toResponse(pathname);
+}
+
 
 
 export async function startServer(
@@ -1927,8 +2798,17 @@ export async function startServer(
   const { url, close } = running;
 
   console.log(`\n  Neutron production server running:\n`);
-  console.log(`  Local:   ${url}\n`);
-  console.log(`  Press Ctrl+C to stop\n`);
+  console.log(`  Local:   ${url}`);
+  if (running.moduleSource) {
+    console.log(
+      `  Modules: ${
+        running.moduleSource === "server-bundle"
+          ? "prebuilt server bundle"
+          : "transformed through Vite (no current server bundle in dist)"
+      }`
+    );
+  }
+  console.log(`\n  Press Ctrl+C to stop\n`);
 
   // Graceful shutdown with a bounded drain (FRAMEWORK_CONTRACT.md §8: 30s).
   onShutdownSignal(close);

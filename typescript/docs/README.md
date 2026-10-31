@@ -47,6 +47,7 @@ These pages are currently TypeScript-focused and should be migrated into `typesc
 - `neutron-data.md`
 - `react-compat.md`
 - `release.md`
+- `server-actions.md`
 - `view-transitions.md`
 
 ## Audit Snapshots

@@ -69,7 +69,12 @@ export async function worker(): Promise<void> {
       configFile: false,
       root: cwd,
       ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
-      ...(runtimeNoExternal.length > 0 ? { ssr: { noExternal: runtimeNoExternal } } : {}),
+      // react-compat: blanket processing — see resolveRuntimeNoExternal.
+      ...(runtimeNoExternal === true
+        ? { ssr: { noExternal: true } }
+        : runtimeNoExternal.length > 0
+          ? { ssr: { noExternal: runtimeNoExternal } }
+          : {}),
       server: {
         middlewareMode: true,
         hmr: false,

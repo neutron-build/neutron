@@ -1,6 +1,6 @@
 # Neutron Server Modes — Design & Implementation
 
-**Status:** Implemented (Phase 1 + Phase 2 shipped together)
+**Status:** Implemented (Phase 1 + Phase 2 shipped together; W9 added in-process API routes — see §14)
 **Scope:** Extends `createServer` in `typescript/packages/neutron/src/server/index.ts` to support non-SSR backend patterns (JSON APIs, raw Hono backends) and an orthogonal WebSocket transport.
 **Supersedes:** The original 4-mode proposal (`ssr | api | realtime | raw`). See §13 for why the design changed during review.
 
@@ -31,15 +31,18 @@ mode?: "ssr" | "api" | "raw"   // default "ssr"
 | Mode | Route discovery + Vite SSR | Asset / image / island routes | HTML catch-all | 404 behavior |
 |------|---------------------------|-------------------------------|----------------|--------------|
 | `"ssr"` (default) | yes | yes | yes (renders HTML) | SSR/static pipeline |
-| `"api"` | **no** | **no** | **no** | `app.notFound` → clean JSON `{ error, path }` |
+| `"api"` | **no** | **no** | **no** | `app.notFound` → RFC 7807 `application/problem+json` (`{type,title,status,detail,instance}`) |
 | `"raw"` | **no** | **no** | **no** | Hono default (`404 Not Found`) |
 
-All three modes keep the **shared batteries**: the request-id middleware (FRAMEWORK_CONTRACT §5), `GET /health`, opt-in trusted-host / CORS / security headers, and opt-out compression. `api` and `raw` differ only in the 404 shape — `api` is the "batteries-included JSON backend," `raw` is "bare Hono, you own everything."
+All three modes keep the **shared batteries**: the request-id middleware (FRAMEWORK_CONTRACT §5), `GET /health`, default-on security headers (`securityHeaders: false` or a custom `headers` map to opt out), opt-in `trustedHosts`, **opt-in CORS** — with no `cors` config a server sends no `Access-Control-*` headers in any mode; pass `cors: { origin: ["https://app.example.com"], credentials: true }` to enable an allowlist — and opt-out compression. `api` and `raw` differ only in the 404 shape — `api` is the "batteries-included JSON backend," `raw` is "bare Hono, you own everything."
+
+Since W9, every mode also accepts a **`mount`** map (§14) and, in `ssr` mode, the route table can carry **resource routes** — route modules exported as `GET`/`POST`/… handlers, served as endpoints next to the HTML routes. An SSR app no longer needs a second, `api`-mode process to have an API.
 
 ### Axis 2 — `websocket` (transport)
 
 ```ts
-websocket?: boolean | { path?: string }   // default off
+websocket?: boolean | { path?: string; authorize?: (request) => boolean | Promise<boolean> }
+// default off; authorize is a fail-closed pre-upgrade check bounded at 5s (TS-28)
 ```
 
 Orthogonal to `mode`. Setting it attaches a WebSocket server to the returned HTTP server; the returned object gains a `wss`. Because it's a separate axis, **every combination is expressible**:
@@ -96,6 +99,8 @@ if (websocket) {
 
 `ws` is added as a direct dependency (`^8.18.0`) with `@types/ws` as a dev dependency. `ws@8.21.0` was already present transitively, so the install footprint is effectively types-only.
 
+**Body cap (TS-22), same layer:** `createServer({ maxRequestBodyBytes })` wraps every body-bearing request at the adapter so reading past the cap fails the read with a 413 — covering chunked bodies and lying `Content-Length`s. The input-limits middleware's declared-length check stays the early rejection; this is the actual-byte half.
+
 **Known boundary (by design):** WS upgrades are handled on the HTTP server's `upgrade` event, *not* through `app.fetch`, so they bypass the Hono middleware stack — request-id, CORS, security headers, and `trustedHosts` do not apply to the handshake. This matches how bare `ws` behaves. Origin/auth checking for sockets is the caller's job inside `wss.on("connection", (ws, req) => ...)` (inspect `req.headers.origin`). Left deliberately un-opinionated rather than bolting on a partial origin allowlist.
 
 ## 5. Corrections to the original plan (verified against code)
@@ -108,6 +113,8 @@ if (websocket) {
 | `api` mode 404 via `app.all("*")` | An `"*"` route **shadows** routes the caller mounts later on the returned `app` | Use `app.notFound()`, which fires only when nothing matched |
 | `api` mode runs route discovery | Unnecessary once route-rules are skipped for non-ssr (Open Q #2) | `api` skips discovery, SSR runtime, and asset routes entirely |
 | 4-mode enum | Cannot express SSR+WS | Split into `mode` × `websocket` (§2) |
+
+The plan text also drifted *below* the shipped code in three places, corrected here in the W9 pass (Gap 4): the `api`-mode 404 was documented as `{ error, path }` JSON but has always shipped as RFC 7807 `application/problem+json` (asserted by `server-modes.test.ts`); `websocket.authorize` (TS-28) and `maxRequestBodyBytes` (TS-22) existed only in code and are now stated in §2 and §4. A fourth option joined them: `mount` (§14).
 
 ## 6. What shipped
 
@@ -132,8 +139,8 @@ All edits in `typescript/packages/neutron/`:
 |---|---|---|
 | Teploy dashboard | `{}` | Marketing + admin UI (SSR sweet spot) |
 | Teploy deploy service | `{ mode: "raw", websocket: true }` | Live deploy-log / build-status relay |
-| Fylun web app | `{}` | Chat/dashboard SSR UI |
-| Fylun AI backend | `{ mode: "api", websocket: true }` | JSON API + LLM/chat streaming |
+| Fylun web app + API (post-W9) | `{ websocket: true, mount: { "/api/trpc": trpcApp } }` | **One server**: SSR UI + tRPC mount + a few resource routes for REST/SSE |
+| Fylun, split shape (pre-W9) | web `{}`, API `{ mode: "api", websocket: true }` | Two processes — still expressible, no longer required |
 | Akiroo SaaS frontends | `{}` | Per-module SSR UIs |
 | Akiroo agent/stream backends | `{ mode: "raw", websocket: true }` | Agent streaming, transcription |
 | Omni Analyst terminal | `{}` | Bloomberg-style dashboard |
@@ -204,4 +211,39 @@ One entry point, one return type, one middleware stack, differences explicit in 
 
 ---
 
-*Implemented and verified: tsc clean, 236/236 tests green.*
+## 14. W9 addendum — in-process API routes (`mount` + resource routes)
+
+Gap 1 (the two-process shape forced on any SSR app with an API) closed two ways, in the order the gap analysis recommended:
+
+### Option B — `mount` config (shipped first)
+
+```ts
+const { app, server } = await createServer({
+  websocket: true,
+  mount: { "/api/trpc": trpcApp },   // any Hono instance, any mode
+});
+```
+
+Each sub-app is registered with `app.route(prefix, subApp)` **after the framework batteries** (`/health`, `/openapi.json`, image/island/static routes) and **before the HTML catch-all** — the exact placement that kills the §5 shadowing class in both directions: the catch-all cannot swallow the mount, and the mount cannot shadow the batteries (which are additionally protected by prefix validation). A request under the prefix that the sub-app does not match falls through to the route table: mounting registers routes under a prefix, it does not claim the namespace.
+
+Startup validation refuses (each with its own message): prefixes that duplicate or nest another mount's; prefixes covering reserved framework paths (`/health`, `/openapi.json`, `/docs`, `/_neutron/image`, `/__neutron_island`, `/assets`, `/public` — the ssr-static ones only in ssr mode); the site root (pointer to `mode: "raw"`); trailing slashes; `*`/`:` segments; and non-Hono values. Tests: `src/server/mount.test.ts` (16).
+
+### Option A — resource routes convention
+
+A route module exporting HTTP method handlers (`GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS`/`HEAD`) and **no** default component is served as an endpoint through `discoverRoutes`:
+
+- dispatched **pre-catch-all** (and pre-static-fast-path) in `server/index.ts`, and identically in the dev middleware via the shared `dispatchResourceHandler` (`core/resource-routes.ts`);
+- middleware contract intact: global → layouts → route middleware wrap every request (the `renderAppRoute` order, so a parent-layout auth gate covers endpoints in its subtree); loaders never run;
+- `405` is RFC 7807 problem+json with `Allow` (A-024/TS-27 precedent); `HEAD` falls back to `GET` (RFC 9110 §9.3.2); non-`Response` returns serialize as JSON; a `ProblemError`/thrown `Response` answers as itself; anything else becomes a 500 problem;
+- a module with **both** a default component and method handlers is a discovery error — the page pipeline would never dispatch the handlers, and the split-the-file message says so;
+- **never prerendered**: `render-static` and the CLI build skip resource routes (including ones with a stray `loader`), and the A-020 gated-static refusal exempts them — no prebuilt file exists to serve before the gate, so a gated resource route is legal and the gate runs per request;
+- handler code never ships to the browser: method handlers were already stripped from client route modules (`stripServerOnlyRouteModule`), and resource routes are now excluded from the client route table (`generateRoutesModule`) so no chunk is emitted at all;
+- mutating endpoint requests advance the cache-invalidation epoch and evict the path around the handler (TS-07 fence, both windows).
+
+Tests: `core/resource-routes.test.ts` (21 unit), discovery facts + both-exports error in `manifest.test.ts`, gated/never-baked in `static-middleware-bypass.test.ts`, client-table exclusion in `vite/resource-route-table.test.ts`, 9 e2e through `createServer` (`server/resource-routes.e2e.test.ts`), 2 dev-parity tests in `vite/dev-contract.dev.test.ts`.
+
+Known boundary, recorded honestly: endpoint mutations invalidate the **path** caches like page actions do, but a mounted sub-app's mutations (Option B) invalidate nothing — sub-apps are outside the cache pipeline by design, same as any `api`-mode process would be. OpenAPI generation does not yet document resource-route handlers (it reads `hasLoader`/`hasAction` only). And a dev-server quirk predates this work: resource routes with extension-bearing paths (`rss.xml.ts`) are caught by the dev middleware's static-asset bypass before the router — loader-based resource routes have the same dev behavior today.
+
+---
+
+*Phases 1+2 implemented and verified: tsc clean, 236/236 tests green at the time. W9 (§14) on top: tsc clean, 647 passed / 1 skipped in `packages/neutron`, 138/138 in `packages/neutron-cli`.*

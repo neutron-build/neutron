@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { createServer, loadConfigFromFile, mergeConfig } from "vite";
 import {
   neutronPlugin,
+  neutronPublicEnvPlugin,
 } from "@neutron-build/core/vite";
 import { runtimeOxc, stripCliOwnedPlugins } from "../lib/vite-shared.js";
 import {
@@ -14,6 +15,7 @@ import {
   resolveRuntimeNoExternal,
   resolvePreactSsr,
   vitePreactAliases,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
 } from "@neutron-build/core";
 import { onShutdownSignal } from "@neutron-build/core/server";
 import { loadNeutronConfig } from "../lib/config.js";
@@ -97,7 +99,11 @@ export async function dev(): Promise<void> {
           routeRules: neutronConfig.routes,
           version: neutronConfig.server?.version,
           openapi: neutronConfig.server?.openapi,
+          securityHeaders: neutronConfig.server?.securityHeaders,
+          serverActions: neutronConfig.server?.serverActions,
+          client: neutronConfig.client,
         }),
+        neutronPublicEnvPlugin(neutronConfig.env),
       ],
       resolve: {
         // Absolute aliases so preact-render-to-string is resolvable even when
@@ -115,7 +121,19 @@ export async function dev(): Promise<void> {
       ssr: {
         // @neutron-build/core shares the SSR graph's preact too, so its inline
         // hook components (e.g. Link) don't crash dev SSR with "reading '__H'".
-        noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+        // react-compat processes EVERYTHING else (`true`): an externalized
+        // dep natively imports real React next to preact and crashes at
+        // render (resolveRuntimeNoExternal documents the tradeoff + the
+        // ssr.external out). core stays IN the graph there too — the same
+        // shape the start server composes — with only its CJS-only deps
+        // kept native (RUNTIME_RUNNER_CJS_EXTERNALS, single source in core's
+        // config.ts). That keeps core's context hooks (useLocation, …) on
+        // the app's Preact instance instead of a second native one.
+        noExternal:
+          runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
+        ...(runtimeNoExternal === true
+          ? { external: [...RUNTIME_RUNNER_CJS_EXTERNALS] }
+          : {}),
       },
       optimizeDeps: {
         // Force the client optimizer to pre-bundle the same absolute entries

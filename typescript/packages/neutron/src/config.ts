@@ -16,8 +16,21 @@ export interface NeutronRewriteRule {
 }
 
 export interface NeutronHeaderRule {
+  /**
+   * Path pattern: literal segments, `:param`, and one catch-all — `:name*`
+   * (zero or more segments, so `/builder/:path*` also matches `/builder`, as
+   * in Next) or `*` (one or more).
+   */
   source: string;
-  headers: Record<string, string>;
+  /**
+   * Headers for matching responses, on every response the server sends for
+   * the path (pages, static and resource routes, mounts). A header the
+   * response set itself wins. A value here overrides the `securityHeaders`
+   * default for these paths; `null` sends no such header here, suppressing
+   * a security default (e.g. `{ "X-Frame-Options": null }` on embeddable
+   * routes).
+   */
+  headers: Record<string, string | null>;
 }
 
 export interface NeutronRoutesConfig {
@@ -107,6 +120,35 @@ export interface NeutronMarkdownConfig {
   renderCacheSize?: number;
 }
 
+export interface NeutronEnvConfig {
+  /**
+   * Prefixes of environment variables that client code may read, as
+   * `import.meta.env.<PREFIX>X` or `process.env.<PREFIX>X` (the Next
+   * spelling). Their build-time values (`.env` files and the process
+   * environment) are inlined in client and server code. Variables without one
+   * of these prefixes are never exposed. Vite's own `VITE_` (or your
+   * `envPrefix`) keeps working for `import.meta.env`.
+   * @default ["PUBLIC_"]
+   * @example ["PUBLIC_", "NEXT_PUBLIC_"]
+   */
+  publicPrefixes?: string[];
+}
+
+/** Client router behaviour (`client` in neutron.config.ts). */
+export interface NeutronClientConfig {
+  /**
+   * After a client navigation has rendered, unlink route stylesheets the new
+   * route does not use. Default `false`, as Next's App Router: stylesheets
+   * loaded for earlier pages stay applied, so rules that conflict across
+   * pages (sections redefining the same `:root` tokens) resolve by load
+   * order. `true` gives each page the cascade of a fresh load, at the cost of
+   * re-requesting a sheet (normally from the HTTP cache) when you navigate
+   * back. The client entry's and layouts' stylesheets are in every route's
+   * list and stay; links added by `head()` are never touched.
+   */
+  unloadRouteStylesheets?: boolean;
+}
+
 export interface NeutronConfig {
   adapter?: NeutronAdapter;
   server?: Omit<NeutronServerOptions, "rootDir">;
@@ -121,6 +163,10 @@ export interface NeutronConfig {
    */
   inputLimits?: NeutronInputLimits;
   markdown?: NeutronMarkdownConfig;
+  /** Public environment variables for client code. */
+  env?: NeutronEnvConfig;
+  /** Client router behaviour. */
+  client?: NeutronClientConfig;
 }
 
 export function defineConfig(config: NeutronConfig): NeutronConfig {
@@ -150,19 +196,79 @@ export function resolveRuntimeAliases(
   };
 }
 
-export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] {
+/**
+ * SSR externals policy for a runtime.
+ *
+ * `preact` needs nothing: the SSR graph is already Preact.
+ *
+ * `react-compat` returns `true` — process EVERY node_modules dependency
+ * through Vite's SSR graph. Under react-compat, any dependency that
+ * imports `react`/`react-dom` must be transformed by Vite for the
+ * react → preact/compat alias to reach it; an externalized dependency
+ * resolves `react` natively and loads REAL React next to
+ * preact-render-to-string, which crashes at render time (observed with
+ * Radix: "Cannot read properties of null (reading 'useRef')"). Which
+ * packages import react cannot be predicted from names — Fylun's graph
+ * is dozens (Radix families, sonner, cmdk, …) and includes transitive
+ * deps the app never lists — so the correct default is all of them.
+ * The previous `react*`-only list covered only the direct alias targets.
+ *
+ * Tradeoff, stated honestly: `noExternal: true` makes the SSR runtime
+ * bundle inline the whole reachable dependency graph and makes dev SSR
+ * transform each dependency once (cached after that). That is the price
+ * of a correct React-ecosystem graph. Opt specific dependencies back
+ * out with `ssr.external: [...]` in vite.config.ts — Vite checks
+ * `ssr.external` before `noExternal`, so named externals stay external
+ * even under a blanket `noExternal: true` (mergeConfig collapses
+ * `noExternal` to `true` when either side is `true`, so `ssr.external`
+ * — not a narrower `noExternal` array — is the escape hatch).
+ */
+export function resolveRuntimeNoExternal(runtime: NeutronRuntime): string[] | true {
   if (runtime !== "react-compat") {
     return [];
   }
 
-  return [
-    "react",
-    "react-dom",
-    "react-dom/client",
-    "react-dom/server",
-    "react-dom/server.browser",
-  ];
+  return true;
 }
+
+/**
+ * Deps that stay EXTERNAL under a runtime's blanket `ssr.noExternal: true`
+ * because Vite's SSR module-runner cannot evaluate them: CommonJS-only (or
+ * CommonJS at their resolved entry), each dies with `require is not
+ * defined` / `exports is not defined` when the runner inlines it. They are
+ * the tops of the CJS subtrees in @neutron-build/core's import graph:
+ *
+ * - `@mdx-js/mdx` — content/mdx; covers the hast/micromark/acorn-jsx and
+ *   style-to-js chains beneath it
+ * - `gray-matter` — content frontmatter (js-yaml/kind-of ride along)
+ * - `yaml` — config/route-rules parsing
+ * - `@babel/parser` — route type generation
+ *
+ *
+ * And one ESM dependency for a different reason:
+ *
+ * - `magic-string` — the Vite plugin's source rewriting, reached through
+ *   core's root entry. Under `resolve.preserveSymlinks` with a pnpm-linked
+ *   core, the runner resolves it at core's LINKED path, where its own
+ *   dependency (`@jridgewell/sourcemap-codec`, a pnpm sibling) is invisible,
+ *   and evaluating core fails. The build's prerender then fell back to the
+ *   CLI's own router providers (a second instance). Native, Node resolves
+ *   it from the real path. It shares no module instance with app code.
+ *
+ * Keeping exactly these native lets CORE itself run in the SSR graph
+ * (dev and start compose this the same way), which is what unifies core's
+ * hooks (useLocation, useLoaderData, …) with the app's react-compat hooks
+ * on one Preact instance — see RouteRenderer in core/render-app-route.ts.
+ * A new CJS-only dependency fails loudly; the runner error names the
+ * module, and it gets added here.
+ */
+export const RUNTIME_RUNNER_CJS_EXTERNALS = [
+  "@mdx-js/mdx",
+  "gray-matter",
+  "yaml",
+  "@babel/parser",
+  "magic-string",
+] as const;
 
 /**
  * esbuild JSX settings for a runtime.

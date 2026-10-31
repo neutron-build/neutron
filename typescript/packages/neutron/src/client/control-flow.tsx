@@ -8,6 +8,7 @@
 
 import { h, ComponentChildren, Fragment } from 'preact';
 import { useMemo } from 'preact/hooks';
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 /**
  * Conditional rendering with type narrowing
@@ -26,7 +27,8 @@ export interface ShowProps<T> {
   children: (item: NonNullable<T>) => ComponentChildren;
 }
 
-export function Show<T>({ when, fallback, children }: ShowProps<T>) {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Show<T>({ when, fallback, children }: ShowProps<T>): AnyJsxElement | null {
   if (when) {
     return <>{children(when as NonNullable<T>)}</>;
   }
@@ -51,7 +53,8 @@ export interface ForProps<T> {
   children: (item: T, index: () => number) => ComponentChildren;
 }
 
-export function For<T>({ each, fallback, children }: ForProps<T>) {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function For<T>({ each, fallback, children }: ForProps<T>): AnyJsxElement | null {
   if (!each || each.length === 0) {
     return <>{fallback}</>;
   }
@@ -87,7 +90,8 @@ export interface SwitchProps {
   children: ComponentChildren;
 }
 
-export function Switch({ fallback, children }: SwitchProps) {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Switch({ fallback, children }: SwitchProps): AnyJsxElement | null {
   // Find first matching child
   const childArray = Array.isArray(children) ? children : [children];
 
@@ -118,7 +122,8 @@ export interface MatchProps {
   children: ComponentChildren;
 }
 
-export function Match({ when, children }: MatchProps) {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Match({ when, children }: MatchProps): AnyJsxElement | null {
   return when ? <>{children}</> : null;
 }
 
@@ -139,7 +144,8 @@ export interface IndexProps<T> {
   children: (item: () => T, index: number) => ComponentChildren;
 }
 
-export function Index<T>({ each, fallback, children }: IndexProps<T>) {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Index<T>({ each, fallback, children }: IndexProps<T>): AnyJsxElement | null {
   if (!each || each.length === 0) {
     return <>{fallback}</>;
   }

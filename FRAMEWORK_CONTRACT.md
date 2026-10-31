@@ -31,6 +31,15 @@ All frameworks MUST return errors as RFC 7807 Problem Details JSON:
 **Required fields**: `type`, `title`, `status`, `detail`
 **Optional fields**: `instance`, `errors` (for validation)
 
+For human-facing HTML (SSR/UI) routes, an HTML representation of an error or
+404 MAY be content-negotiated to clients that prefer HTML (`Accept:
+text/html`) when the framework itself produces it — an unmatched path with no
+application `not-found` page claiming it. Any client that prefers JSON, sends
+no preference, or asks for a data representation MUST receive the Problem
+Details document above — the JSON representation is never optional. An
+application-provided error/404 page answers with its own representation for
+every client.
+
 ### Standard Error Codes
 
 | HTTP Status | `type` suffix | `title` |
@@ -39,6 +48,7 @@ All frameworks MUST return errors as RFC 7807 Problem Details JSON:
 | 401 | `unauthorized` | Unauthorized |
 | 403 | `forbidden` | Forbidden |
 | 404 | `not-found` | Not Found |
+| 405 | `method-not-allowed` | Method Not Allowed |
 | 409 | `conflict` | Conflict |
 | 422 | `validation` | Validation Failed |
 | 429 | `rate-limited` | Rate Limited |

@@ -8,9 +8,19 @@
  * per-operation enrichment (request bodies, response schemas, summaries)
  * is merged in via the `paths`/`components` options on the server's `openapi`
  * setting, which override the generated operations key-by-key.
+ *
+ * Resource routes are documented from the same table: one operation per
+ * exported method handler (`route.resourceMethods`, derived at discovery —
+ * the generator cannot import the module). Bodies are generic object
+ * placeholders for the same untyped-handler reason.
  */
 import { escapeHtml } from "../core/escape.js";
 import type { Route } from "../core/types.js";
+import {
+  isResourceRoute,
+  RESOURCE_ROUTE_METHODS,
+  type ResourceRouteMethod,
+} from "../core/resource-routes.js";
 
 export interface NeutronOpenApiOptions {
   /** Spec `info.title`; also shown on the /docs page. */
@@ -76,9 +86,77 @@ export function routePathToOpenApiPath(routePath: string): string {
   return segments.join("/");
 }
 
+/** Methods whose handlers conventionally read a request body. */
+const METHODS_WITH_REQUEST_BODY = new Set<ResourceRouteMethod>(["POST", "PUT", "PATCH"]);
+
+/** Generic body placeholder — handlers are untyped at the route-table level. */
+function genericBodySchema(): Record<string, unknown> {
+  return { type: "object", additionalProperties: true };
+}
+
+/**
+ * Deterministic operation id from method + (template) path:
+ * `GET /api/users/:id` → `get-api-users-by-id`, `POST /rss.xml` →
+ * `post-rss-xml`. Param segments contribute `by-<name>`; anything the URL
+ * allows but an operation id shouldn't (dots, suffixes) collapses to `-`.
+ */
+export function resourceRouteOperationId(method: string, openApiPath: string): string {
+  const segments = openApiPath
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => {
+      const param = /^\{([^}]+)\}(.*)$/.exec(segment);
+      if (param) return `by-${param[1]}${param[2]}`;
+      return segment;
+    });
+  return [method.toLowerCase(), ...segments]
+    .join("-")
+    .replace(/[^a-zA-Z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+/**
+ * One operation for one exported method handler. Deliberately minimal and
+ * honest: the generator reads the route table (it cannot import the module),
+ * and TS handlers are untyped, so bodies are generic object placeholders —
+ * `summary`/`requestBody`/response schemas can be enriched per operation via
+ * the `paths` option, which replaces the generated operation key-by-key.
+ */
+function resourceRouteOperation(
+  route: Route,
+  method: ResourceRouteMethod,
+  parameters: Array<Record<string, unknown>>
+): Record<string, unknown> {
+  const operation: Record<string, unknown> = {
+    operationId: resourceRouteOperationId(method, routePathToOpenApiPath(route.path)),
+    summary: `${method} ${route.path} (resource route)`,
+    parameters,
+    responses: {
+      "200": {
+        description:
+          "The handler's response. Placeholder: a handler may return any Response; " +
+          "a non-Response return is serialized as JSON 200.",
+        content: { "application/json": { schema: genericBodySchema() } },
+      },
+      default: problemResponse(),
+    },
+  };
+  if (METHODS_WITH_REQUEST_BODY.has(method)) {
+    operation.requestBody = {
+      required: false,
+      content: { "application/json": { schema: genericBodySchema() } },
+    };
+  }
+  return operation;
+}
+
 /**
  * Build the spec. `routes` is the discovered table; only live app-mode routes
  * are documented — static pages are prerendered documents, not API surface.
+ * Resource routes are the exception to the mode filter: they are endpoints in
+ * every mode (never prerendered; the server dispatches them ahead of any
+ * static path), so a resource route is documented whatever its `config.mode`.
  */
 export function buildOpenApiSpec(
   routes: Route[],
@@ -88,15 +166,34 @@ export function buildOpenApiSpec(
 
   for (const route of routes) {
     if (route.isLayout || route.isNotFound) continue;
-    if (route.config.mode !== "app") continue;
 
-    const pathItem: Record<string, unknown> = {};
     const parameters = route.params.map((name) => ({
       name,
       in: "path",
       required: true,
       schema: { type: "string" },
     }));
+
+    if (isResourceRoute(route)) {
+      // One operation per exported method handler, from the route-table
+      // facts. No facts (`resourceMethods` absent) → no fabricated
+      // operations: an undocumented endpoint beats an invented one.
+      const methods = (route.resourceMethods ?? []).filter((method) =>
+        (RESOURCE_ROUTE_METHODS as readonly string[]).includes(method)
+      );
+      const pathItem: Record<string, unknown> = {};
+      for (const method of methods) {
+        pathItem[method.toLowerCase()] = resourceRouteOperation(route, method, parameters);
+      }
+      if (Object.keys(pathItem).length > 0) {
+        paths[routePathToOpenApiPath(route.path)] = pathItem;
+      }
+      continue;
+    }
+
+    if (route.config.mode !== "app") continue;
+
+    const pathItem: Record<string, unknown> = {};
 
     if (route.hasLoader) {
       pathItem.get = { parameters, responses: { default: problemResponse() } };

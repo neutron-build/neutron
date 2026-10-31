@@ -2,6 +2,711 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Breaking
+
+- **`:name*` in `routes` rules matches zero or more segments**, as in Next.
+  It required at least one, so a rule written `/builder/:path*` (the Next
+  spelling of "this section") silently skipped `/builder` itself, which is
+  the document that most needs a section's headers. `/docs/:path*` now also
+  matches `/docs`, and an empty catch-all drops its slash in a destination
+  (`/v2/docs/:path*` → `/v2/docs`). **Migration:** a redirect or rewrite
+  that must not fire on the bare prefix should spell its segments out
+  (`/docs/:first/:rest*`). Bare `*` still requires one segment.
+- **Global middleware runs before `mount` sub-apps.** `src/middleware.ts`
+  never ran for requests a mounted sub-app answered, so an auth gate there
+  silently did not cover mounted APIs (tRPC, REST) — FRAMEWORK_CONTRACT §5
+  places authentication before every route handler. In ssr mode the global
+  chain now runs ahead of each mount, outermost, with the real request; a
+  response it returns without calling `next()` (401, redirect, thrown
+  `Response`, `ProblemError`) answers instead of the sub-app, and a response
+  it substitutes after `next()` replaces the sub-app's. A mount path the
+  sub-app does not match falls through to the routes with the chain run once,
+  not twice. **Migration:** middleware that assumed it only saw page traffic
+  now sees mount traffic too. A sub-app that enforces its own authentication
+  can opt out per mount with the new object form:
+  `mount: { "/api/trpc": { app: trpcApp, globalMiddleware: false } }`
+  (`NeutronMount`). api/raw servers load no global middleware and are
+  unchanged.
+- **CORS is now opt-in.** `createServer` no longer enables CORS by default.
+  Previously, a server created with no `cors` option sent
+  `Access-Control-Allow-Origin: *` on every request that carried an `Origin`
+  header (plus `Vary: Origin` on every response and a 204 preflight
+  short-circuit), in all modes. A wildcard default is the wrong default for
+  credentialed apps — browsers refuse credentials against `*`, which masks the
+  misconfiguration until something switches to echo-mode. With no `cors`
+  option (or `cors: false`) a server in any mode — `ssr`, `api`, `raw` — now
+  sends no `Access-Control-*` headers and never short-circuits a preflight.
+  **Migration:** pass an explicit config to keep cross-origin access:
+  `createServer({ cors: { origin: ["https://app.example.com"], credentials: true } })`.
+  An allowlist echoes the allowed origin exactly; `credentials: true` with
+  `"*"` is refused at startup. `cors: {}` restores allow-all behavior
+  (`origin: "*"`, no credentials) if the old default is genuinely what you
+  want. Security headers stay on by default (`securityHeaders: false` to opt
+  out) and are unchanged by this flip.
+
+### Added
+
+- **`client.unloadRouteStylesheets`: route stylesheets no longer needed are
+  unlinked after client navigation (opt-in, F-B5-1).** Client navigation kept
+  every earlier route's stylesheets in the document, as Next's App Router
+  does, so pages whose sheets redefine the same tokens (Fylun's per-section
+  Tailwind entries on `:root`) showed the cascade of whichever loaded last:
+  after `/files` → `/studio` → `/files` the studio tokens won. With
+  `client: { unloadRouteStylesheets: true }` in `neutron.config.ts`, the
+  router unlinks, in the frame after the new page has rendered (its own
+  sheets were loaded before it rendered, so nothing flashes), the route
+  stylesheets the new route's list does not name. Only links Neutron created
+  for routes are candidates — SSR'd route links now carry `data-neutron-css`
+  in `start`, dev and prerendered pages — so the client entry's and layouts'
+  stylesheets (in every route's list) and `head()` links stay. The default is
+  unchanged; the trade-off is a re-request (normally from the HTTP cache)
+  when navigating back. `configureRouter()` is exported from
+  `@neutron-build/core/client`; the option is applied by the generated
+  `virtual:neutron/routes` module.
+- **The vercel/netlify/cloudflare/docker runtime matches `start` on security
+  headers and serves `src/server.entry.ts` mounts.** The generated handler
+  sent 3 of `start`'s 5 security defaults (no `Cross-Origin-Opener-Policy`,
+  no `Cross-Origin-Resource-Policy`), ignored `server.securityHeaders`
+  (custom headers and `false`), and served no mounts, so a tRPC/REST API
+  declared in the server entry 404ed on every edge deploy. It now applies
+  `routes.headers` and then the configured defaults with core's own
+  functions (the order, overrides and `null` suppression of `start`), on
+  every response it answers, and dispatches the entry's mounts with the
+  global middleware ahead of them (per-mount opt-out honoured, unmatched
+  paths falling through to the routes with the chain run once). What it
+  cannot serve fails the build: a server entry `websocket` on any of these
+  presets, and mounts (or server actions) in an app with no app route, for
+  which no runtime is built; `--preset static` fails on a server entry.
+- **Server Actions: `"use server"` modules.** Client code that imported a
+  `"use server"` module bundled the module whole into the browser build (the
+  Fylun port found Prisma, pg, sharp and Better-Auth in it, F-P3-4, and
+  bridged it with its own endpoint). Such a module now compiles, in the client
+  graph, to one stub per export that POSTs to `/_neutron/action` under an id
+  fixed at build time (a hash of module path and export name). The server
+  registers only the modules client code reached — `neutron-ts build` writes
+  them to `dist/.neutron-server-actions.json`, `neutron-ts dev` registers what
+  Vite transforms for the browser — and answers any other id `404`. Every
+  export must be an async function the build can see is one; anything else
+  (values, sync functions, re-exports, call results) and inline `"use server"`
+  functions are build errors naming the file and line. Requests pass a
+  same-origin check (`Sec-Fetch-Site`, else `Origin` against `Host`; `403`),
+  a body cap (`server.serverActions.bodySizeLimit`, 1 MiB; `413`), and the
+  app's global middleware, which can gate them and fills the `context` the
+  action reads through the new `getActionContext()` (with `request` and
+  mutable `responseHeaders`: `Set-Cookie`, `x-neutron-invalidate`, which
+  evicts the server caches and revalidates the page on screen). Arguments and
+  results use the loader-data serializer; `FormData` and `Blob`/`File`
+  arguments go multipart. Errors follow the RFC 7807 contract: a
+  `ProblemError` answers with its status (the client rejects with a
+  `ServerActionError`), a `Response` answers as itself, anything else is a
+  generic `500` reported to `hooks.onError` (`source: "action"`). A redirect
+  is signalled as `X-Neutron-Redirect` and the client navigates. Served by
+  `dev`, `start` (server bundle and Vite fallback), the docker image and the
+  vercel/netlify/cloudflare runtime; `--preset static`, or an edge preset
+  without an app route, fails the build instead of shipping dead stubs. A
+  server-side import of the module is the real module. Under react-compat,
+  `<form action={fn}>` now calls `fn(formData)` on submit (React 19, client
+  side). The Cloudflare worker no longer sends non-GET requests to the asset
+  binding first. See `docs/server-actions.md`.
+- **`env.publicPrefixes`: public environment variables for client code,
+  including Next's `process.env.NEXT_PUBLIC_*`.** Client builds turned
+  `process.env` into `{}` and exposed only Vite's `import.meta.env.VITE_*`,
+  so every `process.env.NEXT_PUBLIC_*` read in a Next app's browser code was
+  empty in a build and threw `process is not defined` in dev (the Fylun port
+  shimmed it). `neutron.config.ts` `env: { publicPrefixes: ["PUBLIC_",
+  "NEXT_PUBLIC_"] }` (default `["PUBLIC_"]`) makes those prefixes public: they
+  join Vite's `envPrefix` (`import.meta.env.<PREFIX>X`), and
+  `process.env.<PREFIX>X` is replaced with its build-time value from `.env`
+  files or the process environment in client and server code, in builds and
+  in dev. An unset one reads `undefined` in client code and stays a runtime
+  read on the server. Dev client code also gets the rest of a client build's
+  replacement (`process.env` is `{}`, `NODE_ENV` inlined), so it reads what
+  the build reads instead of throwing `process is not defined`. Variables
+  without a public prefix are never inlined, and an empty prefix is refused. `PUBLIC_` was already documented as public
+  but nothing set it, so `PUBLIC_*` variables now reach client code as the
+  docs said. `neutronPublicEnvPlugin` is exported from
+  `@neutron-build/core/vite` for custom Vite setups.
+- **`src/server.entry.ts`: mounts and WebSocket handlers in the routes'
+  module graph.** A custom server had to build its tRPC/REST mounts and its
+  WebSocket handler before `createServer`, outside the graph the routes run
+  in. Under `neutron-ts start` the routes come from the prebuilt server
+  bundle, so every module a mount and a route both imported was loaded twice:
+  two Prisma clients, two auth instances, split singletons. The Fylun port
+  worked around it with `globalThis` bridges. An app now declares them in
+  `src/server.entry.ts` (`export default defineServerEntry({ mount,
+  websocket: { path, authorize, attach }, close })`, or a function returning
+  that, async allowed). Neutron loads the file wherever it loads routes. It
+  is compiled into the `start` server bundle (`neutron-ts build` includes it
+  and `createServer` requires it there), loaded through the Vite runtime when
+  there is no bundle, and loaded through Vite in `neutron-ts dev`, which now
+  serves the entry's mounts (global middleware first, unmatched paths falling
+  through, as in production) and its WebSocket upgrades, and reloads the
+  entry on edit. Entry mounts merge with `createServer({ mount })` (a prefix
+  declared in both is a startup error). `websocket` enables the transport and
+  `attach` receives the `WebSocketServer`, and `close` runs on shutdown after
+  the drain. A present file that fails to load or exports nothing usable is a
+  startup error, like `src/middleware.ts`. The name is not `src/server.ts`:
+  that is where apps keep a custom server that calls `createServer`, which
+  must not import itself. `createServer({ mount })` is unchanged. The
+  vercel/netlify/cloudflare/docker runtime serves the entry's mounts (see
+  the adapter-runtime entry below); its `websocket` needs `start`.
+- **Security headers can be scoped per route.** `securityHeaders` was one
+  site-wide set, so an app that needs cross-origin isolation on one section
+  (Fylun: COOP/COEP on `/builder/**` for WebContainer, and no COEP anywhere
+  else, since COEP breaks third-party embeds) had to hand-roll a global
+  middleware. `routes.headers` rules are now the per-route override, with no
+  parallel mechanism. A rule's value is set before the defaults fill in, so
+  it overrides them on its paths, and a rule's `null` keeps that header off
+  its paths (`{ "X-Frame-Options": null }` on embeddable routes; the
+  generated edge handler honours it for its defaults too). For that to hold
+  everywhere, two gaps closed. Rule headers were applied only inside the
+  page pipeline, and they now reach every response for the path: mounted
+  sub-apps, assets and the built-in endpoints as well as app, static and
+  resource routes. The dev server never sent security headers at all, and it
+  now sends the same ones as `start`, taking `server.securityHeaders` from
+  `neutron.config.ts` (`false` still disables them; the dev server now sends
+  `X-Frame-Options: DENY` on its pages by default, like production).
+
+- **`defaultTitle` in the head API.** A page whose route chain sets no
+  `title` got one guessed from its URL path, templated if a layout set
+  `titleTemplate` — `forgot-password | Fylun`, `c - p3-slug | Fylun` — and
+  there was no way to name the site's own title once. `SeoMetaInput` now has
+  `defaultTitle`, Next's `title.default`: declared in a layout (typically
+  the root), it titles every page beneath that sets no `title`, rendered as
+  written (the template is not applied), and is inherited and overridable
+  like every other field. A page `title` still wins and takes the template.
+  The URL guess stays as the last resort when nothing in the chain declares
+  a title: HTML requires a `<title>`, and dropping the guess would leave every
+  app that never configured titles showing bare URLs in tabs and to screen
+  readers.
+- **React 19 `use()` under `runtime: "react-compat"`.** preact/compat
+  (10.29) has no `use`, so `import { use } from "react"` — how React 19 /
+  Next 15 pages read `params` and promises — failed with `use is not a
+  function`. Bare `react` now resolves to `@neutron-build/core/react-compat`:
+  preact/compat re-exported, plus `use` on the module and on the default
+  `React` object. A promise is tracked under React's thenable protocol
+  (`status`/`value`/`reason` on the promise): settled, it returns its value
+  or throws its reason; pending, it suspends to the nearest `<Suspense>`,
+  which re-renders when it settles — on the client and in streaming SSR,
+  where the resolved content streams into the document (non-streaming
+  `renderToString` cannot suspend). As in React, the promise must be the
+  same object across renders. A context is read with `useContext`, so —
+  unlike React — not conditionally. `react/*` subpaths and `react-dom` are
+  unchanged; `ViteAliasEntry.find` is now `string | RegExp` (the bare-`react`
+  entry is an exact match), and `mergePreactAliases`' flat map omits it.
+- **`<ServerIsland>` is usable from React-typed JSX — the component surface
+  is fully JSX-agnostic.** The last residual named by the control-flow work:
+  the server-side deferred-rendering island (exported from the package root,
+  `@neutron-build/core`) returned a preact `VNode`, so every usage from a
+  module typechecking against `@types/react` (`jsxImportSource: "react"`)
+  failed TS2786. Diagnosed with the same tsc-fixture method before designing:
+  it fails at the return position only — `id`, `fallback` and `children`
+  (React-authored elements) all flow through the untouched
+  `ServerIslandProps`. The fix is the repo precedent (Image/Picture, Await,
+  Island, the nav/form five, the control-flow five): the element return is
+  deliberately `any`, props stay fully typed, pinned by `@ts-expect-error`s
+  in both worlds (`type-fixtures/react-server-island/` on the react side,
+  the preact-JSX ServerIsland tests on the other). With it, a final sweep of
+  the public exports closed the campaign: every component exported from the
+  package root or `@neutron-build/core/client` is JSX-agnostic — the
+  remaining ones not covered by a dedicated fixture family (`Await`,
+  `Image`, `Picture`) are compiled from React-typed JSX by
+  `type-fixtures/react-export-sweep/`, and none fails.
+- **The control-flow components are usable from React-typed JSX.**
+  `<Show>`, `<For>`, `<Switch>`, `<Match>` and `<Index>` (exported from the
+  package root, `@neutron-build/core`) now have JSX-agnostic element returns,
+  completing the client component surface started by `Image`/`Picture`/
+  `Await`/`Island` and the navigation/form five: under
+  `runtime: "react-compat"`, apps typechecking against `@types/react`
+  (`jsxImportSource: "react"`) got TS2786 on every usage, because the
+  components return preact `VNode`s and React's `ReactNode` rejects that
+  shape. Diagnosed per component with tsc fixtures before designing: all
+  five fail at the return position only — the keyed render callbacks
+  (`(item) => …`, `(item, index) => …`, `(item: () => T, index) => …`),
+  `fallback` and `key` props needed no changes; React-authored elements and
+  callbacks flow through the untouched `ComponentChildren` prop types
+  unchanged. Props stay fully typed — mistyped props still fail under either
+  import source, pinned by `@ts-expect-error`s in both worlds:
+  `type-fixtures/react-control-flow/` (react side) and the preact-JSX
+  control-flow tests.
+- **The navigation/form components are usable from React-typed JSX.**
+  `<Form>`, `<Link>`, `<NavLink>`, `<ViewTransitions>` and `<ScrollReveal>`
+  now have JSX-agnostic element returns (the same treatment `Image`,
+  `Picture` and `Await` already ship, and `<Island>` received above):
+  under `runtime: "react-compat"`, apps typechecking against `@types/react`
+  (`jsxImportSource: "react"`) get TS2786 on every usage otherwise, because
+  a preact `FunctionalComponent` returns `ComponentChildren` (which includes
+  bare `object`) and React's `ReactNode` rejects that. Props stay fully
+  typed — a mistyped prop still fails against the same `FormProps`/
+  `LinkProps` under either import source, pinned in both worlds by
+  `type-fixtures/react-nav-form/` (react) and the preact-JSX component tests.
+- **`JsxChildren` / `AnyJsxElement` exported from `@neutron-build/core/client`**
+  (and the root entry): the structural element type both JSX runtimes
+  produce and accept back, for `children` props on components that must
+  compile under both import sources — preact's `ComponentChildren` fails
+  React's render position (TS2322: `object` is not a `ReactNode`) and a
+  preact-only install cannot import `ReactNode` at all. The scaffolded root
+  `_layout.tsx` uses it.
+- **`create-neutron --runtime react-compat` scaffolds with
+  `jsxImportSource: "react"`.** The tsconfig now derives its import source
+  from the runtime token — the same rule the CLI's Vite transform already
+  applies (`resolveRuntimeJsx`) — instead of disagreeing with it. All four
+  runtime templates also typecheck their string `style` attributes into the
+  object form React 19's types require, import hooks from `react` under
+  react-compat (`preact/hooks` otherwise), and ship a `typecheck` script
+  (`tsc --noEmit`). A create-neutron test compiles every runtime template's
+  scaffolded sources under BOTH runtimes, so a scaffolded app typechecks
+  out of the box — the criterion that previously kept the scaffold on
+  `preact` (settings.tsx uses `<Form>`).
+- `docs/react-compat.md` documents the types setup for react-compat apps:
+  `react` ships no bundled types, so apps need `@types/react` (the bundler
+  never needs the real `react` package — the runtime aliases cover it), and
+  the `jsxImportSource` choices with their current limits.
+- `create-neutron --runtime react-compat` scaffolds with `@types/react` in
+  `devDependencies`. Previously the flag only substituted the config value,
+  leaving the scaffold unable to typecheck its first React-ecosystem import.
+
+### Changed
+
+- **Default `Cross-Origin-Opener-Policy` is now `same-origin-allow-popups`**
+  (was `same-origin`). `same-origin` severs `window.opener` in popups a page
+  opens, which is the channel OAuth providers and payment sheets (Google/Apple
+  sign-in, PayPal, wallet popups) use to report back. Every app on the
+  defaults had those flows broken until it found and overrode the header.
+  `same-origin-allow-popups` keeps the protection COOP exists for: a
+  cross-origin page that opens yours gets no handle on it. What it gives up
+  is cross-origin isolation, which needs `Cross-Origin-Embedder-Policy` as
+  well and breaks third-party embeds, so it has to be configured where it is
+  needed anyway. Restore the old value with
+  `securityHeaders: { headers: { "Cross-Origin-Opener-Policy": "same-origin" } }`.
+  `X-Frame-Options: DENY` is unchanged: framing stays opt-in, and a CSP
+  `frame-ancestors` supersedes XFO in browsers that implement CSP 2. The new
+  "Security headers" section of the `neutron.config.ts` docs records both
+  decisions.
+
+- **`client="visible"` finds the island's boxed content.** core 0.4.1 made
+  the `<neutron-island>` marker `display: contents` and observed the marker's
+  child elements, hydrating at once when it had none. The runtime now
+  observes the content's first boxed descendants, looking through nested
+  `display: contents` elements; a marker given a box of its own
+  (`neutron-island { display: block }`) is observed itself, and a box-less
+  marker with only text inside is represented by its nearest ancestor with a
+  box instead of hydrating immediately.
+- **Static-tier pages are no longer in the app's client bundle.** The client
+  route table had an `import()` for every non-resource route, so a `mode:
+  "static"` page's module — stripped only of loader/action/getStaticPaths/
+  headers/middleware, not of `head` or its top-level imports — and its whole
+  import graph were bundled as browser code, although the router never
+  renders such a page: a static page that imported a server-only package
+  failed the client build, and everything it imported shipped as chunks. A
+  page whose whole chain renders at the static client tier
+  (`resolveClientTier` is not `"full"`: every route `mode: "static"` and no
+  `hydrate: true`), and any layout only such pages use, is now listed in the
+  route table with `clientModule: false` and no `import()`. Its document
+  boots like a static site's page — islands hydrate, the router does not
+  start — and the router reaches it by a document load, also under an app
+  layout. Its stylesheets come from the CSS pass, which now also runs in app
+  builds for these pages; a stylesheet both builds emit is linked from the
+  client build's copy, so static and app pages share the file. On a fixture
+  with two app routes and four static pages each importing ~60 KB of
+  content, the client build went from 10 JS files / 276 KB to 6 / 36 KB; an
+  app page's initial JS is unchanged (~35 KB — route chunks were already
+  loaded lazily). `staticTierRouteIds` is exported from
+  `@neutron-build/core/vite`.
+- **Pages link only the stylesheets their route needs.** Every page —
+  prerendered static pages, SSR'd app pages, and the `__css__` list a client
+  navigation loads before it swaps the page — linked every `dist/assets/*.css`
+  file, so an app's CSS grew on every page with every section (29 sheets /
+  ~2.6 MB per page on the Fylun port), and two routes that style `:root`
+  differently fought, the later-sorted file winning on both. `neutron-ts
+  build` now writes `dist/.neutron-route-css.json`: per page route (and
+  not-found route), the client entry's CSS, then each layout's from the
+  outermost in, then the route's own, each being what that module's static
+  import graph reaches. CSS shared by several routes comes from the common
+  chunk Vite splits it into, so they share one file. `start` (Vite runtime
+  and server bundle), the node/docker and worker runtime bundles, and the
+  static prerender all link from it; `dev` already linked per route from the
+  module graph and is unchanged. A route the table does not know (a dist
+  from an older CLI, a route added since the build) still links every
+  stylesheet. Stylesheets are now ordered layout-first rather than
+  alphabetically, so a route's own rules follow its layouts'. On static-only
+  sites the CSS pass is code-split per route: `assets/style-<hash>.css` is
+  replaced by one file per route module and shared chunk, recorded in
+  `dist/.vite/neutron-css-manifest.json`. Stylesheets a previous page linked
+  stay in the document after a client navigation (as in Next's App Router).
+- **`neutron-ts start` serves from a prebuilt server bundle instead of
+  transforming source through Vite.** `createServer` built a Vite SSR server
+  at every boot and transformed each route module, layout, `not-found`,
+  resource route and `src/middleware.ts` on first use, so production paid a
+  full transform per boot (a large app measured ~18 s CPU and ~2.3 GB RSS)
+  and needed Vite at runtime. `neutron-ts build` now compiles that set into
+  `dist/server/start/` (one module graph with preact,
+  preact-render-to-string and `@neutron-build/core`, so hooks, the renderer
+  and router providers share one Preact instance under both runtimes; route
+  modules stay lazily loaded) and records it in
+  `dist/.neutron-server-bundle.json`. `createServer` loads it natively when
+  present and constructs no Vite server. On the reference fixture
+  (react-compat page with hooks, layout, resource route, not-found, global
+  middleware) boot plus one request per route kind went from ~2.1 s to
+  ~0.8 s process CPU and ~200-237 MB to ~120 MB RSS. A dist without a
+  current bundle (older CLI, a route added since the build, another
+  `runtime`) still runs on the Vite runtime, with a warning when a bundle is
+  present but unusable; a bundle that fails to import is a startup error.
+  In the bundle, `import.meta.url`/`filename`/`dirname` keep naming each
+  module's source file, and dependencies of bundled packages resolve from
+  their importer (symlinked aliases under `dist/server/start/node_modules/`)
+  as they do under Vite and Node. New: `createServer({ serverBundle: false })`
+  forces the Vite runtime (for development servers built on `createServer`),
+  `NeutronServer.moduleSource` reports which one is in use, and the boot
+  banner prints it. Server islands are now answered by the `@neutron-build/core`
+  instance in the routes' module graph, where `<ServerIsland>` registered
+  them.
+- **Config redirects merge the incoming query into a destination that has
+  its own.** A `routes.redirects` rule kept the request's query only when the
+  destination had none, so `/old?utm_source=mail` → `/new?tab=info` dropped
+  `utm_source`. Incoming parameters are now appended, except keys the
+  destination sets — the destination wins per key and its query string is
+  kept as written (Next.js semantics); the query goes before any `#fragment`.
+  Destinations without a query behave as before. Applies to `start`, `dev`,
+  `preview` and the edge runtimes, which share the resolver.
+- **Framework components return `AnyJsxElement | null` instead of `any`.**
+  `Form`, `Link`, `NavLink`, `ViewTransitions`, `ScrollReveal`, `Island`,
+  `Image`, `Picture`, `ServerIsland` and `Show`/`For`/`Switch`/`Match`/
+  `Index` declared `any` as their element return so React-typed JSX could
+  use them. The exported structural `AnyJsxElement` passes both runtimes'
+  JSX checks too (the `type-fixtures/react-*` compiles are unchanged and
+  still pass), so the declarations are typed again. Runtime output is
+  unchanged. Code that assigned a component's return value to a preact
+  `VNode` needs a cast. `Await` stays `any`: it returns `children(data)` as
+  is, which can be a string or an array.
+- **The SSR server's default 404 is content-negotiated.** With no
+  application `not-found.tsx`, an unmatched path used to answer bare
+  `text/plain` "Not Found". HTML-preferring clients (`Accept: text/html`,
+  i.e. browsers) now get the same minimal HTML page `notFound()` serves;
+  every other client — `Accept: application/json`, `X-Neutron-Data`, no
+  preference, wildcard-only — gets the RFC 7807 `application/problem+json`
+  document in exactly the shape api mode serves (`No route matches <path>`).
+  An application `not-found.tsx` still answers for every client, and api
+  mode's JSON 404 is unchanged. FRAMEWORK_CONTRACT.md §2 states the
+  negotiation rule.
+
+### Fixed
+
+- **`neutron-ts build` prerenders static pages behind `src/middleware.ts`
+  for `neutron-ts start` again.** core/cli 0.4.0 refused any build with a
+  global middleware and a `mode: "static"` route, because prebuilt files
+  bypass request authorization. Under `start` they do not: its static fast
+  path runs global middleware before every prebuilt file it serves. The
+  refusal now applies only with an adapter other than `node` (`static`,
+  `docker`, `vercel`, `netlify`, `cloudflare`), where dist files are served
+  with no Neutron server in front. Resource routes, never prerendered, are
+  no longer loaded by that check either.
+- **`maxRequestBodyBytes` no longer turns every request into a 500.** The
+  0.4.0 body cap copied the incoming request with the native `Request`
+  constructor, which throws on `@hono/node-server`'s request object now that
+  `serve()` keeps the native globals. It rebuilds the request from its URL,
+  method, headers and signal.
+- **A nested `<Island>` renders inline after hydration too.** The islands
+  runtime hydrated each island outside the context that tells a nested
+  `<Island>` it is nested, so the client render emitted a marker the server
+  render did not.
+- **Dev no longer links a previous build's stylesheets.** With a `dist/`
+  present, dev pages (and client navigations, whose stylesheet list comes
+  from the same walk) could link `dist/assets/*.css` — minified CSS from an
+  old build, stale after any source edit (the Fylun port: `/pricing`,
+  `/studio`, a colour-format diff against a fresh load). Dev reads nothing
+  from `dist/`; the stylesheets came from the module graph. Tailwind v4
+  registers every source file it scans with `addWatchFile`, and where
+  `dist/` is not gitignored it scans the build output; Vite records each such
+  file as a file-only "asset" entry under the stylesheet that registered it,
+  and dev's CSS collection walked those entries as if they were imports.
+  It now follows only real imports, never links a file under the build
+  output directory, and looks route files up by their real path as well
+  (a symlinked path, macOS `/tmp`, no longer misses the route's graph and
+  falls back to every stylesheet). The fallbacks are filtered the same way,
+  and the last-resort `src/*.css` scan is rooted at the app, not the
+  process's working directory.
+- **Docker preset: `/` reaches the app, the image context drops `start`'s
+  bundle, and files get `start`'s headers.** The image's `server.mjs`
+  served `dist/index.html` for `/` before the app handler, so an app route at
+  `/` was shadowed by the client build's shell; a prebuilt HTML file now
+  answers only where no app route (or redirect rule) claims the path, as in
+  `start`. The image context carried `dist/server/start` — `start`'s bundle,
+  unused by the image, whose `node_modules` links point into the build
+  machine's package store; `.dockerignore` now excludes it and its manifest.
+  Files the image serves get the `routes.headers` and security defaults the
+  app's responses get, and `/assets/*` the immutable cache header.
+- **No `Cannot find module '@jridgewell/sourcemap-codec'` during builds with
+  `resolve.preserveSymlinks` (react-compat, pnpm-linked core).** The
+  prerender's SSR runtime evaluated core's `magic-string` at core's linked
+  path, where its own dependency is invisible; loading core failed (logged)
+  and the prerender fell back to the CLI's copy of the router providers.
+  `magic-string` joins the deps the SSR runner keeps native
+  (`RUNTIME_RUNNER_CJS_EXTERNALS`).
+
+- **`neutron-ts dev` sends every `Set-Cookie` of a response.** Dev copied
+  route responses onto the Node response one header entry at a time with
+  `setHeader`, which replaces, so of several `Set-Cookie` headers only the
+  last reached the browser. Better-Auth's sign-in sets the session token and
+  the session data, and only the data arrived, so nobody could sign in under
+  dev (F-B6-2). Resource routes, global middleware (after `next()`, answering
+  an unmatched path, or throwing a `Response`), route-rule redirects and the
+  image endpoint now send each cookie as its own header, as the mount path and
+  `start` already did. `start` (`@hono/node-server`) and the docker/vercel
+  handlers were checked and were correct.
+- **`neutron-ts dev` applies page routes' `headers()` exports.** Dev's
+  renderer never called them, so a page's own headers (cookies, Cache-Control)
+  were sent by `start` and missing in dev. Dev now merges the route and layout
+  `headers()` the way `start` does (Set-Cookie appended across the chain) onto
+  both the HTML document and the data (JSON) response.
+- **`neutron-ts dev` attaches the server entry's WebSocket handler at
+  startup.** Dev created the `WebSocketServer` and called
+  `websocket.attach` only once an upgrade had passed `authorize`, while
+  `start` attaches at boot. An authorizer that depends on state `attach` sets
+  up refused every upgrade in dev (F-B6-1). Dev now loads
+  `src/server.entry.ts` and attaches its handler when the server starts
+  listening. After an edit to the entry or a module it imports, it closes the
+  old entry first (terminates its clients, closes its server, runs its
+  `close`) and then loads and attaches the new one, without waiting for a
+  request. A load failure is logged and surfaces again on the next request.
+
+- **`--preset docker` builds under pnpm and ships a self-contained context.**
+  With pnpm-linked core and `resolve.preserveSymlinks`, the docker runtime
+  bundle failed to build: it bundled core's own dependencies, and
+  gray-matter's `section-matter` is invisible from core's linked path. Keeping
+  them external, as the `start` bundle does, would not have been enough on its
+  own, because the image context is `dist/` alone and its `.dockerignore`
+  excluded `node_modules`, so the image had nothing to load them from. The
+  docker build now asks for a self-contained runtime bundle
+  (`ensureRuntimeBundle("node", { selfContained: true })`, new
+  `AdapterRuntimeBundleOptions`). Core's dependencies stay external, resolved
+  from core's real directory, and every external package the emitted chunks
+  import is copied, `pnpm deploy`-style, into the context as real directories
+  together with its production dependencies (resolved from each package's
+  real path, hoisted to `dist/node_modules` and nested only on a version
+  conflict). Core's aliased externals land under
+  `dist/server/node/node_modules/@neutron-external/` as copies instead of
+  symlinks into the build machine's store. `node_modules` is no longer in the
+  generated `.dockerignore`. The vercel/netlify runtime bundles are
+  unchanged.
+
+- **A redirected client navigation lands on the redirect target.** The router
+  fetched loader data with fetch's default `redirect: "follow"` and never
+  looked at the result: when the data request was redirected — a loader's
+  `redirect()`, an auth gate in `src/middleware.ts`, a `routes.redirects`
+  rule — it rendered the TARGET's data while the address bar kept the URL
+  that redirected, and the target's query string was lost (`/open/note/x`
+  showed the workspace at `/open/note/x`, without `?open=`). Redirects are
+  now part of the data protocol: a 3xx answering an `X-Neutron-Data` request
+  is sent as `204` with the location in `X-Neutron-Redirect` (Set-Cookie and
+  the other headers kept; `Location` removed), by `createServer` outermost
+  (so mounts, middleware, loaders and config rules are all covered), by the
+  dev server and by the generated edge handler. Document requests still get
+  the plain 3xx. The router navigates to the target, replacing the history
+  entry that redirected (the semantics of Next and React Router): a
+  same-origin target is a client navigation that keeps its query and hash, a
+  cross-origin one is `location.replace`. `response.redirected` (a hop fetch
+  followed anyway, e.g. a proxy in front of the app) is honoured the same
+  way, and a redirect loop is handed to the browser after 20 hops. The other
+  data consumers read the same signal: `<Form>`, `useSubmit` and
+  `fetcher.submit` navigate to it as before; `useRevalidator` and fetcher
+  revalidation follow it in place; `fetcher.load` navigates; `prefetch()`
+  (which previously cached a redirected payload under the linked URL) and
+  link prefetching never warm a redirected URL. A client from before this
+  release that receives the 204 reloads the page, which follows the redirect.
+
+- **`createServer` resolves once the server is listening.** It resolved as
+  soon as `serve()` returned, before the socket was bound, so an immediate
+  `close()` threw `ERR_SERVER_NOT_RUNNING`, `url` named the requested port
+  rather than the bound one (wrong for `port: 0`), and a bind failure
+  (`EADDRINUSE`) surfaced as an unhandled `'error'` event. It now waits for
+  `'listening'`, and rejects with the bind error.
+- **CommonJS dependencies run in the SSR module runner.** Vite's runner
+  evaluates ESM only, so a CommonJS module it inlined — every dependency
+  under react-compat's blanket `ssr.noExternal` — failed on its first
+  `require` (`require is not defined`). Externalizing them per app
+  (`ssr.external: [...]`) worked for plain packages but not for the
+  React-ecosystem ones (`use-sync-external-store`, behind zustand, cmdk,
+  @tiptap/react, …): natively, their `require("react")` loads real React
+  beside Preact. `dev`, `start` on the Vite runtime and the build's prerender
+  now rewrite each inlined CommonJS module under `node_modules`: a package
+  that declares no react/react-dom/preact dependency is loaded by Node
+  (`createRequire`); a React-ecosystem package runs in the runner with its
+  own `require`, whose React-family, relative and React-ecosystem requests
+  are hoisted to imports — through the react → preact/compat aliases, on the
+  page's Preact — and whose other requests go to Node. `module.exports` is
+  the module's default export (`.default` for `__esModule` modules) and its
+  keys are named exports. Builds (the `start` server bundle, the client)
+  were already fine — Rolldown bundles CommonJS itself — and are unchanged.
+  Per-app `ssr.external` lists for CommonJS packages are no longer needed.
+- **The server bundle builds when core is linked or pnpm-installed under
+  `resolve.preserveSymlinks`, and no longer inlines core's dependencies.**
+  Under react-compat (`ssr.noExternal: true`) the `start` bundle inlined
+  everything core imports — shiki, `@mdx-js/mdx`, `typescript`, zod, hono —
+  although none of it shares a module instance with app code. With
+  `resolve.preserveSymlinks: true` and core linked or installed by pnpm, the
+  resolver stayed on core's symlinked path, where pnpm's siblings of a
+  dependency are invisible, so the build failed
+  (`failed to resolve import "@shikijs/engine-oniguruma"`) and `start` fell
+  back to transforming routes through Vite. Core's own imports of other
+  packages are now resolved from core's real directory, as Node does, and
+  kept external (aliased under `dist/server/start/node_modules/` when the
+  app root resolves them differently); only preact,
+  preact-render-to-string and `@preact/signals-core` stay in the bundle's
+  graph. On a one-route fixture the bundle's JS went from 8.3 MB (7.8 MB of
+  it an inlined `typescript`) to 0.53 MB.
+- **`Link` and `NavLink` accept `href` as the destination.** The
+  destination prop is `to`; given `href` (the `next/link` and plain-anchor
+  name, common in ported code) `Link` spread it onto the `<a>` and then
+  overwrote it with the missing `to`, rendering a link with no `href`, and
+  `NavLink` was never active. `href` is now an alias for `to`. The props
+  type takes exactly one of the two: both, or neither, is a type error.
+  `LinkProps` and `NavLinkProps` are now type aliases (a union), not
+  interfaces, so code that `extends` them must use an intersection instead.
+- **A failed server bundle build no longer leaves its chunks in
+  `dist/server/start/`.** Rolldown writes the output before it reports a
+  resolve error, so a build that warned and fell back to the Vite runtime
+  still left a complete-looking bundle tree under the app root — 135 MB on
+  the Fylun port. The Vite runtime that `start` fell back to then scanned it:
+  Tailwind's source detection read it on every CSS compile, raising boot RSS
+  from ~590 MB to 710–745 MB and the first SSR of 39 app shells from ~10 s
+  to 15–17 s CPU. The directory is now removed when the bundle fails.
+- **Client builds no longer contain Vite, esbuild, shiki or other server
+  code.** Route modules import `Link` and hooks from `@neutron-build/core`,
+  whose root entry also re-exports the server, the adapters, content
+  collections and the Vite plugins. Tree-shaking dropped their code, but
+  the bundler still had to resolve their imports (a `preserveSymlinks`
+  build failed on magic-string's dependencies) and kept their dynamic
+  imports (`vite`, `ws`, `shiki`, `typescript`) as orphan chunks in
+  `dist/assets/` — on a one-route app, under both runtimes, 18 files /
+  945 KB of client JS, nearly all of it Vite, esbuild, tsx, postcss, jiti and
+  lightningcss; now 5 files / 38 KB. The root entry now has a
+  `browser` export condition (`dist/index.browser.js`) with the same export
+  names: client modules are re-exported unchanged, node-only functions are
+  stubs that throw a "server-only" error if called, and `ServerIsland`
+  renders its children as it already did in the browser. Webworker server
+  bundles, whose resolver also selects `browser`, keep the full entry.
+- **`neutron-ts build` prerenders react-compat pages that import core.**
+  Under `runtime: "react-compat"` the prerender's Vite SSR server processes
+  every dependency, and it did not keep core's CommonJS-only dependencies
+  native the way `dev` and `start` do (`RUNTIME_RUNNER_CJS_EXTERNALS`), so a
+  static page whose imports reached `@neutron-build/core`'s root entry
+  (`useLocation`, `Link`, …) failed the build with `require is not defined`
+  (acorn-jsx, under `@mdx-js/mdx`). The prerender now composes the same
+  externals.
+- **Starting the server no longer replaces the global `Response` and
+  `Request`.** `@hono/node-server`'s `serve()` swaps both for its own
+  lightweight classes by default, for the whole process. A `Response`
+  subclass defined before `createServer`/`startServer` ran (a Next-compat
+  `NextResponse` evaluated at import, for instance) then failed
+  `instanceof Response` in app code, as did every `Response.json()` and
+  `Response.redirect()` result, so code that branched on `instanceof`
+  silently treated real responses as data. Neutron now passes
+  `overrideGlobalObjects: false`; `globalThis.Response` stays the native
+  class. The framework's own response detection already tolerated both
+  classes and is unchanged.
+- **Resource-route mutations honour `x-neutron-invalidate`.** A page action's
+  response could name other paths to evict from the app-response and
+  loader-data caches with the header; a `POST`/`PUT`/`PATCH`/`DELETE`
+  resource-route handler's response could not — the header was ignored, so
+  an API endpoint that changed what a cached page shows left it stale until
+  expiry. Both now go through the same invalidation helper (`self`, `*` and
+  explicit paths, as for actions). The edge runtimes do not serve resource
+  routes and are unchanged.
+- **A static-only build no longer records a deleted file as its client
+  entry.** `dist/.neutron-client-entry.json` named the CSS-extraction pass's
+  JS entry, which the build deletes right after that pass, so anything that
+  injected the client entry pointed at a 404. With no app routes there is no
+  client entry, and the file is no longer written.
+- **Static-only builds emit fonts and images as files instead of inlining
+  them into the stylesheet.** The CSS-extraction pass ran as a Vite library
+  build, and library mode inlines every `url()` asset as a base64 `data:` URI
+  whatever `build.assetsInlineLimit` says — one reported stylesheet was 798 KB,
+  459 KB of it font faces, paid uncached on every first page load. The pass is
+  now a plain build: assets are written under `dist/assets/` with hashed names
+  and referenced by URL, under the same inline limit as the app client
+  build. The stylesheet itself is now `assets/style-<hash>.css` rather than
+  `assets/<package name>-<hash>.css`, and the pass no longer fails on a
+  project whose `package.json` has no `name`.
+- **A static-only build no longer bundles server dependencies as browser
+  code.** With no app routes, `neutron-ts build` extracts CSS by bundling
+  every route module for the browser, so a static page whose imports reach a
+  server-only package (a native addon such as `isolated-vm`) failed the
+  build with `UNLOADABLE_DEPENDENCY`/`UNRESOLVED_IMPORT`. In that pass,
+  packages under `node_modules` are now external unless they resolve to a
+  stylesheet — `import "pkg/style.css"` and packages whose entry is CSS
+  (`@fontsource/*`) are still collected — and resource routes, which render
+  no page, are not imported at all. A stylesheet a dependency's own
+  JavaScript imports internally is no longer picked up by this pass; import
+  it from app code instead.
+- **`neutron-ts build` prerenders static pages inside the router
+  providers.** The CLI's static prerender mounted no router context, so
+  `useLocation()` returned `/` (and `useParams()`/`useLoaderData()` their
+  defaults) on every prerendered page, baking the home-route branch of any
+  pathname-dependent layout into every file. Prerendered pages now get the
+  same providers as SSR, with the real pathname, params (from
+  `getStaticPaths`) and loader data, resolved through the app's module graph
+  like the start server's. Layouts on param-less static routes are also
+  created with the app graph's `h` rather than the CLI's own copy.
+- **`neutron-ts dev` runs `src/middleware.ts`.** The dev server never loaded
+  the app's global middleware, so auth gates ran under `start` and on no path
+  under `dev`. Dev now finds the same file (`src/middleware.{ts,tsx,js,mjs}`)
+  with the same export rules and runs it outermost (FRAMEWORK_CONTRACT §5)
+  for page routes, resource routes and unmatched paths; an unmatched request
+  it lets through is answered by Vite as before (the gate sees no request
+  body there). The file is resolved per request through Vite's module graph,
+  so edits, additions and deletions apply without a restart; a file that
+  fails to load is reported as a dev error instead of being skipped.
+- **The SSR server serves root-URL `public/` files in production, and only
+  those.** Vite copies `public/` into the dist root, and `neutron-ts dev`
+  serves it at root URLs (`/favicon.svg`), but `neutron-ts start` only served
+  `/assets/*` and `/public/*`, so an app's own favicon 404'd in production.
+  The root-asset handler that closed that gap served any extension-bearing
+  file in the dist root, which also exposed `/.vite/manifest.json`,
+  `/.neutron-client-entry.json` and node/docker preset server bundles under
+  `dist/server/`, and let a prebuilt file shadow a resource route at the same
+  path. `neutron build` now records the files it copied from `public/` in
+  `dist/.neutron-public-files.json`, and the server answers root URLs from
+  dist for exactly those paths. A dist without the list (built by an older
+  CLI or other tooling) falls back to refusing any dot-segment path and
+  anything under `server/`.
+- **A resource-route handler's unexpected error no longer reaches the
+  client, and is reported.** A handler that threw anything other than a
+  `ProblemError` or a `Response` answered a 500 whose `detail` was
+  `Resource route handler threw: <error text>` (connection strings, file
+  paths, SQL), and the error never reached the server's `onError` hook, so
+  nothing logged it. The 500 problem body is now generic, and the error goes
+  to `hooks.onError` (`source: "request"`, with the resource route's
+  `routeId`/`routePath`) under `neutron-ts start`, and to the terminal and
+  dev overlay under `neutron-ts dev`. `dispatchResourceHandler` takes an
+  optional `{ onError }` for the same purpose. `ProblemError` and thrown
+  `Response` handling is unchanged.
+- **`Response.redirect()` works wherever app code can return a Response.**
+  Global middleware, loaders (returned or thrown), actions, resource routes
+  and mounted sub-apps that answered with `Response.redirect()` got a bare
+  500 under `neutron-ts start`. Native `Response.redirect()` (like fetched
+  responses) has an immutable header list, and the server sets headers on
+  every response on the way out (`x-request-id`, security headers, CORS,
+  `Vary`, route-rule headers), so the first write threw `TypeError`. The
+  server now copies such a response into one with mutable headers before
+  touching it, keeping body, status and headers (through core 0.4.0's
+  `mutableResponse()`, which now returns `Response.error()`, status 0, as
+  is instead of throwing a `RangeError` copying it). `neutron-ts dev` did not
+  500 but silently dropped route-rule headers on these responses; it now
+  applies them like `start`. `new Response(null, { status: 307, headers: {
+  Location } })` and `redirect()` were never affected.
+- **Global middleware runs for unmatched paths whether or not the app has a
+  `not-found.tsx`.** `src/middleware.ts` ran for an unmatched path only when
+  a `not-found.tsx` existed (its render runs the chain); without one, the
+  framework's default 404 answered with the middleware skipped, so an auth
+  gate that must see every request (FRAMEWORK_CONTRACT §5: authentication
+  precedes the route handler) let unauthenticated clients probe the URL
+  space. The default 404, and the 404 for a static route missing from dist,
+  now answer through global middleware like the static fast path already
+  did; a response it returns (401, redirect) wins.
+
 ## [core 0.4.2] - 2026-10-30
 
 ### Fixed

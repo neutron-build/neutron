@@ -2,7 +2,13 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
-import { neutronPlugin, CLIENT_ROUTE_QUERY } from "@neutron-build/core/vite";
+import {
+  neutronPlugin,
+  neutronPublicEnvPlugin,
+  CLIENT_ROUTE_QUERY,
+  staticTierRouteIds,
+  ServerActionRegistry,
+} from "@neutron-build/core/vite";
 import { runtimeOxc, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
 import {
   discoverRoutes,
@@ -16,6 +22,7 @@ import {
   resolveRuntime,
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
   resolvePreactSsr,
   vitePreactAliases,
   mergeSeoMetaInput,
@@ -26,8 +33,12 @@ import {
   assertRenderedFragment,
   renderSpeculationRules,
   isResponse,
+  isResourceRoute,
+  withRouterProviders,
+  type CreateElement,
   assertStaticRoutesUngated,
 } from "@neutron-build/core";
+import { findGatedStaticRoutes, gatedStaticRoutesError } from "./gated-static.js";
 import type {
   NeutronConfig,
   NeutronAdapter,
@@ -43,9 +54,33 @@ import type {
 import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { extractClientEntryScriptSrc } from "../client-entry.js";
 import { loadNeutronConfig } from "../lib/config.js";
 import { isUnsafeResolvedPath, resolvePath } from "./static-paths.js";
+import { writePublicFilesMetadata } from "./public-files.js";
+import {
+  bareSpecifierPackage,
+  resolvePackageDir,
+  shipDependencies,
+  type ShippedDependencyRoot,
+} from "./ship-dependencies.js";
+import {
+  SERVER_BUNDLE_MANIFEST,
+  SERVER_BUNDLE_FORMAT,
+  SERVER_ACTIONS_MANIFEST,
+  type ServerActionsManifest,
+  findGlobalMiddlewareFile,
+  findServerEntryFile,
+  serverEntryDeclaresWebSocket,
+  generateServerBundleEntry,
+  ROUTE_CSS_MANIFEST,
+  ROUTE_CSS_MANIFEST_FORMAT,
+  collectChunkCss,
+  routeStylesheetHrefs,
+  type RouteCssManifest,
+  type ViteManifest,
+} from "@neutron-build/core/server";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
@@ -195,6 +230,18 @@ export async function build(): Promise<void> {
     },
   };
 
+  // Pages whose CSS the CSS pass collects, and the modules (each page with its
+  // layouts) it bundles to find it.
+  const staticTier = staticTierRouteIds(routes);
+  const cssPassPages = pageRoutes.filter(
+    (route) => !isResourceRoute(route) && (appRouteCount === 0 || staticTier.has(route.id))
+  );
+  const cssPassModules = [...new Set(cssPassPages.flatMap((route) => routeChain(route, routes)))];
+
+  // "use server" modules the client passes (app bundle, islands) reach: the
+  // actions the server registers (dist/.neutron-server-actions.json).
+  const serverActionRegistry = new ServerActionRegistry();
+
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
   // requiring an index.html entry point. Static sites WITH islands take the
@@ -231,7 +278,14 @@ export async function build(): Promise<void> {
               return null;
             },
           },
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            serverActions: { registry: serverActionRegistry },
+            client: neutronConfig.client,
+          }),
+          neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
         resolve: {
@@ -249,34 +303,27 @@ export async function build(): Promise<void> {
         },
       })
     ));
-  } else {
-    console.log("Building CSS bundle (static site)...");
-    const cssEntryDir = path.join(cwd, ".neutron");
-    fs.mkdirSync(cssEntryDir, { recursive: true });
-    const cssEntryPath = path.join(cssEntryDir, "_css-entry.js");
-    // Import every route + layout MODULE through the client-route pipeline so Vite
-    // walks the real import graph and extracts ALL reachable CSS — side-effect
-    // imports, component-level CSS, AND CSS Modules — not just side-effect `*.css`
-    // imports textually present in the route file. The ?CLIENT_ROUTE_QUERY suffix
-    // makes neutronPlugin strip server-only code (loader/action) while keeping CSS
-    // imports in build mode, exactly as the client bundle does. Root-relative paths
-    // (`/src/...`) are used so Vite resolves them from the project root.
-    // Namespace-import + export each module so its component graph is NOT
-    // tree-shaken. Side-effect-only imports would keep `import "x.css"` lines but
-    // drop value-imported CSS Modules (`import s from "x.module.css"`) once the
-    // unused component that references them is shaken away.
-    const importLines: string[] = [];
-    const keepRefs: string[] = [];
-    routes.forEach((route, i) => {
-      const abs = route.file.replace(/\\/g, "/");
-      const rel = abs.startsWith(cwdFwd + "/") ? abs.slice(cwdFwd.length) : "/@fs" + abs;
-      importLines.push(`import * as __r${i} from ${JSON.stringify(rel + "?" + CLIENT_ROUTE_QUERY)};`);
-      keepRefs.push(`__r${i}`);
+  }
+  // Static-tier pages are not in the client build (staticTierRouteIds: no
+  // client module), so their stylesheets come from this pass — for every page
+  // of a static-only site, and for the static-tier pages of an app.
+  if (cssPassModules.length > 0) {
+    console.log(appRouteCount > 0 ? "Building CSS bundle (static-tier pages)..." : "Building CSS bundle (static site)...");
+    // Every route + layout MODULE is an entry of its own, loaded through the
+    // client-route pipeline, so Vite walks the real import graph and extracts
+    // ALL reachable CSS — side-effect imports, component-level CSS, AND CSS
+    // Modules — not just side-effect `*.css` imports textually present in the
+    // route file. The ?CLIENT_ROUTE_QUERY suffix makes neutronPlugin strip
+    // server-only code (loader/action) while keeping CSS imports in build
+    // mode, exactly as the client bundle does. With CSS code-splitting each
+    // entry's own stylesheets (and those of the shared chunks it imports) are
+    // recorded in this pass's manifest, which is what the per-route CSS table
+    // is built from. Resource routes are skipped: they render no page and
+    // carry no CSS, and their handlers are server code through and through.
+    const cssPassInput: Record<string, string> = {};
+    cssPassModules.forEach((route, i) => {
+      cssPassInput[`neutron-css-${i}`] = route.file.replace(/\\/g, "/") + "?" + CLIENT_ROUTE_QUERY;
     });
-    fs.writeFileSync(
-      cssEntryPath,
-      importLines.join("\n") + `\nexport const __keep = [${keepRefs.join(", ")}];\n`
-    );
     recordBrowserOutput(await viteBuild(
       mergeConfig(userConfig, {
         oxc: oxcJsx,
@@ -302,7 +349,27 @@ export async function build(): Promise<void> {
               return null;
             },
           },
+          {
+            // This pass bundles each page's import graph as BROWSER code only to
+            // find its CSS, and a static page may import server-only packages
+            // (a native addon cannot be bundled at all — F-P1-2). Dependencies
+            // are therefore external here, except modules that resolve to a
+            // stylesheet: `import "pkg/style.css"` and packages whose entry is
+            // CSS (`@fontsource/*`) are still collected. Nothing this pass
+            // emits as JS ships.
+            name: "neutron:css-pass-external-deps",
+            enforce: "pre" as const,
+            async resolveId(source: string, importer: string | undefined, options: Record<string, unknown>) {
+              if (!importer || source.startsWith("\0")) return null;
+              const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+              if (!resolved || resolved.external) return resolved;
+              const file = resolved.id.replace(/\?.*$/, "").replace(/\\/g, "/");
+              if (!file.includes("/node_modules/") || CSS_LANG_RE.test(file)) return resolved;
+              return { id: source, external: true };
+            },
+          },
           neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
         resolve: {
@@ -311,21 +378,30 @@ export async function build(): Promise<void> {
         },
         build: {
           outDir: outputDir,
-          emptyOutDir: true,
-          lib: { entry: cssEntryPath, formats: ["es"] as const },
+          emptyOutDir: appRouteCount === 0,
+          // Not a lib build: lib mode inlines every url() asset as a data: URI
+          // regardless of assetsInlineLimit (F-P1-3: every font face base64'd
+          // into the one stylesheet). As a plain build, fonts and images are
+          // emitted under assets/ with hashed names, by the same inline limit
+          // as the app client build. The strict entry signature keeps each
+          // route's exports, so CSS Modules referenced only by components are
+          // not shaken away. JS lands at the top level for the cleanup below.
           rolldownOptions: {
-            output: { assetFileNames: "assets/[name]-[hash][extname]" },
+            input: cssPassInput,
+            preserveEntrySignatures: "strict" as const,
+            output: {
+              entryFileNames: "[name].js",
+              chunkFileNames: "[name]-[hash].js",
+              assetFileNames: "assets/[name]-[hash][extname]",
+            },
           },
-          cssCodeSplit: false,
-          // This build imports every route to walk their CSS, so it emits a
-          // route chunk per route — including `assets/index-<hash>.js`. Without
-          // the manifest naming them, the client-entry resolver can pick one up
-          // and inject a stray route stub into pages that need no JS at all.
-          manifest: true,
+          cssCodeSplit: true,
+          // Its own file: the per-route CSS table reads it, and it must never
+          // be mistaken for the client build's manifest.
+          manifest: CSS_PASS_MANIFEST,
         },
       })
     ));
-    try { fs.unlinkSync(cssEntryPath); } catch {}
     // Remove the JS lib output from the CSS-extraction build — we only need
     // the extracted CSS. Preserve any JS files that were copied here from
     // publicDir (e.g. sw.js, service workers, third-party widgets) so user
@@ -349,19 +425,34 @@ export async function build(): Promise<void> {
   const publicSource = userConfig.publicDir === false ? null : path.resolve(cwd, typeof userConfig.publicDir === "string" ? userConfig.publicDir : "public");
   const recordPublicSource = (dir: string, prefix = "") => {
     if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isSymbolicLink() || entry.name.startsWith(".")) continue;
-      const relative = prefix + entry.name;
-      if (entry.isDirectory()) recordPublicSource(path.join(dir, entry.name), relative + "/");
-      else if (entry.isFile()) publicArtifacts.add(relative);
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(".")) continue;
+      const relative = prefix + name;
+      // statSync follows symlinks, as Vite's public/ copy does (it writes the
+      // target as a real file into dist, which the adapter then copies).
+      const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false });
+      if (stat?.isDirectory()) recordPublicSource(path.join(dir, name), relative + "/");
+      else if (stat?.isFile()) publicArtifacts.add(relative);
     }
   };
   if (publicSource) recordPublicSource(publicSource);
 
-  const clientEntryScriptSrc = extractClientEntryScriptSrc(outputDir);
+  // Only the app client build produces a client entry. The static CSS pass's
+  // manifest also names a JS entry, but that file is deleted right after it is
+  // built, so recording it pointed pages at a 404.
+  const clientEntryScriptSrc = appRouteCount > 0 ? extractClientEntryScriptSrc(outputDir) : null;
   if (clientEntryScriptSrc) {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
   }
+  // The SSR server answers root URLs from dist only for files listed here.
+  writePublicFilesMetadata(
+    outputDir,
+    userConfig.publicDir === false
+      ? null
+      : userConfig.publicDir
+        ? path.resolve(cwd, String(userConfig.publicDir))
+        : path.join(cwd, "public")
+  );
 
   // Standalone islands entry: a SEPARATE Rolldown build (so the SPA/app client
   // bundle stays byte-identical). It imports only the island runtime + the
@@ -374,7 +465,16 @@ export async function build(): Promise<void> {
         oxc: oxcJsx,
         configFile: false,
         root: cwd,
-        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        plugins: [
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            serverActions: { registry: serverActionRegistry },
+            client: neutronConfig.client,
+          }),
+          neutronPublicEnvPlugin(neutronConfig.env),
+        ],
         css: cssConfig,
         resolve: {
           alias: preactAliases,
@@ -401,21 +501,41 @@ export async function build(): Promise<void> {
   // Prerendered static pages with islands reference this instead of the SPA runtime.
   const islandsEntryScriptSrc = hasIslands ? extractIslandsEntryScriptSrc(outputDir) : null;
 
-  // Collect CSS files produced by the client build for injection into static HTML
+  const serverActions = writeServerActionsManifest(outputDir, serverActionRegistry);
+
+  // Per-route stylesheets: each page links what its own route graph needs,
+  // from the CSS pass's manifest for the pages that pass collected, the
+  // client build's for the rest.
+  const routeCss = writeRouteCssManifest(
+    cwd,
+    outputDir,
+    routes,
+    new Set(cssPassPages.map((route) => route.id))
+  );
+  // Every stylesheet the builds produced: what a route missing from the
+  // per-route table links (the pre-table behaviour).
   const clientCssFiles = extractClientCssFiles(outputDir);
+  const stylesheetsFor = (route: Route) => routeStylesheetHrefs(routeCss, route.id, clientCssFiles);
 
   const ensureRuntimeBundle = createRuntimeBundleBuilder({
     cwd,
     outputDir,
     routesDir,
     routeRules: neutronConfig.routes,
+    env: neutronConfig.env,
     routes,
     pageRoutes,
     clientEntryScriptSrc,
     clientCssFiles,
+    routeCss,
+    serverActions,
+    serverActionsOptions: neutronConfig.server?.serverActions,
+    securityHeaders: neutronConfig.server?.securityHeaders,
     userConfig,
     runtimeAliases: preactAliases,
-    runtimeNoExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+    // `true` for react-compat (blanket processing — see resolveRuntimeNoExternal).
+    runtimeNoExternal:
+      runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
   });
 
   // Create a Vite SSR server for rendering
@@ -424,7 +544,10 @@ export async function build(): Promise<void> {
       oxc: oxcJsx,
       configFile: false,
       root: cwd,
-      plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+      plugins: [
+          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPublicEnvPlugin(neutronConfig.env),
+        ],
       css: cssConfig,
       resolve: {
         // Absolute aliases force one preact + RTS into the SSR graph even when
@@ -435,8 +558,18 @@ export async function build(): Promise<void> {
       ssr: {
         // Process these through Vite's SSR graph (aliased + noExternal) instead
         // of native node resolution. @neutron-build/core MUST share this graph
-        // too: its inline components (e.g. Link) use hooks.
-        noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+        // too: its inline components (e.g. Link) use hooks. react-compat goes
+        // further and processes EVERYTHING (`true`): externalized deps resolve
+        // their own react imports natively — real React next to preact (see
+        // resolveRuntimeNoExternal). Core's CJS-only deps stay native, as in
+        // dev and start: the runner cannot evaluate CommonJS, and a static
+        // page that reaches core's root entry otherwise dies with "require is
+        // not defined" (RUNTIME_RUNNER_CJS_EXTERNALS).
+        noExternal:
+          runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
+        ...(runtimeNoExternal === true
+          ? { external: [...RUNTIME_RUNNER_CJS_EXTERNALS] }
+          : {}),
       },
       server: {
         middlewareMode: true,
@@ -468,6 +601,37 @@ export async function build(): Promise<void> {
         "Install preact in the app and ensure @neutron-build/core is installed."
     );
   }
+
+  // Router providers from the SAME graph as the route modules, as the start
+  // server does (loadRunnerRenderer): a Provider and a consumer from two module
+  // instances silently read the context default — `useLocation()` reporting
+  // "/" on every prerendered page. Falls back to the CLI's own copy.
+  let appWithRouterProviders = withRouterProviders;
+  try {
+    const appCore = (await server.ssrLoadModule("@neutron-build/core")) as {
+      withRouterProviders?: typeof withRouterProviders;
+    };
+    if (appCore.withRouterProviders) appWithRouterProviders = appCore.withRouterProviders;
+  } catch {
+    // keep the fallback
+  }
+  // Same provider values the request-serving renderer mounts.
+  const mountRouterProviders = (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    element: any,
+    route: Route,
+    pathname: string,
+    params: Record<string, string>,
+    loaderData: Record<string, unknown>
+  ) =>
+    appWithRouterProviders(appH as CreateElement, element, {
+      routeId: route.id,
+      pathname,
+      search: "",
+      params,
+      loaderData,
+      actionData: undefined,
+    });
 
   // Get layouts map
   const layouts = new Map<string, Route>();
@@ -613,7 +777,18 @@ export async function build(): Promise<void> {
   // modules, not derived facts, through the same helper the standalone
   // renderer uses; a rejected build throws before it can leave a deployable
   // partial dist behind.
-  await assertStaticRoutesUngated(staticRoutes, { loadRouteModule, getLayoutChain, globalMiddleware: ["ts", "tsx", "js", "mjs"].some(ext => fs.existsSync(path.join(cwd, "src", `middleware.${ext}`))) });
+  //
+  // Global middleware gates the build only for presets whose prebuilt files
+  // are served with no Neutron server in front (static hosting, a CDN, the
+  // docker image's file handler): there it never runs for them. `neutron-ts
+  // start` (no adapter, or the node adapter) runs global middleware ahead of
+  // every prebuilt file it serves (server/index.ts static fast path), so a
+  // static page behind it stays gated and may be prerendered.
+  const prebuiltFilesBypassServer = Boolean(selectedAdapter) && selectedAdapter!.name !== "node";
+  const hasGlobalMiddleware = ["ts", "tsx", "js", "mjs"].some(ext => fs.existsSync(path.join(cwd, "src", `middleware.${ext}`)));
+  // Resource routes are exempt, as from the A-020 gate below: never
+  // prerendered, their middleware runs per request.
+  await assertStaticRoutesUngated(staticRoutes.filter((route) => !isResourceRoute(route)), { loadRouteModule, getLayoutChain, globalMiddleware: prebuiltFilesBypassServer && hasGlobalMiddleware });
 
   let renderedCount = 0;
   let skippedCount = 0;
@@ -622,7 +797,27 @@ export async function build(): Promise<void> {
   // a build that shipped one must not report success.
   let renderErrorCount = 0;
 
+  // A-020 (build side): a prerendered file answers before middleware can
+  // run, so `mode: "static"` + middleware would publish a gated page. Core's
+  // renderStatic refuses the combination for its own renderer; the production
+  // build refuses it here, before prerendering any page. Resource routes are
+  // exempt — never prerendered, their gates run per request.
+  const gatedStatic = findGatedStaticRoutes(routes);
+  if (gatedStatic.length > 0) {
+    console.error(`\n${gatedStaticRoutesError(gatedStatic)}`);
+    process.exit(1);
+  }
+
   for (const route of staticRoutes) {
+    // Resource routes (method handlers, no component) are endpoints served
+    // per request — never prerendered, and never baked via a stray `loader`
+    // export (a resource route's loader never runs at serve time either, so
+    // a file baked from it could never be served).
+    if (isResourceRoute(route)) {
+      console.log(`  Skipping ${route.path} (resource route — served per request)`);
+      skippedCount++;
+      continue;
+    }
     try {
       const module = await loadRouteModule(route);
 
@@ -732,6 +927,7 @@ export async function build(): Promise<void> {
             params,
           });
 
+          const loaderDataByRoute: Record<string, unknown> = { [route.id]: loaderData };
           for (const layoutRoute of layoutChain) {
             const layoutModule = await loadRouteModule(layoutRoute);
             // Call layout loaders so sidebars, nav trees, etc. are populated.
@@ -742,11 +938,13 @@ export async function build(): Promise<void> {
                 params,
                 context,
               } as LoaderArgs);
+              loaderDataByRoute[layoutRoute.id] = layoutData;
             }
             if (layoutModule?.default) {
               element = appH(layoutModule.default as any, { data: layoutData }, element);
             }
           }
+          element = mountRouterProviders(element, route, resolvedPath, params, loaderDataByRoute);
 
           const html = appRender(element);
           // Mounted inside the shell's `<div id="app">` (wrapHtml owns the
@@ -768,7 +966,7 @@ export async function build(): Promise<void> {
             loaderData,
             clientEntryScriptSrc,
             headHtml,
-            clientCssFiles,
+            stylesheetsFor(route),
             islandsEntryScriptSrc,
             seo
           );
@@ -816,6 +1014,8 @@ export async function build(): Promise<void> {
         params: {},
       });
 
+      const loaderDataByRoute: Record<string, unknown> =
+        loaderData !== undefined ? { [route.id]: loaderData } : {};
       for (const layoutRoute of layoutChain) {
         const layoutModule = await loadRouteModule(layoutRoute);
         let layoutData: unknown = {};
@@ -825,11 +1025,13 @@ export async function build(): Promise<void> {
             params: {},
             context,
           } as LoaderArgs);
+          loaderDataByRoute[layoutRoute.id] = layoutData;
         }
         if (layoutModule?.default) {
-          element = h(layoutModule.default as any, { data: layoutData }, element);
+          element = appH(layoutModule.default as any, { data: layoutData }, element);
         }
       }
+      element = mountRouterProviders(element, route, route.path, {}, loaderDataByRoute);
 
       const html = appRender(element);
       // Mounted inside the shell's `<div id="app">` (wrapHtml owns the
@@ -851,7 +1053,7 @@ export async function build(): Promise<void> {
         loaderData,
         clientEntryScriptSrc,
         headHtml,
-        clientCssFiles,
+        stylesheetsFor(route),
         islandsEntryScriptSrc,
         seo
       );
@@ -889,6 +1091,22 @@ export async function build(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 50));
   await server.close();
 
+  await buildStartServerBundle({
+    cwd,
+    outputDir,
+    routesDir,
+    routeRules: neutronConfig.routes,
+    env: neutronConfig.env,
+    routes,
+    userConfig,
+    runtimeAliases: preactAliases,
+    runtimeNoExternal:
+      runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
+    runtime,
+    oxc: oxcJsx,
+    serverActions,
+  });
+
   if (selectedAdapter) {
     console.log(`\nRunning adapter: ${selectedAdapter.name}`);
     await selectedAdapter.adapt({
@@ -901,6 +1119,16 @@ export async function build(): Promise<void> {
       },
       publicArtifacts: [...publicArtifacts].filter(file => fs.existsSync(path.join(outputDir, file))),
       clientEntryScriptSrc,
+      serverActions: serverActions ? Object.keys(serverActions.actions).length : 0,
+      serverEntry: (() => {
+        const file = findServerEntryFile(cwd);
+        return file
+          ? {
+              file: path.relative(cwd, file).split(path.sep).join("/"),
+              declaresWebSocket: serverEntryDeclaresWebSocket(fs.readFileSync(file, "utf-8")),
+            }
+          : null;
+      })(),
       ensureRuntimeBundle,
       log: (message: string) => {
         console.log(`  [adapter] ${message}`);
@@ -926,6 +1154,9 @@ export async function build(): Promise<void> {
  */
 
 /** Security gate for every param-derived static write: reject traversal. */
+// Vite's stylesheet languages (CSS_LANGS_RE in vite/src/node/constants.ts).
+const CSS_LANG_RE = /\.(css|less|sass|scss|styl|stylus|pcss|postcss|sss)$/;
+
 function assertSafeResolvedPath(routePath: string, resolvedPath: string): void {
   if (isUnsafeResolvedPath(resolvedPath)) {
     throw new Error(
@@ -956,7 +1187,7 @@ function wrapHtml(
     : "";
 
   const cssLinks = cssFiles
-    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
+    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}" data-neutron-css>`)
     .join("\n");
 
   return `<!DOCTYPE html>
@@ -997,6 +1228,101 @@ function getResourceOutputPath(outputDir: string, routePath: string): string {
   return path.join(outputDir, routePath.replace(/^\//, ""));
 }
 
+// The CSS pass's own manifest, beside the client build's `.vite/manifest.json`.
+const CSS_PASS_MANIFEST = ".vite/neutron-css-manifest.json";
+
+function readViteManifest(file: string): ViteManifest | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf-8")) as ViteManifest;
+  } catch {
+    return null;
+  }
+}
+
+/** A route with its layouts, outermost first. */
+function routeChain(route: Route, routes: Route[]): Route[] {
+  const chain: Route[] = [route];
+  for (let id = route.parentId; id; ) {
+    const parent = routes.find((candidate) => candidate.id === id);
+    if (!parent) break;
+    chain.unshift(parent);
+    id = parent.parentId;
+  }
+  return chain;
+}
+
+/** A route module's key in a Vite manifest: its root-relative id with the client-route query. */
+function clientRouteManifestKey(cwd: string, file: string): string {
+  return path.relative(cwd, file).split(path.sep).join("/") + "?" + CLIENT_ROUTE_QUERY;
+}
+
+/**
+ * Write `dist/.neutron-route-css.json`: for every page route (and not-found
+ * route), the client entry's CSS, then each layout's from the outermost in,
+ * then the route's own, deduplicated. Routes in `cssPassRouteIds` are read
+ * from the CSS pass's manifest, every other route from the client build's.
+ */
+function writeRouteCssManifest(
+  cwd: string,
+  outputDir: string,
+  routes: Route[],
+  cssPassRouteIds: Set<string>
+): RouteCssManifest | null {
+  const client = readViteManifest(path.join(outputDir, ".vite", "manifest.json"));
+  const cssPass = readViteManifest(path.join(outputDir, CSS_PASS_MANIFEST));
+  if (!client && !cssPass) return null;
+  const entryCss = client
+    ? Object.keys(client)
+        .filter((key) => client[key].isEntry)
+        .flatMap((key) => collectChunkCss(client, key))
+    : [];
+  // The CSS pass re-emits stylesheets the client build also has (a layout
+  // shared by static-tier and app pages) under another name. Link the client
+  // build's copy so both kinds of page share one cached file.
+  const alias = new Map<string, string>();
+  if (client && cssPass) {
+    const read = (href: string) => {
+      try {
+        return fs.readFileSync(path.join(outputDir, href), "utf-8");
+      } catch {
+        return null;
+      }
+    };
+    const byContent = new Map<string, string>();
+    for (const key of Object.keys(client)) {
+      for (const href of collectChunkCss(client, key)) {
+        const content = read(href);
+        if (content !== null && !byContent.has(content)) byContent.set(content, href);
+      }
+    }
+    for (const key of Object.keys(cssPass)) {
+      for (const href of collectChunkCss(cssPass, key)) {
+        const content = read(href);
+        const same = content === null ? undefined : byContent.get(content);
+        if (same && same !== href) alias.set(href, same);
+      }
+    }
+  }
+  const table: Record<string, string[]> = {};
+  for (const route of routes) {
+    if (route.isLayout || route.file.includes("_layout") || isResourceRoute(route)) continue;
+    const manifest = cssPassRouteIds.has(route.id) ? cssPass : client;
+    if (!manifest) continue;
+    const chain = routeChain(route, routes);
+    const hrefs = [...entryCss];
+    for (const member of chain) {
+      hrefs.push(...collectChunkCss(manifest, clientRouteManifestKey(cwd, member.file)));
+    }
+    table[route.id] = [...new Set(hrefs.map((href) => alias.get(href) ?? href))];
+  }
+  for (const duplicate of alias.keys()) {
+    fs.rmSync(path.join(outputDir, duplicate), { force: true });
+  }
+  const routeCss: RouteCssManifest = { format: ROUTE_CSS_MANIFEST_FORMAT, routes: table };
+  fs.writeFileSync(path.join(outputDir, ROUTE_CSS_MANIFEST), JSON.stringify(routeCss, null, 2));
+  return routeCss;
+}
+
 function extractClientCssFiles(outputDir: string): string[] {
   const assetsDir = path.join(outputDir, "assets");
   if (!fs.existsSync(assetsDir)) return [];
@@ -1021,6 +1347,28 @@ function extractIslandsEntryScriptSrc(outputDir: string): string | null {
   return `/assets/${candidates[candidates.length - 1]}`;
 }
 
+
+/**
+ * Write `dist/.neutron-server-actions.json` — the actions the client passes
+ * registered — or remove a stale one when there are none.
+ */
+function writeServerActionsManifest(
+  outputDir: string,
+  registry: ServerActionRegistry
+): ServerActionsManifest | null {
+  const manifestPath = path.join(outputDir, SERVER_ACTIONS_MANIFEST);
+  if (registry.size === 0) {
+    fs.rmSync(manifestPath, { force: true });
+    return null;
+  }
+  const manifest = registry.toManifest();
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+  console.log(
+    `\n${registry.size} server action${registry.size === 1 ? "" : "s"} in ${registry.files().length} ` +
+      `module${registry.files().length === 1 ? "" : "s"} → ${SERVER_ACTIONS_MANIFEST}`
+  );
+  return manifest;
+}
 
 function writeClientEntryMetadata(outputDir: string, src: string): void {
   const metadataPath = path.join(outputDir, ".neutron-client-entry.json");
@@ -1079,13 +1427,19 @@ interface RuntimeBundleBuilderOptions {
   outputDir: string;
   routesDir: string;
   routeRules?: NeutronConfig["routes"];
+  env?: NeutronConfig["env"];
   routes: Route[];
   pageRoutes: Route[];
   clientEntryScriptSrc: string | null;
   clientCssFiles: string[];
+  routeCss: RouteCssManifest | null;
+  serverActions: ServerActionsManifest | null;
+  serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] };
+  securityHeaders?: false | { headers?: Record<string, string> };
   userConfig: Record<string, any>;
-  runtimeAliases?: Array<{ find: string; replacement: string }> | Record<string, string>;
-  runtimeNoExternal?: string[];
+  runtimeAliases?: Array<{ find: string | RegExp; replacement: string }> | Record<string, string>;
+  /** `true` = process the whole dependency graph (react-compat). */
+  runtimeNoExternal?: string[] | true;
 }
 
 interface RuntimeBundleArtifact {
@@ -1171,17 +1525,19 @@ function resolveAdapterForBuild(
 
 function createRuntimeBundleBuilder(
   options: RuntimeBundleBuilderOptions
-): (target: RuntimeBundleArtifact["target"]) => Promise<RuntimeBundleArtifact> {
-  const pending = new Map<
-    RuntimeBundleArtifact["target"],
-    Promise<RuntimeBundleArtifact>
-  >();
+): (
+  target: RuntimeBundleArtifact["target"],
+  bundleOptions?: { selfContained?: boolean }
+) => Promise<RuntimeBundleArtifact> {
+  const pending = new Map<string, Promise<RuntimeBundleArtifact>>();
 
-  return async (target: RuntimeBundleArtifact["target"]): Promise<RuntimeBundleArtifact> => {
-    let bundle = pending.get(target);
+  return async (target, bundleOptions = {}): Promise<RuntimeBundleArtifact> => {
+    const selfContained = bundleOptions.selfContained === true;
+    const key = `${target}:${selfContained}`;
+    let bundle = pending.get(key);
     if (!bundle) {
-      bundle = buildRuntimeBundle(options, target);
-      pending.set(target, bundle);
+      bundle = buildRuntimeBundle(options, target, selfContained);
+      pending.set(key, bundle);
     }
     return bundle;
   };
@@ -1189,7 +1545,8 @@ function createRuntimeBundleBuilder(
 
 async function buildRuntimeBundle(
   options: RuntimeBundleBuilderOptions,
-  target: RuntimeBundleArtifact["target"]
+  target: RuntimeBundleArtifact["target"],
+  selfContained = false
 ): Promise<RuntimeBundleArtifact> {
   const appRoutes = options.pageRoutes.filter((route) => route.config.mode === "app");
   if (appRoutes.length === 0) {
@@ -1217,19 +1574,126 @@ async function buildRuntimeBundle(
       appRoutes,
       options.clientEntryScriptSrc,
       options.clientCssFiles,
+      options.routeCss,
       entryPath,
       options.routeRules,
-      globalMiddlewarePath
+      globalMiddlewarePath,
+      options.serverActions,
+      options.serverActionsOptions,
+      options.securityHeaders,
+      findServerEntryFile(options.cwd)
     ),
     "utf-8"
   );
 
   const bundleOutDir = path.join(options.outputDir, "server", target);
+  // Self-contained (docker): core's own dependencies stay external exactly as
+  // in the start bundle (bundling them fails under pnpm + preserveSymlinks),
+  // and everything the bundle imports is shipped into the output.
+  const externals = selfContained
+    ? importerResolvedExternals(bundleOutDir, corePackageRoots(options.cwd))
+    : null;
+  const imported = new Set<string>();
+  await bundleServerEntry(options, {
+    entryPath,
+    outDir: bundleOutDir,
+    target: target === "worker" ? "webworker" : "node",
+    chunkFileNames: "chunks/[name]-[hash].js",
+    ...(externals
+      ? { plugins: [externals.plugin, collectExternalImportsPlugin(imported)], external: ["vite"] }
+      : {}),
+  });
+  if (externals) {
+    const roots: ShippedDependencyRoot[] = [];
+    const aliases = externals.aliases();
+    const seen = new Set<string>();
+    for (const specifier of imported) {
+      const name = bareSpecifierPackage(specifier);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      const aliasTarget = aliases.get(name);
+      if (aliasTarget) {
+        roots.push({ realDir: aliasTarget, dest: path.join(bundleOutDir, "node_modules", name) });
+        continue;
+      }
+      // Bare: resolved from the bundle's location, i.e. the app root.
+      const realDir = resolvePackageDir(bundleOutDir, name);
+      if (realDir) {
+        roots.push({ realDir, dest: path.join(options.outputDir, "node_modules", name) });
+      }
+    }
+    const count = shipDependencies(options.outputDir, roots);
+    console.log(`  ${count} runtime packages shipped → ${path.relative(options.cwd, path.join(options.outputDir, "node_modules"))}/`);
+  }
+
+  const entryRelativePath = path.relative(options.outputDir, path.join(bundleOutDir, "entry.js"));
+  return {
+    target,
+    outDir: bundleOutDir,
+    entryPath: path.join(bundleOutDir, "entry.js"),
+    entryRelativePath: entryRelativePath.split(path.sep).join("/"),
+  };
+}
+
+/**
+ * One SSR (Rolldown) build of a generated server entry, in the module graph
+ * every server bundle uses: the app's Vite config, the runtime's preact
+ * aliases, and preact + preact-render-to-string + @neutron-build/core
+ * processed INTO the bundle (react-compat: everything), so the renderer, the
+ * router providers and the routes' hooks are one Preact instance whatever
+ * the install shape.
+ */
+async function bundleServerEntry(
+  options: Pick<
+    RuntimeBundleBuilderOptions,
+    "cwd" | "routesDir" | "routeRules" | "env" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
+  > & { oxc?: unknown },
+  build: {
+    entryPath: string;
+    outDir: string;
+    target: "node" | "webworker";
+    chunkFileNames: string;
+    sourcemap?: boolean;
+    plugins?: unknown[];
+    external?: string[];
+  }
+): Promise<void> {
+  const entryPath = build.entryPath;
+  const bundleOutDir = build.outDir;
   await viteBuild(
     mergeConfig(options.userConfig, {
       configFile: false,
       root: options.cwd,
+      ...(options.oxc ? { oxc: options.oxc } : {}),
       plugins: [
+        ...(build.plugins ?? []),
+        // A webworker SSR target resolves with the client conditions, which
+        // select core's browser entry (server-only exports stubbed). A worker
+        // bundle is the server, so it takes the full root entry.
+        ...(build.target === "webworker"
+          ? [
+              {
+                name: "neutron:worker-core-entry",
+                enforce: "pre" as const,
+                async resolveId(
+                  this: {
+                    resolve: (
+                      id: string,
+                      importer?: string,
+                      options?: { skipSelf?: boolean }
+                    ) => Promise<{ id: string } | null>;
+                  },
+                  id: string,
+                  importer: string | undefined
+                ) {
+                  if (id !== "@neutron-build/core") return null;
+                  const resolved = await this.resolve(id, importer, { skipSelf: true });
+                  if (!resolved || !resolved.id.endsWith("index.browser.js")) return resolved;
+                  return { ...resolved, id: resolved.id.slice(0, -"index.browser.js".length) + "index.js" };
+                },
+              },
+            ]
+          : []),
         // Vite's SSR resolver does not honor the `exports` map for the
         // dynamic-import subpath `preact-render-to-string/stream` inside the
         // noExternal @neutron-build/core dep — it falls back to a raw
@@ -1267,46 +1731,380 @@ async function buildRuntimeBundle(
           rootDir: options.cwd,
           routeRules: options.routeRules,
         }),
+        neutronPublicEnvPlugin(options.env),
       ],
       resolve: {
         ...(options.runtimeAliases ? { alias: options.runtimeAliases } : {}),
         dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
       },
       ssr: {
-        target: target === "worker" ? "webworker" : "node",
+        target: build.target,
+        ...(build.external ? { external: build.external } : {}),
         // Bundle @neutron-build/core with the same preact the renderer uses, so
         // inline hook components (e.g. Link) in app-mode routes don't hit the
         // two-preact-instance "__H" crash at runtime — matching the build/dev paths.
-        noExternal: [
-          "preact",
-          "preact/hooks",
-          "preact-render-to-string",
-          "@neutron-build/core",
-          ...(options.runtimeNoExternal || []),
-        ],
+        // react-compat passes `true` here (resolveRuntimeNoExternal): every dep
+        // that imports react must be IN the bundle, or the bundle imports real
+        // React at runtime and SSR crashes. Escape hatch: ssr.external in the
+        // app's vite.config re-externalizes specific packages.
+        noExternal:
+          options.runtimeNoExternal === true
+            ? true
+            : [
+                "preact",
+                "preact/hooks",
+                "preact-render-to-string",
+                "@neutron-build/core",
+                ...(options.runtimeNoExternal || []),
+              ],
       },
       build: {
         ssr: entryPath,
         outDir: bundleOutDir,
         emptyOutDir: true,
+        ...(build.sourcemap ? { sourcemap: true } : {}),
         rolldownOptions: {
           output: {
             format: "esm",
             entryFileNames: "entry.js",
-            chunkFileNames: "chunks/[name]-[hash].js",
+            chunkFileNames: build.chunkFileNames,
             assetFileNames: "assets/[name]-[hash][extname]",
           },
         },
       },
     })
   );
+}
 
-  const entryRelativePath = path.relative(options.outputDir, path.join(bundleOutDir, "entry.js"));
+/**
+ * The `neutron-ts start` server bundle (F-P2-1). `createServer` otherwise
+ * builds a Vite SSR runtime at every boot and transforms each route module,
+ * layout and the global middleware on first use. This compiles exactly that
+ * set — every discovered route file, since any of them can be rendered at
+ * runtime (gated static routes, not-found pages, a static path missing from
+ * dist), plus src/middleware.* — into dist/server/start/, and records it in
+ * dist/.neutron-server-bundle.json, which createServer loads natively.
+ *
+ * Built only when the server would start an SSR runtime at all (app routes,
+ * resource routes or global middleware); a static-only site has nothing to
+ * load. A failure here does not fail the build: start then falls back to the
+ * Vite runtime, as it did before bundles existed, and says so at boot.
+ */
+async function buildStartServerBundle(
+  options: Pick<
+    RuntimeBundleBuilderOptions,
+    "cwd" | "outputDir" | "routesDir" | "routeRules" | "env" | "routes" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
+  > & { runtime: string; oxc: unknown; serverActions: ServerActionsManifest | null }
+): Promise<void> {
+  const manifestPath = path.join(options.outputDir, SERVER_BUNDLE_MANIFEST);
+  fs.rmSync(manifestPath, { force: true });
+
+  const globalMiddlewareFile = findGlobalMiddlewareFile(options.cwd);
+  // src/server.entry.ts is compiled into the same bundle, so its mounts and
+  // the routes share one instance of every module they both import.
+  const serverEntryFile = findServerEntryFile(options.cwd);
+  const pages = options.routes.filter((route) => !route.file.includes("_layout"));
+  const actionFiles = options.serverActions
+    ? [...new Set(Object.values(options.serverActions.actions).map((entry) => path.resolve(options.cwd, entry.file)))]
+    : [];
+  const needsRuntime =
+    globalMiddlewareFile !== null ||
+    serverEntryFile !== null ||
+    actionFiles.length > 0 ||
+    pages.some((route) => route.config.mode === "app" || isResourceRoute(route));
+  if (!needsRuntime) {
+    return;
+  }
+
+  const runtimeDir = path.join(options.cwd, ".neutron", "runtime");
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const entryPath = path.join(runtimeDir, "entry.start.ts");
+  const files = [
+    ...options.routes.map((route) => route.file),
+    ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
+    ...(serverEntryFile ? [serverEntryFile] : []),
+    ...actionFiles,
+  ];
+  fs.writeFileSync(
+    entryPath,
+    generateServerBundleEntry({
+      entryPath,
+      rootDir: options.cwd,
+      files,
+      runtime: options.runtime as "preact" | "react-compat",
+    }),
+    "utf-8"
+  );
+
+  const outDir = path.join(options.outputDir, "server", "start");
+  const externals = importerResolvedExternals(outDir, corePackageRoots(options.cwd));
+  console.log("\nBuilding server bundle...");
+  try {
+    await bundleServerEntry(options, {
+      entryPath,
+      outDir,
+      target: "node",
+      // Flat: every chunk sits in outDir, so a source file's location
+      // relative to the chunk that holds it is a build-time constant.
+      chunkFileNames: "[name]-[hash].js",
+      sourcemap: true,
+      plugins: [pinImportMetaPathsPlugin(outDir), externals.plugin],
+      // `vite` is reached only through core's Vite fallback (a dynamic import
+      // that never runs under a bundle). Under react-compat, core's CJS-only
+      // deps stay native exactly as in start's Vite runtime.
+      external: [
+        "vite",
+        ...(options.runtimeNoExternal === true ? RUNTIME_RUNNER_CJS_EXTERNALS : []),
+      ],
+    });
+  } catch (error) {
+    // Rolldown writes the chunks before it reports a resolve error. Left in
+    // place, that tree sits under the app root, where the Vite runtime start
+    // falls back to scans it (Tailwind's source detection read the Fylun
+    // port's 135 MB of dead chunks on every CSS compile: +120 MB boot RSS,
+    // +5 s CPU on first SSR).
+    fs.rmSync(outDir, { recursive: true, force: true });
+    console.warn(
+      `\n  [warn] Server bundle failed to build; \`neutron-ts start\` will transform route ` +
+        `modules through Vite at boot instead.\n  ${String((error as Error)?.message ?? error)}\n`
+    );
+    return;
+  }
+  externals.link();
+
+  fs.writeFileSync(
+    manifestPath,
+    JSON.stringify(
+      {
+        format: SERVER_BUNDLE_FORMAT,
+        entry: path.relative(options.outputDir, path.join(outDir, "entry.js")).split(path.sep).join("/"),
+        runtime: options.runtime,
+      },
+      null,
+      2
+    ),
+    "utf-8"
+  );
+  console.log(`  ${files.length} modules → ${path.relative(options.cwd, outDir)}/entry.js`);
+}
+
+/**
+ * Externals resolve from the module that imports them, as under Vite's SSR
+ * runtime and plain Node. A bundled module's bare import is emitted into a
+ * chunk under dist/server/start/, where Node resolves it from the APP ROOT —
+ * and under pnpm a bundled dependency's own dependencies (core's
+ * @mdx-js/mdx, shiki, …) are not visible from there, or resolve to the app's
+ * different version. Such an import is rewritten to a private alias
+ * (`@neutron-external/<name>-<hash>`) that a symlink in the bundle's own
+ * node_modules/ points at the package root the importer resolved. Node then
+ * applies that package's exports map with its usual conditions and loads the
+ * same file the server's native modules do. Imports the app root resolves
+ * identically stay bare.
+ *
+ * `nativeDepsOf` names packages (by their real directory) whose OWN imports
+ * of other packages are never bundled: @neutron-build/core's shiki,
+ * @mdx-js/mdx, typescript, zod, hono, … share no module instance with app
+ * code, and under
+ * react-compat's `noExternal: true` they were inlined (tens of MB) — or
+ * failed to build: with `resolve.preserveSymlinks` the resolver stays on
+ * core's linked path, where pnpm's siblings of a dependency (shiki's
+ * @shikijs/*) are invisible. Their imports are resolved here from the
+ * importer's REAL path, as Node resolves them, and kept external. Only the
+ * renderer's graph (preact, preact-render-to-string, signals) stays bundled,
+ * because hooks and renderer must share one instance.
+ */
+/**
+ * Real directories of @neutron-build/core: the copy the app resolves (what
+ * the bundle's routes import) and the CLI's own, when they differ.
+ */
+function corePackageRoots(cwd: string): string[] {
+  const roots = new Set<string>();
+  for (let dir = cwd; ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, "node_modules", "@neutron-build", "core");
+    if (fs.existsSync(path.join(candidate, "package.json"))) {
+      roots.add(fs.realpathSync(candidate));
+      break;
+    }
+    if (path.dirname(dir) === dir) break;
+  }
+  for (let dir = path.dirname(fileURLToPath(import.meta.resolve("@neutron-build/core/server"))); ; dir = path.dirname(dir)) {
+    const pkg = path.join(dir, "package.json");
+    if (fs.existsSync(pkg) && JSON.parse(fs.readFileSync(pkg, "utf-8")).name === "@neutron-build/core") {
+      roots.add(fs.realpathSync(dir));
+      break;
+    }
+    if (path.dirname(dir) === dir) break;
+  }
+  return [...roots];
+}
+
+const BUNDLED_WITH_APP = new Set(["preact", "preact-render-to-string", "@preact/signals-core"]);
+
+function importerResolvedExternals(outDir: string, nativeDepsOf: string[] = []) {
+  const links = new Map<string, string>();
+  const rootOwnPackage = new Map<string, string | null>();
+  const owners = nativeDepsOf.map((root) => {
+    const name = (JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf-8")) as { name?: string }).name;
+    return { root, name, nodeModules: path.join(root, "node_modules") };
+  });
+  const realImporters = new Map<string, string | null>();
+  const realPathOf = (importer: string): string | null => {
+    const file = importer.split("?")[0];
+    if (!realImporters.has(file)) {
+      let real: string | null = null;
+      try {
+        real = path.isAbsolute(file) ? fs.realpathSync(file) : null;
+      } catch {
+        real = null;
+      }
+      realImporters.set(file, real);
+    }
+    return realImporters.get(file) ?? null;
+  };
+
+  const packageRootFrom = (dir: string, name: string): string | null => {
+    for (let current = dir; ; current = path.dirname(current)) {
+      const candidate = path.join(current, "node_modules", name);
+      if (fs.existsSync(path.join(candidate, "package.json"))) {
+        return fs.realpathSync(candidate);
+      }
+      if (path.dirname(current) === current) return null;
+    }
+  };
+  const packageRootOf = (packageJsonPath: string, name: string): string | null => {
+    for (let dir = path.dirname(packageJsonPath); ; dir = path.dirname(dir)) {
+      const pkg = path.join(dir, "package.json");
+      if (fs.existsSync(pkg)) {
+        try {
+          if (JSON.parse(fs.readFileSync(pkg, "utf-8")).name === name) return fs.realpathSync(dir);
+        } catch {
+          // keep walking
+        }
+      }
+      if (path.dirname(dir) === dir) return null;
+    }
+  };
+
   return {
-    target,
-    outDir: bundleOutDir,
-    entryPath: path.join(bundleOutDir, "entry.js"),
-    entryRelativePath: entryRelativePath.split(path.sep).join("/"),
+    plugin: {
+      name: "neutron:importer-resolved-externals",
+      enforce: "pre" as const,
+      async resolveId(
+        this: {
+          resolve: (
+            id: string,
+            importer?: string,
+            options?: { skipSelf?: boolean }
+          ) => Promise<{ id: string; external?: boolean | string; packageJsonPath?: string } | null>;
+        },
+        id: string,
+        importer: string | undefined
+      ) {
+        if (!importer || id.startsWith(".") || id.startsWith("/") || id.startsWith("\0") || id.includes(":")) {
+          return null;
+        }
+        const parts = id.split("/");
+        const name = id.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+        const subpath = id.slice(name.length);
+        let target: string | null = null;
+        const realImporter = owners.length > 0 ? realPathOf(importer) : null;
+        const owner = realImporter
+          ? owners.find(
+              (candidate) =>
+                name !== candidate.name &&
+                !BUNDLED_WITH_APP.has(name) &&
+                realImporter.startsWith(candidate.root + path.sep) &&
+                !realImporter.startsWith(candidate.nodeModules + path.sep)
+            )
+          : undefined;
+        if (owner) {
+          target = packageRootFrom(path.dirname(realImporter!), name);
+          // An optional peer that is not installed: external as written, so
+          // the runtime import fails (and is handled) as it does unbundled.
+          if (!target) return { id, external: true };
+        } else {
+          const resolved = await this.resolve(id, importer, { skipSelf: true });
+          if (!resolved || resolved.external !== true || !resolved.packageJsonPath) return null;
+          target = packageRootOf(resolved.packageJsonPath, name);
+          if (!target) return null;
+        }
+        if (!rootOwnPackage.has(name)) rootOwnPackage.set(name, packageRootFrom(outDir, name));
+        if (rootOwnPackage.get(name) === target) return owner ? { id, external: true } : null;
+        const hash = createHash("sha256").update(target).digest("hex").slice(0, 8);
+        const alias = `@neutron-external/${name.replace(/^@/, "").replace(/\//g, "__")}-${hash}`;
+        links.set(alias, target);
+        return { id: alias + subpath, external: true };
+      },
+    },
+    /** Alias package name (`@neutron-external/<name>-<hash>`) → the real package root it stands for. */
+    aliases(): Map<string, string> {
+      return new Map(links);
+    },
+    /** Create the alias symlinks (relative, so the dist moves with node_modules). */
+    link(): void {
+      for (const [alias, target] of links) {
+        const linkPath = path.join(outDir, "node_modules", alias);
+        fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+        fs.rmSync(linkPath, { force: true, recursive: true });
+        fs.symlinkSync(path.relative(path.dirname(linkPath), target), linkPath, "dir");
+      }
+    },
+  };
+}
+
+/** Records every external module id the emitted chunks import (static or dynamic). */
+function collectExternalImportsPlugin(into: Set<string>) {
+  return {
+    name: "neutron:collect-external-imports",
+    generateBundle(
+      _options: unknown,
+      bundle: Record<string, { type: string; imports?: string[]; dynamicImports?: string[] }>
+    ) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== "chunk") continue;
+        for (const id of [...(output.imports ?? []), ...(output.dynamicImports ?? [])]) {
+          if (!(id in bundle)) into.add(id);
+        }
+      }
+    },
+  };
+}
+
+/**
+ * Keep `import.meta.url` / `filename` / `dirname` pointing at each module's
+ * SOURCE file, as they do under Vite's SSR runtime and plain Node. Bundled,
+ * they would name the chunk instead, and code that resolves files next to
+ * itself (fonts, templates, a generated client's engine) reads the wrong
+ * directory. Rewritten relative to the chunk's own URL rather than as an
+ * absolute path, so the dist keeps working when the app root moves with it.
+ */
+function pinImportMetaPathsPlugin(outDir: string) {
+  const META = /\bimport\.meta\.(url|filename|dirname)\b/g;
+  return {
+    name: "neutron:pin-import-meta-paths",
+    enforce: "pre" as const,
+    transform(code: string, id: string) {
+      if (id.startsWith("\0") || !code.includes("import.meta.")) return null;
+      const file = id.split("?")[0];
+      if (!path.isAbsolute(file) || !fs.existsSync(file)) return null;
+      META.lastIndex = 0;
+      if (!META.test(code)) return null;
+      const rel = path.relative(outDir, file).split(path.sep).join("/");
+      const url = `new URL(${JSON.stringify(rel)}, import.meta.url)`;
+      let usesPath = false;
+      const replaced = code.replace(META, (_match, prop: string) => {
+        if (prop === "url") return `${url}.href`;
+        usesPath = true;
+        const filename = `__neutronFileURLToPath(${url})`;
+        return prop === "filename" ? filename : `__neutronDirname(${filename})`;
+      });
+      // Same line: the transform moves no code between lines (map: null).
+      const prefix = usesPath
+        ? 'import { fileURLToPath as __neutronFileURLToPath } from "node:url"; ' +
+          'import { dirname as __neutronDirname } from "node:path"; '
+        : "";
+      return { code: prefix + replaced, map: null };
+    },
   };
 }
 
@@ -1342,9 +2140,14 @@ export function generateRuntimeEntrySource(
   appRoutes: Route[],
   clientEntryScriptSrc: string | null,
   clientCssFiles: string[],
+  routeCss: RouteCssManifest | null,
   entryPath: string,
   routeRules: NeutronConfig["routes"] | undefined,
-  globalMiddlewarePath?: string
+  globalMiddlewarePath?: string,
+  serverActions?: ServerActionsManifest | null,
+  serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] },
+  securityHeaders?: false | { headers?: Record<string, string> },
+  serverEntryPath?: string | null
 ): string {
   const imports: string[] = [];
   const moduleEntries: string[] = [];
@@ -1360,6 +2163,24 @@ export function generateRuntimeEntrySource(
   if (globalMiddlewarePath) {
     const relGm = relativeImportPath(path.dirname(entryPath), globalMiddlewarePath);
     imports.push(`import * as __globalMiddlewareModule from "${relGm}";`);
+  }
+
+  // Server Actions: each registered module imported, ids resolved through a
+  // table the build fixed (core/server-actions.ts answers the request).
+  const actionEntries: string[] = [];
+  if (serverActions) {
+    const actionModuleVars = new Map<string, string>();
+    for (const [id, entry] of Object.entries(serverActions.actions)) {
+      let importVar = actionModuleVars.get(entry.file);
+      if (!importVar) {
+        importVar = `actionModule${actionModuleVars.size}`;
+        actionModuleVars.set(entry.file, importVar);
+        imports.push(
+          `import * as ${importVar} from "${relativeImportPath(path.dirname(entryPath), path.resolve(path.dirname(entryPath), "..", "..", entry.file))}";`
+        );
+      }
+      actionEntries.push(`  ${JSON.stringify(id)}: { module: ${importVar}, name: ${JSON.stringify(entry.export)} },`);
+    }
   }
 
   runtimeRoutes.forEach((route, index) => {
@@ -1378,11 +2199,71 @@ export function generateRuntimeEntrySource(
   },`);
   });
 
-  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
-${imports.join("\n")}
+  const actionsImport = actionEntries.length > 0
+    ? `import { handleServerActionRequest, serverActionReferrerPath, SERVER_ACTION_PATH } from "@neutron-build/core/runtime-edge";\n`
+    : "";
+  const actionsDispatch = actionEntries.length > 0
+    ? `
+  if (pathname === SERVER_ACTION_PATH) {
+    const response = await handleServerActionRequest(request, {
+      ...SERVER_ACTIONS_OPTIONS,
+      globalMiddleware: GLOBAL_MIDDLEWARE,
+      resolve: (id) => {
+        const entry = Object.prototype.hasOwnProperty.call(SERVER_ACTIONS, id) ? SERVER_ACTIONS[id] : undefined;
+        const fn = entry ? entry.module[entry.name] : undefined;
+        return typeof fn === "function" ? { fn, name: entry.name } : null;
+      },
+      onError: (error, action) => {
+        console.error("[neutron] server action " + (action.name || action.id) + " failed:", error);
+      },
+    });
+    if (response.headers.has("x-neutron-invalidate")) {
+      await applyMutationInvalidationToLoaderDataCache(serverActionReferrerPath(request) || pathname, response);
+    }
+    return response;
+  }
+`
+    : "";
+
+  const serverEntryDecl = serverEntryPath
+    ? `import * as __serverEntryModule from "${relativeImportPath(path.dirname(entryPath), serverEntryPath)}";
+import { compileMounts, dispatchMounts } from "@neutron-build/core/runtime-edge";
+
+// Resolved once, on the first request, as start resolves it at boot.
+let __serverEntryMounts;
+function serverEntryMounts() {
+  __serverEntryMounts ??= (async () => {
+    const exported = __serverEntryModule.default;
+    const entry = typeof exported === "function" ? await exported() : exported;
+    if (!entry || typeof entry !== "object") {
+      throw new TypeError("${path.basename(serverEntryPath)}: expected a default export of an object (or a function returning one).");
+    }
+    if (entry.websocket) {
+      throw new Error("${path.basename(serverEntryPath)} declares a websocket, which this deployment target cannot serve.");
+    }
+    return compileMounts(entry.mount);
+  })();
+  return __serverEntryMounts;
+}
+`
+    : "";
+
+  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse, applyRouteRuleHeaders, applySecurityHeaders, resolveSecurityHeadersConfig, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
+${actionsImport}${imports.join("\n")}
+${serverEntryDecl}
+const SECURITY_HEADERS = resolveSecurityHeadersConfig(${securityHeaders === undefined ? "undefined" : JSON.stringify(securityHeaders)});
+
+const SERVER_ACTIONS = {
+${actionEntries.join("\n")}
+};
+const SERVER_ACTIONS_OPTIONS = ${JSON.stringify({
+    bodySizeLimit: serverActionsOptions?.bodySizeLimit,
+    allowedOrigins: serverActionsOptions?.allowedOrigins,
+  })};
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
 const CLIENT_STYLESHEET_HREFS = ${JSON.stringify(clientCssFiles)};
+const ROUTE_CSS = ${JSON.stringify(routeCss)};
 const ROUTE_RULES = compileRouteRules(${routeRulesJson});
 
 const ROUTE_DEFS = [
@@ -1414,7 +2295,17 @@ async function handleNeutronRequestInner(request) {
   if (!pathname) {
     return new Response("Bad Request", { status: 400 });
   }
-
+${actionsDispatch}${serverEntryPath ? `
+  // src/server.entry.ts mounts, with start's semantics (core/mount-dispatch.ts).
+  return dispatchMounts(await serverEntryMounts(), request, pathname, GLOBAL_MIDDLEWARE, (globalChainRan) =>
+    handleRouteRequest(request, requestUrl, pathname, globalChainRan)
+  );
+}
+` : `
+  return handleRouteRequest(request, requestUrl, pathname, false);
+}
+`}
+async function handleRouteRequest(request, requestUrl, pathname, globalChainRan) {
   const redirect = resolveRouteRuleRedirect(ROUTE_RULES, pathname, requestUrl.search);
   if (redirect) {
     return new Response(null, {
@@ -1453,7 +2344,7 @@ async function handleNeutronRequestInner(request) {
     routeModules,
     {
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
-      stylesheetHrefs: CLIENT_STYLESHEET_HREFS,
+      stylesheetHrefs: routeStylesheetHrefs(ROUTE_CSS, match.route.id, CLIENT_STYLESHEET_HREFS),
       loaderDataCache: LOADER_DATA_CACHE,
       loaderCacheFence: { generation, stillValid: () => true },
       requestTrace: {
@@ -1461,7 +2352,7 @@ async function handleNeutronRequestInner(request) {
         method: request.method,
         pathname: effectivePathname,
       },
-      globalMiddleware: GLOBAL_MIDDLEWARE,
+      globalMiddleware: globalChainRan ? [] : GLOBAL_MIDDLEWARE,
     }
   ));
   } catch (error) {
@@ -1475,7 +2366,6 @@ async function handleNeutronRequestInner(request) {
     await applyMutationInvalidationToLoaderDataCache(effectivePathname, response);
   }
 
-  applyRouteRuleHeaders(response, pathname);
   return response;
 }
 
@@ -1516,21 +2406,6 @@ function getLayoutChain(route) {
 }
 
 
-function applyRouteRuleHeaders(response, pathname) {
-  const matches = resolveRouteRuleHeaders(ROUTE_RULES, pathname);
-  for (const match of matches) {
-    for (const [name, value] of Object.entries(match.headers || {})) {
-      try {
-        if (!response.headers.has(name)) {
-          response.headers.set(name, String(value));
-        }
-      } catch {
-        // Ignore immutable Response headers (for example, redirect responses).
-      }
-    }
-  }
-}
-
 async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
   const directive = response.headers.get("x-neutron-invalidate");
   if (!directive) {
@@ -1562,20 +2437,43 @@ async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
   }
 }
 
-// Apply baseline security headers to every response from the production handler
-// (the dev server does this already; the generated handler must match).
+// Whether the app answers \`pathname\` (a redirect rule, or an app route
+// after rewrites): a host serving dist files must not shadow it with one.
+export function handlesPath(pathname) {
+  const normalized = normalizePathname(pathname);
+  if (!normalized) return false;
+  if (resolveRouteRuleRedirect(ROUTE_RULES, normalized, "")) return true;
+  const effective = resolveRouteRuleRewrite(ROUTE_RULES, normalized)?.pathname || normalized;
+  const match = router.match(effective);
+  return Boolean(match && APP_ROUTE_IDS.has(match.route.id));
+}
+
+// The headers a file served for \`pathname\` gets: what handleNeutronRequest
+// adds to its own responses.
+export function staticHeaders(pathname) {
+  const response = new Response(null);
+  const rulePath = normalizePathname(pathname);
+  const suppressed = rulePath
+    ? applyRouteRuleHeaders(response, resolveRouteRuleHeaders(ROUTE_RULES, rulePath))
+    : new Set();
+  if (SECURITY_HEADERS) {
+    applySecurityHeaders(response, SECURITY_HEADERS, suppressed);
+  }
+  return Object.fromEntries(response.headers);
+}
+
+// Route-rule headers, then the security defaults they do not override or
+// null out, on every response — the order and set \`neutron-ts start\` applies.
 export async function handleNeutronRequest(request, transport) {
   if (typeof transport?.remoteAddress === "string") installTransportPeer(request, transport.remoteAddress);
-  const response = mutableResponse(await handleNeutronRequestInner(request));
-  const defaults = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-  };
-  for (const [name, value] of Object.entries(defaults)) {
-    if (!response.headers.has(name)) {
-      response.headers.set(name, value);
-    }
+  // A redirected data request is reported, not followed (core/data-redirect.ts).
+  const response = mutableResponse(toDataRedirectResponse(request, await handleNeutronRequestInner(request)));
+  const rulePath = normalizePathname(new URL(request.url).pathname);
+  const suppressed = rulePath
+    ? applyRouteRuleHeaders(response, resolveRouteRuleHeaders(ROUTE_RULES, rulePath))
+    : new Set();
+  if (SECURITY_HEADERS) {
+    applySecurityHeaders(response, SECURITY_HEADERS, suppressed);
   }
   return response;
 }

@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AdapterBuildContext, NeutronAdapter } from "./adapter.js";
+import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 import {
   readStaticHeadersMap,
   toCloudflareHeadersFile,
@@ -17,6 +17,7 @@ export function adapterNetlify(
   return {
     name: "netlify",
     async adapt(context: AdapterBuildContext) {
+      assertServerFeaturesServable("netlify", context, context.routes.app > 0);
       const hasAppRoutes = context.routes.app > 0;
       if (hasAppRoutes && !context.ensureRuntimeBundle) {
         if (!options.allowAppRoutes) {

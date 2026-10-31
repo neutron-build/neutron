@@ -26,11 +26,14 @@ export type { PictureProps } from "./picture.js";
 export { ViewTransitions } from "./view-transitions.js";
 export { ScrollReveal } from "./scroll-reveal.js";
 export type { ScrollRevealProps } from "./scroll-reveal.js";
+export type { AnyJsxElement, JsxChild, JsxChildren } from "./jsx-agnostic.js";
 // `init`/`registerRoutes` come from the tier shim, not the router: importing
 // the router here would statically pull the navigation machinery into every
 // app entry and defeat the code split. See ./start.ts.
 export { init, registerRoutes, appNeedsRouter } from "./start.js";
 export { navigate, go, subscribe, getCurrentPath, getCurrentSearch } from "./navigate.js";
 export { initIslands } from "./island-runtime.js";
+export { configureRouter, type NeutronRouterOptions } from "./router-options.js";
+export { createServerActionReference, callServerAction, ServerActionError } from "./server-actions.js";
 export { route } from "../core/typed-routes.js";
 export type { RoutePath, RouteHref, NeutronGeneratedRouteMap } from "../core/typed-routes.js";

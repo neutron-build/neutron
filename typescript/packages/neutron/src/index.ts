@@ -1,6 +1,12 @@
 export { createRouter } from "./core/router.js";
 export { discoverRoutes, parseRouteConfig } from "./core/manifest.js";
 export {
+  isResourceRoute,
+  dispatchResourceHandler,
+  resourceRouteAllowedMethods,
+  RESOURCE_ROUTE_METHODS,
+} from "./core/resource-routes.js";
+export {
   renderSpeculationRules,
   renderStaticLinkSpeculationRules,
 } from "./core/speculation-rules.js";
@@ -77,6 +83,8 @@ export {
   type NeutronServerOptions,
   type NeutronServerMode,
   type NeutronWebSocketOptions,
+  type NeutronMountApp,
+  type NeutronMount,
   type NeutronServer,
   type NeutronServerHooks,
   type NeutronRequestStartEvent,
@@ -89,12 +97,21 @@ export {
 } from "./server/index.js";
 export type { NeutronOpenApiOptions } from "./server/index.js";
 export {
+  defineServerEntry,
+  type NeutronServerEntry,
+  type NeutronServerEntryExport,
+  type NeutronServerEntryWebSocket,
+} from "./core/server-entry.js";
+export {
   defineConfig,
   resolveRuntime,
   resolveRuntimeAliases,
   resolveRuntimeJsx,
   resolveRuntimeNoExternal,
+  RUNTIME_RUNNER_CJS_EXTERNALS,
   type NeutronConfig,
+  type NeutronClientConfig,
+  type NeutronEnvConfig,
   type NeutronImageConfig,
   type NeutronRedirectRule,
   type NeutronRewriteRule,
@@ -141,6 +158,7 @@ export type {
   AdapterBuildContext,
   AdapterRoutesSummary,
   AdapterRuntimeBundle,
+  AdapterRuntimeBundleOptions,
 } from "./adapters/adapter.js";
 export {
   parseCookieHeader,
@@ -239,7 +257,16 @@ export type { Fetcher, FetcherState, FetcherSubmitOptions } from "./client/fetch
 // Client components
 export { Form, Link, NavLink, prefetch } from "./client/components.js";
 export type { FormProps, LinkProps, NavLinkProps } from "./client/components.js";
+
+// Router provider mount — used by the server renderers; exported so a host
+// can load the copy from the app's SSR graph (see RouteRenderer and A-011).
+export { withRouterProviders, type CreateElement, type RouterProviderValues } from "./core/router-providers.js";
 export { Island } from "./client/island.js";
+// Server Actions: the request scope an action runs in (server), and the error
+// a client call rejects with.
+export { getActionContext, type ServerActionContext } from "./core/action-context.js";
+export { ServerActionError } from "./client/server-actions.js";
+export type { ServerActionsOptions } from "./core/server-actions.js";
 export { Image, defaultImageLoader } from "./client/image.js";
 export type { ImageProps, ImageLoader, ImageLoaderArgs } from "./client/image.js";
 export { Picture } from "./client/picture.js";
@@ -248,6 +275,7 @@ export type { ErrorBoundaryFallbackProps } from "./client/error-boundary.js";
 export { ViewTransitions } from "./client/view-transitions.js";
 export { ScrollReveal } from "./client/scroll-reveal.js";
 export type { ScrollRevealProps } from "./client/scroll-reveal.js";
+export type { AnyJsxElement, JsxChild, JsxChildren } from "./client/jsx-agnostic.js";
 export { Await } from "./client/await.js";
 export type { AwaitProps } from "./client/await.js";
 export { Show, For, Switch, Match, Index, type ShowProps, type ForProps, type SwitchProps, type MatchProps, type IndexProps } from "./client/control-flow.js";

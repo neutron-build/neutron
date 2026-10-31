@@ -2,6 +2,7 @@
 // Hydrates islands based on client directive
 
 import { h, hydrate, render, type ComponentType } from "preact";
+import { InsideIsland } from "./island-context.js";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -53,7 +54,9 @@ async function hydrateIsland(island: IslandElement) {
   }
 
   try {
-    const element = h(Component, props);
+    // Inside the provider <Island> renders on the server, so a nested <Island>
+    // renders inline here too instead of emitting a marker SSR never did.
+    const element = h(InsideIsland.Provider, { value: true }, h(Component, props));
     // Preact's hydrate() walks the existing DOM and attaches event handlers
     // in place — it crashes with "Cannot read properties of null (reading
     // 'length')" if you call it against an empty container, because its diff
@@ -139,15 +142,33 @@ function normalizeExportName(name: string): string {
   return name.toLowerCase().replace(/[-_\s]/g, "");
 }
 
-function observeVisible(island: IslandElement) {
-  // The marker is `display: contents` (see core/seo.ts), so it has no box of
-  // its own and never intersects; watch its rendered children instead.
-  const targets = Array.from(island.children);
-  if (targets.length === 0) {
-    hydrateIsland(island);
-    return;
-  }
+/**
+ * Elements whose visibility stands for the island's. The marker itself is a
+ * layout-transparent `display: contents` element by default (seo.ts), which
+ * generates no box, and IntersectionObserver never reports an element without
+ * one. Its content does: the first descendants that generate a box, looking
+ * through any further `display: contents` wrappers. A marker that is given a
+ * box of its own is observed directly; a box-less marker with no element
+ * content (text only) stands in with its nearest ancestor that has a box.
+ */
+function visibilityTargets(island: IslandElement): Element[] {
+  const hasBox = (element: Element) => getComputedStyle(element).display !== "contents";
+  if (hasBox(island)) return [island];
+  const targets: Element[] = [];
+  const collect = (parent: Element) => {
+    for (const child of Array.from(parent.children)) {
+      if (hasBox(child)) targets.push(child);
+      else collect(child);
+    }
+  };
+  collect(island);
+  if (targets.length > 0) return targets;
+  let ancestor = island.parentElement;
+  while (ancestor && !hasBox(ancestor)) ancestor = ancestor.parentElement;
+  return [ancestor ?? document.documentElement];
+}
 
+function observeVisible(island: IslandElement) {
   const observer = new IntersectionObserver(
     (entries) => {
       if (entries.some((entry) => entry.isIntersecting)) {
@@ -158,7 +179,7 @@ function observeVisible(island: IslandElement) {
     { threshold: 0.1 }
   );
 
-  for (const target of targets) observer.observe(target);
+  for (const target of visibilityTargets(island)) observer.observe(target);
 }
 
 function onIdle(callback: () => void) {

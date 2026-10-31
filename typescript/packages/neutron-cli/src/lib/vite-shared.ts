@@ -18,7 +18,7 @@ import { resolveRuntimeJsx } from "@neutron-build/core";
  * twice. `dev` has always filtered; `build` did not, which is how the two
  * commands came to behave differently on the same project.
  */
-const CLI_OWNED_PLUGINS = new Set(["neutron:core"]);
+const CLI_OWNED_PLUGINS = new Set(["neutron:core", "neutron:public-env"]);
 
 export function stripCliOwnedPlugins(plugins: unknown): unknown[] {
   if (!Array.isArray(plugins)) return [];

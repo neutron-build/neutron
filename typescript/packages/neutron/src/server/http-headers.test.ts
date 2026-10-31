@@ -8,6 +8,23 @@ import {
 } from "./http-headers.js";
 
 describe("http headers helpers", () => {
+  it("resolves no CORS config to null (default off)", () => {
+    expect(resolveCorsOptions(undefined)).toBeNull();
+    expect(resolveCorsOptions(false)).toBeNull();
+  });
+
+  it("resolves an explicit config object to enabled options", () => {
+    const options = resolveCorsOptions({});
+    expect(options).toEqual({
+      origin: "*",
+      methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+      exposedHeaders: [],
+      credentials: false,
+      maxAge: 600,
+    });
+  });
+
   it("creates preflight response for allowed origins", () => {
     const options = resolveCorsOptions({
       origin: ["https://app.example.com"],
@@ -109,5 +126,21 @@ describe("http headers helpers", () => {
     expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(response.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
     expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+  });
+
+  // A popup the page opens (OAuth provider, payment sheet) reports back
+  // through window.opener; COOP `same-origin` severed that for every app.
+  it("defaults COOP to same-origin-allow-popups and keeps it configurable", () => {
+    const response = new Response("ok");
+    applySecurityHeaders(response, resolveSecurityHeadersConfig(undefined)!);
+    expect(response.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin-allow-popups");
+    expect(response.headers.get("X-Frame-Options")).toBe("DENY");
+
+    const strict = new Response("ok");
+    applySecurityHeaders(
+      strict,
+      resolveSecurityHeadersConfig({ headers: { "Cross-Origin-Opener-Policy": "same-origin" } })!
+    );
+    expect(strict.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
   });
 });

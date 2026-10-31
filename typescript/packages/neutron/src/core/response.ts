@@ -230,15 +230,58 @@ function notFoundDocument(message: string): string {
 }
 
 /**
+ * True when the request's `Accept` header prefers an HTML response — the
+ * signal the SSR server uses to decide between an HTML page and a
+ * machine-readable error document for its default (no `not-found.tsx`) 404.
+ *
+ * An HTML type (`text/html`, `application/xhtml+xml`) must be accepted with a
+ * non-zero quality factor AND not be outranked by any other explicitly
+ * accepted type. A browser's Accept (HTML first, the catch-all wildcard at
+ * `q=0.8`) says yes; `application/json`, a wildcard-only Accept,
+ * `text/html;q=0` and a missing header all say no. Wildcard subtype ranges
+ * like `text/*` are deliberately not treated as HTML — only an explicit HTML
+ * preference earns the HTML page.
+ */
+export function acceptsHtml(request: Request): boolean {
+  const accept = request.headers.get("accept") || "";
+  let htmlQ = 0;
+  let otherMaxQ = 0;
+  for (const item of accept.split(",")) {
+    const [rawType, ...params] = item.split(";");
+    const type = rawType.trim().toLowerCase();
+    if (!type) {
+      continue;
+    }
+    let q = 1;
+    for (const param of params) {
+      const [key, ...rest] = param.trim().split("=");
+      if (key.trim().toLowerCase() === "q") {
+        const parsed = Number(rest.join("="));
+        q = Number.isFinite(parsed) ? Math.min(Math.max(parsed, 0), 1) : 0;
+      }
+    }
+    if (type === "text/html" || type === "application/xhtml+xml") {
+      htmlQ = Math.max(htmlQ, q);
+    } else {
+      otherMaxQ = Math.max(otherMaxQ, q);
+    }
+  }
+  return htmlQ > 0 && htmlQ >= otherMaxQ;
+}
+
+/**
  * True for any Fetch `Response`, whichever `Response` constructor made it.
  *
  * `instanceof Response` is not enough on Node: `@hono/node-server` replaces
  * `globalThis.Response` with a lightweight class whose prototype chains to the
- * native one. `new Response()` then passes `instanceof`, but the inherited
- * static factories (`Response.json()`, `Response.redirect()`,
- * `Response.error()`) still return NATIVE instances, which fail `instanceof`
- * against the replacement — so a returned `Response.json(...)` was treated as
- * plain data. The `Symbol.toStringTag` brand is shared by both.
+ * native one unless `serve()` is told not to. Neutron's own server opts out
+ * (`overrideGlobalObjects: false`), but a server the app starts itself, or a
+ * second realm, can still hand over a Response from another constructor. With
+ * the replacement installed, the inherited static factories
+ * (`Response.json()`, `Response.redirect()`, `Response.error()`) return NATIVE
+ * instances, which fail `instanceof` against it — a returned
+ * `Response.json(...)` was treated as plain data. The `Symbol.toStringTag`
+ * brand is shared by both.
  */
 export function isResponse(value: unknown): value is Response {
   if (typeof Response !== "undefined" && value instanceof Response) return true;
@@ -257,13 +300,19 @@ export function isResponse(value: unknown): value is Response {
  * A response whose headers are already writable is returned as is: copying it
  * on every middleware layer cost a third of the request path's throughput.
  * `Headers.delete` throws on an immutable guard even for an absent name, so
- * the probe never changes a writable response.
+ * the probe never changes a writable response. Native `Response.redirect()`,
+ * `Response.error()` and fetched responses carry an immutable guard.
  */
 export function mutableResponse(response: Response): Response {
   try {
     response.headers.delete("x-neutron-mutability-probe");
     return response;
   } catch {
+    // The Response constructor only accepts 200-599; Response.error()
+    // (status 0) cannot be copied and stays as it is.
+    if (response.status < 200 || response.status > 599) {
+      return response;
+    }
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) });
   }
 }

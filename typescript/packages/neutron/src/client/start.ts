@@ -86,8 +86,9 @@ export async function init(): Promise<void> {
     // Dynamic, so this chunk is only requested by apps that have an app route.
     const router = await import("./hydrate.js");
     router.registerRoutes(registered as never);
-    await router.init();
-    return;
+    // A static-tier page of an app has no client module (staticTierRouteIds)
+    // and boots like a page of a static site, below.
+    if ((await router.init()) !== "static") return;
   }
 
   // Static tier: no router, no click interception, no per-navigation fetch.

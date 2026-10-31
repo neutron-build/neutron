@@ -53,3 +53,125 @@ export default defineConfig({
 | `vite` | `UserConfig` | Vite configuration object. Merged with Neutron's defaults. |
 | `routesDir` | `string` | Path to the routes directory. Default: `"src/routes"`. |
 | `features` | `object` | Toggle experimental features. |
+
+## Server
+
+`server` configures the production server (`createServer` in `@neutron-build/core/server`). `neutron-ts start` and `preview` forward it wholesale. Two options matter for apps that serve an API next to their pages:
+
+```ts
+import { defineConfig } from "@neutron-build/core";
+
+export default defineConfig({
+  server: {
+    // Mount a Hono sub-app at a prefix, in-process: REST, SSE, tRPC.
+    // Registered before the HTML catch-all and after the framework's own
+    // routes (/health, assets, …), so neither can shadow the other.
+    mount: {
+      "/api": myHonoApp, // any Hono instance
+    },
+
+    // Attach a WebSocket server to the same HTTP server (default off).
+    websocket: true,
+  },
+});
+```
+
+Mount prefixes are validated at startup: two mounts may not overlap, and a prefix may not cover a reserved framework path (`/health`, `/openapi.json`, `/docs`, `/_neutron/image`, `/__neutron_island`, `/assets`, `/public`) — the server refuses to start with an error naming the conflict. A request under a mounted prefix that the sub-app does not match falls through to the app's routes, so a mount adds endpoints without claiming the namespace.
+
+**Global middleware runs before mounts.** The app's `src/middleware.ts` runs ahead of every mounted sub-app, outermost, with the real request: an auth gate there covers mounted APIs like it covers pages and resource routes (FRAMEWORK_CONTRACT §5). A response the middleware returns without calling `next()` answers instead of the sub-app; a request the sub-app does not match falls through to the routes with the chain already run, so it runs once. A sub-app that enforces its own authentication can opt out per mount:
+
+```ts
+mount: {
+  "/api/trpc": { app: trpcApp, globalMiddleware: false }, // gates inside tRPC
+  "/api": restApp, // src/middleware.ts runs first
+},
+```
+
+**What mounts do not do.** A mounted sub-app runs outside the framework's page pipeline. Its handlers do not pass through route or layout `middleware` (only the global chain), and — by design — mutations served by a mount neither fence nor evict the server's SSR caches: a `POST` answered by the sub-app does not invalidate a cached page or loader data, exactly as if the API ran in a separate process. If cached pages must reflect a mount's writes immediately, serve those mutations as [resource routes](/docs/routing/file-conventions#resource-routes) instead — resource-route mutations fence the cache epoch and evict the affected paths, like actions do.
+
+When your API is a handful of per-file endpoints rather than a sub-app, prefer [resource routes](/docs/routing/file-conventions#resource-routes) — route modules exporting `GET`/`POST`/… handlers, served through the same middleware chain as pages.
+
+### Server entry
+
+`server.mount` in `neutron.config.ts` needs a live Hono instance, and so does a custom server that builds its mounts before calling `createServer`. Either way the mounts are created outside the module graph the routes run in. Under `neutron-ts start` the routes come from the prebuilt server bundle, so a module imported by both a mount and a route (a database client, an auth instance, a rate limiter, a WebSocket hub) is loaded twice and splits into two instances.
+
+Declare them in `src/server.entry.ts` instead. Neutron loads that file in the same module graph as the routes: it is compiled into the server bundle for `start`, loaded through the Vite runtime when there is no bundle, and loaded through Vite by `neutron-ts dev`. Every module it shares with the routes is one instance.
+
+```ts
+// src/server.entry.ts
+import { defineServerEntry } from "@neutron-build/core";
+import { trpcApp } from "./server/trpc";
+import { hub } from "./server/hub";
+import { db } from "./lib/db"; // the same instance your loaders import
+
+export default defineServerEntry(async () => ({
+  mount: {
+    "/api/trpc": trpcApp, // or { app, globalMiddleware: false }
+  },
+  websocket: {
+    path: "/ws",
+    authorize: (request) => hub.authorize(request), // fail-closed, before the handshake
+    attach: (wss) => hub.attach(wss), // called once with the server's WebSocketServer
+  },
+  close: () => db.$disconnect(), // after in-flight requests drain
+}));
+```
+
+The default export is the entry object or a function returning it (async is fine, for setup that must finish before the server serves). `mount` follows the rules of `server.mount`: global middleware runs first, prefixes are validated, and paths the sub-app does not match fall through to the routes. It is merged with `createServer({ mount })`, and a prefix may only be declared in one of them. `websocket` turns the WebSocket server on (`createServer({ websocket })` options, if given, win for `path` and `authorize`). The dev server serves the entry's mounts and WebSocket too. Like `start`, it loads the entry and calls `attach` when it starts, so `authorize` never runs before `attach`. When the entry or a module it imports changes, dev closes the old entry (its sockets, then its `close`) and loads and attaches the new one. A file that exists but fails to load, or exports nothing usable, stops `start` from starting; dev logs the error and reports it on the next request. The entry runs in `ssr` mode only. The vercel, netlify, cloudflare and docker runtime handlers do not serve mounts. `createServer({ mount })` keeps working as before.
+
+
+## Security headers
+
+`server.securityHeaders` is on by default. Every response gets these unless it already set the header itself:
+
+| Header | Default |
+| :--- | :--- |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Cross-Origin-Opener-Policy` | `same-origin-allow-popups` |
+| `Cross-Origin-Resource-Policy` | `same-origin` |
+
+```ts
+server: {
+  // Override or add values site-wide; `false` disables the defaults entirely.
+  securityHeaders: { headers: { "Cross-Origin-Opener-Policy": "same-origin" } },
+},
+```
+
+### Per-route overrides
+
+Security headers are scoped per path with `routes.headers`, the same rules that add any other header. The headers a rule sets go on every response the server sends for a matching path: app, static and resource routes, mounted sub-apps, and the dev server. A rule's value overrides the default on those paths. A rule's `null` sends no such header there. A header the response sets itself always wins.
+
+```ts
+export default defineConfig({
+  routes: {
+    headers: [
+      // Cross-origin isolation (SharedArrayBuffer, WebContainer) for the
+      // builder only. COEP site-wide would break third-party embeds.
+      {
+        source: "/builder/:path*",
+        headers: {
+          "Cross-Origin-Opener-Policy": "same-origin",
+          "Cross-Origin-Embedder-Policy": "credentialless",
+        },
+      },
+      // Embeddable widgets: no X-Frame-Options; frame-ancestors decides.
+      {
+        source: "/embed/:path*",
+        headers: {
+          "X-Frame-Options": null,
+          "Content-Security-Policy": "frame-ancestors https://partner.example",
+        },
+      },
+    ],
+  },
+});
+```
+
+`:name*` matches zero or more segments, as in Next, so `/builder/:path*` covers the `/builder` document too. `*` requires at least one segment.
+
+**Why COOP is `same-origin-allow-popups`.** A cross-origin page that opens yours still gets no handle on your window, which is the protection COOP is for. What `same-origin` adds on top is severing `window.opener` in popups your page opens, and that is how OAuth providers and payment sheets (Google and Apple sign-in, PayPal, wallet popups) report back to the page that opened them. Under `same-origin` those flows break. Full `same-origin` buys cross-origin isolation (`crossOriginIsolated`, `SharedArrayBuffer`) only together with `Cross-Origin-Embedder-Policy`, and COEP breaks third-party embeds, so it belongs on the routes that need it. If a popup flow returns to a callback page on your own origin, rather than the provider posting a message from its own page, that callback page needs `Cross-Origin-Opener-Policy: unsafe-none`. Otherwise the popup's switch back to your origin severs the opener.
+
+**Why `X-Frame-Options` stays `DENY`.** Clickjacking protection is on until a page opts out. `frame-ancestors` in a `Content-Security-Policy` supersedes XFO in every browser that implements CSP 2. If you send one, browsers ignore XFO, and XFO still covers the ones that don't. To allow framing, set `frame-ancestors` (and drop or relax XFO) on the routes that are framed.
+

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { redirect, json, isResponse, notFound } from "./response.js";
+import { redirect, json, isResponse, notFound, acceptsHtml } from "./response.js";
 
 describe("response helpers", () => {
   it("redirect creates a Response with Location header", () => {
@@ -98,5 +98,41 @@ describe("response helpers", () => {
     const body = await response.text();
     expect(body).toContain("it&#39;s &lt;over&gt;");
     expect(body).not.toContain("it's <over>");
+  });
+});
+
+describe("acceptsHtml — HTML preference for content-negotiated responses", () => {
+  const request = (accept?: string): Request =>
+    new Request("http://localhost/missing", accept === undefined ? {} : { headers: { accept } });
+
+  it("recognizes browser Accept headers (HTML listed first, wildcards lower)", () => {
+    expect(
+      acceptsHtml(
+        request("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+      )
+    ).toBe(true);
+    expect(acceptsHtml(request("text/html"))).toBe(true);
+    expect(acceptsHtml(request("application/xhtml+xml"))).toBe(true);
+  });
+
+  it("is false for JSON, wildcard-only and missing Accept headers", () => {
+    expect(acceptsHtml(request("application/json"))).toBe(false);
+    expect(acceptsHtml(request("*/*"))).toBe(false);
+    expect(acceptsHtml(request())).toBe(false);
+  });
+
+  it("respects q-value ordering: an outranking non-HTML type wins", () => {
+    expect(acceptsHtml(request("application/json;q=0.9, text/html;q=0.1"))).toBe(false);
+    // A tie goes to HTML — the SSR server is a human-facing HTML server.
+    expect(acceptsHtml(request("application/json, text/html"))).toBe(true);
+  });
+
+  it("honors an explicit q=0 refusal of HTML", () => {
+    expect(acceptsHtml(request("text/html;q=0, application/json"))).toBe(false);
+  });
+
+  it("does not treat wildcard subtype ranges as HTML", () => {
+    // Only an explicit HTML preference earns the HTML page.
+    expect(acceptsHtml(request("text/*"))).toBe(false);
   });
 });

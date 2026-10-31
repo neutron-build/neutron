@@ -137,6 +137,54 @@ export function navigate(to: RouteHref): void {
   }
 }
 
+/**
+ * The header a Neutron server answers a redirected data request with
+ * (`X-Neutron-Data: true`): a 3xx becomes `204` + this header carrying the
+ * `Location`, so the client sees the redirect instead of fetch following it
+ * and handing back the target's data under the original URL.
+ */
+export const DATA_REDIRECT_HEADER = "X-Neutron-Redirect";
+
+/**
+ * Where a data response redirects to, or `null`. The server's explicit signal
+ * wins; `response.redirected` covers a redirect fetch followed anyway (a
+ * proxy or non-Neutron hop in front of the app).
+ */
+export function dataRedirectTarget(response: Response): string | null {
+  const signalled = response.headers?.get(DATA_REDIRECT_HEADER);
+  if (signalled) return signalled;
+  if (response.redirected && response.url) return response.url;
+  return null;
+}
+
+/**
+ * Go where a redirected data request pointed. Same-origin targets stay on the
+ * client router; anything else is a document navigation. `replace` swaps the
+ * current history entry, the semantics of a redirect answering a navigation
+ * (the URL that redirected never becomes a page of its own).
+ */
+export function followDataRedirect(to: string, options: { replace?: boolean } = {}): void {
+  const resolved = new URL(to, window.location.href);
+  if (resolved.origin !== window.location.origin) {
+    if (options.replace) {
+      window.location.replace(resolved.toString());
+    } else {
+      window.location.assign(resolved.toString());
+    }
+    return;
+  }
+  const target = resolved.pathname + resolved.search + resolved.hash;
+  if (!options.replace) {
+    navigate(target);
+    return;
+  }
+  window.history.replaceState(null, "", target);
+  handlePopState(false);
+  if (resolved.hash) {
+    scrollToHash(resolved.hash);
+  }
+}
+
 // Scroll to a hash target after the route renders. Two rAFs let the new DOM
 // paint first; relies on CSS scroll-margin-top for fixed-header offset (the
 // web-standard approach) rather than hardcoding an offset.

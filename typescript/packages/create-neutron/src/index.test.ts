@@ -4,6 +4,8 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { scaffoldProject } from "./scaffold.js";
 
@@ -854,6 +856,34 @@ describe("scaffoldProject (real export)", () => {
     }
   });
 
+  it("adds @types/react to devDependencies only under react-compat", async () => {
+    // react ships no types; the react-compat scaffold must not typecheck-fail
+    // on the first React-ecosystem import. preact scaffolds stay untouched.
+    const compatDir = scratchPath("compat-types");
+    const preactDir = scratchPath("preact-types");
+    try {
+      await scaffoldProject({ targetDir: compatDir, template: "basic", runtime: "react-compat" });
+      const compatPkg = JSON.parse(
+        fs.readFileSync(path.join(compatDir, "package.json"), "utf8"),
+      );
+      assert.match(compatPkg.devDependencies["@types/react"], /^\^19\./);
+      // The real react runtime package stays out: the vite plugin aliases it
+      // to preact/compat, and an installed-but-unaliased react is the
+      // two-copies hazard.
+      assert.equal(compatPkg.dependencies.react, undefined);
+      assert.equal(compatPkg.dependencies["react-dom"], undefined);
+
+      await scaffoldProject({ targetDir: preactDir, template: "basic", runtime: "preact" });
+      const preactPkg = JSON.parse(
+        fs.readFileSync(path.join(preactDir, "package.json"), "utf8"),
+      );
+      assert.equal(preactPkg.devDependencies["@types/react"], undefined);
+    } finally {
+      fs.rmSync(compatDir, { recursive: true, force: true });
+      fs.rmSync(preactDir, { recursive: true, force: true });
+    }
+  });
+
   it("pins the released dependency pair when scaffolding outside a workspace", async () => {
     // The external path is where every `latest`-floating site came from.
     const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "cn-external-"));
@@ -904,4 +934,115 @@ describe("scaffoldProject (real export)", () => {
       fs.rmSync(scratchRoot, { recursive: true, force: true });
     }
   });
+});
+
+// The react-compat scaffold typechecks with `jsxImportSource: "react"` — the
+// flip that was blocked on the framework's navigation/form components
+// (Form/Link/NavLink return TS2786 under @types/react until they became
+// JSX-agnostic; see @neutron-build/core's type-fixtures/react-nav-form/).
+// These tests prove the scaffold side of that contract: the tsconfig token
+// resolves per runtime, and every runtime template's freshly scaffolded
+// source COMPILES under that tsconfig, for both runtimes.
+describe("scaffold typecheck (runtime-derived jsxImportSource)", () => {
+  // dist/index.test.js -> packages/create-neutron -> packages/neutron
+  const thisDir = path.dirname(fileURLToPath(import.meta.url));
+  const neutronPkgDir = path.resolve(thisDir, "..", "..", "neutron");
+  const coreDist = path.join(neutronPkgDir, "dist", "client", "index.d.ts");
+
+  function scratchPath(name: string): string {
+    return path.join(process.cwd(), `.scaffold-scratch-${name}-${process.pid}-${Date.now()}`);
+  }
+
+  function linkNodeModules(targetDir: string): void {
+    // A scaffolded app resolves its dependencies from node_modules. Instead
+    // of a full install, link the workspace's already-built packages: the
+    // typecheck only needs @neutron-build/core's dist declarations plus the
+    // type-level dependencies of each runtime (preact for both, @types/react
+    // for react-compat — the scaffold's own devDependency) and vite/client.
+    const links: Array<[string, string]> = [
+      ["node_modules/@neutron-build/core", neutronPkgDir],
+      ["node_modules/preact", path.join(neutronPkgDir, "node_modules", "preact")],
+      ["node_modules/@types/react", path.join(neutronPkgDir, "node_modules", "@types", "react")],
+      ["node_modules/vite", path.join(neutronPkgDir, "node_modules", "vite")],
+    ];
+    for (const [linkPath, target] of links) {
+      const abs = path.join(targetDir, path.dirname(linkPath));
+      fs.mkdirSync(abs, { recursive: true });
+      fs.symlinkSync(target, path.join(targetDir, linkPath), "dir");
+    }
+  }
+
+  function typecheckScaffold(targetDir: string): void {
+    const require = createRequire(import.meta.url);
+    const tsc = require.resolve("typescript/lib/tsc.js");
+    const project = path.join(targetDir, "tsconfig.json");
+    const result = spawnSync(
+      process.execPath,
+      [tsc, "--project", project, "--pretty", "false"],
+      { encoding: "utf8" },
+    );
+    assert.equal(
+      result.status,
+      0,
+      `scaffolded app failed to typecheck:\n${result.stdout}${result.stderr}`,
+    );
+  }
+
+  it("resolves jsxImportSource from the runtime token", async () => {
+    for (const runtime of ["preact", "react-compat"] as const) {
+      const targetDir = scratchPath(`jsx-${runtime}`);
+      try {
+        // full carries every runtime-tokenized file: tsconfig, hooks import
+        // (Counter island) and the JsxChildren-typed root layout.
+        await scaffoldProject({ targetDir, template: "full", runtime });
+        const tsconfig = fs.readFileSync(path.join(targetDir, "tsconfig.json"), "utf8");
+        const expected = runtime === "react-compat" ? "react" : "preact";
+        assert.ok(
+          tsconfig.includes(`"jsxImportSource": "${expected}"`),
+          `${runtime} scaffold should type JSX against ${expected}:\n${tsconfig}`,
+        );
+        // The Vite transform already derives the import source from the
+        // runtime (resolveRuntimeJsx); the tsconfig agreeing with it is the
+        // point of the token.
+        const hooksImport = runtime === "react-compat" ? "react" : "preact/hooks";
+        const counter = fs.readFileSync(
+          path.join(targetDir, "src", "components", "Counter.tsx"),
+          "utf8",
+        );
+        assert.ok(
+          counter.includes(`from "${hooksImport}"`),
+          `${runtime} scaffold should import hooks from ${hooksImport}`,
+        );
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  // Requires @neutron-build/core to be built (pnpm build at the typescript/
+  // workspace root), like the other dist-resolving tests; CI builds before
+  // testing. Fail with the reason instead of 40 resolution errors.
+  it(
+    "scaffolded sources typecheck under both runtimes",
+    { timeout: 180_000 },
+    async () => {
+      if (!fs.existsSync(coreDist)) {
+        assert.fail(
+          `@neutron-build/core dist not built (${coreDist}); run pnpm build at the typescript/ workspace root first`,
+        );
+      }
+      for (const template of ["basic", "marketing", "app", "full"] as const) {
+        for (const runtime of ["preact", "react-compat"] as const) {
+          const targetDir = scratchPath(`tsc-${template}-${runtime}`);
+          try {
+            await scaffoldProject({ targetDir, template, runtime });
+            linkNodeModules(targetDir);
+            typecheckScaffold(targetDir);
+          } finally {
+            fs.rmSync(targetDir, { recursive: true, force: true });
+          }
+        }
+      }
+    },
+  );
 });

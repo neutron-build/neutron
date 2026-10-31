@@ -84,11 +84,18 @@ function collectHtmlHashes() {
 }
 
 function measureServerBundleGz() {
-  const serverDir = join(DIST_DIR, "server");
+  // The docker preset's runtime bundle. dist/server/start is a different
+  // artifact: `neutron-ts start`'s prebuilt bundle of the app's own route
+  // modules and their dependencies, which grows with the app, not with the
+  // shared pipeline this budget guards.
+  const serverDir = join(DIST_DIR, "server", "node");
   if (!existsSync(serverDir)) {
     throw new Error(`server bundle dir missing: ${serverDir}`);
   }
-  const jsFiles = walk(serverDir, (f) => f.endsWith(".js")).sort();
+  // Dependencies the bundle keeps external are shipped beside it as real
+  // packages (node_modules/, the self-contained docker context); they are not
+  // the pipeline's code.
+  const jsFiles = walk(serverDir, (f) => f.endsWith(".js") && !f.split(sep).includes("node_modules")).sort();
   const combined = Buffer.concat(jsFiles.map((f) => readFileSync(f)));
   return gzipSync(combined).length;
 }

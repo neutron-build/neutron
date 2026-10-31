@@ -104,14 +104,21 @@ export function capRequestBody(request: Request, capBytes: number): Request {
     },
     cancel(reason) { return cancelSource(reason); },
   });
-  const wrapped = new Request(request, {
+  const init = {
     signal: request.signal,
     body: capped,
     // A streaming body requires half-duplex in fetch-land Request
     // construction; without it Node's undici rejects the init. Older
     // lib.dom RequestInit typings predate the duplex option, hence the cast.
     duplex: "half",
-  } as RequestInit);
+  } as RequestInit;
+  // Rebuilt from its parts rather than `new Request(request, init)`: `serve()`
+  // runs with overrideGlobalObjects: false, so the adapter hands over
+  // @hono/node-server's lightweight Request. It passes `instanceof Request`
+  // but has none of undici's internal state, and the native copy constructor
+  // throws on it (a bare 500 for every capped request). An incoming request
+  // carries nothing else a handler can observe; the peer is re-installed below.
+  const wrapped = new Request(request.url, { ...init, method: request.method, headers: request.headers });
   const peer = transportPeer(request);
   if (peer) installTransportPeer(wrapped, peer.remoteAddress);
   return wrapped;

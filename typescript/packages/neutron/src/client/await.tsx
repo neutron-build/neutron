@@ -13,6 +13,7 @@ interface AwaitState<T> {
   error?: Error;
 }
 
+/** `any`, not `AnyJsxElement`: it returns `children(data)` / `errorElement` as-is. */
 export function Await<T = unknown>({ resolve, errorElement, children }: AwaitProps<T>): any {
   const [state, setState] = useState<AwaitState<T>>(() => {
     // Check if it's already resolved (not a promise)

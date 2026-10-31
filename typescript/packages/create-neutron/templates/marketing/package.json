@@ -8,6 +8,7 @@
     "build": "neutron-ts build",
     "build:static": "neutron-ts build --preset static",
     "start": "neutron-ts start",
+    "typecheck": "tsc --noEmit",
     "preview": "neutron-ts preview",
     "release:check": "neutron-ts release-check --preset static"
   },

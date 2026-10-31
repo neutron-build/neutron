@@ -24,14 +24,148 @@ export default defineConfig({
 });
 ```
 
+## SSR and your dependency graph
+
+Under `react-compat`, every command that builds or serves an SSR graph —
+`dev`, `build` (static prerender and the runtime bundle) and `start` —
+processes **all** `node_modules` dependencies through Vite
+(`ssr.noExternal: true`), not just the `react*` alias targets. This is a
+correctness requirement, not a preference: an SSR-*externalized* dependency
+resolves its own `react` import through native Node, loading real React
+next to `preact-render-to-string` — hooks then crash at render time
+(observed with Radix: `Cannot read properties of null (reading 'useRef')`).
+Which dependencies import react cannot be predicted from package names, so
+the default covers all of them.
+
+The cost is real and accepted knowingly: the SSR runtime bundle inlines the
+whole reachable dependency graph (larger output, longer builds), and dev SSR
+transforms each dependency once on first request (cached afterwards). If
+you need a specific heavy package to stay external — a database driver that
+must not be bundled, for example — list it in your `vite.config.ts`:
+
+```ts
+export default {
+  ssr: {
+    // Checked before noExternal, so these stay external even under the
+    // blanket default. Do NOT list anything that imports react here.
+    external: ["pg"],
+  },
+};
+```
+
+An app cannot narrow the default back to an array — Vite's `mergeConfig`
+collapses `ssr.noExternal` to `true` when either side is `true` — so
+`ssr.external` is the escape hatch.
+
+`dev` and `start` themselves use that escape hatch for a fixed set of
+framework deps: `@mdx-js/mdx`, `gray-matter`, `yaml` and `@babel/parser`
+(CommonJS-only subtree tops in `@neutron-build/core`'s import graph — the
+runner cannot evaluate them, see the limit below). Keeping exactly those
+native lets **`@neutron-build/core` itself run inside the SSR graph**, which
+is what puts the framework's own hooks (`useLocation`, `useLoaderData`, …)
+and your React hooks on one Preact instance during per-request SSR. Your own
+`ssr.external` entries merge with (do not replace) that list.
+
+One known limit, stated plainly: a **CommonJS-only** dependency cannot be
+processed by Vite's SSR module runner (`neutron-ts start`, and static
+prerendering) — it fails loudly with `require is not defined`. `dev` is
+unaffected (the dev optimizer pre-bundles it). A CJS React library should
+ship as a client-only island instead of server-rendering, the same advice
+the [compatibility matrix](./react-compat-matrix.md) gives for libraries
+that fail under `preact/compat` generally.
+
+## TypeScript setup: `@types/react` and `jsxImportSource`
+
+The `react` npm package ships **no bundled types** — that is React's own
+choice, not Neutron's aliasing. Under `react-compat` the bundler never loads
+real React: `react`, `react-dom` and their subpaths alias onto
+`preact/compat` / `preact-render-to-string` (see `resolveRuntimeAliases` in
+`@neutron-build/core/config`). Typechecking is a separate story — React
+imports and React-authored JSX are checked against whatever types the
+compiler can resolve, so a react-compat app needs one devDependency:
+
+```sh
+pnpm add -D @types/react
+```
+
+`create-neutron --runtime react-compat` scaffolds with this line already in
+place. The real `react`/`react-dom` runtime packages are deliberately **not**
+added: the aliases make them unnecessary, and an installed-but-unaliased
+React next to Preact is exactly the two-copies hazard the aliases exist to
+prevent. The react-compat scaffold also sets `jsxImportSource: "react"` in
+`tsconfig.json` (see below) and ships a `typecheck` script (`tsc --noEmit`),
+so its sources compile out of the box after install.
+
+### Choosing how your JSX is typed
+
+Two coherent setups; mixing them per-file is fine (the pragma is per-module):
+
+1. **Preact-typed JSX (`jsxImportSource: "preact"`).** What a `preact`-runtime
+   scaffold ships. JSX in your own modules checks against Preact's types while
+   React-ecosystem components you import still carry their React-typed
+   props. This is the least-friction default; occasionally a React library's
+   React-typed `children` prop disagrees with Preact's JSX types at the call
+   site — wrap that usage in a small module of its own (see 2) rather than
+   casting everywhere.
+
+2. **React-typed modules (`jsxImportSource: "react"`).** The setup for
+   migration-heavy ports (React-authored JSX everywhere, e.g. a Radix-heavy
+   app). Set it per-file with a pragma, or project-wide in `tsconfig.json` —
+   which is what a `--runtime react-compat` scaffold now ships, using the
+   same runtime → import-source rule the Vite transform already applies
+   (`resolveRuntimeJsx`), so typechecking and bundling agree:
+
+   ```tsx
+   /** @jsxImportSource react */
+   import { Form } from "@neutron-build/core/client";
+   ```
+
+   The framework's client components are usable from React-typed JSX: their
+   element returns are deliberately JSX-agnostic (`<Island>`, `<Form>`,
+   `<Link>`, `<NavLink>`, `<ViewTransitions>`, `<ScrollReveal>`, `<Image>`,
+   `<Picture>`, `<Await>`, and the control-flow family `<Show>`, `<For>`,
+   `<Switch>`, `<Match>`, `<Index>`, plus the server-side `<ServerIsland>`),
+   while their props stay fully typed — a mistyped prop fails TS2322 against
+   the same prop interfaces under either import source, and the control-flow
+   render callbacks and `fallback` props accept React-authored elements
+   unchanged (preact's `ComponentChild` includes `object`). Both worlds are
+   pinned by compiled fixtures in `@neutron-build/core`
+   (`src/client/type-fixtures/react-nav-form/`, `react-control-flow/`,
+   `react-island/` and `react-export-sweep/`, plus
+   `src/server/type-fixtures/react-server-island/`, compiled with
+   `jsxImportSource: "react"` against @types/react — the fixtures carry
+   `@ts-expect-error` pins that fail the compile if prop checking regresses)
+   and by the preact-JSX component tests in the package build. Note the
+   import path split: the control-flow family, `<Await>` and
+   `<ServerIsland>` are exported from the package root
+   (`@neutron-build/core`), unlike the client-entry components above.
+
+   With `<ServerIsland>` fixed, that list is the whole sweep: every
+   component exported from the package root or `@neutron-build/core/client`
+   is JSX-agnostic — the export-sweep fixture compiles the remaining ones
+   (`Await`, `Image`, `Picture`) from React-typed JSX alongside the
+   dedicated families, so none is left failing TS2786.
+
+3. **Children props shared by both worlds.** A component that *forwards*
+   `children` in JSX cannot type that prop with either runtime's native
+   type if the module must compile under both import sources: Preact's
+   `ComponentChildren` includes bare `object`, which React's `ReactNode`
+   rejects in the render position (TS2322), and a preact-only install has no
+   `ReactNode` to import. `@neutron-build/core/client` exports `JsxChildren`
+   for exactly that shape — the structural element type both runtimes
+   produce and accept back. The scaffolded root `_layout.tsx` uses it, so
+   the same source file typechecks under either scaffold runtime.
+
 ## Compatibility Matrix
 
 | Tier | Status | Notes |
 | --- | --- | --- |
 | React component model (JSX, hooks, context, memo, refs) | Supported | Via `preact/compat` aliases. |
+| React 19 `use()` | Supported | `import { use } from "react"` resolves to Neutron's react-compat module (`@neutron-build/core/react-compat`): promises suspend to the nearest `<Suspense>` (client and streaming SSR), contexts read like `useContext` — so not conditionally. The promise must be the same object across renders. |
 | App routing/loaders/actions in Neutron | Supported | Same runtime APIs in both modes. |
+| Server Actions (`"use server"` modules) | Supported | Calls from event handlers in both modes; `<form action={fn}>` calls the action with the form's `FormData` on the client (React 19 semantics, reset included). Not supported: submitting before hydration, `formAction`, `useFormStatus`, `useActionState`. See [Server Actions](./server-actions.md). |
 | Client navigation/forms/hydration | Supported | Covered by runtime-compat smoke lane. |
-| Common React libraries that depend on public React APIs | **Tested per package** | See the [compatibility matrix](./react-compat-matrix.md) — real packages, server-rendered, 12 of 13 currently render. |
+| Common React libraries that depend on public React APIs | **Tested per package** | See the [compatibility matrix](./react-compat-matrix.md) — real packages, server-rendered, 28 of 29 currently render. |
 | Libraries depending on private React internals | Not guaranteed | May fail with `preact/compat`. |
 | React Server Components / Next.js RSC model | Not supported | Out of scope for Neutron runtime. |
 

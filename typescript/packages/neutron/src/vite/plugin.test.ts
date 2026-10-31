@@ -26,6 +26,11 @@ describe("content module client stub", () => {
     expect(src).toContain("export const getCollection");
     expect(src).toContain("export const getEntry");
     expect(src).toContain("export const defineCollection");
+    // renderEntry is re-exported by the package ROOT index (the documented
+    // import surface). A hydratable component importing any root API (e.g.
+    // useLocation) pulls the root index into the client graph; a stub without
+    // this name fails the whole client build with MISSING_EXPORT.
+    expect(src).toContain("export const renderEntry");
     expect(src).not.toContain("node:crypto");
     expect(src).not.toContain("node:fs");
   });
@@ -41,6 +46,32 @@ function makeRoute(overrides: Partial<Route> & Pick<Route, "id" | "path" | "file
   } as Route;
 }
 
+describe("generateRoutesModule: static-tier routes", () => {
+  // A page whose whole chain renders at the static tier is reached by a
+  // document load and never rendered by the router, so the client route
+  // table carries no import() for it — its module and imports stay out of
+  // the client build. Layouts shared with an app route keep theirs.
+  it("emits no import() for static-tier pages and layouts only they use", () => {
+    const cwd = process.cwd().replace(/\\/g, "/");
+    const routes = [
+      makeRoute({ id: "route:_layout.tsx", path: "/", file: `${cwd}/src/routes/_layout.tsx`, isLayout: true }),
+      makeRoute({ id: "route:legal/_layout.tsx", path: "/legal", file: `${cwd}/src/routes/legal/_layout.tsx`, isLayout: true, parentId: "route:_layout.tsx" }),
+      makeRoute({ id: "route:legal/terms.tsx", path: "/legal/terms", file: `${cwd}/src/routes/legal/terms.tsx`, parentId: "route:legal/_layout.tsx" }),
+      makeRoute({ id: "route:about.tsx", path: "/about", file: `${cwd}/src/routes/about.tsx`, parentId: "route:_layout.tsx" }),
+      makeRoute({ id: "route:pinned.tsx", path: "/pinned", file: `${cwd}/src/routes/pinned.tsx`, parentId: "route:_layout.tsx", config: { mode: "static", hydrate: true } }),
+      makeRoute({ id: "route:app.tsx", path: "/app", file: `${cwd}/src/routes/app.tsx`, parentId: "route:_layout.tsx", config: { mode: "app" } }),
+    ];
+    const output = generateRoutesModule(routes);
+    for (const kept of ["_layout.tsx", "app.tsx", "pinned.tsx"]) {
+      expect(output).toContain(`import("/src/routes/${kept}?neutron-client-route")`);
+    }
+    for (const stubbed of ["legal/_layout.tsx", "legal/terms.tsx", "about.tsx"]) {
+      expect(output).not.toContain(`/src/routes/${stubbed}?`);
+    }
+    expect(output.match(/clientModule: false/g)).toHaveLength(3);
+  });
+});
+
 describe("generateRoutesModule", () => {
   it("produces relative import paths for files inside cwd", () => {
     const cwd = process.cwd().replace(/\\/g, "/");
@@ -48,6 +79,7 @@ describe("generateRoutesModule", () => {
       id: "route:index.tsx",
       path: "/",
       file: `${cwd}/src/routes/index.tsx`,
+      config: { mode: "app" },
     });
 
     const output = generateRoutesModule([route]);
@@ -55,11 +87,20 @@ describe("generateRoutesModule", () => {
     expect(output).not.toMatch(/import\("\/\/[A-Za-z]/);
   });
 
+  it("configures the router from neutron.config client options, and emits nothing without them", () => {
+    const route = makeRoute({ id: "route:index.tsx", path: "/", file: "/x/index.tsx", config: { mode: "app" } });
+    expect(generateRoutesModule([route])).not.toContain("configureRouter");
+    expect(generateRoutesModule([route], { unloadRouteStylesheets: false })).not.toContain("configureRouter");
+    const output = generateRoutesModule([route], { unloadRouteStylesheets: true });
+    expect(output.startsWith('import { configureRouter } from "@neutron-build/core/client";\nconfigureRouter({"unloadRouteStylesheets":true});')).toBe(true);
+  });
+
   it("uses /@fs prefix for files outside project root", () => {
     const route = makeRoute({
       id: "route:external",
       path: "/external",
       file: "/some/other/path/component.tsx",
+      config: { mode: "app" },
     });
 
     const output = generateRoutesModule([route]);

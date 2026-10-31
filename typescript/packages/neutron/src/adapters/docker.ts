@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AdapterBuildContext, NeutronAdapter } from "./adapter.js";
+import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 
 export interface DockerAdapterOptions {
   nodeVersion?: string;
@@ -12,6 +12,7 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
   return {
     name: "docker",
     async adapt(context: AdapterBuildContext) {
+      assertServerFeaturesServable("docker", context, context.routes.app > 0);
       // Public membership comes from producers, never directory discovery or
       // a reserved-name denylist. Third-party callers must supply this contract.
       if (!context.publicArtifacts) throw new Error("Docker adapter requires producer-issued publicArtifacts");
@@ -43,7 +44,9 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
           throw new Error("Docker adapter requires runtime bundle support from neutron build.");
         }
 
-        const runtimeBundle = await context.ensureRuntimeBundle("node");
+        // The image context is dist/ alone: the bundle ships its runtime
+        // dependencies into dist/node_modules (real directories).
+        const runtimeBundle = await context.ensureRuntimeBundle("node", { selfContained: true });
         runtimeEntryImport = `./${runtimeBundle.entryRelativePath}`.replace(/\\/g, "/");
         context.log(`Docker runtime bundle: ${runtimeBundle.entryRelativePath}`);
       }
@@ -67,8 +70,14 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
       fs.writeFileSync(
         dockerIgnorePath,
         [
-          "node_modules",
+          // No node_modules here: dist/node_modules is the image's
+          // dependency set, shipped by the build.
           ".git",
+          // `neutron-ts start`'s server bundle: unused by the image (it runs
+          // server.mjs), and its node_modules links point into the build
+          // machine's package store.
+          "server/start",
+          ".neutron-server-bundle.json",
           ".DS_Store",
           "npm-debug.log*",
           "pnpm-debug.log*",
@@ -108,8 +117,14 @@ CMD ["node", "server.mjs"]
 
 function buildDockerServerSource(runtimeEntryImport: string | null, publicFiles: string[]): string {
   const runtimeImport = runtimeEntryImport
-    ? `import { handleNeutronRequest } from "${runtimeEntryImport}";`
-    : "";
+    ? `import * as __runtime from "${runtimeEntryImport}";
+const { handleNeutronRequest } = __runtime;
+// Generated runtimes export both; a runtime bundle from a custom
+// ensureRuntimeBundle may not, and then files are served as before.
+const handlesPath = __runtime.handlesPath ?? (() => false);
+const staticHeaders = __runtime.staticHeaders ?? (() => ({ "X-Content-Type-Options": "nosniff" }));`
+    : `const handlesPath = () => false;
+const staticHeaders = () => ({ "X-Content-Type-Options": "nosniff" });`;
   const runtimeFallback = runtimeEntryImport
     ? `  const response = await handleNeutronRequest(webRequest, { remoteAddress: req.socket?.remoteAddress });
   await writeWebResponse(res, response);`
@@ -150,9 +165,12 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", \`http://\${req.headers.host || "localhost"}\`);
     const pathname = decodeURIComponent(url.pathname);
 
+    // A prebuilt HTML file answers only where no app route claims the path
+    // (start's rule): dist/index.html is the client build's shell, and an
+    // app route at "/" must render, not be shadowed by it.
     const staticPath = resolveStaticPath(pathname);
-    if (staticPath) {
-      return streamFile(res, staticPath);
+    if (staticPath && !(staticPath.endsWith(".html") && handlesPath(pathname))) {
+      return streamFile(res, staticPath, pathname);
     }
 
     const webRequest = toWebRequest(req);
@@ -218,13 +236,20 @@ function resolveStaticPath(pathname) {
   return null;
 }
 
-function streamFile(res, filePath) {
+function streamFile(res, filePath, pathname) {
   const ext = path.extname(filePath).toLowerCase();
   res.statusCode = 200;
+  // routes.headers and the security defaults, as start sends on files.
+  for (const [name, value] of Object.entries(staticHeaders(pathname))) {
+    res.setHeader(name, value);
+  }
   res.setHeader("Content-Type", MIME_TYPES[ext] || "application/octet-stream");
   // Prevent MIME sniffing of static assets (e.g. a .txt/.json that contains
   // HTML being interpreted as HTML).
   res.setHeader("X-Content-Type-Options", "nosniff");
+  if (pathname.startsWith("/assets/") && !res.hasHeader("Cache-Control")) {
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  }
   const stream = createReadStream(filePath);
   stream.pipe(res);
   stream.on("error", () => {

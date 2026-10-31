@@ -1,11 +1,12 @@
-import { h, FunctionalComponent } from "preact";
+import { h } from "preact";
 import { useState, useCallback, useRef, useEffect } from "preact/hooks";
 import { decodeLoaderDataPayload } from "./serialization.js";
-import { navigate } from "./navigate.js";
+import { navigate, dataRedirectTarget } from "./navigate.js";
 import { setNavigationState } from "./hooks.js";
 import type { SubmitError } from "./hooks.js";
 import { hasFreshPrefetch, storePrefetch } from "./prefetch-cache.js";
 import type { RouteHref } from "../core/typed-routes.js";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 function toLocalUrl(url: string): string | null {
   const resolved = new URL(url, window.location.href);
@@ -66,6 +67,8 @@ export async function prefetch(to: string): Promise<void> {
   });
 
   if (!response.ok) return;
+  // A redirect: the data is not this URL's (see incrementalPrefetch).
+  if (response.redirected || dataRedirectTarget(response) !== null) return;
 
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("application/json")) return;
@@ -104,7 +107,8 @@ export interface FormProps {
   onSubmit?: (event: Event) => void;
 }
 
-export const Form: FunctionalComponent<FormProps> = ({
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Form({
   method = "post",
   action,
   replace,
@@ -112,7 +116,7 @@ export const Form: FunctionalComponent<FormProps> = ({
   onError,
   encType,
   ...props
-}) => {
+}: FormProps): AnyJsxElement | null {
   const formRef = useRef<HTMLFormElement>(null);
   const submittingRef = useRef(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -167,8 +171,9 @@ export const Form: FunctionalComponent<FormProps> = ({
         redirect: "follow",
       });
 
-      if (response.redirected) {
-        const localUrl = toLocalUrl(response.url);
+      const redirectTo = dataRedirectTarget(response);
+      if (redirectTo !== null) {
+        const localUrl = toLocalUrl(redirectTo);
           if (localUrl) {
             if (replace) {
               window.history.replaceState(null, "", localUrl);
@@ -177,7 +182,7 @@ export const Form: FunctionalComponent<FormProps> = ({
             }
             window.dispatchEvent(new PopStateEvent("popstate"));
         } else {
-          window.location.href = response.url;
+          window.location.href = redirectTo;
         }
       } else if (response.ok) {
         setNavigationState({
@@ -254,10 +259,9 @@ export const Form: FunctionalComponent<FormProps> = ({
         })
       : children
   );
-};
+}
 
-export interface LinkProps {
-  to: RouteHref;
+interface LinkBaseProps {
   replace?: boolean;
   prefetch?: "none" | "intent" | "render";
   children?: preact.ComponentChildren;
@@ -267,14 +271,24 @@ export interface LinkProps {
   target?: string;
 }
 
-export const Link: FunctionalComponent<LinkProps> = ({ 
-  to, 
+/**
+ * The destination is `to`, or `href` — the Next.js `next/link` / plain-anchor
+ * name, accepted so ported code keeps working. Exactly one of the two.
+ */
+export type LinkProps = LinkBaseProps &
+  ({ to: RouteHref; href?: never } | { href: RouteHref; to?: never });
+
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Link({ 
+  to: toProp,
+  href: hrefProp,
   replace, 
   prefetch = "none",
   target,
   children, 
   ...props 
-}) => {
+}: LinkProps): AnyJsxElement | null {
+  const to: string = toProp ?? hrefProp;
   const linkRef = useRef<HTMLAnchorElement>(null);
   const [prefetched, setPrefetched] = useState(false);
 
@@ -347,22 +361,25 @@ export const Link: FunctionalComponent<LinkProps> = ({
     },
     children
   );
-};
+}
 
-export interface NavLinkProps extends LinkProps {
+export type NavLinkProps = LinkProps & {
   activeClass?: string;
   activeStyle?: Record<string, string>;
   end?: boolean;
-}
+};
 
-export const NavLink: FunctionalComponent<NavLinkProps> = ({ 
-  to, 
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function NavLink({ 
+  to: toProp,
+  href: hrefProp,
   activeClass,
   activeStyle,
   end,
   children,
   ...props 
-}) => {
+}: NavLinkProps): AnyJsxElement | null {
+  const to: string = toProp ?? hrefProp;
   const [isActive, setIsActive] = useState(false);
 
   useEffect(() => {
@@ -402,7 +419,7 @@ export const NavLink: FunctionalComponent<NavLinkProps> = ({
     },
     children
   );
-};
+}
 
 function isRedirectResult(value: unknown): value is { redirect: string } {
   if (!value || typeof value !== "object") {

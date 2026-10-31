@@ -19,8 +19,11 @@ import in the entry, no `ReactDOM.createRoot`. Pages are files in `src/routes/`.
   ```
   `virtual:neutron/routes` is a build-time virtual module — it is real, do not
   "fix" it, do not replace it with manual imports.
-- **Preact, not React.** Import from `"preact"` / `"preact/hooks"`. Do **not**
-  `import React`. JSX is configured for Preact (`jsxImportSource: "preact"`).
+- **One JSX import source per scaffold.** `tsconfig.json` and the Vite
+  transform both use `jsxImportSource: "__JSX_IMPORT_SOURCE__"` (derived from
+  the `runtime` in neutron.config.ts, the same rule the CLI applies). This
+  scaffold imports hooks from `"__HOOKS_IMPORT__"`. Do **not** mix import
+  sources within one module.
 
 ## Project structure
 

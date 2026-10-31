@@ -23,20 +23,37 @@ export interface SecurityHeadersConfig {
 const DEFAULT_CORS_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 const DEFAULT_ALLOWED_HEADERS = ["Content-Type", "Authorization", "Accept"];
 
+// COOP `same-origin-allow-popups`, not `same-origin`: a cross-origin page that
+// opens this one still gets no handle on it, but popups this page opens keep
+// `window.opener` — the channel OAuth providers and payment sheets report back
+// on. `same-origin` broke every such flow by default, and buys only
+// cross-origin isolation, which also needs COEP and so has to be configured
+// per route anyway. XFO stays DENY: `frame-ancestors` in a CSP supersedes it
+// in every browser that implements CSP 2, and XFO covers the ones that don't.
 const DEFAULT_SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "strict-origin-when-cross-origin",
-  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
   "Cross-Origin-Resource-Policy": "same-origin",
 };
 
+/**
+ * Resolve the `cors` server option.
+ *
+ * Default is OFF: `undefined` (option absent) and `false` both yield `null`,
+ * so a server created without CORS config sends no `Access-Control-*` headers
+ * and never short-circuits a preflight. Pass a config object to opt in —
+ * an explicit `origin` allowlist for anything credentialed (`credentials: true`
+ * refuses the `"*"` origin). The old default (wildcard on) went out with the
+ * default-off flip; see CHANGELOG "CORS is now opt-in".
+ */
 export function resolveCorsOptions(options: false | CorsOptions | undefined): ResolvedCorsOptions | null {
-  if (options === false) {
+  if (!options) {
     return null;
   }
 
-  const origin = options?.origin ?? "*";
+  const origin = options.origin ?? "*";
   const credentials = Boolean(options?.credentials);
 
   if (credentials && origin === "*") {
@@ -142,8 +159,19 @@ export function applyCorsHeaders(
   }
 }
 
-export function applySecurityHeaders(response: Response, config: SecurityHeadersConfig): void {
+/**
+ * Fill the security defaults a response did not set. `suppressed` holds the
+ * lower-cased names a `routes.headers` rule nulled for this path.
+ */
+export function applySecurityHeaders(
+  response: Response,
+  config: SecurityHeadersConfig,
+  suppressed?: ReadonlySet<string>
+): void {
   for (const [name, value] of Object.entries(config.defaults)) {
+    if (suppressed?.has(name.toLowerCase())) {
+      continue;
+    }
     if (!response.headers.has(name)) {
       response.headers.set(name, value);
     }

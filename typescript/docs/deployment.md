@@ -37,6 +37,26 @@ Equivalent for other targets:
 - `--preset cloudflare`
 - `--preset docker`
 
+What the generated server runtime (vercel, netlify, cloudflare, docker) serves,
+and how it differs from `neutron-ts start`:
+
+- **Security headers**: the same set and order as `start` — `routes.headers`
+  rules first (a value overrides a default on its paths, `null` keeps it
+  off), then the five defaults (`X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, `Cross-Origin-Opener-Policy`,
+  `Cross-Origin-Resource-Policy`) plus `server.securityHeaders.headers`;
+  `server.securityHeaders: false` turns them off. This covers every response
+  the runtime answers. Files the platform serves itself (prerendered pages,
+  `/assets/*`) carry only what `_headers` / `vercel.json` list.
+- **Mounts**: `src/server.entry.ts` mounts are served with `start`'s
+  semantics — global middleware ahead of each mount unless it opts out, an
+  unmatched path falling through to the routes.
+- **Not servable**, so the build fails instead of deploying them: a
+  `websocket` in `src/server.entry.ts` (no target here has a WebSocket
+  upgrade; use `neutron-ts start`), and server actions or mounts in an app
+  without an app route (the runtime is only built for app routes). A
+  `--preset static` build fails on any server action or server entry.
+
 ## One-Command Validation
 
 Project-level:

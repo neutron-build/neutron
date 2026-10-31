@@ -7,7 +7,7 @@
 // logic. The static (SSG) renderer keeps its own lean, mutation-free pipeline
 // (see render-static.ts) but shares head resolution via core/head.ts, so head
 // output can never drift between the request-serving and build-time paths.
-import { h } from "preact";
+import { h as staticH } from "preact";
 import type * as preact from "preact";
 
 import { escapeHtml, nonceAttr } from "./escape.js";
@@ -29,6 +29,7 @@ import { isProblemError } from "./problem.js";
 import { isResponse } from "./response.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderToString } from "preact-render-to-string";
+import type { StreamRenderFn } from "./preact-ssr.js";
 import type {
   Route,
   RouteMatch,
@@ -46,10 +47,34 @@ import { cacheOperation, publishCacheEntry, supportsBoundedPublication } from ".
 import { sharedResponseMaxAge } from "./shared-cache-policy.js";
 
 const TEXT_ENCODER = new TextEncoder();
-type StreamRenderFn = (element: preact.VNode) => ReadableStream<Uint8Array> & {
-  allReady?: Promise<void>;
-};
 let cachedStreamRenderFn: StreamRenderFn | null | undefined = undefined;
+
+/**
+ * The renderer pair (plus provider mount) a host resolves through the SAME
+ * module graph as the route modules it renders.
+ *
+ * renderAppRoute's own static imports (`preact`, `preact-render-to-string`,
+ * `preact-render-to-string/stream`) are whichever physical copies CORE'S
+ * LOADER found — the right pair only when core and the app share one graph
+ * (bundled builds, the dev server's in-graph core, direct unit tests). A
+ * host that loads route modules through a different graph (the production
+ * start server: its natively-loaded server core renders route modules that
+ * come from Vite's SSR runner) must hand the render core the matching pair,
+ * or hooks crash with `reading '__H'` — the split-graph class documented in
+ * core/preact-ssr.ts (A-011, Gap 5).
+ *
+ * `withRouterProviders` follows the same rule: contexts only match a
+ * consumer from the same module instance, so the host that owns the
+ * renderer graph supplies the provider mount from it too.
+ */
+export interface RouteRenderer {
+  h: typeof import("preact").h;
+  renderToString: typeof import("preact-render-to-string").renderToString;
+  /** Streaming renderer; when absent the buffered path is used. */
+  renderToReadableStream?: StreamRenderFn;
+  /** Provider mount from the renderer's graph; falls back to core's own. */
+  withRouterProviders?: typeof withRouterProviders;
+}
 
 // Structural hook/trace types kept local to avoid a server import cycle.
 export interface RenderRequestTrace {
@@ -76,6 +101,16 @@ export interface RenderAppRouteOptions {
   requestTrace: RenderRequestTrace;
   hooks?: RenderHooks;
   globalMiddleware?: MiddlewareFn[];
+  /**
+   * Renderer pair resolved through the same module graph as `routeModules`
+   * (see {@link RouteRenderer}). Hosts that load route modules through a
+   * graph core does not share — the production start server above all —
+   * must pass this, or any hook-bearing component crashes with
+   * `reading '__H'`. Absent = core's own static imports are the pair, the
+   * correct default when everything renders from one graph (bundled
+   * builds, direct calls).
+   */
+  renderer?: RouteRenderer;
   /**
    * Shared app-response cache boundary, consulted INSIDE the middleware chain
    * so a cache hit still executes every request middleware (auth, rate limits,
@@ -176,7 +211,7 @@ const REPRESENTATION_VARY_FIELDS = [
 
 /** Merge REPRESENTATION_VARY_FIELDS into Vary without dropping or duplicating
  * tokens the route already declared. `Vary: *` already forbids every reuse. */
-function declareRepresentationDimensions(headers: Headers): void {
+export function declareRepresentationDimensions(headers: Headers): void {
   const tokens = (headers.get("Vary") ?? "")
     .split(",")
     .map((token) => token.trim())
@@ -339,7 +374,7 @@ function resolveRequestedDataRouteIds(
   return new Set(filtered);
 }
 
-async function resolveRouteHeaders(
+export async function resolveRouteHeaders(
   allRoutes: Route[],
   modules: Map<string, RouteModule>,
   args: HeadersArgs
@@ -451,7 +486,8 @@ function renderErrorResponse(
   error: Error,
   clientEntryScriptSrc: string | null,
   includeClientRuntime: boolean,
-  stylesheetHrefs: string[]
+  stylesheetHrefs: string[],
+  renderer?: RouteRenderer
 ): Response {
   const boundary = findNearestErrorBoundary(allRoutes, modules, route);
 
@@ -462,10 +498,14 @@ function renderErrorResponse(
     });
   }
 
-  const boundaryElement = h(boundary as any, {
+  // The error boundary is an app component like any other: render it with
+  // the host's renderer pair so a hook-bearing boundary survives too.
+  const boundaryH = renderer?.h ?? staticH;
+  const boundaryRender = renderer?.renderToString ?? renderToString;
+  const boundaryElement = boundaryH(boundary as any, {
     error,
   } as ErrorBoundaryProps);
-  const boundaryHtml = renderToString(boundaryElement);
+  const boundaryHtml = boundaryRender(boundaryElement);
   const fullHtml = wrapHtml(
     boundaryHtml,
     route.path,
@@ -493,7 +533,9 @@ function buildHtmlPrefix(
 ): string {
   const stylesheetLinks = [...new Set(stylesheetHrefs)]
     .filter(Boolean)
-    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
+    // data-neutron-css: a route stylesheet the client router may unlink
+    // after navigation (client.unloadRouteStylesheets).
+    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}" data-neutron-css>`)
     .join("\n");
   return `<!DOCTYPE html>
 ${buildHtmlOpenTag(seo?.htmlAttrs)}
@@ -621,7 +663,15 @@ function wrapHtml(
   )}`;
 }
 
-async function getStreamRenderFn(): Promise<StreamRenderFn | null> {
+async function getStreamRenderFn(renderer?: RouteRenderer): Promise<StreamRenderFn | null> {
+  // A host that passes a renderer owns the pair: use its stream leg, or
+  // none. Falling through to the bundled import here would stream with
+  // core's RTS while hooks live in the host's graph — the split that
+  // crashes hook components with `reading '__H'` (Gap 5) — and only the
+  // first-read catch would save the request, after a wasted render.
+  if (renderer) {
+    return renderer.renderToReadableStream ?? null;
+  }
   if (cachedStreamRenderFn === undefined) {
     try {
       const streamModule = await import("preact-render-to-string/stream");
@@ -708,6 +758,8 @@ interface RenderAppRouteHtmlResponseArgs {
   nonce?: string;
   /** Outermost layout/route file, named in the full-document guard error. */
   sourceFile?: string;
+  /** Host-resolved renderer pair matching the route modules' graph. */
+  renderer?: RouteRenderer;
 }
 
 async function renderAppRouteHtmlResponse(
@@ -722,7 +774,7 @@ async function renderAppRouteHtmlResponse(
   // wrap the fragment in the shell. Also the fallback when streaming is
   // unavailable or fails to initialize.
   const composeFullDocument = (): string => {
-    const html = renderToString(args.element);
+    const html = (args.renderer?.renderToString ?? renderToString)(args.element);
     assertRenderedFragment(html, args.sourceFile);
     return wrapHtml(
       html,
@@ -739,7 +791,7 @@ async function renderAppRouteHtmlResponse(
     );
   };
 
-  const streamRenderFn = await getStreamRenderFn();
+  const streamRenderFn = await getStreamRenderFn(args.renderer);
   if (!streamRenderFn) {
     return new Response(composeFullDocument(), { headers });
   }
@@ -761,10 +813,17 @@ async function renderAppRouteHtmlResponse(
 
   let reader: ReadableStreamDefaultReader<Uint8Array>;
   let firstChunk: ReadableStreamReadResult<Uint8Array>;
+  const stream = streamRenderFn(args.element);
   try {
-    reader = streamRenderFn(args.element).getReader();
+    reader = stream.getReader();
     firstChunk = await reader.read();
   } catch {
+    // Abandoning the stream is not enough: the renderer's `allReady`
+    // deferred rejects with nobody listening (an unhandled rejection that
+    // can take down the host process), and the render loop keeps running.
+    // Swallow + cancel, then fall back to the buffered compose.
+    stream.allReady?.catch(() => {});
+    await stream.cancel().catch(() => {});
     return new Response(composeFullDocument(), { headers });
   }
 
@@ -809,10 +868,16 @@ export async function renderAppRoute(
     globalMiddleware,
     responseCache,
     loaderCacheFence,
+    renderer,
   } = opts;
   const allRoutes = [...match.layouts, match.route];
   const clientTier = resolveClientTier(allRoutes);
   const includeClientRuntime = clientTier !== "none";
+  // Element construction + provider mounting happen on the host's pair when
+  // given (see RouteRenderer): providers must be created from the same
+  // module instance their consumers — app components — read.
+  const h = renderer?.h ?? staticH;
+  const mountProviders = renderer?.withRouterProviders ?? withRouterProviders;
   const middlewares: MiddlewareFn[] = [];
   if (globalMiddleware && globalMiddleware.length > 0) {
     middlewares.push(...globalMiddleware);
@@ -988,7 +1053,8 @@ export async function renderAppRoute(
           toError(error),
           clientEntryScriptSrc,
           includeClientRuntime,
-          stylesheetHrefs
+          stylesheetHrefs,
+          renderer
         );
       }
     }
@@ -1164,7 +1230,8 @@ export async function renderAppRoute(
           toError(result.error),
           clientEntryScriptSrc,
           includeClientRuntime,
-          stylesheetHrefs
+          stylesheetHrefs,
+          renderer
         );
       }
       if (result.data !== undefined) {
@@ -1245,7 +1312,12 @@ export async function renderAppRoute(
       // useSearchParams/useLoaderData read the same values on both sides. Every
       // value here is already computed above to run loaders and resolve the
       // head — nothing new is derived. A-011.
-      element = withRouterProviders(h as CreateElement, element, {
+      //
+      // `mountProviders` is the host's copy when the renderer came from the
+      // route modules' graph: contexts only match consumers from the same
+      // module instance (a createContext pair from two instances silently
+      // returns the DEFAULT value — the A-011 failure mode).
+      element = mountProviders(h as CreateElement, element, {
         routeId: match.route.id,
         pathname,
         search: new URL(request.url).search,
@@ -1279,6 +1351,7 @@ export async function renderAppRoute(
           typeof (context as { cspNonce?: unknown }).cspNonce === "string"
             ? ((context as { cspNonce?: unknown }).cspNonce as string)
             : undefined,
+        renderer,
       });
     } catch (error) {
       emitHook(hooks?.onError, {
@@ -1297,7 +1370,8 @@ export async function renderAppRoute(
         toError(error),
         clientEntryScriptSrc,
         includeClientRuntime,
-        stylesheetHrefs
+        stylesheetHrefs,
+        renderer
       );
     }
   };

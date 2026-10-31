@@ -1,5 +1,7 @@
-import { createContext, h } from "preact";
+import { h } from "preact";
 import { useContext } from "preact/hooks";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
+import { InsideIsland } from "./island-context.js";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -23,10 +25,6 @@ const isServer = typeof window === "undefined";
 let islandCounter = 0;
 const componentIdMap = new WeakMap<preact.FunctionComponent<any>, string>();
 const componentNameCounts = new Map<string, number>();
-
-// True below an <Island>. The outer island's render (SSR and client) owns its
-// whole subtree, so a nested <Island> must not become a second hydration root.
-const InsideIsland = createContext(false);
 
 function IslandComponent({
   component: Component,
@@ -113,10 +111,10 @@ function safeSerializeProps(props: Record<string, unknown>): string {
  * Typed for both JSX runtimes the framework supports, `preact` and
  * `react-compat`: the element an island renders is runtime-specific (a Preact
  * VNode is not a React ReactNode, so React's JSX types rejected `<Island>`),
- * the props are not. The return type is left open; the props stay strict.
+ * the props are not. Returns {@link AnyJsxElement}, which both runtimes'
+ * JSX element checks accept; the props stay strict.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const Island = IslandComponent as unknown as (props: IslandProps) => any;
+export const Island = IslandComponent as unknown as (props: IslandProps) => AnyJsxElement | null;
 
 export type { ClientDirective };
 export type { IslandProps };

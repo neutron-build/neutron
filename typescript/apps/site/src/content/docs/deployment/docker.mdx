@@ -3,7 +3,17 @@ title: Docker
 description: Containerizing your Neutron app.
 ---
 
-You can containerize your Neutron application using the Node.js adapter and a standard Dockerfile.
+You can containerize your Neutron application with the docker preset, or with the Node.js adapter and a Dockerfile of your own.
+
+## `--preset docker`
+
+```bash
+neutron-ts build --preset docker
+docker build -t my-neutron-app dist
+docker run -p 3000:3000 my-neutron-app
+```
+
+The build writes a complete image context into `dist/`: `server.mjs`, a `Dockerfile` and `.dockerignore`, the runtime bundle under `dist/server/node/`, and the bundle's runtime dependencies under `dist/node_modules/`. The bundle keeps `@neutron-build/core`'s own dependencies external, as the `neutron-ts start` bundle does. Everything it imports at runtime is copied into the context as real directories (symlinks dereferenced), together with each package's production dependencies, so the image needs no `npm install` and works from a pnpm workspace, including with `resolve.preserveSymlinks`. Build the image from `dist/` itself; nothing outside it is read.
 
 ## Dockerfile
 

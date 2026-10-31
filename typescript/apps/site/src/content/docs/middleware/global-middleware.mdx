@@ -25,6 +25,10 @@ export const middleware: MiddlewareFn[] = [
 ];
 ```
 
+## What It Covers
+
+Global middleware runs outermost for every request the app serves: pages, resource routes, unmatched paths, and sub-apps mounted with `server.mount`. A mount that gates access itself can opt out with `{ app, globalMiddleware: false }` (see [Server configuration](/docs/configuration/neutron-config#server)).
+
 ## Middleware Signature
 
 ```ts

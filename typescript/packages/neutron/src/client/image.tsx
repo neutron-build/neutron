@@ -1,5 +1,6 @@
 import { h } from "preact";
 import type { JSX } from "preact";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 const DEFAULT_WIDTHS = [320, 640, 960, 1200, 1600];
 
@@ -29,7 +30,8 @@ export interface ImageProps
   priority?: boolean;
 }
 
-export function Image(props: ImageProps): any {
+/** Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX. */
+export function Image(props: ImageProps): AnyJsxElement | null {
   const {
     src,
     alt,

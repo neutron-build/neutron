@@ -18,6 +18,15 @@ export interface SeoMetaInput {
    * @example "%s — Tebian"
    */
   titleTemplate?: string | null;
+  /**
+   * Title for a page in this route chain that sets no `title` of its own —
+   * typically declared once in the root layout, as Next's `title.default`.
+   * Rendered as written: `titleTemplate` is not applied to it. Inherited like
+   * every field; a nested layout can set its own. Without it (and without a
+   * `title`), the title is guessed from the URL path.
+   * @example defaultTitle: "Tebian"
+   */
+  defaultTitle?: string;
   description?: string;
   canonical?: string;
   noindex?: boolean;
@@ -61,7 +70,7 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
 
   const resolvedTitle = input.title
     ? applyTitleTemplate(input.title, input.titleTemplate)
-    : undefined;
+    : input.defaultTitle || undefined;
 
   if (resolvedTitle) {
     tags.push({ tag: "title", content: resolvedTitle });
@@ -292,6 +301,9 @@ export function renderDocumentHead(
     /<title(?:\s|>)/i.test(seoHtml) ||
     /<title(?:\s|>)/i.test(extraHead);
   let titleTag = "";
+  // Last resort, reached only when the route chain declares neither a `title`
+  // nor a `defaultTitle`: HTML requires a <title>, and a document without one
+  // shows its bare URL in tabs, bookmarks and screen readers.
   if (!hasTitle) {
     const inferred = inferPageTitle(pathname);
     const template = seo?.titleTemplate;
@@ -319,14 +331,15 @@ export function renderDocumentHead(
     '<style>html{background:var(--neutron-bg,#0A0A0A);color-scheme:var(--neutron-color-scheme,dark)}</style>';
 
   // <neutron-island> (the hydration wrapper <Island> renders) is a custom
-  // element with no built-in styling, so browsers treat it as inline. Make it
-  // generate no box at all: its children then take part in the parent's
-  // layout exactly as if the wrapper were absent, so wrapping a component in
-  // <Island> never changes how it lays out (flex/grid items, percentage
-  // widths, margins). A sized box is wrong in some context either way: an
-  // inline one shrink-wraps inside centered flex columns, and the earlier
-  // `display:block;width:100%` made an island flex item eat the whole row,
-  // collapsing its `flex-1` siblings to 0px.
+  // element with no built-in styling, so browsers treat it as inline: inside
+  // a flex container with non-stretch alignment an inline/auto-sized item
+  // shrinks to fit, which breaks percentage widths on its children. Any box
+  // of its own changes layout somewhere — a full-width block breaks flex rows,
+  // grids and inline text. `display: contents` gives it none: the island's
+  // content lays out exactly as it would without the marker, as a direct
+  // child of the island's parent. The runtime observes that content for
+  // `client="visible"` (island-runtime.ts). Author CSS that follows can still
+  // give the marker a box.
   const islandBaseStyle =
     '<style>neutron-island{display:contents}</style>';
 

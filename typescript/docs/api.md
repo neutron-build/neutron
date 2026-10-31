@@ -19,7 +19,7 @@ Global route rules (`defineConfig({ routes })` / `createServer({ routes })`):
 
 - `routes.redirects`: source -> destination redirects (`307` default, `308` when `permanent: true`).
 - `routes.rewrites`: source -> destination internal rewrites.
-- `routes.headers`: path-based response headers applied when absent.
+- `routes.headers`: path-based response headers applied when absent, on every response for the path (pages, static and resource routes, mounts, dev). They override the `securityHeaders` defaults per path; a `null` value suppresses that header there. `:name*` in a source matches zero or more segments.
 
 Route config cache fields:
 
@@ -37,6 +37,7 @@ Loader cache policy notes:
 - Fresh loader results can be stored after mutations, then reused on next reads.
 - Requests with `Authorization`/`Cookie` or `Cache-Control: no-cache|no-store` bypass loader cache.
 - Client data requests can use `X-Neutron-Data: true`.
+- A redirect answering a data request (loader, middleware or `routes.redirects`) is sent as `204` with the target in `X-Neutron-Redirect` instead of a 3xx, so fetch does not follow it; the client router navigates to the target (replacing the entry that redirected). Document requests get the plain 3xx.
 - Optional `X-Neutron-Routes: route:id,...` can request partial loader execution for matched routes.
 
 Server cache store options (`createServer({ cache })`):
@@ -102,7 +103,7 @@ Adapter types:
 ## Cookies + Sessions
 
 - `parseCookieHeader(cookieHeader)`
-- `getCookie(cookieHeader, name)`
+- `getCookie(request, name)`
 - `serializeCookie(name, value, options?)`
 - `createMemorySessionStorage(options?)`
 - `sessionMiddleware(options?)`
@@ -147,6 +148,18 @@ Navigation:
 - `navigate(to, options?)`
 - `go(delta)`
 - `route(value)` typed route helper.
+
+Stylesheets across client navigation: by default a route's stylesheets stay
+linked after you navigate away (as in Next's App Router), so rules that
+conflict between pages resolve by load order. `client: {
+unloadRouteStylesheets: true }` in `neutron.config.ts` unlinks, once the new
+page has rendered, the route stylesheets it does not list; the client entry's
+and layouts' stylesheets (in every route's list) and links a `head()` adds stay.
+The cost: navigating back re-requests the sheet (normally an HTTP-cache hit)
+before the page renders.
+
+Server Actions: `"use server"` modules, `getActionContext()`,
+`ServerActionError` — see [server-actions.md](./server-actions.md).
 
 Typed routing types:
 

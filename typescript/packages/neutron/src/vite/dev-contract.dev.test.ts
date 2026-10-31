@@ -2,12 +2,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as http from "node:http";
 import * as net from "node:net";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { createServer as createViteServer } from "vite";
 import { neutronPlugin } from "./plugin.js";
 import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
 import { discoverRoutes } from "../core/manifest.js";
 import { serverOpenApiSpec, type NeutronOpenApiOptions } from "../server/openapi.js";
+import type { NeutronRoutesConfig } from "../config.js";
 
 /**
  * Dev/prod contract parity for the dev pipeline:
@@ -79,12 +80,18 @@ async function makeApp(files: Record<string, string>): Promise<string> {
   roots.push(root);
   await fs.mkdir(path.join(root, "src", "routes"), { recursive: true });
   for (const [name, source] of Object.entries(files)) {
+    await fs.mkdir(path.join(root, "src", "routes", path.dirname(name)), { recursive: true });
     await fs.writeFile(path.join(root, "src", "routes", name), source, "utf-8");
   }
   return root;
 }
 
-async function boot(root: string, version?: string, openapi?: NeutronOpenApiOptions): Promise<string> {
+async function boot(
+  root: string,
+  version?: string,
+  openapi?: NeutronOpenApiOptions,
+  routeRules?: NeutronRoutesConfig
+): Promise<string> {
   const port = await getFreePort();
   const preactSsr = resolvePreactSsr(root);
   const vite = await createViteServer({
@@ -97,6 +104,7 @@ async function boot(root: string, version?: string, openapi?: NeutronOpenApiOpti
         rootDir: root,
         version,
         openapi,
+        routeRules,
       }),
     ],
     resolve: { alias: vitePreactAliases(preactSsr) },
@@ -230,4 +238,228 @@ describe("dev server: Responses from loaders and actions keep status and body", 
       expect(await loaded.json()).toEqual({ from: "loader" });
     });
   }
+});
+
+const RESOURCE_ROUTE = `
+export async function GET({ params }) {
+  return { endpoint: "dev", id: params.id ?? null };
+}
+export async function POST({ request }) {
+  return Response.json(await request.json(), { status: 201 });
+}
+`;
+
+const GATED_RESOURCE_ROUTE = `
+export async function middleware(request, context, next) {
+  if (!request.headers.get("x-token")) {
+    return new Response(JSON.stringify({ error: "denied" }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  return next();
+}
+export async function GET() {
+  return { classified: true };
+}
+`;
+
+describe("dev server: resource routes answer like the production server", () => {
+  it("dispatches method handlers with params and 405s identically", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "api/time.ts": RESOURCE_ROUTE,
+    }));
+
+    const got = await fetch(`${base}/api/time`);
+    expect(got.status).toBe(200);
+    expect(await got.json()).toEqual({ endpoint: "dev", id: null });
+
+    const posted = await fetch(`${base}/api/time`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: 1 }),
+    });
+    expect(posted.status).toBe(201);
+    expect(await posted.json()).toEqual({ ok: 1 });
+
+    // Same 405 problem+json + Allow shape as start (TS-27/A-024 parity).
+    const denied = await fetch(`${base}/api/time`, { method: "DELETE" });
+    expect(denied.status).toBe(405);
+    expect(denied.headers.get("content-type")).toContain("application/problem+json");
+    expect(denied.headers.get("allow")).toBe("GET, POST, HEAD");
+  });
+
+  it("dispatches extension-bearing resource paths instead of bypassing to Vite", { timeout: 30_000 }, async () => {
+    // Both spellings that put an extension in a URL segment:
+    // - `rss[.]xml.ts` — the literal-dot filename escape → /rss.xml
+    // - `feed.xml/index.ts` — a directory whose name carries the extension
+    //   → /feed.xml
+    // The dev static-asset bypass used to hand both to Vite (404) before the
+    // router could dispatch them, while production answered 200 — dev must
+    // route what production routes. `sitemap-xml.ts` (no dot survives in the
+    // URL) is the control that always worked.
+    const root = await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "rss[.]xml.ts": RESOURCE_ROUTE,
+      "feed.xml/index.ts": RESOURCE_ROUTE,
+      "sitemap-xml.ts": RESOURCE_ROUTE,
+    });
+    // A real static asset: the bypass must keep working for files, so the
+    // fix cannot simply route every dotted path.
+    await fs.mkdir(path.join(root, "public"), { recursive: true });
+    await fs.writeFile(path.join(root, "public", "styles.css"), "body{margin:0}", "utf-8");
+    const base = await boot(root);
+
+    for (const path of ["/rss.xml", "/feed.xml", "/sitemap-xml"]) {
+      const res = await fetch(`${base}${path}`);
+      expect(res.status, `GET ${path}`).toBe(200);
+      expect(await res.json()).toEqual({ endpoint: "dev", id: null });
+    }
+
+    // POST and 405 flow through the same dispatch, not the bypass.
+    const posted = await fetch(`${base}/rss.xml`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ok: 1 }),
+    });
+    expect(posted.status).toBe(201);
+    expect(await posted.json()).toEqual({ ok: 1 });
+
+    const denied = await fetch(`${base}/rss.xml`, { method: "DELETE" });
+    expect(denied.status).toBe(405);
+    expect(denied.headers.get("allow")).toBe("GET, POST, HEAD");
+
+    // Real assets still bypass the router to Vite's static handler.
+    const css = await fetch(`${base}/styles.css`);
+    expect(css.status).toBe(200);
+    expect(css.headers.get("content-type")).toContain("text/css");
+    expect(await css.text()).toBe("body{margin:0}");
+  });
+
+  it("answers a handler's thrown error with the same generic 500 as start", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "api/boom.ts": `
+export async function GET() {
+  throw new Error("connect ECONNREFUSED postgres://admin:hunter2@db");
+}
+`,
+    }));
+
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await fetch(`${base}/api/boom`);
+      expect(res.status).toBe(500);
+      expect(res.headers.get("content-type")).toContain("application/problem+json");
+      const text = await res.text();
+      expect(text).not.toContain("hunter2");
+      expect(JSON.parse(text)).toMatchObject({ status: 500, instance: "/api/boom" });
+      // The detail goes to the developer's terminal instead.
+      expect(consoleError.mock.calls.flat().map(String).join(" ")).toContain("hunter2");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("adds route-rule headers to a Response.redirect() like start does", { timeout: 30_000 }, async () => {
+    const base = await boot(
+      await makeApp({
+        "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+        "api/go.ts": `
+export async function GET() {
+  return Response.redirect("http://127.0.0.1/login", 307);
+}
+`,
+      }),
+      undefined,
+      undefined,
+      { headers: [{ source: "/api/go", headers: { "x-route-rule": "yes" } }] }
+    );
+
+    const res = await fetch(`${base}/api/go`, { redirect: "manual" });
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toBe("http://127.0.0.1/login");
+    expect(res.headers.get("x-route-rule")).toBe("yes");
+  });
+
+  it("runs route middleware around dev dispatch", { timeout: 30_000 }, async () => {
+    const base = await boot(await makeApp({
+      "index.tsx": responseRoute(`(b, s) => Response.json(b, { status: s })`),
+      "api/secret.ts": GATED_RESOURCE_ROUTE,
+    }));
+
+    const denied = await fetch(`${base}/api/secret`);
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({ error: "denied" });
+
+    const allowed = await fetch(`${base}/api/secret`, { headers: { "x-token": "t" } });
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual({ classified: true });
+  });
+});
+
+const GLOBAL_GATE = (marker: string) => `
+export const middleware = [
+  async (request, _context, next) => {
+    const path = new URL(request.url).pathname;
+    if (path !== "/public" && request.headers.get("x-token") !== "t") {
+      return Response.json({ gate: "${marker}", path }, { status: 401 });
+    }
+    return next();
+  },
+];
+`;
+
+const PAGE_ROUTE = `
+import { h } from "preact";
+export const config = { mode: "app" };
+export default function Page() {
+  return h("div", null, "page body");
+}
+`;
+
+describe("dev server: global middleware (src/middleware.ts) runs as in start", () => {
+  it("gates page routes, resource routes and unmatched paths, and follows edits", { timeout: 60_000 }, async () => {
+    const root = await makeApp({
+      "index.tsx": PAGE_ROUTE,
+      "public.tsx": PAGE_ROUTE,
+      "api/data.ts": `export async function GET() { return Response.json({ data: 1 }); }`,
+    });
+    const middlewareFile = path.join(root, "src", "middleware.ts");
+    await fs.writeFile(middlewareFile, GLOBAL_GATE("v1"), "utf-8");
+    const base = await boot(root);
+
+    for (const p of ["/", "/api/data", "/nowhere"]) {
+      const denied = await fetch(`${base}${p}`);
+      expect(denied.status, `GET ${p}`).toBe(401);
+      expect(await denied.json(), `GET ${p}`).toEqual({ gate: "v1", path: p });
+    }
+
+    const page = await fetch(`${base}/`, { headers: { "x-token": "t" } });
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("page body");
+    const data = await fetch(`${base}/api/data`, { headers: { "x-token": "t" } });
+    expect(await data.json()).toEqual({ data: 1 });
+    // Let through: Vite answers the unmatched path exactly as without a gate.
+    const unmatched = await fetch(`${base}/nowhere`, { headers: { "x-token": "t" } });
+    expect(unmatched.status).toBe(404);
+    const open = await fetch(`${base}/public`);
+    expect(open.status).toBe(200);
+
+    // An edit is picked up without restarting the dev server.
+    await fs.writeFile(middlewareFile, GLOBAL_GATE("v2"), "utf-8");
+    let gate: unknown;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      gate = await (await fetch(`${base}/api/data`)).json();
+      if ((gate as { gate?: string }).gate === "v2") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(gate).toEqual({ gate: "v2", path: "/api/data" });
+
+    // Deleting the file removes the gate.
+    await fs.rm(middlewareFile);
+    const ungated = await fetch(`${base}/api/data`);
+    expect(ungated.status).toBe(200);
+  });
 });

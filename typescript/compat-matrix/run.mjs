@@ -24,6 +24,11 @@ import process from "node:process";
 import { renderToString } from "preact-render-to-string";
 
 import { CASES } from "./libraries.mjs";
+import { registerBundlerParityHooks } from "./node-hooks.mjs";
+
+// Before anything loads: the hooks make raw Node resolve packages the way the
+// Vite build does (see node-hooks.mjs for why each rule exists).
+registerBundlerParityHooks();
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -48,37 +53,80 @@ function assertOnePreact() {
   const shimPreact = realpathSync(createRequire(shimEntry).resolve("preact/package.json"));
   const oursPreact = realpathSync(require.resolve("preact/package.json"));
 
-  if (shimPreact === oursPreact) return versionAt(dirname(oursPreact));
+  if (shimPreact !== oursPreact) {
+    console.error("The compat shims and this harness are using different copies of preact.");
+    console.error(`  harness : ${versionAt(dirname(oursPreact))}  ${dirname(oursPreact)}`);
+    console.error(`  shims   : ${versionAt(dirname(shimPreact))}  ${dirname(shimPreact)}`);
+    console.error("");
+    console.error("Every hooks-based library will fail with `__H` of undefined, and none of");
+    console.error("those failures says anything about preact/compat. Both package.json files");
+    console.error("under compat-matrix/shims pin preact exactly for this reason -- check that");
+    console.error("the pin still matches compat-matrix/package.json, then reinstall.");
+    process.exit(2);
+  }
 
-  console.error("The compat shims and this harness are using different copies of preact.");
-  console.error(`  harness : ${versionAt(dirname(oursPreact))}  ${dirname(oursPreact)}`);
-  console.error(`  shims   : ${versionAt(dirname(shimPreact))}  ${dirname(shimPreact)}`);
-  console.error("");
-  console.error("Every hooks-based library will fail with `__H` of undefined, and none of");
-  console.error("those failures says anything about preact/compat. Both package.json files");
-  console.error("under compat-matrix/shims pin preact exactly for this reason -- check that");
-  console.error("the pin still matches compat-matrix/package.json, then reinstall.");
-  process.exit(2);
+  // Same package is necessary but not sufficient: Node loads a package's CJS
+  // and ESM builds as two instances, and any dependency that reaches react
+  // through CJS (use-sync-external-store shims, @tiptap/react and @xyflow/react
+  // both do) would call hooks on a preact whose hooks state the renderer never
+  // initializes. node-hooks.mjs forces every preact resolution onto the ESM
+  // dist, so require() and import() must land on the same instance. If they
+  // do not, every library with a CJS hop in its tree reports `__H` failures
+  // that are harness artifacts.
+  const byRequire = require("preact/compat");
+  return import("preact/compat").then((byImport) => {
+    if (byRequire.useState !== byImport.useState) {
+      console.error("preact/compat loaded as two module instances (CJS dist and ESM dist).");
+      console.error("The CJS copy's hooks never see a current component, so any library that");
+      console.error("reaches react through CJS fails with `__H` of undefined. The resolve hook");
+      console.error("in node-hooks.mjs forces preact onto the ESM dist for exactly this reason;");
+      console.error("check that it is registered before the first library import.");
+      process.exit(2);
+    }
+    return versionAt(dirname(oursPreact));
+  });
 }
 
-const PREACT_VERSION = assertOnePreact();
+const PREACT_VERSION = await assertOnePreact();
 const DOC_PATH = join(HERE, "..", "docs", "react-compat-matrix.md");
 const BASELINE_PATH = join(HERE, "baseline.json");
 const WRITE = process.argv.includes("--write");
 
 function versionOf(pkg) {
-  try {
-    const url = import.meta.resolve(`${pkg}/package.json`);
-    return JSON.parse(readFileSync(fileURLToPath(url), "utf-8")).version;
-  } catch {
-    // Not every package exports package.json; fall back to the declared range.
+  // The version actually installed and rendered, not the declared range.
+  // Resolving `<pkg>/package.json` only works for packages that export that
+  // subpath — none of the Radix packages do — and the declared-range fallback
+  // below prints the specifier with its prefix stripped. The first published
+  // matrix combined the two into a quiet lie: every Radix row claimed
+  // "1.1.4"-era numbers while the lockfile had 1.1.23+ installed and under
+  // test. Resolve the package entry and walk up to the manifest that owns it
+  // (skipping marker package.json files with no version, e.g. the ESM marker
+  // inside qrcode.react).
+  const declaredRange = () => {
     try {
       const own = JSON.parse(readFileSync(join(HERE, "package.json"), "utf-8"));
       return (own.dependencies?.[pkg] ?? "").replace(/^[\^~]/, "") || "unknown";
     } catch {
       return "unknown";
     }
+  };
+  try {
+    let dir = dirname(fileURLToPath(import.meta.resolve(pkg)));
+    for (;;) {
+      const manifest = join(dir, "package.json");
+      if (existsSync(manifest)) {
+        const version = JSON.parse(readFileSync(manifest, "utf-8")).version;
+        if (typeof version === "string") return version;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // Not every package resolves an entry from here (@tiptap/pm exports only
+    // subpaths).
   }
+  return declaredRange();
 }
 
 async function runCase(testCase) {
@@ -176,6 +224,12 @@ It covers **server rendering**, which is where most compat failures surface
 across the boundary, \`forwardRef\` shapes). It does not cover interaction:
 a library can render and still misbehave on click, focus, or animation frames.
 Treat a yes as "safe to adopt, still test your own flows", not as certification.
+
+Loading follows the Vite build's semantics, not raw Node's: one preact instance
+for CJS and ESM consumers, require-style path fallbacks, the \`module\` field
+for dependency-internal imports (\`compat-matrix/node-hooks.mjs\` implements and
+explains each). Those are bundler mechanics, not library compatibility — a
+library that still fails here fails for its own reasons, and the row says so.
 
 It also covers only the libraries listed. Adding one is a single entry in
 \`compat-matrix/libraries.mjs\` — a mount and an assertion — and a

@@ -7,7 +7,7 @@ Route files in `src/routes` can export the following named exports.
 
 ## `default` (Component)
 
-**Required**. The React/Preact component to render for this route.
+**Required for pages.** The React/Preact component to render for this route. The one exception is a [resource route](/docs/routing/file-conventions#resource-routes): a module that exports HTTP method handlers and no default component is served as an endpoint, not a page.
 
 ```tsx
 export default function Page() {
@@ -29,6 +29,17 @@ export async function loader(args: LoaderArgs): Promise<Data>;
 
 ```tsx
 export async function action(args: ActionArgs): Promise<Data>;
+```
+
+## HTTP method handlers (`GET`, `POST`, …)
+
+**Optional, resource routes only.** A route module with method-handler exports and no default component is served as an HTTP endpoint — see [Resource Routes](/docs/routing/file-conventions#resource-routes) for the full contract (return values, 405/`Allow`, middleware, client-build stripping). A module that exports both a component and method handlers fails the build.
+
+```ts
+// src/routes/api/health.ts → GET /api/health
+export async function GET() {
+  return { ok: true };
+}
 ```
 
 ## `config`

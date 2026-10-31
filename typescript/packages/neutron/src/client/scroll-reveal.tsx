@@ -1,4 +1,5 @@
 import { h } from "preact";
+import type { AnyJsxElement } from "./jsx-agnostic.js";
 
 export interface ScrollRevealProps {
   /**
@@ -173,8 +174,10 @@ document.querySelectorAll("[data-stagger-children]>*").forEach(function(el){el.s
  * // With your own CSS (recommended for production sites):
  * <ScrollReveal injectCSS={false} />
  * ```
+ *
+ * Returns {@link AnyJsxElement}: renders from preact- and React-typed JSX.
  */
-export function ScrollReveal(props: ScrollRevealProps = {}) {
+export function ScrollReveal(props: ScrollRevealProps = {}): AnyJsxElement | null {
   return h("script", {
     dangerouslySetInnerHTML: { __html: buildBootstrap(props) },
   });

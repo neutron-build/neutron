@@ -12,7 +12,7 @@ async function generated(module: string, global?: string) {
   const entry = path.join(root, 'entry.mjs'); const file = path.join(root, 'route.mjs'); const gm = path.join(root, 'middleware.mjs');
   await fs.writeFile(file, module); if (global !== undefined) await fs.writeFile(gm, global);
   const definition = { id: 'r', path: route.path, file, parentId: null, params: [], mode: 'app' as const, cache: route.config.cache, isLayout: false };
-  let code = generateRuntimeEntrySource([definition], [route], null, [], entry, undefined, global === undefined ? undefined : gm);
+  let code = generateRuntimeEntrySource([definition], [route], null, [], null, entry, undefined, global === undefined ? undefined : gm);
   code = code.replace('"@neutron-build/core/runtime-edge"', JSON.stringify(pathToFileURL(path.resolve('../neutron/dist/runtime/edge.js')).href));
   await fs.writeFile(entry, code);
   return { root, load: () => import(pathToFileURL(entry).href) };

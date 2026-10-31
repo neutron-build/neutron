@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Route, RouteConfig } from "./types.js";
+import { RESOURCE_ROUTE_METHODS } from "./resource-routes.js";
+import type { ResourceRouteMethod } from "./resource-routes.js";
 export { findNotFoundMatch, findNotFoundRoute, type NotFoundMatch } from "./route-path.js";
 import { parse as babelParse } from "@babel/parser";
 
@@ -120,6 +122,26 @@ function validateRoutes(routes: Route[]): void {
     }
   }
 
+  // A module with BOTH a default component and HTTP method handlers is
+  // contradictory: the page pipeline renders the component and never
+  // dispatches method handlers, so the handlers would be dead code — or worse,
+  // a reader's guess ("GET fetches data for my page") would be wrong. Refuse
+  // at discovery so every consumer (dev server, build, start) sees it. A
+  // module with method handlers and NO component is a resource route and is
+  // served as an endpoint instead (core/resource-routes.ts).
+  for (const route of routes) {
+    if (route.isLayout || route.isNotFound) continue;
+    if (route.hasMethodHandlers === true && route.hasDefaultExport === true) {
+      throw new Error(
+        `Neutron: route "${route.path}" exports both a default component and HTTP method handlers\n` +
+          `  from ${route.file}\n` +
+          `  A route module is either a page (default component) or a resource route ` +
+          `(GET/POST/... handlers), not both — the page pipeline would never run ` +
+          `the handlers. Split the file, or drop the component or the handlers.`
+      );
+    }
+  }
+
   // Two files that resolve to the same shape: only one of them can ever be
   // matched, and which one is an accident of discovery order. Param names are
   // erased first, so /users/:id and /users/:name collide too — the router keeps
@@ -202,6 +224,9 @@ function createRoute(
       hasLoader: derived.hasLoader,
       hasMiddleware: derived.hasMiddleware,
       hasAction: derived.hasAction,
+      hasMethodHandlers: derived.hasMethodHandlers,
+      resourceMethods: derived.resourceMethods,
+      hasDefaultExport: derived.hasDefaultExport,
       parentId,
       isLayout: true,
     };
@@ -221,6 +246,9 @@ function createRoute(
       hasLoader: derived.hasLoader,
       hasMiddleware: derived.hasMiddleware,
       hasAction: derived.hasAction,
+      hasMethodHandlers: derived.hasMethodHandlers,
+      resourceMethods: derived.resourceMethods,
+      hasDefaultExport: derived.hasDefaultExport,
       parentId,
       isLayout: false,
       isNotFound: true,
@@ -239,6 +267,9 @@ function createRoute(
     hasLoader: derived.hasLoader,
     hasMiddleware: derived.hasMiddleware,
     hasAction: derived.hasAction,
+    hasMethodHandlers: derived.hasMethodHandlers,
+    resourceMethods: derived.resourceMethods,
+    hasDefaultExport: derived.hasDefaultExport,
     parentId,
     isLayout: false,
   };
@@ -267,6 +298,24 @@ export interface RouteFacts {
    * documented only when an action exists to serve it.
    */
   hasAction: boolean;
+  /**
+   * Whether the route source exports HTTP method handlers (`GET`, `POST`,
+   * ...). With `hasDefaultExport === false` this classifies a resource route
+   * (core/resource-routes.ts); with a default component it is a discovery
+   * error — the page pipeline would never dispatch the handlers.
+   */
+  hasMethodHandlers: boolean;
+  /**
+   * Which HTTP method handlers the route source exports. Derived alongside
+   * `hasMethodHandlers` (which is `resourceMethods.length > 0`); carried in
+   * the route table because OpenAPI generation runs at boot from the table
+   * alone and cannot import the module. Empty when unknown — never guessed.
+   */
+  resourceMethods: ResourceRouteMethod[];
+  /**
+   * Whether the route source has a default export (a component).
+   */
+  hasDefaultExport: boolean;
 }
 
 /**
@@ -383,18 +432,46 @@ export function parseRouteFacts(fileContent: string): RouteFacts {
       sourceType: "module",
       plugins: ["typescript", "jsx"],
     });
-    const { names, unresolvedStar } = collectExportedNames(
-      ast.program.body as unknown as ExportStatementNode[]
-    );
+    const statements = ast.program.body as unknown as ExportStatementNode[];
+    const { names, unresolvedStar } = collectExportedNames(statements);
+    // HTTP method handlers (resource routes). Collect WHICH methods are
+    // exported, not just that one is: the route table is the only place the
+    // fact can live (OpenAPI runs from the table, the client build strips the
+    // exports). Only names the parse resolved count — an unresolved
+    // `export *` is not read as handlers, since a page that also has a
+    // default export would then be a discovery error, and a method listed
+    // without a handler would be documented falsely.
+    const resourceMethods = RESOURCE_ROUTE_METHODS.filter((method) => names.has(method));
+    // `export default …` or `export { X as default }`; `export *` never
+    // re-exports a default.
+    const hasDefaultExport =
+      names.has("default") || statements.some((statement) => statement.type === "ExportDefaultDeclaration");
     return {
       hasLoader: unresolvedStar || names.has("loader"),
       hasMiddleware: unresolvedStar || names.has("middleware"),
       hasAction: unresolvedStar || names.has("action"),
+      hasMethodHandlers: resourceMethods.length > 0,
+      resourceMethods,
+      hasDefaultExport,
     };
   } catch {
-    // Unparseable source: assume the heavier path, and assume gated. Never
-    // convert uncertainty into an absence fact.
-    return { hasLoader: true, hasMiddleware: true, hasAction: true };
+    // Unparseable source: assume the heavier path and assume gated — never
+    // convert uncertainty into an absence fact. Method handlers and the
+    // default export fall back to source shape, which is what classified
+    // resource routes before the parse existed.
+    const resourceMethods = RESOURCE_ROUTE_METHODS.filter(
+      (method) =>
+        new RegExp(`export\\s+(?:async\\s+)?(?:function|const|let|var)\\s+${method}\\b`).test(fileContent) ||
+        new RegExp(`export\\s*\\{[^}]*\\b${method}\\b[^}]*\\}`).test(fileContent)
+    );
+    return {
+      hasLoader: true,
+      hasMiddleware: true,
+      hasAction: true,
+      hasMethodHandlers: resourceMethods.length > 0,
+      resourceMethods,
+      hasDefaultExport: /(^|\n)\s*export\s+default\b/.test(fileContent),
+    };
   }
 }
 
@@ -402,8 +479,18 @@ function readRouteFacts(filePath: string): RouteFacts {
   try {
     return parseRouteFacts(fs.readFileSync(filePath, "utf-8"));
   } catch {
-    // Unreadable source: assume the heavier path, and assume gated.
-    return { hasLoader: true, hasMiddleware: true, hasAction: true };
+    // Unreadable source: assume the heavier path, assume gated, and assume a
+    // page (NOT a resource route) — an endpoint misclassified as a 404 is the
+    // pre-convention behavior; a page misclassified as an endpoint would be
+    // a new break.
+    return {
+      hasLoader: true,
+      hasMiddleware: true,
+      hasAction: true,
+      hasMethodHandlers: false,
+      resourceMethods: [],
+      hasDefaultExport: true,
+    };
   }
 }
 

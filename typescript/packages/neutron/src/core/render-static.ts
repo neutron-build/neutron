@@ -7,6 +7,7 @@ import type {
   LoaderArgs,
 } from "./types.js";
 import { discoverRoutes } from "./manifest.js";
+import { isResourceRoute } from "./resource-routes.js";
 import { assertRenderedFragment } from "./fragment-guard.js";
 import {
   renderDocumentHead,
@@ -129,13 +130,26 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
 
   const layouts = new Map<string, Route>();
   const pageRoutes: Route[] = [];
+  // Resource routes (method handlers, no component) are endpoints, never
+  // pages: separated here so the prerender pass and the gated-static refusal
+  // below both skip them. A-020 refuses `mode: "static"` + middleware because
+  // a PREBUILT FILE would be served before middleware runs; a resource route
+  // produces no file, is served per request through the middleware chain,
+  // and so MAY be gated — refusing it would break every authed endpoint.
+  const resourceRoutes: Route[] = [];
 
   for (const route of allRoutes) {
     if (route.file.includes("_layout")) {
       layouts.set(route.id, route);
+    } else if (isResourceRoute(route)) {
+      resourceRoutes.push(route);
     } else {
       pageRoutes.push(route);
     }
+  }
+
+  for (const route of resourceRoutes) {
+    console.log(`  Skipping ${route.path} (resource route — served per request)`);
   }
 
   function getLayoutChain(route: Route): Route[] {

@@ -34,9 +34,21 @@ export async function scaffoldProject(options: ScaffoldOptions): Promise<Scaffol
     PROJECT_NAME: projectName,
     PACKAGE_NAME: packageName,
     RUNTIME: options.runtime,
+    // Same rule as @neutron-build/core's resolveRuntimeJsx: the tsconfig the
+    // scaffold ships must agree with the import source the CLI's Vite
+    // transform already uses for the runtime. Hooks follow it: preact apps
+    // import "preact/hooks"; react-compat apps import "react" (types from the
+    // @types/react devDependency, runtime through the preact/compat alias —
+    // no react package is installed).
+    JSX_IMPORT_SOURCE: options.runtime === "react-compat" ? "react" : "preact",
+    HOOKS_IMPORT: options.runtime === "react-compat" ? "react" : "preact/hooks",
     NEUTRON_VERSION: dependencyVersions.neutron,
     NEUTRON_CLI_VERSION: dependencyVersions.neutronCli,
   });
+
+  if (options.runtime === "react-compat") {
+    await addReactTypesDependency(absoluteTargetDir);
+  }
 
   return {
     targetDir: options.targetDir,
@@ -65,6 +77,26 @@ function detectPackageManager(): string {
   if (ua.startsWith("yarn")) return "yarn";
   if (ua.startsWith("bun")) return "bun";
   return "npm";
+}
+
+// The react npm package ships no bundled types. A react-compat project
+// typechecks React-ecosystem imports (and, when it opts its own modules into
+// `jsxImportSource: "react"`, its JSX) against @types/react — see
+// typescript/docs/react-compat.md. The bundler never needs the real react
+// package (the vite plugin aliases it to preact/compat), so only the types
+// are added, as a devDependency.
+const REACT_TYPES_VERSION = "^19.2.14";
+
+async function addReactTypesDependency(targetDir: string): Promise<void> {
+  const manifestPath = path.join(targetDir, "package.json");
+  const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf-8")) as {
+    devDependencies?: Record<string, string>;
+  };
+  manifest.devDependencies = {
+    ...manifest.devDependencies,
+    "@types/react": REACT_TYPES_VERSION,
+  };
+  await fsp.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
 }
 
 async function ensureTargetDirectory(targetDir: string): Promise<void> {

@@ -8,7 +8,16 @@ import {
   LoaderData,
   setNavigationState,
 } from "./hooks.js";
-import { getCurrentPath, getCurrentSearch, getNavigationGeneration, subscribeNavigationStart, subscribe, navigate } from "./navigate.js";
+import {
+  getCurrentPath,
+  getCurrentSearch,
+  getNavigationGeneration,
+  subscribeNavigationStart,
+  subscribe,
+  navigate,
+  dataRedirectTarget,
+  followDataRedirect,
+} from "./navigate.js";
 import type { RouteHref } from "../core/typed-routes.js";
 import { initIslands } from "./island-runtime.js";
 import { decodeLoaderDataPayload, readInitialLoaderData } from "./serialization.js";
@@ -18,6 +27,7 @@ import {
   setupIncrementalPrefetch,
 } from "./incremental-prefetch.js";
 import { ClientErrorBoundary } from "./error-boundary.js";
+import { routerOptions } from "./router-options.js";
 
 interface RouteModule {
   id?: string;
@@ -37,6 +47,8 @@ interface RouteRegistration {
   mode?: "static" | "app";
   hasLoader?: boolean;
   load?: () => Promise<unknown>;
+  /** `false` for a static-tier route: the build ships no client module for it. */
+  clientModule?: false;
   default?: ComponentType<{ data?: unknown; params?: Record<string, string>; actionData?: unknown }>;
   loader?: () => Promise<unknown>;
   ErrorBoundary?: ComponentType<{ error: Error; reset?: () => void }>;
@@ -69,6 +81,8 @@ interface RouteInfo {
    */
   mode?: "static" | "app";
   hasLoader?: boolean;
+  /** No client module: the route renders at the static tier (staticTierRouteIds). */
+  clientModule?: false;
 }
 
 let routes: RouteInfo[] = [];
@@ -118,6 +132,7 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
             link.rel = "stylesheet";
             link.href = url;
             link.setAttribute("data-neutron-nav", "true");
+            link.setAttribute("data-neutron-css", "");
             link.onload = () => {
               loadedStylesheets.add(normalizeStylesheetUrl(url));
               resolve();
@@ -137,12 +152,56 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
   ]);
 }
 
-export async function init() {
+/**
+ * With `client.unloadRouteStylesheets`: once the page navigated to has
+ * rendered (the next frame), unlink the route stylesheets it does not list.
+ * Only links Neutron created for routes (`data-neutron-css`) are candidates;
+ * the client entry's and layouts' stylesheets are in every route's list.
+ * Unlinking after the render means the outgoing page never loses its styles
+ * while it is still on screen, and the incoming page's were loaded before it
+ * rendered (loadMissingStylesheets).
+ */
+function unloadUnusedStylesheets(keep: string[], requestId: number): void {
+  if (!routerOptions.unloadRouteStylesheets) return;
+  const wanted = new Set(keep.map(normalizeStylesheetUrl));
+  const run = () => {
+    // A later navigation owns the document now; it will unload for itself.
+    if (requestId !== latestNavigationRequestId) return;
+    document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][data-neutron-css]').forEach((link) => {
+      const key = normalizeStylesheetUrl(link.getAttribute("href") || link.href);
+      if (!wanted.has(key)) {
+        link.remove();
+        loadedStylesheets.delete(key);
+      }
+    });
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => run());
+  } else {
+    setTimeout(run, 0);
+  }
+}
+
+/**
+ * Start the router. Resolves `"static"` without starting it when the current
+ * page is a static-tier route the build shipped no client module for.
+ */
+export async function init(): Promise<"static" | void> {
   if (initialized) return;
   initialized = true;
 
   if (import.meta.env.DEV) {
     await import("preact/debug");
+  }
+
+  // A static-tier page (its whole chain renders without the router) has no
+  // client module to hydrate it with: the router does not start, and the
+  // caller boots the document as a static page — islands only, as a
+  // prerendered page that never loads this module would be.
+  const initialRoute = findRoute(getCurrentPath());
+  if (initialRoute && [...getLayoutChain(initialRoute), initialRoute].some((r) => r.clientModule === false)) {
+    initialized = false;
+    return "static";
   }
 
   window.__NEUTRON_ROUTER_ACTIVE__ = true;
@@ -269,6 +328,9 @@ function findRoute(pathname: string): RouteInfo | null {
 function isBrowserNavigationTarget(pathname: string): boolean {
   const route = findRoute(pathname);
   if (!route) return false;
+  const chain = [...getLayoutChain(route), route];
+  // Built without a client module: only a document load can render it.
+  if (chain.some((entry) => entry.clientModule === false)) return true;
   if (route.mode !== "static") return false;
   return getLayoutChain(route).every((layout) => layout.mode === "static");
 }
@@ -542,6 +604,11 @@ function extractParams(pattern: string, pathname: string): Record<string, string
   try { return bindPathParams(pattern, parseUrlPath(decodeURIComponent(pathname))) ?? {}; } catch { return {}; }
 }
 
+// Redirects followed in a row by the client router; reset by any navigation
+// that lands. Bounded like a browser's own redirect limit.
+const MAX_DATA_REDIRECTS = 20;
+let consecutiveDataRedirects = 0;
+
 async function handleNavigation(forceRevalidate: boolean = false, navigationIdentity = getNavigationGeneration()) {
   const pathname = getCurrentPath();
   const search = getCurrentSearch();
@@ -639,6 +706,9 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
     }
     const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, prefetched);
     commit(merged);
+    if (Array.isArray(prefetchCss)) {
+      unloadUnusedStylesheets(prefetchCss as string[], requestId);
+    }
     setNavigationState({ state: "idle" });
     if (activeNavigationController === controller) activeNavigationController = null;
     // Same contract as the fetched path: a new page starts at the top. Leaving
@@ -673,6 +743,25 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
       return;
     }
 
+    // The URL redirected (loader, middleware or a config rule). Its data is
+    // not this URL's, and the redirect target may lose the address bar's
+    // query if rendered in place, so navigate to the target instead,
+    // replacing the entry that redirected. The route state still describes
+    // the page on screen (it changes only at commit), so the target's layout
+    // diff is taken against what was rendered.
+    const redirectTo = dataRedirectTarget(response);
+    if (redirectTo !== null) {
+      if (++consecutiveDataRedirects > MAX_DATA_REDIRECTS) {
+        // A loop: hand it to the browser, which reports it.
+        consecutiveDataRedirects = 0;
+        window.location.replace(redirectTo);
+        return;
+      }
+      followDataRedirect(redirectTo, { replace: true });
+      return;
+    }
+    consecutiveDataRedirects = 0;
+
     if (response.ok) {
       const payload = await response.json();
       if (!isCurrent()) return;
@@ -698,6 +787,9 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
 
       const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, data);
       commit(merged);
+      if (Array.isArray(cssUrls)) {
+        unloadUnusedStylesheets(cssUrls as string[], requestId);
+      }
       if (previousPathname !== pathname) {
         window.scrollTo({ top: 0, left: 0, behavior: "auto" });
       }
@@ -798,18 +890,23 @@ export function registerRoutes(routeMap: Record<string, RouteRegistration | Rout
     path:
       registration.path || id.replace(/^route:/, "").replace(/\.(tsx|ts|jsx|js|mdx)$/, ""),
     module:
-      typeof registration.load === "function"
+      typeof registration.load === "function" || registration.clientModule === false
         ? null
         : normalizeRouteModule(registration),
     load:
-      typeof registration.load === "function"
-        ? async () => normalizeRouteModule(await registration.load!())
-        : async () => normalizeRouteModule(registration),
+      registration.clientModule === false
+        ? async () => {
+            throw new Error(`neutron: route ${id} renders at the static tier and has no client module`);
+          }
+        : typeof registration.load === "function"
+          ? async () => normalizeRouteModule(await registration.load!())
+          : async () => normalizeRouteModule(registration),
     parentId: registration.parentId ?? null,
     isLayout: registration.isLayout === true,
     isNotFound: registration.isNotFound === true,
     mode: registration.mode,
     hasLoader: registration.hasLoader,
+    clientModule: registration.clientModule,
   }));
 }
 

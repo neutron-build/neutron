@@ -8,6 +8,7 @@
     "build": "neutron-ts build",
     "build:vercel": "neutron-ts build --preset vercel",
     "start": "neutron-ts start",
+    "typecheck": "tsc --noEmit",
     "preview": "neutron-ts preview",
     "release:check": "neutron-ts release-check --preset vercel"
   },

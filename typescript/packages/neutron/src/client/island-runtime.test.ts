@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { h } from "preact";
 import { useState } from "preact/hooks";
 import { initIslands, resolveIslandExport } from "./island-runtime.js";
@@ -170,7 +170,41 @@ describe("router-owned islands", () => {
 describe("nested islands", () => {
   beforeEach(() => {
     document.body.innerHTML = "";
-    delete (window as any).__ISLAND_COMPONENTS__;
+    (window as any).__ISLAND_COMPONENTS__ = undefined;
+  });
+
+  // <Island component={Outer}/> where Outer renders <Island component={Inner}/>:
+  // hydrating Outer mounts Inner as part of its tree. A second root for an
+  // inner marker would mount Inner twice over the same DOM.
+  it("hydrates the outer island only; the inner marker belongs to it", async () => {
+    const { Island } = await import("./island.js");
+    const { useEffect } = await import("preact/hooks");
+    let innerMounts = 0;
+    function Inner() {
+      useEffect(() => {
+        innerMounts++;
+      }, []);
+      return h("span", null, "inner");
+    }
+    function Outer() {
+      return h("div", null, h(Island, { component: Inner, client: "load", id: "Inner" }));
+    }
+    const { renderToString } = await import("preact-render-to-string");
+    document.body.innerHTML = renderToString(h(Island, { component: Outer, client: "load", id: "Outer" }));
+    (window as any).__ISLAND_COMPONENTS__ = { Outer, Inner };
+
+    initIslands();
+    await flush();
+    await flush();
+
+    // The nested <Island> renders inline (island.tsx): one marker, one root.
+    const markers = Array.from(document.querySelectorAll("neutron-island")) as Array<
+      HTMLElement & { __neutronHydrated?: boolean }
+    >;
+    expect(markers.length).toBe(1);
+    expect(markers[0].__neutronHydrated).toBe(true);
+    expect(innerMounts).toBe(1);
+    expect(document.querySelectorAll("span").length).toBe(1);
   });
 
   // Regression: an island inside another island is part of the outer island's
@@ -194,6 +228,62 @@ describe("nested islands", () => {
   });
 });
 
+describe('client="visible"', () => {
+  // IntersectionObserver reports nothing for an element that generates no
+  // box — a `display: contents` marker, the default (seo.ts). The stub
+  // reports only boxed targets as intersecting, as browsers do.
+  let observed: Element[] = [];
+  let fire: () => void = () => {};
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    (window as any).__ISLAND_COMPONENTS__ = { Counter };
+    observed = [];
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(private callback: (entries: Array<{ target: Element; isIntersecting: boolean }>) => void) {
+          fire = () =>
+            this.callback(
+              observed.map((target) => ({
+                target,
+                isIntersecting: getComputedStyle(target).display !== "contents",
+              }))
+            );
+        }
+        observe(target: Element) {
+          observed.push(target);
+        }
+        disconnect() {}
+      }
+    );
+  });
+
+  it("hydrates a display: contents marker when its content scrolls into view", async () => {
+    document.body.innerHTML =
+      '<neutron-island style="display: contents" data-component="Counter" data-client="visible" data-props="{}">' +
+      "<button>count:0</button></neutron-island>";
+    initIslands();
+    expect(observed.map((target) => target.tagName)).toEqual(["BUTTON"]);
+    fire();
+    await flush();
+    const island = document.querySelector("neutron-island") as HTMLElement & { __neutronHydrated?: boolean };
+    expect(island.__neutronHydrated).toBe(true);
+    island.querySelector("button")!.click();
+    await flush();
+    expect(island.querySelector("button")!.textContent).toBe("count:1");
+    vi.unstubAllGlobals();
+  });
+
+  it("observes the marker itself when it has a box, and the nearest boxed ancestor for text-only content", () => {
+    document.body.innerHTML =
+      '<neutron-island style="display: block" data-component="Counter" data-client="visible" data-props="{}"><button>count:0</button></neutron-island>' +
+      '<section><neutron-island style="display: contents" data-component="Counter" data-client="visible" data-props="{}">text</neutron-island></section>';
+    initIslands();
+    expect(observed.map((target) => target.tagName)).toEqual(["NEUTRON-ISLAND", "SECTION"]);
+    vi.unstubAllGlobals();
+  });
+});
+
 describe("client=visible", () => {
   let observed: Element[];
   let trigger: (entries: Partial<IntersectionObserverEntry>[]) => void;
@@ -212,12 +302,15 @@ describe("client=visible", () => {
       disconnect() {}
     };
   });
+  afterEach(() => {
+    delete (globalThis as any).IntersectionObserver;
+  });
 
   // The marker is display:contents and has no box, so the observer must watch
   // its rendered children rather than the marker itself.
   it("observes the island's children and hydrates when one intersects", async () => {
     document.body.innerHTML =
-      '<neutron-island data-component="Counter" data-client="visible" ' +
+      '<neutron-island style="display: contents" data-component="Counter" data-client="visible" ' +
       'data-props="{}" data-src="/c.tsx"><button>count:0</button></neutron-island>';
     const importer = vi.fn(async () => ({ default: Counter }));
     initIslands({ "/c.tsx": importer });
@@ -227,17 +320,6 @@ describe("client=visible", () => {
 
     trigger([{ isIntersecting: true }]);
     await flush();
-    expect(importer).toHaveBeenCalledTimes(1);
-  });
-
-  it("hydrates immediately when there is nothing to observe", async () => {
-    document.body.innerHTML =
-      '<neutron-island data-component="Counter" data-client="visible" ' +
-      'data-props="{}" data-src="/c.tsx"></neutron-island>';
-    const importer = vi.fn(async () => ({ default: Counter }));
-    initIslands({ "/c.tsx": importer });
-    await flush();
-    expect(observed).toEqual([]);
     expect(importer).toHaveBeenCalledTimes(1);
   });
 });
