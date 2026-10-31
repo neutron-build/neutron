@@ -16,8 +16,21 @@ export interface NeutronRewriteRule {
 }
 
 export interface NeutronHeaderRule {
+  /**
+   * Path pattern: literal segments, `:param`, and one catch-all — `:name*`
+   * (zero or more segments, so `/builder/:path*` also matches `/builder`, as
+   * in Next) or `*` (one or more).
+   */
   source: string;
-  headers: Record<string, string>;
+  /**
+   * Headers for matching responses, on every response the server sends for
+   * the path (pages, static and resource routes, mounts). A header the
+   * response set itself wins. A value here overrides the `securityHeaders`
+   * default for these paths; `null` sends no such header here, suppressing
+   * a security default (e.g. `{ "X-Frame-Options": null }` on embeddable
+   * routes).
+   */
+  headers: Record<string, string | null>;
 }
 
 export interface NeutronRoutesConfig {

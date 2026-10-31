@@ -19,7 +19,7 @@ Global route rules (`defineConfig({ routes })` / `createServer({ routes })`):
 
 - `routes.redirects`: source -> destination redirects (`307` default, `308` when `permanent: true`).
 - `routes.rewrites`: source -> destination internal rewrites.
-- `routes.headers`: path-based response headers applied when absent.
+- `routes.headers`: path-based response headers applied when absent, on every response for the path (pages, static and resource routes, mounts, dev). They override the `securityHeaders` defaults per path; a `null` value suppresses that header there. `:name*` in a source matches zero or more segments.
 
 Route config cache fields:
 

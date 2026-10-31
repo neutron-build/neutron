@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file.
 
 ### Breaking
 
+- **`:name*` in `routes` rules matches zero or more segments**, as in Next.
+  It required at least one, so a rule written `/builder/:path*` (the Next
+  spelling of "this section") silently skipped `/builder` itself, which is
+  the document that most needs a section's headers. `/docs/:path*` now also
+  matches `/docs`, and an empty catch-all drops its slash in a destination
+  (`/v2/docs/:path*` → `/v2/docs`). **Migration:** a redirect or rewrite
+  that must not fire on the bare prefix should spell its segments out
+  (`/docs/:first/:rest*`). Bare `*` still requires one segment.
 - **Global middleware runs before `mount` sub-apps.** `src/middleware.ts`
   never ran for requests a mounted sub-app answered, so an auth gate there
   silently did not cover mounted APIs (tRPC, REST) — FRAMEWORK_CONTRACT §5
@@ -39,6 +47,23 @@ All notable changes to this project are documented in this file.
   out) and are unchanged by this flip.
 
 ### Added
+
+- **Security headers can be scoped per route.** `securityHeaders` was one
+  site-wide set, so an app that needs cross-origin isolation on one section
+  (Fylun: COOP/COEP on `/builder/**` for WebContainer, and no COEP anywhere
+  else, since COEP breaks third-party embeds) had to hand-roll a global
+  middleware. `routes.headers` rules are now the per-route override, with no
+  parallel mechanism. A rule's value is set before the defaults fill in, so
+  it overrides them on its paths, and a rule's `null` keeps that header off
+  its paths (`{ "X-Frame-Options": null }` on embeddable routes; the
+  generated edge handler honours it for its defaults too). For that to hold
+  everywhere, two gaps closed. Rule headers were applied only inside the
+  page pipeline, and they now reach every response for the path: mounted
+  sub-apps, assets and the built-in endpoints as well as app, static and
+  resource routes. The dev server never sent security headers at all, and it
+  now sends the same ones as `start`, taking `server.securityHeaders` from
+  `neutron.config.ts` (`false` still disables them; the dev server now sends
+  `X-Frame-Options: DENY` on its pages by default, like production).
 
 - **`defaultTitle` in the head API.** A page whose route chain sets no
   `title` got one guessed from its URL path, templated if a layout set

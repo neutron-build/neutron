@@ -15,7 +15,9 @@ import { dispatchResourceHandler, isResourceRoute } from "../core/resource-route
 import { resolveClientTier } from "../core/render-app-route.js";
 import { transformSsrCommonJs } from "./ssr-cjs.js";
 import { toDataRedirectResponse } from "../core/data-redirect.js";
+import { applySecurityHeaders, resolveSecurityHeadersConfig } from "../server/http-headers.js";
 import {
+  applyRouteRuleHeaders,
   compileRouteRules,
   resolveRouteRuleHeaders,
   resolveRouteRuleRedirect,
@@ -60,6 +62,12 @@ export interface NeutronPluginOptions {
   version?: string;
   /** `server.openapi` in neutron.config: serve /openapi.json and /docs as `start` does. */
   openapi?: NeutronOpenApiOptions;
+  /**
+   * `server.securityHeaders` in neutron.config. The dev server sends the same
+   * security headers as `start` (defaults on; `false` disables), with
+   * `routes.headers` rules overriding them per path.
+   */
+  securityHeaders?: false | { headers?: Record<string, string> };
 }
 
 const ROUTES_DIR_DEFAULT = "src/routes";
@@ -247,6 +255,18 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
   };
   const srcDir = path.resolve(rootDir, "src");
   const compiledRouteRules = compileRouteRules(options.routeRules);
+  const securityHeadersConfig = resolveSecurityHeadersConfig(options.securityHeaders);
+  // Route-rule headers, then the security defaults they do not override or
+  // null out — the order production applies them in (server/index.ts).
+  const applyResponseHeaders = (response: Response, pathname: string): void => {
+    const suppressed = applyRouteRuleHeaders(
+      response,
+      resolveRouteRuleHeaders(compiledRouteRules, normalizePathname(pathname))
+    );
+    if (securityHeadersConfig) {
+      applySecurityHeaders(response, securityHeadersConfig, suppressed);
+    }
+  };
   const clientEntry = resolveClientEntryPath(rootDir);
   let isBuild = false;
 
@@ -445,6 +465,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
               new Request(url.toString(), { headers: req.headers as HeadersInit }),
               new Response(null, { status: redirect.status, headers: { Location: redirect.location } })
             );
+            applyResponseHeaders(answer, originalPathname);
             res.statusCode = answer.status;
             answer.headers.forEach((value, key) => {
               res.setHeader(key, value);
@@ -528,10 +549,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
                 gateResponse
               )
             );
-            applyRouteRuleHeadersToResponse(
-              denied,
-              resolveRouteRuleHeaders(compiledRouteRules, normalizePathname(originalPathname))
-            );
+            applyResponseHeaders(denied, originalPathname);
             res.statusCode = denied.status;
             denied.headers.forEach((value, key) => {
               res.setHeader(key, value);
@@ -581,10 +599,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
               )
             )
           );
-          applyRouteRuleHeadersToResponse(
-            response,
-            resolveRouteRuleHeaders(compiledRouteRules, normalizePathname(originalPathname))
-          );
+          applyResponseHeaders(response, originalPathname);
 
           // Send response
           response.headers.forEach((value, key) => {
@@ -939,23 +954,6 @@ function normalizePathname(pathname: string): string {
     return pathname.slice(0, -1);
   }
   return pathname;
-}
-
-function applyRouteRuleHeadersToResponse(
-  response: Response,
-  ruleHeaders: Array<{ headers: Record<string, string> }>
-): void {
-  for (const rule of ruleHeaders) {
-    for (const [name, value] of Object.entries(rule.headers)) {
-      try {
-        if (!response.headers.has(name)) {
-          response.headers.set(name, value);
-        }
-      } catch {
-        // Some Response instances can expose immutable headers (e.g. redirects).
-      }
-    }
-  }
 }
 
 async function resolveDevHeadHtml(

@@ -98,6 +98,7 @@ export async function dev(): Promise<void> {
           routeRules: neutronConfig.routes,
           version: neutronConfig.server?.version,
           openapi: neutronConfig.server?.openapi,
+          securityHeaders: neutronConfig.server?.securityHeaders,
         }),
       ],
       resolve: {

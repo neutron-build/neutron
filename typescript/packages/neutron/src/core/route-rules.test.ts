@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyRouteRuleHeaders,
   compileRouteRules,
   resolveRouteRuleHeaders,
   resolveRouteRuleRedirect,
@@ -131,5 +132,32 @@ describe("route rules", () => {
     expect(matches).toHaveLength(1);
     expect(matches[0].headers["X-Frame-Options"]).toBe("DENY");
     expect(matches[0].headers["X-Env"]).toBe("test");
+  });
+
+  // Next's `:path*` is zero or more segments; a ported `headers()` source of
+  // `/builder/:path*` must cover the `/builder` document itself.
+  it("matches a named catch-all with zero segments, dropping its slash in the destination", () => {
+    const compiled = compileRouteRules({
+      redirects: [{ source: "/docs/:path*", destination: "/v2/docs/:path*", permanent: false }],
+      headers: [{ source: "/builder/:path*", headers: { "Cross-Origin-Embedder-Policy": "credentialless" } }],
+    });
+    expect(resolveRouteRuleRedirect(compiled, "/docs", "")?.location).toBe("/v2/docs");
+    expect(resolveRouteRuleRedirect(compiled, "/docs/a/b", "")?.location).toBe("/v2/docs/a/b");
+    expect(resolveRouteRuleRedirect(compiled, "/docsx", "")).toBeNull();
+    expect(resolveRouteRuleHeaders(compiled, "/builder")).toHaveLength(1);
+    expect(resolveRouteRuleHeaders(compiled, "/builder/p1/files")).toHaveLength(1);
+    expect(resolveRouteRuleHeaders(compiled, "/builders")).toHaveLength(0);
+  });
+
+  it("keeps a null header value: it suppresses rather than sets", () => {
+    const compiled = compileRouteRules({
+      headers: [{ source: "/embed/:path*", headers: { "X-Frame-Options": null, "X-Embed": "1" } }],
+    });
+    const matches = resolveRouteRuleHeaders(compiled, "/embed/card");
+    const response = new Response("ok");
+    const suppressed = applyRouteRuleHeaders(response, matches);
+    expect([...suppressed]).toEqual(["x-frame-options"]);
+    expect(response.headers.get("x-embed")).toBe("1");
+    expect(response.headers.has("x-frame-options")).toBe(false);
   });
 });

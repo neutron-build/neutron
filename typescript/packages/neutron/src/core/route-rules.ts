@@ -22,7 +22,7 @@ interface CompiledRewriteMeta {
 }
 
 interface CompiledHeaderMeta {
-  headers: Record<string, string>;
+  headers: Record<string, string | null>;
 }
 
 export interface CompiledRouteRules {
@@ -43,7 +43,8 @@ export interface RouteRuleRewriteResult {
 
 export interface RouteRuleHeadersResult {
   source: string;
-  headers: Record<string, string>;
+  /** `null` = send no such header on this path (suppresses a security default). */
+  headers: Record<string, string | null>;
 }
 
 export function compileRouteRules(
@@ -167,6 +168,35 @@ export function resolveRouteRuleHeaders(
   return matches;
 }
 
+/**
+ * Apply matched header rules to a response: each string value is set unless
+ * the response already carries the header (the response's own headers win);
+ * `null` values set nothing. Returns the lower-cased names a rule nulled, for
+ * the security-header pass to leave out.
+ */
+export function applyRouteRuleHeaders(
+  response: Response,
+  matches: Array<{ headers: Record<string, string | null> }>
+): Set<string> {
+  const suppressed = new Set<string>();
+  for (const rule of matches) {
+    for (const [name, value] of Object.entries(rule.headers)) {
+      if (value === null) {
+        suppressed.add(name.toLowerCase());
+        continue;
+      }
+      try {
+        if (!response.headers.has(name)) {
+          response.headers.set(name, value);
+        }
+      } catch {
+        // Some Response instances can expose immutable headers (e.g. redirects).
+      }
+    }
+  }
+  return suppressed;
+}
+
 function compileRedirectRules(
   rules: NeutronRedirectRule[]
 ): Array<CompiledPathRule<CompiledRedirectMeta>> {
@@ -251,7 +281,9 @@ function compilePathRule<TMeta>(
         }
         params.push(name);
         if (catchAll) {
-          regex += "/(.*)";
+          // Zero or more segments, as in Next: `/builder/:path*` matches
+          // `/builder` too. (`*` keeps requiring one.)
+          regex += "(?:/(.*))?";
           break;
         }
         regex += "/([^/]+)";
@@ -294,8 +326,10 @@ function substituteDestination(
 ): string {
   let output = destination;
 
-  output = output.replace(/:([a-zA-Z0-9_]+)\*/g, (_token, name: string) => {
-    return params[name] || "";
+  // An empty catch-all takes its leading slash with it, so `/docs/:path*`
+  // matched by `/docs` maps `/v2/docs/:path*` to `/v2/docs`, not `/v2/docs/`.
+  output = output.replace(/(\/?):([a-zA-Z0-9_]+)\*/g, (_token, slash: string, name: string) => {
+    return params[name] ? slash + params[name] : "";
   });
 
   output = output.replace(/:([a-zA-Z0-9_]+)/g, (_token, name: string) => {
@@ -306,6 +340,9 @@ function substituteDestination(
     output = output.replace(/\*/g, params["*"]);
   }
 
+  if (output === "" || output.startsWith("?") || output.startsWith("#")) {
+    output = "/" + output;
+  }
   return output;
 }
 
@@ -359,10 +396,12 @@ function destinationToPathname(destination: string): string {
   }
 }
 
-function normalizeHeaderValues(headers: Record<string, string>): Record<string, string> {
-  const output: Record<string, string> = {};
+function normalizeHeaderValues(
+  headers: Record<string, string | null>
+): Record<string, string | null> {
+  const output: Record<string, string | null> = {};
   for (const [name, value] of Object.entries(headers || {})) {
-    output[name] = String(value);
+    output[name] = value === null ? null : String(value);
   }
   return output;
 }

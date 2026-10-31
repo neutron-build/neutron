@@ -239,11 +239,12 @@ function normalizePathname(pathname: string): string {
 
 function applyRouteRuleHeaders(
   response: http.ServerResponse,
-  matches: Array<{ headers: Record<string, string> }>
+  matches: Array<{ headers: Record<string, string | null> }>
 ): void {
   for (const match of matches) {
     for (const [name, value] of Object.entries(match.headers || {})) {
-      if (!response.hasHeader(name)) {
+      // null = no such header on this path.
+      if (value !== null && !response.hasHeader(name)) {
         response.setHeader(name, String(value));
       }
     }

@@ -27,6 +27,7 @@ import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "./hea
 import { onShutdownSignal } from "./shutdown.js";
 import { toDataRedirectResponse } from "../core/data-redirect.js";
 import {
+  applyRouteRuleHeaders,
   compileRouteRules,
   resolveRouteRuleHeaders,
   resolveRouteRuleRedirect,
@@ -715,7 +716,14 @@ export async function createServer(
 
   // FRAMEWORK_CONTRACT.md middleware order: CORS precedes Compression. (CORS
   // preflight short-circuits before the body is ever compressed.)
-  if (corsOptions || securityHeadersConfig) {
+  //
+  // `routes.headers` rules are applied here too, so they reach every
+  // response the server sends — mounts, assets and the batteries as well as
+  // the catch-all — and they are the per-route override of the security
+  // defaults: a rule's value is set first (so the default no longer fills
+  // it), and a rule's `null` keeps the default off that path (F-P5-1).
+  const hasHeaderRules = compiledRouteRules.headers.length > 0;
+  if (corsOptions || securityHeadersConfig || hasHeaderRules) {
     app.use("*", async (c, next) => {
       if (corsOptions) {
         const preflightResponse = createCorsPreflightResponse(c.req.raw, corsOptions);
@@ -730,8 +738,12 @@ export async function createServer(
         applyCorsHeaders(c.req.raw, c.res, corsOptions);
       }
 
+      const rulePath = hasHeaderRules ? normalizePathname(c.req.path) : null;
+      const suppressed = rulePath
+        ? applyRouteRuleHeaders(c.res, resolveRouteRuleHeaders(compiledRouteRules, rulePath))
+        : undefined;
       if (securityHeadersConfig) {
-        applySecurityHeaders(c.res, securityHeadersConfig);
+        applySecurityHeaders(c.res, securityHeadersConfig, suppressed);
       }
     });
   }
@@ -963,7 +975,7 @@ export async function createServer(
       // immutable-header Response; route-rule headers are set right below.
       response = withMutableHeaders(response);
       const normalizedRequestPath = normalizePathname(requestTrace.pathname) || "/";
-      applyRouteRuleHeadersToResponse(
+      applyRouteRuleHeaders(
         response,
         resolveRouteRuleHeaders(compiledRouteRules, normalizedRequestPath)
       );
@@ -1814,23 +1826,6 @@ function validateMountConfig(
             `prefixes are not supported (registration order would silently decide ` +
             `which sub-app answers). Mount one sub-app and route the sub-prefix inside it.`
         );
-      }
-    }
-  }
-}
-
-function applyRouteRuleHeadersToResponse(
-  response: Response,
-  ruleHeaders: Array<{ headers: Record<string, string> }>
-): void {
-  for (const rule of ruleHeaders) {
-    for (const [name, value] of Object.entries(rule.headers)) {
-      try {
-        if (!response.headers.has(name)) {
-          response.headers.set(name, value);
-        }
-      } catch {
-        // Some Response instances can expose immutable headers (e.g. redirects).
       }
     }
   }

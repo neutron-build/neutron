@@ -2121,6 +2121,10 @@ function applyRouteRuleHeaders(response, pathname) {
   const matches = resolveRouteRuleHeaders(ROUTE_RULES, pathname);
   for (const match of matches) {
     for (const [name, value] of Object.entries(match.headers || {})) {
+      // null = no such header on this path (it suppresses a default below).
+      if (value === null) {
+        continue;
+      }
       try {
         if (!response.headers.has(name)) {
           response.headers.set(name, String(value));
@@ -2173,8 +2177,16 @@ export async function handleNeutronRequest(request) {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "strict-origin-when-cross-origin",
   };
+  // A routes.headers rule nulling a header keeps the default off its paths.
+  const suppressed = new Set();
+  const rulePath = normalizePathname(new URL(request.url).pathname);
+  for (const match of rulePath ? resolveRouteRuleHeaders(ROUTE_RULES, rulePath) : []) {
+    for (const [name, value] of Object.entries(match.headers || {})) {
+      if (value === null) suppressed.add(name.toLowerCase());
+    }
+  }
   for (const [name, value] of Object.entries(defaults)) {
-    if (!response.headers.has(name)) {
+    if (!suppressed.has(name.toLowerCase()) && !response.headers.has(name)) {
       response.headers.set(name, value);
     }
   }

@@ -159,8 +159,19 @@ export function applyCorsHeaders(
   }
 }
 
-export function applySecurityHeaders(response: Response, config: SecurityHeadersConfig): void {
+/**
+ * Fill the security defaults a response did not set. `suppressed` holds the
+ * lower-cased names a `routes.headers` rule nulled for this path.
+ */
+export function applySecurityHeaders(
+  response: Response,
+  config: SecurityHeadersConfig,
+  suppressed?: ReadonlySet<string>
+): void {
   for (const [name, value] of Object.entries(config.defaults)) {
+    if (suppressed?.has(name.toLowerCase())) {
+      continue;
+    }
     if (!response.headers.has(name)) {
       response.headers.set(name, value);
     }
