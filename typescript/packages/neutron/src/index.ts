@@ -260,6 +260,11 @@ export type { FormProps, LinkProps, NavLinkProps } from "./client/components.js"
 // can load the copy from the app's SSR graph (see RouteRenderer and A-011).
 export { withRouterProviders, type CreateElement, type RouterProviderValues } from "./core/router-providers.js";
 export { Island } from "./client/island.js";
+// Server Actions: the request scope an action runs in (server), and the error
+// a client call rejects with.
+export { getActionContext, type ServerActionContext } from "./core/action-context.js";
+export { ServerActionError } from "./client/server-actions.js";
+export type { ServerActionsOptions } from "./core/server-actions.js";
 export { Image, defaultImageLoader } from "./client/image.js";
 export type { ImageProps, ImageLoader, ImageLoaderArgs } from "./client/image.js";
 export { Picture } from "./client/picture.js";

@@ -83,6 +83,17 @@ import {
 import { handleImageRequest } from "./image-optimizer.js";
 import { capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 import { handleIslandRequest } from "./server-islands.js";
+import {
+  handleServerActionRequest,
+  serverActionReferrerPath,
+  type ServerActionsOptions,
+} from "../core/server-actions.js";
+import {
+  parseServerActionsManifest,
+  SERVER_ACTION_PATH,
+  SERVER_ACTIONS_MANIFEST,
+  type ServerActionsManifest,
+} from "../core/server-action-protocol.js";
 import { loadServerBundle, serverBundleKey, type LoadedServerBundle } from "./server-bundle.js";
 import {
   ROUTE_CSS_MANIFEST,
@@ -120,6 +131,8 @@ export type {
   MemoryLoaderCacheStoreOptions,
 } from "./cache-store.js";
 export { csrfMiddleware } from "./csrf.js";
+export { getActionContext, type ServerActionContext } from "../core/action-context.js";
+export type { ServerActionsOptions } from "../core/server-actions.js";
 export { findGlobalMiddlewareFile } from "../core/global-middleware.js";
 export {
   defineServerEntry,
@@ -128,6 +141,13 @@ export {
   type NeutronServerEntryExport,
   type NeutronServerEntryWebSocket,
 } from "../core/server-entry.js";
+export {
+  SERVER_ACTIONS_MANIFEST,
+  SERVER_ACTIONS_MANIFEST_FORMAT,
+  SERVER_ACTION_PATH,
+  parseServerActionsManifest,
+  type ServerActionsManifest,
+} from "../core/server-action-protocol.js";
 export {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
@@ -312,6 +332,13 @@ export interface NeutronServerOptions {
    * otherwise serve that build's code.
    */
   serverBundle?: boolean;
+  /**
+   * Server Actions (`"use server"` modules client code imports): the body
+   * cap and extra allowed origins of `POST /_neutron/action`. The actions
+   * themselves are the ones `neutron-ts build` recorded in dist
+   * (`.neutron-server-actions.json`); without that file none are served.
+   */
+  serverActions?: ServerActionsOptions;
 }
 
 /** The object form of a {@link NeutronServerOptions.mount} entry. */
@@ -522,6 +549,7 @@ export async function createServer(
     hooks,
     version: serverVersion = DEFAULT_HEALTH_VERSION,
     serverBundle: useServerBundle = true,
+    serverActions: serverActionsOptions,
   } = options;
 
   const resolvedRootDir = path.resolve(rootDir);
@@ -546,6 +574,11 @@ export async function createServer(
   if (cache?.loader) assertAtomicCacheStore(cache.loader);
 
   const routes = isSsr ? discoverRoutes({ routesDir: resolvedRoutesDir }) : [];
+  // The "use server" exports the build registered (client code reached them).
+  const serverActions = isSsr ? loadServerActionsManifest(resolvedDistDir) : null;
+  const serverActionFiles = serverActions
+    ? [...new Set(Object.values(serverActions.actions).map((entry) => path.resolve(resolvedRootDir, entry.file)))]
+    : [];
   const router = createRouter();
   for (const route of routes) {
     router.insert(route);
@@ -573,7 +606,11 @@ export async function createServer(
   // the routes so both share one instance of every module (F-P4-1).
   const serverEntryFile = isSsr ? findServerEntryFile(resolvedRootDir) : null;
   const needsSsrRuntime =
-    hasAppRoutes || hasResourceRoutes || globalMiddlewareFile !== null || serverEntryFile !== null;
+    hasAppRoutes ||
+    hasResourceRoutes ||
+    globalMiddlewareFile !== null ||
+    serverEntryFile !== null ||
+    serverActionFiles.length > 0;
   // Fail closed (TS-01): when the SSR runtime is required — app routes exist
   // or a global middleware file was found — a Vite initialization failure
   // must reject createServer, not silently downgrade the app to a static
@@ -593,6 +630,7 @@ export async function createServer(
           ...routes.map((route) => route.file),
           ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
           ...(serverEntryFile ? [serverEntryFile] : []),
+          ...serverActionFiles,
         ],
       })
     : null;
@@ -867,6 +905,70 @@ export async function createServer(
   // under a prefix the sub-app does not match falls through to the catch-all,
   // which must not run the chain a second time.
   const globallyGatedRequests = new WeakSet<Request>();
+
+  // Server Actions (core/server-actions.ts): one endpoint, ahead of the
+  // mounts (whose prefixes may not cover it) and the catch-all.
+  if (isSsr && serverActions && ssrServer) {
+    const registered = serverActions.actions;
+    app.all(SERVER_ACTION_PATH, async (c) => {
+      const requestId = c.get("requestId") ?? createRequestId();
+      const startedAt = Date.now();
+      const method = c.req.method.toUpperCase();
+      emitHook(hooks?.onRequestStart, {
+        requestId,
+        method,
+        url: c.req.raw.url,
+        pathname: SERVER_ACTION_PATH,
+        startedAt,
+      });
+      const response = await handleServerActionRequest(c.req.raw, {
+        ...serverActionsOptions,
+        globalMiddleware: appGlobalMiddleware,
+        resolve: async (id) => {
+          const entry = Object.prototype.hasOwnProperty.call(registered, id) ? registered[id] : undefined;
+          if (!entry) return null;
+          const mod = (await ssrServer.ssrLoadModule(path.resolve(resolvedRootDir, entry.file))) as Record<
+            string,
+            unknown
+          >;
+          const fn = mod[entry.export];
+          if (typeof fn !== "function") {
+            throw new Error(
+              `Server action ${entry.file}#${entry.export} is registered but the module does not export ` +
+                "that function; rebuild with `neutron-ts build`."
+            );
+          }
+          return { fn: fn as (...args: unknown[]) => unknown, name: entry.export };
+        },
+        onError: (error) =>
+          emitHook(hooks?.onError, {
+            requestId,
+            method,
+            pathname: SERVER_ACTION_PATH,
+            source: "action",
+            error,
+          }),
+      });
+      // An action is a mutation: evict what its x-neutron-invalidate names,
+      // `self` being the page that invoked it.
+      if (response.headers.has("x-neutron-invalidate")) {
+        await invalidateMutatedPath(serverActionReferrerPath(c.req.raw) ?? SERVER_ACTION_PATH, response);
+      }
+      const endedAt = Date.now();
+      emitHook(hooks?.onRequestEnd, {
+        requestId,
+        method,
+        url: c.req.raw.url,
+        pathname: SERVER_ACTION_PATH,
+        startedAt,
+        endedAt,
+        durationMs: endedAt - startedAt,
+        status: response.status,
+      });
+      return response;
+    });
+  }
+
   if (mounts) {
     validateMountConfig(mounts, isSsr);
     for (const [prefix, entry] of Object.entries(mounts)) {
@@ -1796,6 +1898,7 @@ const RESERVED_MOUNT_PATHS: Array<{ path: string; ssrOnly: boolean; what: string
   { path: "/openapi.json", ssrOnly: false, what: "GET /openapi.json (FRAMEWORK_CONTRACT.md §4)" },
   { path: "/docs", ssrOnly: false, what: "GET /docs (FRAMEWORK_CONTRACT.md §4)" },
   { path: "/_neutron/image", ssrOnly: true, what: "the image optimizer route" },
+  { path: SERVER_ACTION_PATH, ssrOnly: true, what: "the server actions endpoint" },
   { path: "/__neutron_island", ssrOnly: true, what: "the server-islands route" },
   { path: "/assets", ssrOnly: true, what: "the built-assets static route" },
   { path: "/public", ssrOnly: true, what: "the public-dir static route" },
@@ -2649,6 +2752,19 @@ function getClientEntryScriptSrc(distDir: string): string | null {
   );
 
   return match?.[1] || null;
+}
+
+function loadServerActionsManifest(distDir: string): ServerActionsManifest | null {
+  const file = path.join(distDir, SERVER_ACTIONS_MANIFEST);
+  if (!fs.existsSync(file)) return null;
+  const manifest = parseServerActionsManifest(fs.readFileSync(file, "utf-8"));
+  if (!manifest) {
+    throw new Error(
+      `${SERVER_ACTIONS_MANIFEST} in ${distDir} is unreadable or from another Neutron version; ` +
+        "rebuild with `neutron-ts build`."
+    );
+  }
+  return Object.keys(manifest.actions).length > 0 ? manifest : null;
 }
 
 function loadRouteCssManifest(distDir: string): RouteCssManifest | null {

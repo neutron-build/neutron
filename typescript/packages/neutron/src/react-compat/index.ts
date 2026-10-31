@@ -6,7 +6,7 @@
  * subpaths and `react-dom` keep resolving through preact/compat itself.
  */
 import compat, { useContext } from "preact/compat";
-import type { Context } from "preact";
+import { options, type Context, type VNode } from "preact";
 
 // preact/compat's types are `export =`, which `export *` cannot re-export;
 // the runtime re-export is what matters (apps type against @types/react).
@@ -74,6 +74,51 @@ function useThenable<T>(thenable: TrackedThenable<T>): T {
       );
       throw thenable;
   }
+}
+
+/**
+ * React 19 form actions: `<form action={fn}>` calls `fn(formData)` on submit
+ * instead of navigating, and resets the form once `fn` has settled
+ * successfully. preact/compat would set the function as the DOM `action`
+ * attribute (a submit to a garbage URL). Here a `form` vnode whose `action`
+ * is a function gets a submit handler in its place — an `onSubmit` of the
+ * element's own runs first and can `preventDefault()` to cancel. A server
+ * action (`"use server"` import) is such a function. What React's version
+ * adds and this does not: submission before hydration (the server-rendered
+ * form carries no action), `formAction` on buttons, `useFormStatus`, and
+ * `useActionState`.
+ */
+const FORM_ACTIONS_INSTALLED = Symbol.for("@neutron-build/core/react-compat/form-actions");
+type HookedOptions = typeof options & { [FORM_ACTIONS_INSTALLED]?: true };
+if (!(options as HookedOptions)[FORM_ACTIONS_INSTALLED]) {
+  (options as HookedOptions)[FORM_ACTIONS_INSTALLED] = true;
+  const previous = options.vnode;
+  options.vnode = (vnode: VNode) => {
+    const props = vnode.props as Record<string, unknown> | null;
+    if (vnode.type === "form" && props && typeof props.action === "function") {
+      const { action, onSubmit, ...rest } = props as {
+        action: (data: FormData) => unknown;
+        onSubmit?: (event: SubmitEvent) => void;
+      } & Record<string, unknown>;
+      (vnode as { props: unknown }).props = {
+        ...rest,
+        onSubmit: (event: SubmitEvent) => {
+          onSubmit?.(event);
+          if (event.defaultPrevented) return;
+          event.preventDefault();
+          const form = event.currentTarget as HTMLFormElement;
+          let data: FormData;
+          try {
+            data = new FormData(form, event.submitter ?? undefined);
+          } catch {
+            data = new FormData(form);
+          }
+          void Promise.resolve(action(data)).then(() => form.reset());
+        },
+      };
+    }
+    previous?.(vnode);
+  };
 }
 
 const React = { ...compat, use };

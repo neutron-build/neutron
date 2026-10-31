@@ -2603,3 +2603,224 @@ export default function Page({ data }) { return h("p", null, "url=" + data.url);
     }
   });
 });
+
+// Server Actions (F-P3-4): a "use server" module imported by client code
+// ships as stubs; the server registers exactly the modules the client graph
+// reached, under ids fixed at build time. One react-compat build with the
+// docker preset carries all three servers that answer them: `start` from the
+// prebuilt bundle, the docker image's server.mjs, and the generated runtime
+// the vercel/netlify/cloudflare handlers import.
+import { serializeTransportData, deserializeTransportData } from "@neutron-build/core";
+
+const ACTIONS_APP: Record<string, string> = {
+  "package.json": JSON.stringify({ name: "server-actions-fixture", type: "module" }),
+  "neutron.config.ts": `export default { runtime: "react-compat", server: { serverActions: { bodySizeLimit: 4096 } } };\n`,
+  "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+  "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+  "src/actions.ts": `"use server";
+import { redirect, getActionContext } from "@neutron-build/core";
+const SECRET = "server-only-secret-marker";
+export async function add(a: number, b: number) {
+  return { sum: a + b, secretLength: SECRET.length, at: new Date(0) };
+}
+export async function save(form: FormData) {
+  getActionContext().responseHeaders.set("x-neutron-invalidate", "self");
+  return { title: form.get("title"), user: getActionContext().context.user ?? null };
+}
+export async function leave() {
+  throw redirect("/bye");
+}
+`,
+  "src/middleware.ts": `
+export default async function middleware(request, context, next) {
+  if (request.headers.get("x-deny") === "1") return new Response("gated", { status: 401 });
+  context.user = request.headers.get("x-user");
+  return next();
+}
+`,
+  "src/routes/index.tsx": `
+import { useState } from "react";
+import { add, save } from "../actions";
+export const config = { mode: "app" };
+export default function Home() {
+  const [result, setResult] = useState("");
+  return (
+    <form onSubmit={async (event) => {
+      event.preventDefault();
+      const saved = await save(new FormData(event.currentTarget));
+      setResult(JSON.stringify({ saved, added: await add(1, 2) }));
+    }}>
+      <input name="title" />
+      <button>save</button>
+      <output>{result || "actions-home"}</output>
+    </form>
+  );
+}
+`,
+};
+
+type ActionCall = (actionId: string, body: BodyInit, headers?: Record<string, string>) => Promise<Response>;
+
+function actionRequest(base: string, actionId: string, body: BodyInit, headers: Record<string, string> = {}): Request {
+  return new Request(`${base}/_neutron/action`, {
+    method: "POST",
+    headers: {
+      "X-Neutron-Action": actionId,
+      "X-Neutron-Data": "true",
+      ...(typeof body === "string" ? { "Content-Type": "application/json" } : {}),
+      ...headers,
+    },
+    body,
+    redirect: "manual",
+  });
+}
+
+/** The action contract every server answers the same way. */
+async function expectActionsServed(call: ActionCall, ids: Record<string, string>): Promise<void> {
+  const added = await call(ids.add, serializeTransportData([2, 3]));
+  assert.equal(added.status, 200);
+  assert.deepEqual(deserializeTransportData(await added.text()), { sum: 5, secretLength: 25, at: new Date(0) });
+
+  // A FormData argument, multipart as the client stub sends it.
+  const form = new FormData();
+  form.append("$neutron_args", '[[1],["FormData",2],"0"]');
+  form.append("$f0:title", "hello");
+  const saved = await call(ids.save, form, { "x-user": "ada", Referer: "http://127.0.0.1/" });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(deserializeTransportData(await saved.text()), { title: "hello", user: "ada" });
+  assert.equal(saved.headers.get("x-neutron-invalidate"), "self");
+
+  const gated = await call(ids.add, serializeTransportData([1, 1]), { "x-deny": "1" });
+  assert.equal(gated.status, 401);
+  const redirected = await call(ids.leave, serializeTransportData([]));
+  assert.equal(redirected.status, 204);
+  assert.equal(redirected.headers.get("x-neutron-redirect"), "/bye");
+  const crossSite = await call(ids.add, serializeTransportData([1, 1]), {
+    Origin: "https://evil.example",
+    "Sec-Fetch-Site": "cross-site",
+  });
+  assert.equal(crossSite.status, 403);
+  const unknown = await call("f".repeat(40), serializeTransportData([]));
+  assert.equal(unknown.status, 404);
+  const oversized = await call(ids.add, serializeTransportData(["x".repeat(8000), 1]));
+  assert.equal(oversized.status, 413);
+}
+
+describe("neutron-ts build (process): server actions", () => {
+  it("registers what the client reached, ships stubs, and start/docker/the adapter runtime serve it", { timeout: 360_000 }, async () => {
+    const dir = makeBuildFixture(ACTIONS_APP);
+    const context = fs.mkdtempSync(path.join(os.tmpdir(), "neutron-actions-docker-"));
+    try {
+      const build = runCli("build", dir, {}, ["--preset", "docker"]);
+      assert.equal(await build.exited, 0, build.output());
+      const dist = path.join(dir, "dist");
+
+      const manifest = JSON.parse(fs.readFileSync(path.join(dist, ".neutron-server-actions.json"), "utf-8"));
+      const ids: Record<string, string> = {};
+      for (const [id, entry] of Object.entries(manifest.actions as Record<string, { file: string; export: string }>)) {
+        assert.equal(entry.file, "src/actions.ts");
+        ids[entry.export] = id;
+      }
+      assert.deepEqual(Object.keys(ids).sort(), ["add", "leave", "save"]);
+
+      // The browser gets stubs bound to those ids, never the module.
+      const clientCode = fs
+        .readdirSync(path.join(dist, "assets"))
+        .filter((name) => name.endsWith(".js"))
+        .map((name) => fs.readFileSync(path.join(dist, "assets", name), "utf-8"))
+        .join("\n");
+      assert.ok(clientCode.includes(ids.add) && clientCode.includes(ids.save), "client stubs missing");
+      assert.ok(!clientCode.includes("server-only-secret-marker"), "the action module shipped to the browser");
+      assertNoServerCodeInClientBuild(dir);
+
+      // start, from the prebuilt bundle.
+      const port = await freePort();
+      const proc = runCli("start", dir, { NEUTRON_HOST: "127.0.0.1", NEUTRON_PORT: String(port) });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc);
+        assert.match(proc.output(), /Modules: prebuilt server bundle/, proc.output());
+        const base = `http://127.0.0.1:${port}`;
+        const home = await fetch(base + "/", { headers: { accept: "text/html" } });
+        assert.ok((await home.text()).includes("actions-home"));
+        await expectActionsServed((id, body, headers) => fetch(actionRequest(base, id, body, headers)), ids);
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+
+      // The adapter runtime (what the vercel/netlify/cloudflare handlers call).
+      const runtime = (await import(pathToFileURL(path.join(dist, "server", "node", "entry.js")).href)) as {
+        handleNeutronRequest: (request: Request) => Promise<Response>;
+      };
+      await expectActionsServed(
+        (id, body, headers) => runtime.handleNeutronRequest(actionRequest("http://127.0.0.1", id, body, headers)),
+        ids
+      );
+
+      // The docker image context, alone.
+      fs.cpSync(dist, context, { recursive: true });
+      const dockerPort = await freePort();
+      const child = spawn(process.execPath, ["server.mjs"], {
+        cwd: context,
+        env: { ...process.env, PORT: String(dockerPort), NODE_PATH: "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout!.on("data", (chunk) => (output += chunk));
+      child.stderr!.on("data", (chunk) => (output += chunk));
+      const exited = new Promise((resolve) => child.on("exit", resolve));
+      try {
+        const base = `http://127.0.0.1:${dockerPort}`;
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
+          assert.equal(child.exitCode, null, output);
+          try {
+            await fetch(base + "/health");
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 150));
+          }
+        }
+        await expectActionsServed((id, body, headers) => fetch(actionRequest(base, id, body, headers)), ids);
+      } finally {
+        child.kill("SIGTERM");
+        await exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(context, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the build on an export that is not an async function, and on inline \"use server\"", { timeout: 240_000 }, async () => {
+    const base = {
+      "package.json": JSON.stringify({ name: "server-actions-bad-fixture", type: "module" }),
+      "index.html": ACTIONS_APP["index.html"],
+      "src/main.tsx": ACTIONS_APP["src/main.tsx"],
+    };
+    const badExport = makeBuildFixture({
+      ...base,
+      "src/actions.ts": `"use server";\nexport async function ok() { return 1; }\nexport function notAsync() { return 2; }\n`,
+      "src/routes/index.tsx": `import { h } from "preact";\nimport { ok, notAsync } from "../actions";\nexport const config = { mode: "app" };\nexport default function Home() { return h("button", { onClick: () => ok() + notAsync() }, "x"); }\n`,
+    });
+    const inline = makeBuildFixture({
+      ...base,
+      "src/routes/index.tsx": `import { h } from "preact";\nexport const config = { mode: "app" };\nexport default function Home() {\n  async function save() {\n    "use server";\n    return 1;\n  }\n  return h("button", { onClick: save }, "x");\n}\n`,
+    });
+    try {
+      const first = runCli("build", badExport, {});
+      assert.notEqual(await first.exited, 0, first.output());
+      assert.match(first.output(), /src\/actions\.ts:3: export "notAsync" is not async/, first.output());
+      const second = runCli("build", inline, {});
+      assert.notEqual(await second.exited, 0, second.output());
+      assert.match(second.output(), /src\/routes\/index\.tsx:4: inline "use server" functions/, second.output());
+    } finally {
+      fs.rmSync(badExport, { recursive: true, force: true });
+      fs.rmSync(inline, { recursive: true, force: true });
+    }
+  });
+});

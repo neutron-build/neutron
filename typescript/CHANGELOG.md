@@ -48,6 +48,37 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Server Actions: `"use server"` modules.** Client code that imported a
+  `"use server"` module bundled the module whole into the browser build (the
+  Fylun port found Prisma, pg, sharp and Better-Auth in it, F-P3-4, and
+  bridged it with its own endpoint). Such a module now compiles, in the client
+  graph, to one stub per export that POSTs to `/_neutron/action` under an id
+  fixed at build time (a hash of module path and export name). The server
+  registers only the modules client code reached — `neutron-ts build` writes
+  them to `dist/.neutron-server-actions.json`, `neutron-ts dev` registers what
+  Vite transforms for the browser — and answers any other id `404`. Every
+  export must be an async function the build can see is one; anything else
+  (values, sync functions, re-exports, call results) and inline `"use server"`
+  functions are build errors naming the file and line. Requests pass a
+  same-origin check (`Sec-Fetch-Site`, else `Origin` against `Host`; `403`),
+  a body cap (`server.serverActions.bodySizeLimit`, 1 MiB; `413`), and the
+  app's global middleware, which can gate them and fills the `context` the
+  action reads through the new `getActionContext()` (with `request` and
+  mutable `responseHeaders`: `Set-Cookie`, `x-neutron-invalidate`, which
+  evicts the server caches and revalidates the page on screen). Arguments and
+  results use the loader-data serializer; `FormData` and `Blob`/`File`
+  arguments go multipart. Errors follow the RFC 7807 contract: a
+  `ProblemError` answers with its status (the client rejects with a
+  `ServerActionError`), a `Response` answers as itself, anything else is a
+  generic `500` reported to `hooks.onError` (`source: "action"`). A redirect
+  is signalled as `X-Neutron-Redirect` and the client navigates. Served by
+  `dev`, `start` (server bundle and Vite fallback), the docker image and the
+  vercel/netlify/cloudflare runtime; `--preset static`, or an edge preset
+  without an app route, fails the build instead of shipping dead stubs. A
+  server-side import of the module is the real module. Under react-compat,
+  `<form action={fn}>` now calls `fn(formData)` on submit (React 19, client
+  side). The Cloudflare worker no longer sends non-GET requests to the asset
+  binding first. See `docs/server-actions.md`.
 - **`env.publicPrefixes`: public environment variables for client code,
   including Next's `process.env.NEXT_PUBLIC_*`.** Client builds turned
   `process.env` into `{}` and exposed only Vite's `import.meta.env.VITE_*`,

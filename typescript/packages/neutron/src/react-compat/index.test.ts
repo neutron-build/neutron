@@ -53,3 +53,53 @@ describe("react-compat use()", () => {
     expect(() => use(42 as never)).toThrow(/unsupported type/);
   });
 });
+
+describe("react-compat form actions", () => {
+  it("<form action={fn}> calls fn with the form's data instead of navigating, then resets the form", async () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const calls: Array<Record<string, FormDataEntryValue>> = [];
+    let ownSubmit = 0;
+    const action = async (data: FormData) => {
+      calls.push(Object.fromEntries(data as unknown as Iterable<[string, FormDataEntryValue]>));
+    };
+    render(
+      createElement(
+        "form",
+        { action, onSubmit: () => void ownSubmit++ } as Record<string, unknown>,
+        createElement("input", { name: "title", defaultValue: "first" })
+      ),
+      root
+    );
+    const form = root.querySelector("form")!;
+    expect(form.getAttribute("action")).toBeNull();
+    const input = form.querySelector("input")!;
+    input.value = "typed";
+    const event = new Event("submit", { bubbles: true, cancelable: true });
+    form.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(ownSubmit).toBe(1);
+    await flush();
+    expect(calls).toEqual([{ title: "typed" }]);
+    expect(input.value).toBe("first");
+    render(null, root);
+    root.remove();
+  });
+
+  it("leaves a string action and a cancelled submit alone", () => {
+    const root = document.createElement("div");
+    let called = false;
+    render(createElement("form", { action: "/search" }), root);
+    expect(root.querySelector("form")!.getAttribute("action")).toBe("/search");
+    render(
+      createElement("form", {
+        action: () => void (called = true),
+        onSubmit: (event: Event) => event.preventDefault(),
+      } as Record<string, unknown>),
+      root
+    );
+    root.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    expect(called).toBe(false);
+    render(null, root);
+  });
+});

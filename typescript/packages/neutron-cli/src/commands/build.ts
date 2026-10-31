@@ -2,7 +2,13 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
-import { neutronPlugin, neutronPublicEnvPlugin, CLIENT_ROUTE_QUERY, staticTierRouteIds } from "@neutron-build/core/vite";
+import {
+  neutronPlugin,
+  neutronPublicEnvPlugin,
+  CLIENT_ROUTE_QUERY,
+  staticTierRouteIds,
+  ServerActionRegistry,
+} from "@neutron-build/core/vite";
 import { runtimeOxc, warnOnDuplicateCorePlugin } from "../lib/vite-shared.js";
 import {
   discoverRoutes,
@@ -61,6 +67,8 @@ import {
 import {
   SERVER_BUNDLE_MANIFEST,
   SERVER_BUNDLE_FORMAT,
+  SERVER_ACTIONS_MANIFEST,
+  type ServerActionsManifest,
   findGlobalMiddlewareFile,
   findServerEntryFile,
   generateServerBundleEntry,
@@ -218,6 +226,10 @@ export async function build(): Promise<void> {
   );
   const cssPassModules = [...new Set(cssPassPages.flatMap((route) => routeChain(route, routes)))];
 
+  // "use server" modules the client passes (app bundle, islands) reach: the
+  // actions the server registers (dist/.neutron-server-actions.json).
+  const serverActionRegistry = new ServerActionRegistry();
+
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
   // requiring an index.html entry point. Static sites WITH islands take the
@@ -254,7 +266,12 @@ export async function build(): Promise<void> {
               return null;
             },
           },
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            serverActions: { registry: serverActionRegistry },
+          }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
@@ -421,7 +438,12 @@ export async function build(): Promise<void> {
         configFile: false,
         root: cwd,
         plugins: [
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            serverActions: { registry: serverActionRegistry },
+          }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
@@ -450,6 +472,8 @@ export async function build(): Promise<void> {
   // Prerendered static pages with islands reference this instead of the SPA runtime.
   const islandsEntryScriptSrc = hasIslands ? extractIslandsEntryScriptSrc(outputDir) : null;
 
+  const serverActions = writeServerActionsManifest(outputDir, serverActionRegistry);
+
   // Per-route stylesheets: each page links what its own route graph needs,
   // from the CSS pass's manifest for the pages that pass collected, the
   // client build's for the rest.
@@ -475,6 +499,8 @@ export async function build(): Promise<void> {
     clientEntryScriptSrc,
     clientCssFiles,
     routeCss,
+    serverActions,
+    serverActionsOptions: neutronConfig.server?.serverActions,
     userConfig,
     runtimeAliases: preactAliases,
     // `true` for react-compat (blanket processing — see resolveRuntimeNoExternal).
@@ -1023,6 +1049,7 @@ export async function build(): Promise<void> {
       runtimeNoExternal === true ? true : [...preactSsr.noExternal, ...runtimeNoExternal],
     runtime,
     oxc: oxcJsx,
+    serverActions,
   });
 
   if (selectedAdapter) {
@@ -1036,6 +1063,7 @@ export async function build(): Promise<void> {
         app: appRouteCount,
       },
       clientEntryScriptSrc,
+      serverActions: serverActions ? Object.keys(serverActions.actions).length : 0,
       ensureRuntimeBundle,
       log: (message: string) => {
         console.log(`  [adapter] ${message}`);
@@ -1255,6 +1283,28 @@ function extractIslandsEntryScriptSrc(outputDir: string): string | null {
 }
 
 
+/**
+ * Write `dist/.neutron-server-actions.json` — the actions the client passes
+ * registered — or remove a stale one when there are none.
+ */
+function writeServerActionsManifest(
+  outputDir: string,
+  registry: ServerActionRegistry
+): ServerActionsManifest | null {
+  const manifestPath = path.join(outputDir, SERVER_ACTIONS_MANIFEST);
+  if (registry.size === 0) {
+    fs.rmSync(manifestPath, { force: true });
+    return null;
+  }
+  const manifest = registry.toManifest();
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+  console.log(
+    `\n${registry.size} server action${registry.size === 1 ? "" : "s"} in ${registry.files().length} ` +
+      `module${registry.files().length === 1 ? "" : "s"} → ${SERVER_ACTIONS_MANIFEST}`
+  );
+  return manifest;
+}
+
 function writeClientEntryMetadata(outputDir: string, src: string): void {
   const metadataPath = path.join(outputDir, ".neutron-client-entry.json");
   fs.writeFileSync(metadataPath, JSON.stringify({ src }, null, 2));
@@ -1318,6 +1368,8 @@ interface RuntimeBundleBuilderOptions {
   clientEntryScriptSrc: string | null;
   clientCssFiles: string[];
   routeCss: RouteCssManifest | null;
+  serverActions: ServerActionsManifest | null;
+  serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] };
   userConfig: Record<string, any>;
   runtimeAliases?: Array<{ find: string | RegExp; replacement: string }> | Record<string, string>;
   /** `true` = process the whole dependency graph (react-compat). */
@@ -1459,7 +1511,9 @@ async function buildRuntimeBundle(
       options.routeCss,
       entryPath,
       options.routeRules,
-      globalMiddlewarePath
+      globalMiddlewarePath,
+      options.serverActions,
+      options.serverActionsOptions
     ),
     "utf-8"
   );
@@ -1672,7 +1726,7 @@ async function buildStartServerBundle(
   options: Pick<
     RuntimeBundleBuilderOptions,
     "cwd" | "outputDir" | "routesDir" | "routeRules" | "env" | "routes" | "userConfig" | "runtimeAliases" | "runtimeNoExternal"
-  > & { runtime: string; oxc: unknown }
+  > & { runtime: string; oxc: unknown; serverActions: ServerActionsManifest | null }
 ): Promise<void> {
   const manifestPath = path.join(options.outputDir, SERVER_BUNDLE_MANIFEST);
   fs.rmSync(manifestPath, { force: true });
@@ -1682,9 +1736,13 @@ async function buildStartServerBundle(
   // the routes share one instance of every module they both import.
   const serverEntryFile = findServerEntryFile(options.cwd);
   const pages = options.routes.filter((route) => !route.file.includes("_layout"));
+  const actionFiles = options.serverActions
+    ? [...new Set(Object.values(options.serverActions.actions).map((entry) => path.resolve(options.cwd, entry.file)))]
+    : [];
   const needsRuntime =
     globalMiddlewareFile !== null ||
     serverEntryFile !== null ||
+    actionFiles.length > 0 ||
     pages.some((route) => route.config.mode === "app" || isResourceRoute(route));
   if (!needsRuntime) {
     return;
@@ -1697,6 +1755,7 @@ async function buildStartServerBundle(
     ...options.routes.map((route) => route.file),
     ...(globalMiddlewareFile ? [globalMiddlewareFile] : []),
     ...(serverEntryFile ? [serverEntryFile] : []),
+    ...actionFiles,
   ];
   fs.writeFileSync(
     entryPath,
@@ -2016,7 +2075,9 @@ function generateRuntimeEntrySource(
   routeCss: RouteCssManifest | null,
   entryPath: string,
   routeRules: NeutronConfig["routes"] | undefined,
-  globalMiddlewarePath?: string
+  globalMiddlewarePath?: string,
+  serverActions?: ServerActionsManifest | null,
+  serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] }
 ): string {
   const imports: string[] = [];
   const moduleEntries: string[] = [];
@@ -2037,6 +2098,24 @@ function generateRuntimeEntrySource(
     imports.push(`import * as __globalMiddlewareModule from "${relGm}";`);
   }
 
+  // Server Actions: each registered module imported, ids resolved through a
+  // table the build fixed (core/server-actions.ts answers the request).
+  const actionEntries: string[] = [];
+  if (serverActions) {
+    const actionModuleVars = new Map<string, string>();
+    for (const [id, entry] of Object.entries(serverActions.actions)) {
+      let importVar = actionModuleVars.get(entry.file);
+      if (!importVar) {
+        importVar = `actionModule${actionModuleVars.size}`;
+        actionModuleVars.set(entry.file, importVar);
+        imports.push(
+          `import * as ${importVar} from "${relativeImportPath(path.dirname(entryPath), path.resolve(path.dirname(entryPath), "..", "..", entry.file))}";`
+        );
+      }
+      actionEntries.push(`  ${JSON.stringify(id)}: { module: ${importVar}, name: ${JSON.stringify(entry.export)} },`);
+    }
+  }
+
   runtimeRoutes.forEach((route, index) => {
     const importVar = `routeModule${index}`;
     const relPath = relativeImportPath(path.dirname(entryPath), route.file);
@@ -2053,8 +2132,42 @@ function generateRuntimeEntrySource(
   },`);
   });
 
+  const actionsImport = actionEntries.length > 0
+    ? `import { handleServerActionRequest, serverActionReferrerPath, SERVER_ACTION_PATH } from "@neutron-build/core/runtime-edge";\n`
+    : "";
+  const actionsDispatch = actionEntries.length > 0
+    ? `
+  if (pathname === SERVER_ACTION_PATH) {
+    const response = await handleServerActionRequest(request, {
+      ...SERVER_ACTIONS_OPTIONS,
+      globalMiddleware: GLOBAL_MIDDLEWARE,
+      resolve: (id) => {
+        const entry = Object.prototype.hasOwnProperty.call(SERVER_ACTIONS, id) ? SERVER_ACTIONS[id] : undefined;
+        const fn = entry ? entry.module[entry.name] : undefined;
+        return typeof fn === "function" ? { fn, name: entry.name } : null;
+      },
+      onError: (error, action) => {
+        console.error("[neutron] server action " + (action.name || action.id) + " failed:", error);
+      },
+    });
+    if (response.headers.has("x-neutron-invalidate")) {
+      await applyMutationInvalidationToLoaderDataCache(serverActionReferrerPath(request) || pathname, response);
+    }
+    return response;
+  }
+`
+    : "";
+
   return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse } from "@neutron-build/core/runtime-edge";
-${imports.join("\n")}
+${actionsImport}${imports.join("\n")}
+
+const SERVER_ACTIONS = {
+${actionEntries.join("\n")}
+};
+const SERVER_ACTIONS_OPTIONS = ${JSON.stringify({
+    bodySizeLimit: serverActionsOptions?.bodySizeLimit,
+    allowedOrigins: serverActionsOptions?.allowedOrigins,
+  })};
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
 const CLIENT_STYLESHEET_HREFS = ${JSON.stringify(clientCssFiles)};
@@ -2090,7 +2203,7 @@ async function handleNeutronRequestInner(request) {
   if (!pathname) {
     return new Response("Bad Request", { status: 400 });
   }
-
+${actionsDispatch}
   const redirect = resolveRouteRuleRedirect(ROUTE_RULES, pathname, requestUrl.search);
   if (redirect) {
     return new Response(null, {

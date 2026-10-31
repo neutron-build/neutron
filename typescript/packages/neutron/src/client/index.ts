@@ -33,5 +33,6 @@ export type { AnyJsxElement, JsxChild, JsxChildren } from "./jsx-agnostic.js";
 export { init, registerRoutes, appNeedsRouter } from "./start.js";
 export { navigate, go, subscribe, getCurrentPath, getCurrentSearch } from "./navigate.js";
 export { initIslands } from "./island-runtime.js";
+export { createServerActionReference, callServerAction, ServerActionError } from "./server-actions.js";
 export { route } from "../core/typed-routes.js";
 export type { RoutePath, RouteHref, NeutronGeneratedRouteMap } from "../core/typed-routes.js";

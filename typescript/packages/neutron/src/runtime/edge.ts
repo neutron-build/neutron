@@ -25,3 +25,5 @@ export {
 export { toDataRedirectResponse } from "../core/data-redirect.js";
 export { createMemoryLoaderCacheStore } from "../server/cache-store.js";
 export { routeStylesheetHrefs } from "../core/route-css.js";
+export { handleServerActionRequest, serverActionReferrerPath } from "../core/server-actions.js";
+export { SERVER_ACTION_PATH } from "../core/server-action-protocol.js";

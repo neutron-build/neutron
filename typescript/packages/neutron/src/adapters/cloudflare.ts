@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { builtinModules } from "node:module";
 import * as path from "node:path";
-import type { AdapterBuildContext, NeutronAdapter } from "./adapter.js";
+import { assertServerActionsServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 import {
   readStaticHeadersMap,
   toCloudflareHeadersFile,
@@ -20,6 +20,7 @@ export function adapterCloudflare(
   return {
     name: "cloudflare",
     async adapt(context: AdapterBuildContext) {
+      assertServerActionsServable("cloudflare", context, context.routes.app > 0);
       const mode = options.mode || "pages";
       const hasAppRoutes = context.routes.app > 0;
 
@@ -164,9 +165,13 @@ function buildCloudflareWorkerSource(runtimeEntryImport: string | null): string 
 
 export default {
   async fetch(request, env) {
-    const assetResponse = await env.ASSETS.fetch(request);
-    if (assetResponse.status !== 404) {
-      return assetResponse;
+    // Assets answer reads only: a POST (an action, a server action) is the
+    // app's, and the asset binding would refuse it rather than 404.
+    if (request.method === "GET" || request.method === "HEAD") {
+      const assetResponse = await env.ASSETS.fetch(request);
+      if (assetResponse.status !== 404) {
+        return assetResponse;
+      }
     }
     return handleNeutronRequest(request);
   },

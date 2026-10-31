@@ -9,3 +9,10 @@ export {
   type PreactSsrResolution,
   type ViteAliasEntry,
 } from "../core/preact-ssr.js";
+export {
+  ServerActionRegistry,
+  analyzeServerActionModule,
+  serverActionId,
+  generateServerActionStub,
+  type ServerActionModuleAnalysis,
+} from "./server-actions.js";

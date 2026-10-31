@@ -104,6 +104,7 @@ export { useFetcher, useFetchers } from "./client/fetcher.js";
 export { Form, Link, NavLink, prefetch } from "./client/components.js";
 export { withRouterProviders } from "./core/router-providers.js";
 export { Island } from "./client/island.js";
+export { ServerActionError } from "./client/server-actions.js";
 export { Image, defaultImageLoader } from "./client/image.js";
 export { Picture } from "./client/picture.js";
 export { ViewTransitions } from "./client/view-transitions.js";
@@ -155,6 +156,7 @@ export const prepareContentCollections = serverOnly("prepareContentCollections")
 export const setActiveMarkdownConfig = serverOnly("setActiveMarkdownConfig");
 export const getActiveMarkdownConfig = serverOnly("getActiveMarkdownConfig");
 export const createServer = serverOnly("createServer");
+export const getActionContext = serverOnly("getActionContext");
 export const startServer = serverOnly("startServer");
 export const defineServerEntry = serverOnly("defineServerEntry");
 export const resolvePreactSsr = serverOnly("resolvePreactSsr");

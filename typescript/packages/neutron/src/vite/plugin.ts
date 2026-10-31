@@ -58,6 +58,15 @@ import {
   type NeutronOpenApiOptions,
 } from "../server/openapi.js";
 import { checkAccessibility } from "./a11y-checker.js";
+import {
+  analyzeServerActionModule,
+  generateServerActionStub,
+  mayContainUseServer,
+  serverActionModuleKey,
+  ServerActionRegistry,
+} from "./server-actions.js";
+import { handleServerActionRequest, type ServerActionsOptions } from "../core/server-actions.js";
+import { SERVER_ACTION_PATH, DEFAULT_SERVER_ACTION_BODY_LIMIT } from "../core/server-action-protocol.js";
 import { parseError } from "./error-parser.js";
 
 export interface NeutronPluginOptions {
@@ -75,6 +84,13 @@ export interface NeutronPluginOptions {
    * `routes.headers` rules overriding them per path.
    */
   securityHeaders?: false | { headers?: Record<string, string> };
+  /**
+   * Server Actions. `registry` collects the `"use server"` modules the CLIENT
+   * graph reaches (`neutron-ts build` shares one across its client passes and
+   * writes it to dist); the dev server serves the ones its own registry holds.
+   * `bodySizeLimit`/`allowedOrigins` are `server.serverActions` in neutron.config.
+   */
+  serverActions?: ServerActionsOptions & { registry?: ServerActionRegistry };
 }
 
 const ROUTES_DIR_DEFAULT = "src/routes";
@@ -275,6 +291,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     }
   };
   const clientEntry = resolveClientEntryPath(rootDir);
+  const serverActionRegistry = options.serverActions?.registry ?? new ServerActionRegistry();
   let isBuild = false;
 
   async function refreshRoutes() {
@@ -469,6 +486,46 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           // before route rules and the routes, runs the global middleware
           // ahead of them, and lets a path the sub-app does not match fall
           // through to the routes with the chain already run.
+          // Server Actions (core/server-actions.ts): the modules the client
+          // graph has reached with "use server", through the same global
+          // middleware and checks as `start`.
+          if (originalPathname === SERVER_ACTION_PATH) {
+            const limit = options.serverActions?.bodySizeLimit ?? DEFAULT_SERVER_ACTION_BODY_LIMIT;
+            const declared = Number(req.headers["content-length"]);
+            // createRequest buffers the body: an oversized one is refused
+            // (413, from its declared length) without reading it.
+            const actionRequest =
+              Number.isFinite(declared) && declared > limit
+                ? new Request(url.toString(), { method: req.method || "POST", headers: req.headers as HeadersInit })
+                : await createRequest(req, url);
+            const response = await handleServerActionRequest(actionRequest, {
+              bodySizeLimit: options.serverActions?.bodySizeLimit,
+              allowedOrigins: options.serverActions?.allowedOrigins,
+              globalMiddleware: await loadDevGlobalMiddleware(),
+              resolve: async (actionId) => {
+                const entry = serverActionRegistry.lookup(actionId);
+                if (!entry) return null;
+                const mod = (await server.ssrLoadModule(path.resolve(rootDir, entry.file))) as Record<string, unknown>;
+                const fn = mod[entry.export];
+                return typeof fn === "function"
+                  ? { fn: fn as (...args: unknown[]) => unknown, name: entry.export }
+                  : null;
+              },
+              onError: (error) => {
+                console.error("Server action error:", error);
+                server.ws.send({
+                  type: "custom",
+                  event: "neutron:dev-toolbar:error",
+                  data: parseError(error, "action", rootDir, undefined, req.url),
+                });
+              },
+            });
+            const sent = withMutableHeaders(response);
+            applyResponseHeaders(sent, originalPathname);
+            await sendWebResponse(req, res, sent);
+            return;
+          }
+
           const devMount = await serverEntryState.match(normalizePathname(originalPathname));
           if (devMount) {
             mountRequest = await createRequest(req, url);
@@ -887,6 +944,26 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       const cleanId = normalizePathForComparison(stripQueryFromId(id));
       if (!isScriptModuleId(cleanId)) {
         return null;
+      }
+
+      // Server Actions (vite/server-actions.ts). App sources only: a package
+      // shipping "use server" modules is not something the build registers.
+      if (!cleanId.includes("/node_modules/") && mayContainUseServer(code)) {
+        const label = path.relative(rootDir, cleanId).split(path.sep).join("/") || cleanId;
+        const analysis = analyzeServerActionModule(code, label);
+        if (analysis.errors.length > 0) {
+          this.error(analysis.errors.join("\n"));
+        }
+        const moduleKey = serverActionModuleKey(rootDir, cleanId);
+        if (analysis.isServerActionModule) {
+          if (!options?.ssr) {
+            // The client graph reached it: register it, and ship stubs.
+            serverActionRegistry.set(moduleKey, analysis.exports);
+            return { code: generateServerActionStub(moduleKey, analysis.exports), map: null };
+          }
+        } else if (!options?.ssr) {
+          serverActionRegistry.delete(moduleKey);
+        }
       }
 
       // Inject a stable `__src="<resolved module id>"` prop into every
