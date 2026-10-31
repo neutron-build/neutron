@@ -605,13 +605,43 @@ fn r16_never_fired_targeted_draws_reach_their_hook() {
         assert!(
             rec.rounds.iter().all(|r| r.fired),
             "seed {seed}: a round's crash spec never fired: {:?}",
-            rec.rounds.iter().map(|r| (r.crash.clone(), r.fired)).collect::<Vec<_>>()
+            rec.rounds
+                .iter()
+                .map(|r| (r.crash.clone(), r.fired))
+                .collect::<Vec<_>>()
         );
         // The twin rounds fired too (35 of the 150 defects were twin
         // rounds; the twin shares the real round's spec).
         assert!(
             !rec.rounds.iter().any(|r| r.crash.ends_with("never fired")),
             "seed {seed}: a stale never-fired description"
+        );
+    }
+}
+
+/// **X5-R16 NO-TWIN pin (P ruling nv3-X-5c-esc-3; literal config =
+/// d2c8bba7's no-twin seeds).** Seed 1267's committed round carried the
+/// oracle's own text "MP/MW round with XX001 and no twin (harness
+/// defect)": its twin round's recovery returned `Err`, no supply was
+/// built and the twin chain broke — the real round then had no O-3 (c)
+/// sets. The harness now supplies the twin for every MP/MW round: a
+/// failed twin still yields its recovery reads (collected on both
+/// arms) and its crashed-disk image slots, and a broken twin chain
+/// re-seeds from the real round's own start (Work 2.5's twin: the same
+/// script, crash and F-CRASH resolutions, faultless). On the reverted
+/// supply the "no twin" text reappears.
+#[test]
+fn r16_no_twin_is_always_supplied() {
+    for seed in [1267u64, 1769] {
+        let rec = workload::run_seed(seed, None);
+        let no_twin = rec
+            .rounds
+            .iter()
+            .filter_map(|r| r.o3_fail.as_ref())
+            .any(|t| t.contains("no twin"));
+        assert!(
+            !no_twin,
+            "seed {seed}: the missing-twin harness defect is back (O-3 (c) never fails open)"
         );
     }
 }

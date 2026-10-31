@@ -990,6 +990,28 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         }
         let mut supply = None;
         let mut twin_points = Vec::new();
+        // **X5-R16 NO-TWIN (P ruling nv3-X-5c-esc-3): supply the twin
+        // for every MP/MW round.** Two shapes lost it before: a twin
+        // round whose recovery returned `Err` (its `end_store` was
+        // `None`, so no supply was built, and the twin chain broke),
+        // and any later round of the same seed (the chain was gone).
+        // The real round then failed O-3 (c) as "MP/MW round with
+        // XX001 and no twin (harness defect)" — 19 rounds in d2c8bba7.
+        // Both are harness defects: the twin's recovery reads (up to
+        // its failure — the collector runs on both arms) and the twin's
+        // crashed-disk image slots (the image its recovery tried to
+        // open) are exactly O-3 (c)'s sets, and a broken chain re-seeds
+        // from the real round's own start (Work 2.5: the twin is the
+        // same script, crash and F-CRASH resolutions, faultless, judged
+        // as class C — from the same base the real round runs).
+        if twin_chain.is_none() && class != FaultClass::C {
+            twin_chain = Some(Chain {
+                disk: ch.disk.clone(),
+                st: ch.st.clone(),
+                model: harness::clone_model(&ch.model),
+                cut: ch.cut,
+            });
+        }
         if let Some(tch) = twin_chain.take() {
             let tf = RoundFaults {
                 class: FaultClass::C,
@@ -1024,14 +1046,15 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                 o1_fail: out.o1.clone().err(),
             });
             twin_points = out.nested_points.clone();
+            // The supply (O-3 (c)'s sets) from the twin round — whether
+            // or not its recovery succeeded (X5-R16 NO-TWIN): the
+            // collected recovery reads and the twin's crashed-disk
+            // image walk.
+            supply = Some(TwinSupply {
+                recovery_reads: reads,
+                image_slots: harness::durable_image(&out.crashed_disk, &cfg).1,
+            });
             if let Some(st) = out.end_store.clone() {
-                // The supply (O-3 (c)'s sets) from the twin's round: the
-                // collected recovery reads and the twin's crashed-disk
-                // image walk.
-                supply = Some(TwinSupply {
-                    recovery_reads: reads,
-                    image_slots: harness::durable_image(&out.crashed_disk, &cfg).1,
-                });
                 twin_chain = Some(Chain {
                     disk: out.end_disk.clone(),
                     st,
