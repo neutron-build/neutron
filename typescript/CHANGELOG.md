@@ -40,6 +40,18 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **`defaultTitle` in the head API.** A page whose route chain sets no
+  `title` got one guessed from its URL path, templated if a layout set
+  `titleTemplate` — `forgot-password | Fylun`, `c - p3-slug | Fylun` — and
+  there was no way to name the site's own title once. `SeoMetaInput` now has
+  `defaultTitle`, Next's `title.default`: declared in a layout (typically
+  the root), it titles every page beneath that sets no `title`, rendered as
+  written (the template is not applied), and is inherited and overridable
+  like every other field. A page `title` still wins and takes the template.
+  The URL guess stays as the last resort when nothing in the chain declares
+  a title: HTML requires a `<title>`, and dropping the guess would leave every
+  app that never configured titles showing bare URLs in tabs and to screen
+  readers.
 - **React 19 `use()` under `runtime: "react-compat"`.** preact/compat
   (10.29) has no `use`, so `import { use } from "react"` — how React 19 /
   Next 15 pages read `params` and promises — failed with `use is not a

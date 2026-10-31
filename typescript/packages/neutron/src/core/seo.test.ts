@@ -160,3 +160,30 @@ describe("island marker base style", () => {
     expect(head).not.toContain("width:100%");
   });
 });
+
+describe("defaultTitle", () => {
+  // A layout declares the site's title once; pages without one inherit it
+  // instead of a title guessed from the URL ("forgot-password | Fylun").
+  const layout = { defaultTitle: "Fylun", titleTemplate: "%s | Fylun" };
+
+  it("titles a page that sets none, as written, with no URL guess", () => {
+    const head = renderDocumentHead("/forgot-password", mergeSeoMetaInput(layout, { description: "Reset" }));
+    expect(head).toContain("<title>Fylun</title>");
+    expect(head).not.toContain("forgot-password");
+  });
+
+  it("yields to a page title, which takes the template", () => {
+    const head = renderDocumentHead("/pricing", mergeSeoMetaInput(layout, { title: "Pricing" }));
+    expect(head).toContain("<title>Pricing | Fylun</title>");
+    expect(head.match(/<title>/g)).toHaveLength(1);
+  });
+
+  it("is inherited and overridable like other fields", () => {
+    const section = mergeSeoMetaInput(layout, { defaultTitle: "Fylun Studio" });
+    expect(renderDocumentHead("/studio/x", section)).toContain("<title>Fylun Studio</title>");
+  });
+
+  it("leaves the URL guess as the fallback when nothing declares a title", () => {
+    expect(renderDocumentHead("/about", { titleTemplate: "%s | Site" })).toContain("<title>about | Site</title>");
+  });
+});

@@ -18,6 +18,15 @@ export interface SeoMetaInput {
    * @example "%s — Tebian"
    */
   titleTemplate?: string | null;
+  /**
+   * Title for a page in this route chain that sets no `title` of its own —
+   * typically declared once in the root layout, as Next's `title.default`.
+   * Rendered as written: `titleTemplate` is not applied to it. Inherited like
+   * every field; a nested layout can set its own. Without it (and without a
+   * `title`), the title is guessed from the URL path.
+   * @example defaultTitle: "Tebian"
+   */
+  defaultTitle?: string;
   description?: string;
   canonical?: string;
   noindex?: boolean;
@@ -61,7 +70,7 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
 
   const resolvedTitle = input.title
     ? applyTitleTemplate(input.title, input.titleTemplate)
-    : undefined;
+    : input.defaultTitle || undefined;
 
   if (resolvedTitle) {
     tags.push({ tag: "title", content: resolvedTitle });
@@ -292,6 +301,9 @@ export function renderDocumentHead(
     /<title(?:\s|>)/i.test(seoHtml) ||
     /<title(?:\s|>)/i.test(extraHead);
   let titleTag = "";
+  // Last resort, reached only when the route chain declares neither a `title`
+  // nor a `defaultTitle`: HTML requires a <title>, and a document without one
+  // shows its bare URL in tabs, bookmarks and screen readers.
   if (!hasTitle) {
     const inferred = inferPageTitle(pathname);
     const template = seo?.titleTemplate;
