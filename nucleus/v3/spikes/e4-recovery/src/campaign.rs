@@ -660,8 +660,7 @@ fn cmd_verify(args: &[String]) -> i32 {
         }
     };
     // X5-R15 (b): the exit code is decided once, at the end, after all
-    // three checks have been reported.
-    let exit;
+    // three checks have been reported (see `verify_exit_code` below).
     // 1. The seed set is exactly the campaign's (0..9999).
     let n = recs.len();
     let seed_set_ok = verify_seed_set_ok(&recs);
@@ -759,7 +758,7 @@ fn cmd_verify(args: &[String]) -> i32 {
     }
     // X5-R15 (b): every check has now been reported; the exit code is
     // decided once, at the end, from all three outcomes together.
-    exit = verify_exit_code(seed_set_ok, bad, missed, no_quotas);
+    let exit = verify_exit_code(seed_set_ok, bad, missed, no_quotas);
     if exit == 0 {
         if no_quotas {
             println!(

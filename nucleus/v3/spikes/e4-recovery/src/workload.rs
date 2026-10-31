@@ -1223,10 +1223,10 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                     None,
                 );
             }
-        } else if !uniform {
-            if let Some(CrashSpec::Hook { ckpt_index, hook }) = script.crash {
-                crash_desc = format!("{hook:?}@{ckpt_index}");
-            }
+        } else if !uniform
+            && let Some(CrashSpec::Hook { ckpt_index, hook }) = script.crash
+        {
+            crash_desc = format!("{hook:?}@{ckpt_index}");
         }
 
         if let Some(d) = crash_fired_defect(&out, &crash_desc)
