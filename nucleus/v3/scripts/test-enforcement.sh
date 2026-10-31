@@ -774,6 +774,26 @@ P
 }
 # out_has WANT... -- CMD...: CMD exits non-zero and its output holds every WANT.
 out_has() { local w=() o rc=0; while [ "$1" != -- ]; do w+=("$1"); shift; done; shift; o=$("$@" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] || return 1; for x in "${w[@]}"; do grep -qF -- "$x" <<<"$o" || { echo "missing: $x"; return 1; }; done; }
+# gshim WORD CMD...: CMD with a git that fails every call one of whose
+# arguments is exactly WORD ("fatal: gshim refused WORD", exit 128) and runs the
+# real git otherwise (X-6-F1-F2-F1). The refusals' fail-closed lines need a git
+# that fails on demand, and no repository state makes for-each-ref or ls-files
+# fail. The shim PATH and GSHIM_FAIL are set for CMD alone and never exported,
+# so every other scenario runs the real git. CMD may be a function (gs, out_has,
+# a python heredoc helper): bash passes a function's prefix assignments to the
+# function's children and drops them when it returns. Wrap only the command
+# under test, as in `out_has LINE -- gshim WORD bash -c ...`.
+gshim_real=$(command -v git)
+mkdir -p "$t/gshim"
+{ echo '#!/usr/bin/env bash'
+  echo 'for a in "$@"; do [ -n "${GSHIM_FAIL:-}" ] && [ "$a" = "$GSHIM_FAIL" ] && { echo "fatal: gshim refused $a" >&2; exit 128; }; done'
+  printf 'exec %q "$@"\n' "$gshim_real"; } >"$t/gshim/git"
+chmod +x "$t/gshim/git"
+gshim() { local w=$1; shift; PATH="$t/gshim:$PATH" GSHIM_FAIL=$w "$@"; }
+gshim_refuses() { local o rc=0; o=$(gshim rev-parse git -C "$r" rev-parse HEAD 2>&1) || rc=$?; echo "$o"; [ "$rc" -eq 128 ] && [ "$o" = "fatal: gshim refused rev-parse" ]; }
+expect_ok "premise: gshim: a call with no argument equal to GSHIM_FAIL runs the real git" gshim no-such-word git -C "$r" rev-parse -q --verify nucleus/v3-scaffold
+expect_ok "premise: gshim: a call with an argument equal to GSHIM_FAIL exits 128, naming it" gshim_refuses
+expect_ok "premise: gshim: the next plain git call is the real git again" bash -c "[ \"\$(command -v git)\" = '$gshim_real' ] && [ -z \"\${GSHIM_FAIL:-}\" ]"
 
 # One definition per language, kept identical; a caller's GIT_CONFIG_* entries
 # are appended to, never clobbered, and a nested source adds nothing.
@@ -892,6 +912,67 @@ git -C "$r" update-index --no-skip-worktree nucleus/v3/spikes/base.txt; git -C "
 expect_ok "git state: the promote scenario's flag is gone" no_state
 git -C "$r" checkout -q nucleus/v3-scaffold
 
+# The refusals fail closed (X-6-F1-F2-F1 a): a git read they cannot make is a
+# problem line, never "nothing found". On a clean $r, gshim fails one read.
+expect_ok "git state: none before the fail-closed rows" no_state
+# gsr WORD LINE: git_state_refuse --index from $v3, the WORD read failing:
+# exit 1, with "LINE (git state hides changes)" as a whole line.
+gsr() { local o rc=0; o=$(cd "$v3" && gshim "$1" bash -c '. scripts/git-env.sh; git_state_refuse --index' 2>&1) || rc=$?; echo "$o"; echo "exit $rc"; [ "$rc" -eq 1 ] && grep -qxF -- "$2 (git state hides changes)" <<<"$o"; }
+expect_ok "git-env.sh: a failed for-each-ref refs/replace/ is a problem" gsr refs/replace/ "git for-each-ref refs/replace/ failed (cannot check for replace refs)"
+expect_ok "git-env.sh: a failed rev-parse --git-common-dir is a problem" gsr --git-common-dir "git rev-parse --git-common-dir --git-dir failed (cannot check for a graft file)"
+expect_ok "git-env.sh: a config --get-all core.fsmonitor exit other than 0/1 is a problem" gsr core.fsmonitor "git config --get-all core.fsmonitor failed (exit 128; cannot check for an fsmonitor hook)"
+expect_ok "git-env.sh: a failed ls-files -v is a problem" gsr ls-files "git ls-files -v failed (cannot check the index flags)"
+# A caller folds the failure into its exit. $qs holds a fine queue (QS1 queued)
+# here; the queue-check scenario below adds the orphan QS2 to it.
+qs=$t/qs; mkdir -p "$qs"; printf '# QUEUE\n- QS1 | queued | S | x\n' >"$qs/QUEUE.local.md"
+printf '# CARD QS1: t\nClass: test        Author: S (t)        Status: ready\n' >"$qs/QS1.local.md"
+qsc() { (cd "$v3" && NV3_CARDS="$qs" bash scripts/queue-check.sh); }
+expect_ok "premise: queue-check: the QS1 queue is fine" bash -c "[ \"\$(cd '$v3' && NV3_CARDS='$qs' bash scripts/queue-check.sh)\" = 'queue-check: ok' ]"
+expect_ok "queue-check: a failed for-each-ref refs/replace/ fails it" out_has "git for-each-ref refs/replace/ failed (cannot check for replace refs) (git state hides changes)" -- gshim refs/replace/ qsc
+# gsp: git_state_problems($r, index=True) under the caller's gshim (gshim WORD
+# gsp) gives an entry ending "(cannot check git state)" that holds "exit 128"
+# and the shim's refusal of WORD.
+gsp() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
+import importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+probs = rc.git_state_problems(pathlib.Path(sys.argv[2]), index=True)
+print(probs)
+w = f"gshim refused {os.environ['GSHIM_FAIL']}"
+sys.exit(0 if probs and any(p.endswith("(cannot check git state)") and "exit 128" in p and w in p for p in probs) else 1)
+P
+}
+expect_ok "runner: a failed for-each-ref refs/replace/ is a problem" gshim refs/replace/ gsp
+expect_ok "runner: a failed ls-files -v is a problem" gshim ls-files gsp
+expect_ok "runner: scope_violations names the failed git state read" gshim refs/replace/ gs nucleus/v3-scaffold - "gshim refused refs/replace/ (cannot check git state)"
+expect_ok "git state: none after the fail-closed rows" no_state
+
+# The index flags are read from the top (X-6-F1-F2-F1 c): promote-pass runs
+# from nucleus/v3, and a flagged file outside it hides its edit from the clean
+# check and the gate just the same.
+git -C "$r" checkout -q -B scratch/pass6 nucleus/v3-scaffold
+echo dirty >>"$r/README"; git -C "$r" update-index --skip-worktree README
+expect_ok "premise: promote top-level: plain status lists nothing" bash -c "[ -z \"\$(git -C '$r' status --porcelain)\" ]"
+expect_ok "premise: promote top-level: ls-files -v in nucleus/v3 lists README only with ':/'" bash -c "cd '$v3' && ! git ls-files -v --full-name | grep -qx '. README' && git ls-files -v --full-name -- ':/' | grep -qx 'S README'"
+promote6() { (cd "$v3" && NV3_CARDS="$qa" bash scripts/promote-pass.sh scratch/pass6); }
+expect_ok "promote: a skip-worktree flag outside nucleus/v3 is refused" out_has "README is marked skip-worktree in the index" "GATE EXIT=0" "audit: ok" "not promoting" -- promote6
+git -C "$r" update-index --no-skip-worktree README; git -C "$r" checkout -q -- README
+expect_ok "git state: the top-level promote scenario's flag is gone" no_state
+git -C "$r" checkout -q nucleus/v3-scaffold
+
+# queue-check reads the merged verdicts from the scaffold's tree, which a replace
+# ref can rewrite (X-6-F1-F2-F1 d): the state fails it, after the orphan check
+# has run. Both commits are unreachable, as in XS.
+qx=$(git -C "$r" commit-tree "nucleus/v3-scaffold^{tree}" -m "nucleus v3: QS replaced")
+git -C "$r" replace "$qx" "$(git -C "$r" commit-tree "nucleus/v3-scaffold^{tree}" -m "nucleus v3: QS replacement")"
+printf '# CARD QS2: t\nClass: test        Author: S (t)        Status: ready\n' >"$qs/QS2.local.md"
+expect_ok "queue-check: a replace ref fails it, and the orphan check still ran" out_has "replace ref refs/replace/$qx (git state hides changes)" "queue-check: orphan card QS2" -- qsc
+printf -- '- QS2 | queued | S | x\n' >>"$qs/QUEUE.local.md"
+qs_state_only() { local o rc=0; o=$(qsc 2>&1) || rc=$?; echo "$o"; echo "exit $rc"; [ "$rc" -ne 0 ] && grep -qxF "replace ref refs/replace/$qx (git state hides changes)" <<<"$o" && ! grep -q 'orphan\|queue-check: ok' <<<"$o"; }
+expect_ok "queue-check: with no orphan, the replace ref alone fails it" qs_state_only
+git -C "$r" replace -d "$qx" >/dev/null
+expect_ok "git state: queue-check's replace ref is gone" no_state
+expect_ok "queue-check: control: with the replace ref gone and QS2 queued it is ok" bash -c "[ \"\$(cd '$v3' && NV3_CARDS='$qs' bash scripts/queue-check.sh)\" = 'queue-check: ok' ]"
+
 # --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
 # The ref store is shared by every worktree, so ref_violations refuses only ref
 # changes it can pin on this run (R1) or that touch a protected ref (R2), and
@@ -1005,6 +1086,11 @@ for a in ${inv[$i]}; do
       git update-ref refs/heads/nucleus/v3-scaffold "$m"; git update-ref refs/remotes/origin/nucleus/v3-scaffold "$m"; git update-ref refs/stash "$o" ;;
     side) git update-ref "refs/heads/side-$id" "$(git commit-tree "HEAD^{tree}" -p HEAD -m "nucleus v3: $id side")" ;;
     adopt) git merge -q --ff-only "side-$id" ;;
+    # The git environment the child inherits: .env holds the three values the
+    # runner switches (the V row); .cfg holds its whole command-scope config
+    # (keys lowercased), for a row on an entry added later.
+    gitenv) { git config core.fsmonitor || echo unset; printenv GIT_NO_REPLACE_OBJECTS || echo unset; printenv GIT_GRAFT_FILE || echo unset; } >"$FAKE_OC_N.env"
+      git config --list --show-scope | grep '^command' >"$FAKE_OC_N.cfg" || true ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -1211,6 +1297,13 @@ expect_ok "runner e2e: S: a replace ref stops the run before attempt 1, naming i
   res XS "rc == 1 and 'git state hides changes; not starting' in out and 'replace ref refs/replace/$xs' in out and 'attempt 1:' not in out and not os.path.exists('$e/XS.n')"
 git -C "$r" replace -d "$xs" >/dev/null
 expect_ok "git state: XS's replace ref is gone" no_state
+# V: the opencode child inherits the runner's git environment (X-6-F1-F2-F1 b).
+# This script unset the caller's protection at the top, so these values can
+# only come from git_env. The effective core.fsmonitor is read, not
+# GIT_CONFIG_COUNT or key indexes, which later entries may shift.
+e2e XV "gitenv work" --attempts 1
+expect_ok "runner e2e: V: opencode runs with replace refs, grafts and fsmonitor off" \
+  res XV "open('$e/XV.n.env').read().split() == ['false', '1', '/dev/null'] and 'command\tcore.fsmonitor=false' in open('$e/XV.n.cfg').read().splitlines()"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
