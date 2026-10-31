@@ -147,16 +147,17 @@ git_state_refuse() {
     *) p+=("git config --get-all core.fsmonitor failed (exit $rc; cannot check for an fsmonitor hook)") ;;
   esac
   # Read under the override, which only a command-line entry can beat: any
-  # value but false means git reads the cache.
+  # value but false means git reads the cache, and so does no value at all
+  # (exit 1: the environment's entry is missing).
   for key in core.commitGraph core.untrackedCache; do
     rc=0
     git config -z --show-origin --get "$key" >"$tmp" || rc=$?
-    if [ "$rc" -eq 0 ]; then
-      { IFS= read -r -d '' origin && IFS= read -r -d '' val; } <"$tmp" || val=
-      case ${val,,} in false | no | off | 0) ;; *) p+=("$key is '$val' ($origin), over the environment's false") ;; esac
-    else
-      p+=("git config --get $key failed (exit $rc; cannot check that the environment's $key=false holds)")
-    fi
+    case $rc in
+      0) { IFS= read -r -d '' origin && IFS= read -r -d '' val; } <"$tmp" || val=
+         case ${val,,} in false | no | off | 0) ;; *) p+=("$key is '$val' ($origin), over the environment's false") ;; esac ;;
+      1) p+=("$key is not set under the environment (its false is missing)") ;;
+      *) p+=("git config --get $key failed (exit $rc; cannot check that the environment's $key=false holds)") ;;
+    esac
   done
   val=${GIT_TEST_COMMIT_GRAPH:-}
   case ${val,,} in '' | false | no | off | 0) ;; *) p+=("GIT_TEST_COMMIT_GRAPH is '$val' in the environment (forces commit-graph reads)") ;; esac

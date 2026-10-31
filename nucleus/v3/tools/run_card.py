@@ -429,8 +429,11 @@ def git_state_problems(wt, index=True):
             if val.lower() not in ("false", "no", "off", "0"):
                 probs.append(f"core.fsmonitor is '{val}' ({origin})")
         for key in ("core.commitGraph", "core.untrackedCache"):
-            origin, val = (git("config", "-z", "--show-origin", "--get", key).stdout.split("\0") + ["", ""])[:2]
-            if val.lower() not in ("false", "no", "off", "0"):
+            p = git("config", "-z", "--show-origin", "--get", key, ok=(0, 1))
+            origin, val = (p.stdout.split("\0") + ["", ""])[:2]
+            if p.returncode == 1:
+                probs.append(f"{key} is not set under the environment (its false is missing)")
+            elif val.lower() not in ("false", "no", "off", "0"):
                 probs.append(f"{key} is '{val}' ({origin}), over the environment's false")
         val = os.environ.get("GIT_TEST_COMMIT_GRAPH", "")
         if val.lower() not in ("", "false", "no", "off", "0"):
