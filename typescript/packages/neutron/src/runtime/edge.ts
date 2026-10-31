@@ -27,3 +27,7 @@ export { createMemoryLoaderCacheStore } from "../server/cache-store.js";
 export { routeStylesheetHrefs } from "../core/route-css.js";
 export { handleServerActionRequest, serverActionReferrerPath } from "../core/server-actions.js";
 export { SERVER_ACTION_PATH } from "../core/server-action-protocol.js";
+export { compileMounts, dispatchMounts } from "../core/mount-dispatch.js";
+export { applySecurityHeaders, resolveSecurityHeadersConfig } from "../server/http-headers.js";
+export { applyRouteRuleHeaders } from "../core/route-rules.js";
+export { withMutableHeaders } from "../core/response.js";

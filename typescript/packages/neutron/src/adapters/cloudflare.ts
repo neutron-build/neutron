@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { builtinModules } from "node:module";
 import * as path from "node:path";
-import { assertServerActionsServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
+import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 import {
   readStaticHeadersMap,
   toCloudflareHeadersFile,
@@ -20,7 +20,7 @@ export function adapterCloudflare(
   return {
     name: "cloudflare",
     async adapt(context: AdapterBuildContext) {
-      assertServerActionsServable("cloudflare", context, context.routes.app > 0);
+      assertServerFeaturesServable("cloudflare", context, context.routes.app > 0);
       const mode = options.mode || "pages";
       const hasAppRoutes = context.routes.app > 0;
 

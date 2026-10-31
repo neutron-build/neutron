@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { IncomingMessage } from "node:http";
+import { parse } from "@babel/parser";
 import type { WebSocketServer } from "ws";
 import type { NeutronMount, NeutronMountApp } from "../server/index.js";
 
@@ -108,4 +109,40 @@ export async function loadServerEntry(
     throw new Error(`Failed to load server entry ${path.basename(absolutePath)}: ${String(error)}`);
   }
   return resolveServerEntryModule(mod, absolutePath);
+}
+
+/**
+ * Whether a server entry's source declares a `websocket` (a property or
+ * method of that name anywhere in the file). Read without evaluating the
+ * entry, which may connect to databases: a build for a target that cannot
+ * serve WebSockets fails on it instead of deploying an entry that would.
+ */
+export function serverEntryDeclaresWebSocket(source: string): boolean {
+  if (!/\bwebsocket\b/.test(source)) return false;
+  let ast: unknown;
+  try {
+    ast = parse(source, { sourceType: "module", plugins: ["typescript", "jsx"] });
+  } catch {
+    return true; // unparseable: let the bundler report it, but do not wave it through
+  }
+  const stack: unknown[] = [ast];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") continue;
+    if (Array.isArray(node)) {
+      stack.push(...node);
+      continue;
+    }
+    const record = node as { type?: string; key?: { type?: string; name?: string; value?: string } };
+    if (
+      (record.type === "ObjectProperty" || record.type === "ObjectMethod") &&
+      (record.key?.name === "websocket" || record.key?.value === "websocket")
+    ) {
+      return true;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key !== "loc" && value && typeof value === "object") stack.push(value);
+    }
+  }
+  return false;
 }

@@ -137,6 +137,7 @@ export { findGlobalMiddlewareFile } from "../core/global-middleware.js";
 export {
   defineServerEntry,
   findServerEntryFile,
+  serverEntryDeclaresWebSocket,
   type NeutronServerEntry,
   type NeutronServerEntryExport,
   type NeutronServerEntryWebSocket,

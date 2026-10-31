@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { assertServerActionsServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
+import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 
 export interface DockerAdapterOptions {
   nodeVersion?: string;
@@ -12,7 +12,7 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
   return {
     name: "docker",
     async adapt(context: AdapterBuildContext) {
-      assertServerActionsServable("docker", context, context.routes.app > 0);
+      assertServerFeaturesServable("docker", context, context.routes.app > 0);
       const hasAppRoutes = context.routes.app > 0;
       let runtimeEntryImport: string | null = null;
 

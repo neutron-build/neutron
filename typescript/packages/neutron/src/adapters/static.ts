@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
-import { assertServerActionsServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
+import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 import { readStaticHeadersMap, toCloudflareHeadersFile } from "./headers.js";
 
 export interface StaticAdapterOptions {
@@ -14,7 +14,7 @@ export function adapterStatic(options: StaticAdapterOptions = {}): NeutronAdapte
   return {
     name: "static",
     adapt(context: AdapterBuildContext) {
-      assertServerActionsServable("static", context, false);
+      assertServerFeaturesServable("static", context, false);
       if (context.routes.app > 0 && !options.allowAppRoutes) {
         throw new Error(
           `Static adapter cannot package app routes (${context.routes.app} found). ` +

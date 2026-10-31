@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { assertServerActionsServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
+import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 import {
   readStaticHeadersMap,
   toVercelHeaders,
@@ -18,7 +18,7 @@ export function adapterVercel(
   return {
     name: "vercel",
     async adapt(context: AdapterBuildContext) {
-      assertServerActionsServable("vercel", context, context.routes.app > 0);
+      assertServerFeaturesServable("vercel", context, context.routes.app > 0);
       const hasAppRoutes = context.routes.app > 0;
       if (hasAppRoutes && !context.ensureRuntimeBundle) {
         if (!options.allowAppRoutes) {

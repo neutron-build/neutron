@@ -7,6 +7,7 @@ import { adapterDocker } from "./docker.js";
 import { adapterNetlify } from "./netlify.js";
 import { adapterStatic } from "./static.js";
 import { adapterVercel } from "./vercel.js";
+import { serverEntryDeclaresWebSocket } from "../core/server-entry.js";
 
 const tempDirs: string[] = [];
 
@@ -283,5 +284,71 @@ describe("platform adapters", () => {
     expect(fs.existsSync(path.join(outDir, "assets/app.js.br"))).toBe(true);
     expect(fs.existsSync(path.join(outDir, ".neutron-static-policy.json"))).toBe(true);
     expect(fs.existsSync(path.join(outDir, ".neutron-adapter-static.json"))).toBe(true);
+  });
+});
+
+describe("server features an adapter cannot serve", () => {
+  const context = (overrides: Record<string, unknown>) => ({
+    rootDir: "/app",
+    outDir: createTempOutDir(),
+    routes: { total: 1, static: 1, app: 0 },
+    log: () => {},
+    ensureRuntimeBundle: async () => {
+      throw new Error("not built in this test");
+    },
+    ...overrides,
+  });
+
+  it("static: server actions and a server entry fail the build", () => {
+    expect(() => adapterStatic().adapt(context({ serverActions: 2 }))).toThrow(
+      /static adapter cannot serve 2 server actions: a static deploy has no server/
+    );
+    expect(() =>
+      adapterStatic().adapt(context({ serverEntry: { file: "src/server.entry.ts", declaresWebSocket: false } }))
+    ).toThrow(/cannot serve the mounts of src\/server\.entry\.ts/);
+  });
+
+  it("edge presets without an app route: no runtime to serve actions or mounts", async () => {
+    for (const adapter of [adapterVercel(), adapterNetlify(), adapterCloudflare(), adapterDocker()]) {
+      await expect(Promise.resolve().then(() => adapter.adapt(context({ serverActions: 1 })))).rejects.toThrow(
+        /built only for apps with at least one app route/
+      );
+    }
+  });
+
+  it("every adapter refuses a server entry that declares a websocket", async () => {
+    const entry = { serverEntry: { file: "src/server.entry.ts", declaresWebSocket: true }, routes: { total: 1, static: 0, app: 1 } };
+    for (const adapter of [adapterVercel(), adapterNetlify(), adapterCloudflare(), adapterDocker()]) {
+      await expect(Promise.resolve().then(() => adapter.adapt(context(entry)))).rejects.toThrow(
+        /cannot serve the websocket src\/server\.entry\.ts declares: this target has no WebSocket upgrade/
+      );
+    }
+  });
+
+  it("cloudflare worker sends only reads to the asset binding", async () => {
+    const outDir = createTempOutDir();
+    await adapterCloudflare().adapt({
+      rootDir: outDir,
+      outDir,
+      routes: { total: 1, static: 0, app: 1 },
+      log: () => {},
+      ensureRuntimeBundle: async () => {
+        fs.mkdirSync(path.join(outDir, "server", "worker"), { recursive: true });
+        fs.writeFileSync(path.join(outDir, "server", "worker", "entry.js"), "export const handleNeutronRequest = () => {};");
+        return { target: "worker", outDir, entryPath: path.join(outDir, "server", "worker", "entry.js"), entryRelativePath: "server/worker/entry.js" };
+      },
+    });
+    const worker = fs.readFileSync(path.join(outDir, "_worker.js"), "utf-8");
+    expect(worker).toMatch(/if \(request\.method === "GET" \|\| request\.method === "HEAD"\) \{\s+const assetResponse = await env\.ASSETS\.fetch\(request\)/);
+  });
+});
+
+describe("serverEntryDeclaresWebSocket", () => {
+  it("finds a websocket property or method, not a mention", () => {
+    expect(serverEntryDeclaresWebSocket(`export default { mount: {} };`)).toBe(false);
+    expect(serverEntryDeclaresWebSocket(`// no websocket here\nexport default { mount: {} };`)).toBe(false);
+    expect(serverEntryDeclaresWebSocket(`export default () => ({ websocket: { attach() {} } });`)).toBe(true);
+    expect(serverEntryDeclaresWebSocket(`export default { "websocket": ws };`)).toBe(true);
+    expect(serverEntryDeclaresWebSocket(`export default { websocket() {} };`)).toBe(true);
   });
 });

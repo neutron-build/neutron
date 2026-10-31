@@ -2824,3 +2824,129 @@ describe("neutron-ts build (process): server actions", () => {
     }
   });
 });
+
+// The vercel/netlify/cloudflare/docker runtime sent 3 of start's 5 security
+// defaults, ignored server.securityHeaders, and served no mounts. It now
+// applies routes.headers then the defaults exactly as start does, and serves
+// src/server.entry.ts mounts with the global middleware ahead of them.
+describe("neutron-ts build (process): adapter runtime parity", () => {
+  const app = (entry: string): Record<string, string> => ({
+    "package.json": JSON.stringify({ name: "adapter-parity-fixture", type: "module" }),
+    "neutron.config.ts": `export default {
+  server: { securityHeaders: { headers: { "Permissions-Policy": "camera=()" } } },
+  routes: {
+    headers: [
+      { source: "/embed", headers: { "X-Frame-Options": null, "Cross-Origin-Opener-Policy": "same-origin" } },
+    ],
+  },
+};
+`,
+    "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+    "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+    "src/middleware.ts": `
+export default async function middleware(request, context, next) {
+  if (request.headers.get("x-deny") === "1") return new Response("gated", { status: 401 });
+  const response = await next();
+  response.headers.set("x-global", (response.headers.get("x-global") || "") + "ran");
+  return response;
+}
+`,
+    "src/server.entry.ts": entry,
+    "src/routes/embed.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export default function Embed() { return h("p", null, "embed-page"); }
+`,
+    "src/routes/api/fallback.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export default function Fallback() { return h("p", null, "fell-through"); }
+`,
+  });
+
+  it("vercel preset: start's security headers and the server entry's mounts", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture(
+      app(`
+import { Hono } from "hono";
+const api = new Hono();
+api.get("/hello", (c) => c.json({ hello: "mount" }));
+const open = new Hono();
+open.get("/ping", (c) => c.text("pong"));
+export default () => ({ mount: { "/api": api, "/open": { app: open, globalMiddleware: false } } });
+`)
+    );
+    // The app's own hono (core's copy, linked in like every other package here).
+    fs.symlinkSync(
+      fs.realpathSync(path.join(CLI_PACKAGE_DIR, "node_modules", "@neutron-build", "core", "node_modules", "hono")),
+      path.join(dir, "node_modules", "hono"),
+      "dir"
+    );
+    try {
+      const build = runCli("build", dir, {}, ["--preset", "vercel"]);
+      assert.equal(await build.exited, 0, build.output());
+      const dist = path.join(dir, "dist");
+      assert.ok(fs.existsSync(path.join(dist, "api", "__neutron.mjs")));
+      const runtime = (await import(pathToFileURL(path.join(dist, "server", "node", "entry.js")).href)) as {
+        handleNeutronRequest: (request: Request) => Promise<Response>;
+      };
+      const get = (p: string, headers: Record<string, string> = {}) =>
+        runtime.handleNeutronRequest(new Request(`http://127.0.0.1${p}`, { headers: { accept: "text/html", ...headers } }));
+
+      const defaults = {
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+        "referrer-policy": "strict-origin-when-cross-origin",
+        "cross-origin-opener-policy": "same-origin-allow-popups",
+        "cross-origin-resource-policy": "same-origin",
+        "permissions-policy": "camera=()",
+      };
+      const mounted = await get("/api/hello");
+      assert.equal(mounted.status, 200);
+      assert.deepEqual(await mounted.json(), { hello: "mount" });
+      assert.equal(mounted.headers.get("x-global"), "ran");
+      for (const [name, value] of Object.entries(defaults)) assert.equal(mounted.headers.get(name), value, name);
+
+      // A rule overrides one default and nulls another, on its path only.
+      const embed = await get("/embed");
+      assert.equal(embed.status, 200);
+      assert.ok((await embed.text()).includes("embed-page"));
+      assert.equal(embed.headers.get("x-frame-options"), null);
+      assert.equal(embed.headers.get("cross-origin-opener-policy"), "same-origin");
+      assert.equal(embed.headers.get("x-content-type-options"), "nosniff");
+
+      // Global middleware gates the mount; an opted-out mount skips it.
+      assert.equal((await get("/api/hello", { "x-deny": "1" })).status, 401);
+      const open = await get("/open/ping", { "x-deny": "1" });
+      assert.equal(open.status, 200);
+      assert.equal(await open.text(), "pong");
+      assert.equal(open.headers.get("x-global"), null);
+
+      // Unmatched by the sub-app: the routes answer, the chain ran once.
+      const fellThrough = await get("/api/fallback");
+      assert.equal(fellThrough.status, 200);
+      assert.ok((await fellThrough.text()).includes("fell-through"));
+      assert.equal(fellThrough.headers.get("x-global"), "ran");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails an edge build whose server entry declares a websocket", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture(
+      app(`
+export default { websocket: { path: "/ws", attach(wss) { wss.on("connection", () => {}); } } };
+`)
+    );
+    try {
+      const build = runCli("build", dir, {}, ["--preset", "netlify"]);
+      assert.notEqual(await build.exited, 0, build.output());
+      assert.match(build.output(), /The netlify adapter cannot serve the websocket src\/server\.entry\.ts declares/, build.output());
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -48,6 +48,20 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **The vercel/netlify/cloudflare/docker runtime matches `start` on security
+  headers and serves `src/server.entry.ts` mounts.** The generated handler
+  sent 3 of `start`'s 5 security defaults (no `Cross-Origin-Opener-Policy`,
+  no `Cross-Origin-Resource-Policy`), ignored `server.securityHeaders`
+  (custom headers and `false`), and served no mounts, so a tRPC/REST API
+  declared in the server entry 404ed on every edge deploy. It now applies
+  `routes.headers` and then the configured defaults with core's own
+  functions (the order, overrides and `null` suppression of `start`), on
+  every response it answers, and dispatches the entry's mounts with the
+  global middleware ahead of them (per-mount opt-out honoured, unmatched
+  paths falling through to the routes with the chain run once). What it
+  cannot serve fails the build: a server entry `websocket` on any of these
+  presets, and mounts (or server actions) in an app with no app route, for
+  which no runtime is built; `--preset static` fails on a server entry.
 - **Server Actions: `"use server"` modules.** Client code that imported a
   `"use server"` module bundled the module whole into the browser build (the
   Fylun port found Prisma, pg, sharp and Better-Auth in it, F-P3-4, and
@@ -119,7 +133,8 @@ All notable changes to this project are documented in this file.
   startup error, like `src/middleware.ts`. The name is not `src/server.ts`:
   that is where apps keep a custom server that calls `createServer`, which
   must not import itself. `createServer({ mount })` is unchanged. The
-  vercel/netlify/cloudflare/docker handlers do not serve mounts, as before.
+  vercel/netlify/cloudflare/docker runtime serves the entry's mounts (see
+  the adapter-runtime entry below); its `websocket` needs `start`.
 - **Security headers can be scoped per route.** `securityHeaders` was one
   site-wide set, so an app that needs cross-origin isolation on one section
   (Fylun: COOP/COEP on `/builder/**` for WebContainer, and no COEP anywhere

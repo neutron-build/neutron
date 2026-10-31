@@ -71,6 +71,7 @@ import {
   type ServerActionsManifest,
   findGlobalMiddlewareFile,
   findServerEntryFile,
+  serverEntryDeclaresWebSocket,
   generateServerBundleEntry,
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
@@ -501,6 +502,7 @@ export async function build(): Promise<void> {
     routeCss,
     serverActions,
     serverActionsOptions: neutronConfig.server?.serverActions,
+    securityHeaders: neutronConfig.server?.securityHeaders,
     userConfig,
     runtimeAliases: preactAliases,
     // `true` for react-compat (blanket processing — see resolveRuntimeNoExternal).
@@ -1064,6 +1066,15 @@ export async function build(): Promise<void> {
       },
       clientEntryScriptSrc,
       serverActions: serverActions ? Object.keys(serverActions.actions).length : 0,
+      serverEntry: (() => {
+        const file = findServerEntryFile(cwd);
+        return file
+          ? {
+              file: path.relative(cwd, file).split(path.sep).join("/"),
+              declaresWebSocket: serverEntryDeclaresWebSocket(fs.readFileSync(file, "utf-8")),
+            }
+          : null;
+      })(),
       ensureRuntimeBundle,
       log: (message: string) => {
         console.log(`  [adapter] ${message}`);
@@ -1370,6 +1381,7 @@ interface RuntimeBundleBuilderOptions {
   routeCss: RouteCssManifest | null;
   serverActions: ServerActionsManifest | null;
   serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] };
+  securityHeaders?: false | { headers?: Record<string, string> };
   userConfig: Record<string, any>;
   runtimeAliases?: Array<{ find: string | RegExp; replacement: string }> | Record<string, string>;
   /** `true` = process the whole dependency graph (react-compat). */
@@ -1513,7 +1525,9 @@ async function buildRuntimeBundle(
       options.routeRules,
       globalMiddlewarePath,
       options.serverActions,
-      options.serverActionsOptions
+      options.serverActionsOptions,
+      options.securityHeaders,
+      findServerEntryFile(options.cwd)
     ),
     "utf-8"
   );
@@ -2077,7 +2091,9 @@ function generateRuntimeEntrySource(
   routeRules: NeutronConfig["routes"] | undefined,
   globalMiddlewarePath?: string,
   serverActions?: ServerActionsManifest | null,
-  serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] }
+  serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] },
+  securityHeaders?: false | { headers?: Record<string, string> },
+  serverEntryPath?: string | null
 ): string {
   const imports: string[] = [];
   const moduleEntries: string[] = [];
@@ -2158,8 +2174,33 @@ function generateRuntimeEntrySource(
 `
     : "";
 
-  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse } from "@neutron-build/core/runtime-edge";
+  const serverEntryDecl = serverEntryPath
+    ? `import * as __serverEntryModule from "${relativeImportPath(path.dirname(entryPath), serverEntryPath)}";
+import { compileMounts, dispatchMounts } from "@neutron-build/core/runtime-edge";
+
+// Resolved once, on the first request, as start resolves it at boot.
+let __serverEntryMounts;
+function serverEntryMounts() {
+  __serverEntryMounts ??= (async () => {
+    const exported = __serverEntryModule.default;
+    const entry = typeof exported === "function" ? await exported() : exported;
+    if (!entry || typeof entry !== "object") {
+      throw new TypeError("${path.basename(serverEntryPath)}: expected a default export of an object (or a function returning one).");
+    }
+    if (entry.websocket) {
+      throw new Error("${path.basename(serverEntryPath)} declares a websocket, which this deployment target cannot serve.");
+    }
+    return compileMounts(entry.mount);
+  })();
+  return __serverEntryMounts;
+}
+`
+    : "";
+
+  return `import { createRouter, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse, applyRouteRuleHeaders, applySecurityHeaders, resolveSecurityHeadersConfig, withMutableHeaders } from "@neutron-build/core/runtime-edge";
 ${actionsImport}${imports.join("\n")}
+${serverEntryDecl}
+const SECURITY_HEADERS = resolveSecurityHeadersConfig(${securityHeaders === undefined ? "undefined" : JSON.stringify(securityHeaders)});
 
 const SERVER_ACTIONS = {
 ${actionEntries.join("\n")}
@@ -2203,7 +2244,17 @@ async function handleNeutronRequestInner(request) {
   if (!pathname) {
     return new Response("Bad Request", { status: 400 });
   }
-${actionsDispatch}
+${actionsDispatch}${serverEntryPath ? `
+  // src/server.entry.ts mounts, with start's semantics (core/mount-dispatch.ts).
+  return dispatchMounts(await serverEntryMounts(), request, pathname, GLOBAL_MIDDLEWARE, (globalChainRan) =>
+    handleRouteRequest(request, requestUrl, pathname, globalChainRan)
+  );
+}
+` : `
+  return handleRouteRequest(request, requestUrl, pathname, false);
+}
+`}
+async function handleRouteRequest(request, requestUrl, pathname, globalChainRan) {
   const redirect = resolveRouteRuleRedirect(ROUTE_RULES, pathname, requestUrl.search);
   if (redirect) {
     return new Response(null, {
@@ -2246,7 +2297,7 @@ ${actionsDispatch}
         method: request.method,
         pathname: effectivePathname,
       },
-      globalMiddleware: GLOBAL_MIDDLEWARE,
+      globalMiddleware: globalChainRan ? [] : GLOBAL_MIDDLEWARE,
     }
   );
 
@@ -2254,7 +2305,6 @@ ${actionsDispatch}
     await applyMutationInvalidationToLoaderDataCache(effectivePathname, response);
   }
 
-  applyRouteRuleHeaders(response, pathname);
   return response;
 }
 
@@ -2311,25 +2361,6 @@ function normalizePathname(pathname) {
   return decoded;
 }
 
-function applyRouteRuleHeaders(response, pathname) {
-  const matches = resolveRouteRuleHeaders(ROUTE_RULES, pathname);
-  for (const match of matches) {
-    for (const [name, value] of Object.entries(match.headers || {})) {
-      // null = no such header on this path (it suppresses a default below).
-      if (value === null) {
-        continue;
-      }
-      try {
-        if (!response.headers.has(name)) {
-          response.headers.set(name, String(value));
-        }
-      } catch {
-        // Ignore immutable Response headers (for example, redirect responses).
-      }
-    }
-  }
-}
-
 async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
   const directive = response.headers.get("x-neutron-invalidate");
   if (!directive) {
@@ -2361,28 +2392,17 @@ async function applyMutationInvalidationToLoaderDataCache(pathname, response) {
   }
 }
 
-// Apply baseline security headers to every response from the production handler
-// (the dev server does this already; the generated handler must match).
+// Route-rule headers, then the security defaults they do not override or
+// null out, on every response — the order and set \`neutron-ts start\` applies.
 export async function handleNeutronRequest(request) {
   // A redirected data request is reported, not followed (core/data-redirect.ts).
-  const response = toDataRedirectResponse(request, await handleNeutronRequestInner(request));
-  const defaults = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-  };
-  // A routes.headers rule nulling a header keeps the default off its paths.
-  const suppressed = new Set();
+  const response = withMutableHeaders(toDataRedirectResponse(request, await handleNeutronRequestInner(request)));
   const rulePath = normalizePathname(new URL(request.url).pathname);
-  for (const match of rulePath ? resolveRouteRuleHeaders(ROUTE_RULES, rulePath) : []) {
-    for (const [name, value] of Object.entries(match.headers || {})) {
-      if (value === null) suppressed.add(name.toLowerCase());
-    }
-  }
-  for (const [name, value] of Object.entries(defaults)) {
-    if (!suppressed.has(name.toLowerCase()) && !response.headers.has(name)) {
-      response.headers.set(name, value);
-    }
+  const suppressed = rulePath
+    ? applyRouteRuleHeaders(response, resolveRouteRuleHeaders(ROUTE_RULES, rulePath))
+    : new Set();
+  if (SECURITY_HEADERS) {
+    applySecurityHeaders(response, SECURITY_HEADERS, suppressed);
   }
   return response;
 }
