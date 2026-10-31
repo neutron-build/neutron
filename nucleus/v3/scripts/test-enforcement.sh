@@ -801,7 +801,7 @@ env_same() { local sh py; sh=$(cd "$v3" && env -i PATH="$PATH" bash -c '. script
   py=$(env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("rc",sys.argv[1]); rc=importlib.util.module_from_spec(s); s.loader.exec_module(rc); [print(f"{k}={v}") for k,v in sorted(rc.git_env({}).items()) if k.startswith("GIT_")]' "$v3/tools/run_card.py" | sort)
   echo "sh: $sh"; echo "py: $py"; [ -n "$sh" ] && [ "$sh" = "$py" ]; }
 expect_ok "git env: git-env.sh and run_card.py's GIT_ENV set the same variables" env_same
-cfg_sh() { (cd "$v3" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=nv3.probe GIT_CONFIG_VALUE_0=kept bash -c '. scripts/git-env.sh; . scripts/git-env.sh; echo "count $GIT_CONFIG_COUNT"; [ "$GIT_CONFIG_COUNT" = 3 ] && [ "$(git config nv3.probe)" = kept ] && [ "$(git config core.fsmonitor)" = false ]'); }
+cfg_sh() { (cd "$v3" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=nv3.probe GIT_CONFIG_VALUE_0=kept bash -c '. scripts/git-env.sh; . scripts/git-env.sh; echo "count $GIT_CONFIG_COUNT"; [ "$GIT_CONFIG_COUNT" = 5 ] && [ "$(git config nv3.probe)" = kept ] && [ "$(git config core.fsmonitor)" = false ]'); }
 expect_ok "git env: git-env.sh appends to a caller's GIT_CONFIG_COUNT entries" cfg_sh
 cfg_py() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
 import importlib.util, os, pathlib, sys
@@ -810,7 +810,7 @@ caller = dict(os.environ, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="nv3.probe", GI
 env = rc.git_env(caller)
 got = [rc.run(["git", "config", k], sys.argv[2], env=caller)[1].strip() for k in ("nv3.probe", "core.fsmonitor")]
 print(got, env["GIT_CONFIG_COUNT"])
-sys.exit(0 if got == ["kept", "false"] and env["GIT_CONFIG_COUNT"] == "3" and rc.git_env(env) == env else 1)
+sys.exit(0 if got == ["kept", "false"] and env["GIT_CONFIG_COUNT"] == "5" and rc.git_env(env) == env else 1)
 P
 }
 expect_ok "git env: run_card.py appends to a caller's GIT_CONFIG_COUNT entries" cfg_py
@@ -1017,6 +1017,216 @@ expect_ok "queue-check: with no orphan, the replace ref alone fails it" qs_state
 git -C "$r" replace -d "$qx" >/dev/null
 expect_ok "git state: queue-check's replace ref is gone" no_state
 expect_ok "queue-check: control: with the replace ref gone and QS2 queued it is ok" bash -c "[ \"\$(cd '$v3' && NV3_CARDS='$qs' bash scripts/queue-check.sh)\" = 'queue-check: ok' ]"
+
+# --- caches and neighbours that hide changes (X-6-F1-F2-F3) -----------------
+# A hand-written commit-graph or a stale untracked cache hides changes; the
+# environment turns both off and the refusal names a forged graph, a -c or
+# GIT_TEST_COMMIT_GRAPH that turns the graph back on, a shallow repository and
+# alternates. no_state2 checks this block's state is gone, as no_state does
+# the rest.
+gobj=$r/.git/objects/info
+no_state2() { [ ! -e "$gobj/commit-graph" ] && [ ! -e "$gobj/commit-graphs" ] && [ ! -e "$gobj/alternates" ] && [ "$(git -C "$r" rev-parse --is-shallow-repository)" = false ] && ! git -C "$r" config core.untrackedCache && ! git -C "$r" config core.trustctime && ! git -C "$r" config status.showUntrackedFiles && ! git -C "$r" config core.ignoreStat; }
+expect_ok "git state: none of the cache state before these scenarios" no_state2
+# both LINE: git_state_refuse --index (git-env.sh, from $v3) exits 1 and names
+# LINE, and so does git_state_problems($r), each under the caller's environment.
+both() { local o rc=0; o=$(cd "$v3" && bash -c '. scripts/git-env.sh; git_state_refuse --index' 2>&1) || rc=$?; echo "sh (exit $rc): $o"; { [ "$rc" -eq 1 ] && grep -qF -- "$1" <<<"$o"; } || return 1
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$1" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+probs = rc.git_state_problems(pathlib.Path(sys.argv[2]))
+print("py:", probs)
+sys.exit(0 if any(sys.argv[3] in p for p in probs) else 1)
+P
+}
+# clean_both BASE: git_state_refuse --index exits 0 and scope_violations names
+# no git state.
+clean_both() { local o rc=0; o=$(cd "$v3" && bash -c '. scripts/git-env.sh; git_state_refuse --index' 2>&1) || rc=$?; echo "sh (exit $rc): $o"; [ "$rc" -eq 0 ] && gs "$1" - none; }
+# cgpatch GRAPH B1 X: in commit-graph file GRAPH, B1's first parent becomes X
+# (both must be in it); the trailing SHA-1 is rewritten. The card author's probe.
+cgpatch() { python3 -I - "$@" <<'P'
+import sys, hashlib, struct
+p, b1, x = sys.argv[1], bytes.fromhex(sys.argv[2]), bytes.fromhex(sys.argv[3])
+d = bytearray(open(p, "rb").read()); toc = {}
+for i in range(d[6] + 1):
+    cid, off = struct.unpack(">4sQ", d[8 + 12 * i: 20 + 12 * i]); toc[cid] = off
+n = (toc[b"CDAT"] - toc[b"OIDL"]) // 20
+oids = [bytes(d[toc[b"OIDL"] + 20 * i: toc[b"OIDL"] + 20 * i + 20]) for i in range(n)]
+struct.pack_into(">I", d, toc[b"CDAT"] + 36 * oids.index(b1) + 20, oids.index(x))
+d[-20:] = hashlib.sha1(bytes(d[:-20])).digest(); open(p, "wb").write(bytes(d))
+P
+}
+# bloomzero GRAPH X: X's changed-path Bloom filter in GRAPH becomes all zero
+# bits ("changed no path"); the trailing SHA-1 is rewritten.
+bloomzero() { python3 -I - "$@" <<'P'
+import sys, hashlib, struct
+p, x = sys.argv[1], bytes.fromhex(sys.argv[2])
+d = bytearray(open(p, "rb").read()); toc = {}
+for i in range(d[6] + 1):
+    cid, off = struct.unpack(">4sQ", d[8 + 12 * i: 20 + 12 * i]); toc[cid] = off
+n = (toc[b"CDAT"] - toc[b"OIDL"]) // 20
+k = [bytes(d[toc[b"OIDL"] + 20 * i: toc[b"OIDL"] + 20 * i + 20]) for i in range(n)].index(x)
+end = struct.unpack(">I", d[toc[b"BIDX"] + 4 * k: toc[b"BIDX"] + 4 * k + 4])[0]
+start = struct.unpack(">I", d[toc[b"BIDX"] + 4 * k - 4: toc[b"BIDX"] + 4 * k])[0] if k else 0
+assert end > start
+d[toc[b"BDAT"] + 12 + start: toc[b"BDAT"] + 12 + end] = bytes(end - start)
+d[-20:] = hashlib.sha1(bytes(d[:-20])).digest(); open(p, "wb").write(bytes(d))
+P
+}
+# GCG commit-graph: R2's geometry with an interior base commit. gcgbase is the
+# scaffold plus B1 and B2; card/v3-GCG commits tools/gcg.py (X) on the
+# scaffold. A written graph, patched so that B1's first parent is X, moves the
+# merge-base to X. (Patching the tip does nothing: git reads command-line tips
+# from the object.)
+git -C "$r" checkout -q -B gcgbase nucleus/v3-scaffold
+git -C "$r" commit -q --allow-empty -m "nucleus v3: GCG B1"; git -C "$r" commit -q --allow-empty -m "nucleus v3: GCG B2"
+git -C "$r" checkout -q -B card/v3-GCG nucleus/v3-scaffold
+echo x >"$v3/tools/gcg.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: GCG work"
+gcx=$(git -C "$r" rev-parse HEAD) gcb1=$(git -C "$r" rev-parse gcgbase~1)
+git -C "$r" commit-graph write --reachable; chmod u+w "$gobj/commit-graph"; cgpatch "$gobj/commit-graph" "$gcb1" "$gcx"
+gcg_hidden() { local d m; d=$(plain diff --name-only gcgbase...card/v3-GCG); m=$(plain merge-base gcgbase card/v3-GCG); echo "diff: $d"; echo "merge-base: $m"; ! grep -qxF nucleus/v3/tools/gcg.py <<<"$d" && [ "$m" = "$gcx" ]; }
+expect_ok "premise: GCG commit-graph: plain diff gcgbase...card drops tools/gcg.py, and the merge-base is X" gcg_hidden
+gcg_verify_false() { local o rc=0; o=$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commitGraph GIT_CONFIG_VALUE_0=false git -C "$r" commit-graph verify 2>&1) || rc=$?; echo "$o"; echo "exit $rc"; [ "$rc" -eq 1 ] && grep -qF "commit-graph parent for $gcb1 is $gcx" <<<"$o"; }
+expect_ok "premise: GCG: commit-graph verify checks the file under core.commitGraph=false too (no skip)" gcg_verify_false
+expect_ok "runner: GCG commit-graph: the committed tools/ file is still protected" gs gcgbase nucleus/v3/tools/gcg.py -
+expect_ok "check-core-paths: under GCG it still lists the hidden CORE file" bash -c "cd '$v3' && bash scripts/check-core-paths.sh gcgbase card/v3-GCG 2>/dev/null | grep -qxF 'CORE tools/gcg.py (tools/)'"
+expect_ok "GCG: both refusals name the forged parent" both "commit-graph fails verification (commit-graph parent for $gcb1 is $gcx"
+expect_ok "runner: GCG: scope_violations names it" gs gcgbase - "commit-graph fails verification"
+expect_ok "audit: fails while the commit-graph fails verification" out_has "audit: commit-graph fails verification" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh nucleus/v3-scaffold"
+# A verify that cannot run is a problem, never "nothing found". gshim matches
+# whole arguments (X-6-F1-F2-F1-F1): merge-card, promote-pass and enforce-lib
+# pass --verify, which must not trip the word verify.
+expect_ok "premise: gshim: an argument that contains GSHIM_FAIL without equalling it runs the real git" gshim verify git -C "$r" rev-parse -q --verify nucleus/v3-scaffold
+expect_ok "git-env.sh: a commit-graph verify that cannot run is a problem" gsr verify "git commit-graph verify failed (exit 128; cannot check the commit-graph)"
+expect_ok "runner: a commit-graph verify that cannot run is a problem" gshim verify gsp
+expect_ok "git-env.sh: a failed rev-parse --is-shallow-repository is a problem" gsr --is-shallow-repository "git rev-parse --is-shallow-repository failed (cannot check for a shallow repository or alternates)"
+expect_ok "runner: a failed rev-parse --is-shallow-repository is a problem" gshim --is-shallow-repository gsp
+expect_ok "git-env.sh: a failed config --get core.commitGraph is a problem" gsr core.commitGraph "git config --get core.commitGraph failed (exit 128; cannot check that the environment's core.commitGraph=false holds)"
+expect_ok "runner: a failed config --get core.untrackedCache is a problem" gshim core.untrackedCache gsp
+rm -rf "$gobj/commit-graph" "$gobj/commit-graphs"
+expect_ok "git state: GCG's commit-graph is gone" no_state2
+# Control: a fresh, honest graph (gc writes these) is not refused.
+git -C "$r" commit-graph write --reachable --changed-paths
+expect_ok "runner: control: an honest commit-graph names no git state" clean_both gcgbase
+rm -rf "$gobj/commit-graph" "$gobj/commit-graphs"
+expect_ok "git state: the honest commit-graph is gone" no_state2
+
+# GCB Bloom filter: X's changed-path filter zeroed in an otherwise honest graph
+# drops X from a walk limited to a plain path, the runner's gate_committed
+# `log -- <file>`. verify does not read the filters, so the environment is the
+# layer, and the refusal names whatever turns the graph back on over it: a
+# caller's -c (GIT_CONFIG_PARAMETERS beats GIT_CONFIG_COUNT) or
+# GIT_TEST_COMMIT_GRAPH.
+git -C "$r" commit-graph write --reachable --changed-paths; chmod u+w "$gobj/commit-graph"; bloomzero "$gobj/commit-graph" "$gcx"
+gcb_plain() { local h; h=$(git -C "$r" log -1 --format=%H card/v3-GCG -- nucleus/v3/tools/gcg.py); echo "log: $h"; [ -z "$h" ] && git -C "$r" commit-graph verify; }
+expect_ok "premise: GCB Bloom: plain log -- tools/gcg.py finds nothing, and verify passes" gcb_plain
+gcb_py() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$gcx" <<'P'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+rcode, out = rc.run(["git", "log", "-1", "--format=%H", "card/v3-GCG", "--", "nucleus/v3/tools/gcg.py"], sys.argv[2])
+print(rcode, out)
+sys.exit(0 if rcode == 0 and out.strip() == sys.argv[3] else 1)
+P
+}
+expect_ok "runner: GCB Bloom: run()'s log -- tools/gcg.py still finds X" gcb_py
+expect_ok "git-env.sh: GCB Bloom: log -- tools/gcg.py still finds X" bash -c "cd '$r' && . nucleus/v3/scripts/git-env.sh && [ \"\$(git log -1 --format=%H card/v3-GCG -- nucleus/v3/tools/gcg.py)\" = '$gcx' ]"
+xcg="'core.commitgraph'='true'"
+expect_ok "premise: GCB: a -c core.commitGraph=true beats the environment (log finds nothing)" bash -c "cd '$r' && . nucleus/v3/scripts/git-env.sh && [ -z \"\$(GIT_CONFIG_PARAMETERS=\"\$1\" git log -1 --format=%H card/v3-GCG -- nucleus/v3/tools/gcg.py)\" ]" _ "$xcg"
+gcb_cp() { GIT_CONFIG_PARAMETERS=$xcg both "core.commitGraph is 'true' (command line:), over the environment's false"; }
+expect_ok "GCB: both refusals name an inherited -c core.commitGraph=true" gcb_cp
+expect_ok "premise: GCB: GIT_TEST_COMMIT_GRAPH=1 beats the environment (log finds nothing)" bash -c "cd '$r' && . nucleus/v3/scripts/git-env.sh && [ -z \"\$(GIT_TEST_COMMIT_GRAPH=1 git log -1 --format=%H card/v3-GCG -- nucleus/v3/tools/gcg.py)\" ]"
+gcb_test() { GIT_TEST_COMMIT_GRAPH=1 both "GIT_TEST_COMMIT_GRAPH is '1' in the environment (forces commit-graph reads)"; }
+expect_ok "GCB: both refusals name GIT_TEST_COMMIT_GRAPH=1" gcb_test
+rm -rf "$gobj/commit-graph" "$gobj/commit-graphs"
+
+# GAL alternates: GCG's forged graph moved into an alternate object directory.
+# git reads it from there, and verify checks only $r's own graph.
+galt=$t/galt; mkdir -p "$galt/info"
+git -C "$r" commit-graph write --reachable; mv "$gobj/commit-graph" "$galt/info/commit-graph"; chmod u+w "$galt/info/commit-graph"; cgpatch "$galt/info/commit-graph" "$gcb1" "$gcx"
+echo "$galt" >"$gobj/alternates"
+gal_hidden() { local d; d=$(plain diff --name-only gcgbase...card/v3-GCG); echo "diff: $d"; ! grep -qxF nucleus/v3/tools/gcg.py <<<"$d" && git -C "$r" commit-graph verify; }
+expect_ok "premise: GAL alternates: plain diff drops tools/gcg.py, and verify passes" gal_hidden
+expect_ok "runner: GAL alternates: the committed tools/ file is still protected" gs gcgbase nucleus/v3/tools/gcg.py -
+expect_ok "GAL: both refusals name the alternates file" both "alternates file $gobj/alternates"
+rm -f "$gobj/alternates"
+gal_env_hidden() { local d; d=$(GIT_ALTERNATE_OBJECT_DIRECTORIES=$galt plain diff --name-only gcgbase...card/v3-GCG); echo "diff: $d"; ! grep -qxF nucleus/v3/tools/gcg.py <<<"$d"; }
+expect_ok "premise: GAL: GIT_ALTERNATE_OBJECT_DIRECTORIES does the same with no file" gal_env_hidden
+gal_env() { GIT_ALTERNATE_OBJECT_DIRECTORIES=$galt both "GIT_ALTERNATE_OBJECT_DIRECTORIES is '$galt' in the environment"; }
+expect_ok "GAL: both refusals name GIT_ALTERNATE_OBJECT_DIRECTORIES" gal_env
+rm -rf "$galt"
+git -C "$r" checkout -q nucleus/v3-scaffold
+
+# GSH shallow: card/v3-GSH has the worker commit W; gsh-other (C, on W) is a
+# ref the run made. With C in .git/shallow, C has no parents, so
+# merge-base --is-ancestor W C says no and ref_violations' R1 misses the ref.
+git -C "$r" checkout -q -B card/v3-GSH nucleus/v3-scaffold
+git -C "$r" commit -q --allow-empty -m "nucleus v3: GSH work"
+git -C "$r" checkout -q -B gsh-other; git -C "$r" commit -q --allow-empty -m "GSH other"
+gshc=$(git -C "$r" rev-parse HEAD); git -C "$r" checkout -q card/v3-GSH
+# gsh_rv 1|0: ref_violations, with gsh-other left out of the snapshot (made
+# during the run), names gsh-other as carrying W (1) or does not (0).
+gsh_rv() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$1" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt = pathlib.Path(sys.argv[2])
+before = rc.ref_snapshot(wt); before.pop("refs/heads/gsh-other")
+pre = rc.run(["git", "rev-parse", "nucleus/v3-scaffold"], wt)[1].strip()
+bad = rc.ref_violations(wt, before, "card/v3-GSH", pre)
+print(bad)
+hit = any(b.startswith("refs/heads/gsh-other: ") and "carries this run's commit" in b for b in bad)
+sys.exit(0 if hit == (sys.argv[3] == "1") else 1)
+P
+}
+expect_ok "premise: GSH: without a shallow file ref_violations names gsh-other as carrying W" gsh_rv 1
+echo "$gshc" >"$r/.git/shallow"
+expect_ok "premise: GSH shallow: merge-base --is-ancestor W C exits 1" bash -c "git -C '$r' merge-base --is-ancestor card/v3-GSH gsh-other; [ \$? -eq 1 ]"
+expect_ok "premise: GSH shallow: ref_violations no longer names gsh-other" gsh_rv 0
+expect_ok "GSH: both refusals name the shallow file" both "shallow repository ($r/.git/shallow)"
+expect_ok "runner: GSH: scope_violations names it" gs nucleus/v3-scaffold - "shallow repository ($r/.git/shallow)"
+rm -f "$r/.git/shallow"
+# The same shallow list from git's GIT_SHALLOW_FILE, with no file in $r: the
+# refusal names the file git reads.
+echo "$gshc" >"$t/gsh.shallow"
+expect_ok "premise: GSH: GIT_SHALLOW_FILE alone makes merge-base --is-ancestor W C exit 1" bash -c "GIT_SHALLOW_FILE='$t/gsh.shallow' git -C '$r' merge-base --is-ancestor card/v3-GSH gsh-other; [ \$? -eq 1 ]"
+gsh_env() { GIT_SHALLOW_FILE=$t/gsh.shallow both "shallow repository ($t/gsh.shallow)"; }
+expect_ok "GSH: both refusals name a GIT_SHALLOW_FILE shallow list" gsh_env
+rm -f "$t/gsh.shallow"
+git -C "$r" checkout -q nucleus/v3-scaffold
+
+# GUC untracked cache: with core.untrackedCache=true, core.trustctime=false and
+# status.showUntrackedFiles=all (so --untracked-files=all reads the cache too),
+# an untracked tools/gucz.py renamed to tools/guc.py, with the directory's
+# times put back, leaves the cached listing valid: status shows the old name.
+# guc_hide re-arms it, since a status under core.untrackedCache=false drops the
+# cache from the index. The directory is first dated 10s back: this git
+# compares whole seconds, and a directory changed in the second the index is
+# written is racy, so git would rescan it.
+git -C "$r" config core.untrackedCache true; git -C "$r" config core.trustctime false; git -C "$r" config status.showUntrackedFiles all
+guc_hide() { rm -f "$v3/tools/guc.py"; echo z >"$v3/tools/gucz.py"; touch -d "@$(($(date +%s) - 10))" "$v3/tools"; git -C "$r" status --porcelain >/dev/null; git -C "$r" status --porcelain >/dev/null
+  touch -r "$v3/tools" "$t/guc.ref"; mv "$v3/tools/gucz.py" "$v3/tools/guc.py"; touch -r "$t/guc.ref" "$v3/tools"; }
+guc_hidden() { local s; s=$(git -C "$r" status --porcelain --no-renames --untracked-files=all); echo "$s"; grep -qxF '?? nucleus/v3/tools/gucz.py' <<<"$s" && ! grep -qxF '?? nucleus/v3/tools/guc.py' <<<"$s"; }
+guc_hide
+expect_ok "premise: GUC untracked cache: plain status --untracked-files=all shows the old name only" guc_hidden
+expect_ok "runner: GUC: the untracked tools/ file is still protected" gs nucleus/v3-scaffold nucleus/v3/tools/guc.py -
+guc_hide
+expect_ok "premise: GUC: hidden again" guc_hidden
+expect_ok "git-env.sh: GUC: promote-pass's status --porcelain lists tools/guc.py" bash -c "cd '$v3' && . scripts/git-env.sh && git status --porcelain | grep -qxF '?? nucleus/v3/tools/guc.py'"
+guc_hide
+xuc="'core.untrackedcache'='true'"
+expect_ok "premise: GUC: a -c core.untrackedCache=true beats the environment" bash -c "cd '$v3' && . scripts/git-env.sh && ! GIT_CONFIG_PARAMETERS=\"\$1\" git status --porcelain | grep -qxF '?? nucleus/v3/tools/guc.py'" _ "$xuc"
+guc_cp() { GIT_CONFIG_PARAMETERS=$xuc both "core.untrackedCache is 'true' (command line:), over the environment's false"; }
+expect_ok "GUC: both refusals name an inherited -c core.untrackedCache=true" guc_cp
+git -C "$r" config --unset core.untrackedCache; git -C "$r" config --unset core.trustctime; git -C "$r" config --unset status.showUntrackedFiles
+git -C "$r" update-index --no-untracked-cache; rm -f "$v3/tools/guc.py" "$v3/tools/gucz.py" "$t/guc.ref"
+
+# GIS core.ignoreStat: `git add` under it marks the entry assume-unchanged, so
+# a second edit is hidden from plain status; the --index refusal names the bit.
+git -C "$r" config core.ignoreStat true
+echo e1 >>"$r/README"; git -C "$r" add README; echo e2 >>"$r/README"
+expect_ok "premise: GIS ignoreStat: plain status shows the staged edit only" bash -c "[ \"\$(git -C '$r' status --porcelain)\" = 'M  README' ]"
+expect_ok "GIS: both refusals name the assume-unchanged bit" both "README is marked assume-unchanged in the index"
+git -C "$r" config --unset core.ignoreStat; git -C "$r" update-index --no-assume-unchanged README; git -C "$r" reset -q -- README; git -C "$r" checkout -q -- README
+expect_ok "git state: none after GUC and GIS" no_state
+expect_ok "git state: none of the cache state after GUC and GIS" no_state2
 
 # --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
 # The ref store is shared by every worktree, so ref_violations refuses only ref
@@ -1358,6 +1568,10 @@ e2e XP work --attempts 1
 unset GIT_CONFIG_PARAMETERS
 expect_ok "runner e2e: P: an inherited -c core.fsmonitor hook stops the run before attempt 1, naming it" \
   res XP "rc == 1 and 'git state hides changes; not starting' in out and \"core.fsmonitor is '$t/fsm'\" in out and 'attempt 1:' not in out"
+# V again (X-6-F1-F2-F3): the child also runs with the commit-graph and the
+# untracked cache off, read from XV's command-scope config dump.
+expect_ok "runner e2e: V: opencode runs with the commit-graph and the untracked cache off" \
+  res XV "{'command\tcore.commitgraph=false', 'command\tcore.untrackedcache=false'} <= set(open('$e/XV.n.cfg').read().splitlines())"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
