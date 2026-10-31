@@ -89,6 +89,13 @@ the packages under Dependents in one step.
   negotiation rule.
   **Migration:** a client or test that matched the bare `Not Found` text
   should check the status code, or the app should add a `not-found.tsx`.
+- **`noindex: true` writes `noindex`, not `noindex, nofollow` (F-P6-1).**
+  The head API emits the robots value an app asks for: Next's
+  `robots: { index: false }` (and Fylun's noindex pages) mean `noindex`,
+  and the framework added `nofollow`, so crawlers stopped following links
+  from those pages. **Migration:** a page that also must not pass link
+  equity sets `robots: "noindex, nofollow"` (or
+  `robots: { index: false, follow: false }`).
 - **`PUBLIC_*` environment variables are inlined into client code.**
   `PUBLIC_` was documented as the public prefix but nothing applied it; the
   new `env.publicPrefixes` (default `["PUBLIC_"]`, see Added) does, so a
@@ -102,6 +109,37 @@ the packages under Dependents in one step.
   key, must handle the RegExp entry.
 
 ### Added
+
+- **The head API covers Next's metadata, and documents carry index.html's
+  head (F-P6-1).** Server-rendered documents ignored the app's `index.html`
+  `<head>`, and `head()` had no way to write a viewport, theme-color or
+  verification tag, so the Fylun port could not emit its viewport
+  `interactive-widget=resizes-content` (the Android keyboard covered the
+  chat composer), both theme-colors, author/creator, `og:locale`,
+  `og:site_name`, og:image dimensions, robots `index, follow` or
+  `google-site-verification`. `SeoMetaInput` gains Next-shaped fields —
+  `viewport` (string or Next's `Viewport` object, replacing the default),
+  `themeColor` (string or `{ media, color }[]`), `authors`, `creator`,
+  `verification` (`google`, `yandex`, `yahoo`, `me`, `other`), `robots`
+  (string as written, or `{ index, follow, … }`), `openGraph.locale`,
+  `openGraph.siteName` and `openGraph.images` (`url`, `width`, `height`,
+  `type`, `alt`) — and a generic `meta` array (`name` / `property` /
+  `httpEquiv`, `content`, `media`) that replaces any field's tag of the same
+  key; `link` already took any link. All values are escaped. `index.html`'s
+  `<title>`, `<meta>` and `<link>` tags (not charset, stylesheets,
+  modulepreload, scripts or styles) are now the lowest head layer in
+  `start`, dev, prerendered pages, streamed responses and the adapter
+  runtimes, as in Vite: a route chain tag with the same key replaces them
+  (a page's `themeColor` replaces every index.html `theme-color`, its title
+  the index.html title, which in turn replaces the URL-guessed one).
+  `neutron-ts build` records the built `index.html` head (after Vite's
+  `%ENV%` and asset-URL rewriting) in `dist/.neutron-document-head.json`.
+  Client navigation now applies the page's whole head: it removed only the
+  first tag per name and never removed one the new page lacks (a previous
+  page's robots `noindex` stayed), skipped viewport changes, and showed
+  title entities (`&amp;`) literally. A `canonical` was and is sent exactly
+  as given (`https://fylun.ai`, no slash added). **Migration:** none, unless
+  index.html holds tags a page must not carry — move those into `head()`.
 
 - **`client.unloadRouteStylesheets`: route stylesheets no longer needed are
   unlinked after client navigation (opt-in, F-B5-1).** Client navigation kept
@@ -411,7 +449,61 @@ the packages under Dependents in one step.
   Destinations without a query behave as before. Applies to `start`, `dev`,
   `preview` and the edge runtimes, which share the resolver.
 
+- **`hono` is a peer dependency of core, and mounts are typed
+  structurally (F-P6-4).** Core depended on its own `hono`, so an app with
+  `hono` in its dependencies could run two copies (always, when core is
+  linked or the versions differ), and `NeutronMountApp` was core's `Hono`
+  class: a sub-app built with the app's copy failed to type-check (TS2322,
+  "Types of property 'get' are incompatible") until cast. `hono`
+  (`^4.12.23`) moved to `peerDependencies`, which is how Hono's own
+  middleware packages declare it, so an installed app and core share the
+  app's copy (npm and pnpm install the peer when the app does not list it).
+  `NeutronMountApp` is now the members Neutron routes a sub-app through
+  (`fetch`, `route`, `routes`), so a different copy still type-checks;
+  routing a foreign instance already worked and is now tested, from
+  `createServer` and the adapter runtime. **Migration:** none; drop
+  `as unknown as NeutronMountApp` casts.
+
 ### Fixed
+
+- **`client.unloadRouteStylesheets` unlinks every route stylesheet the
+  new route does not use, and only those (F-P6-3).** Two gaps made it
+  unusable for Fylun (84 theme-token differences over an 11-stop tour).
+  Vite's preload helper links a route chunk's CSS when the chunk loads,
+  unmarked and before the router links the route's list, so the router
+  added a second, marked link and unlinked only that one: the sheet stayed
+  for good. And a sheet static for one route (in its list) but loaded
+  lazily by the next (a dynamic import's CSS) was unlinked while the new
+  page used it — Vite links an href once per page life, so it never came
+  back. A route stylesheet is now any sheet the build's route-CSS table
+  names, recognised by href however it was linked; the router adopts the
+  link Vite made instead of adding one. `neutron-ts build` records each
+  route's lazy CSS (what its chain's dynamic imports bring in, route
+  modules excluded) as `lazy` in `.neutron-route-css.json`; `start`, the
+  adapter runtimes and the data payload (`__cssLazy__`) pass it on, and the
+  first page names it on the client entry tag (`data-neutron-css-lazy`).
+  Navigation keeps both lists, and relinks lazy sheets it unlinked earlier.
+  Dev is unchanged: CSS Vite injects as `<style>` there is not unlinked.
+- **The app's `not-found.tsx` answers a page's own 404s (F-P6-2).** It
+  rendered only for a path no route matched. A `getStaticPaths` route asked
+  for a param it did not generate got the framework's bare 404 (HTML or
+  problem+json), and a page loader's `notFound()` / `notFoundError()` sent
+  that standalone document, so an app had to rewrite 404s in middleware
+  (Fylun's `not-found-document.ts`). Both now render the nearest
+  `not-found.tsx` with its layouts, status 404, in `start` (server bundle
+  and Vite runtime) and dev; the global middleware runs once, and headers
+  on the loader's 404 (`Set-Cookie`) are kept. A loader's other 404
+  Responses, `notFound()` given a full document of its own, and data
+  requests (the client router reloads the URL as a document on a non-OK
+  answer) are unchanged. Dev now answers a static route's unlisted param
+  with 404, as a build does. `neutron-ts build` writes a static
+  `not-found.tsx` as its directory's `404.html` (a dynamic scope is
+  skipped) — it was prerendered at its directory's own path, the root one
+  colliding with `dist/index.html` — `start` no longer serves a `404.html` as a page
+  at `/404`, `neutron-ts preview` answers unknown paths with the nearest
+  `404.html`, and a prerender loader's 404 writes no page instead of
+  failing the build. **Migration:** none; an app may drop middleware that
+  swapped these 404s for its not-found page.
 
 - **`neutron-ts build` prerenders static pages behind `src/middleware.ts`
   for `neutron-ts start` again.** core/cli 0.4.0 refused any build with a

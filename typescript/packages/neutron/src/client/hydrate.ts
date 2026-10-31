@@ -97,6 +97,17 @@ let latestNavigationRequestId = 0;
 // ── CSS loading for SPA navigation ──
 const loadedStylesheets = new Set<string>();
 const CSS_LOAD_TIMEOUT_MS = 5000;
+// Every route stylesheet the build named (a route's `__css__` list, or its
+// `__cssLazy__` one: CSS its dynamic imports bring in). A link with one of
+// these hrefs is a route stylesheet however it got into the document —
+// linked by the server or the router (`data-neutron-css`), or by Vite's
+// preload helper when a route chunk or a lazy module loaded, which marks
+// nothing. Only these are ever unlinked (client.unloadRouteStylesheets).
+const routeStylesheets = new Set<string>();
+// Route stylesheets this router unlinked. Vite's preload helper inserts a
+// sheet once per href and never again, so a lazy module loaded before keeps
+// importing without its CSS: the router relinks these itself.
+const unlinkedStylesheets = new Set<string>();
 
 function initLoadedStylesheets(): void {
   document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]').forEach((link) => {
@@ -108,7 +119,15 @@ function initLoadedStylesheets(): void {
         loadedStylesheets.add(link.href);
       }
     }
+    if (link.hasAttribute("data-neutron-css")) {
+      routeStylesheets.add(normalizeStylesheetUrl(link.getAttribute("href") || link.href));
+    }
   });
+  // The first page's lazy CSS, named on the client entry's script tag.
+  const lazy = document.querySelector("script[data-neutron-css-lazy]")?.getAttribute("data-neutron-css-lazy");
+  for (const href of lazy ? lazy.split(" ").filter(Boolean) : []) {
+    routeStylesheets.add(normalizeStylesheetUrl(href));
+  }
 }
 
 function normalizeStylesheetUrl(url: string): string {
@@ -119,8 +138,22 @@ function normalizeStylesheetUrl(url: string): string {
   }
 }
 
+function linkedStylesheets(key: string): HTMLLinkElement[] {
+  return Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')).filter(
+    (link) => normalizeStylesheetUrl(link.getAttribute("href") || link.href) === key
+  );
+}
+
 async function loadMissingStylesheets(urls: string[]): Promise<void> {
-  const missing = urls.filter((url) => !loadedStylesheets.has(normalizeStylesheetUrl(url)));
+  const missing = urls.filter((url) => {
+    const key = normalizeStylesheetUrl(url);
+    // Vite's preload helper may have linked it already (the route chunk's CSS,
+    // loaded with the chunk): adopt that link rather than add a second one
+    // that unloading would remove while the first stays.
+    const existing = linkedStylesheets(key);
+    for (const link of existing) link.setAttribute("data-neutron-css", "");
+    return existing.length === 0;
+  });
   if (missing.length === 0) return;
 
   await Promise.race([
@@ -142,6 +175,7 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
               resolve();
             };
             document.head.appendChild(link);
+            unlinkedStylesheets.delete(normalizeStylesheetUrl(url));
           })
       )
     ),
@@ -153,10 +187,30 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
 }
 
 /**
+ * The stylesheets to link before a route renders: its own list, plus the
+ * lazy CSS of its dynamic imports that this router unlinked earlier (Vite
+ * will not link those again). Records both lists as route stylesheets.
+ */
+function routeStylesheetsToLoad(css: string[], lazy: string[]): string[] {
+  for (const href of [...css, ...lazy]) routeStylesheets.add(normalizeStylesheetUrl(href));
+  if (!routerOptions.unloadRouteStylesheets) return css;
+  return [...css, ...lazy.filter((href) => unlinkedStylesheets.has(normalizeStylesheetUrl(href)))];
+}
+
+function readLazyStylesheets(data: Record<string, unknown>): string[] {
+  const lazy = data.__cssLazy__;
+  delete data.__cssLazy__;
+  return Array.isArray(lazy) ? (lazy as string[]) : [];
+}
+
+/**
  * With `client.unloadRouteStylesheets`: once the page navigated to has
- * rendered (the next frame), unlink the route stylesheets it does not list.
- * Only links Neutron created for routes (`data-neutron-css`) are candidates;
- * the client entry's and layouts' stylesheets are in every route's list.
+ * rendered (the next frame), unlink the route stylesheets it uses through
+ * neither path — not in its list (`__css__`), not CSS its dynamic imports
+ * can bring in (`__cssLazy__`). A route stylesheet is recognised by its href
+ * (see `routeStylesheets`), so the links Vite's preload helper inserts go
+ * too; every other link (a `head()` stylesheet, a third-party sheet) stays.
+ * The client entry's and layouts' stylesheets are in every route's list.
  * Unlinking after the render means the outgoing page never loses its styles
  * while it is still on screen, and the incoming page's were loaded before it
  * rendered (loadMissingStylesheets).
@@ -167,12 +221,13 @@ function unloadUnusedStylesheets(keep: string[], requestId: number): void {
   const run = () => {
     // A later navigation owns the document now; it will unload for itself.
     if (requestId !== latestNavigationRequestId) return;
-    document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][data-neutron-css]').forEach((link) => {
+    document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]').forEach((link) => {
       const key = normalizeStylesheetUrl(link.getAttribute("href") || link.href);
-      if (!wanted.has(key)) {
-        link.remove();
-        loadedStylesheets.delete(key);
-      }
+      if (wanted.has(key)) return;
+      if (!link.hasAttribute("data-neutron-css") && !routeStylesheets.has(key)) return;
+      link.remove();
+      loadedStylesheets.delete(key);
+      unlinkedStylesheets.add(key);
     });
   };
   if (typeof requestAnimationFrame === "function") {
@@ -206,6 +261,7 @@ export async function init(): Promise<"static" | void> {
 
   window.__NEUTRON_ROUTER_ACTIVE__ = true;
   initLoadedStylesheets();
+  snapshotHeadTags();
 
   const data = readInitialLoaderData();
   const pathname = getCurrentPath();
@@ -510,85 +566,77 @@ function applyData(data: LoaderData): void {
   markStaticLinks();
 }
 
-/**
- * Apply server-rendered head HTML to the live document.
- * Updates <title>, <meta>, and <link rel="canonical"> tags.
- */
-function applyHeadHtml(headHtml: string): void {
-  // Parse title
-  const titleMatch = headHtml.match(/<title>([^<]*)<\/title>/);
-  if (titleMatch) {
-    document.title = titleMatch[1];
-  }
+// The head tags client navigation manages: the server-rendered document's
+// <meta> (name / property / http-equiv) and <link> (not stylesheets or
+// preloads) tags, and the ones navigation inserted since. Tags other code
+// adds at runtime are never touched.
+const managedHeadTags = new Set<Element>();
 
-  // Collect new meta tags from the head HTML
-  const metaPattern = /<meta\s+([^>]+)>/g;
-  const newMetas: Array<{ attrs: Record<string, string> }> = [];
-  let match: RegExpExecArray | null;
-  while ((match = metaPattern.exec(headHtml)) !== null) {
-    const attrs = parseHtmlAttributes(match[1]);
-    newMetas.push({ attrs });
+function isManagedHeadTag(element: Element): boolean {
+  const tag = element.tagName.toLowerCase();
+  if (tag === "meta") {
+    return (
+      !element.hasAttribute("charset") &&
+      (element.hasAttribute("name") || element.hasAttribute("property") || element.hasAttribute("http-equiv"))
+    );
   }
-
-  // Remove existing managed meta tags (name=, property=) that we'll replace
-  const managedSelectors = new Set<string>();
-  for (const meta of newMetas) {
-    if (meta.attrs.name) {
-      managedSelectors.add(`meta[name="${meta.attrs.name}"]`);
-    } else if (meta.attrs.property) {
-      managedSelectors.add(`meta[property="${meta.attrs.property}"]`);
-    }
+  if (tag === "link") {
+    const rel = (element.getAttribute("rel") || "").toLowerCase().split(/\s+/);
+    return !rel.includes("stylesheet") && !rel.includes("modulepreload") && !rel.includes("preload");
   }
-  for (const selector of managedSelectors) {
-    const existing = document.head.querySelector(selector);
-    if (existing) {
-      existing.remove();
-    }
-  }
-
-  // Insert new meta tags
-  for (const meta of newMetas) {
-    // Skip charset and viewport — these don't change per-page
-    if (meta.attrs.charset || meta.attrs.name === "viewport") continue;
-    const el = document.createElement("meta");
-    for (const [key, value] of Object.entries(meta.attrs)) {
-      el.setAttribute(key, value);
-    }
-    document.head.appendChild(el);
-  }
-
-  // Update canonical link (validate same-origin to prevent open redirects)
-  const canonicalMatch = headHtml.match(/<link\s+rel="canonical"\s+href="([^"]*)"[^>]*>/);
-  let canonical = document.head.querySelector('link[rel="canonical"]');
-  if (canonicalMatch) {
-    let isSameOrigin = false;
-    try {
-      const canonUrl = new URL(canonicalMatch[1], window.location.origin);
-      isSameOrigin = canonUrl.origin === window.location.origin;
-    } catch {
-      // ignore invalid URLs
-    }
-    if (isSameOrigin) {
-      if (!canonical) {
-        canonical = document.createElement("link");
-        canonical.setAttribute("rel", "canonical");
-        document.head.appendChild(canonical);
-      }
-      canonical.setAttribute("href", canonicalMatch[1]);
-    }
-  } else if (canonical) {
-    canonical.remove();
-  }
+  return false;
 }
 
-function parseHtmlAttributes(attrString: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
-  const pattern = /(\w[\w-]*)="([^"]*)"/g;
-  let m: RegExpExecArray | null;
-  while ((m = pattern.exec(attrString)) !== null) {
-    attrs[m[1]] = m[2];
+function snapshotHeadTags(): void {
+  document.head.querySelectorAll("meta, link").forEach((element) => {
+    if (isManagedHeadTag(element)) managedHeadTags.add(element);
+  });
+}
+
+function headTagSignature(element: Element): string {
+  const attrs = Array.from(element.attributes)
+    .map((attr) => `${attr.name.toLowerCase()}=${attr.value}`)
+    .sort();
+  return `${element.tagName.toLowerCase()} ${JSON.stringify(attrs)}`;
+}
+
+/**
+ * Apply server-rendered head HTML (`__head__`, the page's whole resolved
+ * head) to the live document: the title, and every managed <meta>/<link> —
+ * a tag the new head no longer has is removed, one it adds is inserted,
+ * identical ones stay. The HTML is parsed inertly (a <template>), and only
+ * attributes are copied onto fresh elements, never event handlers.
+ */
+function applyHeadHtml(headHtml: string): void {
+  const template = document.createElement("template");
+  template.innerHTML = headHtml;
+  const title = template.content.querySelector("title");
+  if (title) {
+    document.title = title.textContent ?? "";
   }
-  return attrs;
+
+  const incoming = new Map<string, Element>();
+  template.content.querySelectorAll("meta, link").forEach((element) => {
+    if (isManagedHeadTag(element)) incoming.set(headTagSignature(element), element);
+  });
+  for (const element of [...managedHeadTags]) {
+    const signature = headTagSignature(element);
+    if (element.isConnected && incoming.has(signature)) {
+      incoming.delete(signature);
+      continue;
+    }
+    element.remove();
+    managedHeadTags.delete(element);
+  }
+  for (const source of incoming.values()) {
+    const element = document.createElement(source.tagName.toLowerCase());
+    for (const attr of Array.from(source.attributes)) {
+      if (/^on/i.test(attr.name)) continue;
+      element.setAttribute(attr.name, attr.value);
+    }
+    document.head.appendChild(element);
+    managedHeadTags.add(element);
+  }
 }
 
 function safeDecodeSegment(segment: string | undefined): string {
@@ -691,9 +739,10 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
     // CSS should already be loaded from the prefetch, but a route whose
     // stylesheet was evicted or never fetched still must not paint unstyled.
     const prefetchCss = (prefetched as Record<string, unknown>).__css__;
+    const prefetchLazyCss = readLazyStylesheets(prefetched as Record<string, unknown>);
     if (Array.isArray(prefetchCss)) {
       try {
-        await loadMissingStylesheets(prefetchCss as string[]);
+        await loadMissingStylesheets(routeStylesheetsToLoad(prefetchCss as string[], prefetchLazyCss));
       } catch {
         // CSS timeout — fall back to full page load (guaranteed no FOUC)
         if (isCurrent()) window.location.href = nextUrl;
@@ -707,7 +756,7 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
     const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, prefetched);
     commit(merged);
     if (Array.isArray(prefetchCss)) {
-      unloadUnusedStylesheets(prefetchCss as string[], requestId);
+      unloadUnusedStylesheets([...(prefetchCss as string[]), ...prefetchLazyCss], requestId);
     }
     setNavigationState({ state: "idle" });
     if (activeNavigationController === controller) activeNavigationController = null;
@@ -769,9 +818,10 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
 
       // Load CSS for the new route before DOM swap
       const cssUrls = (data as Record<string, unknown>).__css__;
+      const lazyCssUrls = readLazyStylesheets(data as Record<string, unknown>);
       if (Array.isArray(cssUrls)) {
         try {
-          await loadMissingStylesheets(cssUrls as string[]);
+          await loadMissingStylesheets(routeStylesheetsToLoad(cssUrls as string[], lazyCssUrls));
         } catch {
           // CSS timeout — fall back to full page load (guaranteed no FOUC)
           if (isCurrent()) window.location.href = nextUrl;
@@ -788,7 +838,7 @@ async function handleNavigation(forceRevalidate: boolean = false, navigationIden
       const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, data);
       commit(merged);
       if (Array.isArray(cssUrls)) {
-        unloadUnusedStylesheets(cssUrls as string[], requestId);
+        unloadUnusedStylesheets([...(cssUrls as string[]), ...lazyCssUrls], requestId);
       }
       if (previousPathname !== pathname) {
         window.scrollTo({ top: 0, left: 0, behavior: "auto" });

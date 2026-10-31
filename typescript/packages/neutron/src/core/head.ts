@@ -7,7 +7,7 @@
 // Keeping it in one place is what stops head output from drifting between the
 // request-serving and build-time paths.
 import type { Route, RouteModule, AppContext } from "./types.js";
-import { mergeSeoMetaInput, renderDocumentHead, type SeoMetaInput } from "./seo.js";
+import { mergeSeoMetaInput, renderDocumentHead, type SeoMetaInput, type DocumentHeadTag } from "./seo.js";
 
 /** A route paired with its already-loaded module (undefined if not loaded). */
 export interface HeadRouteEntry {
@@ -31,6 +31,11 @@ export interface ResolveHeadHtmlOptions {
    * Undefined for SSG — no nonce middleware runs at build time.
    */
   nonce?: string;
+  /**
+   * The app's index.html head tags (document-head.ts), the layer under the
+   * route chain's.
+   */
+  documentHead?: DocumentHeadTag[];
 }
 
 /** Resolved document head: rendered <head> HTML plus the merged SEO input. */
@@ -88,7 +93,7 @@ export async function resolveHeadDocument(
   }
 
   return {
-    headHtml: renderDocumentHead(options.pathname, mergedSeo, headFragments, options.nonce),
+    headHtml: renderDocumentHead(options.pathname, mergedSeo, headFragments, options.nonce, options.documentHead),
     seo: mergedSeo,
   };
 }

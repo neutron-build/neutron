@@ -78,6 +78,8 @@ export default defineConfig({
 
 Mount prefixes are validated at startup: two mounts may not overlap, and a prefix may not cover a reserved framework path (`/health`, `/openapi.json`, `/docs`, `/_neutron/image`, `/__neutron_island`, `/assets`, `/public`) — the server refuses to start with an error naming the conflict. A request under a mounted prefix that the sub-app does not match falls through to the app's routes, so a mount adds endpoints without claiming the namespace.
 
+`hono` is a peer dependency of `@neutron-build/core` (`^4.12.23`), as it is of every Hono middleware package: the app's own `hono` is the copy core uses, so a sub-app and the server share one Hono instance. A mount is typed structurally (`NeutronMountApp`: anything with Hono's `fetch`, `route` and `routes`), so a sub-app built with a different copy — a linked framework, another 4.x version — type-checks without a cast.
+
 **Global middleware runs before mounts.** The app's `src/middleware.ts` runs ahead of every mounted sub-app, outermost, with the real request: an auth gate there covers mounted APIs like it covers pages and resource routes (FRAMEWORK_CONTRACT §5). A response the middleware returns without calling `next()` answers instead of the sub-app; a request the sub-app does not match falls through to the routes with the chain already run, so it runs once. A sub-app that enforces its own authentication can opt out per mount:
 
 ```ts

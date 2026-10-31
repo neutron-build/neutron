@@ -1149,3 +1149,219 @@ describe("hydrate — route stylesheets after navigation", () => {
     expect(await navigateToTarget(true)).toEqual(["/assets/shared.css", "/assets/target.css", "/fonts.css"]);
   });
 });
+
+/**
+ * F-P6-3: what a production build does to the document during client
+ * navigation, with `client.unloadRouteStylesheets`. Three routes each bring
+ * a theme sheet that redefines the same tokens; `modal.css` is static for /a
+ * (in its list) and lazy for /b (a dynamic import /b's page loads, listed in
+ * `__cssLazy__`). Route chunks and lazy modules load through a stand-in for
+ * Vite's preload helper with its real rules: it links a chunk's CSS
+ * unmarked, skips an href already linked, and never links an href twice in
+ * a page's life (its `seen` map). After A→B→C→A→C→B the document must hold
+ * exactly the current route's sheets: no other theme left behind (the
+ * cascade is then the same as on a fresh load), none of its own missing.
+ */
+describe("hydrate — route stylesheets across chunk-loaded routes (F-P6-3)", () => {
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const SHARED = "/assets/shared.css";
+  const MODAL = "/assets/modal.css";
+  const theme = (route: string) => `/assets/theme-${route}.css`;
+
+  // Vite's __vitePreload, CSS half (vite/src/node/plugins/importAnalysisBuild.ts).
+  const seen = new Set<string>();
+  function vitePreload(hrefs: string[]): void {
+    for (const href of hrefs) {
+      if (seen.has(href)) continue;
+      seen.add(href);
+      const linked = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')).some(
+        (link) => new URL(link.href, location.origin).pathname === href
+      );
+      if (linked) continue;
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.crossOrigin = "";
+      link.href = href;
+      document.head.appendChild(link);
+    }
+  }
+
+  const payloads: Record<string, Record<string, unknown>> = {
+    "/a": { "route:/a": {}, __css__: [SHARED, theme("a"), MODAL] },
+    "/b": { "route:/b": {}, __css__: [SHARED, theme("b")], __cssLazy__: [MODAL] },
+    "/c": { "route:/c": {}, __css__: [SHARED, theme("c")] },
+  };
+
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h, preactHooks } = deps;
+    const page = (name: string) => () => h("p", { class: "title" }, name);
+    // /b's page opens its lazily imported modal when it mounts.
+    function PageB() {
+      preactHooks.useEffect(() => vitePreload([MODAL]), []);
+      return h("p", { class: "title" }, "B");
+    }
+    const chunk = (css: string[], component: ComponentType) => async () => {
+      vitePreload(css);
+      return { default: component };
+    };
+    return {
+      "route:/a": { path: "/a", mode: "app", default: page("A"), load: chunk([SHARED, theme("a"), MODAL], page("A")) },
+      "route:/b": { path: "/b", mode: "app", default: PageB, load: chunk([SHARED, theme("b")], PageB) },
+      "route:/c": { path: "/c", mode: "app", default: page("C"), load: chunk([SHARED, theme("c")], page("C")) },
+    };
+  }
+
+  const sheets = () =>
+    Array.from(document.head.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]'))
+      .map((link) => new URL(link.href, location.origin).pathname)
+      .sort();
+
+  it("leaves exactly the current route's sheets after A→B→C→A→C→B", async () => {
+    seen.clear();
+    document.head.innerHTML = [SHARED, theme("a"), MODAL]
+      .map((href) => `<link rel="stylesheet" href="${href}" data-neutron-css>`)
+      .join("");
+    // No stylesheet server here (happy-dom's own fetch of a sheet fails and
+    // logs): report each linked sheet loaded.
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (node instanceof HTMLLinkElement) setTimeout(() => node.dispatchEvent(new Event("load")), 0);
+        });
+      }
+    });
+    observer.observe(document.head, { childList: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string) => jsonResponse(structuredClone(payloads[new URL(input, location.origin).pathname])))
+    );
+    const frames: FrameRequestCallback[] = [];
+    const booted = await bootRouter({ pathname: "/a", routeId: "route:/a", data: { "route:/a": {} }, routes });
+    (await import("./router-options.js")).configureRouter({ unloadRouteStylesheets: true });
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+
+    const go = async (to: string) => {
+      clickAnchor(addAnchor(to));
+      for (let i = 0; i < 8; i++) await flush();
+      expect(booted.app.querySelector(".title")?.textContent).toBe(to.slice(1).toUpperCase());
+      for (const frame of frames.splice(0)) frame(performance.now());
+      await flush();
+      return sheets();
+    };
+
+    try {
+      expect(await go("/b")).toEqual([MODAL, SHARED, theme("b")].sort());
+      expect(await go("/c")).toEqual([SHARED, theme("c")].sort());
+      expect(await go("/a")).toEqual([MODAL, SHARED, theme("a")].sort());
+      expect(await go("/c")).toEqual([SHARED, theme("c")].sort());
+      // /b's modal was imported before: Vite will not link its CSS again.
+      expect(await go("/b")).toEqual([MODAL, SHARED, theme("b")].sort());
+    } finally {
+      observer.disconnect();
+    }
+  });
+});
+
+/**
+ * F-P6-1: client navigation applies the page's whole resolved head
+ * (`__head__`): every managed <meta>/<link> the new head no longer has goes
+ * (a previous page's robots noindex, both theme-colors), each one it adds
+ * arrives, identical ones stay in place, and tags other code inserted at
+ * runtime are left alone. Entities in the title are decoded.
+ */
+describe("hydrate — head tags after navigation (F-P6-1)", () => {
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h } = deps;
+    return {
+      "route:/settings": { path: "/settings", mode: "app", default: () => h("p", { class: "title" }, "Settings") },
+      "route:/chat": { path: "/chat", mode: "app", default: () => h("p", { class: "title" }, "Chat") },
+    };
+  }
+
+  it("replaces the previous page's managed head tags with the new page's", async () => {
+    document.head.innerHTML = [
+      '<meta charset="UTF-8">',
+      '<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">',
+      "<title>Settings | Fylun</title>",
+      '<meta name="theme-color" media="(prefers-color-scheme: light)" content="#fff">',
+      '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000">',
+      '<meta name="robots" content="noindex">',
+      '<meta property="og:site_name" content="Fylun">',
+      '<link rel="canonical" href="https://fylun.ai/settings">',
+      '<link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml">',
+    ].join("");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          "route:/chat": {},
+          __head__: [
+            '<meta charset="UTF-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">',
+            "<title>Chat &amp; more | Fylun</title>",
+            '<meta name="theme-color" media="(prefers-color-scheme: light)" content="white">',
+            '<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0a0a0a">',
+            '<meta property="og:site_name" content="Fylun">',
+            '<meta name="google-site-verification" content="g-token">',
+            '<link rel="canonical" href="https://fylun.ai">',
+            '<link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml">',
+            '<script type="application/ld+json">{}</script>',
+          ].join("\n"),
+        })
+      )
+    );
+    const booted = await bootRouter({ pathname: "/settings", routeId: "route:/settings", data: { "route:/settings": {} }, routes });
+    const siteName = document.head.querySelector('meta[property="og:site_name"]');
+    // Inserted at runtime by other code (an analytics snippet, say).
+    const foreign = document.createElement("meta");
+    foreign.setAttribute("name", "third-party");
+    foreign.setAttribute("content", "kept");
+    document.head.appendChild(foreign);
+
+    clickAnchor(addAnchor("/chat"));
+    for (let i = 0; i < 4; i++) await flush();
+    expect(booted.app.querySelector(".title")?.textContent).toBe("Chat");
+
+    expect(document.title).toBe("Chat & more | Fylun");
+    const metas = (selector: string) =>
+      Array.from(document.head.querySelectorAll(selector)).map((element) => element.getAttribute("content") ?? element.getAttribute("href"));
+    expect(metas('meta[name="theme-color"]').sort()).toEqual(["#0a0a0a", "white"]);
+    expect(metas('meta[name="robots"]')).toEqual([]);
+    expect(metas('meta[name="google-site-verification"]')).toEqual(["g-token"]);
+    expect(metas('link[rel="canonical"]')).toEqual(["https://fylun.ai"]);
+    expect(metas('meta[name="viewport"]')).toEqual(["width=device-width, initial-scale=1, interactive-widget=resizes-content"]);
+    expect(metas('link[rel="search"]')).toEqual(["/opensearch.xml"]);
+    expect(document.head.querySelectorAll("meta[charset]")).toHaveLength(1);
+    // Unchanged tags are the same elements; other code's are untouched.
+    expect(document.head.querySelector('meta[property="og:site_name"]')).toBe(siteName);
+    expect(foreign.isConnected).toBe(true);
+    expect(document.head.querySelector('script[type="application/ld+json"]')).toBeNull();
+  });
+});

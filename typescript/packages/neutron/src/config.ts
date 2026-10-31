@@ -143,8 +143,12 @@ export interface NeutronClientConfig {
    * pages (sections redefining the same `:root` tokens) resolve by load
    * order. `true` gives each page the cascade of a fresh load, at the cost of
    * re-requesting a sheet (normally from the HTTP cache) when you navigate
-   * back. The client entry's and layouts' stylesheets are in every route's
-   * list and stay; links added by `head()` are never touched.
+   * back. A route stylesheet is any sheet the build's route-CSS table names,
+   * however it was linked (by the server, the router, or Vite's preload of a
+   * route chunk or lazy module); one the new route can bring in through a
+   * dynamic import is kept. The client entry's and layouts' stylesheets are
+   * in every route's list and stay; links added by `head()` are never
+   * touched.
    */
   unloadRouteStylesheets?: boolean;
 }

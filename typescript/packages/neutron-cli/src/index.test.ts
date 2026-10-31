@@ -2398,11 +2398,30 @@ import { routes } from "virtual:neutron/routes";
 registerRoutes(routes);
 void init();
 `,
-      "src/routes/shop.tsx": sectionRoute("shop", "app"),
-      "src/routes/docs.tsx": sectionRoute("docs", "app"),
+      // modal.css: static for /shop, lazy for /docs (F-P6-3).
+      "src/styles/modal.css": ".from-modal { color: red; }\n",
+      "src/Modal.tsx": `import { h } from "preact";
+import "./styles/modal.css";
+export function Modal() { return h("dialog", { class: "from-modal" }, "modal"); }
+`,
+      "src/routes/shop.tsx": sectionRoute("shop", "app").replace(
+        'import { Shared } from "../Shared";',
+        'import { Shared } from "../Shared";\nimport { Modal } from "../Modal";\nexport const modal = Modal;'
+      ),
+      "src/routes/docs.tsx": `${sectionRoute("docs", "app")}export const openModal = () => import("../Modal");\n`,
     });
     try {
       await runBuild(dir);
+      const routeCss = JSON.parse(fs.readFileSync(path.join(dir, "dist", ".neutron-route-css.json"), "utf-8")) as {
+        routes: Record<string, string[]>;
+        lazy?: Record<string, string[]>;
+      };
+      const routeIdOf = (section: string) => Object.keys(routeCss.routes).find((id) => id.includes(section))!;
+      const isModal = (href: string) => fs.readFileSync(path.join(dir, "dist", href), "utf-8").includes(".from-modal");
+      assert.ok(routeCss.routes[routeIdOf("shop")].some(isModal), JSON.stringify(routeCss));
+      assert.ok(!routeCss.routes[routeIdOf("docs")].some(isModal), JSON.stringify(routeCss));
+      const docsLazy = routeCss.lazy?.[routeIdOf("docs")] ?? [];
+      assert.ok(docsLazy.length === 1 && isModal(docsLazy[0]), JSON.stringify(routeCss));
       const about = fs.readFileSync(path.join(dir, "dist", "about", "index.html"), "utf-8");
       assertSectionCss(linkedCss(dir, stylesheetLinks(about)), null, "static /about");
 
@@ -2422,6 +2441,10 @@ void init();
             await (await fetch(`http://127.0.0.1:${port}/${section}`, { headers: { accept: "application/json" } })).json()
           );
           assert.deepEqual(data.__css__, hrefs);
+          if (section === "docs") {
+            assert.deepEqual((data as { __cssLazy__?: string[] }).__cssLazy__, docsLazy);
+            assert.ok(html.includes(`data-neutron-css-lazy="${docsLazy[0]}"`), html);
+          }
         }
       } finally {
         proc.child.kill("SIGTERM");
@@ -2985,6 +3008,176 @@ export default { websocket: { path: "/ws", attach(wss) { wss.on("connection", ()
       const build = runCli("build", dir, {}, ["--preset", "netlify"]);
       assert.notEqual(await build.exited, 0, build.output());
       assert.match(build.output(), /The netlify adapter cannot serve the websocket src\/server\.entry\.ts declares/, build.output());
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("neutron-ts build + start + preview (process): the app's not-found page (F-P6-2)", () => {
+  it("prerenders not-found.tsx as 404.html and renders it for a page's 404s", { timeout: 240_000 }, async () => {
+    const previewPort = await freePort();
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "not-found-fixture", type: "module" }),
+      "neutron.config.ts": `export default { server: { port: ${previewPort} } };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/_layout.tsx": `
+import { h } from "preact";
+export default function Layout({ children }) { return h("main", null, h("nav", null, "site-chrome"), children); }
+`,
+      // Default (static) mode: prerendered, and rendered per request by start.
+      "src/routes/not-found.tsx": `
+import { h } from "preact";
+export function head() { return { title: "Missing page" }; }
+export default function NotFound() { return h("p", null, "custom-missing"); }
+`,
+      "src/routes/index.tsx": `
+import { h } from "preact";
+export default function Home() { return h("p", null, "home-page"); }
+`,
+      "src/routes/models/[id].tsx": `
+import { h } from "preact";
+import { notFound } from "@neutron-build/core";
+export async function getStaticPaths() { return { paths: [{ params: { id: "known" } }, { params: { id: "retired" } }] }; }
+export async function loader({ params }) {
+  if (params.id === "retired") throw notFound();
+  return { id: params.id };
+}
+export default function Model({ data }) { return h("p", null, "model " + data.id); }
+`,
+      "src/routes/items/[id].tsx": `
+import { h } from "preact";
+import { notFound } from "@neutron-build/core";
+export const config = { mode: "app" };
+export async function loader({ params }) {
+  if (params.id === "missing") throw notFound();
+  return { id: params.id };
+}
+export default function Item({ data }) { return h("p", null, "item " + data.id); }
+`,
+    });
+    const get = async (base: string, p: string) => {
+      const res = await fetch(`${base}${p}`, { headers: { accept: "text/html" } });
+      return { status: res.status, body: await res.text() };
+    };
+    const assertNotFoundPage = (page: { status: number; body: string }, label: string) => {
+      assert.equal(page.status, 404, `${label}: ${page.body.slice(0, 300)}`);
+      assert.ok(page.body.includes("custom-missing"), `${label}: ${page.body}`);
+      assert.ok(page.body.includes("site-chrome"), `${label}: ${page.body}`);
+      assert.ok(page.body.includes("<title>Missing page</title>"), `${label}: ${page.body}`);
+    };
+    try {
+      const output = await runBuild(dir);
+      // The not-found page is its directory's 404.html, not the page at "/".
+      const notFoundHtml = fs.readFileSync(path.join(dir, "dist", "404.html"), "utf-8");
+      assert.ok(notFoundHtml.includes("custom-missing") && notFoundHtml.includes("site-chrome"), notFoundHtml);
+      assert.ok(fs.readFileSync(path.join(dir, "dist", "index.html"), "utf-8").includes("home-page"));
+      assert.ok(fs.existsSync(path.join(dir, "dist", "models", "known", "index.html")));
+      // A prerender loader's notFound(): no page written, the host answers 404.html.
+      assert.ok(!fs.existsSync(path.join(dir, "dist", "models", "retired")), output);
+
+      const port = await freePort();
+      const start = runCli("start", dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+      try {
+        const base = `http://127.0.0.1:${port}`;
+        await waitForHealth(`${base}/health`, start);
+        assert.match(start.output(), /Modules: prebuilt server bundle/, start.output());
+        assertNotFoundPage(await get(base, "/models/unknown"), "start: ungenerated param");
+        assertNotFoundPage(await get(base, "/models/retired"), "start: prerender 404");
+        assertNotFoundPage(await get(base, "/items/missing"), "start: loader notFound()");
+        assertNotFoundPage(await get(base, "/no/such/page"), "start: unmatched");
+        assert.equal((await get(base, "/404")).status, 404, "404.html is not a page at /404");
+        assert.equal((await get(base, "/models/known")).status, 200);
+      } finally {
+        start.child.kill("SIGTERM");
+        await start.exited;
+      }
+
+      const preview = runCli("preview", dir, { NEUTRON_HOST: "127.0.0.1" });
+      try {
+        const base = `http://127.0.0.1:${previewPort}`;
+        await waitForHealth(`${base}/`, preview);
+        assertNotFoundPage(await get(base, "/models/unknown"), "preview: unknown path");
+      } finally {
+        preview.child.kill("SIGTERM");
+        await preview.exited;
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("neutron-ts build + start (process): index.html head in documents (F-P6-1)", () => {
+  it("records the built index.html head and renders it in prerendered and server-bundle pages", { timeout: 240_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "document-head-fixture", type: "module" }),
+      "index.html": `<!doctype html><html lang="en"><head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="white" />
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0a0a0a" />
+<meta name="google-site-verification" content="%VITE_SITE_VERIFICATION%" />
+<title>Fylun</title>
+</head><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>
+`,
+      ".env": "VITE_SITE_VERIFICATION=g-token\n",
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      "src/routes/index.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export function head() { return { title: "Home", themeColor: "#123456" }; }
+export default function Home() { return h("p", null, "home-page"); }
+`,
+      "src/routes/about.tsx": `
+import { h } from "preact";
+export function head() { return { openGraph: { siteName: "Fylun", locale: "en_US" } }; }
+export default function About() { return h("p", null, "about-page"); }
+`,
+    });
+    const headOf = (html: string) => /<head>([\s\S]*?)<\/head>/.exec(html)?.[1] ?? "";
+    const count = (html: string, pattern: RegExp) => html.match(pattern)?.length ?? 0;
+    try {
+      await runBuild(dir);
+      const recorded = fs.readFileSync(path.join(dir, "dist", ".neutron-document-head.json"), "utf-8");
+      // From the built index.html: Vite replaced the %ENV% placeholder.
+      assert.ok(recorded.includes("g-token") && !recorded.includes("%VITE_"), recorded);
+      assert.ok(!recorded.includes("<script"), recorded);
+
+      const about = headOf(fs.readFileSync(path.join(dir, "dist", "about", "index.html"), "utf-8"));
+      assert.equal(count(about, /name="viewport"/g), 1, about);
+      assert.ok(about.includes("interactive-widget=resizes-content"), about);
+      assert.equal(count(about, /name="theme-color"/g), 2, about);
+      assert.ok(about.includes('content="g-token"'), about);
+      assert.ok(about.includes("<title>Fylun</title>"), about);
+      assert.ok(about.includes('<meta property="og:site_name" content="Fylun">'), about);
+      assert.ok(about.includes('<meta property="og:locale" content="en_US">'), about);
+
+      const port = await freePort();
+      const start = runCli("start", dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, start);
+        assert.match(start.output(), /Modules: prebuilt server bundle/, start.output());
+        const home = headOf(await (await fetch(`http://127.0.0.1:${port}/`, { headers: { accept: "text/html" } })).text());
+        assert.equal(count(home, /<title>/g), 1, home);
+        assert.ok(home.includes("<title>Home</title>"), home);
+        assert.equal(count(home, /name="theme-color"/g), 1, home);
+        assert.ok(home.includes('<meta name="theme-color" content="#123456">'), home);
+        assert.ok(home.includes("interactive-widget=resizes-content"), home);
+        assert.ok(home.includes('content="g-token"'), home);
+      } finally {
+        start.child.kill("SIGTERM");
+        await start.exited;
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

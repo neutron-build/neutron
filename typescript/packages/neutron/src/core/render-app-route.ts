@@ -22,11 +22,12 @@ import {
   buildHtmlOpenTag,
   buildBodyOpenTag,
   type SeoMetaInput,
+  type DocumentHeadTag,
 } from "./seo.js";
 import { resolveHeadDocument } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
 import { isProblemError } from "./problem.js";
-import { isResponse } from "./response.js";
+import { isNotFoundSignal, isResponse } from "./response.js";
 import { withRouterProviders, type CreateElement } from "./router-providers.js";
 import { renderToString } from "preact-render-to-string";
 import type { StreamRenderFn } from "./preact-ssr.js";
@@ -97,6 +98,14 @@ export interface RenderHooks {
 export interface RenderAppRouteOptions {
   clientEntryScriptSrc: string | null;
   stylesheetHrefs?: string[];
+  /**
+   * Stylesheets the route's dynamic imports can bring in (the build's
+   * route-CSS table, `lazy`): not linked, but sent to the client router so
+   * `client.unloadRouteStylesheets` never unlinks one the page still uses.
+   */
+  lazyStylesheetHrefs?: string[];
+  /** The app's index.html head tags (document-head.ts), under the route chain's. */
+  documentHead?: DocumentHeadTag[];
   loaderDataCache: NeutronLoaderCacheStore;
   requestTrace: RenderRequestTrace;
   hooks?: RenderHooks;
@@ -135,6 +144,44 @@ export interface RenderAppRouteOptions {
     generation?: string;
     stillValid: () => boolean;
   };
+  /**
+   * Renders the app's nearest not-found page for this request (F-P6-2), or
+   * resolves null when the app has none. Called when a page loader returns
+   * or throws a not-found signal (`notFound()`, a 404 `ProblemError`) on a
+   * document request, from inside this request's middleware chain — the
+   * host renders the not-found route with `middleware: false`. Absent, the
+   * loader's response is sent as is.
+   */
+  renderNotFound?: (request: Request) => Promise<Response | null>;
+  /**
+   * `false` skips the global and route middleware: the caller already ran
+   * the chain for this request (a not-found render nested in another
+   * route's). Default `true`.
+   */
+  middleware?: boolean;
+}
+
+/**
+ * The not-found page answering a loader's not-found signal: 404 when the
+ * page rendered (a redirect or error from its own loader passes through),
+ * with the signal response's headers — Set-Cookie and anything middleware
+ * added — carried over, except the body's own Content-Type/Length.
+ */
+export function asNotFoundResponse(page: Response, signal: Response | null): Response {
+  const headers = new Headers(page.headers);
+  if (signal) {
+    signal.headers.forEach((value, name) => {
+      const key = name.toLowerCase();
+      if (key === "content-type" || key === "content-length") return;
+      if (key === "set-cookie") headers.append(name, value);
+      else headers.set(name, value);
+    });
+  }
+  return new Response(page.body, {
+    status: page.status === 200 ? 404 : page.status,
+    statusText: page.status === 200 ? "Not Found" : page.statusText,
+    headers,
+  });
 }
 
 export function toError(value: unknown): Error {
@@ -591,7 +638,8 @@ function buildHtmlSuffix(
   clientEntryScriptSrc: string | null = null,
   includeClientRuntime: boolean = true,
   nonce?: string,
-  clientTier: "none" | "static" | "full" = "full"
+  clientTier: "none" | "static" | "full" = "full",
+  lazyStylesheetHrefs: string[] = []
 ): string {
   if (!includeClientRuntime) {
     return `</div>
@@ -612,8 +660,13 @@ function buildHtmlSuffix(
     Object.keys(allData).length > 0
       ? `<script${na}>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`
       : "";
+  // The page's lazy route CSS rides on the entry tag for the client router
+  // (hydrate.ts initLoadedStylesheets).
+  const lazyCss = lazyStylesheetHrefs.length > 0
+    ? ` data-neutron-css-lazy="${escapeHtml(lazyStylesheetHrefs.join(" "))}"`
+    : "";
   const clientScript = clientEntryScriptSrc
-    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"></script>`
+    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"${lazyCss}></script>`
     : "";
 
   // A static-tier document ships no router, so nothing intercepts its links.
@@ -651,7 +704,8 @@ function wrapHtml(
   nonce?: string,
   seo: SeoMetaInput | null = null,
   stylesheetHrefs: string[] = [],
-  clientTier: "none" | "static" | "full" = "full"
+  clientTier: "none" | "static" | "full" = "full",
+  lazyStylesheetHrefs: string[] = []
 ): string {
   return `${buildHtmlPrefix(pathname, headHtml, seo, stylesheetHrefs)}${content}${buildHtmlSuffix(
     loaderData,
@@ -659,7 +713,8 @@ function wrapHtml(
     clientEntryScriptSrc,
     includeClientRuntime,
     nonce,
-    clientTier
+    clientTier,
+    lazyStylesheetHrefs
   )}`;
 }
 
@@ -751,6 +806,7 @@ interface RenderAppRouteHtmlResponseArgs {
   actionData?: unknown;
   clientEntryScriptSrc: string | null;
   stylesheetHrefs: string[];
+  lazyStylesheetHrefs?: string[];
   includeClientRuntime: boolean;
   /** Which client runtime this document ships. See `resolveClientTier`. */
   clientTier?: "none" | "static" | "full";
@@ -787,7 +843,8 @@ async function renderAppRouteHtmlResponse(
       args.nonce,
       args.seo ?? null,
       args.stylesheetHrefs,
-      args.clientTier ?? "full"
+      args.clientTier ?? "full",
+      args.lazyStylesheetHrefs
     );
   };
 
@@ -808,7 +865,8 @@ async function renderAppRouteHtmlResponse(
     args.clientEntryScriptSrc,
     args.includeClientRuntime,
     args.nonce,
-    args.clientTier ?? "full"
+    args.clientTier ?? "full",
+    args.lazyStylesheetHrefs
   );
 
   let reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -862,6 +920,7 @@ export async function renderAppRoute(
   const {
     clientEntryScriptSrc,
     stylesheetHrefs = [],
+    lazyStylesheetHrefs = [],
     loaderDataCache,
     requestTrace,
     hooks,
@@ -869,6 +928,7 @@ export async function renderAppRoute(
     responseCache,
     loaderCacheFence,
     renderer,
+    renderNotFound,
   } = opts;
   const allRoutes = [...match.layouts, match.route];
   const clientTier = resolveClientTier(allRoutes);
@@ -879,10 +939,10 @@ export async function renderAppRoute(
   const h = renderer?.h ?? staticH;
   const mountProviders = renderer?.withRouterProviders ?? withRouterProviders;
   const middlewares: MiddlewareFn[] = [];
-  if (globalMiddleware && globalMiddleware.length > 0) {
+  if (opts.middleware !== false && globalMiddleware && globalMiddleware.length > 0) {
     middlewares.push(...globalMiddleware);
   }
-  for (const route of allRoutes) {
+  for (const route of opts.middleware === false ? [] : allRoutes) {
     const module = routeModules.get(route.id);
     if (module?.middleware) {
       middlewares.push(module.middleware);
@@ -1206,6 +1266,24 @@ export async function renderAppRoute(
     // Wait for ALL loaders to complete in parallel
     const loaderResults = await Promise.all(loaderPromises);
 
+    // A page loader's notFound() / 404 ProblemError on a document request:
+    // the app's not-found page answers, as for an unmatched path. Data
+    // requests keep the signal response; the client router reloads the URL
+    // as a document on a non-OK answer, which lands here.
+    if (renderNotFound && isReadMethod && !isJsonRequest(request)) {
+      for (const result of loaderResults) {
+        const response = (result as { response?: Response }).response;
+        if (!response && !("error" in result)) continue;
+        // The first loader that answered decides, as below.
+        const signal = response ?? (result as { error: unknown }).error;
+        if (isNotFoundSignal(signal)) {
+          const page = await renderNotFound(request);
+          if (page) return asNotFoundResponse(page, isResponse(signal) ? signal : null);
+        }
+        break;
+      }
+    }
+
     // Check for errors and build data map
     const loaderData: Record<string, unknown> = {};
     for (const result of loaderResults) {
@@ -1271,6 +1349,7 @@ export async function renderAppRoute(
         loaderData,
         actionData,
         nonce: cspNonce,
+        documentHead: opts.documentHead,
       }
     );
 
@@ -1282,6 +1361,9 @@ export async function renderAppRoute(
       payload.__head__ = headHtml;
       if (stylesheetHrefs.length > 0) {
         payload.__css__ = stylesheetHrefs;
+      }
+      if (lazyStylesheetHrefs.length > 0) {
+        payload.__cssLazy__ = lazyStylesheetHrefs;
       }
       routeHeaders.set("Content-Type", "application/json");
       return new Response(encodeSerializedPayloadAsJson(payload), {
@@ -1340,6 +1422,7 @@ export async function renderAppRoute(
         seo,
         clientEntryScriptSrc,
         stylesheetHrefs,
+        lazyStylesheetHrefs,
         includeClientRuntime,
         clientTier,
         headers: routeHeaders,

@@ -160,11 +160,19 @@ export async function preview(): Promise<void> {
       });
     } else {
       res.statusCode = 404;
-      res.setHeader("Content-Type", "text/plain");
       applyRouteRuleHeaders(
         res,
         resolveRouteRuleHeaders(compiledRouteRules, pathname)
       );
+      // The nearest prerendered not-found page (`<dir>/404.html`, written
+      // from not-found.tsx), as static hosts answer an unknown path.
+      const notFoundPage = findNotFoundPage(distDir, effectivePathname);
+      if (notFoundPage) {
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.end(fs.readFileSync(notFoundPage));
+        return;
+      }
+      res.setHeader("Content-Type", "text/plain");
       res.end("Not Found");
     }
   });
@@ -271,4 +279,15 @@ function isWithinDirectory(baseDir: string, candidatePath: string): boolean {
     relative === "" ||
     (!relative.startsWith("..") && !path.isAbsolute(relative))
   );
+}
+
+function findNotFoundPage(distDir: string, pathname: string): string | null {
+  const segments = pathname.split("/").filter(Boolean);
+  for (let depth = segments.length; depth >= 0; depth--) {
+    const candidate = path.join(distDir, ...segments.slice(0, depth), "404.html");
+    if (isWithinDirectory(distDir, candidate) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      return candidate;
+    }
+  }
+  return null;
 }

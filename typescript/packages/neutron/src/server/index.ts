@@ -12,6 +12,8 @@ import {
   isJsonRequest,
   isMutationMethod,
   toError,
+  asNotFoundResponse,
+  type RenderAppRouteOptions,
   type RouteRenderer,
 } from "../core/render-app-route.js";
 import * as path from "node:path";
@@ -81,7 +83,9 @@ import {
   mergeSeoMetaInput,
   renderDocumentHead,
   type SeoMetaInput,
+  type DocumentHeadTag,
 } from "../core/seo.js";
+import { DOCUMENT_HEAD_FILE, parseDocumentHead } from "../core/document-head.js";
 import {
   encodeSerializedPayloadAsJson,
   serializeForInlineScript,
@@ -105,6 +109,7 @@ import {
   ROUTE_CSS_MANIFEST,
   parseRouteCssManifest,
   routeStylesheetHrefs,
+  routeLazyStylesheetHrefs,
   type RouteCssManifest,
 } from "../core/route-css.js";
 import type {
@@ -156,9 +161,15 @@ export {
   type ServerActionsManifest,
 } from "../core/server-action-protocol.js";
 export {
+  DOCUMENT_HEAD_FILE,
+  extractDocumentHead,
+  serializeDocumentHead,
+} from "../core/document-head.js";
+export {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
   collectChunkCss,
+  collectDynamicChunkCss,
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
@@ -361,12 +372,22 @@ export interface NeutronMount {
 }
 
 /**
- * A Hono sub-app accepted by {@link NeutronServerOptions.mount}. Any Hono
- * instance works (`new Hono()` with whatever bindings/variables it needs) —
- * `any` generics keep user sub-apps assignable regardless of their own types.
+ * A Hono sub-app accepted by {@link NeutronServerOptions.mount}: any Hono 4
+ * instance (`new Hono()` with whatever bindings/variables it needs).
+ *
+ * Typed structurally — the members Neutron routes a sub-app through — rather
+ * than as core's `Hono` class: an app whose `hono` is a different copy (a
+ * linked framework, another 4.x version) declares a different class, and
+ * TypeScript rejected its instances without a cast. `hono` is a peer
+ * dependency of core, so an installed app normally shares one copy anyway.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type NeutronMountApp = Hono<any, any, any>;
+export interface NeutronMountApp {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  fetch(request: Request, ...rest: any[]): Response | Promise<Response>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  route(path: string, app: any): unknown;
+  readonly routes: ReadonlyArray<{ readonly method: string; readonly path: string }>;
+}
 
 /** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
 export type NeutronServerMode = "ssr" | "api" | "raw";
@@ -567,6 +588,9 @@ export async function createServer(
   const routeCss = loadRouteCssManifest(resolvedDistDir);
   const stylesheetsFor = (routeId: string) =>
     routeStylesheetHrefs(routeCss, routeId, allStylesheetHrefs);
+  const lazyStylesheetsFor = (routeId: string) => routeLazyStylesheetHrefs(routeCss, routeId);
+  // index.html's head, recorded by `neutron-ts build` (core/document-head.ts).
+  const documentHead = loadDocumentHead(resolvedDistDir);
   const staticRouteHeaders = loadStaticRouteHeaders(resolvedDistDir);
   const staticHtmlCache = buildStaticHtmlCache(resolvedDistDir);
   const corsOptions = resolveCorsOptions(cors);
@@ -1011,7 +1035,9 @@ export async function createServer(
           }
         });
       }
-      app.route(prefix, subApp);
+      // Hono.route reads only public members (routes, errorHandler), so a
+      // sub-app from another hono copy routes the same way.
+      app.route(prefix, subApp as unknown as Hono);
     }
   }
 
@@ -1303,11 +1329,52 @@ export async function createServer(
         }
       }
 
-      if (!match) {
-        // Render the app's own not-found page through its layout chain, so a
-        // 404 looks like the rest of the application rather than two words of
-        // plain text. Falls back to the bare response when the app has no
-        // `not-found.tsx`.
+      // The app's nearest not-found page for this path, rendered inside a
+      // middleware chain that already ran (a page loader's notFound()). Null
+      // when the app has none or it fails to render: the loader's own 404
+      // is sent instead.
+      const renderNestedNotFound = async (request: Request): Promise<Response | null> => {
+        const notFoundMatch = ssrServer ? router.matchNotFound(effectivePathname) : null;
+        if (!notFoundMatch) return null;
+        try {
+          return await handleAppRouteRequest(
+            request,
+            notFoundMatch,
+            ssrServer!,
+            clientEntryScriptSrc,
+            stylesheetsFor(notFoundMatch.route.id),
+            routeModuleCache,
+            loaderDataCacheStore,
+            requestTrace,
+            hooks,
+            undefined,
+            undefined,
+            undefined,
+            { middleware: false, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
+          );
+        } catch (error) {
+          emitHook(hooks?.onError, {
+            requestId: requestTrace.requestId,
+            method: requestTrace.method,
+            pathname: requestTrace.pathname,
+            source: "render",
+            routeId: notFoundMatch.route.id,
+            routePath: notFoundMatch.route.path,
+            error: toError(error),
+          });
+          return null;
+        }
+      };
+
+      // A 404 for a path no page answers — unmatched, or a static route whose
+      // file is not in dist (a getStaticPaths route asked for a param it did
+      // not generate). Renders the app's own not-found page through its
+      // layout chain, so a 404 looks like the rest of the application rather
+      // than two words of plain text. Falls back to the bare response when
+      // the app has no `not-found.tsx`.
+      const answerNotFound = async (
+        info?: Parameters<typeof finalize>[1]
+      ): Promise<Response> => {
         const notFoundMatch = ssrServer ? router.matchNotFound(effectivePathname) : null;
         if (notFoundMatch) {
           try {
@@ -1321,7 +1388,10 @@ export async function createServer(
               loaderDataCacheStore,
               requestTrace,
               hooks,
-              globalMiddleware
+              globalMiddleware,
+              undefined,
+              undefined,
+              { lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
             );
             // The page renders as a normal route, which makes it a 200. The
             // status is the part that matters to crawlers and monitoring — but
@@ -1329,16 +1399,11 @@ export async function createServer(
             // middleware) produced deliberately — a redirect, a 403, a
             // ProblemError — is the real outcome and must pass through
             // (TS-27).
-            const finalResponse =
-              rendered.status === 200
-                ? new Response(rendered.body, { status: 404, headers: rendered.headers })
-                : rendered;
-            return finalize(finalResponse, {
-                routeId: notFoundMatch.route.id,
-                routePath: notFoundMatch.route.path,
-                routeMode: notFoundMatch.route.config.mode,
-              }
-            );
+            return finalize(asNotFoundResponse(rendered, null), {
+              routeId: notFoundMatch.route.id,
+              routePath: notFoundMatch.route.path,
+              routeMode: notFoundMatch.route.config.mode,
+            });
           } catch (error) {
             // A broken not-found page must not turn a 404 into a 500 — that
             // converts "page missing" into "site down" for every bad URL.
@@ -1353,14 +1418,21 @@ export async function createServer(
             });
           }
           // The not-found render already ran the global middleware chain.
-          return finalize(defaultNotFoundResponse(c.req.raw, originalPathname));
+          return finalize(defaultNotFoundResponse(c.req.raw, originalPathname), info);
         }
         // FRAMEWORK_CONTRACT §5: global middleware (auth gates) runs for every
         // request, matched or not — it used to run here only when the app had
         // a not-found.tsx to render.
         return finalize(
-          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname))
+          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname)),
+          info
         );
+      };
+
+      if (!match) {
+        // Awaited: a Response the global middleware throws must reach the
+        // catch below, which answers with it.
+        return await answerNotFound();
       }
 
       // A non-app route that reached here was not answered from dist, and
@@ -1377,17 +1449,15 @@ export async function createServer(
         match.route.file.includes("_layout") ||
         (match.route.config.mode !== "app" && !isJsonRequest(c.req.raw) && !gated)
       ) {
-        // Same content-negotiated default as an unmatched path, behind the
-        // same global middleware: a static route whose file is missing from
-        // dist is still a 404 a human or a machine will read.
-        return finalize(
-          await withGlobalMiddleware(() => defaultNotFoundResponse(c.req.raw, originalPathname)),
-          {
-            routeId: match.route.id,
-            routePath: match.route.path,
-            routeMode: match.route.config.mode,
-          }
-        );
+        // The same answer as an unmatched path, behind the same global
+        // middleware: a static route whose file is missing from dist (a
+        // getStaticPaths param that was not generated) is still a 404 a human
+        // or a machine will read — the app's not-found page when it has one.
+        return await answerNotFound({
+          routeId: match.route.id,
+          routePath: match.route.path,
+          routeMode: match.route.config.mode,
+        });
       }
 
       if (!ssrServer) {
@@ -1493,7 +1563,8 @@ export async function createServer(
           // epoch is captured per request and re-checked immediately before a
           // loader result is committed, so a GET that began before a mutation
           // completed cannot republish the pre-mutation loader data.
-          { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration }
+          { stillValid: () => appCacheEpoch === requestEpoch, generation: loaderGeneration },
+          { renderNotFound: renderNestedNotFound, lazyStylesheetHrefs: lazyStylesheetsFor(match.route.id), documentHead }
         );
       } catch (error) {
         renderFailed = true;
@@ -1766,7 +1837,8 @@ async function handleAppRouteRequest(
   loaderCacheFence?: {
     generation?: string;
     stillValid: () => boolean;
-  }
+  },
+  extra?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware" | "lazyStylesheetHrefs" | "documentHead">
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
   // Vite SSR runtime, then hand the loaded map to the shared render core —
@@ -1789,6 +1861,7 @@ async function handleAppRouteRequest(
     responseCache,
     loaderCacheFence,
     renderer: ssrServer.renderer,
+    ...extra,
   });
 }
 
@@ -2050,6 +2123,12 @@ function toRoutePath(relativeHtmlPath: string): string | null {
 
   if (normalized === "index.html") {
     return "/";
+  }
+
+  // A prerendered not-found page (`neutron-ts build` writes not-found.tsx as
+  // its directory's 404.html for static hosts) is not the page at /404.
+  if (normalized === "404.html" || normalized.endsWith("/404.html")) {
+    return null;
   }
 
   if (normalized.endsWith("/index.html")) {
@@ -2732,6 +2811,14 @@ function loadServerActionsManifest(distDir: string): ServerActionsManifest | nul
     );
   }
   return Object.keys(manifest.actions).length > 0 ? manifest : null;
+}
+
+function loadDocumentHead(distDir: string): DocumentHeadTag[] {
+  try {
+    return parseDocumentHead(fs.readFileSync(path.join(distDir, DOCUMENT_HEAD_FILE), "utf-8"));
+  } catch {
+    return [];
+  }
 }
 
 function loadRouteCssManifest(distDir: string): RouteCssManifest | null {

@@ -33,6 +33,7 @@ import {
   assertRenderedFragment,
   renderSpeculationRules,
   isResponse,
+  isProblemError,
   isResourceRoute,
   withRouterProviders,
   type CreateElement,
@@ -49,6 +50,7 @@ import type {
   HeadersArgs,
   HeadArgs,
   SeoMetaInput,
+  DocumentHeadTag,
   GetStaticPathsResult,
 } from "@neutron-build/core";
 import { renderToString } from "preact-render-to-string";
@@ -77,6 +79,10 @@ import {
   ROUTE_CSS_MANIFEST,
   ROUTE_CSS_MANIFEST_FORMAT,
   collectChunkCss,
+  collectDynamicChunkCss,
+  DOCUMENT_HEAD_FILE,
+  extractDocumentHead,
+  serializeDocumentHead,
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
@@ -437,6 +443,20 @@ export async function build(): Promise<void> {
   };
   if (publicSource) recordPublicSource(publicSource);
 
+  // index.html's head for server-rendered documents (core document-head.ts):
+  // read from the built dist/index.html (Vite replaced %ENV% placeholders and
+  // asset URLs there) before a prerendered "/" overwrites it, else from the
+  // source index.html (a static-only build runs no client HTML build).
+  const documentHead = (() => {
+    const built = path.join(outputDir, "index.html");
+    const source = path.join(cwd, "index.html");
+    const file = fs.existsSync(built) ? built : fs.existsSync(source) ? source : null;
+    return file ? extractDocumentHead(fs.readFileSync(file, "utf-8")) : [];
+  })();
+  if (documentHead.length > 0) {
+    fs.writeFileSync(path.join(outputDir, DOCUMENT_HEAD_FILE), serializeDocumentHead(documentHead));
+  }
+
   // Only the app client build produces a client entry. The static CSS pass's
   // manifest also names a JS entry, but that file is deleted right after it is
   // built, so recording it pointed pages at a 404.
@@ -528,6 +548,7 @@ export async function build(): Promise<void> {
     clientEntryScriptSrc,
     clientCssFiles,
     routeCss,
+    documentHead,
     serverActions,
     serverActionsOptions: neutronConfig.server?.serverActions,
     securityHeaders: neutronConfig.server?.securityHeaders,
@@ -760,7 +781,7 @@ export async function build(): Promise<void> {
     }
 
     return {
-      headHtml: renderDocumentHead(pathname, mergedSeo, headFragments),
+      headHtml: renderDocumentHead(pathname, mergedSeo, headFragments, undefined, documentHead),
       seo: mergedSeo,
     };
   }
@@ -808,7 +829,29 @@ export async function build(): Promise<void> {
     process.exit(1);
   }
 
+  // A page loader that answers 404 (notFound(), notFoundError(), any 404
+  // Response) has no page to prerender: nothing is written, so the host
+  // answers the path with 404.html — what `start` renders for it.
+  const NOT_FOUND = Symbol("not-found");
+  async function runPrerenderLoader(module: RouteModule, args: LoaderArgs): Promise<unknown> {
+    const isNotFound = (value: unknown) => (isResponse(value) || isProblemError(value)) && value.status === 404;
+    try {
+      const data = await module.loader!(args);
+      return isNotFound(data) ? NOT_FOUND : data;
+    } catch (error) {
+      if (isNotFound(error)) return NOT_FOUND;
+      throw error;
+    }
+  }
+
   for (const route of staticRoutes) {
+    // A not-found page with a dynamic scope ([orgId]/not-found.tsx) has no
+    // single document to prerender; `start` renders it per request.
+    if (route.isNotFound && route.params.length > 0) {
+      console.log(`  Skipping ${route.path} not-found page (dynamic scope — rendered per request)`);
+      skippedCount++;
+      continue;
+    }
     // Resource routes (method handlers, no component) are endpoints served
     // per request — never prerendered, and never baked via a stray `loader`
     // export (a resource route's loader never runs at serve time either, so
@@ -912,11 +955,16 @@ export async function build(): Promise<void> {
           // getStaticPaths if there is no loader.
           let loaderData: unknown = props || {};
           if (module.loader) {
-            loaderData = await module.loader({
+            loaderData = await runPrerenderLoader(module, {
               request,
               params,
               context,
             } as LoaderArgs);
+            if (loaderData === NOT_FOUND) {
+              console.log(`  ${resolvedPath} → (loader answered 404, not written)`);
+              skippedCount++;
+              continue;
+            }
           }
 
           const layoutChain = getLayoutChain(route);
@@ -994,16 +1042,24 @@ export async function build(): Promise<void> {
         continue;
       }
 
-      // Static route without params
+      // Static route without params. A not-found page is written as its
+      // directory's 404.html (the file static hosts and `preview` answer
+      // unknown paths with), never at the directory's own path: its route
+      // path is the directory's, and it used to overwrite that index.html.
       const context: AppContext = {};
       const request = new Request("http://localhost" + route.path);
       let loaderData: unknown = undefined;
       if (module.loader) {
-        loaderData = await module.loader({
+        loaderData = await runPrerenderLoader(module, {
           request,
           params: {},
           context,
         } as LoaderArgs);
+        if (loaderData === NOT_FOUND) {
+          console.log(`  ${route.path} → (loader answered 404, not written)`);
+          skippedCount++;
+          continue;
+        }
       }
 
       const layoutChain = getLayoutChain(route);
@@ -1045,7 +1101,8 @@ export async function build(): Promise<void> {
         context,
         {},
         loaderData,
-        route.path
+        // A not-found page answers many paths; its own title is inferred as "404".
+        route.isNotFound ? "/404" : route.path
       );
       const fullHtml = wrapHtml(
         html,
@@ -1058,19 +1115,17 @@ export async function build(): Promise<void> {
         seo
       );
 
-      const outPath = getOutputPath(outputDir, route.path);
+      const outPath = route.isNotFound
+        ? path.join(outputDir, route.path.replace(/^\/+|\/+$/g, ""), "404.html")
+        : getOutputPath(outputDir, route.path);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, fullHtml);
       publicArtifacts.add(path.relative(outputDir, outPath).split(path.sep).join("/"));
 
-      const routeHeaders = await resolveRouteHeaders(
-        route,
-        layoutChain,
-        request,
-        context,
-        {},
-        loaderData
-      );
+      // Headers are recorded per served path; a not-found page has none.
+      const routeHeaders = route.isNotFound
+        ? {}
+        : await resolveRouteHeaders(route, layoutChain, request, context, {}, loaderData);
       if (Object.keys(routeHeaders).length > 0) {
         staticHeadersByRoute[route.path] = routeHeaders;
       }
@@ -1304,6 +1359,8 @@ function writeRouteCssManifest(
     }
   }
   const table: Record<string, string[]> = {};
+  const lazy: Record<string, string[]> = {};
+  const routeKeys = new Set(routes.map((route) => clientRouteManifestKey(cwd, route.file)));
   for (const route of routes) {
     if (route.isLayout || route.file.includes("_layout") || isResourceRoute(route)) continue;
     const manifest = cssPassRouteIds.has(route.id) ? cssPass : client;
@@ -1313,12 +1370,27 @@ function writeRouteCssManifest(
     for (const member of chain) {
       hrefs.push(...collectChunkCss(manifest, clientRouteManifestKey(cwd, member.file)));
     }
-    table[route.id] = [...new Set(hrefs.map((href) => alias.get(href) ?? href))];
+    const listed = [...new Set(hrefs.map((href) => alias.get(href) ?? href))];
+    table[route.id] = listed;
+    // CSS the chain's dynamic imports link when they load (Vite's preload):
+    // the client router must not unlink it while the page may use it.
+    const dynamic = collectDynamicChunkCss(
+      manifest,
+      chain.map((member) => clientRouteManifestKey(cwd, member.file)),
+      routeKeys
+    )
+      .map((href) => alias.get(href) ?? href)
+      .filter((href) => !listed.includes(href));
+    if (dynamic.length > 0) lazy[route.id] = [...new Set(dynamic)];
   }
   for (const duplicate of alias.keys()) {
     fs.rmSync(path.join(outputDir, duplicate), { force: true });
   }
-  const routeCss: RouteCssManifest = { format: ROUTE_CSS_MANIFEST_FORMAT, routes: table };
+  const routeCss: RouteCssManifest = {
+    format: ROUTE_CSS_MANIFEST_FORMAT,
+    routes: table,
+    ...(Object.keys(lazy).length > 0 ? { lazy } : {}),
+  };
   fs.writeFileSync(path.join(outputDir, ROUTE_CSS_MANIFEST), JSON.stringify(routeCss, null, 2));
   return routeCss;
 }
@@ -1433,6 +1505,7 @@ interface RuntimeBundleBuilderOptions {
   clientEntryScriptSrc: string | null;
   clientCssFiles: string[];
   routeCss: RouteCssManifest | null;
+  documentHead: DocumentHeadTag[];
   serverActions: ServerActionsManifest | null;
   serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] };
   securityHeaders?: false | { headers?: Record<string, string> };
@@ -1581,7 +1654,8 @@ async function buildRuntimeBundle(
       options.serverActions,
       options.serverActionsOptions,
       options.securityHeaders,
-      findServerEntryFile(options.cwd)
+      findServerEntryFile(options.cwd),
+      options.documentHead
     ),
     "utf-8"
   );
@@ -2147,7 +2221,8 @@ export function generateRuntimeEntrySource(
   serverActions?: ServerActionsManifest | null,
   serverActionsOptions?: { bodySizeLimit?: number; allowedOrigins?: string[] },
   securityHeaders?: false | { headers?: Record<string, string> },
-  serverEntryPath?: string | null
+  serverEntryPath?: string | null,
+  documentHead: DocumentHeadTag[] = []
 ): string {
   const imports: string[] = [];
   const moduleEntries: string[] = [];
@@ -2248,7 +2323,7 @@ function serverEntryMounts() {
 `
     : "";
 
-  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, toDataRedirectResponse, applyRouteRuleHeaders, applySecurityHeaders, resolveSecurityHeadersConfig, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
+  return `import { createRouter, normalizePathname, normalizeMiddlewareExport, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders, renderAppRoute, isMutationMethod, createMemoryLoaderCacheStore, routeStylesheetHrefs, routeLazyStylesheetHrefs, toDataRedirectResponse, applyRouteRuleHeaders, applySecurityHeaders, resolveSecurityHeadersConfig, mutableResponse, beginCacheMutation, encodeCacheInvalidationPath, installTransportPeer } from "@neutron-build/core/runtime-edge";
 ${actionsImport}${imports.join("\n")}
 ${serverEntryDecl}
 const SECURITY_HEADERS = resolveSecurityHeadersConfig(${securityHeaders === undefined ? "undefined" : JSON.stringify(securityHeaders)});
@@ -2262,6 +2337,7 @@ const SERVER_ACTIONS_OPTIONS = ${JSON.stringify({
   })};
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};
+const DOCUMENT_HEAD = ${JSON.stringify(documentHead)};
 const CLIENT_STYLESHEET_HREFS = ${JSON.stringify(clientCssFiles)};
 const ROUTE_CSS = ${JSON.stringify(routeCss)};
 const ROUTE_RULES = compileRouteRules(${routeRulesJson});
@@ -2345,6 +2421,8 @@ async function handleRouteRequest(request, requestUrl, pathname, globalChainRan)
     {
       clientEntryScriptSrc: CLIENT_ENTRY_SCRIPT_SRC,
       stylesheetHrefs: routeStylesheetHrefs(ROUTE_CSS, match.route.id, CLIENT_STYLESHEET_HREFS),
+      lazyStylesheetHrefs: routeLazyStylesheetHrefs(ROUTE_CSS, match.route.id),
+      documentHead: DOCUMENT_HEAD,
       loaderDataCache: LOADER_DATA_CACHE,
       loaderCacheFence: { generation, stillValid: () => true },
       requestTrace: {

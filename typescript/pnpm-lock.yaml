@@ -383,9 +383,6 @@ importers:
       gray-matter:
         specifier: ^4.0.3
         version: 4.0.3
-      hono:
-        specifier: ^4.12.23
-        version: 4.12.23
       magic-string:
         specifier: ^0.30.21
         version: 0.30.21
@@ -423,6 +420,9 @@ importers:
       happy-dom:
         specifier: ^17.6.3
         version: 17.6.3
+      hono:
+        specifier: ^4.12.23
+        version: 4.12.23
       preact:
         specifier: ^10.25.4
         version: 10.28.3
