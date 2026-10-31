@@ -2,13 +2,18 @@
 
 Status: **stage X-5c — X5-R13 (a)–(d) landed (each pinned in its own
 commit, before any campaign `run`); the gc_step livelock root-caused
-and fixed (seed 36's class: the sweep's resume could not cross the
-subtree boundary — pin `gc_sweep_crosses_subtree_boundaries`);
-`cargo test` green (130 tests), the 16-seed smoke passing; the 10k
-campaign `run` follows in this attempt (two earlier partial runs died
-with runner kills at 7500/10000 — no results file was written; a first
-full campaign landed at 10000 after the gc fix, see below).**
-The stages before it (X-5a, X-5b) are complete and merged.
+and fixed (pin `gc_sweep_crosses_subtree_boundaries`); seed 148's
+livelock pinned to its class (a hidden deadlock behind the service
+spins — budget-valve, repro `run --seeds 148..149`); `cargo test`
+green (130 tests), the 16-seed smoke passing. The 10k campaign **has
+not completed**: three runs died with runner 60-min kills (7500/10000
+pre-fix at ~3 seeds/s under co-tenant load; 3500/10000 post-fix at
+~2.4 seeds/s — the gc fix dropped peak RSS from ~14 GiB to ~4.7 GiB,
+and the projected full run is ~65–70 min on this host, over the
+60-min command budget). The next attempt runs it under `--keep` from
+here: `run` → `verify` → retune if a quota misses → the final `run` →
+`mutants` → the README numbers and the RESULT.** The stages before it
+(X-5a, X-5b) are complete and merged.
 Opus judges E4 on the RESULT with P's rulings X5-R1-R7 (and X5-R9's sim
 fix).
 
