@@ -46,6 +46,16 @@ const COOKIES = (name: string) =>
   `["${name}1=a; Path=/", "${name}2=b; Path=/; HttpOnly", "${name}3=c; Path=/"]`;
 
 const FIXTURE: Record<string, string> = {
+  "src/routes/page.tsx": `
+import { h } from "preact";
+export const config = { mode: "app" };
+export function headers() {
+  const out = new Headers();
+  for (const cookie of ${COOKIES("page")}) out.append("set-cookie", cookie);
+  return out;
+}
+export default function Page() { return h("p", null, "page"); }
+`,
   "src/routes/api/resource.ts": `
 export function GET() {
   const out = new Headers();
@@ -131,6 +141,7 @@ async function bootDev(root: string): Promise<string> {
 }
 
 const CASES: Array<[label: string, pathname: string, name: string, status: number]> = [
+  ["page route headers()", "/page", "page", 200],
   ["resource route", "/api/resource", "resource", 200],
   ["global middleware after next()", "/api/plain", "middleware", 200],
   ["global middleware answering an unmatched path", "/denied", "denied", 401],

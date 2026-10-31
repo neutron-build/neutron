@@ -329,7 +329,7 @@ function resolveRequestedDataRouteIds(
   return new Set(filtered);
 }
 
-async function resolveRouteHeaders(
+export async function resolveRouteHeaders(
   allRoutes: Route[],
   modules: Map<string, RouteModule>,
   args: HeadersArgs

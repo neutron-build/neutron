@@ -12,7 +12,7 @@ import { runMiddlewareChain } from "../core/middleware.js";
 import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
 import { isResponse, withMutableHeaders } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
-import { resolveClientTier } from "../core/render-app-route.js";
+import { resolveClientTier, resolveRouteHeaders } from "../core/render-app-route.js";
 import { transformSsrCommonJs } from "./ssr-cjs.js";
 import { toDataRedirectResponse } from "../core/data-redirect.js";
 import { applySecurityHeaders, resolveSecurityHeadersConfig } from "../server/http-headers.js";
@@ -1192,6 +1192,15 @@ async function handleRequest(
     }
   }
 
+  // headers() exports, merged as in production (render-app-route).
+  const routeHeaders = await resolveRouteHeaders(allRoutes, moduleCache, {
+    request,
+    params,
+    context,
+    loaderData,
+    actionData,
+  });
+
   // Resolve head() exports (mirrors production server behavior)
   const pathname = new URL(request.url).pathname;
   const { headHtml, seo: mergedSeo } = await resolveDevHeadHtml(allRoutes, moduleCache, {
@@ -1211,8 +1220,9 @@ async function handleRequest(
     }
     allData.__head__ = headHtml;
     allData.__css__ = collectCssFromModuleGraph(server, allRoutes.map((r) => r.file));
+    routeHeaders.set("Content-Type", "application/json");
     return new Response(encodeSerializedPayloadAsJson(allData), {
-      headers: { "Content-Type": "application/json" },
+      headers: routeHeaders,
     });
   }
 
@@ -1260,8 +1270,11 @@ async function handleRequest(
 
     const fullHtml = wrapHtml(html, route, request, loaderData, clientEntry, actionData, headHtml, mergedSeo);
 
+    if (!routeHeaders.has("Content-Type")) {
+      routeHeaders.set("Content-Type", "text/html; charset=utf-8");
+    }
     return new Response(fullHtml, {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
+      headers: routeHeaders,
     });
   } catch (error) {
     // Render error - send enriched error to overlay

@@ -339,6 +339,11 @@ All notable changes to this project are documented in this file.
   image endpoint now send each cookie as its own header, as the mount path and
   `start` already did. `start` (`@hono/node-server`) and the docker/vercel
   handlers were checked and were correct.
+- **`neutron-ts dev` applies page routes' `headers()` exports.** Dev's
+  renderer never called them, so a page's own headers (cookies, Cache-Control)
+  were sent by `start` and missing in dev. Dev now merges the route and layout
+  `headers()` the way `start` does (Set-Cookie appended across the chain) onto
+  both the HTML document and the data (JSON) response.
 
 - **`--preset docker` builds under pnpm and ships a self-contained context.**
   With pnpm-linked core and `resolve.preserveSymlinks`, the docker runtime
