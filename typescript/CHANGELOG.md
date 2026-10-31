@@ -220,6 +220,13 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Nested islands hydrate once.** `initIslands` hydrated every
+  `<neutron-island>` in the document, including a marker inside another
+  island's subtree (`<Island component={Outer}/>` where Outer renders
+  `<Island component={Inner}/>`), so Inner got a second Preact root over the
+  DOM the outer root already owned — mounted twice, dynamic nodes inserted
+  twice. A marker nested in another island is now skipped: hydrating the
+  outer island mounts it, whatever either's `client` directive says.
 - **The server bundle builds when core is linked or pnpm-installed under
   `resolve.preserveSymlinks`, and no longer inlines core's dependencies.**
   Under react-compat (`ssr.noExternal: true`) the `start` bundle inlined

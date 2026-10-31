@@ -166,3 +166,43 @@ describe("router-owned islands", () => {
     expect(island.querySelectorAll("button").length).toBe(1);
   });
 });
+
+describe("nested islands", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    (window as any).__ISLAND_COMPONENTS__ = undefined;
+  });
+
+  // <Island component={Outer}/> where Outer renders <Island component={Inner}/>:
+  // hydrating Outer mounts Inner as part of its tree. A second root for the
+  // inner marker would mount Inner twice over the same DOM.
+  it("hydrates the outer island only; the inner marker belongs to it", async () => {
+    const { Island } = await import("./island.js");
+    const { useEffect } = await import("preact/hooks");
+    let innerMounts = 0;
+    function Inner() {
+      useEffect(() => {
+        innerMounts++;
+      }, []);
+      return h("span", null, "inner");
+    }
+    function Outer() {
+      return h("div", null, h(Island, { component: Inner, client: "load", id: "Inner" }));
+    }
+    const { renderToString } = await import("preact-render-to-string");
+    document.body.innerHTML = renderToString(h(Island, { component: Outer, client: "load", id: "Outer" }));
+    (window as any).__ISLAND_COMPONENTS__ = { Outer, Inner };
+
+    initIslands();
+    await flush();
+    await flush();
+
+    const [outer, inner] = Array.from(document.querySelectorAll("neutron-island")) as Array<
+      HTMLElement & { __neutronHydrated?: boolean }
+    >;
+    expect(outer.__neutronHydrated).toBe(true);
+    expect(inner.__neutronHydrated).toBeUndefined();
+    expect(innerMounts).toBe(1);
+    expect(document.querySelectorAll("span").length).toBe(1);
+  });
+});

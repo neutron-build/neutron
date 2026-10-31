@@ -187,6 +187,10 @@ export function initIslands(manifest?: IslandManifest) {
 
   islands.forEach((island) => {
     if (island.__neutronHydrated) return;
+    // An island rendered inside another island is part of the outer one's
+    // component tree: hydrating the outer mounts it. Hydrating it as well
+    // would put a second Preact root over the same DOM.
+    if (island.parentElement?.closest("neutron-island")) return;
 
     const client = island.getAttribute("data-client") as ClientDirective | null;
     const media = island.getAttribute("data-media");
