@@ -777,7 +777,18 @@ export async function build(): Promise<void> {
   // modules, not derived facts, through the same helper the standalone
   // renderer uses; a rejected build throws before it can leave a deployable
   // partial dist behind.
-  await assertStaticRoutesUngated(staticRoutes, { loadRouteModule, getLayoutChain, globalMiddleware: ["ts", "tsx", "js", "mjs"].some(ext => fs.existsSync(path.join(cwd, "src", `middleware.${ext}`))) });
+  //
+  // Global middleware gates the build only for presets whose prebuilt files
+  // are served with no Neutron server in front (static hosting, a CDN, the
+  // docker image's file handler): there it never runs for them. `neutron-ts
+  // start` (no adapter, or the node adapter) runs global middleware ahead of
+  // every prebuilt file it serves (server/index.ts static fast path), so a
+  // static page behind it stays gated and may be prerendered.
+  const prebuiltFilesBypassServer = Boolean(selectedAdapter) && selectedAdapter!.name !== "node";
+  const hasGlobalMiddleware = ["ts", "tsx", "js", "mjs"].some(ext => fs.existsSync(path.join(cwd, "src", `middleware.${ext}`)));
+  // Resource routes are exempt, as from the A-020 gate below: never
+  // prerendered, their middleware runs per request.
+  await assertStaticRoutesUngated(staticRoutes.filter((route) => !isResourceRoute(route)), { loadRouteModule, getLayoutChain, globalMiddleware: prebuiltFilesBypassServer && hasGlobalMiddleware });
 
   let renderedCount = 0;
   let skippedCount = 0;
