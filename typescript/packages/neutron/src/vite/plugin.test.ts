@@ -87,6 +87,14 @@ describe("generateRoutesModule", () => {
     expect(output).not.toMatch(/import\("\/\/[A-Za-z]/);
   });
 
+  it("configures the router from neutron.config client options, and emits nothing without them", () => {
+    const route = makeRoute({ id: "route:index.tsx", path: "/", file: "/x/index.tsx", config: { mode: "app" } });
+    expect(generateRoutesModule([route])).not.toContain("configureRouter");
+    expect(generateRoutesModule([route], { unloadRouteStylesheets: false })).not.toContain("configureRouter");
+    const output = generateRoutesModule([route], { unloadRouteStylesheets: true });
+    expect(output.startsWith('import { configureRouter } from "@neutron-build/core/client";\nconfigureRouter({"unloadRouteStylesheets":true});')).toBe(true);
+  });
+
   it("uses /@fs prefix for files outside project root", () => {
     const route = makeRoute({
       id: "route:external",

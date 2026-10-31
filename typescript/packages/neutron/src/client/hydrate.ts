@@ -24,6 +24,7 @@ import {
   setupIncrementalPrefetch,
 } from "./incremental-prefetch.js";
 import { ClientErrorBoundary } from "./error-boundary.js";
+import { routerOptions } from "./router-options.js";
 
 interface RouteModule {
   id?: string;
@@ -128,6 +129,7 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
             link.rel = "stylesheet";
             link.href = url;
             link.setAttribute("data-neutron-nav", "true");
+            link.setAttribute("data-neutron-css", "");
             link.onload = () => {
               loadedStylesheets.add(normalizeStylesheetUrl(url));
               resolve();
@@ -145,6 +147,36 @@ async function loadMissingStylesheets(urls: string[]): Promise<void> {
       setTimeout(() => reject(new Error("css-timeout")), CSS_LOAD_TIMEOUT_MS)
     ),
   ]);
+}
+
+/**
+ * With `client.unloadRouteStylesheets`: once the page navigated to has
+ * rendered (the next frame), unlink the route stylesheets it does not list.
+ * Only links Neutron created for routes (`data-neutron-css`) are candidates;
+ * the client entry's and layouts' stylesheets are in every route's list.
+ * Unlinking after the render means the outgoing page never loses its styles
+ * while it is still on screen, and the incoming page's were loaded before it
+ * rendered (loadMissingStylesheets).
+ */
+function unloadUnusedStylesheets(keep: string[], requestId: number): void {
+  if (!routerOptions.unloadRouteStylesheets) return;
+  const wanted = new Set(keep.map(normalizeStylesheetUrl));
+  const run = () => {
+    // A later navigation owns the document now; it will unload for itself.
+    if (requestId !== latestNavigationRequestId) return;
+    document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][data-neutron-css]').forEach((link) => {
+      const key = normalizeStylesheetUrl(link.getAttribute("href") || link.href);
+      if (!wanted.has(key)) {
+        link.remove();
+        loadedStylesheets.delete(key);
+      }
+    });
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => run());
+  } else {
+    setTimeout(run, 0);
+  }
 }
 
 /**
@@ -693,6 +725,9 @@ async function handleNavigation(forceRevalidate: boolean = false) {
     }
     const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, prefetched);
     applyData(merged);
+    if (Array.isArray(prefetchCss)) {
+      unloadUnusedStylesheets(prefetchCss as string[], requestId);
+    }
     // Same contract as the fetched path: a new page starts at the top. Leaving
     // this out made a warmed navigation land mid-page, so whether scrolling
     // worked depended on whether the link happened to be prefetched.
@@ -779,6 +814,9 @@ async function handleNavigation(forceRevalidate: boolean = false) {
 
       const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, data);
       applyData(merged);
+      if (Array.isArray(cssUrls)) {
+        unloadUnusedStylesheets(cssUrls as string[], requestId);
+      }
       if (previousPathname !== pathname) {
         window.scrollTo({ top: 0, left: 0, behavior: "auto" });
       }

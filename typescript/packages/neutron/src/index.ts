@@ -109,6 +109,7 @@ export {
   resolveRuntimeNoExternal,
   RUNTIME_RUNNER_CJS_EXTERNALS,
   type NeutronConfig,
+  type NeutronClientConfig,
   type NeutronEnvConfig,
   type NeutronImageConfig,
   type NeutronRedirectRule,

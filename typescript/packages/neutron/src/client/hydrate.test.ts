@@ -994,3 +994,91 @@ describe("hydrate — static-tier page in an app (no client module)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * F-B5-1: client navigation kept every earlier route's stylesheets in the
+ * document (Next parity), so sections redefining the same :root tokens
+ * resolved by load order. `client.unloadRouteStylesheets` unlinks the route
+ * stylesheets the new route does not list, after it has rendered.
+ */
+describe("hydrate — route stylesheets after navigation", () => {
+  afterEach(() => {
+    for (const { target, type, listener, capture } of capturedListeners) {
+      target.removeEventListener(type, listener, capture);
+    }
+    restorePatchedAddEventListener?.();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    for (const key of WINDOW_STATE_KEYS) {
+      delete (window as unknown as Record<string, unknown>)[key];
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function routes(deps: PageDeps): Record<string, RouteReg> {
+    const { h, hooks } = deps;
+    return {
+      "route:/start": { path: "/start", mode: "app", default: () => h("p", { class: "title" }, "Start") },
+      "route:/target": {
+        path: "/target",
+        mode: "app",
+        default: () => h("p", { class: "title" }, hooks.useLoaderData<{ title: string }>()?.title ?? "none"),
+      },
+    };
+  }
+
+  const sheets = () =>
+    Array.from(document.head.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')).map((link) => link.getAttribute("href"));
+
+  async function navigateToTarget(unload: boolean): Promise<string[]> {
+    document.head.innerHTML = [
+      '<link rel="stylesheet" href="/assets/shared.css" data-neutron-css>',
+      '<link rel="stylesheet" href="/assets/start.css" data-neutron-css>',
+      // Loaded by an earlier visit to /target: no fetch needed to show it.
+      '<link rel="stylesheet" href="/assets/target.css" data-neutron-css>',
+      // Not Neutron's: a head() link, never touched.
+      '<link rel="stylesheet" href="/fonts.css">',
+    ].join("");
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          "route:/target": { title: "Target" },
+          __css__: ["/assets/shared.css", "/assets/target.css"],
+        })
+      )
+    );
+    const booted = await bootRouter({
+      pathname: "/start",
+      routeId: "route:/start",
+      data: { "route:/start": {} },
+      routes,
+    });
+    if (unload) {
+      (await import("./router-options.js")).configureRouter({ unloadRouteStylesheets: true });
+    }
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+    clickAnchor(addAnchor("/target"));
+    for (let i = 0; i < 4; i++) await flush();
+    // The new page is in the DOM; nothing is unlinked before the next frame.
+    expect(booted.app.querySelector(".title")?.textContent).toBe("Target");
+    expect(sheets()).toContain("/assets/start.css");
+    for (const frame of frames.splice(0)) frame(performance.now());
+    return sheets() as string[];
+  }
+
+  it("keeps earlier routes' stylesheets by default", async () => {
+    expect(await navigateToTarget(false)).toEqual([
+      "/assets/shared.css",
+      "/assets/start.css",
+      "/assets/target.css",
+      "/fonts.css",
+    ]);
+  });
+
+  it("with unloadRouteStylesheets, unlinks the ones the new route does not list, after it rendered", async () => {
+    expect(await navigateToTarget(true)).toEqual(["/assets/shared.css", "/assets/target.css", "/fonts.css"]);
+  });
+});

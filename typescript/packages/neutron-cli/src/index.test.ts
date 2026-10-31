@@ -2376,7 +2376,7 @@ function linkedCss(dir: string, hrefs: string[]): string {
 }
 
 function stylesheetLinks(html: string): string[] {
-  return [...html.matchAll(/<link rel="stylesheet" href="([^"]+)">/g)].map((match) => match[1]);
+  return [...html.matchAll(/<link rel="stylesheet" href="([^"]+)" data-neutron-css>/g)].map((match) => match[1]);
 }
 
 function assertSectionCss(css: string, section: "shop" | "docs" | null, where: string): void {

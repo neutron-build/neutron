@@ -47,7 +47,7 @@ import {
 } from "./static-interactivity-check.js";
 import { renderDocumentHead, mergeSeoMetaInput, buildHtmlOpenTag, buildBodyOpenTag } from "../core/seo.js";
 import type { SeoMetaInput } from "../core/seo.js";
-import type { NeutronRoutesConfig } from "../config.js";
+import type { NeutronClientConfig, NeutronRoutesConfig } from "../config.js";
 import type { Route, RouteModule, AppContext, LoaderArgs, ActionArgs, HeadArgs, MiddlewareFn, ErrorBoundaryProps } from "../core/types.js";
 import { handleImageRequest } from "../server/image-optimizer.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "../server/health.js";
@@ -91,6 +91,8 @@ export interface NeutronPluginOptions {
    * `bodySizeLimit`/`allowedOrigins` are `server.serverActions` in neutron.config.
    */
   serverActions?: ServerActionsOptions & { registry?: ServerActionRegistry };
+  /** neutron.config.ts `client`: client router options, emitted into `virtual:neutron/routes`. */
+  client?: NeutronClientConfig;
 }
 
 const ROUTES_DIR_DEFAULT = "src/routes";
@@ -752,7 +754,9 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
                   }
                 }
                 const cssLinks = dedupedUrls
-                  .map(url => `  <link rel="stylesheet" href="${url.replace(/"/g, '&quot;')}">`)
+                  // data-neutron-css: a route stylesheet the client router
+                  // may unlink after navigation (client.unloadRouteStylesheets).
+                  .map(url => `  <link rel="stylesheet" href="${url.replace(/"/g, '&quot;')}" data-neutron-css>`)
                   .join("\n");
                 rawHtml = rawHtml.replace("</head>", `${cssLinks}\n</head>`);
               }
@@ -765,7 +769,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
               // (Vite's transformIndexHtml may inject JS-module CSS links that
               // serve JavaScript instead of CSS, causing render-blocking stalls)
               const directBases = new Set<string>();
-              const linkPattern = /<link rel="stylesheet" href="([^"]+)">/g;
+              const linkPattern = /<link rel="stylesheet" href="([^"]+)"(?: data-neutron-css)?>/g;
               let m: RegExpExecArray | null;
               while ((m = linkPattern.exec(transformedHtml)) !== null) {
                 const href = m[1];
@@ -775,7 +779,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
               }
               if (directBases.size > 0) {
                 transformedHtml = transformedHtml.replace(
-                  /<link rel="stylesheet" href="([^"]+)">/g,
+                  /<link rel="stylesheet" href="([^"]+)"(?: data-neutron-css)?>/g,
                   (match, href) => {
                     if (href.includes("?")) return match;
                     if (directBases.has(href)) return "";
@@ -903,7 +907,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
         return generateIslandsModule(state.islandIds);
       }
       if (id === "\0virtual:neutron/routes") {
-        return generateRoutesModule(state.routes);
+        return generateRoutesModule(state.routes, options.client);
       }
       if (id === "\0virtual:neutron/manifest") {
         return generateManifestModule(state.routes);
@@ -1838,7 +1842,7 @@ export function staticTierRouteIds(routes: Route[]): Set<string> {
   return stubbed;
 }
 
-export function generateRoutesModule(routes: Route[]): string {
+export function generateRoutesModule(routes: Route[], client?: NeutronClientConfig): string {
   const cwd = process.cwd().replace(/\\/g, "/");
   // Resource routes are endpoints, not pages: excluded from the client route
   // table entirely so no client chunk is ever emitted for them. Their method
@@ -1869,7 +1873,17 @@ export function generateRoutesModule(routes: Route[]): string {
   }`;
   });
 
-  return `export const routes = {
+  // neutron.config.ts `client`, applied before the app's init() starts the
+  // router (the entry imports this module first). Absent: nothing emitted.
+  const routerOptions =
+    client?.unloadRouteStylesheets === true
+      ? `import { configureRouter } from "@neutron-build/core/client";
+configureRouter(${JSON.stringify({ unloadRouteStylesheets: true })});
+
+`
+      : "";
+
+  return `${routerOptions}export const routes = {
 ${routeMap.join(",\n")}
 };
 

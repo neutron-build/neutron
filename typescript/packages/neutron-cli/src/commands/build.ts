@@ -272,6 +272,7 @@ export async function build(): Promise<void> {
             rootDir: cwd,
             routeRules: neutronConfig.routes,
             serverActions: { registry: serverActionRegistry },
+            client: neutronConfig.client,
           }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
@@ -444,6 +445,7 @@ export async function build(): Promise<void> {
             rootDir: cwd,
             routeRules: neutronConfig.routes,
             serverActions: { registry: serverActionRegistry },
+            client: neutronConfig.client,
           }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
@@ -1133,7 +1135,7 @@ function wrapHtml(
     : "";
 
   const cssLinks = cssFiles
-    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
+    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}" data-neutron-css>`)
     .join("\n");
 
   return `<!DOCTYPE html>

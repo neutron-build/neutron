@@ -48,6 +48,23 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **`client.unloadRouteStylesheets`: route stylesheets no longer needed are
+  unlinked after client navigation (opt-in, F-B5-1).** Client navigation kept
+  every earlier route's stylesheets in the document, as Next's App Router
+  does, so pages whose sheets redefine the same tokens (Fylun's per-section
+  Tailwind entries on `:root`) showed the cascade of whichever loaded last:
+  after `/files` → `/studio` → `/files` the studio tokens won. With
+  `client: { unloadRouteStylesheets: true }` in `neutron.config.ts`, the
+  router unlinks, in the frame after the new page has rendered (its own
+  sheets were loaded before it rendered, so nothing flashes), the route
+  stylesheets the new route's list does not name. Only links Neutron created
+  for routes are candidates — SSR'd route links now carry `data-neutron-css`
+  in `start`, dev and prerendered pages — so the client entry's and layouts'
+  stylesheets (in every route's list) and `head()` links stay. The default is
+  unchanged; the trade-off is a re-request (normally from the HTTP cache)
+  when navigating back. `configureRouter()` is exported from
+  `@neutron-build/core/client`; the option is applied by the generated
+  `virtual:neutron/routes` module.
 - **The vercel/netlify/cloudflare/docker runtime matches `start` on security
   headers and serves `src/server.entry.ts` mounts.** The generated handler
   sent 3 of `start`'s 5 security defaults (no `Cross-Origin-Opener-Policy`,

@@ -101,6 +101,7 @@ export async function dev(): Promise<void> {
           openapi: neutronConfig.server?.openapi,
           securityHeaders: neutronConfig.server?.securityHeaders,
           serverActions: neutronConfig.server?.serverActions,
+          client: neutronConfig.client,
         }),
         neutronPublicEnvPlugin(neutronConfig.env),
       ],

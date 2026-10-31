@@ -134,6 +134,21 @@ export interface NeutronEnvConfig {
   publicPrefixes?: string[];
 }
 
+/** Client router behaviour (`client` in neutron.config.ts). */
+export interface NeutronClientConfig {
+  /**
+   * After a client navigation has rendered, unlink route stylesheets the new
+   * route does not use. Default `false`, as Next's App Router: stylesheets
+   * loaded for earlier pages stay applied, so rules that conflict across
+   * pages (sections redefining the same `:root` tokens) resolve by load
+   * order. `true` gives each page the cascade of a fresh load, at the cost of
+   * re-requesting a sheet (normally from the HTTP cache) when you navigate
+   * back. The client entry's and layouts' stylesheets are in every route's
+   * list and stay; links added by `head()` are never touched.
+   */
+  unloadRouteStylesheets?: boolean;
+}
+
 export interface NeutronConfig {
   adapter?: NeutronAdapter;
   server?: Omit<NeutronServerOptions, "rootDir">;
@@ -150,6 +165,8 @@ export interface NeutronConfig {
   markdown?: NeutronMarkdownConfig;
   /** Public environment variables for client code. */
   env?: NeutronEnvConfig;
+  /** Client router behaviour. */
+  client?: NeutronClientConfig;
 }
 
 export function defineConfig(config: NeutronConfig): NeutronConfig {

@@ -488,7 +488,9 @@ function buildHtmlPrefix(
 ): string {
   const stylesheetLinks = [...new Set(stylesheetHrefs)]
     .filter(Boolean)
-    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
+    // data-neutron-css: a route stylesheet the client router may unlink
+    // after navigation (client.unloadRouteStylesheets).
+    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}" data-neutron-css>`)
     .join("\n");
   return `<!DOCTYPE html>
 ${buildHtmlOpenTag(seo?.htmlAttrs)}

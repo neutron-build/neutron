@@ -97,7 +97,7 @@ export default function Page() { return h("p", null, "${name}-page"); }
   });
 
   const links = (html: string) =>
-    [...html.matchAll(/<link rel="stylesheet" href="([^"]+)">/g)].map((match) => match[1]);
+    [...html.matchAll(/<link rel="stylesheet" href="([^"]+)" data-neutron-css>/g)].map((match) => match[1]);
 
   it("in the document and in the navigation payload", async () => {
     const shop = await (await fetch(`${baseUrl}/shop`, { headers: { accept: "text/html" } })).text();

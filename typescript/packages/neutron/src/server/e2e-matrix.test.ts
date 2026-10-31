@@ -263,7 +263,7 @@ describe("server e2e matrix", () => {
       expect(appHtml.headers.get("content-type")).toContain("text/html");
       const appHtmlText = await appHtml.text();
       expect(appHtmlText).toContain("User route: User 1");
-      expect(appHtmlText).toContain('<link rel="stylesheet" href="/assets/index-test.css">');
+      expect(appHtmlText).toContain('<link rel="stylesheet" href="/assets/index-test.css" data-neutron-css>');
 
       const appJson = await fetch(`${baseUrl}/users/1`, {
         headers: { Accept: "application/json" },

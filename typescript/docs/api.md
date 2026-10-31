@@ -149,6 +149,18 @@ Navigation:
 - `go(delta)`
 - `route(value)` typed route helper.
 
+Stylesheets across client navigation: by default a route's stylesheets stay
+linked after you navigate away (as in Next's App Router), so rules that
+conflict between pages resolve by load order. `client: {
+unloadRouteStylesheets: true }` in `neutron.config.ts` unlinks, once the new
+page has rendered, the route stylesheets it does not list; the client entry's
+and layouts' stylesheets (in every route's list) and links a `head()` adds stay.
+The cost: navigating back re-requests the sheet (normally an HTTP-cache hit)
+before the page renders.
+
+Server Actions: `"use server"` modules, `getActionContext()`,
+`ServerActionError` — see [server-actions.md](./server-actions.md).
+
 Typed routing types:
 
 - `RoutePath`
