@@ -131,3 +131,44 @@ script — quiet-host window, then `nbench run vector-sift1m-qdrant` — with th
 release-built client. Its result (recorded row, or refusal by the unchanged
 check with the reason surfaced per B-0-F6) lands in this directory as
 `vector-sift1m-qdrant.json` with `REPORT.md`.
+
+### Re-measure outcome (recorded, not refused)
+
+`vector-sift1m-qdrant.json`, 2026-10-31, run 08:12–08:23 UTC after a
+quiet-host window (load1 0.30 → 1.10), release client, unchanged 10 ms
+check, init digest **matched** the committed expectation
+(`count=1000000 sample=128 fnv=1150bcb2fd7736a5` — the pinned dataset
+reproduces the 2026-10-19-era content exactly); the final digest had no
+prior expectation (no previous run of this row ever reached it) and was
+first-run recorded with the same value.
+
+The fresh collection the row built settled before the passes —
+`index state at init end: green, 1,000,000 indexed (1x points), 8 segments`
+(`row-collection-info-at-init.txt` beside this file) — and measured, warm
+medians (n=5):
+
+| ef_search | qps | recall@10 | p50 ms | server p50 ms | c−s ms |
+|---|---|---|---|---|---|
+| 16 | 2404 | 0.9410 | 0.344 | 0.221 | 0.12 |
+| 32 | 2115 | 0.9811 | 0.380 | 0.276 | 0.10 |
+| 64 | 664 | 0.9951 | 1.566 | 1.043 | 0.52 |
+| 128 | 409 | 0.9989 | 2.450 | 1.771 | 0.68 |
+| 256 | 278 | 0.9992 | 3.666 | 2.789 | 0.88 |
+
+Every warm pass is far under the unchanged limit; the release client's
+excess over the server stays ≤ 0.9 ms at every ef. Recall@10 at ef=16 is
+0.9410 — next to chain7's 0.9457 on its settled collection and far above the
+wedged collection's 0.8774 — and the sweep is monotone to 0.9992.
+
+**The two states side by side are the card's answer.** Same pinned data,
+same HNSW parameters, same client protocol: a settled collection
+(green, 8 segments, 1x indexed) measures 0.22 ms server p50 and 0.9410
+recall@10 at ef=16; the preserved chain10 collection (grey, 92 segments,
+3.86x indexed, update_queue 0 forever) measures 8.4–8.5 ms server p50 and
+0.8774. The readiness rule this row uses — `green + all points` — cannot
+distinguish them (chain10's collection was also green when its init ended,
+then wedged), which is the Qdrant configuration question for a P judgement
+per the card's arm 2: whether readiness should additionally require the
+optimizer to be settled, and/or whether the 10 ms sanity limit should change
+for a collection that is green-but-unoptimized. This card changes neither;
+the evidence for that judgement is this directory.
