@@ -13,6 +13,7 @@ import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-m
 import { isResponse, withMutableHeaders } from "../core/response.js";
 import { dispatchResourceHandler, isResourceRoute } from "../core/resource-routes.js";
 import { resolveClientTier } from "../core/render-app-route.js";
+import { transformSsrCommonJs } from "./ssr-cjs.js";
 import {
   compileRouteRules,
   resolveRouteRuleHeaders,
@@ -784,6 +785,13 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     transform(code, id, options) {
       if (id.startsWith("\0")) {
         return null;
+      }
+
+      // CommonJS the SSR runner inlines cannot run there as written. Builds
+      // bundle it with Rolldown instead (see vite/ssr-cjs.ts).
+      if (options?.ssr && !isBuild && id.includes("/node_modules/")) {
+        const cjs = transformSsrCommonJs(code, stripQueryFromId(id));
+        if (cjs !== null) return { code: cjs, map: null };
       }
 
       const cleanId = normalizePathForComparison(stripQueryFromId(id));

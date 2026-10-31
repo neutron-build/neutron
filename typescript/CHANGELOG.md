@@ -253,6 +253,24 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **CommonJS dependencies run in the SSR module runner.** Vite's runner
+  evaluates ESM only, so a CommonJS module it inlined — every dependency
+  under react-compat's blanket `ssr.noExternal` — failed on its first
+  `require` (`require is not defined`). Externalizing them per app
+  (`ssr.external: [...]`) worked for plain packages but not for the
+  React-ecosystem ones (`use-sync-external-store`, behind zustand, cmdk,
+  @tiptap/react, …): natively, their `require("react")` loads real React
+  beside Preact. `dev`, `start` on the Vite runtime and the build's prerender
+  now rewrite each inlined CommonJS module under `node_modules`: a package
+  that declares no react/react-dom/preact dependency is loaded by Node
+  (`createRequire`); a React-ecosystem package runs in the runner with its
+  own `require`, whose React-family, relative and React-ecosystem requests
+  are hoisted to imports — through the react → preact/compat aliases, on the
+  page's Preact — and whose other requests go to Node. `module.exports` is
+  the module's default export (`.default` for `__esModule` modules) and its
+  keys are named exports. Builds (the `start` server bundle, the client)
+  were already fine — Rolldown bundles CommonJS itself — and are unchanged.
+  Per-app `ssr.external` lists for CommonJS packages are no longer needed.
 - **Nested islands hydrate once.** `initIslands` hydrated every
   `<neutron-island>` in the document, including a marker inside another
   island's subtree (`<Island component={Outer}/>` where Outer renders

@@ -2296,3 +2296,76 @@ export default function App() { return h("p", null, "app-page"); }
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// CommonJS dependencies under react-compat (F-P3-5), on every SSR path.
+// ---------------------------------------------------------------------------
+
+const CJS_PAGE = (mode: "static" | "app") => `import { useStore } from "store-shim";
+import extend from "plain-cjs";
+export const config = { mode: "${mode}" };
+export default function Page() {
+  return <p>{"cjs-" + "${mode}=" + useStore(() => "s") + ":" + Object.keys(extend({ a: 1 }, { b: 2 })).join("")}</p>;
+}
+`;
+
+describe("neutron-ts (process): CommonJS dependencies under react-compat", () => {
+  it("load in the prerender, start (bundle and Vite runtime) and dev", { timeout: 300_000 }, async () => {
+    const dir = makeBuildFixture({
+      "package.json": JSON.stringify({ name: "cjs-fixture", type: "module" }),
+      "neutron.config.ts": `export default { runtime: "react-compat" };\n`,
+      "index.html": '<!doctype html><html><body><div id="app"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+      "src/main.tsx": `import { init, registerRoutes } from "@neutron-build/core/client";
+import { routes } from "virtual:neutron/routes";
+registerRoutes(routes);
+void init();
+`,
+      // The shape of use-sync-external-store: CommonJS that requires react.
+      "node_modules/store-shim/package.json": JSON.stringify({ name: "store-shim", main: "index.js", peerDependencies: { react: "*" } }),
+      "node_modules/store-shim/index.js":
+        "'use strict';\nif (process.env.NODE_ENV === 'production') {\n  module.exports = require('./cjs/shim.production.js');\n} else {\n  module.exports = require('./cjs/shim.development.js');\n}\n",
+      "node_modules/store-shim/cjs/shim.production.js":
+        "'use strict';\nvar React = require('react');\nexports.useStore = function (get) { return React.useState(get)[0] + typeof React.useSyncExternalStore; };\n",
+      "node_modules/store-shim/cjs/shim.development.js":
+        "'use strict';\nvar React = require('react');\nexports.useStore = function (get) { return React.useState(get)[0] + typeof React.useSyncExternalStore; };\n",
+      // The shape of extend / highlight.js: plain CommonJS.
+      "node_modules/plain-cjs/package.json": JSON.stringify({ name: "plain-cjs", main: "index.js" }),
+      "node_modules/plain-cjs/index.js": "module.exports = function extend(a, b) { return Object.assign({}, a, b); };\n",
+      "src/routes/index.tsx": CJS_PAGE("app"),
+      "src/routes/about.tsx": CJS_PAGE("static"),
+    });
+    const expectApp = "cjs-app=sfunction:ab";
+    const serve = async (command: "start" | "dev") => {
+      const port = await freePort();
+      const proc = runCli(command, dir, { NEUTRON_PORT: String(port), NEUTRON_HOST: "127.0.0.1" });
+      try {
+        await waitForHealth(`http://127.0.0.1:${port}/health`, proc, 60_000);
+        const res = await fetch(`http://127.0.0.1:${port}/`, { headers: { accept: "text/html" } });
+        return { status: res.status, body: await res.text(), output: proc.output() };
+      } finally {
+        proc.child.kill("SIGTERM");
+        await proc.exited;
+      }
+    };
+    try {
+      await runBuild(dir);
+      const about = fs.readFileSync(path.join(dir, "dist", "about", "index.html"), "utf-8");
+      assert.ok(about.includes("cjs-static=sfunction:ab"), about);
+
+      const bundled = await serve("start");
+      assert.match(bundled.output, /Modules: prebuilt server bundle/, bundled.output);
+      assert.ok(bundled.body.includes(expectApp), bundled.body);
+
+      fs.rmSync(path.join(dir, "dist", ".neutron-server-bundle.json"));
+      const viaVite = await serve("start");
+      assert.match(viaVite.output, /Modules: transformed through Vite/, viaVite.output);
+      assert.ok(viaVite.body.includes(expectApp), viaVite.body);
+
+      const dev = await serve("dev");
+      assert.equal(dev.status, 200, dev.body);
+      assert.ok(dev.body.includes(expectApp), dev.body);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

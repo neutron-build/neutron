@@ -693,4 +693,67 @@ describe("react-compat SSR through the Vite graph", () => {
       await server.close();
     }
   });
+
+  // F-P3-5: the runner inlines every dependency under react-compat, and a
+  // CommonJS module has no require/module/exports there. Externalizing the
+  // React-ecosystem ones is no fix (Node would load real React), so both
+  // shapes must run: a CJS shim that requires react (use-sync-external-store),
+  // and a plain CJS package (extend, highlight.js), each imported by name.
+  it("start shape: CommonJS dependencies load in the SSR runner, React-ecosystem ones on preact/compat", async () => {
+    const root = makeHooksStartShapeApp();
+    const vendor = path.join(root, "vendor", "node_modules");
+    const write = (rel: string, source: string) => {
+      fs.mkdirSync(path.dirname(path.join(vendor, rel)), { recursive: true });
+      fs.writeFileSync(path.join(vendor, rel), source);
+    };
+    write("store-shim/package.json", JSON.stringify({ name: "store-shim", main: "index.js", peerDependencies: { react: "*" } }));
+    write(
+      "store-shim/index.js",
+      "'use strict';\nif (process.env.NODE_ENV === 'production') {\n  module.exports = require('./cjs/shim.production.js');\n} else {\n  module.exports = require('./cjs/shim.development.js');\n}\n"
+    );
+    for (const flavor of ["production", "development"]) {
+      write(
+        `store-shim/cjs/shim.${flavor}.js`,
+        "'use strict';\nvar React = require('react');\nexports.useStore = function useStore(get) { var s = React.useState(get); return s[0] + ':' + typeof React.useSyncExternalStore; };\n"
+      );
+    }
+    write("plain-cjs/package.json", JSON.stringify({ name: "plain-cjs", main: "lib/index.js" }));
+    write("plain-cjs/lib/index.js", "var path = require('path');\nmodule.exports = function extend(a, b) { return Object.assign({}, a, b); };\nmodule.exports.sep = path.sep;\n");
+    fs.symlinkSync(path.join(vendor, "store-shim"), path.join(root, "node_modules", "store-shim"), "dir");
+    fs.symlinkSync(path.join(vendor, "plain-cjs"), path.join(root, "node_modules", "plain-cjs"), "dir");
+    fs.writeFileSync(
+      path.join(root, "src", "routes", "cjs.ts"),
+      [
+        'import { createElement } from "react";',
+        'import { useStore } from "store-shim";',
+        'import extend, { sep } from "plain-cjs";',
+        "",
+        'export const config = { mode: "app" };',
+        "",
+        "export default function Page() {",
+        '  const merged = extend({ a: 1 }, { b: 2 });',
+        '  return createElement("span", { "data-cjs": "ok" }, "store:" + useStore(() => "s") + ";extend:" + JSON.stringify(merged) + ";sep:" + sep);',
+        "}",
+        "",
+      ].join("\n")
+    );
+    const port = await getFreePort();
+    const server = await createNeutronServer({
+      mode: "ssr",
+      runtime: "react-compat",
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      compress: false,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/cjs`);
+      const html = await res.text();
+      expect(res.status, html).toBe(200);
+      // useState ran on the renderer's Preact (no '__H' split), and React is compat.
+      expect(html).toContain(`store:s:function;extend:{&quot;a&quot;:1,&quot;b&quot;:2};sep:${path.sep}`);
+    } finally {
+      await server.close();
+    }
+  });
 });
