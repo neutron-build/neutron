@@ -28,6 +28,7 @@ mod vector;
 use error::{Error, Result};
 use json::Value;
 use params::Params;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -43,7 +44,9 @@ USAGE:
   nbench cleanup
   nbench host-info
   nbench vec-qdrant-load   --base F --host H --port P [--collection C] [--m N] [--ef-construct N] [--batch N]
-  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run]
+  nbench vec-qdrant-search --query F --truth F --host H --port P --ef N [--limit K] [--metrics-out F] [--pass-kind cold|warmup|run] [--latency-out F] [--exact] [--max-queries N] [--allow-debug-client]
+  nbench vec-qdrant-info   --host H --port P [--collection C]
+  nbench qdrant-latency-verdict --client-p50-ms X --server-p50-ms Y
   nbench vec-qdrant-digest --host H --port P [--collection C]
   nbench vec-qdrant-version --host H --port P
   nbench vec-pg-copy       --base F
@@ -88,6 +91,12 @@ fn collect_sets(args: &[String]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Whether a boolean flag (e.g. `--exact`) is present. Accepts the
+/// `-exact`/`--exact` spellings `arg_value` allows for valued options.
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a.trim_start_matches('-') == name)
 }
 
 fn write_metrics_json(path: Option<&str>, v: &Value) -> Result<()> {
@@ -156,6 +165,20 @@ fn cmd_vec_qdrant_load(args: &[String]) -> Result<()> {
         vectors.len(),
         start.elapsed().as_secs_f64()
     );
+    // Card B-0-F7 Work 2: the index state the passes will measure —
+    // segment count and the raw config — is part of every init log.
+    // `green` does not mean the optimizer finished (the preserved
+    // chain10 collection was grey with 92 segments and 3.86x indexed
+    // vectors), so the summary line is recorded, never assumed.
+    if let Ok(info) = vector::qdrant_collection_info(&host, port, &collection)
+        && let Ok(s) = vector::collection_summary(&info)
+    {
+        eprintln!(
+            "index state at init end: status={} points={} indexed={} segments={} \
+             update_queue={}",
+            s.status, s.points, s.indexed, s.segments, s.update_queue
+        );
+    }
     Ok(())
 }
 
@@ -175,6 +198,15 @@ struct QdrantPassNumbers {
     p50_ms: f64,
     /// 99th percentile per-query latency in milliseconds.
     p99_ms: f64,
+    /// Median **server-reported** per-query time in milliseconds (card
+    /// B-0-F7 Work 1), when the pass recorded it.
+    server_p50_ms: Option<f64>,
+    /// 99th percentile server-reported time in milliseconds.
+    server_p99_ms: Option<f64>,
+    /// Brute-force control pass (`params.exact`): measures the same
+    /// collection with no HNSW hint; its latency is not comparable to
+    /// an ANN pass and it is never sanity-checked (card B-0-F7).
+    exact: bool,
 }
 
 /// Assemble the Qdrant pass metrics object, enforcing the per-query
@@ -185,11 +217,17 @@ struct QdrantPassNumbers {
 /// unit-tested seam (gate round-3 mutant G4 unwired the check inside
 /// the command and passed 92/92). A failed sanity check returns `Err`
 /// before any metrics exist, so a stalled pass can never record.
+///
+/// Card B-0-F7: the server-reported p50 travels in the metrics next to
+/// the client p50 whenever the pass recorded one, and an `exact`
+/// control pass is exempt from the ANN latency sanity (it pays a full
+/// scan by design; the exemption is exactly this flag, never a missing
+/// value — a pass without the marker is enforced as before).
 fn qdrant_pass_metrics(pass_kind: &str, n: &QdrantPassNumbers) -> Result<Value> {
-    if vector::latency_sanity_enforced(pass_kind) {
+    if !n.exact && vector::latency_sanity_enforced(pass_kind) {
         vector::qdrant_latency_sanity(n.p50_ms)?;
     }
-    Ok(Value::obj(vec![
+    let mut fields: Vec<(&str, Value)> = vec![
         ("qps", Value::n(n.qps)),
         ("recall_at_10", Value::n(n.recall)),
         ("queries", Value::n(n.queries as f64)),
@@ -205,7 +243,17 @@ fn qdrant_pass_metrics(pass_kind: &str, n: &QdrantPassNumbers) -> Result<Value> 
         ),
         ("pass_kind", Value::s(pass_kind)),
         ("limit", Value::n(n.limit as f64)),
-    ]))
+    ];
+    if let Some(s) = n.server_p50_ms {
+        fields.push(("server_p50_ms", Value::n(s)));
+    }
+    if let Some(s) = n.server_p99_ms {
+        fields.push(("server_p99_ms", Value::n(s)));
+    }
+    if n.exact {
+        fields.push(("exact", Value::Bool(true)));
+    }
+    Ok(Value::obj(fields))
 }
 
 fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
@@ -228,9 +276,33 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     // exempt from the p50 sanity limit (engine warm-up after restart is
     // what cold measures); any missing or unknown kind is enforced.
     let pass_kind = arg_value(args, "pass-kind").unwrap_or_default();
+    // Card B-0-F7 Work 1: optional per-query client/server latency CSV.
+    let latency_out = arg_value(args, "latency-out");
+    // Card B-0-F7 recall control: `exact` asks Qdrant for a brute-force
+    // pass (no `hnsw_ef`), which must reproduce the ground truth on the
+    // same collection; such a pass is a control, never a sanity-checked
+    // measurement (see `qdrant_pass_metrics`).
+    let exact = has_flag(args, "exact");
+    // Truncate the pass to the first N queries (used by the exact
+    // control, which scans the whole collection per query).
+    let max_queries: usize = match arg_value(args, "max-queries") {
+        Some(s) => s
+            .parse()
+            .map_err(|_| Error::Usage("bad max-queries".into()))?,
+        None => usize::MAX,
+    };
 
-    let queries = vector::read_fvecs(&PathBuf::from(&query_path))?;
-    let truth = vector::read_ivecs(&PathBuf::from(&truth_path))?;
+    let mut queries = vector::read_fvecs(&PathBuf::from(&query_path))?;
+    let mut truth = vector::read_ivecs(&PathBuf::from(&truth_path))?;
+    if max_queries < queries.len() {
+        queries.truncate(max_queries);
+        truth.truncate(max_queries);
+    }
+    if queries.is_empty() {
+        return Err(Error::Usage(
+            "search pass has no queries (check --max-queries and the query file)".into(),
+        ));
+    }
 
     // One persistent connection for the whole pass (gate nv3-B-0-gate-1
     // finding 5): the pgvector arm times a single psql session, so
@@ -240,18 +312,35 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
     let mut conn = crate::http::Connection::connect(&host, port, Duration::from_secs(120))?;
     let mut results: Vec<Vec<i64>> = Vec::with_capacity(queries.len());
     let mut lat_ms: Vec<f64> = Vec::with_capacity(queries.len());
+    let mut server_ms: Vec<f64> = Vec::with_capacity(queries.len());
     let start = Instant::now();
     for q in &queries {
         let t0 = Instant::now();
-        let ids = vector::qdrant_search_on(&mut conn, &collection, q, limit, ef)?;
+        let out = vector::qdrant_search_on(&mut conn, &collection, q, limit, ef, exact)?;
         lat_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-        results.push(ids);
+        server_ms.push(out.server_time_s * 1000.0);
+        results.push(out.ids);
     }
     let wall = start.elapsed().as_secs_f64();
     let qps = queries.len() as f64 / wall;
     let recall = vector::recall_at_k(&results, &truth, limit)?;
+    // Card B-0-F7 Work 1: per-query client/server pairs are evidence,
+    // not just a summary. Written in query order BEFORE the vectors are
+    // sorted for percentiles, so each row keeps its own pairing; an
+    // all-zero server column is the card's first named instrumentation
+    // mutant and is impossible here — a missing `time` field fails the
+    // pass loudly inside `parse_search_response`.
+    if let Some(path) = latency_out.as_deref() {
+        let mut csv = String::from("client_ms,server_ms\n");
+        for (c, s) in lat_ms.iter().zip(server_ms.iter()) {
+            let _ = writeln!(csv, "{c:.6},{s:.6}");
+        }
+        std::fs::write(path, csv).map_err(Error::Io)?;
+    }
     lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    server_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p50 = percentile_of(&lat_ms, 0.5);
+    let server_p50 = percentile_of(&server_ms, 0.5);
     let v = qdrant_pass_metrics(
         &pass_kind,
         &QdrantPassNumbers {
@@ -262,11 +351,15 @@ fn cmd_vec_qdrant_search(args: &[String]) -> Result<()> {
             recall,
             p50_ms: p50,
             p99_ms: percentile_of(&lat_ms, 0.99),
+            server_p50_ms: Some(server_p50),
+            server_p99_ms: Some(percentile_of(&server_ms, 0.99)),
+            exact,
         },
     )?;
     write_metrics_json(metrics_out.as_deref(), &v)?;
     eprintln!(
-        "ef={ef}: qps={qps:.1} recall@{limit}={recall:.4} p50={p50:.3}ms p99={:.3}ms",
+        "ef={ef}: qps={qps:.1} recall@{limit}={recall:.4} p50={p50:.3}ms p99={:.3}ms \
+         server_p50={server_p50:.3}ms",
         percentile_of(&lat_ms, 0.99)
     );
     Ok(())
@@ -278,6 +371,52 @@ fn cmd_vec_qdrant_version(args: &[String]) -> Result<()> {
         .parse()
         .map_err(|_| Error::Usage("bad port".into()))?;
     println!("{}", vector::qdrant_version(&host, port)?);
+    Ok(())
+}
+
+/// Apply the pre-registered card B-0-F7 Work 4 rule to one pass's p50s
+/// and print the verdict (used by the diagnosis script so the rule has
+/// exactly one implementation — the unit-tested one in `vector.rs`).
+fn cmd_qdrant_latency_verdict(args: &[String]) -> Result<()> {
+    let c: f64 = required(args, "client-p50-ms")?
+        .parse()
+        .map_err(|_| Error::Usage("bad client-p50-ms".into()))?;
+    let s: f64 = required(args, "server-p50-ms")?
+        .parse()
+        .map_err(|_| Error::Usage("bad server-p50-ms".into()))?;
+    let verdict = vector::diagnose_client_server_latency(c, s)?;
+    let (c, s, d) = verdict.numbers();
+    let arm = match verdict {
+        vector::LatencyVerdict::ClientExcess { .. } => "CLIENT-DEFECT",
+        vector::LatencyVerdict::ServerSide { .. } => "SERVER-SIDE",
+        vector::LatencyVerdict::WithinTolerances { .. } => "WITHIN-TOLERANCES",
+    };
+    println!("VERDICT {arm} c={c:.3}ms s={s:.3}ms c-s={d:.3}ms");
+    Ok(())
+}
+
+/// Print a collection's info document (card B-0-F7 Work 2): the raw
+/// `result` JSON on stdout (the committed artefact), a one-line
+/// diagnosis summary on stderr (the init log's provenance line).
+fn cmd_vec_qdrant_info(args: &[String]) -> Result<()> {
+    let host = required(args, "host")?;
+    let port: u16 = required(args, "port")?
+        .parse()
+        .map_err(|_| Error::Usage("bad port".into()))?;
+    let collection = arg_value(args, "collection").unwrap_or_else(|| "nbench-sift".into());
+    let result = vector::qdrant_collection_info(&host, port, &collection)?;
+    let summary = vector::collection_summary(&result)?;
+    eprintln!(
+        "collection {collection}: status={} points={} indexed={} ({}x points) \
+         segments={} update_queue={}",
+        summary.status,
+        summary.points,
+        summary.indexed,
+        summary.indexed as f64 / summary.points.max(1) as f64,
+        summary.segments,
+        summary.update_queue
+    );
+    println!("{}", json::to_string(&result)?);
     Ok(())
 }
 
@@ -583,6 +722,8 @@ fn main() {
         Some("vec-qdrant-search") => ok_or_print(cmd_vec_qdrant_search(&argv[1..])),
         Some("vec-qdrant-digest") => ok_or_print(cmd_vec_qdrant_digest(&argv[1..])),
         Some("vec-qdrant-version") => ok_or_print(cmd_vec_qdrant_version(&argv[1..])),
+        Some("vec-qdrant-info") => ok_or_print(cmd_vec_qdrant_info(&argv[1..])),
+        Some("qdrant-latency-verdict") => ok_or_print(cmd_qdrant_latency_verdict(&argv[1..])),
         Some("vec-pg-copy") => ok_or_print(cmd_vec_pg_copy(&argv[1..])),
         Some("vec-pg-search") => ok_or_print(cmd_vec_pg_search(&argv[1..])),
         _ => {
@@ -626,6 +767,9 @@ mod tests {
                     recall: 0.94,
                     p50_ms: 44.07,
                     p99_ms: 49.0,
+                    server_p50_ms: Some(1.8),
+                    server_p99_ms: Some(2.2),
+                    exact: false,
                 },
             );
             let err = r.expect_err(&format!("kind {kind:?} must be enforced"));
@@ -644,11 +788,19 @@ mod tests {
                     recall: 0.94,
                     p50_ms: 1.8,
                     p99_ms: 2.4,
+                    server_p50_ms: Some(1.7),
+                    server_p99_ms: Some(2.1),
+                    exact: false,
                 },
             )
             .expect("healthy warm pass records");
             assert_eq!(v.get("p50_ms").and_then(Value::as_f64), Some(1.8));
             assert_eq!(v.get("pass_kind").and_then(Value::as_str), Some(kind));
+            // card B-0-F7 Work 1: the server p50 sits next to the
+            // client p50 whenever the pass recorded one — the c−s
+            // table is built from these two numbers.
+            assert_eq!(v.get("server_p50_ms").and_then(Value::as_f64), Some(1.7));
+            assert_eq!(v.get("server_p99_ms").and_then(Value::as_f64), Some(2.1));
         }
     }
 
@@ -669,6 +821,9 @@ mod tests {
                 recall: 0.94,
                 p50_ms: 15.37,
                 p99_ms: 40.0,
+                server_p50_ms: Some(14.9),
+                server_p99_ms: Some(38.0),
+                exact: false,
             },
         )
         .expect("cold pass is exempt from the sanity limit");
@@ -678,5 +833,36 @@ mod tests {
         assert!(vector::latency_sanity_enforced("run"));
         assert!(vector::latency_sanity_enforced("warmup"));
         assert!(vector::latency_sanity_enforced(""));
+    }
+
+    #[test]
+    fn pass_metrics_exempt_exact_controls_and_mark_them() {
+        // Card B-0-F7 recall control: an `exact` pass brute-force scans
+        // the whole collection per query — its latency is a different
+        // quantity from an ANN pass and must not be judged by the ANN
+        // sanity limit. Like the cold exemption, the exemption is one
+        // explicit marker (`exact: true`), carried in the metrics so a
+        // control can never masquerade as a measured pass; a pass
+        // without the marker is enforced exactly as before (previous
+        // test).
+        let v = qdrant_pass_metrics(
+            "run",
+            &QdrantPassNumbers {
+                ef: 16,
+                limit: 10,
+                queries: 100,
+                qps: 2.0,
+                recall: 1.0,
+                p50_ms: 480.0,
+                p99_ms: 600.0,
+                server_p50_ms: Some(470.0),
+                server_p99_ms: Some(590.0),
+                exact: true,
+            },
+        )
+        .expect("exact control is exempt from the ANN sanity limit");
+        assert_eq!(v.get("exact").and_then(Value::as_bool), Some(true));
+        assert_eq!(v.get("p50_ms").and_then(Value::as_f64), Some(480.0));
+        assert_eq!(v.get("server_p50_ms").and_then(Value::as_f64), Some(470.0));
     }
 }

@@ -28,6 +28,13 @@ case ${NB_MODE:?} in
       --collection nbench-sift \
       --m "${NB_P_HNSW_M:?}" --ef-construct "${NB_P_EF_CONSTRUCTION:?}" \
       2>&1 | tee "${NB_LOG:?}"
+    # Card B-0-F7 Work 2: the collection's segment count and config are
+    # recorded next to the init log — index state at measure time is
+    # evidence, not assumption (green does not mean the optimizer
+    # finished).
+    "$BIN" vec-qdrant-info --host "$HOST" --port "$PORT" \
+      --collection nbench-sift \
+      > "${NB_OUT}/collection-info.json" 2>> "${NB_LOG}"
     ;;
   cold|warmup|run)
     ef=$(series_get ef_search)
@@ -39,6 +46,7 @@ case ${NB_MODE:?} in
       --ef "$ef" --limit 10 \
       --pass-kind "${NB_MODE:?}" \
       --metrics-out "${NB_METRICS:?}" \
+      --latency-out "${NB_METRICS%.metrics.json}.latency.csv" \
       2>&1 | tee "${NB_LOG}"
     ;;
   *)
