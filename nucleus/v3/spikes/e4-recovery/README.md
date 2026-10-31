@@ -472,7 +472,203 @@ Copied verbatim from the card X-5c-F1 (its "Carried: X5-R14–R19" section, itse
 - **At the end of the attempt,** if any class is escalated, finish the attempt's remaining Work, then ESCALATE.
 - **Never** fix around an escalated class. Never exclude its seeds, retune to avoid it, or re-run only some seeds.
 
-## The first complete 10k campaign (run 3 of the attempt, committed)
+## Stage X-5c-F1's record (this card)
+
+### X5-R14: the non-reproducing digests — root-caused, fixed, pinned
+
+**The reproduction.** `verify`'s re-run of d2c8bba7 found seeds 180,
+559, 7474 and 8832 with different digests. On this host, seeds 559 and
+8832 re-run **stably** to a different digest than the committed file
+both quiet and loaded (559: committed `1004855635`, re-run
+`2039283878`; 8832: committed `551982438`, re-run `1502800514`);
+seeds 180/7474 reproduce. The committed variants are the rare ones —
+the product of d2c8bba7's specific 16-worker co-tenant mix.
+
+**The record-level divergence.** Seed 559 round 2: the **uniform crash
+point itself moved** (`uniform@y:2706` → `uniform@y:15841`) — the
+probe pass measured a different total scheduler-yield count, so the
+workload pass ran a different schedule — and with it `lo`/`hi`/`c`/
+`frontier`/`gc_w`/`ackl` and the quota flags. Seed 8832 round 1: `hi`
+8 → 7 — a commit record's WAL write was issued in one run and not the
+other.
+
+**The root cause (the host-mutation log, X5-R14's method).** The
+diagnostic `E4_SCHED_LOG` (committed, **default off**, never a digest
+input) logs every `Sched::acquire` with the yield count, the baton
+holder, the crashed flag and the OS thread. Two windows put host steps
+outside baton ownership, and OS scheduling decided their interleaving:
+
+- **Window A — the thread-start window.** A spawned **service** task's
+  first scheduler contact was its loop-entry `Cx::with` (`h:writer`,
+  `h:ev` + `evict:pick`, `h:ck`), not a park: the log shows them at
+  `y=0` with `run=Some(0)` (the harness still holds the baton), and
+  mid-round (`h:writer` at `y=9` with `run=Some(5)`).
+  `wal_writer:take` can drain the WAL buffer and `evict:pick` advances
+  the pool clock hand — sim-visible decisions in OS start order. A
+  controlled flip proves it end-to-end: a diagnostic entry spin
+  (removed) of 10 OS yields before the service bodies' first
+  instruction changed seed 559's digest to a third value
+  (`1476281624`) at the same code.
+- **Window B — the post-crash unwind window.** All four world-fail
+  paths (`yield_baton_budget`'s crash and livelock branches,
+  `handoff_locked`'s deadlock branch, `deliver_crash`) set
+  `running = None` and make every waiter runnable at once; from then
+  on the unwinding tasks' host steps ran concurrently — the log shows
+  `unpin`, `tree_unlock`, `gate_release`, `h:taskerr`, `h:taskcxx` at
+  `run=None crashed=true`, interleaved in OS order across threads.
+
+`Sched::acquire` (src/sim/sched.rs) granted the world lock to **any**
+caller: it never checked `running == Some(me)` and never checked
+`crashed` — exactly the ruling's lead (a), with lead (c) (reads
+outside the baton) the same defect's read side. Lead (b) (nested
+recovery crashes) is a correlation, not a cause: recovery worlds are
+single-task.
+
+**The fix (commit 9b041a3d).** One gate in `Sched::acquire`, which now
+carries the caller's task id:
+
+- **a live world** grants a host step only to the baton holder
+  (`running == Some(me)`); anything else is a loud
+  `SimFail::Baton` naming the site (window A closed). The harness's
+  `run_task` parks every service task before its first host step
+  (`h:entry`), and `tests/store.rs`'s `run_world` driver gained the
+  same entry barrier.
+- **a failed world** grants a host step only to the **unwind turn** —
+  `SchedCore.unwind_turn`, set at every world-fail site to the smallest
+  unfinished `TaskId` and advanced by `finish` (window B closed): the
+  ruling's "deterministic unwind: the baton passes through the
+  unwinding tasks in TaskId order". `HARNESS` is exempt (single-task
+  recovery/extraction/checkpoint worlds; the multi-task harness thread
+  never acquires after the world fails — it joins, and its post-join
+  reads use `Sched::lock`).
+
+**Pins.** `r14_pre_baton_host_step_is_refused` (a live world's
+non-holder acquire is refused; a hand-rolled world whose `start` is
+never called makes the state deterministic) and
+`r14_unwind_host_steps_run_in_taskid_order` (task 2 delivers the crash
+while holding the baton; both tasks' unwind host mutations land in
+`TaskId` order). Both demonstrated failing on the pre-fix acquire,
+3/3 runs: the first returns `Ok`, the second logs `[2, 1]`.
+
+**Stress evidence (the ruling's pin 2).** The four seeds re-run 25
+times each at `--threads 16` while a concurrent 16-thread `run`
+(seeds 3000..10000) loaded the host: **one digest per seed** — 180 →
+`3787622012`, 559 → `2325742370`, 7474 → `2750567368`, 8832 →
+`1502800514` (all four differ from d2c8bba7's, as the fix must).
+
+**Digest stability vs d2c8bba7 (the ruling's pin 3).** See the
+campaign section below: the shift is total and explained by the
+mechanism — every multi-task world previously contained window-A
+service reads (the log shows them in every workload world), so every
+seed whose digest depends on a multi-task schedule changes; the
+fresh campaign's digests reproduce exactly (verify's re-run).
+
+### X5-R15: the reporting corrections — landed, pinned
+
+- **(a)** `E4 FOLD FAILING_SEEDS=<n> FAILING_ROUNDS=<n>
+  TWIN_FAILING_ROUNDS=<n> DEFECT_SEEDS=<n>` after the unchanged Work 7
+  line (`campaign::fold_line`; commit dffe6744). Validated against
+  d2c8bba7: FAILING_SEEDS=1598 (the ruling's corrected count — the
+  1,560 of the first record plus the twin-failing seeds), 
+  FAILING_ROUNDS=1427, TWIN_FAILING_ROUNDS=100 (46 MP + 54 MW),
+  DEFECT_SEEDS=150. Pin:
+  `r15a_fold_line_from_a_literal_2_seed_record_set` — a passing round
+  carrying the recovery-`Err` default O-1(a) text contributes nothing
+  (the 1,315 rounds `O1_FAIL` wrongly counted).
+- **(b)** `verify` reports all three checks (seed set; digests with
+  the non-reproducing list; the full quota table) before one exit
+  decision (`verify_seed_set_ok`/`verify_digest_report`/
+  `verify_exit_code`), and `--no-quotas` waives only the quota check
+  (X-5c-F1's Acceptance form; X-5c's own keeps plain `verify`). Pin:
+  `r15b_verify_reports_all_three_checks_before_failing`.
+- **(c)** The campaign record corrected in place: the quota paragraph
+  no longer claims the digests reproduce; the failing-seed count is
+  1,598 with the seed-level defect seeds; the three missing
+  failing-round groups recorded (MP O-3(a) served corruption, 9
+  rounds — MP-A; O-3(c) XX001 with no damaged referenced slot, 25
+  rounds; O-3(c) "no twin", 19 rounds — NO-TWIN). Commit 20fc5370.
+- **(e)** `examples/` keeps only what "How to reproduce" uses
+  (`pin.rs`, referenced there); `dbg-seed.rs` (823d4f51's named
+  scratch) removed; `restore_probe.local.py` was never in the tree.
+- **(d)** RSS: recorded beside the campaign below.
+
+### X5-R16's instrumentation classes
+
+**NEVER-FIRED (instrumentation: workload) — fixed, pinned (commit
+2da915a8).** 150 seeds carried "the crash spec never fired" (110 C, 35
+twin rounds, 5 other MW; 146 targeting `Mid2`). Root cause: the
+targeted draw picked `CKPT_HOOKS[(seed/20)%10]` of checkpoint index
+`target_ckpt` unconditionally; when that checkpoint's step 2 had
+nothing to write — the tiny pool's evictor had written every dirty
+page itself, so step 2 adopted and `Mid2` (fired after every step-2
+write) never fired — the crash could not happen (seed 660 round 0:
+every checkpoint's hook mask is `1015`, all hooks but `Mid2`). The
+fix: the targeted draw runs the same counting pass the uniform draw
+runs; the checkpointer records per completion index the mask of hooks
+reached (`WorkloadObs::ckpt_hooks_hit`, `ckpt::hook_bit`), and the
+draw keeps the seed's hook but lands on an index that reaches it —
+the drawn index if it does, else the smallest — falling back, when
+the drawn hook is unreachable at every index, to a hook the round
+does reach, drawn deterministically from `(seed, round)` over the
+union mask. Seeds 0..1000 re-run with **zero defects and zero unfired
+rounds**. Pin `r16_never_fired_targeted_draws_reach_their_hook`
+(literal configs 60 and 660), demonstrated failing on the reverted
+draw. No workload change (X5-R17's retune is X-5c-F2's).
+
+**NO-TWIN (instrumentation: harness) — fixed, pinned (commit
+0a8f196b).** 19 MP/MW rounds failed as "MP/MW round with XX001 and no
+twin (harness defect)". Root cause: the twin supply was built only
+when the twin round's recovery returned `Ok`; a twin whose recovery
+returned `Err` supplied nothing and broke the twin chain, so the real
+round (and every later round of the seed) reached the oracle with no
+O-3 (c) sets. The fix: a failed twin still supplies its recovery
+reads (collected on both arms) and its crashed-disk image slots (the
+image its recovery tried to open), and a broken twin chain re-seeds
+from the real round's own start (Work 2.5's twin: the same script,
+crash and F-CRASH resolutions, faultless, judged as class C). The
+repro seeds (1267, 1769, 2149 checked) clear the text; their
+remaining failures are real O-3 findings — F2's classes. Pin
+`r16_no_twin_is_always_supplied` (literal configs 1267 and 1769),
+demonstrated failing on the reverted supply.
+
+**MP-E: O-3 (e) under page damage — completeness fixed and pinned;
+exactness escalated (commit 12b54965).**
+
+- **Completeness (205 rounds, "tainted referenced slot … not
+  reported") — a harness defect, fixed.** Every one is a
+  recovery-`Err` round, and the repro seeds 47/118/198 each name
+  **slot 0**: the §2.1 **file header**, which §3.3's reference model
+  has no reference for, so amcheck (i) can neither check nor report
+  it — but the harness's referenced set hardcoded it, making every
+  media fault on its range an unreportable "tainted referenced slot".
+  The referenced set is now the image's own slots (map, free set,
+  metas); the header stays covered by open's own read (XX001 at
+  `Open`). Pin `r16_mpe_referenced_set_excludes_the_file_header`
+  (literal configs 47/118/198), demonstrated failing on the reverted
+  `used.insert(0)`.
+- **Exactness (199 rounds, "amcheck reported slot … neither tainted
+  nor in R") — ESCALATED with the round evidence; not fixed here.**
+  Seed 37 round 0 refutes the ruling's two candidates: `durable_image`
+  and the store's recovery open the **same** meta (k=1 — recovery's
+  own `Err` names "map page slot 11"), and the R11 (a) loop faithfully
+  applies §3.3. The durable-write history shows slot 11's last covered
+  write (dw[19], epoch-header 98) **predates the meta k=1 write
+  (dw[23]) that references it** — image k=1's map embedded a reference
+  that did not match the slot's durable content at meta time. That is
+  C-XX's mechanism ("a referenced page fails §3.3 with no media
+  fault") inside a Q14 rollback round: the TORN meta fault removes
+  k=2, open falls back to k=1, and k=1's stale reference fails §3.3
+  — a true failure, not an instrumentation artifact. R is correctly
+  empty per R5's text (both of slot 11's writes precede the k=2
+  graduation that anchors R). Per the card's limit — R5 not reopened,
+  R not widened, a finding outside R5's text with R computed correctly
+  is a failure — the exactness half is **escalated to X-5c-F2** (with
+  seed 37 round 0 as the deterministic repro: `run --seeds 37..38`,
+  `O-3(e): amcheck reported slot 11 that is neither tainted nor in
+  R`, `mrb=true rlen=0`, metas k=0@1, k=1@2, k=2@1 torn away).
+
+## The first complete 10k campaign (run 3 of the attempt, committed —
+## d2c8bba7, superseded as the triage file by X-5c-F1's run below)
 
 `run --seeds 0..10000 --threads 16` after the gc fix and X5-R13
 (a)–(d): **exit 0, ~13 min wall on a quiet host (16 threads), peak
