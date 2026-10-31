@@ -641,6 +641,28 @@ git -C "$r" checkout -q -B scratch/zs nucleus/v3-scaffold
 git -C "$r" commit -q --allow-empty -m "nucleus v3: ZS work"
 git -C "$r" checkout -q nucleus/v3-scaffold
 expect_ok "runner: a commit naming the card on another branch is stray" rsc ZS card/v3-ZS "$zs0" "nucleus v3: ZS work"
+# ZO and ZB (S-0-F2-F2-F1-F2): stray_commits' two filters. Each premise lists the
+# same commit with only the filter under test opened up, so the row's [] can come
+# from that filter alone. The listing reads every branch, so the scratch branches
+# are deleted afterwards.
+# ZO: committed (committer and author date) an hour before the window opens, on a
+# branch other than the card's. --since keeps it out (STRAY-SINCE-DROPPED lists it).
+zo0=$(( $(date +%s) - 3600 ))
+git -C "$r" branch -f card/v3-ZO nucleus/v3-scaffold
+git -C "$r" checkout -q -B scratch/zo nucleus/v3-scaffold
+GIT_COMMITTER_DATE="@$zo0 +0000" GIT_AUTHOR_DATE="@$zo0 +0000" git -C "$r" commit -q --allow-empty -m "nucleus v3: ZO work"
+git -C "$r" checkout -q nucleus/v3-scaffold
+expect_ok "runner: premise: ZO's early commit is listed by a window opened before it" rsc ZO card/v3-ZO "$((zo0 - 60))" "nucleus v3: ZO work"
+expect_ok "runner: a commit naming the card dated before the window is not stray" rsc ZO card/v3-ZO "$((zo0 + 60))" none
+# ZB: inside the window, on the card's own branch: the worker's own work. --not
+# BRANCH keeps it out (dropping `--not <branch>` lists it).
+zb0=$(date +%s)
+git -C "$r" checkout -q -B card/v3-ZB nucleus/v3-scaffold
+git -C "$r" commit -q --allow-empty -m "nucleus v3: ZB work"
+git -C "$r" checkout -q nucleus/v3-scaffold
+expect_ok "runner: premise: ZB's commit is listed against another branch in the same window" rsc ZB card/v3-ZO "$zb0" "nucleus v3: ZB work"
+expect_ok "runner: a commit naming the card on its own branch is not stray" rsc ZB card/v3-ZB "$zb0" none
+git -C "$r" branch -q -D scratch/zo card/v3-ZO card/v3-ZB
 
 # --- promote-pass -----------------------------------------------------------
 git -C "$r" checkout -q -B scratch/pass3 nucleus/v3-scaffold
@@ -1117,6 +1139,23 @@ export E2E_SIGTERM_AFTER=1 E2E_STALL_S=30
 e2e XK "forge silent" --attempts 1
 unset E2E_SIGTERM_AFTER E2E_STALL_S
 expect_ok "runner e2e: K: SIGTERM kills opencode and closes the ledger range" res XK "rc == 143 and dead() and $closed"
+# L: main()'s stray stop names a failed listing as such (S-0-F2-F2-F1-F2; MAIN-MSG
+# always says "committed outside its worktree"). No fake-opencode action makes
+# the real git log fail without first tripping the ref check, so a copy of the
+# driver passes the real stray_commits a branch that does not exist: its own
+# failure entry then reaches main(). The premise proves the copy was patched.
+sed '/^spec = importlib.util.spec_from_file_location/a real_sc = rc.stray_commits; rc.stray_commits = lambda card, branch, since: real_sc(card, "no-such-branch", since)' "$t/e2e.py" >"$t/e2e-lf.py"
+expect_ok "runner e2e: L: premise: the driver copy points stray_commits at a missing branch" grep -qF 'real_sc(card, "no-such-branch", since)' "$t/e2e-lf.py"
+rm -f "$e/XLF.n"
+(cd "$r" && FAKE_OC=work FAKE_OC_N=$e/XLF.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e-lf.py" "$v3/tools/run_card.py" "$e/XLF" "$(ec XLF)" --base e2e/base --attempts 2) || true
+expect_ok "runner e2e: L: a failed stray-commit listing stops the run and is named as one" \
+  res XLF "rc == 1 and not r['pass'] and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and '[XLF] cannot list commits to check for stray ones; stopping:' in out.splitlines() and 'committed outside its worktree' not in out and any(l.startswith('git log ') and 'no-such-branch' in l and 'failed (exit' in l and l.endswith('(cannot list commits; treating as stray)') for l in out.splitlines())"
+# Control: a real stray commit (the side action names the card on side-XOW, which
+# the ref check allows) gets the other message, so the selector is not constant.
+e2e XOW side --attempts 2
+expect_ok "runner e2e: L: control: a commit naming the card on another branch is named a stray commit" \
+  res XOW "rc == 1 and r['scope'] == 'OUTSIDE' and r['attempts'] == 1 and '[XOW] worker committed outside its worktree; stopping:' in out.splitlines() and 'cannot list commits' not in out and any(l.endswith(' nucleus v3: XOW side') for l in out.splitlines())"
+git -C "$r" branch -q -D side-XOW
 # R: refs outside the card branch, moved from inside a run (X-6-F1-F3-F1).
 # refmove is `git fetch . +HEAD:main` (the fake binary is not under the deny list).
 main_at='subprocess.run(["git", "-C", repo, "rev-parse", "main"], capture_output=True, text=True).stdout.strip()'
