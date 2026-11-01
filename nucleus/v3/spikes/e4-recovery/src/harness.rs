@@ -2479,6 +2479,12 @@ pub fn run_round(
                 let g = world.lock();
                 (g.disk.clone(), g.st.clone())
             };
+            // X5-R29 (a): the subtree-fallout reading's evidence, on
+            // this round's end disk (stderr only, never a digest
+            // input).
+            if std::env::var("E4_MPE_DIAG").is_ok() {
+                r29_subtree_diag(&end_disk2, &cfg, &findings_ii);
+            }
             // The (ii) image's referenced and tainted slots, from the
             // durable bytes (the same walk as the (i) point).
             let (ii_findings, image_slots_ii, meta_ii) = durable_image(&end_disk2, &cfg);
@@ -3661,6 +3667,134 @@ pub fn kept_set_k(
         }
     }
     out
+}
+
+/// **X5-R29 (a)'s diagnostic** (`E4_MPE_DIAG`, stderr only, never a
+/// digest input): on the end disk's image, the failed lpids (mapped
+/// pages whose durable bytes fail §3.3 against their map `Ref` — the
+/// nodes the store's `check_tree` cannot pass, so never descends), the
+/// descendant set of every failed node (children parsed through the
+/// store's own page decoder — from the failed node's `V_e` content,
+/// composed as X5-R28 (a) composes `V_k`, because the damaged bytes
+/// cannot be trusted to enumerate a subtree; intact descendants parse
+/// from their own durable bytes), and the "mapped lpid N unreachable"
+/// set the store's amcheck reported. Equal sets ⇒ subtree fallout (the
+/// walk cannot decide reachability below a failed node); differing
+/// sets ⇒ real orphan map entries (I-LPID-EXACT), F3's store
+/// deviation. Pure SimDisk history; never an oracle input.
+pub fn r29_subtree_diag(disk: &SimDisk, cfg: &StoreCfg, findings: &[Finding]) {
+    let pf = match disk.stat(crate::sim::PAGE_FILE) {
+        Some(f) => f,
+        None => return,
+    };
+    let m1 = disk.durable_read(pf, 4096, 4096);
+    let m2 = disk.durable_read(pf, 8192, 4096);
+    let meta = match crate::store::page::select_meta(&m1, &m2, false) {
+        crate::store::page::MetaPick::Win { meta, .. } => meta,
+        _ => return,
+    };
+    // The flat map (lpid → Ref), by the same walk durable_image uses.
+    let mut flat: BTreeMap<u64, crate::store::page::Ref> = BTreeMap::new();
+    let mut used: BTreeSet<u64> = BTreeSet::new();
+    let mut sink: Vec<Finding> = Vec::new();
+    if meta.map_root.slot != 0 {
+        let n = ((crate::store::page::PAGE - crate::store::page::HDR)
+            / crate::store::page::MAP_ENTRY) as u64;
+        let span = ckpt::radix_child_span(cfg.map_leaf_cap, n, meta.next_lpid);
+        walk_map_disk(
+            disk, pf, meta.map_root, 0, span, cfg.map_leaf_cap, 0, &mut flat, &mut used,
+            &mut sink, false,
+        );
+    }
+    // The failed nodes: mapped pages failing §3.3 against their Ref.
+    let failed: Vec<u64> = flat
+        .iter()
+        .filter(|(l, r)| {
+            let b = disk.durable_read(pf, r.slot * 4096, 4096);
+            crate::store::page::check(&b, r, **l, None).is_err()
+        })
+        .map(|(l, _)| *l)
+        .collect();
+    // The end meta's V_e cutoff (fail closed: without it the
+    // descendant set cannot be composed and the diag says so).
+    let cutoff = meta_dwrite_cutoff(disk, pf, meta.ckpt_id);
+    // The children of one page's bytes, through the store's decoder.
+    let children_of = |bytes: &[u8]| -> Vec<u64> {
+        if crate::store::page::header_kind(bytes) == crate::store::page::KIND_LEAF {
+            return Vec::new();
+        }
+        match crate::store::tree::inner_seps(bytes) {
+            Ok((seps, right)) => seps.iter().map(|(c, _)| *c).chain([right]).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    // Descendants of the failed nodes: expand a failed node from its
+    // V_e content, an intact one from its durable bytes.
+    let mut desc: BTreeSet<u64> = BTreeSet::new();
+    if let Some(cut) = cutoff {
+        let mut stack: Vec<u64> = failed.clone();
+        while let Some(l) = stack.pop() {
+            let Some(r) = flat.get(&l) else { continue };
+            let is_failed = failed.contains(&l);
+            let kids = if is_failed {
+                let ve = v_at_meta(disk, pf, r.slot, cut);
+                children_of(&ve)
+            } else {
+                let b = disk.durable_read(pf, r.slot * 4096, 4096);
+                children_of(&b)
+            };
+            for c in kids {
+                if desc.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    // The unreachable set, from the store's own findings.
+    let unreachable: BTreeSet<u64> = findings
+        .iter()
+        .filter_map(|f| {
+            f.what
+                .strip_prefix("mapped lpid ")
+                .and_then(|t| t.strip_suffix(" unreachable"))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .collect();
+    // Debug detail for the branch decision (stderr only): the image's
+    // shape and every failed node's V_e header kind and parsed
+    // children, plus the (lpid, slot) of the failed and unreachable
+    // sets.
+    let mut note: BTreeSet<u64> = failed.iter().copied().collect();
+    note.extend(unreachable.iter().copied());
+    eprintln!(
+        "R29 dbg: dir_root={} next_lpid={} slots_of_note={:?}",
+        meta.dir_root,
+        meta.next_lpid,
+        note.iter()
+            .filter_map(|l| flat.get(l).map(|r| (*l, r.slot)))
+            .collect::<Vec<_>>()
+    );
+    if let Some(cut) = cutoff {
+        for l in failed.iter() {
+            let Some(r) = flat.get(l) else { continue };
+            let ve = v_at_meta(disk, pf, r.slot, cut);
+            eprintln!(
+                "R29 dbg: failed lpid {l} slot {} ve_kind={} kids={:?}",
+                r.slot,
+                crate::store::page::header_kind(&ve),
+                children_of(&ve)
+            );
+        }
+    }
+    let equal = cutoff.is_some() && desc == unreachable;
+    eprintln!(
+        "R29 diag: failed_lpids {:?} cutoff_ok={} descendants {:?} unreachable {:?} equal={}",
+        failed,
+        cutoff.is_some(),
+        desc,
+        unreachable,
+        equal
+    );
 }
 
 /// The pure conditions of X5-R5's R for one write's slot: the slot is
