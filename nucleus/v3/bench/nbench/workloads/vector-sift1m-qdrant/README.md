@@ -143,8 +143,9 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   (a digest mismatch writes the JSON and exits 1); its JSON,
   `index-state-*.json`, `collection-info.json`, every log (init,
   settle transcripts and the per-pass logs) and the pass metrics land
-  in `results/<date>/repro/`, and it is never re-run (exit 4 on
-  retry). A FAILED run keeps its log and its work-dir evidence is
+  in `results/<date>/repro/` (only files written during this run are
+  copied), and it is never re-run (exit 4 on retry). A FAILED run
+  keeps its log and its work-dir evidence is
   copied into `repro/run-<x>/` before the script exits, so run B on
   the same UTC date cannot overwrite it. A killed attempt is kept as
   `run-*.killed.log` (one retry). Run B goes into the same `repro/`
