@@ -1,32 +1,31 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F1, relaunched `--keep` under nv3-X-5c-F1-esc-1
-(P, 2026-10-31; run 2's steps 0–3 and NEVER-FIRED/NO-TWIN stand, except
-where X5-R21 (b)/(c) touches them). Resumed at **step 4 (MP-E), then
-step 5**: X5-R20 re-derives the MP-E repros from the committed triage
-file (bc4f3bba), examines shape A (177 of the 222 exactness rounds —
-the seed-37 escalation covered shape B only, and seed 37 now passes),
-and roots or escalates shapes B, C and the completeness residual with
-current-file evidence; X5-R21 (a)–(d) are the record corrections (the
-digest-stability list, the honest NEVER-FIRED record, the twin-pairing
-fix, the twins count); X5-R22 is the run hygiene. A code fix re-runs
-the 10k triage campaign (X5-R20's last bullet). The prior state stands:
-X5-R14 root-caused and pinned, X5-R15 landed with pins, the fresh 10k
-triage campaign committed (exit 0, ~12 min, peak RSS 5.6 GiB):
-`E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=850 DEADLOCK=41
-PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1296
-FAILING_ROUNDS=1247 TWIN_FAILING_ROUNDS=102 DEFECT_SEEDS=0`. Not this
-card (X-5c-F2's): C-XX, C-DIV, MP-LIVELOCK, MP-A, MW-ORPHAN, the
-twins, the retune (X5-R17), the sweep, the RESULT.** The stages before
-it (X-5a, X-5b) are complete and merged. Opus judges E4 on the RESULT
-with P's rulings X5-R1–R21. X5-R14 root-caused (the S-DET
-gate and the deterministic unwind in `Sched::acquire`; both windows
-pinned, stress evidence 4 seeds × 25 loaded runs one digest each),
-X5-R15 (a)–(c)+(e) landed with pins, `verify --no-quotas` green on the
-run-2 file's digests and seed set. The instrumentation classes after
-run 2: NEVER-FIRED 150→0, NO-TWIN 19→0, MP-E completeness 205→6,
-MP-E exactness 199→222 ESCALATED on stale seed-37 evidence (X5-R20
-re-opens it: shapes A/B/C and the residual, below).
+Status: **stage X-5c-F1, relaunched `--keep` under nv3-X-5c-F1-esc-2
+(P, 2026-10-31; run 3 landed X5-R20 shapes A and B and X5-R21 (c), and
+P reverted 31d68b5f (X5-R23) and ran the tip's 10k triage campaign and
+its `verify` itself (X5-R25)). This relaunch runs **no campaign-class
+command** (X5-R25): it commits P's campaign file, writes the
+digest-stability list offline from runs that already exist (X5-R26),
+and finishes the record — X5-R21 (b)/(d), X5-R24 shape-C evidence, and
+the stage record with the esc-2 campaign. **No code changed in this
+relaunch** (no commit touches `src/`, `tests/`, `examples/` or any
+`Cargo.*`). The triage file of record is now P's c8e578b7 run:
+`E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
+PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
+FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
+reproducing (`verify --no-quotas`, exit 0). Per-class state: shape A
+**fixed** (837200a7, accepted X5-R24), shape B **fixed** (80dc0ff3,
+accepted X5-R24, the anchor-0 judgement call left for P's gate), X5-R21
+(c) **fixed and pinned** (04063d1b, accepted X5-R24), the completeness
+residual **ESCALATED to P** as an oracle question (X5-R23; 31d68b5f
+reverted — no harness-side ground truth may stand in for amcheck),
+shape C **ESCALATED to F2** evidence-only (X5-R24: 6 rounds, the
+provisional classification is a store-side map-exactness deviation),
+NEVER-FIRED and NO-TWIN standing (0 defects / 0 no-twin rounds in the
+esc-2 file). Not this card (X-5c-F2's): C-XX, C-DIV, MP-LIVELOCK,
+MP-A, MW-ORPHAN, the twins, the retune (X5-R17), the sweep, the
+RESULT.** The stages before it (X-5a, X-5b) are complete and merged.
+Opus judges E4 on the RESULT with P's rulings X5-R1–R27.
 
 ## P's rulings, verbatim (X-5c-esc-1, 2026-10-31; binding)
 
