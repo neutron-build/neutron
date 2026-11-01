@@ -171,15 +171,27 @@ probe_build_profile() {
 # finding R3): on a failure this is the only chance — run B on the
 # same UTC date overwrites the work dir. Globs are guarded so a file
 # that a refusal-before-init never wrote is skipped, not an error.
+#
+# $3 is this run's marker, touched just before `nbench run` started
+# (verdict B-0-F7-F1 finding 1): the dated work dir is shared by every
+# run on that UTC date, so only a matched file strictly NEWER than the
+# marker — one this run wrote or rewrote, getting a fresh mtime — is
+# copied; an earlier run's leftovers are not. A missing marker is a
+# script bug, not "no filter": refuse loudly instead of copying
+# everything, which would re-file another run's evidence.
 copy_evidence() {
-  local x=$1 work=$2 f
+  local x=$1 work=$2 marker=$3 f
+  if [ ! -f "$marker" ]; then
+    echo "reproduce.sh: run marker $marker is missing — refusing to copy evidence (script bug; copy_evidence must not run unfiltered)" >&2
+    exit 1
+  fi
   mkdir -p "$REPRO/run-$x"
   for f in "$work"/index-state-*.json \
            "$work"/collection-info.json \
            "$work"/*.log \
            "$work"/*.metrics.json \
            "$work"/*.latency.csv; do
-    [ -f "$f" ] && cp "$f" "$REPRO/run-$x/"
+    [ -f "$f" ] && [ "$f" -nt "$marker" ] && cp "$f" "$REPRO/run-$x/"
   done
   return 0
 }
@@ -194,7 +206,7 @@ copy_evidence() {
 # dir holds no results JSON — regenerate_report would otherwise write
 # a header-only file).
 run_one() {
-  local x=$1 log json
+  local x=$1 log json marker
   log="run-$x.log"
   json="$ROW.run-$x.json"
 
@@ -249,6 +261,19 @@ run_one() {
   # would break `check`'s "exactly one repro dir" for a later run.
   mkdir -p "$REPRO"
 
+  # The per-run evidence marker (verdict B-0-F7-F1 finding 1): the
+  # work dir work/<UTC date>/$ROW is shared by EVERY run on that date,
+  # and copy_evidence must not file an earlier run's leftovers as this
+  # run's evidence. Touched just before the run starts; copy_evidence
+  # copies only files strictly newer than it (a file this run rewrites
+  # gets a fresh mtime, so it is still copied). It lives under the
+  # gitignored work/ runtime state, never under results/ or repro/
+  # (those are committed). Overwriting it on a killed-attempt retry is
+  # correct: the retry is a new run.
+  mkdir -p "$ROOT/work"
+  marker="$ROOT/work/.reproduce-run-$x.marker"
+  touch "$marker"
+
   # The run itself. `nbench run` exits 1 both when a row FAILED and
   # when it was recorded-but-VOID; the two are told apart below by
   # what the run actually printed, so set -e must not abort before the
@@ -271,7 +296,7 @@ run_one() {
     # work dir is dated today; run B would overwrite it) and keep the
     # date's report consistent before surfacing the failure.
     date=$(date -u +%F)
-    copy_evidence "$x" "$ROOT/work/$date/$ROW"
+    copy_evidence "$x" "$ROOT/work/$date/$ROW" "$marker"
     date_dir="$ROOT/results/$date"
     if [ -d "$date_dir" ]; then
       remaining=$(find "$date_dir" -maxdepth 1 -name '*.json' -type f | wc -l)
@@ -293,7 +318,7 @@ run_one() {
   mv "$results_json" "$REPRO/$json"
   date=$(basename "$(dirname "$results_json")")
   evidence_work="$ROOT/work/$date/$ROW"
-  copy_evidence "$x" "$evidence_work"
+  copy_evidence "$x" "$evidence_work" "$marker"
 
   # Leave the date's report consistent with what remains there. With
   # the row's JSON moved into repro/, a date dir may hold no results
@@ -492,6 +517,16 @@ case "$1" in
       fi
       exit 1
     fi
+    # The stub must behave like the real `nbench run` on one point: its
+    # work-dir writes must land strictly LATER than the per-run marker
+    # reproduce.sh touches just before starting it. Kernel inode
+    # timestamps come from the coarse clock — writes inside the same
+    # ~few-ms tick compare EQUAL under -nt — and this stub starts
+    # writing within a tick of its parent, unlike the real run (which
+    # takes seconds before its first work-dir file). Sleep past a few
+    # ticks so the marker filter is decided by run order, never by
+    # same-tick luck.
+    sleep 0.2
     date=$(date -u +%F)
     work="$NBENCH_ROOT/work/$date/$row"
     case "${NB_STUB_MODE:-success}" in
@@ -629,6 +664,25 @@ STUB
   NB_STUB_DEBUG=0
   st_ok "refusal quotes the J5 rule" grep -q "needs a release build" "$t/last.out"
   st_ok "nothing was created" test ! -e "$r/results"
+
+  echo "S5: a stale work-dir file is not copied into run-<x>/ (B-0-F7-F1 finding 1: the dated work dir is shared by every run)"
+  r=$t/s5; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  st_rc "a succeeds" 0 st_run "$r" success a
+  # Plant a pass log run A's ef set never wrote, then backdate it and
+  # everything else the work dir already holds by an hour: a
+  # same-millisecond mtime must not decide this test. Run B (failed
+  # mode) rewrites only the ef16 files and index-state-init.json; the
+  # marker it touched before its run separates the two ages.
+  printf 'stale-from-run-a\n' > "$r/work/$D/$ROW/ef_search=64-run-0.log"
+  find "$r/work/$D/$ROW" -type f -exec touch -d '-1 hour' {} +
+  st_rc "b fails at ef16" 1 st_run "$r" failed b
+  st_ok "stale ef64 pass log NOT copied into run-b (finding 1)" test ! -e "$r/results/$D/repro/run-b/ef_search=64-run-0.log"
+  st_ok "run A's collection-info NOT copied (the failed stub does not rewrite it)" test ! -e "$r/results/$D/repro/run-b/collection-info.json"
+  st_ok "run A's init log NOT copied" test ! -e "$r/results/$D/repro/run-b/init-0.log"
+  st_ok "run B's ef16 pass log copied (rewritten by B)" test -f "$r/results/$D/repro/run-b/ef_search=16-cold-0.log"
+  st_ok "run B's ef16 settle log copied" test -f "$r/results/$D/repro/run-b/ef_search=16-cold-0.settle.log"
+  st_ok "run B's init state file copied" test -f "$r/results/$D/repro/run-b/index-state-init.json"
+  st_ok "run A's evidence untouched (no regression for run A)" test -f "$r/results/$D/repro/run-a/collection-info.json" -a -f "$r/results/$D/repro/run-a/init-0.log"
 
   if [ "$fails" -eq 0 ]; then
     echo "REPRO SELFTEST OK ($t)"
