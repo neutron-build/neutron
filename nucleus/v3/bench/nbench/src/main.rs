@@ -1408,22 +1408,46 @@ mod tests {
     }
 
     /// A scripted Qdrant search server for one command pass (card
-    /// B-0-F7-F2 Work 1): binds `127.0.0.1:0`, accepts exactly ONE
-    /// connection — the command's whole pass shares one socket, per the
-    /// keep-alive invariant `cmd_vec_qdrant_search` owns — and answers
-    /// `times_s.len()` Content-Length-framed responses on it. For each
-    /// entry it reads one full request (head, then `Content-Length`
-    /// bytes of body) and answers `200 OK` with the body
+    /// B-0-F7-F2 Work 1) with a zero delay on every request — the
+    /// shape the F2 command tests use. See [`scripted_qdrant_delayed`],
+    /// which owns the framing contract and the delay semantics.
+    fn scripted_qdrant(times_s: Vec<f64>) -> (u16, std::thread::JoinHandle<usize>) {
+        scripted_qdrant_delayed(times_s.into_iter().map(|t| (t, Duration::ZERO)).collect())
+    }
+
+    /// A scripted Qdrant search server for one command pass (card
+    /// B-0-F7-F2 Work 1, given per-request delays by card B-0-F7-F3
+    /// Work 1): binds `127.0.0.1:0`, accepts exactly ONE connection —
+    /// the command's whole pass shares one socket, per the keep-alive
+    /// invariant `cmd_vec_qdrant_search` owns — and answers
+    /// `script.len()` Content-Length-framed responses on it. For each
+    /// `(t, delay)` entry it reads one full request (head, then
+    /// `Content-Length` bytes of body), SLEEPS `delay`, and only then
+    /// answers `200 OK` with the body
     /// `{"result":[{"id":0,"score":0.0},… ids 0..=9 …],"status":"ok",
     /// "time":<t>}` where `<t>` is the entry formatted with `{}`. The
     /// times must be binary-exact (`0.0625`, `0.03125`, `0.125`), so
     /// the seconds→ms conversion in the command is exact and the CSV
     /// fields compare as strings.
     ///
+    /// Why the delay exists (card B-0-F7-F3, verdict B-0-F7-F2 finding
+    /// 1): it runs AFTER the request is read and BEFORE the response
+    /// is written, so the client's measured round trip for THAT query
+    /// is at least `delay`, while the scripted server time stays
+    /// binary-exact. One query can thus be made deterministically the
+    /// slowest on the client side, which pins the per-row
+    /// client↔server pairing of the latency CSV — which query a client
+    /// field belongs to — that no test could see before (the gate
+    /// mutant G3-CSV-AFTER-CLIENT-SORT-ONLY passed 115/115). A
+    /// zero-delay entry behaves exactly like the original zero-delay
+    /// server, which is all [`scripted_qdrant`] asks for.
+    ///
     /// The join value is the number of requests served: a read error,
     /// EOF or the 30 s read timeout returns the count so far, so a
     /// failed pass fails the test instead of hanging it.
-    fn scripted_qdrant(times_s: Vec<f64>) -> (u16, std::thread::JoinHandle<usize>) {
+    fn scripted_qdrant_delayed(
+        script: Vec<(f64, Duration)>,
+    ) -> (u16, std::thread::JoinHandle<usize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted server");
         let port = listener.local_addr().expect("local addr").port();
         let handle = std::thread::spawn(move || {
@@ -1434,7 +1458,7 @@ mod tests {
                 .expect("set read timeout");
             let mut served = 0usize;
             let mut pending: Vec<u8> = Vec::new();
-            for t in times_s {
+            for (t, delay) in script {
                 // one full request: the head, then the body bytes
                 let (sep, body_len) = loop {
                     if let Some(sep) = request_head_end(&pending) {
@@ -1452,6 +1476,14 @@ mod tests {
                 };
                 // consume this request; leftovers belong to the next one
                 pending.drain(..sep + 4 + body_len);
+                // Card B-0-F7-F3: sleep between the read and the write —
+                // the one sleep this module owns (server thread only;
+                // B-0-F7's no-sleep rule is relaxed exactly this far, by
+                // this card's authority), so the client's row for THIS
+                // query carries at least the delay.
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
                 let hits = (0..10)
                     .map(|id| format!("{{\"id\":{id},\"score\":0.0}}"))
                     .collect::<Vec<_>>()
@@ -1471,14 +1503,43 @@ mod tests {
         (port, handle)
     }
 
-    /// Run the real `cmd_vec_qdrant_search` against [`scripted_qdrant`]
-    /// with the card's inputs (card B-0-F7-F2 Work 2-3): 3 dim-2 query
-    /// vectors, truth rows of the ids 0..=9, `--limit 10`, and
-    /// `--pass-kind cold` — cold is exempt from the 10 ms p50 sanity
-    /// check, so a slow test host cannot flake the pass on the client
-    /// column. Returns (metrics path, latency CSV path, requests
-    /// served).
+    /// Run the real `cmd_vec_qdrant_search` against
+    /// [`scripted_qdrant`] with the card's inputs (card B-0-F7-F2
+    /// Work 2-3) and zero per-request delays. The contract lives on
+    /// [`run_scripted_search_command_delayed`]; this is the zero-delay
+    /// entry the F2 tests call.
     fn run_scripted_search_command(name: &str, times_s: Vec<f64>) -> (PathBuf, PathBuf, usize) {
+        run_search_command_against(name, scripted_qdrant(times_s))
+    }
+
+    /// Run the real `cmd_vec_qdrant_search` against
+    /// [`scripted_qdrant_delayed`] with the card's inputs (card
+    /// B-0-F7-F2 Work 2-3; the per-entry delay is card B-0-F7-F3
+    /// Work 1): 3 dim-2 query vectors, truth rows of the ids 0..=9,
+    /// `--limit 10`, and `--pass-kind cold` — cold is exempt from the
+    /// 10 ms p50 sanity check, so a slow test host cannot flake the
+    /// pass on the client column. Each script entry pairs a scripted
+    /// server time with the delay the server sleeps before answering
+    /// that query. Returns (metrics path, latency CSV path, requests
+    /// served).
+    fn run_scripted_search_command_delayed(
+        name: &str,
+        script: Vec<(f64, Duration)>,
+    ) -> (PathBuf, PathBuf, usize) {
+        run_search_command_against(name, scripted_qdrant_delayed(script))
+    }
+
+    /// The body shared by both runners above (card B-0-F7-F2 Work 2-3):
+    /// write the 3-query/truth files, run the REAL command against the
+    /// already-spawned scripted server (it blocks on `accept` until the
+    /// command connects, so spawning before the files are written is
+    /// inert), join it, and return (metrics path, latency CSV path,
+    /// requests served).
+    fn run_search_command_against(
+        name: &str,
+        server: (u16, std::thread::JoinHandle<usize>),
+    ) -> (PathBuf, PathBuf, usize) {
+        let (port, server) = server;
         let dir = cmd_test_dir(name);
         let query = dir.join("query.fvecs");
         let truth = dir.join("truth.ivecs");
@@ -1491,7 +1552,6 @@ mod tests {
         .expect("write query.fvecs");
         let ids: Vec<i32> = (0..10).collect();
         std::fs::write(&truth, cmd_ivec_bytes(&[&ids, &ids, &ids])).expect("write truth.ivecs");
-        let (port, server) = scripted_qdrant(times_s);
         let up = |p: &std::path::Path| p.to_str().expect("temp paths are utf-8").to_string();
         let args: Vec<String> = [
             ("--query", up(&query)),
@@ -1610,6 +1670,96 @@ mod tests {
             "client p50 {client_p50} is suspiciously equal to the server p50; \
              the two columns must be independent measurements"
         );
+    }
+
+    #[test]
+    fn search_command_csv_rows_pair_client_and_server_per_query() {
+        // Card B-0-F7-F3 (verdict B-0-F7-F2 finding 1, gate mutant
+        // G3-CSV-AFTER-CLIENT-SORT-ONLY): one CSV row must carry ONE
+        // query's client time next to the SAME query's server time.
+        // G3 moves the latency write between the command's two sorts,
+        // so the client column comes out sorted while the server
+        // column keeps query order — every property the F2 tests
+        // assert still held, and the full suite passed 115/115,
+        // because no test could tell which query a client field
+        // belonged to. Here query 0 is made deterministically the
+        // slowest on the client side: the scripted server sleeps
+        // 200 ms before answering it (the only sleep this module
+        // owns; server thread only, this card's relaxation of
+        // B-0-F7's no-sleep rule) while its scripted server time
+        // stays binary-exact. Row 1 must carry both. Lower bound
+        // only: a query's client time is at least the delay the
+        // server slept before answering it, which holds on any
+        // host, however slow; no upper bound is asserted anywhere.
+        let (_metrics, latency, served) = run_scripted_search_command_delayed(
+            "csv-rows-pair",
+            vec![
+                (0.0625, Duration::from_millis(200)),
+                (0.03125, Duration::ZERO),
+                (0.125, Duration::ZERO),
+            ],
+        );
+        assert_eq!(
+            served, 3,
+            "one request per query on the pass's single connection"
+        );
+        let text = std::fs::read_to_string(&latency).expect("read latency csv");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "header + one row per query:\n{text}");
+        // Row 1 IS query 0. Its server field is query 0's scripted
+        // time, string-exact (binary-exact seconds → ms), and its
+        // client field must include the 200 ms the server slept
+        // before answering query 0 — that is the pairing. Under G3
+        // the client column is sorted ascending, so row 1 gets the
+        // fastest query's loopback time instead, far below 200 ms;
+        // under G3b-CLIENT-REVERSED query 0's slow time lands in
+        // row 3.
+        assert_eq!(
+            lines[1].split(',').nth(1),
+            Some("62.500000"),
+            "row 1 must carry query 0's server time, in ms:\n{text}"
+        );
+        let row1_client: f64 = lines[1]
+            .split(',')
+            .next()
+            .expect("row 1 client field present")
+            .parse()
+            .expect("row 1 client field parses as a number");
+        assert!(
+            row1_client >= 200.0,
+            "row 1's client time must include the 200 ms the server slept \
+             before answering query 0 — the client field of this row belongs \
+             to query 0, and a sorted (G3) or reversed (G3b) client column \
+             would put a fast query's time here; got {row1_client}\n{text}"
+        );
+        // Rows 2 and 3 are queries 1 and 2: the server column keeps
+        // query order (O8-CSV-AFTER-SORT sorts it and fails here and
+        // in search_command_records_server_ms_per_query_in_order).
+        assert_eq!(
+            lines[2].split(',').nth(1),
+            Some("31.250000"),
+            "row 2 must carry query 1's server time, in ms:\n{text}"
+        );
+        assert_eq!(
+            lines[3].split(',').nth(1),
+            Some("125.000000"),
+            "row 3 must carry query 2's server time, in ms:\n{text}"
+        );
+        // The only other claim about the client column: every field
+        // is finite and >= 0 — no upper bound, no ordering between
+        // rows 2 and 3.
+        for (i, row) in lines[1..].iter().enumerate() {
+            let client: f64 = row
+                .split(',')
+                .next()
+                .expect("client field present")
+                .parse()
+                .expect("client field parses as a number");
+            assert!(
+                client.is_finite() && client >= 0.0,
+                "row {i} client field must be finite and >= 0: {row}"
+            );
+        }
     }
 
     // ---- card B-0-F7-F1: index state in the metrics (J4) ----
