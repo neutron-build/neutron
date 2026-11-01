@@ -779,41 +779,138 @@ In P's esc-2 campaign the guard holds at 10k scale:
 carries a judged twin (2,180 + 1,415 twin records; 103 failing —
 store classes, not pairing).
 
-**MP-E: O-3 (e) under page damage — completeness fixed and pinned;
-exactness escalated (commit 12b54965).**
+**MP-E: O-3 (e) under page damage — the record after run 3 and the
+esc-2 relaunch (X5-R20, X5-R23, X5-R24).** The class had two halves;
+each is now fixed, escalated, or re-attributed, per shape:
 
-- **Completeness (205 rounds, "tainted referenced slot … not
-  reported") — a harness defect, fixed.** Every one is a
-  recovery-`Err` round, and the repro seeds 47/118/198 each name
-  **slot 0**: the §2.1 **file header**, which §3.3's reference model
-  has no reference for, so amcheck (i) can neither check nor report
-  it — but the harness's referenced set hardcoded it, making every
-  media fault on its range an unreportable "tainted referenced slot".
-  The referenced set is now the image's own slots (map, free set,
-  metas); the header stays covered by open's own read (XX001 at
-  `Open`). Pin `r16_mpe_referenced_set_excludes_the_file_header`
-  (literal configs 47/118/198), demonstrated failing on the reverted
-  `used.insert(0)`.
-- **Exactness (199 rounds, "amcheck reported slot … neither tainted
-  nor in R") — ESCALATED with the round evidence; not fixed here.**
-  Seed 37 round 0 refutes the ruling's two candidates: `durable_image`
-  and the store's recovery open the **same** meta (k=1 — recovery's
-  own `Err` names "map page slot 11"), and the R11 (a) loop faithfully
-  applies §3.3. The durable-write history shows slot 11's last covered
-  write (dw[19], epoch-header 98) **predates the meta k=1 write
-  (dw[23]) that references it** — image k=1's map embedded a reference
-  that did not match the slot's durable content at meta time. That is
-  C-XX's mechanism ("a referenced page fails §3.3 with no media
-  fault") inside a Q14 rollback round: the TORN meta fault removes
-  k=2, open falls back to k=1, and k=1's stale reference fails §3.3
-  — a true failure, not an instrumentation artifact. R is correctly
-  empty per R5's text (both of slot 11's writes precede the k=2
-  graduation that anchors R). Per the card's limit — R5 not reopened,
-  R not widened, a finding outside R5's text with R computed correctly
-  is a failure — the exactness half is **escalated to X-5c-F2** (with
-  seed 37 round 0 as the deterministic repro: `run --seeds 37..38`,
-  `O-3(e): amcheck reported slot 11 that is neither tainted nor in
-  R`, `mrb=true rlen=0`, metas k=0@1, k=1@2, k=2@1 torn away).
+- **Completeness, the header half (205 d2c8bba7 rounds, "tainted
+  referenced slot … not reported") — a harness defect, fixed
+  (12b54965).** Every one is a recovery-`Err` round, and the repro
+  seeds 47/118/198 each name **slot 0**: the §2.1 **file header**,
+  which §3.3's reference model has no reference for, so amcheck (i)
+  can neither check nor report it — but the harness's referenced set
+  hardcoded it, making every media fault on its range an unreportable
+  "tainted referenced slot". The referenced set is now the image's own
+  slots (map, free set, metas); the header stays covered by open's own
+  read (XX001 at `Open`). Pin
+  `r16_mpe_referenced_set_excludes_the_file_header` (literal configs
+  47/118/198), demonstrated failing on the reverted `used.insert(0)`.
+- **Exactness, shape A (177 bc4f3bba rounds: the reported slot is a
+  meta slot 1 or 2, `mrb=false`, `rlen=0`) — a harness defect, fixed
+  (837200a7; accepted, X5-R24).** In every one, a Q14 fault kills the
+  only written meta (seed 67: LOST on the create's k=0 write, slot 2
+  never written; seed 268: two MISDIRECTED with the same effect), so
+  open finds no valid meta, recovery returns `Err` at `Open`, and
+  X5-R5 makes O-3 (e) vacuous — but the harness's walk hardcoded
+  `slot: Some(1)` on the NoValid arm, and the frozen oracle's
+  exactness half judged that bogus slotted finding against empty
+  taint/R sets. The finding is now structural (`slot: None`), like the
+  `MisplacedNewer` arm; the damage stays detected at `Open`, never
+  served. The four ruling questions are answered from `E4_MPE_DIAG`
+  evidence (per-slot meta parse/pick, the fault list, the amcheck
+  sets, the per-slot durable-write AND issued-write histories). Pin
+  `r20_mpe_no_opened_image_means_no_slotted_finding` (literal configs
+  67/268), demonstrated failing on the reverted `slot:Some(1)`.
+- **Exactness, shape B (39 rounds: a non-meta slot, `mrb=true`,
+  `rlen=0`) — a harness defect, fixed (80dc0ff3; accepted, X5-R24).**
+  R5's condition 3 reads "SimDisk **records a page-file write to `s`
+  issued** after the first completed `sync_all` that covered a meta
+  newer than the opened one", but the draft computed R from
+  `dwrites_of` — the sync-covered list — only, so a slot reused after
+  the newer graduation whose reuse writes were unsynced at the crash
+  never entered R. Seed 38 round 0 is the ruling's narrative word for
+  word: the Q14 fault removes meta k=1, open rolls back to the
+  create's k=0, the epoch-2 checkpoint reused k=0's freed map-root
+  slot 4 (ten `WriteIssued` after the graduation sync ev[128], the
+  crash keeping ev[287]'s id-6 page; untainted by 1.4, stale
+  create-era reference CRC — §3.3 fails). R now consults both
+  histories (dwrites cross-life, plus this life's event stream
+  anchored at the in-stream graduation sync when that pair is the
+  earliest covered newer meta, else at 0). Seeds 38/137: `rlen 0→1`,
+  O-3 (e) clears. Pin `r20_mpe_r_reads_the_issued_write_history`
+  (literal configs 38/137, asserting `rlen ≥ 1` on the rollback
+  round), demonstrated failing with the events half disabled.
+  **Judgment call for P's gate, standing:** this computes R per the
+  text's word "issued" rather than the committed sync-covered
+  reading — R5 not reopened, R's definition unchanged, the structural
+  guard (R ⊆ untainted referenced slots) and the M-NOINPLACE
+  condition intact; the P gate will also examine the anchor-0
+  fallback (an in-stream newer meta exists but `same` is false) —
+  **not changed in this card** (X5-R24).
+- **The completeness residual (6 bc4f3bba rounds: 1787, 5808, 6157,
+  8598, 9098, 9647; all `mrb=true`, real slots 10/42/43/45/7/130) —
+  ESCALATED to P as an oracle-definition question (X5-R23).** Run 3
+  "fixed" it (31d68b5f) by making the harness's amcheck (i) walk push
+  a ground-truth finding for every tainted slot of the referenced
+  set. P reverted that commit (c8e578b7): the pushed set is exactly
+  what the frozen oracle's completeness half compares amcheck (i)
+  against, so in class MP the check became circular for every
+  non-meta referenced slot — a §3.3 detection miss at (i), the very
+  failure the half exists to catch, would pass. That weakens a Work 2
+  check. The 6 rounds return to failing O-3 (e): in each, a slot's
+  durable bytes equal the content the opened, rolled-back image
+  references (for example a crash-dropped volatile write), so §3.3
+  passes against that image, yet 1.4 calls the slot tainted — which
+  "tainted" O-3 (e) completeness should use under a meta rollback is
+  a question only P can decide; the oracle is frozen. The evidence
+  (from 31d68b5f's record): seeds 1787/6157 round 0 — slot 10 with
+  two sync-covered writes dw[11]/dw[22] and the dropped write issued
+  after them, and slot 42, both §3.3-clean and tainted. Handed to
+  X-5c-F2 as its own item, "MP-E completeness residual (oracle
+  question)". **Never re-implement it: no harness-side ground-truth
+  report may stand in for amcheck to satisfy the oracle.** The
+  meta-slot rollback-fallout loop (X-5b, `durable_image`, slots 1 and
+  2) has the same structure, is unchanged, and is likewise listed as
+  an open P question in the hand-off.
+- **Exactness, shape C (6 rounds: a non-meta slot, `mrb=false` —
+  seeds 688, 3718, 4858, 5238, 5638, 9717) — ESCALATED to F2,
+  evidence-only (X5-R24).** New `E4_MPE_DIAG` evidence at c8e578b7
+  (one single-seed run each, allowed under X5-R25, stderr outside the
+  worktree):
+  - **Seed 688 round 0** (MP, crash `After2@2`, one MISDIRECTED on
+    page slot 46 = mapped lpid 5): amcheck (i) finds exactly slot 46
+    (`tainted {46}`) — the damage correctly detected; recovery opens
+    meta k=2 (slot 1); O-3 (e)'s text names **slot 19**, which comes
+    from **amcheck (ii)** on the post-recovery, post-harness-checkpoint
+    end disk (image k=3): the store's own amcheck reports slot 46
+    ("tree: §3.3 fail on lpid 5") **plus 16 "mapped lpid N
+    unreachable" findings** (slots 3, 19, 20, 24, 25, 26, 28, 29, 31,
+    34, 36, 39, 41, 49, 51 → lpids 8–37) — I-LPID-EXACT violations in
+    the store's own graduated image, on slots that are neither tainted
+    nor in R.
+  - **Seed 3718 round 0** (MP, crash `uniform@y:8906`, TORN slot 49 =
+    lpid 40 + LOST slot 37 = lpid 7): (i) finds exactly 37 and 49,
+    both tainted — correct; recovery opens k=1 (slot 2); amcheck (ii)
+    on the end disk (image k=2) reports slot 37 (§3.3, correct) plus
+    15 "mapped lpid unreachable" findings (slots 8, 10, 17, 19, 22,
+    25, 31, 36, 38, 40, 42, 44, 49, 52, 54 → lpids 12–46). The
+    reported slot 10 ("mapped lpid 12 unreachable") is the round's
+    O-3 (e) text.
+
+  **Provisional classification (P's gate decides):** not an
+  instrumentation artifact — this is the store's own amcheck on the
+  store's own end disk, and the (i)-half detections of the actual
+  damage are correct and complete. The recovered store's next
+  checkpoint graduates an image whose **map holds entries no tree
+  reaches** (I-LPID-EXACT, S-STORE's map-exactness invariant;
+  plausibly the interrupted checkpoint's step-2 page writes adopted
+  into the crashed image's map and copied forward, or replay dropping
+  tree references the map kept). That is a prototype deviation or an
+  S-STORE silence on the recovered map's exactness — F2's to
+  root-cause beside C-XX (the same "findings with no fault" family,
+  here structural rather than §3.3). **No code change was made
+  (X5-R24); no proposed diff is offered** — no fix was verified, and
+  the two candidate mechanisms above are F2's first fork. The six
+  rounds are unchanged in the esc-2 file (still the class's only
+  exactness rounds, `mrb=false rlen=0`).
+- **History — the run-2 exactness escalation on seed 37 is superseded
+  (X5-R20).** Seed 37 round 0 **passes** in bc4f3bba and in the esc-2
+  file (`mrb=false`, no O-3 text): the 12b54965 referenced-set change
+  shifted the fault draw off the meta slot, so the rollback it
+  described no longer occurs. Its mechanism record (a map-reference /
+  durable-content mismatch inside a Q14 rollback round, slot 11, R
+  correctly empty per R5's text) is kept as history for F2's shape-B
+  analysis; it is no longer a repro.
 
 ## The fresh 10k triage campaign (X-5c-F1's run, committed)
 
