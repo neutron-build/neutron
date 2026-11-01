@@ -1492,6 +1492,12 @@ pub struct RoundOutcome {
     /// The digest of the canonical record (byte-identical for the same
     /// inputs; `tests/harness.rs`).
     pub digest: u64,
+    /// X-5c-F2 step 1 (e): the anchor-0 fallback's precondition broke —
+    /// this life's event stream holds a page-file
+    /// `SyncReturned { all: false }` while the fallback anchor 0 was in
+    /// force. A harness-side tripwire lifted to a seed-level defect by
+    /// the driver (never an oracle input; never silently widening R).
+    pub r5_anchor0_defect: bool,
 }
 
 impl Default for RoundOutcome {
@@ -1538,6 +1544,7 @@ impl Default for RoundOutcome {
             r6_round: false,
             renames_dropped: 0,
             digest: 0,
+            r5_anchor0_defect: false,
         }
     }
 }
@@ -2211,6 +2218,17 @@ pub fn run_round(
         }
         None => (false, BTreeSet::new()),
     };
+    // X-5c-F2 step 1 (e): the anchor-0 fallback's precondition. When
+    // the events half's anchor is the fallback 0 (the whole stream read
+    // as post-graduation) and this life's stream holds a page-file
+    // `sync_data` return, the round flags the tripwire — the driver
+    // records the seed-level defect; R is never silently widened. (This
+    // store only ever `sync_all`s the page file, so on a real campaign
+    // the flag cannot rise; it exists so the unsound reading can never
+    // pass silently.)
+    let anchor0_broke = matches!(&meta_i, Some(opened)
+        if matches!(r5_anchor(&disk, pf, opened.ckpt_id, &events), Some((_, 0)))
+            && r5_anchor0_defect(&events, pf).is_some());
 
     // ---- the extraction and the oracle ----
     let mut sample_rng = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
@@ -2223,6 +2241,7 @@ pub fn run_round(
         livelock_site: flags.5,
         livelock_parked: flags.6,
         task_error,
+        r5_anchor0_defect: anchor0_broke,
         ..Default::default()
     };
     match recovery {
@@ -3226,6 +3245,109 @@ pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
     max_k > opened_k
 }
 
+/// **X5-R5's anchor, as the events half computes it** (X-5c-F2 step 1
+/// (d) pins it at the sync's return): the pair `(g, ev_anchor)` for one
+/// (disk, this life's events) view. `g` is the dwrites index of the
+/// first `sync_all`-covered meta newer than `opened_k` (the durable
+/// half's anchor: writes at dwrite indices above it are post-anchor);
+/// `ev_anchor` is the event index the events half skips to — the
+/// in-stream graduation sync's **return** when the first issued-and-
+/// covered newer meta is the in-stream one, else `0`, the fallback
+/// that reads this life's whole stream as post-anchor (a still earlier
+/// graduation preceded it). `None` when no newer covered meta exists
+/// at all: R is empty and no anchor is in force.
+pub fn r5_anchor(
+    disk: &SimDisk,
+    pf: usize,
+    opened_k: u64,
+    events: &[DiskEvent],
+) -> Option<(usize, usize)> {
+    let dw = disk.dwrites_of(pf);
+    let mut newer_graduation: Option<usize> = None;
+    for (i, w) in dw.iter().enumerate() {
+        if w.all
+            && (w.off == 4096 || w.off == 8192)
+            && w.bytes.len() == 4096
+            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
+            && m.ckpt_id > opened_k
+        {
+            newer_graduation = Some(i);
+            break;
+        }
+    }
+    let g = newer_graduation?;
+    // The anchor in the event stream: the first completed `sync_all`
+    // after the first issued write of a meta newer than the opened one.
+    // When that first issued-and-covered newer meta (`dw[g]`) is **not**
+    // the in-stream one, a still earlier graduation happened in a prior
+    // life of the seed (chained round) and the whole stream is
+    // post-anchor. When no in-stream pair exists at all but `dw[g]`
+    // does, same: the graduation precedes this life. Writes before the
+    // anchor are not excused — the slot was the opened image's own
+    // content when they were issued.
+    let is_meta_issued = |e: &DiskEvent| -> bool {
+        match e {
+            DiskEvent::WriteIssued { inode, off, bytes }
+                if *inode == pf && (*off == 4096 || *off == 8192) =>
+            {
+                crate::store::page::parse_meta(bytes)
+                    .ok()
+                    .is_some_and(|m| m.ckpt_id > opened_k)
+            }
+            _ => false,
+        }
+    };
+    let in_stream = events.iter().position(is_meta_issued);
+    let anchor: usize = match in_stream {
+        Some(w) => {
+            let synced = events.iter().skip(w + 1).position(
+                |e| matches!(e, DiskEvent::SyncReturned { inode, all: true } if *inode == pf),
+            );
+            match synced {
+                // The in-stream pair exists: if that issued write is
+                // the same one `dw[g]` covered, this life holds the
+                // earliest graduation and the anchor is its sync's
+                // return (w + 1 + s, the event index of the
+                // `SyncReturned`); otherwise a prior-life graduation
+                // precedes the whole stream (the in-stream one never
+                // synced, or a still earlier covered meta exists).
+                Some(s) => {
+                    let same = match &events[w] {
+                        DiskEvent::WriteIssued { off, bytes, .. } => {
+                            dw[g].off == *off && dw[g].bytes == *bytes
+                        }
+                        _ => false,
+                    };
+                    if same { w + 1 + s } else { 0 }
+                }
+                None => 0,
+            }
+        }
+        None => 0,
+    };
+    Some((g, anchor))
+}
+
+/// **X5-R5 anchor-0 precondition (X-5c-F2 step 1 (e)): the fallback
+/// anchor's tripwire.** The anchor-0 fallback reads this life's whole
+/// event stream as post-graduation, which is only sound while the page
+/// file was never `sync_data`-ed in this life (this store only ever
+/// `sync_all`s the page file, so the tripwire cannot fire on a real
+/// campaign — it exists so the unsound reading can never pass
+/// silently). A page-file `SyncReturned { all: false }` in the stream
+/// breaks the precondition: the round records the returned seed-level
+/// defect instead of silently widening R.
+pub const R5_ANCHOR0_DEFECT: &str = "page file synced by sync_data: X5-R5 anchor precondition";
+
+/// Whether [`r5_anchor`]'s fallback anchor 0 is in force for this view
+/// (the events half reads the whole stream as post-graduation).
+pub fn r5_anchor0_defect(events: &[DiskEvent], pf: usize) -> Option<&'static str> {
+    let sync_data = events
+        .iter()
+        .any(|e| matches!(e, DiskEvent::SyncReturned { inode, all: false } if *inode == pf));
+    sync_data.then_some(R5_ANCHOR0_DEFECT)
+}
+
 /// X5-R5's set R: slots the opened image references that are not tainted,
 /// written after the first completed `sync_all` covering a meta newer
 /// than the opened one, **and never written with an M-NOINPLACE hit**
@@ -3248,7 +3370,8 @@ pub fn meta_rollback_of(disk: &SimDisk, pf: usize, opened_k: u64) -> bool {
 /// k=1 graduation's sync at ev[128], the crash kept ev[287]'s id-6
 /// epoch-2 page, `check2` fails against meta k=0's map-root ref). Both
 /// sources are consulted: the durable-write list (cross-life, as
-/// before) and this life's event stream (the unsynced reuses).
+/// before) and this life's event stream (the unsynced reuses), through
+/// the shared anchor of [`r5_anchor`].
 pub fn exception_set_r(
     disk: &SimDisk,
     pf: usize,
@@ -3258,24 +3381,11 @@ pub fn exception_set_r(
     noinplace_hits: &BTreeSet<u64>,
     events: &[DiskEvent],
 ) -> BTreeSet<u64> {
-    let mut newer_graduation: Option<usize> = None;
-    let dw = disk.dwrites_of(pf);
-    for (i, w) in dw.iter().enumerate() {
-        if w.all
-            && (w.off == 4096 || w.off == 8192)
-            && w.bytes.len() == 4096
-            && let Ok(m) = crate::store::page::parse_meta(&w.bytes)
-            && m.ckpt_id > opened_k
-        {
-            newer_graduation = Some(i);
-            break;
-        }
-    }
-    let Some(g) = newer_graduation else {
+    let Some((g, anchor)) = r5_anchor(disk, pf, opened_k, events) else {
         return BTreeSet::new();
     };
     let mut out = BTreeSet::new();
-    for (i, w) in dw.iter().enumerate() {
+    for (i, w) in disk.dwrites_of(pf).iter().enumerate() {
         if i <= g {
             continue;
         }
@@ -3284,55 +3394,9 @@ pub fn exception_set_r(
             out.insert(slot);
         }
     }
-    // The issued-write half (X5-R20 shape B). The anchor in the event
-    // stream: the first completed `sync_all` after the first issued
-    // write of a meta newer than the opened one. When that first
-    // issued-and-covered newer meta (`dw[g]`) is **not** the in-stream
-    // one, a still earlier graduation happened in a prior life of the
-    // seed (chained round) and the whole stream is post-anchor. When
-    // no in-stream pair exists at all but `dw[g]` does, same: the
-    // graduation precedes this life. Writes before the anchor are not
-    // excused — the slot was the opened image's own content when they
-    // were issued.
-    let is_meta_issued = |e: &DiskEvent| -> bool {
-        match e {
-            DiskEvent::WriteIssued { inode, off, bytes }
-                if *inode == pf && (*off == 4096 || *off == 8192) =>
-            {
-                crate::store::page::parse_meta(bytes)
-                    .ok()
-                    .is_some_and(|m| m.ckpt_id > opened_k)
-            }
-            _ => false,
-        }
-    };
-    let in_stream = events.iter().position(is_meta_issued);
-    let anchor: usize = match in_stream {
-        Some(w) => {
-            let synced = events.iter().skip(w + 1).position(
-                |e| matches!(e, DiskEvent::SyncReturned { inode, all: true } if *inode == pf),
-            );
-            match synced {
-                // The in-stream pair exists: if that issued write is
-                // the same one `dw[g]` covered, this life holds the
-                // earliest graduation and the anchor is its sync;
-                // otherwise a prior-life graduation precedes the whole
-                // stream (the in-stream one never synced, or a still
-                // earlier covered meta exists).
-                Some(s) => {
-                    let same = match &events[w] {
-                        DiskEvent::WriteIssued { off, bytes, .. } => {
-                            dw[g].off == *off && dw[g].bytes == *bytes
-                        }
-                        _ => false,
-                    };
-                    if same { w + 1 + s } else { 0 }
-                }
-                None => 0,
-            }
-        }
-        None => 0,
-    };
+    // The issued-write half (X5-R20 shape B), anchored at the sync's
+    // return (step 1 (d)) or at the fallback 0 (step 1 (e)'s
+    // precondition guards that reading).
     for (i, e) in events.iter().enumerate() {
         if i <= anchor {
             continue;

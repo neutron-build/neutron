@@ -331,6 +331,55 @@ fn f1f2d_r_anchor_is_the_sync_not_the_issue() {
     );
 }
 
+/// **X-5c-F2 step 1 (e) pin: a literal stream holding a page-file
+/// `SyncReturned { all: false }` yields the anchor-0 precondition
+/// defect** — "page file synced by sync_data: X5-R5 anchor
+/// precondition" — and a stream without it does not. The store only
+/// ever `sync_all`s the page file, so on a real campaign this is a
+/// tripwire; removing the check (the assert's revert: the function
+/// answering `None` unconditionally) fails the pin.
+#[test]
+fn f1f2e_page_file_sync_data_yields_the_anchor0_defect() {
+    use e4_recovery::sim::DiskEvent;
+    let pf = 0usize;
+    let with = vec![
+        DiskEvent::WriteIssued {
+            inode: pf,
+            off: 4096,
+            bytes: vec![1u8; 4096],
+        },
+        DiskEvent::SyncReturned {
+            inode: pf,
+            all: false,
+        },
+    ];
+    assert_eq!(
+        e4_recovery::harness::r5_anchor0_defect(&with, pf),
+        Some("page file synced by sync_data: X5-R5 anchor precondition"),
+        "a page-file sync_data return breaks the anchor-0 precondition"
+    );
+    let without = vec![
+        DiskEvent::WriteIssued {
+            inode: pf,
+            off: 4096,
+            bytes: vec![1u8; 4096],
+        },
+        DiskEvent::SyncReturned {
+            inode: pf,
+            all: true,
+        },
+        DiskEvent::SyncReturned {
+            inode: pf + 1,
+            all: false,
+        },
+    ];
+    assert_eq!(
+        e4_recovery::harness::r5_anchor0_defect(&without, pf),
+        None,
+        "a sync_all on the page file, or a sync_data on another file, is not the defect"
+    );
+}
+
 /// The pass fold (the gate's N7 pin): every per-seed failure flag folds
 /// `pass` to false on its own — a verdict that passed the oracle is
 /// still a failed round under any flag.

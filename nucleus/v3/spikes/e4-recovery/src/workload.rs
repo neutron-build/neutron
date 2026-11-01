@@ -1469,6 +1469,12 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
         {
             rec.defect = Some(format!("round {round}: {d}"));
         }
+        // X-5c-F2 step 1 (e): the anchor-0 precondition defect is
+        // seed-level (counted in DEFECT_SEEDS), exactly as P's text
+        // records it.
+        if out.r5_anchor0_defect && rec.defect.is_none() {
+            rec.defect = Some(harness::R5_ANCHOR0_DEFECT.to_owned());
+        }
         let rr = round_rec(&knobs, &cfg, &out, &crash_desc, &crash_hook);
         rec.deadlock |= rr.deadlock;
         rec.panic |= rr.panic;
