@@ -21,6 +21,18 @@
 # NOT-REPRODUCED the row is refused and escalated to P; a refused run
 # is recorded, never re-run until they agree; there is no third run.
 #
+# B-0-F7-F1b findings 1 and 2 (card B-0-F7-F1b-F2):
+#   - a/b refuse (exit 4) when results/<UTC date>/$ROW.json is
+#     git-tracked or already exists — a repro run would overwrite a
+#     committed row. Checked before the quiet window (while nothing
+#     has been created, R5) and again right after it: the wait can
+#     last up to 30 min, long enough for the UTC date to roll over.
+#   - the line the quiet window ended on (the satisfied line, or the
+#     loud selftest BYPASSED line, both UTC-stamped) is appended to
+#     repro/run-<x>.quiet.txt before the run starts: run-*.log is
+#     gitignored (*.log), so the window's evidence must be committed
+#     in its own tracked file.
+#
 # Run outcomes (gate round 1, findings R2/R3): `nbench run` prints a
 # `results:` line whenever it RECORDED a results JSON — on success and
 # on VOID (a digest mismatch writes the JSON, then exits 1). Such a
@@ -48,8 +60,8 @@
 # Exit codes: 0 ok; 1 unexpected failure — also a run recorded but
 # VOID (final evidence; run `verdict`); 2 usage; 3 "host not quiet"
 # (no run happened — that is a retry-later situation, not a refusal);
-# 4 protocol refusal (a run already exists; debug NB_BIN; see the
-# per-mode checks).
+# 4 protocol refusal (a run already exists; the date's row file is
+# committed or already exists; debug NB_BIN; see the per-mode checks).
 set -euo pipefail
 
 # `selftest` builds its own harness root and stub binary; every other
@@ -86,17 +98,38 @@ live_nbench_units() {
     2>/dev/null | head -n 1
 }
 
+# The line quiet_wait ended on — the satisfied line or the selftest
+# BYPASSED line, both with their UTC timestamp. run_one appends it to
+# repro/run-<x>.quiet.txt so the window's evidence is committed
+# (B-0-F7-F1b finding 2: run-*.log is gitignored by *.log).
+QUIET_LINE=""
+
 quiet_wait() {
   # Selftest only (rework acceptance): the stub protocol test must not
   # sit out a real 120 s window. The bypass is loud on purpose — any
   # production log that contains it was not quiet-checked, visibly.
+  # The line carries the same UTC prefix as the satisfied line, so the
+  # recorded evidence is uniform (B-0-F7-F1b finding 2).
   if [ "${NB_REPRO_SELFTEST:-}" = "1" ]; then
-    echo "quiet-host window BYPASSED (NB_REPRO_SELFTEST=1: stub-driven selftest, not a measurement)" >&2
+    QUIET_LINE="$(date -u +%FT%TZ) quiet-host window BYPASSED (NB_REPRO_SELFTEST=1: stub-driven selftest, not a measurement)"
+    printf '%s\n' "$QUIET_LINE" >&2
     return 0
+  fi
+  # NB_REPRO_SELFTEST=window (selftest only, card B-0-F7-F1b-F2 Work 3):
+  # run the REAL window rule, but read load1 from
+  # $NB_REPRO_SELFTEST_LOADAVG instead of /proc/loadavg while the
+  # selftest puts stubbed sleep/pgrep/systemctl first on PATH. This
+  # mode exists only so the selftest can prove the satisfied line is
+  # recorded (S7b) without sitting out a real 120 s window; it is
+  # unreachable without NB_REPRO_SELFTEST, and in every other mode the
+  # window is byte-for-byte the production rule.
+  local loadavg=/proc/loadavg
+  if [ "${NB_REPRO_SELFTEST:-}" = "window" ]; then
+    loadavg=${NB_REPRO_SELFTEST_LOADAVG:?NB_REPRO_SELFTEST_LOADAVG not set}
   fi
   local deadline=$(( $(date +%s) + 1800 )) n=0 first="" a
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    a=$(cut -d' ' -f1 /proc/loadavg)
+    a=$(cut -d' ' -f1 "$loadavg")
     if awk -v v="$a" 'BEGIN { exit !(v < 4) }' \
        && ! pgrep -x cargo >/dev/null 2>&1 \
        && ! pgrep -x rustc >/dev/null 2>&1 \
@@ -104,8 +137,8 @@ quiet_wait() {
       if [ "$n" -eq 0 ]; then first=$a; fi
       n=$((n + 1))
       if [ "$n" -ge 13 ]; then
-        printf '%s %s\n' "$(date -u +%FT%TZ)" \
-          "quiet-host window satisfied (load1 $first -> $a, 13 consecutive samples; no cargo/rustc; no nbench unit)" >&2
+        QUIET_LINE="$(date -u +%FT%TZ) quiet-host window satisfied (load1 $first -> $a, 13 consecutive samples; no cargo/rustc; no nbench unit)"
+        printf '%s\n' "$QUIET_LINE" >&2
         return 0
       fi
     else
@@ -160,6 +193,29 @@ probe_build_profile() {
     *"needs a release build"*)
       refuse "NB_BIN is a debug build — nbench refuses a measured row from it (${out#nbench: })" ;;
   esac
+}
+
+# A repro must never overwrite a committed row (verdict B-0-F7-F1b,
+# finding 1): `nbench run` writes results/<UTC date>/$ROW.json, so a
+# repro on a date that already holds a row would clobber that file in
+# the working tree — exactly what run A of B-0-F7-F1b did to B-0-F7's
+# committed row on 2026-10-31. Refuse (exit 4) when the path is
+# git-tracked — ls-files reads the index, so this also catches a
+# tracked row since deleted from the worktree — or when it merely
+# exists, which is the only check when $ROOT is not in a git work
+# tree. Called from run_one for both a and b, before anything is
+# created (R5) and again right after the quiet window: that wait can
+# last up to 30 min, long enough for the UTC date — and with it this
+# path — to roll over mid-run.
+refuse_if_row_committed() { # refuse_if_row_committed <UTC date>
+  local date=$1
+  local rel="results/$date/$ROW.json"
+  if git -C "$ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+    refuse "$rel is committed (git-tracked); a repro run would overwrite it — run the protocol on a date with no row (verdict B-0-F7-F1b finding 1)"
+  fi
+  if [ -e "$ROOT/$rel" ]; then
+    refuse "$rel already exists (not git-tracked); a repro run would overwrite it — run the protocol on a date with no row (verdict B-0-F7-F1b finding 1)"
+  fi
 }
 
 # Copy this run's evidence (J4) into $REPRO/run-<x>/: every settle
@@ -251,15 +307,31 @@ run_one() {
     REPRO=$dir
   fi
 
+  # The committed-row guard (B-0-F7-F1b finding 1), while nothing has
+  # been created yet (R5): after the protocol refusals above, before
+  # the quiet window burns its 30 min and before NB_BIN is probed.
+  refuse_if_row_committed "$(date -u +%F)"
+
   # Fail fast on a debug client (R5): before the quiet window and
   # before any directory exists, so a wrong NB_BIN costs nothing.
   probe_build_profile
 
   quiet_wait
+  # The committed-row guard again (B-0-F7-F1b finding 1): the wait
+  # above can outlast a UTC midnight, and this run is about to make
+  # nbench write results/<the new UTC date>/$ROW.json.
+  refuse_if_row_committed "$(date -u +%F)"
   # Only now does today's repro dir come into being (R5): an exit 3
   # above must not leave an empty results/<date>/repro behind, which
   # would break `check`'s "exactly one repro dir" for a later run.
   mkdir -p "$REPRO"
+  # The quiet-window evidence must be committed (B-0-F7-F1b finding
+  # 2): run-*.log is gitignored by *.log, so the line the window ended
+  # on — satisfied, or the loud selftest BYPASSED line — is appended
+  # (never overwritten: >>) to a tracked file before the run starts.
+  # A killed-attempt retry adds a second line instead of hiding the
+  # first. An exit 3 above never reaches this: it creates nothing.
+  printf '%s\n' "$QUIET_LINE" >> "$REPRO/run-$x.quiet.txt"
 
   # The per-run evidence marker (verdict B-0-F7-F1 finding 1): the
   # work dir work/<UTC date>/$ROW is shared by EVERY run on that date,
@@ -485,8 +557,9 @@ do_check() {
 # evidence copy), a VOID run A (R2's finality), and a debug NB_BIN
 # (R5's probe). Outcome-neutral: no timing, no podman, no real row,
 # nothing outside the temp root is read or written. The scratch dir is
-# left in place for inspection (its path is printed) — no rm anywhere
-# in this script's test path.
+# left in place for inspection (its path is printed); the only rm in
+# this script's test path is S6b's, of a single file inside its own
+# throwaway root.
 #
 # Assert helpers: st_rc <name> <want-rc> <root> <stub-mode> <args...>
 # runs this script and asserts its exit code; st_ok <name> <cmd...>
@@ -601,6 +674,18 @@ STUB
     local r=$1 m=$2; shift 2
     NB_HARNESS="$r" NB_BIN="$t/nbench-stub" NB_REPRO_SELFTEST=1 \
       NB_STUB_MODE="$m" NB_STUB_DEBUG="${NB_STUB_DEBUG:-0}" \
+      bash "$script" "$@" > "$t/last.out" 2>&1
+  }
+  # Like st_run, but for S7b only: quiet_wait's REAL loop in window
+  # mode (card B-0-F7-F1b-F2 Work 3) — load1 comes from $win_loadavg,
+  # and the Work 3 PATH stubs (sleep instant, pgrep matchless,
+  # systemctl silent) sit first on PATH, so 13 samples pass in
+  # milliseconds and the satisfied line is the real one.
+  st_run_win() {
+    local r=$1 m=$2; shift 2
+    NB_HARNESS="$r" NB_BIN="$t/nbench-stub" NB_REPRO_SELFTEST=window \
+      NB_REPRO_SELFTEST_LOADAVG="$win_loadavg" NB_STUB_MODE="$m" \
+      NB_STUB_DEBUG=0 PATH="$win_bin:$PATH" \
       bash "$script" "$@" > "$t/last.out" 2>&1
   }
   st_rc() { # st_rc <name> <want-rc> <st_run args...>
@@ -722,6 +807,101 @@ STUB
   # results/ tree (verdict finding 4).
   st_ok "markers live under the work/ root" test -f "$r/work/.reproduce-run-a.marker" -a -f "$r/work/.reproduce-run-b.marker"
   st_ok "no marker under the committed results/ tree" test -z "$(find "$r/results" -name '*.marker')"
+
+  echo "S6: a/b refuse to overwrite a committed row (B-0-F7-F1b finding 1)"
+  # Every case gets its own root; the git cases are made repos here,
+  # and git init/add/commit run ONLY inside these throwaway roots,
+  # never against the real checkout. s6_commit_row plants a fake row
+  # at results/<date>/ and commits it with a selftest identity (the
+  # card's flags: gpgsign off, no global user needed).
+  s6_commit_row() { # s6_commit_row <root> <date>
+    local r=$1 d=$2
+    mkdir -p "$r/results/$d"
+    printf '{"row":"%s","s6":"committed fake row"}\n' "$ROW" > "$r/results/$d/$ROW.json"
+    git -C "$r" add "results/$d/$ROW.json"
+    git -C "$r" -c user.name=selftest -c user.email=selftest@invalid \
+      -c commit.gpgsign=false commit -q -m "selftest fake row"
+  }
+  # S6a: a committed row at today's path — refuse before anything.
+  r=$t/s6a; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  s6_commit_row "$r" "$D"
+  st_rc "a refuses when today's row is committed" 4 st_run "$r" success a
+  st_ok "the committed row is byte-identical in the worktree" git -C "$r" diff --quiet
+  st_ok "no repro dir was created (the guard fires before anything)" test ! -e "$r/results/$D/repro"
+  st_ok "the refusal says committed" grep -q "is committed (git-tracked)" "$t/last.out"
+  # S6b: tracked, but deleted from the worktree — ls-files reads the
+  # index, so the row is still committed as far as git is concerned.
+  r=$t/s6b; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  s6_commit_row "$r" "$D"
+  rm -f "$r/results/$D/$ROW.json"
+  st_rc "a still refuses a tracked row deleted from the worktree" 4 st_run "$r" success a
+  st_ok "the refusal still says committed (the index, not the disk, decides)" grep -q "is committed (git-tracked)" "$t/last.out"
+  # S6c: no git at all, an untracked row exists — the -e arm alone.
+  r=$t/s6c; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  mkdir -p "$r/results/$D"
+  printf '{"row":"%s","s6":"untracked row"}\n' "$ROW" > "$r/results/$D/$ROW.json"
+  cp "$r/results/$D/$ROW.json" "$t/s6c.row.json"
+  st_rc "a refuses an existing untracked row (non-git root)" 4 st_run "$r" success a
+  st_ok "the untracked row is unchanged" cmp -s "$r/results/$D/$ROW.json" "$t/s6c.row.json"
+  st_ok "the refusal names an existing, untracked row" grep -q "already exists (not git-tracked)" "$t/last.out"
+  # S6d: run A finished clean, then someone commits a row at today's
+  # path — run B must refuse and leave run A's evidence alone.
+  r=$t/s6d; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds (no row at today's path yet)" 0 st_run "$r" success a
+  s6_commit_row "$r" "$D"
+  # `|| true` on the copies: under a mutant that stops writing the
+  # quiet record they would not exist, and the runner must survive its
+  # own setup (set -e) to report the cmp FAILs below, not die on them.
+  cp "$r/results/$D/repro/$ROW.run-a.json" "$t/s6d.run-a.json" || true
+  cp "$r/results/$D/repro/run-a.quiet.txt" "$t/s6d.run-a.quiet.txt" || true
+  st_rc "b refuses: today's row path became committed after run A" 4 st_run "$r" success b
+  st_ok "run A's JSON is untouched" cmp -s "$r/results/$D/repro/$ROW.run-a.json" "$t/s6d.run-a.json"
+  st_ok "run A's quiet record is untouched" cmp -s "$r/results/$D/repro/run-a.quiet.txt" "$t/s6d.run-a.quiet.txt"
+  # S6e (no regression): a git root with no row at the path just runs.
+  # S1 already covers the non-git root.
+  r=$t/s6e; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  st_rc "a succeeds in a git root with no row" 0 st_run "$r" success a
+  # The quiet record must be committable evidence: with a copy of the
+  # real harness .gitignore in place, git must NOT ignore it (the
+  # repo-root *.log rule hides run-*.log; a .txt under results/ stays
+  # trackable — that asymmetry is the point of the file).
+  cp "$(dirname "$script")/../../.gitignore" "$r/.gitignore"
+  st_ok "the quiet record is git-trackable (the real .gitignore does not ignore it)" \
+    test -z "$(git -C "$r" check-ignore -v "results/$D/repro/run-a.quiet.txt" || true)"
+
+  echo "S7: the line the quiet window ended on is recorded in repro/run-<x>.quiet.txt (B-0-F7-F1b finding 2)"
+  # S7a: bypass mode — each run's quiet file holds exactly the one
+  # UTC-stamped BYPASSED line.
+  r=$t/s7a; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  st_rc "a succeeds (bypassed window)" 0 st_run "$r" success a
+  st_rc "b succeeds (bypassed window)" 0 st_run "$r" success b
+  st_ok "run-a.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-a.quiet.txt")" -eq 1
+  st_ok "run-a's quiet line is the UTC-stamped BYPASSED line" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window BYPASSED' "$r/results/$D/repro/run-a.quiet.txt"
+  st_ok "run-b.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-b.quiet.txt")" -eq 1
+  st_ok "run-b's quiet line is the UTC-stamped BYPASSED line" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window BYPASSED' "$r/results/$D/repro/run-b.quiet.txt"
+  # S7b: window mode (Work 3) — the real loop, stubbed peripherals, so
+  # the satisfied line itself is what gets recorded. No busy-load
+  # case: with sleep stubbed it would spin to the 30-min deadline, and
+  # the window's refusal path is unchanged and not under test here.
+  r=$t/s7b; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  win_loadavg="$t/s7b.loadavg"
+  printf '0.50 0.40 0.30 1/100 1\n' > "$win_loadavg"
+  win_bin="$t/s7b-bin"
+  mkdir -p "$win_bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$win_bin/sleep"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$win_bin/pgrep"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$win_bin/systemctl"
+  chmod +x "$win_bin/sleep" "$win_bin/pgrep" "$win_bin/systemctl"
+  st_rc "a succeeds through the real (stubbed) window" 0 st_run_win "$r" success a
+  st_ok "run-a.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-a.quiet.txt")" -eq 1
+  st_ok "the recorded line is the satisfied line (first -> last load1, 13 samples)" \
+    grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window satisfied \(load1 0\.50 -> 0\.50, 13 consecutive samples' "$r/results/$D/repro/run-a.quiet.txt"
 
   if [ "$fails" -eq 0 ]; then
     echo "REPRO SELFTEST OK ($t)"

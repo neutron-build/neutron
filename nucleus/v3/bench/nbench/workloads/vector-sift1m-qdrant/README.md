@@ -155,6 +155,25 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   first, so run B can never change the word; it refuses only if run
   A has not finished or run B already exists. Run A is the row; run
   B is evidence only; there is no third run.
+- **Committed-row guard (verdict B-0-F7-F1b finding 1).** Before the
+  quiet window — and again right after it, because the wait can last
+  up to 30 min and the UTC date can roll over — `a`/`b` refuse
+  (exit 4) when `results/<UTC date>/vector-sift1m-qdrant.json` is
+  git-tracked (which also catches a tracked row since deleted from
+  the worktree: the check reads git's index) or simply exists. `nbench
+  run` writes exactly that path, so without the guard a repro on a
+  date that already holds a row overwrites the committed row in the
+  working tree — as run A of B-0-F7-F1b did to B-0-F7's row on
+  2026-10-31. Run the protocol on a date with no row.
+- **Quiet-window record (verdict B-0-F7-F1b finding 2).** The line the
+  quiet window ended on — the satisfied line (UTC time, first and
+  last load1) or, under `NB_REPRO_SELFTEST=1`, the loud BYPASSED line,
+  both UTC-stamped — is appended to
+  `results/<date>/repro/run-<x>.quiet.txt` before the run starts, so
+  the window's evidence is committed with the run (`run-*.log` is
+  gitignored by the repo's `*.log` rule; a `.txt` under `results/` is
+  not). The append is `>>`: a killed-attempt retry adds a second line
+  instead of hiding the first.
 - `verdict` — writes `repro/verdict.txt`: `nbench qdrant-repro-verdict
   --a F --b F` when both JSONs exist, or `REPRO VERDICT=INVALID (run X
   refused/voided: …)` for a failed or voided run. On REPRODUCED only,
