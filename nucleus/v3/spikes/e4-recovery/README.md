@@ -1,15 +1,14 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F1, relaunched `--keep` under nv3-X-5c-F1-esc-2
-(P, 2026-10-31; run 3 landed X5-R20 shapes A and B and X5-R21 (c), and
-P reverted 31d68b5f (X5-R23) and ran the tip's 10k triage campaign and
-its `verify` itself (X5-R25)). This relaunch runs **no campaign-class
-command** (X5-R25): it commits P's campaign file, writes the
-digest-stability list offline from runs that already exist (X5-R26),
-and finishes the record — X5-R21 (b)/(d), X5-R24 shape-C evidence, and
-the stage record with the esc-2 campaign. **No code changed in this
-relaunch** (no commit touches `src/`, `tests/`, `examples/` or any
-`Cargo.*`). The triage file of record is now P's c8e578b7 run:
+Status: **stage X-5c-F2 (amended by nv3-X-5c-F2-amend-1, 2026-10-31),
+**step 0 done** — the digest-stability step-4 record corrected offline
+from the X-5c-F1 gate's truth file (54 rows rewritten; the corrected
+counts and the rulings X5-R28–R31 are in the stage record below).
+Remaining: step 1 (harness hardening (a)–(e)), step 2 (X5-R28 + X5-R30
+(a)), step 3 (X5-R29 shape C), step 4 (the stage record). The
+Acceptance 10k and its `verify --no-quotas` are the runner's (X5-R31);
+no campaign-class command runs in this card's attempts. The triage file
+of record stays P's c8e578b7 run:
 `E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
 PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
 FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
@@ -1107,19 +1106,28 @@ d2c8bba7 digest, bc4f3bba digest, cause(s) in commit order. **3,507
 changed / 6,493 unchanged** (the count the bc4f3bba commit recorded).
 Per step: d2c8bba7→9b041a3d **X5-R14 entry park 2,627 seeds**;
 9b041a3d→2da915a8 **NEVER-FIRED re-draw 204**; 2da915a8→0a8f196b
-**NO-TWIN supply 19**; 0a8f196b→bc4f3bba **856 changed: 851 MP-E
-referenced set + 4 NEVER-FIRED redesign (4139/7469/7719/9809, the
-4fedc648 wrap/retry seeds) + 1 both (6868)**. The step-4 split uses
-the card's field rule refined by mechanism evidence, recorded here
-for P's gate: **every referenced-set channel is MP-only** — the
-page-file fault draw biases 60/40 over the referenced set
-(`media_faults_common`), so 12b54965 also shifted fault *targets* at
-equal counts, and the (i)-walk findings and Q13/Q14 flags are
-page-file — while the redesign provably derives the same final specs
-(6cc53657) and shows as fired-guard defect / twin / nested
-signatures. Where the letter of the field rule ("crash/hook/fired or
-round count differs ⇒ NEVER-FIRED") and the mechanism disagree, the
-mechanism won and the seeds are named: **38 MP seeds whose later
+**NO-TWIN supply 19**; 0a8f196b→bc4f3bba **856 changed**. **The
+step-4 attribution is X-5c-F2 step 0's corrected record (offline, from
+the per-seed 12b54965 runs of the X-5c-F1 gate's truth file,
+`$HOME/.cache/nv3-review/runlogs/X-5c-F1-gate.step4-truth.tsv`, 852
+rows): 835 MP-E (795 MP-E only, counting 6868, plus 40 both) and 57
+NEVER-FIRED redesign (13 + 40 + 4 — the 4 being 4139/7469/7719/9809,
+the 4fedc648 wrap/retry seeds). The first form of this list
+mis-attributed 54 of the 852 by the card's field rule refined with
+mechanism reading; they are rewritten (MPE → `MP-E referenced set`,
+RED → `NEVER-FIRED redesign`, MPE+RED → both, in commit order —
+12b54965 MP-E referenced set precedes 6cc53657/4fedc648 NEVER-FIRED
+redesign), and every step-4 label now matches the truth file on all
+852 of its rows. The gate's truth run is the authority: the field rule
+would have been wrong on 107 of the 852.** The mechanism evidence the
+first form recorded, kept for P's gate: **every referenced-set channel
+is MP-only** — the page-file fault draw biases 60/40 over the
+referenced set (`media_faults_common`), so 12b54965 also shifted fault
+*targets* at equal counts, and the (i)-walk findings and Q13/Q14 flags
+are page-file — while the redesign shows as fired-guard defect / twin
+/ nested signatures. Where the letter of the field rule
+("crash/hook/fired or round count differs ⇒ NEVER-FIRED") and the
+mechanism disagree, the seeds are named: **38 MP seeds whose later
 round's crash desc moved at the same hook to a different checkpoint
 index with all earlier rounds record-identical** (7, 987, 2307, 8168,
 9168…) — the fault-draw shift moving the landed index through a
