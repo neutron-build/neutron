@@ -3702,8 +3702,17 @@ pub fn r29_subtree_diag(disk: &SimDisk, cfg: &StoreCfg, findings: &[Finding]) {
             / crate::store::page::MAP_ENTRY) as u64;
         let span = ckpt::radix_child_span(cfg.map_leaf_cap, n, meta.next_lpid);
         walk_map_disk(
-            disk, pf, meta.map_root, 0, span, cfg.map_leaf_cap, 0, &mut flat, &mut used,
-            &mut sink, false,
+            disk,
+            pf,
+            meta.map_root,
+            0,
+            span,
+            cfg.map_leaf_cap,
+            0,
+            &mut flat,
+            &mut used,
+            &mut sink,
+            false,
         );
     }
     // The failed nodes: mapped pages failing §3.3 against their Ref.
