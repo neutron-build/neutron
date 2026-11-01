@@ -380,6 +380,153 @@ fn f1f2e_page_file_sync_data_yields_the_anchor0_defect() {
     );
 }
 
+/// **X5-R28 (a) unit pin: `V_k` is the history at the opened meta's
+/// write, not the latest DWrite.** Literal dwrites: a page write `w1`
+/// to slot 7, the opened meta k=1's write, a newer meta k=2's write,
+/// then a page write `w2` to slot 7 which a LOST fault reverts — the
+/// durable bytes are `w1` again while the last-issued bytes are `w2`
+/// (the taint 1.4 sees). `V_k(7)` composes only the dwrites that
+/// precede the opened meta's own write (`w1`), so the durable bytes
+/// equal it and slot 7 is kept. The mutant "use the latest DWrite"
+/// composes `w2` too, which is not the durable bytes, so the slot
+/// falls out of K.
+#[test]
+fn r28_v_k_is_the_history_at_the_opened_meta() {
+    use e4_recovery::sim::SimDisk;
+    use e4_recovery::store::page::{self, Meta};
+    use std::collections::BTreeSet;
+    let mut disk = SimDisk::new();
+    let pf = disk.create("/pages").expect("create");
+    disk.sync_dir(e4_recovery::sim::ROOT_DIR).expect("dirsync");
+    let m1 = page::build_meta(&Meta {
+        ckpt_id: 1,
+        ..Meta::default()
+    });
+    let m2 = page::build_meta(&Meta {
+        ckpt_id: 2,
+        ..Meta::default()
+    });
+    let w1 = page::build_leaf(7, 1, &[(b"a", b"one")]);
+    let w2 = page::build_leaf(7, 2, &[(b"a", b"two")]);
+    assert_ne!(w1, w2, "the two slot-7 pages must differ");
+    // dw[0]: w1. dw[1]: the opened meta (k=1, slot 2). dw[2]: the
+    // newer meta (k=2, slot 1) — the anchor. dw[3]: w2, issued after
+    // it. (A meta k lives at slot 1 + (k mod 2).)
+    disk.write_at(pf, 7 * 4096, &w1).expect("w1");
+    disk.sync_all(pf).expect("sync");
+    disk.write_at(pf, 8192, &m1).expect("meta k=1");
+    disk.sync_all(pf).expect("sync");
+    disk.write_at(pf, 4096, &m2).expect("meta k=2");
+    disk.sync_all(pf).expect("sync");
+    disk.write_at(pf, 7 * 4096, &w2).expect("w2");
+    disk.sync_all(pf).expect("sync");
+    // A LOST fault reverts w2: durable = w1, last issued = w2 — tainted.
+    disk.apply_one_media_fault(&e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: 7 * 4096,
+        len: 4096,
+        bytes: w2.clone(),
+        pre: w1.clone(),
+        kind: e4_recovery::sim::MediaKind::Lost,
+    });
+    assert!(
+        disk.range_tainted(pf, 7 * 4096, 4096),
+        "slot 7 is tainted (durable w1 != issued w2)"
+    );
+    assert_eq!(
+        disk.durable_read(pf, 7 * 4096, 4096),
+        w1,
+        "the durable bytes are the reverted w1"
+    );
+    let image: BTreeSet<u64> = [7u64].into_iter().collect();
+    let tainted: BTreeSet<u64> = [7u64].into_iter().collect();
+    let hits: BTreeSet<u64> = BTreeSet::new();
+    let k = e4_recovery::harness::kept_set_k(
+        &disk,
+        pf,
+        1,
+        &image,
+        &tainted,
+        &hits,
+        &disk.events.clone(),
+        true,
+    );
+    assert_eq!(
+        k,
+        BTreeSet::from([7u64]),
+        "V_k composes the history at the opened meta's write (w1 = the durable bytes), so slot 7 is kept (K={k:?})"
+    );
+}
+
+/// **X5-R28 (c) pin: the durable-image walk reports no ground-truth
+/// meta-slot finding.** A literal disk with a tainted meta slot (slot
+/// 1's durable bytes differ from its last-issued write) and a media
+/// fault applied: `durable_image` emits **no slotted finding on slots
+/// 1 or 2** — the rollback-fallout loop that pushed one (derived from
+/// `range_tainted` ground truth, standing in for amcheck the way
+/// X5-R23 banned) is deleted. Restoring the loop fails this pin.
+#[test]
+fn r28_no_ground_truth_meta_finding() {
+    use e4_recovery::sim::SimDisk;
+    use e4_recovery::store::page::{self, Meta};
+    let mut disk = SimDisk::new();
+    let pf = disk.create("/pages").expect("create");
+    disk.sync_dir(e4_recovery::sim::ROOT_DIR).expect("dirsync");
+    // A valid opened image: metas k=1 (slot 2) and k=2 (slot 1), the
+    // newer winning. (A meta k lives at slot 1 + (k mod 2).)
+    let m1 = page::build_meta(&Meta {
+        ckpt_id: 1,
+        ..Meta::default()
+    });
+    let m2 = page::build_meta(&Meta {
+        ckpt_id: 2,
+        ..Meta::default()
+    });
+    let stray = page::build_meta(&Meta {
+        ckpt_id: 3,
+        ..Meta::default()
+    });
+    disk.write_at(pf, 8192, &m1).expect("meta k=1");
+    disk.sync_all(pf).expect("sync");
+    disk.write_at(pf, 4096, &m2).expect("meta k=2");
+    disk.sync_all(pf).expect("sync");
+    // A media fault exists on the disk (a harmless LOST on a data
+    // slot), so the deleted loop's gate was armed here. (The fault and
+    // its write come BEFORE the stray issue below: a later sync would
+    // graduate the stray into the durable bytes and untaint the slot.)
+    let w5 = page::build_leaf(5, 1, &[]);
+    disk.write_at(pf, 5 * 4096, &w5).expect("slot 5 write");
+    disk.sync_all(pf).expect("sync");
+    disk.apply_one_media_fault(&e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: 5 * 4096,
+        len: 4096,
+        bytes: w5.clone(),
+        pre: vec![0u8; 4096],
+        kind: e4_recovery::sim::MediaKind::Lost,
+    });
+    // Slot 2 tainted: a k=3 meta issued at slot 2 but never synced —
+    // the durable bytes stay k=1 while the issued bytes are k=3.
+    disk.write_at(pf, 8192, &stray).expect("stray meta issue");
+    assert!(
+        disk.range_tainted(pf, 8192, 4096),
+        "slot 2 is tainted (a crash-dropped volatile meta write)"
+    );
+    let cfg = e4_recovery::workload::Knobs::derive(0, 0).store_cfg(None);
+    let (findings, used, meta) = e4_recovery::harness::durable_image(&disk, &cfg);
+    assert!(meta.is_some(), "a valid meta must open (k=2)");
+    assert!(
+        used.contains(&1) && used.contains(&2),
+        "slots 1 and 2 stay in the referenced set (O-3 (c)/R's guard read it)"
+    );
+    for f in &findings {
+        assert!(
+            !matches!(f.slot, Some(1) | Some(2)),
+            "no slotted finding on a meta slot may be derived from ground truth: {f:?}"
+        );
+    }
+}
+
 /// The pass fold (the gate's N7 pin): every per-seed failure flag folds
 /// `pass` to false on its own — a verdict that passed the oracle is
 /// still a failed round under any flag.

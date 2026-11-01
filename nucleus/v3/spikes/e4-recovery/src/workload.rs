@@ -675,6 +675,11 @@ pub struct RoundRec {
     pub o3_fail: Option<String>,
     /// O-3 (a)'s input (reported beside the rule, never inside it).
     pub served: bool,
+    /// X5-R30 (a): every served range of the round lies wholly inside
+    /// slots of the kept set `K` (vacuously true when nothing was
+    /// served). A diagnostic beside the rule, never an oracle input;
+    /// evidence for F3's O-3 (a) question.
+    pub served_k: bool,
     /// Monitor hits.
     pub monitors: Vec<&'static str>,
     /// XX001 detection sites.
@@ -829,7 +834,7 @@ impl SeedRec {
         );
         for r in &self.rounds {
             s.push_str(&format!(
-                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.crash,
                 r.fired,
                 r.nested,
@@ -845,6 +850,7 @@ impl SeedRec {
                 r.o3_fail,
                 r.o1f_fail,
                 r.served,
+                r.served_k,
                 r.meta_rollback,
                 r.r_len,
                 r.o1_detected_loss,
@@ -1559,6 +1565,7 @@ fn round_rec(
     rr.o2_fail = out.o2_fail.clone();
     rr.o3_fail = out.o3_fail.clone();
     rr.served = out.served;
+    rr.served_k = out.served_k;
     rr.monitors = out.monitors.clone();
     rr.detections = out.detections.clone();
     rr.acked_lost = out.acked_lost.len() as u64;

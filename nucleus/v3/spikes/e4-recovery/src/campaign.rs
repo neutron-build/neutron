@@ -1388,7 +1388,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 s.push(',');
             }
             s.push_str(&format!(
-                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
+                "{{\"crash\":{},\"hook\":{},\"fired\":{},\"nested\":{},\"lost\":{},\"mis\":{},\"torn\":{},\"lo\":{},\"hi\":{},\"c\":{},\"frontier\":{},\"gcw\":{},\"o1\":{},\"o1f\":{},\"o2\":{},\"o3\":{},\"served\":{},\"sk\":{},\"ackl\":{},\"ackls\":{},\"mrb\":{},\"rlen\":{},\"o1dl\":{},\"r6\":{},\"cxx\":{},\"pass\":{},\"dl\":{},\"ll\":{},\"lls\":{},\"pa\":{},\"bt\":{},\"terr\":{},\"q\":[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]}}",
                 esc(&x.crash),
                 esc(&x.hook),
                 x.fired,
@@ -1406,6 +1406,7 @@ pub fn emit_campaign(recs: &[SeedRec]) -> String {
                 x.o2_fail.as_deref().map(esc).unwrap_or_else(|| "null".into()),
                 x.o3_fail.as_deref().map(esc).unwrap_or_else(|| "null".into()),
                 x.served,
+                x.served_k,
                 x.acked_lost,
                 x.acked_lost_syncoff,
                 x.meta_rollback,
@@ -1824,6 +1825,7 @@ fn parse_round(j: &mut Jx<'_>) -> Result<crate::workload::RoundRec, String> {
             "o2" => x.o2_fail = j.opt_string()?,
             "o3" => x.o3_fail = j.opt_string()?,
             "served" => x.served = j.boolv()?,
+            "sk" => x.served_k = j.boolv()?,
             "ackl" => x.acked_lost = j.int()?,
             "ackls" => x.acked_lost_syncoff = j.int()?,
             "mrb" => x.meta_rollback = j.boolv()?,
