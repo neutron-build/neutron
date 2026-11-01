@@ -397,11 +397,24 @@ pub fn free_lpid<H: StoreHost>(cx: &Cx<'_, H>, lpid: u64) -> Result<(), Fail> {
             }
         }
         st.map.cur.remove(&lpid);
-        if lpid + 1 == st.meta.next_lpid && lpid > 0 {
-            st.meta.next_lpid -= 1;
-        } else {
-            st.slots.free_lpids.insert(lpid);
-        }
+        // S-STORE §4.2/§4.3 (card X-5c-F3, class C-XX): a freed LPID
+        // goes to the free set — `next_lpid` never shrinks. The
+        // draft's `next_lpid -= 1` on freeing the highest LPID let the
+        // allocator re-issue an LPID the image being built still maps
+        // (`map.img`'s override keeps the page's epoch-k content across
+        // a free inside a flip window, §4.2), so a checkpoint froze a
+        // radix whose entries reached `next_lpid` itself: the persisted
+        // image mapped an LPID its own meta's span `[1, next_lpid)`
+        // says does not exist (amcheck (i)'s "next_lpid not above every
+        // mapped lpid", a structural finding in faultless class C
+        // rounds — the repros 221/66/907), the LPID bitmap could not
+        // express it (I-FREE-EXACT's span), and a recovery that re-freed
+        // the LPID left a dangling inner reference ("lpid N unmapped",
+        // an XX001 at Open with no fault at all). §4.3's bitmap is
+        // defined over `[1, next_lpid)` precisely because `next_lpid`
+        // is monotone; immediate in-memory reuse goes through
+        // `free_lpids` ("Reuse is immediate, in memory", §4.2).
+        st.slots.free_lpids.insert(lpid);
         Ok(())
     })?;
     cx.w.wake(WaitKey::Pin);

@@ -281,10 +281,19 @@ pub fn open<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInner, 
         c.store().dir = dir;
         Ok(())
     })?;
-    // G3: the segment holding `wal_start_lsn` must exist.
+    // G3: the segment holding `wal_start_lsn` must exist. The probe is
+    // `exists` (card X-5c-F3, class C-XX): a crash delivered at the
+    // probe's yield propagates as `Fail::Sim` — the recovery loop's
+    // nested-crash arm then resolves F-CRASH and retries — while only a
+    // genuinely missing segment is the XX001. Reading `open`'s error
+    // here conflated the two (`SimFail::Crashed` from the yield and
+    // "does not exist" both arrive as `Err(SimFail::Crashed)`), so a
+    // nested recovery crash that landed on this yield was reported as
+    // "start segment missing" — an XX001 at Open in a faultless class C
+    // round (seed 1769's family), with the crash never fired.
     let start_seg = meta.wal_start_lsn - (meta.wal_start_lsn % WAL_SEG);
     let name = format!("/wal/{start_seg:016x}.log");
-    if meta.wal_start_lsn > 0 && cx.env().open(&name).is_err() {
+    if meta.wal_start_lsn > 0 && !cx.env().exists(&name).map_err(Fail::Sim)? {
         if matches!(meta_is_mutant(cx)?, Some(Mutant::StartSegmentMissingOk)) {
             // The mutant treats the WAL as empty.
             cx.with("open:mutwal", |c| {
@@ -1313,9 +1322,15 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
     'outer: loop {
         let seg = wal::seg_of(lsn);
         let name = format!("/wal/{seg:016x}.log");
-        let fid = match cx.env().open(&name) {
-            Ok(f) => f,
-            Err(_) => break 'outer,
+        let fid = match cx.env().exists(&name) {
+            // A crash at the probe's yield propagates (the nested-crash
+            // arm resolves F-CRASH and retries); a missing segment is
+            // the valid end (§12.5); only an existing segment opens.
+            // Reading `open`'s error swallowed a delivered crash into
+            // `break 'outer` (X-5c-F3, class C-XX's G3 family).
+            Err(e) => return Err(Fail::Sim(e)),
+            Ok(false) => break 'outer,
+            Ok(true) => cx.env().open(&name).map_err(Fail::Sim)?,
         };
         let mut off = lsn - seg;
         while off + 16 <= WAL_SEG {
@@ -1495,8 +1510,12 @@ pub fn truncate_wal<H: StoreHost>(cx: &Cx<'_, H>, valid_end: u64) -> Result<(), 
     let mut seg = first;
     loop {
         let name = format!("/wal/{seg:016x}.log");
-        let Ok(f) = cx.env().open(&name) else {
-            break;
+        // The same distinction as open's G3 probe (X-5c-F3): a crash at
+        // the yield propagates; only a missing segment ends the walk.
+        let f = match cx.env().exists(&name) {
+            Err(e) => return Err(Fail::Sim(e)),
+            Ok(false) => break,
+            Ok(true) => cx.env().open(&name).map_err(Fail::Sim)?,
         };
         let off = if seg == first { valid_end - seg } else { 0 };
         if off < WAL_SEG {

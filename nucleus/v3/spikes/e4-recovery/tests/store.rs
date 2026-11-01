@@ -1006,3 +1006,76 @@ fn gc_sweep_crosses_subtree_boundaries() {
         assert_eq!(scan.get(k), Some(v), "post-sweep {k:?}");
     }
 }
+
+/// **X-5c-F3 pin, class C-XX (a literal config: one created tree, three
+/// allocations, the highest freed).** S-STORE §4.2: "Reuse is
+/// immediate, in memory" — a freed LPID goes to the free set, and
+/// §4.2's allocator grows `next_lpid` only (`next_lpid++`); §4.3's LPID
+/// bitmap is defined over `[1, next_lpid)` because the counter is
+/// monotone. The draft decremented `next_lpid` when the highest LPID
+/// was freed, so a flip-window free (whose `map.img` override keeps the
+/// page's epoch-k content for the image being built) left the frozen
+/// radix mapping an LPID the meta's own span says does not exist —
+/// amcheck (i)'s "next_lpid not above every mapped lpid" (seeds 221/66,
+/// a structural O-2/O-3 (b) finding in faultless class C rounds) — and
+/// a recovery that re-freed the LPID left a dangling inner reference
+/// ("lpid N unmapped", an XX001 at Open with no fault). Reverting the
+/// fix (mutant M-CXXa: the `next_lpid -= 1` branch restored) fails
+/// this pin at the monotonicity assertion.
+#[test]
+fn cxx_highest_lpid_free_never_shrinks_next_lpid() {
+    let cfg = tcfg(8, 8, 2);
+    let (disk, st) = create_store(cfg, 11, Some(2));
+    let sched = pass_world(1, 11, disk, st);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    // Drain any create-time free set, then take three fresh LPIDs: they
+    // are the highest allocations, so `next_lpid` sits one above the
+    // third.
+    let mut taken = Vec::new();
+    for _ in 0..3 {
+        taken.push(prims::alloc_lpid(&cx).expect("alloc"));
+    }
+    let before = {
+        let g = sched.lock();
+        assert_eq!(
+            g.st.meta.next_lpid,
+            *taken.last().unwrap_or(&0) + 1,
+            "next_lpid must sit one above the highest allocation"
+        );
+        g.st.meta.next_lpid
+    };
+    // Free the highest LPID: the counter stays, the free set takes it.
+    let highest = *taken.last().unwrap_or(&0);
+    prims::free_lpid(&cx, highest).expect("free the highest lpid");
+    {
+        let g = sched.lock();
+        assert_eq!(
+            g.st.meta.next_lpid, before,
+            "freeing the highest LPID shrank next_lpid (S-STORE 4.2/4.3: the counter is monotone; a freed LPID goes to the free set)"
+        );
+        assert!(
+            g.st.slots.free_lpids.contains(&highest),
+            "the freed highest LPID must enter the free set (immediate in-memory reuse, S-STORE 4.2)"
+        );
+        assert!(
+            !g.st.map.cur.contains_key(&highest),
+            "the freed LPID leaves the current map"
+        );
+    }
+    // Immediate reuse through the free set: the next allocation returns
+    // the freed LPID (lowest-free-first), not a re-issue of a shrunk
+    // counter.
+    let again = prims::alloc_lpid(&cx).expect("alloc after free");
+    assert_eq!(
+        again, highest,
+        "the freed highest LPID must be reusable at once through the free set"
+    );
+    assert_eq!(
+        sched.lock().st.meta.next_lpid,
+        before,
+        "the reuse must not move next_lpid"
+    );
+}

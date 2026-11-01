@@ -870,6 +870,77 @@ fn r28_residual_seeds_clear_via_k() {
     }
 }
 
+/// **X-5c-F3 pin, class C-XX (literal configs = the class's repro seeds
+/// 221 and 66, round 0 each, plus the MP-shape repro 907).** Freeing
+/// the highest LPID never shrinks `next_lpid` (S-STORE §4.2/§4.3: a
+/// freed LPID goes to the free set; the counter is monotone, and §4.3's
+/// LPID bitmap is defined over `[1, next_lpid)` because of it). The
+/// draft's decrement let a flip-window free re-issue an LPID the image
+/// being built still maps, so the frozen radix reached `next_lpid`
+/// itself: amcheck (i) reported "next_lpid not above every mapped lpid"
+/// in faultless class C rounds (O-2 + O-3 (b), seeds 221/66), and a
+/// recovery that re-freed the LPID hit "lpid N unmapped" (an XX001 at
+/// Open with no fault at all, seed 221). 907 is the same defect seen
+/// from class MP (O-3 (c): the unexplained XX001 beside faults that
+/// target unread, unreferenced ranges). That the clear comes **through
+/// the monotone counter** is demonstrated on the revert: with the
+/// `next_lpid -= 1` branch restored (mutant M-CXXa) each seed fails
+/// again with exactly its class text.
+#[test]
+fn cxx_highest_lpid_free_never_shrinks_next_lpid_rounds() {
+    for seed in [221u64, 66, 907] {
+        let rec = workload::run_seed(seed, None);
+        for r in &rec.rounds {
+            assert!(
+                r.o2_fail.is_none() && r.o3_fail.is_none(),
+                "seed {seed}: the C-XX defect is back: O-2 {:?} / O-3 {:?}",
+                r.o2_fail,
+                r.o3_fail
+            );
+            assert!(
+                r.pass,
+                "seed {seed}: a round fails beyond the removed defect: {:?}",
+                r.o3_fail
+            );
+        }
+    }
+}
+
+/// **X-5c-F3 pin, class C-XX's G3 family (literal configs = the MW
+/// shape's repro 1769, round 0, and its faultless twin).** The nested
+/// recovery crash that landed on open's G3 probe yield was swallowed
+/// into `Corrupt("start segment … missing (G3)")`: the faultless twin
+/// (judged as class C) failed `O-1(a)` through the recovery `Err`, and
+/// the media round failed `O-3 (c)` because every fault targeted slots
+/// the crashed twin never read or referenced — with `nested=0` recorded
+/// (the crash never fired). With the crash propagating (the `exists`
+/// probe), the retry resolves F-CRASH, recovery completes, the twin
+/// passes and the O-3 (c) twin-rule text is gone. The round's own
+/// remaining failure is its MW-ORPHAN shape (X5-R16's SPEC class,
+/// evidence-only: `O-1 (c) raw entry above the cut` with `O-3 (d)`),
+/// which this pin deliberately does not judge. Reverting the fix
+/// (mutant M-CXXb) fails this pin with exactly the twin's `O-1(a)`
+/// text and the round's O-3 (c).
+#[test]
+fn cxx_g3_probe_never_swallows_a_recovery_crash() {
+    let rec = workload::run_seed(1769, None);
+    for t in &rec.twin {
+        assert!(
+            t.pass,
+            "the faultless twin's recovery must not fail: {:?}",
+            t.o1_fail
+        );
+    }
+    for r in &rec.rounds {
+        let o3 = r.o3_fail.as_deref().unwrap_or("");
+        assert!(
+            !o3.contains("unread, unreferenced targets"),
+            "seed 1769: the O-3 (c) twin-rule failure is back: {:?}",
+            r.o3_fail
+        );
+    }
+}
+
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {
