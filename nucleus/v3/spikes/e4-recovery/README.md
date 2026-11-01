@@ -671,26 +671,57 @@ fresh campaign's digests reproduce exactly (verify's re-run).
 
 ### X5-R16's instrumentation classes
 
-**NEVER-FIRED (instrumentation: workload) — fixed, pinned (commit
-2da915a8).** 150 seeds carried "the crash spec never fired" (110 C, 35
-twin rounds, 5 other MW; 146 targeting `Mid2`). Root cause: the
-targeted draw picked `CKPT_HOOKS[(seed/20)%10]` of checkpoint index
-`target_ckpt` unconditionally; when that checkpoint's step 2 had
-nothing to write — the tiny pool's evictor had written every dirty
-page itself, so step 2 adopted and `Mid2` (fired after every step-2
-write) never fired — the crash could not happen (seed 660 round 0:
-every checkpoint's hook mask is `1015`, all hooks but `Mid2`). The
-fix: the targeted draw runs the same counting pass the uniform draw
-runs; the checkpointer records per completion index the mask of hooks
-reached (`WorkloadObs::ckpt_hooks_hit`, `ckpt::hook_bit`), and the
-draw keeps the seed's hook but lands on an index that reaches it —
-the drawn index if it does, else the smallest — falling back, when
-the drawn hook is unreachable at every index, to a hook the round
-does reach, drawn deterministically from `(seed, round)` over the
-union mask. Seeds 0..1000 re-run with **zero defects and zero unfired
-rounds**. Pin `r16_never_fired_targeted_draws_reach_their_hook`
-(literal configs 60 and 660), demonstrated failing on the reverted
-draw. No workload change (X5-R17's retune is X-5c-F2's).
+**NEVER-FIRED (instrumentation: workload) — fixed, pinned; the record
+below describes the code as it is after the retry redesign (X5-R21
+(b)).** 150 seeds carried "the crash spec never fired" in d2c8bba7
+(110 class C, 35 twin rounds, 5 other MW; 146 targeting `Mid2`). P's
+stated cause: the targeted checkpoint's step 2 had too little to write
+(the tiny pool's evictor had written every dirty page, so `Mid2` —
+fired after every step-2 write — never fired). The class closed in
+three commits, each still in force:
+
+- **2da915a8 (the counting pass).** The checkpointer records, per
+  checkpoint completion index, the mask of hooks it reached
+  (`WorkloadObs::ckpt_hooks_hit`, `ckpt::hook_bit`), and the targeted
+  draw keeps the seed's drawn hook but lands its index on one that
+  reaches it — the drawn index if it does, else the smallest — falling
+  back, deterministically from `(seed, round)` over the union mask
+  (`reachable_hook_spec`), to a hook the round does reach when the
+  drawn hook is unreachable at all. Pin
+  `r16_never_fired_targeted_draws_reach_their_hook` (literal configs 60
+  and 660), demonstrated failing on the reverted draw. This form ran a
+  probe pass before every targeted round; at ~3 seeds/s it would have
+  blown every 60-minute command budget, `verify` included.
+- **6cc53657 (the redesign: no probe pass on the targeted path).** The
+  drawn spec now runs directly — the twin first for MP/MW (Work 2.5
+  pairs their crash points), the real round itself for class C. If it
+  fires (the overwhelming majority) nothing extra happens; only an
+  unfired round re-derives its spec from its **own complete** hook
+  masks (an unfired crash means the workload ran to completion, so
+  every checkpoint completed) and re-runs — the failed attempt is
+  discarded and never reaches the fired-guard. Same derivation and
+  same final specs as the counting form (the repro seeds'
+  crash descs are identical), back at ~12 min per 10k.
+- **4fedc648 (the residual 7 + the uniform twin wrap).** The MP/MW
+  **real** round retries on its own too: the twin and real chains can
+  diverge — the twin chain re-seeds after a failed twin recovery — so
+  the twin's firing does not guarantee the real round's (the five
+  ruling seeds 2669/4049/4309/7469/9809, all MW round 1). And a
+  **uniform twin** whose counted point overshot (its `k` was counted on
+  the real chain, which may have diverged from the twin chain the
+  re-seed built) **wraps `k` into its own measured total** — `1 +
+  (k−1) % sched_yields`: an unfired crash means the attempt ran to
+  completion, so its own `sched_yields` **is** its total (seeds
+  4139/7719). `verify`'s re-run default became 16 workers (digests are
+  thread-count independent, pinned; a 4-thread re-run of 10k seeds
+  does not fit a 60-minute budget). A re-run that still does not fire
+  trips the fired-guard loudly — never a silent pairing break — and
+  X5-R21 (c) (04063d1b) then re-pairs the real round's retry with its
+  twin (below).
+
+Result in every 10k file since: **0 defect seeds, 0 unfired rounds**
+(`DEFECT_SEEDS=0` in bc4f3bba and in P's esc-2 campaign). No workload
+change (X5-R17's retune is X-5c-F2's).
 
 **NO-TWIN (instrumentation: harness) — fixed, pinned (commit
 0a8f196b).** 19 MP/MW rounds failed as "MP/MW round with XX001 and no
@@ -707,6 +738,46 @@ repro seeds (1267, 1769, 2149 checked) clear the text; their
 remaining failures are real O-3 findings — F2's classes. Pin
 `r16_no_twin_is_always_supplied` (literal configs 1267 and 1769),
 demonstrated failing on the reverted supply.
+
+**X5-R21 (d), the esc-1 verdict's 2e re-seed question, answered from
+the code as it is:** *when a broken twin chain re-seeds from the real
+round's own start, is the round's twin still Work 2.5's twin (the same
+script, crash and F-CRASH resolutions)?* Yes, on every path, and no
+path breaks silently:
+
+- the re-seed (`workload.rs`, the `twin_chain.is_none()` arm at each
+  MP/MW round) rebuilds the twin chain from the **real round's own
+  start** — the same disk, store, model and cut the real round runs
+  from — so the re-seeded twin runs the same script base and the same
+  drawn crash spec as its real round;
+- a **targeted** twin on the re-seeded chain that does not fire
+  re-derives from its own complete masks (`tch_retry`), and the real
+  round then **follows the twin's fixed spec** (Work 2.5: the same
+  crash point). When the real round's own draw does not fire either —
+  the divergence 4fedc648 closed — the real round re-derives, and
+  X5-R21 (c) (04063d1b) re-runs the twin **at that same re-derived
+  spec, from its own start (`tch_pair`), before the real round uses
+  its supply and nested points**, replacing the first attempts' twin
+  record, supply, nested points and chain continuation. Pin
+  `r21c_the_real_rounds_retry_re_pairs_its_twin` (the ruling's five
+  seeds 2669/4049/4309/7469/9809), demonstrated failing with the
+  pairing re-run disabled (`E4_R21C_REVERT=1`, gate reverted clean);
+- a **uniform** twin whose counted point overshot on the re-seeded
+  chain wraps its `k` into its own measured total (4fedc648; the real
+  round's `k` is counted on its own chain and fires there — the
+  record's crash desc is the real round's point);
+- a re-run that still does not fire trips the fired-guard loudly
+  (`crash_fired_defect` is checked on every re-run's outcome), so a
+  re-seed can never leave the round silently unpaired, and the
+  `SeedRec.twin_paired` diagnostic (never a digest input, never
+  serialized; `E4_PAIR_DIAG` prints it) records the invariant per
+  round — the twin's final attempted spec equals the real round's
+  final attempted spec on every targeted round.
+
+In P's esc-2 campaign the guard holds at 10k scale:
+`DEFECT_SEEDS=0` (no fired-guard trip anywhere) and every MP/MW round
+carries a judged twin (2,180 + 1,415 twin records; 103 failing —
+store classes, not pairing).
 
 **MP-E: O-3 (e) under page damage — completeness fixed and pinned;
 exactness escalated (commit 12b54965).**
@@ -805,8 +876,11 @@ each, `run --seeds N..N+1`):
   a Q14 meta-fault round; P classifies).
 - **MW-ORPHAN** (MW raw-entry-above-the-cut with O-3): 439 — repros
   39, 59.
-- **The twins**: 91 failing twin rounds (43 MP + 48 MW) — the classes
-  echo there.
+- **The twins**: 102 failing twin rounds across 91 seeds (44 MP +
+  58 MW) — **X5-R21 (d) correction** of this line's first record (it
+  said "91 failing twin rounds (43 MP + 48 MW)", mixing the seed count
+  into the round count and mis-splitting the classes; P's numbers,
+  re-derived from the committed file). The classes echo there.
 - **MP-E exactness** (this card's escalation): 222 rounds — repros 37,
   38.
 
