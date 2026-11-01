@@ -2342,6 +2342,7 @@ pub fn run_round(
                 tainted_image_slots: tainted_slots.clone(),
                 meta_rollback,
                 rollback_slots: rollback_slots.clone(),
+                kept_slots: kept_slots.clone(),
                 ..Default::default()
             };
             // The published set (a catalog scan at the frontier, 2.3).
@@ -2505,6 +2506,7 @@ pub fn run_round(
             ex.amcheck_ii_ran = ck.is_ok();
             ex.image_slots_ii = image_slots_ii;
             ex.tainted_image_slots_ii = tainted_slots_ii;
+            ex.kept_slots_ii = kept_slots_ii.clone();
             if std::env::var("E4_MPE_DIAG").is_ok() {
                 eprintln!(
                     "MPE diag: kept K {:?} K_ii {:?} served_k={} (X5-R28/R30; stderr only)",
@@ -2622,6 +2624,7 @@ pub fn run_round(
                 tainted_image_slots: tainted_slots.clone(),
                 meta_rollback,
                 rollback_slots: rollback_slots.clone(),
+                kept_slots: kept_slots.clone(),
                 ..Default::default()
             };
             // X5-R11 (b): the failed-recovery path records the (i) sites

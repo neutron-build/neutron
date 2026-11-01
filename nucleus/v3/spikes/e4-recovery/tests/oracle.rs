@@ -176,8 +176,10 @@ fn ex_for(_synth: &Synth, c: u64, model: &Model) -> Extracted {
         meta_rollback: false,
         amcheck_i_ran: false,
         rollback_slots: BTreeSet::new(),
+        kept_slots: BTreeSet::new(),
         image_slots_ii: BTreeSet::new(),
         tainted_image_slots_ii: BTreeSet::new(),
+        kept_slots_ii: BTreeSet::new(),
     }
 }
 
@@ -917,6 +919,127 @@ fn mf19_missing_twin_fails() {
     );
 }
 
+// ---- P ruling nv3-X-5c-F2-amend-1: X5-R28's kept set `K` ----
+
+/// Must fail (20, X5-R28): a tainted referenced slot **outside `K`**
+/// that amcheck (i) does not report fails the completeness half — the
+/// K skip must not become "skip every tainted slot" (that mutant,
+/// M-R28d, passes this world).
+#[test]
+fn mf20_tainted_outside_k_not_reported_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    // Slot 11: tainted, referenced, NOT in K (kept_slots stays empty) —
+    // and unreported.
+    ex.image_slots.insert(11u64);
+    ex.tainted_image_slots.insert(11u64);
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        !v.pass,
+        "a tainted referenced slot outside K must still be reported"
+    );
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("tainted referenced slot 11 not reported"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must fail (21, X5-R28): a slotted amcheck (i) finding on a kept
+/// slot fails the exactness tightening — the slot's bytes are the
+/// opened image's own content, so no correct amcheck can have named
+/// it. Removing the tightening (M-R28b) passes this world (the slot
+/// is tainted, so the old tainted ∪ R rule accepts the finding).
+#[test]
+fn mf21_reported_k_slot_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    ex.kept_slots.insert(5u64);
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "a finding on a kept slot must fail the round");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("amcheck reported kept slot 5"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must fail (22, X5-R28): a malformed `K` — an untainted slot — fails
+/// the structural guard, checked whether or not `r_active` holds (the
+/// guard's removal, M-R28c, either passes this world or fails it with
+/// the wrong text; the pin asserts the guard's own words).
+#[test]
+fn mf22_malformed_k_fails() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    // Slot 9 is referenced and untainted (it sits in R): a kept slot
+    // must be tainted, so K holding it is malformed.
+    ex.kept_slots.insert(9u64);
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "K holding an untainted slot must fail");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("harness K set malformed (slot 9)"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must fail (23, X5-R28): an unreported kept slot with **condition 1
+/// false** (no fault on meta slot 1 or 2) still fails — the K skip
+/// applies only while `r_active` holds. The mutant that skips K
+/// unconditionally (M-R28a) passes this world.
+#[test]
+fn mf23_unreported_k_without_meta_slot_fault_fails() {
+    // rollback_world(5): the fault is on slot 5, so condition 1 is
+    // false. The R findings are cleared (with them, mf13's failure
+    // would mask the K clause this test isolates).
+    let (m, mut s, mut ex, faults, twin) = rollback_world(5);
+    assert!(!faults.meta_slot_fault);
+    ex.rollback_slots.clear();
+    ex.amcheck_i
+        .retain(|f| f.slot != Some(8) && f.slot != Some(9));
+    // Slot 5 is tainted, referenced, in K — and unreported.
+    ex.kept_slots.insert(5u64);
+    ex.amcheck_i.retain(|f| f.slot != Some(5));
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        !v.pass,
+        "without a meta-slot fault the K skip must not apply"
+    );
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("tainted referenced slot 5 not reported"),
+        "got {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must pass (7, X5-R28): an unreported kept slot, with the exception
+/// active (class MP, a fault on meta slot 1, `meta_rollback`) — the
+/// completeness half skips it: its bytes are the opened image's own
+/// content, which no correct amcheck can report.
+#[test]
+fn mp7_unreported_k_slot_passes() {
+    let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+    ex.kept_slots.insert(5u64);
+    ex.amcheck_i.retain(|f| f.slot != Some(5));
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "an unreported kept slot must pass under the active exception: {:?}",
+        v
+    );
+    assert!(v.o1.is_ok());
+}
+
 /// Gate REWORK item 3 (pinned): a load's entries are versions at `S_L` —
 /// a later Put on a loaded key wins at every `S ≥` the Put, and the load
 /// shows between `S_L` and the Put. The run-1 model applied load entries
@@ -1216,6 +1339,25 @@ fn instrumentation_removals_are_load_bearing() {
         assert!(
             v.pass,
             "without condition 1 the R findings without a meta-slot fault pass"
+        );
+    }
+    // (6) X5-R28's K clauses: must-fail 21's world — a reported kept
+    // slot — with the kept set removed from the record (the amendment
+    // "removed") passes, so the tightening is load-bearing.
+    {
+        let (m, mut s, mut ex, faults, twin) = rollback_world(1);
+        ex.kept_slots.insert(5u64);
+        let with_k = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+        assert!(
+            !with_k.pass,
+            "with K in the record the reported kept slot fails"
+        );
+        let mut no_k = ex.clone();
+        no_k.kept_slots.clear();
+        let v = run(&m, FaultClass::Mp, &mut s, &no_k, &faults, Some(&twin));
+        assert!(
+            v.pass,
+            "without the kept set in the record the same findings pass"
         );
     }
 }
