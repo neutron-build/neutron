@@ -805,6 +805,40 @@ fn f1f2a_empty_masks_are_a_defect_not_a_hang() {
     handle.join().expect("the spec thread must finish");
 }
 
+/// **X-5c-F2 step 1 (b) pin: the R21 (c) re-pair update.** A re-paired
+/// twin whose recovery returns no store re-seeds the twin chain
+/// (`twin_chain = None` — the next round's supply block rebuilds it
+/// from the real round's own start); a re-paired twin with a store
+/// continues the chain from the re-paired round's own end state. The
+/// draft kept the FIRST attempt's chain when the re-paired twin's
+/// recovery failed — a chain at a crash spec the round that ran never
+/// used. On the revert (`twin_chain_after_repair` restoring the first
+/// attempt's chain, i.e. keeping the incoming chain on the `None`
+/// arm) this pin fails.
+#[test]
+fn f1f2b_repairs_without_a_store_reseed_the_twin_chain() {
+    use e4_recovery::harness::RoundOutcome;
+    use e4_recovery::store::StoreInner;
+    let cfg = Knobs::derive(7, 0).store_cfg(None);
+    let tout = RoundOutcome {
+        cut: 3,
+        end_store: None,
+        ..RoundOutcome::default()
+    };
+    assert!(
+        workload::twin_chain_after_repair(&tout).is_none(),
+        "a re-paired twin whose recovery returned no store must re-seed the twin chain"
+    );
+    let tout = RoundOutcome {
+        cut: 3,
+        end_store: Some(StoreInner::empty(cfg, 0)),
+        ..RoundOutcome::default()
+    };
+    let ch = workload::twin_chain_after_repair(&tout)
+        .expect("a re-paired twin with a store continues the chain");
+    assert_eq!(ch.cut, 3, "the chain carries the re-paired round's own cut");
+}
+
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {

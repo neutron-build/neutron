@@ -888,12 +888,36 @@ impl SeedRec {
 
 // ---- the per-seed driver (5.5) ----
 
-/// The round-chain state: what the next round starts from.
-struct Chain {
-    disk: crate::sim::SimDisk,
-    st: crate::store::StoreInner,
-    model: Model,
-    cut: u64,
+/// The round-chain state: what the next round starts from. Public with
+/// public fields for the X-5c-F2 step 1 (b) pin
+/// ([`twin_chain_after_repair`]); the twin chain and the real chain are
+/// the same shape.
+pub struct Chain {
+    /// The durable disk at the chain point.
+    pub disk: crate::sim::SimDisk,
+    /// The recovered store at the chain point.
+    pub st: crate::store::StoreInner,
+    /// The model, truncated at `cut`.
+    pub model: Model,
+    /// The truncation cut.
+    pub cut: u64,
+}
+
+/// X5-R21 (c) re-pair update (X-5c-F2 step 1 (b)): the twin chain
+/// after the **re-paired** twin round — `Some(end_store)` continues it
+/// from that round's own end state; `None` (the re-paired twin's
+/// recovery produced no store) **re-seeds** it: the next round's supply
+/// block rebuilds the twin chain from the real round's own start (Work
+/// 2.5: the twin is the same script, crash and F-CRASH resolutions,
+/// from the same base). The draft kept the first attempt's chain in
+/// that case — a chain at a crash spec the round that ran never used.
+pub fn twin_chain_after_repair(tout: &harness::RoundOutcome) -> Option<Chain> {
+    tout.end_store.clone().map(|st| Chain {
+        disk: tout.end_disk.clone(),
+        st,
+        model: harness::clone_model(&tout.end_model),
+        cut: tout.cut,
+    })
 }
 
 /// Run one seed: create, then 1–3 rounds (each with its twin first for
@@ -1372,14 +1396,11 @@ pub fn run_seed(seed: u64, mutant: Option<Mutant>) -> SeedRec {
                             recovery_reads: treads,
                             image_slots: harness::durable_image(&tout.crashed_disk, &cfg).1,
                         });
-                        if let Some(st) = tout.end_store.clone() {
-                            twin_chain = Some(Chain {
-                                disk: tout.end_disk.clone(),
-                                st,
-                                model: tout.end_model,
-                                cut: tout.cut,
-                            });
-                        }
+                        // X-5c-F2 step 1 (b): the re-paired twin's own
+                        // outcome decides the chain — a recovery without
+                        // a store re-seeds it (None), never keeps the
+                        // first attempt's chain at the old spec.
+                        twin_chain = twin_chain_after_repair(&tout);
                         twin_final_spec = Some(spec2.clone());
                     }
                     let script3 = Script {
