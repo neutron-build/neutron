@@ -457,8 +457,12 @@ pub const SYSTEMS: &[SystemDef] = &[
         mount: "/qdrant/storage",
         mem_limit: "24g",
         cpus: "16",
-        // Defaults are Qdrant's documented production defaults; HNSW
-        // parameters are set per-collection at load time.
+        // No server flags: the container runs stock Qdrant; HNSW parameters are
+        // set per collection at load time. Static-load rows (`vec-qdrant-load`)
+        // also PATCH the collection to `indexing_threshold = 1` KB
+        // (`qdrant_index_tail`; judgement J3, card B-0-F7-F1) — an unindexed
+        // tail made latency non-deterministic, so it is always HNSW-indexed.
+        // Not a Qdrant default; a collection built any other way never gets it.
         base_args: &[],
         variants: &[],
         ready: Ready::Http { port: 6333 },
