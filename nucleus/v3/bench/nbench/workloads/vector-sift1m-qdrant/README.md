@@ -170,9 +170,11 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   acceptance, extended in round 2): a fake `NB_BIN` replays `nbench
   run`'s success, VOID, FAILED and debug-refusal outcomes against a
   throwaway root with the quiet wait bypassed loudly — including run
-  B after a FAILED or VOID run A (round 2, R2-1) and the pass-log
-  evidence copy (R2-2). It needs no host, no podman and no dataset,
-  and passes when the protocol above behaves as written.
+  B after a FAILED or VOID run A (round 2, R2-1), the pass-log
+  evidence copy (R2-2), and the marker lifecycle (a fresh
+  between-runs leftover, an mtime-backdated stub write, the marker's
+  gitignored `work/` home). It needs no host, no podman and no
+  dataset, and passes when the protocol above behaves as written.
   `NB_MODE=selftest bash driver.sh` is the matching driver-level test:
   it pins the driver's stderr contract — a J4 settle mismatch's
   both-states diff reaches driver stderr, and a successful settle
