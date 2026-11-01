@@ -912,7 +912,9 @@ each is now fixed, escalated, or re-attributed, per shape:
   correctly empty per R5's text) is kept as history for F2's shape-B
   analysis; it is no longer a repro.
 
-## The fresh 10k triage campaign (X-5c-F1's run, committed)
+## The fresh 10k triage campaign (X-5c-F1's run 2, committed at
+## bc4f3bba — superseded as the triage file of record by P's esc-2 run
+## below; its digest-stability record and class counts stand)
 
 `run --seeds 0..10000 --threads 16` at the fixed code (X5-R14's gate
 and unwind, X5-R15's reporting, NEVER-FIRED, NO-TWIN and MP-E's
@@ -939,7 +941,14 @@ the run (X5-R15 (b) — the retune that would meet the missed quotas is
 X-5c-F2's, X5-R17).
 
 **Digest stability vs d2c8bba7 (X5-R14's pin 3):** 3,507 of 10,000
-digests changed, 6,493 are unchanged. The mechanism explains the shift
+digests changed, 6,493 are unchanged — **the seed list is
+`results/digest-stability.tsv`** (X5-R21 (a)/X5-R26): every changed
+seed with its old and new digest and its cause(s) in commit order
+(2,627 at the entry-park step alone; 204 more at the NEVER-FIRED
+re-draw; 19 at the NO-TWIN supply; 856 at the MP-E
+referenced-set/redesign step — the esc-2 section's digest-stability
+record gives the split and the mechanism notes). The mechanism
+explains the shift
 uniformly, not seed by seed: every multi-task workload world previously
 contained window-A service reads (the host-mutation log shows them in
 every such world), and every crashed world contained window-B unwind
@@ -957,14 +966,17 @@ after):**
 | NEVER-FIRED (defect seeds) | 150 | **0** |
 | NO-TWIN (rounds) | 19 | **0** |
 | MP-E completeness (rounds) | 205 | **6** (residual: real slots 10/42/43/45 — seeds 1787, 5808, 6157, 8598, 9098, 9647; F2's triage) |
-| MP-E exactness (rounds) | 199 | 222 (ESCALATED: C-XX's mechanism in Q14 rollback rounds — see the class record) |
+| MP-E exactness (rounds) | 199 | 222 — shapes A 177 / B 39 / C 6 (A and B fixed in run 3; C and the exactness record are in the class section; the esc-2 table below has the final counts) |
 
 **The hand-off for X-5c-F2** (counts in this file; two repro seeds
 each, `run --seeds N..N+1`):
 
-- **C-DIV** (class C scan-mismatch / raw-above-cut O-1): 334 scan
-  mismatch + 544 raw-above seeds — repros 21, 46 (unchanged from
-  d2c8bba7's list).
+- **C-DIV** (class C scan-mismatch / raw-above-cut O-1): 324
+  scan-mismatch seeds + 95 raw-above-cut seeds — repros 21, 46
+  (unchanged from d2c8bba7's list). **Correction of this line's first
+  record** ("334 scan + 544 raw-above"): the 544 counted 447 MW
+  raw-above seeds beside the class C ones (MW-ORPHAN's superset,
+  double-counted here); the class C counts are 324 and 95.
 - **C-XX** (class C amcheck/XX001 findings with no fault): 101 O-2
   seeds + 127 O-3 seeds (overlapping sets) — repros 221, 66.
 - **MP-LIVELOCK** (DEADLOCK seeds, all MP round 1 after an R6 round):
@@ -978,8 +990,10 @@ each, `run --seeds N..N+1`):
   said "91 failing twin rounds (43 MP + 48 MW)", mixing the seed count
   into the round count and mis-splitting the classes; P's numbers,
   re-derived from the committed file). The classes echo there.
-- **MP-E exactness** (this card's escalation): 222 rounds — repros 37,
-  38.
+- **MP-E exactness** (this card's escalation): 222 rounds — the
+  shape-A/B/C record above supersedes the "repros 37, 38" of this
+  line's first record (seed 37 passes in this file; the shapes are A
+  177 / B 39 / C 6, repros 67/268, 38/137, 688/3718).
 
 No new class appeared on the fixed code beyond the residual MP-E
 completeness six above.
@@ -995,6 +1009,185 @@ seeds beside them. The failing classes are X-5c-F2's to root-cause or
 escalate; this card's instrumentation fixes removed 302 of d2c8bba7's
 1,598 failing seeds and made every remaining one a reproducible
 function of `(seed, mutant)`.
+
+## The esc-2 triage campaign (P's run at c8e578b7, committed — the
+## file of record)
+
+Run 3 of this card landed X5-R20 shapes A and B and X5-R21 (c), then
+all three of its attempts hit the runner's 60-minute limit inside
+campaign-class runs. P reverted 31d68b5f (X5-R23, commit c8e578b7),
+ran the 10k triage `run` and its `verify --no-quotas` himself at that
+tip on a clean tree under X5-R13's backstop, and the esc-2 relaunch
+commits that file (X5-R25). **This relaunch ran no campaign-class
+command**; the provenance checks before the copy (the prov file's
+`commit=c8e578b7… status_lines=0 exit=0 verify_exit=0`, the JSON's
+sha256 equal to the prov file's `json_sha256`
+`98a7c8c5…bc62516`, and `git diff --quiet c8e578b7 HEAD` over
+`src/`, `tests/`, `examples/`, `Cargo.toml`, `v3/Cargo.lock` exiting
+0) all passed. **The verify of record is the runner's Acceptance
+`verify --no-quotas` at the committed tip** (X5-R25): it re-runs all
+10,000 seeds and must reproduce every digest and the exact seed set.
+P's own verify (17:37–17:57, exit 0) already did: *digests reproduce
+exactly; the seed set is exactly 0..9999; 5 quotas missed, waived*.
+
+Final lines, verbatim (from `X-5c-F1-esc2.campaign.out`):
+
+```
+E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41 PANIC=0 O1F_FAIL=2722 MONITOR=0
+E4 FOLD FAILING_SEEDS=1088 FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0
+```
+
+Wall ~20.6 min at 16 threads (17:16:40→17:37:19), verify ~19.7 min;
+the run's `rss=` lines rose from 4,187 MiB at 500 seeds to a peak
+5,957 MiB at 9,500 (X5-R15 (d)'s trend, ~180 KiB per seed — not a
+blocker under X5-R13's 24 GiB budget). The quota table is byte-equal
+to bc4f3bba's (the same five misses — Q4 2/1000, Q7 160/200, Q11
+0/100, Q12 1/100, SIZING 14,959 misses; every other quota met, Q1's
+ten hooks 751–795) and is carried verbatim in the campaign commit's
+message. No code differs from c8e578b7 in any commit of this relaunch.
+
+**The failure table** (rounds: C 11,781 / MP 2,180 + 2,180 twins /
+MW 1,415 + 1,415 twins — the same round counts as bc4f3bba; only MP
+O-3 moved, 254 → 38 failing MP seeds):
+
+| | O-1 | O-2 | O-3 | O-1f | DEADLOCK | livelock rounds | acked lost (SyncOff) |
+|---|---|---|---|---|---|---|---|
+| C | 470 | 101 | 127 | 471 | 0 | 0 | 127 (127) |
+| MP | 1778 | 0 | 38 | 1778 | 41 | 41 | 28 (28) |
+| MW | 463 | 0 | 470 | 479 | 0 | 0 | 1965 (626) |
+
+X5-R6 beside the rule: 360 R6 rounds (MP 314 + MW 46), 5,677
+detected-loss comparisons (all MP).
+
+**RESULT item 2 — every 10k run this card made** (E4 lines verbatim;
+this relaunch made none):
+
+- **Run 2's triage campaign** (the worker, at 4fedc648; committed at
+  bc4f3bba): `E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=850
+  DEADLOCK=41 PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD
+  FAILING_SEEDS=1296 FAILING_ROUNDS=1247 TWIN_FAILING_ROUNDS=102
+  DEFECT_SEEDS=0` — exit 0, ~12 min, peak RSS 5.6 GiB, `verify
+  --no-quotas` exit 0 (the section above).
+- **Run 3's attribution runs** (the worker; labelled as such — they
+  exist to separate the digest-stability ladder's steps, and are
+  never committed): 9b041a3d seeds 0..10000
+  (`O1_FAIL=2705 O2_FAIL=101 O3_FAIL=1036 DEADLOCK=45 PANIC=0
+  O1F_FAIL=2716 MONITOR=0`, no FOLD line — it predates dffe6744);
+  2da915a8 seeds 0..5000 (`O1_FAIL=1365 … DEADLOCK=3 … O1F_FAIL=1373`)
+  and 5000..10000 (`O1_FAIL=1356 O2_FAIL=60 O3_FAIL=545 DEADLOCK=5 …`),
+  FOLD 705/687/48/1 and 746/722/54/3; 0a8f196b seeds 0..5000
+  (`O3_FAIL=486…`) and 5000..10000 (`O3_FAIL=540…`), FOLD
+  705/683/48/1 and 746/717/54/3. A 12b54965 0..5000 run was killed at
+  4,000 seeds (X5-R26 bans its use; it was never used).
+- **Run 3's campaign attempts** — three, each killed at the runner's
+  60-minute limit (no `E4` line exists for them; that is why P ran
+  the esc-2 campaign himself).
+- **P's esc-2 campaign** (nv3-X-5c-F1-esc-2, at c8e578b7 on a clean
+  tree; committed in this relaunch): the two lines at this section's
+  top.
+
+**The instrumentation classes, before → after** (round counts;
+d2c8bba7 → bc4f3bba → this file):
+
+| Class | d2c8bba7 | bc4f3bba | esc-2 (c8e578b7) |
+|---|---|---|---|
+| NEVER-FIRED (defect seeds) | 150 | 0 | **0** |
+| NO-TWIN (rounds) | 19 | 0 | **0** |
+| MP-E completeness (rounds) | 205 | 6 | **6** (ESCALATED to P, X5-R23) |
+| MP-E exactness — shape A | 156 | 177 | **0** (fixed, 837200a7) |
+| MP-E exactness — shape B | 39 | 39 | **0** (fixed, 80dc0ff3) |
+| MP-E exactness — shape C | 4 | 6 | **6** (ESCALATED to F2, X5-R24) |
+
+(Shapes A/B grew d2c8bba7 → bc4f3bba because 12b54965's referenced
+set changed the fault draw; they then cleared entirely.)
+
+**Digest stability (X5-R21 (a) as amended by X5-R26) —
+`results/digest-stability.tsv`, built offline.** Columns: seed,
+d2c8bba7 digest, bc4f3bba digest, cause(s) in commit order. **3,507
+changed / 6,493 unchanged** (the count the bc4f3bba commit recorded).
+Per step: d2c8bba7→9b041a3d **X5-R14 entry park 2,627 seeds**;
+9b041a3d→2da915a8 **NEVER-FIRED re-draw 204**; 2da915a8→0a8f196b
+**NO-TWIN supply 19**; 0a8f196b→bc4f3bba **856 changed: 851 MP-E
+referenced set + 4 NEVER-FIRED redesign (4139/7469/7719/9809, the
+4fedc648 wrap/retry seeds) + 1 both (6868)**. The step-4 split uses
+the card's field rule refined by mechanism evidence, recorded here
+for P's gate: **every referenced-set channel is MP-only** — the
+page-file fault draw biases 60/40 over the referenced set
+(`media_faults_common`), so 12b54965 also shifted fault *targets* at
+equal counts, and the (i)-walk findings and Q13/Q14 flags are
+page-file — while the redesign provably derives the same final specs
+(6cc53657) and shows as fired-guard defect / twin / nested
+signatures. Where the letter of the field rule ("crash/hook/fired or
+round count differs ⇒ NEVER-FIRED") and the mechanism disagree, the
+mechanism won and the seeds are named: **38 MP seeds whose later
+round's crash desc moved at the same hook to a different checkpoint
+index with all earlier rounds record-identical** (7, 987, 2307, 8168,
+9168…) — the fault-draw shift moving the landed index through a
+chain the record cannot see; **the round-count cascades** (97, 148,
+158…: a recovery-`Err` flip stops the chain) — referenced-set, not
+redesign; and **17 MP nested-only seeds** (318, 498, 587…) — the
+shifted fault moves the real recovery's length, so more of the
+twin-supplied nested points fire. No seed remained unattributed.
+**The "stably wrong old order" demonstration is waived (X5-R26)**;
+cited instead: X-5c's own `verify` at 66f33c32 re-ran d2c8bba7's
+10,000 seeds at the old code and reproduced every changed seed's
+digest except the four X5-R14 seeds (180, 559, 7474, 8832) — the old
+file's digests were stable under the old code.
+**bc4f3bba → this campaign: 219 seeds changed** (the X5-R20 shape-A/B
+fixes, X5-R21 (c)'s re-pairing and the X5-R23 revert; one count line
+only — no per-seed attribution, X5-R26).
+
+**The hand-off for X-5c-F2, re-derived from this file** (counts in
+`results/campaign.json`; two repro seeds each, verified failing in
+this file, `run --seeds N..N+1`):
+
+- **C-DIV** (class C scan-mismatch / raw-above-cut O-1): 324
+  scan-mismatch seeds + 95 raw-above-cut seeds — repros 21 (r0 scan
+  mismatch), 46 (r1 scan mismatch).
+- **C-XX** (class C amcheck/XX001 findings with no fault): 101 O-2
+  seeds + 127 O-3 seeds (overlapping sets) — repros 66 (r0, `O-3(b)`
+  at `AmcheckIi`), 221 (r0, `O-3(b)` at `Open`).
+- **MP-LIVELOCK** (DEADLOCK seeds, all MP round 1 after an R6 round):
+  41 — repros 987 (r1, spinning at `h:ckpt`), 1108 (r1, at
+  `h:writer`); seed 148 now passes in this file.
+- **MP-A** (served corruption, never classified by a worker): 7 seeds
+  — repros 1897, 2437 (r0 `O-3(a): served corruption`; every one a
+  Q14 meta-fault round; P classifies).
+- **MW-ORPHAN** (MW raw-entry-above-the-cut with O-3 (d)): 439 —
+  repros 39, 59 (r0 `O-1(c)` + `O-3(d)`).
+- **The twins**: 103 failing twin rounds across 91 seeds (44 MP +
+  59 MW; bc4f3bba: 102 rounds, 44 + 58) — repros 339, 849.
+- **MP-E shape C** (X5-R24's escalation, evidence-only): 6 rounds —
+  repros 688, 3718 (both r0 `O-3(e): (ii) reported slot … neither
+  tainted nor in R`, `mrb=false rlen=0`; the provisional
+  classification and the `E4_MPE_DIAG` evidence are in the class
+  record above).
+- **MP-E completeness residual** (X5-R23's oracle question, F2's own
+  item): 6 rounds — repros 1787 (r0 `tainted referenced slot 10 not
+  reported`), 6157 (r0, slot 42); all `mrb=true`. **An open P
+  question, not a worker fix: which "tainted" O-3 (e) completeness
+  should use under a meta rollback.** The X-5b meta-slot
+  rollback-fallout loop (`durable_image`, slots 1 and 2) has the same
+  structure, is unchanged, and is listed with it.
+
+No new class appeared on the esc-2 code: class C is byte-equal to
+bc4f3bba's counts, class MW moved only inside the X5-R21 (c)
+re-pairing's reach (O-3 rounds 469 → 470, failing twin rounds 58 → 59,
+acked lost 1,969 → 1,965 — the pairing re-run re-runs twins, whose
+outcomes can move), and MP O-3 fell 254 → 38 seeds (shapes A and B
+cleared).
+
+**RESULT item 5, the interim reading (not E4's RESULT):** the rule
+applied verbatim to this file — "*Oracle:* the recovered state equals
+the model at some commit c, with (max acked sync-on commit) ≤ c ≤
+(last WAL-written commit); amcheck is clean; every corrupted page is
+detected (XX001, never served). Any failure means redesign before
+Phase A" — gives **n = FAILING_SEEDS = 1,088** (of 10,000): 1,034
+failing primary rounds + 54 seeds failing only through their twins
+(103 failing twin rounds), 0 defect seeds. Since d2c8bba7 this card's
+instrumentation fixes removed 510 of the 1,598 failing seeds
+(1,296 at bc4f3bba; 1,088 here) and made every remaining one a
+reproducible function of `(seed, mutant)`.
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
@@ -1973,7 +2166,9 @@ cargo run -q --release -p e4-recovery --example pin   # the pinned CRC32C /
                                                       # splitmix64 values (Work 0)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
   --results spikes/e4-recovery/results/campaign.json
-# verify re-runs all 10,000 seeds (~13 min at 16 threads). On this file it
+# verify re-runs all 10,000 seeds at 16 workers (on this host the esc-2
+# campaign took ~20.6 min and its verify ~19.7; each is its own
+# command under the runner's 60-min limit). On this file it
 # exits 2 on the five missed quotas alone (Q4/Q7/Q11/Q12/SIZING — X5-R17's
 # retune is X-5c-F2's); the digests and the seed set reproduce. Its exit
 # is 2 for any failed check (seed set, digests, quotas), 0 otherwise.
