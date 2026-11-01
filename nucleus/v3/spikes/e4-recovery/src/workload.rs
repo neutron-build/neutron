@@ -476,7 +476,7 @@ fn value_of(rng: &mut Rng, lo: u64) -> Vec<u8> {
 /// round does reach, drawn deterministically from `(seed, round)` over
 /// the union mask — the same adaptation the uniform draw makes to the
 /// counted yield total. The workload itself is untouched (no retune:
-/// X5-R17 is X-5c-F2's).
+/// X5-R17 is X-5c-F4's, per X5-R31).
 ///
 /// **X-5c-F2 step 1 (a): an empty mask list, or a union of zero (no
 /// checkpoint reached any hook at all) is a loud `Err`, never a

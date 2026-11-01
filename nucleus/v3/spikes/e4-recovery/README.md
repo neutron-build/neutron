@@ -1,18 +1,18 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F2 (amended by nv3-X-5c-F2-amend-1, 2026-10-31),
-**steps 0–1 done** — step 0 corrected the digest-stability step-4
-record offline (54 rows, from the X-5c-F1 gate's truth file); step 1
-landed the harness hardening (a) `reachable_hook_spec` refuses
-empty/zero masks, (b) the R21 (c) re-pair re-seeds a storeless
-re-paired twin, (c) the FOLD twin term pinned (M13), (d) R's
-events-half anchor pinned at the sync's return (M8), (e) the anchor-0
-precondition tripwire — each with its pin demonstrated on the revert.
-Remaining: step 2 (X5-R28 + X5-R30 (a)), step 3 (X5-R29 shape C),
-step 4 (the stage record). The Acceptance 10k and its `verify
---no-quotas` are the runner's (X5-R31); no campaign-class command
-runs in this card's attempts. The triage file of record stays P's
-c8e578b7 run:
+Status: **stage X-5c-F2, **all steps 0–4 done** (amended by
+nv3-X-5c-F2-amend-1, 2026-10-31) — step 0 corrected the
+digest-stability step-4 record (54 rows, from the X-5c-F1 gate's truth
+file); step 1 landed the harness hardening (a)–(e) with pins; step 2
+landed X5-R28's kept set `K` (harness + the one oracle commit) and
+X5-R30 (a)'s `served_k` record field — the six completeness-residual
+seeds clear via K, the MP-A served_k table is recorded for F3; step 3
+took X5-R29's branch (c) — seed 4858's faultless twin holds the same
+two orphan map entries, so amcheck is unchanged and shape C is handed
+to F3 with the per-lpid evidence; step 4 is this stage record. The
+Acceptance 10k and its `verify --no-quotas` are the runner's (X5-R31):
+no campaign-class command ran in this card's attempts. The triage file
+of record stays P's c8e578b7 run:
 `E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
 PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
 FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
@@ -552,7 +552,71 @@ P's reading of the committed file (bc4f3bba), carried for X5-R20:
 - After any edit, including a lint fix, re-run `cargo fmt --all -- --check` and `cargo clippy -q --workspace --all-targets -- -D warnings` before committing.
 - Read gate failures with `grep 'STEP .* EXIT=[1-9]'` on the full log. The runner's retry message shows only the tail.
 
-## Stage X-5c-F1's record (this card)
+## P rulings X5-R28–R31, verbatim (nv3-X-5c-F2-amend-1, 2026-10-31;
+## binding)
+
+Copied verbatim from card X-5c-F2 before any Acceptance output was
+read. They supersede that card's earlier Goal, which predated esc-1
+and esc-2.
+
+**X5-R28 (O-3 (e) completeness in class MP: the kept set `K`; the meta slots leave the per-slot halves).** This tightens X5-R2/X5-R5 where they were circular, and corrects them where they were unsatisfiable. It is P's, and is recorded under RESULT item 6 as a post-data oracle amendment. The six rounds were seen before it was made. Every campaign from F2's on was not.
+- **Why.** The frozen completeness half requires amcheck (i) to report every referenced slot that is tainted (1.4: the durable bytes differ from the **last bytes issued**). After a meta rollback, a slot that the newer meta freed and the store reissued, where the reissue **did not land** (dropped by F-CRASH, or a LOST fault reverted it), is tainted, yet its bytes are the opened image's own content. §3.3 passes, and no correct amcheck can report it. This is the mirror of X5-R5's R: there the reissue landed, so the slot is untainted but has a stale reference. Seed 1787 round 0 (P, cd3c60e9): a MISDIRECTED fault clobbers meta slot 2 (k=3), and open selects k=2. Slot 10's durable bytes are dw[22], before k=2's meta write. Its reissue at ev[2415], after k=3's graduation sync ev[2402], was dropped by the After6@2 crash. `§3.3=true tainted=true`.
+- **(a) The kept set `K`.** The harness computes it from SimDisk history only: never from store memory, never from §3.3 or any amcheck output, and never from the taint map except as condition 1 below. `K` is non-empty only when X5-R5's conditions 1 and 2 hold. It is the set of slots `s` such that:
+  1. `s ∉ {0, 1, 2}`, `s` is referenced by the opened image, and `s` is tainted at amcheck (i);
+  2. **the durable bytes of `s` at (i) equal `V_k(s)`, byte for byte.** `V_k(s)` is the page's content as the durable-write history had it when the opened meta was written: start from 4096 zero bytes and apply, in order, every `DWrite` of the page file that overlaps `[s·4096, (s+1)·4096)` and precedes the opened meta's own `DWrite`. The opened meta's `DWrite` is the last `DWrite` at offset 4096 or 8192 whose bytes parse as a meta with the opened `ckpt_id`. If no such `DWrite` exists, `K` is empty for the round: fail closed;
+  3. SimDisk records a page-file write to `s` issued after X5-R5's anchor: the first completed `sync_all` covering a meta newer than the opened one. Use the same anchor function as R (`exception_set_r`, after step 1 (d)/(e));
+  4. no write to `s` drew an M-NOINPLACE hit.
+
+  So `K` ⊆ tainted ∩ referenced, and `K ∩ R = ∅`. At the (ii) point, `K_ii` is computed the same way, against the end image's meta (`durable_image`'s third value on the end disk) and the (ii) taint.
+- **(b) The oracle amendment.** The frozen `src/oracle.rs` and `tests/oracle.rs` change **only by this text**, in one commit whose subject names X5-R28:
+  - `Extracted` gains `kept_slots` and `kept_slots_ii`, each a `BTreeSet<u64>`, with doc comments citing X5-R28.
+  - **Structural guard:** a `K` slot that is not referenced, not tainted, in R, or 0, 1 or 2 fails with `O-3(e): harness K set malformed (slot N)` (and likewise for (ii) against its own sets). It is checked whether or not `r_active` holds, like R's guard.
+  - **The completeness halves, (i) and (ii):** skip slots 1 and 2. When `r_active` holds, also skip slots in `K` (or `K_ii`). Every other tainted referenced slot must still be reported.
+  - **The exactness halves (a tightening):** when `r_active` holds, a slotted finding on a `K` slot fails with `O-3(e): amcheck reported kept slot N (its bytes are the opened image's content)`. The `tainted ∪ R` rule stands for everything else.
+  - **X5-R6's `explained` (a tightening):** a tainted slot in `K` does not explain an O-1 read's XX001 when `r_active_r6` holds. The rule becomes "some tainted referenced slot outside K, or an active non-empty R".
+  - `tests/oracle.rs` gains these cases on `rollback_world`. Each is demonstrated against its revert:
+    - mf20: a tainted slot outside K that is not reported fails;
+    - mf21: a reported K slot fails;
+    - mf22: a malformed K (an untainted slot) fails;
+    - mf23: an unreported K slot with condition 1 false (no meta-slot fault) fails;
+    - mp7: an unreported K slot passes.
+    `instrumentation_removals_are_load_bearing` gains the K arm.
+- **(c) The harness.** Delete the meta-slot rollback-fallout loop (`durable_image`, "stale durable meta slot (rollback fallout)"). The walk never pushes a finding derived from `range_tainted`, `issued`, `dwrites` or any other ground truth. Slots 1 and 2 stay in `image_slots`, because O-3 (c)'s twin rule and R's guard read that set. Only the per-slot completeness halves skip them, under (b). A meta-slot fault is judged where it acts: open's selection (S-STORE §2.2), O-1 (the MP lower bound) and O-3 (a)–(d).
+- **(d) No other clause moves.** X5-R28 does not touch O-3 (a), which is X5-R30's question, nor O-1, O-2, O-3 (b)–(d) or R. It is empty in classes C and MW. **Never** satisfy completeness by reporting ground truth (X5-R23 stands).
+- **(e) The decision rule, pre-registered.** At this card's tip, seeds 1787, 5808, 6157, 8598, 9098 and 9647 must clear O-3 (e) **because their named slot is in K**. Their single-seed records show `K ∋` that slot, and the round's other outcomes are recorded unchanged. Any of the six whose slot is **not** in K stays failing. Record its `V_k(s)` against the durable bytes, then ESCALATE it to P with that evidence. Never widen K to catch it.
+- **Why it is neither circular nor unsatisfiable.** The expected set (tainted \ K) comes from the write history. The observed set comes from amcheck's §3.3 verdicts against the store's own references. They agree exactly when the store's references are the image's true content, which is what I-NO-INPLACE and I-META-ATOMIC promise. If a reference is wrong, the two sides disagree, and either the completeness half or the exactness tightening fails.
+
+**X5-R29 (shape C: test the subtree-fallout reading first; then fix amcheck's precision, or root-cause).** In `src/store/amcheck.rs`, `check_tree` `continue`s on a §3.3, read or accept failure, so it never pushes the failed node's children. The I-LPID-EXACT loop that follows then reports every mapped LPID it never reached as `mapped lpid N unreachable`, each with its slot. In seeds 688 and 3718, one or two damaged pages (lpid 5; lpids 7 and 40) are followed by 15–16 "unreachable" findings on contiguous later lpids. That pattern is subtree fallout. F1's provisional reading was a map-exactness store deviation.
+- **(a) The test (evidence before any change).** For each of the six rounds, compute the descendant set of every node that failed in the (ii) walk. Use the faultless twin's end image, or the failed slot's `V_e(s)` composed as in X5-R28 (a), parsed with the store's own page decoder in a diagnostic (stderr only, never a digest input). Compare it with the set of "unreachable" LPIDs.
+- **(b) If the two sets are equal in all six rounds:** this is a prototype precision defect. S-STORE §15 defines I-LPID-EXACT "on a quiescent file", and a walk that cannot pass a failed node cannot decide reachability below it.
+  - **The fix,** in `src/store/amcheck.rs` only: when any node of the tree walks failed, emit the unreached mapped LPIDs as **one structural finding** (`slot: None`, `I-LPID-EXACT inconclusive: N mapped lpids unreached below failed lpids [...]`). Emit no slotted findings for them. With no failed node, the output is unchanged.
+  - **Pins (literal configs):**
+    - a damaged interior node gives exactly its own slotted §3.3 finding plus the one structural finding. Revert-demonstrated;
+    - an undamaged image with an orphan map entry still gives the slotted `mapped lpid N unreachable`. This guards against an "always structural" mutant.
+  - **What it does not weaken:** class C still fails on any finding; MP detection is still credited through the failed node's slotted finding; the oracle is untouched; and a true orphan beside damage is still caught on the faultless twin.
+- **(c) If the sets differ in any round:** the end image really holds orphan map entries, which violates I-LPID-EXACT. Do not change amcheck. Hand it to F3 as a C-XX-family store deviation, with the per-lpid evidence.
+
+**X5-R30 (MP-A: evidence now, the O-3 (a) question kept open).** All seven MP-A rounds are `mrb=true`. A `K` slot is tainted by definition, and its bytes pass §3.3 against the opened image, so a correct store that reads one accepts it, and the sim records a served corruption. O-3 (a) may have the same proxy flaw as completeness. **P does not rule that before F3's evidence.** It is the gravest clause, and the seven rounds have been seen.
+- **(a)** This card adds a per-round record field `served_k`: true iff every served range of the round lies wholly inside slots of `K`. It is computed by the harness from the sim's served list and K. It is a diagnostic in the record, never an oracle input.
+- **(b)** O-3 (a) is unchanged. Every served corruption still fails, and F3 ESCALATEs all of them with X5-R16's evidence plus `served_k` and `V_k(s)`.
+- **(c)** P rules at F3's gate. If O-3 (a) moves, the move is applied to the final file from the recorded fields, with no re-run, and is listed in RESULT item 6 as a post-data amendment.
+
+**X5-R31 (structure and sizing: three stacked cards; the Acceptance hosts every 10k).**
+- **Why.** The runner kills an attempt at 60 min, and runs each Acceptance command under its own 60-min limit after an attempt finishes. A 10k `run` or a `verify` takes about 20 min each at load 20. X-5c-F1 lost three runs to campaign-class commands inside attempts.
+- **The rule.** Inside an attempt, no worker runs any of these:
+  - `e4-campaign run` over more than **200** contiguous seeds;
+  - `e4-campaign verify`;
+  - a stress loop;
+  - `scripts/gate.sh`.
+
+  Each 10k is an **Acceptance command**: run at the card's final tip under X5-R13's backstop, with its output and a provenance file outside the worktree (`$HOME/.cache/nv3-review/runlogs/<CARD>.acc.*`). It is followed by `verify` of that file, then by the gate. The next card's step 0 commits that file after the provenance checks (the X5-R25 pattern).
+- **The cards:**
+  - **X-5c-F2** (this card): steps 0–4 above, with `verify --no-quotas`;
+  - **X-5c-F3**: the classes, with `verify --no-quotas`;
+  - **X-5c-F4**: X5-R17's retune and the final file, with plain `verify`. The worker tunes on contiguous ranges of at most 200 seeds. These are development probes only, never quota evidence. A quota miss fails the Acceptance, which feeds the table back to the next attempt. This amends the old F2 Goal's "each try is a whole 10k run", which was a process rule, not X5-R17's text.
+  - **Then X-5c `--keep`**: it commits F4's file, runs plain `verify` on it, runs `mutants`, and writes the RESULT.
+
+## Stage X-5c-F1's record (X-5c-F1)
 
 ### X5-R14: the non-reproducing digests — root-caused, fixed, pinned
 
@@ -724,7 +788,8 @@ three commits, each still in force:
 
 Result in every 10k file since: **0 defect seeds, 0 unfired rounds**
 (`DEFECT_SEEDS=0` in bc4f3bba and in P's esc-2 campaign). No workload
-change (X5-R17's retune is X-5c-F2's).
+change (X5-R17's retune is X-5c-F4's, per X5-R31; F1's text said
+X-5c-F2's, before the split).
 
 **NO-TWIN (instrumentation: harness) — fixed, pinned (commit
 0a8f196b).** 19 MP/MW rounds failed as "MP/MW round with XX001 and no
@@ -1200,6 +1265,174 @@ failing primary rounds + 54 seeds failing only through their twins
 instrumentation fixes removed 510 of the 1,598 failing seeds
 (1,296 at bc4f3bba; 1,088 here) and made every remaining one a
 reproducible function of `(seed, mutant)`.
+
+## Stage X-5c-F2's record (this card)
+
+Status: complete through step 4. Commits (this branch, in order):
+acc9c858 (step 0), 962154eb (1a), f908bc69 (1b), 26048928 (1c),
+bd0161dd (1d), 57953538 (1e), fe74fc5f (step 2 harness), 5bcb1701
+(X5-R28 (b) oracle), 6d40085d (X5-R28 (e) evidence + pin), bdd46cef +
+97806d0d (step 3).
+
+**Step 0 — the digest-stability step-4 record corrected (X-5c-F1-F1).**
+Exactly the 54 seeds where the X-5c-F1 gate's truth file
+(`$HOME/.cache/nv3-review/runlogs/X-5c-F1-gate.step4-truth.tsv`, the
+per-seed 12b54965 runs) disagrees with the TSV's old label: 13
+RED-truth rows relabeled `NEVER-FIRED redesign`, 40 MPE+RED-truth rows
+given both causes in commit order (12b54965 `MP-E referenced set`
+precedes 6cc53657/4fedc648 `NEVER-FIRED redesign`), and 6868 (truth
+MPE) dropped its spurious redesign half. Earlier steps' causes are
+untouched; all 852 truth-file rows match their step-4 labels
+afterwards. **The corrected counts: 835 MP-E (795 MP-E only, counting
+6868, plus 40 both) and 57 NEVER-FIRED redesign (13 + 40 + 4 — the 4
+being 4139/7469/7719/9809). The field rule would have been wrong on
+107 of the 852** (P's count, from the gate's truth run). The
+paragraph's "provably derives the same final specs" and "the mechanism
+won" are deleted; the mechanism evidence itself is kept for P's gate.
+
+**Step 1 — harness hardening (X-5c-F1-F2), one commit per item.**
+
+| Item | Change | Pin | Revert demonstration |
+|---|---|---|---|
+| (a) | `reachable_hook_spec` returns `Err` when the mask list is empty or its union is 0 (the draft's fallback loop spun forever — a hang in the repair path); the callers record a seed-level defect beside the fired-guard's, and no re-run happens | `f1f2a_empty_masks_are_a_defect_not_a_hang` (spawned thread, 5 s channel timeout; `&[]` and `&[0, 0]`) | early return disabled (`if false && union == 0`): FAILED in 5.00 s — the timeout itself |
+| (b) | the R21 (c) re-pair block's update factored into `twin_chain_after_repair(&RoundOutcome) -> Option<Chain>`: a re-paired twin whose recovery returned no store sets `twin_chain = None` (a re-seed from the real round's own start), never keeps the first attempt's chain at the old spec | `f1f2b_repairs_without_a_store_reseed_the_twin_chain` | the None arm synthesized a chain anyway (the draft's keep-the-chain defect): FAILED |
+| (c) | none — `fold_line` (X5-R15 (a)) already counts the twin term; the pin locks it | `f1f2c_fold_counts_a_twin_only_failure` (a literal `SeedRec`, primaries passing, one failing twin → `FAILING_SEEDS=1 FAILING_ROUNDS=0 TWIN_FAILING_ROUNDS=1`) | M13 (the twin term dropped from the fold): FAILED |
+| (d) | none — the events-half anchor is extracted into the shared `r5_anchor` (behavior unchanged); the pin locks it at the sync's return | `f1f2d_r_anchor_is_the_sync_not_the_issue` (a literal stream: newer-meta issue, slot-7 write, `SyncReturned{all:true}`, slot-9 write → 7 ∉ R, R = {9}) | M8 (anchor at the meta's issue, `w` instead of `w+1+s`): FAILED |
+| (e) | `r5_anchor0_defect(events, pf)` returns `"page file synced by sync_data: X5-R5 anchor precondition"` (`R5_ANCHOR0_DEFECT`); `run_round` flags it on `RoundOutcome.r5_anchor0_defect` only when the fallback anchor 0 is actually in force (`r5_anchor` → `Some((_, 0))`) **and** the stream holds a page-file `sync_data` return; `run_seed` lifts it to `rec.defect` verbatim. R's own computation is unchanged — never silently widened. This store only ever `sync_all`s the page file, so the tripwire cannot fire on a real campaign | `f1f2e_page_file_sync_data_yields_the_anchor0_defect` (with the event → the exact text; a sync_all or another file's sync_data → None) | the check removed (the function answering `None` unconditionally): FAILED |
+
+**Step 2 — X5-R28 + X5-R30 (a).** The harness (fe74fc5f):
+`kept_set_k` computes `K` beside `exception_set_r` from SimDisk history
+only, with the four conditions as ruled; `v_at_meta`/`meta_dwrite_cutoff`
+compose `V_k(s)`; `K_ii` at the (ii) point against the end image's own
+meta; the meta-slot rollback-fallout loop is **deleted** from
+`durable_image` (X5-R28 (c) — the walk never pushes a ground-truth
+finding; slots 1/2 stay in `image_slots`); `served_k` (X5-R30 (a)) is
+computed from every served range of the round (the workload pass's
+list captured before `new_round`, the recovery passes', the extraction
+world's) against `K`, and rides the round record (`sk` in the JSON,
+beside `served` in the digest input) — a diagnostic, never an oracle
+input. The oracle amendment (5bcb1701) changes `src/oracle.rs` and
+`tests/oracle.rs` **only by X5-R28 (b)'s text**: `Extracted` gains
+`kept_slots`/`kept_slots_ii`; the structural guard
+(`O-3(e): harness K set malformed (slot N)`, both halves, whether or
+not `r_active` holds); the completeness halves skip slots 1 and 2 and,
+under `r_active`, `K`/`K_ii`; the exactness tightening
+(`O-3(e): amcheck reported kept slot N (its bytes are the opened
+image's content)`); and X5-R6's `explained` becomes "some tainted
+referenced slot outside K, or an active non-empty R". New oracle
+cases: mf20–mf23 and mp7, plus `instrumentation_removals_are_load_
+bearing`'s K arm — each demonstrated on its own clause's revert (see
+the mutant table below). Interim note, recorded honestly: between
+fe74fc5f and 5bcb1701 the directed d10b/d17 and workload r20 (seed 38)
+tests failed with "tainted referenced slot 1/2 not reported" — the
+card's ordered steps (harness first, then the one oracle commit);
+cleared by the amendment.
+
+**X5-R28 (e) — the six residual seeds clear via K** (single-seed runs
+at 6d40085d's parent tip, `E4_MPE_DIAG=1`, artifacts at
+`$HOME/.cache/nv3-review/runlogs/X-5c-F2.r28e.<seed>.*`):
+
+| Seed/round | K | V_k(s) = durable (crc32c) | new O-3 text | served_k |
+|---|---|---|---|---|
+| 1787 r0 | {10} | `8186a812` | none (clear) | true |
+| 5808 r0 | {43} | `0174e829` | none (clear) | true |
+| 6157 r0 | {42, 56} | `6587a85e` / `420d0f49` | none (clear) | true |
+| 8598 r1 | {45, 80, 94} | `77083692` / `b10d7ba7` / `d7a8afb9` | none (clear) | true |
+| 9098 r1 | {7} | `d76bf9ea` | none (clear) | true |
+| 9647 r1 | {130} | `f4e1951f` | none (clear) | true |
+
+Every named slot (10, 43, 42, 45, 7, 130 — F1's hand-off list) is in
+`K`; all six rounds pass with no O-3 text and `served=false`
+(`served_k` vacuously true). **No ESCALATE under (e): no seed's slot
+fell outside K.** The named slot is in K by the M-R28g demonstration:
+with the harness K disabled, seed 1787 fails again with exactly
+"O-3(e): tainted referenced slot 10 not reported". Pin:
+`r28_residual_seeds_clear_via_k` (seeds 1787/6157).
+
+**X5-R30 (a) — the MP-A `served_k` table** (read-only, single-seed
+runs at `$HOME/.cache/nv3-review/runlogs/X-5c-F2.mpa.<seed>.*`; all
+round 0, all `mrb=true`, all `served=true`, O-3 (a) unchanged):
+
+| Seed | served_k |
+|---|---|
+| 1897 | true |
+| 2437 | true |
+| 4718 | true |
+| 2927 | false |
+| 4378 | false |
+| 7528 | false |
+| 8728 | false |
+
+Three of the seven served corruptions lie wholly inside `K` — the
+X5-R30 proxy-flaw candidates; the other four have served ranges
+outside `K`. Evidence for F3's gate; no judgement here.
+
+**Step 3 — X5-R29 shape C: the branch is (c).** The diagnostic
+(`r29_subtree_diag`, `E4_MPE_DIAG` stderr only) computes, on the end
+image, the failed lpids, each failed node's descendant set (children
+parsed through the store's own decoder — from the failed node's
+`V_e` composed as X5-R28 (a), intact descendants from their own
+durable bytes), and the store's "mapped lpid N unreachable" set.
+Per-round (the Mp round; artifacts at
+`$HOME/.cache/nv3-review/runlogs/X-5c-F2.r29.<seed>.*`):
+
+| Seed/round | failed lpids | descendants | unreachable | equal |
+|---|---|---|---|---|
+| 688 r0 | {5} | {8,9,11,14,16,18,20,22,24,26,27,30,32,35,37} | same 15 | yes |
+| 3718 r0 | {7, 40} | {12,13,17,19,22,24,26,29,32,34,36,39,40,44,46} | same 15 | yes (40 is both failed and a descendant of 7) |
+| 4858 r0 | {2} (its `V_e` is a leaf — no children) | {} | {6, 7} | **no** |
+| 5238 r0 | {6} | {17,18,22,25,27,30,33,36,38,41,43} | same 11 | yes |
+| 5638 r0 | {5, 35} | {9,10,13,14,17,19,21,24,27,31,33,35,38} | same 13 | yes (35 both) |
+| 9717 r0 | {} | {} | {} | vacuously — no unreachable findings at all |
+
+The deciding evidence is 4858: the **faultless twin's** own amcheck
+(ii) reports exactly the same two orphans — "mapped lpid 6
+unreachable" (slot 18) and "mapped lpid 7 unreachable" (slot 9) —
+with no §3.3 failure anywhere on its end disk, and its O-1 fails
+("O-1(b) at c=9, tree 2: scan mismatch"). The lpids are true orphan
+map entries in the recovered image (I-LPID-EXACT), not fallout of the
+damaged node. **Per X5-R29 (c): amcheck is NOT changed; shape C is
+handed to F3 as a C-XX-family store deviation with this per-lpid
+evidence.** Four rounds (688/3718/5238/5638) show exact subtree
+fallout and would have supported (b)'s precision fix; the ruling's
+fork is strict — differ in any round → (c). 9717 is a third mechanism
+inside the same record-field class: no orphans, but "tree: separators
+out of order" (slot 50, lpid 3) and "tree: lpid 36 reachable more
+than once" (slot 36) — F3's beside the orphans.
+
+**Every pin of this card, with its revert demonstration.**
+
+| Pin | Catches | Revert demonstration |
+|---|---|---|
+| `f1f2a_empty_masks_are_a_defect_not_a_hang` | the empty/zero-mask hang | early return disabled: FAILED in 5.00 s (the timeout) |
+| `f1f2b_repairs_without_a_store_reseed_the_twin_chain` | the re-pair block keeping a stale chain | the None arm synthesized a chain: FAILED |
+| `f1f2c_fold_counts_a_twin_only_failure` | M13, the FOLD twin term | the twin term dropped: FAILED |
+| `f1f2d_r_anchor_is_the_sync_not_the_issue` | M8, the anchor at the meta's issue | anchor = `w`: FAILED |
+| `f1f2e_page_file_sync_data_yields_the_anchor0_defect` | the precondition assert removed | the check answering `None` unconditionally: FAILED |
+| `r28_v_k_is_the_history_at_the_opened_meta` | M-R28e, `V_k` using the latest DWrite | cutoff = `dwrites.len()`: K = {} — FAILED |
+| `r28_no_ground_truth_meta_finding` | M-R28f, the fallout loop restored | the loop restored pushed slot `Some(2)`: FAILED |
+| `r28_residual_seeds_clear_via_k` | M-R28g, the harness K disabled | `r5_active` forced false: seed 1787's completeness text returned — FAILED |
+| `mf20_tainted_outside_k_not_reported_fails` | M-R28d, completeness skipping every tainted slot | the skip made unconditional: FAILED |
+| `mf21_reported_k_slot_fails` | M-R28b, the exactness tightening removed | the tightening arm disabled: FAILED |
+| `mf22_malformed_k_fails` | M-R28c, the K guard removed | the guard disabled: FAILED with the wrong text |
+| `mf23_unreported_k_without_meta_slot_fault_fails` | M-R28a, the K skip without `r_active` | the skip unconditional: FAILED |
+| `mp7_unreported_k_slot_passes` | the amendment's positive case | (must-pass; guarded by mf20–mf23's reverts) |
+| `instrumentation_removals_are_load_bearing` (K arm) | the K clauses removed from the record | the kept set cleared: the same findings pass |
+
+M-R29a/M-R29b do not apply: branch (c) made no amcheck change.
+
+**The Acceptance 10k (X5-R31): not this worker's to run.** The runner
+executes, at this card's final tip: `cargo test -q --release -p
+e4-recovery`; then the 10k (`run --seeds 0..10000 --threads 16 --out
+$HOME/.cache/nv3-review/runlogs/X-5c-F2.acc.campaign.json`, under
+`ulimit -v 25165824`) with its provenance in
+`$HOME/.cache/nv3-review/runlogs/X-5c-F2.acc.prov` (commit,
+`status_lines`, start/end, load, exit, the JSON's sha256); then
+`verify --no-quotas` of that file (its head and exit appended to the
+prov file); then `bash scripts/gate.sh`. X-5c-F3's step 0 commits
+that file after the provenance checks. No campaign-class command ran
+inside this card's attempts (only single-seed runs); the committed
+`results/campaign.json` stays P's c8e578b7 esc-2 file.
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
@@ -2172,8 +2405,8 @@ unless noted):
 
 ```bash
 cd nucleus/v3
-cargo test -q --release -p e4-recovery      # the whole crate (137 tests)
-cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (14)
+cargo test -q --release -p e4-recovery      # the whole crate (153 tests)
+cargo test -q -p e4-recovery --test workload  # the Work 5 self-tests + smoke (20)
 cargo run -q --release -p e4-recovery --example pin   # the pinned CRC32C /
                                                       # splitmix64 values (Work 0)
 cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
@@ -2182,11 +2415,43 @@ cargo run -q --release -p e4-recovery --bin e4-campaign -- verify \
 # campaign took ~20.6 min and its verify ~19.7; each is its own
 # command under the runner's 60-min limit). On this file it
 # exits 2 on the five missed quotas alone (Q4/Q7/Q11/Q12/SIZING — X5-R17's
-# retune is X-5c-F2's); the digests and the seed set reproduce. Its exit
+# retune is X-5c-F4's); the digests and the seed set reproduce. Its exit
 # is 2 for any failed check (seed set, digests, quotas), 0 otherwise.
 # `--no-quotas` (X5-R15 (b)) waives only the quota exit: X-5c-F1's
 # Acceptance form.
 ```
+
+**The X-5c-F2 Acceptance 10k is the runner's, never a worker's
+(X5-R31).** Inside an attempt no worker runs `e4-campaign run` over
+more than 200 contiguous seeds, `e4-campaign verify`, a stress loop,
+or `scripts/gate.sh` — X-5c-F1 lost three runs to campaign-class
+commands inside attempts (a 10k `run` and a `verify` each take ~20 min
+at load 20, against the runner's 60-minute attempt limit). The
+Acceptance, at the card's final tip, is:
+
+```bash
+cd nucleus/v3
+O=$HOME/.cache/nv3-review/runlogs/X-5c-F2.acc
+{ echo commit=$(git rev-parse HEAD); echo status_lines=$(git status --porcelain -- spikes/e4-recovery Cargo.lock | wc -l); echo start=$(date -Iseconds); echo load_at_start=$(cut -d' ' -f1-3 /proc/loadavg); } > $O.prov
+(ulimit -v 25165824; cargo run -q --release -p e4-recovery --bin e4-campaign -- run --seeds 0..10000 --threads 16 --out $O.campaign.json > $O.campaign.out 2> $O.campaign.err)
+{ echo exit=$?; echo end=$(date -Iseconds); echo load_at_end=$(cut -d' ' -f1-3 /proc/loadavg); echo json_sha256=$(sha256sum $O.campaign.json | cut -d' ' -f1); } >> $O.prov
+echo verify_head=$(git rev-parse HEAD) verify_start=$(date -Iseconds) >> $O.prov
+(ulimit -v 25165824; cargo run -q --release -p e4-recovery --bin e4-campaign -- verify --no-quotas --results $O.campaign.json > $O.verify.out 2> $O.verify.err)
+echo verify_exit=$? verify_end=$(date -Iseconds) >> $O.prov
+bash scripts/gate.sh
+```
+
+The prov file `$O.prov` records the commit, `status_lines` (the crate
+and the lock only), start/end, load, exit, the JSON's sha256, and the
+verify head and exit; on a retried attempt the last write wins, at the
+then-current tip. The five known quota misses (Q4, Q7, Q11, Q12,
+SIZING) are expected and waived by `--no-quotas` — they are X-5c-F4's.
+X-5c-F3's step 0 commits `$O.campaign.json` after the provenance
+checks (the X5-R25 pattern). Single-seed diagnostics stay allowed
+inside attempts: `E4_MPE_DIAG=1 cargo run -q --release -p e4-recovery
+--bin e4-campaign -- run --seeds N..N+1 --threads 16 --out <outside
+the worktree>` (the K/K_ii/served_k and R29 diag lines are stderr
+only, never digest inputs).
 
 X5-R15 (e): `examples/` keeps only what this block uses (`pin.rs`;
 `dbg-seed.rs`, which 823d4f51 called scratch, is removed), and
