@@ -265,6 +265,72 @@ fn exception_set_r_consults_its_noinplace_hits() {
     );
 }
 
+/// **X-5c-F2 step 1 (d) pin (gate mutant M8): the events half's anchor
+/// is the newer meta's `sync_all` RETURN, not its issue.** A literal
+/// event stream — the newer meta issued, a page write to slot `s`, the
+/// `sync_all` returning, then a page write to slot `t` — must leave
+/// `s ∉ R` and `t ∈ R` (both referenced and untainted). Anchoring at
+/// the meta's issue (M8) wrongly excuses `s`'s write, which the
+/// graduation had not yet covered: its bytes were the opened image's
+/// own content when they were issued.
+#[test]
+fn f1f2d_r_anchor_is_the_sync_not_the_issue() {
+    use e4_recovery::sim::DiskEvent;
+    use e4_recovery::sim::SimDisk;
+    use e4_recovery::store::page::{self, Meta};
+    use std::collections::BTreeSet;
+    let mut disk = SimDisk::new();
+    let pf = disk.create("/pages").expect("create");
+    disk.sync_dir(e4_recovery::sim::ROOT_DIR).expect("dirsync");
+    // The newer meta (ckpt_id 2 > opened 1), graduated by a sync_all —
+    // the dwrites half's graduation point `g`.
+    let m2 = page::build_meta(&Meta {
+        ckpt_id: 2,
+        ..Meta::default()
+    });
+    disk.write_at(pf, 4096, &m2).expect("meta write");
+    disk.sync_all(pf).expect("meta sync");
+    // The literal stream: meta issue, slot-7 write, the sync's return,
+    // slot-9 write. Slot 7's write precedes the anchor; slot 9's
+    // follows it.
+    let w7 = page::build_leaf(7, 1, &[]);
+    let w9 = page::build_leaf(9, 1, &[]);
+    let events = vec![
+        DiskEvent::WriteIssued {
+            inode: pf,
+            off: 4096,
+            bytes: m2.clone(),
+        },
+        DiskEvent::WriteIssued {
+            inode: pf,
+            off: 7 * 4096,
+            bytes: w7,
+        },
+        DiskEvent::SyncReturned {
+            inode: pf,
+            all: true,
+        },
+        DiskEvent::WriteIssued {
+            inode: pf,
+            off: 9 * 4096,
+            bytes: w9,
+        },
+    ];
+    let image: BTreeSet<u64> = [7u64, 9].into_iter().collect();
+    let tainted: BTreeSet<u64> = BTreeSet::new();
+    let hits: BTreeSet<u64> = BTreeSet::new();
+    let r = e4_recovery::harness::exception_set_r(&disk, pf, 1, &image, &tainted, &hits, &events);
+    assert!(
+        !r.contains(&7),
+        "a write issued before the newer meta's sync_all returned must not enter R (R={r:?})"
+    );
+    assert_eq!(
+        r,
+        BTreeSet::from([9u64]),
+        "a write issued after the sync_all returned enters R (R={r:?})"
+    );
+}
+
 /// The pass fold (the gate's N7 pin): every per-seed failure flag folds
 /// `pass` to false on its own — a verdict that passed the oracle is
 /// still a failed round under any flag.
