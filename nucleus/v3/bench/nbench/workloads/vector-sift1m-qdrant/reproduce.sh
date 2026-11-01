@@ -852,8 +852,11 @@ STUB
   git -C "$r" init -q
   st_rc "a succeeds (no row at today's path yet)" 0 st_run "$r" success a
   s6_commit_row "$r" "$D"
-  cp "$r/results/$D/repro/$ROW.run-a.json" "$t/s6d.run-a.json"
-  cp "$r/results/$D/repro/run-a.quiet.txt" "$t/s6d.run-a.quiet.txt"
+  # `|| true` on the copies: under a mutant that stops writing the
+  # quiet record they would not exist, and the runner must survive its
+  # own setup (set -e) to report the cmp FAILs below, not die on them.
+  cp "$r/results/$D/repro/$ROW.run-a.json" "$t/s6d.run-a.json" || true
+  cp "$r/results/$D/repro/run-a.quiet.txt" "$t/s6d.run-a.quiet.txt" || true
   st_rc "b refuses: today's row path became committed after run A" 4 st_run "$r" success b
   st_ok "run A's JSON is untouched" cmp -s "$r/results/$D/repro/$ROW.run-a.json" "$t/s6d.run-a.json"
   st_ok "run A's quiet record is untouched" cmp -s "$r/results/$D/repro/run-a.quiet.txt" "$t/s6d.run-a.quiet.txt"
