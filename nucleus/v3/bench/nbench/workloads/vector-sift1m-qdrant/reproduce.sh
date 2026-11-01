@@ -549,13 +549,27 @@ case "$1" in
         fi
         exit 0
         ;;
-      failed)
+      failed|failed-backdated)
+        # `failed-backdated` (B-0-F7-F1-F2-F1 Work 2, used only by S5's
+        # run b) reproduces `failed`'s observable outcome exactly — the
+        # same writes, the same FAILED line, exit 1 — and adds ONE extra
+        # pass log no existing assertion names, written after the 0.2 s
+        # sleep and then mtime-backdated: its mtime says an hour before
+        # this run, so the marker's -nt (mtime) filter excludes it,
+        # while its ctime is the backdating touch itself — inside this
+        # run, >= 0.2 s after the marker — so a full-granularity ctime
+        # filter would copy it. Pins mtime semantics (verdict
+        # B-0-F7-F1-F2 finding 3).
         mkdir -p "$work"
         : > "$work/index-state-init.json"
         : > "$work/ef_search=16-cold-0.settle.log"
         : > "$work/ef_search=16-cold-0.log"
         : > "$work/ef_search=16-cold-0.metrics.json"
         : > "$work/ef_search=16-cold-0.latency.csv"
+        if [ "${NB_STUB_MODE}" = failed-backdated ]; then
+          : > "$work/ef_search=16-cold-1.log"
+          touch -d '-1 hour' "$work/ef_search=16-cold-1.log"
+        fi
         echo "row $row FAILED: command failed (driver [ef_search=16-cold-0], exit 1): index state differs: init {segments:8,points:1000000,indexed:1000000,threshold_kb:1} vs now {segments:92,points:1000000,indexed:3861632,threshold_kb:1}" >&2
         exit 1
         ;;
@@ -670,12 +684,22 @@ STUB
   st_rc "a succeeds" 0 st_run "$r" success a
   # Plant a pass log run A's ef set never wrote, then backdate it and
   # everything else the work dir already holds by an hour: a
-  # same-millisecond mtime must not decide this test. Run B (failed
-  # mode) rewrites only the ef16 files and index-state-init.json; the
-  # marker it touched before its run separates the two ages.
+  # same-millisecond mtime must not decide this test. Run B
+  # (failed-backdated mode: `failed`'s outcome plus one mtime-backdated
+  # extra write) rewrites only the ef16 files and index-state-init.json;
+  # the marker it touched before its run separates the two ages.
   printf 'stale-from-run-a\n' > "$r/work/$D/$ROW/ef_search=64-run-0.log"
   find "$r/work/$D/$ROW" -type f -exec touch -d '-1 hour' {} +
-  st_rc "b fails at ef16" 1 st_run "$r" failed b
+  # B-0-F7-F1-F2-F1 Work 1: a FRESH leftover, planted after run A fully
+  # finished (run A's stub slept 0.2 s past marker a, so this write is
+  # >= 20 coarse-clock ticks newer than marker a) and never backdated.
+  # The per-run marker b excludes it — it is written before run b
+  # starts, so it can never be newer than marker b (a same-tick landing
+  # compares not-newer); a shared or not-refreshed marker, still at
+  # marker a's time, copies it. Decided by run order, never tick luck
+  # (verdict B-0-F7-F1-F2 finding 2).
+  printf 'fresh-between-runs' > "$r/work/$D/$ROW/ef_search=32-run-0.log"
+  st_rc "b fails at ef16" 1 st_run "$r" failed-backdated b
   st_ok "stale ef64 pass log NOT copied into run-b (finding 1)" test ! -e "$r/results/$D/repro/run-b/ef_search=64-run-0.log"
   st_ok "run A's collection-info NOT copied (the failed stub does not rewrite it)" test ! -e "$r/results/$D/repro/run-b/collection-info.json"
   st_ok "run A's init log NOT copied" test ! -e "$r/results/$D/repro/run-b/init-0.log"
@@ -683,6 +707,21 @@ STUB
   st_ok "run B's ef16 settle log copied" test -f "$r/results/$D/repro/run-b/ef_search=16-cold-0.settle.log"
   st_ok "run B's init state file copied" test -f "$r/results/$D/repro/run-b/index-state-init.json"
   st_ok "run A's evidence untouched (no regression for run A)" test -f "$r/results/$D/repro/run-a/collection-info.json" -a -f "$r/results/$D/repro/run-a/init-0.log"
+  # Work 1 (B-0-F7-F1-F2-F1): the fresh leftover stayed in the work dir
+  # and never reached run-b/ — only a marker refreshed per run excludes
+  # a file newer than run A's own marker (verdict finding 2).
+  st_ok "fresh between-runs leftover exists in the work dir" test -f "$r/work/$D/$ROW/ef_search=32-run-0.log"
+  st_ok "fresh leftover NOT copied into run-b (marker refreshed per run)" test ! -e "$r/results/$D/repro/run-b/ef_search=32-run-0.log"
+  # Work 2: the stub's mtime-backdated write stayed in the work dir and
+  # never reached run-b/ — an mtime (-nt) filter excludes it, a
+  # full-granularity ctime filter would include it (verdict finding 3).
+  st_ok "mtime-backdated stub write exists in the work dir" test -f "$r/work/$D/$ROW/ef_search=16-cold-1.log"
+  st_ok "mtime-backdated stub write NOT copied into run-b (-nt is mtime, not ctime)" test ! -e "$r/results/$D/repro/run-b/ef_search=16-cold-1.log"
+  # Work 3: the markers live directly under the gitignored work/ root
+  # (bench/nbench/.gitignore ignores work/), never under the committed
+  # results/ tree (verdict finding 4).
+  st_ok "markers live under the work/ root" test -f "$r/work/.reproduce-run-a.marker" -a -f "$r/work/.reproduce-run-b.marker"
+  st_ok "no marker under the committed results/ tree" test -z "$(find "$r/results" -name '*.marker')"
 
   if [ "$fails" -eq 0 ]; then
     echo "REPRO SELFTEST OK ($t)"
