@@ -517,6 +517,16 @@ case "$1" in
       fi
       exit 1
     fi
+    # The stub must behave like the real `nbench run` on one point: its
+    # work-dir writes must land strictly LATER than the per-run marker
+    # reproduce.sh touches just before starting it. Kernel inode
+    # timestamps come from the coarse clock — writes inside the same
+    # ~few-ms tick compare EQUAL under -nt — and this stub starts
+    # writing within a tick of its parent, unlike the real run (which
+    # takes seconds before its first work-dir file). Sleep past a few
+    # ticks so the marker filter is decided by run order, never by
+    # same-tick luck.
+    sleep 0.2
     date=$(date -u +%F)
     work="$NBENCH_ROOT/work/$date/$row"
     case "${NB_STUB_MODE:-success}" in
