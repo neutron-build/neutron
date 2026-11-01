@@ -34,7 +34,9 @@ vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed '
 # too, so the tip check below passes the same flag.
 # Callers must check its exit status: a failed listing (a bad BASE) prints
 # nothing, and `done < <(changed ...)` would read that as "nothing changed".
-changed() { local b=$1 h=$2; shift 2; git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$b...$h" -- "$@"; }
+# verify_objects first (git-env.sh says why): a forged object makes the diff
+# list nothing. Its lines go to stderr and stay in VERIFY_PROBLEMS.
+changed() { local b=$1 h=$2; shift 2; verify_objects "$b" "$h" || { printf '%s\n' "$VERIFY_PROBLEMS" >&2; return 1; }; git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$b...$h" -- "$@"; }
 
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
@@ -71,7 +73,12 @@ check_merge() {
   # must name no other commit: rev-parse refused an ambiguous prefix, and without
   # that a late commit ground to share the reviewed prefix would reuse the verdict.
   # Only commits count, as the ^{commit} peel ignored blobs and trees.
-  local tipfiles=()
+  # The tip check reads HEAD^1's trees, the reviewed commit's, which the range
+  # check below does not verify: HEAD^1 is neither the merge base nor the tip.
+  local tipfiles=() vl
+  if ! verify_objects "$head^1" "$head"; then
+    while IFS= read -r vl; do errs+=("$vl"); done <<<"$VERIFY_PROBLEMS"
+  fi
   mapfile -d '' -t tipfiles < <(git diff-tree -z --ignore-submodules=none --no-commit-id --name-only -r "$head" -- ':/')
   { [ ${#tipfiles[@]} -eq 1 ] && [ "${tipfiles[0]}" = "$own" ]; } || errs+=("the branch tip must be the verdict commit (changing only $own); it changes: ${tipfiles[*]}")
   if [[ $vcommit =~ ^[0123456789abcdef]{7,40}$ ]]; then
@@ -121,7 +128,13 @@ check_merge() {
   # Through a file: process substitution drops git's exit status, and NUL-
   # separated paths cannot be held in a variable.
   lst=$(mktemp) || { echo "cannot create a temporary file for the path list"; return 1; }
-  changed "$base" "$head" ':/' >"$lst" || errs+=("cannot list paths changed in $base...$head (git diff failed)")
+  if ! changed "$base" "$head" ':/' >"$lst"; then
+    if [ -n "$VERIFY_PROBLEMS" ]; then
+      while IFS= read -r vl; do errs+=("cannot list paths changed in $base...$head: $vl"); done <<<"$VERIFY_PROBLEMS"
+    else
+      errs+=("cannot list paths changed in $base...$head (git diff failed)")
+    fi
+  fi
   while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     [ "$f" = "$own" ] && continue
@@ -157,8 +170,12 @@ check_merge() {
 # parents, so nothing was edited inside the merge itself ("evil merge"). A card
 # that does not merge cleanly is rebased and re-gated; conflicts are never
 # resolved inside a merge commit.
+# Both parents' trees, the merge base's, and the merge commit and its own tree
+# are verified first (git-env.sh says why): one combined call would need a
+# second listing, so it is two, and sha^1's trees are hashed twice.
 clean_merge() {
   local sha=$1 t
+  { verify_objects "$sha^1" "$sha^2" && verify_objects "$sha^1" "$sha"; } || { printf '%s\n' "$VERIFY_PROBLEMS"; return 1; }
   t=$(git merge-tree --write-tree "$sha^1" "$sha^2" 2>/dev/null) || { echo "the parents do not merge cleanly (conflicts must be fixed on the card branch and re-gated)"; return 1; }
   [ "$(printf '%s\n' "$t" | head -1)" = "$(git rev-parse "$sha^{tree}")" ] || { echo "the merge commit's tree differs from the clean merge of its parents (edited inside the merge)"; return 1; }
 }

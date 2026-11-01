@@ -24,6 +24,8 @@ refused; and a clean filter on a tracked path is refused (it can turn a same-siz
 the index blob, past status and diff). Probed and inert there: colour and diff-prefix keys, rename
 and quotePath keys (listings are -z --no-renames), status.relativePaths, log.showSignature (extra
 lines fail closed), core.fileMode, merge.renames / merge.directoryRenames, textconv.
+A forged object (a loose file or pack .idx offset that returns another object's bytes) is refused by
+verify_objects, which re-hashes every commit and tree a range read depends on (X-6-F1-F2-F3-F1).
 Nothing is merged here: a gate writes verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3,
 §7.6).
 
@@ -47,6 +49,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -345,6 +348,88 @@ def worktree_changes(wt):
     return out + [("!!", f) for f in ignored if f not in hidden_by_tracked]
 
 
+class ObjectsUnverified(subprocess.CalledProcessError):
+    """changed_files' refusal when verify_objects reports problems (the lines
+    are in .problems). A CalledProcessError, so every caller that refuses a
+    failed listing refuses this too."""
+
+    def __init__(self, problems, cmd):
+        super().__init__(1, cmd, "", "\n".join(problems))
+        self.problems = problems
+
+
+def _verify_ids(wt, name, want, d):
+    """Hash-verify the ids in want, as _verify_ids in scripts/git-env.sh does
+    (it says why): problem lines, [] when every id comes back. d is an empty
+    temp dir outside the repository."""
+    if not want:
+        return [f"{name}: the object listing is empty (cannot verify objects)"]
+    env = git_env()
+    # index-pack and show-index run outside any repository (the ceiling stops
+    # the search at d), so index-pack's collision check reads no repository object.
+    out = {k: v for k, v in env.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")}
+    out["GIT_CEILING_DIRECTORIES"] = str(d.parent)
+
+    def failed(step, p):
+        return [f"{name}: git {step} failed (exit {p.returncode}; cannot verify objects)"]
+
+    p = subprocess.run(["git", "rev-parse", "--show-object-format"], cwd=wt, env=env, capture_output=True, text=True)
+    if p.returncode:
+        return failed("rev-parse", p)
+    fmt = p.stdout.strip()
+    with open(d / "p.pack", "wb") as fh:
+        cmd = ["git", "pack-objects", "--stdout", "-q", "--no-reuse-object", "--window=0", "--compression=0"]
+        p = subprocess.run(cmd, cwd=wt, env=env, input="".join(i + "\n" for i in want).encode(), stdout=fh, stderr=subprocess.PIPE)
+    if p.returncode:
+        return failed("pack-objects", p)
+    p = subprocess.run(["git", "index-pack", f"--object-format={fmt}", "-o", "p.idx", "p.pack"], cwd=d, env=out, capture_output=True)
+    if p.returncode:
+        return failed("index-pack", p)
+    with open(d / "p.idx", "rb") as fh:
+        p = subprocess.run(["git", "show-index", f"--object-format={fmt}"], cwd=d, env=out, stdin=fh, capture_output=True, text=True)
+    if p.returncode:
+        return failed("show-index", p)
+    # show-index prints "<offset> <id> (<crc>)".
+    got = {f[1] for f in (l.split(" ") for l in p.stdout.splitlines()) if len(f) > 1}
+    return [f"object {o} fails its hash (git state hides changes)" for o in sorted(set(want) - got)]
+
+
+def verify_objects(wt, base, tip):
+    """The problem lines of a hash check of every commit and tree a base...tip
+    consumer reads ([] when there are none): the twin of verify_objects in
+    scripts/git-env.sh, which gives the class, the object set and why
+    (X-6-F1-F2-F3-F1), and prints the same lines. A failed git step is a
+    problem line, never "nothing found". Caches nothing."""
+    env = git_env()
+
+    def failed(step, p):
+        return [f"verify_objects: git {step} failed (exit {p.returncode}; cannot verify objects)"]
+
+    try:
+        d = pathlib.Path(tempfile.mkdtemp())
+    except OSError:
+        return ["verify_objects: cannot create a temporary directory (cannot verify objects)"]
+    try:
+        p = subprocess.run(["git", "rev-list", "--boundary", f"{base}...{tip}", "--"], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode:
+            return failed("rev-list", p)
+        commits = [c.lstrip("-") for c in p.stdout.split()]
+        # Exit 1 is no merge base (unrelated histories); anything else fails.
+        p = subprocess.run(["git", "merge-base", "--all", base, tip], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode > 1:
+            return failed("merge-base", p)
+        mbs = p.stdout.split()
+        p = subprocess.run(["git", "rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", base, tip, *mbs, "--"], cwd=wt, env=env, capture_output=True, text=True)
+        if p.returncode:
+            return failed("rev-list", p)
+        roots = p.stdout.split()
+        if not roots:
+            return ["verify_objects: the object listing is empty (cannot verify objects)"]
+        return _verify_ids(wt, "verify_objects", commits + mbs + roots, d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def changed_files(wt, base):
     # Raises (from git_paths or worktree_changes) if a listing fails; never a
     # partial set. --no-renames: a rename must report its source path, or a
@@ -356,6 +441,12 @@ def changed_files(wt, base):
     # submodule.<name>.ignore=all in a worktree .gitmodules (tracked or not),
     # drops an added gitlink. changed_since passes the same three.
     files = set(git_paths(["diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", f"{base}...HEAD"], wt))
+    # A forged object makes the diff list nothing (verify_objects), so its
+    # listing is used only once the objects verify. The diff runs first only so
+    # that a git failure (a bad base) is still named as the diff's.
+    probs = verify_objects(wt, base, "HEAD")
+    if probs:
+        raise ObjectsUnverified(probs, ["verify_objects", str(base), "HEAD"])
     files.update(f for _, f in worktree_changes(wt))
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
@@ -431,7 +522,11 @@ def gate_committed(wt, base, f, card_id, pre_head, ledger=None):
     worker can write one), so the commit must also be no worker commit in the
     trust ledger, and the caller requires f untouched since pre_head. ledger
     None checks the subject only: the unit scenarios, which have no runs.
-    main() always passes one."""
+    main() always passes one. Objects that fail verify_objects(base, pre_head)
+    are False before anything is read, ledger or not: a forged commit can carry
+    any subject, and a forged tree can hide a worker's change to f."""
+    if verify_objects(wt, base, pre_head):
+        return False
     _, out = run(["git", "log", "-1", "--format=%H %s", f"{base}..{pre_head}", "--", f], wt)
     sha, _, subject = out.strip().partition(" ")
     if not subject.startswith(f"nucleus v3: {card_id} verdict "):
@@ -564,6 +659,10 @@ def scope_violations(wt, base, touch, card_id=None, pre_head=None, ledger=None):
     bad = [f"{p} (git state hides changes)" for p in git_state_problems(wt)]
     try:
         files = changed_files(wt, base)
+    except ObjectsUnverified as e:
+        # Each line named, as git state is.
+        sfx = " (git state hides changes)"
+        return bad + [p if p.endswith(sfx) else p + sfx for p in e.problems]
     except subprocess.CalledProcessError as e:
         # A check that cannot see the diff refuses (PLAN-v3 §7.6).
         why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]

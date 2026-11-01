@@ -45,6 +45,11 @@ card_class=$(sed -n 's/^Class:[[:space:]]*\([a-z]*\).*/\1/p' "$card" | head -1)
 [ -n "$card_gate" ] || die "card has no Gate: P|S line"
 [ -n "$card_class" ] || die "card has no Class: line"
 
+# Before the merge base is read: check_merge verifies the card's range, but the
+# merge below also reads HEAD's trees, which are not under the merge base once
+# the pass has moved on, and a forged HEAD tree would be merged into the pass.
+verify_objects HEAD "$branch" || die "objects fail verification (git-env.sh's verify_objects):
+$VERIFY_PROBLEMS"
 base=$(git merge-base HEAD "$branch")
 if ! errs=$(check_merge "$id" "$base" "$branch" merge "$card_gate" "$card_class" "$cards/QUEUE.local.md") || [ -n "$GIT_STATE_PROBLEMS" ]; then
   die "refused:

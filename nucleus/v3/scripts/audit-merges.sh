@@ -23,6 +23,11 @@ cd "$here/.."
 state=0
 git_state_refuse >/dev/null || { state=1; sed 's/^/audit: /' <<<"$GIT_STATE_PROBLEMS"; }
 ref=${1:-HEAD}
+# Every commit and tree in REF's history, hash-verified once (git-env.sh's
+# verify_reachable): the path-limited listing below never yields a commit that
+# is TREESAME under a swapped tree. The walk still runs, as for git state; the
+# per-merge checks verify their own ranges again.
+verify_reachable "$ref" || { state=1; sed 's/^/audit: /' <<<"$VERIFY_PROBLEMS"; }
 # The commit list goes through a file, not `done < <(git rev-list ...)`:
 # process substitution drops git's exit status, so a bogus ref read as an empty
 # history and printed "audit: ok (0 commits)". An audit that cannot list refuses.
