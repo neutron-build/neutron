@@ -1,6 +1,13 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F2, **all steps 0–4 done** (amended by
+Status: **stage X-5c-F3, step 0 done (the class table re-derived and
+committed)** — F2's Acceptance 10k (commit 1f8e7c3f, verdict tip 32dc3375)
+is the triage file of record (`results/campaign.json`, sha256 `56e47fb2…`);
+its `E4`/`E4 FOLD` lines and quota table are in the step-0 commit (b9dd5a9a).
+Steps 1–8 (C-XX, C-DIV, MP-LIVELOCK+G8, MP-A, MW-ORPHAN, the twins, the
+other rounds + MP-E shape C, the F4 hand-off) follow below in this section.
+The stage before it (X-5c-F2) is complete and merged (all its steps 0–4
+done, amended by
 nv3-X-5c-F2-amend-1, 2026-10-31) — step 0 corrected the
 digest-stability step-4 record (54 rows, from the X-5c-F1 gate's truth
 file); step 1 landed the harness hardening (a)–(e) with pins; step 2
@@ -11,8 +18,8 @@ took X5-R29's branch (c) — seed 4858's faultless twin holds the same
 two orphan map entries, so amcheck is unchanged and shape C is handed
 to F3 with the per-lpid evidence; step 4 is this stage record. The
 Acceptance 10k and its `verify --no-quotas` are the runner's (X5-R31):
-no campaign-class command ran in this card's attempts. The triage file
-of record stays P's c8e578b7 run:
+no campaign-class command ran in that card's attempts. Its triage file
+of record was P's c8e578b7 run:
 `E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
 PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
 FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
@@ -1433,6 +1440,50 @@ prov file); then `bash scripts/gate.sh`. X-5c-F3's step 0 commits
 that file after the provenance checks. No campaign-class command ran
 inside this card's attempts (only single-seed runs); the committed
 `results/campaign.json` stays P's c8e578b7 esc-2 file.
+
+## Stage X-5c-F3's record (this card)
+
+**Step 0 — F2's Acceptance 10k committed as the triage file of record
+(b9dd5a9a), and this card's class table re-derived from it.** The three
+provenance checks passed before the copy (the prov file's
+`commit=1f8e7c3f… status_lines=0 exit=0 verify_exit=0`; the JSON's sha256
+equal to its `json_sha256` `56e47fb2…f34033`; `git diff --quiet
+1f8e7c3f HEAD` over `src/`, `tests/`, `examples/`, `Cargo.toml` and
+`v3/Cargo.lock` exiting 0 — the merged tip 32dc3375 is F2's verdict
+commit on top of 1f8e7c3f, which touches only `nucleus/v3/verdicts/`).
+
+Final lines, verbatim:
+
+```
+E4 SEEDS=10000 O1_FAIL=2712 O2_FAIL=101 O3_FAIL=624 DEADLOCK=41 PANIC=0 O1F_FAIL=2723 MONITOR=0
+E4 FOLD FAILING_SEEDS=1070 FAILING_ROUNDS=1015 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0
+```
+
+**The class table, re-derived from the committed file (every count
+reproduces P's Goal re-derivation exactly).** Field definitions: a
+**failing** primary round has `pass=false` in the pass fold; a **failing
+twin** round has `pass=false` in the twin record (which carries only
+`pass` and the `o1` text). All counts are over primary rounds unless
+"twin" is in the name.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **C-XX** (class C) | 130 | class C failing round with `o2 != null` ("class C amcheck(i) not clean") or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 45, `AmcheckIi` 82, and 3 rounds with `o2` only (no O-3(b)); 98 carry both `o2` and O-3(b), 29 O-3(b) only, 8 have no `o1` at all | 221 (r0, `Open`), 66 (r0, `AmcheckIi`) |
+| **C-XX** (the same shape in MP/MW: O-3(c) with no damaged referenced slot) | 15 MP + 13 MW | MP/MW failing round with `o3` = `O-3(c): XX001 with every media fault on unread, unreferenced targets`; in MP 7 stand alone (907/1167/4167/7367/7748/8837/9508 r0–r1) and 8 sit inside MP-LIVELOCK rounds | MP 907 (r0; 528 now passes), MW 1769 (r0) |
+| **C-DIV** | 424 | class C failing round carrying an `o1` text, **excluding** rounds whose `o1` is an O-1(a) inside a C-XX round (46 of the 50 (a) rounds: 45 are the recovery-`Err` default `published {} != model {…}`, plus seed 8764 r1 whose genuine (a) sits beside its O-3(b)). Kinds: (b) 267 (266 "scan mismatch" + 1382 r0's "scan read failed", itself an O-2 round), (c) 95, (d) 58, (a) 4 (4004 r0, 7531 r1, 8480 r2, 8804 r1). By round index: r0 88/7,000 (1.3%), r1 70/3,424 (2.0%), r2 266/1,357 (19.6%) | 21 (r0, b), 46 (r1, b), 36 (r2, d), 10 (r2, c) |
+| **MP-LIVELOCK** | 41 | MP failing round with `ll` or `dl` set; livelock site `lls`: `h:writer` 19, `h:evictor` 15, `h:ckpt` 7; 38 at round 1, 3 at round 2; every one's previous round has `r6=true, pass=true, o1dl>0`; 8 also carry the C-XX O-3(c) text | 987 (r1, `h:ckpt`), 1108 (r1, `h:writer`), 1247 (r1, `h:evictor`) |
+| **MP-A** | 7 | MP failing round with `served=true`: 1897/2437/2927/4378/4718/7528/8728, all round 0, all `mrb=true`, all recovery-`Err` (Q14 meta-fault rounds) | 1897, 2437 |
+| **MW-ORPHAN** | 446 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` | 39 (r0), 59 (r0) |
+| **Other MW** | 26 | the MW failing rounds outside MW-ORPHAN: 13 O-3(c) (the C-XX shape above), 10 O-3(d) with O-1(a), 1 O-1(a) only (3399 r0), 2 O-1f only (2019 r2, 4049 r1) | 3399, 2019 |
+| **Other MP** | 4 | MP failing rounds outside every class above: 6028 r0, 7388 r1, 9548 r1 (O-1(b) scan mismatch) and 8788 r1 (O-1(c)); all recovery-`Ok`, no O-3 text | 6028 |
+| **MP-E shape C** (handed on by X5-R29 (c)) | 6 | MP failing round with `o3` starting `O-3(e): (ii)`; all `mrb=false, rlen=0`: 688/3718/4858/5238/5638/9717 (all r0) | 688, 4858, 9717 |
+| **The twins** | 103 | failing twin rounds: 44 MP over 43 seeds + 59 MW over 48 seeds; their `o1` texts: MP (b) 28, (a) 10, (c) 2, (d) 1, none 3; MW (b) 23, (a) 21, (c) 8, (d) 6, none 1 — the classes echo there (the twin is judged as class C) | 339 (MW r0, (c)), 849 (MW r1, (a)), 907 (MP r0, (b)) |
+
+Partition check: C 478 = 130 C-XX ∪ 424 C-DIV (overlap 76 rounds); MP 65
+= 41 LIVELOCK + 7 MP-A + 7 C-XX-alone + 6 shape C + 4 other (the 8
+C-XX-inside-LIVELOCK counted once, in LIVELOCK); MW 472 = 446 ORPHAN +
+26 other. Total failing rounds 1,015; failing seeds 1,070 (1,015 failing
+primary rounds + twin-only failures and seed-level flags).
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
