@@ -777,6 +777,34 @@ fn r21c_the_real_rounds_retry_re_pairs_its_twin() {
     }
 }
 
+/// **X-5c-F2 step 1 (a) pin: an empty or all-zero hook-mask list is a
+/// loud defect, never a hang.** The draft's `reachable_hook_spec`
+/// fallback loop walks `CKPT_HOOKS` decrementing `left`, and with
+/// `union == 0` no candidate ever matches, so it spun forever — in the
+/// exact path that exists to repair an unfired round. The function now
+/// returns `Err` (the caller records a seed-level defect beside the
+/// fired-guard's). The call runs on a spawned thread with a 5 s channel
+/// timeout (the card's test-only wall-clock exception): on the revert
+/// the timeout is what fails the pin.
+#[test]
+fn f1f2a_empty_masks_are_a_defect_not_a_hang() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        use e4_recovery::store::ckpt::CkptHook;
+        let empty = workload::reachable_hook_spec(&[], CkptHook::Mid2, 0, 7, 0);
+        let zeros = workload::reachable_hook_spec(&[0, 0], CkptHook::After2, 1, 7, 0);
+        let _ = tx.send((empty.is_err(), zeros.is_err()));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    assert!(
+        got.unwrap_or((false, false)) == (true, true),
+        "reachable_hook_spec must refuse (&[] and &[0, 0]) within 5 s, not hang or loop"
+    );
+    handle.join().expect("the spec thread must finish");
+}
+
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {
