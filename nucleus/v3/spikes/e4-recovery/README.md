@@ -1,14 +1,18 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
 Status: **stage X-5c-F2 (amended by nv3-X-5c-F2-amend-1, 2026-10-31),
-**step 0 done** — the digest-stability step-4 record corrected offline
-from the X-5c-F1 gate's truth file (54 rows rewritten; the corrected
-counts and the rulings X5-R28–R31 are in the stage record below).
-Remaining: step 1 (harness hardening (a)–(e)), step 2 (X5-R28 + X5-R30
-(a)), step 3 (X5-R29 shape C), step 4 (the stage record). The
-Acceptance 10k and its `verify --no-quotas` are the runner's (X5-R31);
-no campaign-class command runs in this card's attempts. The triage file
-of record stays P's c8e578b7 run:
+**steps 0–1 done** — step 0 corrected the digest-stability step-4
+record offline (54 rows, from the X-5c-F1 gate's truth file); step 1
+landed the harness hardening (a) `reachable_hook_spec` refuses
+empty/zero masks, (b) the R21 (c) re-pair re-seeds a storeless
+re-paired twin, (c) the FOLD twin term pinned (M13), (d) R's
+events-half anchor pinned at the sync's return (M8), (e) the anchor-0
+precondition tripwire — each with its pin demonstrated on the revert.
+Remaining: step 2 (X5-R28 + X5-R30 (a)), step 3 (X5-R29 shape C),
+step 4 (the stage record). The Acceptance 10k and its `verify
+--no-quotas` are the runner's (X5-R31); no campaign-class command
+runs in this card's attempts. The triage file of record stays P's
+c8e578b7 run:
 `E4 SEEDS=10000 O1_FAIL=2711 O2_FAIL=101 O3_FAIL=635 DEADLOCK=41
 PANIC=0 O1F_FAIL=2722 MONITOR=0` / `E4 FOLD FAILING_SEEDS=1088
 FAILING_ROUNDS=1034 TWIN_FAILING_ROUNDS=103 DEFECT_SEEDS=0`, digests
