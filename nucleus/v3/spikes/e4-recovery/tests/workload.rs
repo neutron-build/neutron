@@ -839,6 +839,37 @@ fn f1f2b_repairs_without_a_store_reseed_the_twin_chain() {
     assert_eq!(ch.cut, 3, "the chain carries the re-paired round's own cut");
 }
 
+/// **X5-R28 (e) pin (literal configs = the ruling's residual seeds 1787
+/// and 6157, round 0 each).** The rounds that failed O-3 (e) as
+/// "tainted referenced slot 10/42 not reported" now pass: their named
+/// slot is in the kept set `K` (the diag prints `K slot … durable==V_k`
+/// per round), the rollback conditions hold (`mrb=true`), and no O-3
+/// text remains. That the clear comes **through K** is demonstrated on
+/// the revert: with the harness K computation disabled (always empty —
+/// mutant M-R28g) the completeness text returns and this pin fails.
+#[test]
+fn r28_residual_seeds_clear_via_k() {
+    for seed in [1787u64, 6157] {
+        let rec = workload::run_seed(seed, None);
+        assert!(
+            rec.rounds.iter().any(|r| r.meta_rollback),
+            "seed {seed}: the residual round's rollback condition must hold (the K gate)"
+        );
+        for r in &rec.rounds {
+            assert!(
+                r.o3_fail.is_none(),
+                "seed {seed}: O-3 must be clear (the named slot is kept): {:?}",
+                r.o3_fail
+            );
+            assert!(
+                r.pass,
+                "seed {seed}: the residual round must pass: {:?}",
+                r.o3_fail
+            );
+        }
+    }
+}
+
 #[test]
 fn r20_mpe_no_opened_image_means_no_slotted_finding() {
     for seed in [67u64, 268] {

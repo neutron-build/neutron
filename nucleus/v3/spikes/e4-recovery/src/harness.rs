@@ -2257,6 +2257,19 @@ pub fn run_round(
         ),
         None => BTreeSet::new(),
     };
+    // X5-R28 (e) evidence (`E4_MPE_DIAG`, stderr only, never a digest
+    // input): each kept slot's durable bytes — which condition 2 holds
+    // equal to `V_k(s)` — as a CRC, beside the round's own record.
+    if std::env::var("E4_MPE_DIAG").is_ok() {
+        for slot in kept_slots.iter() {
+            let b = disk.durable_read(pf, slot * 4096, 4096);
+            eprintln!(
+                "MPE diag: K slot {slot} durable==V_k crc32c={:08x} len={}",
+                crate::crc::crc32c(0, &b),
+                b.len()
+            );
+        }
+    }
     // X-5c-F2 step 1 (e): the anchor-0 fallback's precondition. When
     // the events half's anchor is the fallback 0 (the whole stream read
     // as post-graduation) and this life's stream holds a page-file
