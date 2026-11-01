@@ -32,7 +32,11 @@ git_state_refuse >/dev/null || true
 
 cur=$(git rev-parse --abbrev-ref HEAD)
 case $cur in scratch/*) ;; *) die "current branch is $cur, not scratch/*" ;; esac
-[ -z "$(git status --porcelain --untracked-files=no)" ] || die "worktree is not clean"
+# Tracked files only, by design (the merge reads the branches, not the
+# worktree). --ignore-submodules=none: diff.ignoreSubmodules or a worktree
+# .gitmodules ignore=all would hide a changed gitlink (enforce-lib.sh's
+# changed() says why).
+[ -z "$(git status --porcelain --untracked-files=no --ignore-submodules=none)" ] || die "worktree is not clean"
 git rev-parse -q --verify "$branch" >/dev/null || die "no branch $branch"
 card=$cards/$id.local.md
 [ -f "$card" ] || die "no local card $card"

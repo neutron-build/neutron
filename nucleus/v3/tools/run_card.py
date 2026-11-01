@@ -13,7 +13,17 @@ commit-graph that fails verification, a command-line -c turning a cache back on)
 with alternates, or index entries marked assume-unchanged or skip-worktree, is refused: before the
 first attempt, and by every scope check (git_state_problems). Probed and inert (X-6-F1-F2-F3):
 alternates beyond their commit-graph (objects are addressed by hash), and core.ignoreStat (it acts
-only through the assume-unchanged bit, which is refused).
+only through the assume-unchanged bit, which is refused). Settings that reshape diff and status
+output (X-6-F1-F2-F2-F1) are beaten by flags on every listing (--no-relative,
+--ignore-submodules=none, --untracked-files=all); untracked files hidden by an exclude source are
+listed anyway unless a tracked .gitignore at or above them hides them (worktree_changes);
+core.trustctime / core.checkStat are put back to git's defaults (GIT_ENV) and refused when set
+otherwise, since a same-size edit with its mtime restored passes their stat check; core.ignoreCase
+is put back to false (it drops untracked case variants of tracked files) and a -c beating that is
+refused; and a clean filter on a tracked path is refused (it can turn a same-size edit back into
+the index blob, past status and diff). Probed and inert there: colour and diff-prefix keys, rename
+and quotePath keys (listings are -z --no-renames), status.relativePaths, log.showSignature (extra
+lines fail closed), core.fileMode, merge.renames / merge.directoryRenames, textconv.
 Nothing is merged here: a gate writes verdicts/<id>.md and scripts/merge-card.sh merges (PLAN-v3 §7.3,
 §7.6).
 
@@ -84,10 +94,18 @@ GATE_CMD = "cd nucleus/v3 && bash scripts/gate.sh"
 # hide changes. A -c turning either back on beats this, so git_state_problems
 # names it, and also names a graph that fails `git commit-graph verify`, a
 # shallow repository and alternates (git-env.sh gives the reasons).
+# core.trustctime=true and core.checkStat=default (X-6-F1-F2-F2-F1) put git's
+# stat checks back: without ctime, or with only mtime and size, a same-size
+# in-place edit with its mtime restored reads as unchanged. A -c beats them
+# too, so git_state_problems names a false trustctime and any checkStat but
+# default at every scope. core.ignoreCase=false: true, on a case-sensitive
+# filesystem, drops an untracked case variant of a tracked file from every
+# untracked listing; the refusal names a -c that beats it, not a file-scope
+# true, which git sets itself on a case-insensitive filesystem.
 GIT_ENV = {
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_GRAFT_FILE": "/dev/null",
-    "GIT_CONFIG_COUNT": "4",
+    "GIT_CONFIG_COUNT": "7",
     "GIT_CONFIG_KEY_0": "core.fsmonitor",
     "GIT_CONFIG_VALUE_0": "false",
     "GIT_CONFIG_KEY_1": "advice.graftFileDeprecated",
@@ -96,6 +114,12 @@ GIT_ENV = {
     "GIT_CONFIG_VALUE_2": "false",
     "GIT_CONFIG_KEY_3": "core.untrackedCache",
     "GIT_CONFIG_VALUE_3": "false",
+    "GIT_CONFIG_KEY_4": "core.trustctime",
+    "GIT_CONFIG_VALUE_4": "true",
+    "GIT_CONFIG_KEY_5": "core.checkStat",
+    "GIT_CONFIG_VALUE_5": "default",
+    "GIT_CONFIG_KEY_6": "core.ignoreCase",
+    "GIT_CONFIG_VALUE_6": "false",
 }
 GATE_PASS = "GATE EXIT=0"
 OPENCODE_CONFIG = {
@@ -287,13 +311,52 @@ def git_paths(args, wt):
     return [f for f in p.stdout.split("\0") if f]
 
 
-def changed_files(wt, base):
-    # Raises (from git_paths) if either listing fails; never a partial set.
-    # --no-renames: a rename must report its source path, or a protected file
-    # could be moved out of a protected directory unnoticed.
-    files = set(git_paths(["diff", "--no-renames", "--name-only", f"{base}...HEAD"], wt))
+def worktree_changes(wt):
+    """Every uncommitted change in wt as (XY, path) status entries, untracked
+    files included whatever hides them (X-6-F1-F2-F2-F1). --untracked-files=all
+    beats status.showUntrackedFiles=no. Excludes (core.excludesFile from any
+    scope, the XDG default ignore file, info/exclude, an untracked .gitignore
+    ignoring itself) hide untracked files under any flag, so --ignored=matching
+    lists the ignored ones too ("!!", a whole directory when a pattern matches
+    it), and one is dropped only when `git check-ignore -v` names, as its rule,
+    a .gitignore tracked in the index at or above it. That is sound: a new or
+    edited .gitignore is itself a listed change, and it hides only paths below
+    its own directory; "at or above" keeps a core.excludesFile naming a tracked
+    .gitignore from hiding paths elsewhere. Tracked .gitignores are matched as
+    exact names, never as pathspecs. A failed status, ls-files or check-ignore
+    raises CalledProcessError, as git_paths does: never a partial set."""
+    ents = git_paths(["status", "--porcelain", "--no-renames", "--ignore-submodules=none", "--untracked-files=all", "--ignored=matching"], wt)
     # Porcelain -z entries are "XY <path>"; --no-renames means no "orig path" entries.
-    files.update(e[3:] for e in git_paths(["status", "--porcelain", "--no-renames", "--untracked-files=all"], wt))
+    out = [(e[:2], e[3:]) for e in ents if e[:2] != "!!"]
+    ignored = [e[3:] for e in ents if e[:2] == "!!"]
+    if not ignored:
+        return out
+    tracked = set(git_paths(["ls-files", "--full-name", "--", ":(top,glob)**/.gitignore"], wt))
+    cmd = ["git", "check-ignore", "-v", "-z", "--stdin"]
+    p = subprocess.run(cmd, cwd=wt, env=git_env(), input="".join(f + "\0" for f in ignored), capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+    if p.returncode not in (0, 1):  # 1: no path matched, so none is dropped
+        raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+    rec = p.stdout.split("\0")
+    hidden_by_tracked = set()
+    for src, path in zip(rec[0::4], rec[3::4]):
+        # The directory the rule hides in: "" for the top, else "<dir>/".
+        if src in tracked and path.startswith(src[: -len(".gitignore")]):
+            hidden_by_tracked.add(path)
+    return out + [("!!", f) for f in ignored if f not in hidden_by_tracked]
+
+
+def changed_files(wt, base):
+    # Raises (from git_paths or worktree_changes) if a listing fails; never a
+    # partial set. --no-renames: a rename must report its source path, or a
+    # protected file could be moved out of a protected directory unnoticed.
+    # The other two flags beat config at any scope, GIT_CONFIG_PARAMETERS
+    # included (X-6-F1-F2-F2-F1): --no-relative, since diff.relative makes a
+    # diff run below the top print cwd-relative paths and drop the rest;
+    # --ignore-submodules=none, since diff.ignoreSubmodules=all, or
+    # submodule.<name>.ignore=all in a worktree .gitmodules (tracked or not),
+    # drops an added gitlink. changed_since passes the same three.
+    files = set(git_paths(["diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", f"{base}...HEAD"], wt))
+    files.update(f for _, f in worktree_changes(wt))
     return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
 
 
@@ -302,7 +365,7 @@ def changed_since(wt, rev, f):
     staged, unstaged or untracked). Diffs rev itself, not a merge-base, so an
     amend or rebase that drops rev's commits cannot hide the change; any git
     error counts as changed."""
-    rc, diff = run(["git", "diff", "--no-renames", "--name-only", rev, "--", f], wt)
+    rc, diff = run(["git", "diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", rev, "--", f], wt)
     rc2, untracked = run(["git", "ls-files", "--others", "--", f], wt)
     return bool(rc or rc2 or diff.strip() or untracked.strip())
 
@@ -389,11 +452,17 @@ def git_state_problems(wt, index=True):
     core.untrackedCache that is not false under GIT_ENV (only a caller's
     GIT_CONFIG_PARAMETERS can beat it), GIT_TEST_COMMIT_GRAPH (forces graph
     reads), a commit-graph that `git commit-graph verify` (run without the
-    override) rejects, and, with index, entries marked
-    assume-unchanged (lowercase ls-files -v tag) or skip-worktree (S), which
-    status and diff skip. GIT_ENV neutralises replace refs, grafts, fsmonitor
-    and the two caches; nothing neutralises shallow entries, alternates or
-    the index flags. Nor an fsmonitor hook from a caller's
+    override) rejects, a false core.trustctime or a core.checkStat other than
+    default at any scope (read without the override; GIT_ENV puts git's
+    defaults back over the config files, and only a caller's
+    GIT_CONFIG_PARAMETERS beats that), a core.ignoreCase that is not false
+    under GIT_ENV, and, with index, entries marked assume-unchanged
+    (lowercase ls-files -v tag) or skip-worktree (S), which status and diff
+    skip, and a clean filter on a tracked path (a filter attribute whose
+    driver has filter.<driver>.clean or .process set at any scope). GIT_ENV
+    neutralises replace refs, grafts, fsmonitor, the two caches, the two stat
+    keys and core.ignoreCase; nothing neutralises shallow entries, alternates,
+    the index flags or a clean filter. Nor an fsmonitor hook from a caller's
     GIT_CONFIG_PARAMETERS (`git -c`), which applies after GIT_ENV's
     GIT_CONFIG_COUNT entries: the override=False read keeps the variable and
     names the hook ("command line:"), so this refusal is its only layer.
@@ -428,7 +497,15 @@ def git_state_problems(wt, index=True):
         for origin, val in zip(rec[0::2], rec[1::2]):
             if val.lower() not in ("false", "no", "off", "0"):
                 probs.append(f"core.fsmonitor is '{val}' ({origin})")
-        for key in ("core.commitGraph", "core.untrackedCache"):
+        # Every entry at every scope, read as git_state_refuse does (git-env.sh
+        # says why): --type=bool parses trustctime as git does.
+        p = git("config", "-z", "--show-origin", "--type=bool", "--get-all", "core.trustctime", override=False, ok=(0, 1))
+        rec = p.stdout.split("\0") if p.returncode == 0 else []
+        probs += [f"core.trustctime is '{val}' ({origin})" for origin, val in zip(rec[0::2], rec[1::2]) if val == "false"]
+        p = git("config", "-z", "--show-origin", "--get-all", "core.checkStat", override=False, ok=(0, 1))
+        rec = p.stdout.split("\0") if p.returncode == 0 else []
+        probs += [f"core.checkStat is '{val}' ({origin})" for origin, val in zip(rec[0::2], rec[1::2]) if val.lower() != "default"]
+        for key in ("core.commitGraph", "core.untrackedCache", "core.ignoreCase"):
             p = git("config", "-z", "--show-origin", "--get", key, ok=(0, 1))
             origin, val = (p.stdout.split("\0") + ["", ""])[:2]
             if p.returncode == 1:
@@ -450,6 +527,25 @@ def git_state_problems(wt, index=True):
                     probs.append(f"{path} is marked assume-unchanged in the index (ls-files -v tag {tag})")
                 if tag in ("S", "s"):
                     probs.append(f"{path} is marked skip-worktree in the index (ls-files -v tag {tag})")
+            # Clean filters, refuse-only (git-env.sh says why): attributes as
+            # status reads them, from the top, since check-attr takes paths
+            # relative to its cwd.
+            top = git("rev-parse", "--show-toplevel").stdout.rstrip("\n")
+            paths = git("ls-files", "-z", "--full-name", "--", ":/").stdout
+            cmd = ["git", "check-attr", "-z", "--stdin", "filter"]
+            p = subprocess.run(cmd, cwd=top, env=git_env(), input=paths, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape")
+            if p.returncode != 0:
+                raise subprocess.CalledProcessError(p.returncode, cmd, p.stdout, p.stderr)
+            # No value is skipped, the state words included: git runs
+            # filter.set.clean for `filter=set` (git-env.sh says why).
+            rec, drivers = p.stdout.split("\0"), {}
+            for path, val in zip(rec[0::3], rec[2::3]):
+                drivers.setdefault(val, []).append(path)
+            for d, used in drivers.items():
+                for kind in ("clean", "process"):
+                    q = git("config", "-z", "--show-origin", "--get-all", f"filter.{d}.{kind}", override=False, ok=(0, 1))
+                    cfg = q.stdout.split("\0") if q.returncode == 0 else []
+                    probs += [f"filter={d} is on {len(used)} tracked path(s) (first: {used[0]}), and filter.{d}.{kind} is '{val}' ({origin})" for origin, val in zip(cfg[0::2], cfg[1::2])]
     except subprocess.CalledProcessError as e:
         why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
         probs.append(f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot check git state)")
@@ -818,10 +914,15 @@ def main():
                 print(f"[{card_id}] {'PASS' if rc == 0 else 'FAIL'}: {c}", flush=True)
                 if rc:
                     failures.append(f"$ {c}\n" + "\n".join(out.splitlines()[-60:]))
-            _, dirty = run("git status --porcelain --untracked-files=all -- . ':!opencode.json'", wt)
+            try:
+                dirty = "\n".join(f"{xy} {f}" for xy, f in worktree_changes(wt) if f != "opencode.json")
+            except subprocess.CalledProcessError as e:
+                why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]
+                dirty = f"{' '.join(e.cmd)} failed (exit {e.returncode}): {why} (cannot list uncommitted changes)"
             if dirty.strip():
                 failures.append("Uncommitted changes (commit the card's work):\n" + dirty.strip())
                 print(f"[{card_id}] FAIL: uncommitted changes", flush=True)
+                print(failures[-1], flush=True)
             if not failures:
                 result["pass"] = True
                 break

@@ -801,7 +801,7 @@ env_same() { local sh py; sh=$(cd "$v3" && env -i PATH="$PATH" bash -c '. script
   py=$(env -i PATH="$PATH" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("rc",sys.argv[1]); rc=importlib.util.module_from_spec(s); s.loader.exec_module(rc); [print(f"{k}={v}") for k,v in sorted(rc.git_env({}).items()) if k.startswith("GIT_")]' "$v3/tools/run_card.py" | sort)
   echo "sh: $sh"; echo "py: $py"; [ -n "$sh" ] && [ "$sh" = "$py" ]; }
 expect_ok "git env: git-env.sh and run_card.py's GIT_ENV set the same variables" env_same
-cfg_sh() { (cd "$v3" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=nv3.probe GIT_CONFIG_VALUE_0=kept bash -c '. scripts/git-env.sh; . scripts/git-env.sh; echo "count $GIT_CONFIG_COUNT"; [ "$GIT_CONFIG_COUNT" = 5 ] && [ "$(git config nv3.probe)" = kept ] && [ "$(git config core.fsmonitor)" = false ]'); }
+cfg_sh() { (cd "$v3" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=nv3.probe GIT_CONFIG_VALUE_0=kept bash -c '. scripts/git-env.sh; . scripts/git-env.sh; echo "count $GIT_CONFIG_COUNT"; [ "$GIT_CONFIG_COUNT" = 8 ] && [ "$(git config nv3.probe)" = kept ] && [ "$(git config core.fsmonitor)" = false ]'); }
 expect_ok "git env: git-env.sh appends to a caller's GIT_CONFIG_COUNT entries" cfg_sh
 cfg_py() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
 import importlib.util, os, pathlib, sys
@@ -810,7 +810,7 @@ caller = dict(os.environ, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="nv3.probe", GI
 env = rc.git_env(caller)
 got = [rc.run(["git", "config", k], sys.argv[2], env=caller)[1].strip() for k in ("nv3.probe", "core.fsmonitor")]
 print(got, env["GIT_CONFIG_COUNT"])
-sys.exit(0 if got == ["kept", "false"] and env["GIT_CONFIG_COUNT"] == "5" and rc.git_env(env) == env else 1)
+sys.exit(0 if got == ["kept", "false"] and env["GIT_CONFIG_COUNT"] == "8" and rc.git_env(env) == env else 1)
 P
 }
 expect_ok "git env: run_card.py appends to a caller's GIT_CONFIG_COUNT entries" cfg_py
@@ -1228,6 +1228,278 @@ git -C "$r" config --unset core.ignoreStat; git -C "$r" update-index --no-assume
 expect_ok "git state: none after GUC and GIS" no_state
 expect_ok "git state: none of the cache state after GUC and GIS" no_state2
 
+# --- output-shaping config and worktree files (X-6-F1-F2-F2-F1) -------------
+# Settings that reshape what diff and status print hide a change without
+# touching an object: flags beat diff.relative, submodule ignore settings and
+# status.showUntrackedFiles=no at any scope; untracked files are listed by the
+# source that hides them; core.trustctime, core.checkStat and core.ignoreCase
+# are neutralised and refused; an active clean filter is refused. Config is set
+# per command (GIT_CONFIG_PARAMETERS as a prefix, never exported) or in $r's
+# config with a cleanup row; no_state3 checks this block's state is gone.
+no_state3() { [ ! -e "$r/.gitmodules" ] && ! grep -qxF nucleus/v3/tools/ex.py "$r/.git/info/exclude" && [ ! -e "$r/.git/info/attributes" ] && ! git -C "$r" config core.trustctime && ! git -C "$r" config core.checkStat && ! git -C "$r" config core.ignoreCase && [ -z "$(git -C "$r" config --get-regexp '^filter\.')" ] && [ -z "$(git -C "$r" for-each-ref refs/heads/st-base refs/heads/ex-base refs/heads/scratch/dr refs/heads/card/v3-DS refs/heads/card/v3-DSC)" ] && [ -z "$(git -C "$r" status --porcelain --untracked-files=all --ignored=matching)" ]; }
+expect_ok "git state: none of the output-shaping state before these scenarios" no_state3
+# DR diff.relative: from nucleus/v3, `git diff` prints cwd-relative paths and
+# drops everything outside it. Card I (S verdict) changes the v3 workflow;
+# card D (P verdict, Class standard) changes nucleus/v3/docs/X.md.
+xdr="'diff.relative'='true'"
+dr_hidden() { local d; d=$(cd "$v3" && GIT_CONFIG_PARAMETERS=$xdr git diff --name-only nucleus/v3-scaffold...card/v3-I -- ':/'); echo "$d"; [ "$d" = verdicts/I.md ]; }
+expect_ok "premise: DR: under diff.relative, diff from nucleus/v3 drops .forgejo/ and strips the prefix" dr_hidden
+dr_tree() { local d; d=$(cd "$v3" && GIT_CONFIG_PARAMETERS=$xdr git diff-tree --no-commit-id --name-only -r card/v3-D -- ':/'); echo "$d"; [ "$d" = nucleus/v3/verdicts/D.md ]; }
+expect_ok "premise: DR: diff-tree ignores diff.relative (so the tip check needs no flag)" dr_tree
+dr_cm() { (cd "$v3" && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && GIT_CONFIG_PARAMETERS=$xdr check_merge I nucleus/v3-scaffold card/v3-I audit); }
+expect_ok "check_merge: DR: under diff.relative the S verdict's v3 workflow change is still outside nucleus/v3" out_has ".forgejo/workflows/nucleus-v3.yml is outside nucleus/v3 and needs a P verdict" -- dr_cm
+# A titled P merge of card D on a throwaway ref, built with commit-tree.
+drt=$(git -C "$r" merge-tree --write-tree nucleus/v3-scaffold card/v3-D)
+git -C "$r" update-ref refs/heads/scratch/dr "$(git -C "$r" commit-tree "$drt" -p nucleus/v3-scaffold -p card/v3-D -m "nucleus v3: merge card/v3-D (MERGE, gate P/test-model)")"
+dr_audit() { (cd "$v3" && GIT_CONFIG_PARAMETERS=$xdr bash scripts/audit-merges.sh scratch/dr); }
+expect_ok "audit: DR: under diff.relative a P merge's non-spec docs/ change is still refused" out_has "nucleus/v3/docs/X.md: docs/ changes need Class: spec and a P verdict" -- dr_audit
+# This row passed before the card too: every listed path is under nucleus/v3,
+# so the prefix strip is a no-op (NO-REL-CCP is an equivalent mutant).
+expect_ok "check-core-paths: DR: under diff.relative it lists the CORE file" bash -c "cd '$v3' && GIT_CONFIG_PARAMETERS=\"\$1\" bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-GRB | grep -qxF 'CORE tools/grb.py (tools/)'" _ "$xdr"
+git -C "$r" update-ref -d refs/heads/scratch/dr
+
+# DS submodule ignore: card/v3-DS commits a gitlink at nucleus/v3/tools/ds with
+# an S verdict. The empty directory keeps `git add -A` from staging its removal.
+card DS S standard
+git -C "$r" checkout -q -b card/v3-DS nucleus/v3-scaffold
+git -C "$r" update-index --add --cacheinfo "160000,$(git -C "$r" rev-parse nucleus/v3-scaffold),nucleus/v3/tools/ds"
+git -C "$r" commit -qm "nucleus v3: DS work"; mkdir -p "$v3/tools/ds"
+verdict DS S MERGE standard S
+xds="'diff.ignoresubmodules'='all'"
+ds_hidden() { local d; d=$(GIT_CONFIG_PARAMETERS=$1 git -C "$r" diff --name-only nucleus/v3-scaffold...card/v3-DS); echo "$d"; [ "$d" = nucleus/v3/verdicts/DS.md ]; }
+expect_ok "premise: DS: the gitlink is committed" bash -c "git -C '$r' ls-tree card/v3-DS nucleus/v3/tools/ds | grep -q '^160000 commit '"
+expect_ok "premise: DS (a): under diff.ignoreSubmodules=all plain diff drops the gitlink" ds_hidden "$xds"
+ds_cm() { (cd "$v3" && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge DS nucleus/v3-scaffold card/v3-DS audit); }
+ds_cm_cp() { GIT_CONFIG_PARAMETERS=$xds ds_cm; }
+expect_ok "check_merge: DS (a): under diff.ignoreSubmodules=all the CORE gitlink still needs a P verdict" out_has "nucleus/v3/tools/ds is under CORE_PATHS and needs a P verdict" -- ds_cm_cp
+ds_gs() { GIT_CONFIG_PARAMETERS=$xds gs nucleus/v3-scaffold nucleus/v3/tools/ds -; }
+expect_ok "runner: DS (a): under diff.ignoreSubmodules=all the committed gitlink is still protected" ds_gs
+printf '[submodule "ds"]\n\tpath = nucleus/v3/tools/ds\n\turl = ./x\n\tignore = all\n' >"$r/.gitmodules"
+expect_ok "premise: DS (b): with an untracked .gitmodules ignore=all plain diff drops the gitlink" ds_hidden ""
+expect_ok "check_merge: DS (b): with an untracked .gitmodules ignore=all the gitlink still needs a P verdict" out_has "nucleus/v3/tools/ds is under CORE_PATHS and needs a P verdict" -- ds_cm
+expect_ok "runner: DS (b): with an untracked .gitmodules ignore=all the gitlink is still protected" gs nucleus/v3-scaffold nucleus/v3/tools/ds -
+# DS (c): the verdict commit itself also adds the gitlink; .gitmodules hides it
+# from diff-tree, which merge-card's tip check reads. It is put back after the
+# verdict commit, whose `git add -A` would commit it.
+card DSC S standard
+mv "$r/.gitmodules" "$t/ds.gitmodules"
+git -C "$r" checkout -q -b card/v3-DSC nucleus/v3-scaffold
+echo dsc >"$v3/spikes/dsc.txt"; git -C "$r" add nucleus/v3/spikes/dsc.txt; git -C "$r" commit -qm "nucleus v3: DSC work"
+mkdir -p "$v3/tools/ds"; git -C "$r" update-index --add --cacheinfo "160000,$(git -C "$r" rev-parse nucleus/v3-scaffold),nucleus/v3/tools/ds"
+verdict DSC S MERGE standard S
+mv "$t/ds.gitmodules" "$r/.gitmodules"
+dsc_hidden() { local d; d=$(git -C "$r" diff-tree --no-commit-id --name-only -r card/v3-DSC); echo "$d"; [ "$d" = nucleus/v3/verdicts/DSC.md ] && git -C "$r" ls-tree card/v3-DSC nucleus/v3/tools/ds | grep -q '^160000 '; }
+expect_ok "premise: DS (c): with .gitmodules ignore=all plain diff-tree lists only the verdict" dsc_hidden
+scratch
+expect_ok "merge-card: DS (c): the tip check still names a gitlink the verdict commit adds" out_has "it changes: nucleus/v3/tools/ds nucleus/v3/verdicts/DSC.md" -- mc DSC
+rm -f "$r/.gitmodules"; git -C "$r" checkout -q nucleus/v3-scaffold; rmdir "$v3/tools/ds" 2>/dev/null || true
+git -C "$r" branch -q -D card/v3-DS card/v3-DSC; rm -f "$cards/DS.local.md" "$cards/DSC.local.md"
+
+# SU status.showUntrackedFiles=no: promote-pass's clean check still sees an
+# untracked file. scratch/pass7 is the scaffold tip.
+git -C "$r" checkout -q -B scratch/pass7 nucleus/v3-scaffold
+promote7() { (cd "$v3" && NV3_CARDS="$qa" bash scripts/promote-pass.sh scratch/pass7); }
+xsu="'status.showuntrackedfiles'='no'"
+echo su >"$v3/spikes/su.txt"
+expect_ok "premise: SU: under status.showUntrackedFiles=no plain status lists nothing" bash -c "[ -z \"\$(GIT_CONFIG_PARAMETERS=\"\$1\" git -C '$r' status --porcelain)\" ]" _ "$xsu"
+su_promote() { GIT_CONFIG_PARAMETERS=$xsu promote7; }
+expect_ok "promote: SU: an untracked file under status.showUntrackedFiles=no is not clean" out_has "promote-pass: worktree is not clean" "?? nucleus/v3/spikes/su.txt" -- su_promote
+rm -f "$v3/spikes/su.txt"
+
+# EX excludes: an untracked tools/ex.py hidden from status by each exclude
+# source in turn is still listed, and named by path.
+echo ex >"$v3/tools/ex.py"
+ex_hidden() { local s; s=$(git -C "$r" status --porcelain --untracked-files=all); echo "$s"; ! grep -qF ex.py <<<"$s"; }
+expect_ok "premise: EX: control: plain status lists tools/ex.py" bash -c "git -C '$r' status --porcelain --untracked-files=all | grep -qxF '?? nucleus/v3/tools/ex.py'"
+printf 'ex.py\n' >"$t/ex.ignore"
+xex="'core.excludesfile'='$t/ex.ignore'"
+ex_a() { GIT_CONFIG_PARAMETERS=$xex "$@"; }
+expect_ok "premise: EX (a): a -c core.excludesFile hides it from plain status" ex_a ex_hidden
+expect_ok "runner: EX (a): under a -c core.excludesFile tools/ex.py is still protected" ex_a gs nucleus/v3-scaffold nucleus/v3/tools/ex.py -
+expect_ok "promote: EX (f): under a -c core.excludesFile the worktree is not clean" out_has "promote-pass: worktree is not clean" "!! nucleus/v3/tools/ex.py" -- ex_a promote7
+# EX rework (verdict R3): a check-ignore that fails, with an ignored path to
+# name, never reads as "nothing hidden by a tracked rule": the runner's
+# listing raises (the dirty check's and scope_violations' listing alike), and
+# promote-pass dies.
+wtc_raises() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+try:
+    print("listed:", rc.worktree_changes(pathlib.Path(sys.argv[2])))
+except subprocess.CalledProcessError as e:
+    print("raised:", e.cmd, e.returncode, e.stderr)
+    sys.exit(0 if "check-ignore" in e.cmd and e.returncode == 128 else 1)
+sys.exit(1)
+P
+}
+expect_ok "runner: EX: a failed check-ignore makes worktree_changes raise (the dirty check's listing)" ex_a gshim check-ignore wtc_raises
+ci_gs() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), "nucleus/v3-scaffold", ["nucleus/v3/spikes/"])
+print("\n".join(bad) or "(no violations)")
+sys.exit(0 if any(b.startswith("git check-ignore ") and "gshim refused check-ignore" in b and b.endswith("(cannot list changed files)") for b in bad) else 1)
+P
+}
+expect_ok "runner: EX: scope_violations reports a failed check-ignore, not a listing" ex_a gshim check-ignore ci_gs
+expect_ok "promote: EX: a failed check-ignore dies, never reads as clean" out_has "promote-pass: cannot name the rules hiding ignored paths (git check-ignore exit 128)" -- ex_a gshim check-ignore promote7
+mkdir -p "$t/xdg/git"; printf '*.py\n' >"$t/xdg/git/ignore"
+ex_b() { XDG_CONFIG_HOME=$t/xdg "$@"; }
+expect_ok "premise: EX (b): the XDG default ignore file hides it from plain status" ex_b ex_hidden
+expect_ok "runner: EX (b): under the XDG ignore file tools/ex.py is still protected" ex_b gs nucleus/v3-scaffold nucleus/v3/tools/ex.py -
+mkdir -p "$r/.git/info"; touch "$r/.git/info/exclude"; cp "$r/.git/info/exclude" "$t/exclude.orig"; echo nucleus/v3/tools/ex.py >>"$r/.git/info/exclude"
+expect_ok "premise: EX (c): an info/exclude line hides it from plain status" ex_hidden
+expect_ok "runner: EX (c): under an info/exclude line tools/ex.py is still protected" gs nucleus/v3-scaffold nucleus/v3/tools/ex.py -
+cp "$t/exclude.orig" "$r/.git/info/exclude"
+printf '*\n' >"$v3/tools/.gitignore"
+ex_d_hidden() { local s; s=$(git -C "$r" status --porcelain --untracked-files=all); echo "$s"; ! grep -qF nucleus/v3/tools/ <<<"$s"; }
+expect_ok "premise: EX (d): a self-ignoring untracked tools/.gitignore hides itself and ex.py" ex_d_hidden
+expect_ok "runner: EX (d): under a self-ignoring untracked .gitignore tools/ex.py is still protected" gs nucleus/v3-scaffold nucleus/v3/tools/ex.py -
+expect_ok "runner: EX (d): the self-ignoring untracked .gitignore is protected too" gs nucleus/v3-scaffold nucleus/v3/tools/.gitignore -
+expect_ok "promote: EX (d): under a self-ignoring untracked .gitignore the worktree is not clean" out_has "promote-pass: worktree is not clean" "!! nucleus/v3/tools/.gitignore" "!! nucleus/v3/tools/ex.py" -- promote7
+rm -f "$v3/tools/.gitignore"
+# EX (e) control: a rule in a tracked .gitignore hides a path below it, and the
+# listing trusts it. ex-base commits a top-level .gitignore naming tools/ex.py
+# and nucleus/v3/spikes/.gitignore naming exh.py.
+git -C "$r" checkout -q -b ex-base nucleus/v3-scaffold
+printf 'nucleus/v3/tools/ex.py\n' >"$r/.gitignore"; printf 'exh.py\n' >"$v3/spikes/.gitignore"
+git -C "$r" add .gitignore nucleus/v3/spikes/.gitignore; git -C "$r" commit -qm "ex base: tracked ignore rules"
+expect_ok "premise: EX (e): check-ignore names the tracked top-level .gitignore for tools/ex.py" bash -c "[ \"\$(git -C '$r' check-ignore -v nucleus/v3/tools/ex.py)\" = \$'.gitignore:1:nucleus/v3/tools/ex.py\tnucleus/v3/tools/ex.py' ]"
+# gsa BASE PATH: scope_violations on $r names nothing under PATH.
+gsa() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$@" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), sys.argv[3], ["nucleus/v3/spikes/"])
+print("\n".join(bad) or "(no violations)")
+sys.exit(0 if not any(b.startswith(sys.argv[4]) for b in bad) else 1)
+P
+}
+expect_ok "runner: EX (e): control: a path a tracked .gitignore hides is not listed" gsa ex-base nucleus/v3/tools/ex.py
+# A core.excludesFile naming a tracked .gitignore applies its rules everywhere,
+# not only below its own directory: tools/exh.py is not under spikes/.
+echo exh >"$v3/tools/exh.py"
+xexh="'core.excludesfile'='nucleus/v3/spikes/.gitignore'"
+ex_h() { GIT_CONFIG_PARAMETERS=$xexh "$@"; }
+expect_ok "premise: EX (h): a -c core.excludesFile naming tracked spikes/.gitignore hides tools/exh.py, named as that file" ex_h bash -c "[ \"\$(git -C '$r' check-ignore -v nucleus/v3/tools/exh.py)\" = \$'nucleus/v3/spikes/.gitignore:1:exh.py\tnucleus/v3/tools/exh.py' ] && ! git -C '$r' status --porcelain -uall | grep -qF exh.py"
+expect_ok "runner: EX (h): a tracked .gitignore used as core.excludesFile hides nothing outside its directory" ex_h gs ex-base nucleus/v3/tools/exh.py -
+# promote-pass under (e) alone: the clean check passes (ex-base's commits then
+# fail the audit, so nothing is pushed); under (h) it does not.
+git -C "$r" checkout -q -B scratch/pass7 ex-base; rm -f "$v3/tools/exh.py"
+promote_clean_ok() { local o rc=0; o=$(promote7 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "promote-pass: merge audit failed" <<<"$o" && ! grep -qF "worktree is not clean" <<<"$o"; }
+expect_ok "promote: EX (e): control: a path a tracked .gitignore hides leaves the worktree clean" promote_clean_ok
+echo exh >"$v3/tools/exh.py"
+expect_ok "promote: EX (h): a tracked .gitignore used as core.excludesFile leaves tools/exh.py listed" out_has "promote-pass: worktree is not clean" "!! nucleus/v3/tools/exh.py" -- ex_h promote7
+rm -f "$v3/tools/ex.py" "$v3/tools/exh.py" "$t/ex.ignore" "$t/exclude.orig"; rm -rf "$t/xdg"
+git -C "$r" checkout -q nucleus/v3-scaffold; git -C "$r" branch -q -D scratch/pass7 ex-base
+
+# ST stat trust: an uncommitted, same-size edit of tools/st.py with its mtime
+# put back. The file is dated 10s back and the index rewritten, then the edit
+# waits a second, so the index is not racy and the edit's ctime differs.
+git -C "$r" checkout -q -b st-base nucleus/v3-scaffold
+printf 'print("st")\n' >"$v3/tools/st.py"; git -C "$r" add nucleus/v3/tools/st.py; git -C "$r" commit -qm "st base"
+cp "$v3/tools/st.py" "$t/st.orig"
+touch -m -d "@$(($(date +%s) - 10))" "$v3/tools/st.py"; plain status --porcelain >/dev/null; sleep 1
+touch -r "$v3/tools/st.py" "$t/st.ref"; printf 'print("ST")\n' >"$v3/tools/st.py"; touch -m -r "$t/st.ref" "$v3/tools/st.py"
+st_hidden() { local s; s=$(plain status --porcelain); echo "$s"; [ -z "$s" ]; }
+st_sh() { (cd "$v3" && . scripts/git-env.sh && git status --porcelain | grep -qxF ' M nucleus/v3/tools/st.py'); }
+st_refuse() { (cd "$v3" && bash -c '. scripts/git-env.sh; git_state_refuse'); }
+expect_ok "premise: ST: control: plain status lists the edit" bash -c "git -C '$r' status --porcelain | grep -qxF ' M nucleus/v3/tools/st.py'"
+for st in "core.trustctime false" "core.checkStat minimal"; do
+  k=${st% *} v=${st#* }
+  git -C "$r" config "$k" "$v"
+  expect_ok "premise: ST: under $k=$v in the repository config plain status lists nothing" st_hidden
+  expect_ok "runner: ST: under $k=$v in the repository config the edit is still protected" gs st-base nucleus/v3/tools/st.py -
+  expect_ok "runner: ST: $k=$v in the repository config is named" gs st-base - "$k is '$v' (file:"
+  expect_ok "git-env.sh: ST: under $k=$v in the repository config status lists the edit" st_sh
+  expect_ok "git-env.sh: ST: $k=$v in the repository config is refused" out_has "$k is '$v' (file:" -- st_refuse
+  git -C "$r" config --unset "$k"
+  xst="'${k,,}'='$v'"
+  st_cp() { GIT_CONFIG_PARAMETERS=$xst "$@"; }
+  expect_ok "premise: ST: under a -c $k=$v plain status lists nothing" st_cp st_hidden
+  expect_ok "runner: ST: a -c $k=$v is named, at command-line scope" st_cp gs st-base - "$k is '$v' (command line:)"
+  expect_ok "git-env.sh: ST: a -c $k=$v is refused, at command-line scope" st_cp out_has "$k is '$v' (command line:)" -- st_refuse
+done
+expect_ok "git-env.sh: a failed config --get-all core.trustctime is a problem" gsr core.trustctime "git config --get-all core.trustctime failed (exit 128; cannot check core.trustctime)"
+expect_ok "git-env.sh: a failed config --get-all core.checkStat is a problem" gsr core.checkStat "git config --get-all core.checkStat failed (exit 128; cannot check core.checkStat)"
+expect_ok "runner: a failed config --get-all core.trustctime is a problem" gshim core.trustctime gsp
+expect_ok "runner: a failed config --get-all core.checkStat is a problem" gshim core.checkStat gsp
+
+# SF clean filter: with the edit still in place, info/attributes gives st.py a
+# filter whose clean command prints the committed content. status compares the
+# same-size file only through it, so the edit passes status and diff, under
+# the environment too: the refusal is the layer.
+echo 'nucleus/v3/tools/st.py filter=sf' >"$r/.git/info/attributes"
+xsf="'filter.sf.clean'='cat $t/st.orig'"
+sf_hidden() { local s d; s=$(cd "$v3" && . scripts/git-env.sh && GIT_CONFIG_PARAMETERS=$xsf git status --porcelain); d=$(cd "$v3" && . scripts/git-env.sh && GIT_CONFIG_PARAMETERS=$xsf git diff --name-only HEAD); echo "status: $s"; echo "diff: $d"; [ -z "$s" ] && [ -z "$d" ]; }
+expect_ok "premise: SF: under a -c clean filter, status and diff under git-env.sh list nothing" sf_hidden
+sf_line="filter=sf is on 1 tracked path(s) (first: nucleus/v3/tools/st.py), and filter.sf.clean is 'cat $t/st.orig'"
+sf_refuse() { (cd "$v3" && GIT_CONFIG_PARAMETERS=$xsf bash -c '. scripts/git-env.sh; git_state_refuse --index'); }
+expect_ok "git-env.sh: SF: a -c clean filter on a tracked path is refused, at command-line scope" out_has "$sf_line (command line:)" -- sf_refuse
+sf_gs() { GIT_CONFIG_PARAMETERS=$xsf gs st-base - "$sf_line (command line:)"; }
+expect_ok "runner: SF: a -c clean filter on a tracked path is named, at command-line scope" sf_gs
+git -C "$r" config filter.sf.clean "cat $t/st.orig"
+expect_ok "SF: both refusals name a clean filter in the repository config" both "$sf_line (file:"
+expect_ok "git-env.sh: SF: a failed check-attr is a problem" gsr check-attr "git check-attr filter failed (cannot check for clean filters)"
+expect_ok "runner: SF: a failed check-attr is a problem" gshim check-attr gsp
+expect_ok "git-env.sh: SF: a failed config --get-all filter.sf.clean is a problem" gsr filter.sf.clean "git config --get-all filter.sf.clean failed (exit 128; cannot check the clean filter)"
+# SF rework (verdict R1): a driver named like an attribute state. check-attr
+# prints `set` both for a bare `filter` and for `filter=set`, yet git runs
+# filter.set.clean for the second (likewise unset and unspecified), so no
+# value may be skipped. Premise: hash-object --path applies the attribute's
+# filter, so the edited file hashes to the committed blob under the driver.
+# For unspecified the count covers every unattributed path, so that row
+# matches from ", and" on.
+git -C "$r" config --unset filter.sf.clean
+st_blob=$(git -C "$r" rev-parse st-base:nucleus/v3/tools/st.py)
+for sd in set unset unspecified; do
+  echo "nucleus/v3/tools/st.py filter=$sd" >"$r/.git/info/attributes"
+  xsd="'filter.$sd.clean'='cat $t/st.orig'"
+  sd_hash() { (cd "$v3" && . scripts/git-env.sh && GIT_CONFIG_PARAMETERS=$xsd git -C "$r" hash-object --path=nucleus/v3/tools/st.py nucleus/v3/tools/st.py) | grep -qxF "$st_blob" && ! git -C "$r" hash-object --no-filters nucleus/v3/tools/st.py | grep -qxF "$st_blob"; }
+  expect_ok "premise: SF: git runs filter.$sd.clean for filter=$sd: the edit hashes to the committed blob" sd_hash
+  sd_line=", and filter.$sd.clean is 'cat $t/st.orig' (command line:)"
+  [ "$sd" = unspecified ] || sd_line="filter=$sd is on 1 tracked path(s) (first: nucleus/v3/tools/st.py)$sd_line"
+  sd_both() { GIT_CONFIG_PARAMETERS=$xsd both "$sd_line"; }
+  expect_ok "SF: both refusals name a -c clean filter for a driver named '$sd'" sd_both
+done
+# SF rework (verdict R2): a driver with only filter.<driver>.process set. The
+# refusal reads config only, so the command need not run.
+echo 'nucleus/v3/tools/st.py filter=sf' >"$r/.git/info/attributes"
+xsp="'filter.sf.process'='nv3-no-such-process'"
+expect_ok "premise: SF: under a -c filter.sf.process alone, filter.sf.clean is unset" bash -c "! GIT_CONFIG_PARAMETERS=\"\$1\" git -C '$r' config --get-all filter.sf.clean" _ "$xsp"
+sp_both() { GIT_CONFIG_PARAMETERS=$xsp both "filter=sf is on 1 tracked path(s) (first: nucleus/v3/tools/st.py), and filter.sf.process is 'nv3-no-such-process' (command line:)"; }
+expect_ok "SF: both refusals name a -c process filter with no clean command" sp_both
+git -C "$r" config filter.sf.clean "cat $t/st.orig"
+# Controls: a driver no path uses (a global filter.lfs.* in normal use) and a
+# filter attribute with no driver are not refused. The filtered status wrote
+# the edited file's stat into the index (see RESULT: a residual of this
+# layer), so the file is restored by copy: checkout would take it as clean.
+rm -f "$r/.git/info/attributes"
+cp "$t/st.orig" "$v3/tools/st.py"
+expect_ok "SF: control: a configured driver no tracked path uses is not refused" clean_both st-base
+git -C "$r" config --unset filter.sf.clean; echo 'nucleus/v3/tools/st.py filter=sf' >"$r/.git/info/attributes"
+expect_ok "SF: control: a filter attribute with no driver configured is not refused" clean_both st-base
+rm -f "$r/.git/info/attributes" "$t/st.orig" "$t/st.ref"
+
+# IC core.ignoreCase: on this case-sensitive filesystem, true drops an
+# untracked case variant of a tracked file from every untracked listing. The
+# environment's false beats the config files; a -c beating it is refused.
+printf 'x\n' >"$v3/tools/ST.py"
+ic_hidden() { local s o; s=$(plain status --porcelain --untracked-files=all --ignored=matching); o=$(plain ls-files --others); echo "status: $s"; echo "others: $o"; [ -z "$s" ] && [ -z "$o" ]; }
+expect_ok "premise: IC: control: plain status lists tools/ST.py" bash -c "git -C '$r' status --porcelain -uall | grep -qxF '?? nucleus/v3/tools/ST.py'"
+git -C "$r" config core.ignoreCase true
+expect_ok "premise: IC: under core.ignoreCase=true plain status and ls-files --others list nothing" ic_hidden
+expect_ok "runner: IC: under core.ignoreCase=true in the repository config tools/ST.py is still protected" gs st-base nucleus/v3/tools/ST.py none
+expect_ok "git-env.sh: IC: under core.ignoreCase=true in the repository config status lists tools/ST.py" bash -c "cd '$v3' && . scripts/git-env.sh && git status --porcelain -uall | grep -qxF '?? nucleus/v3/tools/ST.py'"
+git -C "$r" config --unset core.ignoreCase
+xic="'core.ignorecase'='true'"
+ic_cp() { GIT_CONFIG_PARAMETERS=$xic both "core.ignoreCase is 'true' (command line:), over the environment's false"; }
+expect_ok "IC: both refusals name an inherited -c core.ignoreCase=true" ic_cp
+rm -f "$v3/tools/ST.py"
+git -C "$r" checkout -q nucleus/v3-scaffold; git -C "$r" branch -q -D st-base
+expect_ok "git state: none after the output-shaping scenarios" no_state
+expect_ok "git state: none of the cache state after the output-shaping scenarios" no_state2
+expect_ok "git state: none of the output-shaping state after these scenarios" no_state3
+
 # --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
 # The ref store is shared by every worktree, so ref_violations refuses only ref
 # changes it can pin on this run (R1) or that touch a protected ref (R2), and
@@ -1346,6 +1618,8 @@ for a in ${inv[$i]}; do
     # (keys lowercased), for a row on an entry added later.
     gitenv) { git config core.fsmonitor || echo unset; printenv GIT_NO_REPLACE_OBJECTS || echo unset; printenv GIT_GRAFT_FILE || echo unset; } >"$FAKE_OC_N.env"
       git config --list --show-scope | grep '^command' >"$FAKE_OC_N.cfg" || true ;;
+    # An untracked file that a self-ignoring untracked .gitignore hides (Q).
+    hideuntracked) echo hidden >"nucleus/v3/spikes/$id-hidden.txt"; printf '*\n' >nucleus/v3/spikes/.gitignore ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -1572,6 +1846,13 @@ expect_ok "runner e2e: P: an inherited -c core.fsmonitor hook stops the run befo
 # untracked cache off, read from XV's command-scope config dump.
 expect_ok "runner e2e: V: opencode runs with the commit-graph and the untracked cache off" \
   res XV "{'command\tcore.commitgraph=false', 'command\tcore.untrackedcache=false'} <= set(open('$e/XV.n.cfg').read().splitlines())"
+# Q (X-6-F1-F2-F2-F1 EX g): the worker leaves an untracked spikes/ file hidden
+# by a self-ignoring untracked spikes/.gitignore. spikes/ is the card's Touch
+# only, so only the dirty check can stop it. work runs first: under `*`, its
+# `git add nucleus/v3/spikes` would skip the new spikes/XQ.txt and commit nothing.
+e2e XQ "work hideuntracked" --attempts 1
+expect_ok "runner e2e: Q: an untracked file a self-ignoring .gitignore hides fails the dirty check, by name" \
+  res XQ "rc == 1 and not r['pass'] and 'Uncommitted changes (commit the card' in out and '!! nucleus/v3/spikes/XQ-hidden.txt' in out and '!! nucleus/v3/spikes/.gitignore' in out"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
