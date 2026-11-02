@@ -676,6 +676,21 @@ STUB
       NB_STUB_MODE="$m" NB_STUB_DEBUG="${NB_STUB_DEBUG:-0}" \
       bash "$script" "$@" > "$t/last.out" 2>&1
   }
+  # The general window-mode runner (card B-0-F7-F1b-F2-F1): like
+  # st_run, but quiet_wait runs its REAL loop in window mode (card
+  # B-0-F7-F1b-F2 Work 3) with load1 read from the given loadavg file
+  # and the given stub dir first on PATH. Both arrive as arguments
+  # because S6f and S6g — the post-window committed-row re-check rows —
+  # run in S6 with their own stubs (a sleep that plants a committed row
+  # mid-wait, a date that rolls the UTC day over mid-wait), before S7b
+  # sets win_bin/win_loadavg: this sibling must not read those.
+  st_run_win_stubs() { # st_run_win_stubs <root> <mode> <stub bin> <loadavg> <args...>
+    local r=$1 m=$2 stub_bin=$3 stub_loadavg=$4; shift 4
+    NB_HARNESS="$r" NB_BIN="$t/nbench-stub" NB_REPRO_SELFTEST=window \
+      NB_REPRO_SELFTEST_LOADAVG="$stub_loadavg" NB_STUB_MODE="$m" \
+      NB_STUB_DEBUG=0 PATH="$stub_bin:$PATH" \
+      bash "$script" "$@" > "$t/last.out" 2>&1
+  }
   # Like st_run, but for S7b only: quiet_wait's REAL loop in window
   # mode (card B-0-F7-F1b-F2 Work 3) — load1 comes from $win_loadavg,
   # and the Work 3 PATH stubs (sleep instant, pgrep matchless,
@@ -683,10 +698,7 @@ STUB
   # milliseconds and the satisfied line is the real one.
   st_run_win() {
     local r=$1 m=$2; shift 2
-    NB_HARNESS="$r" NB_BIN="$t/nbench-stub" NB_REPRO_SELFTEST=window \
-      NB_REPRO_SELFTEST_LOADAVG="$win_loadavg" NB_STUB_MODE="$m" \
-      NB_STUB_DEBUG=0 PATH="$win_bin:$PATH" \
-      bash "$script" "$@" > "$t/last.out" 2>&1
+    st_run_win_stubs "$r" "$m" "$win_bin" "$win_loadavg" "$@"
   }
   st_rc() { # st_rc <name> <want-rc> <st_run args...>
     local name=$1 want=$2 got
@@ -872,6 +884,107 @@ STUB
   cp "$(dirname "$script")/../../.gitignore" "$r/.gitignore"
   st_ok "the quiet record is git-trackable (the real .gitignore does not ignore it)" \
     test -z "$(git -C "$r" check-ignore -v "results/$D/repro/run-a.quiet.txt" || true)"
+  # S6f (card B-0-F7-F1b-F2-F1): a row for TODAY, planted and committed
+  # from inside the quiet window itself. The window-mode sleep stub's
+  # FIRST call only (a flag file guards it) copies the saved fake row
+  # to results/$D/ and commits it with the selftest identity; every
+  # later call exits at once, so the 13 stubbed samples still satisfy
+  # the window. The pre-window guard passed (the row did not exist
+  # yet), so only the post-window re-check can refuse (mutant
+  # POST-WAIT-CHECK-DELETED, verdict B-0-F7-F1b-F2 own OWN-NO-RECHECK).
+  r=$t/s6f; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  s6f_row="$t/s6f.row.json"
+  printf '{"row":"%s","s6f":"committed fake row planted mid-wait"}\n' "$ROW" > "$s6f_row"
+  s6f_flag="$t/s6f-sleep.flag"
+  s6f_bin="$t/s6f-bin"
+  s6f_loadavg="$t/s6f.loadavg"
+  printf '0.50 0.40 0.30 1/100 1\n' > "$s6f_loadavg"
+  mkdir -p "$s6f_bin"
+  cat > "$s6f_bin/sleep" <<S6FSLEEP
+#!/usr/bin/env bash
+# S6f planting stub (generated above; every path baked in): on the
+# first call only, write and commit today's row from inside the quiet
+# window. Later calls exit at once so the window still satisfies.
+set -u
+if [ ! -e "$s6f_flag" ]; then
+  : > "$s6f_flag"
+  mkdir -p "$r/results/$D"
+  cp "$s6f_row" "$r/results/$D/$ROW.json"
+  git -C "$r" add "results/$D/$ROW.json"
+  git -C "$r" -c user.name=selftest -c user.email=selftest@invalid -c commit.gpgsign=false commit -q -m "selftest fake row (S6f: planted mid-wait)"
+fi
+exit 0
+S6FSLEEP
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$s6f_bin/pgrep"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$s6f_bin/systemctl"
+  chmod +x "$s6f_bin/sleep" "$s6f_bin/pgrep" "$s6f_bin/systemctl"
+  st_rc "a refuses the row committed mid-wait (post-window re-check)" 4 \
+    st_run_win_stubs "$r" success "$s6f_bin" "$s6f_loadavg" a
+  st_ok "no repro dir was created (the post-window guard fires before mkdir -p)" \
+    test ! -e "$r/results/$D/repro"
+  st_ok "the refusal says committed" grep -q "is committed (git-tracked)" "$t/last.out"
+  st_ok "the planted row is byte-identical to the saved copy (no run started)" \
+    cmp -s "$r/results/$D/$ROW.json" "$s6f_row"
+  # S6g (card B-0-F7-F1b-F2-F1): the wait rolls onto a date whose row
+  # is already committed. Tomorrow's row ($D2) is committed BEFORE the
+  # run; a date PATH stub reports $D2 for the EXACT argument list
+  # '-u +%F', but only once the sleep stub's flag says the window has
+  # started — every other call execs the real date (resolved by this
+  # selftest, before any PATH override), so the deadline's +%s, the
+  # satisfied line's +%FT%TZ and this selftest's own calls stay real.
+  # The pre-window guard and the REPRO path still see the real $D, so
+  # only a post-window re-check that asks the date afresh can refuse
+  # (mutants POST-WAIT-REUSES-PRE-DATE, verdict B-0-F7-F1b-F2 own
+  # OWN-RECHECK-STALE-DATE, and POST-WAIT-CHECK-DELETED). The rollover
+  # is the stub's, never the host clock's.
+  r=$t/s6g; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  git -C "$r" init -q
+  D2=$(date -u -d '+1 day' +%F)
+  s6_commit_row "$r" "$D2"
+  s6g_row="$t/s6g.row.json"
+  cp "$r/results/$D2/$ROW.json" "$s6g_row"
+  s6g_flag="$t/s6g-sleep.flag"
+  s6g_bin="$t/s6g-bin"
+  s6g_loadavg="$t/s6g.loadavg"
+  s6g_real_date=$(command -v date)
+  printf '0.50 0.40 0.30 1/100 1\n' > "$s6g_loadavg"
+  mkdir -p "$s6g_bin"
+  cat > "$s6g_bin/sleep" <<S6GSLEEP
+#!/usr/bin/env bash
+# S6g flag stub (generated above): the first call only creates the
+# flag that means "the quiet window has started" — the date stub rolls
+# over only once it exists. Later calls exit at once.
+set -u
+if [ ! -e "$s6g_flag" ]; then
+  : > "$s6g_flag"
+fi
+exit 0
+S6GSLEEP
+  cat > "$s6g_bin/date" <<S6GDATE
+#!/usr/bin/env bash
+# S6g rollover stub (generated above): once the window has started
+# (the flag exists), an exact '-u +%F' call reports the rolled-to
+# date; every other call, and every call before the flag, execs the
+# real date.
+set -u
+if [ "\$#" -eq 2 ] && [ "\$1" = "-u" ] && [ "\$2" = "+%F" ] && [ -e "$s6g_flag" ]; then
+  printf '%s\n' "$D2"
+  exit 0
+fi
+exec "$s6g_real_date" "\$@"
+S6GDATE
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$s6g_bin/pgrep"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$s6g_bin/systemctl"
+  chmod +x "$s6g_bin/sleep" "$s6g_bin/date" "$s6g_bin/pgrep" "$s6g_bin/systemctl"
+  st_rc "a refuses when the wait rolled onto a committed date" 4 \
+    st_run_win_stubs "$r" success "$s6g_bin" "$s6g_loadavg" a
+  st_ok "the refusal names the rolled date's committed row" \
+    grep -q "results/$D2/$ROW.json is committed" "$t/last.out"
+  st_ok "no repro dir was created at the pre-rollover date" \
+    test ! -e "$r/results/$D/repro"
+  st_ok "the committed row at the rolled-to date is byte-identical to the saved copy" \
+    cmp -s "$r/results/$D2/$ROW.json" "$s6g_row"
 
   echo "S7: the line the quiet window ended on is recorded in repro/run-<x>.quiet.txt (B-0-F7-F1b finding 2)"
   # S7a: bypass mode — each run's quiet file holds exactly the one
