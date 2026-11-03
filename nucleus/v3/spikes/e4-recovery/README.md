@@ -4164,6 +4164,9 @@ and the lock only), start/end, load, exit, the JSON's sha256, and the
 verify head and exit; on a retried attempt the last write wins, at the
 then-current tip. The five known quota misses (Q4, Q7, Q11, Q12,
 SIZING) are expected and waived by `--no-quotas` — they are X-5c-F4's.
+X-5c-F3-F3a's own verify (at 4cefcb43) adds a sixth, Q8 (acked SyncOff
+commits lost, 80/100 — the store this card built acks fewer SyncOff
+losses): also waived by `--no-quotas`, also F4's to weigh.
 X-5c-F3's step 0 commits `$O.campaign.json` after the provenance
 checks (the X5-R25 pattern). Single-seed diagnostics stay allowed
 inside attempts: `E4_MPE_DIAG=1 cargo run -q --release -p e4-recovery
