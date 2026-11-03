@@ -26,7 +26,7 @@ import { compression } from "./compression.js";
 import { Hono, type Context } from "hono";
 import { h } from "preact";
 import { renderToString } from "preact-render-to-string";
-import { discoverRoutes } from "../core/manifest.js";
+import { loadRouteTable } from "../core/route-table.js";
 import { runMiddlewareChain } from "../core/middleware.js";
 import { findGlobalMiddlewareFile, loadGlobalMiddleware } from "../core/global-middleware.js";
 import { findServerEntryFile, loadServerEntry } from "../core/server-entry.js";
@@ -71,8 +71,6 @@ import {
 } from "./openapi.js";
 import { assertRenderedFragment, decodeChunkStart } from "../core/fragment-guard.js";
 import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
-import { neutronPlugin } from "../vite/plugin.js";
-import { neutronPublicEnvPlugin } from "../vite/public-env.js";
 import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
@@ -182,6 +180,7 @@ export {
   generateServerBundleEntry,
   type ServerBundleManifest,
 } from "./server-bundle.js";
+export { ROUTE_TABLE_FILE, writeRouteTable } from "../core/route-table.js";
 export {
   onShutdownSignal,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -618,7 +617,12 @@ export async function createServer(
   if (cache?.app) assertAtomicCacheStore(cache.app);
   if (cache?.loader) assertAtomicCacheStore(cache.loader);
 
-  const routes = isSsr ? discoverRoutes({ routesDir: resolvedRoutesDir }) : [];
+  // A build's route table spares the boot from parsing every route source
+  // (and from loading the parser); without a current one, discover as dev does.
+  const routes = isSsr
+    ? loadRouteTable(resolvedRootDir, resolvedRoutesDir, resolvedDistDir) ??
+      (await import("../core/manifest.js")).discoverRoutes({ routesDir: resolvedRoutesDir })
+    : [];
   // The "use server" exports the build registered (client code reached them).
   const serverActions = isSsr ? loadServerActionsManifest(resolvedDistDir) : null;
   const serverActionFiles = serverActions
@@ -2589,6 +2593,12 @@ async function createSsrServer(
 ): Promise<SsrServer> {
   try {
     const vite = await import("vite");
+    // Dev/build-only modules: a server running from a server bundle never
+    // reaches this function, so it never loads them.
+    const [{ neutronPlugin }, { neutronPublicEnvPlugin }] = await Promise.all([
+      import("../vite/plugin.js"),
+      import("../vite/public-env.js"),
+    ]);
     const loadedConfig = await vite.loadConfigFromFile(
       { command: "serve", mode: "production" },
       undefined,

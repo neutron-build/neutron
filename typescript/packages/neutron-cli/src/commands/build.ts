@@ -87,6 +87,7 @@ import {
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
+  writeRouteTable,
 } from "@neutron-build/core/server";
 
 export async function build(): Promise<void> {
@@ -1163,6 +1164,10 @@ export async function build(): Promise<void> {
     oxc: oxcJsx,
     serverActions,
   });
+
+  // The production server boots from this table instead of parsing every
+  // route source; it falls back to discovery once src/routes changes.
+  writeRouteTable(cwd, routesDir, outputDir, routes);
 
   // The production server (`neutron-ts start`, the node and docker
   // presets) sends these siblings instead of compressing every request.

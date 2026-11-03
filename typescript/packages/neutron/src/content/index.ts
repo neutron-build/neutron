@@ -3,8 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { evaluate } from "@mdx-js/mdx";
-import matter from "gray-matter";
+import { createRequire } from "node:module";
 import { Marked } from "marked";
 import type { NeutronMarkdownConfig } from "../config.js";
 import { markedShikiExtension } from "./syntax-highlight.js";
@@ -21,6 +20,15 @@ import { renderToString } from "preact-render-to-string";
 import { z } from "zod";
 
 export { z };
+
+// gray-matter and @mdx-js/mdx (with js-yaml, micromark, acorn behind them)
+// load on first use: core's entry is imported by every server, and most
+// never read a content collection.
+let grayMatter: typeof import("gray-matter") | undefined;
+function frontmatter(raw: string) {
+  grayMatter ??= createRequire(import.meta.url)("gray-matter") as typeof import("gray-matter");
+  return grayMatter(raw);
+}
 
 // SECURITY: Validate against prototype pollution
 function hasPrototypePollution(obj: any, visited = new WeakSet()): boolean {
@@ -692,7 +700,7 @@ async function readCollectionEntries(
     // HTML passthrough — no compilation, just frontmatter extraction
     if (ext === ".html" || ext === ".htm") {
       try {
-        const parsed = matter(raw);
+        const parsed = frontmatter(raw);
         const data = definition.schema.parse(parsed.data);
         entries.push(createEntry({
           id,
@@ -717,7 +725,7 @@ async function readCollectionEntries(
     }
 
     try {
-      const parsed = matter(raw);
+      const parsed = frontmatter(raw);
       const data = definition.schema.parse(parsed.data);
       const sourceType = ext === ".mdx" ? "mdx" : "markdown";
 
@@ -1043,6 +1051,7 @@ async function compileMdx(
       rehypeHeadingIds,
       ...(markdownConfig?.rehypePlugins ?? []),
     ];
+    const { evaluate } = await import("@mdx-js/mdx");
     evaluated = (await evaluate(source, mdxOptions as any)) as { default?: preact.FunctionComponent<any> };
   } catch (error) {
     const location =
