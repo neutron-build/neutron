@@ -1973,6 +1973,108 @@ record and G2 zeroed it.
      Still a real derivation-vs-observation divergence, which is P's
      to rule on: **ESCALATE (the derivation, unchanged).**
 
+**Step 2 — SegmentEnd advances the valid end (§12.5 as written; commit
+001d3b7f).** `ckpt::recover`'s walk now sets `valid_end = seg + WAL_SEG`
+when it accepts a `SegmentEnd` ("after `SegmentEnd`, the reader moves on
+to the next segment's first LSN … The stopping point is the valid end"),
+so a missing next segment leaves the valid end **after** the SegmentEnd
+(`truncate_wal` then starts at the missing segment and zeroes nothing in
+this one) and an invalid first record in the next segment leaves it at
+that segment's first LSN. The draft never advanced `valid_end` over the
+filler, so G2's truncation zeroed the very SegmentEnd the reader had
+just accepted — seed 6149 r1's nested crash dropped the zeros before
+their sync and life 2 re-accepted the surviving SegmentEnd, tainted
+against the dropped zeros (an MW served corruption). The pending spec
+home is S-1-F3 (P's card; this implements §12.5's text as written).
+
+- **The pin** `segend_valid_end_survives_a_missing_next_segment`
+  (tests/store.rs; a literal config: segment 0 holds one durable Commit
+  + one durable SegmentEnd at [45, 90), segment 1 does not exist; a
+  nested recovery crash swept over k=1..=120, each with F-CRASH
+  resolved at keep-latest 0 and a life-2 retry, exactly the harness's
+  nested arm): asserts no served range in any life, the SegmentEnd's
+  bytes durable and byte-equal, and `wal.append` = segment 1's first
+  LSN. Under the fix `truncate_wal` issues no write at all (its first
+  probe is the missing segment). **Mutant M-SEGa** (the `valid_end`
+  advance removed): the pin fails at k=1 with the SegmentEnd's bytes
+  zeroed (and at every k: the zeroing truncation either lands durably
+  or is cut between its write and its sync and life 2 then serves the
+  tainted SegmentEnd — 6149's exact mechanism) — applied, shown
+  failing, reverted clean.
+- **Movement:** seed 6149 r1's served corruption is **gone**
+  (`served=false`); its new outcome is **MW-ORPHAN's exact shape**
+  (`O-1(c) at c=2, tree 2: raw entry above the cut (max ts 4)` +
+  `O-3(d)`), which is S-1-F3's and not judged here, exactly as the card
+  predicted.
+
+**Step 3 — the gate's uncaught mutants: G-2 pinned; G-1 and G-1b
+demonstrated equivalent (G-1 ESCALATED).**
+
+- **G-2 (the gate's exact patch, `if !inside_op {` at
+  `fetch_page:poison`) — pinned.** The pin
+  `g8_read_never_poisons_gated_op_does` (tests/store.rs; a literal
+  config: two single-leaf trees checkpointed, tree 2's leaf slot
+  corrupted on the durable disk so every read of it fails §3.3 against
+  the image's reference CRC): (i) a client read (`tree_scan`,
+  `inside_op=false`) gets XX001, the store stays usable and a mutation
+  of the untouched tree succeeds; (ii) a gated op (`tree_insert` into
+  tree 2: apply, `inside_op=true`) gets XX001 **and poisons** — the
+  next mutation, of the untouched tree, returns `Fail::Poisoned`.
+  G-2 fails (i) ("a client read must never poison the store" — the scan
+  poisons); **M-G8a** (the poison mark removed) fails (ii) and the
+  existing `g8_poison_ends_the_workload_instead_of_livelocking`
+  (987 r1 livelocks at `h:ckpt`) — both applied, shown failing,
+  reverted clean.
+- **G-1 (the gate's exact patch, `Err(_) => break 'outer` at the replay
+  walk's segment probe) — an equivalent mutant; ESCALATED to P.** The
+  card's pin `replay_walk_probe_never_swallows_a_recovery_crash` exists
+  (tests/store.rs; a literal two-segment config: segment 0 filled
+  ts=1..4 and ended by a `SegmentEnd` filler, segment 1 holding the
+  durable, acked ts=5; a nested crash swept over k=1..=120): every fired
+  point must propagate as `Err(Sim(Crashed))` and the retry (F-CRASH at
+  keep-latest 0, a fresh recovery) must recover the acked commit
+  (`frontier == 5`); an unfired point finishes clean with the same
+  frontier. **The pin passes on the mutant too** — demonstrated with
+  the exact patch applied: the full suite (all 9 test binaries,
+  including this pin's 120-point sweep) is green, and targeted runs
+  (seeds 2 — two nested-crash rounds — 7 and 21) are byte-identical to
+  the fixed code. Why it is equivalent: after the swallowed `break`,
+  the very next env call — pass 2's page fetch for any replayed op
+  above `T`, or `truncate_wal`'s first `exists` probe when no record
+  applies (it always runs, and its first probe is an env yield) —
+  re-raises `Err(SimFail::Crashed)` with the same error type, so the
+  nested-crash retry arm fires identically; and the disk cannot differ,
+  because every env write after the crash fails before executing. A
+  pin that catches G-1 needs a `recover` that can make no env call
+  after the walk's probe — impossible as the code stands. **The gate's
+  demand for a catching pin is therefore ESCALATED with this
+  demonstration** (the pin itself stays: it catches any swallow that
+  yields `Ok` or a different error, and pins the propagation + recovery
+  behavior).
+- **G-1b (the same swallow in `truncate_wal`'s probe, `Err(_) => break`)
+  — an equivalent mutant, per the card's own clause.** Demonstrated the
+  same way (the exact patch applied: full suite green, seed 2 targeted
+  run identical — that run also carried G-1's patch, both swallows at
+  once, and still nothing moved). Why: the swallow skips the zeroing of
+  later segments, but the world is crashed — the very next statement is
+  `cx.env().sync_dir(WAL_DIR)`, whose yield re-raises the crash, and no
+  env write between them can execute. Left as an equivalent mutant with
+  this demonstration, exactly as the card's G-1b clause prescribes.
+- **A §12.2/§12.5 silence found while building G-1's fixture
+  (ESCALATED, not fixed):** §12.2's enqueuer explicitly allows a record
+  that ends **exactly at the segment boundary** (`room − probe == 0`),
+  which leaves no room for the §12.5 hop filler — and `ckpt::recover`'s
+  walk then exits its inner loop at `off == WAL_SEG` and stops: every
+  record in the next segment is unreachable, whatever its durability
+  (an acked-commit-lost shape). The first form of this card's G-1
+  fixture hit it (4 × REC_MAX = WAL_SEG exactly; the retry recovered
+  `frontier == 4`, never ts=5 in segment 1). It is unreachable in
+  practice through the campaign's workload draws (record sizes are
+  value-sized; landing a byte-exact 64-KiB boundary sum is
+  astronomically unlikely), but the writer/reader disagreement is real
+  and is P's to rule on (S-1-F3's natural home). **No fix was made:
+  a spec silence is never a local design choice.**
+
 
 
 Final lines, verbatim:
