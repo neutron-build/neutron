@@ -23,8 +23,8 @@ export interface ImageProps
   height?: number;
   /**
    * Width ladder override. Defaults to `images.widths`. With the default
-   * loader every entry must also be in `images.widths`: the endpoint rejects
-   * any other width.
+   * loader, an entry not in `images.widths` is served at the next ladder
+   * width up.
    */
   widths?: number[];
   sizes?: string;

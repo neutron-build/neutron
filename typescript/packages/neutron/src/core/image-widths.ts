@@ -1,7 +1,8 @@
 /**
  * The one width ladder shared by `<Image>`/`<Picture>` (which widths they
  * emit) and `/_neutron/image` (which widths it will resize to). The endpoint
- * rejects any other width, so arbitrary `w` values cannot fill the image cache.
+ * serves any other width at the next ladder width up, so arbitrary `w` values
+ * cannot fill the image cache.
  */
 
 /** Default `images.widths`: small fixed-size widths, then device widths. */

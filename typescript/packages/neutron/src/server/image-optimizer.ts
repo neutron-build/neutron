@@ -225,10 +225,14 @@ function parseWidth(
   if (!/^\d+$/.test(wParam)) {
     return { error: "Width must be a decimal integer", status: 400 };
   }
-  const width = Number(wParam);
-  if (!allowedWidths.includes(width)) {
+  // An off-ladder width is served at the next ladder width up rather than
+  // rejected: URLs in already-cached HTML and custom `widths` props keep
+  // working, and only ladder widths are ever generated or cached.
+  const requested = Number(wParam);
+  const width = allowedWidths.find((allowed) => allowed >= requested);
+  if (requested < 1 || width === undefined) {
     return {
-      error: `Width must be one of images.widths: ${allowedWidths.join(", ")}`,
+      error: `Width must be between 1 and ${allowedWidths[allowedWidths.length - 1]} (images.widths)`,
       status: 400,
     };
   }

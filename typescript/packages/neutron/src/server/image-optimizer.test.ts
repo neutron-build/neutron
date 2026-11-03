@@ -115,10 +115,13 @@ describe("validateImageParams", () => {
     });
   });
 
-  it("rejects width below minimum", () => {
-    const params = new URLSearchParams("src=/img.png&w=8");
-    const result = validateImageParams(params);
-    expect("error" in result).toBe(true);
+  it("rejects a zero width", () => {
+    const result = validateImageParams(new URLSearchParams("src=/img.png&w=0"));
+    expect(result).toMatchObject({ status: 400 });
+  });
+
+  it("serves a width below the ladder at the smallest ladder width", () => {
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=8"))).toMatchObject({ width: 16 });
   });
 
   it("rejects width above maximum", () => {
@@ -127,17 +130,18 @@ describe("validateImageParams", () => {
     expect("error" in result).toBe(true);
   });
 
-  it("rejects a width inside the old range that is not on the ladder", () => {
-    const result = validateImageParams(new URLSearchParams("src=/img.png&w=500"));
-    expect(result).toMatchObject({ status: 400 });
-    expect((result as { error: string }).error).toContain("images.widths");
+  it("serves an off-ladder width at the next ladder width up", () => {
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=500"))).toMatchObject({ width: 640 });
   });
 
-  it("accepts every width the components can emit by default, and nothing else nearby", () => {
-    for (const width of DEFAULT_IMAGE_WIDTHS) {
-      const result = validateImageParams(new URLSearchParams(`src=/img.png&w=${width}`));
-      expect(result).toMatchObject({ width });
-      expect("error" in validateImageParams(new URLSearchParams(`src=/img.png&w=${width + 1}`))).toBe(true);
+  it("only ever resolves to ladder widths", () => {
+    for (let i = 0; i < DEFAULT_IMAGE_WIDTHS.length; i++) {
+      const width = DEFAULT_IMAGE_WIDTHS[i];
+      expect(validateImageParams(new URLSearchParams(`src=/img.png&w=${width}`))).toMatchObject({ width });
+      const next = DEFAULT_IMAGE_WIDTHS[i + 1];
+      const above = validateImageParams(new URLSearchParams(`src=/img.png&w=${width + 1}`));
+      if (next === undefined) expect("error" in above).toBe(true);
+      else expect(above).toMatchObject({ width: next });
     }
   });
 
@@ -146,14 +150,15 @@ describe("validateImageParams", () => {
     expect(validateImageParams(new URLSearchParams("src=/img.png&w=960"), [], configured)).toMatchObject({
       width: 960,
     });
-    expect("error" in validateImageParams(new URLSearchParams("src=/img.png&w=384"), [], configured)).toBe(true);
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=384"), [], configured)).toMatchObject({ width: 640 });
+    expect("error" in validateImageParams(new URLSearchParams("src=/img.png&w=1601"), [], configured)).toBe(true);
   });
 
   it("applies the ladder to remote images too", () => {
     const params = new URLSearchParams(
       "src=" + encodeURIComponent("https://cdn.example.com/photo.jpg") + "&w=500"
     );
-    expect("error" in validateImageParams(params, [{ hostname: "cdn.example.com" }])).toBe(true);
+    expect(validateImageParams(params, [{ hostname: "cdn.example.com" }])).toMatchObject({ width: 640 });
   });
 
   it("rejects invalid format", () => {

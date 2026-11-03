@@ -13,7 +13,7 @@ const FORMAT_MIME: Record<string, string> = {
 export interface PictureProps {
   src: string;
   alt: string;
-  /** Width ladder override; entries must be in `images.widths` (see `ImageProps.widths`). */
+  /** Width ladder override; see `ImageProps.widths`. */
   widths?: number[];
   formats?: string[];
   sizes?: string;
