@@ -2414,6 +2414,14 @@ record).
   derivation defect, it would explain the two `frontier < lo` rounds
   (20 r2, 115 r1) directly.**
 
+**RESULT 5 — the Acceptance 10k:** not this card's to report; **see
+X-5c-F4 step 0** (this stage's Acceptance file
+`X-5c-F3-F1.acc.campaign.json` — `E4 SEEDS=10000 O1_FAIL=2617
+O2_FAIL=54 O3_FAIL=542 DEADLOCK=0 PANIC=0 O1F_FAIL=2627 MONITOR=0` /
+`E4 FOLD FAILING_SEEDS=901 FAILING_ROUNDS=860 TWIN_FAILING_ROUNDS=68
+DEFECT_SEEDS=0`, sha256 `f3a1e605…a1af17`, prov `commit=a96620bd` — is
+F4's triage input, per the card's Goal and Notes).
+
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
