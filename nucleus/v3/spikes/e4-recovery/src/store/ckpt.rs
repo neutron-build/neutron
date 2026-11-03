@@ -1342,6 +1342,27 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     // Accept the record the reader yields (card 1.4).
                     cx.env().accepted(fid, off, len).map_err(Fail::Sim)?;
                     if rec.kind == K_SEGEND {
+                        // §12.5 as written (X-5c-F3-F1 step 2): "after
+                        // `SegmentEnd`, the reader moves on to the next
+                        // segment's first LSN … The stopping point is
+                        // the valid end" — accepting the filler moves
+                        // the valid end past it. So a missing next
+                        // segment leaves the valid end **after** the
+                        // SegmentEnd (G2's truncation then starts at
+                        // the missing segment and zeroes nothing in
+                        // this one), and an invalid first record in the
+                        // next segment leaves it at that segment's
+                        // first LSN. The draft never advanced
+                        // `valid_end` over the filler, so `truncate_wal`
+                        // zeroed the very SegmentEnd the reader had
+                        // just accepted (seed 6149 r1: a nested crash
+                        // dropped the zeros before their sync, and
+                        // life 2 re-accepted the surviving SegmentEnd,
+                        // tainted against the dropped zeros — an MW
+                        // served corruption). The pending spec home is
+                        // S-1-F3 (P's card; this implements §12.5's
+                        // text as already written).
+                        valid_end = seg + WAL_SEG;
                         lsn = seg + WAL_SEG;
                         continue 'outer;
                     }
