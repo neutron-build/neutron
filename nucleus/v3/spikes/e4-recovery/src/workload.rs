@@ -695,6 +695,10 @@ pub struct RoundRec {
     /// X5-R6: this round is an R6 round (class MP/MW, recovery `Ok`,
     /// at least one XX001).
     pub r6_round: bool,
+    /// **X5-R32 (b):** the damaged-referenced arm fired (the verdict's
+    /// `r32` — a diagnostic the pass fold never reads; from this card's
+    /// Acceptance file on, every `r32 = true` round must be class MP).
+    pub r32_round: bool,
     /// X-5c: script ops that unwound on a client-visible XX001.
     pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
@@ -834,7 +838,7 @@ impl SeedRec {
         );
         for r in &self.rounds {
             s.push_str(&format!(
-                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.crash,
                 r.fired,
                 r.nested,
@@ -855,6 +859,7 @@ impl SeedRec {
                 r.r_len,
                 r.o1_detected_loss,
                 r.r6_round,
+                r.r32_round,
                 r.client_xx001,
                 r.pass,
                 r.deadlock,
@@ -1581,6 +1586,7 @@ fn round_rec(
     rr.acked_lost_syncoff = out.acked_lost.iter().filter(|(_, so)| *so).count() as u64;
     rr.o1_detected_loss = out.o1_detected_loss;
     rr.r6_round = out.r6_round;
+    rr.r32_round = out.r32_round;
     rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();

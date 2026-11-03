@@ -1544,6 +1544,10 @@ pub struct RoundOutcome {
     /// X5-R6: this round is an R6 round (class MP/MW, recovery `Ok`,
     /// at least one XX001).
     pub r6_round: bool,
+    /// **X5-R32 (b):** the damaged-referenced arm fired (the verdict's
+    /// `r32`, a diagnostic the pass fold never reads; from F3-F1's
+    /// Acceptance file on, every `r32 = true` round must be class MP).
+    pub r32_round: bool,
     /// Recycle renames the F-CRASH directory draw dropped (Q12): rename
     /// events whose from-name still resolves after the crash.
     pub renames_dropped: u64,
@@ -1611,6 +1615,7 @@ impl Default for RoundOutcome {
             client_xx001: 0,
             o1_detected_loss: 0,
             r6_round: false,
+            r32_round: false,
             renames_dropped: 0,
             digest: 0,
             r5_anchor0_defect: false,
@@ -2091,11 +2096,16 @@ pub fn run_round(
         disk.new_round();
     }
     let round_media: Vec<MediaFault> = disk.media.get(media_base..).unwrap_or(&[]).to_vec();
-    let media_targets = if round_media.is_empty() {
+    let pf0 = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
+    // X5-R32 (a) 1: the prior rounds' applied page faults fold into the
+    // target set beside this round's own (`disk.media[..media_base]` —
+    // the disk's own applied-fault list, which the real chain's disk
+    // carries from round to round).
+    let media_targets = if round_media.is_empty() && disk.media.is_empty() {
         FaultTargets::default()
     } else {
-        let pf0 = disk.stat(crate::sim::PAGE_FILE).unwrap_or(0);
         FaultTargets::collect(&round_media, pf0)
+            .with_prior(disk.media.get(..media_base).unwrap_or(&[]), pf0)
     };
     // Q12 (card Work 5.6): recycle renames the F-CRASH directory draw
     // dropped — the workload's rename events (the event stream ends at
@@ -2522,6 +2532,11 @@ pub fn run_round(
                 meta_rollback,
                 rollback_slots: rollback_slots.clone(),
                 kept_slots: kept_slots.clone(),
+                // X5-R32 (a) 2: the real round's own recovery reads and
+                // the page-file inode, set before the verdict's
+                // `check_round` (never the twin's).
+                recovery_reads: recovery_reads.clone(),
+                page_file: pf,
                 ..Default::default()
             };
             // The published set (a catalog scan at the frontier, 2.3).
@@ -2740,6 +2755,8 @@ pub fn run_round(
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
             outcome.served = ex.served;
+            // X5-R32 (b): the damaged-referenced arm's diagnostic.
+            outcome.r32_round = verdict.r32;
             // X5-R28 (a) / X5-R30 (a): the kept sets and served_k ride
             // the outcome (the record's and the diagnostic's inputs;
             // the oracle reads them from `Extracted`, wired in the
@@ -2810,6 +2827,11 @@ pub fn run_round(
                 meta_rollback,
                 rollback_slots: rollback_slots.clone(),
                 kept_slots: kept_slots.clone(),
+                // X5-R32 (a) 2: the failed recovery's own reads (the
+                // life whose result the round judges), set before the
+                // verdict's `check_round`.
+                recovery_reads: recovery_reads.clone(),
+                page_file: pf,
                 ..Default::default()
             };
             // X5-R11 (b): the failed-recovery path records the (i) sites
@@ -2856,6 +2878,8 @@ pub fn run_round(
             outcome.o2_fail = verdict.o2_fail.clone();
             outcome.o3_fail = verdict.o3_fail.clone();
             outcome.served = ex.served;
+            // X5-R32 (b): the damaged-referenced arm's diagnostic.
+            outcome.r32_round = verdict.r32;
             // X5-R28 (a) / X5-R30 (a): the (i) kept set and served_k
             // (amcheck (ii) never ran; K_ii stays empty).
             outcome.served_k = served_k_flag;

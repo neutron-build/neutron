@@ -180,6 +180,8 @@ fn ex_for(_synth: &Synth, c: u64, model: &Model) -> Extracted {
         image_slots_ii: BTreeSet::new(),
         tainted_image_slots_ii: BTreeSet::new(),
         kept_slots_ii: BTreeSet::new(),
+        recovery_reads: Vec::new(),
+        page_file: 0,
     }
 }
 
@@ -1183,6 +1185,197 @@ fn mw_misdirected_landing_range_is_a_fault_target() {
     );
 }
 
+// ---- X5-R32 (nv3-X-5c-F3-F2, 2026-11-01): the damaged-referenced arm ----
+
+/// **X5-R32's literal world** (all six cases built on it; class MP
+/// round 1): the round's only fault is on slot 50 — the twin neither
+/// read nor references it, so the twin rule's `any_fault ∧
+/// all_uncovered` holds; `prior_page_slots = {6}` (a prior round's
+/// applied fault on the disk), slot 6 is referenced and tainted,
+/// amcheck (i) reports it, the XX001 sites are `[Open, AmcheckI]`, and
+/// the real recovery's own reads hold the page file's slot-6 read.
+fn r32_world() -> (Model, Synth, Extracted, FaultTargets, TwinInfo) {
+    let m = base_model();
+    let s = state_at(&m, 10);
+    let mut ex = ex_for(&s, 10, &m);
+    // The real recovery failed at `Open` on the inherited damage (the
+    // round is a detection round, never a served one).
+    ex.ok = false;
+    ex.frontier = 0;
+    ex.xx001 = vec![XxSite::Open, XxSite::AmcheckI];
+    ex.amcheck_i_ran = true;
+    ex.image_slots.insert(6u64);
+    ex.tainted_image_slots.insert(6u64);
+    ex.amcheck_i = vec![Finding {
+        slot: Some(6),
+        what: "crc mismatch".to_owned(),
+    }];
+    ex.page_file = 0;
+    ex.recovery_reads = vec![(0usize, 6u64 * 4096, 4096u64)];
+    // The round's own fault: slot 50 — the twin neither read nor
+    // references it (the twin rule fires).
+    let fault = MediaFault {
+        inode: 0,
+        off: 50 * 4096,
+        len: 4096,
+        bytes: vec![1u8; 4096],
+        pre: vec![0u8; 4096],
+        kind: MediaKind::Lost,
+    };
+    // A prior round's applied fault on slot 6 (the disk's carried
+    // applied-fault list).
+    let prior = MediaFault {
+        inode: 0,
+        off: 6 * 4096,
+        len: 4096,
+        bytes: vec![1u8; 4096],
+        pre: vec![0u8; 4096],
+        kind: MediaKind::Lost,
+    };
+    let faults = FaultTargets::collect(&[fault], 0).with_prior(&[prior], 0);
+    assert_eq!(faults.prior_page_slots, BTreeSet::from([6u64]));
+    let twin = TwinInfo {
+        page_file: 0,
+        recovery_reads: vec![],
+        image_slots: BTreeSet::new(),
+    };
+    (m, s, ex, faults, twin)
+}
+
+/// Must pass (mp8, X5-R32): every XX001 site is explained by the
+/// damaged, referenced, recovery-read slot 6 from the fault history —
+/// the twin's sets are a failed stand-in for the real round's, and
+/// O-3 (c) does not fail (`r32 = true`, a diagnostic).
+#[test]
+fn mp8_damaged_referenced_detection_passes() {
+    let (m, mut s, ex, faults, twin) = r32_world();
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        v.pass,
+        "a detection explained by damaged referenced slots must pass: {:?}",
+        v
+    );
+    assert!(v.r32, "the damaged-referenced arm must record r32 = true");
+    assert!(
+        v.o3_fail.is_none(),
+        "O-3 (c) must not fail: {:?}",
+        v.o3_fail
+    );
+}
+
+/// Must fail (mf24, X5-R32): no read of slot 6 in the real recovery's
+/// reads — `Open`/`Replay` need `D_read`, and a recovery failure that
+/// never touched the damage is a false positive. M-R32a (`Open`
+/// explained by `D ≠ ∅` instead of `D_read`) passes this world.
+#[test]
+fn mf24_no_recovery_read_of_the_damage_fails() {
+    let (m, mut s, mut ex, faults, twin) = r32_world();
+    ex.recovery_reads.clear();
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "an unexplained Open XX001 must fail the round");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+        "got {:?}",
+        v.o3_fail
+    );
+    assert!(!v.r32);
+}
+
+/// Must fail (mf25, X5-R32): `prior_page_slots = {}` — slot 6's taint
+/// then has no media fault in its history, which is the F-CRASH or
+/// store-bug shape the twin rule exists to catch. M-R32b (`H` ignored)
+/// passes this world.
+#[test]
+fn mf25_no_prior_fault_history_fails() {
+    let (m, mut s, ex, faults, twin) = r32_world();
+    let mut faults = faults;
+    faults.prior_page_slots.clear();
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        !v.pass,
+        "taint with no fault in its history must stay a failure"
+    );
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+        "got {:?}",
+        v.o3_fail
+    );
+    assert!(!v.r32);
+}
+
+/// Must fail (mf26, X5-R32): `kept_slots = {6}` (the K exclusion) with
+/// `xx001 = [Open]` only and no amcheck finding — a K slot's bytes are
+/// the opened image's own content, so `D` excludes it and the Open
+/// XX001 stays unexplained. M-R32c (the K exclusion dropped) passes
+/// this world.
+#[test]
+fn mf26_kept_slot_is_not_damaged_referenced_fails() {
+    let (m, mut s, mut ex, faults, twin) = r32_world();
+    ex.kept_slots.insert(6u64);
+    ex.xx001 = vec![XxSite::Open];
+    ex.amcheck_i.clear();
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "a kept slot does not explain an Open XX001");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+        "got {:?}",
+        v.o3_fail
+    );
+    assert!(!v.r32);
+}
+
+/// Must fail (mf27, X5-R32): the same world in class MW — the arm is
+/// class MP only. M-R32d (the class test widened to MP ∨ MW) passes
+/// this world.
+#[test]
+fn mf27_class_mw_stays_a_failure() {
+    let (m, mut s, ex, faults, twin) = r32_world();
+    let v = run(&m, FaultClass::Mw, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "the damaged-referenced arm is class MP only");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+        "got {:?}",
+        v.o3_fail
+    );
+    assert!(!v.r32);
+}
+
+/// Must fail (mf28, X5-R32): `xx001 = [AmcheckIi]` with
+/// `tainted_image_slots_ii = {}` (`D_ii = ∅`) — an AmcheckIi site is
+/// explained only by damaged (ii)-referenced slots. M-R32e (`AmcheckIi`
+/// explained by `D`) passes this world.
+#[test]
+fn mf28_empty_d_ii_fails() {
+    let (m, mut s, mut ex, faults, twin) = r32_world();
+    ex.amcheck_ii_ran = true;
+    ex.image_slots_ii.insert(6u64);
+    ex.tainted_image_slots_ii = BTreeSet::new();
+    ex.xx001 = vec![XxSite::AmcheckIi];
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(!v.pass, "an AmcheckIi site needs D_ii ≠ ∅ to be explained");
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+        "got {:?}",
+        v.o3_fail
+    );
+    assert!(!v.r32);
+}
+
 /// The five instrumentation removals are load-bearing: each removed check
 /// lets a previously failing case pass (card "Instrumentation checks",
 /// with the 2.7 addition of X5-R5's meta-slot-fault condition).
@@ -1358,6 +1551,39 @@ fn instrumentation_removals_are_load_bearing() {
         assert!(
             v.pass,
             "without the kept set in the record the same findings pass"
+        );
+    }
+    // (7) X5-R32's damaged-referenced arm: with the arm removed
+    // (`no_r32`), mp8's explained detection turns red.
+    {
+        let (m, mut s, ex, faults, twin) = r32_world();
+        let mut rng = Rng::new(1);
+        let cfg = OracleCfg {
+            no_r32: true,
+            ..Default::default()
+        };
+        let v = check_round(
+            &m,
+            FaultClass::Mp,
+            0,
+            &ex,
+            &mut s,
+            &faults,
+            Some(&twin),
+            &mut rng,
+            &cfg,
+        );
+        assert!(
+            !v.pass,
+            "with the arm removed (no_r32) the explained detection fails"
+        );
+        assert!(
+            v.o3_fail
+                .clone()
+                .unwrap_or_default()
+                .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+            "got {:?}",
+            v.o3_fail
         );
     }
 }
