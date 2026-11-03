@@ -401,6 +401,11 @@ def ledger_append(path, rec):
         os.fsync(fh.fileno())
 
 
+# A full commit id as the runner writes it (git rev-parse HEAD): the only shape
+# worker_commits() accepts from the ledger, and the only one main() records as an end.
+OID_RE = re.compile(r"[0-9a-f]{40}")
+
+
 def worker_commits(wt, base, path):
     """The commits made while a worker ran, read from the trust ledger at path,
     or None when they cannot be listed (a malformed record, a failed git), which
@@ -415,6 +420,14 @@ def worker_commits(wt, base, path):
     That includes the current run, whose range is open until it exits. Commits
     made between runs, where the gate's verdict commit lands, are in no range.
 
+    Only well-formed records are read: every line a JSON object with a string
+    run, every start a full lowercase 40-hex id (OID_RE), every end one or null.
+    Anything else means "trust nothing", never a repair or a skip: an
+    unparsable line, a number, a ref name, or an option-shaped id such as
+    "--all", which git would read as an option that empties the worker set and
+    so exempts a forged verdict. A well-formed id git does not know fails the
+    rev-list, which is "trust nothing" too.
+
     The ledger is outside the worktree, in cards/logs/, which the worker's file
     tools cannot reach (external_directory: deny); its bash still can. So this
     closes the accidental and rationalized paths (a worker "fixing" a scope
@@ -422,20 +435,28 @@ def worker_commits(wt, base, path):
     determined adversary with a shell."""
     try:
         recs = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
-        starts, ends = {}, {}
-        for r in recs:
-            if "start" in r:
-                starts.setdefault(r["run"], r["start"])  # the earliest start is the widest range
-            elif "end" in r:
-                ends[r["run"]] = r["end"]
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, RecursionError):
         return None
+    oid = lambda v: isinstance(v, str) and OID_RE.fullmatch(v) is not None
+    starts, ends = {}, {}
+    for r in recs:
+        if not isinstance(r, dict) or not isinstance(r.get("run"), str):
+            return None
+        if "start" in r:
+            if not oid(r["start"]):
+                return None
+            starts.setdefault(r["run"], r["start"])  # the earliest start is the widest range
+        elif "end" in r:
+            if r["end"] is not None and not oid(r["end"]):
+                return None
+            ends[r["run"]] = r["end"]
     worker = set()
     for run_id, start in starts.items():
-        if not start:
-            return None
-        # rev-list END --not START BASE is base..END minus base..START.
-        p = subprocess.run(["git", "rev-list", ends.get(run_id) or "HEAD", "--not", start, base, "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
+        # END ^START ^BASE is base..END minus base..START. --end-of-options stops
+        # git reading any later word as an option (base is operator input, from
+        # --base), and the exclusions are spelled ^REV rather than --not because,
+        # after --end-of-options, --not would itself be read as a revision.
+        p = subprocess.run(["git", "rev-list", "--end-of-options", ends.get(run_id) or "HEAD", f"^{start}", f"^{base}", "--"], cwd=wt, env=git_env(), capture_output=True, text=True)
         if p.returncode != 0:
             return None
         worker.update(p.stdout.split())
@@ -971,7 +992,7 @@ def main():
             kill_child(child)
         _, head = run(["git", "rev-parse", "HEAD"], wt)
         head = head.strip()
-        ledger_append(ledger, {"run": run_id, "end": head if re.fullmatch(r"[0-9a-f]{40}", head) else None, "t": time.time()})
+        ledger_append(ledger, {"run": run_id, "end": head if OID_RE.fullmatch(head) else None, "t": time.time()})
         if not refs_final:  # an exit that skipped the final check (quota, disk, exception, signal)
             refs_moved("refs changed outside the card branch (at exit)")
         signal.signal(signal.SIGINT, old_int)
