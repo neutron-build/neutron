@@ -784,6 +784,181 @@ otherwise. 4. The WAL side is not ruled: no worker extends `D` to the WAL.
 X5-R30. It is empty in classes C and MW. Never satisfy O-3(c) by making a
 harness walk report ground truth as a store finding (X5-R23).
 
+## P rulings X5-R33 and X5-R34, verbatim (nv3-X-5c-F3-F3-write-1, 2026-11-03;
+## binding; pre-registered)
+
+Copied word for word from card X-5c-F3-F3a (its "Carried verbatim" section,
+itself verbatim from `verdicts/X-5c-F3-F3-pre.md`) before any `e4-campaign`
+command ran (X5-R33 (a), X5-R34 (a)) — beside X5-R28–R32 above.
+
+### Carried: X5-R34, verbatim (binding; post-data; `verdicts/X-5c-F3-F3-pre.md`)
+**X5-R34 (the acked-commit derivation: I-ACK-PREFIX's `durable_end` from SimDisk history; the client-ack cross-check is judged)**
+
+P (claude-opus-5-5, nv3-X-5c-F3-F3-write-1), 2026-11-03, from the S-1-F3 draft-2 gate's ruling (b) (`verdicts/S-1-F3-draft2-gate.md`, "Ruling on (b)"). **Post-data:** the 37 class-C `0 < frontier < lo` rounds of X-5c-F3-F1's Acceptance file (commit 62d4e739, json_sha256 `f3a1e605…a1af17`) were seen before it was made. It governs every run from the commit that lands it. RESULT item 6 records it as a post-data amendment of the harness's `lo` input. The oracle's text does not change.
+
+**(a) Scope.** It replaces the SyncOn `acked` half of `harness::derive_written_acked`: the per-inode `max`, where `durable_end[inode]` is the max over `SyncReturned` of the returned extent and `acked ⇔ durable_end[inode] ≥ end`. Unchanged:
+- `written` (the `hi` input);
+- SyncOff's `acked` (= written);
+- the `unparsed_written` report;
+- the oracle's `lo = max(c_{r−1}, max{ts : SyncOn ∧ acked})`;
+- X5-R1 (until X5-R33 lands).
+
+**(b) Inputs.** All are harness-side and none is store memory, except `p0`.
+1. **`E`:** the workload pass's `disk.events`, as `run_round` captures them. These are this round's events only, because `new_round` cleared the list.
+   - Index order is time order: every env op is one atomic sim step (`WriteIssued`+`WriteReturned` in one step, `SyncIssued`+`SyncReturned` in one step).
+   - Media faults are applied after `E` is captured, so `E` never contains them.
+2. **`p0`:** the WAL append position the round's workload started from, `start_store.wal.append`. That is the valid end of the recovery that produced the round's base; in round 0 it is the created store's append position.
+   - *Guard:* every record in `wal_commits` has `lsn ≥ p0`. A violation is a harness defect, and it fails the round loudly.
+3. **`B(n)`:** for a segment file name `n` (`{seg:016x}.log` in the sim directory `"/wal/"`), the inode that SimDisk's **durable** directory bindings map `n` to at the end of the workload pass, or none.
+   - That is `durable_bindings["/wal/"][n]`, the binding made by a create or rename that a later `sync_dir` made durable.
+   - It is read through one new read-only observer accessor on `SimDisk`. Nothing else in `src/sim/` changes.
+4. **`β(n)`:** the index in `E` of the last `DirOpIssued` whose `what` is `create /wal/n`, or ends with `-> /wal/n`, and which precedes the last `SyncDirReturned { dir: "/wal/" }` in `E`. It is none if no such event exists, meaning the binding predates the round.
+5. **`Rc`:** the segment names `n` for which `E` holds a `DirOpIssued` whose `what` is `rename /wal/n -> …`. These are the sources of step 6's recycling renames.
+
+For an LSN `x`: `seg(x) = x − (x mod WAL_SEG)`, `name(x) = {seg(x):016x}.log`, and `off(x) = x mod WAL_SEG`.
+
+**(c) Durable bytes.** A byte at LSN `x` is **durable** iff one of the following holds.
+- **(R) Recycled:** `name(x) ∈ Rc`. This is an exemption. A segment is recycled only once it lies wholly below a durable meta's `wal_start_lsn`, so `T` covers its commits.
+- **(W) Written and synced:** all of these hold:
+  - `i = B(name(x))` exists;
+  - the last `WriteIssued` in `E` to inode `i` whose range covers `off(x)` exists;
+  - that write's index is greater than `β(name(x))`, when `β` exists;
+  - a `SyncReturned { inode: i, .. }` (from `sync_data` or `sync_all`) follows it later in `E`.
+- **(S) Slack:** `x` lies after the end of a `SegmentEnd` record that starts at some LSN `q` with `seg(q) = seg(x)`, where:
+  - the `SegmentEnd`'s own bytes are durable by (W); and
+  - its last-issued bytes at `off(q)` in `B(name(q))` decode (`wal::dec_record`) as `K_SEGEND` with `lsn = q`.
+
+*Why the binding index.* A recycled file keeps its previous life's synced bytes at every offset its new life has not yet overwritten. Seed 20 r2 shows this:
+- inode f4 was synced as segment 0x60000 (EV 121);
+- it was renamed to 0xa0000 (EV 7309, dir-synced at EV 7310);
+- ts 64 was written at f4@5952 (EV 7837) and never synced.
+
+Only writes made after a name was bound to its inode belong to the stream at that name. Without the index, an unwritten record lying over stale synced bytes would count as acked.
+
+**(d) `D`.** `D` is the largest `L ≥ p0` such that every byte in `[p0, L)` is durable, scanning in LSN order. A segment boundary is crossed like any other position: an exact segment end, and `SegmentEnd` slack, both continue at the next segment's first LSN. `D` is computed over write intervals (per-inode interval maps, one pass over `E`), never with a per-byte loop over the WAL span.
+
+**(e) Acked.**
+- A SyncOn commit of this round is acked iff `lsn + len ≤ D`, or `name(lsn) ∈ Rc`. The commit is a `Commit`, or a chunked transaction's `CommitMarker`; `(lsn, len)` come from `wal_commits`.
+- A SyncOff commit is acked iff it is written (unchanged).
+- X5-R33's `a` uses this definition of acked.
+
+**(f) The judged cross-check (ACK-OVER-HOLE).** `HarnessState::client_acked` becomes a judged input. It holds every commit whose own `wal_wait_durable`/`wal_wait_written` returned before the crash.
+- **The failure.** Take every SyncOn `ts ∈ client_acked` with `lsn + len > D` and `name(lsn) ∉ Rc`. For each one, the round fails as a store failure, through the same path as X5-R10's guard (the round's task error, so the pass fold fails it), with the text `ACK-OVER-HOLE: client-acked SyncOn ts=<ts> ends at <lsn+len> above durable_end <D> (I-ACK-PREFIX, X5-R34)`.
+- **The record.** The round record gains `ack_over`: the list of such ts, empty when there are none. `run` writes it and `verify` parses it; the pass fold does not read it.
+- **Not a failure:** a commit acked by (e) but absent from `client_acked`, because its committer crashed in its wait. Its record is durable, and recovery must replay it.
+
+**(g) Self-tests** (literal event lists, in `tests/harness.rs`). Each must-fail case must also fail on the frozen derivation. That is shown by restoring the old function, recording the result, and reverting.
+1. **20 r2's shape:** an inode is synced in its life as segment A, renamed to B and dir-synced; then a SyncOn record is written at B's offset with no later sync. It must not be acked.
+2. **Contiguity:** batch 2 is written and synced while batch 1 below it is unwritten. Batch 2's SyncOn commit must not be acked, with batch 2 on the same inode and, as a variant, on the next segment's inode.
+3. **The directory:** a segment is created, or renamed into place, with no later `sync_dir("/wal/")`. Its records must not be acked, even though they are synced.
+4. **A forged early ack:** `client_acked` holds a ts whose record ends above `D`. The round must fail with the ACK-OVER-HOLE text.
+5. **Must pass:**
+   - a record written after its segment's durable binding and then synced, contiguous from `p0`, is acked;
+   - a record in an `Rc` segment is acked, and exempt from (f);
+   - a SyncOn record placed after an exact segment end, in a durably bound and synced next segment, is acked.
+
+**(h) The decision rule (pre-registered).**
+1. **At the commit that lands (a)–(g), before any store change of its card** (the store is still X-5c-F3-F1's), run single seeds for the 37 named rounds:
+   - 20 r2, 115 r1, 403 r1, 622 r0, 780 r2, 801 r1, 825 r2, 830 r1, 1001 r0, 1064 r1;
+   - 1585 r1, 1801 r1, 2183 r0, 2525 r2, 2730 r2, 2765 r0, 2812 r1, 3224 r1, 3806 r1, 4770 r2;
+   - 4930 r0, 5054 r1, 5601 r1, 5604 r0, 6154 r0, 6200 r2, 6263 r2, 6623 r0, 7405 r1, 7531 r0;
+   - 7803 r1, 7823 r1, 8220 r2, 8363 r0, 9200 r0, 9484 r2, 9594 r0.
+
+   Record frontier, `lo` before and after, pass, and `ack_over` per round. Then run 0..200 and record `ack_over` and the count of failing class-C rounds with `0 < frontier < lo`.
+   - **Prediction** (P's prototype of this text):
+     - 33 named rounds get `lo ≤ frontier`;
+     - 1064 r1, 4770 r2, 5054 r1 and 6263 r2 keep `frontier < lo`, with `lo` unchanged;
+     - `ack_over` is empty on all 37 and everywhere in 0..200;
+     - no new failing class-C `0 < frontier < lo` round appears in 0..200.
+   - A named round that then fails another clause is classed under that clause, and never re-ruled here.
+2. **The four exact-boundary rounds are store losses** until the §12.2/§12.5 exact-segment-end hop lands (S-1-F3 gate G2 and edit 2). They are class-C I-REDO-COMPLETE breaks with no media fault. After the hop they must leave the `frontier < lo` shape.
+3. **At the card's tip,** re-run the 37. Any **failing** class-C round that still has `0 < frontier < lo`, whether named or new in a ≤ 200-seed range, is escalated as a store loss with its trace: `D`, the reason `D`'s walk stopped, the record, and its events. It is never re-derived: (b)–(e) do not change, and no exemption is added.
+4. **Any non-empty `ack_over`** is an ACK-OVER-HOLE store failure: record it and ESCALATE. The cross-check is never relaxed.
+5. **From X-5c-F3-F3a's Acceptance file on,** every failing class-C `0 < frontier < lo` round is a store loss, for P's triage. A passing round with `frontier < lo` (O-1 matched at some `c ≥ lo`; e.g. 6851 r2 in F3-F1's file) is not a loss. RESULT item 6 lists X5-R34, with the 33 rounds it moved.
+6. **A round whose workload moved,** because a store fix in the same card shifted it, is recorded "moved by <commit>" with its new outcome. That is not a failure of this rule.
+
+**(i) What it does not touch:**
+- `written`/`hi`, and the oracle's text;
+- X5-R1, until X5-R33 replaces its MW bound;
+- X5-R5's R, and X5-R28's K;
+- `model.rs`, and the sim's fault model, crash model and `taint_ranges`.
+
+It never reads `wal.durable` or `wal.written`, which are store memory. A diagnostic may print them beside `D`.
+
+### Carried: X5-R33, verbatim (binding; pre-data; `verdicts/X-5c-F3-F3-pre.md`; implemented by X-5c-F3-F3b, committed as text by this card's step 0)
+**X5-R33 (X5-R1's MW lower bound, tightened; the WAL-loss `Err`; the `wal_ckpt_end` cross-check)**
+
+**Source.**
+- S-1-F3 draft 2, Implications (e), with the draft-2 gate's edits 4 and 5 applied (`verdicts/S-1-F3-draft2-gate.md`, 2026-11-03).
+- Its two open items are closed by P here, in (h) and (i).
+- Precision added by P: the truncation point in (b), the no-damage case of `a`, and the exact bounds form of the cross-check in (d).
+
+**Status.** It is **pre-data**: no run that judges by it has been read. It tightens X5-R1, which the X-5c card's "may tighten, may not loosen" allows. It is a P-commit to the frozen oracle and its self-tests, landed in one commit whose subject names X5-R33.
+
+**(a) When.**
+- This text is committed before the output of any run that judges rounds by it is read. X-5c-F3-F3a's step 0 commits the text.
+- X-5c-F3-F3b's code commit lands it before F3-F3b's ≤ 200-seed MW smoke.
+- A run whose output is read before that code commit is diagnostic-only, and cannot be cited as a pin or as evidence.
+
+**(b) The stream as it stood at a moment `m`.**
+- It is the records appended by the life writing at `m`, plus, for each earlier life, its records below the **lowest truncation point of every later life up to `m`**. A record that a later truncation superseded never belongs to it.
+- A life's truncation point is the LSN at which it began appending, which is the valid end its recovery found.
+- A recovery life that appends nothing truncates nothing under this definition. If its zeros survive, they stop the next life's walk, and that sets the next life's truncation point.
+
+**(c) The lower bound for an MW `Ok` recovery: `lo_MW := max(c_{r−1}, T, h, a)`.**
+- **`h`** is the largest ts whose `Commit`/`CommitMarker` record lies wholly below the opened meta's `wal_ckpt_end`, in the stream as it stood when the opened meta was written.
+- **`a`** is the largest ts that is SyncOn, acked by X5-R34, and has its record wholly below the round's **first damaged WAL byte**, in the stream as it stood at the round's crash.
+  - Damaged bytes are the MW fault targets and misdirect destinations. They map to LSN through the first LSN of the segment whose name was bound to the target inode at the crash.
+  - If the round damaged no WAL byte, `a` is the round's largest acked SyncOn ts.
+- **The derivation.** The harness derives both values from SimDisk history and the model's record positions. It reads `wal_ckpt_end` and `ts_ckpt_hi` from the meta bytes on SimDisk, never from store memory.
+
+**(d) The harness cross-check.**
+- **What is checked.** For every meta the store writes (every meta-slot `DWrite` whose bytes parse as a meta), with `w` = its `wal_ckpt_end`, `t_hi` = its `ts_ckpt_hi` and `T` = its `T`:
+  1. no `Commit`/`CommitMarker` record that the writing life had appended straddles `w`: each ends at or below `w`, or starts at or above it;
+  2. every such record with ts `≤ T` ends at or below `w`;
+  3. `w` is at or below that life's append position at its crash or end;
+  4. `t_hi` is the largest ts among that life's `Commit`/`CommitMarker` records ending at or below `w`, or, if there is none, the frontier the writing life started from.
+- **Why these bounds are exact.** This is the gate's bounds form, G4 (c). It is exact because step 0 reads both values in one step, inside the commit critical section (§13 step 0 as amended, W5 (i)). `Chunk` records are excluded: they may fall on either side of `w`.
+- **A mismatch** is a store failure of the round, with the text `X5-R33 cross-check: meta <ckpt_id> wal_ckpt_end <w> / ts_ckpt_hi <t_hi> vs <expected>`. It is not a harness error.
+- **What it catches.** A store that writes `wal_ckpt_end` too low (COVER-END-AT-T), without trusting store memory.
+- **Self-tests.** A forged low `wal_ckpt_end` fails it, and so does a forged `ts_ckpt_hi`.
+
+**(e) A recovery `Err` in class MW that is I-WAL-COVER's refusal.**
+- **What it is.** XX001 for WAL loss, identified by the store's typed error, never by its text. It is counted as detection under O-3 (b).
+- **The rule.** It passes iff it is **explained**: a fault of the round damaged a WAL byte in `[wal_start_lsn, wal_ckpt_end)` of the opened meta, in the stream as it stood when that meta was written. Otherwise O-3 (c) fails it as a false positive, with the text `O-3(c): WAL-loss XX001 with no fault in [wal_start_lsn, wal_ckpt_end) (X5-R33)`.
+- **What follows.**
+  - O-1 is not run on the `Err` open, as for an MP recovery `Err`.
+  - The seed ends at that round, as an MP `Err` round's does.
+  - Every other MW `Err` is judged as before, by the twin rule.
+
+**(f) Self-tests.**
+- **Must fail:**
+  - MW `Ok` with `c = h − 1`;
+  - MW `Ok` with `c = a − 1`;
+  - a MW WAL-loss `Err` where every fault lies outside `[wal_start_lsn, wal_ckpt_end)`;
+  - a record superseded by a later truncation counted into `h` (a fixture with a reissued ts below `wal_ckpt_end`);
+  - the cross-check with a forged low meta value, and with a forged `ts_ckpt_hi`.
+- **Must pass:**
+  - a MW WAL-loss `Err` that is explained;
+  - MW `Ok` with `max(h, a) ≤ c <` the max acked.
+
+**(g) Unchanged.**
+- "O-3 requires that no damaged record is replayed";
+- class C;
+- class MP's lower bound.
+
+**(h) Class MP.** This closes S-1-F3's "MP side effect for X5-R33 to rule". P, 2026-11-03, pre-data.
+- **MP rollback rounds** (X5-R5) keep MP's lower bound: the max acked SyncOn, acked by X5-R34. Nothing in X5-R33 excuses them.
+- **A WAL-loss `Err` in class MP** (for example a Q14 rollback to a meta whose WAL span the newer meta's step 6 recycled) is judged by MP's unchanged O-3 (b)/(c): the twin rule, with X5-R32. It is never judged by (e). The rollback's meta-slot fault lies on a slot that every recovery reads, so the twin rule does not call the detection a false positive.
+- **X5-R5's R and K** and amcheck (i) are computed as before, on the opened image.
+- **Counting.** The round record's `cover_err` field lets RESULT count such rounds per class.
+- **Class C.** Any WAL-loss `Err` fails O-3 (b), as every class-C XX001 does. Once the exact-segment-end hop exists, no class-C open fails the coverage check (S-1-F3 gate G5), so such a round is a store failure.
+
+**(i) Salvage.** This closes the conditional "if the prototype gains a read-only salvage open".
+- X-5c-F3-F3 adds no read-only open to the prototype. S-1-F3's salvage (W7) is A-7d's, so the conditional is not triggered.
+- The prototype models Q1 = A's read-write half only: XX001, and nothing written.
+- Any later card that adds a read-only open must first have P pre-register O-1 on it: the state equals the model at `c` = the frontier, with `max(c_{r−1}, T, a) ≤ c`.
+
 **The reporting rule (this card's step 0, standing):** every class table
 splits out `served=true` rounds first (the oracle's `o3` text is
 last-writer-wins, so a serve can read as O-3(d), and an `O-3(a)` text can
