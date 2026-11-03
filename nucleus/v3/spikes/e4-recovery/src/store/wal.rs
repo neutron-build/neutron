@@ -429,8 +429,10 @@ pub fn wal_enqueue<H: StoreHost>(
         if !fits && lsn0 != seg + WAL_SEG {
             // A SegmentEnd filler at lsn0, then the lsn space padded to
             // the boundary (the reader never reads the pad: it hops on
-            // the filler, §12.5).
-            let se = enc_record(K_SEGEND, (0, 0), 0, &[], lsn0);
+            // the filler, §12.5). Its txn id is `(boot_id, 0)` — the
+            // writing boot's id with n = 0 (§12.2 W2; X-5c-F3-F3a
+            // step 4).
+            let se = enc_record(K_SEGEND, (st.boot_id, 0), 0, &[], lsn0);
             placed.extend_from_slice(&se);
             let gap = ((seg + WAL_SEG) - (lsn0 + se.len() as u64)) as usize;
             placed.extend_from_slice(&vec![0u8; gap]);

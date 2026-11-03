@@ -395,9 +395,14 @@ pub fn commit_txn(
     chunked: bool,
 ) -> Result<u64, Fail> {
     let txn = cx.with("h:txn", |c| {
+        // S-1-F3 §12.2 (W2; X-5c-F3-F3a step 4): the txn id is
+        // `(boot_id, n)`, n ≥ 1 dense per boot (the harness's
+        // per-round counter is per boot — a boot is a round's life;
+        // the store's session id comes from its boot checkpoint).
+        let boot = c.store().boot_id;
         let h = c.h();
         h.txn_counter += 1;
-        Ok((1u32, h.txn_counter))
+        Ok((boot, h.txn_counter))
     })?;
     if chunked {
         let mut rest = ops.to_vec();
