@@ -1,6 +1,21 @@
 # E4 recovery spike (card X-5, stage X-5c of three)
 
-Status: **stage X-5c-F3-F1, steps 0–9 done — step 0 committed
+Status: **stage X-5c-F3-F3a — steps 0–4 done — step 0 committed
+F3-F1's Acceptance 10k as the triage file of record (929ade38), the
+X5-R33/X5-R34 rulings verbatim before any run (31effe00), F3-F1-F5's
+record fixes (97e85cab) and the class table re-derived (b68d948c);
+step 1 X5-R34 — I-ACK-PREFIX's `durable_end` from SimDisk history, the
+judged `ack_over` cross-check, the 37-round table holding P's
+prediction exactly (13da010b, b9d6824c); step 2 the exact-segment-end
+hop clearing all four boundary store losses (ce8f8bbc, 51947e16); step
+3 I-ACK-PREFIX with two or more batches in flight, interval-set
+frontiers, the `writer:prewrite` pin (cbf0754c); step 4 per-boot ids —
+the three-way boot-id rule, W4 (i)'s ordered stop, the five pins and
+their five mutants, 186's shape gone and 405 moved (8b71e560 + this
+commit's pins). Remaining: step 5 (the F3-F1-F3 pins + mf29), step 6
+(the C-XX/C-DIV remainder pass), step 7 (the README) and the runner's
+Acceptance. The stage before it (X-5c-F3-F1) is complete: steps 0–9
+done — step 0 committed
 F3's Acceptance 10k as the triage file of record (7b709ccb:
 `E4 SEEDS=10000 O1_FAIL=2654 O2_FAIL=43 O3_FAIL=559 DEADLOCK=0
 PANIC=0 O1F_FAIL=2665 MONITOR=0` / `E4 FOLD FAILING_SEEDS=955
@@ -2894,6 +2909,144 @@ W3; gate (b) item 4).**
   the test's shape precondition, `assert!(r.served)`), re-pointed at
   **537 r0 and 1887 r0** (found by ≤ 200-seed scans; each served with
   `skx = true` and `pass_na = true`), assertions byte-identical.
+
+**Step 4 — per-boot ids (S-1-F3 D6, W1's `boot_id` row, W2, W4 (i)–(ii);
+gate edit 1; the (f′) three-way amendment).** The fix: **8b71e560**
+(step 4a); the pins and mutants: this commit (step 4 e–g).
+
+- **(a)–(d) What landed (8b71e560):** `page::Meta` gains `boot_id`
+  (u32, inside the CRC at offset 40 — `build_meta`/`parse_meta`, every
+  harness parser already going through `parse_meta`; meta 0 carries 0,
+  the creating session's, §2.2 W1); `StoreInner` gains the session's
+  `boot_id` (`src/store/mod.rs`, 0 at `create`); every record's `txn`
+  is `(boot_id, n)` with `n ≥ 1` dense per boot (`harness.rs`
+  `commit_txn` reads the store's session id — the harness's per-round
+  `txn_counter` is per boot, a boot being a round's life — and
+  `SegmentEnd` carries `(boot_id, 0)`, `wal.rs`'s filler in
+  `wal_enqueue`); the boot checkpoint's id per §14 step 8's **three-way
+  rule** — the newest, in serial-number order, of the `ckpt_id` the
+  boot checkpoint writes (low 32 bits), 1 + the opened meta's
+  `boot_id`, and 1 + the newest boot id among the records the recovery
+  walk accepted (`ckpt.rs` `recover`'s `recover:boot` block;
+  `newest_rec_boot` recorded by the walk) — with every meta of the
+  boot carrying it (`checkpoint_inner`'s meta literal); and `recover`'s
+  walk gains W4 (i)'s **ordered boot-id stop** (`ckpt.rs` walk,
+  `floor = last_boot.unwrap_or(meta.boot_id)`, `a` older than `b` iff
+  `(a − b) mod 2³² ≥ 2³¹`): a record of any kind, `SegmentEnd`
+  included, whose boot id is older stops the walk at its start; newer
+  ids are accepted (the walk crosses into newer boots, W4 (ii));
+  **never the equality rule**. The harness checkpoint after a recovery
+  (G4) is the §14 step 8 boot checkpoint and always writes a meta, so
+  (c)'s "can finish without writing a meta" case cannot arise (no
+  ESCALATE).
+- **Judgment call (D7's mutant arm, recorded):** 8b71e560 also updated
+  `tests/directed.rs` `d7_zombie_tail`'s round-2 arm to the designed
+  outcome: its zombie is round 1's record — an older boot's — so W4's
+  ordered stop refuses it even under TRUNCATE-LOGICAL-ONLY ("the stop
+  is by identity, not by zeroing"); the round now **passes** under the
+  mutant (the pre-W4 catcher described a same-boot zombie; this
+  fixture's is cross-boot by construction, each round's workload being
+  its own boot). **Consequence, escalated below:** TRUNCATE-LOGICAL-ONLY
+  is now caught by no failing assertion (its `directed_arms` row was
+  already display-only — `run_arm` encodes no arm for it); re-catching
+  it needs the §12.5 "Residual" shape (post-sync WAL damage **and** a
+  lost meta together), which is new fixture design, not this card's.
+- **(e) The pins** (literal configs, `tests/store.rs`; the
+  rollback fixtures fault through SimDisk's own API — a post-sync LOST
+  on the meta write (`apply_one_media_fault`, built from
+  `dwrites_of`), exactly "a post-sync LOST write on meta k+1's slot
+  reverts it"):
+  - `txn_ids_never_collide_across_lives` — P's finding: life 1 (a
+    recovery boot) leaves the unmarked chunks of txn `(id₁, 1)`, life 2
+    (a later boot, its id raised per §14 step 8) commits a chunked txn
+    with `n = 1` again; recovery attaches only life 2's chunks (key B
+    present, key A absent, frontier = the marker's ts).
+  - `stale_boot_record_stops_the_walk` (`t_stale_boot_record`) — a
+    boot-2 commit at LSN 0, then a complete boot-1 record at the next
+    position (the stale bytes a reverted truncation exposes; built
+    directly on the segment, the end state §12.5 describes — judgment
+    call, recorded: the card's prose builds it through a reverted
+    step-5 zero write, and the direct write produces the identical
+    walk input); the walk stops at its start (frontier 1, append =
+    its LSN, its key excluded).
+  - `meta_rollback_walk_crosses_into_newer_boot`
+    (`t_meta_rollback_crosses_boot`) — boot b−1 writes meta 1 and
+    crashes; boot b recovers, truncates at p_b, writes boot meta 2
+    through the harness checkpoint, then appends and acks a SyncOn
+    commit from p_b; a post-sync LOST reverts meta 2's slot (the open
+    then selects meta 1); the walk crosses into boot b's records and
+    the frontier is at or above the max acked. The fixture keeps
+    everything inside segment 0 (no recycling touches meta 1's WAL
+    span) and boot b's only page writes are its boot checkpoint's
+    image pages (off image 1's slots by the allocator's
+    `used_durable` rule).
+  - `boot_id_fresh_after_rollback` (`t_boot_id_after_rollback`) — two
+    successive rollbacks to meta 1 across boots b (id 2) and b+1 (id 3,
+    fresh through the walk's record term); b leaves the unmarked
+    chunks of `(2, 1)`, b+1 commits a chunked txn `(3, 1)`; recovery
+    from meta 1 never attaches b's chunks to b+1's marker (B1/B2
+    absent, C1/C2 present).
+  - `boot_id_after_rollback_raised_then_no_records` (the (f′) variant,
+    S-STORE §14 step 8's fixture at 7b3d3ac1): boots b and b+1 each
+    write meta 2, append and ack one commit, and lose the meta write;
+    boot b+2 crosses both boots' records (id 4), its meta 2 (`boot_id`
+    4, `wal_start_lsn` = the append position p) is durable and it
+    writes no record; boot b+3 opens meta 2, its walk from p accepts
+    nothing, writes meta 3, appends and acks from p, and crashes; a
+    LOST write on meta 3 leaves its slot holding meta 1. The open
+    selects meta 2 and replays b+3's acked commit (frontier 4 = max
+    acked; P1–P4 all present), and b+3's id is 5, newer than the
+    opened meta's `boot_id` 4.
+- **(f)/(f′) The mutants,** each applied to the real code, shown
+  failing its pin, and reverted (`git diff` clean of the mutant
+  afterwards; command: `cargo test -q --release -p e4-recovery --test
+  store <pin>`):
+  - **BOOT-ID-STOP-SKIP** (the ordered stop disabled) →
+    `stale_boot_record_stops_the_walk` FAILED — "the older boot's
+    record is not replayed (12.5 W4 (i)): left 2, right 1";
+  - **BOOT-ID-EQ-STOP** (stop at any id ≠ the opened meta's) →
+    `meta_rollback_walk_crosses_into_newer_boot` FAILED — "the frontier
+    is at or above the max acked (Z1, ts 3): left 2, right 3" (the walk
+    stopped at p_b);
+  - **BOOT-ID-CKPT-ONLY** (the id is the low 32 bits of `ckpt_id`
+    only) → `boot_id_fresh_after_rollback` FAILED — "boot b+1's id 2 is
+    newer than boot b's 2: left false, right true";
+  - **TXN-BOOT-CONST** (every recovery assigns one constant id, the
+    pre-card `(1, n)`) → `txn_ids_never_collide_across_lives` FAILED —
+    "life 2's boot id is one past life 1's: left 1, right 2";
+  - **BOOT-ID-NO-META-FLOOR** (the opened meta's `boot_id` term
+    omitted) → `boot_id_after_rollback_raised_then_no_records` FAILED —
+    "boot b+3's acked commit replays (the max acked; never a stop at
+    p): left 3, right 4", the exact harm §14 step 8's variant names
+    (an `Ok` open missing the acked commits).
+- **(g) Movement (P's prediction: 186 r2 and 405 r2 lose their C-DIV
+  shape).** Single-seed runs at the step-4 tip
+  (`X-5c-F3-F3a.s4.seed186/405.*`):
+  - **186 r2** — the outcome text is unchanged (O-1(c) at c=15, "raw
+    entry above the cut (max ts 16)", frontier 16 ≥ lo 15 — the same
+    text F3-F1's triage file records), but the shape is no longer
+    `frontier < lo` and the attach mechanism is gone: the failure is
+    the MW-orphan shape, not the cross-life chunk attach. Step 6's
+    `E4_TXN_DIAG` re-verifies the attach count directly (its
+    `0..200`-window check below is the judged evidence here).
+  - **405 — moved by 8b71e560** (X5-R34 (h) 6): the triage file's 405
+    r1 passed (frontier 7 = lo 7); at the step-4 tip 405 r1 now fails
+    **O-1(b) at c=7 with frontier 4 < lo 7** and the chain stops before
+    the named r2. Trace recorded (`E4_D_DIAG`,
+    `X-5c-F3-F3a.s4.seed405.ddiag.err`): p0=128515, **D=318537**, stop
+    = "byte at lsn 318537 (0000000000040000.log@56393): no sync of
+    inode 6 after the last covering write (ev 1866)", `rc={}`,
+    `ack_over=[]`. (h) 6 applies — the workload moved by this card's
+    own store fix, so it is not an (h) 3 escalation — but from the
+    Acceptance file on, (h) 5 makes every failing class-C
+    `0 < frontier < lo` round a store loss for P's triage, and this one
+    will be in it.
+- **(g) The 0..200 run at the step-4 tip** (`X-5c-F3-F3a.s4.0200.*`):
+  `ack_over` empty over every judged round (0); failing class-C rounds
+  with `0 < frontier < lo`: **0**; **C-XX 0, C-DIV 7 (b 3, c 4)** —
+  beside step 3's identical C-XX/C-DIV counts (step 3: FAILING_ROUNDS
+  18, C-XX 0, C-DIV 7; step 4: FAILING_ROUNDS 18, MW-ORPHAN 9, MP
+  O-3(e)(ii) 2, DEADLOCK 0, DEFECT_SEEDS 0).
 
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —

@@ -2365,3 +2365,789 @@ fn ack_prefix_two_batches_in_flight() {
         });
     }
 }
+
+/// **X-5c-F3-F3a step 4 pin (P's finding: cross-life TxnId reuse;
+/// §12.2 W2; a literal config).** The prototype's TxnIds were `(1, n)`
+/// in every life, so a cut-off chunked transaction's dead chunks from
+/// an earlier life attached to a later life's `CommitMarker` with the
+/// same `n` (seed 186 r2: 23 chunks written, 46 attached). With
+/// per-boot ids the lives' txns differ — life 1's unmarked chunks
+/// `(id₁, 1)` never match life 2's marker `(id₂, 1)` — and recovery
+/// attaches exactly the marker's own chunk count.
+///
+/// The config: every life derives its txn ids from the store's session
+/// id (as `commit_txn` does). Life 1 (a recovery over the empty WAL of
+/// the created store: boot 1) leaves the unmarked chunks of txn n=1 (a
+/// CreateTree plus a Put of key A); life 2 (a later boot — its recovery
+/// raised the id per §14 step 8) commits a chunked txn with n=1 again
+/// (a CreateTree plus a Put of key B, marker ts 5); a crash; life 3
+/// recovers. Asserted: key B is present and key A absent (only life
+/// 2's chunks attached), and the frontier is the marker's ts. Reverting
+/// the fix (mutant TXN-BOOT-CONST: every recovery assigns one constant
+/// id) fails this pin — both lives' txns collide at (1, 1), life 1's
+/// chunks attach to life 2's marker, and key A appears.
+#[test]
+fn txn_ids_never_collide_across_lives() {
+    let seed = 1860u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- life 1: a recovery over the created store's empty WAL (boot
+    // 1), then the unmarked chunks of txn (boot, 1) ----
+    let disk = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        let (st1, _) = ckpt::recover(&cx, cfg.clone()).expect("life 1 recover");
+        cx.with("pin:install2", |c| {
+            *c.store() = st1.clone();
+            Ok(())
+        })
+        .expect("install2");
+        let boot1 = cx.with("pin:b1", |c| Ok(c.store().boot_id)).expect("boot1");
+        assert_eq!(boot1, 1, "life 1's boot id (14 step 8 over the empty WAL)");
+        for chunk in [vec![op_create(2)], vec![op_put_a(1)]] {
+            let mut payload = Vec::new();
+            for op in &chunk {
+                wal::enc_op(op, &mut payload);
+            }
+            wal::wal_enqueue(&cx, wal::K_CHUNK, (boot1, 1), 0, &payload).expect("chunk enqueue");
+        }
+        let append = cx
+            .with("pin:a1", |c| Ok(c.store().wal.append))
+            .expect("append");
+        wal::wal_wait_durable(&cx, append).expect("life 1 chunks durable");
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- the crash, then life 2 (a recovery raises the boot id; no
+    // checkpoint, so the opened meta stays meta 0 and the walk crosses
+    // into the newer boots' records) ----
+    let mut d1 = disk;
+    let mut frng = e4_recovery::rng::Rng::new(seed + 1);
+    d1.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    let host = TestWorld {
+        sched: SchedCore::new(1, seed + 2),
+        disk: d1.clone(),
+        st: StoreInner::empty(cfg.clone(), 0),
+        flags: BTreeMap::new(),
+    };
+    let sched = Sched::new(host);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    let (st2, _f1) = ckpt::recover(&cx, cfg.clone()).expect("life 2 recover");
+    cx.with("pin:install3", |c| {
+        *c.store() = st2.clone();
+        Ok(())
+    })
+    .expect("install3");
+    let boot2 = {
+        let g = sched.lock();
+        assert_eq!(g.st.boot_id, 2, "life 2's boot id is one past life 1's");
+        g.st.boot_id
+    };
+    // Life 2's chunked txn, n=1 again (the collision shape), marker
+    // ts 5.
+    for chunk in [vec![op_create(2)], vec![op_put_b(9)]] {
+        let mut payload = Vec::new();
+        for op in &chunk {
+            wal::enc_op(op, &mut payload);
+        }
+        wal::wal_enqueue(&cx, wal::K_CHUNK, (boot2, 1), 0, &payload).expect("chunk enqueue");
+    }
+    let mut marker_payload = Vec::new();
+    marker_payload.extend_from_slice(&2u32.to_le_bytes());
+    let (mlsn, mlen) =
+        wal::wal_enqueue(&cx, wal::K_MARKER, (boot2, 1), 5, &marker_payload).expect("marker");
+    wal::wal_wait_durable(&cx, mlsn + mlen).expect("life 2 txn durable");
+    let end_disk = {
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- the crash, then life 3: recovery attaches only life 2's
+    // chunks ----
+    let mut d2 = end_disk;
+    let mut frng = e4_recovery::rng::Rng::new(seed + 3);
+    d2.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    let world = pass_world(1, seed + 4, d2, StoreInner::empty(cfg.clone(), 0));
+    let cx3 = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx3, cfg.clone()).expect("life 3 recover");
+    assert_eq!(
+        frontier, 5,
+        "the chunked txn replays through its marker (the marker's own chunks)"
+    );
+    let root = tree::dir_root_of(&cx3, 2).expect("tree 2 root");
+    let scan = tree::tree_scan(&cx3, root, u64::MAX).expect("scan");
+    assert!(
+        scan.contains_key(b"B".as_slice()),
+        "life 2's own chunk (key B) must be applied: {scan:?}"
+    );
+    assert!(
+        !scan.contains_key(b"A".as_slice()),
+        "life 1's unmarked chunks (key A) must never attach to life 2's marker: {scan:?}"
+    );
+    let _ = rec_st;
+}
+
+/// Test helper: a CreateTree op.
+fn op_create(tree: u64) -> wal::WOp {
+    wal::WOp::CreateTree { tree }
+}
+
+/// Test helper: a Put of key `A`.
+fn op_put_a(v: u8) -> wal::WOp {
+    wal::WOp::Put {
+        tree: 2,
+        key: b"A".to_vec(),
+        value: vec![v; 8],
+    }
+}
+
+/// Test helper: a Put of key `B`.
+fn op_put_b(v: u8) -> wal::WOp {
+    wal::WOp::Put {
+        tree: 2,
+        key: b"B".to_vec(),
+        value: vec![v; 8],
+    }
+}
+
+/// **X-5c-F3-F3a step 4 pin (S-1-F3 W4 (i), the ordered boot-id stop;
+/// `t_stale_boot_record`; a literal config).** A post-sync LOST fault
+/// on the recovery truncation's zero write reverts it, leaving an
+/// older boot's complete record at the next expected position after
+/// the newer boot's records — here built directly: a boot-2 commit at
+/// LSN 0, then a complete boot-1 record at the next position (the
+/// stale bytes a reverted truncation would expose). §12.5's ordered
+/// stop (W4 (i)) stops the walk at that record's start; the recovered
+/// state excludes it. Reverting the fix (mutant BOOT-ID-STOP-SKIP: the
+/// stop removed) fails this pin — the stale record replays (frontier
+/// 2, its key present).
+#[test]
+fn stale_boot_record_stops_the_walk() {
+    let seed = 7410u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- the fixture: X1 (boot 2, ts 1) at LSN 0, durable; X2 (boot
+    // 1, ts 2 — an older boot's complete record) at the next position,
+    // written and synced directly on the segment file ----
+    let (disk, x2_lsn, x2_key): (SimDisk, u64, Vec<u8>) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        let mut p1 = Vec::new();
+        wal::enc_op(&op_create(2), &mut p1);
+        wal::enc_op(&op_put_key(b"K1", 1), &mut p1);
+        let (l1, n1) = wal::wal_enqueue(&cx, wal::K_COMMIT, (2, 1), 1, &p1).expect("X1 enqueue");
+        wal::wal_wait_durable(&cx, l1 + n1).expect("X1 durable");
+        // X2: an older boot's complete record at the next position.
+        let x2_lsn = l1 + n1;
+        let mut p2 = Vec::new();
+        wal::enc_op(&op_put_key(b"K2", 2), &mut p2);
+        let x2 = wal::enc_record(wal::K_COMMIT, (1, 1), 2, &p2, x2_lsn);
+        let f = cx
+            .env()
+            .open("/wal/0000000000000000.log")
+            .expect("segment 0");
+        cx.env().write_at(f, x2_lsn, &x2).expect("X2 write");
+        cx.env().sync_data(f).expect("X2 sync");
+        let g = sched.lock();
+        (g.disk.clone(), x2_lsn, b"K2".to_vec())
+    };
+    // ---- the crash (everything durable), then recovery: the walk
+    // stops at X2's start ----
+    let mut d1 = disk;
+    let mut frng = e4_recovery::rng::Rng::new(seed + 1);
+    d1.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    let world = pass_world(1, seed + 2, d1, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("recover");
+    assert_eq!(
+        frontier, 1,
+        "the older boot's record is not replayed (12.5 W4 (i): the ordered stop)"
+    );
+    assert_eq!(
+        rec_st.wal.append, x2_lsn,
+        "the valid end is the stale record's start"
+    );
+    let root = tree::dir_root_of(&cx, 2).expect("tree 2 root");
+    let scan = tree::tree_scan(&cx, root, u64::MAX).expect("scan");
+    assert!(
+        scan.contains_key(b"K1".as_slice()),
+        "the newer boot's record replays: {scan:?}"
+    );
+    assert!(
+        !scan.contains_key(&x2_key),
+        "the older boot's stale record must be excluded: {scan:?}"
+    );
+}
+
+/// Test helper: a Put of an arbitrary key.
+fn op_put_key(key: &[u8], v: u8) -> wal::WOp {
+    wal::WOp::Put {
+        tree: 2,
+        key: key.to_vec(),
+        value: vec![v; 8],
+    }
+}
+
+/// Test helper: apply a post-sync LOST fault on the durable meta write
+/// of `ckpt_id` — the fixtures' meta rollback (through SimDisk's fault
+/// API, the same effect D10's directed fault has: the synced write
+/// reverts to its pre-image, exactly "a post-sync LOST write on meta
+/// k+1's slot reverts it").
+fn revert_meta_write(disk: &mut SimDisk, ckpt_id: u64) {
+    let pf = disk
+        .stat(e4_recovery::sim::PAGE_FILE)
+        .expect("the page file");
+    let slot_off = (1 + (ckpt_id % 2)) * e4_recovery::store::page::PAGE as u64;
+    let w = disk
+        .dwrites_of(pf)
+        .iter()
+        .rev()
+        .find(|w| {
+            w.off == slot_off
+                && e4_recovery::store::page::parse_meta(&w.bytes)
+                    .map(|m| m.ckpt_id == ckpt_id)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no durable meta {ckpt_id} write at slot {slot_off}"));
+    disk.apply_one_media_fault(&e4_recovery::sim::MediaFault {
+        inode: pf,
+        off: w.off,
+        len: e4_recovery::store::page::PAGE as u64,
+        bytes: w.bytes.clone(),
+        pre: w.pre.clone(),
+        kind: e4_recovery::sim::MediaKind::Lost,
+    });
+}
+
+/// Test helper: crash a disk with no volatile survivors (every unsynced
+/// write reverts; synced writes — everything these fixtures ack —
+/// stay), matching the other pins' crash shapes.
+fn crash_clean(disk: &mut SimDisk, seed: u64) {
+    let mut frng = e4_recovery::rng::Rng::new(seed);
+    disk.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+}
+
+/// Test helper: enqueue and ack one SyncOn commit record (the ops as
+/// the payload, as `commit_txn` writes a non-chunked commit; the ack is
+/// the record's own §12.4 durable wait).
+fn enqueue_commit(cx: &Cx<'_, TestWorld>, txn: (u32, u64), ts: u64, ops: &[wal::WOp]) {
+    let mut payload = Vec::new();
+    for op in ops {
+        wal::enc_op(op, &mut payload);
+    }
+    let (lsn, len) =
+        wal::wal_enqueue(cx, wal::K_COMMIT, txn, ts, &payload).expect("commit enqueue");
+    wal::wal_wait_durable(cx, lsn + len).expect("commit durable");
+}
+
+/// Test helper: enqueue one chunk of `txn` (ops as the payload, ts 0,
+/// as `commit_txn` writes chunks before the marker's critical section).
+fn enqueue_chunk(cx: &Cx<'_, TestWorld>, txn: (u32, u64), ops: &[wal::WOp]) {
+    let mut payload = Vec::new();
+    for op in ops {
+        wal::enc_op(op, &mut payload);
+    }
+    wal::wal_enqueue(cx, wal::K_CHUNK, txn, 0, &payload).expect("chunk enqueue");
+}
+
+/// Test helper: enqueue and ack one chunked transaction's CommitMarker
+/// (`nchunks` as the payload, as `commit_txn` writes it).
+fn enqueue_marker(cx: &Cx<'_, TestWorld>, txn: (u32, u64), ts: u64, nchunks: u32) {
+    let payload = nchunks.to_le_bytes().to_vec();
+    let (lsn, len) =
+        wal::wal_enqueue(cx, wal::K_MARKER, txn, ts, &payload).expect("marker enqueue");
+    wal::wal_wait_durable(cx, lsn + len).expect("marker durable");
+}
+
+/// **X-5c-F3-F3a step 4 pin (S-1-F3 W4 (ii), `t_meta_rollback_crosses_boot`;
+/// a literal config).** A meta-slot fault leaves an older meta as the
+/// newest valid one, and the walk then legitimately runs from that
+/// meta's `wal_start_lsn` through the next boot's records, whose LSNs
+/// continue the stream: "stopping there would lose that boot's acked
+/// commits silently" (§12.5 W4 (ii)'s rationale).
+///
+/// The fixture (S-STORE §12.5's, all inside segment 0 so no recycling
+/// touches meta k's WAL span, and boot b's only page writes are its
+/// boot checkpoint's image pages — off image k's slots by the
+/// allocator's `used_durable` rule): boot b−1 (the create session)
+/// writes meta 1 and crashes; boot b recovers, truncates at its valid
+/// end p_b, writes boot meta 2 through the harness checkpoint, then
+/// appends and acks a SyncOn commit from p_b; a post-sync LOST on meta
+/// 2's slot reverts it, then a crash before boot b's next checkpoint.
+/// Asserted: the open selects meta 1, replays boot b's acked commit,
+/// and the frontier is at or above the max acked. Reverting the fix
+/// (mutant BOOT-ID-EQ-STOP: the walk stops at any boot id other than
+/// the opened meta's) fails this pin — the walk stops at p_b and the
+/// acked commit is lost.
+#[test]
+fn meta_rollback_walk_crosses_into_newer_boot() {
+    let seed = 8237u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- boot b−1 (the create session): create, commit X1, meta 1,
+    // commit Y1 above it (acked), crash ----
+    let disk = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        enqueue_commit(&cx, (0, 1), 1, &[op_create(2), op_put_key(b"X1", 1)]);
+        cx_checkpoint(&sched, |_| Ok(()));
+        enqueue_commit(&cx, (0, 2), 2, &[op_put_key(b"Y1", 2)]);
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- boot b: recover from meta 1 (truncate at p_b), the boot
+    // checkpoint (meta 2), ack Z1 from p_b, crash; the meta-2 write is
+    // reverted post-sync ----
+    let disk = {
+        let mut d = disk;
+        crash_clean(&mut d, seed + 1);
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed + 2),
+            disk: d,
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let (st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("boot b recover");
+        assert_eq!(st.k, 1, "boot b opens meta 1");
+        assert_eq!(frontier, 2, "Y1 replays above meta 1");
+        assert_eq!(st.boot_id, 2, "boot b's id (§14 step 8)");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        cx_checkpoint(&sched, |_| Ok(()));
+        enqueue_commit(&cx, (2, 1), 3, &[op_put_key(b"Z1", 3)]);
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- the rollback: the meta-2 write reverts, then the next open
+    // selects meta 1 and the walk crosses into boot b's records ----
+    let mut d = disk;
+    crash_clean(&mut d, seed + 3);
+    revert_meta_write(&mut d, 2);
+    let world = pass_world(1, seed + 4, d, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("the rollback recovery");
+    assert_eq!(
+        rec_st.k, 1,
+        "the open selects meta k=1 (the rollback: slot 1 reverted to meta 0)"
+    );
+    assert_eq!(
+        frontier, 3,
+        "the frontier is at or above the max acked (Z1, ts 3)"
+    );
+    let root = tree::dir_root_of(&cx, 2).expect("tree 2 root");
+    let scan = tree::tree_scan(&cx, root, u64::MAX).expect("scan");
+    for key in [&b"X1"[..], &b"Y1"[..], &b"Z1"[..]] {
+        assert!(
+            scan.contains_key(key),
+            "key {key:?} must survive (image / replay / cross-boot replay): {scan:?}"
+        );
+    }
+}
+
+/// **X-5c-F3-F3a step 4 pin (S-1-F3 §14 step 8, gate edit 1,
+/// `t_boot_id_after_rollback`; a literal config).** Two successive
+/// rollbacks to meta k, across boots b and b+1: boot b leaves an
+/// unmarked chunked txn `(id_b, 1)`; boot b+1 commits a chunked txn.
+/// §14 step 8's three-way rule makes boot b+1's id newer than b's
+/// (1 + the newest boot id the walk accepted), so recovery from meta k
+/// never attaches b's chunks to b+1's marker. Reverting the fix (mutant
+/// BOOT-ID-CKPT-ONLY: the id is the low 32 bits of `ckpt_id` only)
+/// fails this pin — both boots get k+1, the marker `(k+1, 1)` collides
+/// with b's chunks, and b's keys appear.
+#[test]
+fn boot_id_fresh_after_rollback() {
+    let seed = 5909u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- setup: meta 1 durable (slot 2, boot 0), nothing above it ----
+    let disk = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        enqueue_commit(&cx, (0, 1), 1, &[op_create(2), op_put_key(b"A0", 1)]);
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- boot b (rollback 1): unmarked chunks of txn (id_b, 1), then
+    // its meta 2 write is lost ----
+    let disk = {
+        let mut d = disk;
+        crash_clean(&mut d, seed + 1);
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed + 2),
+            disk: d,
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let (st, _f) = ckpt::recover(&cx, cfg.clone()).expect("boot b recover");
+        let id_b = st.boot_id;
+        assert_eq!(id_b, 2, "boot b's id");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        cx_checkpoint(&sched, |_| Ok(()));
+        enqueue_chunk(&cx, (id_b, 1), &[op_put_key(b"B1", 1)]);
+        enqueue_chunk(&cx, (id_b, 1), &[op_put_key(b"B2", 2)]);
+        let end = {
+            let g = sched.lock();
+            g.st.wal.append
+        };
+        wal::wal_wait_durable(&cx, end).expect("boot b chunks durable");
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- boot b+1 (rollback 2): the walk crosses b's chunks (so its
+    // id is fresh), then it commits a chunked txn n=1, and its meta
+    // write is lost too ----
+    let disk = {
+        let mut d = disk;
+        crash_clean(&mut d, seed + 3);
+        revert_meta_write(&mut d, 2);
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed + 4),
+            disk: d,
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let (st, _f) = ckpt::recover(&cx, cfg.clone()).expect("boot b+1 recover");
+        let id_b1 = st.boot_id;
+        // Serial-number order: id_b1 (3) is newer than id_b (2).
+        assert!(
+            (2u32.wrapping_sub(id_b1)) >= 1u32 << 31,
+            "boot b+1's id {id_b1} is newer than boot b's 2"
+        );
+        assert_eq!(id_b1, 3, "1 + the newest boot id the walk accepted (2)");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        cx_checkpoint(&sched, |_| Ok(()));
+        enqueue_chunk(&cx, (id_b1, 1), &[op_put_key(b"C1", 1)]);
+        enqueue_chunk(&cx, (id_b1, 1), &[op_put_key(b"C2", 2)]);
+        enqueue_marker(&cx, (id_b1, 1), 2, 2);
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- recovery from meta 1: b's chunks never attach to b+1's
+    // marker ----
+    let mut d = disk;
+    crash_clean(&mut d, seed + 5);
+    revert_meta_write(&mut d, 2);
+    let world = pass_world(1, seed + 6, d, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (_rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("the final recovery");
+    assert_eq!(frontier, 2, "the marker's txn replays (ts 2)");
+    let root = tree::dir_root_of(&cx, 2).expect("tree 2 root");
+    let scan = tree::tree_scan(&cx, root, u64::MAX).expect("scan");
+    for key in [&b"A0"[..], &b"C1"[..], &b"C2"[..]] {
+        assert!(
+            scan.contains_key(key),
+            "key {key:?} (the setup commit / b+1's own chunks) must be present: {scan:?}"
+        );
+    }
+    for key in [&b"B1"[..], &b"B2"[..]] {
+        assert!(
+            !scan.contains_key(key),
+            "boot b's unmarked chunks {key:?} must never attach to b+1's marker: {scan:?}"
+        );
+    }
+}
+
+/// **X-5c-F3-F3a step 4 pin (the (f′) binding amendment, S-STORE §14
+/// step 8's three-way rule; `t_boot_id_after_rollback`, "raised id,
+/// then no records" variant; a literal config).** A boot whose id was
+/// raised above its `ckpt_id` (through the walk's record term) can be
+/// followed by one whose `ckpt_id` is below that id — only the opened
+/// meta's `boot_id` term bounds it.
+///
+/// The fixture (S-STORE §14 step 8's, k=1): boot b−1 writes meta 1 and
+/// crashes; boots b and b+1 each write meta 2, append and ack one
+/// commit, and lose that meta write; boot b+2 crosses both boots'
+/// records (id 4), its meta 2 (`boot_id` 4, `wal_start_lsn` the append
+/// position p) is durable, and it writes no record; boot b+3 opens
+/// meta 2, its walk from p accepts nothing, it writes meta 3, appends
+/// and acks a SyncOn commit from p, and crashes before its next
+/// checkpoint; a LOST write on meta 3 leaves its slot holding meta 1.
+/// Asserted: the open selects meta 2 and replays boot b+3's acked
+/// commit, and b+3's id is newer than the opened meta's `boot_id`.
+/// Reverting the fix (mutant BOOT-ID-NO-META-FLOOR: the opened meta's
+/// `boot_id` term omitted) fails this pin — b+3 gets the id 3, older
+/// than meta 2's `boot_id` 4, the walk stops at p and returns `Ok`
+/// without the acked commit.
+#[test]
+fn boot_id_after_rollback_raised_then_no_records() {
+    let seed = 4421u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- boot b−1: create, commit P1 (tree 2), meta 1, crash ----
+    let disk = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        enqueue_commit(&cx, (0, 1), 1, &[op_create(2), op_put_key(b"P1", 1)]);
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // A boot that recovers, writes its boot meta (k+1 = 2), appends and
+    // acks one commit at `txn`/`ts`, and loses the meta write.
+    let boot_and_lose =
+        |disk: SimDisk, step: u64, txn: (u32, u64), ts: u64, key: &'static [u8]| -> SimDisk {
+            let mut d = disk;
+            crash_clean(&mut d, seed + step);
+            let host = TestWorld {
+                sched: SchedCore::new(1, seed + step + 1),
+                disk: d,
+                st: StoreInner::empty(cfg.clone(), 0),
+                flags: BTreeMap::new(),
+            };
+            let sched = Sched::new(host);
+            let cx = Cx {
+                w: &sched,
+                t: HARNESS,
+            };
+            let (st, _f) = ckpt::recover(&cx, cfg.clone()).expect("recover");
+            cx.with("pin:install", |c| {
+                *c.store() = st;
+                Ok(())
+            })
+            .expect("install");
+            cx_checkpoint(&sched, |_| Ok(()));
+            enqueue_commit(&cx, txn, ts, &[op_put_key(key, ts as u8)]);
+            let g = sched.lock();
+            let mut d = g.disk.clone();
+            drop(g);
+            crash_clean(&mut d, seed + step + 2);
+            revert_meta_write(&mut d, 2);
+            d
+        };
+    // ---- boots b (id 2, P2) and b+1 (id 3, P3): both metas lost ----
+    let disk = boot_and_lose(disk, 10, (2, 1), 2, b"P2");
+    let disk = boot_and_lose(disk, 20, (3, 1), 3, b"P3");
+    // ---- boot b+2: crosses b's and b+1's records (id 4), its meta 2
+    // (boot_id 4, wal_start = the append position p) is durable, and
+    // it writes no record ----
+    let disk = {
+        let mut d = disk;
+        crash_clean(&mut d, seed + 31);
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed + 32),
+            disk: d,
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let (st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("boot b+2 recover");
+        assert_eq!(st.boot_id, 4, "boot b+2's id crosses both boots' records");
+        assert_eq!(frontier, 3, "P2 and P3 replay");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        cx_checkpoint(&sched, |_| Ok(()));
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    // ---- boot b+3: opens meta 2, its walk from p accepts nothing, it
+    // writes meta 3, appends and acks P4 from p, and crashes before its
+    // next checkpoint ----
+    let (disk, b3_boot) = {
+        let mut d = disk;
+        crash_clean(&mut d, seed + 33);
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed + 34),
+            disk: d,
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let (st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("boot b+3 recover");
+        assert_eq!(st.k, 2, "boot b+3 opens meta 2 (the raised boot)");
+        assert_eq!(frontier, 3, "the walk from p accepts nothing");
+        let b3_boot = st.boot_id;
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        cx_checkpoint(&sched, |_| Ok(()));
+        enqueue_commit(&cx, (b3_boot, 1), 4, &[op_put_key(b"P4", 4)]);
+        let g = sched.lock();
+        let mut d = g.disk.clone();
+        drop(g);
+        crash_clean(&mut d, seed + 35);
+        // The final rollback: meta 3's write reverts to meta 1's bytes.
+        revert_meta_write(&mut d, 3);
+        // b3_boot is asserted after the outcome assertions below: the
+        // harm the fixture describes (an `Ok` open missing the acked
+        // commits) is the demonstration that matters.
+        (d, b3_boot)
+    };
+    // ---- the open selects meta 2 and replays boot b+3's acked
+    // commit ----
+    let world = pass_world(1, seed + 40, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("the final recovery");
+    assert_eq!(
+        rec_st.k, 2,
+        "the open selects meta 2 (slot 1; meta 3's write reverted to meta 1)"
+    );
+    assert_eq!(
+        frontier, 4,
+        "boot b+3's acked commit replays (the max acked; never a stop at p)"
+    );
+    let root = tree::dir_root_of(&cx, 2).expect("tree 2 root");
+    let scan = tree::tree_scan(&cx, root, u64::MAX).expect("scan");
+    for key in [&b"P1"[..], &b"P2"[..], &b"P3"[..], &b"P4"[..]] {
+        assert!(
+            scan.contains_key(key),
+            "key {key:?} must survive (image / replay): {scan:?}"
+        );
+    }
+    assert!(
+        (4u32.wrapping_sub(b3_boot)) >= 1u32 << 31,
+        "boot b+3's id {b3_boot} must be newer than the opened meta's boot_id 4"
+    );
+    assert_eq!(b3_boot, 5, "the three-way rule's meta term");
+}
