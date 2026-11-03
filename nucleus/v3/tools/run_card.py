@@ -33,7 +33,11 @@ Every run appends a start and an end record to the card's trust ledger, cards/lo
 outside the worktree (worker_commits()); the end is written on every exit, after the opencode child
 is killed. A commit made while a worker ran never vouches for verdicts/<id>.md. A fresh run moves the
 old ledger aside; --keep on a worktree with no ledger whose branch has a verdict commit refuses to start
-unless --trust-existing records that the operator inspected it. A killed attempt's tokens count.
+unless --trust-existing records that the operator inspected it. Ranges are keyed on commit ids, so a
+rebase or amend between runs gives a forged commit a new id in no range: --keep refuses a branch where
+a closed range's end is no longer an ancestor of HEAD (ledger_rewritten), unless --trust-existing,
+after the operator inspected the rewritten branch, moves the ledger aside and starts a new one trusting
+HEAD as is. An intact ledger is never overridden. A killed attempt's tokens count.
 
 v3 rules on top of v2: the last Acceptance command must be the full gate (`scripts/gate.sh`),
 whose pass requires a literal `GATE EXIT=0` line, not just exit code 0 (§7.6.4); workers may
@@ -495,6 +499,20 @@ def ledger_append(path, rec):
         os.fsync(fh.fileno())
 
 
+def ledger_move_aside(path, card_id):
+    """Rename the ledger at path to <card_id>.ledger.<stamp>[-<n>].jsonl beside
+    it, never over an earlier one, and return the new path. The old ranges are
+    kept for the record; nothing reads them again."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    aside = path.with_name(f"{card_id}.ledger.{stamp}.jsonl")
+    n = 1
+    while aside.exists():
+        n += 1
+        aside = path.with_name(f"{card_id}.ledger.{stamp}-{n}.jsonl")
+    path.rename(aside)
+    return aside
+
+
 # A full commit id as the runner writes it (git rev-parse HEAD): the only shape
 # worker_commits() accepts from the ledger, and the only one main() records as an end.
 OID_RE = re.compile(r"[0-9a-f]{40}")
@@ -513,6 +531,12 @@ def worker_commits(wt, base, path):
     went) fails closed: every commit in base..HEAD outside base..start counts.
     That includes the current run, whose range is open until it exits. Commits
     made between runs, where the gate's verdict commit lands, are in no range.
+    Ranges are keyed on commit ids, so a rebase or amend between runs would
+    also put an earlier run's commits, a forged verdict among them, in no range
+    under new ids: main() refuses a --keep run when a closed range's end is no
+    longer an ancestor of HEAD (ledger_rewritten), and --trust-existing, after
+    the operator inspected the branch, moves that ledger aside and starts a new
+    one at HEAD.
 
     Only well-formed records are read: every line a JSON object with a string
     run, every start a full lowercase 40-hex id (OID_RE), every end one or null.
@@ -555,6 +579,50 @@ def worker_commits(wt, base, path):
             return None
         worker.update(p.stdout.split())
     return worker
+
+
+def ledger_rewritten(wt, path):
+    """The ends of the ledger's closed ranges that are no longer ancestors of
+    HEAD in wt, each listed once: the branch was rewritten (rebased, amended,
+    reset) since those runs. If end is still an ancestor, every commit up to
+    it is byte-identical (each id hashes its parents'), so the range still
+    names the commits it named; an amended tip moves end but leaves start in
+    place, which is why end is the one checked. Open ranges (end null or
+    absent) are not listed: worker_commits already fails them closed.
+
+    The records are read with worker_commits' validation, repeated here
+    because that function is left as it is: every line a JSON object with a
+    string run, every start a full 40-hex id (OID_RE), every end one or null.
+    A ledger that does not validate returns [] ("not judged here"):
+    worker_commits returns None for it and the run already trusts nothing, so
+    it is not refused twice. An end git cannot judge (merge-base exits other
+    than 0 or 1, e.g. the object is gone) is listed as
+    "<end> (git merge-base failed, exit N)": fail closed."""
+    try:
+        recs = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    except (OSError, ValueError, RecursionError):
+        return []
+    oid = lambda v: isinstance(v, str) and OID_RE.fullmatch(v) is not None
+    starts, ends = set(), {}
+    for r in recs:
+        if not isinstance(r, dict) or not isinstance(r.get("run"), str):
+            return []
+        if "start" in r:
+            if not oid(r["start"]):
+                return []
+            starts.add(r["run"])
+        elif "end" in r:
+            if r["end"] is not None and not oid(r["end"]):
+                return []
+            ends[r["run"]] = r["end"]  # the last end wins, as in worker_commits
+    gone = []
+    for end in dict.fromkeys(e for run_id, e in ends.items() if run_id in starts and e):
+        p = subprocess.run(["git", "merge-base", "--is-ancestor", end, "HEAD"], cwd=wt, env=git_env(), capture_output=True, text=True)
+        if p.returncode == 1:
+            gone.append(end)
+        elif p.returncode != 0:
+            gone.append(f"{end} (git merge-base failed, exit {p.returncode})")
+    return gone
 
 
 def gate_committed(wt, base, f, card_id, pre_head, ledger=None):
@@ -857,7 +925,7 @@ def main():
     ap.add_argument("--model", default="zai-coding-plan/glm-5.3")
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB, help="refuse to start an attempt below this much free disk")
     ap.add_argument("--keep", action="store_true", help="reuse an existing worktree and branch")
-    ap.add_argument("--trust-existing", action="store_true", help="with --keep and no trust ledger: trust the branch as it is (after inspecting it)")
+    ap.add_argument("--trust-existing", action="store_true", help="with --keep and no trust ledger, or one whose ranges a rebase or amend left behind: trust the branch as it is (after inspecting it); the latter's ledger is moved aside. Ignored with an intact ledger")
     args = ap.parse_args()
 
     card_path = pathlib.Path(args.card)
@@ -881,30 +949,45 @@ def main():
             sys.exit(out)
         # A recreated branch starts a new ledger; the old one is kept for the record.
         if ledger.exists():
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            aside = ledger.with_name(f"{card_id}.ledger.{stamp}.jsonl")
-            n = 1
-            while aside.exists():
-                n += 1
-                aside = ledger.with_name(f"{card_id}.ledger.{stamp}-{n}.jsonl")
-            ledger.rename(aside)
+            ledger_move_aside(ledger, card_id)
     # Before anything else reads or runs in the worktree, --trust-existing's
     # inspection included: a run on a repository whose git state hides changes
     # never starts (scope_violations would refuse every attempt anyway).
     state = git_state_problems(wt)
     if state:
         sys.exit(f"[{card_id}] git state hides changes; not starting (nothing was cleared):\n" + "\n".join(state))
+
+    def trust_head():
+        # The operator's --trust-existing: a closed range at HEAD, so nothing
+        # on the branch now counts as a worker's commit.
+        _, head = run(["git", "rev-parse", "HEAD"], wt)
+        trusted = uuid.uuid4().hex
+        ledger_append(ledger, {"run": trusted, "start": head.strip(), "t": time.time(), "trust-existing": True})
+        ledger_append(ledger, {"run": trusted, "end": head.strip(), "t": time.time()})
+        return head.strip()
+
+    if kept and ledger.exists():
+        # A rebase or amend since the ledger's runs gives their commits new ids
+        # in no range, so a forged verdict among them would read as the gate's.
+        gone = ledger_rewritten(wt, ledger)
+        if gone and not args.trust_existing:
+            sys.exit(f"[{card_id}] the branch was rewritten since its ledger's runs (ends no longer in HEAD's history: {', '.join(gone)}); rerun without --keep, or pass --trust-existing after inspecting the branch")
+        if gone:
+            # Old ranges name commits no longer on the branch; kept, they would
+            # make worker_commits fail once those objects are pruned.
+            aside = ledger_move_aside(ledger, card_id)
+            head = trust_head()
+            print(f"[{card_id}] --trust-existing: {branch} rewritten since its ledger; trusted as is at {head} (old ledger moved to {aside})", flush=True)
+        elif args.trust_existing:
+            print(f"[{card_id}] --trust-existing ignored: the ledger is intact", flush=True)
     if kept and not ledger.exists():
         # A worktree from before the ledger: nothing says which of its commits a
         # worker made, so a verdict-subject commit on it cannot be told from a forgery.
         rc, subjects = run(["git", "log", "--format=%s", f"{args.base}..HEAD"], wt)
         verdict_subject = rc or any(l.startswith(f"nucleus v3: {card_id} verdict ") for l in subjects.splitlines())
         if args.trust_existing:
-            _, head = run(["git", "rev-parse", "HEAD"], wt)
-            trusted = uuid.uuid4().hex
-            ledger_append(ledger, {"run": trusted, "start": head.strip(), "t": time.time(), "trust-existing": True})
-            ledger_append(ledger, {"run": trusted, "end": head.strip(), "t": time.time()})
-            print(f"[{card_id}] --trust-existing: {branch} at {head.strip()} trusted as is (recorded in {ledger})", flush=True)
+            head = trust_head()
+            print(f"[{card_id}] --trust-existing: {branch} at {head} trusted as is (recorded in {ledger})", flush=True)
         elif verdict_subject:
             sys.exit(f"no trust ledger for {card_id}; rerun without --keep, or pass --trust-existing after inspecting the branch")
     # opencode takes its session directory from PWD, not the process cwd; without this the
