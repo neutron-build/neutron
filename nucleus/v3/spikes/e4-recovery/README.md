@@ -1858,6 +1858,121 @@ list expected it; its findings were "separators out of order" and
 "lpid 36 reachable more than once", the family F3's step-1 `next_lpid`
 fix plausibly cleared — recorded, not re-derived deeper).
 
+**Step 1 — the WAL's serialized writer (§12.4 / I-REDO-COMPLETE;
+commit e6ebbdda).** The gate's S-1-F3 text for §12.4: "a commit is
+acked durable only through the contiguous written-and-synced prefix of
+the WAL". The draft let `wal_writer_step` run in two tasks at once (the
+writer task and a committer helping from `wal_wait_durable`/
+`wal_wait_written`), each taking its own batch and advancing
+`written`/`durable` with `max`, so a later batch's write+sync acked its
+SyncOn commit over an unwritten (or unsynced) earlier batch — seed 21
+r0's ts=15 over ts=14's hole; §12.5's replay stop then lost the acked
+record and G2 zeroed it.
+
+- **The shape chosen: (b), the gate's preferred — serialize the
+  writer** (src/store/wal.rs). `WalState.in_flight: Option<(u64,u64)>`
+  holds the taken batch's LSN range; `wal_writer_step` takes no batch
+  while one is in flight and parks the caller on `WalAcks` (the
+  existing "batch taken but not yet written" rule); the holder clears
+  the flag and wakes `WalAcks` on **every** exit (its error paths
+  included — a `wal_writer:release` step after the body, whose failure
+  is swallowed because a failed world unwinds every waiter anyway);
+  `written` advances to the batch end only when the batch starts at the
+  current `written` (`wal_writer:written`, a loud `Fail::Invalid` on any
+  other case), and `durable` advances only within `[start, end]`
+  (`wal_writer:durable` — a waiter's `wal_sync_through` may already
+  have covered the written bytes while the holder sat at
+  `writer:presync`, D4's own shape, so `durable` may legitimately sit
+  inside the batch). No existing test was changed to fit the shape: D4
+  still passes at the fixed code (step 1 must still make the parked
+  batch durable, and it does — through `wal_sync_through`).
+- **The pin** `cdiv_syncon_ack_never_crosses_an_unwritten_batch`
+  (tests/store.rs, a literal two-task config): segment 0 holds four
+  durable setup commits ending exactly at LSN 65536; task A enqueues
+  ts=5..8 filling segment 1 exactly, takes batch 1, writes it and is
+  held at `writer:presync` (budget 900_000, far under the 1 M livelock
+  budget) — written, unsynced; task B waits for exactly that hole
+  state, enqueues ts=9 (segment 2, a fresh segment whose sync can never
+  cover batch 1's bytes) and runs its §12.4 SyncOn ack wait; the driver
+  crashes the world the moment B parks on `WalAcks` (the rule in force)
+  or B's ack returns (the mutant). Asserts: ts=9's `wal_wait_durable`
+  has not returned; `wal.durable` never passed batch 1's start (65536);
+  and after F-CRASH resolves (`keep_latest_pm: 0, tear_pm: 0`) recovery
+  returns the ts-prefix through the setup commits (`frontier == 4`, the
+  WAL restarted at the valid end 65536). **Mutant M-WALa** (the
+  concurrent take with `max` accounting restored): the pin fails on the
+  first assertion — "ts=9's wal_wait_durable returned before the crash"
+  — applied, shown failing, reverted clean (`git diff` free of the
+  mutant).
+- **Movement (f).** Seed 21 r0 **passes** at the tip (`frontier=14 ≥
+  lo=13`; the `frontier < lo` signature is gone). The fix parks every
+  helper that previously took its own batch, so each workload world's
+  yield stream changes and every uniform crash point moves — the F2/F3
+  seed pins whose literal configs moved were re-derived at the tip with
+  their assertions byte-identical, and each pin's revert was
+  re-demonstrated on the new configs:
+  `g8_poison_ends_the_workload_instead_of_livelocking` 1108 → **7**
+  (1108's r0 flipped to a recovery-Err detection round, its chain stops
+  before r1; 7 r1 is the same MP-LIVELOCK shape after an R6 r0 — M-G8a
+  re-demonstrated: 987 r1 livelocks at `h:ckpt` and 7 r1 at `h:ckpt`
+  with the poison mark removed);
+  `r20_mpe_r_reads_the_issued_write_history` 38/137 → **48/308** (both
+  lost their rollback round; 48 r0 and 308 r0 carry the shape-B
+  rollback with `rlen ≥ 1`, all rounds passing — the events-half revert
+  re-demonstrated: the pin fails on 48 with the exactness text; 308's R
+  has a dwrites-half source and does not catch that revert alone);
+  `r28_residual_seeds_clear_via_k` 6157 → **5808** (6157's round moved
+  to a no-rollback shape and its twin now fails O-1(c) — the inherited
+  C-DIV echo; 5808 r0 carries the residual K shape, K slot 53 — M-R28g
+  re-demonstrated: 1787 fails "tainted referenced slot 14 not reported"
+  and 5808 "…slot 53 not reported" with the harness K disabled).
+  **0..200 at the tip: 18 failing rounds** (F3's file had 22 in 0..200);
+  **C-DIV 10 rounds, of which `frontier < lo`: 2** (20 r2, 115 r1 — both
+  O-1(b) with `frontier == lo − 1`) — not 0, so the remainder goes to
+  step 8. DEADLOCK 0, DEFECT_SEEDS 0, no livelock.
+- **The cross-check (e) — `E4_ACK_DIAG`, ESCALATED to P.**
+  `HarnessState.client_acked` (a diagnostic, never serialized, never a
+  digest input, never an oracle input) records every commit ts whose
+  own §12.4 ack wait returned before the crash (`h:cliack1`/`h:cliack2`
+  in `commit_txn`, both the chunked marker's §12.7 wait and the plain
+  ack). Over `run --seeds 0..200` at the tip, comparing every commit's
+  derived `acked` flag against it over the **fired, judged** rounds (a
+  discarded NEVER-FIRED retry attempt never reaches the judge, so its
+  comparison is noise; the diag gates on `obs.crash_fired`):
+  **4,656 commits, 4,571 agreeing, 55 disagreeing commits across 31
+  rounds** — not "0 disagreements", so per the card the derivation is
+  escalated, unchanged. Two shapes, each with the first three recorded
+  (seed, round, class; ts, lsn, len, sync_on; the events over the
+  record's segment):
+  1. **derived-only (9 rounds; e.g. seed 9 r0 Mw ts=5 lsn=182270
+     len=49 SyncOff; seed 20 r2 C ts=64 lsn=661312 len=3573 SyncOn;
+     seed 115 r1 C ts=25 lsn=411423 len=2937 SyncOn):** the event
+     history says the write (and covering sync) returned — the
+     commit **is** durable — while the committer's own wait never
+     returned (it crashed in or before the wait, `commit:preapply`
+     included, while another task completed the batch). The derivation
+     measures durability; the client measures observation; a crash
+     between the two is inherent asynchrony, not obviously a defect —
+     but the two remaining `frontier < lo` rounds (20 r2, 115 r1) are
+     exactly derived-only rounds whose derived-acked SyncOn commit sits
+     beyond a §12.5 replay stop (step 8 takes them).
+  2. **client-only (23 rounds, always the round's first commits at
+     lsn 0..~1 KiB, ts 1..4; e.g. seed 0 r0 C ts=1 lsn=0 len=206
+     SyncOn):** the events show the record written and synced
+     (`W+ f2@0+206 W= f2@0+206 S+ f2 S= f2`), the client's wait
+     returned, yet the walk never yields the record — a **same-round
+     segment recycle** later reissued the same file offsets (the
+     recycled segment's next life starts at file offset 0), and the
+     derivation's per-offset latest-write map (`files.insert(off, …)`)
+     keeps only the recycled life's bytes, so the original record's
+     header is masked. The record is durable and graduated into the
+     image (a recycle frees only segments wholly below `wal_start`),
+     so O-1 sees it through the image and the under-marked `acked`
+     flag can only lower `lo` (never raise `hi` — the newest record
+     cannot be below the recycle line); 21 of the 23 rounds pass.
+     Still a real derivation-vs-observation divergence, which is P's
+     to rule on: **ESCALATE (the derivation, unchanged).**
+
 
 
 Final lines, verbatim:

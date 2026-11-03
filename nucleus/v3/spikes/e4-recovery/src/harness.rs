@@ -192,6 +192,16 @@ pub struct HarnessState {
     /// derivation's F1 fix: the extent lets it fail loudly when a
     /// record's bytes were written yet can never parse).
     pub wal_commits: BTreeMap<u64, (bool, u64, u64)>,
+    /// **X-5c-F3-F1 step 1 (e): the client-observed acks** — every
+    /// commit ts whose own §12.4 ack wait (`wal_wait_durable` for
+    /// SyncOn, `wal_wait_written` for SyncOff; the chunked marker's
+    /// §12.7 durability wait included) returned before the crash. A
+    /// **diagnostic only**, never serialized, never a digest input and
+    /// never an oracle input: it exists so `E4_ACK_DIAG` can compare it
+    /// against `derive_written_acked`'s derived `acked` flags (the
+    /// derivation feeds `lo`, so a divergence is an instrumentation
+    /// question for P, never something the worker patches in passing).
+    pub client_acked: BTreeSet<u64>,
     /// The txn counter (ids).
     pub txn_counter: u64,
     /// Registered snapshots (long readers).
@@ -520,6 +530,13 @@ pub fn commit_txn(
         } else {
             wal::wal_wait_written(cx, end_lsn)?;
         }
+        // X-5c-F3-F1 step 1 (e): the client observed this commit's
+        // durability wait return (a diagnostic; see
+        // `HarnessState::client_acked`).
+        cx.with("h:cliack1", |c| {
+            c.h().client_acked.insert(ts);
+            Ok(())
+        })?;
     }
     // Release the critical section.
     cx.with("h:cs4", |c| {
@@ -544,6 +561,14 @@ pub fn commit_txn(
     } else {
         wal::wal_wait_written(cx, end_lsn)?;
     }
+    // X-5c-F3-F1 step 1 (e): the client-observed ack (a diagnostic; see
+    // `HarnessState::client_acked`). A task that crashes inside the
+    // wait never records the ts — that is exactly the comparison's
+    // point.
+    cx.with("h:cliack2", |c| {
+        c.h().client_acked.insert(ts);
+        Ok(())
+    })?;
     // Apply: entry by entry, as gated inserts, in ascending user-key
     // order per tree (§9.1).
     let mut ordered: Vec<&Op> = ops.iter().collect();
@@ -1813,7 +1838,17 @@ pub fn run_round(
     // see the arm there.
     run_script(&sched, script, seed);
     let sched_yields_total = sched.lock().sched.yields;
-    let (mut disk, mut model, flip_pos, flags, wal_commits, events, obs, workload_served) = {
+    let (
+        mut disk,
+        mut model,
+        flip_pos,
+        flags,
+        wal_commits,
+        events,
+        obs,
+        workload_served,
+        client_acked,
+    ) = {
         let g = sched.lock();
         // The workload-pass observables, snapshotted the moment the tasks
         // ended (a crash mid-task leaves the partial-apply and walk flags
@@ -1899,6 +1934,9 @@ pub fn run_round(
             // (the round's served_k input; `new_round` below clears the
             // disk's list, so they are captured here).
             g.disk.served.clone(),
+            // X-5c-F3-F1 step 1 (e): the client-observed acks (a
+            // diagnostic for `E4_ACK_DIAG`).
+            g.h.client_acked.clone(),
         )
     };
     if faults.probe_pass {
@@ -1927,6 +1965,83 @@ pub fn run_round(
     // the commit record's last byte returned, and (SyncOn) a WAL sync
     // covering it returned / (SyncOff) the write returned.
     let (written_ts, acked_ts, unparsed_written) = derive_written_acked(&events, &wal_commits);
+    // X-5c-F3-F1 step 1 (e), the cross-check (`E4_ACK_DIAG`, stderr
+    // only, never a digest input): every commit's derived `acked` flag
+    // against the client-observed ack (did this commit's own
+    // `wal_wait_durable`/`wal_wait_written` return before the crash?).
+    // Agreement validates the derivation that feeds `lo`; a divergence
+    // is recorded and ESCALATEs to P — the worker never changes
+    // `derive_written_acked` to make one side match the other.
+    if std::env::var("E4_ACK_DIAG").is_ok() && obs.crash_fired {
+        // (`obs.crash_fired`: a discarded NEVER-FIRED retry attempt —
+        // whose whole workload ran to completion and whose segments may
+        // have been recycled — never reaches the judge; its comparison
+        // would be noise, so only the fired, judged shape prints.)
+        let derived: BTreeSet<u64> = acked_ts.iter().copied().collect();
+        let n = wal_commits.len();
+        let both = derived.intersection(&client_acked).count();
+        let derived_only: Vec<u64> = derived.difference(&client_acked).copied().collect();
+        let client_only: Vec<u64> = client_acked.difference(&derived).copied().collect();
+        eprintln!(
+            "ACK diag: seed={seed} round={round} class={:?} commits={n} agree={both} derived_only={derived_only:?} client_only={client_only:?}",
+            faults.class
+        );
+        for ts in derived_only
+            .iter()
+            .take(3)
+            .chain(client_only.iter().take(3))
+        {
+            let (sync_on, lsn, len) = wal_commits.get(ts).copied().unwrap_or((false, 0, 0));
+            // The derivation's per-cause verdict for this ts, so the
+            // record names the failing half (the walk never yielding
+            // the record vs the returned/durable extent tests).
+            let found = ack_record_present(&events, lsn);
+            let why = if derived.contains(ts) {
+                "derived acked: the write/sync events say durable, but the\
+                 \ncommitter's own ack wait never returned (crashed in or\
+                 \nbefore the wait while another task completed the batch)"
+            } else if found {
+                "record present: an extent test failed"
+            } else {
+                "the walk never yielded the record"
+            };
+            eprintln!(
+                "ACK diag: ts={ts} lsn={lsn} len={len} sync_on={sync_on} derived_acked={} client_acked={} ({why})",
+                derived.contains(ts),
+                client_acked.contains(ts)
+            );
+            // The events over the record's own segment (the escalation
+            // record's evidence: issue/return/sync order, and any later
+            // write into the same file at the same offsets — the
+            // recycle's latest life masking the original).
+            let seg = crate::store::WAL_SEG;
+            let mut ev: Vec<String> = Vec::new();
+            for e in events.iter() {
+                match e {
+                    DiskEvent::WriteIssued { inode, off, bytes } if *off < seg => {
+                        ev.push(format!("W+ f{inode}@{off}+{}", bytes.len()));
+                    }
+                    DiskEvent::WriteReturned { inode, off, len } if *off < seg => {
+                        ev.push(format!("W= f{inode}@{off}+{len}"));
+                    }
+                    DiskEvent::SyncIssued { inode, all } => {
+                        ev.push(format!("S+ f{inode} all={all}"));
+                    }
+                    DiskEvent::SyncReturned { inode, all } => {
+                        ev.push(format!("S= f{inode} all={all}"));
+                    }
+                    _ => {}
+                }
+            }
+            let ev = if ev.len() > 24 {
+                let n = ev.len();
+                Some(format!(" …{} more… ", n - 20)).map(|m| ev[..20].join(" ") + &m)
+            } else {
+                Some(ev.join(" "))
+            };
+            eprintln!("ACK diag:   events[seg0]: {}", ev.unwrap_or_default());
+        }
+    }
     for ts in written_ts {
         model.mark_written(ts);
     }
@@ -2787,6 +2902,64 @@ pub fn run_round(
 /// writer's 4-KiB batch chunks, and recycled segments' file-relative
 /// positions; D9's renamed-segment shape pinned both).
 ///
+/// X-5c-F3-F1 step 1 (e) diagnostic helper (`E4_ACK_DIAG` only): does
+/// the issued-write history hold a parsable record at `lsn`'s
+/// segment-relative position with its own lsn (the walk's `ts_pos`
+/// precondition)? Hops record-to-record exactly as
+/// [`derive_written_acked`] does, so its verdict matches the walk's.
+/// Never a digest input; exists only to name the failing half of a
+/// derived-vs-client ack disagreement.
+fn ack_record_present(events: &[DiskEvent], lsn: u64) -> bool {
+    let seg = crate::store::WAL_SEG;
+    let mut files: BTreeMap<usize, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
+    for e in events {
+        if let DiskEvent::WriteIssued { inode, off, bytes } = e {
+            files.entry(*inode).or_default().insert(*off, bytes.clone());
+        }
+    }
+    for writes in files.values() {
+        let mut off = writes.keys().copied().min().unwrap_or(0);
+        loop {
+            if off >= seg {
+                break;
+            }
+            let whole = stitched(writes, off, (seg - off) as usize);
+            if whole.len() >= 24 && whole.get(0..4) == Some(&0x4C41574Eu32.to_le_bytes()) {
+                let len = {
+                    let mut b = [0u8; 4];
+                    if let Some(s) = whole.get(4..8) {
+                        for (i, x) in s.iter().enumerate() {
+                            b[i] = *x;
+                        }
+                    }
+                    u32::from_le_bytes(b) as u64 & 0xFFFF_FFFF
+                };
+                let rec_lsn = {
+                    let mut b = [0u8; 8];
+                    if let Some(s) = whole.get(16..24) {
+                        for (i, x) in s.iter().enumerate() {
+                            b[i] = *x;
+                        }
+                    }
+                    u64::from_le_bytes(b)
+                };
+                if rec_lsn == lsn && rec_lsn % seg == off && len >= 16 && off + len <= seg {
+                    return true;
+                }
+                if len >= 16 && off + len <= seg {
+                    off += len;
+                    continue;
+                }
+            }
+            match writes.range(off + 1..).next() {
+                Some((&next, _)) if next < seg => off = next,
+                _ => break,
+            }
+        }
+    }
+    false
+}
+
 /// The third return is the **loud** half of the gate's round-3 F1: every
 /// commit whose record header is present in some WAL file's issued
 /// writes at its segment-relative position with its own lsn, but whose
