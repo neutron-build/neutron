@@ -36,15 +36,28 @@ vfield() { printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed '
 # nothing, and `done < <(changed ...)` would read that as "nothing changed".
 # verify_objects first (git-env.sh says why): a forged object makes the diff
 # list nothing. Its lines go to stderr and stay in VERIFY_PROBLEMS.
-changed() { local b=$1 h=$2; shift 2; verify_objects "$b" "$h" || { printf '%s\n' "$VERIFY_PROBLEMS" >&2; return 1; }; git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$b...$h" -- "$@"; }
+# _changed_names is the same listing unverified, for check_merge's audit mode
+# only (it says why); every other caller uses changed.
+_changed_names() { local b=$1 h=$2; shift 2; git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$b...$h" -- "$@"; }
+changed() { local b=$1 h=$2; shift 2; verify_objects "$b" "$h" || { printf '%s\n' "$VERIFY_PROBLEMS" >&2; return 1; }; _changed_names "$b" "$h" "$@"; }
 
 # check_merge ID BASE HEAD MODE [CARD_GATE CARD_CLASS QUEUE_FILE]
 # MODE is "merge" (pre-merge, card file known) or "audit" (CI, from git only).
 # Prints one line per violation; returns 1 if there were any.
+# Audit mode verifies no objects itself (the commit+tree closure of the
+# audited ref is verified once by audit-merges.sh; the skips below say why);
+# every other mode verifies the ranges it reads.
 check_merge() {
   local id=$1 base=$2 head=$3 mode=$4 card_gate=${5:-} card_class=${6:-} queue=${7:-}
-  local own="$V3/verdicts/$id.md" errs=() v
-  if ! v=$(git show "$head:$own" 2>/dev/null); then echo "no $own at the branch tip"; return 1; fi
+  local own="$V3/verdicts/$id.md" errs=() v vid vtmp
+  # The verdict's content decides every check below, so its blob is hashed
+  # (git-env.sh's verify_blob) in both modes, and its fields are read from the
+  # verified file, never from a second read. verify_reachable does not cover
+  # it: it hashes commits and trees only.
+  if ! vid=$(git rev-parse -q --verify "$head:$own"); then echo "no $own at the branch tip"; return 1; fi
+  vtmp=$(mktemp) || { echo "cannot create a temporary file for the verdict"; return 1; }
+  if ! verify_blob "$vid" "$vtmp" "$head:$own" 2>/dev/null; then rm -f "$vtmp"; printf '%s\n' "$VERIFY_PROBLEMS"; return 1; fi
+  v=$(cat "$vtmp"); rm -f "$vtmp"
   local verdict tier gexit model vcard vgate vclass vcommit
   verdict=$(vfield "$v" Verdict); tier=$(vfield "$v" Gate-tier); gexit=$(vfield "$v" Gate-exit)
   model=$(vfield "$v" Gate-model); vcard=$(vfield "$v" Card); vgate=$(vfield "$v" Card-gate)
@@ -75,8 +88,17 @@ check_merge() {
   # Only commits count, as the ^{commit} peel ignored blobs and trees.
   # The tip check reads HEAD^1's trees, the reviewed commit's, which the range
   # check below does not verify: HEAD^1 is neither the merge base nor the tip.
+  # Audit mode skips this call and the one in changed (verdict
+  # X-6-F1-F2-F3-F1-esc-1, ESC-1): every object a per-merge audit check reads
+  # is reachable from the audited REF (HEAD and BASE are the parents of a
+  # merge that rev-list --first-parent REF listed, and every merge base,
+  # range commit and tree under them is their ancestor or below one), and
+  # audit-merges.sh's verify_reachable REF has re-hashed that whole commit+tree
+  # closure under the same git_env(). The skip keys on the literal MODE
+  # argument only, never on an environment variable, a file or a marker: those
+  # are trusted state a worker could write (the card's no-cache rule).
   local tipfiles=() vl
-  if ! verify_objects "$head^1" "$head"; then
+  if [ "$mode" != audit ] && ! verify_objects "$head^1" "$head"; then
     while IFS= read -r vl; do errs+=("$vl"); done <<<"$VERIFY_PROBLEMS"
   fi
   mapfile -d '' -t tipfiles < <(git diff-tree -z --ignore-submodules=none --no-commit-id --name-only -r "$head" -- ':/')
@@ -128,7 +150,10 @@ check_merge() {
   # Through a file: process substitution drops git's exit status, and NUL-
   # separated paths cannot be held in a variable.
   lst=$(mktemp) || { echo "cannot create a temporary file for the path list"; return 1; }
-  if ! changed "$base" "$head" ':/' >"$lst"; then
+  if [ "$mode" = audit ]; then
+    # Unverified: see the skip at the tip check.
+    _changed_names "$base" "$head" ':/' >"$lst" || errs+=("cannot list paths changed in $base...$head (git diff failed)")
+  elif ! changed "$base" "$head" ':/' >"$lst"; then
     if [ -n "$VERIFY_PROBLEMS" ]; then
       while IFS= read -r vl; do errs+=("cannot list paths changed in $base...$head: $vl"); done <<<"$VERIFY_PROBLEMS"
     else
@@ -170,12 +195,13 @@ check_merge() {
 # parents, so nothing was edited inside the merge itself ("evil merge"). A card
 # that does not merge cleanly is rebased and re-gated; conflicts are never
 # resolved inside a merge commit.
-# Both parents' trees, the merge base's, and the merge commit and its own tree
-# are verified first (git-env.sh says why): one combined call would need a
-# second listing, so it is two, and sha^1's trees are hashed twice.
+# It verifies no objects itself (verdict X-6-F1-F2-F3-F1-esc-1, ESC-1): its
+# only caller is audit-merges.sh, which has already run verify_reachable on a
+# ref containing SHA, so SHA, both parents, their merge bases and every tree
+# under them are verified. Any new caller must verify first (verify_objects
+# SHA^1 SHA^2 and SHA^1 SHA, or verify_reachable on a ref containing SHA).
 clean_merge() {
   local sha=$1 t
-  { verify_objects "$sha^1" "$sha^2" && verify_objects "$sha^1" "$sha"; } || { printf '%s\n' "$VERIFY_PROBLEMS"; return 1; }
   t=$(git merge-tree --write-tree "$sha^1" "$sha^2" 2>/dev/null) || { echo "the parents do not merge cleanly (conflicts must be fixed on the card branch and re-gated)"; return 1; }
   [ "$(printf '%s\n' "$t" | head -1)" = "$(git rev-parse "$sha^{tree}")" ] || { echo "the merge commit's tree differs from the clean merge of its parents (edited inside the merge)"; return 1; }
 }

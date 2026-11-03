@@ -350,12 +350,14 @@ def worktree_changes(wt):
 
 class ObjectsUnverified(subprocess.CalledProcessError):
     """changed_files' refusal when verify_objects reports problems (the lines
-    are in .problems). A CalledProcessError, so every caller that refuses a
+    are in .problems; .files is the listing as git gave it, which the lie may
+    have shortened). A CalledProcessError, so every caller that refuses a
     failed listing refuses this too."""
 
-    def __init__(self, problems, cmd):
+    def __init__(self, problems, cmd, files):
         super().__init__(1, cmd, "", "\n".join(problems))
         self.problems = problems
+        self.files = files
 
 
 def _verify_ids(wt, name, want, d):
@@ -441,14 +443,15 @@ def changed_files(wt, base):
     # submodule.<name>.ignore=all in a worktree .gitmodules (tracked or not),
     # drops an added gitlink. changed_since passes the same three.
     files = set(git_paths(["diff", "--no-renames", "--no-relative", "--ignore-submodules=none", "--name-only", f"{base}...HEAD"], wt))
-    # A forged object makes the diff list nothing (verify_objects), so its
-    # listing is used only once the objects verify. The diff runs first only so
-    # that a git failure (a bad base) is still named as the diff's.
+    # A forged object makes the diff list nothing (verify_objects), so the
+    # listing is trusted only once the objects verify. The diff runs first only
+    # so that a git failure (a bad base) is still named as the diff's.
     probs = verify_objects(wt, base, "HEAD")
-    if probs:
-        raise ObjectsUnverified(probs, ["verify_objects", str(base), "HEAD"])
     files.update(f for _, f in worktree_changes(wt))
-    return sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
+    out = sorted(f for f in files if f and f not in ("opencode.json",) and not f.endswith("Cargo.lock"))
+    if probs:
+        raise ObjectsUnverified(probs, ["verify_objects", str(base), "HEAD"], out)
+    return out
 
 
 def changed_since(wt, rev, f):
@@ -660,9 +663,11 @@ def scope_violations(wt, base, touch, card_id=None, pre_head=None, ledger=None):
     try:
         files = changed_files(wt, base)
     except ObjectsUnverified as e:
-        # Each line named, as git state is.
+        # Each line named, as git state is, and the checks below still run on
+        # the listing git gave: it can only add violations to a refusal.
         sfx = " (git state hides changes)"
-        return bad + [p if p.endswith(sfx) else p + sfx for p in e.problems]
+        bad += [p if p.endswith(sfx) else p + sfx for p in e.problems]
+        files = e.files
     except subprocess.CalledProcessError as e:
         # A check that cannot see the diff refuses (PLAN-v3 §7.6).
         why = ((e.stderr or "").strip().splitlines() or ["no stderr"])[0]

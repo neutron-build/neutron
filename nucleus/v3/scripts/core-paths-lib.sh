@@ -49,8 +49,12 @@ EOF
 # entry means present (the blob read is then checked on its own), no entry with
 # exit 0 means absent, and non-zero means BASE itself cannot be read. A base git
 # can diff (diff compares trees, never this blob) can still fail the read.
+# The blob goes through git-env.sh's verify_blob (sourced by every caller): a
+# forged loose object or .idx offset can make this id return a list without
+# tools/, and a mismatch is exit 1, never 3, which would read the worktree's
+# copy (X-6-F1-F2-F3-F1-esc-1).
 base_core_entries() {
-  local base=$1 v3dir=$2 tmp rc=0 n rec meta mode type id text
+  local base=$1 v3dir=$2 tmp rc=0 n rec meta mode type id
   tmp=$(mktemp) || { echo "cannot create a temporary file to read $v3dir/CORE_PATHS at $base" >&2; return 1; }
   git ls-tree --full-tree -z "$base" -- "$v3dir/CORE_PATHS" >"$tmp" 2>/dev/null || rc=$?
   if [ "$rc" -ne 0 ]; then rm -f "$tmp"; echo "git ls-tree $base failed (exit $rc)" >&2; return 1; fi
@@ -68,8 +72,10 @@ EOF
     blob:100644 | blob:100755) ;;
     *) echo "$v3dir/CORE_PATHS at $base is a $type (mode $mode), not a regular file" >&2; return 1 ;;
   esac
-  # Into a variable, not piped into core_entries: a pipe drops git's exit status.
-  text=$(git cat-file blob "$id" 2>/dev/null) || rc=$?
-  if [ "$rc" -ne 0 ]; then echo "git cat-file blob $id at $base failed (exit $rc)" >&2; return 1; fi
-  printf '%s\n' "$text" | core_entries
+  # Into a file, not piped into core_entries: a pipe drops git's exit status.
+  # The entries are read from that verified file, never from the blob again.
+  tmp=$(mktemp) || { echo "cannot create a temporary file to read $v3dir/CORE_PATHS at $base" >&2; return 1; }
+  if ! verify_blob "$id" "$tmp" "$base:$v3dir/CORE_PATHS" 2>/dev/null; then rm -f "$tmp"; echo "$VERIFY_PROBLEMS" >&2; return 1; fi
+  core_entries <"$tmp"
+  rm -f "$tmp"
 }

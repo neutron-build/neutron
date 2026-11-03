@@ -25,8 +25,11 @@ git_state_refuse >/dev/null || { state=1; sed 's/^/audit: /' <<<"$GIT_STATE_PROB
 ref=${1:-HEAD}
 # Every commit and tree in REF's history, hash-verified once (git-env.sh's
 # verify_reachable): the path-limited listing below never yields a commit that
-# is TREESAME under a swapped tree. The walk still runs, as for git state; the
-# per-merge checks verify their own ranges again.
+# is TREESAME under a swapped tree. It runs before the listing, on the same
+# REF, and is the audit's only object check: clean_merge and audit-mode
+# check_merge read only objects reachable from REF, so they verify nothing
+# again (enforce-lib.sh says why; the one exception is the verdict blob, which
+# check_merge hashes itself). The walk still runs, as for git state.
 verify_reachable "$ref" || { state=1; sed 's/^/audit: /' <<<"$VERIFY_PROBLEMS"; }
 # The commit list goes through a file, not `done < <(git rev-list ...)`:
 # process substitution drops git's exit status, so a bogus ref read as an empty

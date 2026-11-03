@@ -338,11 +338,15 @@ git_state_refuse() {
 # index-pack, in a temp dir outside any repository, names each object by the
 # hash of what it got; an id that does not come back fails its hash, whatever
 # lied (a loose file, an .idx/midx/.rev offset, a missing object). An extra id
-# is the lie's true id, not a problem. Blobs are not verified: name-only diffs
-# never read them. Nothing here caches a result (a marker would be one more
-# piece of trusted state a worker could write), repairs an object, or writes
-# into the repository's objects/. tools/run_card.py's verify_objects is the
-# twin and prints the same lines.
+# is the lie's true id, not a problem. Blobs are not verified by these two:
+# name-only diffs never read them, and hashing every blob in history costs
+# about 15 s an audit under load (verdict X-6-F1-F2-F3-F1-esc-1). The two
+# blobs whose content decides a check, the verdict file at the branch tip and
+# CORE_PATHS at BASE, go through verify_blob below instead. Nothing here
+# caches a result (a marker would be one more piece of trusted state a worker
+# could write), repairs an object, or writes into the repository's objects/.
+# tools/run_card.py's verify_objects is the twin and prints the same lines;
+# verify_blob has none (the runner reads no blob content through git).
 VERIFY_PROBLEMS=
 
 # _verify_ids NAME DIR: hash-verify the ids listed in DIR/want; on a problem,
@@ -423,4 +427,25 @@ verify_reachable() {
   fi
   rm -rf "$d"
   [ -z "$VERIFY_PROBLEMS" ]
+}
+
+# verify_blob ID FILE [LABEL]: write blob ID to FILE and check that FILE hashes
+# to ID; the caller then uses FILE's bytes and never reads the blob again, so
+# the content checked is the content used, with no second read to race. For
+# the blobs whose content decides a check (X-6-F1-F2-F3-F1-esc-1, ESC-2): a
+# forged CORE_PATHS at BASE dropping tools/ let an S verdict on tools/ pass.
+# hash-object never writes (no -w) and --no-filters hashes the bytes as they
+# are. On a problem, sets VERIFY_PROBLEMS (cleared on entry) and returns 1:
+# "blob <id> (<LABEL>) fails its hash (git state hides changes)", or
+# "verify_blob: git <step> failed (exit <n>; cannot verify objects)".
+verify_blob() {
+  local id=$1 f=$2 label=${3:-} got rc=0
+  VERIFY_PROBLEMS=
+  git cat-file blob "$id" >"$f" || rc=$?
+  if [ "$rc" -ne 0 ]; then VERIFY_PROBLEMS="verify_blob: git cat-file failed (exit $rc; cannot verify objects)"; return 1; fi
+  got=$(git hash-object --no-filters -t blob -- "$f") || rc=$?
+  if [ "$rc" -ne 0 ]; then VERIFY_PROBLEMS="verify_blob: git hash-object failed (exit $rc; cannot verify objects)"; return 1; fi
+  [ "$got" = "$id" ] && return 0
+  VERIFY_PROBLEMS="blob $id${label:+ ($label)} fails its hash (git state hides changes)"
+  return 1
 }
