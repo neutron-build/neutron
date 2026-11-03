@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use e4_recovery::sim::{HARNESS, HasDisk, Sched, SchedCore, SchedHost, SimDisk, SimFail, TaskId};
 use e4_recovery::store::ckpt::{self, CkptHook};
+use e4_recovery::store::wal;
 use e4_recovery::store::{Cx, Fail, HasStore, Mutant, StoreCfg, StoreInner, amcheck, prims, tree};
 
 /// The test world: scheduling, disk and store slices plus a small shared
@@ -1077,5 +1078,232 @@ fn cxx_highest_lpid_free_never_shrinks_next_lpid() {
         sched.lock().st.meta.next_lpid,
         before,
         "the reuse must not move next_lpid"
+    );
+}
+
+/// **X-5c-F3-F1 step 1 pin (§12.4 / I-REDO-COMPLETE; a literal two-task
+/// config).** A SyncOn commit is acked durable only through the
+/// **contiguous written-and-synced prefix** of the WAL — the gate's
+/// S-STORE §12.4 text. The draft let `wal_writer_step` run in two tasks
+/// at once (the writer task and a committer helping from
+/// `wal_wait_durable`), each taking its own batch and advancing
+/// `written`/`durable` with `max`: a later batch's write+sync acked its
+/// SyncOn commit over an earlier batch's unsynced bytes, and §12.5's
+/// replay stop then lost the acked record at the crash (seed 21 r0:
+/// ts=15 acked over ts=14's hole; the `frontier < lo` signature, 93 of
+/// F3's 388 C-DIV rounds). The serialized writer fixes it: one batch in
+/// flight at a time (`WalState::in_flight`), a helper that finds one
+/// parks on `WalAcks`, and the counters advance only over the
+/// contiguous prefix.
+///
+/// The config: segment 0 holds four durable setup commits ending
+/// exactly at LSN 65536. Task A (the batch-1 holder) enqueues ts=5..8
+/// filling segment 1 exactly, takes batch 1, writes it, and is held at
+/// `writer:presync` (budget 900_000) — written, unsynced. Task B waits
+/// for exactly that hole state, then enqueues ts=9 (segment 2) and runs
+/// its §12.4 SyncOn ack wait. The driver crashes the world the moment B
+/// parks on `WalAcks` (the serialized-writer rule) or B's ack returns
+/// (the mutant). Asserted: ts=9's `wal_wait_durable` has not returned;
+/// `wal.durable` never passed batch 1's start; and after F-CRASH
+/// resolves (unsynced writes dropped) recovery returns the ts-prefix
+/// through the setup commits with the WAL restarted at the valid end.
+/// Reverting the fix (mutant M-WALa: the concurrent take with `max`
+/// accounting restored) fails this pin on both of the first two
+/// assertions — B's ack returns over batch 1's unsynced bytes and
+/// `durable` sits past batch 1's start.
+#[test]
+fn cdiv_syncon_ack_never_crosses_an_unwritten_batch() {
+    use e4_recovery::sim::WaitKey;
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    // §12.2's cap is on the whole record, so the max payload leaves
+    // room for the framing — and exactly four max records fill a
+    // 64-KiB segment (4 × REC_MAX = WAL_SEG).
+    let maxp = e4_recovery::store::wal::REC_MAX - fixed;
+    let seed = 4242u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- setup (single task): segment 0 filled exactly and durable ----
+    let (disk, st) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        for ts in 1..=4u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp as usize])
+                .expect("setup enqueue");
+        }
+        wal::wal_wait_durable(&cx, seg).expect("setup durable");
+        let g = sched.lock();
+        assert_eq!(
+            g.st.wal.append, seg,
+            "the setup must fill segment 0 exactly"
+        );
+        assert_eq!(g.st.wal.durable, seg);
+        (g.disk.clone(), g.st.clone())
+    };
+    // ---- the two-task world ----
+    let mut st = st;
+    st.parks.insert("writer:presync", 900_000);
+    let host = TestWorld {
+        sched: SchedCore::new(3, seed + 1),
+        disk,
+        st,
+        flags: BTreeMap::new(),
+    };
+    let sched = Arc::new(Sched::new(host));
+    fn sf(e: Fail) -> SimFail {
+        match e {
+            Fail::Sim(s) => s,
+            _ => SimFail::Internal("wal pin: a non-sim store failure"),
+        }
+    }
+    // Task A: enqueue ts=5..8 (segment 1 exactly), take batch 1, write
+    // it, and hold at `writer:presync` — written, unsynced.
+    let a_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        for ts in 5..=8u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp as usize])
+                .map_err(sf)?;
+        }
+        set_flag(sched, "a_enq");
+        wal::wal_writer_step(&cx).map_err(sf)?;
+        set_flag(sched, "a_done");
+        Ok(())
+    };
+    // Task B: wait for the hole state (batch 1 written, unsynced),
+    // then enqueue ts=9 (segment 2) and run its SyncOn ack wait.
+    let b_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+        let cx = Cx { w: sched, t };
+        loop {
+            let hole = cx
+                .with("pin:b:gate", |c| {
+                    let st = c.store();
+                    Ok(st.wal.written == 2 * seg && st.wal.durable == seg)
+                })
+                .map_err(sf)?;
+            if hole {
+                break;
+            }
+            cx.yield_now("pin:b:poll").map_err(sf)?;
+        }
+        set_flag(sched, "b_go");
+        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 9), 9, &[7u8; 10]).map_err(sf)?;
+        set_flag(sched, "b_enq2");
+        let end9 = 2 * seg + fixed + 10;
+        let r = wal::wal_wait_durable(&cx, end9).map_err(sf);
+        if r.is_ok() {
+            set_flag(sched, "b_acked");
+        }
+        r
+    };
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (t, body) in [
+            (
+                1usize,
+                &a_body
+                    as &(dyn Fn(&Sched<TestWorld>, TaskId) -> Result<(), SimFail> + Send + Sync),
+            ),
+            (2, &b_body),
+        ] {
+            let sched = Arc::clone(&sched);
+            handles.push(scope.spawn(move || {
+                if let Err(SimFail::Baton(s)) = sched.yield_baton(t) {
+                    panic!("entry barrier refused: Baton at {s}");
+                }
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&sched, t)));
+                let is_panic = r.is_err();
+                sched.finish(t);
+                assert!(!is_panic, "task {t} panicked");
+            }));
+        }
+        // The harness thread hands the baton over and parks on Join.
+        let starter = Arc::clone(&sched);
+        let h0 = scope.spawn(move || starter.start());
+        // The driver: crash the world the moment B parks on WalAcks
+        // (the serialized-writer rule in force) or B's ack returns (the
+        // mutant's leap).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (b_parked, acked) = {
+                let g = sched.lock();
+                (
+                    g.sched.waiting.get(2) == Some(&Some(WaitKey::WalAcks)),
+                    g.flags.get("b_acked").copied().unwrap_or(false),
+                )
+            };
+            if b_parked || acked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "driver timeout: B neither parked on WalAcks nor acked (a_enq={}, a_done={}, b_go={}, b_enq2={})",
+                flag(&sched, "a_enq"),
+                flag(&sched, "a_done"),
+                flag(&sched, "b_go"),
+                flag(&sched, "b_enq2")
+            );
+        }
+        sched.deliver_crash();
+        let _ = h0.join();
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+    // ---- the assertions at the crash ----
+    let (acked, durable) = {
+        let g = sched.lock();
+        (
+            g.flags.get("b_acked").copied().unwrap_or(false),
+            g.st.wal.durable,
+        )
+    };
+    assert!(
+        !acked,
+        "ts=9's wal_wait_durable returned before the crash: the SyncOn ack crossed batch 1's unsynced bytes (12.4 / I-REDO-COMPLETE)"
+    );
+    assert!(
+        durable <= seg,
+        "wal.durable ({durable}) passed batch 1's start ({seg}) before batch 1's sync"
+    );
+    // ---- F-CRASH resolves (unsynced writes dropped), then recovery ----
+    let mut disk = {
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    let mut frng = e4_recovery::rng::Rng::new(0xABCD_1234);
+    disk.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    let world = pass_world(1, seed + 2, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("recover after the crash");
+    assert_eq!(
+        frontier, 4,
+        "the recovered state is the ts-prefix through the setup commits (no acked commit lost)"
+    );
+    assert_eq!(
+        rec_st.wal.append, seg,
+        "the WAL restarts at the valid end (segment 1's first LSN)"
     );
 }
