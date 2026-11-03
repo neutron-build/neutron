@@ -2599,6 +2599,59 @@ DEFECT_SEEDS=0`, sha256 `f3a1e605…a1af17`, prov `commit=62d4e739`
 sha256 `f3a1e605…a1af17`) — is
 F4's triage input, per the card's Goal and Notes).
 
+## Stage X-5c-F3-F3a's record (this card)
+
+**Step 0 — the triage file, the rulings and the F3-F1-F5 record fixes.**
+
+- **(a) The provenance checks passed before the copy:** the prov file
+  shows `commit=62d4e7396f544c17d6d7c1f93875cd5b00275699`,
+  `status_lines=0`, `exit=0`, `verify_exit=0`; the JSON's sha256 equals
+  its `json_sha256` (`f3a1e6058fbccc5025b5be786280917cf1344aea301d9152842518025ea1af17`);
+  `git diff --quiet 62d4e739 HEAD` over `src`, `tests`, `examples`,
+  `Cargo.toml` and `v3/Cargo.lock` exits 0 (6db60b2b adds only
+  `verdicts/X-5c-F3-F1.md`).
+- **(b) The triage file:** committed at 929ade38
+  (`results/campaign.json` only), the message carrying the two E4 lines,
+  the quota table and the prov lines.
+- **(c) The rulings commit — before any `e4-campaign` command ran:**
+  **31effe00** ("P rulings X5-R33 and X5-R34, verbatim (nv3-X-5c-F3-F3-write-1,
+  2026-11-03; binding; pre-registered)", beside X5-R28–R32 above; the
+  two texts verified word for word against the card before the commit).
+- **(d) The F3-F1-F5 record fixes:** committed at 97e85cab (the
+  17-round table's 13 moved rounds each name e6ebbdda with the gate's
+  attribution; RESULT 5's prov commit is 62d4e739; the step-7/8 diag
+  artifacts copied to `X-5c-F3-F1.7.cxxd151*.err` /
+  `X-5c-F3-F1.7.cxxfix151*.err`, the README pointing at the copies).
+
+**(e) The class table, re-derived from `results/campaign.json` (the
+reporting rule: served rounds split out first), judged under X5-R30 (c)
+from the recorded fields — a served round passes iff
+`(skx ∨ smx) ∧ pass_na` (no re-run).** Field definitions as F3-F1's:
+a **failing** primary round has `pass=false` as amended; a **failing
+twin** round has `pass=false` in the twin record.
+
+| Class | Rounds | Record-field definition (re-derived, verifiable from the JSON) | Repros (round) |
+|---|---|---|---|
+| **Served (split out first)** | 7 MP, **all moved to pass** | MP/MW round with `served=true`: 1057, 1897, 2927, 4718, 7238, 7528, 8728 (all r0, all `mrb=true`, all carrying `O-3(a): served corruption` as recorded) — each passes the amendment: skx 1057/1897/4718, smx 2927/7238/7528/8728, all `pass_na=true`. **No failing served round remains.** | 1897 r0, 2927 r0 |
+| **C-XX** (class C) | 76 | class C failing round with `o2 != null` or `o3` = `O-3(b): XX001 in class C at [site]` — sites: `Open` 22, `AmcheckIi` 54 (no `o2`-only round) | 150 (r1, `Open`), 151 (r1, `AmcheckIi`) |
+| **C-DIV** | 314 | class C failing round **outside C-XX** carrying an `o1` text. **37 carry `frontier < lo`** (36 (b) + 1 (a) — 5054 r1) — the X5-R34 set; the rest: (b) 115, (c) 99, (d) 62, (a) 1. By round index: r0 19, r1 28, **r2 267**. (F3-F1's wider definition — carrying an `o1`, excluding only an O-1(a) inside a C-XX round — gives **364**, overlapping C-XX in 50 rounds: 42 O-1(b) + 8 O-1(c); both counts recorded per the card's step 0 (e).) | 20 (r2, b, `frontier < lo`), 63 (r2, c), 273 (r2, d), 5054 (r1, a, `frontier < lo`) |
+| **MW-ORPHAN** | 445 | MW failing round with `o1` = `O-1(c) … raw entry above the cut` and `o3` = `O-3(d): silent Ok with O-1 failing` — F3-F3b's (the `wal_ckpt_end`/I-WAL-COVER work), never fixed here | 19 (r0) |
+| **Other MW** | 8 | the MW failing rounds outside ORPHAN: 7 O-1(a)+O-3(d) (4399/4919/5619/7219/7979 r0, 8039/8649 r1), 1 O-1(d)+O-3(d) (6399 r2) — the ORPHAN published-set family | 4399, 6399 |
+| **MP O-3(e)(ii)** | 6 | MP failing round with `o3` starting `O-3(e): (ii)`: 4027, 4767, 6647, 6897, 9978 (r0) and 7748 (r1), each "reported slot N that is neither tainted nor in R" | 4027 r0, 7748 r1 |
+| **Other MP** | 4 | O-1(b) 3 (3607 r1, 4818 r0, 5227 r1), O-1(a) 1 (5928 r1) — no O-3 text, recovery `Ok` | 3607, 5928 |
+| **The twins** | 68 | failing twin rounds: 24 MP + 44 MW; `o1` kinds: MP (a) 3, (b) 16, (c) 4, (d) 1; MW (a) 12, (b) 16, (c) 8, (d) 7, (none) 1 | 339/849 family |
+
+Partition check: C 390 = 76 C-XX ∪ 314 C-DIV (disjoint by the
+definition above; 73 of the 76 C-XX rounds also carry an `o1` — 23
+O-1(a), 42 O-1(b), 8 O-1(c)); MP 10 = 6 +
+4; MW 453 = 445 + 8. Total failing rounds **853** (the recorded
+`FAILING_ROUNDS=860` minus the 7 served rounds X5-R30 (c) moves);
+failing seeds **894** (the recorded `FAILING_SEEDS=901` minus the same
+7 — 41 of the 901 fail only through their twin rounds);
+`TWIN_FAILING_ROUNDS=68`; 0 livelock/deadlock rounds, 0 defect seeds.
+**Every count equals the card's Goal table** (P's counts at F3-F1's
+gate); no deviation to record.
+
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
