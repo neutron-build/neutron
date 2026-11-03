@@ -91,6 +91,7 @@ import {
   serializeForInlineScript,
 } from "../core/serialization.js";
 import { handleImageRequest } from "./image-optimizer.js";
+import { configureImageWidths } from "../core/image-widths.js";
 import { capRequestBody, RequestBodyTooLargeError } from "./input-limits.js";
 import { handleIslandRequest } from "./server-islands.js";
 import {
@@ -580,6 +581,9 @@ export async function createServer(
     serverActions: serverActionsOptions,
   } = options;
 
+  // <Image>/<Picture> rendered by this server emit the same ladder the image
+  // route below accepts.
+  configureImageWidths(imageConfig?.widths);
   const resolvedRootDir = path.resolve(rootDir);
   const resolvedDistDir = path.resolve(resolvedRootDir, distDir);
   const resolvedRoutesDir = path.resolve(resolvedRootDir, routesDir);
@@ -1108,6 +1112,7 @@ export async function createServer(
       ],
       cacheDir: path.join(resolvedRootDir, ".neutron", "image-cache"),
       remotePatterns: imageConfig?.remotePatterns,
+      widths: imageConfig?.widths,
     });
     return response;
   });

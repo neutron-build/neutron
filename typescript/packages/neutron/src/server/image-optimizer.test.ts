@@ -9,6 +9,7 @@ import {
   optimizeImage,
   handleImageRequest,
 } from "./image-optimizer.js";
+import { DEFAULT_IMAGE_WIDTHS } from "../core/image-widths.js";
 
 describe("validateImageParams", () => {
   it("parses valid params", () => {
@@ -23,11 +24,11 @@ describe("validateImageParams", () => {
   });
 
   it("applies defaults for quality and format", () => {
-    const params = new URLSearchParams("src=/img.png&w=320");
+    const params = new URLSearchParams("src=/img.png&w=384");
     const result = validateImageParams(params);
     expect(result).toEqual({
       src: "/img.png",
-      width: 320,
+      width: 384,
       quality: 75,
       format: "webp",
     });
@@ -124,6 +125,35 @@ describe("validateImageParams", () => {
     const params = new URLSearchParams("src=/img.png&w=5000");
     const result = validateImageParams(params);
     expect("error" in result).toBe(true);
+  });
+
+  it("rejects a width inside the old range that is not on the ladder", () => {
+    const result = validateImageParams(new URLSearchParams("src=/img.png&w=500"));
+    expect(result).toMatchObject({ status: 400 });
+    expect((result as { error: string }).error).toContain("images.widths");
+  });
+
+  it("accepts every width the components can emit by default, and nothing else nearby", () => {
+    for (const width of DEFAULT_IMAGE_WIDTHS) {
+      const result = validateImageParams(new URLSearchParams(`src=/img.png&w=${width}`));
+      expect(result).toMatchObject({ width });
+      expect("error" in validateImageParams(new URLSearchParams(`src=/img.png&w=${width + 1}`))).toBe(true);
+    }
+  });
+
+  it("serves exactly the configured widths when images.widths is set", () => {
+    const configured = [320, 640, 960, 1200, 1600];
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=960"), [], configured)).toMatchObject({
+      width: 960,
+    });
+    expect("error" in validateImageParams(new URLSearchParams("src=/img.png&w=384"), [], configured)).toBe(true);
+  });
+
+  it("applies the ladder to remote images too", () => {
+    const params = new URLSearchParams(
+      "src=" + encodeURIComponent("https://cdn.example.com/photo.jpg") + "&w=500"
+    );
+    expect("error" in validateImageParams(params, [{ hostname: "cdn.example.com" }])).toBe(true);
   });
 
   it("rejects invalid format", () => {

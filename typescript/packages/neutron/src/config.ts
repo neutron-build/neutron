@@ -81,7 +81,14 @@ export interface NeutronImageConfig {
   quality?: number;
   /** Preferred output formats in priority order @default ["avif", "webp"] */
   formats?: string[];
-  /** Responsive image widths to generate @default [320, 640, 960, 1200, 1600] */
+  /**
+   * The width ladder (`server.images.widths`). `<Image>`/`<Picture>` pick
+   * srcset candidates from it, and `/_neutron/image` serves only these widths
+   * (any other `w` is a 400), so the two can never disagree. A fixed layout
+   * width (`sizes="370px"` or a `width` prop without `sizes`) emits just the
+   * 1x and 2x candidates; viewport-relative `sizes` emits the whole ladder.
+   * @default [16, 32, 48, 64, 96, 128, 256, 384, 640, 750, 828, 1080, 1200, 1920, 2048, 3840]
+   */
   widths?: number[];
   /** Allowed remote image hostnames */
   remotePatterns?: Array<{ hostname: string; protocol?: string }>;
