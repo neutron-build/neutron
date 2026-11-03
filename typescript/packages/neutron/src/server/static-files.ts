@@ -16,9 +16,9 @@ import { requestHasMatchingEtag } from "./cache-utils.js";
  *
  * A file's metadata and ETag, and the bytes of small files, are kept after
  * the first request. Every request still stats the file and rebuilds the
- * entry when its size, mtime or inode changed, so a build run in place under
- * a live server never sends a cached length for different bytes. ETags hash
- * the content: reproducible builds give every file the same mtime.
+ * entry when its size, mtime, ctime or inode changed, so a build run in place
+ * under a live server never sends a cached length for different bytes.
+ * ETags hash the content: reproducible builds give every file the same mtime.
  */
 
 interface Representation {
@@ -29,7 +29,7 @@ interface Representation {
 }
 
 interface StaticFile {
-  /** Identity file's size/mtime/inode when the entry was built. */
+  /** Identity file's size/mtime/ctime/inode when the entry was built. */
   signature: string;
   type: string;
   identity: Representation;
@@ -78,7 +78,9 @@ export function createStaticFileHandler(
       }
       return null;
     }
-    const signature = `${stat.size}:${stat.mtimeMs}:${stat.ino}`;
+    // ctime too: tools can set mtime (reproducible builds) but not ctime, and
+    // a deleted file's inode is reused at once on ext4.
+    const signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino}`;
     if (known?.signature === signature) return known;
     if (known) forget(known);
 

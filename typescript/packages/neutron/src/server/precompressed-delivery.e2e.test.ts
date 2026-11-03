@@ -240,7 +240,10 @@ describe("static files under a changing build output", () => {
     await fs.writeFile(file, "export const v = '1.2.3';\n");
     await fs.utimes(file, fixed, fixed);
     const first = await request(port, "/assets/legacy-abc123.js");
-    // Reproducible builds: same size, same mtime, different bytes, new inode.
+    // Reproducible builds: same size, same mtime, different bytes. Linux
+    // reuses the inode at once, so only ctime tells the files apart; file
+    // timestamps tick coarsely (a few ms), and a real rebuild comes later.
+    await new Promise((resolve) => setTimeout(resolve, 50));
     await fs.rm(file);
     await fs.writeFile(file, "export const v = '1.2.4';\n");
     await fs.utimes(file, fixed, fixed);
