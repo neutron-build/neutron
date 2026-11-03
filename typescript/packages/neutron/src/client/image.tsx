@@ -1,8 +1,7 @@
 import { h } from "preact";
 import type { JSX } from "preact";
 import type { AnyJsxElement } from "./jsx-agnostic.js";
-
-const DEFAULT_WIDTHS = [320, 640, 960, 1200, 1600];
+import { selectImageCandidates } from "../core/image-widths.js";
 
 export interface ImageLoaderArgs {
   src: string;
@@ -22,8 +21,15 @@ export interface ImageProps
   alt: string;
   width?: number;
   height?: number;
+  /**
+   * Width ladder override. Defaults to `images.widths`. With the default
+   * loader every entry must also be in `images.widths`: the endpoint rejects
+   * any other width.
+   */
   widths?: number[];
   sizes?: string;
+  /** Natural pixel width of the source; larger candidates are dropped. */
+  intrinsicWidth?: number;
   quality?: number;
   format?: "webp" | "avif" | "jpeg" | "png";
   loader?: ImageLoader;
@@ -39,6 +45,7 @@ export function Image(props: ImageProps): AnyJsxElement | null {
     height,
     widths,
     sizes,
+    intrinsicWidth,
     quality = 75,
     format,
     loader = defaultImageLoader,
@@ -58,10 +65,9 @@ export function Image(props: ImageProps): AnyJsxElement | null {
     });
   }
 
-  const candidateWidths = pickCandidateWidths(widths || DEFAULT_WIDTHS, width);
-  const baseWidth = width || candidateWidths[candidateWidths.length - 1];
-  const resolvedSrc = loader({ src, width: baseWidth, quality, format });
-  const srcSet = candidateWidths
+  const candidates = selectImageCandidates({ widths, width, sizes, intrinsicWidth });
+  const resolvedSrc = loader({ src, width: candidates.src, quality, format });
+  const srcSet = candidates.widths
     .map((candidate) => `${loader({ src, width: candidate, quality, format })} ${candidate}w`)
     .join(", ");
 
@@ -69,7 +75,7 @@ export function Image(props: ImageProps): AnyJsxElement | null {
     ...rest,
     src: resolvedSrc,
     srcSet,
-    sizes: sizes || "100vw",
+    sizes: candidates.sizes,
     alt,
     width,
     height,
@@ -80,28 +86,6 @@ export function Image(props: ImageProps): AnyJsxElement | null {
 
 function canOptimizeSrc(src: string): boolean {
   return !(src.startsWith("data:") || src.startsWith("blob:"));
-}
-
-function pickCandidateWidths(widths: number[], maxWidth?: number): number[] {
-  const filtered = Array.from(new Set(widths.filter((value) => Number.isFinite(value) && value > 0)))
-    .sort((left, right) => left - right);
-
-  if (filtered.length === 0) {
-    return [640];
-  }
-
-  if (!maxWidth || maxWidth <= 0) {
-    return filtered;
-  }
-
-  const withinBounds = filtered.filter((value) => value <= maxWidth);
-  if (withinBounds.length === 0) {
-    return [maxWidth];
-  }
-  if (withinBounds[withinBounds.length - 1] !== maxWidth) {
-    withinBounds.push(maxWidth);
-  }
-  return withinBounds;
 }
 
 export function defaultImageLoader(args: ImageLoaderArgs): string {
