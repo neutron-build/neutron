@@ -2755,6 +2755,50 @@ gate); no deviation to record.
   no slowdown; the derivation is one extra pass over the round's
   events. Well inside X5-R31's 60-min Acceptance limit.
 
+**Step 2 — the exact segment end (S-1-F3 gate G2, edit 2; commit
+ce8f8bbc).** The writer's `fits` rule is already the carried §12.2
+tail rule (its comment now cites the carried sentence); the reader
+(`ckpt::recover`'s walk) hops into the next segment after an accepted
+record that ends exactly at its segment's end (`off == WAL_SEG` after
+the advance → `valid_end = seg + WAL_SEG`, `lsn = seg + WAL_SEG`,
+`continue 'outer`), exactly as the `K_SEGEND` hop does; the loop's
+other exit (a tail shorter than a header at `off < WAL_SEG`) stays a
+stop at `off`.
+
+- **The pins** (literal configs, tests/store.rs):
+  `wal_exact_segment_end_hops` — four max-size records ending exactly
+  at LSN 65536, then two client-acked SyncOn commits in segment 1
+  (synced before the crash): recovery replays them (`frontier = 6` ≥
+  the max acked) and segment 1's record bytes are not zeroed; and
+  `wal_tail_short_never_placed` — an enqueue that would leave a tail
+  of exactly `REC_FIXED − 1` (44) bytes is placed at the next
+  segment's first LSN behind a `SegmentEnd` (the filler's magic sits
+  at the dead tail), and the SyncOn commit after it is acked
+  (`wal_wait_durable` returns) and recovered (`frontier = 5`).
+- **The mutants, demonstrated and reverted clean:**
+  **SEG-EXACT-NO-HOP** (the hop disabled) fails
+  `wal_exact_segment_end_hops` — "recovery replays the acked SyncOn
+  commits in segment 1 (frontier ≥ max acked)" (frontier stalls at 4
+  and `truncate_wal` zeroes segment 1); **SEG-TAIL-SHORT** (`fits`
+  relaxed to `probe ≤ room`) fails `wal_tail_short_never_placed` —
+  the record is placed at 65437 (the dead tail), not 65536.
+- **(e) Movement (X5-R34 (h) 2): single-seed 1064, 4770, 5054 and
+  6263 at ce8f8bbc — every named round leaves the `frontier < lo`
+  shape, with `lo` unchanged:**
+
+  | Seed/round | lo (before → after) | frontier | pass |
+  |---|---|---|---|
+  | 1064 r1 | 17 → 17 | 17 | **true** (was O-1(b) c=17) |
+  | 4770 r2 | 57 → 57 | 58 | **true** (was O-1(b) c=57) |
+  | 5054 r1 | 23 → 23 | 23 | **true** (was O-1(a) c=23) |
+  | 6263 r2 | 21 → 21 | 21 | **true** (was O-1(b) c=21) |
+
+  All four boundary store losses are cleared. One workload moved:
+  **5054 r2 now fails O-1(b) at c=29 (tree 5, scan mismatch,
+  `frontier == lo == 29`)** — moved by ce8f8bbc; not a `frontier < lo`
+  round, so it is C-DIV's remainder (step 6), never an X5-R34
+  escalation.
+
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
