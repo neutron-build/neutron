@@ -1005,12 +1005,19 @@ fn g8_poison_ends_the_workload_instead_of_livelocking() {
     // X-5c-F3-F1 step 1 note: 1108's round 0 flipped to a recovery-Err
     // detection round at the new tip (its chain stops; no r1 exists),
     // so the pin's second literal config was re-derived: seed 7 round 1
-    // is the same MP-LIVELOCK shape (directly after an R6 round 0, the
+    // was the same MP-LIVELOCK shape (directly after an R6 round 0, the
     // crash desc `poison`, no livelock, the round passes). The
     // assertions are unchanged; M-G8a was re-demonstrated on both
     // configs (987 r1 and 7 r1 livelock again with the poison mark
     // removed).
-    for seed in [987u64, 7] {
+    // X-5c-F3-F3a step 3 note: the store changes moved the workloads
+    // again — seed 7's chain now stops after its passing r0 (no r1
+    // exists; it fails only at the `rounds[1]` shape precondition) —
+    // so the second config was re-pointed at seed 387 round 1 (the
+    // same shape: r0 an R6 detection round, r1 the `poison` crash,
+    // passing, no livelock), assertions byte-identical. 987 r1 still
+    // holds.
+    for seed in [987u64, 387] {
         let rec = workload::run_seed(seed, None);
         let r1 = &rec.rounds[1];
         assert!(

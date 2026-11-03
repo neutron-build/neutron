@@ -1045,13 +1045,16 @@ fn cxx_a_crash_at_any_recovery_yield_is_never_corruption() {
 /// diagnostics in the record, never oracle inputs; judging them is P's
 /// (a served round passes iff `(skx ∨ smx) ∧ pass_na`, from the final
 /// file with no re-run). At this card's tip the MP-A seeds carry:
-/// `skx` for 1897 r0 and 4718 r0; `smx` for 2927 r0, 7528 r0 and
-/// 8728 r0 — each with `pass_na = true`; 2437 r0 and 4378 r0 moved
-/// (no longer served); 6149 r1 is not served after step 2
-/// (`skx = smx = false`), exactly as the gate predicted.
+/// `skx` for 537 r0 and 1887 r0; `smx` for 2927 r0, 7528 r0 and
+/// 8728 r0 — each with `pass_na = true`. **X-5c-F3-F3a step 3's shape
+/// maintenance:** the store change moved the workloads wholesale; the
+/// skx seeds 1897 r0 and 4718 r0 no longer carry the shape (they fail
+/// only at this test's `assert!(r.served)` precondition), re-pointed
+/// at 537 r0 and 1887 r0 with the assertions byte-identical; the smx
+/// seeds and 6149 r1 still hold.
 #[test]
 fn r30_skx_and_smx_record_fields() {
-    for (seed, want_skx, want_smx) in [(1897u64, true, false), (4718, true, false)] {
+    for (seed, want_skx, want_smx) in [(537u64, true, false), (1887, true, false)] {
         let rec = e4_recovery::workload::run_seed(seed, None);
         let r = &rec.rounds[0];
         assert!(r.served, "seed {seed} r0: the MP-A serve must hold");

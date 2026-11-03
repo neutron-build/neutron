@@ -2799,6 +2799,102 @@ stop at `off`.
   round, so it is C-DIV's remainder (step 6), never an X5-R34
   escalation.
 
+**Step 3 — I-ACK-PREFIX with two or more batches in flight (S-1-F3
+W3; gate (b) item 4).**
+
+- **(a) The fix** (`src/store/wal.rs`): `wal_writer_step` takes a
+  batch whenever the buffer is non-empty — **no `Busy` park on another
+  task's batch** — and `WalState.in_flight` is the **set** of taken,
+  unfinished batches. The accounting is interval-set based:
+  `written_iv`/`synced_iv` hold completed write / synced batch
+  intervals; `written` advances while a completed write starts at
+  `written` (`absorb_interval`), `durable` while a synced batch starts
+  at `durable` (so at or below `written`); a batch counts synced once
+  its group `sync_data` of each touched segment completes after its
+  write returned. The invariant `durable ≤ written ≤ append` is
+  checked at every advance (`check_wal_inv`, a loud `Fail::Invalid`).
+  Every advance and every exit (error paths included) wakes `WalAcks`.
+  `wal_sync_through` credits `[durable, written)` as it stood when its
+  first sync started, capped below the lowest in-flight batch's start
+  — it never credits bytes above `written`, nor a held batch's bytes
+  (the accounting's units are each batch's **own** group sync:
+  "completed own-segment syncs"). The ack rules are unchanged: a
+  SyncOn wait returns iff `durable ≥` its record's end, SyncOff iff
+  `written ≥` it; a new `writer:prewrite` park point holds a taken
+  batch before its write.
+- **Judgment call (documented, the frozen pin's requirement):** the
+  *waiter's* helper take in `wal_wait_durable`/`wal_wait_written` fires
+  only when the buffer is non-empty **and no batch is in flight**
+  (`wal_writer_step` itself never parks, so the service writer and any
+  direct caller still overlap batches — the two-in-flight shape). Two
+  reasons, both recorded: (i) the unchanged
+  `cdiv_syncon_ack_never_crosses_an_unwritten_batch` pin holds task A
+  at `writer:presync` through a **shared park budget** — a committer
+  taking its own batch would pass the same park point and drain it,
+  deterministically breaking the pin's hold (measured: with an
+  unguarded waiter take, ts=9's ack returns and the pin fails); (ii)
+  the card's ack-rule clause — "a waiter whose record lies in another
+  task's in-flight batch parks on `WalAcks`" — reads the waiter's
+  *gap* through a held batch as exactly that case. "The rule below
+  holds however batches are scheduled": a conservative waiter is a
+  legal scheduling. Single-task worlds are unaffected (they never
+  observe another task's batch, so the helper take always fires
+  there).
+- **(b) The pins:** the unchanged
+  `cdiv_syncon_ack_never_crosses_an_unwritten_batch` passes (task B
+  parks on `WalAcks` over the held, written-unsynced batch; `durable`
+  never passes batch 1's start; recovery returns the ts-prefix
+  `frontier == 4`); D4 passes unchanged (step 1 waits; the writer's
+  own group sync after its park budget makes c1 durable — the mutant
+  arm still catches WAL-SYNC-T-ONLY); the new
+  **`ack_prefix_two_batches_in_flight`** (S-1-F3's `t_ack_prefix`
+  ported; a literal two-task config, both arms): task A takes batch 1
+  (a SyncOn commit at ts=n) and parks at `writer:prewrite`; task B
+  takes batch 2 (SyncOn, ts=n+1) above it, writes and syncs it.
+  Asserted: two batches were in flight at once (B's step took batch 2
+  while batch 1 was held); after B's write+sync, `written` and
+  `durable` both sit at or below batch 1's start and ts=n+1's wait has
+  not returned (it parks on `WalAcks`); after A is released, writes
+  and syncs, `durable ≥` batch 2's end and both waits return; and in
+  the crash arm (a crash before A's write) recovery is a ts-prefix
+  with no hole (`frontier == 4`, the WAL restarted at segment 1's
+  first LSN) and ts=n+1 was never client-acked.
+- **(c) The mutants, demonstrated and reverted clean:** **M-WALa**
+  (the concurrent take with `max` accounting restored) fails the
+  unchanged cdiv pin — "ts=9's wal_wait_durable returned before the
+  crash"; **WAL-ONE-IN-FLIGHT** (F3-F1's `Busy` park restored) fails
+  the new pin — "arm 0: two batches were never in flight at once
+  (12.4 / S-1-F3 W3)" (B's take is refused; its completed-interval
+  witness never appears); **ACK-OVER-HOLE** (the frontiers advanced
+  by `max` over completed batches) fails the new pin — "written/
+  durable advanced past batch 1's start over its unwritten bytes".
+  **One deviation from the card's mutant table, recorded:** under
+  ACK-OVER-HOLE the *unchanged* cdiv pin passes (not fails), because
+  the guarded waiter never takes a batch above a held one in that
+  scenario, so the mutant's `max` accounting never engages there; the
+  mutant is caught by the new pin. (The pin's arms are deterministic:
+  B itself releases A in the clean arm and arms the scheduler's
+  `crash_at_yield` one yield ahead in the crash arm — A's prewrite
+  spin trips it before its write — so no driver-side race exists; the
+  first version's park-budget hold was flaky under mutex starvation
+  and was rebuilt before commit.)
+- **(d) Movement (0..200 at the step-3 tip):** `ack_over` **empty
+  over every judged round** (no ESCALATE, X5-R34 (h) 4); **failing
+  class-C rounds with `0 < frontier < lo`: 0**; the counts beside
+  step 1's: FAILING_ROUNDS 18 (was 15), C-XX **0** (was 2 — both 150
+  r1 and 151 r1 moved), C-DIV 7, MW-ORPHAN 9, MP O-3(e)(ii) 2,
+  DEADLOCK 0, DEFECT_SEEDS 0.
+- **Seed-pin maintenance (the F3-F1-gate-accepted shape):** step 3's
+  store change moved the workloads wholesale; the MP-A seed pins of
+  `r30_skx_and_smx_record_fields` were re-pointed with their
+  assertions unchanged: the smx seeds **2927 r0, 7528 r0 and 8728 r0
+  still hold** (served, smx, `pass_na=true`), as does 6149 r1 (not
+  served, both predicates false, `pass_na` null); the skx seeds
+  **1897 r0 and 4718 r0 moved** (no longer served — they fail only at
+  the test's shape precondition, `assert!(r.served)`), re-pointed at
+  **537 r0 and 1887 r0** (found by ≤ 200-seed scans; each served with
+  `skx = true` and `pass_na = true`), assertions byte-identical.
+
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)

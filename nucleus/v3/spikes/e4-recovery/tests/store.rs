@@ -2007,3 +2007,361 @@ fn wal_tail_short_never_placed() {
         "the WAL restarts past the recovered record"
     );
 }
+
+/// **X-5c-F3-F3a step 3 pin (§12.4 / I-ACK-PREFIX with two or more
+/// batches in flight; S-1-F3 W3's `t_ack_prefix` ported; a literal
+/// two-task config).** "More than one batch may be in flight. The rule
+/// below holds however batches are scheduled": both frontiers advance
+/// only over the contiguous prefix — writing or syncing a batch while
+/// an earlier one is unwritten advances neither past the earlier one.
+///
+/// The config: segment 0 holds four durable setup commits ending
+/// exactly at LSN 65536. Task A enqueues ts=5 (batch 1, segment 1),
+/// takes it through `wal_writer_step` and parks at `writer:prewrite`
+/// (budget 900_000) — taken, **unwritten**. Task B waits for exactly
+/// that state, enqueues ts=6 (n+1, batch 2 above it in the same
+/// segment), takes it through `wal_writer_step` (no `Busy` park: two
+/// batches in flight at once), writes it and syncs it, records the
+/// mid-state, and runs its §12.4 SyncOn ack wait — parking on
+/// `WalAcks`. The driver then releases A (the clean arm: `durable`
+/// covers batch 2's end, both waits return) or crashes the world (the
+/// crash arm: recovery is a ts-prefix with no hole, and ts=6 was never
+/// client-acked).
+#[test]
+fn ack_prefix_two_batches_in_flight() {
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    let maxp = e4_recovery::store::wal::REC_MAX - fixed;
+    let seed = 4343u64;
+    let cfg = tcfg(8, 8, 1);
+    let n = 5u64; // ts = n in batch 1, ts = n+1 in batch 2
+    // ---- setup (single task): segment 0 filled exactly and durable ----
+    let (disk, st) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        for ts in 1..=4u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp as usize])
+                .expect("setup enqueue");
+        }
+        wal::wal_wait_durable(&cx, seg).expect("setup durable");
+        let g = sched.lock();
+        assert_eq!(
+            g.st.wal.append, seg,
+            "the setup must fill segment 0 exactly"
+        );
+        (g.disk.clone(), g.st.clone())
+    };
+    let b1_start = seg;
+    let b2_end = seg + 2 * (fixed + 10);
+    // ---- the two-task world, once per arm (clean release / crash) ----
+    for arm in 0..2 {
+        let mut st = st.clone();
+        // The hold is bounded only by B's next action: in the clean arm
+        // B itself zeroes the budget (releasing A) after recording the
+        // mid-state; in the crash arm B arms the scheduler's
+        // `crash_at_yield` one yield ahead — A's very next prewrite
+        // spin yields, so the crash lands deterministically before A's
+        // write, with no driver-side race.
+        st.parks.insert("writer:prewrite", 900_000);
+        let host = TestWorld {
+            sched: SchedCore::new(3, seed + 1 + arm as u64),
+            disk: disk.clone(),
+            st,
+            flags: BTreeMap::new(),
+        };
+        let sched = Arc::new(Sched::new(host));
+        fn sf(e: Fail) -> SimFail {
+            match e {
+                Fail::Sim(s) => s,
+                _ => SimFail::Internal("wal pin: a non-sim store failure"),
+            }
+        }
+        // Task A: enqueue ts=n, take batch 1 (parks at writer:prewrite),
+        // then wait for its own ack.
+        let a_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, n), n, &[5u8; 10]).map_err(sf)?;
+            set_flag(sched, "a_enq");
+            wal::wal_writer_step(&cx).map_err(sf)?;
+            set_flag(sched, "a_done");
+            let end5 = seg + fixed + 10;
+            wal::wal_wait_durable(&cx, end5).map_err(sf)?;
+            set_flag(sched, "a_acked");
+            Ok(())
+        };
+        // Task B: wait for batch 1 taken-and-unwritten, then take batch
+        // 2 above it (two in flight), write it, sync it, record the
+        // mid-state, and run the ack wait (parking on WalAcks).
+        let b_body = |sched: &Sched<TestWorld>, t: TaskId| -> Result<(), SimFail> {
+            let cx = Cx { w: sched, t };
+            loop {
+                let held = cx
+                    .with("pin:b:gate", |c| {
+                        let st = c.store();
+                        Ok(st.wal.in_flight.len() == 1 && st.wal.written == seg)
+                    })
+                    .map_err(sf)?;
+                if held {
+                    break;
+                }
+                cx.yield_now("pin:b:poll").map_err(sf)?;
+            }
+            set_flag(sched, "b_go");
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, n + 1), n + 1, &[6u8; 10]).map_err(sf)?;
+            set_flag(sched, "b_enq2");
+            // The take itself: batch 2 above the held batch 1 — the
+            // two-in-flight shape (wal_writer_step has no Busy park).
+            wal::wal_writer_step(&cx).map_err(sf)?;
+            // The mid-state, recorded atomically: batch 1 still in
+            // flight (so two were in flight at once — this step took
+            // batch 2 while batch 1 was held), and both frontiers at
+            // or below batch 1's start.
+            let (still_a, b2_completed, w, d) = cx
+                .with("pin:b:mid", |c| {
+                    let st = c.store();
+                    let b2_start = seg + fixed + 10;
+                    Ok((
+                        st.wal.in_flight.contains(&(seg, b2_start)),
+                        // B's own batch was taken, written and synced
+                        // above A's still-held batch — two batches were
+                        // in flight at once (B's is released on its
+                        // step's return; its completed interval is the
+                        // witness).
+                        st.wal.written_iv.iter().any(|&(a, _)| a == b2_start)
+                            && st.wal.synced_iv.iter().any(|&(a, _)| a == b2_start),
+                        st.wal.written,
+                        st.wal.durable,
+                    ))
+                })
+                .map_err(sf)?;
+            if still_a && b2_completed {
+                set_flag(sched, "two_in_flight");
+            }
+            if w <= b1_start {
+                set_flag(sched, "mid_w_ok");
+            }
+            if d <= b1_start {
+                set_flag(sched, "mid_d_ok");
+            }
+            if d < b2_end {
+                // The wait this task is about to enter cannot be
+                // satisfied at entry (its own atomic observation), so
+                // "entered and not returned" is recorded race-free.
+                set_flag(sched, "mid_wait_open");
+            }
+            if arm == 0 {
+                // The clean arm: release A here — its next park
+                // iteration exits, it writes and syncs batch 1, and
+                // the frontiers absorb both batches in order.
+                cx.with("pin:b:release", |c| {
+                    c.store().parks.insert("writer:prewrite", 0);
+                    Ok(())
+                })
+                .map_err(sf)?;
+            } else {
+                // The crash arm: arm the world's crash one yield ahead.
+                // A's prewrite spin yields within microseconds — the
+                // crash lands before A's write, deterministically.
+                cx.with("pin:b:armcrash", |c| {
+                    let y = c.sched_mut().yields;
+                    c.sched_mut().crash_at_yield = Some(y + 1);
+                    Ok(())
+                })
+                .map_err(sf)?;
+            }
+            set_flag(sched, "b_wrote");
+            let r = wal::wal_wait_durable(&cx, b2_end).map_err(sf);
+            if r.is_ok() {
+                set_flag(sched, "b_acked");
+            }
+            r
+        };
+        std::thread::scope(|scope| {
+            let mut handles: Vec<_> = Vec::new();
+            for (t, body) in [
+                (
+                    1usize,
+                    &a_body
+                        as &(
+                             dyn Fn(&Sched<TestWorld>, TaskId) -> Result<(), SimFail> + Send + Sync
+                         ),
+                ),
+                (2, &b_body),
+            ] {
+                let sched = Arc::clone(&sched);
+                handles.push(scope.spawn(move || {
+                    if let Err(SimFail::Baton(s)) = sched.yield_baton(t) {
+                        panic!("entry barrier refused: Baton at {s}");
+                    }
+                    let r =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&sched, t)));
+                    let is_panic = r.is_err();
+                    sched.finish(t);
+                    assert!(!is_panic, "task {t} panicked");
+                }));
+            }
+            let starter = Arc::clone(&sched);
+            let mut h0 = Some(scope.spawn(move || starter.start()));
+            // The driver: B recorded the mid-state atomically and is
+            // entering its wait (which its own observation shows cannot
+            // be satisfied — `mid_wait_open`); A is held at
+            // writer:prewrite (effectively indefinitely; see above).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut timed_out = false;
+            loop {
+                if flag(&sched, "b_wrote") {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Fail the world first so the joins cannot hang on a
+                    // parked task, then report.
+                    sched.deliver_crash();
+                    timed_out = true;
+                    break;
+                }
+            }
+            if timed_out {
+                if let Some(h) = h0.take() {
+                    let _ = h.join();
+                }
+                for h in std::mem::take(&mut handles) {
+                    let _ = h.join();
+                }
+                panic!(
+                    "driver timeout: B never completed batch 2 (a_enq={} b_go={} b_wrote={})",
+                    flag(&sched, "a_enq"),
+                    flag(&sched, "b_go"),
+                    flag(&sched, "b_wrote")
+                );
+            }
+            // The mid-state assertions (both arms): two batches were in
+            // flight at once; both frontiers at or below batch 1's
+            // start after B's write+sync; ts=n+1's wait was entered
+            // unsatisfied (so it has not returned, and it parks on
+            // WalAcks — the check and the park hold one baton).
+            let ok = flag(&sched, "two_in_flight")
+                && flag(&sched, "mid_w_ok")
+                && flag(&sched, "mid_d_ok")
+                && flag(&sched, "mid_wait_open");
+            if !ok {
+                // Fail the world first so the joins below cannot hang on
+                // a parked task, then report.
+                sched.deliver_crash();
+                if let Some(h) = h0.take() {
+                    let _ = h.join();
+                }
+                for h in std::mem::take(&mut handles) {
+                    let _ = h.join();
+                }
+                assert!(
+                    flag(&sched, "two_in_flight"),
+                    "arm {arm}: two batches were never in flight at once (12.4 / S-1-F3 W3)"
+                );
+                assert!(
+                    flag(&sched, "mid_w_ok") && flag(&sched, "mid_d_ok"),
+                    "arm {arm}: written/durable advanced past batch 1's start over its unwritten bytes"
+                );
+                assert!(
+                    flag(&sched, "mid_wait_open"),
+                    "arm {arm}: ts=n+1's wait was entered unsatisfied (b_acked={})",
+                    flag(&sched, "b_acked")
+                );
+            }
+            if arm == 0 {
+                // The clean arm: release A; both waits must return and
+                // durable must cover batch 2's end.
+                sched.lock().st.parks.insert("writer:prewrite", 0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    if flag(&sched, "a_acked") && flag(&sched, "b_acked") {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "clean arm: a wait never returned (a_done={} a_acked={} b_acked={})",
+                        flag(&sched, "a_done"),
+                        flag(&sched, "a_acked"),
+                        flag(&sched, "b_acked")
+                    );
+                }
+                let g = sched.lock();
+                assert!(
+                    g.st.wal.durable >= b2_end,
+                    "clean arm: durable ({}) must cover batch 2's end ({b2_end}) \
+                     after A's write and sync",
+                    g.st.wal.durable
+                );
+            } else {
+                // The crash arm: crash before A's write. ts=n+1 was
+                // never client-acked, and recovery is a ts-prefix with
+                // no hole.
+                sched.deliver_crash();
+                if let Some(h) = h0.take() {
+                    let _ = h.join();
+                }
+                for h in std::mem::take(&mut handles) {
+                    let _ = h.join();
+                }
+                assert!(
+                    !flag(&sched, "b_acked"),
+                    "crash arm: ts=n+1 was never client-acked"
+                );
+                // The mid-state's unsatisfied-wait proof, restated for
+                // the crash arm: the wait never returned over batch 1's
+                // unwritten bytes.
+                assert!(
+                    flag(&sched, "mid_wait_open"),
+                    "crash arm: ts=n+1's SyncOn wait returned over batch 1's unwritten bytes"
+                );
+                let mut d2 = {
+                    let g = sched.lock();
+                    g.disk.clone()
+                };
+                let mut frng = e4_recovery::rng::Rng::new(0x00C0_FFEE);
+                d2.apply_crash(
+                    &mut frng,
+                    &e4_recovery::sim::FaultKnobs {
+                        keep_latest_pm: 0,
+                        tear_pm: 0,
+                    },
+                );
+                let world = pass_world(1, seed + 90, d2, StoreInner::empty(cfg.clone(), 0));
+                let cx2 = Cx {
+                    w: &world,
+                    t: HARNESS,
+                };
+                let (rec_st, frontier) = ckpt::recover(&cx2, cfg.clone()).expect("crash recover");
+                assert_eq!(
+                    frontier, 4,
+                    "crash arm: recovery is the ts-prefix through the setup commits, no hole"
+                );
+                assert_eq!(
+                    rec_st.wal.append, seg,
+                    "crash arm: the WAL restarts at segment 1's first LSN"
+                );
+                return;
+            }
+            if let Some(h) = h0.take() {
+                let _ = h.join();
+            }
+            for h in std::mem::take(&mut handles) {
+                let _ = h.join();
+            }
+        });
+    }
+}
