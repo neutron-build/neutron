@@ -699,6 +699,21 @@ pub struct RoundRec {
     /// `r32` — a diagnostic the pass fold never reads; from this card's
     /// Acceptance file on, every `r32 = true` round must be class MP).
     pub r32_round: bool,
+    /// **X-5c-F3-F1 step 6 (X5-R30 (c)): `skx`** — rule 1's predicate,
+    /// exact. A diagnostic beside the rule, never an oracle input;
+    /// judging it is P's (a served round passes iff
+    /// `(skx ∨ smx) ∧ pass_na`, applied from the final file with no
+    /// re-run).
+    pub skx: bool,
+    /// **X-5c-F3-F1 step 6 (X5-R30 (c)): `smx`** — rule 2's predicate,
+    /// exact (the opened meta slot's own serve, its bytes a
+    /// sync_all-covered DWrite). A diagnostic, never an oracle input.
+    pub smx: bool,
+    /// **X-5c-F3-F1 step 6 (X5-R30 (c)): `pass_na`** — the round's
+    /// verdict re-evaluated with `no_taint`, recorded only when
+    /// `served ∧ (skx ∨ smx)`, else null. A diagnostic, never an oracle
+    /// input.
+    pub pass_na: Option<bool>,
     /// X-5c: script ops that unwound on a client-visible XX001.
     pub client_xx001: u32,
     /// X5-R5: the opened meta is a rollback.
@@ -838,7 +853,7 @@ impl SeedRec {
         );
         for r in &self.rounds {
             s.push_str(&format!(
-                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                "|{},{},{}|{},{},{}|{},{},{},{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 r.crash,
                 r.fired,
                 r.nested,
@@ -860,6 +875,9 @@ impl SeedRec {
                 r.o1_detected_loss,
                 r.r6_round,
                 r.r32_round,
+                r.skx,
+                r.smx,
+                r.pass_na.map(|b| b as u8).unwrap_or(2),
                 r.client_xx001,
                 r.pass,
                 r.deadlock,
@@ -1587,6 +1605,9 @@ fn round_rec(
     rr.o1_detected_loss = out.o1_detected_loss;
     rr.r6_round = out.r6_round;
     rr.r32_round = out.r32_round;
+    rr.skx = out.skx;
+    rr.smx = out.smx;
+    rr.pass_na = out.pass_na;
     rr.client_xx001 = out.client_xx001;
     rr.meta_rollback = out.meta_rollback;
     rr.r_len = out.rollback_slots.len();

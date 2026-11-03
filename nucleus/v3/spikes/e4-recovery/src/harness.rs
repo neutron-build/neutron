@@ -1564,6 +1564,18 @@ pub struct RoundOutcome {
     /// slots of `K` (vacuously true when nothing was served). A
     /// diagnostic in the record, never an oracle input.
     pub served_k: bool,
+    /// **X-5c-F3-F1 step 6 (X5-R30 (c)): `skx`** — rule 1's predicate,
+    /// exact (see [`r30_predicates`]). A diagnostic in the record,
+    /// never an oracle input; false unless `served` holds.
+    pub skx: bool,
+    /// **X-5c-F3-F1 step 6 (X5-R30 (c)): `smx`** — rule 2's predicate,
+    /// exact (the opened meta slot's own serve, its bytes a
+    /// sync_all-covered DWrite). A diagnostic, never an oracle input.
+    pub smx: bool,
+    /// **X-5c-F3-F1 step 6 (X5-R30 (c)): `pass_na`** — the round's
+    /// final verdict re-evaluated with `OracleCfg { no_taint: true }`,
+    /// recorded only when `served ∧ (skx ∨ smx)`, else null.
+    pub pass_na: Option<bool>,
     /// X5-R28 (a): the kept set `K` at the amcheck (i) point —
     /// SimDisk-history-computed (see [`kept_set_k`]); the oracle's
     /// O-3 (e) amendment reads it from `Extracted::kept_slots`.
@@ -1616,6 +1628,9 @@ impl Default for RoundOutcome {
             o1_detected_loss: 0,
             r6_round: false,
             r32_round: false,
+            skx: false,
+            smx: false,
+            pass_na: None,
             renames_dropped: 0,
             digest: 0,
             r5_anchor0_defect: false,
@@ -2277,6 +2292,9 @@ pub fn run_round(
     // The interleaved history of the failed lives (the Err branch's
     // R-taint input).
     let mut recovery_events: Vec<DiskEvent> = Vec::new();
+    // X-5c-F3-F1 step 6 (X5-R30 (c)): every recovery life's uncovered
+    // accepts — an `skx`/`smx` condition (never an oracle input).
+    let mut recovery_uncovered: Vec<(usize, u64, u64)> = Vec::new();
     let recovery = loop {
         let world = round_world(
             seed,
@@ -2319,6 +2337,10 @@ pub fn run_round(
                 }
                 recovery_reads = reads;
                 recovery_served.extend(served);
+                {
+                    let g = world.lock();
+                    recovery_uncovered.extend(g.disk.uncovered_accepts.iter().copied());
+                }
                 let end = world.lock().disk.clone();
                 if let Err(e) = cx.with("h:recinstall", |c| {
                     *c.store() = st.clone();
@@ -2380,6 +2402,7 @@ pub fn run_round(
                     t.extend(recovery_reads.iter().copied());
                 }
                 recovery_served.extend(g.disk.served.clone());
+                recovery_uncovered.extend(g.disk.uncovered_accepts.iter().copied());
                 recovery_events = g.disk.events.clone();
                 break Err(e);
             }
@@ -2466,6 +2489,18 @@ pub fn run_round(
     // `recovery_reads` above.
     #[allow(unused_assignments)]
     let mut served_k_flag = false;
+    // X-5c-F3-F1 step 6 (X5-R30 (c)): the round's `skx`/`smx` predicate
+    // flags and the no-taint re-verdict (diagnostics, never oracle
+    // inputs). Every exit of the match below assigns them before they
+    // are read (both verdict arms compute them; the livelock arm
+    // default-initializes); the initializers only satisfy the borrow
+    // checker.
+    #[allow(unused_assignments)]
+    let mut skx_flag = false;
+    #[allow(unused_assignments)]
+    let mut smx_flag = false;
+    #[allow(unused_assignments)]
+    let mut pass_na_flag: Option<bool> = None;
     let mut outcome = RoundOutcome {
         class: faults.class,
         deadlock: flags.0,
@@ -2593,6 +2628,31 @@ pub fn run_round(
                     let s1 = (off + len - 1) / 4096;
                     (s0..=s1).all(|s| kept_slots.contains(&s))
                 });
+                // X-5c-F3-F1 step 6 (X5-R30 (c)): the `skx`/`smx`
+                // predicates — diagnostics, never oracle inputs. The
+                // byte check runs against the extraction disk (every
+                // recovery life's durable-write history is cloned
+                // forward into it).
+                let uncovered =
+                    !recovery_uncovered.is_empty() || !g.disk.uncovered_accepts.is_empty();
+                let slot = meta_i
+                    .as_ref()
+                    .and_then(|m| opened_meta_slot_of(&disk, pf, m));
+                let (a, b) = r30_predicates(
+                    faults.class,
+                    &served_ranges,
+                    workload_served.is_empty(),
+                    r_taint,
+                    uncovered,
+                    media_targets.meta_slot_fault,
+                    meta_rollback,
+                    &kept_slots,
+                    slot,
+                    &g.disk,
+                    pf,
+                );
+                skx_flag = a;
+                smx_flag = b;
             }
             // The class MP/MW twin supply (card Work 2.5): the
             // campaign's pre-supplied twin (the faultless run's recovery
@@ -2735,6 +2795,28 @@ pub fn run_round(
                 &mut sample_rng2,
                 &OracleCfg::default(),
             );
+            // X-5c-F3-F1 step 6 (X5-R30 (c)): `pass_na` — the final
+            // verdict re-evaluated with `no_taint` (a fresh, identically
+            // seeded rng; a diagnostic, recorded only when
+            // `served ∧ (skx ∨ smx)`, else null).
+            if ex.served && (skx_flag || smx_flag) {
+                let mut na_rng = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
+                let na = check_round(
+                    &model,
+                    faults.class,
+                    c_prev,
+                    &ex,
+                    &mut reader,
+                    &media_targets,
+                    twin_ref,
+                    &mut na_rng,
+                    &OracleCfg {
+                        no_taint: true,
+                        ..Default::default()
+                    },
+                );
+                pass_na_flag = Some(na.pass);
+            }
             // X5-R11 (c): the 2.3 reads' non-Corrupt failures are
             // harness defects — a loud task error, and the seed fails.
             if !reader.defects.is_empty() {
@@ -2762,6 +2844,9 @@ pub fn run_round(
             // the oracle reads them from `Extracted`, wired in the
             // X5-R28 (b) commit).
             outcome.served_k = served_k_flag;
+            outcome.skx = skx_flag;
+            outcome.smx = smx_flag;
+            outcome.pass_na = pass_na_flag;
             outcome.kept_slots = kept_slots.clone();
             outcome.kept_slots_ii = kept_slots_ii.clone();
             // `pass` folds every per-seed failure flag: a DEADLOCK, a
@@ -2816,6 +2901,31 @@ pub fn run_round(
                 let s1 = (off + len - 1) / 4096;
                 (s0..=s1).all(|s| kept_slots.contains(&s))
             });
+            // X-5c-F3-F1 step 6 (X5-R30 (c)): the `skx`/`smx`
+            // predicates on the failed-recovery arm too (both false
+            // unless `served` holds). The byte check runs against the
+            // last recovery life's disk (its durable-write history
+            // carries every earlier life's).
+            {
+                let slot = meta_i
+                    .as_ref()
+                    .and_then(|m| opened_meta_slot_of(&disk, pf, m));
+                let (a, b) = r30_predicates(
+                    faults.class,
+                    &served_ranges,
+                    workload_served.is_empty(),
+                    r_taint_err,
+                    !recovery_uncovered.is_empty(),
+                    media_targets.meta_slot_fault,
+                    meta_rollback,
+                    &kept_slots,
+                    slot,
+                    &recovery_disk,
+                    pf,
+                );
+                skx_flag = a;
+                smx_flag = b;
+            }
             let mut ex = Extracted {
                 ok: false,
                 xx001: vec![XxSite::Open],
@@ -2873,6 +2983,26 @@ pub fn run_round(
                 &mut sample_rng,
                 &OracleCfg::default(),
             );
+            // X-5c-F3-F1 step 6 (X5-R30 (c)): `pass_na` on the
+            // failed-recovery arm (a fresh, identically seeded rng).
+            if ex.served && (skx_flag || smx_flag) {
+                let mut na_rng = Rng::new(derive(seed * 7 + round as u64, S_SAMPLE));
+                let na = check_round(
+                    &model,
+                    faults.class,
+                    c_prev,
+                    &ex,
+                    &mut nop,
+                    &media_targets,
+                    if twin_on { Some(&twin_info) } else { None },
+                    &mut na_rng,
+                    &OracleCfg {
+                        no_taint: true,
+                        ..Default::default()
+                    },
+                );
+                pass_na_flag = Some(na.pass);
+            }
             outcome.o1 = verdict.o1.clone();
             outcome.o1f_ok = verdict.o1f_ok;
             outcome.o2_fail = verdict.o2_fail.clone();
@@ -2883,6 +3013,9 @@ pub fn run_round(
             // X5-R28 (a) / X5-R30 (a): the (i) kept set and served_k
             // (amcheck (ii) never ran; K_ii stays empty).
             outcome.served_k = served_k_flag;
+            outcome.skx = skx_flag;
+            outcome.smx = smx_flag;
+            outcome.pass_na = pass_na_flag;
             outcome.kept_slots = kept_slots.clone();
             outcome.pass = fold_pass(
                 verdict.pass,
@@ -3578,6 +3711,104 @@ fn walk_free_disk(
         }
     }
 }
+/// The opened meta of a disk (durable bytes).
+/// The slot (1 or 2) the opened meta was read from, on the disk
+/// recovery opens (the crashed, fault-resolved disk): the meta slot
+/// whose parsed `ckpt_id` equals the opened selection's. Ambiguous or
+/// absent → `None` (the caller's predicate fails closed).
+/// **X-5c-F3-F1 step 6** (X5-R30 (c)'s `smx` input).
+pub fn opened_meta_slot_of(
+    disk: &SimDisk,
+    pf: usize,
+    opened: &crate::store::page::Meta,
+) -> Option<u64> {
+    let m1 = disk.durable_read(pf, 4096, 4096);
+    let m2 = disk.durable_read(pf, 8192, 4096);
+    let p1 = crate::store::page::parse_meta(&m1).map(|m| m.ckpt_id).ok();
+    let p2 = crate::store::page::parse_meta(&m2).map(|m| m.ckpt_id).ok();
+    match (p1, p2) {
+        (Some(k), Some(k2)) if k == opened.ckpt_id && k2 == opened.ckpt_id => None,
+        (Some(k), _) if k == opened.ckpt_id => Some(1),
+        (_, Some(k)) if k == opened.ckpt_id => Some(2),
+        _ => None,
+    }
+}
+
+/// **X5-R30 (c)'s record fields (X-5c-F3-F1 step 6): `skx` (rule 1) and
+/// `smx` (rule 2), the predicates exact** — diagnostics in the record,
+/// never oracle inputs; the oracle stays frozen (apart from X5-R32).
+/// Both are false unless `served` holds, on the `Ok` arm and the `Err`
+/// arm alike.
+///
+/// `skx` holds iff all of these hold:
+/// - class MP, X5-R5's condition 1 (`meta_slot_fault`) and condition 2
+///   (`meta_rollback`);
+/// - every served range of the round lies on the page file and wholly
+///   inside slots of `K`;
+/// - `workload_served` is empty (every serve was accepted in a recovery
+///   life or in extraction, after open selected the rolled-back meta);
+/// - there is no R-taint;
+/// - no `uncovered_accepts` were recorded on any of the round's
+///   recovery or extraction disks.
+///
+/// `smx` holds iff all of these hold:
+/// - class MP, condition 1 and condition 2;
+/// - every served range is exactly `(page file, s·4096, 4096)` with `s`
+///   the opened meta's slot (1 or 2);
+/// - the accepted bytes — that slot's durable bytes on the disk the
+///   accept read — equal the bytes of some `DWrite` the store issued to
+///   that offset that was covered by a completed `sync_all` (SimDisk's
+///   durable-write history, the `all` mark);
+/// - `workload_served` is empty, there is no R-taint, and there are no
+///   uncovered accepts.
+#[allow(clippy::too_many_arguments)]
+pub fn r30_predicates(
+    class: FaultClass,
+    served_ranges: &[(usize, u64, u64)],
+    workload_served_empty: bool,
+    r_taint: bool,
+    uncovered: bool,
+    meta_slot_fault: bool,
+    meta_rollback: bool,
+    kept_slots: &BTreeSet<u64>,
+    opened_meta_slot: Option<u64>,
+    meta_disk: &SimDisk,
+    pf: usize,
+) -> (bool, bool) {
+    let served = !served_ranges.is_empty();
+    if !served || class != FaultClass::Mp || !meta_slot_fault || !meta_rollback {
+        return (false, false);
+    }
+    if !workload_served_empty || r_taint || uncovered {
+        return (false, false);
+    }
+    let skx = !kept_slots.is_empty()
+        && served_ranges.iter().all(|&(f, off, len)| {
+            if f != pf || len == 0 {
+                return false;
+            }
+            let s0 = off / 4096;
+            let s1 = (off + len - 1) / 4096;
+            (s0..=s1).all(|s| kept_slots.contains(&s))
+        });
+    let smx = match opened_meta_slot {
+        Some(s) if s == 1 || s == 2 => {
+            let meta_serve = served_ranges
+                .iter()
+                .all(|&(f, off, len)| f == pf && off == s * 4096 && len == 4096);
+            let bytes_match = {
+                let durable = meta_disk.durable_read(pf, s * 4096, 4096);
+                meta_disk.dwrites_of(pf).iter().any(|w| {
+                    w.all && w.off == s * 4096 && w.bytes.len() == 4096 && w.bytes == durable
+                })
+            };
+            meta_serve && bytes_match
+        }
+        _ => false,
+    };
+    (skx, smx)
+}
+
 /// The opened meta of a disk (durable bytes).
 pub fn read_opened_meta(disk: &SimDisk) -> (Option<crate::store::page::Meta>, ()) {
     let pf = match disk.stat(crate::sim::PAGE_FILE) {

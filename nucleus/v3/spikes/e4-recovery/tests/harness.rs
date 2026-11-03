@@ -1030,3 +1030,153 @@ fn cxx_a_crash_at_any_recovery_yield_is_never_corruption() {
         );
     }
 }
+
+/// **X-5c-F3-F1 step 6, X5-R30 (c)'s record fields — the seed pins.**
+/// `skx` (rule 1: every serve inside slots of `K`, class MP, X5-R5's
+/// conditions 1+2, no workload-pass serve, no R-taint, no uncovered
+/// accept) and `smx` (rule 2: every serve exactly the opened meta's
+/// own slot, its durable bytes a `sync_all`-covered DWrite) are
+/// diagnostics in the record, never oracle inputs; judging them is P's
+/// (a served round passes iff `(skx ∨ smx) ∧ pass_na`, from the final
+/// file with no re-run). At this card's tip the MP-A seeds carry:
+/// `skx` for 1897 r0 and 4718 r0; `smx` for 2927 r0, 7528 r0 and
+/// 8728 r0 — each with `pass_na = true`; 2437 r0 and 4378 r0 moved
+/// (no longer served); 6149 r1 is not served after step 2
+/// (`skx = smx = false`), exactly as the gate predicted.
+#[test]
+fn r30_skx_and_smx_record_fields() {
+    for (seed, want_skx, want_smx) in [(1897u64, true, false), (4718, true, false)] {
+        let rec = e4_recovery::workload::run_seed(seed, None);
+        let r = &rec.rounds[0];
+        assert!(r.served, "seed {seed} r0: the MP-A serve must hold");
+        assert_eq!(
+            r.skx, want_skx,
+            "seed {seed} r0: skx (rule 1's predicate, exact)"
+        );
+        assert_eq!(
+            r.smx, want_smx,
+            "seed {seed} r0: smx (rule 2's predicate, exact)"
+        );
+        assert_eq!(
+            r.pass_na,
+            Some(true),
+            "seed {seed} r0: the no-taint re-verdict"
+        );
+    }
+    for seed in [2927u64, 7528, 8728] {
+        let rec = e4_recovery::workload::run_seed(seed, None);
+        let r = &rec.rounds[0];
+        assert!(r.served, "seed {seed} r0: the meta-slot serve must hold");
+        assert!(!r.skx, "seed {seed} r0: a meta-slot serve is not inside K");
+        assert!(
+            r.smx,
+            "seed {seed} r0: smx (the opened meta slot's own serve, bytes a sync_all-covered DWrite)"
+        );
+        assert_eq!(
+            r.pass_na,
+            Some(true),
+            "seed {seed} r0: the no-taint re-verdict"
+        );
+    }
+    // 6149 r1: not served after the SegmentEnd fix — both predicates
+    // false and `pass_na` null (recorded only when served).
+    let rec = e4_recovery::workload::run_seed(6149, None);
+    let r = &rec.rounds[1];
+    assert!(!r.served, "seed 6149 r1: the serve is gone after step 2");
+    assert!(!r.skx && !r.smx, "seed 6149 r1: skx = smx = false");
+    assert!(
+        r.pass_na.is_none(),
+        "seed 6149 r1: pass_na is null (not served)"
+    );
+}
+
+/// **X-5c-F3-F1 step 6, X5-R30 (c)'s condition pins (a literal
+/// fixture).** Each condition of [`harness::r30_predicates`] is
+/// load-bearing: the same world with one condition broken must turn
+/// the predicate off. The fixture: a page file whose meta slot 2 was
+/// written and `sync_all`ed (a `DWrite` with the `all` mark), the
+/// served range exactly that slot's read, class MP with X5-R5's
+/// conditions 1+2 — `smx` holds. Each variant drops one condition.
+#[test]
+fn r30_predicate_conditions_are_load_bearing() {
+    use e4_recovery::sim::SimDisk;
+    // The fixture disk: "/pages" with meta slot 2 written and
+    // sync_all'ed.
+    let (pf, slot) = (0usize, 2u64);
+    let mut disk = SimDisk::new();
+    let f = disk.create("/pages").expect("create");
+    assert_eq!(f, pf);
+    let bytes = vec![7u8; 4096];
+    disk.write_at(f, slot * 4096, &bytes).expect("write");
+    disk.sync_all(f).expect("sync_all");
+    let served = vec![(pf, slot * 4096, 4096u64)];
+    let yes = |disk: &SimDisk,
+               workload_empty: bool,
+               r_taint: bool,
+               class: e4_recovery::sim::FaultClass| {
+        harness::r30_predicates(
+            class,
+            &served,
+            workload_empty,
+            r_taint,
+            false,
+            true,
+            true,
+            &std::collections::BTreeSet::new(),
+            Some(slot),
+            disk,
+            pf,
+        )
+    };
+    // The base world: smx holds (skx cannot — a meta slot is never in
+    // K), and every dropped condition turns it off.
+    let (skx, smx) = yes(&disk, true, false, e4_recovery::sim::FaultClass::Mp);
+    assert!(!skx && smx, "the base world: smx holds, skx does not");
+    // (b) a workload-pass serve was added: both predicates off.
+    let (a, b) = yes(&disk, false, false, e4_recovery::sim::FaultClass::Mp);
+    assert!(!a && !b, "a workload-pass serve turns both predicates off");
+    // (c) R-taint: both off.
+    let (a, b) = yes(&disk, true, true, e4_recovery::sim::FaultClass::Mp);
+    assert!(!a && !b, "R-taint turns both predicates off");
+    // (e) the accepted meta bytes match no sync_all-covered DWrite: a
+    // rewrite that only `sync_data` covered changes the slot's durable
+    // bytes, and the only `all`-covered DWrite's bytes no longer equal
+    // them — smx off.
+    let mut dirty2 = SimDisk::new();
+    let f3 = dirty2.create("/pages").expect("create 3");
+    dirty2.write_at(f3, slot * 4096, &bytes).expect("write");
+    dirty2.sync_all(f3).expect("sync_all");
+    dirty2
+        .write_at(f3, slot * 4096, &[9u8; 4096])
+        .expect("rewrite");
+    dirty2.sync_data(f3).expect("sync_data the rewrite");
+    let (a, b) = yes(&dirty2, true, false, e4_recovery::sim::FaultClass::Mp);
+    assert!(
+        !a && !b,
+        "(e) durable bytes matching no sync_all-covered DWrite turn smx off"
+    );
+    // The same no-match shape via a LOST fault's pre-image revert (the
+    // durable bytes change with no new DWrite at all).
+    use e4_recovery::sim::{MediaFault, MediaKind};
+    let mut faulted = SimDisk::new();
+    let f4 = faulted.create("/pages").expect("create 4");
+    faulted.write_at(f4, slot * 4096, &bytes).expect("write");
+    faulted.sync_all(f4).expect("sync_all");
+    let fw = MediaFault {
+        inode: f4,
+        off: slot * 4096,
+        len: 4096,
+        bytes: vec![9u8; 4096],
+        pre: vec![0u8; 4096],
+        kind: MediaKind::Lost,
+    };
+    faulted.apply_one_media_fault(&fw);
+    let (a, b) = yes(&faulted, true, false, e4_recovery::sim::FaultClass::Mp);
+    assert!(
+        !a && !b,
+        "(e) durable bytes matching no synced DWrite turn smx off"
+    );
+    // (f) class MW: both predicates false.
+    let (a, b) = yes(&disk, true, false, e4_recovery::sim::FaultClass::Mw);
+    assert!(!a && !b, "class MW turns both predicates off");
+}

@@ -2075,6 +2075,112 @@ demonstrated equivalent (G-1 ESCALATED).**
   and is P's to rule on (S-1-F3's natural home). **No fix was made:
   a spec silence is never a local design choice.**
 
+**Step 5 — X5-R32, transcribed literally (commit e34b75ef; the one
+oracle commit, its subject naming X5-R32).**
+
+- **(a) The harness supply:** `FaultTargets` gains `prior_page_slots`
+  (+ `FaultTargets::with_prior`, called where `media_targets` is built —
+  `disk.media[..media_base]`, the disk's own applied-fault list, mapped
+  by `page_slots`' rule); `Extracted` gains `recovery_reads` and
+  `page_file` — the **real** round's own recovery reads (the `Ok` arm
+  and the final `Err` arm both set them before the verdict's
+  `check_round`; never the twin's).
+- **(b) The oracle amendment** (src/oracle.rs + tests/oracle.rs change
+  only by the ruling's text): `H`, `D`, `D_ii`, `D_read` and the site
+  list computed inside `check_round`; `Open`/`Replay` explained by
+  `D_read`, `AmcheckI`/`Read23` by `D ≠ ∅`, `AmcheckIi` by `D_ii ≠ ∅`;
+  in the twin rule's `Some(t)` branch, `any_fault ∧ all_uncovered`
+  keeps its failure text except in class MP with `!no_r32` and a
+  non-empty site list all of whose sites are explained — then O-3 (c)
+  does not fail, and the verdict's new `r32` is `true` (a diagnostic;
+  the record's `r32` field is written by `run` and parsed by `verify`;
+  the pass fold never reads it). `OracleCfg` gains `no_r32`.
+  `tests/oracle.rs` gains **mp8** (must-pass, `r32 = true`) and
+  **mf24–mf28** (must-fail, each asserting the exact O-3 (c) text), all
+  on one literal world (class MP round 1: the round's only fault on
+  slot 50, unread and unreferenced by the twin; `prior_page_slots =
+  {6}`; slot 6 referenced, tainted and reported by amcheck (i);
+  `xx001 = [Open, AmcheckI]`; the real recovery's reads holding the
+  slot-6 page read). `instrumentation_removals_are_load_bearing` gains
+  the X5-R32 arm.
+- **Demonstrations:** `no_r32` turns mp8 red (the instrumentation
+  arm); **M-R32a** (`Open` explained by `D ≠ ∅`) turns mf24 green;
+  **M-R32b** (the `H` filter dropped) mf25; **M-R32c** (the K exclusion
+  dropped) mf26; **M-R32d** (the class test widened to MP ∨ MW) mf27;
+  **M-R32e** (`AmcheckIi` explained by `D`) mf28 — each applied, its
+  case shown turning green, reverted clean.
+- **(d) 1 — the 17 named rounds at the tip** (single-seed runs; the
+  first two columns are the card's decision rule's inputs):
+
+  | Seed/round | r32 | O-3 text | pass | Reading |
+  |---|---|---|---|---|
+  | 1167 r1 | true | none | true | the ruled shape |
+  | 4348 r1 | true | none | true | the ruled shape |
+  | 6047 r1 | true | none | true | the ruled shape |
+  | 7367 r1 | true | none | true | the ruled shape |
+  | 7 r1 | false | none | true | moved: the twin-rule shape is gone (no O-3 (c) text at all) |
+  | 3307 r1 | false | none | true | moved, as 7 |
+  | 8837 r1 | false | none | true | moved, as 7 |
+  | 7748 r1 | false | `O-3(e): (ii) reported slot 12 …` | false | moved to an O-3 (e) (ii) failure — classed under that clause, never re-ruled |
+  | 1628, 2047, 2307, 3887, 4707, 6767, 9168, 9508, 9928 | — | — | — | moved outright (the chain stops before the named round) |
+
+  **No round keeps the twin-rule shape with `r32 = false`: no
+  ESCALATE.** P's prediction ("all 17 have `r32 = true` and pass")
+  held wherever the shape survived; the card's own "a round that
+  moved" clause covers the rest — this card's store fixes (steps 1–4)
+  shifted the workloads wholesale (the uniform crash points are
+  yield-counted).
+- **(d) 2 — the 5 MW rounds:** unaffected by the arm (class MP only);
+  their step-4 outcomes stand: 1889 r0, 4699 r1 and 8399 r0 fail
+  MW-ORPHAN's exact text (their XX001 cleared with the store fixes —
+  "if a C-XX fix clears their XX001, their O-3 (c) clears with it"),
+  and 3509 and 5229 pass entirely.
+
+**Step 6 — X5-R30 (c)'s record fields `skx`, `smx` and `pass_na`.**
+`harness::r30_predicates` computes both predicates exactly as ruled
+(the class and X5-R5 conditions 1+2; `skx`: every serve on the page
+file wholly inside slots of `K`, no workload-pass serve, no R-taint, no
+uncovered accept on any recovery or extraction disk — the recovery loop
+now collects every life's `uncovered_accepts`; `smx`: every serve
+exactly `(page file, s·4096, 4096)` with `s` the opened meta's slot
+(`opened_meta_slot_of`), the slot's durable bytes equal to some
+`sync_all`-covered DWrite at that offset); `pass_na` re-runs the final
+verdict with `OracleCfg { no_taint: true, ..Default::default() }`
+(fresh, identically seeded rngs), recorded only when
+`served ∧ (skx ∨ smx)`, else null. All three ride the round record
+(`run` writes them, `verify`'s parser reads them) — **diagnostics,
+never oracle inputs**; the oracle is frozen apart from X5-R32.
+
+- **Pins** (tests/harness.rs): `r30_skx_and_smx_record_fields` (the
+  seed pins — skx for 1897 r0 and 4718 r0, smx for 2927 r0, 7528 r0
+  and 8728 r0, each with `pass_na = true`; 6149 r1 not served, both
+  false, `pass_na` null) and `r30_predicate_conditions_are_load_bearing`
+  (a literal fixture: a page file whose meta slot 2 was written and
+  `sync_all`ed — smx holds; the workload-serve and R-taint conditions,
+  the sync_all-covered byte match (both a `sync_data`-only rewrite and
+  a LOST revert), and the class condition each turn it off).
+  **Mutants M-R30a–e** (the workload condition, the R-taint condition,
+  the byte-match check, the class condition, and skx's K-containment —
+  each dropped): each turns its pin red — all applied, shown, reverted
+  clean.
+- **The MP-A record at the tip** (single-seed runs, the judging P's
+  from the final file):
+
+  | Seed | served | skx | smx | pass_na | The gate's prediction |
+  |---|---|---|---|---|---|
+  | 1897 r0 | true | **true** | false | true | skx — held |
+  | 2437 r0 | false | false | false | null | skx — **moved** (no longer served) |
+  | 4718 r0 | true | **true** | false | true | skx — held |
+  | 2927 r0 | true | false | **true** | true | smx's location — held, the byte check settled |
+  | 4378 r0 | false | false | false | null | smx's location — **moved** (no longer served) |
+  | 7528 r0 | true | false | **true** | true | smx's location — held, the byte check settled |
+  | 8728 r0 | true | false | **true** | true | smx's location — held, the byte check settled |
+  | 6149 r1 | false | false | false | null | "not served after step 2, or else skx = smx = false" — held exactly |
+
+  Judging stays P's: a served round passes iff `(skx ∨ smx) ∧ pass_na`
+  — every served round above would pass under the ruling. **Never
+  adjusted a predicate to fit a round.**
+
 
 
 Final lines, verbatim:
