@@ -38,6 +38,7 @@ import {
   withRouterProviders,
   type CreateElement,
   assertStaticRoutesUngated,
+  precompressBuildOutput,
 } from "@neutron-build/core";
 import { findGatedStaticRoutes, gatedStaticRoutesError } from "./gated-static.js";
 import type {
@@ -1162,6 +1163,15 @@ export async function build(): Promise<void> {
     oxc: oxcJsx,
     serverActions,
   });
+
+  // The production server (`neutron-ts start`, the node and docker
+  // presets) sends these siblings instead of compressing every request.
+  // Platform presets compress at their edge and count deployed files, and
+  // the static adapter writes its own.
+  if (!selectedAdapter || selectedAdapter.name === "node" || selectedAdapter.name === "docker") {
+    const precompressed = precompressBuildOutput(outputDir);
+    console.log(`\nPrecompressed ${precompressed.files} files (brotli + gzip)`);
+  }
 
   if (selectedAdapter) {
     console.log(`\nRunning adapter: ${selectedAdapter.name}`);
