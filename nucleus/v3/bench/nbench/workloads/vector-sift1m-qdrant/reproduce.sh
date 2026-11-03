@@ -646,6 +646,25 @@ case "$1" in
         echo "row $row FAILED: command failed (driver [ef_search=16-cold-0], exit 1): index state differs: init {segments:8,points:1000000,indexed:1000000,threshold_kb:1} vs now {segments:92,points:1000000,indexed:3861632,threshold_kb:1}" >&2
         exit 1
         ;;
+      killed)
+        # `killed` (card B-0-F7-F1-F2-F1-F1 Work 1, used only by S8's
+        # run b) is the protocol's killed attempt: it exits 1 printing
+        # nothing that contains FAILED and no `results:` line, so it
+        # records nothing — run_one's FAILED branch copies its
+        # evidence and exits 1, and the NEXT invocation renames the
+        # log and allows one retry. Its ONE work-dir write
+        # (ef_search=64-killed-0.log, named by no other assertion)
+        # lands between this mode's two 0.2 s sleeps — the leading one
+        # is the shared marker-separation sleep — so it sits >= 20
+        # coarse-clock ticks (CLK_TCK 100) after the killed attempt's
+        # marker touch and >= 20 ticks before the retry's: S8's
+        # marker-newer-than-this-write check is decided by run order,
+        # never tick luck.
+        mkdir -p "$work"
+        printf 'killed-attempt-write\n' > "$work/ef_search=64-killed-0.log"
+        sleep 0.2
+        exit 1
+        ;;
     esac
     ;;
   report)
@@ -1015,6 +1034,43 @@ S6GDATE
   st_ok "run-a.quiet.txt holds exactly one line" test "$(wc -l < "$r/results/$D/repro/run-a.quiet.txt")" -eq 1
   st_ok "the recorded line is the satisfied line (first -> last load1, 13 samples)" \
     grep -Eq '^[0-9-]+T[0-9:]+Z quiet-host window satisfied \(load1 0\.50 -> 0\.50, 13 consecutive samples' "$r/results/$D/repro/run-a.quiet.txt"
+
+  echo "S8: a killed run b, then its one allowed retry (verdict B-0-F7-F1-F2-F1 finding 2: the retry is a new run — the marker refreshes, the quiet record appends)"
+  # No git needed (S1 style): the root is never a repo, so the
+  # committed-row guard's ls-files arm is inert and the -e arm sees
+  # nothing (run a's JSON moved into repro/ before run b starts).
+  r=$t/s8; mkdir -p "$r/lib"; cp "$lib" "$r/lib/nb-lib.sh"
+  st_rc "a succeeds" 0 st_run "$r" success a
+  st_rc "b dies as a killed attempt (exit 1, no FAILED, nothing recorded)" 1 st_run "$r" killed b
+  st_ok "run-b.log exists (the killed attempt kept its log)" test -f "$r/results/$D/repro/run-b.log"
+  st_ok "run-b.log holds no FAILED line" test "$(grep -c FAILED "$r/results/$D/repro/run-b.log")" -eq 0
+  st_ok "run-b.log holds no results: line" test "$(grep -c '^results: ' "$r/results/$D/repro/run-b.log")" -eq 0
+  st_ok "no run-b.json (the killed attempt recorded nothing)" test ! -f "$r/results/$D/repro/$ROW.run-b.json"
+  st_ok "the killed attempt's own write exists in the work dir" test -f "$r/work/$D/$ROW/ef_search=64-killed-0.log"
+  st_rc "the one allowed retry succeeds" 0 st_run "$r" success b
+  st_ok "run-b.json recorded by the retry" test -f "$r/results/$D/repro/$ROW.run-b.json"
+  st_ok "run-b.killed.log exists (the rename fired)" test -f "$r/results/$D/repro/run-b.killed.log"
+  # The marker refresh (verdict B-0-F7-F1-F2-F1 finding 2): the retry
+  # is a new run, so its per-run marker touch must make the marker
+  # strictly newer than the killed attempt's own post-marker work-dir
+  # write — under a touch-only-if-missing marker the retry's
+  # copy_evidence would re-file that write as the retry's evidence.
+  # Why this reads the WORK dir, not run-b/: the killed attempt's own
+  # copy_evidence legitimately files its post-marker writes into
+  # run-b/ (the FAILED branch runs for a killed attempt too — the
+  # FAILED/killed distinction is made only by the next invocation),
+  # and a stale-marker retry re-copies byte-identical files over
+  # them, so presence, content and copy mtime in run-b/ carry no
+  # signal; the marker's own mtime is the signal (an absent-file
+  # assertion cannot work for the same reason).
+  st_ok "the retry's marker is newer than the killed attempt's write (marker refreshed per run)" \
+    test "$r/work/.reproduce-run-b.marker" -nt "$r/work/$D/$ROW/ef_search=64-killed-0.log"
+  # Two quiet lines (verdict B-0-F7-F1b-F2 finding 3, now loud): both
+  # the killed attempt and its retry ended a quiet window, and the one
+  # `>>` site appends both BYPASSED lines — `>` would hide the killed
+  # attempt's line (mutant QUIET-OVERWRITE).
+  st_ok "run-b.quiet.txt holds two lines (the killed attempt's and the retry's)" \
+    test "$(wc -l < "$r/results/$D/repro/run-b.quiet.txt")" -eq 2
 
   if [ "$fails" -eq 0 ]; then
     echo "REPRO SELFTEST OK ($t)"
