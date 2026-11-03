@@ -22,13 +22,18 @@ files and route table that core 0.5.2 serves).
   the stored bytes with a strong per-representation ETag and 304s, instead of
   gzipping every prerendered page and asset on every request. Static page
   throughput roughly doubles. Builds without the siblings fall back to
-  dynamic compression. Vercel, Netlify and Cloudflare builds are unchanged
-  (their edge compresses). On Fylun, prerendered pages went from ~2x to
+  dynamic compression. The docker adapter's standalone server sends the
+  siblings too (it sent every file uncompressed). Static files are stat'ed on
+  every request and their ETags hash the content, so a build run in place
+  under a live server, or a reproducible build with fixed mtimes, never
+  serves a stale length or ETag. Vercel, Netlify and Cloudflare builds are
+  unchanged (their edge compresses). On Fylun, prerendered pages went from ~2x to
   ~4x Next.js 16's throughput on the same hardware.
 - **Dynamic compression uses `node:zlib`**, brotli first: complete bodies are
   compressed in one call (brotli 4 / gzip 6), streams chunk by chunk with a
   flush per chunk, bodies under 1 KB are sent as is, and SSE,
-  `Cache-Control: no-transform` and non-text types are left alone. Replaces
+  `Cache-Control: no-transform`, partial (206) responses and non-text types
+  are left alone. Replaces
   `hono/compress`; the `compress` option is unchanged.
 - **The production server no longer loads build-time code.** The Vite
   plugins, the route-file parser (`@babel/parser`), MDX (`@mdx-js/mdx`,

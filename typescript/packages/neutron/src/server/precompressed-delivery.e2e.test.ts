@@ -215,3 +215,49 @@ describe("precompressed build assets", () => {
     expect(range.body.toString("utf-8")).toBe(ASSET.slice(0, 10));
   });
 });
+
+describe("static files under a changing build output", () => {
+  it("serves the new bytes and length after a file is rebuilt in place", async () => {
+    const root = await makeApp({ precompress: false });
+    const port = await boot(root);
+    const file = path.join(root, "dist/assets/legacy-abc123.js");
+    const before = await request(port, "/assets/legacy-abc123.js");
+    expect(before.status).toBe(200);
+    // Shorter content, as a build run in place under the live server writes.
+    await fs.writeFile(file, "export const short = 1;\n");
+    const after = await request(port, "/assets/legacy-abc123.js");
+    expect(after.status).toBe(200);
+    expect(after.body.toString("utf-8")).toBe("export const short = 1;\n");
+    expect(Number(after.headers["content-length"])).toBe(after.body.byteLength);
+    expect(after.headers.etag).not.toBe(before.headers.etag);
+  });
+
+  it("changes the ETag when content changes but size and mtime do not", async () => {
+    const root = await makeApp({ precompress: false });
+    const port = await boot(root);
+    const file = path.join(root, "dist/assets/legacy-abc123.js");
+    const fixed = new Date("2020-01-01T00:00:00Z");
+    await fs.writeFile(file, "export const v = '1.2.3';\n");
+    await fs.utimes(file, fixed, fixed);
+    const first = await request(port, "/assets/legacy-abc123.js");
+    // Reproducible builds: same size, same mtime, different bytes, new inode.
+    await fs.rm(file);
+    await fs.writeFile(file, "export const v = '1.2.4';\n");
+    await fs.utimes(file, fixed, fixed);
+    const second = await request(port, "/assets/legacy-abc123.js");
+    expect(second.body.toString("utf-8")).toContain("1.2.4");
+    expect(second.headers.etag).not.toBe(first.headers.etag);
+  });
+
+  it("answers a Range request with identity bytes that match Content-Range", async () => {
+    const root = await makeApp();
+    const port = await boot(root);
+    const response = await request(port, "/assets/app-abc123.js", { range: "bytes=0-99", "accept-encoding": "br, gzip" });
+    expect(response.status).toBe(206);
+    expect(response.headers["content-encoding"]).toBeUndefined();
+    expect(response.headers["content-range"]).toMatch(/^bytes 0-99\//);
+    expect(response.body.byteLength).toBe(100);
+    expect(response.body.toString("utf-8")).toBe(ASSET.slice(0, 100));
+    expect(response.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+  });
+});

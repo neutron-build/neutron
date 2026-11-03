@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Readable } from "node:stream";
@@ -13,9 +14,11 @@ import { requestHasMatchingEtag } from "./cache-utils.js";
  * for `If-None-Match`. A file without siblings (an older build) is sent as
  * is, and the dynamic compression middleware still applies to it.
  *
- * Like the prerendered-HTML cache, the output directory is treated as
- * immutable while the server runs: a file's metadata, and the bytes of small
- * files, are kept after the first request.
+ * A file's metadata and ETag, and the bytes of small files, are kept after
+ * the first request. Every request still stats the file and rebuilds the
+ * entry when its size, mtime or inode changed, so a build run in place under
+ * a live server never sends a cached length for different bytes. ETags hash
+ * the content: reproducible builds give every file the same mtime.
  */
 
 interface Representation {
@@ -26,6 +29,8 @@ interface Representation {
 }
 
 interface StaticFile {
+  /** Identity file's size/mtime/inode when the entry was built. */
+  signature: string;
   type: string;
   identity: Representation;
   br?: Representation;
@@ -51,26 +56,44 @@ export function createStaticFileHandler(
   const files = new Map<string, StaticFile>();
   let cachedBytes = 0;
 
-  const lookup = (filename: string): StaticFile | null => {
+  const forget = (entry: StaticFile) => {
+    for (const rep of [entry.identity, entry.br, entry.gzip]) {
+      if (rep?.body) cachedBytes -= rep.body.byteLength;
+    }
+  };
+
+  const lookup = async (filename: string): Promise<StaticFile | null> => {
     if (/(?:^|[/\\])\.{1,2}(?:$|[/\\])|[/\\]{2,}|\0/.test(filename)) return null;
     const known = files.get(filename);
-    if (known) return known;
-
-    let file = path.join(root, filename);
-    let stat = statFile(file);
-    if (stat?.isDirectory()) {
+    let file = known?.identity.file ?? path.join(root, filename);
+    let stat = await statFile(file);
+    if (!known && stat?.isDirectory()) {
       file = path.join(file, "index.html");
-      stat = statFile(file);
+      stat = await statFile(file);
     }
-    if (!stat?.isFile()) return null;
-    const identity = representation(file, stat, "");
-    const entry: StaticFile = { type: getMimeType(file) || "application/octet-stream", identity, available: [] };
+    if (!stat?.isFile()) {
+      if (known) {
+        forget(known);
+        files.delete(filename);
+      }
+      return null;
+    }
+    const signature = `${stat.size}:${stat.mtimeMs}:${stat.ino}`;
+    if (known?.signature === signature) return known;
+    if (known) forget(known);
+
+    const identity = await representation(file, stat, "");
+    if (!identity) return null;
+    const entry: StaticFile = { signature, type: getMimeType(file) || "application/octet-stream", identity, available: [] };
     for (const [coding, suffix] of [["br", ".br"], ["gzip", ".gz"]] as const) {
-      const sibling = statFile(file + suffix);
+      const sibling = await statFile(file + suffix);
       // A sibling older than its source is from an earlier build.
       if (sibling?.isFile() && sibling.mtimeMs >= stat.mtimeMs) {
-        entry[coding] = representation(file + suffix, sibling, `-${coding}`);
-        entry.available.push(coding);
+        const rep = await representation(file + suffix, sibling, `-${coding}`, identity.etag);
+        if (rep) {
+          entry[coding] = rep;
+          entry.available.push(coding);
+        }
       }
     }
     files.set(filename, entry);
@@ -80,9 +103,10 @@ export function createStaticFileHandler(
   const readBody = async (rep: Representation): Promise<Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>> => {
     if (rep.body) return rep.body;
     if (rep.size > MAX_CACHED_FILE_BYTES) {
-      return Readable.toWeb(fs.createReadStream(rep.file)) as ReadableStream<Uint8Array>;
+      return Readable.toWeb(fs.createReadStream(rep.file, { start: 0, end: Math.max(0, rep.size - 1) })) as ReadableStream<Uint8Array>;
     }
     const body = await fs.promises.readFile(rep.file);
+    if (body.byteLength !== rep.size) throw new Error("changed while serving");
     if (cachedBytes + body.byteLength <= MAX_CACHED_TOTAL_BYTES) {
       rep.body = body;
       cachedBytes += body.byteLength;
@@ -100,10 +124,15 @@ export function createStaticFileHandler(
     } catch {
       return next();
     }
-    const entry = lookup(filename);
+    const entry = await lookup(filename);
     if (!entry) return next();
     if (method === "GET" && c.req.raw.headers.has("range")) {
-      return rangeFallback(c, next);
+      const partial = await rangeFallback(c, next);
+      const response = partial ?? c.res;
+      if (cacheControl && response && !response.headers.has("Cache-Control")) {
+        response.headers.set("Cache-Control", cacheControl);
+      }
+      return partial;
     }
 
     const encoding = precompressed
@@ -122,24 +151,39 @@ export function createStaticFileHandler(
     try {
       return new Response(await readBody(rep), { status: 200, headers });
     } catch {
+      forget(entry);
       files.delete(filename);
       return next();
     }
   };
 }
 
-function statFile(file: string): fs.Stats | null {
+async function statFile(file: string): Promise<fs.Stats | null> {
   try {
-    return fs.statSync(file);
+    return await fs.promises.stat(file);
   } catch {
     return null;
   }
 }
 
-function representation(file: string, stat: fs.Stats, suffix: string): Representation {
-  return {
-    file,
-    size: stat.size,
-    etag: `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}${suffix}"`,
-  };
+/**
+ * A representation with a content-hash ETag. A precompressed sibling's tag is
+ * its source's tag plus the coding: the two always change together.
+ */
+async function representation(
+  file: string,
+  stat: fs.Stats,
+  suffix: string,
+  sourceEtag?: string
+): Promise<Representation | null> {
+  if (sourceEtag) {
+    return { file, size: stat.size, etag: `${sourceEtag.slice(0, -1)}${suffix}"` };
+  }
+  try {
+    const hash = crypto.createHash("sha256");
+    for await (const chunk of fs.createReadStream(file)) hash.update(chunk as Buffer);
+    return { file, size: stat.size, etag: `"${hash.digest("base64url").slice(0, 27)}${suffix}"` };
+  } catch {
+    return null;
+  }
 }

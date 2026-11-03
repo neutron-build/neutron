@@ -58,6 +58,9 @@ export function compression(): MiddlewareHandler {
     if (
       !res.body ||
       c.req.method === "HEAD" ||
+      // A partial response's bytes must match its Content-Range.
+      res.status === 206 ||
+      headers.has("Content-Range") ||
       headers.has("Content-Encoding") ||
       headers.has("Transfer-Encoding")
     ) {
@@ -148,7 +151,15 @@ function streamCompressed(
         if (chunks.length > 0) return writeAndFlush(chunks);
       }
       if (!pending) return;
-      const result = await pending;
+      let result: ReadResult;
+      try {
+        result = await pending;
+      } catch (error) {
+        // The upstream body failed: release the native zlib state now.
+        pending = undefined;
+        compressor.destroy();
+        throw error;
+      }
       if (result.done) {
         pending = undefined;
         compressor.end();

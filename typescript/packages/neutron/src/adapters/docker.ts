@@ -34,6 +34,14 @@ export function adapterDocker(options: DockerAdapterOptions = {}): NeutronAdapte
         const destination = path.join(publicRoot, artifact);
         fs.mkdirSync(path.dirname(destination), { recursive: true });
         fs.copyFileSync(realSource, destination);
+        // Its precompressed siblings travel with it (copied after it, so not
+        // older), but stay off the addressable file list.
+        for (const suffix of [".br", ".gz"]) {
+          const sibling = realSource + suffix;
+          if (fs.existsSync(sibling) && !fs.lstatSync(sibling).isSymbolicLink() && fs.statSync(sibling).isFile()) {
+            fs.copyFileSync(sibling, destination + suffix);
+          }
+        }
         publicFiles.push(artifact);
       }
       const hasAppRoutes = context.routes.app > 0;
@@ -170,7 +178,7 @@ const server = createServer(async (req, res) => {
     // app route at "/" must render, not be shadowed by it.
     const staticPath = resolveStaticPath(pathname);
     if (staticPath && !(staticPath.endsWith(".html") && handlesPath(pathname))) {
-      return streamFile(res, staticPath, pathname);
+      return streamFile(req, res, staticPath, pathname);
     }
 
     const webRequest = toWebRequest(req);
@@ -236,7 +244,34 @@ function resolveStaticPath(pathname) {
   return null;
 }
 
-function streamFile(res, filePath, pathname) {
+// The .br / .gz siblings neutron-ts build writes, when the client accepts
+// one (br first; q=0 refuses) and it is not older than its source.
+function precompressedSibling(acceptEncoding, filePath) {
+  if (!acceptEncoding) return null;
+  const accepted = new Map();
+  for (const part of String(acceptEncoding).toLowerCase().split(",")) {
+    const [name, ...params] = part.split(";").map((piece) => piece.trim());
+    let q = 1;
+    for (const param of params) {
+      const [key, value] = param.split("=").map((piece) => piece.trim());
+      if (key === "q") q = Number(value) || 0;
+    }
+    if (name) accepted.set(name, q);
+  }
+  for (const [coding, suffix] of [["br", ".br"], ["gzip", ".gz"]]) {
+    const q = accepted.has(coding) ? accepted.get(coding) : accepted.get("*");
+    if (!q) continue;
+    try {
+      const sibling = statSync(filePath + suffix);
+      if (sibling.isFile() && sibling.mtimeMs >= statSync(filePath).mtimeMs) {
+        return { coding, file: filePath + suffix, size: sibling.size };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function streamFile(req, res, filePath, pathname) {
   const ext = path.extname(filePath).toLowerCase();
   res.statusCode = 200;
   // routes.headers and the security defaults, as start sends on files.
@@ -250,7 +285,19 @@ function streamFile(res, filePath, pathname) {
   if (pathname.startsWith("/assets/") && !res.hasHeader("Cache-Control")) {
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
   }
-  const stream = createReadStream(filePath);
+  let source = filePath;
+  if (!req.headers.range) {
+    const sibling = precompressedSibling(req.headers["accept-encoding"], filePath);
+    if (sibling) {
+      source = sibling.file;
+      res.setHeader("Content-Encoding", sibling.coding);
+      res.setHeader("Content-Length", String(sibling.size));
+    }
+    if (existsSync(filePath + ".br") || existsSync(filePath + ".gz")) {
+      res.setHeader("Vary", "Accept-Encoding");
+    }
+  }
+  const stream = createReadStream(source);
   stream.pipe(res);
   stream.on("error", () => {
     if (!res.headersSent) {
