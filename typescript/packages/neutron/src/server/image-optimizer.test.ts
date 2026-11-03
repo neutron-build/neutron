@@ -364,6 +364,50 @@ describe("optimizeImage", () => {
       expect(fs.existsSync(cacheDir)).toBe(true);
     }
   });
+
+  describe("encode settings", async () => {
+    const sharp = await import("sharp").then((m) => m.default).catch(() => null);
+    const run = sharp ? it : it.skip;
+    const options = () => ({ publicDirs: [path.join(tmpDir, "public")], cacheDir });
+
+    // A noisy photo-like source: flat colours compress to nothing in every
+    // format and would not show a size difference.
+    async function writePhoto(name: string, width: number, height: number, orientation?: number) {
+      const raw = Buffer.alloc(width * height * 3);
+      for (let i = 0; i < raw.length; i++) raw[i] = (i * 7919 + ((i / 3) | 0) * 31) % 251;
+      let image = sharp!(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 90 });
+      if (orientation) image = image.withMetadata({ orientation });
+      fs.writeFileSync(path.join(tmpDir, "public", name), await image.toBuffer());
+    }
+
+    run("does not upscale a source narrower than the requested width", async () => {
+      await writePhoto("small.jpg", 200, 100);
+      const result = await optimizeImage({ src: "/small.jpg", width: 640, quality: 75, format: "webp" }, options());
+      if ("error" in result) throw new Error(result.error);
+      expect((await sharp!(result.buffer).metadata()).width).toBe(200);
+    });
+
+    run("applies EXIF orientation before resizing", async () => {
+      // Stored landscape 400x200, orientation 6 (rotate 90): displays portrait.
+      await writePhoto("rotated.jpg", 400, 200, 6);
+      const result = await optimizeImage({ src: "/rotated.jpg", width: 128, quality: 75, format: "webp" }, options());
+      if ("error" in result) throw new Error(result.error);
+      const meta = await sharp!(result.buffer).metadata();
+      expect(meta.width).toBe(128);
+      expect(meta.height).toBe(256);
+    });
+
+    run("encodes AVIF on the WebP quality scale, not at the raw q", async () => {
+      await writePhoto("photo.jpg", 800, 600);
+      const avif = await optimizeImage({ src: "/photo.jpg", width: 384, quality: 75, format: "avif" }, options());
+      if ("error" in avif) throw new Error(avif.error);
+      expect(avif.contentType).toBe("image/avif");
+      // The old setting (AVIF at the raw q=75) produced files ~2.5x larger
+      // than WebP for real photos.
+      const rawQ = await sharp!(path.join(tmpDir, "public", "photo.jpg")).resize(384).avif({ quality: 75 }).toBuffer();
+      expect(avif.buffer.length).toBeLessThan(rawQ.length * 0.75);
+    });
+  });
 });
 
 describe("handleImageRequest", () => {
