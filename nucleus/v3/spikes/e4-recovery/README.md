@@ -2652,6 +2652,109 @@ failing seeds **894** (the recorded `FAILING_SEEDS=901` minus the same
 **Every count equals the card's Goal table** (P's counts at F3-F1's
 gate); no deviation to record.
 
+**Step 1 — X5-R34, the acked-commit derivation from SimDisk history
+(commit 13da010b; the store unchanged).**
+
+- **(a) What landed:** the SimDisk observer accessor
+  `durable_dir_bindings` (the one permitted `src/sim/` change — the
+  durable `/wal/` name→inode map, exactly as a crash would leave it);
+  `derive_written_acked` takes `p0` (the round's starting append
+  position, with the (b) 2 guard: any `wal_commits` record below `p0`
+  fails the round loudly) and the bindings, and its **SyncOn acked
+  half** is now `D`, the durable prefix of X5-R34 (c)'s R/W/S byte
+  rules computed over per-inode interval maps in one pass over `E`
+  (never a per-byte loop) — `written`/`hi`, SyncOff's acked and the
+  `unparsed_written` report kept exactly. The round record gains
+  `ack_over` (the (f) cross-check's list: SyncOn ts's whose own §12.4
+  wait returned while their record ends above `D` outside `Rc`);
+  non-empty fails the round through the task-error path (X5-R10's
+  guard shape) with the ACK-OVER-HOLE text verbatim; `run` writes it,
+  `verify`'s parser reads it, the pass fold never reads it. The
+  `E4_ACK_DIAG` cross-check diagnostic stays; a new `E4_D_DIAG`
+  (stderr, default off) prints `D`, its stop reason, `Rc` and each
+  commit's verdict.
+- **(b) The frozen-derivation demonstration.** With the frozen per-inode
+  `max` acked half restored in place (and the cross-check removed with
+  it — both halves of the same ruling), `cargo test -q --release -p
+  e4-recovery --test harness x5r34` gives **exactly the four must-fail
+  cases red and the must-pass case green**:
+
+  ```
+  thread 'x5r34_contiguous_prefix_required_two_batches' panicked … (g) 2
+  thread 'x5r34_stale_bytes_of_a_renamed_segment_never_ack' panicked … (g) 1
+  thread 'x5r34_unsynced_directory_binding_blocks_acked' panicked … (g) 3
+  thread 'x5r34_forged_ack_over_hole_fails_loudly' panicked … (g) 4
+  test result: FAILED. 1 passed; 4 failed  (x5r34_genuine_durability_acks green)
+  ```
+
+  Reverted clean afterwards (`git diff` free of the demonstration; the
+  first test build had dummy record bytes that the frozen walk never
+  yields, which would have hidden cases 1–3 — the tests encode genuine
+  records so **both** derivations' walks yield them, and the recorded
+  demonstration above is with that fix in place).
+- **(c) (h) 1's decision rule, at 13da010b before any store change —
+  single-seed runs of the 37 named rounds (the D stop reason from
+  `E4_D_DIAG`):**
+
+  | Seed/round | lo before | lo after | frontier | pass | outcome | ack_over | D's stop reason |
+  |---|---|---|---|---|---|---|---|
+  | 20 r2 | 64 | 62 | 63 | **true** | none | [] | `00000000000a0000.log@5952`: no sync of inode 4 after the last covering write |
+  | 115 r1 | 25 | 24 | 24 | **true** | none | [] | `…060000.log@18207`: no sync of inode 4 after the last covering write |
+  | 403 r1 | 6 | 4 | 4 | **true** | none | [] | `…000000.log@5774`: no sync of inode 2 after the last covering write |
+  | 622 r0 | 14 | 12 | 13 | **true** | none | [] | `…030000.log@2316`: no sync of inode 2 after the last covering write |
+  | 780 r2 | 59 | 58 | 58 | **true** | none | [] | `…080000.log@22304`: no sync of inode 3 after the last covering write |
+  | 801 r1 | 30 | 29 | 29 | **true** | none | [] | `…060000.log@4665`: no sync of inode 4 after the last covering write |
+  | 825 r2 | 54 | 52 | 53 | **true** | none | [] | `…090000.log@44524`: no sync of inode 5 after the last covering write |
+  | 830 r1 | 30 | 28 | 29 | **true** | none | [] | `…060000.log@21552`: no sync of inode 4 after the last covering write |
+  | 1001 r0 | 12 | 11 | 11 | **true** | none | [] | `…030000.log@5740`: no sync of inode 2 after the last covering write |
+  | **1064 r1** | 17 | **17** | 14 | false | O-1(b) c=17 | [] | beyond the last bound or recycled segment (0x60000) |
+  | 1585 r1 | 18 | 17 | 17 | **true** | none | [] | `…060000.log@18843`: no sync of inode 4 after the last covering write |
+  | 1801 r1 | 36 | 35 | 35 | **true** | none | [] | `…070000.log@2762`: no sync of inode 5 after the last covering write |
+  | 2183 r0 | 18 | 13 | 17 | **true** | none | [] | `…030000.log@10881`: no sync of inode 2 after the last covering write |
+  | 2525 r2 | 76 | 75 | 75 | **true** | none | [] | `…0b0000.log@24886`: no sync of inode 5 after the last covering write |
+  | 2730 r2 | 44 | 43 | 43 | **true** | none | [] | `…0a0000.log@17970`: no sync of inode 8 after the last covering write |
+  | 2765 r0 | 13 | 12 | 12 | **true** | none | [] | `…030000.log@3102`: no sync of inode 2 after the last covering write |
+  | 2812 r1 | 9 | 8 | 8 | **true** | none | [] | `…020000.log@37250`: no sync of inode 4 after the last covering write |
+  | 3224 r1 | 7 | 5 | 5 | **true** | none | [] | `…000000.log@9093`: no sync of inode 2 after the last covering write |
+  | 3806 r1 | 30 | 29 | 29 | **true** | none | [] | `…060000.log@0`: no sync of inode 4 after the last covering write |
+  | **4770 r2** | 57 | **57** | 51 | false | O-1(b) c=57 | [] | `…090000.log@10655`: no issued write covers the offset |
+  | 4930 r0 | 28 | 26 | 27 | **true** | none | [] | `…030000.log@28447`: no sync of inode 2 after the last covering write |
+  | **5054 r1** | 23 | **23** | 20 | false | O-1(a) c=23 | [] | `…050000.log@34121`: no issued write covers the offset |
+  | 5601 r1 | 47 | 46 | 46 | **true** | none | [] | `…070000.log@3981`: no sync of inode 2 after the last covering write |
+  | 5604 r0 | 24 | 23 | 23 | **true** | none | [] | `…030000.log@9149`: no sync of inode 2 after the last covering write |
+  | 6154 r0 | 34 | 33 | 33 | **true** | none | [] | `…030000.log@13669`: no sync of inode 2 after the last covering write |
+  | 6200 r2 | 47 | 46 | 46 | **true** | none | [] | `…080000.log@8005`: no sync of inode 3 after the last covering write |
+  | **6263 r2** | 21 | **21** | 20 | false | O-1(b) c=21 | [] | `…060000.log@23222`: no issued write covers the offset |
+  | 6623 r0 | 15 | 14 | 14 | **true** | none | [] | `…030000.log@9179`: no sync of inode 2 after the last covering write |
+  | 7405 r1 | 36 | 35 | 35 | **true** | none | [] | `…070000.log@10370`: no sync of inode 5 after the last covering write |
+  | 7531 r0 | 37 | 36 | 36 | **true** | none | [] | `…030000.log@37339`: no sync of inode 2 after the last covering write |
+  | 7803 r1 | 5 | 4 | 4 | **true** | none | [] | `…000000.log@6103`: no sync of inode 2 after the last covering write |
+  | 7823 r1 | 28 | 27 | 27 | **true** | none | [] | `…060000.log@63292`: no sync of inode 8 after the last covering write |
+  | 8220 r2 | 56 | 55 | 55 | **true** | none | [] | `…070000.log@64072`: no sync of inode 2 after the last covering write |
+  | 8363 r0 | 15 | 14 | 14 | **true** | none | [] | `…030000.log@0`: no sync of inode 2 after the last covering write |
+  | 9200 r0 | 24 | 21 | 23 | **true** | none | [] | `…030000.log@13082`: no sync of inode 2 after the last covering write |
+  | 9484 r2 | 74 | 70 | 73 | **true** | none | [] | `…0b0000.log@4070`: no sync of inode 5 after the last covering write |
+  | 9594 r0 | 33 | 32 | 32 | **true** | none | [] | `…030000.log@30106`: no sync of inode 2 after the last covering write |
+
+  **P's prediction holds exactly:** 33 named rounds get `lo ≤ frontier`
+  (each now passing with no O-1 text); 1064 r1, 4770 r2, 5054 r1 and
+  6263 r2 keep `frontier < lo` with `lo` unchanged (17 / 57 / 23 / 21 —
+  the §12.2/§12.5 exact-boundary store losses, step 2's targets);
+  `ack_over` is empty on all 37. **No ESCALATE** (none of the four
+  boundary rounds is a new keep, no non-empty `ack_over`).
+- **(c) the 0..200 run at the tip** (`E4_D_DIAG=1`, head 13da010b):
+  **`ack_over` empty over every judged round (0 rounds)**; **failing
+  class-C rounds with `0 < frontier < lo`: 0** (F3-F1's tip had 2 in
+  0..200: 20 r2 and 115 r1 — both now pass); FAILING_ROUNDS 15 (was
+  17), C-XX 2, MW-ORPHAN 6, DEADLOCK 0, DEFECT_SEEDS 0 — **no new
+  failing class-C `0 < frontier < lo` round appeared**, exactly as
+  predicted.
+- **(d) Runtime:** the 0..200 run at the X5-R34 commit took **18 s**
+  wall against the step-0-tip baseline of **22 s** (timing-only run,
+  diagnostic: it judges by the old derivation and is never cited) —
+  no slowdown; the derivation is one extra pass over the round's
+  events. Well inside X5-R31's 60-min Acceptance limit.
+
 
 ## The first complete 10k campaign (run 3 of the attempt, committed —
 ## d2c8bba7, superseded as the triage file by X-5c-F1's run above)
