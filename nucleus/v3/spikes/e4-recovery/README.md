@@ -2431,15 +2431,15 @@ oracle commit, its subject naming X5-R32).**
 
   | Seed/round | r32 | O-3 text | pass | Reading |
   |---|---|---|---|---|
-  | 1167 r1 | true | none | true | the ruled shape |
+  | 1167 r1 | true | none | true | the ruled shape (control: 1167 r1 still shows O-3 (c) at e6ebbdda) |
   | 4348 r1 | true | none | true | the ruled shape |
   | 6047 r1 | true | none | true | the ruled shape |
   | 7367 r1 | true | none | true | the ruled shape |
-  | 7 r1 | false | none | true | moved: the twin-rule shape is gone (no O-3 (c) text at all) |
-  | 3307 r1 | false | none | true | moved, as 7 |
-  | 8837 r1 | false | none | true | moved, as 7 |
-  | 7748 r1 | false | `O-3(e): (ii) reported slot 12 …` | false | moved to an O-3 (e) (ii) failure — classed under that clause, never re-ruled |
-  | 1628, 2047, 2307, 3887, 4707, 6767, 9168, 9508, 9928 | — | — | — | moved outright (the chain stops before the named round) |
+  | 7 r1 | false | none | true | moved by e6ebbdda (F3-F1 step 1): passes with no O-3 (the twin-rule shape is gone) |
+  | 3307 r1 | false | none | true | moved by e6ebbdda (F3-F1 step 1): passes with no O-3, as 7 |
+  | 8837 r1 | false | none | true | moved by e6ebbdda (F3-F1 step 1): passes with no O-3, as 7 |
+  | 7748 r1 | false | `O-3(e): (ii) reported slot 12 …` | false | moved by e6ebbdda (F3-F1 step 1): fails O-3 (e) (ii) — classed under that clause, never re-ruled |
+  | 1628, 2047, 2307, 3887, 4707, 6767, 9168, 9508, 9928 | — | — | — | moved by e6ebbdda (F3-F1 step 1): each loses the named round, because the chain stops after an r0/r1 recovery-`Err` detection |
 
   **No round keeps the twin-rule shape with `r32 = false`: no
   ESCALATE.** P's prediction ("all 17 have `r32 = true` and pass")
@@ -2554,8 +2554,8 @@ record).
   open candidate; the root cause sits in the replay/flip interaction
   and is **not** fixed within the budget. Evidence: the `E4_CXX_DIAG`
   artifacts at
-  `$HOME/.cache/nv3-review/runlogs/cxxd151*.err` and
-  `cxxfix151*.err` (the per-record replay findings, the directory keys,
+  `$HOME/.cache/nv3-review/runlogs/X-5c-F3-F1.7.cxxd151*.err` and
+  `X-5c-F3-F1.7.cxxfix151*.err` (the per-record replay findings, the directory keys,
   the post-recovery and post-checkpoint findings, before and after the
   dir fix). **150 r1 (XX001 at
   Open, two nested crashes) was not reached within the budget** —
@@ -2594,7 +2594,9 @@ X-5c-F4 step 0** (this stage's Acceptance file
 `X-5c-F3-F1.acc.campaign.json` — `E4 SEEDS=10000 O1_FAIL=2617
 O2_FAIL=54 O3_FAIL=542 DEADLOCK=0 PANIC=0 O1F_FAIL=2627 MONITOR=0` /
 `E4 FOLD FAILING_SEEDS=901 FAILING_ROUNDS=860 TWIN_FAILING_ROUNDS=68
-DEFECT_SEEDS=0`, sha256 `f3a1e605…a1af17`, prov `commit=a96620bd` — is
+DEFECT_SEEDS=0`, sha256 `f3a1e605…a1af17`, prov `commit=62d4e739`
+(code-identical to a96620bd: 62d4e739 adds 8 README lines; the same
+sha256 `f3a1e605…a1af17`) — is
 F4's triage input, per the card's Goal and Notes).
 
 
