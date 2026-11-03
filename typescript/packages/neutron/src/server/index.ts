@@ -19,6 +19,8 @@ import {
 import * as path from "node:path";
 import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { createStaticFileHandler } from "./static-files.js";
+import { negotiateContentEncoding, type ContentCoding } from "./content-encoding.js";
 import type { WebSocketServer } from "ws";
 import { compress } from "hono/compress";
 import { Hono, type Context } from "hono";
@@ -542,9 +544,21 @@ interface RequestTraceContext {
   startedAt: number;
 }
 
+interface StaticHtmlRepresentation {
+  body: Uint8Array<ArrayBuffer>;
+  etag: string;
+}
+
+/**
+ * A prerendered page, held as the bytes it is sent as. Prerendered HTML is
+ * byte-identical for every request (nothing is injected per request on this
+ * path), so the build's `.br` / `.gz` siblings are sent as they are.
+ */
 interface StaticHtmlEntry {
-  body: string;
-  headers: Record<string, string>;
+  identity: StaticHtmlRepresentation;
+  br?: StaticHtmlRepresentation;
+  gzip?: StaticHtmlRepresentation;
+  available: ContentCoding[];
 }
 
 type StreamRenderFn = (element: preact.VNode) => ReadableStream<Uint8Array> & {
@@ -1044,32 +1058,17 @@ export async function createServer(
   // SSR-only routes: static assets, image optimization, server islands, and the HTML
   // catch-all. "api"/"raw" modes skip these entirely.
   if (isSsr) {
-  app.use(
-    "/assets/*",
-    serveStatic({
-      root: resolvedDistDir,
-      rewriteRequestPath: (p) => p,
-    })
-  );
-  app.use("/assets/*", async (c, next) => {
-    await next();
-    setMutableResponse(c);
-    if (
-      c.res.status >= 200 &&
-      c.res.status < 300 &&
-      !c.res.headers.has("Cache-Control")
-    ) {
-      c.res.headers.set("Cache-Control", "public, max-age=31536000, immutable");
-    }
+  // Build outputs, sent with their precompressed siblings when the client
+  // accepts them (server/static-files.ts). hono's serveStatic answers Range
+  // requests, which only ever get the identity bytes.
+  const distFiles = createStaticFileHandler({
+    root: resolvedDistDir,
+    precompressed: enableCompress,
+    rangeFallback: serveStatic({ root: resolvedDistDir, rewriteRequestPath: (p) => p }),
   });
-
-  app.use(
-    "/public/*",
-    serveStatic({
-      root: resolvedDistDir,
-      rewriteRequestPath: (p) => p,
-    })
-  );
+  // Vite's hashed client assets: a URL's content never changes.
+  app.use("/assets/*", (c, next) => distFiles(c, next, "public, max-age=31536000, immutable"));
+  app.use("/public/*", (c, next) => distFiles(c, next));
 
   // Root-URL public assets (dev/prod parity): Vite copies public/ into the
   // dist ROOT (dist/favicon.svg), and `neutron-ts dev` serves those files at
@@ -1080,10 +1079,6 @@ export async function createServer(
   // (node/docker presets) a server bundle under server/. Route rules still
   // win, and anything else falls through to the route pipeline below, which
   // owns loaders, route rules, gating and the app cache.
-  const rootAssetStatic = serveStatic({
-    root: resolvedDistDir,
-    rewriteRequestPath: (p) => p,
-  });
   const isRootPublicAsset = createRootPublicAssetFilter(resolvedDistDir);
   app.use("*", async (c, next) => {
     const pathname = normalizePathname(c.req.path);
@@ -1096,7 +1091,7 @@ export async function createServer(
     ) {
       return next();
     }
-    return rootAssetStatic(c, next);
+    return distFiles(c, next);
   });
 
   app.get("/_neutron/image", async (c) => {
@@ -1283,6 +1278,33 @@ export async function createServer(
         return runMiddlewareChain(globalMiddleware, c.req.raw, {}, async () => respond());
       };
 
+      // Global middleware sees the page as it always has: the identity bytes.
+      // The precompressed bytes replace that body only when the chain passed
+      // the very response it was given back, so nothing it did is lost and
+      // nothing it may have rewritten is replaced.
+      const respondStaticHtml = async (entry: StaticHtmlEntry): Promise<Response> => {
+        const routeHeaders = staticRouteHeaders.get(effectivePathname);
+        const encoding = enableCompress
+          ? negotiateContentEncoding(c.req.raw.headers.get("accept-encoding"), entry.available)
+          : null;
+        if (globalMiddleware.length === 0 || encoding === null) {
+          return withGlobalMiddleware(() =>
+            createStaticHtmlResponse(entry, c.req.raw, method, routeHeaders, encoding)
+          );
+        }
+        let identity: Response | undefined;
+        const response = await withGlobalMiddleware(() => {
+          const encoded = createStaticHtmlResponse(entry, c.req.raw, method, routeHeaders, encoding);
+          identity =
+            encoded.status === 304
+              ? encoded
+              : createStaticHtmlResponse(entry, c.req.raw, method, routeHeaders, null);
+          return identity;
+        });
+        if (response !== identity || response.status !== 200) return response;
+        return encodeStaticHtmlResponse(response, entry, encoding, method);
+      };
+
       // A warm static-HTML entry must never answer a loader-data request:
       // the same `!isJsonRequest` eligibility the disk path applies (TS-09).
       // Without it, warming the HTML cache changed the response to a later
@@ -1294,14 +1316,7 @@ export async function createServer(
       ) {
         const cached = staticHtmlCache.get(effectivePathname);
         if (cached) {
-          const response = await withGlobalMiddleware(() =>
-            createStaticHtmlResponse(
-              cached,
-              c.req.raw,
-              method,
-              staticRouteHeaders.get(effectivePathname)
-            )
-          );
+          const response = await respondStaticHtml(cached);
           return finalize(response, {
             routePath: effectivePathname,
             routeMode: "static",
@@ -1310,18 +1325,10 @@ export async function createServer(
       }
 
       if ((method === "GET" || method === "HEAD") && !isJsonRequest(c.req.raw) && staticAllowed) {
-        const html = tryReadStaticHtml(resolvedDistDir, effectivePathname);
-        if (html !== null) {
-          const entry = createStaticHtmlEntry(html);
+        const entry = tryReadStaticHtml(resolvedDistDir, effectivePathname);
+        if (entry !== null) {
           staticHtmlCache.set(effectivePathname, entry);
-          const response = await withGlobalMiddleware(() =>
-            createStaticHtmlResponse(
-              entry,
-              c.req.raw,
-              method,
-              staticRouteHeaders.get(effectivePathname)
-            )
-          );
+          const response = await respondStaticHtml(entry);
           return finalize(response, {
             routePath: effectivePathname,
             routeMode: "static",
@@ -2103,8 +2110,7 @@ function buildStaticHtmlCache(distDir: string): Map<string, StaticHtmlEntry> {
       }
 
       try {
-        const body = fs.readFileSync(absolutePath, "utf-8");
-        cache.set(routePath, createStaticHtmlEntry(body));
+        cache.set(routePath, readStaticHtmlEntry(absolutePath));
       } catch (err) {
         console.error(`[neutron] Failed to read static file ${absolutePath}:`, err);
         // Skip this file and continue with others
@@ -2138,25 +2144,44 @@ function toRoutePath(relativeHtmlPath: string): string | null {
   return `/${normalized.slice(0, -".html".length)}`;
 }
 
-function createStaticHtmlEntry(body: string): StaticHtmlEntry {
-  const etag = createEntityTag(body);
-  return {
-    body,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "public, max-age=0, must-revalidate",
-      ETag: etag,
-    },
-  };
+const STATIC_HTML_HEADERS: Record<string, string> = {
+  "Content-Type": "text/html; charset=utf-8",
+  "Cache-Control": "public, max-age=0, must-revalidate",
+};
+
+/**
+ * Read a prerendered page and the siblings `neutron-ts build` wrote for it.
+ * The ETag is strong and names the representation: the encoded bodies are
+ * different bytes, so they carry their own validators.
+ */
+function readStaticHtmlEntry(file: string): StaticHtmlEntry {
+  const body = fs.readFileSync(file);
+  const sourceMtime = fs.statSync(file).mtimeMs;
+  const tag = createEntityTag(body).slice(3, -1);
+  const entry: StaticHtmlEntry = { identity: { body, etag: `"${tag}"` }, available: [] };
+  for (const [coding, suffix] of [["br", ".br"], ["gzip", ".gz"]] as const) {
+    try {
+      // A sibling older than its page is from an earlier build.
+      if (fs.statSync(file + suffix).mtimeMs < sourceMtime) continue;
+      entry[coding] = { body: fs.readFileSync(file + suffix), etag: `"${tag}-${coding}"` };
+      entry.available.push(coding);
+    } catch {
+      // No sibling (an older build): dynamic compression covers the page.
+    }
+  }
+  return entry;
 }
 
 function createStaticHtmlResponse(
   entry: StaticHtmlEntry,
   request: Request,
   method: string,
-  routeHeaders?: Record<string, string>
+  routeHeaders: Record<string, string> | undefined,
+  encoding: ContentCoding | null
 ): Response {
-  const headers = new Headers(entry.headers);
+  const representation = encoding ? entry[encoding]! : entry.identity;
+  const headers = new Headers(STATIC_HTML_HEADERS);
+  headers.set("ETag", representation.etag);
   if (routeHeaders) {
     for (const [name, value] of Object.entries(routeHeaders)) {
       if (name.toLowerCase() === "content-length") {
@@ -2176,13 +2201,35 @@ function createStaticHtmlResponse(
     });
   }
 
+  if (encoding) headers.set("Content-Encoding", encoding);
+  headers.set("Content-Length", String(representation.body.byteLength));
   if (method === "HEAD") {
     return new Response(null, {
       headers,
     });
   }
 
-  return new Response(entry.body, {
+  return new Response(representation.body, {
+    headers,
+  });
+}
+
+/** The page's identity response, after global middleware, re-sent encoded. */
+function encodeStaticHtmlResponse(
+  response: Response,
+  entry: StaticHtmlEntry,
+  encoding: ContentCoding,
+  method: string
+): Response {
+  const representation = entry[encoding]!;
+  const headers = new Headers(response.headers);
+  if (headers.get("ETag") === entry.identity.etag) headers.set("ETag", representation.etag);
+  headers.set("Content-Encoding", encoding);
+  headers.set("Content-Length", String(representation.body.byteLength));
+  void response.body?.cancel();
+  return new Response(method === "HEAD" ? null : representation.body, {
+    status: response.status,
+    statusText: response.statusText,
     headers,
   });
 }
@@ -2517,14 +2564,14 @@ function createRootPublicAssetFilter(distDir: string): (pathname: string) => boo
 
 const PUBLIC_FILES_METADATA = ".neutron-public-files.json";
 
-function tryReadStaticHtml(distDir: string, pathname: string): string | null {
+function tryReadStaticHtml(distDir: string, pathname: string): StaticHtmlEntry | null {
   if (!normalizePathname(pathname)) return null;
   const candidate = path.join(distDir, pathname.slice(1), "index.html");
   try {
     const root = fs.realpathSync(distDir);
     const resolved = fs.realpathSync(candidate);
     if (!resolved.startsWith(root + path.sep) || !fs.statSync(resolved).isFile()) return null;
-    return fs.readFileSync(resolved, "utf-8");
+    return readStaticHtmlEntry(resolved);
   } catch { return null; }
 }
 
