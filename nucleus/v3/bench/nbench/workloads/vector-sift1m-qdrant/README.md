@@ -192,10 +192,11 @@ protocol (card B-0-F7-F1b uses it; environment `NB_HARNESS` and
   B after a FAILED or VOID run A (round 2, R2-1), the pass-log
   evidence copy (R2-2), the marker lifecycle (a fresh between-runs
   leftover, an mtime-backdated stub write, the marker's gitignored
-  `work/` home), and the committed-row re-check after the quiet
+  `work/` home), the committed-row re-check after the quiet
   window (a row planted mid-wait, a stubbed UTC rollover onto a
-  committed date). It needs no host, no podman and no
-  dataset, and passes when the protocol above behaves as written.
+  committed date), and the killed-attempt retry (a refreshed per-run
+  marker, a two-line quiet record). It needs no host, no podman and
+  no dataset, and passes when the protocol above behaves as written.
   `NB_MODE=selftest bash driver.sh` is the matching driver-level test:
   it pins the driver's stderr contract — a J4 settle mismatch's
   both-states diff reaches driver stderr, and a successful settle
