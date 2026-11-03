@@ -1376,6 +1376,33 @@ fn mf28_empty_d_ii_fails() {
     assert!(!v.r32);
 }
 
+/// Must fail (mf29, X-5c-F3-F1-F3; X-5c-F3-F3a step 5): the mp8 world
+/// with `recovery_reads = [(page_file + 1, 6·4096, 4096)]` — slot 6's
+/// byte range is read, but **on a file other than the page file**, and
+/// the page file has no read of it. `D_read` is then false, so `Open`
+/// is unexplained: the round fails O-3 (c), the same `o3` text mf24
+/// asserts. OWN-3 (X5-R32's `D_read` tests the byte range without the
+/// file) passes this world, so it is load-bearing.
+#[test]
+fn mf29_recovery_read_on_another_file_fails() {
+    let (m, mut s, mut ex, faults, twin) = r32_world();
+    ex.recovery_reads = vec![(ex.page_file + 1, 6 * 4096, 4096u64)];
+    let v = run(&m, FaultClass::Mp, &mut s, &ex, &faults, Some(&twin));
+    assert!(
+        !v.pass,
+        "an Open XX001 explained only by a read on another file must fail the round"
+    );
+    assert!(
+        v.o3_fail
+            .clone()
+            .unwrap_or_default()
+            .contains("O-3(c): XX001 with every media fault on unread, unreferenced targets"),
+        "got {:?}",
+        v.o3_fail
+    );
+    assert!(!v.r32);
+}
+
 /// The five instrumentation removals are load-bearing: each removed check
 /// lets a previously failing case pass (card "Instrumentation checks",
 /// with the 2.7 addition of X5-R5's meta-slot-fault condition).
