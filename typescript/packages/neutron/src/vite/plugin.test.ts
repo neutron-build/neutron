@@ -95,6 +95,14 @@ describe("generateRoutesModule", () => {
     expect(output.startsWith('import { configureRouter } from "@neutron-build/core/client";\nconfigureRouter({"unloadRouteStylesheets":true});')).toBe(true);
   });
 
+  it("sets the configured images.widths for browser-rendered images, and nothing without them", () => {
+    const route = makeRoute({ id: "route:index.tsx", path: "/", file: "/x/index.tsx", config: { mode: "app" } });
+    expect(generateRoutesModule([route])).not.toContain("__neutronImageWidths");
+    expect(generateRoutesModule([route], undefined, [960, 320, 640])).toContain(
+      'globalThis["__neutronImageWidths"] = [320,640,960];'
+    );
+  });
+
   it("uses /@fs prefix for files outside project root", () => {
     const route = makeRoute({
       id: "route:external",

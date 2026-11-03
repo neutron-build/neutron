@@ -1,7 +1,6 @@
 import { h } from "preact";
 import type { AnyJsxElement } from "./jsx-agnostic.js";
-
-const DEFAULT_WIDTHS = [320, 640, 960, 1200, 1600];
+import { selectImageCandidates } from "../core/image-widths.js";
 const DEFAULT_FORMATS = ["avif", "webp"];
 
 const FORMAT_MIME: Record<string, string> = {
@@ -14,11 +13,14 @@ const FORMAT_MIME: Record<string, string> = {
 export interface PictureProps {
   src: string;
   alt: string;
+  /** Width ladder override; entries must be in `images.widths` (see `ImageProps.widths`). */
   widths?: number[];
   formats?: string[];
   sizes?: string;
   width?: number;
   height?: number;
+  /** Natural pixel width of the source; larger candidates are dropped. */
+  intrinsicWidth?: number;
   class?: string;
   loading?: "lazy" | "eager";
 }
@@ -41,26 +43,26 @@ export function Picture({
   alt,
   widths,
   formats = DEFAULT_FORMATS,
-  sizes = "100vw",
+  sizes,
   width,
   height,
+  intrinsicWidth,
   class: className,
   loading = "lazy",
 }: PictureProps): AnyJsxElement | null {
-  const candidateWidths = widths || DEFAULT_WIDTHS;
+  const candidates = selectImageCandidates({ widths, width, sizes, intrinsicWidth });
 
   const sources = formats.map((fmt) =>
     h("source", {
       type: FORMAT_MIME[fmt] || `image/${fmt}`,
-      srcSet: buildSrcSet(src, candidateWidths, fmt),
-      sizes,
+      srcSet: buildSrcSet(src, candidates.widths, fmt),
+      sizes: candidates.sizes,
     })
   );
 
-  const fallbackWidth = width || candidateWidths[candidateWidths.length - 1];
   const fallbackParams = new URLSearchParams();
   fallbackParams.set("src", src);
-  fallbackParams.set("w", String(fallbackWidth));
+  fallbackParams.set("w", String(candidates.src));
   const fallbackSrc = `/_neutron/image?${fallbackParams.toString()}`;
 
   return h(

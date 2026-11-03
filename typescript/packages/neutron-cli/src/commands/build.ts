@@ -292,6 +292,7 @@ export async function build(): Promise<void> {
             routeRules: neutronConfig.routes,
             serverActions: { registry: serverActionRegistry },
             client: neutronConfig.client,
+            images: neutronConfig.server?.images,
           }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
@@ -376,7 +377,12 @@ export async function build(): Promise<void> {
               return { id: source, external: true };
             },
           },
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            images: neutronConfig.server?.images,
+          }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
@@ -494,6 +500,7 @@ export async function build(): Promise<void> {
             routeRules: neutronConfig.routes,
             serverActions: { registry: serverActionRegistry },
             client: neutronConfig.client,
+            images: neutronConfig.server?.images,
           }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
@@ -568,7 +575,12 @@ export async function build(): Promise<void> {
       configFile: false,
       root: cwd,
       plugins: [
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            images: neutronConfig.server?.images,
+          }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
       css: cssConfig,

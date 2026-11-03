@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { resolveImageWidths } from "../core/image-widths.js";
 
 export interface ImageParams {
   src: string;
@@ -29,11 +30,11 @@ export interface ImageOptimizerOptions {
   publicDirs: string[];
   cacheDir: string;
   remotePatterns?: RemoteImagePattern[];
+  /** `images.widths`: the only widths served. Defaults to the shared ladder. */
+  widths?: readonly number[];
 }
 
 const VALID_FORMATS = new Set(["webp", "avif", "jpeg", "png"]);
-const MIN_WIDTH = 16;
-const MAX_WIDTH = 3840;
 const MIN_QUALITY = 1;
 const MAX_QUALITY = 100;
 const DEFAULT_QUALITY = 75;
@@ -98,8 +99,10 @@ let sharpWarningLogged = false;
 
 export function validateImageParams(
   searchParams: URLSearchParams,
-  remotePatterns: RemoteImagePattern[] = []
+  remotePatterns: RemoteImagePattern[] = [],
+  widths?: readonly number[]
 ): ImageParams | ImageValidationError {
+  const allowedWidths = resolveImageWidths(widths);
   const src = searchParams.get("src");
   if (!src) {
     return { error: "Missing 'src' parameter", status: 400 };
@@ -142,7 +145,7 @@ export function validateImageParams(
         status: 400,
       };
     }
-    const widthRemote = parseWidth(searchParams);
+    const widthRemote = parseWidth(searchParams, allowedWidths);
     if (typeof widthRemote !== "number") {
       return widthRemote;
     }
@@ -193,7 +196,7 @@ export function validateImageParams(
     return { error: "Absolute URLs not allowed", status: 400 };
   }
 
-  const width = parseWidth(searchParams);
+  const width = parseWidth(searchParams, allowedWidths);
   if (typeof width !== "number") {
     return width;
   }
@@ -209,7 +212,10 @@ export function validateImageParams(
   return { src: normalizedSrc, width, quality, format };
 }
 
-function parseWidth(searchParams: URLSearchParams): number | ImageValidationError {
+function parseWidth(
+  searchParams: URLSearchParams,
+  allowedWidths: readonly number[]
+): number | ImageValidationError {
   const wParam = searchParams.get("w");
   if (!wParam) {
     return { error: "Missing 'w' (width) parameter", status: 400 };
@@ -220,9 +226,9 @@ function parseWidth(searchParams: URLSearchParams): number | ImageValidationErro
     return { error: "Width must be a decimal integer", status: 400 };
   }
   const width = Number(wParam);
-  if (!Number.isSafeInteger(width) || width < MIN_WIDTH || width > MAX_WIDTH) {
+  if (!allowedWidths.includes(width)) {
     return {
-      error: `Width must be between ${MIN_WIDTH} and ${MAX_WIDTH}`,
+      error: `Width must be one of images.widths: ${allowedWidths.join(", ")}`,
       status: 400,
     };
   }
@@ -558,7 +564,11 @@ export async function handleImageRequest(
   opts: ImageOptimizerOptions
 ): Promise<Response> {
   const url = new URL(request.url);
-  const validated = validateImageParams(url.searchParams, opts.remotePatterns ?? []);
+  const validated = validateImageParams(
+    url.searchParams,
+    opts.remotePatterns ?? [],
+    opts.widths
+  );
 
   if ("error" in validated) {
     return new Response(validated.error, { status: validated.status });
