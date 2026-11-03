@@ -1,6 +1,6 @@
 # C-T0: Transaction protocol (normative)
 
-Status: draft 8.2 (card S-2-F2 and its rework, 2026-10-24; draft 8.1 was card S-2-F1, draft 8.0 was card S-2, increment 1 of 4). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`, §11) is made here first, then in the tests and mutants that pin it (and in G0), and only then in code.
+Status: draft 8.3 (card S-1-F3, 2026-11-03: pointer clauses to S-STORE I-ACK-PREFIX, I-WAL-COVER, the ordered and fresh boot ids, and the poisoned store in every wait; draft 8.2 was card S-2-F2 and its rework, 2026-10-24; draft 8.1 was card S-2-F1, draft 8.0 was card S-2, increment 1 of 4). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-txn` card implements against this file. A change to an invariant (`I-*`, §11) is made here first, then in the tests and mutants that pin it (and in G0), and only then in code.
 
 **What v8 is.** v8 is C-T0 draft 7.8 (`nucleus/v2/docs/C-T0-txn-protocol.md` at 8095500b) re-hosted on:
 - **N2**: a private write set and an in-memory lock table, with no write intents, no resolver and no status table;
@@ -241,11 +241,11 @@ Apply maps `Write {key_changed}` and `Delete {moved}` accordingly. The payload b
 There is **no resolver job**, nothing is persisted about `T` beyond its WAL records, and no state about `T` outlives its own finalize or cleanup.
 
 ### 2.5 Txn identity, boot id, no system keys
-- **TxnId** is S-STORE §12.2's `txn` field. `n` is a counter dense per boot, kept in memory.
-- **The boot id** is the low 32 bits of the `ckpt_id` of the **boot checkpoint**: the checkpoint every read-write open runs after recovery (§3.7, S-STORE §14 step 8). It is not S-STORE's checkpoint epoch `e`: after the boot checkpoint's flip, `e` is one higher (S-STORE §1). v8 draft 8.0 called it the "boot epoch".
+- **TxnId** is S-STORE §12.2's `txn` field. `n` is a counter dense per boot, kept in memory, starting at 1 (S-STORE §12.2: `n = 0` is `SegmentEnd`'s).
+- **The boot id** is the low 32 bits of the `ckpt_id` of the **boot checkpoint**: the checkpoint every read-write open runs after recovery (§3.7, S-STORE §14 step 8), or one above the newest boot id the recovery walk accepted, if newer (S-STORE §14 step 8). It is not S-STORE's checkpoint epoch `e`: after the boot checkpoint's flip, `e` is one higher (S-STORE §1). v8 draft 8.0 called it the "boot epoch".
   - **The boot checkpoint is durable before the first txn.** No txn starts (and so no `TxnId` is issued and no `Chunk` is appended) until the boot checkpoint's meta is synced (S-STORE §13 step 5). Mutant **BOOT-CKPT-NOT-DURABLE**: txns start after step 0; a crash before step 5 leaves the previous meta durable, and the next boot's checkpoint gets the same `ckpt_id`.
   - **It always writes a new meta**, with `ckpt_id` one above the recovered meta's, even when no page is dirty. Mutant **BOOT-CKPT-SKIP-CLEAN**: a clean open skips the checkpoint and reuses the recovered meta's `ckpt_id`, which the previous boot already used.
-  - **Why boot ids never repeat.** With both rules, each boot's id comes from a `ckpt_id` above every `ckpt_id` durable before it, so no two boots that issued a `TxnId` share an id (compared for equality only; a repeat would need `2^32` checkpoints).
+  - **Why boot ids never repeat.** With both rules, each boot's id comes from a `ckpt_id` above every `ckpt_id` durable before it, so no two boots that issued a `TxnId` share an id (this file compares them for equality only; S-STORE §12.5 also orders them in serial-number order, sound while fewer than `2^31` checkpoints separate two compared boots; a repeat would need `2^32` checkpoints). The creating session's id is 0 (S-STORE §2.2). A meta lost after its sync can still repeat the id of a boot none of whose records any walk reached; those records lie past the valid end.
   - **Why the boot checkpoint is needed.** Without it, a boot that crashes before its first checkpoint is followed by a boot with the same id. Its counter restarts, and its `TxnId`s collide with the dead chunks of the crashed boot that still lie in the replay span. Recovery would then attach those chunks to the new txn's marker (mutant **BOOT-ID-REUSE**, draft 8.0's EPOCH-REUSE).
   - The boot checkpoint also places `wal_start_lsn` past the crashed boot's unmarked chunks (S-STORE §12.6: a transaction aborted before the flip does not count).
   - **Read-only opens (N11)** run no boot checkpoint and have no boot id. They start no write txn and write no provisional entry, so every provisional entry is dead to them (§2.4). Every txn in a read-only open is READ ONLY, and any data write, DDL or sequence advance gets 25006. S-STORE §14.1 specifies what such an open replays and what it refuses.
@@ -284,10 +284,10 @@ The order below is binding (**C-COMMIT-ORDER**).
 2. **Apply.** Insert one entry per top data layer at ts `c` (S-STORE §9.1).
    - It starts after the append (S-STORE §12.4) and runs concurrently with other commits' applies and with the group sync.
    - A physical error is fail-stop (S-STORE §9.2, I-FAIL-STOP).
-3. **Make visible.** Once applied, and for `synchronous_commit=on` once synced, mark `c` visible. `visible_ts` advances over the contiguous visible prefix (C-VISIBLE-PREFIX, `spikes/e1-mvcc/src/common/sequencer.rs`).
+3. **Make visible.** Once applied, and for `synchronous_commit=on` once durable (`durable_end ≥` the end of its record, S-STORE I-ACK-PREFIX, §12.4), mark `c` visible. `visible_ts` advances over the contiguous visible prefix (C-VISIBLE-PREFIX, `spikes/e1-mvcc/src/common/sequencer.rs`).
    - An `off` commit is marked after its append and apply. It still cannot become visible before an earlier `on` commit's sync, because the prefix is contiguous (v7.8 §3 step 4).
 4. **Release** (§3.3), only once `visible_ts ≥ c`.
-5. **Ack** (§3.4), only once `visible_ts ≥ c`, and for `on` after the sync.
+5. **Ack** (§3.4), only once `visible_ts ≥ c`, and for `on` once durable (S-STORE I-ACK-PREFIX).
 
 **No abort, no skipping.** After step 1 the pipeline never aborts a txn. A physical failure is fail-stop, and the pipeline never fills a ts hole by skipping.
 
@@ -304,7 +304,7 @@ Rules:
 - **Settle first.** Before writing its own provisional entry, `T` settles any foreign provisional entry on `k` (§2.4 (b)).
 - **When.** Materialization runs whenever the write set would exceed `ws_mem`, as the large txn's way of spilling top layers, and at commit step 1′ for every top layer not yet materialised. The implementation may also run it earlier.
 - **Gate holds.** Each materialization is a gated operation, or a bounded batch of them. A checkpoint flip never waits on more than one bounded batch.
-- **WAL head-of-line.** `Chunk` records share the WAL queue with every other commit, and a group sync covers every byte appended before it. So a large txn keeps at most **one batch** of **unsynced** chunks in the queue: it appends its next batch only after the previous one is synced. A batch is at most `chunk_batch` bytes (default 1 MiB, R-1), **or one `Chunk` record** if that record alone is larger. A record is indivisible and may be up to `wal_seg_size / 4` (S-STORE §12.2), for example one op with a large value, so the bound per large txn is `max(chunk_batch, its largest Chunk record)`. A small `on` commit's group sync then covers at most one batch per active large txn, in every phase (materialisation, step 1′, the marker). The marker's own sync covers at most one batch plus the marker, so conflicting waiters resume promptly after the flip (`t_w6_shape_hol`). Mutant **CHUNK-QUEUE-UNBOUNDED**: chunks are appended without waiting for the previous batch's sync. Its deterministic catcher is `t_chunk_queue_bound` (§11.4); `t_w6_shape_hol` catches it only as a perf regression.
+- **WAL head-of-line.** `Chunk` records share the WAL queue with every other commit, and an `on` commit's ack waits for every byte appended before it to be durable (S-STORE I-ACK-PREFIX, §12.4). So a large txn keeps at most **one batch** of **unsynced** chunks in the queue: it appends its next batch only after the previous one is synced. A batch is at most `chunk_batch` bytes (default 1 MiB, R-1), **or one `Chunk` record** if that record alone is larger. A record is indivisible and may be up to `wal_seg_size / 4` (S-STORE §12.2), for example one op with a large value, so the bound per large txn is `max(chunk_batch, its largest Chunk record)`. A small `on` commit's group sync then covers at most one batch per active large txn, in every phase (materialisation, step 1′, the marker). The marker's own sync covers at most one batch plus the marker, so conflicting waiters resume promptly after the flip (`t_w6_shape_hol`). Mutant **CHUNK-QUEUE-UNBOUNDED**: chunks are appended without waiting for the previous batch's sync. Its deterministic catcher is `t_chunk_queue_bound` (§11.4); `t_w6_shape_hol` catches it only as a perf regression.
 - **Supersede.** A later chunk op on the same `(tree, key)` of the same txn supersedes the earlier one. That happens on a rewrite of the key and on `ROLLBACK TO` (§5.5). Recovery applies the last op per key (S-STORE §14).
 - **I-PROV-WAL.** Each provisional entry equals the last chunk op appended for its key.
 
@@ -312,7 +312,7 @@ Rules:
 0. **Pre-commit**, as in §3.1.
 1′. **Materialise** every remaining top layer. `T` is still `Open` and still holds its locks, so nobody waits on `T` longer than they would wait for any open txn.
 1. In **one critical section**: assign `c`, set `Committed(c)`, insert the writer-map entry (SER only), and append `CommitMarker{nchunks}` (I-WAL-TS-ORDER).
-2. **Flip.** The state store of step 1 is the flip. From then on, every provisional entry of `T` reads as a version at `c` (§2.4), so all of `T`'s writes become versions at once (**I-PROV-ATOMIC**). Mark `c` visible: for `on`, after the sync. This is a large txn's "apply", and it is O(1).
+2. **Flip.** The state store of step 1 is the flip. From then on, every provisional entry of `T` reads as a version at `c` (§2.4), so all of `T`'s writes become versions at once (**I-PROV-ATOMIC**). Mark `c` visible: for `on`, once durable (S-STORE I-ACK-PREFIX). This is a large txn's "apply", and it is O(1).
 3. **Release** (§3.3) and 4. **Ack** (§3.4), as in §3.1.
 5. **Finalize.** Settle (convert) each provisional entry of `T`: walk `T`'s key log in key order per tree, one gated operation per conversion. Then mark `T` finalized, which may advance `M` (§3.5), and deregister `T` from the live-txn registry.
    - **Where it runs.** Finalize is `T`'s continuation: on a job thread in server mode; in embedded and wasm mode, in bounded steps run cooperatively at later commits and checkpoints (N10).
@@ -335,7 +335,7 @@ Rules:
   - An acquirer may replace an ended entry before the purge reaches it. The purge removes only entries that still point at its own handle.
 
 ### 3.4 Ack and commit visibility
-**The rule (I-ACK).** COMMIT returns only once `visible_ts ≥ c`, and for `on` after the sync. This settles the X-3 gate observation, which X-4 assigned here (decision block, "Commit visibility").
+**The rule (I-ACK).** COMMIT returns only once `visible_ts ≥ c`, and for `on` once S-STORE I-ACK-PREFIX holds for its record (§12.4: the contiguous written-and-synced prefix through its record). This settles the X-3 gate observation, which X-4 assigned here (decision block, "Commit visibility").
 - **Read-your-commit.** The session's next snapshot is `S = visible_ts ≥ c`, so it sees its commit.
 - **No 40001 against your own delete.** An RR txn that puts a key after the session's own committed delete of it finds the newest version to be that tombstone at `c ≤ S`. The §5.1 RR check therefore does not raise 40001.
 - **Across sessions.** Every snapshot taken after the ack sees the commit (v7.8 I-ACK).
@@ -350,7 +350,7 @@ Rules:
 **The commit-visibility window is kept (v7.8 §3.2).** Between `Committed(c)` and `Released(c)`, every writer-side decision treats the owner as a live holder. Readers need no rule, because `S ≤ visible_ts`.
 
 ### 3.5 Frontiers
-- **`visible_ts`**: the largest `t` such that every commit `≤ t` is applied (small) or flipped (large), and synced if `on`.
+- **`visible_ts`**: the largest `t` such that every commit `≤ t` is applied (small) or flipped (large), and durable if `on` (`durable_end ≥` its record's end, S-STORE I-ACK-PREFIX). So an `on` commit never becomes visible over an unwritten earlier batch (PG parity).
 - **`M`**, the materialized frontier: `M = min(visible_ts, min{c(T) − 1 : T large, committed, not finalized})`.
   - `M` is monotonic: a new flip has `c > visible_ts ≥ M`.
   - Every commit `≤ M` has its versions as ordinary entries in the trees.
@@ -379,7 +379,7 @@ One **snapshot registry** mutex holds every registered ts and publishes `W` (§9
 3. **The watermark floor (I-W-FLOOR).** `W` = the recovered meta's `gc_w`, and the store's `gc_w_used` starts at the same value (S-STORE §10.5). The recovered pages were pruned up to `gc_w`, so no registration may be admitted below it.
    - Mutant **W-FLOOR-ZERO**: `W` restarts at 0, so an AS OF at `t < gc_w` is admitted and reads a pruned state.
    - Test `t_w_floor_after_restart`: prune at `w`, checkpoint, crash, reopen; AS OF at `w − 1` must give 72000.
-4. **Reused ts values.** The ts of commits lost in a crash may be reused. Nothing durable references them: every entry above `T` in an image has durable records and is replayed (I-CKPT-AT-T (b)).
+4. **Reused ts values.** The ts of commits lost in a crash may be reused. Nothing durable references them: every entry above `T` in an image has durable records and is replayed (I-CKPT-AT-T (b)); and a store whose image holds an entry above the recovered frontier, because those records no longer read back, never opens read-write (S-STORE I-WAL-COVER, §14 step 3a).
 5. **No boot sweep.** Provisional entries from the previous boot are dead (§2.4), and no sweep exists for them (§12 O1).
 
 ### 3.8 Scalability requirements
@@ -557,7 +557,8 @@ v7.8 §6 is kept with §0.2 (S-2a writes the full text). It covers:
 - cancellation wakes parked sessions;
 - relation locks held to txn end, released by `ROLLBACK TO` for those taken after the savepoint;
 - advisory locks at xact scope;
-- `wait_for_lockers`.
+- `wait_for_lockers`;
+- a poisoned store (S-STORE §9.2): every wait here has the poison mark in its predicate, evaluated under the wait's own mutex, and returns the poisoning error once it is set. The poisoner wakes every wait queue, each live transaction's waiter list included, after releasing every latch, pin, the gate, the settle stripe and every internal mutex it holds.
 
 The wake generation lives in the owner's shared state (§2.2). The "missing status" cases disappear, because handles never miss.
 
@@ -856,6 +857,11 @@ This file wins over the plan. PL-1 should bring the plan in line:
 ---
 
 ## Changelog
+- **Draft 8.3** (2026-11-03, card S-1-F3, with S-STORE draft 5; pointer clauses only):
+  - **TxnId and boot ids (§2.5).** `n` starts at 1 (`n = 0` is S-STORE `SegmentEnd`'s). A boot's id is one above the newest boot id its recovery walk accepted when that is newer than its `ckpt_id`'s low bits (S-STORE §14 step 8), so a meta rollback cannot make a boot repeat an id whose records a walk can reach. S-STORE §12.5 orders boot ids in serial-number order; the creating session's id is 0.
+  - **"Synced" → I-ACK-PREFIX.** §3.1 steps 3 and 5, §3.2's head-of-line bullet and step 2, §3.4's I-ACK and §3.5's `visible_ts` say "durable" in terms of S-STORE I-ACK-PREFIX (§12.4), so an `on` commit never becomes visible or acked over an unwritten earlier batch (X-5c-F3, seed 21).
+  - **Reused ts (§3.7 step 4).** A store whose image holds an entry above the recovered frontier never opens read-write (S-STORE I-WAL-COVER).
+  - **Poison (§6.3).** Every wait has the poison mark in its predicate; the poisoner wakes every queue after releasing what it holds (S-STORE §9.2).
 - **Draft 8.2** (2026-10-24, card S-2-F2, per `verdicts/S-2-F1.md` MERGE-WITH-FOLLOWUPS; reworked per `verdicts/S-2-F2.md` REWORK):
   - **Rework R5.** `t_chunk_queue_bound`'s gauge sits at the WAL queue's append and sync sites, keyed by `txn`, not in the batcher. Its op sizes do not divide `chunk_batch`, and its large op follows small ones. New mutant BATCH-PLUS-ONE in the I-HOL row.
   - **Rework nit.** §2.4's `Released(⊥)` row cites I-PROV-LOOKUP.

@@ -1,6 +1,6 @@
 # S-STORE: Storage layer (normative)
 
-Status: draft 4 (card S-1-F2, 2026-10-26: the meta own-slot rule in §2.2) on draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace) + the S-2-F2 fixes (2026-10-24: the boot id in §7.3 and §8, `Released(⊥)` chunks in §12.6, the read-only open in §14.1) + the S-2-F2 rework (2026-10-24: the stopped store and its remedy in §14.1, a short segment in §12.5). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
+Status: draft 5 (card S-1-F3, 2026-11-03: WAL loss after sync and the coverage check I-WAL-COVER with read-only salvage, I-ACK-PREFIX, the ordered boot-id stop and boot-id freshness, the exact segment end, XX001 and WAL-path poisoning in §9.2) on draft 4 (card S-1-F2, 2026-10-26: the meta own-slot rule in §2.2) on draft 3 (card S-1-F1, 2026-10-23) + the S-2 co-edit (card S-2, 2026-10-23: provisional entries, the apply frontier `M`, chunk supersede, the boot checkpoint) + the S-2-F1 fixes (2026-10-23: frontiers in §10.1, §10.5 and §17, the boot checkpoint's durability, chain free on replace) + the S-2-F2 fixes (2026-10-24: the boot id in §7.3 and §8, `Released(⊥)` chunks in §12.6, the read-only open in §14.1) + the S-2-F2 rework (2026-10-24: the stopped store and its remedy in §14.1, a short segment in §12.5). This is a P-authored spec edit and needs a P gate before it is normative. Every `nucleus-store` card (Phase A) and the storage side of every `nucleus-txn` card that touches trees (B-1c apply, B-1d provisional entries, B-3 GC, B-4d bulk load, B-6 drop cleanup) implements against this file. A change to an invariant (`I-*`, §15) is made here first, then in the tests and mutants that pin it, and only then in code.
 
 **Scope.** This file covers:
 - the file, the pages, the page map, the free set and the buffer manager;
@@ -86,8 +86,13 @@ dir_root       u64   LPID of the tree directory's root (§6.8)
 next_lpid      u64   one past the highest LPID ever allocated
 slot_count     u64   the file length in slots covered by image k's free set
 wal_start_lsn  u64   replay start (§12.6)
+wal_ckpt_end   u64   the WAL append position read at the flip of checkpoint k (§13 step 0); step 1 made every byte below it durable
+ts_ckpt_hi     u64   the commit_ts of the last Commit or CommitMarker appended before that flip, or the frontier the boot started from if none was; ≥ T
+boot_id        u32   the boot id of the session that wrote meta k (C-T0 v8 §2.5, §14 step 8); 0 in meta 0, written by the creating session (§2.3)
 crc            u32   CRC32C of the bytes above
 ```
+The creating session's boot id is 0, meta 0's `ckpt_id`. Meta 0 is built through the checkpoint path and synced before epoch 1 (§2.3), and every boot checkpoint has `ckpt_id ≥ 1` and a boot id no older than it (§14 step 8), so no later boot has id 0.
+
 **At open**, the meta with the highest `ckpt_id` among those whose magic and CRC are valid wins. There is **no fallback** to the older meta when the newer one is valid but its image fails an integrity check. After meta `k` is synced, the slots of image `k−1` may be reused (§4.4), so falling back is unsafe. The open fails with XX001, and amcheck reports the failure. A meta is valid at open only if it also sits in its own slot, `1 + (ckpt_id mod 2)`; a meta with valid magic and CRC in the other slot is a misdirected write and is never opened, and if its `ckpt_id` exceeds that of every valid meta, the open fails with XX001, because the meta before it was synced before it was written and falling back past a synced meta is unsafe.
 
 ### 2.3 File creation
@@ -486,7 +491,31 @@ Steps 1 and 3 **should be seeks** (a binary search within the leaf, or a re-desc
 
 ### 9.2 Failure (I-FAIL-STOP)
 - **No logical failures.** Apply cannot fail logically: key size is checked when the write enters the write set (§3.2), and entries are unique.
-- **Physical failures.** An I/O error, 53100 or 53200 inside apply, eviction or a checkpoint **poisons the store**. Every later mutation returns the poisoning error, and the process stops. Recovery replays the commit (PLAN-v3 §3.4; `engine.rs` B-FAIL-STOP).
+- **Physical failures poison the store.** An I/O error (58030), 53100, 53200 or XX001 poisons the store when it is raised inside any of these:
+  - a gated operation (§5.6): an apply insert, a tree mutation or SMO, a pack step, a GC mutation, an LPID free, a directory change, a dirty eviction, a materialise or conversion step (C-T0 v8 §3.2);
+  - a checkpoint step (§13);
+  - a step of a background store job (the drop walk, §6.8; the GC sweep, §10.4);
+  - a WAL write or `sync_data`, a segment's creation, preallocation or recycling rename and its `wal/` directory sync (§12.1, §12.4, §12.5), and recovery's step-5 truncation (§14).
+
+  It does so whether or not the operation has mutated a page yet. An XX001 is a failed physical read, a read whose bytes fail §3.3, so it is a physical failure like 58030.
+  - *Why even before a mutation.* An apply cannot be skipped: an XX001 on a page it must descend through leaves its commit unappliable, and nothing may skip a commit (C-T0 v8 §3.1). An SMO cannot be undone (no partial unwinding, below). Any other gated step that has mutated nothing yet (GC, pack, drop walk, materialise) would otherwise be retried forever by its job against the same unreadable page, holding back `W`, the drop or the finalize. That is the livelock this rule removes (below).
+  - *Why the WAL path.* A failed WAL `sync_data` is never retried as if its bytes were safe (PostgreSQL's 2018 fsync-retry lesson). I-ACK-PREFIX's waiters (§12.4) cannot pass the failed batch, so without the poison they would wait forever. And §14.1 already treats a WAL append's 53100 as a stopped store.
+- **Client reads never poison.** An XX001 on a read path that mutates nothing is returned to its caller, and the store stays usable. Such paths are §8's reads and the newest probe, cursors, amcheck, and every read of a read-only open (§14.1). A later gated operation that meets the same page poisons then.
+- **How a poisoned store ends.**
+  1. **The mark.** The poison mark is one atomic store that takes no lock and holds the error. The failing operation makes it before it releases its first latch, the gate or a pin.
+  2. **Every acquisition checks it.** From then on, every call into the store returns the error, reads included. Every latch acquisition, every `try_latch` (the evictor, §5), every gate and pin acquisition checks the mark, so no reader or evictor walks a structure that the failed operation left half-changed.
+  3. **Every wait includes it.** Every blocking wait, in the store and in C-T0 v8, has the mark in its wait predicate, evaluated under that wait's own mutex. The waits are:
+     - commit-ack and visibility waiters (C-T0 v8 §3.4);
+     - the group-commit queue and every wait on `written_end` or `durable_end` (§12.4), checkpoint step 1's included;
+     - gate and pin waiters;
+     - background jobs;
+     - the lock-table waits (C-T0 v8 §6.3): `wait_for` on a holder, relation and advisory lock waits, deferrable-prefix waits and `wait_for_lockers`.
+
+     A holder is released only once `visible_ts` reaches its commit (C-T0 v8 §3.3), and after a poisoned apply `visible_ts` never advances. So without the mark in its predicate, a lock waiter would park forever. Every wait releases its mutex and sleeps in one step (a condition variable or equivalent) and re-tests its predicate on every wake.
+  4. **The broadcast.** After making the mark, the poisoner releases every latch, pin, the gate, the settle stripe and every internal mutex it holds, and **then** broadcasts to every wait queue, taking each queue's mutex in turn. "Every wait queue" includes each live transaction's waiter list. No waker holds a page latch while it takes a waiter's mutex (C-T0 v8 §2.6). A waiter that tested its predicate before the mark is either still holding its mutex, so the broadcast waits for it to sleep, or already asleep on it. So no waiter sleeps through the broadcast. Each woken waiter returns the error. A pending COMMIT returns it too, and its outcome is unknown to the client, as after a crash: it may be durable and recovered.
+  5. **Nothing more is written:** no WAL write, no sync, no checkpoint step, no meta. On disk the store is a crashed store (§14.1).
+  6. **The process stops.** A server exits non-zero after returning the error to its sessions. An embedded or browser handle returns it from every call until it is closed. The next open runs recovery (§14), which replays the commit (PLAN-v3 §3.4; `engine.rs` B-FAIL-STOP).
+- **Why XX001 is named.** Without it, a gated operation that hits an unreadable referenced page fails alone while the store runs on. In E4, every other task then parked forever behind the service loops (X-5c, MP-LIVELOCK: 41 rounds; 0 with this rule as fill G8).
 - **No partial unwinding.** The store never tries to undo a partial apply: under (b), the replay of a partially applied commit is idempotent (§14).
 
 ---
@@ -675,11 +704,13 @@ len        u32  bytes of the whole record
 crc        u32  CRC32C of the bytes after this field, to the end of the record
 lsn        u64  this record's own start position
 kind       u8   1 Commit | 2 Chunk | 3 CommitMarker | 4 SegmentEnd
-txn        (u32 boot id, u64 n)      C-T0 TxnId
+txn        (u32 boot id, u64 n)      C-T0 TxnId, n ≥ 1; in SegmentEnd, (the writing boot's id, 0)
 commit_ts  u64  0 in Chunk and SegmentEnd
 payload
 ```
-**Records never span segments.** A writer that cannot fit a record in the rest of a segment writes `SegmentEnd`, and the next record starts at the next segment's first LSN. A single record is at most `wal_seg_size / 4`; larger transactions are chunked.
+Every record carries the boot id of the boot that wrote it (§12.5). TxnId `n` starts at 1 in every boot (C-T0 v8 §2.5), so `SegmentEnd`'s `n = 0` names no transaction.
+
+**Records never span segments.** A record is placed at the append position only if it ends exactly at its segment's end or leaves room for a `SegmentEnd` after it. Otherwise the writer writes `SegmentEnd` there, and the record starts at the next segment's first LSN. So a segment ends with `SegmentEnd` or with a record that ends exactly at its end, never with a shorter gap. A single record is at most `wal_seg_size / 4`; larger transactions are chunked.
 
 ### 12.3 Record kinds and ops
 **Kinds:**
@@ -699,9 +730,13 @@ Delete{tree_id, key, flags, before?}                              # flags: moved
 - **`revert`** (only in `Chunk` records) means the transaction no longer writes `key`. It cancels the transaction's earlier ops on that key (§12.7, §14).
 - **Bytes.** Card A-6a pins the op encoding and fuzzes it.
 
-### 12.4 Group commit and order (I-WAL-TS-ORDER)
-- **Writer.** One writer drains the queue, writes one batch, does one `sync_data`, then acks the group. In embedded and wasm modes, the committing thread does this work cooperatively (N10).
-- **`synchronous_commit=off`.** The ack comes after the write and before the sync (PLAN-v3 §3.3).
+### 12.4 Group commit, the durable point, and order (I-ACK-PREFIX, I-WAL-TS-ORDER)
+- **Append.** A record's LSN is fixed when it is appended: the commit path reserves its position (and, for `Commit` and `CommitMarker`, its ts, below) and moves the **append position** past it. Its bytes are written later, by a writer.
+- **Writers.** Batches of appended records are written and synced by one writer thread, or cooperatively by committing threads in embedded and wasm modes (N10). More than one batch may be in flight. The rule below holds however batches are scheduled.
+- **The two frontiers.** `written_end` is the largest LSN `L` such that every record byte below `L` has been written (its `write` returned). `durable_end` is the largest `L ≤ written_end` such that every record byte below `L` was written before the start of a `sync_data` on its segment that has completed. Both advance **only over the contiguous prefix**: writing or syncing a batch while an earlier one is unwritten advances neither past the earlier one.
+- **I-ACK-PREFIX.** A `synchronous_commit=on` commit is acked only once `durable_end` is at or above the end of its `Commit` record, or of its `CommitMarker` for a chunked transaction, whose chunks lie below it. With `synchronous_commit=off`, it is acked once `written_end` is at or above that end, before the sync (PLAN-v3 §3.3). C-T0 v8's I-ACK (`visible_ts ≥ c`) is a further condition, not a substitute. Checkpoint step 1 waits on the same `durable_end` (§13).
+  - *Why.* The reader stops at the first invalid record (§12.5), so a record behind an unwritten one is never replayed. An ack over that hole loses an acked commit in an ordinary crash, with no media fault, and I-REDO-COMPLETE depends on this rule. E4 found exactly this (X-5c-F3, seed 21 r0). Two tasks each wrote and synced their own batch and advanced the frontiers with `max`, so ts 15 was synced and acked while the batch holding ts 14 was unwritten, and the crash lost both.
+  - Mutant **ACK-OVER-HOLE**: the frontiers advance by `max` over completed batches. Test `t_ack_prefix` (A-6c): batch 2 is written and synced before batch 1 is written, then a crash; batch 2's `on` commit must not have been acked.
 - **Apply waits for the append.** A commit's apply starts only after its records are appended.
 
 **I-WAL-TS-ORDER.** Across `Commit` and `CommitMarker` records, `commit_ts` strictly increases with LSN. The commit path must assign the ts and the append position **in one critical section**. S-2's sequencer must comply; this file imposes the requirement because recovery depends on it. Without it, a lost record could leave a durable later-ts commit behind a missing earlier one, and the recovered state would not be a ts-prefix, which breaks E4's oracle (PLAN-v3 §4 E4). Mutant: TS-AFTER-APPEND.
@@ -710,9 +745,32 @@ Delete{tree_id, key, flags, before?}                              # flags: moved
 A reader walks records from a start LSN. **It stops at the first record that:**
 - has a bad magic or CRC;
 - has `lsn` ≠ the expected position, which catches a recycled segment's old content;
-- has `len` running past the segment.
+- has `len` running past the segment;
+- has a boot id (§12.2) **older** than the boot id of the last record the walk accepted, or, for the walk's first record, older than the opened meta's `boot_id` (§2.2). Boot ids are compared in serial-number order: `a` is older than `b` iff `(a − b) mod 2^32 ≥ 2^31`.
 
-After `SegmentEnd`, the reader moves on to the next segment's first LSN. The stopping point is the **valid end**: recovery truncates there, and new appends overwrite from it. A segment file shorter than the position the reader needs, or missing, because its creation or preallocation was cut short (for example by 53100), ends the valid end at its end-of-file: for a read-write and a read-only open alike it is a stop, never 58030, since **a writer appends to a segment only after its creation or recycling rename (§12.1) and its preallocated length are durable**, not merely returned: the segment `sync_all`'d and its `wal/` directory entry synced through `Env` (or the platform's equivalent), so no record in it is acked before then and nothing acked lies past that point. Mutant **SEG-ACK-BEFORE-DURABLE**: a created or renamed segment is appended to, `sync_data`'d and acked before its directory entry and length are durable; a power cut loses the create, rename or length, and recovery stops cleanly short of an acked commit. Mutant: LSN-CHECK-SKIP. With the `lsn` check removed, a recycled segment's old records, whose magic and CRC are intact, are replayed as if they were new.
+*Why the boot id, and why ordered.*
+- **Stale records come from older boots.** Boot ids increase across the boots whose records one walk can reach (C-T0 v8 §2.5 with §14 step 8). A boot appends only from the valid end its own recovery found (step 5 truncates there, §14), which lies past every record that recovery accepted. So in the stream as it stands, boot ids never decrease in LSN order. A **stale** record is one that a later boot's truncation superseded: an older boot's record past an earlier valid end, uncovered when post-sync damage reverts the truncation that erased it (§14 step 5). Its magic, CRC and `lsn` may all be intact. It lies at or after the truncation point of a boot newer than its writer. If that newer boot appended up to the stale record's position, the records the walk accepts just before it come from that boot or a later one, so the stale record is older than the record before it, and the walk stops. If the newer boot appended nothing there, the bytes at its truncation point are the ones its own recovery found invalid (a reverted truncation restores exactly them), and the walk stops there anyway.
+- **A walk may cross into newer boots.** The walk does not stop at a **newer** boot id. The opened meta need not be the newest meta written: a meta-slot fault can leave an older meta as the newest valid one. Then the walk legitimately runs from that meta's `wal_start_lsn` through its own boot's records, to the valid end at which the next boot's recovery truncated, and on into that boot's records, whose `lsn` values continue the stream. Stopping there would lose that boot's acked commits silently.
+- **Bound.** Ordering u32 ids is sound while fewer than 2^31 checkpoints separate any two boots whose records the walk compares (68 years at one checkpoint per second).
+- **Residual.** A boot none of whose records any walk reached (its first record torn) can still share its id with a later boot, if a meta is lost after its sync (C-T0 v8 §2.5). If that boot's truncation is later reverted, its stale record is not older than the later boot's records, and the walk accepts it. This needs post-sync WAL damage and a lost meta together (classes MW and MP in one history). A single-copy WAL does not detect it in 2.0; WAL back-pointers would (§19 T4; PLAN-v3 §10 item 9, open).
+- **Mutants.** **BOOT-ID-STOP-SKIP**: the boot-id bullet is removed. **BOOT-ID-EQ-STOP**: the walk stops at any boot id other than the opened meta's.
+- **Tests.**
+  - `t_stale_boot_record` (A-6b, A-7d): the step-5 truncation write is reverted after its sync, leaving an older boot's complete record at the next expected position after the newer boot's records. The walk must stop there. It fails under BOOT-ID-STOP-SKIP.
+  - `t_meta_rollback_crosses_boot` (A-7d, class MP):
+    - boot `b−1` writes meta `k` and crashes;
+    - boot `b` recovers, truncates at its valid end `p_b`, writes its boot meta `k+1`, then appends and acks `synchronous_commit=on` commits from `p_b`;
+    - a post-sync LOST write on meta `k+1`'s slot reverts it, and a crash follows before boot `b`'s next checkpoint;
+    - the fixture keeps meta `k`'s WAL span out of recycling (`p_b` lies in the segment holding meta `k`'s `wal_start_lsn`), and keeps boot `b`'s page writes off image `k`'s slots;
+    - the open selects meta `k` and must replay boot `b`'s acked commits; the recovered state is at or above the max acked commit.
+
+    It fails under BOOT-ID-EQ-STOP, which stops at `p_b`, passes I-WAL-COVER and returns `Ok` without them.
+
+After `SegmentEnd`, **or after an accepted record that ends exactly at its segment's end** (§12.2), the reader moves on to the next segment's first LSN, **and the valid end is then at least that LSN, even when that segment is short or missing**. The **valid end** is the LSN at which the walk stopped: the start of the first record it did not accept, or, after an accepted `SegmentEnd` or an accepted record that ends exactly at its segment's end, the next segment's first LSN, if the walk stops there. Recovery truncates there, and new appends overwrite from it. I-WAL-COVER compares meta `k`'s `wal_ckpt_end` against this valid end, never against an end-of-file (§14 step 3a).
+- *Why the hop at an exact end.* A record that ends exactly at its segment's end leaves no room for a `SegmentEnd`. Without the hop the walk would stop there, step 5 would truncate the whole next segment, and the acked commits in it would be lost with no media fault, an I-REDO-COMPLETE break in class C (E4: 1064 r1, 4770 r2, 5054 r1 and 6263 r2). A flip after them would also give a false I-WAL-COVER XX001. The next segment's first record is still checked by `lsn` and boot-id order, as after `SegmentEnd`.
+- Mutants: **SEG-EXACT-NO-HOP**: the reader does not hop after a record that ends exactly at its segment's end. **SEG-TAIL-SHORT**: the writer leaves a tail that is non-empty but shorter than a `SegmentEnd`.
+- Test `t_wal_exact_segment_end` (A-6b, A-7d, class C): a record sized to end exactly at its segment's end, then acked `on` commits in the next segment, then a power cut. Recovery replays them; under SEG-EXACT-NO-HOP, step 5 zeroes the next segment and acked commits are lost. Variant: a flip after them; under the mutant it gives a false I-WAL-COVER XX001. Variant: a tail one byte shorter than `SegmentEnd`, under SEG-TAIL-SHORT.
+
+A segment file shorter than the position the reader needs, or missing, because its creation or preallocation was cut short (for example by 53100), ends the walk at the start of the record that runs past its end-of-file, or, if it holds no further whole record, at the position the walk had reached in it. That position, never the end-of-file itself, is the valid end: for a read-write and a read-only open alike it is a stop, never 58030, since **a writer appends to a segment only after its creation or recycling rename (§12.1) and its preallocated length are durable**, not merely returned: the segment `sync_all`'d and its `wal/` directory entry synced through `Env` (or the platform's equivalent), so no record in it is acked before then and nothing acked lies past that point. Mutant **SEG-ACK-BEFORE-DURABLE**: a created or renamed segment is appended to, `sync_data`'d and acked before its directory entry and length are durable; a power cut loses the create, rename or length, and recovery stops cleanly short of an acked commit. *Why the record's start, not the end-of-file:* an end-of-file that lies past the start of a partial record would let the coverage check (§14 step 3a) pass while a record below `wal_ckpt_end` was never replayed. That is unreachable under the writer rule without media faults, but the rule must not depend on it. Mutant **COVER-AT-EOF**: the coverage check compares against the end-of-file of a short segment (test: `t_wal_loss_below_ckpt_end`, short-segment variant, §15 I-WAL-COVER). Mutant: LSN-CHECK-SKIP. With the `lsn` check removed, a recycled segment's old records, whose magic and CRC are intact, are replayed as if they were new.
 
 ### 12.6 Replay start and recycling
 At the flip of checkpoint `k`, `wal_start_lsn` is the minimum of:
@@ -754,14 +812,18 @@ At most one checkpoint runs at a time. Its triggers (WAL bytes, dirty volume, ti
 
 **Step 0 (flip).**
 1. Take the epoch gate exclusively. No gated operation is now in flight (§5.6). This generalises PLAN-v3's "pause commit-apply" to every multi-page change.
-2. Take `T` := the apply frontier, record `gc_w := gc_w_used` (§10.5) and the `wal_start_lsn` (§12.6), and set `e := k+1`.
+2. Take `T` := the apply frontier, record `gc_w := gc_w_used` (§10.5) and the `wal_start_lsn` (§12.6). Inside the commit path's I-WAL-TS-ORDER critical section (§12.4), read `wal_ckpt_end` := the append position and `ts_ckpt_hi` := the commit_ts of the last `Commit` or `CommitMarker` appended, or the frontier this boot started from if none was. The two values are read together, in one entry to that critical section, so they describe the same point of the stream. `Chunk` reservations need not be made inside the critical section: a chunk appended concurrently with the read may fall either side of `wal_ckpt_end`, and its provisional entry is dead after recovery (C-T0 v8 §2.4). Every `Commit` and `CommitMarker` reservation is inside it, and that is all the bound below needs. Record the boot id and set `e := k+1`.
+
+   Every ordinary entry in image `k` was inserted by an apply that started before the flip and after its record was appended, so its record ends at or below `wal_ckpt_end` and its ts is at most `ts_ckpt_hi`. A record appended after the read has no entry in image `k`: its apply inserts are gated operations, and the gate is held exclusively. The unlogged entries of a §12.8 bulk load are not apply inserts. Their ts is the load ts, which is the fence commit's ts `f` (C-T6-rehost §9.1 step 4.2), and `f`'s `Commit` record was appended before the load began, so before the flip: it too ends at or below `wal_ckpt_end`, and `f ≤ ts_ckpt_hi`.
 3. Release the gate.
 
-**Step 1 (WAL).** `sync_data` the WAL **through the end of every record appended before the flip**. This is stricter than PLAN-v3's "through the last record with commit_ts ≤ T", and the reason is out-of-order apply:
+**Step 1 (WAL).** `sync_data` the WAL through `wal_ckpt_end`: the step ends only when `durable_end ≥ wal_ckpt_end` (I-ACK-PREFIX, §12.4), so every byte below it is written and synced, not just the last batch's. This is stricter than PLAN-v3's "through the last record with commit_ts ≤ T", and the reason is out-of-order apply:
 - applies run concurrently and finish out of ts order (`e1-mvcc/src/common/commit.rs:35–63`: apply, then `mark_applied` in ts order);
 - so the image may hold some entries of a commit `c > T` that started applying before the flip;
 - with `synchronous_commit=off`, `c`'s record may not yet be synced;
-- syncing through every appended record guarantees `c`'s record is durable before the meta, so recovery replays `c` wholly (I-CKPT-AT-T, I-REPLAY-IDEM). Without it, a crash could expose part of `c` with no record to complete it (mutant WAL-SYNC-T-ONLY).
+- syncing through `wal_ckpt_end` guarantees `c`'s record is durable before the meta, so recovery replays `c` wholly (I-CKPT-AT-T, I-REPLAY-IDEM). Without it, a crash could expose part of `c` with no record to complete it (mutant WAL-SYNC-T-ONLY).
+
+Mutant **CKPT-SYNC-OVER-HOLE**: step 1 ends when the latest batch's sync completes while an earlier batch is unwritten. Test `t_ckpt_sync_prefix` (A-7c): a flip with batch 1 unwritten and batch 2 synced, then a crash after step 5. The test needs no media fault: under the mutant, a class C open fails I-WAL-COVER with XX001.
 
 **Step 2 (image).** The checkpointer writes image `k`, each page to a fresh slot (§4.4), recording each write in the epoch-`k` map:
 - every page whose epoch-`k` content is not already at a slot the image map references: the dirty frames with content epoch `≤ k`, and the epoch copies (§5.6). Pages that eviction already wrote during epoch `k`, or wrote after the flip as epoch-`k` content (§5.2), are adopted as they are;
@@ -787,7 +849,7 @@ Pages created or mutated only after the flip are not part of the image.
 
 **Step 3.** `sync_all` the page file.
 
-**Step 4.** Write meta `k` (`ckpt_id = k`, `T`, `gc_w`, epoch, the roots, `next_lpid`, `slot_count`, `wal_start_lsn`, CRC) to slot `1 + (k mod 2)`.
+**Step 4.** Write meta `k` (`ckpt_id = k`, `T`, `gc_w`, epoch, the roots, `next_lpid`, `slot_count`, `wal_start_lsn`, `wal_ckpt_end`, `ts_ckpt_hi`, `boot_id`, CRC) to slot `1 + (k mod 2)`. Checked at meta write: `T ≤ ts_ckpt_hi` and `wal_start_lsn ≤ wal_ckpt_end ≤ durable_end`. A violation is fail-stop (§9.2), as for `gc_w ≤ T` (§10.5).
 
 **Step 5.** `sync_all`. Meta `k` is now the durable image.
 
@@ -799,7 +861,7 @@ Pages created or mutated only after the flip are not part of the image.
 
 **I-CKPT-AT-T.** Image `k` is a consistent cut: every gated operation is wholly before or wholly after the flip. In image `k`:
 - **(a)** every commit with ts `≤ T` is wholly present, up to GC `≤ gc_w`. For every snapshot `S` with `gc_w ≤ S ≤ T`, reads on the image equal reads on the committed state at `T`;
-- **(b)** every entry with ts `> T` belongs to a commit `c > T` whose records are durable when meta `k` is written (step 1), so recovery replays `c` wholly;
+- **(b)** every ordinary entry with ts `> T` belongs to a commit `c` with `T < c ≤ ts_ckpt_hi` whose records end at or below `wal_ckpt_end` and are durable when meta `k` is written (step 1). Recovery replays `c` wholly **if those records still read back**; if they do not, I-WAL-COVER refuses to open the image as it is (§14 step 3a). An unlogged bulk-load entry (the Exception below) with ts `f > T` has its fence commit `f`'s record below `wal_ckpt_end` in the same way, and a recovered frontier below `f` fails the same check. No open therefore holds an entry above its recovered frontier;
 - **(c)** every ordinary entry belongs to a committed transaction (N2). An image may hold **provisional entries** (§7.3 tags 6–8) of any transaction, committed or not. After recovery every one of them is dead (C-T0 v8 §2.4: its `txn.boot` is not the new boot id), so none is ever read as data. A committed transaction's data is in the image as ordinary entries if its commit ts is `≤ T` (`T` is the apply frontier, C-T0 v8's `M`), and otherwise it is replayed from its durable chunks (§12.6, §14). Mutant CKPT-T-VISIBLE (`T` taken as `visible_ts`).
 
 **Exception.** The unlogged entries of a §12.8 bulk load in a tree that is **not yet published** are exempt from (a)–(c):
@@ -817,9 +879,35 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 
 ## 14. Recovery
 
-1. Read page 0 and both meta slots. The newest valid meta `k` wins (§2.2).
+1. Read page 0 and both meta slots. The newest valid meta `k` wins (§2.2). A meta whose magic and CRC are valid but whose `T > ts_ckpt_hi` or `wal_start_lsn > wal_ckpt_end` is corrupt: the open fails with XX001, with no fallback (§2.2). Mutant **META-RANGE-SKIP**: this open-time check is removed (test `t_cover_ts_cross_check`, §15 I-WAL-COVER).
 2. Load the map root and the free set of image `k`. Every slot not referenced by image `k` is free, including the slots eviction wrote after meta `k`.
 3. **Pass 1:** walk the WAL from `wal_start_lsn` to the valid end (§12.5), collecting the set of `(txn, commit_ts)` of every `CommitMarker` with `commit_ts > T`.
+
+3a. **Coverage check (I-WAL-COVER).** Pass 1 also records the largest `commit_ts` of the `Commit` and `CommitMarker` records it reads. The WAL **covers** image `k` iff:
+   - the valid end (§12.5: the LSN at which the walk stopped, never an end-of-file) is at or above meta `k`'s `wal_ckpt_end`; and
+   - `max(T, that largest commit_ts) ≥ ts_ckpt_hi`.
+
+   If it does not, there is **WAL loss**: bytes that step 1 of checkpoint `k` synced before meta `k` was written no longer read back, and image `k` may hold entries of the commits they recorded (I-CKPT-AT-T (b)). The open then fails with **XX001** (detail: WAL loss, with the valid end, `wal_ckpt_end`, `T` and `ts_ckpt_hi`) **before pass 2, and writes nothing**: no replay mutation, no eviction write and no truncation (step 5). The files stay exactly as found, including any intact records behind the damage. A read-only open serves the salvage state instead (§14.1).
+   - *Why it is sound.* Suppose image `k` held an entry with ts `c` above the recovered frontier.
+     - An ordinary entry's commit record lies below `wal_ckpt_end` (§13 step 0) and at or above `wal_start_lsn` (§12.6, I-WAL-TS-ORDER), and it was not replayed. So the walk stopped below it, and the first condition fails.
+     - An unlogged bulk-load entry (§12.8) has ts `c = f`, its fence commit's ts. `f`'s `Commit` record was appended before the load, so before the flip, and so it ends at or below `wal_ckpt_end`. Since `f >` the frontier `≥ T`, the record lies at or above `wal_start_lsn` (§12.6), and it was not replayed. The first condition fails the same way.
+
+     So no store opens holding an entry above its recovered frontier, and C-T0 v8's sequencer restart at frontier + 1 (C-T0 v8 §3.7) never reissues the ts of an entry in the trees (I-ENTRY-UNIQUE). The check has no false negatives for that hazard, but it is not exact (below). The second condition checks the same floor directly from the meta. In a correct store it never fails alone; it turns a breach of §12.4's "apply waits for the append" or of I-WAL-TS-ORDER into an XX001 here instead of a reissued ts.
+   - *What it also refuses.* It fails on any loss of bytes below `wal_ckpt_end`, whether or not the image depends on them:
+     - records of commits that were appended but not yet applied at the flip, which are synced and may be acked;
+     - chunks of a chunked transaction that committed after the flip, whose chunks lie below `wal_ckpt_end` and whose marker lies above it;
+     - bytes that held **no committed data at all**: chunks of a transaction that never committed, a `SegmentEnd`, or records `≤ T` with nothing above `T` behind them.
+
+     This is deliberate. The check compares positions, so once the bytes are gone it cannot tell what they held, and detected damage below `wal_ckpt_end` is never silent.
+   - *Why never open the image as it is.* The image would serve part of a commit whose record is gone, above the frontier, so the state would be neither atomic nor a ts-prefix, and the sequencer would then reissue that commit's ts. E4 found this in 451 class MW rounds (X-5c-F3, MW-ORPHAN).
+   - Mutants:
+     - **COVER-CHECK-SKIP**: the check is removed;
+     - **COVER-END-AT-T**: `wal_ckpt_end` is taken as the end of the last record with commit_ts `≤ T`, WAL-SYNC-T-ONLY's position;
+     - **COVER-AFTER-TRUNCATE**: the check runs after step 5 or pass 2;
+     - **TS-HI-CHECK-SKIP**: the second condition is removed;
+     - **COVER-AT-EOF**: the first condition compares against a short segment's end-of-file (§12.5).
+
+     Tests: `t_wal_loss_below_ckpt_end` and `t_cover_ts_cross_check` (A-7d; §15 I-WAL-COVER).
 4. **Pass 2:** walk the same span in LSN order, and apply:
    - every `Commit` with `commit_ts > T`;
    - every `Chunk` of a transaction in pass 1's set, at that set's `commit_ts`.
@@ -830,9 +918,15 @@ Mutants: FLIP-NO-GATE (a split or pack straddles the flip), WAL-SYNC-T-ONLY.
 5. Truncate the WAL at the valid end.
 6. Resume the walks of every `dropping` directory entry (§6.8), as a B-6 boot job.
 7. Optionally run `amcheck` (A-8).
-8. Run the **boot checkpoint** (§13). It runs every step 0–6 and **always writes a new meta** (`ckpt_id` one above the recovered meta's), even when no page is dirty. No transaction starts until its step 5 has made that meta durable. Its `ckpt_id` gives C-T0 v8's **boot id** (C-T0 v8 §2.5), which is not the checkpoint epoch `e` (one higher after the flip). Chunks of the previous boot that have no marker belong to transactions that ended without one (aborted, cut off by the crash, or committed with no ts), all ended before this flip, so they do not hold back `wal_start_lsn` (§12.6). A **read-only open** (N11) skips this step and has no boot id; every provisional entry is dead to it (§14.1).
+8. Run the **boot checkpoint** (§13). It runs every step 0–6 and **always writes a new meta** (`ckpt_id` one above the recovered meta's), even when no page is dirty. No transaction starts until its step 5 has made that meta durable. C-T0 v8's **boot id** (C-T0 v8 §2.5) comes from it, and is not the checkpoint epoch `e` (one higher after the flip). Its boot id is the newer, in serial-number order (§12.5), of the low 32 bits of its `ckpt_id` and one above the newest boot id of any record the recovery walk accepted: after a meta rollback (§2.2, X5-R5) the walk can cross into a boot whose meta was lost, and whose `ckpt_id` this boot checkpoint would otherwise repeat. Meta `k+1`'s `boot_id` records it. Mutant **BOOT-ID-CKPT-ONLY**: the boot id is the low 32 bits of `ckpt_id` regardless. Test `t_boot_id_after_rollback` (A-7d, class MP): two successive rollbacks to meta `k`, across boots `b` and `b+1`; boot `b` leaves an unmarked chunked TxnId `(id, 1)`, and boot `b+1` commits a chunked transaction. Recovery from `k` must never attach `b`'s chunks to `b+1`'s marker; BOOT-ID-CKPT-ONLY does. Chunks of the previous boot that have no marker belong to transactions that ended without one (aborted, cut off by the crash, or committed with no ts), all ended before this flip, so they do not hold back `wal_start_lsn` (§12.6). A **read-only open** (N11) skips this step and has no boot id; every provisional entry is dead to it (§14.1).
 
-Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if nothing was replayed. C-T0 v8 restarts its sequencer and watermark from that value and from `gc_w` (C-T0 v8 §3.7). Provisional entries found in the image are dead and are ignored by every read (§8).
+Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if nothing was replayed. By I-WAL-COVER it is at least `ts_ckpt_hi`, so it is at least the ts of every entry in the trees, bulk-load entries included. C-T0 v8 restarts its sequencer and watermark from that value and from `gc_w` (C-T0 v8 §3.7). Provisional entries found in the image are dead and are ignored by every read (§8).
+
+**Post-sync damage.** I-REDO-COMPLETE assumes the device keeps what a completed sync covered. When it does not, recovery's outcome depends on where the damaged bytes lie:
+- **Below `wal_start_lsn`:** never read; the image holds what they recorded.
+- **In `[wal_start_lsn, wal_ckpt_end)`:** detected by I-WAL-COVER (step 3a).
+- **At or above `wal_ckpt_end`:** the valid end stops at the damage. The state is the ts-prefix up to it (I-WAL-TS-ORDER), and no image entry depends on what is lost. But synced, possibly acked, commits past it are lost **without detection**, and step 5 truncates any intact records behind it. A single-copy WAL keeps no durable record of how far it was synced past the last meta (§19 T4).
+- **An older boot's record left at a valid position:** stopped by the ordered boot-id check (§12.5).
 
 **I-REPLAY-IDEM.** Replay is idempotent, so recovering twice, including a crash during recovery, gives the same state. Under (b), every op inserts a uniquely keyed entry (I-ENTRY-UNIQUE). Re-inserting an identical entry is a no-op, so partial applies already in the image (I-CKPT-AT-T (b)) are completed rather than duplicated. A chunked transaction's superseded ops replace one another in LSN order, so each pass ends with the last op per key (I-CHUNK-SUPERSEDE). CreateTree and DropTree are idempotent (§6.8). The final state is the set union of the entries, independent of insertion order. Pass 2 still runs in LSN order, so tree creation and drop ops come before and after the writes that depend on them. Mutants (one per direction of I-ENTRY-UNIQUE):
 - **REPLAY-DUP-CONFLICT:** an identical re-insert is treated as a conflict (XX001);
@@ -840,23 +934,42 @@ Afterwards, the apply frontier is the largest replayed `commit_ts`, or `T` if no
 
 The double-crash test (A-7d) is the test that runs recovery twice. It is not a mutant.
 
-**I-REDO-COMPLETE.** Every acked `synchronous_commit=on` commit is either `≤ T` of the recovered image, and in it, or has durable records at or after `wal_start_lsn` before the valid end, and is replayed. Mutants:
+**I-REDO-COMPLETE.** Every acked `synchronous_commit=on` commit is either `≤ T` of the recovered image, and in it, or has durable records at or after `wal_start_lsn` before the valid end, and is replayed, given I-ACK-PREFIX (§12.4) and a device that keeps what a completed sync covered (above). This holds for a walk from an older meta after a meta-slot fault too, because the walk crosses into newer boots' records (§12.5), when that meta's image and WAL span are intact; otherwise X5-R5's detection (XX001 on the older image's reused slots, §3.3), or I-WAL-COVER after recycling, applies. Mutants:
 - **START-LSN-PAST-CHUNK:** the replay start ignores an open transaction's first chunk;
 - **START-LSN-MARKED-CHUNK:** the replay start counts only transactions with no marker. Its test is §12.6's case: a chunked transaction whose marker (`commit_ts > T`) lies after a commit `≤ T`, with its apply unfinished at the flip, then a crash after step 6. The transaction must be recovered whole.
 
 **E4's oracle.** The recovered state equals the model at some commit `c`, with max acked sync-on commit `≤ c ≤` last WAL-written commit (PLAN-v3 §4 E4). That follows from I-REDO-COMPLETE, I-CKPT-AT-T, I-REPLAY-IDEM and I-WAL-TS-ORDER: the durable commits form a ts-prefix.
 
 ### 14.1 Read-only open (N11)
-N11 makes read-only opens optional. A build that offers them meets this subsection; a build that does not refuses a read-only open. A read-only open recovers exactly the state a read-write open recovers, but keeps it in memory and writes nothing.
+**Every build offers a read-only open**, in server, embedded and browser modes (PLAN-v3 §10 item 8): it is the only path to the data after WAL loss (below), and the export path of a stopped store (C4 decision 5). N11's single-owner rule is unchanged. A read-only open recovers exactly the state a read-write open recovers, but keeps it in memory and writes nothing, except under WAL loss (below), where a read-write open recovers none.
 
 **A stopped store opens read-only with zero free bytes (C4 decision 5).** A store that stopped on 53100 (a full volume or an OPFS quota) is, on disk, a crashed store, because poisoning lives only in memory (§9.2). Whatever the write point, a WAL append, a segment's creation or preallocation, a file extension (§4.5), a checkpoint page write or the meta write, the cut-short write lies past the valid end (§12.5), in a slot or extension that image `k` does not reference (§14 step 2), or in the meta slot that loses (§2.2). So a read-only open of it **succeeds on a volume with zero free bytes** and writes nothing, provided its pool meets the evictable minimum for the replay (below). The data stays readable and exportable without freeing any space. Test `t_ro_open_disk_full` (A-7d, §15 I-RO-OPEN).
 
 **No writer.** While a read-only open is open, no read-write open of the file runs: it takes N11's file lock (through `Env`) in a mode that excludes a read-write open, and it fails rather than wait when a writer holds the lock. **The lock creates and writes no file**, in either mode: it is an advisory lock on the page file itself (opened read-only by a read-only open), or, on OPFS, the access-handle mode (`read-only` against a writer's exclusive `readwrite`). A lock file would be a write, and on a full volume its creation fails (mutant **RO-LOCK-FILE**). <!-- For A-1: an O_RDONLY fd cannot take a POSIX fcntl write lock, so the read-only open needs a shared (read) lock mode; PLAN-v3 §3.2's Env has only lock_exclusive (follow-up proposed in verdicts/S-2-F2.md). --> Why exclude a writer: a writer recycles WAL segments and reuses slots after every checkpoint (§13 step 6), so the reader's image and WAL span would change under it. Whether several read-only opens may share the file is the lock mode's choice; nothing here depends on it, because none of them writes.
 
-**What it replays.** Steps 1–4, unchanged: the same winning meta (§2.2), the same image, the same valid end (§12.5), the same two passes, and the same ops, with I-CHUNK-SUPERSEDE.
+**What it replays.** Steps 1–4, including the open-time meta check (step 1) and the coverage check (step 3a): the same winning meta (§2.2), the same image, the same valid end (§12.5), the same two passes, and the same ops, with I-CHUNK-SUPERSEDE.
 - So its state equals the state a read-write open of the same files has after step 4, before its boot checkpoint.
 - The apply frontier is fixed as after step 4 (the largest replayed `commit_ts`, or `T`), and `W` starts at the meta's `gc_w` (C-T0 v8 §3.7 steps 2–3). Neither advances, because nothing commits.
 - Skipping pass 2 would serve image `k` alone and silently lose every acked commit above `T` (mutant **RO-NO-REPLAY**).
+
+**WAL loss: salvage (I-WAL-COVER).** When the coverage check fails, a read-write open fails with XX001 (§14 step 3a), but a read-only open succeeds in **salvage**:
+- It runs pass 2 over the valid span as usual and fixes the apply frontier at the largest replayed `commit_ts`, or `T`. `visible_ts` is that frontier, and no snapshot above it is admitted.
+- **It serves the ts-prefix state at that frontier.**
+  - Every commit `≤ T` is in the image (I-CKPT-AT-T (a)), and every commit in `(T, frontier]` is replayed from records that read back.
+  - Every lost commit has a ts above the frontier (I-WAL-TS-ORDER), including the commits whose entries sit in the image without a record, and so does every bulk-load entry whose fence commit was lost. A read at `S` sees only versions `≤ S` (§8), so no read sees a lost commit.
+  - Dead provisional entries stay dead.
+- **Dropped trees.** The tree directory is unversioned. Image `k` can hold a `dropping` mark, and page frees, from a drop-cleanup commit `c_d` above `T`, even one whose record is lost: `c_d`'s apply sets `dropping`, and the bounded walk then runs as a background job (C-T6-rehost §7.4), with nothing waiting for `M ≥ c_d`. Salvage still never reads a freed page:
+  - the drop job issues `c_d` only once `W > S_job`, where `S_job ≥ S_ddl`, the retiring DDL's commit ts (C-T6-rehost §7.4, C-T0 v8 §9.3);
+  - `c_d` was applied before the flip, so it was issued before it;
+  - `W ≤ M` at all times and `M` is monotone (C-T0 v8 §3.5), so `S_ddl < W ≤ T ≤` the salvage frontier;
+  - a read at a salvage snapshot `S ≥ S_ddl` reaches trees only through the catalog at `S` (C-T5), which no longer names the dropped trees;
+  - a `CreateTree` of a lost commit leaves a tree that no catalog at `S ≤` the frontier names;
+  - the drop walk does not resume in a read-only open (below).
+
+  Snapshots below `S_ddl` are governed here exactly as in any open, by the watermark floor (C-T0 v8 §3.7 step 3).
+- It reports the loss with the open: the valid end, `wal_ckpt_end`, `T`, `ts_ckpt_hi` and the frontier.
+- **The remedy** is to export from it into a new file (D-7). The read-write open stays refused, and nothing in 2.0 repairs the file in place.
+- Mutant **SALVAGE-ABOVE-FRONTIER**: the salvage open admits snapshots above the frontier (for example, `visible_ts := ts_ckpt_hi`) and reads part of a lost commit. Test `t_wal_loss_salvage` (A-7d).
 
 **Where the replay lives: in the pool, unwritten.** Pass 2's mutations, including its splits and the LPIDs they allocate, exist only in memory.
 - **Eviction.** A dirty frame is never evicted, because §5.2's dirty-victim write is a write. Clean frames are evicted as usual.
@@ -901,7 +1014,7 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-ENTRY-UNIQUE / I-REPLAY-IDEM | §9.1, §14: identical re-insert (chains compared by content) is a no-op, a different one XX001; recovering twice gives the same state | B-1c, A-7d (incl. the double-crash test; an overflow value in a partially applied commit) | REPLAY-DUP-CONFLICT, DUP-DIFFERENT-ACCEPTED, CHAIN-LPID-COMPARED |
 | I-CHUNK-SUPERSEDE | §12.7, §14: within one chunked transaction the last op per key wins, `revert` deletes; replay twice gives the same state | A-7d, B-1d | SUPERSEDE-AS-CONFLICT |
 | I-KEY-SIZE | §3.2: an entry key over `K_MAX` is refused with 54000 at write-set entry; apply never sees one | A-2 (formula and values), B-1a (the write path calls the check) | SIZE-CHECK-OFF |
-| I-FAIL-STOP | §9.2: no mutation after a poisoning error | B-1c, A-3c | POISON-IGNORED |
+| I-FAIL-STOP | §9.2: a 58030/53100/53200/XX001 inside a gated operation, a checkpoint step, a background store job or the WAL path (a WAL write or `sync_data`, a segment's creation, preallocation, recycling rename or `wal/` directory sync, recovery's step-5 truncation) poisons the store; a client read's XX001 never does. The mark is made before the first release, and every acquisition checks it. Every blocking wait, the lock-table waits included, has it in its predicate, under the wait's own mutex, and sleeps by releasing that mutex in one step, re-testing on every wake. The broadcast comes after every latch, pin, the gate, the settle stripe and every internal mutex are released, and reaches every wait queue, each live transaction's waiter list included. After poison, every call fails, every waiter returns, and nothing is written. Test `t_gated_xx001_poisons`: a damaged referenced leaf on an apply's path; every commit waiter returns the error within the test's step budget, and no task is left parked. Its **lock-waiter variant**: a txn waits in the lock table on a key held by a commit that sits behind the poisoned apply, so the holder is never released; the waiter must return the error (POISON-LOST-WAKEUP and POISON-WAITER-PARKED leave it parked; pinned in B-1c and B-1b). Its **WAL variant**: the group-commit writer's `sync_data` fails (58030); the store is poisoned and every waiter on `durable_end` returns the error. WAL-ERR-NOT-POISON (an error on the WAL path does not poison the store) fails it. Test `t_client_read_xx001_no_poison`: a client read of that leaf gets XX001, then an unrelated commit and a checkpoint both succeed. Test `t_poison_before_unlatch` (shuttle): a reader that races the failing SMO gets the error, never the half-changed page; so does an evictor's `try_latch`. Test `t_poison_wakeup_race` (shuttle; A-4c, B-1c): a waiter tests its predicate concurrently with the poisoner's mark and broadcast; under every schedule it returns the error. POISON-LOST-WAKEUP (a wait predicate omits the mark, so a woken waiter re-tests only its own condition and sleeps again) fails it, and so does a broadcast made before the mark | B-1c (commit waiters, COMMIT's error, the WAL variant); B-1b, the lock-table card, with B-2b for `wait_for` (the lock-waiter variant); A-3c, A-4c (the latch and `try_latch` check, shuttle) | POISON-IGNORED, XX001-NOT-POISON, CLIENT-READ-POISONS, POISON-WAITER-PARKED, POISON-AFTER-UNLATCH, POISON-LOST-WAKEUP, WAL-ERR-NOT-POISON |
 | I-GC-READEQ | §10.2: every GC mutation is read-equivalent at every S ≥ the published W | B-3 (+ G0 re-point, B-7) | GC-DROPS-VISIBLE, G-WATERMARK+1, G-RESURRECT |
 | I-GC-ORDER | §10.2/§10.4: an elided tombstone is deleted after every older version of its key | B-3 (a group spanning leaves, read between sweep steps or across a checkpoint and crash) | G-TOMB-FIRST |
 | I-GC-COMPLETE | §10.2: after a quiescent sweep, at most one version ≤ w per key, and it is live | B-3 (the §10.2 directed test, with a reader) | GC-KEEPS-TOMB |
@@ -916,10 +1029,12 @@ Each invariant needs a test and a named mutant that the test catches (PLAN-v3 §
 | I-FREE-SAFE | §4.4/§13 step 6: no reuse before the freeing meta is synced | A-3c, A-7c | FREE-EARLY |
 | I-FREE-EXACT | §4.3: the persisted bitmaps are exact | A-7b, A-8 | BITMAP-OMITS-FREESET-PAGES |
 | I-META-ATOMIC | §13: a meta never points at unwritten pages | A-7c (crash between every step) | META-BEFORE-SYNC |
-| I-CKPT-AT-T | §13: the image is a consistent cut; (a)–(c), with `T` = the apply frontier `M` | A-7a/A-7c (splits and packs during a checkpoint; async mix), B-1d (a checkpoint during a finalize) | FLIP-NO-GATE, WAL-SYNC-T-ONLY, CKPT-T-VISIBLE |
-| I-REDO-COMPLETE | §14: every acked sync commit is in the image or replayed | A-6d, A-7d | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK |
-| I-RO-OPEN | §14.1: a read-only open writes nothing through `Env`, and its reads at every registered `S` equal those of a read-write open of the same files after step 4. Test `t_ro_open`, with a SimEnv that fails every write, sync, rename and truncate. Its fixture is a crashed file with a torn WAL tail, small commits above `T`, a marked chunked txn whose marker lies after a commit `≤ T`, unmarked chunks, a `dropping` entry, provisional entries in the image, and replay splits. The test compares the reads with a read-write open of a copy, checks the files are byte-identical after close, and checks that a pool too small for the replay gives 53200 with nothing written. Test `t_ro_open_disk_full` (the stopped store, C4 decision 5): a SimEnv stops a writer with ENOSPC (53100) at each write point in turn, namely a WAL append, a segment's creation, its preallocation (a short segment, §12.5), a file extension (§4.5), a checkpoint page write and the meta write. A read-only open then runs on a SimEnv that reports zero free bytes and refuses every write, including a lock file's creation. It must succeed, its reads must equal those of a read-write open of a copy on a roomy Env, a full scan of every published tree must succeed, and every file must be byte-identical after close. With a pool below the replay's evictable minimum it must give 53200 with nothing written, and a read-only open of the same files with a larger pool budget must then succeed at zero free bytes (§14.1's remedy). SHORT-SEG-ERROR (a short or missing segment returns 58030 instead of ending the valid end) fails the open. Test `t_seg_ack_durable` (A-6b, §12.5's writer rule), with a SimEnv whose power cut also loses unsynced creates, renames and `set_len`: a segment is newly created (the lost-create case) or recycled by rename (the lost-rename case), records in it are acked, and power is cut at every step from the create or rename to the ack. Recovery must replay every acked record. SEG-ACK-BEFORE-DURABLE (ack before the segment's `sync_all` and its `wal/` directory sync) loses an acked commit as a clean stop and fails it | A-7d, A-6b | RO-NO-REPLAY, RO-WRITES, RO-LOCK-FILE, SHORT-SEG-ERROR, SEG-ACK-BEFORE-DURABLE |
-| I-WAL-STALE | §12.5: the reader stops at the first bad magic/CRC, wrong `lsn` or over-long `len`; recovery truncates there | A-6b | LSN-CHECK-SKIP |
+| I-CKPT-AT-T | §13: the image is a consistent cut; (a)–(c), with `T` = the apply frontier `M`; (b) bounded by `wal_ckpt_end`/`ts_ckpt_hi`, bulk-load entries via their fence commit | A-7a/A-7c (splits and packs during a checkpoint; async mix), B-1d (a checkpoint during a finalize) | FLIP-NO-GATE, WAL-SYNC-T-ONLY, CKPT-T-VISIBLE |
+| I-REDO-COMPLETE | §14: every acked sync commit is in the image or replayed (given I-ACK-PREFIX; §14 Post-sync damage; also from an older meta, `t_meta_rollback_crosses_boot`) | A-6d, A-7d | START-LSN-PAST-CHUNK, START-LSN-MARKED-CHUNK |
+| I-WAL-COVER | §13 step 0, §14 step 3a: meta `k` records `wal_ckpt_end` and `ts_ckpt_hi`. An open fails with XX001 before pass 2 and writes nothing if its valid end (the walk's stop position, §12.5) is below `wal_ckpt_end`, or if its `Commit`/`CommitMarker` records do not reach `ts_ckpt_hi`. No open holds an entry above its recovered frontier. Test `t_wal_loss_below_ckpt_end`: a SimEnv fixture with post-sync WAL faults (LOST, TORN or MISDIRECTED on a synced WAL write) holds a commit `c > T` partly applied before the flip, whose record step 1 synced; then meta `k` is durable, then a fault on `c`'s record. The open gives XX001 and every file is byte-identical afterwards. Variants: the fault on a record that was appended but unapplied at the flip; on a `SegmentEnd` before `wal_ckpt_end`; on a chunk of a marked transaction; on a chunk of a transaction that never committed (no committed data lost; still XX001); on a bulk load's fence commit `f > T`, with loaded entries in image `k`; **short segment**: a segment cut short so that its end-of-file lies past the start of a record that runs past it, below `wal_ckpt_end`. Under COVER-CHECK-SKIP, a new commit and then a read at `S ≥ c` see part of `c`; under COVER-END-AT-T, the open succeeds; under COVER-AFTER-TRUNCATE, the files differ; under COVER-AT-EOF, the short-segment variant opens. Test `t_cover_ts_cross_check`: a meta whose `ts_ckpt_hi` exceeds every replayable commit (forged through `Env`) gives XX001; for §14 step 1's open-time check, a forged meta with `T > ts_ckpt_hi`, and one with `wal_start_lsn > wal_ckpt_end`, each with a valid CRC, give XX001 (META-RANGE-SKIP opens them) | A-7c (the fields), A-7d (SimEnv post-sync WAL damage) | COVER-CHECK-SKIP, COVER-END-AT-T, COVER-AFTER-TRUNCATE, TS-HI-CHECK-SKIP, COVER-AT-EOF, META-RANGE-SKIP |
+| I-RO-OPEN | §14.1: a read-only open writes nothing through `Env`, and its reads at every registered `S` equal those of a read-write open of the same files after step 4, except under WAL loss (§14 step 3a), where the read-write open fails and the read-only open serves the salvage state at the recovered frontier (§14.1). Every build offers it (§14.1). Test `t_ro_open`, with a SimEnv that fails every write, sync, rename and truncate. Its fixture is a crashed file with a torn WAL tail, small commits above `T`, a marked chunked txn whose marker lies after a commit `≤ T`, unmarked chunks, a `dropping` entry, provisional entries in the image, and replay splits. The test compares the reads with a read-write open of a copy, checks the files are byte-identical after close, and checks that a pool too small for the replay gives 53200 with nothing written. Test `t_ro_open_disk_full` (the stopped store, C4 decision 5): a SimEnv stops a writer with ENOSPC (53100) at each write point in turn, namely a WAL append, a segment's creation, its preallocation (a short segment, §12.5), a file extension (§4.5), a checkpoint page write and the meta write. A read-only open then runs on a SimEnv that reports zero free bytes and refuses every write, including a lock file's creation. It must succeed, its reads must equal those of a read-write open of a copy on a roomy Env, a full scan of every published tree must succeed, and every file must be byte-identical after close. With a pool below the replay's evictable minimum it must give 53200 with nothing written, and a read-only open of the same files with a larger pool budget must then succeed at zero free bytes (§14.1's remedy). SHORT-SEG-ERROR (a short or missing segment returns 58030 instead of ending the valid end) fails the open. Test `t_seg_ack_durable` (A-6b, §12.5's writer rule), with a SimEnv whose power cut also loses unsynced creates, renames and `set_len`: a segment is newly created (the lost-create case) or recycled by rename (the lost-rename case), records in it are acked, and power is cut at every step from the create or rename to the ack. Recovery must replay every acked record. SEG-ACK-BEFORE-DURABLE (ack before the segment's `sync_all` and its `wal/` directory sync) loses an acked commit as a clean stop and fails it. Test `t_wal_loss_salvage` (Q1 = A, PLAN-v3 §10 item 8): the `t_wal_loss_below_ckpt_end` fixture, plus a `dropping` mark from a drop-cleanup commit above `T` whose record is lost, opened read-only. At every admitted `S` it reads the model's state at `S ≤` the frontier, never an entry above it, and a full scan of every tree the catalog at `S` names succeeds. SALVAGE-ABOVE-FRONTIER fails it | A-7d, A-6b | RO-NO-REPLAY, RO-WRITES, RO-LOCK-FILE, SHORT-SEG-ERROR, SEG-ACK-BEFORE-DURABLE, SALVAGE-ABOVE-FRONTIER |
+| I-WAL-STALE | §12.5: the reader stops at the first bad magic/CRC, wrong `lsn` or over-long `len`, or a boot id older, in serial-number order, than the last accepted record's (the opened meta's for the first record); a walk may cross into newer boots; recovery truncates there. It hops to the next segment after `SegmentEnd` or after a record that ends exactly at its segment's end, and a writer never leaves a shorter tail (§12.2). A boot's id is fresh after a meta rollback (§14 step 8). Tests `t_stale_boot_record`, `t_meta_rollback_crosses_boot`, `t_wal_exact_segment_end`, `t_boot_id_after_rollback` | A-6b, A-7d | LSN-CHECK-SKIP, BOOT-ID-STOP-SKIP, BOOT-ID-EQ-STOP, SEG-EXACT-NO-HOP, SEG-TAIL-SHORT, BOOT-ID-CKPT-ONLY |
+| I-ACK-PREFIX | §12.4: `written_end` and `durable_end` advance only over the contiguous prefix; an `on` ack needs `durable_end ≥` the record's end; an `off` ack needs `written_end ≥` it; step 1 waits on `durable_end ≥ wal_ckpt_end` | A-6c (`t_ack_prefix`, porting X-5c-F3-F1 (a)'s two-task interleaving), A-7c (`t_ckpt_sync_prefix`), B-1c (C-T0 v8 §3.1 step 3's visibility over the same prefix) | ACK-OVER-HOLE, CKPT-SYNC-OVER-HOLE |
 | I-WAL-TS-ORDER | §12.4: commit_ts strictly increases with LSN | A-6c, B-1c | TS-AFTER-APPEND |
 | I-BULK-PUBLISH | §12.8: unlogged writes only into unpublished trees; publish after the forced meta | B-4d | PUBLISH-BEFORE-META |
 
@@ -974,7 +1089,7 @@ All numbers are from n5000 (i5-13500H, 16 CPUs), rustc 1.99.0, in memory, median
 
 ## 18. Refinements of PLAN-v3 §3.3
 
-This file wins over the plan (precedence above). The plan should be updated through an Opus card to match these. R10 refines the §4 decision block rather than §3.3. R11 comes from the S-2 co-edit:
+This file wins over the plan (precedence above). The plan should be updated through an Opus card to match these. R10 refines the §4 decision block rather than §3.3. R11 comes from the S-2 co-edit. R12–R15 come from card S-1-F3; R15 refines §3.4, as R9 does:
 
 | # | Plan text | Here | Why |
 |---|---|---|---|
@@ -989,6 +1104,10 @@ This file wins over the plan (precedence above). The plan should be updated thro
 | R9 | §3.4 GC "prunes versions below the watermark during page writes and splits" | Page-local prune (required at splits, optional at eviction) **plus** a whole-tree sweep (§10.3–10.4) | Page-local pruning cannot see groups that span leaves, so alone it cannot meet I-GC-COMPLETE or B-3's bound |
 | R10 | §4 decision block, "Space amplification": "after-GC tree bytes" (undefined) | Tree bytes = reachable pages × `page_size` (§11) | The file never shrinks (§4.5), so a file-length or allocated-page reading stays at the post-update peak and B-3 could never pass |
 | R11 | Step 0: "T = the apply frontier (every commit ≤ T is fully applied to the trees; under N2, trees hold only committed data)" | `T` = C-T0 v8's `M`; trees may also hold provisional entries, which are never data after recovery (§1, §13 (c)) | X-4 fired the pre-apply trigger; C-T0 v8 §3.2 |
+| R12 | Meta fields (R1's list) | Adds `wal_ckpt_end`, `ts_ckpt_hi`, `boot_id` (§2.2) | I-WAL-COVER and the ordered boot-id stop |
+| R13 | Recovery: "walk … to the valid end", with no rule for an early end | The coverage check against the walk's stop position: fail closed with XX001, write nothing, and a read-only salvage that every build offers (§14 step 3a, §14.1; PLAN-v3 §10 item 8) | E4 class MW (X-5c-F3) |
+| R14 | Group commit: "one writer … then acks the group" | I-ACK-PREFIX (§12.4) | X-5c-F3 seed 21 |
+| R15 | §3.4's fail-stop (I/O error, disk full) | I-FAIL-STOP includes XX001 inside gated operations, checkpoints and store jobs, and every error on the WAL path; client reads never poison; every wait, the lock-table waits included, observes the poison (§9.2) | G8, MP-LIVELOCK 41 → 0 |
 
 ---
 
@@ -1007,10 +1126,34 @@ This file wins over the plan (precedence above). The plan should be updated thro
 - **T2: space amplification after GC.** 20.11× in E0. **Trigger:** B-3's W3/W4-shape acceptance (after-GC tree bytes `≤ 1.5×` pre-update, both as reachable pages × `page_size`, §11) fails on the real tree. Then N3 is re-opened.
 - **T3: contended writes.** Both arms collapse past 8 threads. This is a shared commit-path or latching bottleneck owned by S-2 and E7, not by N3 or this file.
 
+**Known cost of a single-copy WAL (card S-1-F3):**
+- **T4: undetectable post-sync WAL loss** (§14, "Post-sync damage").
+  - **The cost:** acked commits since the last checkpoint can be lost silently on a device that drops synced writes.
+  - **Mitigations,** none in 2.0 unless the owner adopts WAL back-pointers (PLAN-v3 §10 item 9, open):
+    - per-batch `durable_end` witnesses with a forward scan past the stop (detection only);
+    - a copy on another machine, through synchronous replication (detection and repair). A second WAL copy on the same device barely helps, because the same device can lie for both;
+    - more frequent checkpoints (a narrower window).
+  - **Trigger:** owner Q2 (PLAN-v3 §10 item 9), or a field report on a target that drops synced writes.
+
 ---
 
 ## Changelog
 
+- **Draft 5** (2026-11-03, card S-1-F3, per verdict X-5c-F3 038bb9cc and the draft gates `verdicts/S-1-F3-draft-gate.md` and `verdicts/S-1-F3-draft2-gate.md`):
+  - **Owner Q1 = A** (PLAN-v3 §10 item 8, decided 2026-11-02): detected WAL loss refuses a read-write open with XX001, and a read-only open serves the ts-prefix salvage state, in every mode. Options B, C and C′ were declined.
+  - **Meta fields (W1).** `wal_ckpt_end`, `ts_ckpt_hi` and `boot_id` (§2.2); the creating session's boot id is 0. R12.
+  - **TxnId and `SegmentEnd` (W2).** Every record carries its writing boot's id; TxnId `n ≥ 1`; `SegmentEnd`'s `txn` is `(boot id, 0)` (§12.2).
+  - **Exact segment end (draft-2 gate G2).** A record ends exactly at its segment's end or leaves room for a `SegmentEnd`; the reader hops after either (§12.2, §12.5). Mutants SEG-EXACT-NO-HOP and SEG-TAIL-SHORT, test `t_wal_exact_segment_end` (E4: 1064 r1, 4770 r2, 5054 r1, 6263 r2).
+  - **I-ACK-PREFIX (W3).** §12.4 rewritten: `written_end` and `durable_end` advance only over the contiguous prefix; acks and checkpoint step 1 wait on them. Mutants ACK-OVER-HOLE and CKPT-SYNC-OVER-HOLE. R14.
+  - **Ordered boot-id stop (W4).** §12.5 stops at a record whose boot id is older, in serial-number order, than the last accepted record's (the opened meta's for the first); a walk may cross into newer boots. The valid end is the walk's stop position; a short segment ends the walk at a record's start, never at its end-of-file. Mutants BOOT-ID-STOP-SKIP, BOOT-ID-EQ-STOP, COVER-AT-EOF.
+  - **Boot-id freshness (draft-2 gate G1).** A boot's id is the newer of its `ckpt_id`'s low 32 bits and one above the newest boot id its recovery walk accepted (§14 step 8). Mutant BOOT-ID-CKPT-ONLY, test `t_boot_id_after_rollback`.
+  - **Checkpoint (W5).** Step 0 reads `wal_ckpt_end` and `ts_ckpt_hi` in the sequencer's critical section; step 1 syncs through `wal_ckpt_end` on `durable_end`; step 4's range checks; I-CKPT-AT-T (b) restated, bulk loads included (§13).
+  - **Recovery (W6).** The open-time meta check (step 1, META-RANGE-SKIP); the coverage check I-WAL-COVER (step 3a), failing closed with XX001 before pass 2 and writing nothing; the "Afterwards" bound; the "Post-sync damage" case table; I-REDO-COMPLETE's premises (§14). R13.
+  - **Read-only open and salvage (W7).** Every build offers a read-only open; under WAL loss it serves the salvage state at the recovered frontier, dropped trees included (§14.1). Mutant SALVAGE-ABOVE-FRONTIER.
+  - **I-FAIL-STOP (W8, G8).** §9.2 rewritten: 58030/53100/53200/XX001 inside a gated operation, a checkpoint step, a background store job or the WAL path poisons the store; client reads never do; the atomic mark, the mark in every wait predicate, the broadcast after every lock is released, and how the store ends. R15.
+  - **§15 (W9).** New rows I-WAL-COVER and I-ACK-PREFIX; I-WAL-STALE, I-FAIL-STOP, I-RO-OPEN, I-REDO-COMPLETE and I-CKPT-AT-T amended.
+  - **§18 and §19 (W10).** R12–R15; trigger T4 (undetectable post-sync WAL loss).
+  - Not applied: the optional WAL back-pointer (owner Q2, PLAN-v3 §10 item 9, open).
 - **Draft 4** (2026-10-26, card S-1-F2, per P's ruling on F3 of `verdicts/X-5b.md` at f8a6b6eb, branch card/v3-X-5b):
   - **Meta own slot (F3).** §2.2's open rule adds a positional check: a meta is valid at open only in its own slot, `1 + (ckpt_id mod 2)`. A valid meta in the other slot is a misdirected write. It is never opened, and if it is newer than every valid meta the open fails with XX001. Before this, magic and CRC alone made a misplaced copy openable, which breaks §2.2's torn-write guarantee and is the fallback past a synced meta that §2.2 already forbids. New row I-META-SLOT (§15), mutant META-WRONG-SLOT, pinned by A-7d.
 - **S-2-F2 rework** (2026-10-24, card S-2-F2, per `verdicts/S-2-F2.md` REWORK; C4 decision 5's binding, PLAN-v3 §8.1):
