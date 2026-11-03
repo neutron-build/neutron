@@ -1350,7 +1350,7 @@ export async function createServer(
             undefined,
             undefined,
             undefined,
-            { middleware: false, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
+            { middleware: false, notFoundPage: true, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
           );
         } catch (error) {
           emitHook(hooks?.onError, {
@@ -1391,7 +1391,7 @@ export async function createServer(
               globalMiddleware,
               undefined,
               undefined,
-              { lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
+              { notFoundPage: true, lazyStylesheetHrefs: lazyStylesheetsFor(notFoundMatch.route.id), documentHead }
             );
             // The page renders as a normal route, which makes it a 200. The
             // status is the part that matters to crawlers and monitoring — but
@@ -1838,7 +1838,7 @@ async function handleAppRouteRequest(
     generation?: string;
     stillValid: () => boolean;
   },
-  extra?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware" | "lazyStylesheetHrefs" | "documentHead">
+  extra?: Pick<RenderAppRouteOptions, "renderNotFound" | "middleware" | "notFoundPage" | "lazyStylesheetHrefs" | "documentHead">
 ): Promise<Response> {
   // Dev module-loading adapter: load every route/layout module through the
   // Vite SSR runtime, then hand the loaded map to the shared render core —
