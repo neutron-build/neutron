@@ -38,6 +38,7 @@ import {
   withRouterProviders,
   type CreateElement,
   assertStaticRoutesUngated,
+  precompressBuildOutput,
 } from "@neutron-build/core";
 import { findGatedStaticRoutes, gatedStaticRoutesError } from "./gated-static.js";
 import type {
@@ -86,6 +87,7 @@ import {
   routeStylesheetHrefs,
   type RouteCssManifest,
   type ViteManifest,
+  writeRouteTable,
 } from "@neutron-build/core/server";
 
 export async function build(): Promise<void> {
@@ -290,6 +292,7 @@ export async function build(): Promise<void> {
             routeRules: neutronConfig.routes,
             serverActions: { registry: serverActionRegistry },
             client: neutronConfig.client,
+            images: neutronConfig.server?.images,
           }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
@@ -374,7 +377,12 @@ export async function build(): Promise<void> {
               return { id: source, external: true };
             },
           },
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            images: neutronConfig.server?.images,
+          }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
         css: cssConfig,
@@ -492,6 +500,7 @@ export async function build(): Promise<void> {
             routeRules: neutronConfig.routes,
             serverActions: { registry: serverActionRegistry },
             client: neutronConfig.client,
+            images: neutronConfig.server?.images,
           }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
@@ -566,7 +575,12 @@ export async function build(): Promise<void> {
       configFile: false,
       root: cwd,
       plugins: [
-          neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes }),
+          neutronPlugin({
+            routesDir,
+            rootDir: cwd,
+            routeRules: neutronConfig.routes,
+            images: neutronConfig.server?.images,
+          }),
           neutronPublicEnvPlugin(neutronConfig.env),
         ],
       css: cssConfig,
@@ -1162,6 +1176,19 @@ export async function build(): Promise<void> {
     oxc: oxcJsx,
     serverActions,
   });
+
+  // The production server boots from this table instead of parsing every
+  // route source; it falls back to discovery once src/routes changes.
+  writeRouteTable(cwd, routesDir, outputDir, routes);
+
+  // The production server (`neutron-ts start`, the node and docker
+  // presets) sends these siblings instead of compressing every request.
+  // Platform presets compress at their edge and count deployed files, and
+  // the static adapter writes its own.
+  if (!selectedAdapter || selectedAdapter.name === "node" || selectedAdapter.name === "docker") {
+    const precompressed = precompressBuildOutput(outputDir);
+    console.log(`\nPrecompressed ${precompressed.files} files (brotli + gzip)`);
+  }
 
   if (selectedAdapter) {
     console.log(`\nRunning adapter: ${selectedAdapter.name}`);

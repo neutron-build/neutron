@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
 import { assertServerFeaturesServable, type AdapterBuildContext, type NeutronAdapter } from "./adapter.js";
 import { readStaticHeadersMap, toCloudflareHeadersFile } from "./headers.js";
+import { precompressDirectory } from "../core/precompress.js";
 
 export interface StaticAdapterOptions {
   allowAppRoutes?: boolean;
@@ -166,37 +166,7 @@ function precompressFiles(
   outDir: string,
   context: AdapterBuildContext
 ): { enabled: boolean; files: number; gzipBytesSaved: number; brotliBytesSaved: number } {
-  const targets = collectCompressibleFiles(outDir);
-  let files = 0;
-  let gzipBytesSaved = 0;
-  let brotliBytesSaved = 0;
-
-  for (const filePath of targets) {
-    const source = fs.readFileSync(filePath);
-    if (source.length < 128) {
-      continue;
-    }
-
-    const gzip = gzipSync(source, { level: 9 });
-    const brotli = brotliCompressSync(source, {
-      params: {
-        [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
-      },
-    });
-
-    const gzipPath = `${filePath}.gz`;
-    const brotliPath = `${filePath}.br`;
-    if (gzip.length < source.length) {
-      fs.writeFileSync(gzipPath, gzip);
-      gzipBytesSaved += source.length - gzip.length;
-    }
-    if (brotli.length < source.length) {
-      fs.writeFileSync(brotliPath, brotli);
-      brotliBytesSaved += source.length - brotli.length;
-    }
-
-    files += 1;
-  }
+  const { files, gzipBytesSaved, brotliBytesSaved } = precompressDirectory(outDir, { minBytes: 128 });
 
   context.log(
     `Static precompression complete: ${files} files (${formatBytes(
@@ -210,51 +180,6 @@ function precompressFiles(
     gzipBytesSaved,
     brotliBytesSaved,
   };
-}
-
-function collectCompressibleFiles(dir: string): string[] {
-  const output: string[] = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      output.push(...collectCompressibleFiles(fullPath));
-      continue;
-    }
-
-    if (!entry.isFile()) {
-      continue;
-    }
-
-    if (entry.name.endsWith(".gz") || entry.name.endsWith(".br")) {
-      continue;
-    }
-
-    const ext = path.extname(entry.name).toLowerCase();
-    if (!isCompressibleExtension(ext)) {
-      continue;
-    }
-
-    output.push(fullPath);
-  }
-
-  return output;
-}
-
-function isCompressibleExtension(ext: string): boolean {
-  return (
-    ext === ".html" ||
-    ext === ".js" ||
-    ext === ".mjs" ||
-    ext === ".cjs" ||
-    ext === ".css" ||
-    ext === ".json" ||
-    ext === ".svg" ||
-    ext === ".xml" ||
-    ext === ".txt" ||
-    ext === ".map"
-  );
 }
 
 function formatBytes(bytes: number): string {

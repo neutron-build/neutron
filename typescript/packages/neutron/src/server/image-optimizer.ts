@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { resolveImageWidths } from "../core/image-widths.js";
 
 export interface ImageParams {
   src: string;
@@ -29,11 +30,11 @@ export interface ImageOptimizerOptions {
   publicDirs: string[];
   cacheDir: string;
   remotePatterns?: RemoteImagePattern[];
+  /** `images.widths`: the only widths served. Defaults to the shared ladder. */
+  widths?: readonly number[];
 }
 
 const VALID_FORMATS = new Set(["webp", "avif", "jpeg", "png"]);
-const MIN_WIDTH = 16;
-const MAX_WIDTH = 3840;
 const MIN_QUALITY = 1;
 const MAX_QUALITY = 100;
 const DEFAULT_QUALITY = 75;
@@ -98,8 +99,10 @@ let sharpWarningLogged = false;
 
 export function validateImageParams(
   searchParams: URLSearchParams,
-  remotePatterns: RemoteImagePattern[] = []
+  remotePatterns: RemoteImagePattern[] = [],
+  widths?: readonly number[]
 ): ImageParams | ImageValidationError {
+  const allowedWidths = resolveImageWidths(widths);
   const src = searchParams.get("src");
   if (!src) {
     return { error: "Missing 'src' parameter", status: 400 };
@@ -142,7 +145,7 @@ export function validateImageParams(
         status: 400,
       };
     }
-    const widthRemote = parseWidth(searchParams);
+    const widthRemote = parseWidth(searchParams, allowedWidths);
     if (typeof widthRemote !== "number") {
       return widthRemote;
     }
@@ -193,7 +196,7 @@ export function validateImageParams(
     return { error: "Absolute URLs not allowed", status: 400 };
   }
 
-  const width = parseWidth(searchParams);
+  const width = parseWidth(searchParams, allowedWidths);
   if (typeof width !== "number") {
     return width;
   }
@@ -209,7 +212,10 @@ export function validateImageParams(
   return { src: normalizedSrc, width, quality, format };
 }
 
-function parseWidth(searchParams: URLSearchParams): number | ImageValidationError {
+function parseWidth(
+  searchParams: URLSearchParams,
+  allowedWidths: readonly number[]
+): number | ImageValidationError {
   const wParam = searchParams.get("w");
   if (!wParam) {
     return { error: "Missing 'w' (width) parameter", status: 400 };
@@ -219,10 +225,14 @@ function parseWidth(searchParams: URLSearchParams): number | ImageValidationErro
   if (!/^\d+$/.test(wParam)) {
     return { error: "Width must be a decimal integer", status: 400 };
   }
-  const width = Number(wParam);
-  if (!Number.isSafeInteger(width) || width < MIN_WIDTH || width > MAX_WIDTH) {
+  // An off-ladder width is served at the next ladder width up rather than
+  // rejected: URLs in already-cached HTML and custom `widths` props keep
+  // working, and only ladder widths are ever generated or cached.
+  const requested = Number(wParam);
+  const width = allowedWidths.find((allowed) => allowed >= requested);
+  if (requested < 1 || width === undefined) {
     return {
-      error: `Width must be between ${MIN_WIDTH} and ${MAX_WIDTH}`,
+      error: `Width must be between 1 and ${allowedWidths[allowedWidths.length - 1]} (images.widths)`,
       status: 400,
     };
   }
@@ -298,11 +308,18 @@ export async function resolveSourceFile(
   return null;
 }
 
+/**
+ * Bumped whenever the encode settings change, so a cache written by an older
+ * encoder is not served after an upgrade.
+ */
+const ENCODER_VERSION = 2;
+
 export function buildCacheKey(params: ImageParams): string {
   const hash = crypto
     .createHash("sha256")
     .update(
       JSON.stringify({
+        encoder: ENCODER_VERSION,
         src: params.src,
         width: params.width,
         quality: params.quality,
@@ -506,16 +523,23 @@ export async function optimizeImage(
       return { error: "Unsupported image", status: 415 };
     }
 
+    // rotate(): apply EXIF orientation before resizing. withoutEnlargement:
+    // a source narrower than the requested width is not upscaled.
     let transformed = sharp(sourceBytes ?? sourcePath, {
       limitInputPixels: 40_000_000,
-    }).resize(params.width);
+    })
+      .rotate()
+      .resize(params.width, undefined, { withoutEnlargement: true });
 
     switch (params.format) {
       case "webp":
         transformed = transformed.webp({ quality: params.quality });
         break;
       case "avif":
-        transformed = transformed.avif({ quality: params.quality });
+        // `q` is on the JPEG/WebP scale; AVIF at the same number is far larger
+        // for no visible gain. quality - 20 matches WebP's size at that `q`, and
+        // effort 3 encodes ~6x faster than the default with ~5% larger files.
+        transformed = transformed.avif({ quality: Math.max(1, params.quality - 20), effort: 3 });
         break;
       case "jpeg":
         transformed = transformed.jpeg({ quality: params.quality });
@@ -558,7 +582,11 @@ export async function handleImageRequest(
   opts: ImageOptimizerOptions
 ): Promise<Response> {
   const url = new URL(request.url);
-  const validated = validateImageParams(url.searchParams, opts.remotePatterns ?? []);
+  const validated = validateImageParams(
+    url.searchParams,
+    opts.remotePatterns ?? [],
+    opts.widths
+  );
 
   if ("error" in validated) {
     return new Response(validated.error, { status: validated.status });

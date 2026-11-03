@@ -48,9 +48,10 @@ import {
 import { renderDocumentHead, mergeSeoMetaInput, buildHtmlOpenTag, buildBodyOpenTag, type DocumentHeadTag } from "../core/seo.js";
 import { extractDocumentHead } from "../core/document-head.js";
 import type { SeoMetaInput } from "../core/seo.js";
-import type { NeutronClientConfig, NeutronRoutesConfig } from "../config.js";
+import type { NeutronClientConfig, NeutronImageConfig, NeutronRoutesConfig } from "../config.js";
 import type { Route, RouteModule, AppContext, LoaderArgs, ActionArgs, HeadArgs, MiddlewareFn, ErrorBoundaryProps } from "../core/types.js";
 import { handleImageRequest } from "../server/image-optimizer.js";
+import { configureImageWidths, IMAGE_WIDTHS_GLOBAL, normalizeImageWidths } from "../core/image-widths.js";
 import { appDefinesHealthRoute, DEFAULT_HEALTH_VERSION, healthBody } from "../server/health.js";
 import {
   appDefinesSpecRoute,
@@ -94,6 +95,11 @@ export interface NeutronPluginOptions {
   serverActions?: ServerActionsOptions & { registry?: ServerActionRegistry };
   /** neutron.config.ts `client`: client router options, emitted into `virtual:neutron/routes`. */
   client?: NeutronClientConfig;
+  /**
+   * `server.images` in neutron.config. `widths` drives what `<Image>`/`<Picture>`
+   * emit (SSR and the browser bundle) and what the dev image route accepts.
+   */
+  images?: Pick<NeutronImageConfig, "widths">;
 }
 
 const ROUTES_DIR_DEFAULT = "src/routes";
@@ -366,6 +372,11 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
 
     async configResolved(config) {
       isBuild = config.command === "build";
+      // Only when given: a plugin instance built without config (an adapter's
+      // runtime bundle) must not reset the ladder the CLI configured.
+      if (options.images) {
+        configureImageWidths(options.images.widths);
+      }
       await refreshRoutes();
     },
 
@@ -565,6 +576,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
                 rootDir,
               ],
               cacheDir: path.join(rootDir, ".neutron", "image-cache"),
+              widths: options.images?.widths,
             });
 
             res.statusCode = imageResponse.status;
@@ -926,10 +938,10 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       }
 
       if (id === ISLAND_VIRTUAL_RESOLVED_ID) {
-        return generateIslandsModule(state.islandIds);
+        return generateIslandsModule(state.islandIds, options.images?.widths);
       }
       if (id === "\0virtual:neutron/routes") {
-        return generateRoutesModule(state.routes, options.client);
+        return generateRoutesModule(state.routes, options.client, options.images?.widths);
       }
       if (id === "\0virtual:neutron/manifest") {
         return generateManifestModule(state.routes);
@@ -2004,7 +2016,11 @@ export function staticTierRouteIds(routes: Route[]): Set<string> {
   return stubbed;
 }
 
-export function generateRoutesModule(routes: Route[], client?: NeutronClientConfig): string {
+export function generateRoutesModule(
+  routes: Route[],
+  client?: NeutronClientConfig,
+  imageWidths?: readonly number[]
+): string {
   const cwd = process.cwd().replace(/\\/g, "/");
   // Resource routes are endpoints, not pages: excluded from the client route
   // table entirely so no client chunk is ever emitted for them. Their method
@@ -2045,7 +2061,7 @@ configureRouter(${JSON.stringify({ unloadRouteStylesheets: true })});
 `
       : "";
 
-  return `${routerOptions}export const routes = {
+  return `${routerOptions}${imageWidthsStatement(imageWidths)}export const routes = {
 ${routeMap.join(",\n")}
 };
 
@@ -2077,12 +2093,21 @@ export default neutronPlugin;
  * each import into its own chunk and rewrites the URL in dev AND prod, so the
  * standalone islands entry can lazy-load exactly the island code a page needs.
  */
-function generateIslandsModule(ids: Set<string>): string {
+function generateIslandsModule(ids: Set<string>, imageWidths?: readonly number[]): string {
   const entries = [...ids]
     .sort()
     .map((id) => `  ${JSON.stringify(id)}: () => import(${JSON.stringify(id)})`)
     .join(",\n");
-  return `export const islands = {\n${entries}\n};\n`;
+  return `${imageWidthsStatement(imageWidths)}export const islands = {\n${entries}\n};\n`;
+}
+
+// Both client entries (router, islands-only) evaluate this before rendering,
+// so components rendered in the browser use the configured `images.widths`.
+function imageWidthsStatement(imageWidths: readonly number[] | undefined): string {
+  const widths = normalizeImageWidths(imageWidths);
+  return widths.length > 0
+    ? `globalThis[${JSON.stringify(IMAGE_WIDTHS_GLOBAL)}] = ${JSON.stringify(widths)};\n\n`
+    : "";
 }
 
 function isPathOutsideSrc(cleanId: string, srcDir: string): boolean {

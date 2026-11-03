@@ -2082,12 +2082,14 @@ registerRoutes(routes);
 void init();
 `,
       // z is core's zod: resolvable only from core's real directory, so in
-      // the image it can only come from the shipped dependency set.
+      // the image it can only come from the shipped dependency set. Reaching
+      // getCollection keeps content's lazily imported gray-matter (and its
+      // section-matter) in the runtime graph.
       "src/routes/probe.tsx": `
 import { useState } from "react";
-import { useLocation, z } from "@neutron-build/core";
+import { getCollection, useLocation, z } from "@neutron-build/core";
 export const config = { mode: "app" };
-export async function loader() { return { parsed: z.object({ a: z.string() }).parse({ a: "zod-ok" }).a }; }
+export async function loader() { return { parsed: z.object({ a: z.string() }).parse({ a: "zod-ok" }).a, collections: typeof getCollection }; }
 export default function Probe({ data }) {
   const [n] = useState(7);
   return <p>{"docker-" + n + "-" + useLocation().pathname + "-" + data.parsed}</p>;

@@ -4,7 +4,7 @@ import type { Route, RouteConfig } from "./types.js";
 import { RESOURCE_ROUTE_METHODS } from "./resource-routes.js";
 import type { ResourceRouteMethod } from "./resource-routes.js";
 export { findNotFoundMatch, findNotFoundRoute, type NotFoundMatch } from "./route-path.js";
-import { parse as babelParse } from "@babel/parser";
+import { createRequire } from "node:module";
 
 export interface DiscoverOptions {
   routesDir: string;
@@ -426,8 +426,13 @@ function collectExportedNames(
  * present, so a missed detection costs a fast path rather than an access
  * control.
  */
+let babelParse: typeof import("@babel/parser").parse | undefined;
+
 export function parseRouteFacts(fileContent: string): RouteFacts {
   try {
+    // Required on first use: core's entry re-exports this module, and a
+    // server booting from a build's route table never parses a route.
+    babelParse ??= (createRequire(import.meta.url)("@babel/parser") as typeof import("@babel/parser")).parse;
     const ast = babelParse(fileContent, {
       sourceType: "module",
       plugins: ["typescript", "jsx"],

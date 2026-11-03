@@ -159,6 +159,13 @@ export interface RenderAppRouteOptions {
    * route's). Default `true`.
    */
   middleware?: boolean;
+  /**
+   * The route is the app's not-found page answering a path nothing else
+   * matched. It renders for every method: a POST to an unknown URL is a 404,
+   * not a 405 from the not-found page lacking an action, and the page's own
+   * action never runs for it.
+   */
+  notFoundPage?: boolean;
 }
 
 /**
@@ -980,15 +987,16 @@ export async function renderAppRoute(
   const renderRouteBody = async (): Promise<Response> => {
     let actionData: unknown = undefined;
     const pageModule = routeModules.get(match.route.id);
+    const notFoundPage = opts.notFoundPage === true;
     const requestedRouteIds = resolveRequestedDataRouteIds(
       request,
       allRoutes,
-      isMutationMethod(request.method)
+      !notFoundPage && isMutationMethod(request.method)
     );
 
     const method = request.method.toUpperCase();
-    const isReadMethod = method === "GET" || method === "HEAD";
-    const isMutationMethodRequest = isMutationMethod(method);
+    const isReadMethod = notFoundPage || method === "GET" || method === "HEAD";
+    const isMutationMethodRequest = !notFoundPage && isMutationMethod(method);
 
     // Method dispatch (TS-27): only methods the route actually supports may
     // run. A loader-only resource route answered every non-mutation method
@@ -1028,7 +1036,7 @@ export async function renderAppRoute(
       return new Response("Not Found", { status: 404 });
     }
 
-    if (isMutationMethod(request.method) && pageModule.action) {
+    if (isMutationMethodRequest && pageModule.action) {
       const actionArgs: ActionArgs = {
         request,
         params: match.params,

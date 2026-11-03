@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { IncomingMessage } from "node:http";
-import { parse } from "@babel/parser";
+import { createRequire } from "node:module";
 import type { WebSocketServer } from "ws";
 import type { NeutronMount, NeutronMountApp } from "../server/index.js";
 
@@ -121,6 +121,9 @@ export function serverEntryDeclaresWebSocket(source: string): boolean {
   if (!/\bwebsocket\b/.test(source)) return false;
   let ast: unknown;
   try {
+    // Required here, not imported: this runs at build time only, and the
+    // production server imports this module for its other exports.
+    const { parse } = createRequire(import.meta.url)("@babel/parser") as typeof import("@babel/parser");
     ast = parse(source, { sourceType: "module", plugins: ["typescript", "jsx"] });
   } catch {
     return true; // unparseable: let the bundler report it, but do not wave it through

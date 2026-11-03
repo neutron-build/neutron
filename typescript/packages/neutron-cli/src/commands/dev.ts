@@ -102,6 +102,7 @@ export async function dev(): Promise<void> {
           securityHeaders: neutronConfig.server?.securityHeaders,
           serverActions: neutronConfig.server?.serverActions,
           client: neutronConfig.client,
+          images: neutronConfig.server?.images,
         }),
         neutronPublicEnvPlugin(neutronConfig.env),
       ],

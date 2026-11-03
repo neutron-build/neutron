@@ -9,6 +9,7 @@ import {
   optimizeImage,
   handleImageRequest,
 } from "./image-optimizer.js";
+import { DEFAULT_IMAGE_WIDTHS } from "../core/image-widths.js";
 
 describe("validateImageParams", () => {
   it("parses valid params", () => {
@@ -23,11 +24,11 @@ describe("validateImageParams", () => {
   });
 
   it("applies defaults for quality and format", () => {
-    const params = new URLSearchParams("src=/img.png&w=320");
+    const params = new URLSearchParams("src=/img.png&w=384");
     const result = validateImageParams(params);
     expect(result).toEqual({
       src: "/img.png",
-      width: 320,
+      width: 384,
       quality: 75,
       format: "webp",
     });
@@ -114,16 +115,50 @@ describe("validateImageParams", () => {
     });
   });
 
-  it("rejects width below minimum", () => {
-    const params = new URLSearchParams("src=/img.png&w=8");
-    const result = validateImageParams(params);
-    expect("error" in result).toBe(true);
+  it("rejects a zero width", () => {
+    const result = validateImageParams(new URLSearchParams("src=/img.png&w=0"));
+    expect(result).toMatchObject({ status: 400 });
+  });
+
+  it("serves a width below the ladder at the smallest ladder width", () => {
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=8"))).toMatchObject({ width: 16 });
   });
 
   it("rejects width above maximum", () => {
     const params = new URLSearchParams("src=/img.png&w=5000");
     const result = validateImageParams(params);
     expect("error" in result).toBe(true);
+  });
+
+  it("serves an off-ladder width at the next ladder width up", () => {
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=500"))).toMatchObject({ width: 640 });
+  });
+
+  it("only ever resolves to ladder widths", () => {
+    for (let i = 0; i < DEFAULT_IMAGE_WIDTHS.length; i++) {
+      const width = DEFAULT_IMAGE_WIDTHS[i];
+      expect(validateImageParams(new URLSearchParams(`src=/img.png&w=${width}`))).toMatchObject({ width });
+      const next = DEFAULT_IMAGE_WIDTHS[i + 1];
+      const above = validateImageParams(new URLSearchParams(`src=/img.png&w=${width + 1}`));
+      if (next === undefined) expect("error" in above).toBe(true);
+      else expect(above).toMatchObject({ width: next });
+    }
+  });
+
+  it("serves exactly the configured widths when images.widths is set", () => {
+    const configured = [320, 640, 960, 1200, 1600];
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=960"), [], configured)).toMatchObject({
+      width: 960,
+    });
+    expect(validateImageParams(new URLSearchParams("src=/img.png&w=384"), [], configured)).toMatchObject({ width: 640 });
+    expect("error" in validateImageParams(new URLSearchParams("src=/img.png&w=1601"), [], configured)).toBe(true);
+  });
+
+  it("applies the ladder to remote images too", () => {
+    const params = new URLSearchParams(
+      "src=" + encodeURIComponent("https://cdn.example.com/photo.jpg") + "&w=500"
+    );
+    expect(validateImageParams(params, [{ hostname: "cdn.example.com" }])).toMatchObject({ width: 640 });
   });
 
   it("rejects invalid format", () => {
@@ -328,6 +363,50 @@ describe("optimizeImage", () => {
       // And the published cache entry exists (atomic publication path).
       expect(fs.existsSync(cacheDir)).toBe(true);
     }
+  });
+
+  describe("encode settings", async () => {
+    const sharp = await import("sharp").then((m) => m.default).catch(() => null);
+    const run = sharp ? it : it.skip;
+    const options = () => ({ publicDirs: [path.join(tmpDir, "public")], cacheDir });
+
+    // A noisy photo-like source: flat colours compress to nothing in every
+    // format and would not show a size difference.
+    async function writePhoto(name: string, width: number, height: number, orientation?: number) {
+      const raw = Buffer.alloc(width * height * 3);
+      for (let i = 0; i < raw.length; i++) raw[i] = (i * 7919 + ((i / 3) | 0) * 31) % 251;
+      let image = sharp!(raw, { raw: { width, height, channels: 3 } }).jpeg({ quality: 90 });
+      if (orientation) image = image.withMetadata({ orientation });
+      fs.writeFileSync(path.join(tmpDir, "public", name), await image.toBuffer());
+    }
+
+    run("does not upscale a source narrower than the requested width", async () => {
+      await writePhoto("small.jpg", 200, 100);
+      const result = await optimizeImage({ src: "/small.jpg", width: 640, quality: 75, format: "webp" }, options());
+      if ("error" in result) throw new Error(result.error);
+      expect((await sharp!(result.buffer).metadata()).width).toBe(200);
+    });
+
+    run("applies EXIF orientation before resizing", async () => {
+      // Stored landscape 400x200, orientation 6 (rotate 90): displays portrait.
+      await writePhoto("rotated.jpg", 400, 200, 6);
+      const result = await optimizeImage({ src: "/rotated.jpg", width: 128, quality: 75, format: "webp" }, options());
+      if ("error" in result) throw new Error(result.error);
+      const meta = await sharp!(result.buffer).metadata();
+      expect(meta.width).toBe(128);
+      expect(meta.height).toBe(256);
+    });
+
+    run("encodes AVIF on the WebP quality scale, not at the raw q", async () => {
+      await writePhoto("photo.jpg", 800, 600);
+      const avif = await optimizeImage({ src: "/photo.jpg", width: 384, quality: 75, format: "avif" }, options());
+      if ("error" in avif) throw new Error(avif.error);
+      expect(avif.contentType).toBe("image/avif");
+      // The old setting (AVIF at the raw q=75) produced files ~2.5x larger
+      // than WebP for real photos.
+      const rawQ = await sharp!(path.join(tmpDir, "public", "photo.jpg")).resize(384).avif({ quality: 75 }).toBuffer();
+      expect(avif.buffer.length).toBeLessThan(rawQ.length * 0.75);
+    });
   });
 });
 

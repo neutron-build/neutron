@@ -45,6 +45,7 @@ export default function Layout({ children }) { return h("main", null, h("nav", n
 import { h } from "preact";
 export const config = { mode: "app" };
 export function head() { return { title: "Missing page" }; }
+export async function action() { return new Response("not-found action ran", { status: 200 }); }
 export default function NotFound() { return h("p", null, "custom-missing"); }
 `,
   "src/routes/index.tsx": `
@@ -212,6 +213,25 @@ describe("app not-found page for an unmatched path — start", () => {
   it("names the not-found route too", { timeout: 60_000 }, async () => {
     const base = await bootStart();
     await expectNotFoundPage(base, "/nowhere/at/all");
+  });
+
+  it("answers 404 for every method, never 405 or the page's action", { timeout: 60_000 }, async () => {
+    const base = await bootStart();
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+      const response = await fetch(`${base}/nowhere/at/all`, { method, headers: html });
+      const body = await response.text();
+      expect(response.status, method).toBe(404);
+      expect(response.headers.get("allow"), method).toBeNull();
+      expect(body, method).not.toContain("not-found action ran");
+      expect(body, method).toContain("custom-missing");
+    }
+  });
+
+  it("keeps 405 + Allow for a matched route that lacks the method", { timeout: 60_000 }, async () => {
+    const base = await bootStart();
+    const response = await fetch(`${base}/items/present`, { method: "POST", headers: html });
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("GET, HEAD");
   });
 });
 

@@ -138,6 +138,13 @@ export {
   type StaticAdapterOptions,
 } from "./adapters/static.js";
 export {
+  precompressBuildOutput,
+  precompressDirectory,
+  PRECOMPRESS_MIN_BYTES,
+  type PrecompressOptions,
+  type PrecompressSummary,
+} from "./core/precompress.js";
+export {
   adapterCloudflare,
   type CloudflareAdapterOptions,
 } from "./adapters/cloudflare.js";
