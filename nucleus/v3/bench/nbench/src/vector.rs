@@ -1307,22 +1307,49 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Spawn a one-connection-per-thread TCP server that plays a scripted
-    /// sequence of behaviors, one per accepted connection: `Drop` closes
-    /// without responding (the observed 2026-10-18 failure shape), and
-    /// `Status(u16)` answers with that status and a two-byte body.
-    /// Returns the port and a connection counter.
+    /// Spawn a TCP server that plays a scripted sequence of behaviors,
+    /// one per accepted connection: `Drop` closes without responding
+    /// (the observed 2026-10-18 failure shape), and `Status(u16)`
+    /// answers with that status and a two-byte body. Returns the port
+    /// and a connection counter.
+    ///
+    /// Card NB-FLAKE-1 (flake discipline per B-0-F7-F2: lower bounds
+    /// only, no client-side sleeps): the script is a *prefix* — the
+    /// last entry repeats forever — and the accept loop never exits
+    /// while the test runs; a transient `accept()` error is skipped,
+    /// not fatal. The finite-script version this replaces died mid-test
+    /// under host load: a starved server thread accepted the client's
+    /// abandoned (ghost) connection after its read timeout, the ghost
+    /// consumed the only scripted `Status:200` on a dead socket, the
+    /// thread exited, and every later retry met a closed listener
+    /// (gate pass 127, EXIT=101). With repeat-last semantics a ghost
+    /// can only eat a *repeat* of the final entry, so a retry can never
+    /// arrive at a dead port. The thread and its listener leak for the
+    /// process lifetime — this module's existing norm (an accept-blocked
+    /// server is exactly what `load_retry_gives_up_after_the_budget`
+    /// leaves behind). The counter counts accepted connections, live or
+    /// ghost, and increments before any response write. Scripts must be
+    /// non-empty (the last entry is the repeat behavior).
     fn flaky_server(script: Vec<&'static str>) -> (u16, Arc<AtomicUsize>) {
+        // TEMP NB-FLAKE-1 diagnosis: process-global accept log
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let count = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&count);
         std::thread::spawn(move || {
-            for behavior in script {
+            loop {
                 let Ok((mut conn, _)) = listener.accept() else {
-                    break;
+                    // A transient accept failure must not kill the
+                    // listener either (NB-FLAKE-1): keep accepting.
+                    continue;
                 };
-                counter.fetch_add(1, Ordering::SeqCst);
+                // `i` is the connection number (0-based): the script is
+                // indexed by connections actually accepted, so a
+                // skipped accept never consumes a scripted behavior,
+                // and every accept — live or ghost — consumes entries
+                // in order. The last entry repeats forever.
+                let i = counter.fetch_add(1, Ordering::SeqCst);
+                let behavior = script[i.min(script.len() - 1)];
                 // Drain the request until 100ms of quiet so the socket
                 // never closes with unread data queued (that turns the
                 // close into an RST and races the client's read).
@@ -1351,6 +1378,19 @@ mod tests {
     fn load_retry_survives_dropped_connections() {
         // Two dropped responses, then a good one: the load path must
         // recover (this is the 2026-10-18 upload failure, replayed).
+        //
+        // NB-FLAKE-1 determinism: the 30 s per-attempt timeout (a
+        // bound, not a wall-clock assertion) turns a >5 s starvation
+        // of the server thread into a retry instead of a flake — and
+        // with the never-dying server only ~5 consecutive >30 s
+        // starves could still fail this. The accept count is asserted
+        // as a lower bound only: under load a ghost connection can eat
+        // a repeat of the final `Status:200` and inflate the count,
+        // never shrink it — the counter increments before the response
+        // write, so the client's `Ok` already proves >= 3 accepts. The
+        // two drops stay structurally pinned: entries 0 and 1 are
+        // `Drop`s and every accept consumes entries in order, so any
+        // 200 is served only after both drops.
         let (port, count) = flaky_server(vec!["Drop", "Drop", "Status:200"]);
         let resp = request_with_retry_attempts(
             "127.0.0.1",
@@ -1358,12 +1398,12 @@ mod tests {
             "PUT",
             "/points?wait=true",
             b"{}",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             5,
         )
         .expect("retry succeeds");
         assert_eq!(resp.status, 200);
-        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(count.load(Ordering::SeqCst) >= 3);
     }
 
     #[test]
