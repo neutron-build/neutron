@@ -510,6 +510,39 @@ sys.exit(0 if checks[case] else 1)
 P
 }
 for c in gate-last no-gate fake-gate gate-middle no-touch pass-real pass-lies pass-rc touch-note touch-dir touch-glob; do expect_ok "runner: $c" py "$c"; done
+# ft CASE: failure_text on synthetic output (RUN-F1). A failing gate step's
+# STEP line must reach the retry text even when later steps push it out of the
+# 60-line tail; with none, the text is the old `$ cmd` plus tail.
+ft() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$@" <<'P'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+case = sys.argv[2]
+def filler(n, at):
+    lines = [f"filler {i}" for i in range(1, n + 1)]
+    for i, l in at.items():
+        lines[i - 1] = l
+    return lines
+H = "Failing steps (from the full output):"
+if case == "STEP-EARLY":
+    lines = filler(200, {3: "STEP test EXIT=0", 5: "STEP fmt EXIT=1", 7: "STEP clippy EXIT=101", 200: "GATE EXIT=1"})
+    t = rc.failure_text("c", "\n".join(lines) + "\n")
+    ok = (t.startswith(f"$ c\n{H}\nSTEP fmt EXIT=1\nSTEP clippy EXIT=101\n") and "STEP test EXIT=0" not in t
+          and t.endswith("\n".join(lines[-60:])))
+elif case == "STEP-NONE":
+    lines = filler(100, {})
+    t = rc.failure_text("c", "\n".join(lines) + "\n")
+    ok = t == "$ c\n" + "\n".join(lines[-60:])
+elif case == "STEP-INDENTED":
+    lines = filler(100, {2: "     STEP fmt EXIT=1"})
+    t = rc.failure_text("c", "\n".join(lines) + "\n")
+    ok = H not in t
+print(t)
+sys.exit(0 if ok else 1)
+P
+}
+expect_ok "runner: STEP-EARLY a failing STEP line outside the tail is listed, in order, EXIT=0 not" ft STEP-EARLY
+expect_ok "runner: STEP-NONE with no failing STEP line the retry text is the old cmd plus tail" ft STEP-NONE
+expect_ok "runner: STEP-INDENTED an indented (nested) STEP line is not listed" ft STEP-INDENTED
 # bp WANT CMD: bash_permission on the copied runner's real bash map gives WANT.
 # The deny list is a guard-rail (the scope check is the enforcement), but a
 # worker should not spend attempts on a rewrite that fails its card anyway.
@@ -1620,6 +1653,8 @@ for a in ${inv[$i]}; do
       git config --list --show-scope | grep '^command' >"$FAKE_OC_N.cfg" || true ;;
     # An untracked file that a self-ignoring untracked .gitignore hides (Q).
     hideuntracked) echo hidden >"nucleus/v3/spikes/$id-hidden.txt"; printf '*\n' >nucleus/v3/spikes/.gitignore ;;
+    # The prompt or retry message this invocation got (its last argument; RUN-F1).
+    msg) printf '%s\n' "${@: -1}" >"$FAKE_OC_N.msg$n" ;;
   esac
 done
 echo '{"type":"step_finish","sessionID":"ses_fake","part":{"tokens":{"input":100,"output":10,"reasoning":1}}}'
@@ -1853,6 +1888,44 @@ expect_ok "runner e2e: V: opencode runs with the commit-graph and the untracked 
 e2e XQ "work hideuntracked" --attempts 1
 expect_ok "runner e2e: Q: an untracked file a self-ignoring .gitignore hides fails the dirty check, by name" \
   res XQ "rc == 1 and not r['pass'] and 'Uncommitted changes (commit the card' in out and '!! nucleus/v3/spikes/XQ-hidden.txt' in out and '!! nucleus/v3/spikes/.gitignore' in out"
+
+# M (RUN-F1): the first Acceptance command fails with its STEP line 101 lines
+# from the end, as gate.sh's fmt line was in X-5c-F1. Attempt 2's message must
+# still name it. (XMSG: no other e2e id is a substring of it, nor it of one.)
+ecm() { cat >"$e/cards/$1.local.md" <<C
+# CARD $1: e2e
+
+Class: test        Author: S (t)        Status: ready
+Base: e2e/base        Depends: —        Gate: S
+
+## Goal
+t
+
+## Touch only
+- nucleus/v3/spikes/
+
+## Acceptance
+- \`printf 'STEP fmt EXIT=1\\n'; seq 100; exit 1\`
+- \`cd nucleus/v3 && bash scripts/gate.sh\`
+C
+echo "$e/cards/$1.local.md"; }
+msg_premise() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$(ecm XMSG)" <<'P'
+import importlib.util, pathlib, subprocess, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+cid, touch, accept = rc.parse_card(pathlib.Path(sys.argv[2]))
+p = subprocess.run(["bash", "-c", accept[0]], capture_output=True, text=True)
+lines = (p.stdout + p.stderr).splitlines()
+print(cid, accept, p.returncode, lines[:2], len(lines))
+sys.exit(0 if cid == "XMSG" and rc.validate_card(touch, accept) is None and accept[0] == "printf 'STEP fmt EXIT=1\\n'; seq 100; exit 1"
+         and p.returncode == 1 and "STEP fmt EXIT=1" in lines and "STEP fmt EXIT=1" not in lines[-60:] else 1)
+P
+}
+expect_ok "runner e2e: M: premise: the card parses, and its first command's STEP line is outside the 60-line tail" msg_premise
+rm -f "$e/XMSG.n"
+(cd "$r" && FAKE_OC="msg work" FAKE_OC_N=$e/XMSG.n E2E=$e PYTHONDONTWRITEBYTECODE=1 python3 "$t/e2e.py" "$v3/tools/run_card.py" "$e/XMSG" "$(ecm XMSG)" --base e2e/base --attempts 2) || true
+expect_ok "runner e2e: M: a run whose first Acceptance command always fails does not pass" res XMSG "rc == 1 and not r['pass'] and r['attempts'] == 2"
+expect_ok "runner e2e: M: attempt 2's message lists the failing STEP line from outside the tail" \
+  res XMSG "'Failing steps (from the full output):\nSTEP fmt EXIT=1\n' in open('$e/XMSG.n.msg2').read()"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "test-enforcement: all passed"; else echo "test-enforcement: $fails FAILED"; fi
