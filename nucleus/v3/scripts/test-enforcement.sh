@@ -1533,6 +1533,478 @@ expect_ok "git state: none after the output-shaping scenarios" no_state
 expect_ok "git state: none of the cache state after the output-shaping scenarios" no_state2
 expect_ok "git state: none of the output-shaping state after these scenarios" no_state3
 
+# --- forged objects: loose swaps and .idx offsets (X-6-F1-F2-F3-F1) ---------
+# A same-uid worker can overwrite a loose object file (or a pack .idx offset)
+# so one id returns another object's bytes: the plain diff then hides the
+# change, and rev-list --objects --verify-objects exits 0 (it re-hashes only
+# objects the walk did not parse). Every scenario below proves the hide with a
+# premise row, refuses through each consumer, restores the original bytes and
+# checks no_state4. Forging stays inside this throwaway repository (and its
+# copies); Python in the forging helpers (zlib for loose objects, struct for
+# the .idx) is allowed by the card's Limits. Every id is captured before its
+# object is forged (git's read path hash-checks a forged object, so it cannot
+# be rev-parsed), and the forged bytes are written only after chmod u+w.
+# Two git behaviours shape the rows (probed on 2.47.3): `git status` and
+# `git checkout` hash-check HEAD's tree and refuse (fail closed, exit 128) when
+# it is forged, while diff, rev-list and pack-objects read the lie. So a row
+# that needs HEAD at a forged tip keeps HEAD there from before the forgery,
+# scenarios that need HEAD on two branches forge two windows (no checkout
+# moves under a forged tree), and the runner's own refusal for a forged HEAD
+# tree is worktree_changes' status line — the verify_objects line reaches the
+# runner whenever HEAD's tree is honest ((b), (c)) and the twins directly.
+# objlo REPO OID: the loose object file's path (premise rows assert it exists).
+objlo() { printf '%s\n' "$1/.git/objects/${2:0:2}/${2:2}"; }
+forged_oid=() forged_repo=() forged_save=()
+# save_obj REPO OID: remember OID's current bytes for restoration and no_state4.
+save_obj() { local i=${#forged_oid[@]}; forged_oid+=("$2"); forged_repo+=("$1"); forged_save+=("$t/forge.$i"); cp -p "$(objlo "$1" "$2")" "$t/forge.$i"; }
+# forge_from REPO OID SRCOID: OID's loose file becomes SRCOID's bytes (the id
+# then lies about its content; SRCOID itself stays honest).
+forge_from() { chmod u+w "$(objlo "$1" "$2")"; cp "$(objlo "$1" "$3")" "$(objlo "$1" "$2")"; }
+# forge_commit REPO OID BODY: OID's loose file becomes a commit whose raw body
+# (tree/parent/author/... lines) is BODY's, zlib-compressed as git stores it.
+forge_commit() {
+  local lo; lo=$(objlo "$1" "$2"); chmod u+w "$lo"
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$lo" "$3" <<'P'
+import sys, zlib
+lo, body = sys.argv[1], open(sys.argv[2], "rb").read()
+open(lo, "wb").write(zlib.compress(b"commit %d\0" % len(body) + body, 1))
+P
+}
+# restore_forged: put every saved object file back (they are read-only again
+# after a cp -p restore, so each window reopens its own); no_state4: they are
+# all back byte for byte, and no pack moved into $r ((d) repacks only its copy).
+restore_forged() { local i; for i in "${!forged_oid[@]}"; do chmod u+w "$(objlo "${forged_repo[$i]}" "${forged_oid[$i]}")"; cp -p "${forged_save[$i]}" "$(objlo "${forged_repo[$i]}" "${forged_oid[$i]}")"; done; }
+no_state4() { local i; for i in "${!forged_oid[@]}"; do cmp -s "${forged_save[$i]}" "$(objlo "${forged_repo[$i]}" "${forged_oid[$i]}")" || return 1; done; [ -z "$(ls "$r/.git/objects/pack" 2>/dev/null)" ]; }
+# The two twins (git-env.sh's verify_objects and run_card.py's) as commands a
+# row can run: each prints the problem lines and exits 0 when there are none.
+vsh() { local repo=$1; (cd "$repo/nucleus/v3" && . scripts/git-env.sh && { verify_objects "$2" "$3" || { printf '%s\n' "$VERIFY_PROBLEMS"; return 1; }; }); }
+vpy() { PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "$2" "$3" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1] + "/nucleus/v3/tools/run_card.py")
+rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+lines = rc.verify_objects(pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3])
+for l in lines: print(l)
+sys.exit(1 if lines else 0)
+P
+}
+# vparity_bad REPO BASE TIP: both twins print the same non-empty problem lines
+# ((h), for each forged range); vparity_ok: both print nothing.
+vparity_bad() { local sh py; sh=$(vsh "$1" "$2" "$3" | LC_ALL=C sort); py=$(vpy "$1" "$2" "$3" | LC_ALL=C sort); echo "sh: $sh"; echo "py: $py"; [ -n "$sh" ] && [ "$sh" = "$py" ]; }
+vparity_ok() { local sh py; sh=$(vsh "$1" "$2" "$3" | LC_ALL=C sort); py=$(vpy "$1" "$2" "$3" | LC_ALL=C sort); echo "sh: $sh"; echo "py: $py"; [ -z "$sh" ] && [ "$sh" = "$py" ]; }
+# cmv ID BASE HEAD GATE CLASS: check_merge in merge mode (audit mode is cm).
+cmv() { (cd "$v3" && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge "$1" "$2" "$3" merge "$4" "$5"); }
+# audit_novr REF: audit-merges.sh with the verify_reachable call dropped (the
+# NO-VERIFY-REACHABLE mutant's script), run from inside the repository: the
+# copies live under $v3/scripts/.novr because audit-merges.sh cd's to its own
+# directory's parent. novr_ok: that audit prints "audit: ok" (the premise that
+# the per-merge checks really do skip; of the throwaway refs only (f)'s lie is
+# invisible to the walk — (a)-(c)'s forged trees are read by the walk's own
+# per-merge checks, which is why their audit rows catch but cannot show it).
+audit_novr() {
+  local d=$v3/scripts/.novr rc=0
+  mkdir -p "$d"; cp "$v3"/scripts/*.sh "$d"/
+  sed -i '/^verify_reachable "\$ref" ||/d' "$d/audit-merges.sh"
+  (cd "$v3" && bash scripts/.novr/audit-merges.sh "$1") || rc=$?
+  rm -rf "$d"
+  return "$rc"
+}
+novr_ok() { local o rc=0; o=$(audit_novr "$1") || rc=$?; echo "$o"; [ "$rc" -eq 0 ] && grep -qF "audit: ok" <<<"$o"; }
+# rco BASE TIP: the RANGE-CARD-ONLY mutant's object set (commits of BASE..TIP,
+# trees under TIP only) through the real verification pipeline; exit 0 when it
+# reports nothing (the (b) premise: the range-only set cannot see the base side).
+rco() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$1" "$2" <<'P'
+import importlib.util, pathlib, shutil, subprocess, sys, tempfile
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, base, tip = pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+env = rc.git_env()
+def git(*a):
+    p = subprocess.run(["git", *a], cwd=wt, env=env, capture_output=True, text=True)
+    if p.returncode: raise SystemExit(f"git {a[0]} failed (exit {p.returncode})")
+    return p.stdout.split()
+want = git("rev-list", f"{base}..{tip}", "--") + git("rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", tip, "--")
+d = pathlib.Path(tempfile.mkdtemp())
+try:
+    probs = rc._verify_ids(wt, "verify_objects", want, d)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+print(probs)
+sys.exit(1 if probs else 0)
+P
+}
+# gempty WORD CMD...: like gshim, but the refused call answers nothing and
+# exits 0 (a rev-list that lies empty), so the empty-list refusal is reached;
+# gshim's hard failure never gets that far (verify_objects reports the step).
+gemptydir=$t/gempty
+mkdir -p "$gemptydir"
+{ echo '#!/usr/bin/env bash'
+  echo 'for a in "$@"; do [ -n "${GEMPTY_FAIL:-}" ] && [ "$a" = "$GEMPTY_FAIL" ] && { '"$gshim_real"' "$@" >/dev/null 2>&1; exit 0; }; done'
+  printf 'exec %q "$@"\n' "$gshim_real"; } >"$gemptydir/git"
+chmod +x "$gemptydir/git"
+gempty() { local w=$1; shift; PATH="$gemptydir:$PATH" GEMPTY_FAIL=$w "$@"; }
+# idx_swap IDX A B: in the v2 .idx, A's offset-table slot is pointed at B's
+# bytes (A's id then returns B's object). A literal two-entry swap was probed
+# and is caught the same way, but it makes both ids lie and the diff shows the
+# reverse change; the one-sided form is the loose swap (a) in pack clothing.
+idx_swap() { python3 - "$@" <<'P'
+import struct, sys
+path, a, b = sys.argv[1], bytes.fromhex(sys.argv[2]), bytes.fromhex(sys.argv[3])
+d = bytearray(open(path, "rb").read())
+n = struct.unpack(">I", d[8 + 255 * 4:8 + 256 * 4])[0]
+fan = 8 + 256 * 4
+def pos(oid):
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        e = bytes(d[fan + 20 * mid:fan + 20 * mid + 20])
+        if e < oid: lo = mid + 1
+        elif e > oid: hi = mid
+        else: return mid
+    raise SystemExit(f"oid {oid.hex()} is not in the idx")
+off = fan + 20 * n + 4 * n
+ia, ib = pos(a), pos(b)
+ob = struct.unpack(">I", d[off + 4 * ib:off + 4 * ib + 4])[0]
+print(f"idx_swap: {a.hex()} (slot {ia}) -> offset {ob} (slot {ib}'s)")
+struct.pack_into(">I", d, off + 4 * ia, ob)
+open(path, "wb").write(bytes(d))
+P
+}
+
+# (a) Card side: card/v3-OV's tip root tree file holds the scaffold tip's bytes.
+card OV S standard; branch OV nucleus/v3/tools/ov.py; verdict OV S MERGE standard S
+ovt=$(git -C "$r" rev-parse "card/v3-OV^{tree}")
+sct=$(git -C "$r" rev-parse "nucleus/v3-scaffold^{tree}")
+expect_ok "premise: (a) OV's root tree and the scaffold's are loose objects" bash -c "[ -f '$(objlo "$r" "$ovt")' ] && [ -f '$(objlo "$r" "$sct")' ]"
+# The throwaway audit ref, merged honestly before anything is forged.
+git -C "$r" checkout -q -B scratch/oa nucleus/v3-scaffold
+git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-OV (MERGE, gate S/test-model)" card/v3-OV
+git -C "$r" checkout -q card/v3-OV
+save_obj "$r" "$ovt"
+forge_from "$r" "$ovt" "$sct"
+a_hidden() { local d; d=$(plain diff --name-only nucleus/v3-scaffold...card/v3-OV); echo "diff: $d"; [ -z "$d" ]; }
+expect_ok "premise: (a) plain diff scaffold...card/v3-OV is empty" a_hidden
+expect_ok "premise: (a) rev-list --objects --verify-objects over the range exits 0" plain rev-list --objects --verify-objects nucleus/v3-scaffold...card/v3-OV
+# The runner refuses through worktree_changes' status: git hash-checks HEAD's
+# forged tree and exits 128, so the status listing's refusal comes first and
+# names the mismatched id; the verify_objects line itself is pinned by the
+# twins and, through the runner, by (b) and (c).
+a_runner() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" "$ovt" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+bad = rc.scope_violations(pathlib.Path(sys.argv[2]), "nucleus/v3-scaffold", ["nucleus/v3/spikes/"])
+print("\n".join(bad) or "(no violations)")
+sys.exit(0 if any(f"hash mismatch {sys.argv[3]}" in b and b.endswith("(cannot list changed files)") for b in bad) else 1)
+P
+}
+expect_ok "(a) the runner refuses, naming the mismatched tree" a_runner
+expect_ok "(a) merge-mode check_merge refuses (the lie hides the verdict path)" out_has "no nucleus/v3/verdicts/OV.md at the branch tip" -- cmv OV nucleus/v3-scaffold card/v3-OV S standard
+expect_ok "(a) check-core-paths exits 1 naming the tree" out_has "check-core-paths: object $ovt fails its hash" -- bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-OV"
+expect_ok "(a) audit names the tree (verify_reachable)" out_has "audit: object $ovt fails its hash" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/oa"
+expect_ok "(a) both twins name the tree, identically" vparity_bad "$r" nucleus/v3-scaffold card/v3-OV
+restore_forged
+# merge-card needs HEAD on scratch/*, and no checkout moves under a forged
+# tree: a second forging window with HEAD already in place.
+git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+forge_from "$r" "$ovt" "$sct"
+expect_ok "(a) merge-card refuses, naming the tree" out_has "object $ovt fails its hash" -- mc OV
+restore_forged
+expect_ok "forged objects: (a) restored" no_state4
+
+# (a') The tip check's own range: a verdict tip that also adds tools/ov2.py,
+# with the work commit's root tree swapped for the tip tree minus the verdict,
+# so the tip's diff-tree lists only the verdict, every other rule passes (a P
+# card) and only verify_objects head^1 head refuses (the NO-VERIFY-TIP row).
+card OV2 P core
+git -C "$r" checkout -q -b card/v3-OV2 nucleus/v3-scaffold
+echo ov2 >"$v3/spikes/ov2.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OV2 work"
+w2=$(git -C "$r" rev-parse HEAD); w2t=$(git -C "$r" rev-parse "HEAD^{tree}")
+echo ov2 >"$v3/tools/ov2.py"
+printf 'Card: OV2\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: P\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OV2.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OV2 verdict MERGE"
+ov2py=$(git -C "$r" rev-parse "card/v3-OV2:nucleus/v3/tools/ov2.py")
+# The tip tree minus the verdict file, built through a scratch index.
+GIT_INDEX_FILE=$t/ov2.idx git -C "$r" read-tree "$w2t"
+GIT_INDEX_FILE=$t/ov2.idx git -C "$r" update-index --add --cacheinfo "100644,$ov2py,nucleus/v3/tools/ov2.py"
+v2y=$(GIT_INDEX_FILE=$t/ov2.idx git -C "$r" write-tree)
+rm -f "$t/ov2.idx"
+git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+save_obj "$r" "$w2t"
+forge_from "$r" "$w2t" "$v2y"
+a2_tip() { local d; d=$(git -C "$r" diff-tree --no-commit-id --name-only -r card/v3-OV2); echo "tip: $d"; [ "$d" = nucleus/v3/verdicts/OV2.md ]; }
+expect_ok "premise: (a') under the swap the tip's diff-tree lists only the verdict" a2_tip
+expect_ok "(a') merge-card refuses through the tip check, naming the work tree" out_has "object $w2t fails its hash" -- mc OV2
+restore_forged
+expect_ok "forged objects: (a') restored" no_state4
+
+# (b) Base side: the scaffold tip's root tree file holds OV's root tree bytes.
+git -C "$r" checkout -q -B scratch/ob nucleus/v3-scaffold
+git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-OV (MERGE, gate S/test-model)" card/v3-OV
+git -C "$r" checkout -q card/v3-OV
+save_obj "$r" "$sct"
+forge_from "$r" "$sct" "$ovt"
+b_hidden() { local d; d=$(plain diff --name-only nucleus/v3-scaffold...card/v3-OV); echo "diff: $d"; [ -z "$d" ]; }
+expect_ok "premise: (b) plain diff is empty" b_hidden
+expect_ok "premise: (b) a BASE..TIP-only verification (RANGE-CARD-ONLY's set) reports nothing" rco nucleus/v3-scaffold card/v3-OV
+expect_ok "(b) the runner's scope check names the scaffold tree" gs nucleus/v3-scaffold - "object $sct fails its hash"
+expect_ok "(b) merge-mode check_merge refuses, naming the scaffold tree" out_has "object $sct fails its hash" -- cmv OV nucleus/v3-scaffold card/v3-OV S standard
+# (b) check-core-paths: the CORE_PATHS read walks the forged scaffold tree
+# first, and git's ls-tree hash-checks it, so the refusal names the failed
+# step (fail closed); the object-naming row is (a)'s, where the base tree is
+# honest and verify_objects is what refuses.
+expect_ok "(b) check-core-paths exits 1 on the forged base tree (its CORE_PATHS read fails closed)" out_has "check-core-paths: cannot read CORE_PATHS from nucleus/v3-scaffold (git ls-tree nucleus/v3-scaffold failed" -- bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-OV"
+expect_ok "(b) audit names the scaffold tree (verify_reachable)" out_has "audit: object $sct fails its hash" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/ob"
+expect_ok "(b) both twins name the scaffold tree, identically" vparity_bad "$r" nucleus/v3-scaffold card/v3-OV
+restore_forged
+# merge-card window: HEAD is the scaffold tip itself, whose tree is the forged
+# one; the status read's failure is swallowed by the emptiness test and the
+# verify call before check_merge names the object.
+git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+forge_from "$r" "$sct" "$ovt"
+expect_ok "(b) merge-card refuses, naming the scaffold tree" out_has "object $sct fails its hash" -- mc OV
+restore_forged
+# (b') merge-card's own call: the scratch tip's tree, which no check_merge
+# range covers (the merge base is below it): the NO-VERIFY-MERGE-CARD row and
+# the only row whose forged object enters the want set through BASE alone.
+# HEAD moves to pass2 before the forgery (no checkout moves under one).
+git -C "$r" checkout -q scratch/pass2
+p2t=$(git -C "$r" rev-parse "scratch/pass2^{tree}")
+save_obj "$r" "$p2t"
+forge_from "$r" "$p2t" "$sct"
+expect_ok "(b') merge-card refuses on a forged scratch-tip tree outside the card's range" out_has "object $p2t fails its hash" -- mc A
+restore_forged
+git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+expect_ok "forged objects: (b) restored" no_state4
+
+# (c) Interior base commit: base history ob is M -> S1 -> S2 (two empty
+# commits), card/v3-OI is M -> X -> T; S1's loose commit file becomes a commit
+# with S1's tree and X as parent, so the merge base moves into the card and
+# X's tools/oi.py drops out of every range read.
+git -C "$r" checkout -q -b ob nucleus/v3-scaffold
+git -C "$r" commit -q --allow-empty -m "ob S1"
+s1=$(git -C "$r" rev-parse HEAD); s1t=$(git -C "$r" rev-parse "HEAD^{tree}")
+git -C "$r" commit -q --allow-empty -m "ob S2"
+card OI S standard
+git -C "$r" checkout -q -b card/v3-OI nucleus/v3-scaffold
+echo oi >"$v3/tools/oi.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OI work"
+ox=$(git -C "$r" rev-parse HEAD)
+printf 'Card: OI\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OI.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OI verdict MERGE"
+git -C "$r" checkout -q -B scratch/oc ob
+git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-OI (MERGE, gate S/test-model)" card/v3-OI
+git -C "$r" checkout -q card/v3-OI
+printf 'tree %s\nparent %s\nauthor t <t@t> 1700000000 +0000\ncommitter t <t@t> 1700000000 +0000\n\nob S1 forged\n' "$s1t" "$ox" >"$t/s1.body"
+save_obj "$r" "$s1"
+forge_commit "$r" "$s1" "$t/s1.body"
+c_mb() { local m; m=$(plain merge-base ob card/v3-OI); echo "merge-base: $m"; [ "$m" = "$ox" ]; }
+expect_ok "premise: (c) plain merge-base ob card/v3-OI is X" c_mb
+c_diff() { local d; d=$(plain diff --name-only ob...card/v3-OI); echo "diff: $d"; ! grep -qxF nucleus/v3/tools/oi.py <<<"$d"; }
+expect_ok "premise: (c) plain diff ob...card/v3-OI drops tools/oi.py" c_diff
+expect_ok "(c) the runner's scope check names S1" gs ob - "object $s1 fails its hash"
+expect_ok "(c) merge-mode check_merge refuses, naming S1" out_has "object $s1 fails its hash" -- cmv OI ob card/v3-OI S standard
+expect_ok "(c) audit names S1 (verify_reachable)" out_has "audit: object $s1 fails its hash" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/oc"
+expect_ok "(c) both twins name S1, identically" vparity_bad "$r" ob card/v3-OI
+restore_forged
+expect_ok "forged objects: (c) restored" no_state4
+
+# (d) Pack .idx offset swap, in a cp -a copy: the repack must not disturb $r's
+# loose objects ((k) and (l) forge blobs loose), and git looks in packs first.
+dc=$t/dc
+cp -a "$r" "$dc"
+git -C "$dc" repack -q -a -d
+dcidx=$(ls "$dc"/.git/objects/pack/*.idx)
+expect_ok "premise: (d) OV's tree and the scaffold's are packed, not loose" bash -c "[ \$(ls '$dc'/.git/objects/pack/*.idx | wc -l) -eq 1 ] && [ ! -e '$(objlo "$dc" "$ovt")' ] && [ ! -e '$(objlo "$dc" "$sct")' ]"
+chmod u+w "$dcidx"
+idx_swap "$dcidx" "$ovt" "$sct"
+d_hidden() { local d rc=0; d=$(git -C "$dc" diff --name-only nucleus/v3-scaffold...card/v3-OV) || rc=$?; echo "diff (rc $rc): $d"; [ "$rc" -eq 0 ] && [ -z "$d" ]; }
+expect_ok "premise: (d) the plain diff hides tools/ov.py" d_hidden
+d_sh() { vsh "$dc" nucleus/v3-scaffold card/v3-OV; }
+expect_ok "(d) the shell twin names the tree" out_has "object $ovt fails its hash" -- d_sh
+d_py() { vpy "$dc" nucleus/v3-scaffold card/v3-OV; }
+expect_ok "(d) the Python twin names the tree" out_has "object $ovt fails its hash" -- d_py
+expect_ok "(d) both twins name the tree, identically" vparity_bad "$dc" nucleus/v3-scaffold card/v3-OV
+
+# (e) gate_committed: G is the gate's verdict commit for verdicts/OG.md, W a
+# later worker commit changing it again, R an honest commit on top (HEAD's own
+# tree stays honest: git hash-checks it in status). W's root tree file holds
+# G's bytes, so the path-limited log skips W and finds G.
+card OG S standard
+git -C "$r" checkout -q -b card/v3-OG nucleus/v3-scaffold
+echo og >"$v3/spikes/og.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OG work"
+printf 'Card: OG\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OG.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OG verdict MERGE"
+gog=$(git -C "$r" rev-parse HEAD); gtog=$(git -C "$r" rev-parse "HEAD^{tree}")
+echo forged >>"$v3/verdicts/OG.md"; git -C "$r" commit -qam "nucleus v3: OG rework"
+wog=$(git -C "$r" rev-parse HEAD); wtog=$(git -C "$r" rev-parse "HEAD^{tree}")
+echo og2 >"$v3/spikes/og2.txt"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OG more work"
+save_obj "$r" "$wtog"
+forge_from "$r" "$wtog" "$gtog"
+# The premise (NO-VERIFY-GATE-COMMITTED is not equivalent): the runner with
+# the call dropped reads the lie's history and trusts the forged W.
+sed '/^    if verify_objects(wt, base, pre_head):/,+1d' "$v3/tools/run_card.py" >"$t/run_card-nogc.py"
+e_premise() { PYTHONDONTWRITEBYTECODE=1 python3 - "$t/run_card-nogc.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OG.md OG "$wog" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, base, own, cid, pre = pathlib.Path(sys.argv[2]), *sys.argv[3:7]
+print(rc.gate_committed(wt, base, own, cid, pre))
+sys.exit(0 if rc.gate_committed(wt, base, own, cid, pre) else 1)
+P
+}
+expect_ok "premise: (e) without the call gate_committed trusts the forged W" e_premise
+e_row() { PYTHONDONTWRITEBYTECODE=1 python3 - "$v3/tools/run_card.py" "$r" nucleus/v3-scaffold nucleus/v3/verdicts/OG.md OG "$wog" "$wtog" <<'P'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("rc", sys.argv[1]); rc = importlib.util.module_from_spec(spec); spec.loader.exec_module(rc)
+wt, base, own, cid, pre, wtree = pathlib.Path(sys.argv[2]), *sys.argv[3:8]
+probs = rc.verify_objects(wt, base, pre)
+gc = rc.gate_committed(wt, base, own, cid, pre)
+bad = rc.scope_violations(wt, base, ["nucleus/v3/spikes/"], cid, pre)
+print("verify:", probs)
+print("gate_committed:", gc)
+print("\n".join(bad) or "(no violations)")
+sys.exit(0 if any(f"object {wtree} fails its hash" in p for p in probs) and gc is False and own + " (protected)" in bad else 1)
+P
+}
+expect_ok "(e) with the call: verify names W's tree, gate_committed is False, the verdict is protected" e_row
+restore_forged
+expect_ok "forged objects: (e) restored" no_state4
+
+# (f) Audit listing: a titled merge, then a direct commit D changing
+# nucleus/v3/tools/od.py; D's root tree file holds D^'s bytes, so the
+# path-limited first-parent listing is TREESAME at D and never yields it.
+card OD S standard; branch OD nucleus/v3/spikes/od.txt; verdict OD S MERGE standard S
+git -C "$r" checkout -q -B scratch/of nucleus/v3-scaffold
+git -C "$r" merge -q --no-ff -m "nucleus v3: merge card/v3-OD (MERGE, gate S/test-model)" card/v3-OD
+echo od >"$v3/tools/od.py"; git -C "$r" add -A; git -C "$r" commit -qm "direct commit D"
+dsha=$(git -C "$r" rev-parse HEAD); dtree=$(git -C "$r" rev-parse "HEAD^{tree}")
+dptree=$(git -C "$r" rev-parse "$dsha^^{tree}")
+save_obj "$r" "$dtree"
+forge_from "$r" "$dtree" "$dptree"
+f_listed() { local o; o=$(plain rev-list --first-parent scratch/of -- :/nucleus/v3); echo "$o"; ! grep -qxF "$dsha" <<<"$o"; }
+expect_ok "premise: (f) the listing does not yield D" f_listed
+expect_ok "premise: (f) without verify_reachable the audit prints ok" novr_ok scratch/of
+expect_ok "(f) audit exits 1 naming D's tree" out_has "audit: object $dtree fails its hash" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/of"
+restore_forged
+expect_ok "forged objects: (f) restored" no_state4
+
+# (f') The evil-merge row: the merge's own tree carries an edit (tools/od2.py)
+# and its first parent's root tree file holds the merge's tree bytes, so
+# merge-tree reproduces the evil tree and clean_merge passes under the lie.
+# The first parent commits only README (outside nucleus/v3) so the listing
+# stays quiet; under the lie the listing reads the forged tree and names the
+# first parent as a direct commit, so the per-merge checks cannot all pass and
+# only verify_reachable catches this forgery (the premise that the per-merge
+# checks skip is (f)'s).
+git -C "$r" checkout -q -B scratch/ofp nucleus/v3-scaffold
+echo ofp >>"$r/README"; git -C "$r" commit -qam "OFP first parent"
+ct=$(git -C "$r" rev-parse "HEAD^{tree}")
+git -C "$r" merge -q --no-ff --no-commit card/v3-OD >/dev/null 2>&1 || true
+echo od2 >"$v3/tools/od2.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: merge card/v3-OD (MERGE, gate S/test-model)"
+mt=$(git -C "$r" rev-parse "HEAD^{tree}")
+save_obj "$r" "$ct"
+forge_from "$r" "$ct" "$mt"
+expect_ok "(f') audit exits 1 naming the first parent's tree" out_has "audit: object $ct fails its hash" -- bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/ofp"
+restore_forged
+expect_ok "forged objects: (f') restored" no_state4
+
+# (g) Honest control: both twins return nothing on honest ranges, a card that
+# merged before the forgeries still merges through verification, the audit
+# accepts it, and a range with no merge base verifies clean.
+expect_ok "(g) both twins are clean on scaffold...card/v3-OV" vparity_ok "$r" nucleus/v3-scaffold card/v3-OV
+oroot=$(git -C "$r" commit-tree "$(git -C "$r" rev-parse nucleus/v3-scaffold^{tree})" -m "orphan root")
+expect_ok "(g) both twins are clean on a range with no merge base" vparity_ok "$r" "$oroot" card/v3-A
+card OVC S standard; branch OVC nucleus/v3/spikes/ovc.txt; verdict OVC S MERGE standard S
+scratch
+expect_ok "(g) an honest card still merges through verification" mc OVC
+expect_ok "(g) the audit accepts the merge" bash -c "cd '$v3' && bash scripts/audit-merges.sh scratch/pass1"
+
+# (i) Failure is a problem: a git step verify_objects depends on failing is a
+# problem line, never "nothing found"; the runner and merge-mode check_merge
+# refuse. gshim fails the call; gempty makes it answer nothing and exit 0
+# (the empty listing an honest repository cannot produce).
+expect_ok "(i) the shell twin reports a failed pack-objects" out_has "verify_objects: git pack-objects failed (exit 128; cannot verify objects)" -- gshim pack-objects vsh "$r" nucleus/v3-scaffold card/v3-A
+expect_ok "(i) the Python twin reports a failed pack-objects" out_has "verify_objects: git pack-objects failed (exit 128; cannot verify objects)" -- gshim pack-objects vpy "$r" nucleus/v3-scaffold card/v3-A
+expect_ok "(i) a failed index-pack is a problem" out_has "verify_objects: git index-pack failed (exit 128; cannot verify objects)" -- gshim index-pack vsh "$r" nucleus/v3-scaffold card/v3-A
+expect_ok "(i) a failed show-index is a problem" out_has "verify_objects: git show-index failed (exit 128; cannot verify objects)" -- gshim show-index vsh "$r" nucleus/v3-scaffold card/v3-A
+expect_ok "(i) a failed rev-list is a problem" out_has "verify_objects: git rev-list failed (exit 128; cannot verify objects)" -- gshim rev-list vsh "$r" nucleus/v3-scaffold card/v3-A
+expect_ok "(i) the runner's scope check names the failed verify step" gshim pack-objects gs nucleus/v3-scaffold - "verify_objects: git pack-objects failed"
+expect_ok "(i) merge-mode check_merge refuses on a failed verify step" out_has "verify_objects: git pack-objects failed (exit 128; cannot verify objects)" -- gshim pack-objects cmv A nucleus/v3-scaffold card/v3-A S standard
+expect_ok "(i) a rev-list that answers nothing is a problem (shell)" out_has "verify_objects: the object listing is empty (cannot verify objects)" -- gempty rev-list vsh "$r" nucleus/v3-scaffold card/v3-A
+expect_ok "(i) a rev-list that answers nothing is a problem (Python)" out_has "verify_objects: the object listing is empty (cannot verify objects)" -- gempty rev-list vpy "$r" nucleus/v3-scaffold card/v3-A
+
+# (j) Cost: verify_objects on the widest range (the scratch root to a
+# two-merge pass) and verify_reachable over the scaffold, each under 2 s; the
+# measured times print in the row output.
+j_obj() { local t0 t1 ms rc=0; t0=$(date +%s%N); (cd "$v3" && . scripts/git-env.sh && verify_objects "$root" scratch/pass2) || rc=$?; t1=$(date +%s%N); ms=$(((t1 - t0) / 1000000)); echo "     (j) verify_objects $root...scratch/pass2: ${ms} ms"; [ "$rc" -eq 0 ] && [ "$ms" -lt 2000 ]; }
+expect_ok "(j) verify_objects on the widest range is under 2 s" j_obj
+j_reach() { local t0 t1 ms rc=0; t0=$(date +%s%N); (cd "$v3" && . scripts/git-env.sh && verify_reachable nucleus/v3-scaffold) || rc=$?; t1=$(date +%s%N); ms=$(((t1 - t0) / 1000000)); echo "     (j) verify_reachable nucleus/v3-scaffold: ${ms} ms"; [ "$rc" -eq 0 ] && [ "$ms" -lt 2000 ]; }
+expect_ok "(j) verify_reachable on the scaffold is under 2 s" j_reach
+
+# (k) CORE_PATHS at BASE (the w7 reproduction): the base's CORE_PATHS blob
+# file holds the bytes of a copy without the tools/ line, and an S verdict on
+# tools/k.py. Built in a copy: the base commit is this scenario's own, so the
+# forged blob is not the scaffold's.
+kb=$t/kb
+cp -a "$r" "$kb"
+git -C "$kb" checkout -q -b kb-base nucleus/v3-scaffold
+printf '# kb CORE_PATHS\n' >>"$kb/nucleus/v3/CORE_PATHS"
+git -C "$kb" commit -qam "kb-base CORE_PATHS"
+git -C "$kb" checkout -q -b card/v3-OK kb-base
+echo k >"$kb/nucleus/v3/tools/k.py"; git -C "$kb" add -A; git -C "$kb" commit -qm "nucleus v3: OK work"
+printf 'Card: OK\nClass: standard\nCard-gate: S\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$kb" rev-parse --short HEAD)" >"$kb/nucleus/v3/verdicts/OK.md"
+git -C "$kb" add -A; git -C "$kb" commit -qm "nucleus v3: OK verdict MERGE"
+git -C "$kb" checkout -q -B scratch/ok kb-base
+git -C "$kb" merge -q --no-ff -m "nucleus v3: merge card/v3-OK (MERGE, gate S/test-model)" card/v3-OK
+kbid=$(git -C "$kb" rev-parse kb-base:nucleus/v3/CORE_PATHS)
+grep -v '^tools/$' "$kb/nucleus/v3/CORE_PATHS" >"$t/cp.notools"
+kbnt=$(git -C "$kb" hash-object -w "$t/cp.notools")
+save_obj "$kb" "$kbid"
+forge_from "$kb" "$kbid" "$kbnt"
+k_premise() { local o; o=$(git -C "$kb" cat-file blob "$kbid"); echo "$o"; ! grep -qxF tools/ <<<"$o"; }
+expect_ok "premise: (k) plain cat-file shows no tools/ line" k_premise
+kbv="blob $kbid (kb-base:nucleus/v3/CORE_PATHS) fails its hash"
+expect_ok "(k) merge-mode check_merge refuses, naming the blob" out_has "$kbv" -- bash -c "cd '$kb/nucleus/v3' && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge OK kb-base card/v3-OK merge S standard"
+expect_ok "(k) audit-mode check_merge refuses, naming the blob" out_has "$kbv" -- bash -c "cd '$kb/nucleus/v3' && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge OK kb-base card/v3-OK audit"
+expect_ok "(k) check-core-paths exits 1, naming the blob" out_has "check-core-paths: cannot read CORE_PATHS from kb-base (blob $kbid" -- bash -c "cd '$kb/nucleus/v3' && bash scripts/check-core-paths.sh kb-base card/v3-OK"
+k_audit() { local o rc=0; o=$(cd "$kb/nucleus/v3" && bash scripts/audit-merges.sh scratch/ok 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "blob $kbid" <<<"$o"; }
+expect_ok "(k) audit on a ref merging it exits 1, naming the blob" k_audit
+restore_forged
+expect_ok "forged objects: (k) restored" no_state4
+
+# (l) Verdict at HEAD: card/v3-OL is a P card with a tools/ change and an
+# honest Gate-tier: S verdict; its verdict blob file is forged to read
+# Gate-tier: P, which without the check would pass the P-gate rule.
+card OL P core
+git -C "$r" checkout -q -b card/v3-OL nucleus/v3-scaffold
+echo ol >"$v3/tools/ol.py"; git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OL work"
+printf 'Card: OL\nClass: core\nCard-gate: P\nVerdict: MERGE\nGate-tier: S\nGate-model: test-model\nGate-session: t\nDate: 2026-11-03\nGate-exit: GATE EXIT=0\nCommit: %s\nMutants: n/a\nFollowups: none\n' "$(git -C "$r" rev-parse --short HEAD)" >"$v3/verdicts/OL.md"
+git -C "$r" add -A; git -C "$r" commit -qm "nucleus v3: OL verdict MERGE"
+olid=$(git -C "$r" rev-parse "card/v3-OL:nucleus/v3/verdicts/OL.md")
+sed 's/^Gate-tier: S$/Gate-tier: P/' "$v3/verdicts/OL.md" >"$t/ol.p"
+olf=$(git -C "$r" hash-object -w "$t/ol.p")
+git -C "$r" checkout -q -B scratch/pass1 nucleus/v3-scaffold
+save_obj "$r" "$olid"
+forge_from "$r" "$olid" "$olf"
+l_premise() { local o; o=$(git -C "$r" show "card/v3-OL:nucleus/v3/verdicts/OL.md"); echo "$o"; grep -qxF "Gate-tier: P" <<<"$o"; }
+expect_ok "premise: (l) plain git show reads Gate-tier: P" l_premise
+olv="blob $olid (card/v3-OL:nucleus/v3/verdicts/OL.md) fails its hash"
+expect_ok "(l) merge-mode check_merge refuses, naming the blob" out_has "$olv" -- cmv OL nucleus/v3-scaffold card/v3-OL P core
+expect_ok "(l) audit-mode check_merge refuses, naming the blob" out_has "$olv" -- bash -c "cd '$v3' && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge OL nucleus/v3-scaffold card/v3-OL audit"
+expect_ok "(l) merge-card refuses, naming the blob" out_has "$olv" -- mc OL
+restore_forged
+expect_ok "forged objects: (l) restored" no_state4
+
+# (m) Honest control for the blob checks: the scaffold's CORE_PATHS and an
+# honest verdict blob verify clean (every existing check_merge,
+# check-core-paths, merge-card and audit row above now runs through
+# verify_blob and verify_objects).
+m_blobs() { (cd "$v3" && . scripts/git-env.sh && verify_blob "$(git rev-parse nucleus/v3-scaffold:nucleus/v3/CORE_PATHS)" "$t/mv3" "nucleus/v3-scaffold:nucleus/v3/CORE_PATHS" && verify_blob "$(git rev-parse card/v3-OV:nucleus/v3/verdicts/OV.md)" "$t/mv3" "card/v3-OV:nucleus/v3/verdicts/OV.md"); }
+expect_ok "(m) honest CORE_PATHS and verdict blobs verify clean" m_blobs
+
+# (n) verify_blob fail-closed: a hash-object that cannot run is a problem
+# line, and the consumers refuse, never reading the verdict as verified.
+expect_ok "(n) check_merge refuses when hash-object fails (merge mode)" out_has "verify_blob: git hash-object failed (exit 128; cannot verify objects)" -- gshim hash-object cmv A nucleus/v3-scaffold card/v3-A S standard
+expect_ok "(n) check_merge refuses when hash-object fails (audit mode)" out_has "verify_blob: git hash-object failed (exit 128; cannot verify objects)" -- gshim hash-object bash -c "cd '$v3' && . scripts/core-paths-lib.sh && . scripts/enforce-lib.sh && check_merge A nucleus/v3-scaffold card/v3-A audit"
+n_ccp() { local o rc=0; o=$(gshim hash-object bash -c "cd '$v3' && bash scripts/check-core-paths.sh nucleus/v3-scaffold card/v3-B" 2>&1) || rc=$?; echo "$o"; [ "$rc" -ne 0 ] && grep -qF "verify_blob: git hash-object failed" <<<"$o"; }
+expect_ok "(n) check-core-paths exits 1, not 0, when hash-object fails" n_ccp
+
 # --- runner: refs outside the card branch (X-6-F1-F3-F1) -------------------
 # The ref store is shared by every worktree, so ref_violations refuses only ref
 # changes it can pin on this run (R1) or that touch a protected ref (R2), and

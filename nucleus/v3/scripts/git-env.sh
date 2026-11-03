@@ -311,3 +311,141 @@ git_state_refuse() {
   printf '%s\n' "$GIT_STATE_PROBLEMS"
   return 1
 }
+
+# Object integrity (X-6-F1-F2-F3-F1, probed on git 2.47.3). Git trusts an
+# object file to hold the object its name says: a same-uid worker can
+# overwrite a loose object file, or swap the offsets in a pack's .idx, so that
+# one id returns another object's bytes. Every read then sees the lie, and
+# the environment above does not apply: this is storage integrity, not a cache
+# or a switch. A card tip whose root tree file holds the scaffold tree's bytes
+# (or the scaffold tree holding the card's) diffs as nothing, and so does a
+# base commit given the card's commit as parent, which moves the merge base.
+# `rev-list --objects --verify-objects` does not catch either: it re-hashes
+# only the objects the walk did not parse, so commits and trees are never
+# checked. A range limited to BASE..TIP misses the base side (the merge base's
+# trees, and base commits that move it). `git push` of a lie is rejected
+# ("missing necessary objects") and a fresh clone reads the true objects, so
+# CI's audit on a fresh clone is safe; the local runner, merge-card,
+# check-core-paths and audit are what this covers.
+#
+# So every range consumer first re-hashes every commit and tree its answer
+# depends on, starting from the ref tips (a Merkle check), and refuses on any
+# mismatch. The ids are listed by walking the objects as git reads them: under
+# a swapped tree the walk lists the lie's children, but the swapped id itself
+# is in the list, and it is that id that fails. pack-objects copies each listed
+# object out through git's normal read path (--no-reuse-object: no raw copy of
+# packed bytes, so a forged .idx offset is read as the consumers read it) and
+# index-pack, in a temp dir outside any repository, names each object by the
+# hash of what it got; an id that does not come back fails its hash, whatever
+# lied (a loose file, an .idx/midx/.rev offset, a missing object). An extra id
+# is the lie's true id, not a problem. Blobs are not verified by these two:
+# name-only diffs never read them, and hashing every blob in history costs
+# about 15 s an audit under load (verdict X-6-F1-F2-F3-F1-esc-1). The two
+# blobs whose content decides a check, the verdict file at the branch tip and
+# CORE_PATHS at BASE, go through verify_blob below instead. Nothing here
+# caches a result (a marker would be one more piece of trusted state a worker
+# could write), repairs an object, or writes into the repository's objects/.
+# tools/run_card.py's verify_objects is the twin and prints the same lines;
+# verify_blob has none (the runner reads no blob content through git).
+VERIFY_PROBLEMS=
+
+# _verify_ids NAME DIR: hash-verify the ids listed in DIR/want; on a problem,
+# set VERIFY_PROBLEMS (newline-separated) and return 1. A failed git step is a
+# problem, never "nothing found".
+_verify_ids() {
+  local name=$1 d=$2 fmt rc=0 top=${2%/*}
+  # An empty walk cannot happen in an honest repository: TIP and its root tree
+  # are always listed.
+  [ -s "$d/want" ] || { VERIFY_PROBLEMS="$name: the object listing is empty (cannot verify objects)"; return 1; }
+  fmt=$(git rev-parse --show-object-format) || { VERIFY_PROBLEMS="$name: git rev-parse failed (exit $?; cannot verify objects)"; return 1; }
+  git pack-objects --stdout -q --no-reuse-object --window=0 --compression=0 <"$d/want" >"$d/p.pack" || { VERIFY_PROBLEMS="$name: git pack-objects failed (exit $?; cannot verify objects)"; return 1; }
+  # Outside any repository (the ceiling stops the search at DIR), so
+  # index-pack's collision check reads no repository object.
+  (cd "$d" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY GIT_CEILING_DIRECTORIES="$top" git index-pack --object-format="$fmt" -o p.idx p.pack >/dev/null) || { VERIFY_PROBLEMS="$name: git index-pack failed (exit $?; cannot verify objects)"; return 1; }
+  (cd "$d" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY GIT_CEILING_DIRECTORIES="$top" git show-index --object-format="$fmt" <p.idx >got.raw) || { VERIFY_PROBLEMS="$name: git show-index failed (exit $?; cannot verify objects)"; return 1; }
+  # show-index prints "<offset> <id> (<crc>)".
+  cut -d ' ' -f 2 "$d/got.raw" | LC_ALL=C sort -u >"$d/got" || rc=1
+  LC_ALL=C sort -u "$d/want" >"$d/want.s" || rc=1
+  [ "$rc" -eq 0 ] || { VERIFY_PROBLEMS="$name: cannot compare the object lists (cannot verify objects)"; return 1; }
+  VERIFY_PROBLEMS=$(LC_ALL=C comm -23 "$d/want.s" "$d/got" | sed 's/.*/object & fails its hash (git state hides changes)/')
+  [ -z "$VERIFY_PROBLEMS" ]
+}
+
+# verify_objects BASE TIP: hash-verify every object a BASE...TIP consumer
+# reads: the commits of `rev-list --boundary BASE...TIP` (both sides, and the
+# boundary), every merge base, and BASE, TIP and every merge base with every
+# tree under their root trees. BASE's own trees are in because merge-card's
+# merge and the audit's clean_merge read the first parent's trees; when BASE
+# is the merge base the dedupe drops the copy. Prints nothing; on a problem,
+# sets VERIFY_PROBLEMS (cleared on entry) and returns 1. Lines:
+# "object <id> fails its hash (git state hides changes)", or
+# "verify_objects: git <step> failed (exit <n>; cannot verify objects)".
+verify_objects() {
+  local b=$1 h=$2 d rc=0 mbs=()
+  VERIFY_PROBLEMS=
+  d=$(mktemp -d) || { VERIFY_PROBLEMS="verify_objects: cannot create a temporary directory (cannot verify objects)"; return 1; }
+  git rev-list --boundary "$b...$h" -- >"$d/c" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    VERIFY_PROBLEMS="verify_objects: git rev-list failed (exit $rc; cannot verify objects)"
+  else
+    # Exit 1 is no merge base (unrelated histories); anything else fails.
+    git merge-base --all "$b" "$h" >"$d/mb" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+      VERIFY_PROBLEMS="verify_objects: git merge-base failed (exit $rc; cannot verify objects)"
+    else
+      rc=0
+      mapfile -t mbs <"$d/mb"
+      git rev-list --objects --no-object-names --filter=blob:none --no-walk "$b" "$h" "${mbs[@]}" -- >"$d/t" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        VERIFY_PROBLEMS="verify_objects: git rev-list failed (exit $rc; cannot verify objects)"
+      elif [ ! -s "$d/t" ]; then
+        # The roots' own listing, whatever the commit list holds.
+        VERIFY_PROBLEMS="verify_objects: the object listing is empty (cannot verify objects)"
+      else
+        { sed 's/^-//' "$d/c"; cat "$d/mb" "$d/t"; } >"$d/want"
+        _verify_ids verify_objects "$d" || true
+      fi
+    fi
+  fi
+  rm -rf "$d"
+  [ -z "$VERIFY_PROBLEMS" ]
+}
+
+# verify_reachable REF: the same check over every commit and tree in REF's
+# history. For audit-merges.sh, whose path-limited first-parent listing never
+# yields a commit that is TREESAME under a swapped tree, so no per-merge range
+# can see it. Lines as verify_objects', named "verify_reachable:".
+verify_reachable() {
+  local d rc=0
+  VERIFY_PROBLEMS=
+  d=$(mktemp -d) || { VERIFY_PROBLEMS="verify_reachable: cannot create a temporary directory (cannot verify objects)"; return 1; }
+  git rev-list --objects --no-object-names --filter=blob:none "$1" -- >"$d/want" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    VERIFY_PROBLEMS="verify_reachable: git rev-list failed (exit $rc; cannot verify objects)"
+  else
+    _verify_ids verify_reachable "$d" || true
+  fi
+  rm -rf "$d"
+  [ -z "$VERIFY_PROBLEMS" ]
+}
+
+# verify_blob ID FILE [LABEL]: write blob ID to FILE and check that FILE hashes
+# to ID; the caller then uses FILE's bytes and never reads the blob again, so
+# the content checked is the content used, with no second read to race. For
+# the blobs whose content decides a check (X-6-F1-F2-F3-F1-esc-1, ESC-2): a
+# forged CORE_PATHS at BASE dropping tools/ let an S verdict on tools/ pass.
+# hash-object never writes (no -w) and --no-filters hashes the bytes as they
+# are. On a problem, sets VERIFY_PROBLEMS (cleared on entry) and returns 1:
+# "blob <id> (<LABEL>) fails its hash (git state hides changes)", or
+# "verify_blob: git <step> failed (exit <n>; cannot verify objects)".
+verify_blob() {
+  local id=$1 f=$2 label=${3:-} got rc=0
+  VERIFY_PROBLEMS=
+  git cat-file blob "$id" >"$f" || rc=$?
+  if [ "$rc" -ne 0 ]; then VERIFY_PROBLEMS="verify_blob: git cat-file failed (exit $rc; cannot verify objects)"; return 1; fi
+  got=$(git hash-object --no-filters -t blob -- "$f") || rc=$?
+  if [ "$rc" -ne 0 ]; then VERIFY_PROBLEMS="verify_blob: git hash-object failed (exit $rc; cannot verify objects)"; return 1; fi
+  [ "$got" = "$id" ] && return 0
+  VERIFY_PROBLEMS="blob $id${label:+ ($label)} fails its hash (git state hides changes)"
+  return 1
+}

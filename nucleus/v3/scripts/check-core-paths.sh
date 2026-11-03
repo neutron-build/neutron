@@ -57,6 +57,8 @@ esac
 # by accident: every path is under nucleus/v3, and the prefix strip is a no-op.
 lst=$(mktemp)
 trap 'rm -f "$lst"' EXIT
+# A forged object makes the diff list nothing (git-env.sh's verify_objects).
+verify_objects "$base" "$head" || { sed 's/^/check-core-paths: /' <<<"$VERIFY_PROBLEMS" >&2; exit 1; }
 git diff -z --no-renames --no-relative --ignore-submodules=none --name-only "$base...$head" -- ":/$v3" >"$lst" || { echo "check-core-paths: git diff $base...$head failed" >&2; exit 1; }
 while IFS= read -r -d '' f; do
   [ -n "$f" ] || continue
