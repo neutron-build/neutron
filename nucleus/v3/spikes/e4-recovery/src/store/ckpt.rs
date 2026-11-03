@@ -1374,6 +1374,27 @@ pub fn recover<H: StoreHost>(cx: &Cx<'_, H>, cfg: StoreCfg) -> Result<(StoreInne
                     valid_end = lsn + len;
                     lsn += len;
                     off += len;
+                    if off == WAL_SEG {
+                        // **S-1-F3 §12.5, the hop (gate edit 2; X-5c-F3-
+                        // F3a step 2):** "after `SegmentEnd`, **or after
+                        // an accepted record that ends exactly at its
+                        // segment's end**, the reader moves on to the
+                        // next segment's first LSN, and the valid end is
+                        // then at least that LSN, even when that segment
+                        // is short or missing." §12.2's tail rule lets a
+                        // record end exactly at the boundary with no
+                        // room for a filler, so the hop is the reader's
+                        // only way on; without it the walk stopped at
+                        // `off == WAL_SEG` with the valid end at the
+                        // boundary, and G2's truncation then zeroed the
+                        // next segment's records — the four boundary
+                        // store losses (1064 r1, 4770 r2, 5054 r1, 6263
+                        // r2: class-C I-REDO-COMPLETE breaks, acked
+                        // SyncOn commits lost with no media fault).
+                        valid_end = seg + WAL_SEG;
+                        lsn = seg + WAL_SEG;
+                        continue 'outer;
+                    }
                 }
                 Ok(None) | Err(()) => break 'outer,
             }

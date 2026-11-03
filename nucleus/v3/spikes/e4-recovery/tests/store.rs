@@ -1771,3 +1771,239 @@ fn cxx_dir_reput_never_appends_a_duplicate() {
         "a directory re-put must never disorder the leaf (6.8): {findings:?}"
     );
 }
+
+/// **X-5c-F3-F3a step 2 pin (§12.2/§12.5, the exact segment end; S-1-F3
+/// gate G2, edit 2; a literal config).** §12.2's tail rule lets a record
+/// end **exactly** at its segment's end with no room for a `SegmentEnd`
+/// filler, and §12.5's carried hop text moves the reader on "after
+/// `SegmentEnd`, **or after an accepted record that ends exactly at its
+/// segment's end**". The draft's walk exited its inner loop at
+/// `off == WAL_SEG` and stopped with the valid end at the boundary, so
+/// G2's truncation zeroed the next segment's records — the four
+/// boundary store losses (1064 r1, 4770 r2, 5054 r1, 6263 r2).
+///
+/// The config: segment 0 holds four durable max-size records ending
+/// exactly at LSN 65536 (4 × REC_MAX = WAL_SEG); segment 1 holds two
+/// client-acked SyncOn commits (ts=5, 6), synced before the crash.
+/// Recovery must replay them (frontier = 6 ≥ the max acked), and
+/// segment 1's records must not be zeroed. Reverting the hop (mutant
+/// SEG-EXACT-NO-HOP) fails both: the walk never enters segment 1, the
+/// frontier stalls at 4, and `truncate_wal` zeroes segment 1 from its
+/// first byte — the acked commits are lost with no media fault.
+#[test]
+fn wal_exact_segment_end_hops() {
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    let maxp = (e4_recovery::store::wal::REC_MAX - fixed) as usize;
+    let seed = 6262u64;
+    let cfg = tcfg(8, 8, 1);
+    // ---- setup (single task): segment 0 filled exactly and durable,
+    // then two SyncOn commits in segment 1, acked (synced) ----
+    let (disk, seg1_fid, rec_bytes) = {
+        let host = TestWorld {
+            sched: SchedCore::new(1, seed),
+            disk: SimDisk::new(),
+            st: StoreInner::empty(cfg.clone(), 0),
+            flags: BTreeMap::new(),
+        };
+        let sched = Sched::new(host);
+        let cx = Cx {
+            w: &sched,
+            t: HARNESS,
+        };
+        let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+        cx.with("pin:install", |c| {
+            *c.store() = st;
+            Ok(())
+        })
+        .expect("install");
+        for ts in 1..=4u64 {
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp])
+                .expect("setup enqueue");
+        }
+        {
+            let g = sched.lock();
+            assert_eq!(
+                g.st.wal.append, seg,
+                "the setup must fill segment 0 exactly"
+            );
+        }
+        let (lsn5, _len5) =
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 5), 5, &[5u8; 10]).expect("ts=5 enqueue");
+        let (lsn6, len6) =
+            wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 6), 6, &[6u8; 10]).expect("ts=6 enqueue");
+        assert_eq!(lsn5, seg, "ts=5 starts at segment 1's first LSN");
+        assert_eq!(lsn6, seg + fixed + 10, "ts=6 follows it");
+        let end6 = lsn6 + len6;
+        wal::wal_wait_durable(&cx, end6).expect("both acked durable");
+        let (fid, bytes5, bytes6) = {
+            let g = sched.lock();
+            let fid = g
+                .disk
+                .stat("/wal/0000000000010000.log")
+                .expect("segment 1 bound");
+            let n5 = fixed + 10;
+            (
+                fid,
+                g.disk.durable_read(fid, 0, n5),
+                g.disk.durable_read(fid, n5, len6),
+            )
+        };
+        assert!(
+            !bytes5.iter().all(|b| *b == 0) && !bytes6.iter().all(|b| *b == 0),
+            "the fixture must hold real record bytes"
+        );
+        (g_of(&sched), fid, (bytes5, bytes6))
+    };
+    let (bytes5, bytes6) = rec_bytes;
+    let _ = seg1_fid;
+    // ---- the crash (everything synced: F-CRASH resolves it away) ----
+    let mut disk = disk;
+    let mut frng = e4_recovery::rng::Rng::new(seed + 7);
+    disk.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    // ---- recovery: the hop must carry the walk into segment 1 ----
+    let world = pass_world(1, seed + 8, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx, cfg.clone()).expect("recover after the crash");
+    assert_eq!(
+        frontier, 6,
+        "recovery replays the acked SyncOn commits in segment 1 (frontier >= max acked)"
+    );
+    assert_eq!(
+        rec_st.wal.append,
+        seg + 2 * (fixed + 10),
+        "the WAL restarts past both records"
+    );
+    // Segment 1's records are not zeroed: the bytes survive on the disk
+    // exactly as they were written (G2's truncation started past them).
+    let fid = world
+        .lock()
+        .disk
+        .stat("/wal/0000000000010000.log")
+        .expect("segment 1 still bound");
+    let n5 = fixed + 10;
+    let now5 = world.lock().disk.durable_read(fid, 0, n5);
+    let now6 = world.lock().disk.durable_read(fid, n5, bytes6.len() as u64);
+    assert_eq!(now5, bytes5, "ts=5's bytes are not zeroed");
+    assert_eq!(now6, bytes6, "ts=6's bytes are not zeroed");
+}
+
+/// A small helper: the world's disk, cloned (the pin above).
+fn g_of(sched: &Sched<TestWorld>) -> SimDisk {
+    sched.lock().disk.clone()
+}
+
+/// **X-5c-F3-F3a step 2 pin (§12.2's tail rule; a literal config).** An
+/// enqueue that would leave a tail of exactly `REC_FIXED − 1` bytes
+/// (44: room for the record but not for a `SegmentEnd` after it) is
+/// placed at the **next segment's first LSN**, behind a `SegmentEnd`
+/// filler — the carried §12.2 sentence: "Otherwise the writer writes
+/// `SegmentEnd` there, and the record starts at the next segment's
+/// first LSN." The SyncOn commit after it is acked and recovered.
+///
+/// The config: segment 0 is filled to leave exactly 99 bytes of room
+/// (55 for the ts=5 record + 44 of dead tail); ts=5's enqueue must
+/// return lsn 65536 — not 65437. Reverting the rule (mutant
+/// SEG-TAIL-SHORT: `fits` relaxed to `probe ≤ room`) places the record
+/// in the 44-byte dead tail and fails the placement assertion.
+#[test]
+fn wal_tail_short_never_placed() {
+    let seg = e4_recovery::store::WAL_SEG;
+    let fixed = e4_recovery::store::wal::REC_FIXED;
+    let seed = 6363u64;
+    let cfg = tcfg(8, 8, 1);
+    let host = TestWorld {
+        sched: SchedCore::new(1, seed),
+        disk: SimDisk::new(),
+        st: StoreInner::empty(cfg.clone(), 0),
+        flags: BTreeMap::new(),
+    };
+    let sched = Sched::new(host);
+    let cx = Cx {
+        w: &sched,
+        t: HARNESS,
+    };
+    let st = ckpt::create(&cx, cfg.clone(), seed as u128).expect("create");
+    cx.with("pin:install", |c| {
+        *c.store() = st;
+        Ok(())
+    })
+    .expect("install");
+    // Fill segment 0 to leave exactly 99 bytes: three max records plus
+    // one of payload 16240 (3×(45+16339) + 45+16240 = 65437; 65536 −
+    // 65437 = 99 = 55 + 44).
+    let maxp = (e4_recovery::store::wal::REC_MAX - fixed) as usize;
+    for ts in 1..=3u64 {
+        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, ts), ts, &vec![0u8; maxp]).expect("setup enqueue");
+    }
+    wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 4), 4, &vec![0u8; 16240]).expect("setup enqueue 4");
+    {
+        let g = sched.lock();
+        assert_eq!(
+            g.st.wal.append,
+            seg - 99,
+            "the setup must leave exactly 99 bytes of room"
+        );
+    }
+    // The pin: ts=5 (55 bytes) must be placed at the next segment's
+    // first LSN, behind a SegmentEnd — never in the 44-byte dead tail.
+    let (lsn5, len5) =
+        wal::wal_enqueue(&cx, wal::K_COMMIT, (0, 5), 5, &[5u8; 10]).expect("ts=5 enqueue");
+    assert_eq!(
+        lsn5, seg,
+        "an enqueue leaving a REC_FIXED-1 tail is placed at the next segment (12.2's tail rule)"
+    );
+    assert_eq!(len5, fixed + 10);
+    {
+        let g = sched.lock();
+        assert_eq!(g.st.wal.append, seg + fixed + 10);
+    }
+    // The SegmentEnd filler sits at the dead tail, durable with the
+    // ack (the batch is one write per segment).
+    let end5 = lsn5 + len5;
+    wal::wal_wait_durable(&cx, end5).expect("ts=5 acked durable");
+    // The crash (everything synced) and recovery: the commit replays.
+    let mut disk = {
+        let g = sched.lock();
+        g.disk.clone()
+    };
+    let mut frng = e4_recovery::rng::Rng::new(seed + 7);
+    disk.apply_crash(
+        &mut frng,
+        &e4_recovery::sim::FaultKnobs {
+            keep_latest_pm: 0,
+            tear_pm: 0,
+        },
+    );
+    let f0 = disk.stat("/wal/0000000000000000.log").expect("segment 0");
+    let tail = disk.durable_read(f0, seg - 99, fixed);
+    assert_eq!(
+        tail.first(),
+        Some(&0x4E),
+        "the SegmentEnd filler's magic sits at the dead tail (12.2)"
+    );
+    let world = pass_world(1, seed + 8, disk, StoreInner::empty(cfg.clone(), 0));
+    let cx2 = Cx {
+        w: &world,
+        t: HARNESS,
+    };
+    let (rec_st, frontier) = ckpt::recover(&cx2, cfg.clone()).expect("recover after the crash");
+    assert_eq!(
+        frontier, 5,
+        "the SyncOn commit placed behind the SegmentEnd is recovered"
+    );
+    assert_eq!(
+        rec_st.wal.append,
+        seg + fixed + 10,
+        "the WAL restarts past the recovered record"
+    );
+}

@@ -399,14 +399,19 @@ pub fn wal_enqueue<H: StoreHost>(
         let probe = REC_FIXED + payload.len() as u64;
         let seg = seg_of(lsn0);
         let room = seg + WAL_SEG - lsn0;
-        // A record placed here must either end exactly at the segment
-        // boundary or leave room enough for a later SegmentEnd filler
-        // (§12.2: no record spans segments, and the reader hops segments
-        // only on a filler it can decode). B5 prototype-deviation fix:
-        // the draft compared only `probe ≤ room`, so a record could land
-        // with a tail the 45-byte filler cannot fill — the record then
-        // straddled the boundary while carrying the next segment's lsn,
-        // and §12.5's position check rejected its bytes on read.
+        // **The carried §12.2 tail rule (S-1-F3 gate G2, edit 2; X-5c-
+        // F3-F3a step 2):** "A record is placed at the append position
+        // only if it ends exactly at its segment's end or leaves room
+        // for a `SegmentEnd` after it. Otherwise the writer writes
+        // `SegmentEnd` there, and the record starts at the next
+        // segment's first LSN. So a segment ends with `SegmentEnd` or
+        // with a record that ends exactly at its end, never with a
+        // shorter gap." (B5's prototype-deviation fix first enforced
+        // this: the draft compared only `probe ≤ room`, so a record
+        // could land with a tail the 45-byte filler cannot fill — the
+        // record then straddled the boundary while carrying the next
+        // segment's lsn, and §12.5's position check rejected its bytes
+        // on read.)
         let fits = probe <= room && (room - probe == 0 || room - probe >= REC_FIXED);
         let rec_lsn = if fits { lsn0 } else { seg + WAL_SEG };
         let rec = enc_record(kind, txn, ts, payload, rec_lsn);
