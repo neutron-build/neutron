@@ -3,7 +3,6 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { createRequire } from "node:module";
 import { Marked } from "marked";
 import type { NeutronMarkdownConfig } from "../config.js";
 import { markedShikiExtension } from "./syntax-highlight.js";
@@ -23,11 +22,12 @@ export { z };
 
 // gray-matter and @mdx-js/mdx (with js-yaml, micromark, acorn behind them)
 // load on first use: core's entry is imported by every server, and most
-// never read a content collection.
-let grayMatter: typeof import("gray-matter") | undefined;
-function frontmatter(raw: string) {
-  grayMatter ??= createRequire(import.meta.url)("gray-matter") as typeof import("gray-matter");
-  return grayMatter(raw);
+// never read a content collection. Dynamic imports, not require, so server
+// bundles still see and ship them.
+let grayMatter: Promise<typeof import("gray-matter")> | undefined;
+async function frontmatter(raw: string) {
+  grayMatter ??= import("gray-matter").then((mod) => mod.default);
+  return (await grayMatter)(raw);
 }
 
 // SECURITY: Validate against prototype pollution
@@ -700,7 +700,7 @@ async function readCollectionEntries(
     // HTML passthrough — no compilation, just frontmatter extraction
     if (ext === ".html" || ext === ".htm") {
       try {
-        const parsed = frontmatter(raw);
+        const parsed = await frontmatter(raw);
         const data = definition.schema.parse(parsed.data);
         entries.push(createEntry({
           id,
@@ -725,7 +725,7 @@ async function readCollectionEntries(
     }
 
     try {
-      const parsed = frontmatter(raw);
+      const parsed = await frontmatter(raw);
       const data = definition.schema.parse(parsed.data);
       const sourceType = ext === ".mdx" ? "mdx" : "markdown";
 
